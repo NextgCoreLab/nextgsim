@@ -1,0 +1,42 @@
+# nextgsim-gnb - 5G gNodeB Simulator
+# Optimized single-binary image
+
+FROM rust:1.75-bookworm AS builder
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY rustfmt.toml ./
+COPY nextgsim-common ./nextgsim-common
+COPY nextgsim-crypto ./nextgsim-crypto
+COPY nextgsim-nas ./nextgsim-nas
+COPY nextgsim-ngap ./nextgsim-ngap
+COPY nextgsim-rrc ./nextgsim-rrc
+COPY nextgsim-rls ./nextgsim-rls
+COPY nextgsim-gtp ./nextgsim-gtp
+COPY nextgsim-sctp ./nextgsim-sctp
+COPY nextgsim-gnb ./nextgsim-gnb
+COPY nextgsim-ue ./nextgsim-ue
+COPY nextgsim-cli ./nextgsim-cli
+COPY tests ./tests
+
+# Build only gNB binary
+RUN cargo build --release --package nextgsim-gnb
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/nextgsim-gnb /usr/local/bin/
+
+RUN mkdir -p /etc/nextgsim
+WORKDIR /etc/nextgsim
+
+EXPOSE 38412/sctp
+EXPOSE 2152/udp
+EXPOSE 4997
+
+ENTRYPOINT ["nextgsim-gnb"]
+CMD ["-c", "/etc/nextgsim/gnb.yaml"]

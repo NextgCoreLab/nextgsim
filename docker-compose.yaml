@@ -1,0 +1,78 @@
+# nextgsim Docker Compose Configuration
+# Usage: docker compose up -d
+
+version: '3.8'
+
+services:
+  # gNodeB Simulator
+  gnb:
+    build:
+      context: .
+      dockerfile: Dockerfile.gnb
+    container_name: nextgsim-gnb
+    hostname: gnb
+    volumes:
+      - ../config:/etc/nextgsim:ro
+      - gnb-logs:/var/log/nextgsim
+    command: ["-c", "/etc/nextgsim/open5gs-gnb.yaml"]
+    ports:
+      - "38412:38412/sctp"  # NGAP
+      - "2152:2152/udp"     # GTP-U
+      - "4997:4997"         # CLI
+    networks:
+      nextgsim-net:
+        ipv4_address: 10.100.200.10
+    environment:
+      - RUST_LOG=info,nextgsim_gnb=debug
+    restart: unless-stopped
+
+  # UE Simulator
+  ue:
+    build:
+      context: .
+      dockerfile: Dockerfile.ue
+    container_name: nextgsim-ue
+    hostname: ue
+    volumes:
+      - ../config:/etc/nextgsim:ro
+      - ue-logs:/var/log/nextgsim
+    command: ["-c", "/etc/nextgsim/open5gs-ue.yaml"]
+    ports:
+      - "4998:4998"         # CLI
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      nextgsim-net:
+        ipv4_address: 10.100.200.20
+    environment:
+      - RUST_LOG=info,nextgsim_ue=debug
+    depends_on:
+      - gnb
+    restart: unless-stopped
+
+  # CLI Tool (for interactive use)
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nextgsim-cli
+    entrypoint: ["/bin/bash"]
+    stdin_open: true
+    tty: true
+    networks:
+      - nextgsim-net
+    profiles:
+      - tools
+
+networks:
+  nextgsim-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.200.0/24
+
+volumes:
+  gnb-logs:
+  ue-logs:

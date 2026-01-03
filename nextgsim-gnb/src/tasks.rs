@@ -1,0 +1,1287 @@
+//! gNB Task Framework
+//!
+//! This module implements the actor-based task model with message passing for the gNB.
+//! Each task runs as an independent async task and communicates via typed message channels.
+//!
+//! # Architecture
+//!
+//! The gNB uses the following tasks:
+//! - **App Task**: Application management, CLI handling, status reporting
+//! - **NGAP Task**: NGAP protocol handling, AMF communication
+//! - **RRC Task**: RRC protocol handling, UE context management
+//! - **GTP Task**: GTP-U tunnel management, user plane forwarding
+//! - **RLS Task**: Radio Link Simulation, UE discovery
+//! - **SCTP Task**: SCTP association management for NGAP transport
+//!
+//! # Task Lifecycle
+//!
+//! Tasks follow a lifecycle managed by `TaskManager`:
+//! 1. **Created**: Task is instantiated but not yet running
+//! 2. **Running**: Task is actively processing messages
+//! 3. **Stopping**: Task received shutdown signal, cleaning up
+//! 4. **Stopped**: Task has terminated
+//! 5. **Failed**: Task terminated due to an error
+//!
+//! # Reference
+//!
+//! Based on UERANSIM's NTS (Network Task System) from `src/gnb/nts.hpp`
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+use nextgsim_common::config::GnbConfig;
+use nextgsim_common::OctetString;
+use nextgsim_rls::RrcChannel;
+
+// ============================================================================
+// Task Message Envelope
+// ============================================================================
+
+/// Task message envelope wrapping typed messages with control signals.
+///
+/// This enum provides a uniform way to send messages to tasks while also
+/// supporting graceful shutdown signaling.
+#[derive(Debug)]
+pub enum TaskMessage<T> {
+    /// Regular message payload
+    Message(T),
+    /// Shutdown signal - task should terminate gracefully
+    Shutdown,
+}
+
+impl<T> TaskMessage<T> {
+    /// Creates a new message envelope containing the given payload.
+    pub fn message(msg: T) -> Self {
+        TaskMessage::Message(msg)
+    }
+
+    /// Creates a shutdown signal.
+    pub fn shutdown() -> Self {
+        TaskMessage::Shutdown
+    }
+
+    /// Returns true if this is a shutdown signal.
+    pub fn is_shutdown(&self) -> bool {
+        matches!(self, TaskMessage::Shutdown)
+    }
+
+    /// Unwraps the message payload, panicking if this is a shutdown signal.
+    pub fn unwrap(self) -> T {
+        match self {
+            TaskMessage::Message(msg) => msg,
+            TaskMessage::Shutdown => panic!("called unwrap on Shutdown"),
+        }
+    }
+
+    /// Returns the message payload if present, or None for shutdown.
+    pub fn into_message(self) -> Option<T> {
+        match self {
+            TaskMessage::Message(msg) => Some(msg),
+            TaskMessage::Shutdown => None,
+        }
+    }
+}
+
+// ============================================================================
+// Task Lifecycle State
+// ============================================================================
+
+/// Task lifecycle state.
+///
+/// Based on UERANSIM's NtsTask lifecycle from `src/utils/nts.hpp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    /// Task is created but not yet started
+    Created,
+    /// Task is running and processing messages
+    Running,
+    /// Task is in the process of stopping
+    Stopping,
+    /// Task has stopped gracefully
+    Stopped,
+    /// Task terminated due to an error
+    Failed,
+}
+
+impl Default for TaskState {
+    fn default() -> Self {
+        TaskState::Created
+    }
+}
+
+impl std::fmt::Display for TaskState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskState::Created => write!(f, "Created"),
+            TaskState::Running => write!(f, "Running"),
+            TaskState::Stopping => write!(f, "Stopping"),
+            TaskState::Stopped => write!(f, "Stopped"),
+            TaskState::Failed => write!(f, "Failed"),
+        }
+    }
+}
+
+/// Task identifier for the gNB tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskId {
+    /// Application task
+    App,
+    /// NGAP task
+    Ngap,
+    /// RRC task
+    Rrc,
+    /// GTP task
+    Gtp,
+    /// RLS task
+    Rls,
+    /// SCTP task
+    Sctp,
+}
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskId::App => write!(f, "App"),
+            TaskId::Ngap => write!(f, "NGAP"),
+            TaskId::Rrc => write!(f, "RRC"),
+            TaskId::Gtp => write!(f, "GTP"),
+            TaskId::Rls => write!(f, "RLS"),
+            TaskId::Sctp => write!(f, "SCTP"),
+        }
+    }
+}
+
+/// Information about a running task.
+#[derive(Debug)]
+pub struct TaskInfo {
+    /// Task identifier
+    pub id: TaskId,
+    /// Current state
+    pub state: TaskState,
+    /// Time when the task was started
+    pub started_at: Option<Instant>,
+    /// Time when the task was stopped
+    pub stopped_at: Option<Instant>,
+    /// Error message if task failed
+    pub error: Option<String>,
+}
+
+// ============================================================================
+// Task Trait
+// ============================================================================
+
+/// Base trait for all gNB tasks.
+///
+/// Tasks are async actors that process messages from their receive channel.
+/// Each task implementation defines its own message type and processing logic.
+#[async_trait::async_trait]
+pub trait Task: Send + 'static {
+    /// The message type this task processes.
+    type Message: Send;
+
+    /// Runs the task's main loop, processing messages until shutdown.
+    ///
+    /// The task should:
+    /// 1. Poll the receiver for messages
+    /// 2. Process each message according to its type
+    /// 3. Exit gracefully when receiving `TaskMessage::Shutdown`
+    async fn run(&mut self, rx: mpsc::Receiver<TaskMessage<Self::Message>>);
+}
+
+// ============================================================================
+// Message Types
+// ============================================================================
+
+/// Messages for the Application task.
+#[derive(Debug)]
+pub enum AppMessage {
+    /// Status update from another task
+    StatusUpdate(StatusUpdate),
+    /// CLI command received
+    CliCommand(CliCommand),
+}
+
+/// Status update information.
+#[derive(Debug, Clone)]
+pub struct StatusUpdate {
+    /// Status type identifier
+    pub status_type: StatusType,
+    /// Status value
+    pub value: bool,
+}
+
+/// Types of status updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusType {
+    /// NGAP connection to AMF is up/down
+    NgapIsUp,
+}
+
+/// CLI command for the gNB.
+#[derive(Debug)]
+pub struct CliCommand {
+    /// Command type
+    pub command: GnbCliCommandType,
+    /// Response address (for sending reply)
+    pub response_addr: Option<std::net::SocketAddr>,
+}
+
+/// Types of CLI commands.
+#[derive(Debug, Clone)]
+pub enum GnbCliCommandType {
+    /// Show gNB info
+    Info,
+    /// Show gNB status
+    Status,
+    /// Show connected AMFs
+    AmfList,
+    /// Show connected UEs
+    UeList,
+    /// Show UE details
+    UeInfo { ue_id: i32 },
+    /// Release UE context
+    UeRelease { ue_id: i32 },
+}
+
+// ============================================================================
+// NGAP Messages
+// ============================================================================
+
+/// Messages for the NGAP task.
+#[derive(Debug)]
+pub enum NgapMessage {
+    /// SCTP association established
+    SctpAssociationUp {
+        /// SCTP client ID
+        client_id: i32,
+        /// Association ID
+        association_id: i32,
+        /// Number of inbound streams
+        in_streams: u16,
+        /// Number of outbound streams
+        out_streams: u16,
+    },
+    /// SCTP association closed
+    SctpAssociationDown {
+        /// SCTP client ID
+        client_id: i32,
+    },
+    /// Received NGAP PDU from AMF
+    ReceiveNgapPdu {
+        /// SCTP client ID
+        client_id: i32,
+        /// SCTP stream ID
+        stream: u16,
+        /// NGAP PDU data
+        pdu: OctetString,
+    },
+    /// Initial NAS delivery from RRC
+    InitialNasDelivery {
+        /// UE ID
+        ue_id: i32,
+        /// NAS PDU
+        pdu: OctetString,
+        /// RRC establishment cause
+        rrc_establishment_cause: i64,
+        /// S-TMSI if available
+        s_tmsi: Option<GutiMobileIdentity>,
+    },
+    /// Uplink NAS delivery from RRC
+    UplinkNasDelivery {
+        /// UE ID
+        ue_id: i32,
+        /// NAS PDU
+        pdu: OctetString,
+    },
+    /// Radio link failure notification from RRC
+    RadioLinkFailure {
+        /// UE ID
+        ue_id: i32,
+    },
+}
+
+/// GUTI mobile identity for S-TMSI.
+#[derive(Debug, Clone)]
+pub struct GutiMobileIdentity {
+    /// PLMN
+    pub plmn: nextgsim_common::Plmn,
+    /// AMF region ID
+    pub amf_region_id: u8,
+    /// AMF set ID (10 bits)
+    pub amf_set_id: u16,
+    /// AMF pointer (6 bits)
+    pub amf_pointer: u8,
+    /// 5G-TMSI
+    pub tmsi: u32,
+}
+
+// ============================================================================
+// RRC Messages
+// ============================================================================
+
+/// Messages for the RRC task.
+#[derive(Debug)]
+pub enum RrcMessage {
+    /// Radio power on (from NGAP after NG Setup)
+    RadioPowerOn,
+    /// Signal detected from UE (from RLS)
+    SignalDetected {
+        /// UE ID
+        ue_id: i32,
+    },
+    /// Uplink RRC message from UE (from RLS)
+    UplinkRrc {
+        /// UE ID
+        ue_id: i32,
+        /// RRC channel
+        rrc_channel: RrcChannel,
+        /// RRC PDU data
+        data: OctetString,
+    },
+    /// Downlink NAS delivery (from NGAP)
+    NasDelivery {
+        /// UE ID
+        ue_id: i32,
+        /// NAS PDU
+        pdu: OctetString,
+    },
+    /// AN release request (from NGAP)
+    AnRelease {
+        /// UE ID
+        ue_id: i32,
+    },
+    /// Paging request (from NGAP)
+    Paging {
+        /// UE paging TMSI
+        ue_paging_tmsi: Vec<u8>,
+        /// TAI list for paging
+        tai_list_for_paging: Vec<u8>,
+    },
+}
+
+// ============================================================================
+// GTP Messages
+// ============================================================================
+
+/// Messages for the GTP task.
+#[derive(Debug)]
+pub enum GtpMessage {
+    /// UE context update (from NGAP)
+    UeContextUpdate {
+        /// UE ID
+        ue_id: i32,
+        /// Update information
+        update: GtpUeContextUpdate,
+    },
+    /// UE context release (from NGAP)
+    UeContextRelease {
+        /// UE ID
+        ue_id: i32,
+    },
+    /// PDU session create (from NGAP)
+    SessionCreate {
+        /// UE ID
+        ue_id: i32,
+        /// PDU session resource
+        resource: PduSessionResource,
+    },
+    /// PDU session release (from NGAP)
+    SessionRelease {
+        /// UE ID
+        ue_id: i32,
+        /// PDU session ID
+        psi: i32,
+    },
+    /// Data PDU delivery from UE (from RLS)
+    DataPduDelivery {
+        /// UE ID
+        ue_id: i32,
+        /// PDU session ID
+        psi: i32,
+        /// User plane PDU
+        pdu: OctetString,
+    },
+}
+
+/// GTP UE context update information.
+#[derive(Debug, Clone)]
+pub struct GtpUeContextUpdate {
+    /// UE ID
+    pub ue_id: i32,
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: Option<i64>,
+}
+
+/// PDU session resource information.
+#[derive(Debug, Clone)]
+pub struct PduSessionResource {
+    /// PDU session ID
+    pub psi: i32,
+    /// QoS flow identifier
+    pub qfi: Option<u8>,
+    /// Uplink TEID (gNB -> UPF)
+    pub uplink_teid: u32,
+    /// Downlink TEID (UPF -> gNB)
+    pub downlink_teid: u32,
+    /// UPF address
+    pub upf_address: std::net::IpAddr,
+}
+
+// ============================================================================
+// RLS Messages
+// ============================================================================
+
+/// Messages for the RLS task.
+#[derive(Debug)]
+pub enum RlsMessage {
+    /// Signal detected from UE
+    SignalDetected {
+        /// UE ID
+        ue_id: i32,
+    },
+    /// Signal lost from UE
+    SignalLost {
+        /// UE ID
+        ue_id: i32,
+    },
+    /// Received RLS message from network
+    ReceiveRlsMessage {
+        /// Raw RLS message data
+        data: OctetString,
+        /// Source address
+        source: std::net::SocketAddr,
+    },
+    /// Downlink RRC PDU (from RRC)
+    DownlinkRrc {
+        /// UE ID
+        ue_id: i32,
+        /// RRC channel
+        rrc_channel: RrcChannel,
+        /// PDU ID for acknowledgment tracking
+        pdu_id: u32,
+        /// RRC PDU data
+        data: OctetString,
+    },
+    /// Downlink data PDU (from GTP)
+    DownlinkData {
+        /// UE ID
+        ue_id: i32,
+        /// PDU session ID
+        psi: i32,
+        /// User plane PDU
+        pdu: OctetString,
+    },
+    /// Uplink RRC PDU (internal)
+    UplinkRrc {
+        /// UE ID
+        ue_id: i32,
+        /// RRC channel
+        rrc_channel: RrcChannel,
+        /// RRC PDU data
+        data: OctetString,
+    },
+    /// Uplink data PDU (internal)
+    UplinkData {
+        /// UE ID
+        ue_id: i32,
+        /// PDU session ID
+        psi: i32,
+        /// User plane PDU
+        pdu: OctetString,
+    },
+    /// Radio link failure
+    RadioLinkFailure {
+        /// UE ID
+        ue_id: i32,
+        /// Failure cause
+        cause: RlfCause,
+    },
+    /// Transmission failure (PDUs not acknowledged)
+    TransmissionFailure {
+        /// List of failed PDU IDs
+        pdu_list: Vec<u32>,
+    },
+}
+
+/// Radio link failure cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RlfCause {
+    /// PDU ID already exists
+    PduIdExists,
+    /// PDU ID buffer full
+    PduIdFull,
+    /// Signal lost to connected cell
+    SignalLostToConnectedCell,
+}
+
+// ============================================================================
+// SCTP Messages
+// ============================================================================
+
+/// Messages for the SCTP task.
+#[derive(Debug)]
+pub enum SctpMessage {
+    /// Request to establish connection
+    ConnectionRequest {
+        /// Client ID for this connection
+        client_id: i32,
+        /// Local address to bind
+        local_address: String,
+        /// Local port
+        local_port: u16,
+        /// Remote address to connect
+        remote_address: String,
+        /// Remote port
+        remote_port: u16,
+        /// Payload protocol ID
+        ppid: u32,
+    },
+    /// Request to close connection
+    ConnectionClose {
+        /// Client ID
+        client_id: i32,
+    },
+    /// Association established (internal)
+    AssociationSetup {
+        /// Client ID
+        client_id: i32,
+        /// Association ID
+        association_id: i32,
+        /// Number of inbound streams
+        in_streams: u16,
+        /// Number of outbound streams
+        out_streams: u16,
+    },
+    /// Association shutdown (internal)
+    AssociationShutdown {
+        /// Client ID
+        client_id: i32,
+    },
+    /// Received message from peer
+    ReceiveMessage {
+        /// Client ID
+        client_id: i32,
+        /// Stream ID
+        stream: u16,
+        /// Message data
+        buffer: OctetString,
+    },
+    /// Send message to peer
+    SendMessage {
+        /// Client ID
+        client_id: i32,
+        /// Stream ID
+        stream: u16,
+        /// Message data
+        buffer: OctetString,
+    },
+    /// Unhandled SCTP notification
+    UnhandledNotification {
+        /// Client ID
+        client_id: i32,
+    },
+}
+
+// ============================================================================
+// Task Handle
+// ============================================================================
+
+/// Handle for sending messages to a task.
+///
+/// This is a wrapper around `mpsc::Sender` that provides convenient methods
+/// for sending messages and shutdown signals.
+#[derive(Debug)]
+pub struct TaskHandle<T> {
+    tx: mpsc::Sender<TaskMessage<T>>,
+}
+
+impl<T> Clone for TaskHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<T> TaskHandle<T> {
+    /// Creates a new task handle from a sender.
+    pub fn new(tx: mpsc::Sender<TaskMessage<T>>) -> Self {
+        Self { tx }
+    }
+
+    /// Sends a message to the task.
+    ///
+    /// Returns an error if the task has been dropped.
+    pub async fn send(&self, msg: T) -> Result<(), mpsc::error::SendError<TaskMessage<T>>> {
+        self.tx.send(TaskMessage::Message(msg)).await
+    }
+
+    /// Sends a message to the task without waiting.
+    ///
+    /// Returns an error if the channel is full or the task has been dropped.
+    pub fn try_send(&self, msg: T) -> Result<(), mpsc::error::TrySendError<TaskMessage<T>>> {
+        self.tx.try_send(TaskMessage::Message(msg))
+    }
+
+    /// Sends a shutdown signal to the task.
+    pub async fn shutdown(&self) -> Result<(), mpsc::error::SendError<TaskMessage<T>>> {
+        self.tx.send(TaskMessage::Shutdown).await
+    }
+
+    /// Returns true if the task channel is closed.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
+
+// ============================================================================
+// gNB Task Base
+// ============================================================================
+
+/// Base structure containing all task handles for the gNB.
+///
+/// This structure is shared among all tasks to enable inter-task communication.
+/// Each task receives a clone of this structure and can send messages to any
+/// other task through the appropriate handle.
+#[derive(Clone)]
+pub struct GnbTaskBase {
+    /// gNB configuration
+    pub config: Arc<GnbConfig>,
+    /// Handle to the Application task
+    pub app_tx: TaskHandle<AppMessage>,
+    /// Handle to the NGAP task
+    pub ngap_tx: TaskHandle<NgapMessage>,
+    /// Handle to the RRC task
+    pub rrc_tx: TaskHandle<RrcMessage>,
+    /// Handle to the GTP task
+    pub gtp_tx: TaskHandle<GtpMessage>,
+    /// Handle to the RLS task
+    pub rls_tx: TaskHandle<RlsMessage>,
+    /// Handle to the SCTP task
+    pub sctp_tx: TaskHandle<SctpMessage>,
+}
+
+impl GnbTaskBase {
+    /// Creates a new GnbTaskBase with the given configuration and channel capacity.
+    ///
+    /// Returns the task base along with receivers for each task.
+    pub fn new(
+        config: GnbConfig,
+        channel_capacity: usize,
+    ) -> (
+        Self,
+        mpsc::Receiver<TaskMessage<AppMessage>>,
+        mpsc::Receiver<TaskMessage<NgapMessage>>,
+        mpsc::Receiver<TaskMessage<RrcMessage>>,
+        mpsc::Receiver<TaskMessage<GtpMessage>>,
+        mpsc::Receiver<TaskMessage<RlsMessage>>,
+        mpsc::Receiver<TaskMessage<SctpMessage>>,
+    ) {
+        let (app_tx, app_rx) = mpsc::channel(channel_capacity);
+        let (ngap_tx, ngap_rx) = mpsc::channel(channel_capacity);
+        let (rrc_tx, rrc_rx) = mpsc::channel(channel_capacity);
+        let (gtp_tx, gtp_rx) = mpsc::channel(channel_capacity);
+        let (rls_tx, rls_rx) = mpsc::channel(channel_capacity);
+        let (sctp_tx, sctp_rx) = mpsc::channel(channel_capacity);
+
+        let base = Self {
+            config: Arc::new(config),
+            app_tx: TaskHandle::new(app_tx),
+            ngap_tx: TaskHandle::new(ngap_tx),
+            rrc_tx: TaskHandle::new(rrc_tx),
+            gtp_tx: TaskHandle::new(gtp_tx),
+            rls_tx: TaskHandle::new(rls_tx),
+            sctp_tx: TaskHandle::new(sctp_tx),
+        };
+
+        (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)
+    }
+
+    /// Sends shutdown signals to all tasks.
+    pub async fn shutdown_all(&self) {
+        // Ignore errors - tasks may already be shut down
+        let _ = self.app_tx.shutdown().await;
+        let _ = self.ngap_tx.shutdown().await;
+        let _ = self.rrc_tx.shutdown().await;
+        let _ = self.gtp_tx.shutdown().await;
+        let _ = self.rls_tx.shutdown().await;
+        let _ = self.sctp_tx.shutdown().await;
+    }
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Default channel capacity for task message queues.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+
+/// NGAP Payload Protocol ID for SCTP.
+pub const NGAP_PPID: u32 = 60;
+
+/// Default shutdown timeout in milliseconds.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
+
+// ============================================================================
+// Task Manager
+// ============================================================================
+
+/// Manages the lifecycle of all gNB tasks.
+///
+/// The TaskManager is responsible for:
+/// - Spawning tasks and tracking their handles
+/// - Monitoring task health and state
+/// - Coordinating graceful shutdown across all tasks
+/// - Handling task failures and restarts
+///
+/// Based on UERANSIM's GNodeB class from `src/gnb/gnb.cpp`.
+pub struct TaskManager {
+    /// Task base with all message channels
+    task_base: GnbTaskBase,
+    /// Task state information
+    task_states: HashMap<TaskId, TaskInfo>,
+    /// Shutdown signal sender
+    shutdown_tx: watch::Sender<bool>,
+    /// Shutdown signal receiver (cloneable)
+    shutdown_rx: watch::Receiver<bool>,
+    /// Join handles for spawned tasks
+    join_handles: HashMap<TaskId, JoinHandle<Result<(), TaskError>>>,
+}
+
+/// Error type for task operations.
+#[derive(Debug, Clone)]
+pub struct TaskError {
+    /// Task that failed
+    pub task_id: TaskId,
+    /// Error message
+    pub message: String,
+}
+
+impl std::fmt::Display for TaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Task {} error: {}", self.task_id, self.message)
+    }
+}
+
+impl std::error::Error for TaskError {}
+
+impl TaskManager {
+    /// Creates a new TaskManager with the given configuration.
+    ///
+    /// Returns the manager along with receivers for each task.
+    pub fn new(
+        config: GnbConfig,
+        channel_capacity: usize,
+    ) -> (
+        Self,
+        mpsc::Receiver<TaskMessage<AppMessage>>,
+        mpsc::Receiver<TaskMessage<NgapMessage>>,
+        mpsc::Receiver<TaskMessage<RrcMessage>>,
+        mpsc::Receiver<TaskMessage<GtpMessage>>,
+        mpsc::Receiver<TaskMessage<RlsMessage>>,
+        mpsc::Receiver<TaskMessage<SctpMessage>>,
+    ) {
+        let (task_base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx) =
+            GnbTaskBase::new(config, channel_capacity);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Initialize task states
+        let mut task_states = HashMap::new();
+        for task_id in [
+            TaskId::App,
+            TaskId::Ngap,
+            TaskId::Rrc,
+            TaskId::Gtp,
+            TaskId::Rls,
+            TaskId::Sctp,
+        ] {
+            task_states.insert(
+                task_id,
+                TaskInfo {
+                    id: task_id,
+                    state: TaskState::Created,
+                    started_at: None,
+                    stopped_at: None,
+                    error: None,
+                },
+            );
+        }
+
+        let manager = Self {
+            task_base,
+            task_states,
+            shutdown_tx,
+            shutdown_rx,
+            join_handles: HashMap::new(),
+        };
+
+        (manager, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)
+    }
+
+    /// Returns a clone of the task base for inter-task communication.
+    pub fn task_base(&self) -> GnbTaskBase {
+        self.task_base.clone()
+    }
+
+    /// Returns a receiver for the shutdown signal.
+    ///
+    /// Tasks can use this to detect when shutdown has been requested.
+    pub fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
+    /// Gets the current state of a task.
+    pub fn get_task_state(&self, task_id: TaskId) -> Option<TaskState> {
+        self.task_states.get(&task_id).map(|info| info.state)
+    }
+
+    /// Gets information about a task.
+    pub fn get_task_info(&self, task_id: TaskId) -> Option<&TaskInfo> {
+        self.task_states.get(&task_id)
+    }
+
+    /// Returns true if all tasks are in the Running state.
+    pub fn all_tasks_running(&self) -> bool {
+        self.task_states
+            .values()
+            .all(|info| info.state == TaskState::Running)
+    }
+
+    /// Returns true if any task has failed.
+    pub fn any_task_failed(&self) -> bool {
+        self.task_states
+            .values()
+            .any(|info| info.state == TaskState::Failed)
+    }
+
+    /// Returns true if all tasks have stopped (either Stopped or Failed).
+    pub fn all_tasks_stopped(&self) -> bool {
+        self.task_states
+            .values()
+            .all(|info| info.state == TaskState::Stopped || info.state == TaskState::Failed)
+    }
+
+    /// Marks a task as started.
+    pub fn mark_task_started(&mut self, task_id: TaskId) {
+        if let Some(info) = self.task_states.get_mut(&task_id) {
+            info.state = TaskState::Running;
+            info.started_at = Some(Instant::now());
+        }
+    }
+
+    /// Marks a task as stopping.
+    pub fn mark_task_stopping(&mut self, task_id: TaskId) {
+        if let Some(info) = self.task_states.get_mut(&task_id) {
+            info.state = TaskState::Stopping;
+        }
+    }
+
+    /// Marks a task as stopped.
+    pub fn mark_task_stopped(&mut self, task_id: TaskId) {
+        if let Some(info) = self.task_states.get_mut(&task_id) {
+            info.state = TaskState::Stopped;
+            info.stopped_at = Some(Instant::now());
+        }
+    }
+
+    /// Marks a task as failed with an error message.
+    pub fn mark_task_failed(&mut self, task_id: TaskId, error: String) {
+        if let Some(info) = self.task_states.get_mut(&task_id) {
+            info.state = TaskState::Failed;
+            info.stopped_at = Some(Instant::now());
+            info.error = Some(error);
+        }
+    }
+
+    /// Registers a join handle for a spawned task.
+    pub fn register_task_handle(&mut self, task_id: TaskId, handle: JoinHandle<Result<(), TaskError>>) {
+        self.join_handles.insert(task_id, handle);
+    }
+
+    /// Initiates graceful shutdown of all tasks.
+    ///
+    /// This sends shutdown signals to all tasks and waits for them to complete.
+    pub async fn shutdown(&mut self) -> Result<(), TaskError> {
+        // Signal shutdown to all watchers
+        let _ = self.shutdown_tx.send(true);
+
+        // Mark all running tasks as stopping
+        for info in self.task_states.values_mut() {
+            if info.state == TaskState::Running {
+                info.state = TaskState::Stopping;
+            }
+        }
+
+        // Send shutdown messages to all tasks
+        self.task_base.shutdown_all().await;
+
+        // Wait for all tasks to complete with timeout
+        let timeout = tokio::time::Duration::from_millis(DEFAULT_SHUTDOWN_TIMEOUT_MS);
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        // Collect results first, then update states
+        let handles: Vec<_> = self.join_handles.drain().collect();
+        let mut results: Vec<(TaskId, Result<(), String>)> = Vec::new();
+
+        for (task_id, handle) in handles {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let result = match tokio::time::timeout(remaining, handle).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(e))) => Err(e.message),
+                Ok(Err(_join_error)) => Err("Task panicked".to_string()),
+                Err(_timeout) => Err("Shutdown timeout".to_string()),
+            };
+            results.push((task_id, result));
+        }
+
+        // Now update states
+        for (task_id, result) in results {
+            match result {
+                Ok(()) => self.mark_task_stopped(task_id),
+                Err(msg) => self.mark_task_failed(task_id, msg),
+            }
+        }
+
+        // Check if any tasks failed
+        if self.any_task_failed() {
+            let failed: Vec<_> = self
+                .task_states
+                .values()
+                .filter(|info| info.state == TaskState::Failed)
+                .map(|info| {
+                    format!(
+                        "{}: {}",
+                        info.id,
+                        info.error.as_deref().unwrap_or("unknown error")
+                    )
+                })
+                .collect();
+            return Err(TaskError {
+                task_id: TaskId::App, // Use App as placeholder
+                message: format!("Tasks failed during shutdown: {}", failed.join(", ")),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Returns a summary of all task states.
+    pub fn status_summary(&self) -> Vec<(TaskId, TaskState)> {
+        self.task_states
+            .iter()
+            .map(|(id, info)| (*id, info.state))
+            .collect()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nextgsim_common::Plmn;
+
+    /// Creates a test GnbConfig for unit tests.
+    fn test_config() -> GnbConfig {
+        GnbConfig {
+            nci: 0x000000010,
+            gnb_id_length: 32,
+            plmn: Plmn::new(001, 01, false),
+            tac: 1,
+            nssai: vec![],
+            amf_configs: vec![],
+            link_ip: "127.0.0.1".parse().unwrap(),
+            ngap_ip: "127.0.0.1".parse().unwrap(),
+            gtp_ip: "127.0.0.1".parse().unwrap(),
+            gtp_advertise_ip: None,
+            ignore_stream_ids: false,
+        }
+    }
+
+    #[test]
+    fn test_task_message_variants() {
+        let msg: TaskMessage<i32> = TaskMessage::message(42);
+        assert!(!msg.is_shutdown());
+        assert_eq!(msg.unwrap(), 42);
+
+        let shutdown: TaskMessage<i32> = TaskMessage::shutdown();
+        assert!(shutdown.is_shutdown());
+        assert!(shutdown.into_message().is_none());
+    }
+
+    #[test]
+    fn test_task_message_into_message() {
+        let msg: TaskMessage<String> = TaskMessage::message("hello".to_string());
+        assert_eq!(msg.into_message(), Some("hello".to_string()));
+
+        let shutdown: TaskMessage<String> = TaskMessage::shutdown();
+        assert_eq!(shutdown.into_message(), None);
+    }
+
+    #[tokio::test]
+    async fn test_task_handle_send() {
+        let (tx, mut rx) = mpsc::channel::<TaskMessage<i32>>(10);
+        let handle = TaskHandle::new(tx);
+
+        handle.send(42).await.unwrap();
+
+        match rx.recv().await {
+            Some(TaskMessage::Message(val)) => assert_eq!(val, 42),
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_handle_shutdown() {
+        let (tx, mut rx) = mpsc::channel::<TaskMessage<i32>>(10);
+        let handle = TaskHandle::new(tx);
+
+        handle.shutdown().await.unwrap();
+
+        match rx.recv().await {
+            Some(TaskMessage::Shutdown) => {}
+            _ => panic!("expected shutdown"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gnb_task_base_creation() {
+        let config = test_config();
+        let (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        // Verify all handles are functional
+        assert!(!base.app_tx.is_closed());
+        assert!(!base.ngap_tx.is_closed());
+        assert!(!base.rrc_tx.is_closed());
+        assert!(!base.gtp_tx.is_closed());
+        assert!(!base.rls_tx.is_closed());
+        assert!(!base.sctp_tx.is_closed());
+
+        // Drop receivers to close channels
+        drop(app_rx);
+        drop(ngap_rx);
+        drop(rrc_rx);
+        drop(gtp_rx);
+        drop(rls_rx);
+        drop(sctp_rx);
+
+        // Verify handles detect closed channels
+        assert!(base.app_tx.is_closed());
+        assert!(base.ngap_tx.is_closed());
+        assert!(base.rrc_tx.is_closed());
+        assert!(base.gtp_tx.is_closed());
+        assert!(base.rls_tx.is_closed());
+        assert!(base.sctp_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_inter_task_communication() {
+        let config = test_config();
+        let (base, _app_rx, mut ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        // Simulate RRC -> NGAP communication
+        base.ngap_tx
+            .send(NgapMessage::UplinkNasDelivery {
+                ue_id: 1,
+                pdu: OctetString::from_slice(&[0x7e, 0x00, 0x41]),
+            })
+            .await
+            .unwrap();
+
+        // Simulate NGAP -> RRC communication
+        base.rrc_tx
+            .send(RrcMessage::NasDelivery {
+                ue_id: 1,
+                pdu: OctetString::from_slice(&[0x7e, 0x00, 0x42]),
+            })
+            .await
+            .unwrap();
+
+        // Verify messages received
+        match ngap_rx.recv().await {
+            Some(TaskMessage::Message(NgapMessage::UplinkNasDelivery { ue_id, .. })) => {
+                assert_eq!(ue_id, 1);
+            }
+            _ => panic!("expected UplinkNasDelivery"),
+        }
+
+        match rrc_rx.recv().await {
+            Some(TaskMessage::Message(RrcMessage::NasDelivery { ue_id, .. })) => {
+                assert_eq!(ue_id, 1);
+            }
+            _ => panic!("expected NasDelivery"),
+        }
+    }
+
+    #[test]
+    fn test_status_update() {
+        let update = StatusUpdate {
+            status_type: StatusType::NgapIsUp,
+            value: true,
+        };
+        assert_eq!(update.status_type, StatusType::NgapIsUp);
+        assert!(update.value);
+    }
+
+    #[test]
+    fn test_cli_command_types() {
+        let cmd = GnbCliCommandType::Info;
+        assert!(matches!(cmd, GnbCliCommandType::Info));
+
+        let cmd = GnbCliCommandType::UeInfo { ue_id: 42 };
+        if let GnbCliCommandType::UeInfo { ue_id } = cmd {
+            assert_eq!(ue_id, 42);
+        } else {
+            panic!("expected UeInfo");
+        }
+    }
+
+    #[test]
+    fn test_rlf_cause() {
+        assert_eq!(RlfCause::PduIdExists, RlfCause::PduIdExists);
+        assert_ne!(RlfCause::PduIdExists, RlfCause::PduIdFull);
+    }
+
+    // ========================================================================
+    // Task Lifecycle Management Tests
+    // ========================================================================
+
+    #[test]
+    fn test_task_state_default() {
+        let state = TaskState::default();
+        assert_eq!(state, TaskState::Created);
+    }
+
+    #[test]
+    fn test_task_state_display() {
+        assert_eq!(format!("{}", TaskState::Created), "Created");
+        assert_eq!(format!("{}", TaskState::Running), "Running");
+        assert_eq!(format!("{}", TaskState::Stopping), "Stopping");
+        assert_eq!(format!("{}", TaskState::Stopped), "Stopped");
+        assert_eq!(format!("{}", TaskState::Failed), "Failed");
+    }
+
+    #[test]
+    fn test_task_id_display() {
+        assert_eq!(format!("{}", TaskId::App), "App");
+        assert_eq!(format!("{}", TaskId::Ngap), "NGAP");
+        assert_eq!(format!("{}", TaskId::Rrc), "RRC");
+        assert_eq!(format!("{}", TaskId::Gtp), "GTP");
+        assert_eq!(format!("{}", TaskId::Rls), "RLS");
+        assert_eq!(format!("{}", TaskId::Sctp), "SCTP");
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_creation() {
+        let config = test_config();
+        let (manager, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        // All tasks should start in Created state
+        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::Ngap), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::Rrc), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::Gtp), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::Rls), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::Sctp), Some(TaskState::Created));
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_state_transitions() {
+        let config = test_config();
+        let (mut manager, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        // Test state transitions
+        manager.mark_task_started(TaskId::App);
+        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Running));
+        assert!(manager.get_task_info(TaskId::App).unwrap().started_at.is_some());
+
+        manager.mark_task_stopping(TaskId::App);
+        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Stopping));
+
+        manager.mark_task_stopped(TaskId::App);
+        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Stopped));
+        assert!(manager.get_task_info(TaskId::App).unwrap().stopped_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_failure_tracking() {
+        let config = test_config();
+        let (mut manager, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        manager.mark_task_started(TaskId::Ngap);
+        manager.mark_task_failed(TaskId::Ngap, "Connection refused".to_string());
+
+        assert_eq!(manager.get_task_state(TaskId::Ngap), Some(TaskState::Failed));
+        assert!(manager.any_task_failed());
+
+        let info = manager.get_task_info(TaskId::Ngap).unwrap();
+        assert_eq!(info.error.as_deref(), Some("Connection refused"));
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_all_running_check() {
+        let config = test_config();
+        let (mut manager, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        assert!(!manager.all_tasks_running());
+
+        // Start all tasks
+        for task_id in [TaskId::App, TaskId::Ngap, TaskId::Rrc, TaskId::Gtp, TaskId::Rls, TaskId::Sctp] {
+            manager.mark_task_started(task_id);
+        }
+
+        assert!(manager.all_tasks_running());
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_shutdown_receiver() {
+        let config = test_config();
+        let (manager, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        let mut shutdown_rx = manager.shutdown_receiver();
+        assert!(!*shutdown_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_status_summary() {
+        let config = test_config();
+        let (mut manager, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        manager.mark_task_started(TaskId::App);
+        manager.mark_task_started(TaskId::Ngap);
+
+        let summary = manager.status_summary();
+        assert_eq!(summary.len(), 6);
+
+        // Find App and Ngap in summary
+        let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);
+        let ngap_state = summary.iter().find(|(id, _)| *id == TaskId::Ngap).map(|(_, s)| *s);
+
+        assert_eq!(app_state, Some(TaskState::Running));
+        assert_eq!(ngap_state, Some(TaskState::Running));
+    }
+
+    #[test]
+    fn test_task_error_display() {
+        let error = TaskError {
+            task_id: TaskId::Sctp,
+            message: "Connection timeout".to_string(),
+        };
+        assert_eq!(format!("{}", error), "Task SCTP error: Connection timeout");
+    }
+}

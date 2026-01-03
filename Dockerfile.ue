@@ -1,0 +1,45 @@
+# nextgsim-ue - 5G User Equipment Simulator
+# Optimized single-binary image with TUN support
+
+FROM rust:1.75-bookworm AS builder
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY rustfmt.toml ./
+COPY nextgsim-common ./nextgsim-common
+COPY nextgsim-crypto ./nextgsim-crypto
+COPY nextgsim-nas ./nextgsim-nas
+COPY nextgsim-ngap ./nextgsim-ngap
+COPY nextgsim-rrc ./nextgsim-rrc
+COPY nextgsim-rls ./nextgsim-rls
+COPY nextgsim-gtp ./nextgsim-gtp
+COPY nextgsim-sctp ./nextgsim-sctp
+COPY nextgsim-gnb ./nextgsim-gnb
+COPY nextgsim-ue ./nextgsim-ue
+COPY nextgsim-cli ./nextgsim-cli
+COPY tests ./tests
+
+# Build only UE binary
+RUN cargo build --release --package nextgsim-ue
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    iproute2 \
+    iptables \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/nextgsim-ue /usr/local/bin/
+
+RUN mkdir -p /etc/nextgsim
+WORKDIR /etc/nextgsim
+
+# UE needs NET_ADMIN capability for TUN interface
+# Run with: docker run --cap-add=NET_ADMIN --device=/dev/net/tun
+
+EXPOSE 4998
+
+ENTRYPOINT ["nextgsim-ue"]
+CMD ["-c", "/etc/nextgsim/ue.yaml"]

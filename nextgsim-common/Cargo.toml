@@ -1,0 +1,23 @@
+[package]
+name = "nextgsim-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Common types and utilities for nextgsim"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+bitflags.workspace = true
+num_enum.workspace = true
+hex.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true

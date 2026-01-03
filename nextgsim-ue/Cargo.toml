@@ -1,0 +1,36 @@
+[package]
+name = "nextgsim-ue"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "5G UE (User Equipment) simulator binary"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nr-ue"
+path = "src/main.rs"
+
+[dependencies]
+nextgsim-common.workspace = true
+nextgsim-crypto.workspace = true
+nextgsim-nas.workspace = true
+nextgsim-rrc.workspace = true
+nextgsim-rls.workspace = true
+nextgsim-gtp.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+rand.workspace = true
+tun-rs.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
