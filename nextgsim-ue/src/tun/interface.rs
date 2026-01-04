@@ -7,9 +7,8 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info, warn};
-use tun_rs::AsyncDevice;
+use tracing::{debug, info};
+use tun_rs::{AbstractDevice, AsyncDevice, Configuration};
 
 use super::config::TunConfig;
 
@@ -39,6 +38,16 @@ pub enum TunError {
     /// Invalid packet data.
     #[error("invalid packet: {0}")]
     InvalidPacket(String),
+
+    /// TUN device error.
+    #[error("TUN device error: {0}")]
+    Device(String),
+}
+
+impl From<tun_rs::Error> for TunError {
+    fn from(e: tun_rs::Error) -> Self {
+        TunError::Device(e.to_string())
+    }
 }
 
 /// TUN interface wrapper providing async read/write operations.
@@ -54,6 +63,8 @@ pub struct TunInterface {
     config: TunConfig,
     /// Whether the interface has been configured with IP address.
     configured: bool,
+    /// PDU Session Identifier associated with this interface.
+    psi: i32,
 }
 
 impl TunInterface {
@@ -73,19 +84,19 @@ impl TunInterface {
     ///
     /// ```ignore
     /// let config = TunConfig::new("uesimtun");
-    /// let tun = TunInterface::create(config).await?;
+    /// let tun = TunInterface::create(&config, 1).await?;
     /// println!("Created interface: {}", tun.name());
     /// ```
-    pub async fn create(config: TunConfig) -> Result<Self, TunError> {
-        let mut tun_config = tun_rs::Configuration::default();
+    pub async fn create(config: &TunConfig, psi: i32) -> Result<Self, TunError> {
+        let mut tun_config = Configuration::default();
 
         // Set interface name
         if let Some(ref name) = config.name {
-            tun_config.name(name);
+            tun_config.name(name.clone());
             debug!(name = %name, "Creating TUN interface with specific name");
         } else {
             // Use name prefix - tun-rs will append a number
-            tun_config.name(&config.name_prefix);
+            tun_config.name(config.name_prefix.clone());
             debug!(prefix = %config.name_prefix, "Creating TUN interface with prefix");
         }
 
@@ -93,9 +104,11 @@ impl TunInterface {
         tun_config.mtu(config.mtu);
 
         // Configure as TUN (not TAP) - layer 3 only
+        // Note: layer() is only available on Linux, Windows, and FreeBSD
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "freebsd"))]
         tun_config.layer(tun_rs::Layer::L3);
 
-        // Don't bring up the interface yet - we'll do that after configuring IP
+        // Bring up the interface
         tun_config.up();
 
         // Create the device
@@ -104,17 +117,17 @@ impl TunInterface {
 
         // Get the actual allocated name
         let name = device
-            .as_ref()
             .name()
             .map_err(|e| TunError::CreateFailed(format!("failed to get interface name: {e}")))?;
 
-        info!(name = %name, mtu = config.mtu, "TUN interface created");
+        info!(name = %name, mtu = config.mtu, psi = psi, "TUN interface created");
 
         Ok(Self {
             device,
             name,
-            config,
+            config: config.clone(),
             configured: false,
+            psi,
         })
     }
 
@@ -126,8 +139,8 @@ impl TunInterface {
     /// # Errors
     ///
     /// Returns an error if creation or configuration fails.
-    pub async fn create_and_configure(config: TunConfig) -> Result<Self, TunError> {
-        let mut tun = Self::create(config).await?;
+    pub async fn create_and_configure(config: &TunConfig, psi: i32) -> Result<Self, TunError> {
+        let mut tun = Self::create(config, psi).await?;
         tun.configure().await?;
         Ok(tun)
     }
@@ -153,9 +166,15 @@ impl TunInterface {
             .netmask
             .unwrap_or(Ipv4Addr::new(255, 255, 255, 0));
 
-        // Configure IP address using system commands
-        // The tun-rs crate doesn't provide direct IP configuration, so we use ip command
-        self.configure_ip_address(address, netmask).await?;
+        // Configure IP address using the tun-rs API
+        self.device
+            .set_network_address(address, netmask, None::<Ipv4Addr>)
+            .map_err(|e| TunError::ConfigureFailed(format!("failed to set network address: {e}")))?;
+
+        // Enable the interface
+        self.device
+            .enabled(true)
+            .map_err(|e| TunError::ConfigureFailed(format!("failed to enable interface: {e}")))?;
 
         self.configured = true;
         info!(
@@ -164,56 +183,6 @@ impl TunInterface {
             netmask = %netmask,
             "TUN interface configured"
         );
-
-        Ok(())
-    }
-
-    /// Configures the IP address using system commands.
-    async fn configure_ip_address(
-        &self,
-        address: Ipv4Addr,
-        netmask: Ipv4Addr,
-    ) -> Result<(), TunError> {
-        // Calculate prefix length from netmask
-        let prefix_len = netmask_to_prefix_len(netmask);
-
-        // Use ip command to configure the interface
-        let output = tokio::process::Command::new("ip")
-            .args([
-                "addr",
-                "add",
-                &format!("{address}/{prefix_len}"),
-                "dev",
-                &self.name,
-            ])
-            .output()
-            .await
-            .map_err(|e| TunError::ConfigureFailed(format!("failed to run ip command: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "File exists" error - address may already be configured
-            if !stderr.contains("File exists") {
-                return Err(TunError::ConfigureFailed(format!(
-                    "ip addr add failed: {stderr}"
-                )));
-            }
-            warn!(name = %self.name, "IP address already configured");
-        }
-
-        // Bring the interface up
-        let output = tokio::process::Command::new("ip")
-            .args(["link", "set", &self.name, "up"])
-            .output()
-            .await
-            .map_err(|e| TunError::ConfigureFailed(format!("failed to run ip command: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TunError::ConfigureFailed(format!(
-                "ip link set up failed: {stderr}"
-            )));
-        }
 
         Ok(())
     }
@@ -238,8 +207,8 @@ impl TunInterface {
 
     /// Returns the PDU Session Identifier associated with this interface.
     #[must_use]
-    pub fn psi(&self) -> Option<u8> {
-        self.config.psi
+    pub fn psi(&self) -> i32 {
+        self.psi
     }
 
     /// Reads an IP packet from the TUN interface.
@@ -253,9 +222,9 @@ impl TunInterface {
     /// # Errors
     ///
     /// Returns an error if the read operation fails.
-    pub async fn read(&mut self) -> Result<Vec<u8>, TunError> {
+    pub async fn recv(&self) -> Result<Vec<u8>, TunError> {
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
-        let n = self.device.read(&mut buf).await?;
+        let n = self.device.recv(&mut buf).await?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -269,8 +238,8 @@ impl TunInterface {
     /// # Errors
     ///
     /// Returns an error if the read operation fails.
-    pub async fn read_buf(&mut self, buf: &mut [u8]) -> Result<usize, TunError> {
-        let n = self.device.read(buf).await?;
+    pub async fn recv_buf(&self, buf: &mut [u8]) -> Result<usize, TunError> {
+        let n = self.device.recv(buf).await?;
         Ok(n)
     }
 
@@ -283,23 +252,38 @@ impl TunInterface {
     /// Returns an error if:
     /// - The write operation fails
     /// - The packet is invalid
-    pub async fn write(&mut self, packet: &[u8]) -> Result<usize, TunError> {
+    pub async fn send(&self, packet: &[u8]) -> Result<usize, TunError> {
         if packet.is_empty() {
             return Err(TunError::InvalidPacket("empty packet".to_string()));
         }
 
-        let n = self.device.write(packet).await?;
+        let n = self.device.send(packet).await?;
         Ok(n)
+    }
+
+    /// Writes all bytes of an IP packet to the TUN interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write operation fails.
+    pub async fn write_all(&self, packet: &[u8]) -> Result<(), TunError> {
+        if packet.is_empty() {
+            return Err(TunError::InvalidPacket("empty packet".to_string()));
+        }
+
+        self.device.send(packet).await?;
+        Ok(())
     }
 
     /// Splits the TUN interface into separate read and write halves.
     ///
     /// This allows concurrent reading and writing from different tasks.
     #[must_use]
-    pub fn split(self) -> (TunReader, TunWriter) {
+    pub fn into_split(self) -> (TunReader, TunWriter) {
         let name = self.name.clone();
         let config = self.config.clone();
-        let device = Arc::new(tokio::sync::Mutex::new(self.device));
+        let psi = self.psi;
+        let device = Arc::new(self.device);
 
         (
             TunReader {
@@ -310,6 +294,7 @@ impl TunInterface {
                 device,
                 name,
                 config,
+                psi,
             },
         )
     }
@@ -317,16 +302,15 @@ impl TunInterface {
 
 /// Read half of a split TUN interface.
 pub struct TunReader {
-    device: Arc<tokio::sync::Mutex<AsyncDevice>>,
+    device: Arc<AsyncDevice>,
     name: String,
 }
 
 impl TunReader {
     /// Reads an IP packet from the TUN interface.
-    pub async fn read(&self) -> Result<Vec<u8>, TunError> {
+    pub async fn recv(&self) -> Result<Vec<u8>, TunError> {
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
-        let mut device = self.device.lock().await;
-        let n = device.read(&mut buf).await?;
+        let n = self.device.recv(&mut buf).await?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -340,20 +324,21 @@ impl TunReader {
 
 /// Write half of a split TUN interface.
 pub struct TunWriter {
-    device: Arc<tokio::sync::Mutex<AsyncDevice>>,
+    device: Arc<AsyncDevice>,
     name: String,
+    #[allow(dead_code)]
     config: TunConfig,
+    psi: i32,
 }
 
 impl TunWriter {
     /// Writes an IP packet to the TUN interface.
-    pub async fn write(&self, packet: &[u8]) -> Result<usize, TunError> {
+    pub async fn send(&self, packet: &[u8]) -> Result<usize, TunError> {
         if packet.is_empty() {
             return Err(TunError::InvalidPacket("empty packet".to_string()));
         }
 
-        let mut device = self.device.lock().await;
-        let n = device.write(packet).await?;
+        let n = self.device.send(packet).await?;
         Ok(n)
     }
 
@@ -365,12 +350,13 @@ impl TunWriter {
 
     /// Returns the PSI associated with this interface.
     #[must_use]
-    pub fn psi(&self) -> Option<u8> {
-        self.config.psi
+    pub fn psi(&self) -> i32 {
+        self.psi
     }
 }
 
 /// Converts a netmask to prefix length (CIDR notation).
+#[allow(dead_code)]
 fn netmask_to_prefix_len(netmask: Ipv4Addr) -> u8 {
     let bits = u32::from(netmask);
     bits.count_ones() as u8

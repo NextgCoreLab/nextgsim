@@ -17,7 +17,6 @@
 //!
 //! Based on UERANSIM's `src/lib/app/cli_base.cpp` implementation.
 
-use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
@@ -65,6 +64,7 @@ pub struct CliMessage {
     /// Message value (command or response)
     pub value: String,
     /// Client address (for responses)
+    #[allow(dead_code)]
     pub client_addr: Option<SocketAddr>,
 }
 
@@ -80,6 +80,7 @@ impl CliMessage {
     }
 
     /// Creates a new error message
+    #[allow(dead_code)]
     pub fn error(node_name: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             msg_type: MessageType::Error,
@@ -90,6 +91,7 @@ impl CliMessage {
     }
 
     /// Creates a new result message
+    #[allow(dead_code)]
     pub fn result(node_name: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             msg_type: MessageType::Result,
@@ -100,6 +102,7 @@ impl CliMessage {
     }
 
     /// Creates a new echo message
+    #[allow(dead_code)]
     pub fn echo(message: impl Into<String>) -> Self {
         Self {
             msg_type: MessageType::Echo,
@@ -196,21 +199,25 @@ impl CliMessage {
     }
 
     /// Returns true if this is an error message
+    #[allow(dead_code)]
     pub fn is_error(&self) -> bool {
         self.msg_type == MessageType::Error
     }
 
     /// Returns true if this is a result message
+    #[allow(dead_code)]
     pub fn is_result(&self) -> bool {
         self.msg_type == MessageType::Result
     }
 
     /// Returns true if this is an echo message
+    #[allow(dead_code)]
     pub fn is_echo(&self) -> bool {
         self.msg_type == MessageType::Echo
     }
 
     /// Returns true if this is a command message
+    #[allow(dead_code)]
     pub fn is_command(&self) -> bool {
         self.msg_type == MessageType::Command
     }

@@ -13,6 +13,9 @@ pub mod pdu_session_resource;
 pub mod ue_context_release;
 
 pub use error_indication::*;
+// Note: handover exports UserLocationInfoNr which conflicts with initial_ue_message
+// Use explicit imports when both are needed
+#[allow(ambiguous_glob_reexports)]
 pub use handover::*;
 pub use initial_context_setup::*;
 pub use initial_ue_message::*;

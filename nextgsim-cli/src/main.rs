@@ -1,4 +1,5 @@
 //! nextgsim CLI tool
+#![allow(missing_docs)]
 
 mod client;
 mod proc_table;

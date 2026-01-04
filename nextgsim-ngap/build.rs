@@ -8,10 +8,13 @@ use asn1_compiler::Asn1Compiler;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let schema_path = PathBuf::from("../../tools/ngap-17.9.asn");
+
+    // Get the manifest directory (where Cargo.toml is)
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let schema_path = manifest_dir.parent().unwrap().join("tools/ngap-17.9.asn");
 
     // Rerun if schema changes
-    println!("cargo:rerun-if-changed=../../tools/ngap-17.9.asn");
+    println!("cargo:rerun-if-changed={}", schema_path.display());
     println!("cargo:rerun-if-changed=build.rs");
 
     let output_file = out_dir.join("ngap.rs");

@@ -1,4 +1,5 @@
 //! NAS (Non-Access Stratum) protocol library
+#![allow(missing_docs)]
 //!
 //! Implements 5G NAS message encoding/decoding for:
 //! - 5GMM (Mobility Management)

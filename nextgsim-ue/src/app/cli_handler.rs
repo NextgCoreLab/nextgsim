@@ -185,6 +185,7 @@ pub struct CliHandler {
     /// Procedure transaction manager for SM procedures
     pt_manager: ProcedureTransactionManager,
     /// Next available PDU session ID
+    #[allow(dead_code)]
     next_psi: u8,
     /// Active PDU sessions (PSI -> session info)
     active_sessions: Vec<u8>,

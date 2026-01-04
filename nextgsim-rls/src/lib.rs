@@ -1,4 +1,5 @@
 //! Radio Link Simulation (RLS) protocol
+#![allow(missing_docs)]
 //!
 //! This crate provides the RLS protocol implementation for simulated radio link
 //! communication between UE and gNB over UDP. RLS is UERANSIM's protocol for

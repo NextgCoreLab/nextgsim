@@ -1,4 +1,5 @@
 //! NGAP (NG Application Protocol) library
+#![allow(missing_docs)]
 //!
 //! Implements ASN.1 PER encoding/decoding for NGAP messages
 //! between gNB and AMF.

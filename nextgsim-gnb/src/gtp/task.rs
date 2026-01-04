@@ -21,6 +21,7 @@ use crate::tasks::{
 
 /// GTP-U UE context
 #[derive(Debug)]
+#[allow(dead_code)]
 struct GtpUeContext {
     /// UE ID
     ue_id: i32,

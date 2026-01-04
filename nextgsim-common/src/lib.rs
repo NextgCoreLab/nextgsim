@@ -1,4 +1,5 @@
 //! Common types and utilities for nextgsim
+#![allow(missing_docs)]
 //!
 //! This crate provides shared types, configuration structures, and utilities
 //! used across all nextgsim crates.

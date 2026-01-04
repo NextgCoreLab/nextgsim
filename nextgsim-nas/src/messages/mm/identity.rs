@@ -7,11 +7,11 @@
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
-use crate::enums::{ExtendedProtocolDiscriminator, MmMessageType, SecurityHeaderType};
+use crate::enums::MmMessageType;
 use crate::header::PlainMmHeader;
 use crate::ies::ie1::{Ie5gsIdentityType, IdentityType, InformationElement1};
 
-use super::registration::{Ie5gsMobileIdentity, MobileIdentityType};
+use super::registration::Ie5gsMobileIdentity;
 
 /// Error type for Identity message encoding/decoding
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

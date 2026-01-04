@@ -50,6 +50,7 @@ pub struct ProcTableEntry {
 
 impl ProcTableEntry {
     /// Encodes a process table entry to a string
+    #[allow(dead_code)]
     pub fn encode(&self) -> String {
         let mut s = format!(
             "{} {} {} {} {} {}",
@@ -264,6 +265,7 @@ pub fn list_nodes() -> Result<Vec<String>> {
 ///
 /// * `nodes` - List of node names to register
 /// * `cmd_port` - The command port for CLI communication
+#[allow(dead_code)]
 pub fn create_proc_table(nodes: &[String], cmd_port: u16) -> Result<PathBuf> {
     let proc_table_dir = Path::new(PROC_TABLE_DIR);
 
@@ -301,6 +303,7 @@ pub fn create_proc_table(nodes: &[String], cmd_port: u16) -> Result<PathBuf> {
 }
 
 /// Removes a process table entry
+#[allow(dead_code)]
 pub fn remove_proc_table(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_file(path).context("Failed to remove proc table entry")?;

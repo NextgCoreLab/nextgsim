@@ -163,6 +163,7 @@ impl CliClient {
     }
 
     /// Returns the target address
+    #[allow(dead_code)]
     pub fn target_addr(&self) -> SocketAddr {
         self.target_addr
     }

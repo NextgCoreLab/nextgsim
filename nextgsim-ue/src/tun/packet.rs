@@ -240,6 +240,34 @@ pub fn get_src_ipv4(data: &[u8]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(data[12], data[13], data[14], data[15]))
 }
 
+/// Validates that the given data is a valid IP packet.
+///
+/// Returns true if the data starts with a valid IPv4 or IPv6 header.
+#[must_use]
+pub fn is_valid_ip_packet(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+
+    let version = (data[0] >> 4) & 0x0F;
+
+    match version {
+        4 => {
+            // IPv4: minimum 20 bytes header
+            if data.len() < 20 {
+                return false;
+            }
+            let ihl = (data[0] & 0x0F) as usize * 4;
+            data.len() >= ihl
+        }
+        6 => {
+            // IPv6: 40 bytes header
+            data.len() >= 40
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

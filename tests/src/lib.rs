@@ -1,4 +1,5 @@
 //! Integration test framework for nextgsim
+#![allow(missing_docs)]
 //!
 //! This crate provides test utilities and mock components for integration testing
 //! of the nextgsim 5G UE and gNB simulator.

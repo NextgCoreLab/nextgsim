@@ -1,4 +1,5 @@
 //! nextgsim UE (User Equipment) Library
+#![allow(missing_docs)]
 //!
 //! This crate provides the UE (User Equipment) implementation for the nextgsim
 //! 5G simulator. It includes:
@@ -18,8 +19,7 @@ pub mod rls;
 pub mod rrc;
 pub mod tasks;
 pub mod timer;
-// TODO: TUN module has pre-existing compilation errors that need to be fixed
-// pub mod tun;
+pub mod tun;
 
 // Re-export commonly used types
 pub use timer::{GprsTimer2, GprsTimer3, GprsTimer3Unit, UeTimer};
@@ -57,6 +57,8 @@ pub use app::{
     PduSessionEstablishRequest, PduSessionReleaseRequest, PduSessionType,
 };
 
-// TODO: TUN module has pre-existing compilation errors that need to be fixed
 // Re-export TUN types
-// pub use tun::{IpPacket, IpVersion, TunConfig, TunError, TunInterface, TunTask, TunTaskConfig};
+pub use tun::{
+    is_valid_ip_packet, spawn_tun_reader, IpPacket, IpVersion, TunAppMessage, TunConfig, TunError,
+    TunInterface, TunMessage, TunReader, TunTask, TunTaskConfig, TunWriter,
+};

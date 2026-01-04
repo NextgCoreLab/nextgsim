@@ -31,9 +31,9 @@ use nextgsim_nas::messages::mm::{
 use nextgsim_nas::ies::ie1::{
     DeRegistrationAccessType, IeDeRegistrationType, ReRegistrationRequired, SwitchOff,
 };
-// Use the MmCause and Ie5gMmCause from messages::mm (re-exported at crate root)
+// Use the MmCause from messages::mm (re-exported at crate root)
 // to match the types used in DeregistrationRequestUeTerminated
-use nextgsim_nas::{Ie5gMmCause, MmCause};
+use nextgsim_nas::MmCause;
 use nextgsim_nas::security::NasKeySetIdentifier;
 
 use super::state::{MmState, MmSubState, RmState, UpdateStatus};

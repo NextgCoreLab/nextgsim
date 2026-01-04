@@ -1,4 +1,5 @@
 //! nextgsim-gnb - 5G gNB (gNodeB) Simulator Library
+#![allow(missing_docs)]
 //!
 //! This crate provides the gNB implementation for the nextgsim 5G simulator.
 //! It implements the gNodeB functionality including:

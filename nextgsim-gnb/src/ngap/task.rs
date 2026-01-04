@@ -48,6 +48,7 @@ pub struct NgapTask {
     /// Counter for generating RAN UE NGAP IDs
     ran_ue_ngap_id_counter: i64,
     /// Counter for generating downlink TEIDs
+    #[allow(dead_code)]
     downlink_teid_counter: u32,
     /// Whether the NGAP task is initialized (at least one AMF ready)
     is_initialized: bool,
@@ -73,6 +74,7 @@ impl NgapTask {
     }
 
     /// Generates a new downlink TEID
+    #[allow(dead_code)]
     fn next_downlink_teid(&mut self) -> u32 {
         self.downlink_teid_counter += 1;
         self.downlink_teid_counter
@@ -90,11 +92,13 @@ impl NgapTask {
     }
 
     /// Finds an AMF context by client ID
+    #[allow(dead_code)]
     fn find_amf_context(&self, client_id: i32) -> Option<&NgapAmfContext> {
         self.amf_contexts.get(&client_id)
     }
 
     /// Finds a mutable AMF context by client ID
+    #[allow(dead_code)]
     fn find_amf_context_mut(&mut self, client_id: i32) -> Option<&mut NgapAmfContext> {
         self.amf_contexts.get_mut(&client_id)
     }
@@ -131,16 +135,19 @@ impl NgapTask {
     }
 
     /// Finds a UE context by UE ID
+    #[allow(dead_code)]
     fn find_ue_context(&self, ue_id: i32) -> Option<&NgapUeContext> {
         self.ue_contexts.get(&ue_id)
     }
 
     /// Finds a mutable UE context by UE ID
+    #[allow(dead_code)]
     fn find_ue_context_mut(&mut self, ue_id: i32) -> Option<&mut NgapUeContext> {
         self.ue_contexts.get_mut(&ue_id)
     }
 
     /// Finds a UE context by RAN UE NGAP ID
+    #[allow(dead_code)]
     fn find_ue_by_ran_id(&self, ran_ue_ngap_id: i64) -> Option<&NgapUeContext> {
         self.ue_contexts
             .values()
@@ -148,6 +155,7 @@ impl NgapTask {
     }
 
     /// Finds a UE context by AMF UE NGAP ID
+    #[allow(dead_code)]
     fn find_ue_by_amf_id(&self, amf_ue_ngap_id: i64) -> Option<&NgapUeContext> {
         self.ue_contexts
             .values()
@@ -445,6 +453,7 @@ impl NgapTask {
     }
 
     /// Delivers downlink NAS to RRC
+    #[allow(dead_code)]
     async fn deliver_downlink_nas(&self, ue_id: i32, pdu: OctetString) {
         let msg = RrcMessage::NasDelivery { ue_id, pdu };
         if let Err(e) = self.task_base.rrc_tx.send(msg).await {
@@ -457,6 +466,7 @@ impl NgapTask {
     // ========================================================================
 
     /// Handles PDU Session Resource Setup from AMF
+    #[allow(dead_code)]
     async fn handle_pdu_session_setup(
         &mut self,
         ue_id: i32,
@@ -500,6 +510,7 @@ impl NgapTask {
     }
 
     /// Handles PDU Session Resource Release from AMF
+    #[allow(dead_code)]
     async fn handle_pdu_session_release(&mut self, ue_id: i32, psi: u8) {
         // Remove session from UE context
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {

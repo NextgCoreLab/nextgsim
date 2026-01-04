@@ -118,6 +118,7 @@ struct MockAmfState {
 
 /// gNB context in the mock AMF
 #[derive(Debug)]
+#[allow(dead_code)]
 struct GnbContext {
     gnb_id: u32,
     ng_setup_complete: bool,

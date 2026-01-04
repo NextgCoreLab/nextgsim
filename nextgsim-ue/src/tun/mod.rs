@@ -16,11 +16,11 @@
 //! Based on UERANSIM's TUN implementation from `src/ue/tun/`
 
 pub mod config;
-mod interface;
-mod packet;
-mod task;
+pub mod interface;
+pub mod packet;
+pub mod task;
 
 pub use config::TunConfig;
-pub use interface::{TunError, TunInterface};
-pub use packet::{IpPacket, IpVersion};
-pub use task::{TunTask, TunTaskConfig};
+pub use interface::{TunError, TunInterface, TunReader, TunWriter};
+pub use packet::{is_valid_ip_packet, IpPacket, IpVersion};
+pub use task::{spawn_tun_reader, TunAppMessage, TunMessage, TunTask, TunTaskConfig};

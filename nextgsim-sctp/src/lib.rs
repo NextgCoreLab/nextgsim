@@ -1,4 +1,5 @@
 //! SCTP transport layer for nextgsim
+#![allow(missing_docs)]
 //!
 //! This crate provides SCTP association management for NGAP transport,
 //! wrapping the `sctp-proto` crate with an async tokio-based interface.

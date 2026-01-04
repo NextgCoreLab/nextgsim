@@ -8,10 +8,13 @@ use asn1_compiler::Asn1Compiler;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let schema_path = PathBuf::from("../../tools/rrc-15.6.0.asn1");
+
+    // Get the manifest directory (where Cargo.toml is)
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let schema_path = manifest_dir.parent().unwrap().join("tools/rrc-15.6.0.asn1");
 
     // Rerun if schema changes
-    println!("cargo:rerun-if-changed=../../tools/rrc-15.6.0.asn1");
+    println!("cargo:rerun-if-changed={}", schema_path.display());
     println!("cargo:rerun-if-changed=build.rs");
 
     let output_file = out_dir.join("rrc.rs");

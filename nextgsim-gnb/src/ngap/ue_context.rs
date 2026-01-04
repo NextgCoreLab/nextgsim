@@ -152,6 +152,7 @@ pub struct NgapIdPair {
 
 impl NgapIdPair {
     /// Creates a new NGAP ID pair
+    #[allow(dead_code)]
     pub fn new(ran_ue_ngap_id: i64, amf_ue_ngap_id: i64) -> Self {
         Self {
             ran_ue_ngap_id,

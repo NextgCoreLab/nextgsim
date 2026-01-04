@@ -1,4 +1,5 @@
 //! RRC (Radio Resource Control) protocol library
+#![allow(missing_docs)]
 //!
 //! Implements ASN.1 UPER encoding/decoding for RRC messages.
 //!

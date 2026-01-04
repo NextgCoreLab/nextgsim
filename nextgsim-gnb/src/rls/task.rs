@@ -406,6 +406,7 @@ impl RlsTask {
     }
 
     /// Receives data from the UDP socket
+    #[allow(dead_code)]
     async fn receive_udp(&self) -> Option<(OctetString, SocketAddr)> {
         let socket = self.socket.as_ref()?;
         let mut buf = vec![0u8; UDP_BUFFER_SIZE];

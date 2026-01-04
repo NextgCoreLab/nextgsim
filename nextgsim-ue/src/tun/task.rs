@@ -4,18 +4,15 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use nextgsim_common::OctetString;
 
-use crate::tasks::{AppMessage, TaskHandle, TaskMessage, UeStatusUpdate};
-use crate::tun::interface::{TunConfig, TunError, TunInterface};
-use crate::tun::packet::{is_valid_ip_packet, IpPacket};
-
-/// Default receive buffer size for TUN interface
-/// Should be larger than MTU to handle any packet
-const TUN_RECV_BUFFER_SIZE: usize = 8000;
+use super::config::TunConfig;
+use super::interface::TunInterface;
+use super::packet::{is_valid_ip_packet, IpPacket};
 
 /// TUN task configuration
 #[derive(Debug, Clone)]
@@ -61,6 +58,35 @@ pub enum TunMessage {
     },
 }
 
+/// Messages sent from TUN task to App task
+#[derive(Debug, Clone)]
+pub enum TunAppMessage {
+    /// TUN interface created successfully
+    InterfaceCreated {
+        /// PDU session ID
+        psi: i32,
+        /// Interface name
+        name: String,
+    },
+    /// TUN interface destroyed
+    InterfaceDestroyed {
+        /// PDU session ID
+        psi: i32,
+    },
+    /// Uplink data from TUN interface
+    UplinkData {
+        /// PDU session ID
+        psi: i32,
+        /// IP packet data
+        data: OctetString,
+    },
+    /// Error occurred
+    Error {
+        /// Error message
+        message: String,
+    },
+}
+
 /// TUN task for managing TUN interfaces and IP packet handling
 ///
 /// This task:
@@ -71,14 +97,14 @@ pub struct TunTask {
     /// Task configuration
     config: TunTaskConfig,
     /// Handle to send messages to App task
-    app_tx: TaskHandle<AppMessage>,
+    app_tx: mpsc::Sender<TunAppMessage>,
     /// Active TUN interfaces indexed by PSI
     interfaces: HashMap<i32, TunInterface>,
 }
 
 impl TunTask {
     /// Create a new TUN task
-    pub fn new(config: TunTaskConfig, app_tx: TaskHandle<AppMessage>) -> Self {
+    pub fn new(config: TunTaskConfig, app_tx: mpsc::Sender<TunAppMessage>) -> Self {
         Self {
             config,
             app_tx,
@@ -89,7 +115,7 @@ impl TunTask {
     /// Run the TUN task
     ///
     /// Processes messages and handles TUN interface I/O.
-    pub async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<TunMessage>>) {
+    pub async fn run(&mut self, mut rx: mpsc::Receiver<TunMessage>) {
         info!("TUN task started");
 
         loop {
@@ -98,12 +124,8 @@ impl TunTask {
                 // Handle incoming messages
                 msg = rx.recv() => {
                     match msg {
-                        Some(TaskMessage::Message(tun_msg)) => {
+                        Some(tun_msg) => {
                             self.handle_message(tun_msg).await;
-                        }
-                        Some(TaskMessage::Shutdown) => {
-                            info!("TUN task received shutdown signal");
-                            break;
                         }
                         None => {
                             info!("TUN task channel closed");
@@ -122,14 +144,18 @@ impl TunTask {
     /// Handle a TUN message
     async fn handle_message(&mut self, msg: TunMessage) {
         match msg {
-            TunMessage::CreateInterface { psi, address, netmask } => {
+            TunMessage::CreateInterface {
+                psi,
+                address,
+                netmask,
+            } => {
                 self.create_interface(psi, address, netmask).await;
             }
             TunMessage::DestroyInterface { psi } => {
                 self.destroy_interface(psi).await;
             }
             TunMessage::WriteData { psi, data } => {
-                self.write_data(psi, &data).await;
+                self.write_data(psi, data.as_ref()).await;
             }
         }
     }
@@ -142,34 +168,37 @@ impl TunTask {
             return;
         }
 
-        let config = TunConfig {
-            name_prefix: self.config.name_prefix.clone(),
-            address,
-            netmask,
-            mtu: self.config.mtu,
-        };
+        let config = TunConfig::builder()
+            .name_prefix(&self.config.name_prefix)
+            .address(address)
+            .netmask(netmask)
+            .mtu(self.config.mtu)
+            .psi(psi as u8)
+            .build();
 
         match TunInterface::create(&config, psi).await {
             Ok(interface) => {
+                let name = interface.name().to_string();
                 info!(
                     "Created TUN interface {} for PSI {} with address {}/{}",
-                    interface.name(),
-                    psi,
-                    address,
-                    netmask
+                    name, psi, address, netmask
                 );
                 self.interfaces.insert(psi, interface);
 
                 // Notify App task of session establishment
-                let _ = self.app_tx.send(AppMessage::StatusUpdate(
-                    UeStatusUpdate::SessionEstablishment { psi }
-                )).await;
+                let _ = self
+                    .app_tx
+                    .send(TunAppMessage::InterfaceCreated { psi, name })
+                    .await;
             }
             Err(e) => {
                 error!("Failed to create TUN interface for PSI {}: {}", psi, e);
-                let _ = self.app_tx.send(AppMessage::TunError {
-                    error: format!("Failed to create TUN interface: {}", e),
-                }).await;
+                let _ = self
+                    .app_tx
+                    .send(TunAppMessage::Error {
+                        message: format!("Failed to create TUN interface: {}", e),
+                    })
+                    .await;
             }
         }
     }
@@ -177,20 +206,25 @@ impl TunTask {
     /// Destroy a TUN interface
     async fn destroy_interface(&mut self, psi: i32) {
         if let Some(interface) = self.interfaces.remove(&psi) {
-            info!("Destroyed TUN interface {} for PSI {}", interface.name(), psi);
+            info!(
+                "Destroyed TUN interface {} for PSI {}",
+                interface.name(),
+                psi
+            );
 
             // Notify App task of session release
-            let _ = self.app_tx.send(AppMessage::StatusUpdate(
-                UeStatusUpdate::SessionRelease { psi }
-            )).await;
+            let _ = self
+                .app_tx
+                .send(TunAppMessage::InterfaceDestroyed { psi })
+                .await;
         } else {
             warn!("TUN interface for PSI {} not found", psi);
         }
     }
 
     /// Write data to a TUN interface (downlink)
-    async fn write_data(&mut self, psi: i32, data: &OctetString) {
-        let interface = match self.interfaces.get_mut(&psi) {
+    async fn write_data(&mut self, psi: i32, data: &[u8]) {
+        let interface = match self.interfaces.get(&psi) {
             Some(iface) => iface,
             None => {
                 warn!("TUN interface for PSI {} not found, dropping packet", psi);
@@ -199,20 +233,27 @@ impl TunTask {
         };
 
         // Validate the IP packet
-        if !is_valid_ip_packet(data.as_slice()) {
+        if !is_valid_ip_packet(data) {
             warn!("Invalid IP packet for PSI {}, dropping", psi);
             return;
         }
 
-        match interface.write_all(data.as_slice()).await {
+        match interface.write_all(data).await {
             Ok(()) => {
-                debug!("Wrote {} bytes to TUN interface for PSI {}", data.len(), psi);
+                debug!(
+                    "Wrote {} bytes to TUN interface for PSI {}",
+                    data.len(),
+                    psi
+                );
             }
             Err(e) => {
                 error!("Failed to write to TUN interface for PSI {}: {}", psi, e);
-                let _ = self.app_tx.send(AppMessage::TunError {
-                    error: format!("TUN write error: {}", e),
-                }).await;
+                let _ = self
+                    .app_tx
+                    .send(TunAppMessage::Error {
+                        message: format!("TUN write error: {}", e),
+                    })
+                    .await;
             }
         }
     }
@@ -238,34 +279,38 @@ impl TunTask {
 /// # Returns
 /// A join handle for the spawned task
 pub fn spawn_tun_reader(
-    mut interface: TunInterface,
-    app_tx: TaskHandle<AppMessage>,
+    interface: TunInterface,
+    app_tx: mpsc::Sender<TunAppMessage>,
 ) -> tokio::task::JoinHandle<()> {
     let psi = interface.psi();
+    let name = interface.name().to_string();
 
     tokio::spawn(async move {
-        let mut buffer = vec![0u8; TUN_RECV_BUFFER_SIZE];
+        info!("TUN reader started for interface {} (PSI {})", name, psi);
 
         loop {
-            match interface.read(&mut buffer).await {
-                Ok(0) => {
+            match interface.recv().await {
+                Ok(buf) if buf.is_empty() => {
                     // EOF - interface closed
-                    info!("TUN interface {} closed (EOF)", interface.name());
+                    info!("TUN interface {} closed (EOF)", name);
                     break;
                 }
-                Ok(n) => {
-                    let packet_data = &buffer[..n];
-
+                Ok(buf) => {
                     // Validate and parse the packet
-                    if let Some(packet) = IpPacket::parse(packet_data) {
+                    if let Some(packet) = IpPacket::parse(&buf) {
                         debug!(
-                            "Read {} packet ({} bytes) from TUN interface for PSI {}",
-                            packet.version, n, psi
+                            "Read {:?} packet ({} bytes) from TUN interface for PSI {}",
+                            packet.version(),
+                            buf.len(),
+                            psi
                         );
 
                         // Send to App task for GTP encapsulation
-                        let data = OctetString::from_slice(packet.packet_data());
-                        if let Err(e) = app_tx.send(AppMessage::TunDataDelivery { psi, data }).await {
+                        let data = OctetString::from(buf);
+                        if let Err(e) = app_tx
+                            .send(TunAppMessage::UplinkData { psi, data })
+                            .await
+                        {
                             error!("Failed to send TUN data to App task: {}", e);
                             break;
                         }
@@ -275,13 +320,17 @@ pub fn spawn_tun_reader(
                 }
                 Err(e) => {
                     error!("TUN read error for PSI {}: {}", psi, e);
-                    let _ = app_tx.send(AppMessage::TunError {
-                        error: format!("TUN read error: {}", e),
-                    }).await;
+                    let _ = app_tx
+                        .send(TunAppMessage::Error {
+                            message: format!("TUN read error: {}", e),
+                        })
+                        .await;
                     break;
                 }
             }
         }
+
+        info!("TUN reader stopped for interface {} (PSI {})", name, psi);
     })
 }
 
@@ -310,7 +359,7 @@ mod tests {
 
         let write = TunMessage::WriteData {
             psi: 1,
-            data: OctetString::from_slice(&[0x45, 0x00]),
+            data: OctetString::from(vec![0x45, 0x00]),
         };
         assert!(matches!(write, TunMessage::WriteData { psi: 1, .. }));
     }
@@ -318,10 +367,9 @@ mod tests {
     #[tokio::test]
     async fn test_tun_task_creation() {
         let (tx, _rx) = mpsc::channel(10);
-        let app_tx = TaskHandle::new(tx);
         let config = TunTaskConfig::default();
 
-        let task = TunTask::new(config, app_tx);
+        let task = TunTask::new(config, tx);
         assert!(task.interfaces.is_empty());
     }
 }
