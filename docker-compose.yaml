@@ -1,5 +1,8 @@
 # nextgsim Docker Compose Configuration
 # Usage: docker compose up -d
+#
+# This configuration connects nextgsim (UE/gNB simulator) to nextgcore (5G Core)
+# The gNB connects to the nextgcore AMF at 172.22.0.17:38412
 
 version: '3.8'
 
@@ -12,18 +15,16 @@ services:
     container_name: nextgsim-gnb
     hostname: gnb
     volumes:
-      - ../config:/etc/nextgsim:ro
+      - ./config:/etc/nextgsim:ro
       - gnb-logs:/var/log/nextgsim
-    command: ["-c", "/etc/nextgsim/open5gs-gnb.yaml"]
+    command: ["-c", "/etc/nextgsim/gnb.yaml"]
     ports:
-      - "38412:38412/sctp"  # NGAP
-      - "2152:2152/udp"     # GTP-U
-      - "4997:4997"         # CLI
+      - "4997:4997/udp"       # CLI
     networks:
-      nextgsim-net:
-        ipv4_address: 10.100.200.10
+      nextgcore-net:
+        ipv4_address: 172.22.0.100
     environment:
-      - RUST_LOG=info,nextgsim_gnb=debug
+      - RUST_LOG=info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug
     restart: unless-stopped
 
   # UE Simulator
@@ -34,20 +35,20 @@ services:
     container_name: nextgsim-ue
     hostname: ue
     volumes:
-      - ../config:/etc/nextgsim:ro
+      - ./config:/etc/nextgsim:ro
       - ue-logs:/var/log/nextgsim
-    command: ["-c", "/etc/nextgsim/open5gs-ue.yaml"]
+    command: ["-c", "/etc/nextgsim/ue.yaml"]
     ports:
-      - "4998:4998"         # CLI
+      - "4998:4998/udp"       # CLI
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
     networks:
-      nextgsim-net:
-        ipv4_address: 10.100.200.20
+      nextgcore-net:
+        ipv4_address: 172.22.0.101
     environment:
-      - RUST_LOG=info,nextgsim_ue=debug
+      - RUST_LOG=info,nextgsim_ue=debug,nextgsim_nas=debug,nextgsim_rls=debug
     depends_on:
       - gnb
     restart: unless-stopped
@@ -62,16 +63,16 @@ services:
     stdin_open: true
     tty: true
     networks:
-      - nextgsim-net
+      - nextgcore-net
     profiles:
       - tools
 
+# Connect to the existing nextgcore network
+# This network is created by nextgcore's docker-compose.yml
 networks:
-  nextgsim-net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 10.100.200.0/24
+  nextgcore-net:
+    external: true
+    name: nextgcore-network
 
 volumes:
   gnb-logs:

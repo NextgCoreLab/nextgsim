@@ -1,0 +1,80 @@
+# UE Configuration for NextGSim
+# Connects to gNB which connects to NextGCore 5G Core Network
+#
+# IMSI: 999700000000001 (PLMN 999-70 + MSIN 0000000001)
+# This subscriber must be provisioned in nextgcore MongoDB
+
+# Subscription Permanent Identifier (IMSI format)
+supi: "imsi-999700000000001"
+
+# SUCI Protection Scheme
+# 0: Null scheme (no protection)
+# 1: Profile A (ECIES)
+# 2: Profile B (ECIES)
+protection_scheme: 0
+
+# Home network public key configuration (for SUCI protection)
+home_network_public_key_id: 0
+home_network_public_key: []
+
+# Routing indicator (optional)
+routing_indicator: null
+
+# Home PLMN - Must match nextgcore configuration
+hplmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+# Subscriber authentication key K (128-bit)
+# Default test key from Open5GS/UERANSIM examples
+key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+
+# Operator key OPc (128-bit)
+# Default test OPc from Open5GS/UERANSIM examples
+op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+
+# Type of operator key
+op_type: Opc
+
+# Authentication Management Field (16-bit)
+# 0x8000 = separation bit set (5G)
+amf: [0x80, 0x00]
+
+# International Mobile Equipment Identity (optional)
+imei: "356938035643803"
+
+# IMEI Software Version (optional)
+imei_sv: null
+
+# Supported NAS security algorithms
+supported_algs:
+  nia1: true   # SNOW3G integrity
+  nia2: true   # AES integrity
+  nia3: true   # ZUC integrity
+  nea1: true   # SNOW3G ciphering
+  nea2: true   # AES ciphering
+  nea3: true   # ZUC ciphering
+
+# gNB addresses to search for (RLS protocol)
+# When running in Docker, use the gNB container hostname or IP
+gnb_search_list:
+  - "127.0.0.1:4997"
+
+# Default PDU sessions to establish after registration
+sessions:
+  - type: Ipv4
+    s_nssai:
+      sst: 1
+      sd: null
+    apn: "internet"
+    is_emergency: false
+
+# Configured NSSAI (network slices)
+configured_nssai:
+  slices:
+    - sst: 1
+      sd: null
+
+# TUN interface name (optional, for user plane)
+tun_name: "uesimtun0"

@@ -1,0 +1,52 @@
+# gNB Configuration for NextGSim
+# Connects to NextGCore 5G Core Network
+#
+# Network: PLMN 999-70 (matches nextgcore AMF configuration)
+# AMF Address: 172.22.0.17:38412 (nextgcore-amf container)
+# UPF Address: 172.22.0.19:2152 (nextgcore-upf container)
+
+# NR Cell Identity (36-bit value)
+# Format: gNB-ID (upper bits) + Cell-ID (lower bits)
+# With gnb_id_length=32, gNB-ID is 32 bits, Cell-ID is 4 bits
+nci: 0x000000010
+
+# gNB ID length in bits (22-32)
+gnb_id_length: 32
+
+# PLMN - Must match nextgcore AMF configuration
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+# Tracking Area Code (24-bit) - Must match nextgcore AMF TAI
+tac: 1
+
+# Network Slice Selection Assistance Information
+# Must match nextgcore AMF plmn_support configuration
+nssai:
+  - sst: 1
+    sd: null  # No SD specified (default slice)
+
+# AMF Configuration - Points to nextgcore AMF
+amf_configs:
+  - address: 172.22.0.17
+    port: 38412
+
+# IP addresses for gNB interfaces
+# These should be on the Docker network that can reach nextgcore
+
+# RLS link layer IP (for UE-gNB simulated radio link)
+link_ip: 172.22.0.100
+
+# NGAP interface IP (for AMF communication via SCTP)
+ngap_ip: 172.22.0.100
+
+# GTP-U interface IP (for user plane to UPF)
+gtp_ip: 172.22.0.100
+
+# Advertised GTP IP (for NAT scenarios, optional)
+# gtp_advertise_ip: null
+
+# Whether to ignore SCTP stream IDs (for compatibility)
+ignore_stream_ids: false

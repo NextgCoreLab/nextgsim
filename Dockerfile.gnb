@@ -1,7 +1,10 @@
 # nextgsim-gnb - 5G gNodeB Simulator
 # Optimized single-binary image
 
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.83-bookworm AS builder
+
+# Install rustfmt for ASN.1 code generation
+RUN rustup component add rustfmt
 
 WORKDIR /app
 
@@ -19,6 +22,7 @@ COPY nextgsim-gnb ./nextgsim-gnb
 COPY nextgsim-ue ./nextgsim-ue
 COPY nextgsim-cli ./nextgsim-cli
 COPY tests ./tests
+COPY tools ./tools
 
 # Build only gNB binary
 RUN cargo build --release --package nextgsim-gnb
@@ -29,7 +33,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/nextgsim-gnb /usr/local/bin/
+COPY --from=builder /app/target/release/nr-gnb /usr/local/bin/
 
 RUN mkdir -p /etc/nextgsim
 WORKDIR /etc/nextgsim
@@ -38,5 +42,5 @@ EXPOSE 38412/sctp
 EXPOSE 2152/udp
 EXPOSE 4997
 
-ENTRYPOINT ["nextgsim-gnb"]
+ENTRYPOINT ["nr-gnb"]
 CMD ["-c", "/etc/nextgsim/gnb.yaml"]

@@ -1,7 +1,10 @@
 # nextgsim-ue - 5G User Equipment Simulator
 # Optimized single-binary image with TUN support
 
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.83-bookworm AS builder
+
+# Install rustfmt for ASN.1 code generation
+RUN rustup component add rustfmt
 
 WORKDIR /app
 
@@ -19,6 +22,7 @@ COPY nextgsim-gnb ./nextgsim-gnb
 COPY nextgsim-ue ./nextgsim-ue
 COPY nextgsim-cli ./nextgsim-cli
 COPY tests ./tests
+COPY tools ./tools
 
 # Build only UE binary
 RUN cargo build --release --package nextgsim-ue
@@ -31,7 +35,7 @@ RUN apt-get update && apt-get install -y \
     iptables \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/nextgsim-ue /usr/local/bin/
+COPY --from=builder /app/target/release/nr-ue /usr/local/bin/
 
 RUN mkdir -p /etc/nextgsim
 WORKDIR /etc/nextgsim
@@ -41,5 +45,5 @@ WORKDIR /etc/nextgsim
 
 EXPOSE 4998
 
-ENTRYPOINT ["nextgsim-ue"]
+ENTRYPOINT ["nr-ue"]
 CMD ["-c", "/etc/nextgsim/ue.yaml"]
