@@ -220,6 +220,125 @@ impl Default for StatusReporter {
     }
 }
 
+/// UE basic information for CLI display.
+///
+/// This structure contains static UE information from configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UeInfo {
+    /// SUPI (Subscriber Permanent Identifier) if configured
+    #[serde(rename = "supi", skip_serializing_if = "Option::is_none")]
+    pub supi: Option<String>,
+    /// IMEI (International Mobile Equipment Identity) if configured
+    #[serde(rename = "imei", skip_serializing_if = "Option::is_none")]
+    pub imei: Option<String>,
+    /// Active PDU sessions (list of PSIs)
+    #[serde(rename = "pdu-sessions")]
+    pub pdu_sessions: Vec<u8>,
+    /// Number of pending SM procedures
+    #[serde(rename = "pending-procedures")]
+    pub pending_procedures: usize,
+}
+
+impl Default for UeInfo {
+    fn default() -> Self {
+        Self {
+            supi: None,
+            imei: None,
+            pdu_sessions: Vec::new(),
+            pending_procedures: 0,
+        }
+    }
+}
+
+impl UeInfo {
+    /// Creates a new UeInfo with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the SUPI from configuration.
+    pub fn set_supi(&mut self, supi: impl Into<String>) {
+        self.supi = Some(supi.into());
+    }
+
+    /// Sets the IMEI from configuration.
+    pub fn set_imei(&mut self, imei: impl Into<String>) {
+        self.imei = Some(imei.into());
+    }
+
+    /// Returns the info as a YAML string for CLI output.
+    pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
+        serde_yaml::to_string(self)
+    }
+
+    /// Returns the info as a JSON string.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+/// Timer information for CLI display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimerInfo {
+    /// Timer code (e.g., 3511, 3521, 3580)
+    #[serde(rename = "code")]
+    pub code: u16,
+    /// Timer name (e.g., "T3511", "T3521")
+    #[serde(rename = "name")]
+    pub name: String,
+    /// Whether the timer is currently running
+    #[serde(rename = "running")]
+    pub running: bool,
+    /// Remaining time in seconds (if running)
+    #[serde(rename = "remaining-secs", skip_serializing_if = "Option::is_none")]
+    pub remaining_secs: Option<u32>,
+    /// Expiry count (number of times the timer has expired)
+    #[serde(rename = "expiry-count")]
+    pub expiry_count: u32,
+}
+
+impl TimerInfo {
+    /// Creates a new TimerInfo.
+    pub fn new(code: u16, name: impl Into<String>, running: bool, expiry_count: u32) -> Self {
+        Self {
+            code,
+            name: name.into(),
+            running,
+            remaining_secs: None,
+            expiry_count,
+        }
+    }
+}
+
+/// Collection of timer information for CLI display.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TimersInfo {
+    /// List of active timers
+    #[serde(rename = "timers")]
+    pub timers: Vec<TimerInfo>,
+}
+
+impl TimersInfo {
+    /// Creates a new empty TimersInfo.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a timer to the list.
+    pub fn add_timer(&mut self, timer: TimerInfo) {
+        self.timers.push(timer);
+    }
+
+    /// Returns the info as a YAML string for CLI output.
+    pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
+        if self.timers.is_empty() {
+            Ok("timers: []\n".to_string())
+        } else {
+            serde_yaml::to_string(self)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

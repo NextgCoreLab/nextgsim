@@ -99,7 +99,36 @@ impl RrcTask {
         match message_type {
             0x04 => self.handle_rrc_setup_complete(ue_id, data).await,
             0x08 => self.handle_ul_information_transfer(ue_id, data).await,
-            _ => debug!("Unhandled UL-DCCH message type: {:#x}", message_type),
+            _ => {
+                // Check if this looks like a raw NAS PDU
+                // EPD = 0x7E for 5GMM (Mobility Management), 0x2E for 5GSM (Session Management)
+                // Some UE simulators send NAS directly without proper RRC encapsulation
+                let is_nas_pdu = bytes.len() >= 3 && (bytes[0] == 0x7E || bytes[0] == 0x2E);
+                if is_nas_pdu {
+                    // Check if UE context already exists (meaning Initial UE Message was already sent)
+                    if let Some(ctx) = self.ue_manager.try_find_ue(ue_id) {
+                        if ctx.is_connected() {
+                            // UE is already connected, send as Uplink NAS Transport
+                            info!("Received raw NAS PDU on UL-DCCH from connected UE, sending as Uplink NAS (ue_id={}, epd=0x{:02x})", ue_id, bytes[0]);
+                            self.send_uplink_nas_delivery(ue_id, data.clone()).await;
+                            return;
+                        }
+                    }
+
+                    // First message - send as Initial UE Message
+                    info!("Received raw NAS PDU on UL-DCCH, forwarding to NGAP as Initial UE (ue_id={})", ue_id);
+                    // Create or get UE context
+                    if self.ue_manager.try_find_ue(ue_id).is_none() {
+                        // Auto-create UE context for this UE
+                        let ctx = self.ue_manager.create_ue(ue_id);
+                        ctx.on_setup_complete(); // Mark as connected
+                    }
+                    // Forward as Initial NAS
+                    self.send_initial_nas_delivery(ue_id, data.clone(), 3, None).await; // cause=3 (mo-Data)
+                } else {
+                    debug!("Unhandled UL-DCCH message type: {:#x}", message_type);
+                }
+            }
         }
     }
 
@@ -261,7 +290,7 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false,
+            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
         }
     }
 

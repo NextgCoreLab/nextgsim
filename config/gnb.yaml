@@ -2,8 +2,8 @@
 # Connects to NextGCore 5G Core Network
 #
 # Network: PLMN 999-70 (matches nextgcore AMF configuration)
-# AMF Address: 172.22.0.17:38412 (nextgcore-amf container)
-# UPF Address: 172.22.0.19:2152 (nextgcore-upf container)
+# AMF Address: 172.23.0.5:38412 (nextgcore-amf container on nextgcore-5gc network)
+# UPF Address: 172.23.0.7:2152 (nextgcore-upf container)
 
 # NR Cell Identity (36-bit value)
 # Format: gNB-ID (upper bits) + Cell-ID (lower bits)
@@ -30,23 +30,28 @@ nssai:
 
 # AMF Configuration - Points to nextgcore AMF
 amf_configs:
-  - address: 172.22.0.17
+  - address: 172.23.0.5
     port: 38412
 
 # IP addresses for gNB interfaces
 # These should be on the Docker network that can reach nextgcore
 
 # RLS link layer IP (for UE-gNB simulated radio link)
-link_ip: 172.22.0.100
+link_ip: 172.23.0.100
 
 # NGAP interface IP (for AMF communication via SCTP)
-ngap_ip: 172.22.0.100
+ngap_ip: 172.23.0.100
 
 # GTP-U interface IP (for user plane to UPF)
-gtp_ip: 172.22.0.100
+gtp_ip: 172.23.0.100
 
 # Advertised GTP IP (for NAT scenarios, optional)
 # gtp_advertise_ip: null
 
 # Whether to ignore SCTP stream IDs (for compatibility)
 ignore_stream_ids: false
+
+# UPF Address for GTP-U data plane forwarding
+# If not set, gNB uses loopback mode (for testing without real UPF)
+upf_addr: 172.23.0.7
+upf_port: 2152

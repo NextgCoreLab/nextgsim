@@ -74,10 +74,16 @@
 //! ```
 
 pub mod connection;
+pub mod handover;
 pub mod task;
 pub mod ue_context;
 
 // Re-export main types
 pub use connection::{RrcConnectionManager, RrcReleaseResult, RrcSetupCompleteResult, RrcSetupResult};
+pub use handover::{
+    GnbHandoverManager, HandoverCommand, HandoverConfig, HandoverDecision,
+    MeasurementReport, NeighborMeasurement, UeHandoverState,
+    parse_measurement_report,
+};
 pub use task::RrcTask;
 pub use ue_context::{RrcState, RrcUeContext, RrcUeContextManager};

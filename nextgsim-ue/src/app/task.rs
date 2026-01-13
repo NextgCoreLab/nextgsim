@@ -143,18 +143,34 @@ impl AppTask {
             NasAction::None => {}
             NasAction::EstablishPduSession { psi, pti, session_type, apn } => {
                 info!(
-                    "Initiating PDU session establishment: PSI={}, PTI={}, type={}, apn={:?}",
+                    "Initiating PDU session establishment: PSI={}, PTI={}, type={:?}, apn={:?}",
                     psi, pti, session_type, apn
                 );
-                // TODO: Send message to NAS task to initiate PDU session establishment
+                let msg = NasMessage::InitiatePduSessionEstablishment {
+                    psi,
+                    pti,
+                    session_type: format!("{:?}", session_type),
+                    apn,
+                };
+                if let Err(e) = self.task_base.nas_tx.send(msg).await {
+                    error!("Failed to send PDU session establishment request: {}", e);
+                }
             }
             NasAction::ReleasePduSession { psi, pti } => {
                 info!("Initiating PDU session release: PSI={}, PTI={}", psi, pti);
-                // TODO: Send message to NAS task to initiate PDU session release
+                let msg = NasMessage::InitiatePduSessionRelease { psi, pti };
+                if let Err(e) = self.task_base.nas_tx.send(msg).await {
+                    error!("Failed to send PDU session release request: {}", e);
+                }
             }
             NasAction::Deregister { cause } => {
-                info!("Initiating deregistration: cause={}", cause);
-                // TODO: Send message to NAS task to initiate deregistration
+                use crate::nas::mm::DeregistrationCause;
+                let switch_off = matches!(cause, DeregistrationCause::SwitchOff);
+                info!("Initiating deregistration: cause={}, switch_off={}", cause, switch_off);
+                let msg = NasMessage::InitiateDeregistration { switch_off };
+                if let Err(e) = self.task_base.nas_tx.send(msg).await {
+                    error!("Failed to send deregistration request: {}", e);
+                }
             }
         }
     }
@@ -212,9 +228,13 @@ impl AppTask {
     }
 
     /// Handles downlink data delivery (to TUN).
+    ///
+    /// Note: In the current architecture, downlink data forwarding to TUN is handled
+    /// directly in main.rs via the NasMessage::DownlinkDataDelivery message, as the
+    /// TUN task channel is created there.
     fn handle_downlink_data(&self, psi: i32, data: nextgsim_common::OctetString) {
         debug!("Downlink data delivery: psi={}, len={}", psi, data.len());
-        // TODO: Forward to TUN interface
+        // Downlink data forwarding to TUN is handled in main.rs
     }
 
     /// Updates the RM state.

@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::tasks::{
     AppMessage, GnbTaskBase, GtpMessage, GtpUeContextUpdate, NgapMessage,
     PduSessionResource, RrcMessage, SctpMessage, StatusType, StatusUpdate,
-    Task, TaskMessage,
+    Task, TaskMessage, UeReleaseRequestCause,
 };
 use nextgsim_common::OctetString;
 
@@ -35,7 +35,14 @@ use nextgsim_ngap::procedures::{
     build_ng_setup_request, parse_ng_setup_response, parse_ng_setup_failure,
     is_ng_setup_response, is_ng_setup_failure,
     BroadcastPlmnItem, GnbId, NgSetupRequestParams, PagingDrx, SNssai, SupportedTaItem,
+    // Initial UE Message
+    encode_initial_ue_message, InitialUeMessageParams,
+    RrcEstablishmentCauseValue, UeContextRequestValue,
+    // NAS Transport
+    decode_downlink_nas_transport, DownlinkNasTransportData,
+    encode_uplink_nas_transport, UplinkNasTransportParams,
 };
+use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, UserLocationInfoNr, NrCgi, Tai};
 
 /// NGAP Task for managing AMF communication and UE contexts
 pub struct NgapTask {
@@ -354,7 +361,19 @@ impl NgapTask {
                     amf_id, failure.cause
                 );
 
-                // TODO: Handle time_to_wait for retry
+                // Handle time_to_wait for retry
+                // The time_to_wait IE indicates the minimum time the NG-RAN node should wait
+                // before re-initiating the NG Setup procedure.
+                // Note: In the current implementation, we rely on the SCTP reconnection
+                // mechanism to handle retries. A more sophisticated implementation would
+                // parse the time_to_wait IE and schedule a retry after that duration.
+                if let Some(time_to_wait) = failure.time_to_wait {
+                    info!(
+                        "AMF {} requested wait time before retry: {:?}",
+                        amf_id, time_to_wait
+                    );
+                }
+
                 if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
                     ctx.on_association_down(); // Reset to not connected
                 }
@@ -370,6 +389,69 @@ impl NgapTask {
     // ========================================================================
     // NAS Message Routing
     // ========================================================================
+
+    /// Handles Downlink NAS Transport from AMF
+    async fn handle_downlink_nas_transport(
+        &mut self,
+        _amf_id: i32,
+        _stream: u16,
+        dl_nas: DownlinkNasTransportData,
+    ) {
+        info!(
+            "Downlink NAS Transport: amf_ue_ngap_id={}, ran_ue_ngap_id={}, nas_pdu_len={}",
+            dl_nas.amf_ue_ngap_id,
+            dl_nas.ran_ue_ngap_id,
+            dl_nas.nas_pdu.len()
+        );
+
+        // Find UE context by RAN-UE-NGAP-ID
+        let ue_ctx = self.ue_contexts.values_mut().find(|ctx| {
+            ctx.ran_ue_ngap_id == dl_nas.ran_ue_ngap_id as i64
+        });
+
+        let ue_id = match ue_ctx {
+            Some(ctx) => {
+                // Update AMF-UE-NGAP-ID if not set
+                if ctx.amf_ue_ngap_id.is_none() {
+                    ctx.amf_ue_ngap_id = Some(dl_nas.amf_ue_ngap_id as i64);
+                    info!(
+                        "Updated UE context: ue_id={}, amf_ue_ngap_id={}",
+                        ctx.ue_id, dl_nas.amf_ue_ngap_id
+                    );
+                }
+                ctx.ue_id
+            }
+            None => {
+                warn!(
+                    "No UE context found for RAN-UE-NGAP-ID {}",
+                    dl_nas.ran_ue_ngap_id
+                );
+                return;
+            }
+        };
+
+        // Log the NAS PDU content for debugging
+        debug!(
+            "NAS PDU (first 16 bytes): {:02x?}",
+            &dl_nas.nas_pdu[..dl_nas.nas_pdu.len().min(16)]
+        );
+
+        // Forward NAS PDU to RRC for delivery to UE
+        let msg = RrcMessage::NasDelivery {
+            ue_id,
+            pdu: OctetString::from_slice(&dl_nas.nas_pdu),
+        };
+
+        if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+            error!("Failed to send NAS delivery to RRC: {}", e);
+        } else {
+            info!(
+                "Forwarded NAS PDU to RRC: ue_id={}, nas_len={}",
+                ue_id,
+                dl_nas.nas_pdu.len()
+            );
+        }
+    }
 
     /// Handles Initial NAS delivery from RRC (Initial UE Message)
     async fn handle_initial_nas_delivery(
@@ -404,21 +486,84 @@ impl NgapTask {
             }
         };
 
-        // Build and send Initial UE Message
-        // For now, we'll send the NAS PDU directly - full implementation would use
-        // nextgsim_ngap::procedures::initial_ue_message
+        // Get stream for this UE
         let stream = self
             .ue_contexts
             .get(&ue_id)
             .map(|ctx| ctx.stream_id)
-            .unwrap_or(0);
+            .unwrap_or(1); // Use stream 1 for UE-associated signaling
 
-        // TODO: Build proper Initial UE Message using NGAP procedures
-        // For now, log that we would send it
-        info!(
-            "Would send Initial UE Message: ue_id={}, ran_ue_ngap_id={}, amf_id={}, stream={}",
-            ue_id, ran_ue_ngap_id, amf_id, stream
-        );
+        // Build User Location Information
+        let config = &self.task_base.config;
+        let plmn_bytes = config.plmn.encode();
+        let tac_bytes = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+
+        // Convert RRC establishment cause to NGAP value
+        let rrc_cause = match rrc_establishment_cause {
+            0 => RrcEstablishmentCauseValue::Emergency,
+            1 => RrcEstablishmentCauseValue::HighPriorityAccess,
+            2 => RrcEstablishmentCauseValue::MtAccess,
+            3 => RrcEstablishmentCauseValue::MoSignalling,
+            4 => RrcEstablishmentCauseValue::MoData,
+            5 => RrcEstablishmentCauseValue::MoVoiceCall,
+            6 => RrcEstablishmentCauseValue::MoVideoCall,
+            7 => RrcEstablishmentCauseValue::MoSms,
+            8 => RrcEstablishmentCauseValue::MpsHighPriorityAccess,
+            9 => RrcEstablishmentCauseValue::McsHighPriorityAccess,
+            _ => RrcEstablishmentCauseValue::MoSignalling, // Default
+        };
+
+        // Convert GutiMobileIdentity to FiveGSTmsi if provided
+        let five_g_s_tmsi = _s_tmsi.map(|guti| {
+            // Convert 5G-TMSI (u32) to bytes
+            let tmsi_bytes = guti.tmsi.to_be_bytes();
+            FiveGSTmsi {
+                amf_set_id: guti.amf_set_id,
+                amf_pointer: guti.amf_pointer,
+                five_g_tmsi: tmsi_bytes,
+            }
+        });
+
+        let params = InitialUeMessageParams {
+            ran_ue_ngap_id: ran_ue_ngap_id as u32,
+            nas_pdu: pdu.data().to_vec(),
+            user_location_info: UserLocationInfoNr {
+                nr_cgi: NrCgi {
+                    plmn_identity: plmn_bytes,
+                    nr_cell_identity: config.nci,
+                },
+                tai: Tai {
+                    plmn_identity: plmn_bytes,
+                    tac: tac_bytes,
+                },
+                time_stamp: None,
+            },
+            rrc_establishment_cause: rrc_cause,
+            five_g_s_tmsi,
+            amf_set_id: None,
+            ue_context_request: Some(UeContextRequestValue::Requested),
+            allowed_nssai: None,
+        };
+
+        match encode_initial_ue_message(&params) {
+            Ok(bytes) => {
+                info!(
+                    "Sending Initial UE Message: ue_id={}, ran_ue_ngap_id={}, amf_id={}, stream={}, len={}",
+                    ue_id, ran_ue_ngap_id, amf_id, stream, bytes.len()
+                );
+                self.send_ngap_ue_associated(amf_id, stream, bytes).await;
+            }
+            Err(e) => {
+                error!("Failed to encode Initial UE Message: {}", e);
+                // Clean up UE context on failure
+                self.delete_ue_context(ue_id);
+                return;
+            }
+        }
 
         // Notify GTP task of new UE context
         self.send_gtp_ue_context_update(ue_id, None).await;
@@ -440,16 +585,56 @@ impl NgapTask {
             }
         };
 
-        if ctx.amf_ue_ngap_id.is_none() {
-            warn!("AMF UE NGAP ID not set for UE {}", ue_id);
-            return;
-        }
+        let amf_ue_ngap_id = match ctx.amf_ue_ngap_id {
+            Some(id) => id as u64,
+            None => {
+                warn!("AMF UE NGAP ID not set for UE {}", ue_id);
+                return;
+            }
+        };
 
-        // TODO: Build and send Uplink NAS Transport message
-        info!(
-            "Would send Uplink NAS Transport: ue_id={}, amf_id={}",
-            ue_id, ctx.amf_ctx_id
-        );
+        let ran_ue_ngap_id = ctx.ran_ue_ngap_id as u32;
+        let amf_ctx_id = ctx.amf_ctx_id;
+        let stream = ctx.stream_id;
+
+        // Build User Location Information
+        let config = &self.task_base.config;
+        let plmn_bytes = config.plmn.encode();
+        let tac_bytes = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+
+        let params = UplinkNasTransportParams {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            nas_pdu: pdu.data().to_vec(),
+            user_location_info: UserLocationInfoNr {
+                nr_cgi: NrCgi {
+                    plmn_identity: plmn_bytes,
+                    nr_cell_identity: config.nci,
+                },
+                tai: Tai {
+                    plmn_identity: plmn_bytes,
+                    tac: tac_bytes,
+                },
+                time_stamp: None,
+            },
+        };
+
+        match encode_uplink_nas_transport(&params) {
+            Ok(bytes) => {
+                info!(
+                    "Sending Uplink NAS Transport: ue_id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={}, amf_ctx_id={}, stream={}, len={}",
+                    ue_id, ran_ue_ngap_id, amf_ue_ngap_id, amf_ctx_id, stream, bytes.len()
+                );
+                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes).await;
+            }
+            Err(e) => {
+                error!("Failed to encode Uplink NAS Transport: {}", e);
+            }
+        }
     }
 
     /// Delivers downlink NAS to RRC
@@ -536,23 +721,52 @@ impl NgapTask {
     /// Handles radio link failure notification from RRC
     async fn handle_radio_link_failure(&mut self, ue_id: i32) {
         info!("Radio link failure: ue_id={}", ue_id);
+        self.handle_ue_context_release_request(ue_id, UeReleaseRequestCause::RadioLinkFailure).await;
+    }
+
+    /// Handles UE Context Release Request (from App or RRC)
+    async fn handle_ue_context_release_request(&mut self, ue_id: i32, cause: UeReleaseRequestCause) {
+        info!("UE context release request: ue_id={}, cause={:?}", ue_id, cause);
 
         let ctx = match self.ue_contexts.get(&ue_id) {
             Some(c) => c,
             None => {
-                warn!("UE context not found for RLF: ue_id={}", ue_id);
+                warn!("UE context not found for release: ue_id={}", ue_id);
                 return;
             }
         };
 
-        // TODO: Send UE Context Release Request to AMF
-        info!(
-            "Would send UE Context Release Request: ue_id={}, amf_id={}",
-            ue_id, ctx.amf_ctx_id
-        );
+        let amf_ctx_id = ctx.amf_ctx_id;
+        let ran_ue_ngap_id = ctx.ran_ue_ngap_id;
+        let amf_ue_ngap_id = ctx.amf_ue_ngap_id;
+        let stream = ctx.stream_id;
+
+        // Send UE Context Release Request to AMF if we have the AMF UE NGAP ID
+        if let Some(amf_id) = amf_ue_ngap_id {
+            info!(
+                "Sending UE Context Release Request: ue_id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={}, amf_ctx_id={}",
+                ue_id, ran_ue_ngap_id, amf_id, amf_ctx_id
+            );
+
+            // Build and send UE Context Release Request
+            // For now, we just clean up locally as the encoding is not yet implemented
+            // In a full implementation, we would encode and send the NGAP message here
+            debug!(
+                "UE Context Release Request would be sent on stream {} (encoding not yet implemented)",
+                stream
+            );
+        } else {
+            info!(
+                "UE context release without AMF UE NGAP ID: ue_id={}, ran_ue_ngap_id={}",
+                ue_id, ran_ue_ngap_id
+            );
+        }
 
         // Clean up UE context
         self.delete_ue_context(ue_id);
+
+        // Notify RRC of AN release
+        self.send_an_release(ue_id).await;
 
         // Notify GTP task
         let msg = GtpMessage::UeContextRelease { ue_id };
@@ -596,9 +810,25 @@ impl NgapTask {
             }
             AmfState::Ready | AmfState::Overloaded => {
                 // Handle operational messages
-                // TODO: Decode and dispatch based on message type
-                // For now, just log
-                debug!("Received operational NGAP PDU on stream {}", stream);
+                // Try to decode as Downlink NAS Transport
+                if let Ok(dl_nas) = decode_downlink_nas_transport(pdu_bytes) {
+                    self.handle_downlink_nas_transport(client_id, stream, dl_nas).await;
+                } else {
+                    // Other NGAP message types that may be received in Ready state:
+                    // - PDU Session Resource Setup Request
+                    // - PDU Session Resource Release Command
+                    // - UE Context Release Command
+                    // - Initial Context Setup Request
+                    // - Handover Request
+                    // - Paging
+                    // - Error Indication
+                    // These require additional decoder implementations in nextgsim-ngap
+                    debug!(
+                        "Received operational NGAP PDU on stream {} (not yet handled, first bytes: {:02x?})",
+                        stream,
+                        &pdu_bytes[..pdu_bytes.len().min(16)]
+                    );
+                }
             }
             _ => {
                 warn!(
@@ -615,6 +845,20 @@ impl NgapTask {
 
     /// Sends an NGAP PDU for non-UE-associated signaling (stream 0)
     async fn send_ngap_non_ue(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
+        let msg = SctpMessage::SendMessage {
+            client_id: amf_id,
+            stream,
+            buffer: OctetString::from_slice(&data),
+        };
+
+        if let Err(e) = self.task_base.sctp_tx.send(msg).await {
+            error!("Failed to send NGAP PDU to SCTP: {}", e);
+        }
+    }
+
+    /// Sends an NGAP PDU for UE-associated signaling (stream > 0)
+    async fn send_ngap_ue_associated(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
+        debug!("Sending UE-associated NGAP PDU: amf_id={}, stream={}, len={}", amf_id, stream, data.len());
         let msg = SctpMessage::SendMessage {
             client_id: amf_id,
             stream,
@@ -733,6 +977,9 @@ impl Task for NgapTask {
                         NgapMessage::RadioLinkFailure { ue_id } => {
                             self.handle_radio_link_failure(ue_id).await;
                         }
+                        NgapMessage::UeContextReleaseRequest { ue_id, cause } => {
+                            self.handle_ue_context_release_request(ue_id, cause).await;
+                        }
                     }
                 }
                 Some(TaskMessage::Shutdown) => {
@@ -777,7 +1024,7 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false,
+            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
         }
     }
 

@@ -21,5 +21,5 @@ pub use config_loader::{
     load_and_validate_ue_config, load_ue_config, load_ue_config_from_str, validate_ue_config,
     ConfigError, ConfigValidationError,
 };
-pub use status::{StatusReporter, UeStatusInfo};
+pub use status::{StatusReporter, TimerInfo, TimersInfo, UeInfo, UeStatusInfo};
 pub use task::{parse_ue_cli_command, AppTask};

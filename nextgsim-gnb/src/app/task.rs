@@ -13,14 +13,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::app::{
     parse_cli_command, AmfContext, CliServer, CliServerError, GnbCmdHandler,
     StatusReporter, UeContext,
 };
 use crate::tasks::{
-    AppMessage, GnbCliCommandType, GnbTaskBase, StatusUpdate, Task, TaskMessage,
+    AppMessage, GnbCliCommandType, GnbTaskBase, NgapMessage, StatusUpdate, Task, TaskMessage,
+    UeReleaseRequestCause,
 };
 
 /// gNB Application Task
@@ -118,8 +119,15 @@ impl AppTask {
         // Handle UE release if requested
         if let GnbCliCommandType::UeRelease { ue_id } = command {
             if !response.is_error {
-                // TODO: Send release request to NGAP task
+                // Send release request to NGAP task
                 info!("UE release requested for UE {}", ue_id);
+                let msg = NgapMessage::UeContextReleaseRequest {
+                    ue_id,
+                    cause: UeReleaseRequestCause::UserTriggered,
+                };
+                if let Err(e) = self.task_base.ngap_tx.send(msg).await {
+                    error!("Failed to send UE release request to NGAP: {}", e);
+                }
             }
         }
 
@@ -280,7 +288,7 @@ mod tests {
             ngap_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false,
+            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
         }
     }
 

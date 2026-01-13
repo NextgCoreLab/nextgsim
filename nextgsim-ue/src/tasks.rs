@@ -374,6 +374,36 @@ pub enum NasMessage {
         /// Timer ID
         timer_id: i32,
     },
+    /// Initiate PDU session establishment (from App)
+    InitiatePduSessionEstablishment {
+        /// PDU session ID
+        psi: u8,
+        /// Procedure transaction identity
+        pti: u8,
+        /// Session type (e.g., "IPv4", "IPv6", "IPv4v6")
+        session_type: String,
+        /// APN/DNN (optional)
+        apn: Option<String>,
+    },
+    /// Initiate PDU session release (from App)
+    InitiatePduSessionRelease {
+        /// PDU session ID
+        psi: u8,
+        /// Procedure transaction identity
+        pti: u8,
+    },
+    /// Initiate deregistration (from App)
+    InitiateDeregistration {
+        /// Deregistration cause
+        switch_off: bool,
+    },
+    /// Downlink data delivery (from NAS for data plane)
+    DownlinkDataDelivery {
+        /// PDU session ID
+        psi: i32,
+        /// User data
+        data: OctetString,
+    },
 }
 
 // ============================================================================

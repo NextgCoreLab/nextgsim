@@ -108,6 +108,8 @@ pub struct SctpAssociation {
     pending_transmits: VecDeque<Transmit>,
     event_tx: Option<mpsc::UnboundedSender<SctpEvent>>,
     config: SctpConfig,
+    /// Track streams that we've opened for sending (so we can also read responses from them)
+    opened_streams: Vec<u16>,
 }
 
 impl SctpAssociation {
@@ -169,6 +171,7 @@ impl SctpAssociation {
             pending_transmits: VecDeque::new(),
             event_tx: None,
             config,
+            opened_streams: Vec::new(),
         };
 
         // Perform handshake
@@ -320,9 +323,21 @@ impl SctpAssociation {
         }
 
         let ppi = PayloadProtocolIdentifier::from(ppid);
-        
-        let mut stream = self.association.open_stream(stream_id, ppi)
-            .map_err(|e| SctpError::StreamError(e.to_string()))?;
+
+        // Try to get existing stream first, otherwise open a new one
+        let mut stream = match self.association.stream(stream_id) {
+            Ok(s) => s,
+            Err(_) => {
+                // Open new stream and track it
+                let s = self.association.open_stream(stream_id, ppi)
+                    .map_err(|e| SctpError::StreamError(e.to_string()))?;
+                if !self.opened_streams.contains(&stream_id) {
+                    self.opened_streams.push(stream_id);
+                    debug!("Opened new stream {} (now tracking {} streams)", stream_id, self.opened_streams.len());
+                }
+                s
+            }
+        };
 
         stream.write_with_ppi(data, ppi)
             .map_err(|e| SctpError::StreamError(e.to_string()))?;
@@ -360,37 +375,86 @@ impl SctpAssociation {
         }
     }
 
+    /// Poll for incoming data - receives UDP packets and processes them
+    /// This MUST be called periodically to receive incoming SCTP data
+    pub async fn poll(&mut self) -> Result<()> {
+        if self.state == AssociationState::Closed {
+            return Ok(());
+        }
+
+        // Try to receive incoming UDP packets with a short timeout
+        let recv_timeout = Duration::from_millis(1);
+        match timeout(recv_timeout, self.handle_incoming()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // Only log real errors, not timeouts
+                if !matches!(e, SctpError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock) {
+                    trace!("Handle incoming error: {}", e);
+                }
+            }
+            Err(_) => {
+                // Timeout, no data available
+            }
+        }
+
+        // Process events
+        self.poll_events();
+
+        // Flush any pending transmits
+        self.flush_transmits().await?;
+
+        Ok(())
+    }
+
     /// Try to receive a message (non-blocking)
+    /// Note: You must call poll() first to receive incoming UDP packets
     pub fn try_recv(&mut self) -> Result<Option<ReceivedMessage>> {
         // Accept any incoming streams
-        while let Some(mut stream) = self.association.accept_stream() {
+        while let Some(stream) = self.association.accept_stream() {
             let stream_id = stream.stream_identifier();
             debug!("Accepted stream {}", stream_id);
+
+            // Track newly accepted streams for future reads
+            if !self.opened_streams.contains(&stream_id) {
+                self.opened_streams.push(stream_id);
+            }
 
             if let Some(tx) = &self.event_tx {
                 let _ = tx.send(SctpEvent::StreamOpened(stream_id));
             }
+        }
 
-            // Try to read from the stream
-            if let Ok(Some(chunks)) = stream.read() {
-                let ppid = match chunks.ppi { PayloadProtocolIdentifier::Dcep => 50, PayloadProtocolIdentifier::String => 51, PayloadProtocolIdentifier::Binary => 53, PayloadProtocolIdentifier::StringEmpty => 56, PayloadProtocolIdentifier::BinaryEmpty => 57, PayloadProtocolIdentifier::Unknown => NGAP_PPID, };
-                // Read all data from chunks into a buffer
-                let total_len = chunks.len();
-                if total_len > 0 {
-                    let mut buf = vec![0u8; total_len];
-                    if chunks.read(&mut buf).is_ok() {
-                        let msg = ReceivedMessage {
-                            stream_id,
-                            data: Bytes::from(buf),
-                            ppid,
-                        };
-                        debug!("Received {} bytes on stream {} with PPID {}", msg.data.len(), stream_id, msg.ppid);
+        // Check all tracked streams for incoming data
+        for &stream_id in &self.opened_streams.clone() {
+            if let Ok(mut stream) = self.association.stream(stream_id) {
+                // Try to read from the stream
+                if let Ok(Some(chunks)) = stream.read() {
+                    let ppid = match chunks.ppi {
+                        PayloadProtocolIdentifier::Dcep => 50,
+                        PayloadProtocolIdentifier::String => 51,
+                        PayloadProtocolIdentifier::Binary => 53,
+                        PayloadProtocolIdentifier::StringEmpty => 56,
+                        PayloadProtocolIdentifier::BinaryEmpty => 57,
+                        PayloadProtocolIdentifier::Unknown => NGAP_PPID,
+                    };
+                    // Read all data from chunks into a buffer
+                    let total_len = chunks.len();
+                    if total_len > 0 {
+                        let mut buf = vec![0u8; total_len];
+                        if chunks.read(&mut buf).is_ok() {
+                            let msg = ReceivedMessage {
+                                stream_id,
+                                data: Bytes::from(buf),
+                                ppid,
+                            };
+                            debug!("Received {} bytes on stream {} with PPID {}", msg.data.len(), stream_id, msg.ppid);
 
-                        if let Some(tx) = &self.event_tx {
-                            let _ = tx.send(SctpEvent::DataReceived(msg.clone()));
+                            if let Some(tx) = &self.event_tx {
+                                let _ = tx.send(SctpEvent::DataReceived(msg.clone()));
+                            }
+
+                            return Ok(Some(msg));
                         }
-
-                        return Ok(Some(msg));
                     }
                 }
             }

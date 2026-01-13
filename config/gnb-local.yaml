@@ -1,0 +1,27 @@
+# gNB Configuration for local testing (host machine)
+# AMF is running in Docker at 172.23.0.5:38412
+
+nci: 0x000000010
+gnb_id_length: 32
+
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+tac: 1
+
+nssai:
+  - sst: 1
+    sd: null
+
+amf_configs:
+  - address: 172.23.0.5
+    port: 38412
+
+# Local interfaces (running on host)
+link_ip: 127.0.0.1
+ngap_ip: 10.0.0.60
+gtp_ip: 127.0.0.1
+
+ignore_stream_ids: false

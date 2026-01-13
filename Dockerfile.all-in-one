@@ -1,0 +1,40 @@
+# nextgsim All-in-One Builder
+# Single builder that compiles all simulator binaries once
+
+ARG RUST_VERSION=1.85
+ARG DEBIAN_VERSION=bookworm
+
+# =============================================================================
+# Stage 1: Builder - Build ALL simulator binaries
+# =============================================================================
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+
+# Install build dependencies and rustfmt (needed for ASN.1 code generation)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    cmake \
+    libssl-dev \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add rustfmt
+
+WORKDIR /build
+
+# Copy nextgsim source
+COPY . ./
+
+# Build all binaries in release mode
+RUN cargo build --release --workspace
+
+# Strip debug symbols from all binaries
+RUN strip --strip-all target/release/nr-gnb target/release/nr-ue target/release/nr-cli
+
+# =============================================================================
+# Stage 2: Export binaries for use by runtime images
+# =============================================================================
+FROM scratch AS binaries
+COPY --from=builder /build/target/release/nr-gnb /
+COPY --from=builder /build/target/release/nr-ue /
+COPY --from=builder /build/target/release/nr-cli /

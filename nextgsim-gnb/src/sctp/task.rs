@@ -242,7 +242,7 @@ impl SctpTask {
 
         for client_id in client_ids {
             if let Some(connection) = self.connections.get_mut(&client_id) {
-                match connection.try_recv() {
+                match connection.try_recv().await {
                     Ok(Some(event)) => {
                         match event {
                             AmfConnectionEvent::MessageReceived { client_id, stream, data } => {
@@ -395,7 +395,7 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false,
+            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
         }
     }
 

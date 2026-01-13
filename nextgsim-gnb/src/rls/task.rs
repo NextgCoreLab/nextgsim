@@ -540,7 +540,7 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false,
+            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
         }
     }
 

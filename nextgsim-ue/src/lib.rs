@@ -39,7 +39,7 @@ pub use nas::sm::{
 };
 
 // Re-export RRC types
-pub use rrc::{RrcState, RrcStateMachine, RrcStateTransition, RrcStateError};
+pub use rrc::{RrcState, RrcStateMachine, RrcStateTransition, RrcStateError, RrcTask};
 
 // Re-export RLS types
 pub use rls::{RlsTask, RlsTaskConfig, DEFAULT_RLS_PORT};

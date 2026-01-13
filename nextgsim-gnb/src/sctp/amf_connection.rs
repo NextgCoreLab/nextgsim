@@ -215,12 +215,17 @@ impl AmfConnection {
     }
 
     /// Tries to receive a message without blocking
-    pub fn try_recv(&mut self) -> Result<Option<AmfConnectionEvent>, SctpError> {
+    /// This polls the underlying SCTP association for incoming UDP packets
+    pub async fn try_recv(&mut self) -> Result<Option<AmfConnectionEvent>, SctpError> {
         if self.state == AmfConnectionState::Closed {
             return Ok(None);
         }
 
         if let Some(ref mut association) = self.association {
+            // First poll for incoming UDP packets
+            association.poll().await?;
+
+            // Then try to receive any available messages
             match association.try_recv() {
                 Ok(Some(msg)) => {
                     debug!(

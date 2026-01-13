@@ -326,7 +326,7 @@ mod tests {
             ngap_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false,
+            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
         }
     }
 

@@ -58,6 +58,16 @@ pub struct GnbConfig {
     pub gtp_advertise_ip: Option<IpAddr>,
     /// Whether to ignore SCTP stream IDs
     pub ignore_stream_ids: bool,
+    /// UPF GTP-U address for data plane forwarding (if None, uses loopback mode)
+    #[serde(default)]
+    pub upf_addr: Option<IpAddr>,
+    /// UPF GTP-U port (default: 2152)
+    #[serde(default = "default_gtp_port")]
+    pub upf_port: u16,
+}
+
+fn default_gtp_port() -> u16 {
+    2152
 }
 
 impl GnbConfig {

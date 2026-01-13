@@ -5,7 +5,9 @@
 # This subscriber must be provisioned in nextgcore MongoDB
 
 # Subscription Permanent Identifier (IMSI format)
-supi: "imsi-999700000000001"
+supi:
+  supi_type: Imsi
+  value: "999700000000001"
 
 # SUCI Protection Scheme
 # 0: Null scheme (no protection)
@@ -58,8 +60,9 @@ supported_algs:
 
 # gNB addresses to search for (RLS protocol)
 # When running in Docker, use the gNB container hostname or IP
+# Note: Port is optional - defaults to 4997
 gnb_search_list:
-  - "127.0.0.1:4997"
+  - "172.23.0.100"
 
 # Default PDU sessions to establish after registration
 sessions:

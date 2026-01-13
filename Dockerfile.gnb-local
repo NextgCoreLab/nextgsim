@@ -1,0 +1,20 @@
+# nextgsim-gnb - 5G gNodeB Simulator (pre-built binary)
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY binaries/nr-gnb /usr/local/bin/
+
+RUN mkdir -p /etc/nextgsim
+WORKDIR /etc/nextgsim
+
+EXPOSE 38412/sctp
+EXPOSE 2152/udp
+EXPOSE 4997
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["nr-gnb"]
+CMD ["-c", "/etc/nextgsim/gnb.yaml"]

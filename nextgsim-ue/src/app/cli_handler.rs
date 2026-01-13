@@ -252,13 +252,17 @@ impl CliHandler {
 
     /// Handles the `info` command.
     fn handle_info(&self) -> (CliCommandResult, NasAction) {
-        // TODO: Get actual UE info from config/state
-        let info = format!(
-            "UE Information:\n  Active PDU Sessions: {:?}\n  Pending Procedures: {}",
-            self.active_sessions,
-            self.pt_manager.pending_count()
-        );
-        (CliCommandResult::ok(info), NasAction::None)
+        use crate::app::UeInfo;
+
+        let mut info = UeInfo::new();
+        // Copy active sessions
+        info.pdu_sessions = self.active_sessions.clone();
+        info.pending_procedures = self.pt_manager.pending_count();
+
+        match info.to_yaml() {
+            Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
+            Err(e) => (CliCommandResult::error(format!("Failed to serialize info: {}", e)), NasAction::None),
+        }
     }
 
     /// Handles the `status` command.
@@ -287,9 +291,31 @@ impl CliHandler {
 
     /// Handles the `timers` command.
     fn handle_timers(&self) -> (CliCommandResult, NasAction) {
-        // TODO: Get actual timer states
-        let timers = "Active Timers:\n  (Timer display not yet implemented)";
-        (CliCommandResult::ok(timers), NasAction::None)
+        use crate::app::{TimerInfo, TimersInfo};
+
+        let mut timers_info = TimersInfo::new();
+
+        // Add SM timer information from pending procedures
+        for pti in 1..=254u8 {
+            if let Some(pt) = self.pt_manager.get(pti) {
+                if pt.is_pending() {
+                    if let Some(timer) = pt.timer() {
+                        let timer_info = TimerInfo::new(
+                            timer.code(),
+                            format!("T{}", timer.code()),
+                            timer.is_running(),
+                            timer.expiry_count(),
+                        );
+                        timers_info.add_timer(timer_info);
+                    }
+                }
+            }
+        }
+
+        match timers_info.to_yaml() {
+            Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
+            Err(e) => (CliCommandResult::error(format!("Failed to serialize timers: {}", e)), NasAction::None),
+        }
     }
 
     /// Handles the `deregister` command.

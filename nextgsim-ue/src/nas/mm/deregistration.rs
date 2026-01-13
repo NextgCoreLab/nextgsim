@@ -552,8 +552,8 @@ struct CauseProcessingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Use the same Ie5gMmCause and MmCause as the main module (from messages::mm)
-    // These are re-exported at the crate root
+    use nextgsim_nas::Ie5gMmCause;
+    // Use the same MmCause as the main module (from messages::mm)
 
     #[test]
     fn test_deregistration_cause_display() {

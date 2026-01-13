@@ -302,6 +302,24 @@ pub enum NgapMessage {
         /// UE ID
         ue_id: i32,
     },
+    /// UE Context Release Request (from App for CLI-initiated release)
+    UeContextReleaseRequest {
+        /// UE ID
+        ue_id: i32,
+        /// Release cause
+        cause: UeReleaseRequestCause,
+    },
+}
+
+/// Cause for UE context release request.
+#[derive(Debug, Clone, Copy)]
+pub enum UeReleaseRequestCause {
+    /// User triggered (CLI command)
+    UserTriggered,
+    /// Radio link failure
+    RadioLinkFailure,
+    /// RAN originated release
+    RanOriginated,
 }
 
 /// GUTI mobile identity for S-TMSI.
@@ -1001,7 +1019,7 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false,
+            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
         }
     }
 

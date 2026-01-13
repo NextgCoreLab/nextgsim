@@ -297,6 +297,38 @@ impl RrcStateMachine {
         self.previous_state = None;
         self.transition_count = 0;
     }
+
+    /// Convenience method for RRC Setup (Idle -> Connected)
+    pub fn on_rrc_setup(&mut self) -> Result<RrcState, RrcStateError> {
+        self.transition(RrcStateTransition::SetupComplete)
+    }
+
+    /// Convenience method for RRC Release (Connected/Inactive -> Idle)
+    pub fn on_rrc_release(&mut self) -> Result<RrcState, RrcStateError> {
+        match self.state {
+            RrcState::Connected => self.transition(RrcStateTransition::Release),
+            RrcState::Inactive => self.transition(RrcStateTransition::ReleaseFromInactive),
+            RrcState::Idle => Ok(RrcState::Idle), // Already idle
+        }
+    }
+
+    /// Convenience method for RRC Suspend (Connected -> Inactive)
+    pub fn on_rrc_suspend(&mut self) -> Result<RrcState, RrcStateError> {
+        self.transition(RrcStateTransition::Suspend)
+    }
+
+    /// Convenience method for RRC Resume (Inactive -> Connected)
+    pub fn on_rrc_resume(&mut self) -> Result<RrcState, RrcStateError> {
+        self.transition(RrcStateTransition::Resume)
+    }
+
+    /// Convenience method for Radio Link Failure (-> Idle)
+    pub fn on_radio_link_failure(&mut self) -> Result<RrcState, RrcStateError> {
+        match self.state {
+            RrcState::Idle => Ok(RrcState::Idle), // Already idle
+            _ => self.transition(RrcStateTransition::RadioLinkFailure),
+        }
+    }
 }
 
 impl Default for RrcStateMachine {

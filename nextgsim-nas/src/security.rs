@@ -35,7 +35,7 @@
 
 use crate::enums::{ExtendedProtocolDiscriminator, SecurityHeaderType};
 use nextgsim_crypto::kdf::{derive_knas_enc, derive_knas_int, KEY_128_SIZE, KEY_256_SIZE};
-use nextgsim_crypto::nia::{nia2_compute_mac, nia3_compute_mac, KEY_SIZE, MAC_SIZE};
+use nextgsim_crypto::nia::{nia1_compute_mac, nia2_compute_mac, nia3_compute_mac, KEY_SIZE, MAC_SIZE};
 
 /// Security-protected NAS message header
 ///
@@ -1051,10 +1051,13 @@ pub fn compute_nas_mac(
             [0u8; MAC_SIZE]
         }
         IntegrityAlgorithm::Nia1 => {
-            // NIA1 (SNOW3G-based) - not yet implemented
-            // For now, return zero MAC as placeholder
-            // TODO: Implement NIA1 when SNOW3G integrity is added to crypto crate
-            [0u8; MAC_SIZE]
+            // NIA1 (SNOW3G-based)
+            // Build the message: SQN || Plain NAS message
+            let mut data = Vec::with_capacity(1 + plain_message.len());
+            data.push(sequence_number);
+            data.extend_from_slice(plain_message);
+
+            nia1_compute_mac(count.to_u32(), NAS_BEARER, direction as u8, key, &data)
         }
         IntegrityAlgorithm::Nia2 => {
             // NIA2 (AES-CMAC based)

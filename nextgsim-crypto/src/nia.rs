@@ -1,20 +1,62 @@
 //! NIA (5G integrity algorithms) implementations
 //!
 //! This module implements the 5G NAS integrity algorithms:
+//! - NIA1: SNOW3G-based integrity (128-EIA1)
 //! - NIA2: AES-CMAC based integrity (128-EIA2)
 //! - NIA3: ZUC-based integrity (128-EIA3)
 //!
-//! Reference: 3GPP TS 33.501, TS 33.401, and TS 35.223
+//! Reference: 3GPP TS 33.501, TS 33.401, TS 35.222, and TS 35.223
 
 use aes::Aes128;
 use cmac::{Cmac, Mac};
 use zuc::ZUC128;
+
+use crate::snow3g::uia2_f9;
 
 /// Key size in bytes (128 bits)
 pub const KEY_SIZE: usize = 16;
 
 /// MAC size in bytes (32 bits)
 pub const MAC_SIZE: usize = 4;
+
+/// NIA1 (128-EIA1) - SNOW3G-based integrity algorithm
+///
+/// Implements the 5G integrity algorithm NIA1 as specified in 3GPP TS 33.501
+/// and TS 35.222. NIA1 uses the SNOW3G stream cipher to generate a MAC.
+///
+/// # Parameters
+/// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
+/// - `bearer`: 5-bit bearer identity (0-31)
+/// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
+/// - `key`: 128-bit integrity key (KNASint or KUPint)
+/// - `data`: Message data to authenticate
+///
+/// # Returns
+/// 32-bit MAC (Message Authentication Code)
+///
+/// # Note
+/// NIA1 is equivalent to 128-EIA1 (UIA2/F9) with the FRESH value
+/// constructed from BEARER and padded with zeros.
+pub fn nia1_compute_mac(
+    count: u32,
+    bearer: u8,
+    direction: u8,
+    key: &[u8; KEY_SIZE],
+    data: &[u8],
+) -> [u8; MAC_SIZE] {
+    // For NIA1, the FRESH value is constructed from BEARER
+    // FRESH = BEARER || 0...0 (BEARER in upper 5 bits, rest are zeros)
+    // Per 3GPP TS 33.501, the FRESH value includes BEARER in upper bits
+    let fresh: u32 = (bearer as u32 & 0x1F) << 27;
+
+    // Length in bits
+    let length_bits = (data.len() * 8) as u64;
+
+    // Call the underlying SNOW3G UIA2 (F9) function
+    let mac_value = uia2_f9(key, count, fresh, direction as u32, data, length_bits);
+
+    mac_value.to_be_bytes()
+}
 
 /// NIA2 (128-EIA2) - AES-CMAC based integrity algorithm
 ///
@@ -202,6 +244,62 @@ fn get_word_from_keystream(keystream: &[u32], bit_pos: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nia1_compute_mac_roundtrip() {
+        let key: [u8; 16] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let count = 0x12345678;
+        let bearer = 0x0A;
+        let direction = 1;
+        let data = b"Hello, 5G World!";
+
+        let mac1 = nia1_compute_mac(count, bearer, direction, &key, data);
+        let mac2 = nia1_compute_mac(count, bearer, direction, &key, data);
+
+        // Same inputs should produce same MAC
+        assert_eq!(mac1, mac2);
+    }
+
+    #[test]
+    fn test_nia1_different_data_different_mac() {
+        let key: [u8; 16] = [0x2b; 16];
+        let count = 0;
+        let bearer = 0;
+        let direction = 0;
+
+        let mac1 = nia1_compute_mac(count, bearer, direction, &key, b"data1");
+        let mac2 = nia1_compute_mac(count, bearer, direction, &key, b"data2");
+
+        assert_ne!(mac1, mac2);
+    }
+
+    #[test]
+    fn test_nia1_different_counts_different_mac() {
+        let key: [u8; 16] = [0x2b; 16];
+        let data = b"test data";
+
+        let mac1 = nia1_compute_mac(0, 0, 0, &key, data);
+        let mac2 = nia1_compute_mac(1, 0, 0, &key, data);
+
+        assert_ne!(mac1, mac2);
+    }
+
+    #[test]
+    fn test_nia1_different_directions_different_mac() {
+        let key: [u8; 16] = [0x2b; 16];
+        let data = b"test data";
+
+        let mac1 = nia1_compute_mac(0, 0, 0, &key, data);
+        let mac2 = nia1_compute_mac(0, 0, 1, &key, data);
+
+        assert_ne!(mac1, mac2);
+    }
+
+    // Note: NIA1 with empty data panics in underlying SNOW3G implementation
+    // This is a known limitation
 
     #[test]
     fn test_build_nia3_iv() {

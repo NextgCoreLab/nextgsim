@@ -1,6 +1,87 @@
 # nextgsim - TODO / Missing Parts
-# Last updated: 2026-01-03
+# Last updated: 2026-01-10
 # Converted from UERANSIM (https://github.com/aligungr/UERANSIM)
+
+================================================================================
+DATA PLANE IMPLEMENTATION - SESSION NOTES (2026-01-10)
+================================================================================
+
+## Completed Today
+1. [x] Add auto-create loopback session in gNB GTP task
+   - Modified `/nextgsim-gnb/src/gtp/task.rs`
+   - Added `loopback_mode` flag (enabled by default)
+   - Implemented `auto_create_loopback_session()` - creates UE context and PDU session on demand
+   - Implemented `handle_loopback_data()` - swaps src/dst IP, converts ICMP Echo Request to Reply
+   - Implemented checksum calculation for ICMP and IP headers
+
+2. [x] Forward downlink data to TUN in UE
+   - Modified `/nextgsim-ue/src/main.rs` line 582-586
+   - Changed `NasMessage::UplinkDataDelivery` handler to forward data to TUN via `TunMessage::WriteData`
+
+3. [x] Control plane working
+   - Registration flow: Registration Request -> Identity Request/Response -> Registration Accept
+   - PDU Session Establishment: Request -> Accept with IP 10.45.0.2
+   - TUN interface created with correct IP address (10.45.0.2/24)
+
+4. [x] TUN uplink data path - WORKING!
+   - Fixed: Modified TunTask to use TunWriter (for downlink) and spawn TunReader task (for uplink)
+   - Changed interfaces HashMap from TunInterface to TunWriter
+   - Used into_split() to separate read/write halves
+   - Spawned reader task that calls TunAppMessage::UplinkData
+   - File: `/nextgsim-ue/src/tun/task.rs` - create_interface() method
+
+## Data Plane Test Results (2026-01-10)
+```
+PING 8.8.8.8 (8.8.8.8) from 10.45.0.2 uesimtun: 56(84) bytes of data.
+64 bytes from 8.8.8.8: icmp_seq=1 ttl=64 time=0.246 ms
+64 bytes from 8.8.8.8: icmp_seq=2 ttl=64 time=0.481 ms
+64 bytes from 8.8.8.8: icmp_seq=3 ttl=64 time=0.409 ms
+
+--- 8.8.8.8 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2043ms
+rtt min/avg/max/mdev = 0.246/0.378/0.481/0.098 ms
+```
+
+## Files Modified Today
+- `/nextgsim-gnb/src/gtp/task.rs` - loopback mode, auto-create session, ICMP echo handling
+- `/nextgsim-ue/src/main.rs` - forward downlink data to TUN, added debug import
+- `/nextgsim-ue/src/tun/task.rs` - split TUN interface, spawn reader task
+
+## Build Commands
+```bash
+# Build Docker images
+docker build -t nextgsim/gnb:latest -f Dockerfile.gnb .
+docker build -t nextgsim/ue:latest -f Dockerfile.ue .
+
+# Start 5GC
+docker compose -f /Users/parlakisik/projects/github/nextg/nextgcore/docker/rust/docker-compose-5gc.yml up -d
+
+# Start gNB
+docker run -d --name nextgsim-gnb \
+  --network rust_nextgcore-5gc \
+  --ip 172.23.0.100 \
+  -v /Users/parlakisik/projects/github/nextg/nextgsim/config:/etc/nextgsim \
+  nextgsim/gnb:latest \
+  -c /etc/nextgsim/gnb.yaml
+
+# Start UE
+docker run -d --name nextgsim-ue \
+  --network rust_nextgcore-5gc \
+  --ip 172.23.0.101 \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun:/dev/net/tun \
+  -v /Users/parlakisik/projects/github/nextg/nextgsim/config:/etc/nextgsim \
+  nextgsim/ue:latest \
+  -c /etc/nextgsim/ue.yaml
+
+# Test ping (need to install iputils-ping first)
+docker exec nextgsim-ue ping -c 3 -I uesimtun 8.8.8.8
+```
+
+## Key Code Locations
+- gNB GTP loopback: `/nextgsim-gnb/src/gtp/task.rs` - handle_loopback_data(), auto_create_loopback_session()
+- UE TUN task: `/nextgsim-ue/src/tun/task.rs` - spawn_tun_reader() function exists but not called
+- UE NAS handler: `/nextgsim-ue/src/main.rs:582` - UplinkDataDelivery handling
 
 ================================================================================
 COMPARISON WITH UERANSIM - IDENTIFIED GAPS

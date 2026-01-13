@@ -285,6 +285,8 @@ mod tests {
             gtp_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_advertise_ip: None,
             ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
         }
     }
 
@@ -440,6 +442,8 @@ link_ip: 127.0.0.1
 ngap_ip: 127.0.0.1
 gtp_ip: 127.0.0.1
 ignore_stream_ids: false
+upf_addr: null
+upf_port: 2152
 "#;
         let config = load_gnb_config_from_str(yaml).unwrap();
         assert_eq!(config.nci, 16);

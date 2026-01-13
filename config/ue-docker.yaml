@@ -1,0 +1,39 @@
+# UE Configuration for Docker Test
+# PLMN 999-70 (matches nextgcore AMF configuration)
+
+supi:
+  supi_type: Imsi
+  value: "999700000000001"
+
+protection_scheme: 0
+home_network_public_key_id: 0
+home_network_public_key: []
+routing_indicator: null
+
+hplmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+op_type: Opc
+amf: [0x80, 0x00]
+
+supported_algs:
+  nia1: true
+  nia2: true
+  nia3: true
+  nea1: true
+  nea2: true
+  nea3: true
+
+gnb_search_list:
+  - "172.23.0.100"
+
+sessions: []
+
+configured_nssai:
+  slices:
+    - sst: 1
+      sd: null
