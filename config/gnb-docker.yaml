@@ -1,0 +1,27 @@
+# gNB Configuration for Docker Test
+# PLMN 999-70 (matches nextgcore AMF configuration)
+
+nci: 0x000000010
+gnb_id_length: 32
+
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+tac: 1
+
+nssai:
+  - sst: 1
+    sd: null
+
+amf_configs:
+  - address: 172.23.0.5
+    port: 38412
+
+# IP addresses - use a fixed IP in the Docker network range
+link_ip: 172.23.0.100
+ngap_ip: 172.23.0.100
+gtp_ip: 172.23.0.100
+
+ignore_stream_ids: false

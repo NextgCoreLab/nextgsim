@@ -1,0 +1,58 @@
+[package]
+name = "nextgsim-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Internal crates
+nextgsim-common = { path = "../nextgsim-common" }
+nextgsim-crypto = { path = "../nextgsim-crypto" }
+nextgsim-nas = { path = "../nextgsim-nas" }
+nextgsim-ngap = { path = "../nextgsim-ngap" }
+nextgsim-rrc = { path = "../nextgsim-rrc" }
+nextgsim-rls = { path = "../nextgsim-rls" }
+nextgsim-gtp = { path = "../nextgsim-gtp" }
+nextgsim-sctp = { path = "../nextgsim-sctp" }
+nextgsim-gnb = { path = "../nextgsim-gnb" }
+nextgsim-ue = { path = "../nextgsim-ue" }
+
+# Async runtime
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Utilities
+bytes = "1"
+hex = "0.4"
+async-trait = "0.1"
+
+[lib]
+name = "integration_tests"
+path = "src/lib.rs"
+
+[[test]]
+name = "ue_registration"
+path = "src/ue_registration.rs"
+
+[[test]]
+name = "pdu_session"
+path = "src/pdu_session.rs"
+
+[[test]]
+name = "user_plane"
+path = "src/user_plane.rs"
+
+[[test]]
+name = "multi_ue"
+path = "src/multi_ue.rs"

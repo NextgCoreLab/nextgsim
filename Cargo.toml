@@ -1,0 +1,117 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "nextgsim-common",
+    "nextgsim-crypto",
+    "nextgsim-nas",
+    "nextgsim-ngap",
+    "nextgsim-rrc",
+    "nextgsim-rls",
+    "nextgsim-gtp",
+    "nextgsim-sctp",
+    "nextgsim-gnb",
+    "nextgsim-ue",
+    "nextgsim-cli",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["nextgsim contributors"]
+license = "GPL-3.0"
+repository = "https://github.com/nextgsim/nextgsim"
+description = "Pure Rust 5G UE and gNB simulator"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cryptography (pure Rust)
+aes = "0.8"
+ctr = "0.9"
+cmac = "0.7"
+sha2 = "0.10"
+hmac = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+zuc = "0.1"
+
+# Networking
+socket2 = "0.5"
+sctp-proto = "0.6"
+tun-rs = { version = "1", features = ["async_tokio"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Utilities
+bytes = "1"
+bitflags = "2"
+num_enum = "0.7"
+hex = "0.4"
+async-trait = "0.1"
+
+# ASN.1 PER codec (for NGAP/RRC)
+asn1-codecs = "0.7"
+asn1_codecs_derive = "0.7"
+bitvec = "1"
+log = "0.4"
+asn1-compiler = "0.7"
+
+# Internal crates
+nextgsim-common = { path = "nextgsim-common" }
+nextgsim-crypto = { path = "nextgsim-crypto" }
+nextgsim-nas = { path = "nextgsim-nas" }
+nextgsim-ngap = { path = "nextgsim-ngap" }
+nextgsim-rrc = { path = "nextgsim-rrc" }
+nextgsim-rls = { path = "nextgsim-rls" }
+nextgsim-gtp = { path = "nextgsim-gtp" }
+nextgsim-sctp = { path = "nextgsim-sctp" }
+nextgsim-gnb = { path = "nextgsim-gnb" }
+nextgsim-ue = { path = "nextgsim-ue" }
+nextgsim-cli = { path = "nextgsim-cli" }
+
+# Workspace-wide lint configuration
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Correctness - deny these as they indicate bugs
+enum_glob_use = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Style - enforce consistent code style
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+cloned_instead_of_copied = "warn"
+flat_map_option = "warn"
+
+# Complexity - keep code simple
+too_many_arguments = "warn"
+cognitive_complexity = "warn"
+
+# Performance - avoid unnecessary allocations
+unnecessary_to_owned = "warn"
+inefficient_to_string = "warn"
+
+# Pedantic - additional checks (selectively enabled)
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"

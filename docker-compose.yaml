@@ -1,0 +1,78 @@
+# nextgsim Docker Compose Configuration
+# Usage: docker compose up -d
+#
+# This configuration connects nextgsim (UE/gNB simulator) to nextgcore (5G Core)
+# The gNB connects to the nextgcore AMF at 172.23.0.5:38412 (from docker-compose-5gc.yml)
+
+version: '3.8'
+
+services:
+  # gNodeB Simulator
+  gnb:
+    build:
+      context: .
+      dockerfile: Dockerfile.gnb
+    container_name: nextgsim-gnb
+    hostname: gnb
+    volumes:
+      - ./config:/etc/nextgsim:ro
+      - gnb-logs:/var/log/nextgsim
+    command: ["-c", "/etc/nextgsim/gnb.yaml"]
+    ports:
+      - "4997:4997/udp"       # CLI
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.100
+    environment:
+      - RUST_LOG=info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug,nextgsim_gtp=debug
+    restart: unless-stopped
+
+  # UE Simulator
+  ue:
+    build:
+      context: .
+      dockerfile: Dockerfile.ue
+    container_name: nextgsim-ue
+    hostname: ue
+    volumes:
+      - ./config:/etc/nextgsim:ro
+      - ue-logs:/var/log/nextgsim
+    command: ["-c", "/etc/nextgsim/ue.yaml"]
+    ports:
+      - "4998:4998/udp"       # CLI
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.101
+    environment:
+      - RUST_LOG=info,nextgsim_ue=debug,nextgsim_nas=debug,nextgsim_rls=debug
+    depends_on:
+      - gnb
+    restart: unless-stopped
+
+  # CLI Tool (for interactive use)
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nextgsim-cli
+    entrypoint: ["/bin/bash"]
+    stdin_open: true
+    tty: true
+    networks:
+      - nextgcore-5gc
+    profiles:
+      - tools
+
+# Connect to the nextgcore-5gc network created by nextgcore's docker-compose-5gc.yml
+networks:
+  nextgcore-5gc:
+    external: true
+    name: rust_nextgcore-5gc
+
+volumes:
+  gnb-logs:
+  ue-logs:

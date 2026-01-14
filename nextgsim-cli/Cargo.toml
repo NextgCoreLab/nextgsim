@@ -1,0 +1,21 @@
+[package]
+name = "nextgsim-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI tool for nextgsim"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nr-cli"
+path = "src/main.rs"
+
+[dependencies]
+nextgsim-common.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

@@ -1,0 +1,16 @@
+# rustfmt configuration for nextgsim
+# Run with: cargo fmt
+
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+
+# Imports (stable options)
+reorder_imports = true
+reorder_modules = true
+
+# Misc (stable options)
+use_field_init_shorthand = true
+use_try_shorthand = true

@@ -1,0 +1,20 @@
+# nextgsim-ue - 5G UE Simulator (pre-built binary)
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    iputils-ping \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY binaries/nr-ue /usr/local/bin/
+
+RUN mkdir -p /etc/nextgsim
+WORKDIR /etc/nextgsim
+
+EXPOSE 4997
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["nr-ue"]
+CMD ["-c", "/etc/nextgsim/ue.yaml"]

@@ -1,0 +1,17 @@
+[package]
+name = "nextgsim-rls"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Radio Link Simulation protocol for nextgsim"
+
+[lints]
+workspace = true
+
+[dependencies]
+nextgsim-common.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

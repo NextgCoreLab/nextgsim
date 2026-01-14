@@ -1,0 +1,296 @@
+# nextgsim - TODO / Missing Parts
+# Last updated: 2026-01-10
+# Converted from UERANSIM (https://github.com/aligungr/UERANSIM)
+
+================================================================================
+DATA PLANE IMPLEMENTATION - SESSION NOTES (2026-01-10)
+================================================================================
+
+## Completed Today
+1. [x] Add auto-create loopback session in gNB GTP task
+   - Modified `/nextgsim-gnb/src/gtp/task.rs`
+   - Added `loopback_mode` flag (enabled by default)
+   - Implemented `auto_create_loopback_session()` - creates UE context and PDU session on demand
+   - Implemented `handle_loopback_data()` - swaps src/dst IP, converts ICMP Echo Request to Reply
+   - Implemented checksum calculation for ICMP and IP headers
+
+2. [x] Forward downlink data to TUN in UE
+   - Modified `/nextgsim-ue/src/main.rs` line 582-586
+   - Changed `NasMessage::UplinkDataDelivery` handler to forward data to TUN via `TunMessage::WriteData`
+
+3. [x] Control plane working
+   - Registration flow: Registration Request -> Identity Request/Response -> Registration Accept
+   - PDU Session Establishment: Request -> Accept with IP 10.45.0.2
+   - TUN interface created with correct IP address (10.45.0.2/24)
+
+4. [x] TUN uplink data path - WORKING!
+   - Fixed: Modified TunTask to use TunWriter (for downlink) and spawn TunReader task (for uplink)
+   - Changed interfaces HashMap from TunInterface to TunWriter
+   - Used into_split() to separate read/write halves
+   - Spawned reader task that calls TunAppMessage::UplinkData
+   - File: `/nextgsim-ue/src/tun/task.rs` - create_interface() method
+
+## Data Plane Test Results (2026-01-10)
+```
+PING 8.8.8.8 (8.8.8.8) from 10.45.0.2 uesimtun: 56(84) bytes of data.
+64 bytes from 8.8.8.8: icmp_seq=1 ttl=64 time=0.246 ms
+64 bytes from 8.8.8.8: icmp_seq=2 ttl=64 time=0.481 ms
+64 bytes from 8.8.8.8: icmp_seq=3 ttl=64 time=0.409 ms
+
+--- 8.8.8.8 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2043ms
+rtt min/avg/max/mdev = 0.246/0.378/0.481/0.098 ms
+```
+
+## Files Modified Today
+- `/nextgsim-gnb/src/gtp/task.rs` - loopback mode, auto-create session, ICMP echo handling
+- `/nextgsim-ue/src/main.rs` - forward downlink data to TUN, added debug import
+- `/nextgsim-ue/src/tun/task.rs` - split TUN interface, spawn reader task
+
+## Build Commands
+```bash
+# Build Docker images
+docker build -t nextgsim/gnb:latest -f Dockerfile.gnb .
+docker build -t nextgsim/ue:latest -f Dockerfile.ue .
+
+# Start 5GC
+docker compose -f /Users/parlakisik/projects/github/nextg/nextgcore/docker/rust/docker-compose-5gc.yml up -d
+
+# Start gNB
+docker run -d --name nextgsim-gnb \
+  --network rust_nextgcore-5gc \
+  --ip 172.23.0.100 \
+  -v /Users/parlakisik/projects/github/nextg/nextgsim/config:/etc/nextgsim \
+  nextgsim/gnb:latest \
+  -c /etc/nextgsim/gnb.yaml
+
+# Start UE
+docker run -d --name nextgsim-ue \
+  --network rust_nextgcore-5gc \
+  --ip 172.23.0.101 \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun:/dev/net/tun \
+  -v /Users/parlakisik/projects/github/nextg/nextgsim/config:/etc/nextgsim \
+  nextgsim/ue:latest \
+  -c /etc/nextgsim/ue.yaml
+
+# Test ping (need to install iputils-ping first)
+docker exec nextgsim-ue ping -c 3 -I uesimtun 8.8.8.8
+```
+
+## Key Code Locations
+- gNB GTP loopback: `/nextgsim-gnb/src/gtp/task.rs` - handle_loopback_data(), auto_create_loopback_session()
+- UE TUN task: `/nextgsim-ue/src/tun/task.rs` - spawn_tun_reader() function exists but not called
+- UE NAS handler: `/nextgsim-ue/src/main.rs:582` - UplinkDataDelivery handling
+
+================================================================================
+COMPARISON WITH UERANSIM - IDENTIFIED GAPS
+================================================================================
+
+## Critical Missing Components (from UERANSIM)
+
+### 1. RLC Layer - COMPLETELY MISSING
+- [ ] RLC AM (Acknowledged Mode) entity - handles retransmissions
+- [ ] RLC UM (Unacknowledged Mode) entity - for voice/video
+- [ ] RLC TM (Transparent Mode) entity - for signaling
+- [ ] RLC encoder/decoder
+- Impact: Required for proper PDCP/air interface operation
+
+### 2. UE NAS MM Procedures - ~70% Missing
+- [ ] access.cpp - Initial access procedures
+- [ ] auth.cpp - Authentication procedures (AKA/AKA')
+- [ ] config.cpp - Configuration management
+- [ ] ecall.cpp - Emergency call handling
+- [ ] identity.cpp - Identity procedures
+- [ ] messaging.cpp - UL/DL NAS transport
+- [ ] radio.cpp - Radio capability handling
+- [ ] slice.cpp - Network slice selection
+
+### 3. UE NAS SM Procedures - ~60% Missing
+- [ ] Full PDU session establishment flow
+- [ ] PDU session release handling
+- [ ] Resource allocation logic
+- [ ] SM procedure state machine
+
+### 4. UE RRC Layer - ~80% Missing
+- [ ] Measurement reporting
+- [ ] RRC handover
+- [ ] RRC re-establishment
+- [ ] Cell selection/reselection
+- [ ] System information processing
+
+### 5. gNB RRC Layer - Simplified
+- [ ] Full ASN.1-based RRC message encoding (currently uses placeholders)
+- [ ] Broadcast/system information handling
+- [ ] Proper message handlers
+
+================================================================================
+PHASE 9: TESTING AND HARDENING (In Progress)
+================================================================================
+
+## Task 9.1: Conformance Testing
+- [ ] Test with Open5GS core
+  - Set up Open5GS test environment (AMF, SMF, UPF)
+  - Test UE registration procedure end-to-end
+  - Test PDU session establishment
+  - Test user plane data flow
+  - Document any compatibility issues
+
+- [ ] Test with Free5GC core
+  - Set up Free5GC test environment
+  - Verify compatibility with Free5GC AMF/SMF/UPF
+  - Document any protocol differences
+
+## Task 9.2: Performance Testing
+- [ ] Benchmark message encoding/decoding throughput
+- [ ] Profile memory usage under load
+- [ ] Test with 100+ concurrent UEs
+- [ ] Measure latency for registration procedure
+- [ ] Measure latency for PDU session establishment
+
+## Task 9.3: Error Handling
+- [ ] Add comprehensive error recovery for SCTP disconnections
+- [ ] Implement retry logic for failed procedures
+- [ ] Add timeout handling for all NAS timers
+- [ ] Implement proper cleanup on abnormal termination
+
+
+================================================================================
+KNOWN LIMITATIONS / INCOMPLETE FEATURES
+================================================================================
+
+## Crypto
+- [x] SNOW3G: Implemented (needs more test vectors validation)
+- [x] ZUC: Using external crate, verify all edge cases
+- [x] NEA1/NEA2/NEA3: Implemented
+- [x] NIA1/NIA2/NIA3: Implemented
+- [x] ECIES: Implemented for SUPI concealment
+- [ ] Additional test vector validation needed
+
+## NAS Protocol
+- [x] Registration messages: Implemented
+- [x] Deregistration messages: Implemented
+- [x] Authentication messages: Implemented
+- [x] Security mode messages: Implemented
+- [x] PDU session establishment: Basic implementation
+- [ ] Some optional IEs not fully implemented
+- [ ] EAP-AKA' re-authentication not tested
+- [ ] Emergency registration not implemented
+- [ ] Configuration update handling incomplete
+
+## NGAP Protocol
+- [x] NG Setup: Implemented
+- [x] Initial UE Message: Implemented
+- [x] Initial Context Setup: Implemented
+- [x] PDU Session Resource: Implemented
+- [x] UE Context Release: Implemented
+- [x] Error Indication: Implemented
+- [ ] Handover procedures: Basic implementation only
+- [ ] Paging: Basic implementation, needs optimization
+- [ ] AMF load balancing not implemented
+
+## RRC Protocol
+- [x] RRC Setup: Basic implementation
+- [x] RRC Release: Basic implementation
+- [x] RRC Reconfiguration: Basic implementation
+- [ ] Measurement reporting: Basic implementation only
+- [ ] Handover: Not implemented
+- [ ] RRC re-establishment: Not implemented
+- [ ] Carrier aggregation: Not supported
+
+## GTP-U
+- [x] GTP-U header encoding/decoding
+- [x] Tunnel management
+- [ ] Extension headers: Basic support only
+- [ ] QoS flow handling: Simplified implementation
+- [ ] End marker handling: Basic implementation
+
+## SCTP
+- [x] SCTP association management
+- [ ] Multi-homing: Not implemented
+- [ ] Path MTU discovery: Not implemented
+- [ ] Bundling optimization: Not implemented
+
+## TUN Interface
+- [x] TUN interface creation and management
+- [x] IP packet read/write
+- [x] macOS compatibility (layer() method conditional)
+- [ ] IPv6 support: Not tested
+- [ ] Multiple PDU sessions: Basic support
+- [ ] Routing table cleanup on exit: May leave stale routes
+
+================================================================================
+RECENTLY COMPLETED
+================================================================================
+
+## 2026-01-03 - TUN Module Fixed
+- [x] Fixed TUN module compilation errors
+- [x] Updated tun-rs API usage (recv/send instead of read/write)
+- [x] Added is_valid_ip_packet function
+- [x] Fixed TunInterface::create to take PSI parameter
+- [x] Added macOS compatibility for layer() method
+- [x] Fixed ASN.1 schema paths in build.rs
+- [x] Copied ASN.1 files from UERANSIM
+
+================================================================================
+FUTURE ENHANCEMENTS
+================================================================================
+
+## High Priority
+- [ ] Add Prometheus metrics endpoint
+- [ ] Add OpenTelemetry tracing
+- [ ] Implement configuration hot-reload
+- [ ] Add REST API for control plane
+
+## Medium Priority
+- [ ] Web UI dashboard
+- [ ] PCAP capture integration
+- [ ] Wireshark dissector for RLS protocol
+- [ ] Support for multiple PLMNs
+
+## Low Priority
+- [ ] Support for NR-DC (Dual Connectivity)
+- [ ] Support for network slicing scenarios
+- [ ] Support for URLLC QoS profiles
+- [ ] Support for mMTC scenarios
+
+================================================================================
+DOCKER / DEPLOYMENT
+================================================================================
+
+## Docker
+- [ ] Add health check endpoints
+- [ ] Add Kubernetes manifests (Helm chart)
+- [ ] Add ARM64 multi-arch builds
+- [ ] Optimize image size (consider musl/alpine)
+
+## CI/CD
+- [ ] Add GitHub Actions workflow for Docker builds
+- [ ] Add automated release pipeline
+- [ ] Add integration test pipeline with Open5GS
+- [ ] Add security scanning (cargo audit, trivy)
+
+================================================================================
+DOCUMENTATION
+================================================================================
+
+- [ ] Add API documentation for each crate
+- [ ] Add sequence diagrams for procedures
+- [ ] Add troubleshooting guide
+- [ ] Add performance tuning guide
+- [ ] Add deployment guide for Kubernetes
+
+================================================================================
+ESTIMATED EFFORT FOR FULL UERANSIM PARITY
+================================================================================
+
+Based on the comparison with UERANSIM:
+- Current completion: ~40-50% of UERANSIM functionality
+- Estimated additional code: 20,000-30,000 lines of Rust
+
+Priority order for completion:
+1. RLC layer implementation (blocks air interface)
+2. UE NAS MM procedures (blocks registration)
+3. UE NAS SM procedures (blocks PDU sessions)
+4. UE RRC layer (mobility)
+5. gNB RRC improvements (proper encoding)

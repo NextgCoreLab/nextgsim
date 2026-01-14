@@ -1,0 +1,17 @@
+[package]
+name = "nextgsim-gtp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GTP-U protocol library for nextgsim"
+
+[lints]
+workspace = true
+
+[dependencies]
+nextgsim-common.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "nextgsim-ngap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NGAP protocol library for nextgsim"
+
+[lints]
+workspace = true
+
+[dependencies]
+nextgsim-common.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+asn1-codecs.workspace = true
+asn1_codecs_derive.workspace = true
+bitvec.workspace = true
+log.workspace = true
+
+[build-dependencies]
+asn1-compiler.workspace = true

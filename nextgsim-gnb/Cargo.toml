@@ -1,0 +1,39 @@
+[package]
+name = "nextgsim-gnb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "5G gNB (gNodeB) simulator binary"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nr-gnb"
+path = "src/main.rs"
+
+[lib]
+name = "nextgsim_gnb"
+path = "src/lib.rs"
+
+[dependencies]
+nextgsim-common.workspace = true
+nextgsim-crypto.workspace = true
+nextgsim-ngap.workspace = true
+nextgsim-rrc.workspace = true
+nextgsim-rls.workspace = true
+nextgsim-gtp.workspace = true
+nextgsim-sctp.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+async-trait = "0.1"
+thiserror.workspace = true
+serde_yaml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
