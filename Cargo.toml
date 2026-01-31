@@ -13,6 +13,14 @@ members = [
     "nextgsim-gnb",
     "nextgsim-ue",
     "nextgsim-cli",
+    "nextgsim-ai",
+    "nextgsim-she",
+    "nextgsim-nwdaf",
+    "nextgsim-nkef",
+    "nextgsim-isac",
+    "nextgsim-agent",
+    "nextgsim-fl",
+    "nextgsim-semantic",
     "tests",
 ]
 
@@ -85,6 +93,25 @@ nextgsim-sctp = { path = "nextgsim-sctp" }
 nextgsim-gnb = { path = "nextgsim-gnb" }
 nextgsim-ue = { path = "nextgsim-ue" }
 nextgsim-cli = { path = "nextgsim-cli" }
+
+# AI/ML crates (6G AI-native network functions)
+nextgsim-ai = { path = "nextgsim-ai" }
+nextgsim-she = { path = "nextgsim-she" }
+nextgsim-nwdaf = { path = "nextgsim-nwdaf" }
+nextgsim-nkef = { path = "nextgsim-nkef" }
+nextgsim-isac = { path = "nextgsim-isac" }
+nextgsim-agent = { path = "nextgsim-agent" }
+nextgsim-fl = { path = "nextgsim-fl" }
+nextgsim-semantic = { path = "nextgsim-semantic" }
+
+# ONNX Runtime for ML inference
+ort = { version = "2.0.0-rc.11", features = ["download-binaries"] }
+
+# ndarray for tensor operations
+ndarray = { version = "0.15", features = ["serde"] }
+
+# Half-precision floats
+half = { version = "2", features = ["serde"] }
 
 # Workspace-wide lint configuration
 [workspace.lints.rust]

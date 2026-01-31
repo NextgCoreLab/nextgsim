@@ -140,6 +140,19 @@ pub enum TaskId {
     Rls,
     /// SCTP task
     Sctp,
+    // 6G AI-native network function tasks
+    /// Service Hosting Environment (SHE) task
+    She,
+    /// Network Data Analytics Function (NWDAF) task
+    Nwdaf,
+    /// Network Knowledge Exposure Function (NKEF) task
+    Nkef,
+    /// Integrated Sensing and Communication (ISAC) task
+    Isac,
+    /// AI Agent Framework (AAF) task
+    Agent,
+    /// Federated Learning Aggregator task
+    FlAggregator,
 }
 
 impl std::fmt::Display for TaskId {
@@ -151,6 +164,12 @@ impl std::fmt::Display for TaskId {
             TaskId::Gtp => write!(f, "GTP"),
             TaskId::Rls => write!(f, "RLS"),
             TaskId::Sctp => write!(f, "SCTP"),
+            TaskId::She => write!(f, "SHE"),
+            TaskId::Nwdaf => write!(f, "NWDAF"),
+            TaskId::Nkef => write!(f, "NKEF"),
+            TaskId::Isac => write!(f, "ISAC"),
+            TaskId::Agent => write!(f, "Agent"),
+            TaskId::FlAggregator => write!(f, "FL"),
         }
     }
 }
@@ -605,6 +624,220 @@ pub enum SctpMessage {
 }
 
 // ============================================================================
+// AI/ML Task Messages (6G AI-native network functions)
+// ============================================================================
+
+/// Messages for the Service Hosting Environment (SHE) task.
+///
+/// SHE provides three-tier distributed compute: Local Edge, Regional Edge, Core Cloud.
+#[derive(Debug)]
+pub enum SheMessage {
+    /// Workload placement request
+    PlaceWorkload {
+        /// Workload identifier
+        workload_id: u64,
+        /// Required latency constraint (ms)
+        max_latency_ms: u32,
+        /// Required compute (FLOPS)
+        compute_flops: u64,
+        /// Required memory (bytes)
+        memory_bytes: u64,
+    },
+    /// Inference request
+    InferenceRequest {
+        /// Model identifier
+        model_id: String,
+        /// Request identifier for response correlation
+        request_id: u64,
+        /// Input data
+        input_data: Vec<f32>,
+    },
+    /// Resource status update
+    ResourceUpdate {
+        /// Node identifier
+        node_id: u32,
+        /// Available compute (FLOPS)
+        available_flops: u64,
+        /// Available memory (bytes)
+        available_memory: u64,
+    },
+}
+
+/// Messages for the Network Data Analytics Function (NWDAF) task.
+///
+/// NWDAF provides four-layer analytics with closed-loop automation per 3GPP TS 23.288.
+#[derive(Debug)]
+pub enum NwdafMessage {
+    /// UE measurement report for analytics
+    UeMeasurement {
+        /// UE identifier
+        ue_id: i32,
+        /// Serving cell RSRP (dBm)
+        rsrp: f32,
+        /// Serving cell RSRQ (dB)
+        rsrq: f32,
+        /// Position (x, y, z in meters)
+        position: (f32, f32, f32),
+    },
+    /// Cell load update
+    CellLoad {
+        /// Cell identifier
+        cell_id: i32,
+        /// PRB usage ratio (0.0 - 1.0)
+        prb_usage: f32,
+        /// Number of connected UEs
+        connected_ues: u32,
+    },
+    /// Trajectory prediction request
+    PredictTrajectory {
+        /// UE identifier
+        ue_id: i32,
+        /// Prediction horizon (ms)
+        horizon_ms: u32,
+    },
+    /// Handover optimization recommendation
+    HandoverRecommendation {
+        /// UE identifier
+        ue_id: i32,
+        /// Recommended target cell
+        target_cell: i32,
+        /// Confidence score (0.0 - 1.0)
+        confidence: f32,
+    },
+}
+
+/// Messages for the Network Knowledge Exposure Function (NKEF) task.
+///
+/// NKEF provides knowledge graphs and semantic search for LLM integration.
+#[derive(Debug)]
+pub enum NkefMessage {
+    /// Knowledge update
+    UpdateKnowledge {
+        /// Entity type
+        entity_type: String,
+        /// Entity identifier
+        entity_id: String,
+        /// Properties as key-value pairs
+        properties: Vec<(String, String)>,
+    },
+    /// Semantic query
+    SemanticQuery {
+        /// Query string
+        query: String,
+        /// Maximum results
+        max_results: u32,
+    },
+    /// RAG context retrieval
+    RetrieveContext {
+        /// Prompt for context retrieval
+        prompt: String,
+        /// Maximum context tokens
+        max_tokens: u32,
+    },
+}
+
+/// Messages for the Integrated Sensing and Communication (ISAC) task.
+///
+/// ISAC provides sensing-communication convergence per 3GPP TR 22.837.
+#[derive(Debug)]
+pub enum IsacMessage {
+    /// Sensing data from cell
+    SensingData {
+        /// Cell identifier
+        cell_id: i32,
+        /// Measurement type (ToA, TDoA, AoA, RSS, Doppler)
+        measurement_type: String,
+        /// Measurement values
+        measurements: Vec<f32>,
+    },
+    /// Position fusion request
+    FusionRequest {
+        /// UE identifier
+        ue_id: i32,
+        /// Data source identifiers
+        source_ids: Vec<u32>,
+    },
+    /// Tracking update
+    TrackingUpdate {
+        /// Object identifier
+        object_id: u64,
+        /// Position estimate (x, y, z)
+        position: (f32, f32, f32),
+        /// Velocity estimate (vx, vy, vz)
+        velocity: (f32, f32, f32),
+    },
+}
+
+/// Messages for the AI Agent Framework (AAF) task.
+///
+/// AAF provides multi-agent coordination with OAuth 2.0 authentication.
+#[derive(Debug)]
+pub enum AgentMessage {
+    /// Agent registration
+    RegisterAgent {
+        /// Agent identifier
+        agent_id: String,
+        /// Agent type
+        agent_type: String,
+        /// Capabilities
+        capabilities: Vec<String>,
+    },
+    /// Intent submission
+    SubmitIntent {
+        /// Agent identifier
+        agent_id: String,
+        /// Intent type
+        intent_type: String,
+        /// Intent parameters
+        parameters: Vec<(String, String)>,
+    },
+    /// Agent coordination event
+    CoordinationEvent {
+        /// Event type
+        event_type: String,
+        /// Participating agents
+        agent_ids: Vec<String>,
+    },
+}
+
+/// Messages for the Federated Learning Aggregator task.
+///
+/// FL provides privacy-preserving distributed training per 3GPP TR 23.700-80.
+#[derive(Debug)]
+pub enum FlAggregatorMessage {
+    /// Participant registration
+    RegisterParticipant {
+        /// Participant identifier
+        participant_id: String,
+        /// Device capabilities (FLOPS)
+        compute_capability: u64,
+    },
+    /// Model update from participant
+    SubmitUpdate {
+        /// Participant identifier
+        participant_id: String,
+        /// Round number
+        round: u64,
+        /// Gradient updates
+        gradients: Vec<f32>,
+        /// Number of local samples
+        num_samples: u64,
+    },
+    /// Trigger aggregation
+    Aggregate {
+        /// Round number
+        round: u64,
+    },
+    /// Distribute global model
+    DistributeModel {
+        /// Model version
+        version: u64,
+        /// Model weights
+        weights: Vec<f32>,
+    },
+}
+
+// ============================================================================
 // Task Handle
 // ============================================================================
 
@@ -817,6 +1050,13 @@ impl TaskManager {
             TaskId::Gtp,
             TaskId::Rls,
             TaskId::Sctp,
+            // 6G AI-native network function tasks
+            TaskId::She,
+            TaskId::Nwdaf,
+            TaskId::Nkef,
+            TaskId::Isac,
+            TaskId::Agent,
+            TaskId::FlAggregator,
         ] {
             task_states.insert(
                 task_id,

@@ -1,0 +1,40 @@
+[package]
+name = "nextgsim-ai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AI/ML inference infrastructure for nextgsim - 6G AI-native network functions"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Utilities
+async-trait = { workspace = true }
+
+# ONNX Runtime for ML inference
+ort = { workspace = true }
+
+# ndarray for tensor operations
+ndarray = { workspace = true }
+
+# Half-precision floats
+half = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
+
+[lints]
+workspace = true

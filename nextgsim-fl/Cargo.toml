@@ -1,0 +1,23 @@
+[package]
+name = "nextgsim-fl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Federated Learning Infrastructure - 3GPP TR 23.700-80 compliant distributed training for 6G networks"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+nextgsim-ai = { workspace = true }
+nextgsim-common = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

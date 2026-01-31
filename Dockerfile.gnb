@@ -21,6 +21,14 @@ COPY nextgsim-sctp ./nextgsim-sctp
 COPY nextgsim-gnb ./nextgsim-gnb
 COPY nextgsim-ue ./nextgsim-ue
 COPY nextgsim-cli ./nextgsim-cli
+COPY nextgsim-ai ./nextgsim-ai
+COPY nextgsim-she ./nextgsim-she
+COPY nextgsim-nwdaf ./nextgsim-nwdaf
+COPY nextgsim-nkef ./nextgsim-nkef
+COPY nextgsim-isac ./nextgsim-isac
+COPY nextgsim-agent ./nextgsim-agent
+COPY nextgsim-fl ./nextgsim-fl
+COPY nextgsim-semantic ./nextgsim-semantic
 COPY tests ./tests
 COPY tools ./tools
 
