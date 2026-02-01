@@ -1,6 +1,6 @@
 # nextgsim - Pure Rust 5G/6G UE and gNB Simulator
 
-A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulator with full 6G AI-native capabilities, converted from [UERANSIM](https://github.com/aligungr/UERANSIM). This implementation has **zero C library dependencies**.
+A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulator with full 6G AI-native capabilities, derived from the [UERANSIM](https://github.com/aligungr/UERANSIM). This implementation has **zero C library dependencies**.
 
 ## Features
 
