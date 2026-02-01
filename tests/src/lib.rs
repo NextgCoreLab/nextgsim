@@ -20,6 +20,7 @@
 pub mod mock_amf;
 pub mod test_fixtures;
 pub mod test_utils;
+pub mod ai_integration;
 
 pub use mock_amf::{MockAmf, MockAmfConfig, MockAmfEvent};
 pub use test_fixtures::{TestConfig, TestUeConfig, TestGnbConfig};

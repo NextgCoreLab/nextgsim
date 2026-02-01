@@ -17,6 +17,16 @@ nextgsim-sctp = { path = "../nextgsim-sctp" }
 nextgsim-gnb = { path = "../nextgsim-gnb" }
 nextgsim-ue = { path = "../nextgsim-ue" }
 
+# 6G AI-native network function crates
+nextgsim-ai = { path = "../nextgsim-ai" }
+nextgsim-she = { path = "../nextgsim-she" }
+nextgsim-nwdaf = { path = "../nextgsim-nwdaf" }
+nextgsim-nkef = { path = "../nextgsim-nkef" }
+nextgsim-isac = { path = "../nextgsim-isac" }
+nextgsim-agent = { path = "../nextgsim-agent" }
+nextgsim-fl = { path = "../nextgsim-fl" }
+nextgsim-semantic = { path = "../nextgsim-semantic" }
+
 # Async runtime
 tokio = { version = "1", features = ["full", "test-util"] }
 
@@ -56,3 +66,11 @@ path = "src/user_plane.rs"
 [[test]]
 name = "multi_ue"
 path = "src/multi_ue.rs"
+
+[[test]]
+name = "ai_integration"
+path = "src/ai_integration.rs"
+
+[[test]]
+name = "e2e_scenario"
+path = "src/e2e_scenario.rs"

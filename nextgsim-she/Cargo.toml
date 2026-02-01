@@ -1,0 +1,34 @@
+[package]
+name = "nextgsim-she"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Service Hosting Environment (SHE) - 3-tier distributed compute for 6G networks per 3GPP TS 23.558"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Utilities
+async-trait = { workspace = true }
+
+# Internal crates
+nextgsim-ai = { workspace = true }
+nextgsim-common = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

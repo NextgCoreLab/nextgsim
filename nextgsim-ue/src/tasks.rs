@@ -157,6 +157,20 @@ pub enum TaskId {
     Rrc,
     /// RLS task
     Rls,
+
+    // ========================================================================
+    // 6G AI-native network function tasks
+    // ========================================================================
+    /// SHE Client - Service Hosting Environment client for edge inference
+    SheClient,
+    /// NWDAF Reporter - Reports measurements and receives analytics
+    NwdafReporter,
+    /// ISAC Sensor - Integrated Sensing and Communication data collection
+    IsacSensor,
+    /// FL Participant - Federated Learning local training participant
+    FlParticipant,
+    /// Semantic Codec - Semantic communication encoder/decoder
+    SemanticCodec,
 }
 
 impl std::fmt::Display for TaskId {
@@ -166,6 +180,12 @@ impl std::fmt::Display for TaskId {
             TaskId::Nas => write!(f, "NAS"),
             TaskId::Rrc => write!(f, "RRC"),
             TaskId::Rls => write!(f, "RLS"),
+            // 6G AI-native network function tasks
+            TaskId::SheClient => write!(f, "SHE-Client"),
+            TaskId::NwdafReporter => write!(f, "NWDAF-Reporter"),
+            TaskId::IsacSensor => write!(f, "ISAC-Sensor"),
+            TaskId::FlParticipant => write!(f, "FL-Participant"),
+            TaskId::SemanticCodec => write!(f, "Semantic-Codec"),
         }
     }
 }
@@ -567,6 +587,493 @@ pub enum RlsMessage {
 
 
 // ============================================================================
+// 6G AI-native Network Function Messages (UE-side)
+// ============================================================================
+
+/// Messages for the SHE Client task.
+///
+/// Handles edge inference requests and workload offloading from the UE.
+#[derive(Debug)]
+pub enum SheClientMessage {
+    /// Request inference at the edge
+    InferenceRequest {
+        /// Model identifier
+        model_id: String,
+        /// Input tensor data (flattened)
+        input: Vec<f32>,
+        /// Input shape
+        input_shape: Vec<usize>,
+        /// Deadline in milliseconds (0 = no deadline)
+        deadline_ms: u32,
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<SheClientResponse>>,
+    },
+    /// Cancel pending inference request
+    CancelInference {
+        /// Request ID to cancel
+        request_id: u64,
+    },
+    /// Update available edge nodes
+    EdgeNodeUpdate {
+        /// List of available edge node addresses
+        nodes: Vec<std::net::SocketAddr>,
+    },
+    /// Offload computation to edge
+    OffloadComputation {
+        /// Computation type identifier
+        computation_type: String,
+        /// Input data
+        data: Vec<u8>,
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<SheClientResponse>>,
+    },
+}
+
+/// Response from SHE Client operations.
+#[derive(Debug)]
+pub enum SheClientResponse {
+    /// Inference completed successfully
+    InferenceResult {
+        /// Request ID
+        request_id: u64,
+        /// Output tensor data
+        output: Vec<f32>,
+        /// Output shape
+        output_shape: Vec<usize>,
+        /// Inference latency in milliseconds
+        latency_ms: u32,
+    },
+    /// Computation offload result
+    ComputationResult {
+        /// Result data
+        result: Vec<u8>,
+        /// Latency in milliseconds
+        latency_ms: u32,
+    },
+    /// Request failed
+    Error {
+        /// Error message
+        message: String,
+    },
+}
+
+/// Messages for the NWDAF Reporter task.
+///
+/// Reports UE measurements to NWDAF and receives analytics/predictions.
+#[derive(Debug)]
+pub enum NwdafReporterMessage {
+    /// Report radio measurement to NWDAF
+    ReportMeasurement {
+        /// Serving cell RSRP (dBm)
+        rsrp: f32,
+        /// Serving cell RSRQ (dB)
+        rsrq: f32,
+        /// Serving cell SINR (dB)
+        sinr: Option<f32>,
+        /// UE position (x, y, z) if available
+        position: Option<(f32, f32, f32)>,
+        /// UE velocity (vx, vy, vz) if available
+        velocity: Option<(f32, f32, f32)>,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Report neighbor cell measurements
+    ReportNeighborMeasurements {
+        /// List of neighbor measurements
+        neighbors: Vec<NeighborMeasurementReport>,
+    },
+    /// Request trajectory prediction
+    RequestTrajectoryPrediction {
+        /// Prediction horizon in milliseconds
+        horizon_ms: u32,
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<NwdafReporterResponse>>,
+    },
+    /// Receive handover recommendation from NWDAF
+    HandoverRecommendation {
+        /// Recommended target cell ID
+        target_cell_id: i32,
+        /// Confidence score (0.0 to 1.0)
+        confidence: f32,
+        /// Reason for recommendation
+        reason: String,
+    },
+    /// Update reporting configuration
+    UpdateReportingConfig {
+        /// Reporting interval in milliseconds
+        interval_ms: u32,
+        /// Enable position reporting
+        report_position: bool,
+        /// Enable velocity reporting
+        report_velocity: bool,
+    },
+}
+
+/// Neighbor cell measurement report.
+#[derive(Debug, Clone)]
+pub struct NeighborMeasurementReport {
+    /// Cell ID
+    pub cell_id: i32,
+    /// RSRP (dBm)
+    pub rsrp: f32,
+    /// RSRQ (dB)
+    pub rsrq: f32,
+}
+
+/// Response from NWDAF Reporter operations.
+#[derive(Debug)]
+pub enum NwdafReporterResponse {
+    /// Trajectory prediction result
+    TrajectoryPrediction {
+        /// Predicted waypoints (position, timestamp_ms)
+        waypoints: Vec<((f32, f32, f32), u64)>,
+        /// Confidence scores for each waypoint
+        confidence: Vec<f32>,
+    },
+    /// Analytics update
+    AnalyticsUpdate {
+        /// Analytics type
+        analytics_type: String,
+        /// Analytics data (JSON-encoded)
+        data: String,
+    },
+    /// Error response
+    Error {
+        /// Error message
+        message: String,
+    },
+}
+
+/// Messages for the ISAC Sensor task.
+///
+/// Collects sensing data for Integrated Sensing and Communication.
+#[derive(Debug)]
+pub enum IsacSensorMessage {
+    /// Start sensing with given configuration
+    StartSensing {
+        /// Sensing configuration
+        config: IsacSensingConfig,
+    },
+    /// Stop sensing
+    StopSensing,
+    /// Report sensing measurement
+    SensingMeasurement {
+        /// Measurement type
+        measurement_type: IsacMeasurementType,
+        /// Raw measurement data
+        data: Vec<f32>,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Request fused position estimate
+    RequestFusedPosition {
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<IsacSensorResponse>>,
+    },
+    /// Receive positioning update from network
+    PositioningUpdate {
+        /// Estimated position (x, y, z)
+        position: (f32, f32, f32),
+        /// Position uncertainty (meters)
+        uncertainty: f32,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+}
+
+/// ISAC sensing configuration.
+#[derive(Debug, Clone)]
+pub struct IsacSensingConfig {
+    /// Sensing mode
+    pub mode: IsacSensingMode,
+    /// Measurement interval in milliseconds
+    pub interval_ms: u32,
+    /// Enable ToA (Time of Arrival) measurements
+    pub enable_toa: bool,
+    /// Enable AoA (Angle of Arrival) measurements
+    pub enable_aoa: bool,
+    /// Enable Doppler measurements
+    pub enable_doppler: bool,
+}
+
+/// ISAC sensing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsacSensingMode {
+    /// Passive sensing (listen only)
+    Passive,
+    /// Active sensing (transmit and receive)
+    Active,
+    /// Cooperative sensing with network
+    Cooperative,
+}
+
+/// ISAC measurement type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsacMeasurementType {
+    /// Time of Arrival
+    ToA,
+    /// Angle of Arrival
+    AoA,
+    /// Doppler shift
+    Doppler,
+    /// Channel State Information
+    Csi,
+    /// Combined multi-path measurement
+    MultiPath,
+}
+
+/// Response from ISAC Sensor operations.
+#[derive(Debug)]
+pub enum IsacSensorResponse {
+    /// Fused position estimate
+    FusedPosition {
+        /// Position (x, y, z)
+        position: (f32, f32, f32),
+        /// Velocity (vx, vy, vz)
+        velocity: (f32, f32, f32),
+        /// Position uncertainty (meters)
+        position_uncertainty: f32,
+        /// Velocity uncertainty (m/s)
+        velocity_uncertainty: f32,
+        /// Confidence score (0.0 to 1.0)
+        confidence: f32,
+    },
+    /// Error response
+    Error {
+        /// Error message
+        message: String,
+    },
+}
+
+/// Messages for the FL Participant task.
+///
+/// Handles local model training and updates for Federated Learning.
+#[derive(Debug)]
+pub enum FlParticipantMessage {
+    /// Receive global model from aggregator
+    ReceiveGlobalModel {
+        /// Round number
+        round: u32,
+        /// Model weights (serialized)
+        weights: Vec<u8>,
+        /// Model version
+        version: String,
+    },
+    /// Start local training
+    StartTraining {
+        /// Training configuration
+        config: FlTrainingConfig,
+    },
+    /// Add training sample
+    AddTrainingSample {
+        /// Feature vector
+        features: Vec<f32>,
+        /// Label
+        label: Vec<f32>,
+    },
+    /// Submit local update to aggregator
+    SubmitUpdate {
+        /// Response channel for acknowledgment
+        response_tx: Option<tokio::sync::oneshot::Sender<FlParticipantResponse>>,
+    },
+    /// Abort current training round
+    AbortTraining {
+        /// Reason for abort
+        reason: String,
+    },
+    /// Get current training status
+    GetStatus {
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<FlParticipantResponse>>,
+    },
+}
+
+/// FL training configuration for local participant.
+#[derive(Debug, Clone)]
+pub struct FlTrainingConfig {
+    /// Number of local epochs
+    pub local_epochs: u32,
+    /// Batch size
+    pub batch_size: u32,
+    /// Learning rate
+    pub learning_rate: f32,
+    /// Enable differential privacy
+    pub enable_dp: bool,
+    /// Noise multiplier for DP
+    pub noise_multiplier: f32,
+    /// Gradient clipping threshold
+    pub max_grad_norm: f32,
+}
+
+impl Default for FlTrainingConfig {
+    fn default() -> Self {
+        Self {
+            local_epochs: 1,
+            batch_size: 32,
+            learning_rate: 0.01,
+            enable_dp: false,
+            noise_multiplier: 1.0,
+            max_grad_norm: 1.0,
+        }
+    }
+}
+
+/// Response from FL Participant operations.
+#[derive(Debug)]
+pub enum FlParticipantResponse {
+    /// Training completed, update ready
+    UpdateReady {
+        /// Round number
+        round: u32,
+        /// Model update weights (serialized)
+        weights: Vec<u8>,
+        /// Number of samples used
+        num_samples: u32,
+        /// Local loss after training
+        loss: f32,
+    },
+    /// Current training status
+    Status {
+        /// Current round
+        round: u32,
+        /// Current epoch within round
+        epoch: u32,
+        /// Number of samples processed
+        samples_processed: u32,
+        /// Current loss
+        loss: f32,
+        /// Is training active
+        is_training: bool,
+    },
+    /// Update submission acknowledged
+    Acknowledged {
+        /// Round number
+        round: u32,
+    },
+    /// Error response
+    Error {
+        /// Error message
+        message: String,
+    },
+}
+
+/// Messages for the Semantic Codec task.
+///
+/// Handles semantic encoding/decoding for task-oriented communication.
+#[derive(Debug)]
+pub enum SemanticCodecMessage {
+    /// Encode data for transmission
+    Encode {
+        /// Task type for encoding
+        task_type: SemanticTaskType,
+        /// Raw input data
+        data: Vec<f32>,
+        /// Data dimensions
+        dimensions: Vec<usize>,
+        /// Channel quality information
+        channel_quality: Option<ChannelQualityInfo>,
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<SemanticCodecResponse>>,
+    },
+    /// Decode received features
+    Decode {
+        /// Task type for decoding
+        task_type: SemanticTaskType,
+        /// Received semantic features
+        features: Vec<f32>,
+        /// Feature importance weights
+        importance: Vec<f32>,
+        /// Original dimensions
+        original_dims: Vec<usize>,
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<SemanticCodecResponse>>,
+    },
+    /// Update encoder model
+    UpdateEncoder {
+        /// Model path or identifier
+        model_id: String,
+    },
+    /// Update decoder model
+    UpdateDecoder {
+        /// Model path or identifier
+        model_id: String,
+    },
+    /// Set adaptive compression parameters
+    SetAdaptiveCompression {
+        /// Enable adaptive compression
+        enabled: bool,
+        /// Minimum quality threshold (0.0 to 1.0)
+        min_quality: f32,
+        /// Target compression ratio
+        target_compression: f32,
+    },
+}
+
+/// Semantic task type for encoding/decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticTaskType {
+    /// Image classification
+    ImageClassification,
+    /// Object detection
+    ObjectDetection,
+    /// Speech recognition
+    SpeechRecognition,
+    /// Sensor data fusion
+    SensorFusion,
+    /// Video analytics
+    VideoAnalytics,
+    /// Text understanding
+    TextUnderstanding,
+    /// Custom task with ID
+    Custom(u32),
+}
+
+/// Channel quality information for adaptive encoding.
+#[derive(Debug, Clone)]
+pub struct ChannelQualityInfo {
+    /// Signal-to-noise ratio (dB)
+    pub snr_db: f32,
+    /// Available bandwidth (kHz)
+    pub bandwidth_khz: f32,
+    /// Packet error rate
+    pub per: f32,
+}
+
+/// Response from Semantic Codec operations.
+#[derive(Debug)]
+pub enum SemanticCodecResponse {
+    /// Encoding completed
+    Encoded {
+        /// Semantic features
+        features: Vec<f32>,
+        /// Importance weights
+        importance: Vec<f32>,
+        /// Compression ratio achieved
+        compression_ratio: f32,
+    },
+    /// Decoding completed
+    Decoded {
+        /// Reconstructed data
+        data: Vec<f32>,
+        /// Reconstruction quality score (0.0 to 1.0)
+        quality: f32,
+    },
+    /// Task-specific output (for classification, detection, etc.)
+    TaskOutput {
+        /// Task result (interpretation depends on task type)
+        result: Vec<f32>,
+        /// Confidence score
+        confidence: f32,
+    },
+    /// Error response
+    Error {
+        /// Error message
+        message: String,
+    },
+}
+
+
+// ============================================================================
 // Task Handle
 // ============================================================================
 
@@ -756,7 +1263,18 @@ impl TaskManager {
 
         // Initialize task states
         let mut task_states = HashMap::new();
-        for task_id in [TaskId::App, TaskId::Nas, TaskId::Rrc, TaskId::Rls] {
+        for task_id in [
+            TaskId::App,
+            TaskId::Nas,
+            TaskId::Rrc,
+            TaskId::Rls,
+            // 6G AI-native network function tasks
+            TaskId::SheClient,
+            TaskId::NwdafReporter,
+            TaskId::IsacSensor,
+            TaskId::FlParticipant,
+            TaskId::SemanticCodec,
+        ] {
             task_states.insert(
                 task_id,
                 TaskInfo {
@@ -1099,6 +1617,12 @@ mod tests {
         assert_eq!(format!("{}", TaskId::Nas), "NAS");
         assert_eq!(format!("{}", TaskId::Rrc), "RRC");
         assert_eq!(format!("{}", TaskId::Rls), "RLS");
+        // 6G AI-native network function tasks
+        assert_eq!(format!("{}", TaskId::SheClient), "SHE-Client");
+        assert_eq!(format!("{}", TaskId::NwdafReporter), "NWDAF-Reporter");
+        assert_eq!(format!("{}", TaskId::IsacSensor), "ISAC-Sensor");
+        assert_eq!(format!("{}", TaskId::FlParticipant), "FL-Participant");
+        assert_eq!(format!("{}", TaskId::SemanticCodec), "Semantic-Codec");
     }
 
     #[tokio::test]
@@ -1112,6 +1636,12 @@ mod tests {
         assert_eq!(manager.get_task_state(TaskId::Nas), Some(TaskState::Created));
         assert_eq!(manager.get_task_state(TaskId::Rrc), Some(TaskState::Created));
         assert_eq!(manager.get_task_state(TaskId::Rls), Some(TaskState::Created));
+        // 6G AI-native network function tasks
+        assert_eq!(manager.get_task_state(TaskId::SheClient), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::NwdafReporter), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::IsacSensor), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::FlParticipant), Some(TaskState::Created));
+        assert_eq!(manager.get_task_state(TaskId::SemanticCodec), Some(TaskState::Created));
     }
 
     #[tokio::test]
@@ -1158,7 +1688,18 @@ mod tests {
         assert!(!manager.all_tasks_running());
 
         // Start all tasks
-        for task_id in [TaskId::App, TaskId::Nas, TaskId::Rrc, TaskId::Rls] {
+        for task_id in [
+            TaskId::App,
+            TaskId::Nas,
+            TaskId::Rrc,
+            TaskId::Rls,
+            // 6G AI-native network function tasks
+            TaskId::SheClient,
+            TaskId::NwdafReporter,
+            TaskId::IsacSensor,
+            TaskId::FlParticipant,
+            TaskId::SemanticCodec,
+        ] {
             manager.mark_task_started(task_id);
         }
 
@@ -1185,7 +1726,8 @@ mod tests {
         manager.mark_task_started(TaskId::Nas);
 
         let summary = manager.status_summary();
-        assert_eq!(summary.len(), 4);
+        // 4 core tasks + 5 AI tasks = 9 total
+        assert_eq!(summary.len(), 9);
 
         // Find App and Nas in summary
         let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);
