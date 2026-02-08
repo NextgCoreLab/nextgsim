@@ -88,7 +88,7 @@ pub fn parse_pdu_session_resource_setup_request(
         _ => {
             return Err(PduSessionResourceError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -294,7 +294,7 @@ pub fn parse_pdu_session_resource_setup_response(
         _ => {
             return Err(PduSessionResourceError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -400,7 +400,7 @@ pub fn parse_pdu_session_resource_release_command(
         _ => {
             return Err(PduSessionResourceError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -563,7 +563,7 @@ pub fn parse_pdu_session_resource_release_response(
         _ => {
             return Err(PduSessionResourceError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -656,7 +656,7 @@ pub fn parse_pdu_session_resource_modify_request(
         _ => {
             return Err(PduSessionResourceError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -852,7 +852,7 @@ pub fn parse_pdu_session_resource_modify_response(
         _ => {
             return Err(PduSessionResourceError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

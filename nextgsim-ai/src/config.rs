@@ -10,8 +10,10 @@ use std::path::PathBuf;
 ///
 /// Supports multiple hardware acceleration backends through ONNX Runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ExecutionProvider {
     /// CPU execution (default, always available)
+    #[default]
     Cpu,
     /// NVIDIA CUDA acceleration
     Cuda {
@@ -34,20 +36,15 @@ pub enum ExecutionProvider {
     },
 }
 
-impl Default for ExecutionProvider {
-    fn default() -> Self {
-        ExecutionProvider::Cpu
-    }
-}
 
 impl std::fmt::Display for ExecutionProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExecutionProvider::Cpu => write!(f, "CPU"),
-            ExecutionProvider::Cuda { device_id } => write!(f, "CUDA(device={})", device_id),
+            ExecutionProvider::Cuda { device_id } => write!(f, "CUDA(device={device_id})"),
             ExecutionProvider::CoreML => write!(f, "CoreML"),
-            ExecutionProvider::DirectML { device_id } => write!(f, "DirectML(device={})", device_id),
-            ExecutionProvider::TensorRT { device_id, .. } => write!(f, "TensorRT(device={})", device_id),
+            ExecutionProvider::DirectML { device_id } => write!(f, "DirectML(device={device_id})"),
+            ExecutionProvider::TensorRT { device_id, .. } => write!(f, "TensorRT(device={device_id})"),
         }
     }
 }
@@ -125,6 +122,7 @@ impl InferenceConfig {
 
 /// Graph optimization level for ONNX Runtime
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum GraphOptimizationLevel {
     /// No optimization
     None,
@@ -133,14 +131,10 @@ pub enum GraphOptimizationLevel {
     /// Extended optimizations
     Extended,
     /// All optimizations (default)
+    #[default]
     All,
 }
 
-impl Default for GraphOptimizationLevel {
-    fn default() -> Self {
-        GraphOptimizationLevel::All
-    }
-}
 
 /// Top-level AI configuration for the entire system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +324,11 @@ pub struct FlConfig {
     pub dp_noise_multiplier: f32,
     /// Clipping threshold for differential privacy
     pub dp_clipping_threshold: f32,
+    /// FedProx proximal term coefficient (mu). Controls how much local
+    /// models are penalised for deviating from the global model. Only
+    /// used when `aggregation_algorithm` is `FedProx`. Typical values
+    /// range from 0.001 to 1.0.
+    pub fedprox_mu: f32,
 }
 
 impl Default for FlConfig {
@@ -342,14 +341,17 @@ impl Default for FlConfig {
             enable_differential_privacy: false,
             dp_noise_multiplier: 1.0,
             dp_clipping_threshold: 1.0,
+            fedprox_mu: 0.01,
         }
     }
 }
 
 /// Federated learning aggregation algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum AggregationAlgorithm {
     /// Federated Averaging
+    #[default]
     FedAvg,
     /// Federated Proximal
     FedProx,
@@ -357,11 +359,6 @@ pub enum AggregationAlgorithm {
     SecAgg,
 }
 
-impl Default for AggregationAlgorithm {
-    fn default() -> Self {
-        AggregationAlgorithm::FedAvg
-    }
-}
 
 /// Semantic communication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

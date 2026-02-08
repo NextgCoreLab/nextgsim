@@ -31,7 +31,7 @@ impl BitString {
 
     /// Creates a `BitString` with pre-allocated capacity for the given number of bits.
     pub fn with_capacity(bits: usize) -> Self {
-        let bytes = (bits + 7) / 8;
+        let bytes = bits.div_ceil(8);
         Self {
             data: vec![0u8; bytes],
             bit_index: 0,
@@ -171,7 +171,7 @@ impl BitString {
     ///
     /// This is the ceiling of `bit_length() / 8`.
     pub fn octet_length(&self) -> usize {
-        (self.bit_index + 7) / 8
+        self.bit_index.div_ceil(8)
     }
 
     /// Returns a reference to the underlying byte data.
@@ -396,7 +396,7 @@ mod tests {
     fn test_display() {
         let mut bs = BitString::new();
         bs.write_bits(0b10110, 5);
-        assert_eq!(format!("{}", bs), "10110");
+        assert_eq!(format!("{bs}"), "10110");
     }
 
     #[test]

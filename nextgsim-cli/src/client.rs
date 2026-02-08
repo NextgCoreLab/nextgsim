@@ -45,7 +45,7 @@ impl CliClient {
         let node_name = node_name.into();
 
         // Bind to any available port on localhost
-        let socket = UdpSocket::bind(format!("{}:0", CMD_SERVER_IP))
+        let socket = UdpSocket::bind(format!("{CMD_SERVER_IP}:0"))
             .context("Failed to bind UDP socket")?;
 
         // Set receive timeout
@@ -53,7 +53,7 @@ impl CliClient {
             .set_read_timeout(Some(Duration::from_millis(CMD_RCV_TIMEOUT_MS)))
             .context("Failed to set socket timeout")?;
 
-        let target_addr: SocketAddr = format!("{}:{}", CMD_SERVER_IP, port)
+        let target_addr: SocketAddr = format!("{CMD_SERVER_IP}:{port}")
             .parse()
             .context("Failed to parse target address")?;
 

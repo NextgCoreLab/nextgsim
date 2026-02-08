@@ -168,15 +168,13 @@ pub fn validate_ue_config(config: &UeConfig) -> Result<(), ConfigValidationError
     for (i, addr) in config.gnb_search_list.iter().enumerate() {
         if addr.is_empty() {
             return Err(ConfigValidationError::InvalidGnbAddress(format!(
-                "gNB address {} is empty",
-                i
+                "gNB address {i} is empty"
             )));
         }
         // Try to parse as IP address or hostname
         if addr.parse::<std::net::IpAddr>().is_err() && !is_valid_hostname(addr) {
             return Err(ConfigValidationError::InvalidGnbAddress(format!(
-                "gNB address '{}' is not a valid IP address or hostname",
-                addr
+                "gNB address '{addr}' is not a valid IP address or hostname"
             )));
         }
     }
@@ -200,12 +198,10 @@ pub fn validate_ue_config(config: &UeConfig) -> Result<(), ConfigValidationError
     if let Some(ref supi) = config.supi {
         let supi_str = supi.to_string();
         // SUPI should be in format "imsi-XXXXXXXXXXXXXXX" (15 digits)
-        if supi_str.starts_with("imsi-") {
-            let digits = &supi_str[5..];
+        if let Some(digits) = supi_str.strip_prefix("imsi-") {
             if digits.len() != 15 || !digits.chars().all(|c| c.is_ascii_digit()) {
                 return Err(ConfigValidationError::InvalidSupi(format!(
-                    "IMSI '{}' must be exactly 15 digits",
-                    digits
+                    "IMSI '{digits}' must be exactly 15 digits"
                 )));
             }
         }
@@ -308,6 +304,7 @@ mod tests {
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
+            pqc_config: nextgsim_common::config::PqcConfig::default(),
         }
     }
 

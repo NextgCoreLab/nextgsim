@@ -39,7 +39,7 @@ mod tests {
     /// Convert bytes to hex string for debugging
     #[allow(dead_code)]
     fn bytes_to_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     // ========================================================================
@@ -89,7 +89,7 @@ mod tests {
         // Re-encode and verify
         let mut encoded = Vec::new();
         let msg = RegistrationRequest::new(
-            decoded.registration_type.clone(),
+            decoded.registration_type,
             decoded.ng_ksi,
             decoded.mobile_identity,
         );

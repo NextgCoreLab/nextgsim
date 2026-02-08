@@ -21,6 +21,16 @@ nextgsim-nas.workspace = true
 nextgsim-rrc.workspace = true
 nextgsim-rls.workspace = true
 nextgsim-gtp.workspace = true
+
+# 6G AI-native network function client crates (optional features for UE)
+nextgsim-she = { workspace = true, optional = true }
+nextgsim-nwdaf = { workspace = true, optional = true }
+nextgsim-nkef = { workspace = true, optional = true }
+nextgsim-isac = { workspace = true, optional = true }
+nextgsim-agent = { workspace = true, optional = true }
+nextgsim-fl = { workspace = true, optional = true }
+nextgsim-semantic = { workspace = true, optional = true }
+
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

@@ -310,7 +310,7 @@ pub fn parse_handover_required(
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -439,7 +439,7 @@ pub fn parse_handover_command(pdu: &NGAP_PDU) -> Result<HandoverCommandData, Han
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -562,7 +562,7 @@ pub fn parse_handover_preparation_failure(
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "UnsuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -632,7 +632,7 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -855,7 +855,7 @@ pub fn parse_handover_request_acknowledge(
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -1019,7 +1019,7 @@ pub fn parse_handover_failure(pdu: &NGAP_PDU) -> Result<HandoverFailureData, Han
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "UnsuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -1182,7 +1182,7 @@ pub fn parse_handover_notify(pdu: &NGAP_PDU) -> Result<HandoverNotifyData, Hando
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -1300,7 +1300,7 @@ pub fn parse_handover_cancel(pdu: &NGAP_PDU) -> Result<HandoverCancelData, Hando
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -1366,7 +1366,7 @@ pub fn parse_handover_cancel_acknowledge(
         _ => {
             return Err(HandoverError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

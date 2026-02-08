@@ -297,10 +297,10 @@ impl CellSelector {
     pub fn handle_signal_change(&mut self, cell_id: i32, dbm: i32) -> CellChangeEvent {
         let consider_lost = dbm < CELL_LOST_THRESHOLD_DBM;
 
-        if !self.cells.contains_key(&cell_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.cells.entry(cell_id) {
             if !consider_lost {
                 // New cell detected
-                self.cells.insert(cell_id, CellDescription::new(dbm));
+                e.insert(CellDescription::new(dbm));
                 tracing::debug!(
                     "New cell detected: cell_id={}, dbm={}, total_cells={}",
                     cell_id, dbm, self.cells.len()
@@ -402,7 +402,7 @@ impl CellSelector {
 
         let last_cell = self.current_cell.clone();
         let should_log_errors = last_cell.cell_id != 0 ||
-            self.last_failure_logged.map_or(true, |t| {
+            self.last_failure_logged.is_none_or(|t| {
                 t.elapsed() >= Duration::from_millis(CELL_SELECTION_LOG_INTERVAL_MS)
             });
 
@@ -642,8 +642,7 @@ impl CellSelector {
             }
 
             // Cell is acceptable
-            let matches_plmn = self.selected_plmn
-                .map_or(false, |plmn| cell.sib1.plmn == plmn);
+            let matches_plmn = self.selected_plmn == Some(cell.sib1.plmn);
             candidates.push((cell_id, cell.dbm, matches_plmn));
         }
 

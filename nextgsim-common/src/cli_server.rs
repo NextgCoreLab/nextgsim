@@ -259,7 +259,7 @@ pub struct CliServer {
 impl CliServer {
     /// Creates a new CLI server bound to localhost on a random port
     pub async fn new() -> std::io::Result<Self> {
-        let socket = TokioUdpSocket::bind(format!("{}:0", CMD_SERVER_IP)).await?;
+        let socket = TokioUdpSocket::bind(format!("{CMD_SERVER_IP}:0")).await?;
         let local_addr = socket.local_addr()?;
 
         Ok(Self {
@@ -272,7 +272,7 @@ impl CliServer {
 
     /// Creates a new CLI server bound to the specified port
     pub async fn with_port(port: u16) -> std::io::Result<Self> {
-        let socket = TokioUdpSocket::bind(format!("{}:{}", CMD_SERVER_IP, port)).await?;
+        let socket = TokioUdpSocket::bind(format!("{CMD_SERVER_IP}:{port}")).await?;
         let local_addr = socket.local_addr()?;
 
         Ok(Self {

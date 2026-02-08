@@ -51,15 +51,28 @@
 
 pub mod config;
 pub mod error;
+pub mod fl_training;
 pub mod inference;
+pub mod isac_pipeline;
 pub mod metrics;
 pub mod model;
+pub mod semantic_pipeline;
 pub mod tensor;
+pub mod tflite;
 
 // Re-export main types
 pub use config::{AiConfig, ExecutionProvider, InferenceConfig};
 pub use error::{AiError, InferenceError, ModelError};
+pub use fl_training::{FlError, FlParticipant, FlTrainer, ParticipantStatus, RoundResult};
 pub use inference::{InferenceEngine, OnnxEngine};
+pub use isac_pipeline::{
+    FusedSensingResult, IsacError, IsacPipeline, IsacPipelineBuilder, PositionEstimate,
+    SensingData,
+};
 pub use metrics::{InferenceMetrics, ModelMetrics};
 pub use model::{ModelInfo, ModelMetadata};
+pub use semantic_pipeline::{
+    SemanticDecoding, SemanticEncoding, SemanticError, SemanticPipeline, SemanticPipelineBuilder,
+};
 pub use tensor::{TensorData, TensorShape};
+pub use tflite::TfLiteEngine;

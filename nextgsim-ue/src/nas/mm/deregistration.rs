@@ -227,11 +227,10 @@ impl DeregistrationProcedure {
         self.last_cause = Some(cause);
 
         // Start T3521 for normal de-registration
-        if dereg_type.switch_off == SwitchOff::NormalDeRegistration {
-            if mm_state == MmState::Registered || mm_state == MmState::RegisteredInitiated {
+        if dereg_type.switch_off == SwitchOff::NormalDeRegistration
+            && (mm_state == MmState::Registered || mm_state == MmState::RegisteredInitiated) {
                 self.t3521.start(true);
             }
-        }
 
         Ok((request, MmSubState::DeregisteredInitiated))
     }

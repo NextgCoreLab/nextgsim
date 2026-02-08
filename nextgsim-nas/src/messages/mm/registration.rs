@@ -82,8 +82,7 @@ impl TryFrom<u8> for MobileIdentityType {
             0b110 => Ok(MobileIdentityType::MacAddress),
             0b111 => Ok(MobileIdentityType::Eui64),
             _ => Err(RegistrationError::InvalidIeValue(format!(
-                "Invalid mobile identity type: 0x{:02X}",
-                value
+                "Invalid mobile identity type: 0x{value:02X}"
             ))),
         }
     }
@@ -370,8 +369,7 @@ impl TryFrom<u8> for RegistrationResultValue {
             0b010 => Ok(RegistrationResultValue::NonThreeGppAccess),
             0b011 => Ok(RegistrationResultValue::ThreeGppAndNonThreeGppAccess),
             _ => Err(RegistrationError::InvalidIeValue(format!(
-                "Invalid registration result: 0x{:02X}",
-                value
+                "Invalid registration result: 0x{value:02X}"
             ))),
         }
     }
@@ -863,6 +861,7 @@ mod registration_accept_iei {
 ///
 /// 3GPP TS 24.501 Section 8.2.7
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct RegistrationAccept {
     /// 5GS registration result (mandatory, Type 4)
     pub registration_result: Ie5gsRegistrationResult,
@@ -896,27 +895,6 @@ pub struct RegistrationAccept {
     pub negotiated_drx_parameters: Option<u8>,
 }
 
-impl Default for RegistrationAccept {
-    fn default() -> Self {
-        Self {
-            registration_result: Ie5gsRegistrationResult::default(),
-            guti: None,
-            equivalent_plmns: None,
-            tai_list: None,
-            allowed_nssai: None,
-            rejected_nssai: None,
-            configured_nssai: None,
-            network_feature_support: None,
-            pdu_session_status: None,
-            pdu_session_reactivation_result: None,
-            t3512_value: None,
-            t3502_value: None,
-            eap_message: None,
-            nssai_inclusion_mode: None,
-            negotiated_drx_parameters: None,
-        }
-    }
-}
 
 impl RegistrationAccept {
     /// Create a new Registration Accept with mandatory fields
@@ -1263,6 +1241,7 @@ mod registration_reject_iei {
 ///
 /// 3GPP TS 24.501 Section 8.2.8
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct RegistrationReject {
     /// 5GMM cause (mandatory, Type 3)
     pub mm_cause: Ie5gMmCause,
@@ -1276,17 +1255,6 @@ pub struct RegistrationReject {
     pub rejected_nssai: Option<Vec<u8>>,
 }
 
-impl Default for RegistrationReject {
-    fn default() -> Self {
-        Self {
-            mm_cause: Ie5gMmCause::default(),
-            t3346_value: None,
-            t3502_value: None,
-            eap_message: None,
-            rejected_nssai: None,
-        }
-    }
-}
 
 impl RegistrationReject {
     /// Create a new Registration Reject with mandatory fields

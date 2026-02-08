@@ -145,7 +145,7 @@ fn normalize_imsi(imsi: &str) -> Result<String> {
     }
 
     if !normalized.chars().all(|c| c.is_ascii_digit()) {
-        bail!("Invalid IMSI '{}': must contain only digits", normalized);
+        bail!("Invalid IMSI '{normalized}': must contain only digits");
     }
 
     Ok(normalized)
@@ -154,10 +154,10 @@ fn normalize_imsi(imsi: &str) -> Result<String> {
 /// Loads and validates a UE configuration from a YAML file.
 fn load_ue_config(path: &str) -> Result<UeConfig> {
     let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read configuration file: {}", path))?;
+        .with_context(|| format!("Failed to read configuration file: {path}"))?;
 
     let config: UeConfig = serde_yaml::from_str(&contents)
-        .with_context(|| format!("Failed to parse configuration file: {}", path))?;
+        .with_context(|| format!("Failed to parse configuration file: {path}"))?;
 
     Ok(config)
 }
@@ -229,7 +229,7 @@ impl UeApp {
         let shutdown_rx = task_manager.shutdown_receiver();
 
         // Generate node name for CLI
-        let node_name = format!("ue{}", instance_id);
+        let node_name = format!("ue{instance_id}");
 
         // Spawn all tasks
         Self::spawn_tasks(
@@ -352,8 +352,8 @@ impl UeApp {
         use nextgsim_nas::ies::{Ie5gsRegistrationType, FollowOnRequest, RegistrationType};
         use nextgsim_nas::security::NasKeySetIdentifier;
         use nextgsim_nas::enums::{MmMessageType, SmMessageType};
-        use nextgsim_nas::header::PlainSmHeader;
-        use bytes::{Buf, BufMut};
+        
+        use bytes::BufMut;
 
         info!("NAS task started");
 
@@ -748,13 +748,12 @@ impl UeApp {
 
                             // Receiving a downlink RRC message means RRC connection is established
                             // Transition to Connected state if we're in Idle
-                            if rrc_state_machine.state().is_idle() {
-                                if rrc_state_machine.can_transition(RrcStateTransition::SetupComplete) {
+                            if rrc_state_machine.state().is_idle()
+                                && rrc_state_machine.can_transition(RrcStateTransition::SetupComplete) {
                                     let _ = rrc_state_machine.transition(RrcStateTransition::SetupComplete);
                                     info!("RRC state: {} -> {} (connection established)",
                                           RrcState::Idle, rrc_state_machine.state());
                                 }
-                            }
 
                             // Check if this is DL Information Transfer (0x04) which wraps NAS PDU
                             // Format: [0x04 (msg type), 0x00 (padding), 0x00 (padding), NAS PDU...]
@@ -898,7 +897,7 @@ fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
     let mnc_bytes: Vec<u8> = mnc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
 
     // MCC digit 2 (high nibble) | MCC digit 1 (low nibble)
-    let byte1 = (mcc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mcc_bytes.get(0).copied().unwrap_or(0xF);
+    let byte1 = (mcc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mcc_bytes.first().copied().unwrap_or(0xF);
     data.push(byte1);
 
     // MNC digit 3 (high nibble) | MCC digit 3 (low nibble)
@@ -908,7 +907,7 @@ fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
     data.push(byte2);
 
     // MNC digit 2 (high nibble) | MNC digit 1 (low nibble)
-    let byte3 = (mnc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mnc_bytes.get(0).copied().unwrap_or(0xF);
+    let byte3 = (mnc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mnc_bytes.first().copied().unwrap_or(0xF);
     data.push(byte3);
 
     // Routing indicator (4 digits in BCD, 2 bytes) - use 0000 for default
@@ -923,7 +922,7 @@ fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
     // MSIN digits in BCD pairs
     let msin_bytes: Vec<u8> = msin.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
     for chunk in msin_bytes.chunks(2) {
-        let low = chunk.get(0).copied().unwrap_or(0xF);
+        let low = chunk.first().copied().unwrap_or(0xF);
         let high = chunk.get(1).copied().unwrap_or(0xF);
         data.push((high << 4) | low);
     }
@@ -1063,11 +1062,11 @@ fn increment_imsi(imsi: &str, offset: u64) -> Result<String> {
 
     // Parse as u64 and increment
     let value: u64 = digits.parse()
-        .with_context(|| format!("Invalid IMSI format: {}", imsi))?;
+        .with_context(|| format!("Invalid IMSI format: {imsi}"))?;
     let new_value = value + offset;
 
     // Format back to 15 digits
-    Ok(format!("{:015}", new_value))
+    Ok(format!("{new_value:015}"))
 }
 
 #[cfg(test)]

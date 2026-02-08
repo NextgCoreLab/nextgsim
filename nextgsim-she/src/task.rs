@@ -285,7 +285,7 @@ impl SheTask {
             engine.infer(&input)
         } else {
             Err(nextgsim_ai::InferenceError::NotReady {
-                reason: format!("Model '{}' not loaded", model_id),
+                reason: format!("Model '{model_id}' not loaded"),
             })
         };
 
@@ -329,7 +329,7 @@ impl SheTask {
             engine.batch_infer(&inputs)
         } else {
             Err(nextgsim_ai::InferenceError::NotReady {
-                reason: format!("Model '{}' not loaded", model_id),
+                reason: format!("Model '{model_id}' not loaded"),
             })
         };
 
@@ -432,7 +432,7 @@ impl SheTask {
             }
         } else {
             SheResponse::Error {
-                message: format!("Workload {} not found", workload_id),
+                message: format!("Workload {workload_id} not found"),
             }
         };
 
@@ -467,7 +467,6 @@ impl Default for SheTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workload::WorkloadId;
 
     #[test]
     fn test_she_task_creation() {

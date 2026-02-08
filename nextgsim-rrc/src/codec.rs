@@ -47,7 +47,7 @@ pub enum RrcCodecError {
 pub fn encode_rrc<T: UperCodec>(msg: &T) -> Result<Vec<u8>, RrcCodecError> {
     let mut data = PerCodecData::new_uper();
     msg.uper_encode(&mut data)
-        .map_err(|e| RrcCodecError::EncodeError(format!("{:?}", e)))?;
+        .map_err(|e| RrcCodecError::EncodeError(format!("{e:?}")))?;
     Ok(data.into_bytes())
 }
 
@@ -61,7 +61,7 @@ pub fn encode_rrc<T: UperCodec>(msg: &T) -> Result<Vec<u8>, RrcCodecError> {
 /// * `Err(RrcCodecError)` - If decoding fails
 pub fn decode_rrc<T: UperCodec<Output = T>>(bytes: &[u8]) -> Result<T, RrcCodecError> {
     let mut data = PerCodecData::from_slice_uper(bytes);
-    T::uper_decode(&mut data).map_err(|e| RrcCodecError::DecodeError(format!("{:?}", e)))
+    T::uper_decode(&mut data).map_err(|e| RrcCodecError::DecodeError(format!("{e:?}")))
 }
 
 #[cfg(test)]

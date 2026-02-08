@@ -71,6 +71,13 @@ pub use ies::{
     IeDeRegistrationType, IeImeiSvRequest, IeMicoIndication, IeNasKeySetIdentifier,
     IeNetworkSlicingIndication, IeNssaiInclusionMode, IePayloadContainerType, IePduSessionType,
     IeRequestType, IeServiceType, IeSmsIndication, IeSscMode,
+    // Type 4 IEs (UE Security Capability - A2.9)
+    IeUeSecurityCapability, Ie4Error,
+    // Type 4 6G IEs (A2.12-A2.17)
+    IeAiMlCapability, IeIsacParameter, IeSemanticCommParameter,
+    IeSubThzBandParameter, IeNtnTimingAdvance, IeNtnAccessBarring,
+    // Type 6 IEs (LADN Information - A2.10)
+    IeLadnInformation, LadnEntry, Ie6Error,
 };
 pub use security::{
     CipheringAlgorithm, IntegrityAlgorithm, NasKeySetIdentifier, NasSecurityAlgorithms,
@@ -97,4 +104,8 @@ pub use messages::mm::{
     AuthenticationResult, EapMessage,
     // Status messages
     FiveGMmStatus, StatusError,
+    // Notification messages
+    Notification, NotificationResponse, NotificationError,
+    // NAS Transport messages
+    DlNasTransport, UlNasTransport, NasTransportError,
 };

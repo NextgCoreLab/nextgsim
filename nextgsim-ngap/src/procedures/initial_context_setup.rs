@@ -168,7 +168,7 @@ pub fn parse_initial_context_setup_request(
         _ => {
             return Err(InitialContextSetupError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -441,7 +441,7 @@ pub fn parse_initial_context_setup_response(
         _ => {
             return Err(InitialContextSetupError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -686,7 +686,7 @@ pub fn parse_initial_context_setup_failure(
         _ => {
             return Err(InitialContextSetupError::InvalidMessageType {
                 expected: "UnsuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

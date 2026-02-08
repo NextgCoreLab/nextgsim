@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The `long_mnc` field indicates whether the MNC uses 3 digits (true) or 2 digits (false).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Plmn {
     /// Mobile Country Code (3 digits, range 0-999)
     pub mcc: u16,
@@ -123,12 +124,505 @@ impl fmt::Display for Plmn {
     }
 }
 
-impl Default for Plmn {
+
+// ============================================================================
+// 6G ISAC (Integrated Sensing and Communication) Types
+// ============================================================================
+
+/// ISAC sensing measurement data captured from the environment.
+///
+/// Contains raw sensing data from ISAC operations including radar measurements,
+/// object detection, and environmental sensing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensingMeasurement {
+    /// Timestamp of the measurement (milliseconds since epoch)
+    pub timestamp_ms: u64,
+    /// Range to detected object (meters)
+    pub range_meters: f64,
+    /// Doppler velocity (m/s, positive = approaching)
+    pub velocity_mps: f64,
+    /// Azimuth angle (degrees, 0-360)
+    pub azimuth_deg: f64,
+    /// Elevation angle (degrees, -90 to +90)
+    pub elevation_deg: f64,
+    /// Signal strength (dBm)
+    pub signal_strength_dbm: f32,
+    /// Target ID (0 = unidentified)
+    pub target_id: u32,
+}
+
+impl SensingMeasurement {
+    /// Creates a new sensing measurement.
+    ///
+    /// # Arguments
+    /// * `timestamp_ms` - Timestamp in milliseconds since epoch
+    /// * `range_meters` - Range to target in meters
+    /// * `velocity_mps` - Velocity in meters per second
+    /// * `azimuth_deg` - Azimuth angle in degrees
+    /// * `elevation_deg` - Elevation angle in degrees
+    /// * `signal_strength_dbm` - Signal strength in dBm
+    pub fn new(
+        timestamp_ms: u64,
+        range_meters: f64,
+        velocity_mps: f64,
+        azimuth_deg: f64,
+        elevation_deg: f64,
+        signal_strength_dbm: f32,
+    ) -> Self {
+        Self {
+            timestamp_ms,
+            range_meters,
+            velocity_mps,
+            azimuth_deg,
+            elevation_deg,
+            signal_strength_dbm,
+            target_id: 0,
+        }
+    }
+
+    /// Returns true if this measurement represents a valid detection.
+    pub fn is_valid(&self) -> bool {
+        self.signal_strength_dbm > -120.0 && self.range_meters > 0.0
+    }
+}
+
+/// ISAC sensing configuration parameters.
+///
+/// Defines operational parameters for integrated sensing and communication,
+/// including sensing mode, bandwidth, and detection thresholds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensingConfig {
+    /// Whether ISAC sensing is enabled
+    pub enabled: bool,
+    /// Sensing mode (0=passive, 1=active radar, 2=hybrid)
+    pub mode: u8,
+    /// Sensing bandwidth in MHz
+    pub bandwidth_mhz: u32,
+    /// Maximum sensing range in meters
+    pub max_range_meters: f64,
+    /// Minimum detection threshold in dBm
+    pub detection_threshold_dbm: f32,
+    /// Sensing interval in milliseconds
+    pub sensing_interval_ms: u32,
+}
+
+impl SensingConfig {
+    /// Creates a new sensing configuration.
+    pub fn new(mode: u8, bandwidth_mhz: u32, max_range_meters: f64) -> Self {
+        Self {
+            enabled: true,
+            mode,
+            bandwidth_mhz,
+            max_range_meters,
+            detection_threshold_dbm: -100.0,
+            sensing_interval_ms: 100,
+        }
+    }
+}
+
+impl Default for SensingConfig {
     fn default() -> Self {
         Self {
-            mcc: 0,
-            mnc: 0,
-            long_mnc: false,
+            enabled: false,
+            mode: 0,
+            bandwidth_mhz: 100,
+            max_range_meters: 1000.0,
+            detection_threshold_dbm: -100.0,
+            sensing_interval_ms: 100,
+        }
+    }
+}
+
+/// ISAC sensing result containing processed detection information.
+///
+/// Aggregates multiple measurements into a coherent result with
+/// statistical confidence and classification information.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensingResult {
+    /// Timestamp of result generation
+    pub timestamp_ms: u64,
+    /// Number of detections in this result
+    pub detection_count: u32,
+    /// Individual measurements
+    pub measurements: Vec<SensingMeasurement>,
+    /// Confidence level (0.0-1.0)
+    pub confidence: f32,
+    /// Object classification (0=unknown, 1=person, 2=vehicle, 3=drone, etc.)
+    pub classification: u8,
+}
+
+impl SensingResult {
+    /// Creates a new sensing result.
+    pub fn new(timestamp_ms: u64, measurements: Vec<SensingMeasurement>) -> Self {
+        let detection_count = measurements.len() as u32;
+        Self {
+            timestamp_ms,
+            detection_count,
+            measurements,
+            confidence: 0.0,
+            classification: 0,
+        }
+    }
+}
+
+// ============================================================================
+// 6G Semantic Communication Types
+// ============================================================================
+
+/// Modality type for semantic communication.
+///
+/// Specifies the type of data being transmitted in semantic communication
+/// to optimize encoding and compression strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum ModalityType {
+    /// Text/linguistic data
+    #[default]
+    Text,
+    /// Image/visual data
+    Image,
+    /// Audio/speech data
+    Audio,
+    /// Video data
+    Video,
+    /// Sensor telemetry
+    Sensor,
+    /// Mixed/multimodal data
+    Mixed,
+}
+
+
+impl fmt::Display for ModalityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModalityType::Text => write!(f, "text"),
+            ModalityType::Image => write!(f, "image"),
+            ModalityType::Audio => write!(f, "audio"),
+            ModalityType::Video => write!(f, "video"),
+            ModalityType::Sensor => write!(f, "sensor"),
+            ModalityType::Mixed => write!(f, "mixed"),
+        }
+    }
+}
+
+/// Compression level for semantic encoding.
+///
+/// Defines the trade-off between bandwidth efficiency and information fidelity
+/// in semantic communication systems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum CompressionLevel {
+    /// No compression, preserve all information
+    None,
+    /// Low compression, minimal information loss
+    Low,
+    /// Medium compression, balanced trade-off
+    #[default]
+    Medium,
+    /// High compression, aggressive semantic extraction
+    High,
+    /// Maximum compression, only essential semantics
+    Maximum,
+}
+
+
+impl fmt::Display for CompressionLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompressionLevel::None => write!(f, "none"),
+            CompressionLevel::Low => write!(f, "low"),
+            CompressionLevel::Medium => write!(f, "medium"),
+            CompressionLevel::High => write!(f, "high"),
+            CompressionLevel::Maximum => write!(f, "maximum"),
+        }
+    }
+}
+
+/// Semantic communication profile and metadata.
+///
+/// Contains metadata describing the semantic content, encoding parameters,
+/// and quality requirements for semantic communication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticProfile {
+    /// Modality of the content
+    pub modality: ModalityType,
+    /// Compression level
+    pub compression: CompressionLevel,
+    /// Semantic importance score (0.0-1.0, higher = more important)
+    pub importance: f32,
+    /// Context identifier for semantic understanding
+    pub context_id: u32,
+    /// Expected latency budget in milliseconds
+    pub latency_budget_ms: u32,
+    /// Minimum acceptable quality (0.0-1.0)
+    pub min_quality: f32,
+}
+
+impl SemanticProfile {
+    /// Creates a new semantic profile.
+    pub fn new(modality: ModalityType, compression: CompressionLevel, importance: f32) -> Self {
+        Self {
+            modality,
+            compression,
+            importance: importance.clamp(0.0, 1.0),
+            context_id: 0,
+            latency_budget_ms: 100,
+            min_quality: 0.7,
+        }
+    }
+}
+
+impl Default for SemanticProfile {
+    fn default() -> Self {
+        Self {
+            modality: ModalityType::default(),
+            compression: CompressionLevel::default(),
+            importance: 0.5,
+            context_id: 0,
+            latency_budget_ms: 100,
+            min_quality: 0.7,
+        }
+    }
+}
+
+// ============================================================================
+// 6G Federated Learning Types
+// ============================================================================
+
+/// Federated learning model identifier.
+///
+/// Uniquely identifies a machine learning model in federated learning operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelId(pub u64);
+
+impl ModelId {
+    /// Creates a new model ID.
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Returns the raw ID value.
+    pub const fn value(&self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "model-{:016x}", self.0)
+    }
+}
+
+/// Federated learning model version.
+///
+/// Tracks version evolution of ML models through training rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ModelVersion {
+    /// Major version number
+    pub major: u32,
+    /// Minor version number
+    pub minor: u32,
+    /// Patch version number
+    pub patch: u32,
+}
+
+impl ModelVersion {
+    /// Creates a new model version.
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl Default for ModelVersion {
+    fn default() -> Self {
+        Self::new(0, 0, 0)
+    }
+}
+
+impl fmt::Display for ModelVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Federated learning training round identifier.
+///
+/// Identifies a specific training round in the federated learning process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TrainingRound(pub u64);
+
+impl TrainingRound {
+    /// Creates a new training round identifier.
+    pub const fn new(round: u64) -> Self {
+        Self(round)
+    }
+
+    /// Returns the round number.
+    pub const fn value(&self) -> u64 {
+        self.0
+    }
+
+    /// Increments to the next round.
+    pub fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl fmt::Display for TrainingRound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "round-{}", self.0)
+    }
+}
+
+// ============================================================================
+// 6G Split-Hybrid Edge (SHE) Computing Types
+// ============================================================================
+
+/// Accelerator type for edge computing.
+///
+/// Specifies the type of hardware accelerator available or required
+/// for computational offloading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum AcceleratorType {
+    /// No specific accelerator required
+    None,
+    /// GPU acceleration
+    Gpu,
+    /// TPU (Tensor Processing Unit)
+    Tpu,
+    /// FPGA (Field-Programmable Gate Array)
+    Fpga,
+    /// NPU (Neural Processing Unit)
+    Npu,
+    /// General purpose CPU
+    #[default]
+    Cpu,
+}
+
+
+impl fmt::Display for AcceleratorType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AcceleratorType::None => write!(f, "none"),
+            AcceleratorType::Gpu => write!(f, "gpu"),
+            AcceleratorType::Tpu => write!(f, "tpu"),
+            AcceleratorType::Fpga => write!(f, "fpga"),
+            AcceleratorType::Npu => write!(f, "npu"),
+            AcceleratorType::Cpu => write!(f, "cpu"),
+        }
+    }
+}
+
+/// Placement constraint for compute offloading.
+///
+/// Defines constraints on where computation can be executed in the network.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlacementConstraint {
+    /// Maximum latency budget in milliseconds
+    pub max_latency_ms: u32,
+    /// Required accelerator type
+    pub required_accelerator: AcceleratorType,
+    /// Minimum required memory in MB
+    pub min_memory_mb: u32,
+    /// Minimum required compute capacity (arbitrary units)
+    pub min_compute_units: u32,
+    /// Whether data locality is required
+    pub data_locality_required: bool,
+    /// Allowed deployment zones (empty = no restriction)
+    pub allowed_zones: Vec<String>,
+}
+
+impl PlacementConstraint {
+    /// Creates a new placement constraint with basic parameters.
+    pub fn new(max_latency_ms: u32, required_accelerator: AcceleratorType) -> Self {
+        Self {
+            max_latency_ms,
+            required_accelerator,
+            min_memory_mb: 0,
+            min_compute_units: 0,
+            data_locality_required: false,
+            allowed_zones: Vec::new(),
+        }
+    }
+}
+
+impl Default for PlacementConstraint {
+    fn default() -> Self {
+        Self {
+            max_latency_ms: 1000,
+            required_accelerator: AcceleratorType::default(),
+            min_memory_mb: 0,
+            min_compute_units: 0,
+            data_locality_required: false,
+            allowed_zones: Vec::new(),
+        }
+    }
+}
+
+/// Compute request for edge offloading.
+///
+/// Describes a computational task to be offloaded to edge computing resources.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputeRequest {
+    /// Unique request identifier
+    pub request_id: u64,
+    /// Task type identifier
+    pub task_type: String,
+    /// Estimated workload (in compute units)
+    pub workload_units: u64,
+    /// Placement constraints
+    pub constraints: PlacementConstraint,
+    /// Input data size in bytes
+    pub input_size_bytes: u64,
+    /// Expected output data size in bytes
+    pub output_size_bytes: u64,
+    /// Priority level (0=lowest, 255=highest)
+    pub priority: u8,
+}
+
+impl ComputeRequest {
+    /// Creates a new compute request.
+    pub fn new(request_id: u64, task_type: String, workload_units: u64) -> Self {
+        Self {
+            request_id,
+            task_type,
+            workload_units,
+            constraints: PlacementConstraint::default(),
+            input_size_bytes: 0,
+            output_size_bytes: 0,
+            priority: 128,
+        }
+    }
+}
+
+/// Compute descriptor for SHE operations.
+///
+/// Describes the computational characteristics and requirements of an offloaded task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputeDescriptor {
+    /// Compute request details
+    pub request: ComputeRequest,
+    /// Timestamp of request creation (milliseconds since epoch)
+    pub timestamp_ms: u64,
+    /// Session ID for tracking
+    pub session_id: u64,
+    /// Whether this is a real-time request
+    pub real_time: bool,
+}
+
+impl ComputeDescriptor {
+    /// Creates a new compute descriptor.
+    pub fn new(request: ComputeRequest, session_id: u64) -> Self {
+        Self {
+            request,
+            timestamp_ms: 0,
+            session_id,
+            real_time: false,
         }
     }
 }
@@ -208,25 +702,25 @@ mod tests {
     #[test]
     fn test_plmn_display_2digit() {
         let plmn = Plmn::new(310, 41, false);
-        assert_eq!(format!("{}", plmn), "31041");
+        assert_eq!(format!("{plmn}"), "31041");
     }
 
     #[test]
     fn test_plmn_display_3digit() {
         let plmn = Plmn::new(310, 410, true);
-        assert_eq!(format!("{}", plmn), "310410");
+        assert_eq!(format!("{plmn}"), "310410");
     }
 
     #[test]
     fn test_plmn_debug_2digit() {
         let plmn = Plmn::new(310, 41, false);
-        assert_eq!(format!("{:?}", plmn), "Plmn(310-41)");
+        assert_eq!(format!("{plmn:?}"), "Plmn(310-41)");
     }
 
     #[test]
     fn test_plmn_debug_3digit() {
         let plmn = Plmn::new(310, 410, true);
-        assert_eq!(format!("{:?}", plmn), "Plmn(310-410)");
+        assert_eq!(format!("{plmn:?}"), "Plmn(310-410)");
     }
 
     #[test]
@@ -343,13 +837,13 @@ mod tests {
     #[test]
     fn test_tai_display() {
         let tai = Tai::from_parts(310, 410, true, 0x123456);
-        assert_eq!(format!("{}", tai), "310410-1193046");
+        assert_eq!(format!("{tai}"), "310410-1193046");
     }
 
     #[test]
     fn test_tai_debug() {
         let tai = Tai::from_parts(310, 410, true, 0x123456);
-        assert_eq!(format!("{:?}", tai), "Tai(Plmn(310-410), tac=1193046)");
+        assert_eq!(format!("{tai:?}"), "Tai(Plmn(310-410), tac=1193046)");
     }
 
     #[test]
@@ -480,25 +974,25 @@ mod tests {
     #[test]
     fn test_snssai_display_without_sd() {
         let snssai = SNssai::new(1);
-        assert_eq!(format!("{}", snssai), "1");
+        assert_eq!(format!("{snssai}"), "1");
     }
 
     #[test]
     fn test_snssai_display_with_sd() {
         let snssai = SNssai::with_sd(1, [0x01, 0x02, 0x03]);
-        assert_eq!(format!("{}", snssai), "1-010203");
+        assert_eq!(format!("{snssai}"), "1-010203");
     }
 
     #[test]
     fn test_snssai_debug_without_sd() {
         let snssai = SNssai::new(1);
-        assert_eq!(format!("{:?}", snssai), "SNssai(sst=1)");
+        assert_eq!(format!("{snssai:?}"), "SNssai(sst=1)");
     }
 
     #[test]
     fn test_snssai_debug_with_sd() {
         let snssai = SNssai::with_sd(1, [0x01, 0x02, 0x03]);
-        assert_eq!(format!("{:?}", snssai), "SNssai(sst=1, sd=010203)");
+        assert_eq!(format!("{snssai:?}"), "SNssai(sst=1, sd=010203)");
     }
 
     #[test]
@@ -564,7 +1058,7 @@ mod tests {
         let slices = vec![SNssai::new(1), SNssai::new(2)];
         let ns = NetworkSlice::from_slices(slices.clone());
 
-        let collected: Vec<_> = ns.iter().cloned().collect();
+        let collected: Vec<_> = ns.iter().copied().collect();
         assert_eq!(collected, slices);
     }
 
@@ -645,16 +1139,16 @@ mod tests {
     #[test]
     fn test_supi_display() {
         let supi = Supi::imsi("310410123456789");
-        assert_eq!(format!("{}", supi), "imsi-310410123456789");
+        assert_eq!(format!("{supi}"), "imsi-310410123456789");
 
         let nai = Supi::nai("user@example.com");
-        assert_eq!(format!("{}", nai), "nai-user@example.com");
+        assert_eq!(format!("{nai}"), "nai-user@example.com");
     }
 
     #[test]
     fn test_supi_debug() {
         let supi = Supi::imsi("310410123456789");
-        assert_eq!(format!("{:?}", supi), "Supi(imsi-310410123456789)");
+        assert_eq!(format!("{supi:?}"), "Supi(imsi-310410123456789)");
     }
 
     #[test]
@@ -751,14 +1245,14 @@ mod tests {
     fn test_guti_s_tmsi() {
         let guti = Guti::from_parts(310, 410, true, 0x12, 0x123, 0x15, 0xABCDEF01);
         // S-TMSI = set(10) | pointer(6) | tmsi(32)
-        let amf_set_pointer = ((0x123 as u64) << 6) | 0x15;
+        let amf_set_pointer = (0x123_u64 << 6) | 0x15;
         let expected = (amf_set_pointer << 32) | 0xABCDEF01;
         assert_eq!(guti.s_tmsi(), expected);
     }
 
     #[test]
     fn test_guti_from_s_tmsi() {
-        let amf_set_pointer = ((0x123 as u64) << 6) | 0x15;
+        let amf_set_pointer = (0x123_u64 << 6) | 0x15;
         let s_tmsi = (amf_set_pointer << 32) | 0xABCDEF01;
         let guti = Guti::from_s_tmsi(s_tmsi);
         assert_eq!(guti.amf_set_id, 0x123);
@@ -779,7 +1273,7 @@ mod tests {
         // TMSI: [0xAB, 0xCD, 0xEF, 0x01]
         assert_eq!(encoded[0..3], [0x13, 0x00, 0x14]); // PLMN
         assert_eq!(encoded[3], 0x12); // AMF Region ID
-        let amf_set_pointer = ((0x123 as u16) << 6) | 0x15;
+        let amf_set_pointer = (0x123_u16 << 6) | 0x15;
         assert_eq!(encoded[4], (amf_set_pointer >> 8) as u8);
         assert_eq!(encoded[5], (amf_set_pointer & 0xFF) as u8);
         assert_eq!(encoded[6..10], [0xAB, 0xCD, 0xEF, 0x01]); // TMSI
@@ -831,13 +1325,13 @@ mod tests {
     fn test_guti_display() {
         let guti = Guti::from_parts(310, 410, true, 0x12, 0x123, 0x15, 0xABCDEF01);
         // Format: PLMN-RegionID-SetID-Pointer-TMSI
-        assert_eq!(format!("{}", guti), "310410-12-123-15-ABCDEF01");
+        assert_eq!(format!("{guti}"), "310410-12-123-15-ABCDEF01");
     }
 
     #[test]
     fn test_guti_debug() {
         let guti = Guti::from_parts(310, 410, true, 0x12, 0x123, 0x15, 0xABCDEF01);
-        let debug_str = format!("{:?}", guti);
+        let debug_str = format!("{guti:?}");
         assert!(debug_str.contains("Guti"));
         assert!(debug_str.contains("310"));
         assert!(debug_str.contains("410"));
@@ -874,6 +1368,215 @@ mod tests {
         assert_eq!(decoded.amf_pointer, 0x3F);
         assert_eq!(decoded.tmsi, 0xFFFFFFFF);
     }
+
+    // 6G ISAC tests
+
+    #[test]
+    fn test_sensing_measurement_new() {
+        let measurement = SensingMeasurement::new(1000, 100.0, 5.0, 45.0, 10.0, -80.0);
+        assert_eq!(measurement.timestamp_ms, 1000);
+        assert_eq!(measurement.range_meters, 100.0);
+        assert_eq!(measurement.velocity_mps, 5.0);
+        assert_eq!(measurement.azimuth_deg, 45.0);
+        assert_eq!(measurement.elevation_deg, 10.0);
+        assert_eq!(measurement.signal_strength_dbm, -80.0);
+        assert_eq!(measurement.target_id, 0);
+        assert!(measurement.is_valid());
+    }
+
+    #[test]
+    fn test_sensing_measurement_invalid() {
+        let measurement = SensingMeasurement::new(1000, 0.0, 0.0, 0.0, 0.0, -130.0);
+        assert!(!measurement.is_valid());
+    }
+
+    #[test]
+    fn test_sensing_config_new() {
+        let config = SensingConfig::new(1, 200, 500.0);
+        assert!(config.enabled);
+        assert_eq!(config.mode, 1);
+        assert_eq!(config.bandwidth_mhz, 200);
+        assert_eq!(config.max_range_meters, 500.0);
+    }
+
+    #[test]
+    fn test_sensing_config_default() {
+        let config = SensingConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.mode, 0);
+        assert_eq!(config.bandwidth_mhz, 100);
+    }
+
+    #[test]
+    fn test_sensing_result_new() {
+        let measurements = vec![
+            SensingMeasurement::new(1000, 100.0, 5.0, 45.0, 10.0, -80.0),
+            SensingMeasurement::new(1000, 150.0, -3.0, 90.0, 5.0, -85.0),
+        ];
+        let result = SensingResult::new(1000, measurements);
+        assert_eq!(result.detection_count, 2);
+        assert_eq!(result.measurements.len(), 2);
+    }
+
+    // Semantic communication tests
+
+    #[test]
+    fn test_modality_type_display() {
+        assert_eq!(ModalityType::Text.to_string(), "text");
+        assert_eq!(ModalityType::Image.to_string(), "image");
+        assert_eq!(ModalityType::Audio.to_string(), "audio");
+    }
+
+    #[test]
+    fn test_compression_level_display() {
+        assert_eq!(CompressionLevel::None.to_string(), "none");
+        assert_eq!(CompressionLevel::Medium.to_string(), "medium");
+        assert_eq!(CompressionLevel::Maximum.to_string(), "maximum");
+    }
+
+    #[test]
+    fn test_semantic_profile_new() {
+        let profile = SemanticProfile::new(ModalityType::Video, CompressionLevel::High, 0.9);
+        assert_eq!(profile.modality, ModalityType::Video);
+        assert_eq!(profile.compression, CompressionLevel::High);
+        assert_eq!(profile.importance, 0.9);
+    }
+
+    #[test]
+    fn test_semantic_profile_importance_clamping() {
+        let profile = SemanticProfile::new(ModalityType::Text, CompressionLevel::Low, 1.5);
+        assert_eq!(profile.importance, 1.0);
+
+        let profile2 = SemanticProfile::new(ModalityType::Text, CompressionLevel::Low, -0.5);
+        assert_eq!(profile2.importance, 0.0);
+    }
+
+    #[test]
+    fn test_semantic_profile_default() {
+        let profile = SemanticProfile::default();
+        assert_eq!(profile.modality, ModalityType::Text);
+        assert_eq!(profile.compression, CompressionLevel::Medium);
+        assert_eq!(profile.importance, 0.5);
+    }
+
+    // Federated learning tests
+
+    #[test]
+    fn test_model_id_new() {
+        let id = ModelId::new(12345);
+        assert_eq!(id.value(), 12345);
+    }
+
+    #[test]
+    fn test_model_id_display() {
+        let id = ModelId::new(0xABCD);
+        assert_eq!(id.to_string(), "model-000000000000abcd");
+    }
+
+    #[test]
+    fn test_model_version_new() {
+        let version = ModelVersion::new(1, 2, 3);
+        assert_eq!(version.major, 1);
+        assert_eq!(version.minor, 2);
+        assert_eq!(version.patch, 3);
+    }
+
+    #[test]
+    fn test_model_version_display() {
+        let version = ModelVersion::new(2, 5, 10);
+        assert_eq!(version.to_string(), "2.5.10");
+    }
+
+    #[test]
+    fn test_model_version_ordering() {
+        let v1 = ModelVersion::new(1, 0, 0);
+        let v2 = ModelVersion::new(1, 1, 0);
+        let v3 = ModelVersion::new(2, 0, 0);
+        assert!(v1 < v2);
+        assert!(v2 < v3);
+    }
+
+    #[test]
+    fn test_training_round_new() {
+        let round = TrainingRound::new(10);
+        assert_eq!(round.value(), 10);
+    }
+
+    #[test]
+    fn test_training_round_next() {
+        let round = TrainingRound::new(5);
+        let next = round.next();
+        assert_eq!(next.value(), 6);
+    }
+
+    #[test]
+    fn test_training_round_display() {
+        let round = TrainingRound::new(42);
+        assert_eq!(round.to_string(), "round-42");
+    }
+
+    // SHE computing tests
+
+    #[test]
+    fn test_accelerator_type_display() {
+        assert_eq!(AcceleratorType::Gpu.to_string(), "gpu");
+        assert_eq!(AcceleratorType::Tpu.to_string(), "tpu");
+        assert_eq!(AcceleratorType::Npu.to_string(), "npu");
+    }
+
+    #[test]
+    fn test_placement_constraint_new() {
+        let constraint = PlacementConstraint::new(50, AcceleratorType::Gpu);
+        assert_eq!(constraint.max_latency_ms, 50);
+        assert_eq!(constraint.required_accelerator, AcceleratorType::Gpu);
+    }
+
+    #[test]
+    fn test_placement_constraint_default() {
+        let constraint = PlacementConstraint::default();
+        assert_eq!(constraint.max_latency_ms, 1000);
+        assert_eq!(constraint.required_accelerator, AcceleratorType::Cpu);
+    }
+
+    #[test]
+    fn test_compute_request_new() {
+        let request = ComputeRequest::new(12345, "inference".to_string(), 1000);
+        assert_eq!(request.request_id, 12345);
+        assert_eq!(request.task_type, "inference");
+        assert_eq!(request.workload_units, 1000);
+        assert_eq!(request.priority, 128);
+    }
+
+    #[test]
+    fn test_compute_descriptor_new() {
+        let request = ComputeRequest::new(1, "training".to_string(), 5000);
+        let descriptor = ComputeDescriptor::new(request, 999);
+        assert_eq!(descriptor.session_id, 999);
+        assert!(!descriptor.real_time);
+    }
+
+    // Construction tests verify that all types can be created and compared
+
+    #[test]
+    fn test_sensing_measurement_construction_and_equality() {
+        let measurement1 = SensingMeasurement::new(1000, 100.0, 5.0, 45.0, 10.0, -80.0);
+        let measurement2 = SensingMeasurement::new(1000, 100.0, 5.0, 45.0, 10.0, -80.0);
+        assert_eq!(measurement1, measurement2);
+    }
+
+    #[test]
+    fn test_semantic_profile_construction_and_equality() {
+        let profile1 = SemanticProfile::new(ModalityType::Audio, CompressionLevel::High, 0.8);
+        let profile2 = SemanticProfile::new(ModalityType::Audio, CompressionLevel::High, 0.8);
+        assert_eq!(profile1, profile2);
+    }
+
+    #[test]
+    fn test_compute_request_construction_and_equality() {
+        let request1 = ComputeRequest::new(999, "inference".to_string(), 2000);
+        let request2 = ComputeRequest::new(999, "inference".to_string(), 2000);
+        assert_eq!(request1, request2);
+    }
 }
 
 /// Tracking Area Identity (TAI)
@@ -884,6 +1587,7 @@ mod tests {
 ///
 /// TAI is used in 5G networks for mobility management and paging.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Tai {
     /// Public Land Mobile Network identifier
     pub plmn: Plmn,
@@ -973,14 +1677,6 @@ impl fmt::Display for Tai {
     }
 }
 
-impl Default for Tai {
-    fn default() -> Self {
-        Self {
-            plmn: Plmn::default(),
-            tac: 0,
-        }
-    }
-}
 
 /// Single Network Slice Selection Assistance Information (S-NSSAI)
 ///
@@ -994,6 +1690,7 @@ impl Default for Tai {
 /// - 3: MIoT (Massive IoT)
 /// - 4: V2X (Vehicle-to-Everything)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct SNssai {
     /// Slice/Service Type (8-bit)
     pub sst: u8,
@@ -1105,11 +1802,6 @@ impl fmt::Display for SNssai {
     }
 }
 
-impl Default for SNssai {
-    fn default() -> Self {
-        Self { sst: 0, sd: None }
-    }
-}
 
 /// Network Slice configuration containing multiple S-NSSAIs.
 ///
@@ -1286,6 +1978,7 @@ impl fmt::Display for Supi {
 ///
 /// Per 3GPP TS 23.003 Section 2.10.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Guti {
     /// Public Land Mobile Network identifier
     pub plmn: Plmn,
@@ -1411,7 +2104,7 @@ impl Guti {
     pub fn encode(&self) -> [u8; 10] {
         let plmn_bytes = self.plmn.encode();
         let amf_set_pointer =
-            ((self.amf_set_id as u16 & 0x3FF) << 6) | (self.amf_pointer as u16 & 0x3F);
+            ((self.amf_set_id & 0x3FF) << 6) | (self.amf_pointer as u16 & 0x3F);
 
         [
             plmn_bytes[0],
@@ -1475,14 +2168,3 @@ impl fmt::Display for Guti {
     }
 }
 
-impl Default for Guti {
-    fn default() -> Self {
-        Self {
-            plmn: Plmn::default(),
-            amf_region_id: 0,
-            amf_set_id: 0,
-            amf_pointer: 0,
-            tmsi: 0,
-        }
-    }
-}

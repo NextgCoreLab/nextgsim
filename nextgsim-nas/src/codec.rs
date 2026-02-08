@@ -257,8 +257,7 @@ pub fn encode_ie4_with_iei<B: BufMut, T: InformationElement4>(
     let len = ie.encoded_len();
     if len > 255 {
         return Err(CodecError::EncodingError(format!(
-            "Type 4 IE length {} exceeds maximum of 255",
-            len
+            "Type 4 IE length {len} exceeds maximum of 255"
         )));
     }
     buf.put_u8(len as u8);
@@ -301,8 +300,7 @@ pub fn encode_ie6_with_iei<B: BufMut, T: InformationElement6>(
     let len = ie.encoded_len();
     if len > 65535 {
         return Err(CodecError::EncodingError(format!(
-            "Type 6 IE length {} exceeds maximum of 65535",
-            len
+            "Type 6 IE length {len} exceeds maximum of 65535"
         )));
     }
     buf.put_u16(len as u16);
@@ -469,8 +467,7 @@ impl NasDecode for PlainMmHeader {
             HeaderError::InvalidSecurityHeaderType(v) => CodecError::InvalidSecurityHeaderType(v),
             HeaderError::InvalidMessageType(v) => CodecError::InvalidMessageType(v),
             HeaderError::EpdMismatch { expected, actual } => CodecError::InvalidValue(format!(
-                "EPD mismatch: expected {:?}, got {:?}",
-                expected, actual
+                "EPD mismatch: expected {expected:?}, got {actual:?}"
             )),
         })
     }
@@ -497,8 +494,7 @@ impl NasDecode for PlainSmHeader {
             HeaderError::InvalidSecurityHeaderType(v) => CodecError::InvalidSecurityHeaderType(v),
             HeaderError::InvalidMessageType(v) => CodecError::InvalidMessageType(v),
             HeaderError::EpdMismatch { expected, actual } => CodecError::InvalidValue(format!(
-                "EPD mismatch: expected {:?}, got {:?}",
-                expected, actual
+                "EPD mismatch: expected {expected:?}, got {actual:?}"
             )),
         })
     }
@@ -525,8 +521,7 @@ impl NasDecode for SecuredHeader {
             HeaderError::InvalidSecurityHeaderType(v) => CodecError::InvalidSecurityHeaderType(v),
             HeaderError::InvalidMessageType(v) => CodecError::InvalidMessageType(v),
             HeaderError::EpdMismatch { expected, actual } => CodecError::InvalidValue(format!(
-                "EPD mismatch: expected {:?}, got {:?}",
-                expected, actual
+                "EPD mismatch: expected {expected:?}, got {actual:?}"
             )),
         })
     }
@@ -553,8 +548,7 @@ impl NasDecode for NasHeader {
             HeaderError::InvalidSecurityHeaderType(v) => CodecError::InvalidSecurityHeaderType(v),
             HeaderError::InvalidMessageType(v) => CodecError::InvalidMessageType(v),
             HeaderError::EpdMismatch { expected, actual } => CodecError::InvalidValue(format!(
-                "EPD mismatch: expected {:?}, got {:?}",
-                expected, actual
+                "EPD mismatch: expected {expected:?}, got {actual:?}"
             )),
         })
     }

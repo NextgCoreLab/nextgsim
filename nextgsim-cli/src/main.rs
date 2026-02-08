@@ -32,7 +32,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("ERROR: {:#}", e);
+            eprintln!("ERROR: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -60,7 +60,7 @@ fn run() -> Result<()> {
                 discovery.skipped_due_to_version
             );
         } else {
-            bail!("No node found with name '{}'. Use --dump to list available nodes.", node_name);
+            bail!("No node found with name '{node_name}'. Use --dump to list available nodes.");
         }
     }
 
@@ -76,10 +76,10 @@ fn run() -> Result<()> {
 
 fn validate_node_name(name: &str) -> Result<()> {
     if name.len() < MIN_NODE_NAME {
-        bail!("Node name '{}' is too short (minimum {} characters)", name, MIN_NODE_NAME);
+        bail!("Node name '{name}' is too short (minimum {MIN_NODE_NAME} characters)");
     }
     if name.len() > MAX_NODE_NAME {
-        bail!("Node name '{}' is too long (maximum {} characters)", name, MAX_NODE_NAME);
+        bail!("Node name '{name}' is too long (maximum {MAX_NODE_NAME} characters)");
     }
     Ok(())
 }
@@ -90,7 +90,7 @@ fn dump_nodes() -> Result<()> {
         println!("No running nodes found.");
     } else {
         for node in nodes {
-            println!("{}", node);
+            println!("{node}");
         }
     }
     Ok(())
@@ -104,14 +104,14 @@ fn execute_command(client: &CliClient, command: &str) -> Result<()> {
     match client.execute_command(command) {
         Ok((output, is_error)) => {
             if is_error {
-                eprintln!("ERROR: {}", output);
+                eprintln!("ERROR: {output}");
                 std::process::exit(1);
             } else {
-                println!("{}", output);
+                println!("{output}");
             }
         }
         Err(e) => {
-            bail!("Command execution failed: {}", e);
+            bail!("Command execution failed: {e}");
         }
     }
     Ok(())
@@ -147,16 +147,16 @@ fn interactive_mode(client: &CliClient) -> Result<()> {
                 match client.execute_command(cmd) {
                     Ok((output, is_error)) => {
                         if is_error {
-                            eprintln!("ERROR: {}", output);
+                            eprintln!("ERROR: {output}");
                         } else if !output.is_empty() {
-                            println!("{}", output);
+                            println!("{output}");
                         }
                     }
-                    Err(e) => eprintln!("ERROR: {}", e),
+                    Err(e) => eprintln!("ERROR: {e}"),
                 }
             }
             Err(e) => {
-                eprintln!("Error reading input: {}", e);
+                eprintln!("Error reading input: {e}");
                 break;
             }
         }
@@ -169,9 +169,23 @@ fn interactive_mode(client: &CliClient) -> Result<()> {
 fn print_help(node_name: &str) {
     println!("Available commands:");
     if node_name.contains("ue") {
-        println!("  status, info, ps-establish, ps-release, ps-list, deregister");
+        println!("  5G Core:");
+        println!("    status, info, ps-establish, ps-release, ps-list, deregister");
+        println!("  6G Features:");
+        println!("    nwdaf-query <analytics-id>     - Query NWDAF analytics");
+        println!("    she-offload <task-type>         - Offload computation to edge");
+        println!("    isac-sense <mode>               - Perform ISAC sensing");
+        println!("    fl-train <model-id>             - Participate in federated learning");
+        println!("    semantic-encode <modality>      - Encode data semantically");
     } else if node_name.contains("gnb") {
-        println!("  status, info, ue-list, amf-status");
+        println!("  5G Core:");
+        println!("    status, info, ue-list, amf-status");
+        println!("  6G Features:");
+        println!("    nwdaf-status                    - Show NWDAF analytics status");
+        println!("    she-status                      - Show edge computing status");
+        println!("    isac-config <enable|disable>    - Configure ISAC sensing");
+        println!("    fl-status                       - Show federated learning status");
+        println!("    semantic-status                 - Show semantic codec status");
     } else {
         println!("  status, info");
     }

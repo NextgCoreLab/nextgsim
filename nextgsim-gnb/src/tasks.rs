@@ -1260,6 +1260,7 @@ mod tests {
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
             ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            pqc_config: nextgsim_common::config::PqcConfig::default(),
         }
     }
 
@@ -1496,8 +1497,11 @@ mod tests {
 
         assert!(!manager.all_tasks_running());
 
-        // Start all tasks
-        for task_id in [TaskId::App, TaskId::Ngap, TaskId::Rrc, TaskId::Gtp, TaskId::Rls, TaskId::Sctp] {
+        // Start all tasks (including 6G tasks)
+        for task_id in [
+            TaskId::App, TaskId::Ngap, TaskId::Rrc, TaskId::Gtp, TaskId::Rls, TaskId::Sctp,
+            TaskId::She, TaskId::Nwdaf, TaskId::Nkef, TaskId::Isac, TaskId::Agent, TaskId::FlAggregator,
+        ] {
             manager.mark_task_started(task_id);
         }
 
@@ -1510,7 +1514,7 @@ mod tests {
         let (manager, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
 
-        let mut shutdown_rx = manager.shutdown_receiver();
+        let shutdown_rx = manager.shutdown_receiver();
         assert!(!*shutdown_rx.borrow());
     }
 
@@ -1524,7 +1528,7 @@ mod tests {
         manager.mark_task_started(TaskId::Ngap);
 
         let summary = manager.status_summary();
-        assert_eq!(summary.len(), 6);
+        assert_eq!(summary.len(), 12);
 
         // Find App and Ngap in summary
         let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);

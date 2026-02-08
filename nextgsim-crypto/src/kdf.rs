@@ -10,6 +10,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use unicode_normalization::UnicodeNormalization;
 
 /// HMAC-SHA256 output size in bytes
 pub const HMAC_SHA256_SIZE: usize = 32;
@@ -125,7 +126,7 @@ pub fn calculate_kdf_key(key: &[u8; KEY_256_SIZE], fc: u8, parameters: &[&[u8]])
 /// # Panics
 /// Panics if output_length would require more than 254 rounds
 pub fn calculate_prf_prime(key: &[u8; KEY_256_SIZE], input: &[u8], output_length: usize) -> Vec<u8> {
-    let round = (output_length + 31) / 32; // Ceiling division
+    let round = output_length.div_ceil(32); // Ceiling division
     assert!(round > 0 && round <= 254, "Invalid output_length for PRF'");
 
     let mut t_values: Vec<[u8; HMAC_SHA256_SIZE]> = Vec::with_capacity(round);
@@ -354,10 +355,12 @@ pub fn derive_res_star(
 
 /// Encode a string for KDF input as specified in 3GPP TS 33.501 Annex B.2.1.2
 ///
-/// Character strings are encoded to octet strings according to UTF-8 encoding rules.
-/// Note: Full NFKC normalization is not implemented; input should be pre-normalized.
+/// Character strings are first normalized using NFKC (Normalization Form
+/// Compatibility Composition) and then encoded to octet strings according
+/// to UTF-8 encoding rules.
 pub fn encode_kdf_string(s: &str) -> Vec<u8> {
-    s.as_bytes().to_vec()
+    let normalized: String = s.nfkc().collect();
+    normalized.into_bytes()
 }
 
 #[cfg(test)]
@@ -622,6 +625,32 @@ mod tests {
     #[test]
     fn test_encode_kdf_string() {
         let s = "5G:mnc001.mcc001.3gppnetwork.org";
+        let encoded = encode_kdf_string(s);
+        assert_eq!(encoded, s.as_bytes());
+    }
+
+    #[test]
+    fn test_encode_kdf_string_nfkc_normalization() {
+        // NFKC should decompose compatibility characters
+        // U+2126 (OHM SIGN) -> U+03A9 (GREEK CAPITAL LETTER OMEGA)
+        let s_ohm = "\u{2126}";
+        let encoded = encode_kdf_string(s_ohm);
+        let expected: Vec<u8> = "\u{03A9}".as_bytes().to_vec();
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn test_encode_kdf_string_nfkc_fi_ligature() {
+        // U+FB01 (LATIN SMALL LIGATURE FI) -> "fi"
+        let s = "\u{FB01}";
+        let encoded = encode_kdf_string(s);
+        assert_eq!(encoded, b"fi");
+    }
+
+    #[test]
+    fn test_encode_kdf_string_ascii_unchanged() {
+        // Pure ASCII should pass through unchanged
+        let s = "hello world 12345";
         let encoded = encode_kdf_string(s);
         assert_eq!(encoded, s.as_bytes());
     }

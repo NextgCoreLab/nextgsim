@@ -209,7 +209,7 @@ impl ModelRegistry {
 
     /// Lists all registered model names
     pub fn list(&self) -> Vec<&str> {
-        self.models.keys().map(|s| s.as_str()).collect()
+        self.models.keys().map(std::string::String::as_str).collect()
     }
 
     /// Returns the number of registered models

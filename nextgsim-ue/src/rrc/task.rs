@@ -466,7 +466,7 @@ impl RrcTask {
 
     /// Send RRC Setup Complete message
     async fn send_rrc_setup_complete(&mut self) {
-        let nas_pdu = self.initial_nas_pdu.take().unwrap_or_else(OctetString::new);
+        let nas_pdu = self.initial_nas_pdu.take().unwrap_or_default();
 
         // Build simplified RRC Setup Complete
         let mut rrc_pdu = Vec::with_capacity(nas_pdu.len() + 3);

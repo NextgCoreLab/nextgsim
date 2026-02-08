@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(v.x, 1);
         assert_eq!(v.y, 2);
         assert_eq!(v.z, 3);
-        assert_eq!(format!("{}", v), "(1, 2, 3)");
+        assert_eq!(format!("{v}"), "(1, 2, 3)");
     }
 
     #[test]

@@ -116,6 +116,10 @@ pub struct ComputeNode {
     pub is_available: bool,
     /// Associated cell IDs (for local edge nodes)
     pub cell_ids: Vec<i32>,
+    /// Network slice ID (TS 23.501 slice-specific resources)
+    pub slice_id: Option<u32>,
+    /// Tenant ID for multi-tenancy isolation
+    pub tenant_id: Option<u32>,
 }
 
 impl ComputeNode {
@@ -141,6 +145,8 @@ impl ComputeNode {
             capabilities,
             is_available: true,
             cell_ids: Vec::new(),
+            slice_id: None,
+            tenant_id: None,
         }
     }
 
@@ -201,6 +207,36 @@ impl ComputeNode {
         self.cell_ids.push(cell_id);
         self
     }
+
+    /// Sets the network slice ID (TS 23.501)
+    pub fn with_slice(mut self, slice_id: u32) -> Self {
+        self.slice_id = Some(slice_id);
+        self
+    }
+
+    /// Sets the tenant ID for multi-tenancy
+    pub fn with_tenant(mut self, tenant_id: u32) -> Self {
+        self.tenant_id = Some(tenant_id);
+        self
+    }
+
+    /// Simulates inter-tier latency in milliseconds
+    pub fn inter_tier_latency_ms(&self, target_tier: ComputeTier) -> u32 {
+        if self.tier == target_tier {
+            return 0; // Same tier
+        }
+
+        // Simplified latency model based on tier distance
+        match (self.tier, target_tier) {
+            (ComputeTier::LocalEdge, ComputeTier::RegionalEdge) |
+            (ComputeTier::RegionalEdge, ComputeTier::LocalEdge) => 5, // 5ms between adjacent tiers
+            (ComputeTier::RegionalEdge, ComputeTier::CoreCloud) |
+            (ComputeTier::CoreCloud, ComputeTier::RegionalEdge) => 15, // 15ms to core
+            (ComputeTier::LocalEdge, ComputeTier::CoreCloud) |
+            (ComputeTier::CoreCloud, ComputeTier::LocalEdge) => 25, // 25ms edge-to-core
+            _ => 0,
+        }
+    }
 }
 
 /// Manager for compute tiers
@@ -255,7 +291,7 @@ impl TierManager {
 
     /// Gets all nodes in a tier
     pub fn nodes_in_tier(&self, tier: ComputeTier) -> &[ComputeNode] {
-        self.nodes_by_tier.get(&tier).map(|v| v.as_slice()).unwrap_or(&[])
+        self.nodes_by_tier.get(&tier).map(std::vec::Vec::as_slice).unwrap_or(&[])
     }
 
     /// Gets all available nodes in a tier that support a capability
@@ -298,6 +334,9 @@ impl TierManager {
                         compute_flops: acc.compute_flops + node.capacity.compute_flops,
                         memory_bytes: acc.memory_bytes + node.capacity.memory_bytes,
                         gpu_count: acc.gpu_count + node.capacity.gpu_count,
+                        npu_count: acc.npu_count + node.capacity.npu_count,
+                        tpu_count: acc.tpu_count + node.capacity.tpu_count,
+                        fpga_count: acc.fpga_count + node.capacity.fpga_count,
                     }
                 })
             })
@@ -344,6 +383,9 @@ mod tests {
             compute_flops: 1_000_000_000_000, // 1 TFLOPS
             memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GB
             gpu_count: 1,
+            npu_count: 0,
+            tpu_count: 0,
+            fpga_count: 0,
         }
     }
 

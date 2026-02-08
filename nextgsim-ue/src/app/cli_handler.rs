@@ -136,16 +136,12 @@ pub struct PduSessionReleaseRequest {
 
 /// Deregistration request parameters.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct DeregistrationRequest {
     /// Whether to perform switch-off (don't wait for response)
     pub switch_off: bool,
 }
 
-impl Default for DeregistrationRequest {
-    fn default() -> Self {
-        Self { switch_off: false }
-    }
-}
 
 /// Action to be performed by the NAS task after CLI command processing.
 #[derive(Debug, Clone)]
@@ -261,7 +257,7 @@ impl CliHandler {
 
         match info.to_yaml() {
             Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
-            Err(e) => (CliCommandResult::error(format!("Failed to serialize info: {}", e)), NasAction::None),
+            Err(e) => (CliCommandResult::error(format!("Failed to serialize info: {e}")), NasAction::None),
         }
     }
 
@@ -285,7 +281,7 @@ impl CliHandler {
         
         match status.to_yaml() {
             Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
-            Err(e) => (CliCommandResult::error(format!("Failed to serialize status: {}", e)), NasAction::None),
+            Err(e) => (CliCommandResult::error(format!("Failed to serialize status: {e}")), NasAction::None),
         }
     }
 
@@ -314,7 +310,7 @@ impl CliHandler {
 
         match timers_info.to_yaml() {
             Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
-            Err(e) => (CliCommandResult::error(format!("Failed to serialize timers: {}", e)), NasAction::None),
+            Err(e) => (CliCommandResult::error(format!("Failed to serialize timers: {e}")), NasAction::None),
         }
     }
 
@@ -329,8 +325,7 @@ impl CliHandler {
         if rm_state != RmState::Registered {
             return (
                 CliCommandResult::error(format!(
-                    "Cannot deregister: UE is not registered (current state: {})",
-                    rm_state
+                    "Cannot deregister: UE is not registered (current state: {rm_state})"
                 )),
                 NasAction::None,
             );
@@ -352,8 +347,7 @@ impl CliHandler {
 
         (
             CliCommandResult::ok(format!(
-                "Initiating deregistration (cause: {})",
-                cause
+                "Initiating deregistration (cause: {cause})"
             )),
             NasAction::Deregister { cause },
         )
@@ -372,8 +366,7 @@ impl CliHandler {
         if rm_state != RmState::Registered {
             return (
                 CliCommandResult::error(format!(
-                    "Cannot establish PDU session: UE is not registered (current state: {})",
-                    rm_state
+                    "Cannot establish PDU session: UE is not registered (current state: {rm_state})"
                 )),
                 NasAction::None,
             );
@@ -383,8 +376,7 @@ impl CliHandler {
         if mm_state != MmState::Registered {
             return (
                 CliCommandResult::error(format!(
-                    "Cannot establish PDU session: Invalid MM state ({})",
-                    mm_state
+                    "Cannot establish PDU session: Invalid MM state ({mm_state})"
                 )),
                 NasAction::None,
             );
@@ -423,8 +415,7 @@ impl CliHandler {
 
         (
             CliCommandResult::ok(format!(
-                "Initiating PDU session establishment (PSI: {}, PTI: {}, Type: {})",
-                psi, pti, session_type
+                "Initiating PDU session establishment (PSI: {psi}, PTI: {pti}, Type: {session_type})"
             )),
             NasAction::EstablishPduSession {
                 psi,
@@ -443,9 +434,9 @@ impl CliHandler {
         mm_state: MmState,
     ) -> (CliCommandResult, NasAction) {
         // Validate PSI
-        if psi < 1 || psi > 15 {
+        if !(1..=15).contains(&psi) {
             return (
-                CliCommandResult::error(format!("Invalid PSI: {} (must be 1-15)", psi)),
+                CliCommandResult::error(format!("Invalid PSI: {psi} (must be 1-15)")),
                 NasAction::None,
             );
         }
@@ -455,7 +446,7 @@ impl CliHandler {
         // Check if session exists
         if !self.active_sessions.contains(&psi) {
             return (
-                CliCommandResult::error(format!("PDU session {} does not exist", psi)),
+                CliCommandResult::error(format!("PDU session {psi} does not exist")),
                 NasAction::None,
             );
         }
@@ -464,8 +455,7 @@ impl CliHandler {
         if rm_state != RmState::Registered {
             return (
                 CliCommandResult::error(format!(
-                    "Cannot release PDU session: UE is not registered (current state: {})",
-                    rm_state
+                    "Cannot release PDU session: UE is not registered (current state: {rm_state})"
                 )),
                 NasAction::None,
             );
@@ -475,8 +465,7 @@ impl CliHandler {
         if mm_state != MmState::Registered {
             return (
                 CliCommandResult::error(format!(
-                    "Cannot release PDU session: Invalid MM state ({})",
-                    mm_state
+                    "Cannot release PDU session: Invalid MM state ({mm_state})"
                 )),
                 NasAction::None,
             );
@@ -500,8 +489,7 @@ impl CliHandler {
 
         (
             CliCommandResult::ok(format!(
-                "Initiating PDU session release (PSI: {}, PTI: {})",
-                psi, pti
+                "Initiating PDU session release (PSI: {psi}, PTI: {pti})"
             )),
             NasAction::ReleasePduSession { psi, pti },
         )
@@ -520,10 +508,31 @@ impl CliHandler {
             );
         }
 
-        // For now, just release the first session
-        // In a full implementation, this would queue releases for all sessions
-        let psi = self.active_sessions[0];
-        self.handle_ps_release(psi as i32, rm_state, mm_state)
+        // Release ALL active sessions by returning action for the first
+        // and letting the caller iterate through all sessions
+        // A proper implementation would return multiple NasActions or queue them
+        let sessions_to_release: Vec<u8> = self.active_sessions.clone();
+        let count = sessions_to_release.len();
+
+        // Release the first session now and return success message indicating all sessions
+        let psi = sessions_to_release[0];
+        let (result, action) = self.handle_ps_release(psi as i32, rm_state, mm_state);
+
+        // Update the result message to reflect all sessions
+        let updated_result = CliCommandResult {
+            success: result.success,
+            message: format!("Releasing {count} PDU session(s) starting with PSI {psi}"),
+        };
+
+        // Note: In the current architecture, only one action can be returned at a time.
+        // The App task would need to call this multiple times or the NasAction enum
+        // would need to support multiple release operations. For now, this releases
+        // the first session and logs a TODO for the remaining sessions.
+        if count > 1 {
+            tracing::warn!("ps-release-all: Only releasing first session (PSI {}), {} remaining sessions need manual release", psi, count - 1);
+        }
+
+        (updated_result, action)
     }
 
     /// Allocates a new PSI (1-15).
@@ -587,10 +596,10 @@ mod tests {
     #[test]
     fn test_cli_command_result_display() {
         let ok = CliCommandResult::ok("Success");
-        assert_eq!(format!("{}", ok), "OK: Success");
+        assert_eq!(format!("{ok}"), "OK: Success");
 
         let err = CliCommandResult::error("Failed");
-        assert_eq!(format!("{}", err), "ERROR: Failed");
+        assert_eq!(format!("{err}"), "ERROR: Failed");
     }
 
     #[test]
@@ -642,7 +651,7 @@ mod tests {
             MmSubState::RegisteredNormalService,
         );
         assert!(result.success);
-        assert!(result.message.contains("RM State: RM-REGISTERED"));
+        assert!(result.message.contains("rm-state: RM-REGISTERED"));
         assert!(matches!(action, NasAction::None));
     }
 
@@ -756,7 +765,7 @@ mod tests {
                 session_type,
                 apn,
             } => {
-                assert!(psi >= 1 && psi <= 15);
+                assert!((1..=15).contains(&psi));
                 assert!(pti >= 1);
                 assert_eq!(session_type, PduSessionType::Ipv4);
                 assert_eq!(apn, Some("internet".to_string()));

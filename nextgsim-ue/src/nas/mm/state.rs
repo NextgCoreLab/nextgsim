@@ -303,7 +303,7 @@ pub struct UpdateStatusTransition {
 /// # Example
 ///
 /// ```
-/// use nextgsim_ue::nas::mm::state::{MmStateMachine, MmSubState, CmState, UpdateStatus};
+/// use nextgsim_ue::nas::mm::{MmStateMachine, MmSubState, CmState, UpdateStatus};
 ///
 /// let mut sm = MmStateMachine::new();
 ///
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn test_state_machine_display() {
         let sm = MmStateMachine::new();
-        let display = format!("{}", sm);
+        let display = format!("{sm}");
         assert!(display.contains("RM-DEREGISTERED"));
         assert!(display.contains("CM-IDLE"));
         assert!(display.contains("5GMM-DEREGISTERED"));

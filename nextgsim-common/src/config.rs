@@ -3,6 +3,7 @@
 //! This module provides configuration types for the nextgsim simulator,
 //! including gNB (gNodeB) and UE (User Equipment) configurations.
 
+use std::fmt;
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,9 @@ pub struct GnbConfig {
     /// UPF GTP-U port (default: 2152)
     #[serde(default = "default_gtp_port")]
     pub upf_port: u16,
+    /// Post-quantum cryptography configuration
+    #[serde(default)]
+    pub pqc_config: PqcConfig,
 }
 
 fn default_gtp_port() -> u16 {
@@ -93,18 +97,15 @@ impl GnbConfig {
 
 /// Operator key type for authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum OpType {
     /// Operator key (OP) - needs to be converted to OPc
     Op,
     /// Operator key derived (OPc) - used directly
+    #[default]
     Opc,
 }
 
-impl Default for OpType {
-    fn default() -> Self {
-        OpType::Opc
-    }
-}
 
 /// Supported NAS security algorithms.
 ///
@@ -138,10 +139,150 @@ impl Default for SupportedAlgs {
     }
 }
 
+// ============================================================================
+// 6G Post-Quantum Cryptography (PQC) Configuration
+// ============================================================================
+
+/// Post-quantum Key Encapsulation Mechanism (KEM) algorithm.
+///
+/// Defines the KEM algorithm to use for post-quantum secure key exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum KemAlgorithm {
+    /// No post-quantum KEM (classical only)
+    #[default]
+    None,
+    /// CRYSTALS-Kyber (NIST standard)
+    Kyber512,
+    /// CRYSTALS-Kyber-768
+    Kyber768,
+    /// CRYSTALS-Kyber-1024
+    Kyber1024,
+    /// NTRU (alternative PQC algorithm)
+    Ntru,
+    /// SABER (alternative PQC algorithm)
+    Saber,
+}
+
+
+impl fmt::Display for KemAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KemAlgorithm::None => write!(f, "none"),
+            KemAlgorithm::Kyber512 => write!(f, "kyber512"),
+            KemAlgorithm::Kyber768 => write!(f, "kyber768"),
+            KemAlgorithm::Kyber1024 => write!(f, "kyber1024"),
+            KemAlgorithm::Ntru => write!(f, "ntru"),
+            KemAlgorithm::Saber => write!(f, "saber"),
+        }
+    }
+}
+
+/// Post-quantum signature algorithm.
+///
+/// Defines the signature algorithm to use for post-quantum secure authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum SignAlgorithm {
+    /// No post-quantum signatures (classical only)
+    #[default]
+    None,
+    /// CRYSTALS-Dilithium (NIST standard)
+    Dilithium2,
+    /// CRYSTALS-Dilithium-3
+    Dilithium3,
+    /// CRYSTALS-Dilithium-5
+    Dilithium5,
+    /// FALCON (alternative PQC algorithm)
+    Falcon512,
+    /// FALCON-1024
+    Falcon1024,
+    /// SPHINCS+ (hash-based signatures)
+    SphincsSha256,
+}
+
+
+impl fmt::Display for SignAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SignAlgorithm::None => write!(f, "none"),
+            SignAlgorithm::Dilithium2 => write!(f, "dilithium2"),
+            SignAlgorithm::Dilithium3 => write!(f, "dilithium3"),
+            SignAlgorithm::Dilithium5 => write!(f, "dilithium5"),
+            SignAlgorithm::Falcon512 => write!(f, "falcon512"),
+            SignAlgorithm::Falcon1024 => write!(f, "falcon1024"),
+            SignAlgorithm::SphincsSha256 => write!(f, "sphincs-sha256"),
+        }
+    }
+}
+
+/// Hybrid mode for combining classical and post-quantum cryptography.
+///
+/// Defines how classical and PQC algorithms are combined for transitional security.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum HybridMode {
+    /// Classical cryptography only (no PQC)
+    #[default]
+    ClassicalOnly,
+    /// Post-quantum cryptography only (no classical)
+    PqcOnly,
+    /// Hybrid: use both classical and PQC in parallel
+    HybridParallel,
+    /// Hybrid: concatenate outputs of classical and PQC
+    HybridConcatenate,
+    /// Hybrid: XOR outputs of classical and PQC
+    HybridXor,
+}
+
+
+impl fmt::Display for HybridMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HybridMode::ClassicalOnly => write!(f, "classical-only"),
+            HybridMode::PqcOnly => write!(f, "pqc-only"),
+            HybridMode::HybridParallel => write!(f, "hybrid-parallel"),
+            HybridMode::HybridConcatenate => write!(f, "hybrid-concatenate"),
+            HybridMode::HybridXor => write!(f, "hybrid-xor"),
+        }
+    }
+}
+
+/// Post-quantum cryptography configuration.
+///
+/// Defines the PQC algorithms and modes to use for quantum-resistant security.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
+pub struct PqcConfig {
+    /// Whether PQC is enabled
+    pub enabled: bool,
+    /// KEM algorithm for key exchange
+    pub kem_algorithm: KemAlgorithm,
+    /// Signature algorithm for authentication
+    pub sign_algorithm: SignAlgorithm,
+    /// Hybrid mode for combining classical and PQC
+    pub hybrid_mode: HybridMode,
+}
+
+
+impl PqcConfig {
+    /// Creates a new PQC configuration with specified algorithms.
+    pub fn new(kem: KemAlgorithm, sign: SignAlgorithm, mode: HybridMode) -> Self {
+        Self {
+            enabled: kem != KemAlgorithm::None || sign != SignAlgorithm::None,
+            kem_algorithm: kem,
+            sign_algorithm: sign,
+            hybrid_mode: mode,
+        }
+    }
+}
+
 /// PDU session type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum PduSessionType {
     /// IPv4 PDU session
+    #[default]
     Ipv4,
     /// IPv6 PDU session
     Ipv6,
@@ -153,11 +294,6 @@ pub enum PduSessionType {
     Ethernet,
 }
 
-impl Default for PduSessionType {
-    fn default() -> Self {
-        PduSessionType::Ipv4
-    }
-}
 
 /// PDU session configuration.
 ///
@@ -225,6 +361,9 @@ pub struct UeConfig {
     pub configured_nssai: NetworkSlice,
     /// TUN interface name (optional)
     pub tun_name: Option<String>,
+    /// Post-quantum cryptography configuration
+    #[serde(default)]
+    pub pqc_config: PqcConfig,
 }
 
 impl Default for UeConfig {
@@ -247,6 +386,7 @@ impl Default for UeConfig {
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
+            pqc_config: PqcConfig::default(),
         }
     }
 }
@@ -428,6 +568,9 @@ mod tests {
             gtp_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             gtp_advertise_ip: None,
             ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
+            pqc_config: PqcConfig::default(),
         };
         // With gnb_id_length=24, cell_id is 12 bits
         // NCI = 0x000000001, gnb_id = upper 24 bits = 0, cell_id = lower 12 bits = 1
@@ -449,6 +592,9 @@ mod tests {
             gtp_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             gtp_advertise_ip: None,
             ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
+            pqc_config: PqcConfig::default(),
         };
         // gnb_id_length=24, so gnb_id is upper 24 bits, cell_id is lower 12 bits
         // NCI = 0x123456789
@@ -558,6 +704,9 @@ ignore_stream_ids: false
             gtp_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             gtp_advertise_ip: None,
             ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
+            pqc_config: PqcConfig::default(),
         };
         let yaml = config.to_yaml().unwrap();
         assert!(yaml.contains("nci: 16"));
@@ -579,6 +728,9 @@ ignore_stream_ids: false
             gtp_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
             gtp_advertise_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
             ignore_stream_ids: true,
+            upf_addr: None,
+            upf_port: 2152,
+            pqc_config: PqcConfig::default(),
         };
         let yaml = original.to_yaml().unwrap();
         let parsed = GnbConfig::from_yaml(&yaml).unwrap();
@@ -656,6 +808,7 @@ configured_nssai:
             sessions: vec![SessionConfig::default()],
             configured_nssai: NetworkSlice::new(),
             tun_name: Some("tun0".to_string()),
+            pqc_config: PqcConfig::default(),
         };
         let yaml = original.to_yaml().unwrap();
         let parsed = UeConfig::from_yaml(&yaml).unwrap();
@@ -690,5 +843,117 @@ configured_nssai:
     fn test_ue_config_from_yaml_file_not_found() {
         let result = UeConfig::from_yaml_file("/nonexistent/path/config.yaml");
         assert!(result.is_err());
+    }
+
+    // PQC configuration tests
+
+    #[test]
+    fn test_kem_algorithm_display() {
+        assert_eq!(KemAlgorithm::Kyber512.to_string(), "kyber512");
+        assert_eq!(KemAlgorithm::Kyber768.to_string(), "kyber768");
+        assert_eq!(KemAlgorithm::Ntru.to_string(), "ntru");
+    }
+
+    #[test]
+    fn test_sign_algorithm_display() {
+        assert_eq!(SignAlgorithm::Dilithium2.to_string(), "dilithium2");
+        assert_eq!(SignAlgorithm::Falcon512.to_string(), "falcon512");
+        assert_eq!(SignAlgorithm::SphincsSha256.to_string(), "sphincs-sha256");
+    }
+
+    #[test]
+    fn test_hybrid_mode_display() {
+        assert_eq!(HybridMode::ClassicalOnly.to_string(), "classical-only");
+        assert_eq!(HybridMode::PqcOnly.to_string(), "pqc-only");
+        assert_eq!(HybridMode::HybridParallel.to_string(), "hybrid-parallel");
+    }
+
+    #[test]
+    fn test_pqc_config_default() {
+        let config = PqcConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.kem_algorithm, KemAlgorithm::None);
+        assert_eq!(config.sign_algorithm, SignAlgorithm::None);
+        assert_eq!(config.hybrid_mode, HybridMode::ClassicalOnly);
+    }
+
+    #[test]
+    fn test_pqc_config_new() {
+        let config = PqcConfig::new(
+            KemAlgorithm::Kyber768,
+            SignAlgorithm::Dilithium3,
+            HybridMode::HybridParallel,
+        );
+        assert!(config.enabled);
+        assert_eq!(config.kem_algorithm, KemAlgorithm::Kyber768);
+        assert_eq!(config.sign_algorithm, SignAlgorithm::Dilithium3);
+        assert_eq!(config.hybrid_mode, HybridMode::HybridParallel);
+    }
+
+    #[test]
+    fn test_pqc_config_new_no_algorithms() {
+        let config = PqcConfig::new(
+            KemAlgorithm::None,
+            SignAlgorithm::None,
+            HybridMode::ClassicalOnly,
+        );
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_gnb_config_with_pqc() {
+        let config = GnbConfig {
+            nci: 16,
+            gnb_id_length: 24,
+            plmn: Plmn::new(310, 410, false),
+            tac: 1,
+            nssai: vec![],
+            amf_configs: vec![],
+            link_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ngap_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            gtp_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            gtp_advertise_ip: None,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
+            pqc_config: PqcConfig::new(
+                KemAlgorithm::Kyber512,
+                SignAlgorithm::Dilithium2,
+                HybridMode::HybridParallel,
+            ),
+        };
+        assert!(config.pqc_config.enabled);
+        assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber512);
+    }
+
+    #[test]
+    fn test_ue_config_with_pqc() {
+        let config = UeConfig {
+            supi: None,
+            protection_scheme: 0,
+            home_network_public_key_id: 0,
+            home_network_public_key: Vec::new(),
+            routing_indicator: None,
+            hplmn: Plmn::default(),
+            key: [0u8; 16],
+            op: [0u8; 16],
+            op_type: OpType::default(),
+            amf: [0x80, 0x00],
+            imei: None,
+            imei_sv: None,
+            supported_algs: SupportedAlgs::default(),
+            gnb_search_list: Vec::new(),
+            sessions: Vec::new(),
+            configured_nssai: NetworkSlice::new(),
+            tun_name: None,
+            pqc_config: PqcConfig::new(
+                KemAlgorithm::Kyber1024,
+                SignAlgorithm::Dilithium5,
+                HybridMode::HybridConcatenate,
+            ),
+        };
+        assert!(config.pqc_config.enabled);
+        assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber1024);
+        assert_eq!(config.pqc_config.sign_algorithm, SignAlgorithm::Dilithium5);
     }
 }

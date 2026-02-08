@@ -309,7 +309,7 @@ impl MeasurementManager {
                 if let Some(since) = state.condition_met_since {
                     if since.elapsed() >= Duration::from_millis(trigger.time_to_trigger) {
                         // Check if we should send a report
-                        let should_report = state.last_report.map_or(true, |last| {
+                        let should_report = state.last_report.is_none_or(|last| {
                             last.elapsed() >= Duration::from_millis(config.report_interval)
                         });
 
@@ -382,11 +382,10 @@ impl MeasurementManager {
                         continue;
                     }
                     if let Some(rsrp) = meas.rsrp {
-                        if rsrp > serving_rsrp + offset + hyst {
-                            if best_neighbor.map_or(true, |(_, best_rsrp)| rsrp > best_rsrp) {
+                        if rsrp > serving_rsrp + offset + hyst
+                            && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp) {
                                 best_neighbor = Some((cell_id, rsrp));
                             }
-                        }
                     }
                 }
 
@@ -402,11 +401,10 @@ impl MeasurementManager {
                             continue;
                         }
                         if let Some(rsrp) = meas.rsrp {
-                            if rsrp > thresh + hyst {
-                                if best_neighbor.map_or(true, |(_, best_rsrp)| rsrp > best_rsrp) {
+                            if rsrp > thresh + hyst
+                                && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp) {
                                     best_neighbor = Some((cell_id, rsrp));
                                 }
-                            }
                         }
                     }
 
@@ -430,11 +428,10 @@ impl MeasurementManager {
                         continue;
                     }
                     if let Some(rsrp) = meas.rsrp {
-                        if rsrp > thresh2 + hyst {
-                            if best_neighbor.map_or(true, |(_, best_rsrp)| rsrp > best_rsrp) {
+                        if rsrp > thresh2 + hyst
+                            && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp) {
                                 best_neighbor = Some((cell_id, rsrp));
                             }
-                        }
                     }
                 }
 

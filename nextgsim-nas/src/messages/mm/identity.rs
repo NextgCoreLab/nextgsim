@@ -201,7 +201,7 @@ impl IdentityResponse {
 
         // Decode mobile identity (Type 6 IE - 2-byte length prefix)
         let mobile_identity = Ie5gsMobileIdentity::decode(buf).map_err(|e| {
-            IdentityError::InvalidIeValue(format!("Failed to decode mobile identity: {}", e))
+            IdentityError::InvalidIeValue(format!("Failed to decode mobile identity: {e}"))
         })?;
 
         Ok(Self { mobile_identity })
@@ -236,6 +236,7 @@ impl Default for IdentityResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::registration::MobileIdentityType;
 
     #[test]
     fn test_identity_request_encode_decode() {

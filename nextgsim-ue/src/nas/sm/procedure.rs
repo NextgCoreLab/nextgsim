@@ -240,7 +240,7 @@ impl ProcedureTransactionManager {
 
     /// Free a PTI, returning it to the available pool.
     pub fn free(&mut self, pti: u8) {
-        if pti >= PTI_MIN && pti <= PTI_MAX {
+        if (PTI_MIN..=PTI_MAX).contains(&pti) {
             self.transactions[pti as usize].reset();
         }
     }
@@ -270,7 +270,7 @@ impl ProcedureTransactionManager {
     /// 2. PSI matches the expected PSI for this PTI
     pub fn validate_pti_psi(&self, pti: u8, psi: u8) -> PtiValidationResult {
         // Check PTI range
-        if pti < PTI_MIN || pti > PTI_MAX {
+        if !(PTI_MIN..=PTI_MAX).contains(&pti) {
             return PtiValidationResult::InvalidPti;
         }
 
@@ -304,7 +304,7 @@ impl ProcedureTransactionManager {
     ///
     /// Returns the message type and PSI if the procedure was pending.
     pub fn abort(&mut self, pti: u8) -> Option<(SmMessageType, u8)> {
-        if pti < PTI_MIN || pti > PTI_MAX {
+        if !(PTI_MIN..=PTI_MAX).contains(&pti) {
             return None;
         }
 
@@ -356,7 +356,7 @@ impl ProcedureTransactionManager {
         }
 
         // Also include the specified PTI
-        if pti >= PTI_MIN && pti <= PTI_MAX {
+        if (PTI_MIN..=PTI_MAX).contains(&pti) {
             to_abort.insert(pti);
         }
 
@@ -430,7 +430,7 @@ impl fmt::Debug for ProcedureTransactionManager {
         if pending.is_empty() {
             write!(f, "ProcedureTransactionManager {{ no pending }}")
         } else {
-            write!(f, "ProcedureTransactionManager {{ {:?} }}", pending)
+            write!(f, "ProcedureTransactionManager {{ {pending:?} }}")
         }
     }
 }

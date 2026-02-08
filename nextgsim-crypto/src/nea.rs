@@ -1,12 +1,15 @@
 //! NEA (5G encryption algorithms) implementations
 //!
 //! This module implements the 5G NAS encryption algorithms:
+//! - NEA1: SNOW3G-based ciphering (128-EEA1)
 //! - NEA2: AES-CTR based ciphering (128-EEA2)
 //!
 //! Reference: 3GPP TS 33.501 and TS 33.401
 
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
+
+use crate::snow3g::uea2_f8;
 
 /// AES-128 key size in bytes
 pub const KEY_SIZE: usize = 16;
@@ -16,6 +19,34 @@ pub const IV_SIZE: usize = 16;
 
 /// Type alias for AES-128 CTR mode
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
+
+/// NEA1 (128-EEA1) - SNOW3G-based ciphering algorithm
+///
+/// Implements the 5G encryption algorithm NEA1 as specified in 3GPP TS 33.501.
+/// NEA1 is equivalent to UEA2 (F8) from the UMTS security algorithms,
+/// reused in the 5G NR context.
+///
+/// # Parameters
+/// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
+/// - `bearer`: 5-bit bearer identity (0-31)
+/// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
+/// - `key`: 128-bit encryption key (KNASenc or KUPenc)
+/// - `data`: Data to encrypt/decrypt (modified in place)
+///
+/// # Note
+/// Encryption and decryption are the same operation (XOR with keystream).
+pub fn nea1_encrypt(count: u32, bearer: u8, direction: u8, key: &[u8; KEY_SIZE], data: &mut [u8]) {
+    let length_bits = (data.len() * 8) as u32;
+    uea2_f8(key, count, bearer as u32 & 0x1F, direction as u32 & 0x01, data, length_bits);
+}
+
+/// NEA1 decryption (same as encryption - XOR with keystream)
+///
+/// See [`nea1_encrypt`] for details.
+#[inline]
+pub fn nea1_decrypt(count: u32, bearer: u8, direction: u8, key: &[u8; KEY_SIZE], data: &mut [u8]) {
+    nea1_encrypt(count, bearer, direction, key, data);
+}
 
 /// NEA2 (128-EEA2) - AES-CTR based ciphering algorithm
 ///
@@ -78,6 +109,136 @@ fn build_nea2_iv(count: u32, bearer: u8, direction: u8) -> [u8; IV_SIZE] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nea1_encrypt_decrypt_roundtrip() {
+        let key: [u8; 16] = [
+            0x2b, 0xd6, 0x45, 0x9f, 0x82, 0xc5, 0xb3, 0x00,
+            0x95, 0x2c, 0x49, 0x10, 0x48, 0x81, 0xff, 0x48,
+        ];
+        let count = 0x72A4F20F;
+        let bearer = 0x0C;
+        let direction = 1;
+
+        let original = b"Hello, NEA1 SNOW3G! Test message.";
+        let mut data = original.to_vec();
+
+        // Encrypt
+        nea1_encrypt(count, bearer, direction, &key, &mut data);
+        assert_ne!(&data[..], &original[..]);
+
+        // Decrypt
+        nea1_decrypt(count, bearer, direction, &key, &mut data);
+        assert_eq!(&data[..], &original[..]);
+    }
+
+    #[test]
+    fn test_nea1_empty_data() {
+        let key: [u8; 16] = [0u8; 16];
+        let mut data: Vec<u8> = vec![];
+
+        // Should not panic on empty data
+        nea1_encrypt(0, 0, 0, &key, &mut data);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_nea1_deterministic() {
+        let key: [u8; 16] = [
+            0x2b, 0xd6, 0x45, 0x9f, 0x82, 0xc5, 0xb3, 0x00,
+            0x95, 0x2c, 0x49, 0x10, 0x48, 0x81, 0xff, 0x48,
+        ];
+        let plaintext = b"Determinism test for NEA1";
+
+        let mut data1 = plaintext.to_vec();
+        let mut data2 = plaintext.to_vec();
+
+        nea1_encrypt(0x12345678, 5, 1, &key, &mut data1);
+        nea1_encrypt(0x12345678, 5, 1, &key, &mut data2);
+
+        assert_eq!(data1, data2);
+    }
+
+    #[test]
+    fn test_nea1_different_counts_produce_different_output() {
+        let key: [u8; 16] = [0x2b; 16];
+        let plaintext = [0x00u8; 16];
+
+        let mut data1 = plaintext.to_vec();
+        let mut data2 = plaintext.to_vec();
+
+        nea1_encrypt(0, 0, 0, &key, &mut data1);
+        nea1_encrypt(1, 0, 0, &key, &mut data2);
+
+        assert_ne!(data1, data2);
+    }
+
+    #[test]
+    fn test_nea1_different_directions_produce_different_output() {
+        let key: [u8; 16] = [0x2b; 16];
+        let plaintext = [0x00u8; 16];
+
+        let mut data1 = plaintext.to_vec();
+        let mut data2 = plaintext.to_vec();
+
+        nea1_encrypt(0, 0, 0, &key, &mut data1);
+        nea1_encrypt(0, 0, 1, &key, &mut data2);
+
+        assert_ne!(data1, data2);
+    }
+
+    /// Test NEA1 with 3GPP UEA2 test vector (NEA1 == UEA2)
+    #[test]
+    fn test_nea1_3gpp_test_vector_set1() {
+        // Using 3GPP TS 35.222 UEA2 Test Set 1 (NEA1 is UEA2)
+        let key: [u8; 16] = [
+            0x2B, 0xD6, 0x45, 0x9F, 0x82, 0xC5, 0xB3, 0x00,
+            0x95, 0x2C, 0x49, 0x10, 0x48, 0x81, 0xFF, 0x48,
+        ];
+        let count: u32 = 0x72A4F20F;
+        let bearer: u8 = 0x0C;
+        let direction: u8 = 1;
+
+        let plaintext: [u8; 100] = [
+            0x7E, 0xC6, 0x12, 0x72, 0x74, 0x3B, 0xF1, 0x61,
+            0x47, 0x26, 0x44, 0x6A, 0x6C, 0x38, 0xCE, 0xD1,
+            0x66, 0xF6, 0xCA, 0x76, 0xEB, 0x54, 0x30, 0x04,
+            0x42, 0x86, 0x34, 0x6C, 0xEF, 0x13, 0x0F, 0x92,
+            0x92, 0x2B, 0x03, 0x45, 0x0D, 0x3A, 0x99, 0x75,
+            0xE5, 0xBD, 0x2E, 0xA0, 0xEB, 0x55, 0xAD, 0x8E,
+            0x1B, 0x19, 0x9E, 0x3E, 0xC4, 0x31, 0x60, 0x20,
+            0xE9, 0xA1, 0xB2, 0x85, 0xE7, 0x62, 0x79, 0x53,
+            0x59, 0xB7, 0xBD, 0xFD, 0x39, 0xBE, 0xF4, 0xB2,
+            0x48, 0x45, 0x83, 0xD5, 0xAF, 0xE0, 0x82, 0xAE,
+            0xE6, 0x38, 0xBF, 0x5F, 0xD5, 0xA6, 0x06, 0x19,
+            0x39, 0x01, 0xA0, 0x8F, 0x4A, 0xB4, 0x1A, 0xAB,
+            0x9B, 0x13, 0x48, 0x80,
+        ];
+
+        let expected_ciphertext: [u8; 100] = [
+            0x8C, 0xEB, 0xA6, 0x29, 0x43, 0xDC, 0xED, 0x3A,
+            0x09, 0x90, 0xB0, 0x6E, 0xA1, 0xB0, 0xA2, 0xC4,
+            0xFB, 0x3C, 0xED, 0xC7, 0x1B, 0x36, 0x9F, 0x42,
+            0xBA, 0x64, 0xC1, 0xEB, 0x66, 0x65, 0xE7, 0x2A,
+            0xA1, 0xC9, 0xBB, 0x0D, 0xEA, 0xA2, 0x0F, 0xE8,
+            0x60, 0x58, 0xB8, 0xBA, 0xEE, 0x2C, 0x2E, 0x7F,
+            0x0B, 0xEC, 0xCE, 0x48, 0xB5, 0x29, 0x32, 0xA5,
+            0x3C, 0x9D, 0x5F, 0x93, 0x1A, 0x3A, 0x7C, 0x53,
+            0x22, 0x59, 0xAF, 0x43, 0x25, 0xE2, 0xA6, 0x5E,
+            0x30, 0x84, 0xAD, 0x5F, 0x6A, 0x51, 0x3B, 0x7B,
+            0xDD, 0xC1, 0xB6, 0x5F, 0x0A, 0xA0, 0xD9, 0x7A,
+            0x05, 0x3D, 0xB5, 0x5A, 0x88, 0xC4, 0xC4, 0xF9,
+            0x60, 0x5E, 0x41, 0x43,
+        ];
+
+        let mut data = plaintext;
+        nea1_encrypt(count, bearer, direction, &key, &mut data);
+        assert_eq!(&data[..], &expected_ciphertext[..]);
+
+        // Verify decryption
+        nea1_decrypt(count, bearer, direction, &key, &mut data);
+        assert_eq!(&data[..], &plaintext[..]);
+    }
 
     #[test]
     fn test_build_nea2_iv() {

@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn test_parse_handover_command() {
         // Build a test handover command
-        let mut pdu = vec![
+        let pdu = vec![
             0x00, // message type
             0x05, // transaction_id
             0x00, 0x10, // target PCI = 16

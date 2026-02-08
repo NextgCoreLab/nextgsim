@@ -80,6 +80,14 @@ pub mod rrc;
 pub mod sctp;
 pub mod tasks;
 
+// 6G AI-native network function modules
+pub mod she;
+pub mod nwdaf;
+pub mod nkef;
+pub mod isac;
+pub mod agent;
+pub mod fl;
+
 // Re-export NGAP module types
 pub use ngap::{AmfContextInfo, AmfState, NgapAmfContext, NgapTask, NgapUeContext, UeState};
 
@@ -119,3 +127,11 @@ pub use tasks::{
 pub use tasks::{
     TaskError, TaskId, TaskInfo, TaskManager, TaskState, DEFAULT_SHUTDOWN_TIMEOUT_MS,
 };
+
+// Re-export 6G AI-native network function types
+pub use she::SheTask;
+pub use nwdaf::NwdafTask;
+pub use nkef::NkefTask;
+pub use isac::IsacTask;
+pub use agent::AgentTask;
+pub use fl::FlAggregatorTask;

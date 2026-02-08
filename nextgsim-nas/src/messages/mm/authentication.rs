@@ -55,6 +55,7 @@ pub enum AuthenticationError {
 ///
 /// Contains the random challenge used in authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub struct AuthenticationParameterRand {
     /// 128-bit random value
     pub value: [u8; 16],
@@ -85,11 +86,6 @@ impl AuthenticationParameterRand {
     }
 }
 
-impl Default for AuthenticationParameterRand {
-    fn default() -> Self {
-        Self { value: [0u8; 16] }
-    }
-}
 
 // ============================================================================
 // Authentication Parameter AUTN (3GPP TS 24.501 Section 9.11.3.15)
@@ -99,6 +95,7 @@ impl Default for AuthenticationParameterRand {
 ///
 /// Contains the authentication token.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct AuthenticationParameterAutn {
     /// AUTN value (typically 16 bytes)
     pub value: Vec<u8>,
@@ -142,11 +139,6 @@ impl AuthenticationParameterAutn {
     }
 }
 
-impl Default for AuthenticationParameterAutn {
-    fn default() -> Self {
-        Self { value: Vec::new() }
-    }
-}
 
 // ============================================================================
 // Authentication Response Parameter (3GPP TS 24.501 Section 9.11.3.17)
@@ -156,6 +148,7 @@ impl Default for AuthenticationParameterAutn {
 ///
 /// Contains the RES* value computed by the UE.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct AuthenticationResponseParameter {
     /// RES* value
     pub value: Vec<u8>,
@@ -199,11 +192,6 @@ impl AuthenticationResponseParameter {
     }
 }
 
-impl Default for AuthenticationResponseParameter {
-    fn default() -> Self {
-        Self { value: Vec::new() }
-    }
-}
 
 // ============================================================================
 // Authentication Failure Parameter (3GPP TS 24.501 Section 9.11.3.14)
@@ -213,6 +201,7 @@ impl Default for AuthenticationResponseParameter {
 ///
 /// Contains the AUTS value for synchronization failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct AuthenticationFailureParameter {
     /// AUTS value (14 bytes)
     pub value: Vec<u8>,
@@ -256,11 +245,6 @@ impl AuthenticationFailureParameter {
     }
 }
 
-impl Default for AuthenticationFailureParameter {
-    fn default() -> Self {
-        Self { value: Vec::new() }
-    }
-}
 
 // ============================================================================
 // EAP Message IE (3GPP TS 24.501 Section 9.11.2.2)
@@ -268,6 +252,7 @@ impl Default for AuthenticationFailureParameter {
 
 /// EAP Message IE (Type 6 - variable length with 2-byte LI)
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct EapMessage {
     /// EAP message data
     pub data: Vec<u8>,
@@ -311,11 +296,6 @@ impl EapMessage {
     }
 }
 
-impl Default for EapMessage {
-    fn default() -> Self {
-        Self { data: Vec::new() }
-    }
-}
 
 // ============================================================================
 // ABBA IE (3GPP TS 24.501 Section 9.11.3.10)
@@ -744,6 +724,7 @@ impl AuthenticationReject {
 ///
 /// 3GPP TS 24.501 Section 8.2.4
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct AuthenticationFailure {
     /// 5GMM cause (mandatory, Type 3)
     pub mm_cause: Ie5gMmCause,
@@ -751,14 +732,6 @@ pub struct AuthenticationFailure {
     pub auth_failure_parameter: Option<AuthenticationFailureParameter>,
 }
 
-impl Default for AuthenticationFailure {
-    fn default() -> Self {
-        Self {
-            mm_cause: Ie5gMmCause::default(),
-            auth_failure_parameter: None,
-        }
-    }
-}
 
 impl AuthenticationFailure {
     /// Create a new Authentication Failure with mandatory fields
@@ -791,7 +764,7 @@ impl AuthenticationFailure {
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, AuthenticationError> {
         // 5GMM cause (mandatory, Type 3)
         let mm_cause = Ie5gMmCause::decode(buf).map_err(|e| {
-            AuthenticationError::InvalidIeValue(format!("Failed to decode 5GMM cause: {}", e))
+            AuthenticationError::InvalidIeValue(format!("Failed to decode 5GMM cause: {e}"))
         })?;
 
         let mut msg = Self::new(mm_cause);

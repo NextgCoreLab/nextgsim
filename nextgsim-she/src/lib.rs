@@ -55,19 +55,25 @@
 //! let placement = she.place_workload(workload_id, requirements)?;
 //! ```
 
+pub mod autoscale;
 pub mod error;
 pub mod messages;
 pub mod resource;
 pub mod scheduler;
+pub mod security;
+pub mod sla;
 pub mod task;
 pub mod tier;
 pub mod workload;
 
 // Re-export main types
+pub use autoscale::{AutoScaleConfig, AutoScaler, ScalingAction, ScalingDecision, ScalingPolicy};
 pub use error::SheError;
 pub use messages::{SheMessage, SheResponse};
-pub use resource::{ResourceCapacity, ResourceUsage};
-pub use scheduler::{PlacementDecision, WorkloadScheduler};
+pub use resource::{AcceleratorType, ResourceCapacity, ResourceUsage};
+pub use scheduler::{PlacementDecision, SchedulingPolicy, WorkloadScheduler};
+pub use security::{AttestationEvidence, AttestationResult, SecurityContext, SecurityManager, TeeType};
+pub use sla::{SlaContract, SlaMetric, SlaMonitor, SlaObjective, SlaViolation};
 pub use task::SheTask;
 pub use tier::{ComputeCapability, ComputeNode, ComputeTier, TierManager};
 pub use workload::{Workload, WorkloadId, WorkloadRequirements, WorkloadState};

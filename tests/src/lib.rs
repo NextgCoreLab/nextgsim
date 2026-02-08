@@ -17,10 +17,11 @@
 //! 3. **User Plane Tests** - Test GTP-U data flow
 //! 4. **Multi-UE Tests** - Test scenarios with multiple concurrent UEs
 
+pub mod ai_integration;
+pub mod cross_crate_integration;
 pub mod mock_amf;
 pub mod test_fixtures;
 pub mod test_utils;
-pub mod ai_integration;
 
 pub use mock_amf::{MockAmf, MockAmfConfig, MockAmfEvent};
 pub use test_fixtures::{TestConfig, TestUeConfig, TestGnbConfig};

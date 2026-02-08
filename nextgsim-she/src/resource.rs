@@ -2,6 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Accelerator type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AcceleratorType {
+    /// Graphics Processing Unit
+    Gpu,
+    /// Neural Processing Unit
+    Npu,
+    /// Tensor Processing Unit
+    Tpu,
+    /// Field-Programmable Gate Array
+    Fpga,
+}
+
 /// Resource capacity specification
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ResourceCapacity {
@@ -11,6 +24,12 @@ pub struct ResourceCapacity {
     pub memory_bytes: u64,
     /// Number of GPUs
     pub gpu_count: u32,
+    /// Number of NPUs (Neural Processing Units)
+    pub npu_count: u32,
+    /// Number of TPUs (Tensor Processing Units)
+    pub tpu_count: u32,
+    /// Number of FPGAs
+    pub fpga_count: u32,
 }
 
 impl ResourceCapacity {
@@ -20,6 +39,9 @@ impl ResourceCapacity {
             compute_flops,
             memory_bytes,
             gpu_count,
+            npu_count: 0,
+            tpu_count: 0,
+            fpga_count: 0,
         }
     }
 
@@ -40,6 +62,24 @@ impl ResourceCapacity {
     /// Sets the GPU count
     pub fn with_gpus(mut self, count: u32) -> Self {
         self.gpu_count = count;
+        self
+    }
+
+    /// Sets the NPU count
+    pub fn with_npus(mut self, count: u32) -> Self {
+        self.npu_count = count;
+        self
+    }
+
+    /// Sets the TPU count
+    pub fn with_tpus(mut self, count: u32) -> Self {
+        self.tpu_count = count;
+        self
+    }
+
+    /// Sets the FPGA count
+    pub fn with_fpgas(mut self, count: u32) -> Self {
+        self.fpga_count = count;
         self
     }
 
@@ -177,7 +217,7 @@ mod tests {
     #[test]
     fn test_resource_capacity_display() {
         let cap = ResourceCapacity::with_tflops(10).with_memory_gb(64);
-        let display = format!("{}", cap);
+        let display = format!("{cap}");
         assert!(display.contains("10.00 TFLOPS"));
         assert!(display.contains("64.00 GB"));
     }
