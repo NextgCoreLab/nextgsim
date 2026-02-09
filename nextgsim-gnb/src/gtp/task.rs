@@ -174,6 +174,13 @@ impl GtpTask {
         }
     }
 
+    /// Handle PDU session modify from NGAP (updated tunnel endpoints)
+    fn handle_session_modify(&mut self, ue_id: i32, resource: PduSessionResource) {
+        // Delete existing session and recreate with updated tunnel info
+        let _ = self.tunnel_manager.delete_session(ue_id as u32, resource.psi as u8);
+        self.handle_session_create(ue_id, resource);
+    }
+
     /// Handle PDU session release from NGAP
     fn handle_session_release(&mut self, ue_id: i32, psi: i32) {
         match self.tunnel_manager.delete_session(ue_id as u32, psi as u8) {
@@ -560,6 +567,9 @@ impl Task for GtpTask {
                                 }
                                 GtpMessage::SessionCreate { ue_id, resource } => {
                                     self.handle_session_create(ue_id, resource);
+                                }
+                                GtpMessage::SessionModify { ue_id, resource } => {
+                                    self.handle_session_modify(ue_id, resource);
                                 }
                                 GtpMessage::SessionRelease { ue_id, psi } => {
                                     self.handle_session_release(ue_id, psi);

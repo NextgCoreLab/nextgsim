@@ -426,6 +426,13 @@ pub enum GtpMessage {
         /// PDU session resource
         resource: PduSessionResource,
     },
+    /// PDU session modify (from NGAP)
+    SessionModify {
+        /// UE ID
+        ue_id: i32,
+        /// PDU session resource (updated tunnel info)
+        resource: PduSessionResource,
+    },
     /// PDU session release (from NGAP)
     SessionRelease {
         /// UE ID

@@ -438,6 +438,56 @@ impl UeApp {
                                                 let cause = if pdu.len() > 4 { pdu.data()[4] } else { 0 };
                                                 warn!("PDU Session Establishment Reject: cause={}", cause);
                                             }
+                                            SmMessageType::PduSessionReleaseCommand => {
+                                                // Network requests PDU session release
+                                                info!("PDU Session Release Command received: PSI={}", psi);
+
+                                                // Deactivate TUN interface for this session
+                                                let _ = tun_tx.send(TunMessage::WriteData {
+                                                    psi: psi as i32,
+                                                    data: vec![].into(), // empty = signal close
+                                                }).await;
+
+                                                // Send PDU Session Release Complete
+                                                let release_complete = nextgsim_nas::messages::sm::PduSessionReleaseComplete::new(psi, pti);
+                                                let mut nas_pdu = Vec::new();
+                                                release_complete.encode(&mut nas_pdu);
+
+                                                info!("Sending PDU Session Release Complete: PSI={}, len={}", psi, nas_pdu.len());
+
+                                                pdu_counter += 1;
+                                                let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                                    pdu_id: pdu_counter,
+                                                    pdu: nas_pdu.into(),
+                                                }).await;
+
+                                                if psi == 1 {
+                                                    pdu_session_requested = false;
+                                                }
+                                            }
+                                            SmMessageType::PduSessionModificationCommand => {
+                                                // Network modifies PDU session parameters
+                                                info!("PDU Session Modification Command received: PSI={}", psi);
+
+                                                // Send PDU Session Modification Complete
+                                                let mod_complete = nextgsim_nas::messages::sm::PduSessionModificationComplete::new(psi, pti);
+                                                let mut nas_pdu = Vec::new();
+                                                mod_complete.encode(&mut nas_pdu);
+
+                                                info!("Sending PDU Session Modification Complete: PSI={}, len={}", psi, nas_pdu.len());
+
+                                                pdu_counter += 1;
+                                                let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                                    pdu_id: pdu_counter,
+                                                    pdu: nas_pdu.into(),
+                                                }).await;
+                                            }
+                                            SmMessageType::PduSessionReleaseReject => {
+                                                warn!("PDU Session Release Reject: PSI={}", psi);
+                                            }
+                                            SmMessageType::PduSessionModificationReject => {
+                                                warn!("PDU Session Modification Reject: PSI={}", psi);
+                                            }
                                             _ => {
                                                 info!("Unhandled 5GSM message type: {:?}", sm_type);
                                             }
@@ -660,6 +710,38 @@ impl UeApp {
                                             mm_state.switch_mm_state(MmSubState::Deregistered);
                                             registration_sent = false;
                                         }
+                                        MmMessageType::ServiceAccept => {
+                                            info!("Service Accept received - UE is now CONNECTED");
+                                            mm_state.switch_mm_state(MmSubState::Registered);
+                                            mm_state.switch_cm_state(nextgsim_ue::nas::mm::CmState::Connected);
+                                        }
+                                        MmMessageType::ServiceReject => {
+                                            let cause = if pdu.len() > 3 { pdu.data()[3] } else { 0 };
+                                            warn!("Service Reject received: cause={}", cause);
+                                            mm_state.switch_mm_state(MmSubState::Registered);
+                                        }
+                                        MmMessageType::DlNasTransport => {
+                                            // DL NAS Transport contains an embedded SM message
+                                            // Parse payload container to extract inner NAS PDU
+                                            if pdu.len() > 7 {
+                                                let header_len = 3; // EPD + SecHdr + MsgType
+                                                let payload_type = pdu.data()[header_len]; // Payload container type
+                                                if payload_type == 0x01 { // N1 SM information
+                                                    let container_len = u16::from_be_bytes([
+                                                        pdu.data()[header_len + 1],
+                                                        pdu.data()[header_len + 2],
+                                                    ]) as usize;
+                                                    if container_len > 0 && header_len + 3 + container_len <= pdu.len() {
+                                                        // Forward the embedded SM PDU back through NAS delivery
+                                                        let inner_pdu = pdu.data()[header_len + 3..header_len + 3 + container_len].to_vec();
+                                                        info!("DL NAS Transport: forwarding embedded SM PDU, len={}", inner_pdu.len());
+                                                        let _ = task_base.nas_tx.send(
+                                                            NasMessage::NasDelivery { pdu: inner_pdu.into() }
+                                                        ).await;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         _ => {
                                             info!("Unhandled NAS message type: {:?}", msg_type);
                                         }
@@ -693,6 +775,49 @@ impl UeApp {
                         }
                         NasMessage::Paging { paging_tmsi } => {
                             info!("Paging received: {} TMSIs", paging_tmsi.len());
+
+                            // If registered and CM-IDLE, send Service Request to transition to CONNECTED
+                            if mm_state.is_registered() && mm_state.is_idle() {
+                                info!("Sending Service Request (paging-triggered)");
+
+                                use nextgsim_nas::messages::mm::ServiceRequest;
+                                use nextgsim_nas::ies::ie1::{IeServiceType, ServiceType};
+
+                                // Build 5G-S-TMSI: type (1) + AMF Set ID/Pointer (2) + TMSI (4)
+                                let tmsi_data = if let Some(first) = paging_tmsi.first() {
+                                    let mut data = vec![0xF4]; // TMSI type indicator
+                                    // AMF Set ID (10 bits) + AMF Pointer (6 bits) = 2 bytes
+                                    let set_ptr = ((first.amf_set_id & 0x3FF) << 6) | (first.amf_pointer as u16 & 0x3F);
+                                    data.extend_from_slice(&set_ptr.to_be_bytes());
+                                    data.extend_from_slice(&first.tmsi.to_be_bytes());
+                                    data
+                                } else {
+                                    vec![0xF4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+                                };
+
+                                let tmsi = Ie5gsMobileIdentity::new(
+                                    MobileIdentityType::Tmsi,
+                                    tmsi_data,
+                                );
+
+                                let svc_req = ServiceRequest::new(
+                                    NasKeySetIdentifier::no_key(),
+                                    IeServiceType::new(ServiceType::MobileTerminatedServices),
+                                    tmsi,
+                                );
+
+                                let mut nas_pdu = Vec::new();
+                                svc_req.encode(&mut nas_pdu);
+
+                                info!("Sending Service Request, PDU len={}", nas_pdu.len());
+                                mm_state.switch_mm_state(MmSubState::ServiceRequestInitiated);
+
+                                pdu_counter += 1;
+                                let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                    pdu_id: pdu_counter,
+                                    pdu: nas_pdu.into(),
+                                }).await;
+                            }
                         }
                         NasMessage::ActiveCellChanged { previous_tai } => {
                             info!("Active cell changed from TAI: {:?}", previous_tai);
@@ -759,21 +884,103 @@ impl UeApp {
                                 "Initiating PDU session establishment: PSI={}, PTI={}, type={}, apn={:?}",
                                 psi, pti, session_type, apn
                             );
-                            // Note: This message is sent from App task when user requests PDU session
-                            // establishment via CLI. The actual implementation would encode and send
-                            // a PDU Session Establishment Request message here.
+
+                            // Build PDU Session Establishment Request NAS PDU
+                            let mut nas_pdu = Vec::new();
+
+                            // SM Header: EPD (0x2E) + PSI + PTI + Message Type (0xC1)
+                            nas_pdu.put_u8(0x2E); // EPD: 5GSM
+                            nas_pdu.put_u8(psi);  // PDU Session ID
+                            nas_pdu.put_u8(pti);  // PTI
+                            nas_pdu.put_u8(0xC1); // Message Type: PDU Session Establishment Request
+
+                            // Mandatory IE: Integrity protection maximum data rate (9.11.4.7)
+                            nas_pdu.put_u8(0xFF); // Max data rate UL: full rate
+                            nas_pdu.put_u8(0xFF); // Max data rate DL: full rate
+
+                            // Optional IE: PDU session type (9.11.4.11)
+                            let pdu_type = match session_type.as_str() {
+                                "IPv6" => 0x02,
+                                "IPv4v6" => 0x03,
+                                _ => 0x01, // IPv4
+                            };
+                            nas_pdu.put_u8(0x91); // IEI for PDU session type
+                            nas_pdu.put_u8(pdu_type);
+
+                            // Optional IE: SSC mode (9.11.4.16)
+                            nas_pdu.put_u8(0xA1); // IEI for SSC mode
+                            nas_pdu.put_u8(0x01); // SSC mode 1
+
+                            info!("Sending PDU Session Establishment Request: PSI={}, PTI={}, type={}, len={}",
+                                  psi, pti, session_type, nas_pdu.len());
+
+                            pdu_counter += 1;
+                            let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                pdu_id: pdu_counter,
+                                pdu: nas_pdu.into(),
+                            }).await;
                         }
                         NasMessage::InitiatePduSessionRelease { psi, pti } => {
                             info!("Initiating PDU session release: PSI={}, PTI={}", psi, pti);
-                            // Note: This message is sent from App task when user requests PDU session
-                            // release via CLI. The actual implementation would encode and send
-                            // a PDU Session Release Request message here.
+
+                            // Build PDU Session Release Request NAS PDU
+                            let release_req = nextgsim_nas::messages::sm::PduSessionReleaseRequest::new(psi, pti);
+                            let mut nas_pdu = Vec::new();
+                            release_req.encode(&mut nas_pdu);
+
+                            info!("Sending PDU Session Release Request: PSI={}, PTI={}, len={}", psi, pti, nas_pdu.len());
+
+                            pdu_counter += 1;
+                            let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                pdu_id: pdu_counter,
+                                pdu: nas_pdu.into(),
+                            }).await;
                         }
                         NasMessage::InitiateDeregistration { switch_off } => {
                             info!("Initiating deregistration: switch_off={}", switch_off);
-                            // Note: This message is sent from App task when user requests deregistration
-                            // via CLI. The actual implementation would encode and send
-                            // a Deregistration Request message here.
+
+                            use nextgsim_nas::messages::mm::DeregistrationRequestUeOriginating;
+                            use nextgsim_nas::ies::ie1::{
+                                IeDeRegistrationType, DeRegistrationAccessType,
+                                SwitchOff as NasSwitchOff, ReRegistrationRequired,
+                            };
+
+                            let switch_off_val = if switch_off {
+                                NasSwitchOff::SwitchOff
+                            } else {
+                                NasSwitchOff::NormalDeRegistration
+                            };
+
+                            let dereg_type = IeDeRegistrationType::new(
+                                DeRegistrationAccessType::ThreeGppAccess,
+                                ReRegistrationRequired::NotRequired,
+                                switch_off_val,
+                            );
+
+                            let suci_data = build_suci_null_scheme("999", "70", "0000000001");
+                            let mobile_identity = Ie5gsMobileIdentity::new(
+                                MobileIdentityType::Suci,
+                                suci_data,
+                            );
+
+                            let dereg_req = DeregistrationRequestUeOriginating::new(
+                                dereg_type,
+                                NasKeySetIdentifier::no_key(),
+                                mobile_identity,
+                            );
+
+                            let mut nas_pdu = Vec::new();
+                            dereg_req.encode(&mut nas_pdu);
+
+                            info!("Sending Deregistration Request: switch_off={}, len={}", switch_off, nas_pdu.len());
+
+                            mm_state.switch_mm_state(MmSubState::DeregisteredInitiated);
+
+                            pdu_counter += 1;
+                            let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                pdu_id: pdu_counter,
+                                pdu: nas_pdu.into(),
+                            }).await;
                         }
                         NasMessage::DownlinkDataDelivery { psi, data } => {
                             // Forward downlink data to TUN interface
