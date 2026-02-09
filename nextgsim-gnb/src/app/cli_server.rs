@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_cli_message_decode_wrong_version() {
-        let mut msg = CliMessage::command("test".to_string(), "cmd".to_string(), test_addr());
+        let msg = CliMessage::command("test".to_string(), "cmd".to_string(), test_addr());
         let mut encoded = msg.encode();
         encoded[0] = 99; // Wrong major version
         assert!(CliMessage::decode(&encoded, test_addr()).is_none());

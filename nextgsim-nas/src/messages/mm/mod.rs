@@ -34,18 +34,31 @@
 //! ## Status Messages
 //!
 //! - [`FiveGMmStatus`] - 5GMM status message for error reporting
+//!
+//! ## NAS Transport Messages
+//!
+//! - [`UlNasTransport`] - UE to network NAS transport
+//! - [`DlNasTransport`] - Network to UE NAS transport
+//!
+//! ## Notification Messages
+//!
+//! - [`Notification`] - Network to UE notification
 
-mod authentication;
+pub mod authentication;
 mod deregistration;
 mod identity;
+pub mod nas_transport;
+pub mod notification;
 mod registration;
-mod security_mode;
+pub mod security_mode;
 mod service;
 mod status;
 
 pub use authentication::*;
 pub use deregistration::*;
 pub use identity::*;
+pub use nas_transport::*;
+pub use notification::*;
 pub use registration::*;
 pub use security_mode::*;
 pub use service::*;

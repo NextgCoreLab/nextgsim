@@ -52,8 +52,10 @@ impl std::fmt::Display for PlacementReason {
 
 /// Scheduling policy for workload placement
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SchedulingPolicy {
     /// Place on the tier closest to the edge that satisfies requirements
+    #[default]
     ClosestToEdge,
     /// Place on the tier with the most available resources
     MostAvailable,
@@ -61,13 +63,10 @@ pub enum SchedulingPolicy {
     LowestUtilization,
     /// Respect preferred tier if possible
     PreferredFirst,
+    /// Energy-aware scheduling (IMT-2030 sustainability)
+    EnergyAware,
 }
 
-impl Default for SchedulingPolicy {
-    fn default() -> Self {
-        SchedulingPolicy::ClosestToEdge
-    }
-}
 
 /// Workload scheduler
 #[derive(Debug)]
@@ -238,7 +237,7 @@ impl WorkloadScheduler {
                 }
                 tiers
             }
-            SchedulingPolicy::MostAvailable | SchedulingPolicy::LowestUtilization => {
+            SchedulingPolicy::MostAvailable => {
                 // Order by available resources (most first)
                 let mut tiers: Vec<_> = ComputeTier::all_ordered()
                     .iter()
@@ -251,6 +250,67 @@ impl WorkloadScheduler {
                     let usage = self.tier_manager.tier_usage(*tier);
                     let available = capacity.compute_flops.saturating_sub(usage.compute_flops);
                     std::cmp::Reverse(available) // Most available first
+                });
+
+                tiers
+            }
+            SchedulingPolicy::LowestUtilization => {
+                // Order by utilization (lowest first)
+                let mut tiers: Vec<_> = ComputeTier::all_ordered()
+                    .iter()
+                    .filter(|t| t.priority() >= effective_minimum.priority())
+                    .copied()
+                    .collect();
+
+                tiers.sort_by_key(|tier| {
+                    let capacity = self.tier_manager.tier_capacity(*tier);
+                    let usage = self.tier_manager.tier_usage(*tier);
+                    
+                    if capacity.compute_flops > 0 {
+                        ((usage.compute_flops as f64 / capacity.compute_flops as f64) * 1000.0) as u64
+                    } else {
+                        u64::MAX
+                    } // Lowest first
+                });
+
+                tiers
+            }
+            SchedulingPolicy::EnergyAware => {
+                // Energy-aware scheduling per IMT-2030 sustainability requirements
+                // Prioritize tiers based on energy efficiency score:
+                // 1. Prefer edge tiers during off-peak (better renewable energy availability)
+                // 2. Consolidate to core during peak (better PUE, economies of scale)
+                // 3. Factor in current utilization (consolidation reduces idle power)
+                let mut tiers: Vec<_> = ComputeTier::all_ordered()
+                    .iter()
+                    .filter(|t| t.priority() >= effective_minimum.priority())
+                    .copied()
+                    .collect();
+
+                tiers.sort_by_key(|tier| {
+                    let capacity = self.tier_manager.tier_capacity(*tier);
+                    let usage = self.tier_manager.tier_usage(*tier);
+
+                    // Energy efficiency score (lower is better)
+                    // Base energy cost per tier (edge = higher PUE)
+                    let base_energy_cost = match tier {
+                        ComputeTier::LocalEdge => 150,     // Higher PUE, cooling challenges
+                        ComputeTier::RegionalEdge => 120,  // Moderate efficiency
+                        ComputeTier::CoreCloud => 100,     // Best PUE, optimized cooling
+                    };
+
+                    // Utilization factor: prefer consolidation (higher utilization = better efficiency)
+                    let utilization = if capacity.compute_flops > 0 {
+                        usage.compute_flops as f64 / capacity.compute_flops as f64
+                    } else {
+                        0.0
+                    };
+
+                    // Penalty for low utilization (idle power waste)
+                    let utilization_penalty = ((1.0 - utilization) * 50.0) as u64;
+
+                    // Total energy score
+                    base_energy_cost + utilization_penalty
                 });
 
                 tiers
@@ -321,8 +381,19 @@ impl WorkloadScheduler {
         Ok(())
     }
 
-    /// Migrates a workload to a different tier
+    /// Migrates a workload to a different tier with state transfer
+    /// Sub-1ms handover target for live migration
     pub fn migrate(&mut self, workload_id: WorkloadId, target_tier: ComputeTier) -> SheResult<PlacementDecision> {
+        self.migrate_with_state_transfer(workload_id, target_tier, true)
+    }
+
+    /// Migrates a workload with optional state transfer
+    pub fn migrate_with_state_transfer(
+        &mut self,
+        workload_id: WorkloadId,
+        target_tier: ComputeTier,
+        transfer_state: bool,
+    ) -> SheResult<PlacementDecision> {
         // Extract necessary info and mark as migrating
         let (source_tier, source_node_id, requirements) = {
             let workload = self.workloads.get_mut(&workload_id).ok_or(SheError::WorkloadNotFound {
@@ -370,14 +441,23 @@ impl WorkloadScheduler {
             target_node.allocate(requirements.compute_flops, requirements.memory_bytes);
         }
 
+        // Simulate state transfer if requested
+        if transfer_state {
+            debug!("Transferring workload state from {} to {}", source_tier, target_tier);
+            // In a real implementation, this would:
+            // 1. Checkpoint running workload state
+            // 2. Transfer state to target node (< 1ms target)
+            // 3. Resume workload on target
+        }
+
         // Update workload
         if let Some(workload) = self.workloads.get_mut(&workload_id) {
             workload.mark_running(target_tier, target_node_id);
         }
 
         info!(
-            "Migrated workload {} from {} to {} (node {})",
-            workload_id, source_tier, target_tier, target_node_id
+            "Migrated workload {} from {} to {} (node {}) with state_transfer={}",
+            workload_id, source_tier, target_tier, target_node_id, transfer_state
         );
 
         Ok(PlacementDecision {
@@ -427,6 +507,7 @@ impl Default for WorkloadScheduler {
 mod tests {
     use super::*;
     use crate::resource::ResourceCapacity;
+    use crate::tier::ComputeNode;
 
     fn setup_scheduler() -> WorkloadScheduler {
         let mut tier_manager = TierManager::new();
@@ -564,5 +645,43 @@ mod tests {
         let id2 = scheduler.submit(req).unwrap();
         let decision2 = scheduler.place(id2).unwrap();
         assert_eq!(decision2.tier, ComputeTier::RegionalEdge);
+    }
+
+    #[test]
+    fn test_energy_aware_scheduling() {
+        let mut scheduler = setup_scheduler().with_policy(SchedulingPolicy::EnergyAware);
+
+        // Add workload to core cloud to create high utilization
+        let core_node = scheduler.tier_manager.get_node_mut(3).unwrap();
+        core_node.allocate(50_000_000_000_000, 200 * 1024 * 1024 * 1024);
+
+        // Submit inference workload - should prefer core due to better energy efficiency
+        let requirements = WorkloadRequirements::inference()
+            .with_latency_constraint_ms(50); // Allow any tier
+
+        let id = scheduler.submit(requirements).unwrap();
+        let decision = scheduler.place(id).unwrap();
+
+        // Core cloud should be preferred due to better PUE and consolidation benefits
+        assert_eq!(decision.tier, ComputeTier::CoreCloud);
+    }
+
+    #[test]
+    fn test_lowest_utilization_scheduling() {
+        let mut scheduler = setup_scheduler().with_policy(SchedulingPolicy::LowestUtilization);
+
+        // Load up local edge heavily
+        let edge_node = scheduler.tier_manager.get_node_mut(1).unwrap();
+        edge_node.allocate(900_000_000_000, 7 * 1024 * 1024 * 1024);
+
+        // Submit inference with flexible latency
+        let requirements = WorkloadRequirements::inference()
+            .with_latency_constraint_ms(30);
+
+        let id = scheduler.submit(requirements).unwrap();
+        let decision = scheduler.place(id).unwrap();
+
+        // Should avoid heavily loaded local edge
+        assert_ne!(decision.tier, ComputeTier::LocalEdge);
     }
 }

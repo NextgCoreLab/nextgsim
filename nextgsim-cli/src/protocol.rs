@@ -49,7 +49,7 @@ impl TryFrom<u8> for MessageType {
             2 => Ok(MessageType::Error),
             3 => Ok(MessageType::Result),
             4 => Ok(MessageType::Command),
-            _ => anyhow::bail!("Invalid message type: {}", value),
+            _ => anyhow::bail!("Invalid message type: {value}"),
         }
     }
 }
@@ -150,13 +150,7 @@ impl CliMessage {
 
         if major != VERSION_MAJOR || minor != VERSION_MINOR || patch != VERSION_PATCH {
             anyhow::bail!(
-                "Version mismatch: got {}.{}.{}, expected {}.{}.{}",
-                major,
-                minor,
-                patch,
-                VERSION_MAJOR,
-                VERSION_MINOR,
-                VERSION_PATCH
+                "Version mismatch: got {major}.{minor}.{patch}, expected {VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
             );
         }
 

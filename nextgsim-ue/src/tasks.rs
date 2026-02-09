@@ -115,8 +115,10 @@ impl<T> TaskMessage<T> {
 ///
 /// Based on UERANSIM's NtsTask lifecycle from `src/utils/nts.hpp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TaskState {
     /// Task is created but not yet started
+    #[default]
     Created,
     /// Task is running and processing messages
     Running,
@@ -128,11 +130,6 @@ pub enum TaskState {
     Failed,
 }
 
-impl Default for TaskState {
-    fn default() -> Self {
-        TaskState::Created
-    }
-}
 
 impl std::fmt::Display for TaskState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1463,7 +1460,7 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextgsim_common::Plmn;
+    
 
     /// Creates a test UeConfig for unit tests.
     fn test_config() -> UeConfig {
@@ -1712,7 +1709,7 @@ mod tests {
         let (manager, _app_rx, _nas_rx, _rrc_rx, _rls_rx) =
             TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
 
-        let mut shutdown_rx = manager.shutdown_receiver();
+        let shutdown_rx = manager.shutdown_receiver();
         assert!(!*shutdown_rx.borrow());
     }
 
@@ -1743,6 +1740,6 @@ mod tests {
             task_id: TaskId::Rls,
             message: "Connection timeout".to_string(),
         };
-        assert_eq!(format!("{}", error), "Task RLS error: Connection timeout");
+        assert_eq!(format!("{error}"), "Task RLS error: Connection timeout");
     }
 }

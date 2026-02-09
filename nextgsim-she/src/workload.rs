@@ -42,13 +42,18 @@ pub enum WorkloadType {
     DataProcessing,
     /// Analytics workload
     Analytics,
+    /// ISAC sensing data processing
+    SensingProcessing,
+    /// Semantic communication encoding/decoding
+    SemanticCoding,
 }
 
 impl WorkloadType {
     /// Returns the required capability for this workload type
     pub fn required_capability(&self) -> ComputeCapability {
         match self {
-            WorkloadType::Inference | WorkloadType::DataProcessing | WorkloadType::Analytics => {
+            WorkloadType::Inference | WorkloadType::DataProcessing | WorkloadType::Analytics
+            | WorkloadType::SensingProcessing | WorkloadType::SemanticCoding => {
                 ComputeCapability::Inference
             }
             WorkloadType::FineTuning => ComputeCapability::FineTuning,
@@ -65,6 +70,8 @@ impl std::fmt::Display for WorkloadType {
             WorkloadType::Training => write!(f, "Training"),
             WorkloadType::DataProcessing => write!(f, "DataProcessing"),
             WorkloadType::Analytics => write!(f, "Analytics"),
+            WorkloadType::SensingProcessing => write!(f, "SensingProcessing"),
+            WorkloadType::SemanticCoding => write!(f, "SemanticCoding"),
         }
     }
 }
@@ -173,6 +180,38 @@ impl WorkloadRequirements {
             cell_id: None,
             model_name: None,
             priority: 1,
+        }
+    }
+
+    /// Creates new requirements for sensing processing workload
+    pub fn sensing_processing() -> Self {
+        Self {
+            workload_type: WorkloadType::SensingProcessing,
+            latency_constraint_ms: Some(10), // Real-time sensing at edge
+            compute_flops: 5_000_000_000, // 5 GFLOPS for fusion algorithms
+            memory_bytes: 1024 * 1024 * 1024, // 1 GB
+            capability: ComputeCapability::Inference,
+            preferred_tier: Some(ComputeTier::LocalEdge),
+            ue_id: None,
+            cell_id: None,
+            model_name: None,
+            priority: 7, // High priority for real-time sensing
+        }
+    }
+
+    /// Creates new requirements for semantic coding workload
+    pub fn semantic_coding() -> Self {
+        Self {
+            workload_type: WorkloadType::SemanticCoding,
+            latency_constraint_ms: Some(15), // Near real-time encoding/decoding
+            compute_flops: 10_000_000_000, // 10 GFLOPS for neural codecs
+            memory_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
+            capability: ComputeCapability::Inference,
+            preferred_tier: Some(ComputeTier::LocalEdge),
+            ue_id: None,
+            cell_id: None,
+            model_name: None,
+            priority: 6,
         }
     }
 
@@ -353,7 +392,7 @@ mod tests {
     fn test_workload_id() {
         let id = WorkloadId::new(42);
         assert_eq!(id.value(), 42);
-        assert_eq!(format!("{}", id), "WL-42");
+        assert_eq!(format!("{id}"), "WL-42");
     }
 
     #[test]

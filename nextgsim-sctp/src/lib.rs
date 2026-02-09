@@ -56,12 +56,24 @@
 
 pub mod association;
 pub mod server;
+pub mod quic;
 
 // Re-export main types
 pub use association::{
     AssociationState, ReceivedMessage, SctpAssociation, SctpConfig, SctpError, SctpEvent,
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_NUM_STREAMS, DEFAULT_RECEIVE_BUFFER_SIZE, NGAP_PPID,
+    // Multi-homing support (A6.1)
+    MultihomingConfig, PathManager, PathState, SctpPath,
+    // PR-SCTP support (A6.2)
+    ForwardTsnChunk, ForwardTsnStreamInfo, PartialReliabilityPolicy,
+    PrSctpMessage, PrSctpTracker,
 };
 
 // Re-export server types
 pub use server::{SctpServer, SctpServerConfig, ServerEvent};
+
+// Re-export QUIC transport types (A6.3 - 6G forward-looking)
+pub use quic::{
+    QuicConnectionState, QuicTransport, QuicTransportConfig, QuicTransportError,
+    TlsConfig, Transport, TransportMessage,
+};

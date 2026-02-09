@@ -189,6 +189,7 @@ impl DeregistrationAcceptUeOriginating {
 ///
 /// 3GPP TS 24.501 Section 8.2.13
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct DeregistrationRequestUeTerminated {
     /// De-registration type (mandatory, Type 1)
     pub deregistration_type: IeDeRegistrationType,
@@ -198,15 +199,6 @@ pub struct DeregistrationRequestUeTerminated {
     pub t3346_value: Option<u8>,
 }
 
-impl Default for DeregistrationRequestUeTerminated {
-    fn default() -> Self {
-        Self {
-            deregistration_type: IeDeRegistrationType::default(),
-            mm_cause: None,
-            t3346_value: None,
-        }
-    }
-}
 
 impl DeregistrationRequestUeTerminated {
     /// Create a new Deregistration Request (UE terminated) with mandatory fields

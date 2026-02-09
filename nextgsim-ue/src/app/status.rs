@@ -224,6 +224,7 @@ impl Default for StatusReporter {
 ///
 /// This structure contains static UE information from configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct UeInfo {
     /// SUPI (Subscriber Permanent Identifier) if configured
     #[serde(rename = "supi", skip_serializing_if = "Option::is_none")]
@@ -239,16 +240,6 @@ pub struct UeInfo {
     pub pending_procedures: usize,
 }
 
-impl Default for UeInfo {
-    fn default() -> Self {
-        Self {
-            supi: None,
-            imei: None,
-            pdu_sessions: Vec::new(),
-            pending_procedures: 0,
-        }
-    }
-}
 
 impl UeInfo {
     /// Creates a new UeInfo with default values.
@@ -347,8 +338,8 @@ mod tests {
     fn test_ue_status_info_default() {
         let status = UeStatusInfo::new();
         assert_eq!(status.rm_state, "RM-DEREGISTERED");
-        assert_eq!(status.mm_state, "5GMM-NULL");
-        assert_eq!(status.mm_sub_state, "5GMM-NULL");
+        assert_eq!(status.mm_state, MmState::default().to_string());
+        assert_eq!(status.mm_sub_state, MmSubState::default().to_string());
         assert_eq!(status.cm_state, "CM-IDLE");
         assert!(status.pdu_sessions.is_empty());
     }

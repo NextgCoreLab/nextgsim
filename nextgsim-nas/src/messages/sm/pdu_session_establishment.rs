@@ -9,7 +9,7 @@ use bytes::{Buf, BufMut};
 use thiserror::Error;
 
 use crate::enums::SmMessageType;
-use crate::header::PlainSmHeader;
+
 
 /// Error type for PDU Session Establishment message encoding/decoding
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -243,8 +243,7 @@ impl TryFrom<u8> for PduSessionTypeValue {
             0b100 => Ok(PduSessionTypeValue::Unstructured),
             0b101 => Ok(PduSessionTypeValue::Ethernet),
             _ => Err(PduSessionEstablishmentError::InvalidIeValue(format!(
-                "Invalid PDU session type: 0x{:02X}",
-                value
+                "Invalid PDU session type: 0x{value:02X}"
             ))),
         }
     }
@@ -301,8 +300,7 @@ impl TryFrom<u8> for SscModeValue {
             0b010 => Ok(SscModeValue::SscMode2),
             0b011 => Ok(SscModeValue::SscMode3),
             _ => Err(PduSessionEstablishmentError::InvalidIeValue(format!(
-                "Invalid SSC mode: 0x{:02X}",
-                value
+                "Invalid SSC mode: 0x{value:02X}"
             ))),
         }
     }
@@ -573,8 +571,7 @@ impl TryFrom<u8> for PduAddressType {
             0b010 => Ok(PduAddressType::Ipv6),
             0b011 => Ok(PduAddressType::Ipv4v6),
             _ => Err(PduSessionEstablishmentError::InvalidIeValue(format!(
-                "Invalid PDU address type: 0x{:02X}",
-                value
+                "Invalid PDU address type: 0x{value:02X}"
             ))),
         }
     }

@@ -425,7 +425,7 @@ pub fn parse_ng_setup_response(pdu: &NGAP_PDU) -> Result<NgSetupResponseData, Ng
         _ => {
             return Err(NgSetupError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -587,7 +587,7 @@ pub fn parse_ng_setup_failure(pdu: &NGAP_PDU) -> Result<NgSetupFailureData, NgSe
         _ => {
             return Err(NgSetupError::InvalidMessageType {
                 expected: "UnsuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

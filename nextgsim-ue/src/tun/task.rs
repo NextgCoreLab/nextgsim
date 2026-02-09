@@ -229,7 +229,7 @@ impl TunTask {
                                 error!("TUN read error for PSI {}: {}", psi, e);
                                 let _ = app_tx
                                     .send(TunAppMessage::Error {
-                                        message: format!("TUN read error: {}", e),
+                                        message: format!("TUN read error: {e}"),
                                     })
                                     .await;
                                 break;
@@ -254,7 +254,7 @@ impl TunTask {
                 let _ = self
                     .app_tx
                     .send(TunAppMessage::Error {
-                        message: format!("Failed to create TUN interface: {}", e),
+                        message: format!("Failed to create TUN interface: {e}"),
                     })
                     .await;
             }
@@ -309,7 +309,7 @@ impl TunTask {
                 let _ = self
                     .app_tx
                     .send(TunAppMessage::Error {
-                        message: format!("TUN write error: {}", e),
+                        message: format!("TUN write error: {e}"),
                     })
                     .await;
             }
@@ -380,7 +380,7 @@ pub fn spawn_tun_reader(
                     error!("TUN read error for PSI {}: {}", psi, e);
                     let _ = app_tx
                         .send(TunAppMessage::Error {
-                            message: format!("TUN read error: {}", e),
+                            message: format!("TUN read error: {e}"),
                         })
                         .await;
                     break;

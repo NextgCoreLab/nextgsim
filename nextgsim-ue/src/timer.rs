@@ -637,14 +637,14 @@ impl NasTimerManager {
     ///
     /// Returns `None` if the timer code is not recognized.
     pub fn is_running(&self, code: u16) -> Option<bool> {
-        self.get_timer(code).map(|t| t.is_running())
+        self.get_timer(code).map(UeTimer::is_running)
     }
 
     /// Get the expiry count for a timer.
     ///
     /// Returns `None` if the timer code is not recognized.
     pub fn expiry_count(&self, code: u16) -> Option<u32> {
-        self.get_timer(code).map(|t| t.expiry_count())
+        self.get_timer(code).map(UeTimer::expiry_count)
     }
 
     /// Perform a tick on all timers and return any expiry events.
@@ -794,7 +794,7 @@ impl std::fmt::Debug for NasTimerManager {
         if running.is_empty() {
             write!(f, "NasTimerManager {{ no running timers }}")
         } else {
-            write!(f, "NasTimerManager {{ running: {:?} }}", running)
+            write!(f, "NasTimerManager {{ running: {running:?} }}")
         }
     }
 }
@@ -913,10 +913,10 @@ mod tests {
     #[test]
     fn test_timer_display() {
         let mut timer = UeTimer::new(3510, true, 15);
-        assert_eq!(format!("{}", timer), "T3510: .");
+        assert_eq!(format!("{timer}"), "T3510: .");
 
         timer.start(true);
-        let display = format!("{}", timer);
+        let display = format!("{timer}");
         assert!(display.starts_with("T3510: rem["));
         assert!(display.contains("] int[15]"));
     }
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_timer_manager_expiry_count() {
-        let mut manager = NasTimerManager::new();
+        let manager = NasTimerManager::new();
 
         assert_eq!(manager.expiry_count(TIMER_T3510), Some(0));
         assert_eq!(manager.expiry_count(9999), None);
@@ -1117,12 +1117,12 @@ mod tests {
         let mut manager = NasTimerManager::new();
 
         // No running timers
-        let debug_str = format!("{:?}", manager);
+        let debug_str = format!("{manager:?}");
         assert!(debug_str.contains("no running timers"));
 
         // With running timers
         manager.start(TIMER_T3510, true);
-        let debug_str = format!("{:?}", manager);
+        let debug_str = format!("{manager:?}");
         assert!(debug_str.contains("running"));
         assert!(debug_str.contains("3510"));
     }

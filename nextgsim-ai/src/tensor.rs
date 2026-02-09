@@ -79,7 +79,7 @@ impl fmt::Display for TensorShape {
             if *dim == -1 {
                 write!(f, "?")?;
             } else {
-                write!(f, "{}", dim)?;
+                write!(f, "{dim}")?;
             }
         }
         write!(f, "]")
@@ -107,7 +107,7 @@ impl From<&[i64]> for TensorShape {
 /// - Int32: 32-bit integers
 /// - Int64: 64-bit integers
 /// - Uint8: Unsigned 8-bit (for quantized models)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TensorData {
     /// 32-bit floating point data
     Float32 {
@@ -317,6 +317,122 @@ impl TensorData {
         let expected = self.shape().num_elements();
         self.len() == expected
     }
+
+    /// Scales tensor data by a factor (for federated learning aggregation)
+    pub fn scale(&self, factor: f32) -> Self {
+        match self {
+            TensorData::Float32 { data, shape } => {
+                let scaled_data: Vec<f32> = data.iter().map(|&x| x * factor).collect();
+                TensorData::Float32 {
+                    data: scaled_data,
+                    shape: shape.clone(),
+                }
+            }
+            TensorData::Float64 { data, shape } => {
+                let scaled_data: Vec<f64> = data.iter().map(|&x| x * factor as f64).collect();
+                TensorData::Float64 {
+                    data: scaled_data,
+                    shape: shape.clone(),
+                }
+            }
+            TensorData::Int32 { data, shape } => {
+                let scaled_data: Vec<i32> = data.iter().map(|&x| (x as f32 * factor) as i32).collect();
+                TensorData::Int32 {
+                    data: scaled_data,
+                    shape: shape.clone(),
+                }
+            }
+            TensorData::Int64 { data, shape } => {
+                let scaled_data: Vec<i64> = data.iter().map(|&x| (x as f32 * factor) as i64).collect();
+                TensorData::Int64 {
+                    data: scaled_data,
+                    shape: shape.clone(),
+                }
+            }
+            TensorData::Uint8 { data, shape } => {
+                let scaled_data: Vec<u8> = data.iter().map(|&x| ((x as f32 * factor).min(255.0).max(0.0)) as u8).collect();
+                TensorData::Uint8 {
+                    data: scaled_data,
+                    shape: shape.clone(),
+                }
+            }
+            TensorData::Float16 { data, shape } => {
+                let scaled_data: Vec<f16> = data.iter().map(|&x| f16::from_f32(x.to_f32() * factor)).collect();
+                TensorData::Float16 {
+                    data: scaled_data,
+                    shape: shape.clone(),
+                }
+            }
+        }
+    }
+
+    /// Adds two tensors element-wise (for federated learning aggregation)
+    pub fn add(&self, other: &TensorData) -> Result<Self, String> {
+        if self.shape().dims() != other.shape().dims() {
+            return Err(format!(
+                "Shape mismatch: {:?} vs {:?}",
+                self.shape().dims(),
+                other.shape().dims()
+            ));
+        }
+
+        match (self, other) {
+            (TensorData::Float32 { data: d1, shape }, TensorData::Float32 { data: d2, .. }) => {
+                let sum: Vec<f32> = d1.iter().zip(d2.iter()).map(|(&a, &b)| a + b).collect();
+                Ok(TensorData::Float32 {
+                    data: sum,
+                    shape: shape.clone(),
+                })
+            }
+            (TensorData::Float64 { data: d1, shape }, TensorData::Float64 { data: d2, .. }) => {
+                let sum: Vec<f64> = d1.iter().zip(d2.iter()).map(|(&a, &b)| a + b).collect();
+                Ok(TensorData::Float64 {
+                    data: sum,
+                    shape: shape.clone(),
+                })
+            }
+            _ => Err("Type mismatch or unsupported tensor type for addition".to_string()),
+        }
+    }
+
+    /// Adds Gaussian noise for differential privacy
+    pub fn add_gaussian_noise(&self, noise_multiplier: f32, _clipping_threshold: f32) -> Self {
+        use rand::thread_rng;
+        use rand::Rng;
+
+        let mut rng = thread_rng();
+
+        match self {
+            TensorData::Float32 { data, shape } => {
+                let noisy_data: Vec<f32> = data
+                    .iter()
+                    .map(|&x| {
+                        let noise: f32 = rng.gen_range(-noise_multiplier..noise_multiplier);
+                        x + noise
+                    })
+                    .collect();
+                TensorData::Float32 {
+                    data: noisy_data,
+                    shape: shape.clone(),
+                }
+            }
+            TensorData::Float64 { data, shape } => {
+                let noisy_data: Vec<f64> = data
+                    .iter()
+                    .map(|&x| {
+                        let noise: f64 = rng.gen_range(-(noise_multiplier as f64)..(noise_multiplier as f64));
+                        x + noise
+                    })
+                    .collect();
+                TensorData::Float64 {
+                    data: noisy_data,
+                    shape: shape.clone(),
+                }
+            }
+            // For integer types, just return a copy (noise not applicable)
+            other => other.clone(),
+        }
+    }
 }
 
 impl fmt::Display for TensorData {
@@ -373,7 +489,7 @@ mod tests {
     #[test]
     fn test_tensor_shape_display() {
         let shape = TensorShape::new(vec![1, -1, 3]);
-        assert_eq!(format!("{}", shape), "[1, ?, 3]");
+        assert_eq!(format!("{shape}"), "[1, ?, 3]");
     }
 
     #[test]
@@ -417,7 +533,7 @@ mod tests {
     #[test]
     fn test_tensor_data_display() {
         let tensor = TensorData::float32(vec![1.0, 2.0, 3.0], vec![3i64]);
-        let display = format!("{}", tensor);
+        let display = format!("{tensor}");
         assert!(display.contains("float32"));
         assert!(display.contains("3 elements"));
     }

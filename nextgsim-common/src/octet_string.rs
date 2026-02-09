@@ -179,7 +179,7 @@ impl OctetString {
 
     /// Appends `length` zero bytes.
     pub fn append_padding(&mut self, length: usize) {
-        self.data.extend(std::iter::repeat(0u8).take(length));
+        self.data.extend(std::iter::repeat_n(0u8, length));
     }
 
     // --- Accessor methods ---
@@ -262,7 +262,7 @@ impl OctetString {
     pub fn to_hex_string(&self) -> String {
         self.data
             .iter()
-            .map(|b| format!("{:02X}", b))
+            .map(|b| format!("{b:02X}"))
             .collect::<String>()
     }
 

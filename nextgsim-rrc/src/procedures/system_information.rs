@@ -350,7 +350,7 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
     let plmn_identity_list: Vec<PLMN_IdentityInfo> = params
         .plmn_identity_info_list
         .iter()
-        .map(|info| build_plmn_identity_info(info))
+        .map(build_plmn_identity_info)
         .collect();
 
     let cell_access_related_info = CellAccessRelatedInfo {
@@ -465,7 +465,7 @@ pub fn parse_sib1(msg: &BCCH_DL_SCH_Message) -> Result<Sib1Data, SystemInformati
         .plmn_identity_list
         .0
         .iter()
-        .map(|info| parse_plmn_identity_info(info))
+        .map(parse_plmn_identity_info)
         .collect();
 
     // Parse IMS emergency support

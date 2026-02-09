@@ -479,10 +479,7 @@ impl SctpAssociation {
         // Wait for shutdown to complete with timeout
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.state == AssociationState::ShuttingDown && Instant::now() < deadline {
-            match timeout(Duration::from_millis(100), self.handle_incoming()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => {}
-            }
+            if let Ok(Ok(())) = timeout(Duration::from_millis(100), self.handle_incoming()).await {}
             self.poll_events();
             self.flush_transmits().await?;
 
@@ -588,6 +585,645 @@ impl Drop for SctpAssociation {
     }
 }
 
+
+// ===========================================================================
+// A6.1: Multi-homing support
+// ===========================================================================
+
+/// State of a single network path in a multi-homed association
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathState {
+    /// Path is active and reachable
+    Active,
+    /// Path is inactive (heartbeat lost)
+    Inactive,
+    /// Path is being probed for reachability
+    Probing,
+    /// Path has permanently failed
+    Failed,
+}
+
+/// A single network path in a multi-homed SCTP association
+///
+/// Each path represents a (local_addr, remote_addr) pair that can be used
+/// for data transmission. SCTP multi-homing allows an association to use
+/// multiple network paths for redundancy.
+#[derive(Debug, Clone)]
+pub struct SctpPath {
+    /// Local address for this path
+    pub local_addr: SocketAddr,
+    /// Remote address for this path
+    pub remote_addr: SocketAddr,
+    /// Current state of the path
+    pub state: PathState,
+    /// Estimated RTT for this path
+    pub rtt: Duration,
+    /// Number of consecutive heartbeat failures
+    pub error_count: u32,
+    /// Maximum allowed consecutive errors before marking path as failed
+    pub max_retransmissions: u32,
+    /// Interval between heartbeat probes
+    pub heartbeat_interval: Duration,
+    /// Timestamp of last successful heartbeat acknowledgment
+    pub last_heartbeat_ack: Option<Instant>,
+    /// Timestamp of last sent heartbeat
+    pub last_heartbeat_sent: Option<Instant>,
+}
+
+impl SctpPath {
+    /// Create a new path
+    pub fn new(local_addr: SocketAddr, remote_addr: SocketAddr) -> Self {
+        Self {
+            local_addr,
+            remote_addr,
+            state: PathState::Active,
+            rtt: Duration::from_millis(200), // Initial RTT estimate
+            error_count: 0,
+            max_retransmissions: 5,
+            heartbeat_interval: Duration::from_secs(30),
+            last_heartbeat_ack: None,
+            last_heartbeat_sent: None,
+        }
+    }
+
+    /// Check if this path is usable for data transmission
+    pub fn is_usable(&self) -> bool {
+        self.state == PathState::Active
+    }
+
+    /// Record a heartbeat acknowledgment
+    pub fn heartbeat_ack(&mut self) {
+        self.error_count = 0;
+        self.state = PathState::Active;
+        self.last_heartbeat_ack = Some(Instant::now());
+    }
+
+    /// Record a heartbeat failure
+    pub fn heartbeat_failure(&mut self) {
+        self.error_count += 1;
+        if self.error_count >= self.max_retransmissions {
+            self.state = PathState::Failed;
+        } else {
+            self.state = PathState::Inactive;
+        }
+    }
+
+    /// Check if a heartbeat probe is due
+    pub fn needs_heartbeat(&self) -> bool {
+        match self.last_heartbeat_sent {
+            Some(last) => Instant::now().duration_since(last) >= self.heartbeat_interval,
+            None => true,
+        }
+    }
+
+    /// Record that a heartbeat was sent
+    pub fn mark_heartbeat_sent(&mut self) {
+        self.last_heartbeat_sent = Some(Instant::now());
+        if self.state == PathState::Inactive {
+            self.state = PathState::Probing;
+        }
+    }
+}
+
+
+/// Configuration for SCTP multi-homing
+///
+/// Multi-homing allows an SCTP association to use multiple network
+/// interfaces/addresses for redundancy. If the primary path fails,
+/// traffic is automatically switched to an alternate path.
+#[derive(Debug, Clone)]
+pub struct MultihomingConfig {
+    /// Primary local addresses (first is the primary path)
+    pub local_addresses: Vec<SocketAddr>,
+    /// Primary remote addresses (first is the primary path)
+    pub remote_addresses: Vec<SocketAddr>,
+    /// Heartbeat interval for path probing
+    pub heartbeat_interval: Duration,
+    /// Maximum path retransmissions before declaring path failed
+    pub max_path_retransmissions: u32,
+    /// Automatic failover when primary path fails
+    pub auto_failover: bool,
+}
+
+impl Default for MultihomingConfig {
+    fn default() -> Self {
+        Self {
+            local_addresses: Vec::new(),
+            remote_addresses: Vec::new(),
+            heartbeat_interval: Duration::from_secs(30),
+            max_path_retransmissions: 5,
+            auto_failover: true,
+        }
+    }
+}
+
+impl MultihomingConfig {
+    /// Create a new multi-homing configuration with a primary address pair
+    pub fn new(primary_local: SocketAddr, primary_remote: SocketAddr) -> Self {
+        Self {
+            local_addresses: vec![primary_local],
+            remote_addresses: vec![primary_remote],
+            ..Self::default()
+        }
+    }
+
+    /// Add an alternate local address
+    pub fn with_local_address(mut self, addr: SocketAddr) -> Self {
+        if !self.local_addresses.contains(&addr) {
+            self.local_addresses.push(addr);
+        }
+        self
+    }
+
+    /// Add an alternate remote address
+    pub fn with_remote_address(mut self, addr: SocketAddr) -> Self {
+        if !self.remote_addresses.contains(&addr) {
+            self.remote_addresses.push(addr);
+        }
+        self
+    }
+
+    /// Set the heartbeat interval
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Set the maximum path retransmissions
+    pub fn with_max_path_retransmissions(mut self, max: u32) -> Self {
+        self.max_path_retransmissions = max;
+        self
+    }
+
+    /// Get the primary local address
+    pub fn primary_local(&self) -> Option<SocketAddr> {
+        self.local_addresses.first().copied()
+    }
+
+    /// Get the primary remote address
+    pub fn primary_remote(&self) -> Option<SocketAddr> {
+        self.remote_addresses.first().copied()
+    }
+
+    /// Get all address pairs (local, remote) as paths
+    pub fn all_paths(&self) -> Vec<(SocketAddr, SocketAddr)> {
+        let mut paths = Vec::new();
+        for local in &self.local_addresses {
+            for remote in &self.remote_addresses {
+                paths.push((*local, *remote));
+            }
+        }
+        paths
+    }
+}
+
+
+/// Multi-homed path manager for SCTP associations
+///
+/// Manages multiple network paths for a single SCTP association,
+/// providing path selection, heartbeat monitoring, and failover.
+#[derive(Debug)]
+pub struct PathManager {
+    /// All available paths
+    paths: Vec<SctpPath>,
+    /// Index of the currently active primary path
+    primary_index: usize,
+    /// Whether automatic failover is enabled
+    auto_failover: bool,
+}
+
+impl PathManager {
+    /// Create a new path manager from a multi-homing configuration
+    pub fn from_config(config: &MultihomingConfig) -> Self {
+        let mut paths = Vec::new();
+        for (local, remote) in config.all_paths() {
+            let mut path = SctpPath::new(local, remote);
+            path.heartbeat_interval = config.heartbeat_interval;
+            path.max_retransmissions = config.max_path_retransmissions;
+            paths.push(path);
+        }
+
+        Self {
+            paths,
+            primary_index: 0,
+            auto_failover: config.auto_failover,
+        }
+    }
+
+    /// Create a path manager with a single path
+    pub fn single_path(local: SocketAddr, remote: SocketAddr) -> Self {
+        Self {
+            paths: vec![SctpPath::new(local, remote)],
+            primary_index: 0,
+            auto_failover: true,
+        }
+    }
+
+    /// Get the current primary path
+    pub fn primary_path(&self) -> Option<&SctpPath> {
+        self.paths.get(self.primary_index)
+    }
+
+    /// Get a mutable reference to the primary path
+    pub fn primary_path_mut(&mut self) -> Option<&mut SctpPath> {
+        self.paths.get_mut(self.primary_index)
+    }
+
+    /// Get all paths
+    pub fn paths(&self) -> &[SctpPath] {
+        &self.paths
+    }
+
+    /// Get the number of paths
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Get the number of active (usable) paths
+    pub fn active_path_count(&self) -> usize {
+        self.paths.iter().filter(|p| p.is_usable()).count()
+    }
+
+    /// Select the best available path for data transmission
+    ///
+    /// Returns the primary path if it is usable, otherwise selects
+    /// the first available alternate path. Returns `None` if all paths
+    /// have failed.
+    pub fn select_path(&self) -> Option<&SctpPath> {
+        // Try primary first
+        if let Some(path) = self.paths.get(self.primary_index) {
+            if path.is_usable() {
+                return Some(path);
+            }
+        }
+
+        // Try alternates
+        self.paths.iter().find(|p| p.is_usable())
+    }
+
+    /// Handle a heartbeat acknowledgment for a specific path
+    pub fn handle_heartbeat_ack(&mut self, remote_addr: SocketAddr) {
+        for path in &mut self.paths {
+            if path.remote_addr == remote_addr {
+                path.heartbeat_ack();
+                return;
+            }
+        }
+    }
+
+    /// Handle a heartbeat failure for a specific path
+    ///
+    /// If the primary path fails and `auto_failover` is enabled,
+    /// automatically switches to the next available path.
+    pub fn handle_heartbeat_failure(&mut self, remote_addr: SocketAddr) {
+        let mut primary_failed = false;
+
+        for (i, path) in self.paths.iter_mut().enumerate() {
+            if path.remote_addr == remote_addr {
+                path.heartbeat_failure();
+                if i == self.primary_index && !path.is_usable() {
+                    primary_failed = true;
+                }
+                break;
+            }
+        }
+
+        if primary_failed && self.auto_failover {
+            self.failover();
+        }
+    }
+
+    /// Perform failover: switch primary to the next available path
+    ///
+    /// Returns `true` if failover succeeded, `false` if no alternate
+    /// path is available.
+    pub fn failover(&mut self) -> bool {
+        for (i, path) in self.paths.iter().enumerate() {
+            if i != self.primary_index && path.is_usable() {
+                info!(
+                    "SCTP path failover: {} -> {}",
+                    self.paths[self.primary_index].remote_addr,
+                    path.remote_addr
+                );
+                self.primary_index = i;
+                return true;
+            }
+        }
+        warn!("SCTP path failover failed: no usable alternate paths");
+        false
+    }
+
+    /// Manually set the primary path index
+    pub fn set_primary(&mut self, index: usize) -> bool {
+        if index < self.paths.len() {
+            self.primary_index = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get paths that need heartbeat probes
+    pub fn paths_needing_heartbeat(&self) -> Vec<usize> {
+        self.paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.needs_heartbeat() && p.state != PathState::Failed)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Mark a heartbeat as sent for a specific path
+    pub fn mark_heartbeat_sent(&mut self, index: usize) {
+        if let Some(path) = self.paths.get_mut(index) {
+            path.mark_heartbeat_sent();
+        }
+    }
+}
+
+
+// ===========================================================================
+// A6.2: PR-SCTP (Partial Reliability) support
+// ===========================================================================
+
+/// Partial Reliability policy for SCTP messages (RFC 3758)
+///
+/// PR-SCTP allows per-message reliability configuration. Some messages
+/// (e.g. real-time data) may be discarded if they cannot be delivered
+/// within timing or retransmission constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialReliabilityPolicy {
+    /// Fully reliable transfer (standard SCTP behavior)
+    ReliableTransfer,
+    /// Timed reliability: message may be discarded after the given duration
+    /// since first transmission attempt
+    TimedReliability(Duration),
+    /// Limited retransmissions: message may be discarded after the given
+    /// number of retransmission attempts
+    LimitedRetransmissions(u32),
+}
+
+impl PartialReliabilityPolicy {
+    /// Check if this policy is fully reliable
+    pub fn is_reliable(&self) -> bool {
+        matches!(self, Self::ReliableTransfer)
+    }
+
+    /// Check if a message should be abandoned based on this policy
+    ///
+    /// `first_send_time` is when the message was first transmitted,
+    /// `retransmission_count` is the number of retransmissions so far.
+    pub fn should_abandon(&self, first_send_time: Instant, retransmission_count: u32) -> bool {
+        match self {
+            Self::ReliableTransfer => false,
+            Self::TimedReliability(max_duration) => {
+                Instant::now().duration_since(first_send_time) > *max_duration
+            }
+            Self::LimitedRetransmissions(max_retx) => retransmission_count > *max_retx,
+        }
+    }
+}
+
+impl Default for PartialReliabilityPolicy {
+    fn default() -> Self {
+        Self::ReliableTransfer
+    }
+}
+
+
+/// Forward TSN chunk information for PR-SCTP
+///
+/// When a sender decides to abandon a message under PR-SCTP, it sends
+/// a Forward TSN chunk to inform the receiver that certain TSNs will
+/// never be retransmitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardTsnChunk {
+    /// New cumulative TSN: all TSNs up to and including this value
+    /// are considered received (or abandoned) by the sender
+    pub new_cumulative_tsn: u32,
+    /// Per-stream information about skipped sequence numbers
+    pub stream_info: Vec<ForwardTsnStreamInfo>,
+}
+
+/// Per-stream information in a Forward TSN chunk
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardTsnStreamInfo {
+    /// Stream identifier
+    pub stream_id: u16,
+    /// Stream sequence number being skipped
+    pub stream_sequence_number: u16,
+}
+
+impl ForwardTsnChunk {
+    /// Create a new Forward TSN chunk
+    pub fn new(new_cumulative_tsn: u32) -> Self {
+        Self {
+            new_cumulative_tsn,
+            stream_info: Vec::new(),
+        }
+    }
+
+    /// Add stream info for a skipped message
+    pub fn with_stream_info(mut self, stream_id: u16, sequence_number: u16) -> Self {
+        self.stream_info.push(ForwardTsnStreamInfo {
+            stream_id,
+            stream_sequence_number: sequence_number,
+        });
+        self
+    }
+
+    /// Encode the Forward TSN chunk to bytes
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + self.stream_info.len() * 4);
+
+        // New cumulative TSN
+        buf.extend_from_slice(&self.new_cumulative_tsn.to_be_bytes());
+
+        // Stream info entries
+        for info in &self.stream_info {
+            buf.extend_from_slice(&info.stream_id.to_be_bytes());
+            buf.extend_from_slice(&info.stream_sequence_number.to_be_bytes());
+        }
+
+        buf
+    }
+
+    /// Decode a Forward TSN chunk from bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data is too short.
+    pub fn decode(data: &[u8]) -> std::result::Result<Self, String> {
+        if data.len() < 4 {
+            return Err(format!(
+                "Forward TSN too short: need 4 bytes, have {}",
+                data.len()
+            ));
+        }
+
+        let new_cumulative_tsn =
+            u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+
+        let mut stream_info = Vec::new();
+        let mut offset = 4;
+        while offset + 4 <= data.len() {
+            let stream_id =
+                u16::from_be_bytes([data[offset], data[offset + 1]]);
+            let stream_sequence_number =
+                u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+            stream_info.push(ForwardTsnStreamInfo {
+                stream_id,
+                stream_sequence_number,
+            });
+            offset += 4;
+        }
+
+        Ok(Self {
+            new_cumulative_tsn,
+            stream_info,
+        })
+    }
+}
+
+
+/// Tracks per-message partial reliability state
+///
+/// Each outbound message that uses PR-SCTP gets a `PrSctpMessage` entry
+/// to track when it was first sent and how many times it has been retransmitted.
+#[derive(Debug, Clone)]
+pub struct PrSctpMessage {
+    /// TSN assigned to this message
+    pub tsn: u32,
+    /// Stream identifier
+    pub stream_id: u16,
+    /// Stream sequence number
+    pub stream_sequence_number: u16,
+    /// Reliability policy for this message
+    pub policy: PartialReliabilityPolicy,
+    /// Timestamp of first transmission attempt
+    pub first_send_time: Instant,
+    /// Number of retransmission attempts
+    pub retransmission_count: u32,
+    /// Whether this message has been abandoned
+    pub abandoned: bool,
+}
+
+impl PrSctpMessage {
+    /// Create a new PR-SCTP tracked message
+    pub fn new(
+        tsn: u32,
+        stream_id: u16,
+        stream_sequence_number: u16,
+        policy: PartialReliabilityPolicy,
+    ) -> Self {
+        Self {
+            tsn,
+            stream_id,
+            stream_sequence_number,
+            policy,
+            first_send_time: Instant::now(),
+            retransmission_count: 0,
+            abandoned: false,
+        }
+    }
+
+    /// Check if this message should be abandoned per its policy
+    pub fn should_abandon(&self) -> bool {
+        if self.abandoned {
+            return true;
+        }
+        self.policy.should_abandon(self.first_send_time, self.retransmission_count)
+    }
+
+    /// Increment the retransmission counter
+    pub fn retransmit(&mut self) {
+        self.retransmission_count += 1;
+    }
+
+    /// Mark this message as abandoned
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
+    }
+}
+
+
+/// PR-SCTP tracker for managing partially reliable messages
+///
+/// Maintains a list of outbound messages with their reliability policies
+/// and determines when messages should be abandoned.
+#[derive(Debug, Default)]
+pub struct PrSctpTracker {
+    /// Outstanding messages being tracked
+    messages: Vec<PrSctpMessage>,
+    /// Current cumulative TSN acknowledged by peer
+    cumulative_tsn_ack: u32,
+}
+
+impl PrSctpTracker {
+    /// Create a new PR-SCTP tracker
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Track a new outbound message
+    pub fn track_message(&mut self, msg: PrSctpMessage) {
+        self.messages.push(msg);
+    }
+
+    /// Update the cumulative TSN acknowledgment
+    pub fn update_cumulative_tsn(&mut self, tsn: u32) {
+        self.cumulative_tsn_ack = tsn;
+        // Remove acknowledged messages
+        self.messages.retain(|m| m.tsn > tsn);
+    }
+
+    /// Check for messages that should be abandoned and generate Forward TSN
+    ///
+    /// Returns a `ForwardTsnChunk` if any messages need to be abandoned,
+    /// or `None` if all outstanding messages are still within their policy.
+    pub fn check_abandonments(&mut self) -> Option<ForwardTsnChunk> {
+        let mut highest_abandoned_tsn = self.cumulative_tsn_ack;
+        let mut stream_info = Vec::new();
+        let mut any_abandoned = false;
+
+        for msg in &mut self.messages {
+            if msg.should_abandon() && !msg.abandoned {
+                msg.abandon();
+                any_abandoned = true;
+                if msg.tsn > highest_abandoned_tsn {
+                    highest_abandoned_tsn = msg.tsn;
+                    stream_info.push(ForwardTsnStreamInfo {
+                        stream_id: msg.stream_id,
+                        stream_sequence_number: msg.stream_sequence_number,
+                    });
+                }
+            }
+        }
+
+        if any_abandoned {
+            // Clean up abandoned messages
+            self.messages.retain(|m| !m.abandoned);
+
+            let mut fwd = ForwardTsnChunk::new(highest_abandoned_tsn);
+            fwd.stream_info = stream_info;
+            Some(fwd)
+        } else {
+            None
+        }
+    }
+
+    /// Get the number of outstanding tracked messages
+    pub fn outstanding_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Check if there are any partially reliable messages being tracked
+    pub fn has_pr_messages(&self) -> bool {
+        self.messages.iter().any(|m| !m.policy.is_reliable())
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,7 +1277,7 @@ mod tests {
 
     #[test]
     fn test_sctp_error_display() {
-        let io_err = SctpError::Io(io::Error::new(io::ErrorKind::Other, "test"));
+        let io_err = SctpError::Io(io::Error::other("test"));
         assert!(io_err.to_string().contains("I/O error"));
 
         let conn_err = SctpError::ConnectionFailed("test".into());
@@ -649,5 +1285,372 @@ mod tests {
 
         let closed_err = SctpError::AssociationClosed;
         assert!(closed_err.to_string().contains("closed"));
+    }
+
+    // =======================================================================
+    // A6.1: Multi-homing tests
+    // =======================================================================
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        format!("{ip}:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn test_sctp_path_new() {
+        let path = SctpPath::new(addr("10.0.0.1", 38412), addr("10.0.0.2", 38412));
+        assert_eq!(path.state, PathState::Active);
+        assert!(path.is_usable());
+        assert_eq!(path.error_count, 0);
+        assert!(path.last_heartbeat_ack.is_none());
+    }
+
+    #[test]
+    fn test_sctp_path_heartbeat_ack() {
+        let mut path = SctpPath::new(addr("10.0.0.1", 38412), addr("10.0.0.2", 38412));
+        path.state = PathState::Inactive;
+        path.error_count = 3;
+
+        path.heartbeat_ack();
+        assert_eq!(path.state, PathState::Active);
+        assert_eq!(path.error_count, 0);
+        assert!(path.last_heartbeat_ack.is_some());
+    }
+
+    #[test]
+    fn test_sctp_path_heartbeat_failure() {
+        let mut path = SctpPath::new(addr("10.0.0.1", 38412), addr("10.0.0.2", 38412));
+        path.max_retransmissions = 3;
+
+        path.heartbeat_failure();
+        assert_eq!(path.state, PathState::Inactive);
+        assert_eq!(path.error_count, 1);
+
+        path.heartbeat_failure();
+        path.heartbeat_failure();
+        assert_eq!(path.state, PathState::Failed);
+        assert!(!path.is_usable());
+    }
+
+    #[test]
+    fn test_sctp_path_needs_heartbeat() {
+        let path = SctpPath::new(addr("10.0.0.1", 38412), addr("10.0.0.2", 38412));
+        // Never sent a heartbeat -> needs one
+        assert!(path.needs_heartbeat());
+    }
+
+    #[test]
+    fn test_sctp_path_mark_heartbeat_sent() {
+        let mut path = SctpPath::new(addr("10.0.0.1", 38412), addr("10.0.0.2", 38412));
+        path.state = PathState::Inactive;
+
+        path.mark_heartbeat_sent();
+        assert_eq!(path.state, PathState::Probing);
+        assert!(path.last_heartbeat_sent.is_some());
+    }
+
+    #[test]
+    fn test_multihoming_config() {
+        let config = MultihomingConfig::new(addr("10.0.0.1", 0), addr("10.0.0.2", 38412))
+            .with_local_address(addr("10.0.1.1", 0))
+            .with_remote_address(addr("10.0.1.2", 38412))
+            .with_heartbeat_interval(Duration::from_secs(15))
+            .with_max_path_retransmissions(3);
+
+        assert_eq!(config.local_addresses.len(), 2);
+        assert_eq!(config.remote_addresses.len(), 2);
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(15));
+        assert_eq!(config.max_path_retransmissions, 3);
+        assert_eq!(config.primary_local(), Some(addr("10.0.0.1", 0)));
+        assert_eq!(config.primary_remote(), Some(addr("10.0.0.2", 38412)));
+
+        let paths = config.all_paths();
+        assert_eq!(paths.len(), 4); // 2 local x 2 remote
+    }
+
+    #[test]
+    fn test_multihoming_config_no_duplicates() {
+        let config = MultihomingConfig::new(addr("10.0.0.1", 0), addr("10.0.0.2", 38412))
+            .with_local_address(addr("10.0.0.1", 0)) // duplicate
+            .with_remote_address(addr("10.0.0.2", 38412)); // duplicate
+
+        assert_eq!(config.local_addresses.len(), 1);
+        assert_eq!(config.remote_addresses.len(), 1);
+    }
+
+    #[test]
+    fn test_path_manager_single_path() {
+        let mgr = PathManager::single_path(addr("10.0.0.1", 0), addr("10.0.0.2", 38412));
+        assert_eq!(mgr.path_count(), 1);
+        assert_eq!(mgr.active_path_count(), 1);
+        assert!(mgr.primary_path().is_some());
+        assert!(mgr.select_path().is_some());
+    }
+
+    #[test]
+    fn test_path_manager_from_config() {
+        let config = MultihomingConfig::new(addr("10.0.0.1", 0), addr("10.0.0.2", 38412))
+            .with_local_address(addr("10.0.1.1", 0))
+            .with_remote_address(addr("10.0.1.2", 38412));
+
+        let mgr = PathManager::from_config(&config);
+        assert_eq!(mgr.path_count(), 4);
+        assert_eq!(mgr.active_path_count(), 4);
+    }
+
+    #[test]
+    fn test_path_manager_failover() {
+        let config = MultihomingConfig::new(addr("10.0.0.1", 0), addr("10.0.0.2", 38412))
+            .with_remote_address(addr("10.0.1.2", 38412))
+            .with_max_path_retransmissions(1);
+
+        let mut mgr = PathManager::from_config(&config);
+
+        // Primary should be first path
+        assert_eq!(mgr.primary_path().unwrap().remote_addr, addr("10.0.0.2", 38412));
+
+        // Fail the primary path
+        mgr.handle_heartbeat_failure(addr("10.0.0.2", 38412));
+        // After 1 failure with max_retransmissions=1, path should be failed and failover triggers
+        assert_eq!(mgr.primary_path().unwrap().remote_addr, addr("10.0.1.2", 38412));
+    }
+
+    #[test]
+    fn test_path_manager_heartbeat_ack() {
+        let mut mgr = PathManager::single_path(addr("10.0.0.1", 0), addr("10.0.0.2", 38412));
+
+        mgr.handle_heartbeat_ack(addr("10.0.0.2", 38412));
+        let path = mgr.primary_path().unwrap();
+        assert_eq!(path.state, PathState::Active);
+        assert!(path.last_heartbeat_ack.is_some());
+    }
+
+    #[test]
+    fn test_path_manager_select_alternate() {
+        let config = MultihomingConfig::new(addr("10.0.0.1", 0), addr("10.0.0.2", 38412))
+            .with_remote_address(addr("10.0.1.2", 38412));
+
+        let mut mgr = PathManager::from_config(&config);
+
+        // Mark primary as failed (directly)
+        mgr.primary_path_mut().unwrap().state = PathState::Failed;
+
+        // select_path should return an alternate
+        let selected = mgr.select_path();
+        assert!(selected.is_some());
+        assert!(selected.unwrap().is_usable());
+    }
+
+    #[test]
+    fn test_path_manager_set_primary() {
+        let config = MultihomingConfig::new(addr("10.0.0.1", 0), addr("10.0.0.2", 38412))
+            .with_remote_address(addr("10.0.1.2", 38412));
+
+        let mut mgr = PathManager::from_config(&config);
+        assert!(mgr.set_primary(1));
+        assert_eq!(mgr.primary_path().unwrap().remote_addr, addr("10.0.1.2", 38412));
+
+        // Invalid index
+        assert!(!mgr.set_primary(100));
+    }
+
+    #[test]
+    fn test_path_manager_paths_needing_heartbeat() {
+        let config = MultihomingConfig::new(addr("10.0.0.1", 0), addr("10.0.0.2", 38412))
+            .with_remote_address(addr("10.0.1.2", 38412));
+
+        let mgr = PathManager::from_config(&config);
+
+        // All paths need heartbeat initially (never sent)
+        let needing = mgr.paths_needing_heartbeat();
+        assert_eq!(needing.len(), mgr.path_count());
+    }
+
+    #[test]
+    fn test_path_manager_mark_heartbeat_sent() {
+        let mut mgr = PathManager::single_path(addr("10.0.0.1", 0), addr("10.0.0.2", 38412));
+        mgr.mark_heartbeat_sent(0);
+        assert!(mgr.primary_path().unwrap().last_heartbeat_sent.is_some());
+    }
+
+    // =======================================================================
+    // A6.2: PR-SCTP tests
+    // =======================================================================
+
+    #[test]
+    fn test_partial_reliability_reliable() {
+        let policy = PartialReliabilityPolicy::ReliableTransfer;
+        assert!(policy.is_reliable());
+        // Should never abandon
+        assert!(!policy.should_abandon(Instant::now() - Duration::from_secs(3600), 1000));
+    }
+
+    #[test]
+    fn test_partial_reliability_timed() {
+        let policy = PartialReliabilityPolicy::TimedReliability(Duration::from_millis(100));
+        assert!(!policy.is_reliable());
+
+        // Not expired yet
+        assert!(!policy.should_abandon(Instant::now(), 0));
+
+        // Expired
+        assert!(policy.should_abandon(Instant::now() - Duration::from_millis(200), 0));
+    }
+
+    #[test]
+    fn test_partial_reliability_limited_retransmissions() {
+        let policy = PartialReliabilityPolicy::LimitedRetransmissions(3);
+        assert!(!policy.is_reliable());
+
+        assert!(!policy.should_abandon(Instant::now(), 2));
+        assert!(!policy.should_abandon(Instant::now(), 3));
+        assert!(policy.should_abandon(Instant::now(), 4));
+    }
+
+    #[test]
+    fn test_partial_reliability_default() {
+        let policy = PartialReliabilityPolicy::default();
+        assert_eq!(policy, PartialReliabilityPolicy::ReliableTransfer);
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_encode_decode() {
+        let chunk = ForwardTsnChunk::new(100)
+            .with_stream_info(0, 5)
+            .with_stream_info(1, 3);
+
+        let encoded = chunk.encode();
+        let decoded = ForwardTsnChunk::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.new_cumulative_tsn, 100);
+        assert_eq!(decoded.stream_info.len(), 2);
+        assert_eq!(decoded.stream_info[0].stream_id, 0);
+        assert_eq!(decoded.stream_info[0].stream_sequence_number, 5);
+        assert_eq!(decoded.stream_info[1].stream_id, 1);
+        assert_eq!(decoded.stream_info[1].stream_sequence_number, 3);
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_empty() {
+        let chunk = ForwardTsnChunk::new(42);
+        let encoded = chunk.encode();
+        assert_eq!(encoded.len(), 4);
+
+        let decoded = ForwardTsnChunk::decode(&encoded).unwrap();
+        assert_eq!(decoded.new_cumulative_tsn, 42);
+        assert!(decoded.stream_info.is_empty());
+    }
+
+    #[test]
+    fn test_forward_tsn_decode_too_short() {
+        let result = ForwardTsnChunk::decode(&[0x00, 0x01]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pr_sctp_message() {
+        let msg = PrSctpMessage::new(
+            1,
+            0,
+            0,
+            PartialReliabilityPolicy::LimitedRetransmissions(2),
+        );
+        assert_eq!(msg.tsn, 1);
+        assert!(!msg.abandoned);
+        assert!(!msg.should_abandon());
+
+        let mut msg2 = msg.clone();
+        msg2.retransmit();
+        msg2.retransmit();
+        msg2.retransmit();
+        assert!(msg2.should_abandon());
+    }
+
+    #[test]
+    fn test_pr_sctp_message_abandon() {
+        let mut msg = PrSctpMessage::new(1, 0, 0, PartialReliabilityPolicy::ReliableTransfer);
+        assert!(!msg.should_abandon());
+
+        msg.abandon();
+        assert!(msg.should_abandon());
+        assert!(msg.abandoned);
+    }
+
+    #[test]
+    fn test_pr_sctp_tracker_track_and_ack() {
+        let mut tracker = PrSctpTracker::new();
+
+        tracker.track_message(PrSctpMessage::new(
+            1, 0, 0, PartialReliabilityPolicy::ReliableTransfer,
+        ));
+        tracker.track_message(PrSctpMessage::new(
+            2, 0, 1, PartialReliabilityPolicy::ReliableTransfer,
+        ));
+
+        assert_eq!(tracker.outstanding_count(), 2);
+
+        tracker.update_cumulative_tsn(1);
+        assert_eq!(tracker.outstanding_count(), 1);
+
+        tracker.update_cumulative_tsn(2);
+        assert_eq!(tracker.outstanding_count(), 0);
+    }
+
+    #[test]
+    fn test_pr_sctp_tracker_check_abandonments() {
+        let mut tracker = PrSctpTracker::new();
+
+        // Add a message with very short timed reliability
+        let mut msg = PrSctpMessage::new(
+            1,
+            0,
+            0,
+            PartialReliabilityPolicy::LimitedRetransmissions(0),
+        );
+        // Force one retransmission to trigger abandonment
+        msg.retransmit();
+        tracker.track_message(msg);
+
+        // Add a reliable message
+        tracker.track_message(PrSctpMessage::new(
+            2, 0, 1, PartialReliabilityPolicy::ReliableTransfer,
+        ));
+
+        assert_eq!(tracker.outstanding_count(), 2);
+
+        let fwd = tracker.check_abandonments();
+        assert!(fwd.is_some());
+        let fwd = fwd.unwrap();
+        assert_eq!(fwd.new_cumulative_tsn, 1);
+
+        // Abandoned message should be removed
+        assert_eq!(tracker.outstanding_count(), 1);
+    }
+
+    #[test]
+    fn test_pr_sctp_tracker_has_pr_messages() {
+        let mut tracker = PrSctpTracker::new();
+        assert!(!tracker.has_pr_messages());
+
+        tracker.track_message(PrSctpMessage::new(
+            1, 0, 0, PartialReliabilityPolicy::ReliableTransfer,
+        ));
+        assert!(!tracker.has_pr_messages());
+
+        tracker.track_message(PrSctpMessage::new(
+            2, 0, 1, PartialReliabilityPolicy::TimedReliability(Duration::from_secs(1)),
+        ));
+        assert!(tracker.has_pr_messages());
+    }
+
+    #[test]
+    fn test_pr_sctp_tracker_no_abandonments() {
+        let mut tracker = PrSctpTracker::new();
+
+        tracker.track_message(PrSctpMessage::new(
+            1, 0, 0, PartialReliabilityPolicy::ReliableTransfer,
+        ));
+
+        let fwd = tracker.check_abandonments();
+        assert!(fwd.is_none());
     }
 }

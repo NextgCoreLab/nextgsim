@@ -686,12 +686,12 @@ mod tests {
         cap.encode(&mut buf);
 
         let decoded = IeUeSecurityCapability::decode(&mut buf.as_slice()).unwrap();
-        assert_eq!(decoded.ea0, true);
-        assert_eq!(decoded.ea1_128, true);
-        assert_eq!(decoded.ea2_128, true);
-        assert_eq!(decoded.ia0, true);
-        assert_eq!(decoded.ia1_128, true);
-        assert_eq!(decoded.ia2_128, true);
+        assert!(decoded.ea0);
+        assert!(decoded.ea1_128);
+        assert!(decoded.ea2_128);
+        assert!(decoded.ia0);
+        assert!(decoded.ia1_128);
+        assert!(decoded.ia2_128);
     }
 
     #[test]

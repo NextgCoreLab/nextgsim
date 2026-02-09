@@ -32,6 +32,9 @@ ndarray = { workspace = true }
 # Half-precision floats
 half = { workspace = true }
 
+# Random number generation
+rand = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"

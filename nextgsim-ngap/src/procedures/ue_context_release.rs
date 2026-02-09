@@ -137,7 +137,7 @@ pub fn parse_ue_context_release_request(
         _ => {
             return Err(UeContextReleaseError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -293,7 +293,7 @@ pub fn parse_ue_context_release_command(
         _ => {
             return Err(UeContextReleaseError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -427,7 +427,7 @@ pub fn parse_ue_context_release_complete(
         _ => {
             return Err(UeContextReleaseError::InvalidMessageType {
                 expected: "SuccessfulOutcome".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

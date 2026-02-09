@@ -262,8 +262,7 @@ impl RrcStateMachine {
                 current_state: state,
                 attempted_transition: transition,
                 message: format!(
-                    "Transition '{}' is not valid from state '{}'",
-                    transition, state
+                    "Transition '{transition}' is not valid from state '{state}'"
                 ),
             }),
         }
@@ -587,7 +586,7 @@ mod tests {
     #[test]
     fn test_state_machine_display() {
         let sm = RrcStateMachine::new();
-        assert_eq!(format!("{}", sm), "RrcStateMachine(state=RRC_IDLE)");
+        assert_eq!(format!("{sm}"), "RrcStateMachine(state=RRC_IDLE)");
     }
 
     #[test]
@@ -606,7 +605,7 @@ mod tests {
             attempted_transition: RrcStateTransition::Release,
             message: "Cannot release from Idle".to_string(),
         };
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(display.contains("Invalid RRC state transition"));
         assert!(display.contains("RRC Release"));
         assert!(display.contains("RRC_IDLE"));

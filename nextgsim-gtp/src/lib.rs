@@ -43,6 +43,14 @@ pub mod tunnel;
 pub use codec::{
     ExtHeaderType, GtpError, GtpExtHeader, GtpHeader, GtpMessageType,
     GTP_PROTOCOL_TYPE, GTP_VERSION,
+    // Extension header chaining (A5.1)
+    ExtHeaderChain,
+    // PDU Session Container IE (A5.2)
+    PduSessionInfo, PduSessionType,
+    // 6G TSN markers (A5.3)
+    TsnMarker, EXT_HEADER_TYPE_TSN_MARKER,
+    // 6G In-Network Compute markers (A5.4)
+    InNetworkComputeMarker, ProcessingHint, DataLocality, EXT_HEADER_TYPE_IN_NETWORK_COMPUTE,
 };
 
 pub use tunnel::{

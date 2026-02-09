@@ -332,7 +332,7 @@ pub fn parse_paging(pdu: &NGAP_PDU) -> Result<PagingData, PagingError> {
         _ => {
             return Err(PagingError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

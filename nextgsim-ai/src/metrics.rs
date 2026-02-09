@@ -215,16 +215,16 @@ impl std::fmt::Display for MetricsSummary {
         writeln!(f, "  Errors: {}", self.error_count)?;
         writeln!(f, "  Success Rate: {:.2}%", self.success_rate * 100.0)?;
         if let Some(avg) = self.avg_latency_ms {
-            writeln!(f, "  Avg Latency: {:.2}ms", avg)?;
+            writeln!(f, "  Avg Latency: {avg:.2}ms")?;
         }
         if let Some(p50) = self.p50_latency_ms {
-            writeln!(f, "  P50 Latency: {:.2}ms", p50)?;
+            writeln!(f, "  P50 Latency: {p50:.2}ms")?;
         }
         if let Some(p95) = self.p95_latency_ms {
-            writeln!(f, "  P95 Latency: {:.2}ms", p95)?;
+            writeln!(f, "  P95 Latency: {p95:.2}ms")?;
         }
         if let Some(p99) = self.p99_latency_ms {
-            writeln!(f, "  P99 Latency: {:.2}ms", p99)?;
+            writeln!(f, "  P99 Latency: {p99:.2}ms")?;
         }
         writeln!(f, "  Throughput: {:.2} inf/s", self.throughput)?;
         Ok(())
@@ -258,7 +258,7 @@ impl ModelMetrics {
 
     /// Returns summaries for all models
     pub fn summaries(&self) -> Vec<MetricsSummary> {
-        self.metrics.values().map(|m| m.summary()).collect()
+        self.metrics.values().map(InferenceMetrics::summary).collect()
     }
 
     /// Resets all metrics
@@ -270,12 +270,12 @@ impl ModelMetrics {
 
     /// Returns total inference count across all models
     pub fn total_inference_count(&self) -> u64 {
-        self.metrics.values().map(|m| m.inference_count()).sum()
+        self.metrics.values().map(InferenceMetrics::inference_count).sum()
     }
 
     /// Returns total error count across all models
     pub fn total_error_count(&self) -> u64 {
-        self.metrics.values().map(|m| m.error_count()).sum()
+        self.metrics.values().map(InferenceMetrics::error_count).sum()
     }
 }
 
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_inference_metrics_basic() {
-        let mut metrics = InferenceMetrics::new("test_model");
+        let metrics = InferenceMetrics::new("test_model");
 
         assert_eq!(metrics.model_name(), "test_model");
         assert_eq!(metrics.inference_count(), 0);

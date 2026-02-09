@@ -30,6 +30,6 @@ fn main() {
 
     let schema_str = schema_path.to_str().expect("Invalid schema path");
     if let Err(e) = compiler.compile_files(&[schema_str]) {
-        panic!("Failed to compile RRC ASN.1 schema: {}", e);
+        panic!("Failed to compile RRC ASN.1 schema: {e}");
     }
 }

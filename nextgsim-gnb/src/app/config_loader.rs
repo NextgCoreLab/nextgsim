@@ -287,6 +287,7 @@ mod tests {
             ignore_stream_ids: false,
             upf_addr: None,
             upf_port: 2152,
+            pqc_config: nextgsim_common::config::PqcConfig::default(),
         }
     }
 

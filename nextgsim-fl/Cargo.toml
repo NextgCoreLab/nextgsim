@@ -13,6 +13,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
+x25519-dalek = { workspace = true }
 nextgsim-ai = { workspace = true }
 nextgsim-common = { workspace = true }
 

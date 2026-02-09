@@ -35,9 +35,77 @@
 //! 2. **Learned Codecs**: Use neural networks for encoding/decoding
 //! 3. **Joint Source-Channel**: Combine source and channel coding
 //! 4. **Graceful Degradation**: Quality scales with channel conditions
+//!
+//! # Modules
+//!
+//! | Module | Description |
+//! |--------|-------------|
+//! | [`codec`] | ONNX-based neural encoder / decoder with mean-pooling fallback |
+//! | [`jscc`] | Joint Source-Channel Coding with channel-adaptive symbols |
+//! | [`metrics`] | Cosine similarity, MSE, PSNR, top-k accuracy |
+//! | [`rate_distortion`] | Rate-distortion optimisation controller |
+//! | [`multimodal`] | Generic `SemanticEncode<T>` / `SemanticDecode<T>` traits |
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+// ── New modules ──────────────────────────────────────────────────────────────
+
+/// ONNX-based neural codec (encoder + decoder) with mean-pooling fallback.
+pub mod codec;
+
+/// Joint Source-Channel Coding: channel-adaptive encoding in one step.
+pub mod jscc;
+
+/// Semantic similarity and quality metrics.
+pub mod metrics;
+
+/// Rate-distortion optimisation controller.
+pub mod rate_distortion;
+
+/// Multi-modal trait interfaces (`SemanticEncode<T>`, `SemanticDecode<T>`).
+pub mod multimodal;
+
+/// Learned codec training loop (A18.1)
+pub mod training;
+
+/// Knowledge graph and shared semantic context (A18.2)
+pub mod knowledge;
+
+/// Goal-oriented coding for task effectiveness (A18.3)
+pub mod goal;
+
+/// Multi-user semantic broadcast (A18.9)
+pub mod broadcast;
+
+/// Integration with Service Hosting Environment (SHE) for edge semantic coding
+pub mod she_integration;
+
+/// Integration with ISAC for sensing data compression
+pub mod isac_integration;
+
+// ── Re-exports for convenience ───────────────────────────────────────────────
+
+pub use codec::{CodecError, NeuralCodec, NeuralDecoder, NeuralEncoder};
+pub use jscc::{JsccCodec, JsccConfig, JsccDecoder, JsccEncoder, JsccError, JsccSymbols};
+pub use metrics::{
+    cosine_similarity, evaluate as evaluate_quality, mse, psnr, top_k_accuracy, QualityMetrics,
+};
+pub use multimodal::{
+    AudioData, ImageData, SemanticDecode, SemanticEncode, VectorDecoder, VectorEncoder, VideoData,
+};
+pub use rate_distortion::{
+    auto_compression_ratio, RdController, RdDecision, RdMode,
+};
+pub use she_integration::{
+    CodingMetrics, QualityParameters, SemanticCodingInput, SemanticCodingOperation,
+    SemanticCodingOutput, SemanticCodingRequest, SemanticCodingResult, SheSemanticClient,
+};
+pub use isac_integration::{
+    CompressedSensingData, CompressionStats, IsacSemanticCompressor, MapFeatureData,
+    MeasurementMetadata, Position3D, SensingCompressionParams, SensingCompressionRequest,
+    SensingDataPayload, Velocity3D,
+};
 
 /// Semantic feature representation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +182,51 @@ impl SemanticFeatures {
             original_dims: self.original_dims.clone(),
             compression_ratio: new_compression,
         }
+    }
+
+    /// Applies attention-based importance weighting (A18.5)
+    /// Uses a simplified self-attention mechanism to compute feature importance
+    pub fn apply_attention(&mut self, temperature: f32) {
+        if self.features.is_empty() {
+            return;
+        }
+
+        // Compute attention scores using scaled dot-product
+        let dim = self.features.len();
+        let scale = 1.0 / (dim as f32).sqrt();
+
+        // Compute self-attention: each feature attends to all others
+        let mut attention_scores = vec![0.0f32; dim];
+
+        for i in 0..dim {
+            let query = self.features[i];
+            let mut score = 0.0f32;
+
+            for j in 0..dim {
+                let key = self.features[j];
+                // Scaled dot-product attention
+                let dot_product = query * key * scale;
+                let attention_weight = (dot_product / temperature).exp();
+                score += attention_weight;
+            }
+
+            attention_scores[i] = score;
+        }
+
+        // Normalize attention scores
+        let max_score = attention_scores
+            .iter()
+            .copied()
+            .fold(f32::MIN, f32::max);
+
+        if max_score > 0.0 {
+            for score in &mut attention_scores {
+                *score /= max_score;
+            }
+        }
+
+        // Update importance with attention scores
+        self.importance = attention_scores;
     }
 }
 
@@ -277,7 +390,7 @@ impl SemanticEncoder {
         }
 
         // Normalize importance
-        let max_importance = importance.iter().cloned().fold(f32::MIN, f32::max);
+        let max_importance = importance.iter().copied().fold(f32::MIN, f32::max);
         if max_importance > 0.0 {
             for imp in &mut importance {
                 *imp /= max_importance;
@@ -523,5 +636,50 @@ mod tests {
         // SensorFusion maps to task_id 4
         assert_eq!(output.task_id, 4);
         assert!(output.confidence > 0.0);
+    }
+
+    // Test for A18.5: Attention-based importance
+
+    #[test]
+    fn test_attention_based_importance() {
+        let mut features = SemanticFeatures::new(
+            0,
+            vec![1.0, 0.5, 2.0, 0.3, 1.5],
+            vec![5],
+        );
+
+        // Apply attention
+        features.apply_attention(1.0);
+
+        // Check that importance was updated
+        assert_eq!(features.importance.len(), 5);
+
+        // All importance scores should be between 0 and 1 (normalized)
+        for &imp in &features.importance {
+            assert!((0.0..=1.0).contains(&imp));
+        }
+    }
+
+    #[test]
+    fn test_attention_temperature() {
+        let mut features1 = SemanticFeatures::new(
+            0,
+            vec![1.0, 0.5, 2.0, 0.3, 1.5],
+            vec![5],
+        );
+
+        let mut features2 = features1.clone();
+
+        // Low temperature (sharper attention)
+        features1.apply_attention(0.1);
+
+        // High temperature (softer attention)
+        features2.apply_attention(10.0);
+
+        // Low temperature should have more variation in importance
+        let var1: f32 = features1.importance.iter().map(|x| x * x).sum::<f32>();
+        let var2: f32 = features2.importance.iter().map(|x| x * x).sum::<f32>();
+
+        assert!(var1 != var2);
     }
 }

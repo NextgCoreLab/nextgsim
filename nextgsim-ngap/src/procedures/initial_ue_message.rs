@@ -420,7 +420,7 @@ pub fn parse_initial_ue_message(pdu: &NGAP_PDU) -> Result<InitialUeMessageData, 
         _ => {
             return Err(InitialUeMessageError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

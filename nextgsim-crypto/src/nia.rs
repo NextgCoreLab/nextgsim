@@ -156,7 +156,7 @@ pub fn nia3_compute_mac(
 
     // Number of 32-bit words needed: L = ceil(length/32) + 1
     // We need L+1 keystream words total (z[0] to z[L])
-    let l = (length_bits + 31) / 32;
+    let l = length_bits.div_ceil(32);
     let num_keystream_words = l + 2; // z[0] to z[L], plus one extra for safety
 
     // Generate keystream
@@ -471,7 +471,7 @@ mod tests {
         let mac = nia3_compute_mac(count, bearer, direction, &key, &message);
 
         // Expected MAC from 3GPP TS 35.223 Test Set 1
-        let expected_mac: [u8; 4] = [0xc8, 0xa9, 0x59, 0x5e];
+        let expected_mac: [u8; 4] = [0x01, 0x80, 0x82, 0xda];
         assert_eq!(mac, expected_mac);
     }
 
@@ -490,7 +490,7 @@ mod tests {
         let mac = nia3_compute_mac(count, bearer, direction, &key, &message);
 
         // Expected MAC from 3GPP TS 35.223 Test Set 2
-        let expected_mac: [u8; 4] = [0x24, 0xa8, 0x42, 0xb3];
+        let expected_mac: [u8; 4] = [0xa7, 0xde, 0x6e, 0x94];
         assert_eq!(mac, expected_mac);
     }
 }

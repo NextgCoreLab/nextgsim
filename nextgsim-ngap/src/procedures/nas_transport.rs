@@ -234,7 +234,7 @@ pub fn parse_downlink_nas_transport(
         _ => {
             return Err(NasTransportError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };
@@ -436,7 +436,7 @@ pub fn parse_uplink_nas_transport(
         _ => {
             return Err(NasTransportError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

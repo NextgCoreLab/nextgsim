@@ -13,6 +13,7 @@ pub mod logging;
 pub mod octet;
 pub mod octet_string;
 pub mod octet_view;
+pub mod sim_tick;
 pub mod transport;
 pub mod types;
 
@@ -33,5 +34,6 @@ pub use logging::{
 };
 pub use octet_string::OctetString;
 pub use octet_view::OctetView;
+pub use sim_tick::{SimulationClock, SimulationStepper, SimulationTick, SimulationTimeConfig};
 pub use transport::UdpTransport;
 pub use types::*;

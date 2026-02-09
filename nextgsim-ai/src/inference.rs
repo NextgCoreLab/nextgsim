@@ -168,7 +168,7 @@ impl OnnxEngine {
         // Extract input information from session
         for input in session.inputs() {
             let dtype = input.dtype();
-            let dtype_str = format!("{:?}", dtype).to_lowercase();
+            let dtype_str = format!("{dtype:?}").to_lowercase();
 
             // Default shape - would need to parse from dtype in production
             let shape: Vec<i64> = vec![-1];
@@ -179,7 +179,7 @@ impl OnnxEngine {
         // Extract output information from session
         for output in session.outputs() {
             let dtype = output.dtype();
-            let dtype_str = format!("{:?}", dtype).to_lowercase();
+            let dtype_str = format!("{dtype:?}").to_lowercase();
 
             // Default shape - would need to parse from dtype in production
             let shape: Vec<i64> = vec![-1];
@@ -220,25 +220,25 @@ impl OnnxEngine {
 
         // Try to extract as f32 tensor
         if let Ok((output_shape, output_data)) = output_value.try_extract_tensor::<f32>() {
-            let shape_i64: Vec<i64> = output_shape.iter().map(|&d| d as i64).collect();
+            let shape_i64: Vec<i64> = output_shape.iter().copied().collect();
             return Ok(TensorData::float32(output_data.to_vec(), shape_i64));
         }
 
         // Try to extract as f64 tensor
         if let Ok((output_shape, output_data)) = output_value.try_extract_tensor::<f64>() {
-            let shape_i64: Vec<i64> = output_shape.iter().map(|&d| d as i64).collect();
+            let shape_i64: Vec<i64> = output_shape.iter().copied().collect();
             return Ok(TensorData::float64(output_data.to_vec(), shape_i64));
         }
 
         // Try to extract as i64 tensor
         if let Ok((output_shape, output_data)) = output_value.try_extract_tensor::<i64>() {
-            let shape_i64: Vec<i64> = output_shape.iter().map(|&d| d as i64).collect();
+            let shape_i64: Vec<i64> = output_shape.iter().copied().collect();
             return Ok(TensorData::int64(output_data.to_vec(), shape_i64));
         }
 
         // Try to extract as i32 tensor
         if let Ok((output_shape, output_data)) = output_value.try_extract_tensor::<i32>() {
-            let shape_i64: Vec<i64> = output_shape.iter().map(|&d| d as i64).collect();
+            let shape_i64: Vec<i64> = output_shape.iter().copied().collect();
             return Ok(TensorData::int32(output_data.to_vec(), shape_i64));
         }
 
@@ -297,7 +297,7 @@ impl InferenceEngine for OnnxEngine {
         let mut session = session_mutex
             .lock()
             .map_err(|e| InferenceError::NotReady {
-                reason: format!("Failed to acquire session lock: {}", e),
+                reason: format!("Failed to acquire session lock: {e}"),
             })?;
 
         let start = Instant::now();
@@ -365,7 +365,7 @@ impl InferenceEngine for OnnxEngine {
         let mut session = session_mutex
             .lock()
             .map_err(|e| InferenceError::NotReady {
-                reason: format!("Failed to acquire session lock: {}", e),
+                reason: format!("Failed to acquire session lock: {e}"),
             })?;
 
         let start = Instant::now();
@@ -397,7 +397,7 @@ impl InferenceEngine for OnnxEngine {
         let mut results = Vec::with_capacity(outputs.len());
         for (_, output_value) in outputs {
             if let Ok((output_shape, output_data)) = output_value.try_extract_tensor::<f32>() {
-                let shape_i64: Vec<i64> = output_shape.iter().map(|&d| d as i64).collect();
+                let shape_i64: Vec<i64> = output_shape.iter().copied().collect();
                 results.push(TensorData::float32(output_data.to_vec(), shape_i64));
             } else {
                 return Err(InferenceError::OutputExtractionFailed {

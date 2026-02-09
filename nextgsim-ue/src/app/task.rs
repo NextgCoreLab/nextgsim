@@ -88,7 +88,7 @@ impl AppTask {
     pub fn cli_port(&self) -> u16 {
         self.cli_server
             .as_ref()
-            .map(|s| s.port())
+            .map(nextgsim_common::CliServer::port)
             .unwrap_or(0)
     }
 
@@ -149,7 +149,7 @@ impl AppTask {
                 let msg = NasMessage::InitiatePduSessionEstablishment {
                     psi,
                     pti,
-                    session_type: format!("{:?}", session_type),
+                    session_type: format!("{session_type:?}"),
                     apn,
                 };
                 if let Err(e) = self.task_base.nas_tx.send(msg).await {
@@ -270,7 +270,7 @@ impl AppTask {
 /// * `Ok(UeCliCommandType)` - Successfully parsed command
 /// * `Err(String)` - Parse error with description
 pub fn parse_ue_cli_command(input: &str) -> Result<UeCliCommandType, String> {
-    let tokens: Vec<&str> = input.trim().split_whitespace().collect();
+    let tokens: Vec<&str> = input.split_whitespace().collect();
 
     if tokens.is_empty() {
         return Err("Empty command".to_string());

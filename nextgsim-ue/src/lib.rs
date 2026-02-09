@@ -21,6 +21,13 @@ pub mod tasks;
 pub mod timer;
 pub mod tun;
 
+// 6G AI-native network function client modules
+pub mod she_client;
+pub mod nwdaf_reporter;
+pub mod isac_sensor;
+pub mod fl_participant;
+pub mod semantic_codec;
+
 // Re-export commonly used types
 pub use timer::{GprsTimer2, GprsTimer3, GprsTimer3Unit, UeTimer};
 

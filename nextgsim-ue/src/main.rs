@@ -145,7 +145,7 @@ fn normalize_imsi(imsi: &str) -> Result<String> {
     }
 
     if !normalized.chars().all(|c| c.is_ascii_digit()) {
-        bail!("Invalid IMSI '{}': must contain only digits", normalized);
+        bail!("Invalid IMSI '{normalized}': must contain only digits");
     }
 
     Ok(normalized)
@@ -154,10 +154,10 @@ fn normalize_imsi(imsi: &str) -> Result<String> {
 /// Loads and validates a UE configuration from a YAML file.
 fn load_ue_config(path: &str) -> Result<UeConfig> {
     let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read configuration file: {}", path))?;
+        .with_context(|| format!("Failed to read configuration file: {path}"))?;
 
     let config: UeConfig = serde_yaml::from_str(&contents)
-        .with_context(|| format!("Failed to parse configuration file: {}", path))?;
+        .with_context(|| format!("Failed to parse configuration file: {path}"))?;
 
     Ok(config)
 }
@@ -229,7 +229,7 @@ impl UeApp {
         let shutdown_rx = task_manager.shutdown_receiver();
 
         // Generate node name for CLI
-        let node_name = format!("ue{}", instance_id);
+        let node_name = format!("ue{instance_id}");
 
         // Spawn all tasks
         Self::spawn_tasks(
@@ -349,11 +349,16 @@ impl UeApp {
         use nextgsim_ue::nas::mm::{MmStateMachine, MmSubState};
         use nextgsim_nas::messages::mm::{RegistrationRequest, Ie5gsMobileIdentity, MobileIdentityType};
         use nextgsim_nas::messages::mm::{IdentityRequest, IdentityResponse};
+        use nextgsim_nas::messages::mm::authentication::{AuthenticationRequest as NasAuthRequest, AuthenticationResponse as NasAuthResponse};
+        use nextgsim_nas::messages::mm::security_mode::{SecurityModeCommand as NasSecModeCmd, SecurityModeComplete as NasSecModeComplete};
         use nextgsim_nas::ies::{Ie5gsRegistrationType, FollowOnRequest, RegistrationType};
         use nextgsim_nas::security::NasKeySetIdentifier;
         use nextgsim_nas::enums::{MmMessageType, SmMessageType};
-        use nextgsim_nas::header::PlainSmHeader;
-        use bytes::{Buf, BufMut};
+        use nextgsim_crypto::milenage::{Milenage, compute_opc};
+        use nextgsim_crypto::kdf::derive_res_star;
+        use nextgsim_common::config::OpType;
+
+        use bytes::BufMut;
 
         info!("NAS task started");
 
@@ -480,6 +485,122 @@ impl UeApp {
                                                 }
                                                 Err(e) => {
                                                     warn!("Failed to decode Identity Request: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                        MmMessageType::AuthenticationRequest => {
+                                            // Decode Authentication Request (skip 3-byte header)
+                                            let header_len = 3; // EPD + SecHdr + MsgType
+                                            match NasAuthRequest::decode(&mut &pdu.data()[header_len..]) {
+                                                Ok(auth_req) => {
+                                                    info!("Authentication Request received: ngKSI={}", auth_req.ng_ksi.ksi);
+
+                                                    if let (Some(rand_ie), Some(autn_ie)) = (&auth_req.rand, &auth_req.autn) {
+                                                        // 5G-AKA authentication
+                                                        let rand = &rand_ie.value;
+                                                        let autn = &autn_ie.value;
+                                                        info!("5G-AKA: RAND={:02x?}, AUTN len={}", &rand[..4], autn.len());
+
+                                                        // Get K and OPc from UE config
+                                                        let config = &task_base.config;
+                                                        let opc = match config.op_type {
+                                                            OpType::Opc => config.op,
+                                                            OpType::Op => compute_opc(&config.key, &config.op),
+                                                        };
+
+                                                        // Run Milenage: compute RES, CK, IK, AK
+                                                        let m = Milenage::new(&config.key, &opc);
+                                                        let res = m.f2(rand);
+                                                        let ck = m.f3(rand);
+                                                        let ik = m.f4(rand);
+                                                        let ak = m.f5(rand);
+
+                                                        // Verify AUTN: AUTN = SQN⊕AK || AMF || MAC
+                                                        if autn.len() >= 16 {
+                                                            // Extract SQN⊕AK, AMF, MAC from AUTN
+                                                            let mut sqn_xor_ak = [0u8; 6];
+                                                            sqn_xor_ak.copy_from_slice(&autn[0..6]);
+                                                            let mut amf_from_autn = [0u8; 2];
+                                                            amf_from_autn.copy_from_slice(&autn[6..8]);
+                                                            let mac_from_autn = &autn[8..16];
+
+                                                            // Recover SQN = (SQN⊕AK) ⊕ AK
+                                                            let mut sqn = [0u8; 6];
+                                                            for i in 0..6 {
+                                                                sqn[i] = sqn_xor_ak[i] ^ ak[i];
+                                                            }
+
+                                                            // Verify MAC: expected_mac = f1(K, RAND, SQN, AMF)
+                                                            let expected_mac = m.f1(rand, &sqn, &amf_from_autn);
+                                                            if expected_mac == mac_from_autn {
+                                                                info!("AUTN MAC verified successfully");
+
+                                                                // Compute RES* = KDF(CK||IK, FC=0x6B, SN_name, RAND, RES)
+                                                                let sn_name = format!(
+                                                                    "5G:mnc{:03}.mcc{:03}.3gppnetwork.org",
+                                                                    config.hplmn.mnc, config.hplmn.mcc
+                                                                );
+                                                                let res_star = derive_res_star(
+                                                                    &ck, &ik,
+                                                                    sn_name.as_bytes(),
+                                                                    rand,
+                                                                    &res,
+                                                                );
+                                                                info!("RES* computed: {:02x?}", &res_star[..4]);
+
+                                                                // Build and send Authentication Response
+                                                                let auth_response = NasAuthResponse::with_res_star(res_star.to_vec());
+                                                                let mut nas_pdu = Vec::new();
+                                                                auth_response.encode(&mut nas_pdu);
+
+                                                                info!("Sending Authentication Response, PDU len={}", nas_pdu.len());
+                                                                pdu_counter += 1;
+                                                                let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                                                    pdu_id: pdu_counter,
+                                                                    pdu: nas_pdu.into(),
+                                                                }).await;
+                                                            } else {
+                                                                warn!("AUTN MAC verification failed! expected={:02x?}, got={:02x?}",
+                                                                    expected_mac, mac_from_autn);
+                                                            }
+                                                        } else {
+                                                            warn!("AUTN too short: {} bytes", autn.len());
+                                                        }
+                                                    } else {
+                                                        warn!("Authentication Request missing RAND or AUTN (EAP-AKA not supported)");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to decode Authentication Request: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                        MmMessageType::SecurityModeCommand => {
+                                            // Decode Security Mode Command (skip 3-byte header)
+                                            let header_len = 3;
+                                            match NasSecModeCmd::decode(&mut &pdu.data()[header_len..]) {
+                                                Ok(smc) => {
+                                                    info!(
+                                                        "Security Mode Command: enc_alg={}, int_alg={}, ngKSI={}",
+                                                        smc.selected_nas_security_algorithms.ciphering,
+                                                        smc.selected_nas_security_algorithms.integrity,
+                                                        smc.ng_ksi.ksi
+                                                    );
+
+                                                    // Send Security Mode Complete
+                                                    let smc_complete = NasSecModeComplete::new();
+                                                    let mut nas_pdu = Vec::new();
+                                                    smc_complete.encode(&mut nas_pdu);
+
+                                                    info!("Sending Security Mode Complete, PDU len={}", nas_pdu.len());
+                                                    pdu_counter += 1;
+                                                    let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                                        pdu_id: pdu_counter,
+                                                        pdu: nas_pdu.into(),
+                                                    }).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to decode Security Mode Command: {:?}", e);
                                                 }
                                             }
                                         }
@@ -748,13 +869,12 @@ impl UeApp {
 
                             // Receiving a downlink RRC message means RRC connection is established
                             // Transition to Connected state if we're in Idle
-                            if rrc_state_machine.state().is_idle() {
-                                if rrc_state_machine.can_transition(RrcStateTransition::SetupComplete) {
+                            if rrc_state_machine.state().is_idle()
+                                && rrc_state_machine.can_transition(RrcStateTransition::SetupComplete) {
                                     let _ = rrc_state_machine.transition(RrcStateTransition::SetupComplete);
                                     info!("RRC state: {} -> {} (connection established)",
                                           RrcState::Idle, rrc_state_machine.state());
                                 }
-                            }
 
                             // Check if this is DL Information Transfer (0x04) which wraps NAS PDU
                             // Format: [0x04 (msg type), 0x00 (padding), 0x00 (padding), NAS PDU...]
@@ -898,7 +1018,7 @@ fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
     let mnc_bytes: Vec<u8> = mnc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
 
     // MCC digit 2 (high nibble) | MCC digit 1 (low nibble)
-    let byte1 = (mcc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mcc_bytes.get(0).copied().unwrap_or(0xF);
+    let byte1 = (mcc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mcc_bytes.first().copied().unwrap_or(0xF);
     data.push(byte1);
 
     // MNC digit 3 (high nibble) | MCC digit 3 (low nibble)
@@ -908,7 +1028,7 @@ fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
     data.push(byte2);
 
     // MNC digit 2 (high nibble) | MNC digit 1 (low nibble)
-    let byte3 = (mnc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mnc_bytes.get(0).copied().unwrap_or(0xF);
+    let byte3 = (mnc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mnc_bytes.first().copied().unwrap_or(0xF);
     data.push(byte3);
 
     // Routing indicator (4 digits in BCD, 2 bytes) - use 0000 for default
@@ -923,7 +1043,7 @@ fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
     // MSIN digits in BCD pairs
     let msin_bytes: Vec<u8> = msin.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
     for chunk in msin_bytes.chunks(2) {
-        let low = chunk.get(0).copied().unwrap_or(0xF);
+        let low = chunk.first().copied().unwrap_or(0xF);
         let high = chunk.get(1).copied().unwrap_or(0xF);
         data.push((high << 4) | low);
     }
@@ -1063,11 +1183,11 @@ fn increment_imsi(imsi: &str, offset: u64) -> Result<String> {
 
     // Parse as u64 and increment
     let value: u64 = digits.parse()
-        .with_context(|| format!("Invalid IMSI format: {}", imsi))?;
+        .with_context(|| format!("Invalid IMSI format: {imsi}"))?;
     let new_value = value + offset;
 
     // Format back to 15 digits
-    Ok(format!("{:015}", new_value))
+    Ok(format!("{new_value:015}"))
 }
 
 #[cfg(test)]

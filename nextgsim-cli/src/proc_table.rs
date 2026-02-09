@@ -88,7 +88,7 @@ impl ProcTableEntry {
 
         let nodes: Vec<String> = parts[6..6 + node_count]
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| (*s).to_string())
             .collect();
 
         Ok(Self {

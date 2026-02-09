@@ -401,8 +401,8 @@ fn build_misc_cause(cause: &MiscCause) -> CauseMisc {
 
 fn build_criticality_diagnostics(diag: &CriticalityDiagnosticsInfo) -> CriticalityDiagnostics {
     let procedure_code = diag.procedure_code.map(ProcedureCode);
-    let triggering_message = diag.triggering_message.map(|tm| tm.into());
-    let procedure_criticality = diag.procedure_criticality.map(|c| c.into());
+    let triggering_message = diag.triggering_message.map(std::convert::Into::into);
+    let procedure_criticality = diag.procedure_criticality.map(std::convert::Into::into);
 
     let ies_criticality_diagnostics = if diag.ies_criticality_diagnostics.is_empty() {
         None
@@ -447,7 +447,7 @@ pub fn parse_error_indication(pdu: &NGAP_PDU) -> Result<ErrorIndicationData, Err
         _ => {
             return Err(ErrorIndicationError::InvalidMessageType {
                 expected: "InitiatingMessage".to_string(),
-                actual: format!("{:?}", pdu),
+                actual: format!("{pdu:?}"),
             })
         }
     };

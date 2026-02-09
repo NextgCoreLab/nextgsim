@@ -17,7 +17,7 @@ use std::cell::Cell;
 /// use nextgsim_common::BitBuffer;
 ///
 /// let mut data = [0u8; 4];
-/// let buffer = BitBuffer::new(&mut data);
+/// let mut buffer = BitBuffer::new(&mut data);
 ///
 /// // Write some bits
 /// buffer.write_bits(0b1010, 4);
@@ -178,7 +178,7 @@ impl<'a> BitBuffer<'a> {
     #[inline]
     pub fn written_octets(&self) -> usize {
         let idx = self.index.get();
-        (idx + 7) / 8
+        idx.div_ceil(8)
     }
 
     /// Aligns the buffer to the next octet boundary by writing zero bits.

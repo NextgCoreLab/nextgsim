@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cryptographic algorithms for nextgsim (Milenage, SNOW3G, ZUC, AES)"
+description = "Cryptographic algorithms for nextgsim (Milenage, SNOW3G, ZUC, AES, PQC)"
 
 [lints]
 workspace = true
@@ -15,9 +15,14 @@ nextgsim-common.workspace = true
 aes.workspace = true
 ctr.workspace = true
 cmac.workspace = true
-sha2.workspace = true
+elliptic-curve = { version = "0.13", features = ["ecdh", "arithmetic", "sec1"] }
 hmac.workspace = true
-x25519-dalek.workspace = true
+ml-dsa = "0.1.0-rc.7"
+ml-kem = "0.2.0-rc.1"
+p256 = { version = "0.13", features = ["ecdh", "arithmetic"] }
 rand.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+unicode-normalization = "0.1"
+x25519-dalek.workspace = true
 zuc.workspace = true

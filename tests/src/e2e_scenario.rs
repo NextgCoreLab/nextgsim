@@ -12,9 +12,7 @@
 
 use integration_tests::{
     init_test_logging, MockAmf, MockAmfConfig, MockAmfEvent,
-    TestConfig, TestGnbConfig, TestUeConfig,
 };
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::time::timeout;
 

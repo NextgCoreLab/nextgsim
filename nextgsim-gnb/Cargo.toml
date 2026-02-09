@@ -26,6 +26,15 @@ nextgsim-rrc.workspace = true
 nextgsim-rls.workspace = true
 nextgsim-gtp.workspace = true
 nextgsim-sctp.workspace = true
+
+# 6G AI-native network function crates
+nextgsim-she.workspace = true
+nextgsim-nwdaf.workspace = true
+nextgsim-nkef.workspace = true
+nextgsim-isac.workspace = true
+nextgsim-agent.workspace = true
+nextgsim-fl.workspace = true
+
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

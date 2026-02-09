@@ -160,7 +160,7 @@ pub fn build_security_mode_command(
     // Build security algorithm config
     let security_algorithm_config = SecurityAlgorithmConfig {
         ciphering_algorithm: params.security_algorithms.ciphering_algorithm.into(),
-        integrity_prot_algorithm: params.security_algorithms.integrity_algorithm.map(|a| a.into()),
+        integrity_prot_algorithm: params.security_algorithms.integrity_algorithm.map(std::convert::Into::into),
     };
 
     // Build security config SMC
