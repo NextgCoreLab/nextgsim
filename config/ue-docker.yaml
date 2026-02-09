@@ -31,7 +31,13 @@ supported_algs:
 gnb_search_list:
   - "172.23.0.100"
 
-sessions: []
+sessions:
+  - type: Ipv4
+    s_nssai:
+      sst: 1
+      sd: null
+    apn: "internet"
+    is_emergency: false
 
 configured_nssai:
   slices:

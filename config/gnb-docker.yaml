@@ -25,3 +25,7 @@ ngap_ip: 172.23.0.100
 gtp_ip: 172.23.0.100
 
 ignore_stream_ids: false
+
+# UPF Address for GTP-U data plane forwarding
+upf_addr: 172.23.0.7
+upf_port: 2152

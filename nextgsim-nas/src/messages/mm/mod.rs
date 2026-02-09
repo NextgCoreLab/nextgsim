@@ -44,13 +44,13 @@
 //!
 //! - [`Notification`] - Network to UE notification
 
-mod authentication;
+pub mod authentication;
 mod deregistration;
 mod identity;
 pub mod nas_transport;
 pub mod notification;
 mod registration;
-mod security_mode;
+pub mod security_mode;
 mod service;
 mod status;
 

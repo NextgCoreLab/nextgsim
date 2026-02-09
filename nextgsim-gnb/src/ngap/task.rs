@@ -42,6 +42,11 @@ use nextgsim_ngap::procedures::{
     decode_downlink_nas_transport, DownlinkNasTransportData,
     encode_uplink_nas_transport, UplinkNasTransportParams,
 };
+use nextgsim_ngap::procedures::pdu_session_resource::{
+    decode_pdu_session_resource_setup_request, encode_pdu_session_resource_setup_response,
+    PduSessionResourceSetupRequestData, PduSessionResourceSetupResponseParams,
+    PduSessionResourceSetupResponseItem,
+};
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, UserLocationInfoNr, NrCgi, Tai};
 
 /// NGAP Task for managing AMF communication and UE contexts
@@ -453,6 +458,146 @@ impl NgapTask {
         }
     }
 
+    /// Handles PDU Session Resource Setup Request from AMF
+    async fn handle_pdu_session_resource_setup(
+        &mut self,
+        amf_id: i32,
+        stream: u16,
+        setup_req: PduSessionResourceSetupRequestData,
+    ) {
+        info!(
+            "PDU Session Resource Setup Request: amf_ue_ngap_id={}, ran_ue_ngap_id={}, {} items",
+            setup_req.amf_ue_ngap_id,
+            setup_req.ran_ue_ngap_id,
+            setup_req.pdu_session_resource_setup_list.len()
+        );
+
+        // Find UE context by RAN-UE-NGAP-ID
+        let ue_id = {
+            let ue_ctx = self.ue_contexts.values_mut().find(|ctx| {
+                ctx.ran_ue_ngap_id == setup_req.ran_ue_ngap_id as i64
+            });
+            match ue_ctx {
+                Some(ctx) => {
+                    if ctx.amf_ue_ngap_id.is_none() {
+                        ctx.amf_ue_ngap_id = Some(setup_req.amf_ue_ngap_id as i64);
+                    }
+                    ctx.ue_id
+                }
+                None => {
+                    warn!(
+                        "No UE context for RAN-UE-NGAP-ID {} in PDU Session Resource Setup",
+                        setup_req.ran_ue_ngap_id
+                    );
+                    return;
+                }
+            }
+        };
+
+        let mut setup_response_items = Vec::new();
+        let gnb_ip = self.task_base.config.gtp_ip;
+
+        for item in &setup_req.pdu_session_resource_setup_list {
+            let psi = item.pdu_session_id;
+
+            // Parse N2 SM transfer to extract UPF tunnel info
+            // Format: QFI(1) + TEID(4,BE) + addr_type(1) + IPv4(4) + 5QI(1) + priority(1)
+            let (upf_teid, upf_addr, qfi) = if item.transfer.len() >= 10 {
+                let qfi = item.transfer[0];
+                let teid = u32::from_be_bytes([
+                    item.transfer[1], item.transfer[2],
+                    item.transfer[3], item.transfer[4],
+                ]);
+                let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    item.transfer[6], item.transfer[7],
+                    item.transfer[8], item.transfer[9],
+                ));
+                (teid, addr, qfi)
+            } else {
+                warn!("PDU Session {} has insufficient transfer IE ({} bytes)", psi, item.transfer.len());
+                continue;
+            };
+
+            // Allocate gNB uplink TEID
+            let gnb_teid = self.next_downlink_teid();
+
+            info!(
+                "PDU Session {}: UPF TEID=0x{:08x}, UPF addr={}, QFI={}, gNB TEID=0x{:08x}",
+                psi, upf_teid, upf_addr, qfi, gnb_teid
+            );
+
+            // Store PDU session in UE context
+            if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                ctx.add_pdu_session(NgapPduSession {
+                    psi,
+                    qfi: Some(qfi),
+                    uplink_teid: gnb_teid,
+                    downlink_teid: upf_teid,
+                    upf_address: upf_addr,
+                });
+            }
+
+            // Send GTP SessionCreate to GTP task
+            let resource = PduSessionResource {
+                psi: psi as i32,
+                qfi: Some(qfi),
+                uplink_teid: gnb_teid,
+                downlink_teid: upf_teid,
+                upf_address: upf_addr,
+            };
+            let msg = GtpMessage::SessionCreate { ue_id, resource };
+            if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                error!("Failed to send SessionCreate to GTP: {}", e);
+                continue;
+            }
+            info!("GTP session created for PSI={}, gNB TEID=0x{:08x}", psi, gnb_teid);
+
+            // If NAS PDU present, forward to RRC
+            if let Some(ref nas_pdu) = item.nas_pdu {
+                let msg = RrcMessage::NasDelivery {
+                    ue_id,
+                    pdu: OctetString::from_slice(nas_pdu),
+                };
+                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                    error!("Failed to forward NAS PDU from Setup Request to RRC: {}", e);
+                }
+            }
+
+            // Build response transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
+            let mut response_transfer = Vec::with_capacity(10);
+            response_transfer.push(qfi);
+            response_transfer.extend_from_slice(&gnb_teid.to_be_bytes());
+            response_transfer.push(1); // IPv4
+            match gnb_ip {
+                std::net::IpAddr::V4(v4) => response_transfer.extend_from_slice(&v4.octets()),
+                std::net::IpAddr::V6(_) => response_transfer.extend_from_slice(&[127, 0, 0, 1]),
+            }
+
+            setup_response_items.push(PduSessionResourceSetupResponseItem {
+                pdu_session_id: psi,
+                transfer: response_transfer,
+            });
+        }
+
+        // Build and send PDU Session Resource Setup Response
+        let response_params = PduSessionResourceSetupResponseParams {
+            amf_ue_ngap_id: setup_req.amf_ue_ngap_id,
+            ran_ue_ngap_id: setup_req.ran_ue_ngap_id,
+            setup_list: if setup_response_items.is_empty() { None } else { Some(setup_response_items) },
+            failed_list: None,
+        };
+
+        match encode_pdu_session_resource_setup_response(&response_params) {
+            Ok(response_bytes) => {
+                self.send_ngap_ue_associated(amf_id, stream, response_bytes).await;
+                info!("PDU Session Resource Setup Response sent to AMF");
+            }
+            Err(e) => {
+                error!("Failed to encode PDU Session Resource Setup Response: {}", e);
+            }
+        }
+    }
+
     /// Handles Initial NAS delivery from RRC (Initial UE Message)
     async fn handle_initial_nas_delivery(
         &mut self,
@@ -813,16 +958,9 @@ impl NgapTask {
                 // Try to decode as Downlink NAS Transport
                 if let Ok(dl_nas) = decode_downlink_nas_transport(pdu_bytes) {
                     self.handle_downlink_nas_transport(client_id, stream, dl_nas).await;
+                } else if let Ok(setup_req) = decode_pdu_session_resource_setup_request(pdu_bytes) {
+                    self.handle_pdu_session_resource_setup(client_id, stream, setup_req).await;
                 } else {
-                    // Other NGAP message types that may be received in Ready state:
-                    // - PDU Session Resource Setup Request
-                    // - PDU Session Resource Release Command
-                    // - UE Context Release Command
-                    // - Initial Context Setup Request
-                    // - Handover Request
-                    // - Paging
-                    // - Error Indication
-                    // These require additional decoder implementations in nextgsim-ngap
                     debug!(
                         "Received operational NGAP PDU on stream {} (not yet handled, first bytes: {:02x?})",
                         stream,

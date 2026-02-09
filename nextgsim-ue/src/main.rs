@@ -349,10 +349,15 @@ impl UeApp {
         use nextgsim_ue::nas::mm::{MmStateMachine, MmSubState};
         use nextgsim_nas::messages::mm::{RegistrationRequest, Ie5gsMobileIdentity, MobileIdentityType};
         use nextgsim_nas::messages::mm::{IdentityRequest, IdentityResponse};
+        use nextgsim_nas::messages::mm::authentication::{AuthenticationRequest as NasAuthRequest, AuthenticationResponse as NasAuthResponse};
+        use nextgsim_nas::messages::mm::security_mode::{SecurityModeCommand as NasSecModeCmd, SecurityModeComplete as NasSecModeComplete};
         use nextgsim_nas::ies::{Ie5gsRegistrationType, FollowOnRequest, RegistrationType};
         use nextgsim_nas::security::NasKeySetIdentifier;
         use nextgsim_nas::enums::{MmMessageType, SmMessageType};
-        
+        use nextgsim_crypto::milenage::{Milenage, compute_opc};
+        use nextgsim_crypto::kdf::derive_res_star;
+        use nextgsim_common::config::OpType;
+
         use bytes::BufMut;
 
         info!("NAS task started");
@@ -480,6 +485,122 @@ impl UeApp {
                                                 }
                                                 Err(e) => {
                                                     warn!("Failed to decode Identity Request: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                        MmMessageType::AuthenticationRequest => {
+                                            // Decode Authentication Request (skip 3-byte header)
+                                            let header_len = 3; // EPD + SecHdr + MsgType
+                                            match NasAuthRequest::decode(&mut &pdu.data()[header_len..]) {
+                                                Ok(auth_req) => {
+                                                    info!("Authentication Request received: ngKSI={}", auth_req.ng_ksi.ksi);
+
+                                                    if let (Some(rand_ie), Some(autn_ie)) = (&auth_req.rand, &auth_req.autn) {
+                                                        // 5G-AKA authentication
+                                                        let rand = &rand_ie.value;
+                                                        let autn = &autn_ie.value;
+                                                        info!("5G-AKA: RAND={:02x?}, AUTN len={}", &rand[..4], autn.len());
+
+                                                        // Get K and OPc from UE config
+                                                        let config = &task_base.config;
+                                                        let opc = match config.op_type {
+                                                            OpType::Opc => config.op,
+                                                            OpType::Op => compute_opc(&config.key, &config.op),
+                                                        };
+
+                                                        // Run Milenage: compute RES, CK, IK, AK
+                                                        let m = Milenage::new(&config.key, &opc);
+                                                        let res = m.f2(rand);
+                                                        let ck = m.f3(rand);
+                                                        let ik = m.f4(rand);
+                                                        let ak = m.f5(rand);
+
+                                                        // Verify AUTN: AUTN = SQN⊕AK || AMF || MAC
+                                                        if autn.len() >= 16 {
+                                                            // Extract SQN⊕AK, AMF, MAC from AUTN
+                                                            let mut sqn_xor_ak = [0u8; 6];
+                                                            sqn_xor_ak.copy_from_slice(&autn[0..6]);
+                                                            let mut amf_from_autn = [0u8; 2];
+                                                            amf_from_autn.copy_from_slice(&autn[6..8]);
+                                                            let mac_from_autn = &autn[8..16];
+
+                                                            // Recover SQN = (SQN⊕AK) ⊕ AK
+                                                            let mut sqn = [0u8; 6];
+                                                            for i in 0..6 {
+                                                                sqn[i] = sqn_xor_ak[i] ^ ak[i];
+                                                            }
+
+                                                            // Verify MAC: expected_mac = f1(K, RAND, SQN, AMF)
+                                                            let expected_mac = m.f1(rand, &sqn, &amf_from_autn);
+                                                            if expected_mac == mac_from_autn {
+                                                                info!("AUTN MAC verified successfully");
+
+                                                                // Compute RES* = KDF(CK||IK, FC=0x6B, SN_name, RAND, RES)
+                                                                let sn_name = format!(
+                                                                    "5G:mnc{:03}.mcc{:03}.3gppnetwork.org",
+                                                                    config.hplmn.mnc, config.hplmn.mcc
+                                                                );
+                                                                let res_star = derive_res_star(
+                                                                    &ck, &ik,
+                                                                    sn_name.as_bytes(),
+                                                                    rand,
+                                                                    &res,
+                                                                );
+                                                                info!("RES* computed: {:02x?}", &res_star[..4]);
+
+                                                                // Build and send Authentication Response
+                                                                let auth_response = NasAuthResponse::with_res_star(res_star.to_vec());
+                                                                let mut nas_pdu = Vec::new();
+                                                                auth_response.encode(&mut nas_pdu);
+
+                                                                info!("Sending Authentication Response, PDU len={}", nas_pdu.len());
+                                                                pdu_counter += 1;
+                                                                let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                                                    pdu_id: pdu_counter,
+                                                                    pdu: nas_pdu.into(),
+                                                                }).await;
+                                                            } else {
+                                                                warn!("AUTN MAC verification failed! expected={:02x?}, got={:02x?}",
+                                                                    expected_mac, mac_from_autn);
+                                                            }
+                                                        } else {
+                                                            warn!("AUTN too short: {} bytes", autn.len());
+                                                        }
+                                                    } else {
+                                                        warn!("Authentication Request missing RAND or AUTN (EAP-AKA not supported)");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to decode Authentication Request: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                        MmMessageType::SecurityModeCommand => {
+                                            // Decode Security Mode Command (skip 3-byte header)
+                                            let header_len = 3;
+                                            match NasSecModeCmd::decode(&mut &pdu.data()[header_len..]) {
+                                                Ok(smc) => {
+                                                    info!(
+                                                        "Security Mode Command: enc_alg={}, int_alg={}, ngKSI={}",
+                                                        smc.selected_nas_security_algorithms.ciphering,
+                                                        smc.selected_nas_security_algorithms.integrity,
+                                                        smc.ng_ksi.ksi
+                                                    );
+
+                                                    // Send Security Mode Complete
+                                                    let smc_complete = NasSecModeComplete::new();
+                                                    let mut nas_pdu = Vec::new();
+                                                    smc_complete.encode(&mut nas_pdu);
+
+                                                    info!("Sending Security Mode Complete, PDU len={}", nas_pdu.len());
+                                                    pdu_counter += 1;
+                                                    let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                                        pdu_id: pdu_counter,
+                                                        pdu: nas_pdu.into(),
+                                                    }).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to decode Security Mode Command: {:?}", e);
                                                 }
                                             }
                                         }
