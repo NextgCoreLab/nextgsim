@@ -53,6 +53,54 @@ pub struct RrcReleaseResult {
     pub channel: RrcChannel,
 }
 
+/// Result of processing an RRC Reestablishment Request
+#[derive(Debug)]
+pub struct RrcReestablishmentResult {
+    /// UE ID
+    pub ue_id: i32,
+    /// Transaction ID used
+    pub transaction_id: u8,
+    /// RRC Reestablishment message to send (encoded)
+    pub rrc_reestablishment_pdu: OctetString,
+    /// RRC channel to use
+    pub channel: RrcChannel,
+    /// Reestablishment cause
+    pub cause: u8,
+}
+
+/// Result of processing an RRC Reestablishment Complete
+#[derive(Debug)]
+pub struct RrcReestablishmentCompleteResult {
+    /// UE ID
+    pub ue_id: i32,
+    /// NAS PDU to forward to NGAP (if any)
+    pub nas_pdu: Option<OctetString>,
+}
+
+/// Result of processing an RRC Resume Request
+#[derive(Debug)]
+pub struct RrcResumeResult {
+    /// UE ID
+    pub ue_id: i32,
+    /// Transaction ID used
+    pub transaction_id: u8,
+    /// RRC Resume message to send (encoded)
+    pub rrc_resume_pdu: OctetString,
+    /// RRC channel to use
+    pub channel: RrcChannel,
+    /// Resume cause
+    pub cause: u8,
+}
+
+/// Result of processing an RRC Resume Complete
+#[derive(Debug)]
+pub struct RrcResumeCompleteResult {
+    /// UE ID
+    pub ue_id: i32,
+    /// NAS PDU to forward to NGAP (if any)
+    pub nas_pdu: Option<OctetString>,
+}
+
 /// RRC connection manager
 #[derive(Debug)]
 pub struct RrcConnectionManager {
@@ -222,6 +270,161 @@ impl RrcConnectionManager {
             rrc_release_pdu,
             channel: RrcChannel::DlDcch,
         })
+    }
+
+    /// Processes an RRC Reestablishment Request
+    ///
+    /// Called when a UE attempts to reestablish its RRC connection after
+    /// radio link failure, handover failure, or integrity check failure.
+    pub fn process_rrc_reestablishment_request(
+        &mut self,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+        c_rnti: u16,
+        phys_cell_id: u16,
+        cause: u8,
+    ) -> Option<RrcReestablishmentResult> {
+        if self.is_barred {
+            warn!("Rejecting RRC Reestablishment: cell is barred");
+            return None;
+        }
+
+        // Try to find existing UE context by C-RNTI
+        // If found, the UE is reestablishing on the same cell
+        let existing = ue_mgr.try_find_ue(ue_id);
+        if existing.is_none() {
+            // Create a new context for this UE (may be reestablishing from another cell)
+            let ctx = ue_mgr.create_ue(ue_id);
+            ctx.on_setup_request();
+        }
+
+        let transaction_id = self.next_tid();
+        let rrc_reestablishment_pdu = self.build_rrc_reestablishment(transaction_id);
+
+        if let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) {
+            ctx.on_setup_sent();
+        }
+
+        info!(
+            "RRC Reestablishment for UE[{}], tid={}, c_rnti={}, phys_cell_id={}, cause={}",
+            ue_id, transaction_id, c_rnti, phys_cell_id, cause
+        );
+
+        Some(RrcReestablishmentResult {
+            ue_id,
+            transaction_id,
+            rrc_reestablishment_pdu,
+            channel: RrcChannel::DlCcch,
+            cause,
+        })
+    }
+
+    /// Processes an RRC Reestablishment Complete
+    pub fn process_rrc_reestablishment_complete(
+        &mut self,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+        _transaction_id: u8,
+    ) -> Option<RrcReestablishmentCompleteResult> {
+        let ctx = ue_mgr.try_find_ue_mut(ue_id)?;
+        ctx.on_setup_complete();
+
+        info!("RRC Reestablishment Complete for UE[{}]", ue_id);
+
+        Some(RrcReestablishmentCompleteResult {
+            ue_id,
+            nas_pdu: None,
+        })
+    }
+
+    /// Processes an RRC Resume Request
+    ///
+    /// Called when a UE in RRC_INACTIVE state resumes its connection.
+    pub fn process_rrc_resume_request(
+        &mut self,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+        resume_cause: u8,
+    ) -> Option<RrcResumeResult> {
+        if self.is_barred {
+            warn!("Rejecting RRC Resume: cell is barred");
+            return None;
+        }
+
+        // For resume, the UE may or may not have an existing context
+        if ue_mgr.try_find_ue(ue_id).is_none() {
+            let ctx = ue_mgr.create_ue(ue_id);
+            ctx.on_setup_request();
+        }
+
+        let transaction_id = self.next_tid();
+        let rrc_resume_pdu = self.build_rrc_resume(transaction_id);
+
+        if let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) {
+            ctx.on_setup_sent();
+        }
+
+        info!(
+            "RRC Resume for UE[{}], tid={}, cause={}",
+            ue_id, transaction_id, resume_cause
+        );
+
+        Some(RrcResumeResult {
+            ue_id,
+            transaction_id,
+            rrc_resume_pdu,
+            channel: RrcChannel::DlCcch,
+            cause: resume_cause,
+        })
+    }
+
+    /// Processes an RRC Resume Complete
+    pub fn process_rrc_resume_complete(
+        &mut self,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+        _transaction_id: u8,
+        nas_pdu: Option<OctetString>,
+    ) -> Option<RrcResumeCompleteResult> {
+        let ctx = ue_mgr.try_find_ue_mut(ue_id)?;
+        ctx.on_setup_complete();
+
+        info!("RRC Resume Complete for UE[{}]", ue_id);
+
+        Some(RrcResumeCompleteResult {
+            ue_id,
+            nas_pdu,
+        })
+    }
+
+    /// Builds an RRC Reestablishment message (simplified)
+    fn build_rrc_reestablishment(&self, transaction_id: u8) -> OctetString {
+        let mut pdu = Vec::with_capacity(16);
+
+        // DL-CCCH-Message with RRCReestablishment
+        pdu.push(0x24); // c1 choice = rrcReestablishment
+        pdu.push(transaction_id); // rrc-TransactionIdentifier
+        pdu.push(0x00); // criticalExtensions = rrcReestablishment
+
+        // nextHopChainingCount (3 bits, set to 0)
+        pdu.push(0x00);
+
+        OctetString::from_slice(&pdu)
+    }
+
+    /// Builds an RRC Resume message (simplified)
+    fn build_rrc_resume(&self, transaction_id: u8) -> OctetString {
+        let mut pdu = Vec::with_capacity(16);
+
+        // DL-CCCH-Message with RRCResume
+        pdu.push(0x28); // c1 choice = rrcResume
+        pdu.push(transaction_id); // rrc-TransactionIdentifier
+        pdu.push(0x00); // criticalExtensions = rrcResume
+
+        // Minimal masterCellGroup
+        pdu.extend_from_slice(&[0x00, 0x00]);
+
+        OctetString::from_slice(&pdu)
     }
 
     /// Handles radio link failure for a UE

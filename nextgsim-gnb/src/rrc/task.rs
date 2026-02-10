@@ -12,12 +12,23 @@ use nextgsim_rls::RrcChannel;
 use super::connection::RrcConnectionManager;
 use super::ue_context::RrcUeContextManager;
 
+/// NTN configuration stored at RRC level
+#[derive(Debug, Clone)]
+pub struct NtnRrcConfig {
+    pub satellite_type: String,
+    pub common_ta_us: u64,
+    pub k_offset: u16,
+    pub max_doppler_hz: f64,
+    pub autonomous_ta: bool,
+}
+
 /// RRC Task for managing UE RRC connections
 pub struct RrcTask {
     task_base: GnbTaskBase,
     ue_manager: RrcUeContextManager,
     connection_manager: RrcConnectionManager,
     pdu_id_counter: u32,
+    ntn_config: Option<NtnRrcConfig>,
 }
 
 impl RrcTask {
@@ -27,6 +38,7 @@ impl RrcTask {
             ue_manager: RrcUeContextManager::new(),
             connection_manager: RrcConnectionManager::new(),
             pdu_id_counter: 0,
+            ntn_config: None,
         }
     }
 
@@ -62,28 +74,71 @@ impl RrcTask {
     }
 
     async fn handle_ul_ccch_message(&mut self, ue_id: i32, data: &OctetString) {
-        if data.len() < 6 {
+        if data.len() < 2 {
             warn!("UL-CCCH message too short: {} bytes", data.len());
             return;
         }
 
         let bytes = data.data();
-        let initial_id = i64::from_be_bytes([
-            0, 0, 0,
-            bytes.get(1).copied().unwrap_or(0),
-            bytes.get(2).copied().unwrap_or(0),
-            bytes.get(3).copied().unwrap_or(0),
-            bytes.get(4).copied().unwrap_or(0),
-            bytes.get(5).copied().unwrap_or(0),
-        ]) & 0x7FFFFFFFFF;
-        
-        let is_stmsi = (bytes.get(0).copied().unwrap_or(0) & 0x80) != 0;
-        let establishment_cause = bytes.get(6).copied().unwrap_or(3) as i64;
+        let msg_type = bytes[0] & 0x3F;
 
-        if let Some(result) = self.connection_manager.process_rrc_setup_request(
-            &mut self.ue_manager, ue_id, initial_id, is_stmsi, establishment_cause,
-        ) {
-            self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu).await;
+        match msg_type {
+            // RRC Setup Request (c1 bit = 0x00..0x1F)
+            0x00..=0x1F => {
+                if data.len() < 6 {
+                    warn!("RRC Setup Request too short: {} bytes", data.len());
+                    return;
+                }
+                let initial_id = i64::from_be_bytes([
+                    0, 0, 0,
+                    bytes.get(1).copied().unwrap_or(0),
+                    bytes.get(2).copied().unwrap_or(0),
+                    bytes.get(3).copied().unwrap_or(0),
+                    bytes.get(4).copied().unwrap_or(0),
+                    bytes.get(5).copied().unwrap_or(0),
+                ]) & 0x7FFFFFFFFF;
+
+                let is_stmsi = (bytes[0] & 0x80) != 0;
+                let establishment_cause = bytes.get(6).copied().unwrap_or(3) as i64;
+
+                if let Some(result) = self.connection_manager.process_rrc_setup_request(
+                    &mut self.ue_manager, ue_id, initial_id, is_stmsi, establishment_cause,
+                ) {
+                    self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu).await;
+                }
+            }
+            // RRC Reestablishment Request (0x24)
+            0x24 => {
+                self.handle_rrc_reestablishment_request(ue_id, data).await;
+            }
+            // RRC Resume Request (0x28)
+            0x28 => {
+                self.handle_rrc_resume_request(ue_id, data).await;
+            }
+            _ => {
+                // Fall back to original logic for backwards compatibility
+                if data.len() >= 6 {
+                    let initial_id = i64::from_be_bytes([
+                        0, 0, 0,
+                        bytes.get(1).copied().unwrap_or(0),
+                        bytes.get(2).copied().unwrap_or(0),
+                        bytes.get(3).copied().unwrap_or(0),
+                        bytes.get(4).copied().unwrap_or(0),
+                        bytes.get(5).copied().unwrap_or(0),
+                    ]) & 0x7FFFFFFFFF;
+
+                    let is_stmsi = (bytes[0] & 0x80) != 0;
+                    let establishment_cause = bytes.get(6).copied().unwrap_or(3) as i64;
+
+                    if let Some(result) = self.connection_manager.process_rrc_setup_request(
+                        &mut self.ue_manager, ue_id, initial_id, is_stmsi, establishment_cause,
+                    ) {
+                        self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu).await;
+                    }
+                } else {
+                    debug!("Unknown UL-CCCH message type: 0x{:02x}", msg_type);
+                }
+            }
         }
     }
 
@@ -99,6 +154,8 @@ impl RrcTask {
         match message_type {
             0x04 => self.handle_rrc_setup_complete(ue_id, data).await,
             0x08 => self.handle_ul_information_transfer(ue_id, data).await,
+            0x05 => self.handle_rrc_reestablishment_complete(ue_id, data).await,
+            0x09 => self.handle_rrc_resume_complete(ue_id, data).await,
             _ => {
                 // Check if this looks like a raw NAS PDU
                 // EPD = 0x7E for 5GMM (Mobility Management), 0x2E for 5GSM (Session Management)
@@ -192,6 +249,98 @@ impl RrcTask {
         OctetString::from_slice(&pdu)
     }
 
+    async fn handle_rrc_reestablishment_request(&mut self, ue_id: i32, data: &OctetString) {
+        let bytes = data.data();
+        // Parse C-RNTI (2 bytes at offset 1-2) and PhysCellId (2 bytes at offset 3-4)
+        let c_rnti = if bytes.len() >= 3 {
+            u16::from_be_bytes([bytes[1], bytes[2]])
+        } else {
+            0
+        };
+        let phys_cell_id = if bytes.len() >= 5 {
+            u16::from_be_bytes([bytes[3], bytes[4]])
+        } else {
+            0
+        };
+        let cause = bytes.get(5).copied().unwrap_or(2); // Default: otherFailure
+
+        info!(
+            "RRC Reestablishment Request from UE[{}]: c_rnti={}, phys_cell_id={}, cause={}",
+            ue_id, c_rnti, phys_cell_id, cause
+        );
+
+        if let Some(result) = self.connection_manager.process_rrc_reestablishment_request(
+            &mut self.ue_manager,
+            ue_id,
+            c_rnti,
+            phys_cell_id,
+            cause,
+        ) {
+            self.send_rrc_message(result.ue_id, result.channel, result.rrc_reestablishment_pdu)
+                .await;
+        }
+    }
+
+    async fn handle_rrc_reestablishment_complete(&mut self, ue_id: i32, data: &OctetString) {
+        let bytes = data.data();
+        let transaction_id = if bytes.len() >= 2 { bytes[1] } else { 0 };
+
+        info!("RRC Reestablishment Complete from UE[{}], tid={}", ue_id, transaction_id);
+
+        if let Some(result) = self.connection_manager.process_rrc_reestablishment_complete(
+            &mut self.ue_manager,
+            ue_id,
+            transaction_id,
+        ) {
+            // If there's a NAS PDU, forward it to NGAP
+            if let Some(nas_pdu) = result.nas_pdu {
+                self.send_uplink_nas_delivery(result.ue_id, nas_pdu).await;
+            }
+        }
+    }
+
+    async fn handle_rrc_resume_request(&mut self, ue_id: i32, data: &OctetString) {
+        let bytes = data.data();
+        let resume_cause = bytes.get(1).copied().unwrap_or(0);
+
+        info!(
+            "RRC Resume Request from UE[{}]: cause={}",
+            ue_id, resume_cause
+        );
+
+        if let Some(result) = self.connection_manager.process_rrc_resume_request(
+            &mut self.ue_manager,
+            ue_id,
+            resume_cause,
+        ) {
+            self.send_rrc_message(result.ue_id, result.channel, result.rrc_resume_pdu).await;
+        }
+    }
+
+    async fn handle_rrc_resume_complete(&mut self, ue_id: i32, data: &OctetString) {
+        let bytes = data.data();
+        let transaction_id = if bytes.len() >= 2 { bytes[1] } else { 0 };
+        let nas_pdu = if bytes.len() > 3 {
+            Some(OctetString::from_slice(&bytes[3..]))
+        } else {
+            None
+        };
+
+        info!("RRC Resume Complete from UE[{}], tid={}", ue_id, transaction_id);
+
+        if let Some(result) = self.connection_manager.process_rrc_resume_complete(
+            &mut self.ue_manager,
+            ue_id,
+            transaction_id,
+            nas_pdu,
+        ) {
+            // If there's a NAS PDU, forward it to NGAP as uplink NAS
+            if let Some(nas_pdu) = result.nas_pdu {
+                self.send_uplink_nas_delivery(result.ue_id, nas_pdu).await;
+            }
+        }
+    }
+
     async fn handle_an_release(&mut self, ue_id: i32) {
         if let Some(result) = self.connection_manager.initiate_rrc_release(&mut self.ue_manager, ue_id) {
             self.send_rrc_message(result.ue_id, result.channel, result.rrc_release_pdu).await;
@@ -254,6 +403,22 @@ impl Task for RrcTask {
                             RrcMessage::Paging { ue_paging_tmsi, tai_list_for_paging } => {
                                 self.handle_paging(ue_paging_tmsi, tai_list_for_paging).await;
                             }
+                            RrcMessage::NtnTimingAdvanceConfig {
+                                satellite_type, common_ta_us, k_offset,
+                                max_doppler_hz, autonomous_ta,
+                            } => {
+                                info!(
+                                    "RRC: NTN timing config received: type={}, TA={}us, k_offset={}, doppler={}Hz, autonomous_ta={}",
+                                    satellite_type, common_ta_us, k_offset, max_doppler_hz, autonomous_ta
+                                );
+                                self.ntn_config = Some(NtnRrcConfig {
+                                    satellite_type,
+                                    common_ta_us,
+                                    k_offset,
+                                    max_doppler_hz,
+                                    autonomous_ta,
+                                });
+                            }
                         },
                         TaskMessage::Shutdown => {
                             info!("RRC task received shutdown signal");
@@ -292,6 +457,11 @@ mod tests {
             gtp_advertise_ip: None,
             ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         }
     }
 

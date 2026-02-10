@@ -414,10 +414,11 @@ impl AnalyticsInfoService {
             AnalyticsId::QosSustainability => {
                 anlf.analyze_qos_sustainability(&request.target, data_collector, mtlf)
             }
-            AnalyticsId::EnergyEfficiency | AnalyticsId::SliceOptimization => {
-                Err(crate::NwdafError::Analytics(crate::AnalyticsError::UnsupportedAnalyticsId {
-                    id: request.analytics_id,
-                }))
+            AnalyticsId::EnergyEfficiency => {
+                anlf.analyze_energy_efficiency(&request.target, data_collector)
+            }
+            AnalyticsId::SliceOptimization => {
+                anlf.analyze_slice_optimization(&request.target, data_collector)
             }
         };
 
@@ -813,6 +814,25 @@ impl AnalyticsAccuracyTracker {
     /// Returns the retrain threshold
     pub fn retrain_threshold(&self) -> f32 {
         self.retrain_threshold
+    }
+
+    /// Records feedback and triggers MTLF retraining for degraded analytics.
+    ///
+    /// This connects the accuracy feedback loop (TS 23.288 6.1) to the MTLF
+    /// retraining pipeline. When a consumer reports accuracy below the threshold,
+    /// the corresponding model is scheduled for retraining.
+    pub fn record_feedback_and_retrain(
+        &mut self,
+        feedback: AnalyticsAccuracyFeedback,
+        mtlf: &mut crate::mtlf::Mtlf,
+    ) -> Vec<AnalyticsId> {
+        self.record_feedback(feedback);
+        let degraded = self.needs_retraining();
+        if !degraded.is_empty() {
+            mtlf.trigger_retraining(&degraded)
+        } else {
+            vec![]
+        }
     }
 }
 

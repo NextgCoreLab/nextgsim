@@ -58,6 +58,13 @@ supported_algs:
   nea2: true   # AES ciphering
   nea3: true   # ZUC ciphering
 
+# Post-Quantum Cryptography (Rel-20 research)
+pqc:
+  enabled: false           # Enable PQC algorithm support
+  prefer_pqc: false        # Prefer PQC over classical when available
+  # nea4: X25519 + ML-KEM-768 hybrid key exchange (FIPS 203)
+  # nia4: ML-DSA-65 integrity protection (FIPS 204)
+
 # gNB addresses to search for (RLS protocol)
 # When running in Docker, use the gNB container hostname or IP
 # Note: Port is optional - defaults to 4997

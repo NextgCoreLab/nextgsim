@@ -36,6 +36,15 @@ const RRC_CYCLE_INTERVAL_MS: u64 = 2500;
 /// Cell selection interval in milliseconds
 const CELL_SELECTION_INTERVAL_MS: u64 = 1000;
 
+/// UE-side NTN timing state
+#[derive(Debug, Clone)]
+pub struct UeNtnTiming {
+    pub common_ta_us: u64,
+    pub k_offset: u16,
+    pub autonomous_ta: bool,
+    pub max_doppler_hz: f64,
+}
+
 /// RRC Task for managing cell selection and RRC connections
 pub struct RrcTask {
     task_base: UeTaskBase,
@@ -57,6 +66,8 @@ pub struct RrcTask {
     establishment_cause: i64,
     /// Last cell selection attempt time
     last_cell_selection: Option<Instant>,
+    /// NTN timing advance state (if operating via satellite)
+    ntn_timing: Option<UeNtnTiming>,
 }
 
 impl RrcTask {
@@ -79,6 +90,7 @@ impl RrcTask {
             initial_nas_pdu: None,
             establishment_cause: 3, // mo-Data
             last_cell_selection: None,
+            ntn_timing: None,
         }
     }
 
@@ -758,6 +770,20 @@ impl Task for RrcTask {
                             }
                             RrcMessage::TriggerCycle => {
                                 self.perform_cycle().await;
+                            }
+                            RrcMessage::NtnTimingAdvanceReceived {
+                                common_ta_us, k_offset, autonomous_ta, max_doppler_hz,
+                            } => {
+                                info!(
+                                    "UE RRC: NTN timing advance received: TA={}us, k_offset={}, autonomous={}, doppler={}Hz",
+                                    common_ta_us, k_offset, autonomous_ta, max_doppler_hz
+                                );
+                                self.ntn_timing = Some(UeNtnTiming {
+                                    common_ta_us,
+                                    k_offset,
+                                    autonomous_ta,
+                                    max_doppler_hz,
+                                });
                             }
                         },
                         TaskMessage::Shutdown => {
