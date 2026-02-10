@@ -60,6 +60,19 @@ use nextgsim_ngap::procedures::ue_context_release::{
     UeContextReleaseCompleteParams,
 };
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, UserLocationInfoNr, NrCgi, Tai};
+use nextgsim_ngap::procedures::handover::{
+    decode_handover_command, decode_handover_request,
+    decode_handover_preparation_failure, HandoverCommandData,
+    HandoverRequestData, HandoverPreparationFailureData,
+    encode_handover_required, encode_handover_request_acknowledge,
+    encode_handover_notify,
+    HandoverRequiredParams, HandoverRequestAcknowledgeParams,
+    HandoverNotifyParams, HandoverTypeValue, HandoverCause,
+    PduSessionResourceHoRequiredItem, PduSessionResourceAdmittedItem,
+    TargetIdValue, TaiValue,
+    UserLocationInfoNr as HandoverUserLocationInfoNr,
+    NrCgiValue as HandoverNrCgiValue,
+};
 
 /// NGAP Task for managing AMF communication and UE contexts
 pub struct NgapTask {
@@ -348,6 +361,24 @@ impl NgapTask {
                 if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
                     ctx.on_ng_setup_response(response);
                 }
+
+                // Forward NTN timing config to RRC task if configured
+                if let Some(ref ntn) = self.task_base.config.ntn_config {
+                    info!(
+                        "NTN mode active: satellite_type={}, propagation_delay={}us, k_offset={}",
+                        ntn.satellite_type, ntn.propagation_delay_us, ntn.k_offset
+                    );
+                    let _ = self.task_base.rrc_tx.try_send(
+                        crate::tasks::RrcMessage::NtnTimingAdvanceConfig {
+                            satellite_type: ntn.satellite_type.clone(),
+                            common_ta_us: ntn.common_ta_us,
+                            k_offset: ntn.k_offset,
+                            max_doppler_hz: ntn.max_doppler_hz,
+                            autonomous_ta: ntn.autonomous_ta,
+                        },
+                    );
+                }
+
                 true
             }
             Err(e) => {
@@ -1254,6 +1285,12 @@ impl NgapTask {
                     self.handle_pdu_session_resource_release(client_id, stream, release_cmd).await;
                 } else if let Ok(ue_release_cmd) = decode_ue_context_release_command(pdu_bytes) {
                     self.handle_ue_context_release_command(client_id, stream, ue_release_cmd).await;
+                } else if let Ok(ho_cmd) = decode_handover_command(pdu_bytes) {
+                    self.handle_handover_command(client_id, stream, ho_cmd).await;
+                } else if let Ok(ho_req) = decode_handover_request(pdu_bytes) {
+                    self.handle_handover_request(client_id, stream, ho_req).await;
+                } else if let Ok(ho_fail) = decode_handover_preparation_failure(pdu_bytes) {
+                    self.handle_handover_preparation_failure(client_id, stream, ho_fail).await;
                 } else {
                     debug!(
                         "Received operational NGAP PDU on stream {} (not yet handled, first bytes: {:02x?})",
@@ -1267,6 +1304,326 @@ impl NgapTask {
                     "Received NGAP PDU in unexpected AMF state: {:?}",
                     amf_state
                 );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Handover Procedures
+    // ========================================================================
+
+    /// Handles Handover Command from AMF (source gNB side)
+    /// AMF sends this after receiving HandoverRequestAcknowledge from target gNB.
+    /// Source gNB must forward the transparent container to UE via RRC and
+    /// release resources after UE completes handover.
+    async fn handle_handover_command(
+        &mut self,
+        _client_id: i32,
+        _stream: u16,
+        ho_cmd: HandoverCommandData,
+    ) {
+        info!(
+            "Handover Command received: amf_ue_ngap_id={}, ran_ue_ngap_id={}, type={:?}",
+            ho_cmd.amf_ue_ngap_id, ho_cmd.ran_ue_ngap_id, ho_cmd.handover_type
+        );
+
+        // Find the UE by RAN UE NGAP ID
+        let ue_id = self
+            .find_ue_by_ran_id(ho_cmd.ran_ue_ngap_id as i64)
+            .map(|ctx| ctx.ue_id);
+
+        if let Some(ue_id) = ue_id {
+            // Forward the Target-to-Source Transparent Container to UE via RRC
+            // This contains the RRC Reconfiguration with mobility control info
+            let container = OctetString::from_slice(
+                &ho_cmd.target_to_source_transparent_container,
+            );
+            let msg = RrcMessage::NasDelivery {
+                ue_id,
+                pdu: container,
+            };
+            if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                error!("Failed to forward handover command to RRC: {}", e);
+            }
+
+            // Release PDU sessions that failed handover
+            if let Some(ref release_list) = ho_cmd.pdu_session_resource_to_release_list {
+                for item in release_list {
+                    let msg = GtpMessage::SessionRelease {
+                        ue_id,
+                        psi: item.pdu_session_id as i32,
+                    };
+                    if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                        error!("Failed to release PDU session {}: {}", item.pdu_session_id, e);
+                    }
+                }
+            }
+
+            info!("Handover Command processed for UE[{}], forwarded to RRC", ue_id);
+        } else {
+            warn!(
+                "Handover Command for unknown RAN UE NGAP ID: {}",
+                ho_cmd.ran_ue_ngap_id
+            );
+        }
+    }
+
+    /// Handles Handover Request from AMF (target gNB side)
+    /// AMF sends this to the target gNB to prepare handover resources.
+    /// Target gNB must allocate resources and respond with HandoverRequestAcknowledge.
+    async fn handle_handover_request(
+        &mut self,
+        client_id: i32,
+        stream: u16,
+        ho_req: HandoverRequestData,
+    ) {
+        info!(
+            "Handover Request received (target gNB): amf_ue_ngap_id={}, type={:?}",
+            ho_req.amf_ue_ngap_id, ho_req.handover_type
+        );
+
+        // Allocate a new UE context for the incoming handover
+        if let Some(ran_ue_ngap_id) = self.create_ue_context(
+            self.ue_contexts.len() as i32 + 1000, // Handover UE IDs start from 1000
+            client_id,
+        ) {
+            // Set AMF UE NGAP ID on the new context
+            let ue_id = self
+                .find_ue_by_ran_id(ran_ue_ngap_id)
+                .map(|ctx| ctx.ue_id);
+
+            if let Some(ue_id) = ue_id {
+                if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                    ctx.amf_ue_ngap_id = Some(ho_req.amf_ue_ngap_id as i64);
+                }
+            }
+
+            // Build HandoverRequestAcknowledge - admit all PDU sessions
+            let admitted_list = vec![PduSessionResourceAdmittedItem {
+                pdu_session_id: 1, // Default PDU session
+                handover_request_ack_transfer: vec![0x00], // Minimal transfer
+            }];
+
+            let target_to_source_container =
+                ho_req.source_to_target_transparent_container.clone();
+
+            match encode_handover_request_acknowledge(&HandoverRequestAcknowledgeParams {
+                amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
+                ran_ue_ngap_id: ran_ue_ngap_id as u32,
+                pdu_session_resource_admitted_list: admitted_list,
+                pdu_session_resource_failed_list: None,
+                target_to_source_transparent_container: target_to_source_container,
+            }) {
+                Ok(data) => {
+                    self.send_ngap_ue_associated(client_id, stream, data).await;
+                    info!(
+                        "Sent Handover Request Acknowledge: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
+                        ho_req.amf_ue_ngap_id, ran_ue_ngap_id
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to encode Handover Request Acknowledge: {}", e);
+                }
+            }
+        } else {
+            error!(
+                "Failed to create UE context for handover, amf_ue_ngap_id={}",
+                ho_req.amf_ue_ngap_id
+            );
+        }
+    }
+
+    /// Handles Handover Preparation Failure from AMF (source gNB side)
+    /// AMF sends this when the target gNB rejected the handover.
+    async fn handle_handover_preparation_failure(
+        &mut self,
+        _client_id: i32,
+        _stream: u16,
+        ho_fail: HandoverPreparationFailureData,
+    ) {
+        warn!(
+            "Handover Preparation Failure: amf_ue_ngap_id={}, ran_ue_ngap_id={}, cause={:?}",
+            ho_fail.amf_ue_ngap_id, ho_fail.ran_ue_ngap_id, ho_fail.cause
+        );
+
+        // Handover failed - UE stays on source gNB, no action needed
+        if let Some(ctx) = self.find_ue_by_ran_id(ho_fail.ran_ue_ngap_id as i64) {
+            info!(
+                "Handover preparation failed for UE[{}], staying on source cell",
+                ctx.ue_id
+            );
+        }
+    }
+
+    /// Initiates a handover by sending HandoverRequired to AMF (source gNB side)
+    /// Called when measurement reports indicate better target cell
+    #[allow(dead_code)]
+    async fn initiate_handover(
+        &mut self,
+        ue_id: i32,
+        target_gnb_id: u32,
+        target_tac: u32,
+    ) {
+        let ctx = match self.ue_contexts.get(&ue_id) {
+            Some(c) => c,
+            None => {
+                warn!("Cannot initiate handover for unknown UE[{}]", ue_id);
+                return;
+            }
+        };
+
+        let amf_ue_ngap_id = match ctx.amf_ue_ngap_id {
+            Some(id) => id as u64,
+            None => {
+                warn!("UE[{}] has no AMF UE NGAP ID, cannot handover", ue_id);
+                return;
+            }
+        };
+
+        let config = &self.task_base.config;
+        let plmn_bytes = config.plmn.encode();
+
+        let target_tac_bytes = [
+            ((target_tac >> 16) & 0xFF) as u8,
+            ((target_tac >> 8) & 0xFF) as u8,
+            (target_tac & 0xFF) as u8,
+        ];
+
+        // Build source-to-target transparent container (simplified)
+        let source_container = vec![
+            0x00, // Placeholder - real implementation would include
+            // RRC container with UE capabilities and measurement data
+        ];
+
+        // Collect PDU sessions for handover
+        let pdu_sessions: Vec<PduSessionResourceHoRequiredItem> = ctx
+            .pdu_sessions
+            .values()
+            .map(|sess| PduSessionResourceHoRequiredItem {
+                pdu_session_id: sess.psi,
+                handover_required_transfer: vec![0x00], // Minimal transfer
+            })
+            .collect();
+
+        if pdu_sessions.is_empty() {
+            // Add at least a default entry
+            let pdu_sessions = vec![PduSessionResourceHoRequiredItem {
+                pdu_session_id: 1,
+                handover_required_transfer: vec![0x00],
+            }];
+
+            self.send_handover_required(
+                ctx.amf_ctx_id,
+                amf_ue_ngap_id,
+                ctx.ran_ue_ngap_id as u32,
+                &plmn_bytes,
+                target_gnb_id,
+                &target_tac_bytes,
+                &source_container,
+                &pdu_sessions,
+            )
+            .await;
+        } else {
+            self.send_handover_required(
+                ctx.amf_ctx_id,
+                amf_ue_ngap_id,
+                ctx.ran_ue_ngap_id as u32,
+                &plmn_bytes,
+                target_gnb_id,
+                &target_tac_bytes,
+                &source_container,
+                &pdu_sessions,
+            )
+            .await;
+        }
+    }
+
+    async fn send_handover_required(
+        &self,
+        amf_client_id: i32,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        plmn_bytes: &[u8; 3],
+        target_gnb_id: u32,
+        target_tac_bytes: &[u8; 3],
+        source_container: &[u8],
+        pdu_sessions: &[PduSessionResourceHoRequiredItem],
+    ) {
+        let params = HandoverRequiredParams {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            handover_type: HandoverTypeValue::Intra5gs,
+            cause: HandoverCause::RadioNetwork(
+                nextgsim_ngap::procedures::ng_setup::RadioNetworkCause::HandoverDesirableForRadioReason,
+            ),
+            target_id: TargetIdValue::TargetRanNodeId {
+                global_ran_node_id: target_gnb_id.to_be_bytes().to_vec(),
+                selected_tai: TaiValue {
+                    plmn_identity: *plmn_bytes,
+                    tac: *target_tac_bytes,
+                },
+            },
+            direct_forwarding_path_availability: None,
+            pdu_session_resource_list: pdu_sessions.to_vec(),
+            source_to_target_transparent_container: source_container.to_vec(),
+        };
+
+        match encode_handover_required(&params) {
+            Ok(data) => {
+                self.send_ngap_ue_associated(amf_client_id, 1, data).await;
+                info!(
+                    "Sent Handover Required: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
+                    amf_ue_ngap_id, ran_ue_ngap_id
+                );
+            }
+            Err(e) => {
+                error!("Failed to encode Handover Required: {}", e);
+            }
+        }
+    }
+
+    /// Sends Handover Notify to AMF (target gNB side)
+    /// Called after UE has completed handover to target cell
+    #[allow(dead_code)]
+    async fn send_handover_notify(
+        &self,
+        amf_client_id: i32,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) {
+        let config = &self.task_base.config;
+        let plmn_bytes = config.plmn.encode();
+        let tac_bytes = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+
+        let params = HandoverNotifyParams {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            user_location_info: HandoverUserLocationInfoNr {
+                nr_cgi: HandoverNrCgiValue {
+                    plmn_identity: plmn_bytes,
+                    nr_cell_identity: config.nci,
+                },
+                tai: TaiValue {
+                    plmn_identity: plmn_bytes,
+                    tac: tac_bytes,
+                },
+            },
+        };
+
+        match encode_handover_notify(&params) {
+            Ok(data) => {
+                self.send_ngap_ue_associated(amf_client_id, 1, data).await;
+                info!(
+                    "Sent Handover Notify: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
+                    amf_ue_ngap_id, ran_ue_ngap_id
+                );
+            }
+            Err(e) => {
+                error!("Failed to encode Handover Notify: {}", e);
             }
         }
     }
@@ -1412,6 +1769,15 @@ impl Task for NgapTask {
                         NgapMessage::UeContextReleaseRequest { ue_id, cause } => {
                             self.handle_ue_context_release_request(ue_id, cause).await;
                         }
+                        NgapMessage::NtnTimingInfoReceived {
+                            satellite_type, satellite_id, propagation_delay_us,
+                            common_ta_us, k_offset,
+                        } => {
+                            info!(
+                                "NTN timing info: sat_type={}, sat_id={}, delay={}us, TA={}us, k_offset={}",
+                                satellite_type, satellite_id, propagation_delay_us, common_ta_us, k_offset
+                            );
+                        }
                     }
                 }
                 Some(TaskMessage::Shutdown) => {
@@ -1458,6 +1824,11 @@ mod tests {
             gtp_advertise_ip: None,
             ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         }
     }
 

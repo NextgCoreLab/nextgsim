@@ -476,6 +476,17 @@ pub enum RrcMessage {
     },
     /// Trigger cycle (internal)
     TriggerCycle,
+    /// NTN timing advance received from gNB (in RRC Setup/Reconfiguration)
+    NtnTimingAdvanceReceived {
+        /// Common timing advance in microseconds
+        common_ta_us: u64,
+        /// K-offset for HARQ timing
+        k_offset: u16,
+        /// Whether UE should compute autonomous TA from ephemeris
+        autonomous_ta: bool,
+        /// Max Doppler shift in Hz
+        max_doppler_hz: f64,
+    },
 }
 
 /// Radio link failure cause.

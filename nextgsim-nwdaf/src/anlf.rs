@@ -94,6 +94,26 @@ pub enum AnalyticsPayload {
         /// Affected areas or cells
         affected_areas: Vec<i32>,
     },
+    /// Energy efficiency analytics result (Rel-19, IMT-2030)
+    EnergyEfficiency {
+        /// Energy efficiency score (0.0 to 1.0, higher = more efficient)
+        efficiency_score: f32,
+        /// Estimated power consumption in watts
+        power_consumption_watts: f32,
+        /// Energy per bit in joules/bit
+        energy_per_bit: f32,
+        /// Recommendations for energy optimization
+        recommendations: Vec<String>,
+    },
+    /// Network slice optimization result (Rel-19)
+    SliceOptimization {
+        /// Per-slice utilization (slice_id, utilization 0.0-1.0)
+        slice_utilization: Vec<(i32, f32)>,
+        /// SLA compliance per slice (slice_id, compliant)
+        sla_compliance: Vec<(i32, bool)>,
+        /// Reallocation recommendations
+        reallocation_recommendations: Vec<String>,
+    },
 }
 
 /// QoS metrics for sustainability analytics
@@ -161,6 +181,8 @@ impl Anlf {
                 AnalyticsId::QosSustainability,
                 AnalyticsId::ServiceExperience,
                 AnalyticsId::UserDataCongestion,
+                AnalyticsId::EnergyEfficiency,
+                AnalyticsId::SliceOptimization,
             ],
             recent_results: VecDeque::with_capacity(1000),
             max_results: 1000,
@@ -896,6 +918,296 @@ impl Anlf {
             }
             .into()),
         }
+    }
+
+    /// Performs Energy Efficiency analytics (TS 23.288 6.14, Rel-19 / IMT-2030)
+    ///
+    /// Evaluates network energy efficiency based on cell load, throughput,
+    /// and estimated power consumption using 3GPP ETSI ES 203 228 energy model.
+    pub fn analyze_energy_efficiency(
+        &mut self,
+        target: &AnalyticsTarget,
+        data_collector: &DataCollector,
+    ) -> Result<AnalyticsResult, NwdafError> {
+        match target {
+            AnalyticsTarget::Cell { cell_id } => {
+                let load_history = data_collector
+                    .get_cell_load_history(*cell_id)
+                    .ok_or(AnalyticsError::TargetNotFound {
+                        target: format!("cell-{cell_id}"),
+                    })?;
+
+                if load_history.len() < 5 {
+                    return Err(AnalyticsError::InsufficientData {
+                        required: 5,
+                        available: load_history.len(),
+                    }
+                    .into());
+                }
+
+                // ETSI ES 203 228 power model: P = P_idle + (P_max - P_idle) * load
+                let p_idle: f32 = 50.0; // watts, idle power
+                let p_max: f32 = 200.0; // watts, max power
+                let avg_load = load_history.iter().map(|l| l.prb_usage).sum::<f32>()
+                    / load_history.len() as f32;
+                let avg_throughput = load_history.iter().map(|l| l.avg_throughput_mbps).sum::<f32>()
+                    / load_history.len() as f32;
+
+                let power_consumption = p_idle + (p_max - p_idle) * avg_load;
+                // Energy per bit: power / throughput (J/bit = W / (Mbps * 1e6))
+                let energy_per_bit = if avg_throughput > 0.01 {
+                    power_consumption / (avg_throughput * 1_000_000.0)
+                } else {
+                    f32::MAX
+                };
+                // Efficiency score: inverse relationship with energy per bit (normalized)
+                let efficiency_score = (1.0 - (energy_per_bit * 1e7).min(1.0)).max(0.0);
+
+                let mut recommendations = Vec::new();
+                if avg_load < 0.2 {
+                    recommendations.push("Consider cell sleep mode for low-traffic periods".to_string());
+                }
+                if avg_load > 0.8 {
+                    recommendations.push("High load detected; consider load balancing across cells".to_string());
+                }
+                if energy_per_bit > 1e-7 {
+                    recommendations.push("Enable MIMO sleep and carrier shutdown features".to_string());
+                }
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let result = AnalyticsResult {
+                    analytics_id: AnalyticsId::EnergyEfficiency,
+                    target: target.clone(),
+                    output_type: AnalyticsOutputType::Statistics,
+                    timestamp_ms: now_ms,
+                    confidence: 0.78,
+                    payload: AnalyticsPayload::EnergyEfficiency {
+                        efficiency_score,
+                        power_consumption_watts: power_consumption,
+                        energy_per_bit,
+                        recommendations,
+                    },
+                };
+
+                self.store_result(result.clone());
+                Ok(result)
+            }
+            AnalyticsTarget::Any => {
+                // Aggregate across all known cells
+                let cell_ids: Vec<i32> = data_collector.known_cell_ids();
+                if cell_ids.is_empty() {
+                    return Err(AnalyticsError::TargetNotFound {
+                        target: "any cells".to_string(),
+                    }
+                    .into());
+                }
+
+                let mut total_power = 0.0f32;
+                let mut total_throughput = 0.0f32;
+                let mut cell_count = 0u32;
+
+                for cid in &cell_ids {
+                    if let Some(history) = data_collector.get_cell_load_history(*cid) {
+                        if history.len() >= 5 {
+                            let avg_load = history.iter().map(|l| l.prb_usage).sum::<f32>()
+                                / history.len() as f32;
+                            let avg_tp = history.iter().map(|l| l.avg_throughput_mbps).sum::<f32>()
+                                / history.len() as f32;
+                            total_power += 50.0 + 150.0 * avg_load;
+                            total_throughput += avg_tp;
+                            cell_count += 1;
+                        }
+                    }
+                }
+
+                if cell_count == 0 {
+                    return Err(AnalyticsError::InsufficientData { required: 5, available: 0 }.into());
+                }
+
+                let energy_per_bit = if total_throughput > 0.01 {
+                    total_power / (total_throughput * 1_000_000.0)
+                } else {
+                    f32::MAX
+                };
+                let efficiency_score = (1.0 - (energy_per_bit * 1e7).min(1.0)).max(0.0);
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let result = AnalyticsResult {
+                    analytics_id: AnalyticsId::EnergyEfficiency,
+                    target: target.clone(),
+                    output_type: AnalyticsOutputType::Statistics,
+                    timestamp_ms: now_ms,
+                    confidence: 0.75,
+                    payload: AnalyticsPayload::EnergyEfficiency {
+                        efficiency_score,
+                        power_consumption_watts: total_power,
+                        energy_per_bit,
+                        recommendations: vec![
+                            format!("Network-wide energy analysis across {} cells", cell_count),
+                        ],
+                    },
+                };
+
+                self.store_result(result.clone());
+                Ok(result)
+            }
+            _ => Err(AnalyticsError::ComputationFailed {
+                reason: "Energy efficiency requires Cell or Any target".to_string(),
+            }
+            .into()),
+        }
+    }
+
+    /// Performs Network Slice Optimization analytics (TS 23.288 6.12, Rel-19)
+    ///
+    /// Analyzes per-slice resource utilization and SLA compliance, providing
+    /// reallocation recommendations when slices are over/under-provisioned.
+    pub fn analyze_slice_optimization(
+        &mut self,
+        target: &AnalyticsTarget,
+        data_collector: &DataCollector,
+    ) -> Result<AnalyticsResult, NwdafError> {
+        // Slice analytics works on Cell or Any target
+        let cell_ids: Vec<i32> = match target {
+            AnalyticsTarget::Cell { cell_id } => vec![*cell_id],
+            AnalyticsTarget::Slice { ref snssai } => {
+                let ids = data_collector.known_cell_ids();
+                if ids.is_empty() {
+                    return Err(AnalyticsError::TargetNotFound {
+                        target: format!("slice-{}", snssai),
+                    }
+                    .into());
+                }
+                ids
+            }
+            AnalyticsTarget::Any => {
+                let ids = data_collector.known_cell_ids();
+                if ids.is_empty() {
+                    return Err(AnalyticsError::TargetNotFound {
+                        target: "any cells for slice analytics".to_string(),
+                    }
+                    .into());
+                }
+                ids
+            }
+            _ => {
+                return Err(AnalyticsError::ComputationFailed {
+                    reason: "Slice optimization requires Cell, Slice, or Any target".to_string(),
+                }
+                .into());
+            }
+        };
+
+        // Standard 5G slice types (SST values per TS 23.501):
+        // 1 = eMBB, 2 = URLLC, 3 = MIoT, 4 = V2X
+        let slice_types = [1_i32, 2, 3, 4];
+        let mut slice_utilization = Vec::new();
+        let mut sla_compliance = Vec::new();
+        let mut recommendations = Vec::new();
+
+        // Gather load data across cells
+        let mut total_load = 0.0f32;
+        let mut cell_count = 0u32;
+
+        for cid in &cell_ids {
+            if let Some(history) = data_collector.get_cell_load_history(*cid) {
+                if history.len() >= 3 {
+                    let avg = history.iter().map(|l| l.prb_usage).sum::<f32>()
+                        / history.len() as f32;
+                    total_load += avg;
+                    cell_count += 1;
+                }
+            }
+        }
+
+        let network_load = if cell_count > 0 {
+            total_load / cell_count as f32
+        } else {
+            0.5 // default assumption
+        };
+
+        // Model per-slice utilization based on typical traffic distribution
+        for &sst in &slice_types {
+            let (utilization, sla_target) = match sst {
+                1 => {
+                    // eMBB: consumes ~60% of resources, SLA: throughput > 10 Mbps
+                    let util = (network_load * 0.6).min(1.0);
+                    let sla_ok = util < 0.9; // overloaded eMBB fails SLA
+                    (util, sla_ok)
+                }
+                2 => {
+                    // URLLC: consumes ~15% of resources, SLA: latency < 1ms
+                    let util = (network_load * 0.15).min(1.0);
+                    let sla_ok = util < 0.7; // URLLC very sensitive to load
+                    (util, sla_ok)
+                }
+                3 => {
+                    // MIoT: consumes ~20% of resources, SLA: 99% delivery
+                    let util = (network_load * 0.20).min(1.0);
+                    let sla_ok = util < 0.95;
+                    (util, sla_ok)
+                }
+                4 => {
+                    // V2X: consumes ~5% of resources, SLA: latency < 10ms
+                    let util = (network_load * 0.05).min(1.0);
+                    let sla_ok = util < 0.8;
+                    (util, sla_ok)
+                }
+                _ => (0.0, true),
+            };
+
+            slice_utilization.push((sst, utilization));
+            sla_compliance.push((sst, sla_target));
+
+            if !sla_target {
+                let name = match sst {
+                    1 => "eMBB",
+                    2 => "URLLC",
+                    3 => "MIoT",
+                    4 => "V2X",
+                    _ => "Unknown",
+                };
+                recommendations.push(format!(
+                    "Slice SST={sst} ({name}) SLA at risk: utilization={utilization:.1}%, consider increasing allocation"
+                ));
+            }
+        }
+
+        // Cross-slice recommendations
+        let embb_util = slice_utilization.iter().find(|(s, _)| *s == 1).map(|(_, u)| *u).unwrap_or(0.0);
+        let urllc_util = slice_utilization.iter().find(|(s, _)| *s == 2).map(|(_, u)| *u).unwrap_or(0.0);
+        if embb_util > 0.85 && urllc_util < 0.3 {
+            recommendations.push("Reallocate spare URLLC resources to eMBB to improve throughput".to_string());
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let result = AnalyticsResult {
+            analytics_id: AnalyticsId::SliceOptimization,
+            target: target.clone(),
+            output_type: AnalyticsOutputType::Statistics,
+            timestamp_ms: now_ms,
+            confidence: 0.80,
+            payload: AnalyticsPayload::SliceOptimization {
+                slice_utilization,
+                sla_compliance,
+                reallocation_recommendations: recommendations,
+            },
+        };
+
+        self.store_result(result.clone());
+        Ok(result)
     }
 
     /// Returns recent analytics results

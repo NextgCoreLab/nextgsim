@@ -328,6 +328,19 @@ pub enum NgapMessage {
         /// Release cause
         cause: UeReleaseRequestCause,
     },
+    /// NTN timing info received from AMF (NTN extension IE in NG Setup Response)
+    NtnTimingInfoReceived {
+        /// Satellite type
+        satellite_type: String,
+        /// Satellite ID
+        satellite_id: u32,
+        /// Propagation delay in microseconds
+        propagation_delay_us: u64,
+        /// Common timing advance in microseconds
+        common_ta_us: u64,
+        /// K-offset for HARQ timing
+        k_offset: u16,
+    },
 }
 
 /// Cause for UE context release request.
@@ -397,6 +410,19 @@ pub enum RrcMessage {
         ue_paging_tmsi: Vec<u8>,
         /// TAI list for paging
         tai_list_for_paging: Vec<u8>,
+    },
+    /// NTN timing advance configuration (from NGAP, to include in RRC Setup/Reconfiguration)
+    NtnTimingAdvanceConfig {
+        /// Satellite type
+        satellite_type: String,
+        /// Common timing advance in microseconds
+        common_ta_us: u64,
+        /// K-offset for HARQ timing
+        k_offset: u16,
+        /// Max Doppler shift in Hz
+        max_doppler_hz: f64,
+        /// Whether UE should use autonomous TA calculation
+        autonomous_ta: bool,
     },
 }
 
@@ -1268,6 +1294,11 @@ mod tests {
             gtp_advertise_ip: None,
             ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         }
     }
 

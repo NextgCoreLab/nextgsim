@@ -326,6 +326,29 @@ impl Mtlf {
     pub fn model_dir(&self) -> Option<&PathBuf> {
         self.model_dir.as_ref()
     }
+
+    /// Triggers model retraining for analytics IDs with degraded accuracy.
+    ///
+    /// In production this would schedule an async retraining job.
+    /// Here we invalidate the current model's accuracy to mark it as stale,
+    /// forcing the next model provision to prefer a freshly-registered model.
+    pub fn trigger_retraining(&mut self, analytics_ids: &[AnalyticsId]) -> Vec<AnalyticsId> {
+        let mut triggered = Vec::new();
+        for &aid in analytics_ids {
+            if let Some(best_id) = self.best_model_per_analytics.get(&aid).cloned() {
+                if let Some(model) = self.models.get_mut(&best_id) {
+                    info!(
+                        "MTLF: Triggering retraining for {:?} (model={})",
+                        aid, best_id
+                    );
+                    // Mark model as needing retrain by resetting accuracy
+                    model.accuracy = None;
+                    triggered.push(aid);
+                }
+            }
+        }
+        triggered
+    }
 }
 
 impl Default for Mtlf {

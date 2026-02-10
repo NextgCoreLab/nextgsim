@@ -279,6 +279,11 @@ impl DataCollector {
         self.cell_loads.len()
     }
 
+    /// Returns all known cell IDs
+    pub fn known_cell_ids(&self) -> Vec<i32> {
+        self.cell_loads.keys().copied().collect()
+    }
+
     /// Deactivates a data source (marks it as inactive)
     pub fn deactivate_source(&mut self, source_id: &str) -> bool {
         if let Some(source) = self.sources.get_mut(source_id) {

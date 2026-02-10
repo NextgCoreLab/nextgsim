@@ -290,6 +290,11 @@ mod tests {
             gtp_advertise_ip: None,
             ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         }
     }
 

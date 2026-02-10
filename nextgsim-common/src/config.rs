@@ -68,6 +68,21 @@ pub struct GnbConfig {
     /// Post-quantum cryptography configuration
     #[serde(default)]
     pub pqc_config: PqcConfig,
+    /// NTN (Non-Terrestrial Network) configuration (optional)
+    #[serde(default)]
+    pub ntn_config: Option<NtnConfig>,
+    /// MBS (Multicast/Broadcast) support enabled (Rel-17, TS 23.247)
+    #[serde(default)]
+    pub mbs_enabled: bool,
+    /// ProSe/Sidelink support enabled (Rel-17)
+    #[serde(default)]
+    pub prose_enabled: bool,
+    /// LCS/Positioning support enabled (Rel-17)
+    #[serde(default)]
+    pub lcs_enabled: bool,
+    /// SNPN (Standalone Non-Public Network) configuration
+    #[serde(default)]
+    pub snpn_config: Option<SnpnConfig>,
 }
 
 fn default_gtp_port() -> u16 {
@@ -277,6 +292,88 @@ impl PqcConfig {
     }
 }
 
+/// NTN (Non-Terrestrial Network) configuration.
+///
+/// Configures gNB for satellite-based 5G/6G operation (3GPP TS 38.300 Rel-17).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtnConfig {
+    /// Satellite type (LEO, MEO, GEO, HAPS)
+    pub satellite_type: String,
+    /// Satellite ID
+    pub satellite_id: u32,
+    /// One-way propagation delay in microseconds
+    pub propagation_delay_us: u64,
+    /// Common timing advance in microseconds
+    pub common_ta_us: u64,
+    /// K-offset for HARQ timing (slots)
+    pub k_offset: u16,
+    /// Cell center latitude in degrees
+    pub cell_center_lat: f64,
+    /// Cell center longitude in degrees
+    pub cell_center_lon: f64,
+    /// Cell radius in km
+    pub cell_radius_km: f64,
+    /// Whether the cell footprint is earth-fixed
+    #[serde(default = "default_true")]
+    pub earth_fixed: bool,
+    /// Enable autonomous TA calculation by UE
+    #[serde(default)]
+    pub autonomous_ta: bool,
+    /// Maximum Doppler shift in Hz
+    #[serde(default)]
+    pub max_doppler_hz: f64,
+}
+
+fn default_true() -> bool { true }
+
+/// SNPN (Standalone Non-Public Network) configuration (Rel-17, TS 23.501).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnpnConfig {
+    /// Network Identifier (NID) for the SNPN
+    pub nid: String,
+    /// Closed Access Group (CAG) ID list
+    #[serde(default)]
+    pub cag_ids: Vec<u32>,
+    /// Whether onboarding is allowed for non-subscribed UEs
+    #[serde(default)]
+    pub onboarding_enabled: bool,
+}
+
+/// UE Route Selection Policy rule (Rel-17, TS 24.526).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrspRule {
+    /// Rule precedence (lower = higher priority)
+    pub precedence: u8,
+    /// Traffic descriptor (app ID or IP descriptor)
+    pub traffic_descriptor: String,
+    /// Route selection descriptors
+    pub route_descriptors: Vec<RouteDescriptor>,
+}
+
+/// Route selection descriptor for URSP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteDescriptor {
+    /// Preferred S-NSSAI
+    pub s_nssai: Option<SNssai>,
+    /// Preferred DNN
+    pub dnn: Option<String>,
+    /// PDU session type preference
+    pub session_type: Option<PduSessionType>,
+    /// SSC mode preference (1, 2, or 3)
+    pub ssc_mode: Option<u8>,
+}
+
+/// PIN (Personal IoT Network) role (Rel-18, TS 23.542).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinRole {
+    /// PIN element (IoT device)
+    PinElement,
+    /// PIN gateway (relay to network)
+    PinGateway,
+    /// PIN management entity
+    PinManagement,
+}
+
 /// PDU session type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
@@ -364,6 +461,21 @@ pub struct UeConfig {
     /// Post-quantum cryptography configuration
     #[serde(default)]
     pub pqc_config: PqcConfig,
+    /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.101)
+    #[serde(default)]
+    pub redcap: bool,
+    /// SNPN access configuration
+    #[serde(default)]
+    pub snpn_config: Option<SnpnConfig>,
+    /// ProSe/Sidelink capability
+    #[serde(default)]
+    pub prose_enabled: bool,
+    /// UE Route Selection Policy rules
+    #[serde(default)]
+    pub ursp_rules: Vec<UrspRule>,
+    /// PIN (Personal IoT Network) role
+    #[serde(default)]
+    pub pin_role: Option<PinRole>,
 }
 
 impl Default for UeConfig {
@@ -387,6 +499,11 @@ impl Default for UeConfig {
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             pqc_config: PqcConfig::default(),
+            redcap: false,
+            snpn_config: None,
+            prose_enabled: false,
+            ursp_rules: Vec::new(),
+            pin_role: None,
         }
     }
 }
@@ -571,6 +688,11 @@ mod tests {
             upf_addr: None,
             upf_port: 2152,
             pqc_config: PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         };
         // With gnb_id_length=24, cell_id is 12 bits
         // NCI = 0x000000001, gnb_id = upper 24 bits = 0, cell_id = lower 12 bits = 1
@@ -595,6 +717,11 @@ mod tests {
             upf_addr: None,
             upf_port: 2152,
             pqc_config: PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         };
         // gnb_id_length=24, so gnb_id is upper 24 bits, cell_id is lower 12 bits
         // NCI = 0x123456789
@@ -707,6 +834,11 @@ ignore_stream_ids: false
             upf_addr: None,
             upf_port: 2152,
             pqc_config: PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         };
         let yaml = config.to_yaml().unwrap();
         assert!(yaml.contains("nci: 16"));
@@ -731,6 +863,11 @@ ignore_stream_ids: false
             upf_addr: None,
             upf_port: 2152,
             pqc_config: PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         };
         let yaml = original.to_yaml().unwrap();
         let parsed = GnbConfig::from_yaml(&yaml).unwrap();
@@ -809,6 +946,11 @@ configured_nssai:
             configured_nssai: NetworkSlice::new(),
             tun_name: Some("tun0".to_string()),
             pqc_config: PqcConfig::default(),
+            redcap: false,
+            snpn_config: None,
+            prose_enabled: false,
+            ursp_rules: vec![],
+            pin_role: None,
         };
         let yaml = original.to_yaml().unwrap();
         let parsed = UeConfig::from_yaml(&yaml).unwrap();
@@ -921,6 +1063,11 @@ configured_nssai:
                 SignAlgorithm::Dilithium2,
                 HybridMode::HybridParallel,
             ),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
         };
         assert!(config.pqc_config.enabled);
         assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber512);
@@ -951,6 +1098,11 @@ configured_nssai:
                 SignAlgorithm::Dilithium5,
                 HybridMode::HybridConcatenate,
             ),
+            redcap: false,
+            snpn_config: None,
+            prose_enabled: false,
+            ursp_rules: vec![],
+            pin_role: None,
         };
         assert!(config.pqc_config.enabled);
         assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber1024);

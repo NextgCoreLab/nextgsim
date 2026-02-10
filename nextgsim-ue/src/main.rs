@@ -1144,6 +1144,9 @@ impl UeApp {
                         RrcMessage::TriggerCycle => {
                             // Trigger RRC state machine cycle
                         }
+                        RrcMessage::NtnTimingAdvanceReceived { common_ta_us, k_offset, .. } => {
+                            info!("UE: NTN TA={}us, k_offset={}", common_ta_us, k_offset);
+                        }
                     }
                 }
                 Some(TaskMessage::Shutdown) => {

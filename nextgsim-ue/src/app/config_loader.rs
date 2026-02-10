@@ -305,6 +305,11 @@ mod tests {
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
+            redcap: false,
+            snpn_config: None,
+            prose_enabled: false,
+            ursp_rules: vec![],
+            pin_role: None,
         }
     }
 
