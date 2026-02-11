@@ -290,6 +290,23 @@ impl IeAiMlCapability {
     }
 }
 
+impl NasEncode for IeAiMlCapability {
+    fn nas_encode<B: BufMut>(&self, buf: &mut B) -> CodecResult<()> {
+        self.encode(buf);
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
+impl NasDecode for IeAiMlCapability {
+    fn nas_decode<B: Buf>(buf: &mut B) -> CodecResult<Self> {
+        IeAiMlCapability::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
+    }
+}
+
 
 // ============================================================================
 // ISAC Parameter IE (6G extension)
@@ -377,6 +394,23 @@ impl IeIsacParameter {
     }
 }
 
+impl NasEncode for IeIsacParameter {
+    fn nas_encode<B: BufMut>(&self, buf: &mut B) -> CodecResult<()> {
+        self.encode(buf);
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
+impl NasDecode for IeIsacParameter {
+    fn nas_decode<B: Buf>(buf: &mut B) -> CodecResult<Self> {
+        IeIsacParameter::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
+    }
+}
+
 
 // ============================================================================
 // Semantic Communication Parameter IE (6G extension)
@@ -455,6 +489,23 @@ impl IeSemanticCommParameter {
     /// Get the encoded length (including 1-byte length field)
     pub fn encoded_len(&self) -> usize {
         3 // 1 byte length + 2 bytes value
+    }
+}
+
+impl NasEncode for IeSemanticCommParameter {
+    fn nas_encode<B: BufMut>(&self, buf: &mut B) -> CodecResult<()> {
+        self.encode(buf);
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
+impl NasDecode for IeSemanticCommParameter {
+    fn nas_decode<B: Buf>(buf: &mut B) -> CodecResult<Self> {
+        IeSemanticCommParameter::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
     }
 }
 
@@ -545,6 +596,23 @@ impl IeSubThzBandParameter {
     }
 }
 
+impl NasEncode for IeSubThzBandParameter {
+    fn nas_encode<B: BufMut>(&self, buf: &mut B) -> CodecResult<()> {
+        self.encode(buf);
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
+impl NasDecode for IeSubThzBandParameter {
+    fn nas_decode<B: Buf>(buf: &mut B) -> CodecResult<Self> {
+        IeSubThzBandParameter::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
+    }
+}
+
 
 // ============================================================================
 // NTN Timing Advance IE (6G extension)
@@ -626,6 +694,23 @@ impl IeNtnTimingAdvance {
     /// Get the encoded length (including 1-byte length field)
     pub fn encoded_len(&self) -> usize {
         6 // 1 byte length + 5 bytes value
+    }
+}
+
+impl NasEncode for IeNtnTimingAdvance {
+    fn nas_encode<B: BufMut>(&self, buf: &mut B) -> CodecResult<()> {
+        self.encode(buf);
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
+impl NasDecode for IeNtnTimingAdvance {
+    fn nas_decode<B: Buf>(buf: &mut B) -> CodecResult<Self> {
+        IeNtnTimingAdvance::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
     }
 }
 
@@ -716,6 +801,23 @@ impl IeNtnAccessBarring {
     /// Get the encoded length (including 1-byte length field)
     pub fn encoded_len(&self) -> usize {
         6 // 1 byte length + 5 bytes value
+    }
+}
+
+impl NasEncode for IeNtnAccessBarring {
+    fn nas_encode<B: BufMut>(&self, buf: &mut B) -> CodecResult<()> {
+        self.encode(buf);
+        Ok(())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
+impl NasDecode for IeNtnAccessBarring {
+    fn nas_decode<B: Buf>(buf: &mut B) -> CodecResult<Self> {
+        IeNtnAccessBarring::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
     }
 }
 

@@ -462,3 +462,101 @@ mod tests {
         assert!(stream.is_non_ue_associated());
     }
 }
+
+// ============================================================================
+// 6G Extension Procedure Codes (Rel-20 Research)
+// ============================================================================
+
+/// 6G NGAP extension procedure codes.
+///
+/// These are provisional procedure codes for 6G extensions not yet
+/// standardized in 3GPP TS 38.413. They use the vendor extension range
+/// to avoid conflicts with standard NGAP procedures.
+pub mod sixg_procedure_codes {
+    /// ISAC Measurement Configuration (gNB ↔ AMF)
+    pub const ISAC_MEASUREMENT_CONFIG: u16 = 0xF000;
+    /// ISAC Measurement Report (gNB → AMF)
+    pub const ISAC_MEASUREMENT_REPORT: u16 = 0xF001;
+    /// AI Model Transfer (AMF ↔ gNB)
+    pub const AI_MODEL_TRANSFER: u16 = 0xF010;
+    /// AI Inference Request (AMF → gNB)
+    pub const AI_INFERENCE_REQUEST: u16 = 0xF011;
+    /// AI Inference Response (gNB → AMF)
+    pub const AI_INFERENCE_RESPONSE: u16 = 0xF012;
+    /// NTN Timing Info Update (AMF → gNB)
+    pub const NTN_TIMING_INFO_UPDATE: u16 = 0xF020;
+    /// NTN Cell Info (gNB → AMF)
+    pub const NTN_CELL_INFO: u16 = 0xF021;
+}
+
+/// 6G RRC extension message types (embedded in RRC non-critical extensions).
+pub mod sixg_rrc_extensions {
+    /// AI/ML model configuration in RRCReconfiguration
+    pub const AI_ML_CONFIG: u16 = 0xF100;
+    /// ISAC measurement configuration in RRCReconfiguration
+    pub const ISAC_MEAS_CONFIG: u16 = 0xF101;
+    /// NTN timing advance update in RRCReconfiguration
+    pub const NTN_TIMING_ADVANCE: u16 = 0xF102;
+    /// Sub-THz band configuration in RRCReconfiguration
+    pub const SUB_THZ_BAND_CONFIG: u16 = 0xF103;
+}
+
+/// Wrap a 6G extension payload into an NGAP IE container format.
+///
+/// Format: procedure_code (2 bytes) + length (4 bytes) + payload
+pub fn encode_sixg_ngap_extension(procedure_code: u16, payload: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(6 + payload.len());
+    result.extend_from_slice(&procedure_code.to_be_bytes());
+    result.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    result.extend_from_slice(payload);
+    result
+}
+
+/// Decode a 6G extension from an NGAP IE container format.
+///
+/// Returns (procedure_code, payload).
+pub fn decode_sixg_ngap_extension(data: &[u8]) -> Result<(u16, Vec<u8>), NgapCodecError> {
+    if data.len() < 6 {
+        return Err(NgapCodecError::DecodeError(
+            "6G extension too short".to_string(),
+        ));
+    }
+    let procedure_code = u16::from_be_bytes([data[0], data[1]]);
+    let length = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
+    if data.len() < 6 + length {
+        return Err(NgapCodecError::DecodeError(
+            "6G extension payload truncated".to_string(),
+        ));
+    }
+    Ok((procedure_code, data[6..6 + length].to_vec()))
+}
+
+/// Wrap a 6G extension into an RRC non-critical extension format.
+///
+/// Format: extension_type (2 bytes) + length (2 bytes) + payload
+pub fn encode_sixg_rrc_extension(extension_type: u16, payload: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(4 + payload.len());
+    result.extend_from_slice(&extension_type.to_be_bytes());
+    result.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    result.extend_from_slice(payload);
+    result
+}
+
+/// Decode a 6G extension from an RRC non-critical extension format.
+///
+/// Returns (extension_type, payload).
+pub fn decode_sixg_rrc_extension(data: &[u8]) -> Result<(u16, Vec<u8>), NgapCodecError> {
+    if data.len() < 4 {
+        return Err(NgapCodecError::DecodeError(
+            "6G RRC extension too short".to_string(),
+        ));
+    }
+    let extension_type = u16::from_be_bytes([data[0], data[1]]);
+    let length = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if data.len() < 4 + length {
+        return Err(NgapCodecError::DecodeError(
+            "6G RRC extension payload truncated".to_string(),
+        ));
+    }
+    Ok((extension_type, data[4..4 + length].to_vec()))
+}

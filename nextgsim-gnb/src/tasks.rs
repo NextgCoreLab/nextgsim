@@ -947,6 +947,35 @@ pub struct GnbTaskBase {
     pub rls_tx: TaskHandle<RlsMessage>,
     /// Handle to the SCTP task
     pub sctp_tx: TaskHandle<SctpMessage>,
+    /// 6G task handles (initialized via `init_6g_tasks()`)
+    pub sixg: Option<GnbSixgHandles>,
+}
+
+/// 6G task handles for gNB (Rel-20 extensions)
+#[derive(Clone)]
+pub struct GnbSixgHandles {
+    /// Handle to the SHE (Sub-network Hosted Entity) task
+    pub she_tx: TaskHandle<SheMessage>,
+    /// Handle to the NWDAF (Network Data Analytics) task
+    pub nwdaf_tx: TaskHandle<NwdafMessage>,
+    /// Handle to the NKEF (Network Knowledge Exchange) task
+    pub nkef_tx: TaskHandle<NkefMessage>,
+    /// Handle to the ISAC (Integrated Sensing and Communication) task
+    pub isac_tx: TaskHandle<IsacMessage>,
+    /// Handle to the Agent task
+    pub agent_tx: TaskHandle<AgentMessage>,
+    /// Handle to the FL (Federated Learning) Aggregator task
+    pub fl_tx: TaskHandle<FlAggregatorMessage>,
+}
+
+/// 6G task receivers for gNB
+pub struct GnbSixgReceivers {
+    pub she_rx: mpsc::Receiver<TaskMessage<SheMessage>>,
+    pub nwdaf_rx: mpsc::Receiver<TaskMessage<NwdafMessage>>,
+    pub nkef_rx: mpsc::Receiver<TaskMessage<NkefMessage>>,
+    pub isac_rx: mpsc::Receiver<TaskMessage<IsacMessage>>,
+    pub agent_rx: mpsc::Receiver<TaskMessage<AgentMessage>>,
+    pub fl_rx: mpsc::Receiver<TaskMessage<FlAggregatorMessage>>,
 }
 
 impl GnbTaskBase {
@@ -980,9 +1009,41 @@ impl GnbTaskBase {
             gtp_tx: TaskHandle::new(gtp_tx),
             rls_tx: TaskHandle::new(rls_tx),
             sctp_tx: TaskHandle::new(sctp_tx),
+            sixg: None,
         };
 
         (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)
+    }
+
+    /// Initialize 6G task handles and return their receivers.
+    ///
+    /// Call this after `new()` to enable 6G tasks (SHE, NWDAF, NKEF, ISAC, Agent, FL).
+    /// The returned receivers should be used to spawn the 6G task loops.
+    pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> GnbSixgReceivers {
+        let (she_tx, she_rx) = mpsc::channel(channel_capacity);
+        let (nwdaf_tx, nwdaf_rx) = mpsc::channel(channel_capacity);
+        let (nkef_tx, nkef_rx) = mpsc::channel(channel_capacity);
+        let (isac_tx, isac_rx) = mpsc::channel(channel_capacity);
+        let (agent_tx, agent_rx) = mpsc::channel(channel_capacity);
+        let (fl_tx, fl_rx) = mpsc::channel(channel_capacity);
+
+        self.sixg = Some(GnbSixgHandles {
+            she_tx: TaskHandle::new(she_tx),
+            nwdaf_tx: TaskHandle::new(nwdaf_tx),
+            nkef_tx: TaskHandle::new(nkef_tx),
+            isac_tx: TaskHandle::new(isac_tx),
+            agent_tx: TaskHandle::new(agent_tx),
+            fl_tx: TaskHandle::new(fl_tx),
+        });
+
+        GnbSixgReceivers {
+            she_rx,
+            nwdaf_rx,
+            nkef_rx,
+            isac_rx,
+            agent_rx,
+            fl_rx,
+        }
     }
 
     /// Sends shutdown signals to all tasks.
@@ -994,6 +1055,15 @@ impl GnbTaskBase {
         let _ = self.gtp_tx.shutdown().await;
         let _ = self.rls_tx.shutdown().await;
         let _ = self.sctp_tx.shutdown().await;
+        // 6G tasks (if initialized)
+        if let Some(ref sixg) = self.sixg {
+            let _ = sixg.she_tx.shutdown().await;
+            let _ = sixg.nwdaf_tx.shutdown().await;
+            let _ = sixg.nkef_tx.shutdown().await;
+            let _ = sixg.isac_tx.shutdown().await;
+            let _ = sixg.agent_tx.shutdown().await;
+            let _ = sixg.fl_tx.shutdown().await;
+        }
     }
 }
 

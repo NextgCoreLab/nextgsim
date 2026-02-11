@@ -315,6 +315,28 @@ impl QuicTransport {
         self.state
     }
 
+    /// Initiate connection migration to a new local address
+    ///
+    /// Connection migration is a key QUIC feature for 6G mobility:
+    /// UEs can seamlessly switch between access technologies (NTN, terrestrial)
+    /// without re-establishing the connection.
+    ///
+    /// **Placeholder**: Records the new address but does not perform actual migration.
+    pub fn migrate(&mut self, new_local_addr: SocketAddr) -> Result<(), QuicTransportError> {
+        if self.state != QuicConnectionState::Connected {
+            return Err(QuicTransportError::ConnectionFailed(
+                "Cannot migrate: not connected".to_string(),
+            ));
+        }
+        self.local_addr = new_local_addr;
+        Ok(())
+    }
+
+    /// Get the number of active bidirectional streams
+    pub fn active_streams(&self) -> u64 {
+        0 // Placeholder
+    }
+
     /// Get the configuration
     pub fn config(&self) -> &QuicTransportConfig {
         &self.config

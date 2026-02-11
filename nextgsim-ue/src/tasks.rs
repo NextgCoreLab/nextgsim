@@ -1154,6 +1154,32 @@ pub struct UeTaskBase {
     pub rrc_tx: TaskHandle<RrcMessage>,
     /// Handle to the RLS task
     pub rls_tx: TaskHandle<RlsMessage>,
+    /// 6G task handles (initialized via `init_6g_tasks()`)
+    pub sixg: Option<UeSixgHandles>,
+}
+
+/// 6G task handles for UE (Rel-20 extensions)
+#[derive(Clone)]
+pub struct UeSixgHandles {
+    /// Handle to the SHE Client (edge inference/offloading) task
+    pub she_client_tx: TaskHandle<SheClientMessage>,
+    /// Handle to the NWDAF Reporter (analytics reporting) task
+    pub nwdaf_reporter_tx: TaskHandle<NwdafReporterMessage>,
+    /// Handle to the ISAC Sensor (sensing and communication) task
+    pub isac_sensor_tx: TaskHandle<IsacSensorMessage>,
+    /// Handle to the FL Participant (federated learning) task
+    pub fl_participant_tx: TaskHandle<FlParticipantMessage>,
+    /// Handle to the Semantic Codec (task-oriented communication) task
+    pub semantic_codec_tx: TaskHandle<SemanticCodecMessage>,
+}
+
+/// 6G task receivers for UE
+pub struct UeSixgReceivers {
+    pub she_client_rx: mpsc::Receiver<TaskMessage<SheClientMessage>>,
+    pub nwdaf_reporter_rx: mpsc::Receiver<TaskMessage<NwdafReporterMessage>>,
+    pub isac_sensor_rx: mpsc::Receiver<TaskMessage<IsacSensorMessage>>,
+    pub fl_participant_rx: mpsc::Receiver<TaskMessage<FlParticipantMessage>>,
+    pub semantic_codec_rx: mpsc::Receiver<TaskMessage<SemanticCodecMessage>>,
 }
 
 impl UeTaskBase {
@@ -1181,9 +1207,39 @@ impl UeTaskBase {
             nas_tx: TaskHandle::new(nas_tx),
             rrc_tx: TaskHandle::new(rrc_tx),
             rls_tx: TaskHandle::new(rls_tx),
+            sixg: None,
         };
 
         (base, app_rx, nas_rx, rrc_rx, rls_rx)
+    }
+
+    /// Initialize 6G task handles and return their receivers.
+    ///
+    /// Call this after `new()` to enable 6G tasks (SHE Client, NWDAF Reporter,
+    /// ISAC Sensor, FL Participant, Semantic Codec).
+    /// The returned receivers should be used to spawn the 6G task loops.
+    pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> UeSixgReceivers {
+        let (she_client_tx, she_client_rx) = mpsc::channel(channel_capacity);
+        let (nwdaf_reporter_tx, nwdaf_reporter_rx) = mpsc::channel(channel_capacity);
+        let (isac_sensor_tx, isac_sensor_rx) = mpsc::channel(channel_capacity);
+        let (fl_participant_tx, fl_participant_rx) = mpsc::channel(channel_capacity);
+        let (semantic_codec_tx, semantic_codec_rx) = mpsc::channel(channel_capacity);
+
+        self.sixg = Some(UeSixgHandles {
+            she_client_tx: TaskHandle::new(she_client_tx),
+            nwdaf_reporter_tx: TaskHandle::new(nwdaf_reporter_tx),
+            isac_sensor_tx: TaskHandle::new(isac_sensor_tx),
+            fl_participant_tx: TaskHandle::new(fl_participant_tx),
+            semantic_codec_tx: TaskHandle::new(semantic_codec_tx),
+        });
+
+        UeSixgReceivers {
+            she_client_rx,
+            nwdaf_reporter_rx,
+            isac_sensor_rx,
+            fl_participant_rx,
+            semantic_codec_rx,
+        }
     }
 
     /// Sends shutdown signals to all tasks.
@@ -1193,6 +1249,14 @@ impl UeTaskBase {
         let _ = self.nas_tx.shutdown().await;
         let _ = self.rrc_tx.shutdown().await;
         let _ = self.rls_tx.shutdown().await;
+        // 6G tasks (if initialized)
+        if let Some(ref sixg) = self.sixg {
+            let _ = sixg.she_client_tx.shutdown().await;
+            let _ = sixg.nwdaf_reporter_tx.shutdown().await;
+            let _ = sixg.isac_sensor_tx.shutdown().await;
+            let _ = sixg.fl_participant_tx.shutdown().await;
+            let _ = sixg.semantic_codec_tx.shutdown().await;
+        }
     }
 }
 

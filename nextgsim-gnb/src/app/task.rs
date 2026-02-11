@@ -315,6 +315,7 @@ mod tests {
             gtp_tx: TaskHandle::new(gtp_tx),
             rls_tx: TaskHandle::new(rls_tx),
             sctp_tx: TaskHandle::new(sctp_tx),
+            sixg: None,
         }
     }
 

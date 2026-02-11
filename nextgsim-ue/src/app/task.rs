@@ -422,6 +422,7 @@ mod tests {
             nas_tx: TaskHandle::new(nas_tx),
             rrc_tx: TaskHandle::new(rrc_tx),
             rls_tx: TaskHandle::new(rls_tx),
+            sixg: None,
         }
     }
 
