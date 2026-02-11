@@ -422,6 +422,116 @@ impl Dccf {
         info!("DCCF: Closed session {}", session_id);
         Ok(())
     }
+
+    /// Applies a data transformation pipeline to collected data.
+    ///
+    /// Transforms raw measurements according to a chain of transformations
+    /// (normalization, feature extraction, downsampling, anonymization).
+    pub fn apply_transformations(
+        &self,
+        values: &[f64],
+        transforms: &[DataTransformation],
+    ) -> Vec<f64> {
+        let mut result = values.to_vec();
+        for transform in transforms {
+            result = match transform {
+                DataTransformation::Normalize => {
+                    let min = result.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let max = result.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let range = (max - min).max(f64::EPSILON);
+                    result.iter().map(|v| (v - min) / range).collect()
+                }
+                DataTransformation::Standardize => {
+                    let n = result.len() as f64;
+                    let mean = result.iter().sum::<f64>() / n;
+                    let variance = result.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+                    let std = variance.sqrt().max(f64::EPSILON);
+                    result.iter().map(|v| (v - mean) / std).collect()
+                }
+                DataTransformation::Downsample { factor } => {
+                    result.iter().step_by(*factor).copied().collect()
+                }
+                DataTransformation::MovingAverage { window } => {
+                    let w = (*window).min(result.len()).max(1);
+                    (0..result.len())
+                        .map(|i| {
+                            let start = i.saturating_sub(w - 1);
+                            let slice = &result[start..=i];
+                            slice.iter().sum::<f64>() / slice.len() as f64
+                        })
+                        .collect()
+                }
+                DataTransformation::Clip { min, max } => {
+                    result.iter().map(|v| v.clamp(*min, *max)).collect()
+                }
+            };
+        }
+        result
+    }
+
+    /// Policy-based data routing: determines which NWDAF instances should
+    /// receive data from a given source based on routing policies.
+    pub fn route_data(
+        &self,
+        source_id: &str,
+        policies: &[DataRoutingPolicy],
+    ) -> Vec<String> {
+        let source = match self.sources.get(source_id) {
+            Some(s) => s,
+            None => return vec![],
+        };
+
+        let mut destinations = Vec::new();
+        for policy in policies {
+            let matches = match &policy.condition {
+                RoutingCondition::SourceType(st) => *st == source.source_type,
+                RoutingCondition::Capability(cap) => source.capabilities.contains(cap),
+                RoutingCondition::Always => true,
+            };
+            if matches {
+                destinations.extend(policy.target_nwdaf_ids.iter().cloned());
+            }
+        }
+        // Deduplicate
+        destinations.sort();
+        destinations.dedup();
+        destinations
+    }
+}
+
+/// Data transformation operation for DCCF pipeline
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DataTransformation {
+    /// Min-max normalization to [0, 1]
+    Normalize,
+    /// Z-score standardization (zero mean, unit variance)
+    Standardize,
+    /// Downsample by keeping every N-th sample
+    Downsample { factor: usize },
+    /// Sliding window moving average
+    MovingAverage { window: usize },
+    /// Clip values to [min, max] range
+    Clip { min: f64, max: f64 },
+}
+
+/// Data routing policy for DCCF
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataRoutingPolicy {
+    /// Condition for this policy to apply
+    pub condition: RoutingCondition,
+    /// Target NWDAF instance IDs to receive data
+    pub target_nwdaf_ids: Vec<String>,
+}
+
+/// Condition for data routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RoutingCondition {
+    /// Route data from specific source type
+    SourceType(DataSourceType),
+    /// Route data with specific capability
+    Capability(MeasurementCapability),
+    /// Always route
+    Always,
 }
 
 impl Default for Dccf {
@@ -629,6 +739,91 @@ mod tests {
         let session = dccf.create_session(filter);
         assert_eq!(session.sources.len(), 1);
         assert!(session.sources.contains(&"gnb-1".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_transform() {
+        let dccf = Dccf::new();
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let result = dccf.apply_transformations(&values, &[DataTransformation::Normalize]);
+        assert!((result[0] - 0.0).abs() < 1e-6);
+        assert!((result[4] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_standardize_transform() {
+        let dccf = Dccf::new();
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let result = dccf.apply_transformations(&values, &[DataTransformation::Standardize]);
+        let mean: f64 = result.iter().sum::<f64>() / result.len() as f64;
+        assert!(mean.abs() < 1e-6, "Standardized mean should be ~0, got {mean}");
+    }
+
+    #[test]
+    fn test_downsample_transform() {
+        let dccf = Dccf::new();
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let result = dccf.apply_transformations(&values, &[DataTransformation::Downsample { factor: 2 }]);
+        assert_eq!(result, vec![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_moving_average_transform() {
+        let dccf = Dccf::new();
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let result = dccf.apply_transformations(&values, &[DataTransformation::MovingAverage { window: 3 }]);
+        assert_eq!(result.len(), 5);
+        assert!((result[2] - 2.0).abs() < 1e-6); // avg(1,2,3) = 2
+    }
+
+    #[test]
+    fn test_chained_transforms() {
+        let dccf = Dccf::new();
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let result = dccf.apply_transformations(
+            &values,
+            &[
+                DataTransformation::Downsample { factor: 2 },
+                DataTransformation::Normalize,
+            ],
+        );
+        assert_eq!(result.len(), 3); // 6/2 = 3
+        assert!((result[0] - 0.0).abs() < 1e-6);
+        assert!((result[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_data_routing() {
+        let mut dccf = Dccf::new();
+        dccf.register_source(
+            "gnb-1".to_string(),
+            DataSourceType::Gnb,
+            vec![MeasurementCapability::RadioMeasurement],
+        ).unwrap();
+        dccf.register_source(
+            "amf-1".to_string(),
+            DataSourceType::CoreNf,
+            vec![MeasurementCapability::CellLoad],
+        ).unwrap();
+
+        let policies = vec![
+            DataRoutingPolicy {
+                condition: RoutingCondition::SourceType(DataSourceType::Gnb),
+                target_nwdaf_ids: vec!["nwdaf-1".to_string()],
+            },
+            DataRoutingPolicy {
+                condition: RoutingCondition::Always,
+                target_nwdaf_ids: vec!["nwdaf-central".to_string()],
+            },
+        ];
+
+        let destinations = dccf.route_data("gnb-1", &policies);
+        assert!(destinations.contains(&"nwdaf-1".to_string()));
+        assert!(destinations.contains(&"nwdaf-central".to_string()));
+
+        let destinations = dccf.route_data("amf-1", &policies);
+        assert!(!destinations.contains(&"nwdaf-1".to_string()));
+        assert!(destinations.contains(&"nwdaf-central".to_string()));
     }
 
     #[test]

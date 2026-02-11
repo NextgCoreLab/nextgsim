@@ -68,7 +68,9 @@ pub use she_integration::{
     DetectedObject, MapFeature, SensingProcessingResult, SensingProcessingType,
     SensingWorkloadRequest, SensingWorkloadResult, SheIsacClient,
 };
-pub use waveform::OfdmRadarWaveform;
+pub use waveform::{
+    BistaticGeometry, CfarDetection, CfarDetector, ClutterModel, OfdmRadarWaveform,
+};
 
 /// Speed of light in m/s.
 const SPEED_OF_LIGHT: f64 = 299_792_458.0;

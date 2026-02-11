@@ -63,8 +63,8 @@ pub use ontology::{
     SchemaError,
 };
 pub use query::{
-    GraphPattern, GraphQuery, QueryBuilder, QueryExecutor, QueryFilter, QueryOperator,
-    QueryResult as GraphQueryResult, RelationshipPattern,
+    GraphPath, GraphPattern, GraphQuery, PathStep, QueryBuilder, QueryExecutor, QueryFilter,
+    QueryOperator, QueryResult as GraphQueryResult, RelationshipPattern,
 };
 pub use rag::{BuiltContext, ContextBuilder, ContextFormat, RagConfig};
 pub use storage::{PersistentStorage, StorageConfig, StorageError};

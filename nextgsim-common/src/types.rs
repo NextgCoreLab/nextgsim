@@ -627,6 +627,364 @@ impl ComputeDescriptor {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Rel-20 (6G) Additional Common Types
+// ────────────────────────────────────────────────────────────────────────────
+
+/// RIS (Reconfigurable Intelligent Surface) element configuration (TR 38.901 6G ext).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RisElement {
+    /// Element index within the RIS panel.
+    pub index: u32,
+    /// Phase shift in radians [0, 2π).
+    pub phase_shift: f64,
+    /// Amplitude coefficient [0.0, 1.0].
+    pub amplitude: f64,
+    /// Polarization state.
+    pub polarization: RisPolarization,
+}
+
+/// Polarization mode for an RIS element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RisPolarization {
+    /// Horizontal linear polarization.
+    Horizontal,
+    /// Vertical linear polarization.
+    Vertical,
+    /// Right-hand circular polarization.
+    RhCircular,
+    /// Left-hand circular polarization.
+    LhCircular,
+}
+
+/// RIS panel configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RisConfig {
+    /// Panel identifier.
+    pub panel_id: u32,
+    /// Number of rows in the element grid.
+    pub rows: u16,
+    /// Number of columns in the element grid.
+    pub cols: u16,
+    /// Operating frequency in MHz.
+    pub frequency_mhz: u32,
+    /// Element spacing in wavelengths (λ).
+    pub element_spacing: f64,
+    /// Individual element configurations.
+    pub elements: Vec<RisElement>,
+    /// Whether the panel supports active amplification.
+    pub active_ris: bool,
+    /// Control link latency budget in microseconds.
+    pub control_latency_us: u32,
+}
+
+impl RisConfig {
+    /// Creates a new RIS panel with the given grid dimensions.
+    pub fn new(panel_id: u32, rows: u16, cols: u16, frequency_mhz: u32) -> Self {
+        Self {
+            panel_id,
+            rows,
+            cols,
+            frequency_mhz,
+            element_spacing: 0.5,
+            elements: Vec::new(),
+            active_ris: false,
+            control_latency_us: 100,
+        }
+    }
+
+    /// Total number of RIS elements.
+    pub fn element_count(&self) -> u32 {
+        self.rows as u32 * self.cols as u32
+    }
+}
+
+/// Digital Twin synchronization state (TS 23.700-Digital ext).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DigitalTwinSyncState {
+    /// Twin is being initialized, no data synced yet.
+    Initializing,
+    /// Twin is actively synchronized with the physical entity.
+    Synchronized,
+    /// Twin has stale data beyond the freshness threshold.
+    Stale,
+    /// Synchronization is paused (e.g., UE in idle).
+    Paused,
+    /// Twin is detached from the physical entity.
+    Detached,
+}
+
+/// Digital Twin descriptor for a network entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DigitalTwinDescriptor {
+    /// Unique twin identifier.
+    pub twin_id: u64,
+    /// Type of physical entity this twin represents.
+    pub entity_type: DigitalTwinEntityType,
+    /// Current synchronization state.
+    pub sync_state: DigitalTwinSyncState,
+    /// Maximum acceptable staleness in milliseconds.
+    pub freshness_threshold_ms: u32,
+    /// Last synchronization timestamp (epoch ms).
+    pub last_sync_ms: u64,
+    /// Fidelity level of the twin model.
+    pub fidelity: DigitalTwinFidelity,
+}
+
+/// Type of physical entity represented by a Digital Twin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DigitalTwinEntityType {
+    /// A user equipment device.
+    Ue,
+    /// A gNB base station.
+    Gnb,
+    /// A RIS panel.
+    Ris,
+    /// A network slice instance.
+    Slice,
+    /// An edge compute node.
+    EdgeNode,
+    /// A complete cell site.
+    CellSite,
+}
+
+/// Fidelity level of a Digital Twin model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DigitalTwinFidelity {
+    /// Low fidelity — statistical/aggregate model.
+    Low,
+    /// Medium fidelity — behavioral model.
+    Medium,
+    /// High fidelity — physics-based / ray-tracing model.
+    High,
+}
+
+impl DigitalTwinDescriptor {
+    /// Creates a new twin descriptor.
+    pub fn new(twin_id: u64, entity_type: DigitalTwinEntityType) -> Self {
+        Self {
+            twin_id,
+            entity_type,
+            sync_state: DigitalTwinSyncState::Initializing,
+            freshness_threshold_ms: 100,
+            last_sync_ms: 0,
+            fidelity: DigitalTwinFidelity::Medium,
+        }
+    }
+
+    /// Returns true if the twin data is considered fresh.
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        self.sync_state == DigitalTwinSyncState::Synchronized
+            && now_ms.saturating_sub(self.last_sync_ms) <= self.freshness_threshold_ms as u64
+    }
+}
+
+/// Intent-based networking action descriptor (TS 28.312 6G ext).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntentDescriptor {
+    /// Unique intent identifier.
+    pub intent_id: u64,
+    /// High-level objective.
+    pub objective: IntentObjective,
+    /// Priority (lower = higher priority).
+    pub priority: u8,
+    /// Target scope for this intent.
+    pub scope: IntentScope,
+    /// Expected KPI targets.
+    pub kpi_targets: Vec<IntentKpiTarget>,
+    /// Whether the intent can be decomposed into sub-intents.
+    pub decomposable: bool,
+}
+
+/// High-level objective of an intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntentObjective {
+    /// Maximize throughput for a slice or bearer.
+    MaximizeThroughput,
+    /// Minimize end-to-end latency.
+    MinimizeLatency,
+    /// Minimize energy consumption.
+    MinimizeEnergy,
+    /// Maximize coverage area.
+    MaximizeCoverage,
+    /// Maintain reliability above a target.
+    EnsureReliability,
+    /// Balance load across cells.
+    LoadBalancing,
+    /// Optimize spectral efficiency.
+    SpectralEfficiency,
+}
+
+/// Scope to which an intent applies.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IntentScope {
+    /// Applies to a single UE.
+    Ue(u64),
+    /// Applies to a specific cell.
+    Cell(u32),
+    /// Applies to a network slice.
+    Slice(SNssai),
+    /// Applies to the entire network.
+    Network,
+}
+
+/// KPI target for an intent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntentKpiTarget {
+    /// KPI name (e.g., "latency_ms", "throughput_mbps").
+    pub kpi_name: String,
+    /// Target value.
+    pub target: f64,
+    /// Comparison operator.
+    pub operator: KpiOperator,
+}
+
+/// Comparison operator for a KPI target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KpiOperator {
+    /// KPI must be less than target.
+    LessThan,
+    /// KPI must be less than or equal to target.
+    LessOrEqual,
+    /// KPI must be greater than target.
+    GreaterThan,
+    /// KPI must be greater than or equal to target.
+    GreaterOrEqual,
+    /// KPI must equal target (within tolerance).
+    Equal,
+}
+
+impl IntentDescriptor {
+    /// Creates a new intent descriptor.
+    pub fn new(intent_id: u64, objective: IntentObjective, scope: IntentScope) -> Self {
+        Self {
+            intent_id,
+            objective,
+            priority: 128,
+            scope,
+            kpi_targets: Vec::new(),
+            decomposable: true,
+        }
+    }
+}
+
+/// Sub-THz band configuration (FR3, 92–300 GHz, TR 38.901 6G ext).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubThzConfig {
+    /// Center frequency in GHz.
+    pub center_freq_ghz: f64,
+    /// Channel bandwidth in GHz.
+    pub bandwidth_ghz: f64,
+    /// Molecular absorption loss model.
+    pub absorption_model: AbsorptionModel,
+    /// Maximum transmit power in dBm.
+    pub max_tx_power_dbm: f64,
+    /// Number of antenna elements (massive MIMO).
+    pub antenna_elements: u32,
+    /// Beam tracking update interval in microseconds.
+    pub beam_tracking_interval_us: u32,
+}
+
+/// Molecular absorption model for sub-THz propagation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AbsorptionModel {
+    /// ITU-R P.676 standard gaseous absorption.
+    ItuR676,
+    /// Simplified line-by-line model.
+    LineByLine,
+    /// Window-based model (low-absorption frequency windows).
+    WindowBased,
+}
+
+impl SubThzConfig {
+    /// Creates a new sub-THz configuration.
+    pub fn new(center_freq_ghz: f64, bandwidth_ghz: f64) -> Self {
+        Self {
+            center_freq_ghz,
+            bandwidth_ghz,
+            absorption_model: AbsorptionModel::ItuR676,
+            max_tx_power_dbm: 20.0,
+            antenna_elements: 1024,
+            beam_tracking_interval_us: 50,
+        }
+    }
+
+    /// Returns true if the center frequency is in the sub-THz range (92–300 GHz).
+    pub fn is_valid_sub_thz(&self) -> bool {
+        self.center_freq_ghz >= 92.0 && self.center_freq_ghz <= 300.0
+    }
+}
+
+/// Energy efficiency profile for network entities (TR 21.916 6G ext).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnergyProfile {
+    /// Entity identifier (gNB ID, UE ID, etc.).
+    pub entity_id: u64,
+    /// Current power consumption in watts.
+    pub power_watts: f64,
+    /// Current energy efficiency in bits/joule.
+    pub efficiency_bits_per_joule: f64,
+    /// Active energy-saving features.
+    pub saving_features: Vec<EnergySavingFeature>,
+    /// Sleep mode state.
+    pub sleep_state: SleepState,
+    /// Renewable energy ratio [0.0, 1.0].
+    pub renewable_ratio: f64,
+}
+
+/// Network energy-saving feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnergySavingFeature {
+    /// Carrier shutdown when low traffic.
+    CarrierShutdown,
+    /// MIMO layer reduction.
+    MimoLayerReduction,
+    /// Symbol shutdown within a slot.
+    SymbolShutdown,
+    /// Micro sleep between DRX cycles.
+    MicroSleep,
+    /// Cell DTX (Discontinuous Transmission).
+    CellDtx,
+    /// Bandwidth part adaptation.
+    BwpAdaptation,
+    /// Dynamic power back-off.
+    PowerBackoff,
+}
+
+/// Sleep mode state for a network entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SleepState {
+    /// Fully active.
+    Active,
+    /// Light sleep — fast wake-up (<1 ms).
+    LightSleep,
+    /// Deep sleep — moderate wake-up (<10 ms).
+    DeepSleep,
+    /// Hibernation — slow wake-up (<100 ms).
+    Hibernation,
+    /// Powered off.
+    Off,
+}
+
+impl EnergyProfile {
+    /// Creates a new energy profile for an entity.
+    pub fn new(entity_id: u64) -> Self {
+        Self {
+            entity_id,
+            power_watts: 0.0,
+            efficiency_bits_per_joule: 0.0,
+            saving_features: Vec::new(),
+            sleep_state: SleepState::Active,
+            renewable_ratio: 0.0,
+        }
+    }
+
+    /// Returns true if any energy-saving feature is active.
+    pub fn is_saving_active(&self) -> bool {
+        !self.saving_features.is_empty() || self.sleep_state != SleepState::Active
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

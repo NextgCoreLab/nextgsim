@@ -62,6 +62,9 @@ pub mod metrics;
 /// Integration with semantic communication for distributed codec training
 pub mod semantic_integration;
 
+/// Integration with Service Hosting Environment for FL workload placement
+pub mod she_integration;
+
 // ---------------------------------------------------------------------------
 // Core data structures
 // ---------------------------------------------------------------------------

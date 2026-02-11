@@ -88,18 +88,22 @@ pub mod service;
 
 // Re-export key types from new modules for convenience
 pub use analytics_id::AnalyticsId;
-pub use anlf::{AnalyticsPayload, AnalyticsResult, Anlf, QosMetrics, ServiceLevelMetrics};
+pub use anlf::{
+    AnalyticsPayload, AnalyticsResult, Anlf, CellEnergyModel, QosMetrics, QosThresholds,
+    ResourceType, ServiceLevelMetrics, ServiceType,
+};
 pub use anomaly::{Anomaly, AnomalyDetector, AnomalySeverity};
 pub use coordination::{
     DelegationRequest, DelegationResponse, LoadBalancingStrategy, NwdafCapabilities,
-    NwdafCoordinator, NwdafInstance,
+    NwdafCoordinator, NwdafInstance, SharedAnalyticsResult,
 };
 pub use data_collection::{
     DataCollector, DataSourceRegistration, DataSourceType, MeasurementCapability,
 };
 pub use dccf::{
-    AggregatedData, AggregationMethod, DataCollectionFilter, DataCollectionSession, Dccf,
-    DccfDataSource, GeographicArea, SessionStatus,
+    AggregatedData, AggregationMethod, DataCollectionFilter, DataCollectionSession,
+    DataRoutingPolicy, DataTransformation, Dccf, DccfDataSource, GeographicArea,
+    RoutingCondition, SessionStatus,
 };
 pub use error::{
     AnalyticsError, DataCollectionError, NwdafError, PredictionError, SubscriptionError,
@@ -114,7 +118,7 @@ pub use model_transfer::{
     ModelFilter, ModelMetadata, ModelPackage, ModelTransferMessage, ModelTransferProtocol,
     ModelType, TransferStatistics,
 };
-pub use mtlf::{MlModelInfo, Mtlf};
+pub use mtlf::{AbTestResult, MlModelInfo, Mtlf};
 pub use nkef_bridge::{NwdafNkefBridge, NwdafNkefBridgeConfig};
 pub use predictor::{OnnxPredictor, PredictionMethod, PredictionOutput};
 pub use service::{

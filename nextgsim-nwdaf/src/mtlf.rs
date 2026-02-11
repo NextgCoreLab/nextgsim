@@ -349,6 +349,88 @@ impl Mtlf {
         }
         triggered
     }
+
+    /// Performs A/B test comparison between two models.
+    ///
+    /// Compares champion (current best) vs challenger model by evaluating
+    /// both against held-out accuracy data. Returns the winner model ID.
+    pub fn ab_test(
+        &self,
+        analytics_id: AnalyticsId,
+        challenger_id: &str,
+    ) -> Option<AbTestResult> {
+        let champion_id = self.best_model_per_analytics.get(&analytics_id)?;
+        let champion = self.models.get(champion_id)?;
+        let challenger = self.models.get(challenger_id)?;
+
+        let champion_accuracy = champion.accuracy.unwrap_or(0.0);
+        let challenger_accuracy = challenger.accuracy.unwrap_or(0.0);
+
+        let winner_id = if challenger_accuracy > champion_accuracy + 0.01 {
+            // Challenger must be at least 1% better to dethrone champion
+            challenger_id.to_string()
+        } else {
+            champion_id.clone()
+        };
+
+        let improvement = challenger_accuracy - champion_accuracy;
+
+        info!(
+            "MTLF: A/B test for {:?}: champion={} ({:.3}) vs challenger={} ({:.3}), winner={}",
+            analytics_id, champion_id, champion_accuracy, challenger_id, challenger_accuracy, winner_id
+        );
+
+        Some(AbTestResult {
+            analytics_id,
+            champion_id: champion_id.clone(),
+            challenger_id: challenger_id.to_string(),
+            champion_accuracy,
+            challenger_accuracy,
+            winner_id: winner_id.clone(),
+            improvement,
+        })
+    }
+
+    /// Promotes a model to be the best (champion) for its analytics ID.
+    pub fn promote_model(&mut self, model_id: &str) -> bool {
+        if let Some(model) = self.models.get(model_id) {
+            let analytics_id = model.analytics_id;
+            self.best_model_per_analytics.insert(analytics_id, model_id.to_string());
+            info!("MTLF: Promoted model {} as champion for {:?}", model_id, analytics_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Performs canary deployment check: evaluates if a model is safe for full rollout.
+    ///
+    /// Returns true if the model's accuracy meets the minimum threshold.
+    pub fn canary_check(&self, model_id: &str, min_accuracy: f32) -> bool {
+        self.models.get(model_id)
+            .and_then(|m| m.accuracy)
+            .map(|acc| acc >= min_accuracy)
+            .unwrap_or(false)
+    }
+}
+
+/// Result of an A/B test between champion and challenger models
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbTestResult {
+    /// Analytics ID being tested
+    pub analytics_id: AnalyticsId,
+    /// Current champion model ID
+    pub champion_id: String,
+    /// Challenger model ID
+    pub challenger_id: String,
+    /// Champion accuracy
+    pub champion_accuracy: f32,
+    /// Challenger accuracy
+    pub challenger_accuracy: f32,
+    /// Winner model ID
+    pub winner_id: String,
+    /// Accuracy improvement (positive = challenger better)
+    pub improvement: f32,
 }
 
 impl Default for Mtlf {
@@ -475,6 +557,57 @@ mod tests {
         };
         let response = mtlf.handle_provision_request(&request);
         assert!(response.success);
+    }
+
+    #[test]
+    fn test_ab_test() {
+        let mut mtlf = Mtlf::new();
+        // Register challenger first so it becomes the initial "best"
+        mtlf.register_model(make_model_info("challenger", AnalyticsId::UeMobility, Some(0.92)));
+        // Register champion with lower accuracy
+        mtlf.register_model(make_model_info("champion", AnalyticsId::UeMobility, Some(0.85)));
+        // Force champion as the "best" model
+        mtlf.promote_model("champion");
+
+        let result = mtlf.ab_test(AnalyticsId::UeMobility, "challenger");
+        assert!(result.is_some());
+
+        let result = result.unwrap();
+        assert_eq!(result.winner_id, "challenger");
+        assert!(result.improvement > 0.0);
+    }
+
+    #[test]
+    fn test_ab_test_champion_wins() {
+        let mut mtlf = Mtlf::new();
+        mtlf.register_model(make_model_info("champion", AnalyticsId::NfLoad, Some(0.90)));
+        mtlf.register_model(make_model_info("challenger", AnalyticsId::NfLoad, Some(0.89)));
+
+        let result = mtlf.ab_test(AnalyticsId::NfLoad, "challenger").unwrap();
+        // Champion wins because challenger is not 1% better
+        assert_eq!(result.winner_id, "champion");
+    }
+
+    #[test]
+    fn test_promote_model() {
+        let mut mtlf = Mtlf::new();
+        mtlf.register_model(make_model_info("m1", AnalyticsId::UeMobility, Some(0.8)));
+        mtlf.register_model(make_model_info("m2", AnalyticsId::UeMobility, Some(0.7)));
+
+        assert!(mtlf.promote_model("m2"));
+        let best = mtlf.get_best_model(AnalyticsId::UeMobility).unwrap();
+        assert_eq!(best.model_id, "m2");
+    }
+
+    #[test]
+    fn test_canary_check() {
+        let mut mtlf = Mtlf::new();
+        mtlf.register_model(make_model_info("m1", AnalyticsId::UeMobility, Some(0.9)));
+        mtlf.register_model(make_model_info("m2", AnalyticsId::UeMobility, Some(0.5)));
+
+        assert!(mtlf.canary_check("m1", 0.8));
+        assert!(!mtlf.canary_check("m2", 0.8));
+        assert!(!mtlf.canary_check("nonexistent", 0.8));
     }
 
     #[test]

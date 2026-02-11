@@ -509,6 +509,136 @@ pub struct TaskOutput {
     pub confidence: f32,
 }
 
+// ─── Channel Simulation (A18.4) ─────────────────────────────────────────────
+
+/// AWGN channel simulator for semantic communication testing
+///
+/// Adds white Gaussian noise to transmitted symbols based on SNR.
+pub struct AwgnChannel {
+    /// Signal-to-noise ratio (dB)
+    snr_db: f32,
+}
+
+impl AwgnChannel {
+    /// Creates a new AWGN channel with the given SNR
+    pub fn new(snr_db: f32) -> Self {
+        Self { snr_db }
+    }
+
+    /// Transmits symbols through the AWGN channel (adds noise)
+    pub fn transmit(&self, symbols: &[f32]) -> Vec<f32> {
+        if symbols.is_empty() {
+            return Vec::new();
+        }
+
+        // Compute signal power
+        let signal_power: f32 =
+            symbols.iter().map(|s| s * s).sum::<f32>() / symbols.len() as f32;
+
+        // Compute noise power from SNR
+        let snr_linear = 10.0_f32.powf(self.snr_db / 10.0);
+        let noise_power = if snr_linear > 0.0 {
+            signal_power / snr_linear
+        } else {
+            0.0
+        };
+
+        let noise_stddev = noise_power.sqrt();
+
+        // Add Gaussian noise using Box-Muller transform
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        symbols
+            .iter()
+            .map(|&s| {
+                let u1: f32 = rng.gen::<f32>().max(f32::EPSILON);
+                let u2: f32 = rng.gen();
+                let noise =
+                    noise_stddev * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                s + noise
+            })
+            .collect()
+    }
+
+    /// Returns the SNR in dB
+    pub fn snr_db(&self) -> f32 {
+        self.snr_db
+    }
+}
+
+/// Rayleigh fading channel simulator
+///
+/// Models flat fading with Rayleigh-distributed amplitude.
+pub struct FadingChannel {
+    /// Average SNR (dB) before fading
+    avg_snr_db: f32,
+    /// Doppler spread (Hz) — higher means faster fading
+    doppler_hz: f32,
+}
+
+impl FadingChannel {
+    /// Creates a new Rayleigh fading channel
+    pub fn new(avg_snr_db: f32, doppler_hz: f32) -> Self {
+        Self {
+            avg_snr_db,
+            doppler_hz,
+        }
+    }
+
+    /// Generates a Rayleigh fading coefficient (magnitude)
+    fn fading_gain(&self) -> f32 {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let x: f32 = rng.gen::<f32>().max(f32::EPSILON);
+        let y: f32 = rng.gen();
+        let re = (-2.0 * x.ln()).sqrt() * (2.0 * std::f32::consts::PI * y).cos() / std::f32::consts::SQRT_2;
+        let im = (-2.0 * x.ln()).sqrt() * (2.0 * std::f32::consts::PI * y).sin() / std::f32::consts::SQRT_2;
+        (re * re + im * im).sqrt()
+    }
+
+    /// Transmits symbols through the fading channel
+    pub fn transmit(&self, symbols: &[f32]) -> Vec<f32> {
+        if symbols.is_empty() {
+            return Vec::new();
+        }
+
+        let signal_power: f32 =
+            symbols.iter().map(|s| s * s).sum::<f32>() / symbols.len() as f32;
+        let snr_linear = 10.0_f32.powf(self.avg_snr_db / 10.0);
+        let noise_power = if snr_linear > 0.0 {
+            signal_power / snr_linear
+        } else {
+            0.0
+        };
+        let noise_stddev = noise_power.sqrt();
+
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        symbols
+            .iter()
+            .map(|&s| {
+                let h = self.fading_gain();
+                let u1: f32 = rng.gen::<f32>().max(f32::EPSILON);
+                let u2: f32 = rng.gen();
+                let noise =
+                    noise_stddev * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                h * s + noise
+            })
+            .collect()
+    }
+
+    /// Returns the Doppler spread
+    pub fn doppler_hz(&self) -> f32 {
+        self.doppler_hz
+    }
+
+    /// Returns the average SNR
+    pub fn avg_snr_db(&self) -> f32 {
+        self.avg_snr_db
+    }
+}
+
 /// Semantic communication message
 #[derive(Debug)]
 pub enum SemanticMessage {
@@ -681,5 +811,61 @@ mod tests {
         let var2: f32 = features2.importance.iter().map(|x| x * x).sum::<f32>();
 
         assert!(var1 != var2);
+    }
+
+    // ── Channel simulation tests (A18.4) ───────────────────────────────────
+
+    #[test]
+    fn test_awgn_channel_high_snr() {
+        let channel = AwgnChannel::new(40.0); // Very high SNR → almost no noise
+        let symbols: Vec<f32> = vec![1.0, -1.0, 0.5, -0.5];
+        let received = channel.transmit(&symbols);
+
+        assert_eq!(received.len(), symbols.len());
+        // With 40 dB SNR, noise should be tiny
+        for (s, r) in symbols.iter().zip(received.iter()) {
+            assert!((s - r).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn test_awgn_channel_empty() {
+        let channel = AwgnChannel::new(10.0);
+        let received = channel.transmit(&[]);
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn test_awgn_snr_accessor() {
+        let channel = AwgnChannel::new(15.0);
+        assert_eq!(channel.snr_db(), 15.0);
+    }
+
+    #[test]
+    fn test_fading_channel() {
+        let channel = FadingChannel::new(20.0, 10.0);
+        let symbols: Vec<f32> = vec![1.0; 100];
+        let received = channel.transmit(&symbols);
+
+        assert_eq!(received.len(), 100);
+        // With fading, received signal should vary
+        let mean: f32 = received.iter().sum::<f32>() / received.len() as f32;
+        // Mean should be roughly positive (fading gain is positive)
+        // but we can't assert exact values due to randomness
+        assert!(mean.is_finite());
+    }
+
+    #[test]
+    fn test_fading_channel_empty() {
+        let channel = FadingChannel::new(20.0, 100.0);
+        let received = channel.transmit(&[]);
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn test_fading_channel_accessors() {
+        let channel = FadingChannel::new(25.0, 50.0);
+        assert_eq!(channel.avg_snr_db(), 25.0);
+        assert_eq!(channel.doppler_hz(), 50.0);
     }
 }

@@ -140,6 +140,129 @@ pub struct ServiceLevelMetrics {
     pub data_rate_mbps: f32,
 }
 
+/// Service type for MOS model selection (TS 23.288 6.4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceType {
+    /// Voice service (ITU-T G.107 E-model)
+    Voice,
+    /// Video service (ITU-T P.1203)
+    Video,
+    /// Streaming/buffered media
+    Streaming,
+    /// Web browsing
+    WebBrowsing,
+    /// Gaming (interactive)
+    Gaming,
+    /// Generic data service
+    Data,
+}
+
+/// 5QI-aware QoS thresholds (TS 23.501 Table 5.7.4-1)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QosThresholds {
+    /// 5QI value
+    pub fiveqi: u8,
+    /// Maximum acceptable latency (ms)
+    pub max_latency_ms: f32,
+    /// Maximum acceptable packet loss rate
+    pub max_packet_loss: f32,
+    /// Guaranteed flow bit rate (kbps), None for non-GBR
+    pub gfbr_kbps: Option<f32>,
+    /// Resource type (GBR, non-GBR, delay-critical GBR)
+    pub resource_type: ResourceType,
+}
+
+/// 5QI resource type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceType {
+    /// Guaranteed Bit Rate
+    Gbr,
+    /// Non-GBR
+    NonGbr,
+    /// Delay-Critical GBR
+    DelayCriticalGbr,
+}
+
+impl QosThresholds {
+    /// Returns standard thresholds for a given 5QI (TS 23.501 Table 5.7.4-1)
+    pub fn for_5qi(fiveqi: u8) -> Self {
+        match fiveqi {
+            1 => Self { fiveqi: 1, max_latency_ms: 100.0, max_packet_loss: 1e-2, gfbr_kbps: None, resource_type: ResourceType::Gbr },
+            2 => Self { fiveqi: 2, max_latency_ms: 150.0, max_packet_loss: 1e-3, gfbr_kbps: None, resource_type: ResourceType::Gbr },
+            3 => Self { fiveqi: 3, max_latency_ms: 50.0, max_packet_loss: 1e-3, gfbr_kbps: None, resource_type: ResourceType::Gbr },
+            4 => Self { fiveqi: 4, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::Gbr },
+            5 => Self { fiveqi: 5, max_latency_ms: 100.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+            6 => Self { fiveqi: 6, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+            7 => Self { fiveqi: 7, max_latency_ms: 100.0, max_packet_loss: 1e-3, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+            8 => Self { fiveqi: 8, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+            9 => Self { fiveqi: 9, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+            // Delay-critical GBR
+            82 => Self { fiveqi: 82, max_latency_ms: 10.0, max_packet_loss: 1e-4, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
+            83 => Self { fiveqi: 83, max_latency_ms: 10.0, max_packet_loss: 1e-4, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
+            84 => Self { fiveqi: 84, max_latency_ms: 30.0, max_packet_loss: 1e-5, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
+            85 => Self { fiveqi: 85, max_latency_ms: 5.0, max_packet_loss: 1e-5, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
+            // Default: best-effort
+            _ => Self { fiveqi, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+        }
+    }
+
+    /// Checks if the given QoS metrics satisfy this 5QI's requirements
+    pub fn is_satisfied(&self, latency_ms: f32, packet_loss: f32) -> bool {
+        latency_ms <= self.max_latency_ms && packet_loss <= self.max_packet_loss
+    }
+}
+
+/// Energy model parameters per cell type (ETSI ES 203 228)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellEnergyModel {
+    /// Cell type description
+    pub cell_type: String,
+    /// Idle power consumption (watts)
+    pub p_idle_watts: f32,
+    /// Maximum power consumption (watts)
+    pub p_max_watts: f32,
+    /// Number of TRX chains
+    pub num_trx: u8,
+    /// Whether cell supports DTX (Discontinuous Transmission)
+    pub supports_dtx: bool,
+    /// DTX power saving factor (0.0-1.0)
+    pub dtx_saving_factor: f32,
+    /// Renewable energy percentage (0.0-1.0)
+    pub renewable_fraction: f32,
+}
+
+impl Default for CellEnergyModel {
+    fn default() -> Self {
+        Self {
+            cell_type: "macro".to_string(),
+            p_idle_watts: 50.0,
+            p_max_watts: 200.0,
+            num_trx: 4,
+            supports_dtx: true,
+            dtx_saving_factor: 0.3,
+            renewable_fraction: 0.0,
+        }
+    }
+}
+
+impl CellEnergyModel {
+    /// Computes power consumption for given load, accounting for DTX and TRX sleep
+    pub fn compute_power(&self, load: f32) -> f32 {
+        let base_power = self.p_idle_watts + (self.p_max_watts - self.p_idle_watts) * load;
+        if self.supports_dtx && load < 0.3 {
+            // DTX saves power during low-activity periods
+            base_power * (1.0 - self.dtx_saving_factor * (1.0 - load / 0.3))
+        } else {
+            base_power
+        }
+    }
+
+    /// Computes carbon-equivalent power (non-renewable portion)
+    pub fn carbon_power(&self, total_power: f32) -> f32 {
+        total_power * (1.0 - self.renewable_fraction)
+    }
+}
+
 /// Analytics Logical Function
 ///
 /// Consumes ML models from MTLF and data from DataCollector to produce
@@ -674,6 +797,93 @@ impl Anlf {
 
         self.store_result(result.clone());
         Ok(result)
+    }
+
+    /// Computes service-specific MOS using appropriate ITU-T model
+    ///
+    /// - Voice: ITU-T G.107 E-model (R-factor → MOS mapping)
+    /// - Video: ITU-T P.1203 (bitrate + stalling → MOS)
+    /// - Gaming: Latency-focused model
+    /// - Other: Weighted average of latency, throughput, loss
+    pub fn compute_service_mos(
+        service_type: ServiceType,
+        latency_ms: f32,
+        packet_loss: f32,
+        throughput_mbps: f32,
+        jitter_ms: f32,
+    ) -> f32 {
+        let mos = match service_type {
+            ServiceType::Voice => {
+                // ITU-T G.107 E-model simplified
+                // R = R0 - Is - Id - Ie + A
+                // R0 = 93.2 (base), Is = 0 (simplified), A = 0 (simplified)
+                let id = if latency_ms < 177.3 {
+                    0.024 * latency_ms + 0.11 * (latency_ms - 177.3) * (if latency_ms > 177.3 { 1.0 } else { 0.0 })
+                } else {
+                    0.024 * latency_ms + 0.11 * (latency_ms - 177.3)
+                };
+                let ie = 0.0 + 30.0 * (1.0 - 1.0 / (1.0 + packet_loss * 100.0 / 15.0));
+                let r = (93.2 - id - ie).clamp(0.0, 100.0);
+                // R → MOS mapping
+                if r < 6.5 {
+                    1.0
+                } else if r > 100.0 {
+                    4.5
+                } else {
+                    1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7.0e-6
+                }
+            }
+            ServiceType::Video => {
+                // ITU-T P.1203 mode 0 simplified
+                // Quality depends on bitrate, resolution (estimated from throughput), stalling
+                let bitrate_factor = (throughput_mbps / 5.0).min(1.0).max(0.0); // 5 Mbps = max quality
+                let stalling_factor = 1.0 - (packet_loss * 10.0).min(1.0);
+                let latency_factor = 1.0 - (latency_ms / 500.0).min(0.5);
+                let base_mos = 1.0 + 3.5 * bitrate_factor;
+                base_mos * stalling_factor * latency_factor
+            }
+            ServiceType::Streaming => {
+                // Buffered streaming: throughput dominates, latency less critical
+                let throughput_score = (throughput_mbps / 10.0).min(1.0).max(0.0);
+                let rebuffer_factor = 1.0 - (packet_loss * 5.0).min(0.8);
+                1.0 + 3.5 * throughput_score * rebuffer_factor
+            }
+            ServiceType::Gaming => {
+                // Gaming: latency-dominant model
+                let latency_score = (1.0 - (latency_ms / 100.0).min(1.0)).max(0.0);
+                let jitter_score = (1.0 - (jitter_ms / 30.0).min(1.0)).max(0.0);
+                let loss_score = (1.0 - (packet_loss * 200.0).min(1.0)).max(0.0);
+                1.0 + 3.5 * latency_score * 0.5 + 3.5 * jitter_score * 0.3 + 3.5 * loss_score * 0.2
+            }
+            ServiceType::WebBrowsing => {
+                // Web: page load time approximation
+                let load_time_score = (1.0 - (latency_ms / 3000.0).min(1.0)).max(0.0);
+                let throughput_score = (throughput_mbps / 5.0).min(1.0).max(0.0);
+                1.0 + 2.0 * load_time_score + 1.5 * throughput_score
+            }
+            ServiceType::Data => {
+                // Generic: weighted average
+                let latency_score = (5.0 - (latency_ms / 50.0).min(4.0)).max(1.0);
+                let loss_score = (5.0 - (packet_loss * 100.0).min(4.0)).max(1.0);
+                let throughput_score = (throughput_mbps / 20.0).min(5.0).max(1.0);
+                (latency_score + loss_score + throughput_score) / 3.0
+            }
+        };
+        mos.clamp(1.0, 5.0)
+    }
+
+    /// Analyzes QoS sustainability for a specific 5QI value
+    ///
+    /// Checks current metrics against 5QI-specific thresholds from TS 23.501 Table 5.7.4-1.
+    pub fn check_5qi_compliance(
+        &self,
+        fiveqi: u8,
+        latency_ms: f32,
+        packet_loss: f32,
+    ) -> (bool, QosThresholds) {
+        let thresholds = QosThresholds::for_5qi(fiveqi);
+        let compliant = thresholds.is_satisfied(latency_ms, packet_loss);
+        (compliant, thresholds)
     }
 
     /// Performs User Data Congestion analytics (TS 23.288 6.8)

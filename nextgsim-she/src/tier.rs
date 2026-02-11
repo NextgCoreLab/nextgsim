@@ -359,6 +359,43 @@ impl TierManager {
             .unwrap_or_default()
     }
 
+    /// Finds the best node with a specific accelerator type
+    pub fn find_best_node_with_accelerator(
+        &self,
+        tier: ComputeTier,
+        accelerator: crate::resource::AcceleratorType,
+        compute_flops: u64,
+        memory_bytes: u64,
+    ) -> Option<&ComputeNode> {
+        self.nodes_by_tier
+            .get(&tier)?
+            .iter()
+            .filter(|n| {
+                n.is_available
+                    && n.can_accommodate(compute_flops, memory_bytes)
+                    && match accelerator {
+                        crate::resource::AcceleratorType::Gpu => n.capacity.gpu_count > 0,
+                        crate::resource::AcceleratorType::Npu => n.capacity.npu_count > 0,
+                        crate::resource::AcceleratorType::Tpu => n.capacity.tpu_count > 0,
+                        crate::resource::AcceleratorType::Fpga => n.capacity.fpga_count > 0,
+                    }
+            })
+            .min_by_key(|n| ((n.compute_utilization() + n.memory_utilization()) * 1000.0) as u64)
+    }
+
+    /// Finds nodes accessible to a specific tenant (shared or tenant-specific)
+    pub fn tenant_nodes(&self, tier: ComputeTier, tenant_id: u32) -> Vec<&ComputeNode> {
+        self.nodes_by_tier
+            .get(&tier)
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter(|n| n.tenant_id == Some(tenant_id) || n.tenant_id.is_none())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Returns the number of nodes in each tier
     pub fn node_counts(&self) -> HashMap<ComputeTier, usize> {
         self.nodes_by_tier
