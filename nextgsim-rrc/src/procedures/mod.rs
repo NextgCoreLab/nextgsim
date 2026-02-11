@@ -16,6 +16,7 @@ pub mod measurement_report;
 pub mod ai_ml_config;
 pub mod isac_config;
 pub mod ntn_timing;
+pub mod ntn_link_sim;
 pub mod sub_thz_config;
 
 pub use information_transfer::*;
@@ -31,4 +32,5 @@ pub use measurement_report::*;
 pub use ai_ml_config::*;
 pub use isac_config::*;
 pub use ntn_timing::*;
+pub use ntn_link_sim::*;
 pub use sub_thz_config::*;
