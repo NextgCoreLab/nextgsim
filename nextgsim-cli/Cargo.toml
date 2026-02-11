@@ -14,8 +14,14 @@ workspace = true
 name = "nr-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "nr-loadtest"
+path = "src/loadtest_main.rs"
+
 [dependencies]
 nextgsim-common.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true
