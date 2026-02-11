@@ -106,8 +106,9 @@ pub use error::{
 };
 pub use llm_analytics::{LlmAnalyticsEngine, LlmAnalyticsQuery, LlmAnalyticsResponse};
 pub use ml_training::{
-    MlModelTrainingService, ModelArchitecture, ModelTrainingRequest, ModelTrainingResponse,
-    TrainingConfig, TrainingDataset, TrainingJob, TrainingMetrics, TrainingSample, TrainingStatus,
+    DistributedTrainingCoordinator, FederatedRound, FederatedStrategy, MlModelTrainingService,
+    ModelArchitecture, ModelTrainingRequest, ModelTrainingResponse, ModelUpdate, TrainingConfig,
+    TrainingDataset, TrainingJob, TrainingMetrics, TrainingSample, TrainingStatus,
 };
 pub use model_transfer::{
     ModelFilter, ModelMetadata, ModelPackage, ModelTransferMessage, ModelTransferProtocol,

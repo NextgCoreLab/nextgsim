@@ -310,6 +310,7 @@ mod tests {
             prose_enabled: false,
             ursp_rules: vec![],
             pin_role: None,
+            ..Default::default()
         }
     }
 

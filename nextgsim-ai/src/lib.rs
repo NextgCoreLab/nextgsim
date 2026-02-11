@@ -56,7 +56,9 @@ pub mod inference;
 pub mod isac_pipeline;
 pub mod metrics;
 pub mod model;
+pub mod nr_models;
 pub mod semantic_pipeline;
+pub mod xr_traffic;
 pub mod tensor;
 pub mod tflite;
 
@@ -76,3 +78,7 @@ pub use semantic_pipeline::{
 };
 pub use tensor::{TensorData, TensorShape};
 pub use tflite::TfLiteEngine;
+pub use xr_traffic::{
+    CdrxState, PduSet, PduSetManager, Xr5Qi, XrCdrxController, XrFrame, XrQosFlow,
+    XrTrafficModel,
+};

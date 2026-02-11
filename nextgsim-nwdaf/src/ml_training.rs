@@ -385,6 +385,230 @@ impl Default for MlModelTrainingService {
     }
 }
 
+// ============================================================================
+// Rel-18 Distributed ML Training Coordination (TS 23.288 7.6)
+// ============================================================================
+
+/// Federated learning aggregation strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FederatedStrategy {
+    /// FedAvg: Weighted average of model parameters
+    FedAvg,
+    /// FedProx: Proximal term for heterogeneous data
+    FedProx,
+    /// FedSGD: Stochastic gradient aggregation
+    FedSgd,
+}
+
+impl Default for FederatedStrategy {
+    fn default() -> Self {
+        Self::FedAvg
+    }
+}
+
+/// Model update from a participant NWDAF instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUpdate {
+    /// Participant NWDAF instance ID
+    pub nwdaf_id: String,
+    /// Model parameter deltas (flattened weight updates)
+    pub weight_deltas: Vec<f64>,
+    /// Number of training samples used
+    pub num_samples: u64,
+    /// Training loss achieved
+    pub loss: f64,
+    /// Round number this update is for
+    pub round: u32,
+}
+
+/// Federated learning round state.
+#[derive(Debug, Clone)]
+pub struct FederatedRound {
+    /// Round number
+    pub round: u32,
+    /// Model updates received from participants
+    pub updates: Vec<ModelUpdate>,
+    /// Expected number of participants
+    pub expected_participants: usize,
+    /// Whether aggregation has been performed
+    pub aggregated: bool,
+    /// Aggregated global model weights (after aggregation)
+    pub global_weights: Vec<f64>,
+}
+
+/// Distributed ML training coordinator (Rel-18).
+///
+/// Coordinates federated learning across multiple NWDAF instances.
+/// Each NWDAF trains a local model on its data and sends weight updates
+/// to the coordinator, which aggregates them into a global model.
+#[derive(Debug)]
+pub struct DistributedTrainingCoordinator {
+    /// Aggregation strategy
+    strategy: FederatedStrategy,
+    /// Current training round
+    current_round: u32,
+    /// Active federated rounds
+    rounds: HashMap<u32, FederatedRound>,
+    /// Registered participant NWDAF instances
+    participants: Vec<String>,
+    /// Global model weights
+    global_weights: Vec<f64>,
+    /// Model dimension (number of parameters)
+    model_dimension: usize,
+}
+
+impl DistributedTrainingCoordinator {
+    /// Creates a new distributed training coordinator.
+    pub fn new(strategy: FederatedStrategy, model_dimension: usize) -> Self {
+        Self {
+            strategy,
+            current_round: 0,
+            rounds: HashMap::new(),
+            participants: Vec::new(),
+            global_weights: vec![0.0; model_dimension],
+            model_dimension,
+        }
+    }
+
+    /// Registers a participant NWDAF instance.
+    pub fn register_participant(&mut self, nwdaf_id: String) {
+        if !self.participants.contains(&nwdaf_id) {
+            info!("DistributedTraining: Registered participant {}", nwdaf_id);
+            self.participants.push(nwdaf_id);
+        }
+    }
+
+    /// Starts a new federated learning round.
+    pub fn start_round(&mut self) -> u32 {
+        self.current_round += 1;
+        let round = FederatedRound {
+            round: self.current_round,
+            updates: Vec::new(),
+            expected_participants: self.participants.len(),
+            aggregated: false,
+            global_weights: Vec::new(),
+        };
+        self.rounds.insert(self.current_round, round);
+        info!("DistributedTraining: Started round {} with {} participants",
+            self.current_round, self.participants.len());
+        self.current_round
+    }
+
+    /// Submits a model update from a participant.
+    pub fn submit_update(&mut self, update: ModelUpdate) -> Result<(), NwdafError> {
+        let round_num = update.round;
+
+        let round = self.rounds.get_mut(&round_num).ok_or_else(|| {
+            crate::error::AnalyticsError::TargetNotFound {
+                target: format!("round-{}", round_num),
+            }
+        })?;
+
+        if round.aggregated {
+            return Err(NwdafError::Analytics(
+                crate::error::AnalyticsError::TargetNotFound {
+                    target: format!("round {} already aggregated", round_num),
+                },
+            ));
+        }
+
+        debug!("DistributedTraining: Received update from {} for round {} (loss={:.4})",
+            update.nwdaf_id, update.round, update.loss);
+        round.updates.push(update);
+
+        let should_aggregate = round.updates.len() >= round.expected_participants;
+        // Drop the mutable borrow before calling aggregate_round
+        drop(round);
+
+        // Auto-aggregate when all participants have submitted
+        if should_aggregate {
+            self.aggregate_round(round_num)?;
+        }
+
+        Ok(())
+    }
+
+    /// Aggregates model updates for a round using the configured strategy.
+    fn aggregate_round(&mut self, round_num: u32) -> Result<(), NwdafError> {
+        let round = self.rounds.get_mut(&round_num).ok_or_else(|| {
+            crate::error::AnalyticsError::TargetNotFound {
+                target: format!("round-{}", round_num),
+            }
+        })?;
+
+        if round.updates.is_empty() {
+            return Ok(());
+        }
+
+        let aggregated = match self.strategy {
+            FederatedStrategy::FedAvg => {
+                // Weighted average by number of samples
+                let total_samples: u64 = round.updates.iter().map(|u| u.num_samples).sum();
+                let mut avg = vec![0.0; self.model_dimension];
+                for update in &round.updates {
+                    let weight = update.num_samples as f64 / total_samples as f64;
+                    for (i, delta) in update.weight_deltas.iter().enumerate() {
+                        if i < avg.len() {
+                            avg[i] += delta * weight;
+                        }
+                    }
+                }
+                avg
+            }
+            FederatedStrategy::FedProx | FederatedStrategy::FedSgd => {
+                // Simple average for FedProx/FedSGD (proximal term applied during local training)
+                let n = round.updates.len() as f64;
+                let mut avg = vec![0.0; self.model_dimension];
+                for update in &round.updates {
+                    for (i, delta) in update.weight_deltas.iter().enumerate() {
+                        if i < avg.len() {
+                            avg[i] += delta / n;
+                        }
+                    }
+                }
+                avg
+            }
+        };
+
+        // Apply aggregated update to global model
+        for (i, delta) in aggregated.iter().enumerate() {
+            if i < self.global_weights.len() {
+                self.global_weights[i] += delta;
+            }
+        }
+
+        round.aggregated = true;
+        round.global_weights = self.global_weights.clone();
+
+        let avg_loss: f64 = round.updates.iter().map(|u| u.loss).sum::<f64>()
+            / round.updates.len() as f64;
+        info!("DistributedTraining: Round {} aggregated ({} updates, avg_loss={:.4})",
+            round_num, round.updates.len(), avg_loss);
+
+        Ok(())
+    }
+
+    /// Returns the current global model weights.
+    pub fn global_weights(&self) -> &[f64] {
+        &self.global_weights
+    }
+
+    /// Returns the current round number.
+    pub fn current_round(&self) -> u32 {
+        self.current_round
+    }
+
+    /// Returns the number of registered participants.
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
+
+    /// Returns whether a round has been completed (aggregated).
+    pub fn is_round_complete(&self, round: u32) -> bool {
+        self.rounds.get(&round).map_or(false, |r| r.aggregated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
