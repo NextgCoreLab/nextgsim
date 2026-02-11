@@ -64,6 +64,8 @@ pub use association::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_NUM_STREAMS, DEFAULT_RECEIVE_BUFFER_SIZE, NGAP_PPID,
     // Multi-homing support (A6.1)
     MultihomingConfig, PathManager, PathState, SctpPath,
+    // Stream management (A5.3)
+    NgapStreamCategory, StreamAllocationPolicy, StreamManager,
     // PR-SCTP support (A6.2)
     ForwardTsnChunk, ForwardTsnStreamInfo, PartialReliabilityPolicy,
     PrSctpMessage, PrSctpTracker,

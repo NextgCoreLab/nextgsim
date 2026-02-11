@@ -214,10 +214,12 @@ pub fn build_measurement_report(
 
     let meas_result_serv_mo_list = MeasResultServMOList(serv_mo_list_entries);
 
+    let meas_result_neigh_cells = build_neigh_cell_results(&params.neigh_freq_results);
+
     let meas_results = MeasResults {
         meas_id,
         meas_result_serving_mo_list: meas_result_serv_mo_list,
-        meas_result_neigh_cells: None,
+        meas_result_neigh_cells,
     };
 
     let measurement_report_ies = MeasurementReport_IEs {
@@ -258,15 +260,74 @@ fn build_meas_result_nr_value(nr: &MeasResultNr) -> MeasResultNR {
         }),
     };
 
+    // Build RS index results if provided
+    let rs_index_results = nr.rs_index_results.as_ref().map(|ri| {
+        let ssb_indexes = if ri.ssb_results.is_empty() {
+            None
+        } else {
+            Some(ResultsPerSSB_IndexList(
+                ri.ssb_results.iter().map(|s| {
+                    ResultsPerSSB_Index {
+                        ssb_index: SSB_Index(s.ssb_index),
+                        ssb_results: Some(MeasQuantityResults {
+                            rsrp: s.results.rsrp.map(RSRP_Range),
+                            rsrq: s.results.rsrq.map(RSRQ_Range),
+                            sinr: s.results.sinr.map(SINR_Range),
+                        }),
+                    }
+                }).collect(),
+            ))
+        };
+        let csi_rs_indexes = if ri.csi_rs_results.is_empty() {
+            None
+        } else {
+            Some(ResultsPerCSI_RS_IndexList(
+                ri.csi_rs_results.iter().map(|c| {
+                    ResultsPerCSI_RS_Index {
+                        csi_rs_index: CSI_RS_Index(c.csi_rs_index),
+                        csi_rs_results: Some(MeasQuantityResults {
+                            rsrp: c.results.rsrp.map(RSRP_Range),
+                            rsrq: c.results.rsrq.map(RSRQ_Range),
+                            sinr: c.results.sinr.map(SINR_Range),
+                        }),
+                    }
+                }).collect(),
+            ))
+        };
+        MeasResultNRMeasResultRsIndexResults {
+            results_ssb_indexes: ssb_indexes,
+            results_csi_rs_indexes: csi_rs_indexes,
+        }
+    });
+
     let meas_result = MeasResultNRMeasResult {
         cell_results,
-        rs_index_results: None,
+        rs_index_results,
     };
 
     MeasResultNR {
         phys_cell_id: nr.phys_cell_id.map(PhysCellId),
         meas_result,
     }
+}
+
+/// Build a list of neighbor cell results for the generated types
+fn build_neigh_cell_results(neigh: &[MeasResult2Nr]) -> Option<MeasResultsMeasResultNeighCells> {
+    if neigh.is_empty() {
+        return None;
+    }
+    let mut nr_list = Vec::new();
+    for freq in neigh {
+        for cell in &freq.meas_result_list {
+            nr_list.push(build_meas_result_nr_value(cell));
+        }
+    }
+    if nr_list.is_empty() {
+        return None;
+    }
+    Some(MeasResultsMeasResultNeighCells::MeasResultListNR(
+        MeasResultListNR(nr_list),
+    ))
 }
 
 /// Parse a Measurement Report from a UL-DCCH message
@@ -319,10 +380,28 @@ pub fn parse_measurement_report(
         });
     }
 
+    // Parse neighbor cell results
+    let neigh_freq_results = match &ies.meas_results.meas_result_neigh_cells {
+        Some(MeasResultsMeasResultNeighCells::MeasResultListNR(list)) => {
+            // All neighbor cells reported as a flat list; group into single frequency entry
+            let nr_results: Vec<MeasResultNr> = list.0.iter().map(parse_meas_result_nr).collect();
+            if nr_results.is_empty() {
+                Vec::new()
+            } else {
+                vec![MeasResult2Nr {
+                    ssb_frequency_arfcn: None,
+                    ref_freq_csi_rs: None,
+                    meas_result_list: nr_results,
+                }]
+            }
+        }
+        _ => Vec::new(),
+    };
+
     Ok(MeasurementReportData {
         meas_id,
         serv_freq_results,
-        neigh_freq_results: Vec::new(), // Simplified parsing
+        neigh_freq_results,
         enhanced_quantities: None,
     })
 }
@@ -345,13 +424,51 @@ fn parse_meas_result_nr(nr: &MeasResultNR) -> MeasResultNr {
         }
     });
 
+    // Parse RS index results
+    let rs_index_results = nr.meas_result.rs_index_results.as_ref().map(|ri| {
+        let ssb_results = ri.results_ssb_indexes.as_ref()
+            .map(|list| {
+                list.0.iter().map(|s| {
+                    MeasResultPerSsbIndex {
+                        ssb_index: s.ssb_index.0,
+                        results: s.ssb_results.as_ref().map(|r| MeasCellResults {
+                            rsrp: r.rsrp.as_ref().map(|v| v.0),
+                            rsrq: r.rsrq.as_ref().map(|v| v.0),
+                            sinr: r.sinr.as_ref().map(|v| v.0),
+                        }).unwrap_or(MeasCellResults { rsrp: None, rsrq: None, sinr: None }),
+                    }
+                }).collect()
+            })
+            .unwrap_or_default();
+
+        let csi_rs_results = ri.results_csi_rs_indexes.as_ref()
+            .map(|list| {
+                list.0.iter().map(|c| {
+                    MeasResultPerCsiRsIndex {
+                        csi_rs_index: c.csi_rs_index.0,
+                        results: c.csi_rs_results.as_ref().map(|r| MeasCellResults {
+                            rsrp: r.rsrp.as_ref().map(|v| v.0),
+                            rsrq: r.rsrq.as_ref().map(|v| v.0),
+                            sinr: r.sinr.as_ref().map(|v| v.0),
+                        }).unwrap_or(MeasCellResults { rsrp: None, rsrq: None, sinr: None }),
+                    }
+                }).collect()
+            })
+            .unwrap_or_default();
+
+        MeasResultRsIndexNr {
+            ssb_results,
+            csi_rs_results,
+        }
+    });
+
     MeasResultNr {
         phys_cell_id: nr.phys_cell_id.as_ref().map(|pci| pci.0),
         cell_results: MeasResultCellNr {
             ssb_results,
             csi_rs_results,
         },
-        rs_index_results: None,
+        rs_index_results,
     }
 }
 

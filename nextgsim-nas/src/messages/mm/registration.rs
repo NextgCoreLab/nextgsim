@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::enums::MmMessageType;
 use crate::header::PlainMmHeader;
-use crate::ies::ie1::{Ie5gsRegistrationType, InformationElement1, NssaiInclusionMode};
+use crate::ies::ie1::{Ie5gsRegistrationType, IeMicoIndication, InformationElement1, NssaiInclusionMode};
 use crate::security::NasKeySetIdentifier;
 
 /// Error type for Registration message encoding/decoding
@@ -528,6 +528,10 @@ pub struct RegistrationRequest {
     pub pdu_session_status: Option<u16>,
     /// NAS message container (optional, Type 6, IEI 0x71)
     pub nas_message_container: Option<Vec<u8>>,
+    /// MICO indication (optional, Type 1, IEI 0xB)
+    pub mico_indication: Option<IeMicoIndication>,
+    /// LADN indication (optional, Type 6, IEI 0x74)
+    pub ladn_indication: Option<Vec<u8>>,
 }
 
 impl Default for RegistrationRequest {
@@ -545,6 +549,8 @@ impl Default for RegistrationRequest {
             uplink_data_status: None,
             pdu_session_status: None,
             nas_message_container: None,
+            mico_indication: None,
+            ladn_indication: None,
         }
     }
 }
@@ -602,12 +608,16 @@ impl RegistrationRequest {
                     continue;
                 }
                 0xB => {
-                    // MICO indication - skip for now
-                    buf.advance(1);
+                    // MICO indication (Type 1, IEI 0xB)
+                    let val = buf.get_u8() & 0x0F;
+                    msg.mico_indication = Some(
+                        IeMicoIndication::decode(val)
+                            .unwrap_or_default()
+                    );
                     continue;
                 }
                 0x9 => {
-                    // Network slicing indication - skip for now
+                    // Network slicing indication
                     buf.advance(1);
                     continue;
                 }
@@ -710,6 +720,19 @@ impl RegistrationRequest {
                     buf.copy_to_slice(&mut data);
                     msg.nas_message_container = Some(data);
                 }
+                registration_request_iei::LADN_INDICATION => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.ladn_indication = Some(data);
+                }
                 _ => {
                     // Skip unknown IEs
                     buf.advance(1);
@@ -790,6 +813,16 @@ impl RegistrationRequest {
             buf.put_u8(registration_request_iei::NAS_MESSAGE_CONTAINER);
             buf.put_u16(container.len() as u16);
             buf.put_slice(container);
+        }
+
+        if let Some(ref mico) = self.mico_indication {
+            buf.put_u8((registration_request_iei::MICO_INDICATION << 4) | (mico.encode() & 0x0F));
+        }
+
+        if let Some(ref ladn) = self.ladn_indication {
+            buf.put_u8(registration_request_iei::LADN_INDICATION);
+            buf.put_u16(ladn.len() as u16);
+            buf.put_slice(ladn);
         }
     }
 
@@ -893,6 +926,10 @@ pub struct RegistrationAccept {
     pub nssai_inclusion_mode: Option<NssaiInclusionMode>,
     /// Negotiated DRX parameters (optional, Type 4, IEI 0x51)
     pub negotiated_drx_parameters: Option<u8>,
+    /// MICO indication (optional, Type 1, IEI 0xB)
+    pub mico_indication: Option<IeMicoIndication>,
+    /// LADN information (optional, Type 6, IEI 0x79)
+    pub ladn_information: Option<Vec<u8>>,
 }
 
 
@@ -920,12 +957,16 @@ impl RegistrationAccept {
             let iei_high = (iei >> 4) & 0x0F;
             match iei_high {
                 0xB => {
-                    // MICO indication - skip
-                    buf.advance(1);
+                    // MICO indication (Type 1, IEI 0xB)
+                    let val = buf.get_u8() & 0x0F;
+                    msg.mico_indication = Some(
+                        IeMicoIndication::decode(val)
+                            .unwrap_or_default()
+                    );
                     continue;
                 }
                 0x9 => {
-                    // Network slicing indication - skip
+                    // Network slicing indication
                     buf.advance(1);
                     continue;
                 }
@@ -1106,6 +1147,19 @@ impl RegistrationAccept {
                         buf.advance(len - 1);
                     }
                 }
+                registration_accept_iei::LADN_INFORMATION => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.ladn_information = Some(data);
+                }
                 _ => {
                     // Skip unknown IEs
                     buf.advance(1);
@@ -1211,6 +1265,16 @@ impl RegistrationAccept {
             buf.put_u8(registration_accept_iei::NEGOTIATED_DRX_PARAMETERS);
             buf.put_u8(1);
             buf.put_u8(drx);
+        }
+
+        if let Some(ref mico) = self.mico_indication {
+            buf.put_u8((registration_accept_iei::MICO_INDICATION << 4) | (mico.encode() & 0x0F));
+        }
+
+        if let Some(ref ladn) = self.ladn_information {
+            buf.put_u8(registration_accept_iei::LADN_INFORMATION);
+            buf.put_u16(ladn.len() as u16);
+            buf.put_slice(ladn);
         }
     }
 

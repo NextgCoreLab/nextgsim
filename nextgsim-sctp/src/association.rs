@@ -943,6 +943,194 @@ impl PathManager {
 
 
 // ===========================================================================
+// A5.3: Multi-SCTP Stream Management (TS 38.412)
+// ===========================================================================
+
+/// NGAP message category for stream routing (TS 38.412 Section 7)
+///
+/// Different NGAP procedure types are mapped to different SCTP streams
+/// to prevent head-of-line blocking between critical signaling and
+/// non-UE-associated procedures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NgapStreamCategory {
+    /// Non-UE-associated signaling (NG Setup, Reset, Error Indication)
+    /// Must always use stream 0 per TS 38.412
+    NonUeAssociated,
+    /// UE-associated signaling (Initial UE Message, UL/DL NAS Transport, etc.)
+    /// Can use any stream > 0
+    UeAssociated,
+    /// High-priority UE signaling (Handover, PDU Session Resource Setup)
+    UeHighPriority,
+}
+
+/// Stream allocation policy for NGAP
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAllocationPolicy {
+    /// Round-robin across available streams
+    RoundRobin,
+    /// Use stream 0 for non-UE, stream 1+ for UE-associated (hash-based)
+    CategoryBased,
+}
+
+impl Default for StreamAllocationPolicy {
+    fn default() -> Self {
+        Self::CategoryBased
+    }
+}
+
+/// SCTP stream manager for NGAP multi-stream transport
+///
+/// Manages stream allocation and routing per 3GPP TS 38.412, which requires:
+/// - Stream 0: Non-UE-associated signaling (NG Setup, Reset, etc.)
+/// - Stream 1+: UE-associated signaling (distributed by UE context)
+///
+/// This prevents head-of-line blocking between different UE contexts
+/// and between non-UE and UE-associated procedures.
+#[derive(Debug)]
+pub struct StreamManager {
+    /// Total number of outbound streams negotiated
+    num_streams: u16,
+    /// Stream allocation policy
+    policy: StreamAllocationPolicy,
+    /// Round-robin counter for UE-associated stream allocation
+    rr_counter: u16,
+    /// Per-stream message count (for load monitoring)
+    stream_msg_count: Vec<u64>,
+}
+
+impl StreamManager {
+    /// Create a new stream manager with the given number of streams
+    pub fn new(num_streams: u16) -> Self {
+        let effective = num_streams.max(1);
+        Self {
+            num_streams: effective,
+            policy: StreamAllocationPolicy::default(),
+            rr_counter: 0,
+            stream_msg_count: vec![0; effective as usize],
+        }
+    }
+
+    /// Create a stream manager with a specific allocation policy
+    pub fn with_policy(mut self, policy: StreamAllocationPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Get the number of available streams
+    pub fn num_streams(&self) -> u16 {
+        self.num_streams
+    }
+
+    /// Get the allocation policy
+    pub fn policy(&self) -> StreamAllocationPolicy {
+        self.policy
+    }
+
+    /// Select a stream for the given NGAP message category
+    ///
+    /// Per TS 38.412:
+    /// - Non-UE-associated: always stream 0
+    /// - UE-associated: hash-based or round-robin on streams 1..N
+    pub fn select_stream(&mut self, category: NgapStreamCategory) -> u16 {
+        match self.policy {
+            StreamAllocationPolicy::CategoryBased => {
+                self.select_stream_category_based(category)
+            }
+            StreamAllocationPolicy::RoundRobin => {
+                self.select_stream_round_robin(category)
+            }
+        }
+    }
+
+    /// Select stream for a UE-associated message with a specific UE context ID
+    ///
+    /// Ensures all messages for the same UE use the same stream,
+    /// preserving ordering guarantees per UE context.
+    pub fn select_stream_for_ue(&mut self, ue_id: u32) -> u16 {
+        if self.num_streams <= 1 {
+            return 0;
+        }
+        // Hash UE ID to stream 1..N (stream 0 reserved for non-UE)
+        let stream = 1 + (ue_id as u16 % (self.num_streams - 1));
+        self.record_usage(stream);
+        stream
+    }
+
+    /// Get per-stream message counts for load monitoring
+    pub fn stream_msg_counts(&self) -> &[u64] {
+        &self.stream_msg_count
+    }
+
+    /// Get the total number of messages sent across all streams
+    pub fn total_messages(&self) -> u64 {
+        self.stream_msg_count.iter().sum()
+    }
+
+    /// Get the least loaded stream (excluding stream 0)
+    pub fn least_loaded_stream(&self) -> u16 {
+        if self.num_streams <= 1 {
+            return 0;
+        }
+        let mut min_stream = 1u16;
+        let mut min_count = u64::MAX;
+        for i in 1..self.num_streams {
+            let count = self.stream_msg_count[i as usize];
+            if count < min_count {
+                min_count = count;
+                min_stream = i;
+            }
+        }
+        min_stream
+    }
+
+    fn select_stream_category_based(&mut self, category: NgapStreamCategory) -> u16 {
+        let stream = match category {
+            NgapStreamCategory::NonUeAssociated => 0,
+            NgapStreamCategory::UeAssociated => {
+                if self.num_streams <= 1 {
+                    0
+                } else {
+                    self.least_loaded_stream()
+                }
+            }
+            NgapStreamCategory::UeHighPriority => {
+                if self.num_streams <= 1 {
+                    0
+                } else {
+                    // High-priority uses stream 1 (dedicated)
+                    1
+                }
+            }
+        };
+        self.record_usage(stream);
+        stream
+    }
+
+    fn select_stream_round_robin(&mut self, category: NgapStreamCategory) -> u16 {
+        let stream = match category {
+            NgapStreamCategory::NonUeAssociated => 0,
+            _ => {
+                if self.num_streams <= 1 {
+                    0
+                } else {
+                    let stream = 1 + (self.rr_counter % (self.num_streams - 1));
+                    self.rr_counter = self.rr_counter.wrapping_add(1);
+                    stream
+                }
+            }
+        };
+        self.record_usage(stream);
+        stream
+    }
+
+    fn record_usage(&mut self, stream: u16) {
+        if (stream as usize) < self.stream_msg_count.len() {
+            self.stream_msg_count[stream as usize] += 1;
+        }
+    }
+}
+
+// ===========================================================================
 // A6.2: PR-SCTP (Partial Reliability) support
 // ===========================================================================
 
