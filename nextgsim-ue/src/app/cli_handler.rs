@@ -167,6 +167,11 @@ pub enum NasAction {
         /// Procedure Transaction Identity
         pti: u8,
     },
+    /// Release all PDU sessions sequentially
+    ReleaseAllPduSessions {
+        /// List of (PSI, PTI) pairs to release
+        sessions: Vec<(u8, u8)>,
+    },
     /// Initiate deregistration
     Deregister {
         /// Deregistration cause
@@ -509,31 +514,69 @@ impl CliHandler {
             );
         }
 
-        // Release ALL active sessions by returning action for the first
-        // and letting the caller iterate through all sessions
-        // A proper implementation would return multiple NasActions or queue them
+        // Check if UE is registered
+        if rm_state != RmState::Registered {
+            return (
+                CliCommandResult::error(format!(
+                    "Cannot release PDU sessions: UE is not registered (current state: {rm_state})"
+                )),
+                NasAction::None,
+            );
+        }
+
+        // Check MM state
+        if mm_state != MmState::Registered {
+            return (
+                CliCommandResult::error(format!(
+                    "Cannot release PDU sessions: Invalid MM state ({mm_state})"
+                )),
+                NasAction::None,
+            );
+        }
+
         let sessions_to_release: Vec<u8> = self.active_sessions.clone();
         let count = sessions_to_release.len();
 
-        // Release the first session now and return success message indicating all sessions
-        let psi = sessions_to_release[0];
-        let (result, action) = self.handle_ps_release(psi as i32, rm_state, mm_state);
+        // Allocate a PTI for each session and build the release list
+        let mut release_pairs = Vec::new();
+        for &psi in &sessions_to_release {
+            let pti = match self.pt_manager.allocate() {
+                Some(pti) => pti,
+                None => {
+                    // Free any already-allocated PTIs on failure
+                    for &(_, allocated_pti) in &release_pairs {
+                        self.pt_manager.free(allocated_pti);
+                    }
+                    return (
+                        CliCommandResult::error(format!(
+                            "No PTI available for release (allocated {}/{} sessions)",
+                            release_pairs.len(), count
+                        )),
+                        NasAction::None,
+                    );
+                }
+            };
 
-        // Update the result message to reflect all sessions
-        let updated_result = CliCommandResult {
-            success: result.success,
-            message: format!("Releasing {count} PDU session(s) starting with PSI {psi}"),
-        };
+            // Start the procedure transaction
+            if let Some(pt) = self.pt_manager.get_mut(pti) {
+                pt.start(psi, SmMessageType::PduSessionReleaseRequest, SM_TIMER_T3582);
+            }
 
-        // Note: In the current architecture, only one action can be returned at a time.
-        // The App task would need to call this multiple times or the NasAction enum
-        // would need to support multiple release operations. For now, this releases
-        // the first session and logs a TODO for the remaining sessions.
-        if count > 1 {
-            tracing::warn!("ps-release-all: Only releasing first session (PSI {}), {} remaining sessions need manual release", psi, count - 1);
+            release_pairs.push((psi, pti));
         }
 
-        (updated_result, action)
+        let psi_list: Vec<String> = release_pairs.iter().map(|(psi, _)| psi.to_string()).collect();
+
+        (
+            CliCommandResult::ok(format!(
+                "Releasing {} PDU session(s): PSI [{}]",
+                count,
+                psi_list.join(", ")
+            )),
+            NasAction::ReleaseAllPduSessions {
+                sessions: release_pairs,
+            },
+        )
     }
 
     /// Allocates a new PSI (1-15).

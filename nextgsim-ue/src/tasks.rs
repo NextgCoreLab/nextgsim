@@ -421,6 +421,11 @@ pub enum NasMessage {
         /// User data
         data: OctetString,
     },
+    /// Initiate Service Request procedure (IDLE -> CONNECTED transition)
+    ///
+    /// Triggered when UE has data to send while in CM-IDLE or CM-INACTIVE state.
+    /// Sends NAS Service Request message (5GMM type 0x4C) via RRC.
+    InitiateServiceRequest,
 }
 
 // ============================================================================

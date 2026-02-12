@@ -163,6 +163,19 @@ impl AppTask {
                     error!("Failed to send PDU session release request: {}", e);
                 }
             }
+            NasAction::ReleaseAllPduSessions { sessions } => {
+                info!("Releasing {} PDU session(s) sequentially", sessions.len());
+                for (psi, pti) in sessions {
+                    info!("Initiating PDU session release: PSI={}, PTI={}", psi, pti);
+                    let msg = NasMessage::InitiatePduSessionRelease { psi, pti };
+                    if let Err(e) = self.task_base.nas_tx.send(msg).await {
+                        error!("Failed to send PDU session release for PSI={}: {}", psi, e);
+                        break;
+                    }
+                    // Small delay between releases to avoid race conditions
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
             NasAction::Deregister { cause } => {
                 use crate::nas::mm::DeregistrationCause;
                 let switch_off = matches!(cause, DeregistrationCause::SwitchOff);

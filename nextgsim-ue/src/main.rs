@@ -273,6 +273,7 @@ impl UeApp {
 
         // Spawn TUN app message handler (logs TUN events)
         let rls_tx_for_tun = task_base.rls_tx.clone();
+        let nas_tx_for_tun = task_base.nas_tx.clone();
         tokio::spawn(async move {
             while let Some(msg) = tun_app_rx.recv().await {
                 match msg {
@@ -284,6 +285,9 @@ impl UeApp {
                     }
                     TunAppMessage::UplinkData { psi, data } => {
                         info!("TUN uplink data: PSI={}, len={}", psi, data.len());
+                        // Trigger Service Request if UE is in IDLE state
+                        // (NAS task will check actual state and only send if needed)
+                        let _ = nas_tx_for_tun.send(NasMessage::InitiateServiceRequest).await;
                         // Forward uplink data to RLS for transmission to gNB
                         let _ = rls_tx_for_tun.send(RlsMessage::DataPduDelivery { psi, pdu: data }).await;
                     }
@@ -830,6 +834,47 @@ impl UeApp {
                             // Write it to the TUN interface
                             debug!("Downlink data received: psi={}, len={}", psi, data.len());
                             let _ = tun_tx.send(TunMessage::WriteData { psi, data }).await;
+                        }
+                        NasMessage::InitiateServiceRequest => {
+                            // Data-triggered Service Request: UE has data to send while in IDLE
+                            if mm_state.is_registered() && mm_state.is_idle() {
+                                info!("Initiating Service Request (data-triggered, IDLE -> CONNECTED)");
+
+                                use nextgsim_nas::messages::mm::ServiceRequest;
+                                use nextgsim_nas::ies::ie1::{IeServiceType, ServiceType};
+
+                                // Build 5G-S-TMSI with default values (real implementation
+                                // would use the stored GUTI from registration)
+                                let tmsi_data = vec![0xF4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+                                let tmsi = Ie5gsMobileIdentity::new(
+                                    MobileIdentityType::Tmsi,
+                                    tmsi_data,
+                                );
+
+                                let svc_req = ServiceRequest::new(
+                                    NasKeySetIdentifier::no_key(),
+                                    IeServiceType::new(ServiceType::Data),
+                                    tmsi,
+                                );
+
+                                let mut nas_pdu = Vec::new();
+                                svc_req.encode(&mut nas_pdu);
+
+                                info!("Sending Service Request (data), PDU len={}", nas_pdu.len());
+                                mm_state.switch_mm_state(MmSubState::ServiceRequestInitiated);
+
+                                pdu_counter += 1;
+                                let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                    pdu_id: pdu_counter,
+                                    pdu: nas_pdu.into(),
+                                }).await;
+                            } else if mm_state.is_registered() && mm_state.is_connected() {
+                                debug!("Service Request not needed: already in CM-CONNECTED");
+                            } else {
+                                warn!("Cannot send Service Request: not registered (RM={}, CM={})",
+                                    mm_state.rm_state(), mm_state.cm_state());
+                            }
                         }
                         NasMessage::PerformMmCycle => {
                             info!("PerformMmCycle received, MM state: {}", mm_state);
