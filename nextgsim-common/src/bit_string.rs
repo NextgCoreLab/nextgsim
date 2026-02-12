@@ -1,4 +1,4 @@
-//! BitString type for bit-level operations.
+//! `BitString` type for bit-level operations.
 //!
 //! This module provides the `BitString` type for building and manipulating
 //! sequences of bits, commonly used in ASN.1 encoding and protocol messages.

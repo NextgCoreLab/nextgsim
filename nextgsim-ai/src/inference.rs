@@ -68,7 +68,7 @@ pub trait InferenceEngine: Send + Sync {
 /// ONNX Runtime inference engine
 ///
 /// Production-quality inference engine using ONNX Runtime with
-/// support for multiple execution providers (CPU, CUDA, CoreML, etc.)
+/// support for multiple execution providers (CPU, CUDA, `CoreML`, etc.)
 pub struct OnnxEngine {
     /// ONNX Runtime session (wrapped in Mutex for interior mutability)
     session: Option<Mutex<Session>>,

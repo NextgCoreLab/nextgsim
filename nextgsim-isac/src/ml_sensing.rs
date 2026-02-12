@@ -208,8 +208,8 @@ impl MlPositioningEngine {
 
         // Average top-k positions
         let mut pos_sum = Vector3::default();
-        for i in 0..k {
-            let pos = distances[i].1;
+        for item in distances.iter().take(k) {
+            let pos = item.1;
             pos_sum.x += pos.x;
             pos_sum.y += pos.y;
             pos_sum.z += pos.z;
@@ -254,7 +254,7 @@ impl MlPositioningEngine {
 /// Trajectory prediction using LSTM-like model
 #[derive(Debug)]
 pub struct TrajectoryPredictor {
-    /// Historical positions (object_id -> position history)
+    /// Historical positions (`object_id` -> position history)
     position_history: HashMap<u64, Vec<(f64, Vector3)>>, // (timestamp, position)
     /// Maximum history length
     max_history: usize,

@@ -9,6 +9,8 @@
 //! - Knowledge Exposure Function (NKEF) semantic search
 //! - AI Agent Framework coordination
 
+#![allow(unused_imports)]
+
 use std::collections::HashMap;
 
 use nextgsim_she::{TierManager, ComputeNode, ComputeTier, ResourceCapacity, WorkloadScheduler, WorkloadRequirements};

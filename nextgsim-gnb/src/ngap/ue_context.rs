@@ -11,8 +11,10 @@ use std::collections::HashMap;
 
 /// UE state within NGAP
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum UeState {
     /// Initial state, waiting for Initial Context Setup
+    #[default]
     Initial,
     /// Initial Context Setup in progress
     InitialContextSetup,
@@ -22,11 +24,6 @@ pub enum UeState {
     Releasing,
 }
 
-impl Default for UeState {
-    fn default() -> Self {
-        UeState::Initial
-    }
-}
 
 impl std::fmt::Display for UeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,7 +41,7 @@ impl std::fmt::Display for UeState {
 pub struct NgapPduSession {
     /// PDU Session ID (1-15)
     pub psi: u8,
-    /// QoS Flow Identifier
+    /// `QoS` Flow Identifier
     pub qfi: Option<u8>,
     /// Uplink TEID (gNB -> UPF)
     pub uplink_teid: u32,

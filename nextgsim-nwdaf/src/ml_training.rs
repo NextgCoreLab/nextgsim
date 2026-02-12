@@ -1,4 +1,4 @@
-//! Nnwdaf_MLModelTraining service (TS 23.288 7.6, Rel-18)
+//! `Nnwdaf_MLModelTraining` service (TS 23.288 7.6, Rel-18)
 //!
 //! Provides ML model training coordination service between NWDAF instances.
 //! In Rel-18, NWDAF can request other NWDAFs to train models or share training data.
@@ -81,7 +81,7 @@ impl TrainingDataset {
     }
 }
 
-/// Model training request (Nnwdaf_MLModelTraining)
+/// Model training request (`Nnwdaf_MLModelTraining`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelTrainingRequest {
     /// Analytics ID to train model for
@@ -135,7 +135,7 @@ pub enum ModelArchitecture {
     Cnn,
     /// Transformer-based
     Transformer,
-    /// Gradient boosting (XGBoost, LightGBM)
+    /// Gradient boosting (`XGBoost`, `LightGBM`)
     GradientBoosting,
 }
 
@@ -205,7 +205,7 @@ pub struct TrainingMetrics {
 
 /// ML Model Training service
 ///
-/// Implements the Nnwdaf_MLModelTraining service for distributed model training
+/// Implements the `Nnwdaf_MLModelTraining` service for distributed model training
 /// coordination. This is a Rel-18 feature enabling NWDAF instances to:
 /// - Request other NWDAFs to train models
 /// - Share training data
@@ -213,7 +213,7 @@ pub struct TrainingMetrics {
 ///
 /// # 3GPP Reference
 ///
-/// - TS 23.288 Section 7.6: Nnwdaf_MLModelTraining service (Rel-18)
+/// - TS 23.288 Section 7.6: `Nnwdaf_MLModelTraining` service (Rel-18)
 #[derive(Debug)]
 pub struct MlModelTrainingService {
     /// Active training jobs
@@ -392,11 +392,11 @@ impl Default for MlModelTrainingService {
 /// Federated learning aggregation strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FederatedStrategy {
-    /// FedAvg: Weighted average of model parameters
+    /// `FedAvg`: Weighted average of model parameters
     FedAvg,
-    /// FedProx: Proximal term for heterogeneous data
+    /// `FedProx`: Proximal term for heterogeneous data
     FedProx,
-    /// FedSGD: Stochastic gradient aggregation
+    /// `FedSGD`: Stochastic gradient aggregation
     FedSgd,
 }
 
@@ -500,14 +500,14 @@ impl DistributedTrainingCoordinator {
 
         let round = self.rounds.get_mut(&round_num).ok_or_else(|| {
             crate::error::AnalyticsError::TargetNotFound {
-                target: format!("round-{}", round_num),
+                target: format!("round-{round_num}"),
             }
         })?;
 
         if round.aggregated {
             return Err(NwdafError::Analytics(
                 crate::error::AnalyticsError::TargetNotFound {
-                    target: format!("round {} already aggregated", round_num),
+                    target: format!("round {round_num} already aggregated"),
                 },
             ));
         }
@@ -517,8 +517,8 @@ impl DistributedTrainingCoordinator {
         round.updates.push(update);
 
         let should_aggregate = round.updates.len() >= round.expected_participants;
-        // Drop the mutable borrow before calling aggregate_round
-        drop(round);
+        // Release the mutable borrow before calling aggregate_round
+        let _ = round;
 
         // Auto-aggregate when all participants have submitted
         if should_aggregate {
@@ -532,7 +532,7 @@ impl DistributedTrainingCoordinator {
     fn aggregate_round(&mut self, round_num: u32) -> Result<(), NwdafError> {
         let round = self.rounds.get_mut(&round_num).ok_or_else(|| {
             crate::error::AnalyticsError::TargetNotFound {
-                target: format!("round-{}", round_num),
+                target: format!("round-{round_num}"),
             }
         })?;
 
@@ -605,7 +605,7 @@ impl DistributedTrainingCoordinator {
 
     /// Returns whether a round has been completed (aggregated).
     pub fn is_round_complete(&self, round: u32) -> bool {
-        self.rounds.get(&round).map_or(false, |r| r.aggregated)
+        self.rounds.get(&round).is_some_and(|r| r.aggregated)
     }
 }
 

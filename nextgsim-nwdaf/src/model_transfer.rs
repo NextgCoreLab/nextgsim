@@ -56,7 +56,7 @@ pub enum ModelType {
     LoadPrediction,
     /// Anomaly detection model
     AnomalyDetection,
-    /// QoS prediction model
+    /// `QoS` prediction model
     QosPrediction,
     /// Energy efficiency model
     EnergyEfficiency,

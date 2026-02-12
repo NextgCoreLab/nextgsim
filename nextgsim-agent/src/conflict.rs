@@ -587,7 +587,7 @@ impl PersistentIntentStore {
             let file = File::create(file_path)?;
             let writer = BufWriter::new(file);
             serde_json::to_writer_pretty(writer, intent)
-                .map_err(|e| std::io::Error::other(e))?;
+                .map_err(std::io::Error::other)?;
         }
         Ok(())
     }
@@ -597,7 +597,7 @@ impl PersistentIntentStore {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         serde_json::from_reader(reader)
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
     }
 
     /// Deletes an intent file from disk
@@ -855,7 +855,7 @@ mod tests {
 
         // Add some intents
         for i in 0..5 {
-            let intent = make_intent(&format!("agent-{}", i), IntentType::Query, None, 5);
+            let intent = make_intent(&format!("agent-{i}"), IntentType::Query, None, 5);
             store.store(intent).unwrap();
         }
         assert_eq!(store.count(), 5);
@@ -867,7 +867,7 @@ mod tests {
         // Verify files are gone
         let entries: Vec<_> = std::fs::read_dir(&temp_dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .collect();
         assert_eq!(entries.len(), 0);
 

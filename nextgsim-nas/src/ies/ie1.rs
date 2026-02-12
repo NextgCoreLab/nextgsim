@@ -287,7 +287,7 @@ pub enum PduSessionType {
     Ipv4 = 0b001,
     /// IPv6
     Ipv6 = 0b010,
-    /// IPv4v6
+    /// `IPv4v6`
     Ipv4v6 = 0b011,
     /// Unstructured
     Unstructured = 0b100,

@@ -320,7 +320,7 @@ impl ProcedureTransactionManager {
 
     /// Abort all procedures for a given PSI.
     ///
-    /// Returns a vector of (PTI, message_type) pairs for aborted procedures.
+    /// Returns a vector of (PTI, `message_type`) pairs for aborted procedures.
     pub fn abort_by_psi(&mut self, psi: u8) -> Vec<(u8, SmMessageType)> {
         let mut aborted = Vec::new();
 

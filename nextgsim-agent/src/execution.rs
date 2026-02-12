@@ -44,7 +44,7 @@ pub struct IntentExecutionResult {
 /// A resource that was touched during execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedResource {
-    /// Resource kind (cell, ue, slice, qos_flow, ...).
+    /// Resource kind (cell, ue, slice, `qos_flow`, ...).
     pub kind: ResourceKind,
     /// Unique ID of the resource.
     pub id: String,
@@ -61,7 +61,7 @@ pub enum ResourceKind {
     Ue,
     /// A network slice.
     Slice,
-    /// A QoS flow.
+    /// A `QoS` flow.
     QosFlow,
     /// A frequency / spectrum resource.
     Spectrum,
@@ -452,7 +452,7 @@ impl IntentExecutor for TriggerHandoverExecutor {
 
 /// Executor for `IntentType::AdjustQos`.
 ///
-/// Reads current QoS parameters, computes adjustments within bounds, and
+/// Reads current `QoS` parameters, computes adjustments within bounds, and
 /// writes updated values.
 #[derive(Debug, Default)]
 pub struct AdjustQosExecutor;

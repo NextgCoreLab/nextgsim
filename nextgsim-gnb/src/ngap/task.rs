@@ -292,7 +292,7 @@ impl NgapTask {
             gnb_id: GnbId {
                 plmn_identity: plmn_bytes,
                 gnb_id_value: (config.nci >> (36 - config.gnb_id_length)) as u32,
-                gnb_id_length: config.gnb_id_length as u8,
+                gnb_id_length: config.gnb_id_length,
             },
             ran_node_name: Some("nextgsim-gnb".to_string()),
             supported_ta_list: vec![SupportedTaItem {
@@ -1313,7 +1313,7 @@ impl NgapTask {
     // ========================================================================
 
     /// Handles Handover Command from AMF (source gNB side)
-    /// AMF sends this after receiving HandoverRequestAcknowledge from target gNB.
+    /// AMF sends this after receiving `HandoverRequestAcknowledge` from target gNB.
     /// Source gNB must forward the transparent container to UE via RRC and
     /// release resources after UE completes handover.
     async fn handle_handover_command(
@@ -1370,7 +1370,7 @@ impl NgapTask {
 
     /// Handles Handover Request from AMF (target gNB side)
     /// AMF sends this to the target gNB to prepare handover resources.
-    /// Target gNB must allocate resources and respond with HandoverRequestAcknowledge.
+    /// Target gNB must allocate resources and respond with `HandoverRequestAcknowledge`.
     async fn handle_handover_request(
         &mut self,
         client_id: i32,
@@ -1455,7 +1455,7 @@ impl NgapTask {
         }
     }
 
-    /// Initiates a handover by sending HandoverRequired to AMF (source gNB side)
+    /// Initiates a handover by sending `HandoverRequired` to AMF (source gNB side)
     /// Called when measurement reports indicate better target cell
     #[allow(dead_code)]
     async fn initiate_handover(
@@ -1538,6 +1538,7 @@ impl NgapTask {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_handover_required(
         &self,
         amf_client_id: i32,
@@ -1681,7 +1682,7 @@ impl NgapTask {
 
     /// Updates initialization status and notifies App task
     async fn update_initialization_status(&mut self) {
-        let any_ready = self.amf_contexts.values().any(|ctx| ctx.is_ready());
+        let any_ready = self.amf_contexts.values().any(super::amf_context::NgapAmfContext::is_ready);
 
         if any_ready != self.is_initialized {
             self.is_initialized = any_ready;

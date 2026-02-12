@@ -41,7 +41,7 @@ pub enum RrcChannel {
 }
 
 impl RrcChannel {
-    /// Creates an RrcChannel from a u32 value
+    /// Creates an `RrcChannel` from a u32 value
     pub fn from_u32(value: u32) -> Option<Self> {
         match value {
             0 => Some(Self::BcchBch),
@@ -299,7 +299,7 @@ impl RlsTransport {
 
     /// Creates acknowledgment messages for pending PDUs
     ///
-    /// Returns a list of (endpoint_id, ack message) pairs.
+    /// Returns a list of (`endpoint_id`, ack message) pairs.
     pub fn create_pending_acks(&mut self) -> Vec<(u32, RlsPduTransmissionAck)> {
         let pending = std::mem::take(&mut self.pending_acks);
 

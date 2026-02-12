@@ -1,13 +1,13 @@
 //! RRC Resume Procedure
 //!
 //! Implements the RRC Resume procedure as defined in 3GPP TS 38.331 Section 5.3.13.
-//! This procedure is used when UE transitions from RRC_INACTIVE to RRC_CONNECTED,
+//! This procedure is used when UE transitions from `RRC_INACTIVE` to `RRC_CONNECTED`,
 //! reusing the previously established UE context.
 //!
 //! The procedure consists of three messages:
-//! 1. RRCResumeRequest - UE -> gNB: Request to resume RRC connection
-//! 2. RRCResume - gNB -> UE: Network response with updated configuration
-//! 3. RRCResumeComplete - UE -> gNB: Confirmation of resume
+//! 1. `RRCResumeRequest` - UE -> gNB: Request to resume RRC connection
+//! 2. `RRCResume` - gNB -> UE: Network response with updated configuration
+//! 3. `RRCResumeComplete` - UE -> gNB: Confirmation of resume
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};

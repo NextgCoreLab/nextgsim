@@ -74,7 +74,7 @@ impl MetricStats {
         }
     }
 
-    /// Adds a value and returns (mean, std_dev) after the update
+    /// Adds a value and returns (mean, `std_dev`) after the update
     fn push(&mut self, value: f64) -> (f64, f64) {
         // If window is full, remove oldest value from running stats
         if self.values.len() >= self.max_window {
@@ -114,7 +114,7 @@ impl MetricStats {
 ///
 /// For each incoming measurement:
 /// 1. Compute the current sliding-window mean and standard deviation
-/// 2. Calculate z-score = |value - mean| / std_dev
+/// 2. Calculate z-score = |value - mean| / `std_dev`
 /// 3. If z-score > threshold, classify as an anomaly
 ///
 /// # Example
@@ -181,7 +181,7 @@ impl AnomalyDetector {
     ///
     /// # Arguments
     ///
-    /// * `metric_name` - Name of the metric (e.g. "rsrp", "prb_usage", "sinr")
+    /// * `metric_name` - Name of the metric (e.g. "rsrp", "`prb_usage`", "sinr")
     /// * `entity_id` - Entity producing the measurement (e.g. "ue-42", "cell-7")
     /// * `value` - The measured value
     /// * `timestamp_ms` - Measurement timestamp

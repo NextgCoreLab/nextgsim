@@ -28,7 +28,7 @@ pub enum FlWorkloadType {
     GlobalAggregation,
     /// Model inference (serving)
     Inference,
-    /// Privacy mechanism (DP noise, SecAgg masking)
+    /// Privacy mechanism (DP noise, `SecAgg` masking)
     PrivacyProcessing,
 }
 
@@ -96,9 +96,9 @@ pub struct FlPlacementDecision {
 
 /// SHE-FL placement planner
 pub struct FlPlacementPlanner {
-    /// Latency budget per tier (ms): [local_edge, regional_edge, core_cloud]
+    /// Latency budget per tier (ms): [`local_edge`, `regional_edge`, `core_cloud`]
     tier_latency_ms: [u32; 3],
-    /// Compute capacity per tier (FLOPS): [local_edge, regional_edge, core_cloud]
+    /// Compute capacity per tier (FLOPS): [`local_edge`, `regional_edge`, `core_cloud`]
     tier_compute_flops: [u64; 3],
 }
 

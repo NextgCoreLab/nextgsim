@@ -1,7 +1,7 @@
 //! Federated Learning training loop implementation
 //!
 //! This module implements the execution engine for Federated Learning,
-//! supporting FedAvg and FedProx aggregation algorithms with optional
+//! supporting `FedAvg` and `FedProx` aggregation algorithms with optional
 //! differential privacy.
 
 #![allow(missing_docs)]
@@ -291,7 +291,7 @@ impl FlTrainer {
         Ok(round_result)
     }
 
-    /// FedAvg aggregation: weighted average based on number of samples
+    /// `FedAvg` aggregation: weighted average based on number of samples
     fn fedavg_aggregate(
         &self,
         participants: &[FlParticipant],
@@ -343,14 +343,14 @@ impl FlTrainer {
         Ok(aggregated)
     }
 
-    /// FedProx aggregation: FedAvg with proximal correction toward global model
+    /// `FedProx` aggregation: `FedAvg` with proximal correction toward global model
     ///
-    /// FedProx adds a proximal term `(mu/2) * ||w - w_global||^2` to each
+    /// `FedProx` adds a proximal term `(mu/2) * ||w - w_global||^2` to each
     /// participant's local objective. At aggregation time we first compute the
     /// FedAvg-style weighted average and then shift the result back toward the
     /// current global model:
     ///
-    ///   w_new = (1 / (1 + mu)) * w_fedavg + (mu / (1 + mu)) * w_global
+    ///   `w_new` = (1 / (1 + mu)) * `w_fedavg` + (mu / (1 + mu)) * `w_global`
     ///
     /// This stabilises convergence under heterogeneous data distributions.
     fn fedprox_aggregate(

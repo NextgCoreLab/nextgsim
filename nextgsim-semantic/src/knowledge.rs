@@ -212,7 +212,7 @@ impl SharedContext {
     }
 
     /// Compresses data using shared knowledge
-    /// Returns (concept_ids, residual) where residual is what can't be captured by concepts
+    /// Returns (`concept_ids`, residual) where residual is what can't be captured by concepts
     pub fn compress_with_context(
         &self,
         embedding: &[f32],

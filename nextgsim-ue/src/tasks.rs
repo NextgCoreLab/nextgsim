@@ -113,7 +113,7 @@ impl<T> TaskMessage<T> {
 
 /// Task lifecycle state.
 ///
-/// Based on UERANSIM's NtsTask lifecycle from `src/utils/nts.hpp`.
+/// Based on UERANSIM's `NtsTask` lifecycle from `src/utils/nts.hpp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
 pub enum TaskState {
@@ -324,7 +324,7 @@ pub enum UeCliCommandType {
     },
     /// Establish PDU session
     PsEstablish {
-        /// Session type (IPv4, IPv6, IPv4v6)
+        /// Session type (IPv4, IPv6, `IPv4v6`)
         session_type: Option<String>,
         /// APN/DNN
         apn: Option<String>,
@@ -397,7 +397,7 @@ pub enum NasMessage {
         psi: u8,
         /// Procedure transaction identity
         pti: u8,
-        /// Session type (e.g., "IPv4", "IPv6", "IPv4v6")
+        /// Session type (e.g., "IPv4", "IPv6", "`IPv4v6`")
         session_type: String,
         /// APN/DNN (optional)
         apn: Option<String>,
@@ -733,7 +733,7 @@ pub struct NeighborMeasurementReport {
 pub enum NwdafReporterResponse {
     /// Trajectory prediction result
     TrajectoryPrediction {
-        /// Predicted waypoints (position, timestamp_ms)
+        /// Predicted waypoints (position, `timestamp_ms`)
         waypoints: Vec<((f32, f32, f32), u64)>,
         /// Confidence scores for each waypoint
         confidence: Vec<f32>,
@@ -796,9 +796,9 @@ pub struct IsacSensingConfig {
     pub mode: IsacSensingMode,
     /// Measurement interval in milliseconds
     pub interval_ms: u32,
-    /// Enable ToA (Time of Arrival) measurements
+    /// Enable `ToA` (Time of Arrival) measurements
     pub enable_toa: bool,
-    /// Enable AoA (Angle of Arrival) measurements
+    /// Enable `AoA` (Angle of Arrival) measurements
     pub enable_aoa: bool,
     /// Enable Doppler measurements
     pub enable_doppler: bool,
@@ -1183,9 +1183,10 @@ pub struct UeSixgReceivers {
 }
 
 impl UeTaskBase {
-    /// Creates a new UeTaskBase with the given configuration and channel capacity.
+    /// Creates a new `UeTaskBase` with the given configuration and channel capacity.
     ///
     /// Returns the task base along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: UeConfig,
         channel_capacity: usize,
@@ -1277,13 +1278,13 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
 /// Manages the lifecycle of all UE tasks.
 ///
-/// The TaskManager is responsible for:
+/// The `TaskManager` is responsible for:
 /// - Spawning tasks and tracking their handles
 /// - Monitoring task health and state
 /// - Coordinating graceful shutdown across all tasks
 /// - Handling task failures and restarts
 ///
-/// Based on UERANSIM's UserEquipment class from `src/ue/ue.cpp`.
+/// Based on UERANSIM's `UserEquipment` class from `src/ue/ue.cpp`.
 pub struct TaskManager {
     /// Task base with all message channels
     task_base: UeTaskBase,
@@ -1315,9 +1316,10 @@ impl std::fmt::Display for TaskError {
 impl std::error::Error for TaskError {}
 
 impl TaskManager {
-    /// Creates a new TaskManager with the given configuration.
+    /// Creates a new `TaskManager` with the given configuration.
     ///
     /// Returns the manager along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: UeConfig,
         channel_capacity: usize,
@@ -1537,7 +1539,7 @@ mod tests {
     use super::*;
     
 
-    /// Creates a test UeConfig for unit tests.
+    /// Creates a test `UeConfig` for unit tests.
     fn test_config() -> UeConfig {
         UeConfig::default()
     }

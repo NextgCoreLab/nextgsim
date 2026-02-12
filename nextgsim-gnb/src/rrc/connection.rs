@@ -1,7 +1,7 @@
 //! RRC Connection Management
 //!
 //! This module implements RRC connection procedures for the gNB:
-//! - RRC Setup procedure (RRCSetupRequest → RRCSetup → RRCSetupComplete)
+//! - RRC Setup procedure (`RRCSetupRequest` → `RRCSetup` → `RRCSetupComplete`)
 //! - RRC Release procedure
 //! - RRC Reconfiguration procedure
 //! - Security Mode Command procedure
@@ -339,7 +339,7 @@ impl RrcConnectionManager {
 
     /// Processes an RRC Resume Request
     ///
-    /// Called when a UE in RRC_INACTIVE state resumes its connection.
+    /// Called when a UE in `RRC_INACTIVE` state resumes its connection.
     pub fn process_rrc_resume_request(
         &mut self,
         ue_mgr: &mut RrcUeContextManager,

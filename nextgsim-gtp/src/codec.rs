@@ -21,7 +21,7 @@
 //! # PDU Session Container
 //!
 //! The PDU Session Container (type 0x85) is a 5GC-specific extension header that
-//! carries PDU session information including QoS Flow Identifier (QFI), PDU type
+//! carries PDU session information including `QoS` Flow Identifier (QFI), PDU type
 //! (DL/UL), and additional indicators. See [`PduSessionInfo`] for details.
 //!
 //! # 6G Extensions
@@ -152,20 +152,20 @@ impl PduSessionType {
 ///
 /// # Downlink PDU Session Information
 ///
-/// Contains the QoS Flow Identifier (QFI), Reflective QoS Indicator (RQI),
+/// Contains the `QoS` Flow Identifier (QFI), Reflective `QoS` Indicator (RQI),
 /// Paging Policy Presence (PPP), and Paging Policy Indicator (PPI).
 ///
 /// # Uplink PDU Session Information
 ///
-/// Contains the QoS Flow Identifier (QFI) and an optional DL Sending
+/// Contains the `QoS` Flow Identifier (QFI) and an optional DL Sending
 /// Timestamp for N9 interface usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduSessionInfo {
     /// PDU type: DL (0) or UL (1)
     pub pdu_type: PduSessionType,
-    /// QoS Flow Identifier (6 bits, 0-63)
+    /// `QoS` Flow Identifier (6 bits, 0-63)
     pub qfi: u8,
-    /// Reflective QoS Indicator (DL only, 1 bit)
+    /// Reflective `QoS` Indicator (DL only, 1 bit)
     pub rqi: bool,
     /// Paging Policy Presence (DL only, 1 bit)
     pub ppp: bool,
@@ -200,7 +200,7 @@ impl PduSessionInfo {
         }
     }
 
-    /// Set the Reflective QoS Indicator (DL only)
+    /// Set the Reflective `QoS` Indicator (DL only)
     pub fn with_rqi(mut self, rqi: bool) -> Self {
         self.rqi = rqi;
         self
@@ -1105,7 +1105,7 @@ impl GtpExtHeader {
     /// is the `next_extension_header_type` value from the previous header or
     /// the optional fields area.
     ///
-    /// Returns (header, bytes_consumed, next_ext_type) where `next_ext_type`
+    /// Returns (header, `bytes_consumed`, `next_ext_type`) where `next_ext_type`
     /// is the type of the next header in the chain (0x00 = end of chain).
     fn decode(ext_type: u8, data: &[u8]) -> Result<(Self, usize, u8), GtpError> {
         if data.is_empty() {

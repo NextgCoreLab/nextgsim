@@ -1,6 +1,6 @@
-//! XR (Extended Reality) Traffic Modeling and QoS (Rel-18, TS 26.928)
+//! XR (Extended Reality) Traffic Modeling and `QoS` (Rel-18, TS 26.928)
 //!
-//! Implements XR-specific traffic patterns, PDU Set handling, QoS flow
+//! Implements XR-specific traffic patterns, PDU Set handling, `QoS` flow
 //! management with 5QI 82-85, and C-DRX power saving for XR devices.
 
 use std::collections::VecDeque;
@@ -99,7 +99,7 @@ pub struct XrFrame {
     pub pdu_count: u16,
     /// Whether this is an I-frame (keyframe)
     pub is_keyframe: bool,
-    /// Frame importance (0.0-1.0, used for PDU Set-level QoS)
+    /// Frame importance (0.0-1.0, used for PDU Set-level `QoS`)
     pub importance: f32,
 }
 
@@ -125,6 +125,7 @@ pub struct XrTrafficModel {
     /// Current timestamp (ms)
     current_time_ms: u64,
     /// Frame buffer for scheduled frames
+    #[allow(dead_code)]
     frame_buffer: VecDeque<XrFrame>,
 }
 
@@ -177,7 +178,7 @@ impl XrTrafficModel {
 
         // Simple deterministic jitter based on sequence
         let jitter = self.jitter_std_ms
-            * ((self.sequence as f64 * 2.718281828).sin() * 0.5);
+            * ((self.sequence as f64 * std::f64::consts::E).sin() * 0.5);
         let timestamp = self.current_time_ms
             + (self.frame_interval_ms + jitter).max(0.0) as u64;
 
@@ -221,7 +222,7 @@ impl XrTrafficModel {
 // PDU Set Handler (groups PDUs for QoS treatment per TS 23.501 Rel-18)
 // ============================================================================
 
-/// PDU Set state for tracking frame-level QoS.
+/// PDU Set state for tracking frame-level `QoS`.
 #[derive(Debug, Clone)]
 pub struct PduSet {
     /// PDU Set identifier
@@ -382,6 +383,7 @@ pub struct XrCdrxController {
     /// Time in current state (ms)
     state_time_ms: u32,
     /// XR frame-aligned wake-up enabled
+    #[allow(dead_code)]
     frame_aligned: bool,
     /// Next expected frame time (ms, for frame-aligned wake-up)
     next_frame_time_ms: u64,
@@ -425,7 +427,7 @@ impl XrCdrxController {
         )
     }
 
-    /// Advances the C-DRX state machine by delta_ms.
+    /// Advances the C-DRX state machine by `delta_ms`.
     pub fn tick(&mut self, delta_ms: u32) {
         self.state_time_ms += delta_ms;
 
@@ -511,10 +513,10 @@ impl XrCdrxController {
 // XR QoS Flow Manager
 // ============================================================================
 
-/// XR QoS flow with 5QI and PDU Set-aware scheduling.
+/// XR `QoS` flow with 5QI and PDU Set-aware scheduling.
 #[derive(Debug)]
 pub struct XrQosFlow {
-    /// QoS Flow Identifier (QFI)
+    /// `QoS` Flow Identifier (QFI)
     pub qfi: u8,
     /// XR 5QI for this flow
     pub xr_5qi: Xr5Qi,
@@ -533,7 +535,7 @@ pub struct XrQosFlow {
 }
 
 impl XrQosFlow {
-    /// Creates a new XR QoS flow.
+    /// Creates a new XR `QoS` flow.
     pub fn new(qfi: u8, xr_5qi: Xr5Qi, gfbr_kbps: u64, mfbr_kbps: u64) -> Self {
         Self {
             qfi,
@@ -547,17 +549,17 @@ impl XrQosFlow {
         }
     }
 
-    /// Creates a QoS flow for cloud rendering DL video.
+    /// Creates a `QoS` flow for cloud rendering DL video.
     pub fn cloud_rendering_dl(qfi: u8) -> Self {
         Self::new(qfi, Xr5Qi::CloudRenderingDl, 30_000, 100_000)
     }
 
-    /// Creates a QoS flow for pose/control UL data.
+    /// Creates a `QoS` flow for pose/control UL data.
     pub fn pose_control_ul(qfi: u8) -> Self {
         Self::new(qfi, Xr5Qi::PoseControlUl, 500, 2_000)
     }
 
-    /// Creates a QoS flow for haptic feedback.
+    /// Creates a `QoS` flow for haptic feedback.
     pub fn haptic(qfi: u8) -> Self {
         Self::new(qfi, Xr5Qi::HapticFeedback, 100, 500)
     }
@@ -582,7 +584,7 @@ impl XrQosFlow {
         self.packets_dropped as f64 / total as f64
     }
 
-    /// Returns true if the flow meets its QoS requirements.
+    /// Returns true if the flow meets its `QoS` requirements.
     pub fn meets_qos(&self) -> bool {
         self.packet_loss_rate() <= self.xr_5qi.per()
     }

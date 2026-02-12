@@ -201,7 +201,7 @@ impl RdController {
 
     /// Estimates the channel capacity in bits per channel use (Shannon formula).
     ///
-    /// C = log2(1 + SNR_linear)
+    /// C = log2(1 + `SNR_linear`)
     fn channel_capacity_bps(&self, channel: &ChannelQuality) -> f32 {
         let snr_linear = 10.0f32.powf(channel.snr_db / 10.0);
         (1.0 + snr_linear).log2()

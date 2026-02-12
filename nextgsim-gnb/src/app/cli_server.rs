@@ -254,7 +254,7 @@ impl CliServer {
 
         match result {
             Ok(Ok((size, addr))) => {
-                if size < CLI_MIN_LENGTH || size >= CLI_BUFFER_SIZE {
+                if !(CLI_MIN_LENGTH..CLI_BUFFER_SIZE).contains(&size) {
                     return Err(CliServerError::InvalidMessage);
                 }
                 CliMessage::decode(&buffer[..size], addr).ok_or(CliServerError::InvalidMessage)
@@ -276,7 +276,7 @@ impl CliServer {
 
         match self.socket.try_recv_from(&mut buffer) {
             Ok((size, addr)) => {
-                if size < CLI_MIN_LENGTH || size >= CLI_BUFFER_SIZE {
+                if !(CLI_MIN_LENGTH..CLI_BUFFER_SIZE).contains(&size) {
                     return Err(CliServerError::InvalidMessage);
                 }
                 Ok(CliMessage::decode(&buffer[..size], addr))

@@ -22,9 +22,9 @@
 //! - **ONNX Runtime**: Primary inference backend with GPU acceleration support
 //!   - CPU execution provider (default)
 //!   - CUDA execution provider (NVIDIA GPUs)
-//!   - CoreML execution provider (Apple Silicon)
-//!   - DirectML execution provider (Windows)
-//!   - TensorRT execution provider (NVIDIA optimized)
+//!   - `CoreML` execution provider (Apple Silicon)
+//!   - `DirectML` execution provider (Windows)
+//!   - `TensorRT` execution provider (NVIDIA optimized)
 //!
 //! # Example Usage
 //!

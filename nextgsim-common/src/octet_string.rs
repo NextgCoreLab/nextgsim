@@ -1,4 +1,4 @@
-//! OctetString type for variable-length byte sequences.
+//! `OctetString` type for variable-length byte sequences.
 //!
 //! This module provides the `OctetString` type, which is a wrapper around `Vec<u8>`
 //! with convenient methods for protocol encoding/decoding operations.

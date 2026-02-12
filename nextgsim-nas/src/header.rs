@@ -70,9 +70,9 @@ pub enum HeaderError {
 /// Total size: 3 bytes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlainMmHeader {
-    /// Extended Protocol Discriminator (always MobilityManagement)
+    /// Extended Protocol Discriminator (always `MobilityManagement`)
     pub epd: ExtendedProtocolDiscriminator,
-    /// Security header type (should be NotProtected for plain messages)
+    /// Security header type (should be `NotProtected` for plain messages)
     pub security_header_type: SecurityHeaderType,
     /// Message type
     pub message_type: MmMessageType,
@@ -147,7 +147,7 @@ impl PlainMmHeader {
 /// Total size: 4 bytes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlainSmHeader {
-    /// Extended Protocol Discriminator (always SessionManagement)
+    /// Extended Protocol Discriminator (always `SessionManagement`)
     pub epd: ExtendedProtocolDiscriminator,
     /// PDU Session Identity
     pub pdu_session_id: u8,
@@ -226,7 +226,7 @@ impl PlainSmHeader {
 /// Total size: 7 bytes (header only, excluding the plain NAS message)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecuredHeader {
-    /// Extended Protocol Discriminator (always MobilityManagement for secured messages)
+    /// Extended Protocol Discriminator (always `MobilityManagement` for secured messages)
     pub epd: ExtendedProtocolDiscriminator,
     /// Security header type
     pub security_header_type: SecurityHeaderType,

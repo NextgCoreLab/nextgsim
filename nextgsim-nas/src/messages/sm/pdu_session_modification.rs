@@ -49,9 +49,9 @@ mod modification_request_iei {
     pub const ALWAYS_ON_PDU_SESSION_REQUESTED: u8 = 0xB;
     /// Integrity protection maximum data rate
     pub const INTEGRITY_PROTECTION_MAX_DATA_RATE: u8 = 0x13;
-    /// Requested QoS rules
+    /// Requested `QoS` rules
     pub const REQUESTED_QOS_RULES: u8 = 0x7A;
-    /// Requested QoS flow descriptions
+    /// Requested `QoS` flow descriptions
     pub const REQUESTED_QOS_FLOW_DESCRIPTIONS: u8 = 0x79;
     /// Mapped EPS bearer contexts
     pub const MAPPED_EPS_BEARER_CONTEXTS: u8 = 0x75;
@@ -79,11 +79,11 @@ mod modification_command_iei {
     pub const RQ_TIMER_VALUE: u8 = 0x56;
     /// Always-on PDU session indication
     pub const ALWAYS_ON_PDU_SESSION_INDICATION: u8 = 0x8;
-    /// Authorized QoS rules
+    /// Authorized `QoS` rules
     pub const AUTHORIZED_QOS_RULES: u8 = 0x7A;
     /// Mapped EPS bearer contexts
     pub const MAPPED_EPS_BEARER_CONTEXTS: u8 = 0x75;
-    /// Authorized QoS flow descriptions
+    /// Authorized `QoS` flow descriptions
     pub const AUTHORIZED_QOS_FLOW_DESCRIPTIONS: u8 = 0x79;
     /// Extended protocol configuration options
     pub const EXTENDED_PROTOCOL_CONFIG_OPTIONS: u8 = 0x7B;
@@ -123,9 +123,9 @@ pub struct PduSessionModificationRequest {
     pub always_on_pdu_session_requested: Option<bool>,
     /// Integrity protection maximum data rate (optional, Type 4, IEI 0x13)
     pub integrity_protection_max_data_rate: Option<[u8; 2]>,
-    /// Requested QoS rules (optional, Type 6, IEI 0x7A)
+    /// Requested `QoS` rules (optional, Type 6, IEI 0x7A)
     pub requested_qos_rules: Option<Vec<u8>>,
-    /// Requested QoS flow descriptions (optional, Type 6, IEI 0x79)
+    /// Requested `QoS` flow descriptions (optional, Type 6, IEI 0x79)
     pub requested_qos_flow_descriptions: Option<Vec<u8>>,
     /// Mapped EPS bearer contexts (optional, Type 6, IEI 0x75)
     pub mapped_eps_bearer_contexts: Option<Vec<u8>>,
@@ -531,11 +531,11 @@ pub struct PduSessionModificationCommand {
     pub rq_timer_value: Option<u8>,
     /// Always-on PDU session indication (optional, Type 1, IEI 0x8)
     pub always_on_pdu_session_indication: Option<bool>,
-    /// Authorized QoS rules (optional, Type 6, IEI 0x7A)
+    /// Authorized `QoS` rules (optional, Type 6, IEI 0x7A)
     pub authorized_qos_rules: Option<Vec<u8>>,
     /// Mapped EPS bearer contexts (optional, Type 6, IEI 0x75)
     pub mapped_eps_bearer_contexts: Option<Vec<u8>>,
-    /// Authorized QoS flow descriptions (optional, Type 6, IEI 0x79)
+    /// Authorized `QoS` flow descriptions (optional, Type 6, IEI 0x79)
     pub authorized_qos_flow_descriptions: Option<Vec<u8>>,
     /// Extended protocol configuration options (optional, Type 6, IEI 0x7B)
     pub extended_protocol_config_options: Option<Vec<u8>>,

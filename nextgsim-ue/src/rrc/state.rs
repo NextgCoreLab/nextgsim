@@ -4,14 +4,14 @@
 //!
 //! # RRC States
 //!
-//! - **RRC_IDLE**: UE is not connected to the network. The UE performs cell selection/reselection
+//! - **`RRC_IDLE`**: UE is not connected to the network. The UE performs cell selection/reselection
 //!   and monitors paging. No dedicated radio resources are allocated.
 //!
-//! - **RRC_CONNECTED**: UE has an active RRC connection with the network. The UE can send and
+//! - **`RRC_CONNECTED`**: UE has an active RRC connection with the network. The UE can send and
 //!   receive data, and has dedicated radio resources allocated.
 //!
-//! - **RRC_INACTIVE**: UE has suspended its RRC connection but maintains the UE context in both
-//!   UE and network. This allows for faster connection resumption compared to RRC_IDLE.
+//! - **`RRC_INACTIVE`**: UE has suspended its RRC connection but maintains the UE context in both
+//!   UE and network. This allows for faster connection resumption compared to `RRC_IDLE`.
 //!
 //! # State Transitions
 //!
@@ -33,7 +33,7 @@ use std::fmt;
 /// - Inactive: Suspended RRC connection with maintained context
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum RrcState {
-    /// RRC_IDLE: No RRC connection established.
+    /// `RRC_IDLE`: No RRC connection established.
     ///
     /// In this state, the UE:
     /// - Performs cell selection and reselection
@@ -43,7 +43,7 @@ pub enum RrcState {
     #[default]
     Idle,
 
-    /// RRC_CONNECTED: Active RRC connection.
+    /// `RRC_CONNECTED`: Active RRC connection.
     ///
     /// In this state, the UE:
     /// - Has an established RRC connection with the gNB
@@ -52,7 +52,7 @@ pub enum RrcState {
     /// - Performs measurements as configured by the network
     Connected,
 
-    /// RRC_INACTIVE: Suspended RRC connection.
+    /// `RRC_INACTIVE`: Suspended RRC connection.
     ///
     /// In this state, the UE:
     /// - Has suspended its RRC connection
@@ -63,17 +63,17 @@ pub enum RrcState {
 }
 
 impl RrcState {
-    /// Returns true if the UE is in RRC_IDLE state.
+    /// Returns true if the UE is in `RRC_IDLE` state.
     pub fn is_idle(&self) -> bool {
         matches!(self, RrcState::Idle)
     }
 
-    /// Returns true if the UE is in RRC_CONNECTED state.
+    /// Returns true if the UE is in `RRC_CONNECTED` state.
     pub fn is_connected(&self) -> bool {
         matches!(self, RrcState::Connected)
     }
 
-    /// Returns true if the UE is in RRC_INACTIVE state.
+    /// Returns true if the UE is in `RRC_INACTIVE` state.
     pub fn is_inactive(&self) -> bool {
         matches!(self, RrcState::Inactive)
     }

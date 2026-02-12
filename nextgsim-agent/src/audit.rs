@@ -324,7 +324,7 @@ mod tests {
     fn test_circular_buffer_eviction() {
         let mut trail = AuditTrail::new(3);
         for i in 0..5 {
-            trail.record_agent_registered(&AgentId::new(format!("a{}", i)), "Custom");
+            trail.record_agent_registered(&AgentId::new(format!("a{i}")), "Custom");
         }
         assert_eq!(trail.len(), 3);
         // Oldest entries (a0, a1) should be evicted; a2, a3, a4 remain.
@@ -375,7 +375,7 @@ mod tests {
     fn test_query_recent() {
         let mut trail = AuditTrail::new(100);
         for i in 0..10 {
-            trail.record_agent_registered(&AgentId::new(format!("a{}", i)), "Custom");
+            trail.record_agent_registered(&AgentId::new(format!("a{i}")), "Custom");
         }
 
         let recent = trail.recent(3);

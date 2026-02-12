@@ -10,9 +10,9 @@
 //! RLS uses UDP for transport and supports the following message types:
 //!
 //! - **Heartbeat**: Sent by UE for cell search and connection maintenance
-//! - **HeartbeatAck**: Sent by gNB in response, indicating signal strength
-//! - **PduTransmission**: Carries RRC messages or user plane data
-//! - **PduTransmissionAck**: Acknowledges received PDUs
+//! - **`HeartbeatAck`**: Sent by gNB in response, indicating signal strength
+//! - **`PduTransmission`**: Carries RRC messages or user plane data
+//! - **`PduTransmissionAck`**: Acknowledges received PDUs
 //!
 //! # Modules
 //!

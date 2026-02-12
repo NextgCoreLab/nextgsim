@@ -36,7 +36,7 @@ pub struct NwdafInstance {
 pub struct NwdafCapabilities {
     /// Whether instance has MTLF (model training capability)
     pub has_mtlf: bool,
-    /// Whether instance has AnLF (analytics capability)
+    /// Whether instance has `AnLF` (analytics capability)
     pub has_anlf: bool,
     /// Maximum concurrent analytics requests
     pub max_concurrent_requests: usize,
@@ -373,7 +373,7 @@ impl NwdafCoordinator {
         );
         self.shared_results
             .entry(key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(result);
     }
 
@@ -396,18 +396,18 @@ impl NwdafCoordinator {
             .iter()
             .filter(|((aid, tkey), _)| {
                 *aid == analytics_id
-                    && target_key.map_or(true, |tk| tkey == tk)
+                    && target_key.is_none_or(|tk| tkey == tk)
             })
             .flat_map(|(_, results)| results.iter())
             .filter(|r| {
-                max_age_ms.map_or(true, |max| now_ms.saturating_sub(r.timestamp_ms) <= max)
+                max_age_ms.is_none_or(|max| now_ms.saturating_sub(r.timestamp_ms) <= max)
             })
             .collect()
     }
 
     /// Returns the count of shared results
     pub fn shared_result_count(&self) -> usize {
-        self.shared_results.values().map(|v| v.len()).sum()
+        self.shared_results.values().map(std::vec::Vec::len).sum()
     }
 }
 

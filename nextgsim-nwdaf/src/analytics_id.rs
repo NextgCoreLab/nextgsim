@@ -9,7 +9,7 @@ use std::fmt;
 /// Analytics identifiers as defined in 3GPP TS 23.288
 ///
 /// Each variant represents a standardized analytics type that NWDAF
-/// can produce, covering mobility, load, QoS, and behavioral analytics.
+/// can produce, covering mobility, load, `QoS`, and behavioral analytics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AnalyticsId {
     /// UE Mobility analytics (clause 6.7)
@@ -42,9 +42,9 @@ pub enum AnalyticsId {
     /// including per-cell and per-slice congestion levels.
     UserDataCongestion,
 
-    /// QoS Sustainability analytics (clause 6.6)
+    /// `QoS` Sustainability analytics (clause 6.6)
     ///
-    /// Predicts whether current QoS levels can be maintained,
+    /// Predicts whether current `QoS` levels can be maintained,
     /// considering network conditions and resource availability.
     QosSustainability,
 

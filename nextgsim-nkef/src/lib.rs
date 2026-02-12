@@ -179,7 +179,7 @@ pub struct QueryResult {
 /// Context for RAG queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryContext {
-    /// Query intent (e.g., "find_ue", "network_status")
+    /// Query intent (e.g., "`find_ue`", "`network_status`")
     pub intent: String,
     /// Additional filters
     pub filters: HashMap<String, String>,

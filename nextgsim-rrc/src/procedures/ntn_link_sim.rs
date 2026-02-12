@@ -406,7 +406,7 @@ impl NtnLinkSimulator {
         let sat_r = earth_r + sat.altitude_km;
         let cos_elev = (sat_r.powi(2) - earth_r.powi(2) - range.powi(2))
             / (2.0 * earth_r * range);
-        let elevation = cos_elev.acos().to_degrees().max(5.0).min(90.0);
+        let elevation = cos_elev.acos().to_degrees().clamp(5.0, 90.0);
 
         // Atmospheric losses
         let rain_loss = rain_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 5.0);
@@ -469,7 +469,7 @@ mod tests {
         let sat = SatellitePosition { latitude_deg: 40.0, longitude_deg: -74.0, altitude_km: 550.0 };
         let delay = propagation_delay_ms(&ground, &sat);
         // LEO at zenith: ~550km → ~1.8ms
-        assert!(delay > 1.0 && delay < 5.0, "LEO delay = {}ms", delay);
+        assert!(delay > 1.0 && delay < 5.0, "LEO delay = {delay}ms");
     }
 
     #[test]
@@ -478,7 +478,7 @@ mod tests {
         let sat = SatellitePosition { latitude_deg: 0.0, longitude_deg: 0.0, altitude_km: 35786.0 };
         let delay = propagation_delay_ms(&ground, &sat);
         // GEO at zenith: ~35786km → ~119ms
-        assert!(delay > 100.0 && delay < 150.0, "GEO delay = {}ms", delay);
+        assert!(delay > 100.0 && delay < 150.0, "GEO delay = {delay}ms");
     }
 
     #[test]
@@ -500,7 +500,7 @@ mod tests {
     fn test_max_doppler_leo() {
         let orbit = OrbitParams::leo(550.0, 53.0);
         let max_d = max_doppler_shift_hz(&orbit, 2e9);
-        assert!(max_d > 30000.0, "LEO max Doppler = {}Hz", max_d);
+        assert!(max_d > 30000.0, "LEO max Doppler = {max_d}Hz");
     }
 
     #[test]
@@ -508,7 +508,7 @@ mod tests {
         let lb = LinkBudget::s_band_ntn();
         let snr = lb.snr_db(550.0); // LEO zenith
         // Should be positive SNR for a working link
-        assert!(snr > 0.0, "SNR = {}dB at 550km", snr);
+        assert!(snr > 0.0, "SNR = {snr}dB at 550km");
     }
 
     #[test]
@@ -516,7 +516,7 @@ mod tests {
         let lb = LinkBudget::s_band_ntn();
         let fspl = lb.fspl_db(550.0);
         // Expect ~155-165 dB at S-band / 550km
-        assert!(fspl > 140.0 && fspl < 180.0, "FSPL = {}dB", fspl);
+        assert!(fspl > 140.0 && fspl < 180.0, "FSPL = {fspl}dB");
     }
 
     #[test]
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn test_rain_attenuation() {
         let atten = rain_attenuation_db(20.0, 30.0, 10.0);
-        assert!(atten > 0.0, "Rain atten = {}dB", atten);
+        assert!(atten > 0.0, "Rain atten = {atten}dB");
 
         // No rain = no attenuation
         let no_rain = rain_attenuation_db(20.0, 30.0, 0.0);

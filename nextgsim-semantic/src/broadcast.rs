@@ -264,7 +264,7 @@ impl BroadcastEncoder {
     }
 }
 
-/// Converts SemanticTask to task ID
+/// Converts `SemanticTask` to task ID
 fn task_to_id(task: SemanticTask) -> u32 {
     match task {
         SemanticTask::ImageClassification => 0,

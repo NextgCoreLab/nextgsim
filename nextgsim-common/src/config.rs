@@ -83,13 +83,13 @@ pub struct GnbConfig {
     /// SNPN (Standalone Non-Public Network) configuration
     #[serde(default)]
     pub snpn_config: Option<SnpnConfig>,
-    /// XR QoS support enabled (Rel-18 5QI 82-85)
+    /// XR `QoS` support enabled (Rel-18 5QI 82-85)
     #[serde(default)]
     pub xr_qos_enabled: bool,
     /// AI/ML for NR support enabled (Rel-18, TS 38.843)
     #[serde(default)]
     pub ai_ml_nr_enabled: bool,
-    /// Ambient IoT reader support enabled (Rel-18, TS 22.369)
+    /// Ambient `IoT` reader support enabled (Rel-18, TS 22.369)
     #[serde(default)]
     pub ambient_iot_enabled: bool,
     /// UAV tracking and identification enabled (Rel-18, TS 23.256)
@@ -152,7 +152,7 @@ impl GnbConfig {
     /// Returns the Cell ID extracted from the NCI.
     ///
     /// The Cell ID is the lower bits of the NCI, with the number of bits
-    /// being (36 - gnb_id_length).
+    /// being (36 - `gnb_id_length`).
     pub fn cell_id(&self) -> u32 {
         let cell_id_bits = 36 - self.gnb_id_length;
         let mask = (1u64 << cell_id_bits) - 1;
@@ -164,9 +164,9 @@ impl GnbConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
 pub enum OpType {
-    /// Operator key (OP) - needs to be converted to OPc
+    /// Operator key (OP) - needs to be converted to `OPc`
     Op,
-    /// Operator key derived (OPc) - used directly
+    /// Operator key derived (`OPc`) - used directly
     #[default]
     Opc,
 }
@@ -413,10 +413,10 @@ pub struct RouteDescriptor {
     pub ssc_mode: Option<u8>,
 }
 
-/// PIN (Personal IoT Network) role (Rel-18, TS 23.542).
+/// PIN (Personal `IoT` Network) role (Rel-18, TS 23.542).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PinRole {
-    /// PIN element (IoT device)
+    /// PIN element (`IoT` device)
     PinElement,
     /// PIN gateway (relay to network)
     PinGateway,
@@ -428,7 +428,7 @@ pub enum PinRole {
 // Rel-18 XR (Extended Reality) Configuration (TS 26.928)
 // ============================================================================
 
-/// XR traffic type for QoS differentiation.
+/// XR traffic type for `QoS` differentiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum XrTrafficType {
     /// Cloud/split rendering video (downlink heavy)
@@ -490,7 +490,7 @@ impl Default for XrConfig {
 // Rel-18 Ambient IoT Configuration (TS 22.369)
 // ============================================================================
 
-/// Ambient IoT device type.
+/// Ambient `IoT` device type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AmbientIotDeviceType {
     /// Type A: Energy harvesting, no battery (backscatter only)
@@ -501,7 +501,7 @@ pub enum AmbientIotDeviceType {
     TypeC,
 }
 
-/// Ambient IoT configuration for a UE acting as reader/writer.
+/// Ambient `IoT` configuration for a UE acting as reader/writer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmbientIotConfig {
     /// Device type
@@ -552,7 +552,7 @@ pub struct UavConfig {
     /// Remote identification enabled (broadcast ID)
     #[serde(default)]
     pub remote_id_enabled: bool,
-    /// C2 (Command and Control) link QoS required
+    /// C2 (Command and Control) link `QoS` required
     #[serde(default)]
     pub c2_link_required: bool,
 }
@@ -583,7 +583,7 @@ pub enum RangingMethod {
     Rtt,
     /// RSRP (Reference Signal Received Power) based
     Rsrp,
-    /// AoA (Angle of Arrival) based
+    /// `AoA` (Angle of Arrival) based
     AoA,
     /// Carrier phase based (high precision)
     CarrierPhase,
@@ -632,6 +632,7 @@ impl Default for RangingConfig {
 
 /// MINT (Multi-IMSI) configuration for UEs with multiple subscriptions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct MintConfig {
     /// Whether MINT is enabled (dual-SIM/multi-USIM)
     #[serde(default)]
@@ -647,22 +648,12 @@ pub struct MintConfig {
     pub simultaneous_registration: bool,
 }
 
-impl Default for MintConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            secondary_supis: Vec::new(),
-            active_subscription: 0,
-            simultaneous_registration: false,
-        }
-    }
-}
 
 // ============================================================================
 // Rel-18 Enhanced RedCap Configuration (TS 38.300 v18)
 // ============================================================================
 
-/// Enhanced RedCap configuration (Rel-18 extends Rel-17 RedCap).
+/// Enhanced `RedCap` configuration (Rel-18 extends Rel-17 `RedCap`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedCapR18Config {
     /// 5 MHz bandwidth support (Rel-18 extends Rel-17's 20 MHz minimum)
@@ -691,7 +682,7 @@ pub enum PduSessionType {
     Ipv4,
     /// IPv6 PDU session
     Ipv6,
-    /// IPv4v6 (dual-stack) PDU session
+    /// `IPv4v6` (dual-stack) PDU session
     Ipv4v6,
     /// Unstructured PDU session
     Unstructured,
@@ -746,9 +737,9 @@ pub struct UeConfig {
     pub hplmn: Plmn,
     /// Subscriber key K (128-bit)
     pub key: [u8; 16],
-    /// Operator key OP or OPc (128-bit)
+    /// Operator key OP or `OPc` (128-bit)
     pub op: [u8; 16],
-    /// Type of operator key (OP or OPc)
+    /// Type of operator key (OP or `OPc`)
     pub op_type: OpType,
     /// Authentication Management Field (16-bit)
     pub amf: [u8; 2],
@@ -769,7 +760,7 @@ pub struct UeConfig {
     /// Post-quantum cryptography configuration
     #[serde(default)]
     pub pqc_config: PqcConfig,
-    /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.101)
+    /// `RedCap` (Reduced Capability) UE indication (Rel-17, TS 38.101)
     #[serde(default)]
     pub redcap: bool,
     /// SNPN access configuration
@@ -781,13 +772,13 @@ pub struct UeConfig {
     /// UE Route Selection Policy rules
     #[serde(default)]
     pub ursp_rules: Vec<UrspRule>,
-    /// PIN (Personal IoT Network) role
+    /// PIN (Personal `IoT` Network) role
     #[serde(default)]
     pub pin_role: Option<PinRole>,
     /// XR (Extended Reality) configuration (Rel-18, TS 26.928)
     #[serde(default)]
     pub xr_config: Option<XrConfig>,
-    /// Ambient IoT reader/writer configuration (Rel-18, TS 22.369)
+    /// Ambient `IoT` reader/writer configuration (Rel-18, TS 22.369)
     #[serde(default)]
     pub ambient_iot_config: Option<AmbientIotConfig>,
     /// UAV (aerial UE) configuration (Rel-18, TS 23.256)
@@ -799,7 +790,7 @@ pub struct UeConfig {
     /// MINT (Multi-IMSI) configuration (Rel-18, TS 23.761)
     #[serde(default)]
     pub mint_config: Option<MintConfig>,
-    /// Enhanced RedCap configuration (Rel-18 extensions)
+    /// Enhanced `RedCap` configuration (Rel-18 extensions)
     #[serde(default)]
     pub redcap_r18: Option<RedCapR18Config>,
 }

@@ -1,6 +1,6 @@
 //! Multi-UE Load Testing Tool
 //!
-//! Item 125: Multi-UE load test for NextGCore 5G Core
+//! Item 125: Multi-UE load test for `NextGCore` 5G Core
 
 mod loadtest;
 

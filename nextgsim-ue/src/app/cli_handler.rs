@@ -66,7 +66,7 @@ impl fmt::Display for CliCommandResult {
 pub struct PduSessionEstablishRequest {
     /// PDU session ID (1-15, 0 means auto-assign)
     pub psi: u8,
-    /// Session type (IPv4, IPv6, IPv4v6)
+    /// Session type (IPv4, IPv6, `IPv4v6`)
     pub session_type: PduSessionType,
     /// APN/DNN name (optional)
     pub apn: Option<String>,
@@ -103,6 +103,7 @@ pub enum PduSessionType {
 
 impl PduSessionType {
     /// Parses a session type from a string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "ipv4" => Some(PduSessionType::Ipv4),

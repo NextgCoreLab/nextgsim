@@ -105,9 +105,9 @@ pub enum SmCause {
     InvalidPtiValue = 81,
     /// Maximum data rate per UE for user-plane integrity protection is too low
     MaxDataRateTooLow = 82,
-    /// Semantic error in the QoS operation
+    /// Semantic error in the `QoS` operation
     SemanticErrorInQosOperation = 83,
-    /// Syntactical error in the QoS operation
+    /// Syntactical error in the `QoS` operation
     SyntacticalErrorInQosOperation = 84,
     /// Invalid mapped EPS bearer identity
     InvalidMappedEpsBearerIdentity = 85,
@@ -224,7 +224,7 @@ pub enum PduSessionTypeValue {
     Ipv4 = 0b001,
     /// IPv6
     Ipv6 = 0b010,
-    /// IPv4v6
+    /// `IPv4v6`
     Ipv4v6 = 0b011,
     /// Unstructured
     Unstructured = 0b100,
@@ -415,17 +415,17 @@ impl IeIntegrityProtectionMaxDataRate {
 // QoS Rules (Type 6 - variable length)
 // ============================================================================
 
-/// Authorized QoS Rules IE (Type 6)
+/// Authorized `QoS` Rules IE (Type 6)
 ///
 /// 3GPP TS 24.501 Section 9.11.4.13
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IeQosRules {
-    /// Raw QoS rules data
+    /// Raw `QoS` rules data
     pub data: Vec<u8>,
 }
 
 impl IeQosRules {
-    /// Create a new QoS Rules IE with raw data
+    /// Create a new `QoS` Rules IE with raw data
     pub fn new(data: Vec<u8>) -> Self {
         Self { data }
     }
@@ -558,7 +558,7 @@ pub enum PduAddressType {
     Ipv4 = 0b001,
     /// IPv6
     Ipv6 = 0b010,
-    /// IPv4v6
+    /// `IPv4v6`
     Ipv4v6 = 0b011,
 }
 
@@ -584,7 +584,7 @@ impl TryFrom<u8> for PduAddressType {
 pub struct IePduAddress {
     /// PDU address type
     pub address_type: PduAddressType,
-    /// Address data (4 bytes for IPv4, 8 bytes for IPv6 interface ID, 12 bytes for IPv4v6)
+    /// Address data (4 bytes for IPv4, 8 bytes for IPv6 interface ID, 12 bytes for `IPv4v6`)
     pub address: Vec<u8>,
 }
 

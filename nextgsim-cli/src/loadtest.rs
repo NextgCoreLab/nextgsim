@@ -26,14 +26,19 @@ pub struct LoadTestConfig {
     /// Base IMSI (incremented per UE)
     pub base_imsi: String,
     /// Base key (K)
+    #[allow(dead_code)]
     pub base_key: String,
-    /// OPc value
+    /// `OPc` value
+    #[allow(dead_code)]
     pub opc: String,
     /// DNN for PDU session
+    #[allow(dead_code)]
     pub dnn: String,
     /// S-NSSAI SST
+    #[allow(dead_code)]
     pub sst: u8,
     /// S-NSSAI SD (optional)
+    #[allow(dead_code)]
     pub sd: Option<String>,
     /// Test duration limit (0 = until all UEs complete)
     pub duration_secs: u64,
@@ -344,9 +349,9 @@ async fn simulate_registration(imsi: &str, _config: &LoadTestConfig) -> bool {
     // Simulate 95% success rate
     let success = rand_u32() % 100 < 95;
     if success {
-        log::debug!("UE {} registration success ({:?})", imsi, latency);
+        log::debug!("UE {imsi} registration success ({latency:?})");
     } else {
-        log::warn!("UE {} registration failed", imsi);
+        log::warn!("UE {imsi} registration failed");
     }
     success
 }
@@ -358,9 +363,9 @@ async fn simulate_pdu_session(imsi: &str, _config: &LoadTestConfig) -> bool {
 
     let success = rand_u32() % 100 < 98;
     if success {
-        log::debug!("UE {} PDU session success ({:?})", imsi, latency);
+        log::debug!("UE {imsi} PDU session success ({latency:?})");
     } else {
-        log::warn!("UE {} PDU session failed", imsi);
+        log::warn!("UE {imsi} PDU session failed");
     }
     success
 }
@@ -372,7 +377,7 @@ async fn simulate_ping(imsi: &str) -> bool {
 
     let success = rand_u32() % 100 < 99;
     if success {
-        log::debug!("UE {} ping success ({:?})", imsi, latency);
+        log::debug!("UE {imsi} ping success ({latency:?})");
     }
     success
 }

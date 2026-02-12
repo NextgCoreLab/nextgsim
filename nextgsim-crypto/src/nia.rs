@@ -28,7 +28,7 @@ pub const MAC_SIZE: usize = 4;
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit integrity key (KNASint or KUPint)
+/// - `key`: 128-bit integrity key (`KNASint` or `KUPint`)
 /// - `data`: Message data to authenticate
 ///
 /// # Returns
@@ -73,7 +73,7 @@ pub fn nia1_compute_mac(
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit integrity key (KNASint or KUPint)
+/// - `key`: 128-bit integrity key (`KNASint` or `KUPint`)
 /// - `data`: Message data to authenticate
 ///
 /// # Returns
@@ -136,7 +136,7 @@ pub fn nia2_compute_mac(
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit integrity key (KNASint or KUPint)
+/// - `key`: 128-bit integrity key (`KNASint` or `KUPint`)
 /// - `data`: Message data to authenticate
 ///
 /// # Returns

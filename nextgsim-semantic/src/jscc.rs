@@ -121,7 +121,7 @@ impl JsccEncoder {
     /// The model is expected to accept two inputs:
     ///   - `features`: `[1, feature_dim]` f32
     ///   - `snr`:      `[1, 1]` f32 (channel SNR in dB)
-    /// and produce one output:
+    ///     and produce one output:
     ///   - `symbols`:  `[1, num_symbols]` f32
     ///
     /// # Errors
@@ -266,7 +266,7 @@ impl JsccDecoder {
     /// The model is expected to accept two inputs:
     ///   - `symbols`: `[1, num_symbols]` f32 (received channel symbols)
     ///   - `snr`:     `[1, 1]` f32 (channel SNR in dB)
-    /// and produce one output:
+    ///     and produce one output:
     ///   - `features`: `[1, output_dim]` f32
     ///
     /// # Errors

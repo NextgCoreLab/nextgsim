@@ -1385,8 +1385,8 @@ async fn run_ue(options: UeOptions) -> Result<()> {
 /// IMSI is a 15-digit string, and we increment the numeric value.
 fn increment_imsi(imsi: &str, offset: u64) -> Result<String> {
     // Remove "imsi-" prefix if present
-    let digits = if imsi.starts_with("imsi-") {
-        &imsi[5..]
+    let digits = if let Some(stripped) = imsi.strip_prefix("imsi-") {
+        stripped
     } else {
         imsi
     };

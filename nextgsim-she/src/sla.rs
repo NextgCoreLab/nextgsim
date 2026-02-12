@@ -1,4 +1,4 @@
-//! SLA enforcement and QoS monitoring
+//! SLA enforcement and `QoS` monitoring
 //!
 //! Implements Service Level Agreement violation detection and enforcement.
 
@@ -101,11 +101,11 @@ impl SlaObjective {
         if self.less_than {
             // How much over the threshold?
             let threshold = self.target * (1.0 + self.violation_threshold);
-            ((actual - threshold) / threshold).max(0.0).min(1.0)
+            ((actual - threshold) / threshold).clamp(0.0, 1.0)
         } else {
             // How much under the threshold?
             let threshold = self.target * (1.0 - self.violation_threshold);
-            ((threshold - actual) / threshold).max(0.0).min(1.0)
+            ((threshold - actual) / threshold).clamp(0.0, 1.0)
         }
     }
 }

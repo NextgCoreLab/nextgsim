@@ -4,7 +4,7 @@
 //! MTLF is responsible for:
 //! - Training ML models using collected data
 //! - Managing the ML model lifecycle (versioning, storage, distribution)
-//! - Providing trained models to AnLF or external consumers
+//! - Providing trained models to `AnLF` or external consumers
 //!
 //! In the simulator context, MTLF manages loading and distributing
 //! pre-trained ONNX models rather than performing real training.
@@ -40,7 +40,7 @@ pub struct MlModelInfo {
     pub description: String,
 }
 
-/// Model provision request from a consumer (e.g. AnLF)
+/// Model provision request from a consumer (e.g. `AnLF`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProvisionRequest {
     /// Requested analytics ID
@@ -67,17 +67,17 @@ pub struct ModelProvisionResponse {
 /// Manages the ML model lifecycle within NWDAF. In a production 3GPP
 /// deployment, MTLF would perform actual model training on collected data.
 /// In the simulator, it manages pre-trained ONNX models, handles versioning,
-/// and distributes models to the AnLF and external consumers.
+/// and distributes models to the `AnLF` and external consumers.
 ///
 /// # 3GPP Reference
 ///
 /// - TS 23.288 Section 6.2A: NWDAF containing MTLF
-/// - TS 23.288 Section 7.5: Nnwdaf_MLModelProvision service
+/// - TS 23.288 Section 7.5: `Nnwdaf_MLModelProvision` service
 #[derive(Debug)]
 pub struct Mtlf {
     /// Registered ML models indexed by model ID
     models: HashMap<String, MlModelInfo>,
-    /// Best model per analytics ID (model_id)
+    /// Best model per analytics ID (`model_id`)
     best_model_per_analytics: HashMap<AnalyticsId, String>,
     /// Active trajectory predictor (loaded ONNX model)
     trajectory_predictor: Option<OnnxPredictor>,
@@ -140,7 +140,7 @@ impl Mtlf {
     /// Loads a trajectory prediction model from file
     ///
     /// Creates an `OnnxPredictor` and loads the model, making it available
-    /// for the AnLF to use.
+    /// for the `AnLF` to use.
     ///
     /// # Errors
     ///
@@ -206,7 +206,7 @@ impl Mtlf {
             .collect()
     }
 
-    /// Handles a model provision request (Nnwdaf_MLModelProvision)
+    /// Handles a model provision request (`Nnwdaf_MLModelProvision`)
     ///
     /// Returns the best available model for the requested analytics ID,
     /// or an error if no model is available.

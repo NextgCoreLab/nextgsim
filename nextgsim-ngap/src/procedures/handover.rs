@@ -110,7 +110,7 @@ pub struct HandoverRequiredParams {
     pub handover_type: HandoverTypeValue,
     /// Cause for handover
     pub cause: HandoverCause,
-    /// Target ID (opaque - contains TargetRANNodeID or TargeteNB-ID)
+    /// Target ID (opaque - contains `TargetRANNodeID` or TargeteNB-ID)
     pub target_id: TargetIdValue,
     /// Direct forwarding path availability (optional)
     pub direct_forwarding_path_availability: Option<DirectForwardingPathAvailabilityValue>,
@@ -125,7 +125,7 @@ pub struct HandoverRequiredParams {
 pub enum TargetIdValue {
     /// Target NG-RAN Node ID
     TargetRanNodeId {
-        /// Global RAN Node ID (opaque bytes - encoded GlobalRANNodeID)
+        /// Global RAN Node ID (opaque bytes - encoded `GlobalRANNodeID`)
         global_ran_node_id: Vec<u8>,
         /// Selected TAI
         selected_tai: TaiValue,

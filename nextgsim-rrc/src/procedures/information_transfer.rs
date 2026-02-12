@@ -4,8 +4,8 @@
 //! These procedures are used to transfer NAS messages between the UE and the network.
 //!
 //! The procedures consist of two messages:
-//! 1. DLInformationTransfer - gNB → UE: Downlink NAS message transfer
-//! 2. ULInformationTransfer - UE → gNB: Uplink NAS message transfer
+//! 1. `DLInformationTransfer` - gNB → UE: Downlink NAS message transfer
+//! 2. `ULInformationTransfer` - UE → gNB: Uplink NAS message transfer
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};

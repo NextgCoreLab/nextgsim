@@ -85,7 +85,7 @@ pub struct ScalingDecision {
     pub reason: String,
     /// Current utilization that triggered this decision
     pub current_utilization: f64,
-    /// Timestamp (not serializable, use timestamp_ms for persistence)
+    /// Timestamp (not serializable, use `timestamp_ms` for persistence)
     pub timestamp: Instant,
     /// Timestamp in milliseconds since UNIX epoch
     pub timestamp_ms: u64,
@@ -247,7 +247,7 @@ impl AutoScaler {
                 format!("Queue depth {} exceeds threshold {}", queue_depth, self.config.queue_depth_threshold)
             }
             ScalingAction::ScaleDown { .. } => "Queue empty, reducing capacity".to_string(),
-            ScalingAction::None => format!("Queue depth {} within bounds", queue_depth),
+            ScalingAction::None => format!("Queue depth {queue_depth} within bounds"),
         };
 
         ScalingDecision {

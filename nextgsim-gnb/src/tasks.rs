@@ -92,10 +92,12 @@ impl<T> TaskMessage<T> {
 
 /// Task lifecycle state.
 ///
-/// Based on UERANSIM's NtsTask lifecycle from `src/utils/nts.hpp`.
+/// Based on UERANSIM's `NtsTask` lifecycle from `src/utils/nts.hpp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TaskState {
     /// Task is created but not yet started
+    #[default]
     Created,
     /// Task is running and processing messages
     Running,
@@ -107,11 +109,6 @@ pub enum TaskState {
     Failed,
 }
 
-impl Default for TaskState {
-    fn default() -> Self {
-        TaskState::Created
-    }
-}
 
 impl std::fmt::Display for TaskState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -491,7 +488,7 @@ pub struct GtpUeContextUpdate {
 pub struct PduSessionResource {
     /// PDU session ID
     pub psi: i32,
-    /// QoS flow identifier
+    /// `QoS` flow identifier
     pub qfi: Option<u8>,
     /// Uplink TEID (gNB -> UPF)
     pub uplink_teid: u32,
@@ -778,7 +775,7 @@ pub enum IsacMessage {
     SensingData {
         /// Cell identifier
         cell_id: i32,
-        /// Measurement type (ToA, TDoA, AoA, RSS, Doppler)
+        /// Measurement type (`ToA`, `TDoA`, `AoA`, RSS, Doppler)
         measurement_type: String,
         /// Measurement values
         measurements: Vec<f32>,
@@ -979,9 +976,10 @@ pub struct GnbSixgReceivers {
 }
 
 impl GnbTaskBase {
-    /// Creates a new GnbTaskBase with the given configuration and channel capacity.
+    /// Creates a new `GnbTaskBase` with the given configuration and channel capacity.
     ///
     /// Returns the task base along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: GnbConfig,
         channel_capacity: usize,
@@ -1086,13 +1084,13 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
 /// Manages the lifecycle of all gNB tasks.
 ///
-/// The TaskManager is responsible for:
+/// The `TaskManager` is responsible for:
 /// - Spawning tasks and tracking their handles
 /// - Monitoring task health and state
 /// - Coordinating graceful shutdown across all tasks
 /// - Handling task failures and restarts
 ///
-/// Based on UERANSIM's GNodeB class from `src/gnb/gnb.cpp`.
+/// Based on UERANSIM's `GNodeB` class from `src/gnb/gnb.cpp`.
 pub struct TaskManager {
     /// Task base with all message channels
     task_base: GnbTaskBase,
@@ -1124,9 +1122,10 @@ impl std::fmt::Display for TaskError {
 impl std::error::Error for TaskError {}
 
 impl TaskManager {
-    /// Creates a new TaskManager with the given configuration.
+    /// Creates a new `TaskManager` with the given configuration.
     ///
     /// Returns the manager along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: GnbConfig,
         channel_capacity: usize,
@@ -1349,7 +1348,7 @@ mod tests {
     use super::*;
     use nextgsim_common::Plmn;
 
-    /// Creates a test GnbConfig for unit tests.
+    /// Creates a test `GnbConfig` for unit tests.
     fn test_config() -> GnbConfig {
         GnbConfig {
             nci: 0x000000010,
@@ -1653,6 +1652,6 @@ mod tests {
             task_id: TaskId::Sctp,
             message: "Connection timeout".to_string(),
         };
-        assert_eq!(format!("{}", error), "Task SCTP error: Connection timeout");
+        assert_eq!(format!("{error}"), "Task SCTP error: Connection timeout");
     }
 }

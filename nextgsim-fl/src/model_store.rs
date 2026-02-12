@@ -142,7 +142,7 @@ impl ModelStore {
         self.latest_version
     }
 
-    /// Prunes old versions to stay within max_versions limit
+    /// Prunes old versions to stay within `max_versions` limit
     fn prune_old_versions(&mut self) {
         if self.models.len() <= self.max_versions {
             return;

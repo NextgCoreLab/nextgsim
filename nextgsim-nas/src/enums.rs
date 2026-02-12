@@ -160,7 +160,7 @@ impl MessageType {
         }
     }
 
-    /// Try to create a MessageType from EPD and raw value
+    /// Try to create a `MessageType` from EPD and raw value
     pub fn from_epd_and_value(
         epd: ExtendedProtocolDiscriminator,
         value: u8,

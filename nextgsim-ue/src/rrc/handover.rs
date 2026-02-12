@@ -8,9 +8,9 @@
 //! message containing a handover command (reconfigurationWithSync).
 //!
 //! ## Intra-frequency Handover Steps:
-//! 1. UE receives RRCReconfiguration with reconfigurationWithSync
+//! 1. UE receives `RRCReconfiguration` with reconfigurationWithSync
 //! 2. UE synchronizes with target cell
-//! 3. UE sends RRCReconfigurationComplete to target cell
+//! 3. UE sends `RRCReconfigurationComplete` to target cell
 //! 4. Handover complete
 //!
 //! ## Handover Failure Handling:

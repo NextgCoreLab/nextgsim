@@ -98,6 +98,7 @@ impl OfdmRadarWaveform {
     /// Returns a simplified 2D representation where:
     /// - Rows represent range bins
     /// - Columns represent Doppler bins
+    #[allow(clippy::needless_range_loop)]
     pub fn generate_range_doppler_map(
         &self,
         num_range_bins: usize,
@@ -188,7 +189,7 @@ impl Default for ClutterModel {
 impl ClutterModel {
     /// Computes clutter power at a given range (linear scale)
     ///
-    /// Uses range-dependent power law: P(r) = P_ref * (r_ref / r)^n
+    /// Uses range-dependent power law: P(r) = `P_ref` * (`r_ref` / r)^n
     pub fn clutter_power(&self, range_m: f64) -> f64 {
         if range_m <= 0.0 {
             return 0.0;
@@ -269,6 +270,7 @@ impl CfarDetector {
     ///
     /// Returns a list of detections where the cell under test exceeds the
     /// adaptive threshold computed from surrounding training cells.
+    #[allow(clippy::needless_range_loop)]
     pub fn detect(&self, range_doppler_map: &[Vec<f64>]) -> Vec<CfarDetection> {
         let mut detections = Vec::new();
         let alpha = self.threshold_factor();
@@ -288,8 +290,8 @@ impl CfarDetector {
                 let mut count = 0u32;
                 for ri in (r - window)..=(r + window) {
                     for di in (d - window)..=(d + window) {
-                        let dr = if ri > r { ri - r } else { r - ri };
-                        let dd = if di > d { di - d } else { d - di };
+                        let dr = ri.abs_diff(r);
+                        let dd = di.abs_diff(d);
                         // Skip CUT and guard cells
                         if dr <= self.guard_cells && dd <= self.guard_cells {
                             continue;
@@ -373,8 +375,8 @@ impl BistaticGeometry {
     /// Computes the bistatic Doppler shift (Hz) for a target with given velocity.
     ///
     /// Uses the bistatic Doppler formula:
-    /// f_d = (1/λ) * (v⃗ · (t̂_TX + t̂_RX))
-    /// where t̂_TX and t̂_RX are unit vectors from target to TX and RX.
+    /// `f_d` = (1/λ) * (v⃗ · (`t̂_TX` + `t̂_RX`))
+    /// where `t̂_TX` and `t̂_RX` are unit vectors from target to TX and RX.
     pub fn bistatic_doppler(&self, target: &[f64; 3], velocity: &[f64; 3]) -> f64 {
         let c = 299_792_458.0_f64;
         let lambda = c / self.carrier_freq_hz;

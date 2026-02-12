@@ -39,7 +39,7 @@ pub enum RrcCodecError {
 /// Encode an RRC message to bytes using UPER
 ///
 /// # Arguments
-/// * `msg` - The RRC message to encode (any type implementing UperCodec)
+/// * `msg` - The RRC message to encode (any type implementing `UperCodec`)
 ///
 /// # Returns
 /// * `Ok(Vec<u8>)` - The encoded bytes

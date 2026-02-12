@@ -6,7 +6,7 @@
 //!
 //! # Reference
 //!
-//! Based on UERANSIM's `src/ue/types.hpp` (UeStatusInfo) and
+//! Based on UERANSIM's `src/ue/types.hpp` (`UeStatusInfo`) and
 //! `src/ue/app/task.cpp` (status update handling).
 
 use serde::{Deserialize, Serialize};
@@ -242,7 +242,7 @@ pub struct UeInfo {
 
 
 impl UeInfo {
-    /// Creates a new UeInfo with default values.
+    /// Creates a new `UeInfo` with default values.
     pub fn new() -> Self {
         Self::default()
     }
@@ -289,7 +289,7 @@ pub struct TimerInfo {
 }
 
 impl TimerInfo {
-    /// Creates a new TimerInfo.
+    /// Creates a new `TimerInfo`.
     pub fn new(code: u16, name: impl Into<String>, running: bool, expiry_count: u32) -> Self {
         Self {
             code,
@@ -310,7 +310,7 @@ pub struct TimersInfo {
 }
 
 impl TimersInfo {
-    /// Creates a new empty TimersInfo.
+    /// Creates a new empty `TimersInfo`.
     pub fn new() -> Self {
         Self::default()
     }

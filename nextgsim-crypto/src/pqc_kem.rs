@@ -157,7 +157,7 @@ pub fn ml_kem_generate_keypair(level: MlKemLevel) -> MlKemKeyPair {
 /// * `encapsulation_key` - The recipient's encapsulation (public) key bytes
 ///
 /// # Returns
-/// A tuple of (ciphertext_bytes, shared_secret_bytes)
+/// A tuple of (`ciphertext_bytes`, `shared_secret_bytes`)
 ///
 /// # Errors
 /// Returns an error if the encapsulation key is invalid.

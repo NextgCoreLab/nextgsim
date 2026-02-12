@@ -109,9 +109,9 @@ pub fn hybrid_generate_keypair() -> HybridKeyPair {
 /// * `hybrid_pk` - The recipient's hybrid public key (combined X25519 + ML-KEM)
 ///
 /// # Returns
-/// A tuple of (combined_ciphertext, shared_secret) where:
-/// - combined_ciphertext = X25519_ephemeral_public (32 bytes) || ML-KEM ciphertext
-/// - shared_secret = SHA-256(x25519_ss || ml_kem_ss) (32 bytes)
+/// A tuple of (`combined_ciphertext`, `shared_secret`) where:
+/// - `combined_ciphertext` = `X25519_ephemeral_public` (32 bytes) || ML-KEM ciphertext
+/// - `shared_secret` = SHA-256(x25519_ss || `ml_kem_ss`) (32 bytes)
 ///
 /// # Errors
 /// Returns an error if the public key is invalid or encapsulation fails.
@@ -129,7 +129,7 @@ pub fn hybrid_encapsulate(hybrid_pk: &HybridKeyPair) -> HybridResult<(Vec<u8>, [
 /// * `ml_kem_ek` - The recipient's ML-KEM-768 encapsulation key bytes
 ///
 /// # Returns
-/// A tuple of (combined_ciphertext, shared_secret)
+/// A tuple of (`combined_ciphertext`, `shared_secret`)
 ///
 /// # Errors
 /// Returns an error if the public keys are invalid or encapsulation fails.

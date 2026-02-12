@@ -15,7 +15,7 @@
 //! - The cell is not barred
 //! - The cell is not reserved
 //! - The TAI is not in the forbidden list
-//! (PLMN matching is not required)
+//!   (PLMN matching is not required)
 //!
 //! # Reference
 //! - 3GPP TS 38.304: NR; User Equipment (UE) procedures in Idle mode and RRC Inactive state
@@ -159,7 +159,7 @@ impl CellDescription {
     }
 
     /// Calculate Srxlev (cell selection RX level value)
-    /// Srxlev = Q_rxlevmeas - (Q_rxlevmin + Q_rxlevminoffset)
+    /// Srxlev = `Q_rxlevmeas` - (`Q_rxlevmin` + `Q_rxlevminoffset`)
     /// Per 3GPP TS 38.304 Section 5.2.3.2
     pub fn srxlev(&self) -> i32 {
         let q_rxlev_min = self.sib1.q_rx_lev_min as i32 * 2; // Convert to dBm
@@ -220,7 +220,7 @@ impl Default for CellReselectionParams {
 
 /// Cell selection and reselection manager
 pub struct CellSelector {
-    /// Detected cells indexed by cell_id
+    /// Detected cells indexed by `cell_id`
     cells: HashMap<i32, CellDescription>,
     /// Currently selected cell
     current_cell: ActiveCellInfo,
@@ -386,7 +386,7 @@ impl CellSelector {
     }
 
     /// Perform cell selection
-    /// Returns Some(cell_info) if a new cell was selected, None if no change
+    /// Returns `Some(cell_info)` if a new cell was selected, None if no change
     pub fn perform_cell_selection(&mut self) -> Option<ActiveCellInfo> {
         let elapsed = self.started_time.elapsed();
 

@@ -21,7 +21,7 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
-    /// Creates a new TensorInfo
+    /// Creates a new `TensorInfo`
     pub fn new(name: impl Into<String>, shape: impl Into<TensorShape>, dtype: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -47,7 +47,7 @@ pub struct ModelMetadata {
 }
 
 impl ModelMetadata {
-    /// Creates a new ModelMetadata with required fields
+    /// Creates a new `ModelMetadata` with required fields
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -129,7 +129,7 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
-    /// Creates a new ModelInfo
+    /// Creates a new `ModelInfo`
     pub fn new(path: impl Into<PathBuf>, model_type: ModelType) -> Self {
         Self {
             path: path.into(),

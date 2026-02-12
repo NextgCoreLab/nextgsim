@@ -65,7 +65,7 @@ pub struct PduSession {
     pub uplink_tunnel: GtpTunnel,
     /// Downlink tunnel (UPF -> gNB)
     pub downlink_tunnel: GtpTunnel,
-    /// QoS Flow Identifier (0-63)
+    /// `QoS` Flow Identifier (0-63)
     pub qfi: Option<u8>,
 }
 
@@ -86,7 +86,7 @@ impl PduSession {
         }
     }
 
-    /// Set the QoS Flow Identifier
+    /// Set the `QoS` Flow Identifier
     pub fn with_qfi(mut self, qfi: u8) -> Self {
         self.qfi = Some(qfi);
         self
@@ -123,7 +123,7 @@ pub fn get_psi(session_key: u64) -> u8 {
 /// and session identifiers.
 #[derive(Debug, Default)]
 pub struct TunnelManager {
-    /// PDU sessions indexed by session key (ue_id << 32 | psi)
+    /// PDU sessions indexed by session key (`ue_id` << 32 | psi)
     sessions: HashMap<u64, PduSession>,
     /// Downlink TEID to session key mapping
     downlink_teid_map: HashMap<u32, u64>,

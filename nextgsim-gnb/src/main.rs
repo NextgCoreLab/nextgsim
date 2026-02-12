@@ -58,7 +58,7 @@ impl GnbApp {
         // Load and validate configuration
         info!("Loading configuration from: {}", config_path);
         let config = load_and_validate_gnb_config(config_path)
-            .with_context(|| format!("Failed to load configuration from {}", config_path))?;
+            .with_context(|| format!("Failed to load configuration from {config_path}"))?;
 
         info!(
             "Configuration loaded: NCI={:#x}, PLMN={}-{}, TAC={}",
@@ -97,6 +97,7 @@ impl GnbApp {
     }
 
     /// Spawns all gNB tasks
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tasks(
         _task_manager: &TaskManager,
         task_base: nextgsim_gnb::GnbTaskBase,

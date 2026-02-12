@@ -116,7 +116,7 @@ pub struct MeasResultPerCsiRsIndex {
     pub results: MeasCellResults,
 }
 
-/// Measurement result for NR frequencies (MeasResult2NR in 3GPP)
+/// Measurement result for NR frequencies (`MeasResult2NR` in 3GPP)
 #[derive(Debug, Clone)]
 pub struct MeasResult2Nr {
     /// SSB frequency in ARFCN
@@ -241,7 +241,7 @@ pub fn build_measurement_report(
     Ok(UL_DCCH_Message { message: message_type })
 }
 
-/// Build a MeasResultNR value for the generated types
+/// Build a `MeasResultNR` value for the generated types
 fn build_meas_result_nr_value(nr: &MeasResultNr) -> MeasResultNR {
     let cell_results = MeasResultNRMeasResultCellResults {
         results_ssb_cell: nr.cell_results.ssb_results.as_ref().map(|r| {
@@ -406,7 +406,7 @@ pub fn parse_measurement_report(
     })
 }
 
-/// Parse a MeasResultNR generated type into our domain type
+/// Parse a `MeasResultNR` generated type into our domain type
 fn parse_meas_result_nr(nr: &MeasResultNR) -> MeasResultNr {
     let ssb_results = nr.meas_result.cell_results.results_ssb_cell.as_ref().map(|r| {
         MeasCellResults {

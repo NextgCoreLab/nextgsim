@@ -8,7 +8,7 @@
 //! The NAS security context contains all the security-related information needed
 //! for protecting NAS messages between the UE and the AMF:
 //!
-//! - Security keys (KAUSF, KSEAF, KAMF, KNASint, KNASenc)
+//! - Security keys (KAUSF, KSEAF, KAMF, `KNASint`, `KNASenc`)
 //! - Selected security algorithms (ciphering and integrity)
 //! - NAS COUNT values (uplink and downlink)
 //! - Key set identifier (ngKSI)
@@ -349,14 +349,14 @@ pub struct UeKeys {
     kseaf: Option<[u8; KEY_256_SIZE]>,
     /// KAMF - Key for AMF (256-bit)
     kamf: Option<[u8; KEY_256_SIZE]>,
-    /// KNASint - NAS integrity key (128-bit)
+    /// `KNASint` - NAS integrity key (128-bit)
     knas_int: Option<[u8; KEY_128_SIZE]>,
-    /// KNASenc - NAS encryption key (128-bit)
+    /// `KNASenc` - NAS encryption key (128-bit)
     knas_enc: Option<[u8; KEY_128_SIZE]>,
 }
 
 impl UeKeys {
-    /// Create a new empty UeKeys structure
+    /// Create a new empty `UeKeys` structure
     pub fn new() -> Self {
         Self::default()
     }
@@ -391,22 +391,22 @@ impl UeKeys {
         self.kamf.as_ref()
     }
 
-    /// Set the KNASint key
+    /// Set the `KNASint` key
     pub fn set_knas_int(&mut self, key: &[u8; KEY_128_SIZE]) {
         self.knas_int = Some(*key);
     }
 
-    /// Get the KNASint key
+    /// Get the `KNASint` key
     pub fn knas_int(&self) -> Option<&[u8; KEY_128_SIZE]> {
         self.knas_int.as_ref()
     }
 
-    /// Set the KNASenc key
+    /// Set the `KNASenc` key
     pub fn set_knas_enc(&mut self, key: &[u8; KEY_128_SIZE]) {
         self.knas_enc = Some(*key);
     }
 
-    /// Get the KNASenc key
+    /// Get the `KNASenc` key
     pub fn knas_enc(&self) -> Option<&[u8; KEY_128_SIZE]> {
         self.knas_enc.as_ref()
     }
@@ -594,12 +594,12 @@ impl NasSecurityContext {
         self.ng_ksi = ksi & 0x07;
     }
 
-    /// Get the NAS key set identifier as a NasKeySetIdentifier struct
+    /// Get the NAS key set identifier as a `NasKeySetIdentifier` struct
     pub fn nas_ksi(&self) -> NasKeySetIdentifier {
         NasKeySetIdentifier::new(self.tsc, self.ng_ksi)
     }
 
-    /// Set the NAS key set identifier from a NasKeySetIdentifier struct
+    /// Set the NAS key set identifier from a `NasKeySetIdentifier` struct
     pub fn set_nas_ksi(&mut self, ksi: NasKeySetIdentifier) {
         self.tsc = ksi.tsc;
         self.ng_ksi = ksi.ksi;
@@ -635,7 +635,7 @@ impl NasSecurityContext {
         self.ciphering_algorithm
     }
 
-    /// Get the selected algorithms as NasSecurityAlgorithms
+    /// Get the selected algorithms as `NasSecurityAlgorithms`
     pub fn algorithms(&self) -> NasSecurityAlgorithms {
         NasSecurityAlgorithms::new(self.ciphering_algorithm, self.integrity_algorithm)
     }
@@ -687,7 +687,7 @@ impl NasSecurityContext {
 
     /// Derive NAS keys from KAMF
     ///
-    /// This derives KNASint and KNASenc from KAMF using the specified algorithms.
+    /// This derives `KNASint` and `KNASenc` from KAMF using the specified algorithms.
     /// KAMF must be set before calling this method.
     ///
     /// # Arguments
@@ -914,7 +914,7 @@ impl NasCount {
 
     /// Convert NAS count to 32-bit value for use in crypto algorithms
     ///
-    /// Format: [0x00][overflow_high][overflow_low][sqn]
+    /// Format: [0x00][overflow_high][`overflow_low`][sqn]
     pub fn to_u32(&self) -> u32 {
         ((self.overflow as u32) << 8) | (self.sqn as u32)
     }
@@ -1011,7 +1011,7 @@ pub enum NasDirection {
 ///
 /// # Parameters
 /// - `algorithm`: The integrity algorithm to use (NIA0-NIA3)
-/// - `key`: 128-bit integrity key (KNASint)
+/// - `key`: 128-bit integrity key (`KNASint`)
 /// - `count`: NAS COUNT value (32-bit)
 /// - `direction`: Direction (uplink or downlink)
 /// - `sequence_number`: NAS sequence number (8-bit)
@@ -1087,7 +1087,7 @@ pub fn compute_nas_mac(
 ///
 /// # Parameters
 /// - `algorithm`: The integrity algorithm to use (NIA0-NIA3)
-/// - `key`: 128-bit integrity key (KNASint)
+/// - `key`: 128-bit integrity key (`KNASint`)
 /// - `count`: NAS COUNT value (32-bit)
 /// - `direction`: Direction (uplink or downlink)
 /// - `sequence_number`: NAS sequence number (8-bit)

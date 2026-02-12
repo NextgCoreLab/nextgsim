@@ -831,7 +831,7 @@ pub enum IntentScope {
 /// KPI target for an intent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntentKpiTarget {
-    /// KPI name (e.g., "latency_ms", "throughput_mbps").
+    /// KPI name (e.g., "`latency_ms`", "`throughput_mbps`").
     pub kpi_name: String,
     /// Target value.
     pub target: f64,
@@ -2045,7 +2045,7 @@ impl fmt::Display for Tai {
 /// Standard SST values (3GPP TS 23.501):
 /// - 1: eMBB (enhanced Mobile Broadband)
 /// - 2: URLLC (Ultra-Reliable Low-Latency Communications)
-/// - 3: MIoT (Massive IoT)
+/// - 3: `MIoT` (Massive `IoT`)
 /// - 4: V2X (Vehicle-to-Everything)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[derive(Default)]
@@ -2172,12 +2172,12 @@ pub struct NetworkSlice {
 }
 
 impl NetworkSlice {
-    /// Creates a new empty NetworkSlice.
+    /// Creates a new empty `NetworkSlice`.
     pub const fn new() -> Self {
         Self { slices: Vec::new() }
     }
 
-    /// Creates a NetworkSlice from a vector of S-NSSAIs.
+    /// Creates a `NetworkSlice` from a vector of S-NSSAIs.
     pub fn from_slices(slices: Vec<SNssai>) -> Self {
         Self { slices }
     }

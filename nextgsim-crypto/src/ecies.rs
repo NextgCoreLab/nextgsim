@@ -313,7 +313,7 @@ fn p256_ecdh(
 /// AES-128-CTR for encryption, and HMAC-SHA256 (truncated to 8 bytes) for MAC.
 ///
 /// # Returns
-/// Tuple of (ephemeral_public_key_compressed, ciphertext, mac_tag)
+/// Tuple of (`ephemeral_public_key_compressed`, ciphertext, `mac_tag`)
 ///
 /// # Errors
 /// Returns an error if the public key is invalid or ECDH fails.

@@ -148,7 +148,7 @@ impl Default for HandoverConfig {
 pub struct GnbHandoverManager {
     /// Configuration
     config: HandoverConfig,
-    /// Handover context per UE (ue_id -> context)
+    /// Handover context per UE (`ue_id` -> context)
     ue_contexts: HashMap<i32, UeHandoverContext>,
     /// Transaction ID counter
     transaction_counter: u8,
@@ -198,11 +198,10 @@ impl GnbHandoverManager {
         for neighbor in &report.neighbors {
             // Check A3 condition: neighbor > serving + offset - hysteresis
             let threshold = report.serving_rsrp + self.config.a3_offset - self.config.hysteresis;
-            if neighbor.rsrp > threshold {
-                if best_candidate.map_or(true, |(_, rsrp)| neighbor.rsrp > rsrp) {
+            if neighbor.rsrp > threshold
+                && best_candidate.is_none_or(|(_, rsrp)| neighbor.rsrp > rsrp) {
                     best_candidate = Some((neighbor.pci, neighbor.rsrp));
                 }
-            }
         }
 
         if let Some((pci, rsrp)) = best_candidate {

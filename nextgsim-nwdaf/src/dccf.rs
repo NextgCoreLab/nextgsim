@@ -436,8 +436,8 @@ impl Dccf {
         for transform in transforms {
             result = match transform {
                 DataTransformation::Normalize => {
-                    let min = result.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let max = result.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let min = result.iter().copied().fold(f64::INFINITY, f64::min);
+                    let max = result.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let range = (max - min).max(f64::EPSILON);
                     result.iter().map(|v| (v - min) / range).collect()
                 }

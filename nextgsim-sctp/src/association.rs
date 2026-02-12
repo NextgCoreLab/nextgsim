@@ -407,7 +407,7 @@ impl SctpAssociation {
     }
 
     /// Try to receive a message (non-blocking)
-    /// Note: You must call poll() first to receive incoming UDP packets
+    /// Note: You must call `poll()` first to receive incoming UDP packets
     pub fn try_recv(&mut self) -> Result<Option<ReceivedMessage>> {
         // Accept any incoming streams
         while let Some(stream) = self.association.accept_stream() {
@@ -508,7 +508,7 @@ impl SctpAssociation {
         }
     }
 
-    /// Run the association event loop (for use with tokio::spawn)
+    /// Run the association event loop (for use with `tokio::spawn`)
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting SCTP association event loop");
 
@@ -605,7 +605,7 @@ pub enum PathState {
 
 /// A single network path in a multi-homed SCTP association
 ///
-/// Each path represents a (local_addr, remote_addr) pair that can be used
+/// Each path represents a (`local_addr`, `remote_addr`) pair that can be used
 /// for data transmission. SCTP multi-homing allows an association to use
 /// multiple network paths for redundancy.
 #[derive(Debug, Clone)]

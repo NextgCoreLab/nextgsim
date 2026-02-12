@@ -150,11 +150,11 @@ impl NwdafTask {
             NwdafResponse::TrajectoryPrediction(pred)
         } else {
             warn!("NWDAF: No trajectory prediction available for UE {}", ue_id);
-            NwdafResponse::Error(format!("Insufficient data for UE {}", ue_id))
+            NwdafResponse::Error(format!("Insufficient data for UE {ue_id}"))
         };
 
         if let Some(tx) = response_tx {
-            if let Err(_) = tx.send(response) {
+            if tx.send(response).is_err() {
                 error!("NWDAF: Failed to send trajectory prediction response");
             }
         }

@@ -127,7 +127,7 @@ pub struct FederatedLearningConfig {
 /// Aggregation strategy for federated learning
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregationStrategy {
-    /// Federated Averaging (FedAvg)
+    /// Federated Averaging (`FedAvg`)
     FedAvg,
     /// Federated SGD
     FedSgd,

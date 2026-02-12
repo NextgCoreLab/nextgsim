@@ -50,7 +50,7 @@ pub struct KnowledgeEvent {
     pub related_entity_id: Option<String>,
     /// Relationship type (for relationship events)
     pub relation_type: Option<String>,
-    /// Changed properties (for update events: key -> (old_value, new_value))
+    /// Changed properties (for update events: key -> (`old_value`, `new_value`))
     pub changed_properties: HashMap<String, (Option<String>, Option<String>)>,
 }
 

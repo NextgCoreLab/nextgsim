@@ -106,9 +106,9 @@ pub struct AggregatedModel {
 /// Aggregation algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregationAlgorithm {
-    /// Federated Averaging (FedAvg) - McMahan et al. 2017
+    /// Federated Averaging (`FedAvg`) - `McMahan` et al. 2017
     FedAvg,
-    /// Federated Proximal (FedProx) - Li et al. 2020
+    /// Federated Proximal (`FedProx`) - Li et al. 2020
     FedProx,
     /// Secure Aggregation - Bonawitz et al. 2017
     SecAgg,
@@ -300,7 +300,7 @@ pub struct Participant {
 // FedProx configuration
 // ---------------------------------------------------------------------------
 
-/// FedProx configuration
+/// `FedProx` configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FedProxConfig {
     /// Proximal term coefficient (mu). Higher values keep local models
@@ -384,7 +384,7 @@ pub fn topk_decompress(compressed: &CompressedGradient) -> Vec<f32> {
 // Secure Aggregation (Bonawitz et al.)
 // ---------------------------------------------------------------------------
 
-/// A participant's keypair and public key for the SecAgg protocol.
+/// A participant's keypair and public key for the `SecAgg` protocol.
 ///
 /// Uses x25519 Diffie-Hellman for pairwise key agreement.
 pub struct SecAggParticipant {
@@ -406,7 +406,7 @@ impl std::fmt::Debug for SecAggParticipant {
 }
 
 impl SecAggParticipant {
-    /// Creates a new SecAgg participant with a fresh x25519 keypair.
+    /// Creates a new `SecAgg` participant with a fresh x25519 keypair.
     pub fn new(id: impl Into<String>) -> Self {
         let mut rng = rand::thread_rng();
         let secret = x25519_dalek::StaticSecret::random_from_rng(&mut rng);
@@ -531,7 +531,7 @@ fn sample_gaussian<R: Rng>(rng: &mut R, sigma: f32) -> f32 {
 // FederatedAggregator (synchronous)
 // ---------------------------------------------------------------------------
 
-/// FL aggregator supporting FedAvg, FedProx, and SecAgg.
+/// FL aggregator supporting `FedAvg`, `FedProx`, and `SecAgg`.
 #[derive(Debug)]
 pub struct FederatedAggregator {
     /// Current global model
@@ -552,9 +552,9 @@ pub struct FederatedAggregator {
     min_participants: usize,
     /// Round timeout (seconds)
     round_timeout_secs: u64,
-    /// FedProx configuration (used when algorithm == FedProx)
+    /// `FedProx` configuration (used when algorithm == `FedProx`)
     fedprox_config: FedProxConfig,
-    /// SecAgg participants (participant_id -> SecAggParticipant)
+    /// `SecAgg` participants (`participant_id` -> `SecAggParticipant`)
     secagg_participants: HashMap<String, SecAggParticipant>,
 }
 
@@ -586,7 +586,7 @@ impl FederatedAggregator {
         self
     }
 
-    /// Sets the FedProx proximal term coefficient.
+    /// Sets the `FedProx` proximal term coefficient.
     pub fn with_fedprox_config(mut self, config: FedProxConfig) -> Self {
         self.fedprox_config = config;
         self
@@ -597,14 +597,14 @@ impl FederatedAggregator {
         self.privacy_tracker.as_ref()
     }
 
-    /// Returns a reference to the FedProx config.
+    /// Returns a reference to the `FedProx` config.
     pub fn fedprox_config(&self) -> &FedProxConfig {
         &self.fedprox_config
     }
 
     /// Registers a participant.
     ///
-    /// When using SecAgg, this also generates an x25519 keypair for the
+    /// When using `SecAgg`, this also generates an x25519 keypair for the
     /// participant.
     pub fn register_participant(&mut self, id: impl Into<String>, num_samples: u64) {
         let id = id.into();
@@ -624,7 +624,7 @@ impl FederatedAggregator {
         }
     }
 
-    /// Returns the public keys of all registered SecAgg participants.
+    /// Returns the public keys of all registered `SecAgg` participants.
     pub fn secagg_public_keys(&self) -> Vec<(String, x25519_dalek::PublicKey)> {
         self.secagg_participants
             .values()
@@ -718,7 +718,7 @@ impl FederatedAggregator {
     ///
     /// 1. Clip the gradient to `clipping_threshold` (L2 norm).
     /// 2. Add per-parameter Gaussian noise N(0, sigma^2) where
-    ///    sigma = clipping_threshold * noise_multiplier.
+    ///    sigma = `clipping_threshold` * `noise_multiplier`.
     fn apply_dp(&self, update: &ModelUpdate) -> ModelUpdate {
         let mut processed = update.clone();
 
@@ -750,11 +750,11 @@ impl FederatedAggregator {
     /// Aggregates received updates.
     ///
     /// The aggregation strategy depends on the selected algorithm:
-    /// - **FedAvg**: sample-weighted average of gradients.
-    /// - **FedProx**: FedAvg-style weighted average with an additional
+    /// - **`FedAvg`**: sample-weighted average of gradients.
+    /// - **`FedProx`**: FedAvg-style weighted average with an additional
     ///   proximal correction term that penalises deviation from the global
     ///   model.
-    /// - **SecAgg**: secure aggregation with pairwise masking (the masks
+    /// - **`SecAgg`**: secure aggregation with pairwise masking (the masks
     ///   cancel in the sum, yielding the true aggregate).
     pub fn aggregate(&mut self) -> Result<AggregatedModel, String> {
         // First, check conditions and extract needed data
@@ -838,7 +838,7 @@ impl FederatedAggregator {
         Ok(model)
     }
 
-    /// FedAvg aggregation: sample-weighted average of participant gradients.
+    /// `FedAvg` aggregation: sample-weighted average of participant gradients.
     fn fedavg_aggregate(&self, updates: &HashMap<String, ModelUpdate>) -> Vec<f32> {
         if updates.is_empty() {
             return Vec::new();
@@ -861,18 +861,18 @@ impl FederatedAggregator {
         aggregated
     }
 
-    /// FedProx aggregation.
+    /// `FedProx` aggregation.
     ///
-    /// FedProx adds a proximal term `(mu/2) * ||w - w_global||^2` to each
+    /// `FedProx` adds a proximal term `(mu/2) * ||w - w_global||^2` to each
     /// participant's local objective, which means participant gradients already
     /// incorporate the proximal penalty during local training.
     ///
-    /// At aggregation time, FedProx performs a weighted average similar to
-    /// FedAvg but applies a proximal correction step: the aggregated result
+    /// At aggregation time, `FedProx` performs a weighted average similar to
+    /// `FedAvg` but applies a proximal correction step: the aggregated result
     /// is shifted toward the current global model proportionally to `mu`.
     ///
     /// Specifically:
-    ///   w_new = (1 / (1 + mu)) * w_fedavg + (mu / (1 + mu)) * w_global
+    ///   `w_new` = (1 / (1 + mu)) * `w_fedavg` + (mu / (1 + mu)) * `w_global`
     ///
     /// This ensures that even after aggregation, the new global model does
     /// not drift too far from the previous global model, which stabilizes
@@ -901,7 +901,7 @@ impl FederatedAggregator {
             .collect()
     }
 
-    /// SecAgg aggregation using pairwise x25519 masking.
+    /// `SecAgg` aggregation using pairwise x25519 masking.
     ///
     /// Each participant masks their gradient with pairwise random masks
     /// derived from DH shared secrets. The masks are antisymmetric
@@ -984,7 +984,7 @@ struct AsyncUpdate {
 /// wait for all participants before aggregating. Instead, it incorporates
 /// updates as they arrive, weighting each contribution by a staleness factor:
 ///
-///   weight_i = (num_samples_i / total_samples) * alpha^(current_version - base_version_i)
+///   `weight_i` = (`num_samples_i` / `total_samples`) * `alpha^(current_version` - `base_version_i`)
 ///
 /// where `alpha` is a staleness decay factor in (0, 1]. An `alpha` of 1.0
 /// gives equal weight regardless of staleness; smaller values down-weight
@@ -1639,7 +1639,7 @@ impl RenyiDPTracker {
     }
 
     /// Records a Gaussian mechanism with noise multiplier sigma
-    /// RDP guarantee at order alpha: epsilon_alpha = alpha / (2 * sigma^2)
+    /// RDP guarantee at order alpha: `epsilon_alpha` = alpha / (2 * sigma^2)
     pub fn record_gaussian(&mut self, sigma: f32) {
         for (i, &alpha) in self.orders.iter().enumerate() {
             let epsilon_alpha = alpha / (2.0 * sigma * sigma);
@@ -1649,7 +1649,7 @@ impl RenyiDPTracker {
     }
 
     /// Converts RDP to (epsilon, delta)-DP using the optimal order
-    /// epsilon = min_alpha (RDP_alpha + log(1/delta) / (alpha - 1))
+    /// epsilon = `min_alpha` (`RDP_alpha` + log(1/delta) / (alpha - 1))
     pub fn get_epsilon(&self) -> f32 {
         if self.num_compositions == 0 {
             return 0.0;
@@ -1841,13 +1841,13 @@ impl PersonalizationLayer {
         let mut personalized = global_weights.to_vec();
 
         // Update local adaptation weights
-        for i in 0..dim {
-            self.local_weights[i] -= self.learning_rate * local_gradients[i];
+        for (lw, lg) in self.local_weights.iter_mut().zip(local_gradients.iter()).take(dim) {
+            *lw -= self.learning_rate * lg;
         }
 
         // Combine global model with local adaptation
-        for i in 0..dim {
-            personalized[i] += self.local_weights[i];
+        for (p, lw) in personalized.iter_mut().zip(self.local_weights.iter()).take(dim) {
+            *p += lw;
         }
 
         personalized
@@ -1954,7 +1954,7 @@ pub fn multi_krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize, m: usize
     result
 }
 
-/// Trimmed mean: removes top and bottom trim_ratio of values per coordinate
+/// Trimmed mean: removes top and bottom `trim_ratio` of values per coordinate
 pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32> {
     if updates.is_empty() {
         return vec![];
@@ -1966,13 +1966,13 @@ pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32>
 
     let mut result = vec![0.0f32; dim];
 
-    for i in 0..dim {
+    for (i, result_val) in result.iter_mut().enumerate().take(dim) {
         let mut values: Vec<f32> = updates.iter().map(|u| u.get(i).copied().unwrap_or(0.0)).collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Trim extremes
         let trimmed = &values[trim_count..n.saturating_sub(trim_count)];
-        result[i] = if trimmed.is_empty() {
+        *result_val = if trimmed.is_empty() {
             0.0
         } else {
             trimmed.iter().sum::<f32>() / trimmed.len() as f32
@@ -1991,12 +1991,12 @@ pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
     let dim = updates[0].len();
     let mut result = vec![0.0f32; dim];
 
-    for i in 0..dim {
+    for (i, result_val) in result.iter_mut().enumerate().take(dim) {
         let mut values: Vec<f32> = updates.iter().map(|u| u.get(i).copied().unwrap_or(0.0)).collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mid = values.len() / 2;
-        result[i] = if values.len() % 2 == 0 {
+        *result_val = if values.len() % 2 == 0 {
             (values[mid - 1] + values[mid]) / 2.0
         } else {
             values[mid]

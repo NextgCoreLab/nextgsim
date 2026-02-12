@@ -82,7 +82,7 @@ pub struct Action {
     pub parameters: HashMap<String, String>,
 }
 
-/// Experience tuple for RL: (state, action, reward, next_state)
+/// Experience tuple for RL: (state, action, reward, `next_state`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experience {
     /// State before action

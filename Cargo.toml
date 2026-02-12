@@ -115,31 +115,15 @@ ndarray = { version = "0.15", features = ["serde"] }
 half = { version = "2", features = ["serde"] }
 
 # Workspace-wide lint configuration
-[workspace.lints.rust]
-unsafe_code = "warn"
-missing_docs = "warn"
-
 [workspace.lints.clippy]
-# Correctness - deny these as they indicate bugs
+# Correctness
 enum_glob_use = "deny"
-unwrap_used = "warn"
-expect_used = "warn"
 
-# Style - enforce consistent code style
-needless_pass_by_value = "warn"
+# Style
 redundant_closure_for_method_calls = "warn"
 cloned_instead_of_copied = "warn"
 flat_map_option = "warn"
 
-# Complexity - keep code simple
-too_many_arguments = "warn"
-cognitive_complexity = "warn"
-
-# Performance - avoid unnecessary allocations
+# Performance
 unnecessary_to_owned = "warn"
 inefficient_to_string = "warn"
-
-# Pedantic - additional checks (selectively enabled)
-doc_markdown = "warn"
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"

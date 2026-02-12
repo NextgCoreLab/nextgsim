@@ -230,7 +230,7 @@ impl AppTask {
     /// Handles downlink data delivery (to TUN).
     ///
     /// Note: In the current architecture, downlink data forwarding to TUN is handled
-    /// directly in main.rs via the NasMessage::DownlinkDataDelivery message, as the
+    /// directly in main.rs via the `NasMessage::DownlinkDataDelivery` message, as the
     /// TUN task channel is created there.
     fn handle_downlink_data(&self, psi: i32, data: nextgsim_common::OctetString) {
         debug!("Downlink data delivery: psi={}, len={}", psi, data.len());

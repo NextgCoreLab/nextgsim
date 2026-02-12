@@ -2,7 +2,7 @@
 //!
 //! Implements the Initial UE Message procedure as defined in 3GPP TS 38.413 Section 8.6.1.
 //! This procedure is used by the NG-RAN node to transfer the initial NAS message from the UE
-//! to the AMF when the UE is in RRC_CONNECTED state and no UE-associated logical NG-connection
+//! to the AMF when the UE is in `RRC_CONNECTED` state and no UE-associated logical NG-connection
 //! exists for the UE.
 
 use crate::codec::generated::*;
@@ -329,7 +329,7 @@ fn build_user_location_info(info: &UserLocationInfoNr) -> UserLocationInformatio
     UserLocationInformation::UserLocationInformationNR(user_location_info_nr)
 }
 
-/// Build an NR-CGI from the NrCgi struct
+/// Build an NR-CGI from the `NrCgi` struct
 pub fn build_nr_cgi(nr_cgi: &NrCgi) -> NR_CGI {
     // NR Cell Identity is 36 bits
     let mut bv: BitVec<u8, Msb0> = BitVec::new();
@@ -516,7 +516,7 @@ fn parse_user_location_info(
     }
 }
 
-/// Parse an NR-CGI into the NrCgi struct
+/// Parse an NR-CGI into the `NrCgi` struct
 pub fn parse_nr_cgi(nr_cgi: &NR_CGI) -> NrCgi {
     let plmn_identity: [u8; 3] = nr_cgi
         .plmn_identity

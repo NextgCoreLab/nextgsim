@@ -198,7 +198,7 @@ impl SemanticFeatures {
         // Compute self-attention: each feature attends to all others
         let mut attention_scores = vec![0.0f32; dim];
 
-        for i in 0..dim {
+        for (i, attn_score) in attention_scores.iter_mut().enumerate().take(dim) {
             let query = self.features[i];
             let mut score = 0.0f32;
 
@@ -210,7 +210,7 @@ impl SemanticFeatures {
                 score += attention_weight;
             }
 
-            attention_scores[i] = score;
+            *attn_score = score;
         }
 
         // Normalize attention scores

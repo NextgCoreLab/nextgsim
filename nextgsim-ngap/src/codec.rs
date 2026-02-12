@@ -82,7 +82,7 @@ impl StreamId {
     /// Stream 0 is reserved for non-UE-associated signalling (NG Setup, Reset, etc.)
     pub const NON_UE_ASSOCIATED: StreamId = StreamId(0);
 
-    /// Create a new StreamId
+    /// Create a new `StreamId`
     pub fn new(id: u16) -> Self {
         StreamId(id)
     }
@@ -491,19 +491,19 @@ pub mod sixg_procedure_codes {
 
 /// 6G RRC extension message types (embedded in RRC non-critical extensions).
 pub mod sixg_rrc_extensions {
-    /// AI/ML model configuration in RRCReconfiguration
+    /// AI/ML model configuration in `RRCReconfiguration`
     pub const AI_ML_CONFIG: u16 = 0xF100;
-    /// ISAC measurement configuration in RRCReconfiguration
+    /// ISAC measurement configuration in `RRCReconfiguration`
     pub const ISAC_MEAS_CONFIG: u16 = 0xF101;
-    /// NTN timing advance update in RRCReconfiguration
+    /// NTN timing advance update in `RRCReconfiguration`
     pub const NTN_TIMING_ADVANCE: u16 = 0xF102;
-    /// Sub-THz band configuration in RRCReconfiguration
+    /// Sub-THz band configuration in `RRCReconfiguration`
     pub const SUB_THZ_BAND_CONFIG: u16 = 0xF103;
 }
 
 /// Wrap a 6G extension payload into an NGAP IE container format.
 ///
-/// Format: procedure_code (2 bytes) + length (4 bytes) + payload
+/// Format: `procedure_code` (2 bytes) + length (4 bytes) + payload
 pub fn encode_sixg_ngap_extension(procedure_code: u16, payload: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(6 + payload.len());
     result.extend_from_slice(&procedure_code.to_be_bytes());
@@ -514,7 +514,7 @@ pub fn encode_sixg_ngap_extension(procedure_code: u16, payload: &[u8]) -> Vec<u8
 
 /// Decode a 6G extension from an NGAP IE container format.
 ///
-/// Returns (procedure_code, payload).
+/// Returns (`procedure_code`, payload).
 pub fn decode_sixg_ngap_extension(data: &[u8]) -> Result<(u16, Vec<u8>), NgapCodecError> {
     if data.len() < 6 {
         return Err(NgapCodecError::DecodeError(
@@ -533,7 +533,7 @@ pub fn decode_sixg_ngap_extension(data: &[u8]) -> Result<(u16, Vec<u8>), NgapCod
 
 /// Wrap a 6G extension into an RRC non-critical extension format.
 ///
-/// Format: extension_type (2 bytes) + length (2 bytes) + payload
+/// Format: `extension_type` (2 bytes) + length (2 bytes) + payload
 pub fn encode_sixg_rrc_extension(extension_type: u16, payload: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(4 + payload.len());
     result.extend_from_slice(&extension_type.to_be_bytes());
@@ -544,7 +544,7 @@ pub fn encode_sixg_rrc_extension(extension_type: u16, payload: &[u8]) -> Vec<u8>
 
 /// Decode a 6G extension from an RRC non-critical extension format.
 ///
-/// Returns (extension_type, payload).
+/// Returns (`extension_type`, payload).
 pub fn decode_sixg_rrc_extension(data: &[u8]) -> Result<(u16, Vec<u8>), NgapCodecError> {
     if data.len() < 4 {
         return Err(NgapCodecError::DecodeError(

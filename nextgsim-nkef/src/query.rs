@@ -417,7 +417,7 @@ impl QueryExecutor {
     /// Finds all paths between two entities up to a maximum depth.
     ///
     /// Uses BFS to find paths from source to target through the relationship graph.
-    /// Returns paths as sequences of (entity_id, relationship_type) pairs.
+    /// Returns paths as sequences of (`entity_id`, `relationship_type`) pairs.
     pub fn find_paths(
         source_id: &str,
         target_id: &str,

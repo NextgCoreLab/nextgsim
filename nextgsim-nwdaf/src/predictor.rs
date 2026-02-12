@@ -24,7 +24,7 @@ pub enum PredictionMethod {
 /// Raw prediction output from the predictor
 #[derive(Debug, Clone)]
 pub struct PredictionOutput {
-    /// Predicted waypoints as (position, timestamp_ms) pairs
+    /// Predicted waypoints as (position, `timestamp_ms`) pairs
     pub waypoints: Vec<(Vector3, u64)>,
     /// Confidence score (0.0 to 1.0)
     pub confidence: f32,

@@ -513,7 +513,7 @@ pub struct CrossProcessMessage {
 
 /// Distributed coordinator for cross-process agent coordination
 ///
-/// Extends MessageRouter with cross-process communication capabilities
+/// Extends `MessageRouter` with cross-process communication capabilities
 /// using message passing and distributed consensus.
 pub struct DistributedCoordinator {
     /// Local message router

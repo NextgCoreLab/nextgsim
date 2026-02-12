@@ -1,14 +1,14 @@
-//! Analytics Logical Function (AnLF)
+//! Analytics Logical Function (`AnLF`)
 //!
-//! Implements the AnLF component of NWDAF as defined in 3GPP TS 23.288.
-//! AnLF is responsible for:
+//! Implements the `AnLF` component of NWDAF as defined in 3GPP TS 23.288.
+//! `AnLF` is responsible for:
 //! - Performing analytics inference using models from MTLF
 //! - Exposing analytics results via Nnwdaf services
 //! - Running anomaly detection on incoming data
 //! - Generating handover recommendations and load predictions
 //!
-//! AnLF consumes trained models from MTLF and collected data from
-//! the DataCollector to produce analytics outputs.
+//! `AnLF` consumes trained models from MTLF and collected data from
+//! the `DataCollector` to produce analytics outputs.
 
 use std::collections::VecDeque;
 
@@ -67,13 +67,13 @@ pub enum AnalyticsPayload {
         /// Detected anomalies
         anomalies: Vec<Anomaly>,
     },
-    /// QoS sustainability result
+    /// `QoS` sustainability result
     QosSustainability {
-        /// Whether current QoS can be sustained
+        /// Whether current `QoS` can be sustained
         sustainable: bool,
-        /// Estimated remaining time at current QoS level
+        /// Estimated remaining time at current `QoS` level
         remaining_time_ms: Option<u64>,
-        /// Current QoS metrics
+        /// Current `QoS` metrics
         current_qos: QosMetrics,
     },
     /// Service experience result (TS 23.288 6.4)
@@ -107,16 +107,16 @@ pub enum AnalyticsPayload {
     },
     /// Network slice optimization result (Rel-19)
     SliceOptimization {
-        /// Per-slice utilization (slice_id, utilization 0.0-1.0)
+        /// Per-slice utilization (`slice_id`, utilization 0.0-1.0)
         slice_utilization: Vec<(i32, f32)>,
-        /// SLA compliance per slice (slice_id, compliant)
+        /// SLA compliance per slice (`slice_id`, compliant)
         sla_compliance: Vec<(i32, bool)>,
         /// Reallocation recommendations
         reallocation_recommendations: Vec<String>,
     },
 }
 
-/// QoS metrics for sustainability analytics
+/// `QoS` metrics for sustainability analytics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QosMetrics {
     /// Average latency in milliseconds
@@ -157,7 +157,7 @@ pub enum ServiceType {
     Data,
 }
 
-/// 5QI-aware QoS thresholds (TS 23.501 Table 5.7.4-1)
+/// 5QI-aware `QoS` thresholds (TS 23.501 Table 5.7.4-1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QosThresholds {
     /// 5QI value
@@ -206,7 +206,7 @@ impl QosThresholds {
         }
     }
 
-    /// Checks if the given QoS metrics satisfy this 5QI's requirements
+    /// Checks if the given `QoS` metrics satisfy this 5QI's requirements
     pub fn is_satisfied(&self, latency_ms: f32, packet_loss: f32) -> bool {
         latency_ms <= self.max_latency_ms && packet_loss <= self.max_packet_loss
     }
@@ -265,14 +265,14 @@ impl CellEnergyModel {
 
 /// Analytics Logical Function
 ///
-/// Consumes ML models from MTLF and data from DataCollector to produce
+/// Consumes ML models from MTLF and data from `DataCollector` to produce
 /// analytics. Provides the main analytics execution engine for NWDAF.
 ///
 /// # 3GPP Reference
 ///
-/// - TS 23.288 Section 6.2B: NWDAF containing AnLF
-/// - TS 23.288 Section 7.3: Nnwdaf_AnalyticsInfo service
-/// - TS 23.288 Section 7.2: Nnwdaf_AnalyticsSubscription service
+/// - TS 23.288 Section 6.2B: NWDAF containing `AnLF`
+/// - TS 23.288 Section 7.3: `Nnwdaf_AnalyticsInfo` service
+/// - TS 23.288 Section 7.2: `Nnwdaf_AnalyticsSubscription` service
 #[derive(Debug)]
 pub struct Anlf {
     /// Anomaly detector instance
@@ -290,7 +290,7 @@ pub struct Anlf {
 }
 
 impl Anlf {
-    /// Creates a new AnLF instance
+    /// Creates a new `AnLF` instance
     pub fn new() -> Self {
         let fallback = OnnxPredictor::new().ok();
 
@@ -400,7 +400,7 @@ impl Anlf {
     /// Performs UE mobility analytics (trajectory prediction)
     ///
     /// Uses the MTLF's trajectory predictor if available, otherwise
-    /// falls back to the AnLF's local fallback predictor.
+    /// falls back to the `AnLF`'s local fallback predictor.
     ///
     /// # Errors
     ///
@@ -760,7 +760,7 @@ impl Anlf {
         // MOS ranges from 1 (bad) to 5 (excellent)
         let latency_score = (5.0 - (avg_latency_ms / 50.0).min(4.0)).max(1.0);
         let loss_score = (5.0 - (packet_loss_rate * 100.0).min(4.0)).max(1.0);
-        let throughput_score = (throughput_mbps / 20.0).min(5.0).max(1.0);
+        let throughput_score = (throughput_mbps / 20.0).clamp(1.0, 5.0);
         let mos = (latency_score + loss_score + throughput_score) / 3.0;
 
         let metrics = ServiceLevelMetrics {
@@ -836,7 +836,7 @@ impl Anlf {
             ServiceType::Video => {
                 // ITU-T P.1203 mode 0 simplified
                 // Quality depends on bitrate, resolution (estimated from throughput), stalling
-                let bitrate_factor = (throughput_mbps / 5.0).min(1.0).max(0.0); // 5 Mbps = max quality
+                let bitrate_factor = (throughput_mbps / 5.0).clamp(0.0, 1.0); // 5 Mbps = max quality
                 let stalling_factor = 1.0 - (packet_loss * 10.0).min(1.0);
                 let latency_factor = 1.0 - (latency_ms / 500.0).min(0.5);
                 let base_mos = 1.0 + 3.5 * bitrate_factor;
@@ -844,7 +844,7 @@ impl Anlf {
             }
             ServiceType::Streaming => {
                 // Buffered streaming: throughput dominates, latency less critical
-                let throughput_score = (throughput_mbps / 10.0).min(1.0).max(0.0);
+                let throughput_score = (throughput_mbps / 10.0).clamp(0.0, 1.0);
                 let rebuffer_factor = 1.0 - (packet_loss * 5.0).min(0.8);
                 1.0 + 3.5 * throughput_score * rebuffer_factor
             }
@@ -858,21 +858,21 @@ impl Anlf {
             ServiceType::WebBrowsing => {
                 // Web: page load time approximation
                 let load_time_score = (1.0 - (latency_ms / 3000.0).min(1.0)).max(0.0);
-                let throughput_score = (throughput_mbps / 5.0).min(1.0).max(0.0);
+                let throughput_score = (throughput_mbps / 5.0).clamp(0.0, 1.0);
                 1.0 + 2.0 * load_time_score + 1.5 * throughput_score
             }
             ServiceType::Data => {
                 // Generic: weighted average
                 let latency_score = (5.0 - (latency_ms / 50.0).min(4.0)).max(1.0);
                 let loss_score = (5.0 - (packet_loss * 100.0).min(4.0)).max(1.0);
-                let throughput_score = (throughput_mbps / 20.0).min(5.0).max(1.0);
+                let throughput_score = (throughput_mbps / 20.0).clamp(1.0, 5.0);
                 (latency_score + loss_score + throughput_score) / 3.0
             }
         };
         mos.clamp(1.0, 5.0)
     }
 
-    /// Analyzes QoS sustainability for a specific 5QI value
+    /// Analyzes `QoS` sustainability for a specific 5QI value
     ///
     /// Checks current metrics against 5QI-specific thresholds from TS 23.501 Table 5.7.4-1.
     pub fn check_5qi_compliance(
@@ -982,9 +982,9 @@ impl Anlf {
         }
     }
 
-    /// Performs QoS Sustainability analytics (TS 23.288 6.6)
+    /// Performs `QoS` Sustainability analytics (TS 23.288 6.6)
     ///
-    /// Predicts whether current QoS levels can be sustained given network conditions.
+    /// Predicts whether current `QoS` levels can be sustained given network conditions.
     ///
     /// # Errors
     ///
@@ -1292,7 +1292,7 @@ impl Anlf {
                 let ids = data_collector.known_cell_ids();
                 if ids.is_empty() {
                     return Err(AnalyticsError::TargetNotFound {
-                        target: format!("slice-{}", snssai),
+                        target: format!("slice-{snssai}"),
                     }
                     .into());
                 }

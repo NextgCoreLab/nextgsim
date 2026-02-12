@@ -123,7 +123,7 @@ impl OccupancyGrid {
         self.cells.len()
     }
 
-    /// Clears old cells (older than max_age_ms)
+    /// Clears old cells (older than `max_age_ms`)
     pub fn cleanup_old_cells(&mut self, current_time_ms: u64, max_age_ms: u64) {
         self.cells.retain(|_, cell| {
             current_time_ms - cell.last_update_ms < max_age_ms

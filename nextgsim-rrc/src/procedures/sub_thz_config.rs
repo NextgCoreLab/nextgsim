@@ -160,9 +160,9 @@ pub struct BeamFailureConfig {
 /// Channel propagation model for sub-THz
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubThzChannelModel {
-    /// Line-of-sight (LoS) dominant
+    /// Line-of-sight (`LoS`) dominant
     LineOfSight,
-    /// Non-line-of-sight (NLoS) via reflection
+    /// Non-line-of-sight (`NLoS`) via reflection
     NonLineOfSight,
     /// Reconfigurable Intelligent Surface (RIS) assisted
     RisAssisted,
