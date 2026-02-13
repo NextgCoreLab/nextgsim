@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use crate::tasks::GutiMobileIdentity;
+use super::redcap::RedCapProcessor;
 
 /// RRC connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,6 +63,8 @@ pub struct RrcUeContext {
     pub s_tmsi: Option<GutiMobileIdentity>,
     /// Current RRC connection state
     pub state: RrcState,
+    /// RedCap processor for this UE (Rel-17)
+    pub redcap: RedCapProcessor,
 }
 
 impl RrcUeContext {
@@ -74,6 +77,7 @@ impl RrcUeContext {
             establishment_cause: 0,
             s_tmsi: None,
             state: RrcState::Idle,
+            redcap: RedCapProcessor::new(),
         }
     }
 

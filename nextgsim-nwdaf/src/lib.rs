@@ -78,6 +78,7 @@ pub mod coordination;
 pub mod data_collection;
 pub mod dccf;
 pub mod error;
+pub mod event_exposure;
 pub mod federation;
 pub mod llm_analytics;
 pub mod ml_training;
@@ -108,6 +109,10 @@ pub use dccf::{
 };
 pub use error::{
     AnalyticsError, DataCollectionError, NwdafError, PredictionError, SubscriptionError,
+};
+pub use event_exposure::{
+    EventType, EventSubscription, EventExposureManager, EventNotification,
+    EventData, NfType, SubscriptionStatus, TargetArea, MobilityState,
 };
 pub use federation::{
     AggregatedFederationResult, AreaFilter, ConsentType, DataFederationManager,

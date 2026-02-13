@@ -345,6 +345,45 @@ pub enum NgapMessage {
         /// K-offset for HARQ timing
         k_offset: u16,
     },
+    /// MBS Session Activation Request from AMF (Rel-17 MBS)
+    MbsSessionActivationRequest {
+        /// MBS session ID
+        session_id: u32,
+        /// TMGI (Temporary Mobile Group Identity)
+        tmgi: [u8; 6],
+        /// Is broadcast session (vs multicast)
+        is_broadcast: bool,
+        /// Multicast group IP address
+        multicast_ip: Option<std::net::IpAddr>,
+        /// MBS QFI
+        qfi: u8,
+    },
+    /// MBS Session Deactivation Request from AMF (Rel-17 MBS)
+    MbsSessionDeactivationRequest {
+        /// MBS session ID
+        session_id: u32,
+    },
+    /// Multicast Group Paging from AMF (Rel-17 MBS)
+    MulticastGroupPaging {
+        /// TMGI
+        tmgi: [u8; 6],
+        /// Area scope for paging
+        area_scope: Vec<u32>,
+    },
+    /// MBS UE Join Request from RRC (Rel-17 MBS)
+    MbsUeJoinRequest {
+        /// UE ID
+        ue_id: i32,
+        /// TMGI to join
+        tmgi: [u8; 6],
+    },
+    /// MBS UE Leave Request from RRC (Rel-17 MBS)
+    MbsUeLeaveRequest {
+        /// UE ID
+        ue_id: i32,
+        /// TMGI to leave
+        tmgi: [u8; 6],
+    },
 }
 
 /// Cause for UE context release request.

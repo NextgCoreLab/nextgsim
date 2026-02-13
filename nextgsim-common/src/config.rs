@@ -573,6 +573,137 @@ impl Default for UavConfig {
 }
 
 // ============================================================================
+// Rel-16 V2X (Vehicle-to-Everything) Configuration (TS 23.287)
+// ============================================================================
+
+/// V2X service type for differentiated QoS handling.
+///
+/// Reference: 3GPP TS 23.287 Section 5.2
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum V2xServiceType {
+    /// V2V (Vehicle-to-Vehicle) communication
+    V2V,
+    /// V2I (Vehicle-to-Infrastructure) communication
+    V2I,
+    /// V2P (Vehicle-to-Pedestrian) communication
+    V2P,
+    /// V2N (Vehicle-to-Network) communication
+    V2N,
+}
+
+/// V2X QoS requirements per service type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V2xQosRequirements {
+    /// Maximum end-to-end latency (ms)
+    pub max_latency_ms: u32,
+    /// Required reliability (probability 0.0-1.0)
+    pub reliability: f64,
+    /// Communication range (meters)
+    pub range_meters: f64,
+    /// Message priority (0-7, 7 = highest)
+    pub priority: u8,
+}
+
+/// V2X UE configuration.
+///
+/// Configures UE for V2X operation with network slicing (SST=3).
+/// Reference: 3GPP TS 23.287
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V2xConfig {
+    /// Whether V2X is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// V2X service types this UE supports
+    pub service_types: Vec<V2xServiceType>,
+    /// S-NSSAI for V2X slice (typically SST=3)
+    #[serde(default = "default_v2x_snssai")]
+    pub s_nssai: SNssai,
+    /// QoS requirements per service type
+    pub qos_requirements: Vec<(V2xServiceType, V2xQosRequirements)>,
+    /// Geographical area of operation (optional)
+    pub geo_area: Option<V2xGeoArea>,
+    /// Preferred communication mode (PC5 sidelink or Uu network)
+    #[serde(default)]
+    pub preferred_mode: V2xCommMode,
+}
+
+fn default_v2x_snssai() -> SNssai {
+    SNssai {
+        sst: 3, // V2X slice type
+        sd: None,
+    }
+}
+
+/// V2X geographical area of operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V2xGeoArea {
+    /// Center latitude (degrees)
+    pub center_lat: f64,
+    /// Center longitude (degrees)
+    pub center_lon: f64,
+    /// Radius (meters)
+    pub radius_meters: f64,
+}
+
+/// V2X communication mode preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum V2xCommMode {
+    /// Prefer Uu (network) communication
+    #[default]
+    Uu,
+    /// Prefer PC5 (sidelink) communication
+    Pc5,
+    /// Use both Uu and PC5 (hybrid)
+    Hybrid,
+}
+
+impl Default for V2xConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_types: vec![V2xServiceType::V2V, V2xServiceType::V2I],
+            s_nssai: SNssai {
+                sst: 3, // V2X slice
+                sd: None,
+            },
+            qos_requirements: vec![
+                // Default V2V requirements (critical safety messages)
+                (V2xServiceType::V2V, V2xQosRequirements {
+                    max_latency_ms: 20,
+                    reliability: 0.99,
+                    range_meters: 300.0,
+                    priority: 7,
+                }),
+                // Default V2I requirements
+                (V2xServiceType::V2I, V2xQosRequirements {
+                    max_latency_ms: 50,
+                    reliability: 0.95,
+                    range_meters: 500.0,
+                    priority: 5,
+                }),
+                // Default V2P requirements
+                (V2xServiceType::V2P, V2xQosRequirements {
+                    max_latency_ms: 100,
+                    reliability: 0.95,
+                    range_meters: 200.0,
+                    priority: 6,
+                }),
+                // Default V2N requirements
+                (V2xServiceType::V2N, V2xQosRequirements {
+                    max_latency_ms: 100,
+                    reliability: 0.90,
+                    range_meters: 1000.0,
+                    priority: 4,
+                }),
+            ],
+            geo_area: None,
+            preferred_mode: V2xCommMode::Uu,
+        }
+    }
+}
+
+// ============================================================================
 // Rel-18 Ranging/Sidelink Positioning (TS 23.586)
 // ============================================================================
 
@@ -793,6 +924,9 @@ pub struct UeConfig {
     /// Enhanced `RedCap` configuration (Rel-18 extensions)
     #[serde(default)]
     pub redcap_r18: Option<RedCapR18Config>,
+    /// V2X (Vehicle-to-Everything) configuration (Rel-16, TS 23.287)
+    #[serde(default)]
+    pub v2x_config: Option<V2xConfig>,
 }
 
 impl Default for UeConfig {
@@ -827,6 +961,7 @@ impl Default for UeConfig {
             ranging_config: None,
             mint_config: None,
             redcap_r18: None,
+            v2x_config: None,
         }
     }
 }
