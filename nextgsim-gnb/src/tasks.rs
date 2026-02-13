@@ -150,6 +150,12 @@ pub enum TaskId {
     Agent,
     /// Federated Learning Aggregator task
     FlAggregator,
+
+    // ========================================================================
+    // Rel-18 5G-Advanced tasks
+    // ========================================================================
+    /// Energy Savings - Cell sleep modes and energy efficiency metrics
+    Energy,
 }
 
 impl std::fmt::Display for TaskId {
@@ -167,6 +173,7 @@ impl std::fmt::Display for TaskId {
             TaskId::Isac => write!(f, "ISAC"),
             TaskId::Agent => write!(f, "Agent"),
             TaskId::FlAggregator => write!(f, "FL"),
+            TaskId::Energy => write!(f, "Energy"),
         }
     }
 }
@@ -900,6 +907,49 @@ pub enum FlAggregatorMessage {
 }
 
 // ============================================================================
+// Rel-18 Energy Savings Messages
+// ============================================================================
+
+/// Messages for the Energy Savings task.
+///
+/// Handles cell sleep/dormant modes and energy efficiency metrics.
+#[derive(Debug)]
+pub enum EnergyMessage {
+    /// Put cell into sleep mode
+    CellSleep {
+        /// Cell identifier
+        cell_id: i32,
+        /// Sleep mode: "light", "deep", or "dormant"
+        sleep_mode: String,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Wake up cell from sleep
+    CellWakeUp {
+        /// Cell identifier
+        cell_id: i32,
+        /// Wake-up reason: "paging", "traffic", "timer", "manual"
+        reason: String,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Report traffic volume for energy efficiency calculation
+    TrafficReport {
+        /// Cell identifier
+        cell_id: i32,
+        /// Data volume in bits
+        data_bits: u64,
+        /// Number of connected UEs
+        connected_ues: u32,
+    },
+    /// Get energy efficiency metrics for all cells
+    GetMetrics {
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<Vec<crate::energy::task::CellEnergyReport>>>,
+    },
+}
+
+// ============================================================================
 // Task Handle
 // ============================================================================
 
@@ -978,6 +1028,20 @@ pub struct GnbTaskBase {
     pub sctp_tx: TaskHandle<SctpMessage>,
     /// 6G task handles (initialized via `init_6g_tasks()`)
     pub sixg: Option<GnbSixgHandles>,
+    /// Rel-18 task handles (initialized via `init_rel18_tasks()`)
+    pub rel18: Option<GnbRel18Handles>,
+}
+
+/// Rel-18 5G-Advanced task handles for gNB
+#[derive(Clone)]
+pub struct GnbRel18Handles {
+    /// Handle to the Energy Savings task
+    pub energy_tx: TaskHandle<EnergyMessage>,
+}
+
+/// Rel-18 task receivers for gNB
+pub struct GnbRel18Receivers {
+    pub energy_rx: mpsc::Receiver<TaskMessage<EnergyMessage>>,
 }
 
 /// 6G task handles for gNB (Rel-20 extensions)
@@ -1040,6 +1104,7 @@ impl GnbTaskBase {
             rls_tx: TaskHandle::new(rls_tx),
             sctp_tx: TaskHandle::new(sctp_tx),
             sixg: None,
+            rel18: None,
         };
 
         (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)
@@ -1076,6 +1141,17 @@ impl GnbTaskBase {
         }
     }
 
+    /// Initialize Rel-18 5G-Advanced task handles and return their receivers.
+    pub fn init_rel18_tasks(&mut self, channel_capacity: usize) -> GnbRel18Receivers {
+        let (energy_tx, energy_rx) = mpsc::channel(channel_capacity);
+
+        self.rel18 = Some(GnbRel18Handles {
+            energy_tx: TaskHandle::new(energy_tx),
+        });
+
+        GnbRel18Receivers { energy_rx }
+    }
+
     /// Sends shutdown signals to all tasks.
     pub async fn shutdown_all(&self) {
         // Ignore errors - tasks may already be shut down
@@ -1093,6 +1169,10 @@ impl GnbTaskBase {
             let _ = sixg.isac_tx.shutdown().await;
             let _ = sixg.agent_tx.shutdown().await;
             let _ = sixg.fl_tx.shutdown().await;
+        }
+        // Rel-18 tasks (if initialized)
+        if let Some(ref rel18) = self.rel18 {
+            let _ = rel18.energy_tx.shutdown().await;
         }
     }
 }
@@ -1191,6 +1271,8 @@ impl TaskManager {
             TaskId::Isac,
             TaskId::Agent,
             TaskId::FlAggregator,
+            // Rel-18 5G-Advanced tasks
+            TaskId::Energy,
         ] {
             task_states.insert(
                 task_id,
@@ -1637,10 +1719,11 @@ mod tests {
 
         assert!(!manager.all_tasks_running());
 
-        // Start all tasks (including 6G tasks)
+        // Start all tasks (including 6G + Rel-18 tasks)
         for task_id in [
             TaskId::App, TaskId::Ngap, TaskId::Rrc, TaskId::Gtp, TaskId::Rls, TaskId::Sctp,
             TaskId::She, TaskId::Nwdaf, TaskId::Nkef, TaskId::Isac, TaskId::Agent, TaskId::FlAggregator,
+            TaskId::Energy,
         ] {
             manager.mark_task_started(task_id);
         }
@@ -1668,7 +1751,7 @@ mod tests {
         manager.mark_task_started(TaskId::Ngap);
 
         let summary = manager.status_summary();
-        assert_eq!(summary.len(), 12);
+        assert_eq!(summary.len(), 13);
 
         // Find App and Ngap in summary
         let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);

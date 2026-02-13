@@ -88,6 +88,9 @@ pub mod isac;
 pub mod agent;
 pub mod fl;
 
+// Rel-18 5G-Advanced modules
+pub mod energy;
+
 // Re-export NGAP module types
 pub use ngap::{AmfContextInfo, AmfState, NgapAmfContext, NgapTask, NgapUeContext, UeState};
 
@@ -135,3 +138,6 @@ pub use nkef::NkefTask;
 pub use isac::IsacTask;
 pub use agent::AgentTask;
 pub use fl::FlAggregatorTask;
+
+// Re-export Rel-18 5G-Advanced types
+pub use energy::EnergyTask;

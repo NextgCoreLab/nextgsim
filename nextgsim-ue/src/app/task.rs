@@ -436,6 +436,7 @@ mod tests {
             rrc_tx: TaskHandle::new(rrc_tx),
             rls_tx: TaskHandle::new(rls_tx),
             sixg: None,
+            rel18: None,
         }
     }
 

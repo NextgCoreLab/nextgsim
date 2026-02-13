@@ -37,6 +37,7 @@
 //! ```
 
 pub mod codec;
+pub mod qos;
 pub mod tunnel;
 
 // Re-export main types for convenience
@@ -56,4 +57,9 @@ pub use codec::{
 pub use tunnel::{
     GtpTunnel, PduSession, TunnelError, TunnelManager,
     GTP_U_PORT, get_psi, get_ue_id, make_session_key,
+};
+
+pub use qos::{
+    FiveQiCharacteristics, QosResourceType, QfiDscpMapper, QosFlowEnforcer,
+    FlowStats, TokenBucket, lookup_5qi, default_qfi_to_dscp, standard_5qi_table,
 };
