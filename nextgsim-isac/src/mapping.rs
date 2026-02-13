@@ -129,6 +129,11 @@ impl OccupancyGrid {
             current_time_ms - cell.last_update_ms < max_age_ms
         });
     }
+
+    /// Returns the cell size in meters
+    pub fn cell_size_m(&self) -> f64 {
+        self.cell_size_m
+    }
 }
 
 /// Environment feature (detected landmark or object)
@@ -274,6 +279,11 @@ impl EnvironmentMapper {
         &self.grid
     }
 
+    /// Returns a mutable reference to the occupancy grid
+    pub fn grid_mut(&mut self) -> &mut OccupancyGrid {
+        &mut self.grid
+    }
+
     /// Returns the number of detected features
     pub fn feature_count(&self) -> usize {
         self.features.len()
@@ -293,6 +303,234 @@ impl EnvironmentMapper {
 impl Default for EnvironmentMapper {
     fn default() -> Self {
         Self::new(Vector3::new(0.0, 0.0, 0.0), 1.0)
+    }
+}
+
+// ─── SLAM (Simultaneous Localization And Mapping) ─────────────────────────────
+
+/// 2D pose (x, y, heading) for SLAM
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Pose2D {
+    /// X position (meters)
+    pub x: f64,
+    /// Y position (meters)
+    pub y: f64,
+    /// Heading angle (radians, counter-clockwise from X axis)
+    pub heading: f64,
+}
+
+impl Pose2D {
+    /// Creates a new 2D pose
+    pub fn new(x: f64, y: f64, heading: f64) -> Self {
+        Self { x, y, heading }
+    }
+
+    /// Applies a motion model: move forward then rotate
+    pub fn apply_motion(&self, forward_m: f64, rotation_rad: f64) -> Self {
+        Self {
+            x: self.x + forward_m * self.heading.cos(),
+            y: self.y + forward_m * self.heading.sin(),
+            heading: self.heading + rotation_rad,
+        }
+    }
+
+    /// Distance to another pose
+    pub fn distance_to(&self, other: &Pose2D) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+impl Default for Pose2D {
+    fn default() -> Self {
+        Self::new(0.0, 0.0, 0.0)
+    }
+}
+
+/// Scan observation: set of range measurements at given angles
+#[derive(Debug, Clone)]
+pub struct ScanObservation {
+    /// Angles of each ray (radians)
+    pub angles: Vec<f64>,
+    /// Range measurement for each ray (meters, 0.0 = no return)
+    pub ranges: Vec<f64>,
+    /// Timestamp
+    pub timestamp_ms: u64,
+}
+
+/// SLAM system combining localization with mapping
+///
+/// Implements a simple scan-matching SLAM approach where:
+/// 1. Odometry provides initial pose estimate
+/// 2. Scan matching refines the pose against the current map
+/// 3. Map is updated with the corrected pose and scan data
+#[derive(Debug)]
+pub struct SlamSystem {
+    /// Current estimated pose
+    pub current_pose: Pose2D,
+    /// Pose history
+    pub pose_history: Vec<(u64, Pose2D)>,
+    /// Environment mapper (occupancy grid)
+    pub mapper: EnvironmentMapper,
+    /// Pose uncertainty (meters)
+    pub pose_uncertainty: f64,
+    /// Maximum scan range (meters)
+    max_range_m: f64,
+}
+
+impl SlamSystem {
+    /// Creates a new SLAM system
+    pub fn new(initial_pose: Pose2D, cell_size_m: f64, max_range_m: f64) -> Self {
+        let origin = Vector3::new(
+            initial_pose.x - max_range_m * 2.0,
+            initial_pose.y - max_range_m * 2.0,
+            0.0,
+        );
+        Self {
+            current_pose: initial_pose,
+            pose_history: Vec::new(),
+            mapper: EnvironmentMapper::new(origin, cell_size_m),
+            pose_uncertainty: 1.0,
+            max_range_m,
+        }
+    }
+
+    /// Processes odometry + scan observation to update pose and map
+    pub fn update(
+        &mut self,
+        forward_m: f64,
+        rotation_rad: f64,
+        scan: &ScanObservation,
+    ) {
+        // 1. Predict pose from odometry
+        let predicted_pose = self.current_pose.apply_motion(forward_m, rotation_rad);
+
+        // 2. Scan matching: refine pose against current map
+        let corrected_pose = self.scan_match(&predicted_pose, scan);
+
+        // 3. Update pose
+        self.current_pose = corrected_pose;
+        self.pose_history.push((scan.timestamp_ms, corrected_pose));
+
+        // 4. Update map with corrected pose and scan
+        self.update_map_from_scan(&corrected_pose, scan);
+
+        // 5. Update uncertainty (decreases with good scan matches)
+        let correction_dist = predicted_pose.distance_to(&corrected_pose);
+        self.pose_uncertainty = (self.pose_uncertainty * 0.95 + correction_dist * 0.1).max(0.1);
+    }
+
+    /// Simple scan matching by evaluating map consistency at nearby poses
+    fn scan_match(&self, predicted: &Pose2D, scan: &ScanObservation) -> Pose2D {
+        let mut best_pose = *predicted;
+        let mut best_score = self.evaluate_scan_match(predicted, scan);
+
+        // Search in a small neighborhood around the predicted pose
+        let dx_steps = [-0.2, -0.1, 0.0, 0.1, 0.2];
+        let dy_steps = [-0.2, -0.1, 0.0, 0.1, 0.2];
+        let dh_steps = [-0.05, -0.02, 0.0, 0.02, 0.05];
+
+        for &dx in &dx_steps {
+            for &dy in &dy_steps {
+                for &dh in &dh_steps {
+                    let candidate = Pose2D::new(
+                        predicted.x + dx,
+                        predicted.y + dy,
+                        predicted.heading + dh,
+                    );
+                    let score = self.evaluate_scan_match(&candidate, scan);
+                    if score > best_score {
+                        best_score = score;
+                        best_pose = candidate;
+                    }
+                }
+            }
+        }
+
+        best_pose
+    }
+
+    /// Evaluates how well a scan matches the current map at a given pose
+    fn evaluate_scan_match(&self, pose: &Pose2D, scan: &ScanObservation) -> f64 {
+        let mut score = 0.0;
+        let mut count = 0;
+
+        for (angle, range) in scan.angles.iter().zip(scan.ranges.iter()) {
+            if *range <= 0.0 || *range >= self.max_range_m {
+                continue;
+            }
+
+            let world_angle = pose.heading + angle;
+            let endpoint = Vector3::new(
+                pose.x + range * world_angle.cos(),
+                pose.y + range * world_angle.sin(),
+                0.0,
+            );
+
+            // Check if endpoint matches an occupied cell
+            if let Some(cell) = self.mapper.grid().get_cell(&endpoint) {
+                score += cell.occupancy * cell.confidence;
+            }
+            count += 1;
+        }
+
+        if count > 0 {
+            score / count as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Updates the map using a scan from a given pose
+    fn update_map_from_scan(&mut self, pose: &Pose2D, scan: &ScanObservation) {
+        for (angle, range) in scan.angles.iter().zip(scan.ranges.iter()) {
+            if *range <= 0.0 || *range >= self.max_range_m {
+                continue;
+            }
+
+            let world_angle = pose.heading + angle;
+
+            // Mark cells along the ray as free
+            let num_steps = (*range / self.mapper.grid().cell_size_m).ceil() as usize;
+            for step in 0..num_steps {
+                let t = step as f64 / num_steps as f64;
+                let pos = Vector3::new(
+                    pose.x + range * t * world_angle.cos(),
+                    pose.y + range * t * world_angle.sin(),
+                    0.0,
+                );
+                self.mapper.grid_mut().update_cell(&pos, false, scan.timestamp_ms);
+            }
+
+            // Mark endpoint as occupied
+            let endpoint = Vector3::new(
+                pose.x + range * world_angle.cos(),
+                pose.y + range * world_angle.sin(),
+                0.0,
+            );
+            self.mapper.grid_mut().update_cell(&endpoint, true, scan.timestamp_ms);
+        }
+    }
+
+    /// Returns the current estimated pose
+    pub fn pose(&self) -> &Pose2D {
+        &self.current_pose
+    }
+
+    /// Returns pose uncertainty
+    pub fn uncertainty(&self) -> f64 {
+        self.pose_uncertainty
+    }
+
+    /// Returns pose history length
+    pub fn pose_history_len(&self) -> usize {
+        self.pose_history.len()
+    }
+
+    /// Returns the environment map
+    pub fn map(&self) -> &EnvironmentMapper {
+        &self.mapper
     }
 }
 
@@ -397,5 +635,59 @@ mod tests {
 
         mapper.cleanup(15000, 6000);
         assert_eq!(mapper.feature_count(), 1); // Only recent feature remains
+    }
+
+    // ── SLAM tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pose2d() {
+        let pose = Pose2D::new(0.0, 0.0, 0.0);
+        let moved = pose.apply_motion(1.0, 0.0);
+        assert!((moved.x - 1.0).abs() < 0.01);
+        assert!(moved.y.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pose2d_rotation() {
+        let pose = Pose2D::new(0.0, 0.0, std::f64::consts::FRAC_PI_2);
+        let moved = pose.apply_motion(1.0, 0.0);
+        assert!(moved.x.abs() < 0.01);
+        assert!((moved.y - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_slam_creation() {
+        let slam = SlamSystem::new(Pose2D::default(), 0.5, 50.0);
+        assert!((slam.pose().x).abs() < 0.01);
+        assert_eq!(slam.pose_history_len(), 0);
+    }
+
+    #[test]
+    fn test_slam_update() {
+        let mut slam = SlamSystem::new(Pose2D::default(), 0.5, 50.0);
+
+        let scan = ScanObservation {
+            angles: vec![0.0, std::f64::consts::FRAC_PI_2],
+            ranges: vec![5.0, 10.0],
+            timestamp_ms: 1000,
+        };
+
+        slam.update(1.0, 0.0, &scan);
+        assert_eq!(slam.pose_history_len(), 1);
+        assert!(slam.pose().x > 0.0); // Should have moved forward
+    }
+
+    #[test]
+    fn test_slam_map_update() {
+        let mut slam = SlamSystem::new(Pose2D::default(), 1.0, 50.0);
+
+        let scan = ScanObservation {
+            angles: vec![0.0],
+            ranges: vec![5.0],
+            timestamp_ms: 1000,
+        };
+
+        slam.update(0.0, 0.0, &scan);
+        assert!(slam.map().grid().cell_count() > 0);
     }
 }

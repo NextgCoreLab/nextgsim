@@ -78,6 +78,7 @@ pub mod coordination;
 pub mod data_collection;
 pub mod dccf;
 pub mod error;
+pub mod federation;
 pub mod llm_analytics;
 pub mod ml_training;
 pub mod model_transfer;
@@ -107,6 +108,11 @@ pub use dccf::{
 };
 pub use error::{
     AnalyticsError, DataCollectionError, NwdafError, PredictionError, SubscriptionError,
+};
+pub use federation::{
+    AggregatedFederationResult, AreaFilter, ConsentType, DataFederationManager,
+    FederatedAggregationMethod, FederatedAnalyticsResult, FederationPeer, FederationRequest,
+    FederationResponse, PlmnId, PrivacyPolicy, TrustLevel,
 };
 pub use llm_analytics::{LlmAnalyticsEngine, LlmAnalyticsQuery, LlmAnalyticsResponse};
 pub use ml_training::{

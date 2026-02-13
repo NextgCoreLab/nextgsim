@@ -58,8 +58,14 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 // Re-export modules
-pub use mapping::{EnvironmentFeature, EnvironmentMapper, FeatureType, MapCell, OccupancyGrid};
-pub use ml_sensing::{MlModelType, MlPositioningEngine, MlPositioningResult, TrajectoryPredictor};
+pub use mapping::{
+    EnvironmentFeature, EnvironmentMapper, FeatureType, MapCell, OccupancyGrid, Pose2D,
+    ScanObservation, SlamSystem,
+};
+pub use ml_sensing::{
+    AiDetectionResult, AiSensingEngine, MlModelType, MlPositioningEngine, MlPositioningResult,
+    TargetClass, TrajectoryPredictor,
+};
 pub use saas::{
     GeographicArea, SensingApiRequest, SensingApiResponse, SensingAsAService, SensingQos,
     SensingResult, SensingServiceType, SensingSubscription,
@@ -69,7 +75,8 @@ pub use she_integration::{
     SensingWorkloadRequest, SensingWorkloadResult, SheIsacClient,
 };
 pub use waveform::{
-    BistaticGeometry, CfarDetection, CfarDetector, ClutterModel, OfdmRadarWaveform,
+    BistaticGeometry, CfarDetection, CfarDetector, ClutterModel, JointWaveformDesign,
+    JointWaveformMetrics, MultstaticNetwork, MultstaticNode, OfdmRadarWaveform,
 };
 
 /// Speed of light in m/s.

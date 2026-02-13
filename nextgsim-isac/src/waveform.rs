@@ -426,6 +426,334 @@ impl BistaticGeometry {
     }
 }
 
+// ─── Joint Communication-Sensing Waveform Design ──────────────────────────────
+
+/// Performance metrics for joint sensing-communication waveform
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointWaveformMetrics {
+    /// Range resolution (meters)
+    pub range_resolution_m: f64,
+    /// Maximum unambiguous range (meters)
+    pub max_range_m: f64,
+    /// Velocity resolution (m/s)
+    pub velocity_resolution_ms: f64,
+    /// Maximum unambiguous velocity (m/s)
+    pub max_velocity_ms: f64,
+    /// Communication spectral efficiency (bps/Hz)
+    pub comm_spectral_efficiency: f64,
+    /// Sensing SNR (dB) for given communication SNR
+    pub sensing_snr_db: f64,
+}
+
+/// Joint communication-sensing OFDM waveform design
+///
+/// Optimizes power allocation between sensing and communication subcarriers
+/// to maximize both radar detection performance and data throughput.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointWaveformDesign {
+    /// Carrier frequency (Hz)
+    pub carrier_freq_hz: f64,
+    /// Total bandwidth (Hz)
+    pub bandwidth_hz: f64,
+    /// Number of subcarriers
+    pub num_subcarriers: usize,
+    /// Number of OFDM symbols per frame
+    pub num_symbols: usize,
+    /// Subcarrier spacing (Hz)
+    pub subcarrier_spacing_hz: f64,
+    /// Fraction of total power allocated to sensing (0..1)
+    pub sensing_power_fraction: f64,
+    /// Sensing subcarrier allocation pattern (true = sensing, false = comm)
+    pub subcarrier_allocation: Vec<bool>,
+}
+
+impl JointWaveformDesign {
+    /// Creates a new joint waveform design with default even allocation
+    pub fn new(
+        carrier_freq_hz: f64,
+        bandwidth_hz: f64,
+        num_subcarriers: usize,
+        num_symbols: usize,
+    ) -> Self {
+        let subcarrier_spacing_hz = bandwidth_hz / num_subcarriers as f64;
+
+        // Default: interleaved allocation (every 4th subcarrier for sensing)
+        let subcarrier_allocation: Vec<bool> = (0..num_subcarriers)
+            .map(|i| i % 4 == 0)
+            .collect();
+
+        let sensing_count = subcarrier_allocation.iter().filter(|&&s| s).count();
+        let sensing_power_fraction = sensing_count as f64 / num_subcarriers as f64;
+
+        Self {
+            carrier_freq_hz,
+            bandwidth_hz,
+            num_subcarriers,
+            num_symbols,
+            subcarrier_spacing_hz,
+            sensing_power_fraction,
+            subcarrier_allocation,
+        }
+    }
+
+    /// Optimizes power allocation between sensing and communication
+    ///
+    /// `target_snr_db` - minimum required communication SNR
+    /// `sensing_priority` - 0.0 (comm-only) to 1.0 (sensing-only)
+    pub fn optimize_power_allocation(
+        &mut self,
+        target_snr_db: f64,
+        sensing_priority: f64,
+    ) {
+        let priority = sensing_priority.clamp(0.0, 1.0);
+
+        // Water-filling inspired allocation:
+        // Higher comm SNR requirement -> less power for sensing
+        let snr_factor = 1.0 / (1.0 + 10.0_f64.powf(target_snr_db / 10.0));
+        self.sensing_power_fraction = (priority * 0.5 + snr_factor * 0.3).clamp(0.05, 0.5);
+
+        // Update subcarrier allocation based on power fraction
+        let sensing_count = (self.num_subcarriers as f64 * self.sensing_power_fraction) as usize;
+        self.subcarrier_allocation = vec![false; self.num_subcarriers];
+
+        // Distribute sensing subcarriers evenly across bandwidth
+        if sensing_count > 0 {
+            let step = self.num_subcarriers / sensing_count;
+            for i in 0..sensing_count {
+                let idx = (i * step).min(self.num_subcarriers - 1);
+                self.subcarrier_allocation[idx] = true;
+            }
+        }
+    }
+
+    /// Computes the ambiguity function value at (delay, doppler)
+    ///
+    /// The ambiguity function characterizes the waveform's ability to resolve
+    /// targets in range and velocity simultaneously.
+    pub fn ambiguity_function(&self, delay_s: f64, doppler_hz: f64) -> f64 {
+        let sensing_indices: Vec<usize> = self.subcarrier_allocation
+            .iter()
+            .enumerate()
+            .filter(|(_, &s)| s)
+            .map(|(i, _)| i)
+            .collect();
+
+        if sensing_indices.is_empty() {
+            return 0.0;
+        }
+
+        let n = sensing_indices.len() as f64;
+        let mut real_sum = 0.0;
+        let mut imag_sum = 0.0;
+
+        for &k in &sensing_indices {
+            let freq = k as f64 * self.subcarrier_spacing_hz;
+            let phase = 2.0 * std::f64::consts::PI
+                * (freq * delay_s + doppler_hz * k as f64 / (self.num_subcarriers as f64 * self.subcarrier_spacing_hz));
+            real_sum += phase.cos();
+            imag_sum += phase.sin();
+        }
+
+        (real_sum * real_sum + imag_sum * imag_sum).sqrt() / n
+    }
+
+    /// Computes performance metrics for the current waveform configuration
+    pub fn performance_metrics(&self, comm_snr_db: f64) -> JointWaveformMetrics {
+        let c = 299_792_458.0;
+        let lambda = c / self.carrier_freq_hz;
+
+        let sensing_bw = self.bandwidth_hz * self.sensing_power_fraction;
+        let comm_bw = self.bandwidth_hz * (1.0 - self.sensing_power_fraction);
+
+        let symbol_duration = 1.0 / self.subcarrier_spacing_hz;
+        let frame_duration = symbol_duration * self.num_symbols as f64;
+
+        JointWaveformMetrics {
+            range_resolution_m: c / (2.0 * sensing_bw),
+            max_range_m: c * symbol_duration / 2.0,
+            velocity_resolution_ms: lambda / (2.0 * frame_duration),
+            max_velocity_ms: lambda * self.subcarrier_spacing_hz / 4.0,
+            comm_spectral_efficiency: (1.0 + 10.0_f64.powf(comm_snr_db / 10.0) * comm_bw / self.bandwidth_hz).log2(),
+            sensing_snr_db: comm_snr_db + 10.0 * self.sensing_power_fraction.log10(),
+        }
+    }
+}
+
+// ─── Multistatic Sensing Network ──────────────────────────────────────────────
+
+/// A node in a multistatic sensing network (can be TX, RX, or both)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultstaticNode {
+    /// Node position [x, y, z] in meters
+    pub position: [f64; 3],
+    /// Whether this node can transmit
+    pub is_transmitter: bool,
+    /// Whether this node can receive
+    pub is_receiver: bool,
+}
+
+/// Multistatic sensing network with multiple TX/RX points
+///
+/// Enables multi-geometry sensing using combinations of transmitters
+/// and receivers for improved target detection and localization.
+#[derive(Debug, Clone)]
+pub struct MultstaticNetwork {
+    /// Nodes in the network
+    pub nodes: Vec<MultstaticNode>,
+    /// Carrier frequency (Hz)
+    pub carrier_freq_hz: f64,
+}
+
+impl MultstaticNetwork {
+    /// Creates a new empty multistatic network
+    pub fn new(carrier_freq_hz: f64) -> Self {
+        Self {
+            nodes: Vec::new(),
+            carrier_freq_hz,
+        }
+    }
+
+    /// Adds a node to the network
+    pub fn add_node(&mut self, position: [f64; 3], is_transmitter: bool, is_receiver: bool) {
+        self.nodes.push(MultstaticNode {
+            position,
+            is_transmitter,
+            is_receiver,
+        });
+    }
+
+    /// Returns all valid bistatic TX-RX pairs
+    pub fn bistatic_pairs(&self) -> Vec<BistaticGeometry> {
+        let mut pairs = Vec::new();
+        for (i, tx) in self.nodes.iter().enumerate() {
+            if !tx.is_transmitter {
+                continue;
+            }
+            for (j, rx) in self.nodes.iter().enumerate() {
+                if i == j || !rx.is_receiver {
+                    continue;
+                }
+                pairs.push(BistaticGeometry::new(
+                    tx.position,
+                    rx.position,
+                    self.carrier_freq_hz,
+                ));
+            }
+        }
+        pairs
+    }
+
+    /// Locates a target using bistatic range measurements from all pairs
+    ///
+    /// Uses least-squares minimization of bistatic range residuals.
+    /// Returns the estimated target position or None if insufficient geometry.
+    pub fn locate_target(&self, true_target: &[f64; 3]) -> Option<[f64; 3]> {
+        let pairs = self.bistatic_pairs();
+        if pairs.len() < 2 {
+            return None;
+        }
+
+        // Compute bistatic ranges as "measurements"
+        let measured_ranges: Vec<f64> = pairs
+            .iter()
+            .map(|bg| bg.bistatic_range(true_target))
+            .collect();
+
+        // Initial guess: centroid of all nodes
+        let n = self.nodes.len() as f64;
+        let mut x = [0.0; 3];
+        for node in &self.nodes {
+            x[0] += node.position[0] / n;
+            x[1] += node.position[1] / n;
+            x[2] += node.position[2] / n;
+        }
+
+        // Gauss-Newton iteration on bistatic range residuals
+        for _ in 0..50 {
+            let mut jtj = [[0.0f64; 3]; 3];
+            let mut jtr = [0.0f64; 3];
+
+            for (k, bg) in pairs.iter().enumerate() {
+                let pred = bg.bistatic_range(&x);
+                let residual = pred - measured_ranges[k];
+
+                // Jacobian of bistatic range w.r.t. target position
+                let d_tx = BistaticGeometry::distance(&bg.tx_position, &x).max(1e-12);
+                let d_rx = BistaticGeometry::distance(&bg.rx_position, &x).max(1e-12);
+
+                let jac = [
+                    (x[0] - bg.tx_position[0]) / d_tx + (x[0] - bg.rx_position[0]) / d_rx,
+                    (x[1] - bg.tx_position[1]) / d_tx + (x[1] - bg.rx_position[1]) / d_rx,
+                    (x[2] - bg.tx_position[2]) / d_tx + (x[2] - bg.rx_position[2]) / d_rx,
+                ];
+
+                for i in 0..3 {
+                    for j in 0..3 {
+                        jtj[i][j] += jac[i] * jac[j];
+                    }
+                    jtr[i] += jac[i] * residual;
+                }
+            }
+
+            // Add damping
+            for (i, row) in jtj.iter_mut().enumerate() {
+                row[i] += 1e-6;
+            }
+
+            // Solve 3x3 system
+            let det = jtj[0][0] * (jtj[1][1] * jtj[2][2] - jtj[1][2] * jtj[2][1])
+                - jtj[0][1] * (jtj[1][0] * jtj[2][2] - jtj[1][2] * jtj[2][0])
+                + jtj[0][2] * (jtj[1][0] * jtj[2][1] - jtj[1][1] * jtj[2][0]);
+
+            if det.abs() < 1e-30 {
+                break;
+            }
+
+            let inv_det = 1.0 / det;
+            let delta = [
+                inv_det * ((jtj[1][1] * jtj[2][2] - jtj[1][2] * jtj[2][1]) * jtr[0]
+                    + (jtj[0][2] * jtj[2][1] - jtj[0][1] * jtj[2][2]) * jtr[1]
+                    + (jtj[0][1] * jtj[1][2] - jtj[0][2] * jtj[1][1]) * jtr[2]),
+                inv_det * ((jtj[1][2] * jtj[2][0] - jtj[1][0] * jtj[2][2]) * jtr[0]
+                    + (jtj[0][0] * jtj[2][2] - jtj[0][2] * jtj[2][0]) * jtr[1]
+                    + (jtj[0][2] * jtj[1][0] - jtj[0][0] * jtj[1][2]) * jtr[2]),
+                inv_det * ((jtj[1][0] * jtj[2][1] - jtj[1][1] * jtj[2][0]) * jtr[0]
+                    + (jtj[0][1] * jtj[2][0] - jtj[0][0] * jtj[2][1]) * jtr[1]
+                    + (jtj[0][0] * jtj[1][1] - jtj[0][1] * jtj[1][0]) * jtr[2]),
+            ];
+
+            x[0] -= delta[0];
+            x[1] -= delta[1];
+            x[2] -= delta[2];
+
+            let step = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            if step < 1e-6 {
+                break;
+            }
+        }
+
+        Some(x)
+    }
+
+    /// Computes the spatial diversity gain from multiple bistatic pairs
+    ///
+    /// More diverse geometries yield better target localization.
+    pub fn diversity_gain(&self) -> f64 {
+        let pairs = self.bistatic_pairs();
+        if pairs.is_empty() {
+            return 0.0;
+        }
+
+        // Diversity gain proportional to sqrt(number of independent pairs)
+        (pairs.len() as f64).sqrt()
+    }
+
+    /// Returns the number of nodes
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +977,76 @@ mod tests {
         let target = [1000.0, 0.0, 0.0];
         let angle = bg.bistatic_angle(&target);
         assert!(angle < 0.15); // Small angle
+    }
+
+    // ── Joint Waveform Design tests ──────────────────────────────────────
+
+    #[test]
+    fn test_joint_waveform_creation() {
+        let jw = JointWaveformDesign::new(3.5e9, 100e6, 1200, 14);
+        assert_eq!(jw.num_subcarriers, 1200);
+        assert_eq!(jw.num_symbols, 14);
+        assert!(jw.sensing_power_fraction > 0.0);
+    }
+
+    #[test]
+    fn test_joint_waveform_optimize() {
+        let mut jw = JointWaveformDesign::new(3.5e9, 100e6, 1200, 14);
+        jw.optimize_power_allocation(20.0, 0.5);
+        assert!(jw.sensing_power_fraction > 0.0);
+        assert!(jw.sensing_power_fraction <= 1.0);
+    }
+
+    #[test]
+    fn test_joint_waveform_ambiguity() {
+        let jw = JointWaveformDesign::new(3.5e9, 100e6, 1200, 14);
+        let amb = jw.ambiguity_function(0.0, 0.0);
+        assert!((amb - 1.0).abs() < 0.01); // Peak at (0,0) should be ~1
+    }
+
+    #[test]
+    fn test_joint_waveform_metrics() {
+        let jw = JointWaveformDesign::new(3.5e9, 100e6, 1200, 14);
+        let metrics = jw.performance_metrics(20.0);
+        assert!(metrics.range_resolution_m > 0.0);
+        assert!(metrics.max_range_m > 0.0);
+        assert!(metrics.comm_spectral_efficiency > 0.0);
+    }
+
+    // ── Multistatic Network tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_multistatic_network() {
+        let mut net = MultstaticNetwork::new(3.5e9);
+        net.add_node([0.0, 0.0, 0.0], true, true);
+        net.add_node([100.0, 0.0, 0.0], true, true);
+        net.add_node([50.0, 100.0, 0.0], false, true);
+
+        let pairs = net.bistatic_pairs();
+        assert!(!pairs.is_empty());
+    }
+
+    #[test]
+    fn test_multistatic_locate() {
+        let mut net = MultstaticNetwork::new(3.5e9);
+        net.add_node([0.0, 0.0, 0.0], true, true);
+        net.add_node([100.0, 0.0, 0.0], true, true);
+        net.add_node([50.0, 100.0, 0.0], true, true);
+
+        let target = [50.0, 50.0, 0.0];
+        let result = net.locate_target(&target);
+        assert!(result.is_some());
+        let pos = result.unwrap();
+        assert!((pos[0] - 50.0).abs() < 5.0);
+        assert!((pos[1] - 50.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn test_multistatic_diversity_gain() {
+        let mut net = MultstaticNetwork::new(3.5e9);
+        net.add_node([0.0, 0.0, 0.0], true, true);
+        net.add_node([100.0, 0.0, 0.0], true, true);
+        let gain = net.diversity_gain();
+        assert!(gain >= 1.0);
     }
 }
