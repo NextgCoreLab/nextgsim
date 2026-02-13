@@ -84,6 +84,8 @@ pub use handover::{
     GnbHandoverManager, HandoverCommand, HandoverConfig, HandoverDecision,
     MeasurementReport, NeighborMeasurement, UeHandoverState,
     parse_measurement_report,
+    XnHandoverRequest, XnHandoverAcknowledge, XnHandoverCause,
+    XnUeContext, XnPduSessionContext, PathSwitchRequest,
 };
 pub use task::RrcTask;
 pub use ue_context::{RrcState, RrcUeContext, RrcUeContextManager};

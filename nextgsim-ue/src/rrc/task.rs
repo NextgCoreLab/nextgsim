@@ -24,11 +24,41 @@ use crate::rrc::handover::{
 use crate::rrc::measurement::{MeasConfig, MeasurementManager, ReportTriggerType, MeasEventType, ReportTriggerConfig};
 use crate::rrc::state::{RrcState, RrcStateMachine};
 use crate::tasks::{
-    NasMessage, RlsMessage, RlfCause, RrcMessage, Task, TaskMessage, UeTaskBase,
+    IsacSensorMessage, IsacMeasurementType, NasMessage, RlsMessage, RlfCause, RrcMessage,
+    SemanticCodecMessage, SemanticTaskType, SheClientMessage, Task, TaskMessage, UeTaskBase,
 };
 use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
+use nextgsim_rrc::procedures::rrc_setup::{
+    encode_rrc_setup_request, encode_rrc_setup_complete,
+    RrcSetupRequestParams, RrcSetupCompleteParams,
+    RrcEstablishmentCause as AsnEstablishmentCause,
+    UeIdentity,
+};
+
+/// UAC barring configuration per 3GPP TS 38.331
+/// Represents the uac-BarringInfoSetList from SIB1
+#[derive(Debug, Clone)]
+pub struct UacBarringConfig {
+    /// Barring factor (0..95 in steps of 5, percent probability of being barred)
+    /// 0 means no barring, 95 means 95% of attempts are barred
+    pub barring_factor_percent: u8,
+    /// Barring time in seconds (range: 5, 10, 20, 30, 60, 120, 240, 512)
+    pub barring_time_secs: u16,
+    /// Bitmask of access categories subject to barring (bit 0 = category 0, etc.)
+    pub barring_for_access_category: u32,
+}
+
+impl Default for UacBarringConfig {
+    fn default() -> Self {
+        Self {
+            barring_factor_percent: 0,
+            barring_time_secs: 5,
+            barring_for_access_category: 0,
+        }
+    }
+}
 
 /// RRC cycle interval in milliseconds
 const RRC_CYCLE_INTERVAL_MS: u64 = 2500;
@@ -68,6 +98,8 @@ pub struct RrcTask {
     last_cell_selection: Option<Instant>,
     /// NTN timing advance state (if operating via satellite)
     ntn_timing: Option<UeNtnTiming>,
+    /// UAC barring configuration from SIB1
+    uac_barring: UacBarringConfig,
 }
 
 impl RrcTask {
@@ -91,6 +123,7 @@ impl RrcTask {
             establishment_cause: 3, // mo-Data
             last_cell_selection: None,
             ntn_timing: None,
+            uac_barring: UacBarringConfig::default(),
         }
     }
 
@@ -476,18 +509,36 @@ impl RrcTask {
         }
     }
 
-    /// Send RRC Setup Complete message
+    /// Send RRC Setup Complete message using proper ASN.1 UPER encoding
     async fn send_rrc_setup_complete(&mut self) {
         let nas_pdu = self.initial_nas_pdu.take().unwrap_or_default();
+        let nas_data = nas_pdu.data().to_vec();
 
-        // Build simplified RRC Setup Complete
-        let mut rrc_pdu = Vec::with_capacity(nas_pdu.len() + 3);
-        rrc_pdu.push(0x04); // RRCSetupComplete message type
-        rrc_pdu.push(0x00); // Transaction ID
-        rrc_pdu.push(0x01); // Selected PLMN Identity = 1
-        rrc_pdu.extend_from_slice(nas_pdu.data());
+        let params = RrcSetupCompleteParams {
+            rrc_transaction_id: 0,
+            selected_plmn_identity: 1,
+            guami_type: None,
+            s_nssai_list: None,
+            dedicated_nas_message: nas_data.clone(),
+            ng_5g_s_tmsi_value: None,
+        };
 
-        let pdu = OctetString::from_slice(&rrc_pdu);
+        let pdu = match encode_rrc_setup_complete(&params) {
+            Ok(bytes) => {
+                debug!("ASN.1 RRCSetupComplete encoded: {} bytes", bytes.len());
+                OctetString::from_slice(&bytes)
+            }
+            Err(e) => {
+                warn!("ASN.1 RRCSetupComplete encoding failed ({}), using fallback", e);
+                let mut rrc_pdu = Vec::with_capacity(nas_data.len() + 3);
+                rrc_pdu.push(0x04);
+                rrc_pdu.push(0x00);
+                rrc_pdu.push(0x01);
+                rrc_pdu.extend_from_slice(&nas_data);
+                OctetString::from_slice(&rrc_pdu)
+            }
+        };
+
         self.send_uplink_rrc(RrcChannel::UlDcch, pdu).await;
     }
 
@@ -648,7 +699,7 @@ impl RrcTask {
         }
     }
 
-    /// Start RRC connection establishment
+    /// Start RRC connection establishment using proper ASN.1 UPER encoding
     async fn start_connection_establishment(&mut self, _nas_pdu: OctetString) {
         if self.state_machine.state() != RrcState::Idle {
             warn!("Cannot start connection establishment: not in idle state");
@@ -664,16 +715,41 @@ impl RrcTask {
 
         info!("Starting RRC connection establishment");
 
-        // Build simplified RRC Setup Request
-        // Format: [msg_type, initial_ue_id (5 bytes), establishment_cause]
-        let mut rrc_pdu = Vec::with_capacity(8);
-        rrc_pdu.push(0x00); // RRCSetupRequest message type + random value indicator
-        // 5-byte random Initial UE Identity
         let random_id: u64 = rand::random::<u64>() & 0x7FFFFFFFFF; // 39-bit value
-        rrc_pdu.extend_from_slice(&random_id.to_be_bytes()[3..8]);
-        rrc_pdu.push(self.establishment_cause as u8);
 
-        let pdu = OctetString::from_slice(&rrc_pdu);
+        let establishment_cause = match self.establishment_cause {
+            0 => AsnEstablishmentCause::Emergency,
+            1 => AsnEstablishmentCause::HighPriorityAccess,
+            2 => AsnEstablishmentCause::MtAccess,
+            3 => AsnEstablishmentCause::MoSignalling,
+            5 => AsnEstablishmentCause::MoVoiceCall,
+            6 => AsnEstablishmentCause::MoVideoCall,
+            7 => AsnEstablishmentCause::MoSms,
+            8 => AsnEstablishmentCause::MpsPriorityAccess,
+            9 => AsnEstablishmentCause::McsPriorityAccess,
+            _ => AsnEstablishmentCause::MoData, // 4 or default
+        };
+
+        let params = RrcSetupRequestParams {
+            ue_identity: UeIdentity::RandomValue(random_id),
+            establishment_cause,
+        };
+
+        let pdu = match encode_rrc_setup_request(&params) {
+            Ok(bytes) => {
+                debug!("ASN.1 RRCSetupRequest encoded: {} bytes, random_id={:x}", bytes.len(), random_id);
+                OctetString::from_slice(&bytes)
+            }
+            Err(e) => {
+                warn!("ASN.1 RRCSetupRequest encoding failed ({}), using fallback", e);
+                let mut rrc_pdu = Vec::with_capacity(8);
+                rrc_pdu.push(0x00);
+                rrc_pdu.extend_from_slice(&random_id.to_be_bytes()[3..8]);
+                rrc_pdu.push(self.establishment_cause as u8);
+                OctetString::from_slice(&rrc_pdu)
+            }
+        };
+
         self.send_uplink_rrc(RrcChannel::UlCcch, pdu).await;
     }
 
@@ -703,6 +779,51 @@ impl RrcTask {
         }
     }
 
+    /// Perform Unified Access Control check per 3GPP TS 38.331 Section 5.3.14
+    ///
+    /// Returns true if access is allowed, false if barred.
+    fn perform_uac_check(&self, access_category: i32, access_identities: u32) -> bool {
+        // Access categories 0 (MT access) and 2 (emergency) are never barred
+        if access_category == 0 || access_category == 2 {
+            return true;
+        }
+
+        // Check if access identities indicate high-priority (bit 0 = priority access)
+        // Access identity 0 is always allowed per TS 38.331
+        if access_identities & 0x01 != 0 {
+            return true;
+        }
+
+        // Check if this access category is subject to barring
+        if access_category >= 0 && (access_category as u32) < 32 {
+            let category_mask = 1u32 << (access_category as u32);
+            if self.uac_barring.barring_for_access_category & category_mask == 0 {
+                // This category is not subject to barring
+                return true;
+            }
+        }
+
+        // Apply barring factor check
+        if self.uac_barring.barring_factor_percent == 0 {
+            return true; // No barring configured
+        }
+
+        // Generate random number 0..99 and compare against barring factor
+        let random: u8 = rand::random::<u8>() % 100;
+        let allowed = random >= self.uac_barring.barring_factor_percent;
+
+        if !allowed {
+            info!(
+                "UAC barred: category={}, identities={:#x}, factor={}%, barring_time={}s",
+                access_category, access_identities,
+                self.uac_barring.barring_factor_percent,
+                self.uac_barring.barring_time_secs
+            );
+        }
+
+        allowed
+    }
+
     /// Handle local release connection request from NAS
     async fn handle_local_release_connection(&mut self, _treat_barred: bool) {
         info!("Local release connection requested");
@@ -721,6 +842,80 @@ impl RrcTask {
     async fn send_uplink_rrc(&mut self, channel: RrcChannel, pdu: OctetString) {
         let pdu_id = self.next_pdu_id();
         self.send_uplink_rrc_with_id(channel, pdu_id, pdu).await;
+    }
+
+    /// Route AI/ML inference request to SHE Client task
+    async fn route_6g_inference(&self, model_id: String, input_data: Vec<f32>) {
+        if let Some(ref sixg) = self.task_base.sixg {
+            let msg = SheClientMessage::InferenceRequest {
+                model_id,
+                input: input_data,
+                input_shape: vec![],
+                deadline_ms: 0,
+                response_tx: None,
+            };
+            if let Err(e) = sixg.she_client_tx.send(msg).await {
+                error!("Failed to route inference to SHE Client: {}", e);
+            }
+        } else {
+            warn!("6G tasks not initialized, dropping inference request");
+        }
+    }
+
+    /// Route sensing measurement to ISAC Sensor task
+    async fn route_6g_sensing(&self, measurement_type: String, measurements: Vec<f32>) {
+        if let Some(ref sixg) = self.task_base.sixg {
+            let meas_type = match measurement_type.as_str() {
+                "toa" | "ToA" => IsacMeasurementType::ToA,
+                "aoa" | "AoA" => IsacMeasurementType::AoA,
+                "doppler" | "Doppler" => IsacMeasurementType::Doppler,
+                "csi" | "CSI" => IsacMeasurementType::Csi,
+                _ => IsacMeasurementType::MultiPath,
+            };
+            let msg = IsacSensorMessage::SensingMeasurement {
+                measurement_type: meas_type,
+                data: measurements,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            if let Err(e) = sixg.isac_sensor_tx.send(msg).await {
+                error!("Failed to route sensing data to ISAC: {}", e);
+            }
+        } else {
+            warn!("6G tasks not initialized, dropping sensing measurement");
+        }
+    }
+
+    /// Route semantic communication data to Semantic Codec task
+    async fn route_6g_semantic(&self, content_type: String, data: Vec<u8>) {
+        if let Some(ref sixg) = self.task_base.sixg {
+            let task_type = match content_type.as_str() {
+                "image" => SemanticTaskType::ImageClassification,
+                "object" => SemanticTaskType::ObjectDetection,
+                "speech" => SemanticTaskType::SpeechRecognition,
+                "sensor" => SemanticTaskType::SensorFusion,
+                "video" => SemanticTaskType::VideoAnalytics,
+                "text" => SemanticTaskType::TextUnderstanding,
+                _ => SemanticTaskType::Custom(0),
+            };
+            // Convert raw bytes to f32 features for the codec
+            let features: Vec<f32> = data.iter().map(|&b| b as f32 / 255.0).collect();
+            let dims = vec![features.len()];
+            let msg = SemanticCodecMessage::Encode {
+                task_type,
+                data: features,
+                dimensions: dims,
+                channel_quality: None,
+                response_tx: None,
+            };
+            if let Err(e) = sixg.semantic_codec_tx.send(msg).await {
+                error!("Failed to route semantic data to codec: {}", e);
+            }
+        } else {
+            warn!("6G tasks not initialized, dropping semantic data");
+        }
     }
 
     /// Send uplink RRC message with specific PDU ID
@@ -756,8 +951,14 @@ impl Task for RrcTask {
                                 debug!("RRC notify received");
                             }
                             RrcMessage::PerformUac { access_category, access_identities } => {
-                                debug!("UAC check: category={}, identities={}", access_category, access_identities);
-                                // For now, always allow access
+                                let allowed = self.perform_uac_check(access_category, access_identities);
+                                debug!("UAC check: category={}, identities={}, allowed={}", access_category, access_identities, allowed);
+                                if !allowed {
+                                    // Notify NAS that access is barred
+                                    if let Err(e) = self.task_base.nas_tx.send(NasMessage::RrcEstablishmentFailure).await {
+                                        error!("Failed to notify NAS of UAC barring: {}", e);
+                                    }
+                                }
                             }
                             RrcMessage::DownlinkRrcDelivery { cell_id, channel, pdu } => {
                                 self.handle_downlink_rrc(cell_id, channel, pdu).await;
@@ -784,6 +985,16 @@ impl Task for RrcTask {
                                     autonomous_ta,
                                     max_doppler_hz,
                                 });
+                            }
+                            // 6G message routing
+                            RrcMessage::SixgInferenceRequest { model_id, input_data } => {
+                                self.route_6g_inference(model_id, input_data).await;
+                            }
+                            RrcMessage::SixgSensingMeasurement { measurement_type, measurements } => {
+                                self.route_6g_sensing(measurement_type, measurements).await;
+                            }
+                            RrcMessage::SixgSemanticData { content_type, data } => {
+                                self.route_6g_semantic(content_type, data).await;
                             }
                         },
                         TaskMessage::Shutdown => {

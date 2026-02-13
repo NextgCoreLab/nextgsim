@@ -1192,6 +1192,16 @@ impl UeApp {
                         RrcMessage::NtnTimingAdvanceReceived { common_ta_us, k_offset, .. } => {
                             info!("UE: NTN TA={}us, k_offset={}", common_ta_us, k_offset);
                         }
+                        // 6G message routing - log and drop in main binary (handled by lib RrcTask)
+                        RrcMessage::SixgInferenceRequest { model_id, .. } => {
+                            debug!("6G inference request for model {}, not handled in main binary", model_id);
+                        }
+                        RrcMessage::SixgSensingMeasurement { measurement_type, .. } => {
+                            debug!("6G sensing measurement type {}, not handled in main binary", measurement_type);
+                        }
+                        RrcMessage::SixgSemanticData { content_type, .. } => {
+                            debug!("6G semantic data type {}, not handled in main binary", content_type);
+                        }
                     }
                 }
                 Some(TaskMessage::Shutdown) => {

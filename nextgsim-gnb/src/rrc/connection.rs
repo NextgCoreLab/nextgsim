@@ -10,6 +10,10 @@ use tracing::{debug, info, warn};
 
 use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
+use nextgsim_rrc::procedures::{
+    rrc_release::{encode_rrc_release, RrcReleaseParams},
+    rrc_setup::{encode_rrc_setup, RrcSetupParams},
+};
 
 use crate::tasks::GutiMobileIdentity;
 use super::ue_context::RrcUeContextManager;
@@ -397,33 +401,37 @@ impl RrcConnectionManager {
         })
     }
 
-    /// Builds an RRC Reestablishment message (simplified)
+    /// Builds an RRC Reestablishment message
+    ///
+    /// Note: The RRC procedures module provides UE-side RRCReestablishmentRequest
+    /// and RRCReestablishmentComplete. The gNB-side RRCReestablishment (DL-CCCH)
+    /// uses a simplified encoding since the ASN.1 gNB-side builder requires
+    /// nextHopChainingCount from security context which is not yet wired.
     fn build_rrc_reestablishment(&self, transaction_id: u8) -> OctetString {
         let mut pdu = Vec::with_capacity(16);
-
         // DL-CCCH-Message with RRCReestablishment
         pdu.push(0x24); // c1 choice = rrcReestablishment
-        pdu.push(transaction_id); // rrc-TransactionIdentifier
+        pdu.push(transaction_id);
         pdu.push(0x00); // criticalExtensions = rrcReestablishment
-
         // nextHopChainingCount (3 bits, set to 0)
         pdu.push(0x00);
-
         OctetString::from_slice(&pdu)
     }
 
-    /// Builds an RRC Resume message (simplified)
+    /// Builds an RRC Resume message
+    ///
+    /// Note: The RRC procedures module provides UE-side RRCResumeRequest
+    /// and RRCResumeComplete. The gNB-side RRCResume (DL-CCCH) uses a simplified
+    /// encoding since the ASN.1 gNB-side builder requires masterCellGroup and
+    /// radio bearer configuration from the suspended UE context.
     fn build_rrc_resume(&self, transaction_id: u8) -> OctetString {
         let mut pdu = Vec::with_capacity(16);
-
         // DL-CCCH-Message with RRCResume
         pdu.push(0x28); // c1 choice = rrcResume
-        pdu.push(transaction_id); // rrc-TransactionIdentifier
+        pdu.push(transaction_id);
         pdu.push(0x00); // criticalExtensions = rrcResume
-
         // Minimal masterCellGroup
         pdu.extend_from_slice(&[0x00, 0x00]);
-
         OctetString::from_slice(&pdu)
     }
 
@@ -443,39 +451,56 @@ impl RrcConnectionManager {
         }
     }
 
-    /// Builds an RRC Setup message (simplified)
+    /// Builds an RRC Setup message using proper ASN.1 UPER encoding
     fn build_rrc_setup(&self, transaction_id: u8) -> OctetString {
-        // Simplified RRC Setup message
-        // In a full implementation, this would use nextgsim_rrc::procedures::rrc_setup
-        // For now, create a minimal placeholder
-        let mut pdu = Vec::with_capacity(16);
-        
-        // DL-CCCH-Message with RRCSetup
-        // This is a simplified encoding - real implementation would use ASN.1
-        pdu.push(0x20); // c1 choice = rrcSetup
-        pdu.push(transaction_id); // rrc-TransactionIdentifier
-        pdu.push(0x00); // criticalExtensions = rrcSetup
-        
-        // Minimal RadioBearerConfig
-        pdu.extend_from_slice(&[0x00, 0x00]);
-        
-        // Minimal MasterCellGroup
-        pdu.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        
-        OctetString::from_slice(&pdu)
+        // Build a minimal but valid RadioBearerConfig (empty SRB-to-add list)
+        let radio_bearer_config = vec![0x00];
+        // Minimal MasterCellGroup config
+        let master_cell_group = vec![0x00];
+
+        let params = RrcSetupParams {
+            rrc_transaction_id: transaction_id,
+            radio_bearer_config,
+            master_cell_group,
+        };
+
+        match encode_rrc_setup(&params) {
+            Ok(bytes) => OctetString::from_slice(&bytes),
+            Err(e) => {
+                warn!("ASN.1 RRC Setup encoding failed ({}), using fallback", e);
+                // Fallback: simplified encoding for interop with simplified UE parser
+                let mut pdu = Vec::with_capacity(16);
+                pdu.push(0x20);
+                pdu.push(transaction_id);
+                pdu.push(0x00);
+                pdu.extend_from_slice(&[0x00, 0x00]);
+                pdu.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                OctetString::from_slice(&pdu)
+            }
+        }
     }
 
-    /// Builds an RRC Release message (simplified)
+    /// Builds an RRC Release message using proper ASN.1 UPER encoding
     fn build_rrc_release(&self, transaction_id: u8) -> OctetString {
-        // Simplified RRC Release message
-        let mut pdu = Vec::with_capacity(8);
-        
-        // DL-DCCH-Message with RRCRelease
-        pdu.push(0x0D); // c1 choice = rrcRelease
-        pdu.push(transaction_id); // rrc-TransactionIdentifier
-        pdu.push(0x00); // criticalExtensions = rrcRelease
-        
-        OctetString::from_slice(&pdu)
+        let params = RrcReleaseParams {
+            rrc_transaction_id: transaction_id,
+            redirected_carrier_info: None,
+            suspend_config: None,
+            deprioritisation_req: None,
+            wait_time: None,
+        };
+
+        match encode_rrc_release(&params) {
+            Ok(bytes) => OctetString::from_slice(&bytes),
+            Err(e) => {
+                warn!("ASN.1 RRC Release encoding failed ({}), using fallback", e);
+                let mut pdu = Vec::with_capacity(8);
+                pdu.push(0x0D);
+                pdu.push(transaction_id);
+                pdu.push(0x00);
+                OctetString::from_slice(&pdu)
+            }
+        }
     }
 }
 

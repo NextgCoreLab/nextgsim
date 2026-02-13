@@ -492,6 +492,32 @@ pub enum RrcMessage {
         /// Max Doppler shift in Hz
         max_doppler_hz: f64,
     },
+
+    // ========================================================================
+    // 6G Message Routing (Rel-20 extensions)
+    // ========================================================================
+
+    /// AI/ML inference request (route to SHE Client)
+    SixgInferenceRequest {
+        /// Model identifier
+        model_id: String,
+        /// Input data
+        input_data: Vec<f32>,
+    },
+    /// ISAC sensing measurement (route to ISAC Sensor)
+    SixgSensingMeasurement {
+        /// Measurement type
+        measurement_type: String,
+        /// Measurement data
+        measurements: Vec<f32>,
+    },
+    /// Semantic communication data (route to Semantic Codec)
+    SixgSemanticData {
+        /// Content type identifier
+        content_type: String,
+        /// Encoded data
+        data: Vec<u8>,
+    },
 }
 
 /// Radio link failure cause.

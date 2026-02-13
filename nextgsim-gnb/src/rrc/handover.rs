@@ -341,6 +341,212 @@ impl GnbHandoverManager {
     }
 }
 
+// ============================================================================
+// Inter-gNB Xn Handover Support
+// ============================================================================
+
+/// Xn handover request sent to target gNB
+#[derive(Debug, Clone)]
+pub struct XnHandoverRequest {
+    /// UE ID at source gNB
+    pub source_ue_id: i32,
+    /// Source gNB ID
+    pub source_gnb_id: u32,
+    /// Target cell ID
+    pub target_cell_id: i32,
+    /// Cause of handover
+    pub cause: XnHandoverCause,
+    /// UE context to transfer (serialized)
+    pub ue_context: XnUeContext,
+}
+
+/// Xn handover acknowledge from target gNB
+#[derive(Debug, Clone)]
+pub struct XnHandoverAcknowledge {
+    /// UE ID allocated at target gNB
+    pub target_ue_id: i32,
+    /// Target gNB ID
+    pub target_gnb_id: u32,
+    /// Handover command (RRC Reconfiguration with mobility control) for the UE
+    pub handover_command: Vec<u8>,
+    /// Admitted PDU sessions
+    pub admitted_pdu_sessions: Vec<i32>,
+}
+
+/// UE context transferred during Xn handover
+#[derive(Debug, Clone)]
+pub struct XnUeContext {
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: Option<i64>,
+    /// Security capabilities
+    pub security_capabilities: u32,
+    /// Active PDU sessions (session ID list)
+    pub pdu_sessions: Vec<XnPduSessionContext>,
+    /// RRC establishment cause
+    pub establishment_cause: u8,
+}
+
+/// PDU session context for Xn transfer
+#[derive(Debug, Clone)]
+pub struct XnPduSessionContext {
+    /// PDU session ID
+    pub psi: i32,
+    /// QoS flow ID
+    pub qfi: u8,
+    /// UPF tunnel endpoint (TEID)
+    pub uplink_teid: u32,
+    /// UPF address
+    pub upf_address: std::net::IpAddr,
+}
+
+/// Cause for Xn handover
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XnHandoverCause {
+    /// Radio resource management
+    RadioResourceManagement,
+    /// Resource optimization
+    ResourceOptimization,
+    /// Reduce load in serving cell
+    ReduceLoadInServingCell,
+}
+
+/// Path Switch Request to AMF after Xn handover completion
+#[derive(Debug, Clone)]
+pub struct PathSwitchRequest {
+    /// UE ID at target gNB
+    pub ue_id: i32,
+    /// Source AMF UE NGAP ID
+    pub source_amf_ue_ngap_id: i64,
+    /// Target gNB ID
+    pub target_gnb_id: u32,
+    /// User location information (TAI + NR CGI)
+    pub tai: u32,
+    /// PDU sessions switched
+    pub pdu_sessions: Vec<i32>,
+}
+
+impl GnbHandoverManager {
+    /// Process an inter-gNB handover decision and build an Xn Handover Request
+    pub fn initiate_xn_handover(
+        &mut self,
+        ue_id: i32,
+        source_cell_id: i32,
+        target_gnb_id: u32,
+        target_cell_id: i32,
+        ue_context: XnUeContext,
+    ) -> Option<XnHandoverRequest> {
+        let transaction_id = self.next_transaction_id();
+
+        let ctx = UeHandoverContext {
+            state: UeHandoverState::Preparing,
+            source_cell_id: Some(source_cell_id),
+            target_cell_id: Some(target_cell_id),
+            transaction_id,
+            start_time: Some(Instant::now()),
+            t304_duration: Duration::from_millis(self.config.t304_duration),
+        };
+        self.ue_contexts.insert(ue_id, ctx);
+
+        info!(
+            "Initiating Xn handover for UE {}: cell {} -> gnb {} cell {}",
+            ue_id, source_cell_id, target_gnb_id, target_cell_id
+        );
+
+        Some(XnHandoverRequest {
+            source_ue_id: ue_id,
+            source_gnb_id: self.cell_id as u32,
+            target_cell_id,
+            cause: XnHandoverCause::RadioResourceManagement,
+            ue_context,
+        })
+    }
+
+    /// Handle incoming Xn Handover Request at target gNB
+    /// Returns an XnHandoverAcknowledge if the target can accept the UE
+    pub fn handle_xn_handover_request(
+        &mut self,
+        request: &XnHandoverRequest,
+        new_ue_id: i32,
+    ) -> Option<XnHandoverAcknowledge> {
+        let transaction_id = self.next_transaction_id();
+
+        // Create handover context at target
+        let ctx = UeHandoverContext {
+            state: UeHandoverState::Preparing,
+            source_cell_id: None,
+            target_cell_id: Some(request.target_cell_id),
+            transaction_id,
+            start_time: Some(Instant::now()),
+            t304_duration: Duration::from_millis(self.config.t304_duration),
+        };
+        self.ue_contexts.insert(new_ue_id, ctx);
+
+        info!(
+            "Accepting Xn handover at target: source_ue={}, new_ue_id={}, target_cell={}",
+            request.source_ue_id, new_ue_id, request.target_cell_id
+        );
+
+        // Build handover command for the UE
+        let ho_cmd = HandoverCommand {
+            ue_id: new_ue_id,
+            target_cell_id: request.target_cell_id,
+            target_pci: request.target_cell_id as u32,
+            new_ue_id: Some(new_ue_id),
+            transaction_id,
+        };
+
+        let admitted_pdu_sessions: Vec<i32> = request
+            .ue_context
+            .pdu_sessions
+            .iter()
+            .map(|s| s.psi)
+            .collect();
+
+        Some(XnHandoverAcknowledge {
+            target_ue_id: new_ue_id,
+            target_gnb_id: self.cell_id as u32,
+            handover_command: ho_cmd.build_rrc_pdu(),
+            admitted_pdu_sessions,
+        })
+    }
+
+    /// Build a Path Switch Request after successful Xn handover at target gNB
+    pub fn build_path_switch_request(
+        &self,
+        ue_id: i32,
+        source_amf_ue_ngap_id: i64,
+        tai: u32,
+        pdu_sessions: Vec<i32>,
+    ) -> PathSwitchRequest {
+        PathSwitchRequest {
+            ue_id,
+            source_amf_ue_ngap_id,
+            target_gnb_id: self.cell_id as u32,
+            tai,
+            pdu_sessions,
+        }
+    }
+
+    /// Complete Xn handover at target gNB (UE has arrived)
+    pub fn complete_xn_handover(&mut self, ue_id: i32) -> bool {
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            if matches!(ctx.state, UeHandoverState::Preparing | UeHandoverState::Executing) {
+                if let Some(start) = ctx.start_time {
+                    info!(
+                        "Xn handover complete for UE {}: duration={:?}",
+                        ue_id, start.elapsed()
+                    );
+                }
+                ctx.state = UeHandoverState::Complete;
+                ctx.state = UeHandoverState::Idle;
+                ctx.start_time = None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 impl Default for GnbHandoverManager {
     fn default() -> Self {
         Self::new(0)

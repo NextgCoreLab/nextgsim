@@ -421,6 +421,38 @@ pub enum RrcMessage {
         /// Whether UE should use autonomous TA calculation
         autonomous_ta: bool,
     },
+
+    // ========================================================================
+    // 6G Message Routing (Rel-20 extensions)
+    // ========================================================================
+
+    /// AI/ML model inference request from UE (routed to SHE)
+    SixgAiMlInference {
+        /// UE ID
+        ue_id: i32,
+        /// Model identifier
+        model_id: String,
+        /// Input data
+        input_data: Vec<f32>,
+    },
+    /// ISAC sensing data from UE (routed to ISAC task)
+    SixgIsacSensingData {
+        /// UE ID
+        ue_id: i32,
+        /// Measurement type
+        measurement_type: String,
+        /// Measurements
+        measurements: Vec<f32>,
+    },
+    /// Semantic communication message from UE (routed to NKEF)
+    SixgSemanticMessage {
+        /// UE ID
+        ue_id: i32,
+        /// Semantic content type
+        content_type: String,
+        /// Encoded semantic data
+        data: Vec<u8>,
+    },
 }
 
 // ============================================================================
