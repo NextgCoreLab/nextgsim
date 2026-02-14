@@ -137,7 +137,7 @@ impl RedCapMode {
             return vec![]; // No RedCap capabilities
         }
 
-        let mut caps = Vec::with_capacity(8);
+        let mut caps = Vec::with_capacity(16);
 
         // RedCap indicator (1 byte)
         caps.push(1); // RedCap enabled
@@ -161,6 +161,35 @@ impl RedCapMode {
             RedCapRelease::Rel17 => 17,
             RedCapRelease::Rel18 => 18,
         });
+
+        // Rel-18 specific capabilities
+        if self.release == RedCapRelease::Rel18 {
+            // Extended capabilities byte (bit flags)
+            let mut ext_caps: u8 = 0;
+            // Bit 0: supports eDRX
+            if self.bandwidth_mhz <= 20 {
+                ext_caps |= 0x01;
+            }
+            // Bit 1: supports relaxed monitoring (1 Rx antenna)
+            if self.bandwidth_mhz <= 5 {
+                ext_caps |= 0x02;
+            }
+            // Bit 2: supports extended T_proc
+            ext_caps |= 0x04;
+            caps.push(ext_caps);
+
+            // Peak data rate cap (4 bytes, kbps)
+            let peak_rate_kbps: u32 = if self.bandwidth_mhz <= 5 {
+                50_000 // 50 Mbps max for 5 MHz variant
+            } else {
+                200_000 // 200 Mbps for 20 MHz variant
+            };
+            caps.extend_from_slice(&peak_rate_kbps.to_be_bytes());
+
+            // Number of Rx antennas (1 byte)
+            let rx_antennas = if self.bandwidth_mhz <= 5 { 1 } else { 2 };
+            caps.push(rx_antennas);
+        }
 
         caps
     }

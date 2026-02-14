@@ -54,21 +54,29 @@ pub enum AiMlUseCase {
     Custom(u8),
 }
 
-/// AI/ML model lifecycle state
+/// AI/ML model lifecycle state per TS 38.843
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiMlModelState {
     /// Model is idle (not deployed)
     Idle,
+    /// Model is in training phase
+    Training,
+    /// Model is in validation phase
+    Validation,
     /// Model is being downloaded/deployed
     Deploying,
     /// Model is deployed and ready
     Ready,
-    /// Model is actively running inference
-    Active,
+    /// Model is deployed and actively running inference
+    Deployed,
+    /// Model is in monitoring phase (checking performance/drift)
+    Monitoring,
     /// Model is being updated
     Updating,
     /// Model is deactivated (still deployed but not running)
     Deactivated,
+    /// Model is retired due to performance degradation
+    Retired,
     /// Model has been released/removed
     Released,
 }
@@ -86,7 +94,7 @@ pub enum AiMlInferenceMode {
     TwoSided,
 }
 
-/// Model performance monitoring configuration
+/// Model performance monitoring configuration per TS 38.843
 #[derive(Debug, Clone)]
 pub struct AiMlPerformanceConfig {
     /// Performance monitoring periodicity in milliseconds
@@ -99,6 +107,10 @@ pub struct AiMlPerformanceConfig {
     pub auto_fallback_enabled: bool,
     /// Number of consecutive failures before fallback
     pub fallback_threshold_count: u8,
+    /// Model drift detection threshold (KL divergence or similar)
+    pub drift_detection_threshold: f64,
+    /// Enable automatic model retirement on drift
+    pub auto_retire_on_drift: bool,
 }
 
 /// Federated learning configuration
@@ -275,8 +287,144 @@ pub struct AiMlPerformanceReport {
     pub fallback_count: u32,
     /// Resource utilization (0.0 to 1.0)
     pub resource_utilization: Option<f64>,
+    /// Model drift metric (0.0 = no drift, higher = more drift)
+    pub drift_metric: Option<f64>,
     /// Timestamp of report in ms since epoch
     pub timestamp_ms: u64,
+}
+
+/// Model lifecycle manager - handles state transitions and versioning
+#[derive(Debug, Clone)]
+pub struct ModelLifecycleManager {
+    /// Current model state
+    pub current_state: AiMlModelState,
+    /// Model version history (version -> deployment timestamp)
+    pub version_history: Vec<(String, u64)>,
+    /// Current active version
+    pub active_version: String,
+    /// Previous version for rollback
+    pub previous_version: Option<String>,
+    /// Performance monitoring enabled
+    pub monitoring_enabled: bool,
+    /// Consecutive failure count
+    pub consecutive_failures: u32,
+    /// Drift detection counter
+    pub drift_detections: u32,
+}
+
+impl ModelLifecycleManager {
+    /// Creates a new lifecycle manager
+    pub fn new(initial_version: String) -> Self {
+        Self {
+            current_state: AiMlModelState::Idle,
+            version_history: vec![(initial_version.clone(), 0)],
+            active_version: initial_version,
+            previous_version: None,
+            monitoring_enabled: false,
+            consecutive_failures: 0,
+            drift_detections: 0,
+        }
+    }
+
+    /// Transitions to a new state
+    pub fn transition_to(&mut self, new_state: AiMlModelState) -> Result<(), String> {
+        // Validate state transition
+        let valid = match (self.current_state, new_state) {
+            // Allow any transition from Idle
+            (AiMlModelState::Idle, _) => true,
+            // Training -> Validation
+            (AiMlModelState::Training, AiMlModelState::Validation) => true,
+            // Validation -> Deploying or back to Training
+            (AiMlModelState::Validation, AiMlModelState::Deploying)
+            | (AiMlModelState::Validation, AiMlModelState::Training) => true,
+            // Deploying -> Ready
+            (AiMlModelState::Deploying, AiMlModelState::Ready) => true,
+            // Ready -> Deployed
+            (AiMlModelState::Ready, AiMlModelState::Deployed) => true,
+            // Deployed -> Monitoring
+            (AiMlModelState::Deployed, AiMlModelState::Monitoring) => true,
+            // Monitoring -> Deployed (if OK) or Retired (if drift)
+            (AiMlModelState::Monitoring, AiMlModelState::Deployed)
+            | (AiMlModelState::Monitoring, AiMlModelState::Retired) => true,
+            // Deployed/Monitoring -> Updating
+            (AiMlModelState::Deployed, AiMlModelState::Updating)
+            | (AiMlModelState::Monitoring, AiMlModelState::Updating) => true,
+            // Updating -> Ready
+            (AiMlModelState::Updating, AiMlModelState::Ready) => true,
+            // Any active state -> Deactivated
+            (_, AiMlModelState::Deactivated) if self.current_state != AiMlModelState::Idle => true,
+            // Deactivated -> Deployed
+            (AiMlModelState::Deactivated, AiMlModelState::Deployed) => true,
+            // Retired -> Released
+            (AiMlModelState::Retired, AiMlModelState::Released) => true,
+            // Any state -> Released (cleanup)
+            (_, AiMlModelState::Released) => true,
+            _ => false,
+        };
+
+        if !valid {
+            return Err(format!(
+                "Invalid state transition from {:?} to {:?}",
+                self.current_state, new_state
+            ));
+        }
+
+        self.current_state = new_state;
+
+        // Enable monitoring when deployed
+        if new_state == AiMlModelState::Deployed {
+            self.monitoring_enabled = true;
+        }
+
+        Ok(())
+    }
+
+    /// Deploys a new model version
+    pub fn deploy_version(&mut self, version: String, timestamp_ms: u64) {
+        self.previous_version = Some(self.active_version.clone());
+        self.active_version = version.clone();
+        self.version_history.push((version, timestamp_ms));
+        self.consecutive_failures = 0;
+        self.drift_detections = 0;
+    }
+
+    /// Rolls back to previous version
+    pub fn rollback(&mut self) -> Result<String, String> {
+        if let Some(prev) = self.previous_version.take() {
+            self.active_version = prev.clone();
+            self.consecutive_failures = 0;
+            self.drift_detections = 0;
+            Ok(prev)
+        } else {
+            Err("No previous version available for rollback".to_string())
+        }
+    }
+
+    /// Records a performance failure
+    pub fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+    }
+
+    /// Records drift detection
+    pub fn record_drift(&mut self) {
+        self.drift_detections += 1;
+    }
+
+    /// Checks if automatic fallback should trigger
+    pub fn should_fallback(&self, threshold: u32) -> bool {
+        self.consecutive_failures >= threshold
+    }
+
+    /// Checks if automatic retirement should trigger
+    pub fn should_retire(&self, drift_threshold: u32) -> bool {
+        self.drift_detections >= drift_threshold
+    }
+
+    /// Resets failure counters
+    pub fn reset_counters(&mut self) {
+        self.consecutive_failures = 0;
+        self.drift_detections = 0;
+    }
 }
 
 impl AiMlConfig {
@@ -398,12 +546,16 @@ pub fn encode_ai_ml_config(config: &AiMlConfig) -> Result<Vec<u8>, AiMlConfigErr
     // model_state (1 byte)
     bytes.push(match config.model_state {
         AiMlModelState::Idle => 0,
-        AiMlModelState::Deploying => 1,
-        AiMlModelState::Ready => 2,
-        AiMlModelState::Active => 3,
-        AiMlModelState::Updating => 4,
-        AiMlModelState::Deactivated => 5,
-        AiMlModelState::Released => 6,
+        AiMlModelState::Training => 1,
+        AiMlModelState::Validation => 2,
+        AiMlModelState::Deploying => 3,
+        AiMlModelState::Ready => 4,
+        AiMlModelState::Deployed => 5,
+        AiMlModelState::Monitoring => 6,
+        AiMlModelState::Updating => 7,
+        AiMlModelState::Deactivated => 8,
+        AiMlModelState::Retired => 9,
+        AiMlModelState::Released => 10,
     });
     // inference_mode (1 byte)
     bytes.push(match config.inference_mode {
@@ -451,12 +603,16 @@ pub fn decode_ai_ml_config_header(
     };
     let model_state = match bytes[3] {
         0 => AiMlModelState::Idle,
-        1 => AiMlModelState::Deploying,
-        2 => AiMlModelState::Ready,
-        3 => AiMlModelState::Active,
-        4 => AiMlModelState::Updating,
-        5 => AiMlModelState::Deactivated,
-        6 => AiMlModelState::Released,
+        1 => AiMlModelState::Training,
+        2 => AiMlModelState::Validation,
+        3 => AiMlModelState::Deploying,
+        4 => AiMlModelState::Ready,
+        5 => AiMlModelState::Deployed,
+        6 => AiMlModelState::Monitoring,
+        7 => AiMlModelState::Updating,
+        8 => AiMlModelState::Deactivated,
+        9 => AiMlModelState::Retired,
+        10 => AiMlModelState::Released,
         _ => return Err(AiMlConfigError::CodecError("Unknown model state".to_string())),
     };
     let inference_mode = match bytes[4] {
@@ -480,7 +636,7 @@ mod tests {
             model_id: "csi-feedback-v2".to_string(),
             model_version: "2.1.0".to_string(),
             use_case: AiMlUseCase::CsiFeedback,
-            model_state: AiMlModelState::Active,
+            model_state: AiMlModelState::Deployed,
             inference_mode: AiMlInferenceMode::TwoSided,
             input_dimensions: vec![32, 64],
             output_dimensions: vec![16],
@@ -490,6 +646,8 @@ mod tests {
                 max_latency_ms: 10,
                 auto_fallback_enabled: true,
                 fallback_threshold_count: 3,
+                drift_detection_threshold: 0.1,
+                auto_retire_on_drift: true,
             }),
             federated_config: None,
             split_inference_config: Some(SplitInferenceConfig {
@@ -645,6 +803,7 @@ mod tests {
             inference_count: 1000,
             fallback_count: 2,
             resource_utilization: Some(0.6),
+            drift_metric: Some(0.05),
             timestamp_ms: 1700000000000,
         };
         assert!(report.validate().is_ok());
@@ -660,6 +819,7 @@ mod tests {
             inference_count: 0,
             fallback_count: 0,
             resource_utilization: None,
+            drift_metric: None,
             timestamp_ms: 0,
         };
         assert!(report.validate().is_err());
@@ -675,6 +835,7 @@ mod tests {
             inference_count: 0,
             fallback_count: 0,
             resource_utilization: Some(-0.1), // invalid
+            drift_metric: None,
             timestamp_ms: 0,
         };
         assert!(report.validate().is_err());
@@ -711,7 +872,7 @@ mod tests {
             decode_ai_ml_config_header(&encoded).expect("Failed to decode");
         assert_eq!(config_id, 1);
         assert_eq!(use_case, AiMlUseCase::CsiFeedback);
-        assert_eq!(model_state, AiMlModelState::Active);
+        assert_eq!(model_state, AiMlModelState::Deployed);
         assert_eq!(inference_mode, AiMlInferenceMode::TwoSided);
     }
 
@@ -745,11 +906,15 @@ mod tests {
     fn test_all_model_states() {
         let states = [
             AiMlModelState::Idle,
+            AiMlModelState::Training,
+            AiMlModelState::Validation,
             AiMlModelState::Deploying,
             AiMlModelState::Ready,
-            AiMlModelState::Active,
+            AiMlModelState::Deployed,
+            AiMlModelState::Monitoring,
             AiMlModelState::Updating,
             AiMlModelState::Deactivated,
+            AiMlModelState::Retired,
             AiMlModelState::Released,
         ];
 
@@ -794,5 +959,115 @@ mod tests {
         config.inference_mode = AiMlInferenceMode::NetworkSide;
         config.split_inference_config = None;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_lifecycle_manager_creation() {
+        let manager = ModelLifecycleManager::new("v1.0.0".to_string());
+        assert_eq!(manager.current_state, AiMlModelState::Idle);
+        assert_eq!(manager.active_version, "v1.0.0");
+        assert_eq!(manager.version_history.len(), 1);
+    }
+
+    #[test]
+    fn test_lifecycle_state_transitions() {
+        let mut manager = ModelLifecycleManager::new("v1.0.0".to_string());
+
+        // Valid transition: Idle -> Training
+        assert!(manager.transition_to(AiMlModelState::Training).is_ok());
+        assert_eq!(manager.current_state, AiMlModelState::Training);
+
+        // Valid: Training -> Validation
+        assert!(manager.transition_to(AiMlModelState::Validation).is_ok());
+
+        // Valid: Validation -> Deploying
+        assert!(manager.transition_to(AiMlModelState::Deploying).is_ok());
+
+        // Valid: Deploying -> Ready
+        assert!(manager.transition_to(AiMlModelState::Ready).is_ok());
+
+        // Valid: Ready -> Deployed
+        assert!(manager.transition_to(AiMlModelState::Deployed).is_ok());
+        assert!(manager.monitoring_enabled);
+
+        // Valid: Deployed -> Monitoring
+        assert!(manager.transition_to(AiMlModelState::Monitoring).is_ok());
+    }
+
+    #[test]
+    fn test_lifecycle_invalid_transitions() {
+        let mut manager = ModelLifecycleManager::new("v1.0.0".to_string());
+
+        // Start in Ready state
+        assert!(manager.transition_to(AiMlModelState::Ready).is_ok());
+
+        // Invalid: Ready -> Retired (can't retire without being deployed first)
+        assert!(manager.transition_to(AiMlModelState::Retired).is_err());
+    }
+
+    #[test]
+    fn test_lifecycle_version_deployment() {
+        let mut manager = ModelLifecycleManager::new("v1.0.0".to_string());
+
+        manager.deploy_version("v2.0.0".to_string(), 1000);
+        assert_eq!(manager.active_version, "v2.0.0");
+        assert_eq!(manager.previous_version, Some("v1.0.0".to_string()));
+        assert_eq!(manager.version_history.len(), 2);
+    }
+
+    #[test]
+    fn test_lifecycle_rollback() {
+        let mut manager = ModelLifecycleManager::new("v1.0.0".to_string());
+
+        manager.deploy_version("v2.0.0".to_string(), 1000);
+        let rollback_version = manager.rollback().unwrap();
+        assert_eq!(rollback_version, "v1.0.0");
+        assert_eq!(manager.active_version, "v1.0.0");
+    }
+
+    #[test]
+    fn test_lifecycle_failure_tracking() {
+        let mut manager = ModelLifecycleManager::new("v1.0.0".to_string());
+
+        manager.record_failure();
+        manager.record_failure();
+        manager.record_failure();
+
+        assert_eq!(manager.consecutive_failures, 3);
+        assert!(manager.should_fallback(3));
+        assert!(!manager.should_fallback(5));
+
+        manager.reset_counters();
+        assert_eq!(manager.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn test_lifecycle_drift_tracking() {
+        let mut manager = ModelLifecycleManager::new("v1.0.0".to_string());
+
+        manager.record_drift();
+        manager.record_drift();
+
+        assert_eq!(manager.drift_detections, 2);
+        assert!(manager.should_retire(2));
+        assert!(!manager.should_retire(5));
+    }
+
+    #[test]
+    fn test_lifecycle_retirement_flow() {
+        let mut manager = ModelLifecycleManager::new("v1.0.0".to_string());
+
+        // Transition to deployed
+        assert!(manager.transition_to(AiMlModelState::Deployed).is_ok());
+
+        // Move to monitoring
+        assert!(manager.transition_to(AiMlModelState::Monitoring).is_ok());
+
+        // Retire due to drift
+        assert!(manager.transition_to(AiMlModelState::Retired).is_ok());
+        assert_eq!(manager.current_state, AiMlModelState::Retired);
+
+        // Release retired model
+        assert!(manager.transition_to(AiMlModelState::Released).is_ok());
     }
 }

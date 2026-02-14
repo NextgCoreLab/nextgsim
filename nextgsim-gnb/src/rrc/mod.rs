@@ -78,6 +78,7 @@ pub mod handover;
 pub mod task;
 pub mod ue_context;
 pub mod redcap;
+pub mod energy_saving;
 
 // Re-export main types
 pub use connection::{RrcConnectionManager, RrcReleaseResult, RrcSetupCompleteResult, RrcSetupResult};
@@ -93,4 +94,8 @@ pub use ue_context::{RrcState, RrcUeContext, RrcUeContextManager};
 pub use redcap::{
     RedCapUeCapabilities, RedCapRrcConfig, RedCapProcessor,
     RedCapRelease, RedCapRestrictions, MimoRestriction,
+};
+pub use energy_saving::{
+    EnergySavingManager, CellSleepMode, EnergySavingPolicy,
+    EnergySavingConfig, CellEnergyState, CellEnergyKpis,
 };

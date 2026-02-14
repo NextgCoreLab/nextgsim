@@ -146,6 +146,8 @@ pub struct RedCapRrcConfig {
     pub relaxed_processing: Option<RelaxedProcessingConfig>,
     /// MIMO layer restriction
     pub mimo_restriction: MimoRestriction,
+    /// eDRX configuration for Rel-18 RedCap (extended discontinuous reception)
+    pub edrx_config: Option<EDrxConfig>,
 }
 
 /// Half-duplex FDD gap configuration
@@ -166,6 +168,8 @@ pub struct RelaxedProcessingConfig {
     pub processing_time_capability: u8,
     /// HARQ-ACK timing adjustment (slots)
     pub harq_timing_offset: u8,
+    /// Extended T_proc for Rel-18 (additional processing time in ms)
+    pub extended_t_proc_ms: Option<u8>,
 }
 
 /// MIMO layer restriction for RedCap UE
@@ -175,6 +179,19 @@ pub enum MimoRestriction {
     SingleLayer,
     /// Up to 2 layers
     TwoLayers,
+}
+
+/// eDRX (extended Discontinuous Reception) configuration for Rel-18 RedCap
+///
+/// Enables ultra-long sleep cycles for IoT/wearable devices
+#[derive(Debug, Clone)]
+pub struct EDrxConfig {
+    /// eDRX cycle length in seconds (up to 10485.76s per TS 24.008)
+    pub edrx_cycle_s: f32,
+    /// Paging Time Window (PTW) in seconds
+    pub ptw_s: f32,
+    /// Whether UE is allowed to skip paging occasions within PTW
+    pub skip_paging_allowed: bool,
 }
 
 impl RedCapRrcConfig {
@@ -191,9 +208,16 @@ impl RedCapRrcConfig {
         };
 
         let relaxed_processing = if capabilities.reduced_processing_time {
+            // Rel-18 RedCap gets extended T_proc for ultra-low complexity
+            let extended_t_proc = if capabilities.redcap_release == RedCapRelease::Rel18 && capabilities.max_bandwidth_mhz <= 5 {
+                Some(8) // 8ms extended processing time for Rel-18 5MHz variant
+            } else {
+                None
+            };
             Some(RelaxedProcessingConfig {
                 processing_time_capability: 2,
                 harq_timing_offset: 4,
+                extended_t_proc_ms: extended_t_proc,
             })
         } else {
             None
@@ -205,12 +229,24 @@ impl RedCapRrcConfig {
             MimoRestriction::TwoLayers
         };
 
+        // Rel-18 RedCap supports eDRX for power savings
+        let edrx_config = if capabilities.redcap_release == RedCapRelease::Rel18 {
+            Some(EDrxConfig {
+                edrx_cycle_s: 20.48, // 20.48s eDRX cycle for wearables/sensors
+                ptw_s: 2.56,          // 2.56s Paging Time Window
+                skip_paging_allowed: true,
+            })
+        } else {
+            None
+        };
+
         Self {
             restricted_bandwidth_mhz: capabilities.max_bandwidth_mhz,
             capabilities,
             hd_fdd_gap_config,
             relaxed_processing,
             mimo_restriction,
+            edrx_config,
         }
     }
 
