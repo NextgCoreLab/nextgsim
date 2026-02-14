@@ -19,15 +19,15 @@ pub struct SafetyPolicy {
     pub max_cells_affected: u32,
     /// Maximum number of UEs an intent can impact at once.
     pub max_ues_impacted: u32,
-    /// Maximum allowed QoS change percentage (absolute value).
-    /// E.g., 50 means a single intent cannot change any QoS metric by more
+    /// Maximum allowed `QoS` change percentage (absolute value).
+    /// E.g., 50 means a single intent cannot change any `QoS` metric by more
     /// than 50% up or down.
     pub max_qos_change_pct: f64,
     /// Maximum number of slices that can be created per agent per minute.
     pub max_slice_creations_per_minute: u32,
     /// Forbidden actions.  Each entry is a rule checked before execution.
     pub forbidden_actions: Vec<ForbiddenAction>,
-    /// Agent-specific overrides (agent_id -> policy override).
+    /// Agent-specific overrides (`agent_id` -> policy override).
     /// If an agent has an override, those fields replace the defaults.
     pub agent_overrides: std::collections::HashMap<String, SafetyPolicyOverride>,
 }
@@ -68,11 +68,11 @@ pub enum ForbiddenRule {
 /// Per-agent overrides for safety limits.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SafetyPolicyOverride {
-    /// Override max_cells_affected (if Some).
+    /// Override `max_cells_affected` (if Some).
     pub max_cells_affected: Option<u32>,
-    /// Override max_ues_impacted (if Some).
+    /// Override `max_ues_impacted` (if Some).
     pub max_ues_impacted: Option<u32>,
-    /// Override max_qos_change_pct (if Some).
+    /// Override `max_qos_change_pct` (if Some).
     pub max_qos_change_pct: Option<f64>,
 }
 
@@ -132,9 +132,9 @@ pub struct SafetyChecker {
     policy: SafetyPolicy,
     /// Log of all violations detected.
     violation_log: Vec<SafetyViolation>,
-    /// Tracks recent slice creations per agent: (agent_id, creation_timestamp_ms).
+    /// Tracks recent slice creations per agent: (`agent_id`, `creation_timestamp_ms`).
     recent_slice_creations: Vec<(String, u64)>,
-    /// Active handover count for MaxConcurrentHandovers rule.
+    /// Active handover count for `MaxConcurrentHandovers` rule.
     active_handovers: u32,
 }
 
@@ -413,7 +413,7 @@ mod tests {
         let affected: Vec<AffectedResource> = (0..5)
             .map(|i| AffectedResource {
                 kind: ResourceKind::Cell,
-                id: format!("cell-{}", i),
+                id: format!("cell-{i}"),
                 access: ResourceAccess::Write,
             })
             .collect();
@@ -527,7 +527,7 @@ mod tests {
         let affected: Vec<AffectedResource> = (0..5)
             .map(|i| AffectedResource {
                 kind: ResourceKind::Cell,
-                id: format!("cell-{}", i),
+                id: format!("cell-{i}"),
                 access: ResourceAccess::Write,
             })
             .collect();

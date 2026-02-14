@@ -1,4 +1,4 @@
-//! OctetView - A read-only view over byte slices for parsing protocol messages.
+//! `OctetView` - A read-only view over byte slices for parsing protocol messages.
 //!
 //! This module provides `OctetView`, which allows sequential reading of bytes
 //! from a byte slice without copying. It's commonly used for parsing 5G NAS

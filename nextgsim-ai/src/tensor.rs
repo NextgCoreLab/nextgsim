@@ -350,7 +350,7 @@ impl TensorData {
                 }
             }
             TensorData::Uint8 { data, shape } => {
-                let scaled_data: Vec<u8> = data.iter().map(|&x| ((x as f32 * factor).min(255.0).max(0.0)) as u8).collect();
+                let scaled_data: Vec<u8> = data.iter().map(|&x| (x as f32 * factor).clamp(0.0, 255.0) as u8).collect();
                 TensorData::Uint8 {
                     data: scaled_data,
                     shape: shape.clone(),
@@ -441,7 +441,7 @@ impl fmt::Display for TensorData {
     }
 }
 
-/// Creates a TensorData from ndarray
+/// Creates a `TensorData` from ndarray
 impl From<ArrayD<f32>> for TensorData {
     fn from(array: ArrayD<f32>) -> Self {
         let shape = TensorShape::new(array.shape().iter().map(|&d| d as i64).collect());

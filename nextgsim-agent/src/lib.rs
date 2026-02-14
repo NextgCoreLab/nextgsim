@@ -131,7 +131,7 @@ pub enum AgentType {
     Mobility,
     /// Resource allocation agent
     Resource,
-    /// QoS optimization agent
+    /// `QoS` optimization agent
     Qos,
     /// Security monitoring agent
     Security,
@@ -255,9 +255,9 @@ pub struct TokenRequest {
     pub client_id: String,
     /// Client secret
     pub client_secret: String,
-    /// Authorization code (for AuthorizationCode grant)
+    /// Authorization code (for `AuthorizationCode` grant)
     pub code: Option<String>,
-    /// Refresh token (for RefreshToken grant)
+    /// Refresh token (for `RefreshToken` grant)
     pub refresh_token: Option<String>,
     /// Requested scopes
     pub scopes: Vec<String>,
@@ -283,9 +283,9 @@ pub struct TokenResponse {
 /// Provides integration with external OAuth 2.0 Identity Providers
 /// for proper authentication and authorization.
 pub struct OAuth2Client {
-    /// IdP authorization endpoint
+    /// `IdP` authorization endpoint
     _auth_endpoint: String,
-    /// IdP token endpoint
+    /// `IdP` token endpoint
     _token_endpoint: String,
     /// Client ID
     client_id: String,
@@ -354,9 +354,9 @@ impl OAuth2Client {
         })
     }
 
-    /// Validates a token with the IdP
+    /// Validates a token with the `IdP`
     ///
-    /// In production, this would make an introspection request to the IdP
+    /// In production, this would make an introspection request to the `IdP`
     pub fn validate_token(&self, token: &str) -> Result<bool, String> {
         // Placeholder implementation - in production this would:
         // 1. Make HTTP POST to introspection endpoint
@@ -492,7 +492,7 @@ pub enum IntentType {
     OptimizeResources,
     /// Trigger handover
     TriggerHandover,
-    /// Adjust QoS
+    /// Adjust `QoS`
     AdjustQos,
     /// Create network slice
     CreateSlice,
@@ -747,13 +747,9 @@ impl AgentCoordinator {
     ///
     /// If any check fails the intent is rejected and the error is returned.
     pub fn submit_intent(&mut self, intent: Intent) -> Result<(), String> {
-        // Validate agent is registered
-        if !self.agents.contains_key(&intent.agent_id) {
-            return Err("Agent not registered".to_string());
-        }
-
-        // Check capabilities
-        let registration = self.agents.get(&intent.agent_id).unwrap();
+        // Validate agent is registered and get capabilities
+        let registration = self.agents.get(&intent.agent_id)
+            .ok_or_else(|| "Agent not registered".to_string())?;
         let caps = &registration.capabilities;
 
         match intent.intent_type {
@@ -986,7 +982,7 @@ pub enum AgentMessage {
     Register {
         /// Unique agent identifier
         agent_id: AgentId,
-        /// Type of agent (Mobility, Resource, QoS, etc.)
+        /// Type of agent (Mobility, Resource, `QoS`, etc.)
         agent_type: AgentType,
         /// Agent capabilities and permissions
         capabilities: AgentCapabilities,

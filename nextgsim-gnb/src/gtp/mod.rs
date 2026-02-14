@@ -17,7 +17,7 @@
 //!
 //! # Reference
 //!
-//! Based on UERANSIM's GtpTask from `src/gnb/gtp/task.cpp`
+//! Based on UERANSIM's `GtpTask` from `src/gnb/gtp/task.cpp`
 
 mod task;
 

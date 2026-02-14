@@ -4,10 +4,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
-    GnbTaskBase, GutiMobileIdentity, NgapMessage, RlsMessage, RrcMessage, Task, TaskMessage,
+    GnbTaskBase, GutiMobileIdentity, IsacMessage, NgapMessage, NkefMessage, RlsMessage,
+    RrcMessage, SheMessage, Task, TaskMessage,
 };
 use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
+use nextgsim_rrc::procedures::rrc_setup::{
+    decode_rrc_setup_request, RrcEstablishmentCause as AsnEstablishmentCause, UeIdentity,
+};
 
 use super::connection::RrcConnectionManager;
 use super::ue_context::RrcUeContextManager;
@@ -80,10 +84,42 @@ impl RrcTask {
         }
 
         let bytes = data.data();
+
+        // Try ASN.1 UPER decoding first (proper 3GPP encoding)
+        if let Ok(setup_req) = decode_rrc_setup_request(bytes) {
+            let (initial_id, is_stmsi) = match setup_req.ue_identity {
+                UeIdentity::Ng5gSTmsiPart1(v) => (v as i64, true),
+                UeIdentity::RandomValue(v) => (v as i64, false),
+            };
+            let establishment_cause = match setup_req.establishment_cause {
+                AsnEstablishmentCause::Emergency => 0,
+                AsnEstablishmentCause::HighPriorityAccess => 1,
+                AsnEstablishmentCause::MtAccess => 2,
+                AsnEstablishmentCause::MoSignalling => 3,
+                AsnEstablishmentCause::MoData => 4,
+                AsnEstablishmentCause::MoVoiceCall => 5,
+                AsnEstablishmentCause::MoVideoCall => 6,
+                AsnEstablishmentCause::MoSms => 7,
+                AsnEstablishmentCause::MpsPriorityAccess => 8,
+                AsnEstablishmentCause::McsPriorityAccess => 9,
+            };
+
+            debug!("Decoded ASN.1 RRCSetupRequest: initial_id={:x}, is_stmsi={}, cause={}",
+                initial_id, is_stmsi, establishment_cause);
+
+            if let Some(result) = self.connection_manager.process_rrc_setup_request(
+                &mut self.ue_manager, ue_id, initial_id, is_stmsi, establishment_cause,
+            ) {
+                self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu).await;
+            }
+            return;
+        }
+
+        // Fallback: simplified byte-level parsing for backwards compatibility
         let msg_type = bytes[0] & 0x3F;
 
         match msg_type {
-            // RRC Setup Request (c1 bit = 0x00..0x1F)
+            // RRC Setup Request (simplified encoding)
             0x00..=0x1F => {
                 if data.len() < 6 {
                     warn!("RRC Setup Request too short: {} bytes", data.len());
@@ -116,28 +152,7 @@ impl RrcTask {
                 self.handle_rrc_resume_request(ue_id, data).await;
             }
             _ => {
-                // Fall back to original logic for backwards compatibility
-                if data.len() >= 6 {
-                    let initial_id = i64::from_be_bytes([
-                        0, 0, 0,
-                        bytes.get(1).copied().unwrap_or(0),
-                        bytes.get(2).copied().unwrap_or(0),
-                        bytes.get(3).copied().unwrap_or(0),
-                        bytes.get(4).copied().unwrap_or(0),
-                        bytes.get(5).copied().unwrap_or(0),
-                    ]) & 0x7FFFFFFFFF;
-
-                    let is_stmsi = (bytes[0] & 0x80) != 0;
-                    let establishment_cause = bytes.get(6).copied().unwrap_or(3) as i64;
-
-                    if let Some(result) = self.connection_manager.process_rrc_setup_request(
-                        &mut self.ue_manager, ue_id, initial_id, is_stmsi, establishment_cause,
-                    ) {
-                        self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu).await;
-                    }
-                } else {
-                    debug!("Unknown UL-CCCH message type: 0x{:02x}", msg_type);
-                }
+                debug!("Unknown UL-CCCH message type: 0x{:02x}", msg_type);
             }
         }
     }
@@ -375,6 +390,59 @@ impl RrcTask {
             error!("Failed to send Uplink NAS to NGAP: {}", e);
         }
     }
+
+    /// Route AI/ML inference request from UE to SHE task
+    async fn route_6g_ai_ml(&self, ue_id: i32, model_id: String, input_data: Vec<f32>) {
+        if let Some(ref sixg) = self.task_base.sixg {
+            let request_id = ue_id as u64;
+            let msg = SheMessage::InferenceRequest {
+                model_id,
+                request_id,
+                input_data,
+            };
+            if let Err(e) = sixg.she_tx.send(msg).await {
+                error!("Failed to route AI/ML inference to SHE: {}", e);
+            }
+        } else {
+            warn!("6G tasks not initialized, dropping AI/ML inference from UE[{}]", ue_id);
+        }
+    }
+
+    /// Route ISAC sensing data from UE to ISAC task
+    async fn route_6g_isac(&self, ue_id: i32, measurement_type: String, measurements: Vec<f32>) {
+        if let Some(ref sixg) = self.task_base.sixg {
+            let cell_id = ue_id; // Use ue_id as cell context
+            let msg = IsacMessage::SensingData {
+                cell_id,
+                measurement_type,
+                measurements,
+            };
+            if let Err(e) = sixg.isac_tx.send(msg).await {
+                error!("Failed to route ISAC sensing data: {}", e);
+            }
+        } else {
+            warn!("6G tasks not initialized, dropping ISAC data from UE[{}]", ue_id);
+        }
+    }
+
+    /// Route semantic communication message from UE to NKEF task
+    async fn route_6g_semantic(&self, ue_id: i32, content_type: String, data: Vec<u8>) {
+        if let Some(ref sixg) = self.task_base.sixg {
+            let msg = NkefMessage::UpdateKnowledge {
+                entity_type: content_type,
+                entity_id: format!("ue-{ue_id}"),
+                properties: vec![
+                    ("source".to_string(), "semantic-comm".to_string()),
+                    ("data_len".to_string(), data.len().to_string()),
+                ],
+            };
+            if let Err(e) = sixg.nkef_tx.send(msg).await {
+                error!("Failed to route semantic message to NKEF: {}", e);
+            }
+        } else {
+            warn!("6G tasks not initialized, dropping semantic message from UE[{}]", ue_id);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -419,6 +487,16 @@ impl Task for RrcTask {
                                     autonomous_ta,
                                 });
                             }
+                            // 6G message routing
+                            RrcMessage::SixgAiMlInference { ue_id, model_id, input_data } => {
+                                self.route_6g_ai_ml(ue_id, model_id, input_data).await;
+                            }
+                            RrcMessage::SixgIsacSensingData { ue_id, measurement_type, measurements } => {
+                                self.route_6g_isac(ue_id, measurement_type, measurements).await;
+                            }
+                            RrcMessage::SixgSemanticMessage { ue_id, content_type, data } => {
+                                self.route_6g_semantic(ue_id, content_type, data).await;
+                            }
                         },
                         TaskMessage::Shutdown => {
                             info!("RRC task received shutdown signal");
@@ -462,6 +540,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 

@@ -256,11 +256,10 @@ impl GtpTask {
     /// Auto-create a loopback PDU session for testing
     fn auto_create_loopback_session(&mut self, ue_id: i32, psi: i32) {
         // Ensure UE context exists
-        if !self.ue_contexts.contains_key(&ue_id) {
+        self.ue_contexts.entry(ue_id).or_insert_with(|| {
             info!("Auto-creating UE context for loopback: ue_id={}", ue_id);
-            self.ue_contexts
-                .insert(ue_id, GtpUeContext::new(ue_id));
-        }
+            GtpUeContext::new(ue_id)
+        });
 
         // Create a loopback session with dummy TEIDs
         // TEID format: 0xFFUUPP0X where FF=loopback marker, UU=ue_id (lower 8 bits), PP=psi, X=direction
@@ -305,11 +304,10 @@ impl GtpTask {
         let upf_port = self.task_base.config.upf_port;
 
         // Ensure UE context exists
-        if !self.ue_contexts.contains_key(&ue_id) {
+        self.ue_contexts.entry(ue_id).or_insert_with(|| {
             info!("Auto-creating UE context for UPF session: ue_id={}", ue_id);
-            self.ue_contexts
-                .insert(ue_id, GtpUeContext::new(ue_id));
-        }
+            GtpUeContext::new(ue_id)
+        });
 
         // Create session with TEIDs
         // Use a simple TEID allocation: 0x0001UUPP where UU=ue_id (lower 8 bits), PP=psi
@@ -630,6 +628,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 

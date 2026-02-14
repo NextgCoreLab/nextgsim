@@ -413,6 +413,137 @@ impl QueryExecutor {
 
         true
     }
+
+    /// Finds all paths between two entities up to a maximum depth.
+    ///
+    /// Uses BFS to find paths from source to target through the relationship graph.
+    /// Returns paths as sequences of (`entity_id`, `relationship_type`) pairs.
+    pub fn find_paths(
+        source_id: &str,
+        target_id: &str,
+        max_depth: usize,
+        relationships: &[Relationship],
+    ) -> Vec<GraphPath> {
+        let mut paths = Vec::new();
+        let mut queue: std::collections::VecDeque<(String, Vec<PathStep>, std::collections::HashSet<String>)> =
+            std::collections::VecDeque::new();
+
+        let mut initial_visited = std::collections::HashSet::new();
+        initial_visited.insert(source_id.to_string());
+        queue.push_back((source_id.to_string(), Vec::new(), initial_visited));
+
+        while let Some((current_id, path, visited)) = queue.pop_front() {
+            if path.len() >= max_depth {
+                continue;
+            }
+
+            for rel in relationships {
+                let (next_id, direction) = if rel.source_id == current_id {
+                    (&rel.target_id, "outgoing")
+                } else if rel.target_id == current_id {
+                    (&rel.source_id, "incoming")
+                } else {
+                    continue;
+                };
+
+                if visited.contains(next_id.as_str()) {
+                    continue;
+                }
+
+                let step = PathStep {
+                    entity_id: next_id.clone(),
+                    relation_type: rel.relation_type.clone(),
+                    direction: direction.to_string(),
+                };
+
+                let mut new_path = path.clone();
+                new_path.push(step);
+
+                if next_id == target_id {
+                    paths.push(GraphPath {
+                        source_id: source_id.to_string(),
+                        target_id: target_id.to_string(),
+                        steps: new_path,
+                    });
+                    continue;
+                }
+
+                let mut new_visited = visited.clone();
+                new_visited.insert(next_id.clone());
+                queue.push_back((next_id.clone(), new_path, new_visited));
+            }
+        }
+
+        paths
+    }
+
+    /// Finds all neighbors of an entity within a given hop distance.
+    pub fn find_neighbors(
+        entity_id: &str,
+        max_hops: usize,
+        relationships: &[Relationship],
+    ) -> Vec<(String, usize)> {
+        let mut neighbors: Vec<(String, usize)> = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(entity_id.to_string());
+
+        let mut frontier = vec![entity_id.to_string()];
+
+        for hop in 1..=max_hops {
+            let mut next_frontier = Vec::new();
+            for current in &frontier {
+                for rel in relationships {
+                    let next_id = if rel.source_id == *current {
+                        &rel.target_id
+                    } else if rel.target_id == *current {
+                        &rel.source_id
+                    } else {
+                        continue;
+                    };
+
+                    if visited.contains(next_id.as_str()) {
+                        continue;
+                    }
+
+                    visited.insert(next_id.clone());
+                    neighbors.push((next_id.clone(), hop));
+                    next_frontier.push(next_id.clone());
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        neighbors
+    }
+}
+
+/// A path through the knowledge graph
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPath {
+    /// Source entity ID
+    pub source_id: String,
+    /// Target entity ID
+    pub target_id: String,
+    /// Steps in the path
+    pub steps: Vec<PathStep>,
+}
+
+impl GraphPath {
+    /// Returns the length (number of hops) of this path
+    pub fn length(&self) -> usize {
+        self.steps.len()
+    }
+}
+
+/// A single step in a graph path
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathStep {
+    /// Entity reached at this step
+    pub entity_id: String,
+    /// Relationship type traversed
+    pub relation_type: String,
+    /// Direction: "outgoing" or "incoming"
+    pub direction: String,
 }
 
 #[cfg(test)]
@@ -511,6 +642,86 @@ mod tests {
 
         assert_eq!(result.entities.len(), 2);
         assert_eq!(result.total_count, 3);
+    }
+
+    #[test]
+    fn test_find_paths_direct() {
+        let rels = vec![
+            Relationship::new("A", "B", "connects"),
+            Relationship::new("B", "C", "connects"),
+        ];
+        let paths = QueryExecutor::find_paths("A", "C", 5, &rels);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].length(), 2);
+        assert_eq!(paths[0].steps[0].entity_id, "B");
+        assert_eq!(paths[0].steps[1].entity_id, "C");
+    }
+
+    #[test]
+    fn test_find_paths_no_path() {
+        let rels = vec![
+            Relationship::new("A", "B", "connects"),
+            Relationship::new("C", "D", "connects"),
+        ];
+        let paths = QueryExecutor::find_paths("A", "D", 5, &rels);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_find_paths_max_depth() {
+        let rels = vec![
+            Relationship::new("A", "B", "connects"),
+            Relationship::new("B", "C", "connects"),
+            Relationship::new("C", "D", "connects"),
+        ];
+        // Depth 2 should not find A→D (needs 3 hops)
+        let paths = QueryExecutor::find_paths("A", "D", 2, &rels);
+        assert!(paths.is_empty());
+        // Depth 3 should find it
+        let paths = QueryExecutor::find_paths("A", "D", 3, &rels);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].length(), 3);
+    }
+
+    #[test]
+    fn test_find_paths_bidirectional() {
+        let rels = vec![
+            Relationship::new("B", "A", "upstream"),
+            Relationship::new("B", "C", "downstream"),
+        ];
+        // A→C via B (A is target of first rel, B is source of second)
+        let paths = QueryExecutor::find_paths("A", "C", 5, &rels);
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn test_find_neighbors() {
+        let rels = vec![
+            Relationship::new("A", "B", "connects"),
+            Relationship::new("A", "C", "connects"),
+            Relationship::new("B", "D", "connects"),
+        ];
+        let neighbors = QueryExecutor::find_neighbors("A", 1, &rels);
+        assert_eq!(neighbors.len(), 2);
+        assert!(neighbors.iter().any(|(id, hop)| id == "B" && *hop == 1));
+        assert!(neighbors.iter().any(|(id, hop)| id == "C" && *hop == 1));
+
+        let neighbors_2hop = QueryExecutor::find_neighbors("A", 2, &rels);
+        assert_eq!(neighbors_2hop.len(), 3); // B, C at hop 1; D at hop 2
+        assert!(neighbors_2hop.iter().any(|(id, hop)| id == "D" && *hop == 2));
+    }
+
+    #[test]
+    fn test_graph_path_length() {
+        let path = GraphPath {
+            source_id: "A".into(),
+            target_id: "C".into(),
+            steps: vec![
+                PathStep { entity_id: "B".into(), relation_type: "x".into(), direction: "outgoing".into() },
+                PathStep { entity_id: "C".into(), relation_type: "y".into(), direction: "outgoing".into() },
+            ],
+        };
+        assert_eq!(path.length(), 2);
     }
 
     #[test]

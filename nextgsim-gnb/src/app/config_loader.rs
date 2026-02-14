@@ -195,8 +195,7 @@ pub fn validate_gnb_config(config: &GnbConfig) -> Result<(), ConfigValidationErr
     for (i, amf) in config.amf_configs.iter().enumerate() {
         if amf.port == 0 {
             return Err(ConfigValidationError::InvalidAmfConfig(format!(
-                "AMF {} has invalid port 0",
-                i
+                "AMF {i} has invalid port 0"
             )));
         }
     }
@@ -293,6 +292,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 

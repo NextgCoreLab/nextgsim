@@ -15,7 +15,7 @@ pub const DEFAULT_NAME_PREFIX: &str = "uesimtun";
 pub struct TunConfig {
     /// Name prefix for the TUN interface (e.g., "uesimtun" -> "uesimtun0", "uesimtun1", etc.)
     pub name_prefix: String,
-    /// Specific interface name (if set, overrides name_prefix)
+    /// Specific interface name (if set, overrides `name_prefix`)
     pub name: Option<String>,
     /// IPv4 address to assign to the interface
     pub address: Option<Ipv4Addr>,

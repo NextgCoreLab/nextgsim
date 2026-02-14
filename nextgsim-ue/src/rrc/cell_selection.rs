@@ -15,7 +15,7 @@
 //! - The cell is not barred
 //! - The cell is not reserved
 //! - The TAI is not in the forbidden list
-//! (PLMN matching is not required)
+//!   (PLMN matching is not required)
 //!
 //! # Reference
 //! - 3GPP TS 38.304: NR; User Equipment (UE) procedures in Idle mode and RRC Inactive state
@@ -159,12 +159,46 @@ impl CellDescription {
     }
 
     /// Calculate Srxlev (cell selection RX level value)
-    /// Srxlev = Q_rxlevmeas - (Q_rxlevmin + Q_rxlevminoffset)
+    /// Srxlev = `Q_rxlevmeas` - (`Q_rxlevmin` + `Q_rxlevminoffset`)
     /// Per 3GPP TS 38.304 Section 5.2.3.2
     pub fn srxlev(&self) -> i32 {
         let q_rxlev_min = self.sib1.q_rx_lev_min as i32 * 2; // Convert to dBm
         let q_rxlev_min_offset = self.sib1.q_rx_lev_min_offset.unwrap_or(0) as i32 * 2;
         self.dbm - (q_rxlev_min + q_rxlev_min_offset)
+    }
+
+    /// Calculate Squal (cell selection quality value)
+    /// Squal = Q_qualmeas - (Q_qualmin + Q_qualminoffset)
+    /// Per 3GPP TS 38.304 Section 5.2.3.2
+    /// Returns None if Q_qualmin is not configured (quality criteria not applicable)
+    pub fn squal(&self) -> Option<i32> {
+        let q_qual_min = self.sib1.q_qual_min? as i32;
+        // RSRQ is approximated from RSRP for simulation:
+        // RSRQ ~ RSRP + 10*log10(N_RB) - noise, simplified as RSRP + 10 for typical load
+        let q_qual_meas = self.dbm + 10;
+        Some(q_qual_meas - q_qual_min)
+    }
+
+    /// Combined cell selection criterion S per TS 38.304 Section 5.2.3.2
+    /// Cell is selected if Srxlev > 0 AND (Squal > 0 if configured)
+    pub fn meets_s_criteria(&self) -> bool {
+        if self.srxlev() <= 0 {
+            return false;
+        }
+        // If Squal is configured, it must also be positive
+        if let Some(squal) = self.squal() {
+            if squal <= 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Cell ranking value R per TS 38.304 Section 5.2.4.6
+    /// Rs = Q_meas,s + Q_hyst (serving cell)
+    /// Rn = Q_meas,n - Q_offset (neighbor cell)
+    pub fn ranking_value(&self, q_offset: i32) -> i32 {
+        self.dbm - q_offset
     }
 }
 
@@ -220,7 +254,7 @@ impl Default for CellReselectionParams {
 
 /// Cell selection and reselection manager
 pub struct CellSelector {
-    /// Detected cells indexed by cell_id
+    /// Detected cells indexed by `cell_id`
     cells: HashMap<i32, CellDescription>,
     /// Currently selected cell
     current_cell: ActiveCellInfo,
@@ -386,7 +420,7 @@ impl CellSelector {
     }
 
     /// Perform cell selection
-    /// Returns Some(cell_info) if a new cell was selected, None if no change
+    /// Returns `Some(cell_info)` if a new cell was selected, None if no change
     pub fn perform_cell_selection(&mut self) -> Option<ActiveCellInfo> {
         let elapsed = self.started_time.elapsed();
 
@@ -573,14 +607,14 @@ impl CellSelector {
                 continue;
             }
 
-            // Check signal level (Srxlev > 0)
-            if cell.srxlev() <= 0 {
+            // Check combined S criteria: Srxlev > 0 AND Squal > 0 (if configured)
+            if !cell.meets_s_criteria() {
                 report.low_signal_cells += 1;
                 continue;
             }
 
-            // Cell is suitable
-            candidates.push((cell_id, cell.dbm));
+            // Cell is suitable - use ranking value for comparison
+            candidates.push((cell_id, cell.ranking_value(0)));
         }
 
         if candidates.is_empty() {

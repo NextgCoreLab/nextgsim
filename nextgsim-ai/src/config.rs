@@ -20,14 +20,14 @@ pub enum ExecutionProvider {
         /// CUDA device ID (0 for first GPU)
         device_id: i32,
     },
-    /// Apple CoreML acceleration (macOS/iOS)
+    /// Apple `CoreML` acceleration (macOS/iOS)
     CoreML,
-    /// Windows DirectML acceleration
+    /// Windows `DirectML` acceleration
     DirectML {
         /// Device ID
         device_id: i32,
     },
-    /// NVIDIA TensorRT optimization
+    /// NVIDIA `TensorRT` optimization
     TensorRT {
         /// Device ID
         device_id: i32,
@@ -93,7 +93,7 @@ impl InferenceConfig {
         }
     }
 
-    /// Creates a new config with CoreML execution
+    /// Creates a new config with `CoreML` execution
     pub fn coreml() -> Self {
         Self {
             execution_provider: ExecutionProvider::CoreML,
@@ -324,7 +324,7 @@ pub struct FlConfig {
     pub dp_noise_multiplier: f32,
     /// Clipping threshold for differential privacy
     pub dp_clipping_threshold: f32,
-    /// FedProx proximal term coefficient (mu). Controls how much local
+    /// `FedProx` proximal term coefficient (mu). Controls how much local
     /// models are penalised for deviating from the global model. Only
     /// used when `aggregation_algorithm` is `FedProx`. Typical values
     /// range from 0.001 to 1.0.

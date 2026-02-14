@@ -14,8 +14,10 @@ use nextgsim_ngap::procedures::{
 
 /// AMF connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AmfState {
     /// Not connected
+    #[default]
     NotConnected,
     /// SCTP association established, waiting for NG Setup
     Connected,
@@ -27,11 +29,6 @@ pub enum AmfState {
     Overloaded,
 }
 
-impl Default for AmfState {
-    fn default() -> Self {
-        AmfState::NotConnected
-    }
-}
 
 impl std::fmt::Display for AmfState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -293,7 +290,7 @@ mod tests {
 
         // Streams should be different (1, 2, 3)
         let streams: HashSet<_> = [s1, s2, s3].iter().filter_map(|s| *s).collect();
-        assert!(streams.len() >= 1); // At least some unique streams
+        assert!(!streams.is_empty()); // At least some unique streams
 
         // Release and reallocate
         if let Some(stream) = s1 {

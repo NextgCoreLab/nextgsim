@@ -13,7 +13,7 @@ pub enum TeeType {
     IntelSgx,
     /// AMD SEV
     AmdSev,
-    /// ARM TrustZone
+    /// ARM `TrustZone`
     ArmTrustZone,
     /// AWS Nitro Enclaves
     AwsNitro,

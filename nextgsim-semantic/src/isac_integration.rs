@@ -22,7 +22,7 @@ pub struct SensingCompressionRequest {
 /// Sensing data payload types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SensingDataPayload {
-    /// Raw measurements (ToA, RSS, Doppler, etc.)
+    /// Raw measurements (`ToA`, RSS, Doppler, etc.)
     Measurements {
         measurements: Vec<f32>,
         metadata: MeasurementMetadata,
@@ -50,7 +50,7 @@ pub enum SensingDataPayload {
 /// Metadata for sensing measurements
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeasurementMetadata {
-    /// Measurement types (e.g., ToA, RSS, Doppler)
+    /// Measurement types (e.g., `ToA`, RSS, Doppler)
     pub measurement_types: Vec<String>,
     /// Anchor/cell IDs
     pub anchor_ids: Vec<i32>,

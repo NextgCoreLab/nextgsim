@@ -109,9 +109,9 @@ pub fn hybrid_generate_keypair() -> HybridKeyPair {
 /// * `hybrid_pk` - The recipient's hybrid public key (combined X25519 + ML-KEM)
 ///
 /// # Returns
-/// A tuple of (combined_ciphertext, shared_secret) where:
-/// - combined_ciphertext = X25519_ephemeral_public (32 bytes) || ML-KEM ciphertext
-/// - shared_secret = SHA-256(x25519_ss || ml_kem_ss) (32 bytes)
+/// A tuple of (`combined_ciphertext`, `shared_secret`) where:
+/// - `combined_ciphertext` = `X25519_ephemeral_public` (32 bytes) || ML-KEM ciphertext
+/// - `shared_secret` = SHA-256(x25519_ss || `ml_kem_ss`) (32 bytes)
 ///
 /// # Errors
 /// Returns an error if the public key is invalid or encapsulation fails.
@@ -129,7 +129,7 @@ pub fn hybrid_encapsulate(hybrid_pk: &HybridKeyPair) -> HybridResult<(Vec<u8>, [
 /// * `ml_kem_ek` - The recipient's ML-KEM-768 encapsulation key bytes
 ///
 /// # Returns
-/// A tuple of (combined_ciphertext, shared_secret)
+/// A tuple of (`combined_ciphertext`, `shared_secret`)
 ///
 /// # Errors
 /// Returns an error if the public keys are invalid or encapsulation fails.
@@ -228,9 +228,10 @@ pub fn hybrid_decapsulate_from_keys(
     }
 
     // Split combined ciphertext
+    // Length already validated above (>= X25519_KEY_SIZE)
     let eph_public_bytes: [u8; X25519_KEY_SIZE] = combined_ct[..X25519_KEY_SIZE]
         .try_into()
-        .expect("validated above");
+        .map_err(|_| HybridError::InvalidCiphertext("Failed to extract X25519 ephemeral public key".into()))?;
     let ml_kem_ct_bytes = &combined_ct[X25519_KEY_SIZE..];
 
     // Step 1: X25519 key agreement

@@ -36,7 +36,7 @@ pub struct NwdafInstance {
 pub struct NwdafCapabilities {
     /// Whether instance has MTLF (model training capability)
     pub has_mtlf: bool,
-    /// Whether instance has AnLF (analytics capability)
+    /// Whether instance has `AnLF` (analytics capability)
     pub has_anlf: bool,
     /// Maximum concurrent analytics requests
     pub max_concurrent_requests: usize,
@@ -116,6 +116,8 @@ pub struct NwdafCoordinator {
     next_request_id: u64,
     /// Heartbeat timeout (ms)
     heartbeat_timeout_ms: u64,
+    /// Shared analytics results from peer instances
+    shared_results: HashMap<(AnalyticsId, String), Vec<SharedAnalyticsResult>>,
 }
 
 impl NwdafCoordinator {
@@ -127,6 +129,7 @@ impl NwdafCoordinator {
             strategy,
             next_request_id: 1,
             heartbeat_timeout_ms: 30_000, // 30 seconds
+            shared_results: HashMap::new(),
         }
     }
 
@@ -357,6 +360,72 @@ impl NwdafCoordinator {
         info!("Changing load balancing strategy to {:?}", strategy);
         self.strategy = strategy;
     }
+
+    /// Shares an analytics result with peer NWDAF instances (TS 23.288 6.2B.3).
+    ///
+    /// Posts the result to the shared result store, where other instances can
+    /// query it. Results are stored indexed by analytics ID and target.
+    pub fn share_result(&mut self, result: SharedAnalyticsResult) {
+        let key = (result.analytics_id, result.target_key.clone());
+        debug!(
+            "Sharing analytics result from {} for {:?} target={}",
+            result.source_instance_id, result.analytics_id, result.target_key
+        );
+        self.shared_results
+            .entry(key)
+            .or_default()
+            .push(result);
+    }
+
+    /// Queries shared analytics results from peer instances.
+    ///
+    /// Returns all results matching the given analytics ID, optionally filtered
+    /// by target key and maximum age.
+    pub fn query_shared_results(
+        &self,
+        analytics_id: AnalyticsId,
+        target_key: Option<&str>,
+        max_age_ms: Option<u64>,
+    ) -> Vec<&SharedAnalyticsResult> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        self.shared_results
+            .iter()
+            .filter(|((aid, tkey), _)| {
+                *aid == analytics_id
+                    && target_key.is_none_or(|tk| tkey == tk)
+            })
+            .flat_map(|(_, results)| results.iter())
+            .filter(|r| {
+                max_age_ms.is_none_or(|max| now_ms.saturating_sub(r.timestamp_ms) <= max)
+            })
+            .collect()
+    }
+
+    /// Returns the count of shared results
+    pub fn shared_result_count(&self) -> usize {
+        self.shared_results.values().map(std::vec::Vec::len).sum()
+    }
+}
+
+/// Analytics result shared across NWDAF instances
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedAnalyticsResult {
+    /// Source NWDAF instance that produced the result
+    pub source_instance_id: String,
+    /// Analytics ID
+    pub analytics_id: AnalyticsId,
+    /// Target key (e.g. "ue-42", "cell-7", "any")
+    pub target_key: String,
+    /// Confidence score
+    pub confidence: f32,
+    /// Timestamp of the result
+    pub timestamp_ms: u64,
+    /// Serialized result payload (JSON)
+    pub payload_json: String,
 }
 
 impl Default for NwdafCoordinator {
@@ -510,6 +579,54 @@ mod tests {
         let active = coordinator.active_instances();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].instance_id, "nwdaf-1");
+    }
+
+    #[test]
+    fn test_share_and_query_results() {
+        let mut coordinator = NwdafCoordinator::new(LoadBalancingStrategy::LeastLoaded);
+
+        coordinator.share_result(SharedAnalyticsResult {
+            source_instance_id: "nwdaf-1".to_string(),
+            analytics_id: AnalyticsId::UeMobility,
+            target_key: "ue-42".to_string(),
+            confidence: 0.9,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            payload_json: "{}".to_string(),
+        });
+
+        coordinator.share_result(SharedAnalyticsResult {
+            source_instance_id: "nwdaf-2".to_string(),
+            analytics_id: AnalyticsId::NfLoad,
+            target_key: "cell-7".to_string(),
+            confidence: 0.85,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            payload_json: "{}".to_string(),
+        });
+
+        assert_eq!(coordinator.shared_result_count(), 2);
+
+        let mobility_results = coordinator.query_shared_results(
+            AnalyticsId::UeMobility, Some("ue-42"), None,
+        );
+        assert_eq!(mobility_results.len(), 1);
+        assert_eq!(mobility_results[0].source_instance_id, "nwdaf-1");
+
+        let load_results = coordinator.query_shared_results(
+            AnalyticsId::NfLoad, None, None,
+        );
+        assert_eq!(load_results.len(), 1);
+
+        // Query for nonexistent
+        let empty = coordinator.query_shared_results(
+            AnalyticsId::AbnormalBehavior, None, None,
+        );
+        assert!(empty.is_empty());
     }
 
     #[test]

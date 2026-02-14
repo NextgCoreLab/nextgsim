@@ -239,7 +239,7 @@ pub struct ModelMetrics {
 }
 
 impl ModelMetrics {
-    /// Creates a new ModelMetrics
+    /// Creates a new `ModelMetrics`
     pub fn new() -> Self {
         Self::default()
     }

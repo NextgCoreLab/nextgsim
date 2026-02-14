@@ -61,7 +61,7 @@ impl SctpTask {
         );
 
         // Parse addresses
-        let local_addr: SocketAddr = match format!("{}:{}", local_address, local_port).parse() {
+        let local_addr: SocketAddr = match format!("{local_address}:{local_port}").parse() {
             Ok(addr) => addr,
             Err(e) => {
                 error!("Invalid local address {}:{}: {}", local_address, local_port, e);
@@ -69,7 +69,7 @@ impl SctpTask {
             }
         };
 
-        let remote_addr: SocketAddr = match format!("{}:{}", remote_address, remote_port).parse() {
+        let remote_addr: SocketAddr = match format!("{remote_address}:{remote_port}").parse() {
             Ok(addr) => addr,
             Err(e) => {
                 error!("Invalid remote address {}:{}: {}", remote_address, remote_port, e);
@@ -402,6 +402,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 

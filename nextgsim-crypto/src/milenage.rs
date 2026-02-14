@@ -44,6 +44,9 @@ pub const IK_SIZE: usize = 16;
 /// AK size in bytes (48 bits)
 pub const AK_SIZE: usize = 6;
 
+/// Result type for `compute_all`: (MAC-A, RES, CK, IK, AK)
+pub type MilenageResult = ([u8; MAC_SIZE], [u8; RES_SIZE], [u8; CK_SIZE], [u8; IK_SIZE], [u8; AK_SIZE]);
+
 /// Milenage constants for rotation and XOR operations
 /// c1 = 0x00...00 (all zeros)
 const C1: [u8; BLOCK_SIZE] = [0x00; BLOCK_SIZE];
@@ -85,30 +88,30 @@ fn rotate_left(block: &[u8; BLOCK_SIZE], bits: usize) -> [u8; BLOCK_SIZE] {
     let bit_shift = bits % 8;
     let mut result = [0u8; BLOCK_SIZE];
     
-    for i in 0..BLOCK_SIZE {
+    for (i, result_byte) in result.iter_mut().enumerate().take(BLOCK_SIZE) {
         let src_idx = (i + byte_shift) % BLOCK_SIZE;
         let next_idx = (i + byte_shift + 1) % BLOCK_SIZE;
-        
+
         if bit_shift == 0 {
-            result[i] = block[src_idx];
+            *result_byte = block[src_idx];
         } else {
-            result[i] = (block[src_idx] << bit_shift) | (block[next_idx] >> (8 - bit_shift));
+            *result_byte = (block[src_idx] << bit_shift) | (block[next_idx] >> (8 - bit_shift));
         }
     }
     
     result
 }
 
-/// Compute OPc from OP and K
+/// Compute `OPc` from OP and K
 ///
-/// OPc = OP XOR E_K(OP)
+/// `OPc` = OP XOR `E_K(OP)`
 ///
 /// # Arguments
 /// * `k` - 128-bit subscriber key
 /// * `op` - 128-bit operator variant algorithm configuration field
 ///
 /// # Returns
-/// 128-bit OPc value
+/// 128-bit `OPc` value
 pub fn compute_opc(k: &[u8; KEY_SIZE], op: &[u8; OP_SIZE]) -> [u8; OP_SIZE] {
     let cipher = Aes128Block::new(k);
     let encrypted = cipher.encrypt_block_copy(op);
@@ -127,11 +130,11 @@ pub struct Milenage {
 }
 
 impl Milenage {
-    /// Create a new Milenage instance with K and OPc
+    /// Create a new Milenage instance with K and `OPc`
     ///
     /// # Arguments
     /// * `k` - 128-bit subscriber key
-    /// * `opc` - 128-bit OPc (pre-computed from OP)
+    /// * `opc` - 128-bit `OPc` (pre-computed from OP)
     pub fn new(k: &[u8; KEY_SIZE], opc: &[u8; OP_SIZE]) -> Self {
         Self {
             cipher: Aes128Block::new(k),
@@ -139,7 +142,7 @@ impl Milenage {
         }
     }
 
-    /// Create a new Milenage instance with K and OP (computes OPc internally)
+    /// Create a new Milenage instance with K and OP (computes `OPc` internally)
     ///
     /// # Arguments
     /// * `k` - 128-bit subscriber key
@@ -149,7 +152,7 @@ impl Milenage {
         Self::new(k, &opc)
     }
 
-    /// Compute TEMP = E_K(RAND XOR OPc)
+    /// Compute TEMP = `E_K(RAND` XOR `OPc`)
     fn compute_temp(&self, rand: &[u8; RAND_SIZE]) -> [u8; BLOCK_SIZE] {
         let mut temp = [0u8; BLOCK_SIZE];
         for i in 0..BLOCK_SIZE {
@@ -162,7 +165,7 @@ impl Milenage {
     /// Compute OUT1 for f1/f1* (MAC-A/MAC-S)
     /// 
     /// Per 3GPP TS 35.206 and reference implementation:
-    /// OUT1 = E_K(TEMP XOR rot(IN1 XOR OPc, r1) XOR c1) XOR OPc
+    /// OUT1 = `E_K(TEMP` XOR rot(IN1 XOR `OPc`, r1) XOR c1) XOR `OPc`
     fn compute_out1(&self, rand: &[u8; RAND_SIZE], sqn: &[u8; SQN_SIZE], amf: &[u8; AMF_SIZE]) -> [u8; BLOCK_SIZE] {
         let temp = self.compute_temp(rand);
         
@@ -235,7 +238,7 @@ impl Milenage {
     /// Compute OUT2 for f2/f5 (RES/AK)
     ///
     /// Per 3GPP TS 35.206:
-    /// OUT2 = E_K(rotate(TEMP XOR OPc, r2) XOR c2) XOR OPc
+    /// OUT2 = `E_K(rotate(TEMP` XOR `OPc`, r2) XOR c2) XOR `OPc`
     fn compute_out2(&self, rand: &[u8; RAND_SIZE]) -> [u8; BLOCK_SIZE] {
         let temp = self.compute_temp(rand);
         
@@ -296,7 +299,7 @@ impl Milenage {
     /// Compute OUT3 for f3 (CK)
     ///
     /// Per 3GPP TS 35.206:
-    /// OUT3 = E_K(rotate(TEMP XOR OPc, r3) XOR c3) XOR OPc
+    /// OUT3 = `E_K(rotate(TEMP` XOR `OPc`, r3) XOR c3) XOR `OPc`
     fn compute_out3(&self, rand: &[u8; RAND_SIZE]) -> [u8; BLOCK_SIZE] {
         let temp = self.compute_temp(rand);
         
@@ -338,7 +341,7 @@ impl Milenage {
     /// Compute OUT4 for f4 (IK)
     ///
     /// Per 3GPP TS 35.206:
-    /// OUT4 = E_K(rotate(TEMP XOR OPc, r4) XOR c4) XOR OPc
+    /// OUT4 = `E_K(rotate(TEMP` XOR `OPc`, r4) XOR c4) XOR `OPc`
     fn compute_out4(&self, rand: &[u8; RAND_SIZE]) -> [u8; BLOCK_SIZE] {
         let temp = self.compute_temp(rand);
         
@@ -380,7 +383,7 @@ impl Milenage {
     /// Compute OUT5 for f5* (AK for resync)
     ///
     /// Per 3GPP TS 35.206:
-    /// OUT5 = E_K(rotate(TEMP XOR OPc, r5) XOR c5) XOR OPc
+    /// OUT5 = `E_K(rotate(TEMP` XOR `OPc`, r5) XOR c5) XOR `OPc`
     fn compute_out5(&self, rand: &[u8; RAND_SIZE]) -> [u8; BLOCK_SIZE] {
         let temp = self.compute_temp(rand);
         
@@ -439,7 +442,7 @@ impl Milenage {
         rand: &[u8; RAND_SIZE],
         sqn: &[u8; SQN_SIZE],
         amf: &[u8; AMF_SIZE],
-    ) -> ([u8; MAC_SIZE], [u8; RES_SIZE], [u8; CK_SIZE], [u8; IK_SIZE], [u8; AK_SIZE]) {
+    ) -> MilenageResult {
         let mac_a = self.f1(rand, sqn, amf);
         let res = self.f2(rand);
         let ck = self.f3(rand);
@@ -450,7 +453,7 @@ impl Milenage {
     }
 }
 
-/// Convenience function to compute OPc
+/// Convenience function to compute `OPc`
 pub fn milenage_opc(k: &[u8; KEY_SIZE], op: &[u8; OP_SIZE]) -> [u8; OP_SIZE] {
     compute_opc(k, op)
 }
@@ -838,7 +841,7 @@ mod tests {
         assert_eq!(m.f5_star(&rand), expected_f5_star, "f5* mismatch");
     }
 
-    /// Test rotate_left function
+    /// Test `rotate_left` function
     #[test]
     fn test_rotate_left() {
         let block: [u8; 16] = [
@@ -894,7 +897,7 @@ mod tests {
         assert_eq!(f4.len(), 16);
     }
 
-    /// Test compute_all function
+    /// Test `compute_all` function
     #[test]
     fn test_compute_all() {
         let k: [u8; 16] = [

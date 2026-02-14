@@ -4,8 +4,8 @@
 //! This procedure is used to activate AS security between the UE and the network.
 //!
 //! The procedure consists of two messages:
-//! 1. SecurityModeCommand - gNB → UE: Network command to activate security
-//! 2. SecurityModeComplete - UE → gNB: Confirmation of security activation
+//! 1. `SecurityModeCommand` - gNB → UE: Network command to activate security
+//! 2. `SecurityModeComplete` - UE → gNB: Confirmation of security activation
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};

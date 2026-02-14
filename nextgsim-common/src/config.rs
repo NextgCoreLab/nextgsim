@@ -83,10 +83,60 @@ pub struct GnbConfig {
     /// SNPN (Standalone Non-Public Network) configuration
     #[serde(default)]
     pub snpn_config: Option<SnpnConfig>,
+    /// XR `QoS` support enabled (Rel-18 5QI 82-85)
+    #[serde(default)]
+    pub xr_qos_enabled: bool,
+    /// AI/ML for NR support enabled (Rel-18, TS 38.843)
+    #[serde(default)]
+    pub ai_ml_nr_enabled: bool,
+    /// Ambient `IoT` reader support enabled (Rel-18, TS 22.369)
+    #[serde(default)]
+    pub ambient_iot_enabled: bool,
+    /// UAV tracking and identification enabled (Rel-18, TS 23.256)
+    #[serde(default)]
+    pub uav_enabled: bool,
+    /// Ranging/sidelink positioning enabled (Rel-18, TS 23.586)
+    #[serde(default)]
+    pub ranging_enabled: bool,
+    /// Energy saving features enabled (Rel-18)
+    #[serde(default)]
+    pub energy_saving_enabled: bool,
 }
 
 fn default_gtp_port() -> u16 {
     2152
+}
+
+impl Default for GnbConfig {
+    fn default() -> Self {
+        Self {
+            nci: 0,
+            gnb_id_length: 24,
+            plmn: Plmn::default(),
+            tac: 0,
+            nssai: Vec::new(),
+            amf_configs: Vec::new(),
+            link_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            ngap_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            gtp_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            gtp_advertise_ip: None,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
+            pqc_config: PqcConfig::default(),
+            ntn_config: None,
+            mbs_enabled: false,
+            prose_enabled: false,
+            lcs_enabled: false,
+            snpn_config: None,
+            xr_qos_enabled: false,
+            ai_ml_nr_enabled: false,
+            ambient_iot_enabled: false,
+            uav_enabled: false,
+            ranging_enabled: false,
+            energy_saving_enabled: false,
+        }
+    }
 }
 
 impl GnbConfig {
@@ -102,7 +152,7 @@ impl GnbConfig {
     /// Returns the Cell ID extracted from the NCI.
     ///
     /// The Cell ID is the lower bits of the NCI, with the number of bits
-    /// being (36 - gnb_id_length).
+    /// being (36 - `gnb_id_length`).
     pub fn cell_id(&self) -> u32 {
         let cell_id_bits = 36 - self.gnb_id_length;
         let mask = (1u64 << cell_id_bits) - 1;
@@ -114,9 +164,9 @@ impl GnbConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
 pub enum OpType {
-    /// Operator key (OP) - needs to be converted to OPc
+    /// Operator key (OP) - needs to be converted to `OPc`
     Op,
-    /// Operator key derived (OPc) - used directly
+    /// Operator key derived (`OPc`) - used directly
     #[default]
     Opc,
 }
@@ -363,15 +413,395 @@ pub struct RouteDescriptor {
     pub ssc_mode: Option<u8>,
 }
 
-/// PIN (Personal IoT Network) role (Rel-18, TS 23.542).
+/// PIN (Personal `IoT` Network) role (Rel-18, TS 23.542).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PinRole {
-    /// PIN element (IoT device)
+    /// PIN element (`IoT` device)
     PinElement,
     /// PIN gateway (relay to network)
     PinGateway,
     /// PIN management entity
     PinManagement,
+}
+
+// ============================================================================
+// Rel-18 XR (Extended Reality) Configuration (TS 26.928)
+// ============================================================================
+
+/// XR traffic type for `QoS` differentiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XrTrafficType {
+    /// Cloud/split rendering video (downlink heavy)
+    CloudRendering,
+    /// Pose/control data (uplink, low latency)
+    PoseControl,
+    /// Haptic feedback (bidirectional, ultra-low latency)
+    Haptic,
+    /// Audio stream
+    Audio,
+    /// Scene description updates
+    SceneUpdate,
+}
+
+/// XR application profile configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XrConfig {
+    /// Whether XR optimizations are enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// XR traffic type
+    pub traffic_type: XrTrafficType,
+    /// Target frame rate (fps)
+    #[serde(default = "default_xr_fps")]
+    pub target_fps: u32,
+    /// Motion-to-photon latency budget (ms)
+    #[serde(default = "default_xr_mtp_latency")]
+    pub mtp_latency_ms: u32,
+    /// PDU Set awareness enabled (groups related PDUs)
+    #[serde(default)]
+    pub pdu_set_enabled: bool,
+    /// C-DRX cycle for XR power saving (ms, 0 = disabled)
+    #[serde(default)]
+    pub cdrx_cycle_ms: u32,
+    /// Jitter tolerance (ms)
+    #[serde(default = "default_xr_jitter")]
+    pub jitter_tolerance_ms: u32,
+}
+
+fn default_xr_fps() -> u32 { 90 }
+fn default_xr_mtp_latency() -> u32 { 20 }
+fn default_xr_jitter() -> u32 { 5 }
+
+impl Default for XrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            traffic_type: XrTrafficType::CloudRendering,
+            target_fps: 90,
+            mtp_latency_ms: 20,
+            pdu_set_enabled: false,
+            cdrx_cycle_ms: 0,
+            jitter_tolerance_ms: 5,
+        }
+    }
+}
+
+// ============================================================================
+// Rel-18 Ambient IoT Configuration (TS 22.369)
+// ============================================================================
+
+/// Ambient `IoT` device type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AmbientIotDeviceType {
+    /// Type A: Energy harvesting, no battery (backscatter only)
+    TypeA,
+    /// Type B: Assisted energy harvesting with small capacitor
+    TypeB,
+    /// Type C: Battery-assisted with active Tx
+    TypeC,
+}
+
+/// Ambient `IoT` configuration for a UE acting as reader/writer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbientIotConfig {
+    /// Device type
+    pub device_type: AmbientIotDeviceType,
+    /// Maximum read range (meters)
+    #[serde(default = "default_aiot_range")]
+    pub max_range_meters: f64,
+    /// Inventory round interval (ms)
+    #[serde(default = "default_aiot_interval")]
+    pub inventory_interval_ms: u32,
+    /// Command data size (bytes, max for backscatter response)
+    #[serde(default = "default_aiot_payload")]
+    pub max_payload_bytes: u32,
+}
+
+fn default_aiot_range() -> f64 { 10.0 }
+fn default_aiot_interval() -> u32 { 1000 }
+fn default_aiot_payload() -> u32 { 96 }
+
+impl Default for AmbientIotConfig {
+    fn default() -> Self {
+        Self {
+            device_type: AmbientIotDeviceType::TypeA,
+            max_range_meters: 10.0,
+            inventory_interval_ms: 1000,
+            max_payload_bytes: 96,
+        }
+    }
+}
+
+// ============================================================================
+// Rel-18 UAV (Unmanned Aerial Vehicle) Configuration (TS 23.256)
+// ============================================================================
+
+/// UAV UE configuration for aerial vehicle identification and tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UavConfig {
+    /// Whether this UE is a UAV (aerial UE)
+    #[serde(default)]
+    pub is_aerial_ue: bool,
+    /// UAV ID (Civil Aviation Authority assigned)
+    pub uav_id: Option<String>,
+    /// USS (UAV Traffic Management) address
+    pub uss_address: Option<String>,
+    /// Maximum flight altitude (meters)
+    #[serde(default = "default_uav_alt")]
+    pub max_altitude_meters: f64,
+    /// Remote identification enabled (broadcast ID)
+    #[serde(default)]
+    pub remote_id_enabled: bool,
+    /// C2 (Command and Control) link `QoS` required
+    #[serde(default)]
+    pub c2_link_required: bool,
+}
+
+fn default_uav_alt() -> f64 { 120.0 }
+
+impl Default for UavConfig {
+    fn default() -> Self {
+        Self {
+            is_aerial_ue: false,
+            uav_id: None,
+            uss_address: None,
+            max_altitude_meters: 120.0,
+            remote_id_enabled: false,
+            c2_link_required: false,
+        }
+    }
+}
+
+// ============================================================================
+// Rel-16 V2X (Vehicle-to-Everything) Configuration (TS 23.287)
+// ============================================================================
+
+/// V2X service type for differentiated QoS handling.
+///
+/// Reference: 3GPP TS 23.287 Section 5.2
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum V2xServiceType {
+    /// V2V (Vehicle-to-Vehicle) communication
+    V2V,
+    /// V2I (Vehicle-to-Infrastructure) communication
+    V2I,
+    /// V2P (Vehicle-to-Pedestrian) communication
+    V2P,
+    /// V2N (Vehicle-to-Network) communication
+    V2N,
+}
+
+/// V2X QoS requirements per service type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V2xQosRequirements {
+    /// Maximum end-to-end latency (ms)
+    pub max_latency_ms: u32,
+    /// Required reliability (probability 0.0-1.0)
+    pub reliability: f64,
+    /// Communication range (meters)
+    pub range_meters: f64,
+    /// Message priority (0-7, 7 = highest)
+    pub priority: u8,
+}
+
+/// V2X UE configuration.
+///
+/// Configures UE for V2X operation with network slicing (SST=3).
+/// Reference: 3GPP TS 23.287
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V2xConfig {
+    /// Whether V2X is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// V2X service types this UE supports
+    pub service_types: Vec<V2xServiceType>,
+    /// S-NSSAI for V2X slice (typically SST=3)
+    #[serde(default = "default_v2x_snssai")]
+    pub s_nssai: SNssai,
+    /// QoS requirements per service type
+    pub qos_requirements: Vec<(V2xServiceType, V2xQosRequirements)>,
+    /// Geographical area of operation (optional)
+    pub geo_area: Option<V2xGeoArea>,
+    /// Preferred communication mode (PC5 sidelink or Uu network)
+    #[serde(default)]
+    pub preferred_mode: V2xCommMode,
+}
+
+fn default_v2x_snssai() -> SNssai {
+    SNssai {
+        sst: 3, // V2X slice type
+        sd: None,
+    }
+}
+
+/// V2X geographical area of operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V2xGeoArea {
+    /// Center latitude (degrees)
+    pub center_lat: f64,
+    /// Center longitude (degrees)
+    pub center_lon: f64,
+    /// Radius (meters)
+    pub radius_meters: f64,
+}
+
+/// V2X communication mode preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
+pub enum V2xCommMode {
+    /// Prefer Uu (network) communication
+    #[default]
+    Uu,
+    /// Prefer PC5 (sidelink) communication
+    Pc5,
+    /// Use both Uu and PC5 (hybrid)
+    Hybrid,
+}
+
+impl Default for V2xConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_types: vec![V2xServiceType::V2V, V2xServiceType::V2I],
+            s_nssai: SNssai {
+                sst: 3, // V2X slice
+                sd: None,
+            },
+            qos_requirements: vec![
+                // Default V2V requirements (critical safety messages)
+                (V2xServiceType::V2V, V2xQosRequirements {
+                    max_latency_ms: 20,
+                    reliability: 0.99,
+                    range_meters: 300.0,
+                    priority: 7,
+                }),
+                // Default V2I requirements
+                (V2xServiceType::V2I, V2xQosRequirements {
+                    max_latency_ms: 50,
+                    reliability: 0.95,
+                    range_meters: 500.0,
+                    priority: 5,
+                }),
+                // Default V2P requirements
+                (V2xServiceType::V2P, V2xQosRequirements {
+                    max_latency_ms: 100,
+                    reliability: 0.95,
+                    range_meters: 200.0,
+                    priority: 6,
+                }),
+                // Default V2N requirements
+                (V2xServiceType::V2N, V2xQosRequirements {
+                    max_latency_ms: 100,
+                    reliability: 0.90,
+                    range_meters: 1000.0,
+                    priority: 4,
+                }),
+            ],
+            geo_area: None,
+            preferred_mode: V2xCommMode::Uu,
+        }
+    }
+}
+
+// ============================================================================
+// Rel-18 Ranging/Sidelink Positioning (TS 23.586)
+// ============================================================================
+
+/// Ranging method for UE-to-UE positioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RangingMethod {
+    /// RTT (Round-Trip Time) based ranging
+    Rtt,
+    /// RSRP (Reference Signal Received Power) based
+    Rsrp,
+    /// `AoA` (Angle of Arrival) based
+    AoA,
+    /// Carrier phase based (high precision)
+    CarrierPhase,
+    /// Multi-RTT (triangulation with multiple UEs)
+    MultiRtt,
+}
+
+/// Ranging/sidelink positioning configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangingConfig {
+    /// Whether ranging is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ranging method
+    pub method: RangingMethod,
+    /// Maximum ranging distance (meters)
+    #[serde(default = "default_ranging_distance")]
+    pub max_distance_meters: f64,
+    /// Ranging interval (ms)
+    #[serde(default = "default_ranging_interval")]
+    pub interval_ms: u32,
+    /// Target accuracy (meters)
+    #[serde(default = "default_ranging_accuracy")]
+    pub target_accuracy_meters: f64,
+}
+
+fn default_ranging_distance() -> f64 { 200.0 }
+fn default_ranging_interval() -> u32 { 100 }
+fn default_ranging_accuracy() -> f64 { 0.3 }
+
+impl Default for RangingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            method: RangingMethod::Rtt,
+            max_distance_meters: 200.0,
+            interval_ms: 100,
+            target_accuracy_meters: 0.3,
+        }
+    }
+}
+
+// ============================================================================
+// Rel-18 MINT (Multi-IMSI/Multi-USIM) Configuration (TS 23.761)
+// ============================================================================
+
+/// MINT (Multi-IMSI) configuration for UEs with multiple subscriptions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
+pub struct MintConfig {
+    /// Whether MINT is enabled (dual-SIM/multi-USIM)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Secondary SUPIs for additional subscriptions
+    #[serde(default)]
+    pub secondary_supis: Vec<String>,
+    /// Active subscription index (0 = primary)
+    #[serde(default)]
+    pub active_subscription: u8,
+    /// Allow simultaneous registration on multiple PLMNs
+    #[serde(default)]
+    pub simultaneous_registration: bool,
+}
+
+
+// ============================================================================
+// Rel-18 Enhanced RedCap Configuration (TS 38.300 v18)
+// ============================================================================
+
+/// Enhanced `RedCap` configuration (Rel-18 extends Rel-17 `RedCap`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedCapR18Config {
+    /// 5 MHz bandwidth support (Rel-18 extends Rel-17's 20 MHz minimum)
+    #[serde(default)]
+    pub bw_5mhz: bool,
+    /// Enhanced Power Saving Mode (ePSM)
+    #[serde(default)]
+    pub enhanced_psm: bool,
+    /// Extended eDRX cycle (seconds, 0 = default)
+    #[serde(default)]
+    pub edrx_cycle_seconds: u32,
+    /// Relaxed measurement criteria enabled
+    #[serde(default)]
+    pub relaxed_measurements: bool,
+    /// Reduced PDCCH monitoring
+    #[serde(default)]
+    pub reduced_pdcch_monitoring: bool,
 }
 
 /// PDU session type.
@@ -383,7 +813,7 @@ pub enum PduSessionType {
     Ipv4,
     /// IPv6 PDU session
     Ipv6,
-    /// IPv4v6 (dual-stack) PDU session
+    /// `IPv4v6` (dual-stack) PDU session
     Ipv4v6,
     /// Unstructured PDU session
     Unstructured,
@@ -438,9 +868,9 @@ pub struct UeConfig {
     pub hplmn: Plmn,
     /// Subscriber key K (128-bit)
     pub key: [u8; 16],
-    /// Operator key OP or OPc (128-bit)
+    /// Operator key OP or `OPc` (128-bit)
     pub op: [u8; 16],
-    /// Type of operator key (OP or OPc)
+    /// Type of operator key (OP or `OPc`)
     pub op_type: OpType,
     /// Authentication Management Field (16-bit)
     pub amf: [u8; 2],
@@ -461,7 +891,7 @@ pub struct UeConfig {
     /// Post-quantum cryptography configuration
     #[serde(default)]
     pub pqc_config: PqcConfig,
-    /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.101)
+    /// `RedCap` (Reduced Capability) UE indication (Rel-17, TS 38.101)
     #[serde(default)]
     pub redcap: bool,
     /// SNPN access configuration
@@ -473,9 +903,30 @@ pub struct UeConfig {
     /// UE Route Selection Policy rules
     #[serde(default)]
     pub ursp_rules: Vec<UrspRule>,
-    /// PIN (Personal IoT Network) role
+    /// PIN (Personal `IoT` Network) role
     #[serde(default)]
     pub pin_role: Option<PinRole>,
+    /// XR (Extended Reality) configuration (Rel-18, TS 26.928)
+    #[serde(default)]
+    pub xr_config: Option<XrConfig>,
+    /// Ambient `IoT` reader/writer configuration (Rel-18, TS 22.369)
+    #[serde(default)]
+    pub ambient_iot_config: Option<AmbientIotConfig>,
+    /// UAV (aerial UE) configuration (Rel-18, TS 23.256)
+    #[serde(default)]
+    pub uav_config: Option<UavConfig>,
+    /// Ranging/sidelink positioning configuration (Rel-18, TS 23.586)
+    #[serde(default)]
+    pub ranging_config: Option<RangingConfig>,
+    /// MINT (Multi-IMSI) configuration (Rel-18, TS 23.761)
+    #[serde(default)]
+    pub mint_config: Option<MintConfig>,
+    /// Enhanced `RedCap` configuration (Rel-18 extensions)
+    #[serde(default)]
+    pub redcap_r18: Option<RedCapR18Config>,
+    /// V2X (Vehicle-to-Everything) configuration (Rel-16, TS 23.287)
+    #[serde(default)]
+    pub v2x_config: Option<V2xConfig>,
 }
 
 impl Default for UeConfig {
@@ -504,6 +955,13 @@ impl Default for UeConfig {
             prose_enabled: false,
             ursp_rules: Vec::new(),
             pin_role: None,
+            xr_config: None,
+            ambient_iot_config: None,
+            uav_config: None,
+            ranging_config: None,
+            mint_config: None,
+            redcap_r18: None,
+            v2x_config: None,
         }
     }
 }
@@ -693,6 +1151,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         };
         // With gnb_id_length=24, cell_id is 12 bits
         // NCI = 0x000000001, gnb_id = upper 24 bits = 0, cell_id = lower 12 bits = 1
@@ -722,6 +1181,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         };
         // gnb_id_length=24, so gnb_id is upper 24 bits, cell_id is lower 12 bits
         // NCI = 0x123456789
@@ -839,6 +1299,7 @@ ignore_stream_ids: false
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         };
         let yaml = config.to_yaml().unwrap();
         assert!(yaml.contains("nci: 16"));
@@ -868,6 +1329,7 @@ ignore_stream_ids: false
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         };
         let yaml = original.to_yaml().unwrap();
         let parsed = GnbConfig::from_yaml(&yaml).unwrap();
@@ -951,6 +1413,7 @@ configured_nssai:
             prose_enabled: false,
             ursp_rules: vec![],
             pin_role: None,
+            ..Default::default()
         };
         let yaml = original.to_yaml().unwrap();
         let parsed = UeConfig::from_yaml(&yaml).unwrap();
@@ -1068,6 +1531,7 @@ configured_nssai:
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         };
         assert!(config.pqc_config.enabled);
         assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber512);
@@ -1103,6 +1567,7 @@ configured_nssai:
             prose_enabled: false,
             ursp_rules: vec![],
             pin_role: None,
+            ..Default::default()
         };
         assert!(config.pqc_config.enabled);
         assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber1024);

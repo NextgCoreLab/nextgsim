@@ -295,6 +295,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 
@@ -314,6 +315,8 @@ mod tests {
             gtp_tx: TaskHandle::new(gtp_tx),
             rls_tx: TaskHandle::new(rls_tx),
             sctp_tx: TaskHandle::new(sctp_tx),
+            sixg: None,
+            rel18: None,
         }
     }
 

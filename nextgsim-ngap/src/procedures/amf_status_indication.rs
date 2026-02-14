@@ -2,7 +2,7 @@
 //!
 //! Implements the AMF Status Indication procedure as defined in 3GPP TS 38.413 Section 8.7.6.
 //! This is a Class 2 (no response) procedure sent by an AMF to notify other AMFs
-//! or NG-RAN nodes of status changes, containing the UnavailableGUAMIList IE.
+//! or NG-RAN nodes of status changes, containing the `UnavailableGUAMIList` IE.
 
 use crate::codec::generated::*;
 use crate::codec::{decode_ngap_pdu, encode_ngap_pdu, NgapCodecError};
@@ -166,7 +166,7 @@ pub fn parse_amf_status_indication(
     let mut unavailable_guami_list: Option<Vec<UnavailableGuamiItem>> = None;
 
     for ie in &amf_status_indication.protocol_i_es.0 {
-        #[allow(unreachable_patterns)]
+        #[allow(irrefutable_let_patterns)]
         if let AMFStatusIndicationProtocolIEs_EntryValue::Id_UnavailableGUAMIList(list) = &ie.value {
             unavailable_guami_list = Some(parse_unavailable_guami_list(list));
         }

@@ -29,9 +29,9 @@ pub enum ConditionalHandoverError {
 /// CHO condition type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChoConditionType {
-    /// Event A3: Neighbour becomes offset better than SpCell
+    /// Event A3: Neighbour becomes offset better than `SpCell`
     EventA3,
-    /// Event A5: SpCell becomes worse than threshold1 AND neighbour becomes better than threshold2
+    /// Event A5: `SpCell` becomes worse than threshold1 AND neighbour becomes better than threshold2
     EventA5,
     /// Timer-based: handover after timer expiry
     TimerBased,
@@ -168,7 +168,7 @@ impl A3Offset {
 
 /// Event A3 condition parameters
 ///
-/// Condition: Neighbour becomes amount of offset better than SpCell
+/// Condition: Neighbour becomes amount of offset better than `SpCell`
 #[derive(Debug, Clone)]
 pub struct EventA3Condition {
     /// A3 offset value in dB
@@ -183,7 +183,7 @@ pub struct EventA3Condition {
 
 /// Event A5 condition parameters
 ///
-/// Condition: SpCell RSRP < threshold1 AND Neighbour RSRP > threshold2
+/// Condition: `SpCell` RSRP < threshold1 AND Neighbour RSRP > threshold2
 #[derive(Debug, Clone)]
 pub struct EventA5Condition {
     /// Threshold 1 (for serving cell becoming worse)

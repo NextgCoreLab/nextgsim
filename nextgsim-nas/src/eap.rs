@@ -206,65 +206,65 @@ impl From<EapAkaSubType> for u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum EapAttributeType {
-    /// AT_RAND (1) - Random challenge
+    /// `AT_RAND` (1) - Random challenge
     AtRand = 1,
-    /// AT_AUTN (2) - Authentication token
+    /// `AT_AUTN` (2) - Authentication token
     AtAutn = 2,
-    /// AT_RES (3) - Authentication response
+    /// `AT_RES` (3) - Authentication response
     AtRes = 3,
-    /// AT_AUTS (4) - Resynchronization parameter
+    /// `AT_AUTS` (4) - Resynchronization parameter
     AtAuts = 4,
-    /// AT_PADDING (6) - Padding
+    /// `AT_PADDING` (6) - Padding
     AtPadding = 6,
-    /// AT_NONCE_MT (7) - Nonce from MT
+    /// `AT_NONCE_MT` (7) - Nonce from MT
     AtNonceMt = 7,
-    /// AT_PERMANENT_ID_REQ (10) - Permanent identity request
+    /// `AT_PERMANENT_ID_REQ` (10) - Permanent identity request
     AtPermanentIdReq = 10,
-    /// AT_MAC (11) - Message authentication code
+    /// `AT_MAC` (11) - Message authentication code
     AtMac = 11,
-    /// AT_NOTIFICATION (12) - Notification code
+    /// `AT_NOTIFICATION` (12) - Notification code
     AtNotification = 12,
-    /// AT_ANY_ID_REQ (13) - Any identity request
+    /// `AT_ANY_ID_REQ` (13) - Any identity request
     AtAnyIdReq = 13,
-    /// AT_IDENTITY (14) - Identity
+    /// `AT_IDENTITY` (14) - Identity
     AtIdentity = 14,
-    /// AT_VERSION_LIST (15) - Version list
+    /// `AT_VERSION_LIST` (15) - Version list
     AtVersionList = 15,
-    /// AT_SELECTED_VERSION (16) - Selected version
+    /// `AT_SELECTED_VERSION` (16) - Selected version
     AtSelectedVersion = 16,
-    /// AT_FULLAUTH_ID_REQ (17) - Full authentication identity request
+    /// `AT_FULLAUTH_ID_REQ` (17) - Full authentication identity request
     AtFullauthIdReq = 17,
-    /// AT_COUNTER (19) - Counter
+    /// `AT_COUNTER` (19) - Counter
     AtCounter = 19,
-    /// AT_COUNTER_TOO_SMALL (20) - Counter too small
+    /// `AT_COUNTER_TOO_SMALL` (20) - Counter too small
     AtCounterTooSmall = 20,
-    /// AT_NONCE_S (21) - Nonce from server
+    /// `AT_NONCE_S` (21) - Nonce from server
     AtNonceS = 21,
-    /// AT_CLIENT_ERROR_CODE (22) - Client error code
+    /// `AT_CLIENT_ERROR_CODE` (22) - Client error code
     AtClientErrorCode = 22,
-    /// AT_KDF_INPUT (23) - KDF input (network name)
+    /// `AT_KDF_INPUT` (23) - KDF input (network name)
     AtKdfInput = 23,
-    /// AT_KDF (24) - Key derivation function
+    /// `AT_KDF` (24) - Key derivation function
     AtKdf = 24,
-    /// AT_IV (129) - Initialization vector
+    /// `AT_IV` (129) - Initialization vector
     AtIv = 129,
-    /// AT_ENCR_DATA (130) - Encrypted data
+    /// `AT_ENCR_DATA` (130) - Encrypted data
     AtEncrData = 130,
-    /// AT_NEXT_PSEUDONYM (132) - Next pseudonym
+    /// `AT_NEXT_PSEUDONYM` (132) - Next pseudonym
     AtNextPseudonym = 132,
-    /// AT_NEXT_REAUTH_ID (133) - Next reauthentication identity
+    /// `AT_NEXT_REAUTH_ID` (133) - Next reauthentication identity
     AtNextReauthId = 133,
-    /// AT_CHECKCODE (134) - Checkcode
+    /// `AT_CHECKCODE` (134) - Checkcode
     AtCheckcode = 134,
-    /// AT_RESULT_IND (135) - Result indication
+    /// `AT_RESULT_IND` (135) - Result indication
     AtResultInd = 135,
-    /// AT_BIDDING (136) - Bidding
+    /// `AT_BIDDING` (136) - Bidding
     AtBidding = 136,
-    /// AT_IPMS_IND (137) - IPMS indication
+    /// `AT_IPMS_IND` (137) - IPMS indication
     AtIpmsInd = 137,
-    /// AT_IPMS_RES (138) - IPMS response
+    /// `AT_IPMS_RES` (138) - IPMS response
     AtIpmsRes = 138,
-    /// AT_TRUST_IND (139) - Trust indication
+    /// `AT_TRUST_IND` (139) - Trust indication
     AtTrustInd = 139,
 }
 

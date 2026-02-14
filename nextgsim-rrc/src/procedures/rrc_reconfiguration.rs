@@ -5,8 +5,8 @@
 //! measurement configuration, and cell group configuration.
 //!
 //! The procedure consists of two messages:
-//! 1. RRCReconfiguration - gNB → UE: Network request to modify RRC connection
-//! 2. RRCReconfigurationComplete - UE → gNB: Confirmation of reconfiguration
+//! 1. `RRCReconfiguration` - gNB → UE: Network request to modify RRC connection
+//! 2. `RRCReconfigurationComplete` - UE → gNB: Confirmation of reconfiguration
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};

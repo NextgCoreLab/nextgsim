@@ -4,7 +4,7 @@
 //!
 //! # Overview
 //!
-//! In RRC_CONNECTED state, the UE performs measurements and reports them
+//! In `RRC_CONNECTED` state, the UE performs measurements and reports them
 //! to the network based on measurement configuration provided by the gNB.
 //! The network uses these reports to make handover decisions.
 //!
@@ -186,7 +186,7 @@ struct EventState {
 pub struct MeasurementManager {
     /// Active measurement configurations
     configs: HashMap<u8, MeasConfig>,
-    /// Current measurements per cell (cell_id -> measurement)
+    /// Current measurements per cell (`cell_id` -> measurement)
     measurements: HashMap<i32, CellMeasResult>,
     /// Event states per measurement ID
     event_states: HashMap<u8, EventState>,

@@ -174,7 +174,7 @@ impl ContextBuilder {
         });
     }
 
-    /// Sorts entries by relevance (highest first) and truncates to max_entries.
+    /// Sorts entries by relevance (highest first) and truncates to `max_entries`.
     fn finalize_entries(&mut self) {
         self.entries.sort_by(|a, b| {
             b.relevance

@@ -44,6 +44,8 @@ pub mod handover;
 pub mod measurement;
 pub mod state;
 pub mod task;
+pub mod redcap;
+pub mod uav;
 
 // Re-export main types
 pub use cell_selection::{
@@ -60,4 +62,11 @@ pub use measurement::{
 pub use handover::{
     HandoverState, HandoverFailureCause, TargetCellInfo, HandoverCommand,
     HandoverManager, parse_handover_command, build_reconfiguration_complete,
+};
+pub use redcap::{
+    RedCapMode, ReducedMimoMode, RedCapRelease, RedCapMeasurementRestrictions,
+};
+pub use uav::{
+    UavIdentity, UavAuthorizationState, GeoPosition, FlightWaypoint, FlightPathConfig,
+    RemoteIdBroadcast, C2LinkQuality, UavRegistrationContext,
 };

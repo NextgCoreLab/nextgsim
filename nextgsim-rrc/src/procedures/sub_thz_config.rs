@@ -160,9 +160,9 @@ pub struct BeamFailureConfig {
 /// Channel propagation model for sub-THz
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubThzChannelModel {
-    /// Line-of-sight (LoS) dominant
+    /// Line-of-sight (`LoS`) dominant
     LineOfSight,
-    /// Non-line-of-sight (NLoS) via reflection
+    /// Non-line-of-sight (`NLoS`) via reflection
     NonLineOfSight,
     /// Reconfigurable Intelligent Surface (RIS) assisted
     RisAssisted,
@@ -454,14 +454,22 @@ pub fn decode_sub_thz_config_header(
         ));
     }
 
-    let config_id = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+    let config_id = u16::from_be_bytes(
+        bytes[0..2]
+            .try_into()
+            .map_err(|_| SubThzConfigError::CodecError("Invalid config_id bytes".to_string()))?,
+    );
     let band = match bytes[2] {
         0 => SubThzBand::DBand,
         1 => SubThzBand::HBand,
         2 => SubThzBand::Custom { min_ghz: 100, max_ghz: 300 },
         _ => return Err(SubThzConfigError::CodecError("Unknown band type".to_string())),
     };
-    let center_freq_ghz = u16::from_be_bytes(bytes[3..5].try_into().unwrap());
+    let center_freq_ghz = u16::from_be_bytes(
+        bytes[3..5]
+            .try_into()
+            .map_err(|_| SubThzConfigError::CodecError("Invalid center_freq_ghz bytes".to_string()))?,
+    );
     let channel_model = match bytes[7] {
         0 => SubThzChannelModel::LineOfSight,
         1 => SubThzChannelModel::NonLineOfSight,

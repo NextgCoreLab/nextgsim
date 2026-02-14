@@ -29,6 +29,7 @@ use nextgsim_common::OctetString;
 
 use super::amf_context::{AmfState, NgapAmfContext};
 use super::ue_context::{NgapPduSession, NgapUeContext};
+use super::mbs_context::{GnbMbsContext, MbsSessionManager, Tmgi, MulticastTunnelInfo};
 
 use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu};
 use nextgsim_ngap::procedures::{
@@ -89,6 +90,8 @@ pub struct NgapTask {
     downlink_teid_counter: u32,
     /// Whether the NGAP task is initialized (at least one AMF ready)
     is_initialized: bool,
+    /// MBS session manager (Rel-17)
+    mbs_sessions: MbsSessionManager,
 }
 
 impl NgapTask {
@@ -101,6 +104,7 @@ impl NgapTask {
             ran_ue_ngap_id_counter: 0,
             downlink_teid_counter: 0,
             is_initialized: false,
+            mbs_sessions: MbsSessionManager::new(),
         }
     }
 
@@ -292,7 +296,7 @@ impl NgapTask {
             gnb_id: GnbId {
                 plmn_identity: plmn_bytes,
                 gnb_id_value: (config.nci >> (36 - config.gnb_id_length)) as u32,
-                gnb_id_length: config.gnb_id_length as u8,
+                gnb_id_length: config.gnb_id_length,
             },
             ran_node_name: Some("nextgsim-gnb".to_string()),
             supported_ta_list: vec![SupportedTaItem {
@@ -1313,7 +1317,7 @@ impl NgapTask {
     // ========================================================================
 
     /// Handles Handover Command from AMF (source gNB side)
-    /// AMF sends this after receiving HandoverRequestAcknowledge from target gNB.
+    /// AMF sends this after receiving `HandoverRequestAcknowledge` from target gNB.
     /// Source gNB must forward the transparent container to UE via RRC and
     /// release resources after UE completes handover.
     async fn handle_handover_command(
@@ -1370,7 +1374,7 @@ impl NgapTask {
 
     /// Handles Handover Request from AMF (target gNB side)
     /// AMF sends this to the target gNB to prepare handover resources.
-    /// Target gNB must allocate resources and respond with HandoverRequestAcknowledge.
+    /// Target gNB must allocate resources and respond with `HandoverRequestAcknowledge`.
     async fn handle_handover_request(
         &mut self,
         client_id: i32,
@@ -1455,7 +1459,7 @@ impl NgapTask {
         }
     }
 
-    /// Initiates a handover by sending HandoverRequired to AMF (source gNB side)
+    /// Initiates a handover by sending `HandoverRequired` to AMF (source gNB side)
     /// Called when measurement reports indicate better target cell
     #[allow(dead_code)]
     async fn initiate_handover(
@@ -1538,6 +1542,7 @@ impl NgapTask {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_handover_required(
         &self,
         amf_client_id: i32,
@@ -1681,7 +1686,7 @@ impl NgapTask {
 
     /// Updates initialization status and notifies App task
     async fn update_initialization_status(&mut self) {
-        let any_ready = self.amf_contexts.values().any(|ctx| ctx.is_ready());
+        let any_ready = self.amf_contexts.values().any(super::amf_context::NgapAmfContext::is_ready);
 
         if any_ready != self.is_initialized {
             self.is_initialized = any_ready;
@@ -1703,6 +1708,160 @@ impl NgapTask {
                 }
                 info!("NGAP initialized, radio powered on");
             }
+        }
+    }
+
+    // ========================================================================
+    // MBS (Multicast/Broadcast Service) Procedures (Rel-17)
+    // ========================================================================
+
+    /// Handles MBS Session Activation Request from AMF
+    async fn handle_mbs_session_activation_request(
+        &mut self,
+        session_id: u32,
+        tmgi_bytes: [u8; 6],
+        is_broadcast: bool,
+        multicast_ip: Option<std::net::IpAddr>,
+        qfi: u8,
+    ) {
+        info!(
+            "MBS Session Activation Request: session_id={}, tmgi={:02x?}, broadcast={}, qfi={}",
+            session_id, tmgi_bytes, is_broadcast, qfi
+        );
+
+        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
+        let mut mbs_ctx = GnbMbsContext::new(session_id, tmgi, is_broadcast);
+
+        // Create multicast tunnel info if provided
+        if let Some(mcast_ip) = multicast_ip {
+            let tnl_info = MulticastTunnelInfo {
+                multicast_ip: mcast_ip,
+                source_ip: None,
+                teid: self.next_downlink_teid(),
+                qfi,
+            };
+            mbs_ctx.activate(Some(tnl_info));
+        } else {
+            mbs_ctx.activate(None);
+        }
+
+        // Add session to manager
+        if self.mbs_sessions.add_session(mbs_ctx) {
+            info!(
+                "MBS session {} activated successfully (TMGI={:02x?})",
+                session_id, tmgi_bytes
+            );
+        } else {
+            warn!("Failed to activate MBS session {}, already exists", session_id);
+        }
+    }
+
+    /// Handles MBS Session Deactivation Request from AMF
+    async fn handle_mbs_session_deactivation_request(&mut self, session_id: u32) {
+        info!("MBS Session Deactivation Request: session_id={}", session_id);
+
+        if let Some(mut session) = self.mbs_sessions.remove_session(session_id) {
+            session.deactivate();
+            info!("MBS session {} deactivated", session_id);
+        } else {
+            warn!("MBS session {} not found for deactivation", session_id);
+        }
+    }
+
+    /// Handles Multicast Group Paging from AMF
+    async fn handle_multicast_group_paging(&mut self, tmgi_bytes: [u8; 6], area_scope: Vec<u32>) {
+        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
+        info!(
+            "Multicast Group Paging: tmgi={:02x?}, area_scope={:?}",
+            tmgi_bytes, area_scope
+        );
+
+        // Find the MBS session
+        if let Some(session) = self.mbs_sessions.get_session_by_tmgi(&tmgi) {
+            if session.is_active() {
+                info!(
+                    "Paging for MBS session {}, {} joined UEs",
+                    session.session_id,
+                    session.ue_count()
+                );
+                // In a real implementation, would trigger RRC paging for interested UEs
+                // For now, just log the paging request
+            } else {
+                warn!(
+                    "MBS session {} is not active (state: {:?})",
+                    session.session_id, session.state
+                );
+            }
+        } else {
+            warn!("MBS session with TMGI {:02x?} not found", tmgi_bytes);
+        }
+    }
+
+    /// Handles MBS UE Join Request from RRC
+    async fn handle_mbs_ue_join_request(&mut self, ue_id: i32, tmgi_bytes: [u8; 6]) {
+        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
+        info!(
+            "MBS UE Join Request: ue_id={}, tmgi={:02x?}",
+            ue_id, tmgi_bytes
+        );
+
+        if let Some(session) = self.mbs_sessions.get_session_by_tmgi_mut(&tmgi) {
+            if session.add_ue(ue_id) {
+                info!(
+                    "UE {} joined MBS session {}, total UEs: {}",
+                    ue_id,
+                    session.session_id,
+                    session.ue_count()
+                );
+
+                // Send MulticastSessionUpdateRequest to AMF to inform of UE join
+                // In a real implementation, would encode and send NGAP message
+                debug!(
+                    "Would send MulticastSessionUpdateRequest to AMF for session {} (UE {} joined)",
+                    session.session_id, ue_id
+                );
+            } else {
+                debug!("UE {} already in MBS session {}", ue_id, session.session_id);
+            }
+        } else {
+            warn!(
+                "Cannot join MBS session: TMGI {:02x?} not found",
+                tmgi_bytes
+            );
+        }
+    }
+
+    /// Handles MBS UE Leave Request from RRC
+    async fn handle_mbs_ue_leave_request(&mut self, ue_id: i32, tmgi_bytes: [u8; 6]) {
+        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
+        info!(
+            "MBS UE Leave Request: ue_id={}, tmgi={:02x?}",
+            ue_id, tmgi_bytes
+        );
+
+        if let Some(session) = self.mbs_sessions.get_session_by_tmgi_mut(&tmgi) {
+            if session.remove_ue(ue_id) {
+                info!(
+                    "UE {} left MBS session {}, remaining UEs: {}",
+                    ue_id,
+                    session.session_id,
+                    session.ue_count()
+                );
+
+                // Send MulticastSessionUpdateRequest to AMF to inform of UE leave
+                // In a real implementation, would encode and send NGAP message
+                debug!(
+                    "Would send MulticastSessionUpdateRequest to AMF for session {} (UE {} left)",
+                    session.session_id, ue_id
+                );
+            } else {
+                debug!("UE {} not in MBS session {}", ue_id, session.session_id);
+            }
+        } else {
+            warn!(
+                "Cannot leave MBS session: TMGI {:02x?} not found",
+                tmgi_bytes
+            );
         }
     }
 }
@@ -1778,6 +1937,34 @@ impl Task for NgapTask {
                                 satellite_type, satellite_id, propagation_delay_us, common_ta_us, k_offset
                             );
                         }
+                        NgapMessage::MbsSessionActivationRequest {
+                            session_id,
+                            tmgi,
+                            is_broadcast,
+                            multicast_ip,
+                            qfi,
+                        } => {
+                            self.handle_mbs_session_activation_request(
+                                session_id,
+                                tmgi,
+                                is_broadcast,
+                                multicast_ip,
+                                qfi,
+                            )
+                            .await;
+                        }
+                        NgapMessage::MbsSessionDeactivationRequest { session_id } => {
+                            self.handle_mbs_session_deactivation_request(session_id).await;
+                        }
+                        NgapMessage::MulticastGroupPaging { tmgi, area_scope } => {
+                            self.handle_multicast_group_paging(tmgi, area_scope).await;
+                        }
+                        NgapMessage::MbsUeJoinRequest { ue_id, tmgi } => {
+                            self.handle_mbs_ue_join_request(ue_id, tmgi).await;
+                        }
+                        NgapMessage::MbsUeLeaveRequest { ue_id, tmgi } => {
+                            self.handle_mbs_ue_leave_request(ue_id, tmgi).await;
+                        }
                     }
                 }
                 Some(TaskMessage::Shutdown) => {
@@ -1829,6 +2016,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 

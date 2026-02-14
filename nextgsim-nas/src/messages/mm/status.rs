@@ -62,7 +62,7 @@ impl FiveGMmStatus {
         }
     }
 
-    /// Create a 5GMM Status message from an Ie5gMmCause
+    /// Create a 5GMM Status message from an `Ie5gMmCause`
     pub fn from_ie(mm_cause: Ie5gMmCause) -> Self {
         Self { mm_cause }
     }

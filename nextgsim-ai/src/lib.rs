@@ -22,9 +22,9 @@
 //! - **ONNX Runtime**: Primary inference backend with GPU acceleration support
 //!   - CPU execution provider (default)
 //!   - CUDA execution provider (NVIDIA GPUs)
-//!   - CoreML execution provider (Apple Silicon)
-//!   - DirectML execution provider (Windows)
-//!   - TensorRT execution provider (NVIDIA optimized)
+//!   - `CoreML` execution provider (Apple Silicon)
+//!   - `DirectML` execution provider (Windows)
+//!   - `TensorRT` execution provider (NVIDIA optimized)
 //!
 //! # Example Usage
 //!
@@ -56,7 +56,9 @@ pub mod inference;
 pub mod isac_pipeline;
 pub mod metrics;
 pub mod model;
+pub mod nr_models;
 pub mod semantic_pipeline;
+pub mod xr_traffic;
 pub mod tensor;
 pub mod tflite;
 
@@ -76,3 +78,7 @@ pub use semantic_pipeline::{
 };
 pub use tensor::{TensorData, TensorShape};
 pub use tflite::TfLiteEngine;
+pub use xr_traffic::{
+    CdrxState, PduSet, PduSetManager, Xr5Qi, XrCdrxController, XrFrame, XrQosFlow,
+    XrTrafficModel,
+};

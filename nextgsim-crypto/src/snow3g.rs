@@ -45,7 +45,7 @@ const SQ: [u8; 256] = [
     0x56, 0xE1, 0x77, 0xC9, 0x1E, 0x9E, 0x95, 0xA3, 0x90, 0x19, 0xA8, 0x6C, 0x09, 0xD0, 0xF0, 0x86,
 ];
 
-/// MULx operation: multiplication by x in GF(2^8) with reduction polynomial
+/// `MULx` operation: multiplication by x in GF(2^8) with reduction polynomial
 #[inline]
 fn mul_x(v: u8, c: u8) -> u8 {
     if v & 0x80 != 0 {
@@ -55,7 +55,7 @@ fn mul_x(v: u8, c: u8) -> u8 {
     }
 }
 
-/// MULxPOW: repeated MULx operation
+/// `MULxPOW`: repeated `MULx` operation
 fn mul_x_pow(v: u8, i: u8, c: u8) -> u8 {
     let mut result = v;
     for _ in 0..i {
@@ -64,7 +64,7 @@ fn mul_x_pow(v: u8, i: u8, c: u8) -> u8 {
     result
 }
 
-/// MULalpha: multiplication by alpha in the LFSR feedback polynomial
+/// `MULalpha`: multiplication by alpha in the LFSR feedback polynomial
 #[inline]
 fn mul_alpha(c: u8) -> u32 {
     ((mul_x_pow(c, 23, 0xa9) as u32) << 24)
@@ -73,7 +73,7 @@ fn mul_alpha(c: u8) -> u32 {
         | (mul_x_pow(c, 239, 0xa9) as u32)
 }
 
-/// DIValpha: division by alpha in the LFSR feedback polynomial
+/// `DIValpha`: division by alpha in the LFSR feedback polynomial
 #[inline]
 fn div_alpha(c: u8) -> u32 {
     ((mul_x_pow(c, 16, 0xa9) as u32) << 24)
@@ -272,7 +272,7 @@ pub fn uea2_f8(key: &[u8; 16], count: u32, bearer: u32, direction: u32, data: &m
     }
 }
 
-/// MUL64x operation for UIA2
+/// `MUL64x` operation for UIA2
 #[inline]
 fn mul64x(v: u64, c: u64) -> u64 {
     if v & 0x8000000000000000 != 0 {
@@ -282,7 +282,7 @@ fn mul64x(v: u64, c: u64) -> u64 {
     }
 }
 
-/// MUL64xPOW operation for UIA2
+/// `MUL64xPOW` operation for UIA2
 fn mul64x_pow(v: u64, i: u8, c: u64) -> u64 {
     let mut result = v;
     for _ in 0..i {
@@ -397,8 +397,8 @@ pub fn uia2_f9(key: &[u8; 16], count: u32, fresh: u32, direction: u32, data: &[u
 
     // Compute MAC
     let mut mac_i = [0u8; 4];
-    for i in 0..4 {
-        mac_i[i] = (((eval >> (56 - i * 8)) ^ ((z[4] >> (24 - i * 8)) as u64)) & 0xff) as u8;
+    for (i, byte) in mac_i.iter_mut().enumerate() {
+        *byte = (((eval >> (56 - i * 8)) ^ ((z[4] >> (24 - i * 8)) as u64)) & 0xff) as u8;
     }
 
     u32::from_be_bytes(mac_i)
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(s2(input), output);
     }
 
-    /// Test MULx operation
+    /// Test `MULx` operation
     #[test]
     fn test_mul_x() {
         // When MSB is 0, just shift left
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(mul_x(0x81, 0x1b), 0x1b ^ 0x02);
     }
 
-    /// Test MULxPOW operation
+    /// Test `MULxPOW` operation
     #[test]
     fn test_mul_x_pow() {
         // MULxPOW with i=0 should return original value

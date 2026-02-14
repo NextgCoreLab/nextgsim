@@ -163,6 +163,19 @@ impl AppTask {
                     error!("Failed to send PDU session release request: {}", e);
                 }
             }
+            NasAction::ReleaseAllPduSessions { sessions } => {
+                info!("Releasing {} PDU session(s) sequentially", sessions.len());
+                for (psi, pti) in sessions {
+                    info!("Initiating PDU session release: PSI={}, PTI={}", psi, pti);
+                    let msg = NasMessage::InitiatePduSessionRelease { psi, pti };
+                    if let Err(e) = self.task_base.nas_tx.send(msg).await {
+                        error!("Failed to send PDU session release for PSI={}: {}", psi, e);
+                        break;
+                    }
+                    // Small delay between releases to avoid race conditions
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
             NasAction::Deregister { cause } => {
                 use crate::nas::mm::DeregistrationCause;
                 let switch_off = matches!(cause, DeregistrationCause::SwitchOff);
@@ -230,7 +243,7 @@ impl AppTask {
     /// Handles downlink data delivery (to TUN).
     ///
     /// Note: In the current architecture, downlink data forwarding to TUN is handled
-    /// directly in main.rs via the NasMessage::DownlinkDataDelivery message, as the
+    /// directly in main.rs via the `NasMessage::DownlinkDataDelivery` message, as the
     /// TUN task channel is created there.
     fn handle_downlink_data(&self, psi: i32, data: nextgsim_common::OctetString) {
         debug!("Downlink data delivery: psi={}, len={}", psi, data.len());
@@ -422,6 +435,8 @@ mod tests {
             nas_tx: TaskHandle::new(nas_tx),
             rrc_tx: TaskHandle::new(rrc_tx),
             rls_tx: TaskHandle::new(rls_tx),
+            sixg: None,
+            rel18: None,
         }
     }
 

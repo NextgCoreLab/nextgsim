@@ -16,7 +16,7 @@ pub enum EffectivenessMetric {
     F1Score,
     /// mAP (mean Average Precision) for detection
     MeanAveragePrecision,
-    /// IoU (Intersection over Union) for segmentation
+    /// `IoU` (Intersection over Union) for segmentation
     IoU,
     /// BLEU score for translation
     BleuScore,
@@ -198,7 +198,7 @@ impl GoalOrientedEncoder {
     }
 }
 
-/// Converts SemanticTask to task ID
+/// Converts `SemanticTask` to task ID
 fn task_to_id(task: SemanticTask) -> u32 {
     match task {
         SemanticTask::ImageClassification => 0,

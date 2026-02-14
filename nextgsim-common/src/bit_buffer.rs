@@ -1,4 +1,4 @@
-//! BitBuffer - A bit-level read/write buffer for ASN.1 encoding.
+//! `BitBuffer` - A bit-level read/write buffer for ASN.1 encoding.
 //!
 //! This module provides `BitBuffer`, which allows reading and writing
 //! individual bits and multi-bit values. It's commonly used for ASN.1

@@ -560,7 +560,7 @@ impl NasTimerManager {
     /// Start a timer by its code with default interval.
     ///
     /// # Arguments
-    /// * `code` - Timer code (e.g., TIMER_T3510)
+    /// * `code` - Timer code (e.g., `TIMER_T3510`)
     /// * `clear_expiry_count` - Whether to reset the expiry count
     ///
     /// Returns `true` if the timer was found and started.
@@ -755,7 +755,7 @@ impl NasTimerManager {
 
     /// Get status information for all timers.
     ///
-    /// Returns a vector of (code, is_running, remaining_secs) tuples.
+    /// Returns a vector of (code, `is_running`, `remaining_secs`) tuples.
     pub fn status(&self) -> Vec<(u16, bool, u32)> {
         let all_timers: [&UeTimer; 15] = [
             &self.t3346,

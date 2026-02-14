@@ -49,9 +49,9 @@ mod modification_request_iei {
     pub const ALWAYS_ON_PDU_SESSION_REQUESTED: u8 = 0xB;
     /// Integrity protection maximum data rate
     pub const INTEGRITY_PROTECTION_MAX_DATA_RATE: u8 = 0x13;
-    /// Requested QoS rules
+    /// Requested `QoS` rules
     pub const REQUESTED_QOS_RULES: u8 = 0x7A;
-    /// Requested QoS flow descriptions
+    /// Requested `QoS` flow descriptions
     pub const REQUESTED_QOS_FLOW_DESCRIPTIONS: u8 = 0x79;
     /// Mapped EPS bearer contexts
     pub const MAPPED_EPS_BEARER_CONTEXTS: u8 = 0x75;
@@ -79,11 +79,11 @@ mod modification_command_iei {
     pub const RQ_TIMER_VALUE: u8 = 0x56;
     /// Always-on PDU session indication
     pub const ALWAYS_ON_PDU_SESSION_INDICATION: u8 = 0x8;
-    /// Authorized QoS rules
+    /// Authorized `QoS` rules
     pub const AUTHORIZED_QOS_RULES: u8 = 0x7A;
     /// Mapped EPS bearer contexts
     pub const MAPPED_EPS_BEARER_CONTEXTS: u8 = 0x75;
-    /// Authorized QoS flow descriptions
+    /// Authorized `QoS` flow descriptions
     pub const AUTHORIZED_QOS_FLOW_DESCRIPTIONS: u8 = 0x79;
     /// Extended protocol configuration options
     pub const EXTENDED_PROTOCOL_CONFIG_OPTIONS: u8 = 0x7B;
@@ -123,9 +123,9 @@ pub struct PduSessionModificationRequest {
     pub always_on_pdu_session_requested: Option<bool>,
     /// Integrity protection maximum data rate (optional, Type 4, IEI 0x13)
     pub integrity_protection_max_data_rate: Option<[u8; 2]>,
-    /// Requested QoS rules (optional, Type 6, IEI 0x7A)
+    /// Requested `QoS` rules (optional, Type 6, IEI 0x7A)
     pub requested_qos_rules: Option<Vec<u8>>,
-    /// Requested QoS flow descriptions (optional, Type 6, IEI 0x79)
+    /// Requested `QoS` flow descriptions (optional, Type 6, IEI 0x79)
     pub requested_qos_flow_descriptions: Option<Vec<u8>>,
     /// Mapped EPS bearer contexts (optional, Type 6, IEI 0x75)
     pub mapped_eps_bearer_contexts: Option<Vec<u8>>,
@@ -531,11 +531,11 @@ pub struct PduSessionModificationCommand {
     pub rq_timer_value: Option<u8>,
     /// Always-on PDU session indication (optional, Type 1, IEI 0x8)
     pub always_on_pdu_session_indication: Option<bool>,
-    /// Authorized QoS rules (optional, Type 6, IEI 0x7A)
+    /// Authorized `QoS` rules (optional, Type 6, IEI 0x7A)
     pub authorized_qos_rules: Option<Vec<u8>>,
     /// Mapped EPS bearer contexts (optional, Type 6, IEI 0x75)
     pub mapped_eps_bearer_contexts: Option<Vec<u8>>,
-    /// Authorized QoS flow descriptions (optional, Type 6, IEI 0x79)
+    /// Authorized `QoS` flow descriptions (optional, Type 6, IEI 0x79)
     pub authorized_qos_flow_descriptions: Option<Vec<u8>>,
     /// Extended protocol configuration options (optional, Type 6, IEI 0x7B)
     pub extended_protocol_config_options: Option<Vec<u8>>,
@@ -832,6 +832,142 @@ impl PduSessionModificationComplete {
 }
 
 // ============================================================================
+// PDU Session Modification Command Reject (3GPP TS 24.501 Section 8.3.11)
+// ============================================================================
+
+/// IEI values for PDU Session Modification Command Reject optional IEs
+#[allow(dead_code)]
+mod modification_command_reject_iei {
+    /// Extended protocol configuration options
+    pub const EXTENDED_PROTOCOL_CONFIG_OPTIONS: u8 = 0x7B;
+}
+
+/// PDU Session Modification Command Reject message (UE to network)
+///
+/// This message is sent by the UE to the network to reject a PDU session
+/// modification command.
+///
+/// 3GPP TS 24.501 Section 8.3.11
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PduSessionModificationCommandReject {
+    /// PDU Session ID (from header)
+    pub pdu_session_id: u8,
+    /// Procedure Transaction Identity (from header)
+    pub pti: u8,
+    /// 5GSM cause (mandatory, Type 3)
+    pub sm_cause: Ie5gSmCause,
+    /// Extended protocol configuration options (optional, Type 6, IEI 0x7B)
+    pub extended_protocol_config_options: Option<Vec<u8>>,
+}
+
+impl Default for PduSessionModificationCommandReject {
+    fn default() -> Self {
+        Self {
+            pdu_session_id: 0,
+            pti: 0,
+            sm_cause: Ie5gSmCause::new(SmCause::ProtocolErrorUnspecified),
+            extended_protocol_config_options: None,
+        }
+    }
+}
+
+impl PduSessionModificationCommandReject {
+    /// Create a new PDU Session Modification Command Reject
+    pub fn new(pdu_session_id: u8, pti: u8, cause: SmCause) -> Self {
+        Self {
+            pdu_session_id,
+            pti,
+            sm_cause: Ie5gSmCause::new(cause),
+            ..Default::default()
+        }
+    }
+
+    /// Decode from bytes (after header has been parsed)
+    pub fn decode<B: Buf>(
+        buf: &mut B,
+        pdu_session_id: u8,
+        pti: u8,
+    ) -> Result<Self, PduSessionModificationError> {
+        // 5GSM cause (mandatory, Type 3 - 1 byte)
+        if buf.remaining() < 1 {
+            return Err(PduSessionModificationError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
+        }
+        let cause_val = buf.get_u8();
+        let cause = SmCause::try_from(cause_val).unwrap_or(SmCause::ProtocolErrorUnspecified);
+
+        let mut msg = Self::new(pdu_session_id, pti, cause);
+
+        // Parse optional IEs
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+
+            match iei {
+                modification_command_reject_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.extended_protocol_config_options = Some(data);
+                }
+                _ => {
+                    // Skip unknown IEs
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(msg)
+    }
+
+    /// Encode to bytes (including header)
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        // Header
+        let header = PlainSmHeader::new(
+            self.pdu_session_id,
+            self.pti,
+            SmMessageType::PduSessionModificationCommandReject,
+        );
+        header.encode(buf);
+
+        // 5GSM cause (mandatory)
+        buf.put_u8(self.sm_cause.value as u8);
+
+        // Optional IEs
+        if let Some(ref epco) = self.extended_protocol_config_options {
+            buf.put_u8(modification_command_reject_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS);
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+    }
+
+    /// Get the message type
+    pub fn message_type() -> SmMessageType {
+        SmMessageType::PduSessionModificationCommandReject
+    }
+
+    /// Get the cause value
+    pub fn cause(&self) -> SmCause {
+        self.sm_cause.value
+    }
+}
+
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1037,5 +1173,64 @@ mod tests {
         let result = PduSessionModificationComplete::decode(&mut &buf[..], 5, 1);
         // Should succeed with no optional IEs
         assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // PDU Session Modification Command Reject Tests
+    // ========================================================================
+
+    #[test]
+    fn test_modification_command_reject_new() {
+        let msg = PduSessionModificationCommandReject::new(5, 1, SmCause::SemanticallyIncorrectMessage);
+        assert_eq!(msg.pdu_session_id, 5);
+        assert_eq!(msg.pti, 1);
+        assert_eq!(msg.sm_cause.value, SmCause::SemanticallyIncorrectMessage);
+        assert!(msg.extended_protocol_config_options.is_none());
+    }
+
+    #[test]
+    fn test_modification_command_reject_encode_minimal() {
+        let msg = PduSessionModificationCommandReject::new(5, 1, SmCause::SemanticallyIncorrectMessage);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        // Header (4) + Cause (1) = 5 bytes
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf[0], 0x2E); // EPD
+        assert_eq!(buf[1], 5);    // PDU Session ID
+        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[3], 0xCD); // Message Type
+        assert_eq!(buf[4], SmCause::SemanticallyIncorrectMessage as u8);
+    }
+
+    #[test]
+    fn test_modification_command_reject_encode_decode() {
+        let msg = PduSessionModificationCommandReject::new(5, 1, SmCause::MessageTypeNotCompatible);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let decoded = PduSessionModificationCommandReject::decode(&mut &buf[4..], 5, 1).unwrap();
+        assert_eq!(decoded.cause(), SmCause::MessageTypeNotCompatible);
+    }
+
+    #[test]
+    fn test_modification_command_reject_encode_decode_with_epco() {
+        let mut msg = PduSessionModificationCommandReject::new(5, 1, SmCause::ProtocolErrorUnspecified);
+        msg.extended_protocol_config_options = Some(vec![0xAA, 0xBB]);
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let decoded = PduSessionModificationCommandReject::decode(&mut &buf[4..], 5, 1).unwrap();
+        assert_eq!(decoded.cause(), SmCause::ProtocolErrorUnspecified);
+        assert_eq!(decoded.extended_protocol_config_options, Some(vec![0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn test_modification_command_reject_message_type() {
+        assert_eq!(
+            PduSessionModificationCommandReject::message_type(),
+            SmMessageType::PduSessionModificationCommandReject
+        );
     }
 }

@@ -85,7 +85,7 @@ pub struct ScalingDecision {
     pub reason: String,
     /// Current utilization that triggered this decision
     pub current_utilization: f64,
-    /// Timestamp (not serializable, use timestamp_ms for persistence)
+    /// Timestamp (not serializable, use `timestamp_ms` for persistence)
     pub timestamp: Instant,
     /// Timestamp in milliseconds since UNIX epoch
     pub timestamp_ms: u64,
@@ -206,23 +206,65 @@ impl AutoScaler {
         }
     }
 
+    /// Evaluates scaling needs based on queue depth
+    pub fn evaluate_queue_based(
+        &self,
+        tier: ComputeTier,
+        tier_manager: &TierManager,
+        queue_depth: usize,
+    ) -> ScalingDecision {
+        let node_count = tier_manager.nodes_in_tier(tier).len() as u32;
+        let now = Instant::now();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let action = if queue_depth > self.config.queue_depth_threshold
+            && node_count < self.config.max_nodes_per_tier
+            && self.is_scaling_allowed(tier)
+        {
+            let scale_count = if queue_depth > self.config.queue_depth_threshold * 3 {
+                2
+            } else {
+                1
+            };
+            ScalingAction::ScaleUp {
+                tier,
+                count: scale_count.min(self.config.max_nodes_per_tier - node_count),
+            }
+        } else if queue_depth == 0
+            && node_count > self.config.min_nodes_per_tier
+            && self.is_scaling_allowed(tier)
+        {
+            ScalingAction::ScaleDown { tier, count: 1 }
+        } else {
+            ScalingAction::None
+        };
+
+        let reason = match action {
+            ScalingAction::ScaleUp { .. } => {
+                format!("Queue depth {} exceeds threshold {}", queue_depth, self.config.queue_depth_threshold)
+            }
+            ScalingAction::ScaleDown { .. } => "Queue empty, reducing capacity".to_string(),
+            ScalingAction::None => format!("Queue depth {queue_depth} within bounds"),
+        };
+
+        ScalingDecision {
+            action,
+            reason,
+            current_utilization: queue_depth as f64 / self.config.queue_depth_threshold.max(1) as f64,
+            timestamp: now,
+            timestamp_ms: ts,
+        }
+    }
+
     /// Evaluates scaling needs for a tier
     pub fn evaluate(&self, tier: ComputeTier, tier_manager: &TierManager) -> ScalingDecision {
         match self.config.policy {
             ScalingPolicy::UtilizationBased => self.evaluate_utilization_based(tier, tier_manager),
             ScalingPolicy::QueueBased => {
-                // Simplified queue-based evaluation (would need actual queue depth)
-                let now = Instant::now();
-                ScalingDecision {
-                    action: ScalingAction::None,
-                    reason: "Queue-based scaling not fully implemented".to_string(),
-                    current_utilization: 0.0,
-                    timestamp: now,
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64,
-                }
+                self.evaluate_queue_based(tier, tier_manager, 0)
             }
             ScalingPolicy::Predictive | ScalingPolicy::Manual => {
                 let now = Instant::now();

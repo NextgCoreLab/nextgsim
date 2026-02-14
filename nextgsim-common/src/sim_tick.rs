@@ -82,7 +82,7 @@ pub struct SimulationTimeConfig {
     pub tick_duration_ms: u64,
     /// Total simulation duration in ticks
     pub total_ticks: u64,
-    /// Real-time simulation (if true, wait for tick_duration_ms between ticks)
+    /// Real-time simulation (if true, wait for `tick_duration_ms` between ticks)
     pub real_time: bool,
 }
 

@@ -137,7 +137,7 @@ pub struct NotificationResponse {
     pub pdu_session_status: Option<Vec<u8>>,
 }
 
-/// IEI constants for NotificationResponse optional IEs
+/// IEI constants for `NotificationResponse` optional IEs
 #[allow(dead_code)]
 mod notification_response_iei {
     /// PDU session status

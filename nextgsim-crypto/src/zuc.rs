@@ -34,7 +34,7 @@ pub const IV_SIZE: usize = 16;
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit encryption key (KNASenc or KUPenc)
+/// - `key`: 128-bit encryption key (`KNASenc` or `KUPenc`)
 /// - `data`: Data to encrypt/decrypt (modified in place)
 ///
 /// # Note

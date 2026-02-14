@@ -6,7 +6,7 @@
 //! - KSEAF: Key for SEAF (Security Anchor Function)
 //! - KAMF: Key for AMF (Access and Mobility Management Function)
 //! - KNASint/KNASenc: Keys for NAS integrity and encryption
-//! - KgNB: Key for gNB (Next Generation Node B)
+//! - `KgNB`: Key for gNB (Next Generation Node B)
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -31,9 +31,9 @@ pub enum FcValue {
     Kseaf = 0x6C,
     /// FC = 0x6D: Derivation of KAMF from KSEAF
     Kamf = 0x6D,
-    /// FC = 0x69: Derivation of KNASint and KNASenc from KAMF
+    /// FC = 0x69: Derivation of `KNASint` and `KNASenc` from KAMF
     KnasIntEnc = 0x69,
-    /// FC = 0x6E: Derivation of KgNB from KAMF
+    /// FC = 0x6E: Derivation of `KgNB` from KAMF
     Kgnb = 0x6E,
     /// FC = 0x6B: Derivation of RES* from CK' and IK'
     ResStar = 0x6B,
@@ -69,7 +69,9 @@ pub enum AlgorithmTypeDistinguisher {
 /// # Returns
 /// 32-byte HMAC-SHA256 output
 pub fn hmac_sha256(key: &[u8], input: &[u8]) -> [u8; HMAC_SHA256_SIZE] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+    // HMAC-SHA256 accepts keys of any size, so this should never fail
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts keys of any size"));
     mac.update(input);
     let result = mac.finalize();
     let mut output = [0u8; HMAC_SHA256_SIZE];
@@ -124,7 +126,7 @@ pub fn calculate_kdf_key(key: &[u8; KEY_256_SIZE], fc: u8, parameters: &[&[u8]])
 /// Derived key material of the requested length
 ///
 /// # Panics
-/// Panics if output_length would require more than 254 rounds
+/// Panics if `output_length` would require more than 254 rounds
 pub fn calculate_prf_prime(key: &[u8; KEY_256_SIZE], input: &[u8], output_length: usize) -> Vec<u8> {
     let round = output_length.div_ceil(32); // Ceiling division
     assert!(round > 0 && round <= 254, "Invalid output_length for PRF'");
@@ -206,7 +208,7 @@ pub fn derive_kamf(kseaf: &[u8; KEY_256_SIZE], supi: &[u8], abba: &[u8]) -> [u8;
     calculate_kdf_key(kseaf, FcValue::Kamf as u8, &[supi, abba])
 }
 
-/// Derive NAS keys (KNASint and KNASenc) from KAMF (3GPP TS 33.501 Annex A.8)
+/// Derive NAS keys (`KNASint` and `KNASenc`) from KAMF (3GPP TS 33.501 Annex A.8)
 ///
 /// KNASint/KNASenc = KDF(KAMF, FC, algorithm type distinguisher, algorithm identity)
 ///
@@ -233,34 +235,34 @@ pub fn derive_nas_key(
     key
 }
 
-/// Derive KNASenc (NAS encryption key) from KAMF
+/// Derive `KNASenc` (NAS encryption key) from KAMF
 ///
 /// # Arguments
 /// * `kamf` - 256-bit KAMF
 /// * `algorithm_id` - NAS encryption algorithm identity (0=NULL, 1=NEA1, 2=NEA2, 3=NEA3)
 ///
 /// # Returns
-/// 128-bit KNASenc
+/// 128-bit `KNASenc`
 pub fn derive_knas_enc(kamf: &[u8; KEY_256_SIZE], algorithm_id: u8) -> [u8; KEY_128_SIZE] {
     derive_nas_key(kamf, AlgorithmTypeDistinguisher::NasEnc, algorithm_id)
 }
 
-/// Derive KNASint (NAS integrity key) from KAMF
+/// Derive `KNASint` (NAS integrity key) from KAMF
 ///
 /// # Arguments
 /// * `kamf` - 256-bit KAMF
 /// * `algorithm_id` - NAS integrity algorithm identity (0=NULL, 1=NIA1, 2=NIA2, 3=NIA3)
 ///
 /// # Returns
-/// 128-bit KNASint
+/// 128-bit `KNASint`
 pub fn derive_knas_int(kamf: &[u8; KEY_256_SIZE], algorithm_id: u8) -> [u8; KEY_128_SIZE] {
     derive_nas_key(kamf, AlgorithmTypeDistinguisher::NasInt, algorithm_id)
 }
 
 
-/// Derive KgNB from KAMF (3GPP TS 33.501 Annex A.9)
+/// Derive `KgNB` from KAMF (3GPP TS 33.501 Annex A.9)
 ///
-/// KgNB = KDF(KAMF, FC, uplink NAS COUNT, access type distinguisher)
+/// `KgNB` = KDF(KAMF, FC, uplink NAS COUNT, access type distinguisher)
 ///
 /// # Arguments
 /// * `kamf` - 256-bit KAMF
@@ -268,7 +270,7 @@ pub fn derive_knas_int(kamf: &[u8; KEY_256_SIZE], algorithm_id: u8) -> [u8; KEY_
 /// * `access_type` - Access type distinguisher (0x01 for 3GPP access, 0x02 for non-3GPP access)
 ///
 /// # Returns
-/// 256-bit KgNB
+/// 256-bit `KgNB`
 pub fn derive_kgnb(
     kamf: &[u8; KEY_256_SIZE],
     uplink_nas_count: u32,
@@ -280,10 +282,10 @@ pub fn derive_kgnb(
     calculate_kdf_key(kamf, FcValue::Kgnb as u8, &[&nas_count_bytes, &access_type_byte])
 }
 
-/// Derive RRC/UP keys from KgNB (3GPP TS 33.501 Annex A.8)
+/// Derive RRC/UP keys from `KgNB` (3GPP TS 33.501 Annex A.8)
 ///
 /// # Arguments
-/// * `kgnb` - 256-bit KgNB
+/// * `kgnb` - 256-bit `KgNB`
 /// * `algorithm_type` - Algorithm type distinguisher
 /// * `algorithm_id` - Algorithm identity
 ///
@@ -311,7 +313,7 @@ pub fn derive_rrc_up_key(
 ///
 /// # Arguments
 /// * `kamf` - 256-bit KAMF
-/// * `sync_input` - Synchronization input (KgNB or previous NH, 256 bits)
+/// * `sync_input` - Synchronization input (`KgNB` or previous NH, 256 bits)
 ///
 /// # Returns
 /// 256-bit NH

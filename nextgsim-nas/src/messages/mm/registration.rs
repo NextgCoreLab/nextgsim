@@ -11,7 +11,11 @@ use thiserror::Error;
 
 use crate::enums::MmMessageType;
 use crate::header::PlainMmHeader;
-use crate::ies::ie1::{Ie5gsRegistrationType, InformationElement1, NssaiInclusionMode};
+use crate::ies::ie1::{Ie5gsRegistrationType, IeMicoIndication, InformationElement1, NssaiInclusionMode};
+use crate::ies::ie4::{
+    IeAiMlCapability, IeIsacParameter, IeSemanticCommParameter,
+    IeSubThzBandParameter, IeNtnTimingAdvance, IeNtnAccessBarring,
+};
 use crate::security::NasKeySetIdentifier;
 
 /// Error type for Registration message encoding/decoding
@@ -497,6 +501,18 @@ mod registration_request_iei {
     pub const UPDATE_TYPE: u8 = 0x53;
     /// NAS message container
     pub const NAS_MESSAGE_CONTAINER: u8 = 0x71;
+    /// AI/ML capability (6G extension)
+    pub const AI_ML_CAPABILITY: u8 = 0xA0;
+    /// ISAC parameter (6G extension)
+    pub const ISAC_PARAMETER: u8 = 0xA1;
+    /// Semantic communication parameter (6G extension)
+    pub const SEMANTIC_COMM_PARAMETER: u8 = 0xA2;
+    /// Sub-THz band parameter (6G extension)
+    pub const SUB_THZ_BAND_PARAMETER: u8 = 0xA3;
+    /// NTN timing advance (6G extension)
+    pub const NTN_TIMING_ADVANCE: u8 = 0xA4;
+    /// NTN access barring (6G extension)
+    pub const NTN_ACCESS_BARRING: u8 = 0xA5;
 }
 
 /// Registration Request message (UE to network)
@@ -528,6 +544,22 @@ pub struct RegistrationRequest {
     pub pdu_session_status: Option<u16>,
     /// NAS message container (optional, Type 6, IEI 0x71)
     pub nas_message_container: Option<Vec<u8>>,
+    /// MICO indication (optional, Type 1, IEI 0xB)
+    pub mico_indication: Option<IeMicoIndication>,
+    /// LADN indication (optional, Type 6, IEI 0x74)
+    pub ladn_indication: Option<Vec<u8>>,
+    /// AI/ML capability (optional, Type 4, IEI 0xA0) - 6G extension
+    pub ai_ml_capability: Option<IeAiMlCapability>,
+    /// ISAC parameter (optional, Type 4, IEI 0xA1) - 6G extension
+    pub isac_parameter: Option<IeIsacParameter>,
+    /// Semantic communication parameter (optional, Type 4, IEI 0xA2) - 6G extension
+    pub semantic_comm_parameter: Option<IeSemanticCommParameter>,
+    /// Sub-THz band parameter (optional, Type 4, IEI 0xA3) - 6G extension
+    pub sub_thz_band_parameter: Option<IeSubThzBandParameter>,
+    /// NTN timing advance (optional, Type 4, IEI 0xA4) - 6G extension
+    pub ntn_timing_advance: Option<IeNtnTimingAdvance>,
+    /// NTN access barring (optional, Type 4, IEI 0xA5) - 6G extension
+    pub ntn_access_barring: Option<IeNtnAccessBarring>,
 }
 
 impl Default for RegistrationRequest {
@@ -545,6 +577,14 @@ impl Default for RegistrationRequest {
             uplink_data_status: None,
             pdu_session_status: None,
             nas_message_container: None,
+            mico_indication: None,
+            ladn_indication: None,
+            ai_ml_capability: None,
+            isac_parameter: None,
+            semantic_comm_parameter: None,
+            sub_thz_band_parameter: None,
+            ntn_timing_advance: None,
+            ntn_access_barring: None,
         }
     }
 }
@@ -602,12 +642,16 @@ impl RegistrationRequest {
                     continue;
                 }
                 0xB => {
-                    // MICO indication - skip for now
-                    buf.advance(1);
+                    // MICO indication (Type 1, IEI 0xB)
+                    let val = buf.get_u8() & 0x0F;
+                    msg.mico_indication = Some(
+                        IeMicoIndication::decode(val)
+                            .unwrap_or_default()
+                    );
                     continue;
                 }
                 0x9 => {
-                    // Network slicing indication - skip for now
+                    // Network slicing indication
                     buf.advance(1);
                     continue;
                 }
@@ -710,6 +754,56 @@ impl RegistrationRequest {
                     buf.copy_to_slice(&mut data);
                     msg.nas_message_container = Some(data);
                 }
+                registration_request_iei::LADN_INDICATION => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.ladn_indication = Some(data);
+                }
+                // 6G extension IEs
+                registration_request_iei::AI_ML_CAPABILITY => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeAiMlCapability::decode(buf) {
+                        msg.ai_ml_capability = Some(ie);
+                    }
+                }
+                registration_request_iei::ISAC_PARAMETER => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeIsacParameter::decode(buf) {
+                        msg.isac_parameter = Some(ie);
+                    }
+                }
+                registration_request_iei::SEMANTIC_COMM_PARAMETER => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeSemanticCommParameter::decode(buf) {
+                        msg.semantic_comm_parameter = Some(ie);
+                    }
+                }
+                registration_request_iei::SUB_THZ_BAND_PARAMETER => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeSubThzBandParameter::decode(buf) {
+                        msg.sub_thz_band_parameter = Some(ie);
+                    }
+                }
+                registration_request_iei::NTN_TIMING_ADVANCE => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeNtnTimingAdvance::decode(buf) {
+                        msg.ntn_timing_advance = Some(ie);
+                    }
+                }
+                registration_request_iei::NTN_ACCESS_BARRING => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeNtnAccessBarring::decode(buf) {
+                        msg.ntn_access_barring = Some(ie);
+                    }
+                }
                 _ => {
                     // Skip unknown IEs
                     buf.advance(1);
@@ -791,6 +885,42 @@ impl RegistrationRequest {
             buf.put_u16(container.len() as u16);
             buf.put_slice(container);
         }
+
+        if let Some(ref mico) = self.mico_indication {
+            buf.put_u8((registration_request_iei::MICO_INDICATION << 4) | (mico.encode() & 0x0F));
+        }
+
+        if let Some(ref ladn) = self.ladn_indication {
+            buf.put_u8(registration_request_iei::LADN_INDICATION);
+            buf.put_u16(ladn.len() as u16);
+            buf.put_slice(ladn);
+        }
+
+        // 6G extension IEs
+        if let Some(ref ie) = self.ai_ml_capability {
+            buf.put_u8(registration_request_iei::AI_ML_CAPABILITY);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.isac_parameter {
+            buf.put_u8(registration_request_iei::ISAC_PARAMETER);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.semantic_comm_parameter {
+            buf.put_u8(registration_request_iei::SEMANTIC_COMM_PARAMETER);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.sub_thz_band_parameter {
+            buf.put_u8(registration_request_iei::SUB_THZ_BAND_PARAMETER);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.ntn_timing_advance {
+            buf.put_u8(registration_request_iei::NTN_TIMING_ADVANCE);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.ntn_access_barring {
+            buf.put_u8(registration_request_iei::NTN_ACCESS_BARRING);
+            ie.encode(buf);
+        }
     }
 
     /// Get the message type
@@ -855,6 +985,18 @@ mod registration_accept_iei {
     pub const OPERATOR_DEFINED_ACCESS_CATEGORY_DEFINITIONS: u8 = 0x76;
     /// Negotiated DRX parameters
     pub const NEGOTIATED_DRX_PARAMETERS: u8 = 0x51;
+    /// AI/ML capability (6G extension)
+    pub const AI_ML_CAPABILITY: u8 = 0xA0;
+    /// ISAC parameter (6G extension)
+    pub const ISAC_PARAMETER: u8 = 0xA1;
+    /// Semantic communication parameter (6G extension)
+    pub const SEMANTIC_COMM_PARAMETER: u8 = 0xA2;
+    /// Sub-THz band parameter (6G extension)
+    pub const SUB_THZ_BAND_PARAMETER: u8 = 0xA3;
+    /// NTN timing advance (6G extension)
+    pub const NTN_TIMING_ADVANCE: u8 = 0xA4;
+    /// NTN access barring (6G extension)
+    pub const NTN_ACCESS_BARRING: u8 = 0xA5;
 }
 
 /// Registration Accept message (network to UE)
@@ -893,6 +1035,22 @@ pub struct RegistrationAccept {
     pub nssai_inclusion_mode: Option<NssaiInclusionMode>,
     /// Negotiated DRX parameters (optional, Type 4, IEI 0x51)
     pub negotiated_drx_parameters: Option<u8>,
+    /// MICO indication (optional, Type 1, IEI 0xB)
+    pub mico_indication: Option<IeMicoIndication>,
+    /// LADN information (optional, Type 6, IEI 0x79)
+    pub ladn_information: Option<Vec<u8>>,
+    /// AI/ML capability (optional, Type 4, IEI 0xA0) - 6G extension
+    pub ai_ml_capability: Option<IeAiMlCapability>,
+    /// ISAC parameter (optional, Type 4, IEI 0xA1) - 6G extension
+    pub isac_parameter: Option<IeIsacParameter>,
+    /// Semantic communication parameter (optional, Type 4, IEI 0xA2) - 6G extension
+    pub semantic_comm_parameter: Option<IeSemanticCommParameter>,
+    /// Sub-THz band parameter (optional, Type 4, IEI 0xA3) - 6G extension
+    pub sub_thz_band_parameter: Option<IeSubThzBandParameter>,
+    /// NTN timing advance (optional, Type 4, IEI 0xA4) - 6G extension
+    pub ntn_timing_advance: Option<IeNtnTimingAdvance>,
+    /// NTN access barring (optional, Type 4, IEI 0xA5) - 6G extension
+    pub ntn_access_barring: Option<IeNtnAccessBarring>,
 }
 
 
@@ -920,12 +1078,16 @@ impl RegistrationAccept {
             let iei_high = (iei >> 4) & 0x0F;
             match iei_high {
                 0xB => {
-                    // MICO indication - skip
-                    buf.advance(1);
+                    // MICO indication (Type 1, IEI 0xB)
+                    let val = buf.get_u8() & 0x0F;
+                    msg.mico_indication = Some(
+                        IeMicoIndication::decode(val)
+                            .unwrap_or_default()
+                    );
                     continue;
                 }
                 0x9 => {
-                    // Network slicing indication - skip
+                    // Network slicing indication
                     buf.advance(1);
                     continue;
                 }
@@ -1106,6 +1268,56 @@ impl RegistrationAccept {
                         buf.advance(len - 1);
                     }
                 }
+                registration_accept_iei::LADN_INFORMATION => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.ladn_information = Some(data);
+                }
+                // 6G extension IEs
+                registration_accept_iei::AI_ML_CAPABILITY => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeAiMlCapability::decode(buf) {
+                        msg.ai_ml_capability = Some(ie);
+                    }
+                }
+                registration_accept_iei::ISAC_PARAMETER => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeIsacParameter::decode(buf) {
+                        msg.isac_parameter = Some(ie);
+                    }
+                }
+                registration_accept_iei::SEMANTIC_COMM_PARAMETER => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeSemanticCommParameter::decode(buf) {
+                        msg.semantic_comm_parameter = Some(ie);
+                    }
+                }
+                registration_accept_iei::SUB_THZ_BAND_PARAMETER => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeSubThzBandParameter::decode(buf) {
+                        msg.sub_thz_band_parameter = Some(ie);
+                    }
+                }
+                registration_accept_iei::NTN_TIMING_ADVANCE => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeNtnTimingAdvance::decode(buf) {
+                        msg.ntn_timing_advance = Some(ie);
+                    }
+                }
+                registration_accept_iei::NTN_ACCESS_BARRING => {
+                    buf.advance(1);
+                    if let Ok(ie) = IeNtnAccessBarring::decode(buf) {
+                        msg.ntn_access_barring = Some(ie);
+                    }
+                }
                 _ => {
                     // Skip unknown IEs
                     buf.advance(1);
@@ -1211,6 +1423,42 @@ impl RegistrationAccept {
             buf.put_u8(registration_accept_iei::NEGOTIATED_DRX_PARAMETERS);
             buf.put_u8(1);
             buf.put_u8(drx);
+        }
+
+        if let Some(ref mico) = self.mico_indication {
+            buf.put_u8((registration_accept_iei::MICO_INDICATION << 4) | (mico.encode() & 0x0F));
+        }
+
+        if let Some(ref ladn) = self.ladn_information {
+            buf.put_u8(registration_accept_iei::LADN_INFORMATION);
+            buf.put_u16(ladn.len() as u16);
+            buf.put_slice(ladn);
+        }
+
+        // 6G extension IEs
+        if let Some(ref ie) = self.ai_ml_capability {
+            buf.put_u8(registration_accept_iei::AI_ML_CAPABILITY);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.isac_parameter {
+            buf.put_u8(registration_accept_iei::ISAC_PARAMETER);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.semantic_comm_parameter {
+            buf.put_u8(registration_accept_iei::SEMANTIC_COMM_PARAMETER);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.sub_thz_band_parameter {
+            buf.put_u8(registration_accept_iei::SUB_THZ_BAND_PARAMETER);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.ntn_timing_advance {
+            buf.put_u8(registration_accept_iei::NTN_TIMING_ADVANCE);
+            ie.encode(buf);
+        }
+        if let Some(ref ie) = self.ntn_access_barring {
+            buf.put_u8(registration_accept_iei::NTN_ACCESS_BARRING);
+            ie.encode(buf);
         }
     }
 

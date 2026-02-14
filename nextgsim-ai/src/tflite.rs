@@ -1,9 +1,9 @@
 //! TensorFlow Lite inference backend
 //!
-//! This module provides TFLite inference engine implementation following
+//! This module provides `TFLite` inference engine implementation following
 //! the same pattern as the ONNX inference backend. Since the tflite crate
 //! may not be available, this is a well-structured placeholder with proper
-//! traits that can be integrated when TFLite support is needed.
+//! traits that can be integrated when `TFLite` support is needed.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -20,11 +20,11 @@ use crate::tensor::TensorData;
 
 /// TensorFlow Lite inference engine
 ///
-/// Provides TFLite model inference with support for CPU and GPU delegates.
-/// This is a placeholder implementation that follows the InferenceEngine trait
-/// and can be expanded when TFLite runtime support is added.
+/// Provides `TFLite` model inference with support for CPU and GPU delegates.
+/// This is a placeholder implementation that follows the `InferenceEngine` trait
+/// and can be expanded when `TFLite` runtime support is added.
 pub struct TfLiteEngine {
-    /// Internal TFLite session state (placeholder)
+    /// Internal `TFLite` session state (placeholder)
     session: Option<Mutex<TfLiteSession>>,
     /// Model metadata
     metadata: ModelMetadata,
@@ -38,7 +38,7 @@ pub struct TfLiteEngine {
     is_ready: bool,
 }
 
-/// Internal TFLite session representation (placeholder)
+/// Internal `TFLite` session representation (placeholder)
 struct TfLiteSession {
     /// Model path
     _model_path: std::path::PathBuf,
@@ -46,7 +46,7 @@ struct TfLiteSession {
     _delegate: TfLiteDelegate,
 }
 
-/// TFLite delegate types
+/// `TFLite` delegate types
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum TfLiteDelegate {
@@ -56,12 +56,12 @@ enum TfLiteDelegate {
     Gpu,
     /// NNAPI delegate (Android)
     Nnapi,
-    /// CoreML delegate (iOS/macOS)
+    /// `CoreML` delegate (iOS/macOS)
     CoreML,
 }
 
 impl TfLiteEngine {
-    /// Creates a new TFLite engine with the given execution provider
+    /// Creates a new `TFLite` engine with the given execution provider
     pub fn new(execution_provider: ExecutionProvider) -> Result<Self, ModelError> {
         let config = InferenceConfig {
             execution_provider,
@@ -70,7 +70,7 @@ impl TfLiteEngine {
         Self::with_config(config)
     }
 
-    /// Creates a new TFLite engine with full configuration
+    /// Creates a new `TFLite` engine with full configuration
     pub fn with_config(config: InferenceConfig) -> Result<Self, ModelError> {
         info!(
             "Creating TFLite inference engine with {} execution provider",
@@ -87,7 +87,7 @@ impl TfLiteEngine {
         })
     }
 
-    /// Creates a TFLite session from a file path
+    /// Creates a `TFLite` session from a file path
     fn create_session(&self, path: &Path) -> Result<TfLiteSession, ModelError> {
         // Map execution provider to TFLite delegate
         let delegate = match &self.config.execution_provider {
@@ -125,7 +125,7 @@ impl TfLiteEngine {
         })
     }
 
-    /// Extracts metadata from a TFLite model
+    /// Extracts metadata from a `TFLite` model
     fn extract_metadata(path: &Path) -> Result<ModelMetadata, ModelError> {
         // Placeholder: In a real implementation, this would:
         // 1. Read the FlatBuffer model file

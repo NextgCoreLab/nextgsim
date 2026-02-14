@@ -239,7 +239,7 @@ async fn test_e2e_multi_ue_with_ai() {
 
     for i in 1..=num_ues {
         let ran_ue_id = i as u32;
-        let imsi = format!("imsi-00101000000000{}", i);
+        let imsi = format!("imsi-00101000000000{i}");
 
         let amf_ue_id = amf.simulate_initial_ue_message(ran_ue_id, vec![]).await.unwrap();
         let _ = amf.next_event().await;

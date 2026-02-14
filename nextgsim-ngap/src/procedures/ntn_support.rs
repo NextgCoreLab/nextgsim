@@ -235,11 +235,31 @@ pub fn decode_ntn_timing_info(bytes: &[u8]) -> Result<NtnTimingInfo, NtnSupportE
         3 => SatelliteType::Haps,
         _ => return Err(NtnSupportError::CodecError("Unknown satellite type".to_string())),
     };
-    let satellite_id = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-    let propagation_delay_us = u64::from_be_bytes(bytes[5..13].try_into().unwrap());
-    let common_ta_us = u64::from_be_bytes(bytes[13..21].try_into().unwrap());
-    let validity_duration_ms = u32::from_be_bytes(bytes[21..25].try_into().unwrap());
-    let reference_time_ms = u64::from_be_bytes(bytes[25..33].try_into().unwrap());
+    let satellite_id = u32::from_be_bytes(
+        bytes[1..5]
+            .try_into()
+            .map_err(|_| NtnSupportError::CodecError("Invalid satellite_id bytes".to_string()))?,
+    );
+    let propagation_delay_us = u64::from_be_bytes(
+        bytes[5..13]
+            .try_into()
+            .map_err(|_| NtnSupportError::CodecError("Invalid propagation_delay_us bytes".to_string()))?,
+    );
+    let common_ta_us = u64::from_be_bytes(
+        bytes[13..21]
+            .try_into()
+            .map_err(|_| NtnSupportError::CodecError("Invalid common_ta_us bytes".to_string()))?,
+    );
+    let validity_duration_ms = u32::from_be_bytes(
+        bytes[21..25]
+            .try_into()
+            .map_err(|_| NtnSupportError::CodecError("Invalid validity_duration_ms bytes".to_string()))?,
+    );
+    let reference_time_ms = u64::from_be_bytes(
+        bytes[25..33]
+            .try_into()
+            .map_err(|_| NtnSupportError::CodecError("Invalid reference_time_ms bytes".to_string()))?,
+    );
 
     Ok(NtnTimingInfo {
         satellite_type,

@@ -4,9 +4,9 @@
 //! This procedure is used to establish an RRC connection between the UE and the network.
 //!
 //! The procedure consists of three messages:
-//! 1. RRCSetupRequest - UE → gNB: Initial request to establish RRC connection
-//! 2. RRCSetup - gNB → UE: Network response with radio bearer configuration
-//! 3. RRCSetupComplete - UE → gNB: Confirmation with NAS message
+//! 1. `RRCSetupRequest` - UE → gNB: Initial request to establish RRC connection
+//! 2. `RRCSetup` - gNB → UE: Network response with radio bearer configuration
+//! 3. `RRCSetupComplete` - UE → gNB: Confirmation with NAS message
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
@@ -199,7 +199,7 @@ pub fn parse_rrc_setup_request(msg: &UL_CCCH_Message) -> Result<RrcSetupRequestD
     Ok(RrcSetupRequestData { ue_identity, establishment_cause })
 }
 
-/// Helper function to convert BitVec to u64
+/// Helper function to convert `BitVec` to u64
 fn bitvec_to_u64(bv: &BitVec<u8, Msb0>) -> u64 {
     let mut value: u64 = 0;
     for bit in bv.iter() {

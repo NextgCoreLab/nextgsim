@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use crate::tasks::GutiMobileIdentity;
+use super::redcap::RedCapProcessor;
 
 /// RRC connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,12 +57,14 @@ pub struct RrcUeContext {
     pub initial_id: Option<i64>,
     /// Whether the initial ID is from S-TMSI (true) or random (false)
     pub is_initial_id_s_tmsi: bool,
-    /// RRC establishment cause (from RRCSetupRequest)
+    /// RRC establishment cause (from `RRCSetupRequest`)
     pub establishment_cause: i64,
-    /// S-TMSI if available (from RRCSetupComplete)
+    /// S-TMSI if available (from `RRCSetupComplete`)
     pub s_tmsi: Option<GutiMobileIdentity>,
     /// Current RRC connection state
     pub state: RrcState,
+    /// RedCap processor for this UE (Rel-17)
+    pub redcap: RedCapProcessor,
 }
 
 impl RrcUeContext {
@@ -74,6 +77,7 @@ impl RrcUeContext {
             establishment_cause: 0,
             s_tmsi: None,
             state: RrcState::Idle,
+            redcap: RedCapProcessor::new(),
         }
     }
 
@@ -92,27 +96,27 @@ impl RrcUeContext {
         self.establishment_cause = cause;
     }
 
-    /// Sets the S-TMSI from RRCSetupComplete
+    /// Sets the S-TMSI from `RRCSetupComplete`
     pub fn set_s_tmsi(&mut self, s_tmsi: GutiMobileIdentity) {
         self.s_tmsi = Some(s_tmsi);
     }
 
-    /// Transitions to SetupRequest state (RRCSetupRequest received)
+    /// Transitions to `SetupRequest` state (`RRCSetupRequest` received)
     pub fn on_setup_request(&mut self) {
         self.state = RrcState::SetupRequest;
     }
 
-    /// Transitions to SetupSent state (RRCSetup sent)
+    /// Transitions to `SetupSent` state (`RRCSetup` sent)
     pub fn on_setup_sent(&mut self) {
         self.state = RrcState::SetupSent;
     }
 
-    /// Transitions to Connected state (RRCSetupComplete received)
+    /// Transitions to Connected state (`RRCSetupComplete` received)
     pub fn on_setup_complete(&mut self) {
         self.state = RrcState::Connected;
     }
 
-    /// Transitions to Releasing state (RRCRelease being sent)
+    /// Transitions to Releasing state (`RRCRelease` being sent)
     pub fn on_release(&mut self) {
         self.state = RrcState::Releasing;
     }

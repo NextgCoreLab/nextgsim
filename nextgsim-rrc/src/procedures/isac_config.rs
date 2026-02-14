@@ -424,7 +424,11 @@ pub fn decode_isac_meas_config_header(
         ));
     }
 
-    let config_id = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+    let config_id = u16::from_be_bytes(
+        bytes[0..2]
+            .try_into()
+            .map_err(|_| IsacConfigError::CodecError("Invalid config_id bytes".to_string()))?,
+    );
     let sensing_mode = match bytes[2] {
         0 => SensingMode::Monostatic,
         1 => SensingMode::Bistatic,

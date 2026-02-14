@@ -3,7 +3,7 @@
 //! Implements a standalone Handover Preparation Failure procedure as defined in
 //! 3GPP TS 38.413 Section 8.4.1.
 //! Sent by the target AMF to the source AMF when handover preparation fails.
-//! Contains Cause IE and optional CriticalityDiagnostics.
+//! Contains Cause IE and optional `CriticalityDiagnostics`.
 
 use crate::codec::generated::*;
 use crate::codec::{decode_ngap_pdu, encode_ngap_pdu, NgapCodecError};

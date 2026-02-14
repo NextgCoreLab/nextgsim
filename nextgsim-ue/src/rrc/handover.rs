@@ -8,9 +8,9 @@
 //! message containing a handover command (reconfigurationWithSync).
 //!
 //! ## Intra-frequency Handover Steps:
-//! 1. UE receives RRCReconfiguration with reconfigurationWithSync
+//! 1. UE receives `RRCReconfiguration` with reconfigurationWithSync
 //! 2. UE synchronizes with target cell
-//! 3. UE sends RRCReconfigurationComplete to target cell
+//! 3. UE sends `RRCReconfigurationComplete` to target cell
 //! 4. Handover complete
 //!
 //! ## Handover Failure Handling:
@@ -400,4 +400,297 @@ mod tests {
         let pdu = build_reconfiguration_complete(5);
         assert_eq!(pdu, vec![0x08, 0x05]);
     }
+}
+
+// ============================================================================
+// DAPS (Dual Active Protocol Stack) Handover Support (Rel-16)
+// ============================================================================
+
+/// UE-side DAPS handover context.
+///
+/// Maintains state for dual connection to both source and target cells during
+/// make-before-break handover (zero interruption time).
+///
+/// Reference: 3GPP TS 38.331 Section 5.3.5.9
+#[derive(Debug, Clone)]
+pub struct UeDapsContext {
+    /// Source cell connection info
+    pub source_cell: DapsCellConnection,
+    /// Target cell connection info
+    pub target_cell: DapsCellConnection,
+    /// DAPS handover state
+    pub state: DapsState,
+    /// T304daps timer start time
+    pub t304_daps_start: Option<Instant>,
+    /// T304daps duration
+    pub t304_daps_duration: Duration,
+    /// Data path currently active (Source or Target)
+    pub active_data_path: DataPath,
+}
+
+/// DAPS cell connection information.
+#[derive(Debug, Clone)]
+pub struct DapsCellConnection {
+    /// Physical cell ID
+    pub pci: u32,
+    /// Cell ID
+    pub cell_id: i32,
+    /// C-RNTI assigned by this cell
+    pub crnti: u16,
+    /// Whether this cell is synchronized
+    pub synchronized: bool,
+    /// Uplink data buffer size (bytes)
+    pub ul_buffer_bytes: usize,
+    /// Downlink data buffer size (bytes)
+    pub dl_buffer_bytes: usize,
+}
+
+/// DAPS handover state for UE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DapsState {
+    /// No DAPS handover in progress
+    Inactive,
+    /// Received DAPS RRC Reconfiguration, preparing target cell
+    Preparing,
+    /// Both cells active, synchronizing with target
+    DualActive,
+    /// Synchronized with target, switching data path
+    Switching,
+    /// Complete, releasing source cell
+    Complete,
+    /// DAPS handover failed
+    Failed,
+}
+
+/// Data path selection during DAPS handover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataPath {
+    /// Data routed through source cell
+    Source,
+    /// Data routed through target cell
+    Target,
+    /// Both paths active (transition state)
+    Both,
+}
+
+impl UeDapsContext {
+    /// Creates a new UE DAPS context from RRC Reconfiguration.
+    pub fn new(
+        source_pci: u32,
+        source_cell_id: i32,
+        source_crnti: u16,
+        target_pci: u32,
+        target_cell_id: i32,
+        target_crnti: u16,
+        t304_daps_ms: u64,
+    ) -> Self {
+        Self {
+            source_cell: DapsCellConnection {
+                pci: source_pci,
+                cell_id: source_cell_id,
+                crnti: source_crnti,
+                synchronized: true, // Source already synchronized
+                ul_buffer_bytes: 0,
+                dl_buffer_bytes: 0,
+            },
+            target_cell: DapsCellConnection {
+                pci: target_pci,
+                cell_id: target_cell_id,
+                crnti: target_crnti,
+                synchronized: false, // Need to sync with target
+                ul_buffer_bytes: 0,
+                dl_buffer_bytes: 0,
+            },
+            state: DapsState::Preparing,
+            t304_daps_start: Some(Instant::now()),
+            t304_daps_duration: Duration::from_millis(t304_daps_ms),
+            active_data_path: DataPath::Source,
+        }
+    }
+
+    /// Starts synchronization with target cell.
+    pub fn start_target_sync(&mut self) {
+        if self.state == DapsState::Preparing {
+            tracing::debug!("DAPS: Starting synchronization with target cell PCI={}",
+                          self.target_cell.pci);
+            self.state = DapsState::DualActive;
+        }
+    }
+
+    /// Marks target cell as synchronized.
+    pub fn target_sync_complete(&mut self) {
+        if self.state == DapsState::DualActive {
+            tracing::info!("DAPS: Target cell synchronized, preparing for data path switch");
+            self.target_cell.synchronized = true;
+        }
+    }
+
+    /// Switches data path from source to target cell.
+    ///
+    /// Called after target sync is complete and RRC Reconfiguration Complete is sent.
+    pub fn switch_to_target(&mut self) {
+        if self.state == DapsState::DualActive && self.target_cell.synchronized {
+            tracing::info!("DAPS: Switching data path from source to target cell");
+            self.state = DapsState::Switching;
+            self.active_data_path = DataPath::Both; // Temporarily use both
+        }
+    }
+
+    /// Completes data path switch to target.
+    pub fn complete_switch(&mut self) {
+        if self.state == DapsState::Switching {
+            tracing::debug!("DAPS: Data path switch complete, all data via target cell");
+            self.active_data_path = DataPath::Target;
+        }
+    }
+
+    /// Releases source cell resources.
+    ///
+    /// Called after all buffered data from source is delivered.
+    pub fn release_source(&mut self) {
+        if self.state == DapsState::Switching {
+            tracing::info!("DAPS: Releasing source cell PCI={}", self.source_cell.pci);
+            self.state = DapsState::Complete;
+            self.source_cell.ul_buffer_bytes = 0;
+            self.source_cell.dl_buffer_bytes = 0;
+        }
+    }
+
+    /// Sends uplink data on source cell.
+    ///
+    /// Used while in DualActive state to maintain UL on source.
+    pub fn send_ul_source(&mut self, data_bytes: usize) -> bool {
+        if self.active_data_path == DataPath::Source || self.active_data_path == DataPath::Both {
+            self.source_cell.ul_buffer_bytes += data_bytes;
+            return true;
+        }
+        false
+    }
+
+    /// Sends uplink data on target cell.
+    ///
+    /// Used after switch to send UL via target.
+    pub fn send_ul_target(&mut self, data_bytes: usize) -> bool {
+        if self.active_data_path == DataPath::Target || self.active_data_path == DataPath::Both {
+            self.target_cell.ul_buffer_bytes += data_bytes;
+            return true;
+        }
+        false
+    }
+
+    /// Receives downlink data on source cell.
+    pub fn receive_dl_source(&mut self, data_bytes: usize) -> bool {
+        if self.active_data_path == DataPath::Source || self.active_data_path == DataPath::Both {
+            self.source_cell.dl_buffer_bytes += data_bytes;
+            return true;
+        }
+        false
+    }
+
+    /// Receives downlink data on target cell.
+    pub fn receive_dl_target(&mut self, data_bytes: usize) -> bool {
+        if self.active_data_path == DataPath::Target || self.active_data_path == DataPath::Both {
+            self.target_cell.dl_buffer_bytes += data_bytes;
+            return true;
+        }
+        false
+    }
+
+    /// Checks if T304daps timer has expired.
+    pub fn check_t304_daps_expired(&self) -> bool {
+        if let Some(start) = self.t304_daps_start {
+            if self.state != DapsState::Inactive && self.state != DapsState::Complete {
+                return start.elapsed() >= self.t304_daps_duration;
+            }
+        }
+        false
+    }
+
+    /// Fails the DAPS handover.
+    pub fn fail(&mut self) {
+        tracing::warn!("DAPS handover failed");
+        self.state = DapsState::Failed;
+    }
+
+    /// Completes and resets the DAPS context.
+    pub fn complete(&mut self) {
+        if let Some(start) = self.t304_daps_start {
+            tracing::info!("DAPS handover complete: duration={:?}", start.elapsed());
+        }
+        self.state = DapsState::Complete;
+    }
+}
+
+impl HandoverManager {
+    /// Starts DAPS handover procedure.
+    ///
+    /// Called when UE receives RRC Reconfiguration with DAPS configuration.
+    pub fn start_daps_handover(&mut self, daps_ctx: UeDapsContext) {
+        tracing::info!(
+            "Starting DAPS handover: source_cell={}, target_cell={}",
+            daps_ctx.source_cell.cell_id,
+            daps_ctx.target_cell.cell_id
+        );
+
+        // Store DAPS context separately (in real implementation)
+        // For now, use regular handover state
+        self.state = HandoverState::Preparing;
+        self.ho_start_time = Some(Instant::now());
+    }
+
+    /// Completes DAPS handover after target cell is synchronized.
+    pub fn complete_daps(&mut self) -> Option<i32> {
+        if matches!(self.state, HandoverState::Preparing | HandoverState::Synchronizing | HandoverState::Completing) {
+            self.state = HandoverState::Idle;
+            self.ho_complete_time = Some(Instant::now());
+
+            if let Some(start) = self.ho_start_time {
+                tracing::info!(
+                    "DAPS handover complete: duration={:?}",
+                    start.elapsed()
+                );
+            }
+
+            self.command = None;
+            self.source_cell_id = None;
+            self.ho_start_time = None;
+            return Some(0); // Placeholder target cell
+        }
+        None
+    }
+}
+
+/// Parses DAPS RRC Reconfiguration message (simplified format).
+///
+/// Simplified format:
+/// [0] = message type (0x10 = RRC Reconfiguration with DAPS)
+/// [1] = transaction_id
+/// [2-3] = source PCI (big endian)
+/// [4-5] = source C-RNTI (big endian)
+/// [6-7] = target PCI (big endian)
+/// [8-9] = target C-RNTI (big endian)
+/// [10-11] = T304daps (big endian, ms)
+/// [12] = flags (0x01 = data_forwarding_enabled)
+pub fn parse_daps_reconfiguration(pdu: &[u8]) -> Option<UeDapsContext> {
+    if pdu.len() < 13 || pdu[0] != 0x10 {
+        return None;
+    }
+
+    let _transaction_id = pdu[1];
+    let source_pci = u16::from_be_bytes([pdu[2], pdu[3]]) as u32;
+    let source_crnti = u16::from_be_bytes([pdu[4], pdu[5]]);
+    let target_pci = u16::from_be_bytes([pdu[6], pdu[7]]) as u32;
+    let target_crnti = u16::from_be_bytes([pdu[8], pdu[9]]);
+    let t304_daps_ms = u16::from_be_bytes([pdu[10], pdu[11]]) as u64;
+    let _flags = pdu[12];
+
+    Some(UeDapsContext::new(
+        source_pci,
+        source_pci as i32, // Simplified: use PCI as cell_id
+        source_crnti,
+        target_pci,
+        target_pci as i32,
+        target_crnti,
+        t304_daps_ms,
+    ))
 }

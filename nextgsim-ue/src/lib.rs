@@ -28,6 +28,12 @@ pub mod isac_sensor;
 pub mod fl_participant;
 pub mod semantic_codec;
 
+// Rel-18 5G-Advanced modules
+pub mod ranging;
+pub mod mint;
+pub mod sidelink;
+pub mod ambient_iot;
+
 // Re-export commonly used types
 pub use timer::{GprsTimer2, GprsTimer3, GprsTimer3Unit, UeTimer};
 

@@ -391,25 +391,24 @@ fn parse_security_key(key: &SecurityKey) -> [u8; 32] {
 pub fn build_initial_context_setup_response(
     params: &InitialContextSetupResponseParams,
 ) -> Result<NGAP_PDU, InitialContextSetupError> {
-    let mut protocol_ies = Vec::new();
-
-    // IE: AMF-UE-NGAP-ID (mandatory)
-    protocol_ies.push(InitialContextSetupResponseProtocolIEs_Entry {
-        id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
-        criticality: Criticality(Criticality::IGNORE),
-        value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
-            AMF_UE_NGAP_ID(params.amf_ue_ngap_id),
-        ),
-    });
-
-    // IE: RAN-UE-NGAP-ID (mandatory)
-    protocol_ies.push(InitialContextSetupResponseProtocolIEs_Entry {
-        id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
-        criticality: Criticality(Criticality::IGNORE),
-        value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
-            RAN_UE_NGAP_ID(params.ran_ue_ngap_id),
-        ),
-    });
+    let protocol_ies = vec![
+        // IE: AMF-UE-NGAP-ID (mandatory)
+        InitialContextSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+                AMF_UE_NGAP_ID(params.amf_ue_ngap_id),
+            ),
+        },
+        // IE: RAN-UE-NGAP-ID (mandatory)
+        InitialContextSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+                RAN_UE_NGAP_ID(params.ran_ue_ngap_id),
+            ),
+        },
+    ];
 
     let response = InitialContextSetupResponse {
         protocol_i_es: InitialContextSetupResponseProtocolIEs(protocol_ies),

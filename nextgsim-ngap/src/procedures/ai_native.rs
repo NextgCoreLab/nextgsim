@@ -56,7 +56,7 @@ pub enum AiModelFormat {
     Onnx,
     /// TensorFlow Lite format
     TfLite,
-    /// PyTorch serialized format
+    /// `PyTorch` serialized format
     PyTorch,
     /// Custom binary format
     CustomBinary,

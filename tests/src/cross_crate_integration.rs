@@ -6,6 +6,8 @@
 //! - FL <-> Semantic: Distributed codec training
 //! - ISAC <-> Semantic: Sensing data compression
 
+#![allow(unused_imports)]
+
 use nextgsim_isac::{SheIsacClient, SensingData, SensingMeasurement, SensingType, SensingProcessingType};
 use nextgsim_she::{TierManager, ComputeNode, ComputeTier, WorkloadRequirements};
 use nextgsim_she::workload::WorkloadType;

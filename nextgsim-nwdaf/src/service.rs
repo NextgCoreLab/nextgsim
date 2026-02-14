@@ -1,11 +1,11 @@
 //! TS 23.288 NWDAF Service Operations
 //!
 //! Implements the three Nnwdaf service operations defined in 3GPP TS 23.288:
-//! - **Nnwdaf_AnalyticsSubscription** (Section 7.2): Subscribe/unsubscribe to
+//! - **`Nnwdaf_AnalyticsSubscription`** (Section 7.2): Subscribe/unsubscribe to
 //!   analytics with asynchronous callback notification
-//! - **Nnwdaf_AnalyticsInfo** (Section 7.3): On-demand (request/response)
+//! - **`Nnwdaf_AnalyticsInfo`** (Section 7.3): On-demand (request/response)
 //!   analytics query
-//! - **Nnwdaf_MLModelProvision** (Section 7.5): ML model distribution service
+//! - **`Nnwdaf_MLModelProvision`** (Section 7.5): ML model distribution service
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,14 +94,14 @@ pub struct SubscriptionResponse {
     pub error: Option<String>,
 }
 
-/// Manages analytics subscriptions (Nnwdaf_AnalyticsSubscription service)
+/// Manages analytics subscriptions (`Nnwdaf_AnalyticsSubscription` service)
 ///
 /// Handles subscribe, unsubscribe, and notification dispatch for analytics
 /// consumers (AMF, SMF, other NFs, AF).
 ///
 /// # 3GPP Reference
 ///
-/// - TS 23.288 Section 7.2: Nnwdaf_AnalyticsSubscription service
+/// - TS 23.288 Section 7.2: `Nnwdaf_AnalyticsSubscription` service
 #[derive(Debug)]
 pub struct SubscriptionManager {
     /// Active subscriptions indexed by subscription ID
@@ -333,20 +333,20 @@ pub struct AnalyticsInfoResponse {
     pub error: Option<String>,
 }
 
-/// Nnwdaf_AnalyticsInfo service handler
+/// `Nnwdaf_AnalyticsInfo` service handler
 ///
-/// Processes on-demand analytics queries by delegating to the AnLF
+/// Processes on-demand analytics queries by delegating to the `AnLF`
 /// and returning results synchronously.
 ///
 /// # 3GPP Reference
 ///
-/// - TS 23.288 Section 7.3: Nnwdaf_AnalyticsInfo service
+/// - TS 23.288 Section 7.3: `Nnwdaf_AnalyticsInfo` service
 pub struct AnalyticsInfoService;
 
 impl AnalyticsInfoService {
     /// Handles an on-demand analytics info request
     ///
-    /// Routes the request to the appropriate AnLF analytics function
+    /// Routes the request to the appropriate `AnLF` analytics function
     /// based on the analytics ID.
     pub fn handle_request(
         request: &AnalyticsInfoRequest,
@@ -449,7 +449,7 @@ impl AnalyticsInfoService {
 ///
 /// # 3GPP Reference
 ///
-/// - TS 23.288 Section 7.5: Nnwdaf_MLModelProvision service
+/// - TS 23.288 Section 7.5: `Nnwdaf_MLModelProvision` service
 pub struct MlModelProvisionService;
 
 impl MlModelProvisionService {
@@ -496,7 +496,7 @@ pub enum DataManagementOp {
     Export,
 }
 
-/// Request to the Nnwdaf_DataManagement service
+/// Request to the `Nnwdaf_DataManagement` service
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataManagementRequest {
     /// Operation type
@@ -505,13 +505,13 @@ pub struct DataManagementRequest {
     pub analytics_id: AnalyticsId,
     /// Target entity
     pub target: AnalyticsTarget,
-    /// Optional time range (start_ms, end_ms)
+    /// Optional time range (`start_ms`, `end_ms`)
     pub time_range: Option<(u64, u64)>,
     /// Requestor identity
     pub requestor_id: String,
 }
 
-/// Response from the Nnwdaf_DataManagement service
+/// Response from the `Nnwdaf_DataManagement` service
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataManagementResponse {
     /// Whether the operation succeeded
@@ -524,14 +524,14 @@ pub struct DataManagementResponse {
     pub error: Option<String>,
 }
 
-/// Nnwdaf_DataManagement service
+/// `Nnwdaf_DataManagement` service
 ///
 /// Manages the lifecycle of collected analytics data. Consumers can fetch,
 /// delete, or export data through this standardised interface.
 ///
 /// # 3GPP Reference
 ///
-/// - TS 23.288 Section 7.4: Nnwdaf_DataManagement service
+/// - TS 23.288 Section 7.4: `Nnwdaf_DataManagement` service
 pub struct DataManagementService;
 
 impl DataManagementService {

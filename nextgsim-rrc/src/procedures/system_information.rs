@@ -253,7 +253,7 @@ pub fn parse_mib(msg: &BCCH_BCH_Message) -> Result<MibData, SystemInformationErr
     })
 }
 
-/// Helper function to convert BitVec to u8
+/// Helper function to convert `BitVec` to u8
 fn bitvec_to_u8(bv: &BitVec<u8, Msb0>) -> u8 {
     let mut value: u8 = 0;
     for bit in bv.iter() {
@@ -514,7 +514,7 @@ fn parse_plmn_identity_info(info: &PLMN_IdentityInfo) -> PlmnIdentityInfo {
     }
 }
 
-/// Helper function to convert BitVec to u32
+/// Helper function to convert `BitVec` to u32
 fn bitvec_to_u32(bv: &BitVec<u8, Msb0>) -> u32 {
     let mut value: u32 = 0;
     for bit in bv.iter() {
@@ -523,7 +523,7 @@ fn bitvec_to_u32(bv: &BitVec<u8, Msb0>) -> u32 {
     value
 }
 
-/// Helper function to convert BitVec to u64
+/// Helper function to convert `BitVec` to u64
 fn bitvec_to_u64(bv: &BitVec<u8, Msb0>) -> u64 {
     let mut value: u64 = 0;
     for bit in bv.iter() {

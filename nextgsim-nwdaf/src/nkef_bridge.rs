@@ -57,7 +57,7 @@ impl NwdafNkefBridge {
     /// Publishes an analytics result to the knowledge graph
     ///
     /// Creates an entity representing the analytics result and links it
-    /// to the target entity (UE, cell, etc.) via a "has_analytics"
+    /// to the target entity (UE, cell, etc.) via a "`has_analytics`"
     /// relationship.
     pub fn publish_analytics(
         &mut self,

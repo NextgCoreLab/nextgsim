@@ -6,7 +6,7 @@
 //!
 //! # Reference
 //!
-//! Based on UERANSIM's `src/gnb/types.hpp` (GnbStatusInfo) and
+//! Based on UERANSIM's `src/gnb/types.hpp` (`GnbStatusInfo`) and
 //! `src/gnb/app/task.cpp` (status update handling).
 
 use serde::{Deserialize, Serialize};

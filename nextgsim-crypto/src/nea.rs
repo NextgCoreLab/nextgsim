@@ -30,7 +30,7 @@ type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit encryption key (KNASenc or KUPenc)
+/// - `key`: 128-bit encryption key (`KNASenc` or `KUPenc`)
 /// - `data`: Data to encrypt/decrypt (modified in place)
 ///
 /// # Note
@@ -62,7 +62,7 @@ pub fn nea1_decrypt(count: u32, bearer: u8, direction: u8, key: &[u8; KEY_SIZE],
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit encryption key (KNASenc or KUPenc)
+/// - `key`: 128-bit encryption key (`KNASenc` or `KUPenc`)
 /// - `data`: Data to encrypt/decrypt (modified in place)
 ///
 /// # Note

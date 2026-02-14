@@ -92,7 +92,7 @@ impl UeContext {
             self.ue_id, self.ran_ue_ngap_id
         );
         if let Some(amf_id) = self.amf_ue_ngap_id {
-            yaml.push_str(&format!("\namf_ue_ngap_id: {}", amf_id));
+            yaml.push_str(&format!("\namf_ue_ngap_id: {amf_id}"));
         }
         yaml
     }
@@ -123,7 +123,7 @@ impl AmfContext {
     pub fn to_yaml(&self) -> String {
         let mut yaml = format!("amf_id: {}\nis_connected: {}", self.amf_id, self.is_connected);
         if let Some(ref name) = self.amf_name {
-            yaml.push_str(&format!("\namf_name: {}", name));
+            yaml.push_str(&format!("\namf_name: {name}"));
         }
         yaml
     }
@@ -189,13 +189,13 @@ impl<'a> GnbCmdHandler<'a> {
         match self.status_info.to_yaml() {
             Ok(yaml) => CliResponse::success(yaml, response_addr),
             Err(e) => CliResponse::error(
-                format!("Failed to serialize status: {}", e),
+                format!("Failed to serialize status: {e}"),
                 response_addr,
             ),
         }
     }
 
-    /// Handles the AMF_LIST command - shows connected AMFs.
+    /// Handles the `AMF_LIST` command - shows connected AMFs.
     fn handle_amf_list(&self, response_addr: Option<SocketAddr>) -> CliResponse {
         if self.amf_contexts.is_empty() {
             return CliResponse::success("amfs: []".to_string(), response_addr);
@@ -208,7 +208,7 @@ impl<'a> GnbCmdHandler<'a> {
         CliResponse::success(yaml, response_addr)
     }
 
-    /// Handles the UE_LIST command - shows connected UEs.
+    /// Handles the `UE_LIST` command - shows connected UEs.
     fn handle_ue_list(&self, response_addr: Option<SocketAddr>) -> CliResponse {
         if self.ue_contexts.is_empty() {
             return CliResponse::success("ues: []".to_string(), response_addr);
@@ -221,31 +221,31 @@ impl<'a> GnbCmdHandler<'a> {
                 ue.ue_id, ue.ran_ue_ngap_id
             ));
             if let Some(amf_id) = ue.amf_ue_ngap_id {
-                yaml.push_str(&format!("\n    amf_ngap_id: {}", amf_id));
+                yaml.push_str(&format!("\n    amf_ngap_id: {amf_id}"));
             }
         }
         CliResponse::success(yaml, response_addr)
     }
 
-    /// Handles the UE_INFO command - shows details for a specific UE.
+    /// Handles the `UE_INFO` command - shows details for a specific UE.
     fn handle_ue_info(&self, ue_id: i32, response_addr: Option<SocketAddr>) -> CliResponse {
         match self.ue_contexts.get(&ue_id) {
             Some(ue) => CliResponse::success(ue.to_yaml(), response_addr),
-            None => CliResponse::error(format!("UE not found with ID: {}", ue_id), response_addr),
+            None => CliResponse::error(format!("UE not found with ID: {ue_id}"), response_addr),
         }
     }
 
-    /// Handles the UE_RELEASE command - requests UE context release.
+    /// Handles the `UE_RELEASE` command - requests UE context release.
     ///
     /// Note: This only validates the UE exists. The actual release is performed
     /// by sending a message to the NGAP task.
     fn handle_ue_release(&self, ue_id: i32, response_addr: Option<SocketAddr>) -> CliResponse {
         if !self.ue_contexts.contains_key(&ue_id) {
-            return CliResponse::error(format!("UE not found with ID: {}", ue_id), response_addr);
+            return CliResponse::error(format!("UE not found with ID: {ue_id}"), response_addr);
         }
         // The actual release will be triggered by the App task after this returns
         CliResponse::success(
-            format!("Requesting UE context release for UE {}", ue_id),
+            format!("Requesting UE context release for UE {ue_id}"),
             response_addr,
         )
     }
@@ -267,7 +267,7 @@ impl<'a> GnbCmdHandler<'a> {
 /// * `Ok(GnbCliCommandType)` - Successfully parsed command
 /// * `Err(String)` - Parse error with description
 pub fn parse_cli_command(input: &str) -> Result<GnbCliCommandType, String> {
-    let tokens: Vec<&str> = input.trim().split_whitespace().collect();
+    let tokens: Vec<&str> = input.split_whitespace().collect();
 
     if tokens.is_empty() {
         return Err("Empty command".to_string());
@@ -333,6 +333,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 
@@ -352,6 +353,8 @@ mod tests {
             gtp_tx: TaskHandle::new(gtp_tx),
             rls_tx: TaskHandle::new(rls_tx),
             sctp_tx: TaskHandle::new(sctp_tx),
+            sixg: None,
+            rel18: None,
         }
     }
 

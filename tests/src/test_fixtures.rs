@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Test configuration container
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct TestConfig {
     /// UE configuration
     pub ue: TestUeConfig,
@@ -16,15 +17,6 @@ pub struct TestConfig {
     pub amf: TestAmfConfig,
 }
 
-impl Default for TestConfig {
-    fn default() -> Self {
-        Self {
-            ue: TestUeConfig::default(),
-            gnb: TestGnbConfig::default(),
-            amf: TestAmfConfig::default(),
-        }
-    }
-}
 
 /// Test UE configuration
 #[derive(Debug, Clone)]
@@ -66,7 +58,7 @@ impl Default for TestUeConfig {
 impl TestUeConfig {
     /// Create a new test UE config with custom IMSI
     pub fn with_imsi(mut self, imsi: &str) -> Self {
-        self.supi = format!("imsi-{}", imsi);
+        self.supi = format!("imsi-{imsi}");
         self
     }
 

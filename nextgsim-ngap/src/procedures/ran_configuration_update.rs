@@ -5,9 +5,9 @@
 //! its configuration information at the AMF.
 //!
 //! The procedure consists of:
-//! 1. RANConfigurationUpdate - NG-RAN node -> AMF: Request to update configuration
-//! 2. RANConfigurationUpdateAcknowledge - AMF -> NG-RAN node: Successful response
-//! 3. RANConfigurationUpdateFailure - AMF -> NG-RAN node: Failure response
+//! 1. `RANConfigurationUpdate` - NG-RAN node -> AMF: Request to update configuration
+//! 2. `RANConfigurationUpdateAcknowledge` - AMF -> NG-RAN node: Successful response
+//! 3. `RANConfigurationUpdateFailure` - AMF -> NG-RAN node: Failure response
 
 use crate::codec::generated::*;
 use crate::codec::{decode_ngap_pdu, encode_ngap_pdu, NgapCodecError};

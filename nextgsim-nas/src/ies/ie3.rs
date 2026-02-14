@@ -146,7 +146,7 @@ pub enum SmCause {
     PduSessionTypeIpv6OnlyAllowed = 0x33,
     /// PDU session does not exist
     PduSessionDoesNotExist = 0x36,
-    /// PDU session type IPv4v6 only allowed
+    /// PDU session type `IPv4v6` only allowed
     PduSessionTypeIpv4v6OnlyAllowed = 0x39,
     /// PDU session type Unstructured only allowed
     PduSessionTypeUnstructuredOnlyAllowed = 0x3A,
@@ -166,9 +166,9 @@ pub enum SmCause {
     InvalidPtiValue = 0x51,
     /// Maximum data rate per UE for user-plane integrity protection is too low
     MaxDataRateForIntegrityProtectionTooLow = 0x52,
-    /// Semantic error in the QoS operation
+    /// Semantic error in the `QoS` operation
     SemanticErrorInQosOperation = 0x53,
-    /// Syntactical error in the QoS operation
+    /// Syntactical error in the `QoS` operation
     SyntacticalErrorInQosOperation = 0x54,
     /// Semantically incorrect message
     #[default]
@@ -327,10 +327,10 @@ pub trait InformationElement3: Sized {
     /// The fixed length of this IE in bytes
     const LENGTH: usize;
 
-    /// Decode from an OctetView
+    /// Decode from an `OctetView`
     fn decode(stream: &OctetView) -> Result<Self, Ie3Error>;
 
-    /// Encode to an OctetString
+    /// Encode to an `OctetString`
     fn encode(&self, stream: &mut OctetString);
 }
 
@@ -745,7 +745,7 @@ impl InformationElement3 for IeTimeZone {
     }
 }
 
-/// Universal time structure for TimeZoneAndTime IE
+/// Universal time structure for `TimeZoneAndTime` IE
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VTime {
     /// Year (BCD encoded)
@@ -763,7 +763,7 @@ pub struct VTime {
 }
 
 impl VTime {
-    /// Create a new VTime
+    /// Create a new `VTime`
     pub fn new(year: u8, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Self {
         Self {
             year,
@@ -775,7 +775,7 @@ impl VTime {
         }
     }
 
-    /// Decode from OctetView (6 bytes)
+    /// Decode from `OctetView` (6 bytes)
     pub fn decode(stream: &OctetView) -> Self {
         Self {
             year: stream.read(),
@@ -787,7 +787,7 @@ impl VTime {
         }
     }
 
-    /// Encode to OctetString
+    /// Encode to `OctetString`
     pub fn encode(&self, stream: &mut OctetString) {
         stream.append_octet(self.year);
         stream.append_octet(self.month);

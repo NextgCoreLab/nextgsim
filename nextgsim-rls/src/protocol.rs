@@ -40,7 +40,7 @@ pub enum MessageType {
 }
 
 impl MessageType {
-    /// Creates a MessageType from a u8 value
+    /// Creates a `MessageType` from a u8 value
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Reserved),
@@ -69,7 +69,7 @@ pub enum PduType {
 }
 
 impl PduType {
-    /// Creates a PduType from a u8 value
+    /// Creates a `PduType` from a u8 value
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Reserved),

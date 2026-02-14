@@ -108,8 +108,8 @@ impl SensingFeatureExtractor {
 
                 features.push(mean);
                 features.push(variance.sqrt());
-                features.push(*values.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&0.0));
-                features.push(*values.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&0.0));
+                features.push(*values.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0));
+                features.push(*values.iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0));
             }
         }
 
@@ -200,7 +200,7 @@ impl MlPositioningEngine {
             })
             .collect();
 
-        distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         if distances.len() < k {
             return None;
@@ -208,8 +208,8 @@ impl MlPositioningEngine {
 
         // Average top-k positions
         let mut pos_sum = Vector3::default();
-        for i in 0..k {
-            let pos = distances[i].1;
+        for item in distances.iter().take(k) {
+            let pos = item.1;
             pos_sum.x += pos.x;
             pos_sum.y += pos.y;
             pos_sum.z += pos.z;
@@ -254,7 +254,7 @@ impl MlPositioningEngine {
 /// Trajectory prediction using LSTM-like model
 #[derive(Debug)]
 pub struct TrajectoryPredictor {
-    /// Historical positions (object_id -> position history)
+    /// Historical positions (`object_id` -> position history)
     position_history: HashMap<u64, Vec<(f64, Vector3)>>, // (timestamp, position)
     /// Maximum history length
     max_history: usize,
@@ -320,6 +320,262 @@ impl TrajectoryPredictor {
 impl Default for TrajectoryPredictor {
     fn default() -> Self {
         Self::new(100)
+    }
+}
+
+// ─── AI-Native Target Detection and Classification ────────────────────────────
+
+/// Target classification category from radar returns
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TargetClass {
+    /// Pedestrian
+    Pedestrian,
+    /// Vehicle (car, truck, etc.)
+    Vehicle,
+    /// Cyclist
+    Cyclist,
+    /// Drone / UAV
+    Drone,
+    /// Static object (building, wall, etc.)
+    StaticObject,
+    /// Unknown
+    Unknown,
+}
+
+impl std::fmt::Display for TargetClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetClass::Pedestrian => write!(f, "Pedestrian"),
+            TargetClass::Vehicle => write!(f, "Vehicle"),
+            TargetClass::Cyclist => write!(f, "Cyclist"),
+            TargetClass::Drone => write!(f, "Drone"),
+            TargetClass::StaticObject => write!(f, "StaticObject"),
+            TargetClass::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+/// Detection result from AI-native sensing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiDetectionResult {
+    /// Detected target class
+    pub target_class: TargetClass,
+    /// Classification confidence (0.0 to 1.0)
+    pub confidence: f64,
+    /// Estimated range (meters)
+    pub range_m: f64,
+    /// Estimated velocity (m/s)
+    pub velocity_ms: f64,
+    /// Estimated radar cross-section (m^2)
+    pub rcs_m2: f64,
+    /// Feature vector used for classification
+    pub features: Vec<f64>,
+}
+
+/// AI-native sensing engine for target detection and classification
+///
+/// Uses ML-based feature extraction from radar range-Doppler maps
+/// to detect and classify targets from radar returns.
+#[derive(Debug)]
+pub struct AiSensingEngine {
+    /// Training samples: (features, class)
+    training_data: Vec<(Vec<f64>, TargetClass)>,
+    /// Class centroids computed from training data
+    class_centroids: HashMap<TargetClass, Vec<f64>>,
+    /// Whether the engine is trained
+    is_trained: bool,
+}
+
+impl AiSensingEngine {
+    /// Creates a new AI sensing engine
+    pub fn new(_feature_dim: usize) -> Self {
+        Self {
+            training_data: Vec::new(),
+            class_centroids: HashMap::new(),
+            is_trained: false,
+        }
+    }
+
+    /// Extracts features from a range-Doppler map cell
+    ///
+    /// Features: [power, range_bin_norm, doppler_bin_norm, spread_range, spread_doppler, peak_ratio]
+    pub fn extract_features(
+        range_doppler_map: &[Vec<f64>],
+        range_bin: usize,
+        doppler_bin: usize,
+    ) -> Vec<f64> {
+        let num_range = range_doppler_map.len();
+        if num_range == 0 {
+            return vec![0.0; 6];
+        }
+        let num_doppler = range_doppler_map[0].len();
+
+        let power = range_doppler_map[range_bin.min(num_range - 1)]
+            [doppler_bin.min(num_doppler - 1)];
+
+        // Normalized bin positions
+        let range_norm = range_bin as f64 / num_range as f64;
+        let doppler_norm = doppler_bin as f64 / num_doppler as f64;
+
+        // Compute local spread (variance in 3x3 neighborhood)
+        let mut spread_range = 0.0;
+        let mut spread_doppler = 0.0;
+        let mut count = 0.0;
+
+        for dr in 0..=2usize {
+            for dd in 0..=2usize {
+                let r = (range_bin + dr).saturating_sub(1);
+                let d = (doppler_bin + dd).saturating_sub(1);
+                if r < num_range && d < num_doppler {
+                    let val = range_doppler_map[r][d];
+                    spread_range += (r as f64 - range_bin as f64).powi(2) * val;
+                    spread_doppler += (d as f64 - doppler_bin as f64).powi(2) * val;
+                    count += val;
+                }
+            }
+        }
+
+        if count > 0.0 {
+            spread_range /= count;
+            spread_doppler /= count;
+        }
+
+        // Peak-to-average ratio in local neighborhood
+        let max_val: f64 = range_doppler_map
+            .iter()
+            .flat_map(|row| row.iter())
+            .copied()
+            .fold(0.0, f64::max);
+        let peak_ratio = if max_val > 0.0 { power / max_val } else { 0.0 };
+
+        vec![power, range_norm, doppler_norm, spread_range, spread_doppler, peak_ratio]
+    }
+
+    /// Adds a training sample
+    pub fn add_training_sample(&mut self, features: Vec<f64>, class: TargetClass) {
+        self.training_data.push((features, class));
+    }
+
+    /// Trains the classifier using centroid-based approach
+    pub fn train(&mut self) {
+        if self.training_data.len() < 5 {
+            return;
+        }
+
+        self.class_centroids.clear();
+
+        // Group by class
+        let mut class_groups: HashMap<TargetClass, Vec<&Vec<f64>>> = HashMap::new();
+        for (features, class) in &self.training_data {
+            class_groups.entry(*class).or_default().push(features);
+        }
+
+        // Compute centroid for each class
+        for (class, samples) in &class_groups {
+            let dim = samples[0].len();
+            let mut centroid = vec![0.0; dim];
+            let n = samples.len() as f64;
+
+            for sample in samples {
+                for (i, &val) in sample.iter().enumerate() {
+                    if i < dim {
+                        centroid[i] += val / n;
+                    }
+                }
+            }
+
+            self.class_centroids.insert(*class, centroid);
+        }
+
+        self.is_trained = !self.class_centroids.is_empty();
+    }
+
+    /// Detects and classifies a target from a range-Doppler map detection
+    pub fn detect_and_classify(
+        &self,
+        range_doppler_map: &[Vec<f64>],
+        range_bin: usize,
+        doppler_bin: usize,
+        range_per_bin_m: f64,
+        velocity_per_bin_ms: f64,
+    ) -> AiDetectionResult {
+        let features = Self::extract_features(range_doppler_map, range_bin, doppler_bin);
+        let power = features[0];
+        let range_m = range_bin as f64 * range_per_bin_m;
+        let velocity_ms = doppler_bin as f64 * velocity_per_bin_ms;
+
+        // Estimate RCS from power (simplified radar equation)
+        let rcs_m2 = power * range_m.powi(4) / 1e6;
+
+        if !self.is_trained {
+            // Default classification heuristic based on RCS and velocity
+            let target_class = Self::heuristic_classify(rcs_m2, velocity_ms);
+            return AiDetectionResult {
+                target_class,
+                confidence: 0.5,
+                range_m,
+                velocity_ms,
+                rcs_m2,
+                features,
+            };
+        }
+
+        // Nearest-centroid classification
+        let mut best_class = TargetClass::Unknown;
+        let mut best_dist = f64::MAX;
+
+        for (class, centroid) in &self.class_centroids {
+            let dist: f64 = features
+                .iter()
+                .zip(centroid.iter())
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f64>()
+                .sqrt();
+
+            if dist < best_dist {
+                best_dist = dist;
+                best_class = *class;
+            }
+        }
+
+        let confidence = (1.0 / (1.0 + best_dist)).clamp(0.0, 1.0);
+
+        AiDetectionResult {
+            target_class: best_class,
+            confidence,
+            range_m,
+            velocity_ms,
+            rcs_m2,
+            features,
+        }
+    }
+
+    /// Heuristic classification based on RCS and velocity
+    fn heuristic_classify(rcs_m2: f64, velocity_ms: f64) -> TargetClass {
+        let abs_vel = velocity_ms.abs();
+        if abs_vel < 0.1 {
+            TargetClass::StaticObject
+        } else if rcs_m2 > 10.0 && abs_vel > 5.0 {
+            TargetClass::Vehicle
+        } else if rcs_m2 < 0.5 && abs_vel < 2.0 {
+            TargetClass::Pedestrian
+        } else if rcs_m2 < 1.0 && abs_vel > 2.0 && abs_vel < 10.0 {
+            TargetClass::Cyclist
+        } else if rcs_m2 < 0.1 && abs_vel > 1.0 {
+            TargetClass::Drone
+        } else {
+            TargetClass::Unknown
+        }
+    }
+
+    /// Returns whether the engine is trained
+    pub fn is_trained(&self) -> bool {
+        self.is_trained
+    }
+
+    /// Returns the number of training samples
+    pub fn training_sample_count(&self) -> usize {
+        self.training_data.len()
     }
 }
 
@@ -433,5 +689,63 @@ mod tests {
         engine.clear_training_cache();
         assert_eq!(engine.training_sample_count(), 0);
         assert!(!engine.is_trained());
+    }
+
+    // ── AI-Native Sensing tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_ai_sensing_engine_creation() {
+        let engine = AiSensingEngine::new(6);
+        assert!(!engine.is_trained());
+        assert_eq!(engine.training_sample_count(), 0);
+    }
+
+    #[test]
+    fn test_feature_extraction() {
+        let map = vec![vec![0.0; 32]; 32];
+        let features = AiSensingEngine::extract_features(&map, 16, 16);
+        assert_eq!(features.len(), 6);
+    }
+
+    #[test]
+    fn test_heuristic_classify() {
+        // Vehicle: high RCS, high speed
+        let result = AiSensingEngine::heuristic_classify(20.0, 30.0);
+        assert_eq!(result, TargetClass::Vehicle);
+
+        // Static object: very low velocity
+        let result = AiSensingEngine::heuristic_classify(5.0, 0.01);
+        assert_eq!(result, TargetClass::StaticObject);
+    }
+
+    #[test]
+    fn test_ai_sensing_detect_untrained() {
+        let engine = AiSensingEngine::new(6);
+        let map = vec![vec![1.0; 32]; 32];
+        let result = engine.detect_and_classify(&map, 16, 16, 1.0, 1.0);
+        assert_eq!(result.confidence, 0.5); // Default confidence for untrained
+    }
+
+    #[test]
+    fn test_ai_sensing_train_and_classify() {
+        let mut engine = AiSensingEngine::new(6);
+
+        // Add training samples for vehicles
+        for _ in 0..10 {
+            engine.add_training_sample(
+                vec![50.0, 0.5, 0.7, 1.0, 2.0, 0.8],
+                TargetClass::Vehicle,
+            );
+        }
+        // Add training samples for pedestrians
+        for _ in 0..10 {
+            engine.add_training_sample(
+                vec![5.0, 0.3, 0.2, 0.1, 0.1, 0.3],
+                TargetClass::Pedestrian,
+            );
+        }
+
+        engine.train();
+        assert!(engine.is_trained());
     }
 }

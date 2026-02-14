@@ -378,25 +378,24 @@ pub struct UeContextReleaseCompleteData {
 pub fn build_ue_context_release_complete(
     params: &UeContextReleaseCompleteParams,
 ) -> Result<NGAP_PDU, UeContextReleaseError> {
-    let mut protocol_ies = Vec::new();
-
-    // IE: AMF-UE-NGAP-ID (mandatory)
-    protocol_ies.push(UEContextReleaseCompleteProtocolIEs_Entry {
-        id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
-        criticality: Criticality(Criticality::IGNORE),
-        value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(
-            params.amf_ue_ngap_id,
-        )),
-    });
-
-    // IE: RAN-UE-NGAP-ID (mandatory)
-    protocol_ies.push(UEContextReleaseCompleteProtocolIEs_Entry {
-        id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
-        criticality: Criticality(Criticality::IGNORE),
-        value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(
-            params.ran_ue_ngap_id,
-        )),
-    });
+    let protocol_ies = vec![
+        // IE: AMF-UE-NGAP-ID (mandatory)
+        UEContextReleaseCompleteProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(
+                params.amf_ue_ngap_id,
+            )),
+        },
+        // IE: RAN-UE-NGAP-ID (mandatory)
+        UEContextReleaseCompleteProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(
+                params.ran_ue_ngap_id,
+            )),
+        },
+    ];
 
     let complete = UEContextReleaseComplete {
         protocol_i_es: UEContextReleaseCompleteProtocolIEs(protocol_ies),

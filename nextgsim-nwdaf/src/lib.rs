@@ -57,8 +57,8 @@
 //! - 3GPP TS 23.288: Network Data Analytics Services
 //! - MTLF/AnLF logical separation (TS 23.288 Section 6.2A/6.2B)
 //! - Standardized Analytics IDs (TS 23.288 Section 6.1)
-//! - Service operations: Nnwdaf_AnalyticsSubscription, Nnwdaf_AnalyticsInfo,
-//!   Nnwdaf_MLModelProvision (TS 23.288 Sections 7.2, 7.3, 7.5)
+//! - Service operations: `Nnwdaf_AnalyticsSubscription`, `Nnwdaf_AnalyticsInfo`,
+//!   `Nnwdaf_MLModelProvision` (TS 23.288 Sections 7.2, 7.3, 7.5)
 //!
 //! # Modules
 //!
@@ -78,6 +78,8 @@ pub mod coordination;
 pub mod data_collection;
 pub mod dccf;
 pub mod error;
+pub mod event_exposure;
+pub mod federation;
 pub mod llm_analytics;
 pub mod ml_training;
 pub mod model_transfer;
@@ -88,32 +90,46 @@ pub mod service;
 
 // Re-export key types from new modules for convenience
 pub use analytics_id::AnalyticsId;
-pub use anlf::{AnalyticsPayload, AnalyticsResult, Anlf, QosMetrics, ServiceLevelMetrics};
+pub use anlf::{
+    AnalyticsPayload, AnalyticsResult, Anlf, CellEnergyModel, QosMetrics, QosThresholds,
+    ResourceType, ServiceLevelMetrics, ServiceType,
+};
 pub use anomaly::{Anomaly, AnomalyDetector, AnomalySeverity};
 pub use coordination::{
     DelegationRequest, DelegationResponse, LoadBalancingStrategy, NwdafCapabilities,
-    NwdafCoordinator, NwdafInstance,
+    NwdafCoordinator, NwdafInstance, SharedAnalyticsResult,
 };
 pub use data_collection::{
     DataCollector, DataSourceRegistration, DataSourceType, MeasurementCapability,
 };
 pub use dccf::{
-    AggregatedData, AggregationMethod, DataCollectionFilter, DataCollectionSession, Dccf,
-    DccfDataSource, GeographicArea, SessionStatus,
+    AggregatedData, AggregationMethod, DataCollectionFilter, DataCollectionSession,
+    DataRoutingPolicy, DataTransformation, Dccf, DccfDataSource, GeographicArea,
+    RoutingCondition, SessionStatus,
 };
 pub use error::{
     AnalyticsError, DataCollectionError, NwdafError, PredictionError, SubscriptionError,
 };
+pub use event_exposure::{
+    EventType, EventSubscription, EventExposureManager, EventNotification,
+    EventData, NfType, SubscriptionStatus, TargetArea, MobilityState,
+};
+pub use federation::{
+    AggregatedFederationResult, AreaFilter, ConsentType, DataFederationManager,
+    FederatedAggregationMethod, FederatedAnalyticsResult, FederationPeer, FederationRequest,
+    FederationResponse, PlmnId, PrivacyPolicy, TrustLevel,
+};
 pub use llm_analytics::{LlmAnalyticsEngine, LlmAnalyticsQuery, LlmAnalyticsResponse};
 pub use ml_training::{
-    MlModelTrainingService, ModelArchitecture, ModelTrainingRequest, ModelTrainingResponse,
-    TrainingConfig, TrainingDataset, TrainingJob, TrainingMetrics, TrainingSample, TrainingStatus,
+    DistributedTrainingCoordinator, FederatedRound, FederatedStrategy, MlModelTrainingService,
+    ModelArchitecture, ModelTrainingRequest, ModelTrainingResponse, ModelUpdate, TrainingConfig,
+    TrainingDataset, TrainingJob, TrainingMetrics, TrainingSample, TrainingStatus,
 };
 pub use model_transfer::{
     ModelFilter, ModelMetadata, ModelPackage, ModelTransferMessage, ModelTransferProtocol,
     ModelType, TransferStatistics,
 };
-pub use mtlf::{MlModelInfo, Mtlf};
+pub use mtlf::{AbTestResult, MlModelInfo, Mtlf};
 pub use nkef_bridge::{NwdafNkefBridge, NwdafNkefBridgeConfig};
 pub use predictor::{OnnxPredictor, PredictionMethod, PredictionOutput};
 pub use service::{
@@ -406,7 +422,7 @@ impl NwdafManager {
     /// Records a UE measurement
     ///
     /// Stores the measurement in the data collector and runs it through
-    /// the AnLF anomaly detector.
+    /// the `AnLF` anomaly detector.
     pub fn record_measurement(&mut self, measurement: UeMeasurement) {
         // Feed into anomaly detector before storing
         let _anomalies = self.anlf.process_measurement(&measurement);
@@ -457,17 +473,15 @@ impl NwdafManager {
         let predictor = self.mtlf.trajectory_predictor();
 
         if let Some(pred) = predictor {
-            match pred.predict_trajectory(&positions, &timestamps, horizon_ms, current_time) {
-                Ok(output) => {
-                    return Some(TrajectoryPrediction {
-                        ue_id,
-                        waypoints: output.waypoints,
-                        confidence: output.confidence,
-                        horizon_ms,
-                    });
-                }
-                Err(_) => {} // fall through to linear extrapolation
+            if let Ok(output) = pred.predict_trajectory(&positions, &timestamps, horizon_ms, current_time) {
+                return Some(TrajectoryPrediction {
+                    ue_id,
+                    waypoints: output.waypoints,
+                    confidence: output.confidence,
+                    horizon_ms,
+                });
             }
+            // fall through to linear extrapolation
         }
 
         // Linear extrapolation fallback (same algorithm as original)
@@ -584,12 +598,12 @@ impl NwdafManager {
         &mut self.data_collector
     }
 
-    /// Returns a reference to the AnLF
+    /// Returns a reference to the `AnLF`
     pub fn anlf(&self) -> &Anlf {
         &self.anlf
     }
 
-    /// Returns a mutable reference to the AnLF
+    /// Returns a mutable reference to the `AnLF`
     pub fn anlf_mut(&mut self) -> &mut Anlf {
         &mut self.anlf
     }
@@ -604,7 +618,7 @@ impl NwdafManager {
         &mut self.mtlf
     }
 
-    /// Performs UE mobility analytics via the AnLF
+    /// Performs UE mobility analytics via the `AnLF`
     ///
     /// # Errors
     ///
@@ -618,7 +632,7 @@ impl NwdafManager {
             .analyze_ue_mobility(ue_id, horizon_ms, &self.data_collector, &self.mtlf)
     }
 
-    /// Performs NF load analytics via the AnLF
+    /// Performs NF load analytics via the `AnLF`
     ///
     /// # Errors
     ///
@@ -632,7 +646,7 @@ impl NwdafManager {
             .analyze_nf_load(cell_id, horizon_steps, &self.data_collector, &self.mtlf)
     }
 
-    /// Performs Service Experience analytics via the AnLF (TS 23.288 6.4)
+    /// Performs Service Experience analytics via the `AnLF` (TS 23.288 6.4)
     ///
     /// Computes MOS scores and service-level metrics for the given target.
     ///
@@ -647,7 +661,7 @@ impl NwdafManager {
             .analyze_service_experience(target, &self.data_collector)
     }
 
-    /// Performs User Data Congestion analytics via the AnLF (TS 23.288 6.8)
+    /// Performs User Data Congestion analytics via the `AnLF` (TS 23.288 6.8)
     ///
     /// Analyzes congestion levels and predicts future congestion for the given cell.
     ///
@@ -662,9 +676,9 @@ impl NwdafManager {
             .analyze_user_data_congestion(target, &self.data_collector, &self.mtlf)
     }
 
-    /// Performs QoS Sustainability analytics via the AnLF (TS 23.288 6.6)
+    /// Performs `QoS` Sustainability analytics via the `AnLF` (TS 23.288 6.6)
     ///
-    /// Predicts whether current QoS levels can be sustained.
+    /// Predicts whether current `QoS` levels can be sustained.
     ///
     /// # Errors
     ///
@@ -677,7 +691,7 @@ impl NwdafManager {
             .analyze_qos_sustainability(target, &self.data_collector, &self.mtlf)
     }
 
-    /// Returns recent anomalies detected by the AnLF
+    /// Returns recent anomalies detected by the `AnLF`
     pub fn recent_anomalies(&self) -> &std::collections::VecDeque<Anomaly> {
         self.anlf.anomaly_detector().recent_anomalies()
     }

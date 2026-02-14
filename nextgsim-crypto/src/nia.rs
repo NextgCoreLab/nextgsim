@@ -28,7 +28,7 @@ pub const MAC_SIZE: usize = 4;
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit integrity key (KNASint or KUPint)
+/// - `key`: 128-bit integrity key (`KNASint` or `KUPint`)
 /// - `data`: Message data to authenticate
 ///
 /// # Returns
@@ -73,7 +73,7 @@ pub fn nia1_compute_mac(
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit integrity key (KNASint or KUPint)
+/// - `key`: 128-bit integrity key (`KNASint` or `KUPint`)
 /// - `data`: Message data to authenticate
 ///
 /// # Returns
@@ -104,8 +104,9 @@ pub fn nia2_compute_mac(
     // MESSAGE
     input.extend_from_slice(data);
 
-    // Compute CMAC
-    let mut mac = Cmac::<Aes128>::new_from_slice(key).expect("Invalid key length");
+    // Compute CMAC (key is guaranteed to be 16 bytes from function signature)
+    let mut mac = Cmac::<Aes128>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("Key is guaranteed to be 16 bytes"));
     mac.update(&input);
     let result = mac.finalize().into_bytes();
 
@@ -136,7 +137,7 @@ pub fn nia2_compute_mac(
 /// - `count`: 32-bit counter value (NAS COUNT or PDCP COUNT)
 /// - `bearer`: 5-bit bearer identity (0-31)
 /// - `direction`: 1-bit direction (0 = uplink, 1 = downlink)
-/// - `key`: 128-bit integrity key (KNASint or KUPint)
+/// - `key`: 128-bit integrity key (`KNASint` or `KUPint`)
 /// - `data`: Message data to authenticate
 ///
 /// # Returns

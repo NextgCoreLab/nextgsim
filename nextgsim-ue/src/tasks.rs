@@ -113,7 +113,7 @@ impl<T> TaskMessage<T> {
 
 /// Task lifecycle state.
 ///
-/// Based on UERANSIM's NtsTask lifecycle from `src/utils/nts.hpp`.
+/// Based on UERANSIM's `NtsTask` lifecycle from `src/utils/nts.hpp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
 pub enum TaskState {
@@ -168,6 +168,16 @@ pub enum TaskId {
     FlParticipant,
     /// Semantic Codec - Semantic communication encoder/decoder
     SemanticCodec,
+
+    // ========================================================================
+    // Rel-18 5G-Advanced tasks
+    // ========================================================================
+    /// Ranging - UE-to-UE ranging and carrier phase positioning (TS 23.586)
+    Ranging,
+    /// MINT - Multi-IMSI terminal support (TS 23.761)
+    Mint,
+    /// Sidelink - NR relay, discovery, PC5, sidelink positioning
+    Sidelink,
 }
 
 impl std::fmt::Display for TaskId {
@@ -183,6 +193,10 @@ impl std::fmt::Display for TaskId {
             TaskId::IsacSensor => write!(f, "ISAC-Sensor"),
             TaskId::FlParticipant => write!(f, "FL-Participant"),
             TaskId::SemanticCodec => write!(f, "Semantic-Codec"),
+            // Rel-18 5G-Advanced tasks
+            TaskId::Ranging => write!(f, "Ranging"),
+            TaskId::Mint => write!(f, "MINT"),
+            TaskId::Sidelink => write!(f, "Sidelink"),
         }
     }
 }
@@ -324,7 +338,7 @@ pub enum UeCliCommandType {
     },
     /// Establish PDU session
     PsEstablish {
-        /// Session type (IPv4, IPv6, IPv4v6)
+        /// Session type (IPv4, IPv6, `IPv4v6`)
         session_type: Option<String>,
         /// APN/DNN
         apn: Option<String>,
@@ -397,7 +411,7 @@ pub enum NasMessage {
         psi: u8,
         /// Procedure transaction identity
         pti: u8,
-        /// Session type (e.g., "IPv4", "IPv6", "IPv4v6")
+        /// Session type (e.g., "IPv4", "IPv6", "`IPv4v6`")
         session_type: String,
         /// APN/DNN (optional)
         apn: Option<String>,
@@ -421,6 +435,11 @@ pub enum NasMessage {
         /// User data
         data: OctetString,
     },
+    /// Initiate Service Request procedure (IDLE -> CONNECTED transition)
+    ///
+    /// Triggered when UE has data to send while in CM-IDLE or CM-INACTIVE state.
+    /// Sends NAS Service Request message (5GMM type 0x4C) via RRC.
+    InitiateServiceRequest,
 }
 
 // ============================================================================
@@ -486,6 +505,32 @@ pub enum RrcMessage {
         autonomous_ta: bool,
         /// Max Doppler shift in Hz
         max_doppler_hz: f64,
+    },
+
+    // ========================================================================
+    // 6G Message Routing (Rel-20 extensions)
+    // ========================================================================
+
+    /// AI/ML inference request (route to SHE Client)
+    SixgInferenceRequest {
+        /// Model identifier
+        model_id: String,
+        /// Input data
+        input_data: Vec<f32>,
+    },
+    /// ISAC sensing measurement (route to ISAC Sensor)
+    SixgSensingMeasurement {
+        /// Measurement type
+        measurement_type: String,
+        /// Measurement data
+        measurements: Vec<f32>,
+    },
+    /// Semantic communication data (route to Semantic Codec)
+    SixgSemanticData {
+        /// Content type identifier
+        content_type: String,
+        /// Encoded data
+        data: Vec<u8>,
     },
 }
 
@@ -733,7 +778,7 @@ pub struct NeighborMeasurementReport {
 pub enum NwdafReporterResponse {
     /// Trajectory prediction result
     TrajectoryPrediction {
-        /// Predicted waypoints (position, timestamp_ms)
+        /// Predicted waypoints (position, `timestamp_ms`)
         waypoints: Vec<((f32, f32, f32), u64)>,
         /// Confidence scores for each waypoint
         confidence: Vec<f32>,
@@ -796,9 +841,9 @@ pub struct IsacSensingConfig {
     pub mode: IsacSensingMode,
     /// Measurement interval in milliseconds
     pub interval_ms: u32,
-    /// Enable ToA (Time of Arrival) measurements
+    /// Enable `ToA` (Time of Arrival) measurements
     pub enable_toa: bool,
-    /// Enable AoA (Angle of Arrival) measurements
+    /// Enable `AoA` (Angle of Arrival) measurements
     pub enable_aoa: bool,
     /// Enable Doppler measurements
     pub enable_doppler: bool,
@@ -1082,6 +1127,165 @@ pub enum SemanticCodecResponse {
 
 
 // ============================================================================
+// Rel-18 Ranging Messages (TS 23.586)
+// ============================================================================
+
+/// Messages for the Ranging task.
+///
+/// Handles UE-to-UE ranging via RTT and carrier phase positioning.
+#[derive(Debug)]
+pub enum RangingMessage {
+    /// Start ranging session with a peer UE
+    StartRanging {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+        /// Ranging method
+        method: String,
+    },
+    /// Stop ranging session
+    StopRanging {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+    },
+    /// RTT measurement result
+    RttMeasurement {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+        /// Round-trip time in nanoseconds
+        rtt_ns: u64,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Carrier phase measurement for high-precision ranging
+    CarrierPhaseMeasurement {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+        /// Frequency in MHz
+        frequency_mhz: f64,
+        /// Measured phase in radians
+        phase_rad: f64,
+        /// Phase quality indicator (0.0 - 1.0)
+        quality: f64,
+    },
+    /// Report ranging results to LMF
+    ReportToLmf {
+        /// Response channel for ranging results
+        response_tx: Option<tokio::sync::oneshot::Sender<Vec<crate::ranging::task::RangingResult>>>,
+    },
+}
+
+// ============================================================================
+// Rel-18 MINT Messages (TS 23.761)
+// ============================================================================
+
+/// Messages for the MINT (Multi-IMSI) task.
+///
+/// Handles multi-subscription management for dual-SIM UEs.
+#[derive(Debug)]
+pub enum MintMessage {
+    /// Switch active subscription
+    SwitchSubscription {
+        /// Subscription index to activate
+        index: u8,
+    },
+    /// Registration status update for a subscription
+    RegistrationUpdate {
+        /// Subscription index
+        subscription_index: u8,
+        /// Whether registered
+        registered: bool,
+        /// Serving PLMN (MCC, MNC)
+        serving_plmn: Option<(u16, u16)>,
+        /// Assigned GUTI
+        guti: Option<String>,
+    },
+    /// Select subscription for outgoing session
+    SelectForSession {
+        /// DNN for the session
+        dnn: String,
+        /// Response: (subscription_index, supi)
+        response_tx: Option<tokio::sync::oneshot::Sender<(u8, String)>>,
+    },
+    /// PDU session update on a subscription
+    SessionUpdate {
+        /// Subscription index
+        subscription_index: u8,
+        /// PDU session ID
+        psi: u8,
+        /// Whether session is active
+        active: bool,
+    },
+    /// Get status of all subscriptions
+    GetStatus {
+        /// Response: Vec of (index, supi, registered, active_session_count)
+        #[allow(clippy::type_complexity)]
+        response_tx: Option<tokio::sync::oneshot::Sender<Vec<(u8, String, bool, usize)>>>,
+    },
+}
+
+// ============================================================================
+// Rel-18 Sidelink Messages
+// ============================================================================
+
+/// Messages for the Sidelink task.
+///
+/// Handles NR sidelink relay, discovery, PC5, and sidelink positioning.
+#[derive(Debug)]
+pub enum SidelinkMessage {
+    /// Start sidelink discovery
+    StartDiscovery,
+    /// Stop sidelink discovery
+    StopDiscovery,
+    /// Peer UE discovered via sidelink
+    PeerDiscovered {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+        /// Signal quality in dBm
+        signal_dbm: i32,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Establish PC5 link with peer
+    EstablishPc5Link {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+    },
+    /// Release PC5 link
+    ReleasePc5Link {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+    },
+    /// Set relay mode
+    SetRelayMode {
+        /// Mode: "l2", "l3", "ue-to-network", or "none"
+        mode: String,
+    },
+    /// Relay data between UEs
+    RelayData {
+        /// Source UE
+        source_ue_id: u64,
+        /// Destination UE
+        destination_ue_id: u64,
+        /// Data size in bytes
+        data_size: u32,
+    },
+    /// Sidelink positioning measurement
+    PositioningMeasurement {
+        /// Peer UE identifier
+        peer_ue_id: u64,
+        /// Measured distance in meters
+        distance_m: f64,
+        /// Peer position if known (x, y, z)
+        peer_position: Option<(f64, f64, f64)>,
+    },
+    /// Request cooperative positioning estimate
+    CooperativePositioning {
+        /// Response: estimated position (x, y, z)
+        response_tx: Option<tokio::sync::oneshot::Sender<Option<(f64, f64, f64)>>>,
+    },
+}
+
+// ============================================================================
 // Task Handle
 // ============================================================================
 
@@ -1154,12 +1358,59 @@ pub struct UeTaskBase {
     pub rrc_tx: TaskHandle<RrcMessage>,
     /// Handle to the RLS task
     pub rls_tx: TaskHandle<RlsMessage>,
+    /// 6G task handles (initialized via `init_6g_tasks()`)
+    pub sixg: Option<UeSixgHandles>,
+    /// Rel-18 task handles (initialized via `init_rel18_tasks()`)
+    pub rel18: Option<UeRel18Handles>,
+}
+
+/// 6G task handles for UE (Rel-20 extensions)
+#[derive(Clone)]
+pub struct UeSixgHandles {
+    /// Handle to the SHE Client (edge inference/offloading) task
+    pub she_client_tx: TaskHandle<SheClientMessage>,
+    /// Handle to the NWDAF Reporter (analytics reporting) task
+    pub nwdaf_reporter_tx: TaskHandle<NwdafReporterMessage>,
+    /// Handle to the ISAC Sensor (sensing and communication) task
+    pub isac_sensor_tx: TaskHandle<IsacSensorMessage>,
+    /// Handle to the FL Participant (federated learning) task
+    pub fl_participant_tx: TaskHandle<FlParticipantMessage>,
+    /// Handle to the Semantic Codec (task-oriented communication) task
+    pub semantic_codec_tx: TaskHandle<SemanticCodecMessage>,
+}
+
+/// 6G task receivers for UE
+pub struct UeSixgReceivers {
+    pub she_client_rx: mpsc::Receiver<TaskMessage<SheClientMessage>>,
+    pub nwdaf_reporter_rx: mpsc::Receiver<TaskMessage<NwdafReporterMessage>>,
+    pub isac_sensor_rx: mpsc::Receiver<TaskMessage<IsacSensorMessage>>,
+    pub fl_participant_rx: mpsc::Receiver<TaskMessage<FlParticipantMessage>>,
+    pub semantic_codec_rx: mpsc::Receiver<TaskMessage<SemanticCodecMessage>>,
+}
+
+/// Rel-18 5G-Advanced task handles for UE
+#[derive(Clone)]
+pub struct UeRel18Handles {
+    /// Handle to the Ranging task (TS 23.586)
+    pub ranging_tx: TaskHandle<RangingMessage>,
+    /// Handle to the MINT (Multi-IMSI) task (TS 23.761)
+    pub mint_tx: TaskHandle<MintMessage>,
+    /// Handle to the Sidelink (NR relay, PC5, positioning) task
+    pub sidelink_tx: TaskHandle<SidelinkMessage>,
+}
+
+/// Rel-18 task receivers for UE
+pub struct UeRel18Receivers {
+    pub ranging_rx: mpsc::Receiver<TaskMessage<RangingMessage>>,
+    pub mint_rx: mpsc::Receiver<TaskMessage<MintMessage>>,
+    pub sidelink_rx: mpsc::Receiver<TaskMessage<SidelinkMessage>>,
 }
 
 impl UeTaskBase {
-    /// Creates a new UeTaskBase with the given configuration and channel capacity.
+    /// Creates a new `UeTaskBase` with the given configuration and channel capacity.
     ///
     /// Returns the task base along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: UeConfig,
         channel_capacity: usize,
@@ -1181,9 +1432,61 @@ impl UeTaskBase {
             nas_tx: TaskHandle::new(nas_tx),
             rrc_tx: TaskHandle::new(rrc_tx),
             rls_tx: TaskHandle::new(rls_tx),
+            sixg: None,
+            rel18: None,
         };
 
         (base, app_rx, nas_rx, rrc_rx, rls_rx)
+    }
+
+    /// Initialize 6G task handles and return their receivers.
+    ///
+    /// Call this after `new()` to enable 6G tasks (SHE Client, NWDAF Reporter,
+    /// ISAC Sensor, FL Participant, Semantic Codec).
+    /// The returned receivers should be used to spawn the 6G task loops.
+    pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> UeSixgReceivers {
+        let (she_client_tx, she_client_rx) = mpsc::channel(channel_capacity);
+        let (nwdaf_reporter_tx, nwdaf_reporter_rx) = mpsc::channel(channel_capacity);
+        let (isac_sensor_tx, isac_sensor_rx) = mpsc::channel(channel_capacity);
+        let (fl_participant_tx, fl_participant_rx) = mpsc::channel(channel_capacity);
+        let (semantic_codec_tx, semantic_codec_rx) = mpsc::channel(channel_capacity);
+
+        self.sixg = Some(UeSixgHandles {
+            she_client_tx: TaskHandle::new(she_client_tx),
+            nwdaf_reporter_tx: TaskHandle::new(nwdaf_reporter_tx),
+            isac_sensor_tx: TaskHandle::new(isac_sensor_tx),
+            fl_participant_tx: TaskHandle::new(fl_participant_tx),
+            semantic_codec_tx: TaskHandle::new(semantic_codec_tx),
+        });
+
+        UeSixgReceivers {
+            she_client_rx,
+            nwdaf_reporter_rx,
+            isac_sensor_rx,
+            fl_participant_rx,
+            semantic_codec_rx,
+        }
+    }
+
+    /// Initialize Rel-18 5G-Advanced task handles and return their receivers.
+    ///
+    /// Call this after `new()` to enable Rel-18 tasks (Ranging, MINT, Sidelink).
+    pub fn init_rel18_tasks(&mut self, channel_capacity: usize) -> UeRel18Receivers {
+        let (ranging_tx, ranging_rx) = mpsc::channel(channel_capacity);
+        let (mint_tx, mint_rx) = mpsc::channel(channel_capacity);
+        let (sidelink_tx, sidelink_rx) = mpsc::channel(channel_capacity);
+
+        self.rel18 = Some(UeRel18Handles {
+            ranging_tx: TaskHandle::new(ranging_tx),
+            mint_tx: TaskHandle::new(mint_tx),
+            sidelink_tx: TaskHandle::new(sidelink_tx),
+        });
+
+        UeRel18Receivers {
+            ranging_rx,
+            mint_rx,
+            sidelink_rx,
+        }
     }
 
     /// Sends shutdown signals to all tasks.
@@ -1193,6 +1496,20 @@ impl UeTaskBase {
         let _ = self.nas_tx.shutdown().await;
         let _ = self.rrc_tx.shutdown().await;
         let _ = self.rls_tx.shutdown().await;
+        // 6G tasks (if initialized)
+        if let Some(ref sixg) = self.sixg {
+            let _ = sixg.she_client_tx.shutdown().await;
+            let _ = sixg.nwdaf_reporter_tx.shutdown().await;
+            let _ = sixg.isac_sensor_tx.shutdown().await;
+            let _ = sixg.fl_participant_tx.shutdown().await;
+            let _ = sixg.semantic_codec_tx.shutdown().await;
+        }
+        // Rel-18 tasks (if initialized)
+        if let Some(ref rel18) = self.rel18 {
+            let _ = rel18.ranging_tx.shutdown().await;
+            let _ = rel18.mint_tx.shutdown().await;
+            let _ = rel18.sidelink_tx.shutdown().await;
+        }
     }
 }
 
@@ -1213,13 +1530,13 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
 /// Manages the lifecycle of all UE tasks.
 ///
-/// The TaskManager is responsible for:
+/// The `TaskManager` is responsible for:
 /// - Spawning tasks and tracking their handles
 /// - Monitoring task health and state
 /// - Coordinating graceful shutdown across all tasks
 /// - Handling task failures and restarts
 ///
-/// Based on UERANSIM's UserEquipment class from `src/ue/ue.cpp`.
+/// Based on UERANSIM's `UserEquipment` class from `src/ue/ue.cpp`.
 pub struct TaskManager {
     /// Task base with all message channels
     task_base: UeTaskBase,
@@ -1251,9 +1568,10 @@ impl std::fmt::Display for TaskError {
 impl std::error::Error for TaskError {}
 
 impl TaskManager {
-    /// Creates a new TaskManager with the given configuration.
+    /// Creates a new `TaskManager` with the given configuration.
     ///
     /// Returns the manager along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: UeConfig,
         channel_capacity: usize,
@@ -1282,6 +1600,10 @@ impl TaskManager {
             TaskId::IsacSensor,
             TaskId::FlParticipant,
             TaskId::SemanticCodec,
+            // Rel-18 5G-Advanced tasks
+            TaskId::Ranging,
+            TaskId::Mint,
+            TaskId::Sidelink,
         ] {
             task_states.insert(
                 task_id,
@@ -1473,7 +1795,7 @@ mod tests {
     use super::*;
     
 
-    /// Creates a test UeConfig for unit tests.
+    /// Creates a test `UeConfig` for unit tests.
     fn test_config() -> UeConfig {
         UeConfig::default()
     }
@@ -1707,6 +2029,10 @@ mod tests {
             TaskId::IsacSensor,
             TaskId::FlParticipant,
             TaskId::SemanticCodec,
+            // Rel-18 5G-Advanced tasks
+            TaskId::Ranging,
+            TaskId::Mint,
+            TaskId::Sidelink,
         ] {
             manager.mark_task_started(task_id);
         }
@@ -1734,8 +2060,8 @@ mod tests {
         manager.mark_task_started(TaskId::Nas);
 
         let summary = manager.status_summary();
-        // 4 core tasks + 5 AI tasks = 9 total
-        assert_eq!(summary.len(), 9);
+        // 4 core tasks + 5 AI tasks + 3 Rel-18 tasks = 12 total
+        assert_eq!(summary.len(), 12);
 
         // Find App and Nas in summary
         let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);

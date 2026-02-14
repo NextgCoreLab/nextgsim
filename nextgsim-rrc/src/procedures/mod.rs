@@ -16,7 +16,12 @@ pub mod measurement_report;
 pub mod ai_ml_config;
 pub mod isac_config;
 pub mod ntn_timing;
+pub mod ntn_link_sim;
+pub mod ntn_constellation;
+pub mod ntn_integration_example;
 pub mod sub_thz_config;
+pub mod isl_handover;
+pub mod xr_cdrx;
 
 pub use information_transfer::*;
 pub use rrc_reconfiguration::*;
@@ -31,4 +36,11 @@ pub use measurement_report::*;
 pub use ai_ml_config::*;
 pub use isac_config::*;
 pub use ntn_timing::*;
+pub use ntn_link_sim::*;
+pub use ntn_constellation::*;
 pub use sub_thz_config::*;
+pub use isl_handover::{
+    IslHandoverContext, IslHandoverState, IslHandoverManager,
+    IslHandoverError, // SatellitePosition from isl_handover (conflicts with ntn_link_sim)
+};
+pub use xr_cdrx::*;

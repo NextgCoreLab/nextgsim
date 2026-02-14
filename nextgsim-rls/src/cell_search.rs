@@ -35,7 +35,7 @@ pub struct CellInfo {
 }
 
 impl CellInfo {
-    /// Creates a new CellInfo
+    /// Creates a new `CellInfo`
     pub fn new(cell_id: u32, sti: u64, address: SocketAddr, dbm: i32) -> Self {
         Self {
             cell_id,
@@ -100,7 +100,7 @@ pub struct UeCellSearch {
     search_space: Vec<SocketAddr>,
     /// Discovered cells indexed by STI
     cells: HashMap<u64, CellInfo>,
-    /// Mapping from cell_id to STI
+    /// Mapping from `cell_id` to STI
     cell_id_to_sti: HashMap<u32, u64>,
     /// Counter for generating cell IDs
     next_cell_id: u32,
@@ -267,7 +267,7 @@ pub struct GnbCellTracker {
     phy_location: Vector3,
     /// Tracked UEs indexed by STI
     ues: HashMap<u64, UeInfo>,
-    /// Mapping from ue_id to STI
+    /// Mapping from `ue_id` to STI
     ue_id_to_sti: HashMap<u32, u64>,
     /// Counter for generating UE IDs
     next_ue_id: u32,
@@ -289,7 +289,7 @@ pub struct UeInfo {
 }
 
 impl UeInfo {
-    /// Creates a new UeInfo
+    /// Creates a new `UeInfo`
     pub fn new(ue_id: u32, sti: u64, address: SocketAddr) -> Self {
         Self {
             ue_id,

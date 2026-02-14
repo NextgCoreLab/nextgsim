@@ -58,8 +58,14 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 // Re-export modules
-pub use mapping::{EnvironmentFeature, EnvironmentMapper, FeatureType, MapCell, OccupancyGrid};
-pub use ml_sensing::{MlModelType, MlPositioningEngine, MlPositioningResult, TrajectoryPredictor};
+pub use mapping::{
+    EnvironmentFeature, EnvironmentMapper, FeatureType, MapCell, OccupancyGrid, Pose2D,
+    ScanObservation, SlamSystem,
+};
+pub use ml_sensing::{
+    AiDetectionResult, AiSensingEngine, MlModelType, MlPositioningEngine, MlPositioningResult,
+    TargetClass, TrajectoryPredictor,
+};
 pub use saas::{
     GeographicArea, SensingApiRequest, SensingApiResponse, SensingAsAService, SensingQos,
     SensingResult, SensingServiceType, SensingSubscription,
@@ -68,7 +74,10 @@ pub use she_integration::{
     DetectedObject, MapFeature, SensingProcessingResult, SensingProcessingType,
     SensingWorkloadRequest, SensingWorkloadResult, SheIsacClient,
 };
-pub use waveform::OfdmRadarWaveform;
+pub use waveform::{
+    BistaticGeometry, CfarDetection, CfarDetector, ClutterModel, JointWaveformDesign,
+    JointWaveformMetrics, MultstaticNetwork, MultstaticNode, OfdmRadarWaveform,
+};
 
 /// Speed of light in m/s.
 const SPEED_OF_LIGHT: f64 = 299_792_458.0;
@@ -496,7 +505,7 @@ fn solve_3x3(a: &Array2<f64>, b: &Array1<f64>) -> Option<[f64; 3]> {
 
 // ─── TDoA Solver ───────────────────────────────────────────────────────────────
 
-/// TDoA (Time Difference of Arrival) positioning result
+/// `TDoA` (Time Difference of Arrival) positioning result
 #[derive(Debug, Clone)]
 pub struct TdoaResult {
     /// Estimated position
@@ -509,9 +518,9 @@ pub struct TdoaResult {
     pub converged: bool,
 }
 
-/// Solves for position using TDoA measurements
+/// Solves for position using `TDoA` measurements
 ///
-/// TDoA measures the difference in arrival times between pairs of anchors.
+/// `TDoA` measures the difference in arrival times between pairs of anchors.
 /// This is equivalent to hyperbolic positioning.
 ///
 /// # Arguments
@@ -1043,7 +1052,7 @@ impl ExtendedKalmanFilter {
         self.covariance = i_kh.dot(&self.covariance).dot(&i_kh.t()) + kr_kt;
     }
 
-    /// Update with a ZoA (elevation angle) measurement.
+    /// Update with a `ZoA` (elevation angle) measurement.
     ///
     /// `elevation_rad` is the measured elevation angle (radians) from the anchor
     /// to the target, measured from the XY plane upwards.
@@ -1229,7 +1238,7 @@ fn invert_3x3(m: &Array2<f64>) -> Option<Array2<f64>> {
 // ─── 3. Multi-Sensor Bayesian Fusion ──────────────────────────────────────────
 
 /// A single sensor estimate produced by any positioning method (trilateration,
-/// AoA intersection, RSS fingerprinting, etc.).
+/// `AoA` intersection, RSS fingerprinting, etc.).
 ///
 /// The estimate is described by a Gaussian: position mean + 3x3 covariance.
 #[derive(Debug, Clone)]
@@ -1315,7 +1324,7 @@ pub fn bayesian_fuse(estimates: &[SensorEstimate]) -> Option<BayesianFusionResul
 /// different sensor types into [`SensorEstimate`]s and fuses them.
 ///
 /// For ToA/RTT measurements, trilateration is run on the set of range
-/// measurements.  For AoA measurements, simple geometric intersection is
+/// measurements.  For `AoA` measurements, simple geometric intersection is
 /// attempted.  For RSS measurements, a path-loss-based range is computed and
 /// fed into trilateration.
 ///
@@ -1525,7 +1534,7 @@ pub fn detect_object(
 
     // Confidence based on how far above threshold
     let confidence = if threshold_db > 0.0 {
-        (rms_change / threshold_db).min(1.0).max(0.0)
+        (rms_change / threshold_db).clamp(0.0, 1.0)
     } else if detected {
         1.0
     } else {
@@ -1565,7 +1574,7 @@ pub struct VelocityEstimate {
 /// * `doppler_measurements` - slice of `(anchor_id, doppler_shift_hz, sigma_hz)`.
 /// * `carrier_freq_hz` - the carrier frequency used for sensing.
 /// * `target_position` - current estimated target position (needed for 3-D).
-/// * `anchors` - map of anchor_id to position.
+/// * `anchors` - map of `anchor_id` to position.
 pub fn estimate_velocity_doppler(
     doppler_measurements: &[(i32, f64, f64)],
     carrier_freq_hz: f64,
@@ -1994,11 +2003,11 @@ impl BistaticConfig {
 /// ISAC manager
 #[derive(Debug)]
 pub struct IsacManager {
-    /// Anchor positions (cell_id -> position)
+    /// Anchor positions (`cell_id` -> position)
     anchors: HashMap<i32, Vector3>,
-    /// Tracking states (object_id -> state)
+    /// Tracking states (`object_id` -> state)
     tracking: HashMap<u64, TrackingState>,
-    /// Extended Kalman Filters per target (object_id -> EKF)
+    /// Extended Kalman Filters per target (`object_id` -> EKF)
     ekf_states: HashMap<u64, ExtendedKalmanFilter>,
     /// Recent sensing data
     recent_data: HashMap<i32, SensingData>,
@@ -2057,7 +2066,7 @@ impl IsacManager {
         })
     }
 
-    /// Performs multi-sensor Bayesian fusion for a target, combining ToA, AoA,
+    /// Performs multi-sensor Bayesian fusion for a target, combining `ToA`, `AoA`,
     /// and RSS measurements.
     pub fn fuse_position_bayesian(&self, target_id: i32) -> Option<FusedPosition> {
         let data = self.recent_data.get(&target_id)?;

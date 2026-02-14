@@ -114,8 +114,8 @@ impl CliClient {
     ///
     /// # Returns
     ///
-    /// A tuple of (output, is_error) where output is the collected response
-    /// and is_error indicates if the final message was an error.
+    /// A tuple of (output, `is_error`) where output is the collected response
+    /// and `is_error` indicates if the final message was an error.
     pub fn execute_command(&self, command: &str) -> Result<(String, bool)> {
         self.send_command(command)?;
 

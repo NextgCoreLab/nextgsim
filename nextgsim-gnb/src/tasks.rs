@@ -92,10 +92,12 @@ impl<T> TaskMessage<T> {
 
 /// Task lifecycle state.
 ///
-/// Based on UERANSIM's NtsTask lifecycle from `src/utils/nts.hpp`.
+/// Based on UERANSIM's `NtsTask` lifecycle from `src/utils/nts.hpp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TaskState {
     /// Task is created but not yet started
+    #[default]
     Created,
     /// Task is running and processing messages
     Running,
@@ -107,11 +109,6 @@ pub enum TaskState {
     Failed,
 }
 
-impl Default for TaskState {
-    fn default() -> Self {
-        TaskState::Created
-    }
-}
 
 impl std::fmt::Display for TaskState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -153,6 +150,12 @@ pub enum TaskId {
     Agent,
     /// Federated Learning Aggregator task
     FlAggregator,
+
+    // ========================================================================
+    // Rel-18 5G-Advanced tasks
+    // ========================================================================
+    /// Energy Savings - Cell sleep modes and energy efficiency metrics
+    Energy,
 }
 
 impl std::fmt::Display for TaskId {
@@ -170,6 +173,7 @@ impl std::fmt::Display for TaskId {
             TaskId::Isac => write!(f, "ISAC"),
             TaskId::Agent => write!(f, "Agent"),
             TaskId::FlAggregator => write!(f, "FL"),
+            TaskId::Energy => write!(f, "Energy"),
         }
     }
 }
@@ -341,6 +345,45 @@ pub enum NgapMessage {
         /// K-offset for HARQ timing
         k_offset: u16,
     },
+    /// MBS Session Activation Request from AMF (Rel-17 MBS)
+    MbsSessionActivationRequest {
+        /// MBS session ID
+        session_id: u32,
+        /// TMGI (Temporary Mobile Group Identity)
+        tmgi: [u8; 6],
+        /// Is broadcast session (vs multicast)
+        is_broadcast: bool,
+        /// Multicast group IP address
+        multicast_ip: Option<std::net::IpAddr>,
+        /// MBS QFI
+        qfi: u8,
+    },
+    /// MBS Session Deactivation Request from AMF (Rel-17 MBS)
+    MbsSessionDeactivationRequest {
+        /// MBS session ID
+        session_id: u32,
+    },
+    /// Multicast Group Paging from AMF (Rel-17 MBS)
+    MulticastGroupPaging {
+        /// TMGI
+        tmgi: [u8; 6],
+        /// Area scope for paging
+        area_scope: Vec<u32>,
+    },
+    /// MBS UE Join Request from RRC (Rel-17 MBS)
+    MbsUeJoinRequest {
+        /// UE ID
+        ue_id: i32,
+        /// TMGI to join
+        tmgi: [u8; 6],
+    },
+    /// MBS UE Leave Request from RRC (Rel-17 MBS)
+    MbsUeLeaveRequest {
+        /// UE ID
+        ue_id: i32,
+        /// TMGI to leave
+        tmgi: [u8; 6],
+    },
 }
 
 /// Cause for UE context release request.
@@ -424,6 +467,38 @@ pub enum RrcMessage {
         /// Whether UE should use autonomous TA calculation
         autonomous_ta: bool,
     },
+
+    // ========================================================================
+    // 6G Message Routing (Rel-20 extensions)
+    // ========================================================================
+
+    /// AI/ML model inference request from UE (routed to SHE)
+    SixgAiMlInference {
+        /// UE ID
+        ue_id: i32,
+        /// Model identifier
+        model_id: String,
+        /// Input data
+        input_data: Vec<f32>,
+    },
+    /// ISAC sensing data from UE (routed to ISAC task)
+    SixgIsacSensingData {
+        /// UE ID
+        ue_id: i32,
+        /// Measurement type
+        measurement_type: String,
+        /// Measurements
+        measurements: Vec<f32>,
+    },
+    /// Semantic communication message from UE (routed to NKEF)
+    SixgSemanticMessage {
+        /// UE ID
+        ue_id: i32,
+        /// Semantic content type
+        content_type: String,
+        /// Encoded semantic data
+        data: Vec<u8>,
+    },
 }
 
 // ============================================================================
@@ -491,7 +566,7 @@ pub struct GtpUeContextUpdate {
 pub struct PduSessionResource {
     /// PDU session ID
     pub psi: i32,
-    /// QoS flow identifier
+    /// `QoS` flow identifier
     pub qfi: Option<u8>,
     /// Uplink TEID (gNB -> UPF)
     pub uplink_teid: u32,
@@ -778,7 +853,7 @@ pub enum IsacMessage {
     SensingData {
         /// Cell identifier
         cell_id: i32,
-        /// Measurement type (ToA, TDoA, AoA, RSS, Doppler)
+        /// Measurement type (`ToA`, `TDoA`, `AoA`, RSS, Doppler)
         measurement_type: String,
         /// Measurement values
         measurements: Vec<f32>,
@@ -871,6 +946,49 @@ pub enum FlAggregatorMessage {
 }
 
 // ============================================================================
+// Rel-18 Energy Savings Messages
+// ============================================================================
+
+/// Messages for the Energy Savings task.
+///
+/// Handles cell sleep/dormant modes and energy efficiency metrics.
+#[derive(Debug)]
+pub enum EnergyMessage {
+    /// Put cell into sleep mode
+    CellSleep {
+        /// Cell identifier
+        cell_id: i32,
+        /// Sleep mode: "light", "deep", or "dormant"
+        sleep_mode: String,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Wake up cell from sleep
+    CellWakeUp {
+        /// Cell identifier
+        cell_id: i32,
+        /// Wake-up reason: "paging", "traffic", "timer", "manual"
+        reason: String,
+        /// Timestamp in milliseconds
+        timestamp_ms: u64,
+    },
+    /// Report traffic volume for energy efficiency calculation
+    TrafficReport {
+        /// Cell identifier
+        cell_id: i32,
+        /// Data volume in bits
+        data_bits: u64,
+        /// Number of connected UEs
+        connected_ues: u32,
+    },
+    /// Get energy efficiency metrics for all cells
+    GetMetrics {
+        /// Response channel
+        response_tx: Option<tokio::sync::oneshot::Sender<Vec<crate::energy::task::CellEnergyReport>>>,
+    },
+}
+
+// ============================================================================
 // Task Handle
 // ============================================================================
 
@@ -947,12 +1065,56 @@ pub struct GnbTaskBase {
     pub rls_tx: TaskHandle<RlsMessage>,
     /// Handle to the SCTP task
     pub sctp_tx: TaskHandle<SctpMessage>,
+    /// 6G task handles (initialized via `init_6g_tasks()`)
+    pub sixg: Option<GnbSixgHandles>,
+    /// Rel-18 task handles (initialized via `init_rel18_tasks()`)
+    pub rel18: Option<GnbRel18Handles>,
+}
+
+/// Rel-18 5G-Advanced task handles for gNB
+#[derive(Clone)]
+pub struct GnbRel18Handles {
+    /// Handle to the Energy Savings task
+    pub energy_tx: TaskHandle<EnergyMessage>,
+}
+
+/// Rel-18 task receivers for gNB
+pub struct GnbRel18Receivers {
+    pub energy_rx: mpsc::Receiver<TaskMessage<EnergyMessage>>,
+}
+
+/// 6G task handles for gNB (Rel-20 extensions)
+#[derive(Clone)]
+pub struct GnbSixgHandles {
+    /// Handle to the SHE (Sub-network Hosted Entity) task
+    pub she_tx: TaskHandle<SheMessage>,
+    /// Handle to the NWDAF (Network Data Analytics) task
+    pub nwdaf_tx: TaskHandle<NwdafMessage>,
+    /// Handle to the NKEF (Network Knowledge Exchange) task
+    pub nkef_tx: TaskHandle<NkefMessage>,
+    /// Handle to the ISAC (Integrated Sensing and Communication) task
+    pub isac_tx: TaskHandle<IsacMessage>,
+    /// Handle to the Agent task
+    pub agent_tx: TaskHandle<AgentMessage>,
+    /// Handle to the FL (Federated Learning) Aggregator task
+    pub fl_tx: TaskHandle<FlAggregatorMessage>,
+}
+
+/// 6G task receivers for gNB
+pub struct GnbSixgReceivers {
+    pub she_rx: mpsc::Receiver<TaskMessage<SheMessage>>,
+    pub nwdaf_rx: mpsc::Receiver<TaskMessage<NwdafMessage>>,
+    pub nkef_rx: mpsc::Receiver<TaskMessage<NkefMessage>>,
+    pub isac_rx: mpsc::Receiver<TaskMessage<IsacMessage>>,
+    pub agent_rx: mpsc::Receiver<TaskMessage<AgentMessage>>,
+    pub fl_rx: mpsc::Receiver<TaskMessage<FlAggregatorMessage>>,
 }
 
 impl GnbTaskBase {
-    /// Creates a new GnbTaskBase with the given configuration and channel capacity.
+    /// Creates a new `GnbTaskBase` with the given configuration and channel capacity.
     ///
     /// Returns the task base along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: GnbConfig,
         channel_capacity: usize,
@@ -980,9 +1142,53 @@ impl GnbTaskBase {
             gtp_tx: TaskHandle::new(gtp_tx),
             rls_tx: TaskHandle::new(rls_tx),
             sctp_tx: TaskHandle::new(sctp_tx),
+            sixg: None,
+            rel18: None,
         };
 
         (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)
+    }
+
+    /// Initialize 6G task handles and return their receivers.
+    ///
+    /// Call this after `new()` to enable 6G tasks (SHE, NWDAF, NKEF, ISAC, Agent, FL).
+    /// The returned receivers should be used to spawn the 6G task loops.
+    pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> GnbSixgReceivers {
+        let (she_tx, she_rx) = mpsc::channel(channel_capacity);
+        let (nwdaf_tx, nwdaf_rx) = mpsc::channel(channel_capacity);
+        let (nkef_tx, nkef_rx) = mpsc::channel(channel_capacity);
+        let (isac_tx, isac_rx) = mpsc::channel(channel_capacity);
+        let (agent_tx, agent_rx) = mpsc::channel(channel_capacity);
+        let (fl_tx, fl_rx) = mpsc::channel(channel_capacity);
+
+        self.sixg = Some(GnbSixgHandles {
+            she_tx: TaskHandle::new(she_tx),
+            nwdaf_tx: TaskHandle::new(nwdaf_tx),
+            nkef_tx: TaskHandle::new(nkef_tx),
+            isac_tx: TaskHandle::new(isac_tx),
+            agent_tx: TaskHandle::new(agent_tx),
+            fl_tx: TaskHandle::new(fl_tx),
+        });
+
+        GnbSixgReceivers {
+            she_rx,
+            nwdaf_rx,
+            nkef_rx,
+            isac_rx,
+            agent_rx,
+            fl_rx,
+        }
+    }
+
+    /// Initialize Rel-18 5G-Advanced task handles and return their receivers.
+    pub fn init_rel18_tasks(&mut self, channel_capacity: usize) -> GnbRel18Receivers {
+        let (energy_tx, energy_rx) = mpsc::channel(channel_capacity);
+
+        self.rel18 = Some(GnbRel18Handles {
+            energy_tx: TaskHandle::new(energy_tx),
+        });
+
+        GnbRel18Receivers { energy_rx }
     }
 
     /// Sends shutdown signals to all tasks.
@@ -994,6 +1200,19 @@ impl GnbTaskBase {
         let _ = self.gtp_tx.shutdown().await;
         let _ = self.rls_tx.shutdown().await;
         let _ = self.sctp_tx.shutdown().await;
+        // 6G tasks (if initialized)
+        if let Some(ref sixg) = self.sixg {
+            let _ = sixg.she_tx.shutdown().await;
+            let _ = sixg.nwdaf_tx.shutdown().await;
+            let _ = sixg.nkef_tx.shutdown().await;
+            let _ = sixg.isac_tx.shutdown().await;
+            let _ = sixg.agent_tx.shutdown().await;
+            let _ = sixg.fl_tx.shutdown().await;
+        }
+        // Rel-18 tasks (if initialized)
+        if let Some(ref rel18) = self.rel18 {
+            let _ = rel18.energy_tx.shutdown().await;
+        }
     }
 }
 
@@ -1016,13 +1235,13 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
 /// Manages the lifecycle of all gNB tasks.
 ///
-/// The TaskManager is responsible for:
+/// The `TaskManager` is responsible for:
 /// - Spawning tasks and tracking their handles
 /// - Monitoring task health and state
 /// - Coordinating graceful shutdown across all tasks
 /// - Handling task failures and restarts
 ///
-/// Based on UERANSIM's GNodeB class from `src/gnb/gnb.cpp`.
+/// Based on UERANSIM's `GNodeB` class from `src/gnb/gnb.cpp`.
 pub struct TaskManager {
     /// Task base with all message channels
     task_base: GnbTaskBase,
@@ -1054,9 +1273,10 @@ impl std::fmt::Display for TaskError {
 impl std::error::Error for TaskError {}
 
 impl TaskManager {
-    /// Creates a new TaskManager with the given configuration.
+    /// Creates a new `TaskManager` with the given configuration.
     ///
     /// Returns the manager along with receivers for each task.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         config: GnbConfig,
         channel_capacity: usize,
@@ -1090,6 +1310,8 @@ impl TaskManager {
             TaskId::Isac,
             TaskId::Agent,
             TaskId::FlAggregator,
+            // Rel-18 5G-Advanced tasks
+            TaskId::Energy,
         ] {
             task_states.insert(
                 task_id,
@@ -1279,7 +1501,7 @@ mod tests {
     use super::*;
     use nextgsim_common::Plmn;
 
-    /// Creates a test GnbConfig for unit tests.
+    /// Creates a test `GnbConfig` for unit tests.
     fn test_config() -> GnbConfig {
         GnbConfig {
             nci: 0x000000010,
@@ -1299,6 +1521,7 @@ mod tests {
             prose_enabled: false,
             lcs_enabled: false,
             snpn_config: None,
+            ..Default::default()
         }
     }
 
@@ -1535,10 +1758,11 @@ mod tests {
 
         assert!(!manager.all_tasks_running());
 
-        // Start all tasks (including 6G tasks)
+        // Start all tasks (including 6G + Rel-18 tasks)
         for task_id in [
             TaskId::App, TaskId::Ngap, TaskId::Rrc, TaskId::Gtp, TaskId::Rls, TaskId::Sctp,
             TaskId::She, TaskId::Nwdaf, TaskId::Nkef, TaskId::Isac, TaskId::Agent, TaskId::FlAggregator,
+            TaskId::Energy,
         ] {
             manager.mark_task_started(task_id);
         }
@@ -1566,7 +1790,7 @@ mod tests {
         manager.mark_task_started(TaskId::Ngap);
 
         let summary = manager.status_summary();
-        assert_eq!(summary.len(), 12);
+        assert_eq!(summary.len(), 13);
 
         // Find App and Ngap in summary
         let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);
@@ -1582,6 +1806,6 @@ mod tests {
             task_id: TaskId::Sctp,
             message: "Connection timeout".to_string(),
         };
-        assert_eq!(format!("{}", error), "Task SCTP error: Connection timeout");
+        assert_eq!(format!("{error}"), "Task SCTP error: Connection timeout");
     }
 }

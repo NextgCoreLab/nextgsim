@@ -120,7 +120,7 @@ pub enum SensingApiRequest {
         service_type: SensingServiceType,
         target_area: Option<GeographicArea>,
     },
-    /// Update QoS parameters
+    /// Update `QoS` parameters
     UpdateQos {
         subscription_id: u64,
         qos: SensingQos,
@@ -139,7 +139,7 @@ pub enum SensingApiResponse {
     Unsubscribed { subscription_id: u64 },
     /// Query result
     QueryResult { results: Vec<SensingResult> },
-    /// QoS updated
+    /// `QoS` updated
     QosUpdated { subscription_id: u64 },
     /// Error
     Error { code: u32, message: String },
@@ -178,7 +178,7 @@ pub struct SensingAsAService {
 }
 
 impl SensingAsAService {
-    /// Creates a new SaaS manager
+    /// Creates a new `SaaS` manager
     pub fn new() -> Self {
         Self {
             subscriptions: HashMap::new(),
@@ -299,7 +299,7 @@ impl SensingAsAService {
         self.subscriptions.len()
     }
 
-    /// Converts a FusedPosition to a SensingResult
+    /// Converts a `FusedPosition` to a `SensingResult`
     pub fn fused_position_to_result(
         fused: &FusedPosition,
         service_type: SensingServiceType,

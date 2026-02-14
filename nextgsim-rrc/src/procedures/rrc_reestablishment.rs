@@ -5,9 +5,9 @@
 //! handover failure, integrity check failure, or RRC reconfiguration failure.
 //!
 //! The procedure consists of three messages:
-//! 1. RRCReestablishmentRequest - UE -> gNB: Request to reestablish RRC connection
-//! 2. RRCReestablishment - gNB -> UE: Network response with configuration
-//! 3. RRCReestablishmentComplete - UE -> gNB: Confirmation of reestablishment
+//! 1. `RRCReestablishmentRequest` - UE -> gNB: Request to reestablish RRC connection
+//! 2. `RRCReestablishment` - gNB -> UE: Network response with configuration
+//! 3. `RRCReestablishmentComplete` - UE -> gNB: Confirmation of reestablishment
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};

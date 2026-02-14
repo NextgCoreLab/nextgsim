@@ -24,7 +24,9 @@ pub use cli_server::{
     CMD_SERVER_IP, PROC_TABLE_DIR, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH,
 };
 pub use config::{
-    AmfConfig, GnbConfig, OpType, PduSessionType, SessionConfig, SupportedAlgs, UeConfig,
+    AmfConfig, AmbientIotConfig, AmbientIotDeviceType, GnbConfig, MintConfig, OpType,
+    PduSessionType, RangingConfig, RangingMethod, RedCapR18Config, SessionConfig, SupportedAlgs,
+    UavConfig, UeConfig, XrConfig, XrTrafficType,
 };
 pub use error::Error;
 pub use logging::{

@@ -4,7 +4,7 @@
 //! This procedure is used to release an RRC connection between the UE and the network.
 //!
 //! The procedure consists of one message:
-//! 1. RRCRelease - gNB → UE: Network command to release the RRC connection
+//! 1. `RRCRelease` - gNB → UE: Network command to release the RRC connection
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};

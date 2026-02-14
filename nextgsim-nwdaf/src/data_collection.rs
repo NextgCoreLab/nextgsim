@@ -62,7 +62,7 @@ pub enum MeasurementCapability {
     LocationReport,
     /// Cell load (PRB usage, throughput)
     CellLoad,
-    /// QoS flow statistics
+    /// `QoS` flow statistics
     QosFlowStats,
     /// PDU session statistics
     PduSessionStats,

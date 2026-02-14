@@ -38,7 +38,7 @@ impl Default for TrainingConfig {
     }
 }
 
-/// Training sample: (input, channel_quality, task)
+/// Training sample: (input, `channel_quality`, task)
 #[derive(Debug, Clone)]
 pub struct TrainingSample {
     /// Input feature vector
@@ -121,7 +121,7 @@ impl CodecTrainer {
 
     /// Trains the codec for one epoch
     /// Note: This is a simplified training loop. In production, this would
-    /// interface with ONNX Runtime training or PyTorch via Python bindings.
+    /// interface with ONNX Runtime training or `PyTorch` via Python bindings.
     pub fn train_epoch(&mut self) -> EpochStats {
         let start = std::time::Instant::now();
 
