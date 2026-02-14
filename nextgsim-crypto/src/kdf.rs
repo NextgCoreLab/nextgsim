@@ -69,7 +69,9 @@ pub enum AlgorithmTypeDistinguisher {
 /// # Returns
 /// 32-byte HMAC-SHA256 output
 pub fn hmac_sha256(key: &[u8], input: &[u8]) -> [u8; HMAC_SHA256_SIZE] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+    // HMAC-SHA256 accepts keys of any size, so this should never fail
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC-SHA256 accepts keys of any size"));
     mac.update(input);
     let result = mac.finalize();
     let mut output = [0u8; HMAC_SHA256_SIZE];

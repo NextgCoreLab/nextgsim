@@ -414,7 +414,11 @@ pub fn decode_ntn_timing_advance_header(
         ));
     }
 
-    let config_id = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+    let config_id = u16::from_be_bytes(
+        bytes[0..2]
+            .try_into()
+            .map_err(|_| NtnTimingError::CodecError("Invalid config_id bytes".to_string()))?,
+    );
     let orbit_type = match bytes[2] {
         0 => SatelliteOrbitType::Leo,
         1 => SatelliteOrbitType::Meo,
@@ -423,8 +427,16 @@ pub fn decode_ntn_timing_advance_header(
         4 => SatelliteOrbitType::Haps,
         _ => return Err(NtnTimingError::CodecError("Unknown orbit type".to_string())),
     };
-    let satellite_id = u32::from_be_bytes(bytes[3..7].try_into().unwrap());
-    let common_ta_us = u64::from_be_bytes(bytes[7..15].try_into().unwrap());
+    let satellite_id = u32::from_be_bytes(
+        bytes[3..7]
+            .try_into()
+            .map_err(|_| NtnTimingError::CodecError("Invalid satellite_id bytes".to_string()))?,
+    );
+    let common_ta_us = u64::from_be_bytes(
+        bytes[7..15]
+            .try_into()
+            .map_err(|_| NtnTimingError::CodecError("Invalid common_ta_us bytes".to_string()))?,
+    );
 
     Ok((config_id, orbit_type, satellite_id, common_ta_us))
 }

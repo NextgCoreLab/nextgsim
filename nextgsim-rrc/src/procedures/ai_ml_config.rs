@@ -586,7 +586,11 @@ pub fn decode_ai_ml_config_header(
         ));
     }
 
-    let config_id = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+    let config_id = u16::from_be_bytes(
+        bytes[0..2]
+            .try_into()
+            .map_err(|_| AiMlConfigError::CodecError("Invalid config_id bytes".to_string()))?,
+    );
     let use_case = match bytes[2] {
         0 => AiMlUseCase::CsiFeedback,
         1 => AiMlUseCase::BeamManagement,

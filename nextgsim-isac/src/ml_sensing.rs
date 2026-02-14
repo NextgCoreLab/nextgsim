@@ -108,8 +108,8 @@ impl SensingFeatureExtractor {
 
                 features.push(mean);
                 features.push(variance.sqrt());
-                features.push(*values.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&0.0));
-                features.push(*values.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&0.0));
+                features.push(*values.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0));
+                features.push(*values.iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0));
             }
         }
 
@@ -200,7 +200,7 @@ impl MlPositioningEngine {
             })
             .collect();
 
-        distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         if distances.len() < k {
             return None;

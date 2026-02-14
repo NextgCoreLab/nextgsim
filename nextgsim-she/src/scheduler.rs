@@ -407,7 +407,12 @@ impl WorkloadScheduler {
                 reason: "Workload not currently placed".to_string(),
             })?;
 
-            let source_node_id = workload.assigned_node_id.expect("Node ID should be set");
+            let source_node_id = workload.assigned_node_id.ok_or(SheError::MigrationFailed {
+                workload_id,
+                source_tier,
+                target_tier,
+                reason: "Node ID should be set but was not".to_string(),
+            })?;
 
             workload.mark_migrating();
 

@@ -223,7 +223,11 @@ pub fn decode_isac_config(bytes: &[u8]) -> Result<IsacMeasurementConfig, IsacRep
         ));
     }
 
-    let config_id = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    let config_id = u32::from_be_bytes(
+        bytes[0..4]
+            .try_into()
+            .map_err(|_| IsacReportingError::InvalidConfig("Invalid config_id bytes".to_string()))?,
+    );
     let measurement_type = match bytes[4] {
         0 => SensingMeasurementType::Range,
         1 => SensingMeasurementType::Velocity,
@@ -248,9 +252,21 @@ pub fn decode_isac_config(bytes: &[u8]) -> Result<IsacMeasurementConfig, IsacRep
             ))
         }
     };
-    let periodicity_ms = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
-    let center_frequency_mhz = u64::from_be_bytes(bytes[10..18].try_into().unwrap());
-    let bandwidth_mhz = u32::from_be_bytes(bytes[18..22].try_into().unwrap());
+    let periodicity_ms = u32::from_be_bytes(
+        bytes[6..10]
+            .try_into()
+            .map_err(|_| IsacReportingError::InvalidConfig("Invalid periodicity_ms bytes".to_string()))?,
+    );
+    let center_frequency_mhz = u64::from_be_bytes(
+        bytes[10..18]
+            .try_into()
+            .map_err(|_| IsacReportingError::InvalidConfig("Invalid center_frequency_mhz bytes".to_string()))?,
+    );
+    let bandwidth_mhz = u32::from_be_bytes(
+        bytes[18..22]
+            .try_into()
+            .map_err(|_| IsacReportingError::InvalidConfig("Invalid bandwidth_mhz bytes".to_string()))?,
+    );
     let is_monostatic = bytes[22] == 1;
 
     Ok(IsacMeasurementConfig {

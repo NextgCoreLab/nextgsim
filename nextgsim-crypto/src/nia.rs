@@ -104,8 +104,9 @@ pub fn nia2_compute_mac(
     // MESSAGE
     input.extend_from_slice(data);
 
-    // Compute CMAC
-    let mut mac = Cmac::<Aes128>::new_from_slice(key).expect("Invalid key length");
+    // Compute CMAC (key is guaranteed to be 16 bytes from function signature)
+    let mut mac = Cmac::<Aes128>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("Key is guaranteed to be 16 bytes"));
     mac.update(&input);
     let result = mac.finalize().into_bytes();
 

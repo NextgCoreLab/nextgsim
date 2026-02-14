@@ -35,37 +35,40 @@ pub struct NtnScenario {
 
 impl NtnScenario {
     /// Create a new LEO constellation scenario
-    pub fn new_leo_scenario(ue_lat_deg: f64, ue_lon_deg: f64) -> Self {
+    ///
+    /// Returns None if the constellation cannot be created or no satellite is visible
+    pub fn new_leo_scenario(ue_lat_deg: f64, ue_lon_deg: f64) -> Option<Self> {
         let config = ConstellationConfig::starlink_like();
-        let mut constellation = Constellation::new(config).expect("Failed to create constellation");
+        let mut constellation = Constellation::new(config).ok()?;
 
         constellation.set_time(0.0);
 
         let ue_position = GeodeticPosition::from_degrees(ue_lat_deg, ue_lon_deg, 0.0);
 
         // Find initial serving satellite
-        let serving_satellite = constellation.find_best_satellite(&ue_position)
-            .expect("No satellite visible");
+        let serving_satellite = constellation.find_best_satellite(&ue_position).ok()?;
 
         // Create link simulator for the serving satellite
         let link_sim = NtnLinkSimulator::new_leo(550.0);
 
         let handover_mgr = IslHandoverManager::new();
 
-        Self {
+        Some(Self {
             constellation,
             link_sim,
             handover_mgr,
             serving_satellite,
             ue_position,
             time_s: 0.0,
-        }
+        })
     }
 
     /// Create a GEO satellite scenario
-    pub fn new_geo_scenario(ue_lat_deg: f64, ue_lon_deg: f64) -> Self {
+    ///
+    /// Returns None if the constellation cannot be created
+    pub fn new_geo_scenario(ue_lat_deg: f64, ue_lon_deg: f64) -> Option<Self> {
         let config = ConstellationConfig::geo();
-        let mut constellation = Constellation::new(config).expect("Failed to create constellation");
+        let mut constellation = Constellation::new(config).ok()?;
 
         constellation.set_time(0.0);
 
@@ -77,14 +80,14 @@ impl NtnScenario {
 
         let handover_mgr = IslHandoverManager::new();
 
-        Self {
+        Some(Self {
             constellation,
             link_sim,
             handover_mgr,
             serving_satellite,
             ue_position,
             time_s: 0.0,
-        }
+        })
     }
 
     /// Advance simulation by time_step seconds
@@ -139,7 +142,9 @@ impl NtnScenario {
     }
 
     /// Get current link quality
-    pub fn get_link_quality(&mut self) -> LinkQuality {
+    ///
+    /// Returns None if satellite state cannot be calculated
+    pub fn get_link_quality(&mut self) -> Option<LinkQuality> {
         let ground = GroundPosition {
             latitude_deg: self.ue_position.latitude_deg(),
             longitude_deg: self.ue_position.longitude_deg(),
@@ -149,14 +154,13 @@ impl NtnScenario {
         let link_result = self.link_sim.simulate(&ground);
 
         // Get satellite state for additional info
-        let sat_state = self.constellation.calculate_satellite_state(self.serving_satellite)
-            .expect("Failed to get satellite state");
+        let sat_state = self.constellation.calculate_satellite_state(self.serving_satellite).ok()?;
 
         let doppler = sat_state.calculate_doppler(&self.ue_position, 2e9);
         let propagation_delay = sat_state.propagation_delay_ms(&self.ue_position);
         let visibility = sat_state.calculate_visibility(&self.ue_position);
 
-        LinkQuality {
+        Some(LinkQuality {
             snr_db: link_result.snr_db,
             delay_ms: propagation_delay,
             doppler_hz: doppler,
@@ -164,13 +168,14 @@ impl NtnScenario {
             azimuth_deg: visibility.azimuth_deg,
             link_margin_db: link_result.link_margin_db,
             serving_satellite: self.serving_satellite,
-        }
+        })
     }
 
     /// Get timing advance configuration for UE
-    pub fn get_timing_advance(&self) -> NtnTimingAdvance {
-        let sat_state = self.constellation.calculate_satellite_state(self.serving_satellite)
-            .expect("Failed to get satellite state");
+    ///
+    /// Returns None if satellite state cannot be calculated
+    pub fn get_timing_advance(&self) -> Option<NtnTimingAdvance> {
+        let sat_state = self.constellation.calculate_satellite_state(self.serving_satellite).ok()?;
 
         let delay_ms = sat_state.propagation_delay_ms(&self.ue_position);
         let delay_us = (delay_ms * 1000.0) as u64;
@@ -195,7 +200,7 @@ impl NtnScenario {
             orbit_type: SatelliteOrbitType::Leo,
         };
 
-        NtnTimingAdvance {
+        Some(NtnTimingAdvance {
             config_id: 1,
             orbit_type: SatelliteOrbitType::Leo,
             satellite_id: self.serving_satellite,
@@ -215,7 +220,7 @@ impl NtnScenario {
             ta_validity_timer_s: 30,
             autonomous_ta_enabled: true,
             guard_time_us: 50,
-        }
+        })
     }
 
     /// Get handover statistics
@@ -249,10 +254,10 @@ mod tests {
 
     #[test]
     fn test_leo_scenario() {
-        let mut scenario = NtnScenario::new_leo_scenario(40.0, -74.0);
+        let mut scenario = NtnScenario::new_leo_scenario(40.0, -74.0).unwrap();
 
         // Get initial link quality
-        let lq = scenario.get_link_quality();
+        let lq = scenario.get_link_quality().unwrap();
         assert!(lq.snr_db > -100.0 && lq.snr_db < 100.0);
         assert!(lq.delay_ms > 0.0);
         assert!(lq.elevation_deg >= 5.0);
@@ -261,24 +266,24 @@ mod tests {
         scenario.step(1.0);
 
         // Get updated link quality
-        let lq2 = scenario.get_link_quality();
+        let lq2 = scenario.get_link_quality().unwrap();
         assert!(lq2.snr_db > -100.0 && lq2.snr_db < 100.0);
     }
 
     #[test]
     fn test_geo_scenario() {
-        let mut scenario = NtnScenario::new_geo_scenario(0.0, 0.0);
+        let mut scenario = NtnScenario::new_geo_scenario(0.0, 0.0).unwrap();
 
-        let lq = scenario.get_link_quality();
+        let lq = scenario.get_link_quality().unwrap();
         assert!(lq.delay_ms > 100.0); // GEO should have > 100ms delay
         assert!(lq.doppler_hz.abs() < 1000.0); // GEO has minimal Doppler
     }
 
     #[test]
     fn test_timing_advance() {
-        let scenario = NtnScenario::new_leo_scenario(40.0, -74.0);
+        let scenario = NtnScenario::new_leo_scenario(40.0, -74.0).unwrap();
 
-        let ta = scenario.get_timing_advance();
+        let ta = scenario.get_timing_advance().unwrap();
         assert!(ta.validate().is_ok());
         assert!(ta.common_ta_us > 0);
         assert!(ta.max_doppler_shift_hz > 0.0);
@@ -286,9 +291,9 @@ mod tests {
 
     #[test]
     fn test_simulation_step() {
-        let mut scenario = NtnScenario::new_leo_scenario(40.0, -74.0);
+        let mut scenario = NtnScenario::new_leo_scenario(40.0, -74.0).unwrap();
 
-        let initial_sat = scenario.serving_satellite;
+        let _initial_sat = scenario.serving_satellite;
 
         // Step through several seconds
         for _ in 0..10 {
@@ -304,9 +309,10 @@ mod tests {
 
     #[test]
     fn test_handover_stats() {
-        let scenario = NtnScenario::new_leo_scenario(40.0, -74.0);
+        let scenario = NtnScenario::new_leo_scenario(40.0, -74.0).unwrap();
 
         let stats = scenario.get_handover_stats();
-        assert!(stats.total_handovers >= 0);
+        // total_handovers is unsigned, so it's always >= 0 - just verify it exists
+        let _ = stats.total_handovers;
     }
 }

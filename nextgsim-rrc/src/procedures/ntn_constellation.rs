@@ -498,7 +498,11 @@ impl Constellation {
         }
 
         // Sort by elevation (highest first)
-        visible.sort_by(|a, b| b.1.elevation_deg.partial_cmp(&a.1.elevation_deg).unwrap());
+        visible.sort_by(|a, b| {
+            b.1.elevation_deg
+                .partial_cmp(&a.1.elevation_deg)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         visible
     }

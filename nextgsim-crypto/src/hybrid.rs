@@ -228,9 +228,10 @@ pub fn hybrid_decapsulate_from_keys(
     }
 
     // Split combined ciphertext
+    // Length already validated above (>= X25519_KEY_SIZE)
     let eph_public_bytes: [u8; X25519_KEY_SIZE] = combined_ct[..X25519_KEY_SIZE]
         .try_into()
-        .expect("validated above");
+        .map_err(|_| HybridError::InvalidCiphertext("Failed to extract X25519 ephemeral public key".into()))?;
     let ml_kem_ct_bytes = &combined_ct[X25519_KEY_SIZE..];
 
     // Step 1: X25519 key agreement

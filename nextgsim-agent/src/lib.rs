@@ -747,13 +747,9 @@ impl AgentCoordinator {
     ///
     /// If any check fails the intent is rejected and the error is returned.
     pub fn submit_intent(&mut self, intent: Intent) -> Result<(), String> {
-        // Validate agent is registered
-        if !self.agents.contains_key(&intent.agent_id) {
-            return Err("Agent not registered".to_string());
-        }
-
-        // Check capabilities
-        let registration = self.agents.get(&intent.agent_id).unwrap();
+        // Validate agent is registered and get capabilities
+        let registration = self.agents.get(&intent.agent_id)
+            .ok_or_else(|| "Agent not registered".to_string())?;
         let caps = &registration.capabilities;
 
         match intent.intent_type {

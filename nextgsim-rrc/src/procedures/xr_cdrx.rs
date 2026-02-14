@@ -290,7 +290,7 @@ impl XrCDrxManager {
         }
 
         let avg_inter_arrival = inter_arrivals.iter().sum::<u64>() / inter_arrivals.len() as u64;
-        self.predicted_arrivals.last().unwrap() + avg_inter_arrival
+        self.predicted_arrivals.last().copied().unwrap_or(current_time_ms) + avg_inter_arrival
     }
 
     /// Calculates when to wake up for the next frame (with jitter compensation)

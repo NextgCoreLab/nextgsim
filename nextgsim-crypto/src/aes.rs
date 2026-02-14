@@ -73,8 +73,9 @@ impl Aes128Cmac {
 
     /// Compute CMAC over the given message, returning the full 16-byte MAC
     pub fn compute(&self, message: &[u8]) -> [u8; CMAC_SIZE] {
+        // Key is guaranteed to be 16 bytes from struct definition
         let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(&self.key)
-            .expect("CMAC key size is always valid");
+            .unwrap_or_else(|_| unreachable!("Key is guaranteed to be 16 bytes"));
         mac.update(message);
         let result = mac.finalize();
         let mut output = [0u8; CMAC_SIZE];

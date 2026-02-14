@@ -134,15 +134,21 @@ pub fn ecies_encrypt_with_keypair(
 ) -> EciesResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let shared_secret = x25519_shared_secret(ephemeral_keypair.private_key(), home_network_public_key);
     let derived_key = x963_kdf(&shared_secret, ephemeral_keypair.public_key(), 64);
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into().expect("slice");
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into().expect("slice");
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into().expect("slice");
+
+    // KDF output is guaranteed to be 64 bytes
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
 
     let mut ciphertext = plaintext.to_vec();
     let mut cipher = ctr::Ctr128BE::<aes::Aes128>::new(&encryption_key.into(), &iv.into());
     cipher.apply_keystream(&mut ciphertext);
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key).expect("HMAC");
+    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key)
+        .map_err(|_| EciesError::KeyDerivationError("Invalid MAC key size".into()))?;
     mac.update(&ciphertext);
     let mac_tag = mac.finalize().into_bytes()[..MAC_TAG_SIZE].to_vec();
 
@@ -167,14 +173,22 @@ pub fn ecies_decrypt(
         )));
     }
 
-    let ephemeral_pk: [u8; X25519_KEY_SIZE] = ephemeral_public_key.try_into().expect("validated");
+    // Length already validated above
+    let ephemeral_pk: [u8; X25519_KEY_SIZE] = ephemeral_public_key.try_into()
+        .map_err(|_| EciesError::InvalidPublicKey("Invalid key length".into()))?;
     let shared_secret = x25519_shared_secret(home_network_private_key, &ephemeral_pk);
     let derived_key = x963_kdf(&shared_secret, &ephemeral_pk, 64);
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into().expect("slice");
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into().expect("slice");
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into().expect("slice");
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key).expect("HMAC");
+    // KDF output is guaranteed to be 64 bytes
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key)
+        .map_err(|_| EciesError::KeyDerivationError("Invalid MAC key size".into()))?;
     mac.update(ciphertext);
     let computed_mac = mac.finalize().into_bytes();
     if &computed_mac[..MAC_TAG_SIZE] != mac_tag {
@@ -338,15 +352,20 @@ pub fn ecies_profile_b_encrypt_with_keypair(
     let ephemeral_pk_compressed = ephemeral_keypair.public_key_compressed();
     let derived_key = x963_kdf_bytes(&shared_secret, &ephemeral_pk_compressed, 64);
 
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into().expect("slice");
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into().expect("slice");
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into().expect("slice");
+    // KDF output is guaranteed to be 64 bytes
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
 
     let mut ciphertext = plaintext.to_vec();
     let mut cipher = ctr::Ctr128BE::<aes::Aes128>::new(&encryption_key.into(), &iv.into());
     cipher.apply_keystream(&mut ciphertext);
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key).expect("HMAC");
+    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key)
+        .map_err(|_| EciesError::KeyDerivationError("Invalid MAC key size".into()))?;
     mac.update(&ciphertext);
     let mac_tag = mac.finalize().into_bytes()[..MAC_TAG_SIZE].to_vec();
 
@@ -380,12 +399,17 @@ pub fn ecies_profile_b_decrypt(
     let shared_secret = p256_ecdh(home_network_secret_key, &ephemeral_pk)?;
     let derived_key = x963_kdf_bytes(&shared_secret, ephemeral_public_key, 64);
 
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into().expect("slice");
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into().expect("slice");
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into().expect("slice");
+    // KDF output is guaranteed to be 64 bytes
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+        .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
 
     // Verify MAC
-    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key).expect("HMAC");
+    let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key)
+        .map_err(|_| EciesError::KeyDerivationError("Invalid MAC key size".into()))?;
     mac.update(ciphertext);
     let computed_mac = mac.finalize().into_bytes();
     if &computed_mac[..MAC_TAG_SIZE] != mac_tag {
