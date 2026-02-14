@@ -79,6 +79,7 @@ pub mod task;
 pub mod ue_context;
 pub mod redcap;
 pub mod energy_saving;
+pub mod ntn_gnb;
 
 // Re-export main types
 pub use connection::{RrcConnectionManager, RrcReleaseResult, RrcSetupCompleteResult, RrcSetupResult};
@@ -98,4 +99,8 @@ pub use redcap::{
 pub use energy_saving::{
     EnergySavingManager, CellSleepMode, EnergySavingPolicy,
     EnergySavingConfig, CellEnergyState, CellEnergyKpis,
+};
+pub use ntn_gnb::{
+    NtnGnbConfig, NtnGnbManager, NtnBeamCell, NtnHarqManager,
+    NtnTimingAdvanceManager, BeamManagementMode,
 };

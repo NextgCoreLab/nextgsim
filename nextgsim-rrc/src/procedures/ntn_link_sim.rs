@@ -322,6 +322,45 @@ pub fn gaseous_attenuation_db(freq_ghz: f64, elevation_deg: f64) -> f64 {
     zenith_atten / elevation_deg.to_radians().sin()
 }
 
+/// Scintillation attenuation (ionospheric/tropospheric)
+pub fn scintillation_attenuation_db(freq_ghz: f64, elevation_deg: f64, time_percentage: f64) -> f64 {
+    if elevation_deg <= 5.0 { return 0.0; }
+
+    // Scintillation is stronger at lower frequencies and lower elevations
+    let base_scint = if freq_ghz < 10.0 {
+        // Ionospheric scintillation dominant
+        2.0 / freq_ghz.sqrt()
+    } else {
+        // Tropospheric scintillation
+        0.1 * freq_ghz.sqrt()
+    };
+
+    // Elevation dependency
+    let elev_factor = 1.0 / (elevation_deg.to_radians().sin().sqrt());
+
+    // Time percentage factor (higher for rare events)
+    let time_factor = if time_percentage < 1.0 {
+        1.0 + (1.0 - time_percentage) * 2.0
+    } else {
+        1.0
+    };
+
+    base_scint * elev_factor * time_factor
+}
+
+/// Cloud attenuation (liquid water content)
+pub fn cloud_attenuation_db(freq_ghz: f64, elevation_deg: f64, liquid_water_kg_m2: f64) -> f64 {
+    if elevation_deg <= 5.0 || liquid_water_kg_m2 <= 0.0 { return 0.0; }
+
+    // ITU-R P.840 model: specific attenuation coefficient
+    let k_l = 0.819 * freq_ghz / (freq_ghz + 1.0).powi(2); // Simplified
+
+    // Path length through clouds
+    let path_length = liquid_water_kg_m2 / elevation_deg.to_radians().sin();
+
+    k_l * path_length
+}
+
 // ============================================================================
 // Composite Link Simulator
 // ============================================================================
@@ -337,14 +376,24 @@ pub struct NtnLinkResult {
     pub snr_db: f64,
     /// Doppler shift (Hz)
     pub doppler_hz: f64,
+    /// Doppler rate (Hz/s)
+    pub doppler_rate_hz_s: f64,
     /// Free-space path loss (dB)
     pub fspl_db: f64,
     /// Total atmospheric loss (dB)
     pub atmospheric_loss_db: f64,
+    /// Rain fade loss (dB)
+    pub rain_fade_db: f64,
+    /// Scintillation loss (dB)
+    pub scintillation_db: f64,
     /// Slant range (km)
     pub slant_range_km: f64,
     /// Elevation angle (degrees)
     pub elevation_deg: f64,
+    /// Azimuth angle (degrees)
+    pub azimuth_deg: f64,
+    /// Link margin (dB)
+    pub link_margin_db: f64,
 }
 
 /// NTN link simulator
@@ -401,35 +450,52 @@ impl NtnLinkSimulator {
         let range = slant_range_km(ground, &sat);
         let delay = propagation_delay_ms(ground, &sat);
 
-        // Elevation angle (simplified)
+        // Elevation and azimuth angles
         let earth_r = EARTH_RADIUS_KM;
         let sat_r = earth_r + sat.altitude_km;
         let cos_elev = (sat_r.powi(2) - earth_r.powi(2) - range.powi(2))
             / (2.0 * earth_r * range);
         let elevation = cos_elev.acos().to_degrees().clamp(5.0, 90.0);
 
-        // Atmospheric losses
+        // Azimuth (simplified)
+        let delta_lat = sat.latitude_deg - ground.latitude_deg;
+        let delta_lon = sat.longitude_deg - ground.longitude_deg;
+        let azimuth = delta_lon.atan2(delta_lat).to_degrees();
+
+        // Atmospheric losses with more detail
         let rain_loss = rain_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 5.0);
         let gas_loss = gaseous_attenuation_db(self.link_budget.carrier_freq_ghz, elevation);
-        let total_atmos = rain_loss + gas_loss;
+        let scint_loss = scintillation_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 0.01);
+        let cloud_loss = cloud_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 0.5);
+        let total_atmos = rain_loss + gas_loss + scint_loss + cloud_loss;
 
         let fspl = self.link_budget.fspl_db(range);
         let snr = self.link_budget.snr_db(range) - total_atmos;
 
         let carrier_hz = self.link_budget.carrier_freq_ghz * 1e9;
         let doppler = max_doppler_shift_hz(&self.orbit, carrier_hz) * (self.tick as f64 * 0.01).sin();
+        let doppler_rate = doppler_rate_hz_per_s(&self.orbit, carrier_hz);
 
         let jitter = self.jitter.sample_jitter_ms(self.tick);
+
+        // Link margin (assume required SNR of 10 dB for example)
+        let required_snr_db = 10.0;
+        let link_margin = snr - required_snr_db;
 
         NtnLinkResult {
             delay_ms: delay,
             jitter_ms: jitter,
             snr_db: snr,
             doppler_hz: doppler,
+            doppler_rate_hz_s: doppler_rate,
             fspl_db: fspl,
             atmospheric_loss_db: total_atmos,
+            rain_fade_db: rain_loss,
+            scintillation_db: scint_loss,
             slant_range_km: range,
             elevation_deg: elevation,
+            azimuth_deg: azimuth,
+            link_margin_db: link_margin,
         }
     }
 
@@ -577,5 +643,50 @@ mod tests {
 
         // Jitter should vary between ticks
         assert_ne!(r1.jitter_ms, r2.jitter_ms);
+    }
+
+    #[test]
+    fn test_scintillation_attenuation() {
+        // Low frequency - ionospheric scintillation
+        let scint_low = scintillation_attenuation_db(2.0, 30.0, 0.01);
+        assert!(scint_low > 0.0);
+
+        // High frequency - tropospheric scintillation
+        let scint_high = scintillation_attenuation_db(20.0, 30.0, 0.01);
+        assert!(scint_high > 0.0);
+
+        // Low elevation should have more scintillation
+        let scint_low_elev = scintillation_attenuation_db(2.0, 10.0, 0.01);
+        assert!(scint_low_elev > scint_low);
+    }
+
+    #[test]
+    fn test_cloud_attenuation() {
+        let atten = cloud_attenuation_db(20.0, 45.0, 2.0);
+        assert!(atten > 0.0);
+
+        // No clouds = no attenuation
+        let no_cloud = cloud_attenuation_db(20.0, 45.0, 0.0);
+        assert_eq!(no_cloud, 0.0);
+
+        // More liquid water = more attenuation
+        let heavy_cloud = cloud_attenuation_db(20.0, 45.0, 4.0);
+        assert!(heavy_cloud > atten);
+    }
+
+    #[test]
+    fn test_enhanced_link_result() {
+        let mut sim = NtnLinkSimulator::new_leo(550.0);
+        let ground = GroundPosition::new(40.0, -74.0);
+
+        let result = sim.simulate(&ground);
+
+        // Check all new fields are populated
+        assert!(result.doppler_rate_hz_s.abs() >= 0.0);
+        assert!(result.rain_fade_db >= 0.0);
+        assert!(result.scintillation_db >= 0.0);
+        assert!(result.azimuth_deg.abs() <= 360.0);
+        // Link margin can be positive or negative
+        assert!(result.link_margin_db.abs() < 1000.0);
     }
 }

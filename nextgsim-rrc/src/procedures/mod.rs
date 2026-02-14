@@ -17,6 +17,8 @@ pub mod ai_ml_config;
 pub mod isac_config;
 pub mod ntn_timing;
 pub mod ntn_link_sim;
+pub mod ntn_constellation;
+pub mod ntn_integration_example;
 pub mod sub_thz_config;
 pub mod isl_handover;
 pub mod xr_cdrx;
@@ -35,6 +37,7 @@ pub use ai_ml_config::*;
 pub use isac_config::*;
 pub use ntn_timing::*;
 pub use ntn_link_sim::*;
+pub use ntn_constellation::*;
 pub use sub_thz_config::*;
 pub use isl_handover::{
     IslHandoverContext, IslHandoverState, IslHandoverManager,

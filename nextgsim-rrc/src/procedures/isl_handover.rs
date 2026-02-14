@@ -130,6 +130,23 @@ pub struct IslHandoverManager {
     active_handover: Option<IslHandoverContext>,
     /// Satellite position cache for delay calculation
     satellite_positions: std::collections::HashMap<u32, SatellitePosition>,
+    /// Handover history for analytics
+    handover_history: Vec<HandoverRecord>,
+}
+
+/// Handover record for tracking
+#[derive(Debug, Clone)]
+pub struct HandoverRecord {
+    /// Source satellite
+    pub source_satellite: u32,
+    /// Target satellite
+    pub target_satellite: u32,
+    /// Start time (ms since epoch)
+    pub start_time_ms: u64,
+    /// Completion time (ms since epoch)
+    pub completion_time_ms: u64,
+    /// Success flag
+    pub success: bool,
 }
 
 /// Satellite position in 3D space
@@ -161,6 +178,7 @@ impl IslHandoverManager {
         Self {
             active_handover: None,
             satellite_positions: std::collections::HashMap::new(),
+            handover_history: Vec::new(),
         }
     }
 
@@ -234,7 +252,25 @@ impl IslHandoverManager {
 
         // Seamless switch: UE continues using same service link
         // but it's now served by target satellite
+        let start_time = context.trigger_time_ms;
+        let source = context.source_satellite;
+        let target = context.target_satellite;
+
         context.complete();
+
+        // Record successful handover
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        self.handover_history.push(HandoverRecord {
+            source_satellite: source,
+            target_satellite: target,
+            start_time_ms: start_time,
+            completion_time_ms: now_ms,
+            success: true,
+        });
 
         Ok(())
     }
@@ -255,6 +291,76 @@ impl IslHandoverManager {
             .as_ref()
             .and_then(|ctx| ctx.isl_delay_us)
     }
+
+    /// Predict handover based on satellite trajectory
+    ///
+    /// Returns predicted time until handover needed (in seconds)
+    pub fn predict_handover(&self, current_satellite: u32, ue_position: &SatellitePosition,
+                           elevation_threshold_deg: f64) -> Option<f64> {
+        // Get current satellite position
+        let current_pos = self.satellite_positions.get(&current_satellite)?;
+
+        // Calculate current elevation (simplified)
+        let distance = current_pos.distance_to(ue_position);
+        let earth_r = 6371.0; // km
+        let sat_alt = (current_pos.x_km * current_pos.x_km +
+                      current_pos.y_km * current_pos.y_km +
+                      current_pos.z_km * current_pos.z_km).sqrt() - earth_r;
+
+        let elevation = (sat_alt / distance).atan().to_degrees();
+
+        if elevation < elevation_threshold_deg {
+            // Already below threshold, handover imminent
+            return Some(0.0);
+        }
+
+        // Simple prediction: estimate time until elevation drops below threshold
+        // Assuming linear motion (simplified)
+        let velocity = 7.5; // km/s for LEO
+        let time_to_horizon = distance / velocity;
+
+        Some(time_to_horizon)
+    }
+
+    /// Get handover statistics
+    pub fn get_handover_stats(&self) -> HandoverStats {
+        let total = self.handover_history.len();
+        let successful = self.handover_history.iter().filter(|r| r.success).count();
+
+        let avg_duration_ms = if !self.handover_history.is_empty() {
+            let sum: u64 = self.handover_history.iter()
+                .map(|r| r.completion_time_ms - r.start_time_ms)
+                .sum();
+            sum / total as u64
+        } else {
+            0
+        };
+
+        HandoverStats {
+            total_handovers: total,
+            successful_handovers: successful,
+            failed_handovers: total - successful,
+            average_duration_ms: avg_duration_ms,
+        }
+    }
+
+    /// Clear handover history
+    pub fn clear_history(&mut self) {
+        self.handover_history.clear();
+    }
+}
+
+/// Handover statistics
+#[derive(Debug, Clone, Copy)]
+pub struct HandoverStats {
+    /// Total number of handovers attempted
+    pub total_handovers: usize,
+    /// Number of successful handovers
+    pub successful_handovers: usize,
+    /// Number of failed handovers
+    pub failed_handovers: usize,
+    /// Average handover duration in milliseconds
+    pub average_duration_ms: u64,
 }
 
 impl Default for IslHandoverManager {
