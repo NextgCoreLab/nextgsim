@@ -41,10 +41,59 @@ spec:
       initContainers:
         - name: wait-amf
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z amf.nextg-system.svc.cluster.local 38412; do echo waiting for amf ngap; sleep 2; done']
+          command: ['sh', '-c', 'echo "Waiting for AMF deployment..."; sleep 5; echo "AMF should be ready (deploy.sh ensures ordering)"']
+        - name: resolve-dns
+          image: busybox:1.36
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          command:
+            - sh
+            - -c
+            - |
+              echo "[resolve-dns] Pod IP: $POD_IP"
+              echo "[resolve-dns] Resolving AMF and UPF service IPs..."
+              # Resolve AMF ClusterIP
+              AMF_IP=""
+              for i in $(seq 1 30); do
+                AMF_IP=$(nslookup amf.nextg-system.svc.cluster.local 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $2}' | head -1)
+                if [ -n "$AMF_IP" ]; then break; fi
+                echo "[resolve-dns] Waiting for AMF DNS... ($i/30)"
+                sleep 2
+              done
+              if [ -z "$AMF_IP" ]; then echo "[resolve-dns] FATAL: Could not resolve AMF"; exit 1; fi
+              echo "[resolve-dns] AMF IP: $AMF_IP"
+              # Resolve UPF ClusterIP
+              UPF_IP=""
+              for i in $(seq 1 30); do
+                UPF_IP=$(nslookup upf.nextg-system.svc.cluster.local 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $2}' | head -1)
+                if [ -n "$UPF_IP" ]; then break; fi
+                echo "[resolve-dns] Waiting for UPF DNS... ($i/30)"
+                sleep 2
+              done
+              if [ -z "$UPF_IP" ]; then echo "[resolve-dns] FATAL: Could not resolve UPF"; exit 1; fi
+              echo "[resolve-dns] UPF IP: $UPF_IP"
+              # Generate gnb.yaml with resolved IPs and pod IP for interfaces
+              cp /tmp/config-template/gnb.yaml /etc/nextgsim/gnb.yaml
+              sed -i "s|amf.nextg-system.svc.cluster.local|$AMF_IP|g" /etc/nextgsim/gnb.yaml
+              sed -i "s|upf.nextg-system.svc.cluster.local|$UPF_IP|g" /etc/nextgsim/gnb.yaml
+              sed -i "s|link_ip: 0.0.0.0|link_ip: $POD_IP|g" /etc/nextgsim/gnb.yaml
+              sed -i "s|ngap_ip: 0.0.0.0|ngap_ip: $POD_IP|g" /etc/nextgsim/gnb.yaml
+              sed -i "s|gtp_ip: 0.0.0.0|gtp_ip: $POD_IP|g" /etc/nextgsim/gnb.yaml
+              echo "[resolve-dns] Generated gnb.yaml:"
+              cat /etc/nextgsim/gnb.yaml
+          volumeMounts:
+            - name: config-template
+              mountPath: /tmp/config-template/gnb.yaml
+              subPath: gnb.yaml
+              readOnly: true
+            - name: config-resolved
+              mountPath: /etc/nextgsim
       containers:
         - name: gnb
-          image: nextgsim/gnb:latest
+          image: nextgsim-gnb:latest
           imagePullPolicy: IfNotPresent
           args: ["-c", "/etc/nextgsim/gnb.yaml"]
           ports:
@@ -65,21 +114,22 @@ spec:
               cpu: 500m
               memory: 256Mi
           volumeMounts:
-            - name: config
-              mountPath: /etc/nextgsim/gnb.yaml
-              subPath: gnb.yaml
+            - name: config-resolved
+              mountPath: /etc/nextgsim
               readOnly: true
           readinessProbe:
             exec:
-              command: ["pgrep", "-f", "nr-gnb"]
+              command: ["sh", "-c", "kill -0 1"]
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             exec:
-              command: ["pgrep", "-f", "nr-gnb"]
+              command: ["sh", "-c", "kill -0 1"]
             initialDelaySeconds: 15
             periodSeconds: 30
       volumes:
-        - name: config
+        - name: config-template
           configMap:
             name: nextgsim-configs
+        - name: config-resolved
+          emptyDir: {}
