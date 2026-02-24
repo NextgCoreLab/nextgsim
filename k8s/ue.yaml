@@ -20,10 +20,38 @@ spec:
       initContainers:
         - name: wait-gnb
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -zu gnb.nextg-system.svc.cluster.local 4997; do echo waiting for gnb; sleep 2; done']
+          command: ['sh', '-c', 'until nslookup gnb.nextg-system.svc.cluster.local >/dev/null 2>&1; do echo waiting for gnb DNS; sleep 2; done; echo "gNB DNS resolved, waiting 5s for readiness"; sleep 5']
+        - name: resolve-dns
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "[resolve-dns] Resolving gNB service IP..."
+              GNB_IP=""
+              for i in $(seq 1 30); do
+                GNB_IP=$(nslookup gnb.nextg-system.svc.cluster.local 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $2}' | head -1)
+                if [ -n "$GNB_IP" ]; then break; fi
+                echo "[resolve-dns] Waiting for gNB DNS... ($i/30)"
+                sleep 2
+              done
+              if [ -z "$GNB_IP" ]; then echo "[resolve-dns] FATAL: Could not resolve gNB"; exit 1; fi
+              echo "[resolve-dns] gNB IP: $GNB_IP"
+              # Generate ue.yaml with resolved IPs
+              cp /tmp/config-template/ue.yaml /etc/nextgsim/ue.yaml
+              sed -i "s|gnb.nextg-system.svc.cluster.local|$GNB_IP|g" /etc/nextgsim/ue.yaml
+              echo "[resolve-dns] Generated ue.yaml:"
+              cat /etc/nextgsim/ue.yaml
+          volumeMounts:
+            - name: config-template
+              mountPath: /tmp/config-template/ue.yaml
+              subPath: ue.yaml
+              readOnly: true
+            - name: config-resolved
+              mountPath: /etc/nextgsim
       containers:
         - name: ue
-          image: nextgsim/ue:latest
+          image: nextgsim-ue:latest
           imagePullPolicy: IfNotPresent
           args: ["-c", "/etc/nextgsim/ue.yaml"]
           ports:
@@ -46,16 +74,17 @@ spec:
               cpu: 500m
               memory: 256Mi
           volumeMounts:
-            - name: config
-              mountPath: /etc/nextgsim/ue.yaml
-              subPath: ue.yaml
+            - name: config-resolved
+              mountPath: /etc/nextgsim
               readOnly: true
             - name: dev-tun
               mountPath: /dev/net/tun
       volumes:
-        - name: config
+        - name: config-template
           configMap:
             name: nextgsim-configs
+        - name: config-resolved
+          emptyDir: {}
         - name: dev-tun
           hostPath:
             path: /dev/net/tun
