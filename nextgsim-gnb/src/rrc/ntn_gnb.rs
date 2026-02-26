@@ -379,6 +379,207 @@ impl NtnGnbManager {
     }
 }
 
+// ============================================================================
+// G16: Inter-Satellite Link (ISL) Handover (3GPP TR 38.821 §6.3, Rel-17 NTN)
+// ============================================================================
+
+/// Discovered neighbor satellite reachable over an ISL
+#[derive(Debug, Clone)]
+pub struct IslNeighbor {
+    /// Satellite ID of the neighbor
+    pub satellite_id: u32,
+    /// Current ISL link quality (SNR-like metric, dB; higher is better)
+    pub link_quality_db: f64,
+    /// One-way ISL propagation delay (microseconds)
+    pub isl_delay_us: u64,
+    /// Whether this satellite currently serves the same coverage area
+    pub overlapping_coverage: bool,
+}
+
+/// ISL handover state machine state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IslHandoverState {
+    /// No handover in progress; serving satellite is stable
+    Idle,
+    /// Scanning for better ISL candidates
+    Scanning,
+    /// Preparing the target satellite (Xn-like setup over ISL)
+    Preparing,
+    /// Handover command sent to UEs; path switch in flight
+    Executing,
+    /// Handover complete; UEs anchored to new satellite
+    Complete,
+    /// Handover failed; rolled back to previous satellite
+    Failed,
+}
+
+/// Reason that triggered an ISL handover
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IslHandoverTrigger {
+    /// Serving satellite is moving out of UE coverage area
+    CoverageEdge,
+    /// ISL link quality degraded below threshold
+    LinkDegradation,
+    /// Better ISL path discovered (load balancing)
+    BetterPathAvailable,
+    /// Serving satellite entering eclipse (power constraint)
+    Eclipse,
+}
+
+/// Manages Inter-Satellite Link handover procedures for an NTN gNB.
+///
+/// When the serving satellite approaches the edge of its coverage arc (LEO)
+/// or its ISL link degrades, this manager orchestrates:
+///   1. Neighbor discovery via beacon scanning
+///   2. Target satellite selection (best link quality + coverage overlap)
+///   3. Path preparation (RRC reconfiguration + new TA computation over ISL)
+///   4. Path switch execution
+///   5. Rollback on failure
+#[derive(Debug)]
+pub struct IslHandoverManager {
+    /// ID of the satellite currently serving this gNB
+    pub serving_satellite_id: u32,
+    /// Known ISL neighbors
+    neighbors: Vec<IslNeighbor>,
+    /// Current handover state
+    state: IslHandoverState,
+    /// Target satellite for the in-progress handover (if any)
+    target_satellite_id: Option<u32>,
+    /// Trigger for the current handover (if any)
+    trigger: Option<IslHandoverTrigger>,
+    /// Minimum link quality (dB) to consider a neighbor as candidate
+    quality_threshold_db: f64,
+    /// Count of completed ISL handovers
+    handover_count: u32,
+    /// Count of failed ISL handovers
+    failure_count: u32,
+}
+
+impl IslHandoverManager {
+    /// Creates a new ISL handover manager for `serving_satellite_id`.
+    pub fn new(serving_satellite_id: u32) -> Self {
+        Self {
+            serving_satellite_id,
+            neighbors: Vec::new(),
+            state: IslHandoverState::Idle,
+            target_satellite_id: None,
+            trigger: None,
+            quality_threshold_db: 5.0,
+            handover_count: 0,
+            failure_count: 0,
+        }
+    }
+
+    /// Updates the full neighbor list (from beacon scan).
+    pub fn update_neighbors(&mut self, neighbors: Vec<IslNeighbor>) {
+        self.neighbors = neighbors;
+    }
+
+    /// Adds or updates a single neighbor entry.
+    pub fn upsert_neighbor(&mut self, neighbor: IslNeighbor) {
+        if let Some(existing) = self.neighbors.iter_mut()
+            .find(|n| n.satellite_id == neighbor.satellite_id)
+        {
+            *existing = neighbor;
+        } else {
+            self.neighbors.push(neighbor);
+        }
+    }
+
+    /// Selects the best ISL handover target.
+    ///
+    /// Criteria: overlapping coverage, link quality ≥ threshold,
+    /// not already serving.  Returns the highest-quality candidate.
+    pub fn select_target(&self) -> Option<&IslNeighbor> {
+        self.neighbors.iter()
+            .filter(|n| {
+                n.overlapping_coverage
+                    && n.link_quality_db >= self.quality_threshold_db
+                    && n.satellite_id != self.serving_satellite_id
+            })
+            .max_by(|a, b| a.link_quality_db.partial_cmp(&b.link_quality_db).unwrap())
+    }
+
+    /// Initiates an ISL handover due to `trigger`.
+    ///
+    /// Returns `Ok(target_satellite_id)` or `Err` if no candidate exists.
+    pub fn initiate(&mut self, trigger: IslHandoverTrigger) -> Result<u32, &'static str> {
+        if self.state != IslHandoverState::Idle {
+            return Err("handover already in progress");
+        }
+        self.state = IslHandoverState::Scanning;
+        self.trigger = Some(trigger);
+
+        match self.select_target() {
+            Some(target) => {
+                let target_id = target.satellite_id;
+                log::info!(
+                    "[NTN ISL] serving={} → target={} trigger={:?} quality={:.1}dB",
+                    self.serving_satellite_id, target_id, trigger, target.link_quality_db,
+                );
+                self.target_satellite_id = Some(target_id);
+                self.state = IslHandoverState::Preparing;
+                Ok(target_id)
+            }
+            None => {
+                self.state = IslHandoverState::Idle;
+                Err("no suitable ISL neighbor found")
+            }
+        }
+    }
+
+    /// Advances from Preparing → Executing (called when Xn setup ACK received).
+    pub fn execute(&mut self) -> Result<(), &'static str> {
+        if self.state != IslHandoverState::Preparing {
+            return Err("not in preparing state");
+        }
+        self.state = IslHandoverState::Executing;
+        log::info!(
+            "[NTN ISL] executing handover serving={} → target={}",
+            self.serving_satellite_id,
+            self.target_satellite_id.unwrap_or(0),
+        );
+        Ok(())
+    }
+
+    /// Completes the handover: serving satellite becomes the target.
+    pub fn complete(&mut self) -> Result<(), &'static str> {
+        if self.state != IslHandoverState::Executing {
+            return Err("not in executing state");
+        }
+        let target = self.target_satellite_id.ok_or("no target satellite")?;
+        log::info!("[NTN ISL] complete: {} → {}", self.serving_satellite_id, target);
+        self.serving_satellite_id = target;
+        self.target_satellite_id = None;
+        self.trigger = None;
+        self.state = IslHandoverState::Complete;
+        self.handover_count += 1;
+        Ok(())
+    }
+
+    /// Resets state to Idle after Complete/Failed to allow a new handover cycle.
+    pub fn reset(&mut self) {
+        self.state = IslHandoverState::Idle;
+    }
+
+    /// Fails the handover and rolls back.
+    pub fn fail(&mut self, reason: &str) {
+        log::warn!(
+            "[NTN ISL] handover failed serving={} reason={}",
+            self.serving_satellite_id, reason,
+        );
+        self.target_satellite_id = None;
+        self.trigger = None;
+        self.state = IslHandoverState::Failed;
+        self.failure_count += 1;
+    }
+
+    pub fn state(&self) -> IslHandoverState { self.state }
+    pub fn target_satellite_id(&self) -> Option<u32> { self.target_satellite_id }
+    pub fn handover_count(&self) -> u32 { self.handover_count }
+    pub fn failure_count(&self) -> u32 { self.failure_count }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +674,84 @@ mod tests {
         // Find best beam
         let best = manager.find_best_beam(40.0, -74.0);
         assert_eq!(best, Some(1));
+    }
+
+    // ---- G16 ISL handover tests ----
+
+    fn make_neighbor(id: u32, quality_db: f64, coverage: bool) -> IslNeighbor {
+        IslNeighbor {
+            satellite_id: id,
+            link_quality_db: quality_db,
+            isl_delay_us: 500,
+            overlapping_coverage: coverage,
+        }
+    }
+
+    #[test]
+    fn test_isl_handover_no_neighbors() {
+        let mut mgr = IslHandoverManager::new(1);
+        let result = mgr.initiate(IslHandoverTrigger::CoverageEdge);
+        assert!(result.is_err());
+        assert_eq!(mgr.state(), IslHandoverState::Idle);
+    }
+
+    #[test]
+    fn test_isl_handover_selects_best_neighbor() {
+        let mut mgr = IslHandoverManager::new(1);
+        mgr.update_neighbors(vec![
+            make_neighbor(2, 10.0, true),
+            make_neighbor(3, 18.0, true), // best quality
+            make_neighbor(4, 15.0, false), // no coverage overlap
+        ]);
+        let target = mgr.select_target().unwrap();
+        assert_eq!(target.satellite_id, 3);
+    }
+
+    #[test]
+    fn test_isl_handover_full_cycle() {
+        let mut mgr = IslHandoverManager::new(10);
+        mgr.update_neighbors(vec![make_neighbor(20, 12.0, true)]);
+
+        // Initiate
+        let target = mgr.initiate(IslHandoverTrigger::LinkDegradation).unwrap();
+        assert_eq!(target, 20);
+        assert_eq!(mgr.state(), IslHandoverState::Preparing);
+
+        // Execute
+        mgr.execute().unwrap();
+        assert_eq!(mgr.state(), IslHandoverState::Executing);
+
+        // Complete
+        mgr.complete().unwrap();
+        assert_eq!(mgr.state(), IslHandoverState::Complete);
+        assert_eq!(mgr.serving_satellite_id, 20);
+        assert_eq!(mgr.handover_count(), 1);
+        assert_eq!(mgr.failure_count(), 0);
+
+        // Reset for next cycle
+        mgr.reset();
+        assert_eq!(mgr.state(), IslHandoverState::Idle);
+    }
+
+    #[test]
+    fn test_isl_handover_failure_rollback() {
+        let mut mgr = IslHandoverManager::new(10);
+        mgr.update_neighbors(vec![make_neighbor(20, 12.0, true)]);
+
+        mgr.initiate(IslHandoverTrigger::Eclipse).unwrap();
+        mgr.execute().unwrap();
+        mgr.fail("Xn setup timeout");
+        assert_eq!(mgr.state(), IslHandoverState::Failed);
+        assert_eq!(mgr.serving_satellite_id, 10); // unchanged
+        assert_eq!(mgr.failure_count(), 1);
+    }
+
+    #[test]
+    fn test_isl_rejects_double_initiate() {
+        let mut mgr = IslHandoverManager::new(1);
+        mgr.update_neighbors(vec![make_neighbor(2, 10.0, true)]);
+        mgr.initiate(IslHandoverTrigger::CoverageEdge).unwrap();
+        let result = mgr.initiate(IslHandoverTrigger::CoverageEdge);
+        assert!(result.is_err()); // already in progress
     }
 }
