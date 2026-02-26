@@ -37,6 +37,24 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
