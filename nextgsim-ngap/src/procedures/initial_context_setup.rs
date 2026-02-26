@@ -1217,4 +1217,248 @@ mod tests {
         assert_eq!(snssai_no_sd.sst, 1);
         assert!(snssai_no_sd.sd.is_none());
     }
+
+    // ============================================
+    // Request decode round-trip tests
+    // ============================================
+
+    fn build_test_guami() -> GUAMI {
+        let mut amf_region_id_bv: BitVec<u8, Msb0> = BitVec::with_capacity(8);
+        for i in (0..8).rev() {
+            amf_region_id_bv.push((1u8 >> i) & 1 == 1);
+        }
+        let mut amf_set_id_bv: BitVec<u8, Msb0> = BitVec::with_capacity(10);
+        for i in (0..10).rev() {
+            amf_set_id_bv.push((1u16 >> i) & 1 == 1);
+        }
+        let mut amf_pointer_bv: BitVec<u8, Msb0> = BitVec::with_capacity(6);
+        for i in (0..6).rev() {
+            amf_pointer_bv.push((0u8 >> i) & 1 == 1);
+        }
+        GUAMI {
+            plmn_identity: PLMNIdentity(vec![0x00, 0xF1, 0x10]),
+            amf_region_id: AMFRegionID(amf_region_id_bv),
+            amf_set_id: AMFSetID(amf_set_id_bv),
+            amf_pointer: AMFPointer(amf_pointer_bv),
+            ie_extensions: None,
+        }
+    }
+
+    fn build_16bit_bitvec_from_u16(value: u16) -> BitVec<u8, Msb0> {
+        let mut bv: BitVec<u8, Msb0> = BitVec::with_capacity(16);
+        for i in (0..16).rev() {
+            bv.push((value >> i) & 1 == 1);
+        }
+        bv
+    }
+
+    fn build_test_request_pdu(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas_pdu: Option<Vec<u8>>,
+    ) -> NGAP_PDU {
+        let mut protocol_ies = Vec::new();
+
+        // AMF-UE-NGAP-ID
+        protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+                AMF_UE_NGAP_ID(amf_ue_ngap_id),
+            ),
+        });
+
+        // RAN-UE-NGAP-ID
+        protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+                RAN_UE_NGAP_ID(ran_ue_ngap_id),
+            ),
+        });
+
+        // GUAMI
+        protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_GUAMI),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_GUAMI(
+                build_test_guami(),
+            ),
+        });
+
+        // Allowed NSSAI
+        let allowed_nssai = AllowedNSSAI(vec![
+            AllowedNSSAI_Item {
+                s_nssai: S_NSSAI {
+                    sst: SST(vec![1]),
+                    sd: Some(SD(vec![0x00, 0x00, 0x01])),
+                    ie_extensions: None,
+                },
+                ie_extensions: None,
+            },
+        ]);
+        protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_ALLOWED_NSSAI),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_AllowedNSSAI(
+                allowed_nssai,
+            ),
+        });
+
+        // UE Security Capabilities
+        let ue_sec_caps = UESecurityCapabilities {
+            n_rencryption_algorithms: NRencryptionAlgorithms(
+                build_16bit_bitvec_from_u16(0xE000),
+            ),
+            n_rintegrity_protection_algorithms: NRintegrityProtectionAlgorithms(
+                build_16bit_bitvec_from_u16(0xE000),
+            ),
+            eutr_aencryption_algorithms: EUTRAencryptionAlgorithms(
+                build_16bit_bitvec_from_u16(0x0000),
+            ),
+            eutr_aintegrity_protection_algorithms: EUTRAintegrityProtectionAlgorithms(
+                build_16bit_bitvec_from_u16(0x0000),
+            ),
+            ie_extensions: None,
+        };
+        protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_SECURITY_CAPABILITIES),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_UESecurityCapabilities(
+                ue_sec_caps,
+            ),
+        });
+
+        // Security Key (256 bits)
+        let key_bytes: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+        ];
+        let security_key_bv = BitVec::<u8, Msb0>::from_slice(&key_bytes);
+        protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_SECURITY_KEY),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_SecurityKey(
+                SecurityKey(security_key_bv),
+            ),
+        });
+
+        // Optional NAS PDU
+        if let Some(pdu) = nas_pdu {
+            protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_NAS_PDU),
+                criticality: Criticality(Criticality::IGNORE),
+                value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(
+                    NAS_PDU(pdu),
+                ),
+            });
+        }
+
+        let request = InitialContextSetupRequest {
+            protocol_i_es: InitialContextSetupRequestProtocolIEs(protocol_ies),
+        };
+
+        let initiating_message = InitiatingMessage {
+            procedure_code: ProcedureCode(ID_INITIAL_CONTEXT_SETUP),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitiatingMessageValue::Id_InitialContextSetup(request),
+        };
+
+        NGAP_PDU::InitiatingMessage(initiating_message)
+    }
+
+    #[test]
+    fn test_initial_context_setup_request_roundtrip() {
+        let pdu = build_test_request_pdu(12345, 1, None);
+
+        // Encode to bytes
+        let encoded = encode_ngap_pdu(&pdu).expect("Failed to encode request");
+        assert!(!encoded.is_empty());
+
+        // Decode and parse
+        let parsed = decode_initial_context_setup_request(&encoded)
+            .expect("Failed to decode request");
+
+        assert_eq!(parsed.amf_ue_ngap_id, 12345);
+        assert_eq!(parsed.ran_ue_ngap_id, 1);
+        assert_eq!(parsed.guami.plmn_identity, [0x00, 0xF1, 0x10]);
+        assert_eq!(parsed.guami.amf_region_id, 1);
+        assert_eq!(parsed.guami.amf_set_id, 1);
+        assert_eq!(parsed.guami.amf_pointer, 0);
+        assert_eq!(parsed.allowed_nssai.len(), 1);
+        assert_eq!(parsed.allowed_nssai[0].sst, 1);
+        assert_eq!(parsed.allowed_nssai[0].sd, Some([0x00, 0x00, 0x01]));
+        assert_eq!(parsed.ue_security_capabilities.nr_encryption_algorithms, 0xE000);
+        assert_eq!(parsed.ue_security_capabilities.nr_integrity_algorithms, 0xE000);
+        // Verify security key round-trips
+        let expected_key: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+        ];
+        assert_eq!(parsed.security_key, expected_key);
+        assert!(parsed.nas_pdu.is_none());
+    }
+
+    #[test]
+    fn test_initial_context_setup_request_with_nas_pdu() {
+        let nas_bytes = vec![0x7E, 0x00, 0x5D, 0x01, 0x02, 0x03];
+        let pdu = build_test_request_pdu(99999, 42, Some(nas_bytes.clone()));
+
+        let encoded = encode_ngap_pdu(&pdu).expect("Failed to encode");
+        let parsed = decode_initial_context_setup_request(&encoded)
+            .expect("Failed to decode");
+
+        assert_eq!(parsed.amf_ue_ngap_id, 99999);
+        assert_eq!(parsed.ran_ue_ngap_id, 42);
+        assert_eq!(parsed.nas_pdu, Some(nas_bytes));
+    }
+
+    #[test]
+    fn test_initial_context_setup_request_is_type() {
+        let pdu = build_test_request_pdu(12345, 1, None);
+        assert!(is_initial_context_setup_request(&pdu));
+        assert!(!is_initial_context_setup_response(&pdu));
+        assert!(!is_initial_context_setup_failure(&pdu));
+    }
+
+    #[test]
+    fn test_response_aper_byte_level_roundtrip() {
+        let params = create_test_response_params();
+        let encoded = encode_initial_context_setup_response(&params)
+            .expect("Failed to encode");
+
+        // Decode the PDU from bytes, then re-encode
+        let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
+        let re_encoded = encode_ngap_pdu(&decoded_pdu).expect("Failed to re-encode");
+
+        // APER is deterministic: byte-for-byte match
+        assert_eq!(encoded, re_encoded, "APER re-encoding should produce identical bytes");
+    }
+
+    #[test]
+    fn test_failure_aper_byte_level_roundtrip() {
+        let params = create_test_failure_params();
+        let encoded = encode_initial_context_setup_failure(&params)
+            .expect("Failed to encode");
+
+        let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
+        let re_encoded = encode_ngap_pdu(&decoded_pdu).expect("Failed to re-encode");
+
+        assert_eq!(encoded, re_encoded, "APER re-encoding should produce identical bytes");
+    }
+
+    #[test]
+    fn test_request_aper_byte_level_roundtrip() {
+        let pdu = build_test_request_pdu(12345, 1, Some(vec![0x7E, 0x00, 0x41]));
+        let encoded = encode_ngap_pdu(&pdu).expect("Failed to encode");
+
+        let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
+        let re_encoded = encode_ngap_pdu(&decoded_pdu).expect("Failed to re-encode");
+
+        assert_eq!(encoded, re_encoded, "APER re-encoding should produce identical bytes");
+    }
 }

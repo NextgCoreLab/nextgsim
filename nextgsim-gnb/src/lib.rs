@@ -91,6 +91,10 @@ pub mod fl;
 // Rel-18 5G-Advanced modules
 pub mod energy;
 
+// Rel-17 protocol extensions
+pub mod daps;     // DAPS handover (TS 38.300 §10.1.2.4)
+pub mod mbs_ngap; // MBS NGAP session procedures (TS 38.413 §8.21)
+
 // Re-export NGAP module types
 pub use ngap::{AmfContextInfo, AmfState, NgapAmfContext, NgapTask, NgapUeContext, UeState};
 
@@ -141,3 +145,7 @@ pub use fl::FlAggregatorTask;
 
 // Re-export Rel-18 5G-Advanced types
 pub use energy::EnergyTask;
+
+// Re-export Rel-17 protocol extension types
+pub use daps::{DapsManager, DapsSession, DapsState, DapsRlcBearer};
+pub use mbs_ngap::{NgapMbsManager, GnbMbsSession, GnbMbsState, MbsFlow};

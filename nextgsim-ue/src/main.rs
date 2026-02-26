@@ -356,10 +356,10 @@ impl UeApp {
         use nextgsim_nas::messages::mm::authentication::{AuthenticationRequest as NasAuthRequest, AuthenticationResponse as NasAuthResponse};
         use nextgsim_nas::messages::mm::security_mode::{SecurityModeCommand as NasSecModeCmd, SecurityModeComplete as NasSecModeComplete};
         use nextgsim_nas::ies::{Ie5gsRegistrationType, FollowOnRequest, RegistrationType};
-        use nextgsim_nas::security::NasKeySetIdentifier;
+        use nextgsim_nas::security::{NasKeySetIdentifier, NasSecurityContext, CipheringAlgorithm, IntegrityAlgorithm};
         use nextgsim_nas::enums::{MmMessageType, SmMessageType};
         use nextgsim_crypto::milenage::{Milenage, compute_opc};
-        use nextgsim_crypto::kdf::derive_res_star;
+        use nextgsim_crypto::kdf::{derive_res_star, derive_kausf, derive_kseaf, derive_kamf};
         use nextgsim_common::config::OpType;
 
         use bytes::BufMut;
@@ -372,6 +372,7 @@ impl UeApp {
         let mut registration_sent = false;
         let mut pdu_session_requested = false;
         let mut pti_counter: u8 = 1; // Procedure Transaction Identity counter
+        let mut nas_security_ctx = NasSecurityContext::new_3gpp();
 
         loop {
             match rx.recv().await {
@@ -514,10 +515,7 @@ impl UeApp {
                                                     info!("Identity Request - Type: {:?}", id_req.identity_type.value);
 
                                                     // Build SUCI for Identity Response
-                                                    let suci_data = build_suci_null_scheme(
-                                                        "999", "70", // PLMN MCC/MNC
-                                                        "0000000001" // MSIN
-                                                    );
+                                                    let suci_data = build_suci_from_config(&task_base.config);
                                                     let mobile_identity = Ie5gsMobileIdentity::new(
                                                         MobileIdentityType::Suci,
                                                         suci_data,
@@ -602,6 +600,22 @@ impl UeApp {
                                                                 );
                                                                 info!("RES* computed: {:02x?}", &res_star[..4]);
 
+                                                                // Derive key hierarchy: Kausf → Kseaf → Kamf
+                                                                let kausf = derive_kausf(&ck, &ik, sn_name.as_bytes(), &sqn_xor_ak);
+                                                                let kseaf = derive_kseaf(&kausf, sn_name.as_bytes());
+                                                                let supi_str = if let Some(ref supi) = config.supi {
+                                                                    supi.value.clone()
+                                                                } else {
+                                                                    format!("{:03}{:02}0000000001", config.hplmn.mcc, config.hplmn.mnc)
+                                                                };
+                                                                let abba = vec![0x00, 0x00]; // Default ABBA
+                                                                let kamf = derive_kamf(&kseaf, supi_str.as_bytes(), &abba);
+                                                                nas_security_ctx.keys_mut().set_kausf(&kausf);
+                                                                nas_security_ctx.keys_mut().set_kseaf(&kseaf);
+                                                                nas_security_ctx.keys_mut().set_kamf(&kamf);
+                                                                nas_security_ctx.begin_establishing();
+                                                                info!("Key hierarchy derived: Kausf/Kseaf/Kamf set, security ctx establishing");
+
                                                                 // Build and send Authentication Response
                                                                 let auth_response = NasAuthResponse::with_res_star(res_star.to_vec());
                                                                 let mut nas_pdu = Vec::new();
@@ -641,10 +655,62 @@ impl UeApp {
                                                         smc.ng_ksi.ksi
                                                     );
 
-                                                    // Send Security Mode Complete
+                                                    // Derive NAS keys from KAMF using selected algorithms
+                                                    let cipher_alg = CipheringAlgorithm::try_from(
+                                                        smc.selected_nas_security_algorithms.ciphering
+                                                    ).unwrap_or(CipheringAlgorithm::Nea0);
+                                                    let integ_alg = IntegrityAlgorithm::try_from(
+                                                        smc.selected_nas_security_algorithms.integrity
+                                                    ).unwrap_or(IntegrityAlgorithm::Nia0);
+
+                                                    nas_security_ctx.set_ng_ksi(smc.ng_ksi.ksi);
+                                                    if let Err(e) = nas_security_ctx.derive_nas_keys(cipher_alg, integ_alg) {
+                                                        warn!("Failed to derive NAS keys: {}", e);
+                                                    } else {
+                                                        info!("NAS keys derived: cipher={:?}, integrity={:?}", cipher_alg, integ_alg);
+                                                    }
+
+                                                    // Activate security context
+                                                    nas_security_ctx.activate();
+
+                                                    // Encode plain SecurityModeComplete
                                                     let smc_complete = NasSecModeComplete::new();
-                                                    let mut nas_pdu = Vec::new();
-                                                    smc_complete.encode(&mut nas_pdu);
+                                                    let mut plain_pdu = Vec::new();
+                                                    smc_complete.encode(&mut plain_pdu);
+
+                                                    // Integrity-protect the SecurityModeComplete
+                                                    // SecurityHeaderType = IntegrityProtectedAndCipheredWithNewSecurityContext (0x04)
+                                                    let nas_pdu = if nas_security_ctx.is_active() {
+                                                        match nas_security_ctx.increment_uplink_count() {
+                                                            Ok(count) => {
+                                                                let sqn = count.sqn;
+                                                                match nas_security_ctx.compute_uplink_mac(sqn, &plain_pdu) {
+                                                                    Ok(mac) => {
+                                                                        // Build secured NAS: EPD(1) + SHT(1) + MAC(4) + SQN(1) + plain
+                                                                        let mut secured = Vec::with_capacity(7 + plain_pdu.len());
+                                                                        secured.push(0x7E); // EPD: 5GMM
+                                                                        secured.push(0x04); // Security header: integrity + cipher + new ctx
+                                                                        secured.extend_from_slice(&mac);
+                                                                        secured.push(sqn);
+                                                                        secured.extend_from_slice(&plain_pdu);
+                                                                        info!("SecurityModeComplete integrity-protected, MAC={:02x?}", mac);
+                                                                        secured
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!("MAC computation failed: {}, sending plain", e);
+                                                                        nas_security_ctx.rollback_uplink_count();
+                                                                        plain_pdu
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("NAS count increment failed: {}, sending plain", e);
+                                                                plain_pdu
+                                                            }
+                                                        }
+                                                    } else {
+                                                        plain_pdu
+                                                    };
 
                                                     info!("Sending Security Mode Complete, PDU len={}", nas_pdu.len());
                                                     pdu_counter += 1;
@@ -885,12 +951,8 @@ impl UeApp {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                                 info!("Initiating initial registration");
 
-                                // Build SUCI (SUPI Concealed Identity) - for testing, use null scheme
-                                // Format: Type (SUCI=0x01) | PLMN | Routing Indicator | Scheme | Scheme Output
-                                let suci_data = build_suci_null_scheme(
-                                    "999", "70", // PLMN MCC/MNC
-                                    "0000000001" // MSIN
-                                );
+                                // Build SUCI (SUPI Concealed Identity) from UE config
+                                let suci_data = build_suci_from_config(&task_base.config);
                                 let mobile_identity = Ie5gsMobileIdentity::new(
                                     MobileIdentityType::Suci,
                                     suci_data,
@@ -1002,7 +1064,7 @@ impl UeApp {
                                 switch_off_val,
                             );
 
-                            let suci_data = build_suci_null_scheme("999", "70", "0000000001");
+                            let suci_data = build_suci_from_config(&task_base.config);
                             let mobile_identity = Ie5gsMobileIdentity::new(
                                 MobileIdentityType::Suci,
                                 suci_data,
@@ -1265,6 +1327,28 @@ impl UeApp {
 /// Returns the raw SUCI data bytes for the 5GS Mobile Identity IE
 ///
 /// Format: Type octet | SUPI Format | PLMN | Routing Indicator | Protection Scheme | Home Network Public Key ID | Scheme Output (MSIN)
+/// Build SUCI from UE config (extracts MCC/MNC/MSIN from config)
+fn build_suci_from_config(config: &nextgsim_common::config::UeConfig) -> Vec<u8> {
+    let mcc = format!("{:03}", config.hplmn.mcc);
+    let mnc = if config.hplmn.long_mnc {
+        format!("{:03}", config.hplmn.mnc)
+    } else {
+        format!("{:02}", config.hplmn.mnc)
+    };
+    let msin = if let Some(ref supi) = config.supi {
+        // IMSI = MCC + MNC + MSIN, extract MSIN by skipping MCC+MNC length
+        let plmn_len = mcc.len() + mnc.len();
+        if supi.value.len() > plmn_len {
+            supi.value[plmn_len..].to_string()
+        } else {
+            "0000000001".to_string()
+        }
+    } else {
+        "0000000001".to_string()
+    };
+    build_suci_null_scheme(&mcc, &mnc, &msin)
+}
+
 fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
     let mut data = Vec::new();
 
@@ -1627,5 +1711,101 @@ mod tests {
     fn test_increment_imsi_with_prefix() {
         let result = increment_imsi("imsi-001010000000001", 5).unwrap();
         assert_eq!(result, "001010000000006");
+    }
+
+    // -- SUCI BCD encoding tests --
+
+    #[test]
+    fn test_build_suci_null_scheme_2digit_mnc() {
+        let suci = build_suci_null_scheme("001", "01", "0000000001");
+        // Byte structure: Type(1) + PLMN(3) + RoutingInd(2) + SchemeId(1) + SchemeOutput(5)
+        assert!(!suci.is_empty());
+        // Type byte: SUCI = 0x01 (type 1, even/odd indicator varies)
+        // PLMN BCD: MCC=001 → 0x00,0xF1; MNC=01 → encoded in PLMN bytes
+        // At minimum verify we get the right length for null scheme
+        // SUCI format: type(1) + PLMN(3) + routing_indicator(2) + protection_scheme(1) + home_nw_pki(1) + scheme_output(5) = 13
+        assert!(suci.len() >= 10, "SUCI should be at least 10 bytes, got {}", suci.len());
+    }
+
+    #[test]
+    fn test_build_suci_null_scheme_3digit_mnc() {
+        let suci = build_suci_null_scheme("999", "070", "0000000001");
+        assert!(suci.len() >= 10);
+        // Different MNC lengths should produce valid SUCI
+        let suci2 = build_suci_null_scheme("999", "70", "0000000001");
+        // 2-digit and 3-digit MNC encodings differ in the PLMN BCD bytes
+        // Both should be valid
+        assert!(suci.len() >= 10);
+        assert!(suci2.len() >= 10);
+    }
+
+    #[test]
+    fn test_build_suci_null_scheme_deterministic() {
+        let s1 = build_suci_null_scheme("999", "70", "0000000001");
+        let s2 = build_suci_null_scheme("999", "70", "0000000001");
+        assert_eq!(s1, s2, "Same input must produce identical SUCI bytes");
+    }
+
+    #[test]
+    fn test_build_suci_null_scheme_different_msin() {
+        let s1 = build_suci_null_scheme("999", "70", "0000000001");
+        let s2 = build_suci_null_scheme("999", "70", "0000000002");
+        assert_ne!(s1, s2, "Different MSIN must produce different SUCI");
+    }
+
+    #[test]
+    fn test_build_suci_from_config_standard() {
+        use nextgsim_common::config::{UeConfig, OpType};
+        use nextgsim_common::types::{Plmn, Supi, SupiType};
+
+        let config = UeConfig {
+            hplmn: Plmn { mcc: 999, mnc: 70, long_mnc: false },
+            supi: Some(Supi { supi_type: SupiType::Imsi, value: "999700000000001".to_string() }),
+            key: [0u8; 16],
+            op: [0u8; 16],
+            op_type: OpType::Opc,
+            ..Default::default()
+        };
+        let suci = build_suci_from_config(&config);
+        // Should produce same result as direct call
+        let expected = build_suci_null_scheme("999", "70", "0000000001");
+        assert_eq!(suci, expected);
+    }
+
+    #[test]
+    fn test_build_suci_from_config_3digit_mnc() {
+        use nextgsim_common::config::{UeConfig, OpType};
+        use nextgsim_common::types::{Plmn, Supi, SupiType};
+
+        let config = UeConfig {
+            hplmn: Plmn { mcc: 1, mnc: 1, long_mnc: true },
+            supi: Some(Supi { supi_type: SupiType::Imsi, value: "0010010000000099".to_string() }),
+            key: [0u8; 16],
+            op: [0u8; 16],
+            op_type: OpType::Opc,
+            ..Default::default()
+        };
+        let suci = build_suci_from_config(&config);
+        let expected = build_suci_null_scheme("001", "001", "0000000099");
+        assert_eq!(suci, expected);
+    }
+
+    #[test]
+    fn test_build_suci_from_config_no_supi_fallback() {
+        use nextgsim_common::config::{UeConfig, OpType};
+        use nextgsim_common::types::Plmn;
+
+        let config = UeConfig {
+            hplmn: Plmn { mcc: 999, mnc: 70, long_mnc: false },
+            supi: None, // no SUPI
+            key: [0u8; 16],
+            op: [0u8; 16],
+            op_type: OpType::Opc,
+            ..Default::default()
+        };
+        let suci = build_suci_from_config(&config);
+        // Should fall back to default MSIN "0000000001"
+        let expected = build_suci_null_scheme("999", "70", "0000000001");
+        assert_eq!(suci, expected);
     }
 }

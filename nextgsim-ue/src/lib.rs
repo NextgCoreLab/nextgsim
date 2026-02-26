@@ -34,6 +34,11 @@ pub mod mint;
 pub mod sidelink;
 pub mod ambient_iot;
 
+// Rel-17 protocol extensions
+pub mod prose;  // ProSe PC5 proximity services (TS 23.303/23.304)
+pub mod uav;    // UAV identification and C2 link management (TS 23.256)
+pub mod daps;   // DAPS dual active protocol stack handover (TS 38.331)
+
 // Re-export commonly used types
 pub use timer::{GprsTimer2, GprsTimer3, GprsTimer3Unit, UeTimer};
 
