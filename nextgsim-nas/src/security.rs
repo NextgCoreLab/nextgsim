@@ -2043,4 +2043,150 @@ mod tests {
         assert_eq!(copy.keys().kamf(), ctx.keys().kamf());
         assert_eq!(copy.keys().knas_int(), ctx.keys().knas_int());
     }
+
+    // ============================================
+    // State Machine Edge Case Tests
+    // ============================================
+
+    #[test]
+    fn test_state_transition_null_to_active_directly() {
+        // Code has no guards, activate() from Null should work
+        let mut ctx = NasSecurityContext::new();
+        assert!(ctx.is_null());
+        ctx.activate();
+        assert!(ctx.is_active());
+    }
+
+    #[test]
+    fn test_state_regression_active_to_establishing() {
+        // begin_establishing() from Active regresses state
+        let mut ctx = NasSecurityContext::new();
+        ctx.activate();
+        assert!(ctx.is_active());
+
+        ctx.begin_establishing();
+        assert_eq!(ctx.state(), SecurityContextState::Establishing);
+        assert!(!ctx.is_active());
+    }
+
+    #[test]
+    fn test_mac_fails_in_establishing_state() {
+        let mut ctx = NasSecurityContext::new();
+        ctx.keys_mut().set_kamf(&[0x55u8; 32]);
+        ctx.derive_nas_keys(CipheringAlgorithm::Nea2, IntegrityAlgorithm::Nia2).unwrap();
+        ctx.begin_establishing();
+
+        let message = vec![0x7E, 0x00, 0x41];
+        let result = ctx.compute_uplink_mac(1, &message);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), SecurityError::SecurityContextNotActive);
+    }
+
+    #[test]
+    fn test_mac_fails_in_inactive_state() {
+        let mut ctx = NasSecurityContext::new();
+        ctx.keys_mut().set_kamf(&[0x55u8; 32]);
+        ctx.derive_nas_keys(CipheringAlgorithm::Nea2, IntegrityAlgorithm::Nia2).unwrap();
+        ctx.begin_establishing();
+        ctx.set_inactive();
+
+        let message = vec![0x7E, 0x00, 0x41];
+        let result = ctx.compute_uplink_mac(1, &message);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), SecurityError::SecurityContextNotActive);
+    }
+
+    #[test]
+    fn test_derive_nas_keys_with_null_algorithms() {
+        let mut ctx = NasSecurityContext::new();
+        ctx.keys_mut().set_kamf(&[0x55u8; 32]);
+
+        let result = ctx.derive_nas_keys(CipheringAlgorithm::Nea0, IntegrityAlgorithm::Nia0);
+        assert!(result.is_ok());
+
+        // Keys should still be derived (even if null algorithms)
+        assert!(ctx.keys().has_nas_keys());
+        assert_eq!(ctx.ciphering_algorithm(), CipheringAlgorithm::Nea0);
+        assert_eq!(ctx.integrity_algorithm(), IntegrityAlgorithm::Nia0);
+    }
+
+    #[test]
+    fn test_derive_nas_keys_twice_replaces_keys() {
+        let mut ctx = NasSecurityContext::new();
+        ctx.keys_mut().set_kamf(&[0x55u8; 32]);
+
+        // First derivation with Nea2/Nia2
+        ctx.derive_nas_keys(CipheringAlgorithm::Nea2, IntegrityAlgorithm::Nia2).unwrap();
+        let first_enc = ctx.keys().knas_enc().unwrap().clone();
+        let first_int = ctx.keys().knas_int().unwrap().clone();
+
+        // Second derivation with Nea1/Nia1 (different algorithm IDs → different keys)
+        ctx.derive_nas_keys(CipheringAlgorithm::Nea1, IntegrityAlgorithm::Nia1).unwrap();
+        let second_enc = ctx.keys().knas_enc().unwrap().clone();
+        let second_int = ctx.keys().knas_int().unwrap().clone();
+
+        // Keys should differ because algorithm ID is input to KDF
+        assert_ne!(first_enc, second_enc);
+        assert_ne!(first_int, second_int);
+        assert_eq!(ctx.ciphering_algorithm(), CipheringAlgorithm::Nea1);
+        assert_eq!(ctx.integrity_algorithm(), IntegrityAlgorithm::Nia1);
+    }
+
+    #[test]
+    fn test_nas_security_algorithms_nea0_nia0() {
+        let algs = NasSecurityAlgorithms::new(CipheringAlgorithm::Nea0, IntegrityAlgorithm::Nia0);
+        let encoded = algs.encode();
+        assert_eq!(encoded, 0x00);
+
+        let decoded = NasSecurityAlgorithms::decode(encoded).unwrap();
+        assert_eq!(decoded, algs);
+    }
+
+    #[test]
+    fn test_nas_security_algorithms_nea3_nia3() {
+        let algs = NasSecurityAlgorithms::new(CipheringAlgorithm::Nea3, IntegrityAlgorithm::Nia3);
+        let encoded = algs.encode();
+        assert_eq!(encoded, 0x33);
+
+        let decoded = NasSecurityAlgorithms::decode(encoded).unwrap();
+        assert_eq!(decoded, algs);
+    }
+
+    #[test]
+    fn test_reset_counts_clears_sequence_window() {
+        let mut ctx = NasSecurityContext::new();
+
+        // Track some sequences
+        ctx.track_sequence_number(5);
+        ctx.track_sequence_number(10);
+        assert!(ctx.is_sequence_number_seen(5));
+        assert!(ctx.is_sequence_number_seen(10));
+
+        // reset_counts should clear the window
+        ctx.reset_counts();
+        assert!(!ctx.is_sequence_number_seen(5));
+        assert!(!ctx.is_sequence_number_seen(10));
+        assert_eq!(ctx.uplink_count().sqn, 0);
+        assert_eq!(ctx.downlink_count().sqn, 0);
+    }
+
+    #[test]
+    fn test_mac_with_nia0_active_context_returns_zero() {
+        let mut ctx = NasSecurityContext::new();
+        ctx.keys_mut().set_kamf(&[0x55u8; 32]);
+        ctx.derive_nas_keys(CipheringAlgorithm::Nea0, IntegrityAlgorithm::Nia0).unwrap();
+        ctx.activate();
+
+        let message = vec![0x7E, 0x00, 0x41];
+        let mac = ctx.compute_uplink_mac(0, &message).unwrap();
+        assert_eq!(mac, [0u8; 4], "NIA0 should produce zero MAC");
+    }
+
+    #[test]
+    fn test_set_inactive_from_null() {
+        let mut ctx = NasSecurityContext::new();
+        assert!(ctx.is_null());
+        ctx.set_inactive();
+        assert_eq!(ctx.state(), SecurityContextState::Inactive);
+    }
 }

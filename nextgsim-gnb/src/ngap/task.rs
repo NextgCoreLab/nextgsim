@@ -60,6 +60,10 @@ use nextgsim_ngap::procedures::ue_context_release::{
     decode_ue_context_release_command, encode_ue_context_release_complete,
     UeContextReleaseCompleteParams,
 };
+use nextgsim_ngap::procedures::initial_context_setup::{
+    decode_initial_context_setup_request, encode_initial_context_setup_response,
+    InitialContextSetupResponseParams,
+};
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, UserLocationInfoNr, NrCgi, Tai};
 use nextgsim_ngap::procedures::handover::{
     decode_handover_command, decode_handover_request,
@@ -502,6 +506,91 @@ impl NgapTask {
                 ue_id,
                 dl_nas.nas_pdu.len()
             );
+        }
+    }
+
+    /// Handles Initial Context Setup Request from AMF
+    ///
+    /// Establishes UE security context (KgNB), stores security capabilities,
+    /// forwards piggybacked NAS PDU to UE, and sends response back to AMF.
+    async fn handle_initial_context_setup_request(
+        &mut self,
+        amf_id: i32,
+        stream: u16,
+        ics_req: nextgsim_ngap::procedures::initial_context_setup::InitialContextSetupRequestData,
+    ) {
+        info!(
+            "Initial Context Setup Request: amf_ue_ngap_id={}, ran_ue_ngap_id={}, security_key_len={}",
+            ics_req.amf_ue_ngap_id,
+            ics_req.ran_ue_ngap_id,
+            ics_req.security_key.len()
+        );
+
+        // Find UE context by RAN-UE-NGAP-ID
+        let ue_ctx = self.ue_contexts.values_mut().find(|ctx| {
+            ctx.ran_ue_ngap_id == ics_req.ran_ue_ngap_id as i64
+        });
+
+        let ue_id = match ue_ctx {
+            Some(ctx) => {
+                // Update AMF-UE-NGAP-ID
+                if ctx.amf_ue_ngap_id.is_none() {
+                    ctx.amf_ue_ngap_id = Some(ics_req.amf_ue_ngap_id as i64);
+                }
+                // Transition UE state
+                ctx.on_initial_context_setup();
+                info!(
+                    "UE context updated: ue_id={}, state={}, amf_ue_ngap_id={}",
+                    ctx.ue_id, ctx.state, ics_req.amf_ue_ngap_id
+                );
+                ctx.ue_id
+            }
+            None => {
+                warn!(
+                    "No UE context found for RAN-UE-NGAP-ID {}",
+                    ics_req.ran_ue_ngap_id
+                );
+                return;
+            }
+        };
+
+        // Forward piggybacked NAS PDU (e.g., SecurityModeCommand) to UE via RRC
+        if let Some(nas_pdu) = &ics_req.nas_pdu {
+            debug!(
+                "Forwarding piggybacked NAS PDU ({} bytes) to UE {}",
+                nas_pdu.len(), ue_id
+            );
+            let msg = RrcMessage::NasDelivery {
+                ue_id,
+                pdu: OctetString::from_slice(nas_pdu),
+            };
+            if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                error!("Failed to forward NAS PDU from InitialContextSetup to RRC: {}", e);
+            }
+        }
+
+        // Transition to Active state (security context established)
+        if let Some(ctx) = self.ue_contexts.values_mut().find(|ctx| ctx.ue_id == ue_id) {
+            ctx.on_context_setup_complete();
+            info!("UE {} context setup complete, state={}", ue_id, ctx.state);
+        }
+
+        // Send Initial Context Setup Response
+        let response_params = InitialContextSetupResponseParams {
+            amf_ue_ngap_id: ics_req.amf_ue_ngap_id,
+            ran_ue_ngap_id: ics_req.ran_ue_ngap_id,
+        };
+        match encode_initial_context_setup_response(&response_params) {
+            Ok(response_bytes) => {
+                self.send_ngap_ue_associated(amf_id, stream, response_bytes).await;
+                info!(
+                    "Initial Context Setup Response sent for RAN-UE-NGAP-ID {}",
+                    ics_req.ran_ue_ngap_id
+                );
+            }
+            Err(e) => {
+                error!("Failed to encode Initial Context Setup Response: {}", e);
+            }
         }
     }
 
@@ -1295,6 +1384,8 @@ impl NgapTask {
                     self.handle_handover_request(client_id, stream, ho_req).await;
                 } else if let Ok(ho_fail) = decode_handover_preparation_failure(pdu_bytes) {
                     self.handle_handover_preparation_failure(client_id, stream, ho_fail).await;
+                } else if let Ok(ics_req) = decode_initial_context_setup_request(pdu_bytes) {
+                    self.handle_initial_context_setup_request(client_id, stream, ics_req).await;
                 } else {
                     debug!(
                         "Received operational NGAP PDU on stream {} (not yet handled, first bytes: {:02x?})",
