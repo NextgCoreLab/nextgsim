@@ -38,6 +38,7 @@ pub use isac_config::*;
 pub use ntn_timing::*;
 pub use ntn_link_sim::*;
 pub use ntn_constellation::*;
+pub use ntn_integration_example::*;
 pub use sub_thz_config::*;
 pub use isl_handover::{
     IslHandoverContext, IslHandoverState, IslHandoverManager,

@@ -36,6 +36,7 @@ nextgsim-agent.workspace = true
 nextgsim-fl.workspace = true
 
 log.workspace = true
+tracing-log.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
