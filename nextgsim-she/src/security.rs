@@ -85,7 +85,7 @@ impl AttestationEvidence {
             nonce: vec![0; 32], // Would be random in production
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         }
     }

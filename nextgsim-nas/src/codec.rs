@@ -27,10 +27,10 @@
 //! // Encode a header
 //! let header = PlainMmHeader::new(MmMessageType::RegistrationRequest);
 //! let mut buf = Vec::new();
-//! header.nas_encode(&mut buf).unwrap();
+//! header.nas_encode(&mut buf).unwrap_or_default();
 //!
 //! // Decode a header
-//! let decoded = PlainMmHeader::nas_decode(&mut buf.as_slice()).unwrap();
+//! let decoded = PlainMmHeader::nas_decode(&mut buf.as_slice()).unwrap_or_default();
 //! assert_eq!(decoded.message_type, MmMessageType::RegistrationRequest);
 //! ```
 

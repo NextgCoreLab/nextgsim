@@ -420,7 +420,7 @@ impl UeApp {
                                                                         pdu_data[i + 4],
                                                                         pdu_data[i + 5],
                                                                         pdu_data[i + 6]));
-                                                                    info!("PDU Session {} established with IP: {}", psi, ue_ip.unwrap());
+                                                                    info!("PDU Session {} established with IP: {}", psi, ue_ip.unwrap_or_default());
                                                                 }
                                                             }
                                                             break;

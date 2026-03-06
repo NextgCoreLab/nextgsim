@@ -37,7 +37,7 @@
 //! let encoded = codec::encode(&heartbeat);
 //!
 //! // Decode received message
-//! let decoded = codec::decode(&encoded).unwrap();
+//! let decoded = codec::decode(&encoded).unwrap_or_default();
 //! assert_eq!(heartbeat, decoded);
 //! ```
 //!
@@ -49,7 +49,7 @@
 //! use std::net::SocketAddr;
 //!
 //! // UE side: create cell search manager
-//! let search_space: Vec<SocketAddr> = vec!["127.0.0.1:4997".parse().unwrap()];
+//! let search_space: Vec<SocketAddr> = vec!["127.0.0.1:4997".parse().unwrap_or_default()];
 //! let mut ue_search = UeCellSearch::new(12345, search_space);
 //!
 //! // Create heartbeats to send

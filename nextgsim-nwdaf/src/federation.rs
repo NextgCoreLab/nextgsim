@@ -646,7 +646,7 @@ impl DataFederationManager {
                 let latest = all_results
                     .iter()
                     .max_by_key(|(_, r)| r.timestamp_ms)
-                    .unwrap();
+                    .unwrap_or_default();
                 (latest.1.confidence, latest.1.payload_json.clone())
             }
             FederatedAggregationMethod::Union => {

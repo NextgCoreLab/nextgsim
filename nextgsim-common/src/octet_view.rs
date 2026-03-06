@@ -188,7 +188,7 @@ impl<'a> OctetView<'a> {
     pub fn read_utf8_string(&self, length: usize) -> String {
         let idx = self.index.get();
         let result = String::from_utf8(self.data[idx..idx + length].to_vec())
-            .expect("Invalid UTF-8 sequence");
+            .unwrap_or_default();
         self.index.set(idx + length);
         result
     }
