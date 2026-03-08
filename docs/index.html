@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NextGSim — Agentic 6G Simulator</title>
+  <meta name="description" content="Agentic 6G UE and gNB simulator in pure Rust. 8 AI-native crates: ISAC, federated learning, semantic communication, autonomous agents, NWDAF analytics.">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="nav">
+  <a href="#" class="nav-logo">Next<span>GSim</span></a>
+  <ul class="nav-links">
+    <li><a href="#features">Features</a></li>
+    <li><a href="#ai-native">AI-Native</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#workflows">Workflows</a></li>
+    <li><a href="#components">Components</a></li>
+    <li><a href="#quickstart">Quick Start</a></li>
+    <li><a href="api.html">CLI &amp; API</a></li>
+    <li><a href="https://github.com/NextgCoreLab/nextgsim" class="btn btn-secondary" style="padding:0.4rem 1rem;font-size:0.8rem;">GitHub</a></li>
+  </ul>
+  <button class="mobile-menu-btn">&#9776;</button>
+</nav>
+
+<!-- Hero -->
+<section class="hero" id="hero">
+  <div class="container">
+    <div class="hero-content">
+      <div class="hero-badge">
+        <span>v0.1.0</span> &middot; 5G + 6G AI-Native &middot; Zero C Dependencies
+      </div>
+      <h1>Agentic <span class="accent">6G</span> Simulator</h1>
+      <p>The first AI-native 5G/6G UE and gNB simulator — with 8 dedicated 6G crates for ISAC, federated learning, semantic communication, autonomous AI agents, and knowledge graph-driven network intelligence. Pure Rust, zero C dependencies.</p>
+      <div class="hero-buttons">
+        <a href="#quickstart" class="btn btn-primary">Get Started</a>
+        <a href="#ai-native" class="btn btn-secondary">Explore 6G AI</a>
+        <a href="api.html" class="btn btn-secondary">CLI Reference</a>
+      </div>
+      <div class="stats-row">
+        <div class="stat"><div class="stat-value">20</div><div class="stat-label">Rust Crates</div></div>
+        <div class="stat"><div class="stat-value">8</div><div class="stat-label">6G AI Crates</div></div>
+        <div class="stat"><div class="stat-value">~70k</div><div class="stat-label">Lines of Rust</div></div>
+        <div class="stat"><div class="stat-value">3</div><div class="stat-label">Binaries</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+  <div class="container">
+    <h2 class="section-title">Why NextGSim?</h2>
+    <p class="section-subtitle">The first simulator with built-in 6G AI-native intelligence.</p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">&#129302;</div>
+        <h3>Autonomous AI Agents</h3>
+        <p>Intent-based networking with RL-powered agents. Express goals ("optimize slice latency") and the agent figures out handovers, load balancing, and resource allocation autonomously.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#128225;</div>
+        <h3>Semantic Communication</h3>
+        <p>Neural encoder/decoder codecs that transmit meaning, not bits. ONNX-based learned compression with joint source-channel coding (JSCC) that adapts to SNR in real-time. 2-10x bandwidth reduction.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#128752;</div>
+        <h3>Federated Learning</h3>
+        <p>Privacy-preserving distributed ML: FedAvg, FedProx, secure aggregation with x25519. Gaussian/Renyi differential privacy, Byzantine-robust aggregation (Krum, trimmed mean).</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#128506;</div>
+        <h3>ISAC Sensing</h3>
+        <p>Integrated Sensing and Communication — joint radar-comm waveforms, multi-sensor fusion (EKF + Bayesian), ML positioning (DNN, LSTM, Transformer), SLAM-like environment mapping.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#129504;</div>
+        <h3>Knowledge Graphs</h3>
+        <p>NKEF with semantic search, RAG-ready context generation, temporal entity tracking, distributed replication, and formal ontology validation. Powers all AI agent decision-making.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#9881;</div>
+        <h3>Pure Rust Stack</h3>
+        <p>Zero C dependencies from SCTP to ASN.1 PER. Single static binary. NAS 5G, NGAP, RRC, GTP-U, SCTP — all implemented natively. Compile anywhere Rust runs.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- AI-Native 6G Deep Dives -->
+<section id="ai-native">
+  <div class="container">
+    <h2 class="section-title">6G AI-Native Crates</h2>
+    <p class="section-subtitle">8 specialized crates that bring intelligence to every layer of the network.</p>
+
+    <!-- AI Data Flow Diagram -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">AI Data Flow — How It All Connects</h3>
+      <div class="arch-diagram">
+        <div class="arch-layer">
+          <div class="arch-label">Sensors</div>
+          <div class="arch-nodes">
+            <div class="arch-node">UE Measurements</div>
+            <div class="arch-node">gNB Cell Load</div>
+            <div class="arch-node">ISAC Radar</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; Raw data &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-label">Analytics</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai">NWDAF</div>
+            <div class="arch-node ai">ISAC</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; Insights + predictions &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-label">Knowledge</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai">NKEF Graph</div>
+            <div class="arch-node ai">Semantic Search</div>
+            <div class="arch-node ai">RAG Context</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; Context + goals &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-label">Agents</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai">Agent (RL)</div>
+            <div class="arch-node ai">Intent Engine</div>
+            <div class="arch-node ai">Conflict Resolver</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; Actions &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-label">Execution</div>
+          <div class="arch-nodes">
+            <div class="arch-node core">Handover</div>
+            <div class="arch-node core">Slice Mgmt</div>
+            <div class="arch-node core">Load Balance</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; Training data loops back via FL &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-label">Learning</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai">FL Trainer</div>
+            <div class="arch-node ai">SHE Placement</div>
+            <div class="arch-node ai">Semantic Codec</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- NWDAF -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">NWDAF — 4-Layer Analytics (TS 23.288)</h3>
+      <div class="arch-diagram">
+        <div class="arch-layer">
+          <div class="arch-nodes"><div class="arch-node ai">Layer 4: Autonomous Actions</div></div>
+        </div>
+        <div class="arch-connector">Adjust handover params &middot; Cell power &middot; Load balancing</div>
+        <div class="arch-layer">
+          <div class="arch-nodes"><div class="arch-node ai">Layer 3: Prescriptive</div></div>
+        </div>
+        <div class="arch-connector">UE mobility &middot; NF load &middot; Abnormal behavior &middot; QoS &middot; Service experience</div>
+        <div class="arch-layer">
+          <div class="arch-nodes"><div class="arch-node ai">Layer 2: Predictive (ONNX)</div></div>
+        </div>
+        <div class="arch-connector">Trajectory prediction &middot; Load forecasting &middot; Time-to-overload</div>
+        <div class="arch-layer">
+          <div class="arch-nodes"><div class="arch-node ai">Layer 1: Real-Time</div></div>
+        </div>
+        <div class="arch-connector">Z-score anomaly detection &middot; RSRP/SINR monitoring &middot; Cell load</div>
+      </div>
+      <p style="color:var(--text-secondary);font-size:0.9rem;margin-top:1rem;">Handover types: signal-based, mobility-predicted, load-balancing, and coverage-optimized. Integrates with NKEF for knowledge enrichment and Agent for autonomous execution.</p>
+    </div>
+
+    <!-- Agent -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">Agent — Intent-Based Autonomous Networking (TR 23.700-80)</h3>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>Intent System</h3>
+          <p>Declarative intents: Handover, ModifySlice, CreateSlice, OptimizeResources, TriggerLoadBalancing. Each intent specifies constraints, priority, and deadline. Conflict detection across competing intents with priority-based resolution.</p>
+        </div>
+        <div class="feature-card">
+          <h3>RL Learning</h3>
+          <p>Q-learning with experience replay. State: network load, active UEs, latency, success rate. Reward: intent success, cost, safety metrics. Agents improve from every execution outcome.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Multi-Agent Coordination</h3>
+          <p>Hierarchical roles (Network > Region > Cell). Agent types: Mobility, Resource, QoS, Security, Slicing. Composite intents for cooperative goals. Safety guardrails with forbidden rules.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ISAC -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">ISAC — Integrated Sensing &amp; Communication (TR 22.837)</h3>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>Sensing Methods</h3>
+          <p>ToA, TDoA, AoA, ZoA (elevation), RSS, Doppler, RTT measurements. OFDM-radar waveform design with configurable sensing/comm split and range/Doppler resolution.</p>
+        </div>
+        <div class="feature-card">
+          <h3>ML Positioning</h3>
+          <p>4 model types: DeepPositioning (DNN), TrajectoryLstm, TransformerTracking, FingerprintCnn. Feature extraction across time and space dimensions. Multi-target tracking.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Environment Mapping</h3>
+          <p>SLAM-like occupancy grid mapping. Multi-sensor fusion with Extended Kalman Filter + Bayesian estimation. Sensing-as-a-Service API for application subscriptions.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Semantic Communication -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">Semantic Communication — Task-Aware Transmission</h3>
+      <div class="arch-diagram">
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node">Raw Data (Image/Video/Audio)</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; Neural Encoder (ONNX) &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node ai">Semantic Features (task-relevant only)</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; JSCC (SNR-adaptive: high → more symbols, low → fewer) &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node">Channel Symbols</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8595; Neural Decoder &#8595;</div>
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node core">Reconstructed Task Output</div>
+          </div>
+        </div>
+      </div>
+      <p style="color:var(--text-secondary);font-size:0.9rem;margin-top:1rem;">Rate-distortion optimization (Lagrangian). Quality metrics: cosine similarity, MSE, PSNR, top-k accuracy. Importance weighting allocates bits to task-critical features. Goal-oriented coding transmits only what matters. Codec trained via federated learning (FL integration).</p>
+    </div>
+
+    <!-- Federated Learning -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">Federated Learning — Privacy-Preserving Distributed ML (TR 23.700-80)</h3>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>Aggregation Strategies</h3>
+          <p><strong>FedAvg</strong> (weighted averaging), <strong>FedProx</strong> (regularized for heterogeneity), <strong>SecAgg</strong> (encrypted with x25519 key exchange). Asynchronous FL with staleness weighting.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Privacy Mechanisms</h3>
+          <p>Gaussian differential privacy with gradient clipping. Renyi DP composition tracking. Zero-concentrated DP (zCDP) accounting. UE gradients never leave the device unencrypted.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Byzantine Robustness</h3>
+          <p>Krum (multi-distance scoring), trimmed mean, coordinate-wise median. Detects and filters malicious participant updates. Gradient compression: top-k, 1-bit, ternary quantization (32x bandwidth reduction).</p>
+        </div>
+        <div class="feature-card">
+          <h3>Hierarchical Aggregation</h3>
+          <p>3-tier: UE trains locally (via SHE edge) → gNB aggregates nearby → Regional aggregates multiple gNBs → Cloud final aggregation. Model versioning and distribution.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- SHE & NKEF -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">SHE &amp; NKEF — Compute Placement &amp; Knowledge Intelligence</h3>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>SHE: 3-Tier Compute (TS 23.558)</h3>
+          <p>LocalEdge (&lt;10ms), RegionalEdge (&lt;20ms), CoreCloud (unlimited). Workload placement by latency/compute constraints. Auto-scaling, SLA monitoring, TEE attestation. Scheduling: ClosestToEdge, OptimalLatency, LoadBalanced.</p>
+        </div>
+        <div class="feature-card">
+          <h3>NKEF: Knowledge Graph</h3>
+          <p>Entity types: gNB, UE, Cell, AMF, UPF, Slice, PDUSession, Service, Analytics, Agent, Intent. Directed relationships with properties. TF-IDF + ONNX vector embeddings for semantic search.</p>
+        </div>
+        <div class="feature-card">
+          <h3>NKEF: RAG Integration</h3>
+          <p>Context builder with relevance scoring, token limits, relationship awareness. Powers all agent decision-making. Temporal tracking (entity history), distributed replication, formal ontology validation.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI Infrastructure -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">AI Infrastructure — ONNX Inference Engine</h3>
+      <p style="color:var(--text-secondary);font-size:0.9rem;margin-bottom:1rem;">The <strong>nextgsim-ai</strong> crate provides the ML backbone for all 6G functions.</p>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>ONNX Runtime</h3>
+          <p>Load any ONNX model. Batch inference, multi-input tensors, graph optimization (O0-O3). Float32/Float16/Int64 tensor types.</p>
+        </div>
+        <div class="feature-card">
+          <h3>GPU Acceleration</h3>
+          <p>Execution providers: CPU, CUDA (NVIDIA), CoreML (Apple), DirectML (Windows), TensorRT (optimized). Model warmup for consistent latency.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Specialized Pipelines</h3>
+          <p>IsacPipeline (sensing ML), SemanticPipeline (codec), FlTrainer (federated), XrTrafficModel (metaverse). Per-inference latency/throughput metrics.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Architecture -->
+<section id="architecture">
+  <div class="container">
+    <h2 class="section-title">Architecture</h2>
+    <p class="section-subtitle">Layered crate architecture from radio to AI intelligence.</p>
+    <div class="arch-diagram">
+      <div class="arch-layer">
+        <div class="arch-label">Binaries</div>
+        <div class="arch-nodes">
+          <div class="arch-node core">nr-gnb</div>
+          <div class="arch-node core">nr-ue</div>
+          <div class="arch-node core">nr-cli</div>
+        </div>
+      </div>
+      <div class="arch-connector">&#8595;</div>
+      <div class="arch-layer">
+        <div class="arch-label">Protocol</div>
+        <div class="arch-nodes">
+          <div class="arch-node">NAS</div>
+          <div class="arch-node">NGAP</div>
+          <div class="arch-node">RRC</div>
+          <div class="arch-node">GTP</div>
+          <div class="arch-node">SCTP</div>
+          <div class="arch-node">RLS</div>
+        </div>
+      </div>
+      <div class="arch-connector">&#8595;</div>
+      <div class="arch-layer">
+        <div class="arch-label">Core</div>
+        <div class="arch-nodes">
+          <div class="arch-node core">common</div>
+          <div class="arch-node core">crypto</div>
+        </div>
+      </div>
+      <div class="arch-connector">&#8595;</div>
+      <div class="arch-layer">
+        <div class="arch-label">6G AI</div>
+        <div class="arch-nodes">
+          <div class="arch-node ai">SHE</div>
+          <div class="arch-node ai">NWDAF</div>
+          <div class="arch-node ai">NKEF</div>
+          <div class="arch-node ai">ISAC</div>
+          <div class="arch-node ai">Agent</div>
+          <div class="arch-node ai">FL</div>
+          <div class="arch-node ai">Semantic</div>
+          <div class="arch-node ai">AI</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Workflows -->
+<section id="workflows">
+  <div class="container">
+    <h2 class="section-title">Key Workflows</h2>
+    <p class="section-subtitle">End-to-end procedures from UE attach to AI-driven optimization.</p>
+
+    <h3 class="group-heading">UE Registration via gNB (TS 23.502 &sect;4.2.2)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Setup Request (RLS link-layer over UDP)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Setup (SRB1 established, cell config)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Setup Complete + NAS Registration Request (SUCI, requested NSSAI)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP Initial UE Message (NAS PDU, TAI, user location)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF (SCTP)</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nausf_UEAuthentication (SUCI → SUPI via SIDF)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AUSF → UDM</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS Authentication Request (5G-AKA RAND, AUTN)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS Authentication Response (RES*) — verify AUTN, compute HRES*</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS Security Mode Command (EA1/EA2, IA1/IA2, ABBA)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS Security Mode Complete (NAS ciphered from here)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP InitialContextSetup (K_gNB, security capabilities, allowed NSSAI)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Security Mode + RRC Reconfiguration (SRB2, DRB setup)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS Registration Accept (5G-GUTI, allowed NSSAI, TAI list)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS Registration Complete — UE state: RM-REGISTERED, CM-CONNECTED</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <p class="wf-desc">Full RLS→RRC→NGAP→NAS stack simulated end-to-end. UE stores GUTI for subsequent registrations. gNB maintains UE context with AS security keys derived from K_gNB.</p>
+    </div>
+
+    <h3 class="group-heading">PDU Session Establishment (TS 23.502 &sect;4.3.2)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS PDU Session Establishment Request (SST:1, SD:0x010203, DNN:internet)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP UL NAS Transport (PDU Session ID, S-NSSAI, request transfer)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nsmf_PDUSession_CreateSMContext (SUPI, DNN, S-NSSAI)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">SMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PCF policy fetch: QoS rules, session AMBR, PCC rules</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">PCF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PFCP Session Establishment (PDR + FAR + QER + URR rules)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UPF</span></div>
+      <div class="workflow-step"><span class="wf-actor">UPF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PFCP Response (F-TEID for GTP-U N3 tunnel)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">SMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">IP: 10.45.x.x allocated (bitmap pool), QoS flow with 5QI=9</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF → gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Reconfiguration (add DRB for PDU Session, QoS flow mapping)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">User data: IP packets → GTP-U encap → N3 tunnel → UPF → N6 → DN</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Internet</span></div>
+      <p class="wf-desc">GTP-U tunnel established between gNB and UPF. UE TUN interface created with assigned IP. PFCP rules define packet detection (PDR), forwarding (FAR), QoS enforcement (QER), and usage reporting (URR).</p>
+    </div>
+
+    <h3 class="group-heading">Xn Handover (TS 23.502 &sect;4.9.1)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Measurement Report (RSRP/RSRQ for neighbor cells)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Source gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Src gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">A3 event triggered: neighbor RSRP &gt; serving + hysteresis</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">HO Decision</span></div>
+      <div class="workflow-step"><span class="wf-actor">Src gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Xn Handover Request (UE context, PDU sessions, target cell)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Target gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Tgt gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Admission control → Handover Request Ack (DL forwarding GTP TEIDs)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Src gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Src gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Reconfiguration (target cell config, new C-RNTI)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Sync to target cell → RRC Reconfiguration Complete</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Target gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Tgt gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP Path Switch Request (new N3 GTP tunnel info)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF → SMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PFCP Session Modification (update PDR/FAR to target gNB TEID)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UPF</span></div>
+      <p class="wf-desc">Seamless mobility with data forwarding during handover. Source gNB forwards buffered DL data to target via GTP tunnel. UE re-derives AS security keys from NH/NCC chain.</p>
+    </div>
+
+    <h3 class="group-heading">ISAC Sensing + ML Positioning (6G)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Configure OFDM-radar waveform (sensing subcarriers, PRS-like RS)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">RF Front-end</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Transmit joint comm+sensing signal (shared spectrum, no guard band)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Air Interface</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB Rx</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Collect echo: ToA, AoA, RSS, Doppler from reflected signals</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">ISAC Engine</span></div>
+      <div class="workflow-step"><span class="wf-actor">ISAC</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Feature extraction: range-Doppler map, angle spectrum, temporal features</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">ML Pipeline</span></div>
+      <div class="workflow-step"><span class="wf-actor">ML</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">DeepPositioning CNN inference → (x, y, z) estimate with confidence</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Fusion</span></div>
+      <div class="workflow-step"><span class="wf-actor">ML</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">TransformerTracking → velocity + trajectory prediction</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Fusion</span></div>
+      <div class="workflow-step"><span class="wf-actor">Fusion</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">EKF + Bayesian sensor fusion → refined position (sub-meter accuracy)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Analytics event: UE_LOCATION update → beam management + HO prediction</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB / Agent</span></div>
+      <p class="wf-desc">Joint communication and sensing on shared 6G waveform. ISAC engine runs radar processing in parallel with data demodulation. ML models trained via federated learning across gNBs for environment-adaptive positioning.</p>
+    </div>
+
+    <h3 class="group-heading">Semantic Communication Pipeline (6G)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE App</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Raw data input (image 1920x1080, video frame, audio segment)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Semantic Tx</span></div>
+      <div class="workflow-step"><span class="wf-actor">Encoder</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">ONNX neural codec: extract task-relevant semantic features only</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Latent Space</span></div>
+      <div class="workflow-step"><span class="wf-actor">JSCC</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Joint source-channel coding: SNR-adaptive symbol mapping</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Modulator</span></div>
+      <div class="workflow-step"><span class="wf-actor">Channel</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Bandwidth: 2-10x reduction vs Shannon (task-oriented compression)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB Rx</span></div>
+      <div class="workflow-step"><span class="wf-actor">JSCC Rx</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Adaptive demodulation (matched to channel state feedback)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Decoder</span></div>
+      <div class="workflow-step"><span class="wf-actor">Decoder</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">ONNX neural decoder: reconstruct task output (not raw data)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB App</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB App</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Semantic similarity metric: SSIM/BLEU → feedback to encoder rate control</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <p class="wf-desc">Beyond-Shannon paradigm: transmit meaning, not bits. JSCC eliminates the separation between source and channel coding. Compression ratio adapts in real-time to channel conditions and task importance. ONNX runtime enables cross-platform model deployment.</p>
+    </div>
+
+    <h3 class="group-heading">Federated Learning Round (6G)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">FL Server</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Broadcast global model v(n) + training config (epochs, LR, batch)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Selected UEs</span></div>
+      <div class="workflow-step"><span class="wf-actor">UEs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Local SGD training on private data (never leaves device)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Local Models</span></div>
+      <div class="workflow-step"><span class="wf-actor">UEs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Differential privacy: add calibrated Gaussian noise (epsilon=1.0)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">DP Gradients</span></div>
+      <div class="workflow-step"><span class="wf-actor">UEs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Gradient compression: top-k sparsification or 1-bit quantization</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Compressed</span></div>
+      <div class="workflow-step"><span class="wf-actor">UEs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Upload compressed updates (over-the-air or dedicated channel)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB Edge</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB Edge</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Hierarchical aggregate: Byzantine-robust filter (Krum/Median)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Regional</span></div>
+      <div class="workflow-step"><span class="wf-actor">Regional</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">FedAvg (weighted by samples) or FedProx (proximal term mu=0.01)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">FL Server</span></div>
+      <div class="workflow-step"><span class="wf-actor">FL Server</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">SecAgg verify → global model v(n+1) → convergence check</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Model registry update → redistribute to participating UEs/gNBs</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Network</span></div>
+      <p class="wf-desc">Privacy-preserving distributed ML across the RAN. Three-tier aggregation (UE → gNB → Regional → Cloud) minimizes backhaul. Byzantine filtering protects against poisoning attacks. SecAgg ensures server never sees individual updates.</p>
+    </div>
+
+    <h3 class="group-heading">Autonomous Agent Decision Loop (6G)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Analytics event: cell-123 PRB utilization 85%, QoS degradation predicted</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Agent</span></div>
+      <div class="workflow-step"><span class="wf-actor">NKEF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Knowledge graph query: 3 UEs eligible for HO, neighbor cells at 40% load</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Agent</span></div>
+      <div class="workflow-step"><span class="wf-actor">Agent</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">State encoding: [PRB=0.85, QoS_violation=2, neighbors=[0.40, 0.55, 0.30]]</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">RL Policy</span></div>
+      <div class="workflow-step"><span class="wf-actor">RL Policy</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Q-learning action selection: TriggerLoadBalancing (Q=0.87, epsilon=0.1)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Intent</span></div>
+      <div class="workflow-step"><span class="wf-actor">Agent</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Conflict resolution: check safety constraints, no conflicting intents</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Validator</span></div>
+      <div class="workflow-step"><span class="wf-actor">Agent</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Execute: Handover UE-1, UE-2 to cell-456 (lowest load neighbor)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Xn Handover executed → cell-123 PRB drops to 60%</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Result</span></div>
+      <div class="workflow-step"><span class="wf-actor">Result</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Reward: +0.8 (PRB↓, QoS✓) → Q-table update → experience replay buffer</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Agent</span></div>
+      <p class="wf-desc">Closed-loop autonomous network optimization. Agent observes state via NWDAF analytics, reasons with NKEF knowledge graph, acts via RL policy (Q-learning with epsilon-greedy exploration), and learns from outcomes. Safety constraints prevent destructive actions.</p>
+    </div>
+
+    <h3 class="group-heading">SHE Compute Offloading (6G)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE App</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Task request: ML inference (model=ResNet50, deadline=10ms, data=2MB)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">SHE Manager</span></div>
+      <div class="workflow-step"><span class="wf-actor">SHE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Score tiers: UE(latency=50ms), Edge(12ms, 2ms net), Cloud(5ms, 15ms net)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Placement</span></div>
+      <div class="workflow-step"><span class="wf-actor">SHE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Decision: Edge placement (meets deadline, minimizes energy)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB Edge</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB Edge</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Execute inference → result (class=vehicle, confidence=0.94)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE App</span></div>
+      <div class="workflow-step"><span class="wf-actor">SHE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Log: actual_latency=8ms, energy=0.3J → update placement model</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
+      <p class="wf-desc">Smart Heterogeneous Environment manager evaluates compute tiers (UE/Edge/Cloud) for each task based on latency budget, energy cost, and network conditions. Placement decisions improve over time via feedback loop.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Components -->
+<section id="components">
+  <div class="container">
+    <h2 class="section-title">All 20 Crates</h2>
+    <p class="section-subtitle">Protocol, core, and 6G AI modules.</p>
+
+    <h3 class="group-heading">Protocol Crates</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-nas</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">5G NAS — Registration, Auth, Security Mode, PDU Session, Deregistration codec.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-ngap</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">NGAP — ASN.1 PER encoder/decoder for gNB-AMF signaling over SCTP.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-rrc</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">RRC — Setup, Reconfig, Measurement Reports, Handover, NTN extensions.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-gtp</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">GTP-U — User plane tunneling for data forwarding.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-sctp</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">Pure Rust SCTP — No libsctp dependency.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-rls</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">Radio Link Simulation — UE-gNB air interface over UDP.</div>
+      </div>
+    </div>
+
+    <h3 class="group-heading">Core Crates</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-gnb</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">gNodeB — NGAP, RRC, GTP-U, cell management, UE context, handover.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-ue</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">UE — NAS procedures, RRC state machine, PDU sessions, multi-UE.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-cli</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">CLI — Runtime control, status queries, scenario scripting.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-common</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Shared types — SUPI, PLMN, S-NSSAI, QoS, config structs.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-crypto</span><span class="component-badge badge-crypto">Crypto</span></div>
+        <div class="component-desc">Pure Rust crypto — MILENAGE, Snow3G, ZUC, AES, HMAC-SHA256.</div>
+      </div>
+    </div>
+
+    <h3 class="group-heading">6G AI-Native Crates</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-ai</span><span class="component-badge badge-6g">AI</span></div>
+        <div class="component-desc">ONNX Runtime, GPU acceleration (CUDA/CoreML/TensorRT), batch inference, model warmup.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-she</span><span class="component-badge badge-6g">SHE</span></div>
+        <div class="component-desc">3-tier compute placement, auto-scaling, SLA monitoring, TEE attestation.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-nwdaf</span><span class="component-badge badge-6g">Analytics</span></div>
+        <div class="component-desc">4-layer analytics, ONNX prediction, anomaly detection, ML model lifecycle.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-nkef</span><span class="component-badge badge-6g">Knowledge</span></div>
+        <div class="component-desc">Knowledge graph, semantic search, RAG context, temporal tracking, ontology.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-isac</span><span class="component-badge badge-6g">Sensing</span></div>
+        <div class="component-desc">Joint radar-comm, ML positioning, EKF fusion, SLAM mapping, SaaS API.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-agent</span><span class="component-badge badge-6g">Agent</span></div>
+        <div class="component-desc">Intent-based RL agents, conflict resolution, multi-agent coordination, safety guardrails.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-fl</span><span class="component-badge badge-6g">FL</span></div>
+        <div class="component-desc">FedAvg/FedProx/SecAgg, differential privacy, Byzantine robustness, gradient compression.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-semantic</span><span class="component-badge badge-6g">Semantic</span></div>
+        <div class="component-desc">Neural codecs, JSCC, rate-distortion optimization, multimodal support.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Quick Start -->
+<section id="quickstart">
+  <div class="container">
+    <h2 class="section-title">Quick Start</h2>
+    <p class="section-subtitle">Get a UE and gNB simulator running in minutes.</p>
+
+    <h3 class="group-heading">Build from Source</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Clone the repository</span>
+<span class="cmd">git clone https://github.com/NextgCoreLab/nextgsim.git</span>
+<span class="cmd">cd nextgsim</span>
+
+<span class="comment"># Build all 20 crates</span>
+<span class="cmd">cargo build --release</span>
+
+<span class="comment"># Binaries: nr-gnb, nr-ue, nr-cli</span>
+<span class="cmd">ls target/release/nr-*</span></code>
+    </div>
+
+    <h3 class="group-heading">Run gNB + UE</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Terminal 1: Start gNB (connects to AMF)</span>
+<span class="cmd">./target/release/nr-gnb --config config/gnb.yaml</span>
+
+<span class="comment"># Terminal 2: Start UE</span>
+<span class="cmd">./target/release/nr-ue --config config/ue.yaml</span>
+
+<span class="comment"># Terminal 3: Interactive CLI</span>
+<span class="cmd">./target/release/nr-cli</span></code>
+    </div>
+
+    <h3 class="group-heading">Multi-UE Simulation</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Simulate 10 UEs with auto-incrementing IMSI</span>
+<span class="cmd">./target/release/nr-ue --config config/ue.yaml --num-ues 10</span>
+
+<span class="comment"># With debug logging</span>
+<span class="cmd">RUST_LOG=debug ./target/release/nr-gnb --config config/gnb.yaml</span></code>
+    </div>
+  </div>
+</section>
+
+<!-- Contributing -->
+<section id="contributing">
+  <div class="container">
+    <h2 class="section-title">Contributing</h2>
+    <p class="section-subtitle">We welcome contributions to the protocol stack, AI crates, and documentation.</p>
+    <div class="contrib-grid">
+      <div class="contrib-step">
+        <div class="contrib-num">1</div>
+        <div>
+          <h4>Fork &amp; Clone</h4>
+          <p>Fork the repository on GitHub and clone your fork locally.</p>
+        </div>
+      </div>
+      <div class="contrib-step">
+        <div class="contrib-num">2</div>
+        <div>
+          <h4>Create a Branch</h4>
+          <p>Create a feature branch from <code>main</code> with a descriptive name.</p>
+        </div>
+      </div>
+      <div class="contrib-step">
+        <div class="contrib-num">3</div>
+        <div>
+          <h4>Write Code &amp; Tests</h4>
+          <p>Follow Rust conventions. Run <code>cargo test</code> and <code>cargo clippy</code>. AI crates need ONNX models in <code>tests/models/</code>.</p>
+        </div>
+      </div>
+      <div class="contrib-step">
+        <div class="contrib-num">4</div>
+        <div>
+          <h4>Submit PR</h4>
+          <p>Push your branch, open a PR with a clear description. We review all PRs promptly.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <p>NextGSim &mdash; Agentic 6G Simulator &middot; <a href="https://github.com/NextgCoreLab/nextgsim">GitHub</a> &middot; <a href="api.html">CLI &amp; API</a> &middot; GPL-3.0 License</p>
+  </div>
+</footer>
+
+<script src="js/main.js"></script>
+</body>
+</html>
