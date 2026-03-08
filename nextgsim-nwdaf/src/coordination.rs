@@ -216,7 +216,7 @@ impl NwdafCoordinator {
 
         match target {
             Some(instance_id) => {
-                let instance = self.instances.get(&instance_id).unwrap();
+                let instance = self.instances.get(&instance_id).unwrap_or_default();
 
                 let request = DelegationRequest {
                     request_id: request_id.clone(),

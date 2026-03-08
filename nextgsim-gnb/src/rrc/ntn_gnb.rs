@@ -358,7 +358,7 @@ impl NtnGnbManager {
                              (a.center_lon_deg - ue_lon_deg).powi(2)).sqrt();
                 let dist_b = ((b.center_lat_deg - ue_lat_deg).powi(2) +
                              (b.center_lon_deg - ue_lon_deg).powi(2)).sqrt();
-                dist_a.partial_cmp(&dist_b).unwrap()
+                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(id, _)| *id)
     }
@@ -497,7 +497,7 @@ impl IslHandoverManager {
                     && n.link_quality_db >= self.quality_threshold_db
                     && n.satellite_id != self.serving_satellite_id
             })
-            .max_by(|a, b| a.link_quality_db.partial_cmp(&b.link_quality_db).unwrap())
+            .max_by(|a, b| a.link_quality_db.partial_cmp(&b.link_quality_db).unwrap_or(std::cmp::Ordering::Equal))
     }
 
     /// Initiates an ISL handover due to `trigger`.

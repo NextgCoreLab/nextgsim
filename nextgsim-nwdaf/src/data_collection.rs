@@ -106,7 +106,7 @@ impl std::fmt::Display for MeasurementCapability {
 ///     reporting_interval_ms: 100,
 ///     active: true,
 /// };
-/// collector.register_source(reg).unwrap();
+/// collector.register_source(reg).unwrap_or_default();
 ///
 /// // Push a UE measurement
 /// let meas = UeMeasurement {

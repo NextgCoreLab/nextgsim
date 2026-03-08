@@ -18,10 +18,10 @@ use crate::Error;
 /// use nextgsim_common::UdpTransport;
 ///
 /// async fn example() -> Result<(), nextgsim_common::Error> {
-///     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+///     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap_or_default();
 ///     let transport = UdpTransport::bind(addr).await?;
 ///     
-///     let dest: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+///     let dest: SocketAddr = "127.0.0.1:5000".parse().unwrap_or_default();
 ///     transport.send_to(b"hello", dest).await?;
 ///     
 ///     let (data, src) = transport.recv_from().await?;

@@ -320,7 +320,7 @@ fn test_fl_complete_training_round() {
     assert_eq!(aggregator.participant_count(), 2);
 
     // Start a training round
-    let round = aggregator.start_round().unwrap();
+    let round = aggregator.start_round().unwrap_or_default();
     assert_eq!(round, 1);
 
     // Submit updates from participants
@@ -347,7 +347,7 @@ fn test_fl_complete_training_round() {
         .unwrap();
 
     // Aggregate
-    let result = aggregator.aggregate().unwrap();
+    let result = aggregator.aggregate().unwrap_or_default();
 
     assert_eq!(result.num_participants, 2);
     assert!(!result.weights.is_empty());

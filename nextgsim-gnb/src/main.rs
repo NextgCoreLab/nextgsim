@@ -246,7 +246,9 @@ impl GnbApp {
     }
 }
 
-/// Initializes the tracing subscriber for logging
+/// Initializes the tracing subscriber for logging, with a log→tracing bridge
+/// so that crates using the `log` crate (e.g. ntn_gnb.rs ISL handover) are
+/// captured by the same tracing pipeline.
 fn init_logging() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -257,6 +259,9 @@ fn init_logging() {
         .with(fmt::layer())
         .with(filter)
         .init();
+
+    // Bridge `log` records into the tracing subscriber
+    tracing_log::LogTracer::init().ok();
 }
 
 #[tokio::main]

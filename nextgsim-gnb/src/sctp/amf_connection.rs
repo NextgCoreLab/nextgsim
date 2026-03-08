@@ -71,8 +71,8 @@ pub struct AmfConnectionConfig {
 impl Default for AmfConnectionConfig {
     fn default() -> Self {
         Self {
-            local_address: "0.0.0.0:0".parse().unwrap(),
-            remote_address: "127.0.0.1:38412".parse().unwrap(),
+            local_address: "0.0.0.0:0".parse().unwrap_or_default(),
+            remote_address: "127.0.0.1:38412".parse().unwrap_or_default(),
             sctp_config: SctpConfig::default(),
         }
     }

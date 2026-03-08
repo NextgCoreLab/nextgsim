@@ -1323,6 +1323,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "log",
  "nextgsim-agent",
  "nextgsim-common",
  "nextgsim-crypto",
@@ -1342,6 +1343,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 

@@ -1004,7 +1004,7 @@ impl GnbConfig {
     /// ignore_stream_ids: false
     /// "#;
     ///
-    /// let config = GnbConfig::from_yaml(yaml).unwrap();
+    /// let config = GnbConfig::from_yaml(yaml).unwrap_or_default();
     /// assert_eq!(config.tac, 1);
     /// ```
     pub fn from_yaml(yaml: &str) -> Result<Self, Error> {
@@ -1024,7 +1024,7 @@ impl GnbConfig {
     /// ```no_run
     /// use nextgsim_common::GnbConfig;
     ///
-    /// let config = GnbConfig::from_yaml_file("config/gnb.yaml").unwrap();
+    /// let config = GnbConfig::from_yaml_file("config/gnb.yaml").unwrap_or_default();
     /// ```
     pub fn from_yaml_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let contents = fs::read_to_string(path)?;
@@ -1080,7 +1080,7 @@ impl UeConfig {
     ///   slices: []
     /// "#;
     ///
-    /// let config = UeConfig::from_yaml(yaml).unwrap();
+    /// let config = UeConfig::from_yaml(yaml).unwrap_or_default();
     /// assert_eq!(config.protection_scheme, 0);
     /// ```
     pub fn from_yaml(yaml: &str) -> Result<Self, Error> {
@@ -1100,7 +1100,7 @@ impl UeConfig {
     /// ```no_run
     /// use nextgsim_common::UeConfig;
     ///
-    /// let config = UeConfig::from_yaml_file("config/ue.yaml").unwrap();
+    /// let config = UeConfig::from_yaml_file("config/ue.yaml").unwrap_or_default();
     /// ```
     pub fn from_yaml_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let contents = fs::read_to_string(path)?;

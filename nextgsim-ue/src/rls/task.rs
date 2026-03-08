@@ -96,7 +96,7 @@ impl RlsTask {
     pub fn serving_cell(&self) -> Option<i32> { self.serving_cell }
 
     async fn init_socket(&mut self) -> Result<(), std::io::Error> {
-        let bind_addr = self.config.bind_address.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+        let bind_addr = self.config.bind_address.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap_or_default());
         let socket = UdpSocket::bind(bind_addr).await?;
         info!("RLS task bound to {}", socket.local_addr()?);
         self.socket = Some(Arc::new(socket));

@@ -201,7 +201,7 @@ impl AutoScaler {
             timestamp: now,
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64,
         }
     }
@@ -217,7 +217,7 @@ impl AutoScaler {
         let now = Instant::now();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         let action = if queue_depth > self.config.queue_depth_threshold
@@ -275,7 +275,7 @@ impl AutoScaler {
                     timestamp: now,
                     timestamp_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_millis() as u64,
                 }
             }

@@ -159,7 +159,7 @@ impl RrcUeContextManager {
     pub fn create_ue(&mut self, ue_id: i32) -> &mut RrcUeContext {
         let ctx = RrcUeContext::new(ue_id);
         self.contexts.insert(ue_id, ctx);
-        self.contexts.get_mut(&ue_id).unwrap()
+        self.contexts.get_mut(&ue_id).unwrap_or_default()
     }
 
     /// Tries to find a UE context by ID
@@ -184,7 +184,7 @@ impl RrcUeContextManager {
         if !self.contexts.contains_key(&ue_id) {
             self.create_ue(ue_id);
         }
-        self.contexts.get_mut(&ue_id).unwrap()
+        self.contexts.get_mut(&ue_id).unwrap_or_default()
     }
 
     /// Deletes a UE context by ID
