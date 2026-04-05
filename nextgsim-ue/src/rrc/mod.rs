@@ -42,6 +42,8 @@
 pub mod cell_selection;
 pub mod handover;
 pub mod measurement;
+pub mod reestablishment;
+pub mod resume;
 pub mod state;
 pub mod task;
 pub mod redcap;
@@ -69,4 +71,14 @@ pub use redcap::{
 pub use uav::{
     UavIdentity, UavAuthorizationState, GeoPosition, FlightWaypoint, FlightPathConfig,
     RemoteIdBroadcast, C2LinkQuality, UavRegistrationContext,
+};
+pub use reestablishment::{
+    ReestablishmentCompleteParams, ReestablishmentError, ReestablishmentProcedure,
+    ReestablishmentRequestParams, ReestablishmentState, ReestablishmentTrigger,
+    RlfDetector,
+    N310_DEFAULT, N311_DEFAULT, T301_DEFAULT_MS, T311_DEFAULT_MS,
+};
+pub use resume::{
+    ResumeCause, ResumeCompleteParams, ResumeError, ResumeProcedure,
+    ResumeProcedureState, ResumeRequestParams, T319_DEFAULT_MS,
 };

@@ -22,8 +22,14 @@
 //!
 //! Based on UERANSIM's `src/ue/nas/mm/` implementation.
 
+mod config_update;
 mod deregistration;
+mod emergency;
+mod service_request;
 mod state;
 
+pub use config_update::*;
 pub use deregistration::*;
+pub use emergency::*;
+pub use service_request::*;
 pub use state::*;

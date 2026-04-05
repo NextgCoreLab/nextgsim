@@ -1508,7 +1508,6 @@ dependencies = [
  "ndarray 0.15.6",
  "nextgsim-ai",
  "nextgsim-common",
- "ort",
  "rand 0.8.5",
  "serde",
  "serde_json",

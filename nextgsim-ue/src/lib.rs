@@ -49,9 +49,22 @@ pub use timer::{GprsTimer2, GprsTimer3, GprsTimer3Unit, UeTimer};
 
 // Re-export NAS types
 pub use nas::mm::{
+    // Deregistration
     DeregistrationCause, DeregistrationProcedure, DeregistrationProcedureError,
-    MmState, MmSubState, NetworkDeregistrationResult, ProcedureResult, RmState, UpdateStatus,
+    NetworkDeregistrationResult, ProcedureResult,
     T3521_CODE, T3521_DEFAULT_INTERVAL_SECS, T3521_MAX_RETRANSMISSION,
+    // States
+    MmState, MmSubState, RmState, UpdateStatus,
+    // Emergency registration
+    EmergencyRegistrationError, EmergencyRegistrationProcedure,
+    T3510_CODE, T3510_DEFAULT_INTERVAL_SECS, T3510_MAX_RETRANSMISSION,
+    // Configuration update
+    ConfigUpdateError, ConfigUpdateProcedure, ConfigUpdateResult,
+    ConfigurationUpdateCommand, ConfigurationUpdateComplete,
+    // Service request
+    ServiceAcceptResult, ServiceRejectResult, ServiceRequestCause,
+    ServiceRequestError, ServiceRequestProcedure,
+    T3517_CODE, T3517_DEFAULT_INTERVAL_SECS, T3517_MAX_RETRANSMISSION,
 };
 
 // Re-export SM types
@@ -62,7 +75,16 @@ pub use nas::sm::{
 };
 
 // Re-export RRC types
-pub use rrc::{RrcState, RrcStateMachine, RrcStateTransition, RrcStateError, RrcTask};
+pub use rrc::{
+    RrcState, RrcStateMachine, RrcStateTransition, RrcStateError, RrcTask,
+    // Re-establishment
+    ReestablishmentCompleteParams, ReestablishmentError, ReestablishmentProcedure,
+    ReestablishmentRequestParams, ReestablishmentState, ReestablishmentTrigger,
+    RlfDetector, N310_DEFAULT, N311_DEFAULT, T301_DEFAULT_MS, T311_DEFAULT_MS,
+    // Resume
+    ResumeCause, ResumeCompleteParams, ResumeError, ResumeProcedure,
+    ResumeProcedureState, ResumeRequestParams, T319_DEFAULT_MS,
+};
 
 // Re-export RLS types
 pub use rls::{RlsTask, RlsTaskConfig, DEFAULT_RLS_PORT};
