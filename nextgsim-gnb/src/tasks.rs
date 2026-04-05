@@ -41,50 +41,7 @@ use nextgsim_rls::RrcChannel;
 // Task Message Envelope
 // ============================================================================
 
-/// Task message envelope wrapping typed messages with control signals.
-///
-/// This enum provides a uniform way to send messages to tasks while also
-/// supporting graceful shutdown signaling.
-#[derive(Debug)]
-pub enum TaskMessage<T> {
-    /// Regular message payload
-    Message(T),
-    /// Shutdown signal - task should terminate gracefully
-    Shutdown,
-}
-
-impl<T> TaskMessage<T> {
-    /// Creates a new message envelope containing the given payload.
-    pub fn message(msg: T) -> Self {
-        TaskMessage::Message(msg)
-    }
-
-    /// Creates a shutdown signal.
-    pub fn shutdown() -> Self {
-        TaskMessage::Shutdown
-    }
-
-    /// Returns true if this is a shutdown signal.
-    pub fn is_shutdown(&self) -> bool {
-        matches!(self, TaskMessage::Shutdown)
-    }
-
-    /// Unwraps the message payload, panicking if this is a shutdown signal.
-    pub fn unwrap(self) -> T {
-        match self {
-            TaskMessage::Message(msg) => msg,
-            TaskMessage::Shutdown => panic!("called unwrap on Shutdown"),
-        }
-    }
-
-    /// Returns the message payload if present, or None for shutdown.
-    pub fn into_message(self) -> Option<T> {
-        match self {
-            TaskMessage::Message(msg) => Some(msg),
-            TaskMessage::Shutdown => None,
-        }
-    }
-}
+pub use nextgsim_common::TaskMessage;
 
 // ============================================================================
 // Task Lifecycle State

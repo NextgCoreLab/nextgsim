@@ -146,31 +146,7 @@ use std::collections::VecDeque;
 // Core data types (backward-compatible with original API)
 // ---------------------------------------------------------------------------
 
-/// 3D position vector
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct Vector3 {
-    /// X coordinate
-    pub x: f64,
-    /// Y coordinate
-    pub y: f64,
-    /// Z coordinate
-    pub z: f64,
-}
-
-impl Vector3 {
-    /// Creates a new Vector3
-    pub fn new(x: f64, y: f64, z: f64) -> Self {
-        Self { x, y, z }
-    }
-
-    /// Calculates distance to another point
-    pub fn distance_to(&self, other: &Vector3) -> f64 {
-        let dx = self.x - other.x;
-        let dy = self.y - other.y;
-        let dz = self.z - other.z;
-        (dx * dx + dy * dy + dz * dz).sqrt()
-    }
-}
+pub use nextgsim_common::Vector3;
 
 /// UE measurement data
 #[derive(Debug, Clone, Serialize, Deserialize)]

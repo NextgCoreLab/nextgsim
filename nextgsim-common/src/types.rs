@@ -915,6 +915,44 @@ impl SubThzConfig {
     }
 }
 
+// ============================================================================
+// Shared Geometry Types
+// ============================================================================
+
+/// 3D position/velocity vector using floating-point coordinates.
+///
+/// Used across ISAC, NWDAF, and other crates for sensing, tracking,
+/// and positioning computations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Vector3 {
+    /// X coordinate (meters)
+    pub x: f64,
+    /// Y coordinate (meters)
+    pub y: f64,
+    /// Z coordinate (meters)
+    pub z: f64,
+}
+
+impl Vector3 {
+    /// Creates a new Vector3 with the given coordinates.
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Calculates the Euclidean distance to another point.
+    pub fn distance_to(&self, other: &Vector3) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    /// Calculates the magnitude (length) of this vector.
+    pub fn magnitude(&self) -> f64 {
+        (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+    }
+}
+
 /// Energy efficiency profile for network entities (TR 21.916 6G ext).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnergyProfile {
@@ -982,6 +1020,55 @@ impl EnergyProfile {
     /// Returns true if any energy-saving feature is active.
     pub fn is_saving_active(&self) -> bool {
         !self.saving_features.is_empty() || self.sleep_state != SleepState::Active
+    }
+}
+
+// ============================================================================
+// Task Message Envelope
+// ============================================================================
+
+/// Task message envelope wrapping typed messages with control signals.
+///
+/// This enum provides a uniform way to send messages to tasks while also
+/// supporting graceful shutdown signaling.
+#[derive(Debug)]
+pub enum TaskMessage<T> {
+    /// Regular message payload
+    Message(T),
+    /// Shutdown signal — task should terminate gracefully
+    Shutdown,
+}
+
+impl<T> TaskMessage<T> {
+    /// Creates a new message envelope containing the given payload.
+    pub fn message(msg: T) -> Self {
+        TaskMessage::Message(msg)
+    }
+
+    /// Creates a shutdown signal.
+    pub fn shutdown() -> Self {
+        TaskMessage::Shutdown
+    }
+
+    /// Returns true if this is a shutdown signal.
+    pub fn is_shutdown(&self) -> bool {
+        matches!(self, TaskMessage::Shutdown)
+    }
+
+    /// Unwraps the message payload, panicking if this is a shutdown signal.
+    pub fn unwrap(self) -> T {
+        match self {
+            TaskMessage::Message(msg) => msg,
+            TaskMessage::Shutdown => panic!("called unwrap on Shutdown"),
+        }
+    }
+
+    /// Returns the message payload if present, or None for shutdown.
+    pub fn into_message(self) -> Option<T> {
+        match self {
+            TaskMessage::Message(msg) => Some(msg),
+            TaskMessage::Shutdown => None,
+        }
     }
 }
 
