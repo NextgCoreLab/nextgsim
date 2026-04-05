@@ -116,14 +116,19 @@ pub enum TaskId {
     // 6G AI-native network function tasks
     // ========================================================================
     /// SHE Client - Service Hosting Environment client for edge inference
+    #[cfg(feature = "nextgsim-she")]
     SheClient,
     /// NWDAF Reporter - Reports measurements and receives analytics
+    #[cfg(feature = "nextgsim-nwdaf")]
     NwdafReporter,
     /// ISAC Sensor - Integrated Sensing and Communication data collection
+    #[cfg(feature = "nextgsim-isac")]
     IsacSensor,
     /// FL Participant - Federated Learning local training participant
+    #[cfg(feature = "nextgsim-fl")]
     FlParticipant,
     /// Semantic Codec - Semantic communication encoder/decoder
+    #[cfg(feature = "nextgsim-semantic")]
     SemanticCodec,
 
     // ========================================================================
@@ -145,10 +150,15 @@ impl std::fmt::Display for TaskId {
             TaskId::Rrc => write!(f, "RRC"),
             TaskId::Rls => write!(f, "RLS"),
             // 6G AI-native network function tasks
+            #[cfg(feature = "nextgsim-she")]
             TaskId::SheClient => write!(f, "SHE-Client"),
+            #[cfg(feature = "nextgsim-nwdaf")]
             TaskId::NwdafReporter => write!(f, "NWDAF-Reporter"),
+            #[cfg(feature = "nextgsim-isac")]
             TaskId::IsacSensor => write!(f, "ISAC-Sensor"),
+            #[cfg(feature = "nextgsim-fl")]
             TaskId::FlParticipant => write!(f, "FL-Participant"),
+            #[cfg(feature = "nextgsim-semantic")]
             TaskId::SemanticCodec => write!(f, "Semantic-Codec"),
             // Rel-18 5G-Advanced tasks
             TaskId::Ranging => write!(f, "Ranging"),
@@ -469,6 +479,7 @@ pub enum RrcMessage {
     // ========================================================================
 
     /// AI/ML inference request (route to SHE Client)
+    #[cfg(feature = "nextgsim-she")]
     SixgInferenceRequest {
         /// Model identifier
         model_id: String,
@@ -476,6 +487,7 @@ pub enum RrcMessage {
         input_data: Vec<f32>,
     },
     /// ISAC sensing measurement (route to ISAC Sensor)
+    #[cfg(feature = "nextgsim-isac")]
     SixgSensingMeasurement {
         /// Measurement type
         measurement_type: String,
@@ -483,6 +495,7 @@ pub enum RrcMessage {
         measurements: Vec<f32>,
     },
     /// Semantic communication data (route to Semantic Codec)
+    #[cfg(feature = "nextgsim-semantic")]
     SixgSemanticData {
         /// Content type identifier
         content_type: String,
@@ -603,6 +616,7 @@ pub enum RlsMessage {
 /// Messages for the SHE Client task.
 ///
 /// Handles edge inference requests and workload offloading from the UE.
+#[cfg(feature = "nextgsim-she")]
 #[derive(Debug)]
 pub enum SheClientMessage {
     /// Request inference at the edge
@@ -640,6 +654,7 @@ pub enum SheClientMessage {
 }
 
 /// Response from SHE Client operations.
+#[cfg(feature = "nextgsim-she")]
 #[derive(Debug)]
 pub enum SheClientResponse {
     /// Inference completed successfully
@@ -670,6 +685,7 @@ pub enum SheClientResponse {
 /// Messages for the NWDAF Reporter task.
 ///
 /// Reports UE measurements to NWDAF and receives analytics/predictions.
+#[cfg(feature = "nextgsim-nwdaf")]
 #[derive(Debug)]
 pub enum NwdafReporterMessage {
     /// Report radio measurement to NWDAF
@@ -720,6 +736,7 @@ pub enum NwdafReporterMessage {
 }
 
 /// Neighbor cell measurement report.
+#[cfg(feature = "nextgsim-nwdaf")]
 #[derive(Debug, Clone)]
 pub struct NeighborMeasurementReport {
     /// Cell ID
@@ -731,6 +748,7 @@ pub struct NeighborMeasurementReport {
 }
 
 /// Response from NWDAF Reporter operations.
+#[cfg(feature = "nextgsim-nwdaf")]
 #[derive(Debug)]
 pub enum NwdafReporterResponse {
     /// Trajectory prediction result
@@ -757,6 +775,7 @@ pub enum NwdafReporterResponse {
 /// Messages for the ISAC Sensor task.
 ///
 /// Collects sensing data for Integrated Sensing and Communication.
+#[cfg(feature = "nextgsim-isac")]
 #[derive(Debug)]
 pub enum IsacSensorMessage {
     /// Start sensing with given configuration
@@ -792,6 +811,7 @@ pub enum IsacSensorMessage {
 }
 
 /// ISAC sensing configuration.
+#[cfg(feature = "nextgsim-isac")]
 #[derive(Debug, Clone)]
 pub struct IsacSensingConfig {
     /// Sensing mode
@@ -807,6 +827,7 @@ pub struct IsacSensingConfig {
 }
 
 /// ISAC sensing mode.
+#[cfg(feature = "nextgsim-isac")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsacSensingMode {
     /// Passive sensing (listen only)
@@ -818,6 +839,7 @@ pub enum IsacSensingMode {
 }
 
 /// ISAC measurement type.
+#[cfg(feature = "nextgsim-isac")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsacMeasurementType {
     /// Time of Arrival
@@ -833,6 +855,7 @@ pub enum IsacMeasurementType {
 }
 
 /// Response from ISAC Sensor operations.
+#[cfg(feature = "nextgsim-isac")]
 #[derive(Debug)]
 pub enum IsacSensorResponse {
     /// Fused position estimate
@@ -858,6 +881,7 @@ pub enum IsacSensorResponse {
 /// Messages for the FL Participant task.
 ///
 /// Handles local model training and updates for Federated Learning.
+#[cfg(feature = "nextgsim-fl")]
 #[derive(Debug)]
 pub enum FlParticipantMessage {
     /// Receive global model from aggregator
@@ -899,6 +923,7 @@ pub enum FlParticipantMessage {
 }
 
 /// FL training configuration for local participant.
+#[cfg(feature = "nextgsim-fl")]
 #[derive(Debug, Clone)]
 pub struct FlTrainingConfig {
     /// Number of local epochs
@@ -915,6 +940,7 @@ pub struct FlTrainingConfig {
     pub max_grad_norm: f32,
 }
 
+#[cfg(feature = "nextgsim-fl")]
 impl Default for FlTrainingConfig {
     fn default() -> Self {
         Self {
@@ -929,6 +955,7 @@ impl Default for FlTrainingConfig {
 }
 
 /// Response from FL Participant operations.
+#[cfg(feature = "nextgsim-fl")]
 #[derive(Debug)]
 pub enum FlParticipantResponse {
     /// Training completed, update ready
@@ -970,6 +997,7 @@ pub enum FlParticipantResponse {
 /// Messages for the Semantic Codec task.
 ///
 /// Handles semantic encoding/decoding for task-oriented communication.
+#[cfg(feature = "nextgsim-semantic")]
 #[derive(Debug)]
 pub enum SemanticCodecMessage {
     /// Encode data for transmission
@@ -1020,6 +1048,7 @@ pub enum SemanticCodecMessage {
 }
 
 /// Semantic task type for encoding/decoding.
+#[cfg(feature = "nextgsim-semantic")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticTaskType {
     /// Image classification
@@ -1039,6 +1068,7 @@ pub enum SemanticTaskType {
 }
 
 /// Channel quality information for adaptive encoding.
+#[cfg(feature = "nextgsim-semantic")]
 #[derive(Debug, Clone)]
 pub struct ChannelQualityInfo {
     /// Signal-to-noise ratio (dB)
@@ -1050,6 +1080,7 @@ pub struct ChannelQualityInfo {
 }
 
 /// Response from Semantic Codec operations.
+#[cfg(feature = "nextgsim-semantic")]
 #[derive(Debug)]
 pub enum SemanticCodecResponse {
     /// Encoding completed
@@ -1316,32 +1347,63 @@ pub struct UeTaskBase {
     /// Handle to the RLS task
     pub rls_tx: TaskHandle<RlsMessage>,
     /// 6G task handles (initialized via `init_6g_tasks()`)
+    #[cfg(any(
+        feature = "nextgsim-she",
+        feature = "nextgsim-nwdaf",
+        feature = "nextgsim-isac",
+        feature = "nextgsim-fl",
+        feature = "nextgsim-semantic",
+    ))]
     pub sixg: Option<UeSixgHandles>,
     /// Rel-18 task handles (initialized via `init_rel18_tasks()`)
     pub rel18: Option<UeRel18Handles>,
 }
 
 /// 6G task handles for UE (Rel-20 extensions)
+#[cfg(any(
+    feature = "nextgsim-she",
+    feature = "nextgsim-nwdaf",
+    feature = "nextgsim-isac",
+    feature = "nextgsim-fl",
+    feature = "nextgsim-semantic",
+))]
 #[derive(Clone)]
 pub struct UeSixgHandles {
     /// Handle to the SHE Client (edge inference/offloading) task
+    #[cfg(feature = "nextgsim-she")]
     pub she_client_tx: TaskHandle<SheClientMessage>,
     /// Handle to the NWDAF Reporter (analytics reporting) task
+    #[cfg(feature = "nextgsim-nwdaf")]
     pub nwdaf_reporter_tx: TaskHandle<NwdafReporterMessage>,
     /// Handle to the ISAC Sensor (sensing and communication) task
+    #[cfg(feature = "nextgsim-isac")]
     pub isac_sensor_tx: TaskHandle<IsacSensorMessage>,
     /// Handle to the FL Participant (federated learning) task
+    #[cfg(feature = "nextgsim-fl")]
     pub fl_participant_tx: TaskHandle<FlParticipantMessage>,
     /// Handle to the Semantic Codec (task-oriented communication) task
+    #[cfg(feature = "nextgsim-semantic")]
     pub semantic_codec_tx: TaskHandle<SemanticCodecMessage>,
 }
 
 /// 6G task receivers for UE
+#[cfg(any(
+    feature = "nextgsim-she",
+    feature = "nextgsim-nwdaf",
+    feature = "nextgsim-isac",
+    feature = "nextgsim-fl",
+    feature = "nextgsim-semantic",
+))]
 pub struct UeSixgReceivers {
+    #[cfg(feature = "nextgsim-she")]
     pub she_client_rx: mpsc::Receiver<TaskMessage<SheClientMessage>>,
+    #[cfg(feature = "nextgsim-nwdaf")]
     pub nwdaf_reporter_rx: mpsc::Receiver<TaskMessage<NwdafReporterMessage>>,
+    #[cfg(feature = "nextgsim-isac")]
     pub isac_sensor_rx: mpsc::Receiver<TaskMessage<IsacSensorMessage>>,
+    #[cfg(feature = "nextgsim-fl")]
     pub fl_participant_rx: mpsc::Receiver<TaskMessage<FlParticipantMessage>>,
+    #[cfg(feature = "nextgsim-semantic")]
     pub semantic_codec_rx: mpsc::Receiver<TaskMessage<SemanticCodecMessage>>,
 }
 
@@ -1389,6 +1451,13 @@ impl UeTaskBase {
             nas_tx: TaskHandle::new(nas_tx),
             rrc_tx: TaskHandle::new(rrc_tx),
             rls_tx: TaskHandle::new(rls_tx),
+            #[cfg(any(
+                feature = "nextgsim-she",
+                feature = "nextgsim-nwdaf",
+                feature = "nextgsim-isac",
+                feature = "nextgsim-fl",
+                feature = "nextgsim-semantic",
+            ))]
             sixg: None,
             rel18: None,
         };
@@ -1401,26 +1470,48 @@ impl UeTaskBase {
     /// Call this after `new()` to enable 6G tasks (SHE Client, NWDAF Reporter,
     /// ISAC Sensor, FL Participant, Semantic Codec).
     /// The returned receivers should be used to spawn the 6G task loops.
+    #[cfg(any(
+        feature = "nextgsim-she",
+        feature = "nextgsim-nwdaf",
+        feature = "nextgsim-isac",
+        feature = "nextgsim-fl",
+        feature = "nextgsim-semantic",
+    ))]
     pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> UeSixgReceivers {
+        #[cfg(feature = "nextgsim-she")]
         let (she_client_tx, she_client_rx) = mpsc::channel(channel_capacity);
+        #[cfg(feature = "nextgsim-nwdaf")]
         let (nwdaf_reporter_tx, nwdaf_reporter_rx) = mpsc::channel(channel_capacity);
+        #[cfg(feature = "nextgsim-isac")]
         let (isac_sensor_tx, isac_sensor_rx) = mpsc::channel(channel_capacity);
+        #[cfg(feature = "nextgsim-fl")]
         let (fl_participant_tx, fl_participant_rx) = mpsc::channel(channel_capacity);
+        #[cfg(feature = "nextgsim-semantic")]
         let (semantic_codec_tx, semantic_codec_rx) = mpsc::channel(channel_capacity);
 
         self.sixg = Some(UeSixgHandles {
+            #[cfg(feature = "nextgsim-she")]
             she_client_tx: TaskHandle::new(she_client_tx),
+            #[cfg(feature = "nextgsim-nwdaf")]
             nwdaf_reporter_tx: TaskHandle::new(nwdaf_reporter_tx),
+            #[cfg(feature = "nextgsim-isac")]
             isac_sensor_tx: TaskHandle::new(isac_sensor_tx),
+            #[cfg(feature = "nextgsim-fl")]
             fl_participant_tx: TaskHandle::new(fl_participant_tx),
+            #[cfg(feature = "nextgsim-semantic")]
             semantic_codec_tx: TaskHandle::new(semantic_codec_tx),
         });
 
         UeSixgReceivers {
+            #[cfg(feature = "nextgsim-she")]
             she_client_rx,
+            #[cfg(feature = "nextgsim-nwdaf")]
             nwdaf_reporter_rx,
+            #[cfg(feature = "nextgsim-isac")]
             isac_sensor_rx,
+            #[cfg(feature = "nextgsim-fl")]
             fl_participant_rx,
+            #[cfg(feature = "nextgsim-semantic")]
             semantic_codec_rx,
         }
     }
@@ -1454,11 +1545,23 @@ impl UeTaskBase {
         let _ = self.rrc_tx.shutdown().await;
         let _ = self.rls_tx.shutdown().await;
         // 6G tasks (if initialized)
+        #[cfg(any(
+            feature = "nextgsim-she",
+            feature = "nextgsim-nwdaf",
+            feature = "nextgsim-isac",
+            feature = "nextgsim-fl",
+            feature = "nextgsim-semantic",
+        ))]
         if let Some(ref sixg) = self.sixg {
+            #[cfg(feature = "nextgsim-she")]
             let _ = sixg.she_client_tx.shutdown().await;
+            #[cfg(feature = "nextgsim-nwdaf")]
             let _ = sixg.nwdaf_reporter_tx.shutdown().await;
+            #[cfg(feature = "nextgsim-isac")]
             let _ = sixg.isac_sensor_tx.shutdown().await;
+            #[cfg(feature = "nextgsim-fl")]
             let _ = sixg.fl_participant_tx.shutdown().await;
+            #[cfg(feature = "nextgsim-semantic")]
             let _ = sixg.semantic_codec_tx.shutdown().await;
         }
         // Rel-18 tasks (if initialized)
@@ -1546,33 +1649,39 @@ impl TaskManager {
 
         // Initialize task states
         let mut task_states = HashMap::new();
-        for task_id in [
-            TaskId::App,
-            TaskId::Nas,
-            TaskId::Rrc,
-            TaskId::Rls,
-            // 6G AI-native network function tasks
-            TaskId::SheClient,
-            TaskId::NwdafReporter,
-            TaskId::IsacSensor,
-            TaskId::FlParticipant,
-            TaskId::SemanticCodec,
-            // Rel-18 5G-Advanced tasks
-            TaskId::Ranging,
-            TaskId::Mint,
-            TaskId::Sidelink,
-        ] {
-            task_states.insert(
-                task_id,
-                TaskInfo {
-                    id: task_id,
-                    state: TaskState::Created,
-                    started_at: None,
-                    stopped_at: None,
-                    error: None,
-                },
-            );
+        macro_rules! register_task {
+            ($id:expr) => {
+                task_states.insert(
+                    $id,
+                    TaskInfo {
+                        id: $id,
+                        state: TaskState::Created,
+                        started_at: None,
+                        stopped_at: None,
+                        error: None,
+                    },
+                );
+            };
         }
+        register_task!(TaskId::App);
+        register_task!(TaskId::Nas);
+        register_task!(TaskId::Rrc);
+        register_task!(TaskId::Rls);
+        // 6G AI-native network function tasks
+        #[cfg(feature = "nextgsim-she")]
+        register_task!(TaskId::SheClient);
+        #[cfg(feature = "nextgsim-nwdaf")]
+        register_task!(TaskId::NwdafReporter);
+        #[cfg(feature = "nextgsim-isac")]
+        register_task!(TaskId::IsacSensor);
+        #[cfg(feature = "nextgsim-fl")]
+        register_task!(TaskId::FlParticipant);
+        #[cfg(feature = "nextgsim-semantic")]
+        register_task!(TaskId::SemanticCodec);
+        // Rel-18 5G-Advanced tasks
+        register_task!(TaskId::Ranging);
+        register_task!(TaskId::Mint);
+        register_task!(TaskId::Sidelink);
 
         let manager = Self {
             task_base,
@@ -1905,10 +2014,15 @@ mod tests {
         assert_eq!(format!("{}", TaskId::Rrc), "RRC");
         assert_eq!(format!("{}", TaskId::Rls), "RLS");
         // 6G AI-native network function tasks
+        #[cfg(feature = "nextgsim-she")]
         assert_eq!(format!("{}", TaskId::SheClient), "SHE-Client");
+        #[cfg(feature = "nextgsim-nwdaf")]
         assert_eq!(format!("{}", TaskId::NwdafReporter), "NWDAF-Reporter");
+        #[cfg(feature = "nextgsim-isac")]
         assert_eq!(format!("{}", TaskId::IsacSensor), "ISAC-Sensor");
+        #[cfg(feature = "nextgsim-fl")]
         assert_eq!(format!("{}", TaskId::FlParticipant), "FL-Participant");
+        #[cfg(feature = "nextgsim-semantic")]
         assert_eq!(format!("{}", TaskId::SemanticCodec), "Semantic-Codec");
     }
 
@@ -1924,10 +2038,15 @@ mod tests {
         assert_eq!(manager.get_task_state(TaskId::Rrc), Some(TaskState::Created));
         assert_eq!(manager.get_task_state(TaskId::Rls), Some(TaskState::Created));
         // 6G AI-native network function tasks
+        #[cfg(feature = "nextgsim-she")]
         assert_eq!(manager.get_task_state(TaskId::SheClient), Some(TaskState::Created));
+        #[cfg(feature = "nextgsim-nwdaf")]
         assert_eq!(manager.get_task_state(TaskId::NwdafReporter), Some(TaskState::Created));
+        #[cfg(feature = "nextgsim-isac")]
         assert_eq!(manager.get_task_state(TaskId::IsacSensor), Some(TaskState::Created));
+        #[cfg(feature = "nextgsim-fl")]
         assert_eq!(manager.get_task_state(TaskId::FlParticipant), Some(TaskState::Created));
+        #[cfg(feature = "nextgsim-semantic")]
         assert_eq!(manager.get_task_state(TaskId::SemanticCodec), Some(TaskState::Created));
     }
 
@@ -1975,22 +2094,22 @@ mod tests {
         assert!(!manager.all_tasks_running());
 
         // Start all tasks
-        for task_id in [
-            TaskId::App,
-            TaskId::Nas,
-            TaskId::Rrc,
-            TaskId::Rls,
-            // 6G AI-native network function tasks
-            TaskId::SheClient,
-            TaskId::NwdafReporter,
-            TaskId::IsacSensor,
-            TaskId::FlParticipant,
-            TaskId::SemanticCodec,
-            // Rel-18 5G-Advanced tasks
-            TaskId::Ranging,
-            TaskId::Mint,
-            TaskId::Sidelink,
-        ] {
+        for task_id in [TaskId::App, TaskId::Nas, TaskId::Rrc, TaskId::Rls] {
+            manager.mark_task_started(task_id);
+        }
+        // 6G AI-native network function tasks
+        #[cfg(feature = "nextgsim-she")]
+        manager.mark_task_started(TaskId::SheClient);
+        #[cfg(feature = "nextgsim-nwdaf")]
+        manager.mark_task_started(TaskId::NwdafReporter);
+        #[cfg(feature = "nextgsim-isac")]
+        manager.mark_task_started(TaskId::IsacSensor);
+        #[cfg(feature = "nextgsim-fl")]
+        manager.mark_task_started(TaskId::FlParticipant);
+        #[cfg(feature = "nextgsim-semantic")]
+        manager.mark_task_started(TaskId::SemanticCodec);
+        // Rel-18 5G-Advanced tasks
+        for task_id in [TaskId::Ranging, TaskId::Mint, TaskId::Sidelink] {
             manager.mark_task_started(task_id);
         }
 
@@ -2017,8 +2136,15 @@ mod tests {
         manager.mark_task_started(TaskId::Nas);
 
         let summary = manager.status_summary();
-        // 4 core tasks + 5 AI tasks + 3 Rel-18 tasks = 12 total
-        assert_eq!(summary.len(), 12);
+        // 4 core tasks + 3 Rel-18 tasks + however many 6G features are enabled
+        let expected_6g: usize = [
+            cfg!(feature = "nextgsim-she"),
+            cfg!(feature = "nextgsim-nwdaf"),
+            cfg!(feature = "nextgsim-isac"),
+            cfg!(feature = "nextgsim-fl"),
+            cfg!(feature = "nextgsim-semantic"),
+        ].iter().filter(|&&x| x).count();
+        assert_eq!(summary.len(), 4 + 3 + expected_6g);
 
         // Find App and Nas in summary
         let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);

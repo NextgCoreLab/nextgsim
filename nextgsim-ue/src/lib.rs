@@ -22,10 +22,15 @@ pub mod timer;
 pub mod tun;
 
 // 6G AI-native network function client modules
+#[cfg(feature = "nextgsim-she")]
 pub mod she_client;
+#[cfg(feature = "nextgsim-nwdaf")]
 pub mod nwdaf_reporter;
+#[cfg(feature = "nextgsim-isac")]
 pub mod isac_sensor;
+#[cfg(feature = "nextgsim-fl")]
 pub mod fl_participant;
+#[cfg(feature = "nextgsim-semantic")]
 pub mod semantic_codec;
 
 // Rel-18 5G-Advanced modules
@@ -82,8 +87,13 @@ pub use tun::{
 };
 
 // Re-export 6G AI-native network function task types
+#[cfg(feature = "nextgsim-she")]
 pub use she_client::SheClientTask;
+#[cfg(feature = "nextgsim-nwdaf")]
 pub use nwdaf_reporter::NwdafReporterTask;
+#[cfg(feature = "nextgsim-isac")]
 pub use isac_sensor::IsacSensorTask;
+#[cfg(feature = "nextgsim-fl")]
 pub use fl_participant::FlParticipantTask;
+#[cfg(feature = "nextgsim-semantic")]
 pub use semantic_codec::SemanticCodecTask;

@@ -24,9 +24,14 @@ use crate::rrc::handover::{
 use crate::rrc::measurement::{MeasConfig, MeasurementManager, ReportTriggerType, MeasEventType, ReportTriggerConfig};
 use crate::rrc::state::{RrcState, RrcStateMachine};
 use crate::tasks::{
-    IsacSensorMessage, IsacMeasurementType, NasMessage, RlsMessage, RlfCause, RrcMessage,
-    SemanticCodecMessage, SemanticTaskType, SheClientMessage, Task, TaskMessage, UeTaskBase,
+    NasMessage, RlsMessage, RlfCause, RrcMessage, Task, TaskMessage, UeTaskBase,
 };
+#[cfg(feature = "nextgsim-she")]
+use crate::tasks::SheClientMessage;
+#[cfg(feature = "nextgsim-isac")]
+use crate::tasks::{IsacSensorMessage, IsacMeasurementType};
+#[cfg(feature = "nextgsim-semantic")]
+use crate::tasks::{SemanticCodecMessage, SemanticTaskType};
 use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
@@ -845,6 +850,7 @@ impl RrcTask {
     }
 
     /// Route AI/ML inference request to SHE Client task
+    #[cfg(feature = "nextgsim-she")]
     async fn route_6g_inference(&self, model_id: String, input_data: Vec<f32>) {
         if let Some(ref sixg) = self.task_base.sixg {
             let msg = SheClientMessage::InferenceRequest {
@@ -863,6 +869,7 @@ impl RrcTask {
     }
 
     /// Route sensing measurement to ISAC Sensor task
+    #[cfg(feature = "nextgsim-isac")]
     async fn route_6g_sensing(&self, measurement_type: String, measurements: Vec<f32>) {
         if let Some(ref sixg) = self.task_base.sixg {
             let meas_type = match measurement_type.as_str() {
@@ -889,6 +896,7 @@ impl RrcTask {
     }
 
     /// Route semantic communication data to Semantic Codec task
+    #[cfg(feature = "nextgsim-semantic")]
     async fn route_6g_semantic(&self, content_type: String, data: Vec<u8>) {
         if let Some(ref sixg) = self.task_base.sixg {
             let task_type = match content_type.as_str() {
@@ -987,12 +995,15 @@ impl Task for RrcTask {
                                 });
                             }
                             // 6G message routing
+                            #[cfg(feature = "nextgsim-she")]
                             RrcMessage::SixgInferenceRequest { model_id, input_data } => {
                                 self.route_6g_inference(model_id, input_data).await;
                             }
+                            #[cfg(feature = "nextgsim-isac")]
                             RrcMessage::SixgSensingMeasurement { measurement_type, measurements } => {
                                 self.route_6g_sensing(measurement_type, measurements).await;
                             }
+                            #[cfg(feature = "nextgsim-semantic")]
                             RrcMessage::SixgSemanticData { content_type, data } => {
                                 self.route_6g_semantic(content_type, data).await;
                             }
