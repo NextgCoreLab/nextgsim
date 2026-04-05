@@ -55,3 +55,23 @@ jobs:
           components: rustfmt
       - name: cargo fmt
         run: cargo fmt --all -- --check
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build gNB image
+        run: |
+          docker build -f Dockerfile.gnb-local -t nextgsim/nr-gnb:latest .
+
+      - name: Build UE image
+        run: |
+          docker build -f Dockerfile.ue-local -t nextgsim/nr-ue:latest .
+
+      - name: Verify images
+        run: |
+          echo "Built images:"
+          docker images | grep nextgsim
