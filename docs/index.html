@@ -198,6 +198,21 @@
       </div>
     </div>
 
+    <!-- NAS/RRC Procedures -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">Extended NAS &amp; RRC Procedures</h3>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>NAS Procedures</h3>
+          <p><strong>Emergency registration</strong> — unauthenticated attach for emergency services. <strong>Configuration update</strong> — network-initiated UE parameter refresh (GUTI, TAI list, allowed NSSAI). <strong>Service request</strong> — UE-triggered transition from CM-IDLE to CM-CONNECTED for uplink data or paging response.</p>
+        </div>
+        <div class="feature-card">
+          <h3>RRC Procedures</h3>
+          <p><strong>RRC Re-establishment</strong> — RLF (Radio Link Failure) detection triggers re-establishment to the best neighbour cell; AS security re-keyed from stored NH/NCC. <strong>RRC Resume</strong> — UE transitions from RRC_INACTIVE to RRC_CONNECTED, resuming suspended context without full re-registration.</p>
+        </div>
+      </div>
+    </div>
+
     <!-- ISAC -->
     <div class="ai-feature-block">
       <h3 class="group-heading">ISAC — Integrated Sensing &amp; Communication (TR 22.837)</h3>
@@ -361,6 +376,25 @@
         </div>
       </div>
     </div>
+
+    <div class="features-grid" style="margin-top: 2rem;">
+      <div class="feature-card">
+        <h3>UE Feature Flags</h3>
+        <p>UE 6G modules (SHE, ISAC, Agent, FL, Semantic) are gated behind <code>cfg(feature)</code> Cargo flags. Omit the feature to get a lean 5G-only UE binary with no 6G overhead — useful for large-scale UE load tests.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Docker Compose</h3>
+        <p>A <code>docker-compose.yaml</code> is provided for full RAN simulator deployment. Brings up nr-gnb and nr-ue containers with pre-configured networking, ready to connect to a NextGCore AMF/UPF stack.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Config Feature Flags</h3>
+        <p>gNB config supports runtime 6G feature flags: <code>she_enabled</code>, <code>nwdaf_enabled</code>, <code>nkef_enabled</code>, <code>isac_enabled</code>, <code>agent_enabled</code>, <code>fl_enabled</code>, <code>energy_enabled</code>. Each flag controls whether the corresponding task is spawned at startup.</p>
+      </div>
+      <div class="feature-card">
+        <h3>ONNX Centralisation</h3>
+        <p><code>nextgsim-ai</code> is the sole workspace crate that depends on <code>ort</code> (ONNX Runtime). All other crates that need inference depend on <code>nextgsim-ai</code> — eliminating duplicate linking and binary size bloat.</p>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -415,17 +449,30 @@
       <p class="wf-desc">Seamless mobility with data forwarding during handover. Source gNB forwards buffered DL data to target via GTP tunnel. UE re-derives AS security keys from NH/NCC chain.</p>
     </div>
 
+    <h3 class="group-heading">6G Task Lifecycle — Runtime Spawn (gNB &amp; UE)</h3>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">Config</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">gnb.yaml flags: she_enabled, nwdaf_enabled, nkef_enabled, isac_enabled, agent_enabled, fl_enabled, energy_enabled</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB init</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB init</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Spawn 7 6G tasks at runtime: SheTask, NwdafTask, NkefTask, IsacTask, AgentTask, FlAggregatorTask, EnergyTask</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Task runtime</span></div>
+      <div class="workflow-step"><span class="wf-actor">Config</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">ue.yaml flags: she_enabled, isac_enabled, agent_enabled, fl_enabled, semantic_enabled (Cargo feature gates)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE init</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE init</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Spawn 5 6G tasks when features enabled: SheMobileTask, IsacUeTask, AgentUeTask, FlClientTask, SemanticTask</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Task runtime</span></div>
+      <div class="workflow-step"><span class="wf-actor">AgentTask</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Wired to AgentCoordinator: register() → submit_intent() → process()</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AgentCoordinator</span></div>
+      <div class="workflow-step"><span class="wf-actor">FlAggregatorTask</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Wired to FederatedAggregator: collect client updates → aggregate → distribute global model</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">FederatedAggregator</span></div>
+      <div class="workflow-step"><span class="wf-actor">IsacTask</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Sensing data processed via IsacManager → position estimates forwarded to NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">IsacManager</span></div>
+      <p class="wf-desc">6G tasks are spawned at runtime based on config flags — not compiled away. UE 6G modules are additionally gated behind Cargo <code>cfg(feature)</code> for lean builds without 6G overhead. Docker-compose is available for full RAN simulator deployment.</p>
+    </div>
+
     <h3 class="group-heading">ISAC Sensing + ML Positioning (6G)</h3>
     <div class="workflow-diagram">
       <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Configure OFDM-radar waveform (sensing subcarriers, PRS-like RS)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">RF Front-end</span></div>
       <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Transmit joint comm+sensing signal (shared spectrum, no guard band)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Air Interface</span></div>
       <div class="workflow-step"><span class="wf-actor">gNB Rx</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Collect echo: ToA, AoA, RSS, Doppler from reflected signals</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">ISAC Engine</span></div>
+      <div class="workflow-step"><span class="wf-actor">IsacTask</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Route sensing data through IsacManager for pipeline coordination</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">IsacManager</span></div>
       <div class="workflow-step"><span class="wf-actor">ISAC</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Feature extraction: range-Doppler map, angle spectrum, temporal features</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">ML Pipeline</span></div>
       <div class="workflow-step"><span class="wf-actor">ML</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">DeepPositioning CNN inference → (x, y, z) estimate with confidence</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Fusion</span></div>
       <div class="workflow-step"><span class="wf-actor">ML</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">TransformerTracking → velocity + trajectory prediction</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Fusion</span></div>
       <div class="workflow-step"><span class="wf-actor">Fusion</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">EKF + Bayesian sensor fusion → refined position (sub-meter accuracy)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
-      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Analytics event: UE_LOCATION update → beam management + HO prediction</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB / Agent</span></div>
-      <p class="wf-desc">Joint communication and sensing on shared 6G waveform. ISAC engine runs radar processing in parallel with data demodulation. ML models trained via federated learning across gNBs for environment-adaptive positioning.</p>
+      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Analytics event: UE_LOCATION update → handover recommendation to RRC task</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">RRC / Agent</span></div>
+      <p class="wf-desc">Joint communication and sensing on shared 6G waveform. IsacTask channels all sensing data through IsacManager. ISAC engine runs radar processing in parallel with data demodulation. NWDAF position analytics feed directly to the RRC task for predictive handover decisions. ML models trained via federated learning across gNBs.</p>
     </div>
 
     <h3 class="group-heading">Semantic Communication Pipeline (6G)</h3>
@@ -442,6 +489,7 @@
 
     <h3 class="group-heading">Federated Learning Round (6G)</h3>
     <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">FlAggregatorTask</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Wired to FederatedAggregator — drives round lifecycle: collect, aggregate, distribute</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">FederatedAggregator</span></div>
       <div class="workflow-step"><span class="wf-actor">FL Server</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Broadcast global model v(n) + training config (epochs, LR, batch)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Selected UEs</span></div>
       <div class="workflow-step"><span class="wf-actor">UEs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Local SGD training on private data (never leaves device)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Local Models</span></div>
       <div class="workflow-step"><span class="wf-actor">UEs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Differential privacy: add calibrated Gaussian noise (epsilon=1.0)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">DP Gradients</span></div>
@@ -456,15 +504,16 @@
 
     <h3 class="group-heading">Autonomous Agent Decision Loop (6G)</h3>
     <div class="workflow-diagram">
-      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Analytics event: cell-123 PRB utilization 85%, QoS degradation predicted</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Agent</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Analytics event: cell-123 PRB utilization 85%, QoS degradation predicted — handover recommendation sent to RRC task</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">RRC / Agent</span></div>
       <div class="workflow-step"><span class="wf-actor">NKEF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Knowledge graph query: 3 UEs eligible for HO, neighbor cells at 40% load</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Agent</span></div>
+      <div class="workflow-step"><span class="wf-actor">AgentTask</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">register() with AgentCoordinator → submit_intent(TriggerLoadBalancing) → process()</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AgentCoordinator</span></div>
       <div class="workflow-step"><span class="wf-actor">Agent</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">State encoding: [PRB=0.85, QoS_violation=2, neighbors=[0.40, 0.55, 0.30]]</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">RL Policy</span></div>
       <div class="workflow-step"><span class="wf-actor">RL Policy</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Q-learning action selection: TriggerLoadBalancing (Q=0.87, epsilon=0.1)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Intent</span></div>
       <div class="workflow-step"><span class="wf-actor">Agent</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Conflict resolution: check safety constraints, no conflicting intents</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Validator</span></div>
       <div class="workflow-step"><span class="wf-actor">Agent</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Execute: Handover UE-1, UE-2 to cell-456 (lowest load neighbor)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
       <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Xn Handover executed → cell-123 PRB drops to 60%</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Result</span></div>
       <div class="workflow-step"><span class="wf-actor">Result</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Reward: +0.8 (PRB↓, QoS✓) → Q-table update → experience replay buffer</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Agent</span></div>
-      <p class="wf-desc">Closed-loop autonomous network optimization. Agent observes state via NWDAF analytics, reasons with NKEF knowledge graph, acts via RL policy (Q-learning with epsilon-greedy exploration), and learns from outcomes. Safety constraints prevent destructive actions.</p>
+      <p class="wf-desc">Closed-loop autonomous network optimization. AgentTask registers with AgentCoordinator, submits intents, and drives the process loop. NWDAF analytics now feed handover recommendations directly to the RRC task. Agent observes state, reasons with NKEF knowledge graph, acts via RL policy, and learns from outcomes.</p>
     </div>
 
     <h3 class="group-heading">SHE Compute Offloading (6G)</h3>
@@ -529,11 +578,11 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-common</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">Shared types — SUPI, PLMN, S-NSSAI, QoS, config structs.</div>
+        <div class="component-desc">Shared types — SUPI, PLMN, S-NSSAI, QoS, config structs. Canonical home for <code>Vector3</code> and <code>TaskMessage</code> (deduplicated from 6G crates).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-crypto</span><span class="component-badge badge-crypto">Crypto</span></div>
-        <div class="component-desc">Pure Rust crypto — MILENAGE, Snow3G, ZUC, AES, HMAC-SHA256.</div>
+        <div class="component-desc">Pure Rust crypto — MILENAGE, Snow3G, ZUC, AES, HMAC-SHA256. <strong>Note:</strong> SNOW5G is deprecated — calls panic at runtime rather than producing silent wrong output.</div>
       </div>
     </div>
 
@@ -541,7 +590,7 @@
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-ai</span><span class="component-badge badge-6g">AI</span></div>
-        <div class="component-desc">ONNX Runtime, GPU acceleration (CUDA/CoreML/TensorRT), batch inference, model warmup.</div>
+        <div class="component-desc">Sole ONNX provider for the workspace — ONNX Runtime, GPU acceleration (CUDA/CoreML/TensorRT), batch inference, model warmup. All other crates (including nextgsim-semantic) depend on this crate for inference; none carry a direct <code>ort</code> dependency.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-she</span><span class="component-badge badge-6g">SHE</span></div>
@@ -569,7 +618,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-semantic</span><span class="component-badge badge-6g">Semantic</span></div>
-        <div class="component-desc">Neural codecs, JSCC, rate-distortion optimization, multimodal support.</div>
+        <div class="component-desc">Neural codecs, JSCC, rate-distortion optimization, multimodal support. ONNX inference delegated to <code>nextgsim-ai</code> (no direct <code>ort</code> dep).</div>
       </div>
     </div>
   </div>
@@ -616,6 +665,26 @@
 
 <span class="comment"># With debug logging</span>
 <span class="cmd">RUST_LOG=debug ./target/release/nr-gnb --config config/gnb.yaml</span></code>
+    </div>
+
+    <h3 class="group-heading">Docker Compose (Full RAN)</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Start gNB + UE via Docker Compose</span>
+<span class="cmd">docker compose up</span>
+
+<span class="comment"># With 6G features enabled (edit docker-compose.yaml config paths)</span>
+<span class="cmd">docker compose up --build</span></code>
+    </div>
+
+    <h3 class="group-heading">Enable 6G Features (UE lean build)</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Build UE with specific 6G feature flags</span>
+<span class="cmd">cargo build --release --package nextgsim-ue --features "isac,agent,fl"</span>
+
+<span class="comment"># Minimal 5G-only UE (no 6G overhead)</span>
+<span class="cmd">cargo build --release --package nextgsim-ue --no-default-features</span></code>
     </div>
   </div>
 </section>
