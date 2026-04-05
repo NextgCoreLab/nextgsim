@@ -24,6 +24,7 @@ nextgsim-crypto.workspace = true
 nextgsim-ngap.workspace = true
 nextgsim-rrc.workspace = true
 nextgsim-rls.workspace = true
+nextgsim-rlc.workspace = true
 nextgsim-gtp.workspace = true
 nextgsim-sctp.workspace = true
 

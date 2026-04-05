@@ -46,6 +46,7 @@ anyhow = "1"
 bytes = "1"
 hex = "0.4"
 async-trait = "0.1"
+futures = "0.3"
 
 [lib]
 name = "integration_tests"
@@ -78,3 +79,7 @@ path = "src/e2e_scenario.rs"
 [[test]]
 name = "cross_crate_integration"
 path = "src/cross_crate_integration.rs"
+
+[[test]]
+name = "sixg_task_integration"
+path = "src/sixg_task_integration.rs"

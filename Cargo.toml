@@ -8,6 +8,7 @@ members = [
     "nextgsim-ngap",
     "nextgsim-rrc",
     "nextgsim-rls",
+    "nextgsim-rlc",
     "nextgsim-gtp",
     "nextgsim-sctp",
     "nextgsim-gnb",
@@ -90,6 +91,7 @@ nextgsim-nas = { path = "nextgsim-nas" }
 nextgsim-ngap = { path = "nextgsim-ngap" }
 nextgsim-rrc = { path = "nextgsim-rrc" }
 nextgsim-rls = { path = "nextgsim-rls" }
+nextgsim-rlc = { path = "nextgsim-rlc" }
 nextgsim-gtp = { path = "nextgsim-gtp" }
 nextgsim-sctp = { path = "nextgsim-sctp" }
 nextgsim-gnb = { path = "nextgsim-gnb" }
