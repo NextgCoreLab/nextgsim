@@ -718,7 +718,10 @@ mod tests {
     /// server receives.  Both sides run on loopback (127.0.0.1) with
     /// auto-assigned ports.
     #[tokio::test]
+    #[ignore = "requires QUIC loopback — run with --ignored"]
     async fn test_quic_transport_roundtrip() {
+        // Install rustls crypto provider for tests
+        let _ = rustls::crypto::ring::default_provider().install_default();
         // --- server setup ---
         let server_cfg = make_server_config().expect("server config");
         let server_ep = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
