@@ -326,7 +326,7 @@ impl MessageRouter {
         self.mailboxes
             .get_mut(agent_id)
             .map(|mb| mb.drain(..).collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Peek at the number of pending messages for an agent.

@@ -75,7 +75,7 @@ impl AppTask {
             return Ok(0);
         }
 
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap_or_default();
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("value expected");
         let server = CliServer::new(bind_addr, node_name).await?;
         let port = server.local_addr()?.port();
         self.cli_server = Some(server);

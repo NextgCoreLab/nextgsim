@@ -88,3 +88,11 @@ configured_nssai:
 
 # TUN interface name (optional, for user plane)
 tun_name: "uesimtun0"
+
+# Rel-20 6G AI-native network function features
+# All disabled by default; enable for 6G research deployments
+she_enabled: false              # SHE Client - edge inference offloading (Rel-20)
+ai_ml_enabled: false            # NWDAF Reporter - AI/ML data reporting (Rel-20)
+isac_enabled: false             # ISAC Sensor - sensing and communication (Rel-20)
+federated_learning_enabled: false  # FL Participant - federated learning (Rel-20)
+semantic_comm_enabled: false    # Semantic Codec - semantic communication (Rel-20)

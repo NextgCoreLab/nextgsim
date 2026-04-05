@@ -155,7 +155,7 @@ async fn test_e2e_ue_registration_flow() {
     tracing::info!("----------------------------------------");
     tracing::info!("[STATUS] UE Registration SUCCESSFUL");
     tracing::info!("  - AMF UE NGAP ID: {}", amf_ue_id);
-    tracing::info!("  - SUPI: {}", ue.supi.as_ref().unwrap_or_default());
+    tracing::info!("  - SUPI: {}", ue.supi.as_ref().expect("value expected"));
     tracing::info!("  - RM State: RM-REGISTERED");
     tracing::info!("----------------------------------------");
 

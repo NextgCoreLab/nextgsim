@@ -389,7 +389,7 @@ impl ContextBuilder {
                 );
             }
 
-            let entry_json = serde_json::to_string(&entry_map).unwrap_or_default();
+            let entry_json = serde_json::to_string(&entry_map).expect("value expected");
             if current_len + entry_json.len() > max_chars && included_count > 0 {
                 break;
             }
@@ -406,7 +406,7 @@ impl ContextBuilder {
             "entry_count": included_count,
         });
 
-        let text = serde_json::to_string_pretty(&wrapper).unwrap_or_default();
+        let text = serde_json::to_string_pretty(&wrapper).expect("value expected");
 
         let confidence = if included_count > 0 {
             total_relevance / included_count as f32

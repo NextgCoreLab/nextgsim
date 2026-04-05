@@ -272,7 +272,7 @@ impl MlModelTrainingService {
         };
 
         // Estimate completion time based on epochs and dataset size
-        let dataset = self.datasets.get(&request.dataset_id).unwrap_or_default();
+        let dataset = self.datasets.get(&request.dataset_id).expect("value expected");
         let samples_per_sec = 1000; // Simplified estimate
         let estimated_time_sec = (dataset.len() * request.config.epochs as usize) / samples_per_sec;
         let estimated_completion_ms = Some(now_ms + (estimated_time_sec as u64 * 1000));

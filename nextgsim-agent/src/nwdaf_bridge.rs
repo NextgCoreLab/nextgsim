@@ -135,7 +135,7 @@ impl AgentNwdafBridge {
         self.cache
             .get(&analytics_id)
             .map(|entries| entries.iter().map(|e| &e.result).collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Builds a decision context by collecting latest analytics for all subscribed IDs

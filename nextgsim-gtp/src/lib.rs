@@ -19,7 +19,7 @@
 //! let encoded = header.encode();
 //!
 //! // Decode from bytes
-//! let decoded = GtpHeader::decode(&encoded).unwrap_or_default();
+//! let decoded = GtpHeader::decode(&encoded).expect("value expected");
 //! assert_eq!(decoded.teid, 0x12345678);
 //!
 //! // Tunnel management
@@ -33,7 +33,7 @@
 //!     GtpTunnel::new(0x1000, upf_addr),   // Uplink tunnel
 //!     GtpTunnel::new(0x2000, gnb_addr),   // Downlink tunnel
 //! );
-//! manager.create_session(session).unwrap_or_default();
+//! manager.create_session(session).expect("value expected");
 //! ```
 
 pub mod codec;

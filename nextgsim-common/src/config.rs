@@ -101,6 +101,27 @@ pub struct GnbConfig {
     /// Energy saving features enabled (Rel-18)
     #[serde(default)]
     pub energy_saving_enabled: bool,
+    // ========================================================================
+    // Rel-20 6G feature flags
+    // ========================================================================
+    /// Service Hosting Environment (SHE) task enabled (Rel-20)
+    #[serde(default)]
+    pub she_enabled: bool,
+    /// Network Data Analytics Function (NWDAF) task enabled (Rel-20)
+    #[serde(default)]
+    pub nwdaf_enabled: bool,
+    /// Network Knowledge Exposure Function (NKEF) task enabled (Rel-20)
+    #[serde(default)]
+    pub nkef_enabled: bool,
+    /// Integrated Sensing and Communication (ISAC) task enabled (Rel-20)
+    #[serde(default)]
+    pub isac_enabled: bool,
+    /// AI Agent Framework task enabled (Rel-20)
+    #[serde(default)]
+    pub agent_enabled: bool,
+    /// Federated Learning Aggregator task enabled (Rel-20)
+    #[serde(default)]
+    pub federated_learning_enabled: bool,
 }
 
 fn default_gtp_port() -> u16 {
@@ -135,6 +156,12 @@ impl Default for GnbConfig {
             uav_enabled: false,
             ranging_enabled: false,
             energy_saving_enabled: false,
+            she_enabled: false,
+            nwdaf_enabled: false,
+            nkef_enabled: false,
+            isac_enabled: false,
+            agent_enabled: false,
+            federated_learning_enabled: false,
         }
     }
 }
@@ -927,6 +954,24 @@ pub struct UeConfig {
     /// V2X (Vehicle-to-Everything) configuration (Rel-16, TS 23.287)
     #[serde(default)]
     pub v2x_config: Option<V2xConfig>,
+    // ========================================================================
+    // Rel-20 6G feature flags
+    // ========================================================================
+    /// Service Hosting Environment (SHE) client task enabled (Rel-20)
+    #[serde(default)]
+    pub she_enabled: bool,
+    /// AI/ML NWDAF reporter task enabled (Rel-20)
+    #[serde(default)]
+    pub ai_ml_enabled: bool,
+    /// Integrated Sensing and Communication (ISAC) sensor task enabled (Rel-20)
+    #[serde(default)]
+    pub isac_enabled: bool,
+    /// Federated Learning participant task enabled (Rel-20)
+    #[serde(default)]
+    pub federated_learning_enabled: bool,
+    /// Semantic Communication codec task enabled (Rel-20)
+    #[serde(default)]
+    pub semantic_comm_enabled: bool,
 }
 
 impl Default for UeConfig {
@@ -962,6 +1007,11 @@ impl Default for UeConfig {
             mint_config: None,
             redcap_r18: None,
             v2x_config: None,
+            she_enabled: false,
+            ai_ml_enabled: false,
+            isac_enabled: false,
+            federated_learning_enabled: false,
+            semantic_comm_enabled: false,
         }
     }
 }
@@ -1004,7 +1054,7 @@ impl GnbConfig {
     /// ignore_stream_ids: false
     /// "#;
     ///
-    /// let config = GnbConfig::from_yaml(yaml).unwrap_or_default();
+    /// let config = GnbConfig::from_yaml(yaml).expect("value expected");
     /// assert_eq!(config.tac, 1);
     /// ```
     pub fn from_yaml(yaml: &str) -> Result<Self, Error> {
@@ -1024,7 +1074,7 @@ impl GnbConfig {
     /// ```no_run
     /// use nextgsim_common::GnbConfig;
     ///
-    /// let config = GnbConfig::from_yaml_file("config/gnb.yaml").unwrap_or_default();
+    /// let config = GnbConfig::from_yaml_file("config/gnb.yaml").expect("value expected");
     /// ```
     pub fn from_yaml_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let contents = fs::read_to_string(path)?;
@@ -1080,7 +1130,7 @@ impl UeConfig {
     ///   slices: []
     /// "#;
     ///
-    /// let config = UeConfig::from_yaml(yaml).unwrap_or_default();
+    /// let config = UeConfig::from_yaml(yaml).expect("value expected");
     /// assert_eq!(config.protection_scheme, 0);
     /// ```
     pub fn from_yaml(yaml: &str) -> Result<Self, Error> {
@@ -1100,7 +1150,7 @@ impl UeConfig {
     /// ```no_run
     /// use nextgsim_common::UeConfig;
     ///
-    /// let config = UeConfig::from_yaml_file("config/ue.yaml").unwrap_or_default();
+    /// let config = UeConfig::from_yaml_file("config/ue.yaml").expect("value expected");
     /// ```
     pub fn from_yaml_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let contents = fs::read_to_string(path)?;

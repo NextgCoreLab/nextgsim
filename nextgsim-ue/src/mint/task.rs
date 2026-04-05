@@ -173,7 +173,7 @@ impl Task for MintTask {
                             .iter()
                             .find(|s| s.index == selected)
                             .map(|s| s.supi.clone())
-                            .unwrap_or_default();
+                            .expect("value expected");
                         if let Some(tx) = response_tx {
                             let _ = tx.send((selected, supi));
                         }

@@ -651,7 +651,7 @@ fn parse_criticality_diagnostics(
                 .collect::<Result<Vec<_>, ErrorIndicationError>>()
         })
         .transpose()?
-        .unwrap_or_default();
+        .expect("value expected");
 
     Ok(CriticalityDiagnosticsInfo {
         procedure_code,

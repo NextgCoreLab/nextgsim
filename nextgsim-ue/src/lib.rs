@@ -80,3 +80,10 @@ pub use tun::{
     is_valid_ip_packet, spawn_tun_reader, IpPacket, IpVersion, TunAppMessage, TunConfig, TunError,
     TunInterface, TunMessage, TunReader, TunTask, TunTaskConfig, TunWriter,
 };
+
+// Re-export 6G AI-native network function task types
+pub use she_client::SheClientTask;
+pub use nwdaf_reporter::NwdafReporterTask;
+pub use isac_sensor::IsacSensorTask;
+pub use fl_participant::FlParticipantTask;
+pub use semantic_codec::SemanticCodecTask;

@@ -55,3 +55,15 @@ ignore_stream_ids: false
 # If not set, gNB uses loopback mode (for testing without real UPF)
 upf_addr: 172.23.0.7
 upf_port: 2152
+
+# Rel-18 5G-Advanced features
+energy_saving_enabled: false  # Cell sleep modes and energy efficiency (Rel-18)
+
+# Rel-20 6G AI-native network function features
+# All disabled by default; enable for 6G research deployments
+she_enabled: false              # Service Hosting Environment - edge inference (Rel-20)
+nwdaf_enabled: false            # Network Data Analytics Function (Rel-20)
+nkef_enabled: false             # Network Knowledge Exposure Function (Rel-20)
+isac_enabled: false             # Integrated Sensing and Communication (Rel-20)
+agent_enabled: false            # AI Agent Framework (Rel-20)
+federated_learning_enabled: false  # Federated Learning Aggregator (Rel-20)

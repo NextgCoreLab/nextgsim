@@ -242,7 +242,7 @@ impl ModelTransferProtocol {
             .collect();
 
         // Sort by accuracy (descending)
-        models.sort_by(|a, b| b.accuracy.partial_cmp(&a.accuracy).unwrap_or_default());
+        models.sort_by(|a, b| b.accuracy.partial_cmp(&a.accuracy).expect("value expected"));
 
         ModelTransferMessage::ModelQueryResponse { models }
     }
@@ -264,7 +264,7 @@ impl ModelTransferProtocol {
         if let Some(max_age_secs) = filter.max_age_secs {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .as_millis() as u64;
             let age_secs = (now - metadata.trained_at_ms) / 1000;
             if age_secs > max_age_secs {

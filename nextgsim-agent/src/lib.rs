@@ -967,7 +967,7 @@ fn uuid_simple() -> String {
     let counter = INTENT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+        .expect("value expected");
     format!("intent-{}-{}-{}", now.as_secs(), now.subsec_nanos(), counter)
 }
 

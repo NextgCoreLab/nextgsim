@@ -916,7 +916,7 @@ impl Anlf {
                 }
 
                 // Current congestion based on PRB usage and connected UEs
-                let latest = load_history.back().unwrap_or_default();
+                let latest = load_history.back().expect("value expected");
                 let congestion_level = (latest.prb_usage * 0.7
                     + (latest.connected_ues as f32 / 100.0).min(1.0) * 0.3)
                     .min(1.0);
@@ -1011,7 +1011,7 @@ impl Anlf {
                     .into());
                 }
 
-                let latest = load_history.back().unwrap_or_default();
+                let latest = load_history.back().expect("value expected");
 
                 // Current QoS metrics
                 let current_qos = QosMetrics {
@@ -1083,7 +1083,7 @@ impl Anlf {
                     .into());
                 }
 
-                let latest = history.latest().unwrap_or_default();
+                let latest = history.latest().expect("value expected");
                 let avg_rsrp = history.all().iter()
                     .map(|m| m.rsrp)
                     .sum::<f32>() / history.len() as f32;

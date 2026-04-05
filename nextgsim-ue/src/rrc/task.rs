@@ -511,7 +511,7 @@ impl RrcTask {
 
     /// Send RRC Setup Complete message using proper ASN.1 UPER encoding
     async fn send_rrc_setup_complete(&mut self) {
-        let nas_pdu = self.initial_nas_pdu.take().unwrap_or_default();
+        let nas_pdu = self.initial_nas_pdu.take().expect("value expected");
         let nas_data = nas_pdu.data().to_vec();
 
         let params = RrcSetupCompleteParams {
@@ -877,7 +877,7 @@ impl RrcTask {
                 data: measurements,
                 timestamp_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .expect("value expected")
                     .as_millis() as u64,
             };
             if let Err(e) = sixg.isac_sensor_tx.send(msg).await {

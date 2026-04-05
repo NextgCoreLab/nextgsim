@@ -379,7 +379,7 @@ pub struct ReplicationStatus {
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("value expected")
         .as_millis() as u64
 }
 

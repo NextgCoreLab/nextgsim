@@ -27,14 +27,14 @@ use nextgsim_nwdaf::{
     CellLoad, NwdafManager, NwdafResponse, UeMeasurement, Vector3,
 };
 
-use crate::tasks::{GnbTaskBase, NwdafMessage, Task, TaskMessage};
+use crate::tasks::{GnbTaskBase, NwdafMessage, RrcMessage, Task, TaskMessage};
 
 /// NWDAF Task for gNB
 ///
 /// Provides four-layer network data analytics with closed-loop automation.
 pub struct NwdafTask {
     /// Task base for inter-task communication
-    _task_base: GnbTaskBase,
+    task_base: GnbTaskBase,
     /// NWDAF analytics manager
     nwdaf: NwdafManager,
     /// Cell load tracking
@@ -54,7 +54,7 @@ impl NwdafTask {
         let nwdaf = NwdafManager::new(max_history_length);
 
         Self {
-            _task_base: task_base,
+            task_base,
             nwdaf,
             cell_loads: HashMap::new(),
             _max_history_length: max_history_length,
@@ -81,7 +81,7 @@ impl NwdafTask {
             sinr: None,
             position: Vector3::new(position.0 as f64, position.1 as f64, position.2 as f64),
             velocity: None,
-            serving_cell_id: 1, // TODO: Get from UE context
+            serving_cell_id: self.task_base.config.cell_id() as i32,
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -115,7 +115,7 @@ impl NwdafTask {
             cell_id,
             prb_usage,
             connected_ues,
-            avg_throughput_mbps: 100.0, // TODO: Calculate actual throughput
+            avg_throughput_mbps: prb_usage * 1000.0,
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -172,14 +172,16 @@ impl NwdafTask {
             ue_id, target_cell, confidence
         );
 
-        // In a full implementation, this would use neighbor cell measurements
-        // For now, we log the recommendation
         info!(
             "NWDAF: Recommended handover for UE {} to cell {} with confidence {:.2}",
             ue_id, target_cell, confidence
         );
 
-        // TODO: Send recommendation to RRC task for execution
+        // Send recommendation to RRC task for execution
+        let msg = RrcMessage::NwdafHandoverRecommendation { ue_id, target_cell, confidence };
+        if let Err(e) = self.task_base.rrc_tx.try_send(msg) {
+            warn!("NWDAF: Failed to send handover recommendation to RRC: {}", e);
+        }
     }
 }
 

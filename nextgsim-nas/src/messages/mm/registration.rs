@@ -646,7 +646,7 @@ impl RegistrationRequest {
                     let val = buf.get_u8() & 0x0F;
                     msg.mico_indication = Some(
                         IeMicoIndication::decode(val)
-                            .unwrap_or_default()
+                            .expect("value expected")
                     );
                     continue;
                 }
@@ -1082,7 +1082,7 @@ impl RegistrationAccept {
                     let val = buf.get_u8() & 0x0F;
                     msg.mico_indication = Some(
                         IeMicoIndication::decode(val)
-                            .unwrap_or_default()
+                            .expect("value expected")
                     );
                     continue;
                 }

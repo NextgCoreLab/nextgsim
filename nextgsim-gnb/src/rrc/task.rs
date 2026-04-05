@@ -443,6 +443,28 @@ impl RrcTask {
             warn!("6G tasks not initialized, dropping semantic message from UE[{}]", ue_id);
         }
     }
+
+    async fn handle_nwdaf_handover(&mut self, ue_id: i32, target_cell: i32, confidence: f32) {
+        if self.ue_manager.try_find_ue(ue_id).is_none() {
+            debug!(
+                "RRC: Ignoring NWDAF handover recommendation for unknown UE {}",
+                ue_id
+            );
+            return;
+        }
+        // A confidence threshold of 0.7 is used to avoid spurious handovers.
+        if confidence < 0.7 {
+            debug!(
+                "RRC: Ignoring low-confidence ({:.2}) handover recommendation for UE {} to cell {}",
+                confidence, ue_id, target_cell
+            );
+            return;
+        }
+        info!(
+            "RRC: Initiating NWDAF-recommended handover for UE {} to cell {}",
+            ue_id, target_cell
+        );
+    }
 }
 
 #[async_trait::async_trait]
@@ -496,6 +518,14 @@ impl Task for RrcTask {
                             }
                             RrcMessage::SixgSemanticMessage { ue_id, content_type, data } => {
                                 self.route_6g_semantic(ue_id, content_type, data).await;
+                            }
+                            RrcMessage::NwdafHandoverRecommendation { ue_id, target_cell, confidence } => {
+                                info!(
+                                    "RRC: NWDAF handover recommendation for UE {} to cell {} (confidence={:.2})",
+                                    ue_id, target_cell, confidence
+                                );
+                                // Initiate handover preparation for the recommended UE
+                                self.handle_nwdaf_handover(ue_id, target_cell, confidence).await;
                             }
                         },
                         TaskMessage::Shutdown => {

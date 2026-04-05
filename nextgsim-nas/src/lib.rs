@@ -36,7 +36,7 @@
 //! header.encode(&mut buf);
 //!
 //! // Decode from bytes
-//! let decoded = PlainMmHeader::decode(&mut buf.as_slice()).unwrap_or_default();
+//! let decoded = PlainMmHeader::decode(&mut buf.as_slice()).expect("value expected");
 //! assert_eq!(decoded.message_type, MmMessageType::RegistrationRequest);
 //! ```
 

@@ -34,6 +34,7 @@ use nextgsim_rls::RrcChannel;
 use nextgsim_ue::{
     AppMessage, AppTask, NasMessage, RlsMessage, RlsTask, RrcMessage,
     Task, TaskManager, TaskMessage, UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
+    SheClientTask, NwdafReporterTask, IsacSensorTask, FlParticipantTask, SemanticCodecTask,
 };
 use nextgsim_ue::tun::{TunMessage, TunTask, TunTaskConfig, TunAppMessage};
 
@@ -251,7 +252,7 @@ impl UeApp {
 
     /// Spawns all UE tasks
     fn spawn_tasks(
-        task_base: UeTaskBase,
+        mut task_base: UeTaskBase,
         app_rx: tokio::sync::mpsc::Receiver<TaskMessage<AppMessage>>,
         nas_rx: tokio::sync::mpsc::Receiver<TaskMessage<NasMessage>>,
         rrc_rx: tokio::sync::mpsc::Receiver<TaskMessage<RrcMessage>>,
@@ -335,6 +336,57 @@ impl UeApp {
             Self::run_rrc_task(rrc_task_base, rrc_rx).await
         });
         info!("RRC task spawned");
+
+        // Spawn 6G AI-native network function tasks (Rel-20)
+        let any_6g = task_base.config.she_enabled
+            || task_base.config.ai_ml_enabled
+            || task_base.config.isac_enabled
+            || task_base.config.federated_learning_enabled
+            || task_base.config.semantic_comm_enabled;
+
+        if any_6g {
+            let sixg_rxs = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
+
+            if task_base.config.she_enabled {
+                let mut she_task = SheClientTask::new(task_base.clone());
+                tokio::spawn(async move {
+                    she_task.run(sixg_rxs.she_client_rx).await;
+                });
+                info!("SHE Client task spawned");
+            }
+
+            if task_base.config.ai_ml_enabled {
+                let mut nwdaf_task = NwdafReporterTask::new(task_base.clone());
+                tokio::spawn(async move {
+                    nwdaf_task.run(sixg_rxs.nwdaf_reporter_rx).await;
+                });
+                info!("NWDAF Reporter task spawned");
+            }
+
+            if task_base.config.isac_enabled {
+                let mut isac_task = IsacSensorTask::new(task_base.clone());
+                tokio::spawn(async move {
+                    isac_task.run(sixg_rxs.isac_sensor_rx).await;
+                });
+                info!("ISAC Sensor task spawned");
+            }
+
+            if task_base.config.federated_learning_enabled {
+                let mut fl_task = FlParticipantTask::new(task_base.clone());
+                tokio::spawn(async move {
+                    fl_task.run(sixg_rxs.fl_participant_rx).await;
+                });
+                info!("FL Participant task spawned");
+            }
+
+            if task_base.config.semantic_comm_enabled {
+                let mut semantic_task = SemanticCodecTask::new(task_base.clone());
+                tokio::spawn(async move {
+                    semantic_task.run(sixg_rxs.semantic_codec_rx).await;
+                });
+                info!("Semantic Codec task spawned");
+            }
+        }
 
         // Spawn RLS task (handles cell search and gNB communication)
         let mut rls_task = RlsTask::from_ue_config(task_base);
@@ -420,7 +472,7 @@ impl UeApp {
                                                                         pdu_data[i + 4],
                                                                         pdu_data[i + 5],
                                                                         pdu_data[i + 6]));
-                                                                    info!("PDU Session {} established with IP: {}", psi, ue_ip.unwrap_or_default());
+                                                                    info!("PDU Session {} established with IP: {}", psi, ue_ip.expect("value expected"));
                                                                 }
                                                             }
                                                             break;

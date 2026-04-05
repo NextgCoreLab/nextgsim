@@ -499,6 +499,15 @@ pub enum RrcMessage {
         /// Encoded semantic data
         data: Vec<u8>,
     },
+    /// NWDAF handover recommendation (from NWDAF task)
+    NwdafHandoverRecommendation {
+        /// UE identifier
+        ue_id: i32,
+        /// Recommended target cell
+        target_cell: i32,
+        /// Confidence score (0.0 - 1.0)
+        confidence: f32,
+    },
 }
 
 // ============================================================================

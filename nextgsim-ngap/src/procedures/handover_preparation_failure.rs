@@ -428,7 +428,7 @@ fn parse_criticality_diagnostics(
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .expect("value expected");
 
     CriticalityDiagnosticsInfo {
         procedure_code,

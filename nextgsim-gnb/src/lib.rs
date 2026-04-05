@@ -63,7 +63,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let config = load_and_validate_gnb_config("config/gnb.yaml").unwrap_or_default();
+//!     let config = load_and_validate_gnb_config("config/gnb.yaml").expect("value expected");
 //!     let (mut manager, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx) =
 //!         TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
 //!

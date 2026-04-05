@@ -450,7 +450,7 @@ impl MeasurementManager {
         // Get serving cell measurement
         let serving_cell = self.measurements.get(&serving_cell_id)
             .cloned()
-            .unwrap_or_default();
+            .expect("value expected");
 
         // Get neighbor cell measurements, sorted by RSRP
         let mut neighbors: Vec<_> = self.measurements.iter()
