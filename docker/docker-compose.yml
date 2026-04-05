@@ -1,0 +1,60 @@
+# NextGSim RAN Simulator
+# Connects to NextGCore 5G Core on the same Docker bridge network.
+#
+# Usage:
+#   # Start core first:
+#   cd ../nextgcore/docker/rust && docker compose up -d
+#   # Then start RAN:
+#   docker compose up -d
+#   docker compose logs -f gnb ue
+
+x-common: &common
+  restart: on-failure:3
+  environment: &common-env
+    RUST_LOG: info
+    RUST_BACKTRACE: 1
+
+x-healthcheck: &healthcheck
+  healthcheck:
+    test: ["CMD-SHELL", "kill -0 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+
+services:
+  gnb:
+    image: nextgsim/nr-gnb:latest
+    container_name: nextgsim-gnb
+    <<: [*common, *healthcheck]
+    command: ["--config", "/etc/nextgsim/gnb.yaml"]
+    volumes:
+      - ../config/gnb-docker.yaml:/etc/nextgsim/gnb.yaml:ro
+    networks:
+      nextgcore_core:
+        ipv4_address: 172.23.0.100
+    ports:
+      - "2152:2152/udp"   # GTP-U
+
+  ue:
+    image: nextgsim/nr-ue:latest
+    container_name: nextgsim-ue
+    <<: [*common, *healthcheck]
+    command: ["--config", "/etc/nextgsim/ue.yaml"]
+    volumes:
+      - ../config/ue-docker.yaml:/etc/nextgsim/ue.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      nextgcore_core:
+        ipv4_address: 172.23.0.101
+    depends_on:
+      gnb:
+        condition: service_healthy
+
+networks:
+  nextgcore_core:
+    external: true
+    name: rust_core
