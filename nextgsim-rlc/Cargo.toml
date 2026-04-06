@@ -1,0 +1,17 @@
+[package]
+name = "nextgsim-rlc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Radio Link Control (RLC) layer per TS 38.322 for nextgsim"
+
+[lints]
+workspace = true
+
+[dependencies]
+nextgsim-common.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

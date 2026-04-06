@@ -35,6 +35,16 @@ use nextgsim_ue::{
     AppMessage, AppTask, NasMessage, RlsMessage, RlsTask, RrcMessage,
     Task, TaskManager, TaskMessage, UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
 };
+#[cfg(feature = "nextgsim-she")]
+use nextgsim_ue::SheClientTask;
+#[cfg(feature = "nextgsim-nwdaf")]
+use nextgsim_ue::NwdafReporterTask;
+#[cfg(feature = "nextgsim-isac")]
+use nextgsim_ue::IsacSensorTask;
+#[cfg(feature = "nextgsim-fl")]
+use nextgsim_ue::FlParticipantTask;
+#[cfg(feature = "nextgsim-semantic")]
+use nextgsim_ue::SemanticCodecTask;
 use nextgsim_ue::tun::{TunMessage, TunTask, TunTaskConfig, TunAppMessage};
 
 /// nextgsim UE - 5G User Equipment Simulator
@@ -250,8 +260,9 @@ impl UeApp {
     }
 
     /// Spawns all UE tasks
+    #[allow(unused_mut)]
     fn spawn_tasks(
-        task_base: UeTaskBase,
+        mut task_base: UeTaskBase,
         app_rx: tokio::sync::mpsc::Receiver<TaskMessage<AppMessage>>,
         nas_rx: tokio::sync::mpsc::Receiver<TaskMessage<NasMessage>>,
         rrc_rx: tokio::sync::mpsc::Receiver<TaskMessage<RrcMessage>>,
@@ -335,6 +346,72 @@ impl UeApp {
             Self::run_rrc_task(rrc_task_base, rrc_rx).await
         });
         info!("RRC task spawned");
+
+        // Spawn 6G AI-native network function tasks (Rel-20)
+        #[cfg(any(
+            feature = "nextgsim-she",
+            feature = "nextgsim-nwdaf",
+            feature = "nextgsim-isac",
+            feature = "nextgsim-fl",
+            feature = "nextgsim-semantic",
+        ))]
+        {
+            let any_6g = false
+                || cfg!(feature = "nextgsim-she") && task_base.config.she_enabled
+                || cfg!(feature = "nextgsim-nwdaf") && task_base.config.ai_ml_enabled
+                || cfg!(feature = "nextgsim-isac") && task_base.config.isac_enabled
+                || cfg!(feature = "nextgsim-fl") && task_base.config.federated_learning_enabled
+                || cfg!(feature = "nextgsim-semantic") && task_base.config.semantic_comm_enabled;
+
+            if any_6g {
+                let sixg_rxs = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
+
+                #[cfg(feature = "nextgsim-she")]
+                if task_base.config.she_enabled {
+                    let mut she_task = SheClientTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        she_task.run(sixg_rxs.she_client_rx).await;
+                    });
+                    info!("SHE Client task spawned");
+                }
+
+                #[cfg(feature = "nextgsim-nwdaf")]
+                if task_base.config.ai_ml_enabled {
+                    let mut nwdaf_task = NwdafReporterTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        nwdaf_task.run(sixg_rxs.nwdaf_reporter_rx).await;
+                    });
+                    info!("NWDAF Reporter task spawned");
+                }
+
+                #[cfg(feature = "nextgsim-isac")]
+                if task_base.config.isac_enabled {
+                    let mut isac_task = IsacSensorTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        isac_task.run(sixg_rxs.isac_sensor_rx).await;
+                    });
+                    info!("ISAC Sensor task spawned");
+                }
+
+                #[cfg(feature = "nextgsim-fl")]
+                if task_base.config.federated_learning_enabled {
+                    let mut fl_task = FlParticipantTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        fl_task.run(sixg_rxs.fl_participant_rx).await;
+                    });
+                    info!("FL Participant task spawned");
+                }
+
+                #[cfg(feature = "nextgsim-semantic")]
+                if task_base.config.semantic_comm_enabled {
+                    let mut semantic_task = SemanticCodecTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        semantic_task.run(sixg_rxs.semantic_codec_rx).await;
+                    });
+                    info!("Semantic Codec task spawned");
+                }
+            }
+        }
 
         // Spawn RLS task (handles cell search and gNB communication)
         let mut rls_task = RlsTask::from_ue_config(task_base);
@@ -420,7 +497,7 @@ impl UeApp {
                                                                         pdu_data[i + 4],
                                                                         pdu_data[i + 5],
                                                                         pdu_data[i + 6]));
-                                                                    info!("PDU Session {} established with IP: {}", psi, ue_ip.unwrap_or_default());
+                                                                    info!("PDU Session {} established with IP: {}", psi, ue_ip.expect("value expected"));
                                                                 }
                                                             }
                                                             break;
@@ -1255,12 +1332,15 @@ impl UeApp {
                             info!("UE: NTN TA={}us, k_offset={}", common_ta_us, k_offset);
                         }
                         // 6G message routing - log and drop in main binary (handled by lib RrcTask)
+                        #[cfg(feature = "nextgsim-she")]
                         RrcMessage::SixgInferenceRequest { model_id, .. } => {
                             debug!("6G inference request for model {}, not handled in main binary", model_id);
                         }
+                        #[cfg(feature = "nextgsim-isac")]
                         RrcMessage::SixgSensingMeasurement { measurement_type, .. } => {
                             debug!("6G sensing measurement type {}, not handled in main binary", measurement_type);
                         }
+                        #[cfg(feature = "nextgsim-semantic")]
                         RrcMessage::SixgSemanticData { content_type, .. } => {
                             debug!("6G semantic data type {}, not handled in main binary", content_type);
                         }

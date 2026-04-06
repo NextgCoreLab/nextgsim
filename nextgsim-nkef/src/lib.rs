@@ -467,7 +467,7 @@ impl KnowledgeGraph {
         self.type_index
             .get(&entity_type)
             .map(|ids| ids.iter().filter_map(|id| self.entities.get(id)).collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Gets (non-temporal) relationships for an entity

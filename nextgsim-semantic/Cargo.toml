@@ -15,7 +15,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 nextgsim-ai = { workspace = true }
 nextgsim-common = { workspace = true }
-ort = { workspace = true }
 ndarray = { workspace = true }
 rand = { workspace = true }
 

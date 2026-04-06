@@ -8,6 +8,7 @@ members = [
     "nextgsim-ngap",
     "nextgsim-rrc",
     "nextgsim-rls",
+    "nextgsim-rlc",
     "nextgsim-gtp",
     "nextgsim-sctp",
     "nextgsim-gnb",
@@ -60,6 +61,9 @@ zuc = "0.1"
 socket2 = "0.5"
 sctp-proto = "0.6"
 tun-rs = { version = "1", features = ["async_tokio"] }
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -90,6 +94,7 @@ nextgsim-nas = { path = "nextgsim-nas" }
 nextgsim-ngap = { path = "nextgsim-ngap" }
 nextgsim-rrc = { path = "nextgsim-rrc" }
 nextgsim-rls = { path = "nextgsim-rls" }
+nextgsim-rlc = { path = "nextgsim-rlc" }
 nextgsim-gtp = { path = "nextgsim-gtp" }
 nextgsim-sctp = { path = "nextgsim-sctp" }
 nextgsim-gnb = { path = "nextgsim-gnb" }

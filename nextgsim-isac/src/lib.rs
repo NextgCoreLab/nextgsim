@@ -84,36 +84,7 @@ const SPEED_OF_LIGHT: f64 = 299_792_458.0;
 
 // ─── Core data types (backward-compatible) ────────────────────────────────────
 
-/// 3D position vector
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct Vector3 {
-    /// X coordinate (meters)
-    pub x: f64,
-    /// Y coordinate (meters)
-    pub y: f64,
-    /// Z coordinate (meters)
-    pub z: f64,
-}
-
-impl Vector3 {
-    /// Creates a new Vector3
-    pub fn new(x: f64, y: f64, z: f64) -> Self {
-        Self { x, y, z }
-    }
-
-    /// Calculates Euclidean distance to another point
-    pub fn distance_to(&self, other: &Vector3) -> f64 {
-        let dx = self.x - other.x;
-        let dy = self.y - other.y;
-        let dz = self.z - other.z;
-        (dx * dx + dy * dy + dz * dz).sqrt()
-    }
-
-    /// Calculates magnitude
-    pub fn magnitude(&self) -> f64 {
-        (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
-    }
-}
+pub use nextgsim_common::Vector3;
 
 /// Sensing measurement type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

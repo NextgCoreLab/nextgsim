@@ -304,7 +304,7 @@ impl TierManager {
                     .filter(|n| n.is_available && n.supports(capability))
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Finds the best node for a workload in a tier
@@ -340,7 +340,7 @@ impl TierManager {
                     }
                 })
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Returns aggregate usage for a tier
@@ -356,7 +356,7 @@ impl TierManager {
                     }
                 })
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Finds the best node with a specific accelerator type
@@ -393,7 +393,7 @@ impl TierManager {
                     .filter(|n| n.tenant_id == Some(tenant_id) || n.tenant_id.is_none())
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Returns the number of nodes in each tier

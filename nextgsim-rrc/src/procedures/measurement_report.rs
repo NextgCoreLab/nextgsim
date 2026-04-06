@@ -439,7 +439,7 @@ fn parse_meas_result_nr(nr: &MeasResultNR) -> MeasResultNr {
                     }
                 }).collect()
             })
-            .unwrap_or_default();
+            .expect("value expected");
 
         let csi_rs_results = ri.results_csi_rs_indexes.as_ref()
             .map(|list| {
@@ -454,7 +454,7 @@ fn parse_meas_result_nr(nr: &MeasResultNR) -> MeasResultNr {
                     }
                 }).collect()
             })
-            .unwrap_or_default();
+            .expect("value expected");
 
         MeasResultRsIndexNr {
             ssb_results,

@@ -389,7 +389,7 @@ fn rand_u32() -> u32 {
         static STATE: Cell<u32> = Cell::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .subsec_nanos()
         );
     }

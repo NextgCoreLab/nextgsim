@@ -18,8 +18,8 @@ async fn test_gtp_encapsulation() {
     let psi = 1u8;
     let uplink_teid = 0x10000001;
     let downlink_teid = 0x20000001;
-    let upf_addr = "10.0.0.1:2152".parse().unwrap_or_default();
-    let gnb_addr = "10.0.0.2:2152".parse().unwrap_or_default();
+    let upf_addr = "10.0.0.1:2152".parse().expect("value expected");
+    let gnb_addr = "10.0.0.2:2152".parse().expect("value expected");
     
     let session = PduSession::new(
         ue_id,
@@ -54,8 +54,8 @@ async fn test_gtp_decapsulation() {
     let psi = 1u8;
     let uplink_teid = 0x10000001;
     let downlink_teid = 0x20000001;
-    let upf_addr = "10.0.0.1:2152".parse().unwrap_or_default();
-    let gnb_addr = "10.0.0.2:2152".parse().unwrap_or_default();
+    let upf_addr = "10.0.0.1:2152".parse().expect("value expected");
+    let gnb_addr = "10.0.0.2:2152".parse().expect("value expected");
     
     let session = PduSession::new(
         ue_id,
@@ -88,8 +88,8 @@ async fn test_tunnel_management() {
     
     // Create multiple sessions for same UE
     let ue_id = 1u32;
-    let upf_addr = "10.0.0.1:2152".parse().unwrap_or_default();
-    let gnb_addr = "10.0.0.2:2152".parse().unwrap_or_default();
+    let upf_addr = "10.0.0.1:2152".parse().expect("value expected");
+    let gnb_addr = "10.0.0.2:2152".parse().expect("value expected");
     
     let session1 = PduSession::new(
         ue_id, 1,

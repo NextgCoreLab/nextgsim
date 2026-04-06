@@ -157,7 +157,16 @@ amf_configs:
 slices:
   - sst: 1           <span class="comment"># eMBB</span>
   - sst: 2           <span class="comment"># URLLC</span>
-  - sst: 3           <span class="comment"># MIoT</span></code>
+  - sst: 3           <span class="comment"># MIoT</span>
+
+<span class="comment"># 6G feature flags (each spawns a corresponding task at runtime)</span>
+she_enabled: false
+nwdaf_enabled: false
+nkef_enabled: false
+isac_enabled: false
+agent_enabled: false
+fl_enabled: false
+energy_enabled: false</code>
       </div>
     </div>
 
@@ -218,7 +227,7 @@ sessions:
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-crypto</span><span class="component-badge badge-crypto">Crypto</span></div>
-        <div class="component-desc">MILENAGE, KDF, Snow3G, ZUC algorithms</div>
+        <div class="component-desc">MILENAGE, KDF, Snow3G, ZUC algorithms. SNOW5G is deprecated — panics loudly instead of producing silent wrong output.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-ai</span><span class="component-badge badge-6g">6G</span></div>

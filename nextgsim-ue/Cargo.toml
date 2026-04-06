@@ -20,6 +20,7 @@ nextgsim-crypto.workspace = true
 nextgsim-nas.workspace = true
 nextgsim-rrc.workspace = true
 nextgsim-rls.workspace = true
+nextgsim-rlc.workspace = true
 nextgsim-gtp.workspace = true
 
 # 6G AI-native network function client crates (optional features for UE)

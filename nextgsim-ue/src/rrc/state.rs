@@ -171,11 +171,11 @@ impl std::error::Error for RrcStateError {}
 /// assert_eq!(sm.state(), RrcState::Idle);
 ///
 /// // Establish RRC connection
-/// sm.transition(RrcStateTransition::SetupComplete).unwrap_or_default();
+/// sm.transition(RrcStateTransition::SetupComplete).expect("value expected");
 /// assert_eq!(sm.state(), RrcState::Connected);
 ///
 /// // Release connection
-/// sm.transition(RrcStateTransition::Release).unwrap_or_default();
+/// sm.transition(RrcStateTransition::Release).expect("value expected");
 /// assert_eq!(sm.state(), RrcState::Idle);
 /// ```
 #[derive(Debug)]

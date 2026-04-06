@@ -67,7 +67,7 @@ impl GtpTask {
         } else {
             info!(
                 "GTP-U forwarding to UPF at {}:{}",
-                task_base.config.upf_addr.unwrap_or_default(),
+                task_base.config.upf_addr.expect("value expected"),
                 task_base.config.upf_port
             );
         }
@@ -357,8 +357,8 @@ impl GtpTask {
                 let protocol = response[9];
                 if protocol == 1 {
                     // Swap source and destination IP addresses
-                    let src_ip: [u8; 4] = response[12..16].try_into().unwrap_or_default();
-                    let dst_ip: [u8; 4] = response[16..20].try_into().unwrap_or_default();
+                    let src_ip: [u8; 4] = response[12..16].try_into().expect("value expected");
+                    let dst_ip: [u8; 4] = response[16..20].try_into().expect("value expected");
                     response[12..16].copy_from_slice(&dst_ip);
                     response[16..20].copy_from_slice(&src_ip);
 
@@ -534,7 +534,7 @@ impl Task for GtpTask {
             return;
         }
 
-        let socket = self.udp_socket.clone().unwrap_or_default();
+        let socket = self.udp_socket.clone().expect("value expected");
         let mut recv_buf = vec![0u8; self.recv_buffer_size];
 
         // Log mode

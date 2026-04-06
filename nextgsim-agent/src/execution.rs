@@ -129,7 +129,7 @@ impl StateProvider for InMemoryStateProvider {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     fn set(&self, key: &str, value: &str) -> bool {
@@ -698,7 +698,7 @@ impl IntentExecutor for ModifySliceExecutor {
         for param_name in &modifiable {
             if let Some(value) = intent.parameters.get(*param_name) {
                 let key = format!("{prefix}/{param_name}");
-                let old_value = state.get(&key).unwrap_or_default();
+                let old_value = state.get(&key).expect("value expected");
                 state.set(&key, value);
                 output.insert(format!("previous_{param_name}"), old_value);
                 output.insert(format!("new_{param_name}"), value.clone());
