@@ -19,6 +19,14 @@ pub struct AmfConfig {
     pub address: IpAddr,
     /// SCTP port of the AMF (typically 38412)
     pub port: u16,
+    /// Secondary AMF addresses for SCTP multi-homing (e.g. `["192.168.1.2"]`).
+    ///
+    /// When non-empty the gNB uses a `MultihomeSctpAssociation` so that the
+    /// transport can fail over to an alternate path without dropping the NGAP
+    /// session.  Addresses are plain IP strings; the same port as the primary
+    /// address is used.
+    #[serde(default)]
+    pub secondary_addresses: Vec<String>,
 }
 
 impl AmfConfig {
@@ -28,7 +36,11 @@ impl AmfConfig {
     /// * `address` - IP address of the AMF
     /// * `port` - SCTP port of the AMF
     pub fn new(address: IpAddr, port: u16) -> Self {
-        Self { address, port }
+        Self {
+            address,
+            port,
+            secondary_addresses: Vec::new(),
+        }
     }
 }
 
@@ -128,6 +140,17 @@ pub struct GnbConfig {
     /// Federated Learning Aggregator task enabled (Rel-20)
     #[serde(default)]
     pub federated_learning_enabled: bool,
+    /// Use QUIC transport instead of SCTP for NGAP (6G forward-looking, Rel-20+).
+    ///
+    /// When `true` the gNB will attempt to use `QuicTransport` for the AMF
+    /// connection.  QUIC provides built-in TLS 1.3, connection migration, and
+    /// multiplexed streams — capabilities that align with 6G requirements.
+    ///
+    /// **Note**: full QUIC transport selection is scaffolded here; the runtime
+    /// wiring logs a warning and falls back to SCTP until the path is fully
+    /// integrated.
+    #[serde(default)]
+    pub quic_enabled: bool,
 }
 
 fn default_gtp_port() -> u16 {
@@ -174,6 +197,7 @@ impl Default for GnbConfig {
             isac_anchors: default_isac_anchors(),
             agent_enabled: false,
             federated_learning_enabled: false,
+            quic_enabled: false,
         }
     }
 }

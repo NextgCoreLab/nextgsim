@@ -60,6 +60,17 @@ impl SctpTask {
             local_address, local_port, remote_address, remote_port, client_id, ppid
         );
 
+        // Warn early if QUIC transport is configured — full wiring is a
+        // separate work item; we fall through to SCTP for now.
+        if self.task_base.config.quic_enabled {
+            warn!(
+                "quic_enabled=true in GnbConfig but QUIC transport selection is not yet \
+                 fully wired (client_id: {}). Falling back to SCTP.",
+                client_id
+            );
+            // TODO: instantiate QuicTransport here when the QUIC path is fully integrated.
+        }
+
         // Parse addresses
         let local_addr: SocketAddr = match format!("{local_address}:{local_port}").parse() {
             Ok(addr) => addr,
@@ -77,16 +88,61 @@ impl SctpTask {
             }
         };
 
-        // Create connection config
-        let config = AmfConnectionConfig {
+        // Resolve secondary addresses from the gNB config using client_id as
+        // an index into amf_configs.  An out-of-range client_id means no
+        // secondary addresses are registered (safe default).
+        let secondary_addresses: Vec<SocketAddr> = self
+            .task_base
+            .config
+            .amf_configs
+            .get(client_id as usize)
+            .map(|amf_cfg| {
+                amf_cfg
+                    .secondary_addresses
+                    .iter()
+                    .filter_map(|s| {
+                        // Secondary address strings may or may not include a
+                        // port; if there is no colon we append the same port
+                        // as the primary address.
+                        let with_port = if s.contains(':') {
+                            s.clone()
+                        } else {
+                            format!("{s}:{remote_port}")
+                        };
+                        match with_port.parse::<SocketAddr>() {
+                            Ok(a) => Some(a),
+                            Err(e) => {
+                                warn!(
+                                    "Ignoring unparseable secondary AMF address {:?}: {}",
+                                    s, e
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !secondary_addresses.is_empty() {
+            info!(
+                "SCTP multi-homing enabled for AMF {} with {} secondary address(es)",
+                client_id,
+                secondary_addresses.len()
+            );
+        }
+
+        // Build the full connection config.
+        let conn_config = AmfConnectionConfig {
             local_address: local_addr,
             remote_address: remote_addr,
+            secondary_addresses,
             sctp_config: SctpConfig::default(),
         };
 
-        // Create and connect
-        let mut connection = AmfConnection::new(client_id, config.clone());
-        match connection.connect(&config.sctp_config).await {
+        // Create and connect.
+        let mut connection = AmfConnection::new(client_id, conn_config.clone());
+        match connection.connect(&conn_config).await {
             Ok(event) => {
                 // Store the connection
                 self.connections.insert(client_id, connection);

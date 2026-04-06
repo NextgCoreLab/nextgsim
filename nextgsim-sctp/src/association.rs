@@ -775,6 +775,21 @@ impl MultihomeSctpAssociation {
     pub fn address_count(&self) -> usize {
         self.remote_addresses.len()
     }
+
+    /// Poll for incoming data on the active path (delegates to `SctpAssociation::poll`).
+    ///
+    /// Must be called periodically to drive incoming UDP packets through the
+    /// SCTP state machine before calling `try_recv`.
+    pub async fn poll(&mut self) -> Result<()> {
+        self.active.poll().await
+    }
+
+    /// Try to receive a message without blocking (delegates to the active path).
+    ///
+    /// Call `poll()` first to process any pending UDP datagrams.
+    pub fn try_recv(&mut self) -> Result<Option<ReceivedMessage>> {
+        self.active.try_recv()
+    }
 }
 
 
