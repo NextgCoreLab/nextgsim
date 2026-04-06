@@ -619,7 +619,12 @@ impl RrcTask {
 
     /// Send RRC Setup Complete message using proper ASN.1 UPER encoding
     async fn send_rrc_setup_complete(&mut self) {
-        let nas_pdu = self.initial_nas_pdu.take().expect("value expected");
+        let nas_pdu = if let Some(pdu) = self.initial_nas_pdu.take() {
+            pdu
+        } else {
+            warn!("send_rrc_setup_complete called but initial_nas_pdu is None — ignoring");
+            return;
+        };
         let nas_data = nas_pdu.data().to_vec();
 
         let params = RrcSetupCompleteParams {
