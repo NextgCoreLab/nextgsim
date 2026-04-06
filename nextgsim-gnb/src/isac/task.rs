@@ -68,13 +68,22 @@ impl Task for IsacTask {
                         }
                         IsacMessage::FusionRequest { ue_id, source_ids } => {
                             debug!("ISAC: Fusion request for UE {} from {} sources", ue_id, source_ids.len());
-                            // Register source anchors at origin as placeholders if not yet known,
-                            // then invoke position fusion for the requested UE.
-                            for &src in &source_ids {
-                                self.engine.register_anchor(
-                                    src as i32,
-                                    Vector3::new(src as f64 * 100.0, 0.0, 0.0),
-                                );
+                            // Register source anchors using configured positions.
+                            // source_ids are matched to isac_anchors by index; if the index
+                            // exceeds the configured anchor list the anchor is skipped.
+                            let anchors = &self.task_base.config.isac_anchors;
+                            for (idx, &src) in source_ids.iter().enumerate() {
+                                if let Some(&[x, y, z]) = anchors.get(idx) {
+                                    self.engine.register_anchor(
+                                        src as i32,
+                                        Vector3::new(x, y, z),
+                                    );
+                                } else {
+                                    debug!(
+                                        "ISAC: No anchor position configured for source index {} (id {}), skipping",
+                                        idx, src
+                                    );
+                                }
                             }
                             if let Some(fused) = self.engine.fuse_position(ue_id) {
                                 info!(

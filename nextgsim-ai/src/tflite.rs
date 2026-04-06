@@ -23,6 +23,9 @@ use crate::tensor::TensorData;
 /// Provides `TFLite` model inference with support for CPU and GPU delegates.
 /// This is a placeholder implementation that follows the `InferenceEngine` trait
 /// and can be expanded when `TFLite` runtime support is added.
+#[deprecated(
+    note = "TFLite backend is a placeholder — use OnnxEngine for production inference"
+)]
 pub struct TfLiteEngine {
     /// Internal `TFLite` session state (placeholder)
     session: Option<Mutex<TfLiteSession>>,
@@ -76,6 +79,7 @@ impl TfLiteEngine {
             "Creating TFLite inference engine with {} execution provider",
             config.execution_provider
         );
+        warn!("TFLite backend is a placeholder returning dummy values — use ONNX for real inference");
 
         Ok(Self {
             session: None,

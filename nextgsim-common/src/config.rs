@@ -116,6 +116,12 @@ pub struct GnbConfig {
     /// Integrated Sensing and Communication (ISAC) task enabled (Rel-20)
     #[serde(default)]
     pub isac_enabled: bool,
+    /// ISAC anchor positions in metres [x, y, z].
+    ///
+    /// Defaults to a 100 m equilateral triangle at 10 m height:
+    /// `(0,0,10)`, `(100,0,10)`, `(50,87,10)`.
+    #[serde(default = "default_isac_anchors")]
+    pub isac_anchors: Vec<[f64; 3]>,
     /// AI Agent Framework task enabled (Rel-20)
     #[serde(default)]
     pub agent_enabled: bool,
@@ -126,6 +132,11 @@ pub struct GnbConfig {
 
 fn default_gtp_port() -> u16 {
     2152
+}
+
+fn default_isac_anchors() -> Vec<[f64; 3]> {
+    // 100 m equilateral triangle at 10 m height
+    vec![[0.0, 0.0, 10.0], [100.0, 0.0, 10.0], [50.0, 87.0, 10.0]]
 }
 
 impl Default for GnbConfig {
@@ -160,6 +171,7 @@ impl Default for GnbConfig {
             nwdaf_enabled: false,
             nkef_enabled: false,
             isac_enabled: false,
+            isac_anchors: default_isac_anchors(),
             agent_enabled: false,
             federated_learning_enabled: false,
         }
