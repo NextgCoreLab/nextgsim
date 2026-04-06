@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::tasks::{NasMessage, RlsMessage, RrcMessage, RlfCause, Task, TaskMessage, UeTaskBase};
 use nextgsim_common::OctetString;
+use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
     codec, CellSearchEvent, RlsMessage as RlsProtocolMessage, RlsTransport, RrcChannel,
     TransportEvent, UeCellSearch,
@@ -58,6 +59,9 @@ pub struct RlsTask {
     socket: Option<Arc<UdpSocket>>,
     config: RlsTaskConfig,
     sti: u64,
+    /// RLC entities keyed by PSI (PDU Session ID).
+    /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
+    rlc_entities: HashMap<i32, RlcEntity>,
 }
 
 impl RlsTask {
@@ -80,6 +84,7 @@ impl RlsTask {
             socket: None,
             config,
             sti,
+            rlc_entities: HashMap::new(),
         }
     }
 
@@ -94,6 +99,13 @@ impl RlsTask {
 
     pub fn cell_count(&self) -> usize { self.cell_search.cell_count() }
     pub fn serving_cell(&self) -> Option<i32> { self.serving_cell }
+
+    /// Returns the RLC entity for a PSI bearer, creating a UM SN12 entity on first use.
+    fn rlc_entity_for(&mut self, psi: i32) -> &mut RlcEntity {
+        self.rlc_entities
+            .entry(psi)
+            .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
+    }
 
     async fn init_socket(&mut self) -> Result<(), std::io::Error> {
         let bind_addr = self.config.bind_address.unwrap_or_else(|| "0.0.0.0:0".parse().expect("value expected"));
@@ -197,15 +209,39 @@ impl RlsTask {
             None => { warn!("PDU from unknown source {}", source); return; }
         };
 
-        for event in self.transport.process_pdu_transmission(cell_id as u32, pdu) {
+        // Collect events first so the transport borrow is released before we
+        // mutate self.rlc_entities below.
+        let events: Vec<TransportEvent> = self.transport.process_pdu_transmission(cell_id as u32, pdu);
+
+        for event in events {
             match event {
                 TransportEvent::RrcReceived { channel, data, .. } => {
                     let pdu = OctetString::from_slice(&data);
                     let _ = self.task_base.rrc_tx.send(RrcMessage::DownlinkRrcDelivery { cell_id, channel, pdu }).await;
                 }
                 TransportEvent::DataReceived { psi, data } => {
-                    let pdu = OctetString::from_slice(&data);
-                    let _ = self.task_base.nas_tx.send(NasMessage::UplinkDataDelivery { psi: psi as i32, data: pdu }).await;
+                    // Feed the received RLC PDU into the per-PSI entity and
+                    // forward any fully-reassembled SDUs up to NAS.
+                    // Collect reassembled SDUs first so the mutable borrow on
+                    // self.rlc_entities is released before the async send.
+                    let psi_i32 = psi as i32;
+                    debug!("Downlink data (RLC): psi={}, len={}", psi_i32, data.len());
+                    let reassembled = {
+                        let rlc = self.rlc_entity_for(psi_i32);
+                        rlc.receive_pdu(&data);
+                        let mut sdus = Vec::new();
+                        while let Some(sdu) = rlc.poll_reassembled() {
+                            sdus.push(sdu);
+                        }
+                        sdus
+                    };
+                    for sdu in reassembled {
+                        debug!("RLC reassembled SDU: psi={}, len={}", psi_i32, sdu.len());
+                        let octet = OctetString::from_slice(&sdu);
+                        let _ = self.task_base.nas_tx.send(
+                            NasMessage::UplinkDataDelivery { psi: psi_i32, data: octet }
+                        ).await;
+                    }
                 }
                 TransportEvent::TransmissionFailure { pdus } => warn!("Transmission failure: {} PDUs", pdus.len()),
                 TransportEvent::RadioLinkFailure { cause } => {
@@ -263,14 +299,38 @@ impl RlsTask {
         }
     }
 
+    /// Send uplink user-plane data from NAS/TUN to the gNB.
+    ///
+    /// The SDU is first submitted to the per-PSI RLC entity (UM, SN12) which
+    /// segments it if necessary.  Each resulting RLC PDU is then wrapped in an
+    /// RLS frame and sent to the serving gNB.
     async fn handle_data_pdu_delivery(&mut self, psi: i32, pdu: OctetString) {
         let dest = match self.serving_cell.and_then(|id| self.cell_addresses.get(&id).copied()) {
             Some(addr) => addr,
             None => { warn!("Cannot send uplink data: no serving cell"); return; }
         };
-        debug!("Uplink data: psi={}, len={}", psi, pdu.len());
-        let transmission = self.transport.create_data_transmission(psi as u32, Bytes::copy_from_slice(pdu.data()));
-        self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission)).await;
+        debug!("Uplink data (RLC): psi={}, len={}", psi, pdu.len());
+
+        // Submit SDU to RLC and collect all resulting PDUs before releasing
+        // the mutable borrow so that self.transport and self.socket are
+        // accessible again for transmission.
+        let rlc_pdus = {
+            let rlc = self.rlc_entity_for(psi);
+            rlc.submit_sdu(pdu.data().to_vec());
+            let mut pdus = Vec::new();
+            while let Some(rlc_pdu) = rlc.build_pdu(1500) {
+                pdus.push(rlc_pdu);
+            }
+            pdus
+        };
+
+        for rlc_pdu in rlc_pdus {
+            let transmission = self.transport.create_data_transmission(
+                psi as u32,
+                Bytes::from(rlc_pdu),
+            );
+            self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission)).await;
+        }
     }
 
 

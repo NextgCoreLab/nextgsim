@@ -18,6 +18,7 @@ use crate::tasks::{
     GnbTaskBase, GtpMessage, RlsMessage, RrcMessage, Task, TaskMessage,
 };
 use nextgsim_common::OctetString;
+use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
     codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck, RlsMessage as RlsProtocolMessage,
     RlsPduTransmission, RlsPduTransmissionAck, RrcChannel, Vector3,
@@ -50,6 +51,9 @@ pub struct RlsTask {
     socket: Option<Arc<UdpSocket>>,
     /// Local bind address
     bind_address: SocketAddr,
+    /// RLC entities keyed by UE ID.
+    /// Each entry is the primary DRB entity (UM, SN12) used for user-plane data.
+    rlc_entities: HashMap<i32, RlcEntity>,
 }
 
 impl RlsTask {
@@ -58,7 +62,7 @@ impl RlsTask {
         // Generate STI from gNB NCI
         let sti = task_base.config.nci;
         let phy_location = Vector3::new(0, 0, 0);
-        
+
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
 
@@ -71,6 +75,7 @@ impl RlsTask {
             sti,
             socket: None,
             bind_address,
+            rlc_entities: HashMap::new(),
         }
     }
 
@@ -88,7 +93,15 @@ impl RlsTask {
             sti,
             socket: None,
             bind_address,
+            rlc_entities: HashMap::new(),
         }
+    }
+
+    /// Returns the RLC entity for a UE, creating a default UM DRB entity if absent.
+    fn rlc_entity_for(&mut self, ue_id: i32) -> &mut RlcEntity {
+        self.rlc_entities
+            .entry(ue_id)
+            .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
     }
 
     /// Initializes the UDP socket
@@ -248,27 +261,47 @@ impl RlsTask {
         }
     }
 
-    /// Handles uplink user plane data from UE
-    async fn handle_uplink_data(&self, ue_id: i32, pdu: &RlsPduTransmission) {
+    /// Handles uplink user plane data from UE.
+    ///
+    /// The raw bytes arriving over RLS are an RLC PDU (UM, SN12).  They are
+    /// fed into the per-UE RLC entity for reassembly; only complete SDUs are
+    /// forwarded to the GTP task.
+    async fn handle_uplink_data(&mut self, ue_id: i32, pdu: &RlsPduTransmission) {
         let psi = pdu.payload as i32;
-        
+
         debug!(
-            "Uplink data: ue_id={}, psi={}, len={}",
+            "Uplink data (RLC): ue_id={}, psi={}, len={}",
             ue_id,
             psi,
             pdu.pdu.len()
         );
 
-        // Forward to GTP task
-        let data = OctetString::from_slice(&pdu.pdu);
-        let msg = GtpMessage::DataPduDelivery {
-            ue_id,
-            psi,
-            pdu: data,
+        // Feed the RLC PDU into the entity and collect any reassembled SDUs,
+        // releasing the mutable borrow before the async send below.
+        let reassembled_sdus = {
+            let rlc = self.rlc_entity_for(ue_id);
+            rlc.receive_pdu(&pdu.pdu);
+            let mut sdus = Vec::new();
+            while let Some(sdu) = rlc.poll_reassembled() {
+                sdus.push(sdu);
+            }
+            sdus
         };
 
-        if let Err(e) = self.task_base.gtp_tx.send(msg).await {
-            error!("Failed to send uplink data to GTP task: {}", e);
+        for sdu in reassembled_sdus {
+            debug!(
+                "RLC reassembled SDU: ue_id={}, psi={}, len={}",
+                ue_id, psi, sdu.len()
+            );
+            let data = OctetString::from_slice(&sdu);
+            let msg = GtpMessage::DataPduDelivery {
+                ue_id,
+                psi,
+                pdu: data,
+            };
+            if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                error!("Failed to send uplink data to GTP task: {}", e);
+            }
         }
     }
 
@@ -314,7 +347,12 @@ impl RlsTask {
         self.send_rls_message(dest, &msg).await;
     }
 
-    /// Handles downlink user plane data from GTP task
+    /// Handles downlink user plane data from GTP task.
+    ///
+    /// The SDU from GTP is submitted to the per-UE RLC entity (UM, SN12).
+    /// One or more RLC PDUs are then built and sent over RLS to the UE.
+    /// A 1500-byte MTU is used as the MAC grant size so that typical IP
+    /// packets fit in a single PDU.
     async fn handle_downlink_data(&mut self, ue_id: i32, psi: i32, data: OctetString) {
         let dest = match self.ue_addresses.get(&ue_id) {
             Some(&addr) => addr,
@@ -325,22 +363,37 @@ impl RlsTask {
         };
 
         debug!(
-            "Downlink data: ue_id={}, psi={}, len={}",
+            "Downlink data (RLC): ue_id={}, psi={}, len={}",
             ue_id,
             psi,
             data.len()
         );
 
-        let pdu = RlsPduTransmission {
-            sti: self.sti,
-            pdu_type: PduType::Data,
-            pdu_id: 0, // Data PDUs don't require acknowledgment
-            payload: psi as u32,
-            pdu: Bytes::copy_from_slice(data.data()),
+        // Submit SDU to RLC and collect all resulting PDUs before releasing
+        // the mutable borrow so that self.sti and self.socket are accessible
+        // again for transmission.
+        let rlc_pdus = {
+            let rlc = self.rlc_entity_for(ue_id);
+            rlc.submit_sdu(data.data().to_vec());
+            let mut pdus = Vec::new();
+            while let Some(rlc_pdu) = rlc.build_pdu(1500) {
+                pdus.push(rlc_pdu);
+            }
+            pdus
         };
 
-        let msg = RlsProtocolMessage::PduTransmission(pdu);
-        self.send_rls_message(dest, &msg).await;
+        let sti = self.sti;
+        for rlc_pdu in rlc_pdus {
+            let transmission = RlsPduTransmission {
+                sti,
+                pdu_type: PduType::Data,
+                pdu_id: 0, // Data PDUs don't require RLS acknowledgment
+                payload: psi as u32,
+                pdu: Bytes::from(rlc_pdu),
+            };
+            let msg = RlsProtocolMessage::PduTransmission(transmission);
+            self.send_rls_message(dest, &msg).await;
+        }
     }
 
     /// Sends an RLS message to a destination
