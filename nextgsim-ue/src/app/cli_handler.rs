@@ -177,6 +177,8 @@ pub enum NasAction {
         /// Deregistration cause
         cause: DeregistrationCause,
     },
+    /// Initiate emergency registration
+    EmergencyRegister,
 }
 
 /// CLI command handler for the UE.
@@ -249,6 +251,9 @@ impl CliHandler {
                 self.handle_ps_release(*psi, rm_state, mm_state)
             }
             UeCliCommandType::PsReleaseAll => self.handle_ps_release_all(rm_state, mm_state),
+            UeCliCommandType::EmergencyRegister => {
+                self.handle_emergency_register(mm_state)
+            }
         }
     }
 
@@ -576,6 +581,27 @@ impl CliHandler {
             NasAction::ReleaseAllPduSessions {
                 sessions: release_pairs,
             },
+        )
+    }
+
+    /// Handles the `emergency-register` CLI command.
+    ///
+    /// Only valid when the UE is in DEREGISTERED state. Sends
+    /// `NasAction::EmergencyRegister` which the NAS task converts into an
+    /// `EmergencyRegistration` Registration Request.
+    fn handle_emergency_register(&self, mm_state: MmState) -> (CliCommandResult, NasAction) {
+        if mm_state != MmState::Deregistered {
+            return (
+                CliCommandResult::error(format!(
+                    "Emergency registration only allowed from DEREGISTERED state (current: {:?})",
+                    mm_state
+                )),
+                NasAction::None,
+            );
+        }
+        (
+            CliCommandResult::ok("Initiating emergency registration".to_string()),
+            NasAction::EmergencyRegister,
         )
     }
 

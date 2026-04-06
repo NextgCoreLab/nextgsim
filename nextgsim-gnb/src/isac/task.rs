@@ -1,14 +1,14 @@
 //! ISAC Task for gNB - Integrated Sensing and Communication
 
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use nextgsim_isac::{
     IsacManager, SensingData, SensingMeasurement, SensingType, TrackingState, Vector3,
 };
-use crate::tasks::{GnbTaskBase, IsacMessage, Task, TaskMessage};
+use crate::tasks::{GnbTaskBase, IsacMessage, NwdafMessage, Task, TaskMessage};
 
 pub struct IsacTask {
-    _task_base: GnbTaskBase,
+    task_base: GnbTaskBase,
     engine: IsacManager,
     trackers: std::collections::HashMap<u64, TrackingState>,
 }
@@ -16,7 +16,7 @@ pub struct IsacTask {
 impl IsacTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         Self {
-            _task_base: task_base,
+            task_base,
             engine: IsacManager::new(50),
             trackers: std::collections::HashMap::new(),
         }
@@ -77,7 +77,7 @@ impl Task for IsacTask {
                                 );
                             }
                             if let Some(fused) = self.engine.fuse_position(ue_id) {
-                                debug!(
+                                info!(
                                     "ISAC: Fused position for UE {}: ({:.1}, {:.1}, {:.1}), confidence={:.2}",
                                     ue_id,
                                     fused.position.x,
@@ -85,6 +85,22 @@ impl Task for IsacTask {
                                     fused.position.z,
                                     fused.confidence
                                 );
+                                // Forward fused position to NWDAF for analytics
+                                if let Some(ref sixg) = self.task_base.sixg {
+                                    let nwdaf_msg = NwdafMessage::UeMeasurement {
+                                        ue_id: ue_id as i32,
+                                        rsrp: 0.0,
+                                        rsrq: 0.0,
+                                        position: (
+                                            fused.position.x as f32,
+                                            fused.position.y as f32,
+                                            fused.position.z as f32,
+                                        ),
+                                    };
+                                    if let Err(e) = sixg.nwdaf_tx.send(nwdaf_msg).await {
+                                        warn!("ISAC: Failed to forward position to NWDAF: {}", e);
+                                    }
+                                }
                             }
                         }
                         IsacMessage::TrackingUpdate { object_id, position, velocity: _ } => {

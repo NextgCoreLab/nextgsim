@@ -319,6 +319,8 @@ pub enum UeCliCommandType {
     },
     /// Release all PDU sessions
     PsReleaseAll,
+    /// Initiate emergency registration
+    EmergencyRegister,
 }
 
 
@@ -407,6 +409,11 @@ pub enum NasMessage {
     /// Triggered when UE has data to send while in CM-IDLE or CM-INACTIVE state.
     /// Sends NAS Service Request message (5GMM type 0x4C) via RRC.
     InitiateServiceRequest,
+    /// Initiate emergency registration (from App/CLI).
+    ///
+    /// Builds a `RegistrationRequest` with `RegistrationType::EmergencyRegistration`
+    /// and sends it via RRC. The UE must currently be in a DEREGISTERED sub-state.
+    InitiateEmergencyRegistration,
 }
 
 // ============================================================================

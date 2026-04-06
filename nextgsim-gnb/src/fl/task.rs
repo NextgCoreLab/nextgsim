@@ -7,7 +7,7 @@ use nextgsim_fl::{FederatedAggregator, AggregationAlgorithm, ModelUpdate};
 use crate::tasks::{GnbTaskBase, FlAggregatorMessage, Task, TaskMessage};
 
 pub struct FlAggregatorTask {
-    _task_base: GnbTaskBase,
+    task_base: GnbTaskBase,
     aggregator: FederatedAggregator,
     participants: HashMap<String, u64>,
     current_round: u64,
@@ -16,7 +16,7 @@ pub struct FlAggregatorTask {
 impl FlAggregatorTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         Self {
-            _task_base: task_base,
+            task_base,
             aggregator: FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2),
             participants: HashMap::new(),
             current_round: 0,
@@ -61,8 +61,14 @@ impl Task for FlAggregatorTask {
                             self.current_round = round;
                             match self.aggregator.aggregate() {
                                 Ok(model) => {
-                                    info!("FL: Aggregation complete for round {}, {} participants, {} params",
-                                        round, model.num_participants, model.weights.len());
+                                    info!(
+                                        "FL: Aggregation complete for round {}, {} participants, \
+                                         {} params, nci={}",
+                                        round,
+                                        model.num_participants,
+                                        model.weights.len(),
+                                        self.task_base.config.nci,
+                                    );
                                 }
                                 Err(e) => {
                                     warn!("FL: Aggregation failed for round {}: {}", round, e);

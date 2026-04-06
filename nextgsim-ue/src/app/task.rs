@@ -185,6 +185,15 @@ impl AppTask {
                     error!("Failed to send deregistration request: {}", e);
                 }
             }
+            NasAction::EmergencyRegister => {
+                info!("CLI: triggering emergency registration");
+                if let Err(e) = self.task_base.nas_tx
+                    .send(NasMessage::InitiateEmergencyRegistration)
+                    .await
+                {
+                    error!("Failed to send emergency registration request: {}", e);
+                }
+            }
         }
     }
 
@@ -277,6 +286,7 @@ impl AppTask {
 /// - `ps-establish [--type <type>] [--apn <apn>] [--sst <sst>]` - Establish PDU session
 /// - `ps-release <psi>` - Release PDU session
 /// - `ps-release-all` - Release all PDU sessions
+/// - `emergency-register` - Initiate emergency registration (from DEREGISTERED state)
 ///
 /// # Returns
 ///
@@ -344,6 +354,7 @@ pub fn parse_ue_cli_command(input: &str) -> Result<UeCliCommandType, String> {
             Ok(UeCliCommandType::PsRelease { psi })
         }
         "ps-release-all" => Ok(UeCliCommandType::PsReleaseAll),
+        "emergency-register" => Ok(UeCliCommandType::EmergencyRegister),
         "ps-list" => {
             // Alias for status (shows PDU sessions)
             Ok(UeCliCommandType::Status)

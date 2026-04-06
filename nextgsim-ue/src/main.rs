@@ -889,6 +889,56 @@ impl UeApp {
                                                 }
                                             }
                                         }
+                                        MmMessageType::ConfigurationUpdateCommand => {
+                                            // Decode optional IEs (after the 3-byte NAS header)
+                                            let header_len = 3; // EPD + SecHdr + MsgType
+                                            use nextgsim_ue::nas::mm::{
+                                                ConfigurationUpdateCommand as CuCmd,
+                                                ConfigurationUpdateComplete as CuComplete,
+                                                ConfigUpdateProcedure,
+                                            };
+                                            let cmd = if pdu.len() > header_len {
+                                                CuCmd::decode(&mut &pdu.data()[header_len..])
+                                                    .unwrap_or_default()
+                                            } else {
+                                                CuCmd::default()
+                                            };
+                                            let result = ConfigUpdateProcedure::process_command(&cmd);
+
+                                            // Store new GUTI if provided
+                                            if let Some(ref new_guti) = result.new_guti {
+                                                info!(
+                                                    "ConfigurationUpdate: new GUTI received (type={:?})",
+                                                    new_guti.identity_type
+                                                );
+                                                // In a full implementation the GUTI would be
+                                                // persisted in the MM context; we log it here.
+                                            }
+                                            if let Some(t) = result.new_t3512_secs {
+                                                info!("ConfigurationUpdate: T3512 updated to {}s", t);
+                                            }
+                                            if result.re_register {
+                                                info!("ConfigurationUpdate: re-registration requested");
+                                                mm_state.switch_mm_state(MmSubState::RegisteredUpdateNeeded);
+                                            }
+
+                                            // Send ConfigurationUpdateComplete if ACK bit was set
+                                            if result.send_complete {
+                                                let mut nas_pdu = Vec::new();
+                                                CuComplete::new().encode(&mut nas_pdu);
+                                                info!(
+                                                    "Sending ConfigurationUpdateComplete, len={}",
+                                                    nas_pdu.len()
+                                                );
+                                                pdu_counter += 1;
+                                                let _ = task_base.rrc_tx.send(
+                                                    RrcMessage::UplinkNasDelivery {
+                                                        pdu_id: pdu_counter,
+                                                        pdu: nas_pdu.into(),
+                                                    }
+                                                ).await;
+                                            }
+                                        }
                                         _ => {
                                             info!("Unhandled NAS message type: {:?}", msg_type);
                                         }
@@ -1165,6 +1215,50 @@ impl UeApp {
                                 pdu_id: pdu_counter,
                                 pdu: nas_pdu.into(),
                             }).await;
+                        }
+                        NasMessage::InitiateEmergencyRegistration => {
+                            info!("Initiating emergency registration");
+
+                            use nextgsim_ue::nas::mm::EmergencyRegistrationProcedure;
+
+                            let mut emerg_proc = EmergencyRegistrationProcedure::new();
+
+                            // Use IMEI as identity if SUCI is not available (no USIM).
+                            // Here we always build a SUCI — a full implementation would
+                            // fall back to IMEI when no USIM is present.
+                            let suci_data = build_suci_from_config(&task_base.config);
+                            let mobile_identity = Ie5gsMobileIdentity::new(
+                                MobileIdentityType::Suci,
+                                suci_data,
+                            );
+
+                            use nextgsim_ue::nas::mm::MmState;
+                            match emerg_proc.initiate(
+                                MmState::Deregistered,
+                                MmSubState::DeregisteredNormalService,
+                                None,
+                                mobile_identity,
+                                false,
+                            ) {
+                                Ok((req, new_sub_state)) => {
+                                    let mut nas_pdu = Vec::new();
+                                    req.encode(&mut nas_pdu);
+                                    info!(
+                                        "Sending Emergency Registration Request, len={}, new_sub_state={:?}",
+                                        nas_pdu.len(), new_sub_state
+                                    );
+                                    mm_state.switch_mm_state(new_sub_state);
+                                    registration_sent = true;
+                                    pdu_counter += 1;
+                                    let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
+                                        pdu_id: pdu_counter,
+                                        pdu: nas_pdu.into(),
+                                    }).await;
+                                }
+                                Err(e) => {
+                                    warn!("Emergency registration initiation failed: {}", e);
+                                }
+                            }
                         }
                         NasMessage::DownlinkDataDelivery { psi, data } => {
                             // Forward downlink data to TUN interface
