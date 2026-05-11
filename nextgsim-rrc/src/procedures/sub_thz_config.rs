@@ -337,7 +337,9 @@ impl SubThzBandConfig {
                 "Maximum link distance must be > 0".to_string(),
             ));
         }
-        if self.atmospheric_config.humidity_factor < 0.0 || self.atmospheric_config.humidity_factor > 1.0 {
+        if self.atmospheric_config.humidity_factor < 0.0
+            || self.atmospheric_config.humidity_factor > 1.0
+        {
             return Err(SubThzConfigError::InvalidConfig(
                 "Humidity factor must be in range [0.0, 1.0]".to_string(),
             ));
@@ -462,14 +464,20 @@ pub fn decode_sub_thz_config_header(
     let band = match bytes[2] {
         0 => SubThzBand::DBand,
         1 => SubThzBand::HBand,
-        2 => SubThzBand::Custom { min_ghz: 100, max_ghz: 300 },
-        _ => return Err(SubThzConfigError::CodecError("Unknown band type".to_string())),
+        2 => SubThzBand::Custom {
+            min_ghz: 100,
+            max_ghz: 300,
+        },
+        _ => {
+            return Err(SubThzConfigError::CodecError(
+                "Unknown band type".to_string(),
+            ))
+        }
     };
-    let center_freq_ghz = u16::from_be_bytes(
-        bytes[3..5]
-            .try_into()
-            .map_err(|_| SubThzConfigError::CodecError("Invalid center_freq_ghz bytes".to_string()))?,
-    );
+    let center_freq_ghz =
+        u16::from_be_bytes(bytes[3..5].try_into().map_err(|_| {
+            SubThzConfigError::CodecError("Invalid center_freq_ghz bytes".to_string())
+        })?);
     let channel_model = match bytes[7] {
         0 => SubThzChannelModel::LineOfSight,
         1 => SubThzChannelModel::NonLineOfSight,
@@ -477,7 +485,11 @@ pub fn decode_sub_thz_config_header(
         3 => SubThzChannelModel::IndoorShortRange,
         4 => SubThzChannelModel::OutdoorUrban,
         5 => SubThzChannelModel::BackhaulFronthaul,
-        _ => return Err(SubThzConfigError::CodecError("Unknown channel model".to_string())),
+        _ => {
+            return Err(SubThzConfigError::CodecError(
+                "Unknown channel model".to_string(),
+            ))
+        }
     };
 
     Ok((config_id, band, center_freq_ghz, channel_model))
@@ -721,7 +733,10 @@ mod tests {
         assert_eq!(min, 220);
         assert_eq!(max, 330);
 
-        let custom = SubThzBand::Custom { min_ghz: 150, max_ghz: 200 };
+        let custom = SubThzBand::Custom {
+            min_ghz: 150,
+            max_ghz: 200,
+        };
         let (min, max) = custom.frequency_range_ghz();
         assert_eq!(min, 150);
         assert_eq!(max, 200);
@@ -732,8 +747,10 @@ mod tests {
         let config = create_test_config();
         let subcarriers = config.approximate_subcarriers(0).unwrap();
         // 2.0 GHz / 960 kHz = ~2083 subcarriers
-        assert!(subcarriers > 2_000 && subcarriers < 3_000,
-            "Expected ~2083 subcarriers, got {subcarriers}");
+        assert!(
+            subcarriers > 2_000 && subcarriers < 3_000,
+            "Expected ~2083 subcarriers, got {subcarriers}"
+        );
     }
 
     #[test]

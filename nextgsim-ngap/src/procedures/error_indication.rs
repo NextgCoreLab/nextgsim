@@ -211,7 +211,9 @@ pub struct ErrorIndicationData {
 /// # Returns
 /// * `Ok(NGAP_PDU)` - The constructed PDU
 /// * `Err(ErrorIndicationError)` - If construction fails
-pub fn build_error_indication(params: &ErrorIndicationParams) -> Result<NGAP_PDU, ErrorIndicationError> {
+pub fn build_error_indication(
+    params: &ErrorIndicationParams,
+) -> Result<NGAP_PDU, ErrorIndicationError> {
     let mut protocol_ies = Vec::new();
 
     // IE: AMF-UE-NGAP-ID (optional)
@@ -673,7 +675,9 @@ fn parse_criticality_diagnostics(
 /// # Returns
 /// * `Ok(Vec<u8>)` - The encoded bytes
 /// * `Err(ErrorIndicationError)` - If building or encoding fails
-pub fn encode_error_indication(params: &ErrorIndicationParams) -> Result<Vec<u8>, ErrorIndicationError> {
+pub fn encode_error_indication(
+    params: &ErrorIndicationParams,
+) -> Result<Vec<u8>, ErrorIndicationError> {
     let pdu = build_error_indication(params)?;
     Ok(encode_ngap_pdu(&pdu)?)
 }
@@ -792,7 +796,6 @@ pub fn error_indication_missing_ie(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,9 +866,7 @@ mod tests {
         let params = ErrorIndicationParams {
             amf_ue_ngap_id: Some(12345),
             ran_ue_ngap_id: Some(67890),
-            cause: Some(NgSetupFailureCause::Protocol(
-                ProtocolCause::SemanticError,
-            )),
+            cause: Some(NgSetupFailureCause::Protocol(ProtocolCause::SemanticError)),
             criticality_diagnostics: None,
         };
 

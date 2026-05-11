@@ -2,12 +2,77 @@
 //!
 //! This module manages SCTP connections to AMF (Access and Mobility Management Function).
 //! Each AMF connection is represented by an `AmfConnection` which wraps an SCTP association.
+//!
+//! When `AmfConnectionConfig::secondary_addresses` is non-empty a
+//! `MultihomeSctpAssociation` is used so the transport can fail over to an
+//! alternate path without tearing down the NGAP session.
 
 use std::net::SocketAddr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use nextgsim_common::OctetString;
-use nextgsim_sctp::{SctpAssociation, SctpConfig, SctpError};
+use nextgsim_sctp::{
+    MultihomeSctpAssociation, MultihomingConfig, ReceivedMessage, SctpAssociation, SctpConfig,
+    SctpError,
+};
+
+// ---------------------------------------------------------------------------
+// Internal association abstraction
+// ---------------------------------------------------------------------------
+
+/// Thin enum that lets `AmfConnection` hold either a plain SCTP association
+/// or a multi-homed one without boxing.  Both variants expose the same
+/// async API (`send`, `recv`, `shutdown`, `poll`, `try_recv`).
+enum AssociationKind {
+    Single(SctpAssociation),
+    Multihome(MultihomeSctpAssociation),
+}
+
+impl AssociationKind {
+    async fn send(&mut self, stream_id: u16, data: &[u8]) -> Result<(), SctpError> {
+        match self {
+            Self::Single(a) => a.send(stream_id, data).await,
+            Self::Multihome(a) => a.send(stream_id, data).await,
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Option<ReceivedMessage>, SctpError> {
+        match self {
+            Self::Single(a) => a.recv().await,
+            Self::Multihome(a) => a.recv().await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<(), SctpError> {
+        match self {
+            Self::Single(a) => a.shutdown().await,
+            Self::Multihome(a) => a.shutdown().await,
+        }
+    }
+
+    async fn poll(&mut self) -> Result<(), SctpError> {
+        match self {
+            Self::Single(a) => a.poll().await,
+            Self::Multihome(a) => a.poll().await,
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<Option<ReceivedMessage>, SctpError> {
+        match self {
+            Self::Single(a) => a.try_recv(),
+            Self::Multihome(a) => a.try_recv(),
+        }
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        match self {
+            Self::Single(a) => a.local_addr(),
+            Self::Multihome(a) => a.local_addr(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 /// AMF connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +127,13 @@ pub enum AmfConnectionEvent {
 pub struct AmfConnectionConfig {
     /// Local address to bind
     pub local_address: SocketAddr,
-    /// Remote AMF address
+    /// Remote AMF address (primary)
     pub remote_address: SocketAddr,
+    /// Secondary remote addresses for SCTP multi-homing.
+    ///
+    /// When non-empty a `MultihomeSctpAssociation` is used.  Each entry must
+    /// be a valid `SocketAddr` string (e.g. `"192.168.1.2:38412"`).
+    pub secondary_addresses: Vec<SocketAddr>,
     /// SCTP configuration
     pub sctp_config: SctpConfig,
 }
@@ -73,6 +143,7 @@ impl Default for AmfConnectionConfig {
         Self {
             local_address: "0.0.0.0:0".parse().expect("value expected"),
             remote_address: "127.0.0.1:38412".parse().expect("value expected"),
+            secondary_addresses: Vec::new(),
             sctp_config: SctpConfig::default(),
         }
     }
@@ -82,8 +153,8 @@ impl Default for AmfConnectionConfig {
 pub struct AmfConnection {
     /// Client ID for this connection
     client_id: i32,
-    /// SCTP association
-    association: Option<SctpAssociation>,
+    /// SCTP association (single-homed or multi-homed)
+    association: Option<AssociationKind>,
     /// Connection state
     state: AmfConnectionState,
     /// Remote AMF address
@@ -113,30 +184,55 @@ impl AmfConnection {
         }
     }
 
-    /// Establishes the SCTP connection to the AMF
-    pub async fn connect(&mut self, config: &SctpConfig) -> Result<AmfConnectionEvent, SctpError> {
+    /// Establishes the SCTP connection to the AMF.
+    ///
+    /// When `AmfConnectionConfig::secondary_addresses` is non-empty a
+    /// `MultihomeSctpAssociation` is used, enabling automatic path failover.
+    pub async fn connect(
+        &mut self,
+        config: &AmfConnectionConfig,
+    ) -> Result<AmfConnectionEvent, SctpError> {
         info!(
-            "Connecting to AMF at {} (client_id: {})",
-            self.remote_address, self.client_id
+            "Connecting to AMF at {} (client_id: {}, multi-homed: {})",
+            self.remote_address,
+            self.client_id,
+            !config.secondary_addresses.is_empty(),
         );
 
         self.state = AmfConnectionState::Connecting;
 
-        let association = SctpAssociation::connect_with_local(
-            self.local_address,
-            self.remote_address,
-            config.clone(),
-        )
-        .await?;
+        let kind = if config.secondary_addresses.is_empty() {
+            // Plain single-homed SCTP association.
+            let association = SctpAssociation::connect_with_local(
+                self.local_address,
+                self.remote_address,
+                config.sctp_config.clone(),
+            )
+            .await?;
+            self.local_address = association.local_addr();
+            AssociationKind::Single(association)
+        } else {
+            // Multi-homed SCTP association.
+            let mut mh_config = MultihomingConfig::new(self.local_address, self.remote_address);
+            for &secondary in &config.secondary_addresses {
+                warn!(
+                    "SCTP multi-homing: registering secondary AMF address {} (client_id: {})",
+                    secondary, self.client_id
+                );
+                mh_config = mh_config.with_remote_address(secondary);
+            }
+            let association =
+                MultihomeSctpAssociation::connect(mh_config, config.sctp_config.clone()).await?;
+            self.local_address = association.local_addr();
+            AssociationKind::Multihome(association)
+        };
 
-        // Get stream counts from the association
-        // For now, use default values since sctp-proto doesn't expose negotiated stream counts directly
-        self.in_streams = config.max_inbound_streams;
-        self.out_streams = config.max_outbound_streams;
-        self.association_id = Some(self.client_id); // Use client_id as association_id for simplicity
-        self.local_address = association.local_addr();
+        // Use config values; sctp-proto doesn't expose negotiated counts directly.
+        self.in_streams = config.sctp_config.max_inbound_streams;
+        self.out_streams = config.sctp_config.max_outbound_streams;
+        self.association_id = Some(self.client_id);
 
-        self.association = Some(association);
+        self.association = Some(kind);
         self.state = AmfConnectionState::Connected;
 
         info!(
@@ -152,7 +248,7 @@ impl AmfConnection {
         })
     }
 
-    /// Sends data to the AMF on the specified stream
+    /// Sends data to the AMF on the specified stream.
     pub async fn send(&mut self, stream: u16, data: &[u8]) -> Result<(), SctpError> {
         if self.state != AmfConnectionState::Connected {
             return Err(SctpError::InvalidState(
@@ -160,27 +256,27 @@ impl AmfConnection {
             ));
         }
 
-        if let Some(ref mut association) = self.association {
+        if let Some(ref mut kind) = self.association {
             debug!(
                 "Sending {} bytes to AMF on stream {} (client_id: {})",
                 data.len(),
                 stream,
                 self.client_id
             );
-            association.send(stream, data).await
+            kind.send(stream, data).await
         } else {
             Err(SctpError::AssociationClosed)
         }
     }
 
-    /// Receives a message from the AMF (blocking)
+    /// Receives a message from the AMF (blocking).
     pub async fn recv(&mut self) -> Result<Option<AmfConnectionEvent>, SctpError> {
         if self.state == AmfConnectionState::Closed {
             return Ok(None);
         }
 
-        if let Some(ref mut association) = self.association {
-            match association.recv().await {
+        if let Some(ref mut kind) = self.association {
+            match kind.recv().await {
                 Ok(Some(msg)) => {
                     debug!(
                         "Received {} bytes from AMF on stream {} (client_id: {})",
@@ -195,7 +291,6 @@ impl AmfConnection {
                     }))
                 }
                 Ok(None) => {
-                    // Association closed
                     self.state = AmfConnectionState::Closed;
                     Ok(Some(AmfConnectionEvent::AssociationDown {
                         client_id: self.client_id,
@@ -214,19 +309,20 @@ impl AmfConnection {
         }
     }
 
-    /// Tries to receive a message without blocking
-    /// This polls the underlying SCTP association for incoming UDP packets
+    /// Tries to receive a message without blocking.
+    ///
+    /// Polls the underlying SCTP association for incoming UDP packets, then
+    /// returns any buffered message.
     pub async fn try_recv(&mut self) -> Result<Option<AmfConnectionEvent>, SctpError> {
         if self.state == AmfConnectionState::Closed {
             return Ok(None);
         }
 
-        if let Some(ref mut association) = self.association {
-            // First poll for incoming UDP packets
-            association.poll().await?;
+        if let Some(ref mut kind) = self.association {
+            // Drive the state machine with any pending UDP datagrams.
+            kind.poll().await?;
 
-            // Then try to receive any available messages
-            match association.try_recv() {
+            match kind.try_recv() {
                 Ok(Some(msg)) => {
                     debug!(
                         "Received {} bytes from AMF on stream {} (client_id: {})",
@@ -248,7 +344,7 @@ impl AmfConnection {
         }
     }
 
-    /// Gracefully closes the connection
+    /// Gracefully closes the connection.
     pub async fn close(&mut self) -> Result<(), SctpError> {
         if self.state == AmfConnectionState::Closed {
             return Ok(());
@@ -257,8 +353,8 @@ impl AmfConnection {
         info!("Closing AMF connection (client_id: {})", self.client_id);
         self.state = AmfConnectionState::Closing;
 
-        if let Some(ref mut association) = self.association {
-            association.shutdown().await?;
+        if let Some(ref mut kind) = self.association {
+            kind.shutdown().await?;
         }
 
         self.association = None;
@@ -287,9 +383,15 @@ impl AmfConnection {
         self.remote_address
     }
 
-    /// Returns the local address
+    /// Returns the local address (reflects the OS-assigned port after connect).
     pub fn local_address(&self) -> SocketAddr {
-        self.local_address
+        // If connected, read the actual local address from the association so
+        // that the OS-assigned port is always returned correctly.
+        if let Some(ref kind) = self.association {
+            kind.local_addr()
+        } else {
+            self.local_address
+        }
     }
 
     /// Returns the association ID if connected
@@ -319,7 +421,10 @@ mod tests {
 
     #[test]
     fn test_amf_connection_state() {
-        assert_ne!(AmfConnectionState::Connecting, AmfConnectionState::Connected);
+        assert_ne!(
+            AmfConnectionState::Connecting,
+            AmfConnectionState::Connected
+        );
         assert_ne!(AmfConnectionState::Connected, AmfConnectionState::Closing);
         assert_ne!(AmfConnectionState::Closing, AmfConnectionState::Closed);
     }

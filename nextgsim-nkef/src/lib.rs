@@ -72,7 +72,9 @@ pub use temporal::{
     AttributeChange, EntityHistory, EntityHistoryStore, TemporalRelationship,
     TemporalRelationshipStore, Timestamp,
 };
-pub use vector::{SimilarityResult, VectorIndex, cosine_similarity, dot_product, l2_norm, normalize};
+pub use vector::{
+    cosine_similarity, dot_product, l2_norm, normalize, SimilarityResult, VectorIndex,
+};
 
 /// Entity type in the knowledge graph
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -270,7 +272,10 @@ impl std::fmt::Debug for KnowledgeGraph {
             .field("entity_count", &self.entities.len())
             .field("relationship_count", &self.relationships.len())
             .field("vector_index_size", &self.vector_index.len())
-            .field("temporal_relationship_count", &self.temporal_relationships.total_count())
+            .field(
+                "temporal_relationship_count",
+                &self.temporal_relationships.total_count(),
+            )
             .field("entity_history_count", &self.entity_histories.len())
             .finish()
     }
@@ -329,22 +334,17 @@ impl KnowledgeGraph {
                 for (key, new_val) in &entity.properties {
                     let old_val = old_entity.properties.get(key);
                     if old_val.map(|v| v != new_val).unwrap_or(true) {
-                        changed.insert(
-                            key.clone(),
-                            (old_val.cloned(), Some(new_val.clone())),
-                        );
+                        changed.insert(key.clone(), (old_val.cloned(), Some(new_val.clone())));
                     }
                 }
                 for (key, old_val) in &old_entity.properties {
                     if !entity.properties.contains_key(key) {
-                        changed.insert(
-                            key.clone(),
-                            (Some(old_val.clone()), None),
-                        );
+                        changed.insert(key.clone(), (Some(old_val.clone()), None));
                     }
                 }
 
-                self.event_bus.dispatch(KnowledgeEvent::entity_updated(&id, now, changed));
+                self.event_bus
+                    .dispatch(KnowledgeEvent::entity_updated(&id, now, changed));
             }
         } else {
             // New entity - add to type index
@@ -359,7 +359,8 @@ impl KnowledgeGraph {
                 history.record_change(key.clone(), None, Some(value.clone()));
             }
 
-            self.event_bus.dispatch(KnowledgeEvent::entity_created(&id, now));
+            self.event_bus
+                .dispatch(KnowledgeEvent::entity_created(&id, now));
         }
 
         // Generate embedding if not already present
@@ -407,16 +408,24 @@ impl KnowledgeGraph {
                 .relationships
                 .iter()
                 .filter(|r| r.source_id == id || r.target_id == id)
-                .map(|r| (r.source_id.clone(), r.target_id.clone(), r.relation_type.clone()))
+                .map(|r| {
+                    (
+                        r.source_id.clone(),
+                        r.target_id.clone(),
+                        r.relation_type.clone(),
+                    )
+                })
                 .collect();
-            self.relationships.retain(|r| r.source_id != id && r.target_id != id);
+            self.relationships
+                .retain(|r| r.source_id != id && r.target_id != id);
 
             // Dispatch relationship removal events
             let now = temporal::now_millis();
             for (source, target, rel_type) in &removed_rels {
-                self.event_bus.dispatch(KnowledgeEvent::relationship_removed(
-                    source, target, rel_type, now,
-                ));
+                self.event_bus
+                    .dispatch(KnowledgeEvent::relationship_removed(
+                        source, target, rel_type, now,
+                    ));
             }
 
             // Expire temporal relationships
@@ -426,7 +435,8 @@ impl KnowledgeGraph {
             self.vector_index.remove(id);
 
             // Dispatch entity removed event
-            self.event_bus.dispatch(KnowledgeEvent::entity_removed(id, now));
+            self.event_bus
+                .dispatch(KnowledgeEvent::entity_removed(id, now));
 
             Some(entity)
         } else {
@@ -489,7 +499,8 @@ impl KnowledgeGraph {
         entity_id: &str,
         timestamp: Timestamp,
     ) -> Vec<&TemporalRelationship> {
-        self.temporal_relationships.for_entity_at_time(entity_id, timestamp)
+        self.temporal_relationships
+            .for_entity_at_time(entity_id, timestamp)
     }
 
     /// Gets the history of attribute changes for an entity.
@@ -503,7 +514,9 @@ impl KnowledgeGraph {
         entity_id: &str,
         timestamp: Timestamp,
     ) -> Option<HashMap<String, String>> {
-        self.entity_histories.get(entity_id).map(|h| h.state_at(timestamp))
+        self.entity_histories
+            .get(entity_id)
+            .map(|h| h.state_at(timestamp))
     }
 
     /// Keyword-based search (backward compatible).
@@ -625,11 +638,7 @@ impl KnowledgeGraph {
     /// Generates RAG context with full configuration control.
     ///
     /// Returns a [`BuiltContext`] with detailed metadata about the context.
-    pub fn generate_context_with_config(
-        &self,
-        prompt: &str,
-        config: RagConfig,
-    ) -> BuiltContext {
+    pub fn generate_context_with_config(&self, prompt: &str, config: RagConfig) -> BuiltContext {
         let results = self.search(prompt, config.max_entries);
 
         let mut builder = ContextBuilder::with_config(config);
@@ -741,7 +750,10 @@ impl KnowledgeGraph {
 
     /// Returns all entity IDs in the graph.
     pub fn entity_ids(&self) -> Vec<&str> {
-        self.entities.keys().map(std::string::String::as_str).collect()
+        self.entities
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Returns an iterator over all entities.
@@ -772,7 +784,6 @@ impl std::fmt::Debug for NkefManager {
             .finish()
     }
 }
-
 
 impl NkefManager {
     /// Creates a new NKEF manager
@@ -816,11 +827,7 @@ impl NkefManager {
     }
 
     /// Retrieves context for RAG with full configuration control.
-    pub fn retrieve_context_with_config(
-        &self,
-        prompt: &str,
-        config: RagConfig,
-    ) -> BuiltContext {
+    pub fn retrieve_context_with_config(&self, prompt: &str, config: RagConfig) -> BuiltContext {
         self.graph.generate_context_with_config(prompt, config)
     }
 
@@ -892,12 +899,8 @@ mod tests {
     fn test_knowledge_graph() {
         let mut graph = KnowledgeGraph::new();
 
-        graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"),
-        );
-        graph.add_entity(
-            Entity::new("ue-001", EntityType::Ue).with_property("imsi", "12345"),
-        );
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"));
+        graph.add_entity(Entity::new("ue-001", EntityType::Ue).with_property("imsi", "12345"));
 
         graph.add_relationship(Relationship::new("ue-001", "gnb-001", "connected_to"));
 
@@ -915,12 +918,9 @@ mod tests {
         graph.add_entity(
             Entity::new("gnb-001", EntityType::Gnb).with_property("name", "Main Tower"),
         );
-        graph.add_entity(
-            Entity::new("gnb-002", EntityType::Gnb).with_property("name", "Secondary"),
-        );
-        graph.add_entity(
-            Entity::new("ue-001", EntityType::Ue).with_property("name", "Test UE"),
-        );
+        graph
+            .add_entity(Entity::new("gnb-002", EntityType::Gnb).with_property("name", "Secondary"));
+        graph.add_entity(Entity::new("ue-001", EntityType::Ue).with_property("name", "Test UE"));
 
         let results = graph.search("tower", 10);
         assert!(!results.is_empty());
@@ -947,9 +947,8 @@ mod tests {
     fn test_nkef_manager() {
         let mut manager = NkefManager::new(384);
 
-        manager.update_entity(
-            Entity::new("cell-001", EntityType::Cell).with_property("pci", "100"),
-        );
+        manager
+            .update_entity(Entity::new("cell-001", EntityType::Cell).with_property("pci", "100"));
 
         let context = QueryContext {
             intent: "find_cell".to_string(),
@@ -1004,8 +1003,7 @@ mod tests {
         let mut graph = KnowledgeGraph::with_embedding_dim(64);
 
         graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb)
-                .with_property("name", "Tower Alpha"),
+            Entity::new("gnb-001", EntityType::Gnb).with_property("name", "Tower Alpha"),
         );
 
         // Entity should have an embedding automatically generated
@@ -1021,12 +1019,8 @@ mod tests {
     fn test_rebuild_embeddings() {
         let mut graph = KnowledgeGraph::with_embedding_dim(64);
 
-        graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb).with_property("name", "Alpha"),
-        );
-        graph.add_entity(
-            Entity::new("gnb-002", EntityType::Gnb).with_property("name", "Beta"),
-        );
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb).with_property("name", "Alpha"));
+        graph.add_entity(Entity::new("gnb-002", EntityType::Gnb).with_property("name", "Beta"));
 
         // Rebuild to get proper TF-IDF vocabulary
         graph.rebuild_embeddings();
@@ -1039,12 +1033,9 @@ mod tests {
     fn test_temporal_relationship_in_graph() {
         let mut graph = KnowledgeGraph::new();
 
-        graph.add_entity(
-            Entity::new("ue-001", EntityType::Ue).with_property("status", "connected"),
-        );
-        graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"),
-        );
+        graph
+            .add_entity(Entity::new("ue-001", EntityType::Ue).with_property("status", "connected"));
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"));
 
         graph.add_temporal_relationship(TemporalRelationship::with_validity(
             "ue-001",
@@ -1079,9 +1070,7 @@ mod tests {
         let mut graph = KnowledgeGraph::new();
 
         // Create entity
-        graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"),
-        );
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"));
 
         // Update entity
         graph.add_entity(
@@ -1089,7 +1078,9 @@ mod tests {
         );
 
         // Check history
-        let history = graph.get_entity_history("gnb-001").expect("should have history");
+        let history = graph
+            .get_entity_history("gnb-001")
+            .expect("should have history");
         assert!(history.change_count() >= 2); // at least initial + update
 
         let status_changes = history.changes_for_key("status");
@@ -1150,9 +1141,7 @@ mod tests {
         assert_eq!(create_count.load(Ordering::SeqCst), 1);
 
         // Update
-        graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"),
-        );
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"));
         assert_eq!(update_count.load(Ordering::SeqCst), 1);
 
         // Add relationship
@@ -1174,7 +1163,9 @@ mod tests {
 
         let events = manager.drain_events();
         assert_eq!(events.len(), 3);
-        assert!(events.iter().all(|e| e.kind == KnowledgeEventKind::EntityCreated));
+        assert!(events
+            .iter()
+            .all(|e| e.kind == KnowledgeEventKind::EntityCreated));
     }
 
     #[test]
@@ -1186,10 +1177,7 @@ mod tests {
                 .with_property("status", "active")
                 .with_property("load", "75%"),
         );
-        graph.add_entity(
-            Entity::new("ue-001", EntityType::Ue)
-                .with_property("imsi", "12345"),
-        );
+        graph.add_entity(Entity::new("ue-001", EntityType::Ue).with_property("imsi", "12345"));
         graph.add_relationship(Relationship::new("ue-001", "gnb-001", "connected_to"));
 
         let config = RagConfig::default()
@@ -1205,10 +1193,7 @@ mod tests {
     fn test_rag_context_json_format() {
         let mut graph = KnowledgeGraph::with_embedding_dim(64);
 
-        graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb)
-                .with_property("status", "active"),
-        );
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb).with_property("status", "active"));
 
         let config = RagConfig::default()
             .with_max_tokens(2000)
@@ -1290,10 +1275,8 @@ mod tests {
         let mut graph = KnowledgeGraph::with_embedding_dim(3);
         let custom_emb = vec![0.5, 0.3, 0.1];
 
-        graph.add_entity(
-            Entity::new("gnb-001", EntityType::Gnb)
-                .with_embedding(custom_emb.clone()),
-        );
+        graph
+            .add_entity(Entity::new("gnb-001", EntityType::Gnb).with_embedding(custom_emb.clone()));
 
         let entity = graph.get_entity("gnb-001").expect("entity exists");
         assert_eq!(entity.embedding.as_ref(), Some(&custom_emb));
@@ -1309,9 +1292,7 @@ mod tests {
         graph.add_entity(
             Entity::new("gnb-002", EntityType::Gnb).with_property("name", "Beta Tower"),
         );
-        graph.add_entity(
-            Entity::new("ue-001", EntityType::Ue).with_property("name", "User Phone"),
-        );
+        graph.add_entity(Entity::new("ue-001", EntityType::Ue).with_property("name", "User Phone"));
 
         graph.rebuild_embeddings();
 

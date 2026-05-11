@@ -446,7 +446,9 @@ impl SecAggParticipant {
         let mut state = seed;
         let mask: Vec<f32> = (0..dim)
             .map(|_| {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 // Map to small float in [-0.01, 0.01]
                 let bits = ((state >> 33) as i32) % 10000;
                 bits as f32 / 1_000_000.0
@@ -679,10 +681,7 @@ impl FederatedAggregator {
     pub fn submit_update(&mut self, update: ModelUpdate) -> Result<(), String> {
         // Check conditions first with an immutable borrow
         {
-            let round = self
-                .current_round
-                .as_ref()
-                .ok_or("No active round")?;
+            let round = self.current_round.as_ref().ok_or("No active round")?;
 
             if !round.expected_participants.contains(&update.participant_id) {
                 return Err("Participant not in this round".to_string());
@@ -701,10 +700,7 @@ impl FederatedAggregator {
         };
 
         // Now mutate with a new mutable borrow
-        let round = self
-            .current_round
-            .as_mut()
-            .ok_or("No active round")?;
+        let round = self.current_round.as_mut().ok_or("No active round")?;
 
         round
             .received_updates
@@ -759,10 +755,7 @@ impl FederatedAggregator {
     pub fn aggregate(&mut self) -> Result<AggregatedModel, String> {
         // First, check conditions and extract needed data
         let (num_updates, round_num, updates_clone, total_samples, avg_loss) = {
-            let round = self
-                .current_round
-                .as_ref()
-                .ok_or("No active round")?;
+            let round = self.current_round.as_ref().ok_or("No active round")?;
 
             if round.received_updates.len() < self.min_participants {
                 return Err(format!(
@@ -773,14 +766,9 @@ impl FederatedAggregator {
             }
 
             let num_updates = round.received_updates.len();
-            let total_samples: u64 =
-                round.received_updates.values().map(|u| u.num_samples).sum();
-            let avg_loss = round
-                .received_updates
-                .values()
-                .map(|u| u.loss)
-                .sum::<f32>()
-                / num_updates as f32;
+            let total_samples: u64 = round.received_updates.values().map(|u| u.num_samples).sum();
+            let avg_loss =
+                round.received_updates.values().map(|u| u.loss).sum::<f32>() / num_updates as f32;
 
             (
                 num_updates,
@@ -844,7 +832,11 @@ impl FederatedAggregator {
             return Vec::new();
         }
 
-        let dim = updates.values().next().map(|u| u.gradients.len()).unwrap_or(0);
+        let dim = updates
+            .values()
+            .next()
+            .map(|u| u.gradients.len())
+            .unwrap_or(0);
         let total_samples: u64 = updates.values().map(|u| u.num_samples).sum();
 
         let mut aggregated = vec![0.0f32; dim];
@@ -1062,11 +1054,7 @@ impl AsyncFederatedAggregator {
             id.clone(),
             Participant {
                 id,
-                model_version: self
-                    .global_model
-                    .as_ref()
-                    .map(|m| m.version)
-                    .unwrap_or(0),
+                model_version: self.global_model.as_ref().map(|m| m.version).unwrap_or(0),
                 num_samples,
                 last_update_ms: 0,
                 is_active: true,
@@ -1090,11 +1078,7 @@ impl AsyncFederatedAggregator {
             update
         };
 
-        let current_version = self
-            .global_model
-            .as_ref()
-            .map(|m| m.version)
-            .unwrap_or(0);
+        let current_version = self.global_model.as_ref().map(|m| m.version).unwrap_or(0);
 
         self.pending_updates.push(AsyncUpdate {
             update: processed,
@@ -1148,11 +1132,7 @@ impl AsyncFederatedAggregator {
             return Err("No pending updates".to_string());
         }
 
-        let current_version = self
-            .global_model
-            .as_ref()
-            .map(|m| m.version)
-            .unwrap_or(0);
+        let current_version = self.global_model.as_ref().map(|m| m.version).unwrap_or(0);
 
         // Compute staleness-weighted contributions
         let dim = self.pending_updates[0].update.gradients.len();
@@ -1361,7 +1341,12 @@ impl HierarchicalAggregator {
     }
 
     /// Registers a participant to a specific edge aggregator
-    pub fn register_participant(&mut self, edge_id: usize, participant_id: String, num_samples: u64) {
+    pub fn register_participant(
+        &mut self,
+        edge_id: usize,
+        participant_id: String,
+        num_samples: u64,
+    ) {
         if edge_id < self.edge_aggregators.len() {
             self.edge_aggregators[edge_id].register_participant(participant_id, num_samples);
         }
@@ -1597,11 +1582,7 @@ impl ClientSelector {
 
     /// Selects clients in round-robin order
     fn select_round_robin(&self, k: usize) -> Vec<String> {
-        self.profiles
-            .keys()
-            .take(k)
-            .cloned()
-            .collect()
+        self.profiles.keys().take(k).cloned().collect()
     }
 }
 
@@ -1774,7 +1755,11 @@ pub fn onebit_dequantize(quantized: &QuantizedGradient) -> Vec<f32> {
 /// Quantizes a gradient vector using ternary quantization {-1, 0, +1}
 /// Values below threshold are set to 0 for additional sparsity
 pub fn ternary_quantize(gradient: &[f32], threshold: f32) -> QuantizedGradient {
-    let scale = gradient.iter().map(|g| g.abs()).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(1.0);
+    let scale = gradient
+        .iter()
+        .map(|g| g.abs())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(1.0);
 
     let values: Vec<i8> = gradient
         .iter()
@@ -1841,12 +1826,21 @@ impl PersonalizationLayer {
         let mut personalized = global_weights.to_vec();
 
         // Update local adaptation weights
-        for (lw, lg) in self.local_weights.iter_mut().zip(local_gradients.iter()).take(dim) {
+        for (lw, lg) in self
+            .local_weights
+            .iter_mut()
+            .zip(local_gradients.iter())
+            .take(dim)
+        {
             *lw -= self.learning_rate * lg;
         }
 
         // Combine global model with local adaptation
-        for (p, lw) in personalized.iter_mut().zip(self.local_weights.iter()).take(dim) {
+        for (p, lw) in personalized
+            .iter_mut()
+            .zip(self.local_weights.iter())
+            .take(dim)
+        {
             *p += lw;
         }
 
@@ -1967,7 +1961,10 @@ pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32>
     let mut result = vec![0.0f32; dim];
 
     for (i, result_val) in result.iter_mut().enumerate().take(dim) {
-        let mut values: Vec<f32> = updates.iter().map(|u| u.get(i).copied().unwrap_or(0.0)).collect();
+        let mut values: Vec<f32> = updates
+            .iter()
+            .map(|u| u.get(i).copied().unwrap_or(0.0))
+            .collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Trim extremes
@@ -1992,7 +1989,10 @@ pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
     let mut result = vec![0.0f32; dim];
 
     for (i, result_val) in result.iter_mut().enumerate().take(dim) {
-        let mut values: Vec<f32> = updates.iter().map(|u| u.get(i).copied().unwrap_or(0.0)).collect();
+        let mut values: Vec<f32> = updates
+            .iter()
+            .map(|u| u.get(i).copied().unwrap_or(0.0))
+            .collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mid = values.len() / 2;
@@ -2212,14 +2212,15 @@ mod tests {
 
     #[test]
     fn test_differential_privacy_gaussian() {
-        let aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2)
-            .with_dp_config(DifferentialPrivacyConfig {
+        let aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2).with_dp_config(
+            DifferentialPrivacyConfig {
                 enabled: true,
                 noise_multiplier: 1.0,
                 clipping_threshold: 1.0,
                 target_epsilon: 8.0,
                 target_delta: 1e-5,
-            });
+            },
+        );
 
         let update = ModelUpdate {
             participant_id: "ue-1".to_string(),
@@ -2246,14 +2247,15 @@ mod tests {
 
     #[test]
     fn test_dp_gradient_clipping() {
-        let aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2)
-            .with_dp_config(DifferentialPrivacyConfig {
+        let aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2).with_dp_config(
+            DifferentialPrivacyConfig {
                 enabled: true,
                 noise_multiplier: 0.0001, // Very small noise to test clipping
                 clipping_threshold: 1.0,
                 target_epsilon: 8.0,
                 target_delta: 1e-5,
-            });
+            },
+        );
 
         // Create a gradient with L2 norm = 10 (well above threshold of 1.0)
         let update = ModelUpdate {
@@ -2567,14 +2569,10 @@ mod tests {
         let samples: Vec<f32> = (0..n).map(|_| sample_gaussian(&mut rng, sigma)).collect();
 
         let mean = samples.iter().sum::<f32>() / n as f32;
-        let variance =
-            samples.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / (n - 1) as f32;
+        let variance = samples.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / (n - 1) as f32;
         let stddev = variance.sqrt();
 
-        assert!(
-            mean.abs() < 0.1,
-            "Mean should be near 0, got {mean}"
-        );
+        assert!(mean.abs() < 0.1, "Mean should be near 0, got {mean}");
         assert!(
             (stddev - sigma).abs() < 0.2,
             "Stddev should be near {sigma}, got {stddev}"
@@ -2602,7 +2600,12 @@ mod tests {
         let mut selector = ClientSelector::new(SelectionStrategy::TopK);
 
         selector.register(ClientProfile::new("client1".to_string(), 100.0, 50.0, 1000));
-        selector.register(ClientProfile::new("client2".to_string(), 200.0, 100.0, 2000));
+        selector.register(ClientProfile::new(
+            "client2".to_string(),
+            200.0,
+            100.0,
+            2000,
+        ));
         selector.register(ClientProfile::new("client3".to_string(), 50.0, 25.0, 500));
 
         let selected = selector.select_clients(2);

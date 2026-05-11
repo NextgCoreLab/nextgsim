@@ -104,15 +104,15 @@ pub use data_collection::{
 };
 pub use dccf::{
     AggregatedData, AggregationMethod, DataCollectionFilter, DataCollectionSession,
-    DataRoutingPolicy, DataTransformation, Dccf, DccfDataSource, GeographicArea,
-    RoutingCondition, SessionStatus,
+    DataRoutingPolicy, DataTransformation, Dccf, DccfDataSource, GeographicArea, RoutingCondition,
+    SessionStatus,
 };
 pub use error::{
     AnalyticsError, DataCollectionError, NwdafError, PredictionError, SubscriptionError,
 };
 pub use event_exposure::{
-    EventType, EventSubscription, EventExposureManager, EventNotification,
-    EventData, NfType, SubscriptionStatus, TargetArea, MobilityState,
+    EventData, EventExposureManager, EventNotification, EventSubscription, EventType,
+    MobilityState, NfType, SubscriptionStatus, TargetArea,
 };
 pub use federation::{
     AggregatedFederationResult, AreaFilter, ConsentType, DataFederationManager,
@@ -133,8 +133,8 @@ pub use mtlf::{AbTestResult, MlModelInfo, Mtlf};
 pub use nkef_bridge::{NwdafNkefBridge, NwdafNkefBridgeConfig};
 pub use predictor::{OnnxPredictor, PredictionMethod, PredictionOutput};
 pub use service::{
-    AnalyticsAccuracyFeedback, AnalyticsAccuracyTracker, AnalyticsCallback, AnalyticsInfoRequest,
-    AnalyticsInfoResponse, AnalyticsInfoService, AnalyticsQueryParams, AccuracyStats,
+    AccuracyStats, AnalyticsAccuracyFeedback, AnalyticsAccuracyTracker, AnalyticsCallback,
+    AnalyticsInfoRequest, AnalyticsInfoResponse, AnalyticsInfoService, AnalyticsQueryParams,
     DataManagementOp, DataManagementRequest, DataManagementResponse, DataManagementService,
     MlModelProvisionService, SubscriptionManager, SubscriptionRequest, SubscriptionResponse,
 };
@@ -425,11 +425,7 @@ impl NwdafManager {
     ///
     /// If an ONNX model has been loaded via [`NwdafManager::load_trajectory_model`],
     /// uses ML-based prediction. Otherwise falls back to linear extrapolation.
-    pub fn predict_trajectory(
-        &self,
-        ue_id: i32,
-        horizon_ms: u32,
-    ) -> Option<TrajectoryPrediction> {
+    pub fn predict_trajectory(&self, ue_id: i32, horizon_ms: u32) -> Option<TrajectoryPrediction> {
         let history = self.data_collector.get_ue_history(ue_id)?;
 
         if history.len() < 2 {
@@ -449,7 +445,9 @@ impl NwdafManager {
         let predictor = self.mtlf.trajectory_predictor();
 
         if let Some(pred) = predictor {
-            if let Ok(output) = pred.predict_trajectory(&positions, &timestamps, horizon_ms, current_time) {
+            if let Ok(output) =
+                pred.predict_trajectory(&positions, &timestamps, horizon_ms, current_time)
+            {
                 return Some(TrajectoryPrediction {
                     ue_id,
                     waypoints: output.waypoints,
@@ -493,8 +491,7 @@ impl NwdafManager {
             })
             .collect();
 
-        let confidence =
-            (history.len() as f32 / self.max_history_length as f32).min(0.9);
+        let confidence = (history.len() as f32 / self.max_history_length as f32).min(0.9);
 
         Some(TrajectoryPrediction {
             ue_id,
@@ -557,10 +554,7 @@ impl NwdafManager {
     /// # Errors
     ///
     /// Returns an error if the model file cannot be loaded.
-    pub fn load_trajectory_model(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<(), NwdafError> {
+    pub fn load_trajectory_model(&mut self, path: &std::path::Path) -> Result<(), NwdafError> {
         self.mtlf.load_trajectory_model(path)
     }
 
@@ -883,7 +877,10 @@ mod tests {
             reporting_interval_ms: 100,
             active: true,
         };
-        manager.data_collector_mut().register_source(reg).expect("should register");
+        manager
+            .data_collector_mut()
+            .register_source(reg)
+            .expect("should register");
 
         // Report measurements
         for i in 0..20 {
@@ -957,9 +954,8 @@ mod tests {
             });
         }
 
-        let result = manager.analyze_service_experience(
-            &analytics_id::AnalyticsTarget::Cell { cell_id: 1 },
-        );
+        let result =
+            manager.analyze_service_experience(&analytics_id::AnalyticsTarget::Cell { cell_id: 1 });
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");
@@ -980,9 +976,8 @@ mod tests {
             });
         }
 
-        let result = manager.analyze_user_data_congestion(
-            &analytics_id::AnalyticsTarget::Cell { cell_id: 1 },
-        );
+        let result = manager
+            .analyze_user_data_congestion(&analytics_id::AnalyticsTarget::Cell { cell_id: 1 });
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");
@@ -1003,9 +998,8 @@ mod tests {
             });
         }
 
-        let result = manager.analyze_qos_sustainability(
-            &analytics_id::AnalyticsTarget::Cell { cell_id: 1 },
-        );
+        let result =
+            manager.analyze_qos_sustainability(&analytics_id::AnalyticsTarget::Cell { cell_id: 1 });
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");

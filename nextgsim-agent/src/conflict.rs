@@ -158,9 +158,9 @@ impl ConflictDetector {
             let key = (format!("{:?}", rb.kind), rb.id.clone());
             // Wildcard match: if either side uses "*", it conflicts with any
             // resource of the same kind.
-            let matches_wildcard = writes_a.iter().any(|ra| {
-                format!("{:?}", ra.kind) == key.0 && (ra.id == "*" || rb.id == "*")
-            });
+            let matches_wildcard = writes_a
+                .iter()
+                .any(|ra| format!("{:?}", ra.kind) == key.0 && (ra.id == "*" || rb.id == "*"));
             if set_a.contains(&key) || matches_wildcard {
                 contested.push(ContestedResource {
                     kind: rb.kind.clone(),
@@ -182,10 +182,7 @@ impl ConflictDetector {
     }
 
     /// Check a new intent against all intents already in the queue.
-    pub fn check_against_queue(
-        new_intent: &Intent,
-        queue: &[Intent],
-    ) -> Vec<(usize, Conflict)> {
+    pub fn check_against_queue(new_intent: &Intent, queue: &[Intent]) -> Vec<(usize, Conflict)> {
         queue
             .iter()
             .enumerate()
@@ -231,7 +228,12 @@ impl ConflictResolver {
     /// Resolve a conflict between two intents.
     ///
     /// Returns the outcome indicating which intent(s) should proceed.
-    pub fn resolve(&self, a: &Intent, b: &Intent, conflict: &mut Conflict) -> ConflictResolutionOutcome {
+    pub fn resolve(
+        &self,
+        a: &Intent,
+        b: &Intent,
+        conflict: &mut Conflict,
+    ) -> ConflictResolutionOutcome {
         let outcome = match self.strategy {
             ResolutionStrategy::PriorityBased => self.resolve_priority(a, b),
             ResolutionStrategy::TimeBased => self.resolve_time(a, b),
@@ -289,7 +291,9 @@ impl ConflictResolver {
             ConflictResolutionOutcome::Merged
         } else {
             // Check if overlapping keys have the same values.
-            let all_same = overlap.iter().all(|k| a.parameters.get(**k) == b.parameters.get(**k));
+            let all_same = overlap
+                .iter()
+                .all(|k| a.parameters.get(**k) == b.parameters.get(**k));
             if all_same {
                 ConflictResolutionOutcome::Merged
             } else {
@@ -586,8 +590,7 @@ impl PersistentIntentStore {
             let file_path = self.intent_file_path(intent_id);
             let file = File::create(file_path)?;
             let writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(writer, intent)
-                .map_err(std::io::Error::other)?;
+            serde_json::to_writer_pretty(writer, intent).map_err(std::io::Error::other)?;
         }
         Ok(())
     }
@@ -596,8 +599,7 @@ impl PersistentIntentStore {
     fn load_intent_file(&self, path: &Path) -> Result<Intent, std::io::Error> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        serde_json::from_reader(reader)
-            .map_err(std::io::Error::other)
+        serde_json::from_reader(reader).map_err(std::io::Error::other)
     }
 
     /// Deletes an intent file from disk
@@ -726,9 +728,11 @@ mod tests {
     #[test]
     fn test_merge_resolver_non_overlapping_params() {
         let mut a = make_intent("a1", IntentType::AdjustQos, Some("flow-1"), 5);
-        a.parameters.insert("mbr_change_pct".to_string(), "10".to_string());
+        a.parameters
+            .insert("mbr_change_pct".to_string(), "10".to_string());
         let mut b = make_intent("a2", IntentType::AdjustQos, Some("flow-1"), 5);
-        b.parameters.insert("latency_change_pct".to_string(), "-5".to_string());
+        b.parameters
+            .insert("latency_change_pct".to_string(), "-5".to_string());
         let mut conflict = ConflictDetector::check_conflict(&a, &b).unwrap();
         let resolver = ConflictResolver::new(ResolutionStrategy::Merge);
         let outcome = resolver.resolve(&a, &b, &mut conflict);

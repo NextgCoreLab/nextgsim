@@ -9,12 +9,12 @@ use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use nextgsim_ai::{InferenceEngine, OnnxEngine, ExecutionProvider};
+use nextgsim_ai::{ExecutionProvider, InferenceEngine, OnnxEngine};
 
 use crate::error::SheResult;
 use crate::messages::{SheMessage, SheResponse};
 use crate::resource::ResourceCapacity;
-use crate::scheduler::{WorkloadScheduler, SchedulingPolicy};
+use crate::scheduler::{SchedulingPolicy, WorkloadScheduler};
 use crate::tier::{ComputeNode, ComputeTier, TierManager};
 use crate::workload::WorkloadRequirements;
 
@@ -68,8 +68,7 @@ impl SheTask {
     /// Creates a new SHE task with the given configuration
     pub fn with_config(config: SheTaskConfig) -> Self {
         let tier_manager = Self::create_default_tier_manager(&config);
-        let scheduler = WorkloadScheduler::new(tier_manager)
-            .with_policy(config.scheduling_policy);
+        let scheduler = WorkloadScheduler::new(tier_manager).with_policy(config.scheduling_policy);
 
         Self {
             config,
@@ -89,7 +88,9 @@ impl SheTask {
             1,
             "local-edge-1",
             ComputeTier::LocalEdge,
-            ResourceCapacity::with_tflops(1).with_memory_gb(8).with_gpus(1),
+            ResourceCapacity::with_tflops(1)
+                .with_memory_gb(8)
+                .with_gpus(1),
         ));
 
         // Regional edge node (medium)
@@ -97,7 +98,9 @@ impl SheTask {
             2,
             "regional-edge-1",
             ComputeTier::RegionalEdge,
-            ResourceCapacity::with_tflops(10).with_memory_gb(64).with_gpus(4),
+            ResourceCapacity::with_tflops(10)
+                .with_memory_gb(64)
+                .with_gpus(4),
         ));
 
         // Core cloud node (largest)
@@ -105,7 +108,9 @@ impl SheTask {
             3,
             "core-cloud-1",
             ComputeTier::CoreCloud,
-            ResourceCapacity::with_tflops(100).with_memory_gb(512).with_gpus(8),
+            ResourceCapacity::with_tflops(100)
+                .with_memory_gb(512)
+                .with_gpus(8),
         ));
 
         tier_manager
@@ -180,7 +185,10 @@ impl SheTask {
                 Ok(())
             }
 
-            SheMessage::NodeHealthUpdate { node_id, is_available } => {
+            SheMessage::NodeHealthUpdate {
+                node_id,
+                is_available,
+            } => {
                 if let Some(node) = self.scheduler.tier_manager_mut().get_node_mut(node_id) {
                     node.is_available = is_available;
                     info!("Node {} availability updated to {}", node_id, is_available);
@@ -214,9 +222,7 @@ impl SheTask {
                 model_id,
                 model_path,
                 tier,
-            } => {
-                self.handle_load_model(&model_id, &model_path, tier).await
-            }
+            } => self.handle_load_model(&model_id, &model_path, tier).await,
 
             SheMessage::UnloadModel { model_id, tier } => {
                 self.handle_unload_model(&model_id, tier).await
@@ -294,7 +300,11 @@ impl SheTask {
         if let Some(tx) = response_tx {
             match result {
                 Ok(output) => {
-                    let tier = self.model_tiers.get(&model_id).copied().unwrap_or(ComputeTier::LocalEdge);
+                    let tier = self
+                        .model_tiers
+                        .get(&model_id)
+                        .copied()
+                        .unwrap_or(ComputeTier::LocalEdge);
                     let _ = tx.send(SheResponse::InferenceResult {
                         request_id,
                         output,
@@ -363,7 +373,10 @@ impl SheTask {
         model_path: &Path,
         tier: ComputeTier,
     ) -> SheResult<()> {
-        info!("Loading model '{}' from {:?} to {}", model_id, model_path, tier);
+        info!(
+            "Loading model '{}' from {:?} to {}",
+            model_id, model_path, tier
+        );
 
         let mut engine = OnnxEngine::new(self.config.execution_provider.clone())
             .map_err(|e| crate::error::SheError::Internal(e.to_string()))?;
@@ -377,7 +390,8 @@ impl SheTask {
             warn!("Model warmup failed: {}", e);
         }
 
-        self.inference_engines.insert(model_id.to_string(), Box::new(engine));
+        self.inference_engines
+            .insert(model_id.to_string(), Box::new(engine));
         self.model_tiers.insert(model_id.to_string(), tier);
 
         info!("Model '{}' loaded successfully on {}", model_id, tier);
@@ -471,9 +485,27 @@ mod tests {
     #[test]
     fn test_she_task_creation() {
         let task = SheTask::new();
-        assert_eq!(task.scheduler.tier_manager().nodes_in_tier(ComputeTier::LocalEdge).len(), 1);
-        assert_eq!(task.scheduler.tier_manager().nodes_in_tier(ComputeTier::RegionalEdge).len(), 1);
-        assert_eq!(task.scheduler.tier_manager().nodes_in_tier(ComputeTier::CoreCloud).len(), 1);
+        assert_eq!(
+            task.scheduler
+                .tier_manager()
+                .nodes_in_tier(ComputeTier::LocalEdge)
+                .len(),
+            1
+        );
+        assert_eq!(
+            task.scheduler
+                .tier_manager()
+                .nodes_in_tier(ComputeTier::RegionalEdge)
+                .len(),
+            1
+        );
+        assert_eq!(
+            task.scheduler
+                .tier_manager()
+                .nodes_in_tier(ComputeTier::CoreCloud)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -500,7 +532,13 @@ mod tests {
             ResourceCapacity::with_tflops(2).with_memory_gb(16),
         ));
 
-        assert_eq!(task.scheduler.tier_manager().nodes_in_tier(ComputeTier::LocalEdge).len(), 2);
+        assert_eq!(
+            task.scheduler
+                .tier_manager()
+                .nodes_in_tier(ComputeTier::LocalEdge)
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -521,11 +559,15 @@ mod tests {
         let task = SheTask::new();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        task.handle_query_tier_status(ComputeTier::LocalEdge, tx).await.unwrap();
+        task.handle_query_tier_status(ComputeTier::LocalEdge, tx)
+            .await
+            .unwrap();
 
         let response = rx.await.unwrap();
         match response {
-            SheResponse::TierStatus { tier, node_count, .. } => {
+            SheResponse::TierStatus {
+                tier, node_count, ..
+            } => {
                 assert_eq!(tier, ComputeTier::LocalEdge);
                 assert_eq!(node_count, 1);
             }

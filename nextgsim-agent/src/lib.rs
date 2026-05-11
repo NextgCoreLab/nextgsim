@@ -71,14 +71,12 @@ pub use coordination::{
     CrossProcessMessage, DistributedCoordinator, MessagePayload, MessageRouter, SubIntentEntry,
 };
 pub use execution::{
-    AdjustQosExecutor, AffectedResource, CreateSliceExecutor, ExecutorRegistry, InMemoryStateProvider,
-    IntentExecutionResult, IntentExecutor, IntentStatus, ModifySliceExecutor,
-    OptimizeResourcesExecutor, QueryExecutor, ResourceAccess, ResourceKind, StateProvider,
-    TriggerHandoverExecutor,
+    AdjustQosExecutor, AffectedResource, CreateSliceExecutor, ExecutorRegistry,
+    InMemoryStateProvider, IntentExecutionResult, IntentExecutor, IntentStatus,
+    ModifySliceExecutor, OptimizeResourcesExecutor, QueryExecutor, ResourceAccess, ResourceKind,
+    StateProvider, TriggerHandoverExecutor,
 };
-pub use learning::{
-    Action, Algorithm, Experience, LearningConfig, LearningError, RLAgent, State,
-};
+pub use learning::{Action, Algorithm, Experience, LearningConfig, LearningError, RLAgent, State};
 pub use safety::{
     ForbiddenAction, ForbiddenRule, SafetyChecker, SafetyPolicy, SafetyPolicyOverride,
     SafetyViolation, ViolationSeverity,
@@ -660,10 +658,8 @@ impl AgentCoordinator {
         });
 
         // Audit.
-        self.audit_trail.record_agent_registered(
-            &agent_id,
-            &format!("{agent_type:?}"),
-        );
+        self.audit_trail
+            .record_agent_registered(&agent_id, &format!("{agent_type:?}"));
 
         token
     }
@@ -748,7 +744,9 @@ impl AgentCoordinator {
     /// If any check fails the intent is rejected and the error is returned.
     pub fn submit_intent(&mut self, intent: Intent) -> Result<(), String> {
         // Validate agent is registered and get capabilities
-        let registration = self.agents.get(&intent.agent_id)
+        let registration = self
+            .agents
+            .get(&intent.agent_id)
             .ok_or_else(|| "Agent not registered".to_string())?;
         let caps = &registration.capabilities;
 
@@ -772,15 +770,14 @@ impl AgentCoordinator {
         }
 
         // Safety check -- project the resources that would be affected.
-        let projected: Vec<AffectedResource> =
-            ConflictDetector::projected_write_resources(&intent)
-                .into_iter()
-                .map(|cr| AffectedResource {
-                    kind: cr.kind,
-                    id: cr.id,
-                    access: ResourceAccess::Write,
-                })
-                .collect();
+        let projected: Vec<AffectedResource> = ConflictDetector::projected_write_resources(&intent)
+            .into_iter()
+            .map(|cr| AffectedResource {
+                kind: cr.kind,
+                id: cr.id,
+                access: ResourceAccess::Write,
+            })
+            .collect();
 
         if let Err(violations) = self.safety_checker.validate(&intent, &projected) {
             for v in &violations {
@@ -845,7 +842,9 @@ impl AgentCoordinator {
         let mut results = Vec::with_capacity(intents.len());
 
         for intent in &intents {
-            let result = self.executor_registry.execute(intent, self.state_provider.as_ref());
+            let result = self
+                .executor_registry
+                .execute(intent, self.state_provider.as_ref());
 
             // Record in audit trail.
             self.audit_trail
@@ -968,7 +967,12 @@ fn uuid_simple() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("value expected");
-    format!("intent-{}-{}-{}", now.as_secs(), now.subsec_nanos(), counter)
+    format!(
+        "intent-{}-{}-{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        counter
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,10 +1126,8 @@ mod tests {
         );
 
         // Submit multiple intents with different priorities
-        let intent1 =
-            Intent::new(AgentId::new("test-agent"), IntentType::Query).with_priority(3);
-        let intent2 =
-            Intent::new(AgentId::new("test-agent"), IntentType::Query).with_priority(8);
+        let intent1 = Intent::new(AgentId::new("test-agent"), IntentType::Query).with_priority(3);
+        let intent2 = Intent::new(AgentId::new("test-agent"), IntentType::Query).with_priority(8);
 
         coordinator.submit_intent(intent1).unwrap();
         coordinator.submit_intent(intent2).unwrap();
@@ -1166,7 +1168,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, IntentStatus::Success);
         assert_eq!(
-            results[0].output.get("cell/cell-1/load").map(String::as_str),
+            results[0]
+                .output
+                .get("cell/cell-1/load")
+                .map(String::as_str),
             Some("0.75")
         );
     }
@@ -1195,8 +1200,8 @@ mod tests {
             },
         );
 
-        let intent = Intent::new(AgentId::new("mob-agent"), IntentType::TriggerHandover)
-            .with_target("ue-1");
+        let intent =
+            Intent::new(AgentId::new("mob-agent"), IntentType::TriggerHandover).with_target("ue-1");
 
         coordinator.submit_intent(intent).unwrap();
         let results = coordinator.process_intents_full();
@@ -1273,8 +1278,7 @@ mod tests {
             },
         );
 
-        let intent =
-            Intent::new(AgentId::new("a1"), IntentType::Query).with_target("anything");
+        let intent = Intent::new(AgentId::new("a1"), IntentType::Query).with_target("anything");
         coordinator.submit_intent(intent).unwrap();
         coordinator.process_intents();
 
@@ -1344,7 +1348,10 @@ mod tests {
             "client-secret-456",
         );
 
-        assert_eq!(client._auth_endpoint, "https://idp.example.com/oauth2/authorize");
+        assert_eq!(
+            client._auth_endpoint,
+            "https://idp.example.com/oauth2/authorize"
+        );
         assert_eq!(client.client_id, "client-id-123");
     }
 
@@ -1418,7 +1425,9 @@ mod tests {
         let scopes = vec!["read".to_string()];
 
         // Request token - should be cached
-        client.request_token_client_credentials(&agent_id, scopes).unwrap();
+        client
+            .request_token_client_credentials(&agent_id, scopes)
+            .unwrap();
 
         // Retrieve from cache
         let cached = client.get_cached_token(&agent_id);
@@ -1509,7 +1518,10 @@ mod tests {
         // Create composite through the message router.
         let cid = coordinator
             .message_router_mut()
-            .create_composite(&AgentId::new("region-ctrl"), "Optimize region-east".to_string())
+            .create_composite(
+                &AgentId::new("region-ctrl"),
+                "Optimize region-east".to_string(),
+            )
             .unwrap();
 
         let sub = Intent::new(AgentId::new("cell-a"), IntentType::OptimizeResources)

@@ -100,16 +100,23 @@ impl SensingFeatureExtractor {
             let values: Vec<f64> = meas.iter().map(|m| m.value).collect();
             if !values.is_empty() {
                 let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
-                let variance: f64 = values
-                    .iter()
-                    .map(|v| (v - mean).powi(2))
-                    .sum::<f64>()
-                    / values.len() as f64;
+                let variance: f64 =
+                    values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
 
                 features.push(mean);
                 features.push(variance.sqrt());
-                features.push(*values.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0));
-                features.push(*values.iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(&0.0));
+                features.push(
+                    *values
+                        .iter()
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(&0.0),
+                );
+                features.push(
+                    *values
+                        .iter()
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(&0.0),
+                );
             }
         }
 
@@ -152,13 +159,18 @@ impl MlPositioningEngine {
     }
 
     /// Adds a training sample
-    pub fn add_training_sample(&mut self, measurements: &[SensingMeasurement], ground_truth: Vector3) {
+    pub fn add_training_sample(
+        &mut self,
+        measurements: &[SensingMeasurement],
+        ground_truth: Vector3,
+    ) {
         let features = self.feature_extractor.extract(measurements);
         self.training_cache.push((features, ground_truth));
 
         // Trim cache if needed
         if self.training_cache.len() > self.max_cache_size {
-            self.training_cache.drain(0..self.training_cache.len() - self.max_cache_size);
+            self.training_cache
+                .drain(0..self.training_cache.len() - self.max_cache_size);
         }
     }
 
@@ -298,11 +310,7 @@ impl TrajectoryPredictor {
         }
 
         let dt_future = future_timestamp - t2;
-        let velocity = Vector3::new(
-            (p2.x - p1.x) / dt,
-            (p2.y - p1.y) / dt,
-            (p2.z - p1.z) / dt,
-        );
+        let velocity = Vector3::new((p2.x - p1.x) / dt, (p2.y - p1.y) / dt, (p2.z - p1.z) / dt);
 
         Some(Vector3::new(
             p2.x + velocity.x * dt_future,
@@ -410,8 +418,8 @@ impl AiSensingEngine {
         }
         let num_doppler = range_doppler_map[0].len();
 
-        let power = range_doppler_map[range_bin.min(num_range - 1)]
-            [doppler_bin.min(num_doppler - 1)];
+        let power =
+            range_doppler_map[range_bin.min(num_range - 1)][doppler_bin.min(num_doppler - 1)];
 
         // Normalized bin positions
         let range_norm = range_bin as f64 / num_range as f64;
@@ -448,7 +456,14 @@ impl AiSensingEngine {
             .fold(0.0, f64::max);
         let peak_ratio = if max_val > 0.0 { power / max_val } else { 0.0 };
 
-        vec![power, range_norm, doppler_norm, spread_range, spread_doppler, peak_ratio]
+        vec![
+            power,
+            range_norm,
+            doppler_norm,
+            spread_range,
+            spread_doppler,
+            peak_ratio,
+        ]
     }
 
     /// Adds a training sample
@@ -732,17 +747,11 @@ mod tests {
 
         // Add training samples for vehicles
         for _ in 0..10 {
-            engine.add_training_sample(
-                vec![50.0, 0.5, 0.7, 1.0, 2.0, 0.8],
-                TargetClass::Vehicle,
-            );
+            engine.add_training_sample(vec![50.0, 0.5, 0.7, 1.0, 2.0, 0.8], TargetClass::Vehicle);
         }
         // Add training samples for pedestrians
         for _ in 0..10 {
-            engine.add_training_sample(
-                vec![5.0, 0.3, 0.2, 0.1, 0.1, 0.3],
-                TargetClass::Pedestrian,
-            );
+            engine.add_training_sample(vec![5.0, 0.3, 0.2, 0.1, 0.1, 0.3], TargetClass::Pedestrian);
         }
 
         engine.train();

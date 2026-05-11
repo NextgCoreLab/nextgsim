@@ -91,13 +91,9 @@ impl OnnxPredictor {
     /// # Errors
     ///
     /// Returns an error if the ONNX runtime cannot be initialized.
-    pub fn with_execution_provider(
-        provider: ExecutionProvider,
-    ) -> Result<Self, PredictionError> {
-        let engine = OnnxEngine::new(provider).map_err(|e| {
-            PredictionError::InferenceFailed {
-                reason: format!("Failed to create ONNX engine: {e}"),
-            }
+    pub fn with_execution_provider(provider: ExecutionProvider) -> Result<Self, PredictionError> {
+        let engine = OnnxEngine::new(provider).map_err(|e| PredictionError::InferenceFailed {
+            reason: format!("Failed to create ONNX engine: {e}"),
         })?;
         Ok(Self {
             engine,
@@ -123,11 +119,11 @@ impl OnnxPredictor {
 
         info!("Loading trajectory prediction model from {:?}", path);
 
-        self.engine.load_model(path).map_err(|e| {
-            PredictionError::InferenceFailed {
+        self.engine
+            .load_model(path)
+            .map_err(|e| PredictionError::InferenceFailed {
                 reason: format!("Failed to load model: {e}"),
-            }
-        })?;
+            })?;
 
         self.model_loaded = true;
         info!("Trajectory prediction model loaded successfully");
@@ -211,23 +207,22 @@ impl OnnxPredictor {
             flat_data.push(pos.z as f32);
         }
 
-        let input = TensorData::float32(
-            flat_data,
-            vec![1i64, num_points as i64, 3],
-        );
+        let input = TensorData::float32(flat_data, vec![1i64, num_points as i64, 3]);
 
-        let output = self.engine.infer(&input).map_err(|e| {
-            PredictionError::InferenceFailed {
+        let output = self
+            .engine
+            .infer(&input)
+            .map_err(|e| PredictionError::InferenceFailed {
                 reason: format!("Inference execution failed: {e}"),
-            }
-        })?;
+            })?;
 
         // Parse output tensor into waypoints
-        let output_data = output.as_f32_slice().ok_or_else(|| {
-            PredictionError::InferenceFailed {
-                reason: "Model output is not Float32".to_string(),
-            }
-        })?;
+        let output_data =
+            output
+                .as_f32_slice()
+                .ok_or_else(|| PredictionError::InferenceFailed {
+                    reason: "Model output is not Float32".to_string(),
+                })?;
 
         if output_data.len() % 3 != 0 {
             return Err(PredictionError::InferenceFailed {
@@ -285,7 +280,11 @@ impl OnnxPredictor {
         let dt_ms = if timestamps.len() >= 2 {
             let t1 = timestamps[timestamps.len() - 2];
             let t2 = timestamps[timestamps.len() - 1];
-            if t2 > t1 { t2 - t1 } else { 100 } // default 100ms if timestamps are not ordered
+            if t2 > t1 {
+                t2 - t1
+            } else {
+                100
+            } // default 100ms if timestamps are not ordered
         } else {
             100 // assume 100ms interval
         };
@@ -443,17 +442,17 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.expect_err("should fail"),
-            PredictionError::InsufficientHistory { required: 2, available: 1 }
+            PredictionError::InsufficientHistory {
+                required: 2,
+                available: 1
+            }
         ));
     }
 
     #[test]
     fn test_predict_trajectory_zero_horizon() {
         let predictor = OnnxPredictor::new().expect("should create");
-        let positions = vec![
-            Vector3::new(0.0, 0.0, 0.0),
-            Vector3::new(1.0, 1.0, 0.0),
-        ];
+        let positions = vec![Vector3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 1.0, 0.0)];
         let timestamps = vec![0, 100];
 
         let result = predictor.predict_trajectory(&positions, &timestamps, 0, 100);

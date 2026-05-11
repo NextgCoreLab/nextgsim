@@ -214,9 +214,8 @@ impl TunTask {
 
                                     // Send to App task for GTP encapsulation
                                     let data = OctetString::from(buf);
-                                    if let Err(e) = app_tx
-                                        .send(TunAppMessage::UplinkData { psi, data })
-                                        .await
+                                    if let Err(e) =
+                                        app_tx.send(TunAppMessage::UplinkData { psi, data }).await
                                     {
                                         error!("Failed to send TUN data to App task: {}", e);
                                         break;
@@ -298,11 +297,7 @@ impl TunTask {
 
         match writer.send(data).await {
             Ok(n) => {
-                debug!(
-                    "Wrote {} bytes to TUN interface for PSI {}",
-                    n,
-                    psi
-                );
+                debug!("Wrote {} bytes to TUN interface for PSI {}", n, psi);
             }
             Err(e) => {
                 error!("Failed to write to TUN interface for PSI {}: {}", psi, e);
@@ -365,10 +360,7 @@ pub fn spawn_tun_reader(
 
                         // Send to App task for GTP encapsulation
                         let data = OctetString::from(buf);
-                        if let Err(e) = app_tx
-                            .send(TunAppMessage::UplinkData { psi, data })
-                            .await
-                        {
+                        if let Err(e) = app_tx.send(TunAppMessage::UplinkData { psi, data }).await {
                             error!("Failed to send TUN data to App task: {}", e);
                             break;
                         }

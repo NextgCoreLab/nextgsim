@@ -433,16 +433,14 @@ impl ReestablishmentProcedure {
     ///
     /// If T311 expires before finding a suitable cell, the UE moves to RRC_IDLE.
     pub fn t311_expired(&self) -> bool {
-        self.t311_deadline
-            .is_some_and(|d| Instant::now() >= d)
+        self.t311_deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     /// Checks if T301 (response timer) has expired.
     ///
     /// If T301 expires, the UE moves to RRC_IDLE.
     pub fn t301_expired(&self) -> bool {
-        self.t301_deadline
-            .is_some_and(|d| Instant::now() >= d)
+        self.t301_deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     /// Called when T311 or T301 expires.
@@ -614,14 +612,11 @@ mod tests {
 
         // Second initiation attempt
         let mut sm2 = setup_connected_sm();
-        let result = proc.initiate(
-            ReestablishmentTrigger::HandoverFailure,
-            2,
-            2,
-            2,
-            &mut sm2,
-        );
-        assert!(matches!(result, Err(ReestablishmentError::AlreadyInProgress)));
+        let result = proc.initiate(ReestablishmentTrigger::HandoverFailure, 2, 2, 2, &mut sm2);
+        assert!(matches!(
+            result,
+            Err(ReestablishmentError::AlreadyInProgress)
+        ));
     }
 
     #[test]

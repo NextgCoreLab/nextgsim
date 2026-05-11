@@ -138,11 +138,12 @@ pub fn build_rrc_resume_request(
         rrc_resume_request: rrc_resume_request_ies,
     };
 
-    let message_type = UL_CCCH_MessageType::C1(
-        UL_CCCH_MessageType_c1::RrcResumeRequest(rrc_resume_request),
-    );
+    let message_type =
+        UL_CCCH_MessageType::C1(UL_CCCH_MessageType_c1::RrcResumeRequest(rrc_resume_request));
 
-    Ok(UL_CCCH_Message { message: message_type })
+    Ok(UL_CCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Resume Request from a UL-CCCH message
@@ -272,7 +273,9 @@ pub fn build_rrc_resume_complete(
         rrc_resume_complete,
     ));
 
-    Ok(UL_DCCH_Message { message: message_type })
+    Ok(UL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Resume Complete from a UL-DCCH message
@@ -325,9 +328,7 @@ pub fn encode_rrc_resume_request(
 }
 
 /// Decode and parse an RRC Resume Request from bytes
-pub fn decode_rrc_resume_request(
-    bytes: &[u8],
-) -> Result<RrcResumeRequestData, RrcResumeError> {
+pub fn decode_rrc_resume_request(bytes: &[u8]) -> Result<RrcResumeRequestData, RrcResumeError> {
     let msg: UL_CCCH_Message = decode_rrc(bytes)?;
     parse_rrc_resume_request(&msg)
 }
@@ -341,9 +342,7 @@ pub fn encode_rrc_resume_complete(
 }
 
 /// Decode and parse an RRC Resume Complete from bytes
-pub fn decode_rrc_resume_complete(
-    bytes: &[u8],
-) -> Result<RrcResumeCompleteData, RrcResumeError> {
+pub fn decode_rrc_resume_complete(bytes: &[u8]) -> Result<RrcResumeCompleteData, RrcResumeError> {
     let msg: UL_DCCH_Message = decode_rrc(bytes)?;
     parse_rrc_resume_complete(&msg)
 }

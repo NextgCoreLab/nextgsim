@@ -306,7 +306,11 @@ fn parse_allowed_nssai(nssai: &AllowedNSSAI) -> Vec<AllowedSnssaiItem> {
         .iter()
         .map(|item| {
             let sst = item.s_nssai.sst.0.first().copied().unwrap_or(0);
-            let sd = item.s_nssai.sd.as_ref().and_then(|sd| sd.0.as_slice().try_into().ok());
+            let sd = item
+                .s_nssai
+                .sd
+                .as_ref()
+                .and_then(|sd| sd.0.as_slice().try_into().ok());
             AllowedSnssaiItem { sst, sd }
         })
         .collect()
@@ -595,7 +599,6 @@ pub fn is_uplink_nas_transport(pdu: &NGAP_PDU) -> bool {
             if matches!(msg.value, InitiatingMessageValue::Id_UplinkNASTransport(_))
     )
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -229,41 +229,45 @@ impl RrcStateMachine {
     /// | Inactive | Resume | Connected |
     /// | Inactive | ReleaseFromInactive | Idle |
     /// | Inactive | RadioLinkFailure | Idle |
-    pub fn transition(&mut self, transition: RrcStateTransition) -> Result<RrcState, RrcStateError> {
+    pub fn transition(
+        &mut self,
+        transition: RrcStateTransition,
+    ) -> Result<RrcState, RrcStateError> {
         let new_state = self.validate_transition(transition)?;
-        
+
         self.previous_state = Some(self.state);
         self.state = new_state;
         self.transition_count += 1;
-        
+
         Ok(new_state)
     }
 
     /// Validates a transition without performing it.
     ///
     /// Returns the new state if the transition would be valid, or an error otherwise.
-    pub fn validate_transition(&self, transition: RrcStateTransition) -> Result<RrcState, RrcStateError> {
+    pub fn validate_transition(
+        &self,
+        transition: RrcStateTransition,
+    ) -> Result<RrcState, RrcStateError> {
         match (self.state, transition) {
             // From Idle
             (RrcState::Idle, RrcStateTransition::SetupComplete) => Ok(RrcState::Connected),
-            
+
             // From Connected
             (RrcState::Connected, RrcStateTransition::Release) => Ok(RrcState::Idle),
             (RrcState::Connected, RrcStateTransition::Suspend) => Ok(RrcState::Inactive),
             (RrcState::Connected, RrcStateTransition::RadioLinkFailure) => Ok(RrcState::Idle),
-            
+
             // From Inactive
             (RrcState::Inactive, RrcStateTransition::Resume) => Ok(RrcState::Connected),
             (RrcState::Inactive, RrcStateTransition::ReleaseFromInactive) => Ok(RrcState::Idle),
             (RrcState::Inactive, RrcStateTransition::RadioLinkFailure) => Ok(RrcState::Idle),
-            
+
             // Invalid transitions
             (state, transition) => Err(RrcStateError {
                 current_state: state,
                 attempted_transition: transition,
-                message: format!(
-                    "Transition '{transition}' is not valid from state '{state}'"
-                ),
+                message: format!("Transition '{transition}' is not valid from state '{state}'"),
             }),
         }
     }
@@ -399,7 +403,7 @@ mod tests {
     #[test]
     fn test_state_machine_idle_to_connected() {
         let mut sm = RrcStateMachine::new();
-        
+
         let result = sm.transition(RrcStateTransition::SetupComplete);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Connected);
@@ -412,7 +416,7 @@ mod tests {
     fn test_state_machine_connected_to_idle() {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
-        
+
         let result = sm.transition(RrcStateTransition::Release);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Idle);
@@ -424,7 +428,7 @@ mod tests {
     fn test_state_machine_connected_to_inactive() {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
-        
+
         let result = sm.transition(RrcStateTransition::Suspend);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Inactive);
@@ -436,7 +440,7 @@ mod tests {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
         sm.transition(RrcStateTransition::Suspend).unwrap();
-        
+
         let result = sm.transition(RrcStateTransition::Resume);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Connected);
@@ -448,7 +452,7 @@ mod tests {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
         sm.transition(RrcStateTransition::Suspend).unwrap();
-        
+
         let result = sm.transition(RrcStateTransition::ReleaseFromInactive);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Idle);
@@ -459,7 +463,7 @@ mod tests {
     fn test_state_machine_radio_link_failure_from_connected() {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
-        
+
         let result = sm.transition(RrcStateTransition::RadioLinkFailure);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Idle);
@@ -470,7 +474,7 @@ mod tests {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
         sm.transition(RrcStateTransition::Suspend).unwrap();
-        
+
         let result = sm.transition(RrcStateTransition::RadioLinkFailure);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Idle);
@@ -479,18 +483,18 @@ mod tests {
     #[test]
     fn test_state_machine_invalid_transition_from_idle() {
         let mut sm = RrcStateMachine::new();
-        
+
         // Cannot release from Idle
         let result = sm.transition(RrcStateTransition::Release);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.current_state, RrcState::Idle);
         assert_eq!(err.attempted_transition, RrcStateTransition::Release);
-        
+
         // Cannot suspend from Idle
         let result = sm.transition(RrcStateTransition::Suspend);
         assert!(result.is_err());
-        
+
         // Cannot resume from Idle
         let result = sm.transition(RrcStateTransition::Resume);
         assert!(result.is_err());
@@ -500,11 +504,11 @@ mod tests {
     fn test_state_machine_invalid_transition_from_connected() {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
-        
+
         // Cannot setup again from Connected
         let result = sm.transition(RrcStateTransition::SetupComplete);
         assert!(result.is_err());
-        
+
         // Cannot resume from Connected
         let result = sm.transition(RrcStateTransition::Resume);
         assert!(result.is_err());
@@ -515,11 +519,11 @@ mod tests {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
         sm.transition(RrcStateTransition::Suspend).unwrap();
-        
+
         // Cannot setup from Inactive
         let result = sm.transition(RrcStateTransition::SetupComplete);
         assert!(result.is_err());
-        
+
         // Cannot suspend from Inactive
         let result = sm.transition(RrcStateTransition::Suspend);
         assert!(result.is_err());
@@ -528,15 +532,15 @@ mod tests {
     #[test]
     fn test_state_machine_can_transition() {
         let mut sm = RrcStateMachine::new();
-        
+
         // From Idle
         assert!(sm.can_transition(RrcStateTransition::SetupComplete));
         assert!(!sm.can_transition(RrcStateTransition::Release));
         assert!(!sm.can_transition(RrcStateTransition::Suspend));
         assert!(!sm.can_transition(RrcStateTransition::Resume));
-        
+
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
-        
+
         // From Connected
         assert!(!sm.can_transition(RrcStateTransition::SetupComplete));
         assert!(sm.can_transition(RrcStateTransition::Release));
@@ -548,11 +552,11 @@ mod tests {
     #[test]
     fn test_state_machine_validate_transition() {
         let sm = RrcStateMachine::new();
-        
+
         let result = sm.validate_transition(RrcStateTransition::SetupComplete);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), RrcState::Connected);
-        
+
         // State should not change from validate
         assert_eq!(sm.state(), RrcState::Idle);
     }
@@ -560,12 +564,12 @@ mod tests {
     #[test]
     fn test_state_machine_force_state() {
         let mut sm = RrcStateMachine::new();
-        
+
         sm.force_state(RrcState::Connected);
         assert_eq!(sm.state(), RrcState::Connected);
         assert_eq!(sm.previous_state(), Some(RrcState::Idle));
         assert_eq!(sm.transition_count(), 1);
-        
+
         sm.force_state(RrcState::Inactive);
         assert_eq!(sm.state(), RrcState::Inactive);
         assert_eq!(sm.previous_state(), Some(RrcState::Connected));
@@ -576,7 +580,7 @@ mod tests {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
         sm.transition(RrcStateTransition::Suspend).unwrap();
-        
+
         sm.reset();
         assert_eq!(sm.state(), RrcState::Idle);
         assert!(sm.previous_state().is_none());
@@ -591,11 +595,17 @@ mod tests {
 
     #[test]
     fn test_state_transition_display() {
-        assert_eq!(format!("{}", RrcStateTransition::SetupComplete), "RRC Setup Complete");
+        assert_eq!(
+            format!("{}", RrcStateTransition::SetupComplete),
+            "RRC Setup Complete"
+        );
         assert_eq!(format!("{}", RrcStateTransition::Release), "RRC Release");
         assert_eq!(format!("{}", RrcStateTransition::Suspend), "RRC Suspend");
         assert_eq!(format!("{}", RrcStateTransition::Resume), "RRC Resume");
-        assert_eq!(format!("{}", RrcStateTransition::RadioLinkFailure), "Radio Link Failure");
+        assert_eq!(
+            format!("{}", RrcStateTransition::RadioLinkFailure),
+            "Radio Link Failure"
+        );
     }
 
     #[test]
@@ -614,26 +624,26 @@ mod tests {
     #[test]
     fn test_full_connection_lifecycle() {
         let mut sm = RrcStateMachine::new();
-        
+
         // Initial state
         assert_eq!(sm.state(), RrcState::Idle);
-        
+
         // Establish connection
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
         assert_eq!(sm.state(), RrcState::Connected);
-        
+
         // Suspend connection
         sm.transition(RrcStateTransition::Suspend).unwrap();
         assert_eq!(sm.state(), RrcState::Inactive);
-        
+
         // Resume connection
         sm.transition(RrcStateTransition::Resume).unwrap();
         assert_eq!(sm.state(), RrcState::Connected);
-        
+
         // Release connection
         sm.transition(RrcStateTransition::Release).unwrap();
         assert_eq!(sm.state(), RrcState::Idle);
-        
+
         assert_eq!(sm.transition_count(), 4);
     }
 }

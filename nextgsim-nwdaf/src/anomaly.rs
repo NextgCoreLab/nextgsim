@@ -278,10 +278,7 @@ impl AnomalyDetector {
     }
 
     /// Checks a batch of measurements at once
-    pub fn check_batch(
-        &mut self,
-        measurements: &[(&str, &str, f64, u64)],
-    ) -> Vec<Anomaly> {
+    pub fn check_batch(&mut self, measurements: &[(&str, &str, f64, u64)]) -> Vec<Anomaly> {
         let mut all_anomalies = Vec::new();
         for &(metric, entity, value, ts) in measurements {
             all_anomalies.extend(self.check(metric, entity, value, ts));
@@ -388,7 +385,12 @@ mod tests {
 
         // Build baseline
         for i in 0..50 {
-            detector.check("load", "cell-1", 0.5 + (i % 5) as f64 * 0.01, i as u64 * 100);
+            detector.check(
+                "load",
+                "cell-1",
+                0.5 + (i % 5) as f64 * 0.01,
+                i as u64 * 100,
+            );
         }
 
         // The detected anomaly severity depends on z-score magnitude
@@ -408,7 +410,10 @@ mod tests {
         for i in 0..15 {
             let value = if i == 10 { 999.0 } else { 1.0 };
             let anomalies = detector.check("metric", "entity", value, i as u64 * 100);
-            assert!(anomalies.is_empty(), "Should not detect during warmup (step {i})");
+            assert!(
+                anomalies.is_empty(),
+                "Should not detect during warmup (step {i})"
+            );
         }
     }
 
@@ -446,7 +451,7 @@ mod tests {
 
         let measurements = vec![
             ("metric", "e1", 10.0, 1000u64), // normal
-            ("metric", "e1", 100.0, 1100),    // anomalous
+            ("metric", "e1", 100.0, 1100),   // anomalous
         ];
         let anomalies = detector.check_batch(&measurements);
         assert_eq!(anomalies.len(), 1);

@@ -213,11 +213,7 @@ impl SharedContext {
 
     /// Compresses data using shared knowledge
     /// Returns (`concept_ids`, residual) where residual is what can't be captured by concepts
-    pub fn compress_with_context(
-        &self,
-        embedding: &[f32],
-        k: usize,
-    ) -> (Vec<String>, Vec<f32>) {
+    pub fn compress_with_context(&self, embedding: &[f32], k: usize) -> (Vec<String>, Vec<f32>) {
         let concept_ids = self.knowledge.encode_with_knowledge(embedding, k);
         let reconstructed = self.knowledge.decode_with_knowledge(&concept_ids);
 
@@ -232,11 +228,7 @@ impl SharedContext {
     }
 
     /// Decompresses data using shared knowledge
-    pub fn decompress_with_context(
-        &self,
-        concept_ids: &[String],
-        residual: &[f32],
-    ) -> Vec<f32> {
+    pub fn decompress_with_context(&self, concept_ids: &[String], residual: &[f32]) -> Vec<f32> {
         let base = self.knowledge.decode_with_knowledge(concept_ids);
 
         // Add residual
@@ -278,11 +270,7 @@ mod tests {
 
     #[test]
     fn test_concept_node() {
-        let mut node = ConceptNode::new(
-            "cat".to_string(),
-            "Cat".to_string(),
-            vec![0.1, 0.2, 0.3],
-        );
+        let mut node = ConceptNode::new("cat".to_string(), "Cat".to_string(), vec![0.1, 0.2, 0.3]);
 
         assert_eq!(node.relations.len(), 0);
         node.add_relation("dog".to_string());
@@ -401,11 +389,14 @@ mod tests {
     fn test_shared_context() {
         let mut context = SharedContext::new(3);
 
-        context.knowledge.add_concept(ConceptNode::new(
-            "cat".to_string(),
-            "Cat".to_string(),
-            vec![1.0, 0.0, 0.0],
-        )).unwrap();
+        context
+            .knowledge
+            .add_concept(ConceptNode::new(
+                "cat".to_string(),
+                "Cat".to_string(),
+                vec![1.0, 0.0, 0.0],
+            ))
+            .unwrap();
 
         context.add_word("cat".to_string(), 100);
         context.add_prior("cat".to_string(), 0.5);
@@ -418,17 +409,23 @@ mod tests {
     fn test_compress_decompress_with_context() {
         let mut context = SharedContext::new(3);
 
-        context.knowledge.add_concept(ConceptNode::new(
-            "cat".to_string(),
-            "Cat".to_string(),
-            vec![1.0, 0.0, 0.0],
-        )).unwrap();
+        context
+            .knowledge
+            .add_concept(ConceptNode::new(
+                "cat".to_string(),
+                "Cat".to_string(),
+                vec![1.0, 0.0, 0.0],
+            ))
+            .unwrap();
 
-        context.knowledge.add_concept(ConceptNode::new(
-            "dog".to_string(),
-            "Dog".to_string(),
-            vec![0.0, 1.0, 0.0],
-        )).unwrap();
+        context
+            .knowledge
+            .add_concept(ConceptNode::new(
+                "dog".to_string(),
+                "Dog".to_string(),
+                vec![0.0, 1.0, 0.0],
+            ))
+            .unwrap();
 
         let embedding = vec![0.8, 0.2, 0.1];
         let (concept_ids, residual) = context.compress_with_context(&embedding, 1);

@@ -169,7 +169,9 @@ impl TunInterface {
         // Configure IP address using the tun-rs API
         self.device
             .set_network_address(address, netmask, None::<Ipv4Addr>)
-            .map_err(|e| TunError::ConfigureFailed(format!("failed to set network address: {e}")))?;
+            .map_err(|e| {
+                TunError::ConfigureFailed(format!("failed to set network address: {e}"))
+            })?;
 
         // Enable the interface
         self.device

@@ -18,27 +18,29 @@ use crate::rrc::cell_selection::{
     CellChangeEvent, CellSelector, MibInfo, Plmn as CellPlmn, Sib1Info,
 };
 use crate::rrc::handover::{
-    HandoverCommand, HandoverManager, parse_handover_command,
-    build_reconfiguration_complete,
+    build_reconfiguration_complete, parse_handover_command, HandoverCommand, HandoverManager,
 };
-use crate::rrc::measurement::{MeasConfig, MeasurementManager, ReportTriggerType, MeasEventType, ReportTriggerConfig};
+use crate::rrc::measurement::{
+    MeasConfig, MeasEventType, MeasurementManager, ReportTriggerConfig, ReportTriggerType,
+};
+use crate::rrc::reestablishment::{
+    ReestablishmentProcedure, ReestablishmentState, ReestablishmentTrigger,
+};
+use crate::rrc::resume::ResumeProcedure;
 use crate::rrc::state::{RrcState, RrcStateMachine};
-use crate::tasks::{
-    NasMessage, RlsMessage, RlfCause, RrcMessage, Task, TaskMessage, UeTaskBase,
-};
 #[cfg(feature = "nextgsim-she")]
 use crate::tasks::SheClientMessage;
 #[cfg(feature = "nextgsim-isac")]
-use crate::tasks::{IsacSensorMessage, IsacMeasurementType};
+use crate::tasks::{IsacMeasurementType, IsacSensorMessage};
+use crate::tasks::{NasMessage, RlfCause, RlsMessage, RrcMessage, Task, TaskMessage, UeTaskBase};
 #[cfg(feature = "nextgsim-semantic")]
 use crate::tasks::{SemanticCodecMessage, SemanticTaskType};
 use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::rrc_setup::{
-    encode_rrc_setup_request, encode_rrc_setup_complete,
-    RrcSetupRequestParams, RrcSetupCompleteParams,
-    RrcEstablishmentCause as AsnEstablishmentCause,
+    encode_rrc_setup_complete, encode_rrc_setup_request,
+    RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupRequestParams,
     UeIdentity,
 };
 
@@ -105,6 +107,10 @@ pub struct RrcTask {
     ntn_timing: Option<UeNtnTiming>,
     /// UAC barring configuration from SIB1
     uac_barring: UacBarringConfig,
+    /// RRC re-establishment procedure state
+    reestablishment_proc: ReestablishmentProcedure,
+    /// RRC resume procedure state
+    resume_proc: ResumeProcedure,
 }
 
 impl RrcTask {
@@ -129,6 +135,8 @@ impl RrcTask {
             last_cell_selection: None,
             ntn_timing: None,
             uac_barring: UacBarringConfig::default(),
+            reestablishment_proc: ReestablishmentProcedure::new(),
+            resume_proc: ResumeProcedure::new(),
         }
     }
 
@@ -179,7 +187,10 @@ impl RrcTask {
 
             info!(
                 "Cell selection complete: cell_id={}, plmn={}, tac={}, category={:?}",
-                selected_cell.cell_id, selected_cell.plmn, selected_cell.tac, selected_cell.category
+                selected_cell.cell_id,
+                selected_cell.plmn,
+                selected_cell.tac,
+                selected_cell.category
             );
 
             // Notify RLS of the new serving cell
@@ -199,7 +210,9 @@ impl RrcTask {
                 if let Err(e) = self
                     .task_base
                     .nas_tx
-                    .send(NasMessage::ActiveCellChanged { previous_tai: old_tai })
+                    .send(NasMessage::ActiveCellChanged {
+                        previous_tai: old_tai,
+                    })
                     .await
                 {
                     error!("Failed to notify NAS of cell change: {}", e);
@@ -228,12 +241,14 @@ impl RrcTask {
     /// Perform measurements for handover (in connected state)
     async fn perform_measurements(&mut self) {
         // Update measurement manager with serving cell
-        self.measurement_manager.set_serving_cell(self.serving_cell_id);
+        self.measurement_manager
+            .set_serving_cell(self.serving_cell_id);
 
         // Update measurements from cell selector
         let cells = self.cell_selector.cells();
         for (&cell_id, cell) in cells.iter() {
-            self.measurement_manager.update_measurement(cell_id, cell.dbm);
+            self.measurement_manager
+                .update_measurement(cell_id, cell.dbm);
         }
 
         // Evaluate measurement events
@@ -247,7 +262,10 @@ impl RrcTask {
     }
 
     /// Send measurement report to the network via RRC
-    async fn send_measurement_report(&mut self, report: &crate::rrc::measurement::MeasurementReport) {
+    async fn send_measurement_report(
+        &mut self,
+        report: &crate::rrc::measurement::MeasurementReport,
+    ) {
         // Build simplified measurement report message
         // In real implementation, this would be proper ASN.1 encoding
         let mut rrc_pdu = Vec::with_capacity(32);
@@ -304,8 +322,8 @@ impl RrcTask {
                 threshold: None,
                 threshold1: None,
                 threshold2: None,
-                a3_offset: Some(3), // Neighbor 3dB better than serving
-                hysteresis: 2,      // 1dB hysteresis
+                a3_offset: Some(3),   // Neighbor 3dB better than serving
+                hysteresis: 2,        // 1dB hysteresis
                 time_to_trigger: 640, // 640ms
             },
             report_amount: 8,
@@ -383,12 +401,7 @@ impl RrcTask {
     }
 
     /// Handle downlink RRC message from RLS
-    async fn handle_downlink_rrc(
-        &mut self,
-        cell_id: i32,
-        channel: RrcChannel,
-        pdu: OctetString,
-    ) {
+    async fn handle_downlink_rrc(&mut self, cell_id: i32, channel: RrcChannel, pdu: OctetString) {
         if pdu.is_empty() {
             warn!("Empty downlink RRC PDU");
             return;
@@ -428,12 +441,57 @@ impl RrcTask {
             0x00 => {
                 // RRC Setup
                 info!("Received RRC Setup from cell {}", cell_id);
+                // If a re-establishment was in progress, this is the fallback path
+                if self.reestablishment_proc.is_in_progress() {
+                    self.reestablishment_proc.on_rrc_setup_fallback();
+                }
                 self.handle_rrc_setup(cell_id, pdu).await;
             }
             0x01 => {
                 // RRC Reject
                 warn!("Received RRC Reject from cell {}", cell_id);
                 self.handle_rrc_reject(cell_id).await;
+            }
+            0x02 => {
+                // RRCReestablishment — network accepted re-establishment
+                info!("Received RRCReestablishment from cell {}", cell_id);
+                // Extract RRC transaction ID (byte 1, lower nibble)
+                let rrc_transaction_id = if bytes.len() > 1 { bytes[1] & 0x03 } else { 0 };
+
+                // If a re-establishment was not already in WaitingForResponse, the UE
+                // could have crashed and recovered; treat cell as found first.
+                if self.reestablishment_proc.state() == ReestablishmentState::CellSearch {
+                    let _ = self.reestablishment_proc.on_cell_found();
+                }
+
+                match self
+                    .reestablishment_proc
+                    .on_reestablishment_received(rrc_transaction_id, &mut self.state_machine)
+                {
+                    Ok(complete_params) => {
+                        // Send RRCReestablishmentComplete
+                        // Encoding: message type 0x02 | transaction_id in bits[1:0]
+                        let rrc_pdu = OctetString::from_slice(&[
+                            0x02 | (complete_params.rrc_transaction_id & 0x03)
+                        ]);
+                        self.send_uplink_rrc(RrcChannel::UlCcch, rrc_pdu).await;
+
+                        // Notify NAS that connection is restored
+                        if let Err(e) = self
+                            .task_base
+                            .nas_tx
+                            .send(NasMessage::RrcConnectionSetup)
+                            .await
+                        {
+                            error!("Failed to notify NAS after re-establishment: {}", e);
+                        }
+                        self.serving_cell_id = Some(cell_id);
+                        info!("RRC re-establishment complete on cell {}", cell_id);
+                    }
+                    Err(e) => {
+                        warn!("RRCReestablishment handling failed: {}", e);
+                    }
+                }
             }
             _ => {
                 debug!("Unhandled DL-CCCH message type: {:#x}", msg_type);
@@ -466,12 +524,67 @@ impl RrcTask {
             0x0D => {
                 // RRC Release
                 info!("Received RRC Release from cell {}", cell_id);
-                self.handle_rrc_release().await;
+                // If a resume was in progress, the network is rejecting it
+                if self.resume_proc.is_in_progress() {
+                    self.resume_proc
+                        .on_release_received(&mut self.state_machine);
+                } else {
+                    self.handle_rrc_release().await;
+                }
             }
             0x00 => {
                 // RRC Reconfiguration
                 debug!("Received RRC Reconfiguration from cell {}", cell_id);
                 self.handle_rrc_reconfiguration(cell_id, pdu).await;
+            }
+            0x08 => {
+                // RRCResume (first byte 0x28; low nibble 0x08)
+                // gNB encodes: bytes[0]=0x28, bytes[1]=transaction_id
+                info!("Received RRCResume from cell {}", cell_id);
+                let rrc_transaction_id = if bytes.len() > 1 { bytes[1] } else { 0 };
+
+                match self.resume_proc.on_resume_received(
+                    rrc_transaction_id,
+                    None,
+                    &mut self.state_machine,
+                ) {
+                    Ok(complete_params) => {
+                        // Send RRCResumeComplete
+                        // Encoding mirrors gNB: first byte indicates ResumeComplete
+                        let mut rrc_complete = Vec::with_capacity(4);
+                        rrc_complete.push(0x08); // RRCResumeComplete message type
+                        rrc_complete.push(complete_params.rrc_transaction_id);
+                        rrc_complete.push(0x00); // criticalExtensions placeholder
+                        if let Some(nas) = complete_params.dedicated_nas_message {
+                            rrc_complete.extend_from_slice(&nas);
+                        }
+                        let rrc_pdu = OctetString::from_slice(&rrc_complete);
+                        self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+
+                        // Notify NAS that connection is back
+                        if let Err(e) = self
+                            .task_base
+                            .nas_tx
+                            .send(NasMessage::RrcConnectionSetup)
+                            .await
+                        {
+                            error!("Failed to notify NAS after RRC resume: {}", e);
+                        }
+                        info!("RRC resume complete on cell {}", cell_id);
+                    }
+                    Err(e) => {
+                        warn!("RRCResume handling failed ({}), falling back to idle", e);
+                        // Resume failed; ensure NAS is told the connection is gone
+                        if let Err(ne) = self
+                            .task_base
+                            .nas_tx
+                            .send(NasMessage::RrcEstablishmentFailure)
+                            .await
+                        {
+                            error!("Failed to send RrcEstablishmentFailure: {}", ne);
+                        }
+                    }
+                }
             }
             _ => {
                 // Check if this is a raw NAS PDU (EPD = 0x7E or 0x2E)
@@ -516,7 +629,12 @@ impl RrcTask {
 
     /// Send RRC Setup Complete message using proper ASN.1 UPER encoding
     async fn send_rrc_setup_complete(&mut self) {
-        let nas_pdu = self.initial_nas_pdu.take().expect("value expected");
+        let nas_pdu = if let Some(pdu) = self.initial_nas_pdu.take() {
+            pdu
+        } else {
+            warn!("send_rrc_setup_complete called but initial_nas_pdu is None — ignoring");
+            return;
+        };
         let nas_data = nas_pdu.data().to_vec();
 
         let params = RrcSetupCompleteParams {
@@ -534,7 +652,10 @@ impl RrcTask {
                 OctetString::from_slice(&bytes)
             }
             Err(e) => {
-                warn!("ASN.1 RRCSetupComplete encoding failed ({}), using fallback", e);
+                warn!(
+                    "ASN.1 RRCSetupComplete encoding failed ({}), using fallback",
+                    e
+                );
                 let mut rrc_pdu = Vec::with_capacity(nas_data.len() + 3);
                 rrc_pdu.push(0x04);
                 rrc_pdu.push(0x00);
@@ -611,7 +732,8 @@ impl RrcTask {
         let transaction_id = command.transaction_id;
 
         // Start handover in the handover manager
-        self.handover_manager.start_handover(source_cell_id, command);
+        self.handover_manager
+            .start_handover(source_cell_id, command);
 
         // Check if we have signal to the target cell
         if self.cell_selector.has_signal_to_cell(target_cell_id) {
@@ -634,7 +756,9 @@ impl RrcTask {
                 if let Err(e) = self
                     .task_base
                     .rls_tx
-                    .send(RlsMessage::AssignCurrentCell { cell_id: new_cell_id })
+                    .send(RlsMessage::AssignCurrentCell {
+                        cell_id: new_cell_id,
+                    })
                     .await
                 {
                     error!("Failed to notify RLS of handover: {}", e);
@@ -642,19 +766,25 @@ impl RrcTask {
 
                 info!(
                     "Handover successful: {} -> {}",
-                    old_cell_id.unwrap_or(-1), new_cell_id
+                    old_cell_id.unwrap_or(-1),
+                    new_cell_id
                 );
 
                 // Send RRC Reconfiguration Complete
-                let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
+                let rrc_pdu =
+                    OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
                 self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
             }
         } else {
             // Target cell not reachable - handover failure
-            warn!("Handover failed: target cell {} not in coverage", target_cell_id);
-            if let Some(source_cell) = self.handover_manager.fail(
-                crate::rrc::handover::HandoverFailureCause::TargetCellUnreachable
-            ) {
+            warn!(
+                "Handover failed: target cell {} not in coverage",
+                target_cell_id
+            );
+            if let Some(source_cell) = self
+                .handover_manager
+                .fail(crate::rrc::handover::HandoverFailureCause::TargetCellUnreachable)
+            {
                 // Stay on source cell
                 self.serving_cell_id = Some(source_cell);
             }
@@ -669,7 +799,12 @@ impl RrcTask {
         warn!("Initiating RRC re-establishment after handover failure");
 
         // Notify NAS of radio link failure
-        if let Err(e) = self.task_base.nas_tx.send(NasMessage::RadioLinkFailure).await {
+        if let Err(e) = self
+            .task_base
+            .nas_tx
+            .send(NasMessage::RadioLinkFailure)
+            .await
+        {
             error!("Failed to notify NAS of handover failure: {}", e);
         }
     }
@@ -700,7 +835,8 @@ impl RrcTask {
             rrc_pdu.extend_from_slice(pdu.data());
 
             let ul_info = OctetString::from_slice(&rrc_pdu);
-            self.send_uplink_rrc_with_id(RrcChannel::UlDcch, pdu_id, ul_info).await;
+            self.send_uplink_rrc_with_id(RrcChannel::UlDcch, pdu_id, ul_info)
+                .await;
         }
     }
 
@@ -742,11 +878,18 @@ impl RrcTask {
 
         let pdu = match encode_rrc_setup_request(&params) {
             Ok(bytes) => {
-                debug!("ASN.1 RRCSetupRequest encoded: {} bytes, random_id={:x}", bytes.len(), random_id);
+                debug!(
+                    "ASN.1 RRCSetupRequest encoded: {} bytes, random_id={:x}",
+                    bytes.len(),
+                    random_id
+                );
                 OctetString::from_slice(&bytes)
             }
             Err(e) => {
-                warn!("ASN.1 RRCSetupRequest encoding failed ({}), using fallback", e);
+                warn!(
+                    "ASN.1 RRCSetupRequest encoding failed ({}), using fallback",
+                    e
+                );
                 let mut rrc_pdu = Vec::with_capacity(8);
                 rrc_pdu.push(0x00);
                 rrc_pdu.extend_from_slice(&random_id.to_be_bytes()[3..8]);
@@ -774,13 +917,84 @@ impl RrcTask {
     async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
         warn!("Radio link failure: {:?}", cause);
 
-        // Transition to idle
-        let _ = self.state_machine.on_rrc_release();
-        self.serving_cell_id = None;
+        // Map RLF cause to re-establishment trigger
+        let trigger = match cause {
+            RlfCause::PduIdExists | RlfCause::PduIdFull | RlfCause::SignalLostToConnectedCell => {
+                ReestablishmentTrigger::RadioLinkFailure
+            }
+        };
 
-        // Notify NAS
-        if let Err(e) = self.task_base.nas_tx.send(NasMessage::RadioLinkFailure).await {
-            error!("Failed to notify NAS of radio link failure: {}", e);
+        // Only attempt re-establishment if we have connection context
+        if self.state_machine.state().has_connection_context()
+            && !self.reestablishment_proc.is_in_progress()
+        {
+            let c_rnti = 0x0001u16; // placeholder — real impl would store the allocated C-RNTI
+            let pci = self.serving_cell_id.unwrap_or(0) as u16;
+            let short_mac_i = 0x0000u16; // placeholder — real impl derives from AS security
+
+            match self.reestablishment_proc.initiate(
+                trigger,
+                c_rnti,
+                pci,
+                short_mac_i,
+                &mut self.state_machine,
+            ) {
+                Ok(params) => {
+                    info!(
+                        "RLF: sending RRCReestablishmentRequest (cause={}, c_rnti={:#06x}, pci={})",
+                        params.trigger, params.c_rnti, params.pci
+                    );
+                    // Immediately mark cell as found (re-use serving cell if still visible)
+                    let _ = self.reestablishment_proc.on_cell_found();
+
+                    // Build a minimal RRCReestablishmentRequest
+                    // Encoding: [cause_byte, c_rnti_hi, c_rnti_lo, pci_hi, pci_lo, short_mac_hi, short_mac_lo]
+                    let cause_byte = match params.trigger {
+                        ReestablishmentTrigger::ReconfigurationFailure => 0x00,
+                        ReestablishmentTrigger::HandoverFailure => 0x01,
+                        _ => 0x03, // otherFailure
+                    };
+                    let rrc_pdu = OctetString::from_slice(&[
+                        0x05, // RRCReestablishmentRequest message type
+                        cause_byte,
+                        (params.c_rnti >> 8) as u8,
+                        params.c_rnti as u8,
+                        (params.pci >> 8) as u8,
+                        params.pci as u8,
+                        (params.short_mac_i >> 8) as u8,
+                        params.short_mac_i as u8,
+                    ]);
+                    self.send_uplink_rrc(RrcChannel::UlCcch, rrc_pdu).await;
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not initiate re-establishment: {} — falling back to idle",
+                        e
+                    );
+                    let _ = self.state_machine.on_rrc_release();
+                    self.serving_cell_id = None;
+                    if let Err(ne) = self
+                        .task_base
+                        .nas_tx
+                        .send(NasMessage::RadioLinkFailure)
+                        .await
+                    {
+                        error!("Failed to notify NAS of radio link failure: {}", ne);
+                    }
+                }
+            }
+        } else {
+            // Already idle or re-establishment in progress — just notify NAS
+            let _ = self.state_machine.on_rrc_release();
+            self.serving_cell_id = None;
+            if let Err(e) = self
+                .task_base
+                .nas_tx
+                .send(NasMessage::RadioLinkFailure)
+                .await
+            {
+                error!("Failed to notify NAS of radio link failure: {}", e);
+            }
         }
     }
 
@@ -820,7 +1034,8 @@ impl RrcTask {
         if !allowed {
             info!(
                 "UAC barred: category={}, identities={:#x}, factor={}%, barring_time={}s",
-                access_category, access_identities,
+                access_category,
+                access_identities,
                 self.uac_barring.barring_factor_percent,
                 self.uac_barring.barring_time_secs
             );
@@ -928,7 +1143,11 @@ impl RrcTask {
 
     /// Send uplink RRC message with specific PDU ID
     async fn send_uplink_rrc_with_id(&self, channel: RrcChannel, pdu_id: u32, pdu: OctetString) {
-        let msg = RlsMessage::RrcPduDelivery { channel, pdu_id, pdu };
+        let msg = RlsMessage::RrcPduDelivery {
+            channel,
+            pdu_id,
+            pdu,
+        };
         if let Err(e) = self.task_base.rls_tx.send(msg).await {
             error!("Failed to send RRC message to RLS: {}", e);
         }
@@ -1040,8 +1259,7 @@ mod tests {
     #[test]
     fn test_rrc_task_creation() {
         let config = test_config();
-        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) =
-            UeTaskBase::new(config, 16);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let task = RrcTask::new(task_base);
         assert_eq!(task.state_machine.state(), RrcState::Idle);
         assert!(task.serving_cell_id.is_none());
@@ -1050,8 +1268,7 @@ mod tests {
     #[test]
     fn test_pdu_id_generation() {
         let config = test_config();
-        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) =
-            UeTaskBase::new(config, 16);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
         assert_eq!(task.next_pdu_id(), 1);
         assert_eq!(task.next_pdu_id(), 2);
@@ -1061,8 +1278,7 @@ mod tests {
     #[test]
     fn test_is_active_cell() {
         let config = test_config();
-        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) =
-            UeTaskBase::new(config, 16);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
         assert!(!task.is_active_cell(1));
 

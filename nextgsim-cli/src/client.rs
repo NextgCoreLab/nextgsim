@@ -45,8 +45,8 @@ impl CliClient {
         let node_name = node_name.into();
 
         // Bind to any available port on localhost
-        let socket = UdpSocket::bind(format!("{CMD_SERVER_IP}:0"))
-            .context("Failed to bind UDP socket")?;
+        let socket =
+            UdpSocket::bind(format!("{CMD_SERVER_IP}:0")).context("Failed to bind UDP socket")?;
 
         // Set receive timeout
         socket

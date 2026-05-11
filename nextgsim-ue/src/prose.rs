@@ -154,7 +154,8 @@ impl ProseContext {
 
     /// Selects the best relay peer for a given RSC (highest RSRP)
     pub fn select_relay(&self, rsc: RelayServiceCode) -> Option<&ProsePeer> {
-        self.peers.values()
+        self.peers
+            .values()
             .filter(|p| p.is_relay && p.relay_service_codes.contains(&rsc))
             .max_by_key(|p| p.rsrp_dbm)
     }

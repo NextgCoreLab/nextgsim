@@ -47,7 +47,9 @@ pub enum SheError {
     },
 
     /// Migration failed
-    #[error("Migration of workload {workload_id} from {source_tier} to {target_tier} failed: {reason}")]
+    #[error(
+        "Migration of workload {workload_id} from {source_tier} to {target_tier} failed: {reason}"
+    )]
     MigrationFailed {
         /// Workload ID
         workload_id: WorkloadId,

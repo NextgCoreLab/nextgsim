@@ -25,10 +25,9 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use nextgsim_gnb::{
-    load_and_validate_gnb_config, AppTask, GtpTask, NgapTask, RlsTask, RrcTask, SctpTask,
-    SheTask, NwdafTask, NkefTask, IsacTask, AgentTask, FlAggregatorTask, EnergyTask,
-    SctpMessage, Task, TaskError, TaskManager, TaskMessage,
-    DEFAULT_CHANNEL_CAPACITY, NGAP_PPID,
+    load_and_validate_gnb_config, AgentTask, AppTask, EnergyTask, FlAggregatorTask, GtpTask,
+    IsacTask, NgapTask, NkefTask, NwdafTask, RlsTask, RrcTask, SctpMessage, SctpTask, SheTask,
+    Task, TaskError, TaskManager, TaskMessage, DEFAULT_CHANNEL_CAPACITY, NGAP_PPID,
 };
 
 /// nextgsim gNB - 5G gNodeB Simulator
@@ -69,7 +68,10 @@ impl GnbApp {
             "Network interfaces: link={}, ngap={}, gtp={}",
             config.link_ip, config.ngap_ip, config.gtp_ip
         );
-        info!("AMF configurations: {} AMF(s) configured", config.amf_configs.len());
+        info!(
+            "AMF configurations: {} AMF(s) configured",
+            config.amf_configs.len()
+        );
 
         // Create TaskManager with all channels
         let (task_manager, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx) =
@@ -276,7 +278,10 @@ impl GnbApp {
             };
 
             if let Err(e) = task_base.sctp_tx.send(msg).await {
-                error!("Failed to send connection request for AMF {}: {}", client_id, e);
+                error!(
+                    "Failed to send connection request for AMF {}: {}",
+                    client_id, e
+                );
             }
         }
 
@@ -331,8 +336,7 @@ impl GnbApp {
 fn init_logging() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(fmt::layer())

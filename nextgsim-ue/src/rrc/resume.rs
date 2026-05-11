@@ -351,8 +351,7 @@ impl ResumeProcedure {
 
     /// Checks whether T319 has expired.
     pub fn t319_expired(&self) -> bool {
-        self.t319_deadline
-            .is_some_and(|d| Instant::now() >= d)
+        self.t319_deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     /// Called when T319 expires.
@@ -482,10 +481,7 @@ mod tests {
         let mut sm = setup_inactive_sm();
 
         let result = proc.on_resume_received(0, None, &mut sm);
-        assert!(matches!(
-            result,
-            Err(ResumeError::InvalidProcedureState(_))
-        ));
+        assert!(matches!(result, Err(ResumeError::InvalidProcedureState(_))));
     }
 
     #[test]

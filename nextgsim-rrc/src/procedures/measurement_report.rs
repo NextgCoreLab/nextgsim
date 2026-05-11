@@ -205,7 +205,8 @@ pub fn build_measurement_report(
         let entry = MeasResultServMO {
             serv_cell_id: ServCellIndex(serv.serv_cell_index),
             meas_result_serving_cell: meas_result_nr,
-            meas_result_best_neigh_cell: serv.meas_result_best_neigh_cell
+            meas_result_best_neigh_cell: serv
+                .meas_result_best_neigh_cell
                 .as_ref()
                 .map(build_meas_result_nr_value),
         };
@@ -234,31 +235,36 @@ pub fn build_measurement_report(
         ),
     };
 
-    let message_type = UL_DCCH_MessageType::C1(
-        UL_DCCH_MessageType_c1::MeasurementReport(measurement_report),
-    );
+    let message_type = UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::MeasurementReport(
+        measurement_report,
+    ));
 
-    Ok(UL_DCCH_Message { message: message_type })
+    Ok(UL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Build a `MeasResultNR` value for the generated types
 fn build_meas_result_nr_value(nr: &MeasResultNr) -> MeasResultNR {
-    let cell_results = MeasResultNRMeasResultCellResults {
-        results_ssb_cell: nr.cell_results.ssb_results.as_ref().map(|r| {
-            MeasQuantityResults {
-                rsrp: r.rsrp.map(RSRP_Range),
-                rsrq: r.rsrq.map(RSRQ_Range),
-                sinr: r.sinr.map(SINR_Range),
-            }
-        }),
-        results_csi_rs_cell: nr.cell_results.csi_rs_results.as_ref().map(|r| {
-            MeasQuantityResults {
-                rsrp: r.rsrp.map(RSRP_Range),
-                rsrq: r.rsrq.map(RSRQ_Range),
-                sinr: r.sinr.map(SINR_Range),
-            }
-        }),
-    };
+    let cell_results =
+        MeasResultNRMeasResultCellResults {
+            results_ssb_cell: nr
+                .cell_results
+                .ssb_results
+                .as_ref()
+                .map(|r| MeasQuantityResults {
+                    rsrp: r.rsrp.map(RSRP_Range),
+                    rsrq: r.rsrq.map(RSRQ_Range),
+                    sinr: r.sinr.map(SINR_Range),
+                }),
+            results_csi_rs_cell: nr.cell_results.csi_rs_results.as_ref().map(|r| {
+                MeasQuantityResults {
+                    rsrp: r.rsrp.map(RSRP_Range),
+                    rsrq: r.rsrq.map(RSRQ_Range),
+                    sinr: r.sinr.map(SINR_Range),
+                }
+            }),
+        };
 
     // Build RS index results if provided
     let rs_index_results = nr.rs_index_results.as_ref().map(|ri| {
@@ -266,32 +272,34 @@ fn build_meas_result_nr_value(nr: &MeasResultNr) -> MeasResultNR {
             None
         } else {
             Some(ResultsPerSSB_IndexList(
-                ri.ssb_results.iter().map(|s| {
-                    ResultsPerSSB_Index {
+                ri.ssb_results
+                    .iter()
+                    .map(|s| ResultsPerSSB_Index {
                         ssb_index: SSB_Index(s.ssb_index),
                         ssb_results: Some(MeasQuantityResults {
                             rsrp: s.results.rsrp.map(RSRP_Range),
                             rsrq: s.results.rsrq.map(RSRQ_Range),
                             sinr: s.results.sinr.map(SINR_Range),
                         }),
-                    }
-                }).collect(),
+                    })
+                    .collect(),
             ))
         };
         let csi_rs_indexes = if ri.csi_rs_results.is_empty() {
             None
         } else {
             Some(ResultsPerCSI_RS_IndexList(
-                ri.csi_rs_results.iter().map(|c| {
-                    ResultsPerCSI_RS_Index {
+                ri.csi_rs_results
+                    .iter()
+                    .map(|c| ResultsPerCSI_RS_Index {
                         csi_rs_index: CSI_RS_Index(c.csi_rs_index),
                         csi_rs_results: Some(MeasQuantityResults {
                             rsrp: c.results.rsrp.map(RSRP_Range),
                             rsrq: c.results.rsrq.map(RSRQ_Range),
                             sinr: c.results.sinr.map(SINR_Range),
                         }),
-                    }
-                }).collect(),
+                    })
+                    .collect(),
             ))
         };
         MeasResultNRMeasResultRsIndexResults {
@@ -408,51 +416,79 @@ pub fn parse_measurement_report(
 
 /// Parse a `MeasResultNR` generated type into our domain type
 fn parse_meas_result_nr(nr: &MeasResultNR) -> MeasResultNr {
-    let ssb_results = nr.meas_result.cell_results.results_ssb_cell.as_ref().map(|r| {
-        MeasCellResults {
+    let ssb_results = nr
+        .meas_result
+        .cell_results
+        .results_ssb_cell
+        .as_ref()
+        .map(|r| MeasCellResults {
             rsrp: r.rsrp.as_ref().map(|v| v.0),
             rsrq: r.rsrq.as_ref().map(|v| v.0),
             sinr: r.sinr.as_ref().map(|v| v.0),
-        }
-    });
+        });
 
-    let csi_rs_results = nr.meas_result.cell_results.results_csi_rs_cell.as_ref().map(|r| {
-        MeasCellResults {
+    let csi_rs_results = nr
+        .meas_result
+        .cell_results
+        .results_csi_rs_cell
+        .as_ref()
+        .map(|r| MeasCellResults {
             rsrp: r.rsrp.as_ref().map(|v| v.0),
             rsrq: r.rsrq.as_ref().map(|v| v.0),
             sinr: r.sinr.as_ref().map(|v| v.0),
-        }
-    });
+        });
 
     // Parse RS index results
     let rs_index_results = nr.meas_result.rs_index_results.as_ref().map(|ri| {
-        let ssb_results = ri.results_ssb_indexes.as_ref()
+        let ssb_results = ri
+            .results_ssb_indexes
+            .as_ref()
             .map(|list| {
-                list.0.iter().map(|s| {
-                    MeasResultPerSsbIndex {
+                list.0
+                    .iter()
+                    .map(|s| MeasResultPerSsbIndex {
                         ssb_index: s.ssb_index.0,
-                        results: s.ssb_results.as_ref().map(|r| MeasCellResults {
-                            rsrp: r.rsrp.as_ref().map(|v| v.0),
-                            rsrq: r.rsrq.as_ref().map(|v| v.0),
-                            sinr: r.sinr.as_ref().map(|v| v.0),
-                        }).unwrap_or(MeasCellResults { rsrp: None, rsrq: None, sinr: None }),
-                    }
-                }).collect()
+                        results: s
+                            .ssb_results
+                            .as_ref()
+                            .map(|r| MeasCellResults {
+                                rsrp: r.rsrp.as_ref().map(|v| v.0),
+                                rsrq: r.rsrq.as_ref().map(|v| v.0),
+                                sinr: r.sinr.as_ref().map(|v| v.0),
+                            })
+                            .unwrap_or(MeasCellResults {
+                                rsrp: None,
+                                rsrq: None,
+                                sinr: None,
+                            }),
+                    })
+                    .collect()
             })
             .expect("value expected");
 
-        let csi_rs_results = ri.results_csi_rs_indexes.as_ref()
+        let csi_rs_results = ri
+            .results_csi_rs_indexes
+            .as_ref()
             .map(|list| {
-                list.0.iter().map(|c| {
-                    MeasResultPerCsiRsIndex {
+                list.0
+                    .iter()
+                    .map(|c| MeasResultPerCsiRsIndex {
                         csi_rs_index: c.csi_rs_index.0,
-                        results: c.csi_rs_results.as_ref().map(|r| MeasCellResults {
-                            rsrp: r.rsrp.as_ref().map(|v| v.0),
-                            rsrq: r.rsrq.as_ref().map(|v| v.0),
-                            sinr: r.sinr.as_ref().map(|v| v.0),
-                        }).unwrap_or(MeasCellResults { rsrp: None, rsrq: None, sinr: None }),
-                    }
-                }).collect()
+                        results: c
+                            .csi_rs_results
+                            .as_ref()
+                            .map(|r| MeasCellResults {
+                                rsrp: r.rsrp.as_ref().map(|v| v.0),
+                                rsrq: r.rsrq.as_ref().map(|v| v.0),
+                                sinr: r.sinr.as_ref().map(|v| v.0),
+                            })
+                            .unwrap_or(MeasCellResults {
+                                rsrp: None,
+                                rsrq: None,
+                                sinr: None,
+                            }),
+                    })
+                    .collect()
             })
             .expect("value expected");
 

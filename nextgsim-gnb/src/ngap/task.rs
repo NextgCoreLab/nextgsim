@@ -21,62 +21,75 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
-    AppMessage, GnbTaskBase, GtpMessage, GtpUeContextUpdate, NgapMessage,
-    PduSessionResource, RrcMessage, SctpMessage, StatusType, StatusUpdate,
-    Task, TaskMessage, UeReleaseRequestCause,
+    AppMessage, GnbTaskBase, GtpMessage, GtpUeContextUpdate, NgapMessage, PduSessionResource,
+    RrcMessage, SctpMessage, StatusType, StatusUpdate, Task, TaskMessage, UeReleaseRequestCause,
 };
 use nextgsim_common::OctetString;
 
 use super::amf_context::{AmfState, NgapAmfContext};
+use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{NgapPduSession, NgapUeContext};
-use super::mbs_context::{GnbMbsContext, MbsSessionManager, Tmgi, MulticastTunnelInfo};
 
 use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu};
-use nextgsim_ngap::procedures::{
-    build_ng_setup_request, parse_ng_setup_response, parse_ng_setup_failure,
-    is_ng_setup_response, is_ng_setup_failure,
-    BroadcastPlmnItem, GnbId, NgSetupRequestParams, PagingDrx, SNssai, SupportedTaItem,
-    // Initial UE Message
-    encode_initial_ue_message, InitialUeMessageParams,
-    RrcEstablishmentCauseValue, UeContextRequestValue,
-    // NAS Transport
-    decode_downlink_nas_transport, DownlinkNasTransportData,
-    encode_uplink_nas_transport, UplinkNasTransportParams,
-};
-use nextgsim_ngap::procedures::pdu_session_resource::{
-    decode_pdu_session_resource_setup_request, encode_pdu_session_resource_setup_response,
-    PduSessionResourceSetupRequestData, PduSessionResourceSetupResponseParams,
-    PduSessionResourceSetupResponseItem,
-    // Modify
-    decode_pdu_session_resource_modify_request, encode_pdu_session_resource_modify_response,
-    PduSessionResourceModifyRequestData, PduSessionResourceModifyResponseParams,
-    PduSessionResourceModifyResponseItem,
-    // Release
-    decode_pdu_session_resource_release_command, encode_pdu_session_resource_release_response,
-    PduSessionResourceReleaseCommandData, PduSessionResourceReleaseResponseParams,
-    PduSessionResourceReleasedItem,
-};
-use nextgsim_ngap::procedures::ue_context_release::{
-    decode_ue_context_release_command, encode_ue_context_release_complete,
-    UeContextReleaseCompleteParams,
+use nextgsim_ngap::procedures::handover::{
+    decode_handover_command, decode_handover_preparation_failure, decode_handover_request,
+    encode_handover_notify, encode_handover_request_acknowledge, encode_handover_required,
+    HandoverCause, HandoverCommandData, HandoverNotifyParams, HandoverPreparationFailureData,
+    HandoverRequestAcknowledgeParams, HandoverRequestData, HandoverRequiredParams,
+    HandoverTypeValue, NrCgiValue as HandoverNrCgiValue, PduSessionResourceAdmittedItem,
+    PduSessionResourceHoRequiredItem, TaiValue, TargetIdValue,
+    UserLocationInfoNr as HandoverUserLocationInfoNr,
 };
 use nextgsim_ngap::procedures::initial_context_setup::{
     decode_initial_context_setup_request, encode_initial_context_setup_response,
     InitialContextSetupResponseParams,
 };
-use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, UserLocationInfoNr, NrCgi, Tai};
-use nextgsim_ngap::procedures::handover::{
-    decode_handover_command, decode_handover_request,
-    decode_handover_preparation_failure, HandoverCommandData,
-    HandoverRequestData, HandoverPreparationFailureData,
-    encode_handover_required, encode_handover_request_acknowledge,
-    encode_handover_notify,
-    HandoverRequiredParams, HandoverRequestAcknowledgeParams,
-    HandoverNotifyParams, HandoverTypeValue, HandoverCause,
-    PduSessionResourceHoRequiredItem, PduSessionResourceAdmittedItem,
-    TargetIdValue, TaiValue,
-    UserLocationInfoNr as HandoverUserLocationInfoNr,
-    NrCgiValue as HandoverNrCgiValue,
+use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
+use nextgsim_ngap::procedures::pdu_session_resource::{
+    // Modify
+    decode_pdu_session_resource_modify_request,
+    // Release
+    decode_pdu_session_resource_release_command,
+    decode_pdu_session_resource_setup_request,
+    encode_pdu_session_resource_modify_response,
+    encode_pdu_session_resource_release_response,
+    encode_pdu_session_resource_setup_response,
+    PduSessionResourceModifyRequestData,
+    PduSessionResourceModifyResponseItem,
+    PduSessionResourceModifyResponseParams,
+    PduSessionResourceReleaseCommandData,
+    PduSessionResourceReleaseResponseParams,
+    PduSessionResourceReleasedItem,
+    PduSessionResourceSetupRequestData,
+    PduSessionResourceSetupResponseItem,
+    PduSessionResourceSetupResponseParams,
+};
+use nextgsim_ngap::procedures::ue_context_release::{
+    decode_ue_context_release_command, encode_ue_context_release_complete,
+    UeContextReleaseCompleteParams,
+};
+use nextgsim_ngap::procedures::{
+    build_ng_setup_request,
+    // NAS Transport
+    decode_downlink_nas_transport,
+    // Initial UE Message
+    encode_initial_ue_message,
+    encode_uplink_nas_transport,
+    is_ng_setup_failure,
+    is_ng_setup_response,
+    parse_ng_setup_failure,
+    parse_ng_setup_response,
+    BroadcastPlmnItem,
+    DownlinkNasTransportData,
+    GnbId,
+    InitialUeMessageParams,
+    NgSetupRequestParams,
+    PagingDrx,
+    RrcEstablishmentCauseValue,
+    SNssai,
+    SupportedTaItem,
+    UeContextRequestValue,
+    UplinkNasTransportParams,
 };
 
 /// NGAP Task for managing AMF communication and UE contexts
@@ -461,9 +474,10 @@ impl NgapTask {
         );
 
         // Find UE context by RAN-UE-NGAP-ID
-        let ue_ctx = self.ue_contexts.values_mut().find(|ctx| {
-            ctx.ran_ue_ngap_id == dl_nas.ran_ue_ngap_id as i64
-        });
+        let ue_ctx = self
+            .ue_contexts
+            .values_mut()
+            .find(|ctx| ctx.ran_ue_ngap_id == dl_nas.ran_ue_ngap_id as i64);
 
         let ue_id = match ue_ctx {
             Some(ctx) => {
@@ -527,9 +541,10 @@ impl NgapTask {
         );
 
         // Find UE context by RAN-UE-NGAP-ID
-        let ue_ctx = self.ue_contexts.values_mut().find(|ctx| {
-            ctx.ran_ue_ngap_id == ics_req.ran_ue_ngap_id as i64
-        });
+        let ue_ctx = self
+            .ue_contexts
+            .values_mut()
+            .find(|ctx| ctx.ran_ue_ngap_id == ics_req.ran_ue_ngap_id as i64);
 
         let ue_id = match ue_ctx {
             Some(ctx) => {
@@ -558,14 +573,18 @@ impl NgapTask {
         if let Some(nas_pdu) = &ics_req.nas_pdu {
             debug!(
                 "Forwarding piggybacked NAS PDU ({} bytes) to UE {}",
-                nas_pdu.len(), ue_id
+                nas_pdu.len(),
+                ue_id
             );
             let msg = RrcMessage::NasDelivery {
                 ue_id,
                 pdu: OctetString::from_slice(nas_pdu),
             };
             if let Err(e) = self.task_base.rrc_tx.send(msg).await {
-                error!("Failed to forward NAS PDU from InitialContextSetup to RRC: {}", e);
+                error!(
+                    "Failed to forward NAS PDU from InitialContextSetup to RRC: {}",
+                    e
+                );
             }
         }
 
@@ -582,7 +601,8 @@ impl NgapTask {
         };
         match encode_initial_context_setup_response(&response_params) {
             Ok(response_bytes) => {
-                self.send_ngap_ue_associated(amf_id, stream, response_bytes).await;
+                self.send_ngap_ue_associated(amf_id, stream, response_bytes)
+                    .await;
                 info!(
                     "Initial Context Setup Response sent for RAN-UE-NGAP-ID {}",
                     ics_req.ran_ue_ngap_id
@@ -610,9 +630,10 @@ impl NgapTask {
 
         // Find UE context by RAN-UE-NGAP-ID
         let ue_id = {
-            let ue_ctx = self.ue_contexts.values_mut().find(|ctx| {
-                ctx.ran_ue_ngap_id == setup_req.ran_ue_ngap_id as i64
-            });
+            let ue_ctx = self
+                .ue_contexts
+                .values_mut()
+                .find(|ctx| ctx.ran_ue_ngap_id == setup_req.ran_ue_ngap_id as i64);
             match ue_ctx {
                 Some(ctx) => {
                     if ctx.amf_ue_ngap_id.is_none() {
@@ -641,16 +662,24 @@ impl NgapTask {
             let (upf_teid, upf_addr, qfi) = if item.transfer.len() >= 10 {
                 let qfi = item.transfer[0];
                 let teid = u32::from_be_bytes([
-                    item.transfer[1], item.transfer[2],
-                    item.transfer[3], item.transfer[4],
+                    item.transfer[1],
+                    item.transfer[2],
+                    item.transfer[3],
+                    item.transfer[4],
                 ]);
                 let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                    item.transfer[6], item.transfer[7],
-                    item.transfer[8], item.transfer[9],
+                    item.transfer[6],
+                    item.transfer[7],
+                    item.transfer[8],
+                    item.transfer[9],
                 ));
                 (teid, addr, qfi)
             } else {
-                warn!("PDU Session {} has insufficient transfer IE ({} bytes)", psi, item.transfer.len());
+                warn!(
+                    "PDU Session {} has insufficient transfer IE ({} bytes)",
+                    psi,
+                    item.transfer.len()
+                );
                 continue;
             };
 
@@ -686,7 +715,10 @@ impl NgapTask {
                 error!("Failed to send SessionCreate to GTP: {}", e);
                 continue;
             }
-            info!("GTP session created for PSI={}, gNB TEID=0x{:08x}", psi, gnb_teid);
+            info!(
+                "GTP session created for PSI={}, gNB TEID=0x{:08x}",
+                psi, gnb_teid
+            );
 
             // If NAS PDU present, forward to RRC
             if let Some(ref nas_pdu) = item.nas_pdu {
@@ -719,17 +751,25 @@ impl NgapTask {
         let response_params = PduSessionResourceSetupResponseParams {
             amf_ue_ngap_id: setup_req.amf_ue_ngap_id,
             ran_ue_ngap_id: setup_req.ran_ue_ngap_id,
-            setup_list: if setup_response_items.is_empty() { None } else { Some(setup_response_items) },
+            setup_list: if setup_response_items.is_empty() {
+                None
+            } else {
+                Some(setup_response_items)
+            },
             failed_list: None,
         };
 
         match encode_pdu_session_resource_setup_response(&response_params) {
             Ok(response_bytes) => {
-                self.send_ngap_ue_associated(amf_id, stream, response_bytes).await;
+                self.send_ngap_ue_associated(amf_id, stream, response_bytes)
+                    .await;
                 info!("PDU Session Resource Setup Response sent to AMF");
             }
             Err(e) => {
-                error!("Failed to encode PDU Session Resource Setup Response: {}", e);
+                error!(
+                    "Failed to encode PDU Session Resource Setup Response: {}",
+                    e
+                );
             }
         }
     }
@@ -743,18 +783,23 @@ impl NgapTask {
     ) {
         info!(
             "PDU Session Resource Modify Request: amf_ue_ngap_id={}, ran_ue_ngap_id={}, {} items",
-            modify_req.amf_ue_ngap_id, modify_req.ran_ue_ngap_id,
+            modify_req.amf_ue_ngap_id,
+            modify_req.ran_ue_ngap_id,
             modify_req.pdu_session_resource_modify_list.len()
         );
 
         let ue_id = {
-            let ue_ctx = self.ue_contexts.values().find(|ctx| {
-                ctx.ran_ue_ngap_id == modify_req.ran_ue_ngap_id as i64
-            });
+            let ue_ctx = self
+                .ue_contexts
+                .values()
+                .find(|ctx| ctx.ran_ue_ngap_id == modify_req.ran_ue_ngap_id as i64);
             match ue_ctx {
                 Some(ctx) => ctx.ue_id,
                 None => {
-                    warn!("No UE context for RAN-UE-NGAP-ID {} in PDU Session Modify", modify_req.ran_ue_ngap_id);
+                    warn!(
+                        "No UE context for RAN-UE-NGAP-ID {} in PDU Session Modify",
+                        modify_req.ran_ue_ngap_id
+                    );
                     return;
                 }
             }
@@ -770,12 +815,16 @@ impl NgapTask {
             let (upf_teid, upf_addr, qfi) = if item.transfer.len() >= 10 {
                 let qfi = item.transfer[0];
                 let teid = u32::from_be_bytes([
-                    item.transfer[1], item.transfer[2],
-                    item.transfer[3], item.transfer[4],
+                    item.transfer[1],
+                    item.transfer[2],
+                    item.transfer[3],
+                    item.transfer[4],
                 ]);
                 let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                    item.transfer[6], item.transfer[7],
-                    item.transfer[8], item.transfer[9],
+                    item.transfer[6],
+                    item.transfer[7],
+                    item.transfer[8],
+                    item.transfer[9],
                 ));
                 (teid, addr, qfi)
             } else {
@@ -844,17 +893,25 @@ impl NgapTask {
         let response_params = PduSessionResourceModifyResponseParams {
             amf_ue_ngap_id: modify_req.amf_ue_ngap_id,
             ran_ue_ngap_id: modify_req.ran_ue_ngap_id,
-            modify_list: if modify_response_items.is_empty() { None } else { Some(modify_response_items) },
+            modify_list: if modify_response_items.is_empty() {
+                None
+            } else {
+                Some(modify_response_items)
+            },
             failed_list: None,
         };
 
         match encode_pdu_session_resource_modify_response(&response_params) {
             Ok(response_bytes) => {
-                self.send_ngap_ue_associated(amf_id, stream, response_bytes).await;
+                self.send_ngap_ue_associated(amf_id, stream, response_bytes)
+                    .await;
                 info!("PDU Session Resource Modify Response sent to AMF");
             }
             Err(e) => {
-                error!("Failed to encode PDU Session Resource Modify Response: {}", e);
+                error!(
+                    "Failed to encode PDU Session Resource Modify Response: {}",
+                    e
+                );
             }
         }
     }
@@ -868,18 +925,23 @@ impl NgapTask {
     ) {
         info!(
             "PDU Session Resource Release Command: amf_ue_ngap_id={}, ran_ue_ngap_id={}, {} items",
-            release_cmd.amf_ue_ngap_id, release_cmd.ran_ue_ngap_id,
+            release_cmd.amf_ue_ngap_id,
+            release_cmd.ran_ue_ngap_id,
             release_cmd.pdu_session_resource_to_release_list.len()
         );
 
         let ue_id = {
-            let ue_ctx = self.ue_contexts.values().find(|ctx| {
-                ctx.ran_ue_ngap_id == release_cmd.ran_ue_ngap_id as i64
-            });
+            let ue_ctx = self
+                .ue_contexts
+                .values()
+                .find(|ctx| ctx.ran_ue_ngap_id == release_cmd.ran_ue_ngap_id as i64);
             match ue_ctx {
                 Some(ctx) => ctx.ue_id,
                 None => {
-                    warn!("No UE context for RAN-UE-NGAP-ID {} in PDU Session Release", release_cmd.ran_ue_ngap_id);
+                    warn!(
+                        "No UE context for RAN-UE-NGAP-ID {} in PDU Session Release",
+                        release_cmd.ran_ue_ngap_id
+                    );
                     return;
                 }
             }
@@ -929,11 +991,15 @@ impl NgapTask {
 
         match encode_pdu_session_resource_release_response(&response_params) {
             Ok(response_bytes) => {
-                self.send_ngap_ue_associated(amf_id, stream, response_bytes).await;
+                self.send_ngap_ue_associated(amf_id, stream, response_bytes)
+                    .await;
                 info!("PDU Session Resource Release Response sent to AMF");
             }
             Err(e) => {
-                error!("Failed to encode PDU Session Resource Release Response: {}", e);
+                error!(
+                    "Failed to encode PDU Session Resource Release Response: {}",
+                    e
+                );
             }
         }
     }
@@ -947,21 +1013,29 @@ impl NgapTask {
     ) {
         use nextgsim_ngap::procedures::ue_context_release::UeNgapIds;
 
-        info!("UE Context Release Command: ids={:?}, cause={:?}", release_cmd.ue_ngap_ids, release_cmd.cause);
+        info!(
+            "UE Context Release Command: ids={:?}, cause={:?}",
+            release_cmd.ue_ngap_ids, release_cmd.cause
+        );
 
         // Find UE by AMF or RAN NGAP ID
         let ue_id = match &release_cmd.ue_ngap_ids {
-            UeNgapIds::Pair { amf_ue_ngap_id, ran_ue_ngap_id } => {
-                self.ue_contexts.values()
-                    .find(|ctx| ctx.ran_ue_ngap_id == *ran_ue_ngap_id as i64
-                        || ctx.amf_ue_ngap_id == Some(*amf_ue_ngap_id as i64))
-                    .map(|ctx| ctx.ue_id)
-            }
-            UeNgapIds::AmfOnly(amf_id_val) => {
-                self.ue_contexts.values()
-                    .find(|ctx| ctx.amf_ue_ngap_id == Some(*amf_id_val as i64))
-                    .map(|ctx| ctx.ue_id)
-            }
+            UeNgapIds::Pair {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+            } => self
+                .ue_contexts
+                .values()
+                .find(|ctx| {
+                    ctx.ran_ue_ngap_id == *ran_ue_ngap_id as i64
+                        || ctx.amf_ue_ngap_id == Some(*amf_ue_ngap_id as i64)
+                })
+                .map(|ctx| ctx.ue_id),
+            UeNgapIds::AmfOnly(amf_id_val) => self
+                .ue_contexts
+                .values()
+                .find(|ctx| ctx.amf_ue_ngap_id == Some(*amf_id_val as i64))
+                .map(|ctx| ctx.ue_id),
         };
 
         let ue_id = match ue_id {
@@ -985,7 +1059,10 @@ impl NgapTask {
         let (amf_ue_ngap_id, ran_ue_ngap_id) = {
             let ctx = self.ue_contexts.get(&ue_id);
             match ctx {
-                Some(c) => (c.amf_ue_ngap_id.unwrap_or(0) as u64, c.ran_ue_ngap_id as u32),
+                Some(c) => (
+                    c.amf_ue_ngap_id.unwrap_or(0) as u64,
+                    c.ran_ue_ngap_id as u32,
+                ),
                 None => (0, 0),
             }
         };
@@ -1001,8 +1078,12 @@ impl NgapTask {
 
         match encode_ue_context_release_complete(&complete_params) {
             Ok(complete_bytes) => {
-                self.send_ngap_ue_associated(amf_id, stream, complete_bytes).await;
-                info!("UE Context Release Complete sent to AMF for ue_id={}", ue_id);
+                self.send_ngap_ue_associated(amf_id, stream, complete_bytes)
+                    .await;
+                info!(
+                    "UE Context Release Complete sent to AMF for ue_id={}",
+                    ue_id
+                );
             }
             Err(e) => {
                 error!("Failed to encode UE Context Release Complete: {}", e);
@@ -1186,7 +1267,8 @@ impl NgapTask {
                     "Sending Uplink NAS Transport: ue_id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={}, amf_ctx_id={}, stream={}, len={}",
                     ue_id, ran_ue_ngap_id, amf_ue_ngap_id, amf_ctx_id, stream, bytes.len()
                 );
-                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes).await;
+                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes)
+                    .await;
             }
             Err(e) => {
                 error!("Failed to encode Uplink NAS Transport: {}", e);
@@ -1278,12 +1360,20 @@ impl NgapTask {
     /// Handles radio link failure notification from RRC
     async fn handle_radio_link_failure(&mut self, ue_id: i32) {
         info!("Radio link failure: ue_id={}", ue_id);
-        self.handle_ue_context_release_request(ue_id, UeReleaseRequestCause::RadioLinkFailure).await;
+        self.handle_ue_context_release_request(ue_id, UeReleaseRequestCause::RadioLinkFailure)
+            .await;
     }
 
     /// Handles UE Context Release Request (from App or RRC)
-    async fn handle_ue_context_release_request(&mut self, ue_id: i32, cause: UeReleaseRequestCause) {
-        info!("UE context release request: ue_id={}, cause={:?}", ue_id, cause);
+    async fn handle_ue_context_release_request(
+        &mut self,
+        ue_id: i32,
+        cause: UeReleaseRequestCause,
+    ) {
+        info!(
+            "UE context release request: ue_id={}, cause={:?}",
+            ue_id, cause
+        );
 
         let ctx = match self.ue_contexts.get(&ue_id) {
             Some(c) => c,
@@ -1369,23 +1459,35 @@ impl NgapTask {
                 // Handle operational messages
                 // Try to decode as Downlink NAS Transport
                 if let Ok(dl_nas) = decode_downlink_nas_transport(pdu_bytes) {
-                    self.handle_downlink_nas_transport(client_id, stream, dl_nas).await;
+                    self.handle_downlink_nas_transport(client_id, stream, dl_nas)
+                        .await;
                 } else if let Ok(setup_req) = decode_pdu_session_resource_setup_request(pdu_bytes) {
-                    self.handle_pdu_session_resource_setup(client_id, stream, setup_req).await;
-                } else if let Ok(modify_req) = decode_pdu_session_resource_modify_request(pdu_bytes) {
-                    self.handle_pdu_session_resource_modify(client_id, stream, modify_req).await;
-                } else if let Ok(release_cmd) = decode_pdu_session_resource_release_command(pdu_bytes) {
-                    self.handle_pdu_session_resource_release(client_id, stream, release_cmd).await;
+                    self.handle_pdu_session_resource_setup(client_id, stream, setup_req)
+                        .await;
+                } else if let Ok(modify_req) = decode_pdu_session_resource_modify_request(pdu_bytes)
+                {
+                    self.handle_pdu_session_resource_modify(client_id, stream, modify_req)
+                        .await;
+                } else if let Ok(release_cmd) =
+                    decode_pdu_session_resource_release_command(pdu_bytes)
+                {
+                    self.handle_pdu_session_resource_release(client_id, stream, release_cmd)
+                        .await;
                 } else if let Ok(ue_release_cmd) = decode_ue_context_release_command(pdu_bytes) {
-                    self.handle_ue_context_release_command(client_id, stream, ue_release_cmd).await;
+                    self.handle_ue_context_release_command(client_id, stream, ue_release_cmd)
+                        .await;
                 } else if let Ok(ho_cmd) = decode_handover_command(pdu_bytes) {
-                    self.handle_handover_command(client_id, stream, ho_cmd).await;
+                    self.handle_handover_command(client_id, stream, ho_cmd)
+                        .await;
                 } else if let Ok(ho_req) = decode_handover_request(pdu_bytes) {
-                    self.handle_handover_request(client_id, stream, ho_req).await;
+                    self.handle_handover_request(client_id, stream, ho_req)
+                        .await;
                 } else if let Ok(ho_fail) = decode_handover_preparation_failure(pdu_bytes) {
-                    self.handle_handover_preparation_failure(client_id, stream, ho_fail).await;
+                    self.handle_handover_preparation_failure(client_id, stream, ho_fail)
+                        .await;
                 } else if let Ok(ics_req) = decode_initial_context_setup_request(pdu_bytes) {
-                    self.handle_initial_context_setup_request(client_id, stream, ics_req).await;
+                    self.handle_initial_context_setup_request(client_id, stream, ics_req)
+                        .await;
                 } else {
                     debug!(
                         "Received operational NGAP PDU on stream {} (not yet handled, first bytes: {:02x?})",
@@ -1395,10 +1497,7 @@ impl NgapTask {
                 }
             }
             _ => {
-                warn!(
-                    "Received NGAP PDU in unexpected AMF state: {:?}",
-                    amf_state
-                );
+                warn!("Received NGAP PDU in unexpected AMF state: {:?}", amf_state);
             }
         }
     }
@@ -1430,9 +1529,7 @@ impl NgapTask {
         if let Some(ue_id) = ue_id {
             // Forward the Target-to-Source Transparent Container to UE via RRC
             // This contains the RRC Reconfiguration with mobility control info
-            let container = OctetString::from_slice(
-                &ho_cmd.target_to_source_transparent_container,
-            );
+            let container = OctetString::from_slice(&ho_cmd.target_to_source_transparent_container);
             let msg = RrcMessage::NasDelivery {
                 ue_id,
                 pdu: container,
@@ -1449,12 +1546,18 @@ impl NgapTask {
                         psi: item.pdu_session_id as i32,
                     };
                     if let Err(e) = self.task_base.gtp_tx.send(msg).await {
-                        error!("Failed to release PDU session {}: {}", item.pdu_session_id, e);
+                        error!(
+                            "Failed to release PDU session {}: {}",
+                            item.pdu_session_id, e
+                        );
                     }
                 }
             }
 
-            info!("Handover Command processed for UE[{}], forwarded to RRC", ue_id);
+            info!(
+                "Handover Command processed for UE[{}], forwarded to RRC",
+                ue_id
+            );
         } else {
             warn!(
                 "Handover Command for unknown RAN UE NGAP ID: {}",
@@ -1483,9 +1586,7 @@ impl NgapTask {
             client_id,
         ) {
             // Set AMF UE NGAP ID on the new context
-            let ue_id = self
-                .find_ue_by_ran_id(ran_ue_ngap_id)
-                .map(|ctx| ctx.ue_id);
+            let ue_id = self.find_ue_by_ran_id(ran_ue_ngap_id).map(|ctx| ctx.ue_id);
 
             if let Some(ue_id) = ue_id {
                 if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
@@ -1495,12 +1596,11 @@ impl NgapTask {
 
             // Build HandoverRequestAcknowledge - admit all PDU sessions
             let admitted_list = vec![PduSessionResourceAdmittedItem {
-                pdu_session_id: 1, // Default PDU session
+                pdu_session_id: 1,                         // Default PDU session
                 handover_request_ack_transfer: vec![0x00], // Minimal transfer
             }];
 
-            let target_to_source_container =
-                ho_req.source_to_target_transparent_container.clone();
+            let target_to_source_container = ho_req.source_to_target_transparent_container.clone();
 
             match encode_handover_request_acknowledge(&HandoverRequestAcknowledgeParams {
                 amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
@@ -1553,12 +1653,7 @@ impl NgapTask {
     /// Initiates a handover by sending `HandoverRequired` to AMF (source gNB side)
     /// Called when measurement reports indicate better target cell
     #[allow(dead_code)]
-    async fn initiate_handover(
-        &mut self,
-        ue_id: i32,
-        target_gnb_id: u32,
-        target_tac: u32,
-    ) {
+    async fn initiate_handover(&mut self, ue_id: i32, target_gnb_id: u32, target_tac: u32) {
         let ctx = match self.ue_contexts.get(&ue_id) {
             Some(c) => c,
             None => {
@@ -1587,7 +1682,7 @@ impl NgapTask {
         // Build source-to-target transparent container (simplified)
         let source_container = vec![
             0x00, // Placeholder - real implementation would include
-            // RRC container with UE capabilities and measurement data
+                 // RRC container with UE capabilities and measurement data
         ];
 
         // Collect PDU sessions for handover
@@ -1743,7 +1838,12 @@ impl NgapTask {
 
     /// Sends an NGAP PDU for UE-associated signaling (stream > 0)
     async fn send_ngap_ue_associated(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
-        debug!("Sending UE-associated NGAP PDU: amf_id={}, stream={}, len={}", amf_id, stream, data.len());
+        debug!(
+            "Sending UE-associated NGAP PDU: amf_id={}, stream={}, len={}",
+            amf_id,
+            stream,
+            data.len()
+        );
         let msg = SctpMessage::SendMessage {
             client_id: amf_id,
             stream,
@@ -1777,7 +1877,10 @@ impl NgapTask {
 
     /// Updates initialization status and notifies App task
     async fn update_initialization_status(&mut self) {
-        let any_ready = self.amf_contexts.values().any(super::amf_context::NgapAmfContext::is_ready);
+        let any_ready = self
+            .amf_contexts
+            .values()
+            .any(super::amf_context::NgapAmfContext::is_ready);
 
         if any_ready != self.is_initialized {
             self.is_initialized = any_ready;
@@ -1843,13 +1946,19 @@ impl NgapTask {
                 session_id, tmgi_bytes
             );
         } else {
-            warn!("Failed to activate MBS session {}, already exists", session_id);
+            warn!(
+                "Failed to activate MBS session {}, already exists",
+                session_id
+            );
         }
     }
 
     /// Handles MBS Session Deactivation Request from AMF
     async fn handle_mbs_session_deactivation_request(&mut self, session_id: u32) {
-        info!("MBS Session Deactivation Request: session_id={}", session_id);
+        info!(
+            "MBS Session Deactivation Request: session_id={}",
+            session_id
+        );
 
         if let Some(mut session) = self.mbs_sessions.remove_session(session_id) {
             session.deactivate();
@@ -1970,94 +2079,96 @@ impl Task for NgapTask {
 
         loop {
             match rx.recv().await {
-                Some(TaskMessage::Message(msg)) => {
-                    match msg {
-                        NgapMessage::SctpAssociationUp {
+                Some(TaskMessage::Message(msg)) => match msg {
+                    NgapMessage::SctpAssociationUp {
+                        client_id,
+                        association_id,
+                        in_streams,
+                        out_streams,
+                    } => {
+                        self.handle_association_up(
                             client_id,
                             association_id,
                             in_streams,
                             out_streams,
-                        } => {
-                            self.handle_association_up(
-                                client_id,
-                                association_id,
-                                in_streams,
-                                out_streams,
-                            )
-                            .await;
-                        }
-                        NgapMessage::SctpAssociationDown { client_id } => {
-                            self.handle_association_down(client_id).await;
-                        }
-                        NgapMessage::ReceiveNgapPdu {
-                            client_id,
-                            stream,
-                            pdu,
-                        } => {
-                            self.handle_ngap_pdu(client_id, stream, pdu).await;
-                        }
-                        NgapMessage::InitialNasDelivery {
+                        )
+                        .await;
+                    }
+                    NgapMessage::SctpAssociationDown { client_id } => {
+                        self.handle_association_down(client_id).await;
+                    }
+                    NgapMessage::ReceiveNgapPdu {
+                        client_id,
+                        stream,
+                        pdu,
+                    } => {
+                        self.handle_ngap_pdu(client_id, stream, pdu).await;
+                    }
+                    NgapMessage::InitialNasDelivery {
+                        ue_id,
+                        pdu,
+                        rrc_establishment_cause,
+                        s_tmsi,
+                    } => {
+                        self.handle_initial_nas_delivery(
                             ue_id,
                             pdu,
                             rrc_establishment_cause,
                             s_tmsi,
-                        } => {
-                            self.handle_initial_nas_delivery(
-                                ue_id,
-                                pdu,
-                                rrc_establishment_cause,
-                                s_tmsi,
-                            )
-                            .await;
-                        }
-                        NgapMessage::UplinkNasDelivery { ue_id, pdu } => {
-                            self.handle_uplink_nas_delivery(ue_id, pdu).await;
-                        }
-                        NgapMessage::RadioLinkFailure { ue_id } => {
-                            self.handle_radio_link_failure(ue_id).await;
-                        }
-                        NgapMessage::UeContextReleaseRequest { ue_id, cause } => {
-                            self.handle_ue_context_release_request(ue_id, cause).await;
-                        }
-                        NgapMessage::NtnTimingInfoReceived {
-                            satellite_type, satellite_id, propagation_delay_us,
-                            common_ta_us, k_offset,
-                        } => {
-                            info!(
+                        )
+                        .await;
+                    }
+                    NgapMessage::UplinkNasDelivery { ue_id, pdu } => {
+                        self.handle_uplink_nas_delivery(ue_id, pdu).await;
+                    }
+                    NgapMessage::RadioLinkFailure { ue_id } => {
+                        self.handle_radio_link_failure(ue_id).await;
+                    }
+                    NgapMessage::UeContextReleaseRequest { ue_id, cause } => {
+                        self.handle_ue_context_release_request(ue_id, cause).await;
+                    }
+                    NgapMessage::NtnTimingInfoReceived {
+                        satellite_type,
+                        satellite_id,
+                        propagation_delay_us,
+                        common_ta_us,
+                        k_offset,
+                    } => {
+                        info!(
                                 "NTN timing info: sat_type={}, sat_id={}, delay={}us, TA={}us, k_offset={}",
                                 satellite_type, satellite_id, propagation_delay_us, common_ta_us, k_offset
                             );
-                        }
-                        NgapMessage::MbsSessionActivationRequest {
+                    }
+                    NgapMessage::MbsSessionActivationRequest {
+                        session_id,
+                        tmgi,
+                        is_broadcast,
+                        multicast_ip,
+                        qfi,
+                    } => {
+                        self.handle_mbs_session_activation_request(
                             session_id,
                             tmgi,
                             is_broadcast,
                             multicast_ip,
                             qfi,
-                        } => {
-                            self.handle_mbs_session_activation_request(
-                                session_id,
-                                tmgi,
-                                is_broadcast,
-                                multicast_ip,
-                                qfi,
-                            )
-                            .await;
-                        }
-                        NgapMessage::MbsSessionDeactivationRequest { session_id } => {
-                            self.handle_mbs_session_deactivation_request(session_id).await;
-                        }
-                        NgapMessage::MulticastGroupPaging { tmgi, area_scope } => {
-                            self.handle_multicast_group_paging(tmgi, area_scope).await;
-                        }
-                        NgapMessage::MbsUeJoinRequest { ue_id, tmgi } => {
-                            self.handle_mbs_ue_join_request(ue_id, tmgi).await;
-                        }
-                        NgapMessage::MbsUeLeaveRequest { ue_id, tmgi } => {
-                            self.handle_mbs_ue_leave_request(ue_id, tmgi).await;
-                        }
+                        )
+                        .await;
                     }
-                }
+                    NgapMessage::MbsSessionDeactivationRequest { session_id } => {
+                        self.handle_mbs_session_deactivation_request(session_id)
+                            .await;
+                    }
+                    NgapMessage::MulticastGroupPaging { tmgi, area_scope } => {
+                        self.handle_multicast_group_paging(tmgi, area_scope).await;
+                    }
+                    NgapMessage::MbsUeJoinRequest { ue_id, tmgi } => {
+                        self.handle_mbs_ue_join_request(ue_id, tmgi).await;
+                    }
+                    NgapMessage::MbsUeLeaveRequest { ue_id, tmgi } => {
+                        self.handle_mbs_ue_leave_request(ue_id, tmgi).await;
+                    }
+                },
                 Some(TaskMessage::Shutdown) => {
                     info!("NGAP task received shutdown signal");
                     break;
@@ -2100,7 +2211,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,

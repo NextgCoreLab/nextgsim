@@ -177,10 +177,9 @@ impl XrTrafficModel {
         };
 
         // Simple deterministic jitter based on sequence
-        let jitter = self.jitter_std_ms
-            * ((self.sequence as f64 * std::f64::consts::E).sin() * 0.5);
-        let timestamp = self.current_time_ms
-            + (self.frame_interval_ms + jitter).max(0.0) as u64;
+        let jitter =
+            self.jitter_std_ms * ((self.sequence as f64 * std::f64::consts::E).sin() * 0.5);
+        let timestamp = self.current_time_ms + (self.frame_interval_ms + jitter).max(0.0) as u64;
 
         // Calculate PDU count based on frame size (assume 1400-byte MTU PDUs)
         let pdu_count = ((base_size as f64 / 1400.0).ceil() as u16).max(1);
@@ -401,7 +400,12 @@ impl XrCdrxController {
     /// * `on_duration_ms` - On-duration timer in ms
     /// * `inactivity_ms` - Inactivity timer in ms
     /// * `frame_aligned` - Whether to align wake-up with XR frame timing
-    pub fn new(cycle_ms: u32, on_duration_ms: u32, inactivity_ms: u32, frame_aligned: bool) -> Self {
+    pub fn new(
+        cycle_ms: u32,
+        on_duration_ms: u32,
+        inactivity_ms: u32,
+        frame_aligned: bool,
+    ) -> Self {
         Self {
             cycle_ms,
             on_duration_ms,
@@ -420,7 +424,7 @@ impl XrCdrxController {
     pub fn xr_optimized(fps: u32) -> Self {
         let frame_interval = 1000 / fps;
         Self::new(
-            frame_interval, // Cycle = frame interval
+            frame_interval,     // Cycle = frame interval
             frame_interval / 2, // On-duration = half frame interval
             frame_interval / 4, // Inactivity = quarter frame interval
             true,

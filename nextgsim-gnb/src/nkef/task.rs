@@ -32,7 +32,9 @@ impl NkefTask {
     ) {
         debug!(
             "NKEF: Updating knowledge for {} '{}' with {} properties",
-            entity_type, entity_id, properties.len()
+            entity_type,
+            entity_id,
+            properties.len()
         );
 
         let etype = match entity_type.as_str() {
@@ -61,7 +63,10 @@ impl NkefTask {
     }
 
     fn handle_semantic_query(&mut self, query: String, max_results: u32) {
-        debug!("NKEF: Semantic query '{}' (max_results={})", query, max_results);
+        debug!(
+            "NKEF: Semantic query '{}' (max_results={})",
+            query, max_results
+        );
 
         let results = self.knowledge_graph.search(&query, max_results as usize);
 
@@ -92,21 +97,21 @@ impl Task for NkefTask {
 
         loop {
             match rx.recv().await {
-                Some(TaskMessage::Message(msg)) => {
-                    match msg {
-                        NkefMessage::UpdateKnowledge {
-                            entity_type, entity_id, properties,
-                        } => {
-                            self.handle_update_knowledge(entity_type, entity_id, properties);
-                        }
-                        NkefMessage::SemanticQuery { query, max_results } => {
-                            self.handle_semantic_query(query, max_results);
-                        }
-                        NkefMessage::RetrieveContext { prompt, max_tokens } => {
-                            self.handle_retrieve_context(prompt, max_tokens);
-                        }
+                Some(TaskMessage::Message(msg)) => match msg {
+                    NkefMessage::UpdateKnowledge {
+                        entity_type,
+                        entity_id,
+                        properties,
+                    } => {
+                        self.handle_update_knowledge(entity_type, entity_id, properties);
                     }
-                }
+                    NkefMessage::SemanticQuery { query, max_results } => {
+                        self.handle_semantic_query(query, max_results);
+                    }
+                    NkefMessage::RetrieveContext { prompt, max_tokens } => {
+                        self.handle_retrieve_context(prompt, max_tokens);
+                    }
+                },
                 Some(TaskMessage::Shutdown) => {
                     info!("NKEF task received shutdown signal");
                     break;
@@ -119,7 +124,10 @@ impl Task for NkefTask {
         }
 
         let total_entities: usize = self.entity_count.values().sum();
-        info!("NKEF task stopped, {} total entities in knowledge graph", total_entities);
+        info!(
+            "NKEF task stopped, {} total entities in knowledge graph",
+            total_entities
+        );
     }
 }
 

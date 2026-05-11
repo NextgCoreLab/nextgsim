@@ -22,7 +22,11 @@ pub struct TensorInfo {
 
 impl TensorInfo {
     /// Creates a new `TensorInfo`
-    pub fn new(name: impl Into<String>, shape: impl Into<TensorShape>, dtype: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        shape: impl Into<TensorShape>,
+        dtype: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             shape: shape.into(),
@@ -209,7 +213,10 @@ impl ModelRegistry {
 
     /// Lists all registered model names
     pub fn list(&self) -> Vec<&str> {
-        self.models.keys().map(std::string::String::as_str).collect()
+        self.models
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Returns the number of registered models

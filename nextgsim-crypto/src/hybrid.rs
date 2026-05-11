@@ -66,9 +66,8 @@ impl HybridKeyPair {
 
     /// Get the combined public key (X25519 public || ML-KEM encapsulation key)
     pub fn combined_public_key(&self) -> Vec<u8> {
-        let mut combined = Vec::with_capacity(
-            X25519_KEY_SIZE + self.ml_kem_encapsulation_key.len(),
-        );
+        let mut combined =
+            Vec::with_capacity(X25519_KEY_SIZE + self.ml_kem_encapsulation_key.len());
         combined.extend_from_slice(&self.x25519_public);
         combined.extend_from_slice(&self.ml_kem_encapsulation_key);
         combined
@@ -148,17 +147,17 @@ pub fn hybrid_encapsulate_from_keys(
     let x25519_ss = eph_secret.diffie_hellman(&their_public);
 
     // Step 2: ML-KEM-768 encapsulation
-    let ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(
-        ml_kem_ek.try_into().map_err(|_| {
+    let ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(ml_kem_ek.try_into().map_err(
+        |_| {
             HybridError::InvalidKeyData(format!(
                 "Invalid ML-KEM-768 encapsulation key length: {}",
                 ml_kem_ek.len()
             ))
-        })?,
-    );
-    let (ml_kem_ct, ml_kem_ss) = ek.encapsulate(&mut OsRng).map_err(|e| {
-        HybridError::MlKemError(format!("Encapsulation failed: {e:?}"))
-    })?;
+        },
+    )?);
+    let (ml_kem_ct, ml_kem_ss) = ek
+        .encapsulate(&mut OsRng)
+        .map_err(|e| HybridError::MlKemError(format!("Encapsulation failed: {e:?}")))?;
 
     // Step 3: Combine shared secrets
     let ml_kem_ss_bytes: &[u8] = ml_kem_ss.as_ref();
@@ -192,10 +191,7 @@ pub fn hybrid_encapsulate_from_keys(
 ///
 /// # Errors
 /// Returns an error if decapsulation fails or the ciphertext is invalid.
-pub fn hybrid_decapsulate(
-    hybrid_sk: &HybridKeyPair,
-    combined_ct: &[u8],
-) -> HybridResult<[u8; 32]> {
+pub fn hybrid_decapsulate(hybrid_sk: &HybridKeyPair, combined_ct: &[u8]) -> HybridResult<[u8; 32]> {
     hybrid_decapsulate_from_keys(
         &hybrid_sk.x25519_secret,
         &hybrid_sk.ml_kem_decapsulation_key,
@@ -229,9 +225,10 @@ pub fn hybrid_decapsulate_from_keys(
 
     // Split combined ciphertext
     // Length already validated above (>= X25519_KEY_SIZE)
-    let eph_public_bytes: [u8; X25519_KEY_SIZE] = combined_ct[..X25519_KEY_SIZE]
-        .try_into()
-        .map_err(|_| HybridError::InvalidCiphertext("Failed to extract X25519 ephemeral public key".into()))?;
+    let eph_public_bytes: [u8; X25519_KEY_SIZE] =
+        combined_ct[..X25519_KEY_SIZE].try_into().map_err(|_| {
+            HybridError::InvalidCiphertext("Failed to extract X25519 ephemeral public key".into())
+        })?;
     let ml_kem_ct_bytes = &combined_ct[X25519_KEY_SIZE..];
 
     // Step 1: X25519 key agreement
@@ -240,23 +237,23 @@ pub fn hybrid_decapsulate_from_keys(
     let x25519_ss = my_secret.diffie_hellman(&eph_public);
 
     // Step 2: ML-KEM-768 decapsulation
-    let dk = <MlKem768 as KemCore>::DecapsulationKey::from_bytes(
-        ml_kem_dk.try_into().map_err(|_| {
+    let dk = <MlKem768 as KemCore>::DecapsulationKey::from_bytes(ml_kem_dk.try_into().map_err(
+        |_| {
             HybridError::InvalidKeyData(format!(
                 "Invalid ML-KEM-768 decapsulation key length: {}",
                 ml_kem_dk.len()
             ))
-        })?,
-    );
+        },
+    )?);
     let ct_encoded = ml_kem_ct_bytes.try_into().map_err(|_| {
         HybridError::InvalidCiphertext(format!(
             "Invalid ML-KEM-768 ciphertext length: {}",
             ml_kem_ct_bytes.len()
         ))
     })?;
-    let ml_kem_ss = dk.decapsulate(ct_encoded).map_err(|e| {
-        HybridError::MlKemError(format!("Decapsulation failed: {e:?}"))
-    })?;
+    let ml_kem_ss = dk
+        .decapsulate(ct_encoded)
+        .map_err(|e| HybridError::MlKemError(format!("Decapsulation failed: {e:?}")))?;
 
     // Step 3: Combine shared secrets
     let ml_kem_ss_bytes: &[u8] = ml_kem_ss.as_ref();
@@ -338,11 +335,9 @@ mod tests {
     fn test_hybrid_encapsulate_from_raw_keys() {
         let kp = hybrid_generate_keypair();
 
-        let (combined_ct, ss_enc) = hybrid_encapsulate_from_keys(
-            kp.x25519_public_key(),
-            kp.ml_kem_encapsulation_key(),
-        )
-        .expect("encapsulate");
+        let (combined_ct, ss_enc) =
+            hybrid_encapsulate_from_keys(kp.x25519_public_key(), kp.ml_kem_encapsulation_key())
+                .expect("encapsulate");
 
         let ss_dec = hybrid_decapsulate(&kp, &combined_ct).expect("decapsulate");
         assert_eq!(ss_enc, ss_dec);

@@ -240,7 +240,10 @@ impl SubscriptionManager {
 
     /// Returns all subscription IDs
     pub fn subscription_ids(&self) -> Vec<&str> {
-        self.subscriptions.keys().map(std::string::String::as_str).collect()
+        self.subscriptions
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Returns a subscription by ID
@@ -250,24 +253,22 @@ impl SubscriptionManager {
 
     /// Suspends a subscription (stops notifications without removing)
     pub fn suspend(&mut self, subscription_id: &str) -> Result<(), SubscriptionError> {
-        let sub = self
-            .subscriptions
-            .get_mut(subscription_id)
-            .ok_or_else(|| SubscriptionError::NotFound {
+        let sub = self.subscriptions.get_mut(subscription_id).ok_or_else(|| {
+            SubscriptionError::NotFound {
                 id: subscription_id.to_string(),
-            })?;
+            }
+        })?;
         sub.active = false;
         Ok(())
     }
 
     /// Resumes a suspended subscription
     pub fn resume(&mut self, subscription_id: &str) -> Result<(), SubscriptionError> {
-        let sub = self
-            .subscriptions
-            .get_mut(subscription_id)
-            .ok_or_else(|| SubscriptionError::NotFound {
+        let sub = self.subscriptions.get_mut(subscription_id).ok_or_else(|| {
+            SubscriptionError::NotFound {
                 id: subscription_id.to_string(),
-            })?;
+            }
+        })?;
         sub.active = true;
         Ok(())
     }
@@ -373,9 +374,7 @@ impl AnalyticsInfoService {
                         return AnalyticsInfoResponse {
                             result: None,
                             success: false,
-                            error: Some(
-                                "UeMobility analytics requires a UE target".to_string(),
-                            ),
+                            error: Some("UeMobility analytics requires a UE target".to_string()),
                         };
                     }
                 };
@@ -402,9 +401,7 @@ impl AnalyticsInfoService {
                 };
                 anlf.analyze_nf_load(cell_id, horizon_steps, data_collector, mtlf)
             }
-            AnalyticsId::AbnormalBehavior => {
-                anlf.analyze_abnormal_behavior(&request.target)
-            }
+            AnalyticsId::AbnormalBehavior => anlf.analyze_abnormal_behavior(&request.target),
             AnalyticsId::ServiceExperience => {
                 anlf.analyze_service_experience(&request.target, data_collector)
             }
@@ -456,10 +453,7 @@ impl MlModelProvisionService {
     /// Handles a model provision request
     ///
     /// Delegates to the MTLF to find and provision the requested model.
-    pub fn handle_request(
-        request: &ModelProvisionRequest,
-        mtlf: &Mtlf,
-    ) -> ModelProvisionResponse {
+    pub fn handle_request(request: &ModelProvisionRequest, mtlf: &Mtlf) -> ModelProvisionResponse {
         info!(
             "MLModelProvision: Request from {} for {:?}",
             request.requestor_id, request.analytics_id
@@ -473,10 +467,7 @@ impl MlModelProvisionService {
     }
 
     /// Lists models available for a specific analytics ID
-    pub fn list_models_for_analytics(
-        mtlf: &Mtlf,
-        analytics_id: AnalyticsId,
-    ) -> Vec<&MlModelInfo> {
+    pub fn list_models_for_analytics(mtlf: &Mtlf, analytics_id: AnalyticsId) -> Vec<&MlModelInfo> {
         mtlf.list_models_for_analytics(analytics_id)
     }
 }
@@ -740,10 +731,7 @@ impl AnalyticsAccuracyTracker {
             feedback.consumer_id, feedback.analytics_id, feedback.reported_accuracy
         );
 
-        let entries = self
-            .feedback
-            .entry(feedback.analytics_id)
-            .or_default();
+        let entries = self.feedback.entry(feedback.analytics_id).or_default();
 
         entries.push(feedback);
 
@@ -774,11 +762,7 @@ impl AnalyticsAccuracyTracker {
             .map(|f| f.reported_accuracy)
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(0.0);
-        let latest_ts = entries
-            .iter()
-            .map(|f| f.timestamp_ms)
-            .max()
-            .unwrap_or(0);
+        let latest_ts = entries.iter().map(|f| f.timestamp_ms).max().unwrap_or(0);
 
         Some(AccuracyStats {
             analytics_id,
@@ -1107,8 +1091,7 @@ mod tests {
             params: AnalyticsQueryParams::UeMobility { horizon_ms: 1000 },
         };
 
-        let response =
-            AnalyticsInfoService::handle_request(&request, &mut anlf, &collector, &mtlf);
+        let response = AnalyticsInfoService::handle_request(&request, &mut anlf, &collector, &mtlf);
         assert!(response.success);
         assert!(response.result.is_some());
     }
@@ -1127,8 +1110,7 @@ mod tests {
             params: AnalyticsQueryParams::None,
         };
 
-        let response =
-            AnalyticsInfoService::handle_request(&request, &mut anlf, &collector, &mtlf);
+        let response = AnalyticsInfoService::handle_request(&request, &mut anlf, &collector, &mtlf);
         assert!(!response.success);
         assert!(response.error.is_some());
     }
@@ -1163,7 +1145,10 @@ mod tests {
 
     #[test]
     fn test_target_matches() {
-        assert!(target_matches(&AnalyticsTarget::Any, &AnalyticsTarget::Ue { ue_id: 1 }));
+        assert!(target_matches(
+            &AnalyticsTarget::Any,
+            &AnalyticsTarget::Ue { ue_id: 1 }
+        ));
         assert!(target_matches(
             &AnalyticsTarget::Ue { ue_id: 1 },
             &AnalyticsTarget::Ue { ue_id: 1 }

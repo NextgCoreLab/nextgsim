@@ -110,7 +110,6 @@ impl From<UeContextRequestValue> for UEContextRequest {
     }
 }
 
-
 /// User Location Information for NR (5G)
 #[derive(Debug, Clone)]
 pub struct UserLocationInfoNr {
@@ -230,9 +229,7 @@ pub fn build_initial_ue_message(
     protocol_ies.push(InitialUEMessageProtocolIEs_Entry {
         id: ProtocolIE_ID(ID_NAS_PDU),
         criticality: Criticality(Criticality::REJECT),
-        value: InitialUEMessageProtocolIEs_EntryValue::Id_NAS_PDU(NAS_PDU(
-            params.nas_pdu.clone(),
-        )),
+        value: InitialUEMessageProtocolIEs_EntryValue::Id_NAS_PDU(NAS_PDU(params.nas_pdu.clone())),
     });
 
     // IE: UserLocationInformation (mandatory)
@@ -307,7 +304,6 @@ pub fn build_initial_ue_message(
 
     Ok(NGAP_PDU::InitiatingMessage(initiating_message))
 }
-
 
 fn build_user_location_info(info: &UserLocationInfoNr) -> UserLocationInformation {
     // Build NR-CGI
@@ -414,7 +410,9 @@ fn build_allowed_nssai(allowed_nssai: &[AllowedSnssai]) -> AllowedNSSAI {
 /// # Returns
 /// * `Ok(InitialUeMessageData)` - The parsed message data
 /// * `Err(InitialUeMessageError)` - If parsing fails
-pub fn parse_initial_ue_message(pdu: &NGAP_PDU) -> Result<InitialUeMessageData, InitialUeMessageError> {
+pub fn parse_initial_ue_message(
+    pdu: &NGAP_PDU,
+) -> Result<InitialUeMessageData, InitialUeMessageError> {
     let initiating_message = match pdu {
         NGAP_PDU::InitiatingMessage(msg) => msg,
         _ => {
@@ -475,8 +473,9 @@ pub fn parse_initial_ue_message(pdu: &NGAP_PDU) -> Result<InitialUeMessageData, 
     }
 
     Ok(InitialUeMessageData {
-        ran_ue_ngap_id: ran_ue_ngap_id
-            .ok_or_else(|| InitialUeMessageError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
+            InitialUeMessageError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
+        })?,
         nas_pdu: nas_pdu
             .ok_or_else(|| InitialUeMessageError::MissingMandatoryIe("NAS-PDU".to_string()))?,
         user_location_info: user_location_info.ok_or_else(|| {
@@ -490,7 +489,6 @@ pub fn parse_initial_ue_message(pdu: &NGAP_PDU) -> Result<InitialUeMessageData, 
         ue_context_request,
     })
 }
-
 
 fn parse_user_location_info(
     info: &UserLocationInformation,
@@ -640,7 +638,9 @@ pub fn encode_initial_ue_message(
 /// # Returns
 /// * `Ok(InitialUeMessageData)` - The parsed message data
 /// * `Err(InitialUeMessageError)` - If decoding or parsing fails
-pub fn decode_initial_ue_message(bytes: &[u8]) -> Result<InitialUeMessageData, InitialUeMessageError> {
+pub fn decode_initial_ue_message(
+    bytes: &[u8],
+) -> Result<InitialUeMessageData, InitialUeMessageError> {
     let pdu = decode_ngap_pdu(bytes)?;
     parse_initial_ue_message(&pdu)
 }

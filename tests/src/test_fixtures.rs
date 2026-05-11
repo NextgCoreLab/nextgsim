@@ -6,8 +6,7 @@ use nextgsim_common::{Plmn, SNssai, Tai};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Test configuration container
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TestConfig {
     /// UE configuration
     pub ue: TestUeConfig,
@@ -16,7 +15,6 @@ pub struct TestConfig {
     /// Mock AMF configuration
     pub amf: TestAmfConfig,
 }
-
 
 /// Test UE configuration
 #[derive(Debug, Clone)]
@@ -42,15 +40,17 @@ impl Default for TestUeConfig {
         Self {
             supi: "imsi-001010000000001".to_string(),
             hplmn: Plmn::new(1, 1, false),
-            key: [0x46, 0x5b, 0x5c, 0xe8, 0xb1, 0x99, 0xb4, 0x9f,
-                  0xaa, 0x5f, 0x0a, 0x2e, 0xe2, 0x38, 0xa6, 0xbc],
-            op: [0xcd, 0xc2, 0x02, 0xd5, 0x12, 0x3e, 0x20, 0xf6,
-                 0x2b, 0x6d, 0x67, 0x6a, 0xc7, 0x2c, 0xb3, 0x18],
+            key: [
+                0x46, 0x5b, 0x5c, 0xe8, 0xb1, 0x99, 0xb4, 0x9f, 0xaa, 0x5f, 0x0a, 0x2e, 0xe2, 0x38,
+                0xa6, 0xbc,
+            ],
+            op: [
+                0xcd, 0xc2, 0x02, 0xd5, 0x12, 0x3e, 0x20, 0xf6, 0x2b, 0x6d, 0x67, 0x6a, 0xc7, 0x2c,
+                0xb3, 0x18,
+            ],
             op_is_opc: false,
             nssai: vec![SNssai::new(1)],
-            gnb_search_list: vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4997),
-            ],
+            gnb_search_list: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4997)],
         }
     }
 }
@@ -106,9 +106,7 @@ impl Default for TestGnbConfig {
             nci: 0x000000010,
             tai: Tai::new(Plmn::new(1, 1, false), 1),
             nssai: vec![SNssai::new(1)],
-            amf_addresses: vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38412),
-            ],
+            amf_addresses: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38412)],
             ngap_bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             gtp_bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2152),
             rls_bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4997),
@@ -218,7 +216,7 @@ mod tests {
         let config = TestUeConfig::default()
             .with_imsi("001010000000002")
             .with_plmn(310, 260);
-        
+
         assert_eq!(config.supi, "imsi-001010000000002");
         assert_eq!(config.hplmn.mcc, 310);
         assert_eq!(config.hplmn.mnc, 260);
@@ -228,7 +226,7 @@ mod tests {
     fn test_gnb_config_builder() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 38412);
         let config = TestGnbConfig::default().with_amf_addr(addr);
-        
+
         assert_eq!(config.amf_addresses[0], addr);
     }
 }

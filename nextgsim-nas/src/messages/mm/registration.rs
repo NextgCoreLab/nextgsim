@@ -11,10 +11,12 @@ use thiserror::Error;
 
 use crate::enums::MmMessageType;
 use crate::header::PlainMmHeader;
-use crate::ies::ie1::{Ie5gsRegistrationType, IeMicoIndication, InformationElement1, NssaiInclusionMode};
+use crate::ies::ie1::{
+    Ie5gsRegistrationType, IeMicoIndication, InformationElement1, NssaiInclusionMode,
+};
 use crate::ies::ie4::{
-    IeAiMlCapability, IeIsacParameter, IeSemanticCommParameter,
-    IeSubThzBandParameter, IeNtnTimingAdvance, IeNtnAccessBarring,
+    IeAiMlCapability, IeIsacParameter, IeNtnAccessBarring, IeNtnTimingAdvance,
+    IeSemanticCommParameter, IeSubThzBandParameter,
 };
 use crate::security::NasKeySetIdentifier;
 
@@ -404,7 +406,10 @@ pub struct Ie5gsRegistrationResult {
 impl Ie5gsRegistrationResult {
     /// Create a new 5GS Registration Result IE
     pub fn new(sms_allowed: SmsOverNasAllowed, result: RegistrationResultValue) -> Self {
-        Self { sms_allowed, result }
+        Self {
+            sms_allowed,
+            result,
+        }
     }
 
     /// Decode from bytes (without IEI, with length)
@@ -437,7 +442,10 @@ impl Ie5gsRegistrationResult {
             buf.advance(length - 1);
         }
 
-        Ok(Self { sms_allowed, result })
+        Ok(Self {
+            sms_allowed,
+            result,
+        })
     }
 
     /// Encode to bytes (without IEI, with length)
@@ -452,7 +460,6 @@ impl Ie5gsRegistrationResult {
         2 // 1 byte length + 1 byte value
     }
 }
-
 
 // ============================================================================
 // Registration Request Message (3GPP TS 24.501 Section 8.2.6)
@@ -644,10 +651,8 @@ impl RegistrationRequest {
                 0xB => {
                     // MICO indication (Type 1, IEI 0xB)
                     let val = buf.get_u8() & 0x0F;
-                    msg.mico_indication = Some(
-                        IeMicoIndication::decode(val)
-                            .expect("value expected")
-                    );
+                    msg.mico_indication =
+                        Some(IeMicoIndication::decode(val).expect("value expected"));
                     continue;
                 }
                 0x9 => {
@@ -837,7 +842,9 @@ impl RegistrationRequest {
 
         // Optional IEs
         if let Some(ref ng_ksi) = self.non_current_ng_ksi {
-            buf.put_u8((registration_request_iei::NON_CURRENT_NGKSI << 4) | (ng_ksi.encode() & 0x0F));
+            buf.put_u8(
+                (registration_request_iei::NON_CURRENT_NGKSI << 4) | (ng_ksi.encode() & 0x0F),
+            );
         }
 
         if let Some(ref cap) = self.ue_security_capability {
@@ -929,7 +936,6 @@ impl RegistrationRequest {
     }
 }
 
-
 // ============================================================================
 // Registration Accept Message (3GPP TS 24.501 Section 8.2.7)
 // ============================================================================
@@ -1002,8 +1008,7 @@ mod registration_accept_iei {
 /// Registration Accept message (network to UE)
 ///
 /// 3GPP TS 24.501 Section 8.2.7
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RegistrationAccept {
     /// 5GS registration result (mandatory, Type 4)
     pub registration_result: Ie5gsRegistrationResult,
@@ -1053,7 +1058,6 @@ pub struct RegistrationAccept {
     pub ntn_access_barring: Option<IeNtnAccessBarring>,
 }
 
-
 impl RegistrationAccept {
     /// Create a new Registration Accept with mandatory fields
     pub fn new(registration_result: Ie5gsRegistrationResult) -> Self {
@@ -1080,10 +1084,8 @@ impl RegistrationAccept {
                 0xB => {
                     // MICO indication (Type 1, IEI 0xB)
                     let val = buf.get_u8() & 0x0F;
-                    msg.mico_indication = Some(
-                        IeMicoIndication::decode(val)
-                            .expect("value expected")
-                    );
+                    msg.mico_indication =
+                        Some(IeMicoIndication::decode(val).expect("value expected"));
                     continue;
                 }
                 0x9 => {
@@ -1094,8 +1096,9 @@ impl RegistrationAccept {
                 0xA => {
                     // NSSAI inclusion mode
                     buf.advance(1);
-                    msg.nssai_inclusion_mode = Some(NssaiInclusionMode::try_from(iei & 0x03)
-                        .unwrap_or(NssaiInclusionMode::A));
+                    msg.nssai_inclusion_mode = Some(
+                        NssaiInclusionMode::try_from(iei & 0x03).unwrap_or(NssaiInclusionMode::A),
+                    );
                     continue;
                 }
                 _ => {}
@@ -1468,7 +1471,6 @@ impl RegistrationAccept {
     }
 }
 
-
 // ============================================================================
 // Registration Reject Message (3GPP TS 24.501 Section 8.2.8)
 // ============================================================================
@@ -1488,8 +1490,7 @@ mod registration_reject_iei {
 /// Registration Reject message (network to UE)
 ///
 /// 3GPP TS 24.501 Section 8.2.8
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RegistrationReject {
     /// 5GMM cause (mandatory, Type 3)
     pub mm_cause: Ie5gMmCause,
@@ -1502,7 +1503,6 @@ pub struct RegistrationReject {
     /// Rejected NSSAI (optional, Type 4, IEI 0x69)
     pub rejected_nssai: Option<Vec<u8>>,
 }
-
 
 impl RegistrationReject {
     /// Create a new Registration Reject with mandatory fields
@@ -1821,10 +1821,19 @@ mod tests {
         // Skip header (3 bytes) and decode
         let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
 
-        assert_eq!(decoded.registration_type.registration_type, RegistrationType::MobilityRegistrationUpdating);
-        assert_eq!(decoded.registration_type.follow_on_request_pending, FollowOnRequest::Pending);
+        assert_eq!(
+            decoded.registration_type.registration_type,
+            RegistrationType::MobilityRegistrationUpdating
+        );
+        assert_eq!(
+            decoded.registration_type.follow_on_request_pending,
+            FollowOnRequest::Pending
+        );
         assert_eq!(decoded.ng_ksi.ksi, 3);
-        assert_eq!(decoded.mobile_identity.identity_type, MobileIdentityType::Suci);
+        assert_eq!(
+            decoded.mobile_identity.identity_type,
+            MobileIdentityType::Suci
+        );
         assert_eq!(decoded.ue_security_capability, Some(vec![0xE0, 0xE0]));
     }
 
@@ -1861,8 +1870,14 @@ mod tests {
         // Skip header (3 bytes) and decode
         let decoded = RegistrationAccept::decode(&mut buf[3..].as_ref()).unwrap();
 
-        assert_eq!(decoded.registration_result.sms_allowed, SmsOverNasAllowed::Allowed);
-        assert_eq!(decoded.registration_result.result, RegistrationResultValue::ThreeGppAndNonThreeGppAccess);
+        assert_eq!(
+            decoded.registration_result.sms_allowed,
+            SmsOverNasAllowed::Allowed
+        );
+        assert_eq!(
+            decoded.registration_result.result,
+            RegistrationResultValue::ThreeGppAndNonThreeGppAccess
+        );
         assert_eq!(decoded.t3512_value, Some(0x21));
         assert_eq!(decoded.allowed_nssai, Some(vec![0x01, 0x02]));
     }
@@ -1920,6 +1935,9 @@ mod tests {
         // Skip header (3 bytes) and decode
         let decoded = RegistrationComplete::decode(&mut buf[3..].as_ref()).unwrap();
 
-        assert_eq!(decoded.sor_transparent_container, Some(vec![0x01, 0x02, 0x03, 0x04]));
+        assert_eq!(
+            decoded.sor_transparent_container,
+            Some(vec![0x01, 0x02, 0x03, 0x04])
+        );
     }
 }

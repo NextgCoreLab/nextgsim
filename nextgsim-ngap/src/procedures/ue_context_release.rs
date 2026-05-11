@@ -323,9 +323,8 @@ pub fn parse_ue_context_release_command(
     }
 
     Ok(UeContextReleaseCommandData {
-        ue_ngap_ids: ue_ngap_ids.ok_or_else(|| {
-            UeContextReleaseError::MissingMandatoryIe("UE-NGAP-IDs".to_string())
-        })?,
+        ue_ngap_ids: ue_ngap_ids
+            .ok_or_else(|| UeContextReleaseError::MissingMandatoryIe("UE-NGAP-IDs".to_string()))?,
         cause: cause
             .ok_or_else(|| UeContextReleaseError::MissingMandatoryIe("Cause".to_string()))?,
     })
@@ -383,17 +382,17 @@ pub fn build_ue_context_release_complete(
         UEContextReleaseCompleteProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
             criticality: Criticality(Criticality::IGNORE),
-            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(
-                params.amf_ue_ngap_id,
-            )),
+            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+                AMF_UE_NGAP_ID(params.amf_ue_ngap_id),
+            ),
         },
         // IE: RAN-UE-NGAP-ID (mandatory)
         UEContextReleaseCompleteProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
             criticality: Criticality(Criticality::IGNORE),
-            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(
-                params.ran_ue_ngap_id,
-            )),
+            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+                RAN_UE_NGAP_ID(params.ran_ue_ngap_id),
+            ),
         },
     ];
 
@@ -604,9 +603,7 @@ fn build_misc_cause(cause: &MiscCause) -> CauseMisc {
 
 fn parse_cause(cause: &Cause) -> UeContextReleaseCause {
     match cause {
-        Cause::RadioNetwork(rn) => {
-            NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn))
-        }
+        Cause::RadioNetwork(rn) => NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn)),
         Cause::Transport(t) => NgSetupFailureCause::Transport(parse_transport_cause(t)),
         Cause::Nas(n) => NgSetupFailureCause::Nas(parse_nas_cause(n)),
         Cause::Protocol(p) => NgSetupFailureCause::Protocol(parse_protocol_cause(p)),

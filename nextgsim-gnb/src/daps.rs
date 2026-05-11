@@ -157,14 +157,16 @@ impl DapsManager {
 
     /// Returns count of active DAPS sessions
     pub fn active_count(&self) -> usize {
-        self.sessions.values()
+        self.sessions
+            .values()
             .filter(|s| s.state == DapsState::Active)
             .count()
     }
 
     /// Returns sessions that need downlink forwarding
     pub fn forwarding_sessions(&self) -> Vec<&DapsSession> {
-        self.sessions.values()
+        self.sessions
+            .values()
             .filter(|s| s.needs_forwarding())
             .collect()
     }

@@ -52,10 +52,11 @@ impl WorkloadType {
     /// Returns the required capability for this workload type
     pub fn required_capability(&self) -> ComputeCapability {
         match self {
-            WorkloadType::Inference | WorkloadType::DataProcessing | WorkloadType::Analytics
-            | WorkloadType::SensingProcessing | WorkloadType::SemanticCoding => {
-                ComputeCapability::Inference
-            }
+            WorkloadType::Inference
+            | WorkloadType::DataProcessing
+            | WorkloadType::Analytics
+            | WorkloadType::SensingProcessing
+            | WorkloadType::SemanticCoding => ComputeCapability::Inference,
             WorkloadType::FineTuning => ComputeCapability::FineTuning,
             WorkloadType::Training => ComputeCapability::Training,
         }
@@ -140,7 +141,7 @@ impl WorkloadRequirements {
         Self {
             workload_type: WorkloadType::Inference,
             latency_constraint_ms: Some(10), // Local edge latency
-            compute_flops: 1_000_000_000, // 1 GFLOPS
+            compute_flops: 1_000_000_000,    // 1 GFLOPS
             memory_bytes: 512 * 1024 * 1024, // 512 MB
             capability: ComputeCapability::Inference,
             preferred_tier: Some(ComputeTier::LocalEdge),
@@ -156,7 +157,7 @@ impl WorkloadRequirements {
         Self {
             workload_type: WorkloadType::FineTuning,
             latency_constraint_ms: Some(20), // Regional edge latency
-            compute_flops: 100_000_000_000, // 100 GFLOPS
+            compute_flops: 100_000_000_000,  // 100 GFLOPS
             memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GB
             capability: ComputeCapability::FineTuning,
             preferred_tier: Some(ComputeTier::RegionalEdge),
@@ -171,8 +172,8 @@ impl WorkloadRequirements {
     pub fn training() -> Self {
         Self {
             workload_type: WorkloadType::Training,
-            latency_constraint_ms: None, // No constraint
-            compute_flops: 1_000_000_000_000, // 1 TFLOPS
+            latency_constraint_ms: None,           // No constraint
+            compute_flops: 1_000_000_000_000,      // 1 TFLOPS
             memory_bytes: 64 * 1024 * 1024 * 1024, // 64 GB
             capability: ComputeCapability::Training,
             preferred_tier: Some(ComputeTier::CoreCloud),
@@ -188,7 +189,7 @@ impl WorkloadRequirements {
         Self {
             workload_type: WorkloadType::SensingProcessing,
             latency_constraint_ms: Some(10), // Real-time sensing at edge
-            compute_flops: 5_000_000_000, // 5 GFLOPS for fusion algorithms
+            compute_flops: 5_000_000_000,    // 5 GFLOPS for fusion algorithms
             memory_bytes: 1024 * 1024 * 1024, // 1 GB
             capability: ComputeCapability::Inference,
             preferred_tier: Some(ComputeTier::LocalEdge),
@@ -204,7 +205,7 @@ impl WorkloadRequirements {
         Self {
             workload_type: WorkloadType::SemanticCoding,
             latency_constraint_ms: Some(15), // Near real-time encoding/decoding
-            compute_flops: 10_000_000_000, // 10 GFLOPS for neural codecs
+            compute_flops: 10_000_000_000,   // 10 GFLOPS for neural codecs
             memory_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
             capability: ComputeCapability::Inference,
             preferred_tier: Some(ComputeTier::LocalEdge),
@@ -372,7 +373,8 @@ impl Workload {
 
     /// Returns the queue time (time from creation to start)
     pub fn queue_time(&self) -> Option<std::time::Duration> {
-        self.started_at.map(|start| start.duration_since(self.created_at))
+        self.started_at
+            .map(|start| start.duration_since(self.created_at))
     }
 
     /// Returns true if the workload is terminal (completed, failed, or cancelled)

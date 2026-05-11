@@ -278,7 +278,8 @@ impl SlaMonitor {
 
         // Trim history if needed
         if self.violations.len() > self.max_violations {
-            self.violations.drain(0..self.violations.len() - self.max_violations);
+            self.violations
+                .drain(0..self.violations.len() - self.max_violations);
         }
     }
 
@@ -427,8 +428,8 @@ mod tests {
 
     #[test]
     fn test_contract_expiry() {
-        let contract = SlaContract::new(WorkloadId::new(1), vec![])
-            .with_duration(Duration::from_millis(100));
+        let contract =
+            SlaContract::new(WorkloadId::new(1), vec![]).with_duration(Duration::from_millis(100));
 
         assert!(contract.is_active());
 
@@ -460,8 +461,8 @@ mod tests {
     fn test_cleanup_expired() {
         let mut monitor = SlaMonitor::new(100);
 
-        let contract = SlaContract::new(WorkloadId::new(1), vec![])
-            .with_duration(Duration::from_millis(50));
+        let contract =
+            SlaContract::new(WorkloadId::new(1), vec![]).with_duration(Duration::from_millis(50));
 
         monitor.register_contract(contract);
         assert_eq!(monitor.active_contract_count(), 1);

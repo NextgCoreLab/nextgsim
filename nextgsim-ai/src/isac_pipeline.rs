@@ -192,20 +192,18 @@ impl IsacPipeline {
             .as_ref()
             .ok_or(IsacError::ModelNotLoaded)?;
 
-        debug!(
-            "Fusing {} sensing data sources",
-            self.pending_data.len()
-        );
+        debug!("Fusing {} sensing data sources", self.pending_data.len());
 
         // Prepare input for positioning model
         let fused_input = self.prepare_fusion_input()?;
 
         // Run positioning inference
-        let position_output = model
-            .infer(&fused_input)
-            .map_err(|e| IsacError::PositioningError {
-                reason: format!("Model inference failed: {e}"),
-            })?;
+        let position_output =
+            model
+                .infer(&fused_input)
+                .map_err(|e| IsacError::PositioningError {
+                    reason: format!("Model inference failed: {e}"),
+                })?;
 
         // Extract position estimate from model output
         let position = self.extract_position_estimate(&position_output)?;
@@ -219,7 +217,11 @@ impl IsacPipeline {
         }
 
         // Create result
-        let sources: Vec<String> = self.pending_data.iter().map(|d| d.source_id.clone()).collect();
+        let sources: Vec<String> = self
+            .pending_data
+            .iter()
+            .map(|d| d.source_id.clone())
+            .collect();
         let num_sources = sources.len();
 
         let result = FusedSensingResult {
@@ -275,7 +277,10 @@ impl IsacPipeline {
     }
 
     /// Extracts position estimate from model output
-    fn extract_position_estimate(&self, output: &TensorData) -> Result<PositionEstimate, IsacError> {
+    fn extract_position_estimate(
+        &self,
+        output: &TensorData,
+    ) -> Result<PositionEstimate, IsacError> {
         // Placeholder implementation: extract from model output tensor
         // Expected output format: [x, y, z, uncertainty]
 
@@ -436,8 +441,12 @@ mod tests {
         config.max_data_sources = 2;
         let mut pipeline = IsacPipeline::new(config);
 
-        pipeline.add_sensing_data(create_test_sensing_data("gNB-1")).unwrap();
-        pipeline.add_sensing_data(create_test_sensing_data("gNB-2")).unwrap();
+        pipeline
+            .add_sensing_data(create_test_sensing_data("gNB-1"))
+            .unwrap();
+        pipeline
+            .add_sensing_data(create_test_sensing_data("gNB-2"))
+            .unwrap();
 
         let result = pipeline.add_sensing_data(create_test_sensing_data("gNB-3"));
         assert!(result.is_err());
@@ -456,14 +465,18 @@ mod tests {
         assert!(!pipeline.should_fuse());
 
         // Add data, should fuse (first time)
-        pipeline.add_sensing_data(create_test_sensing_data("gNB-1")).unwrap();
+        pipeline
+            .add_sensing_data(create_test_sensing_data("gNB-1"))
+            .unwrap();
         assert!(pipeline.should_fuse());
     }
 
     #[test]
     fn test_fuse_without_model() {
         let mut pipeline = IsacPipeline::new(IsacConfig::default());
-        pipeline.add_sensing_data(create_test_sensing_data("gNB-1")).unwrap();
+        pipeline
+            .add_sensing_data(create_test_sensing_data("gNB-1"))
+            .unwrap();
 
         let result = pipeline.fuse_and_position();
         assert!(result.is_err());
@@ -499,8 +512,12 @@ mod tests {
     #[test]
     fn test_clear_pending() {
         let mut pipeline = IsacPipeline::new(IsacConfig::default());
-        pipeline.add_sensing_data(create_test_sensing_data("gNB-1")).unwrap();
-        pipeline.add_sensing_data(create_test_sensing_data("gNB-2")).unwrap();
+        pipeline
+            .add_sensing_data(create_test_sensing_data("gNB-1"))
+            .unwrap();
+        pipeline
+            .add_sensing_data(create_test_sensing_data("gNB-2"))
+            .unwrap();
         assert_eq!(pipeline.pending_sources(), 2);
 
         pipeline.clear_pending();

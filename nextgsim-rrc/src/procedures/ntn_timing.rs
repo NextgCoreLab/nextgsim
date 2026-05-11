@@ -361,9 +361,7 @@ impl NtnHarqConfig {
 }
 
 /// Encode NTN timing advance to bytes (simplified serialization)
-pub fn encode_ntn_timing_advance(
-    ta: &NtnTimingAdvance,
-) -> Result<Vec<u8>, NtnTimingError> {
+pub fn encode_ntn_timing_advance(ta: &NtnTimingAdvance) -> Result<Vec<u8>, NtnTimingError> {
     ta.validate()?;
     let mut bytes = Vec::with_capacity(48);
 
@@ -621,14 +619,20 @@ mod tests {
         let alt = eph.periapsis_altitude_m();
         // a = 6_921_000, e = 0.001, Earth_R = 6_371_000
         // periapsis = a * (1-e) - R = 6_921_000 * 0.999 - 6_371_000 ≈ 543_079
-        assert!(alt > 500_000.0 && alt < 600_000.0, "Periapsis altitude was {alt}");
+        assert!(
+            alt > 500_000.0 && alt < 600_000.0,
+            "Periapsis altitude was {alt}"
+        );
     }
 
     #[test]
     fn test_ephemeris_apoapsis_altitude() {
         let eph = create_test_ephemeris();
         let alt = eph.apoapsis_altitude_m();
-        assert!(alt > 540_000.0 && alt < 560_000.0, "Apoapsis altitude was {alt}");
+        assert!(
+            alt > 540_000.0 && alt < 560_000.0,
+            "Apoapsis altitude was {alt}"
+        );
     }
 
     #[test]

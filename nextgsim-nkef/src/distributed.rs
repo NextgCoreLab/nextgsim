@@ -199,7 +199,12 @@ impl DistributedNode {
     }
 
     /// Replicates an entity from another node
-    fn replicate_entity(&mut self, entity: Entity, source_node: NodeId, version: u64) -> ReplicationResult {
+    fn replicate_entity(
+        &mut self,
+        entity: Entity,
+        source_node: NodeId,
+        version: u64,
+    ) -> ReplicationResult {
         let entity_id = entity.id.clone();
 
         // Check if we already have this entity
@@ -228,7 +233,12 @@ impl DistributedNode {
     }
 
     /// Handles entity deletion
-    fn replicate_delete(&mut self, entity_id: &str, source_node: &NodeId, version: u64) -> ReplicationResult {
+    fn replicate_delete(
+        &mut self,
+        entity_id: &str,
+        source_node: &NodeId,
+        version: u64,
+    ) -> ReplicationResult {
         if let Some(existing) = self.replicated_entities.get(entity_id) {
             if &existing.source_node == source_node && version > existing.version {
                 self.replicated_entities.remove(entity_id);
@@ -299,14 +309,20 @@ impl DistributedNode {
     }
 
     /// Handles sync response
-    fn handle_sync_response(&mut self, entities: Vec<ReplicatedEntity>, relationships: Vec<Relationship>) -> ReplicationResult {
+    fn handle_sync_response(
+        &mut self,
+        entities: Vec<ReplicatedEntity>,
+        relationships: Vec<Relationship>,
+    ) -> ReplicationResult {
         for replicated in entities {
             let entity_id = replicated.entity.id.clone();
             self.replicated_entities.insert(entity_id, replicated);
         }
 
         for relationship in relationships {
-            if !self.local_relationships.iter().any(|r| r.source_id == relationship.source_id && r.target_id == relationship.target_id) {
+            if !self.local_relationships.iter().any(|r| {
+                r.source_id == relationship.source_id && r.target_id == relationship.target_id
+            }) {
                 self.local_relationships.push(relationship);
             }
         }
@@ -463,7 +479,9 @@ mod tests {
             properties: HashMap::new(),
             embedding: None,
         };
-        entity1.properties.insert("key".to_string(), "value1".to_string());
+        entity1
+            .properties
+            .insert("key".to_string(), "value1".to_string());
 
         node.replicate_entity(entity1, "node2".to_string(), 1);
 
@@ -474,7 +492,9 @@ mod tests {
             properties: HashMap::new(),
             embedding: None,
         };
-        entity2.properties.insert("key".to_string(), "value2".to_string());
+        entity2
+            .properties
+            .insert("key".to_string(), "value2".to_string());
 
         let result = node.replicate_entity(entity2, "node2".to_string(), 2);
 
@@ -522,6 +542,9 @@ mod tests {
         let status = node.replication_status();
         assert_eq!(status.node_id, "node1");
         assert_eq!(status.peer_count, 2);
-        assert_eq!(status.consistency_level, ConsistencyLevel::EventualConsistency);
+        assert_eq!(
+            status.consistency_level,
+            ConsistencyLevel::EventualConsistency
+        );
     }
 }

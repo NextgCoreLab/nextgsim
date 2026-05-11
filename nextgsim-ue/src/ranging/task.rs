@@ -116,8 +116,12 @@ impl RangingSession {
             let resolved_distance = distance_widelane + n * lambda_w;
 
             // Refine with narrowlane using first frequency
-            let n_narrow = ((resolved_distance - (m1.phase_rad / (2.0 * std::f64::consts::PI)) * lambda1) / lambda1).round();
-            let refined_distance = (m1.phase_rad / (2.0 * std::f64::consts::PI)) * lambda1 + n_narrow * lambda1;
+            let n_narrow = ((resolved_distance
+                - (m1.phase_rad / (2.0 * std::f64::consts::PI)) * lambda1)
+                / lambda1)
+                .round();
+            let refined_distance =
+                (m1.phase_rad / (2.0 * std::f64::consts::PI)) * lambda1 + n_narrow * lambda1;
 
             // Weight by quality
             let avg_quality = (m1.quality + m2.quality) / 2.0;
@@ -158,14 +162,22 @@ impl Task for RangingTask {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {
                     RangingMessage::StartRanging { peer_ue_id, method } => {
-                        debug!("Ranging: Start session with peer UE {} method={:?}", peer_ue_id, method);
-                        self.sessions.insert(peer_ue_id, RangingSession::new(peer_ue_id));
+                        debug!(
+                            "Ranging: Start session with peer UE {} method={:?}",
+                            peer_ue_id, method
+                        );
+                        self.sessions
+                            .insert(peer_ue_id, RangingSession::new(peer_ue_id));
                     }
                     RangingMessage::StopRanging { peer_ue_id } => {
                         debug!("Ranging: Stop session with peer UE {}", peer_ue_id);
                         self.sessions.remove(&peer_ue_id);
                     }
-                    RangingMessage::RttMeasurement { peer_ue_id, rtt_ns, timestamp_ms } => {
+                    RangingMessage::RttMeasurement {
+                        peer_ue_id,
+                        rtt_ns,
+                        timestamp_ms,
+                    } => {
                         if let Some(session) = self.sessions.get_mut(&peer_ue_id) {
                             session.update_rtt(rtt_ns, timestamp_ms);
                             debug!(
@@ -226,7 +238,10 @@ impl Task for RangingTask {
                 None => break,
             }
         }
-        info!("Ranging task stopped, {} active sessions", self.sessions.len());
+        info!(
+            "Ranging task stopped, {} active sessions",
+            self.sessions.len()
+        );
     }
 }
 

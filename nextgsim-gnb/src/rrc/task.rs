@@ -4,8 +4,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
-    GnbTaskBase, GutiMobileIdentity, IsacMessage, NgapMessage, NkefMessage, RlsMessage,
-    RrcMessage, SheMessage, Task, TaskMessage,
+    GnbTaskBase, GutiMobileIdentity, IsacMessage, NgapMessage, NkefMessage, RlsMessage, RrcMessage,
+    SheMessage, Task, TaskMessage,
 };
 use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
@@ -64,7 +64,12 @@ impl RrcTask {
     }
 
     async fn handle_uplink_rrc(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
-        debug!("Uplink RRC: ue_id={}, channel={:?}, len={}", ue_id, channel, data.len());
+        debug!(
+            "Uplink RRC: ue_id={}, channel={:?}, len={}",
+            ue_id,
+            channel,
+            data.len()
+        );
 
         match channel {
             RrcChannel::UlCcch | RrcChannel::UlCcch1 => {
@@ -104,13 +109,20 @@ impl RrcTask {
                 AsnEstablishmentCause::McsPriorityAccess => 9,
             };
 
-            debug!("Decoded ASN.1 RRCSetupRequest: initial_id={:x}, is_stmsi={}, cause={}",
-                initial_id, is_stmsi, establishment_cause);
+            debug!(
+                "Decoded ASN.1 RRCSetupRequest: initial_id={:x}, is_stmsi={}, cause={}",
+                initial_id, is_stmsi, establishment_cause
+            );
 
             if let Some(result) = self.connection_manager.process_rrc_setup_request(
-                &mut self.ue_manager, ue_id, initial_id, is_stmsi, establishment_cause,
+                &mut self.ue_manager,
+                ue_id,
+                initial_id,
+                is_stmsi,
+                establishment_cause,
             ) {
-                self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu).await;
+                self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu)
+                    .await;
             }
             return;
         }
@@ -126,7 +138,9 @@ impl RrcTask {
                     return;
                 }
                 let initial_id = i64::from_be_bytes([
-                    0, 0, 0,
+                    0,
+                    0,
+                    0,
                     bytes.get(1).copied().unwrap_or(0),
                     bytes.get(2).copied().unwrap_or(0),
                     bytes.get(3).copied().unwrap_or(0),
@@ -138,9 +152,14 @@ impl RrcTask {
                 let establishment_cause = bytes.get(6).copied().unwrap_or(3) as i64;
 
                 if let Some(result) = self.connection_manager.process_rrc_setup_request(
-                    &mut self.ue_manager, ue_id, initial_id, is_stmsi, establishment_cause,
+                    &mut self.ue_manager,
+                    ue_id,
+                    initial_id,
+                    is_stmsi,
+                    establishment_cause,
                 ) {
-                    self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu).await;
+                    self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu)
+                        .await;
                 }
             }
             // RRC Reestablishment Request (0x24)
@@ -196,7 +215,8 @@ impl RrcTask {
                         ctx.on_setup_complete(); // Mark as connected
                     }
                     // Forward as Initial NAS
-                    self.send_initial_nas_delivery(ue_id, data.clone(), 3, None).await; // cause=3 (mo-Data)
+                    self.send_initial_nas_delivery(ue_id, data.clone(), 3, None)
+                        .await; // cause=3 (mo-Data)
                 } else {
                     debug!("Unhandled UL-DCCH message type: {:#x}", message_type);
                 }
@@ -219,11 +239,19 @@ impl RrcTask {
         };
 
         if let Some(result) = self.connection_manager.process_rrc_setup_complete(
-            &mut self.ue_manager, ue_id, transaction_id, nas_pdu, None,
+            &mut self.ue_manager,
+            ue_id,
+            transaction_id,
+            nas_pdu,
+            None,
         ) {
             self.send_initial_nas_delivery(
-                result.ue_id, result.nas_pdu, result.establishment_cause, result.s_tmsi,
-            ).await;
+                result.ue_id,
+                result.nas_pdu,
+                result.establishment_cause,
+                result.s_tmsi,
+            )
+            .await;
         }
     }
 
@@ -252,7 +280,8 @@ impl RrcTask {
         }
 
         let dl_info_transfer = self.build_dl_information_transfer(&nas_pdu);
-        self.send_rrc_message(ue_id, RrcChannel::DlDcch, dl_info_transfer).await;
+        self.send_rrc_message(ue_id, RrcChannel::DlDcch, dl_info_transfer)
+            .await;
     }
 
     fn build_dl_information_transfer(&self, nas_pdu: &OctetString) -> OctetString {
@@ -300,13 +329,15 @@ impl RrcTask {
         let bytes = data.data();
         let transaction_id = if bytes.len() >= 2 { bytes[1] } else { 0 };
 
-        info!("RRC Reestablishment Complete from UE[{}], tid={}", ue_id, transaction_id);
+        info!(
+            "RRC Reestablishment Complete from UE[{}], tid={}",
+            ue_id, transaction_id
+        );
 
-        if let Some(result) = self.connection_manager.process_rrc_reestablishment_complete(
-            &mut self.ue_manager,
-            ue_id,
-            transaction_id,
-        ) {
+        if let Some(result) = self
+            .connection_manager
+            .process_rrc_reestablishment_complete(&mut self.ue_manager, ue_id, transaction_id)
+        {
             // If there's a NAS PDU, forward it to NGAP
             if let Some(nas_pdu) = result.nas_pdu {
                 self.send_uplink_nas_delivery(result.ue_id, nas_pdu).await;
@@ -328,7 +359,8 @@ impl RrcTask {
             ue_id,
             resume_cause,
         ) {
-            self.send_rrc_message(result.ue_id, result.channel, result.rrc_resume_pdu).await;
+            self.send_rrc_message(result.ue_id, result.channel, result.rrc_resume_pdu)
+                .await;
         }
     }
 
@@ -341,7 +373,10 @@ impl RrcTask {
             None
         };
 
-        info!("RRC Resume Complete from UE[{}], tid={}", ue_id, transaction_id);
+        info!(
+            "RRC Resume Complete from UE[{}], tid={}",
+            ue_id, transaction_id
+        );
 
         if let Some(result) = self.connection_manager.process_rrc_resume_complete(
             &mut self.ue_manager,
@@ -357,8 +392,12 @@ impl RrcTask {
     }
 
     async fn handle_an_release(&mut self, ue_id: i32) {
-        if let Some(result) = self.connection_manager.initiate_rrc_release(&mut self.ue_manager, ue_id) {
-            self.send_rrc_message(result.ue_id, result.channel, result.rrc_release_pdu).await;
+        if let Some(result) = self
+            .connection_manager
+            .initiate_rrc_release(&mut self.ue_manager, ue_id)
+        {
+            self.send_rrc_message(result.ue_id, result.channel, result.rrc_release_pdu)
+                .await;
         }
         self.ue_manager.delete_ue(ue_id);
     }
@@ -369,16 +408,30 @@ impl RrcTask {
 
     async fn send_rrc_message(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
         let pdu_id = self.next_pdu_id();
-        let msg = RlsMessage::DownlinkRrc { ue_id, rrc_channel: channel, pdu_id, data };
+        let msg = RlsMessage::DownlinkRrc {
+            ue_id,
+            rrc_channel: channel,
+            pdu_id,
+            data,
+        };
         if let Err(e) = self.task_base.rls_tx.send(msg).await {
             error!("Failed to send RRC message to RLS: {}", e);
         }
     }
 
     async fn send_initial_nas_delivery(
-        &self, ue_id: i32, pdu: OctetString, rrc_establishment_cause: i64, s_tmsi: Option<GutiMobileIdentity>,
+        &self,
+        ue_id: i32,
+        pdu: OctetString,
+        rrc_establishment_cause: i64,
+        s_tmsi: Option<GutiMobileIdentity>,
     ) {
-        let msg = NgapMessage::InitialNasDelivery { ue_id, pdu, rrc_establishment_cause, s_tmsi };
+        let msg = NgapMessage::InitialNasDelivery {
+            ue_id,
+            pdu,
+            rrc_establishment_cause,
+            s_tmsi,
+        };
         if let Err(e) = self.task_base.ngap_tx.send(msg).await {
             error!("Failed to send Initial NAS to NGAP: {}", e);
         }
@@ -404,7 +457,10 @@ impl RrcTask {
                 error!("Failed to route AI/ML inference to SHE: {}", e);
             }
         } else {
-            warn!("6G tasks not initialized, dropping AI/ML inference from UE[{}]", ue_id);
+            warn!(
+                "6G tasks not initialized, dropping AI/ML inference from UE[{}]",
+                ue_id
+            );
         }
     }
 
@@ -421,7 +477,10 @@ impl RrcTask {
                 error!("Failed to route ISAC sensing data: {}", e);
             }
         } else {
-            warn!("6G tasks not initialized, dropping ISAC data from UE[{}]", ue_id);
+            warn!(
+                "6G tasks not initialized, dropping ISAC data from UE[{}]",
+                ue_id
+            );
         }
     }
 
@@ -440,7 +499,10 @@ impl RrcTask {
                 error!("Failed to route semantic message to NKEF: {}", e);
             }
         } else {
-            warn!("6G tasks not initialized, dropping semantic message from UE[{}]", ue_id);
+            warn!(
+                "6G tasks not initialized, dropping semantic message from UE[{}]",
+                ue_id
+            );
         }
     }
 
@@ -541,7 +603,10 @@ impl Task for RrcTask {
             }
         }
 
-        info!("RRC task stopped with {} UE contexts", self.ue_manager.count());
+        info!(
+            "RRC task stopped with {} UE contexts",
+            self.ue_manager.count()
+        );
     }
 }
 
@@ -563,7 +628,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,

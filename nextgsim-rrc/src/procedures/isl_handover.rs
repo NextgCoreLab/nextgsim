@@ -199,8 +199,12 @@ impl IslHandoverManager {
             return Err(IslHandoverError::HandoverInProgress);
         }
 
-        let mut context =
-            IslHandoverContext::new(source_satellite, target_satellite, service_link, feeder_link);
+        let mut context = IslHandoverContext::new(
+            source_satellite,
+            target_satellite,
+            service_link,
+            feeder_link,
+        );
 
         // Calculate ISL delay if satellite positions are available
         if let (Some(source_pos), Some(target_pos)) = (
@@ -295,17 +299,23 @@ impl IslHandoverManager {
     /// Predict handover based on satellite trajectory
     ///
     /// Returns predicted time until handover needed (in seconds)
-    pub fn predict_handover(&self, current_satellite: u32, ue_position: &SatellitePosition,
-                           elevation_threshold_deg: f64) -> Option<f64> {
+    pub fn predict_handover(
+        &self,
+        current_satellite: u32,
+        ue_position: &SatellitePosition,
+        elevation_threshold_deg: f64,
+    ) -> Option<f64> {
         // Get current satellite position
         let current_pos = self.satellite_positions.get(&current_satellite)?;
 
         // Calculate current elevation (simplified)
         let distance = current_pos.distance_to(ue_position);
         let earth_r = 6371.0; // km
-        let sat_alt = (current_pos.x_km * current_pos.x_km +
-                      current_pos.y_km * current_pos.y_km +
-                      current_pos.z_km * current_pos.z_km).sqrt() - earth_r;
+        let sat_alt = (current_pos.x_km * current_pos.x_km
+            + current_pos.y_km * current_pos.y_km
+            + current_pos.z_km * current_pos.z_km)
+            .sqrt()
+            - earth_r;
 
         let elevation = (sat_alt / distance).atan().to_degrees();
 
@@ -328,7 +338,9 @@ impl IslHandoverManager {
         let successful = self.handover_history.iter().filter(|r| r.success).count();
 
         let avg_duration_ms = if !self.handover_history.is_empty() {
-            let sum: u64 = self.handover_history.iter()
+            let sum: u64 = self
+                .handover_history
+                .iter()
                 .map(|r| r.completion_time_ms - r.start_time_ms)
                 .sum();
             sum / total as u64
@@ -509,9 +521,7 @@ mod tests {
         assert!(matches!(result, Err(IslHandoverError::NoActiveHandover)));
 
         // Initiate handover
-        manager
-            .initiate_isl_handover(100, 200, 1, None)
-            .unwrap();
+        manager.initiate_isl_handover(100, 200, 1, None).unwrap();
 
         // Try to initiate another handover
         let result = manager.initiate_isl_handover(100, 300, 1, None);

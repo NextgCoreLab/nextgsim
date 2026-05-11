@@ -10,8 +10,7 @@
 use std::collections::HashMap;
 
 /// UE state within NGAP
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UeState {
     /// Initial state, waiting for Initial Context Setup
     #[default]
@@ -23,7 +22,6 @@ pub enum UeState {
     /// UE context release in progress
     Releasing,
 }
-
 
 impl std::fmt::Display for UeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

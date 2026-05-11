@@ -322,7 +322,10 @@ mod tests {
         assert_eq!(request.priority, 6);
 
         match request.input {
-            SemanticCodingInput::RawData { data, dimensions: dims } => {
+            SemanticCodingInput::RawData {
+                data,
+                dimensions: dims,
+            } => {
                 assert_eq!(data.len(), 256);
                 assert_eq!(dims, vec![16, 16]);
             }
@@ -388,10 +391,7 @@ mod tests {
 
     #[test]
     fn test_semantic_coding_operation_display() {
-        assert_eq!(
-            format!("{}", SemanticCodingOperation::Encode),
-            "Encode"
-        );
+        assert_eq!(format!("{}", SemanticCodingOperation::Encode), "Encode");
         assert_eq!(
             format!("{}", SemanticCodingOperation::AdaptiveEncode),
             "AdaptiveEncode"
@@ -414,7 +414,8 @@ mod tests {
         let data = vec![1.0, 2.0];
         let dims = vec![2];
 
-        let req1 = client.submit_encode(data.clone(), dims.clone(), SemanticTask::SensorFusion, 5.0);
+        let req1 =
+            client.submit_encode(data.clone(), dims.clone(), SemanticTask::SensorFusion, 5.0);
         let req2 = client.submit_encode(data, dims, SemanticTask::SensorFusion, 5.0);
 
         assert_eq!(req1.workload_id, 1);

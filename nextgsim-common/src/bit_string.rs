@@ -420,9 +420,6 @@ mod tests {
         bs.write_bits_u64(0x123456789ABCDEF0, 64);
         assert_eq!(bs.bit_length(), 64);
         assert_eq!(bs.octet_length(), 8);
-        assert_eq!(
-            bs.data(),
-            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]
-        );
+        assert_eq!(bs.data(), &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]);
     }
 }

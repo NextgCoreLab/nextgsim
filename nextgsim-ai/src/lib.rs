@@ -58,9 +58,9 @@ pub mod metrics;
 pub mod model;
 pub mod nr_models;
 pub mod semantic_pipeline;
-pub mod xr_traffic;
 pub mod tensor;
 pub mod tflite;
+pub mod xr_traffic;
 
 // Re-export main types
 pub use config::{AiConfig, ExecutionProvider, InferenceConfig};
@@ -68,8 +68,7 @@ pub use error::{AiError, InferenceError, ModelError};
 pub use fl_training::{FlError, FlParticipant, FlTrainer, ParticipantStatus, RoundResult};
 pub use inference::{InferenceEngine, OnnxEngine};
 pub use isac_pipeline::{
-    FusedSensingResult, IsacError, IsacPipeline, IsacPipelineBuilder, PositionEstimate,
-    SensingData,
+    FusedSensingResult, IsacError, IsacPipeline, IsacPipelineBuilder, PositionEstimate, SensingData,
 };
 pub use metrics::{InferenceMetrics, ModelMetrics};
 pub use model::{ModelInfo, ModelMetadata};
@@ -79,6 +78,5 @@ pub use semantic_pipeline::{
 pub use tensor::{TensorData, TensorShape};
 pub use tflite::TfLiteEngine;
 pub use xr_traffic::{
-    CdrxState, PduSet, PduSetManager, Xr5Qi, XrCdrxController, XrFrame, XrQosFlow,
-    XrTrafficModel,
+    CdrxState, PduSet, PduSetManager, Xr5Qi, XrCdrxController, XrFrame, XrQosFlow, XrTrafficModel,
 };

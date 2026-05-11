@@ -35,9 +35,9 @@ impl SlPrsResourceConfig {
     pub fn new(resource_id: u16) -> Self {
         Self {
             resource_id,
-            periodicity_slots: 40,     // 40 slots = 40ms for 1kHz SCS
+            periodicity_slots: 40, // 40 slots = 40ms for 1kHz SCS
             slot_offset: 0,
-            num_symbols: 12,           // One slot
+            num_symbols: 12, // One slot
             start_symbol: 0,
             comb_size: 4,
             tx_power_dbm: 23,
@@ -409,7 +409,8 @@ impl SidelinkPositioningEngine {
         // Initial guess: centroid of anchors
         let mut pos = Position3D::new(
             self.anchors.iter().map(|a| a.position.east_m).sum::<f64>() / self.anchors.len() as f64,
-            self.anchors.iter().map(|a| a.position.north_m).sum::<f64>() / self.anchors.len() as f64,
+            self.anchors.iter().map(|a| a.position.north_m).sum::<f64>()
+                / self.anchors.len() as f64,
             self.anchors.iter().map(|a| a.position.up_m).sum::<f64>() / self.anchors.len() as f64,
         );
 
@@ -460,7 +461,8 @@ impl SidelinkPositioningEngine {
         }
 
         // Average measurement quality
-        let avg_quality = self.anchors.iter().map(|a| a.quality).sum::<f64>() / self.anchors.len() as f64;
+        let avg_quality =
+            self.anchors.iter().map(|a| a.quality).sum::<f64>() / self.anchors.len() as f64;
 
         // Base accuracy from measurement quality
         // High quality (0.9-1.0) -> 1-2m, medium (0.5-0.9) -> 2-5m, low (<0.5) -> 5-20m
@@ -556,10 +558,30 @@ mod tests {
         let mut engine = SidelinkPositioningEngine::new();
 
         // Create 4 anchors in a square around origin
-        engine.add_anchor(AnchorUe::new(1, Position3D::new(10.0, 10.0, 0.0), 14.14, 1.0));
-        engine.add_anchor(AnchorUe::new(2, Position3D::new(-10.0, 10.0, 0.0), 14.14, 1.0));
-        engine.add_anchor(AnchorUe::new(3, Position3D::new(-10.0, -10.0, 0.0), 14.14, 1.0));
-        engine.add_anchor(AnchorUe::new(4, Position3D::new(10.0, -10.0, 0.0), 14.14, 1.0));
+        engine.add_anchor(AnchorUe::new(
+            1,
+            Position3D::new(10.0, 10.0, 0.0),
+            14.14,
+            1.0,
+        ));
+        engine.add_anchor(AnchorUe::new(
+            2,
+            Position3D::new(-10.0, 10.0, 0.0),
+            14.14,
+            1.0,
+        ));
+        engine.add_anchor(AnchorUe::new(
+            3,
+            Position3D::new(-10.0, -10.0, 0.0),
+            14.14,
+            1.0,
+        ));
+        engine.add_anchor(AnchorUe::new(
+            4,
+            Position3D::new(10.0, -10.0, 0.0),
+            14.14,
+            1.0,
+        ));
 
         let estimate = engine.calculate_position(0);
         assert!(estimate.is_some());
@@ -572,13 +594,7 @@ mod tests {
 
     #[test]
     fn test_position_estimate_accuracy_check() {
-        let estimate = PositionEstimate::new(
-            Position3D::new(0.0, 0.0, 0.0),
-            2.0,
-            3.0,
-            4,
-            0,
-        );
+        let estimate = PositionEstimate::new(Position3D::new(0.0, 0.0, 0.0), 2.0, 3.0, 4, 0);
 
         assert!(estimate.meets_accuracy(5.0, 5.0));
         assert!(!estimate.meets_accuracy(1.0, 5.0));

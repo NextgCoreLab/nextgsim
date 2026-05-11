@@ -129,7 +129,8 @@ impl FlTrainer {
     /// Registers a new participant
     pub fn register_participant(&mut self, participant: FlParticipant) {
         info!("Registering FL participant: {}", participant.id);
-        self.participants.insert(participant.id.clone(), participant);
+        self.participants
+            .insert(participant.id.clone(), participant);
     }
 
     /// Removes a participant
@@ -142,7 +143,9 @@ impl FlTrainer {
     pub fn active_participant_count(&self) -> usize {
         self.participants
             .values()
-            .filter(|p| p.status == ParticipantStatus::Active || p.status == ParticipantStatus::Waiting)
+            .filter(|p| {
+                p.status == ParticipantStatus::Active || p.status == ParticipantStatus::Waiting
+            })
             .count()
     }
 
@@ -163,12 +166,12 @@ impl FlTrainer {
         participant_id: &str,
         weights: HashMap<String, TensorData>,
     ) -> Result<(), FlError> {
-        let participant = self
-            .participants
-            .get_mut(participant_id)
-            .ok_or_else(|| FlError::UpdateFailed {
-                reason: format!("Participant {participant_id} not found"),
-            })?;
+        let participant =
+            self.participants
+                .get_mut(participant_id)
+                .ok_or_else(|| FlError::UpdateFailed {
+                    reason: format!("Participant {participant_id} not found"),
+                })?;
 
         // Validate weights match global model structure
         if weights.keys().len() != self.global_weights.keys().len() {
@@ -231,7 +234,10 @@ impl FlTrainer {
             .collect();
 
         if waiting_participants.is_empty() {
-            warn!("No participants ready for aggregation in round {}", self.current_round);
+            warn!(
+                "No participants ready for aggregation in round {}",
+                self.current_round
+            );
             return Err(FlError::InsufficientParticipants {
                 actual: 0,
                 minimum: self.config.min_participants,
@@ -240,15 +246,9 @@ impl FlTrainer {
 
         // Perform aggregation
         let aggregated_weights = match self.config.aggregation_algorithm {
-            AggregationAlgorithm::FedAvg => {
-                self.fedavg_aggregate(&waiting_participants)?
-            }
-            AggregationAlgorithm::FedProx => {
-                self.fedprox_aggregate(&waiting_participants)?
-            }
-            AggregationAlgorithm::SecAgg => {
-                self.secure_aggregate(&waiting_participants)?
-            }
+            AggregationAlgorithm::FedAvg => self.fedavg_aggregate(&waiting_participants)?,
+            AggregationAlgorithm::FedProx => self.fedprox_aggregate(&waiting_participants)?,
+            AggregationAlgorithm::SecAgg => self.secure_aggregate(&waiting_participants)?,
         };
 
         // Apply differential privacy if enabled
@@ -313,15 +313,16 @@ impl FlTrainer {
             let mut weighted_sum: Option<TensorData> = None;
 
             for participant in participants {
-                let weight = participant
-                    .weights
-                    .get(layer_name)
-                    .ok_or_else(|| FlError::InvalidWeights {
-                        reason: format!(
-                            "Participant {} missing weights for layer {}",
-                            participant.id, layer_name
-                        ),
-                    })?;
+                let weight =
+                    participant
+                        .weights
+                        .get(layer_name)
+                        .ok_or_else(|| FlError::InvalidWeights {
+                            reason: format!(
+                                "Participant {} missing weights for layer {}",
+                                participant.id, layer_name
+                            ),
+                        })?;
 
                 let weight_factor = participant.num_samples as f32 / total_samples as f32;
                 let scaled_weight = weight.scale(weight_factor);
@@ -357,7 +358,10 @@ impl FlTrainer {
         &self,
         participants: &[FlParticipant],
     ) -> Result<HashMap<String, TensorData>, FlError> {
-        debug!("Performing FedProx aggregation with mu={}", self.config.fedprox_mu);
+        debug!(
+            "Performing FedProx aggregation with mu={}",
+            self.config.fedprox_mu
+        );
 
         // Start with FedAvg-style weighted average
         let fedavg_result = self.fedavg_aggregate(participants)?;
@@ -385,11 +389,14 @@ impl FlTrainer {
             // w_new = correction_factor * w_fedavg + global_factor * w_global
             let scaled_fedavg = fedavg_tensor.scale(correction_factor);
             let scaled_global = global_tensor.scale(global_factor);
-            let combined = scaled_fedavg.add(&scaled_global).map_err(|e| {
-                FlError::AggregationFailed {
-                    reason: format!("FedProx proximal correction failed for layer {layer_name}: {e}"),
-                }
-            })?;
+            let combined =
+                scaled_fedavg
+                    .add(&scaled_global)
+                    .map_err(|e| FlError::AggregationFailed {
+                        reason: format!(
+                            "FedProx proximal correction failed for layer {layer_name}: {e}"
+                        ),
+                    })?;
             result.insert(layer_name.clone(), combined);
         }
 
@@ -645,12 +652,18 @@ mod tests {
         trainer.register_participant(p2.clone());
 
         // Round 1
-        trainer.submit_update("participant-1", p1.weights.clone()).unwrap();
-        trainer.submit_update("participant-2", p2.weights.clone()).unwrap();
+        trainer
+            .submit_update("participant-1", p1.weights.clone())
+            .unwrap();
+        trainer
+            .submit_update("participant-2", p2.weights.clone())
+            .unwrap();
         assert!(trainer.run_round().is_ok());
 
         // Round 2
-        trainer.submit_update("participant-1", p1.weights.clone()).unwrap();
+        trainer
+            .submit_update("participant-1", p1.weights.clone())
+            .unwrap();
         trainer.submit_update("participant-2", p2.weights).unwrap();
         assert!(trainer.run_round().is_ok());
 

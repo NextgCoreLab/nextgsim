@@ -313,8 +313,14 @@ impl SecurityManager {
     }
 
     /// Attests a node
-    pub fn attest_node(&mut self, node_id: u32, evidence: AttestationEvidence) -> Option<AttestationResult> {
-        self.contexts.get_mut(&node_id).map(|context| context.attest(evidence))
+    pub fn attest_node(
+        &mut self,
+        node_id: u32,
+        evidence: AttestationEvidence,
+    ) -> Option<AttestationResult> {
+        self.contexts
+            .get_mut(&node_id)
+            .map(|context| context.attest(evidence))
     }
 
     /// Checks if a node is trusted (meets security requirements)
@@ -377,11 +383,8 @@ mod tests {
     fn test_attestation_valid() {
         let mut ctx = SecurityContext::new(1, TeeType::IntelSgx);
 
-        let evidence = AttestationEvidence::new(
-            TeeType::IntelSgx,
-            vec![1, 2, 3, 4],
-            vec![5, 6, 7, 8],
-        );
+        let evidence =
+            AttestationEvidence::new(TeeType::IntelSgx, vec![1, 2, 3, 4], vec![5, 6, 7, 8]);
 
         let result = ctx.attest(evidence);
         assert_eq!(result.status, AttestationStatus::Valid);
@@ -412,11 +415,8 @@ mod tests {
         assert!(!ctx.meets_requirements(5, true));
 
         // With valid attestation
-        let evidence = AttestationEvidence::new(
-            TeeType::IntelSgx,
-            vec![1, 2, 3, 4],
-            vec![5, 6, 7, 8],
-        );
+        let evidence =
+            AttestationEvidence::new(TeeType::IntelSgx, vec![1, 2, 3, 4], vec![5, 6, 7, 8]);
         ctx.attest(evidence);
 
         assert!(ctx.meets_requirements(5, true));
@@ -450,11 +450,7 @@ mod tests {
         assert!(manager.nodes_needing_attestation().contains(&1));
 
         // Attest node 1
-        let evidence = AttestationEvidence::new(
-            TeeType::IntelSgx,
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-        );
+        let evidence = AttestationEvidence::new(TeeType::IntelSgx, vec![1, 2, 3], vec![4, 5, 6]);
         manager.attest_node(1, evidence);
 
         // Now node 1 should be trusted

@@ -66,10 +66,11 @@ impl Notification {
     /// The access type is encoded in the spare half-octet that was part
     /// of the header. It should be passed in from the header parsing.
     pub fn decode_with_access_type(access_type_val: u8) -> Result<Self, NotificationError> {
-        let access_type = AccessType::try_from(access_type_val & 0x03)
-            .map_err(|_| NotificationError::InvalidIeValue(
-                format!("Invalid access type: 0x{access_type_val:02X}"),
-            ))?;
+        let access_type = AccessType::try_from(access_type_val & 0x03).map_err(|_| {
+            NotificationError::InvalidIeValue(format!(
+                "Invalid access type: 0x{access_type_val:02X}"
+            ))
+        })?;
         Ok(Self { access_type })
     }
 
@@ -88,8 +89,8 @@ impl Notification {
         // Default to 3GPP access if we cannot determine from buffer.
         if buf.remaining() >= 1 {
             let val = buf.get_u8();
-            let access_type = AccessType::try_from(val & 0x03)
-                .unwrap_or(AccessType::ThreeGppAccess);
+            let access_type =
+                AccessType::try_from(val & 0x03).unwrap_or(AccessType::ThreeGppAccess);
             Ok(Self { access_type })
         } else {
             // No additional data; access type was in header spare bits
@@ -119,7 +120,6 @@ impl Notification {
     }
 }
 
-
 // ============================================================================
 // Notification Response (3GPP TS 24.501 Section 8.2.22)
 // ============================================================================
@@ -130,8 +130,7 @@ impl Notification {
 /// Notification message. The UE acknowledges receipt of the notification.
 ///
 /// 3GPP TS 24.501 Section 8.2.22
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NotificationResponse {
     /// PDU session status (optional, Type 4, IEI 0x50)
     pub pdu_session_status: Option<Vec<u8>>,
@@ -143,7 +142,6 @@ mod notification_response_iei {
     /// PDU session status
     pub const PDU_SESSION_STATUS: u8 = 0x50;
 }
-
 
 impl NotificationResponse {
     /// Create a new Notification Response message
@@ -216,7 +214,6 @@ impl NotificationResponse {
         MmMessageType::NotificationResponse
     }
 }
-
 
 // ============================================================================
 // Tests

@@ -19,6 +19,14 @@ pub struct AmfConfig {
     pub address: IpAddr,
     /// SCTP port of the AMF (typically 38412)
     pub port: u16,
+    /// Secondary AMF addresses for SCTP multi-homing (e.g. `["192.168.1.2"]`).
+    ///
+    /// When non-empty the gNB uses a `MultihomeSctpAssociation` so that the
+    /// transport can fail over to an alternate path without dropping the NGAP
+    /// session.  Addresses are plain IP strings; the same port as the primary
+    /// address is used.
+    #[serde(default)]
+    pub secondary_addresses: Vec<String>,
 }
 
 impl AmfConfig {
@@ -28,7 +36,11 @@ impl AmfConfig {
     /// * `address` - IP address of the AMF
     /// * `port` - SCTP port of the AMF
     pub fn new(address: IpAddr, port: u16) -> Self {
-        Self { address, port }
+        Self {
+            address,
+            port,
+            secondary_addresses: Vec::new(),
+        }
     }
 }
 
@@ -116,16 +128,38 @@ pub struct GnbConfig {
     /// Integrated Sensing and Communication (ISAC) task enabled (Rel-20)
     #[serde(default)]
     pub isac_enabled: bool,
+    /// ISAC anchor positions in metres [x, y, z].
+    ///
+    /// Defaults to a 100 m equilateral triangle at 10 m height:
+    /// `(0,0,10)`, `(100,0,10)`, `(50,87,10)`.
+    #[serde(default = "default_isac_anchors")]
+    pub isac_anchors: Vec<[f64; 3]>,
     /// AI Agent Framework task enabled (Rel-20)
     #[serde(default)]
     pub agent_enabled: bool,
     /// Federated Learning Aggregator task enabled (Rel-20)
     #[serde(default)]
     pub federated_learning_enabled: bool,
+    /// Use QUIC transport instead of SCTP for NGAP (6G forward-looking, Rel-20+).
+    ///
+    /// When `true` the gNB will attempt to use `QuicTransport` for the AMF
+    /// connection.  QUIC provides built-in TLS 1.3, connection migration, and
+    /// multiplexed streams — capabilities that align with 6G requirements.
+    ///
+    /// **Note**: full QUIC transport selection is scaffolded here; the runtime
+    /// wiring logs a warning and falls back to SCTP until the path is fully
+    /// integrated.
+    #[serde(default)]
+    pub quic_enabled: bool,
 }
 
 fn default_gtp_port() -> u16 {
     2152
+}
+
+fn default_isac_anchors() -> Vec<[f64; 3]> {
+    // 100 m equilateral triangle at 10 m height
+    vec![[0.0, 0.0, 10.0], [100.0, 0.0, 10.0], [50.0, 87.0, 10.0]]
 }
 
 impl Default for GnbConfig {
@@ -160,8 +194,10 @@ impl Default for GnbConfig {
             nwdaf_enabled: false,
             nkef_enabled: false,
             isac_enabled: false,
+            isac_anchors: default_isac_anchors(),
             agent_enabled: false,
             federated_learning_enabled: false,
+            quic_enabled: false,
         }
     }
 }
@@ -188,8 +224,7 @@ impl GnbConfig {
 }
 
 /// Operator key type for authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OpType {
     /// Operator key (OP) - needs to be converted to `OPc`
     Op,
@@ -197,7 +232,6 @@ pub enum OpType {
     #[default]
     Opc,
 }
-
 
 /// Supported NAS security algorithms.
 ///
@@ -238,8 +272,7 @@ impl Default for SupportedAlgs {
 /// Post-quantum Key Encapsulation Mechanism (KEM) algorithm.
 ///
 /// Defines the KEM algorithm to use for post-quantum secure key exchange.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum KemAlgorithm {
     /// No post-quantum KEM (classical only)
     #[default]
@@ -255,7 +288,6 @@ pub enum KemAlgorithm {
     /// SABER (alternative PQC algorithm)
     Saber,
 }
-
 
 impl fmt::Display for KemAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -273,8 +305,7 @@ impl fmt::Display for KemAlgorithm {
 /// Post-quantum signature algorithm.
 ///
 /// Defines the signature algorithm to use for post-quantum secure authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SignAlgorithm {
     /// No post-quantum signatures (classical only)
     #[default]
@@ -293,7 +324,6 @@ pub enum SignAlgorithm {
     SphincsSha256,
 }
 
-
 impl fmt::Display for SignAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -311,8 +341,7 @@ impl fmt::Display for SignAlgorithm {
 /// Hybrid mode for combining classical and post-quantum cryptography.
 ///
 /// Defines how classical and PQC algorithms are combined for transitional security.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HybridMode {
     /// Classical cryptography only (no PQC)
     #[default]
@@ -326,7 +355,6 @@ pub enum HybridMode {
     /// Hybrid: XOR outputs of classical and PQC
     HybridXor,
 }
-
 
 impl fmt::Display for HybridMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -343,8 +371,7 @@ impl fmt::Display for HybridMode {
 /// Post-quantum cryptography configuration.
 ///
 /// Defines the PQC algorithms and modes to use for quantum-resistant security.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PqcConfig {
     /// Whether PQC is enabled
     pub enabled: bool,
@@ -355,7 +382,6 @@ pub struct PqcConfig {
     /// Hybrid mode for combining classical and PQC
     pub hybrid_mode: HybridMode,
 }
-
 
 impl PqcConfig {
     /// Creates a new PQC configuration with specified algorithms.
@@ -401,7 +427,9 @@ pub struct NtnConfig {
     pub max_doppler_hz: f64,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// SNPN (Standalone Non-Public Network) configuration (Rel-17, TS 23.501).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,9 +523,15 @@ pub struct XrConfig {
     pub jitter_tolerance_ms: u32,
 }
 
-fn default_xr_fps() -> u32 { 90 }
-fn default_xr_mtp_latency() -> u32 { 20 }
-fn default_xr_jitter() -> u32 { 5 }
+fn default_xr_fps() -> u32 {
+    90
+}
+fn default_xr_mtp_latency() -> u32 {
+    20
+}
+fn default_xr_jitter() -> u32 {
+    5
+}
 
 impl Default for XrConfig {
     fn default() -> Self {
@@ -544,9 +578,15 @@ pub struct AmbientIotConfig {
     pub max_payload_bytes: u32,
 }
 
-fn default_aiot_range() -> f64 { 10.0 }
-fn default_aiot_interval() -> u32 { 1000 }
-fn default_aiot_payload() -> u32 { 96 }
+fn default_aiot_range() -> f64 {
+    10.0
+}
+fn default_aiot_interval() -> u32 {
+    1000
+}
+fn default_aiot_payload() -> u32 {
+    96
+}
 
 impl Default for AmbientIotConfig {
     fn default() -> Self {
@@ -584,7 +624,9 @@ pub struct UavConfig {
     pub c2_link_required: bool,
 }
 
-fn default_uav_alt() -> f64 { 120.0 }
+fn default_uav_alt() -> f64 {
+    120.0
+}
 
 impl Default for UavConfig {
     fn default() -> Self {
@@ -673,8 +715,7 @@ pub struct V2xGeoArea {
 }
 
 /// V2X communication mode preference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum V2xCommMode {
     /// Prefer Uu (network) communication
     #[default]
@@ -696,33 +737,45 @@ impl Default for V2xConfig {
             },
             qos_requirements: vec![
                 // Default V2V requirements (critical safety messages)
-                (V2xServiceType::V2V, V2xQosRequirements {
-                    max_latency_ms: 20,
-                    reliability: 0.99,
-                    range_meters: 300.0,
-                    priority: 7,
-                }),
+                (
+                    V2xServiceType::V2V,
+                    V2xQosRequirements {
+                        max_latency_ms: 20,
+                        reliability: 0.99,
+                        range_meters: 300.0,
+                        priority: 7,
+                    },
+                ),
                 // Default V2I requirements
-                (V2xServiceType::V2I, V2xQosRequirements {
-                    max_latency_ms: 50,
-                    reliability: 0.95,
-                    range_meters: 500.0,
-                    priority: 5,
-                }),
+                (
+                    V2xServiceType::V2I,
+                    V2xQosRequirements {
+                        max_latency_ms: 50,
+                        reliability: 0.95,
+                        range_meters: 500.0,
+                        priority: 5,
+                    },
+                ),
                 // Default V2P requirements
-                (V2xServiceType::V2P, V2xQosRequirements {
-                    max_latency_ms: 100,
-                    reliability: 0.95,
-                    range_meters: 200.0,
-                    priority: 6,
-                }),
+                (
+                    V2xServiceType::V2P,
+                    V2xQosRequirements {
+                        max_latency_ms: 100,
+                        reliability: 0.95,
+                        range_meters: 200.0,
+                        priority: 6,
+                    },
+                ),
                 // Default V2N requirements
-                (V2xServiceType::V2N, V2xQosRequirements {
-                    max_latency_ms: 100,
-                    reliability: 0.90,
-                    range_meters: 1000.0,
-                    priority: 4,
-                }),
+                (
+                    V2xServiceType::V2N,
+                    V2xQosRequirements {
+                        max_latency_ms: 100,
+                        reliability: 0.90,
+                        range_meters: 1000.0,
+                        priority: 4,
+                    },
+                ),
             ],
             geo_area: None,
             preferred_mode: V2xCommMode::Uu,
@@ -768,9 +821,15 @@ pub struct RangingConfig {
     pub target_accuracy_meters: f64,
 }
 
-fn default_ranging_distance() -> f64 { 200.0 }
-fn default_ranging_interval() -> u32 { 100 }
-fn default_ranging_accuracy() -> f64 { 0.3 }
+fn default_ranging_distance() -> f64 {
+    200.0
+}
+fn default_ranging_interval() -> u32 {
+    100
+}
+fn default_ranging_accuracy() -> f64 {
+    0.3
+}
 
 impl Default for RangingConfig {
     fn default() -> Self {
@@ -789,8 +848,7 @@ impl Default for RangingConfig {
 // ============================================================================
 
 /// MINT (Multi-IMSI) configuration for UEs with multiple subscriptions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MintConfig {
     /// Whether MINT is enabled (dual-SIM/multi-USIM)
     #[serde(default)]
@@ -805,7 +863,6 @@ pub struct MintConfig {
     #[serde(default)]
     pub simultaneous_registration: bool,
 }
-
 
 // ============================================================================
 // Rel-18 Enhanced RedCap Configuration (TS 38.300 v18)
@@ -832,8 +889,7 @@ pub struct RedCapR18Config {
 }
 
 /// PDU session type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PduSessionType {
     /// IPv4 PDU session
     #[default]
@@ -847,7 +903,6 @@ pub enum PduSessionType {
     /// Ethernet PDU session
     Ethernet,
 }
-
 
 /// PDU session configuration.
 ///
@@ -1365,7 +1420,10 @@ ignore_stream_ids: false
             plmn: Plmn::new(310, 410, true),
             tac: 100,
             nssai: vec![SNssai::with_sd_u32(1, 0x010203)],
-            amf_configs: vec![AmfConfig::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 38412)],
+            amf_configs: vec![AmfConfig::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                38412,
+            )],
             link_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             ngap_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             gtp_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
@@ -1468,7 +1526,10 @@ configured_nssai:
         let yaml = original.to_yaml().unwrap();
         let parsed = UeConfig::from_yaml(&yaml).unwrap();
         assert_eq!(original.protection_scheme, parsed.protection_scheme);
-        assert_eq!(original.home_network_public_key_id, parsed.home_network_public_key_id);
+        assert_eq!(
+            original.home_network_public_key_id,
+            parsed.home_network_public_key_id
+        );
         assert_eq!(original.key, parsed.key);
         assert_eq!(original.op, parsed.op);
         assert_eq!(original.op_type, parsed.op_type);

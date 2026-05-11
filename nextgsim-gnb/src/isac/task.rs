@@ -1,14 +1,14 @@
 //! ISAC Task for gNB - Integrated Sensing and Communication
 
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use crate::tasks::{GnbTaskBase, IsacMessage, NwdafMessage, Task, TaskMessage};
 use nextgsim_isac::{
     IsacManager, SensingData, SensingMeasurement, SensingType, TrackingState, Vector3,
 };
-use crate::tasks::{GnbTaskBase, IsacMessage, Task, TaskMessage};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 pub struct IsacTask {
-    _task_base: GnbTaskBase,
+    task_base: GnbTaskBase,
     engine: IsacManager,
     trackers: std::collections::HashMap<u64, TrackingState>,
 }
@@ -16,7 +16,7 @@ pub struct IsacTask {
 impl IsacTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         Self {
-            _task_base: task_base,
+            task_base,
             engine: IsacManager::new(50),
             trackers: std::collections::HashMap::new(),
         }
@@ -33,8 +33,15 @@ impl Task for IsacTask {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => {
                     match msg {
-                        IsacMessage::SensingData { cell_id, measurement_type, measurements } => {
-                            debug!("ISAC: Sensing data from cell {} ({})", cell_id, measurement_type);
+                        IsacMessage::SensingData {
+                            cell_id,
+                            measurement_type,
+                            measurements,
+                        } => {
+                            debug!(
+                                "ISAC: Sensing data from cell {} ({})",
+                                cell_id, measurement_type
+                            );
                             let sensing_type = match measurement_type.as_str() {
                                 "ToA" => SensingType::ToA,
                                 "TDoA" => SensingType::TDoA,
@@ -67,17 +74,28 @@ impl Task for IsacTask {
                             self.engine.record_sensing_data(data);
                         }
                         IsacMessage::FusionRequest { ue_id, source_ids } => {
-                            debug!("ISAC: Fusion request for UE {} from {} sources", ue_id, source_ids.len());
-                            // Register source anchors at origin as placeholders if not yet known,
-                            // then invoke position fusion for the requested UE.
-                            for &src in &source_ids {
-                                self.engine.register_anchor(
-                                    src as i32,
-                                    Vector3::new(src as f64 * 100.0, 0.0, 0.0),
-                                );
+                            debug!(
+                                "ISAC: Fusion request for UE {} from {} sources",
+                                ue_id,
+                                source_ids.len()
+                            );
+                            // Register source anchors using configured positions.
+                            // source_ids are matched to isac_anchors by index; if the index
+                            // exceeds the configured anchor list the anchor is skipped.
+                            let anchors = &self.task_base.config.isac_anchors;
+                            for (idx, &src) in source_ids.iter().enumerate() {
+                                if let Some(&[x, y, z]) = anchors.get(idx) {
+                                    self.engine
+                                        .register_anchor(src as i32, Vector3::new(x, y, z));
+                                } else {
+                                    debug!(
+                                        "ISAC: No anchor position configured for source index {} (id {}), skipping",
+                                        idx, src
+                                    );
+                                }
                             }
                             if let Some(fused) = self.engine.fuse_position(ue_id) {
-                                debug!(
+                                info!(
                                     "ISAC: Fused position for UE {}: ({:.1}, {:.1}, {:.1}), confidence={:.2}",
                                     ue_id,
                                     fused.position.x,
@@ -85,12 +103,37 @@ impl Task for IsacTask {
                                     fused.position.z,
                                     fused.confidence
                                 );
+                                // Forward fused position to NWDAF for analytics
+                                if let Some(ref sixg) = self.task_base.sixg {
+                                    let nwdaf_msg = NwdafMessage::UeMeasurement {
+                                        ue_id: ue_id as i32,
+                                        rsrp: 0.0,
+                                        rsrq: 0.0,
+                                        position: (
+                                            fused.position.x as f32,
+                                            fused.position.y as f32,
+                                            fused.position.z as f32,
+                                        ),
+                                    };
+                                    if let Err(e) = sixg.nwdaf_tx.send(nwdaf_msg).await {
+                                        warn!("ISAC: Failed to forward position to NWDAF: {}", e);
+                                    }
+                                }
                             }
                         }
-                        IsacMessage::TrackingUpdate { object_id, position, velocity: _ } => {
+                        IsacMessage::TrackingUpdate {
+                            object_id,
+                            position,
+                            velocity: _,
+                        } => {
                             debug!("ISAC: Tracking update for object {}", object_id);
-                            let pos = Vector3::new(position.0 as f64, position.1 as f64, position.2 as f64);
-                            self.trackers.entry(object_id)
+                            let pos = Vector3::new(
+                                position.0 as f64,
+                                position.1 as f64,
+                                position.2 as f64,
+                            );
+                            self.trackers
+                                .entry(object_id)
                                 .and_modify(|t| t.update(pos, 1.0))
                                 .or_insert_with(|| TrackingState::new(object_id, pos));
                         }

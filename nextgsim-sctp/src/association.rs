@@ -3,9 +3,15 @@
 use bytes::Bytes;
 use sctp_proto::{
     Association, AssociationHandle, ClientConfig, DatagramEvent, Endpoint, EndpointConfig, Event,
-    Payload, PayloadProtocolIdentifier, TransportConfig, Transmit,
+    Payload, PayloadProtocolIdentifier, Transmit, TransportConfig,
 };
-use std::{collections::VecDeque, io, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
 use tracing::{debug, error, info, trace, warn};
@@ -231,7 +237,10 @@ impl SctpAssociation {
         trace!("Received {} bytes from {}", len, from);
 
         let now = Instant::now();
-        if let Some((handle, event)) = self.endpoint.handle(now, from, None, None, Bytes::from(buf)) {
+        if let Some((handle, event)) = self
+            .endpoint
+            .handle(now, from, None, None, Bytes::from(buf))
+        {
             if handle == self.handle {
                 match event {
                     DatagramEvent::AssociationEvent(assoc_event) => {
@@ -329,20 +338,32 @@ impl SctpAssociation {
             Ok(s) => s,
             Err(_) => {
                 // Open new stream and track it
-                let s = self.association.open_stream(stream_id, ppi)
+                let s = self
+                    .association
+                    .open_stream(stream_id, ppi)
                     .map_err(|e| SctpError::StreamError(e.to_string()))?;
                 if !self.opened_streams.contains(&stream_id) {
                     self.opened_streams.push(stream_id);
-                    debug!("Opened new stream {} (now tracking {} streams)", stream_id, self.opened_streams.len());
+                    debug!(
+                        "Opened new stream {} (now tracking {} streams)",
+                        stream_id,
+                        self.opened_streams.len()
+                    );
                 }
                 s
             }
         };
 
-        stream.write_with_ppi(data, ppi)
+        stream
+            .write_with_ppi(data, ppi)
             .map_err(|e| SctpError::StreamError(e.to_string()))?;
 
-        debug!("Queued {} bytes on stream {} with PPID {}", data.len(), stream_id, ppid);
+        debug!(
+            "Queued {} bytes on stream {} with PPID {}",
+            data.len(),
+            stream_id,
+            ppid
+        );
 
         // Poll and flush
         self.poll_events();
@@ -388,7 +409,8 @@ impl SctpAssociation {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 // Only log real errors, not timeouts
-                if !matches!(e, SctpError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock) {
+                if !matches!(e, SctpError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock)
+                {
                     trace!("Handle incoming error: {}", e);
                 }
             }
@@ -447,7 +469,12 @@ impl SctpAssociation {
                                 data: Bytes::from(buf),
                                 ppid,
                             };
-                            debug!("Received {} bytes on stream {} with PPID {}", msg.data.len(), stream_id, msg.ppid);
+                            debug!(
+                                "Received {} bytes on stream {} with PPID {}",
+                                msg.data.len(),
+                                stream_id,
+                                msg.ppid
+                            );
 
                             if let Some(tx) = &self.event_tx {
                                 let _ = tx.send(SctpEvent::DataReceived(msg.clone()));
@@ -585,7 +612,6 @@ impl Drop for SctpAssociation {
     }
 }
 
-
 // ===========================================================================
 // Multi-homing integration for SctpAssociation
 // ===========================================================================
@@ -615,22 +641,17 @@ impl MultihomeSctpAssociation {
     /// `mh_config` are registered with the path manager so that heartbeat
     /// monitoring and automatic failover work without a full reconnect in
     /// tests (which cannot do real SCTP over a loopback multi-homed pair).
-    pub async fn connect(
-        mh_config: MultihomingConfig,
-        sctp_config: SctpConfig,
-    ) -> Result<Self> {
+    pub async fn connect(mh_config: MultihomingConfig, sctp_config: SctpConfig) -> Result<Self> {
         let primary_remote = mh_config
             .primary_remote()
             .ok_or_else(|| SctpError::ConnectionFailed("no remote addresses".into()))?;
-        let primary_local = mh_config
-            .primary_local()
-            .unwrap_or_else(|| {
-                if primary_remote.is_ipv6() {
-                    "[::]:0".parse().expect("valid ipv6 any")
-                } else {
-                    "0.0.0.0:0".parse().expect("valid ipv4 any")
-                }
-            });
+        let primary_local = mh_config.primary_local().unwrap_or_else(|| {
+            if primary_remote.is_ipv6() {
+                "[::]:0".parse().expect("valid ipv6 any")
+            } else {
+                "0.0.0.0:0".parse().expect("valid ipv4 any")
+            }
+        });
 
         let active =
             SctpAssociation::connect_with_local(primary_local, primary_remote, sctp_config.clone())
@@ -659,7 +680,8 @@ impl MultihomeSctpAssociation {
         }
         let local = self.active.local_addr();
         let mut path = SctpPath::new(local, addr);
-        path.heartbeat_interval = self.path_manager
+        path.heartbeat_interval = self
+            .path_manager
             .primary_path()
             .map(|p| p.heartbeat_interval)
             .unwrap_or(Duration::from_secs(30));
@@ -775,8 +797,22 @@ impl MultihomeSctpAssociation {
     pub fn address_count(&self) -> usize {
         self.remote_addresses.len()
     }
-}
 
+    /// Poll for incoming data on the active path (delegates to `SctpAssociation::poll`).
+    ///
+    /// Must be called periodically to drive incoming UDP packets through the
+    /// SCTP state machine before calling `try_recv`.
+    pub async fn poll(&mut self) -> Result<()> {
+        self.active.poll().await
+    }
+
+    /// Try to receive a message without blocking (delegates to the active path).
+    ///
+    /// Call `poll()` first to process any pending UDP datagrams.
+    pub fn try_recv(&mut self) -> Result<Option<ReceivedMessage>> {
+        self.active.try_recv()
+    }
+}
 
 // ===========================================================================
 // A6.1: Multi-homing support
@@ -877,7 +913,6 @@ impl SctpPath {
     }
 }
 
-
 /// Configuration for SCTP multi-homing
 ///
 /// Multi-homing allows an SCTP association to use multiple network
@@ -968,7 +1003,6 @@ impl MultihomingConfig {
         paths
     }
 }
-
 
 /// Multi-homed path manager for SCTP associations
 ///
@@ -1094,8 +1128,7 @@ impl PathManager {
             if i != self.primary_index && path.is_usable() {
                 info!(
                     "SCTP path failover: {} -> {}",
-                    self.paths[self.primary_index].remote_addr,
-                    path.remote_addr
+                    self.paths[self.primary_index].remote_addr, path.remote_addr
                 );
                 self.primary_index = i;
                 return true;
@@ -1160,7 +1193,6 @@ impl PathManager {
         self.primary_index
     }
 }
-
 
 // ===========================================================================
 // A5.3: Multi-SCTP Stream Management (TS 38.412)
@@ -1253,12 +1285,8 @@ impl StreamManager {
     /// - UE-associated: hash-based or round-robin on streams 1..N
     pub fn select_stream(&mut self, category: NgapStreamCategory) -> u16 {
         match self.policy {
-            StreamAllocationPolicy::CategoryBased => {
-                self.select_stream_category_based(category)
-            }
-            StreamAllocationPolicy::RoundRobin => {
-                self.select_stream_round_robin(category)
-            }
+            StreamAllocationPolicy::CategoryBased => self.select_stream_category_based(category),
+            StreamAllocationPolicy::RoundRobin => self.select_stream_round_robin(category),
         }
     }
 
@@ -1398,7 +1426,6 @@ impl Default for PartialReliabilityPolicy {
     }
 }
 
-
 /// Forward TSN chunk information for PR-SCTP
 ///
 /// When a sender decides to abandon a message under PR-SCTP, it sends
@@ -1469,16 +1496,13 @@ impl ForwardTsnChunk {
             ));
         }
 
-        let new_cumulative_tsn =
-            u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let new_cumulative_tsn = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
 
         let mut stream_info = Vec::new();
         let mut offset = 4;
         while offset + 4 <= data.len() {
-            let stream_id =
-                u16::from_be_bytes([data[offset], data[offset + 1]]);
-            let stream_sequence_number =
-                u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+            let stream_id = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            let stream_sequence_number = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
             stream_info.push(ForwardTsnStreamInfo {
                 stream_id,
                 stream_sequence_number,
@@ -1492,7 +1516,6 @@ impl ForwardTsnChunk {
         })
     }
 }
-
 
 /// Tracks per-message partial reliability state
 ///
@@ -1540,7 +1563,8 @@ impl PrSctpMessage {
         if self.abandoned {
             return true;
         }
-        self.policy.should_abandon(self.first_send_time, self.retransmission_count)
+        self.policy
+            .should_abandon(self.first_send_time, self.retransmission_count)
     }
 
     /// Increment the retransmission counter
@@ -1553,7 +1577,6 @@ impl PrSctpMessage {
         self.abandoned = true;
     }
 }
-
 
 /// PR-SCTP tracker for managing partially reliable messages
 ///
@@ -1631,7 +1654,6 @@ impl PrSctpTracker {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,7 +1677,10 @@ mod tests {
     fn test_association_state() {
         assert_ne!(AssociationState::Closed, AssociationState::Connecting);
         assert_ne!(AssociationState::Connecting, AssociationState::Established);
-        assert_ne!(AssociationState::Established, AssociationState::ShuttingDown);
+        assert_ne!(
+            AssociationState::Established,
+            AssociationState::ShuttingDown
+        );
     }
 
     #[test]
@@ -1814,12 +1839,18 @@ mod tests {
         let mut mgr = PathManager::from_config(&config);
 
         // Primary should be first path
-        assert_eq!(mgr.primary_path().unwrap().remote_addr, addr("10.0.0.2", 38412));
+        assert_eq!(
+            mgr.primary_path().unwrap().remote_addr,
+            addr("10.0.0.2", 38412)
+        );
 
         // Fail the primary path
         mgr.handle_heartbeat_failure(addr("10.0.0.2", 38412));
         // After 1 failure with max_retransmissions=1, path should be failed and failover triggers
-        assert_eq!(mgr.primary_path().unwrap().remote_addr, addr("10.0.1.2", 38412));
+        assert_eq!(
+            mgr.primary_path().unwrap().remote_addr,
+            addr("10.0.1.2", 38412)
+        );
     }
 
     #[test]
@@ -1855,7 +1886,10 @@ mod tests {
 
         let mut mgr = PathManager::from_config(&config);
         assert!(mgr.set_primary(1));
-        assert_eq!(mgr.primary_path().unwrap().remote_addr, addr("10.0.1.2", 38412));
+        assert_eq!(
+            mgr.primary_path().unwrap().remote_addr,
+            addr("10.0.1.2", 38412)
+        );
 
         // Invalid index
         assert!(!mgr.set_primary(100));
@@ -1956,12 +1990,7 @@ mod tests {
 
     #[test]
     fn test_pr_sctp_message() {
-        let msg = PrSctpMessage::new(
-            1,
-            0,
-            0,
-            PartialReliabilityPolicy::LimitedRetransmissions(2),
-        );
+        let msg = PrSctpMessage::new(1, 0, 0, PartialReliabilityPolicy::LimitedRetransmissions(2));
         assert_eq!(msg.tsn, 1);
         assert!(!msg.abandoned);
         assert!(!msg.should_abandon());
@@ -1988,10 +2017,16 @@ mod tests {
         let mut tracker = PrSctpTracker::new();
 
         tracker.track_message(PrSctpMessage::new(
-            1, 0, 0, PartialReliabilityPolicy::ReliableTransfer,
+            1,
+            0,
+            0,
+            PartialReliabilityPolicy::ReliableTransfer,
         ));
         tracker.track_message(PrSctpMessage::new(
-            2, 0, 1, PartialReliabilityPolicy::ReliableTransfer,
+            2,
+            0,
+            1,
+            PartialReliabilityPolicy::ReliableTransfer,
         ));
 
         assert_eq!(tracker.outstanding_count(), 2);
@@ -2008,19 +2043,18 @@ mod tests {
         let mut tracker = PrSctpTracker::new();
 
         // Add a message with very short timed reliability
-        let mut msg = PrSctpMessage::new(
-            1,
-            0,
-            0,
-            PartialReliabilityPolicy::LimitedRetransmissions(0),
-        );
+        let mut msg =
+            PrSctpMessage::new(1, 0, 0, PartialReliabilityPolicy::LimitedRetransmissions(0));
         // Force one retransmission to trigger abandonment
         msg.retransmit();
         tracker.track_message(msg);
 
         // Add a reliable message
         tracker.track_message(PrSctpMessage::new(
-            2, 0, 1, PartialReliabilityPolicy::ReliableTransfer,
+            2,
+            0,
+            1,
+            PartialReliabilityPolicy::ReliableTransfer,
         ));
 
         assert_eq!(tracker.outstanding_count(), 2);
@@ -2040,12 +2074,18 @@ mod tests {
         assert!(!tracker.has_pr_messages());
 
         tracker.track_message(PrSctpMessage::new(
-            1, 0, 0, PartialReliabilityPolicy::ReliableTransfer,
+            1,
+            0,
+            0,
+            PartialReliabilityPolicy::ReliableTransfer,
         ));
         assert!(!tracker.has_pr_messages());
 
         tracker.track_message(PrSctpMessage::new(
-            2, 0, 1, PartialReliabilityPolicy::TimedReliability(Duration::from_secs(1)),
+            2,
+            0,
+            1,
+            PartialReliabilityPolicy::TimedReliability(Duration::from_secs(1)),
         ));
         assert!(tracker.has_pr_messages());
     }
@@ -2055,7 +2095,10 @@ mod tests {
         let mut tracker = PrSctpTracker::new();
 
         tracker.track_message(PrSctpMessage::new(
-            1, 0, 0, PartialReliabilityPolicy::ReliableTransfer,
+            1,
+            0,
+            0,
+            PartialReliabilityPolicy::ReliableTransfer,
         ));
 
         let fwd = tracker.check_abandonments();
@@ -2124,9 +2167,7 @@ mod tests {
 
     /// Build a minimal `MultihomeSctpAssociation` for testing without
     /// establishing a real SCTP connection.  We construct the parts directly.
-    fn make_multihome_parts(
-        remotes: &[SocketAddr],
-    ) -> (PathManager, Vec<SocketAddr>) {
+    fn make_multihome_parts(remotes: &[SocketAddr]) -> (PathManager, Vec<SocketAddr>) {
         let local = addr("10.0.0.1", 0);
         let mut config = MultihomingConfig::new(local, remotes[0]);
         for r in remotes.iter().skip(1) {

@@ -26,7 +26,6 @@ pub enum Ie4Error {
     InvalidValue(String),
 }
 
-
 // ============================================================================
 // UE Security Capability IE (3GPP TS 24.501 Section 9.11.3.54)
 // ============================================================================
@@ -53,8 +52,8 @@ pub struct IeUeSecurityCapability {
 impl Default for IeUeSecurityCapability {
     fn default() -> Self {
         Self {
-            ea: 0x80,  // EA0 supported by default
-            ia: 0x80,  // IA0 supported by default
+            ea: 0x80, // EA0 supported by default
+            ia: 0x80, // IA0 supported by default
             eea: None,
             eia: None,
         }
@@ -192,7 +191,6 @@ impl NasDecode for IeUeSecurityCapability {
     }
 }
 
-
 // ============================================================================
 // AI/ML Capability IE (6G extension)
 // ============================================================================
@@ -307,7 +305,6 @@ impl NasDecode for IeAiMlCapability {
     }
 }
 
-
 // ============================================================================
 // ISAC Parameter IE (6G extension)
 // ============================================================================
@@ -411,7 +408,6 @@ impl NasDecode for IeIsacParameter {
     }
 }
 
-
 // ============================================================================
 // Semantic Communication Parameter IE (6G extension)
 // ============================================================================
@@ -508,7 +504,6 @@ impl NasDecode for IeSemanticCommParameter {
         IeSemanticCommParameter::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
     }
 }
-
 
 // ============================================================================
 // Sub-THz Band Parameter IE (6G extension)
@@ -613,7 +608,6 @@ impl NasDecode for IeSubThzBandParameter {
     }
 }
 
-
 // ============================================================================
 // NTN Timing Advance IE (6G extension)
 // ============================================================================
@@ -713,7 +707,6 @@ impl NasDecode for IeNtnTimingAdvance {
         IeNtnTimingAdvance::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
     }
 }
-
 
 // ============================================================================
 // NTN Access Barring IE (6G extension)
@@ -820,7 +813,6 @@ impl NasDecode for IeNtnAccessBarring {
         IeNtnAccessBarring::decode(buf).map_err(|e| CodecError::InvalidValue(e.to_string()))
     }
 }
-
 
 // ============================================================================
 // Tests

@@ -59,7 +59,10 @@ mod tests {
         match decoded {
             NGAP_PDU::InitiatingMessage(msg) => {
                 // NG Setup procedure code is 21 (0x15)
-                assert_eq!(msg.procedure_code.0, 21, "Procedure code should be 21 (NGSetup)");
+                assert_eq!(
+                    msg.procedure_code.0, 21,
+                    "Procedure code should be 21 (NGSetup)"
+                );
             }
             _ => panic!("Expected InitiatingMessage"),
         }
@@ -81,9 +84,15 @@ mod tests {
                 broadcast_plmn_list: vec![BroadcastPlmnItem {
                     plmn_identity: [0x21, 0xF3, 0x54],
                     slice_support_list: vec![
-                        SNssai { sst: 1, sd: None },                          // eMBB
-                        SNssai { sst: 2, sd: Some([0x00, 0x00, 0x01]) },      // URLLC
-                        SNssai { sst: 3, sd: Some([0x00, 0x00, 0x02]) },      // MIoT
+                        SNssai { sst: 1, sd: None }, // eMBB
+                        SNssai {
+                            sst: 2,
+                            sd: Some([0x00, 0x00, 0x01]),
+                        }, // URLLC
+                        SNssai {
+                            sst: 3,
+                            sd: Some([0x00, 0x00, 0x02]),
+                        }, // MIoT
                     ],
                 }],
             }],
@@ -308,7 +317,10 @@ mod tests {
 
         // Re-encode and verify byte-for-byte match
         let re_encoded = encode_ngap_pdu(&decoded).expect("Failed to re-encode");
-        assert_eq!(capture, re_encoded, "Re-encoded bytes should match original capture");
+        assert_eq!(
+            capture, re_encoded,
+            "Re-encoded bytes should match original capture"
+        );
     }
 
     /// Test decoding a real Initial UE Message capture
@@ -400,7 +412,10 @@ mod tests {
                 tac: [0xFF, 0xFF, 0xFF],
                 broadcast_plmn_list: vec![BroadcastPlmnItem {
                     plmn_identity: [0x00, 0xF1, 0x10],
-                    slice_support_list: vec![SNssai { sst: 255, sd: Some([0xFF, 0xFF, 0xFF]) }],
+                    slice_support_list: vec![SNssai {
+                        sst: 255,
+                        sd: Some([0xFF, 0xFF, 0xFF]),
+                    }],
                 }],
             }],
             default_paging_drx: PagingDrx::V256,

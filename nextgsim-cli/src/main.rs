@@ -45,13 +45,15 @@ fn run() -> Result<()> {
         return dump_nodes();
     }
 
-    let node_name = args.node_name.as_ref()
+    let node_name = args
+        .node_name
+        .as_ref()
         .context("Node name is required. Use --dump to list available nodes.")?;
 
     validate_node_name(node_name)?;
 
     let discovery = discover_node(node_name)?;
-    
+
     if discovery.port == 0 {
         if discovery.skipped_due_to_version > 0 {
             bail!(
@@ -64,8 +66,8 @@ fn run() -> Result<()> {
         }
     }
 
-    let client = CliClient::connect(discovery.port, node_name)
-        .context("Failed to connect to node")?;
+    let client =
+        CliClient::connect(discovery.port, node_name).context("Failed to connect to node")?;
 
     if let Some(cmd) = &args.exec {
         execute_command(&client, cmd)
@@ -137,13 +139,17 @@ fn interactive_mode(client: &CliClient) -> Result<()> {
             }
             Ok(_) => {
                 let cmd = line.trim();
-                if cmd.is_empty() { continue; }
-                if cmd == "exit" || cmd == "quit" { break; }
+                if cmd.is_empty() {
+                    continue;
+                }
+                if cmd == "exit" || cmd == "quit" {
+                    break;
+                }
                 if cmd == "help" {
                     print_help(client.node_name());
                     continue;
                 }
-                
+
                 match client.execute_command(cmd) {
                     Ok((output, is_error)) => {
                         if is_error {
@@ -198,7 +204,9 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn test_cli_parsing() { Args::command().debug_assert(); }
+    fn test_cli_parsing() {
+        Args::command().debug_assert();
+    }
 
     #[test]
     fn test_dump_flag() {

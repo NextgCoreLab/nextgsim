@@ -393,7 +393,7 @@ fn decode_gprs_timer3(byte: u8) -> u32 {
         3 => 600,
         4 => 3600,
         5 => 36_000,
-        6 => 1_152_000, // 320 hours
+        6 => 1_152_000,       // 320 hours
         _ => return u32::MAX, // deactivated
     };
 
@@ -409,11 +409,7 @@ mod tests {
     use super::*;
     use nextgsim_nas::ies::ie1::{Acknowledgement, RegistrationRequested};
 
-    fn build_config_update_command_bytes(
-        ack: bool,
-        red: bool,
-        include_tai: bool,
-    ) -> Vec<u8> {
+    fn build_config_update_command_bytes(ack: bool, red: bool, include_tai: bool) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
 
         // Type 1 IE for config update indication (IEI 0xD in high nibble)
@@ -499,7 +495,10 @@ mod tests {
         let result = ConfigUpdateProcedure::process_command(&cmd);
         assert!(!result.send_complete);
         assert!(result.re_register);
-        assert_eq!(result.new_sub_state, Some(MmSubState::RegisteredUpdateNeeded));
+        assert_eq!(
+            result.new_sub_state,
+            Some(MmSubState::RegisteredUpdateNeeded)
+        );
     }
 
     #[test]
@@ -508,7 +507,9 @@ mod tests {
         let mut cmd = ConfigurationUpdateCommand::new();
         cmd.guti = Some(Ie5gsMobileIdentity::new(
             MobileIdentityType::Guti,
-            vec![0x02, 0xF8, 0x39, 0xCA, 0xFE, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00],
+            vec![
+                0x02, 0xF8, 0x39, 0xCA, 0xFE, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            ],
         ));
 
         let result = ConfigUpdateProcedure::process_command(&cmd);

@@ -603,7 +603,11 @@ pub fn decode_ai_ml_config_header(
         8 => AiMlUseCase::NetworkSlicing,
         9 => AiMlUseCase::SpectrumSharing,
         v if v >= 128 => AiMlUseCase::Custom(v - 128),
-        _ => return Err(AiMlConfigError::CodecError("Unknown AI/ML use case".to_string())),
+        _ => {
+            return Err(AiMlConfigError::CodecError(
+                "Unknown AI/ML use case".to_string(),
+            ))
+        }
     };
     let model_state = match bytes[3] {
         0 => AiMlModelState::Idle,
@@ -617,14 +621,22 @@ pub fn decode_ai_ml_config_header(
         8 => AiMlModelState::Deactivated,
         9 => AiMlModelState::Retired,
         10 => AiMlModelState::Released,
-        _ => return Err(AiMlConfigError::CodecError("Unknown model state".to_string())),
+        _ => {
+            return Err(AiMlConfigError::CodecError(
+                "Unknown model state".to_string(),
+            ))
+        }
     };
     let inference_mode = match bytes[4] {
         0 => AiMlInferenceMode::UeSide,
         1 => AiMlInferenceMode::NetworkSide,
         2 => AiMlInferenceMode::Joint,
         3 => AiMlInferenceMode::TwoSided,
-        _ => return Err(AiMlConfigError::CodecError("Unknown inference mode".to_string())),
+        _ => {
+            return Err(AiMlConfigError::CodecError(
+                "Unknown inference mode".to_string(),
+            ))
+        }
     };
 
     Ok((config_id, use_case, model_state, inference_mode))

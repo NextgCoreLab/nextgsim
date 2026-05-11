@@ -146,11 +146,8 @@ impl Mtlf {
     ///
     /// Returns an error if the model file cannot be loaded.
     pub fn load_trajectory_model(&mut self, path: &Path) -> Result<(), NwdafError> {
-        let mut predictor =
-            OnnxPredictor::new().map_err(NwdafError::Prediction)?;
-        predictor
-            .load_model(path)
-            .map_err(NwdafError::Prediction)?;
+        let mut predictor = OnnxPredictor::new().map_err(NwdafError::Prediction)?;
+        predictor.load_model(path).map_err(NwdafError::Prediction)?;
 
         // Register model info
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -274,10 +271,7 @@ impl Mtlf {
                         description: String::new(),
                     },
                     success: false,
-                    error: Some(format!(
-                        "No model available for {:?}",
-                        request.analytics_id
-                    )),
+                    error: Some(format!("No model available for {:?}", request.analytics_id)),
                 }
             }
         }
@@ -304,8 +298,7 @@ impl Mtlf {
 
                     match next_best {
                         Some(id) => {
-                            self.best_model_per_analytics
-                                .insert(info.analytics_id, id);
+                            self.best_model_per_analytics.insert(info.analytics_id, id);
                         }
                         None => {
                             self.best_model_per_analytics.remove(&info.analytics_id);
@@ -354,11 +347,7 @@ impl Mtlf {
     ///
     /// Compares champion (current best) vs challenger model by evaluating
     /// both against held-out accuracy data. Returns the winner model ID.
-    pub fn ab_test(
-        &self,
-        analytics_id: AnalyticsId,
-        challenger_id: &str,
-    ) -> Option<AbTestResult> {
+    pub fn ab_test(&self, analytics_id: AnalyticsId, challenger_id: &str) -> Option<AbTestResult> {
         let champion_id = self.best_model_per_analytics.get(&analytics_id)?;
         let champion = self.models.get(champion_id)?;
         let challenger = self.models.get(challenger_id)?;
@@ -377,7 +366,12 @@ impl Mtlf {
 
         info!(
             "MTLF: A/B test for {:?}: champion={} ({:.3}) vs challenger={} ({:.3}), winner={}",
-            analytics_id, champion_id, champion_accuracy, challenger_id, challenger_accuracy, winner_id
+            analytics_id,
+            champion_id,
+            champion_accuracy,
+            challenger_id,
+            challenger_accuracy,
+            winner_id
         );
 
         Some(AbTestResult {
@@ -395,8 +389,12 @@ impl Mtlf {
     pub fn promote_model(&mut self, model_id: &str) -> bool {
         if let Some(model) = self.models.get(model_id) {
             let analytics_id = model.analytics_id;
-            self.best_model_per_analytics.insert(analytics_id, model_id.to_string());
-            info!("MTLF: Promoted model {} as champion for {:?}", model_id, analytics_id);
+            self.best_model_per_analytics
+                .insert(analytics_id, model_id.to_string());
+            info!(
+                "MTLF: Promoted model {} as champion for {:?}",
+                model_id, analytics_id
+            );
             true
         } else {
             false
@@ -407,7 +405,8 @@ impl Mtlf {
     ///
     /// Returns true if the model's accuracy meets the minimum threshold.
     pub fn canary_check(&self, model_id: &str, min_accuracy: f32) -> bool {
-        self.models.get(model_id)
+        self.models
+            .get(model_id)
             .and_then(|m| m.accuracy)
             .map(|acc| acc >= min_accuracy)
             .unwrap_or(false)
@@ -563,9 +562,17 @@ mod tests {
     fn test_ab_test() {
         let mut mtlf = Mtlf::new();
         // Register challenger first so it becomes the initial "best"
-        mtlf.register_model(make_model_info("challenger", AnalyticsId::UeMobility, Some(0.92)));
+        mtlf.register_model(make_model_info(
+            "challenger",
+            AnalyticsId::UeMobility,
+            Some(0.92),
+        ));
         // Register champion with lower accuracy
-        mtlf.register_model(make_model_info("champion", AnalyticsId::UeMobility, Some(0.85)));
+        mtlf.register_model(make_model_info(
+            "champion",
+            AnalyticsId::UeMobility,
+            Some(0.85),
+        ));
         // Force champion as the "best" model
         mtlf.promote_model("champion");
 
@@ -581,7 +588,11 @@ mod tests {
     fn test_ab_test_champion_wins() {
         let mut mtlf = Mtlf::new();
         mtlf.register_model(make_model_info("champion", AnalyticsId::NfLoad, Some(0.90)));
-        mtlf.register_model(make_model_info("challenger", AnalyticsId::NfLoad, Some(0.89)));
+        mtlf.register_model(make_model_info(
+            "challenger",
+            AnalyticsId::NfLoad,
+            Some(0.89),
+        ));
 
         let result = mtlf.ab_test(AnalyticsId::NfLoad, "challenger").unwrap();
         // Champion wins because challenger is not 1% better

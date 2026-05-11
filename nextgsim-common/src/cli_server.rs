@@ -79,7 +79,11 @@ pub struct CliMessage {
 
 impl CliMessage {
     /// Creates a new error response
-    pub fn error(addr: SocketAddr, node_name: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn error(
+        addr: SocketAddr,
+        node_name: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             msg_type: CliMessageType::Error,
             node_name: node_name.into(),
@@ -89,7 +93,11 @@ impl CliMessage {
     }
 
     /// Creates a new result response
-    pub fn result(addr: SocketAddr, node_name: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn result(
+        addr: SocketAddr,
+        node_name: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             msg_type: CliMessageType::Result,
             node_name: node_name.into(),
@@ -174,7 +182,9 @@ impl CliMessage {
         if data.len() < value_data_offset + value_len {
             return None;
         }
-        let value = String::from_utf8(data[value_data_offset..value_data_offset + value_len].to_vec()).ok()?;
+        let value =
+            String::from_utf8(data[value_data_offset..value_data_offset + value_len].to_vec())
+                .ok()?;
 
         Some(Self {
             msg_type,
@@ -381,25 +391,39 @@ impl CliServer {
     }
 
     /// Sends an error response to the CLI tool
-    pub async fn send_error(&self, addr: SocketAddr, message: impl Into<String>) -> std::io::Result<()> {
+    pub async fn send_error(
+        &self,
+        addr: SocketAddr,
+        message: impl Into<String>,
+    ) -> std::io::Result<()> {
         self.send_response(CliResponse {
             message: message.into(),
             is_error: true,
             client_addr: addr,
-        }).await
+        })
+        .await
     }
 
     /// Sends a result response to the CLI tool
-    pub async fn send_result(&self, addr: SocketAddr, message: impl Into<String>) -> std::io::Result<()> {
+    pub async fn send_result(
+        &self,
+        addr: SocketAddr,
+        message: impl Into<String>,
+    ) -> std::io::Result<()> {
         self.send_response(CliResponse {
             message: message.into(),
             is_error: false,
             client_addr: addr,
-        }).await
+        })
+        .await
     }
 
     /// Sends an echo message to the CLI tool
-    pub async fn send_echo(&self, addr: SocketAddr, message: impl Into<String>) -> std::io::Result<()> {
+    pub async fn send_echo(
+        &self,
+        addr: SocketAddr,
+        message: impl Into<String>,
+    ) -> std::io::Result<()> {
         let msg = CliMessage::echo(addr, message);
         let data = msg.encode();
         self.socket.send_to(&data, addr).await?;

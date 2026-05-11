@@ -217,10 +217,7 @@ mod tests {
 
     #[test]
     fn test_analytics_target_display() {
-        assert_eq!(
-            format!("{}", AnalyticsTarget::Ue { ue_id: 42 }),
-            "UE(42)"
-        );
+        assert_eq!(format!("{}", AnalyticsTarget::Ue { ue_id: 42 }), "UE(42)");
         assert_eq!(
             format!("{}", AnalyticsTarget::Cell { cell_id: 7 }),
             "Cell(7)"

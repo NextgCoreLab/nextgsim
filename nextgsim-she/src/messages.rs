@@ -14,7 +14,6 @@ pub enum SheMessage {
     // ========================================================================
     // Workload Management
     // ========================================================================
-
     /// Request to place a workload
     PlaceWorkload {
         /// Unique workload ID
@@ -52,7 +51,6 @@ pub enum SheMessage {
     // ========================================================================
     // Resource Management
     // ========================================================================
-
     /// Resource capacity update from a node
     ResourceUpdate {
         /// Node ID
@@ -76,7 +74,6 @@ pub enum SheMessage {
     // ========================================================================
     // Inference Requests
     // ========================================================================
-
     /// Request inference on a model
     InferenceRequest {
         /// Request ID
@@ -108,7 +105,6 @@ pub enum SheMessage {
     // ========================================================================
     // Model Management
     // ========================================================================
-
     /// Load a model on a tier
     LoadModel {
         /// Model name/ID
@@ -130,7 +126,6 @@ pub enum SheMessage {
     // ========================================================================
     // Status and Queries
     // ========================================================================
-
     /// Query tier status
     QueryTierStatus {
         /// Tier to query

@@ -345,11 +345,7 @@ impl RlsTransport {
     }
 
     /// Processes an RLS message and returns any events
-    pub fn process_message(
-        &mut self,
-        endpoint_id: u32,
-        msg: &RlsMessage,
-    ) -> Vec<TransportEvent> {
+    pub fn process_message(&mut self, endpoint_id: u32, msg: &RlsMessage) -> Vec<TransportEvent> {
         match msg {
             RlsMessage::PduTransmission(pdu) => self.process_pdu_transmission(endpoint_id, pdu),
             RlsMessage::PduTransmissionAck(ack) => {
@@ -528,12 +524,7 @@ mod tests {
         // Fill up pending PDUs
         for i in 0..MAX_PDU_COUNT {
             transport
-                .create_rrc_transmission(
-                    1,
-                    RrcChannel::UlDcch,
-                    Bytes::from(vec![i as u8]),
-                    true,
-                )
+                .create_rrc_transmission(1, RrcChannel::UlDcch, Bytes::from(vec![i as u8]), true)
                 .unwrap();
         }
 

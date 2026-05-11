@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 /// - MNC (Mobile Network Code): 2 or 3 decimal digits
 ///
 /// The `long_mnc` field indicates whether the MNC uses 3 digits (true) or 2 digits (false).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Plmn {
     /// Mobile Country Code (3 digits, range 0-999)
     pub mcc: u16,
@@ -123,7 +122,6 @@ impl fmt::Display for Plmn {
         }
     }
 }
-
 
 // ============================================================================
 // 6G ISAC (Integrated Sensing and Communication) Types
@@ -273,8 +271,7 @@ impl SensingResult {
 ///
 /// Specifies the type of data being transmitted in semantic communication
 /// to optimize encoding and compression strategies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ModalityType {
     /// Text/linguistic data
     #[default]
@@ -290,7 +287,6 @@ pub enum ModalityType {
     /// Mixed/multimodal data
     Mixed,
 }
-
 
 impl fmt::Display for ModalityType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -309,8 +305,7 @@ impl fmt::Display for ModalityType {
 ///
 /// Defines the trade-off between bandwidth efficiency and information fidelity
 /// in semantic communication systems.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CompressionLevel {
     /// No compression, preserve all information
     None,
@@ -324,7 +319,6 @@ pub enum CompressionLevel {
     /// Maximum compression, only essential semantics
     Maximum,
 }
-
 
 impl fmt::Display for CompressionLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -486,8 +480,7 @@ impl fmt::Display for TrainingRound {
 ///
 /// Specifies the type of hardware accelerator available or required
 /// for computational offloading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AcceleratorType {
     /// No specific accelerator required
     None,
@@ -503,7 +496,6 @@ pub enum AcceleratorType {
     #[default]
     Cpu,
 }
-
 
 impl fmt::Display for AcceleratorType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2031,8 +2023,7 @@ mod tests {
 /// - TAC: Tracking Area Code (24-bit value, range 0-16777215)
 ///
 /// TAI is used in 5G networks for mobility management and paging.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Tai {
     /// Public Land Mobile Network identifier
     pub plmn: Plmn,
@@ -2122,7 +2113,6 @@ impl fmt::Display for Tai {
     }
 }
 
-
 /// Single Network Slice Selection Assistance Information (S-NSSAI)
 ///
 /// S-NSSAI identifies a network slice and consists of:
@@ -2134,8 +2124,7 @@ impl fmt::Display for Tai {
 /// - 2: URLLC (Ultra-Reliable Low-Latency Communications)
 /// - 3: `MIoT` (Massive `IoT`)
 /// - 4: V2X (Vehicle-to-Everything)
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct SNssai {
     /// Slice/Service Type (8-bit)
     pub sst: u8,
@@ -2179,7 +2168,8 @@ impl SNssai {
 
     /// Returns the SD as a u32 value, or None if SD is not set.
     pub fn sd_as_u32(&self) -> Option<u32> {
-        self.sd.map(|sd| ((sd[0] as u32) << 16) | ((sd[1] as u32) << 8) | (sd[2] as u32))
+        self.sd
+            .map(|sd| ((sd[0] as u32) << 16) | ((sd[1] as u32) << 8) | (sd[2] as u32))
     }
 
     /// Returns true if this S-NSSAI has a valid SST value set.
@@ -2246,7 +2236,6 @@ impl fmt::Display for SNssai {
         }
     }
 }
-
 
 /// Network Slice configuration containing multiple S-NSSAIs.
 ///
@@ -2422,8 +2411,7 @@ impl fmt::Display for Supi {
 /// - 5G-TMSI: 32-bit Temporary Mobile Subscriber Identity
 ///
 /// Per 3GPP TS 23.003 Section 2.10.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Guti {
     /// Public Land Mobile Network identifier
     pub plmn: Plmn,
@@ -2548,8 +2536,7 @@ impl Guti {
     /// - Bytes 6-9: 5G-TMSI in big-endian format
     pub fn encode(&self) -> [u8; 10] {
         let plmn_bytes = self.plmn.encode();
-        let amf_set_pointer =
-            ((self.amf_set_id & 0x3FF) << 6) | (self.amf_pointer as u16 & 0x3F);
+        let amf_set_pointer = ((self.amf_set_id & 0x3FF) << 6) | (self.amf_pointer as u16 & 0x3F);
 
         [
             plmn_bytes[0],
@@ -2612,4 +2599,3 @@ impl fmt::Display for Guti {
         )
     }
 }
-

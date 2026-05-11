@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::enums::MmMessageType;
 use crate::header::PlainMmHeader;
-use crate::ies::ie1::{Ie5gsIdentityType, IdentityType, InformationElement1};
+use crate::ies::ie1::{IdentityType, Ie5gsIdentityType, InformationElement1};
 
 use super::registration::Ie5gsMobileIdentity;
 
@@ -235,8 +235,8 @@ impl Default for IdentityResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::registration::MobileIdentityType;
+    use super::*;
 
     #[test]
     fn test_identity_request_encode_decode() {
@@ -280,10 +280,8 @@ mod tests {
 
     #[test]
     fn test_identity_response_encode_decode() {
-        let mobile_identity = Ie5gsMobileIdentity::new(
-            MobileIdentityType::Suci,
-            vec![0x01, 0x02, 0x03, 0x04, 0x05],
-        );
+        let mobile_identity =
+            Ie5gsMobileIdentity::new(MobileIdentityType::Suci, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
         let msg = IdentityResponse::new(mobile_identity.clone());
 
         let mut buf = Vec::new();
@@ -293,14 +291,20 @@ mod tests {
         assert_eq!(buf[0], 0x7E); // EPD: Mobility Management
         assert_eq!(buf[1], 0x00); // Security header type: Not protected
         assert_eq!(buf[2], 0x5C); // Message type: Identity Response
-        // Length is 2 bytes (big-endian)
+                                  // Length is 2 bytes (big-endian)
         assert_eq!(buf[3], 0x00);
         assert_eq!(buf[4], 0x05); // Length = 5
 
         // Decode and verify
         let decoded = IdentityResponse::decode(&mut buf.as_slice()).unwrap();
-        assert_eq!(decoded.mobile_identity.identity_type, MobileIdentityType::Suci);
-        assert_eq!(decoded.mobile_identity.data, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(
+            decoded.mobile_identity.identity_type,
+            MobileIdentityType::Suci
+        );
+        assert_eq!(
+            decoded.mobile_identity.data,
+            vec![0x01, 0x02, 0x03, 0x04, 0x05]
+        );
     }
 
     #[test]
@@ -311,7 +315,10 @@ mod tests {
         msg.encode(&mut buf);
 
         let decoded = IdentityResponse::decode(&mut buf.as_slice()).unwrap();
-        assert_eq!(decoded.mobile_identity.identity_type, MobileIdentityType::NoIdentity);
+        assert_eq!(
+            decoded.mobile_identity.identity_type,
+            MobileIdentityType::NoIdentity
+        );
     }
 
     #[test]
@@ -326,7 +333,10 @@ mod tests {
         // Create a valid header but with wrong message type (Registration Request)
         let buf = vec![0x7E, 0x00, 0x41, 0x01];
         let result = IdentityRequest::decode(&mut buf.as_slice());
-        assert!(matches!(result, Err(IdentityError::InvalidMessageType { .. })));
+        assert!(matches!(
+            result,
+            Err(IdentityError::InvalidMessageType { .. })
+        ));
     }
 
     #[test]
@@ -341,7 +351,10 @@ mod tests {
         // Create a valid header but with wrong message type (Identity Request)
         let buf = vec![0x7E, 0x00, 0x5B, 0x00, 0x01, 0x00];
         let result = IdentityResponse::decode(&mut buf.as_slice());
-        assert!(matches!(result, Err(IdentityError::InvalidMessageType { .. })));
+        assert!(matches!(
+            result,
+            Err(IdentityError::InvalidMessageType { .. })
+        ));
     }
 
     #[test]

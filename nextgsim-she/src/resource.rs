@@ -226,7 +226,7 @@ mod tests {
     fn test_resource_usage_utilization() {
         let capacity = ResourceCapacity::with_tflops(10).with_memory_gb(64);
         let usage = ResourceUsage {
-            compute_flops: 5_000_000_000_000, // 5 TFLOPS
+            compute_flops: 5_000_000_000_000,      // 5 TFLOPS
             memory_bytes: 32 * 1024 * 1024 * 1024, // 32 GB
             active_workloads: 2,
         };

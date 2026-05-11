@@ -166,16 +166,12 @@ impl MessageType {
         value: u8,
     ) -> Result<Self, MessageTypeError> {
         match epd {
-            ExtendedProtocolDiscriminator::MobilityManagement => {
-                MmMessageType::try_from(value)
-                    .map(MessageType::Mm)
-                    .map_err(|_| MessageTypeError::UnknownMmType(value))
-            }
-            ExtendedProtocolDiscriminator::SessionManagement => {
-                SmMessageType::try_from(value)
-                    .map(MessageType::Sm)
-                    .map_err(|_| MessageTypeError::UnknownSmType(value))
-            }
+            ExtendedProtocolDiscriminator::MobilityManagement => MmMessageType::try_from(value)
+                .map(MessageType::Mm)
+                .map_err(|_| MessageTypeError::UnknownMmType(value)),
+            ExtendedProtocolDiscriminator::SessionManagement => SmMessageType::try_from(value)
+                .map(MessageType::Sm)
+                .map_err(|_| MessageTypeError::UnknownSmType(value)),
         }
     }
 }
@@ -221,7 +217,9 @@ mod tests {
         assert!(SecurityHeaderType::IntegrityProtected.is_protected());
         assert!(SecurityHeaderType::IntegrityProtectedAndCiphered.is_ciphered());
         assert!(!SecurityHeaderType::IntegrityProtected.is_ciphered());
-        assert!(SecurityHeaderType::IntegrityProtectedWithNewSecurityContext.is_new_security_context());
+        assert!(
+            SecurityHeaderType::IntegrityProtectedWithNewSecurityContext.is_new_security_context()
+        );
     }
 
     #[test]
@@ -233,7 +231,10 @@ mod tests {
 
     #[test]
     fn test_sm_message_type_values() {
-        assert_eq!(u8::from(SmMessageType::PduSessionEstablishmentRequest), 0xC1);
+        assert_eq!(
+            u8::from(SmMessageType::PduSessionEstablishmentRequest),
+            0xC1
+        );
         assert_eq!(u8::from(SmMessageType::PduSessionReleaseCommand), 0xD3);
     }
 
@@ -245,13 +246,13 @@ mod tests {
         );
         assert_eq!(mt, Ok(MessageType::Mm(MmMessageType::RegistrationRequest)));
 
-        let mt = MessageType::from_epd_and_value(
-            ExtendedProtocolDiscriminator::SessionManagement,
-            0xC1,
-        );
+        let mt =
+            MessageType::from_epd_and_value(ExtendedProtocolDiscriminator::SessionManagement, 0xC1);
         assert_eq!(
             mt,
-            Ok(MessageType::Sm(SmMessageType::PduSessionEstablishmentRequest))
+            Ok(MessageType::Sm(
+                SmMessageType::PduSessionEstablishmentRequest
+            ))
         );
     }
 }

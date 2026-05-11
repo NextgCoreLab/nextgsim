@@ -168,7 +168,11 @@ impl BroadcastMessage {
     /// Returns the total size (base + all refinements) in number of floats
     pub fn total_size(&self) -> usize {
         let base_size = self.base.num_features();
-        let refinement_size: usize = self.refinements.values().map(RefinementLayer::num_features).sum();
+        let refinement_size: usize = self
+            .refinements
+            .values()
+            .map(RefinementLayer::num_features)
+            .sum();
         base_size + refinement_size
     }
 }
@@ -188,11 +192,7 @@ impl BroadcastEncoder {
     }
 
     /// Encodes data for multi-user broadcast
-    pub fn encode(
-        &self,
-        data: &[f32],
-        users: &[UserProfile],
-    ) -> BroadcastMessage {
+    pub fn encode(&self, data: &[f32], users: &[UserProfile]) -> BroadcastMessage {
         // First, create semantic features
         let task_id = task_to_id(self.task);
         let features = SemanticFeatures::new(task_id, data.to_vec(), vec![data.len()]);
@@ -212,7 +212,11 @@ impl BroadcastEncoder {
     }
 
     /// Creates a user-specific refinement layer
-    fn create_refinement(&self, features: &SemanticFeatures, user: &UserProfile) -> RefinementLayer {
+    fn create_refinement(
+        &self,
+        features: &SemanticFeatures,
+        user: &UserProfile,
+    ) -> RefinementLayer {
         // Determine how many features this user needs based on channel quality
         let user_ratio = 1.0 / user.channel.recommended_compression();
         let user_ratio = user_ratio.clamp(self.base_ratio, 1.0);
@@ -247,11 +251,8 @@ impl BroadcastEncoder {
 
         // Skip base layer features and take additional
         let start = (features.num_features() as f32 * self.base_ratio) as usize;
-        let refinement_features: Vec<_> = scored
-            .iter()
-            .skip(start)
-            .take(additional_count)
-            .collect();
+        let refinement_features: Vec<_> =
+            scored.iter().skip(start).take(additional_count).collect();
 
         let features: Vec<f32> = refinement_features.iter().map(|(_, f, _)| *f).collect();
         let indices: Vec<usize> = refinement_features.iter().map(|(i, _, _)| *i).collect();
@@ -298,11 +299,8 @@ mod tests {
 
     #[test]
     fn test_base_layer_creation() {
-        let features = SemanticFeatures::new(
-            0,
-            vec![1.0, 2.0, 3.0, 4.0, 5.0],
-            vec![5],
-        ).with_importance(vec![0.9, 0.5, 0.8, 0.3, 0.7]);
+        let features = SemanticFeatures::new(0, vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5])
+            .with_importance(vec![0.9, 0.5, 0.8, 0.3, 0.7]);
 
         let base = BaseLayer::from_features(&features, 0.6);
 

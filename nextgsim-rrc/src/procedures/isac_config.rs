@@ -708,7 +708,10 @@ mod tests {
             ) {
                 config.waveform_config.subcarrier_spacing_khz = None;
             }
-            assert!(config.validate().is_ok(), "Waveform type {wf:?} should be valid");
+            assert!(
+                config.validate().is_ok(),
+                "Waveform type {wf:?} should be valid"
+            );
         }
     }
 

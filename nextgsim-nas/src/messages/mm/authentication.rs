@@ -46,7 +46,6 @@ pub enum AuthenticationError {
     HeaderError(#[from] crate::header::HeaderError),
 }
 
-
 // ============================================================================
 // Authentication Parameter RAND (3GPP TS 24.501 Section 9.11.3.16)
 // ============================================================================
@@ -54,8 +53,7 @@ pub enum AuthenticationError {
 /// Authentication Parameter RAND IE (Type 3 - 16 bytes)
 ///
 /// Contains the random challenge used in authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AuthenticationParameterRand {
     /// 128-bit random value
     pub value: [u8; 16],
@@ -86,7 +84,6 @@ impl AuthenticationParameterRand {
     }
 }
 
-
 // ============================================================================
 // Authentication Parameter AUTN (3GPP TS 24.501 Section 9.11.3.15)
 // ============================================================================
@@ -94,8 +91,7 @@ impl AuthenticationParameterRand {
 /// Authentication Parameter AUTN IE (Type 4 - variable length, typically 16 bytes)
 ///
 /// Contains the authentication token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuthenticationParameterAutn {
     /// AUTN value (typically 16 bytes)
     pub value: Vec<u8>,
@@ -139,7 +135,6 @@ impl AuthenticationParameterAutn {
     }
 }
 
-
 // ============================================================================
 // Authentication Response Parameter (3GPP TS 24.501 Section 9.11.3.17)
 // ============================================================================
@@ -147,8 +142,7 @@ impl AuthenticationParameterAutn {
 /// Authentication Response Parameter IE (Type 4 - variable length)
 ///
 /// Contains the RES* value computed by the UE.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuthenticationResponseParameter {
     /// RES* value
     pub value: Vec<u8>,
@@ -192,7 +186,6 @@ impl AuthenticationResponseParameter {
     }
 }
 
-
 // ============================================================================
 // Authentication Failure Parameter (3GPP TS 24.501 Section 9.11.3.14)
 // ============================================================================
@@ -200,8 +193,7 @@ impl AuthenticationResponseParameter {
 /// Authentication Failure Parameter IE (Type 4 - 14 bytes)
 ///
 /// Contains the AUTS value for synchronization failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuthenticationFailureParameter {
     /// AUTS value (14 bytes)
     pub value: Vec<u8>,
@@ -245,14 +237,12 @@ impl AuthenticationFailureParameter {
     }
 }
 
-
 // ============================================================================
 // EAP Message IE (3GPP TS 24.501 Section 9.11.2.2)
 // ============================================================================
 
 /// EAP Message IE (Type 6 - variable length with 2-byte LI)
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EapMessage {
     /// EAP message data
     pub data: Vec<u8>,
@@ -295,7 +285,6 @@ impl EapMessage {
         2 + self.data.len()
     }
 }
-
 
 // ============================================================================
 // ABBA IE (3GPP TS 24.501 Section 9.11.3.10)
@@ -348,7 +337,9 @@ impl Abba {
 
 impl Default for Abba {
     fn default() -> Self {
-        Self { value: vec![0x00, 0x00] } // Default ABBA value
+        Self {
+            value: vec![0x00, 0x00],
+        } // Default ABBA value
     }
 }
 
@@ -596,7 +587,8 @@ impl AuthenticationResponse {
             match iei {
                 authentication_response_iei::AUTH_RESPONSE_PARAMETER => {
                     buf.advance(1);
-                    msg.auth_response_parameter = Some(AuthenticationResponseParameter::decode(buf)?);
+                    msg.auth_response_parameter =
+                        Some(AuthenticationResponseParameter::decode(buf)?);
                 }
                 authentication_response_iei::EAP_MESSAGE => {
                     buf.advance(1);
@@ -723,15 +715,13 @@ impl AuthenticationReject {
 /// Authentication Failure message (UE to network)
 ///
 /// 3GPP TS 24.501 Section 8.2.4
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuthenticationFailure {
     /// 5GMM cause (mandatory, Type 3)
     pub mm_cause: Ie5gMmCause,
     /// Authentication failure parameter (optional, Type 4, IEI 0x30)
     pub auth_failure_parameter: Option<AuthenticationFailureParameter>,
 }
-
 
 impl AuthenticationFailure {
     /// Create a new Authentication Failure with mandatory fields

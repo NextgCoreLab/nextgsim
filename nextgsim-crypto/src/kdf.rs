@@ -59,7 +59,6 @@ pub enum AlgorithmTypeDistinguisher {
     UpInt = 0x06,
 }
 
-
 /// Compute HMAC-SHA256
 ///
 /// # Arguments
@@ -96,7 +95,11 @@ pub fn hmac_sha256(key: &[u8], input: &[u8]) -> [u8; HMAC_SHA256_SIZE] {
 ///
 /// # Returns
 /// 32-byte derived key
-pub fn calculate_kdf_key(key: &[u8; KEY_256_SIZE], fc: u8, parameters: &[&[u8]]) -> [u8; KEY_256_SIZE] {
+pub fn calculate_kdf_key(
+    key: &[u8; KEY_256_SIZE],
+    fc: u8,
+    parameters: &[&[u8]],
+) -> [u8; KEY_256_SIZE] {
     let mut input = Vec::new();
     input.push(fc);
 
@@ -110,7 +113,6 @@ pub fn calculate_kdf_key(key: &[u8; KEY_256_SIZE], fc: u8, parameters: &[&[u8]])
 
     hmac_sha256(key, &input)
 }
-
 
 /// Calculate PRF' (Pseudo-Random Function Prime) as specified in 3GPP TS 33.501 Annex B
 ///
@@ -127,7 +129,11 @@ pub fn calculate_kdf_key(key: &[u8; KEY_256_SIZE], fc: u8, parameters: &[&[u8]])
 ///
 /// # Panics
 /// Panics if `output_length` would require more than 254 rounds
-pub fn calculate_prf_prime(key: &[u8; KEY_256_SIZE], input: &[u8], output_length: usize) -> Vec<u8> {
+pub fn calculate_prf_prime(
+    key: &[u8; KEY_256_SIZE],
+    input: &[u8],
+    output_length: usize,
+) -> Vec<u8> {
     let round = output_length.div_ceil(32); // Ceiling division
     assert!(round > 0 && round <= 254, "Invalid output_length for PRF'");
 
@@ -177,7 +183,6 @@ pub fn derive_kausf(
 
     calculate_kdf_key(&key, FcValue::Kausf as u8, &[sn_name, sqn_xor_ak])
 }
-
 
 /// Derive KSEAF from KAUSF (3GPP TS 33.501 Annex A.6)
 ///
@@ -259,7 +264,6 @@ pub fn derive_knas_int(kamf: &[u8; KEY_256_SIZE], algorithm_id: u8) -> [u8; KEY_
     derive_nas_key(kamf, AlgorithmTypeDistinguisher::NasInt, algorithm_id)
 }
 
-
 /// Derive `KgNB` from KAMF (3GPP TS 33.501 Annex A.9)
 ///
 /// `KgNB` = KDF(KAMF, FC, uplink NAS COUNT, access type distinguisher)
@@ -279,7 +283,11 @@ pub fn derive_kgnb(
     let nas_count_bytes = uplink_nas_count.to_be_bytes();
     let access_type_byte = [access_type];
 
-    calculate_kdf_key(kamf, FcValue::Kgnb as u8, &[&nas_count_bytes, &access_type_byte])
+    calculate_kdf_key(
+        kamf,
+        FcValue::Kgnb as u8,
+        &[&nas_count_bytes, &access_type_byte],
+    )
 }
 
 /// Derive RRC/UP keys from `KgNB` (3GPP TS 33.501 Annex A.8)
@@ -354,7 +362,6 @@ pub fn derive_res_star(
     result
 }
 
-
 /// Encode a string for KDF input as specified in 3GPP TS 33.501 Annex B.2.1.2
 ///
 /// Character strings are first normalized using NFKC (Normalization Form
@@ -375,10 +382,9 @@ mod tests {
         let key = [0x0b; 20];
         let data = b"Hi There";
         let expected: [u8; 32] = [
-            0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
-            0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
-            0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
-            0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7,
+            0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+            0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+            0x2e, 0x32, 0xcf, 0xf7,
         ];
 
         let result = hmac_sha256(&key, data);
@@ -391,16 +397,14 @@ mod tests {
         let key = b"Jefe";
         let data = b"what do ya want for nothing?";
         let expected: [u8; 32] = [
-            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e,
-            0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
-            0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83,
-            0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43,
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95,
+            0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9,
+            0x64, 0xec, 0x38, 0x43,
         ];
 
         let result = hmac_sha256(key, data);
         assert_eq!(result, expected);
     }
-
 
     #[test]
     fn test_calculate_kdf_key_structure() {
@@ -470,7 +474,6 @@ mod tests {
         let kausf2 = derive_kausf(&ck, &ik, sn_name, &sqn_xor_ak);
         assert_eq!(kausf, kausf2);
     }
-
 
     #[test]
     fn test_derive_kseaf() {
@@ -547,7 +550,6 @@ mod tests {
 
         assert_ne!(knas_enc, knas_int);
     }
-
 
     #[test]
     fn test_derive_kgnb() {

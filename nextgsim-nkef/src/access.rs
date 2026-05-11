@@ -101,7 +101,10 @@ impl AccessController {
     /// Checks if a consumer can access an entity
     pub fn can_access(&self, consumer_id: &str, entity: &Entity) -> bool {
         let level = self.get_access_level(consumer_id, entity);
-        matches!(level, AccessLevel::Read | AccessLevel::ReadWrite | AccessLevel::Admin)
+        matches!(
+            level,
+            AccessLevel::Read | AccessLevel::ReadWrite | AccessLevel::Admin
+        )
     }
 
     /// Checks if a consumer can modify an entity
@@ -155,7 +158,9 @@ impl AccessController {
 
             if applies && !policy.allowed_properties.is_empty() {
                 // Keep only allowed properties
-                entity.properties.retain(|k, _| policy.allowed_properties.contains(k));
+                entity
+                    .properties
+                    .retain(|k, _| policy.allowed_properties.contains(k));
                 return;
             }
         }
@@ -186,7 +191,11 @@ mod tests {
     #[test]
     fn test_add_remove_policy() {
         let mut controller = AccessController::new(AccessLevel::None);
-        let policy = AccessPolicy::new("p1".to_string(), "consumer-1".to_string(), AccessLevel::Read);
+        let policy = AccessPolicy::new(
+            "p1".to_string(),
+            "consumer-1".to_string(),
+            AccessLevel::Read,
+        );
 
         controller.add_policy(policy);
         assert_eq!(controller.policy_count(), 1);
@@ -198,8 +207,12 @@ mod tests {
     #[test]
     fn test_can_access() {
         let mut controller = AccessController::new(AccessLevel::None);
-        let policy = AccessPolicy::new("p1".to_string(), "consumer-1".to_string(), AccessLevel::Read)
-            .for_entity_type(EntityType::Gnb);
+        let policy = AccessPolicy::new(
+            "p1".to_string(),
+            "consumer-1".to_string(),
+            AccessLevel::Read,
+        )
+        .for_entity_type(EntityType::Gnb);
 
         controller.add_policy(policy);
 
@@ -211,8 +224,12 @@ mod tests {
     #[test]
     fn test_can_modify() {
         let mut controller = AccessController::new(AccessLevel::None);
-        let policy = AccessPolicy::new("p1".to_string(), "consumer-1".to_string(), AccessLevel::ReadWrite)
-            .for_entity_type(EntityType::Gnb);
+        let policy = AccessPolicy::new(
+            "p1".to_string(),
+            "consumer-1".to_string(),
+            AccessLevel::ReadWrite,
+        )
+        .for_entity_type(EntityType::Gnb);
 
         controller.add_policy(policy);
 
@@ -224,9 +241,13 @@ mod tests {
     #[test]
     fn test_filter_properties() {
         let mut controller = AccessController::new(AccessLevel::Read);
-        let policy = AccessPolicy::new("p1".to_string(), "consumer-1".to_string(), AccessLevel::Read)
-            .for_entity_type(EntityType::Gnb)
-            .with_properties(vec!["status".to_string()]);
+        let policy = AccessPolicy::new(
+            "p1".to_string(),
+            "consumer-1".to_string(),
+            AccessLevel::Read,
+        )
+        .for_entity_type(EntityType::Gnb)
+        .with_properties(vec!["status".to_string()]);
 
         controller.add_policy(policy);
 

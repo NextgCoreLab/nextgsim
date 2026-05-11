@@ -21,8 +21,7 @@ use crate::error::{AnalyticsError, NwdafError};
 use crate::mtlf::Mtlf;
 use crate::predictor::OnnxPredictor;
 use crate::{
-    CellLoad, HandoverReason, HandoverRecommendation, TrajectoryPrediction,
-    UeMeasurement,
+    CellLoad, HandoverReason, HandoverRecommendation, TrajectoryPrediction, UeMeasurement,
 };
 use serde::{Deserialize, Serialize};
 
@@ -187,22 +186,106 @@ impl QosThresholds {
     /// Returns standard thresholds for a given 5QI (TS 23.501 Table 5.7.4-1)
     pub fn for_5qi(fiveqi: u8) -> Self {
         match fiveqi {
-            1 => Self { fiveqi: 1, max_latency_ms: 100.0, max_packet_loss: 1e-2, gfbr_kbps: None, resource_type: ResourceType::Gbr },
-            2 => Self { fiveqi: 2, max_latency_ms: 150.0, max_packet_loss: 1e-3, gfbr_kbps: None, resource_type: ResourceType::Gbr },
-            3 => Self { fiveqi: 3, max_latency_ms: 50.0, max_packet_loss: 1e-3, gfbr_kbps: None, resource_type: ResourceType::Gbr },
-            4 => Self { fiveqi: 4, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::Gbr },
-            5 => Self { fiveqi: 5, max_latency_ms: 100.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
-            6 => Self { fiveqi: 6, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
-            7 => Self { fiveqi: 7, max_latency_ms: 100.0, max_packet_loss: 1e-3, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
-            8 => Self { fiveqi: 8, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
-            9 => Self { fiveqi: 9, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+            1 => Self {
+                fiveqi: 1,
+                max_latency_ms: 100.0,
+                max_packet_loss: 1e-2,
+                gfbr_kbps: None,
+                resource_type: ResourceType::Gbr,
+            },
+            2 => Self {
+                fiveqi: 2,
+                max_latency_ms: 150.0,
+                max_packet_loss: 1e-3,
+                gfbr_kbps: None,
+                resource_type: ResourceType::Gbr,
+            },
+            3 => Self {
+                fiveqi: 3,
+                max_latency_ms: 50.0,
+                max_packet_loss: 1e-3,
+                gfbr_kbps: None,
+                resource_type: ResourceType::Gbr,
+            },
+            4 => Self {
+                fiveqi: 4,
+                max_latency_ms: 300.0,
+                max_packet_loss: 1e-6,
+                gfbr_kbps: None,
+                resource_type: ResourceType::Gbr,
+            },
+            5 => Self {
+                fiveqi: 5,
+                max_latency_ms: 100.0,
+                max_packet_loss: 1e-6,
+                gfbr_kbps: None,
+                resource_type: ResourceType::NonGbr,
+            },
+            6 => Self {
+                fiveqi: 6,
+                max_latency_ms: 300.0,
+                max_packet_loss: 1e-6,
+                gfbr_kbps: None,
+                resource_type: ResourceType::NonGbr,
+            },
+            7 => Self {
+                fiveqi: 7,
+                max_latency_ms: 100.0,
+                max_packet_loss: 1e-3,
+                gfbr_kbps: None,
+                resource_type: ResourceType::NonGbr,
+            },
+            8 => Self {
+                fiveqi: 8,
+                max_latency_ms: 300.0,
+                max_packet_loss: 1e-6,
+                gfbr_kbps: None,
+                resource_type: ResourceType::NonGbr,
+            },
+            9 => Self {
+                fiveqi: 9,
+                max_latency_ms: 300.0,
+                max_packet_loss: 1e-6,
+                gfbr_kbps: None,
+                resource_type: ResourceType::NonGbr,
+            },
             // Delay-critical GBR
-            82 => Self { fiveqi: 82, max_latency_ms: 10.0, max_packet_loss: 1e-4, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
-            83 => Self { fiveqi: 83, max_latency_ms: 10.0, max_packet_loss: 1e-4, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
-            84 => Self { fiveqi: 84, max_latency_ms: 30.0, max_packet_loss: 1e-5, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
-            85 => Self { fiveqi: 85, max_latency_ms: 5.0, max_packet_loss: 1e-5, gfbr_kbps: None, resource_type: ResourceType::DelayCriticalGbr },
+            82 => Self {
+                fiveqi: 82,
+                max_latency_ms: 10.0,
+                max_packet_loss: 1e-4,
+                gfbr_kbps: None,
+                resource_type: ResourceType::DelayCriticalGbr,
+            },
+            83 => Self {
+                fiveqi: 83,
+                max_latency_ms: 10.0,
+                max_packet_loss: 1e-4,
+                gfbr_kbps: None,
+                resource_type: ResourceType::DelayCriticalGbr,
+            },
+            84 => Self {
+                fiveqi: 84,
+                max_latency_ms: 30.0,
+                max_packet_loss: 1e-5,
+                gfbr_kbps: None,
+                resource_type: ResourceType::DelayCriticalGbr,
+            },
+            85 => Self {
+                fiveqi: 85,
+                max_latency_ms: 5.0,
+                max_packet_loss: 1e-5,
+                gfbr_kbps: None,
+                resource_type: ResourceType::DelayCriticalGbr,
+            },
             // Default: best-effort
-            _ => Self { fiveqi, max_latency_ms: 300.0, max_packet_loss: 1e-6, gfbr_kbps: None, resource_type: ResourceType::NonGbr },
+            _ => Self {
+                fiveqi,
+                max_latency_ms: 300.0,
+                max_packet_loss: 1e-6,
+                gfbr_kbps: None,
+                resource_type: ResourceType::NonGbr,
+            },
         }
     }
 
@@ -413,11 +496,12 @@ impl Anlf {
         data_collector: &DataCollector,
         mtlf: &Mtlf,
     ) -> Result<AnalyticsResult, NwdafError> {
-        let history = data_collector
-            .get_ue_history(ue_id)
-            .ok_or(AnalyticsError::TargetNotFound {
-                target: format!("ue-{ue_id}"),
-            })?;
+        let history =
+            data_collector
+                .get_ue_history(ue_id)
+                .ok_or(AnalyticsError::TargetNotFound {
+                    target: format!("ue-{ue_id}"),
+                })?;
 
         if history.len() < 2 {
             return Err(AnalyticsError::InsufficientData {
@@ -480,11 +564,12 @@ impl Anlf {
         data_collector: &DataCollector,
         mtlf: &Mtlf,
     ) -> Result<Option<HandoverRecommendation>, NwdafError> {
-        let history = data_collector
-            .get_ue_history(ue_id)
-            .ok_or(AnalyticsError::TargetNotFound {
-                target: format!("ue-{ue_id}"),
-            })?;
+        let history =
+            data_collector
+                .get_ue_history(ue_id)
+                .ok_or(AnalyticsError::TargetNotFound {
+                    target: format!("ue-{ue_id}"),
+                })?;
 
         let latest = history.latest().ok_or(AnalyticsError::InsufficientData {
             required: 1,
@@ -495,10 +580,7 @@ impl Anlf {
         let best_neighbor = neighbor_cells
             .iter()
             .filter(|(_, rsrp)| *rsrp > latest.rsrp + 3.0)
-            .max_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let best_neighbor = match best_neighbor {
             Some(n) => n,
@@ -554,11 +636,11 @@ impl Anlf {
         data_collector: &DataCollector,
         mtlf: &Mtlf,
     ) -> Result<AnalyticsResult, NwdafError> {
-        let load_history = data_collector
-            .get_cell_load_history(cell_id)
-            .ok_or(AnalyticsError::TargetNotFound {
+        let load_history = data_collector.get_cell_load_history(cell_id).ok_or(
+            AnalyticsError::TargetNotFound {
                 target: format!("cell-{cell_id}"),
-            })?;
+            },
+        )?;
 
         if load_history.len() < 2 {
             return Err(AnalyticsError::InsufficientData {
@@ -591,17 +673,14 @@ impl Anlf {
         };
 
         // Estimate time to overload (PRB usage > 0.9)
-        let time_to_overload_ms = predicted_load
-            .iter()
-            .position(|&l| l > 0.9)
-            .map(|step| {
-                let interval_ms = if timestamps.len() >= 2 {
-                    timestamps[timestamps.len() - 1] - timestamps[timestamps.len() - 2]
-                } else {
-                    100
-                };
-                (step as u64 + 1) * interval_ms
-            });
+        let time_to_overload_ms = predicted_load.iter().position(|&l| l > 0.9).map(|step| {
+            let interval_ms = if timestamps.len() >= 2 {
+                timestamps[timestamps.len() - 1] - timestamps[timestamps.len() - 2]
+            } else {
+                100
+            };
+            (step as u64 + 1) * interval_ms
+        });
 
         let result = AnalyticsResult {
             analytics_id: AnalyticsId::NfLoad,
@@ -685,13 +764,18 @@ impl Anlf {
         data_collector: &DataCollector,
     ) -> Result<AnalyticsResult, NwdafError> {
         // Extract metrics based on target type
-        let (avg_latency_ms, throughput_mbps, packet_loss_rate, success_rate): (f32, f32, f32, f32) = match target {
+        let (avg_latency_ms, throughput_mbps, packet_loss_rate, success_rate): (
+            f32,
+            f32,
+            f32,
+            f32,
+        ) = match target {
             AnalyticsTarget::Cell { cell_id } => {
-                let load_history = data_collector
-                    .get_cell_load_history(*cell_id)
-                    .ok_or(AnalyticsError::TargetNotFound {
+                let load_history = data_collector.get_cell_load_history(*cell_id).ok_or(
+                    AnalyticsError::TargetNotFound {
                         target: format!("cell-{cell_id}"),
-                    })?;
+                    },
+                )?;
 
                 if load_history.len() < 5 {
                     return Err(AnalyticsError::InsufficientData {
@@ -702,12 +786,13 @@ impl Anlf {
                 }
 
                 // Derive metrics from cell load
-                let avg_throughput = load_history.iter()
+                let avg_throughput = load_history
+                    .iter()
                     .map(|l| l.avg_throughput_mbps)
-                    .sum::<f32>() / load_history.len() as f32;
-                let avg_prb = load_history.iter()
-                    .map(|l| l.prb_usage)
-                    .sum::<f32>() / load_history.len() as f32;
+                    .sum::<f32>()
+                    / load_history.len() as f32;
+                let avg_prb = load_history.iter().map(|l| l.prb_usage).sum::<f32>()
+                    / load_history.len() as f32;
 
                 // Estimate latency from PRB usage (higher usage -> higher latency)
                 let latency = 10.0 + (avg_prb * 40.0);
@@ -718,11 +803,11 @@ impl Anlf {
                 (latency, avg_throughput, loss, success)
             }
             AnalyticsTarget::Ue { ue_id } => {
-                let history = data_collector
-                    .get_ue_history(*ue_id)
-                    .ok_or(AnalyticsError::TargetNotFound {
+                let history = data_collector.get_ue_history(*ue_id).ok_or(
+                    AnalyticsError::TargetNotFound {
                         target: format!("ue-{ue_id}"),
-                    })?;
+                    },
+                )?;
 
                 if history.len() < 5 {
                     return Err(AnalyticsError::InsufficientData {
@@ -733,12 +818,10 @@ impl Anlf {
                 }
 
                 // Derive metrics from RSRP/RSRQ
-                let avg_rsrp = history.all().iter()
-                    .map(|m| m.rsrp)
-                    .sum::<f32>() / history.len() as f32;
-                let avg_rsrq = history.all().iter()
-                    .map(|m| m.rsrq)
-                    .sum::<f32>() / history.len() as f32;
+                let avg_rsrp =
+                    history.all().iter().map(|m| m.rsrp).sum::<f32>() / history.len() as f32;
+                let avg_rsrq =
+                    history.all().iter().map(|m| m.rsrq).sum::<f32>() / history.len() as f32;
 
                 // Better signal -> lower latency, higher throughput
                 let latency = 20.0 + ((-avg_rsrp - 60.0).max(0.0) / 2.0);
@@ -818,7 +901,8 @@ impl Anlf {
                 // R = R0 - Is - Id - Ie + A
                 // R0 = 93.2 (base), Is = 0 (simplified), A = 0 (simplified)
                 let id = if latency_ms < 177.3 {
-                    0.024 * latency_ms + 0.11 * (latency_ms - 177.3) * (if latency_ms > 177.3 { 1.0 } else { 0.0 })
+                    0.024 * latency_ms
+                        + 0.11 * (latency_ms - 177.3) * (if latency_ms > 177.3 { 1.0 } else { 0.0 })
                 } else {
                     0.024 * latency_ms + 0.11 * (latency_ms - 177.3)
                 };
@@ -901,11 +985,11 @@ impl Anlf {
     ) -> Result<AnalyticsResult, NwdafError> {
         match target {
             AnalyticsTarget::Cell { cell_id } => {
-                let load_history = data_collector
-                    .get_cell_load_history(*cell_id)
-                    .ok_or(AnalyticsError::TargetNotFound {
+                let load_history = data_collector.get_cell_load_history(*cell_id).ok_or(
+                    AnalyticsError::TargetNotFound {
                         target: format!("cell-{cell_id}"),
-                    })?;
+                    },
+                )?;
 
                 if load_history.len() < 10 {
                     return Err(AnalyticsError::InsufficientData {
@@ -997,11 +1081,11 @@ impl Anlf {
     ) -> Result<AnalyticsResult, NwdafError> {
         match target {
             AnalyticsTarget::Cell { cell_id } => {
-                let load_history = data_collector
-                    .get_cell_load_history(*cell_id)
-                    .ok_or(AnalyticsError::TargetNotFound {
+                let load_history = data_collector.get_cell_load_history(*cell_id).ok_or(
+                    AnalyticsError::TargetNotFound {
                         target: format!("cell-{cell_id}"),
-                    })?;
+                    },
+                )?;
 
                 if load_history.len() < 10 {
                     return Err(AnalyticsError::InsufficientData {
@@ -1069,11 +1153,11 @@ impl Anlf {
                 Ok(result)
             }
             AnalyticsTarget::Ue { ue_id } => {
-                let history = data_collector
-                    .get_ue_history(*ue_id)
-                    .ok_or(AnalyticsError::TargetNotFound {
+                let history = data_collector.get_ue_history(*ue_id).ok_or(
+                    AnalyticsError::TargetNotFound {
                         target: format!("ue-{ue_id}"),
-                    })?;
+                    },
+                )?;
 
                 if history.len() < 10 {
                     return Err(AnalyticsError::InsufficientData {
@@ -1084,9 +1168,8 @@ impl Anlf {
                 }
 
                 let latest = history.latest().expect("value expected");
-                let avg_rsrp = history.all().iter()
-                    .map(|m| m.rsrp)
-                    .sum::<f32>() / history.len() as f32;
+                let avg_rsrp =
+                    history.all().iter().map(|m| m.rsrp).sum::<f32>() / history.len() as f32;
 
                 let current_qos = QosMetrics {
                     avg_latency_ms: 20.0 + ((-avg_rsrp - 60.0).max(0.0) / 2.0),
@@ -1141,11 +1224,11 @@ impl Anlf {
     ) -> Result<AnalyticsResult, NwdafError> {
         match target {
             AnalyticsTarget::Cell { cell_id } => {
-                let load_history = data_collector
-                    .get_cell_load_history(*cell_id)
-                    .ok_or(AnalyticsError::TargetNotFound {
+                let load_history = data_collector.get_cell_load_history(*cell_id).ok_or(
+                    AnalyticsError::TargetNotFound {
                         target: format!("cell-{cell_id}"),
-                    })?;
+                    },
+                )?;
 
                 if load_history.len() < 5 {
                     return Err(AnalyticsError::InsufficientData {
@@ -1160,7 +1243,10 @@ impl Anlf {
                 let p_max: f32 = 200.0; // watts, max power
                 let avg_load = load_history.iter().map(|l| l.prb_usage).sum::<f32>()
                     / load_history.len() as f32;
-                let avg_throughput = load_history.iter().map(|l| l.avg_throughput_mbps).sum::<f32>()
+                let avg_throughput = load_history
+                    .iter()
+                    .map(|l| l.avg_throughput_mbps)
+                    .sum::<f32>()
                     / load_history.len() as f32;
 
                 let power_consumption = p_idle + (p_max - p_idle) * avg_load;
@@ -1175,13 +1261,17 @@ impl Anlf {
 
                 let mut recommendations = Vec::new();
                 if avg_load < 0.2 {
-                    recommendations.push("Consider cell sleep mode for low-traffic periods".to_string());
+                    recommendations
+                        .push("Consider cell sleep mode for low-traffic periods".to_string());
                 }
                 if avg_load > 0.8 {
-                    recommendations.push("High load detected; consider load balancing across cells".to_string());
+                    recommendations.push(
+                        "High load detected; consider load balancing across cells".to_string(),
+                    );
                 }
                 if energy_per_bit > 1e-7 {
-                    recommendations.push("Enable MIMO sleep and carrier shutdown features".to_string());
+                    recommendations
+                        .push("Enable MIMO sleep and carrier shutdown features".to_string());
                 }
 
                 let now_ms = std::time::SystemTime::now()
@@ -1235,7 +1325,11 @@ impl Anlf {
                 }
 
                 if cell_count == 0 {
-                    return Err(AnalyticsError::InsufficientData { required: 5, available: 0 }.into());
+                    return Err(AnalyticsError::InsufficientData {
+                        required: 5,
+                        available: 0,
+                    }
+                    .into());
                 }
 
                 let energy_per_bit = if total_throughput > 0.01 {
@@ -1260,9 +1354,10 @@ impl Anlf {
                         efficiency_score,
                         power_consumption_watts: total_power,
                         energy_per_bit,
-                        recommendations: vec![
-                            format!("Network-wide energy analysis across {} cells", cell_count),
-                        ],
+                        recommendations: vec![format!(
+                            "Network-wide energy analysis across {} cells",
+                            cell_count
+                        )],
                     },
                 };
 
@@ -1330,8 +1425,8 @@ impl Anlf {
         for cid in &cell_ids {
             if let Some(history) = data_collector.get_cell_load_history(*cid) {
                 if history.len() >= 3 {
-                    let avg = history.iter().map(|l| l.prb_usage).sum::<f32>()
-                        / history.len() as f32;
+                    let avg =
+                        history.iter().map(|l| l.prb_usage).sum::<f32>() / history.len() as f32;
                     total_load += avg;
                     cell_count += 1;
                 }
@@ -1392,10 +1487,19 @@ impl Anlf {
         }
 
         // Cross-slice recommendations
-        let embb_util = slice_utilization.iter().find(|(s, _)| *s == 1).map(|(_, u)| *u).unwrap_or(0.0);
-        let urllc_util = slice_utilization.iter().find(|(s, _)| *s == 2).map(|(_, u)| *u).unwrap_or(0.0);
+        let embb_util = slice_utilization
+            .iter()
+            .find(|(s, _)| *s == 1)
+            .map(|(_, u)| *u)
+            .unwrap_or(0.0);
+        let urllc_util = slice_utilization
+            .iter()
+            .find(|(s, _)| *s == 2)
+            .map(|(_, u)| *u)
+            .unwrap_or(0.0);
         if embb_util > 0.85 && urllc_util < 0.3 {
-            recommendations.push("Reallocate spare URLLC resources to eMBB to improve throughput".to_string());
+            recommendations
+                .push("Reallocate spare URLLC resources to eMBB to improve throughput".to_string());
         }
 
         let now_ms = std::time::SystemTime::now()
@@ -1726,10 +1830,8 @@ mod tests {
             });
         }
 
-        let result = anlf.analyze_service_experience(
-            &AnalyticsTarget::Cell { cell_id: 1 },
-            &collector,
-        );
+        let result =
+            anlf.analyze_service_experience(&AnalyticsTarget::Cell { cell_id: 1 }, &collector);
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");
@@ -1768,10 +1870,7 @@ mod tests {
             });
         }
 
-        let result = anlf.analyze_service_experience(
-            &AnalyticsTarget::Ue { ue_id: 1 },
-            &collector,
-        );
+        let result = anlf.analyze_service_experience(&AnalyticsTarget::Ue { ue_id: 1 }, &collector);
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");
@@ -1800,10 +1899,8 @@ mod tests {
             });
         }
 
-        let result = anlf.analyze_service_experience(
-            &AnalyticsTarget::Cell { cell_id: 1 },
-            &collector,
-        );
+        let result =
+            anlf.analyze_service_experience(&AnalyticsTarget::Cell { cell_id: 1 }, &collector);
         assert!(result.is_err());
     }
 
@@ -1823,10 +1920,8 @@ mod tests {
             });
         }
 
-        let result = anlf.analyze_service_experience(
-            &AnalyticsTarget::Cell { cell_id: 1 },
-            &collector,
-        );
+        let result =
+            anlf.analyze_service_experience(&AnalyticsTarget::Cell { cell_id: 1 }, &collector);
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");
@@ -1838,7 +1933,10 @@ mod tests {
         {
             // High load -> low MOS
             assert!(*mos < 3.5, "MOS={mos} should be degraded under high load");
-            assert!(!degraded_services.is_empty(), "Should report degraded services");
+            assert!(
+                !degraded_services.is_empty(),
+                "Should report degraded services"
+            );
         } else {
             panic!("Expected ServiceExperience payload");
         }
@@ -1918,11 +2016,8 @@ mod tests {
         let mtlf = Mtlf::new();
 
         // UserDataCongestion requires Cell target
-        let result = anlf.analyze_user_data_congestion(
-            &AnalyticsTarget::Ue { ue_id: 1 },
-            &collector,
-            &mtlf,
-        );
+        let result =
+            anlf.analyze_user_data_congestion(&AnalyticsTarget::Ue { ue_id: 1 }, &collector, &mtlf);
         assert!(result.is_err());
     }
 
@@ -1999,7 +2094,10 @@ mod tests {
         } = &analytics.payload
         {
             assert!(!sustainable, "High load should be unsustainable");
-            assert!(remaining_time_ms.is_some(), "Should estimate remaining time");
+            assert!(
+                remaining_time_ms.is_some(),
+                "Should estimate remaining time"
+            );
             assert!(current_qos.packet_loss_rate > 0.0);
         } else {
             panic!("Expected QosSustainability payload");
@@ -2026,11 +2124,8 @@ mod tests {
             });
         }
 
-        let result = anlf.analyze_qos_sustainability(
-            &AnalyticsTarget::Ue { ue_id: 1 },
-            &collector,
-            &mtlf,
-        );
+        let result =
+            anlf.analyze_qos_sustainability(&AnalyticsTarget::Ue { ue_id: 1 }, &collector, &mtlf);
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");
@@ -2067,11 +2162,8 @@ mod tests {
             });
         }
 
-        let result = anlf.analyze_qos_sustainability(
-            &AnalyticsTarget::Ue { ue_id: 1 },
-            &collector,
-            &mtlf,
-        );
+        let result =
+            anlf.analyze_qos_sustainability(&AnalyticsTarget::Ue { ue_id: 1 }, &collector, &mtlf);
         assert!(result.is_ok());
 
         let analytics = result.expect("should succeed");
@@ -2134,9 +2226,6 @@ mod tests {
 
         let _ = anlf.analyze_ue_mobility(1, 1000, &collector, &mtlf);
         assert_eq!(anlf.recent_results().len(), 1);
-        assert_eq!(
-            anlf.results_for_analytics(AnalyticsId::UeMobility).len(),
-            1
-        );
+        assert_eq!(anlf.results_for_analytics(AnalyticsId::UeMobility).len(), 1);
     }
 }

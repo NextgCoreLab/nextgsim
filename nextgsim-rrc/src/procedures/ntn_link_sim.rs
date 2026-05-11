@@ -40,7 +40,12 @@ impl OrbitParams {
         let r = EARTH_RADIUS_KM + altitude_km;
         // Kepler's third law: T = 2π√(r³/μ), μ = 398600.4418 km³/s²
         let period_s = 2.0 * PI * (r.powi(3) / 398600.4418).sqrt();
-        Self { altitude_km, inclination_deg, period_s, raan_deg: 0.0 }
+        Self {
+            altitude_km,
+            inclination_deg,
+            period_s,
+            raan_deg: 0.0,
+        }
     }
 
     /// Creates GEO orbit parameters
@@ -57,17 +62,29 @@ impl OrbitParams {
     pub fn meo(altitude_km: f64) -> Self {
         let r = EARTH_RADIUS_KM + altitude_km;
         let period_s = 2.0 * PI * (r.powi(3) / 398600.4418).sqrt();
-        Self { altitude_km, inclination_deg: 0.0, period_s, raan_deg: 0.0 }
+        Self {
+            altitude_km,
+            inclination_deg: 0.0,
+            period_s,
+            raan_deg: 0.0,
+        }
     }
 
     /// Creates HAPS parameters
     pub fn haps(altitude_km: f64) -> Self {
-        Self { altitude_km, inclination_deg: 0.0, period_s: f64::INFINITY, raan_deg: 0.0 }
+        Self {
+            altitude_km,
+            inclination_deg: 0.0,
+            period_s: f64::INFINITY,
+            raan_deg: 0.0,
+        }
     }
 
     /// Angular velocity in rad/s
     pub fn angular_velocity(&self) -> f64 {
-        if self.period_s.is_infinite() { return 0.0; }
+        if self.period_s.is_infinite() {
+            return 0.0;
+        }
         2.0 * PI / self.period_s
     }
 }
@@ -86,7 +103,11 @@ pub struct GroundPosition {
 
 impl GroundPosition {
     pub fn new(lat: f64, lon: f64) -> Self {
-        Self { latitude_deg: lat, longitude_deg: lon, altitude_km: 0.0 }
+        Self {
+            latitude_deg: lat,
+            longitude_deg: lon,
+            altitude_km: 0.0,
+        }
     }
 }
 
@@ -187,7 +208,7 @@ impl LinkBudget {
     /// Creates a typical S-band NTN link budget
     pub fn s_band_ntn() -> Self {
         Self {
-            tx_power_dbm: 43.0,     // 20W EIRP typical for satellite
+            tx_power_dbm: 43.0, // 20W EIRP typical for satellite
             tx_antenna_gain_dbi: 30.0,
             rx_antenna_gain_dbi: 0.0, // UE isotropic
             carrier_freq_ghz: 2.0,
@@ -222,7 +243,8 @@ impl LinkBudget {
     pub fn snr_db(&self, slant_range_km: f64) -> f64 {
         let eirp = self.tx_power_dbm + self.tx_antenna_gain_dbi;
         let fspl = self.fspl_db(slant_range_km);
-        let noise_power = K_BOLTZMANN_DB + 10.0 * self.noise_temp_k.log10()
+        let noise_power = K_BOLTZMANN_DB
+            + 10.0 * self.noise_temp_k.log10()
             + 10.0 * (self.bandwidth_mhz * 1e6).log10();
 
         eirp - fspl + self.rx_antenna_gain_dbi
@@ -278,7 +300,9 @@ impl JitterModel {
     /// (in production, use random normal distribution)
     pub fn sample_jitter_ms(&self, seed: u64) -> f64 {
         // Simple hash-based pseudo-random for determinism
-        let hash = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let hash = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let normalized = ((hash >> 33) as f64) / (u32::MAX as f64) * 2.0 - 1.0;
         normalized * self.total_jitter_std_ms()
     }
@@ -290,7 +314,9 @@ impl JitterModel {
 
 /// Rain attenuation model (ITU-R P.618)
 pub fn rain_attenuation_db(freq_ghz: f64, elevation_deg: f64, rain_rate_mm_h: f64) -> f64 {
-    if rain_rate_mm_h <= 0.0 || elevation_deg <= 5.0 { return 0.0; }
+    if rain_rate_mm_h <= 0.0 || elevation_deg <= 5.0 {
+        return 0.0;
+    }
 
     // Simplified ITU-R model coefficients
     let (k, alpha) = if freq_ghz < 10.0 {
@@ -307,7 +333,9 @@ pub fn rain_attenuation_db(freq_ghz: f64, elevation_deg: f64, rain_rate_mm_h: f6
 
 /// Gaseous attenuation (oxygen + water vapor) in dB
 pub fn gaseous_attenuation_db(freq_ghz: f64, elevation_deg: f64) -> f64 {
-    if elevation_deg <= 5.0 { return 0.0; }
+    if elevation_deg <= 5.0 {
+        return 0.0;
+    }
 
     // Simplified model: attenuation increases with frequency
     let zenith_atten = if freq_ghz < 10.0 {
@@ -323,8 +351,14 @@ pub fn gaseous_attenuation_db(freq_ghz: f64, elevation_deg: f64) -> f64 {
 }
 
 /// Scintillation attenuation (ionospheric/tropospheric)
-pub fn scintillation_attenuation_db(freq_ghz: f64, elevation_deg: f64, time_percentage: f64) -> f64 {
-    if elevation_deg <= 5.0 { return 0.0; }
+pub fn scintillation_attenuation_db(
+    freq_ghz: f64,
+    elevation_deg: f64,
+    time_percentage: f64,
+) -> f64 {
+    if elevation_deg <= 5.0 {
+        return 0.0;
+    }
 
     // Scintillation is stronger at lower frequencies and lower elevations
     let base_scint = if freq_ghz < 10.0 {
@@ -350,7 +384,9 @@ pub fn scintillation_attenuation_db(freq_ghz: f64, elevation_deg: f64, time_perc
 
 /// Cloud attenuation (liquid water content)
 pub fn cloud_attenuation_db(freq_ghz: f64, elevation_deg: f64, liquid_water_kg_m2: f64) -> f64 {
-    if elevation_deg <= 5.0 || liquid_water_kg_m2 <= 0.0 { return 0.0; }
+    if elevation_deg <= 5.0 || liquid_water_kg_m2 <= 0.0 {
+        return 0.0;
+    }
 
     // ITU-R P.840 model: specific attenuation coefficient
     let k_l = 0.819 * freq_ghz / (freq_ghz + 1.0).powi(2); // Simplified
@@ -431,7 +467,12 @@ impl NtnLinkSimulator {
 
     /// Creates with custom parameters
     pub fn new(orbit: OrbitParams, link_budget: LinkBudget, jitter: JitterModel) -> Self {
-        Self { orbit, link_budget, jitter, tick: 0 }
+        Self {
+            orbit,
+            link_budget,
+            jitter,
+            tick: 0,
+        }
     }
 
     /// Simulates the satellite link at a given time
@@ -453,8 +494,7 @@ impl NtnLinkSimulator {
         // Elevation and azimuth angles
         let earth_r = EARTH_RADIUS_KM;
         let sat_r = earth_r + sat.altitude_km;
-        let cos_elev = (sat_r.powi(2) - earth_r.powi(2) - range.powi(2))
-            / (2.0 * earth_r * range);
+        let cos_elev = (sat_r.powi(2) - earth_r.powi(2) - range.powi(2)) / (2.0 * earth_r * range);
         let elevation = cos_elev.acos().to_degrees().clamp(5.0, 90.0);
 
         // Azimuth (simplified)
@@ -465,7 +505,8 @@ impl NtnLinkSimulator {
         // Atmospheric losses with more detail
         let rain_loss = rain_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 5.0);
         let gas_loss = gaseous_attenuation_db(self.link_budget.carrier_freq_ghz, elevation);
-        let scint_loss = scintillation_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 0.01);
+        let scint_loss =
+            scintillation_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 0.01);
         let cloud_loss = cloud_attenuation_db(self.link_budget.carrier_freq_ghz, elevation, 0.5);
         let total_atmos = rain_loss + gas_loss + scint_loss + cloud_loss;
 
@@ -473,7 +514,8 @@ impl NtnLinkSimulator {
         let snr = self.link_budget.snr_db(range) - total_atmos;
 
         let carrier_hz = self.link_budget.carrier_freq_ghz * 1e9;
-        let doppler = max_doppler_shift_hz(&self.orbit, carrier_hz) * (self.tick as f64 * 0.01).sin();
+        let doppler =
+            max_doppler_shift_hz(&self.orbit, carrier_hz) * (self.tick as f64 * 0.01).sin();
         let doppler_rate = doppler_rate_hz_per_s(&self.orbit, carrier_hz);
 
         let jitter = self.jitter.sample_jitter_ms(self.tick);
@@ -500,10 +542,14 @@ impl NtnLinkSimulator {
     }
 
     /// Returns the orbit parameters
-    pub fn orbit(&self) -> &OrbitParams { &self.orbit }
+    pub fn orbit(&self) -> &OrbitParams {
+        &self.orbit
+    }
 
     /// Returns the current tick
-    pub fn tick(&self) -> u64 { self.tick }
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
 }
 
 // ============================================================================
@@ -532,7 +578,11 @@ mod tests {
     #[test]
     fn test_propagation_delay_leo() {
         let ground = GroundPosition::new(40.0, -74.0);
-        let sat = SatellitePosition { latitude_deg: 40.0, longitude_deg: -74.0, altitude_km: 550.0 };
+        let sat = SatellitePosition {
+            latitude_deg: 40.0,
+            longitude_deg: -74.0,
+            altitude_km: 550.0,
+        };
         let delay = propagation_delay_ms(&ground, &sat);
         // LEO at zenith: ~550km → ~1.8ms
         assert!(delay > 1.0 && delay < 5.0, "LEO delay = {delay}ms");
@@ -541,7 +591,11 @@ mod tests {
     #[test]
     fn test_propagation_delay_geo() {
         let ground = GroundPosition::new(0.0, 0.0);
-        let sat = SatellitePosition { latitude_deg: 0.0, longitude_deg: 0.0, altitude_km: 35786.0 };
+        let sat = SatellitePosition {
+            latitude_deg: 0.0,
+            longitude_deg: 0.0,
+            altitude_km: 35786.0,
+        };
         let delay = propagation_delay_ms(&ground, &sat);
         // GEO at zenith: ~35786km → ~119ms
         assert!(delay > 100.0 && delay < 150.0, "GEO delay = {delay}ms");
@@ -550,7 +604,11 @@ mod tests {
     #[test]
     fn test_rtt() {
         let ground = GroundPosition::new(0.0, 0.0);
-        let sat = SatellitePosition { latitude_deg: 0.0, longitude_deg: 0.0, altitude_km: 550.0 };
+        let sat = SatellitePosition {
+            latitude_deg: 0.0,
+            longitude_deg: 0.0,
+            altitude_km: 550.0,
+        };
         let rtt = rtt_ms(&ground, &sat);
         assert!((rtt - 2.0 * propagation_delay_ms(&ground, &sat)).abs() < 0.001);
     }
@@ -573,7 +631,7 @@ mod tests {
     fn test_link_budget_snr() {
         let lb = LinkBudget::s_band_ntn();
         let snr = lb.snr_db(550.0); // LEO zenith
-        // Should be positive SNR for a working link
+                                    // Should be positive SNR for a working link
         assert!(snr > 0.0, "SNR = {snr}dB at 550km");
     }
 

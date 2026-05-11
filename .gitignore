@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Build artifacts — regenerate via Dockerfile.builder
+/binaries/

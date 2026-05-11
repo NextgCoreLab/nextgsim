@@ -20,9 +20,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::tasks::{
-    GnbTaskBase, NgapMessage, SctpMessage, Task, TaskMessage,
-};
+use crate::tasks::{GnbTaskBase, NgapMessage, SctpMessage, Task, TaskMessage};
 use nextgsim_common::OctetString;
 use nextgsim_sctp::SctpConfig;
 
@@ -60,11 +58,25 @@ impl SctpTask {
             local_address, local_port, remote_address, remote_port, client_id, ppid
         );
 
+        // Warn early if QUIC transport is configured — full wiring is a
+        // separate work item; we fall through to SCTP for now.
+        if self.task_base.config.quic_enabled {
+            warn!(
+                "quic_enabled=true in GnbConfig but QUIC transport selection is not yet \
+                 fully wired (client_id: {}). Falling back to SCTP.",
+                client_id
+            );
+            // TODO: instantiate QuicTransport here when the QUIC path is fully integrated.
+        }
+
         // Parse addresses
         let local_addr: SocketAddr = match format!("{local_address}:{local_port}").parse() {
             Ok(addr) => addr,
             Err(e) => {
-                error!("Invalid local address {}:{}: {}", local_address, local_port, e);
+                error!(
+                    "Invalid local address {}:{}: {}",
+                    local_address, local_port, e
+                );
                 return;
             }
         };
@@ -72,21 +84,66 @@ impl SctpTask {
         let remote_addr: SocketAddr = match format!("{remote_address}:{remote_port}").parse() {
             Ok(addr) => addr,
             Err(e) => {
-                error!("Invalid remote address {}:{}: {}", remote_address, remote_port, e);
+                error!(
+                    "Invalid remote address {}:{}: {}",
+                    remote_address, remote_port, e
+                );
                 return;
             }
         };
 
-        // Create connection config
-        let config = AmfConnectionConfig {
+        // Resolve secondary addresses from the gNB config using client_id as
+        // an index into amf_configs.  An out-of-range client_id means no
+        // secondary addresses are registered (safe default).
+        let secondary_addresses: Vec<SocketAddr> = self
+            .task_base
+            .config
+            .amf_configs
+            .get(client_id as usize)
+            .map(|amf_cfg| {
+                amf_cfg
+                    .secondary_addresses
+                    .iter()
+                    .filter_map(|s| {
+                        // Secondary address strings may or may not include a
+                        // port; if there is no colon we append the same port
+                        // as the primary address.
+                        let with_port = if s.contains(':') {
+                            s.clone()
+                        } else {
+                            format!("{s}:{remote_port}")
+                        };
+                        match with_port.parse::<SocketAddr>() {
+                            Ok(a) => Some(a),
+                            Err(e) => {
+                                warn!("Ignoring unparseable secondary AMF address {:?}: {}", s, e);
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !secondary_addresses.is_empty() {
+            info!(
+                "SCTP multi-homing enabled for AMF {} with {} secondary address(es)",
+                client_id,
+                secondary_addresses.len()
+            );
+        }
+
+        // Build the full connection config.
+        let conn_config = AmfConnectionConfig {
             local_address: local_addr,
             remote_address: remote_addr,
+            secondary_addresses,
             sctp_config: SctpConfig::default(),
         };
 
-        // Create and connect
-        let mut connection = AmfConnection::new(client_id, config.clone());
-        match connection.connect(&config.sctp_config).await {
+        // Create and connect.
+        let mut connection = AmfConnection::new(client_id, conn_config.clone());
+        match connection.connect(&conn_config).await {
             Ok(event) => {
                 // Store the connection
                 self.connections.insert(client_id, connection);
@@ -179,7 +236,10 @@ impl SctpTask {
 
         if let Some(connection) = self.connections.get_mut(&client_id) {
             if let Err(e) = connection.send(stream, buffer.data()).await {
-                error!("Failed to send message to AMF (client_id: {}): {}", client_id, e);
+                error!(
+                    "Failed to send message to AMF (client_id: {}): {}",
+                    client_id, e
+                );
                 // Connection may be broken, notify NGAP task
                 self.route_association_down(client_id).await;
                 self.connections.remove(&client_id);
@@ -245,7 +305,11 @@ impl SctpTask {
                 match connection.try_recv().await {
                     Ok(Some(event)) => {
                         match event {
-                            AmfConnectionEvent::MessageReceived { client_id, stream, data } => {
+                            AmfConnectionEvent::MessageReceived {
+                                client_id,
+                                stream,
+                                data,
+                            } => {
                                 self.route_ngap_pdu(client_id, stream, data).await;
                             }
                             AmfConnectionEvent::AssociationDown { client_id } => {
@@ -365,10 +429,16 @@ impl Task for SctpTask {
         }
 
         // Cleanup: close all connections
-        info!("SCTP task shutting down, closing {} connections", self.connections.len());
+        info!(
+            "SCTP task shutting down, closing {} connections",
+            self.connections.len()
+        );
         for (client_id, mut connection) in self.connections.drain() {
             if let Err(e) = connection.close().await {
-                warn!("Error closing connection {} during shutdown: {}", client_id, e);
+                warn!(
+                    "Error closing connection {} during shutdown: {}",
+                    client_id, e
+                );
             }
         }
 
@@ -395,7 +465,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,

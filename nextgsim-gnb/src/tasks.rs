@@ -50,8 +50,7 @@ pub use nextgsim_common::TaskMessage;
 /// Task lifecycle state.
 ///
 /// Based on UERANSIM's `NtsTask` lifecycle from `src/utils/nts.hpp`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TaskState {
     /// Task is created but not yet started
     #[default]
@@ -65,7 +64,6 @@ pub enum TaskState {
     /// Task terminated due to an error
     Failed,
 }
-
 
 impl std::fmt::Display for TaskState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -428,7 +426,6 @@ pub enum RrcMessage {
     // ========================================================================
     // 6G Message Routing (Rel-20 extensions)
     // ========================================================================
-
     /// AI/ML model inference request from UE (routed to SHE)
     SixgAiMlInference {
         /// UE ID
@@ -950,7 +947,8 @@ pub enum EnergyMessage {
     /// Get energy efficiency metrics for all cells
     GetMetrics {
         /// Response channel
-        response_tx: Option<tokio::sync::oneshot::Sender<Vec<crate::energy::task::CellEnergyReport>>>,
+        response_tx:
+            Option<tokio::sync::oneshot::Sender<Vec<crate::energy::task::CellEnergyReport>>>,
     },
 }
 
@@ -1378,7 +1376,11 @@ impl TaskManager {
     }
 
     /// Registers a join handle for a spawned task.
-    pub fn register_task_handle(&mut self, task_id: TaskId, handle: JoinHandle<Result<(), TaskError>>) {
+    pub fn register_task_handle(
+        &mut self,
+        task_id: TaskId,
+        handle: JoinHandle<Result<(), TaskError>>,
+    ) {
         self.join_handles.insert(task_id, handle);
     }
 
@@ -1480,7 +1482,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,
@@ -1673,12 +1677,30 @@ mod tests {
             TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
 
         // All tasks should start in Created state
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Ngap), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Rrc), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Gtp), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Rls), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Sctp), Some(TaskState::Created));
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Ngap),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Rrc),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Gtp),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Rls),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Sctp),
+            Some(TaskState::Created)
+        );
     }
 
     #[tokio::test]
@@ -1689,15 +1711,32 @@ mod tests {
 
         // Test state transitions
         manager.mark_task_started(TaskId::App);
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Running));
-        assert!(manager.get_task_info(TaskId::App).unwrap().started_at.is_some());
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Running)
+        );
+        assert!(manager
+            .get_task_info(TaskId::App)
+            .unwrap()
+            .started_at
+            .is_some());
 
         manager.mark_task_stopping(TaskId::App);
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Stopping));
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Stopping)
+        );
 
         manager.mark_task_stopped(TaskId::App);
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Stopped));
-        assert!(manager.get_task_info(TaskId::App).unwrap().stopped_at.is_some());
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Stopped)
+        );
+        assert!(manager
+            .get_task_info(TaskId::App)
+            .unwrap()
+            .stopped_at
+            .is_some());
     }
 
     #[tokio::test]
@@ -1709,7 +1748,10 @@ mod tests {
         manager.mark_task_started(TaskId::Ngap);
         manager.mark_task_failed(TaskId::Ngap, "Connection refused".to_string());
 
-        assert_eq!(manager.get_task_state(TaskId::Ngap), Some(TaskState::Failed));
+        assert_eq!(
+            manager.get_task_state(TaskId::Ngap),
+            Some(TaskState::Failed)
+        );
         assert!(manager.any_task_failed());
 
         let info = manager.get_task_info(TaskId::Ngap).unwrap();
@@ -1726,8 +1768,18 @@ mod tests {
 
         // Start all tasks (including 6G + Rel-18 tasks)
         for task_id in [
-            TaskId::App, TaskId::Ngap, TaskId::Rrc, TaskId::Gtp, TaskId::Rls, TaskId::Sctp,
-            TaskId::She, TaskId::Nwdaf, TaskId::Nkef, TaskId::Isac, TaskId::Agent, TaskId::FlAggregator,
+            TaskId::App,
+            TaskId::Ngap,
+            TaskId::Rrc,
+            TaskId::Gtp,
+            TaskId::Rls,
+            TaskId::Sctp,
+            TaskId::She,
+            TaskId::Nwdaf,
+            TaskId::Nkef,
+            TaskId::Isac,
+            TaskId::Agent,
+            TaskId::FlAggregator,
             TaskId::Energy,
         ] {
             manager.mark_task_started(task_id);
@@ -1759,8 +1811,14 @@ mod tests {
         assert_eq!(summary.len(), 13);
 
         // Find App and Ngap in summary
-        let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);
-        let ngap_state = summary.iter().find(|(id, _)| *id == TaskId::Ngap).map(|(_, s)| *s);
+        let app_state = summary
+            .iter()
+            .find(|(id, _)| *id == TaskId::App)
+            .map(|(_, s)| *s);
+        let ngap_state = summary
+            .iter()
+            .find(|(id, _)| *id == TaskId::Ngap)
+            .map(|(_, s)| *s);
 
         assert_eq!(app_state, Some(TaskState::Running));
         assert_eq!(ngap_state, Some(TaskState::Running));

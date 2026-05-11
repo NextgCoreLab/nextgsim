@@ -96,7 +96,6 @@ mod modification_complete_iei {
     pub const EXTENDED_PROTOCOL_CONFIG_OPTIONS: u8 = 0x7B;
 }
 
-
 // ============================================================================
 // PDU Session Modification Request (3GPP TS 24.501 Section 8.3.7)
 // ============================================================================
@@ -185,7 +184,8 @@ impl PduSessionModificationRequest {
                         break;
                     }
                     let cause_val = buf.get_u8();
-                    let cause = SmCause::try_from(cause_val).unwrap_or(SmCause::ProtocolErrorUnspecified);
+                    let cause =
+                        SmCause::try_from(cause_val).unwrap_or(SmCause::ProtocolErrorUnspecified);
                     msg.sm_cause = Some(Ie5gSmCause::new(cause));
                 }
                 modification_request_iei::MAX_PACKET_FILTERS => {
@@ -354,7 +354,6 @@ impl PduSessionModificationRequest {
     }
 }
 
-
 // ============================================================================
 // PDU Session Modification Reject (3GPP TS 24.501 Section 8.3.8)
 // ============================================================================
@@ -506,7 +505,6 @@ impl PduSessionModificationReject {
     }
 }
 
-
 // ============================================================================
 // PDU Session Modification Command (3GPP TS 24.501 Section 8.3.9)
 // ============================================================================
@@ -580,7 +578,8 @@ impl PduSessionModificationCommand {
                         break;
                     }
                     let cause_val = buf.get_u8();
-                    let cause = SmCause::try_from(cause_val).unwrap_or(SmCause::ProtocolErrorUnspecified);
+                    let cause =
+                        SmCause::try_from(cause_val).unwrap_or(SmCause::ProtocolErrorUnspecified);
                     msg.sm_cause = Some(Ie5gSmCause::new(cause));
                 }
                 modification_command_iei::SESSION_AMBR => {
@@ -733,7 +732,6 @@ impl PduSessionModificationCommand {
         SmMessageType::PduSessionModificationCommand
     }
 }
-
 
 // ============================================================================
 // PDU Session Modification Complete (3GPP TS 24.501 Section 8.3.10)
@@ -966,7 +964,6 @@ impl PduSessionModificationCommandReject {
     }
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -997,8 +994,8 @@ mod tests {
         // Header only: EPD (1) + PDU Session ID (1) + PTI (1) + Message Type (1) = 4 bytes
         assert_eq!(buf.len(), 4);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xC9); // Message Type
     }
 
@@ -1012,7 +1009,10 @@ mod tests {
 
         // Skip header (4 bytes) and decode
         let decoded = PduSessionModificationRequest::decode(&mut &buf[4..], 5, 1).unwrap();
-        assert_eq!(decoded.sm_cause.unwrap().value, SmCause::RegularDeactivation);
+        assert_eq!(
+            decoded.sm_cause.unwrap().value,
+            SmCause::RegularDeactivation
+        );
     }
 
     #[test]
@@ -1044,8 +1044,8 @@ mod tests {
         // Header (4) + Cause (1) = 5 bytes
         assert_eq!(buf.len(), 5);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xCA); // Message Type
         assert_eq!(buf[4], 0x1A); // Cause: InsufficientResources
     }
@@ -1091,8 +1091,8 @@ mod tests {
         // Header only: 4 bytes
         assert_eq!(buf.len(), 4);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xCB); // Message Type
     }
 
@@ -1106,7 +1106,10 @@ mod tests {
 
         // Skip header (4 bytes) and decode
         let decoded = PduSessionModificationCommand::decode(&mut &buf[4..], 5, 1).unwrap();
-        assert_eq!(decoded.sm_cause.unwrap().value, SmCause::ReactivationRequested);
+        assert_eq!(
+            decoded.sm_cause.unwrap().value,
+            SmCause::ReactivationRequested
+        );
     }
 
     #[test]
@@ -1138,8 +1141,8 @@ mod tests {
         // Header only: 4 bytes
         assert_eq!(buf.len(), 4);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xCC); // Message Type
     }
 
@@ -1181,7 +1184,8 @@ mod tests {
 
     #[test]
     fn test_modification_command_reject_new() {
-        let msg = PduSessionModificationCommandReject::new(5, 1, SmCause::SemanticallyIncorrectMessage);
+        let msg =
+            PduSessionModificationCommandReject::new(5, 1, SmCause::SemanticallyIncorrectMessage);
         assert_eq!(msg.pdu_session_id, 5);
         assert_eq!(msg.pti, 1);
         assert_eq!(msg.sm_cause.value, SmCause::SemanticallyIncorrectMessage);
@@ -1190,15 +1194,16 @@ mod tests {
 
     #[test]
     fn test_modification_command_reject_encode_minimal() {
-        let msg = PduSessionModificationCommandReject::new(5, 1, SmCause::SemanticallyIncorrectMessage);
+        let msg =
+            PduSessionModificationCommandReject::new(5, 1, SmCause::SemanticallyIncorrectMessage);
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 
         // Header (4) + Cause (1) = 5 bytes
         assert_eq!(buf.len(), 5);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xCD); // Message Type
         assert_eq!(buf[4], SmCause::SemanticallyIncorrectMessage as u8);
     }
@@ -1215,7 +1220,8 @@ mod tests {
 
     #[test]
     fn test_modification_command_reject_encode_decode_with_epco() {
-        let mut msg = PduSessionModificationCommandReject::new(5, 1, SmCause::ProtocolErrorUnspecified);
+        let mut msg =
+            PduSessionModificationCommandReject::new(5, 1, SmCause::ProtocolErrorUnspecified);
         msg.extended_protocol_config_options = Some(vec![0xAA, 0xBB]);
 
         let mut buf = Vec::new();
@@ -1223,7 +1229,10 @@ mod tests {
 
         let decoded = PduSessionModificationCommandReject::decode(&mut &buf[4..], 5, 1).unwrap();
         assert_eq!(decoded.cause(), SmCause::ProtocolErrorUnspecified);
-        assert_eq!(decoded.extended_protocol_config_options, Some(vec![0xAA, 0xBB]));
+        assert_eq!(
+            decoded.extended_protocol_config_options,
+            Some(vec![0xAA, 0xBB])
+        );
     }
 
     #[test]

@@ -72,7 +72,6 @@ mod release_complete_iei {
     pub const SM_CAUSE: u8 = 0x59;
 }
 
-
 // ============================================================================
 // PDU Session Release Request (3GPP TS 24.501 Section 8.3.12)
 // ============================================================================
@@ -124,8 +123,8 @@ impl PduSessionReleaseRequest {
                         break;
                     }
                     let cause_val = buf.get_u8();
-                    let cause = SmCause::try_from(cause_val)
-                        .unwrap_or(SmCause::ProtocolErrorUnspecified);
+                    let cause =
+                        SmCause::try_from(cause_val).unwrap_or(SmCause::ProtocolErrorUnspecified);
                     msg.sm_cause = Some(Ie5gSmCause::new(cause));
                 }
                 release_request_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS => {
@@ -185,7 +184,6 @@ impl PduSessionReleaseRequest {
         SmMessageType::PduSessionReleaseRequest
     }
 }
-
 
 // ============================================================================
 // PDU Session Release Reject (3GPP TS 24.501 Section 8.3.13)
@@ -314,7 +312,6 @@ impl PduSessionReleaseReject {
         self.sm_cause.value
     }
 }
-
 
 // ============================================================================
 // PDU Session Release Command (3GPP TS 24.501 Section 8.3.14)
@@ -489,7 +486,6 @@ impl PduSessionReleaseCommand {
     }
 }
 
-
 // ============================================================================
 // PDU Session Release Complete (3GPP TS 24.501 Section 8.3.15)
 // ============================================================================
@@ -555,8 +551,8 @@ impl PduSessionReleaseComplete {
                         break;
                     }
                     let cause_val = buf.get_u8();
-                    let cause = SmCause::try_from(cause_val)
-                        .unwrap_or(SmCause::ProtocolErrorUnspecified);
+                    let cause =
+                        SmCause::try_from(cause_val).unwrap_or(SmCause::ProtocolErrorUnspecified);
                     msg.sm_cause = Some(Ie5gSmCause::new(cause));
                 }
                 _ => {
@@ -604,7 +600,6 @@ impl PduSessionReleaseComplete {
     }
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -635,8 +630,8 @@ mod tests {
         // Header only: EPD (1) + PDU Session ID (1) + PTI (1) + Message Type (1) = 4 bytes
         assert_eq!(buf.len(), 4);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xD1); // Message Type
     }
 
@@ -650,7 +645,10 @@ mod tests {
 
         // Skip header (4 bytes) and decode
         let decoded = PduSessionReleaseRequest::decode(&mut &buf[4..], 5, 1).unwrap();
-        assert_eq!(decoded.sm_cause.unwrap().value, SmCause::RegularDeactivation);
+        assert_eq!(
+            decoded.sm_cause.unwrap().value,
+            SmCause::RegularDeactivation
+        );
     }
 
     #[test]
@@ -704,8 +702,8 @@ mod tests {
         // Header (4) + Cause (1) = 5 bytes
         assert_eq!(buf.len(), 5);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xD2); // Message Type
         assert_eq!(buf[4], SmCause::InsufficientResources as u8); // Cause
     }
@@ -730,7 +728,10 @@ mod tests {
 
         let decoded = PduSessionReleaseReject::decode(&mut &buf[4..], 5, 1).unwrap();
         assert_eq!(decoded.cause(), SmCause::NetworkFailure);
-        assert_eq!(decoded.extended_protocol_config_options, Some(vec![0xAA, 0xBB]));
+        assert_eq!(
+            decoded.extended_protocol_config_options,
+            Some(vec![0xAA, 0xBB])
+        );
     }
 
     #[test]
@@ -764,8 +765,8 @@ mod tests {
         // Header (4) + Cause (1) = 5 bytes
         assert_eq!(buf.len(), 5);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xD3); // Message Type
         assert_eq!(buf[4], SmCause::RegularDeactivation as u8); // Cause
     }
@@ -835,8 +836,8 @@ mod tests {
         // Header only: 4 bytes
         assert_eq!(buf.len(), 4);
         assert_eq!(buf[0], 0x2E); // EPD
-        assert_eq!(buf[1], 5);    // PDU Session ID
-        assert_eq!(buf[2], 1);    // PTI
+        assert_eq!(buf[1], 5); // PDU Session ID
+        assert_eq!(buf[2], 1); // PTI
         assert_eq!(buf[3], 0xD4); // Message Type
     }
 
@@ -864,7 +865,10 @@ mod tests {
         msg.encode(&mut buf);
 
         let decoded = PduSessionReleaseComplete::decode(&mut &buf[4..], 5, 1).unwrap();
-        assert_eq!(decoded.sm_cause.unwrap().value, SmCause::RegularDeactivation);
+        assert_eq!(
+            decoded.sm_cause.unwrap().value,
+            SmCause::RegularDeactivation
+        );
     }
 
     #[test]

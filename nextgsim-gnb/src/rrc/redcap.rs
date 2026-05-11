@@ -209,7 +209,9 @@ impl RedCapRrcConfig {
 
         let relaxed_processing = if capabilities.reduced_processing_time {
             // Rel-18 RedCap gets extended T_proc for ultra-low complexity
-            let extended_t_proc = if capabilities.redcap_release == RedCapRelease::Rel18 && capabilities.max_bandwidth_mhz <= 5 {
+            let extended_t_proc = if capabilities.redcap_release == RedCapRelease::Rel18
+                && capabilities.max_bandwidth_mhz <= 5
+            {
                 Some(8) // 8ms extended processing time for Rel-18 5MHz variant
             } else {
                 None
@@ -233,7 +235,7 @@ impl RedCapRrcConfig {
         let edrx_config = if capabilities.redcap_release == RedCapRelease::Rel18 {
             Some(EDrxConfig {
                 edrx_cycle_s: 20.48, // 20.48s eDRX cycle for wearables/sensors
-                ptw_s: 2.56,          // 2.56s Paging Time Window
+                ptw_s: 2.56,         // 2.56s Paging Time Window
                 skip_paging_allowed: true,
             })
         } else {
@@ -314,7 +316,9 @@ impl RedCapProcessor {
 
     /// Gets applied restrictions
     pub fn get_restrictions(&self) -> Option<RedCapRestrictions> {
-        self.config.as_ref().map(RedCapRrcConfig::apply_restrictions)
+        self.config
+            .as_ref()
+            .map(RedCapRrcConfig::apply_restrictions)
     }
 
     /// Applies bandwidth restriction to a measurement

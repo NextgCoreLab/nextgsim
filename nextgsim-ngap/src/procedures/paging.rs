@@ -56,7 +56,6 @@ pub enum PagingPriorityValue {
     PrioLevel8,
 }
 
-
 impl From<PagingPriorityValue> for PagingPriority {
     fn from(priority: PagingPriorityValue) -> Self {
         let value = match priority {
@@ -161,7 +160,6 @@ impl TryFrom<PagingDRX> for PagingDrxValue {
         }
     }
 }
-
 
 /// UE Paging Identity - identifies the UE to be paged
 #[derive(Debug, Clone)]
@@ -270,7 +268,6 @@ pub fn build_paging(params: &PagingParams) -> Result<NGAP_PDU, PagingError> {
 
     Ok(NGAP_PDU::InitiatingMessage(initiating_message))
 }
-
 
 fn build_ue_paging_identity(identity: &UePagingIdentityValue) -> UEPagingIdentity {
     match identity {
@@ -387,8 +384,9 @@ pub fn parse_paging(pdu: &NGAP_PDU) -> Result<PagingData, PagingError> {
     })
 }
 
-
-fn parse_ue_paging_identity(identity: &UEPagingIdentity) -> Result<UePagingIdentityValue, PagingError> {
+fn parse_ue_paging_identity(
+    identity: &UEPagingIdentity,
+) -> Result<UePagingIdentityValue, PagingError> {
     match identity {
         UEPagingIdentity::FiveG_S_TMSI(tmsi) => {
             Ok(UePagingIdentityValue::FiveGSTmsi(parse_five_g_s_tmsi(tmsi)))
@@ -441,10 +439,7 @@ fn parse_five_g_s_tmsi(tmsi: &FiveG_S_TMSI) -> FiveGSTmsi {
 }
 
 fn parse_tai_list_for_paging(list: &TAIListForPaging) -> Vec<Tai> {
-    list.0
-        .iter()
-        .map(|item| parse_tai(&item.tai))
-        .collect()
+    list.0.iter().map(|item| parse_tai(&item.tai)).collect()
 }
 
 // ============================================================================
@@ -485,7 +480,6 @@ pub fn is_paging(pdu: &NGAP_PDU) -> bool {
             if matches!(msg.value, InitiatingMessageValue::Id_Paging(_))
     )
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -580,7 +574,10 @@ mod tests {
             }
         }
 
-        assert_eq!(parsed.tai_list_for_paging.len(), params.tai_list_for_paging.len());
+        assert_eq!(
+            parsed.tai_list_for_paging.len(),
+            params.tai_list_for_paging.len()
+        );
         assert_eq!(
             parsed.tai_list_for_paging[0].plmn_identity,
             params.tai_list_for_paging[0].plmn_identity
@@ -602,7 +599,10 @@ mod tests {
         let parsed = decode_paging(&encoded).expect("Failed to decode and parse");
 
         assert_eq!(parsed.paging_drx, Some(PagingDrxValue::V128));
-        assert_eq!(parsed.paging_priority, Some(PagingPriorityValue::PrioLevel1));
+        assert_eq!(
+            parsed.paging_priority,
+            Some(PagingPriorityValue::PrioLevel1)
+        );
         assert_eq!(parsed.paging_origin, Some(PagingOriginValue::Non3gpp));
     }
 

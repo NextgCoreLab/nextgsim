@@ -146,9 +146,7 @@ pub struct IsacSemanticCompressor {
 impl IsacSemanticCompressor {
     /// Creates a new ISAC semantic compressor
     pub fn new() -> Self {
-        Self {
-            next_request_id: 1,
-        }
+        Self { next_request_id: 1 }
     }
 
     /// Compresses sensing measurements
@@ -183,7 +181,8 @@ impl IsacSemanticCompressor {
         for i in 0..num_features {
             let start = i * chunk_size;
             let end = ((i + 1) * chunk_size).min(measurements.len());
-            let chunk_mean: f32 = measurements[start..end].iter().sum::<f32>() / (end - start) as f32;
+            let chunk_mean: f32 =
+                measurements[start..end].iter().sum::<f32>() / (end - start) as f32;
             compressed.push(chunk_mean);
         }
 
@@ -419,8 +418,11 @@ mod tests {
 
         let grid_dimensions = vec![10, 10];
 
-        let result =
-            compressor.compress_environment_map(occupancy_grid, grid_dimensions, SensingCompressionParams::default());
+        let result = compressor.compress_environment_map(
+            occupancy_grid,
+            grid_dimensions,
+            SensingCompressionParams::default(),
+        );
 
         assert_eq!(result.request_id, 1);
         assert!(result.compression_stats.compression_ratio > 1.0);

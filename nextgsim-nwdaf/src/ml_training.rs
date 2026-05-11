@@ -272,7 +272,10 @@ impl MlModelTrainingService {
         };
 
         // Estimate completion time based on epochs and dataset size
-        let dataset = self.datasets.get(&request.dataset_id).expect("value expected");
+        let dataset = self
+            .datasets
+            .get(&request.dataset_id)
+            .expect("value expected");
         let samples_per_sec = 1000; // Simplified estimate
         let estimated_time_sec = (dataset.len() * request.config.epochs as usize) / samples_per_sec;
         let estimated_completion_ms = Some(now_ms + (estimated_time_sec as u64 * 1000));
@@ -317,7 +320,11 @@ impl MlModelTrainingService {
         job.progress = epoch as f32 / job.request.config.epochs as f32;
         job.status = TrainingStatus::InProgress;
 
-        debug!("Updated training job {} progress: {:.2}%", job_id, job.progress * 100.0);
+        debug!(
+            "Updated training job {} progress: {:.2}%",
+            job_id,
+            job.progress * 100.0
+        );
 
         Ok(())
     }
@@ -374,7 +381,12 @@ impl MlModelTrainingService {
     pub fn active_job_count(&self) -> usize {
         self.jobs
             .values()
-            .filter(|j| matches!(j.status, TrainingStatus::Queued | TrainingStatus::InProgress))
+            .filter(|j| {
+                matches!(
+                    j.status,
+                    TrainingStatus::Queued | TrainingStatus::InProgress
+                )
+            })
             .count()
     }
 }
@@ -489,8 +501,11 @@ impl DistributedTrainingCoordinator {
             global_weights: Vec::new(),
         };
         self.rounds.insert(self.current_round, round);
-        info!("DistributedTraining: Started round {} with {} participants",
-            self.current_round, self.participants.len());
+        info!(
+            "DistributedTraining: Started round {} with {} participants",
+            self.current_round,
+            self.participants.len()
+        );
         self.current_round
     }
 
@@ -512,8 +527,10 @@ impl DistributedTrainingCoordinator {
             ));
         }
 
-        debug!("DistributedTraining: Received update from {} for round {} (loss={:.4})",
-            update.nwdaf_id, update.round, update.loss);
+        debug!(
+            "DistributedTraining: Received update from {} for round {} (loss={:.4})",
+            update.nwdaf_id, update.round, update.loss
+        );
         round.updates.push(update);
 
         let should_aggregate = round.updates.len() >= round.expected_participants;
@@ -580,10 +597,14 @@ impl DistributedTrainingCoordinator {
         round.aggregated = true;
         round.global_weights = self.global_weights.clone();
 
-        let avg_loss: f64 = round.updates.iter().map(|u| u.loss).sum::<f64>()
-            / round.updates.len() as f64;
-        info!("DistributedTraining: Round {} aggregated ({} updates, avg_loss={:.4})",
-            round_num, round.updates.len(), avg_loss);
+        let avg_loss: f64 =
+            round.updates.iter().map(|u| u.loss).sum::<f64>() / round.updates.len() as f64;
+        info!(
+            "DistributedTraining: Round {} aggregated ({} updates, avg_loss={:.4})",
+            round_num,
+            round.updates.len(),
+            avg_loss
+        );
 
         Ok(())
     }
@@ -640,7 +661,10 @@ impl DistributedTrainingCoordinator {
             let noise = noise_scale * (seed.sin() * 2.0 - 1.0) * 0.01;
             self.global_weights[i] += noise;
         }
-        info!("DistributedTraining: Applied differential privacy noise (scale={:.4})", noise_scale);
+        info!(
+            "DistributedTraining: Applied differential privacy noise (scale={:.4})",
+            noise_scale
+        );
     }
 
     /// Compress model updates using top-K sparsification.
@@ -796,7 +820,9 @@ mod tests {
             best_val_loss: Some(0.6),
         };
 
-        service.update_job_progress(&job_id, 5, metrics.clone()).unwrap();
+        service
+            .update_job_progress(&job_id, 5, metrics.clone())
+            .unwrap();
 
         let job = service.get_job_status(&job_id).unwrap();
         assert_eq!(job.status, TrainingStatus::InProgress);
@@ -869,7 +895,9 @@ mod tests {
         let original: Vec<f64> = coord.global_weights().to_vec();
         coord.apply_differential_privacy(1.0);
         // Weights should be slightly different after noise
-        let changed = coord.global_weights().iter()
+        let changed = coord
+            .global_weights()
+            .iter()
             .zip(original.iter())
             .any(|(a, b)| (a - b).abs() > 1e-10);
         assert!(changed);
@@ -887,7 +915,11 @@ mod tests {
 
         DistributedTrainingCoordinator::compress_update(&mut update, 0.25);
         // Only top 25% (2 values) should remain non-zero
-        let non_zero = update.weight_deltas.iter().filter(|v| v.abs() > 0.0).count();
+        let non_zero = update
+            .weight_deltas
+            .iter()
+            .filter(|v| v.abs() > 0.0)
+            .count();
         assert!(non_zero <= 3); // Some tolerance due to ties
     }
 }

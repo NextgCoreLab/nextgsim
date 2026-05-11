@@ -18,7 +18,9 @@
 //!
 //! Based on 3GPP TS 24.501 and UERANSIM's `src/ue/nas/sm/procedure.cpp`.
 
-use crate::timer::{UeTimer, DEFAULT_T3580_INTERVAL, DEFAULT_T3581_INTERVAL, DEFAULT_T3582_INTERVAL};
+use crate::timer::{
+    UeTimer, DEFAULT_T3580_INTERVAL, DEFAULT_T3581_INTERVAL, DEFAULT_T3582_INTERVAL,
+};
 use std::fmt;
 
 /// Minimum valid PTI value (1)
@@ -458,7 +460,11 @@ mod tests {
     #[test]
     fn test_procedure_transaction_start() {
         let mut pt = ProcedureTransaction::new(10);
-        pt.start(3, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+        pt.start(
+            3,
+            SmMessageType::PduSessionEstablishmentRequest,
+            SM_TIMER_T3580,
+        );
 
         assert!(pt.is_pending());
         assert_eq!(pt.psi(), 3);
@@ -473,7 +479,11 @@ mod tests {
     #[test]
     fn test_procedure_transaction_reset() {
         let mut pt = ProcedureTransaction::new(10);
-        pt.start(3, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+        pt.start(
+            3,
+            SmMessageType::PduSessionEstablishmentRequest,
+            SM_TIMER_T3580,
+        );
         pt.reset();
 
         assert!(pt.is_inactive());
@@ -492,7 +502,11 @@ mod tests {
 
         // Mark it as pending
         if let Some(pt) = manager.get_mut(1) {
-            pt.start(1, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                1,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         // Second allocation should return PTI 2
@@ -506,7 +520,11 @@ mod tests {
 
         let pti = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti) {
-            pt.start(1, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                1,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         assert!(manager.get(pti).unwrap().is_pending());
@@ -521,14 +539,15 @@ mod tests {
 
         let pti = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti) {
-            pt.start(5, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                5,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         // Valid case
-        assert_eq!(
-            manager.validate_pti_psi(pti, 5),
-            PtiValidationResult::Valid
-        );
+        assert_eq!(manager.validate_pti_psi(pti, 5), PtiValidationResult::Valid);
 
         // Invalid PTI
         assert_eq!(
@@ -553,7 +572,11 @@ mod tests {
         // Create two procedures for PSI 5
         let pti1 = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti1) {
-            pt.start(5, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                5,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         let pti2 = manager.allocate().unwrap();
@@ -564,7 +587,11 @@ mod tests {
         // Create one for PSI 3
         let pti3 = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti3) {
-            pt.start(3, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                3,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         let found = manager.find_by_psi(5);
@@ -579,7 +606,11 @@ mod tests {
 
         let pti = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti) {
-            pt.start(5, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                5,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         let result = manager.abort(pti);
@@ -597,7 +628,11 @@ mod tests {
         // Create two procedures for PSI 5
         let pti1 = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti1) {
-            pt.start(5, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                5,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         let pti2 = manager.allocate().unwrap();
@@ -621,7 +656,11 @@ mod tests {
 
         let pti1 = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti1) {
-            pt.start(1, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                1,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         assert_eq!(manager.pending_count(), 1);
@@ -641,7 +680,11 @@ mod tests {
 
         let pti1 = manager.allocate().unwrap();
         if let Some(pt) = manager.get_mut(pti1) {
-            pt.start(1, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                1,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         let pti2 = manager.allocate().unwrap();

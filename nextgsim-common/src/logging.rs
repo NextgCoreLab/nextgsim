@@ -75,8 +75,8 @@ impl std::str::FromStr for LogLevel {
 /// init_logging(LogLevel::Debug);
 /// ```
 pub fn init_logging(level: LogLevel) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level.to_string()));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_string()));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -99,8 +99,7 @@ pub fn init_logging(level: LogLevel) {
 /// init_logging_with_filter("info,nextgsim_nas=debug");
 /// ```
 pub fn init_logging_with_filter(filter: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(filter));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

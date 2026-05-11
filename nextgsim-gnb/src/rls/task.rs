@@ -14,13 +14,13 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::tasks::{
-    GnbTaskBase, GtpMessage, RlsMessage, RrcMessage, Task, TaskMessage,
-};
+use crate::tasks::{GnbTaskBase, GtpMessage, RlsMessage, RrcMessage, Task, TaskMessage};
 use nextgsim_common::OctetString;
+use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
-    codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck, RlsMessage as RlsProtocolMessage,
-    RlsPduTransmission, RlsPduTransmissionAck, RrcChannel, Vector3,
+    codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
+    RlsMessage as RlsProtocolMessage, RlsPduTransmission, RlsPduTransmissionAck, RrcChannel,
+    Vector3,
 };
 
 /// Default RLS port for gNB
@@ -50,6 +50,9 @@ pub struct RlsTask {
     socket: Option<Arc<UdpSocket>>,
     /// Local bind address
     bind_address: SocketAddr,
+    /// RLC entities keyed by UE ID.
+    /// Each entry is the primary DRB entity (UM, SN12) used for user-plane data.
+    rlc_entities: HashMap<i32, RlcEntity>,
 }
 
 impl RlsTask {
@@ -58,7 +61,7 @@ impl RlsTask {
         // Generate STI from gNB NCI
         let sti = task_base.config.nci;
         let phy_location = Vector3::new(0, 0, 0);
-        
+
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
 
@@ -71,6 +74,7 @@ impl RlsTask {
             sti,
             socket: None,
             bind_address,
+            rlc_entities: HashMap::new(),
         }
     }
 
@@ -88,7 +92,15 @@ impl RlsTask {
             sti,
             socket: None,
             bind_address,
+            rlc_entities: HashMap::new(),
         }
+    }
+
+    /// Returns the RLC entity for a UE, creating a default UM DRB entity if absent.
+    fn rlc_entity_for(&mut self, ue_id: i32) -> &mut RlcEntity {
+        self.rlc_entities
+            .entry(ue_id)
+            .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
     }
 
     /// Initializes the UDP socket
@@ -102,7 +114,7 @@ impl RlsTask {
     /// Handles a received RLS message from the network
     async fn handle_receive_rls_message(&mut self, data: OctetString, source: SocketAddr) {
         let bytes = Bytes::copy_from_slice(data.data());
-        
+
         match codec::decode(&bytes) {
             Ok(msg) => {
                 self.process_rls_message(msg, source).await;
@@ -117,7 +129,8 @@ impl RlsTask {
     async fn process_rls_message(&mut self, msg: RlsProtocolMessage, source: SocketAddr) {
         match msg {
             RlsProtocolMessage::Heartbeat(heartbeat) => {
-                self.handle_heartbeat(heartbeat.sti, source, &heartbeat).await;
+                self.handle_heartbeat(heartbeat.sti, source, &heartbeat)
+                    .await;
             }
             RlsProtocolMessage::PduTransmission(pdu) => {
                 self.handle_pdu_transmission(pdu.sti, source, &pdu).await;
@@ -149,11 +162,14 @@ impl RlsTask {
                     let ue_id_i32 = ue_id as i32;
                     self.ue_addresses.insert(ue_id_i32, source);
                     self.sti_to_ue_id.insert(sti, ue_id_i32);
-                    
+
                     // Notify RRC task about signal detection
-                    if let Err(e) = self.task_base.rrc_tx.send(RrcMessage::SignalDetected { 
-                        ue_id: ue_id_i32 
-                    }).await {
+                    if let Err(e) = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::SignalDetected { ue_id: ue_id_i32 })
+                        .await
+                    {
                         error!("Failed to send SignalDetected to RRC: {}", e);
                     }
                 }
@@ -199,10 +215,7 @@ impl RlsTask {
 
         // Queue acknowledgment if PDU ID is non-zero
         if pdu.pdu_id != 0 {
-            self.pending_acks
-                .entry(ue_id)
-                .or_default()
-                .push(pdu.pdu_id);
+            self.pending_acks.entry(ue_id).or_default().push(pdu.pdu_id);
         }
 
         match pdu.pdu_type {
@@ -248,27 +261,49 @@ impl RlsTask {
         }
     }
 
-    /// Handles uplink user plane data from UE
-    async fn handle_uplink_data(&self, ue_id: i32, pdu: &RlsPduTransmission) {
+    /// Handles uplink user plane data from UE.
+    ///
+    /// The raw bytes arriving over RLS are an RLC PDU (UM, SN12).  They are
+    /// fed into the per-UE RLC entity for reassembly; only complete SDUs are
+    /// forwarded to the GTP task.
+    async fn handle_uplink_data(&mut self, ue_id: i32, pdu: &RlsPduTransmission) {
         let psi = pdu.payload as i32;
-        
+
         debug!(
-            "Uplink data: ue_id={}, psi={}, len={}",
+            "Uplink data (RLC): ue_id={}, psi={}, len={}",
             ue_id,
             psi,
             pdu.pdu.len()
         );
 
-        // Forward to GTP task
-        let data = OctetString::from_slice(&pdu.pdu);
-        let msg = GtpMessage::DataPduDelivery {
-            ue_id,
-            psi,
-            pdu: data,
+        // Feed the RLC PDU into the entity and collect any reassembled SDUs,
+        // releasing the mutable borrow before the async send below.
+        let reassembled_sdus = {
+            let rlc = self.rlc_entity_for(ue_id);
+            rlc.receive_pdu(&pdu.pdu);
+            let mut sdus = Vec::new();
+            while let Some(sdu) = rlc.poll_reassembled() {
+                sdus.push(sdu);
+            }
+            sdus
         };
 
-        if let Err(e) = self.task_base.gtp_tx.send(msg).await {
-            error!("Failed to send uplink data to GTP task: {}", e);
+        for sdu in reassembled_sdus {
+            debug!(
+                "RLC reassembled SDU: ue_id={}, psi={}, len={}",
+                ue_id,
+                psi,
+                sdu.len()
+            );
+            let data = OctetString::from_slice(&sdu);
+            let msg = GtpMessage::DataPduDelivery {
+                ue_id,
+                psi,
+                pdu: data,
+            };
+            if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                error!("Failed to send uplink data to GTP task: {}", e);
+            }
         }
     }
 
@@ -314,7 +349,12 @@ impl RlsTask {
         self.send_rls_message(dest, &msg).await;
     }
 
-    /// Handles downlink user plane data from GTP task
+    /// Handles downlink user plane data from GTP task.
+    ///
+    /// The SDU from GTP is submitted to the per-UE RLC entity (UM, SN12).
+    /// One or more RLC PDUs are then built and sent over RLS to the UE.
+    /// A 1500-byte MTU is used as the MAC grant size so that typical IP
+    /// packets fit in a single PDU.
     async fn handle_downlink_data(&mut self, ue_id: i32, psi: i32, data: OctetString) {
         let dest = match self.ue_addresses.get(&ue_id) {
             Some(&addr) => addr,
@@ -325,22 +365,37 @@ impl RlsTask {
         };
 
         debug!(
-            "Downlink data: ue_id={}, psi={}, len={}",
+            "Downlink data (RLC): ue_id={}, psi={}, len={}",
             ue_id,
             psi,
             data.len()
         );
 
-        let pdu = RlsPduTransmission {
-            sti: self.sti,
-            pdu_type: PduType::Data,
-            pdu_id: 0, // Data PDUs don't require acknowledgment
-            payload: psi as u32,
-            pdu: Bytes::copy_from_slice(data.data()),
+        // Submit SDU to RLC and collect all resulting PDUs before releasing
+        // the mutable borrow so that self.sti and self.socket are accessible
+        // again for transmission.
+        let rlc_pdus = {
+            let rlc = self.rlc_entity_for(ue_id);
+            rlc.submit_sdu(data.data().to_vec());
+            let mut pdus = Vec::new();
+            while let Some(rlc_pdu) = rlc.build_pdu(1500) {
+                pdus.push(rlc_pdu);
+            }
+            pdus
         };
 
-        let msg = RlsProtocolMessage::PduTransmission(pdu);
-        self.send_rls_message(dest, &msg).await;
+        let sti = self.sti;
+        for rlc_pdu in rlc_pdus {
+            let transmission = RlsPduTransmission {
+                sti,
+                pdu_type: PduType::Data,
+                pdu_id: 0, // Data PDUs don't require RLS acknowledgment
+                payload: psi as u32,
+                pdu: Bytes::from(rlc_pdu),
+            };
+            let msg = RlsProtocolMessage::PduTransmission(transmission);
+            self.send_rls_message(dest, &msg).await;
+        }
     }
 
     /// Sends an RLS message to a destination
@@ -387,17 +442,18 @@ impl RlsTask {
             if let GnbTrackerEvent::UeLost { ue_id } = event {
                 let ue_id_i32 = ue_id as i32;
                 info!("UE[{}] lost due to heartbeat timeout", ue_id_i32);
-                
+
                 self.ue_addresses.remove(&ue_id_i32);
                 self.pending_acks.remove(&ue_id_i32);
-                
+
                 // Find and remove STI mapping
-                let sti_to_remove: Vec<u64> = self.sti_to_ue_id
+                let sti_to_remove: Vec<u64> = self
+                    .sti_to_ue_id
                     .iter()
                     .filter(|(_, &id)| id == ue_id_i32)
                     .map(|(&sti, _)| sti)
                     .collect();
-                
+
                 for sti in sti_to_remove {
                     self.sti_to_ue_id.remove(&sti);
                 }
@@ -410,7 +466,7 @@ impl RlsTask {
     async fn receive_udp(&self) -> Option<(OctetString, SocketAddr)> {
         let socket = self.socket.as_ref()?;
         let mut buf = vec![0u8; UDP_BUFFER_SIZE];
-        
+
         match socket.recv_from(&mut buf).await {
             Ok((len, addr)) => {
                 buf.truncate(len);
@@ -518,7 +574,10 @@ impl Task for RlsTask {
             }
         }
 
-        info!("RLS task stopped with {} tracked UEs", self.cell_tracker.ue_count());
+        info!(
+            "RLS task stopped with {} tracked UEs",
+            self.cell_tracker.ue_count()
+        );
     }
 }
 
@@ -540,7 +599,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,
@@ -557,7 +618,7 @@ mod tests {
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
         let task = RlsTask::new(task_base);
-        
+
         assert_eq!(task.sti, 0x000000010);
         assert!(task.ue_addresses.is_empty());
         assert!(task.sti_to_ue_id.is_empty());
@@ -568,10 +629,10 @@ mod tests {
         let config = test_config();
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
-        
+
         let bind_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let task = RlsTask::with_bind_address(task_base, bind_addr);
-        
+
         assert_eq!(task.bind_address, bind_addr);
     }
 }

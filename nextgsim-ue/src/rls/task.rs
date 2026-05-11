@@ -14,8 +14,9 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::tasks::{NasMessage, RlsMessage, RrcMessage, RlfCause, Task, TaskMessage, UeTaskBase};
+use crate::tasks::{NasMessage, RlfCause, RlsMessage, RrcMessage, Task, TaskMessage, UeTaskBase};
 use nextgsim_common::OctetString;
+use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
     codec, CellSearchEvent, RlsMessage as RlsProtocolMessage, RlsTransport, RrcChannel,
     TransportEvent, UeCellSearch,
@@ -58,13 +59,24 @@ pub struct RlsTask {
     socket: Option<Arc<UdpSocket>>,
     config: RlsTaskConfig,
     sti: u64,
+    /// RLC entities keyed by PSI (PDU Session ID).
+    /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
+    rlc_entities: HashMap<i32, RlcEntity>,
 }
 
 impl RlsTask {
     pub fn new(task_base: UeTaskBase, config: RlsTaskConfig) -> Self {
         let sti = rand::random::<u64>();
-        let search_space: Vec<SocketAddr> = config.gnb_search_list.iter()
-            .map(|addr| if addr.port() == 0 { SocketAddr::new(addr.ip(), DEFAULT_RLS_PORT) } else { *addr })
+        let search_space: Vec<SocketAddr> = config
+            .gnb_search_list
+            .iter()
+            .map(|addr| {
+                if addr.port() == 0 {
+                    SocketAddr::new(addr.ip(), DEFAULT_RLS_PORT)
+                } else {
+                    *addr
+                }
+            })
             .collect();
 
         let mut cell_search = UeCellSearch::new(sti, search_space);
@@ -80,23 +92,44 @@ impl RlsTask {
             socket: None,
             config,
             sti,
+            rlc_entities: HashMap::new(),
         }
     }
 
     pub fn from_ue_config(task_base: UeTaskBase) -> Self {
-        let gnb_search_list: Vec<SocketAddr> = task_base.config.gnb_search_list.iter()
+        let gnb_search_list: Vec<SocketAddr> = task_base
+            .config
+            .gnb_search_list
+            .iter()
             .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
             .map(|ip| SocketAddr::new(ip, DEFAULT_RLS_PORT))
             .collect();
-        let config = RlsTaskConfig { gnb_search_list, ..Default::default() };
+        let config = RlsTaskConfig {
+            gnb_search_list,
+            ..Default::default()
+        };
         Self::new(task_base, config)
     }
 
-    pub fn cell_count(&self) -> usize { self.cell_search.cell_count() }
-    pub fn serving_cell(&self) -> Option<i32> { self.serving_cell }
+    pub fn cell_count(&self) -> usize {
+        self.cell_search.cell_count()
+    }
+    pub fn serving_cell(&self) -> Option<i32> {
+        self.serving_cell
+    }
+
+    /// Returns the RLC entity for a PSI bearer, creating a UM SN12 entity on first use.
+    fn rlc_entity_for(&mut self, psi: i32) -> &mut RlcEntity {
+        self.rlc_entities
+            .entry(psi)
+            .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
+    }
 
     async fn init_socket(&mut self) -> Result<(), std::io::Error> {
-        let bind_addr = self.config.bind_address.unwrap_or_else(|| "0.0.0.0:0".parse().expect("value expected"));
+        let bind_addr = self
+            .config
+            .bind_address
+            .unwrap_or_else(|| "0.0.0.0:0".parse().expect("value expected"));
         let socket = UdpSocket::bind(bind_addr).await?;
         info!("RLS task bound to {}", socket.local_addr()?);
         self.socket = Some(Arc::new(socket));
@@ -104,9 +137,12 @@ impl RlsTask {
     }
 
     async fn send_heartbeats(&mut self) {
-        if !self.cell_search.should_send_heartbeats() { return; }
+        if !self.cell_search.should_send_heartbeats() {
+            return;
+        }
         for (addr, heartbeat) in self.cell_search.create_heartbeats() {
-            self.send_rls_message(addr, &RlsProtocolMessage::Heartbeat(heartbeat)).await;
+            self.send_rls_message(addr, &RlsProtocolMessage::Heartbeat(heartbeat))
+                .await;
         }
     }
 
@@ -118,9 +154,13 @@ impl RlsTask {
                 if self.serving_cell == Some(cell_id as i32) {
                     self.serving_cell = None;
                     self.transport.clear_serving_endpoint();
-                    let _ = self.task_base.rrc_tx.send(RrcMessage::RadioLinkFailure {
-                        cause: RlfCause::SignalLostToConnectedCell,
-                    }).await;
+                    let _ = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::RadioLinkFailure {
+                            cause: RlfCause::SignalLostToConnectedCell,
+                        })
+                        .await;
                 }
             }
         }
@@ -129,7 +169,8 @@ impl RlsTask {
     async fn send_pending_acks(&mut self) {
         for (endpoint_id, ack) in self.transport.create_pending_acks() {
             if let Some(&addr) = self.cell_addresses.get(&(endpoint_id as i32)) {
-                self.send_rls_message(addr, &RlsProtocolMessage::PduTransmissionAck(ack)).await;
+                self.send_rls_message(addr, &RlsProtocolMessage::PduTransmissionAck(ack))
+                    .await;
             }
         }
     }
@@ -160,23 +201,50 @@ impl RlsTask {
     async fn process_rls_message(&mut self, msg: RlsProtocolMessage, source: SocketAddr) {
         match msg {
             RlsProtocolMessage::HeartbeatAck(ack) => self.handle_heartbeat_ack(source, &ack).await,
-            RlsProtocolMessage::PduTransmission(pdu) => self.handle_pdu_transmission(source, &pdu).await,
+            RlsProtocolMessage::PduTransmission(pdu) => {
+                self.handle_pdu_transmission(source, &pdu).await
+            }
             RlsProtocolMessage::PduTransmissionAck(ack) => self.transport.process_pdu_ack(&ack),
             RlsProtocolMessage::Heartbeat(_) => debug!("Ignoring heartbeat from {}", source),
         }
     }
 
-
-    async fn handle_heartbeat_ack(&mut self, source: SocketAddr, ack: &nextgsim_rls::RlsHeartbeatAck) {
+    async fn handle_heartbeat_ack(
+        &mut self,
+        source: SocketAddr,
+        ack: &nextgsim_rls::RlsHeartbeatAck,
+    ) {
         for event in self.cell_search.process_heartbeat_ack(ack.sti, source, ack) {
             match event {
-                CellSearchEvent::CellDiscovered { cell_id, sti: _, dbm } => {
+                CellSearchEvent::CellDiscovered {
+                    cell_id,
+                    sti: _,
+                    dbm,
+                } => {
                     info!("Cell discovered: cell_id={}, dbm={}", cell_id, dbm);
                     self.cell_addresses.insert(cell_id as i32, source);
-                    let _ = self.task_base.rrc_tx.send(RrcMessage::SignalChanged { cell_id: cell_id as i32, dbm }).await;
+                    let _ = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::SignalChanged {
+                            cell_id: cell_id as i32,
+                            dbm,
+                        })
+                        .await;
                 }
-                CellSearchEvent::SignalChanged { cell_id, old_dbm: _, new_dbm } => {
-                    let _ = self.task_base.rrc_tx.send(RrcMessage::SignalChanged { cell_id: cell_id as i32, dbm: new_dbm }).await;
+                CellSearchEvent::SignalChanged {
+                    cell_id,
+                    old_dbm: _,
+                    new_dbm,
+                } => {
+                    let _ = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::SignalChanged {
+                            cell_id: cell_id as i32,
+                            dbm: new_dbm,
+                        })
+                        .await;
                 }
                 CellSearchEvent::CellLost { cell_id } => {
                     info!("Cell lost: cell_id={}", cell_id);
@@ -184,37 +252,101 @@ impl RlsTask {
                     if self.serving_cell == Some(cell_id as i32) {
                         self.serving_cell = None;
                         self.transport.clear_serving_endpoint();
-                        let _ = self.task_base.rrc_tx.send(RrcMessage::RadioLinkFailure { cause: RlfCause::SignalLostToConnectedCell }).await;
+                        let _ = self
+                            .task_base
+                            .rrc_tx
+                            .send(RrcMessage::RadioLinkFailure {
+                                cause: RlfCause::SignalLostToConnectedCell,
+                            })
+                            .await;
                     }
                 }
             }
         }
     }
 
-    async fn handle_pdu_transmission(&mut self, source: SocketAddr, pdu: &nextgsim_rls::RlsPduTransmission) {
-        let cell_id = match self.cell_addresses.iter().find(|(_, addr)| **addr == source).map(|(id, _)| *id) {
+    async fn handle_pdu_transmission(
+        &mut self,
+        source: SocketAddr,
+        pdu: &nextgsim_rls::RlsPduTransmission,
+    ) {
+        let cell_id = match self
+            .cell_addresses
+            .iter()
+            .find(|(_, addr)| **addr == source)
+            .map(|(id, _)| *id)
+        {
             Some(id) => id,
-            None => { warn!("PDU from unknown source {}", source); return; }
+            None => {
+                warn!("PDU from unknown source {}", source);
+                return;
+            }
         };
 
-        for event in self.transport.process_pdu_transmission(cell_id as u32, pdu) {
+        // Collect events first so the transport borrow is released before we
+        // mutate self.rlc_entities below.
+        let events: Vec<TransportEvent> =
+            self.transport.process_pdu_transmission(cell_id as u32, pdu);
+
+        for event in events {
             match event {
                 TransportEvent::RrcReceived { channel, data, .. } => {
                     let pdu = OctetString::from_slice(&data);
-                    let _ = self.task_base.rrc_tx.send(RrcMessage::DownlinkRrcDelivery { cell_id, channel, pdu }).await;
+                    let _ = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::DownlinkRrcDelivery {
+                            cell_id,
+                            channel,
+                            pdu,
+                        })
+                        .await;
                 }
                 TransportEvent::DataReceived { psi, data } => {
-                    let pdu = OctetString::from_slice(&data);
-                    let _ = self.task_base.nas_tx.send(NasMessage::UplinkDataDelivery { psi: psi as i32, data: pdu }).await;
+                    // Feed the received RLC PDU into the per-PSI entity and
+                    // forward any fully-reassembled SDUs up to NAS.
+                    // Collect reassembled SDUs first so the mutable borrow on
+                    // self.rlc_entities is released before the async send.
+                    let psi_i32 = psi as i32;
+                    debug!("Downlink data (RLC): psi={}, len={}", psi_i32, data.len());
+                    let reassembled = {
+                        let rlc = self.rlc_entity_for(psi_i32);
+                        rlc.receive_pdu(&data);
+                        let mut sdus = Vec::new();
+                        while let Some(sdu) = rlc.poll_reassembled() {
+                            sdus.push(sdu);
+                        }
+                        sdus
+                    };
+                    for sdu in reassembled {
+                        debug!("RLC reassembled SDU: psi={}, len={}", psi_i32, sdu.len());
+                        let octet = OctetString::from_slice(&sdu);
+                        let _ = self
+                            .task_base
+                            .nas_tx
+                            .send(NasMessage::UplinkDataDelivery {
+                                psi: psi_i32,
+                                data: octet,
+                            })
+                            .await;
+                    }
                 }
-                TransportEvent::TransmissionFailure { pdus } => warn!("Transmission failure: {} PDUs", pdus.len()),
+                TransportEvent::TransmissionFailure { pdus } => {
+                    warn!("Transmission failure: {} PDUs", pdus.len())
+                }
                 TransportEvent::RadioLinkFailure { cause } => {
                     let rlf_cause = match cause {
                         nextgsim_rls::RlfCause::PduIdExists => RlfCause::PduIdExists,
                         nextgsim_rls::RlfCause::PduIdFull => RlfCause::PduIdFull,
-                        nextgsim_rls::RlfCause::SignalLostToConnectedCell => RlfCause::SignalLostToConnectedCell,
+                        nextgsim_rls::RlfCause::SignalLostToConnectedCell => {
+                            RlfCause::SignalLostToConnectedCell
+                        }
                     };
-                    let _ = self.task_base.rrc_tx.send(RrcMessage::RadioLinkFailure { cause: rlf_cause }).await;
+                    let _ = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::RadioLinkFailure { cause: rlf_cause })
+                        .await;
                 }
             }
         }
@@ -238,60 +370,156 @@ impl RlsTask {
         self.transport = RlsTransport::new(self.sti);
         let search_space: Vec<SocketAddr> = self.config.gnb_search_list.clone();
         self.cell_search = UeCellSearch::new(self.sti, search_space);
-        self.cell_search.set_heartbeat_interval(self.config.heartbeat_interval);
-        self.cell_search.set_heartbeat_threshold(self.config.heartbeat_threshold);
+        self.cell_search
+            .set_heartbeat_interval(self.config.heartbeat_interval);
+        self.cell_search
+            .set_heartbeat_threshold(self.config.heartbeat_threshold);
     }
 
-    async fn handle_rrc_pdu_delivery(&mut self, channel: RrcChannel, pdu_id: u32, pdu: OctetString) {
-        let (cell_id, dest) = match (self.serving_cell, self.serving_cell.and_then(|id| self.cell_addresses.get(&id).copied())) {
+    async fn handle_rrc_pdu_delivery(
+        &mut self,
+        channel: RrcChannel,
+        pdu_id: u32,
+        pdu: OctetString,
+    ) {
+        let (cell_id, dest) = match (
+            self.serving_cell,
+            self.serving_cell
+                .and_then(|id| self.cell_addresses.get(&id).copied()),
+        ) {
             (Some(id), Some(addr)) => (id, addr),
-            _ => { warn!("Cannot send uplink RRC: no serving cell"); return; }
+            _ => {
+                warn!("Cannot send uplink RRC: no serving cell");
+                return;
+            }
         };
 
-        debug!("Uplink RRC: cell_id={}, channel={:?}, pdu_id={}, len={}", cell_id, channel, pdu_id, pdu.len());
+        debug!(
+            "Uplink RRC: cell_id={}, channel={:?}, pdu_id={}, len={}",
+            cell_id,
+            channel,
+            pdu_id,
+            pdu.len()
+        );
         let require_ack = pdu_id != 0;
-        match self.transport.create_rrc_transmission(cell_id as u32, channel, Bytes::copy_from_slice(pdu.data()), require_ack) {
-            Ok(transmission) => self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission)).await,
+        match self.transport.create_rrc_transmission(
+            cell_id as u32,
+            channel,
+            Bytes::copy_from_slice(pdu.data()),
+            require_ack,
+        ) {
+            Ok(transmission) => {
+                self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
+                    .await
+            }
             Err(cause) => {
                 let rlf_cause = match cause {
                     nextgsim_rls::RlfCause::PduIdExists => RlfCause::PduIdExists,
                     nextgsim_rls::RlfCause::PduIdFull => RlfCause::PduIdFull,
-                    nextgsim_rls::RlfCause::SignalLostToConnectedCell => RlfCause::SignalLostToConnectedCell,
+                    nextgsim_rls::RlfCause::SignalLostToConnectedCell => {
+                        RlfCause::SignalLostToConnectedCell
+                    }
                 };
-                let _ = self.task_base.rrc_tx.send(RrcMessage::RadioLinkFailure { cause: rlf_cause }).await;
+                let _ = self
+                    .task_base
+                    .rrc_tx
+                    .send(RrcMessage::RadioLinkFailure { cause: rlf_cause })
+                    .await;
             }
         }
     }
 
+    /// Send uplink user-plane data from NAS/TUN to the gNB.
+    ///
+    /// The SDU is first submitted to the per-PSI RLC entity (UM, SN12) which
+    /// segments it if necessary.  Each resulting RLC PDU is then wrapped in an
+    /// RLS frame and sent to the serving gNB.
     async fn handle_data_pdu_delivery(&mut self, psi: i32, pdu: OctetString) {
-        let dest = match self.serving_cell.and_then(|id| self.cell_addresses.get(&id).copied()) {
+        let dest = match self
+            .serving_cell
+            .and_then(|id| self.cell_addresses.get(&id).copied())
+        {
             Some(addr) => addr,
-            None => { warn!("Cannot send uplink data: no serving cell"); return; }
+            None => {
+                warn!("Cannot send uplink data: no serving cell");
+                return;
+            }
         };
-        debug!("Uplink data: psi={}, len={}", psi, pdu.len());
-        let transmission = self.transport.create_data_transmission(psi as u32, Bytes::copy_from_slice(pdu.data()));
-        self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission)).await;
-    }
+        debug!("Uplink data (RLC): psi={}, len={}", psi, pdu.len());
 
+        // Submit SDU to RLC and collect all resulting PDUs before releasing
+        // the mutable borrow so that self.transport and self.socket are
+        // accessible again for transmission.
+        let rlc_pdus = {
+            let rlc = self.rlc_entity_for(psi);
+            rlc.submit_sdu(pdu.data().to_vec());
+            let mut pdus = Vec::new();
+            while let Some(rlc_pdu) = rlc.build_pdu(1500) {
+                pdus.push(rlc_pdu);
+            }
+            pdus
+        };
+
+        for rlc_pdu in rlc_pdus {
+            let transmission = self
+                .transport
+                .create_data_transmission(psi as u32, Bytes::from(rlc_pdu));
+            self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
+                .await;
+        }
+    }
 
     async fn handle_rls_message(&mut self, msg: RlsMessage) {
         match msg {
             RlsMessage::AssignCurrentCell { cell_id } => self.handle_assign_current_cell(cell_id),
-            RlsMessage::RrcPduDelivery { channel, pdu_id, pdu } => self.handle_rrc_pdu_delivery(channel, pdu_id, pdu).await,
+            RlsMessage::RrcPduDelivery {
+                channel,
+                pdu_id,
+                pdu,
+            } => self.handle_rrc_pdu_delivery(channel, pdu_id, pdu).await,
             RlsMessage::ResetSti => self.handle_reset_sti(),
-            RlsMessage::DataPduDelivery { psi, pdu } => self.handle_data_pdu_delivery(psi, pdu).await,
-            RlsMessage::ReceiveRlsMessage { data, .. } => debug!("Received internal RLS message, len={}", data.len()),
-            RlsMessage::SignalChanged { cell_id, dbm } => debug!("Signal changed: cell_id={}, dbm={}", cell_id, dbm),
-            RlsMessage::UplinkData { psi, data } => self.handle_data_pdu_delivery(psi, data).await,
-            RlsMessage::UplinkRrc { channel, pdu_id, data, .. } => self.handle_rrc_pdu_delivery(channel, pdu_id, data).await,
-            RlsMessage::DownlinkData { psi, data } => {
-                let _ = self.task_base.nas_tx.send(NasMessage::UplinkDataDelivery { psi, data }).await;
+            RlsMessage::DataPduDelivery { psi, pdu } => {
+                self.handle_data_pdu_delivery(psi, pdu).await
             }
-            RlsMessage::DownlinkRrc { cell_id, channel, data } => {
-                let _ = self.task_base.rrc_tx.send(RrcMessage::DownlinkRrcDelivery { cell_id, channel, pdu: data }).await;
+            RlsMessage::ReceiveRlsMessage { data, .. } => {
+                debug!("Received internal RLS message, len={}", data.len())
+            }
+            RlsMessage::SignalChanged { cell_id, dbm } => {
+                debug!("Signal changed: cell_id={}, dbm={}", cell_id, dbm)
+            }
+            RlsMessage::UplinkData { psi, data } => self.handle_data_pdu_delivery(psi, data).await,
+            RlsMessage::UplinkRrc {
+                channel,
+                pdu_id,
+                data,
+                ..
+            } => self.handle_rrc_pdu_delivery(channel, pdu_id, data).await,
+            RlsMessage::DownlinkData { psi, data } => {
+                let _ = self
+                    .task_base
+                    .nas_tx
+                    .send(NasMessage::UplinkDataDelivery { psi, data })
+                    .await;
+            }
+            RlsMessage::DownlinkRrc {
+                cell_id,
+                channel,
+                data,
+            } => {
+                let _ = self
+                    .task_base
+                    .rrc_tx
+                    .send(RrcMessage::DownlinkRrcDelivery {
+                        cell_id,
+                        channel,
+                        pdu: data,
+                    })
+                    .await;
             }
             RlsMessage::RadioLinkFailure { cause } => warn!("Radio link failure: {:?}", cause),
-            RlsMessage::TransmissionFailure { pdu_list } => warn!("Transmission failure: {} PDUs", pdu_list.len()),
+            RlsMessage::TransmissionFailure { pdu_list } => {
+                warn!("Transmission failure: {} PDUs", pdu_list.len())
+            }
         }
     }
 }
@@ -306,7 +534,10 @@ impl Task for RlsTask {
             error!("Failed to initialize RLS socket: {}", e);
             return;
         }
-        info!("RLS task started with {} gNBs in search list", self.config.gnb_search_list.len());
+        info!(
+            "RLS task started with {} gNBs in search list",
+            self.config.gnb_search_list.len()
+        );
 
         let mut heartbeat_timer = interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
         let mut lost_cell_timer = interval(Duration::from_millis(LOST_CELL_CHECK_INTERVAL_MS));
@@ -337,7 +568,10 @@ impl Task for RlsTask {
                 }
             }
         }
-        info!("RLS task stopped with {} discovered cells", self.cell_search.cell_count());
+        info!(
+            "RLS task stopped with {} discovered cells",
+            self.cell_search.cell_count()
+        );
     }
 }
 

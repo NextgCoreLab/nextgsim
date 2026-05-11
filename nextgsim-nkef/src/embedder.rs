@@ -177,7 +177,11 @@ impl TextEmbedder {
     ///
     /// Concatenates the entity ID, type, and all property key-value pairs into
     /// a single string suitable for embedding.
-    pub fn entity_text(id: &str, entity_type: &str, properties: &HashMap<String, String>) -> String {
+    pub fn entity_text(
+        id: &str,
+        entity_type: &str,
+        properties: &HashMap<String, String>,
+    ) -> String {
         let mut parts = vec![id.to_string(), entity_type.to_string()];
         // Sort properties for deterministic output
         let mut props: Vec<(&String, &String)> = properties.iter().collect();
@@ -446,7 +450,10 @@ impl OnnxEmbedder {
     pub fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
         if self.model_loaded {
             // In real implementation, would batch process through ONNX
-            texts.iter().map(|t| self.mock_neural_embedding(t)).collect()
+            texts
+                .iter()
+                .map(|t| self.mock_neural_embedding(t))
+                .collect()
         } else if let Some(ref fallback) = self.fallback {
             fallback.embed_batch(texts)
         } else {
@@ -581,7 +588,10 @@ impl OnnxEmbedder {
 /// then further split long tokens into subword-like chunks.
 fn wordpiece_tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    for word in text.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '\'') {
+    for word in text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+    {
         if word.is_empty() {
             continue;
         }
@@ -650,7 +660,9 @@ mod onnx_tests {
         let mut embedder = OnnxEmbedder::new(384);
         let path = std::path::Path::new("models/sentence-transformer.onnx");
 
-        embedder.load_model(path, "all-MiniLM-L6-v2".to_string()).unwrap();
+        embedder
+            .load_model(path, "all-MiniLM-L6-v2".to_string())
+            .unwrap();
 
         assert!(embedder.is_loaded());
         assert_eq!(embedder.model_id(), Some("all-MiniLM-L6-v2"));
@@ -662,8 +674,7 @@ mod onnx_tests {
 
         // Set up fallback with vocabulary
         let mut fallback = TextEmbedder::new(64);
-        fallback.build_vocabulary(&["network entity".to_string(),
-            "base station".to_string()]);
+        fallback.build_vocabulary(&["network entity".to_string(), "base station".to_string()]);
         embedder.set_fallback(fallback);
 
         let emb = embedder.embed("network entity");

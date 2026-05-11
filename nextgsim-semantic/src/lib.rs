@@ -87,6 +87,11 @@ pub mod isac_integration;
 // ── Re-exports for convenience ───────────────────────────────────────────────
 
 pub use codec::{CodecError, NeuralCodec, NeuralDecoder, NeuralEncoder};
+pub use isac_integration::{
+    CompressedSensingData, CompressionStats, IsacSemanticCompressor, MapFeatureData,
+    MeasurementMetadata, Position3D, SensingCompressionParams, SensingCompressionRequest,
+    SensingDataPayload, Velocity3D,
+};
 pub use jscc::{JsccCodec, JsccConfig, JsccDecoder, JsccEncoder, JsccError, JsccSymbols};
 pub use metrics::{
     cosine_similarity, evaluate as evaluate_quality, mse, psnr, top_k_accuracy, QualityMetrics,
@@ -94,17 +99,10 @@ pub use metrics::{
 pub use multimodal::{
     AudioData, ImageData, SemanticDecode, SemanticEncode, VectorDecoder, VectorEncoder, VideoData,
 };
-pub use rate_distortion::{
-    auto_compression_ratio, RdController, RdDecision, RdMode,
-};
+pub use rate_distortion::{auto_compression_ratio, RdController, RdDecision, RdMode};
 pub use she_integration::{
     CodingMetrics, QualityParameters, SemanticCodingInput, SemanticCodingOperation,
     SemanticCodingOutput, SemanticCodingRequest, SemanticCodingResult, SheSemanticClient,
-};
-pub use isac_integration::{
-    CompressedSensingData, CompressionStats, IsacSemanticCompressor, MapFeatureData,
-    MeasurementMetadata, Position3D, SensingCompressionParams, SensingCompressionRequest,
-    SensingDataPayload, Velocity3D,
 };
 
 /// Semantic feature representation
@@ -171,7 +169,8 @@ impl SemanticFeatures {
         let kept_indices: Vec<usize> = indices.into_iter().take(keep_count).collect();
 
         let pruned_features: Vec<f32> = kept_indices.iter().map(|&i| self.features[i]).collect();
-        let pruned_importance: Vec<f32> = kept_indices.iter().map(|&i| self.importance[i]).collect();
+        let pruned_importance: Vec<f32> =
+            kept_indices.iter().map(|&i| self.importance[i]).collect();
 
         let new_compression = self.compression_ratio / keep_ratio;
 
@@ -214,10 +213,7 @@ impl SemanticFeatures {
         }
 
         // Normalize attention scores
-        let max_score = attention_scores
-            .iter()
-            .copied()
-            .fold(f32::MIN, f32::max);
+        let max_score = attention_scores.iter().copied().fold(f32::MIN, f32::max);
 
         if max_score > 0.0 {
             for score in &mut attention_scores {
@@ -381,7 +377,8 @@ impl SemanticEncoder {
             if start < data.len() {
                 let chunk = &data[start..end];
                 let mean: f32 = chunk.iter().sum::<f32>() / chunk.len() as f32;
-                let variance: f32 = chunk.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / chunk.len() as f32;
+                let variance: f32 =
+                    chunk.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / chunk.len() as f32;
 
                 features.push(mean);
                 // Importance based on variance (more variable = more important)
@@ -407,8 +404,7 @@ impl SemanticEncoder {
             SemanticTask::Custom(id) => id,
         };
 
-        SemanticFeatures::new(task_id, features, vec![data.len()])
-            .with_importance(importance)
+        SemanticFeatures::new(task_id, features, vec![data.len()]).with_importance(importance)
     }
 
     /// Adapts compression based on channel quality
@@ -532,8 +528,7 @@ impl AwgnChannel {
         }
 
         // Compute signal power
-        let signal_power: f32 =
-            symbols.iter().map(|s| s * s).sum::<f32>() / symbols.len() as f32;
+        let signal_power: f32 = symbols.iter().map(|s| s * s).sum::<f32>() / symbols.len() as f32;
 
         // Compute noise power from SNR
         let snr_linear = 10.0_f32.powf(self.snr_db / 10.0);
@@ -553,8 +548,9 @@ impl AwgnChannel {
             .map(|&s| {
                 let u1: f32 = rng.gen::<f32>().max(f32::EPSILON);
                 let u2: f32 = rng.gen();
-                let noise =
-                    noise_stddev * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                let noise = noise_stddev
+                    * (-2.0 * u1.ln()).sqrt()
+                    * (2.0 * std::f32::consts::PI * u2).cos();
                 s + noise
             })
             .collect()
@@ -591,8 +587,10 @@ impl FadingChannel {
         let mut rng = rand::thread_rng();
         let x: f32 = rng.gen::<f32>().max(f32::EPSILON);
         let y: f32 = rng.gen();
-        let re = (-2.0 * x.ln()).sqrt() * (2.0 * std::f32::consts::PI * y).cos() / std::f32::consts::SQRT_2;
-        let im = (-2.0 * x.ln()).sqrt() * (2.0 * std::f32::consts::PI * y).sin() / std::f32::consts::SQRT_2;
+        let re = (-2.0 * x.ln()).sqrt() * (2.0 * std::f32::consts::PI * y).cos()
+            / std::f32::consts::SQRT_2;
+        let im = (-2.0 * x.ln()).sqrt() * (2.0 * std::f32::consts::PI * y).sin()
+            / std::f32::consts::SQRT_2;
         (re * re + im * im).sqrt()
     }
 
@@ -602,8 +600,7 @@ impl FadingChannel {
             return Vec::new();
         }
 
-        let signal_power: f32 =
-            symbols.iter().map(|s| s * s).sum::<f32>() / symbols.len() as f32;
+        let signal_power: f32 = symbols.iter().map(|s| s * s).sum::<f32>() / symbols.len() as f32;
         let snr_linear = 10.0_f32.powf(self.avg_snr_db / 10.0);
         let noise_power = if snr_linear > 0.0 {
             signal_power / snr_linear
@@ -621,8 +618,9 @@ impl FadingChannel {
                 let h = self.fading_gain();
                 let u1: f32 = rng.gen::<f32>().max(f32::EPSILON);
                 let u2: f32 = rng.gen();
-                let noise =
-                    noise_stddev * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                let noise = noise_stddev
+                    * (-2.0 * u1.ln()).sqrt()
+                    * (2.0 * std::f32::consts::PI * u2).cos();
                 h * s + noise
             })
             .collect()
@@ -743,11 +741,13 @@ mod tests {
 
         // Good channel - less compression
         let good_channel = ChannelQuality::new(20.0, 1000.0, 0.01);
-        let good_features = encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &good_channel);
+        let good_features =
+            encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &good_channel);
 
         // Poor channel - more compression
         let poor_channel = ChannelQuality::new(5.0, 100.0, 0.1);
-        let poor_features = encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &poor_channel);
+        let poor_features =
+            encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &poor_channel);
 
         // Poor channel should result in fewer features
         assert!(poor_features.num_features() <= good_features.num_features());
@@ -772,11 +772,7 @@ mod tests {
 
     #[test]
     fn test_attention_based_importance() {
-        let mut features = SemanticFeatures::new(
-            0,
-            vec![1.0, 0.5, 2.0, 0.3, 1.5],
-            vec![5],
-        );
+        let mut features = SemanticFeatures::new(0, vec![1.0, 0.5, 2.0, 0.3, 1.5], vec![5]);
 
         // Apply attention
         features.apply_attention(1.0);
@@ -792,11 +788,7 @@ mod tests {
 
     #[test]
     fn test_attention_temperature() {
-        let mut features1 = SemanticFeatures::new(
-            0,
-            vec![1.0, 0.5, 2.0, 0.3, 1.5],
-            vec![5],
-        );
+        let mut features1 = SemanticFeatures::new(0, vec![1.0, 0.5, 2.0, 0.3, 1.5], vec![5]);
 
         let mut features2 = features1.clone();
 

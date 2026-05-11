@@ -36,7 +36,10 @@ struct Reassembly {
 
 impl Reassembly {
     fn new() -> Self {
-        Self { segments: BTreeMap::new(), total_len: None }
+        Self {
+            segments: BTreeMap::new(),
+            total_len: None,
+        }
     }
 
     /// Insert a segment. Returns `Err` on duplicate.
@@ -69,7 +72,11 @@ impl Reassembly {
             sdu.extend_from_slice(&seg.data);
             expected = offset + seg.data.len() as u16;
         }
-        if sdu.len() == total { Some(sdu) } else { None }
+        if sdu.len() == total {
+            Some(sdu)
+        } else {
+            None
+        }
     }
 }
 
@@ -219,8 +226,7 @@ impl RlcEntity {
             // TM does not support segmentation — drop and warn
             warn!(
                 len = sdu.len(),
-                max_size,
-                "RLC TM: SDU too large for MAC grant, dropping"
+                max_size, "RLC TM: SDU too large for MAC grant, dropping"
             );
             return None;
         }
@@ -279,7 +285,12 @@ impl RlcEntity {
         let sn = (self.tx_next % self.sn_size.modulus()) as u16;
         let pdu_data = remaining[..payload_len].to_vec();
 
-        let pdu = RlcUmPdu { si, sn, so, data: pdu_data };
+        let pdu = RlcUmPdu {
+            si,
+            sn,
+            so,
+            data: pdu_data,
+        };
         let encoded = match self.sn_size {
             SnSize::Sn6 => pdu.encode_sn6(),
             SnSize::Sn12 => pdu.encode_sn12(),
@@ -316,7 +327,11 @@ impl RlcEntity {
 
         let so = pdu.so.unwrap_or(0);
         let is_last = pdu.si.is_last();
-        let seg = RlcSegment { offset: so, is_last, data: pdu.data };
+        let seg = RlcSegment {
+            offset: so,
+            is_last,
+            data: pdu.data,
+        };
 
         let entry = self.rx_reassembly.entry(sn).or_insert_with(Reassembly::new);
         if let Err(mut e) = entry.insert(seg) {
@@ -388,14 +403,25 @@ impl RlcEntity {
             (false, false) => SegmentationInfo::MiddleSegment,
         };
 
-        let so = if has_so { Some(self.tx_current_offset as u16) } else { None };
+        let so = if has_so {
+            Some(self.tx_current_offset as u16)
+        } else {
+            None
+        };
         let sn = self.tx_next;
         let pdu_data = remaining[..payload_len].to_vec();
 
         // Set poll bit on last segment of each SDU (simple poll strategy)
         let p = is_last;
 
-        let am_pdu = RlcAmPdu { dc: true, p, si, sn, so, data: pdu_data };
+        let am_pdu = RlcAmPdu {
+            dc: true,
+            p,
+            si,
+            sn,
+            so,
+            data: pdu_data,
+        };
         let encoded = match self.sn_size {
             SnSize::Sn12 => am_pdu.encode_sn12(),
             SnSize::Sn18 => am_pdu.encode_sn18(),
@@ -447,7 +473,11 @@ impl RlcEntity {
 
         let so = pdu.so.unwrap_or(0);
         let is_last = pdu.si.is_last();
-        let seg = RlcSegment { offset: so, is_last, data: pdu.data };
+        let seg = RlcSegment {
+            offset: so,
+            is_last,
+            data: pdu.data,
+        };
 
         let entry = self.rx_reassembly.entry(sn).or_insert_with(Reassembly::new);
         if let Err(mut e) = entry.insert(seg) {

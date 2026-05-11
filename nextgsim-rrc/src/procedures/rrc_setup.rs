@@ -72,7 +72,9 @@ impl TryFrom<EstablishmentCause> for RrcEstablishmentCause {
     fn try_from(cause: EstablishmentCause) -> Result<Self, Self::Error> {
         match cause.0 {
             EstablishmentCause::EMERGENCY => Ok(RrcEstablishmentCause::Emergency),
-            EstablishmentCause::HIGH_PRIORITY_ACCESS => Ok(RrcEstablishmentCause::HighPriorityAccess),
+            EstablishmentCause::HIGH_PRIORITY_ACCESS => {
+                Ok(RrcEstablishmentCause::HighPriorityAccess)
+            }
             EstablishmentCause::MT_ACCESS => Ok(RrcEstablishmentCause::MtAccess),
             EstablishmentCause::MO_SIGNALLING => Ok(RrcEstablishmentCause::MoSignalling),
             EstablishmentCause::MO_DATA => Ok(RrcEstablishmentCause::MoData),
@@ -121,7 +123,9 @@ pub struct RrcSetupRequestData {
 }
 
 /// Build an RRC Setup Request message
-pub fn build_rrc_setup_request(params: &RrcSetupRequestParams) -> Result<UL_CCCH_Message, RrcSetupError> {
+pub fn build_rrc_setup_request(
+    params: &RrcSetupRequestParams,
+) -> Result<UL_CCCH_Message, RrcSetupError> {
     // Build UE Identity
     let ue_identity = match &params.ue_identity {
         UeIdentity::Ng5gSTmsiPart1(value) => {
@@ -154,13 +158,18 @@ pub fn build_rrc_setup_request(params: &RrcSetupRequestParams) -> Result<UL_CCCH
         rrc_setup_request: rrc_setup_request_ies,
     };
 
-    let message_type = UL_CCCH_MessageType::C1(UL_CCCH_MessageType_c1::RrcSetupRequest(rrc_setup_request));
+    let message_type =
+        UL_CCCH_MessageType::C1(UL_CCCH_MessageType_c1::RrcSetupRequest(rrc_setup_request));
 
-    Ok(UL_CCCH_Message { message: message_type })
+    Ok(UL_CCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Setup Request from a UL-CCCH message
-pub fn parse_rrc_setup_request(msg: &UL_CCCH_Message) -> Result<RrcSetupRequestData, RrcSetupError> {
+pub fn parse_rrc_setup_request(
+    msg: &UL_CCCH_Message,
+) -> Result<RrcSetupRequestData, RrcSetupError> {
     let rrc_setup_request = match &msg.message {
         UL_CCCH_MessageType::C1(c1) => match c1 {
             UL_CCCH_MessageType_c1::RrcSetupRequest(req) => req,
@@ -196,7 +205,10 @@ pub fn parse_rrc_setup_request(msg: &UL_CCCH_Message) -> Result<RrcSetupRequestD
     // Parse establishment cause
     let establishment_cause = RrcEstablishmentCause::try_from(ies.establishment_cause.clone())?;
 
-    Ok(RrcSetupRequestData { ue_identity, establishment_cause })
+    Ok(RrcSetupRequestData {
+        ue_identity,
+        establishment_cause,
+    })
 }
 
 /// Helper function to convert `BitVec` to u64
@@ -259,7 +271,9 @@ pub fn build_rrc_setup(params: &RrcSetupParams) -> Result<DL_CCCH_Message, RrcSe
 
     let message_type = DL_CCCH_MessageType::C1(DL_CCCH_MessageType_c1::RrcSetup(rrc_setup));
 
-    Ok(DL_CCCH_Message { message: message_type })
+    Ok(DL_CCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Setup from a DL-CCCH message
@@ -366,7 +380,9 @@ pub struct RrcSetupCompleteData {
 }
 
 /// Build an RRC Setup Complete message
-pub fn build_rrc_setup_complete(params: &RrcSetupCompleteParams) -> Result<UL_DCCH_Message, RrcSetupError> {
+pub fn build_rrc_setup_complete(
+    params: &RrcSetupCompleteParams,
+) -> Result<UL_DCCH_Message, RrcSetupError> {
     if params.rrc_transaction_id > 3 {
         return Err(RrcSetupError::InvalidFieldValue(
             "RRC Transaction ID must be 0-3".to_string(),
@@ -395,7 +411,7 @@ pub fn build_rrc_setup_complete(params: &RrcSetupCompleteParams) -> Result<UL_DC
                 for i in (0..8).rev() {
                     sst_bv.push((snssai.sst >> i) & 1 == 1);
                 }
-                
+
                 if let Some(sd) = snssai.sd {
                     // SST + SD combined (32 bits total)
                     let mut sst_sd_bv: BitVec<u8, Msb0> = BitVec::new();
@@ -437,7 +453,9 @@ pub fn build_rrc_setup_complete(params: &RrcSetupCompleteParams) -> Result<UL_DC
     });
 
     let rrc_setup_complete_ies = RRCSetupComplete_IEs {
-        selected_plmn_identity: RRCSetupComplete_IEsSelectedPLMN_Identity(params.selected_plmn_identity),
+        selected_plmn_identity: RRCSetupComplete_IEsSelectedPLMN_Identity(
+            params.selected_plmn_identity,
+        ),
         registered_amf: None, // Simplified - not including RegisteredAMF for now
         guami_type,
         s_nssai_list,
@@ -449,16 +467,23 @@ pub fn build_rrc_setup_complete(params: &RrcSetupCompleteParams) -> Result<UL_DC
 
     let rrc_setup_complete = RRCSetupComplete {
         rrc_transaction_identifier: RRC_TransactionIdentifier(params.rrc_transaction_id),
-        critical_extensions: RRCSetupCompleteCriticalExtensions::RrcSetupComplete(rrc_setup_complete_ies),
+        critical_extensions: RRCSetupCompleteCriticalExtensions::RrcSetupComplete(
+            rrc_setup_complete_ies,
+        ),
     };
 
-    let message_type = UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::RrcSetupComplete(rrc_setup_complete));
+    let message_type =
+        UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::RrcSetupComplete(rrc_setup_complete));
 
-    Ok(UL_DCCH_Message { message: message_type })
+    Ok(UL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Setup Complete from a UL-DCCH message
-pub fn parse_rrc_setup_complete(msg: &UL_DCCH_Message) -> Result<RrcSetupCompleteData, RrcSetupError> {
+pub fn parse_rrc_setup_complete(
+    msg: &UL_DCCH_Message,
+) -> Result<RrcSetupCompleteData, RrcSetupError> {
     let rrc_setup_complete = match &msg.message {
         UL_DCCH_MessageType::C1(c1) => match c1 {
             UL_DCCH_MessageType_c1::RrcSetupComplete(complete) => complete,
@@ -562,7 +587,9 @@ pub fn decode_rrc_setup(bytes: &[u8]) -> Result<RrcSetupData, RrcSetupError> {
 }
 
 /// Build and encode an RRC Setup Complete to bytes
-pub fn encode_rrc_setup_complete(params: &RrcSetupCompleteParams) -> Result<Vec<u8>, RrcSetupError> {
+pub fn encode_rrc_setup_complete(
+    params: &RrcSetupCompleteParams,
+) -> Result<Vec<u8>, RrcSetupError> {
     let msg = build_rrc_setup_complete(params)?;
     Ok(encode_rrc(&msg)?)
 }
@@ -730,7 +757,10 @@ mod tests {
             guami_type: Some(GuamiType::Native),
             s_nssai_list: Some(vec![
                 SNssai { sst: 1, sd: None },
-                SNssai { sst: 2, sd: Some(0x000001) },
+                SNssai {
+                    sst: 2,
+                    sd: Some(0x000001),
+                },
             ]),
             dedicated_nas_message: vec![0x7E, 0x00, 0x41, 0x01, 0x02],
             ng_5g_s_tmsi_value: Some(Ng5gSTmsiValue::Full(0x123456789ABC)),

@@ -97,9 +97,10 @@ impl OccupancyGrid {
     pub fn update_cell(&mut self, position: &Vector3, occupied: bool, timestamp_ms: u64) {
         let grid_coords = self.world_to_grid(position);
         let world_pos = self.grid_to_world(grid_coords);
-        let cell = self.cells.entry(grid_coords).or_insert_with(|| {
-            MapCell::new(world_pos)
-        });
+        let cell = self
+            .cells
+            .entry(grid_coords)
+            .or_insert_with(|| MapCell::new(world_pos));
 
         cell.update_occupancy(occupied, timestamp_ms);
     }
@@ -125,9 +126,8 @@ impl OccupancyGrid {
 
     /// Clears old cells (older than `max_age_ms`)
     pub fn cleanup_old_cells(&mut self, current_time_ms: u64, max_age_ms: u64) {
-        self.cells.retain(|_, cell| {
-            current_time_ms - cell.last_update_ms < max_age_ms
-        });
+        self.cells
+            .retain(|_, cell| current_time_ms - cell.last_update_ms < max_age_ms);
     }
 
     /// Returns the cell size in meters
@@ -218,17 +218,18 @@ impl EnvironmentMapper {
         }
 
         // Mark endpoint as occupied
-        let endpoint = Vector3::new(
-            sensor_pos.x + dx,
-            sensor_pos.y + dy,
-            sensor_pos.z + dz,
-        );
+        let endpoint = Vector3::new(sensor_pos.x + dx, sensor_pos.y + dy, sensor_pos.z + dz);
         self.grid.update_cell(&endpoint, true, timestamp_ms);
 
         // Check for feature detection
         if let Some(cell) = self.grid.get_cell(&endpoint) {
             if cell.occupancy > self.feature_threshold && cell.confidence > 0.7 {
-                self.add_feature(endpoint, FeatureType::Reflector, cell.occupancy, timestamp_ms);
+                self.add_feature(
+                    endpoint,
+                    FeatureType::Reflector,
+                    cell.occupancy,
+                    timestamp_ms,
+                );
             }
         }
     }
@@ -294,9 +295,8 @@ impl EnvironmentMapper {
         self.grid.cleanup_old_cells(current_time_ms, max_age_ms);
 
         // Remove stale features
-        self.features.retain(|_, feature| {
-            current_time_ms - feature.last_observed_ms < max_age_ms
-        });
+        self.features
+            .retain(|_, feature| current_time_ms - feature.last_observed_ms < max_age_ms);
     }
 }
 
@@ -397,12 +397,7 @@ impl SlamSystem {
     }
 
     /// Processes odometry + scan observation to update pose and map
-    pub fn update(
-        &mut self,
-        forward_m: f64,
-        rotation_rad: f64,
-        scan: &ScanObservation,
-    ) {
+    pub fn update(&mut self, forward_m: f64, rotation_rad: f64, scan: &ScanObservation) {
         // 1. Predict pose from odometry
         let predicted_pose = self.current_pose.apply_motion(forward_m, rotation_rad);
 
@@ -434,11 +429,8 @@ impl SlamSystem {
         for &dx in &dx_steps {
             for &dy in &dy_steps {
                 for &dh in &dh_steps {
-                    let candidate = Pose2D::new(
-                        predicted.x + dx,
-                        predicted.y + dy,
-                        predicted.heading + dh,
-                    );
+                    let candidate =
+                        Pose2D::new(predicted.x + dx, predicted.y + dy, predicted.heading + dh);
                     let score = self.evaluate_scan_match(&candidate, scan);
                     if score > best_score {
                         best_score = score;
@@ -500,7 +492,9 @@ impl SlamSystem {
                     pose.y + range * t * world_angle.sin(),
                     0.0,
                 );
-                self.mapper.grid_mut().update_cell(&pos, false, scan.timestamp_ms);
+                self.mapper
+                    .grid_mut()
+                    .update_cell(&pos, false, scan.timestamp_ms);
             }
 
             // Mark endpoint as occupied
@@ -509,7 +503,9 @@ impl SlamSystem {
                 pose.y + range * world_angle.sin(),
                 0.0,
             );
-            self.mapper.grid_mut().update_cell(&endpoint, true, scan.timestamp_ms);
+            self.mapper
+                .grid_mut()
+                .update_cell(&endpoint, true, scan.timestamp_ms);
         }
     }
 
@@ -628,7 +624,12 @@ mod tests {
     fn test_cleanup() {
         let mut mapper = EnvironmentMapper::new(Vector3::new(0.0, 0.0, 0.0), 1.0);
 
-        mapper.add_feature(Vector3::new(0.0, 0.0, 0.0), FeatureType::Reflector, 0.9, 1000);
+        mapper.add_feature(
+            Vector3::new(0.0, 0.0, 0.0),
+            FeatureType::Reflector,
+            0.9,
+            1000,
+        );
         mapper.add_feature(Vector3::new(10.0, 0.0, 0.0), FeatureType::Wall, 0.8, 10000);
 
         assert_eq!(mapper.feature_count(), 2);

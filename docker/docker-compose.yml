@@ -7,6 +7,12 @@
 #   # Then start RAN:
 #   docker compose up -d
 #   docker compose logs -f gnb ue
+#
+# Note on nr-cli and nr-loadtest:
+#   These binaries are intentionally NOT deployed as services.
+#   - nr-cli: interactive operator tool. Run via `docker exec -it nextgsim-gnb nr-cli`
+#   - nr-loadtest: on-demand stress test. Run with `docker run --rm --network ... nextgsim-loadtest`
+#   They are not long-running services, so they don't belong in compose.
 
 x-common: &common
   restart: on-failure:3

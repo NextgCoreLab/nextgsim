@@ -34,9 +34,9 @@ impl CellSleepMode {
     pub fn power_factor(&self) -> f32 {
         match self {
             CellSleepMode::Active => 1.0,
-            CellSleepMode::LightSleep => 0.6,   // 40% power savings
-            CellSleepMode::DeepSleep => 0.2,    // 80% power savings
-            CellSleepMode::Shutdown => 0.05,    // 95% power savings (residual only)
+            CellSleepMode::LightSleep => 0.6, // 40% power savings
+            CellSleepMode::DeepSleep => 0.2,  // 80% power savings
+            CellSleepMode::Shutdown => 0.05,  // 95% power savings (residual only)
         }
     }
 
@@ -87,8 +87,8 @@ impl Default for EnergySavingConfig {
     fn default() -> Self {
         Self {
             policy: EnergySavingPolicy::LoadBased,
-            light_sleep_load_threshold: 0.2,  // <20% PRB usage
-            deep_sleep_load_threshold: 0.05,  // <5% PRB usage
+            light_sleep_load_threshold: 0.2, // <20% PRB usage
+            deep_sleep_load_threshold: 0.05, // <5% PRB usage
             min_sleep_duration_s: 60,
             neighbor_cells: Vec::new(),
             inter_cell_coordination: true,
@@ -202,16 +202,19 @@ impl CellEnergyState {
             return 0;
         }
         // Weighted average based on time spent in each sleep mode
-        let total_sleep = self.time_in_light_sleep + self.time_in_deep_sleep + self.time_in_shutdown;
+        let total_sleep =
+            self.time_in_light_sleep + self.time_in_deep_sleep + self.time_in_shutdown;
         if total_sleep.as_secs() == 0 {
             return 0;
         }
 
-        let weighted_latency =
-            (self.time_in_light_sleep.as_secs_f32() * CellSleepMode::LightSleep.wake_up_latency_ms() as f32 +
-             self.time_in_deep_sleep.as_secs_f32() * CellSleepMode::DeepSleep.wake_up_latency_ms() as f32 +
-             self.time_in_shutdown.as_secs_f32() * CellSleepMode::Shutdown.wake_up_latency_ms() as f32) /
-            total_sleep.as_secs_f32();
+        let weighted_latency = (self.time_in_light_sleep.as_secs_f32()
+            * CellSleepMode::LightSleep.wake_up_latency_ms() as f32
+            + self.time_in_deep_sleep.as_secs_f32()
+                * CellSleepMode::DeepSleep.wake_up_latency_ms() as f32
+            + self.time_in_shutdown.as_secs_f32()
+                * CellSleepMode::Shutdown.wake_up_latency_ms() as f32)
+            / total_sleep.as_secs_f32();
 
         weighted_latency as u32
     }
@@ -291,9 +294,7 @@ impl EnergySavingManager {
                     time_mode
                 }
             }
-            EnergySavingPolicy::CoverageBased => {
-                self.coverage_based_decision(state)
-            }
+            EnergySavingPolicy::CoverageBased => self.coverage_based_decision(state),
         };
 
         // Check minimum sleep duration before allowing mode change
@@ -406,7 +407,8 @@ impl EnergySavingManager {
 
     /// Gets KPIs for all cells
     pub fn get_all_kpis(&self) -> Vec<CellEnergyKpis> {
-        self.cells.keys()
+        self.cells
+            .keys()
             .filter_map(|cell_id| self.get_cell_kpis(*cell_id))
             .collect()
     }

@@ -258,7 +258,10 @@ impl ModelMetrics {
 
     /// Returns summaries for all models
     pub fn summaries(&self) -> Vec<MetricsSummary> {
-        self.metrics.values().map(InferenceMetrics::summary).collect()
+        self.metrics
+            .values()
+            .map(InferenceMetrics::summary)
+            .collect()
     }
 
     /// Resets all metrics
@@ -270,12 +273,18 @@ impl ModelMetrics {
 
     /// Returns total inference count across all models
     pub fn total_inference_count(&self) -> u64 {
-        self.metrics.values().map(InferenceMetrics::inference_count).sum()
+        self.metrics
+            .values()
+            .map(InferenceMetrics::inference_count)
+            .sum()
     }
 
     /// Returns total error count across all models
     pub fn total_error_count(&self) -> u64 {
-        self.metrics.values().map(InferenceMetrics::error_count).sum()
+        self.metrics
+            .values()
+            .map(InferenceMetrics::error_count)
+            .sum()
     }
 }
 

@@ -167,7 +167,10 @@ impl ModelTransferProtocol {
     }
 
     /// Handles incoming model transfer message
-    pub fn handle_message(&mut self, message: ModelTransferMessage) -> Option<ModelTransferMessage> {
+    pub fn handle_message(
+        &mut self,
+        message: ModelTransferMessage,
+    ) -> Option<ModelTransferMessage> {
         match message {
             ModelTransferMessage::ModelRequest {
                 requester_id,
@@ -175,9 +178,10 @@ impl ModelTransferProtocol {
                 model_type: _,
             } => self.handle_model_request(&requester_id, &model_id),
 
-            ModelTransferMessage::ModelTransfer { source_id: _, model } => {
-                self.handle_model_transfer(model)
-            }
+            ModelTransferMessage::ModelTransfer {
+                source_id: _,
+                model,
+            } => self.handle_model_transfer(model),
 
             ModelTransferMessage::ModelQuery {
                 requester_id: _,
@@ -189,7 +193,11 @@ impl ModelTransferProtocol {
     }
 
     /// Handles model request
-    fn handle_model_request(&mut self, requester_id: &str, model_id: &str) -> Option<ModelTransferMessage> {
+    fn handle_model_request(
+        &mut self,
+        requester_id: &str,
+        model_id: &str,
+    ) -> Option<ModelTransferMessage> {
         if let Some(model) = self.models.get(model_id) {
             self.stats.models_sent += 1;
             self.stats.total_bytes_sent += model.size_bytes;
@@ -293,7 +301,11 @@ impl ModelTransferProtocol {
     }
 
     /// Creates a model request message
-    pub fn create_model_request(&self, model_id: String, model_type: ModelType) -> ModelTransferMessage {
+    pub fn create_model_request(
+        &self,
+        model_id: String,
+        model_type: ModelType,
+    ) -> ModelTransferMessage {
         ModelTransferMessage::ModelRequest {
             requester_id: self.nwdaf_id.clone(),
             model_id,
@@ -456,9 +468,17 @@ mod tests {
     fn test_model_query_with_filter() {
         let mut protocol = ModelTransferProtocol::new("nwdaf1".to_string());
 
-        protocol.register_model(create_test_model("model1", ModelType::MobilityPrediction, 0.95));
+        protocol.register_model(create_test_model(
+            "model1",
+            ModelType::MobilityPrediction,
+            0.95,
+        ));
         protocol.register_model(create_test_model("model2", ModelType::LoadPrediction, 0.85));
-        protocol.register_model(create_test_model("model3", ModelType::MobilityPrediction, 0.80));
+        protocol.register_model(create_test_model(
+            "model3",
+            ModelType::MobilityPrediction,
+            0.80,
+        ));
 
         let filter = ModelFilter {
             model_type: Some(ModelType::MobilityPrediction),

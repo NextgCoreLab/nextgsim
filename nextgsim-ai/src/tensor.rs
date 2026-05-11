@@ -336,28 +336,36 @@ impl TensorData {
                 }
             }
             TensorData::Int32 { data, shape } => {
-                let scaled_data: Vec<i32> = data.iter().map(|&x| (x as f32 * factor) as i32).collect();
+                let scaled_data: Vec<i32> =
+                    data.iter().map(|&x| (x as f32 * factor) as i32).collect();
                 TensorData::Int32 {
                     data: scaled_data,
                     shape: shape.clone(),
                 }
             }
             TensorData::Int64 { data, shape } => {
-                let scaled_data: Vec<i64> = data.iter().map(|&x| (x as f32 * factor) as i64).collect();
+                let scaled_data: Vec<i64> =
+                    data.iter().map(|&x| (x as f32 * factor) as i64).collect();
                 TensorData::Int64 {
                     data: scaled_data,
                     shape: shape.clone(),
                 }
             }
             TensorData::Uint8 { data, shape } => {
-                let scaled_data: Vec<u8> = data.iter().map(|&x| (x as f32 * factor).clamp(0.0, 255.0) as u8).collect();
+                let scaled_data: Vec<u8> = data
+                    .iter()
+                    .map(|&x| (x as f32 * factor).clamp(0.0, 255.0) as u8)
+                    .collect();
                 TensorData::Uint8 {
                     data: scaled_data,
                     shape: shape.clone(),
                 }
             }
             TensorData::Float16 { data, shape } => {
-                let scaled_data: Vec<f16> = data.iter().map(|&x| f16::from_f32(x.to_f32() * factor)).collect();
+                let scaled_data: Vec<f16> = data
+                    .iter()
+                    .map(|&x| f16::from_f32(x.to_f32() * factor))
+                    .collect();
                 TensorData::Float16 {
                     data: scaled_data,
                     shape: shape.clone(),
@@ -420,7 +428,8 @@ impl TensorData {
                 let noisy_data: Vec<f64> = data
                     .iter()
                     .map(|&x| {
-                        let noise: f64 = rng.gen_range(-(noise_multiplier as f64)..(noise_multiplier as f64));
+                        let noise: f64 =
+                            rng.gen_range(-(noise_multiplier as f64)..(noise_multiplier as f64));
                         x + noise
                     })
                     .collect();
@@ -437,7 +446,13 @@ impl TensorData {
 
 impl fmt::Display for TensorData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Tensor<{}>({}, {} elements)", self.dtype(), self.shape(), self.len())
+        write!(
+            f,
+            "Tensor<{}>({}, {} elements)",
+            self.dtype(),
+            self.shape(),
+            self.len()
+        )
     }
 }
 
@@ -566,7 +581,7 @@ mod tests {
         // Note: In a strict implementation, this would be invalid
         // but for flexibility, we allow mismatched sizes and validate() returns false
         let invalid = TensorData::Float32 {
-            data: vec![1.0, 2.0, 3.0], // 3 elements
+            data: vec![1.0, 2.0, 3.0],           // 3 elements
             shape: TensorShape::new(vec![2, 3]), // expects 6 elements
         };
         assert!(!invalid.validate());

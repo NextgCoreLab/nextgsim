@@ -299,11 +299,7 @@ impl IntentExecutor for OptimizeResourcesExecutor {
 
         let mut changes = Vec::new();
         for (cell_key, load) in &loads {
-            let weight = if avg_load > 0.0 {
-                load / avg_load
-            } else {
-                1.0
-            };
+            let weight = if avg_load > 0.0 { load / avg_load } else { 1.0 };
             let allocation = (total_budget / loads.len() as f64) * weight;
             let alloc_key = format!("{cell_key}/allocation");
             state.set(&alloc_key, &format!("{allocation:.2}"));
@@ -399,11 +395,7 @@ impl IntentExecutor for TriggerHandoverExecutor {
         }
 
         // If a target cell parameter was explicitly provided, use it.
-        let target_cell = intent
-            .parameters
-            .get("target_cell")
-            .cloned()
-            .or(best_cell);
+        let target_cell = intent.parameters.get("target_cell").cloned().or(best_cell);
 
         match target_cell {
             Some(tc) => {
@@ -500,7 +492,10 @@ impl IntentExecutor for AdjustQosExecutor {
         });
 
         // Requested adjustments from parameters.
-        let target_5qi: Option<u32> = intent.parameters.get("target_5qi").and_then(|v| v.parse().ok());
+        let target_5qi: Option<u32> = intent
+            .parameters
+            .get("target_5qi")
+            .and_then(|v| v.parse().ok());
         let mbr_delta_pct: f64 = intent
             .parameters
             .get("mbr_change_pct")
@@ -632,7 +627,10 @@ impl IntentExecutor for CreateSliceExecutor {
         output.insert("sst".to_string(), sst.to_string());
         output.insert("sd".to_string(), sd);
         output.insert("max_ues".to_string(), max_ues.to_string());
-        output.insert("guaranteed_mbr_mbps".to_string(), format!("{guaranteed_mbr:.2}"));
+        output.insert(
+            "guaranteed_mbr_mbps".to_string(),
+            format!("{guaranteed_mbr:.2}"),
+        );
         output.insert("isolation".to_string(), isolation.to_string());
 
         IntentExecutionResult {
@@ -693,7 +691,13 @@ impl IntentExecutor for ModifySliceExecutor {
         });
 
         // Apply each provided parameter.
-        let modifiable = ["max_ues", "guaranteed_mbr_mbps", "isolation", "status", "sd"];
+        let modifiable = [
+            "max_ues",
+            "guaranteed_mbr_mbps",
+            "isolation",
+            "status",
+            "sd",
+        ];
         let mut modified_count = 0u32;
         for param_name in &modifiable {
             if let Some(value) = intent.parameters.get(*param_name) {
@@ -846,7 +850,10 @@ mod tests {
 
         let result = QueryExecutor.execute(&intent, &state);
         assert_eq!(result.status, IntentStatus::Success);
-        assert_eq!(result.output.get("cell/cell-1/load").map(String::as_str), Some("0.8"));
+        assert_eq!(
+            result.output.get("cell/cell-1/load").map(String::as_str),
+            Some("0.8")
+        );
     }
 
     #[test]
@@ -868,18 +875,24 @@ mod tests {
 
         let result = OptimizeResourcesExecutor.execute(&intent, &state);
         assert_eq!(result.status, IntentStatus::Success);
-        assert_eq!(result.output.get("cells_optimized").map(String::as_str), Some("3"));
+        assert_eq!(
+            result.output.get("cells_optimized").map(String::as_str),
+            Some("3")
+        );
     }
 
     #[test]
     fn test_trigger_handover_executor() {
         let state = make_state();
-        let intent = Intent::new(AgentId::new("a1"), IntentType::TriggerHandover)
-            .with_target("ue-42");
+        let intent =
+            Intent::new(AgentId::new("a1"), IntentType::TriggerHandover).with_target("ue-42");
 
         let result = TriggerHandoverExecutor.execute(&intent, &state);
         assert_eq!(result.status, IntentStatus::Success);
-        assert_eq!(result.output.get("target_cell").map(String::as_str), Some("cell/cell-2"));
+        assert_eq!(
+            result.output.get("target_cell").map(String::as_str),
+            Some("cell/cell-2")
+        );
     }
 
     #[test]
@@ -892,8 +905,14 @@ mod tests {
 
         let result = AdjustQosExecutor.execute(&intent, &state);
         assert_eq!(result.status, IntentStatus::Success);
-        assert_eq!(result.output.get("new_mbr_mbps").map(String::as_str), Some("60.00"));
-        assert_eq!(result.output.get("new_latency_ms").map(String::as_str), Some("18.00"));
+        assert_eq!(
+            result.output.get("new_mbr_mbps").map(String::as_str),
+            Some("60.00")
+        );
+        assert_eq!(
+            result.output.get("new_latency_ms").map(String::as_str),
+            Some("18.00")
+        );
     }
 
     #[test]
@@ -929,7 +948,10 @@ mod tests {
 
         let result = ModifySliceExecutor.execute(&intent, &state);
         assert_eq!(result.status, IntentStatus::Success);
-        assert_eq!(state.get("slice/existing-slice/max_ues"), Some("1000".to_string()));
+        assert_eq!(
+            state.get("slice/existing-slice/max_ues"),
+            Some("1000".to_string())
+        );
     }
 
     #[test]

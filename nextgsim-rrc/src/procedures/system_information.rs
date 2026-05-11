@@ -173,7 +173,9 @@ pub fn build_mib(params: &MibParams) -> Result<BCCH_BCH_Message, SystemInformati
             DmrsTypeAPosition::Pos3 => MIBDmrs_TypeA_Position(MIBDmrs_TypeA_Position::POS3),
         },
         pdcch_config_sib1: PDCCH_ConfigSIB1 {
-            control_resource_set_zero: ControlResourceSetZero(params.pdcch_config_sib1.coreset_zero),
+            control_resource_set_zero: ControlResourceSetZero(
+                params.pdcch_config_sib1.coreset_zero,
+            ),
             search_space_zero: SearchSpaceZero(params.pdcch_config_sib1.search_space_zero),
         },
         cell_barred: match params.cell_barred {
@@ -336,15 +338,21 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
     }
 
     // Build cell selection info if present
-    let cell_selection_info = params.cell_selection_info.as_ref().map(|csi| {
-        SIB1CellSelectionInfo {
-            q_rx_lev_min: Q_RxLevMin(csi.q_rx_lev_min),
-            q_rx_lev_min_offset: csi.q_rx_lev_min_offset.map(SIB1CellSelectionInfoQ_RxLevMinOffset),
-            q_rx_lev_min_sul: csi.q_rx_lev_min_sul.map(Q_RxLevMin),
-            q_qual_min: csi.q_qual_min.map(Q_QualMin),
-            q_qual_min_offset: csi.q_qual_min_offset.map(SIB1CellSelectionInfoQ_QualMinOffset),
-        }
-    });
+    let cell_selection_info =
+        params
+            .cell_selection_info
+            .as_ref()
+            .map(|csi| SIB1CellSelectionInfo {
+                q_rx_lev_min: Q_RxLevMin(csi.q_rx_lev_min),
+                q_rx_lev_min_offset: csi
+                    .q_rx_lev_min_offset
+                    .map(SIB1CellSelectionInfoQ_RxLevMinOffset),
+                q_rx_lev_min_sul: csi.q_rx_lev_min_sul.map(Q_RxLevMin),
+                q_qual_min: csi.q_qual_min.map(Q_QualMin),
+                q_qual_min_offset: csi
+                    .q_qual_min_offset
+                    .map(SIB1CellSelectionInfoQ_QualMinOffset),
+            });
 
     // Build PLMN identity info list
     let plmn_identity_list: Vec<PLMN_IdentityInfo> = params
@@ -382,7 +390,9 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
     };
 
     Ok(BCCH_DL_SCH_Message {
-        message: BCCH_DL_SCH_MessageType::C1(BCCH_DL_SCH_MessageType_c1::SystemInformationBlockType1(sib1)),
+        message: BCCH_DL_SCH_MessageType::C1(
+            BCCH_DL_SCH_MessageType_c1::SystemInformationBlockType1(sib1),
+        ),
     })
 }
 
@@ -451,13 +461,16 @@ pub fn parse_sib1(msg: &BCCH_DL_SCH_Message) -> Result<Sib1Data, SystemInformati
     };
 
     // Parse cell selection info
-    let cell_selection_info = sib1.cell_selection_info.as_ref().map(|csi| CellSelectionInfo {
-        q_rx_lev_min: csi.q_rx_lev_min.0,
-        q_rx_lev_min_offset: csi.q_rx_lev_min_offset.as_ref().map(|v| v.0),
-        q_rx_lev_min_sul: csi.q_rx_lev_min_sul.as_ref().map(|v| v.0),
-        q_qual_min: csi.q_qual_min.as_ref().map(|v| v.0),
-        q_qual_min_offset: csi.q_qual_min_offset.as_ref().map(|v| v.0),
-    });
+    let cell_selection_info = sib1
+        .cell_selection_info
+        .as_ref()
+        .map(|csi| CellSelectionInfo {
+            q_rx_lev_min: csi.q_rx_lev_min.0,
+            q_rx_lev_min_offset: csi.q_rx_lev_min_offset.as_ref().map(|v| v.0),
+            q_rx_lev_min_sul: csi.q_rx_lev_min_sul.as_ref().map(|v| v.0),
+            q_qual_min: csi.q_qual_min.as_ref().map(|v| v.0),
+            q_qual_min_offset: csi.q_qual_min_offset.as_ref().map(|v| v.0),
+        });
 
     // Parse PLMN identity info list
     let plmn_identity_info_list: Vec<PlmnIdentityInfo> = sib1
@@ -502,7 +515,10 @@ fn parse_plmn_identity_info(info: &PLMN_IdentityInfo) -> PlmnIdentityInfo {
         .collect();
 
     // Parse tracking area code (24 bits)
-    let tracking_area_code = info.tracking_area_code.as_ref().map(|tac| bitvec_to_u32(&tac.0));
+    let tracking_area_code = info
+        .tracking_area_code
+        .as_ref()
+        .map(|tac| bitvec_to_u32(&tac.0));
 
     // Parse cell identity (36 bits)
     let cell_identity = bitvec_to_u64(&info.cell_identity.0);
@@ -615,7 +631,10 @@ mod tests {
 
         let data = result.unwrap();
         assert_eq!(data.system_frame_number, params.system_frame_number);
-        assert_eq!(data.sub_carrier_spacing_common, params.sub_carrier_spacing_common);
+        assert_eq!(
+            data.sub_carrier_spacing_common,
+            params.sub_carrier_spacing_common
+        );
         assert_eq!(data.ssb_subcarrier_offset, params.ssb_subcarrier_offset);
         assert_eq!(data.dmrs_type_a_position, params.dmrs_type_a_position);
         assert_eq!(data.cell_barred, params.cell_barred);
@@ -660,7 +679,10 @@ mod tests {
 
     #[test]
     fn test_mib_all_scs_options() {
-        for scs in [SubCarrierSpacingCommon::Scs15Or60, SubCarrierSpacingCommon::Scs30Or120] {
+        for scs in [
+            SubCarrierSpacingCommon::Scs15Or60,
+            SubCarrierSpacingCommon::Scs30Or120,
+        ] {
             let params = MibParams {
                 sub_carrier_spacing_common: scs,
                 ..create_test_mib_params()
@@ -775,16 +797,20 @@ mod tests {
     #[test]
     fn test_sib1_multiple_plmns() {
         let params = Sib1Params {
-            plmn_identity_info_list: vec![
-                PlmnIdentityInfo {
-                    plmn_identity_list: vec![
-                        PlmnIdentity { mcc: Some([0, 0, 1]), mnc: vec![0, 1] },
-                        PlmnIdentity { mcc: Some([3, 1, 0]), mnc: vec![2, 6, 0] },
-                    ],
-                    tracking_area_code: Some(0x000001),
-                    cell_identity: 0x123456789,
-                },
-            ],
+            plmn_identity_info_list: vec![PlmnIdentityInfo {
+                plmn_identity_list: vec![
+                    PlmnIdentity {
+                        mcc: Some([0, 0, 1]),
+                        mnc: vec![0, 1],
+                    },
+                    PlmnIdentity {
+                        mcc: Some([3, 1, 0]),
+                        mnc: vec![2, 6, 0],
+                    },
+                ],
+                tracking_area_code: Some(0x000001),
+                cell_identity: 0x123456789,
+            }],
             ..create_test_sib1_params()
         };
         let msg = build_sib1(&params).unwrap();

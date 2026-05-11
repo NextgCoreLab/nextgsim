@@ -106,13 +106,13 @@ pub struct MibInfo {
 pub struct Sib1Info {
     pub has_sib1: bool,
     pub is_reserved: bool,
-    pub nci: i64,       // NR Cell Identity
-    pub tac: u32,       // Tracking Area Code
+    pub nci: i64, // NR Cell Identity
+    pub tac: u32, // Tracking Area Code
     pub plmn: Plmn,
     // Cell selection parameters (from CellSelectionInfo)
-    pub q_rx_lev_min: i8,        // Minimum required RX level
+    pub q_rx_lev_min: i8, // Minimum required RX level
     pub q_rx_lev_min_offset: Option<u8>,
-    pub q_qual_min: Option<i8>,  // Minimum quality level
+    pub q_qual_min: Option<i8>, // Minimum quality level
 }
 
 /// Description of a detected cell
@@ -337,7 +337,9 @@ impl CellSelector {
                 e.insert(CellDescription::new(dbm));
                 tracing::debug!(
                     "New cell detected: cell_id={}, dbm={}, total_cells={}",
-                    cell_id, dbm, self.cells.len()
+                    cell_id,
+                    dbm,
+                    self.cells.len()
                 );
                 return CellChangeEvent::CellDetected(cell_id);
             }
@@ -349,7 +351,9 @@ impl CellSelector {
                 self.cells.remove(&cell_id);
                 tracing::debug!(
                     "Cell lost: cell_id={}, was_active={}, total_cells={}",
-                    cell_id, was_active, self.cells.len()
+                    cell_id,
+                    was_active,
+                    self.cells.len()
                 );
                 if was_active {
                     let old_cell = std::mem::take(&mut self.current_cell);
@@ -371,7 +375,9 @@ impl CellSelector {
         if let Some(cell) = self.cells.get_mut(&cell_id) {
             tracing::debug!(
                 "MIB updated for cell {}: barred={}, intra_freq_reselect={}",
-                cell_id, mib.is_barred, mib.is_intra_freq_reselect_allowed
+                cell_id,
+                mib.is_barred,
+                mib.is_intra_freq_reselect_allowed
             );
             cell.mib = mib;
         }
@@ -382,7 +388,10 @@ impl CellSelector {
         if let Some(cell) = self.cells.get_mut(&cell_id) {
             tracing::debug!(
                 "SIB1 updated for cell {}: plmn={}, tac={}, reserved={}",
-                cell_id, sib1.plmn, sib1.tac, sib1.is_reserved
+                cell_id,
+                sib1.plmn,
+                sib1.tac,
+                sib1.is_reserved
             );
             cell.sib1 = sib1;
         }
@@ -425,7 +434,8 @@ impl CellSelector {
         let elapsed = self.started_time.elapsed();
 
         // Wait for initial discovery period
-        if elapsed < Duration::from_millis(CELL_SELECTION_STARTUP_DELAY_MS) && self.cells.is_empty() {
+        if elapsed < Duration::from_millis(CELL_SELECTION_STARTUP_DELAY_MS) && self.cells.is_empty()
+        {
             return None;
         }
 
@@ -435,8 +445,8 @@ impl CellSelector {
         }
 
         let last_cell = self.current_cell.clone();
-        let should_log_errors = last_cell.cell_id != 0 ||
-            self.last_failure_logged.is_none_or(|t| {
+        let should_log_errors = last_cell.cell_id != 0
+            || self.last_failure_logged.is_none_or(|t| {
                 t.elapsed() >= Duration::from_millis(CELL_SELECTION_LOG_INTERVAL_MS)
             });
 
@@ -477,10 +487,8 @@ impl CellSelector {
 
         // Apply cell reselection with hysteresis if we already have a serving cell
         if last_cell.cell_id != 0 && cell_found {
-            let should_reselect = self.evaluate_cell_reselection(
-                last_cell.cell_id,
-                cell_info.cell_id,
-            );
+            let should_reselect =
+                self.evaluate_cell_reselection(last_cell.cell_id, cell_info.cell_id);
             if !should_reselect {
                 // Keep current cell, reset candidate
                 cell_info = last_cell.clone();
@@ -494,7 +502,10 @@ impl CellSelector {
         if cell_info.cell_id != 0 && cell_info.cell_id != last_cell.cell_id {
             tracing::info!(
                 "Cell reselection: id={}, plmn={}, tac={}, category={:?}",
-                cell_info.cell_id, cell_info.plmn, cell_info.tac, cell_info.category
+                cell_info.cell_id,
+                cell_info.plmn,
+                cell_info.tac,
+                cell_info.category
             );
             // Clear reselection candidate on successful reselection
             self.reselection_params.reselection_candidate = None;
@@ -520,8 +531,16 @@ impl CellSelector {
         }
 
         // Get signal strengths
-        let current_dbm = self.cells.get(&current_cell_id).map(|c| c.dbm).unwrap_or(i32::MIN);
-        let best_dbm = self.cells.get(&best_cell_id).map(|c| c.dbm).unwrap_or(i32::MIN);
+        let current_dbm = self
+            .cells
+            .get(&current_cell_id)
+            .map(|c| c.dbm)
+            .unwrap_or(i32::MIN);
+        let best_dbm = self
+            .cells
+            .get(&best_cell_id)
+            .map(|c| c.dbm)
+            .unwrap_or(i32::MIN);
 
         // Apply hysteresis: new cell must be better by q_hyst dB
         let required_margin = self.reselection_params.q_hyst;
@@ -539,7 +558,10 @@ impl CellSelector {
             self.reselection_params.candidate_better_since = Some(Instant::now());
             tracing::debug!(
                 "Cell reselection candidate: cell_id={}, dbm={} (current: cell_id={}, dbm={})",
-                best_cell_id, best_dbm, current_cell_id, current_dbm
+                best_cell_id,
+                best_dbm,
+                current_cell_id,
+                current_dbm
             );
             return false;
         }
@@ -724,7 +746,13 @@ pub enum CellChangeEvent {
 mod tests {
     use super::*;
 
-    fn make_cell_with_sib1(dbm: i32, plmn: Plmn, tac: u32, barred: bool, reserved: bool) -> CellDescription {
+    fn make_cell_with_sib1(
+        dbm: i32,
+        plmn: Plmn,
+        tac: u32,
+        barred: bool,
+        reserved: bool,
+    ) -> CellDescription {
         CellDescription {
             dbm,
             last_seen: Some(Instant::now()),
@@ -753,7 +781,9 @@ mod tests {
         selector.set_selected_plmn(Some(plmn));
 
         // Add a suitable cell
-        selector.cells.insert(1, make_cell_with_sib1(-80, plmn, 1, false, false));
+        selector
+            .cells
+            .insert(1, make_cell_with_sib1(-80, plmn, 1, false, false));
         // Override started_time to bypass startup delay
         selector.started_time = Instant::now() - Duration::from_secs(10);
 
@@ -772,7 +802,9 @@ mod tests {
         selector.set_selected_plmn(Some(plmn1));
 
         // Add a cell with different PLMN (acceptable but not suitable)
-        selector.cells.insert(1, make_cell_with_sib1(-80, plmn2, 1, false, false));
+        selector
+            .cells
+            .insert(1, make_cell_with_sib1(-80, plmn2, 1, false, false));
         selector.started_time = Instant::now() - Duration::from_secs(10);
 
         let result = selector.perform_cell_selection();
@@ -789,7 +821,9 @@ mod tests {
         selector.set_selected_plmn(Some(plmn));
 
         // Add a barred cell
-        selector.cells.insert(1, make_cell_with_sib1(-80, plmn, 1, true, false));
+        selector
+            .cells
+            .insert(1, make_cell_with_sib1(-80, plmn, 1, true, false));
         selector.started_time = Instant::now() - Duration::from_secs(10);
 
         let result = selector.perform_cell_selection();
@@ -803,9 +837,15 @@ mod tests {
         selector.set_selected_plmn(Some(plmn));
 
         // Add multiple suitable cells with different signal strengths
-        selector.cells.insert(1, make_cell_with_sib1(-90, plmn, 1, false, false));
-        selector.cells.insert(2, make_cell_with_sib1(-70, plmn, 1, false, false)); // Best
-        selector.cells.insert(3, make_cell_with_sib1(-85, plmn, 1, false, false));
+        selector
+            .cells
+            .insert(1, make_cell_with_sib1(-90, plmn, 1, false, false));
+        selector
+            .cells
+            .insert(2, make_cell_with_sib1(-70, plmn, 1, false, false)); // Best
+        selector
+            .cells
+            .insert(3, make_cell_with_sib1(-85, plmn, 1, false, false));
         selector.started_time = Instant::now() - Duration::from_secs(10);
 
         let result = selector.perform_cell_selection();
@@ -836,7 +876,9 @@ mod tests {
         selector.set_selected_plmn(Some(plmn));
 
         // Add a cell
-        selector.cells.insert(1, make_cell_with_sib1(-80, plmn, 1, false, false));
+        selector
+            .cells
+            .insert(1, make_cell_with_sib1(-80, plmn, 1, false, false));
 
         // Add TAI to forbidden list
         selector.add_forbidden_tai_roaming(Tai::new(plmn, 1));

@@ -52,7 +52,7 @@ impl NtnGnbConfig {
             satellite_id,
             altitude_m,
             is_transparent: true,
-            feeder_link_delay_us: 2000, // ~2ms typical for LEO
+            feeder_link_delay_us: 2000,       // ~2ms typical for LEO
             max_service_link_delay_us: 10000, // ~10ms max for LEO
             harq_rtt_compensation: true,
             num_harq_processes: 16,
@@ -130,10 +130,10 @@ impl NtnBeamCell {
         let dlat = (ue_lat_deg - self.center_lat_deg).to_radians();
         let dlon = (ue_lon_deg - self.center_lon_deg).to_radians();
 
-        let a = (dlat / 2.0).sin().powi(2) +
-                self.center_lat_deg.to_radians().cos() *
-                ue_lat_deg.to_radians().cos() *
-                (dlon / 2.0).sin().powi(2);
+        let a = (dlat / 2.0).sin().powi(2)
+            + self.center_lat_deg.to_radians().cos()
+                * ue_lat_deg.to_radians().cos()
+                * (dlon / 2.0).sin().powi(2);
 
         let distance_km = 6371.0 * 2.0 * a.sqrt().asin();
 
@@ -186,10 +186,13 @@ impl NtnHarqManager {
 
         let mut process_states = HashMap::new();
         for i in 0..num_processes {
-            process_states.insert(i, HarqProcessState {
-                busy: false,
-                available_at: Instant::now(),
-            });
+            process_states.insert(
+                i,
+                HarqProcessState {
+                    busy: false,
+                    available_at: Instant::now(),
+                },
+            );
         }
 
         Self {
@@ -227,7 +230,8 @@ impl NtnHarqManager {
     /// Get number of available processes
     pub fn available_processes(&self) -> usize {
         let now = Instant::now();
-        self.process_states.values()
+        self.process_states
+            .values()
             .filter(|s| !s.busy || now >= s.available_at)
             .count()
     }
@@ -351,14 +355,19 @@ impl NtnGnbManager {
 
     /// Find best beam cell for UE
     pub fn find_best_beam(&self, ue_lat_deg: f64, ue_lon_deg: f64) -> Option<u32> {
-        self.beam_cells.iter()
+        self.beam_cells
+            .iter()
             .filter(|(_, cell)| cell.is_ue_in_beam(ue_lat_deg, ue_lon_deg))
             .min_by(|(_, a), (_, b)| {
-                let dist_a = ((a.center_lat_deg - ue_lat_deg).powi(2) +
-                             (a.center_lon_deg - ue_lon_deg).powi(2)).sqrt();
-                let dist_b = ((b.center_lat_deg - ue_lat_deg).powi(2) +
-                             (b.center_lon_deg - ue_lon_deg).powi(2)).sqrt();
-                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                let dist_a = ((a.center_lat_deg - ue_lat_deg).powi(2)
+                    + (a.center_lon_deg - ue_lon_deg).powi(2))
+                .sqrt();
+                let dist_b = ((b.center_lat_deg - ue_lat_deg).powi(2)
+                    + (b.center_lon_deg - ue_lon_deg).powi(2))
+                .sqrt();
+                dist_a
+                    .partial_cmp(&dist_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(id, _)| *id)
     }
@@ -477,7 +486,9 @@ impl IslHandoverManager {
 
     /// Adds or updates a single neighbor entry.
     pub fn upsert_neighbor(&mut self, neighbor: IslNeighbor) {
-        if let Some(existing) = self.neighbors.iter_mut()
+        if let Some(existing) = self
+            .neighbors
+            .iter_mut()
             .find(|n| n.satellite_id == neighbor.satellite_id)
         {
             *existing = neighbor;
@@ -491,13 +502,18 @@ impl IslHandoverManager {
     /// Criteria: overlapping coverage, link quality ≥ threshold,
     /// not already serving.  Returns the highest-quality candidate.
     pub fn select_target(&self) -> Option<&IslNeighbor> {
-        self.neighbors.iter()
+        self.neighbors
+            .iter()
             .filter(|n| {
                 n.overlapping_coverage
                     && n.link_quality_db >= self.quality_threshold_db
                     && n.satellite_id != self.serving_satellite_id
             })
-            .max_by(|a, b| a.link_quality_db.partial_cmp(&b.link_quality_db).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.link_quality_db
+                    .partial_cmp(&b.link_quality_db)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     /// Initiates an ISL handover due to `trigger`.
@@ -515,7 +531,10 @@ impl IslHandoverManager {
                 let target_id = target.satellite_id;
                 log::info!(
                     "[NTN ISL] serving={} → target={} trigger={:?} quality={:.1}dB",
-                    self.serving_satellite_id, target_id, trigger, target.link_quality_db,
+                    self.serving_satellite_id,
+                    target_id,
+                    trigger,
+                    target.link_quality_db,
                 );
                 self.target_satellite_id = Some(target_id);
                 self.state = IslHandoverState::Preparing;
@@ -548,7 +567,11 @@ impl IslHandoverManager {
             return Err("not in executing state");
         }
         let target = self.target_satellite_id.ok_or("no target satellite")?;
-        log::info!("[NTN ISL] complete: {} → {}", self.serving_satellite_id, target);
+        log::info!(
+            "[NTN ISL] complete: {} → {}",
+            self.serving_satellite_id,
+            target
+        );
         self.serving_satellite_id = target;
         self.target_satellite_id = None;
         self.trigger = None;
@@ -566,7 +589,8 @@ impl IslHandoverManager {
     pub fn fail(&mut self, reason: &str) {
         log::warn!(
             "[NTN ISL] handover failed serving={} reason={}",
-            self.serving_satellite_id, reason,
+            self.serving_satellite_id,
+            reason,
         );
         self.target_satellite_id = None;
         self.trigger = None;
@@ -574,10 +598,18 @@ impl IslHandoverManager {
         self.failure_count += 1;
     }
 
-    pub fn state(&self) -> IslHandoverState { self.state }
-    pub fn target_satellite_id(&self) -> Option<u32> { self.target_satellite_id }
-    pub fn handover_count(&self) -> u32 { self.handover_count }
-    pub fn failure_count(&self) -> u32 { self.failure_count }
+    pub fn state(&self) -> IslHandoverState {
+        self.state
+    }
+    pub fn target_satellite_id(&self) -> Option<u32> {
+        self.target_satellite_id
+    }
+    pub fn handover_count(&self) -> u32 {
+        self.handover_count
+    }
+    pub fn failure_count(&self) -> u32 {
+        self.failure_count
+    }
 }
 
 #[cfg(test)]
@@ -700,7 +732,7 @@ mod tests {
         let mut mgr = IslHandoverManager::new(1);
         mgr.update_neighbors(vec![
             make_neighbor(2, 10.0, true),
-            make_neighbor(3, 18.0, true), // best quality
+            make_neighbor(3, 18.0, true),  // best quality
             make_neighbor(4, 15.0, false), // no coverage overlap
         ]);
         let target = mgr.select_target().unwrap();

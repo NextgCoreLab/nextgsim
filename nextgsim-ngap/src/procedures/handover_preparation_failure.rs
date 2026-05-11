@@ -81,18 +81,18 @@ pub fn build_handover_preparation_failure(
     protocol_ies.push(HandoverPreparationFailureProtocolIEs_Entry {
         id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
         criticality: Criticality(Criticality::IGNORE),
-        value: HandoverPreparationFailureProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
-            AMF_UE_NGAP_ID(params.amf_ue_ngap_id),
-        ),
+        value: HandoverPreparationFailureProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(
+            params.amf_ue_ngap_id,
+        )),
     });
 
     // IE: RAN-UE-NGAP-ID (mandatory)
     protocol_ies.push(HandoverPreparationFailureProtocolIEs_Entry {
         id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
         criticality: Criticality(Criticality::IGNORE),
-        value: HandoverPreparationFailureProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
-            RAN_UE_NGAP_ID(params.ran_ue_ngap_id),
-        ),
+        value: HandoverPreparationFailureProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(
+            params.ran_ue_ngap_id,
+        )),
     });
 
     // IE: Cause (mandatory)
@@ -195,9 +195,7 @@ pub fn parse_handover_preparation_failure_full(
 
 fn build_cause(cause: &NgSetupFailureCause) -> Cause {
     match cause {
-        NgSetupFailureCause::RadioNetwork(rn) => {
-            Cause::RadioNetwork(build_radio_network_cause(rn))
-        }
+        NgSetupFailureCause::RadioNetwork(rn) => Cause::RadioNetwork(build_radio_network_cause(rn)),
         NgSetupFailureCause::Transport(t) => Cause::Transport(build_transport_cause(t)),
         NgSetupFailureCause::Nas(n) => Cause::Nas(build_nas_cause(n)),
         NgSetupFailureCause::Protocol(p) => Cause::Protocol(build_protocol_cause(p)),
@@ -267,9 +265,7 @@ fn build_misc_cause(cause: &MiscCause) -> CauseMisc {
 
 fn parse_cause(cause: &Cause) -> NgSetupFailureCause {
     match cause {
-        Cause::RadioNetwork(rn) => {
-            NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn))
-        }
+        Cause::RadioNetwork(rn) => NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn)),
         Cause::Transport(t) => NgSetupFailureCause::Transport(parse_transport_cause(t)),
         Cause::Nas(n) => NgSetupFailureCause::Nas(parse_nas_cause(n)),
         Cause::Protocol(p) => NgSetupFailureCause::Protocol(parse_protocol_cause(p)),
@@ -385,9 +381,7 @@ fn build_criticality_diagnostics(diag: &CriticalityDiagnosticsInfo) -> Criticali
     }
 }
 
-fn parse_criticality_diagnostics(
-    diag: &CriticalityDiagnostics,
-) -> CriticalityDiagnosticsInfo {
+fn parse_criticality_diagnostics(diag: &CriticalityDiagnostics) -> CriticalityDiagnosticsInfo {
     let procedure_code = diag.procedure_code.as_ref().map(|pc| pc.0);
     let triggering_message = diag.triggering_message.as_ref().map(|tm| match tm.0 {
         TriggeringMessage::INITIATING_MESSAGE => TriggeringMessageValue::InitiatingMessage,
@@ -535,8 +529,7 @@ mod tests {
         };
 
         let encoded = encode_handover_preparation_failure_msg(&params).expect("Failed to encode");
-        let parsed =
-            decode_handover_preparation_failure_msg(&encoded).expect("Failed to decode");
+        let parsed = decode_handover_preparation_failure_msg(&encoded).expect("Failed to decode");
 
         assert_eq!(parsed.amf_ue_ngap_id, 100);
         assert_eq!(parsed.ran_ue_ngap_id, 200);

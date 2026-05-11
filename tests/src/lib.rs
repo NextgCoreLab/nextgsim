@@ -24,10 +24,8 @@ pub mod test_fixtures;
 pub mod test_utils;
 
 pub use mock_amf::{MockAmf, MockAmfConfig, MockAmfEvent};
-pub use test_fixtures::{TestConfig, TestUeConfig, TestGnbConfig};
+pub use test_fixtures::{TestConfig, TestGnbConfig, TestUeConfig};
 pub use test_utils::{
-    init_test_logging, wait_for_condition, TestResult,
-    DEFAULT_TEST_TIMEOUT, DEFAULT_POLL_INTERVAL,
-    TEST_SCTP_PORT_BASE, TEST_GTP_PORT_BASE, TEST_CLI_PORT_BASE,
-    get_test_port,
+    get_test_port, init_test_logging, wait_for_condition, TestResult, DEFAULT_POLL_INTERVAL,
+    DEFAULT_TEST_TIMEOUT, TEST_CLI_PORT_BASE, TEST_GTP_PORT_BASE, TEST_SCTP_PORT_BASE,
 };

@@ -1,13 +1,13 @@
 //! AI Agent Framework Task for gNB
 
+use crate::tasks::{AgentMessage, GnbTaskBase, RrcMessage, Task, TaskMessage};
+use nextgsim_agent::{AgentCapabilities, AgentCoordinator, AgentId, AgentType, Intent, IntentType};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use nextgsim_agent::{AgentCapabilities, AgentCoordinator, AgentId, AgentType, Intent, IntentType};
-use crate::tasks::{GnbTaskBase, AgentMessage, Task, TaskMessage};
 
 pub struct AgentTask {
-    _task_base: GnbTaskBase,
+    task_base: GnbTaskBase,
     coordinator: AgentCoordinator,
     agents: HashMap<String, Vec<String>>,
 }
@@ -15,7 +15,7 @@ pub struct AgentTask {
 impl AgentTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         Self {
-            _task_base: task_base,
+            task_base,
             coordinator: AgentCoordinator::new(),
             agents: HashMap::new(),
         }
@@ -32,8 +32,17 @@ impl Task for AgentTask {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => {
                     match msg {
-                        AgentMessage::RegisterAgent { agent_id, agent_type, capabilities } => {
-                            debug!("Agent: Registering {} (type={}, caps={})", agent_id, agent_type, capabilities.len());
+                        AgentMessage::RegisterAgent {
+                            agent_id,
+                            agent_type,
+                            capabilities,
+                        } => {
+                            debug!(
+                                "Agent: Registering {} (type={}, caps={})",
+                                agent_id,
+                                agent_type,
+                                capabilities.len()
+                            );
                             let a_id = AgentId::new(&agent_id);
                             let a_type = match agent_type.as_str() {
                                 "mobility" => AgentType::Mobility,
@@ -48,7 +57,11 @@ impl Task for AgentTask {
                             self.coordinator.register_agent(a_id, a_type, caps);
                             self.agents.insert(agent_id, capabilities);
                         }
-                        AgentMessage::SubmitIntent { agent_id, intent_type, parameters } => {
+                        AgentMessage::SubmitIntent {
+                            agent_id,
+                            intent_type,
+                            parameters,
+                        } => {
                             debug!("Agent: Intent '{}' from {}", intent_type, agent_id);
                             let a_id = AgentId::new(&agent_id);
                             let i_type = match intent_type.as_str() {
@@ -68,12 +81,56 @@ impl Task for AgentTask {
                                 warn!("Agent: Intent submission failed: {}", e);
                             }
                         }
-                        AgentMessage::CoordinationEvent { event_type, agent_ids } => {
-                            debug!("Agent: Coordination event '{}' with {} agents", event_type, agent_ids.len());
+                        AgentMessage::CoordinationEvent {
+                            event_type,
+                            agent_ids,
+                        } => {
+                            debug!(
+                                "Agent: Coordination event '{}' with {} agents",
+                                event_type,
+                                agent_ids.len()
+                            );
                             // Process any pending intents queued during this coordination cycle
                             let results = self.coordinator.process_intents();
                             if !results.is_empty() {
-                                debug!("Agent: Processed {} intents after coordination event '{}'", results.len(), event_type);
+                                debug!(
+                                    "Agent: Processed {} intents after coordination event '{}'",
+                                    results.len(),
+                                    event_type
+                                );
+                                // Forward any handover actions produced by intent processing to RRC
+                                for result in &results {
+                                    if let Some(ue_id_str) = result.data.get("ue_id") {
+                                        if let Some(target_cell_str) =
+                                            result.data.get("target_cell")
+                                        {
+                                            if let (Ok(ue_id), Ok(target_cell)) = (
+                                                ue_id_str.parse::<i32>(),
+                                                target_cell_str.parse::<i32>(),
+                                            ) {
+                                                let confidence = result
+                                                    .data
+                                                    .get("confidence")
+                                                    .and_then(|s| s.parse::<f32>().ok())
+                                                    .unwrap_or(0.8);
+                                                debug!(
+                                                    "Agent: Forwarding handover action: ue_id={}, target_cell={}, confidence={}",
+                                                    ue_id, target_cell, confidence
+                                                );
+                                                let msg = RrcMessage::NwdafHandoverRecommendation {
+                                                    ue_id,
+                                                    target_cell,
+                                                    confidence,
+                                                };
+                                                if let Err(e) =
+                                                    self.task_base.rrc_tx.send(msg).await
+                                                {
+                                                    warn!("Agent: Failed to send handover action to RRC: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -82,6 +139,9 @@ impl Task for AgentTask {
                 None => break,
             }
         }
-        info!("Agent task stopped, {} registered agents", self.agents.len());
+        info!(
+            "Agent task stopped, {} registered agents",
+            self.agents.len()
+        );
     }
 }

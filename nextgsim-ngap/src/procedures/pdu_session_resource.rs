@@ -135,17 +135,25 @@ pub fn parse_pdu_session_resource_setup_request(
         })?,
         nas_pdu,
         pdu_session_resource_setup_list: pdu_session_resource_setup_list.ok_or_else(|| {
-            PduSessionResourceError::MissingMandatoryIe("PDUSessionResourceSetupListSUReq".to_string())
+            PduSessionResourceError::MissingMandatoryIe(
+                "PDUSessionResourceSetupListSUReq".to_string(),
+            )
         })?,
     })
 }
 
-fn parse_setup_list_su_req(list: &PDUSessionResourceSetupListSUReq) -> Vec<PduSessionResourceSetupItem> {
+fn parse_setup_list_su_req(
+    list: &PDUSessionResourceSetupListSUReq,
+) -> Vec<PduSessionResourceSetupItem> {
     list.0
         .iter()
         .map(|item| {
             let sst = item.s_nssai.sst.0.first().copied().unwrap_or(0);
-            let sd = item.s_nssai.sd.as_ref().and_then(|sd| sd.0.as_slice().try_into().ok());
+            let sd = item
+                .s_nssai
+                .sd
+                .as_ref()
+                .and_then(|sd| sd.0.as_slice().try_into().ok());
             PduSessionResourceSetupItem {
                 pdu_session_id: item.pdu_session_id.0,
                 nas_pdu: item.pdu_session_nas_pdu.as_ref().map(|p| p.0.clone()),
@@ -261,24 +269,34 @@ pub fn build_pdu_session_resource_setup_response(
     Ok(NGAP_PDU::SuccessfulOutcome(successful_outcome))
 }
 
-fn build_setup_list_su_res(items: &[PduSessionResourceSetupResponseItem]) -> PDUSessionResourceSetupListSURes {
+fn build_setup_list_su_res(
+    items: &[PduSessionResourceSetupResponseItem],
+) -> PDUSessionResourceSetupListSURes {
     let list: Vec<PDUSessionResourceSetupItemSURes> = items
         .iter()
         .map(|item| PDUSessionResourceSetupItemSURes {
             pdu_session_id: PDUSessionID(item.pdu_session_id),
-            pdu_session_resource_setup_response_transfer: PDUSessionResourceSetupItemSUResPDUSessionResourceSetupResponseTransfer(item.transfer.clone()),
+            pdu_session_resource_setup_response_transfer:
+                PDUSessionResourceSetupItemSUResPDUSessionResourceSetupResponseTransfer(
+                    item.transfer.clone(),
+                ),
             ie_extensions: None,
         })
         .collect();
     PDUSessionResourceSetupListSURes(list)
 }
 
-fn build_failed_to_setup_list_su_res(items: &[PduSessionResourceFailedToSetupItem]) -> PDUSessionResourceFailedToSetupListSURes {
+fn build_failed_to_setup_list_su_res(
+    items: &[PduSessionResourceFailedToSetupItem],
+) -> PDUSessionResourceFailedToSetupListSURes {
     let list: Vec<PDUSessionResourceFailedToSetupItemSURes> = items
         .iter()
         .map(|item| PDUSessionResourceFailedToSetupItemSURes {
             pdu_session_id: PDUSessionID(item.pdu_session_id),
-            pdu_session_resource_setup_unsuccessful_transfer: PDUSessionResourceFailedToSetupItemSUResPDUSessionResourceSetupUnsuccessfulTransfer(item.transfer.clone()),
+            pdu_session_resource_setup_unsuccessful_transfer:
+                PDUSessionResourceFailedToSetupItemSUResPDUSessionResourceSetupUnsuccessfulTransfer(
+                    item.transfer.clone(),
+                ),
             ie_extensions: None,
         })
         .collect();
@@ -344,7 +362,9 @@ pub fn parse_pdu_session_resource_setup_response(
     })
 }
 
-fn parse_setup_list_su_res(list: &PDUSessionResourceSetupListSURes) -> Vec<PduSessionResourceSetupResponseItem> {
+fn parse_setup_list_su_res(
+    list: &PDUSessionResourceSetupListSURes,
+) -> Vec<PduSessionResourceSetupResponseItem> {
     list.0
         .iter()
         .map(|item| PduSessionResourceSetupResponseItem {
@@ -354,16 +374,20 @@ fn parse_setup_list_su_res(list: &PDUSessionResourceSetupListSURes) -> Vec<PduSe
         .collect()
 }
 
-fn parse_failed_to_setup_list_su_res(list: &PDUSessionResourceFailedToSetupListSURes) -> Vec<PduSessionResourceFailedToSetupItem> {
+fn parse_failed_to_setup_list_su_res(
+    list: &PDUSessionResourceFailedToSetupListSURes,
+) -> Vec<PduSessionResourceFailedToSetupItem> {
     list.0
         .iter()
         .map(|item| PduSessionResourceFailedToSetupItem {
             pdu_session_id: item.pdu_session_id.0,
-            transfer: item.pdu_session_resource_setup_unsuccessful_transfer.0.clone(),
+            transfer: item
+                .pdu_session_resource_setup_unsuccessful_transfer
+                .0
+                .clone(),
         })
         .collect()
 }
-
 
 // ============================================================================
 // PDU Session Resource Release Command
@@ -418,7 +442,8 @@ pub fn parse_pdu_session_resource_release_command(
     let mut amf_ue_ngap_id: Option<u64> = None;
     let mut ran_ue_ngap_id: Option<u32> = None;
     let mut nas_pdu: Option<Vec<u8>> = None;
-    let mut pdu_session_resource_to_release_list: Option<Vec<PduSessionResourceToReleaseItem>> = None;
+    let mut pdu_session_resource_to_release_list: Option<Vec<PduSessionResourceToReleaseItem>> =
+        None;
 
     for ie in &command.protocol_i_es.0 {
         match &ie.value {
@@ -446,13 +471,19 @@ pub fn parse_pdu_session_resource_release_command(
             PduSessionResourceError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
         })?,
         nas_pdu,
-        pdu_session_resource_to_release_list: pdu_session_resource_to_release_list.ok_or_else(|| {
-            PduSessionResourceError::MissingMandatoryIe("PDUSessionResourceToReleaseListRelCmd".to_string())
-        })?,
+        pdu_session_resource_to_release_list: pdu_session_resource_to_release_list.ok_or_else(
+            || {
+                PduSessionResourceError::MissingMandatoryIe(
+                    "PDUSessionResourceToReleaseListRelCmd".to_string(),
+                )
+            },
+        )?,
     })
 }
 
-fn parse_to_release_list_rel_cmd(list: &PDUSessionResourceToReleaseListRelCmd) -> Vec<PduSessionResourceToReleaseItem> {
+fn parse_to_release_list_rel_cmd(
+    list: &PDUSessionResourceToReleaseListRelCmd,
+) -> Vec<PduSessionResourceToReleaseItem> {
     list.0
         .iter()
         .map(|item| PduSessionResourceToReleaseItem {
@@ -542,12 +573,17 @@ pub fn build_pdu_session_resource_release_response(
     Ok(NGAP_PDU::SuccessfulOutcome(successful_outcome))
 }
 
-fn build_released_list_rel_res(items: &[PduSessionResourceReleasedItem]) -> PDUSessionResourceReleasedListRelRes {
+fn build_released_list_rel_res(
+    items: &[PduSessionResourceReleasedItem],
+) -> PDUSessionResourceReleasedListRelRes {
     let list: Vec<PDUSessionResourceReleasedItemRelRes> = items
         .iter()
         .map(|item| PDUSessionResourceReleasedItemRelRes {
             pdu_session_id: PDUSessionID(item.pdu_session_id),
-            pdu_session_resource_release_response_transfer: PDUSessionResourceReleasedItemRelResPDUSessionResourceReleaseResponseTransfer(item.transfer.clone()),
+            pdu_session_resource_release_response_transfer:
+                PDUSessionResourceReleasedItemRelResPDUSessionResourceReleaseResponseTransfer(
+                    item.transfer.clone(),
+                ),
             ie_extensions: None,
         })
         .collect();
@@ -605,21 +641,27 @@ pub fn parse_pdu_session_resource_release_response(
             PduSessionResourceError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
         })?,
         released_list: released_list.ok_or_else(|| {
-            PduSessionResourceError::MissingMandatoryIe("PDUSessionResourceReleasedListRelRes".to_string())
+            PduSessionResourceError::MissingMandatoryIe(
+                "PDUSessionResourceReleasedListRelRes".to_string(),
+            )
         })?,
     })
 }
 
-fn parse_released_list_rel_res(list: &PDUSessionResourceReleasedListRelRes) -> Vec<PduSessionResourceReleasedItem> {
+fn parse_released_list_rel_res(
+    list: &PDUSessionResourceReleasedListRelRes,
+) -> Vec<PduSessionResourceReleasedItem> {
     list.0
         .iter()
         .map(|item| PduSessionResourceReleasedItem {
             pdu_session_id: item.pdu_session_id.0,
-            transfer: item.pdu_session_resource_release_response_transfer.0.clone(),
+            transfer: item
+                .pdu_session_resource_release_response_transfer
+                .0
+                .clone(),
         })
         .collect()
 }
-
 
 // ============================================================================
 // PDU Session Resource Modify Request
@@ -673,7 +715,8 @@ pub fn parse_pdu_session_resource_modify_request(
 
     let mut amf_ue_ngap_id: Option<u64> = None;
     let mut ran_ue_ngap_id: Option<u32> = None;
-    let mut pdu_session_resource_modify_list: Option<Vec<PduSessionResourceModifyRequestItem>> = None;
+    let mut pdu_session_resource_modify_list: Option<Vec<PduSessionResourceModifyRequestItem>> =
+        None;
 
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
@@ -698,12 +741,16 @@ pub fn parse_pdu_session_resource_modify_request(
             PduSessionResourceError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
         })?,
         pdu_session_resource_modify_list: pdu_session_resource_modify_list.ok_or_else(|| {
-            PduSessionResourceError::MissingMandatoryIe("PDUSessionResourceModifyListModReq".to_string())
+            PduSessionResourceError::MissingMandatoryIe(
+                "PDUSessionResourceModifyListModReq".to_string(),
+            )
         })?,
     })
 }
 
-fn parse_modify_list_mod_req(list: &PDUSessionResourceModifyListModReq) -> Vec<PduSessionResourceModifyRequestItem> {
+fn parse_modify_list_mod_req(
+    list: &PDUSessionResourceModifyListModReq,
+) -> Vec<PduSessionResourceModifyRequestItem> {
     list.0
         .iter()
         .map(|item| PduSessionResourceModifyRequestItem {
@@ -819,19 +866,26 @@ pub fn build_pdu_session_resource_modify_response(
     Ok(NGAP_PDU::SuccessfulOutcome(successful_outcome))
 }
 
-fn build_modify_list_mod_res(items: &[PduSessionResourceModifyResponseItem]) -> PDUSessionResourceModifyListModRes {
+fn build_modify_list_mod_res(
+    items: &[PduSessionResourceModifyResponseItem],
+) -> PDUSessionResourceModifyListModRes {
     let list: Vec<PDUSessionResourceModifyItemModRes> = items
         .iter()
         .map(|item| PDUSessionResourceModifyItemModRes {
             pdu_session_id: PDUSessionID(item.pdu_session_id),
-            pdu_session_resource_modify_response_transfer: PDUSessionResourceModifyItemModResPDUSessionResourceModifyResponseTransfer(item.transfer.clone()),
+            pdu_session_resource_modify_response_transfer:
+                PDUSessionResourceModifyItemModResPDUSessionResourceModifyResponseTransfer(
+                    item.transfer.clone(),
+                ),
             ie_extensions: None,
         })
         .collect();
     PDUSessionResourceModifyListModRes(list)
 }
 
-fn build_failed_to_modify_list_mod_res(items: &[PduSessionResourceFailedToModifyItem]) -> PDUSessionResourceFailedToModifyListModRes {
+fn build_failed_to_modify_list_mod_res(
+    items: &[PduSessionResourceFailedToModifyItem],
+) -> PDUSessionResourceFailedToModifyListModRes {
     let list: Vec<PDUSessionResourceFailedToModifyItemModRes> = items
         .iter()
         .map(|item| PDUSessionResourceFailedToModifyItemModRes {
@@ -902,7 +956,9 @@ pub fn parse_pdu_session_resource_modify_response(
     })
 }
 
-fn parse_modify_list_mod_res(list: &PDUSessionResourceModifyListModRes) -> Vec<PduSessionResourceModifyResponseItem> {
+fn parse_modify_list_mod_res(
+    list: &PDUSessionResourceModifyListModRes,
+) -> Vec<PduSessionResourceModifyResponseItem> {
     list.0
         .iter()
         .map(|item| PduSessionResourceModifyResponseItem {
@@ -912,16 +968,20 @@ fn parse_modify_list_mod_res(list: &PDUSessionResourceModifyListModRes) -> Vec<P
         .collect()
 }
 
-fn parse_failed_to_modify_list_mod_res(list: &PDUSessionResourceFailedToModifyListModRes) -> Vec<PduSessionResourceFailedToModifyItem> {
+fn parse_failed_to_modify_list_mod_res(
+    list: &PDUSessionResourceFailedToModifyListModRes,
+) -> Vec<PduSessionResourceFailedToModifyItem> {
     list.0
         .iter()
         .map(|item| PduSessionResourceFailedToModifyItem {
             pdu_session_id: item.pdu_session_id.0,
-            transfer: item.pdu_session_resource_modify_unsuccessful_transfer.0.clone(),
+            transfer: item
+                .pdu_session_resource_modify_unsuccessful_transfer
+                .0
+                .clone(),
         })
         .collect()
 }
-
 
 // ============================================================================
 // Convenience Functions
@@ -1125,7 +1185,8 @@ mod tests {
     fn test_pdu_session_resource_setup_response_roundtrip() {
         let params = create_test_setup_response_params();
 
-        let pdu = build_pdu_session_resource_setup_response(&params).expect("Failed to build response");
+        let pdu =
+            build_pdu_session_resource_setup_response(&params).expect("Failed to build response");
         let encoded = encode_ngap_pdu(&pdu).expect("Failed to encode");
         let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
 
@@ -1141,8 +1202,10 @@ mod tests {
     fn test_pdu_session_resource_setup_response_parse_roundtrip() {
         let params = create_test_setup_response_params();
 
-        let encoded = encode_pdu_session_resource_setup_response(&params).expect("Failed to encode");
-        let parsed = decode_pdu_session_resource_setup_response(&encoded).expect("Failed to decode and parse");
+        let encoded =
+            encode_pdu_session_resource_setup_response(&params).expect("Failed to encode");
+        let parsed = decode_pdu_session_resource_setup_response(&encoded)
+            .expect("Failed to decode and parse");
 
         assert_eq!(parsed.amf_ue_ngap_id, params.amf_ue_ngap_id);
         assert_eq!(parsed.ran_ue_ngap_id, params.ran_ue_ngap_id);
@@ -1181,7 +1244,8 @@ mod tests {
     fn test_pdu_session_resource_release_response_roundtrip() {
         let params = create_test_release_response_params();
 
-        let pdu = build_pdu_session_resource_release_response(&params).expect("Failed to build response");
+        let pdu =
+            build_pdu_session_resource_release_response(&params).expect("Failed to build response");
         let encoded = encode_ngap_pdu(&pdu).expect("Failed to encode");
         let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
 
@@ -1197,8 +1261,10 @@ mod tests {
     fn test_pdu_session_resource_release_response_parse_roundtrip() {
         let params = create_test_release_response_params();
 
-        let encoded = encode_pdu_session_resource_release_response(&params).expect("Failed to encode");
-        let parsed = decode_pdu_session_resource_release_response(&encoded).expect("Failed to decode and parse");
+        let encoded =
+            encode_pdu_session_resource_release_response(&params).expect("Failed to encode");
+        let parsed = decode_pdu_session_resource_release_response(&encoded)
+            .expect("Failed to decode and parse");
 
         assert_eq!(parsed.amf_ue_ngap_id, params.amf_ue_ngap_id);
         assert_eq!(parsed.ran_ue_ngap_id, params.ran_ue_ngap_id);
@@ -1235,7 +1301,8 @@ mod tests {
     fn test_pdu_session_resource_modify_response_roundtrip() {
         let params = create_test_modify_response_params();
 
-        let pdu = build_pdu_session_resource_modify_response(&params).expect("Failed to build response");
+        let pdu =
+            build_pdu_session_resource_modify_response(&params).expect("Failed to build response");
         let encoded = encode_ngap_pdu(&pdu).expect("Failed to encode");
         let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
 
@@ -1251,8 +1318,10 @@ mod tests {
     fn test_pdu_session_resource_modify_response_parse_roundtrip() {
         let params = create_test_modify_response_params();
 
-        let encoded = encode_pdu_session_resource_modify_response(&params).expect("Failed to encode");
-        let parsed = decode_pdu_session_resource_modify_response(&encoded).expect("Failed to decode and parse");
+        let encoded =
+            encode_pdu_session_resource_modify_response(&params).expect("Failed to encode");
+        let parsed = decode_pdu_session_resource_modify_response(&encoded)
+            .expect("Failed to decode and parse");
 
         assert_eq!(parsed.amf_ue_ngap_id, params.amf_ue_ngap_id);
         assert_eq!(parsed.ran_ue_ngap_id, params.ran_ue_ngap_id);
@@ -1265,7 +1334,8 @@ mod tests {
     #[test]
     fn test_is_pdu_session_resource_setup_response() {
         let params = create_test_setup_response_params();
-        let pdu = build_pdu_session_resource_setup_response(&params).expect("Failed to build response");
+        let pdu =
+            build_pdu_session_resource_setup_response(&params).expect("Failed to build response");
         assert!(is_pdu_session_resource_setup_response(&pdu));
         assert!(!is_pdu_session_resource_release_response(&pdu));
         assert!(!is_pdu_session_resource_modify_response(&pdu));
@@ -1274,7 +1344,8 @@ mod tests {
     #[test]
     fn test_is_pdu_session_resource_release_response() {
         let params = create_test_release_response_params();
-        let pdu = build_pdu_session_resource_release_response(&params).expect("Failed to build response");
+        let pdu =
+            build_pdu_session_resource_release_response(&params).expect("Failed to build response");
         assert!(is_pdu_session_resource_release_response(&pdu));
         assert!(!is_pdu_session_resource_setup_response(&pdu));
         assert!(!is_pdu_session_resource_modify_response(&pdu));
@@ -1283,7 +1354,8 @@ mod tests {
     #[test]
     fn test_is_pdu_session_resource_modify_response() {
         let params = create_test_modify_response_params();
-        let pdu = build_pdu_session_resource_modify_response(&params).expect("Failed to build response");
+        let pdu =
+            build_pdu_session_resource_modify_response(&params).expect("Failed to build response");
         assert!(is_pdu_session_resource_modify_response(&pdu));
         assert!(!is_pdu_session_resource_setup_response(&pdu));
         assert!(!is_pdu_session_resource_release_response(&pdu));
@@ -1315,8 +1387,10 @@ mod tests {
             }]),
         };
 
-        let encoded = encode_pdu_session_resource_setup_response(&params).expect("Failed to encode");
-        let parsed = decode_pdu_session_resource_setup_response(&encoded).expect("Failed to decode and parse");
+        let encoded =
+            encode_pdu_session_resource_setup_response(&params).expect("Failed to encode");
+        let parsed = decode_pdu_session_resource_setup_response(&encoded)
+            .expect("Failed to decode and parse");
 
         assert!(parsed.setup_list.is_none());
         assert!(parsed.failed_list.is_some());
@@ -1337,8 +1411,10 @@ mod tests {
             }]),
         };
 
-        let encoded = encode_pdu_session_resource_modify_response(&params).expect("Failed to encode");
-        let parsed = decode_pdu_session_resource_modify_response(&encoded).expect("Failed to decode and parse");
+        let encoded =
+            encode_pdu_session_resource_modify_response(&params).expect("Failed to encode");
+        let parsed = decode_pdu_session_resource_modify_response(&encoded)
+            .expect("Failed to decode and parse");
 
         assert!(parsed.modify_list.is_none());
         assert!(parsed.failed_list.is_some());

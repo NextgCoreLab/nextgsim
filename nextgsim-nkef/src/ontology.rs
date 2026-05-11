@@ -64,7 +64,11 @@ pub struct AttributeDefinition {
 
 impl AttributeDefinition {
     /// Creates a required attribute definition
-    pub fn required(name: impl Into<String>, attr_type: AttributeType, description: impl Into<String>) -> Self {
+    pub fn required(
+        name: impl Into<String>,
+        attr_type: AttributeType,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             attr_type,
@@ -166,12 +170,33 @@ impl Ontology {
         ontology.add_entity_schema(EntitySchema {
             entity_type: EntityType::Ue,
             attributes: vec![
-                AttributeDefinition::required("supi", AttributeType::String, "Subscription Permanent Identifier"),
-                AttributeDefinition::required("imei", AttributeType::String, "International Mobile Equipment Identity"),
-                AttributeDefinition::optional("cell_id", AttributeType::Integer, None, "Current serving cell ID"),
-                AttributeDefinition::optional("connected", AttributeType::Boolean, Some("false".to_string()), "Connection status"),
+                AttributeDefinition::required(
+                    "supi",
+                    AttributeType::String,
+                    "Subscription Permanent Identifier",
+                ),
+                AttributeDefinition::required(
+                    "imei",
+                    AttributeType::String,
+                    "International Mobile Equipment Identity",
+                ),
+                AttributeDefinition::optional(
+                    "cell_id",
+                    AttributeType::Integer,
+                    None,
+                    "Current serving cell ID",
+                ),
+                AttributeDefinition::optional(
+                    "connected",
+                    AttributeType::Boolean,
+                    Some("false".to_string()),
+                    "Connection status",
+                ),
             ],
-            allowed_relationships: ["attached_to", "served_by", "has_session"].iter().map(|s| (*s).to_string()).collect(),
+            allowed_relationships: ["attached_to", "served_by", "has_session"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             constraints: vec![Constraint::Unique {
                 attribute: "supi".to_string(),
             }],
@@ -181,11 +206,28 @@ impl Ontology {
         ontology.add_entity_schema(EntitySchema {
             entity_type: EntityType::Gnb,
             attributes: vec![
-                AttributeDefinition::required("gnb_id", AttributeType::Integer, "gNodeB identifier"),
-                AttributeDefinition::optional("plmn_id", AttributeType::String, None, "PLMN identifier"),
-                AttributeDefinition::optional("location", AttributeType::String, None, "Geographic location"),
+                AttributeDefinition::required(
+                    "gnb_id",
+                    AttributeType::Integer,
+                    "gNodeB identifier",
+                ),
+                AttributeDefinition::optional(
+                    "plmn_id",
+                    AttributeType::String,
+                    None,
+                    "PLMN identifier",
+                ),
+                AttributeDefinition::optional(
+                    "location",
+                    AttributeType::String,
+                    None,
+                    "Geographic location",
+                ),
             ],
-            allowed_relationships: ["serves", "connects_to"].iter().map(|s| (*s).to_string()).collect(),
+            allowed_relationships: ["serves", "connects_to"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             constraints: vec![Constraint::Unique {
                 attribute: "gnb_id".to_string(),
             }],
@@ -197,9 +239,17 @@ impl Ontology {
             attributes: vec![
                 AttributeDefinition::required("amf_id", AttributeType::String, "AMF identifier"),
                 AttributeDefinition::optional("region", AttributeType::String, None, "AMF region"),
-                AttributeDefinition::optional("capacity", AttributeType::Integer, None, "AMF capacity"),
+                AttributeDefinition::optional(
+                    "capacity",
+                    AttributeType::Integer,
+                    None,
+                    "AMF capacity",
+                ),
             ],
-            allowed_relationships: ["manages", "routes_to"].iter().map(|s| (*s).to_string()).collect(),
+            allowed_relationships: ["manages", "routes_to"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             constraints: vec![],
         });
 
@@ -207,11 +257,28 @@ impl Ontology {
         ontology.add_entity_schema(EntitySchema {
             entity_type: EntityType::Slice,
             attributes: vec![
-                AttributeDefinition::required("s_nssai", AttributeType::String, "Single NSSAI identifier"),
-                AttributeDefinition::optional("sst", AttributeType::Integer, None, "Slice/Service Type"),
-                AttributeDefinition::optional("sd", AttributeType::String, None, "Slice Differentiator"),
+                AttributeDefinition::required(
+                    "s_nssai",
+                    AttributeType::String,
+                    "Single NSSAI identifier",
+                ),
+                AttributeDefinition::optional(
+                    "sst",
+                    AttributeType::Integer,
+                    None,
+                    "Slice/Service Type",
+                ),
+                AttributeDefinition::optional(
+                    "sd",
+                    AttributeType::String,
+                    None,
+                    "Slice Differentiator",
+                ),
             ],
-            allowed_relationships: ["provides", "allocated_to"].iter().map(|s| (*s).to_string()).collect(),
+            allowed_relationships: ["provides", "allocated_to"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             constraints: vec![],
         });
 
@@ -219,7 +286,10 @@ impl Ontology {
         ontology.add_relationship_schema(RelationshipSchema {
             relationship_type: "attached_to".to_string(),
             allowed_sources: [EntityType::Ue].iter().copied().collect(),
-            allowed_targets: [EntityType::Gnb, EntityType::Cell].iter().copied().collect(),
+            allowed_targets: [EntityType::Gnb, EntityType::Cell]
+                .iter()
+                .copied()
+                .collect(),
             attributes: vec![AttributeDefinition::optional(
                 "attachment_time",
                 AttributeType::Timestamp,
@@ -251,9 +321,12 @@ impl Ontology {
 
     /// Validates an entity against the schema
     pub fn validate_entity(&self, entity: &Entity) -> Result<(), SchemaError> {
-        let schema = self.entity_schemas.get(&entity.entity_type).ok_or_else(|| SchemaError::InvalidEntity {
-            reason: format!("No schema defined for entity type {:?}", entity.entity_type),
-        })?;
+        let schema = self
+            .entity_schemas
+            .get(&entity.entity_type)
+            .ok_or_else(|| SchemaError::InvalidEntity {
+                reason: format!("No schema defined for entity type {:?}", entity.entity_type),
+            })?;
 
         // Check required attributes
         for attr_def in &schema.attributes {
@@ -285,7 +358,10 @@ impl Ontology {
             .relationship_schemas
             .get(&relationship.relation_type)
             .ok_or_else(|| SchemaError::InvalidRelationship {
-                reason: format!("No schema defined for relationship type '{}'", relationship.relation_type),
+                reason: format!(
+                    "No schema defined for relationship type '{}'",
+                    relationship.relation_type
+                ),
             })?;
 
         // Note: We would need entity type information to fully validate sources and targets
@@ -295,44 +371,79 @@ impl Ontology {
     }
 
     /// Validates attribute type
-    fn validate_attribute_type(&self, value: &str, expected_type: &AttributeType) -> Result<(), SchemaError> {
+    fn validate_attribute_type(
+        &self,
+        value: &str,
+        expected_type: &AttributeType,
+    ) -> Result<(), SchemaError> {
         match expected_type {
             AttributeType::String => Ok(()),
-            AttributeType::Integer => value.parse::<i64>().map(|_| ()).map_err(|_| SchemaError::InvalidAttributeType {
-                expected: "Integer".to_string(),
-                actual: value.to_string(),
-            }),
-            AttributeType::Float => value.parse::<f64>().map(|_| ()).map_err(|_| SchemaError::InvalidAttributeType {
-                expected: "Float".to_string(),
-                actual: value.to_string(),
-            }),
-            AttributeType::Boolean => value.parse::<bool>().map(|_| ()).map_err(|_| SchemaError::InvalidAttributeType {
-                expected: "Boolean".to_string(),
-                actual: value.to_string(),
-            }),
-            AttributeType::Timestamp => value.parse::<u64>().map(|_| ()).map_err(|_| SchemaError::InvalidAttributeType {
-                expected: "Timestamp".to_string(),
-                actual: value.to_string(),
-            }),
+            AttributeType::Integer => {
+                value
+                    .parse::<i64>()
+                    .map(|_| ())
+                    .map_err(|_| SchemaError::InvalidAttributeType {
+                        expected: "Integer".to_string(),
+                        actual: value.to_string(),
+                    })
+            }
+            AttributeType::Float => {
+                value
+                    .parse::<f64>()
+                    .map(|_| ())
+                    .map_err(|_| SchemaError::InvalidAttributeType {
+                        expected: "Float".to_string(),
+                        actual: value.to_string(),
+                    })
+            }
+            AttributeType::Boolean => {
+                value
+                    .parse::<bool>()
+                    .map(|_| ())
+                    .map_err(|_| SchemaError::InvalidAttributeType {
+                        expected: "Boolean".to_string(),
+                        actual: value.to_string(),
+                    })
+            }
+            AttributeType::Timestamp => {
+                value
+                    .parse::<u64>()
+                    .map(|_| ())
+                    .map_err(|_| SchemaError::InvalidAttributeType {
+                        expected: "Timestamp".to_string(),
+                        actual: value.to_string(),
+                    })
+            }
             _ => Ok(()), // Simplified
         }
     }
 
     /// Validates a constraint
-    fn validate_constraint(&self, entity: &Entity, constraint: &Constraint) -> Result<(), SchemaError> {
+    fn validate_constraint(
+        &self,
+        entity: &Entity,
+        constraint: &Constraint,
+    ) -> Result<(), SchemaError> {
         match constraint {
             Constraint::Unique { attribute: _ } => {
                 // Would need to check against all entities in the store
                 Ok(())
             }
-            Constraint::Pattern { attribute, pattern: _ } => {
+            Constraint::Pattern {
+                attribute,
+                pattern: _,
+            } => {
                 if !entity.properties.contains_key(attribute) {
                     return Ok(()); // Optional attribute
                 }
                 // Would use regex matching here
                 Ok(())
             }
-            Constraint::Range { attribute, min, max } => {
+            Constraint::Range {
+                attribute,
+                min,
+                max,
+            } => {
                 if let Some(value_str) = entity.properties.get(attribute) {
                     if let Ok(value) = value_str.parse::<f64>() {
                         if let Some(min_val) = min {
@@ -357,9 +468,13 @@ impl Ontology {
                 source_attribute,
                 required_attribute,
             } => {
-                if entity.properties.contains_key(source_attribute) && !entity.properties.contains_key(required_attribute) {
+                if entity.properties.contains_key(source_attribute)
+                    && !entity.properties.contains_key(required_attribute)
+                {
                     return Err(SchemaError::ConstraintViolation {
-                        constraint: format!("If {source_attribute} is set, {required_attribute} must also be set"),
+                        constraint: format!(
+                            "If {source_attribute} is set, {required_attribute} must also be set"
+                        ),
                     });
                 }
                 Ok(())
@@ -413,8 +528,12 @@ mod tests {
             properties: HashMap::new(),
             embedding: None,
         };
-        entity.properties.insert("supi".to_string(), "imsi-001".to_string());
-        entity.properties.insert("imei".to_string(), "123456789".to_string());
+        entity
+            .properties
+            .insert("supi".to_string(), "imsi-001".to_string());
+        entity
+            .properties
+            .insert("imei".to_string(), "123456789".to_string());
 
         let result = ontology.validate_entity(&entity);
         assert!(result.is_ok());
@@ -433,7 +552,10 @@ mod tests {
 
         let result = ontology.validate_entity(&entity);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SchemaError::MissingAttribute { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SchemaError::MissingAttribute { .. }
+        ));
     }
 
     #[test]
@@ -442,7 +564,11 @@ mod tests {
 
         let schema = EntitySchema {
             entity_type: EntityType::Gnb,
-            attributes: vec![AttributeDefinition::required("gnb_id", AttributeType::Integer, "gNB ID")],
+            attributes: vec![AttributeDefinition::required(
+                "gnb_id",
+                AttributeType::Integer,
+                "gNB ID",
+            )],
             allowed_relationships: HashSet::new(),
             constraints: vec![],
         };
@@ -454,11 +580,16 @@ mod tests {
             properties: HashMap::new(),
             embedding: None,
         };
-        entity.properties.insert("gnb_id".to_string(), "not_a_number".to_string());
+        entity
+            .properties
+            .insert("gnb_id".to_string(), "not_a_number".to_string());
 
         let result = ontology.validate_entity(&entity);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SchemaError::InvalidAttributeType { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SchemaError::InvalidAttributeType { .. }
+        ));
     }
 
     #[test]
@@ -486,11 +617,18 @@ mod tests {
             properties: HashMap::new(),
             embedding: None,
         };
-        entity.properties.insert("amf_id".to_string(), "amf-001".to_string());
-        entity.properties.insert("capacity".to_string(), "1500".to_string());
+        entity
+            .properties
+            .insert("amf_id".to_string(), "amf-001".to_string());
+        entity
+            .properties
+            .insert("capacity".to_string(), "1500".to_string());
 
         let result = ontology.validate_entity(&entity);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SchemaError::ConstraintViolation { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SchemaError::ConstraintViolation { .. }
+        ));
     }
 }

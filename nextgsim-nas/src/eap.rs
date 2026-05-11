@@ -314,7 +314,6 @@ impl From<EapAttributeType> for u8 {
     }
 }
 
-
 // ============================================================================
 // EAP Attributes Container
 // ============================================================================
@@ -338,13 +337,15 @@ impl EapAttributes {
 
     /// Get the RAND attribute value (skipping 2-byte reserved field)
     pub fn get_rand(&self) -> Option<Vec<u8>> {
-        self.attributes.get(&EapAttributeType::AtRand).and_then(|v| {
-            if v.len() >= 2 {
-                Some(v[2..].to_vec())
-            } else {
-                None
-            }
-        })
+        self.attributes
+            .get(&EapAttributeType::AtRand)
+            .and_then(|v| {
+                if v.len() >= 2 {
+                    Some(v[2..].to_vec())
+                } else {
+                    None
+                }
+            })
     }
 
     /// Get the MAC attribute value (skipping 2-byte reserved field)
@@ -360,13 +361,15 @@ impl EapAttributes {
 
     /// Get the AUTN attribute value (skipping 2-byte reserved field)
     pub fn get_autn(&self) -> Option<Vec<u8>> {
-        self.attributes.get(&EapAttributeType::AtAutn).and_then(|v| {
-            if v.len() >= 2 {
-                Some(v[2..].to_vec())
-            } else {
-                None
-            }
-        })
+        self.attributes
+            .get(&EapAttributeType::AtAutn)
+            .and_then(|v| {
+                if v.len() >= 2 {
+                    Some(v[2..].to_vec())
+                } else {
+                    None
+                }
+            })
     }
 
     /// Get the client error code
@@ -635,7 +638,6 @@ impl EapAkaPrime {
     }
 }
 
-
 // ============================================================================
 // EAP Encoding
 // ============================================================================
@@ -673,7 +675,7 @@ pub fn encode_eap<B: BufMut>(buf: &mut B, eap: &Eap) {
             }
             // Header (4) + type (1) + subtype (1) + reserved (2) + attributes
             let total_len = 4 + 1 + 1 + 2 + attr_len;
-            
+
             buf.put_u16(total_len as u16);
             buf.put_u8(EapType::EapAkaPrime.into());
             buf.put_u8(aka_prime.sub_type.into());
@@ -897,7 +899,7 @@ mod tests {
     #[test]
     fn test_eap_attributes_put_and_get() {
         let mut attrs = EapAttributes::new();
-        
+
         // Test KDF
         attrs.put_kdf(1);
         assert_eq!(attrs.get_kdf(), Some(1));
@@ -952,7 +954,7 @@ mod tests {
         let eap = Eap::AkaPrime(aka_prime);
         let encoded = encode_eap_to_vec(&eap);
         let decoded = decode_eap(&mut encoded.as_slice()).unwrap();
-        
+
         if let (Eap::AkaPrime(orig), Eap::AkaPrime(dec)) = (&eap, &decoded) {
             assert_eq!(orig.code, dec.code);
             assert_eq!(orig.id, dec.id);

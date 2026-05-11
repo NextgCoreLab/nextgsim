@@ -57,12 +57,7 @@ impl AgentNkefBridge {
     }
 
     /// Records an agent's identity in the knowledge graph
-    pub fn register_agent(
-        &self,
-        agent_id: &str,
-        role: &str,
-        knowledge_graph: &mut KnowledgeGraph,
-    ) {
+    pub fn register_agent(&self, agent_id: &str, role: &str, knowledge_graph: &mut KnowledgeGraph) {
         let entity_id = format!("{}-{}", self.config.entity_prefix, agent_id);
         let entity = Entity::new(&entity_id, EntityType::Agent)
             .with_property("agent_id", agent_id)
@@ -264,9 +259,7 @@ mod tests {
         let mut bridge = AgentNkefBridge::new(AgentNkefBridgeConfig::default());
         let mut kg = KnowledgeGraph::new();
 
-        kg.add_entity(
-            Entity::new("gnb-1", EntityType::Gnb).with_property("status", "active"),
-        );
+        kg.add_entity(Entity::new("gnb-1", EntityType::Gnb).with_property("status", "active"));
 
         let entity = bridge.query_entity("gnb-1", &kg);
         assert!(entity.is_some());

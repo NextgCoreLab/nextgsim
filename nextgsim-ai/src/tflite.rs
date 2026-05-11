@@ -23,6 +23,7 @@ use crate::tensor::TensorData;
 /// Provides `TFLite` model inference with support for CPU and GPU delegates.
 /// This is a placeholder implementation that follows the `InferenceEngine` trait
 /// and can be expanded when `TFLite` runtime support is added.
+#[deprecated(note = "TFLite backend is a placeholder — use OnnxEngine for production inference")]
 pub struct TfLiteEngine {
     /// Internal `TFLite` session state (placeholder)
     session: Option<Mutex<TfLiteSession>>,
@@ -75,6 +76,9 @@ impl TfLiteEngine {
         info!(
             "Creating TFLite inference engine with {} execution provider",
             config.execution_provider
+        );
+        warn!(
+            "TFLite backend is a placeholder returning dummy values — use ONNX for real inference"
         );
 
         Ok(Self {
@@ -195,10 +199,7 @@ impl InferenceEngine for TfLiteEngine {
         if let Some(ext) = path.extension() {
             if ext != "tflite" {
                 return Err(ModelError::InvalidFormat {
-                    reason: format!(
-                        "Expected .tflite file, got .{}",
-                        ext.to_string_lossy()
-                    ),
+                    reason: format!("Expected .tflite file, got .{}", ext.to_string_lossy()),
                 });
             }
         } else {
@@ -242,11 +243,9 @@ impl InferenceEngine for TfLiteEngine {
             reason: "Model not loaded".to_string(),
         })?;
 
-        let mut session = session_mutex
-            .lock()
-            .map_err(|e| InferenceError::NotReady {
-                reason: format!("Failed to acquire session lock: {e}"),
-            })?;
+        let mut session = session_mutex.lock().map_err(|e| InferenceError::NotReady {
+            reason: format!("Failed to acquire session lock: {e}"),
+        })?;
 
         let start = Instant::now();
 
@@ -306,16 +305,17 @@ impl InferenceEngine for TfLiteEngine {
         inputs.iter().map(|input| self.infer(input)).collect()
     }
 
-    fn infer_multi(&self, inputs: &[(&str, TensorData)]) -> Result<Vec<TensorData>, InferenceError> {
+    fn infer_multi(
+        &self,
+        inputs: &[(&str, TensorData)],
+    ) -> Result<Vec<TensorData>, InferenceError> {
         let session_mutex = self.session.as_ref().ok_or(InferenceError::NotReady {
             reason: "Model not loaded".to_string(),
         })?;
 
-        let mut session = session_mutex
-            .lock()
-            .map_err(|e| InferenceError::NotReady {
-                reason: format!("Failed to acquire session lock: {e}"),
-            })?;
+        let mut session = session_mutex.lock().map_err(|e| InferenceError::NotReady {
+            reason: format!("Failed to acquire session lock: {e}"),
+        })?;
 
         let start = Instant::now();
 

@@ -14,13 +14,9 @@ pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>
 ///
 /// Uses RUST_LOG environment variable if set, otherwise defaults to "info"
 pub fn init_test_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_test_writer()
-        .try_init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let _ = fmt().with_env_filter(filter).with_test_writer().try_init();
 }
 
 /// Wait for a condition to become true with timeout
@@ -88,20 +84,20 @@ mod tests {
     async fn test_wait_for_condition_success() {
         let flag = Arc::new(AtomicBool::new(false));
         let flag_clone = flag.clone();
-        
+
         // Set flag after a short delay
         tokio::spawn(async move {
             sleep(Duration::from_millis(50)).await;
             flag_clone.store(true, Ordering::SeqCst);
         });
-        
+
         let result = wait_for_condition(
             || async { flag.load(Ordering::SeqCst) },
             Duration::from_secs(1),
             Duration::from_millis(10),
         )
         .await;
-        
+
         assert!(result.is_ok());
     }
 
@@ -113,7 +109,7 @@ mod tests {
             Duration::from_millis(10),
         )
         .await;
-        
+
         assert!(result.is_err());
     }
 

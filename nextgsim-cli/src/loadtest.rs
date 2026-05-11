@@ -232,7 +232,11 @@ impl std::fmt::Display for LoadTestReport {
         }
         writeln!(f, "  Avg latency:     {:.1}ms", self.avg_reg_latency_ms)?;
         writeln!(f, "  Max latency:     {:.1}ms", self.max_reg_latency_ms)?;
-        writeln!(f, "  Throughput:      {:.1} UE/s", self.throughput_ue_per_sec)?;
+        writeln!(
+            f,
+            "  Throughput:      {:.1} UE/s",
+            self.throughput_ue_per_sec
+        )?;
         writeln!(f)?;
         writeln!(f, "--- PDU Session ---")?;
         writeln!(f, "  Success:         {}", self.pdu_session_success)?;
@@ -254,7 +258,11 @@ pub fn generate_imsi(base_imsi: &str, index: u32) -> String {
     if let Ok(base_num) = base_imsi.parse::<u64>() {
         format!("{:015}", base_num + index as u64)
     } else {
-        format!("{}{:04}", &base_imsi[..base_imsi.len().saturating_sub(4)], index)
+        format!(
+            "{}{:04}",
+            &base_imsi[..base_imsi.len().saturating_sub(4)],
+            index
+        )
     }
 }
 

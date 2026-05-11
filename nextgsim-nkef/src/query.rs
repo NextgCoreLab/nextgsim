@@ -281,12 +281,8 @@ impl QueryExecutor {
 
                 // Check relationship pattern if present
                 if let Some(ref rel_pattern) = pattern.relationship {
-                    let has_matching_rel = Self::check_relationship(
-                        entity,
-                        rel_pattern,
-                        relationships,
-                        entities,
-                    );
+                    let has_matching_rel =
+                        Self::check_relationship(entity, rel_pattern, relationships, entities);
                     if !has_matching_rel {
                         continue;
                     }
@@ -313,8 +309,16 @@ impl QueryExecutor {
         if let Some(ref order_prop) = query.order_by {
             let descending = query.order_direction == "desc";
             matched_entities.sort_by(|a, b| {
-                let val_a = a.properties.get(order_prop).map(std::string::String::as_str).unwrap_or("");
-                let val_b = b.properties.get(order_prop).map(std::string::String::as_str).unwrap_or("");
+                let val_a = a
+                    .properties
+                    .get(order_prop)
+                    .map(std::string::String::as_str)
+                    .unwrap_or("");
+                let val_b = b
+                    .properties
+                    .get(order_prop)
+                    .map(std::string::String::as_str)
+                    .unwrap_or("");
                 if descending {
                     val_b.cmp(val_a)
                 } else {
@@ -425,8 +429,11 @@ impl QueryExecutor {
         relationships: &[Relationship],
     ) -> Vec<GraphPath> {
         let mut paths = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<PathStep>, std::collections::HashSet<String>)> =
-            std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<(
+            String,
+            Vec<PathStep>,
+            std::collections::HashSet<String>,
+        )> = std::collections::VecDeque::new();
 
         let mut initial_visited = std::collections::HashSet::new();
         initial_visited.insert(source_id.to_string());
@@ -561,22 +568,38 @@ mod tests {
     #[test]
     fn test_query_filter_eq() {
         let entity = make_entity("e1", EntityType::Gnb, vec![("status", "active")]);
-        let filter = QueryFilter::new("status".to_string(), QueryOperator::Eq, "active".to_string());
+        let filter = QueryFilter::new(
+            "status".to_string(),
+            QueryOperator::Eq,
+            "active".to_string(),
+        );
 
         assert!(filter.matches(&entity));
 
-        let filter2 = QueryFilter::new("status".to_string(), QueryOperator::Eq, "inactive".to_string());
+        let filter2 = QueryFilter::new(
+            "status".to_string(),
+            QueryOperator::Eq,
+            "inactive".to_string(),
+        );
         assert!(!filter2.matches(&entity));
     }
 
     #[test]
     fn test_query_filter_contains() {
         let entity = make_entity("e1", EntityType::Gnb, vec![("name", "Main Tower")]);
-        let filter = QueryFilter::new("name".to_string(), QueryOperator::Contains, "Tower".to_string());
+        let filter = QueryFilter::new(
+            "name".to_string(),
+            QueryOperator::Contains,
+            "Tower".to_string(),
+        );
 
         assert!(filter.matches(&entity));
 
-        let filter2 = QueryFilter::new("name".to_string(), QueryOperator::Contains, "Cell".to_string());
+        let filter2 = QueryFilter::new(
+            "name".to_string(),
+            QueryOperator::Contains,
+            "Cell".to_string(),
+        );
         assert!(!filter2.matches(&entity));
     }
 
@@ -595,7 +618,11 @@ mod tests {
     fn test_query_builder() {
         let query = QueryBuilder::new()
             .match_type(EntityType::Gnb)
-            .filter("status".to_string(), QueryOperator::Eq, "active".to_string())
+            .filter(
+                "status".to_string(),
+                QueryOperator::Eq,
+                "active".to_string(),
+            )
             .limit(10)
             .build();
 
@@ -614,7 +641,11 @@ mod tests {
 
         let query = QueryBuilder::new()
             .match_type(EntityType::Gnb)
-            .filter("status".to_string(), QueryOperator::Eq, "active".to_string())
+            .filter(
+                "status".to_string(),
+                QueryOperator::Eq,
+                "active".to_string(),
+            )
             .build();
 
         let result = QueryExecutor::execute(&query, &entities, &[]);
@@ -708,7 +739,9 @@ mod tests {
 
         let neighbors_2hop = QueryExecutor::find_neighbors("A", 2, &rels);
         assert_eq!(neighbors_2hop.len(), 3); // B, C at hop 1; D at hop 2
-        assert!(neighbors_2hop.iter().any(|(id, hop)| id == "D" && *hop == 2));
+        assert!(neighbors_2hop
+            .iter()
+            .any(|(id, hop)| id == "D" && *hop == 2));
     }
 
     #[test]
@@ -717,8 +750,16 @@ mod tests {
             source_id: "A".into(),
             target_id: "C".into(),
             steps: vec![
-                PathStep { entity_id: "B".into(), relation_type: "x".into(), direction: "outgoing".into() },
-                PathStep { entity_id: "C".into(), relation_type: "y".into(), direction: "outgoing".into() },
+                PathStep {
+                    entity_id: "B".into(),
+                    relation_type: "x".into(),
+                    direction: "outgoing".into(),
+                },
+                PathStep {
+                    entity_id: "C".into(),
+                    relation_type: "y".into(),
+                    direction: "outgoing".into(),
+                },
             ],
         };
         assert_eq!(path.length(), 2);
@@ -732,9 +773,7 @@ mod tests {
             make_entity("gnb-3", EntityType::Gnb, vec![("name", "Bob")]),
         ];
 
-        let query = QueryBuilder::new()
-            .match_type(EntityType::Gnb)
-            .build();
+        let query = QueryBuilder::new().match_type(EntityType::Gnb).build();
 
         let mut query_asc = query.clone();
         query_asc.order_by = Some("name".to_string());

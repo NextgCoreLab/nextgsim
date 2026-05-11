@@ -123,7 +123,6 @@ pub fn load_ue_config_from_str(yaml: &str) -> Result<UeConfig, ConfigError> {
     Ok(config)
 }
 
-
 /// Validates a UE configuration.
 ///
 /// This function performs comprehensive validation of the configuration,
@@ -243,11 +242,21 @@ fn is_valid_hostname(hostname: &str) -> bool {
             return false;
         }
         // Labels must start with alphanumeric
-        if !label.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+        if !label
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
+        {
             return false;
         }
         // Labels must end with alphanumeric
-        if !label.chars().last().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+        if !label
+            .chars()
+            .last()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
+        {
             return false;
         }
         // Labels can only contain alphanumeric and hyphens
@@ -358,7 +367,10 @@ mod tests {
         let mut config = valid_config();
         config.gnb_search_list = vec![];
         let result = validate_ue_config(&config);
-        assert!(matches!(result, Err(ConfigValidationError::NoGnbConfigured)));
+        assert!(matches!(
+            result,
+            Err(ConfigValidationError::NoGnbConfigured)
+        ));
     }
 
     #[test]

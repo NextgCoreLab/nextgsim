@@ -172,10 +172,7 @@ impl JsccEncoder {
         // Prepare a single concatenated input: [features..., snr]
         let mut input_data = data.to_vec();
         input_data.push(channel.snr_db);
-        let input = TensorData::float32(
-            input_data.clone(),
-            vec![1i64, input_data.len() as i64],
-        );
+        let input = TensorData::float32(input_data.clone(), vec![1i64, input_data.len() as i64]);
         let output = self.engine.infer(&input)?;
         let symbols = output
             .as_f32_slice()
@@ -301,10 +298,7 @@ impl JsccDecoder {
     fn decode_neural(&self, received: &JsccSymbols) -> Result<Vec<f32>, JsccError> {
         let mut input_data = received.symbols.clone();
         input_data.push(received.snr_db);
-        let input = TensorData::float32(
-            input_data.clone(),
-            vec![1i64, input_data.len() as i64],
-        );
+        let input = TensorData::float32(input_data.clone(), vec![1i64, input_data.len() as i64]);
         let output = self.engine.infer(&input)?;
         let decoded = output
             .as_f32_slice()
@@ -390,7 +384,8 @@ impl JsccSymbols {
         let mut rng = rand::thread_rng();
 
         // Compute signal power
-        let signal_power = self.symbols.iter().map(|s| s * s).sum::<f32>() / self.symbols.len() as f32;
+        let signal_power =
+            self.symbols.iter().map(|s| s * s).sum::<f32>() / self.symbols.len() as f32;
 
         // Compute noise power from SNR
         let snr_linear = 10.0f32.powf(snr_db / 10.0);

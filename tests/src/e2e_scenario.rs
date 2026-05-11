@@ -10,9 +10,7 @@
 //! - User plane data flow
 //! - 6G AI component integration
 
-use integration_tests::{
-    init_test_logging, MockAmf, MockAmfConfig, MockAmfEvent,
-};
+use integration_tests::{init_test_logging, MockAmf, MockAmfConfig, MockAmfEvent};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -47,7 +45,9 @@ async fn test_e2e_ue_registration_flow() {
 
     let gnb_id = 1;
     tracing::info!("[RAN] gNB-{} connecting to AMF...", gnb_id);
-    amf.simulate_gnb_connect(gnb_id).await.expect("Failed to connect gNB");
+    amf.simulate_gnb_connect(gnb_id)
+        .await
+        .expect("Failed to connect gNB");
 
     // Verify event
     let event = timeout(Duration::from_secs(1), amf.next_event())
@@ -73,7 +73,9 @@ async fn test_e2e_ue_registration_flow() {
     tracing::info!("  - Supported TA: TAC=1, PLMN=001-01");
     tracing::info!("  - Paging DRX: v256");
 
-    amf.simulate_ng_setup_request(gnb_id).await.expect("Failed NG Setup");
+    amf.simulate_ng_setup_request(gnb_id)
+        .await
+        .expect("Failed NG Setup");
 
     let event = timeout(Duration::from_secs(1), amf.next_event())
         .await
@@ -91,7 +93,10 @@ async fn test_e2e_ue_registration_flow() {
     }
 
     assert_eq!(amf.gnb_count().await, 1);
-    tracing::info!("[CORE] AMF status: {} gNB(s) connected", amf.gnb_count().await);
+    tracing::info!(
+        "[CORE] AMF status: {} gNB(s) connected",
+        amf.gnb_count().await
+    );
 
     // Phase 3: Initial UE Message (Registration Request)
     tracing::info!("----------------------------------------");
@@ -101,13 +106,13 @@ async fn test_e2e_ue_registration_flow() {
     let ran_ue_ngap_id = 1;
     // Simplified Registration Request NAS PDU
     let registration_request = vec![
-        0x7e,       // Extended protocol discriminator (5GMM)
-        0x00,       // Security header type (plain)
-        0x41,       // Registration request message type
-        0x79,       // 5GS registration type + NAS key set identifier
+        0x7e, // Extended protocol discriminator (5GMM)
+        0x00, // Security header type (plain)
+        0x41, // Registration request message type
+        0x79, // 5GS registration type + NAS key set identifier
         0x00, 0x0d, // 5GS mobile identity length
-        0x01,       // SUCI type
-        // ... simplified
+        0x01, // SUCI type
+              // ... simplified
     ];
 
     tracing::info!("[UE] UE-001 -> gNB-{}: RRC Setup Complete", gnb_id);
@@ -116,7 +121,8 @@ async fn test_e2e_ue_registration_flow() {
     tracing::info!("  - NAS-PDU: Registration Request");
     tracing::info!("  - SUPI: imsi-001010000000001");
 
-    let amf_ue_id = amf.simulate_initial_ue_message(ran_ue_ngap_id, registration_request)
+    let amf_ue_id = amf
+        .simulate_initial_ue_message(ran_ue_ngap_id, registration_request)
         .await
         .expect("Failed to process Initial UE Message");
 
@@ -128,7 +134,10 @@ async fn test_e2e_ue_registration_flow() {
         .expect("No event received");
 
     match event {
-        MockAmfEvent::InitialUeMessage { ran_ue_ngap_id: id, nas_pdu } => {
+        MockAmfEvent::InitialUeMessage {
+            ran_ue_ngap_id: id,
+            nas_pdu,
+        } => {
             tracing::info!("[CORE] AMF received Initial UE Message (RAN-UE-ID={})", id);
             tracing::info!("  - NAS PDU length: {} bytes", nas_pdu.len());
         }
@@ -147,7 +156,10 @@ async fn test_e2e_ue_registration_flow() {
         .expect("Failed to complete registration");
 
     // Verify UE is registered
-    let ue = amf.get_ue_context(amf_ue_id).await.expect("UE context not found");
+    let ue = amf
+        .get_ue_context(amf_ue_id)
+        .await
+        .expect("UE context not found");
     assert!(ue.registered);
     assert_eq!(ue.supi, Some("imsi-001010000000001".to_string()));
 
@@ -173,7 +185,8 @@ async fn test_e2e_ue_registration_flow() {
     tracing::info!("  - S-NSSAI: SST=1");
     tracing::info!("  - DNN: internet");
 
-    let upf_teid = amf.simulate_pdu_session_establish(amf_ue_id, psi, ue_ip)
+    let upf_teid = amf
+        .simulate_pdu_session_establish(amf_ue_id, psi, ue_ip)
         .await
         .expect("Failed to establish PDU session");
 
@@ -187,7 +200,10 @@ async fn test_e2e_ue_registration_flow() {
     tracing::info!("[CORE] AMF -> UE: PDU Session Establishment Accept");
 
     // Verify PDU session
-    let ue = amf.get_ue_context(amf_ue_id).await.expect("UE context not found");
+    let ue = amf
+        .get_ue_context(amf_ue_id)
+        .await
+        .expect("UE context not found");
     assert_eq!(ue.pdu_sessions.len(), 1);
     assert_eq!(ue.pdu_sessions[0].psi, psi);
     assert_eq!(ue.pdu_sessions[0].ue_ip, Some(ue_ip.to_string()));
@@ -241,14 +257,21 @@ async fn test_e2e_multi_ue_with_ai() {
         let ran_ue_id = i as u32;
         let imsi = format!("imsi-00101000000000{i}");
 
-        let amf_ue_id = amf.simulate_initial_ue_message(ran_ue_id, vec![]).await.unwrap();
+        let amf_ue_id = amf
+            .simulate_initial_ue_message(ran_ue_id, vec![])
+            .await
+            .unwrap();
         let _ = amf.next_event().await;
 
-        amf.simulate_registration_complete(amf_ue_id, &imsi).await.unwrap();
+        amf.simulate_registration_complete(amf_ue_id, &imsi)
+            .await
+            .unwrap();
 
         // Establish PDU session
         let ue_ip = format!("10.45.0.{}", i + 1);
-        amf.simulate_pdu_session_establish(amf_ue_id, 1, &ue_ip).await.unwrap();
+        amf.simulate_pdu_session_establish(amf_ue_id, 1, &ue_ip)
+            .await
+            .unwrap();
 
         tracing::info!("[UE-{}] Registered with IP {}", i, ue_ip);
     }
@@ -336,8 +359,12 @@ async fn test_e2e_handover_scenario() {
     // Register UE on gNB1
     let amf_ue_id = amf.simulate_initial_ue_message(1, vec![]).await.unwrap();
     let _ = amf.next_event().await;
-    amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001").await.unwrap();
-    amf.simulate_pdu_session_establish(amf_ue_id, 1, "10.45.0.2").await.unwrap();
+    amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001")
+        .await
+        .unwrap();
+    amf.simulate_pdu_session_establish(amf_ue_id, 1, "10.45.0.2")
+        .await
+        .unwrap();
 
     tracing::info!("[UE] Registered on Cell-1");
     tracing::info!("----------------------------------------");
@@ -392,7 +419,9 @@ async fn test_e2e_qos_session() {
 
     let amf_ue_id = amf.simulate_initial_ue_message(1, vec![]).await.unwrap();
     let _ = amf.next_event().await;
-    amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001").await.unwrap();
+    amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001")
+        .await
+        .unwrap();
 
     tracing::info!("[UE] Requesting multiple QoS flows:");
 
@@ -402,7 +431,9 @@ async fn test_e2e_qos_session() {
     tracing::info!("  - 5QI: 1 (Conversational Voice)");
     tracing::info!("  - GBR: 150 kbps");
     tracing::info!("  - Delay Budget: 100ms");
-    amf.simulate_pdu_session_establish(amf_ue_id, 1, "10.45.0.2").await.unwrap();
+    amf.simulate_pdu_session_establish(amf_ue_id, 1, "10.45.0.2")
+        .await
+        .unwrap();
     tracing::info!("  [OK] Session established");
 
     // Video streaming (QoS Flow 2)
@@ -411,7 +442,9 @@ async fn test_e2e_qos_session() {
     tracing::info!("  - 5QI: 4 (Non-conversational Video)");
     tracing::info!("  - GBR: 10 Mbps");
     tracing::info!("  - Delay Budget: 300ms");
-    amf.simulate_pdu_session_establish(amf_ue_id, 2, "10.45.0.3").await.unwrap();
+    amf.simulate_pdu_session_establish(amf_ue_id, 2, "10.45.0.3")
+        .await
+        .unwrap();
     tracing::info!("  [OK] Session established");
 
     // IoT data (QoS Flow 3)
@@ -419,7 +452,9 @@ async fn test_e2e_qos_session() {
     tracing::info!("[UE] PDU Session 3: IoT Sensor Data");
     tracing::info!("  - 5QI: 9 (Best Effort)");
     tracing::info!("  - Non-GBR");
-    amf.simulate_pdu_session_establish(amf_ue_id, 3, "10.45.0.4").await.unwrap();
+    amf.simulate_pdu_session_establish(amf_ue_id, 3, "10.45.0.4")
+        .await
+        .unwrap();
     tracing::info!("  [OK] Session established");
 
     let ue = amf.get_ue_context(amf_ue_id).await.unwrap();

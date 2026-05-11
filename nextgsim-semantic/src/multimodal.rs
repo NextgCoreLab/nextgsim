@@ -88,7 +88,11 @@ impl VectorEncoder {
 }
 
 impl SemanticEncode<Vec<f32>> for VectorEncoder {
-    fn encode(&self, source: &Vec<f32>, task: SemanticTask) -> Result<SemanticFeatures, CodecError> {
+    fn encode(
+        &self,
+        source: &Vec<f32>,
+        task: SemanticTask,
+    ) -> Result<SemanticFeatures, CodecError> {
         self.inner.encode(source, task)
     }
 }
@@ -243,7 +247,11 @@ impl VideoData {
 // ---------------------------------------------------------------------------
 
 impl SemanticEncode<ImageData> for VectorEncoder {
-    fn encode(&self, source: &ImageData, task: SemanticTask) -> Result<SemanticFeatures, CodecError> {
+    fn encode(
+        &self,
+        source: &ImageData,
+        task: SemanticTask,
+    ) -> Result<SemanticFeatures, CodecError> {
         self.inner.encode(&source.pixels, task)
     }
 }
@@ -540,8 +548,9 @@ mod tests {
     fn test_image_encode_via_trait() {
         let encoder = VectorEncoder::new(8).expect("Failed to create encoder");
         let img = ImageData::new(vec![0.5; 64], 8, 8, 1);
-        let features = SemanticEncode::<ImageData>::encode(&encoder, &img, SemanticTask::ImageClassification)
-            .expect("Image encoding failed");
+        let features =
+            SemanticEncode::<ImageData>::encode(&encoder, &img, SemanticTask::ImageClassification)
+                .expect("Image encoding failed");
         assert!(features.num_features() > 0);
     }
 

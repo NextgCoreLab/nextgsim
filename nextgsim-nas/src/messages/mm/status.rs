@@ -70,8 +70,8 @@ impl FiveGMmStatus {
     /// Decode from bytes (after header has been parsed)
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, StatusError> {
         // 5GMM cause (mandatory, Type 3 - 1 byte)
-        let mm_cause = Ie5gMmCause::decode(buf)
-            .map_err(|e| StatusError::InvalidIeValue(e.to_string()))?;
+        let mm_cause =
+            Ie5gMmCause::decode(buf).map_err(|e| StatusError::InvalidIeValue(e.to_string()))?;
 
         Ok(Self { mm_cause })
     }

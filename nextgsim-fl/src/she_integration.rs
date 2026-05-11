@@ -104,10 +104,7 @@ pub struct FlPlacementPlanner {
 
 impl FlPlacementPlanner {
     /// Creates a new placement planner
-    pub fn new(
-        tier_latency_ms: [u32; 3],
-        tier_compute_flops: [u64; 3],
-    ) -> Self {
+    pub fn new(tier_latency_ms: [u32; 3], tier_compute_flops: [u64; 3]) -> Self {
         Self {
             tier_latency_ms,
             tier_compute_flops,
@@ -163,7 +160,7 @@ impl FlPlacementPlanner {
 impl Default for FlPlacementPlanner {
     fn default() -> Self {
         Self::new(
-            [5, 15, 50],                               // latency ms
+            [5, 15, 50],                                      // latency ms
             [1_000_000_000, 10_000_000_000, 100_000_000_000], // FLOPS
         )
     }

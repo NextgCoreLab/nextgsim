@@ -4,8 +4,8 @@
 //! Supports orbital mechanics, visibility windows, handover prediction, and realistic
 //! propagation modeling per 3GPP TR 38.811/38.821.
 
-use std::f64::consts::PI;
 use std::collections::HashMap;
+use std::f64::consts::PI;
 use thiserror::Error;
 
 // ============================================================================
@@ -78,13 +78,13 @@ impl OrbitalElements {
     pub fn validate(&self) -> Result<(), ConstellationError> {
         if self.semi_major_axis_m <= EARTH_RADIUS_M {
             return Err(ConstellationError::InvalidOrbitalParameters(
-                "Semi-major axis must be greater than Earth radius".to_string()
+                "Semi-major axis must be greater than Earth radius".to_string(),
             ));
         }
 
         if self.eccentricity < 0.0 || self.eccentricity >= 1.0 {
             return Err(ConstellationError::InvalidOrbitalParameters(
-                "Eccentricity must be in range [0, 1)".to_string()
+                "Eccentricity must be in range [0, 1)".to_string(),
             ));
         }
 
@@ -206,13 +206,15 @@ impl SatelliteState {
         let ground_to_sat_y = self.position.y - ground_ecef.y;
         let ground_to_sat_z = self.position.z - ground_ecef.z;
 
-        let ground_radius = (ground_ecef.x * ground_ecef.x +
-                           ground_ecef.y * ground_ecef.y +
-                           ground_ecef.z * ground_ecef.z).sqrt();
+        let ground_radius = (ground_ecef.x * ground_ecef.x
+            + ground_ecef.y * ground_ecef.y
+            + ground_ecef.z * ground_ecef.z)
+            .sqrt();
 
-        let dot_product = (ground_ecef.x * ground_to_sat_x +
-                          ground_ecef.y * ground_to_sat_y +
-                          ground_ecef.z * ground_to_sat_z) / ground_radius;
+        let dot_product = (ground_ecef.x * ground_to_sat_x
+            + ground_ecef.y * ground_to_sat_y
+            + ground_ecef.z * ground_to_sat_z)
+            / ground_radius;
 
         let elevation_rad = (dot_product / slant_range_m).asin();
         let elevation_deg = elevation_rad.to_degrees();
@@ -245,9 +247,8 @@ impl SatelliteState {
         let unit_z = range_z / range;
 
         // Radial velocity (dot product of velocity and unit range vector)
-        let radial_velocity = self.velocity.x * unit_x +
-                             self.velocity.y * unit_y +
-                             self.velocity.z * unit_z;
+        let radial_velocity =
+            self.velocity.x * unit_x + self.velocity.y * unit_y + self.velocity.z * unit_z;
 
         // Doppler shift: f_d = (v_r / c) * f_c
         (radial_velocity / SPEED_OF_LIGHT) * carrier_freq_hz
@@ -402,8 +403,13 @@ impl Constellation {
     }
 
     /// Calculate satellite position at current time using simplified propagation
-    pub fn calculate_satellite_state(&self, sat_id: u32) -> Result<SatelliteState, ConstellationError> {
-        let elements = self.satellites.get(&sat_id)
+    pub fn calculate_satellite_state(
+        &self,
+        sat_id: u32,
+    ) -> Result<SatelliteState, ConstellationError> {
+        let elements = self
+            .satellites
+            .get(&sat_id)
             .ok_or(ConstellationError::InvalidSatelliteId(sat_id))?;
 
         let time_since_epoch = self.current_time_s - elements.epoch_s;
@@ -414,11 +420,14 @@ impl Constellation {
         let eccentric_anomaly = self.solve_kepler(mean_anomaly, elements.eccentricity);
 
         // True anomaly
-        let true_anomaly = 2.0 * ((eccentric_anomaly / 2.0).tan() *
-                                 ((1.0 + elements.eccentricity) / (1.0 - elements.eccentricity)).sqrt()).atan();
+        let true_anomaly = 2.0
+            * ((eccentric_anomaly / 2.0).tan()
+                * ((1.0 + elements.eccentricity) / (1.0 - elements.eccentricity)).sqrt())
+            .atan();
 
         // Orbital radius
-        let r = elements.semi_major_axis_m * (1.0 - elements.eccentricity * eccentric_anomaly.cos());
+        let r =
+            elements.semi_major_axis_m * (1.0 - elements.eccentricity * eccentric_anomaly.cos());
 
         // Position in orbital plane
         let x_orb = r * true_anomaly.cos();
@@ -426,7 +435,8 @@ impl Constellation {
 
         // Rotate to ECEF
         let (x, y, z) = self.orbital_to_ecef(
-            x_orb, y_orb,
+            x_orb,
+            y_orb,
             elements.inclination_rad,
             elements.raan_rad,
             elements.argument_of_periapsis_rad,
@@ -437,7 +447,8 @@ impl Constellation {
         let v_x = -v_mag * mean_anomaly.sin();
         let v_y = v_mag * mean_anomaly.cos();
         let (vx, vy, vz) = self.orbital_to_ecef(
-            v_x, v_y,
+            v_x,
+            v_y,
             elements.inclination_rad,
             elements.raan_rad,
             elements.argument_of_periapsis_rad,
@@ -446,7 +457,11 @@ impl Constellation {
         Ok(SatelliteState {
             satellite_id: sat_id,
             position: EcefPosition { x, y, z },
-            velocity: EcefPosition { x: vx, y: vy, z: vz },
+            velocity: EcefPosition {
+                x: vx,
+                y: vy,
+                z: vz,
+            },
             time_s: self.current_time_s,
         })
     }
@@ -465,7 +480,14 @@ impl Constellation {
     }
 
     /// Transform orbital plane coordinates to ECEF
-    fn orbital_to_ecef(&self, x_orb: f64, y_orb: f64, incl: f64, raan: f64, aop: f64) -> (f64, f64, f64) {
+    fn orbital_to_ecef(
+        &self,
+        x_orb: f64,
+        y_orb: f64,
+        incl: f64,
+        raan: f64,
+        aop: f64,
+    ) -> (f64, f64, f64) {
         let cos_raan = raan.cos();
         let sin_raan = raan.sin();
         let cos_incl = incl.cos();
@@ -473,11 +495,11 @@ impl Constellation {
         let cos_aop = aop.cos();
         let sin_aop = aop.sin();
 
-        let x = (cos_raan * cos_aop - sin_raan * sin_aop * cos_incl) * x_orb +
-                (-cos_raan * sin_aop - sin_raan * cos_aop * cos_incl) * y_orb;
+        let x = (cos_raan * cos_aop - sin_raan * sin_aop * cos_incl) * x_orb
+            + (-cos_raan * sin_aop - sin_raan * cos_aop * cos_incl) * y_orb;
 
-        let y = (sin_raan * cos_aop + cos_raan * sin_aop * cos_incl) * x_orb +
-                (-sin_raan * sin_aop + cos_raan * cos_aop * cos_incl) * y_orb;
+        let y = (sin_raan * cos_aop + cos_raan * sin_aop * cos_incl) * x_orb
+            + (-sin_raan * sin_aop + cos_raan * cos_aop * cos_incl) * y_orb;
 
         let z = sin_incl * sin_aop * x_orb + sin_incl * cos_aop * y_orb;
 
@@ -485,7 +507,10 @@ impl Constellation {
     }
 
     /// Find all visible satellites from a ground position
-    pub fn find_visible_satellites(&self, ground_pos: &GeodeticPosition) -> Vec<(u32, VisibilityInfo)> {
+    pub fn find_visible_satellites(
+        &self,
+        ground_pos: &GeodeticPosition,
+    ) -> Vec<(u32, VisibilityInfo)> {
         let mut visible = Vec::new();
 
         for &sat_id in self.satellites.keys() {
@@ -508,12 +533,15 @@ impl Constellation {
     }
 
     /// Find best serving satellite (highest elevation)
-    pub fn find_best_satellite(&self, ground_pos: &GeodeticPosition) -> Result<u32, ConstellationError> {
+    pub fn find_best_satellite(
+        &self,
+        ground_pos: &GeodeticPosition,
+    ) -> Result<u32, ConstellationError> {
         let visible = self.find_visible_satellites(ground_pos);
 
         if visible.is_empty() {
             return Err(ConstellationError::SatelliteNotVisible(
-                "No satellites visible from ground position".to_string()
+                "No satellites visible from ground position".to_string(),
             ));
         }
 
@@ -521,8 +549,13 @@ impl Constellation {
     }
 
     /// Predict handover time to next satellite
-    pub fn predict_handover(&self, ground_pos: &GeodeticPosition, current_sat_id: u32,
-                           time_step_s: f64, max_lookahead_s: f64) -> Option<(u32, f64)> {
+    pub fn predict_handover(
+        &self,
+        ground_pos: &GeodeticPosition,
+        current_sat_id: u32,
+        time_step_s: f64,
+        max_lookahead_s: f64,
+    ) -> Option<(u32, f64)> {
         let mut best_future_sat = None;
         let mut handover_time = None;
 
@@ -608,7 +641,10 @@ mod tests {
         let config = ConstellationConfig::starlink_like();
         let constellation = Constellation::new(config.clone()).unwrap();
 
-        assert_eq!(constellation.num_satellites(), config.total_satellites() as usize);
+        assert_eq!(
+            constellation.num_satellites(),
+            config.total_satellites() as usize
+        );
     }
 
     #[test]

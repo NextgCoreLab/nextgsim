@@ -201,7 +201,9 @@ impl AmbientDevice {
             );
         } else if !energy_status.is_operational() {
             self.status = DeviceStatus::Inactive;
-        } else if self.status == DeviceStatus::CriticalEnergy || self.status == DeviceStatus::Inactive {
+        } else if self.status == DeviceStatus::CriticalEnergy
+            || self.status == DeviceStatus::Inactive
+        {
             self.status = DeviceStatus::Active;
         }
 
@@ -435,8 +437,13 @@ impl FleetManager {
     /// Creates a new device group.
     pub fn create_group(&mut self, group_name: String) {
         if !self.groups.contains_key(&group_name) {
-            tracing::info!("Fleet '{}': Created group '{}'", self.fleet_name, group_name);
-            self.groups.insert(group_name.clone(), DeviceGroup::new(group_name));
+            tracing::info!(
+                "Fleet '{}': Created group '{}'",
+                self.fleet_name,
+                group_name
+            );
+            self.groups
+                .insert(group_name.clone(), DeviceGroup::new(group_name));
         }
     }
 
@@ -476,7 +483,9 @@ impl FleetManager {
         if let Some(group) = self.groups.get(group_name) {
             for &device_id in &group.device_ids {
                 if let Some(device) = self.devices.get(&device_id) {
-                    if device.status == DeviceStatus::Active || device.status == DeviceStatus::CriticalEnergy {
+                    if device.status == DeviceStatus::Active
+                        || device.status == DeviceStatus::CriticalEnergy
+                    {
                         tracing::debug!(
                             "Fleet '{}': Dispatching {:?} to device {} in group '{}'",
                             self.fleet_name,
@@ -505,7 +514,9 @@ impl FleetManager {
         let mut dispatched = Vec::new();
 
         for (&device_id, device) in &self.devices {
-            if device.status == DeviceStatus::Active || device.status == DeviceStatus::CriticalEnergy {
+            if device.status == DeviceStatus::Active
+                || device.status == DeviceStatus::CriticalEnergy
+            {
                 tracing::debug!(
                     "Fleet '{}': Dispatching {:?} to device {}",
                     self.fleet_name,
@@ -676,8 +687,8 @@ mod tests {
 
     #[test]
     fn test_command_response() {
-        let response = CommandResponse::new(123, "Wake".to_string(), true)
-            .with_data(vec![1, 2, 3, 4]);
+        let response =
+            CommandResponse::new(123, "Wake".to_string(), true).with_data(vec![1, 2, 3, 4]);
 
         assert_eq!(response.device_id, 123);
         assert_eq!(response.command_type, "Wake");

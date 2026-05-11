@@ -125,7 +125,12 @@ impl AuditTrail {
     }
 
     /// Record an intent execution result.
-    pub fn record_execution(&mut self, agent_id: &AgentId, intent: &Intent, result: &IntentExecutionResult) {
+    pub fn record_execution(
+        &mut self,
+        agent_id: &AgentId,
+        intent: &Intent,
+        result: &IntentExecutionResult,
+    ) {
         let seq = self.next_seq();
         self.push(AuditEntry {
             seq,
@@ -213,7 +218,10 @@ impl AuditTrail {
 
     /// Query entries by agent ID.
     pub fn by_agent(&self, agent_id: &AgentId) -> Vec<&AuditEntry> {
-        self.entries.iter().filter(|e| e.agent_id == *agent_id).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.agent_id == *agent_id)
+            .collect()
     }
 
     /// Query entries within a time range (inclusive).
@@ -421,7 +429,8 @@ mod tests {
         trail.record_safety_violation(&AgentId::new("a1"), "i1", "rule", "Block");
         trail.record_agent_registered(&AgentId::new("a2"), "Resource");
 
-        let registrations = trail.by_event_filter(|e| matches!(e, AuditEvent::AgentRegistered { .. }));
+        let registrations =
+            trail.by_event_filter(|e| matches!(e, AuditEvent::AgentRegistered { .. }));
         assert_eq!(registrations.len(), 2);
     }
 }

@@ -31,9 +31,7 @@ pub use cli_server::{
     CLI_RECV_TIMEOUT_MS, CLI_VERSION_MAJOR, CLI_VERSION_MINOR, CLI_VERSION_PATCH,
 };
 
-pub use cmd_handler::{
-    parse_cli_command, AmfContext, CliResponse, GnbCmdHandler, UeContext,
-};
+pub use cmd_handler::{parse_cli_command, AmfContext, CliResponse, GnbCmdHandler, UeContext};
 
 pub use config_loader::{
     load_and_validate_gnb_config, load_gnb_config, load_gnb_config_from_str, validate_gnb_config,

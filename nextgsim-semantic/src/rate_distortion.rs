@@ -46,10 +46,7 @@ impl std::fmt::Display for RdDecision {
         write!(
             f,
             "compression={:.2}x, rate={:.3} bps, MSE={:.6}, keep={}",
-            self.compression_ratio,
-            self.estimated_rate_bps,
-            self.estimated_mse,
-            self.keep_features,
+            self.compression_ratio, self.estimated_rate_bps, self.estimated_mse, self.keep_features,
         )
     }
 }
@@ -210,11 +207,7 @@ impl RdController {
 
 /// Convenience function: given a source dimension and channel, pick a good
 /// compression ratio using a target-distortion strategy.
-pub fn auto_compression_ratio(
-    source_dim: usize,
-    channel: &ChannelQuality,
-    max_mse: f32,
-) -> f32 {
+pub fn auto_compression_ratio(source_dim: usize, channel: &ChannelQuality, max_mse: f32) -> f32 {
     let controller = RdController::new(source_dim);
     controller
         .decide(RdMode::TargetDistortion { max_mse }, channel)
@@ -231,10 +224,7 @@ mod tests {
         let controller = RdController::new(256);
         let channel = ChannelQuality::new(20.0, 1000.0, 0.01);
 
-        let decision = controller.decide(
-            RdMode::TargetDistortion { max_mse: 0.01 },
-            &channel,
-        );
+        let decision = controller.decide(RdMode::TargetDistortion { max_mse: 0.01 }, &channel);
 
         assert!(decision.compression_ratio >= 1.0);
         assert!(decision.keep_features > 0);
@@ -246,10 +236,7 @@ mod tests {
         let controller = RdController::new(128);
         let channel = ChannelQuality::new(10.0, 500.0, 0.05);
 
-        let decision = controller.decide(
-            RdMode::TargetRate { max_rate_bps: 1.0 },
-            &channel,
-        );
+        let decision = controller.decide(RdMode::TargetRate { max_rate_bps: 1.0 }, &channel);
 
         assert!(decision.estimated_rate_bps <= 1.0 + 0.01); // small tolerance
     }
