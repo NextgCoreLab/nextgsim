@@ -139,7 +139,8 @@ impl NwdafCoordinator {
             "Registering NWDAF instance {} at {} (analytics: {:?})",
             instance.instance_id, instance.address, instance.supported_analytics
         );
-        self.instances.insert(instance.instance_id.clone(), instance);
+        self.instances
+            .insert(instance.instance_id.clone(), instance);
     }
 
     /// Unregisters an NWDAF instance
@@ -170,7 +171,10 @@ impl NwdafCoordinator {
         instance.available_capacity = (1.0 - load_level).max(0.0);
         instance.is_active = true;
 
-        debug!("Updated heartbeat for {} (load: {:.2})", instance_id, load_level);
+        debug!(
+            "Updated heartbeat for {} (load: {:.2})",
+            instance_id, load_level
+        );
 
         Ok(())
     }
@@ -188,8 +192,11 @@ impl NwdafCoordinator {
             if instance.is_active
                 && now_ms.saturating_sub(instance.last_heartbeat_ms) > self.heartbeat_timeout_ms
             {
-                warn!("Instance {} is inactive (last heartbeat: {}ms ago)",
-                    id, now_ms.saturating_sub(instance.last_heartbeat_ms));
+                warn!(
+                    "Instance {} is inactive (last heartbeat: {}ms ago)",
+                    id,
+                    now_ms.saturating_sub(instance.last_heartbeat_ms)
+                );
                 instance.is_active = false;
                 inactive.push(id.clone());
             }
@@ -243,16 +250,17 @@ impl NwdafCoordinator {
                 }
             }
             None => {
-                warn!("No available instance found for {:?} analytics", analytics_id);
+                warn!(
+                    "No available instance found for {:?} analytics",
+                    analytics_id
+                );
 
                 DelegationResponse {
                     request_id,
                     accepted: false,
                     assigned_instance_id: None,
                     estimated_completion_ms: None,
-                    error: Some(format!(
-                        "No available NWDAF instance for {analytics_id:?}"
-                    )),
+                    error: Some(format!("No available NWDAF instance for {analytics_id:?}")),
                 }
             }
         }
@@ -301,10 +309,10 @@ impl NwdafCoordinator {
             LoadBalancingStrategy::AnalyticsAware => {
                 // Prefer instances with AnLF for analytics execution
                 candidates.sort_by(|a, b| {
-                    let a_score = if a.capabilities.has_anlf { 1.0 } else { 0.5 }
-                        * (1.0 - a.load_level);
-                    let b_score = if b.capabilities.has_anlf { 1.0 } else { 0.5 }
-                        * (1.0 - b.load_level);
+                    let a_score =
+                        if a.capabilities.has_anlf { 1.0 } else { 0.5 } * (1.0 - a.load_level);
+                    let b_score =
+                        if b.capabilities.has_anlf { 1.0 } else { 0.5 } * (1.0 - b.load_level);
                     b_score
                         .partial_cmp(&a_score)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -371,10 +379,7 @@ impl NwdafCoordinator {
             "Sharing analytics result from {} for {:?} target={}",
             result.source_instance_id, result.analytics_id, result.target_key
         );
-        self.shared_results
-            .entry(key)
-            .or_default()
-            .push(result);
+        self.shared_results.entry(key).or_default().push(result);
     }
 
     /// Queries shared analytics results from peer instances.
@@ -395,13 +400,10 @@ impl NwdafCoordinator {
         self.shared_results
             .iter()
             .filter(|((aid, tkey), _)| {
-                *aid == analytics_id
-                    && target_key.is_none_or(|tk| tkey == tk)
+                *aid == analytics_id && target_key.is_none_or(|tk| tkey == tk)
             })
             .flat_map(|(_, results)| results.iter())
-            .filter(|r| {
-                max_age_ms.is_none_or(|max| now_ms.saturating_sub(r.timestamp_ms) <= max)
-            })
+            .filter(|r| max_age_ms.is_none_or(|max| now_ms.saturating_sub(r.timestamp_ms) <= max))
             .collect()
     }
 
@@ -500,16 +502,8 @@ mod tests {
     fn test_delegation_least_loaded() {
         let mut coordinator = NwdafCoordinator::new(LoadBalancingStrategy::LeastLoaded);
 
-        coordinator.register_instance(make_instance(
-            "nwdaf-1",
-            vec![AnalyticsId::UeMobility],
-            0.7,
-        ));
-        coordinator.register_instance(make_instance(
-            "nwdaf-2",
-            vec![AnalyticsId::UeMobility],
-            0.3,
-        ));
+        coordinator.register_instance(make_instance("nwdaf-1", vec![AnalyticsId::UeMobility], 0.7));
+        coordinator.register_instance(make_instance("nwdaf-2", vec![AnalyticsId::UeMobility], 0.3));
 
         let response = coordinator.delegate_analytics(
             AnalyticsId::UeMobility,
@@ -526,11 +520,7 @@ mod tests {
     fn test_delegation_no_capable_instance() {
         let mut coordinator = NwdafCoordinator::new(LoadBalancingStrategy::LeastLoaded);
 
-        coordinator.register_instance(make_instance(
-            "nwdaf-1",
-            vec![AnalyticsId::NfLoad],
-            0.3,
-        ));
+        coordinator.register_instance(make_instance("nwdaf-1", vec![AnalyticsId::NfLoad], 0.3));
 
         let response = coordinator.delegate_analytics(
             AnalyticsId::UeMobility,
@@ -611,21 +601,16 @@ mod tests {
 
         assert_eq!(coordinator.shared_result_count(), 2);
 
-        let mobility_results = coordinator.query_shared_results(
-            AnalyticsId::UeMobility, Some("ue-42"), None,
-        );
+        let mobility_results =
+            coordinator.query_shared_results(AnalyticsId::UeMobility, Some("ue-42"), None);
         assert_eq!(mobility_results.len(), 1);
         assert_eq!(mobility_results[0].source_instance_id, "nwdaf-1");
 
-        let load_results = coordinator.query_shared_results(
-            AnalyticsId::NfLoad, None, None,
-        );
+        let load_results = coordinator.query_shared_results(AnalyticsId::NfLoad, None, None);
         assert_eq!(load_results.len(), 1);
 
         // Query for nonexistent
-        let empty = coordinator.query_shared_results(
-            AnalyticsId::AbnormalBehavior, None, None,
-        );
+        let empty = coordinator.query_shared_results(AnalyticsId::AbnormalBehavior, None, None);
         assert!(empty.is_empty());
     }
 

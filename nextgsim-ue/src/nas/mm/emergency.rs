@@ -21,12 +21,8 @@
 
 use thiserror::Error;
 
-use nextgsim_nas::messages::mm::{
-    Ie5gsMobileIdentity, MobileIdentityType, RegistrationRequest,
-};
-use nextgsim_nas::ies::ie1::{
-    FollowOnRequest, Ie5gsRegistrationType, RegistrationType,
-};
+use nextgsim_nas::ies::ie1::{FollowOnRequest, Ie5gsRegistrationType, RegistrationType};
+use nextgsim_nas::messages::mm::{Ie5gsMobileIdentity, MobileIdentityType, RegistrationRequest};
 use nextgsim_nas::security::NasKeySetIdentifier;
 
 use super::state::{MmState, MmSubState, RmState};
@@ -85,9 +81,7 @@ impl Default for EmergencyRegistrationProcedure {
 impl EmergencyRegistrationProcedure {
     /// Creates a new emergency registration procedure handler.
     pub fn new() -> Self {
-        Self {
-            last_request: None,
-        }
+        Self { last_request: None }
     }
 
     /// Returns the last emergency registration request (for retransmission).
@@ -150,10 +144,8 @@ impl EmergencyRegistrationProcedure {
             FollowOnRequest::NoPending
         };
 
-        let registration_type = Ie5gsRegistrationType::new(
-            follow_on_req,
-            RegistrationType::EmergencyRegistration,
-        );
+        let registration_type =
+            Ie5gsRegistrationType::new(follow_on_req, RegistrationType::EmergencyRegistration);
 
         let ksi = ng_ksi.unwrap_or_else(NasKeySetIdentifier::no_key);
 
@@ -167,10 +159,7 @@ impl EmergencyRegistrationProcedure {
     /// Handles T3510 expiry for emergency registration.
     ///
     /// Returns `Some(request)` to retransmit, or `None` if max retries reached.
-    pub fn handle_t3510_expiry(
-        &self,
-        expiry_count: u32,
-    ) -> Option<&RegistrationRequest> {
+    pub fn handle_t3510_expiry(&self, expiry_count: u32) -> Option<&RegistrationRequest> {
         if expiry_count >= T3510_MAX_RETRANSMISSION {
             return None;
         }

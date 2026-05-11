@@ -185,10 +185,8 @@ impl Task for EnergyTask {
                                 power_consumption_w: c.power_consumption_w,
                                 bits_per_joule: c.bits_per_joule(),
                                 total_energy_j: c.total_energy_j,
-                                time_active_pct: if (c.time_in_active_s + c.time_in_sleep_s) > 0.0
-                                {
-                                    c.time_in_active_s
-                                        / (c.time_in_active_s + c.time_in_sleep_s)
+                                time_active_pct: if (c.time_in_active_s + c.time_in_sleep_s) > 0.0 {
+                                    c.time_in_active_s / (c.time_in_active_s + c.time_in_sleep_s)
                                         * 100.0
                                 } else {
                                     100.0

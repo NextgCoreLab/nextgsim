@@ -162,7 +162,8 @@ impl PersistentStorage {
         self.entity_cache.remove(id);
 
         // Remove related relationships
-        self.relationship_cache.retain(|r| r.source_id != id && r.target_id != id);
+        self.relationship_cache
+            .retain(|r| r.source_id != id && r.target_id != id);
 
         if self.should_auto_save() {
             self.save()?;
@@ -283,8 +284,8 @@ mod tests {
             let mut storage = PersistentStorage::new(config.clone());
             storage.initialize().unwrap();
 
-            let entity = Entity::new("test-entity", EntityType::Gnb)
-                .with_property("status", "active");
+            let entity =
+                Entity::new("test-entity", EntityType::Gnb).with_property("status", "active");
             storage.put_entity(entity).unwrap();
 
             let rel = Relationship::new("test-entity", "other-entity", "connects_to");
@@ -328,8 +329,12 @@ mod tests {
         let (mut storage, _temp) = make_test_storage();
         storage.initialize().unwrap();
 
-        storage.put_entity(Entity::new("e1", EntityType::Gnb)).unwrap();
-        storage.put_entity(Entity::new("e2", EntityType::Ue)).unwrap();
+        storage
+            .put_entity(Entity::new("e1", EntityType::Gnb))
+            .unwrap();
+        storage
+            .put_entity(Entity::new("e2", EntityType::Ue))
+            .unwrap();
 
         let all = storage.all_entities();
         assert_eq!(all.len(), 2);
@@ -340,8 +345,12 @@ mod tests {
         let (mut storage, _temp) = make_test_storage();
         storage.initialize().unwrap();
 
-        storage.put_entity(Entity::new("e1", EntityType::Gnb)).unwrap();
-        storage.put_relationship(Relationship::new("e1", "e2", "test")).unwrap();
+        storage
+            .put_entity(Entity::new("e1", EntityType::Gnb))
+            .unwrap();
+        storage
+            .put_relationship(Relationship::new("e1", "e2", "test"))
+            .unwrap();
 
         assert_eq!(storage.entity_count(), 1);
         assert_eq!(storage.relationship_count(), 1);

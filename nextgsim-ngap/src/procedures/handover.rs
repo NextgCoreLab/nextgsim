@@ -159,9 +159,7 @@ pub struct HandoverRequiredData {
 }
 
 /// Build a Handover Required PDU
-pub fn build_handover_required(
-    params: &HandoverRequiredParams,
-) -> Result<NGAP_PDU, HandoverError> {
+pub fn build_handover_required(params: &HandoverRequiredParams) -> Result<NGAP_PDU, HandoverError> {
     let mut protocol_ies = Vec::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
@@ -186,9 +184,7 @@ pub fn build_handover_required(
     protocol_ies.push(HandoverRequiredProtocolIEs_Entry {
         id: ProtocolIE_ID(ID_HANDOVER_TYPE),
         criticality: Criticality(Criticality::REJECT),
-        value: HandoverRequiredProtocolIEs_EntryValue::Id_HandoverType(
-            params.handover_type.into(),
-        ),
+        value: HandoverRequiredProtocolIEs_EntryValue::Id_HandoverType(params.handover_type.into()),
     });
 
     // IE: Cause (mandatory)
@@ -221,7 +217,8 @@ pub fn build_handover_required(
     }
 
     // IE: PDUSessionResourceListHORqd (mandatory)
-    let pdu_session_list = build_pdu_session_resource_list_ho_rqd(&params.pdu_session_resource_list);
+    let pdu_session_list =
+        build_pdu_session_resource_list_ho_rqd(&params.pdu_session_resource_list);
     protocol_ies.push(HandoverRequiredProtocolIEs_Entry {
         id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_LIST_HO_RQD),
         criticality: Criticality(Criticality::REJECT),
@@ -302,9 +299,7 @@ fn build_pdu_session_resource_list_ho_rqd(
 }
 
 /// Parse a Handover Required from an NGAP PDU
-pub fn parse_handover_required(
-    pdu: &NGAP_PDU,
-) -> Result<HandoverRequiredData, HandoverError> {
+pub fn parse_handover_required(pdu: &NGAP_PDU) -> Result<HandoverRequiredData, HandoverError> {
     let initiating_message = match pdu {
         NGAP_PDU::InitiatingMessage(msg) => msg,
         _ => {
@@ -359,25 +354,19 @@ pub fn parse_handover_required(
     }
 
     Ok(HandoverRequiredData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
-        })?,
-        handover_type: handover_type.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("HandoverType".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
+        handover_type: handover_type
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("HandoverType".to_string()))?,
         cause: cause.ok_or_else(|| HandoverError::MissingMandatoryIe("Cause".to_string()))?,
         pdu_session_resource_list: pdu_session_resource_list.ok_or_else(|| {
             HandoverError::MissingMandatoryIe("PDUSessionResourceListHORqd".to_string())
         })?,
-        source_to_target_transparent_container: source_to_target_transparent_container
-            .ok_or_else(|| {
-                HandoverError::MissingMandatoryIe(
-                    "SourceToTarget-TransparentContainer".to_string(),
-                )
-            })?,
+        source_to_target_transparent_container: source_to_target_transparent_container.ok_or_else(
+            || HandoverError::MissingMandatoryIe("SourceToTarget-TransparentContainer".to_string()),
+        )?,
     })
 }
 
@@ -458,8 +447,9 @@ pub fn parse_handover_command(pdu: &NGAP_PDU) -> Result<HandoverCommandData, Han
     let mut ran_ue_ngap_id: Option<u32> = None;
     let mut handover_type: Option<HandoverTypeValue> = None;
     let mut pdu_session_resource_handover_list: Option<Vec<PduSessionResourceHandoverItem>> = None;
-    let mut pdu_session_resource_to_release_list: Option<Vec<PduSessionResourceToReleaseHoCmdItem>> =
-        None;
+    let mut pdu_session_resource_to_release_list: Option<
+        Vec<PduSessionResourceToReleaseHoCmdItem>,
+    > = None;
     let mut target_to_source_transparent_container: Option<Vec<u8>> = None;
 
     for ie in &command.protocol_i_es.0 {
@@ -477,7 +467,9 @@ pub fn parse_handover_command(pdu: &NGAP_PDU) -> Result<HandoverCommandData, Han
                 pdu_session_resource_handover_list =
                     Some(parse_pdu_session_resource_handover_list(list));
             }
-            HandoverCommandProtocolIEs_EntryValue::Id_PDUSessionResourceToReleaseListHOCmd(list) => {
+            HandoverCommandProtocolIEs_EntryValue::Id_PDUSessionResourceToReleaseListHOCmd(
+                list,
+            ) => {
                 pdu_session_resource_to_release_list =
                     Some(parse_pdu_session_resource_to_release_list_ho_cmd(list));
             }
@@ -491,23 +483,17 @@ pub fn parse_handover_command(pdu: &NGAP_PDU) -> Result<HandoverCommandData, Han
     }
 
     Ok(HandoverCommandData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
-        })?,
-        handover_type: handover_type.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("HandoverType".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
+        handover_type: handover_type
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("HandoverType".to_string()))?,
         pdu_session_resource_handover_list,
         pdu_session_resource_to_release_list,
-        target_to_source_transparent_container: target_to_source_transparent_container
-            .ok_or_else(|| {
-                HandoverError::MissingMandatoryIe(
-                    "TargetToSource-TransparentContainer".to_string(),
-                )
-            })?,
+        target_to_source_transparent_container: target_to_source_transparent_container.ok_or_else(
+            || HandoverError::MissingMandatoryIe("TargetToSource-TransparentContainer".to_string()),
+        )?,
     })
 }
 
@@ -597,16 +583,13 @@ pub fn parse_handover_preparation_failure(
     }
 
     Ok(HandoverPreparationFailureData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
         cause: cause.ok_or_else(|| HandoverError::MissingMandatoryIe("Cause".to_string()))?,
     })
 }
-
 
 // ============================================================================
 // Handover Request (AMF -> Target gNB)
@@ -673,19 +656,14 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
     }
 
     Ok(HandoverRequestData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        handover_type: handover_type.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("HandoverType".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        handover_type: handover_type
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("HandoverType".to_string()))?,
         cause: cause.ok_or_else(|| HandoverError::MissingMandatoryIe("Cause".to_string()))?,
-        source_to_target_transparent_container: source_to_target_transparent_container
-            .ok_or_else(|| {
-                HandoverError::MissingMandatoryIe(
-                    "SourceToTarget-TransparentContainer".to_string(),
-                )
-            })?,
+        source_to_target_transparent_container: source_to_target_transparent_container.ok_or_else(
+            || HandoverError::MissingMandatoryIe("SourceToTarget-TransparentContainer".to_string()),
+        )?,
     })
 }
 
@@ -766,7 +744,8 @@ pub fn build_handover_request_acknowledge(
     });
 
     // IE: PDUSessionResourceAdmittedList (mandatory)
-    let admitted_list = build_pdu_session_resource_admitted_list(&params.pdu_session_resource_admitted_list);
+    let admitted_list =
+        build_pdu_session_resource_admitted_list(&params.pdu_session_resource_admitted_list);
     protocol_ies.push(HandoverRequestAcknowledgeProtocolIEs_Entry {
         id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_ADMITTED_LIST),
         criticality: Criticality(Criticality::IGNORE),
@@ -873,8 +852,9 @@ pub fn parse_handover_request_acknowledge(
     let mut amf_ue_ngap_id: Option<u64> = None;
     let mut ran_ue_ngap_id: Option<u32> = None;
     let mut pdu_session_resource_admitted_list: Option<Vec<PduSessionResourceAdmittedItem>> = None;
-    let mut pdu_session_resource_failed_list: Option<Vec<PduSessionResourceFailedToSetupHoAckItem>> =
-        None;
+    let mut pdu_session_resource_failed_list: Option<
+        Vec<PduSessionResourceFailedToSetupHoAckItem>,
+    > = None;
     let mut target_to_source_transparent_container: Option<Vec<u8>> = None;
 
     for ie in &ack.protocol_i_es.0 {
@@ -907,22 +887,17 @@ pub fn parse_handover_request_acknowledge(
     }
 
     Ok(HandoverRequestAcknowledgeData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
-        })?,
-        pdu_session_resource_admitted_list: pdu_session_resource_admitted_list.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("PDUSessionResourceAdmittedList".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
+        pdu_session_resource_admitted_list: pdu_session_resource_admitted_list.ok_or_else(
+            || HandoverError::MissingMandatoryIe("PDUSessionResourceAdmittedList".to_string()),
+        )?,
         pdu_session_resource_failed_list,
-        target_to_source_transparent_container: target_to_source_transparent_container
-            .ok_or_else(|| {
-                HandoverError::MissingMandatoryIe(
-                    "TargetToSource-TransparentContainer".to_string(),
-                )
-            })?,
+        target_to_source_transparent_container: target_to_source_transparent_container.ok_or_else(
+            || HandoverError::MissingMandatoryIe("TargetToSource-TransparentContainer".to_string()),
+        )?,
     })
 }
 
@@ -953,7 +928,6 @@ fn parse_pdu_session_resource_failed_to_setup_list_ho_ack(
         .collect()
 }
 
-
 // ============================================================================
 // Handover Failure (Target gNB -> AMF)
 // ============================================================================
@@ -977,9 +951,7 @@ pub struct HandoverFailureData {
 }
 
 /// Build a Handover Failure PDU
-pub fn build_handover_failure(
-    params: &HandoverFailureParams,
-) -> Result<NGAP_PDU, HandoverError> {
+pub fn build_handover_failure(params: &HandoverFailureParams) -> Result<NGAP_PDU, HandoverError> {
     let mut protocol_ies = Vec::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
@@ -1050,9 +1022,8 @@ pub fn parse_handover_failure(pdu: &NGAP_PDU) -> Result<HandoverFailureData, Han
     }
 
     Ok(HandoverFailureData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
         cause: cause.ok_or_else(|| HandoverError::MissingMandatoryIe("Cause".to_string()))?,
     })
 }
@@ -1100,9 +1071,7 @@ pub struct HandoverNotifyData {
 }
 
 /// Build a Handover Notify PDU
-pub fn build_handover_notify(
-    params: &HandoverNotifyParams,
-) -> Result<NGAP_PDU, HandoverError> {
+pub fn build_handover_notify(params: &HandoverNotifyParams) -> Result<NGAP_PDU, HandoverError> {
     let mut protocol_ies = Vec::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
@@ -1213,12 +1182,10 @@ pub fn parse_handover_notify(pdu: &NGAP_PDU) -> Result<HandoverNotifyData, Hando
     }
 
     Ok(HandoverNotifyData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
     })
 }
 
@@ -1249,9 +1216,7 @@ pub struct HandoverCancelData {
 }
 
 /// Build a Handover Cancel PDU
-pub fn build_handover_cancel(
-    params: &HandoverCancelParams,
-) -> Result<NGAP_PDU, HandoverError> {
+pub fn build_handover_cancel(params: &HandoverCancelParams) -> Result<NGAP_PDU, HandoverError> {
     let mut protocol_ies = Vec::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
@@ -1334,12 +1299,10 @@ pub fn parse_handover_cancel(pdu: &NGAP_PDU) -> Result<HandoverCancelData, Hando
     }
 
     Ok(HandoverCancelData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
         cause: cause.ok_or_else(|| HandoverError::MissingMandatoryIe("Cause".to_string()))?,
     })
 }
@@ -1397,15 +1360,12 @@ pub fn parse_handover_cancel_acknowledge(
     }
 
     Ok(HandoverCancelAcknowledgeData {
-        amf_ue_ngap_id: amf_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string())
-        })?,
-        ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
-            HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
-        })?,
+        amf_ue_ngap_id: amf_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("AMF-UE-NGAP-ID".to_string()))?,
+        ran_ue_ngap_id: ran_ue_ngap_id
+            .ok_or_else(|| HandoverError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string()))?,
     })
 }
-
 
 // ============================================================================
 // Helper Functions

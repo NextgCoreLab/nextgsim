@@ -8,10 +8,12 @@
 
 #![allow(unused_imports)]
 
-use nextgsim_isac::{SheIsacClient, SensingData, SensingMeasurement, SensingType, SensingProcessingType};
-use nextgsim_she::{TierManager, ComputeNode, ComputeTier, WorkloadRequirements};
+use nextgsim_isac::{
+    SensingData, SensingMeasurement, SensingProcessingType, SensingType, SheIsacClient,
+};
+use nextgsim_semantic::{SemanticCodingOperation, SemanticTask, SheSemanticClient};
 use nextgsim_she::workload::WorkloadType;
-use nextgsim_semantic::{SheSemanticClient, SemanticCodingOperation, SemanticTask};
+use nextgsim_she::{ComputeNode, ComputeTier, TierManager, WorkloadRequirements};
 
 // ============================================================================
 // A19.2: SHE <-> ISAC Integration Tests
@@ -55,7 +57,10 @@ fn test_she_isac_sensing_workload_submission() {
     // Submit position fusion workload to SHE
     let request = isac_client.submit_position_fusion(sensing_data.clone());
 
-    assert_eq!(request.processing_type, SensingProcessingType::PositionFusion);
+    assert_eq!(
+        request.processing_type,
+        SensingProcessingType::PositionFusion
+    );
     assert_eq!(request.latency_requirement_ms, 10);
     assert_eq!(request.priority, 7);
     assert_eq!(request.sensing_data.target_id, 1);
@@ -154,7 +159,10 @@ fn test_isac_object_tracking_workload() {
     // Submit object tracking workload
     let request = isac_client.submit_object_tracking(sensing_data);
 
-    assert_eq!(request.processing_type, SensingProcessingType::ObjectTracking);
+    assert_eq!(
+        request.processing_type,
+        SensingProcessingType::ObjectTracking
+    );
     assert_eq!(request.latency_requirement_ms, 15);
     assert_eq!(request.priority, 6);
 }
@@ -195,7 +203,10 @@ fn test_isac_ml_positioning_workload() {
     // Submit ML positioning workload
     let request = isac_client.submit_ml_positioning(sensing_data);
 
-    assert_eq!(request.processing_type, SensingProcessingType::MlPositioning);
+    assert_eq!(
+        request.processing_type,
+        SensingProcessingType::MlPositioning
+    );
     assert_eq!(request.latency_requirement_ms, 20);
     assert_eq!(request.priority, 5);
 }
@@ -327,11 +338,8 @@ fn test_she_semantic_roundtrip_workload() {
     let dimensions = vec![2, 4];
 
     // Submit roundtrip workload for testing
-    let request = semantic_client.submit_roundtrip(
-        raw_data,
-        dimensions,
-        SemanticTask::SpeechRecognition,
-    );
+    let request =
+        semantic_client.submit_roundtrip(raw_data, dimensions, SemanticTask::SpeechRecognition);
 
     assert_eq!(request.operation, SemanticCodingOperation::Roundtrip);
     assert_eq!(request.task, SemanticTask::SpeechRecognition);

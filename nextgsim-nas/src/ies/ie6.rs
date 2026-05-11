@@ -27,7 +27,6 @@ pub enum Ie6Error {
     InvalidValue(String),
 }
 
-
 // ============================================================================
 // LADN Entry (3GPP TS 24.501 Section 9.11.3.30)
 // ============================================================================
@@ -104,7 +103,6 @@ impl LadnEntry {
         1 + self.dnn.len() + 2 + self.tai_list.len()
     }
 }
-
 
 // ============================================================================
 // LADN Information IE (3GPP TS 24.501 Section 9.11.3.30)
@@ -206,7 +204,6 @@ impl NasDecode for IeLadnInformation {
     }
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -265,7 +262,7 @@ mod tests {
     fn test_ladn_information_encode_decode_single_entry() {
         let entry = LadnEntry::new(
             vec![0x04, 0x74, 0x65, 0x73, 0x74], // "test"
-            vec![0x00, 0x01, 0x02],              // dummy TAI
+            vec![0x00, 0x01, 0x02],             // dummy TAI
         );
         let info = IeLadnInformation::new(vec![entry]);
 

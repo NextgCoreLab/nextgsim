@@ -10,7 +10,7 @@
 //! shared secrets between parties.
 
 use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{EncodedSizeUser, KemCore, MlKem512, MlKem768, MlKem1024};
+use ml_kem::{EncodedSizeUser, KemCore, MlKem1024, MlKem512, MlKem768};
 use rand::rngs::OsRng;
 use thiserror::Error;
 
@@ -83,9 +83,9 @@ macro_rules! ml_kem_ops {
             ))
         })?;
         let ek = <$kem_type as KemCore>::EncapsulationKey::from_bytes(ek_encoded);
-        let (ct, ss) = ek.encapsulate(&mut OsRng).map_err(|e| {
-            MlKemError::EncapsulationFailed(format!("{e:?}"))
-        })?;
+        let (ct, ss) = ek
+            .encapsulate(&mut OsRng)
+            .map_err(|e| MlKemError::EncapsulationFailed(format!("{e:?}")))?;
         let ct_slice: &[u8] = ct.as_ref();
         let ss_slice: &[u8] = ss.as_ref();
         Ok((ct_slice.to_vec(), ss_slice.to_vec()))
@@ -99,14 +99,11 @@ macro_rules! ml_kem_ops {
         })?;
         let dk = <$kem_type as KemCore>::DecapsulationKey::from_bytes(dk_encoded);
         let ct_encoded = $ct_bytes.try_into().map_err(|_| {
-            MlKemError::InvalidKeyData(format!(
-                "Invalid ciphertext length: {}",
-                $ct_bytes.len()
-            ))
+            MlKemError::InvalidKeyData(format!("Invalid ciphertext length: {}", $ct_bytes.len()))
         })?;
-        let ss = dk.decapsulate(ct_encoded).map_err(|e| {
-            MlKemError::DecapsulationFailed(format!("{e:?}"))
-        })?;
+        let ss = dk
+            .decapsulate(ct_encoded)
+            .map_err(|e| MlKemError::DecapsulationFailed(format!("{e:?}")))?;
         let ss_slice: &[u8] = ss.as_ref();
         Ok(ss_slice.to_vec())
     }};
@@ -241,9 +238,8 @@ mod tests {
         let kp = ml_kem_generate_keypair(MlKemLevel::MlKem768);
         let (ct, ss_enc) =
             ml_kem_encapsulate(MlKemLevel::MlKem768, kp.encapsulation_key()).expect("encapsulate");
-        let ss_dec =
-            ml_kem_decapsulate(MlKemLevel::MlKem768, kp.decapsulation_key(), &ct)
-                .expect("decapsulate");
+        let ss_dec = ml_kem_decapsulate(MlKemLevel::MlKem768, kp.decapsulation_key(), &ct)
+            .expect("decapsulate");
 
         assert_eq!(ss_enc, ss_dec);
         assert_eq!(ss_enc.len(), 32);
@@ -254,9 +250,8 @@ mod tests {
         let kp = ml_kem_generate_keypair(MlKemLevel::MlKem512);
         let (ct, ss_enc) =
             ml_kem_encapsulate(MlKemLevel::MlKem512, kp.encapsulation_key()).expect("encapsulate");
-        let ss_dec =
-            ml_kem_decapsulate(MlKemLevel::MlKem512, kp.decapsulation_key(), &ct)
-                .expect("decapsulate");
+        let ss_dec = ml_kem_decapsulate(MlKemLevel::MlKem512, kp.decapsulation_key(), &ct)
+            .expect("decapsulate");
 
         assert_eq!(ss_enc, ss_dec);
         assert_eq!(ss_enc.len(), 32);
@@ -266,11 +261,9 @@ mod tests {
     fn test_ml_kem_1024_roundtrip() {
         let kp = ml_kem_generate_keypair(MlKemLevel::MlKem1024);
         let (ct, ss_enc) =
-            ml_kem_encapsulate(MlKemLevel::MlKem1024, kp.encapsulation_key())
-                .expect("encapsulate");
-        let ss_dec =
-            ml_kem_decapsulate(MlKemLevel::MlKem1024, kp.decapsulation_key(), &ct)
-                .expect("decapsulate");
+            ml_kem_encapsulate(MlKemLevel::MlKem1024, kp.encapsulation_key()).expect("encapsulate");
+        let ss_dec = ml_kem_decapsulate(MlKemLevel::MlKem1024, kp.decapsulation_key(), &ct)
+            .expect("decapsulate");
 
         assert_eq!(ss_enc, ss_dec);
         assert_eq!(ss_enc.len(), 32);
@@ -282,11 +275,9 @@ mod tests {
         let kp2 = ml_kem_generate_keypair(MlKemLevel::MlKem768);
 
         let (_, ss1) =
-            ml_kem_encapsulate(MlKemLevel::MlKem768, kp1.encapsulation_key())
-                .expect("encapsulate");
+            ml_kem_encapsulate(MlKemLevel::MlKem768, kp1.encapsulation_key()).expect("encapsulate");
         let (_, ss2) =
-            ml_kem_encapsulate(MlKemLevel::MlKem768, kp2.encapsulation_key())
-                .expect("encapsulate");
+            ml_kem_encapsulate(MlKemLevel::MlKem768, kp2.encapsulation_key()).expect("encapsulate");
 
         assert_ne!(ss1, ss2);
     }
@@ -301,8 +292,7 @@ mod tests {
     fn test_ml_kem_invalid_decapsulation_key() {
         let kp = ml_kem_generate_keypair(MlKemLevel::MlKem768);
         let (ct, _) =
-            ml_kem_encapsulate(MlKemLevel::MlKem768, kp.encapsulation_key())
-                .expect("encapsulate");
+            ml_kem_encapsulate(MlKemLevel::MlKem768, kp.encapsulation_key()).expect("encapsulate");
         let result = ml_kem_decapsulate(MlKemLevel::MlKem768, &[0u8; 10], &ct);
         assert!(result.is_err());
     }

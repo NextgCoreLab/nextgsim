@@ -10,7 +10,7 @@
 #[cfg(test)]
 mod tests {
     use crate::enums::MmMessageType;
-    use crate::ies::ie1::{FollowOnRequest, RegistrationType, Ie5gsRegistrationType};
+    use crate::ies::ie1::{FollowOnRequest, Ie5gsRegistrationType, RegistrationType};
     use crate::messages::mm::{
         Abba, AuthenticationRequest, AuthenticationResponse, Ie5gsMobileIdentity,
         Ie5gsRegistrationResult, MobileIdentityType, RegistrationAccept, RegistrationComplete,
@@ -47,10 +47,10 @@ mod tests {
     // ========================================================================
 
     /// Test Registration Request encoding against a real capture
-    /// 
+    ///
     /// This capture represents an initial registration request from a UE
     /// with SUCI identity type.
-    /// 
+    ///
     /// Message structure per 3GPP TS 24.501:
     /// - EPD: 0x7E (5GMM)
     /// - Security header: 0x00 (Plain)
@@ -61,9 +61,7 @@ mod tests {
     fn test_registration_request_initial_suci_capture() {
         // Real capture: Registration Request with SUCI
         // EPD=7E, SHT=00, MT=41, ngKSI+RegType=71, MobileIdentity(SUCI)
-        let capture = hex_to_bytes(
-            "7e0041710009f10700000000000001"
-        );
+        let capture = hex_to_bytes("7e0041710009f10700000000000001");
 
         // Verify header
         assert_eq!(capture[0], 0x7E); // EPD: 5GMM
@@ -84,7 +82,10 @@ mod tests {
         );
 
         // Verify mobile identity type
-        assert_eq!(decoded.mobile_identity.identity_type, MobileIdentityType::Suci);
+        assert_eq!(
+            decoded.mobile_identity.identity_type,
+            MobileIdentityType::Suci
+        );
 
         // Re-encode and verify
         let mut encoded = Vec::new();
@@ -100,7 +101,7 @@ mod tests {
     }
 
     /// Test Registration Request with 5G-GUTI identity
-    /// 
+    ///
     /// Per 3GPP TS 24.501 Section 9.11.3.4, 5G-GUTI format:
     /// - Type: 0b010 (GUTI)
     /// - MCC/MNC + AMF Region ID + AMF Set ID + AMF Pointer + 5G-TMSI
@@ -109,18 +110,18 @@ mod tests {
         // Registration Request with 5G-GUTI
         // ngKSI=0 (native), RegType=1 (initial), GUTI identity
         let capture = hex_to_bytes(
-            "7e00410100" // Header + ngKSI(0)+RegType(1) + length prefix
+            "7e00410100", // Header + ngKSI(0)+RegType(1) + length prefix
         );
 
         assert_eq!(capture[0], 0x7E); // EPD
         assert_eq!(capture[1], 0x00); // Plain NAS
         assert_eq!(capture[2], 0x41); // Registration Request
-        
+
         // First byte after header: ngKSI (high nibble) + reg type (low nibble)
         let first_byte = capture[3];
         let ng_ksi_value = (first_byte >> 4) & 0x0F;
         let reg_type_value = first_byte & 0x0F;
-        
+
         assert_eq!(ng_ksi_value, 0); // ngKSI = 0
         assert_eq!(reg_type_value, 1); // Initial registration
     }
@@ -143,8 +144,11 @@ mod tests {
         // Verify 3GPP TS 24.501 format
         assert_eq!(buf[0], 0x7E, "EPD must be 0x7E for 5GMM");
         assert_eq!(buf[1], 0x00, "Security header must be 0x00 for plain NAS");
-        assert_eq!(buf[2], 0x41, "Message type must be 0x41 for Registration Request");
-        
+        assert_eq!(
+            buf[2], 0x41,
+            "Message type must be 0x41 for Registration Request"
+        );
+
         // ngKSI (7 = no key) in high nibble, reg type (1 = initial) in low nibble
         assert_eq!(buf[3], 0x71, "ngKSI=7 + RegType=1 should be 0x71");
     }
@@ -154,7 +158,7 @@ mod tests {
     // ========================================================================
 
     /// Test Registration Accept encoding against capture
-    /// 
+    ///
     /// Message structure per 3GPP TS 24.501:
     /// - EPD: 0x7E
     /// - Security header: 0x00
@@ -192,7 +196,7 @@ mod tests {
             RegistrationResultValue::ThreeGppAccess,
         );
         let mut msg = RegistrationAccept::new(result);
-        
+
         // Add a 5G-GUTI (Type 6 IE with IEI 0x77)
         let guti_data = vec![
             0xF2, // Type: GUTI (010) + spare
@@ -201,7 +205,10 @@ mod tests {
             0x01, // AMF Pointer
             0x00, 0x00, 0x00, 0x01, // 5G-TMSI
         ];
-        msg.guti = Some(Ie5gsMobileIdentity::new(MobileIdentityType::Guti, guti_data));
+        msg.guti = Some(Ie5gsMobileIdentity::new(
+            MobileIdentityType::Guti,
+            guti_data,
+        ));
 
         let mut buf = Vec::new();
         msg.encode(&mut buf);
@@ -214,7 +221,10 @@ mod tests {
         // Decode and verify
         let decoded = RegistrationAccept::decode(&mut &buf[3..]).unwrap();
         assert!(decoded.guti.is_some());
-        assert_eq!(decoded.guti.unwrap().identity_type, MobileIdentityType::Guti);
+        assert_eq!(
+            decoded.guti.unwrap().identity_type,
+            MobileIdentityType::Guti
+        );
     }
 
     // ========================================================================
@@ -222,7 +232,7 @@ mod tests {
     // ========================================================================
 
     /// Test Registration Complete encoding
-    /// 
+    ///
     /// Registration Complete is a simple message with only optional IEs
     #[test]
     fn test_registration_complete_basic_capture() {
@@ -246,7 +256,7 @@ mod tests {
     // ========================================================================
 
     /// Test Authentication Request encoding for 5G-AKA
-    /// 
+    ///
     /// Per 3GPP TS 24.501 Section 8.2.1:
     /// - ngKSI (mandatory)
     /// - ABBA (mandatory)
@@ -256,12 +266,12 @@ mod tests {
     fn test_authentication_request_5g_aka_capture() {
         // Authentication Request with RAND and AUTN for 5G-AKA
         let rand = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
         ];
         let autn = vec![
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+            0x1F, 0x20,
         ];
         let abba = Abba::new(vec![0x00, 0x00]);
         let ng_ksi = NasKeySetIdentifier::new(SecurityContextType::Native, 1);
@@ -312,15 +322,15 @@ mod tests {
     // ========================================================================
 
     /// Test Authentication Response with RES* for 5G-AKA
-    /// 
+    ///
     /// Per 3GPP TS 24.501 Section 8.2.2:
     /// - Authentication response parameter (optional, IEI 0x2D)
     #[test]
     fn test_authentication_response_res_star_capture() {
         // RES* value (typically 16 bytes)
         let res_star = vec![
-            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
-            0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E, 0x8F, 0x90,
+            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E,
+            0x8F, 0x90,
         ];
 
         let msg = AuthenticationResponse::with_res_star(res_star.clone());
@@ -362,7 +372,7 @@ mod tests {
     // ========================================================================
 
     /// Test Security Mode Command encoding
-    /// 
+    ///
     /// Per 3GPP TS 24.501 Section 8.2.25:
     /// - Selected NAS security algorithms (mandatory)
     /// - ngKSI (mandatory)
@@ -372,7 +382,7 @@ mod tests {
         // Security algorithms: EA2 (ciphering), IA2 (integrity)
         let alg = IeNasSecurityAlgorithms::new(0x02, 0x02);
         let ng_ksi = NasKeySetIdentifier::new(SecurityContextType::Native, 1);
-        
+
         let mut cap = IeUeSecurityCapability::new();
         cap.ea0 = true;
         cap.ea1_128 = true;
@@ -419,7 +429,7 @@ mod tests {
         for (ea, ia, expected) in test_cases {
             let alg = IeNasSecurityAlgorithms::new(ea, ia);
             assert_eq!(alg.encode(), expected);
-            
+
             let decoded = IeNasSecurityAlgorithms::decode(expected);
             assert_eq!(decoded.ciphering, ea);
             assert_eq!(decoded.integrity, ia);
@@ -452,7 +462,7 @@ mod tests {
     #[test]
     fn test_security_mode_complete_with_container() {
         let mut msg = SecurityModeComplete::new();
-        
+
         // NAS message container typically contains the initial NAS message
         // (e.g., Registration Request) that was sent before security was established
         let container = vec![0x7E, 0x00, 0x41, 0x71, 0x00, 0x01, 0x00];
@@ -527,7 +537,7 @@ mod tests {
     fn test_security_mode_command_roundtrip() {
         let alg = IeNasSecurityAlgorithms::new(0x01, 0x02);
         let ng_ksi = NasKeySetIdentifier::new(SecurityContextType::Native, 0);
-        
+
         let mut cap = IeUeSecurityCapability::new();
         cap.ea0 = true;
         cap.ea1_128 = true;

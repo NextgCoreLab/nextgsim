@@ -3,12 +3,12 @@
 //! Provides a simplified AMF implementation for testing UE registration,
 //! authentication, and PDU session management.
 
-use crate::test_fixtures::{TestAmfConfig, Guami, PlmnSupport};
+use crate::test_fixtures::{Guami, PlmnSupport, TestAmfConfig};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
 use thiserror::Error;
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 /// Mock AMF errors
 #[derive(Debug, Error)]
@@ -33,9 +33,15 @@ pub enum MockAmfEvent {
     /// NG Setup Request received
     NgSetupReceived { gnb_id: u32 },
     /// Initial UE Message received
-    InitialUeMessage { ran_ue_ngap_id: u32, nas_pdu: Vec<u8> },
+    InitialUeMessage {
+        ran_ue_ngap_id: u32,
+        nas_pdu: Vec<u8>,
+    },
     /// Uplink NAS Transport received
-    UplinkNasTransport { amf_ue_ngap_id: u64, nas_pdu: Vec<u8> },
+    UplinkNasTransport {
+        amf_ue_ngap_id: u64,
+        nas_pdu: Vec<u8>,
+    },
     /// UE Context Release Request received
     UeContextReleaseRequest { amf_ue_ngap_id: u64 },
 }
@@ -142,7 +148,7 @@ impl MockAmf {
     /// Create a new mock AMF with custom configuration
     pub fn with_config(config: MockAmfConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
-        
+
         Self {
             config,
             state: Arc::new(RwLock::new(MockAmfState {
@@ -204,18 +210,29 @@ impl MockAmf {
 
     /// Get UE context by AMF UE NGAP ID
     pub async fn get_ue_context(&self, amf_ue_ngap_id: u64) -> Option<MockUeContext> {
-        self.state.read().await.ue_contexts.get(&amf_ue_ngap_id).cloned()
+        self.state
+            .read()
+            .await
+            .ue_contexts
+            .get(&amf_ue_ngap_id)
+            .cloned()
     }
 
     /// Simulate gNB connection
     pub async fn simulate_gnb_connect(&self, gnb_id: u32) -> Result<(), MockAmfError> {
         let mut state = self.state.write().await;
-        state.gnbs.insert(gnb_id, GnbContext {
+        state.gnbs.insert(
             gnb_id,
-            ng_setup_complete: false,
-        });
-        
-        let _ = self.event_tx.send(MockAmfEvent::GnbConnected { gnb_id }).await;
+            GnbContext {
+                gnb_id,
+                ng_setup_complete: false,
+            },
+        );
+
+        let _ = self
+            .event_tx
+            .send(MockAmfEvent::GnbConnected { gnb_id })
+            .await;
         Ok(())
     }
 
@@ -223,8 +240,11 @@ impl MockAmf {
     pub async fn simulate_gnb_disconnect(&self, gnb_id: u32) -> Result<(), MockAmfError> {
         let mut state = self.state.write().await;
         state.gnbs.remove(&gnb_id);
-        
-        let _ = self.event_tx.send(MockAmfEvent::GnbDisconnected { gnb_id }).await;
+
+        let _ = self
+            .event_tx
+            .send(MockAmfEvent::GnbDisconnected { gnb_id })
+            .await;
         Ok(())
     }
 
@@ -234,8 +254,11 @@ impl MockAmf {
         if let Some(gnb) = state.gnbs.get_mut(&gnb_id) {
             gnb.ng_setup_complete = true;
         }
-        
-        let _ = self.event_tx.send(MockAmfEvent::NgSetupReceived { gnb_id }).await;
+
+        let _ = self
+            .event_tx
+            .send(MockAmfEvent::NgSetupReceived { gnb_id })
+            .await;
         Ok(())
     }
 
@@ -248,20 +271,26 @@ impl MockAmf {
         let mut state = self.state.write().await;
         let amf_ue_ngap_id = state.next_amf_ue_ngap_id;
         state.next_amf_ue_ngap_id += 1;
-        
-        state.ue_contexts.insert(amf_ue_ngap_id, MockUeContext {
-            ran_ue_ngap_id,
+
+        state.ue_contexts.insert(
             amf_ue_ngap_id,
-            supi: None,
-            registered: false,
-            pdu_sessions: Vec::new(),
-        });
-        
-        let _ = self.event_tx.send(MockAmfEvent::InitialUeMessage {
-            ran_ue_ngap_id,
-            nas_pdu,
-        }).await;
-        
+            MockUeContext {
+                ran_ue_ngap_id,
+                amf_ue_ngap_id,
+                supi: None,
+                registered: false,
+                pdu_sessions: Vec::new(),
+            },
+        );
+
+        let _ = self
+            .event_tx
+            .send(MockAmfEvent::InitialUeMessage {
+                ran_ue_ngap_id,
+                nas_pdu,
+            })
+            .await;
+
         Ok(amf_ue_ngap_id)
     }
 
@@ -289,7 +318,7 @@ impl MockAmf {
         let mut state = self.state.write().await;
         let upf_teid = state.next_upf_teid;
         state.next_upf_teid += 1;
-        
+
         if let Some(ue) = state.ue_contexts.get_mut(&amf_ue_ngap_id) {
             ue.pdu_sessions.push(MockPduSession {
                 psi,
@@ -299,7 +328,7 @@ impl MockAmf {
                 gnb_teid: None,
             });
         }
-        
+
         Ok(upf_teid)
     }
 
@@ -346,10 +375,10 @@ mod tests {
     #[tokio::test]
     async fn test_mock_amf_start_stop() {
         let amf = MockAmf::new();
-        
+
         amf.start().await.unwrap();
         assert!(amf.is_running().await);
-        
+
         amf.stop().await.unwrap();
         assert!(!amf.is_running().await);
     }
@@ -358,10 +387,10 @@ mod tests {
     async fn test_gnb_connect_disconnect() {
         let amf = MockAmf::new();
         amf.start().await.unwrap();
-        
+
         amf.simulate_gnb_connect(1).await.unwrap();
         assert_eq!(amf.gnb_count().await, 1);
-        
+
         amf.simulate_gnb_disconnect(1).await.unwrap();
         assert_eq!(amf.gnb_count().await, 0);
     }
@@ -370,12 +399,17 @@ mod tests {
     async fn test_ue_registration() {
         let amf = MockAmf::new();
         amf.start().await.unwrap();
-        
-        let amf_ue_id = amf.simulate_initial_ue_message(1, vec![0x7e, 0x00, 0x41]).await.unwrap();
+
+        let amf_ue_id = amf
+            .simulate_initial_ue_message(1, vec![0x7e, 0x00, 0x41])
+            .await
+            .unwrap();
         assert_eq!(amf.ue_count().await, 1);
-        
-        amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001").await.unwrap();
-        
+
+        amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001")
+            .await
+            .unwrap();
+
         let ue = amf.get_ue_context(amf_ue_id).await.unwrap();
         assert!(ue.registered);
         assert_eq!(ue.supi, Some("imsi-001010000000001".to_string()));
@@ -385,19 +419,26 @@ mod tests {
     async fn test_pdu_session() {
         let amf = MockAmf::new();
         amf.start().await.unwrap();
-        
+
         let amf_ue_id = amf.simulate_initial_ue_message(1, vec![]).await.unwrap();
-        amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001").await.unwrap();
-        
-        let upf_teid = amf.simulate_pdu_session_establish(amf_ue_id, 1, "10.45.0.2").await.unwrap();
-        
+        amf.simulate_registration_complete(amf_ue_id, "imsi-001010000000001")
+            .await
+            .unwrap();
+
+        let upf_teid = amf
+            .simulate_pdu_session_establish(amf_ue_id, 1, "10.45.0.2")
+            .await
+            .unwrap();
+
         let ue = amf.get_ue_context(amf_ue_id).await.unwrap();
         assert_eq!(ue.pdu_sessions.len(), 1);
         assert_eq!(ue.pdu_sessions[0].psi, 1);
         assert_eq!(ue.pdu_sessions[0].upf_teid, upf_teid);
-        
-        amf.simulate_pdu_session_release(amf_ue_id, 1).await.unwrap();
-        
+
+        amf.simulate_pdu_session_release(amf_ue_id, 1)
+            .await
+            .unwrap();
+
         let ue = amf.get_ue_context(amf_ue_id).await.unwrap();
         assert_eq!(ue.pdu_sessions.len(), 0);
     }

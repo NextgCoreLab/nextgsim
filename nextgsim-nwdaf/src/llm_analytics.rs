@@ -285,7 +285,9 @@ mod tests {
 
         let response = engine.query(query).unwrap();
         assert!(!response.response.is_empty());
-        assert!(response.related_analytics.contains(&AnalyticsId::UeMobility));
+        assert!(response
+            .related_analytics
+            .contains(&AnalyticsId::UeMobility));
         assert!(!response.suggested_actions.is_empty());
         assert_eq!(engine.history_len(), 1);
     }
@@ -302,7 +304,9 @@ mod tests {
         assert!(!response.response.is_empty());
         assert!(
             response.related_analytics.contains(&AnalyticsId::NfLoad)
-                || response.related_analytics.contains(&AnalyticsId::UserDataCongestion)
+                || response
+                    .related_analytics
+                    .contains(&AnalyticsId::UserDataCongestion)
         );
     }
 
@@ -316,7 +320,9 @@ mod tests {
 
         let response = engine.query(query).unwrap();
         assert!(!response.response.is_empty());
-        assert!(response.related_analytics.contains(&AnalyticsId::QosSustainability));
+        assert!(response
+            .related_analytics
+            .contains(&AnalyticsId::QosSustainability));
     }
 
     #[test]
@@ -329,7 +335,9 @@ mod tests {
 
         let response = engine.query(query).unwrap();
         assert!(!response.response.is_empty());
-        assert!(response.related_analytics.contains(&AnalyticsId::AbnormalBehavior));
+        assert!(response
+            .related_analytics
+            .contains(&AnalyticsId::AbnormalBehavior));
     }
 
     #[test]

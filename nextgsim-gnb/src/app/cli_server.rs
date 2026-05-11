@@ -118,7 +118,8 @@ impl CliMessage {
 
     /// Encodes the message to bytes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(CLI_MIN_LENGTH + self.node_name.len() + self.value.len());
+        let mut buffer =
+            Vec::with_capacity(CLI_MIN_LENGTH + self.node_name.len() + self.value.len());
 
         // Version
         buffer.push(CLI_VERSION_MAJOR);
@@ -183,7 +184,8 @@ impl CliMessage {
         if data.len() < value_start + value_len {
             return None;
         }
-        let value = String::from_utf8_lossy(&data[value_start..value_start + value_len]).to_string();
+        let value =
+            String::from_utf8_lossy(&data[value_start..value_start + value_len]).to_string();
 
         Some(Self {
             msg_type,
@@ -342,11 +344,8 @@ mod tests {
 
     #[test]
     fn test_cli_message_encode_decode_roundtrip() {
-        let original = CliMessage::command(
-            "test-gnb".to_string(),
-            "status".to_string(),
-            test_addr(),
-        );
+        let original =
+            CliMessage::command("test-gnb".to_string(), "status".to_string(), test_addr());
 
         let encoded = original.encode();
         let decoded = CliMessage::decode(&encoded, test_addr()).unwrap();
@@ -374,11 +373,7 @@ mod tests {
 
     #[test]
     fn test_cli_message_encode_error() {
-        let msg = CliMessage::error(
-            "gnb-1".to_string(),
-            "UE not found".to_string(),
-            test_addr(),
-        );
+        let msg = CliMessage::error("gnb-1".to_string(), "UE not found".to_string(), test_addr());
 
         let encoded = msg.encode();
         let decoded = CliMessage::decode(&encoded, test_addr()).unwrap();
@@ -429,11 +424,7 @@ mod tests {
 
     #[test]
     fn test_cli_message_unicode() {
-        let msg = CliMessage::command(
-            "gnb-日本語".to_string(),
-            "状態".to_string(),
-            test_addr(),
-        );
+        let msg = CliMessage::command("gnb-日本語".to_string(), "状態".to_string(), test_addr());
         let encoded = msg.encode();
         let decoded = CliMessage::decode(&encoded, test_addr()).unwrap();
 
@@ -465,11 +456,7 @@ mod tests {
         let client_local = client.local_addr().unwrap();
 
         // Send command from client
-        let cmd = CliMessage::command(
-            "test-gnb".to_string(),
-            "status".to_string(),
-            client_local,
-        );
+        let cmd = CliMessage::command("test-gnb".to_string(), "status".to_string(), client_local);
         let server_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), server_port);
         client.send_to(&cmd.encode(), server_target).await.unwrap();
 

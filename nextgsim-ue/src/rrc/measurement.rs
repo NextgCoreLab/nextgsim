@@ -96,8 +96,8 @@ impl Default for ReportTriggerConfig {
             threshold: None,
             threshold1: None,
             threshold2: None,
-            a3_offset: Some(3), // 3 dB offset
-            hysteresis: 2,      // 1 dB
+            a3_offset: Some(3),   // 3 dB offset
+            hysteresis: 2,        // 1 dB
             time_to_trigger: 640, // 640 ms
         }
     }
@@ -239,10 +239,13 @@ impl MeasurementManager {
 
     /// Update measurement for a cell
     pub fn update_measurement(&mut self, cell_id: i32, rsrp: i32) {
-        let result = self.measurements.entry(cell_id).or_insert_with(|| CellMeasResult {
-            pci: cell_id as u32,
-            ..Default::default()
-        });
+        let result = self
+            .measurements
+            .entry(cell_id)
+            .or_insert_with(|| CellMeasResult {
+                pci: cell_id as u32,
+                ..Default::default()
+            });
         result.rsrp = Some(rsrp);
     }
 
@@ -263,7 +266,9 @@ impl MeasurementManager {
             None => return,
         };
 
-        let serving_rsrp = self.measurements.get(&serving_cell_id)
+        let serving_rsrp = self
+            .measurements
+            .get(&serving_cell_id)
             .and_then(|m| m.rsrp)
             .unwrap_or(i32::MIN);
 
@@ -280,12 +285,7 @@ impl MeasurementManager {
 
         let (condition_met, triggering_cell) = match trigger.trigger_type {
             ReportTriggerType::Event(event_type) => {
-                self.check_event_condition(
-                    event_type,
-                    trigger,
-                    serving_cell_id,
-                    serving_rsrp,
-                )
+                self.check_event_condition(event_type, trigger, serving_cell_id, serving_rsrp)
             }
             ReportTriggerType::Periodic => (true, None),
         };
@@ -313,12 +313,17 @@ impl MeasurementManager {
                             last.elapsed() >= Duration::from_millis(config.report_interval)
                         });
 
-                        let reports_remaining = config.report_amount == 0 ||
-                            state.reports_sent < config.report_amount;
+                        let reports_remaining =
+                            config.report_amount == 0 || state.reports_sent < config.report_amount;
 
                         if should_report && reports_remaining {
                             generate_report = true;
-                            report_params = Some((meas_id, serving_cell_id, triggering_cell, config.max_report_cells));
+                            report_params = Some((
+                                meas_id,
+                                serving_cell_id,
+                                triggering_cell,
+                                config.max_report_cells,
+                            ));
                             state.reports_sent += 1;
                             state.last_report = Some(Instant::now());
 
@@ -340,7 +345,8 @@ impl MeasurementManager {
         // Generate report outside the borrow scope
         if generate_report {
             if let Some((meas_id, serving_cell_id, triggering_cell, max_cells)) = report_params {
-                let report = self.generate_report(meas_id, serving_cell_id, triggering_cell, max_cells);
+                let report =
+                    self.generate_report(meas_id, serving_cell_id, triggering_cell, max_cells);
                 self.pending_reports.push(report);
             }
         }
@@ -383,9 +389,10 @@ impl MeasurementManager {
                     }
                     if let Some(rsrp) = meas.rsrp {
                         if rsrp > serving_rsrp + offset + hyst
-                            && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp) {
-                                best_neighbor = Some((cell_id, rsrp));
-                            }
+                            && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp)
+                        {
+                            best_neighbor = Some((cell_id, rsrp));
+                        }
                     }
                 }
 
@@ -402,9 +409,10 @@ impl MeasurementManager {
                         }
                         if let Some(rsrp) = meas.rsrp {
                             if rsrp > thresh + hyst
-                                && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp) {
-                                    best_neighbor = Some((cell_id, rsrp));
-                                }
+                                && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp)
+                            {
+                                best_neighbor = Some((cell_id, rsrp));
+                            }
                         }
                     }
 
@@ -429,9 +437,10 @@ impl MeasurementManager {
                     }
                     if let Some(rsrp) = meas.rsrp {
                         if rsrp > thresh2 + hyst
-                            && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp) {
-                                best_neighbor = Some((cell_id, rsrp));
-                            }
+                            && best_neighbor.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp)
+                        {
+                            best_neighbor = Some((cell_id, rsrp));
+                        }
                     }
                 }
 
@@ -448,19 +457,21 @@ impl MeasurementManager {
         max_cells: u8,
     ) -> MeasurementReport {
         // Get serving cell measurement
-        let serving_cell = self.measurements.get(&serving_cell_id)
+        let serving_cell = self
+            .measurements
+            .get(&serving_cell_id)
             .cloned()
             .expect("value expected");
 
         // Get neighbor cell measurements, sorted by RSRP
-        let mut neighbors: Vec<_> = self.measurements.iter()
+        let mut neighbors: Vec<_> = self
+            .measurements
+            .iter()
             .filter(|(&id, _)| id != serving_cell_id)
             .map(|(_, m)| m.clone())
             .collect();
 
-        neighbors.sort_by(|a, b| {
-            b.rsrp.unwrap_or(i32::MIN).cmp(&a.rsrp.unwrap_or(i32::MIN))
-        });
+        neighbors.sort_by(|a, b| b.rsrp.unwrap_or(i32::MIN).cmp(&a.rsrp.unwrap_or(i32::MIN)));
 
         // If there's a triggering cell, put it first
         if let Some(trig_id) = triggering_cell {

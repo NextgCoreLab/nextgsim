@@ -172,7 +172,8 @@ impl CodecTrainer {
 
         for sample in &batch.samples {
             // Simulate encoding/decoding
-            let compressed_dim = (sample.input.len() as f32 / self.config.target_compression) as usize;
+            let compressed_dim =
+                (sample.input.len() as f32 / self.config.target_compression) as usize;
             let compressed_dim = compressed_dim.max(1);
 
             // Simulated compression: mean pooling
@@ -277,9 +278,17 @@ impl CodecTrainer {
         }
 
         let recent = &self.history[self.history.len() - window..];
-        let first_half_loss = recent.iter().take(window / 2).map(|s| s.val_loss).sum::<f32>()
+        let first_half_loss = recent
+            .iter()
+            .take(window / 2)
+            .map(|s| s.val_loss)
+            .sum::<f32>()
             / (window / 2) as f32;
-        let second_half_loss = recent.iter().skip(window / 2).map(|s| s.val_loss).sum::<f32>()
+        let second_half_loss = recent
+            .iter()
+            .skip(window / 2)
+            .map(|s| s.val_loss)
+            .sum::<f32>()
             / (window - window / 2) as f32;
 
         if first_half_loss == 0.0 {

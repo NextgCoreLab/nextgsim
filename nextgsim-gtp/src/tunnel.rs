@@ -51,7 +51,6 @@ impl GtpTunnel {
     }
 }
 
-
 /// PDU session resource
 ///
 /// Represents a PDU session with uplink and downlink GTP tunnels.
@@ -71,12 +70,7 @@ pub struct PduSession {
 
 impl PduSession {
     /// Create a new PDU session
-    pub fn new(
-        ue_id: u32,
-        psi: u8,
-        uplink_tunnel: GtpTunnel,
-        downlink_tunnel: GtpTunnel,
-    ) -> Self {
+    pub fn new(ue_id: u32, psi: u8, uplink_tunnel: GtpTunnel, downlink_tunnel: GtpTunnel) -> Self {
         Self {
             ue_id,
             psi,
@@ -115,7 +109,6 @@ pub fn get_ue_id(session_key: u64) -> u32 {
 pub fn get_psi(session_key: u64) -> u8 {
     (session_key & 0xFF) as u8
 }
-
 
 /// Tunnel manager for GTP-U
 ///
@@ -224,7 +217,6 @@ impl TunnelManager {
         self.sessions.contains_key(&session_key)
     }
 }
-
 
 impl TunnelManager {
     /// Encapsulate user data for uplink transmission

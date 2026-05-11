@@ -273,9 +273,9 @@ impl RLAgent {
         }
 
         // Decay exploration rate
-        self.current_exploration_rate =
-            (self.current_exploration_rate * self.config.exploration_decay)
-                .max(self.config.min_exploration_rate);
+        self.current_exploration_rate = (self.current_exploration_rate
+            * self.config.exploration_decay)
+            .max(self.config.min_exploration_rate);
 
         self.total_steps += 1;
 
@@ -311,9 +311,10 @@ impl RLAgent {
                 .q_table
                 .get(&next_state_hash)
                 .and_then(|action_map| {
-                    action_map.values().map(|q| q.value).max_by(|a, b| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    action_map
+                        .values()
+                        .map(|q| q.value)
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 })
                 .unwrap_or(0.0);
 
@@ -400,7 +401,10 @@ impl RLAgent {
 
     /// Returns the size of the Q-table
     pub fn q_table_size(&self) -> usize {
-        self.q_table.values().map(std::collections::HashMap::len).sum()
+        self.q_table
+            .values()
+            .map(std::collections::HashMap::len)
+            .sum()
     }
 
     /// Returns the number of experiences in the replay buffer
@@ -486,7 +490,9 @@ mod tests {
 
         let selected = agent.select_action(&state, &actions);
         // Should select one of the available actions
-        assert!(actions.iter().any(|a| format!("{:?}", a.intent_type) == format!("{:?}", selected.intent_type)));
+        assert!(actions
+            .iter()
+            .any(|a| format!("{:?}", a.intent_type) == format!("{:?}", selected.intent_type)));
     }
 
     #[test]

@@ -38,5 +38,7 @@
 mod amf_connection;
 mod task;
 
-pub use amf_connection::{AmfConnection, AmfConnectionConfig, AmfConnectionEvent, AmfConnectionState};
+pub use amf_connection::{
+    AmfConnection, AmfConnectionConfig, AmfConnectionEvent, AmfConnectionState,
+};
 pub use task::SctpTask;

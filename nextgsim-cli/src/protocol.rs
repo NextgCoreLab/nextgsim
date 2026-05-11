@@ -181,8 +181,9 @@ impl CliMessage {
         if data.len() < value_data_offset + value_len {
             anyhow::bail!("Message truncated: missing value data");
         }
-        let value = String::from_utf8(data[value_data_offset..value_data_offset + value_len].to_vec())
-            .context("Invalid UTF-8 in value")?;
+        let value =
+            String::from_utf8(data[value_data_offset..value_data_offset + value_len].to_vec())
+                .context("Invalid UTF-8 in value")?;
 
         Ok(Self {
             msg_type,

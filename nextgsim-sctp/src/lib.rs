@@ -55,20 +55,37 @@
 //! ```
 
 pub mod association;
-pub mod server;
 pub mod quic;
+pub mod server;
 
 // Re-export main types
 pub use association::{
-    AssociationState, ReceivedMessage, SctpAssociation, SctpConfig, SctpError, SctpEvent,
-    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_NUM_STREAMS, DEFAULT_RECEIVE_BUFFER_SIZE, NGAP_PPID,
-    // Multi-homing support (A6.1)
-    MultihomeSctpAssociation, MultihomingConfig, PathManager, PathState, SctpPath,
-    // Stream management (A5.3)
-    NgapStreamCategory, StreamAllocationPolicy, StreamManager,
+    AssociationState,
     // PR-SCTP support (A6.2)
-    ForwardTsnChunk, ForwardTsnStreamInfo, PartialReliabilityPolicy,
-    PrSctpMessage, PrSctpTracker,
+    ForwardTsnChunk,
+    ForwardTsnStreamInfo,
+    // Multi-homing support (A6.1)
+    MultihomeSctpAssociation,
+    MultihomingConfig,
+    // Stream management (A5.3)
+    NgapStreamCategory,
+    PartialReliabilityPolicy,
+    PathManager,
+    PathState,
+    PrSctpMessage,
+    PrSctpTracker,
+    ReceivedMessage,
+    SctpAssociation,
+    SctpConfig,
+    SctpError,
+    SctpEvent,
+    SctpPath,
+    StreamAllocationPolicy,
+    StreamManager,
+    DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_NUM_STREAMS,
+    DEFAULT_RECEIVE_BUFFER_SIZE,
+    NGAP_PPID,
 };
 
 // Re-export server types
@@ -76,6 +93,6 @@ pub use server::{SctpServer, SctpServerConfig, ServerEvent};
 
 // Re-export QUIC transport types (A6.3 - 6G forward-looking)
 pub use quic::{
-    QuicConnectionState, QuicTransport, QuicTransportConfig, QuicTransportError,
-    TlsConfig, Transport, TransportMessage,
+    QuicConnectionState, QuicTransport, QuicTransportConfig, QuicTransportError, TlsConfig,
+    Transport, TransportMessage,
 };

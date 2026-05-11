@@ -23,9 +23,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-use nextgsim_nwdaf::{
-    CellLoad, NwdafManager, NwdafResponse, UeMeasurement, Vector3,
-};
+use nextgsim_nwdaf::{CellLoad, NwdafManager, NwdafResponse, UeMeasurement, Vector3};
 
 use crate::tasks::{GnbTaskBase, NwdafMessage, RrcMessage, Task, TaskMessage};
 
@@ -93,17 +91,16 @@ impl NwdafTask {
         // Check for anomalies
         let anomalies = self.nwdaf.recent_anomalies();
         if !anomalies.is_empty() {
-            warn!("NWDAF: Detected {} anomalies for UE {}", anomalies.len(), ue_id);
+            warn!(
+                "NWDAF: Detected {} anomalies for UE {}",
+                anomalies.len(),
+                ue_id
+            );
         }
     }
 
     /// Handles a cell load report
-    fn handle_cell_load(
-        &mut self,
-        cell_id: i32,
-        prb_usage: f32,
-        connected_ues: u32,
-    ) {
+    fn handle_cell_load(&mut self, cell_id: i32, prb_usage: f32, connected_ues: u32) {
         debug!(
             "NWDAF: Cell {} load - PRB usage={:.1}%, connected UEs={}",
             cell_id,
@@ -161,12 +158,7 @@ impl NwdafTask {
     }
 
     /// Handles a handover recommendation request
-    fn handle_handover_recommendation(
-        &mut self,
-        ue_id: i32,
-        target_cell: i32,
-        confidence: f32,
-    ) {
+    fn handle_handover_recommendation(&mut self, ue_id: i32, target_cell: i32, confidence: f32) {
         debug!(
             "NWDAF: Handover recommendation for UE {} to cell {} (confidence={:.2})",
             ue_id, target_cell, confidence
@@ -178,9 +170,16 @@ impl NwdafTask {
         );
 
         // Send recommendation to RRC task for execution
-        let msg = RrcMessage::NwdafHandoverRecommendation { ue_id, target_cell, confidence };
+        let msg = RrcMessage::NwdafHandoverRecommendation {
+            ue_id,
+            target_cell,
+            confidence,
+        };
         if let Err(e) = self.task_base.rrc_tx.try_send(msg) {
-            warn!("NWDAF: Failed to send handover recommendation to RRC: {}", e);
+            warn!(
+                "NWDAF: Failed to send handover recommendation to RRC: {}",
+                e
+            );
         }
     }
 }
@@ -194,38 +193,33 @@ impl Task for NwdafTask {
 
         loop {
             match rx.recv().await {
-                Some(TaskMessage::Message(msg)) => {
-                    match msg {
-                        NwdafMessage::UeMeasurement {
-                            ue_id,
-                            rsrp,
-                            rsrq,
-                            position,
-                        } => {
-                            self.handle_ue_measurement(ue_id, rsrp, rsrq, position);
-                        }
-                        NwdafMessage::CellLoad {
-                            cell_id,
-                            prb_usage,
-                            connected_ues,
-                        } => {
-                            self.handle_cell_load(cell_id, prb_usage, connected_ues);
-                        }
-                        NwdafMessage::PredictTrajectory {
-                            ue_id,
-                            horizon_ms,
-                        } => {
-                            self.handle_predict_trajectory(ue_id, horizon_ms, None);
-                        }
-                        NwdafMessage::HandoverRecommendation {
-                            ue_id,
-                            target_cell,
-                            confidence,
-                        } => {
-                            self.handle_handover_recommendation(ue_id, target_cell, confidence);
-                        }
+                Some(TaskMessage::Message(msg)) => match msg {
+                    NwdafMessage::UeMeasurement {
+                        ue_id,
+                        rsrp,
+                        rsrq,
+                        position,
+                    } => {
+                        self.handle_ue_measurement(ue_id, rsrp, rsrq, position);
                     }
-                }
+                    NwdafMessage::CellLoad {
+                        cell_id,
+                        prb_usage,
+                        connected_ues,
+                    } => {
+                        self.handle_cell_load(cell_id, prb_usage, connected_ues);
+                    }
+                    NwdafMessage::PredictTrajectory { ue_id, horizon_ms } => {
+                        self.handle_predict_trajectory(ue_id, horizon_ms, None);
+                    }
+                    NwdafMessage::HandoverRecommendation {
+                        ue_id,
+                        target_cell,
+                        confidence,
+                    } => {
+                        self.handle_handover_recommendation(ue_id, target_cell, confidence);
+                    }
+                },
                 Some(TaskMessage::Shutdown) => {
                     info!("NWDAF task received shutdown signal");
                     break;
@@ -333,12 +327,7 @@ mod tests {
 
         // Record measurements to build history
         for i in 0..10 {
-            task.handle_ue_measurement(
-                1,
-                -80.0,
-                -10.0,
-                (i as f32 * 10.0, i as f32 * 5.0, 0.0),
-            );
+            task.handle_ue_measurement(1, -80.0, -10.0, (i as f32 * 10.0, i as f32 * 5.0, 0.0));
         }
 
         // Request prediction

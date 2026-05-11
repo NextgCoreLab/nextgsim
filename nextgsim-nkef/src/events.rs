@@ -195,10 +195,7 @@ impl EventBus {
     pub fn on(&mut self, kind: KnowledgeEventKind, handler: EventHandler) -> HandlerId {
         let id = HandlerId(self.next_handler_id);
         self.next_handler_id += 1;
-        self.handlers
-            .entry(kind)
-            .or_default()
-            .push((id, handler));
+        self.handlers.entry(kind).or_default().push((id, handler));
         id
     }
 
@@ -445,10 +442,7 @@ mod tests {
     fn test_event_bus_clear() {
         let mut bus = EventBus::new(100);
 
-        bus.on(
-            KnowledgeEventKind::EntityCreated,
-            Box::new(|_| {}),
-        );
+        bus.on(KnowledgeEventKind::EntityCreated, Box::new(|_| {}));
         bus.on_all(Box::new(|_| {}));
         bus.enqueue(KnowledgeEvent::entity_created("a", 1));
 

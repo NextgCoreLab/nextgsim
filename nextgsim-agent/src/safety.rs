@@ -218,9 +218,7 @@ impl SafetyChecker {
 
         if ues_impacted > max_ues {
             violations.push(SafetyViolation {
-                rule_description: format!(
-                    "Intent impacts {ues_impacted} UEs, limit is {max_ues}"
-                ),
+                rule_description: format!("Intent impacts {ues_impacted} UEs, limit is {max_ues}"),
                 intent_id: intent.id.clone(),
                 agent_id: intent.agent_id.clone(),
                 timestamp_ms: now_ms,
@@ -318,16 +316,24 @@ impl SafetyChecker {
                 // Check if the intent would set status to inactive on all cells
                 // (wildcard target with deactivate).
                 if intent.target.is_none()
-                    && intent.parameters.get("status").map(std::string::String::as_str) == Some("inactive")
+                    && intent
+                        .parameters
+                        .get("status")
+                        .map(std::string::String::as_str)
+                        == Some("inactive")
                 {
                     return Some(ViolationSeverity::Critical);
                 }
                 // Also block if projected affected cells include wildcard.
-                let has_wildcard_cell = projected_affected.iter().any(|r| {
-                    r.kind == ResourceKind::Cell && r.id == "*"
-                });
+                let has_wildcard_cell = projected_affected
+                    .iter()
+                    .any(|r| r.kind == ResourceKind::Cell && r.id == "*");
                 if has_wildcard_cell
-                    && intent.parameters.get("status").map(std::string::String::as_str) == Some("inactive")
+                    && intent
+                        .parameters
+                        .get("status")
+                        .map(std::string::String::as_str)
+                        == Some("inactive")
                 {
                     return Some(ViolationSeverity::Critical);
                 }
@@ -450,7 +456,9 @@ mod tests {
     fn test_forbidden_disable_all_cells() {
         let mut checker = SafetyChecker::default();
         let mut intent = make_intent(IntentType::OptimizeResources);
-        intent.parameters.insert("status".to_string(), "inactive".to_string());
+        intent
+            .parameters
+            .insert("status".to_string(), "inactive".to_string());
         // No target = global scope.
 
         let affected = vec![AffectedResource {
@@ -462,7 +470,9 @@ mod tests {
         let result = checker.validate(&intent, &affected);
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations.iter().any(|v| v.severity == ViolationSeverity::Critical));
+        assert!(violations
+            .iter()
+            .any(|v| v.severity == ViolationSeverity::Critical));
     }
 
     #[test]
@@ -533,11 +543,15 @@ mod tests {
             .collect();
 
         // Normal agent should fail.
-        let normal_intent = Intent::new(AgentId::new("normal-agent"), IntentType::OptimizeResources);
+        let normal_intent =
+            Intent::new(AgentId::new("normal-agent"), IntentType::OptimizeResources);
         assert!(checker.validate(&normal_intent, &affected).is_err());
 
         // Privileged agent should pass.
-        let priv_intent = Intent::new(AgentId::new("privileged-agent"), IntentType::OptimizeResources);
+        let priv_intent = Intent::new(
+            AgentId::new("privileged-agent"),
+            IntentType::OptimizeResources,
+        );
         assert!(checker.validate(&priv_intent, &affected).is_ok());
     }
 

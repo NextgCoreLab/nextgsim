@@ -466,7 +466,9 @@ pub fn encode_cho_config(config: &ChoConfig) -> Result<Vec<u8>, ConditionalHando
 ///
 /// Note: This only decodes the simplified header fields. Full condition
 /// parameters require the complete RRC reconfiguration message.
-pub fn decode_cho_config_header(bytes: &[u8]) -> Result<(u8, u8, bool, bool), ConditionalHandoverError> {
+pub fn decode_cho_config_header(
+    bytes: &[u8],
+) -> Result<(u8, u8, bool, bool), ConditionalHandoverError> {
     if bytes.len() < 3 {
         return Err(ConditionalHandoverError::CodecError(
             "Insufficient bytes for CHO config header".to_string(),
@@ -477,7 +479,12 @@ pub fn decode_cho_config_header(bytes: &[u8]) -> Result<(u8, u8, bool, bool), Co
     let report_cho_execution = (bytes[2] & 0x01) != 0;
     let predictive_ho_enabled = (bytes[2] & 0x02) != 0;
 
-    Ok((config_id, num_candidates, report_cho_execution, predictive_ho_enabled))
+    Ok((
+        config_id,
+        num_candidates,
+        report_cho_execution,
+        predictive_ho_enabled,
+    ))
 }
 
 #[cfg(test)]

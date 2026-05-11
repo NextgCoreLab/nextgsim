@@ -252,9 +252,11 @@ fn parse_supported_ta_list(list: &SupportedTAList) -> Vec<SupportedTaItem> {
                         .iter()
                         .map(|slice_item| {
                             let sst = slice_item.s_nssai.sst.0.first().copied().unwrap_or(0);
-                            let sd = slice_item.s_nssai.sd.as_ref().and_then(|sd| {
-                                sd.0.as_slice().try_into().ok()
-                            });
+                            let sd = slice_item
+                                .s_nssai
+                                .sd
+                                .as_ref()
+                                .and_then(|sd| sd.0.as_slice().try_into().ok());
                             SNssai { sst, sd }
                         })
                         .collect();
@@ -324,9 +326,8 @@ pub fn parse_ran_configuration_update_failure(
     }
 
     Ok(RanConfigurationUpdateFailureData {
-        cause: cause.ok_or_else(|| {
-            RanConfigurationUpdateError::MissingMandatoryIe("Cause".to_string())
-        })?,
+        cause: cause
+            .ok_or_else(|| RanConfigurationUpdateError::MissingMandatoryIe("Cause".to_string()))?,
         time_to_wait,
     })
 }

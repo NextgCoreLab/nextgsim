@@ -223,8 +223,7 @@ impl Default for StatusReporter {
 /// UE basic information for CLI display.
 ///
 /// This structure contains static UE information from configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UeInfo {
     /// SUPI (Subscriber Permanent Identifier) if configured
     #[serde(rename = "supi", skip_serializing_if = "Option::is_none")]
@@ -239,7 +238,6 @@ pub struct UeInfo {
     #[serde(rename = "pending-procedures")]
     pub pending_procedures: usize,
 }
-
 
 impl UeInfo {
     /// Creates a new `UeInfo` with default values.
@@ -347,16 +345,16 @@ mod tests {
     #[test]
     fn test_ue_status_info_set_states() {
         let mut status = UeStatusInfo::new();
-        
+
         status.set_rm_state(RmState::Registered);
         assert_eq!(status.rm_state, "RM-REGISTERED");
-        
+
         status.set_mm_state(MmState::Registered);
         assert_eq!(status.mm_state, "5GMM-REGISTERED");
-        
+
         status.set_mm_sub_state(MmSubState::RegisteredNormalService);
         assert_eq!(status.mm_sub_state, "5GMM-REGISTERED.NORMAL-SERVICE");
-        
+
         status.set_cm_state(CmState::Connected);
         assert_eq!(status.cm_state, "CM-CONNECTED");
     }
@@ -364,15 +362,15 @@ mod tests {
     #[test]
     fn test_ue_status_info_apply_session_establishment() {
         let mut status = UeStatusInfo::new();
-        
+
         let update = UeStatusUpdate::SessionEstablishment { psi: 1 };
         status.apply_update(&update);
         assert_eq!(status.pdu_sessions, vec![1]);
-        
+
         let update = UeStatusUpdate::SessionEstablishment { psi: 3 };
         status.apply_update(&update);
         assert_eq!(status.pdu_sessions, vec![1, 3]);
-        
+
         // Duplicate should not be added
         let update = UeStatusUpdate::SessionEstablishment { psi: 1 };
         status.apply_update(&update);
@@ -383,7 +381,7 @@ mod tests {
     fn test_ue_status_info_apply_session_release() {
         let mut status = UeStatusInfo::new();
         status.pdu_sessions = vec![1, 2, 3];
-        
+
         let update = UeStatusUpdate::SessionRelease { psi: 2 };
         status.apply_update(&update);
         assert_eq!(status.pdu_sessions, vec![1, 3]);
@@ -392,8 +390,10 @@ mod tests {
     #[test]
     fn test_ue_status_info_apply_cm_state_changed() {
         let mut status = UeStatusInfo::new();
-        
-        let update = UeStatusUpdate::CmStateChanged { cm_state: CmState::Connected };
+
+        let update = UeStatusUpdate::CmStateChanged {
+            cm_state: CmState::Connected,
+        };
         status.apply_update(&update);
         assert_eq!(status.cm_state, "CM-CONNECTED");
     }
@@ -421,15 +421,15 @@ mod tests {
     #[test]
     fn test_ue_status_info_helpers() {
         let mut status = UeStatusInfo::new();
-        
+
         assert!(!status.is_registered());
         assert!(!status.is_connected());
         assert_eq!(status.session_count(), 0);
-        
+
         status.set_rm_state(RmState::Registered);
         status.set_cm_state(CmState::Connected);
         status.pdu_sessions = vec![1, 2];
-        
+
         assert!(status.is_registered());
         assert!(status.is_connected());
         assert_eq!(status.session_count(), 2);
@@ -454,12 +454,12 @@ mod tests {
     #[test]
     fn test_status_reporter_set_states() {
         let mut reporter = StatusReporter::new();
-        
+
         reporter.set_rm_state(RmState::Registered);
         reporter.set_mm_state(MmState::Registered);
         reporter.set_mm_sub_state(MmSubState::RegisteredNormalService);
         reporter.set_cm_state(CmState::Connected);
-        
+
         assert!(reporter.status().is_registered());
         assert!(reporter.status().is_connected());
     }

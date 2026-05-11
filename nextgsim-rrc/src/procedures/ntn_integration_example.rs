@@ -12,10 +12,12 @@
 
 #![allow(dead_code)]
 
-use super::ntn_constellation::{Constellation, ConstellationConfig, GeodeticPosition};
-use super::ntn_link_sim::{NtnLinkSimulator, GroundPosition};
 use super::isl_handover::{IslHandoverManager, SatellitePosition as IslSatPosition};
-use super::ntn_timing::{NtnTimingAdvance, SatelliteOrbitType, NtnEphemerisData, KeplerianElements, EphemerisSource};
+use super::ntn_constellation::{Constellation, ConstellationConfig, GeodeticPosition};
+use super::ntn_link_sim::{GroundPosition, NtnLinkSimulator};
+use super::ntn_timing::{
+    EphemerisSource, KeplerianElements, NtnEphemerisData, NtnTimingAdvance, SatelliteOrbitType,
+};
 
 /// Complete NTN simulation scenario
 pub struct NtnScenario {
@@ -99,7 +101,7 @@ impl NtnScenario {
         if let Some((new_sat, handover_time)) = self.constellation.predict_handover(
             &self.ue_position,
             self.serving_satellite,
-            1.0, // 1 second time step
+            1.0,  // 1 second time step
             60.0, // 60 second lookahead
         ) {
             if handover_time < 5.0 {
@@ -109,14 +111,18 @@ impl NtnScenario {
         }
 
         // Update satellite positions in handover manager
-        if let Ok(state) = self.constellation.calculate_satellite_state(self.serving_satellite) {
+        if let Ok(state) = self
+            .constellation
+            .calculate_satellite_state(self.serving_satellite)
+        {
             let isl_pos = IslSatPosition {
                 x_km: state.position.x / 1000.0,
                 y_km: state.position.y / 1000.0,
                 z_km: state.position.z / 1000.0,
                 timestamp_ms: (self.time_s * 1000.0) as u64,
             };
-            self.handover_mgr.update_satellite_position(self.serving_satellite, isl_pos);
+            self.handover_mgr
+                .update_satellite_position(self.serving_satellite, isl_pos);
         }
     }
 
@@ -154,7 +160,10 @@ impl NtnScenario {
         let link_result = self.link_sim.simulate(&ground);
 
         // Get satellite state for additional info
-        let sat_state = self.constellation.calculate_satellite_state(self.serving_satellite).ok()?;
+        let sat_state = self
+            .constellation
+            .calculate_satellite_state(self.serving_satellite)
+            .ok()?;
 
         let doppler = sat_state.calculate_doppler(&self.ue_position, 2e9);
         let propagation_delay = sat_state.propagation_delay_ms(&self.ue_position);
@@ -175,7 +184,10 @@ impl NtnScenario {
     ///
     /// Returns None if satellite state cannot be calculated
     pub fn get_timing_advance(&self) -> Option<NtnTimingAdvance> {
-        let sat_state = self.constellation.calculate_satellite_state(self.serving_satellite).ok()?;
+        let sat_state = self
+            .constellation
+            .calculate_satellite_state(self.serving_satellite)
+            .ok()?;
 
         let delay_ms = sat_state.propagation_delay_ms(&self.ue_position);
         let delay_us = (delay_ms * 1000.0) as u64;

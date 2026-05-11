@@ -94,7 +94,7 @@ mod tests {
     async fn test_bind_and_local_addr() {
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
         let transport = UdpTransport::bind(addr).await.expect("bind should succeed");
-        
+
         let local = transport.local_addr().expect("local_addr should succeed");
         assert_eq!(local.ip(), addr.ip());
         assert_ne!(local.port(), 0); // Port should be assigned
@@ -105,20 +105,27 @@ mod tests {
         // Create two transports
         let addr1: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
         let addr2: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
-        
-        let transport1 = UdpTransport::bind(addr1).await.expect("bind should succeed");
-        let transport2 = UdpTransport::bind(addr2).await.expect("bind should succeed");
-        
+
+        let transport1 = UdpTransport::bind(addr1)
+            .await
+            .expect("bind should succeed");
+        let transport2 = UdpTransport::bind(addr2)
+            .await
+            .expect("bind should succeed");
+
         let local1 = transport1.local_addr().expect("local_addr should succeed");
         let local2 = transport2.local_addr().expect("local_addr should succeed");
-        
+
         // Send from transport1 to transport2
         let test_data = b"hello, udp!";
-        transport1.send_to(test_data, local2).await.expect("send should succeed");
-        
+        transport1
+            .send_to(test_data, local2)
+            .await
+            .expect("send should succeed");
+
         // Receive on transport2
         let (received, src) = transport2.recv_from().await.expect("recv should succeed");
-        
+
         assert_eq!(received, test_data);
         assert_eq!(src, local1);
     }
@@ -127,16 +134,23 @@ mod tests {
     async fn test_large_datagram() {
         let addr1: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
         let addr2: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
-        
-        let transport1 = UdpTransport::bind(addr1).await.expect("bind should succeed");
-        let transport2 = UdpTransport::bind(addr2).await.expect("bind should succeed");
-        
+
+        let transport1 = UdpTransport::bind(addr1)
+            .await
+            .expect("bind should succeed");
+        let transport2 = UdpTransport::bind(addr2)
+            .await
+            .expect("bind should succeed");
+
         let local2 = transport2.local_addr().expect("local_addr should succeed");
-        
+
         // Send a larger datagram (8KB)
         let test_data: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
-        transport1.send_to(&test_data, local2).await.expect("send should succeed");
-        
+        transport1
+            .send_to(&test_data, local2)
+            .await
+            .expect("send should succeed");
+
         let (received, _) = transport2.recv_from().await.expect("recv should succeed");
         assert_eq!(received, test_data);
     }

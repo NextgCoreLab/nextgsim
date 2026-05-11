@@ -140,7 +140,9 @@ impl HandoverManager {
     pub fn start_handover(&mut self, source_cell: i32, command: HandoverCommand) {
         tracing::info!(
             "Starting handover: source_cell={}, target_pci={}, target_cell_id={}",
-            source_cell, command.target_cell.pci, command.target_cell.cell_id
+            source_cell,
+            command.target_cell.pci,
+            command.target_cell.cell_id
         );
 
         self.source_cell_id = Some(source_cell);
@@ -168,7 +170,10 @@ impl HandoverManager {
 
     /// Complete the handover
     pub fn complete(&mut self) -> Option<i32> {
-        if matches!(self.state, HandoverState::Synchronizing | HandoverState::Completing) {
+        if matches!(
+            self.state,
+            HandoverState::Synchronizing | HandoverState::Completing
+        ) {
             self.state = HandoverState::Idle;
             self.t304_start = None;
             self.ho_complete_time = Some(Instant::now());
@@ -178,7 +183,8 @@ impl HandoverManager {
             if let Some(start) = self.ho_start_time {
                 tracing::info!(
                     "Handover complete: target_cell_id={:?}, duration={:?}",
-                    target_cell_id, start.elapsed()
+                    target_cell_id,
+                    start.elapsed()
                 );
             }
 
@@ -511,8 +517,10 @@ impl UeDapsContext {
     /// Starts synchronization with target cell.
     pub fn start_target_sync(&mut self) {
         if self.state == DapsState::Preparing {
-            tracing::debug!("DAPS: Starting synchronization with target cell PCI={}",
-                          self.target_cell.pci);
+            tracing::debug!(
+                "DAPS: Starting synchronization with target cell PCI={}",
+                self.target_cell.pci
+            );
             self.state = DapsState::DualActive;
         }
     }
@@ -640,15 +648,15 @@ impl HandoverManager {
 
     /// Completes DAPS handover after target cell is synchronized.
     pub fn complete_daps(&mut self) -> Option<i32> {
-        if matches!(self.state, HandoverState::Preparing | HandoverState::Synchronizing | HandoverState::Completing) {
+        if matches!(
+            self.state,
+            HandoverState::Preparing | HandoverState::Synchronizing | HandoverState::Completing
+        ) {
             self.state = HandoverState::Idle;
             self.ho_complete_time = Some(Instant::now());
 
             if let Some(start) = self.ho_start_time {
-                tracing::info!(
-                    "DAPS handover complete: duration={:?}",
-                    start.elapsed()
-                );
+                tracing::info!("DAPS handover complete: duration={:?}", start.elapsed());
             }
 
             self.command = None;

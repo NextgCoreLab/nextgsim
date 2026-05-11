@@ -131,11 +131,13 @@ pub fn build_rrc_reestablishment_request(
         rrc_reestablishment_request: rrc_reestablishment_request_ies,
     };
 
-    let message_type = UL_CCCH_MessageType::C1(
-        UL_CCCH_MessageType_c1::RrcReestablishmentRequest(rrc_reestablishment_request),
-    );
+    let message_type = UL_CCCH_MessageType::C1(UL_CCCH_MessageType_c1::RrcReestablishmentRequest(
+        rrc_reestablishment_request,
+    ));
 
-    Ok(UL_CCCH_Message { message: message_type })
+    Ok(UL_CCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Reestablishment Request from a UL-CCCH message
@@ -238,11 +240,13 @@ pub fn build_rrc_reestablishment_complete(
             RRCReestablishmentCompleteCriticalExtensions::RrcReestablishmentComplete(ies),
     };
 
-    let message_type = UL_DCCH_MessageType::C1(
-        UL_DCCH_MessageType_c1::RrcReestablishmentComplete(rrc_reestablishment_complete),
-    );
+    let message_type = UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::RrcReestablishmentComplete(
+        rrc_reestablishment_complete,
+    ));
 
-    Ok(UL_DCCH_Message { message: message_type })
+    Ok(UL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Reestablishment Complete from a UL-DCCH message
@@ -347,7 +351,10 @@ mod tests {
         let data = parse_rrc_reestablishment_request(&msg).unwrap();
 
         assert_eq!(data.ue_identity.c_rnti, params.ue_identity.c_rnti);
-        assert_eq!(data.ue_identity.phys_cell_id, params.ue_identity.phys_cell_id);
+        assert_eq!(
+            data.ue_identity.phys_cell_id,
+            params.ue_identity.phys_cell_id
+        );
         assert_eq!(data.ue_identity.short_mac_i, params.ue_identity.short_mac_i);
         assert_eq!(data.reestablishment_cause, params.reestablishment_cause);
     }

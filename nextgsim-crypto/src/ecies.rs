@@ -63,7 +63,11 @@ pub enum EciesError {
 pub type EciesResult<T> = Result<T, EciesError>;
 
 /// X9.63 Key Derivation Function using SHA-256
-pub fn x963_kdf(shared_secret: &[u8; X25519_SHARED_SIZE], shared_info: &[u8], key_size: usize) -> Vec<u8> {
+pub fn x963_kdf(
+    shared_secret: &[u8; X25519_SHARED_SIZE],
+    shared_info: &[u8],
+    key_size: usize,
+) -> Vec<u8> {
     const SHA256_DIGEST_SIZE: usize = 32;
     let max_count = key_size.div_ceil(SHA256_DIGEST_SIZE);
     let mut result = Vec::with_capacity(max_count * SHA256_DIGEST_SIZE);
@@ -98,14 +102,21 @@ impl EciesKeyPair {
     pub fn from_seed(seed: &[u8; X25519_KEY_SIZE]) -> Self {
         let secret = StaticSecret::from(*seed);
         let public = PublicKey::from(&secret);
-        Self { private_key: *seed, public_key: *public.as_bytes() }
+        Self {
+            private_key: *seed,
+            public_key: *public.as_bytes(),
+        }
     }
 
     /// Get the public key
-    pub fn public_key(&self) -> &[u8; X25519_KEY_SIZE] { &self.public_key }
+    pub fn public_key(&self) -> &[u8; X25519_KEY_SIZE] {
+        &self.public_key
+    }
 
     /// Get the private key
-    pub fn private_key(&self) -> &[u8; X25519_KEY_SIZE] { &self.private_key }
+    pub fn private_key(&self) -> &[u8; X25519_KEY_SIZE] {
+        &self.private_key
+    }
 }
 
 /// Compute X25519 shared secret
@@ -123,7 +134,11 @@ pub fn ecies_encrypt(
     plaintext: &[u8],
     home_network_public_key: &[u8; X25519_KEY_SIZE],
 ) -> EciesResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    ecies_encrypt_with_keypair(plaintext, home_network_public_key, &EciesKeyPair::generate())
+    ecies_encrypt_with_keypair(
+        plaintext,
+        home_network_public_key,
+        &EciesKeyPair::generate(),
+    )
 }
 
 /// ECIES Profile A encryption with a specific ephemeral key pair (for testing)
@@ -132,15 +147,19 @@ pub fn ecies_encrypt_with_keypair(
     home_network_public_key: &[u8; X25519_KEY_SIZE],
     ephemeral_keypair: &EciesKeyPair,
 ) -> EciesResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let shared_secret = x25519_shared_secret(ephemeral_keypair.private_key(), home_network_public_key);
+    let shared_secret =
+        x25519_shared_secret(ephemeral_keypair.private_key(), home_network_public_key);
     let derived_key = x963_kdf(&shared_secret, ephemeral_keypair.public_key(), 64);
 
     // KDF output is guaranteed to be 64 bytes
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
 
     let mut ciphertext = plaintext.to_vec();
@@ -164,27 +183,35 @@ pub fn ecies_decrypt(
 ) -> EciesResult<Vec<u8>> {
     if ephemeral_public_key.len() != X25519_KEY_SIZE {
         return Err(EciesError::InvalidPublicKey(format!(
-            "Expected {} bytes, got {}", X25519_KEY_SIZE, ephemeral_public_key.len()
+            "Expected {} bytes, got {}",
+            X25519_KEY_SIZE,
+            ephemeral_public_key.len()
         )));
     }
     if mac_tag.len() != MAC_TAG_SIZE {
         return Err(EciesError::InvalidCiphertext(format!(
-            "Invalid MAC tag length: expected {}, got {}", MAC_TAG_SIZE, mac_tag.len()
+            "Invalid MAC tag length: expected {}, got {}",
+            MAC_TAG_SIZE,
+            mac_tag.len()
         )));
     }
 
     // Length already validated above
-    let ephemeral_pk: [u8; X25519_KEY_SIZE] = ephemeral_public_key.try_into()
+    let ephemeral_pk: [u8; X25519_KEY_SIZE] = ephemeral_public_key
+        .try_into()
         .map_err(|_| EciesError::InvalidPublicKey("Invalid key length".into()))?;
     let shared_secret = x25519_shared_secret(home_network_private_key, &ephemeral_pk);
     let derived_key = x963_kdf(&shared_secret, &ephemeral_pk, 64);
 
     // KDF output is guaranteed to be 64 bytes
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key)
@@ -207,7 +234,8 @@ pub fn generate_suci_profile_a(
     home_network_public_key: &[u8; X25519_KEY_SIZE],
 ) -> EciesResult<Vec<u8>> {
     let (ephemeral_pk, ciphertext, mac_tag) = ecies_encrypt(msin, home_network_public_key)?;
-    let mut scheme_output = Vec::with_capacity(ephemeral_pk.len() + ciphertext.len() + mac_tag.len());
+    let mut scheme_output =
+        Vec::with_capacity(ephemeral_pk.len() + ciphertext.len() + mac_tag.len());
     scheme_output.extend_from_slice(&ephemeral_pk);
     scheme_output.extend_from_slice(&ciphertext);
     scheme_output.extend_from_slice(&mac_tag);
@@ -221,7 +249,8 @@ pub fn decode_suci_profile_a(
 ) -> EciesResult<Vec<u8>> {
     if scheme_output.len() < X25519_KEY_SIZE + 1 + MAC_TAG_SIZE {
         return Err(EciesError::InvalidCiphertext(format!(
-            "Scheme output too short: {} bytes", scheme_output.len()
+            "Scheme output too short: {} bytes",
+            scheme_output.len()
         )));
     }
     let ephemeral_pk = &scheme_output[..X25519_KEY_SIZE];
@@ -266,7 +295,10 @@ impl EciesProfileBKeyPair {
     pub fn generate() -> Self {
         let secret_key = P256SecretKey::random(&mut OsRng);
         let public_key = secret_key.public_key();
-        Self { secret_key, public_key }
+        Self {
+            secret_key,
+            public_key,
+        }
     }
 
     /// Create a key pair from raw secret key bytes
@@ -277,7 +309,10 @@ impl EciesProfileBKeyPair {
         let secret_key = P256SecretKey::from_bytes(bytes.into())
             .map_err(|e| EciesError::P256Error(format!("Invalid secret key: {e}")))?;
         let public_key = secret_key.public_key();
-        Ok(Self { secret_key, public_key })
+        Ok(Self {
+            secret_key,
+            public_key,
+        })
     }
 
     /// Get the compressed public key (33 bytes)
@@ -309,15 +344,9 @@ impl EciesProfileBKeyPair {
 }
 
 /// Perform P-256 ECDH key agreement
-fn p256_ecdh(
-    my_secret: &P256SecretKey,
-    their_public: &P256PublicKey,
-) -> EciesResult<Vec<u8>> {
+fn p256_ecdh(my_secret: &P256SecretKey, their_public: &P256PublicKey) -> EciesResult<Vec<u8>> {
     use p256::ecdh::diffie_hellman;
-    let shared_secret = diffie_hellman(
-        my_secret.to_nonzero_scalar(),
-        their_public.as_affine(),
-    );
+    let shared_secret = diffie_hellman(my_secret.to_nonzero_scalar(), their_public.as_affine());
     Ok(shared_secret.raw_secret_bytes().to_vec())
 }
 
@@ -353,11 +382,14 @@ pub fn ecies_profile_b_encrypt_with_keypair(
     let derived_key = x963_kdf_bytes(&shared_secret, &ephemeral_pk_compressed, 64);
 
     // KDF output is guaranteed to be 64 bytes
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
 
     let mut ciphertext = plaintext.to_vec();
@@ -392,7 +424,9 @@ pub fn ecies_profile_b_decrypt(
 
     if mac_tag.len() != MAC_TAG_SIZE {
         return Err(EciesError::InvalidCiphertext(format!(
-            "Invalid MAC tag length: expected {}, got {}", MAC_TAG_SIZE, mac_tag.len()
+            "Invalid MAC tag length: expected {}, got {}",
+            MAC_TAG_SIZE,
+            mac_tag.len()
         )));
     }
 
@@ -400,11 +434,14 @@ pub fn ecies_profile_b_decrypt(
     let derived_key = x963_kdf_bytes(&shared_secret, ephemeral_public_key, 64);
 
     // KDF output is guaranteed to be 64 bytes
-    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16].try_into()
+    let encryption_key: [u8; AES_KEY_SIZE] = derived_key[0..16]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract encryption key".into()))?;
-    let iv: [u8; AES_IV_SIZE] = derived_key[16..32].try_into()
+    let iv: [u8; AES_IV_SIZE] = derived_key[16..32]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract IV".into()))?;
-    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64].try_into()
+    let mac_key: [u8; HMAC_KEY_SIZE] = derived_key[32..64]
+        .try_into()
         .map_err(|_| EciesError::KeyDerivationError("Failed to extract MAC key".into()))?;
 
     // Verify MAC
@@ -457,7 +494,8 @@ pub fn decode_suci_profile_b(
 ) -> EciesResult<Vec<u8>> {
     if scheme_output.len() < P256_COMPRESSED_POINT_SIZE + 1 + MAC_TAG_SIZE {
         return Err(EciesError::InvalidCiphertext(format!(
-            "Scheme output too short: {} bytes", scheme_output.len()
+            "Scheme output too short: {} bytes",
+            scheme_output.len()
         )));
     }
     let ephemeral_pk = &scheme_output[..P256_COMPRESSED_POINT_SIZE];
@@ -529,9 +567,13 @@ mod tests {
             ecies_encrypt(plaintext, hn_keypair.public_key()).expect("encrypt");
         assert_eq!(ciphertext.len(), plaintext.len());
         assert_ne!(&ciphertext[..], &plaintext[..]);
-        let decrypted =
-            ecies_decrypt(&ephemeral_pk, &ciphertext, &mac_tag, hn_keypair.private_key())
-                .expect("decrypt");
+        let decrypted = ecies_decrypt(
+            &ephemeral_pk,
+            &ciphertext,
+            &mac_tag,
+            hn_keypair.private_key(),
+        )
+        .expect("decrypt");
         assert_eq!(&decrypted[..], &plaintext[..]);
     }
 
@@ -543,9 +585,13 @@ mod tests {
         let (ephemeral_pk, ciphertext, mac_tag) =
             ecies_encrypt_with_keypair(&plaintext, hn_keypair.public_key(), &ephemeral_keypair)
                 .expect("encrypt");
-        let decrypted =
-            ecies_decrypt(&ephemeral_pk, &ciphertext, &mac_tag, hn_keypair.private_key())
-                .expect("decrypt");
+        let decrypted = ecies_decrypt(
+            &ephemeral_pk,
+            &ciphertext,
+            &mac_tag,
+            hn_keypair.private_key(),
+        )
+        .expect("decrypt");
         assert_eq!(&decrypted[..], &plaintext[..]);
     }
 
@@ -556,7 +602,12 @@ mod tests {
         let (ephemeral_pk, ciphertext, mut mac_tag) =
             ecies_encrypt(plaintext, hn_keypair.public_key()).expect("encrypt");
         mac_tag[0] ^= 0xFF;
-        let result = ecies_decrypt(&ephemeral_pk, &ciphertext, &mac_tag, hn_keypair.private_key());
+        let result = ecies_decrypt(
+            &ephemeral_pk,
+            &ciphertext,
+            &mac_tag,
+            hn_keypair.private_key(),
+        );
         assert!(matches!(result, Err(EciesError::MacVerificationFailed)));
     }
 
@@ -567,7 +618,12 @@ mod tests {
         let (ephemeral_pk, mut ciphertext, mac_tag) =
             ecies_encrypt(plaintext, hn_keypair.public_key()).expect("encrypt");
         ciphertext[0] ^= 0xFF;
-        let result = ecies_decrypt(&ephemeral_pk, &ciphertext, &mac_tag, hn_keypair.private_key());
+        let result = ecies_decrypt(
+            &ephemeral_pk,
+            &ciphertext,
+            &mac_tag,
+            hn_keypair.private_key(),
+        );
         assert!(matches!(result, Err(EciesError::MacVerificationFailed)));
     }
 
@@ -578,8 +634,12 @@ mod tests {
         let wrong_keypair = EciesKeyPair::generate();
         let (ephemeral_pk, ciphertext, mac_tag) =
             ecies_encrypt(plaintext, hn_keypair.public_key()).expect("encrypt");
-        let result =
-            ecies_decrypt(&ephemeral_pk, &ciphertext, &mac_tag, wrong_keypair.private_key());
+        let result = ecies_decrypt(
+            &ephemeral_pk,
+            &ciphertext,
+            &mac_tag,
+            wrong_keypair.private_key(),
+        );
         assert!(matches!(result, Err(EciesError::MacVerificationFailed)));
     }
 
@@ -589,8 +649,8 @@ mod tests {
         let hn_keypair = EciesKeyPair::generate();
         let scheme_output = generate_suci_profile_a(&msin, hn_keypair.public_key()).expect("gen");
         assert_eq!(scheme_output.len(), 32 + msin.len() + 8);
-        let decoded_msin = decode_suci_profile_a(&scheme_output, hn_keypair.private_key())
-            .expect("decode");
+        let decoded_msin =
+            decode_suci_profile_a(&scheme_output, hn_keypair.private_key()).expect("decode");
         assert_eq!(&decoded_msin[..], &msin[..]);
     }
 
@@ -598,7 +658,8 @@ mod tests {
     fn test_suci_profile_a_with_real_msin() {
         let msin_bcd = [0x10, 0x32, 0x54, 0x76, 0x98];
         let hn_keypair = EciesKeyPair::generate();
-        let scheme_output = generate_suci_profile_a(&msin_bcd, hn_keypair.public_key()).expect("gen");
+        let scheme_output =
+            generate_suci_profile_a(&msin_bcd, hn_keypair.public_key()).expect("gen");
         let decoded = decode_suci_profile_a(&scheme_output, hn_keypair.private_key()).expect("dec");
         assert_eq!(&decoded[..], &msin_bcd[..]);
     }
@@ -618,9 +679,13 @@ mod tests {
         let (ephemeral_pk, ciphertext, mac_tag) =
             ecies_encrypt(&plaintext, hn_keypair.public_key()).expect("encrypt");
         assert_eq!(ciphertext.len(), 0);
-        let decrypted =
-            ecies_decrypt(&ephemeral_pk, &ciphertext, &mac_tag, hn_keypair.private_key())
-                .expect("decrypt");
+        let decrypted = ecies_decrypt(
+            &ephemeral_pk,
+            &ciphertext,
+            &mac_tag,
+            hn_keypair.private_key(),
+        )
+        .expect("decrypt");
         assert_eq!(decrypted.len(), 0);
     }
 
@@ -631,9 +696,13 @@ mod tests {
         let (ephemeral_pk, ciphertext, mac_tag) =
             ecies_encrypt(&plaintext, hn_keypair.public_key()).expect("encrypt");
         assert_eq!(ciphertext.len(), plaintext.len());
-        let decrypted =
-            ecies_decrypt(&ephemeral_pk, &ciphertext, &mac_tag, hn_keypair.private_key())
-                .expect("decrypt");
+        let decrypted = ecies_decrypt(
+            &ephemeral_pk,
+            &ciphertext,
+            &mac_tag,
+            hn_keypair.private_key(),
+        )
+        .expect("decrypt");
         assert_eq!(decrypted, plaintext);
     }
 
@@ -718,10 +787,12 @@ mod tests {
         let msin = [0x00, 0x00, 0x00, 0x00, 0x01];
         let hn_keypair = EciesProfileBKeyPair::generate();
 
-        let scheme_output =
-            generate_suci_profile_b(&msin, hn_keypair.public_key()).expect("gen");
+        let scheme_output = generate_suci_profile_b(&msin, hn_keypair.public_key()).expect("gen");
         // 33 (compressed P-256) + 5 (msin) + 8 (mac) = 46
-        assert_eq!(scheme_output.len(), P256_COMPRESSED_POINT_SIZE + msin.len() + MAC_TAG_SIZE);
+        assert_eq!(
+            scheme_output.len(),
+            P256_COMPRESSED_POINT_SIZE + msin.len() + MAC_TAG_SIZE
+        );
 
         let decoded_msin =
             decode_suci_profile_b(&scheme_output, hn_keypair.secret_key()).expect("decode");
@@ -735,8 +806,7 @@ mod tests {
 
         let scheme_output =
             generate_suci_profile_b(&msin_bcd, hn_keypair.public_key()).expect("gen");
-        let decoded =
-            decode_suci_profile_b(&scheme_output, hn_keypair.secret_key()).expect("dec");
+        let decoded = decode_suci_profile_b(&scheme_output, hn_keypair.secret_key()).expect("dec");
         assert_eq!(&decoded[..], &msin_bcd[..]);
     }
 

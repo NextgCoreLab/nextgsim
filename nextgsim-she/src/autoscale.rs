@@ -14,8 +14,7 @@ use crate::resource::ResourceCapacity;
 use crate::tier::{ComputeNode, ComputeTier, TierManager};
 
 /// Auto-scaling policy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ScalingPolicy {
     /// Scale based on CPU/memory utilization thresholds
     #[default]
@@ -27,7 +26,6 @@ pub enum ScalingPolicy {
     /// Manual scaling only
     Manual,
 }
-
 
 /// Auto-scaling configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,19 +175,24 @@ impl AutoScaler {
 
         let reason = match action {
             ScalingAction::ScaleUp { .. } => {
-                format!("Utilization {:.1}% exceeds threshold {:.1}%",
+                format!(
+                    "Utilization {:.1}% exceeds threshold {:.1}%",
                     utilization * 100.0,
                     self.config.scale_up_threshold * 100.0
                 )
             }
             ScalingAction::ScaleDown { .. } => {
-                format!("Utilization {:.1}% below threshold {:.1}%",
+                format!(
+                    "Utilization {:.1}% below threshold {:.1}%",
                     utilization * 100.0,
                     self.config.scale_down_threshold * 100.0
                 )
             }
             ScalingAction::None => {
-                format!("Utilization {:.1}% within target range", utilization * 100.0)
+                format!(
+                    "Utilization {:.1}% within target range",
+                    utilization * 100.0
+                )
             }
         };
 
@@ -244,7 +247,10 @@ impl AutoScaler {
 
         let reason = match action {
             ScalingAction::ScaleUp { .. } => {
-                format!("Queue depth {} exceeds threshold {}", queue_depth, self.config.queue_depth_threshold)
+                format!(
+                    "Queue depth {} exceeds threshold {}",
+                    queue_depth, self.config.queue_depth_threshold
+                )
             }
             ScalingAction::ScaleDown { .. } => "Queue empty, reducing capacity".to_string(),
             ScalingAction::None => format!("Queue depth {queue_depth} within bounds"),
@@ -253,7 +259,8 @@ impl AutoScaler {
         ScalingDecision {
             action,
             reason,
-            current_utilization: queue_depth as f64 / self.config.queue_depth_threshold.max(1) as f64,
+            current_utilization: queue_depth as f64
+                / self.config.queue_depth_threshold.max(1) as f64,
             timestamp: now,
             timestamp_ms: ts,
         }
@@ -263,9 +270,7 @@ impl AutoScaler {
     pub fn evaluate(&self, tier: ComputeTier, tier_manager: &TierManager) -> ScalingDecision {
         match self.config.policy {
             ScalingPolicy::UtilizationBased => self.evaluate_utilization_based(tier, tier_manager),
-            ScalingPolicy::QueueBased => {
-                self.evaluate_queue_based(tier, tier_manager, 0)
-            }
+            ScalingPolicy::QueueBased => self.evaluate_queue_based(tier, tier_manager, 0),
             ScalingPolicy::Predictive | ScalingPolicy::Manual => {
                 let now = Instant::now();
                 ScalingDecision {
@@ -341,7 +346,8 @@ impl AutoScaler {
     /// Trims scaling history to max size
     fn trim_history(&mut self) {
         if self.scaling_history.len() > self.max_history {
-            self.scaling_history.drain(0..self.scaling_history.len() - self.max_history);
+            self.scaling_history
+                .drain(0..self.scaling_history.len() - self.max_history);
         }
     }
 

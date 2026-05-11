@@ -307,9 +307,7 @@ pub fn build_ng_setup_request(params: &NgSetupRequestParams) -> Result<NGAP_PDU,
         protocol_ies.push(NGSetupRequestProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_RAN_NODE_NAME),
             criticality: Criticality(Criticality::IGNORE),
-            value: NGSetupRequestProtocolIEs_EntryValue::Id_RANNodeName(RANNodeName(
-                name.clone(),
-            )),
+            value: NGSetupRequestProtocolIEs_EntryValue::Id_RANNodeName(RANNodeName(name.clone())),
         });
     }
 
@@ -347,7 +345,7 @@ fn build_global_ran_node_id(gnb_id: &GnbId) -> GlobalRANNodeID {
     // Build the gNB-ID bit string
     // The gNB ID is 22-32 bits, we need to create a BitVec
     let mut bv: BitVec<u8, Msb0> = BitVec::new();
-    
+
     // Add the bits from the gnb_id_value (MSB first)
     for i in (0..gnb_id.gnb_id_length).rev() {
         bv.push((gnb_id.gnb_id_value >> i) & 1 == 1);
@@ -466,7 +464,8 @@ pub fn parse_ng_setup_response(pdu: &NGAP_PDU) -> Result<NgSetupResponseData, Ng
     }
 
     Ok(NgSetupResponseData {
-        amf_name: amf_name.ok_or_else(|| NgSetupError::MissingMandatoryIe("AMFName".to_string()))?,
+        amf_name: amf_name
+            .ok_or_else(|| NgSetupError::MissingMandatoryIe("AMFName".to_string()))?,
         served_guami_list: served_guami_list
             .ok_or_else(|| NgSetupError::MissingMandatoryIe("ServedGUAMIList".to_string()))?,
         relative_amf_capacity: relative_amf_capacity
@@ -481,12 +480,12 @@ fn parse_served_guami_list(list: &ServedGUAMIList) -> Vec<ServedGuamiItem> {
         .iter()
         .map(|item| {
             let guami = parse_guami(&item.guami);
-            let backup_amf_name = item
-                .backup_amf_name
-                .as_ref()
-                .map(|name| name.0.clone());
+            let backup_amf_name = item.backup_amf_name.as_ref().map(|name| name.0.clone());
 
-            ServedGuamiItem { guami, backup_amf_name }
+            ServedGuamiItem {
+                guami,
+                backup_amf_name,
+            }
         })
         .collect()
 }
@@ -501,7 +500,13 @@ fn parse_guami(guami: &GUAMI) -> Guami {
 
     // AMFRegionID is a BitVec of 8 bits
     let amf_region_id = if !guami.amf_region_id.0.is_empty() {
-        guami.amf_region_id.0.as_raw_slice().first().copied().unwrap_or(0)
+        guami
+            .amf_region_id
+            .0
+            .as_raw_slice()
+            .first()
+            .copied()
+            .unwrap_or(0)
     } else {
         0
     };
@@ -557,14 +562,19 @@ fn parse_plmn_support_list(list: &PLMNSupportList) -> Vec<PlmnSupportItem> {
                 .iter()
                 .map(|slice_item| {
                     let sst = slice_item.s_nssai.sst.0.first().copied().unwrap_or(0);
-                    let sd = slice_item.s_nssai.sd.as_ref().and_then(|sd| {
-                        sd.0.as_slice().try_into().ok()
-                    });
+                    let sd = slice_item
+                        .s_nssai
+                        .sd
+                        .as_ref()
+                        .and_then(|sd| sd.0.as_slice().try_into().ok());
                     SNssai { sst, sd }
                 })
                 .collect();
 
-            PlmnSupportItem { plmn_identity, slice_support_list }
+            PlmnSupportItem {
+                plmn_identity,
+                slice_support_list,
+            }
         })
         .collect()
 }
@@ -627,16 +637,12 @@ pub fn parse_ng_setup_failure(pdu: &NGAP_PDU) -> Result<NgSetupFailureData, NgSe
 
 fn parse_cause(cause: &Cause) -> NgSetupFailureCause {
     match cause {
-        Cause::RadioNetwork(rn) => {
-            NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn))
-        }
+        Cause::RadioNetwork(rn) => NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn)),
         Cause::Transport(t) => NgSetupFailureCause::Transport(parse_transport_cause(t)),
         Cause::Nas(n) => NgSetupFailureCause::Nas(parse_nas_cause(n)),
         Cause::Protocol(p) => NgSetupFailureCause::Protocol(parse_protocol_cause(p)),
         Cause::Misc(m) => NgSetupFailureCause::Misc(parse_misc_cause(m)),
-        Cause::Choice_Extensions(_) => {
-            NgSetupFailureCause::Misc(MiscCause::Unspecified)
-        }
+        Cause::Choice_Extensions(_) => NgSetupFailureCause::Misc(MiscCause::Unspecified),
     }
 }
 
@@ -845,7 +851,10 @@ mod tests {
                     plmn_identity: [0x00, 0xF1, 0x10],
                     slice_support_list: vec![
                         SNssai { sst: 1, sd: None },
-                        SNssai { sst: 1, sd: Some([0x00, 0x00, 0x01]) },
+                        SNssai {
+                            sst: 1,
+                            sd: Some([0x00, 0x00, 0x01]),
+                        },
                     ],
                 }],
             }],
@@ -921,10 +930,22 @@ mod tests {
         assert_eq!(drx.0, PagingDRX::V256);
 
         // Test TryFrom<PagingDRX> for PagingDrx
-        assert_eq!(PagingDrx::try_from(PagingDRX(PagingDRX::V32)).unwrap(), PagingDrx::V32);
-        assert_eq!(PagingDrx::try_from(PagingDRX(PagingDRX::V64)).unwrap(), PagingDrx::V64);
-        assert_eq!(PagingDrx::try_from(PagingDRX(PagingDRX::V128)).unwrap(), PagingDrx::V128);
-        assert_eq!(PagingDrx::try_from(PagingDRX(PagingDRX::V256)).unwrap(), PagingDrx::V256);
+        assert_eq!(
+            PagingDrx::try_from(PagingDRX(PagingDRX::V32)).unwrap(),
+            PagingDrx::V32
+        );
+        assert_eq!(
+            PagingDrx::try_from(PagingDRX(PagingDRX::V64)).unwrap(),
+            PagingDrx::V64
+        );
+        assert_eq!(
+            PagingDrx::try_from(PagingDRX(PagingDRX::V128)).unwrap(),
+            PagingDrx::V128
+        );
+        assert_eq!(
+            PagingDrx::try_from(PagingDRX(PagingDRX::V256)).unwrap(),
+            PagingDrx::V256
+        );
     }
 
     #[test]

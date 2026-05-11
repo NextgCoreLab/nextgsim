@@ -63,8 +63,7 @@ pub fn encode_ngap_pdu(pdu: &NGAP_PDU) -> Result<Vec<u8>, NgapCodecError> {
 /// * `Err(NgapCodecError)` - If decoding fails
 pub fn decode_ngap_pdu(bytes: &[u8]) -> Result<NGAP_PDU, NgapCodecError> {
     let mut data = PerCodecData::from_slice_aper(bytes);
-    NGAP_PDU::aper_decode(&mut data)
-        .map_err(|e| NgapCodecError::DecodeError(format!("{e:?}")))
+    NGAP_PDU::aper_decode(&mut data).map_err(|e| NgapCodecError::DecodeError(format!("{e:?}")))
 }
 
 // ============================================================================
@@ -297,12 +296,12 @@ mod tests {
         let plmn = PLMNIdentity(vec![0x00, 0xF1, 0x10]);
 
         let mut data = PerCodecData::new_aper();
-        plmn.aper_encode(&mut data).expect("Encoding should succeed");
+        plmn.aper_encode(&mut data)
+            .expect("Encoding should succeed");
         let encoded = data.into_bytes();
 
         let mut decode_data = PerCodecData::from_slice_aper(&encoded);
-        let decoded =
-            PLMNIdentity::aper_decode(&mut decode_data).expect("Decoding should succeed");
+        let decoded = PLMNIdentity::aper_decode(&mut decode_data).expect("Decoding should succeed");
 
         assert_eq!(plmn.0, decoded.0);
     }

@@ -195,7 +195,10 @@ impl VectorIndex {
 
     /// Returns all entity IDs stored in the index.
     pub fn entity_ids(&self) -> Vec<&str> {
-        self.embeddings.keys().map(std::string::String::as_str).collect()
+        self.embeddings
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Clears all embeddings from the index.
@@ -366,10 +369,7 @@ mod tests {
         index.upsert("b", vec![0.0, 1.0, 0.0]);
         index.upsert("c", vec![0.0, 0.0, 1.0]);
 
-        let queries = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-        ];
+        let queries = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
         let results = index.batch_search(&queries, 1);
 
         assert_eq!(results.len(), 2);

@@ -357,7 +357,6 @@ pub enum SscMode {
     SscMode3 = 0b011,
 }
 
-
 // ============================================================================
 // Type 1 IE Structures
 // ============================================================================
@@ -408,7 +407,10 @@ pub struct Ie5gsRegistrationType {
 
 impl Ie5gsRegistrationType {
     /// Create a new 5GS Registration Type IE
-    pub fn new(follow_on_request_pending: FollowOnRequest, registration_type: RegistrationType) -> Self {
+    pub fn new(
+        follow_on_request_pending: FollowOnRequest,
+        registration_type: RegistrationType,
+    ) -> Self {
         Self {
             follow_on_request_pending,
             registration_type,
@@ -483,12 +485,11 @@ impl IeAllowedSscMode {
 impl InformationElement1 for IeAllowedSscMode {
     fn decode(val: u8) -> Result<Self, Ie1Error> {
         // Bit 0: SSC1, Bit 1: SSC2, Bit 2: SSC3, Bit 3: spare
-        let ssc1 = Ssc1::try_from(val & 0x01)
-            .map_err(|_| Ie1Error::InvalidValue(val, "Ssc1"))?;
-        let ssc2 = Ssc2::try_from((val >> 1) & 0x01)
-            .map_err(|_| Ie1Error::InvalidValue(val, "Ssc2"))?;
-        let ssc3 = Ssc3::try_from((val >> 2) & 0x01)
-            .map_err(|_| Ie1Error::InvalidValue(val, "Ssc3"))?;
+        let ssc1 = Ssc1::try_from(val & 0x01).map_err(|_| Ie1Error::InvalidValue(val, "Ssc1"))?;
+        let ssc2 =
+            Ssc2::try_from((val >> 1) & 0x01).map_err(|_| Ie1Error::InvalidValue(val, "Ssc2"))?;
+        let ssc3 =
+            Ssc3::try_from((val >> 2) & 0x01).map_err(|_| Ie1Error::InvalidValue(val, "Ssc3"))?;
         Ok(Self { ssc1, ssc2, ssc3 })
     }
 
@@ -687,7 +688,6 @@ impl InformationElement1 for IeMicoIndication {
     }
 }
 
-
 /// NAS Key Set Identifier IE (3GPP TS 24.501 Section 9.11.3.32)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IeNasKeySetIdentifier {
@@ -703,7 +703,10 @@ impl IeNasKeySetIdentifier {
 
     /// Create a new NAS Key Set Identifier IE
     pub fn new(tsc: TypeOfSecurityContext, ksi: u8) -> Self {
-        Self { tsc, ksi: ksi & 0x07 }
+        Self {
+            tsc,
+            ksi: ksi & 0x07,
+        }
     }
 
     /// Create a NAS Key Set Identifier indicating not available
@@ -763,8 +766,10 @@ impl IeNetworkSlicingIndication {
 impl InformationElement1 for IeNetworkSlicingIndication {
     fn decode(val: u8) -> Result<Self, Ie1Error> {
         // Bit 0: NSSCI, Bit 1: DCNI, Bits 2-3: spare
-        let nssci = NetworkSlicingSubscriptionChangeIndication::try_from(val & 0x01)
-            .map_err(|_| Ie1Error::InvalidValue(val, "NetworkSlicingSubscriptionChangeIndication"))?;
+        let nssci =
+            NetworkSlicingSubscriptionChangeIndication::try_from(val & 0x01).map_err(|_| {
+                Ie1Error::InvalidValue(val, "NetworkSlicingSubscriptionChangeIndication")
+            })?;
         let dcni = DefaultConfiguredNssaiIndication::try_from((val >> 1) & 0x01)
             .map_err(|_| Ie1Error::InvalidValue(val, "DefaultConfiguredNssaiIndication"))?;
         Ok(Self { nssci, dcni })
@@ -787,7 +792,9 @@ pub struct IeNssaiInclusionMode {
 impl IeNssaiInclusionMode {
     /// Create a new NSSAI Inclusion Mode IE
     pub fn new(nssai_inclusion_mode: NssaiInclusionMode) -> Self {
-        Self { nssai_inclusion_mode }
+        Self {
+            nssai_inclusion_mode,
+        }
     }
 }
 
@@ -795,7 +802,9 @@ impl InformationElement1 for IeNssaiInclusionMode {
     fn decode(val: u8) -> Result<Self, Ie1Error> {
         let nssai_inclusion_mode = NssaiInclusionMode::try_from(val & 0x03)
             .map_err(|_| Ie1Error::InvalidValue(val, "NssaiInclusionMode"))?;
-        Ok(Self { nssai_inclusion_mode })
+        Ok(Self {
+            nssai_inclusion_mode,
+        })
     }
 
     fn encode(&self) -> u8 {
@@ -813,7 +822,9 @@ pub struct IePayloadContainerType {
 impl IePayloadContainerType {
     /// Create a new Payload Container Type IE
     pub fn new(payload_container_type: PayloadContainerType) -> Self {
-        Self { payload_container_type }
+        Self {
+            payload_container_type,
+        }
     }
 }
 
@@ -821,7 +832,9 @@ impl InformationElement1 for IePayloadContainerType {
     fn decode(val: u8) -> Result<Self, Ie1Error> {
         let payload_container_type = PayloadContainerType::try_from(val & 0x0F)
             .map_err(|_| Ie1Error::InvalidValue(val, "PayloadContainerType"))?;
-        Ok(Self { payload_container_type })
+        Ok(Self {
+            payload_container_type,
+        })
     }
 
     fn encode(&self) -> u8 {
@@ -949,8 +962,8 @@ impl IeSscMode {
 
 impl InformationElement1 for IeSscMode {
     fn decode(val: u8) -> Result<Self, Ie1Error> {
-        let ssc_mode = SscMode::try_from(val & 0x07)
-            .map_err(|_| Ie1Error::InvalidValue(val, "SscMode"))?;
+        let ssc_mode =
+            SscMode::try_from(val & 0x07).map_err(|_| Ie1Error::InvalidValue(val, "SscMode"))?;
         Ok(Self { ssc_mode })
     }
 
@@ -958,7 +971,6 @@ impl InformationElement1 for IeSscMode {
         self.ssc_mode.into()
     }
 }
-
 
 // ============================================================================
 // Unit Tests
@@ -999,7 +1011,10 @@ mod tests {
 
         let decoded = Ie5gsRegistrationType::decode(encoded).unwrap();
         assert_eq!(decoded.follow_on_request_pending, FollowOnRequest::Pending);
-        assert_eq!(decoded.registration_type, RegistrationType::InitialRegistration);
+        assert_eq!(
+            decoded.registration_type,
+            RegistrationType::InitialRegistration
+        );
     }
 
     #[test]
@@ -1085,8 +1100,14 @@ mod tests {
         assert_eq!(encoded, 0b1111);
 
         let decoded = IeDeRegistrationType::decode(encoded).unwrap();
-        assert_eq!(decoded.access_type, DeRegistrationAccessType::ThreeGppAndNonThreeGppAccess);
-        assert_eq!(decoded.re_registration_required, ReRegistrationRequired::Required);
+        assert_eq!(
+            decoded.access_type,
+            DeRegistrationAccessType::ThreeGppAndNonThreeGppAccess
+        );
+        assert_eq!(
+            decoded.re_registration_required,
+            ReRegistrationRequired::Required
+        );
         assert_eq!(decoded.switch_off, SwitchOff::SwitchOff);
     }
 
@@ -1107,7 +1128,10 @@ mod tests {
         assert_eq!(encoded, 0b1);
 
         let decoded = IeMicoIndication::decode(encoded).unwrap();
-        assert_eq!(decoded.raai, RegistrationAreaAllocationIndication::Allocated);
+        assert_eq!(
+            decoded.raai,
+            RegistrationAreaAllocationIndication::Allocated
+        );
     }
 
     #[test]
@@ -1141,8 +1165,14 @@ mod tests {
         assert_eq!(encoded, 0b11); // DCNI=1, NSSCI=1
 
         let decoded = IeNetworkSlicingIndication::decode(encoded).unwrap();
-        assert_eq!(decoded.nssci, NetworkSlicingSubscriptionChangeIndication::Changed);
-        assert_eq!(decoded.dcni, DefaultConfiguredNssaiIndication::CreatedFromDefault);
+        assert_eq!(
+            decoded.nssci,
+            NetworkSlicingSubscriptionChangeIndication::Changed
+        );
+        assert_eq!(
+            decoded.dcni,
+            DefaultConfiguredNssaiIndication::CreatedFromDefault
+        );
     }
 
     #[test]

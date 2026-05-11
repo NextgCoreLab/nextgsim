@@ -44,7 +44,8 @@ pub trait InferenceEngine: Send + Sync {
     ///
     /// # Errors
     /// Returns `InferenceError` if inference fails
-    fn infer_multi(&self, inputs: &[(&str, TensorData)]) -> Result<Vec<TensorData>, InferenceError>;
+    fn infer_multi(&self, inputs: &[(&str, TensorData)])
+        -> Result<Vec<TensorData>, InferenceError>;
 
     /// Returns the model metadata
     fn metadata(&self) -> &ModelMetadata;
@@ -142,9 +143,15 @@ impl OnnxEngine {
                 debug!("Attempting CoreML execution provider");
             }
             ExecutionProvider::DirectML { device_id } => {
-                debug!("Attempting DirectML execution provider (device {})", device_id);
+                debug!(
+                    "Attempting DirectML execution provider (device {})",
+                    device_id
+                );
             }
-            ExecutionProvider::TensorRT { device_id, max_workspace_size } => {
+            ExecutionProvider::TensorRT {
+                device_id,
+                max_workspace_size,
+            } => {
                 debug!(
                     "Attempting TensorRT execution provider (device {}, workspace {})",
                     device_id, max_workspace_size
@@ -191,7 +198,12 @@ impl OnnxEngine {
     }
 
     /// Runs inference with float32 input data
-    fn run_inference_f32(&self, session: &mut Session, data: &[f32], shape: Vec<i64>) -> Result<TensorData, InferenceError> {
+    fn run_inference_f32(
+        &self,
+        session: &mut Session,
+        data: &[f32],
+        shape: Vec<i64>,
+    ) -> Result<TensorData, InferenceError> {
         use ort::value::Tensor;
 
         // Convert shape to usize
@@ -211,12 +223,13 @@ impl OnnxEngine {
         let outputs = session.run(ort::inputs![input_name.as_str() => input_tensor])?;
 
         // Extract first output
-        let (_, output_value) = outputs
-            .into_iter()
-            .next()
-            .ok_or(InferenceError::OutputExtractionFailed {
-                reason: "No outputs from model".to_string(),
-            })?;
+        let (_, output_value) =
+            outputs
+                .into_iter()
+                .next()
+                .ok_or(InferenceError::OutputExtractionFailed {
+                    reason: "No outputs from model".to_string(),
+                })?;
 
         // Try to extract as f32 tensor
         if let Ok((output_shape, output_data)) = output_value.try_extract_tensor::<f32>() {
@@ -294,11 +307,9 @@ impl InferenceEngine for OnnxEngine {
             reason: "Model not loaded".to_string(),
         })?;
 
-        let mut session = session_mutex
-            .lock()
-            .map_err(|e| InferenceError::NotReady {
-                reason: format!("Failed to acquire session lock: {e}"),
-            })?;
+        let mut session = session_mutex.lock().map_err(|e| InferenceError::NotReady {
+            reason: format!("Failed to acquire session lock: {e}"),
+        })?;
 
         let start = Instant::now();
 
@@ -329,7 +340,8 @@ impl InferenceEngine for OnnxEngine {
             }
             TensorData::Float16 { .. } => {
                 return Err(InferenceError::InvalidInput {
-                    reason: "Float16 tensors must be converted to Float32 before inference".to_string(),
+                    reason: "Float16 tensors must be converted to Float32 before inference"
+                        .to_string(),
                 });
             }
         };
@@ -357,16 +369,17 @@ impl InferenceEngine for OnnxEngine {
         inputs.iter().map(|input| self.infer(input)).collect()
     }
 
-    fn infer_multi(&self, inputs: &[(&str, TensorData)]) -> Result<Vec<TensorData>, InferenceError> {
+    fn infer_multi(
+        &self,
+        inputs: &[(&str, TensorData)],
+    ) -> Result<Vec<TensorData>, InferenceError> {
         let session_mutex = self.session.as_ref().ok_or(InferenceError::NotReady {
             reason: "Model not loaded".to_string(),
         })?;
 
-        let mut session = session_mutex
-            .lock()
-            .map_err(|e| InferenceError::NotReady {
-                reason: format!("Failed to acquire session lock: {e}"),
-            })?;
+        let mut session = session_mutex.lock().map_err(|e| InferenceError::NotReady {
+            reason: format!("Failed to acquire session lock: {e}"),
+        })?;
 
         let start = Instant::now();
 
@@ -378,7 +391,8 @@ impl InferenceEngine for OnnxEngine {
         for (name, tensor) in inputs {
             match tensor {
                 TensorData::Float32 { data, shape } => {
-                    let shape_usize: Vec<usize> = shape.dims().iter().map(|&d| d as usize).collect();
+                    let shape_usize: Vec<usize> =
+                        shape.dims().iter().map(|&d| d as usize).collect();
                     let input_tensor = Tensor::from_array((shape_usize, data.clone()))?;
                     ort_inputs.push((*name, input_tensor.into_dyn()));
                 }
@@ -496,7 +510,10 @@ mod tests {
         let mut engine = OnnxEngine::new(ExecutionProvider::Cpu).expect("Engine creation failed");
         let result = engine.load_model(Path::new("/nonexistent/model.onnx"));
         assert!(result.is_err());
-        assert!(matches!(result.expect_err("Expected error"), ModelError::NotFound { .. }));
+        assert!(matches!(
+            result.expect_err("Expected error"),
+            ModelError::NotFound { .. }
+        ));
     }
 
     #[test]
@@ -505,7 +522,10 @@ mod tests {
         let input = TensorData::float32(vec![1.0, 2.0, 3.0], vec![1i64, 3]);
         let result = engine.infer(&input);
         assert!(result.is_err());
-        assert!(matches!(result.expect_err("Expected error"), InferenceError::NotReady { .. }));
+        assert!(matches!(
+            result.expect_err("Expected error"),
+            InferenceError::NotReady { .. }
+        ));
     }
 
     #[test]

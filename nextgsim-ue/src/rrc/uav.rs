@@ -220,9 +220,7 @@ impl C2LinkQuality {
     ///
     /// Based on typical requirements: RSRP > -110 dBm, packet loss < 10%, latency < 500ms.
     pub fn is_acceptable(&self) -> bool {
-        self.rsrp_dbm > -110
-            && self.packet_loss_rate < 0.1
-            && self.latency_ms < 500
+        self.rsrp_dbm > -110 && self.packet_loss_rate < 0.1 && self.latency_ms < 500
     }
 
     /// Returns true if C2 link quality is critical (fail-safe required).
@@ -277,10 +275,7 @@ impl UavRegistrationContext {
 
     /// Grants authorization for flight operations.
     pub fn grant_authorization(&mut self) {
-        tracing::info!(
-            "UAV {}: Authorization granted",
-            self.identity.serial_number
-        );
+        tracing::info!("UAV {}: Authorization granted", self.identity.serial_number);
         self.authorization_state = UavAuthorizationState::Authorized;
     }
 
@@ -458,7 +453,10 @@ mod tests {
         let config = FlightPathConfig::default();
         let mut context = UavRegistrationContext::new(identity, config);
 
-        assert_eq!(context.authorization_state, UavAuthorizationState::NotAuthorized);
+        assert_eq!(
+            context.authorization_state,
+            UavAuthorizationState::NotAuthorized
+        );
         assert!(!context.is_authorized());
 
         context.request_authorization();
@@ -468,7 +466,10 @@ mod tests {
         );
 
         context.grant_authorization();
-        assert_eq!(context.authorization_state, UavAuthorizationState::Authorized);
+        assert_eq!(
+            context.authorization_state,
+            UavAuthorizationState::Authorized
+        );
         assert!(context.is_authorized());
 
         context.revoke_authorization();

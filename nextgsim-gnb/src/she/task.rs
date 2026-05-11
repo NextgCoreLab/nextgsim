@@ -5,8 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use nextgsim_she::{
-    SchedulingPolicy, WorkloadId, WorkloadRequirements, WorkloadScheduler,
-    TierManager,
+    SchedulingPolicy, TierManager, WorkloadId, WorkloadRequirements, WorkloadScheduler,
 };
 
 use crate::tasks::{GnbTaskBase, SheMessage, Task, TaskMessage};
@@ -23,8 +22,8 @@ pub struct SheTask {
 impl SheTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         let tier_manager = TierManager::default();
-        let scheduler = WorkloadScheduler::new(tier_manager)
-            .with_policy(SchedulingPolicy::ClosestToEdge);
+        let scheduler =
+            WorkloadScheduler::new(tier_manager).with_policy(SchedulingPolicy::ClosestToEdge);
 
         Self {
             _task_base: task_base,
@@ -53,20 +52,18 @@ impl SheTask {
             .with_memory_bytes(memory_bytes);
 
         match self.scheduler.submit(requirements) {
-            Ok(wl_id) => {
-                match self.scheduler.place(wl_id) {
-                    Ok(decision) => {
-                        info!(
-                            "SHE: Placed workload {} on {:?} (node={}): {}",
-                            workload_id, decision.tier, decision.node_id, decision.reason
-                        );
-                        self.workloads.insert(workload_id, wl_id);
-                    }
-                    Err(e) => {
-                        error!("SHE: Failed to place workload {}: {}", workload_id, e);
-                    }
+            Ok(wl_id) => match self.scheduler.place(wl_id) {
+                Ok(decision) => {
+                    info!(
+                        "SHE: Placed workload {} on {:?} (node={}): {}",
+                        workload_id, decision.tier, decision.node_id, decision.reason
+                    );
+                    self.workloads.insert(workload_id, wl_id);
                 }
-            }
+                Err(e) => {
+                    error!("SHE: Failed to place workload {}: {}", workload_id, e);
+                }
+            },
             Err(e) => {
                 error!("SHE: Failed to submit workload {}: {}", workload_id, e);
             }
@@ -81,7 +78,9 @@ impl SheTask {
     ) {
         debug!(
             "SHE: Inference request {} for model '{}' with {} input samples",
-            request_id, model_id, input_data.len()
+            request_id,
+            model_id,
+            input_data.len()
         );
         info!(
             "SHE: Processing inference request {} for model '{}'",
@@ -116,34 +115,35 @@ impl Task for SheTask {
 
         loop {
             match rx.recv().await {
-                Some(TaskMessage::Message(msg)) => {
-                    match msg {
-                        SheMessage::PlaceWorkload {
+                Some(TaskMessage::Message(msg)) => match msg {
+                    SheMessage::PlaceWorkload {
+                        workload_id,
+                        max_latency_ms,
+                        compute_flops,
+                        memory_bytes,
+                    } => {
+                        self.handle_place_workload(
                             workload_id,
                             max_latency_ms,
                             compute_flops,
                             memory_bytes,
-                        } => {
-                            self.handle_place_workload(
-                                workload_id, max_latency_ms, compute_flops, memory_bytes,
-                            );
-                        }
-                        SheMessage::InferenceRequest {
-                            model_id,
-                            request_id,
-                            input_data,
-                        } => {
-                            self.handle_inference_request(model_id, request_id, input_data);
-                        }
-                        SheMessage::ResourceUpdate {
-                            node_id,
-                            available_flops,
-                            available_memory,
-                        } => {
-                            self.handle_resource_update(node_id, available_flops, available_memory);
-                        }
+                        );
                     }
-                }
+                    SheMessage::InferenceRequest {
+                        model_id,
+                        request_id,
+                        input_data,
+                    } => {
+                        self.handle_inference_request(model_id, request_id, input_data);
+                    }
+                    SheMessage::ResourceUpdate {
+                        node_id,
+                        available_flops,
+                        available_memory,
+                    } => {
+                        self.handle_resource_update(node_id, available_flops, available_memory);
+                    }
+                },
                 Some(TaskMessage::Shutdown) => {
                     info!("SHE task received shutdown signal");
                     break;

@@ -20,9 +20,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::tasks::{
-    GnbTaskBase, NgapMessage, SctpMessage, Task, TaskMessage,
-};
+use crate::tasks::{GnbTaskBase, NgapMessage, SctpMessage, Task, TaskMessage};
 use nextgsim_common::OctetString;
 use nextgsim_sctp::SctpConfig;
 
@@ -75,7 +73,10 @@ impl SctpTask {
         let local_addr: SocketAddr = match format!("{local_address}:{local_port}").parse() {
             Ok(addr) => addr,
             Err(e) => {
-                error!("Invalid local address {}:{}: {}", local_address, local_port, e);
+                error!(
+                    "Invalid local address {}:{}: {}",
+                    local_address, local_port, e
+                );
                 return;
             }
         };
@@ -83,7 +84,10 @@ impl SctpTask {
         let remote_addr: SocketAddr = match format!("{remote_address}:{remote_port}").parse() {
             Ok(addr) => addr,
             Err(e) => {
-                error!("Invalid remote address {}:{}: {}", remote_address, remote_port, e);
+                error!(
+                    "Invalid remote address {}:{}: {}",
+                    remote_address, remote_port, e
+                );
                 return;
             }
         };
@@ -112,10 +116,7 @@ impl SctpTask {
                         match with_port.parse::<SocketAddr>() {
                             Ok(a) => Some(a),
                             Err(e) => {
-                                warn!(
-                                    "Ignoring unparseable secondary AMF address {:?}: {}",
-                                    s, e
-                                );
+                                warn!("Ignoring unparseable secondary AMF address {:?}: {}", s, e);
                                 None
                             }
                         }
@@ -235,7 +236,10 @@ impl SctpTask {
 
         if let Some(connection) = self.connections.get_mut(&client_id) {
             if let Err(e) = connection.send(stream, buffer.data()).await {
-                error!("Failed to send message to AMF (client_id: {}): {}", client_id, e);
+                error!(
+                    "Failed to send message to AMF (client_id: {}): {}",
+                    client_id, e
+                );
                 // Connection may be broken, notify NGAP task
                 self.route_association_down(client_id).await;
                 self.connections.remove(&client_id);
@@ -301,7 +305,11 @@ impl SctpTask {
                 match connection.try_recv().await {
                     Ok(Some(event)) => {
                         match event {
-                            AmfConnectionEvent::MessageReceived { client_id, stream, data } => {
+                            AmfConnectionEvent::MessageReceived {
+                                client_id,
+                                stream,
+                                data,
+                            } => {
                                 self.route_ngap_pdu(client_id, stream, data).await;
                             }
                             AmfConnectionEvent::AssociationDown { client_id } => {
@@ -421,10 +429,16 @@ impl Task for SctpTask {
         }
 
         // Cleanup: close all connections
-        info!("SCTP task shutting down, closing {} connections", self.connections.len());
+        info!(
+            "SCTP task shutting down, closing {} connections",
+            self.connections.len()
+        );
         for (client_id, mut connection) in self.connections.drain() {
             if let Err(e) = connection.close().await {
-                warn!("Error closing connection {} during shutdown: {}", client_id, e);
+                warn!(
+                    "Error closing connection {} during shutdown: {}",
+                    client_id, e
+                );
             }
         }
 
@@ -451,7 +465,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,

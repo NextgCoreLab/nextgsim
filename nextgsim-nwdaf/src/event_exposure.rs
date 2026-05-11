@@ -271,11 +271,11 @@ impl EventExposureManager {
 
     /// Deletes a subscription
     pub fn delete_subscription(&mut self, subscription_id: &str) -> Result<(), NwdafError> {
-        self.subscriptions
-            .remove(subscription_id)
-            .ok_or_else(|| crate::error::DataCollectionError::InvalidData {
+        self.subscriptions.remove(subscription_id).ok_or_else(|| {
+            crate::error::DataCollectionError::InvalidData {
                 reason: format!("Subscription {subscription_id} not found"),
-            })?;
+            }
+        })?;
 
         info!("Deleted event subscription: {}", subscription_id);
         Ok(())

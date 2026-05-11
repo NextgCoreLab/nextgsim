@@ -231,7 +231,10 @@ impl SensingAsAService {
                 let results = self.query_sensing_data(service_type, target_area.as_ref());
                 SensingApiResponse::QueryResult { results }
             }
-            SensingApiRequest::UpdateQos { subscription_id, qos } => {
+            SensingApiRequest::UpdateQos {
+                subscription_id,
+                qos,
+            } => {
                 if let Some(sub) = self.subscriptions.get_mut(&subscription_id) {
                     sub.qos = qos;
                     SensingApiResponse::QosUpdated { subscription_id }

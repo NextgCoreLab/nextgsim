@@ -223,11 +223,10 @@ pub fn decode_isac_config(bytes: &[u8]) -> Result<IsacMeasurementConfig, IsacRep
         ));
     }
 
-    let config_id = u32::from_be_bytes(
-        bytes[0..4]
-            .try_into()
-            .map_err(|_| IsacReportingError::InvalidConfig("Invalid config_id bytes".to_string()))?,
-    );
+    let config_id =
+        u32::from_be_bytes(bytes[0..4].try_into().map_err(|_| {
+            IsacReportingError::InvalidConfig("Invalid config_id bytes".to_string())
+        })?);
     let measurement_type = match bytes[4] {
         0 => SensingMeasurementType::Range,
         1 => SensingMeasurementType::Velocity,
@@ -252,21 +251,15 @@ pub fn decode_isac_config(bytes: &[u8]) -> Result<IsacMeasurementConfig, IsacRep
             ))
         }
     };
-    let periodicity_ms = u32::from_be_bytes(
-        bytes[6..10]
-            .try_into()
-            .map_err(|_| IsacReportingError::InvalidConfig("Invalid periodicity_ms bytes".to_string()))?,
-    );
-    let center_frequency_mhz = u64::from_be_bytes(
-        bytes[10..18]
-            .try_into()
-            .map_err(|_| IsacReportingError::InvalidConfig("Invalid center_frequency_mhz bytes".to_string()))?,
-    );
-    let bandwidth_mhz = u32::from_be_bytes(
-        bytes[18..22]
-            .try_into()
-            .map_err(|_| IsacReportingError::InvalidConfig("Invalid bandwidth_mhz bytes".to_string()))?,
-    );
+    let periodicity_ms = u32::from_be_bytes(bytes[6..10].try_into().map_err(|_| {
+        IsacReportingError::InvalidConfig("Invalid periodicity_ms bytes".to_string())
+    })?);
+    let center_frequency_mhz = u64::from_be_bytes(bytes[10..18].try_into().map_err(|_| {
+        IsacReportingError::InvalidConfig("Invalid center_frequency_mhz bytes".to_string())
+    })?);
+    let bandwidth_mhz = u32::from_be_bytes(bytes[18..22].try_into().map_err(|_| {
+        IsacReportingError::InvalidConfig("Invalid bandwidth_mhz bytes".to_string())
+    })?);
     let is_monostatic = bytes[22] == 1;
 
     Ok(IsacMeasurementConfig {
@@ -334,13 +327,8 @@ mod tests {
 
     #[test]
     fn test_isac_report_creation() {
-        let mut report = IsacMeasurementReport::new(
-            1,
-            1,
-            100,
-            1700000000000,
-            SensingMeasurementType::Range,
-        );
+        let mut report =
+            IsacMeasurementReport::new(1, 1, 100, 1700000000000, SensingMeasurementType::Range);
 
         report.add_target(IsacTargetResult {
             target_id: 1,
@@ -359,26 +347,16 @@ mod tests {
 
     #[test]
     fn test_isac_report_empty_invalid() {
-        let report = IsacMeasurementReport::new(
-            1,
-            1,
-            100,
-            1700000000000,
-            SensingMeasurementType::Range,
-        );
+        let report =
+            IsacMeasurementReport::new(1, 1, 100, 1700000000000, SensingMeasurementType::Range);
 
         assert!(report.validate().is_err());
     }
 
     #[test]
     fn test_isac_report_with_ue_context() {
-        let mut report = IsacMeasurementReport::new(
-            2,
-            1,
-            100,
-            1700000000000,
-            SensingMeasurementType::Velocity,
-        );
+        let mut report =
+            IsacMeasurementReport::new(2, 1, 100, 1700000000000, SensingMeasurementType::Velocity);
         report.set_ue_context(12345, 67890);
         report.set_raw_data(vec![0x01, 0x02, 0x03]);
 
@@ -389,13 +367,8 @@ mod tests {
 
     #[test]
     fn test_isac_report_invalid_confidence() {
-        let mut report = IsacMeasurementReport::new(
-            1,
-            1,
-            100,
-            1700000000000,
-            SensingMeasurementType::Range,
-        );
+        let mut report =
+            IsacMeasurementReport::new(1, 1, 100, 1700000000000, SensingMeasurementType::Range);
 
         report.add_target(IsacTargetResult {
             target_id: 1,

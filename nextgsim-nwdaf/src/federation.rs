@@ -315,8 +315,10 @@ impl DataFederationManager {
 
     /// Updates the privacy policy.
     pub fn set_privacy_policy(&mut self, policy: PrivacyPolicy) {
-        info!("Updating privacy policy (k={}, epsilon={:.2})",
-              policy.k_anonymity_threshold, policy.dp_epsilon);
+        info!(
+            "Updating privacy policy (k={}, epsilon={:.2})",
+            policy.k_anonymity_threshold, policy.dp_epsilon
+        );
         self.privacy_policy = policy;
     }
 
@@ -379,7 +381,10 @@ impl DataFederationManager {
 
     /// Records subscriber consent for data sharing.
     pub fn record_consent(&mut self, subscriber_id: &str, consent: ConsentType) {
-        debug!("Recording consent {:?} for subscriber {}", consent, subscriber_id);
+        debug!(
+            "Recording consent {:?} for subscriber {}",
+            consent, subscriber_id
+        );
         self.consent_records
             .entry(subscriber_id.to_string())
             .or_default()
@@ -436,8 +441,9 @@ impl DataFederationManager {
         }
 
         if !peer.shared_analytics.contains(&analytics_id) {
-            return Err(crate::error::AnalyticsError::UnsupportedAnalyticsId { id: analytics_id }
-                .into());
+            return Err(
+                crate::error::AnalyticsError::UnsupportedAnalyticsId { id: analytics_id }.into(),
+            );
         }
 
         // Check rate limit
@@ -448,7 +454,11 @@ impl DataFederationManager {
             .into());
         }
 
-        let request_id = format!("fed-{}-{}", self.local_plmn.canonical(), self.next_request_id);
+        let request_id = format!(
+            "fed-{}-{}",
+            self.local_plmn.canonical(),
+            self.next_request_id
+        );
         self.next_request_id += 1;
 
         let request = FederationRequest {
@@ -545,10 +555,7 @@ impl DataFederationManager {
     /// Processes a federation response from a peer.
     ///
     /// Stores results in the cache for later aggregation.
-    pub fn process_response(
-        &mut self,
-        response: FederationResponse,
-    ) -> Result<usize, NwdafError> {
+    pub fn process_response(&mut self, response: FederationResponse) -> Result<usize, NwdafError> {
         // Remove from pending
         let request = self.pending_requests.remove(&response.request_id);
 
@@ -627,7 +634,8 @@ impl DataFederationManager {
 
         let (confidence, payload_json) = match method {
             FederatedAggregationMethod::WeightedAverage => {
-                let total_weight: f64 = all_results.iter().map(|(_, r)| r.sample_count as f64).sum();
+                let total_weight: f64 =
+                    all_results.iter().map(|(_, r)| r.sample_count as f64).sum();
                 let weighted_confidence: f64 = all_results
                     .iter()
                     .map(|(_, r)| r.confidence as f64 * r.sample_count as f64)
@@ -650,9 +658,8 @@ impl DataFederationManager {
                 (latest.1.confidence, latest.1.payload_json.clone())
             }
             FederatedAggregationMethod::Union => {
-                let avg_confidence =
-                    all_results.iter().map(|(_, r)| r.confidence).sum::<f32>()
-                        / all_results.len() as f32;
+                let avg_confidence = all_results.iter().map(|(_, r)| r.confidence).sum::<f32>()
+                    / all_results.len() as f32;
                 (
                     avg_confidence,
                     format!(
@@ -663,9 +670,8 @@ impl DataFederationManager {
                 )
             }
             FederatedAggregationMethod::MajorityVote => {
-                let avg_confidence =
-                    all_results.iter().map(|(_, r)| r.confidence).sum::<f32>()
-                        / all_results.len() as f32;
+                let avg_confidence = all_results.iter().map(|(_, r)| r.confidence).sum::<f32>()
+                    / all_results.len() as f32;
                 (
                     avg_confidence,
                     format!(
@@ -791,7 +797,10 @@ impl DataFederationManager {
     /// Increments the rate limit counter for a peer.
     fn increment_rate_counter(&mut self, plmn: &PlmnId) {
         let now_ms = current_time_ms();
-        let entry = self.rate_counters.entry(plmn.clone()).or_insert((0, now_ms));
+        let entry = self
+            .rate_counters
+            .entry(plmn.clone())
+            .or_insert((0, now_ms));
         if now_ms.saturating_sub(entry.1) >= 60_000 {
             *entry = (1, now_ms);
         } else {
@@ -844,7 +853,11 @@ mod tests {
         }
     }
 
-    fn make_result(analytics_id: AnalyticsId, samples: usize, confidence: f32) -> FederatedAnalyticsResult {
+    fn make_result(
+        analytics_id: AnalyticsId,
+        samples: usize,
+        confidence: f32,
+    ) -> FederatedAnalyticsResult {
         FederatedAnalyticsResult {
             analytics_id,
             confidence,
@@ -964,12 +977,8 @@ mod tests {
     #[test]
     fn test_create_request_unknown_peer() {
         let mut mgr = DataFederationManager::new(PlmnId::new("001", "01"));
-        let result = mgr.create_request(
-            &PlmnId::new("999", "99"),
-            AnalyticsId::UeMobility,
-            None,
-            10,
-        );
+        let result =
+            mgr.create_request(&PlmnId::new("999", "99"), AnalyticsId::UeMobility, None, 10);
         assert!(result.is_err());
     }
 
@@ -1117,17 +1126,22 @@ mod tests {
         // Insert results into cache directly for testing
         let key_a = (AnalyticsId::UeMobility, PlmnId::new("310", "410"));
         let key_b = (AnalyticsId::UeMobility, PlmnId::new("310", "260"));
-        mgr.result_cache
-            .entry(key_a)
-            .or_default()
-            .push(make_result(AnalyticsId::UeMobility, 100, 0.9));
-        mgr.result_cache
-            .entry(key_b)
-            .or_default()
-            .push(make_result(AnalyticsId::UeMobility, 50, 0.6));
+        mgr.result_cache.entry(key_a).or_default().push(make_result(
+            AnalyticsId::UeMobility,
+            100,
+            0.9,
+        ));
+        mgr.result_cache.entry(key_b).or_default().push(make_result(
+            AnalyticsId::UeMobility,
+            50,
+            0.6,
+        ));
 
         let aggregated = mgr
-            .aggregate_results(AnalyticsId::UeMobility, FederatedAggregationMethod::WeightedAverage)
+            .aggregate_results(
+                AnalyticsId::UeMobility,
+                FederatedAggregationMethod::WeightedAverage,
+            )
             .unwrap();
 
         assert_eq!(aggregated.analytics_id, AnalyticsId::UeMobility);
@@ -1181,8 +1195,7 @@ mod tests {
             required_consent: vec![ConsentType::Analytics, ConsentType::CrossOperatorSharing],
         };
 
-        let mgr =
-            DataFederationManager::with_privacy_policy(PlmnId::new("001", "01"), policy);
+        let mgr = DataFederationManager::with_privacy_policy(PlmnId::new("001", "01"), policy);
 
         assert_eq!(mgr.privacy_policy().k_anonymity_threshold, 10);
         assert_eq!(mgr.privacy_policy().dp_epsilon, 0.5);

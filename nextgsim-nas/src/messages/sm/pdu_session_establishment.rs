@@ -10,7 +10,6 @@ use thiserror::Error;
 
 use crate::enums::SmMessageType;
 
-
 /// Error type for PDU Session Establishment message encoding/decoding
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PduSessionEstablishmentError {
@@ -210,7 +209,6 @@ impl Ie5gSmCause {
     }
 }
 
-
 // ============================================================================
 // PDU Session Type (Type 1 - half octet)
 // ============================================================================
@@ -409,7 +407,6 @@ impl IeIntegrityProtectionMaxDataRate {
         2
     }
 }
-
 
 // ============================================================================
 // QoS Rules (Type 6 - variable length)

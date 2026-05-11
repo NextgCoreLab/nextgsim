@@ -115,8 +115,8 @@ impl OfdmRadarWaveform {
 
             // Map to bins
             let range_bin = (range / range_bin_size).floor() as usize;
-            let doppler_bin = ((doppler + self.max_unambiguous_doppler_hz()) / doppler_bin_size)
-                .floor() as usize;
+            let doppler_bin =
+                ((doppler + self.max_unambiguous_doppler_hz()) / doppler_bin_size).floor() as usize;
 
             if range_bin < num_range_bins && doppler_bin < num_doppler_bins {
                 // Simplified response (Gaussian-like spread)
@@ -124,7 +124,9 @@ impl OfdmRadarWaveform {
                 let sigma_doppler = 2.0;
 
                 for r in range_bin.saturating_sub(3)..=(range_bin + 3).min(num_range_bins - 1) {
-                    for d in doppler_bin.saturating_sub(3)..=(doppler_bin + 3).min(num_doppler_bins - 1) {
+                    for d in
+                        doppler_bin.saturating_sub(3)..=(doppler_bin + 3).min(num_doppler_bins - 1)
+                    {
                         let dr = (r as f64 - range_bin as f64) / sigma_range;
                         let dd = (d as f64 - doppler_bin as f64) / sigma_doppler;
                         let response = rcs * (-0.5 * (dr * dr + dd * dd)).exp();
@@ -401,9 +403,7 @@ impl BistaticGeometry {
         ];
 
         // Dot product: v · (tx_hat + rx_hat)
-        let dot: f64 = (0..3)
-            .map(|i| velocity[i] * (tx_hat[i] + rx_hat[i]))
-            .sum();
+        let dot: f64 = (0..3).map(|i| velocity[i] * (tx_hat[i] + rx_hat[i])).sum();
 
         dot / lambda
     }
@@ -420,8 +420,7 @@ impl BistaticGeometry {
 
         // cos(β) = (d_tx² + d_rx² - baseline²) / (2 * d_tx * d_rx)
         let baseline = self.baseline_m();
-        let cos_beta =
-            (d_tx * d_tx + d_rx * d_rx - baseline * baseline) / (2.0 * d_tx * d_rx);
+        let cos_beta = (d_tx * d_tx + d_rx * d_rx - baseline * baseline) / (2.0 * d_tx * d_rx);
         cos_beta.clamp(-1.0, 1.0).acos()
     }
 }
@@ -478,9 +477,7 @@ impl JointWaveformDesign {
         let subcarrier_spacing_hz = bandwidth_hz / num_subcarriers as f64;
 
         // Default: interleaved allocation (every 4th subcarrier for sensing)
-        let subcarrier_allocation: Vec<bool> = (0..num_subcarriers)
-            .map(|i| i % 4 == 0)
-            .collect();
+        let subcarrier_allocation: Vec<bool> = (0..num_subcarriers).map(|i| i % 4 == 0).collect();
 
         let sensing_count = subcarrier_allocation.iter().filter(|&&s| s).count();
         let sensing_power_fraction = sensing_count as f64 / num_subcarriers as f64;
@@ -500,11 +497,7 @@ impl JointWaveformDesign {
     ///
     /// `target_snr_db` - minimum required communication SNR
     /// `sensing_priority` - 0.0 (comm-only) to 1.0 (sensing-only)
-    pub fn optimize_power_allocation(
-        &mut self,
-        target_snr_db: f64,
-        sensing_priority: f64,
-    ) {
+    pub fn optimize_power_allocation(&mut self, target_snr_db: f64, sensing_priority: f64) {
         let priority = sensing_priority.clamp(0.0, 1.0);
 
         // Water-filling inspired allocation:
@@ -531,7 +524,8 @@ impl JointWaveformDesign {
     /// The ambiguity function characterizes the waveform's ability to resolve
     /// targets in range and velocity simultaneously.
     pub fn ambiguity_function(&self, delay_s: f64, doppler_hz: f64) -> f64 {
-        let sensing_indices: Vec<usize> = self.subcarrier_allocation
+        let sensing_indices: Vec<usize> = self
+            .subcarrier_allocation
             .iter()
             .enumerate()
             .filter(|(_, &s)| s)
@@ -548,8 +542,11 @@ impl JointWaveformDesign {
 
         for &k in &sensing_indices {
             let freq = k as f64 * self.subcarrier_spacing_hz;
-            let phase = 2.0 * std::f64::consts::PI
-                * (freq * delay_s + doppler_hz * k as f64 / (self.num_subcarriers as f64 * self.subcarrier_spacing_hz));
+            let phase = 2.0
+                * std::f64::consts::PI
+                * (freq * delay_s
+                    + doppler_hz * k as f64
+                        / (self.num_subcarriers as f64 * self.subcarrier_spacing_hz));
             real_sum += phase.cos();
             imag_sum += phase.sin();
         }
@@ -573,7 +570,9 @@ impl JointWaveformDesign {
             max_range_m: c * symbol_duration / 2.0,
             velocity_resolution_ms: lambda / (2.0 * frame_duration),
             max_velocity_ms: lambda * self.subcarrier_spacing_hz / 4.0,
-            comm_spectral_efficiency: (1.0 + 10.0_f64.powf(comm_snr_db / 10.0) * comm_bw / self.bandwidth_hz).log2(),
+            comm_spectral_efficiency: (1.0
+                + 10.0_f64.powf(comm_snr_db / 10.0) * comm_bw / self.bandwidth_hz)
+                .log2(),
             sensing_snr_db: comm_snr_db + 10.0 * self.sensing_power_fraction.log10(),
         }
     }
@@ -711,15 +710,18 @@ impl MultstaticNetwork {
 
             let inv_det = 1.0 / det;
             let delta = [
-                inv_det * ((jtj[1][1] * jtj[2][2] - jtj[1][2] * jtj[2][1]) * jtr[0]
-                    + (jtj[0][2] * jtj[2][1] - jtj[0][1] * jtj[2][2]) * jtr[1]
-                    + (jtj[0][1] * jtj[1][2] - jtj[0][2] * jtj[1][1]) * jtr[2]),
-                inv_det * ((jtj[1][2] * jtj[2][0] - jtj[1][0] * jtj[2][2]) * jtr[0]
-                    + (jtj[0][0] * jtj[2][2] - jtj[0][2] * jtj[2][0]) * jtr[1]
-                    + (jtj[0][2] * jtj[1][0] - jtj[0][0] * jtj[1][2]) * jtr[2]),
-                inv_det * ((jtj[1][0] * jtj[2][1] - jtj[1][1] * jtj[2][0]) * jtr[0]
-                    + (jtj[0][1] * jtj[2][0] - jtj[0][0] * jtj[2][1]) * jtr[1]
-                    + (jtj[0][0] * jtj[1][1] - jtj[0][1] * jtj[1][0]) * jtr[2]),
+                inv_det
+                    * ((jtj[1][1] * jtj[2][2] - jtj[1][2] * jtj[2][1]) * jtr[0]
+                        + (jtj[0][2] * jtj[2][1] - jtj[0][1] * jtj[2][2]) * jtr[1]
+                        + (jtj[0][1] * jtj[1][2] - jtj[0][2] * jtj[1][1]) * jtr[2]),
+                inv_det
+                    * ((jtj[1][2] * jtj[2][0] - jtj[1][0] * jtj[2][2]) * jtr[0]
+                        + (jtj[0][0] * jtj[2][2] - jtj[0][2] * jtj[2][0]) * jtr[1]
+                        + (jtj[0][2] * jtj[1][0] - jtj[0][0] * jtj[1][2]) * jtr[2]),
+                inv_det
+                    * ((jtj[1][0] * jtj[2][1] - jtj[1][1] * jtj[2][0]) * jtr[0]
+                        + (jtj[0][1] * jtj[2][0] - jtj[0][0] * jtj[2][1]) * jtr[1]
+                        + (jtj[0][0] * jtj[1][1] - jtj[0][1] * jtj[1][0]) * jtr[2]),
             ];
 
             x[0] -= delta[0];
@@ -808,7 +810,11 @@ mod tests {
         assert_eq!(map[0].len(), 64);
 
         // Check that the map has non-zero values
-        let max_val: f64 = map.iter().flat_map(|row| row.iter()).copied().fold(0.0, f64::max);
+        let max_val: f64 = map
+            .iter()
+            .flat_map(|row| row.iter())
+            .copied()
+            .fold(0.0, f64::max);
         assert!(max_val > 0.0);
     }
 
@@ -901,7 +907,9 @@ mod tests {
         let dets = det.detect(&map);
         assert!(!dets.is_empty());
         // Target should be near bin (16, 16)
-        let found = dets.iter().any(|d| d.range_bin == 16 && d.doppler_bin == 16);
+        let found = dets
+            .iter()
+            .any(|d| d.range_bin == 16 && d.doppler_bin == 16);
         assert!(found);
     }
 

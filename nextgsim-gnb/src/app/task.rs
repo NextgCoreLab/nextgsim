@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{
-    parse_cli_command, AmfContext, CliServer, CliServerError, GnbCmdHandler,
-    StatusReporter, UeContext,
+    parse_cli_command, AmfContext, CliServer, CliServerError, GnbCmdHandler, StatusReporter,
+    UeContext,
 };
 use crate::tasks::{
     AppMessage, GnbCliCommandType, GnbTaskBase, NgapMessage, StatusUpdate, Task, TaskMessage,
@@ -187,10 +187,16 @@ impl AppTask {
     }
 
     /// Updates UE context (called when UE state changes).
-    pub fn update_ue_context(&mut self, ue_id: i32, ran_ue_ngap_id: i64, amf_ue_ngap_id: Option<i64>) {
-        let context = self.ue_contexts.entry(ue_id).or_insert_with(|| {
-            UeContext::new(ue_id, ran_ue_ngap_id)
-        });
+    pub fn update_ue_context(
+        &mut self,
+        ue_id: i32,
+        ran_ue_ngap_id: i64,
+        amf_ue_ngap_id: Option<i64>,
+    ) {
+        let context = self
+            .ue_contexts
+            .entry(ue_id)
+            .or_insert_with(|| UeContext::new(ue_id, ran_ue_ngap_id));
         context.ran_ue_ngap_id = ran_ue_ngap_id;
         context.amf_ue_ngap_id = amf_ue_ngap_id;
     }
@@ -201,10 +207,16 @@ impl AppTask {
     }
 
     /// Updates AMF context.
-    pub fn update_amf_context(&mut self, amf_id: i32, amf_name: Option<String>, is_connected: bool) {
-        let context = self.amf_contexts.entry(amf_id).or_insert_with(|| {
-            AmfContext::new(amf_id)
-        });
+    pub fn update_amf_context(
+        &mut self,
+        amf_id: i32,
+        amf_name: Option<String>,
+        is_connected: bool,
+    ) {
+        let context = self
+            .amf_contexts
+            .entry(amf_id)
+            .or_insert_with(|| AmfContext::new(amf_id));
         context.amf_name = amf_name;
         context.is_connected = is_connected;
     }
@@ -224,7 +236,10 @@ impl Task for AppTask {
 
         if self.cli_enabled {
             if let Some(server) = &self.cli_server {
-                info!("CLI server listening on port {}", server.local_addr().map(|a| a.port()).unwrap_or(0));
+                info!(
+                    "CLI server listening on port {}",
+                    server.local_addr().map(|a| a.port()).unwrap_or(0)
+                );
             }
         }
 
@@ -288,7 +303,9 @@ mod tests {
             ngap_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,
@@ -381,7 +398,10 @@ mod tests {
         // Add AMF context
         task.update_amf_context(1, Some("test-amf".to_string()), true);
         assert!(task.amf_contexts.contains_key(&1));
-        assert_eq!(task.amf_contexts.get(&1).unwrap().amf_name, Some("test-amf".to_string()));
+        assert_eq!(
+            task.amf_contexts.get(&1).unwrap().amf_name,
+            Some("test-amf".to_string())
+        );
         assert!(task.amf_contexts.get(&1).unwrap().is_connected);
 
         // Update AMF context

@@ -239,8 +239,7 @@ impl Dccf {
             .values()
             .filter(|s| {
                 // Check source type
-                if !filter.source_types.is_empty()
-                    && !filter.source_types.contains(&s.source_type)
+                if !filter.source_types.is_empty() && !filter.source_types.contains(&s.source_type)
                 {
                     return false;
                 }
@@ -292,14 +291,17 @@ impl Dccf {
         session_id: &str,
         status: SessionStatus,
     ) -> Result<(), NwdafError> {
-        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
-            DataCollectionError::InvalidData {
-                reason: format!("Session {session_id} not found"),
-            }
-        })?;
+        let session =
+            self.sessions
+                .get_mut(session_id)
+                .ok_or_else(|| DataCollectionError::InvalidData {
+                    reason: format!("Session {session_id} not found"),
+                })?;
 
-        debug!("DCCF: Session {} status: {:?} -> {:?}",
-            session_id, session.status, status);
+        debug!(
+            "DCCF: Session {} status: {:?} -> {:?}",
+            session_id, session.status, status
+        );
 
         session.status = status;
         Ok(())
@@ -307,11 +309,12 @@ impl Dccf {
 
     /// Records data arrival for a session
     pub fn record_data(&mut self, session_id: &str, count: usize) -> Result<(), NwdafError> {
-        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
-            DataCollectionError::InvalidData {
-                reason: format!("Session {session_id} not found"),
-            }
-        })?;
+        let session =
+            self.sessions
+                .get_mut(session_id)
+                .ok_or_else(|| DataCollectionError::InvalidData {
+                    reason: format!("Session {session_id} not found"),
+                })?;
 
         session.data_count += count;
         Ok(())
@@ -327,11 +330,11 @@ impl Dccf {
         metric: &str,
         method: AggregationMethod,
     ) -> Result<Vec<AggregatedData>, NwdafError> {
-        let session = self.get_session(session_id).ok_or_else(|| {
-            DataCollectionError::InvalidData {
-                reason: format!("Session {session_id} not found"),
-            }
-        })?;
+        let session =
+            self.get_session(session_id)
+                .ok_or_else(|| DataCollectionError::InvalidData {
+                    reason: format!("Session {session_id} not found"),
+                })?;
 
         if session.status != SessionStatus::Active {
             return Err(DataCollectionError::InvalidData {
@@ -471,11 +474,7 @@ impl Dccf {
 
     /// Policy-based data routing: determines which NWDAF instances should
     /// receive data from a given source based on routing policies.
-    pub fn route_data(
-        &self,
-        source_id: &str,
-        policies: &[DataRoutingPolicy],
-    ) -> Vec<String> {
+    pub fn route_data(&self, source_id: &str, policies: &[DataRoutingPolicy]) -> Vec<String> {
         let source = match self.sources.get(source_id) {
             Some(s) => s,
             None => return vec![],
@@ -756,14 +755,18 @@ mod tests {
         let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
         let result = dccf.apply_transformations(&values, &[DataTransformation::Standardize]);
         let mean: f64 = result.iter().sum::<f64>() / result.len() as f64;
-        assert!(mean.abs() < 1e-6, "Standardized mean should be ~0, got {mean}");
+        assert!(
+            mean.abs() < 1e-6,
+            "Standardized mean should be ~0, got {mean}"
+        );
     }
 
     #[test]
     fn test_downsample_transform() {
         let dccf = Dccf::new();
         let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let result = dccf.apply_transformations(&values, &[DataTransformation::Downsample { factor: 2 }]);
+        let result =
+            dccf.apply_transformations(&values, &[DataTransformation::Downsample { factor: 2 }]);
         assert_eq!(result, vec![1.0, 3.0, 5.0]);
     }
 
@@ -771,7 +774,8 @@ mod tests {
     fn test_moving_average_transform() {
         let dccf = Dccf::new();
         let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let result = dccf.apply_transformations(&values, &[DataTransformation::MovingAverage { window: 3 }]);
+        let result =
+            dccf.apply_transformations(&values, &[DataTransformation::MovingAverage { window: 3 }]);
         assert_eq!(result.len(), 5);
         assert!((result[2] - 2.0).abs() < 1e-6); // avg(1,2,3) = 2
     }
@@ -799,12 +803,14 @@ mod tests {
             "gnb-1".to_string(),
             DataSourceType::Gnb,
             vec![MeasurementCapability::RadioMeasurement],
-        ).unwrap();
+        )
+        .unwrap();
         dccf.register_source(
             "amf-1".to_string(),
             DataSourceType::CoreNf,
             vec![MeasurementCapability::CellLoad],
-        ).unwrap();
+        )
+        .unwrap();
 
         let policies = vec![
             DataRoutingPolicy {

@@ -157,7 +157,8 @@ impl SemanticCodecTrainer {
 
     /// Registers a participant for training
     pub fn register_participant(&mut self, participant_id: &str, num_samples: u64) {
-        self.aggregator.register_participant(participant_id, num_samples);
+        self.aggregator
+            .register_participant(participant_id, num_samples);
     }
 
     /// Starts a new training round
@@ -170,10 +171,7 @@ impl SemanticCodecTrainer {
     }
 
     /// Submits a semantic model update
-    pub fn submit_semantic_update(
-        &mut self,
-        update: SemanticModelUpdate,
-    ) -> Result<(), String> {
+    pub fn submit_semantic_update(&mut self, update: SemanticModelUpdate) -> Result<(), String> {
         self.aggregator
             .submit_update(update.model_update)
             .map_err(|e| format!("Failed to submit update: {e}"))

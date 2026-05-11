@@ -130,8 +130,7 @@ impl DeregistrationRequestUeOriginating {
         header.encode(buf);
 
         // First octet: ngKSI (high nibble) + De-registration type (low nibble)
-        let first_octet =
-            (self.ng_ksi.encode() << 4) | (self.deregistration_type.encode() & 0x0F);
+        let first_octet = (self.ng_ksi.encode() << 4) | (self.deregistration_type.encode() & 0x0F);
         buf.put_u8(first_octet);
 
         // 5GS mobile identity (mandatory)
@@ -188,8 +187,7 @@ impl DeregistrationAcceptUeOriginating {
 /// Deregistration Request message (UE terminated - network to UE)
 ///
 /// 3GPP TS 24.501 Section 8.2.13
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeregistrationRequestUeTerminated {
     /// De-registration type (mandatory, Type 1)
     pub deregistration_type: IeDeRegistrationType,
@@ -198,7 +196,6 @@ pub struct DeregistrationRequestUeTerminated {
     /// T3346 value (optional, Type 4, IEI 0x5F)
     pub t3346_value: Option<u8>,
 }
-
 
 impl DeregistrationRequestUeTerminated {
     /// Create a new Deregistration Request (UE terminated) with mandatory fields
@@ -362,8 +359,7 @@ mod tests {
         msg.encode(&mut buf);
 
         // Skip header (3 bytes) for decoding
-        let decoded =
-            DeregistrationRequestUeOriginating::decode(&mut &buf[3..]).unwrap();
+        let decoded = DeregistrationRequestUeOriginating::decode(&mut &buf[3..]).unwrap();
 
         assert_eq!(decoded.deregistration_type, dereg_type);
         assert_eq!(decoded.ng_ksi, ng_ksi);
@@ -404,8 +400,7 @@ mod tests {
         msg.encode(&mut buf);
 
         // Skip header (3 bytes) for decoding
-        let decoded =
-            DeregistrationRequestUeTerminated::decode(&mut &buf[3..]).unwrap();
+        let decoded = DeregistrationRequestUeTerminated::decode(&mut &buf[3..]).unwrap();
 
         assert_eq!(decoded.deregistration_type, dereg_type);
         assert_eq!(
@@ -429,8 +424,7 @@ mod tests {
         msg.encode(&mut buf);
 
         // Skip header (3 bytes) for decoding
-        let decoded =
-            DeregistrationRequestUeTerminated::decode(&mut &buf[3..]).unwrap();
+        let decoded = DeregistrationRequestUeTerminated::decode(&mut &buf[3..]).unwrap();
 
         assert_eq!(decoded.deregistration_type, dereg_type);
         assert_eq!(decoded.mm_cause, None);

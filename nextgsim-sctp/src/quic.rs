@@ -207,7 +207,9 @@ pub enum QuicConnectionState {
 /// Generate a self-signed certificate for `server_name` using `rcgen`.
 ///
 /// Returns `(cert_der, key_der)`.
-fn generate_self_signed(server_name: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), QuicTransportError> {
+fn generate_self_signed(
+    server_name: &str,
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), QuicTransportError> {
     let cert = generate_simple_self_signed(vec![server_name.to_string()])
         .map_err(|e| QuicTransportError::TlsError(format!("rcgen: {e}")))?;
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
@@ -356,9 +358,7 @@ impl QuicTransport {
             .map_err(|e| QuicTransportError::ConnectionFailed(e.to_string()))?;
         endpoint.set_default_client_config(client_cfg);
 
-        self.local_addr = endpoint
-            .local_addr()
-            .map_err(QuicTransportError::Io)?;
+        self.local_addr = endpoint.local_addr().map_err(QuicTransportError::Io)?;
 
         info!("QUIC connecting {} -> {}", self.local_addr, remote_addr);
 
@@ -379,7 +379,12 @@ impl QuicTransport {
             .map_err(|e| QuicTransportError::StreamError(e.to_string()))?;
 
         let stream_id = send.id().index();
-        self.active = Some(ActiveConnection { connection, send, recv, stream_id });
+        self.active = Some(ActiveConnection {
+            connection,
+            send,
+            recv,
+            stream_id,
+        });
         self.endpoint = Some(endpoint);
         self.state = QuicConnectionState::Connected;
         info!("QUIC connected to {}", remote_addr);
@@ -402,26 +407,24 @@ impl QuicTransport {
         let endpoint = Endpoint::server(server_cfg, self.config.listen_addr)
             .map_err(|e| QuicTransportError::ConnectionFailed(e.to_string()))?;
 
-        self.local_addr = endpoint
-            .local_addr()
-            .map_err(QuicTransportError::Io)?;
+        self.local_addr = endpoint.local_addr().map_err(QuicTransportError::Io)?;
 
         info!("QUIC server listening on {}", self.local_addr);
 
-        let incoming = tokio::time::timeout(
-            self.config.connect_timeout,
-            endpoint.accept(),
-        )
-        .await
-        .map_err(|_| QuicTransportError::ConnectionFailed("accept timed out".into()))?
-        .ok_or_else(|| QuicTransportError::ConnectionFailed("endpoint closed".into()))?;
+        let incoming = tokio::time::timeout(self.config.connect_timeout, endpoint.accept())
+            .await
+            .map_err(|_| QuicTransportError::ConnectionFailed("accept timed out".into()))?
+            .ok_or_else(|| QuicTransportError::ConnectionFailed("endpoint closed".into()))?;
 
         let connection = incoming
             .await
             .map_err(|e| QuicTransportError::ConnectionFailed(e.to_string()))?;
 
         self.remote_addr = Some(connection.remote_address());
-        debug!("QUIC accepted connection from {}", connection.remote_address());
+        debug!(
+            "QUIC accepted connection from {}",
+            connection.remote_address()
+        );
 
         let (send, recv) = connection
             .accept_bi()
@@ -429,7 +432,12 @@ impl QuicTransport {
             .map_err(|e| QuicTransportError::StreamError(e.to_string()))?;
 
         let stream_id = send.id().index();
-        self.active = Some(ActiveConnection { connection, send, recv, stream_id });
+        self.active = Some(ActiveConnection {
+            connection,
+            send,
+            recv,
+            stream_id,
+        });
         self.endpoint = Some(endpoint);
         self.state = QuicConnectionState::Connected;
         info!("QUIC server ready, stream {}", stream_id);
@@ -464,7 +472,11 @@ impl QuicTransport {
             .await
             .map_err(|e| QuicTransportError::StreamError(e.to_string()))?;
 
-        debug!("QUIC sent {} bytes on stream {}", data.len(), active.stream_id);
+        debug!(
+            "QUIC sent {} bytes on stream {}",
+            data.len(),
+            active.stream_id
+        );
         Ok(())
     }
 
@@ -550,7 +562,11 @@ impl QuicTransport {
 
     /// Get the number of active bidirectional streams (0 or 1 in this impl).
     pub fn active_streams(&self) -> u64 {
-        if self.active.is_some() { 1 } else { 0 }
+        if self.active.is_some() {
+            1
+        } else {
+            0
+        }
     }
 
     /// Get the configuration.
@@ -584,7 +600,6 @@ impl Transport for QuicTransport {
         self.state == QuicConnectionState::Connected
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -640,7 +655,10 @@ mod tests {
     #[test]
     fn test_quic_connection_states_are_distinct() {
         assert_ne!(QuicConnectionState::Idle, QuicConnectionState::Connected);
-        assert_ne!(QuicConnectionState::Handshaking, QuicConnectionState::Draining);
+        assert_ne!(
+            QuicConnectionState::Handshaking,
+            QuicConnectionState::Draining
+        );
         assert_ne!(QuicConnectionState::Connected, QuicConnectionState::Closed);
     }
 
@@ -681,7 +699,10 @@ mod tests {
     fn test_migrate_not_connected_returns_error() {
         let mut transport = default_transport();
         let result = transport.migrate("127.0.0.1:4433".parse().unwrap());
-        assert!(matches!(result, Err(QuicTransportError::ConnectionFailed(_))));
+        assert!(matches!(
+            result,
+            Err(QuicTransportError::ConnectionFailed(_))
+        ));
     }
 
     #[test]
@@ -693,7 +714,10 @@ mod tests {
             enable_0rtt: true,
             ..QuicTransportConfig::default()
         };
-        assert_eq!(config.listen_addr, "10.0.0.1:4433".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            config.listen_addr,
+            "10.0.0.1:4433".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(config.max_streams, 32);
         assert!(config.enable_0rtt);
     }
@@ -701,13 +725,21 @@ mod tests {
     #[test]
     fn test_generate_self_signed_cert() {
         let result = generate_self_signed("localhost");
-        assert!(result.is_ok(), "self-signed cert generation failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "self-signed cert generation failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_make_server_config() {
         let result = make_server_config();
-        assert!(result.is_ok(), "server config creation failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "server config creation failed: {:?}",
+            result.err()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -724,8 +756,8 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // --- server setup ---
         let server_cfg = make_server_config().expect("server config");
-        let server_ep = Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
-            .expect("server endpoint");
+        let server_ep =
+            Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).expect("server endpoint");
         let server_addr = server_ep.local_addr().expect("server local addr");
 
         // Spawn server task
@@ -742,7 +774,9 @@ mod tests {
             recv.read_exact(&mut buf).await.expect("read body");
 
             // Echo back
-            send.write_all(&(msg_len as u32).to_be_bytes()).await.expect("write len");
+            send.write_all(&(msg_len as u32).to_be_bytes())
+                .await
+                .expect("write len");
             send.write_all(&buf).await.expect("write body");
             send.finish().expect("finish");
 

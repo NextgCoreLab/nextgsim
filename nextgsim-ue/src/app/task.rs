@@ -141,7 +141,12 @@ impl AppTask {
     async fn execute_nas_action(&self, action: NasAction) {
         match action {
             NasAction::None => {}
-            NasAction::EstablishPduSession { psi, pti, session_type, apn } => {
+            NasAction::EstablishPduSession {
+                psi,
+                pti,
+                session_type,
+                apn,
+            } => {
                 info!(
                     "Initiating PDU session establishment: PSI={}, PTI={}, type={:?}, apn={:?}",
                     psi, pti, session_type, apn
@@ -179,7 +184,10 @@ impl AppTask {
             NasAction::Deregister { cause } => {
                 use crate::nas::mm::DeregistrationCause;
                 let switch_off = matches!(cause, DeregistrationCause::SwitchOff);
-                info!("Initiating deregistration: cause={}, switch_off={}", cause, switch_off);
+                info!(
+                    "Initiating deregistration: cause={}, switch_off={}",
+                    cause, switch_off
+                );
                 let msg = NasMessage::InitiateDeregistration { switch_off };
                 if let Err(e) = self.task_base.nas_tx.send(msg).await {
                     error!("Failed to send deregistration request: {}", e);
@@ -187,7 +195,9 @@ impl AppTask {
             }
             NasAction::EmergencyRegister => {
                 info!("CLI: triggering emergency registration");
-                if let Err(e) = self.task_base.nas_tx
+                if let Err(e) = self
+                    .task_base
+                    .nas_tx
                     .send(NasMessage::InitiateEmergencyRegistration)
                     .await
                 {
@@ -493,20 +503,33 @@ mod tests {
     #[test]
     fn test_parse_deregister_command() {
         let cmd = parse_ue_cli_command("deregister").unwrap();
-        assert!(matches!(cmd, UeCliCommandType::Deregister { switch_off: false }));
+        assert!(matches!(
+            cmd,
+            UeCliCommandType::Deregister { switch_off: false }
+        ));
 
         let cmd = parse_ue_cli_command("deregister --switch-off").unwrap();
-        assert!(matches!(cmd, UeCliCommandType::Deregister { switch_off: true }));
+        assert!(matches!(
+            cmd,
+            UeCliCommandType::Deregister { switch_off: true }
+        ));
 
         let cmd = parse_ue_cli_command("deregister -s").unwrap();
-        assert!(matches!(cmd, UeCliCommandType::Deregister { switch_off: true }));
+        assert!(matches!(
+            cmd,
+            UeCliCommandType::Deregister { switch_off: true }
+        ));
     }
 
     #[test]
     fn test_parse_ps_establish_command() {
         let cmd = parse_ue_cli_command("ps-establish").unwrap();
         match cmd {
-            UeCliCommandType::PsEstablish { session_type, apn, s_nssai } => {
+            UeCliCommandType::PsEstablish {
+                session_type,
+                apn,
+                s_nssai,
+            } => {
                 assert!(session_type.is_none());
                 assert!(apn.is_none());
                 assert!(s_nssai.is_none());
@@ -516,7 +539,11 @@ mod tests {
 
         let cmd = parse_ue_cli_command("ps-establish --type IPv4 --apn internet").unwrap();
         match cmd {
-            UeCliCommandType::PsEstablish { session_type, apn, s_nssai } => {
+            UeCliCommandType::PsEstablish {
+                session_type,
+                apn,
+                s_nssai,
+            } => {
                 assert_eq!(session_type, Some("IPv4".to_string()));
                 assert_eq!(apn, Some("internet".to_string()));
                 assert!(s_nssai.is_none());

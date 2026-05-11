@@ -7,14 +7,13 @@
 //! - Served GUAMIs and PLMNs
 //! - Stream allocation for UE-associated signaling
 
-use std::collections::HashSet;
 use nextgsim_ngap::procedures::{
-    Guami, NgSetupResponseData, PlmnSupportItem, ServedGuamiItem, SNssai,
+    Guami, NgSetupResponseData, PlmnSupportItem, SNssai, ServedGuamiItem,
 };
+use std::collections::HashSet;
 
 /// AMF connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AmfState {
     /// Not connected
     #[default]
@@ -28,7 +27,6 @@ pub enum AmfState {
     /// AMF is overloaded
     Overloaded,
 }
-
 
 impl std::fmt::Display for AmfState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

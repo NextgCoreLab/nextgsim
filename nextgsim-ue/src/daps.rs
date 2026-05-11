@@ -129,7 +129,10 @@ impl UeDapsContext {
 
     /// Returns true if UL data should go to source cell
     pub fn use_source_for_ul(&self) -> bool {
-        matches!(self.state, UeDapsState::DualConnected | UeDapsState::ReleasingSource)
+        matches!(
+            self.state,
+            UeDapsState::DualConnected | UeDapsState::ReleasingSource
+        )
     }
 
     /// Returns true if DL data should come from target cell

@@ -9,8 +9,7 @@ use std::path::PathBuf;
 /// Execution provider for ML inference
 ///
 /// Supports multiple hardware acceleration backends through ONNX Runtime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ExecutionProvider {
     /// CPU execution (default, always available)
     #[default]
@@ -36,7 +35,6 @@ pub enum ExecutionProvider {
     },
 }
 
-
 impl std::fmt::Display for ExecutionProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -44,7 +42,9 @@ impl std::fmt::Display for ExecutionProvider {
             ExecutionProvider::Cuda { device_id } => write!(f, "CUDA(device={device_id})"),
             ExecutionProvider::CoreML => write!(f, "CoreML"),
             ExecutionProvider::DirectML { device_id } => write!(f, "DirectML(device={device_id})"),
-            ExecutionProvider::TensorRT { device_id, .. } => write!(f, "TensorRT(device={device_id})"),
+            ExecutionProvider::TensorRT { device_id, .. } => {
+                write!(f, "TensorRT(device={device_id})")
+            }
         }
     }
 }
@@ -121,8 +121,7 @@ impl InferenceConfig {
 }
 
 /// Graph optimization level for ONNX Runtime
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GraphOptimizationLevel {
     /// No optimization
     None,
@@ -134,7 +133,6 @@ pub enum GraphOptimizationLevel {
     #[default]
     All,
 }
-
 
 /// Top-level AI configuration for the entire system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,12 +202,12 @@ impl Default for SheConfig {
             enabled: true,
             local_edge_latency_ms: 10,
             regional_edge_latency_ms: 20,
-            local_edge_capacity_flops: 1_000_000_000_000,      // 1 TFLOPS
-            regional_edge_capacity_flops: 10_000_000_000_000,  // 10 TFLOPS
-            core_cloud_capacity_flops: 100_000_000_000_000,    // 100 TFLOPS
-            local_edge_memory_mb: 8 * 1024,    // 8 GB
-            regional_edge_memory_mb: 64 * 1024, // 64 GB
-            core_cloud_memory_mb: 512 * 1024,   // 512 GB
+            local_edge_capacity_flops: 1_000_000_000_000, // 1 TFLOPS
+            regional_edge_capacity_flops: 10_000_000_000_000, // 10 TFLOPS
+            core_cloud_capacity_flops: 100_000_000_000_000, // 100 TFLOPS
+            local_edge_memory_mb: 8 * 1024,               // 8 GB
+            regional_edge_memory_mb: 64 * 1024,           // 64 GB
+            core_cloud_memory_mb: 512 * 1024,             // 512 GB
         }
     }
 }
@@ -347,8 +345,7 @@ impl Default for FlConfig {
 }
 
 /// Federated learning aggregation algorithm
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AggregationAlgorithm {
     /// Federated Averaging
     #[default]
@@ -358,7 +355,6 @@ pub enum AggregationAlgorithm {
     /// Secure Aggregation
     SecAgg,
 }
-
 
 /// Semantic communication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,8 +466,7 @@ mod tests {
     fn test_config_serialization() {
         let config = AiConfig::default();
         let json = serde_json::to_string(&config).expect("Failed to serialize");
-        let deserialized: AiConfig =
-            serde_json::from_str(&json).expect("Failed to deserialize");
+        let deserialized: AiConfig = serde_json::from_str(&json).expect("Failed to deserialize");
         assert_eq!(config.enabled, deserialized.enabled);
     }
 }

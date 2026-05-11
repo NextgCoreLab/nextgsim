@@ -69,10 +69,7 @@ impl MintTask {
         // Add secondary subscriptions from MINT config
         if let Some(ref mint_config) = task_base.config.mint_config {
             for (i, secondary_supi) in mint_config.secondary_supis.iter().enumerate() {
-                subscriptions.push(SubscriptionNasContext::new(
-                    (i + 1) as u8,
-                    secondary_supi,
-                ));
+                subscriptions.push(SubscriptionNasContext::new((i + 1) as u8, secondary_supi));
             }
         }
 

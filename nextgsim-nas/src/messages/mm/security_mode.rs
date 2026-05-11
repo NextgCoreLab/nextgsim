@@ -41,7 +41,6 @@ pub enum SecurityModeError {
     UnknownIei(u8),
 }
 
-
 // ============================================================================
 // IEI values for Security Mode messages
 // ============================================================================
@@ -221,10 +220,13 @@ impl IeUeSecurityCapability {
     /// Get encoded length (including length field)
     pub fn encoded_len(&self) -> usize {
         let has_eps = self.eps_ea.is_some() && self.eps_ia.is_some();
-        if has_eps { 5 } else { 3 }
+        if has_eps {
+            5
+        } else {
+            3
+        }
     }
 }
-
 
 // ============================================================================
 // NAS Security Algorithms IE (Type 3)
@@ -458,7 +460,9 @@ impl SecurityModeCommand {
 
         // Optional IEs
         if let Some(ref imeisv_req) = self.imeisv_request {
-            buf.put_u8((security_mode_command_iei::IMEISV_REQUEST << 4) | (imeisv_req.encode() & 0x0F));
+            buf.put_u8(
+                (security_mode_command_iei::IMEISV_REQUEST << 4) | (imeisv_req.encode() & 0x0F),
+            );
         }
 
         if let Some(eps_alg) = self.selected_eps_nas_security_algorithms {
@@ -662,7 +666,6 @@ impl SecurityModeReject {
     }
 }
 
-
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -800,7 +803,10 @@ mod tests {
 
         // Skip header for decoding
         let decoded = SecurityModeReject::decode(&mut &buf[3..]).unwrap();
-        assert_eq!(decoded.mm_cause.value, MmCause::UeSecurityCapabilitiesMismatch);
+        assert_eq!(
+            decoded.mm_cause.value,
+            MmCause::UeSecurityCapabilitiesMismatch
+        );
     }
 
     #[test]

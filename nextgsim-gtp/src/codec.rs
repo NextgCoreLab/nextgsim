@@ -78,7 +78,6 @@ impl GtpMessageType {
     }
 }
 
-
 /// Extension Header Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -117,7 +116,6 @@ impl ExtHeaderType {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // PDU Session Container IE (A5.2 - 5GC-specific GTP-U extension header)
@@ -292,7 +290,6 @@ impl PduSessionInfo {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // 6G Extension: TSN Marker (A5.3 - Deterministic Networking)
 // ---------------------------------------------------------------------------
@@ -367,8 +364,7 @@ impl TsnMarker {
         let stream_id = u16::from_be_bytes([data[0], data[1]]);
         let sequence_number = u16::from_be_bytes([data[2], data[3]]);
         let timestamp = u64::from_be_bytes([
-            data[4], data[5], data[6], data[7],
-            data[8], data[9], data[10], data[11],
+            data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
         ]);
         let priority = data[12] & 0x07;
 
@@ -380,7 +376,6 @@ impl TsnMarker {
         })
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 6G Extension: In-Network Compute Marker (A5.4)
@@ -516,10 +511,10 @@ impl InNetworkComputeMarker {
             });
         }
         let compute_task_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let data_locality = DataLocality::from_u8(data[4])
-            .ok_or(GtpError::InvalidExtHeaderType(data[4]))?;
-        let processing_hint = ProcessingHint::from_u8(data[5])
-            .ok_or(GtpError::InvalidExtHeaderType(data[5]))?;
+        let data_locality =
+            DataLocality::from_u8(data[4]).ok_or(GtpError::InvalidExtHeaderType(data[4]))?;
+        let processing_hint =
+            ProcessingHint::from_u8(data[5]).ok_or(GtpError::InvalidExtHeaderType(data[5]))?;
 
         Ok(Self {
             compute_task_id,
@@ -528,7 +523,6 @@ impl InNetworkComputeMarker {
         })
     }
 }
-
 
 /// GTP-U Extension Header
 ///
@@ -583,7 +577,6 @@ pub enum GtpExtHeader {
         marker: InNetworkComputeMarker,
     },
 }
-
 
 /// GTP-U codec errors
 #[derive(Debug, Error)]
@@ -654,7 +647,6 @@ pub struct GtpHeader {
     /// Payload data
     pub payload: Bytes,
 }
-
 
 impl GtpHeader {
     /// Minimum GTP-U header size (without optional fields)
@@ -738,7 +730,9 @@ impl GtpHeader {
 
     /// Find the first extension header of a given type in the chain
     pub fn find_extension_header(&self, ext_type: ExtHeaderType) -> Option<&GtpExtHeader> {
-        self.extension_headers.iter().find(|ext| ext.ext_type() == ext_type)
+        self.extension_headers
+            .iter()
+            .find(|ext| ext.ext_type() == ext_type)
     }
 
     /// Get the number of extension headers in the chain
@@ -842,7 +836,6 @@ impl GtpHeader {
 
         buf.put_slice(&self.payload);
     }
-
 
     /// Calculate the length field value (bytes after TEID)
     fn calculate_length(&self) -> usize {
@@ -958,7 +951,6 @@ impl GtpHeader {
     }
 }
 
-
 impl GtpExtHeader {
     /// Get the extension header type identifier for this header
     pub fn ext_type(&self) -> ExtHeaderType {
@@ -1033,7 +1025,7 @@ impl GtpExtHeader {
             Self::LongPdcpPduNumber { pdu_number } => {
                 buf.put_u8(ExtHeaderType::LongPdcpPduNumber as u8);
                 buf.put_u8(2); // length in 4-byte units
-                // 18-bit PDU number in 3 bytes
+                               // 18-bit PDU number in 3 bytes
                 buf.put_u8(((pdu_number >> 16) & 0x03) as u8);
                 buf.put_u8(((pdu_number >> 8) & 0xFF) as u8);
                 buf.put_u8((pdu_number & 0xFF) as u8);
@@ -1098,7 +1090,6 @@ impl GtpExtHeader {
         }
     }
 
-
     /// Decode an extension header from bytes
     ///
     /// Decodes a single extension header from the chain. The `ext_type` parameter
@@ -1152,9 +1143,8 @@ impl GtpExtHeader {
                 if len_units != 2 {
                     return Err(GtpError::InvalidExtHeaderLength(len_units as u8));
                 }
-                let pdu_number = ((data[1] as u32 & 0x03) << 16)
-                    | ((data[2] as u32) << 8)
-                    | (data[3] as u32);
+                let pdu_number =
+                    ((data[1] as u32 & 0x03) << 16) | ((data[2] as u32) << 8) | (data[3] as u32);
                 Self::LongPdcpPduNumber { pdu_number }
             }
             0x85 => {
@@ -1197,7 +1187,6 @@ impl GtpExtHeader {
         Ok((ext, total_len, next_ext_type))
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Extension Header Chain builder (A5.1)
@@ -1309,7 +1298,6 @@ impl ExtHeaderChain {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,8 +1319,8 @@ mod tests {
 
     #[test]
     fn test_encode_decode_with_sequence_number() {
-        let header = GtpHeader::g_pdu(0xABCDEF01, Bytes::from_static(b"test"))
-            .with_sequence_number(0x1234);
+        let header =
+            GtpHeader::g_pdu(0xABCDEF01, Bytes::from_static(b"test")).with_sequence_number(0x1234);
 
         let encoded = header.encode();
         let decoded = GtpHeader::decode(&encoded).unwrap();
@@ -1344,8 +1332,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_with_n_pdu_number() {
-        let header = GtpHeader::g_pdu(0x11223344, Bytes::new())
-            .with_n_pdu_number(0x42);
+        let header = GtpHeader::g_pdu(0x11223344, Bytes::new()).with_n_pdu_number(0x42);
 
         let encoded = header.encode();
         let decoded = GtpHeader::decode(&encoded).unwrap();
@@ -1367,7 +1354,6 @@ mod tests {
         assert_eq!(decoded.n_pdu_number, Some(0xAB));
         assert_eq!(decoded.payload, Bytes::from_static(b"payload"));
     }
-
 
     #[test]
     fn test_encode_decode_echo_request() {
@@ -1424,8 +1410,11 @@ mod tests {
 
     #[test]
     fn test_encode_decode_with_long_pdcp_pdu_number_ext_header() {
-        let header = GtpHeader::g_pdu(0x12345678, Bytes::new())
-            .with_extension_header(GtpExtHeader::LongPdcpPduNumber { pdu_number: 0x3FFFF });
+        let header = GtpHeader::g_pdu(0x12345678, Bytes::new()).with_extension_header(
+            GtpExtHeader::LongPdcpPduNumber {
+                pdu_number: 0x3FFFF,
+            },
+        );
 
         let encoded = header.encode();
         let decoded = GtpHeader::decode(&encoded).unwrap();
@@ -1437,12 +1426,14 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_encode_decode_with_pdu_session_container() {
         let container_data = Bytes::from_static(&[0x00, 0x01, 0x02, 0x03]);
-        let header = GtpHeader::g_pdu(0x12345678, Bytes::new())
-            .with_extension_header(GtpExtHeader::PduSessionContainer { data: container_data.clone() });
+        let header = GtpHeader::g_pdu(0x12345678, Bytes::new()).with_extension_header(
+            GtpExtHeader::PduSessionContainer {
+                data: container_data.clone(),
+            },
+        );
 
         let encoded = header.encode();
         let decoded = GtpHeader::decode(&encoded).unwrap();
@@ -1460,7 +1451,9 @@ mod tests {
                 // Structured decode succeeded - this is valid behavior
                 assert_eq!(info.pdu_type, PduSessionType::Dl);
             }
-            other => panic!("Expected PduSessionContainer or PduSessionContainerInfo, got {other:?}"),
+            other => {
+                panic!("Expected PduSessionContainer or PduSessionContainerInfo, got {other:?}")
+            }
         }
     }
 
@@ -1518,11 +1511,26 @@ mod tests {
 
     #[test]
     fn test_message_type_conversion() {
-        assert_eq!(GtpMessageType::from_u8(1), Some(GtpMessageType::EchoRequest));
-        assert_eq!(GtpMessageType::from_u8(2), Some(GtpMessageType::EchoResponse));
-        assert_eq!(GtpMessageType::from_u8(26), Some(GtpMessageType::ErrorIndication));
-        assert_eq!(GtpMessageType::from_u8(31), Some(GtpMessageType::SupportedExtHeadersNotification));
-        assert_eq!(GtpMessageType::from_u8(254), Some(GtpMessageType::EndMarker));
+        assert_eq!(
+            GtpMessageType::from_u8(1),
+            Some(GtpMessageType::EchoRequest)
+        );
+        assert_eq!(
+            GtpMessageType::from_u8(2),
+            Some(GtpMessageType::EchoResponse)
+        );
+        assert_eq!(
+            GtpMessageType::from_u8(26),
+            Some(GtpMessageType::ErrorIndication)
+        );
+        assert_eq!(
+            GtpMessageType::from_u8(31),
+            Some(GtpMessageType::SupportedExtHeadersNotification)
+        );
+        assert_eq!(
+            GtpMessageType::from_u8(254),
+            Some(GtpMessageType::EndMarker)
+        );
         assert_eq!(GtpMessageType::from_u8(255), Some(GtpMessageType::GPdu));
         assert_eq!(GtpMessageType::from_u8(100), None);
     }
@@ -1549,7 +1557,9 @@ mod tests {
             .with_sequence_number(1)
             .with_extension_header(GtpExtHeader::UdpPort { port: 2152 })
             .with_extension_header(GtpExtHeader::PdcpPduNumber { pdu_number: 0x5678 })
-            .with_extension_header(GtpExtHeader::LongPdcpPduNumber { pdu_number: 0x1FFFF });
+            .with_extension_header(GtpExtHeader::LongPdcpPduNumber {
+                pdu_number: 0x1FFFF,
+            });
 
         let encoded = header.encode();
         let decoded = GtpHeader::decode(&encoded).unwrap();
@@ -1623,21 +1633,33 @@ mod tests {
             other => panic!("Expected UdpPort, got {other:?}"),
         }
 
-        assert!(header.find_extension_header(ExtHeaderType::TsnMarker).is_none());
+        assert!(header
+            .find_extension_header(ExtHeaderType::TsnMarker)
+            .is_none());
     }
 
     #[test]
     fn test_ext_header_type_method() {
-        assert_eq!(GtpExtHeader::UdpPort { port: 0 }.ext_type(), ExtHeaderType::UdpPort);
-        assert_eq!(GtpExtHeader::PdcpPduNumber { pdu_number: 0 }.ext_type(), ExtHeaderType::PdcpPduNumber);
         assert_eq!(
-            GtpExtHeader::TsnMarker { marker: TsnMarker::new(0, 0, 0, 0) }.ext_type(),
+            GtpExtHeader::UdpPort { port: 0 }.ext_type(),
+            ExtHeaderType::UdpPort
+        );
+        assert_eq!(
+            GtpExtHeader::PdcpPduNumber { pdu_number: 0 }.ext_type(),
+            ExtHeaderType::PdcpPduNumber
+        );
+        assert_eq!(
+            GtpExtHeader::TsnMarker {
+                marker: TsnMarker::new(0, 0, 0, 0)
+            }
+            .ext_type(),
             ExtHeaderType::TsnMarker
         );
         assert_eq!(
             GtpExtHeader::InNetworkCompute {
                 marker: InNetworkComputeMarker::new(0, DataLocality::Any, ProcessingHint::None)
-            }.ext_type(),
+            }
+            .ext_type(),
             ExtHeaderType::InNetworkCompute
         );
     }
@@ -1665,8 +1687,7 @@ mod tests {
 
     #[test]
     fn test_pdu_session_info_ul_encode_decode() {
-        let info = PduSessionInfo::uplink(15)
-            .with_dl_sending_timestamp(0xDEADBEEF);
+        let info = PduSessionInfo::uplink(15).with_dl_sending_timestamp(0xDEADBEEF);
 
         let encoded = info.encode();
         let decoded = PduSessionInfo::decode(&encoded).unwrap();
@@ -1753,8 +1774,8 @@ mod tests {
     #[test]
     fn test_tsn_marker_as_ext_header() {
         let marker = TsnMarker::new(1, 42, 999_999, 0);
-        let header = GtpHeader::g_pdu(0x12345678, Bytes::from_static(b"tsn_data"))
-            .with_tsn_marker(marker);
+        let header =
+            GtpHeader::g_pdu(0x12345678, Bytes::from_static(b"tsn_data")).with_tsn_marker(marker);
 
         let encoded = header.encode();
         let decoded = GtpHeader::decode(&encoded).unwrap();
@@ -1783,9 +1804,18 @@ mod tests {
         assert_eq!(decoded.sequence_number, Some(7));
 
         // Verify chain order
-        assert_eq!(decoded.extension_headers[0].ext_type(), ExtHeaderType::UdpPort);
-        assert_eq!(decoded.extension_headers[1].ext_type(), ExtHeaderType::TsnMarker);
-        assert_eq!(decoded.extension_headers[2].ext_type(), ExtHeaderType::PdcpPduNumber);
+        assert_eq!(
+            decoded.extension_headers[0].ext_type(),
+            ExtHeaderType::UdpPort
+        );
+        assert_eq!(
+            decoded.extension_headers[1].ext_type(),
+            ExtHeaderType::TsnMarker
+        );
+        assert_eq!(
+            decoded.extension_headers[2].ext_type(),
+            ExtHeaderType::PdcpPduNumber
+        );
 
         let tsn = decoded.tsn_marker().unwrap();
         assert_eq!(tsn.stream_id, 5);
@@ -1806,11 +1836,8 @@ mod tests {
 
     #[test]
     fn test_in_network_compute_marker_encode_decode() {
-        let marker = InNetworkComputeMarker::new(
-            0xCAFEBABE,
-            DataLocality::Edge,
-            ProcessingHint::Inference,
-        );
+        let marker =
+            InNetworkComputeMarker::new(0xCAFEBABE, DataLocality::Edge, ProcessingHint::Inference);
 
         let encoded = marker.encode();
         let decoded = InNetworkComputeMarker::decode(&encoded).unwrap();
@@ -1822,11 +1849,8 @@ mod tests {
 
     #[test]
     fn test_in_network_compute_as_ext_header() {
-        let marker = InNetworkComputeMarker::new(
-            42,
-            DataLocality::Regional,
-            ProcessingHint::Aggregate,
-        );
+        let marker =
+            InNetworkComputeMarker::new(42, DataLocality::Regional, ProcessingHint::Aggregate);
         let header = GtpHeader::g_pdu(0x12345678, Bytes::from_static(b"compute"))
             .with_in_network_compute(marker);
 
@@ -1925,14 +1949,20 @@ mod tests {
         assert_eq!(decoded.extension_header_count(), 3);
         assert_eq!(decoded.pdu_session_info().unwrap().qfi, 30);
         assert_eq!(decoded.tsn_marker().unwrap().stream_id, 100);
-        assert_eq!(decoded.in_network_compute_marker().unwrap().compute_task_id, 777);
+        assert_eq!(
+            decoded.in_network_compute_marker().unwrap().compute_task_id,
+            777
+        );
         assert_eq!(decoded.payload, Bytes::from_static(b"6g"));
     }
 
     #[test]
     fn test_ext_header_type_conversion_new_types() {
         assert_eq!(ExtHeaderType::from_u8(0xE1), Some(ExtHeaderType::TsnMarker));
-        assert_eq!(ExtHeaderType::from_u8(0xE2), Some(ExtHeaderType::InNetworkCompute));
+        assert_eq!(
+            ExtHeaderType::from_u8(0xE2),
+            Some(ExtHeaderType::InNetworkCompute)
+        );
         assert_eq!(ExtHeaderType::from_u8(0xE3), None);
     }
 

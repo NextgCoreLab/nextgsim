@@ -5,6 +5,6 @@
 pub mod fleet;
 
 pub use fleet::{
-    FleetManager, DeviceGroup, AmbientDevice, DeviceCommand, DeviceStatus,
-    EnergyHarvestingStatus, FleetAnalytics, CommandResponse,
+    AmbientDevice, CommandResponse, DeviceCommand, DeviceGroup, DeviceStatus,
+    EnergyHarvestingStatus, FleetAnalytics, FleetManager,
 };

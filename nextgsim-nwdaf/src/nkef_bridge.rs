@@ -135,14 +135,9 @@ impl NwdafNkefBridge {
     }
 
     /// Derives a NKEF entity ID from an analytics target
-    fn target_entity_id(
-        &self,
-        target: &crate::analytics_id::AnalyticsTarget,
-    ) -> Option<String> {
+    fn target_entity_id(&self, target: &crate::analytics_id::AnalyticsTarget) -> Option<String> {
         match target {
-            crate::analytics_id::AnalyticsTarget::Ue { ue_id } => {
-                Some(format!("ue-{ue_id}"))
-            }
+            crate::analytics_id::AnalyticsTarget::Ue { ue_id } => Some(format!("ue-{ue_id}")),
             crate::analytics_id::AnalyticsTarget::Cell { cell_id } => {
                 Some(format!("cell-{cell_id}"))
             }

@@ -62,7 +62,6 @@ mod ul_nas_transport_iei {
     pub const DNN: u8 = 0x25;
 }
 
-
 // ============================================================================
 // DL NAS Transport (3GPP TS 24.501 Section 8.2.11)
 // ============================================================================
@@ -122,10 +121,12 @@ impl DlNasTransport {
             });
         }
         let pct_byte = buf.get_u8();
-        let payload_container_type = PayloadContainerType::try_from(pct_byte & 0x0F)
-            .map_err(|_| NasTransportError::InvalidIeValue(
-                format!("Invalid payload container type: 0x{pct_byte:02X}"),
-            ))?;
+        let payload_container_type =
+            PayloadContainerType::try_from(pct_byte & 0x0F).map_err(|_| {
+                NasTransportError::InvalidIeValue(format!(
+                    "Invalid payload container type: 0x{pct_byte:02X}"
+                ))
+            })?;
 
         // Payload container (mandatory, TLV-E: IEI(1) + Length(2) + Value)
         // In the mandatory position there is no IEI, just the length-value
@@ -253,7 +254,6 @@ impl DlNasTransport {
     }
 }
 
-
 // ============================================================================
 // UL NAS Transport (3GPP TS 24.501 Section 8.2.10)
 // ============================================================================
@@ -316,10 +316,12 @@ impl UlNasTransport {
             });
         }
         let pct_byte = buf.get_u8();
-        let payload_container_type = PayloadContainerType::try_from(pct_byte & 0x0F)
-            .map_err(|_| NasTransportError::InvalidIeValue(
-                format!("Invalid payload container type: 0x{pct_byte:02X}"),
-            ))?;
+        let payload_container_type =
+            PayloadContainerType::try_from(pct_byte & 0x0F).map_err(|_| {
+                NasTransportError::InvalidIeValue(format!(
+                    "Invalid payload container type: 0x{pct_byte:02X}"
+                ))
+            })?;
 
         // Payload container (mandatory, length-value with 2-byte length)
         if buf.remaining() < 2 {
@@ -348,8 +350,7 @@ impl UlNasTransport {
             let iei_high = (iei >> 4) & 0x0F;
             if iei_high == ul_nas_transport_iei::REQUEST_TYPE_HIGH_NIBBLE {
                 buf.advance(1);
-                let rt = RequestType::try_from(iei & 0x07)
-                    .unwrap_or(RequestType::InitialRequest);
+                let rt = RequestType::try_from(iei & 0x07).unwrap_or(RequestType::InitialRequest);
                 msg.request_type = Some(rt);
                 continue;
             }
@@ -461,7 +462,6 @@ impl UlNasTransport {
     }
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -476,21 +476,18 @@ mod tests {
 
     #[test]
     fn test_dl_nas_transport_new() {
-        let msg = DlNasTransport::new(
-            PayloadContainerType::N1SmInformation,
-            vec![0x01, 0x02],
+        let msg = DlNasTransport::new(PayloadContainerType::N1SmInformation, vec![0x01, 0x02]);
+        assert_eq!(
+            msg.payload_container_type,
+            PayloadContainerType::N1SmInformation
         );
-        assert_eq!(msg.payload_container_type, PayloadContainerType::N1SmInformation);
         assert_eq!(msg.payload_container, vec![0x01, 0x02]);
         assert!(msg.pdu_session_id.is_none());
     }
 
     #[test]
     fn test_dl_nas_transport_encode_minimal() {
-        let msg = DlNasTransport::new(
-            PayloadContainerType::N1SmInformation,
-            vec![0xAA, 0xBB],
-        );
+        let msg = DlNasTransport::new(PayloadContainerType::N1SmInformation, vec![0xAA, 0xBB]);
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 
@@ -520,7 +517,10 @@ mod tests {
 
         // Skip header (3 bytes) and decode
         let decoded = DlNasTransport::decode(&mut &buf[3..]).unwrap();
-        assert_eq!(decoded.payload_container_type, PayloadContainerType::N1SmInformation);
+        assert_eq!(
+            decoded.payload_container_type,
+            PayloadContainerType::N1SmInformation
+        );
         assert_eq!(decoded.payload_container, vec![0x01, 0x02, 0x03]);
         assert_eq!(decoded.pdu_session_id, Some(5));
         assert_eq!(decoded.mm_cause, Some(0x16));
@@ -528,10 +528,7 @@ mod tests {
 
     #[test]
     fn test_dl_nas_transport_encode_decode_with_timer() {
-        let mut msg = DlNasTransport::new(
-            PayloadContainerType::Sms,
-            vec![0x10],
-        );
+        let mut msg = DlNasTransport::new(PayloadContainerType::Sms, vec![0x10]);
         msg.back_off_timer_value = Some(0x21);
 
         let mut buf = Vec::new();
@@ -544,7 +541,10 @@ mod tests {
 
     #[test]
     fn test_dl_nas_transport_message_type() {
-        assert_eq!(DlNasTransport::message_type(), MmMessageType::DlNasTransport);
+        assert_eq!(
+            DlNasTransport::message_type(),
+            MmMessageType::DlNasTransport
+        );
     }
 
     // ========================================================================
@@ -553,11 +553,11 @@ mod tests {
 
     #[test]
     fn test_ul_nas_transport_new() {
-        let msg = UlNasTransport::new(
-            PayloadContainerType::N1SmInformation,
-            vec![0x01, 0x02],
+        let msg = UlNasTransport::new(PayloadContainerType::N1SmInformation, vec![0x01, 0x02]);
+        assert_eq!(
+            msg.payload_container_type,
+            PayloadContainerType::N1SmInformation
         );
-        assert_eq!(msg.payload_container_type, PayloadContainerType::N1SmInformation);
         assert_eq!(msg.payload_container, vec![0x01, 0x02]);
         assert!(msg.pdu_session_id.is_none());
         assert!(msg.request_type.is_none());
@@ -565,10 +565,7 @@ mod tests {
 
     #[test]
     fn test_ul_nas_transport_encode_minimal() {
-        let msg = UlNasTransport::new(
-            PayloadContainerType::N1SmInformation,
-            vec![0xCC],
-        );
+        let msg = UlNasTransport::new(PayloadContainerType::N1SmInformation, vec![0xCC]);
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 
@@ -582,10 +579,7 @@ mod tests {
 
     #[test]
     fn test_ul_nas_transport_encode_decode() {
-        let mut msg = UlNasTransport::new(
-            PayloadContainerType::N1SmInformation,
-            vec![0x01, 0x02],
-        );
+        let mut msg = UlNasTransport::new(PayloadContainerType::N1SmInformation, vec![0x01, 0x02]);
         msg.pdu_session_id = Some(5);
         msg.request_type = Some(RequestType::InitialRequest);
         msg.s_nssai = Some(vec![0x01]); // SST only
@@ -595,7 +589,10 @@ mod tests {
         msg.encode(&mut buf);
 
         let decoded = UlNasTransport::decode(&mut &buf[3..]).unwrap();
-        assert_eq!(decoded.payload_container_type, PayloadContainerType::N1SmInformation);
+        assert_eq!(
+            decoded.payload_container_type,
+            PayloadContainerType::N1SmInformation
+        );
         assert_eq!(decoded.payload_container, vec![0x01, 0x02]);
         assert_eq!(decoded.pdu_session_id, Some(5));
         assert_eq!(decoded.request_type, Some(RequestType::InitialRequest));
@@ -608,10 +605,7 @@ mod tests {
 
     #[test]
     fn test_ul_nas_transport_encode_decode_with_old_pdu_session() {
-        let mut msg = UlNasTransport::new(
-            PayloadContainerType::N1SmInformation,
-            vec![0xFF],
-        );
+        let mut msg = UlNasTransport::new(PayloadContainerType::N1SmInformation, vec![0xFF]);
         msg.pdu_session_id = Some(3);
         msg.old_pdu_session_id = Some(1);
 
@@ -625,15 +619,15 @@ mod tests {
 
     #[test]
     fn test_ul_nas_transport_message_type() {
-        assert_eq!(UlNasTransport::message_type(), MmMessageType::UlNasTransport);
+        assert_eq!(
+            UlNasTransport::message_type(),
+            MmMessageType::UlNasTransport
+        );
     }
 
     #[test]
     fn test_ul_nas_transport_decode_empty_payload() {
-        let msg = UlNasTransport::new(
-            PayloadContainerType::N1SmInformation,
-            vec![],
-        );
+        let msg = UlNasTransport::new(PayloadContainerType::N1SmInformation, vec![]);
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 

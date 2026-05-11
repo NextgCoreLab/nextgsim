@@ -42,24 +42,34 @@ pub mod tunnel;
 
 // Re-export main types for convenience
 pub use codec::{
-    ExtHeaderType, GtpError, GtpExtHeader, GtpHeader, GtpMessageType,
-    GTP_PROTOCOL_TYPE, GTP_VERSION,
+    DataLocality,
     // Extension header chaining (A5.1)
     ExtHeaderChain,
-    // PDU Session Container IE (A5.2)
-    PduSessionInfo, PduSessionType,
-    // 6G TSN markers (A5.3)
-    TsnMarker, EXT_HEADER_TYPE_TSN_MARKER,
+    ExtHeaderType,
+    GtpError,
+    GtpExtHeader,
+    GtpHeader,
+    GtpMessageType,
     // 6G In-Network Compute markers (A5.4)
-    InNetworkComputeMarker, ProcessingHint, DataLocality, EXT_HEADER_TYPE_IN_NETWORK_COMPUTE,
+    InNetworkComputeMarker,
+    // PDU Session Container IE (A5.2)
+    PduSessionInfo,
+    PduSessionType,
+    ProcessingHint,
+    // 6G TSN markers (A5.3)
+    TsnMarker,
+    EXT_HEADER_TYPE_IN_NETWORK_COMPUTE,
+    EXT_HEADER_TYPE_TSN_MARKER,
+    GTP_PROTOCOL_TYPE,
+    GTP_VERSION,
 };
 
 pub use tunnel::{
-    GtpTunnel, PduSession, TunnelError, TunnelManager,
-    GTP_U_PORT, get_psi, get_ue_id, make_session_key,
+    get_psi, get_ue_id, make_session_key, GtpTunnel, PduSession, TunnelError, TunnelManager,
+    GTP_U_PORT,
 };
 
 pub use qos::{
-    FiveQiCharacteristics, QosResourceType, QfiDscpMapper, QosFlowEnforcer,
-    FlowStats, TokenBucket, lookup_5qi, default_qfi_to_dscp, standard_5qi_table,
+    default_qfi_to_dscp, lookup_5qi, standard_5qi_table, FiveQiCharacteristics, FlowStats,
+    QfiDscpMapper, QosFlowEnforcer, QosResourceType, TokenBucket,
 };

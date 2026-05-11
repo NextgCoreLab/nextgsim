@@ -146,12 +146,7 @@ impl ContextBuilder {
     }
 
     /// Adds a context entry for an entity with its relationships.
-    pub fn add_entity(
-        &mut self,
-        entity: &Entity,
-        relevance: f32,
-        relationships: &[&Relationship],
-    ) {
+    pub fn add_entity(&mut self, entity: &Entity, relevance: f32, relationships: &[&Relationship]) {
         if relevance < self.config.min_relevance {
             return;
         }
@@ -231,14 +226,21 @@ impl ContextBuilder {
                 entry_text.push_str("**Relationships:**\n");
                 for rel in &entry.relationships {
                     let direction = if rel.source_id == entry.entity_id {
-                        format!("{} --[{}]--> {}", rel.source_id, rel.relation_type, rel.target_id)
+                        format!(
+                            "{} --[{}]--> {}",
+                            rel.source_id, rel.relation_type, rel.target_id
+                        )
                     } else {
-                        format!("{} <--[{}]-- {}", entry.entity_id, rel.relation_type, rel.source_id)
+                        format!(
+                            "{} <--[{}]-- {}",
+                            entry.entity_id, rel.relation_type, rel.source_id
+                        )
                     };
                     entry_text.push_str(&format!("- {direction}\n"));
 
                     if !rel.properties.is_empty() {
-                        let mut rel_props: Vec<(&String, &String)> = rel.properties.iter().collect();
+                        let mut rel_props: Vec<(&String, &String)> =
+                            rel.properties.iter().collect();
                         rel_props.sort_by_key(|(k, _)| *k);
                         for (k, v) in rel_props {
                             entry_text.push_str(&format!("  - {k}: {v}\n"));
@@ -354,10 +356,7 @@ impl ContextBuilder {
                 "entity_type".to_string(),
                 serde_json::Value::String(format!("{:?}", entry.entity_type)),
             );
-            entry_map.insert(
-                "relevance".to_string(),
-                serde_json::json!(entry.relevance),
-            );
+            entry_map.insert("relevance".to_string(), serde_json::json!(entry.relevance));
 
             if self.config.include_properties {
                 let props: serde_json::Map<String, serde_json::Value> = entry
@@ -365,10 +364,7 @@ impl ContextBuilder {
                     .iter()
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
-                entry_map.insert(
-                    "properties".to_string(),
-                    serde_json::Value::Object(props),
-                );
+                entry_map.insert("properties".to_string(), serde_json::Value::Object(props));
             }
 
             if !entry.relationships.is_empty() {
@@ -383,10 +379,7 @@ impl ContextBuilder {
                         })
                     })
                     .collect();
-                entry_map.insert(
-                    "relationships".to_string(),
-                    serde_json::Value::Array(rels),
-                );
+                entry_map.insert("relationships".to_string(), serde_json::Value::Array(rels));
             }
 
             let entry_json = serde_json::to_string(&entry_map).expect("value expected");
@@ -535,8 +528,10 @@ mod tests {
 
         // Add many entities
         for i in 0..20 {
-            let entity = Entity::new(format!("gnb-{i:03}"), EntityType::Gnb)
-                .with_property("description", "A very long description that takes up many tokens in the output context string");
+            let entity = Entity::new(format!("gnb-{i:03}"), EntityType::Gnb).with_property(
+                "description",
+                "A very long description that takes up many tokens in the output context string",
+            );
             builder.add_entity(&entity, 0.9 - (i as f32 * 0.01), &[]);
         }
 
@@ -618,7 +613,8 @@ mod tests {
     #[test]
     fn test_relationship_context_from_relationship() {
         let mut rel = Relationship::new("a", "b", "connected_to");
-        rel.properties.insert("quality".to_string(), "high".to_string());
+        rel.properties
+            .insert("quality".to_string(), "high".to_string());
 
         let rc = RelationshipContext::from_relationship(&rel);
         assert_eq!(rc.source_id, "a");

@@ -51,8 +51,7 @@ impl std::fmt::Display for PlacementReason {
 }
 
 /// Scheduling policy for workload placement
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SchedulingPolicy {
     /// Place on the tier closest to the edge that satisfies requirements
     #[default]
@@ -66,7 +65,6 @@ pub enum SchedulingPolicy {
     /// Energy-aware scheduling (IMT-2030 sustainability)
     EnergyAware,
 }
-
 
 /// Workload scheduler
 #[derive(Debug)]
@@ -120,7 +118,10 @@ impl WorkloadScheduler {
         let id = self.allocate_id();
         let workload = Workload::new(id, requirements);
 
-        info!("Submitted workload {}: type={}", id, workload.requirements.workload_type);
+        info!(
+            "Submitted workload {}: type={}",
+            id, workload.requirements.workload_type
+        );
 
         self.workloads.insert(id, workload);
         Ok(id)
@@ -130,9 +131,10 @@ impl WorkloadScheduler {
     pub fn place(&mut self, workload_id: WorkloadId) -> SheResult<PlacementDecision> {
         // First, extract requirements and mark as scheduling
         let requirements = {
-            let workload = self.workloads.get_mut(&workload_id).ok_or(SheError::WorkloadNotFound {
-                workload_id,
-            })?;
+            let workload = self
+                .workloads
+                .get_mut(&workload_id)
+                .ok_or(SheError::WorkloadNotFound { workload_id })?;
             workload.mark_scheduling();
             workload.requirements.clone()
         };
@@ -181,7 +183,10 @@ impl WorkloadScheduler {
 
         // Try each tier in order
         for tier in candidate_tiers {
-            if let Some(node) = self.tier_manager.find_best_node(tier, capability, compute, memory) {
+            if let Some(node) = self
+                .tier_manager
+                .find_best_node(tier, capability, compute, memory)
+            {
                 let reason = self.determine_reason(tier, requirements);
                 return Ok(PlacementDecision {
                     workload_id,
@@ -229,9 +234,7 @@ impl WorkloadScheduler {
                     }
                 }
                 for tier in ComputeTier::all_ordered() {
-                    if tier.priority() >= effective_minimum.priority()
-                        && !tiers.contains(tier)
-                    {
+                    if tier.priority() >= effective_minimum.priority() && !tiers.contains(tier) {
                         tiers.push(*tier);
                     }
                 }
@@ -265,9 +268,10 @@ impl WorkloadScheduler {
                 tiers.sort_by_key(|tier| {
                     let capacity = self.tier_manager.tier_capacity(*tier);
                     let usage = self.tier_manager.tier_usage(*tier);
-                    
+
                     if capacity.compute_flops > 0 {
-                        ((usage.compute_flops as f64 / capacity.compute_flops as f64) * 1000.0) as u64
+                        ((usage.compute_flops as f64 / capacity.compute_flops as f64) * 1000.0)
+                            as u64
                     } else {
                         u64::MAX
                     } // Lowest first
@@ -294,9 +298,9 @@ impl WorkloadScheduler {
                     // Energy efficiency score (lower is better)
                     // Base energy cost per tier (edge = higher PUE)
                     let base_energy_cost = match tier {
-                        ComputeTier::LocalEdge => 150,     // Higher PUE, cooling challenges
-                        ComputeTier::RegionalEdge => 120,  // Moderate efficiency
-                        ComputeTier::CoreCloud => 100,     // Best PUE, optimized cooling
+                        ComputeTier::LocalEdge => 150,    // Higher PUE, cooling challenges
+                        ComputeTier::RegionalEdge => 120, // Moderate efficiency
+                        ComputeTier::CoreCloud => 100,    // Best PUE, optimized cooling
                     };
 
                     // Utilization factor: prefer consolidation (higher utilization = better efficiency)
@@ -319,7 +323,11 @@ impl WorkloadScheduler {
     }
 
     /// Determines the reason for a placement decision
-    fn determine_reason(&self, tier: ComputeTier, requirements: &WorkloadRequirements) -> PlacementReason {
+    fn determine_reason(
+        &self,
+        tier: ComputeTier,
+        requirements: &WorkloadRequirements,
+    ) -> PlacementReason {
         if requirements.preferred_tier == Some(tier) {
             PlacementReason::PreferredTier
         } else if let Some(latency) = requirements.latency_constraint_ms {
@@ -337,9 +345,10 @@ impl WorkloadScheduler {
 
     /// Releases a workload and frees its resources
     pub fn release(&mut self, workload_id: WorkloadId) -> SheResult<()> {
-        let workload = self.workloads.get_mut(&workload_id).ok_or(SheError::WorkloadNotFound {
-            workload_id,
-        })?;
+        let workload = self
+            .workloads
+            .get_mut(&workload_id)
+            .ok_or(SheError::WorkloadNotFound { workload_id })?;
 
         // Release resources if the workload was running
         if let (Some(node_id), WorkloadState::Running | WorkloadState::Migrating) =
@@ -361,9 +370,10 @@ impl WorkloadScheduler {
 
     /// Cancels a workload
     pub fn cancel(&mut self, workload_id: WorkloadId) -> SheResult<()> {
-        let workload = self.workloads.get_mut(&workload_id).ok_or(SheError::WorkloadNotFound {
-            workload_id,
-        })?;
+        let workload = self
+            .workloads
+            .get_mut(&workload_id)
+            .ok_or(SheError::WorkloadNotFound { workload_id })?;
 
         // Release resources if allocated
         if let Some(node_id) = workload.assigned_node_id {
@@ -383,7 +393,11 @@ impl WorkloadScheduler {
 
     /// Migrates a workload to a different tier with state transfer
     /// Sub-1ms handover target for live migration
-    pub fn migrate(&mut self, workload_id: WorkloadId, target_tier: ComputeTier) -> SheResult<PlacementDecision> {
+    pub fn migrate(
+        &mut self,
+        workload_id: WorkloadId,
+        target_tier: ComputeTier,
+    ) -> SheResult<PlacementDecision> {
         self.migrate_with_state_transfer(workload_id, target_tier, true)
     }
 
@@ -396,9 +410,10 @@ impl WorkloadScheduler {
     ) -> SheResult<PlacementDecision> {
         // Extract necessary info and mark as migrating
         let (source_tier, source_node_id, requirements) = {
-            let workload = self.workloads.get_mut(&workload_id).ok_or(SheError::WorkloadNotFound {
-                workload_id,
-            })?;
+            let workload = self
+                .workloads
+                .get_mut(&workload_id)
+                .ok_or(SheError::WorkloadNotFound { workload_id })?;
 
             let source_tier = workload.assigned_tier.ok_or(SheError::MigrationFailed {
                 workload_id,
@@ -424,7 +439,12 @@ impl WorkloadScheduler {
 
         let target_node = self
             .tier_manager
-            .find_best_node(target_tier, capability, requirements.compute_flops, requirements.memory_bytes)
+            .find_best_node(
+                target_tier,
+                capability,
+                requirements.compute_flops,
+                requirements.memory_bytes,
+            )
             .ok_or(SheError::InsufficientResources {
                 tier: target_tier,
                 available: "Insufficient".to_string(),
@@ -448,7 +468,10 @@ impl WorkloadScheduler {
 
         // Simulate state transfer if requested
         if transfer_state {
-            debug!("Transferring workload state from {} to {}", source_tier, target_tier);
+            debug!(
+                "Transferring workload state from {} to {}",
+                source_tier, target_tier
+            );
             // In a real implementation, this would:
             // 1. Checkpoint running workload state
             // 2. Transfer state to target node (< 1ms target)
@@ -490,10 +513,7 @@ impl WorkloadScheduler {
 
     /// Gets the number of active workloads
     pub fn active_workload_count(&self) -> usize {
-        self.workloads
-            .values()
-            .filter(|w| !w.is_terminal())
-            .count()
+        self.workloads.values().filter(|w| !w.is_terminal()).count()
     }
 
     /// Cleans up terminal workloads
@@ -591,8 +611,7 @@ mod tests {
         let mut scheduler = setup_scheduler();
 
         // Use 10ms latency to start at LocalEdge (<=10ms = LocalEdge minimum)
-        let requirements = WorkloadRequirements::inference()
-            .with_latency_constraint_ms(10);
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(10);
 
         let id = scheduler.submit(requirements).unwrap();
         let initial = scheduler.place(id).unwrap();
@@ -618,14 +637,17 @@ mod tests {
         let mut scheduler = setup_scheduler();
 
         // Request more compute than any tier has
-        let requirements = WorkloadRequirements::inference()
-            .with_compute_flops(1_000_000_000_000_000); // 1000 TFLOPS
+        let requirements =
+            WorkloadRequirements::inference().with_compute_flops(1_000_000_000_000_000); // 1000 TFLOPS
 
         let id = scheduler.submit(requirements).unwrap();
         let result = scheduler.place(id);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SheError::NoSuitableTier { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SheError::NoSuitableTier { .. }
+        ));
     }
 
     #[test]
@@ -633,8 +655,7 @@ mod tests {
         let mut scheduler = setup_scheduler().with_policy(SchedulingPolicy::PreferredFirst);
 
         // Use 10ms latency to allow LocalEdge tier (<=10ms = LocalEdge minimum)
-        let requirements = WorkloadRequirements::inference()
-            .with_latency_constraint_ms(10);
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(10);
 
         // Without preference, should go to local edge (closest to edge)
         let id1 = scheduler.submit(requirements.clone()).unwrap();
@@ -661,8 +682,7 @@ mod tests {
         core_node.allocate(50_000_000_000_000, 200 * 1024 * 1024 * 1024);
 
         // Submit inference workload - should prefer core due to better energy efficiency
-        let requirements = WorkloadRequirements::inference()
-            .with_latency_constraint_ms(50); // Allow any tier
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(50); // Allow any tier
 
         let id = scheduler.submit(requirements).unwrap();
         let decision = scheduler.place(id).unwrap();
@@ -680,8 +700,7 @@ mod tests {
         edge_node.allocate(900_000_000_000, 7 * 1024 * 1024 * 1024);
 
         // Submit inference with flexible latency
-        let requirements = WorkloadRequirements::inference()
-            .with_latency_constraint_ms(30);
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(30);
 
         let id = scheduler.submit(requirements).unwrap();
         let decision = scheduler.place(id).unwrap();

@@ -54,7 +54,6 @@ pub struct DlInformationTransferData {
     pub dedicated_nas_message: Option<Vec<u8>>,
 }
 
-
 /// Build a DL Information Transfer message
 pub fn build_dl_information_transfer(
     params: &DlInformationTransferParams,
@@ -85,7 +84,9 @@ pub fn build_dl_information_transfer(
         dl_information_transfer,
     ));
 
-    Ok(DL_DCCH_Message { message: message_type })
+    Ok(DL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse a DL Information Transfer from a DL-DCCH message
@@ -125,7 +126,6 @@ pub fn parse_dl_information_transfer(
         dedicated_nas_message: ies.dedicated_nas_message.as_ref().map(|msg| msg.0.clone()),
     })
 }
-
 
 // ============================================================================
 // UL Information Transfer
@@ -168,7 +168,9 @@ pub fn build_ul_information_transfer(
         ul_information_transfer,
     ));
 
-    Ok(UL_DCCH_Message { message: message_type })
+    Ok(UL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse a UL Information Transfer from a UL-DCCH message
@@ -207,7 +209,6 @@ pub fn parse_ul_information_transfer(
         dedicated_nas_message: ies.dedicated_nas_message.as_ref().map(|msg| msg.0.clone()),
     })
 }
-
 
 // ============================================================================
 // Convenience Functions
@@ -260,7 +261,6 @@ pub fn is_ul_information_transfer(msg: &UL_DCCH_Message) -> bool {
         UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::UlInformationTransfer(_))
     )
 }
-
 
 #[cfg(test)]
 mod tests {

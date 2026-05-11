@@ -7,9 +7,9 @@ use std::path::Path;
 
 use tracing::{debug, info};
 
-use nextgsim_ai::inference::{InferenceEngine, OnnxEngine};
 use nextgsim_ai::config::ExecutionProvider;
 use nextgsim_ai::error::ModelError;
+use nextgsim_ai::inference::{InferenceEngine, OnnxEngine};
 use nextgsim_ai::tensor::TensorData;
 
 use crate::{SemanticFeatures, SemanticTask};
@@ -72,7 +72,10 @@ impl NeuralEncoder {
     ///
     /// # Errors
     /// Returns `CodecError::ModelLoad` if the ONNX engine cannot be initialized.
-    pub fn with_provider(target_dim: usize, provider: ExecutionProvider) -> Result<Self, CodecError> {
+    pub fn with_provider(
+        target_dim: usize,
+        provider: ExecutionProvider,
+    ) -> Result<Self, CodecError> {
         let engine = OnnxEngine::new(provider)?;
         Ok(Self {
             engine,
@@ -123,7 +126,11 @@ impl NeuralEncoder {
     }
 
     /// Runs the ONNX encoder model on the input data.
-    fn encode_neural(&self, data: &[f32], task: SemanticTask) -> Result<SemanticFeatures, CodecError> {
+    fn encode_neural(
+        &self,
+        data: &[f32],
+        task: SemanticTask,
+    ) -> Result<SemanticFeatures, CodecError> {
         let input = TensorData::float32(data.to_vec(), vec![1i64, data.len() as i64]);
         let output = self.engine.infer(&input)?;
 

@@ -72,7 +72,9 @@ pub use error::SheError;
 pub use messages::{SheMessage, SheResponse};
 pub use resource::{AcceleratorType, ResourceCapacity, ResourceUsage};
 pub use scheduler::{PlacementDecision, SchedulingPolicy, WorkloadScheduler};
-pub use security::{AttestationEvidence, AttestationResult, SecurityContext, SecurityManager, TeeType};
+pub use security::{
+    AttestationEvidence, AttestationResult, SecurityContext, SecurityManager, TeeType,
+};
 pub use sla::{SlaContract, SlaMetric, SlaMonitor, SlaObjective, SlaViolation};
 pub use task::SheTask;
 pub use tier::{ComputeCapability, ComputeNode, ComputeTier, TierManager};

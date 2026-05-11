@@ -98,7 +98,11 @@ impl GoalOrientedEncoder {
 
     /// Evaluates task effectiveness of transmitted features
     /// Returns a score between 0.0 and 1.0
-    pub fn evaluate_effectiveness(&self, transmitted: &SemanticFeatures, ground_truth: &[f32]) -> f32 {
+    pub fn evaluate_effectiveness(
+        &self,
+        transmitted: &SemanticFeatures,
+        ground_truth: &[f32],
+    ) -> f32 {
         // Simulate task-specific evaluation
         // In practice, this would run the downstream task (e.g., classifier)
 
@@ -126,7 +130,12 @@ impl GoalOrientedEncoder {
     }
 
     /// Checks if top-k features are preserved
-    fn top_k_preservation(&self, transmitted: &SemanticFeatures, ground_truth: &[f32], k: usize) -> f32 {
+    fn top_k_preservation(
+        &self,
+        transmitted: &SemanticFeatures,
+        ground_truth: &[f32],
+        k: usize,
+    ) -> f32 {
         let k = k.min(ground_truth.len());
 
         // Find top-k indices in ground truth

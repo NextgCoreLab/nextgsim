@@ -13,14 +13,21 @@
 
 use std::collections::HashMap;
 
-use nextgsim_she::{TierManager, ComputeNode, ComputeTier, ResourceCapacity, WorkloadScheduler, WorkloadRequirements};
-use nextgsim_nwdaf::{NwdafManager, UeMeasurement, CellLoad, Vector3 as NwdafVector3};
-use nextgsim_isac::{SensingMeasurement, SensingType, Vector3, fuse_positions, TrackingState};
-use nextgsim_fl::{FederatedAggregator, AggregationAlgorithm, ModelUpdate};
-use nextgsim_semantic::{SemanticEncoder, SemanticDecoder, EncoderConfig, ChannelQuality, SemanticTask};
+use nextgsim_agent::{
+    AgentCapabilities, AgentCoordinator, AgentId, AgentType, Intent, IntentType, ResourceLimits,
+};
 use nextgsim_ai::{TensorData, TensorShape};
-use nextgsim_nkef::{KnowledgeGraph, Entity, EntityType, NkefManager, QueryContext};
-use nextgsim_agent::{AgentCoordinator, AgentId, AgentType, AgentCapabilities, Intent, IntentType, ResourceLimits};
+use nextgsim_fl::{AggregationAlgorithm, FederatedAggregator, ModelUpdate};
+use nextgsim_isac::{fuse_positions, SensingMeasurement, SensingType, TrackingState, Vector3};
+use nextgsim_nkef::{Entity, EntityType, KnowledgeGraph, NkefManager, QueryContext};
+use nextgsim_nwdaf::{CellLoad, NwdafManager, UeMeasurement, Vector3 as NwdafVector3};
+use nextgsim_semantic::{
+    ChannelQuality, EncoderConfig, SemanticDecoder, SemanticEncoder, SemanticTask,
+};
+use nextgsim_she::{
+    ComputeNode, ComputeTier, ResourceCapacity, TierManager, WorkloadRequirements,
+    WorkloadScheduler,
+};
 
 // ============================================================================
 // SHE Integration Tests
@@ -112,7 +119,9 @@ fn test_she_workload_migration() {
 
 #[test]
 fn test_she_resource_capacity_display() {
-    let capacity = ResourceCapacity::with_tflops(10).with_memory_gb(64).with_gpus(4);
+    let capacity = ResourceCapacity::with_tflops(10)
+        .with_memory_gb(64)
+        .with_gpus(4);
     let display = format!("{}", capacity);
     assert!(display.contains("TFLOPS"));
     assert!(display.contains("GB"));
@@ -288,8 +297,14 @@ fn test_isac_tracking_state() {
     state.update(Vector3::new(20.0, 10.0, 0.0), 2.0);
 
     // After filtering, position should have moved toward measurements
-    assert!(state.position.x > 0.0, "position should advance from initial");
-    assert!(state.position.y > 0.0, "position should advance from initial");
+    assert!(
+        state.position.x > 0.0,
+        "position should advance from initial"
+    );
+    assert!(
+        state.position.y > 0.0,
+        "position should advance from initial"
+    );
 
     // Predict position at future time
     let predicted = state.predict(1.0);
@@ -356,16 +371,15 @@ fn test_fl_complete_training_round() {
 
 #[test]
 fn test_fl_with_differential_privacy() {
-    let aggregator = FederatedAggregator::new(
-        AggregationAlgorithm::FedAvg,
-        2,
-    ).with_dp_config(nextgsim_fl::DifferentialPrivacyConfig {
-        enabled: true,
-        noise_multiplier: 1.1,
-        clipping_threshold: 1.0,
-        target_epsilon: 8.0,
-        target_delta: 1e-5,
-    });
+    let aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2).with_dp_config(
+        nextgsim_fl::DifferentialPrivacyConfig {
+            enabled: true,
+            noise_multiplier: 1.1,
+            clipping_threshold: 1.0,
+            target_epsilon: 8.0,
+            target_delta: 1e-5,
+        },
+    );
 
     // DP config is applied via builder pattern
     assert!(aggregator.participant_count() == 0); // No participants yet
@@ -441,7 +455,10 @@ fn test_semantic_channel_quality_categories() {
     let excellent = ChannelQuality::new(25.0, 1000.0, 0.001);
     let poor = ChannelQuality::new(3.0, 100.0, 0.2);
 
-    assert_eq!(excellent.category(), nextgsim_semantic::ChannelCategory::Excellent);
+    assert_eq!(
+        excellent.category(),
+        nextgsim_semantic::ChannelCategory::Excellent
+    );
     assert_eq!(poor.category(), nextgsim_semantic::ChannelCategory::Poor);
 }
 
@@ -476,7 +493,7 @@ fn test_nkef_knowledge_graph_e2e() {
 
     // Search for gNBs - note: search also finds UE's "connected_gnb" property containing "gnb"
     let results = graph.search("gnb", 10);
-    assert_eq!(results.len(), 3);  // 2 gNBs + 1 UE with connected_gnb property
+    assert_eq!(results.len(), 3); // 2 gNBs + 1 UE with connected_gnb property
 
     // Search for specific building
     let building_a = graph.search("Building A", 10);
@@ -581,11 +598,8 @@ fn test_agent_token_validation() {
     let mut coordinator = AgentCoordinator::new();
 
     let agent_id = AgentId::new("validated-agent");
-    let token = coordinator.register_agent(
-        agent_id,
-        AgentType::Mobility,
-        AgentCapabilities::default(),
-    );
+    let token =
+        coordinator.register_agent(agent_id, AgentType::Mobility, AgentCapabilities::default());
 
     // Validate the token
     let registration = coordinator.validate_token(&token.token);
@@ -618,12 +632,14 @@ fn test_semantic_with_channel_adaptation() {
 
     // Good channel scenario
     let good_channel = ChannelQuality::new(20.0, 1000.0, 0.01);
-    let good_features = encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &good_channel);
+    let good_features =
+        encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &good_channel);
     let good_decoded = decoder.decode(&good_features);
 
     // Poor channel scenario
     let poor_channel = ChannelQuality::new(5.0, 100.0, 0.1);
-    let poor_features = encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &poor_channel);
+    let poor_features =
+        encoder.adaptive_encode(&data, SemanticTask::ImageClassification, &poor_channel);
     let poor_decoded = decoder.decode(&poor_features);
 
     // Both should produce valid outputs

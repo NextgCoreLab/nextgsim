@@ -124,11 +124,18 @@ pub struct ComputeNode {
 
 impl ComputeNode {
     /// Creates a new compute node
-    pub fn new(id: u32, name: impl Into<String>, tier: ComputeTier, capacity: ResourceCapacity) -> Self {
+    pub fn new(
+        id: u32,
+        name: impl Into<String>,
+        tier: ComputeTier,
+        capacity: ResourceCapacity,
+    ) -> Self {
         // Set default capabilities based on tier
         let capabilities = match tier {
             ComputeTier::LocalEdge => vec![ComputeCapability::Inference],
-            ComputeTier::RegionalEdge => vec![ComputeCapability::Inference, ComputeCapability::FineTuning],
+            ComputeTier::RegionalEdge => {
+                vec![ComputeCapability::Inference, ComputeCapability::FineTuning]
+            }
             ComputeTier::CoreCloud => vec![
                 ComputeCapability::Inference,
                 ComputeCapability::FineTuning,
@@ -152,12 +159,16 @@ impl ComputeNode {
 
     /// Returns the available compute capacity (FLOPS)
     pub fn available_compute(&self) -> u64 {
-        self.capacity.compute_flops.saturating_sub(self.usage.compute_flops)
+        self.capacity
+            .compute_flops
+            .saturating_sub(self.usage.compute_flops)
     }
 
     /// Returns the available memory (bytes)
     pub fn available_memory(&self) -> u64 {
-        self.capacity.memory_bytes.saturating_sub(self.usage.memory_bytes)
+        self.capacity
+            .memory_bytes
+            .saturating_sub(self.usage.memory_bytes)
     }
 
     /// Returns the compute utilization (0.0 to 1.0)
@@ -228,12 +239,12 @@ impl ComputeNode {
 
         // Simplified latency model based on tier distance
         match (self.tier, target_tier) {
-            (ComputeTier::LocalEdge, ComputeTier::RegionalEdge) |
-            (ComputeTier::RegionalEdge, ComputeTier::LocalEdge) => 5, // 5ms between adjacent tiers
-            (ComputeTier::RegionalEdge, ComputeTier::CoreCloud) |
-            (ComputeTier::CoreCloud, ComputeTier::RegionalEdge) => 15, // 15ms to core
-            (ComputeTier::LocalEdge, ComputeTier::CoreCloud) |
-            (ComputeTier::CoreCloud, ComputeTier::LocalEdge) => 25, // 25ms edge-to-core
+            (ComputeTier::LocalEdge, ComputeTier::RegionalEdge)
+            | (ComputeTier::RegionalEdge, ComputeTier::LocalEdge) => 5, // 5ms between adjacent tiers
+            (ComputeTier::RegionalEdge, ComputeTier::CoreCloud)
+            | (ComputeTier::CoreCloud, ComputeTier::RegionalEdge) => 15, // 15ms to core
+            (ComputeTier::LocalEdge, ComputeTier::CoreCloud)
+            | (ComputeTier::CoreCloud, ComputeTier::LocalEdge) => 25, // 25ms edge-to-core
             _ => 0,
         }
     }
@@ -277,25 +288,37 @@ impl TierManager {
     /// Gets a node by ID
     pub fn get_node(&self, node_id: u32) -> Option<&ComputeNode> {
         self.node_by_id.get(&node_id).and_then(|(tier, index)| {
-            self.nodes_by_tier.get(tier).and_then(|nodes| nodes.get(*index))
+            self.nodes_by_tier
+                .get(tier)
+                .and_then(|nodes| nodes.get(*index))
         })
     }
 
     /// Gets a mutable node by ID
     pub fn get_node_mut(&mut self, node_id: u32) -> Option<&mut ComputeNode> {
         if let Some(&(tier, index)) = self.node_by_id.get(&node_id) {
-            return self.nodes_by_tier.get_mut(&tier).and_then(|nodes| nodes.get_mut(index));
+            return self
+                .nodes_by_tier
+                .get_mut(&tier)
+                .and_then(|nodes| nodes.get_mut(index));
         }
         None
     }
 
     /// Gets all nodes in a tier
     pub fn nodes_in_tier(&self, tier: ComputeTier) -> &[ComputeNode] {
-        self.nodes_by_tier.get(&tier).map(std::vec::Vec::as_slice).unwrap_or(&[])
+        self.nodes_by_tier
+            .get(&tier)
+            .map(std::vec::Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Gets all available nodes in a tier that support a capability
-    pub fn available_nodes(&self, tier: ComputeTier, capability: ComputeCapability) -> Vec<&ComputeNode> {
+    pub fn available_nodes(
+        &self,
+        tier: ComputeTier,
+        capability: ComputeCapability,
+    ) -> Vec<&ComputeNode> {
         self.nodes_by_tier
             .get(&tier)
             .map(|nodes| {
@@ -329,16 +352,16 @@ impl TierManager {
         self.nodes_by_tier
             .get(&tier)
             .map(|nodes| {
-                nodes.iter().fold(ResourceCapacity::default(), |acc, node| {
-                    ResourceCapacity {
+                nodes
+                    .iter()
+                    .fold(ResourceCapacity::default(), |acc, node| ResourceCapacity {
                         compute_flops: acc.compute_flops + node.capacity.compute_flops,
                         memory_bytes: acc.memory_bytes + node.capacity.memory_bytes,
                         gpu_count: acc.gpu_count + node.capacity.gpu_count,
                         npu_count: acc.npu_count + node.capacity.npu_count,
                         tpu_count: acc.tpu_count + node.capacity.tpu_count,
                         fpga_count: acc.fpga_count + node.capacity.fpga_count,
-                    }
-                })
+                    })
             })
             .expect("value expected")
     }
@@ -348,13 +371,13 @@ impl TierManager {
         self.nodes_by_tier
             .get(&tier)
             .map(|nodes| {
-                nodes.iter().fold(ResourceUsage::default(), |acc, node| {
-                    ResourceUsage {
+                nodes
+                    .iter()
+                    .fold(ResourceUsage::default(), |acc, node| ResourceUsage {
                         compute_flops: acc.compute_flops + node.usage.compute_flops,
                         memory_bytes: acc.memory_bytes + node.usage.memory_bytes,
                         active_workloads: acc.active_workloads + node.usage.active_workloads,
-                    }
-                })
+                    })
             })
             .expect("value expected")
     }
@@ -417,7 +440,7 @@ mod tests {
 
     fn test_capacity() -> ResourceCapacity {
         ResourceCapacity {
-            compute_flops: 1_000_000_000_000, // 1 TFLOPS
+            compute_flops: 1_000_000_000_000,     // 1 TFLOPS
             memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GB
             gpu_count: 1,
             npu_count: 0,
@@ -441,9 +464,18 @@ mod tests {
 
     #[test]
     fn test_capability_minimum_tier() {
-        assert_eq!(ComputeCapability::Inference.minimum_tier(), ComputeTier::LocalEdge);
-        assert_eq!(ComputeCapability::FineTuning.minimum_tier(), ComputeTier::RegionalEdge);
-        assert_eq!(ComputeCapability::Training.minimum_tier(), ComputeTier::CoreCloud);
+        assert_eq!(
+            ComputeCapability::Inference.minimum_tier(),
+            ComputeTier::LocalEdge
+        );
+        assert_eq!(
+            ComputeCapability::FineTuning.minimum_tier(),
+            ComputeTier::RegionalEdge
+        );
+        assert_eq!(
+            ComputeCapability::Training.minimum_tier(),
+            ComputeTier::CoreCloud
+        );
     }
 
     #[test]
@@ -494,9 +526,24 @@ mod tests {
     fn test_tier_manager() {
         let mut manager = TierManager::new();
 
-        manager.add_node(ComputeNode::new(1, "edge-1", ComputeTier::LocalEdge, test_capacity()));
-        manager.add_node(ComputeNode::new(2, "edge-2", ComputeTier::LocalEdge, test_capacity()));
-        manager.add_node(ComputeNode::new(3, "regional-1", ComputeTier::RegionalEdge, test_capacity()));
+        manager.add_node(ComputeNode::new(
+            1,
+            "edge-1",
+            ComputeTier::LocalEdge,
+            test_capacity(),
+        ));
+        manager.add_node(ComputeNode::new(
+            2,
+            "edge-2",
+            ComputeTier::LocalEdge,
+            test_capacity(),
+        ));
+        manager.add_node(ComputeNode::new(
+            3,
+            "regional-1",
+            ComputeTier::RegionalEdge,
+            test_capacity(),
+        ));
 
         let counts = manager.node_counts();
         assert_eq!(counts.get(&ComputeTier::LocalEdge), Some(&2));

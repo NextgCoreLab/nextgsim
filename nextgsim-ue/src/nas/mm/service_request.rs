@@ -384,14 +384,12 @@ impl ServiceRequestProcedure {
                 backoff_secs: None,
                 clear_guti: true,
             },
-            MmCause::TrackingAreaNotAllowed | MmCause::NoSuitableCellsInTa => {
-                ServiceRejectResult {
-                    new_sub_state: MmSubState::DeregisteredLimitedService,
-                    new_update_status: Some(UpdateStatus::RoamingNotAllowed),
-                    backoff_secs: None,
-                    clear_guti: false,
-                }
-            }
+            MmCause::TrackingAreaNotAllowed | MmCause::NoSuitableCellsInTa => ServiceRejectResult {
+                new_sub_state: MmSubState::DeregisteredLimitedService,
+                new_update_status: Some(UpdateStatus::RoamingNotAllowed),
+                backoff_secs: None,
+                clear_guti: false,
+            },
             MmCause::Congestion => ServiceRejectResult {
                 new_sub_state: MmSubState::RegisteredAttemptingRegistrationUpdate,
                 new_update_status: Some(UpdateStatus::NotUpdated),
@@ -431,10 +429,7 @@ mod tests {
     use nextgsim_nas::messages::mm::MobileIdentityType;
 
     fn make_tmsi() -> Ie5gsMobileIdentity {
-        Ie5gsMobileIdentity::new(
-            MobileIdentityType::Tmsi,
-            vec![0xF4, 0x01, 0x02, 0x03, 0x04],
-        )
+        Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, vec![0xF4, 0x01, 0x02, 0x03, 0x04])
     }
 
     fn make_ng_ksi() -> NasKeySetIdentifier {
@@ -478,10 +473,7 @@ mod tests {
             None,
         );
 
-        assert!(matches!(
-            result,
-            Err(ServiceRequestError::NotRegistered(_))
-        ));
+        assert!(matches!(result, Err(ServiceRequestError::NotRegistered(_))));
     }
 
     #[test]
@@ -498,10 +490,7 @@ mod tests {
             None,
         );
 
-        assert!(matches!(
-            result,
-            Err(ServiceRequestError::AlreadyConnected)
-        ));
+        assert!(matches!(result, Err(ServiceRequestError::AlreadyConnected)));
     }
 
     #[test]
@@ -545,7 +534,10 @@ mod tests {
 
         assert!(result.is_ok());
         let accept_result = result.unwrap();
-        assert_eq!(accept_result.new_sub_state, MmSubState::RegisteredNormalService);
+        assert_eq!(
+            accept_result.new_sub_state,
+            MmSubState::RegisteredNormalService
+        );
         assert_eq!(accept_result.new_cm_state, CmState::Connected);
         assert!(!proc.t3517.is_running());
     }
@@ -556,10 +548,7 @@ mod tests {
         let accept = ServiceAccept::new();
         let result = proc.receive_service_accept(&accept, MmState::Registered);
 
-        assert!(matches!(
-            result,
-            Err(ServiceRequestError::InvalidState(_))
-        ));
+        assert!(matches!(result, Err(ServiceRequestError::InvalidState(_))));
     }
 
     #[test]

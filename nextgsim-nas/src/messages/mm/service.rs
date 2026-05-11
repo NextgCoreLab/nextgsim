@@ -480,8 +480,8 @@ impl ServiceReject {
     /// Decode from bytes (after header has been parsed)
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, ServiceError> {
         // 5GMM cause (mandatory, Type 3 - 1 byte)
-        let mm_cause = Ie5gMmCause::decode(buf)
-            .map_err(|e| ServiceError::InvalidIeValue(e.to_string()))?;
+        let mm_cause =
+            Ie5gMmCause::decode(buf).map_err(|e| ServiceError::InvalidIeValue(e.to_string()))?;
 
         let mut msg = Self {
             mm_cause,
@@ -585,7 +585,6 @@ impl ServiceReject {
     }
 }
 
-
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -627,10 +626,8 @@ mod tests {
 
     #[test]
     fn test_service_request_with_optional_ies() {
-        let tmsi = Ie5gsMobileIdentity::new(
-            MobileIdentityType::Tmsi,
-            vec![0xF4, 0x01, 0x02, 0x03, 0x04],
-        );
+        let tmsi =
+            Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, vec![0xF4, 0x01, 0x02, 0x03, 0x04]);
         let mut msg = ServiceRequest::new(
             NasKeySetIdentifier::new(SecurityContextType::Native, 2),
             IeServiceType::new(ServiceType::Signalling),
@@ -689,7 +686,7 @@ mod tests {
         assert_eq!(buf[0], 0x7E); // EPD: Mobility Management
         assert_eq!(buf[1], 0x00); // Security header type: Not protected
         assert_eq!(buf[2], 0x4D); // Message type: Service Reject
-        assert_eq!(buf[3], 22);   // 5GMM Cause: Congestion
+        assert_eq!(buf[3], 22); // 5GMM Cause: Congestion
 
         // Decode and verify
         let decoded = ServiceReject::decode(&mut &buf[3..]).unwrap();
@@ -760,7 +757,10 @@ mod tests {
 
     #[test]
     fn test_message_types() {
-        assert_eq!(ServiceRequest::message_type(), MmMessageType::ServiceRequest);
+        assert_eq!(
+            ServiceRequest::message_type(),
+            MmMessageType::ServiceRequest
+        );
         assert_eq!(ServiceAccept::message_type(), MmMessageType::ServiceAccept);
         assert_eq!(ServiceReject::message_type(), MmMessageType::ServiceReject);
     }

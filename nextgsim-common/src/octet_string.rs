@@ -396,10 +396,7 @@ mod tests {
     fn test_from_u64() {
         let os = OctetString::from_u64(0x123456789ABCDEF0);
         assert_eq!(os.len(), 8);
-        assert_eq!(
-            os.data(),
-            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]
-        );
+        assert_eq!(os.data(), &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]);
     }
 
     #[test]
@@ -460,10 +457,7 @@ mod tests {
     fn test_append_u64() {
         let mut os = OctetString::new();
         os.append_u64(0x123456789ABCDEF0);
-        assert_eq!(
-            os.data(),
-            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]
-        );
+        assert_eq!(os.data(), &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]);
     }
 
     #[test]

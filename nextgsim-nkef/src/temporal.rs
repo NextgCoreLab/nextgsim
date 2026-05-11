@@ -78,8 +78,7 @@ impl TemporalRelationship {
 
     /// Returns true if this relationship is valid at the given timestamp.
     pub fn is_valid_at(&self, timestamp: Timestamp) -> bool {
-        timestamp >= self.valid_from
-            && self.valid_to.is_none_or(|end| timestamp < end)
+        timestamp >= self.valid_from && self.valid_to.is_none_or(|end| timestamp < end)
     }
 
     /// Returns true if this relationship is currently valid (no end time or end is in the future).
@@ -265,8 +264,7 @@ impl TemporalRelationshipStore {
         self.relationships
             .iter()
             .filter(|r| {
-                (r.source_id == entity_id || r.target_id == entity_id)
-                    && r.is_valid_at(timestamp)
+                (r.source_id == entity_id || r.target_id == entity_id) && r.is_valid_at(timestamp)
             })
             .collect()
     }
@@ -275,9 +273,7 @@ impl TemporalRelationshipStore {
     pub fn active_for_entity(&self, entity_id: &str) -> Vec<&TemporalRelationship> {
         self.relationships
             .iter()
-            .filter(|r| {
-                (r.source_id == entity_id || r.target_id == entity_id) && r.is_active()
-            })
+            .filter(|r| (r.source_id == entity_id || r.target_id == entity_id) && r.is_active())
             .collect()
     }
 
@@ -365,11 +361,7 @@ impl EntityHistoryStore {
         for (key, new_val) in new_properties {
             let old_val = old_properties.get(key);
             if old_val.map(|v| v != new_val).unwrap_or(true) {
-                history.record_change(
-                    key.clone(),
-                    old_val.cloned(),
-                    Some(new_val.clone()),
-                );
+                history.record_change(key.clone(), old_val.cloned(), Some(new_val.clone()));
             }
         }
 
@@ -424,13 +416,8 @@ mod tests {
 
     #[test]
     fn test_temporal_relationship_expire() {
-        let mut rel = TemporalRelationship::with_validity(
-            "ue-001",
-            "gnb-001",
-            "connected_to",
-            100,
-            None,
-        );
+        let mut rel =
+            TemporalRelationship::with_validity("ue-001", "gnb-001", "connected_to", 100, None);
 
         assert!(rel.is_valid_at(1000));
         rel.expire_at(500);
@@ -443,13 +430,25 @@ mod tests {
         let mut store = TemporalRelationshipStore::new();
 
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-001", "connected_to", 100, Some(200),
+            "ue-001",
+            "gnb-001",
+            "connected_to",
+            100,
+            Some(200),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-002", "connected_to", 200, Some(300),
+            "ue-001",
+            "gnb-002",
+            "connected_to",
+            200,
+            Some(300),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-002", "gnb-001", "connected_to", 100, None,
+            "ue-002",
+            "gnb-001",
+            "connected_to",
+            100,
+            None,
         ));
 
         let at_150 = store.at_time(150);
@@ -464,13 +463,25 @@ mod tests {
         let mut store = TemporalRelationshipStore::new();
 
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-001", "connected_to", 100, Some(200),
+            "ue-001",
+            "gnb-001",
+            "connected_to",
+            100,
+            Some(200),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-002", "connected_to", 200, Some(300),
+            "ue-001",
+            "gnb-002",
+            "connected_to",
+            200,
+            Some(300),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-002", "gnb-001", "connected_to", 100, None,
+            "ue-002",
+            "gnb-001",
+            "connected_to",
+            100,
+            None,
         ));
 
         let ue1_rels = store.for_entity("ue-001");
@@ -486,10 +497,18 @@ mod tests {
         let mut store = TemporalRelationshipStore::new();
 
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-001", "connected_to", 100, None,
+            "ue-001",
+            "gnb-001",
+            "connected_to",
+            100,
+            None,
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-002", "served_by", 100, None,
+            "ue-001",
+            "gnb-002",
+            "served_by",
+            100,
+            None,
         ));
 
         assert_eq!(store.active_count(), 2);
@@ -502,13 +521,25 @@ mod tests {
         let mut store = TemporalRelationshipStore::new();
 
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-001", "connected_to", 100, Some(200),
+            "ue-001",
+            "gnb-001",
+            "connected_to",
+            100,
+            Some(200),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-002", "connected_to", 200, Some(300),
+            "ue-001",
+            "gnb-002",
+            "connected_to",
+            200,
+            Some(300),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-002", "gnb-001", "connected_to", 100, None,
+            "ue-002",
+            "gnb-001",
+            "connected_to",
+            100,
+            None,
         ));
 
         assert_eq!(store.total_count(), 3);
@@ -523,7 +554,12 @@ mod tests {
 
         history.record_change_at("status", None, Some("active".to_string()), 100);
         history.record_change_at("load", None, Some("50%".to_string()), 100);
-        history.record_change_at("load", Some("50%".to_string()), Some("75%".to_string()), 200);
+        history.record_change_at(
+            "load",
+            Some("50%".to_string()),
+            Some("75%".to_string()),
+            200,
+        );
 
         assert_eq!(history.change_count(), 3);
     }
@@ -534,8 +570,18 @@ mod tests {
 
         history.record_change_at("status", None, Some("active".to_string()), 100);
         history.record_change_at("load", None, Some("50%".to_string()), 100);
-        history.record_change_at("load", Some("50%".to_string()), Some("75%".to_string()), 200);
-        history.record_change_at("status", Some("active".to_string()), Some("degraded".to_string()), 300);
+        history.record_change_at(
+            "load",
+            Some("50%".to_string()),
+            Some("75%".to_string()),
+            200,
+        );
+        history.record_change_at(
+            "status",
+            Some("active".to_string()),
+            Some("degraded".to_string()),
+            300,
+        );
 
         let state_at_150 = history.state_at(150);
         assert_eq!(state_at_150.get("status"), Some(&"active".to_string()));
@@ -556,7 +602,12 @@ mod tests {
 
         history.record_change_at("status", None, Some("active".to_string()), 100);
         history.record_change_at("load", None, Some("50%".to_string()), 200);
-        history.record_change_at("load", Some("50%".to_string()), Some("75%".to_string()), 300);
+        history.record_change_at(
+            "load",
+            Some("50%".to_string()),
+            Some("75%".to_string()),
+            300,
+        );
 
         let changes = history.changes_in_range(150, 350);
         assert_eq!(changes.len(), 2);
@@ -568,7 +619,12 @@ mod tests {
 
         history.record_change_at("status", None, Some("active".to_string()), 100);
         history.record_change_at("load", None, Some("50%".to_string()), 100);
-        history.record_change_at("load", Some("50%".to_string()), Some("75%".to_string()), 200);
+        history.record_change_at(
+            "load",
+            Some("50%".to_string()),
+            Some("75%".to_string()),
+            200,
+        );
 
         let load_changes = history.changes_for_key("load");
         assert_eq!(load_changes.len(), 2);
@@ -608,13 +664,25 @@ mod tests {
         let mut store = TemporalRelationshipStore::new();
 
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-001", "connected_to", 100, Some(200),
+            "ue-001",
+            "gnb-001",
+            "connected_to",
+            100,
+            Some(200),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-002", "connected_to", 300, Some(400),
+            "ue-001",
+            "gnb-002",
+            "connected_to",
+            300,
+            Some(400),
         ));
         store.add(TemporalRelationship::with_validity(
-            "ue-001", "gnb-003", "connected_to", 500, None,
+            "ue-001",
+            "gnb-003",
+            "connected_to",
+            500,
+            None,
         ));
 
         // Range that overlaps first two relationships

@@ -14,14 +14,13 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::tasks::{
-    GnbTaskBase, GtpMessage, RlsMessage, RrcMessage, Task, TaskMessage,
-};
+use crate::tasks::{GnbTaskBase, GtpMessage, RlsMessage, RrcMessage, Task, TaskMessage};
 use nextgsim_common::OctetString;
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
-    codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck, RlsMessage as RlsProtocolMessage,
-    RlsPduTransmission, RlsPduTransmissionAck, RrcChannel, Vector3,
+    codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
+    RlsMessage as RlsProtocolMessage, RlsPduTransmission, RlsPduTransmissionAck, RrcChannel,
+    Vector3,
 };
 
 /// Default RLS port for gNB
@@ -115,7 +114,7 @@ impl RlsTask {
     /// Handles a received RLS message from the network
     async fn handle_receive_rls_message(&mut self, data: OctetString, source: SocketAddr) {
         let bytes = Bytes::copy_from_slice(data.data());
-        
+
         match codec::decode(&bytes) {
             Ok(msg) => {
                 self.process_rls_message(msg, source).await;
@@ -130,7 +129,8 @@ impl RlsTask {
     async fn process_rls_message(&mut self, msg: RlsProtocolMessage, source: SocketAddr) {
         match msg {
             RlsProtocolMessage::Heartbeat(heartbeat) => {
-                self.handle_heartbeat(heartbeat.sti, source, &heartbeat).await;
+                self.handle_heartbeat(heartbeat.sti, source, &heartbeat)
+                    .await;
             }
             RlsProtocolMessage::PduTransmission(pdu) => {
                 self.handle_pdu_transmission(pdu.sti, source, &pdu).await;
@@ -162,11 +162,14 @@ impl RlsTask {
                     let ue_id_i32 = ue_id as i32;
                     self.ue_addresses.insert(ue_id_i32, source);
                     self.sti_to_ue_id.insert(sti, ue_id_i32);
-                    
+
                     // Notify RRC task about signal detection
-                    if let Err(e) = self.task_base.rrc_tx.send(RrcMessage::SignalDetected { 
-                        ue_id: ue_id_i32 
-                    }).await {
+                    if let Err(e) = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::SignalDetected { ue_id: ue_id_i32 })
+                        .await
+                    {
                         error!("Failed to send SignalDetected to RRC: {}", e);
                     }
                 }
@@ -212,10 +215,7 @@ impl RlsTask {
 
         // Queue acknowledgment if PDU ID is non-zero
         if pdu.pdu_id != 0 {
-            self.pending_acks
-                .entry(ue_id)
-                .or_default()
-                .push(pdu.pdu_id);
+            self.pending_acks.entry(ue_id).or_default().push(pdu.pdu_id);
         }
 
         match pdu.pdu_type {
@@ -291,7 +291,9 @@ impl RlsTask {
         for sdu in reassembled_sdus {
             debug!(
                 "RLC reassembled SDU: ue_id={}, psi={}, len={}",
-                ue_id, psi, sdu.len()
+                ue_id,
+                psi,
+                sdu.len()
             );
             let data = OctetString::from_slice(&sdu);
             let msg = GtpMessage::DataPduDelivery {
@@ -440,17 +442,18 @@ impl RlsTask {
             if let GnbTrackerEvent::UeLost { ue_id } = event {
                 let ue_id_i32 = ue_id as i32;
                 info!("UE[{}] lost due to heartbeat timeout", ue_id_i32);
-                
+
                 self.ue_addresses.remove(&ue_id_i32);
                 self.pending_acks.remove(&ue_id_i32);
-                
+
                 // Find and remove STI mapping
-                let sti_to_remove: Vec<u64> = self.sti_to_ue_id
+                let sti_to_remove: Vec<u64> = self
+                    .sti_to_ue_id
                     .iter()
                     .filter(|(_, &id)| id == ue_id_i32)
                     .map(|(&sti, _)| sti)
                     .collect();
-                
+
                 for sti in sti_to_remove {
                     self.sti_to_ue_id.remove(&sti);
                 }
@@ -463,7 +466,7 @@ impl RlsTask {
     async fn receive_udp(&self) -> Option<(OctetString, SocketAddr)> {
         let socket = self.socket.as_ref()?;
         let mut buf = vec![0u8; UDP_BUFFER_SIZE];
-        
+
         match socket.recv_from(&mut buf).await {
             Ok((len, addr)) => {
                 buf.truncate(len);
@@ -571,7 +574,10 @@ impl Task for RlsTask {
             }
         }
 
-        info!("RLS task stopped with {} tracked UEs", self.cell_tracker.ue_count());
+        info!(
+            "RLS task stopped with {} tracked UEs",
+            self.cell_tracker.ue_count()
+        );
     }
 }
 
@@ -593,7 +599,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,
@@ -610,7 +618,7 @@ mod tests {
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
         let task = RlsTask::new(task_base);
-        
+
         assert_eq!(task.sti, 0x000000010);
         assert!(task.ue_addresses.is_empty());
         assert!(task.sti_to_ue_id.is_empty());
@@ -621,10 +629,10 @@ mod tests {
         let config = test_config();
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
-        
+
         let bind_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let task = RlsTask::with_bind_address(task_base, bind_addr);
-        
+
         assert_eq!(task.bind_address, bind_addr);
     }
 }

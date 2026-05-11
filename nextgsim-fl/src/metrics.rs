@@ -81,13 +81,15 @@ impl ConvergenceDetector {
             return false;
         }
 
-        let first_half: f32 = self.loss_history
+        let first_half: f32 = self
+            .loss_history
             .iter()
             .take(self.window_size / 2)
             .sum::<f32>()
             / (self.window_size / 2) as f32;
 
-        let second_half: f32 = self.loss_history
+        let second_half: f32 = self
+            .loss_history
             .iter()
             .skip(self.window_size / 2)
             .sum::<f32>()
@@ -177,8 +179,8 @@ impl TrainingDashboard {
 
         // Update reliability (exponential moving average)
         let alpha = 0.1; // Smoothing factor
-        contribution.reliability = alpha * if completed { 1.0 } else { 0.0 }
-            + (1.0 - alpha) * contribution.reliability;
+        contribution.reliability =
+            alpha * if completed { 1.0 } else { 0.0 } + (1.0 - alpha) * contribution.reliability;
     }
 
     /// Returns whether training has converged
@@ -195,9 +197,17 @@ impl TrainingDashboard {
         let recent_rounds = self.round_history.len().min(10);
         let recent = &self.round_history[self.round_history.len() - recent_rounds..];
 
-        let first_avg = recent.iter().take(recent_rounds / 2).map(|r| r.avg_loss).sum::<f32>()
+        let first_avg = recent
+            .iter()
+            .take(recent_rounds / 2)
+            .map(|r| r.avg_loss)
+            .sum::<f32>()
             / (recent_rounds / 2) as f32;
-        let second_avg = recent.iter().skip(recent_rounds / 2).map(|r| r.avg_loss).sum::<f32>()
+        let second_avg = recent
+            .iter()
+            .skip(recent_rounds / 2)
+            .map(|r| r.avg_loss)
+            .sum::<f32>()
             / (recent_rounds - recent_rounds / 2) as f32;
 
         if second_avg < first_avg * 0.95 {
@@ -220,11 +230,7 @@ impl TrainingDashboard {
     /// Returns training summary statistics
     pub fn summary(&self) -> TrainingSummary {
         let total_rounds = self.round_history.len() as u64;
-        let current_loss = self
-            .round_history
-            .last()
-            .map(|r| r.avg_loss)
-            .unwrap_or(0.0);
+        let current_loss = self.round_history.last().map(|r| r.avg_loss).unwrap_or(0.0);
 
         let best_loss = self
             .round_history
@@ -238,7 +244,10 @@ impl TrainingDashboard {
         let avg_reliability = if num_participants == 0 {
             0.0
         } else {
-            self.contributions.values().map(|c| c.reliability).sum::<f32>()
+            self.contributions
+                .values()
+                .map(|c| c.reliability)
+                .sum::<f32>()
                 / num_participants as f32
         };
 

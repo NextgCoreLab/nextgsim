@@ -241,7 +241,11 @@ impl SecuredHeader {
     pub const SIZE: usize = 7;
 
     /// Create a new secured header
-    pub fn new(security_header_type: SecurityHeaderType, mac: [u8; 4], sequence_number: u8) -> Self {
+    pub fn new(
+        security_header_type: SecurityHeaderType,
+        mac: [u8; 4],
+        sequence_number: u8,
+    ) -> Self {
         Self {
             epd: ExtendedProtocolDiscriminator::MobilityManagement,
             security_header_type,
@@ -520,7 +524,10 @@ mod tests {
 
         match header {
             NasHeader::Secured(h) => {
-                assert_eq!(h.security_header_type, SecurityHeaderType::IntegrityProtected);
+                assert_eq!(
+                    h.security_header_type,
+                    SecurityHeaderType::IntegrityProtected
+                );
                 assert_eq!(h.mac, [0xAA, 0xBB, 0xCC, 0xDD]);
                 assert_eq!(h.sequence_number, 0x10);
             }

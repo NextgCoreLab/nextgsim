@@ -42,10 +42,10 @@ impl XrFrameRate {
     /// Returns the DRX cycle length aligned with frame period
     pub fn aligned_drx_cycle_ms(&self) -> u16 {
         match self {
-            XrFrameRate::Fps30 => 32,   // Closest power of 2: 32ms
-            XrFrameRate::Fps60 => 16,   // 16ms matches exactly
-            XrFrameRate::Fps90 => 10,   // 10ms (slight mismatch, but good for power)
-            XrFrameRate::Fps120 => 8,   // 8ms matches exactly
+            XrFrameRate::Fps30 => 32, // Closest power of 2: 32ms
+            XrFrameRate::Fps60 => 16, // 16ms matches exactly
+            XrFrameRate::Fps90 => 10, // 10ms (slight mismatch, but good for power)
+            XrFrameRate::Fps120 => 8, // 8ms matches exactly
             XrFrameRate::Variable => 16,
         }
     }
@@ -77,7 +77,10 @@ impl XrTrafficType {
 
     /// Returns whether this traffic type requires bidirectional optimization
     pub fn is_bidirectional(&self) -> bool {
-        matches!(self, XrTrafficType::SplitRendering | XrTrafficType::ArOverlay)
+        matches!(
+            self,
+            XrTrafficType::SplitRendering | XrTrafficType::ArOverlay
+        )
     }
 }
 
@@ -164,10 +167,10 @@ impl XrCDrxConfig {
     /// Returns the optimal QFI (QoS Flow Identifier) for this XR traffic
     pub fn recommended_qfi(&self) -> u8 {
         match self.traffic_type {
-            XrTrafficType::CloudGaming => 20,      // GBR with ultra-low latency
-            XrTrafficType::VrStreaming => 21,      // GBR with high throughput
-            XrTrafficType::ArOverlay => 22,        // GBR with moderate latency
-            XrTrafficType::SplitRendering => 19,   // GBR with minimum latency
+            XrTrafficType::CloudGaming => 20,    // GBR with ultra-low latency
+            XrTrafficType::VrStreaming => 21,    // GBR with high throughput
+            XrTrafficType::ArOverlay => 22,      // GBR with moderate latency
+            XrTrafficType::SplitRendering => 19, // GBR with minimum latency
         }
     }
 }
@@ -290,7 +293,11 @@ impl XrCDrxManager {
         }
 
         let avg_inter_arrival = inter_arrivals.iter().sum::<u64>() / inter_arrivals.len() as u64;
-        self.predicted_arrivals.last().copied().unwrap_or(current_time_ms) + avg_inter_arrival
+        self.predicted_arrivals
+            .last()
+            .copied()
+            .unwrap_or(current_time_ms)
+            + avg_inter_arrival
     }
 
     /// Calculates when to wake up for the next frame (with jitter compensation)
@@ -536,14 +543,23 @@ mod tests {
 
     #[test]
     fn test_all_frame_rates() {
-        for frame_rate in [XrFrameRate::Fps30, XrFrameRate::Fps60, XrFrameRate::Fps90, XrFrameRate::Fps120] {
+        for frame_rate in [
+            XrFrameRate::Fps30,
+            XrFrameRate::Fps60,
+            XrFrameRate::Fps90,
+            XrFrameRate::Fps120,
+        ] {
             let mut config = XrCDrxConfig::for_frame_rate(frame_rate, XrTrafficType::VrStreaming);
             // VrStreaming has 10ms jitter tolerance, but Fps90 has 10ms DRX cycle
             // Need to reduce jitter buffer for Fps90 and Fps120
             if matches!(frame_rate, XrFrameRate::Fps90 | XrFrameRate::Fps120) {
                 config.jitter_buffer_ms = config.drx_cycle_ms as f32 * 0.8;
             }
-            assert!(config.validate().is_ok(), "Validation failed for {:?}", frame_rate);
+            assert!(
+                config.validate().is_ok(),
+                "Validation failed for {:?}",
+                frame_rate
+            );
             assert!(config.on_duration_ms as u16 <= config.drx_cycle_ms);
         }
     }

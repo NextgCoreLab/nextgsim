@@ -3,17 +3,16 @@
 //! Provides NR sidelink relay (UE-to-UE relay), sidelink discovery
 //! procedures, PC5 link establishment, and sidelink positioning.
 
-pub mod task;
 pub mod pc5;
 pub mod positioning;
+pub mod task;
 
-pub use task::SidelinkTask;
 pub use pc5::{
-    Pc5RrcConnection, Pc5RrcState, Pc5RadioBearerConfig,
-    Pc5Discovery, Pc5DiscoveryMode, Pc5ResourceMode,
-    Pc5DiscoveredPeer, Pc5HarqFeedback,
+    Pc5DiscoveredPeer, Pc5Discovery, Pc5DiscoveryMode, Pc5HarqFeedback, Pc5RadioBearerConfig,
+    Pc5ResourceMode, Pc5RrcConnection, Pc5RrcState,
 };
 pub use positioning::{
-    SlPrsResourceConfig, RttMeasurement, AoaMeasurement, AodMeasurement,
-    Position3D, AnchorUe, PositionEstimate, SidelinkPositioningEngine,
+    AnchorUe, AoaMeasurement, AodMeasurement, Position3D, PositionEstimate, RttMeasurement,
+    SidelinkPositioningEngine, SlPrsResourceConfig,
 };
+pub use task::SidelinkTask;

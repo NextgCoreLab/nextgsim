@@ -15,8 +15,8 @@ use nextgsim_rrc::procedures::{
     rrc_setup::{encode_rrc_setup, RrcSetupParams},
 };
 
-use crate::tasks::GutiMobileIdentity;
 use super::ue_context::RrcUeContextManager;
+use crate::tasks::GutiMobileIdentity;
 
 /// Result of processing an RRC Setup Request
 #[derive(Debug)]
@@ -395,10 +395,7 @@ impl RrcConnectionManager {
 
         info!("RRC Resume Complete for UE[{}]", ue_id);
 
-        Some(RrcResumeCompleteResult {
-            ue_id,
-            nas_pdu,
-        })
+        Some(RrcResumeCompleteResult { ue_id, nas_pdu })
     }
 
     /// Builds an RRC Reestablishment message
@@ -413,7 +410,7 @@ impl RrcConnectionManager {
         pdu.push(0x24); // c1 choice = rrcReestablishment
         pdu.push(transaction_id);
         pdu.push(0x00); // criticalExtensions = rrcReestablishment
-        // nextHopChainingCount (3 bits, set to 0)
+                        // nextHopChainingCount (3 bits, set to 0)
         pdu.push(0x00);
         OctetString::from_slice(&pdu)
     }
@@ -430,7 +427,7 @@ impl RrcConnectionManager {
         pdu.push(0x28); // c1 choice = rrcResume
         pdu.push(transaction_id);
         pdu.push(0x00); // criticalExtensions = rrcResume
-        // Minimal masterCellGroup
+                        // Minimal masterCellGroup
         pdu.extend_from_slice(&[0x00, 0x00]);
         OctetString::from_slice(&pdu)
     }
@@ -528,10 +525,10 @@ mod tests {
     fn test_set_barred() {
         let mut mgr = RrcConnectionManager::new();
         assert!(mgr.is_barred());
-        
+
         mgr.set_barred(false);
         assert!(!mgr.is_barred());
-        
+
         mgr.set_barred(true);
         assert!(mgr.is_barred());
     }
@@ -540,7 +537,7 @@ mod tests {
     fn test_rrc_setup_request_barred() {
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
-        
+
         // Cell is barred by default
         let result = conn_mgr.process_rrc_setup_request(
             &mut ue_mgr,
@@ -549,7 +546,7 @@ mod tests {
             false,
             3, // MO_SIGNALLING
         );
-        
+
         assert!(result.is_none());
     }
 
@@ -557,22 +554,16 @@ mod tests {
     fn test_rrc_setup_request_success() {
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
-        
+
         conn_mgr.set_barred(false);
-        
-        let result = conn_mgr.process_rrc_setup_request(
-            &mut ue_mgr,
-            1,
-            0x1234567890,
-            false,
-            3,
-        );
-        
+
+        let result = conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
+
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.ue_id, 1);
         assert_eq!(result.channel, RrcChannel::DlCcch);
-        
+
         // Verify UE context was created
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert_eq!(ctx.initial_id, Some(0x1234567890));
@@ -583,27 +574,15 @@ mod tests {
     fn test_rrc_setup_request_duplicate() {
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
-        
+
         conn_mgr.set_barred(false);
-        
+
         // First request succeeds
-        let result1 = conn_mgr.process_rrc_setup_request(
-            &mut ue_mgr,
-            1,
-            0x1234567890,
-            false,
-            3,
-        );
+        let result1 = conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
         assert!(result1.is_some());
-        
+
         // Second request for same UE fails
-        let result2 = conn_mgr.process_rrc_setup_request(
-            &mut ue_mgr,
-            1,
-            0x1234567890,
-            false,
-            3,
-        );
+        let result2 = conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
         assert!(result2.is_none());
     }
 
@@ -611,33 +590,21 @@ mod tests {
     fn test_rrc_setup_complete() {
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
-        
+
         conn_mgr.set_barred(false);
-        
+
         // Setup request
-        conn_mgr.process_rrc_setup_request(
-            &mut ue_mgr,
-            1,
-            0x1234567890,
-            false,
-            3,
-        );
-        
+        conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
+
         // Setup complete
         let nas_pdu = OctetString::from_slice(&[0x7E, 0x00, 0x41]);
-        let result = conn_mgr.process_rrc_setup_complete(
-            &mut ue_mgr,
-            1,
-            0,
-            nas_pdu.clone(),
-            None,
-        );
-        
+        let result = conn_mgr.process_rrc_setup_complete(&mut ue_mgr, 1, 0, nas_pdu.clone(), None);
+
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.ue_id, 1);
         assert_eq!(result.nas_pdu, nas_pdu);
-        
+
         // Verify UE is now connected
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert!(ctx.is_connected());
@@ -647,9 +614,9 @@ mod tests {
     fn test_rrc_release() {
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
-        
+
         conn_mgr.set_barred(false);
-        
+
         // Setup
         conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
         conn_mgr.process_rrc_setup_complete(
@@ -659,14 +626,14 @@ mod tests {
             OctetString::from_slice(&[0x7E]),
             None,
         );
-        
+
         // Release
         let result = conn_mgr.initiate_rrc_release(&mut ue_mgr, 1);
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.ue_id, 1);
         assert_eq!(result.channel, RrcChannel::DlDcch);
-        
+
         // Verify UE is now releasing
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert!(!ctx.is_connected());
@@ -676,9 +643,9 @@ mod tests {
     fn test_radio_link_failure() {
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
-        
+
         conn_mgr.set_barred(false);
-        
+
         // Setup
         conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
         conn_mgr.process_rrc_setup_complete(
@@ -688,11 +655,11 @@ mod tests {
             OctetString::from_slice(&[0x7E]),
             None,
         );
-        
+
         // Radio link failure
         let result = conn_mgr.handle_radio_link_failure(&mut ue_mgr, 1);
         assert!(result);
-        
+
         // Verify UE is now releasing
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert!(!ctx.is_connected());

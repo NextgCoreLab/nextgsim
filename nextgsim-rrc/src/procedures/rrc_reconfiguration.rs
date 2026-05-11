@@ -67,7 +67,6 @@ pub struct RrcReconfigurationData {
     pub full_config: bool,
 }
 
-
 /// Build an RRC Reconfiguration message
 pub fn build_rrc_reconfiguration(
     params: &RrcReconfigurationParams,
@@ -108,10 +107,13 @@ pub fn build_rrc_reconfiguration(
         ),
     };
 
-    let message_type =
-        DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcReconfiguration(rrc_reconfiguration));
+    let message_type = DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcReconfiguration(
+        rrc_reconfiguration,
+    ));
 
-    Ok(DL_DCCH_Message { message: message_type })
+    Ok(DL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Build the v1530 extension for RRC Reconfiguration
@@ -197,7 +199,6 @@ pub fn parse_rrc_reconfiguration(
     })
 }
 
-
 // ============================================================================
 // RRC Reconfiguration Complete
 // ============================================================================
@@ -233,16 +234,19 @@ pub fn build_rrc_reconfiguration_complete(
 
     let rrc_reconfiguration_complete = RRCReconfigurationComplete {
         rrc_transaction_identifier: RRC_TransactionIdentifier(params.rrc_transaction_id),
-        critical_extensions: RRCReconfigurationCompleteCriticalExtensions::RrcReconfigurationComplete(
-            rrc_reconfiguration_complete_ies,
-        ),
+        critical_extensions:
+            RRCReconfigurationCompleteCriticalExtensions::RrcReconfigurationComplete(
+                rrc_reconfiguration_complete_ies,
+            ),
     };
 
     let message_type = UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::RrcReconfigurationComplete(
         rrc_reconfiguration_complete,
     ));
 
-    Ok(UL_DCCH_Message { message: message_type })
+    Ok(UL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Reconfiguration Complete from a UL-DCCH message
@@ -283,7 +287,6 @@ pub fn parse_rrc_reconfiguration_complete(
     })
 }
 
-
 // ============================================================================
 // Convenience Functions
 // ============================================================================
@@ -297,7 +300,9 @@ pub fn encode_rrc_reconfiguration(
 }
 
 /// Decode and parse an RRC Reconfiguration from bytes
-pub fn decode_rrc_reconfiguration(bytes: &[u8]) -> Result<RrcReconfigurationData, RrcReconfigurationError> {
+pub fn decode_rrc_reconfiguration(
+    bytes: &[u8],
+) -> Result<RrcReconfigurationData, RrcReconfigurationError> {
     let msg: DL_DCCH_Message = decode_rrc(bytes)?;
     parse_rrc_reconfiguration(&msg)
 }

@@ -11,7 +11,10 @@ fn main() {
 
     // Get the manifest directory (where Cargo.toml is)
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("value expected"));
-    let schema_path = manifest_dir.parent().unwrap_or(Path::new(".")).join("tools/rrc-15.6.0.asn1");
+    let schema_path = manifest_dir
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("tools/rrc-15.6.0.asn1");
 
     // Rerun if schema changes
     println!("cargo:rerun-if-changed={}", schema_path.display());

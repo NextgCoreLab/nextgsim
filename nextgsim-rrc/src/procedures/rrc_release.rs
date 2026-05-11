@@ -96,7 +96,6 @@ pub struct RrcReleaseData {
     pub wait_time: Option<u8>,
 }
 
-
 /// Build an RRC Release message
 pub fn build_rrc_release(params: &RrcReleaseParams) -> Result<DL_DCCH_Message, RrcReleaseError> {
     if params.rrc_transaction_id > 3 {
@@ -175,7 +174,9 @@ pub fn build_rrc_release(params: &RrcReleaseParams) -> Result<DL_DCCH_Message, R
 
     let message_type = DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcRelease(rrc_release));
 
-    Ok(DL_DCCH_Message { message: message_type })
+    Ok(DL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse an RRC Release from a DL-DCCH message
@@ -268,7 +269,6 @@ pub fn parse_rrc_release(msg: &DL_DCCH_Message) -> Result<RrcReleaseData, RrcRel
         wait_time,
     })
 }
-
 
 // ============================================================================
 // Convenience Functions
@@ -466,7 +466,10 @@ mod tests {
 
             let msg = build_rrc_release(&params).unwrap();
             let data = parse_rrc_release(&msg).unwrap();
-            assert_eq!(data.deprioritisation_req.unwrap().deprioritisation_timer, timer);
+            assert_eq!(
+                data.deprioritisation_req.unwrap().deprioritisation_timer,
+                timer
+            );
         }
     }
 }

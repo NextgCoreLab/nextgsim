@@ -141,16 +141,21 @@ impl SemanticPipeline {
     ///
     /// Returns compressed semantic features along with quality metrics
     pub fn encode(&mut self, input: &TensorData) -> Result<SemanticEncoding, SemanticError> {
-        let encoder = self.encoder.as_ref().ok_or_else(|| SemanticError::ModelNotLoaded {
-            model_type: "encoder".to_string(),
-        })?;
+        let encoder = self
+            .encoder
+            .as_ref()
+            .ok_or_else(|| SemanticError::ModelNotLoaded {
+                model_type: "encoder".to_string(),
+            })?;
 
         debug!("Encoding data with shape {:?}", input.shape().dims());
 
         // Run encoder inference
-        let encoded = encoder.infer(input).map_err(|e| SemanticError::EncoderError {
-            reason: format!("Inference failed: {e}"),
-        })?;
+        let encoded = encoder
+            .infer(input)
+            .map_err(|e| SemanticError::EncoderError {
+                reason: format!("Inference failed: {e}"),
+            })?;
 
         // Calculate compression ratio
         let original_size = input.len();
@@ -197,17 +202,26 @@ impl SemanticPipeline {
     }
 
     /// Decodes semantic features back to original data
-    pub fn decode(&mut self, encoding: &SemanticEncoding) -> Result<SemanticDecoding, SemanticError> {
-        let decoder = self.decoder.as_ref().ok_or_else(|| SemanticError::ModelNotLoaded {
-            model_type: "decoder".to_string(),
-        })?;
+    pub fn decode(
+        &mut self,
+        encoding: &SemanticEncoding,
+    ) -> Result<SemanticDecoding, SemanticError> {
+        let decoder = self
+            .decoder
+            .as_ref()
+            .ok_or_else(|| SemanticError::ModelNotLoaded {
+                model_type: "decoder".to_string(),
+            })?;
 
         debug!("Decoding features to shape {:?}", encoding.original_shape);
 
         // Run decoder inference
-        let decoded = decoder.infer(&encoding.features).map_err(|e| SemanticError::DecoderError {
-            reason: format!("Inference failed: {e}"),
-        })?;
+        let decoded =
+            decoder
+                .infer(&encoding.features)
+                .map_err(|e| SemanticError::DecoderError {
+                    reason: format!("Inference failed: {e}"),
+                })?;
 
         // Validate output shape matches original
         if decoded.shape().dims() != encoding.original_shape.as_slice() {
@@ -400,13 +414,12 @@ mod tests {
 
     #[test]
     fn test_builder_pattern() {
-        let builder = SemanticPipelineBuilder::new()
-            .with_config(SemanticConfig {
-                enabled: true,
-                compression_ratio: 0.1,
-                quality_threshold: 0.9,
-                ..Default::default()
-            });
+        let builder = SemanticPipelineBuilder::new().with_config(SemanticConfig {
+            enabled: true,
+            compression_ratio: 0.1,
+            quality_threshold: 0.9,
+            ..Default::default()
+        });
 
         // Can't actually build without valid model paths, but we can test the builder
         assert!(builder.config.enabled);

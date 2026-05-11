@@ -279,8 +279,9 @@ mod tests {
             0x00, 0x00, 0x40, 0x00, // ID, Flags, Fragment Offset
             0x40, 0x01, 0x00, 0x00, // TTL, Protocol (ICMP=1), Checksum
             0x0a, 0x2d, 0x00, 0x02, // Source IP: 10.45.0.2
-            0x08, 0x08, 0x08, 0x08, // Dest IP: 8.8.8.8
-            // ... payload would follow
+            0x08, 0x08, 0x08,
+            0x08, // Dest IP: 8.8.8.8
+                  // ... payload would follow
         ]
     }
 

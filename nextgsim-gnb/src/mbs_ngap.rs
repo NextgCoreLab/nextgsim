@@ -162,7 +162,8 @@ impl NgapMbsManager {
 
     /// Returns all sessions active on a given cell
     pub fn sessions_for_cell(&self, cell_id: i32) -> Vec<&GnbMbsSession> {
-        self.sessions.values()
+        self.sessions
+            .values()
             .filter(|s| s.active_cells.contains(&cell_id))
             .collect()
     }

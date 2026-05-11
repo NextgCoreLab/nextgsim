@@ -188,7 +188,10 @@ impl AmfConnection {
     ///
     /// When `AmfConnectionConfig::secondary_addresses` is non-empty a
     /// `MultihomeSctpAssociation` is used, enabling automatic path failover.
-    pub async fn connect(&mut self, config: &AmfConnectionConfig) -> Result<AmfConnectionEvent, SctpError> {
+    pub async fn connect(
+        &mut self,
+        config: &AmfConnectionConfig,
+    ) -> Result<AmfConnectionEvent, SctpError> {
         info!(
             "Connecting to AMF at {} (client_id: {}, multi-homed: {})",
             self.remote_address,
@@ -210,8 +213,7 @@ impl AmfConnection {
             AssociationKind::Single(association)
         } else {
             // Multi-homed SCTP association.
-            let mut mh_config =
-                MultihomingConfig::new(self.local_address, self.remote_address);
+            let mut mh_config = MultihomingConfig::new(self.local_address, self.remote_address);
             for &secondary in &config.secondary_addresses {
                 warn!(
                     "SCTP multi-homing: registering secondary AMF address {} (client_id: {})",
@@ -220,8 +222,7 @@ impl AmfConnection {
                 mh_config = mh_config.with_remote_address(secondary);
             }
             let association =
-                MultihomeSctpAssociation::connect(mh_config, config.sctp_config.clone())
-                    .await?;
+                MultihomeSctpAssociation::connect(mh_config, config.sctp_config.clone()).await?;
             self.local_address = association.local_addr();
             AssociationKind::Multihome(association)
         };
@@ -420,7 +421,10 @@ mod tests {
 
     #[test]
     fn test_amf_connection_state() {
-        assert_ne!(AmfConnectionState::Connecting, AmfConnectionState::Connected);
+        assert_ne!(
+            AmfConnectionState::Connecting,
+            AmfConnectionState::Connected
+        );
         assert_ne!(AmfConnectionState::Connected, AmfConnectionState::Closing);
         assert_ne!(AmfConnectionState::Closing, AmfConnectionState::Closed);
     }

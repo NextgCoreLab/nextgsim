@@ -352,7 +352,8 @@ impl GnbCellTracker {
         let dy = self.phy_location.y - ue_pos.y;
         let dz = self.phy_location.z - ue_pos.z;
 
-        let distance_sq = (dx as i64 * dx as i64 + dy as i64 * dy as i64 + dz as i64 * dz as i64) as f64;
+        let distance_sq =
+            (dx as i64 * dx as i64 + dy as i64 * dy as i64 + dz as i64 * dz as i64) as f64;
         let distance = distance_sq.sqrt() as i32;
 
         if distance == 0 {

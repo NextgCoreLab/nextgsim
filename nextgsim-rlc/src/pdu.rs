@@ -143,7 +143,10 @@ impl RlcUmPdu {
 
         let (so, data_start) = if si.has_so() {
             if buf.len() < 3 {
-                return Err(RlcError::PduTooShort { need: 3, got: buf.len() });
+                return Err(RlcError::PduTooShort {
+                    need: 3,
+                    got: buf.len(),
+                });
             }
             let so = ((buf[1] as u16) << 8) | buf[2] as u16;
             (Some(so), 3)
@@ -151,20 +154,31 @@ impl RlcUmPdu {
             (None, 1)
         };
 
-        Ok(Self { si, sn, so, data: buf[data_start..].to_vec() })
+        Ok(Self {
+            si,
+            sn,
+            so,
+            data: buf[data_start..].to_vec(),
+        })
     }
 
     /// Decode a UM PDU from bytes using a 12-bit SN field.
     pub fn decode_sn12(buf: &[u8]) -> Result<Self, RlcError> {
         if buf.len() < 2 {
-            return Err(RlcError::PduTooShort { need: 2, got: buf.len() });
+            return Err(RlcError::PduTooShort {
+                need: 2,
+                got: buf.len(),
+            });
         }
         let si = SegmentationInfo::from_u8(buf[0] >> 4)?;
         let sn = (((buf[0] & 0x0F) as u16) << 8) | buf[1] as u16;
 
         let (so, data_start) = if si.has_so() {
             if buf.len() < 4 {
-                return Err(RlcError::PduTooShort { need: 4, got: buf.len() });
+                return Err(RlcError::PduTooShort {
+                    need: 4,
+                    got: buf.len(),
+                });
             }
             let so = ((buf[2] as u16) << 8) | buf[3] as u16;
             (Some(so), 4)
@@ -172,7 +186,12 @@ impl RlcUmPdu {
             (None, 2)
         };
 
-        Ok(Self { si, sn, so, data: buf[data_start..].to_vec() })
+        Ok(Self {
+            si,
+            sn,
+            so,
+            data: buf[data_start..].to_vec(),
+        })
     }
 }
 
@@ -259,7 +278,10 @@ impl RlcAmPdu {
     /// Decode using a 12-bit SN field.
     pub fn decode_sn12(buf: &[u8]) -> Result<Self, RlcError> {
         if buf.len() < 2 {
-            return Err(RlcError::PduTooShort { need: 2, got: buf.len() });
+            return Err(RlcError::PduTooShort {
+                need: 2,
+                got: buf.len(),
+            });
         }
         let dc = (buf[0] & 0x80) != 0;
         let p = (buf[0] & 0x40) != 0;
@@ -268,7 +290,10 @@ impl RlcAmPdu {
 
         let (so, data_start) = if si.has_so() {
             if buf.len() < 4 {
-                return Err(RlcError::PduTooShort { need: 4, got: buf.len() });
+                return Err(RlcError::PduTooShort {
+                    need: 4,
+                    got: buf.len(),
+                });
             }
             let so = ((buf[2] as u16) << 8) | buf[3] as u16;
             (Some(so), 4)
@@ -276,24 +301,35 @@ impl RlcAmPdu {
             (None, 2)
         };
 
-        Ok(Self { dc, p, si, sn, so, data: buf[data_start..].to_vec() })
+        Ok(Self {
+            dc,
+            p,
+            si,
+            sn,
+            so,
+            data: buf[data_start..].to_vec(),
+        })
     }
 
     /// Decode using an 18-bit SN field.
     pub fn decode_sn18(buf: &[u8]) -> Result<Self, RlcError> {
         if buf.len() < 3 {
-            return Err(RlcError::PduTooShort { need: 3, got: buf.len() });
+            return Err(RlcError::PduTooShort {
+                need: 3,
+                got: buf.len(),
+            });
         }
         let dc = (buf[0] & 0x80) != 0;
         let p = (buf[0] & 0x40) != 0;
         let si = SegmentationInfo::from_u8((buf[0] >> 4) & 0x03)?;
-        let sn = (((buf[0] & 0x03) as u32) << 16)
-            | ((buf[1] as u32) << 8)
-            | buf[2] as u32;
+        let sn = (((buf[0] & 0x03) as u32) << 16) | ((buf[1] as u32) << 8) | buf[2] as u32;
 
         let (so, data_start) = if si.has_so() {
             if buf.len() < 5 {
-                return Err(RlcError::PduTooShort { need: 5, got: buf.len() });
+                return Err(RlcError::PduTooShort {
+                    need: 5,
+                    got: buf.len(),
+                });
             }
             let so = ((buf[3] as u16) << 8) | buf[4] as u16;
             (Some(so), 5)
@@ -301,7 +337,14 @@ impl RlcAmPdu {
             (None, 3)
         };
 
-        Ok(Self { dc, p, si, sn, so, data: buf[data_start..].to_vec() })
+        Ok(Self {
+            dc,
+            p,
+            si,
+            sn,
+            so,
+            data: buf[data_start..].to_vec(),
+        })
     }
 }
 
@@ -342,7 +385,10 @@ impl RlcStatusPdu {
     /// Decode from bytes (12-bit SN STATUS PDU).
     pub fn decode_sn12(buf: &[u8]) -> Result<Self, RlcError> {
         if buf.len() < 3 {
-            return Err(RlcError::PduTooShort { need: 3, got: buf.len() });
+            return Err(RlcError::PduTooShort {
+                need: 3,
+                got: buf.len(),
+            });
         }
         let ack_sn = (((buf[0] & 0x0F) as u32) << 8) | buf[1] as u32;
         Ok(Self { ack_sn })

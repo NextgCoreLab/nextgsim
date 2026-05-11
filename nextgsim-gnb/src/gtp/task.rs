@@ -15,8 +15,7 @@ use nextgsim_gtp::codec::{GtpHeader, GtpMessageType};
 use nextgsim_gtp::tunnel::{GtpTunnel, PduSession, TunnelManager, GTP_U_PORT};
 
 use crate::tasks::{
-    GnbTaskBase, GtpMessage, GtpUeContextUpdate, PduSessionResource, RlsMessage, Task,
-    TaskMessage,
+    GnbTaskBase, GtpMessage, GtpUeContextUpdate, PduSessionResource, RlsMessage, Task, TaskMessage,
 };
 
 /// GTP-U UE context
@@ -55,7 +54,6 @@ pub struct GtpTask {
     /// Enable loopback mode (for testing without UPF)
     loopback_mode: bool,
 }
-
 
 impl GtpTask {
     /// Create a new GTP task
@@ -123,11 +121,7 @@ impl GtpTask {
     fn handle_ue_context_release(&mut self, ue_id: i32) {
         // Delete all PDU sessions for this UE
         let deleted = self.tunnel_manager.delete_sessions_for_ue(ue_id as u32);
-        debug!(
-            "Deleted {} PDU sessions for UE {}",
-            deleted.len(),
-            ue_id
-        );
+        debug!("Deleted {} PDU sessions for UE {}", deleted.len(), ue_id);
 
         // Remove UE context
         self.ue_contexts.remove(&ue_id);
@@ -177,7 +171,9 @@ impl GtpTask {
     /// Handle PDU session modify from NGAP (updated tunnel endpoints)
     fn handle_session_modify(&mut self, ue_id: i32, resource: PduSessionResource) {
         // Delete existing session and recreate with updated tunnel info
-        let _ = self.tunnel_manager.delete_session(ue_id as u32, resource.psi as u8);
+        let _ = self
+            .tunnel_manager
+            .delete_session(ue_id as u32, resource.psi as u8);
         self.handle_session_create(ue_id, resource);
     }
 
@@ -192,7 +188,6 @@ impl GtpTask {
             }
         }
     }
-
 
     /// Handle uplink data PDU from RLS (UE -> UPF)
     async fn handle_uplink_data(&mut self, ue_id: i32, psi: i32, pdu: Vec<u8>) {
@@ -264,8 +259,10 @@ impl GtpTask {
         // Create a loopback session with dummy TEIDs
         // TEID format: 0xFFUUPP0X where FF=loopback marker, UU=ue_id (lower 8 bits), PP=psi, X=direction
         let teid_base = 0xFF000000u32;
-        let uplink_teid = teid_base | ((ue_id as u32 & 0xFF) << 16) | ((psi as u32 & 0xFF) << 8) | 0x01;
-        let downlink_teid = teid_base | ((ue_id as u32 & 0xFF) << 16) | ((psi as u32 & 0xFF) << 8) | 0x02;
+        let uplink_teid =
+            teid_base | ((ue_id as u32 & 0xFF) << 16) | ((psi as u32 & 0xFF) << 8) | 0x01;
+        let downlink_teid =
+            teid_base | ((ue_id as u32 & 0xFF) << 16) | ((psi as u32 & 0xFF) << 8) | 0x02;
 
         let gtp_ip = self.task_base.config.gtp_ip;
         let local_addr = SocketAddr::new(gtp_ip, GTP_U_PORT);
@@ -522,7 +519,6 @@ impl GtpTask {
     }
 }
 
-
 #[async_trait::async_trait]
 impl Task for GtpTask {
     type Message = GtpMessage;
@@ -543,8 +539,7 @@ impl Task for GtpTask {
         } else if let Some(upf_addr) = self.task_base.config.upf_addr {
             info!(
                 "GTP-U forwarding to UPF at {}:{}",
-                upf_addr,
-                self.task_base.config.upf_port
+                upf_addr, self.task_base.config.upf_port
             );
         }
 
@@ -621,7 +616,9 @@ mod tests {
             ngap_ip: "127.0.0.1".parse().unwrap(),
             gtp_ip: "127.0.0.1".parse().unwrap(),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,
@@ -641,8 +638,7 @@ mod tests {
 
     #[test]
     fn test_gtp_task_new() {
-        let (task_base, _, _, _, _, _, _) =
-            GnbTaskBase::new(test_config(), 16);
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(test_config(), 16);
         let task = GtpTask::new(task_base);
 
         assert!(task.udp_socket.is_none());
@@ -652,8 +648,7 @@ mod tests {
 
     #[test]
     fn test_handle_ue_context_update() {
-        let (task_base, _, _, _, _, _, _) =
-            GnbTaskBase::new(test_config(), 16);
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(test_config(), 16);
         let mut task = GtpTask::new(task_base);
 
         let update = GtpUeContextUpdate {
@@ -669,8 +664,7 @@ mod tests {
 
     #[test]
     fn test_handle_session_create_without_context() {
-        let (task_base, _, _, _, _, _, _) =
-            GnbTaskBase::new(test_config(), 16);
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(test_config(), 16);
         let mut task = GtpTask::new(task_base);
 
         let resource = PduSessionResource {
@@ -688,8 +682,7 @@ mod tests {
 
     #[test]
     fn test_handle_session_create_with_context() {
-        let (task_base, _, _, _, _, _, _) =
-            GnbTaskBase::new(test_config(), 16);
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(test_config(), 16);
         let mut task = GtpTask::new(task_base);
 
         // First create UE context
@@ -715,8 +708,7 @@ mod tests {
 
     #[test]
     fn test_handle_session_release() {
-        let (task_base, _, _, _, _, _, _) =
-            GnbTaskBase::new(test_config(), 16);
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(test_config(), 16);
         let mut task = GtpTask::new(task_base);
 
         // Create UE context and session
@@ -742,8 +734,7 @@ mod tests {
 
     #[test]
     fn test_handle_ue_context_release() {
-        let (task_base, _, _, _, _, _, _) =
-            GnbTaskBase::new(test_config(), 16);
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(test_config(), 16);
         let mut task = GtpTask::new(task_base);
 
         // Create UE context and multiple sessions

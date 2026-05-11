@@ -177,10 +177,7 @@ impl SheIsacClient {
     }
 
     /// Submits position fusion workload to SHE
-    pub fn submit_position_fusion(
-        &mut self,
-        sensing_data: SensingData,
-    ) -> SensingWorkloadRequest {
+    pub fn submit_position_fusion(&mut self, sensing_data: SensingData) -> SensingWorkloadRequest {
         self.create_request(
             sensing_data,
             SensingProcessingType::PositionFusion,
@@ -190,10 +187,7 @@ impl SheIsacClient {
     }
 
     /// Submits object tracking workload to SHE
-    pub fn submit_object_tracking(
-        &mut self,
-        sensing_data: SensingData,
-    ) -> SensingWorkloadRequest {
+    pub fn submit_object_tracking(&mut self, sensing_data: SensingData) -> SensingWorkloadRequest {
         self.create_request(
             sensing_data,
             SensingProcessingType::ObjectTracking,
@@ -280,7 +274,10 @@ mod tests {
 
         let request = client.submit_position_fusion(sensing_data);
 
-        assert_eq!(request.processing_type, SensingProcessingType::PositionFusion);
+        assert_eq!(
+            request.processing_type,
+            SensingProcessingType::PositionFusion
+        );
         assert_eq!(request.latency_requirement_ms, 10);
         assert_eq!(request.priority, 7);
         assert_eq!(request.workload_id, 1);
@@ -299,7 +296,10 @@ mod tests {
 
         let request = client.submit_ml_positioning(sensing_data);
 
-        assert_eq!(request.processing_type, SensingProcessingType::MlPositioning);
+        assert_eq!(
+            request.processing_type,
+            SensingProcessingType::MlPositioning
+        );
         assert_eq!(request.latency_requirement_ms, 20);
         assert_eq!(request.priority, 5);
     }

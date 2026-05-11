@@ -73,7 +73,11 @@ impl ModelStore {
     }
 
     /// Stores a new model version
-    pub fn store(&mut self, model: AggregatedModel, tags: Vec<String>) -> Result<u64, ModelStoreError> {
+    pub fn store(
+        &mut self,
+        model: AggregatedModel,
+        tags: Vec<String>,
+    ) -> Result<u64, ModelStoreError> {
         let version = model.version;
 
         // Create metadata
@@ -162,8 +166,7 @@ impl ModelStore {
     /// Exports a model version for distribution (serialized)
     pub fn export(&self, version: u64) -> Result<Vec<u8>, ModelStoreError> {
         let model = self.get(version)?;
-        serde_json::to_vec(model)
-            .map_err(|e| ModelStoreError::Serialization(e.to_string()))
+        serde_json::to_vec(model).map_err(|e| ModelStoreError::Serialization(e.to_string()))
     }
 
     /// Imports a model from serialized bytes
@@ -179,11 +182,7 @@ impl ModelStore {
         StoreStats {
             num_versions: self.models.len(),
             latest_version: self.latest_version,
-            total_size_bytes: self
-                .metadata
-                .values()
-                .map(|m| m.size_bytes)
-                .sum(),
+            total_size_bytes: self.metadata.values().map(|m| m.size_bytes).sum(),
         }
     }
 }
@@ -283,7 +282,9 @@ mod tests {
         let mut store = ModelStore::new(10);
 
         let model = create_test_model(1);
-        let version = store.store(model.clone(), vec!["test".to_string()]).unwrap();
+        let version = store
+            .store(model.clone(), vec!["test".to_string()])
+            .unwrap();
 
         assert_eq!(version, 1);
         assert_eq!(store.latest_version(), 1);
@@ -356,7 +357,9 @@ mod tests {
         let exported = store1.export(1).unwrap();
 
         let mut store2 = ModelStore::new(10);
-        let version = store2.import(&exported, vec!["imported".to_string()]).unwrap();
+        let version = store2
+            .import(&exported, vec!["imported".to_string()])
+            .unwrap();
 
         assert_eq!(version, 1);
         let imported_model = store2.get(1).unwrap();
@@ -389,9 +392,7 @@ mod tests {
             .store(create_test_model(2), vec![])
             .unwrap();
 
-        let model = manager
-            .serve_model("client1".to_string(), Some(1))
-            .unwrap();
+        let model = manager.serve_model("client1".to_string(), Some(1)).unwrap();
         assert_eq!(model.version, 1);
 
         let history = manager.get_download_history("client1").unwrap();

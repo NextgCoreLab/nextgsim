@@ -72,15 +72,18 @@ async fn test_sixg_task_channels_open_after_init() {
 
     let (base, _sixg_rx, _app_rx, _rrc_rx) = make_base_with_6g();
 
-    let sixg = base.sixg.as_ref().expect("6G handles must be present after init_6g_tasks");
+    let sixg = base
+        .sixg
+        .as_ref()
+        .expect("6G handles must be present after init_6g_tasks");
 
     // All sender handles must report open channels
     assert!(!sixg.nwdaf_tx.is_closed(), "NWDAF channel must be open");
-    assert!(!sixg.isac_tx.is_closed(),  "ISAC channel must be open");
+    assert!(!sixg.isac_tx.is_closed(), "ISAC channel must be open");
     assert!(!sixg.agent_tx.is_closed(), "Agent channel must be open");
-    assert!(!sixg.fl_tx.is_closed(),    "FL channel must be open");
-    assert!(!sixg.she_tx.is_closed(),   "SHE channel must be open");
-    assert!(!sixg.nkef_tx.is_closed(),  "NKEF channel must be open");
+    assert!(!sixg.fl_tx.is_closed(), "FL channel must be open");
+    assert!(!sixg.she_tx.is_closed(), "SHE channel must be open");
+    assert!(!sixg.nkef_tx.is_closed(), "NKEF channel must be open");
 }
 
 /// Verify that task structs can be instantiated from a GnbTaskBase
@@ -93,8 +96,8 @@ async fn test_sixg_tasks_can_be_instantiated() {
 
     // Each constructor must succeed without panic
     let _agent_task = AgentTask::new(base.clone());
-    let _fl_task    = FlAggregatorTask::new(base.clone());
-    let _isac_task  = IsacTask::new(base.clone());
+    let _fl_task = FlAggregatorTask::new(base.clone());
+    let _isac_task = IsacTask::new(base.clone());
     let _nwdaf_task = NwdafTask::new(base.clone());
 
     // If we reach here all constructors ran cleanly
@@ -124,10 +127,7 @@ async fn test_agent_register_then_submit_intent() {
         .send(AgentMessage::RegisterAgent {
             agent_id: "mobility-optimizer-001".to_string(),
             agent_type: "mobility".to_string(),
-            capabilities: vec![
-                "trigger_handover".to_string(),
-                "query".to_string(),
-            ],
+            capabilities: vec!["trigger_handover".to_string(), "query".to_string()],
         })
         .await
         .expect("RegisterAgent send must succeed");
@@ -238,10 +238,7 @@ async fn test_fl_task_full_training_round_via_channel() {
         .expect("Aggregate must succeed");
 
     // Shutdown and verify no panic
-    sixg.fl_tx
-        .shutdown()
-        .await
-        .expect("Shutdown must succeed");
+    sixg.fl_tx.shutdown().await.expect("Shutdown must succeed");
 
     timeout(Duration::from_secs(2), handle)
         .await
@@ -328,7 +325,10 @@ async fn test_isac_task_sensing_data_recorded_via_channel() {
         .await
         .expect("TrackingUpdate send must succeed");
 
-    sixg.isac_tx.shutdown().await.expect("Shutdown must succeed");
+    sixg.isac_tx
+        .shutdown()
+        .await
+        .expect("Shutdown must succeed");
 
     timeout(Duration::from_secs(2), handle)
         .await
@@ -382,15 +382,24 @@ fn test_isac_manager_records_sensing_data() {
 
     // After recording, fuse_position must return Some (data is present)
     let fused = manager.fuse_position(1);
-    assert!(fused.is_some(), "fuse_position must return Some after data is recorded");
+    assert!(
+        fused.is_some(),
+        "fuse_position must return Some after data is recorded"
+    );
 
     let fp = fused.unwrap();
     assert_eq!(fp.target_id, 1);
     assert!(fp.confidence > 0.0, "confidence must be positive");
-    assert!(fp.position_uncertainty > 0.0, "uncertainty must be positive");
+    assert!(
+        fp.position_uncertainty > 0.0,
+        "uncertainty must be positive"
+    );
     // Position must be within the bounding box of the triangle
-    assert!(fp.position.x >= 0.0 && fp.position.x <= 100.0,
-        "x={} must lie within anchor bounding box", fp.position.x);
+    assert!(
+        fp.position.x >= 0.0 && fp.position.x <= 100.0,
+        "x={} must lie within anchor bounding box",
+        fp.position.x
+    );
 }
 
 // ============================================================================
@@ -470,7 +479,10 @@ async fn test_nwdaf_to_rrc_handover_recommendation_arrives() {
     }
 
     // 5. Shutdown cleanly
-    sixg.nwdaf_tx.shutdown().await.expect("Shutdown must succeed");
+    sixg.nwdaf_tx
+        .shutdown()
+        .await
+        .expect("Shutdown must succeed");
 
     timeout(Duration::from_secs(2), handle)
         .await
@@ -513,7 +525,10 @@ async fn test_nwdaf_task_predict_trajectory_via_channel() {
         .await
         .expect("PredictTrajectory send must succeed");
 
-    sixg.nwdaf_tx.shutdown().await.expect("Shutdown must succeed");
+    sixg.nwdaf_tx
+        .shutdown()
+        .await
+        .expect("Shutdown must succeed");
 
     timeout(Duration::from_secs(2), handle)
         .await

@@ -1,11 +1,11 @@
 //! ISAC Task for gNB - Integrated Sensing and Communication
 
-use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use crate::tasks::{GnbTaskBase, IsacMessage, NwdafMessage, Task, TaskMessage};
 use nextgsim_isac::{
     IsacManager, SensingData, SensingMeasurement, SensingType, TrackingState, Vector3,
 };
-use crate::tasks::{GnbTaskBase, IsacMessage, NwdafMessage, Task, TaskMessage};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 pub struct IsacTask {
     task_base: GnbTaskBase,
@@ -33,8 +33,15 @@ impl Task for IsacTask {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => {
                     match msg {
-                        IsacMessage::SensingData { cell_id, measurement_type, measurements } => {
-                            debug!("ISAC: Sensing data from cell {} ({})", cell_id, measurement_type);
+                        IsacMessage::SensingData {
+                            cell_id,
+                            measurement_type,
+                            measurements,
+                        } => {
+                            debug!(
+                                "ISAC: Sensing data from cell {} ({})",
+                                cell_id, measurement_type
+                            );
                             let sensing_type = match measurement_type.as_str() {
                                 "ToA" => SensingType::ToA,
                                 "TDoA" => SensingType::TDoA,
@@ -67,17 +74,19 @@ impl Task for IsacTask {
                             self.engine.record_sensing_data(data);
                         }
                         IsacMessage::FusionRequest { ue_id, source_ids } => {
-                            debug!("ISAC: Fusion request for UE {} from {} sources", ue_id, source_ids.len());
+                            debug!(
+                                "ISAC: Fusion request for UE {} from {} sources",
+                                ue_id,
+                                source_ids.len()
+                            );
                             // Register source anchors using configured positions.
                             // source_ids are matched to isac_anchors by index; if the index
                             // exceeds the configured anchor list the anchor is skipped.
                             let anchors = &self.task_base.config.isac_anchors;
                             for (idx, &src) in source_ids.iter().enumerate() {
                                 if let Some(&[x, y, z]) = anchors.get(idx) {
-                                    self.engine.register_anchor(
-                                        src as i32,
-                                        Vector3::new(x, y, z),
-                                    );
+                                    self.engine
+                                        .register_anchor(src as i32, Vector3::new(x, y, z));
                                 } else {
                                     debug!(
                                         "ISAC: No anchor position configured for source index {} (id {}), skipping",
@@ -112,10 +121,19 @@ impl Task for IsacTask {
                                 }
                             }
                         }
-                        IsacMessage::TrackingUpdate { object_id, position, velocity: _ } => {
+                        IsacMessage::TrackingUpdate {
+                            object_id,
+                            position,
+                            velocity: _,
+                        } => {
                             debug!("ISAC: Tracking update for object {}", object_id);
-                            let pos = Vector3::new(position.0 as f64, position.1 as f64, position.2 as f64);
-                            self.trackers.entry(object_id)
+                            let pos = Vector3::new(
+                                position.0 as f64,
+                                position.1 as f64,
+                                position.2 as f64,
+                            );
+                            self.trackers
+                                .entry(object_id)
                                 .and_modify(|t| t.update(pos, 1.0))
                                 .or_insert_with(|| TrackingState::new(object_id, pos));
                         }

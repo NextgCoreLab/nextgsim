@@ -187,14 +187,17 @@ impl<'a> OctetView<'a> {
     /// Panics if there are not enough bytes remaining or if the bytes are not valid UTF-8.
     pub fn read_utf8_string(&self, length: usize) -> String {
         let idx = self.index.get();
-        let result = String::from_utf8(self.data[idx..idx + length].to_vec())
-            .expect("value expected");
+        let result =
+            String::from_utf8(self.data[idx..idx + length].to_vec()).expect("value expected");
         self.index.set(idx + length);
         result
     }
 
     /// Reads a UTF-8 string of the specified length, returning an error if invalid.
-    pub fn try_read_utf8_string(&self, length: usize) -> Result<String, std::string::FromUtf8Error> {
+    pub fn try_read_utf8_string(
+        &self,
+        length: usize,
+    ) -> Result<String, std::string::FromUtf8Error> {
         let idx = self.index.get();
         let result = String::from_utf8(self.data[idx..idx + length].to_vec())?;
         self.index.set(idx + length);

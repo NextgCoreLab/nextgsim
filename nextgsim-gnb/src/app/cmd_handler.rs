@@ -121,7 +121,10 @@ impl AmfContext {
 
     /// Formats the AMF context as YAML.
     pub fn to_yaml(&self) -> String {
-        let mut yaml = format!("amf_id: {}\nis_connected: {}", self.amf_id, self.is_connected);
+        let mut yaml = format!(
+            "amf_id: {}\nis_connected: {}",
+            self.amf_id, self.is_connected
+        );
         if let Some(ref name) = self.amf_name {
             yaml.push_str(&format!("\namf_name: {name}"));
         }
@@ -188,10 +191,7 @@ impl<'a> GnbCmdHandler<'a> {
     fn handle_status(&self, response_addr: Option<SocketAddr>) -> CliResponse {
         match self.status_info.to_yaml() {
             Ok(yaml) => CliResponse::success(yaml, response_addr),
-            Err(e) => CliResponse::error(
-                format!("Failed to serialize status: {e}"),
-                response_addr,
-            ),
+            Err(e) => CliResponse::error(format!("Failed to serialize status: {e}"), response_addr),
         }
     }
 
@@ -326,7 +326,9 @@ mod tests {
             ngap_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             gtp_advertise_ip: None,
-            ignore_stream_ids: false, upf_addr: None, upf_port: 2152,
+            ignore_stream_ids: false,
+            upf_addr: None,
+            upf_port: 2152,
             pqc_config: nextgsim_common::config::PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,

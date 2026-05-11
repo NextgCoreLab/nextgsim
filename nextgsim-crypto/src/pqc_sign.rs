@@ -9,9 +9,9 @@
 //! ML-DSA provides quantum-resistant digital signatures for authentication
 //! and integrity in 5G/6G security protocols.
 
-use ml_dsa::{MlDsa44, MlDsa65, MlDsa87};
 use ml_dsa::signature::Signer;
 use ml_dsa::signature::Verifier;
+use ml_dsa::{MlDsa44, MlDsa65, MlDsa87};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use thiserror::Error;
@@ -127,11 +127,7 @@ pub fn ml_dsa_generate_keypair(level: MlDsaLevel) -> MlDsaKeyPair {
 ///
 /// # Errors
 /// Returns an error if the signing key is invalid.
-pub fn ml_dsa_sign(
-    level: MlDsaLevel,
-    signing_key: &[u8],
-    message: &[u8],
-) -> MlDsaResult<Vec<u8>> {
+pub fn ml_dsa_sign(level: MlDsaLevel, signing_key: &[u8], message: &[u8]) -> MlDsaResult<Vec<u8>> {
     let seed: &[u8; 32] = signing_key.try_into().map_err(|_| {
         MlDsaError::InvalidKeyData(format!(
             "Invalid signing key seed length: {} (expected 32)",
@@ -280,10 +276,9 @@ mod tests {
         let kp = ml_dsa_generate_keypair(MlDsaLevel::MlDsa44);
         let message = b"Test message for ML-DSA-44";
 
-        let sig = ml_dsa_sign(MlDsaLevel::MlDsa44, kp.signing_key(), message)
-            .expect("sign");
-        let valid = ml_dsa_verify(MlDsaLevel::MlDsa44, kp.verifying_key(), message, &sig)
-            .expect("verify");
+        let sig = ml_dsa_sign(MlDsaLevel::MlDsa44, kp.signing_key(), message).expect("sign");
+        let valid =
+            ml_dsa_verify(MlDsaLevel::MlDsa44, kp.verifying_key(), message, &sig).expect("verify");
 
         assert!(valid);
     }
@@ -293,10 +288,9 @@ mod tests {
         let kp = ml_dsa_generate_keypair(MlDsaLevel::MlDsa65);
         let message = b"Test message for ML-DSA-65";
 
-        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp.signing_key(), message)
-            .expect("sign");
-        let valid = ml_dsa_verify(MlDsaLevel::MlDsa65, kp.verifying_key(), message, &sig)
-            .expect("verify");
+        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp.signing_key(), message).expect("sign");
+        let valid =
+            ml_dsa_verify(MlDsaLevel::MlDsa65, kp.verifying_key(), message, &sig).expect("verify");
 
         assert!(valid);
     }
@@ -306,10 +300,9 @@ mod tests {
         let kp = ml_dsa_generate_keypair(MlDsaLevel::MlDsa87);
         let message = b"Test message for ML-DSA-87";
 
-        let sig = ml_dsa_sign(MlDsaLevel::MlDsa87, kp.signing_key(), message)
-            .expect("sign");
-        let valid = ml_dsa_verify(MlDsaLevel::MlDsa87, kp.verifying_key(), message, &sig)
-            .expect("verify");
+        let sig = ml_dsa_sign(MlDsaLevel::MlDsa87, kp.signing_key(), message).expect("sign");
+        let valid =
+            ml_dsa_verify(MlDsaLevel::MlDsa87, kp.verifying_key(), message, &sig).expect("verify");
 
         assert!(valid);
     }
@@ -320,11 +313,9 @@ mod tests {
         let message = b"Original message";
         let wrong_message = b"Tampered message";
 
-        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp.signing_key(), message)
-            .expect("sign");
-        let valid =
-            ml_dsa_verify(MlDsaLevel::MlDsa65, kp.verifying_key(), wrong_message, &sig)
-                .expect("verify");
+        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp.signing_key(), message).expect("sign");
+        let valid = ml_dsa_verify(MlDsaLevel::MlDsa65, kp.verifying_key(), wrong_message, &sig)
+            .expect("verify");
 
         assert!(!valid);
     }
@@ -335,11 +326,9 @@ mod tests {
         let kp2 = ml_dsa_generate_keypair(MlDsaLevel::MlDsa65);
         let message = b"Test message";
 
-        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp1.signing_key(), message)
-            .expect("sign");
+        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp1.signing_key(), message).expect("sign");
         let valid =
-            ml_dsa_verify(MlDsaLevel::MlDsa65, kp2.verifying_key(), message, &sig)
-                .expect("verify");
+            ml_dsa_verify(MlDsaLevel::MlDsa65, kp2.verifying_key(), message, &sig).expect("verify");
 
         assert!(!valid);
     }
@@ -361,11 +350,9 @@ mod tests {
         let kp = ml_dsa_generate_keypair(MlDsaLevel::MlDsa65);
         let message = b"";
 
-        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp.signing_key(), message)
-            .expect("sign");
+        let sig = ml_dsa_sign(MlDsaLevel::MlDsa65, kp.signing_key(), message).expect("sign");
         let valid =
-            ml_dsa_verify(MlDsaLevel::MlDsa65, kp.verifying_key(), message, &sig)
-                .expect("verify");
+            ml_dsa_verify(MlDsaLevel::MlDsa65, kp.verifying_key(), message, &sig).expect("verify");
 
         assert!(valid);
     }

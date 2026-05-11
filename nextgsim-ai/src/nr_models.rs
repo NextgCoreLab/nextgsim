@@ -118,7 +118,8 @@ impl CsiPredictionModel {
         // Online learning: adjust alpha based on prediction error
         for window in samples.windows(3) {
             let predicted_cqi = (window[0].wideband_cqi as f64
-                + self.learned_cqi_alpha * (window[1].wideband_cqi as f64 - window[0].wideband_cqi as f64))
+                + self.learned_cqi_alpha
+                    * (window[1].wideband_cqi as f64 - window[0].wideband_cqi as f64))
                 .clamp(1.0, 15.0);
             let actual_cqi = window[2].wideband_cqi as f64;
             let error = (predicted_cqi - actual_cqi).abs();
@@ -126,16 +127,19 @@ impl CsiPredictionModel {
             // Gradient step on alpha
             let learning_rate = 0.01 / (1.0 + self.training_samples as f64 * 0.001);
             if predicted_cqi > actual_cqi {
-                self.learned_cqi_alpha = (self.learned_cqi_alpha - learning_rate * error).clamp(0.05, 0.95);
+                self.learned_cqi_alpha =
+                    (self.learned_cqi_alpha - learning_rate * error).clamp(0.05, 0.95);
             } else {
-                self.learned_cqi_alpha = (self.learned_cqi_alpha + learning_rate * error).clamp(0.05, 0.95);
+                self.learned_cqi_alpha =
+                    (self.learned_cqi_alpha + learning_rate * error).clamp(0.05, 0.95);
             }
 
             // Update subband weights if subband data available
             let num_sb = window[2].subband_cqi.len().min(self.subband_weights.len());
             for i in 0..num_sb {
                 let sb_error = window[2].subband_cqi[i] as f64;
-                self.subband_weights[i] = (self.subband_weights[i] + 0.001 * sb_error).clamp(0.5, 2.0);
+                self.subband_weights[i] =
+                    (self.subband_weights[i] + 0.001 * sb_error).clamp(0.5, 2.0);
             }
 
             self.training_samples += 1;
@@ -171,10 +175,9 @@ impl CsiPredictionModel {
                     0.0
                 };
 
-                let predicted_cqi = (l.wideband_cqi as f64
-                    + self.learned_cqi_alpha * cqi_trend
-                    + sinr_factor)
-                    .clamp(1.0, 15.0) as u8;
+                let predicted_cqi =
+                    (l.wideband_cqi as f64 + self.learned_cqi_alpha * cqi_trend + sinr_factor)
+                        .clamp(1.0, 15.0) as u8;
                 let predicted_ri = l.rank_indicator;
                 let predicted_pmi = l.pmi_i1;
                 (predicted_cqi, predicted_ri, predicted_pmi)
@@ -185,17 +188,22 @@ impl CsiPredictionModel {
 
         // Predict subband CQI differentials
         let predicted_subband_cqi: Vec<i8> = if let Some(l) = latest {
-            l.subband_cqi.iter().enumerate().map(|(i, &sb)| {
-                let w = self.subband_weights.get(i).copied().unwrap_or(1.0);
-                (sb as f64 * w).clamp(-7.0, 7.0) as i8
-            }).collect()
+            l.subband_cqi
+                .iter()
+                .enumerate()
+                .map(|(i, &sb)| {
+                    let w = self.subband_weights.get(i).copied().unwrap_or(1.0);
+                    (sb as f64 * w).clamp(-7.0, 7.0) as i8
+                })
+                .collect()
         } else {
             Vec::new()
         };
 
         // Confidence decreases with prediction horizon and increases with training
         let base_confidence = 0.85 + (self.training_samples as f64 * 0.001).min(0.1);
-        let confidence = (base_confidence - self.prediction_horizon_slots as f64 * 0.02).clamp(0.0, 1.0);
+        let confidence =
+            (base_confidence - self.prediction_horizon_slots as f64 * 0.02).clamp(0.0, 1.0);
 
         CsiPrediction {
             predicted_cqi,
@@ -306,9 +314,7 @@ impl BeamManagementModel {
                 let beam_id = measurement.beam_id as usize;
                 if beam_id < self.beam_angular_map.len() {
                     // Update angular map using UE bearing
-                    let bearing = pv.bearing_deg.unwrap_or(
-                        self.beam_angular_map[beam_id],
-                    );
+                    let bearing = pv.bearing_deg.unwrap_or(self.beam_angular_map[beam_id]);
                     let alpha = 0.1 / (1.0 + self.training_samples as f64 * 0.001);
                     self.beam_angular_map[beam_id] =
                         self.beam_angular_map[beam_id] * (1.0 - alpha) + bearing * alpha;
@@ -324,9 +330,11 @@ impl BeamManagementModel {
         self.inference_count += 1;
 
         // Find best measured beam and predict based on spatial correlation
-        let best = measurements
-            .iter()
-            .max_by(|a, b| a.rsrp_dbm.partial_cmp(&b.rsrp_dbm).unwrap_or(std::cmp::Ordering::Equal));
+        let best = measurements.iter().max_by(|a, b| {
+            a.rsrp_dbm
+                .partial_cmp(&b.rsrp_dbm)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let (best_beam_id, best_rsrp) = match best {
             Some(m) => (m.beam_id, m.rsrp_dbm),
@@ -334,7 +342,11 @@ impl BeamManagementModel {
         };
 
         // Predict adjacent beams that might be better (spatial correlation model)
-        let alt_beam = if best_beam_id > 0 { best_beam_id - 1 } else { best_beam_id + 1 };
+        let alt_beam = if best_beam_id > 0 {
+            best_beam_id - 1
+        } else {
+            best_beam_id + 1
+        };
 
         BeamPrediction {
             predicted_beam_id: best_beam_id,
@@ -358,7 +370,8 @@ impl BeamManagementModel {
 
         // If we have bearing info, find the beam closest to that bearing
         if let Some(bearing) = ue_pos_vel.bearing_deg {
-            let predicted_beam = self.beam_angular_map
+            let predicted_beam = self
+                .beam_angular_map
                 .iter()
                 .enumerate()
                 .min_by(|(_, a), (_, b)| {
@@ -377,13 +390,19 @@ impl BeamManagementModel {
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
-                        let da = ((**a - future_bearing).abs()).min(360.0 - (**a - future_bearing).abs());
-                        let db = ((**b - future_bearing).abs()).min(360.0 - (**b - future_bearing).abs());
+                        let da = ((**a - future_bearing).abs())
+                            .min(360.0 - (**a - future_bearing).abs());
+                        let db = ((**b - future_bearing).abs())
+                            .min(360.0 - (**b - future_bearing).abs());
                         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .map(|(i, _)| i as u16)
                     .unwrap_or(predicted_beam)
-            } else if predicted_beam > 0 { predicted_beam - 1 } else { predicted_beam + 1 };
+            } else if predicted_beam > 0 {
+                predicted_beam - 1
+            } else {
+                predicted_beam + 1
+            };
 
             // Estimate RSRP from measurements or default
             let rsrp = measurements
@@ -398,7 +417,11 @@ impl BeamManagementModel {
                 });
 
             let confidence = (self.top_k_accuracy + 0.05).min(1.0); // Position info boosts confidence
-            let failure_prob = if rsrp < -110.0 || ue_pos_vel.speed_mps > 30.0 { 0.15 } else { 0.01 };
+            let failure_prob = if rsrp < -110.0 || ue_pos_vel.speed_mps > 30.0 {
+                0.15
+            } else {
+                0.01
+            };
 
             return BeamPrediction {
                 predicted_beam_id: predicted_beam,
@@ -564,7 +587,10 @@ impl MlPositioningModel {
     }
 
     /// Estimate position from radio measurements
-    pub fn estimate_position(&mut self, measurements: &[PositioningMeasurement]) -> PositionEstimateResult {
+    pub fn estimate_position(
+        &mut self,
+        measurements: &[PositioningMeasurement],
+    ) -> PositionEstimateResult {
         self.inference_count += 1;
 
         // Try fingerprinting first if we have a database
@@ -764,16 +790,19 @@ impl GnbModelLifecycleManager {
 
     /// Register a new model
     pub fn register_model(&mut self, domain: NrModelDomain, version: &str) {
-        self.models.insert(domain, GnbManagedModel {
+        self.models.insert(
             domain,
-            version: version.to_string(),
-            state: ModelLifecycleState::Registered,
-            loaded_at: None,
-            total_inferences: 0,
-            avg_latency_us: 0.0,
-            performance_metric: 0.0,
-            performance_history: Vec::new(),
-        });
+            GnbManagedModel {
+                domain,
+                version: version.to_string(),
+                state: ModelLifecycleState::Registered,
+                loaded_at: None,
+                total_inferences: 0,
+                avg_latency_us: 0.0,
+                performance_metric: 0.0,
+                performance_history: Vec::new(),
+            },
+        );
     }
 
     /// Activate a model (transition: Registered/Loaded -> Active)
@@ -804,7 +833,8 @@ impl GnbModelLifecycleManager {
             let avg_perf = if model.performance_history.is_empty() {
                 model.performance_metric
             } else {
-                model.performance_history.iter().sum::<f64>() / model.performance_history.len() as f64
+                model.performance_history.iter().sum::<f64>()
+                    / model.performance_history.len() as f64
             };
 
             let record = ModelVersionRecord {
@@ -858,17 +888,24 @@ impl GnbModelLifecycleManager {
         if !self.models.contains_key(&domain) {
             return false;
         }
-        self.canary_slots.insert(domain, CanaryDeployment {
-            candidate_version: candidate_version.to_string(),
-            traffic_pct: traffic_pct.min(50), // Cap at 50% for safety
-            candidate_performance: Vec::new(),
-            required_observations,
-        });
+        self.canary_slots.insert(
+            domain,
+            CanaryDeployment {
+                candidate_version: candidate_version.to_string(),
+                traffic_pct: traffic_pct.min(50), // Cap at 50% for safety
+                candidate_performance: Vec::new(),
+                required_observations,
+            },
+        );
         true
     }
 
     /// Record a canary observation. Returns Some(true) if promoted, Some(false) if rolled back.
-    pub fn record_canary_observation(&mut self, domain: NrModelDomain, performance: f64) -> Option<bool> {
+    pub fn record_canary_observation(
+        &mut self,
+        domain: NrModelDomain,
+        performance: f64,
+    ) -> Option<bool> {
         let threshold = self.retraining_thresholds.get(&domain).copied();
         let canary = self.canary_slots.get_mut(&domain)?;
         canary.candidate_performance.push(performance);
@@ -903,12 +940,7 @@ impl GnbModelLifecycleManager {
     }
 
     /// Record inference result and update metrics
-    pub fn record_inference(
-        &mut self,
-        domain: NrModelDomain,
-        latency: Duration,
-        performance: f64,
-    ) {
+    pub fn record_inference(&mut self, domain: NrModelDomain, latency: Duration, performance: f64) {
         if let Some(model) = self.models.get_mut(&domain) {
             model.total_inferences += 1;
             let lat_us = latency.as_micros() as f64;
@@ -985,12 +1017,20 @@ mod tests {
 
         let measurements = vec![
             CsiMeasurement {
-                rank_indicator: 2, pmi_i1: 5, pmi_i2: vec![1, 2],
-                wideband_cqi: 10, subband_cqi: vec![0, 1, -1], sinr_db: 15.0,
+                rank_indicator: 2,
+                pmi_i1: 5,
+                pmi_i2: vec![1, 2],
+                wideband_cqi: 10,
+                subband_cqi: vec![0, 1, -1],
+                sinr_db: 15.0,
             },
             CsiMeasurement {
-                rank_indicator: 2, pmi_i1: 5, pmi_i2: vec![1, 3],
-                wideband_cqi: 11, subband_cqi: vec![0, 1, 0], sinr_db: 16.0,
+                rank_indicator: 2,
+                pmi_i1: 5,
+                pmi_i2: vec![1, 3],
+                wideband_cqi: 11,
+                subband_cqi: vec![0, 1, 0],
+                sinr_db: 16.0,
             },
         ];
 
@@ -1006,16 +1046,24 @@ mod tests {
         let mut model = CsiPredictionModel::new("csi_v2", 4, 4);
         let initial_alpha = model.learned_cqi_alpha();
 
-        let samples: Vec<CsiMeasurement> = (0..10).map(|i| CsiMeasurement {
-            rank_indicator: 2, pmi_i1: 5, pmi_i2: vec![1],
-            wideband_cqi: (7 + (i % 3)) as u8, subband_cqi: vec![0, 1],
-            sinr_db: 15.0 + i as f64 * 0.5,
-        }).collect();
+        let samples: Vec<CsiMeasurement> = (0..10)
+            .map(|i| CsiMeasurement {
+                rank_indicator: 2,
+                pmi_i1: 5,
+                pmi_i2: vec![1],
+                wideband_cqi: (7 + (i % 3)) as u8,
+                subband_cqi: vec![0, 1],
+                sinr_db: 15.0 + i as f64 * 0.5,
+            })
+            .collect();
 
         model.train(&samples);
         assert!(model.training_sample_count() > 0);
         // Alpha should have been adjusted
-        assert!((model.learned_cqi_alpha() - initial_alpha).abs() > 0.0 || model.training_sample_count() > 0);
+        assert!(
+            (model.learned_cqi_alpha() - initial_alpha).abs() > 0.0
+                || model.training_sample_count() > 0
+        );
     }
 
     #[test]
@@ -1023,9 +1071,24 @@ mod tests {
         let mut model = BeamManagementModel::new("beam_v1", 64, 128);
 
         let measurements = vec![
-            BeamMeasurement { beam_id: 10, rsrp_dbm: -85.0, sinr_db: Some(15.0), is_ssb: true },
-            BeamMeasurement { beam_id: 11, rsrp_dbm: -90.0, sinr_db: Some(12.0), is_ssb: true },
-            BeamMeasurement { beam_id: 12, rsrp_dbm: -82.0, sinr_db: Some(18.0), is_ssb: true },
+            BeamMeasurement {
+                beam_id: 10,
+                rsrp_dbm: -85.0,
+                sinr_db: Some(15.0),
+                is_ssb: true,
+            },
+            BeamMeasurement {
+                beam_id: 11,
+                rsrp_dbm: -90.0,
+                sinr_db: Some(12.0),
+                is_ssb: true,
+            },
+            BeamMeasurement {
+                beam_id: 12,
+                rsrp_dbm: -82.0,
+                sinr_db: Some(18.0),
+                is_ssb: true,
+            },
         ];
 
         let prediction = model.predict_best_beam(&measurements);
@@ -1041,13 +1104,26 @@ mod tests {
         let mut model = BeamManagementModel::new("beam_v2", 64, 128);
 
         let measurements = vec![
-            BeamMeasurement { beam_id: 10, rsrp_dbm: -85.0, sinr_db: Some(15.0), is_ssb: true },
-            BeamMeasurement { beam_id: 32, rsrp_dbm: -80.0, sinr_db: Some(18.0), is_ssb: true },
+            BeamMeasurement {
+                beam_id: 10,
+                rsrp_dbm: -85.0,
+                sinr_db: Some(15.0),
+                is_ssb: true,
+            },
+            BeamMeasurement {
+                beam_id: 32,
+                rsrp_dbm: -80.0,
+                sinr_db: Some(18.0),
+                is_ssb: true,
+            },
         ];
 
         let pos_vel = UePositionVelocity {
-            latitude: 40.0, longitude: 29.0, speed_mps: 1.5,
-            bearing_deg: Some(180.0), altitude_m: Some(50.0),
+            latitude: 40.0,
+            longitude: 29.0,
+            speed_mps: 1.5,
+            bearing_deg: Some(180.0),
+            altitude_m: Some(50.0),
         };
 
         let prediction = model.predict_with_position(&measurements, &pos_vel);
@@ -1059,15 +1135,21 @@ mod tests {
     fn test_beam_train_with_position() {
         let mut model = BeamManagementModel::new("beam_v3", 8, 16);
 
-        let samples: Vec<(BeamMeasurement, Option<UePositionVelocity>)> = vec![
-            (
-                BeamMeasurement { beam_id: 2, rsrp_dbm: -80.0, sinr_db: None, is_ssb: true },
-                Some(UePositionVelocity {
-                    latitude: 40.0, longitude: 29.0, speed_mps: 5.0,
-                    bearing_deg: Some(90.0), altitude_m: None,
-                }),
-            ),
-        ];
+        let samples: Vec<(BeamMeasurement, Option<UePositionVelocity>)> = vec![(
+            BeamMeasurement {
+                beam_id: 2,
+                rsrp_dbm: -80.0,
+                sinr_db: None,
+                is_ssb: true,
+            },
+            Some(UePositionVelocity {
+                latitude: 40.0,
+                longitude: 29.0,
+                speed_mps: 5.0,
+                bearing_deg: Some(90.0),
+                altitude_m: None,
+            }),
+        )];
 
         model.train(&samples);
         assert_eq!(model.training_sample_count(), 1);
@@ -1080,12 +1162,22 @@ mod tests {
 
         let measurements = vec![
             PositioningMeasurement {
-                cell_id: 1, cell_lat: 40.0, cell_lon: 29.0, altitude_m: 50.0,
-                rsrp_dbm: -80.0, timing_advance_us: Some(1.0), aoa_deg: Some(45.0),
+                cell_id: 1,
+                cell_lat: 40.0,
+                cell_lon: 29.0,
+                altitude_m: 50.0,
+                rsrp_dbm: -80.0,
+                timing_advance_us: Some(1.0),
+                aoa_deg: Some(45.0),
             },
             PositioningMeasurement {
-                cell_id: 2, cell_lat: 40.001, cell_lon: 29.001, altitude_m: 50.0,
-                rsrp_dbm: -90.0, timing_advance_us: Some(2.0), aoa_deg: Some(135.0),
+                cell_id: 2,
+                cell_lat: 40.001,
+                cell_lon: 29.001,
+                altitude_m: 50.0,
+                rsrp_dbm: -90.0,
+                timing_advance_us: Some(2.0),
+                aoa_deg: Some(135.0),
             },
         ];
 
@@ -1099,28 +1191,38 @@ mod tests {
         let mut model = MlPositioningModel::new("pos_fp", MlPositioningMethod::Fingerprint);
 
         // Train fingerprint database
-        let training: Vec<(PositioningMeasurement, f64, f64)> = (0..20).map(|i| {
-            (
-                PositioningMeasurement {
-                    cell_id: 1, cell_lat: 40.0, cell_lon: 29.0, altitude_m: 50.0,
-                    rsrp_dbm: -80.0 + i as f64 * 0.5, timing_advance_us: None, aoa_deg: None,
-                },
-                40.0 + i as f64 * 0.0001,
-                29.0 + i as f64 * 0.0001,
-            )
-        }).collect();
+        let training: Vec<(PositioningMeasurement, f64, f64)> = (0..20)
+            .map(|i| {
+                (
+                    PositioningMeasurement {
+                        cell_id: 1,
+                        cell_lat: 40.0,
+                        cell_lon: 29.0,
+                        altitude_m: 50.0,
+                        rsrp_dbm: -80.0 + i as f64 * 0.5,
+                        timing_advance_us: None,
+                        aoa_deg: None,
+                    },
+                    40.0 + i as f64 * 0.0001,
+                    29.0 + i as f64 * 0.0001,
+                )
+            })
+            .collect();
 
         model.train_fingerprint(&training);
         assert!(model.fingerprint_count() > 0);
         assert_eq!(model.training_sample_count(), 20);
 
         // Now estimate using fingerprint
-        let measurements = vec![
-            PositioningMeasurement {
-                cell_id: 1, cell_lat: 40.0, cell_lon: 29.0, altitude_m: 50.0,
-                rsrp_dbm: -75.0, timing_advance_us: None, aoa_deg: None,
-            },
-        ];
+        let measurements = vec![PositioningMeasurement {
+            cell_id: 1,
+            cell_lat: 40.0,
+            cell_lon: 29.0,
+            altitude_m: 50.0,
+            rsrp_dbm: -75.0,
+            timing_advance_us: None,
+            aoa_deg: None,
+        }];
 
         let result = model.estimate_position(&measurements);
         assert!(result.latitude > 39.0 && result.latitude < 41.0);
@@ -1135,21 +1237,35 @@ mod tests {
 
         assert!(mgr.activate_model(NrModelDomain::CsiPrediction));
         assert_eq!(
-            mgr.get_model_status(NrModelDomain::CsiPrediction).unwrap().state,
+            mgr.get_model_status(NrModelDomain::CsiPrediction)
+                .unwrap()
+                .state,
             ModelLifecycleState::Active
         );
 
         // Record good performance
-        mgr.record_inference(NrModelDomain::CsiPrediction, Duration::from_micros(100), -15.0);
+        mgr.record_inference(
+            NrModelDomain::CsiPrediction,
+            Duration::from_micros(100),
+            -15.0,
+        );
         assert_eq!(
-            mgr.get_model_status(NrModelDomain::CsiPrediction).unwrap().state,
+            mgr.get_model_status(NrModelDomain::CsiPrediction)
+                .unwrap()
+                .state,
             ModelLifecycleState::Active
         );
 
         // Record degraded performance (NMSE above threshold)
-        mgr.record_inference(NrModelDomain::CsiPrediction, Duration::from_micros(100), -5.0);
+        mgr.record_inference(
+            NrModelDomain::CsiPrediction,
+            Duration::from_micros(100),
+            -5.0,
+        );
         assert_eq!(
-            mgr.get_model_status(NrModelDomain::CsiPrediction).unwrap().state,
+            mgr.get_model_status(NrModelDomain::CsiPrediction)
+                .unwrap()
+                .state,
             ModelLifecycleState::Degraded
         );
 
@@ -1162,20 +1278,36 @@ mod tests {
         let mut mgr = GnbModelLifecycleManager::new();
         mgr.register_model(NrModelDomain::CsiPrediction, "1.0");
         mgr.activate_model(NrModelDomain::CsiPrediction);
-        mgr.record_inference(NrModelDomain::CsiPrediction, Duration::from_micros(100), -15.0);
+        mgr.record_inference(
+            NrModelDomain::CsiPrediction,
+            Duration::from_micros(100),
+            -15.0,
+        );
 
         // Upgrade to v2.0
         assert!(mgr.upgrade_model(NrModelDomain::CsiPrediction, "2.0"));
-        assert_eq!(mgr.get_model_status(NrModelDomain::CsiPrediction).unwrap().version, "2.0");
+        assert_eq!(
+            mgr.get_model_status(NrModelDomain::CsiPrediction)
+                .unwrap()
+                .version,
+            "2.0"
+        );
 
-        let history = mgr.get_version_history(NrModelDomain::CsiPrediction).unwrap();
+        let history = mgr
+            .get_version_history(NrModelDomain::CsiPrediction)
+            .unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].version, "1.0");
 
         // Rollback to v1.0
         let rolled_back = mgr.rollback_model(NrModelDomain::CsiPrediction);
         assert_eq!(rolled_back, Some("1.0".to_string()));
-        assert_eq!(mgr.get_model_status(NrModelDomain::CsiPrediction).unwrap().version, "1.0");
+        assert_eq!(
+            mgr.get_model_status(NrModelDomain::CsiPrediction)
+                .unwrap()
+                .version,
+            "1.0"
+        );
     }
 
     #[test]
@@ -1189,13 +1321,22 @@ mod tests {
         assert!(mgr.has_canary(NrModelDomain::BeamManagement));
 
         // Record good observations (accuracy > 0.80 threshold)
-        assert!(mgr.record_canary_observation(NrModelDomain::BeamManagement, 0.92).is_none());
-        assert!(mgr.record_canary_observation(NrModelDomain::BeamManagement, 0.91).is_none());
+        assert!(mgr
+            .record_canary_observation(NrModelDomain::BeamManagement, 0.92)
+            .is_none());
+        assert!(mgr
+            .record_canary_observation(NrModelDomain::BeamManagement, 0.91)
+            .is_none());
         // Third observation triggers promotion
         let result = mgr.record_canary_observation(NrModelDomain::BeamManagement, 0.93);
         assert_eq!(result, Some(true)); // Promoted
         assert!(!mgr.has_canary(NrModelDomain::BeamManagement));
-        assert_eq!(mgr.get_model_status(NrModelDomain::BeamManagement).unwrap().version, "2.0");
+        assert_eq!(
+            mgr.get_model_status(NrModelDomain::BeamManagement)
+                .unwrap()
+                .version,
+            "2.0"
+        );
     }
 
     #[test]
@@ -1211,7 +1352,12 @@ mod tests {
         mgr.record_canary_observation(NrModelDomain::BeamManagement, 0.55);
         let result = mgr.record_canary_observation(NrModelDomain::BeamManagement, 0.50);
         assert_eq!(result, Some(false)); // Rolled back
-        // Original version still active
-        assert_eq!(mgr.get_model_status(NrModelDomain::BeamManagement).unwrap().version, "1.0");
+                                         // Original version still active
+        assert_eq!(
+            mgr.get_model_status(NrModelDomain::BeamManagement)
+                .unwrap()
+                .version,
+            "1.0"
+        );
     }
 }

@@ -23,18 +23,17 @@
 
 use thiserror::Error;
 
-use nextgsim_nas::messages::mm::{
-    DeregistrationAcceptUeOriginating, DeregistrationAcceptUeTerminated,
-    DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated,
-    Ie5gsMobileIdentity,
-};
 use nextgsim_nas::ies::ie1::{
     DeRegistrationAccessType, IeDeRegistrationType, ReRegistrationRequired, SwitchOff,
 };
+use nextgsim_nas::messages::mm::{
+    DeregistrationAcceptUeOriginating, DeregistrationAcceptUeTerminated,
+    DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated, Ie5gsMobileIdentity,
+};
 // Use the MmCause from messages::mm (re-exported at crate root)
 // to match the types used in DeregistrationRequestUeTerminated
-use nextgsim_nas::MmCause;
 use nextgsim_nas::security::NasKeySetIdentifier;
+use nextgsim_nas::MmCause;
 
 use super::state::{MmState, MmSubState, RmState, UpdateStatus};
 use crate::timer::UeTimer;
@@ -228,9 +227,10 @@ impl DeregistrationProcedure {
 
         // Start T3521 for normal de-registration
         if dereg_type.switch_off == SwitchOff::NormalDeRegistration
-            && (mm_state == MmState::Registered || mm_state == MmState::RegisteredInitiated) {
-                self.t3521.start(true);
-            }
+            && (mm_state == MmState::Registered || mm_state == MmState::RegisteredInitiated)
+        {
+            self.t3521.start(true);
+        }
 
         Ok((request, MmSubState::DeregisteredInitiated))
     }
@@ -397,7 +397,9 @@ impl DeregistrationProcedure {
     /// Creates the deregistration type IE based on the cause.
     fn make_deregistration_type(cause: DeregistrationCause) -> IeDeRegistrationType {
         let switch_off = match cause {
-            DeregistrationCause::SwitchOff | DeregistrationCause::UsimRemoval => SwitchOff::SwitchOff,
+            DeregistrationCause::SwitchOff | DeregistrationCause::UsimRemoval => {
+                SwitchOff::SwitchOff
+            }
             _ => SwitchOff::NormalDeRegistration,
         };
 
@@ -464,14 +466,16 @@ impl DeregistrationProcedure {
                 invalidate_usim: false,
                 new_update_status: Some(UpdateStatus::RoamingNotAllowed),
             },
-            MmCause::TrackingAreaNotAllowed | MmCause::NoSuitableCellsInTa => CauseProcessingResult {
-                new_sub_state: MmSubState::DeregisteredLimitedService,
-                clear_guti: true,
-                clear_tai_list: true,
-                clear_equivalent_plmn: false,
-                invalidate_usim: false,
-                new_update_status: Some(UpdateStatus::RoamingNotAllowed),
-            },
+            MmCause::TrackingAreaNotAllowed | MmCause::NoSuitableCellsInTa => {
+                CauseProcessingResult {
+                    new_sub_state: MmSubState::DeregisteredLimitedService,
+                    clear_guti: true,
+                    clear_tai_list: true,
+                    clear_equivalent_plmn: false,
+                    invalidate_usim: false,
+                    new_update_status: Some(UpdateStatus::RoamingNotAllowed),
+                }
+            }
             MmCause::N1ModeNotAllowed => CauseProcessingResult {
                 new_sub_state: MmSubState::Null,
                 clear_guti: true,

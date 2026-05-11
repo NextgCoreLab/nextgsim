@@ -191,10 +191,7 @@ impl Task for SidelinkTask {
                         // Compute position estimate from sidelink measurements
                         // using trilateration from known peer positions
                         let position = self.compute_cooperative_position();
-                        debug!(
-                            "Sidelink: Cooperative positioning result={:?}",
-                            position
-                        );
+                        debug!("Sidelink: Cooperative positioning result={:?}", position);
                         if let Some(tx) = response_tx {
                             let _ = tx.send(position);
                         }

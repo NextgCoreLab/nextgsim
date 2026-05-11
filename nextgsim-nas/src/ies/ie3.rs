@@ -357,8 +357,7 @@ impl InformationElement3 for Ie5gMmCause {
 
     fn decode(stream: &OctetView) -> Result<Self, Ie3Error> {
         let val = stream.read();
-        let value = MmCause::try_from(val)
-            .map_err(|_| Ie3Error::InvalidValue(val, "MmCause"))?;
+        let value = MmCause::try_from(val).map_err(|_| Ie3Error::InvalidValue(val, "MmCause"))?;
         Ok(Self { value })
     }
 
@@ -386,8 +385,7 @@ impl InformationElement3 for Ie5gSmCause {
 
     fn decode(stream: &OctetView) -> Result<Self, Ie3Error> {
         let val = stream.read();
-        let value = SmCause::try_from(val)
-            .map_err(|_| Ie3Error::InvalidValue(val, "SmCause"))?;
+        let value = SmCause::try_from(val).map_err(|_| Ie3Error::InvalidValue(val, "SmCause"))?;
         Ok(Self { value })
     }
 
@@ -487,7 +485,10 @@ impl IeNasSecurityAlgorithms {
         integrity: TypeOfIntegrityProtectionAlgorithm,
         ciphering: TypeOfCipheringAlgorithm,
     ) -> Self {
-        Self { integrity, ciphering }
+        Self {
+            integrity,
+            ciphering,
+        }
     }
 }
 
@@ -500,7 +501,10 @@ impl InformationElement3 for IeNasSecurityAlgorithms {
             .map_err(|_| Ie3Error::InvalidValue(val, "TypeOfCipheringAlgorithm"))?;
         let integrity = TypeOfIntegrityProtectionAlgorithm::try_from(val & 0x0F)
             .map_err(|_| Ie3Error::InvalidValue(val, "TypeOfIntegrityProtectionAlgorithm"))?;
-        Ok(Self { integrity, ciphering })
+        Ok(Self {
+            integrity,
+            ciphering,
+        })
     }
 
     fn encode(&self, stream: &mut OctetString) {
@@ -525,7 +529,10 @@ impl IeEpsNasSecurityAlgorithms {
         integrity: EpsTypeOfIntegrityProtectionAlgorithm,
         ciphering: EpsTypeOfCipheringAlgorithm,
     ) -> Self {
-        Self { integrity, ciphering }
+        Self {
+            integrity,
+            ciphering,
+        }
     }
 }
 
@@ -538,7 +545,10 @@ impl InformationElement3 for IeEpsNasSecurityAlgorithms {
             .map_err(|_| Ie3Error::InvalidValue(val, "EpsTypeOfCipheringAlgorithm"))?;
         let integrity = EpsTypeOfIntegrityProtectionAlgorithm::try_from(val & 0x07)
             .map_err(|_| Ie3Error::InvalidValue(val, "EpsTypeOfIntegrityProtectionAlgorithm"))?;
-        Ok(Self { integrity, ciphering })
+        Ok(Self {
+            integrity,
+            ciphering,
+        })
     }
 
     fn encode(&self, stream: &mut OctetString) {
@@ -878,8 +888,10 @@ mod tests {
 
     #[test]
     fn test_ie_authentication_parameter_rand_encode_decode() {
-        let bytes = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                     0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+        let bytes = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
         let ie = IeAuthenticationParameterRand::from_bytes(bytes);
         let mut stream = OctetString::new();
         ie.encode(&mut stream);
@@ -904,7 +916,10 @@ mod tests {
 
         let view = OctetView::new(stream.data());
         let decoded = IeNasSecurityAlgorithms::decode(&view).unwrap();
-        assert_eq!(decoded.integrity, TypeOfIntegrityProtectionAlgorithm::Ia2_128);
+        assert_eq!(
+            decoded.integrity,
+            TypeOfIntegrityProtectionAlgorithm::Ia2_128
+        );
         assert_eq!(decoded.ciphering, TypeOfCipheringAlgorithm::Ea1_128);
     }
 
@@ -921,7 +936,10 @@ mod tests {
 
         let view = OctetView::new(stream.data());
         let decoded = IeEpsNasSecurityAlgorithms::decode(&view).unwrap();
-        assert_eq!(decoded.integrity, EpsTypeOfIntegrityProtectionAlgorithm::Eia1_128);
+        assert_eq!(
+            decoded.integrity,
+            EpsTypeOfIntegrityProtectionAlgorithm::Eia1_128
+        );
         assert_eq!(decoded.ciphering, EpsTypeOfCipheringAlgorithm::Eea2_128);
     }
 
@@ -936,7 +954,10 @@ mod tests {
         let view = OctetView::new(stream.data());
         let decoded = IeGprsTimer::decode(&view).unwrap();
         assert_eq!(decoded.timer_value, 10);
-        assert_eq!(decoded.timer_value_unit, GprsTimerValueUnit::MultiplesOf1Minute);
+        assert_eq!(
+            decoded.timer_value_unit,
+            GprsTimerValueUnit::MultiplesOf1Minute
+        );
     }
 
     #[test]
@@ -952,7 +973,10 @@ mod tests {
         let view = OctetView::new(stream.data());
         let decoded = IeIntegrityProtectionMaximumDataRate::decode(&view).unwrap();
         assert_eq!(decoded.max_rate_uplink, MaxDataRateUplink::FullDataRate);
-        assert_eq!(decoded.max_rate_downlink, MaxDataRateDownlink::SixtyFourKbps);
+        assert_eq!(
+            decoded.max_rate_downlink,
+            MaxDataRateDownlink::SixtyFourKbps
+        );
     }
 
     #[test]

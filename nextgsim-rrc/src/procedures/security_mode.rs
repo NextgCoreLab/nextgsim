@@ -160,7 +160,10 @@ pub fn build_security_mode_command(
     // Build security algorithm config
     let security_algorithm_config = SecurityAlgorithmConfig {
         ciphering_algorithm: params.security_algorithms.ciphering_algorithm.into(),
-        integrity_prot_algorithm: params.security_algorithms.integrity_algorithm.map(std::convert::Into::into),
+        integrity_prot_algorithm: params
+            .security_algorithms
+            .integrity_algorithm
+            .map(std::convert::Into::into),
     };
 
     // Build security config SMC
@@ -181,10 +184,13 @@ pub fn build_security_mode_command(
         ),
     };
 
-    let message_type =
-        DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::SecurityModeCommand(security_mode_command));
+    let message_type = DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::SecurityModeCommand(
+        security_mode_command,
+    ));
 
-    Ok(DL_DCCH_Message { message: message_type })
+    Ok(DL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse a Security Mode Command from a DL-DCCH message
@@ -220,8 +226,12 @@ pub fn parse_security_mode_command(
     };
 
     // Parse security algorithms
-    let ciphering_algorithm =
-        CipheringAlgorithmType::try_from(ies.security_config_smc.security_algorithm_config.ciphering_algorithm.clone())?;
+    let ciphering_algorithm = CipheringAlgorithmType::try_from(
+        ies.security_config_smc
+            .security_algorithm_config
+            .ciphering_algorithm
+            .clone(),
+    )?;
 
     let integrity_algorithm = ies
         .security_config_smc
@@ -284,7 +294,9 @@ pub fn build_security_mode_complete(
         security_mode_complete,
     ));
 
-    Ok(UL_DCCH_Message { message: message_type })
+    Ok(UL_DCCH_Message {
+        message: message_type,
+    })
 }
 
 /// Parse a Security Mode Complete from a UL-DCCH message
@@ -338,7 +350,9 @@ pub fn encode_security_mode_command(
 }
 
 /// Decode and parse a Security Mode Command from bytes
-pub fn decode_security_mode_command(bytes: &[u8]) -> Result<SecurityModeCommandData, RrcSecurityModeError> {
+pub fn decode_security_mode_command(
+    bytes: &[u8],
+) -> Result<SecurityModeCommandData, RrcSecurityModeError> {
     let msg: DL_DCCH_Message = decode_rrc(bytes)?;
     parse_security_mode_command(&msg)
 }
@@ -374,7 +388,6 @@ pub fn is_security_mode_complete(msg: &UL_DCCH_Message) -> bool {
         UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::SecurityModeComplete(_))
     )
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -437,7 +450,10 @@ mod tests {
         let data = parse_security_mode_command(&msg).unwrap();
 
         assert_eq!(data.rrc_transaction_id, 1);
-        assert_eq!(data.security_algorithms.ciphering_algorithm, CipheringAlgorithmType::Nea0);
+        assert_eq!(
+            data.security_algorithms.ciphering_algorithm,
+            CipheringAlgorithmType::Nea0
+        );
         assert_eq!(data.security_algorithms.integrity_algorithm, None);
     }
 

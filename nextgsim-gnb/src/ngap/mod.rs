@@ -20,11 +20,11 @@
 //! the appropriate tasks (RRC for NAS, GTP for PDU sessions).
 
 mod amf_context;
+pub mod mbs_context;
 mod task;
 mod ue_context;
-pub mod mbs_context;
 
 pub use amf_context::{AmfContextInfo, AmfState, NgapAmfContext};
+pub use mbs_context::{GnbMbsContext, MbsSessionState};
 pub use task::NgapTask;
 pub use ue_context::{NgapUeContext, UeState};
-pub use mbs_context::{GnbMbsContext, MbsSessionState};

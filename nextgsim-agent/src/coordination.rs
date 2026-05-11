@@ -201,9 +201,7 @@ impl MessageRouter {
 
     /// Register an agent profile so it can send/receive messages.
     pub fn register_agent(&mut self, profile: AgentProfile) {
-        self.mailboxes
-            .entry(profile.agent_id.clone())
-            .or_default();
+        self.mailboxes.entry(profile.agent_id.clone()).or_default();
         self.profiles.insert(profile.agent_id.clone(), profile);
     }
 
@@ -331,10 +329,7 @@ impl MessageRouter {
 
     /// Peek at the number of pending messages for an agent.
     pub fn pending_count(&self, agent_id: &AgentId) -> usize {
-        self.mailboxes
-            .get(agent_id)
-            .map(VecDeque::len)
-            .unwrap_or(0)
+        self.mailboxes.get(agent_id).map(VecDeque::len).unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -430,7 +425,9 @@ impl MessageRouter {
             .ok_or_else(|| format!("Composite {composite_id} not found"))?;
 
         if composite.state != CompositeState::Gathering {
-            return Err(format!("Composite {composite_id} is not in Gathering state"));
+            return Err(format!(
+                "Composite {composite_id} is not in Gathering state"
+            ));
         }
 
         composite.state = CompositeState::Ready;
@@ -611,7 +608,8 @@ impl DistributedCoordinator {
 
                 // Deliver to local mailbox (use deliver_remote since sender is cross-process)
                 if router.get_profile(&to_agent).is_some() {
-                    let _ = router.deliver_remote(&from_agent, &to_agent, msg.payload, Some(msg.id));
+                    let _ =
+                        router.deliver_remote(&from_agent, &to_agent, msg.payload, Some(msg.id));
                 }
             }
         }
@@ -793,8 +791,7 @@ mod tests {
     fn test_cell_level_cannot_create_composite() {
         let mut router = MessageRouter::new();
         router.register_agent(profile("cell-only", AgentRole::CellLevel));
-        let result =
-            router.create_composite(&AgentId::new("cell-only"), "attempt".to_string());
+        let result = router.create_composite(&AgentId::new("cell-only"), "attempt".to_string());
         assert!(result.is_err());
     }
 
@@ -931,7 +928,9 @@ mod tests {
         assert_eq!(coordinator.inbound_count().await, 0);
 
         // Check if message was delivered to local agent
-        let messages = coordinator.receive_messages(&AgentId::new("agent-local")).await;
+        let messages = coordinator
+            .receive_messages(&AgentId::new("agent-local"))
+            .await;
         assert_eq!(messages.len(), 1);
     }
 }

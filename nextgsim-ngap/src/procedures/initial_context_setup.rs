@@ -72,7 +72,6 @@ pub struct UeSecurityCapabilitiesValue {
     pub eutra_integrity_algorithms: Option<u16>,
 }
 
-
 /// Allowed S-NSSAI item
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedSnssaiValue {
@@ -204,7 +203,9 @@ pub fn parse_initial_context_setup_request(
             InitialContextSetupRequestProtocolIEs_EntryValue::Id_OldAMF(name) => {
                 old_amf = Some(name.0.clone());
             }
-            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UEAggregateMaximumBitRate(rate) => {
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UEAggregateMaximumBitRate(
+                rate,
+            ) => {
                 ue_aggregate_max_bit_rate = Some(parse_ue_aggregate_max_bit_rate(rate));
             }
             InitialContextSetupRequestProtocolIEs_EntryValue::Id_GUAMI(g) => {
@@ -251,7 +252,6 @@ pub fn parse_initial_context_setup_request(
         nas_pdu,
     })
 }
-
 
 fn parse_ue_aggregate_max_bit_rate(rate: &UEAggregateMaximumBitRate) -> UeAggregateMaxBitRate {
     UeAggregateMaxBitRate {
@@ -342,8 +342,9 @@ fn parse_ue_security_capabilities(caps: &UESecurityCapabilities) -> UeSecurityCa
     let eutra_encryption_algorithms = Some(parse_16bit_bitvec(&caps.eutr_aencryption_algorithms.0));
 
     // E-UTRA integrity algorithms is 16 bits
-    let eutra_integrity_algorithms =
-        Some(parse_16bit_bitvec(&caps.eutr_aintegrity_protection_algorithms.0));
+    let eutra_integrity_algorithms = Some(parse_16bit_bitvec(
+        &caps.eutr_aintegrity_protection_algorithms.0,
+    ));
 
     UeSecurityCapabilitiesValue {
         nr_encryption_algorithms,
@@ -422,7 +423,6 @@ pub fn build_initial_context_setup_response(
 
     Ok(NGAP_PDU::SuccessfulOutcome(successful_outcome))
 }
-
 
 /// Parse an Initial Context Setup Response from an NGAP PDU
 ///
@@ -668,7 +668,6 @@ fn build_misc_cause(cause: &MiscCause) -> CauseMisc {
     CauseMisc(value)
 }
 
-
 /// Parse an Initial Context Setup Failure from an NGAP PDU
 ///
 /// # Arguments
@@ -735,9 +734,7 @@ pub fn parse_initial_context_setup_failure(
 
 fn parse_cause(cause: &Cause) -> InitialContextSetupFailureCause {
     match cause {
-        Cause::RadioNetwork(rn) => {
-            NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn))
-        }
+        Cause::RadioNetwork(rn) => NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn)),
         Cause::Transport(t) => NgSetupFailureCause::Transport(parse_transport_cause(t)),
         Cause::Nas(n) => NgSetupFailureCause::Nas(parse_nas_cause(n)),
         Cause::Protocol(p) => NgSetupFailureCause::Protocol(parse_protocol_cause(p)),
@@ -966,7 +963,6 @@ pub fn is_initial_context_setup_failure(pdu: &NGAP_PDU) -> bool {
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,8 +1039,7 @@ mod tests {
         let params = create_test_response_params();
 
         // Build, encode, decode, and parse
-        let encoded =
-            encode_initial_context_setup_response(&params).expect("Failed to encode");
+        let encoded = encode_initial_context_setup_response(&params).expect("Failed to encode");
         let parsed =
             decode_initial_context_setup_response(&encoded).expect("Failed to decode and parse");
 
@@ -1110,8 +1105,7 @@ mod tests {
         let params = create_test_failure_params();
 
         // Build, encode, decode, and parse
-        let encoded =
-            encode_initial_context_setup_failure(&params).expect("Failed to encode");
+        let encoded = encode_initial_context_setup_failure(&params).expect("Failed to encode");
         let parsed =
             decode_initial_context_setup_failure(&encoded).expect("Failed to decode and parse");
 
@@ -1139,8 +1133,7 @@ mod tests {
                 cause: cause.clone(),
             };
 
-            let encoded =
-                encode_initial_context_setup_failure(&params).expect("Failed to encode");
+            let encoded = encode_initial_context_setup_failure(&params).expect("Failed to encode");
             let parsed =
                 decode_initial_context_setup_failure(&encoded).expect("Failed to decode and parse");
 
@@ -1193,8 +1186,8 @@ mod tests {
     #[test]
     fn test_ue_security_capabilities_value() {
         let caps = UeSecurityCapabilitiesValue {
-            nr_encryption_algorithms: 0xF000,    // NEA0, NEA1, NEA2, NEA3
-            nr_integrity_algorithms: 0xF000,     // NIA0, NIA1, NIA2, NIA3
+            nr_encryption_algorithms: 0xF000, // NEA0, NEA1, NEA2, NEA3
+            nr_integrity_algorithms: 0xF000,  // NIA0, NIA1, NIA2, NIA3
             eutra_encryption_algorithms: Some(0xF000),
             eutra_integrity_algorithms: Some(0xF000),
         };
@@ -1281,41 +1274,33 @@ mod tests {
         protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_GUAMI),
             criticality: Criticality(Criticality::REJECT),
-            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_GUAMI(
-                build_test_guami(),
-            ),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_GUAMI(build_test_guami()),
         });
 
         // Allowed NSSAI
-        let allowed_nssai = AllowedNSSAI(vec![
-            AllowedNSSAI_Item {
-                s_nssai: S_NSSAI {
-                    sst: SST(vec![1]),
-                    sd: Some(SD(vec![0x00, 0x00, 0x01])),
-                    ie_extensions: None,
-                },
+        let allowed_nssai = AllowedNSSAI(vec![AllowedNSSAI_Item {
+            s_nssai: S_NSSAI {
+                sst: SST(vec![1]),
+                sd: Some(SD(vec![0x00, 0x00, 0x01])),
                 ie_extensions: None,
             },
-        ]);
+            ie_extensions: None,
+        }]);
         protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_ALLOWED_NSSAI),
             criticality: Criticality(Criticality::REJECT),
-            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_AllowedNSSAI(
-                allowed_nssai,
-            ),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_AllowedNSSAI(allowed_nssai),
         });
 
         // UE Security Capabilities
         let ue_sec_caps = UESecurityCapabilities {
-            n_rencryption_algorithms: NRencryptionAlgorithms(
-                build_16bit_bitvec_from_u16(0xE000),
-            ),
+            n_rencryption_algorithms: NRencryptionAlgorithms(build_16bit_bitvec_from_u16(0xE000)),
             n_rintegrity_protection_algorithms: NRintegrityProtectionAlgorithms(
                 build_16bit_bitvec_from_u16(0xE000),
             ),
-            eutr_aencryption_algorithms: EUTRAencryptionAlgorithms(
-                build_16bit_bitvec_from_u16(0x0000),
-            ),
+            eutr_aencryption_algorithms: EUTRAencryptionAlgorithms(build_16bit_bitvec_from_u16(
+                0x0000,
+            )),
             eutr_aintegrity_protection_algorithms: EUTRAintegrityProtectionAlgorithms(
                 build_16bit_bitvec_from_u16(0x0000),
             ),
@@ -1331,18 +1316,17 @@ mod tests {
 
         // Security Key (256 bits)
         let key_bytes: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x1D, 0x1E, 0x1F, 0x20,
         ];
         let security_key_bv = BitVec::<u8, Msb0>::from_slice(&key_bytes);
         protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_SECURITY_KEY),
             criticality: Criticality(Criticality::REJECT),
-            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_SecurityKey(
-                SecurityKey(security_key_bv),
-            ),
+            value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_SecurityKey(SecurityKey(
+                security_key_bv,
+            )),
         });
 
         // Optional NAS PDU
@@ -1350,9 +1334,7 @@ mod tests {
             protocol_ies.push(InitialContextSetupRequestProtocolIEs_Entry {
                 id: ProtocolIE_ID(ID_NAS_PDU),
                 criticality: Criticality(Criticality::IGNORE),
-                value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(
-                    NAS_PDU(pdu),
-                ),
+                value: InitialContextSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(NAS_PDU(pdu)),
             });
         }
 
@@ -1378,8 +1360,8 @@ mod tests {
         assert!(!encoded.is_empty());
 
         // Decode and parse
-        let parsed = decode_initial_context_setup_request(&encoded)
-            .expect("Failed to decode request");
+        let parsed =
+            decode_initial_context_setup_request(&encoded).expect("Failed to decode request");
 
         assert_eq!(parsed.amf_ue_ngap_id, 12345);
         assert_eq!(parsed.ran_ue_ngap_id, 1);
@@ -1390,14 +1372,19 @@ mod tests {
         assert_eq!(parsed.allowed_nssai.len(), 1);
         assert_eq!(parsed.allowed_nssai[0].sst, 1);
         assert_eq!(parsed.allowed_nssai[0].sd, Some([0x00, 0x00, 0x01]));
-        assert_eq!(parsed.ue_security_capabilities.nr_encryption_algorithms, 0xE000);
-        assert_eq!(parsed.ue_security_capabilities.nr_integrity_algorithms, 0xE000);
+        assert_eq!(
+            parsed.ue_security_capabilities.nr_encryption_algorithms,
+            0xE000
+        );
+        assert_eq!(
+            parsed.ue_security_capabilities.nr_integrity_algorithms,
+            0xE000
+        );
         // Verify security key round-trips
         let expected_key: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x1D, 0x1E, 0x1F, 0x20,
         ];
         assert_eq!(parsed.security_key, expected_key);
         assert!(parsed.nas_pdu.is_none());
@@ -1409,8 +1396,7 @@ mod tests {
         let pdu = build_test_request_pdu(99999, 42, Some(nas_bytes.clone()));
 
         let encoded = encode_ngap_pdu(&pdu).expect("Failed to encode");
-        let parsed = decode_initial_context_setup_request(&encoded)
-            .expect("Failed to decode");
+        let parsed = decode_initial_context_setup_request(&encoded).expect("Failed to decode");
 
         assert_eq!(parsed.amf_ue_ngap_id, 99999);
         assert_eq!(parsed.ran_ue_ngap_id, 42);
@@ -1428,27 +1414,31 @@ mod tests {
     #[test]
     fn test_response_aper_byte_level_roundtrip() {
         let params = create_test_response_params();
-        let encoded = encode_initial_context_setup_response(&params)
-            .expect("Failed to encode");
+        let encoded = encode_initial_context_setup_response(&params).expect("Failed to encode");
 
         // Decode the PDU from bytes, then re-encode
         let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
         let re_encoded = encode_ngap_pdu(&decoded_pdu).expect("Failed to re-encode");
 
         // APER is deterministic: byte-for-byte match
-        assert_eq!(encoded, re_encoded, "APER re-encoding should produce identical bytes");
+        assert_eq!(
+            encoded, re_encoded,
+            "APER re-encoding should produce identical bytes"
+        );
     }
 
     #[test]
     fn test_failure_aper_byte_level_roundtrip() {
         let params = create_test_failure_params();
-        let encoded = encode_initial_context_setup_failure(&params)
-            .expect("Failed to encode");
+        let encoded = encode_initial_context_setup_failure(&params).expect("Failed to encode");
 
         let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
         let re_encoded = encode_ngap_pdu(&decoded_pdu).expect("Failed to re-encode");
 
-        assert_eq!(encoded, re_encoded, "APER re-encoding should produce identical bytes");
+        assert_eq!(
+            encoded, re_encoded,
+            "APER re-encoding should produce identical bytes"
+        );
     }
 
     #[test]
@@ -1459,6 +1449,9 @@ mod tests {
         let decoded_pdu = decode_ngap_pdu(&encoded).expect("Failed to decode");
         let re_encoded = encode_ngap_pdu(&decoded_pdu).expect("Failed to re-encode");
 
-        assert_eq!(encoded, re_encoded, "APER re-encoding should produce identical bytes");
+        assert_eq!(
+            encoded, re_encoded,
+            "APER re-encoding should produce identical bytes"
+        );
     }
 }

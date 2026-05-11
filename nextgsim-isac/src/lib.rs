@@ -200,8 +200,8 @@ impl TrackingState {
 
         if dt > 0.0 {
             // Simple Kalman-like update
-            let kalman_gain = self.position_uncertainty
-                / (self.position_uncertainty + measurement_uncertainty);
+            let kalman_gain =
+                self.position_uncertainty / (self.position_uncertainty + measurement_uncertainty);
 
             // Update position
             self.position.x += kalman_gain * (measured_position.x - self.position.x);
@@ -218,8 +218,7 @@ impl TrackingState {
             }
 
             // Update uncertainty
-            self.position_uncertainty =
-                ((1.0 - kalman_gain) * self.position_uncertainty).max(0.1);
+            self.position_uncertainty = ((1.0 - kalman_gain) * self.position_uncertainty).max(0.1);
 
             // Update quality based on update frequency and uncertainty
             self.quality = (1.0 / (1.0 + self.position_uncertainty / 10.0)).min(1.0) as f32;
@@ -658,8 +657,8 @@ pub fn fuse_positions(
 
     // Uncertainty estimate: geometric mean of measurement sigmas scaled by
     // residual.  Provides a reasonable single-number uncertainty.
-    let avg_sigma: f64 = measurements.iter().map(|m| m.uncertainty).sum::<f64>()
-        / measurements.len() as f64;
+    let avg_sigma: f64 =
+        measurements.iter().map(|m| m.uncertainty).sum::<f64>() / measurements.len() as f64;
     let uncertainty = avg_sigma * (1.0 + result.residual_norm.sqrt());
 
     Some((result.position, uncertainty))
@@ -1336,8 +1335,8 @@ pub fn fuse_multi_sensor(
         }
         if a_pos.len() >= 3 {
             if let Some(res) = trilaterate(&a_pos, &ranges, &w, &TrilaterationConfig::default()) {
-                let avg_sigma: f64 = toa_rtt.iter().map(|m| m.uncertainty).sum::<f64>()
-                    / toa_rtt.len() as f64;
+                let avg_sigma: f64 =
+                    toa_rtt.iter().map(|m| m.uncertainty).sum::<f64>() / toa_rtt.len() as f64;
                 estimates.push(SensorEstimate::isotropic(
                     SensingType::ToA,
                     res.position,
@@ -1636,8 +1635,8 @@ pub fn estimate_velocity_doppler(
     let _speed = velocity.magnitude();
 
     // Average radial velocity (for the scalar field)
-    let avg_radial: f64 = radial_vels.iter().map(|(_, vr, _)| *vr).sum::<f64>()
-        / radial_vels.len() as f64;
+    let avg_radial: f64 =
+        radial_vels.iter().map(|(_, vr, _)| *vr).sum::<f64>() / radial_vels.len() as f64;
 
     // Velocity uncertainty from the covariance of the LS solution: (A^T W A)^{-1}
     let vel_cov = invert_3x3(&atwa);
@@ -1938,11 +1937,7 @@ impl BistaticConfig {
             target.z - self.transmitter.z,
         );
         let tx_dist = tx_dir.magnitude();
-        let tx_unit = Vector3::new(
-            tx_dir.x / tx_dist,
-            tx_dir.y / tx_dist,
-            tx_dir.z / tx_dist,
-        );
+        let tx_unit = Vector3::new(tx_dir.x / tx_dist, tx_dir.y / tx_dist, tx_dir.z / tx_dist);
 
         let rx_dir = Vector3::new(
             self.receiver.x - target.x,
@@ -1950,11 +1945,7 @@ impl BistaticConfig {
             self.receiver.z - target.z,
         );
         let rx_dist = rx_dir.magnitude();
-        let rx_unit = Vector3::new(
-            rx_dir.x / rx_dist,
-            rx_dir.y / rx_dist,
-            rx_dir.z / rx_dist,
-        );
+        let rx_unit = Vector3::new(rx_dir.x / rx_dist, rx_dir.y / rx_dist, rx_dir.z / rx_dist);
 
         // Radial velocities
         let v_tx = target_velocity.x * tx_unit.x
@@ -2120,9 +2111,8 @@ impl IsacManager {
 
     /// Removes stale tracks
     pub fn cleanup_stale_tracks(&mut self, max_age_seconds: f64) {
-        self.tracking.retain(|_, state| {
-            state.last_update.elapsed().as_secs_f64() < max_age_seconds
-        });
+        self.tracking
+            .retain(|_, state| state.last_update.elapsed().as_secs_f64() < max_age_seconds);
     }
 
     /// Returns the number of active tracks
@@ -2373,16 +2363,8 @@ mod tests {
         }
 
         let pos = ekf.position();
-        assert!(
-            (pos.x - 40.0).abs() < 2.0,
-            "EKF x error: {} vs 40",
-            pos.x
-        );
-        assert!(
-            (pos.y - 30.0).abs() < 2.0,
-            "EKF y error: {} vs 30",
-            pos.y
-        );
+        assert!((pos.x - 40.0).abs() < 2.0, "EKF x error: {} vs 40", pos.x);
+        assert!((pos.y - 30.0).abs() < 2.0, "EKF y error: {} vs 30", pos.y);
     }
 
     #[test]
@@ -2403,16 +2385,8 @@ mod tests {
         }
 
         let pos = ekf.position();
-        assert!(
-            (pos.x - 40.0).abs() < 1.0,
-            "x: {} vs 40.0",
-            pos.x
-        );
-        assert!(
-            (pos.y - 30.0).abs() < 1.0,
-            "y: {} vs 30.0",
-            pos.y
-        );
+        assert!((pos.x - 40.0).abs() < 1.0, "x: {} vs 40.0", pos.x);
+        assert!((pos.y - 30.0).abs() < 1.0, "y: {} vs 30.0", pos.y);
     }
 
     #[test]
@@ -2469,16 +2443,8 @@ mod tests {
 
     #[test]
     fn test_bayesian_fuse_equal_weight() {
-        let est1 = SensorEstimate::isotropic(
-            SensingType::ToA,
-            Vector3::new(10.0, 0.0, 0.0),
-            1.0,
-        );
-        let est2 = SensorEstimate::isotropic(
-            SensingType::Rss,
-            Vector3::new(0.0, 0.0, 0.0),
-            1.0,
-        );
+        let est1 = SensorEstimate::isotropic(SensingType::ToA, Vector3::new(10.0, 0.0, 0.0), 1.0);
+        let est2 = SensorEstimate::isotropic(SensingType::Rss, Vector3::new(0.0, 0.0, 0.0), 1.0);
 
         let result = bayesian_fuse(&[est1, est2]).unwrap();
 
@@ -2532,16 +2498,8 @@ mod tests {
         let result = fuse_multi_sensor(&measurements, &anchors);
         assert!(result.is_some());
         let r = result.unwrap();
-        assert!(
-            (r.position.x - 40.0).abs() < 2.0,
-            "x: {}",
-            r.position.x
-        );
-        assert!(
-            (r.position.y - 30.0).abs() < 2.0,
-            "y: {}",
-            r.position.y
-        );
+        assert!((r.position.x - 40.0).abs() < 2.0, "x: {}", r.position.x);
+        assert!((r.position.y - 30.0).abs() < 2.0, "y: {}", r.position.y);
     }
 
     // --- Object detection tests ---
@@ -2620,13 +2578,9 @@ mod tests {
             doppler_measurements.push((id, fd, 1.0));
         }
 
-        let result = estimate_velocity_doppler(
-            &doppler_measurements,
-            carrier_freq,
-            Some(&target),
-            &anchors,
-        )
-        .unwrap();
+        let result =
+            estimate_velocity_doppler(&doppler_measurements, carrier_freq, Some(&target), &anchors)
+                .unwrap();
 
         assert!(result.velocity_3d.is_some());
         let v = result.velocity_3d.unwrap();
@@ -2743,16 +2697,8 @@ mod tests {
         let true_pos = Vector3::new(40.0, 30.0, 0.0);
         let ranges: Vec<(i32, f64, f64)> = vec![
             (1, true_pos.distance_to(&Vector3::new(0.0, 0.0, 0.0)), 1.0),
-            (
-                2,
-                true_pos.distance_to(&Vector3::new(100.0, 0.0, 0.0)),
-                1.0,
-            ),
-            (
-                3,
-                true_pos.distance_to(&Vector3::new(50.0, 86.6, 0.0)),
-                1.0,
-            ),
+            (2, true_pos.distance_to(&Vector3::new(100.0, 0.0, 0.0)), 1.0),
+            (3, true_pos.distance_to(&Vector3::new(50.0, 86.6, 0.0)), 1.0),
         ];
 
         for _ in 0..20 {
@@ -2762,16 +2708,8 @@ mod tests {
         let ekf = manager.get_ekf(42);
         assert!(ekf.is_some());
         let pos = ekf.unwrap().position();
-        assert!(
-            (pos.x - 40.0).abs() < 3.0,
-            "Manager EKF x: {}",
-            pos.x
-        );
-        assert!(
-            (pos.y - 30.0).abs() < 3.0,
-            "Manager EKF y: {}",
-            pos.y
-        );
+        assert!((pos.x - 40.0).abs() < 3.0, "Manager EKF x: {}", pos.x);
+        assert!((pos.y - 30.0).abs() < 3.0, "Manager EKF y: {}", pos.y);
     }
 
     #[test]

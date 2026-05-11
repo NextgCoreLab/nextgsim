@@ -136,13 +136,11 @@ pub struct PduSessionReleaseRequest {
 }
 
 /// Deregistration request parameters.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeregistrationRequest {
     /// Whether to perform switch-off (don't wait for response)
     pub switch_off: bool,
 }
-
 
 /// Action to be performed by the NAS task after CLI command processing.
 #[derive(Debug, Clone)]
@@ -247,13 +245,9 @@ impl CliHandler {
                 rm_state,
                 mm_state,
             ),
-            UeCliCommandType::PsRelease { psi } => {
-                self.handle_ps_release(*psi, rm_state, mm_state)
-            }
+            UeCliCommandType::PsRelease { psi } => self.handle_ps_release(*psi, rm_state, mm_state),
             UeCliCommandType::PsReleaseAll => self.handle_ps_release_all(rm_state, mm_state),
-            UeCliCommandType::EmergencyRegister => {
-                self.handle_emergency_register(mm_state)
-            }
+            UeCliCommandType::EmergencyRegister => self.handle_emergency_register(mm_state),
         }
     }
 
@@ -268,7 +262,10 @@ impl CliHandler {
 
         match info.to_yaml() {
             Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
-            Err(e) => (CliCommandResult::error(format!("Failed to serialize info: {e}")), NasAction::None),
+            Err(e) => (
+                CliCommandResult::error(format!("Failed to serialize info: {e}")),
+                NasAction::None,
+            ),
         }
     }
 
@@ -280,7 +277,7 @@ impl CliHandler {
         mm_sub_state: MmSubState,
     ) -> (CliCommandResult, NasAction) {
         use crate::app::UeStatusInfo;
-        
+
         let mut status = UeStatusInfo::new();
         status.set_rm_state(rm_state);
         status.set_mm_state(mm_state);
@@ -289,10 +286,13 @@ impl CliHandler {
         for &psi in &self.active_sessions {
             status.pdu_sessions.push(psi);
         }
-        
+
         match status.to_yaml() {
             Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
-            Err(e) => (CliCommandResult::error(format!("Failed to serialize status: {e}")), NasAction::None),
+            Err(e) => (
+                CliCommandResult::error(format!("Failed to serialize status: {e}")),
+                NasAction::None,
+            ),
         }
     }
 
@@ -321,7 +321,10 @@ impl CliHandler {
 
         match timers_info.to_yaml() {
             Ok(yaml) => (CliCommandResult::ok(yaml), NasAction::None),
-            Err(e) => (CliCommandResult::error(format!("Failed to serialize timers: {e}")), NasAction::None),
+            Err(e) => (
+                CliCommandResult::error(format!("Failed to serialize timers: {e}")),
+                NasAction::None,
+            ),
         }
     }
 
@@ -357,9 +360,7 @@ impl CliHandler {
         };
 
         (
-            CliCommandResult::ok(format!(
-                "Initiating deregistration (cause: {cause})"
-            )),
+            CliCommandResult::ok(format!("Initiating deregistration (cause: {cause})")),
             NasAction::Deregister { cause },
         )
     }
@@ -421,7 +422,11 @@ impl CliHandler {
 
         // Start the procedure transaction
         if let Some(pt) = self.pt_manager.get_mut(pti) {
-            pt.start(psi, SmMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                psi,
+                SmMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
 
         (
@@ -555,7 +560,8 @@ impl CliHandler {
                     return (
                         CliCommandResult::error(format!(
                             "No PTI available for release (allocated {}/{} sessions)",
-                            release_pairs.len(), count
+                            release_pairs.len(),
+                            count
                         )),
                         NasAction::None,
                     );
@@ -570,7 +576,10 @@ impl CliHandler {
             release_pairs.push((psi, pti));
         }
 
-        let psi_list: Vec<String> = release_pairs.iter().map(|(psi, _)| psi.to_string()).collect();
+        let psi_list: Vec<String> = release_pairs
+            .iter()
+            .map(|(psi, _)| psi.to_string())
+            .collect();
 
         (
             CliCommandResult::ok(format!(
@@ -827,7 +836,9 @@ mod tests {
             MmSubState::RegisteredNormalService,
         );
         assert!(result.success);
-        assert!(result.message.contains("Initiating PDU session establishment"));
+        assert!(result
+            .message
+            .contains("Initiating PDU session establishment"));
         match action {
             NasAction::EstablishPduSession {
                 psi,

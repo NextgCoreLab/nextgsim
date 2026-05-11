@@ -76,8 +76,7 @@ impl CylindricalGeofence {
         let lat1 = self.center.latitude.to_radians();
         let lat2 = pos.latitude.to_radians();
         // Haversine formula
-        let a = (dlat / 2.0).sin().powi(2)
-            + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+        let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
         let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
         let dist_m = 6_371_000.0 * c;
         let alt_ok = pos.altitude_msl >= self.floor_m && pos.altitude_msl <= self.ceiling_m;
@@ -144,7 +143,9 @@ impl UavContext {
         self.position_history.push_back((pos, ts));
 
         // Check for restricted geofence violations
-        self.geofences.iter().enumerate()
+        self.geofences
+            .iter()
+            .enumerate()
             .find(|(_, gf)| gf.restricted && gf.contains(&pos))
             .map(|(i, _)| i)
     }
@@ -223,14 +224,26 @@ mod tests {
     #[test]
     fn test_geofence_containment() {
         let gf = CylindricalGeofence {
-            center: GeoPosition { latitude: 37.0, longitude: -122.0, altitude_msl: 0.0 },
+            center: GeoPosition {
+                latitude: 37.0,
+                longitude: -122.0,
+                altitude_msl: 0.0,
+            },
             radius_m: 1000.0,
             floor_m: 0.0,
             ceiling_m: 400.0,
             restricted: true,
         };
-        let inside = GeoPosition { latitude: 37.001, longitude: -122.0, altitude_msl: 100.0 };
-        let outside = GeoPosition { latitude: 38.0, longitude: -122.0, altitude_msl: 100.0 };
+        let inside = GeoPosition {
+            latitude: 37.001,
+            longitude: -122.0,
+            altitude_msl: 100.0,
+        };
+        let outside = GeoPosition {
+            latitude: 38.0,
+            longitude: -122.0,
+            altitude_msl: 100.0,
+        };
         assert!(gf.contains(&inside));
         assert!(!gf.contains(&outside));
     }
@@ -239,15 +252,27 @@ mod tests {
     fn test_position_update_geofence_violation() {
         let mut ctx = UavContext::new(test_identity());
         ctx.add_geofence(CylindricalGeofence {
-            center: GeoPosition { latitude: 37.0, longitude: -122.0, altitude_msl: 0.0 },
+            center: GeoPosition {
+                latitude: 37.0,
+                longitude: -122.0,
+                altitude_msl: 0.0,
+            },
             radius_m: 1000.0,
             floor_m: 0.0,
             ceiling_m: 400.0,
             restricted: true,
         });
-        let outside = GeoPosition { latitude: 38.0, longitude: -122.0, altitude_msl: 100.0 };
+        let outside = GeoPosition {
+            latitude: 38.0,
+            longitude: -122.0,
+            altitude_msl: 100.0,
+        };
         assert!(ctx.update_position(outside).is_none());
-        let inside = GeoPosition { latitude: 37.001, longitude: -122.0, altitude_msl: 100.0 };
+        let inside = GeoPosition {
+            latitude: 37.001,
+            longitude: -122.0,
+            altitude_msl: 100.0,
+        };
         assert!(ctx.update_position(inside).is_some());
     }
 

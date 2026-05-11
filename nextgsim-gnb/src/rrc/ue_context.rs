@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 
-use crate::tasks::GutiMobileIdentity;
 use super::redcap::RedCapProcessor;
+use crate::tasks::GutiMobileIdentity;
 
 /// RRC connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -275,12 +275,12 @@ mod tests {
     #[test]
     fn test_rrc_ue_context_set_initial_id() {
         let mut ctx = RrcUeContext::new(1);
-        
+
         // Set random initial ID
         ctx.set_initial_id(0x123456789, false);
         assert_eq!(ctx.initial_id, Some(0x123456789));
         assert!(!ctx.is_initial_id_s_tmsi);
-        
+
         // Set S-TMSI initial ID
         ctx.set_initial_id(0x987654321, true);
         assert_eq!(ctx.initial_id, Some(0x987654321));
@@ -307,19 +307,19 @@ mod tests {
     fn test_rrc_ue_context_state_transitions() {
         let mut ctx = RrcUeContext::new(1);
         assert!(ctx.is_idle());
-        
+
         ctx.on_setup_request();
         assert_eq!(ctx.state, RrcState::SetupRequest);
         assert!(!ctx.is_idle());
         assert!(!ctx.is_connected());
-        
+
         ctx.on_setup_sent();
         assert_eq!(ctx.state, RrcState::SetupSent);
-        
+
         ctx.on_setup_complete();
         assert_eq!(ctx.state, RrcState::Connected);
         assert!(ctx.is_connected());
-        
+
         ctx.on_release();
         assert_eq!(ctx.state, RrcState::Releasing);
         assert!(!ctx.is_connected());
@@ -335,12 +335,12 @@ mod tests {
     #[test]
     fn test_rrc_ue_context_manager_create_ue() {
         let mut manager = RrcUeContextManager::new();
-        
+
         let ctx = manager.create_ue(1);
         assert_eq!(ctx.ue_id, 1);
         assert_eq!(manager.count(), 1);
         assert!(!manager.is_empty());
-        
+
         // Creating with same ID replaces
         let ctx = manager.create_ue(1);
         ctx.set_establishment_cause(5);
@@ -351,9 +351,9 @@ mod tests {
     #[test]
     fn test_rrc_ue_context_manager_try_find_ue() {
         let mut manager = RrcUeContextManager::new();
-        
+
         assert!(manager.try_find_ue(1).is_none());
-        
+
         manager.create_ue(1);
         assert!(manager.try_find_ue(1).is_some());
         assert_eq!(manager.try_find_ue(1).unwrap().ue_id, 1);
@@ -363,22 +363,22 @@ mod tests {
     fn test_rrc_ue_context_manager_try_find_ue_mut() {
         let mut manager = RrcUeContextManager::new();
         manager.create_ue(1);
-        
+
         let ctx = manager.try_find_ue_mut(1).unwrap();
         ctx.set_establishment_cause(7);
-        
+
         assert_eq!(manager.try_find_ue(1).unwrap().establishment_cause, 7);
     }
 
     #[test]
     fn test_rrc_ue_context_manager_find_or_create_ue() {
         let mut manager = RrcUeContextManager::new();
-        
+
         // Creates new context
         let ctx = manager.find_or_create_ue(1);
         ctx.set_establishment_cause(3);
         assert_eq!(manager.count(), 1);
-        
+
         // Returns existing context
         let ctx = manager.find_or_create_ue(1);
         assert_eq!(ctx.establishment_cause, 3);
@@ -391,12 +391,12 @@ mod tests {
         manager.create_ue(1);
         manager.create_ue(2);
         assert_eq!(manager.count(), 2);
-        
+
         let removed = manager.delete_ue(1);
         assert!(removed.is_some());
         assert_eq!(removed.unwrap().ue_id, 1);
         assert_eq!(manager.count(), 1);
-        
+
         // Deleting non-existent returns None
         let removed = manager.delete_ue(1);
         assert!(removed.is_none());
@@ -408,7 +408,7 @@ mod tests {
         manager.create_ue(1);
         manager.create_ue(2);
         manager.create_ue(3);
-        
+
         let mut ids = manager.ue_ids();
         ids.sort();
         assert_eq!(ids, vec![1, 2, 3]);
@@ -417,16 +417,16 @@ mod tests {
     #[test]
     fn test_rrc_ue_context_manager_connected_ue_ids() {
         let mut manager = RrcUeContextManager::new();
-        
+
         manager.create_ue(1);
         manager.try_find_ue_mut(1).unwrap().on_setup_complete();
-        
+
         manager.create_ue(2);
         // UE 2 stays in Idle
-        
+
         manager.create_ue(3);
         manager.try_find_ue_mut(3).unwrap().on_setup_complete();
-        
+
         let mut connected = manager.connected_ue_ids();
         connected.sort();
         assert_eq!(connected, vec![1, 3]);
@@ -437,7 +437,7 @@ mod tests {
         let mut manager = RrcUeContextManager::new();
         manager.create_ue(1);
         manager.create_ue(2);
-        
+
         let count = manager.iter().count();
         assert_eq!(count, 2);
     }

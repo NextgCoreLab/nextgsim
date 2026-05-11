@@ -71,8 +71,7 @@ pub use nextgsim_common::TaskMessage;
 /// Task lifecycle state.
 ///
 /// Based on UERANSIM's `NtsTask` lifecycle from `src/utils/nts.hpp`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TaskState {
     /// Task is created but not yet started
     #[default]
@@ -86,7 +85,6 @@ pub enum TaskState {
     /// Task terminated due to an error
     Failed,
 }
-
 
 impl std::fmt::Display for TaskState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -205,7 +203,6 @@ pub trait Task: Send + 'static {
     async fn run(&mut self, rx: mpsc::Receiver<TaskMessage<Self::Message>>);
 }
 
-
 // ============================================================================
 // App Task Messages
 // ============================================================================
@@ -322,7 +319,6 @@ pub enum UeCliCommandType {
     /// Initiate emergency registration
     EmergencyRegister,
 }
-
 
 // ============================================================================
 // NAS Task Messages
@@ -484,7 +480,6 @@ pub enum RrcMessage {
     // ========================================================================
     // 6G Message Routing (Rel-20 extensions)
     // ========================================================================
-
     /// AI/ML inference request (route to SHE Client)
     #[cfg(feature = "nextgsim-she")]
     SixgInferenceRequest {
@@ -521,7 +516,6 @@ pub enum RlfCause {
     /// Signal lost to connected cell
     SignalLostToConnectedCell,
 }
-
 
 // ============================================================================
 // RLS Task Messages
@@ -614,7 +608,6 @@ pub enum RlsMessage {
         pdu_list: Vec<u32>,
     },
 }
-
 
 // ============================================================================
 // 6G AI-native Network Function Messages (UE-side)
@@ -1120,7 +1113,6 @@ pub enum SemanticCodecResponse {
     },
 }
 
-
 // ============================================================================
 // Rel-18 Ranging Messages (TS 23.586)
 // ============================================================================
@@ -1580,7 +1572,6 @@ impl UeTaskBase {
     }
 }
 
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1649,8 +1640,7 @@ impl TaskManager {
         mpsc::Receiver<TaskMessage<RrcMessage>>,
         mpsc::Receiver<TaskMessage<RlsMessage>>,
     ) {
-        let (task_base, app_rx, nas_rx, rrc_rx, rls_rx) =
-            UeTaskBase::new(config, channel_capacity);
+        let (task_base, app_rx, nas_rx, rrc_rx, rls_rx) = UeTaskBase::new(config, channel_capacity);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1777,10 +1767,13 @@ impl TaskManager {
     }
 
     /// Registers a join handle for a spawned task.
-    pub fn register_task_handle(&mut self, task_id: TaskId, handle: JoinHandle<Result<(), TaskError>>) {
+    pub fn register_task_handle(
+        &mut self,
+        task_id: TaskId,
+        handle: JoinHandle<Result<(), TaskError>>,
+    ) {
         self.join_handles.insert(task_id, handle);
     }
-
 
     /// Initiates graceful shutdown of all tasks.
     ///
@@ -1858,7 +1851,6 @@ impl TaskManager {
     }
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1866,7 +1858,6 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     /// Creates a test `UeConfig` for unit tests.
     fn test_config() -> UeConfig {
@@ -2040,21 +2031,48 @@ mod tests {
             TaskManager::new(config, DEFAULT_CHANNEL_CAPACITY);
 
         // All tasks should start in Created state
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Nas), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Rrc), Some(TaskState::Created));
-        assert_eq!(manager.get_task_state(TaskId::Rls), Some(TaskState::Created));
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Nas),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Rrc),
+            Some(TaskState::Created)
+        );
+        assert_eq!(
+            manager.get_task_state(TaskId::Rls),
+            Some(TaskState::Created)
+        );
         // 6G AI-native network function tasks
         #[cfg(feature = "nextgsim-she")]
-        assert_eq!(manager.get_task_state(TaskId::SheClient), Some(TaskState::Created));
+        assert_eq!(
+            manager.get_task_state(TaskId::SheClient),
+            Some(TaskState::Created)
+        );
         #[cfg(feature = "nextgsim-nwdaf")]
-        assert_eq!(manager.get_task_state(TaskId::NwdafReporter), Some(TaskState::Created));
+        assert_eq!(
+            manager.get_task_state(TaskId::NwdafReporter),
+            Some(TaskState::Created)
+        );
         #[cfg(feature = "nextgsim-isac")]
-        assert_eq!(manager.get_task_state(TaskId::IsacSensor), Some(TaskState::Created));
+        assert_eq!(
+            manager.get_task_state(TaskId::IsacSensor),
+            Some(TaskState::Created)
+        );
         #[cfg(feature = "nextgsim-fl")]
-        assert_eq!(manager.get_task_state(TaskId::FlParticipant), Some(TaskState::Created));
+        assert_eq!(
+            manager.get_task_state(TaskId::FlParticipant),
+            Some(TaskState::Created)
+        );
         #[cfg(feature = "nextgsim-semantic")]
-        assert_eq!(manager.get_task_state(TaskId::SemanticCodec), Some(TaskState::Created));
+        assert_eq!(
+            manager.get_task_state(TaskId::SemanticCodec),
+            Some(TaskState::Created)
+        );
     }
 
     #[tokio::test]
@@ -2065,15 +2083,32 @@ mod tests {
 
         // Test state transitions
         manager.mark_task_started(TaskId::App);
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Running));
-        assert!(manager.get_task_info(TaskId::App).unwrap().started_at.is_some());
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Running)
+        );
+        assert!(manager
+            .get_task_info(TaskId::App)
+            .unwrap()
+            .started_at
+            .is_some());
 
         manager.mark_task_stopping(TaskId::App);
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Stopping));
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Stopping)
+        );
 
         manager.mark_task_stopped(TaskId::App);
-        assert_eq!(manager.get_task_state(TaskId::App), Some(TaskState::Stopped));
-        assert!(manager.get_task_info(TaskId::App).unwrap().stopped_at.is_some());
+        assert_eq!(
+            manager.get_task_state(TaskId::App),
+            Some(TaskState::Stopped)
+        );
+        assert!(manager
+            .get_task_info(TaskId::App)
+            .unwrap()
+            .stopped_at
+            .is_some());
     }
 
     #[tokio::test]
@@ -2150,12 +2185,21 @@ mod tests {
             cfg!(feature = "nextgsim-isac"),
             cfg!(feature = "nextgsim-fl"),
             cfg!(feature = "nextgsim-semantic"),
-        ].iter().filter(|&&x| x).count();
+        ]
+        .iter()
+        .filter(|&&x| x)
+        .count();
         assert_eq!(summary.len(), 4 + 3 + expected_6g);
 
         // Find App and Nas in summary
-        let app_state = summary.iter().find(|(id, _)| *id == TaskId::App).map(|(_, s)| *s);
-        let nas_state = summary.iter().find(|(id, _)| *id == TaskId::Nas).map(|(_, s)| *s);
+        let app_state = summary
+            .iter()
+            .find(|(id, _)| *id == TaskId::App)
+            .map(|(_, s)| *s);
+        let nas_state = summary
+            .iter()
+            .find(|(id, _)| *id == TaskId::Nas)
+            .map(|(_, s)| *s);
 
         assert_eq!(app_state, Some(TaskState::Running));
         assert_eq!(nas_state, Some(TaskState::Running));

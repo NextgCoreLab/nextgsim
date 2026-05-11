@@ -44,30 +44,160 @@ pub enum QosResourceType {
 pub fn standard_5qi_table() -> Vec<FiveQiCharacteristics> {
     vec![
         // GBR
-        FiveQiCharacteristics { five_qi: 1, resource_type: QosResourceType::Gbr, priority: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_bytes: 0, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 2, resource_type: QosResourceType::Gbr, priority: 40, packet_delay_budget_ms: 150, packet_error_rate_exp: 3, max_data_burst_bytes: 0, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 3, resource_type: QosResourceType::Gbr, priority: 30, packet_delay_budget_ms: 50, packet_error_rate_exp: 3, max_data_burst_bytes: 0, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 4, resource_type: QosResourceType::Gbr, priority: 50, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_bytes: 0, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 65, resource_type: QosResourceType::Gbr, priority: 7, packet_delay_budget_ms: 75, packet_error_rate_exp: 2, max_data_burst_bytes: 0, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 66, resource_type: QosResourceType::Gbr, priority: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_bytes: 0, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 67, resource_type: QosResourceType::Gbr, priority: 15, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_bytes: 0, averaging_window_ms: 2000 },
+        FiveQiCharacteristics {
+            five_qi: 1,
+            resource_type: QosResourceType::Gbr,
+            priority: 20,
+            packet_delay_budget_ms: 100,
+            packet_error_rate_exp: 2,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 2,
+            resource_type: QosResourceType::Gbr,
+            priority: 40,
+            packet_delay_budget_ms: 150,
+            packet_error_rate_exp: 3,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 3,
+            resource_type: QosResourceType::Gbr,
+            priority: 30,
+            packet_delay_budget_ms: 50,
+            packet_error_rate_exp: 3,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 4,
+            resource_type: QosResourceType::Gbr,
+            priority: 50,
+            packet_delay_budget_ms: 300,
+            packet_error_rate_exp: 6,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 65,
+            resource_type: QosResourceType::Gbr,
+            priority: 7,
+            packet_delay_budget_ms: 75,
+            packet_error_rate_exp: 2,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 66,
+            resource_type: QosResourceType::Gbr,
+            priority: 20,
+            packet_delay_budget_ms: 100,
+            packet_error_rate_exp: 2,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 67,
+            resource_type: QosResourceType::Gbr,
+            priority: 15,
+            packet_delay_budget_ms: 100,
+            packet_error_rate_exp: 3,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 2000,
+        },
         // Non-GBR
-        FiveQiCharacteristics { five_qi: 5, resource_type: QosResourceType::NonGbr, priority: 10, packet_delay_budget_ms: 100, packet_error_rate_exp: 6, max_data_burst_bytes: 0, averaging_window_ms: 0 },
-        FiveQiCharacteristics { five_qi: 6, resource_type: QosResourceType::NonGbr, priority: 60, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_bytes: 0, averaging_window_ms: 0 },
-        FiveQiCharacteristics { five_qi: 7, resource_type: QosResourceType::NonGbr, priority: 70, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_bytes: 0, averaging_window_ms: 0 },
-        FiveQiCharacteristics { five_qi: 8, resource_type: QosResourceType::NonGbr, priority: 80, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_bytes: 0, averaging_window_ms: 0 },
-        FiveQiCharacteristics { five_qi: 9, resource_type: QosResourceType::NonGbr, priority: 90, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_bytes: 0, averaging_window_ms: 0 },
+        FiveQiCharacteristics {
+            five_qi: 5,
+            resource_type: QosResourceType::NonGbr,
+            priority: 10,
+            packet_delay_budget_ms: 100,
+            packet_error_rate_exp: 6,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 0,
+        },
+        FiveQiCharacteristics {
+            five_qi: 6,
+            resource_type: QosResourceType::NonGbr,
+            priority: 60,
+            packet_delay_budget_ms: 300,
+            packet_error_rate_exp: 6,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 0,
+        },
+        FiveQiCharacteristics {
+            five_qi: 7,
+            resource_type: QosResourceType::NonGbr,
+            priority: 70,
+            packet_delay_budget_ms: 100,
+            packet_error_rate_exp: 3,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 0,
+        },
+        FiveQiCharacteristics {
+            five_qi: 8,
+            resource_type: QosResourceType::NonGbr,
+            priority: 80,
+            packet_delay_budget_ms: 300,
+            packet_error_rate_exp: 6,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 0,
+        },
+        FiveQiCharacteristics {
+            five_qi: 9,
+            resource_type: QosResourceType::NonGbr,
+            priority: 90,
+            packet_delay_budget_ms: 300,
+            packet_error_rate_exp: 6,
+            max_data_burst_bytes: 0,
+            averaging_window_ms: 0,
+        },
         // Delay-critical GBR (Rel-16+)
-        FiveQiCharacteristics { five_qi: 82, resource_type: QosResourceType::DelayCriticalGbr, priority: 19, packet_delay_budget_ms: 10, packet_error_rate_exp: 4, max_data_burst_bytes: 255, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 83, resource_type: QosResourceType::DelayCriticalGbr, priority: 22, packet_delay_budget_ms: 10, packet_error_rate_exp: 4, max_data_burst_bytes: 1354, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 84, resource_type: QosResourceType::DelayCriticalGbr, priority: 24, packet_delay_budget_ms: 30, packet_error_rate_exp: 5, max_data_burst_bytes: 1354, averaging_window_ms: 2000 },
-        FiveQiCharacteristics { five_qi: 85, resource_type: QosResourceType::DelayCriticalGbr, priority: 21, packet_delay_budget_ms: 5, packet_error_rate_exp: 5, max_data_burst_bytes: 255, averaging_window_ms: 2000 },
+        FiveQiCharacteristics {
+            five_qi: 82,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 19,
+            packet_delay_budget_ms: 10,
+            packet_error_rate_exp: 4,
+            max_data_burst_bytes: 255,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 83,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 22,
+            packet_delay_budget_ms: 10,
+            packet_error_rate_exp: 4,
+            max_data_burst_bytes: 1354,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 84,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 24,
+            packet_delay_budget_ms: 30,
+            packet_error_rate_exp: 5,
+            max_data_burst_bytes: 1354,
+            averaging_window_ms: 2000,
+        },
+        FiveQiCharacteristics {
+            five_qi: 85,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 21,
+            packet_delay_budget_ms: 5,
+            packet_error_rate_exp: 5,
+            max_data_burst_bytes: 255,
+            averaging_window_ms: 2000,
+        },
     ]
 }
 
 /// Lookup 5QI characteristics by value.
 pub fn lookup_5qi(five_qi: u16) -> Option<FiveQiCharacteristics> {
-    standard_5qi_table().into_iter().find(|c| c.five_qi == five_qi)
+    standard_5qi_table()
+        .into_iter()
+        .find(|c| c.five_qi == five_qi)
 }
 
 // ============================================================================
@@ -376,7 +506,7 @@ mod tests {
     fn test_default_dscp_mapping() {
         assert_eq!(default_qfi_to_dscp(0, 1), 46); // Voice -> EF
         assert_eq!(default_qfi_to_dscp(0, 2), 34); // Video -> AF41
-        assert_eq!(default_qfi_to_dscp(0, 9), 0);  // Best effort
+        assert_eq!(default_qfi_to_dscp(0, 9), 0); // Best effort
         assert_eq!(default_qfi_to_dscp(0, 82), 40); // XR -> CS5
     }
 
@@ -404,7 +534,7 @@ mod tests {
     #[test]
     fn test_token_bucket_rate_limit() {
         let mut bucket = TokenBucket::new(1000, 2000); // 1KB/s, 2KB burst
-        // Consume entire burst
+                                                       // Consume entire burst
         assert!(bucket.allow(2000));
         // Should be rate-limited now
         assert!(!bucket.allow(1000));

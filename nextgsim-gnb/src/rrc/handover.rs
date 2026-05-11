@@ -33,8 +33,8 @@
 //! - 3GPP TS 38.331: NR; RRC protocol specification
 //! - 3GPP TS 38.413: NGAP protocol
 
-use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -46,7 +46,10 @@ pub enum HandoverDecision {
     /// Intra-gNB handover to specified cell
     IntraGnbHandover { target_cell_id: i32 },
     /// Inter-gNB handover (not implemented yet)
-    InterGnbHandover { target_gnb_id: u32, target_cell_id: i32 },
+    InterGnbHandover {
+        target_gnb_id: u32,
+        target_cell_id: i32,
+    },
 }
 
 /// Handover state for a UE
@@ -187,7 +190,10 @@ impl GnbHandoverManager {
         // Check if handover is already in progress
         if let Some(ctx) = self.ue_contexts.get(&ue_id) {
             if !matches!(ctx.state, UeHandoverState::Idle | UeHandoverState::Failed) {
-                debug!("Ignoring measurement report - handover in progress for UE {}", ue_id);
+                debug!(
+                    "Ignoring measurement report - handover in progress for UE {}",
+                    ue_id
+                );
                 return HandoverDecision::NoHandover;
             }
         }
@@ -199,9 +205,10 @@ impl GnbHandoverManager {
             // Check A3 condition: neighbor > serving + offset - hysteresis
             let threshold = report.serving_rsrp + self.config.a3_offset - self.config.hysteresis;
             if neighbor.rsrp > threshold
-                && best_candidate.is_none_or(|(_, rsrp)| neighbor.rsrp > rsrp) {
-                    best_candidate = Some((neighbor.pci, neighbor.rsrp));
-                }
+                && best_candidate.is_none_or(|(_, rsrp)| neighbor.rsrp > rsrp)
+            {
+                best_candidate = Some((neighbor.pci, neighbor.rsrp));
+            }
         }
 
         if let Some((pci, rsrp)) = best_candidate {
@@ -210,7 +217,9 @@ impl GnbHandoverManager {
                 ue_id, pci, rsrp, report.serving_rsrp
             );
             // For now, use PCI as cell_id (in real impl, would lookup cell_id from PCI)
-            HandoverDecision::IntraGnbHandover { target_cell_id: pci as i32 }
+            HandoverDecision::IntraGnbHandover {
+                target_cell_id: pci as i32,
+            }
         } else {
             HandoverDecision::NoHandover
         }
@@ -246,7 +255,7 @@ impl GnbHandoverManager {
             ue_id,
             target_cell_id,
             target_pci: target_cell_id as u32, // Simplified: PCI = cell_id
-            new_ue_id: None, // Same UE ID for intra-gNB handover
+            new_ue_id: None,                   // Same UE ID for intra-gNB handover
             transaction_id,
         })
     }
@@ -267,7 +276,8 @@ impl GnbHandoverManager {
                 if let Some(start) = ctx.start_time {
                     info!(
                         "Handover complete for UE {}: duration={:?}",
-                        ue_id, start.elapsed()
+                        ue_id,
+                        start.elapsed()
                     );
                 }
 
@@ -328,15 +338,22 @@ impl GnbHandoverManager {
 
     /// Get handover state for a UE
     pub fn get_state(&self, ue_id: i32) -> UeHandoverState {
-        self.ue_contexts.get(&ue_id)
+        self.ue_contexts
+            .get(&ue_id)
             .map(|c| c.state)
             .unwrap_or(UeHandoverState::Idle)
     }
 
     /// Check if handover is in progress for a UE
     pub fn is_in_progress(&self, ue_id: i32) -> bool {
-        self.ue_contexts.get(&ue_id)
-            .map(|c| matches!(c.state, UeHandoverState::Preparing | UeHandoverState::Executing))
+        self.ue_contexts
+            .get(&ue_id)
+            .map(|c| {
+                matches!(
+                    c.state,
+                    UeHandoverState::Preparing | UeHandoverState::Executing
+                )
+            })
             .unwrap_or(false)
     }
 }
@@ -581,7 +598,8 @@ impl GnbHandoverManager {
     ) -> PathSwitchRequest {
         info!(
             "Building Path Switch Request for UE {}: {} PDU sessions",
-            ue_id, pdu_sessions.len()
+            ue_id,
+            pdu_sessions.len()
         );
 
         PathSwitchRequest {
@@ -611,7 +629,8 @@ impl GnbHandoverManager {
     ) -> bool {
         info!(
             "Received Path Switch Acknowledge for UE {}: {} PDU sessions updated",
-            ue_id, ack.pdu_sessions.len()
+            ue_id,
+            ack.pdu_sessions.len()
         );
 
         // Update UE context with new security context if provided
@@ -660,11 +679,15 @@ impl GnbHandoverManager {
     /// Complete Xn handover at target gNB (UE has arrived)
     pub fn complete_xn_handover(&mut self, ue_id: i32) -> bool {
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
-            if matches!(ctx.state, UeHandoverState::Preparing | UeHandoverState::Executing) {
+            if matches!(
+                ctx.state,
+                UeHandoverState::Preparing | UeHandoverState::Executing
+            ) {
                 if let Some(start) = ctx.start_time {
                     info!(
                         "Xn handover complete for UE {}: duration={:?}",
-                        ue_id, start.elapsed()
+                        ue_id,
+                        start.elapsed()
                     );
                 }
                 ctx.state = UeHandoverState::Complete;
@@ -792,8 +815,10 @@ impl DapsHandoverManager {
         }
 
         self.source_rlc_buffer_bytes += data_bytes;
-        debug!("DAPS: Forwarded {} bytes on source cell, total buffered: {}",
-               data_bytes, self.source_rlc_buffer_bytes);
+        debug!(
+            "DAPS: Forwarded {} bytes on source cell, total buffered: {}",
+            data_bytes, self.source_rlc_buffer_bytes
+        );
         true
     }
 
@@ -820,8 +845,10 @@ impl DapsHandoverManager {
         }
 
         self.target_rlc_buffer_bytes += data_bytes;
-        debug!("DAPS: Sent {} bytes on target cell, total buffered: {}",
-               data_bytes, self.target_rlc_buffer_bytes);
+        debug!(
+            "DAPS: Sent {} bytes on target cell, total buffered: {}",
+            data_bytes, self.target_rlc_buffer_bytes
+        );
         true
     }
 
@@ -835,7 +862,10 @@ impl DapsHandoverManager {
         }
 
         if let Some(start) = self.start_time {
-            info!("DAPS: Releasing source cell, handover duration: {:?}", start.elapsed());
+            info!(
+                "DAPS: Releasing source cell, handover duration: {:?}",
+                start.elapsed()
+            );
         }
 
         self.state = DapsHandoverState::Complete;
@@ -980,11 +1010,15 @@ impl GnbHandoverManager {
     /// Initiates data path switch from source to target cell.
     pub fn complete_daps_handover(&mut self, ue_id: i32) -> bool {
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
-            if matches!(ctx.state, UeHandoverState::Preparing | UeHandoverState::Executing) {
+            if matches!(
+                ctx.state,
+                UeHandoverState::Preparing | UeHandoverState::Executing
+            ) {
                 if let Some(start) = ctx.start_time {
                     info!(
                         "DAPS handover complete for UE {}: duration={:?}",
-                        ue_id, start.elapsed()
+                        ue_id,
+                        start.elapsed()
                     );
                 }
                 ctx.state = UeHandoverState::Complete;
@@ -1016,7 +1050,11 @@ impl DapsRrcReconfiguration {
         pdu.extend_from_slice(&(self.target_cell_config.pci as u16).to_be_bytes());
         pdu.extend_from_slice(&self.target_cell_config.crnti.to_be_bytes());
         pdu.extend_from_slice(&(self.t304_daps_ms as u16).to_be_bytes());
-        let flags = if self.data_forwarding_enabled { 0x01 } else { 0x00 };
+        let flags = if self.data_forwarding_enabled {
+            0x01
+        } else {
+            0x00
+        };
         pdu.push(flags);
         pdu
     }
@@ -1177,7 +1215,7 @@ mod tests {
         let pdu = cmd.build_rrc_pdu();
         assert_eq!(pdu[0], 0x00); // Message type
         assert_eq!(pdu[1], 5); // Transaction ID
-        // Target PCI = 16
+                               // Target PCI = 16
         assert_eq!(u16::from_be_bytes([pdu[2], pdu[3]]), 16);
         // Target cell ID = 100
         assert_eq!(i32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]), 100);
@@ -1188,10 +1226,10 @@ mod tests {
         let pdu = vec![
             0x0B, // Message type
             0x01, // meas_id
-            0x00, 0x01, // serving PCI
+            0x00, 0x01,   // serving PCI
             0xA6u8, // serving RSRP (-90 as signed byte)
-            0x01, // 1 neighbor
-            0x00, 0x02, // neighbor PCI = 2
+            0x01,   // 1 neighbor
+            0x00, 0x02,   // neighbor PCI = 2
             0xB0u8, // neighbor RSRP (-80 as signed byte)
         ];
 

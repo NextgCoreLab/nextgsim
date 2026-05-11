@@ -91,14 +91,15 @@ pub fn build_amf_status_indication(
     Ok(NGAP_PDU::InitiatingMessage(initiating_message))
 }
 
-fn build_unavailable_guami_list(
-    items: &[UnavailableGuamiItem],
-) -> UnavailableGUAMIList {
+fn build_unavailable_guami_list(items: &[UnavailableGuamiItem]) -> UnavailableGUAMIList {
     let list: Vec<UnavailableGUAMIItem> = items
         .iter()
         .map(|item| {
             let guami = build_guami(&item.guami);
-            let backup_amf_name = item.backup_amf_name.as_ref().map(|name| AMFName(name.clone()));
+            let backup_amf_name = item
+                .backup_amf_name
+                .as_ref()
+                .map(|name| AMFName(name.clone()));
 
             UnavailableGUAMIItem {
                 guami,
@@ -167,7 +168,8 @@ pub fn parse_amf_status_indication(
 
     for ie in &amf_status_indication.protocol_i_es.0 {
         #[allow(irrefutable_let_patterns)]
-        if let AMFStatusIndicationProtocolIEs_EntryValue::Id_UnavailableGUAMIList(list) = &ie.value {
+        if let AMFStatusIndicationProtocolIEs_EntryValue::Id_UnavailableGUAMIList(list) = &ie.value
+        {
             unavailable_guami_list = Some(parse_unavailable_guami_list(list));
         }
     }
@@ -179,9 +181,7 @@ pub fn parse_amf_status_indication(
     })
 }
 
-fn parse_unavailable_guami_list(
-    list: &UnavailableGUAMIList,
-) -> Vec<UnavailableGuamiItem> {
+fn parse_unavailable_guami_list(list: &UnavailableGUAMIList) -> Vec<UnavailableGuamiItem> {
     list.0
         .iter()
         .map(|item| {
@@ -204,7 +204,13 @@ fn parse_guami(guami: &GUAMI) -> GuamiValue {
         .unwrap_or([0, 0, 0]);
 
     let amf_region_id = if !guami.amf_region_id.0.is_empty() {
-        guami.amf_region_id.0.as_raw_slice().first().copied().unwrap_or(0)
+        guami
+            .amf_region_id
+            .0
+            .as_raw_slice()
+            .first()
+            .copied()
+            .unwrap_or(0)
     } else {
         0
     };

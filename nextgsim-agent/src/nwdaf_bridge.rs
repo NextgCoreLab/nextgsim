@@ -76,7 +76,11 @@ impl AgentNwdafBridge {
     /// Caches the result if it matches the agent's subscribed analytics
     /// and meets the minimum confidence threshold.
     pub fn ingest_analytics(&mut self, result: AnalyticsResult) {
-        if !self.config.subscribed_analytics.contains(&result.analytics_id) {
+        if !self
+            .config
+            .subscribed_analytics
+            .contains(&result.analytics_id)
+        {
             debug!(
                 "AgentNwdafBridge: ignoring {:?} (not subscribed)",
                 result.analytics_id

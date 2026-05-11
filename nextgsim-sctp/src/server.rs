@@ -11,7 +11,7 @@
 use bytes::Bytes;
 use sctp_proto::{
     Association, AssociationHandle, DatagramEvent, Endpoint, EndpointConfig, Event, Payload,
-    PayloadProtocolIdentifier, ServerConfig, TransportConfig, Transmit,
+    PayloadProtocolIdentifier, ServerConfig, Transmit, TransportConfig,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -76,10 +76,7 @@ pub enum ServerEvent {
         remote_addr: SocketAddr,
     },
     /// Association closed
-    AssociationClosed {
-        association_id: u64,
-        reason: String,
-    },
+    AssociationClosed { association_id: u64, reason: String },
     /// Data received from an association
     DataReceived {
         association_id: u64,
@@ -132,7 +129,10 @@ impl SctpServer {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
 
-        info!("SCTP server listening on {} (sctp-proto over UDP)", local_addr);
+        info!(
+            "SCTP server listening on {} (sctp-proto over UDP)",
+            local_addr
+        );
 
         // Create endpoint config
         let endpoint_config = EndpointConfig::new();
@@ -237,7 +237,8 @@ impl SctpServer {
         if let Some((handle, event)) = self.endpoint.handle(now, from, None, None, data) {
             match event {
                 DatagramEvent::NewAssociation(association) => {
-                    self.handle_new_association(handle, association, from).await?;
+                    self.handle_new_association(handle, association, from)
+                        .await?;
                 }
                 DatagramEvent::AssociationEvent(assoc_event) => {
                     self.handle_association_event(handle, assoc_event).await?;

@@ -81,18 +81,18 @@ pub mod sctp;
 pub mod tasks;
 
 // 6G AI-native network function modules
-pub mod she;
-pub mod nwdaf;
-pub mod nkef;
-pub mod isac;
 pub mod agent;
 pub mod fl;
+pub mod isac;
+pub mod nkef;
+pub mod nwdaf;
+pub mod she;
 
 // Rel-18 5G-Advanced modules
 pub mod energy;
 
 // Rel-17 protocol extensions
-pub mod daps;     // DAPS handover (TS 38.300 §10.1.2.4)
+pub mod daps; // DAPS handover (TS 38.300 §10.1.2.4)
 pub mod mbs_ngap; // MBS NGAP session procedures (TS 38.413 §8.21)
 
 // Re-export NGAP module types
@@ -100,12 +100,14 @@ pub use ngap::{AmfContextInfo, AmfState, NgapAmfContext, NgapTask, NgapUeContext
 
 // Re-export RRC module types
 pub use rrc::{
-    RrcConnectionManager, RrcReleaseResult, RrcSetupCompleteResult,
-    RrcSetupResult, RrcState, RrcTask, RrcUeContext, RrcUeContextManager,
+    RrcConnectionManager, RrcReleaseResult, RrcSetupCompleteResult, RrcSetupResult, RrcState,
+    RrcTask, RrcUeContext, RrcUeContextManager,
 };
 
 // Re-export SCTP module types
-pub use sctp::{AmfConnection, AmfConnectionConfig, AmfConnectionEvent, AmfConnectionState, SctpTask};
+pub use sctp::{
+    AmfConnection, AmfConnectionConfig, AmfConnectionEvent, AmfConnectionState, SctpTask,
+};
 
 // Re-export GTP module types
 pub use gtp::GtpTask;
@@ -115,8 +117,8 @@ pub use rls::RlsTask;
 
 // Re-export app module types
 pub use app::{
-    load_and_validate_gnb_config, load_gnb_config, load_gnb_config_from_str, validate_gnb_config,
-    parse_cli_command, AmfContext, AppTask, CliMessage, CliMessageType, CliResponse, CliServer,
+    load_and_validate_gnb_config, load_gnb_config, load_gnb_config_from_str, parse_cli_command,
+    validate_gnb_config, AmfContext, AppTask, CliMessage, CliMessageType, CliResponse, CliServer,
     CliServerError, ConfigError, ConfigValidationError, GnbCmdHandler, GnbStatusInfo,
     StatusReporter, UeContext, CLI_BUFFER_SIZE, CLI_MIN_LENGTH, CLI_RECV_TIMEOUT_MS,
     CLI_VERSION_MAJOR, CLI_VERSION_MINOR, CLI_VERSION_PATCH,
@@ -131,21 +133,19 @@ pub use tasks::{
 };
 
 // Re-export lifecycle management types
-pub use tasks::{
-    TaskError, TaskId, TaskInfo, TaskManager, TaskState, DEFAULT_SHUTDOWN_TIMEOUT_MS,
-};
+pub use tasks::{TaskError, TaskId, TaskInfo, TaskManager, TaskState, DEFAULT_SHUTDOWN_TIMEOUT_MS};
 
 // Re-export 6G AI-native network function types
-pub use she::SheTask;
-pub use nwdaf::NwdafTask;
-pub use nkef::NkefTask;
-pub use isac::IsacTask;
 pub use agent::AgentTask;
 pub use fl::FlAggregatorTask;
+pub use isac::IsacTask;
+pub use nkef::NkefTask;
+pub use nwdaf::NwdafTask;
+pub use she::SheTask;
 
 // Re-export Rel-18 5G-Advanced types
 pub use energy::EnergyTask;
 
 // Re-export Rel-17 protocol extension types
-pub use daps::{DapsManager, DapsSession, DapsState, DapsRlcBearer};
-pub use mbs_ngap::{NgapMbsManager, GnbMbsSession, GnbMbsState, MbsFlow};
+pub use daps::{DapsManager, DapsRlcBearer, DapsSession, DapsState};
+pub use mbs_ngap::{GnbMbsSession, GnbMbsState, MbsFlow, NgapMbsManager};
