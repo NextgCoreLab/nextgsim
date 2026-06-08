@@ -1,8 +1,16 @@
 //! Statistical anomaly detection using z-score
 //!
-//! Implements a sliding-window anomaly detector that maintains running
-//! statistics (mean and standard deviation) over measurement history
-//! and flags values whose z-score exceeds a configurable threshold.
+//! Implements a sliding-window anomaly detector over measurement history that
+//! flags values whose z-score exceeds a configurable threshold.
+//!
+//! Two scoring modes are available:
+//! - **Classic** (default): mean / standard-deviation z-score. Assumes the
+//!   metric is roughly Gaussian.
+//! - **Robust** ([`AnomalyDetector::with_robust_scoring`]): median / MAD
+//!   modified z-score (Iglewicz–Hoaglin). Use it for skewed or heavy-tailed
+//!   metrics (latency, throughput, PRB usage) where the Gaussian assumption
+//!   produces false anomalies, and to resist outlier-contaminated baselines
+//!   that inflate the mean/std and mask real anomalies.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -18,11 +26,14 @@ pub struct Anomaly {
     pub entity_id: String,
     /// The observed value
     pub observed_value: f64,
-    /// Expected mean at the time of detection
+    /// Expected center at the time of detection (mean in classic mode, median
+    /// in robust mode)
     pub expected_mean: f64,
-    /// Standard deviation at the time of detection
+    /// Spread estimate at the time of detection (standard deviation in classic
+    /// mode, MAD-derived sigma in robust mode)
     pub std_deviation: f64,
-    /// Z-score of the observed value
+    /// Score of the observed value (Gaussian z-score in classic mode, modified
+    /// z-score in robust mode)
     pub z_score: f64,
     /// Timestamp of the measurement (ms since epoch)
     pub timestamp_ms: u64,
@@ -103,6 +114,52 @@ impl MetricStats {
     fn len(&self) -> usize {
         self.values.len()
     }
+
+    /// Classic (Gaussian) location/scale: `(mean, std_dev)` over the window.
+    fn classic_stats(&self) -> (f64, f64) {
+        let n = self.values.len() as f64;
+        if n < 1.0 {
+            return (0.0, 0.0);
+        }
+        let mean = self.sum / n;
+        let variance = if n > 1.0 {
+            (self.sum_sq / n) - (mean * mean)
+        } else {
+            0.0
+        };
+        (mean, variance.max(0.0).sqrt())
+    }
+
+    /// Robust location/scale: `(median, sigma_estimate)` where the sigma estimate
+    /// is the Median Absolute Deviation scaled by `1/0.6745` so it is comparable
+    /// to a standard deviation for normally distributed data (letting the same
+    /// threshold apply). Resists skewed distributions and outlier-contaminated
+    /// baselines that inflate mean/std. Returns `None` with fewer than 2 values.
+    fn robust_stats(&self) -> Option<(f64, f64)> {
+        if self.values.len() < 2 {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.values.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = median_of_sorted(&sorted);
+        let mut devs: Vec<f64> = sorted.iter().map(|v| (v - median).abs()).collect();
+        devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mad = median_of_sorted(&devs);
+        // 0.6745 = Phi^-1(0.75); MAD/0.6745 is a consistent estimator of sigma.
+        Some((median, mad / 0.6745))
+    }
+}
+
+/// Median of an already-sorted slice (0.0 for an empty slice).
+fn median_of_sorted(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
 }
 
 /// Statistical anomaly detector using z-score analysis
@@ -147,6 +204,10 @@ pub struct AnomalyDetector {
     recent_anomalies: VecDeque<Anomaly>,
     /// Maximum stored anomalies
     max_anomalies: usize,
+    /// When true, use the robust median/MAD modified z-score instead of the
+    /// Gaussian mean/std z-score. Robust scoring avoids false anomalies on
+    /// skewed metrics (e.g. latency) and resists outlier-contaminated baselines.
+    robust: bool,
 }
 
 impl AnomalyDetector {
@@ -164,6 +225,7 @@ impl AnomalyDetector {
             min_samples: 10,
             recent_anomalies: VecDeque::with_capacity(1000),
             max_anomalies: 1000,
+            robust: false,
         }
     }
 
@@ -171,6 +233,22 @@ impl AnomalyDetector {
     pub fn with_min_samples(mut self, min_samples: usize) -> Self {
         self.min_samples = min_samples;
         self
+    }
+
+    /// Enables robust (median/MAD modified z-score) scoring.
+    ///
+    /// Use this for metrics whose distribution is skewed or heavy-tailed (most
+    /// network KPIs: latency, throughput, PRB usage), where the Gaussian
+    /// mean/std z-score over- or under-flags. The reported `expected_mean` and
+    /// `std_deviation` then carry the median and the MAD-derived sigma estimate.
+    pub fn with_robust_scoring(mut self) -> Self {
+        self.robust = true;
+        self
+    }
+
+    /// Returns whether robust (median/MAD) scoring is enabled.
+    pub fn is_robust(&self) -> bool {
+        self.robust
     }
 
     /// Checks a measurement value for anomalies
@@ -203,41 +281,36 @@ impl AnomalyDetector {
         // is compared against the historical distribution
         let count_before = stats.len();
 
-        // We need pre-push mean/std for comparison, but the running stats
-        // are designed around push. So we compute manually from the window
-        // content before pushing.
-        let (pre_mean, pre_std) = if count_before >= self.min_samples {
-            let n = stats.values.len() as f64;
-            let mean = stats.sum / n;
-            let variance = if n > 1.0 {
-                (stats.sum_sq / n) - (mean * mean)
-            } else {
-                0.0
-            };
-            (mean, variance.max(0.0).sqrt())
-        } else {
+        // Compute the reference location/scale from the window BEFORE pushing
+        // the new value, so the value is compared against the historical
+        // distribution. Classic mode uses mean/std (assumes ~Gaussian); robust
+        // mode uses median + MAD-derived sigma (Iglewicz–Hoaglin modified
+        // z-score), which resists skewed metrics and outlier-contaminated
+        // baselines.
+        let (center, scale) = if count_before < self.min_samples {
             (0.0, 0.0)
+        } else if self.robust {
+            stats.robust_stats().unwrap_or_else(|| stats.classic_stats())
+        } else {
+            stats.classic_stats()
         };
 
-        // Now push the value (updates running stats)
-        let (_new_mean, _new_std) = stats.push(value);
+        // Now push the value (updates running stats / window)
+        stats.push(value);
 
         // Only detect anomalies once we have enough history
         if count_before < self.min_samples {
             return Vec::new();
         }
 
-        // Avoid division by zero: if std_dev is near zero, all values
-        // are essentially the same, so any deviation is anomalous
-        let z_score = if pre_std > f64::EPSILON {
-            (value - pre_mean).abs() / pre_std
+        // Avoid division by zero: if the scale is near zero, the window is
+        // essentially constant, so any deviation is anomalous.
+        let z_score = if scale > f64::EPSILON {
+            (value - center).abs() / scale
+        } else if (value - center).abs() > f64::EPSILON {
+            self.threshold + 1.0 // Force detection
         } else {
-            // If std is ~0, any value different from the mean is infinitely anomalous
-            if (value - pre_mean).abs() > f64::EPSILON {
-                self.threshold + 1.0 // Force detection
-            } else {
-                0.0 // Exact match
-            }
+            0.0 // Exact match
         };
 
         if z_score > self.threshold {
@@ -253,8 +326,8 @@ impl AnomalyDetector {
                 metric_name: metric_name.to_string(),
                 entity_id: entity_id.to_string(),
                 observed_value: value,
-                expected_mean: pre_mean,
-                std_deviation: pre_std,
+                expected_mean: center,
+                std_deviation: scale,
                 z_score,
                 timestamp_ms,
                 severity,
@@ -491,6 +564,51 @@ mod tests {
         detector.reset();
         assert_eq!(detector.tracked_streams(), 0);
         assert!(detector.recent_anomalies().is_empty());
+    }
+
+    #[test]
+    fn test_robust_scoring_resists_baseline_contamination() {
+        // A single huge outlier in the baseline inflates mean/std so much that
+        // the classic z-score masks a later genuine anomaly. The robust
+        // median/MAD score is unaffected and still catches it.
+        let mut baseline: Vec<f64> = (0..29).map(|i| 8.0 + (i % 5) as f64).collect();
+        baseline.push(1000.0); // contaminant
+
+        let mut classic = AnomalyDetector::new(3.0, 100).with_min_samples(10);
+        let mut robust = AnomalyDetector::new(3.0, 100)
+            .with_min_samples(10)
+            .with_robust_scoring();
+        for (i, &x) in baseline.iter().enumerate() {
+            classic.check("lat", "cell-1", x, i as u64);
+            robust.check("lat", "cell-1", x, i as u64);
+        }
+
+        // 50.0 is a genuine anomaly relative to the ~8..12 baseline.
+        let classic_hit = classic.check("lat", "cell-1", 50.0, 2000);
+        let robust_hit = robust.check("lat", "cell-1", 50.0, 2000);
+
+        assert!(
+            classic_hit.is_empty(),
+            "classic z-score is masked by the contaminated baseline (std inflated)"
+        );
+        assert!(
+            !robust_hit.is_empty(),
+            "robust median/MAD score should still flag the genuine anomaly"
+        );
+        assert!(robust.is_robust() && !classic.is_robust());
+    }
+
+    #[test]
+    fn test_robust_scoring_still_detects_clean_spike() {
+        // Sanity: robust mode still flags an obvious spike on a clean baseline.
+        let mut detector = AnomalyDetector::new(3.0, 100)
+            .with_min_samples(10)
+            .with_robust_scoring();
+        for i in 0..30 {
+            detector.check("rsrp", "ue-1", -80.0 + (i % 3) as f64 * 0.5, i as u64);
+        }
+        let hit = detector.check("rsrp", "ue-1", -20.0, 3000);
+        assert!(!hit.is_empty(), "robust mode must still catch a large spike");
     }
 
     #[test]
