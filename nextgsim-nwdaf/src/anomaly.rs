@@ -290,7 +290,9 @@ impl AnomalyDetector {
         let (center, scale) = if count_before < self.min_samples {
             (0.0, 0.0)
         } else if self.robust {
-            stats.robust_stats().unwrap_or_else(|| stats.classic_stats())
+            stats
+                .robust_stats()
+                .unwrap_or_else(|| stats.classic_stats())
         } else {
             stats.classic_stats()
         };
@@ -608,7 +610,10 @@ mod tests {
             detector.check("rsrp", "ue-1", -80.0 + (i % 3) as f64 * 0.5, i as u64);
         }
         let hit = detector.check("rsrp", "ue-1", -20.0, 3000);
-        assert!(!hit.is_empty(), "robust mode must still catch a large spike");
+        assert!(
+            !hit.is_empty(),
+            "robust mode must still catch a large spike"
+        );
     }
 
     #[test]

@@ -2405,7 +2405,10 @@ mod tests {
 
         // The refused round must not have consumed additional budget.
         let tracker = aggregator.privacy_tracker().expect("tracker");
-        assert_eq!(tracker.rounds_tracked, 1, "refused round must not be tracked");
+        assert_eq!(
+            tracker.rounds_tracked, 1,
+            "refused round must not be tracked"
+        );
     }
 
     #[test]
