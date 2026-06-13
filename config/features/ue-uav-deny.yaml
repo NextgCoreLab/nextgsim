@@ -1,4 +1,4 @@
-# W6 feature test — UAV geofence DENY, Rel-18 (TS 23.256).
+# Rel-17/18 feature test — UAV geofence DENY, Rel-18 (TS 23.256).
 # Aerial UE reporting altitude 200 m, above the AMF default geofence ceiling
 # (120 m). The UAV tracking report (0x6A) triggers an altitude violation and the
 # AMF revokes the flight authorization. Exercises:
@@ -54,7 +54,7 @@ tun_name: "uesimtun0"
 
 redcap: false
 
-# --- W6 feature under test: aerial UE, above-ceiling altitude (deny) ---
+# --- Feature under test: aerial UE, above-ceiling altitude (deny) ---
 uav_config:
   is_aerial_ue: true
   uav_id: "FAA-N12345"

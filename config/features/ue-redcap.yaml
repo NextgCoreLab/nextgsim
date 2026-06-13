@@ -1,9 +1,9 @@
-# W6 feature test — SNPN accept, Rel-17 (TS 23.501 §5.30).
-# UE carries NID 7AB01234567; gNB broadcasts the same NID (gnb-snpn-accept.yaml),
-# and the AMF is started with AMF_SNPN_ALLOWED_NIDS=7AB01234567 so the NID
-# validates and registration proceeds. Exercises:
-#   UE  : "SNPN registration: including NID=7AB01234567"
-#   AMF : "SNPN registration authorized for NID=7AB01234567"
+# Rel-17/18 feature test — RedCap (Reduced Capability) UE, Rel-17 (TS 38.101).
+# Baseline 999-70 UE + redcap: true. Exercises:
+#   UE  : "Signalling RedCap (Reduced Capability) indication in RRCSetupComplete"
+#   gNB : "RedCap UE[..]: scheduler bandwidth restricted to .. MHz"
+#   AMF : "UE indicates RedCap (Reduced Capability) device" + "redcap=true"
+#   SMF : "RedCap UE: session-AMBR reduced from UL/DL .."
 supi:
   supi_type: Imsi
   value: "999700000000001"
@@ -51,10 +51,5 @@ configured_nssai:
 
 tun_name: "uesimtun0"
 
-redcap: false
-
-# --- W6 feature under test: SNPN with served NID ---
-snpn_config:
-  nid: "7AB01234567"
-  cag_ids: []
-  onboarding_enabled: false
+# --- Feature under test ---
+redcap: true

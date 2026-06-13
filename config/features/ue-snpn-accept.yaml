@@ -1,11 +1,9 @@
-# W6 feature test — UAV geofence ALLOW, Rel-18 (TS 23.256).
-# Aerial UE reporting altitude 100 m, inside the AMF default geofence ceiling
-# (120 m). Registration includes the UAV indication (IEI 0xA8); after security
-# the UE sends a UAV tracking report (0x6A) that the AMF allows. Exercises:
-#   UE  : "UAV registration: including aerial-UE indication (CAA-ID=FAA-N12345)"
-#   UE  : "UAV tracking report: CAA-ID=FAA-N12345"
-#   AMF : "UAV registration: aerial UE authorized (CAA-ID=FAA-N12345)"
-#   AMF : "[UAV Tracking] Geofence ALLOW: UAV FAA-N12345"
+# Rel-17/18 feature test — SNPN accept, Rel-17 (TS 23.501 §5.30).
+# UE carries NID 7AB01234567; gNB broadcasts the same NID (gnb-snpn-accept.yaml),
+# and the AMF is started with AMF_SNPN_ALLOWED_NIDS=7AB01234567 so the NID
+# validates and registration proceeds. Exercises:
+#   UE  : "SNPN registration: including NID=7AB01234567"
+#   AMF : "SNPN registration authorized for NID=7AB01234567"
 supi:
   supi_type: Imsi
   value: "999700000000001"
@@ -55,11 +53,8 @@ tun_name: "uesimtun0"
 
 redcap: false
 
-# --- W6 feature under test: aerial UE, in-zone altitude (allow) ---
-uav_config:
-  is_aerial_ue: true
-  uav_id: "FAA-N12345"
-  uss_address: null
-  max_altitude_meters: 100.0
-  remote_id_enabled: true
-  c2_link_required: false
+# --- Feature under test: SNPN with served NID ---
+snpn_config:
+  nid: "7AB01234567"
+  cag_ids: []
+  onboarding_enabled: false

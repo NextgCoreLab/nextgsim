@@ -1,4 +1,4 @@
-# W6 feature test — MINT / disaster-roaming, Rel-18 (TS 23.761).
+# Rel-17/18 feature test — MINT / disaster-roaming, Rel-18 (TS 23.761).
 # Baseline 999-70 UE holding a secondary SUPI 999700000000002 (seeded in Mongo).
 # After the primary registers, the UE initiates a simultaneous registration for
 # the secondary SUPI with the disaster-roaming indication (IEI 0xA7), and the
@@ -64,7 +64,7 @@ tun_name: "uesimtun0"
 
 redcap: false
 
-# --- W6 feature under test: MINT multi-SUPI / disaster roaming ---
+# --- Feature under test: MINT multi-SUPI / disaster roaming ---
 mint_config:
   enabled: true
   secondary_supis:

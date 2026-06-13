@@ -1,4 +1,4 @@
-# W6 feature test — SNPN reject, Rel-17 (TS 23.501 §5.30).
+# Rel-17/18 feature test — SNPN reject, Rel-17 (TS 23.501 §5.30).
 # UE carries a bogus NID 00000000000; gNB broadcasts that NID so the UE camps
 # (gnb-snpn-reject.yaml), but the AMF is started with
 # AMF_SNPN_ALLOWED_NIDS=7AB01234567, so the NID fails validation and the AMF
@@ -54,7 +54,7 @@ tun_name: "uesimtun0"
 
 redcap: false
 
-# --- W6 feature under test: SNPN with a NID NOT in the AMF allowed list ---
+# --- Feature under test: SNPN with a NID NOT in the AMF allowed list ---
 snpn_config:
   nid: "00000000000"
   cag_ids: []

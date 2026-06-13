@@ -1,10 +1,11 @@
-# W6 feature test — XR (Extended Reality) 5QI, Rel-18 (TS 23.501 5.7.4 / TS 22.261).
-# Baseline 999-70 UE + a second PDU session requesting XR 5QI 82. The XR session
-# omits `apn` so the UE auto-selects the XR DNN (logs "XR PDU session requested").
-# Exercises:
-#   UE  : "XR PDU session requested (5QI=82) — selecting XR DNN"
-#   SMF : "XR QoS flow bound: 5QI=82" + "PFCP: installing XR QER"
-#   UPF : "Installed XR QER"
+# Rel-17/18 feature test — UAV geofence ALLOW, Rel-18 (TS 23.256).
+# Aerial UE reporting altitude 100 m, inside the AMF default geofence ceiling
+# (120 m). Registration includes the UAV indication (IEI 0xA8); after security
+# the UE sends a UAV tracking report (0x6A) that the AMF allows. Exercises:
+#   UE  : "UAV registration: including aerial-UE indication (CAA-ID=FAA-N12345)"
+#   UE  : "UAV tracking report: CAA-ID=FAA-N12345"
+#   AMF : "UAV registration: aerial UE authorized (CAA-ID=FAA-N12345)"
+#   AMF : "[UAV Tracking] Geofence ALLOW: UAV FAA-N12345"
 supi:
   supi_type: Imsi
   value: "999700000000001"
@@ -44,13 +45,6 @@ sessions:
       sd: null
     apn: "internet"
     is_emergency: false
-  # --- W6 feature under test: XR delay-critical GBR session (5QI 82) ---
-  - type: Ipv4
-    s_nssai:
-      sst: 1
-      sd: null
-    is_emergency: false
-    requested_5qi: 82
 
 configured_nssai:
   slices:
@@ -60,3 +54,12 @@ configured_nssai:
 tun_name: "uesimtun0"
 
 redcap: false
+
+# --- Feature under test: aerial UE, in-zone altitude (allow) ---
+uav_config:
+  is_aerial_ue: true
+  uav_id: "FAA-N12345"
+  uss_address: null
+  max_altitude_meters: 100.0
+  remote_id_enabled: true
+  c2_link_required: false

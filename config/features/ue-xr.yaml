@@ -1,9 +1,10 @@
-# W6 feature test — RedCap (Reduced Capability) UE, Rel-17 (TS 38.101).
-# Baseline 999-70 UE + redcap: true. Exercises:
-#   UE  : "Signalling RedCap (Reduced Capability) indication in RRCSetupComplete"
-#   gNB : "RedCap UE[..]: scheduler bandwidth restricted to .. MHz"
-#   AMF : "UE indicates RedCap (Reduced Capability) device" + "redcap=true"
-#   SMF : "RedCap UE: session-AMBR reduced from UL/DL .."
+# Rel-17/18 feature test — XR (Extended Reality) 5QI, Rel-18 (TS 23.501 5.7.4 / TS 22.261).
+# Baseline 999-70 UE + a second PDU session requesting XR 5QI 82. The XR session
+# omits `apn` so the UE auto-selects the XR DNN (logs "XR PDU session requested").
+# Exercises:
+#   UE  : "XR PDU session requested (5QI=82) — selecting XR DNN"
+#   SMF : "XR QoS flow bound: 5QI=82" + "PFCP: installing XR QER"
+#   UPF : "Installed XR QER"
 supi:
   supi_type: Imsi
   value: "999700000000001"
@@ -43,6 +44,13 @@ sessions:
       sd: null
     apn: "internet"
     is_emergency: false
+  # --- Feature under test: XR delay-critical GBR session (5QI 82) ---
+  - type: Ipv4
+    s_nssai:
+      sst: 1
+      sd: null
+    is_emergency: false
+    requested_5qi: 82
 
 configured_nssai:
   slices:
@@ -51,5 +59,4 @@ configured_nssai:
 
 tun_name: "uesimtun0"
 
-# --- W6 feature under test ---
-redcap: true
+redcap: false

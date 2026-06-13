@@ -1,7 +1,5 @@
-# W6 feature test — gNB for SNPN reject. Baseline gNB + broadcasts NID
-# 00000000000 so the SNPN UE (ue-snpn-reject.yaml) camps on the cell and
-# attempts registration; the AMF (AMF_SNPN_ALLOWED_NIDS=7AB01234567) then
-# rejects the unknown NID.
+# Rel-17/18 feature test — gNB for SNPN accept. Baseline gNB + broadcasts NID
+# 7AB01234567 so the SNPN UE (ue-snpn-accept.yaml) finds a suitable cell.
 nci: 0x000000010
 gnb_id_length: 32
 
@@ -35,8 +33,8 @@ isac_enabled: false
 agent_enabled: false
 federated_learning_enabled: false
 
-# --- W6 feature under test: broadcast a NID the AMF does NOT serve ---
+# --- Feature under test: broadcast SNPN NID ---
 snpn_config:
-  nid: "00000000000"
+  nid: "7AB01234567"
   cag_ids: []
   onboarding_enabled: false

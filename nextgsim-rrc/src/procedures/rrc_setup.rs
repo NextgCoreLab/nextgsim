@@ -390,7 +390,7 @@ pub struct RrcSetupCompleteParams {
     /// `redCapIndication` in RRCSetupComplete-v1700-IEs). The Rel-15.6 ASN.1
     /// schema used here predates the v1700 IE group, so the indication is
     /// carried as a minimal TLV inside the spec-legal `lateNonCriticalExtension`
-    /// OCTET STRING container (the same octet-container pattern W5.4 uses to
+    /// OCTET STRING container (the same octet-container pattern used to
     /// ride later-release IEs over the Rel-15 schema).
     pub redcap_indication: bool,
 }

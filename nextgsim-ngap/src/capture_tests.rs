@@ -490,7 +490,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Cross-codec NG Setup regression guards (W5 E2E NGAP reconciliation)
+    // Cross-codec NG Setup regression guards (E2E NGAP reconciliation)
     // ========================================================================
     //
     // These pin the wire bytes that the independent ogs-ngap (nextgcore) codec
@@ -669,7 +669,7 @@ mod tests {
     }
 
     /// ICS Request (AMF → gNB): the gNB must decode the AMF's encode. Pinned
-    /// vector is the strict core's (ogs-ngap) output after the W5 ICS fixes
+    /// vector is the strict core's (ogs-ngap) output after the ICS fixes
     /// (BitRate extensible-constrained, UESecurityCapabilities size-ext bits,
     /// AllowedNSSAI bare S-NSSAI). The matching core test
     /// (builder.rs::ics_request_matches_sim_wire_bytes) re-encodes it.
@@ -699,7 +699,7 @@ mod tests {
 
     /// PDU Session Resource Setup Request (AMF → gNB) outer NGAP envelope: the
     /// gNB must decode the core's encode (the inner N2 transfer is opaque and
-    /// covered by the W5.4 transfer tests). Pinned vector is the core's output.
+    /// covered by the transfer tests). Pinned vector is the core's output.
     const CORE_PDU_SESSION_SETUP_REQUEST: [u8; 33] = [
         0x00, 0x1d, 0x00, 0x1d, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, 0x00, 0x55,
         0x00, 0x02, 0x00, 0x01, 0x00, 0x4a, 0x00, 0x0a, 0x00, 0x00, 0x05, 0x00, 0x20, 0x04, 0x00,
@@ -724,7 +724,7 @@ mod tests {
     /// N2 SM `PDUSessionResourceSetupRequestTransfer` as emitted by the core
     /// smfd `build_setup_request_transfer` via ogs-ngap `transfer.rs`
     /// (UPF F-TEID 0x00010001, addr 10.45.0.1, QFI 1, 5QI 9, ARP 8). The gNB's
-    /// strict nextgsim-ngap transfer decoder must read it (the W5 PDU-session
+    /// strict nextgsim-ngap transfer decoder must read it (the PDU-session
     /// data-plane blocker was the smfd's old hand-rolled 12-byte layout).
     const SMFD_SETUP_REQUEST_TRANSFER: [u8; 32] = [
         0x00, 0x03, 0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0, 0x0a, 0x2d, 0x00, 0x01, 0x00, 0x01, 0x00,
