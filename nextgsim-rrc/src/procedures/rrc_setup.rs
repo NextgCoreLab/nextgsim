@@ -386,7 +386,17 @@ pub struct RrcSetupCompleteParams {
     pub dedicated_nas_message: Vec<u8>,
     /// 5G-S-TMSI value (optional)
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
+    /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.331 §6.2.2
+    /// `redCapIndication` in RRCSetupComplete-v1700-IEs). The Rel-15.6 ASN.1
+    /// schema used here predates the v1700 IE group, so the indication is
+    /// carried as a minimal TLV inside the spec-legal `lateNonCriticalExtension`
+    /// OCTET STRING container (the same octet-container pattern W5.4 uses to
+    /// ride later-release IEs over the Rel-15 schema).
+    pub redcap_indication: bool,
 }
+
+/// Tag for the RedCap indication TLV inside `lateNonCriticalExtension`.
+const REDCAP_LNCE_TAG: u8 = 0x52; // 'R'
 
 /// Parsed RRC Setup Complete data
 #[derive(Debug, Clone)]
@@ -405,6 +415,9 @@ pub struct RrcSetupCompleteData {
     pub dedicated_nas_message: Vec<u8>,
     /// 5G-S-TMSI value
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
+    /// RedCap (Reduced Capability) UE indication (Rel-17), recovered from the
+    /// `lateNonCriticalExtension` octet container (see [`RrcSetupCompleteParams`]).
+    pub redcap_indication: bool,
 }
 
 /// Build an RRC Setup Complete message
@@ -487,6 +500,18 @@ pub fn build_rrc_setup_complete(
         .map(build_registered_amf)
         .transpose()?;
 
+    // RedCap indication (Rel-17): carried as a minimal TLV in the spec-legal
+    // lateNonCriticalExtension OCTET STRING when set.
+    let late_non_critical_extension = if params.redcap_indication {
+        Some(RRCSetupComplete_IEsLateNonCriticalExtension(vec![
+            REDCAP_LNCE_TAG,
+            1, // length
+            1, // value: RedCap = true
+        ]))
+    } else {
+        None
+    };
+
     let rrc_setup_complete_ies = RRCSetupComplete_IEs {
         selected_plmn_identity: RRCSetupComplete_IEsSelectedPLMN_Identity(
             params.selected_plmn_identity,
@@ -496,7 +521,7 @@ pub fn build_rrc_setup_complete(
         s_nssai_list,
         dedicated_nas_message: DedicatedNAS_Message(params.dedicated_nas_message.clone()),
         ng_5g_s_tmsi_value,
-        late_non_critical_extension: None,
+        late_non_critical_extension,
         non_critical_extension: None,
     };
 
@@ -586,6 +611,14 @@ pub fn parse_rrc_setup_complete(
     // Parse RegisteredAMF
     let registered_amf = ies.registered_amf.as_ref().map(parse_registered_amf);
 
+    // RedCap indication (Rel-17): recovered from the lateNonCriticalExtension
+    // octet container TLV emitted by the UE.
+    let redcap_indication = ies
+        .late_non_critical_extension
+        .as_ref()
+        .map(|lnce| parse_redcap_lnce(&lnce.0))
+        .unwrap_or(false);
+
     Ok(RrcSetupCompleteData {
         rrc_transaction_id: rrc_setup_complete.rrc_transaction_identifier.0,
         selected_plmn_identity: ies.selected_plmn_identity.0,
@@ -594,7 +627,27 @@ pub fn parse_rrc_setup_complete(
         s_nssai_list,
         dedicated_nas_message: ies.dedicated_nas_message.0.clone(),
         ng_5g_s_tmsi_value,
+        redcap_indication,
     })
+}
+
+/// Scan a `lateNonCriticalExtension` octet container for the RedCap indication
+/// TLV (`REDCAP_LNCE_TAG`, len, value). Returns true when present and set.
+fn parse_redcap_lnce(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let tag = bytes[i];
+        let len = bytes[i + 1] as usize;
+        let val_start = i + 2;
+        if val_start + len > bytes.len() {
+            break;
+        }
+        if tag == REDCAP_LNCE_TAG {
+            return bytes.get(val_start).copied().unwrap_or(0) != 0;
+        }
+        i = val_start + len;
+    }
+    false
 }
 
 /// Build a generated `RegisteredAMF` from typed parameters
@@ -835,7 +888,27 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E, 0x00, 0x41], // Sample NAS message
             ng_5g_s_tmsi_value: None,
+            redcap_indication: false,
         }
+    }
+
+    #[test]
+    fn test_rrc_setup_complete_redcap_roundtrip() {
+        // RedCap set: indication survives UPER encode/decode via the
+        // lateNonCriticalExtension octet container.
+        let mut params = create_test_setup_complete_params();
+        params.redcap_indication = true;
+
+        let bytes = encode_rrc_setup_complete(&params).unwrap();
+        let data = decode_rrc_setup_complete(&bytes).unwrap();
+        assert!(data.redcap_indication, "RedCap indication must round-trip");
+        assert_eq!(data.dedicated_nas_message, params.dedicated_nas_message);
+
+        // RedCap not set: default decode yields false.
+        let params_off = create_test_setup_complete_params();
+        let bytes_off = encode_rrc_setup_complete(&params_off).unwrap();
+        let data_off = decode_rrc_setup_complete(&bytes_off).unwrap();
+        assert!(!data_off.redcap_indication);
     }
 
     #[test]
@@ -877,6 +950,7 @@ mod tests {
             ]),
             dedicated_nas_message: vec![0x7E, 0x00, 0x41, 0x01, 0x02],
             ng_5g_s_tmsi_value: Some(Ng5gSTmsiValue::Full(0x123456789ABC)),
+            redcap_indication: false,
         };
 
         let msg = build_rrc_setup_complete(&params).unwrap();
@@ -915,6 +989,7 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: None,
+            redcap_indication: false,
         };
 
         let result = build_rrc_setup_complete(&params);
@@ -931,6 +1006,7 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: None,
+            redcap_indication: false,
         };
 
         let result = build_rrc_setup_complete(&params);
@@ -947,6 +1023,7 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: Some(Ng5gSTmsiValue::Part2(0x1FF)), // Max 9-bit value
+            redcap_indication: false,
         };
 
         let msg = build_rrc_setup_complete(&params).unwrap();

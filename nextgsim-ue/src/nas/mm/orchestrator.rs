@@ -67,6 +67,13 @@ pub const SQN_DELTA: u64 = 1 << 28;
 /// (same default as UERANSIM)
 const DEFAULT_IMEISV: &str = "4370816125816151";
 
+/// AMF-private 5GMM message type for the UAV tracking report (Rel-18,
+/// TS 23.256). The standard does not allocate a UE-originated tracking-report
+/// 5GMM message type; this simulator uses an unassigned 5GMM message-type code
+/// (the AMF dispatches it in its Uplink NAS Transport handler). Kept in sync
+/// with `nextgcore-amfd`'s `gmm_build::message_type::UAV_TRACKING_REPORT`.
+pub const UAV_TRACKING_REPORT_MSG_TYPE: u8 = 0x6A;
+
 /// Decode a GPRS Timer 2 IE value octet (3GPP TS 24.008 Section 10.5.7.4)
 /// into seconds. Returns 0 when the timer is deactivated.
 pub fn gprs_timer2_seconds(byte: u8) -> u32 {
@@ -123,6 +130,18 @@ pub struct MmUeIdentity {
     pub requested_nssai: Option<Vec<u8>>,
     /// Home PLMN encoded as BCD (3 octets, TS 24.501 Section 9.11.3.4)
     pub plmn_bcd: [u8; 3],
+    /// SNPN NID (Rel-17, TS 23.501 §5.30) when the UE is configured to access
+    /// a Standalone Non-Public Network; included in the Registration Request.
+    pub snpn_nid: Option<String>,
+    /// MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2). Set on the
+    /// identity of a MINT secondary subscription so its Registration Request
+    /// carries the disaster-roaming indication. Independent of the SNPN field.
+    pub disaster_roaming: bool,
+    /// UAV indication (Rel-18, TS 23.256). `Some(caa_id)` when the UE registers
+    /// as an aerial UE; the Registration Request then advertises the aerial-UE
+    /// flag plus the UAV CAA-level ID so the AMF creates the UAV flight
+    /// authorization (geofence) context.
+    pub uav_indication: Option<String>,
 }
 
 impl MmUeIdentity {
@@ -189,7 +208,41 @@ impl MmUeIdentity {
             ia_cap,
             requested_nssai,
             plmn_bcd: encode_plmn_bcd(mcc, mnc, config.hplmn.long_mnc),
+            // SNPN access (Rel-17, TS 23.501 §5.30): carry the configured NID
+            // so the Registration Request advertises the SNPN being accessed.
+            snpn_nid: config.snpn_config.as_ref().map(|s| s.nid.clone()),
+            // The primary subscription never sets disaster-roaming; MINT
+            // secondary identities opt in via `with_supi` (TS 23.761 §4.2).
+            disaster_roaming: false,
+            // UAV (Rel-18, TS 23.256): aerial UE registers with its CAA-level
+            // ID so the AMF grants/tracks flight authorization. Inert (None)
+            // unless the UE config enables the UAV feature.
+            uav_indication: config
+                .uav_config
+                .as_ref()
+                .filter(|u| u.is_aerial_ue)
+                .map(|u| u.uav_id.clone().unwrap_or_default()),
         }
+    }
+
+    /// Derive a MINT secondary-subscription identity from the UE configuration
+    /// but for a different SUPI value (TS 23.761): the home PLMN, keys and
+    /// security capabilities are shared with the primary, only the signalled
+    /// SUPI and the pre-built SUCI differ. `disaster_roaming` controls the
+    /// disaster-roaming indication in this subscription's Registration Request.
+    pub fn for_secondary_supi(
+        config: &UeConfig,
+        suci: Vec<u8>,
+        supi_value: &str,
+        disaster_roaming: bool,
+    ) -> Self {
+        let mut id = Self::from_config(config, suci);
+        id.supi = supi_value.to_string();
+        id.disaster_roaming = disaster_roaming;
+        // A MINT secondary subscription is not the aerial-UE registration; the
+        // UAV indication belongs only to the primary subscription's identity.
+        id.uav_indication = None;
+        id
     }
 }
 
@@ -356,6 +409,12 @@ impl MmOrchestrator {
     /// The 5G-GUTI assigned by the network, if any
     pub fn stored_guti(&self) -> Option<&Ie5gsMobileIdentity> {
         self.stored_guti.as_ref()
+    }
+
+    /// The SUPI this orchestrator registers (used by MINT to report a
+    /// secondary subscription's identity, TS 23.761).
+    pub fn supi(&self) -> &str {
+        &self.identity.supi
     }
 
     /// Registration area (TAI list) assigned by the network, if any
@@ -566,6 +625,26 @@ impl MmOrchestrator {
         req.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
         req.requested_nssai = self.identity.requested_nssai.clone();
         req.last_visited_tai = self.current_tai;
+        // SNPN access (Rel-17, TS 23.501 §5.30): when configured, advertise the
+        // NID so the AMF can validate SNPN authorization (TS 24.501).
+        if let Some(ref nid) = self.identity.snpn_nid {
+            req.snpn_nid = Some(nid.clone());
+            info!("SNPN registration: including NID={nid}");
+        }
+        // MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2): a MINT
+        // secondary subscription advertises disaster-roaming so the AMF can
+        // apply minimization-of-service-interruption handling.
+        if self.identity.disaster_roaming {
+            req.disaster_roaming = true;
+            info!("MINT registration: including disaster-roaming indication (SUPI={})", self.identity.supi);
+        }
+        // UAV indication (Rel-18, TS 23.256): an aerial UE advertises the
+        // aerial-UE flag plus its CAA-level ID so the AMF creates the UAV
+        // flight-authorization context for this registration.
+        if let Some(ref caa_id) = self.identity.uav_indication {
+            req.uav_indication = Some(caa_id.clone());
+            info!("UAV registration: including aerial-UE indication (CAA-ID={caa_id})");
+        }
 
         let mut plain = Vec::new();
         req.encode(&mut plain);
@@ -584,6 +663,51 @@ impl MmOrchestrator {
 
         let pdu = self.protect_if_active(plain);
         vec![MmOutput::SendNasPdu(pdu)]
+    }
+
+    /// Build a UAV tracking report uplink NAS PDU (Rel-18, TS 23.256).
+    ///
+    /// The aerial UE periodically reports its position (Remote ID / flight
+    /// position) to the network so the AMF can run the geofence and enforce
+    /// flight authorization. This is carried as a plain 5GMM message with the
+    /// AMF-private message type [`UAV_TRACKING_REPORT_MSG_TYPE`]; the value is a
+    /// fixed layout of latitude/longitude/altitude (fixed point) plus a flight
+    /// status octet. It is protected with the active NAS security context (the
+    /// gNB relays it to the AMF as an Uplink NAS Transport), and returns `None`
+    /// before security is established so it is never sent in the clear.
+    ///
+    /// `caa_id` is the UAV CAA-level identifier; `lat`/`lon` are decimal
+    /// degrees and `alt` is metres; `flight_status` is 0=grounded, 1=flying,
+    /// 2=emergency.
+    pub fn build_uav_tracking_report(
+        &mut self,
+        caa_id: &str,
+        lat: f64,
+        lon: f64,
+        alt: f64,
+        flight_status: u8,
+    ) -> Option<Vec<u8>> {
+        if !self.sec.is_active() {
+            warn!("UAV tracking report suppressed: NAS security not established");
+            return None;
+        }
+        let mut plain = Vec::with_capacity(3 + 1 + caa_id.len() + 13);
+        plain.push(0x7E); // 5GMM extended protocol discriminator
+        plain.push(0x00); // plain NAS message (security applied below)
+        plain.push(UAV_TRACKING_REPORT_MSG_TYPE);
+        // CAA-level ID (length-prefixed)
+        plain.push(caa_id.len() as u8);
+        plain.extend_from_slice(caa_id.as_bytes());
+        // Position: lat/lon as 1e-7 degree fixed point (i32), alt as 0.1 m (i32)
+        plain.extend_from_slice(&((lat * 1e7) as i32).to_be_bytes());
+        plain.extend_from_slice(&((lon * 1e7) as i32).to_be_bytes());
+        plain.extend_from_slice(&((alt * 10.0) as i32).to_be_bytes());
+        plain.push(flight_status);
+        info!(
+            "UAV tracking report: CAA-ID={caa_id}, pos=({lat:.6}, {lon:.6}), \
+             alt={alt:.1}m, status={flight_status}"
+        );
+        Some(self.protect_if_active(plain))
     }
 
     /// Registration Accept handling (TS 24.501 Section 5.5.1.2.4)
@@ -1557,6 +1681,9 @@ mod tests {
             ia_cap: 0x70, // IA1-IA3 (no IA0)
             requested_nssai: Some(vec![0x01, 0x01]),
             plmn_bcd: encode_plmn_bcd(999, 70, false),
+            snpn_nid: None,
+            disaster_roaming: false,
+            uav_indication: None,
         }
     }
 

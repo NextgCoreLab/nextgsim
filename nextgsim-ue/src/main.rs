@@ -490,6 +490,22 @@ impl UeApp {
         let mut sm_orch = SmOrchestrator::new(true);
         let sm_session_params = SmSessionParams::from_config(&task_base.config);
 
+        // MINT secondary-subscription driver (Rel-18, TS 23.761). Inert unless
+        // the UE config enables MINT with secondary SUPIs; it owns each
+        // secondary subscription's MM/security context and SM sessions. Only
+        // the primary subscription's sessions (subscription_index 0) are
+        // established by the main `sm_orch`; secondary-SUPI sessions are routed
+        // here per the DNN→subscription map.
+        let mut mint_secondary =
+            nextgsim_ue::nas::mm::MintSecondary::from_config(&task_base.config, true);
+        if mint_secondary.is_active() {
+            info!(
+                "MINT enabled: {} secondary subscription(s), disaster_roaming={}",
+                "configured",
+                mint_secondary.disaster_roaming()
+            );
+        }
+
         // TS 23.122 PLMN selector (automatic mode), consuming the MM
         // orchestrator's forbidden-PLMN list
         let home_plmn = Plmn::new(
@@ -500,6 +516,18 @@ impl UeApp {
         let mut plmn_selector = PlmnSelector::new(home_plmn);
 
         let mut pdu_counter: u32 = 0;
+
+        // UAV tracking-report cadence (Rel-18, TS 23.256). `uav_report_ticks`
+        // counts NAS timer ticks once the aerial UE is registered; the report
+        // position is the configured flight altitude at a fixed simulated
+        // coordinate so the AMF geofence is exercised end to end.
+        let mut uav_report_ticks: u64 = 0;
+        let uav_report_position: (f64, f64, f64) = task_base
+            .config
+            .uav_config
+            .as_ref()
+            .map(|u| (37.7749, -122.4194, u.max_altitude_meters))
+            .unwrap_or((0.0, 0.0, 0.0));
 
         // 1-second tick driving the NAS timers (T3510/T3511/T3502/T3512/
         // ..., T3580/T3581/T3582, SM back-off and the higher-priority PLMN
@@ -525,6 +553,60 @@ impl UeApp {
                 let sm_outs = sm_orch.tick();
                 process_sm_outputs(sm_outs, &mut orch, &task_base, &tun_tx, &mut pdu_counter)
                     .await;
+
+                // MINT secondary subscriptions (Rel-18, TS 23.761): start the
+                // secondary registrations once the primary is registered, then
+                // drive their MM/SM timers each tick.
+                if mint_secondary.is_active() && orch.state().is_registered() {
+                    let started = mint_secondary.start_secondary_registrations();
+                    for (index, outs) in started {
+                        process_secondary_mm_outputs(
+                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
+                            &mut pdu_counter,
+                        )
+                        .await;
+                    }
+                    let ticks = mint_secondary.tick();
+                    for (index, outs) in ticks {
+                        process_secondary_mm_outputs(
+                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
+                            &mut pdu_counter,
+                        )
+                        .await;
+                    }
+                }
+
+                // UAV tracking report (Rel-18, TS 23.256): once the aerial UE
+                // is registered, periodically report its position so the AMF
+                // can run the geofence and enforce flight authorization. The
+                // configured position is reported as a Remote ID / flight
+                // position; the gNB relays it to the AMF as Uplink NAS Transport.
+                if let Some(uav) = task_base.config.uav_config.as_ref().filter(|u| u.is_aerial_ue) {
+                    if orch.state().is_registered() {
+                        uav_report_ticks += 1;
+                        // Report at ~5 s cadence after registration.
+                        if uav_report_ticks.is_multiple_of(5) {
+                            let caa_id = uav.uav_id.clone().unwrap_or_default();
+                            // Default flight position: the configured max
+                            // altitude at a fixed simulated coordinate, so the
+                            // report exercises the AMF geofence end to end.
+                            let (lat, lon, alt) = uav_report_position;
+                            if let Some(pdu) =
+                                orch.build_uav_tracking_report(&caa_id, lat, lon, alt, 1)
+                            {
+                                pdu_counter += 1;
+                                let _ = task_base
+                                    .rrc_tx
+                                    .send(RrcMessage::UplinkNasDelivery {
+                                        pdu_id: pdu_counter,
+                                        pdu: pdu.into(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
                 // Higher-priority PLMN periodic search (TS 23.122 4.4.3.3)
                 if plmn_selector.tick() {
                     perform_plmn_selection(
@@ -554,18 +636,34 @@ impl UeApp {
                             // a strict peer always wraps N1 SM containers
                             // (TS 24.501 Section 5.4.5).
                             if pdu.len() >= 4 && pdu.data()[0] == 0x7E {
-                                let outs = orch.handle_downlink(pdu.data());
-                                process_mm_outputs(
-                                    outs,
-                                    &mut orch,
-                                    &mut sm_orch,
-                                    &sm_session_params,
-                                    &mut plmn_selector,
-                                    &task_base,
-                                    &tun_tx,
-                                    &mut pdu_counter,
-                                )
-                                .await;
+                                // MINT (Rel-18, TS 23.761): on the shared radio
+                                // connection, route the downlink to a secondary
+                                // subscription's MM context when it owns the
+                                // in-flight procedure; otherwise to the primary.
+                                if let Some(index) = mint_secondary.owns_pending_downlink() {
+                                    process_secondary_downlink(
+                                        index,
+                                        pdu.data(),
+                                        &mut mint_secondary,
+                                        &task_base,
+                                        &tun_tx,
+                                        &mut pdu_counter,
+                                    )
+                                    .await;
+                                } else {
+                                    let outs = orch.handle_downlink(pdu.data());
+                                    process_mm_outputs(
+                                        outs,
+                                        &mut orch,
+                                        &mut sm_orch,
+                                        &sm_session_params,
+                                        &mut plmn_selector,
+                                        &task_base,
+                                        &tun_tx,
+                                        &mut pdu_counter,
+                                    )
+                                    .await;
+                                }
                             } else if pdu.len() >= 4 {
                                 warn!(
                                     "Discarding NAS PDU with EPD 0x{:02x}: raw 5GSM over RRC is not accepted",
@@ -713,16 +811,37 @@ impl UeApp {
                                 "Ethernet" => PduSessionTypeValue::Ethernet,
                                 _ => PduSessionTypeValue::Ipv4,
                             };
+                            let dnn = apn.clone().or_else(|| {
+                                sm_session_params.first().and_then(|p| p.dnn.clone())
+                            });
+                            // An XR DNN (xr/xr-split/xr-haptic) implies a
+                            // requested XR 5QI so the SM orchestrator marks the
+                            // session as XR (mirrors the SMF DNN→5QI mapping).
+                            let requested_5qi = dnn.as_deref().and_then(|d| {
+                                match d.to_ascii_lowercase().as_str() {
+                                    "xr" | "xr-cloud" | "xr-gaming" => Some(82),
+                                    "xr-split" => Some(84),
+                                    "xr-haptic" => Some(85),
+                                    _ => None,
+                                }
+                            });
+                            // MINT (Rel-18, TS 23.761): a CLI-triggered session
+                            // also routes to the subscription mapped to its DNN.
+                            let subscription_index = task_base
+                                .config
+                                .mint_config
+                                .as_ref()
+                                .map_or(0, |m| m.subscription_for_dnn(dnn.as_deref()));
                             let params = SmSessionParams {
                                 session_type: requested_type,
                                 ssc_mode: SscModeValue::SscMode1,
-                                dnn: apn.clone().or_else(|| {
-                                    sm_session_params.first().and_then(|p| p.dnn.clone())
-                                }),
+                                dnn,
                                 s_nssai: sm_session_params
                                     .first()
                                     .and_then(|p| p.s_nssai.clone()),
                                 emergency: false,
+                                requested_5qi,
+                                subscription_index,
                             };
                             info!(
                                 "Initiating PDU session establishment: type={}, dnn={:?}",
@@ -1170,7 +1289,16 @@ async fn process_mm_outputs(
                     // Give the core a moment to finish the registration
                     // path before requesting the PDU session
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    let outs = sm_orch.establish_default_sessions(sm_session_params);
+                    // MINT (Rel-18, TS 23.761): the primary subscription only
+                    // establishes sessions routed to it (subscription_index 0);
+                    // secondary-SUPI sessions are established by the MINT driver
+                    // under their own SUPI's context.
+                    let primary_params: Vec<_> = sm_session_params
+                        .iter()
+                        .filter(|p| p.subscription_index == 0)
+                        .cloned()
+                        .collect();
+                    let outs = sm_orch.establish_default_sessions(&primary_params);
                     process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;
                 }
             }
@@ -1263,6 +1391,209 @@ async fn process_sm_outputs(
                 warn!(
                     "PDU session {psi} modification failed: {:?} (#{})",
                     cause, cause as u8
+                );
+            }
+        }
+    }
+}
+
+/// Deliver a MINT secondary subscription's MM outputs (Rel-18, TS 23.761):
+/// transmit its NAS PDUs over the shared radio connection, and on its
+/// registration success report the subscription to the MINT task and establish
+/// the PDU sessions routed to this subscription's SUPI under its own context.
+async fn process_secondary_mm_outputs(
+    index: u8,
+    outputs: Vec<nextgsim_ue::nas::mm::MmOutput>,
+    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_ue::nas::mm::MmOutput;
+
+    for output in outputs {
+        match output {
+            MmOutput::SendNasPdu(nas_pdu) => {
+                *pdu_counter += 1;
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::UplinkNasDelivery {
+                        pdu_id: *pdu_counter,
+                        pdu: nas_pdu.into(),
+                    })
+                    .await;
+            }
+            MmOutput::RegistrationSucceeded => {
+                info!("MINT: secondary subscription {index} registered");
+                // Report the secondary registration to the MINT task so it
+                // tracks per-SUPI state (TS 23.761).
+                if let Some(ref rel18) = task_base.rel18 {
+                    let supi = mint_secondary
+                        .get_mut(index)
+                        .map(|s| s.supi.clone())
+                        .unwrap_or_default();
+                    let _ = supi; // SUPI is tracked by index in the MINT task
+                    let _ = rel18
+                        .mint_tx
+                        .send(MintMessage::RegistrationUpdate {
+                            subscription_index: index,
+                            registered: true,
+                            serving_plmn: Some((
+                                task_base.config.hplmn.mcc,
+                                task_base.config.hplmn.mnc,
+                            )),
+                            guti: None,
+                        })
+                        .await;
+                }
+                // Establish this subscription's PDU sessions (routed by DNN to
+                // this SUPI) under its own MM/security context, so the SMF
+                // resolves SUPI-N's subscription in UDM/UDR.
+                let params = nextgsim_ue::nas::mm::MintSecondary::session_params_for(
+                    &task_base.config,
+                    index,
+                );
+                if let Some(sub) = mint_secondary.get_mut(index) {
+                    if sub.sm.active_sessions().is_empty() && !params.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let sm_outs = sub.sm.establish_default_sessions(&params);
+                        process_secondary_sm_outputs(
+                            index, sm_outs, mint_secondary, task_base, tun_tx, pdu_counter,
+                        )
+                        .await;
+                    }
+                }
+            }
+            MmOutput::RegistrationFailed(cause) => {
+                warn!("MINT: secondary subscription {index} registration failed: {cause:?}");
+            }
+            MmOutput::AuthenticationRejected => {
+                warn!("MINT: secondary subscription {index} authentication rejected");
+            }
+            MmOutput::PlmnSearchNeeded => {
+                warn!("MINT: secondary subscription {index} requested PLMN search (ignored)");
+            }
+            MmOutput::NotHandled(plain) => {
+                // Dispatch a plain 5GMM message the secondary orchestrator does
+                // not own (e.g. DL NAS Transport carrying its 5GSM responses).
+                if plain.len() >= 3
+                    && plain[2] == u8::from(nextgsim_nas::enums::MmMessageType::DlNasTransport)
+                {
+                    use nextgsim_nas::messages::mm::DlNasTransport;
+                    if let Ok(dl) = DlNasTransport::decode(&mut &plain[3..]) {
+                        if let Some(sub) = mint_secondary.get_mut(index) {
+                            let sm_outs = sub.sm.handle_dl_nas_transport(&dl);
+                            process_secondary_sm_outputs(
+                                index, sm_outs, mint_secondary, task_base, tun_tx, pdu_counter,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Process a downlink NAS PDU for a MINT secondary subscription's MM context.
+async fn process_secondary_downlink(
+    index: u8,
+    pdu: &[u8],
+    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    let outs = match mint_secondary.get_mut(index) {
+        Some(sub) => sub.mm.handle_downlink(pdu),
+        None => return,
+    };
+    process_secondary_mm_outputs(index, outs, mint_secondary, task_base, tun_tx, pdu_counter)
+        .await;
+}
+
+/// Deliver a MINT secondary subscription's SM outputs: protect the UL NAS
+/// Transport with that subscription's MM security context and transmit it,
+/// and manage TUN interfaces for its session lifecycle (Rel-18, TS 23.761).
+async fn process_secondary_sm_outputs(
+    index: u8,
+    outputs: Vec<nextgsim_ue::nas::sm::SmOutput>,
+    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_ue::nas::sm::SmOutput;
+
+    for output in outputs {
+        match output {
+            SmOutput::SendNasPdu(plain) => {
+                let pdu = match mint_secondary.get_mut(index) {
+                    Some(sub) => sub.mm.protect_if_active(plain),
+                    None => return,
+                };
+                *pdu_counter += 1;
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::UplinkNasDelivery {
+                        pdu_id: *pdu_counter,
+                        pdu: pdu.into(),
+                    })
+                    .await;
+            }
+            SmOutput::SessionEstablished { psi, ipv4 } => {
+                info!(
+                    "MINT: secondary subscription {index} PDU session {psi} ACTIVE (IPv4: {ipv4:?})"
+                );
+                // Report the session to the MINT task (per-SUPI session count).
+                if let Some(ref rel18) = task_base.rel18 {
+                    let _ = rel18
+                        .mint_tx
+                        .send(MintMessage::SessionUpdate {
+                            subscription_index: index,
+                            psi,
+                            active: true,
+                        })
+                        .await;
+                }
+                if let Some(ip) = ipv4 {
+                    let address = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                    let _ = tun_tx
+                        .send(TunMessage::CreateInterface {
+                            psi: i32::from(psi),
+                            address,
+                            netmask: Ipv4Addr::new(255, 255, 255, 0),
+                        })
+                        .await;
+                }
+            }
+            SmOutput::SessionEstablishmentFailed { psi, cause } => {
+                warn!(
+                    "MINT: secondary subscription {index} PDU session {psi} establishment failed: {cause:?}"
+                );
+            }
+            SmOutput::SessionReleased { psi } => {
+                info!("MINT: secondary subscription {index} PDU session {psi} released");
+                if let Some(ref rel18) = task_base.rel18 {
+                    let _ = rel18
+                        .mint_tx
+                        .send(MintMessage::SessionUpdate {
+                            subscription_index: index,
+                            psi,
+                            active: false,
+                        })
+                        .await;
+                }
+                let _ = tun_tx
+                    .send(TunMessage::DestroyInterface { psi: i32::from(psi) })
+                    .await;
+            }
+            SmOutput::SessionModified { psi } => {
+                info!("MINT: secondary subscription {index} PDU session {psi} modified");
+            }
+            SmOutput::SessionModificationFailed { psi, cause } => {
+                warn!(
+                    "MINT: secondary subscription {index} PDU session {psi} modification failed: {cause:?}"
                 );
             }
         }

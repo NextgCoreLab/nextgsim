@@ -354,7 +354,18 @@ pub struct Sib1Params {
     pub ecall_over_ims_support: bool,
     /// UE timers and constants (optional)
     pub ue_timers_and_constants: Option<UeTimersAndConstantsParams>,
+    /// `intraFreqReselectionRedCap` (Rel-17, TS 38.331 §6.3.2 SIB1-v1700-IEs):
+    /// controls whether RedCap UEs are allowed to perform intra-frequency cell
+    /// reselection. The Rel-15.6 ASN.1 schema predates the v1700 IE group, so
+    /// the flag is broadcast via the spec-legal `lateNonCriticalExtension`
+    /// OCTET STRING container (the same octet-container pattern used elsewhere
+    /// to ride later-release IEs over the Rel-15 schema).
+    pub intra_freq_reselection_redcap: bool,
 }
+
+/// Tag for the `intraFreqReselectionRedCap` TLV inside SIB1
+/// `lateNonCriticalExtension`.
+const SIB1_REDCAP_LNCE_TAG: u8 = 0x52; // 'R'
 
 /// Parsed SIB1 data
 #[derive(Debug, Clone)]
@@ -369,6 +380,9 @@ pub struct Sib1Data {
     pub ecall_over_ims_support: bool,
     /// UE timers and constants
     pub ue_timers_and_constants: Option<UeTimersAndConstantsParams>,
+    /// `intraFreqReselectionRedCap` (Rel-17), recovered from the SIB1
+    /// `lateNonCriticalExtension` octet container (see [`Sib1Params`]).
+    pub intra_freq_reselection_redcap: bool,
 }
 
 /// Build a SIB1 message
@@ -431,7 +445,17 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
             .transpose()?,
         uac_barring_info: None,
         use_full_resume_id: None,
-        late_non_critical_extension: None,
+        // intraFreqReselectionRedCap (Rel-17): broadcast as a minimal TLV in the
+        // spec-legal lateNonCriticalExtension OCTET STRING when allowed.
+        late_non_critical_extension: if params.intra_freq_reselection_redcap {
+            Some(SIB1LateNonCriticalExtension(vec![
+                SIB1_REDCAP_LNCE_TAG,
+                1, // length
+                1, // value: intra-freq reselection allowed for RedCap
+            ]))
+        } else {
+            None
+        },
         non_critical_extension: None,
     };
 
@@ -540,13 +564,42 @@ pub fn parse_sib1(msg: &BCCH_DL_SCH_Message) -> Result<Sib1Data, SystemInformati
         .map(parse_ue_timers_and_constants)
         .transpose()?;
 
+    // intraFreqReselectionRedCap (Rel-17): recovered from the SIB1
+    // lateNonCriticalExtension octet container TLV.
+    let intra_freq_reselection_redcap = sib1
+        .late_non_critical_extension
+        .as_ref()
+        .map(|lnce| parse_redcap_lnce(&lnce.0))
+        .unwrap_or(false);
+
     Ok(Sib1Data {
         cell_selection_info,
         plmn_identity_info_list,
         ims_emergency_support,
         ecall_over_ims_support,
         ue_timers_and_constants,
+        intra_freq_reselection_redcap,
     })
+}
+
+/// Scan a SIB1 `lateNonCriticalExtension` octet container for the
+/// `intraFreqReselectionRedCap` TLV (`SIB1_REDCAP_LNCE_TAG`, len, value).
+/// Returns true when present and set.
+fn parse_redcap_lnce(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let tag = bytes[i];
+        let len = bytes[i + 1] as usize;
+        let val_start = i + 2;
+        if val_start + len > bytes.len() {
+            break;
+        }
+        if tag == SIB1_REDCAP_LNCE_TAG {
+            return bytes.get(val_start).copied().unwrap_or(0) != 0;
+        }
+        i = val_start + len;
+    }
+    false
 }
 
 /// Build the generated `UE_TimersAndConstants` from millisecond/count values
@@ -976,7 +1029,30 @@ mod tests {
             }],
             ims_emergency_support: false,
             ecall_over_ims_support: false,
+            intra_freq_reselection_redcap: false,
         }
+    }
+
+    #[test]
+    fn test_sib1_intra_freq_reselection_redcap_roundtrip() {
+        // intraFreqReselectionRedCap set: survives UPER encode/decode via the
+        // SIB1 lateNonCriticalExtension octet container.
+        let params = Sib1Params {
+            intra_freq_reselection_redcap: true,
+            ..create_test_sib1_params()
+        };
+        let bytes = encode_sib1(&params).unwrap();
+        let data = decode_sib1(&bytes).unwrap();
+        assert!(
+            data.intra_freq_reselection_redcap,
+            "intraFreqReselectionRedCap must round-trip"
+        );
+
+        // Not set: default decode yields false.
+        let params_off = create_test_sib1_params();
+        let bytes_off = encode_sib1(&params_off).unwrap();
+        let data_off = decode_sib1(&bytes_off).unwrap();
+        assert!(!data_off.intra_freq_reselection_redcap);
     }
 
     #[test]

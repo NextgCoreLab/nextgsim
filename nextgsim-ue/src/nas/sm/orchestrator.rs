@@ -30,7 +30,9 @@ use std::collections::HashMap;
 
 use tracing::{debug, info, warn};
 
-use nextgsim_common::config::{PduSessionType as ConfigPduSessionType, UeConfig};
+use nextgsim_common::config::{
+    PduSessionType as ConfigPduSessionType, SessionConfig as ConfigSessionConfig, UeConfig,
+};
 use nextgsim_nas::enums::SmMessageType as NasSmMessageType;
 use nextgsim_nas::header::PlainSmHeader;
 use nextgsim_nas::ies::ie1::{PayloadContainerType, RequestType};
@@ -87,6 +89,16 @@ pub struct SmSessionParams {
     pub s_nssai: Option<Vec<u8>>,
     /// Whether this is an emergency PDU session
     pub emergency: bool,
+    /// Requested 5QI (TS 23.501 §5.7). When this is an XR delay-critical GBR
+    /// 5QI (82-85, Rel-18), the UE requests an XR PDU session; the DNN selects
+    /// the XR service so the SMF maps and installs the XR QoS flow.
+    pub requested_5qi: Option<u8>,
+    /// MINT subscription index that serves this session (Rel-18, TS 23.761).
+    /// 0 = primary SUPI; >0 selects a secondary SUPI's subscription. The DNN
+    /// drives the mapping (see [`SmSessionParams::from_config`]); the session
+    /// is established under the matching subscription's MM/security context so
+    /// the SMF resolves SUPI-N's subscription in UDM/UDR.
+    pub subscription_index: u8,
 }
 
 impl SmSessionParams {
@@ -109,6 +121,8 @@ impl SmSessionParams {
                 dnn: Some("internet".to_string()),
                 s_nssai: default_snssai,
                 emergency: false,
+                requested_5qi: None,
+                subscription_index: 0,
             }];
         }
 
@@ -134,12 +148,36 @@ impl SmSessionParams {
                         v
                     })
                     .or_else(|| default_snssai.clone());
+                // For an XR session with no explicit APN, select the XR DNN so
+                // the SMF derives the XR 5QI and installs the XR QoS flow
+                // (TS 23.501 §5.7.4, Rel-18).
+                let dnn = match (s.apn.clone(), s.requested_5qi) {
+                    (Some(apn), _) => Some(apn),
+                    (None, Some(five_qi)) if s.is_xr() => {
+                        let xr_dnn = ConfigSessionConfig::xr_dnn_for_5qi(five_qi);
+                        info!(
+                            "XR PDU session requested (5QI={five_qi}) — selecting XR DNN {xr_dnn:?}"
+                        );
+                        Some(xr_dnn.to_string())
+                    }
+                    (None, _) => None,
+                };
+                // MINT (Rel-18, TS 23.761): pick which subscription's SUPI
+                // serves this session from the DNN→subscription map; absent a
+                // MINT config or matching DNN the primary subscription (0) is
+                // used, so non-MINT deployments are unaffected.
+                let subscription_index = config
+                    .mint_config
+                    .as_ref()
+                    .map_or(0, |m| m.subscription_for_dnn(dnn.as_deref()));
                 Self {
                     session_type,
                     ssc_mode: SscModeValue::SscMode1,
-                    dnn: s.apn.clone(),
+                    dnn,
                     s_nssai,
                     emergency: s.is_emergency,
+                    requested_5qi: s.requested_5qi,
+                    subscription_index,
                 }
             })
             .collect()
@@ -300,6 +338,21 @@ impl SmOrchestrator {
             .flatten()
             .filter(|s| s.state != PsState::Inactive)
             .collect()
+    }
+
+    /// Whether any session has a procedure in flight (establishment,
+    /// modification or release pending). Used by MINT to route a downlink NAS
+    /// PDU to the subscription whose SM procedure is awaiting a response on the
+    /// shared radio connection (TS 23.761).
+    pub fn has_pending_procedure(&self) -> bool {
+        self.sessions.iter().flatten().any(|s| {
+            matches!(
+                s.state,
+                PsState::ActivePending
+                    | PsState::ModificationPending
+                    | PsState::InactivePending
+            )
+        })
     }
 
     /// Whether a back-off timer currently blocks the given [S-NSSAI, DNN]
@@ -1250,6 +1303,8 @@ mod tests {
             dnn: Some("internet".to_string()),
             s_nssai: Some(vec![0x01]),
             emergency: false,
+            requested_5qi: None,
+            subscription_index: 0,
         }
     }
 
@@ -1920,5 +1975,41 @@ mod tests {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].session_type, PduSessionTypeValue::Ipv4);
         assert_eq!(params[0].dnn.as_deref(), Some("internet"));
+        assert_eq!(params[0].requested_5qi, None);
+    }
+
+    #[test]
+    fn test_xr_session_selects_xr_dnn() {
+        use nextgsim_common::config::SessionConfig as ConfigSessionConfig;
+        let mut config = UeConfig::default();
+        // XR session with requested_5qi but no explicit APN: the UE must
+        // select the XR DNN so the SMF derives the XR 5QI.
+        config.sessions = vec![ConfigSessionConfig {
+            requested_5qi: Some(82),
+            apn: None,
+            ..ConfigSessionConfig::default()
+        }];
+        let params = SmSessionParams::from_config(&config);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].requested_5qi, Some(82));
+        assert_eq!(params[0].dnn.as_deref(), Some("xr"));
+
+        // 5QI 84 maps to the split-rendering XR DNN.
+        config.sessions = vec![ConfigSessionConfig {
+            requested_5qi: Some(84),
+            apn: None,
+            ..ConfigSessionConfig::default()
+        }];
+        let params = SmSessionParams::from_config(&config);
+        assert_eq!(params[0].dnn.as_deref(), Some("xr-split"));
+
+        // An explicit APN always wins over the XR-derived DNN.
+        config.sessions = vec![ConfigSessionConfig {
+            requested_5qi: Some(82),
+            apn: Some("custom-xr".to_string()),
+            ..ConfigSessionConfig::default()
+        }];
+        let params = SmSessionParams::from_config(&config);
+        assert_eq!(params[0].dnn.as_deref(), Some("custom-xr"));
     }
 }

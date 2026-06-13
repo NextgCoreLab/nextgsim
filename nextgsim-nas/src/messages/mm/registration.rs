@@ -520,6 +520,20 @@ mod registration_request_iei {
     pub const NTN_TIMING_ADVANCE: u8 = 0xA4;
     /// NTN access barring (6G extension)
     pub const NTN_ACCESS_BARRING: u8 = 0xA5;
+    /// SNPN NID (Rel-17, TS 23.501 §5.30 / TS 24.501). UE-included Network
+    /// Identifier of the SNPN being accessed, carried as a TLV value holding
+    /// the 11-hex-char NID string (44 bits per TS 23.003 §12.7).
+    pub const SNPN_NID: u8 = 0xA6;
+    /// MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2 / TS 24.501).
+    /// Type-4 TLV; a single value octet whose bit 1 carries the
+    /// disaster-roaming registration indication so the AMF applies MINT /
+    /// minimization-of-service-interruption handling for this subscription.
+    pub const MINT_DISASTER_ROAMING: u8 = 0xA7;
+    /// UAV (aerial UE) indication (Rel-18, TS 23.256 / TS 24.501). Type-4 TLV
+    /// whose value carries bit 1 (aerial-UE flag) in the first octet followed
+    /// by the UAV CAA-level ID string, so the AMF can grant and track UAV
+    /// flight authorization (geofence) for this registration.
+    pub const UAV_INDICATION: u8 = 0xA8;
 }
 
 /// Registration Request message (UE to network)
@@ -567,6 +581,19 @@ pub struct RegistrationRequest {
     pub ntn_timing_advance: Option<IeNtnTimingAdvance>,
     /// NTN access barring (optional, Type 4, IEI 0xA5) - 6G extension
     pub ntn_access_barring: Option<IeNtnAccessBarring>,
+    /// SNPN NID (optional, Type 4, IEI 0xA6) - Rel-17 (TS 23.501 §5.30).
+    /// Network Identifier of the SNPN the UE is requesting access to,
+    /// as an 11-hex-char string (44 bits per TS 23.003 §12.7).
+    pub snpn_nid: Option<String>,
+    /// MINT disaster-roaming indication (optional, Type 4, IEI 0xA7) - Rel-18
+    /// (TS 23.761 §4.2). Set when this registration is for a MINT secondary
+    /// subscription requesting disaster-roaming / service-continuity handling.
+    pub disaster_roaming: bool,
+    /// UAV indication (optional, Type 4, IEI 0xA8) - Rel-18 (TS 23.256). When
+    /// `Some`, the UE registers as an aerial UE; the value is the UAV CAA-level
+    /// identifier (may be empty when only the aerial-UE capability is signalled)
+    /// used by the AMF to create the UAV flight-authorization context.
+    pub uav_indication: Option<String>,
 }
 
 impl Default for RegistrationRequest {
@@ -592,6 +619,9 @@ impl Default for RegistrationRequest {
             sub_thz_band_parameter: None,
             ntn_timing_advance: None,
             ntn_access_barring: None,
+            snpn_nid: None,
+            disaster_roaming: false,
+            uav_indication: None,
         }
     }
 }
@@ -809,6 +839,59 @@ impl RegistrationRequest {
                         msg.ntn_access_barring = Some(ie);
                     }
                 }
+                // SNPN NID (Rel-17, TS 23.501 §5.30): TLV string value
+                registration_request_iei::SNPN_NID => {
+                    buf.advance(1);
+                    if buf.remaining() == 0 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    if let Ok(nid) = String::from_utf8(data) {
+                        msg.snpn_nid = Some(nid);
+                    }
+                }
+                // MINT disaster-roaming indication (Rel-18, TS 23.761): TLV
+                // with a single value octet; bit 1 is the indication flag.
+                registration_request_iei::MINT_DISASTER_ROAMING => {
+                    buf.advance(1);
+                    if buf.remaining() == 0 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len || len < 1 {
+                        break;
+                    }
+                    msg.disaster_roaming = buf.get_u8() & 0x01 == 0x01;
+                    if len > 1 {
+                        buf.advance(len - 1);
+                    }
+                }
+                // UAV indication (Rel-18, TS 23.256): TLV with a flags octet
+                // (bit 1 = aerial UE) followed by the optional CAA-level ID.
+                registration_request_iei::UAV_INDICATION => {
+                    buf.advance(1);
+                    if buf.remaining() == 0 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len || len < 1 {
+                        break;
+                    }
+                    let flags = buf.get_u8();
+                    let id_len = len - 1;
+                    let mut data = vec![0u8; id_len];
+                    if id_len > 0 {
+                        buf.copy_to_slice(&mut data);
+                    }
+                    if flags & 0x01 == 0x01 {
+                        msg.uav_indication = Some(String::from_utf8(data).unwrap_or_default());
+                    }
+                }
                 _ => {
                     // Skip unknown IEs
                     buf.advance(1);
@@ -927,6 +1010,30 @@ impl RegistrationRequest {
         if let Some(ref ie) = self.ntn_access_barring {
             buf.put_u8(registration_request_iei::NTN_ACCESS_BARRING);
             ie.encode(buf);
+        }
+
+        // SNPN NID (Rel-17, TS 23.501 §5.30): TLV with the NID string value
+        if let Some(ref nid) = self.snpn_nid {
+            buf.put_u8(registration_request_iei::SNPN_NID);
+            buf.put_u8(nid.len() as u8);
+            buf.put_slice(nid.as_bytes());
+        }
+
+        // MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2): TLV with
+        // a single value octet; bit 1 set means disaster-roaming requested.
+        if self.disaster_roaming {
+            buf.put_u8(registration_request_iei::MINT_DISASTER_ROAMING);
+            buf.put_u8(1);
+            buf.put_u8(0x01);
+        }
+
+        // UAV indication (Rel-18, TS 23.256): TLV with a flags octet (bit 1 =
+        // aerial UE set) followed by the UAV CAA-level ID string, if any.
+        if let Some(ref caa_id) = self.uav_indication {
+            buf.put_u8(registration_request_iei::UAV_INDICATION);
+            buf.put_u8((1 + caa_id.len()) as u8);
+            buf.put_u8(0x01); // aerial-UE flag
+            buf.put_slice(caa_id.as_bytes());
         }
     }
 
@@ -1835,6 +1942,94 @@ mod tests {
             MobileIdentityType::Suci
         );
         assert_eq!(decoded.ue_security_capability, Some(vec![0xE0, 0xE0]));
+    }
+
+    #[test]
+    fn test_registration_request_snpn_nid_roundtrip() {
+        // SNPN (Rel-17, TS 23.501 §5.30): NID included in the Registration
+        // Request must survive an encode/decode roundtrip.
+        let reg_type = Ie5gsRegistrationType::new(
+            FollowOnRequest::NoPending,
+            RegistrationType::InitialRegistration,
+        );
+        let ng_ksi = NasKeySetIdentifier::no_key();
+        let mobile_id = Ie5gsMobileIdentity::new(MobileIdentityType::Suci, vec![0x01, 0x02, 0x03]);
+
+        let mut msg = RegistrationRequest::new(reg_type, ng_ksi, mobile_id);
+        msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
+        msg.snpn_nid = Some("7AB01234567".to_string());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        // IEI 0xA6 + length 11 + the NID bytes must appear in the encoding.
+        assert!(buf.windows(2).any(|w| w[0] == 0xA6 && w[1] == 11));
+
+        let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
+        assert_eq!(decoded.snpn_nid.as_deref(), Some("7AB01234567"));
+    }
+
+    #[test]
+    fn test_registration_request_uav_indication_roundtrip() {
+        // UAV (Rel-18, TS 23.256): the aerial-UE indication plus CAA-level ID
+        // must survive an encode/decode roundtrip and only emit when set.
+        let reg_type = Ie5gsRegistrationType::new(
+            FollowOnRequest::NoPending,
+            RegistrationType::InitialRegistration,
+        );
+        let ng_ksi = NasKeySetIdentifier::no_key();
+        let mobile_id = Ie5gsMobileIdentity::new(MobileIdentityType::Suci, vec![0x01, 0x02, 0x03]);
+
+        // Not set: IEI 0xA8 must be absent.
+        let mut msg = RegistrationRequest::new(reg_type.clone(), ng_ksi.clone(), mobile_id.clone());
+        msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert!(!buf.contains(&0xA8));
+
+        // Set: IEI 0xA8, flags octet 0x01 then the CAA-level ID must roundtrip.
+        let mut msg = RegistrationRequest::new(reg_type, ng_ksi, mobile_id);
+        msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
+        msg.uav_indication = Some("FAA-N12345".to_string());
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert!(buf.windows(2).any(|w| w[0] == 0xA8 && w[1] == 11));
+        let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
+        assert_eq!(decoded.uav_indication.as_deref(), Some("FAA-N12345"));
+    }
+
+    #[test]
+    fn test_registration_request_mint_disaster_roaming_roundtrip() {
+        // MINT (Rel-18, TS 23.761 §4.2): the disaster-roaming indication on a
+        // secondary subscription's Registration Request must survive a
+        // roundtrip and only be emitted when set.
+        let reg_type = Ie5gsRegistrationType::new(
+            FollowOnRequest::NoPending,
+            RegistrationType::InitialRegistration,
+        );
+        let ng_ksi = NasKeySetIdentifier::no_key();
+        let mobile_id = Ie5gsMobileIdentity::new(MobileIdentityType::Suci, vec![0x01, 0x02, 0x03]);
+
+        // Not set: IEI 0xA7 must be absent.
+        let mut msg = RegistrationRequest::new(reg_type, ng_ksi, mobile_id.clone());
+        msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert!(!buf.contains(&0xA7));
+        let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
+        assert!(!decoded.disaster_roaming);
+
+        // Set: IEI 0xA7, length 1, value 0x01 must appear and decode true.
+        let mut msg = RegistrationRequest::new(reg_type, ng_ksi, mobile_id);
+        msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
+        msg.disaster_roaming = true;
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert!(buf
+            .windows(3)
+            .any(|w| w[0] == 0xA7 && w[1] == 1 && w[2] == 0x01));
+        let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
+        assert!(decoded.disaster_roaming);
     }
 
     #[test]

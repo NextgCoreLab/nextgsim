@@ -113,6 +113,10 @@ pub struct Sib1Info {
     pub q_rx_lev_min: i8, // Minimum required RX level
     pub q_rx_lev_min_offset: Option<u8>,
     pub q_qual_min: Option<i8>, // Minimum quality level
+    /// Broadcast SNPN NID (Rel-17, TS 23.501 §5.30). When the cell is an SNPN
+    /// cell, SIB1 advertises the Network Identifier (`npn-IdentityInfoList`).
+    /// `None` for a public (PLMN) cell.
+    pub nid: Option<String>,
 }
 
 /// Description of a detected cell
@@ -260,6 +264,10 @@ pub struct CellSelector {
     current_cell: ActiveCellInfo,
     /// Selected PLMN (from NAS)
     selected_plmn: Option<Plmn>,
+    /// Required SNPN NID (Rel-17, TS 23.501 §5.30). When set (SNPN mode), only
+    /// a cell whose broadcast NID matches is treated as suitable; cells with a
+    /// different or absent NID are rejected.
+    required_nid: Option<String>,
     /// Forbidden TAIs for roaming
     forbidden_tai_roaming: Vec<Tai>,
     /// Forbidden TAIs for regional provision of service
@@ -278,6 +286,7 @@ impl CellSelector {
             cells: HashMap::new(),
             current_cell: ActiveCellInfo::default(),
             selected_plmn: None,
+            required_nid: None,
             forbidden_tai_roaming: Vec::new(),
             forbidden_tai_rps: Vec::new(),
             started_time: Instant::now(),
@@ -304,6 +313,18 @@ impl CellSelector {
     /// Get the selected PLMN
     pub fn selected_plmn(&self) -> Option<Plmn> {
         self.selected_plmn
+    }
+
+    /// Set the required SNPN NID for NID-qualified cell selection (Rel-17,
+    /// TS 23.501 §5.30). When `Some`, only cells broadcasting the matching NID
+    /// are selectable; clears SNPN gating when `None`.
+    pub fn set_required_nid(&mut self, nid: Option<String>) {
+        self.required_nid = nid;
+    }
+
+    /// Get the required SNPN NID, if SNPN-qualified selection is active.
+    pub fn required_nid(&self) -> Option<&str> {
+        self.required_nid.as_deref()
     }
 
     /// Add a TAI to the forbidden roaming list
@@ -608,6 +629,21 @@ impl CellSelector {
             if cell.sib1.plmn != selected_plmn {
                 report.out_of_plmn_cells += 1;
                 continue;
+            }
+
+            // SNPN NID-qualified selection (Rel-17, TS 23.501 §5.30): in SNPN
+            // mode only a cell broadcasting the configured NID is suitable.
+            if let Some(ref required_nid) = self.required_nid {
+                if cell.sib1.nid.as_deref() != Some(required_nid.as_str()) {
+                    report.out_of_plmn_cells += 1;
+                    tracing::debug!(
+                        "Cell {} rejected: SNPN NID mismatch (required={}, broadcast={:?})",
+                        cell_id,
+                        required_nid,
+                        cell.sib1.nid
+                    );
+                    continue;
+                }
             }
 
             // Check barred
@@ -1054,6 +1090,7 @@ mod tests {
                 q_rx_lev_min: -70,
                 q_rx_lev_min_offset: None,
                 q_qual_min: None,
+                nid: None,
             },
         }
     }
@@ -1076,6 +1113,48 @@ mod tests {
         let cell = result.unwrap();
         assert_eq!(cell.cell_id, 1);
         assert_eq!(cell.category, CellCategory::SuitableCell);
+    }
+
+    #[test]
+    fn test_cell_selection_snpn_nid_match_suitable() {
+        // SNPN (Rel-17, TS 23.501 §5.30): with a required NID, a cell whose
+        // broadcast NID matches is suitable.
+        let mut selector = CellSelector::new();
+        let plmn = Plmn::new(999, 70, false);
+        selector.set_selected_plmn(Some(plmn));
+        selector.set_required_nid(Some("7AB01234567".to_string()));
+
+        let mut cell = make_cell_with_sib1(-80, plmn, 1, false, false);
+        cell.sib1.nid = Some("7AB01234567".to_string());
+        selector.cells.insert(1, cell);
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+
+        let result = selector.perform_cell_selection();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().category, CellCategory::SuitableCell);
+    }
+
+    #[test]
+    fn test_cell_selection_snpn_nid_mismatch_rejected() {
+        // SNPN (Rel-17, TS 23.501 §5.30): a cell broadcasting a different NID
+        // is not suitable and must be rejected (falls back to acceptable-cell
+        // search, which on the same PLMN yields an acceptable, not suitable,
+        // selection).
+        let mut selector = CellSelector::new();
+        let plmn = Plmn::new(999, 70, false);
+        selector.set_selected_plmn(Some(plmn));
+        selector.set_required_nid(Some("7AB01234567".to_string()));
+
+        let mut cell = make_cell_with_sib1(-80, plmn, 1, false, false);
+        cell.sib1.nid = Some("FFFFFFFFFFF".to_string());
+        selector.cells.insert(1, cell);
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+
+        let result = selector.perform_cell_selection();
+        // Not selected as a suitable (NID-matching) cell.
+        if let Some(info) = result {
+            assert_ne!(info.category, CellCategory::SuitableCell);
+        }
     }
 
     #[test]

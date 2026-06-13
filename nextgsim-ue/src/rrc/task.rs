@@ -138,6 +138,11 @@ impl RrcTask {
 
         let mut cell_selector = CellSelector::new();
         cell_selector.set_selected_plmn(Some(selected_plmn));
+        // SNPN (Rel-17, TS 23.501 §5.30): when configured, gate cell selection
+        // on the SNPN NID so only the matching SNPN cell is selectable.
+        if let Some(ref snpn) = task_base.config.snpn_config {
+            cell_selector.set_required_nid(Some(snpn.nid.clone()));
+        }
 
         Self {
             task_base,
@@ -416,6 +421,10 @@ impl RrcTask {
             q_rx_lev_min: -70, // Reasonable minimum
             q_rx_lev_min_offset: None,
             q_qual_min: None,
+            // SNPN (Rel-17, TS 23.501 §5.30): the simulated cell broadcasts the
+            // configured SNPN NID (the gNB SIB1 npn-IdentityInfoList in a real
+            // deployment); None for a public cell.
+            nid: self.task_base.config.snpn_config.as_ref().map(|s| s.nid.clone()),
         };
         self.cell_selector.update_sib1(cell_id, sib1);
 
@@ -667,6 +676,14 @@ impl RrcTask {
         };
         let nas_data = nas_pdu.data().to_vec();
 
+        // RedCap (Reduced Capability) indication driven by UE config (Rel-17,
+        // TS 38.331 §6.2.2). When set, the gNB caps this UE's serving
+        // bandwidth and the core reduces the session-AMBR.
+        let redcap_indication = self.task_base.config.redcap;
+        if redcap_indication {
+            info!("Signalling RedCap (Reduced Capability) indication in RRCSetupComplete");
+        }
+
         let params = RrcSetupCompleteParams {
             registered_amf: None,
             rrc_transaction_id: 0,
@@ -675,6 +692,7 @@ impl RrcTask {
             s_nssai_list: None,
             dedicated_nas_message: nas_data.clone(),
             ng_5g_s_tmsi_value: None,
+            redcap_indication,
         };
 
         let pdu = match encode_rrc_setup_complete(&params) {

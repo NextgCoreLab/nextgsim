@@ -10,7 +10,8 @@ use crate::tasks::{
 use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::rrc_setup::{
-    decode_rrc_setup_request, RrcEstablishmentCause as AsnEstablishmentCause, UeIdentity,
+    decode_rrc_setup_complete, decode_rrc_setup_request,
+    RrcEstablishmentCause as AsnEstablishmentCause, UeIdentity,
 };
 use nextgsim_rrc::procedures::ue_capability::{
     decode_ue_capability_information, encode_ue_capability_enquiry, parse_nr_capability_bands,
@@ -251,6 +252,18 @@ impl RrcTask {
             OctetString::new()
         };
 
+        // RedCap (Reduced Capability) indication (Rel-17, TS 38.331 §6.2.2).
+        // The UE rides the indication in the RRCSetupComplete
+        // lateNonCriticalExtension octet container; best-effort ASN.1 decode of
+        // the full PDU recovers it without disturbing the lenient NAS
+        // extraction above.
+        let redcap_indication = decode_rrc_setup_complete(bytes)
+            .map(|data| data.redcap_indication)
+            .unwrap_or(false);
+        if redcap_indication {
+            self.apply_redcap_restrictions(ue_id);
+        }
+
         if let Some(result) = self.connection_manager.process_rrc_setup_complete(
             &mut self.ue_manager,
             ue_id,
@@ -269,6 +282,50 @@ impl RrcTask {
             // Enquire UE radio access capabilities (TS 38.331 §5.6.1)
             self.send_ue_capability_enquiry(ue_id).await;
         }
+    }
+
+    /// Configures the UE's RedCap processor and applies the RedCap bandwidth /
+    /// HD-FDD scheduling restriction (Rel-17, TS 38.306 / TS 38.331).
+    ///
+    /// The scheduler enforces a reduced serving bandwidth for a RedCap UE: the
+    /// cell's PRB grid is clamped to the RedCap maximum bandwidth (20 MHz for
+    /// Rel-17), so a RedCap UE is never granted more PRBs than its narrowband
+    /// RF supports. The enforced PRB ceiling is stored on the UE context and
+    /// observed by downstream resource allocation.
+    fn apply_redcap_restrictions(&mut self, ue_id: i32) {
+        // Cell serving bandwidth (FR1 normal UE baseline: 100 MHz / 273 PRB at
+        // 30 kHz SCS, TS 38.101-1 Table 5.3.2-1).
+        const CELL_BANDWIDTH_MHZ: u8 = 100;
+        const CELL_MAX_PRB: u32 = 273;
+
+        let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
+            return;
+        };
+
+        // Configure the RedCap processor with Rel-17 capabilities (20 MHz,
+        // single-layer, HD-FDD).
+        ctx.redcap
+            .configure(super::redcap::RedCapUeCapabilities::rel17());
+
+        // Scheduler enforcement: clamp the granted bandwidth to the RedCap
+        // ceiling and translate it to a hard PRB cap proportional to the
+        // bandwidth reduction. This is a real reduction applied to this UE's
+        // resource grid, not a log-only marker.
+        let enforced_bw_mhz = ctx.redcap.restrict_bandwidth(CELL_BANDWIDTH_MHZ);
+        let enforced_max_prb =
+            (CELL_MAX_PRB * enforced_bw_mhz as u32 / CELL_BANDWIDTH_MHZ as u32).max(1);
+        ctx.set_redcap_max_prb(enforced_max_prb);
+
+        info!(
+            "RedCap UE[{}]: scheduler bandwidth restricted to {} MHz ({} PRB max, \
+             was {} MHz / {} PRB); HD-FDD gaps={}",
+            ue_id,
+            enforced_bw_mhz,
+            enforced_max_prb,
+            CELL_BANDWIDTH_MHZ,
+            CELL_MAX_PRB,
+            ctx.redcap.needs_hd_fdd_gaps(),
+        );
     }
 
     /// Sends a UECapabilityEnquiry to the UE (TS 38.331 §5.6.1)

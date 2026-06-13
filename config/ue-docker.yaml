@@ -60,8 +60,26 @@ sessions:
       sd: null
     apn: "internet"
     is_emergency: false
+  # Optional XR (Extended Reality) PDU session, Rel-18 (TS 23.501 5.7.4).
+  # requested_5qi 82-85 requests an XR delay-critical GBR session; with no apn
+  # the UE selects an XR DNN (xr / xr-split / xr-haptic) and the SMF installs
+  # the XR QoS flow (dedicated GBR QER, EF/AF41 DSCP) end to end.
+  # - type: Ipv4
+  #   s_nssai:
+  #     sst: 1
+  #     sd: null
+  #   apn: "xr"
+  #   is_emergency: false
+  #   requested_5qi: 82
 
 configured_nssai:
   slices:
     - sst: 1
       sd: null
+
+# RedCap (Reduced Capability) UE indication (Rel-17, TS 38.101).
+# When true the UE signals redcapIndication in RRCSetupComplete; the gNB caps
+# this UE's serving bandwidth (20 MHz / reduced PRB) and the core reduces the
+# session-AMBR (default 150 Mbps DL / 50 Mbps UL, override via
+# REDCAP_SESS_AMBR_DL_BPS / REDCAP_SESS_AMBR_UL_BPS on the SMF).
+redcap: false
