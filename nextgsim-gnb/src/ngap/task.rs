@@ -730,8 +730,10 @@ impl NgapTask {
             let resource = PduSessionResource {
                 psi: psi as i32,
                 qfi: Some(qfi),
-                uplink_teid: gnb_teid,
-                downlink_teid: upf_teid,
+                // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
+                // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
+                uplink_teid: upf_teid,
+                downlink_teid: gnb_teid,
                 upf_address: upf_addr,
             };
             let msg = GtpMessage::SessionCreate { ue_id, resource };
@@ -951,8 +953,10 @@ impl NgapTask {
             let resource = PduSessionResource {
                 psi: psi as i32,
                 qfi: Some(qfi),
-                uplink_teid: gnb_teid,
-                downlink_teid: upf_teid,
+                // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
+                // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
+                uplink_teid: upf_teid,
+                downlink_teid: gnb_teid,
                 upf_address: upf_addr,
             };
             let msg = GtpMessage::SessionModify { ue_id, resource };
@@ -2127,8 +2131,11 @@ impl NgapTask {
                 let resource = PduSessionResource {
                     psi: s.psi as i32,
                     qfi: s.qfi,
-                    uplink_teid: s.uplink_teid,
-                    downlink_teid: s.downlink_teid,
+                    // NgapPduSession stores UPF TEID in downlink_teid and gNB TEID in
+                    // uplink_teid (internal convention); the GTP task expects the opposite
+                    // (uplink_teid = UPF dest). Map across the boundary here.
+                    uplink_teid: s.downlink_teid,
+                    downlink_teid: s.uplink_teid,
                     upf_address: s.upf_address,
                 };
                 let msg = GtpMessage::SessionModify { ue_id, resource };
