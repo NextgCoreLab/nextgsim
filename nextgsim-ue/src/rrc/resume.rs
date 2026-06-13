@@ -425,7 +425,12 @@ mod tests {
         let sm = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
 
-        let result = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x123456), 0xABCD, &sm);
+        let result = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x123456),
+            0xABCD,
+            &sm,
+        );
 
         assert!(result.is_ok());
         assert_eq!(proc.state(), ResumeProcedureState::WaitingForResponse);
@@ -443,7 +448,12 @@ mod tests {
         sm.transition(RrcStateTransition::SetupComplete).unwrap(); // CONNECTED
         let mut proc = ResumeProcedure::new();
 
-        let result = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x000001), 0x0001, &sm);
+        let result = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm,
+        );
 
         assert!(matches!(result, Err(ResumeError::NotInactive(_))));
     }
@@ -453,7 +463,12 @@ mod tests {
         let sm = RrcStateMachine::new(); // IDLE
         let mut proc = ResumeProcedure::new();
 
-        let result = proc.initiate(ResumeCause::MoSignalling, ResumeIdentity::Short(0x000002), 0x0002, &sm);
+        let result = proc.initiate(
+            ResumeCause::MoSignalling,
+            ResumeIdentity::Short(0x000002),
+            0x0002,
+            &sm,
+        );
 
         assert!(matches!(result, Err(ResumeError::NotInactive(_))));
     }
@@ -463,10 +478,20 @@ mod tests {
         let sm = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
 
-        let _ = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x111111), 0x0001, &sm);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x111111),
+            0x0001,
+            &sm,
+        );
 
         let sm2 = setup_inactive_sm();
-        let result = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x222222), 0x0002, &sm2);
+        let result = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x222222),
+            0x0002,
+            &sm2,
+        );
 
         assert!(matches!(result, Err(ResumeError::AlreadyInProgress)));
     }
@@ -475,7 +500,12 @@ mod tests {
     fn test_on_resume_received_happy_path() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x123456), 0xABCD, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x123456),
+            0xABCD,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         let result = proc.on_resume_received(1, None, &mut sm);
@@ -492,7 +522,12 @@ mod tests {
     fn test_on_resume_received_with_nas_message() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoSignalling, ResumeIdentity::Short(0x000001), 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoSignalling,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         let nas_msg = vec![0x7E, 0x00, 0x46]; // dummy NAS service request
@@ -516,7 +551,12 @@ mod tests {
     fn test_on_release_received_moves_to_idle() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MtAccess, ResumeIdentity::Short(0x000001), 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MtAccess,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         proc.on_release_received(&mut sm);
@@ -529,7 +569,12 @@ mod tests {
     fn test_on_setup_fallback() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x000001), 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         proc.on_setup_fallback();
         assert_eq!(proc.state(), ResumeProcedureState::Failed);
@@ -539,7 +584,12 @@ mod tests {
     fn test_on_t319_expired() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x000001), 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         proc.on_t319_expired(&mut sm);
@@ -552,7 +602,12 @@ mod tests {
     fn test_reset_clears_state() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, ResumeIdentity::Short(0x123456), 0xABCD, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x123456),
+            0xABCD,
+            &sm_ref,
+        );
 
         proc.reset();
 

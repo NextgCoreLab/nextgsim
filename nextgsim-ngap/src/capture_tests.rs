@@ -520,8 +520,8 @@ mod tests {
     /// Response produced by the strict core codec.
     #[test]
     fn ng_setup_response_from_core_decodes() {
-        let decoded =
-            decode_ngap_pdu(&CORE_NG_SETUP_RESPONSE).expect("sim must decode core NG Setup Response");
+        let decoded = decode_ngap_pdu(&CORE_NG_SETUP_RESPONSE)
+            .expect("sim must decode core NG Setup Response");
         match decoded {
             NGAP_PDU::SuccessfulOutcome(outcome) => {
                 assert_eq!(outcome.procedure_code.0, 21, "NGSetup procedure code");
@@ -685,11 +685,13 @@ mod tests {
 
     #[test]
     fn ics_request_from_core_decodes() {
-        let decoded =
-            decode_ngap_pdu(&CORE_ICS_REQUEST).expect("sim must decode core ICS Request");
+        let decoded = decode_ngap_pdu(&CORE_ICS_REQUEST).expect("sim must decode core ICS Request");
         match decoded {
             NGAP_PDU::InitiatingMessage(msg) => {
-                assert_eq!(msg.procedure_code.0, 14, "InitialContextSetup procedure code");
+                assert_eq!(
+                    msg.procedure_code.0, 14,
+                    "InitialContextSetup procedure code"
+                );
             }
             other => panic!("expected InitiatingMessage, got {other:?}"),
         }
@@ -768,10 +770,7 @@ mod tests {
         // Pin the wire bytes so the core smfd cross-codec test can decode them.
         assert_eq!(
             bytes,
-            vec![
-                0x00, 0x03, 0xe0, 0x0a, 0x2e, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01,
-            ]
+            vec![0x00, 0x03, 0xe0, 0x0a, 0x2e, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01,]
         );
     }
-
 }

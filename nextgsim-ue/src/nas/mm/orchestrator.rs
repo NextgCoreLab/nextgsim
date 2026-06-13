@@ -174,9 +174,8 @@ impl MmUeIdentity {
             | (u8::from(algs.nea1) << 6)
             | (u8::from(algs.nea2) << 5)
             | (u8::from(algs.nea3) << 4);
-        let ia_cap = (u8::from(algs.nia1) << 6)
-            | (u8::from(algs.nia2) << 5)
-            | (u8::from(algs.nia3) << 4);
+        let ia_cap =
+            (u8::from(algs.nia1) << 6) | (u8::from(algs.nia2) << 5) | (u8::from(algs.nia3) << 4);
 
         // Requested NSSAI value: list of S-NSSAI entries (TS 24.501 9.11.3.37)
         let requested_nssai = if config.configured_nssai.slices.is_empty() {
@@ -255,7 +254,11 @@ impl MmUeIdentity {
 
 /// Encode MCC/MNC as the 3-octet BCD PLMN field of TS 24.501 9.11.3.4.
 pub(crate) fn encode_plmn_bcd(mcc: u16, mnc: u16, long_mnc: bool) -> [u8; 3] {
-    let mcc_d = [(mcc / 100 % 10) as u8, (mcc / 10 % 10) as u8, (mcc % 10) as u8];
+    let mcc_d = [
+        (mcc / 100 % 10) as u8,
+        (mcc / 10 % 10) as u8,
+        (mcc % 10) as u8,
+    ];
     let (mnc_d3, mnc_d) = if long_mnc || mnc > 99 {
         (
             (mnc % 10) as u8,
@@ -560,7 +563,8 @@ impl MmOrchestrator {
                 // TS 24.501 5.6.1.7: abort the service request procedure
                 warn!("T3517 expired: service request procedure timed out");
                 if self.state.mm_substate() == MmSubState::ServiceRequestInitiated {
-                    self.state.switch_mm_state(MmSubState::RegisteredNormalService);
+                    self.state
+                        .switch_mm_state(MmSubState::RegisteredNormalService);
                 }
                 Vec::new()
             }
@@ -643,7 +647,10 @@ impl MmOrchestrator {
         // apply minimization-of-service-interruption handling.
         if self.identity.disaster_roaming {
             req.disaster_roaming = true;
-            info!("MINT registration: including disaster-roaming indication (SUPI={})", self.identity.supi);
+            info!(
+                "MINT registration: including disaster-roaming indication (SUPI={})",
+                self.identity.supi
+            );
         }
         // UAV indication (Rel-18, TS 23.256): an aerial UE advertises the
         // aerial-UE flag plus its CAA-level ID so the AMF creates the UAV
@@ -743,7 +750,8 @@ impl MmOrchestrator {
         self.res_star = None;
         self.registration_attempt_counter = 0;
 
-        self.state.switch_mm_state(MmSubState::RegisteredNormalService);
+        self.state
+            .switch_mm_state(MmSubState::RegisteredNormalService);
         self.state.switch_update_status(UpdateStatus::Updated);
         info!("Registration Accept: UE is now {}", self.state);
 
@@ -778,7 +786,10 @@ impl MmOrchestrator {
 
         let mut outs = Vec::new();
         if let Some(guti) = acc.guti {
-            info!("Registration Accept assigned a new 5G-GUTI ({} bytes)", guti.data.len());
+            info!(
+                "Registration Accept assigned a new 5G-GUTI ({} bytes)",
+                guti.data.len()
+            );
             self.stored_guti = Some(guti);
             // TS 24.501 5.5.1.2.4: a new 5G-GUTI assignment must be
             // acknowledged with Registration Complete (the AMF runs T3550)
@@ -815,53 +826,62 @@ impl MmOrchestrator {
         match cause {
             MmCause::IllegalUe | MmCause::IllegalMe | MmCause::FiveGsServicesNotAllowed => {
                 // 5U3, delete 5G-GUTI/TAI list/ngKSI, USIM invalid, no retry
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 self.usim_invalid = true;
                 self.state.switch_mm_state(MmSubState::Deregistered);
                 vec![MmOutput::RegistrationFailed(cause)]
             }
             MmCause::PlmnNotAllowed => {
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 self.forbidden_plmns.push(self.identity.plmn_bcd);
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredPlmnSearch);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
                 vec![
                     MmOutput::PlmnSearchNeeded,
                     MmOutput::RegistrationFailed(cause),
                 ]
             }
             MmCause::TrackingAreaNotAllowed => {
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 if let Some(tai) = self.current_tai {
                     self.forbidden_tais_service.push(tai);
                 }
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredLimitedService);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredLimitedService);
                 vec![MmOutput::RegistrationFailed(cause)]
             }
             MmCause::RoamingNotAllowedInTa => {
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 if let Some(tai) = self.current_tai {
                     self.forbidden_tais_roaming.push(tai);
                 }
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredPlmnSearch);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
                 vec![
                     MmOutput::PlmnSearchNeeded,
                     MmOutput::RegistrationFailed(cause),
                 ]
             }
             MmCause::NoSuitableCellsInTa => {
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 if let Some(tai) = self.current_tai {
                     self.forbidden_tais_roaming.push(tai);
                 }
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredLimitedService);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredLimitedService);
                 vec![MmOutput::RegistrationFailed(cause)]
             }
             MmCause::Congestion => {
@@ -882,7 +902,8 @@ impl MmOrchestrator {
                 }
             }
             MmCause::N1ModeNotAllowed => {
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 self.n1_mode_disabled = true;
                 self.state.switch_mm_state(MmSubState::Deregistered);
@@ -892,7 +913,8 @@ impl MmOrchestrator {
                 // #62: delete the allowed NSSAI, limited service
                 self.allowed_nssai = None;
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredLimitedService);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredLimitedService);
                 vec![MmOutput::RegistrationFailed(cause)]
             }
             MmCause::Non3gppAccessTo5gcnNotAllowed => {
@@ -901,11 +923,13 @@ impl MmOrchestrator {
                 self.abnormal_registration_failure()
             }
             MmCause::ServingNetworkNotAuthorized => {
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 self.forbidden_plmns.push(self.identity.plmn_bcd);
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredPlmnSearch);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
                 vec![
                     MmOutput::PlmnSearchNeeded,
                     MmOutput::RegistrationFailed(cause),
@@ -915,7 +939,8 @@ impl MmOrchestrator {
                 self.delete_registration_context();
                 self.snpn_temporarily_forbidden = true;
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredPlmnSearch);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
                 vec![
                     MmOutput::PlmnSearchNeeded,
                     MmOutput::RegistrationFailed(cause),
@@ -925,7 +950,8 @@ impl MmOrchestrator {
                 self.delete_registration_context();
                 self.snpn_permanently_forbidden = true;
                 self.registration_attempt_counter = 0;
-                self.state.switch_mm_state(MmSubState::DeregisteredPlmnSearch);
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
                 vec![
                     MmOutput::PlmnSearchNeeded,
                     MmOutput::RegistrationFailed(cause),
@@ -1040,7 +1066,8 @@ impl MmOrchestrator {
         if amf_autn[0] & 0x80 == 0 {
             warn!("AMF separation bit not set: non-5G authentication unacceptable");
             self.auth_failure_count += 1;
-            return self.send_authentication_failure(MmCause::Non5gAuthenticationUnacceptable, None);
+            return self
+                .send_authentication_failure(MmCause::Non5gAuthenticationUnacceptable, None);
         }
 
         // 3) SQN range check (TS 33.102 Annex C.2: cause #21 with AUTS)
@@ -1146,7 +1173,8 @@ impl MmOrchestrator {
         self.timers.stop(TIMER_T3521, true);
         self.res_star = None;
         self.usim_invalid = true;
-        self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+        self.state
+            .switch_update_status(UpdateStatus::RoamingNotAllowed);
         self.delete_registration_context();
         self.state.switch_mm_state(MmSubState::Deregistered);
         vec![MmOutput::AuthenticationRejected]
@@ -1195,11 +1223,17 @@ impl MmOrchestrator {
         // advertised capabilities
         let algs = &smc.selected_nas_security_algorithms;
         let Ok(cipher_alg) = CipheringAlgorithm::try_from(algs.ciphering) else {
-            warn!("SMC selected unknown ciphering algorithm {}", algs.ciphering);
+            warn!(
+                "SMC selected unknown ciphering algorithm {}",
+                algs.ciphering
+            );
             return self.send_security_mode_reject(MmCause::UeSecurityCapabilitiesMismatch);
         };
         let Ok(integ_alg) = IntegrityAlgorithm::try_from(algs.integrity) else {
-            warn!("SMC selected unknown integrity algorithm {}", algs.integrity);
+            warn!(
+                "SMC selected unknown integrity algorithm {}",
+                algs.integrity
+            );
             return self.send_security_mode_reject(MmCause::UeSecurityCapabilitiesMismatch);
         };
         if !alg_in_capability(self.identity.ea_cap, cipher_alg as u8)
@@ -1245,11 +1279,7 @@ impl MmOrchestrator {
         self.sec.reset_counts();
 
         let count = NasCount::new(0, sqn);
-        let knas_int = *self
-            .sec
-            .keys()
-            .knas_int()
-            .expect("knas_int derived above");
+        let knas_int = *self.sec.keys().knas_int().expect("knas_int derived above");
         if let Err(e) = verify_nas_mac(
             integ_alg,
             &knas_int,
@@ -1285,8 +1315,10 @@ impl MmOrchestrator {
 
         let mut plain = Vec::new();
         complete.encode(&mut plain);
-        info!("Sending Security Mode Complete (container={} bytes)",
-            complete.nas_message_container.as_ref().map_or(0, Vec::len));
+        info!(
+            "Sending Security Mode Complete (container={} bytes)",
+            complete.nas_message_container.as_ref().map_or(0, Vec::len)
+        );
         let pdu = self.protect_uplink(
             plain,
             SecurityHeaderType::IntegrityProtectedAndCipheredWithNewSecurityContext,
@@ -1323,17 +1355,15 @@ impl MmOrchestrator {
             return Vec::new();
         };
 
-        let mut req = ServiceRequest::new(
-            self.sec.nas_ksi(),
-            IeServiceType::new(service_type),
-            s_tmsi,
-        );
+        let mut req =
+            ServiceRequest::new(self.sec.nas_ksi(), IeServiceType::new(service_type), s_tmsi);
         req.uplink_data_status = uplink_data_status;
 
         let mut plain = Vec::new();
         req.encode(&mut plain);
 
-        self.state.switch_mm_state(MmSubState::ServiceRequestInitiated);
+        self.state
+            .switch_mm_state(MmSubState::ServiceRequestInitiated);
         self.timers.start(TIMER_T3517, true);
         info!("Sending Service Request ({service_type:?}), T3517 started");
         let pdu = self.protect_if_active(plain);
@@ -1359,7 +1389,8 @@ impl MmOrchestrator {
         self.timers.stop(TIMER_T3517, true);
         self.timers.stop(TIMER_T3516, true);
         self.res_star = None;
-        self.state.switch_mm_state(MmSubState::RegisteredNormalService);
+        self.state
+            .switch_mm_state(MmSubState::RegisteredNormalService);
         self.state.switch_cm_state(CmState::Connected);
         Vec::new()
     }
@@ -1379,7 +1410,8 @@ impl MmOrchestrator {
         match cause {
             MmCause::IllegalUe | MmCause::IllegalMe | MmCause::FiveGsServicesNotAllowed => {
                 // Same terminal handling as for registration (5.6.1.5)
-                self.state.switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 self.usim_invalid = true;
                 self.state.switch_mm_state(MmSubState::Deregistered);
@@ -1400,11 +1432,13 @@ impl MmOrchestrator {
                         .start_with_timer2(TIMER_T3346, GprsTimer2::new(secs), true);
                     info!("T3346 (congestion backoff) started: {secs}s");
                 }
-                self.state.switch_mm_state(MmSubState::RegisteredNormalService);
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredNormalService);
                 Vec::new()
             }
             _ => {
-                self.state.switch_mm_state(MmSubState::RegisteredNormalService);
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredNormalService);
                 Vec::new()
             }
         }
@@ -1435,12 +1469,16 @@ impl MmOrchestrator {
         } else {
             Ie5gsMobileIdentity::new(MobileIdentityType::Suci, self.identity.suci.clone())
         };
-        let req =
-            DeregistrationRequestUeOriginating::new(dereg_type, self.sec.nas_ksi(), mobile_identity);
+        let req = DeregistrationRequestUeOriginating::new(
+            dereg_type,
+            self.sec.nas_ksi(),
+            mobile_identity,
+        );
         let mut plain = Vec::new();
         req.encode(&mut plain);
 
-        self.state.switch_mm_state(MmSubState::DeregisteredInitiated);
+        self.state
+            .switch_mm_state(MmSubState::DeregisteredInitiated);
         if switch_off {
             // No response expected on switch-off (5.5.2.2.4)
             self.dereg_pdu = None;
@@ -1688,7 +1726,9 @@ mod tests {
     fn test_identity() -> MmUeIdentity {
         MmUeIdentity {
             supi: "999700000000001".to_string(),
-            suci: vec![0x01, 0x09, 0xF9, 0x07, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10],
+            suci: vec![
+                0x01, 0x09, 0xF9, 0x07, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+            ],
             k: TEST_K,
             opc: compute_opc(&TEST_K, &TEST_OP),
             sn_name: "5G:mnc070.mcc999.3gppnetwork.org".to_string(),
@@ -1857,7 +1897,10 @@ mod tests {
             guti_data.push(0x01); // AMF region
             guti_data.extend_from_slice(&[0x00, 0x40]); // AMF set/ptr
             guti_data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // TMSI
-            acc.guti = Some(Ie5gsMobileIdentity::new(MobileIdentityType::Guti, guti_data));
+            acc.guti = Some(Ie5gsMobileIdentity::new(
+                MobileIdentityType::Guti,
+                guti_data,
+            ));
         }
         let mut pdu = Vec::new();
         acc.encode(&mut pdu);
@@ -1885,10 +1928,7 @@ mod tests {
         assert_eq!(pdu[1], 0x00, "initial registration must be plain");
         assert_eq!(pdu[2], u8::from(MmMessageType::RegistrationRequest));
         assert!(orch.timers().t3510.is_running());
-        assert_eq!(
-            orch.state().mm_substate(),
-            MmSubState::RegisteredInitiated
-        );
+        assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
 
         // Round-trip: the request must contain the UE security capability
         // and the requested NSSAI
@@ -2116,7 +2156,10 @@ mod tests {
                 orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3511, true, i));
             }
         }
-        assert_eq!(orch.registration_attempt_counter(), MAX_REGISTRATION_ATTEMPTS);
+        assert_eq!(
+            orch.registration_attempt_counter(),
+            MAX_REGISTRATION_ATTEMPTS
+        );
         assert!(orch.timers().t3502.is_running());
         assert!(!orch.timers().t3511.is_running());
         assert_eq!(orch.state().update_status(), UpdateStatus::NotUpdated);
@@ -2447,8 +2490,7 @@ mod tests {
         orch.handle_downlink(&auth);
 
         // Replayed capabilities differ from what the UE advertised
-        let weak_caps =
-            IeUeSecurityCapability::decode(&mut [2u8, 0x80, 0x00].as_slice()).unwrap();
+        let weak_caps = IeUeSecurityCapability::decode(&mut [2u8, 0x80, 0x00].as_slice()).unwrap();
         let smc = SecurityModeCommand::new(
             IeNasSecurityAlgorithms::new(0, 0),
             NasKeySetIdentifier::new(nextgsim_nas::security::SecurityContextType::Native, 0),

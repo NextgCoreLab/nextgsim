@@ -139,7 +139,9 @@ impl MintSecondary {
                 "MINT: initiating secondary registration for subscription {} (SUPI={})",
                 sub.index, sub.supi
             );
-            let outs = sub.mm.start_registration(RegistrationType::InitialRegistration);
+            let outs = sub
+                .mm
+                .start_registration(RegistrationType::InitialRegistration);
             out.push((sub.index, outs));
         }
         out
@@ -187,10 +189,7 @@ impl MintSecondary {
 
     /// Derive the per-subscription session parameter list for a secondary
     /// subscription: the configured sessions whose DNN routes to this index.
-    pub fn session_params_for(
-        config: &UeConfig,
-        index: u8,
-    ) -> Vec<SmSessionParams> {
+    pub fn session_params_for(config: &UeConfig, index: u8) -> Vec<SmSessionParams> {
         SmSessionParams::from_config(config)
             .into_iter()
             .filter(|p| p.subscription_index == index)

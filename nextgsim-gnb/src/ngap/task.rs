@@ -45,6 +45,14 @@ use nextgsim_ngap::procedures::initial_context_setup::{
     InitialContextSetupResponseParams,
 };
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
+use nextgsim_ngap::procedures::ng_setup::{
+    NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
+};
+use nextgsim_ngap::procedures::path_switch::{
+    decode_path_switch_request_acknowledge, decode_path_switch_request_failure,
+    encode_path_switch_request, PathSwitchRequestAcknowledgeData, PathSwitchRequestFailureData,
+    PathSwitchRequestParams, PathSwitchSessionItem, UeSecurityCapabilityBits,
+};
 use nextgsim_ngap::procedures::pdu_session_resource::{
     // Modify
     decode_pdu_session_resource_modify_request,
@@ -66,20 +74,12 @@ use nextgsim_ngap::procedures::pdu_session_resource::{
     PduSessionResourceSetupResponseItem,
     PduSessionResourceSetupResponseParams,
 };
-use nextgsim_ngap::procedures::ng_setup::{
-    NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
-};
-use nextgsim_ngap::procedures::path_switch::{
-    decode_path_switch_request_acknowledge, decode_path_switch_request_failure,
-    encode_path_switch_request, PathSwitchRequestAcknowledgeData, PathSwitchRequestFailureData,
-    PathSwitchRequestParams, PathSwitchSessionItem, UeSecurityCapabilityBits,
-};
 use nextgsim_ngap::procedures::transfer::{
-    decode_modify_request_transfer, decode_release_command_transfer,
-    decode_setup_request_transfer, encode_modify_response_transfer,
-    encode_modify_unsuccessful_transfer, encode_release_response_transfer,
-    encode_setup_response_transfer, encode_setup_unsuccessful_transfer, GtpTunnelInfo,
-    ModifyResponseTransferParams, SetupResponseTransferParams,
+    decode_modify_request_transfer, decode_release_command_transfer, decode_setup_request_transfer,
+    encode_modify_response_transfer, encode_modify_unsuccessful_transfer,
+    encode_release_response_transfer, encode_setup_response_transfer,
+    encode_setup_unsuccessful_transfer, GtpTunnelInfo, ModifyResponseTransferParams,
+    SetupResponseTransferParams,
 };
 use nextgsim_ngap::procedures::ue_context_release::{
     decode_ue_context_release_command, encode_ue_context_release_complete,
@@ -671,7 +671,11 @@ impl NgapTask {
 
         let mut setup_response_items = Vec::new();
         let mut failed_items = Vec::new();
-        let gnb_ip = self.task_base.config.gtp_advertise_ip.unwrap_or(self.task_base.config.gtp_ip);
+        let gnb_ip = self
+            .task_base
+            .config
+            .gtp_advertise_ip
+            .unwrap_or(self.task_base.config.gtp_ip);
 
         for item in &setup_req.pdu_session_resource_setup_list {
             let psi = item.pdu_session_id;
@@ -742,11 +746,11 @@ impl NgapTask {
                 if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
                     ctx.remove_pdu_session(psi);
                 }
-                if let Ok(transfer) = encode_setup_unsuccessful_transfer(
-                    &NgSetupFailureCause::RadioNetwork(
+                if let Ok(transfer) =
+                    encode_setup_unsuccessful_transfer(&NgSetupFailureCause::RadioNetwork(
                         RadioNetworkCause::RadioResourcesNotAvailable,
-                    ),
-                ) {
+                    ))
+                {
                     failed_items.push(PduSessionResourceFailedToSetupItem {
                         pdu_session_id: psi,
                         transfer,
@@ -792,11 +796,11 @@ impl NgapTask {
                         "Failed to encode SetupResponseTransfer for PSI {}: {}",
                         psi, e
                     );
-                    if let Ok(transfer) = encode_setup_unsuccessful_transfer(
-                        &NgSetupFailureCause::Misc(
+                    if let Ok(transfer) =
+                        encode_setup_unsuccessful_transfer(&NgSetupFailureCause::Misc(
                             nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
-                        ),
-                    ) {
+                        ))
+                    {
                         failed_items.push(PduSessionResourceFailedToSetupItem {
                             pdu_session_id: psi,
                             transfer,
@@ -870,7 +874,11 @@ impl NgapTask {
 
         let mut modify_response_items = Vec::new();
         let mut failed_items = Vec::new();
-        let gnb_ip = self.task_base.config.gtp_advertise_ip.unwrap_or(self.task_base.config.gtp_ip);
+        let gnb_ip = self
+            .task_base
+            .config
+            .gtp_advertise_ip
+            .unwrap_or(self.task_base.config.gtp_ip);
 
         for item in &modify_req.pdu_session_resource_modify_list {
             let psi = item.pdu_session_id;
@@ -962,11 +970,11 @@ impl NgapTask {
             let msg = GtpMessage::SessionModify { ue_id, resource };
             if let Err(e) = self.task_base.gtp_tx.send(msg).await {
                 error!("Failed to send SessionModify to GTP: {}", e);
-                if let Ok(transfer) = encode_modify_unsuccessful_transfer(
-                    &NgSetupFailureCause::RadioNetwork(
+                if let Ok(transfer) =
+                    encode_modify_unsuccessful_transfer(&NgSetupFailureCause::RadioNetwork(
                         RadioNetworkCause::RadioResourcesNotAvailable,
-                    ),
-                ) {
+                    ))
+                {
                     failed_items.push(PduSessionResourceFailedToModifyItem {
                         pdu_session_id: psi,
                         transfer,
@@ -1538,10 +1546,12 @@ impl NgapTask {
         if let Some(amf_id) = amf_ue_ngap_id {
             // Map the local trigger to the NGAP cause (TS 38.413 §9.3.1.2)
             let ngap_cause = match cause {
-                UeReleaseRequestCause::UserTriggered => NgSetupFailureCause::Nas(NasCause::NormalRelease),
-                UeReleaseRequestCause::RadioLinkFailure => NgSetupFailureCause::RadioNetwork(
-                    RadioNetworkCause::RadioConnectionWithUeLost,
-                ),
+                UeReleaseRequestCause::UserTriggered => {
+                    NgSetupFailureCause::Nas(NasCause::NormalRelease)
+                }
+                UeReleaseRequestCause::RadioLinkFailure => {
+                    NgSetupFailureCause::RadioNetwork(RadioNetworkCause::RadioConnectionWithUeLost)
+                }
                 UeReleaseRequestCause::RanOriginated => NgSetupFailureCause::RadioNetwork(
                     RadioNetworkCause::ReleaseDueToNgranGeneratedReason,
                 ),
@@ -1559,7 +1569,8 @@ impl NgapTask {
                         "Sending UE Context Release Request: ue_id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={}, amf_ctx_id={}, cause={:?}",
                         ue_id, ran_ue_ngap_id, amf_id, amf_ctx_id, cause
                     );
-                    self.send_ngap_ue_associated(amf_ctx_id, stream, bytes).await;
+                    self.send_ngap_ue_associated(amf_ctx_id, stream, bytes)
+                        .await;
 
                     // Keep the context in Releasing state; cleanup happens when
                     // the AMF answers with UE Context Release Command
@@ -2069,7 +2080,8 @@ impl NgapTask {
 
         match encode_path_switch_request(&params) {
             Ok(bytes) => {
-                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes).await;
+                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes)
+                    .await;
                 info!(
                     "Sent Path Switch Request: ue_id={}, ran_ue_ngap_id={}, source_amf_ue_ngap_id={}",
                     ue_id, ran_ue_ngap_id, source_amf_ue_ngap_id

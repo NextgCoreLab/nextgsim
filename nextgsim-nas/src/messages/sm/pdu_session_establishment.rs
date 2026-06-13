@@ -982,9 +982,7 @@ impl PduSessionEstablishmentRequest {
 
         // Optional IEs
         if let Some(ref t) = self.pdu_session_type {
-            buf.put_u8(
-                (establishment_request_iei::PDU_SESSION_TYPE_HIGH_NIBBLE << 4) | t.encode(),
-            );
+            buf.put_u8((establishment_request_iei::PDU_SESSION_TYPE_HIGH_NIBBLE << 4) | t.encode());
         }
         if let Some(ref m) = self.ssc_mode {
             buf.put_u8((establishment_request_iei::SSC_MODE_HIGH_NIBBLE << 4) | m.encode());
@@ -1319,7 +1317,9 @@ impl PduSessionEstablishmentAccept {
         header.encode(buf);
 
         // Octet 5: SSC mode (bits 5-7) | PDU session type (bits 1-3)
-        buf.put_u8((self.selected_ssc_mode.encode() << 4) | self.selected_pdu_session_type.encode());
+        buf.put_u8(
+            (self.selected_ssc_mode.encode() << 4) | self.selected_pdu_session_type.encode(),
+        );
 
         // Authorized QoS rules (mandatory, LV-E)
         self.authorized_qos_rules.encode(buf);
@@ -1447,7 +1447,9 @@ impl PduSessionEstablishmentReject {
     ) -> Result<Self, PduSessionEstablishmentError> {
         // 5GSM cause (mandatory, V)
         if buf.remaining() < 1 {
-            return Err(PduSessionEstablishmentError::MissingMandatoryIe("5GSM cause"));
+            return Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "5GSM cause",
+            ));
         }
         let cause = SmCause::try_from(buf.get_u8())?;
         let mut msg = Self::new(pdu_session_id, pti, cause);
@@ -1698,7 +1700,9 @@ mod tests {
         let result = PduSessionEstablishmentAccept::decode(&mut &truncated[..], 1, 1);
         assert_eq!(
             result,
-            Err(PduSessionEstablishmentError::MissingMandatoryIe("Session AMBR"))
+            Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Session AMBR"
+            ))
         );
     }
 
@@ -1731,11 +1735,15 @@ mod tests {
     #[test]
     fn test_establishment_accept_invalid_ssc_mode_rejected() {
         // SSC mode 0 (reserved) in the high nibble of octet 5
-        let buf: &[u8] = &[0x01, 0x00, 0x01, 0xAA, 0x06, 0x06, 0x00, 0xC8, 0x06, 0x00, 0x32];
+        let buf: &[u8] = &[
+            0x01, 0x00, 0x01, 0xAA, 0x06, 0x06, 0x00, 0xC8, 0x06, 0x00, 0x32,
+        ];
         let result = PduSessionEstablishmentAccept::decode(&mut &buf[..], 1, 1);
         assert_eq!(
             result,
-            Err(PduSessionEstablishmentError::MissingMandatoryIe("Selected SSC mode"))
+            Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Selected SSC mode"
+            ))
         );
     }
 
@@ -1748,7 +1756,9 @@ mod tests {
         let result = PduSessionEstablishmentAccept::decode(&mut &buf[..], 1, 1);
         assert_eq!(
             result,
-            Err(PduSessionEstablishmentError::MissingMandatoryIe("Session AMBR"))
+            Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Session AMBR"
+            ))
         );
     }
 
@@ -1775,7 +1785,10 @@ mod tests {
         // The strict parser misreads the legacy layout (separate SSC octet
         // shifts the QoS rules LV-E length) and must fail.
         let result = PduSessionEstablishmentAccept::decode(&mut &bytes[4..], 5, 3);
-        assert!(result.is_err(), "strict parser must reject the legacy core shape");
+        assert!(
+            result.is_err(),
+            "strict parser must reject the legacy core shape"
+        );
     }
 
     #[test]
@@ -1842,7 +1855,9 @@ mod tests {
         let result = PduSessionEstablishmentReject::decode(&mut &buf[..], 1, 1);
         assert_eq!(
             result,
-            Err(PduSessionEstablishmentError::MissingMandatoryIe("5GSM cause"))
+            Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "5GSM cause"
+            ))
         );
     }
 

@@ -39,11 +39,11 @@ use nextgsim_nas::ies::ie1::{PayloadContainerType, RequestType};
 use nextgsim_nas::messages::mm::{DlNasTransport, UlNasTransport};
 use nextgsim_nas::messages::sm::{
     IeDnn, IeIntegrityProtectionMaxDataRate, IeSelectedPduSessionType, IeSelectedSscMode,
-    IeSessionAmbr, PduAddressType, PduSessionEstablishmentAccept,
-    PduSessionEstablishmentReject, PduSessionEstablishmentRequest, PduSessionModificationCommand,
-    PduSessionModificationComplete, PduSessionModificationReject, PduSessionModificationRequest,
-    PduSessionReleaseCommand, PduSessionReleaseComplete, PduSessionReleaseReject,
-    PduSessionReleaseRequest, PduSessionTypeValue, SmCause, SscModeValue,
+    IeSessionAmbr, PduAddressType, PduSessionEstablishmentAccept, PduSessionEstablishmentReject,
+    PduSessionEstablishmentRequest, PduSessionModificationCommand, PduSessionModificationComplete,
+    PduSessionModificationReject, PduSessionModificationRequest, PduSessionReleaseCommand,
+    PduSessionReleaseComplete, PduSessionReleaseReject, PduSessionReleaseRequest,
+    PduSessionTypeValue, SmCause, SscModeValue,
 };
 
 use crate::timer::{GprsTimer3, UeTimer, MAX_T3580_RETRIES, MAX_T3581_RETRIES, MAX_T3582_RETRIES};
@@ -348,9 +348,7 @@ impl SmOrchestrator {
         self.sessions.iter().flatten().any(|s| {
             matches!(
                 s.state,
-                PsState::ActivePending
-                    | PsState::ModificationPending
-                    | PsState::InactivePending
+                PsState::ActivePending | PsState::ModificationPending | PsState::InactivePending
             )
         })
     }
@@ -358,8 +356,7 @@ impl SmOrchestrator {
     /// Whether a back-off timer currently blocks the given [S-NSSAI, DNN]
     pub fn is_backed_off(&self, s_nssai: Option<&[u8]>, dnn: Option<&str>) -> bool {
         self.backoff.iter().any(|(key, entry)| {
-            let nssai_match = key.s_nssai.is_none()
-                || key.s_nssai.as_deref() == s_nssai;
+            let nssai_match = key.s_nssai.is_none() || key.s_nssai.as_deref() == s_nssai;
             let dnn_match = key.dnn.is_none() || key.dnn.as_deref() == dnn;
             let blocking = match &entry.timer {
                 Some(t) => t.is_running(),
@@ -414,8 +411,7 @@ impl SmOrchestrator {
     /// Start a PDU session establishment procedure (TS 24.501 6.4.1.2).
     pub fn start_establishment(&mut self, mut params: SmSessionParams) -> Vec<SmOutput> {
         // Back-off consultation (TS 24.501 6.4.1.4 / 6.2.8)
-        if self.is_backed_off(params.s_nssai.as_deref(), params.dnn.as_deref())
-            && !params.emergency
+        if self.is_backed_off(params.s_nssai.as_deref(), params.dnn.as_deref()) && !params.emergency
         {
             warn!(
                 "PDU session establishment for DNN {:?} blocked by back-off timer ({:?}s left)",
@@ -479,10 +475,18 @@ impl SmOrchestrator {
         self.sessions[psi as usize] = Some(session);
 
         if let Some(pt) = self.pt.get_mut(pti) {
-            pt.start(psi, PtMessageType::PduSessionEstablishmentRequest, SM_TIMER_T3580);
+            pt.start(
+                psi,
+                PtMessageType::PduSessionEstablishmentRequest,
+                SM_TIMER_T3580,
+            );
         }
-        self.pending
-            .insert(pti, PendingProcedure { ul_pdu: ul_pdu.clone() });
+        self.pending.insert(
+            pti,
+            PendingProcedure {
+                ul_pdu: ul_pdu.clone(),
+            },
+        );
 
         info!("Sending PDU Session Establishment Request: PSI={psi}, PTI={pti}, T3580 started");
         vec![SmOutput::SendNasPdu(ul_pdu)]
@@ -521,10 +525,18 @@ impl SmOrchestrator {
             s.state = PsState::ModificationPending;
         }
         if let Some(pt) = self.pt.get_mut(pti) {
-            pt.start(psi, PtMessageType::PduSessionModificationRequest, SM_TIMER_T3581);
+            pt.start(
+                psi,
+                PtMessageType::PduSessionModificationRequest,
+                SM_TIMER_T3581,
+            );
         }
-        self.pending
-            .insert(pti, PendingProcedure { ul_pdu: ul_pdu.clone() });
+        self.pending.insert(
+            pti,
+            PendingProcedure {
+                ul_pdu: ul_pdu.clone(),
+            },
+        );
 
         info!("Sending PDU Session Modification Request: PSI={psi}, PTI={pti}, T3581 started");
         vec![SmOutput::SendNasPdu(ul_pdu)]
@@ -536,8 +548,14 @@ impl SmOrchestrator {
             warn!("Release requested for unknown PSI {psi}");
             return Vec::new();
         };
-        if !matches!(session.state, PsState::Active | PsState::ModificationPending) {
-            warn!("Release requested for PSI {psi} in state {:?}", session.state);
+        if !matches!(
+            session.state,
+            PsState::Active | PsState::ModificationPending
+        ) {
+            warn!(
+                "Release requested for PSI {psi} in state {:?}",
+                session.state
+            );
             return Vec::new();
         }
         let Some(pti) = self.pt.allocate() else {
@@ -557,8 +575,12 @@ impl SmOrchestrator {
         if let Some(pt) = self.pt.get_mut(pti) {
             pt.start(psi, PtMessageType::PduSessionReleaseRequest, SM_TIMER_T3582);
         }
-        self.pending
-            .insert(pti, PendingProcedure { ul_pdu: ul_pdu.clone() });
+        self.pending.insert(
+            pti,
+            PendingProcedure {
+                ul_pdu: ul_pdu.clone(),
+            },
+        );
 
         info!("Sending PDU Session Release Request: PSI={psi}, PTI={pti}, T3582 started");
         vec![SmOutput::SendNasPdu(ul_pdu)]
@@ -596,20 +618,21 @@ impl SmOrchestrator {
         }
 
         // Back-off timers: drop entries whose timer has expired
-        self.backoff.retain(|key, entry| match entry.timer.as_mut() {
-            Some(timer) => {
-                if timer.perform_tick() {
-                    info!(
-                        "Back-off timer expired for S-NSSAI {:?} / DNN {:?}",
-                        key.s_nssai, key.dnn
-                    );
-                    false
-                } else {
-                    timer.is_running()
+        self.backoff
+            .retain(|key, entry| match entry.timer.as_mut() {
+                Some(timer) => {
+                    if timer.perform_tick() {
+                        info!(
+                            "Back-off timer expired for S-NSSAI {:?} / DNN {:?}",
+                            key.s_nssai, key.dnn
+                        );
+                        false
+                    } else {
+                        timer.is_running()
+                    }
                 }
-            }
-            None => true, // deactivated: keep blocking
-        });
+                None => true, // deactivated: keep blocking
+            });
 
         outs
     }
@@ -744,11 +767,7 @@ impl SmOrchestrator {
     }
 
     /// Dispatch a plain 5GSM message from the N1 SM container.
-    fn handle_n1_sm_container(
-        &mut self,
-        container: &[u8],
-        dl_psi: Option<u8>,
-    ) -> Vec<SmOutput> {
+    fn handle_n1_sm_container(&mut self, container: &[u8], dl_psi: Option<u8>) -> Vec<SmOutput> {
         if container.len() < 4 {
             warn!("N1 SM container too short: {} bytes", container.len());
             return Vec::new();
@@ -787,9 +806,7 @@ impl SmOrchestrator {
             NasSmMessageType::PduSessionReleaseCommand => {
                 self.handle_release_command(body, psi, pti)
             }
-            NasSmMessageType::PduSessionReleaseReject => {
-                self.handle_release_reject(body, psi, pti)
-            }
+            NasSmMessageType::PduSessionReleaseReject => self.handle_release_reject(body, psi, pti),
             NasSmMessageType::FiveGSmStatus => {
                 let cause = body.first().copied().unwrap_or(111);
                 warn!("5GSM Status received: cause #{cause} (PSI={psi}, PTI={pti})");
@@ -828,11 +845,9 @@ impl SmOrchestrator {
 
     /// PDU Session Establishment Accept (TS 24.501 6.4.1.3)
     fn handle_establishment_accept(&mut self, body: &[u8], psi: u8, pti: u8) -> Vec<SmOutput> {
-        if let Err(cause) = self.validate_response_pt(
-            pti,
-            psi,
-            PtMessageType::PduSessionEstablishmentRequest,
-        ) {
+        if let Err(cause) =
+            self.validate_response_pt(pti, psi, PtMessageType::PduSessionEstablishmentRequest)
+        {
             warn!("Establishment Accept with invalid PTI {pti} / PSI {psi}");
             return self.send_sm_status(psi, pti, cause);
         }
@@ -860,8 +875,7 @@ impl SmOrchestrator {
                         // 5GSM Status with cause #96; the procedure keeps
                         // running (T3580 will retransmit the request)
                         warn!("Establishment Accept failed strict decoding: {e:?}");
-                        return self
-                            .send_sm_status(psi, pti, SmCause::InvalidMandatoryInformation);
+                        return self.send_sm_status(psi, pti, SmCause::InvalidMandatoryInformation);
                     }
                 }
             }
@@ -871,11 +885,16 @@ impl SmOrchestrator {
         self.pt.abort(pti);
         self.pending.remove(&pti);
 
-        let ipv4 = acc.pdu_address.as_ref().and_then(|addr| {
-            match addr.address_type {
-                PduAddressType::Ipv4 if addr.address.len() >= 4 => {
-                    Some([addr.address[0], addr.address[1], addr.address[2], addr.address[3]])
-                }
+        let ipv4 = acc
+            .pdu_address
+            .as_ref()
+            .and_then(|addr| match addr.address_type {
+                PduAddressType::Ipv4 if addr.address.len() >= 4 => Some([
+                    addr.address[0],
+                    addr.address[1],
+                    addr.address[2],
+                    addr.address[3],
+                ]),
                 PduAddressType::Ipv4v6 if addr.address.len() >= 12 => Some([
                     addr.address[8],
                     addr.address[9],
@@ -883,8 +902,7 @@ impl SmOrchestrator {
                     addr.address[11],
                 ]),
                 _ => None,
-            }
-        });
+            });
 
         if let Some(s) = self.sessions[psi as usize].as_mut() {
             s.state = PsState::Active;
@@ -909,11 +927,9 @@ impl SmOrchestrator {
 
     /// PDU Session Establishment Reject (TS 24.501 6.4.1.4)
     fn handle_establishment_reject(&mut self, body: &[u8], psi: u8, pti: u8) -> Vec<SmOutput> {
-        if let Err(cause) = self.validate_response_pt(
-            pti,
-            psi,
-            PtMessageType::PduSessionEstablishmentRequest,
-        ) {
+        if let Err(cause) =
+            self.validate_response_pt(pti, psi, PtMessageType::PduSessionEstablishmentRequest)
+        {
             warn!("Establishment Reject with invalid PTI {pti} / PSI {psi}");
             return self.send_sm_status(psi, pti, cause);
         }
@@ -926,7 +942,10 @@ impl SmOrchestrator {
             }
         };
         let cause = rej.cause();
-        warn!("PDU Session Establishment Reject: cause {:?} (#{})", cause, cause as u8);
+        warn!(
+            "PDU Session Establishment Reject: cause {:?} (#{})",
+            cause, cause as u8
+        );
 
         // Stop T3580, release the PTI and the allocated PSI
         self.pt.abort(pti);
@@ -1010,23 +1029,25 @@ impl SmOrchestrator {
         let Some(byte) = timer_byte else {
             // No back-off timer IE: the UE may retry after an
             // implementation specific delay (no timer armed)
-            info!("Reject cause #{} without back-off timer IE: no back-off armed", cause as u8);
+            info!(
+                "Reject cause #{} without back-off timer IE: no back-off armed",
+                cause as u8
+            );
             return;
         };
         let timer3 = GprsTimer3::from_byte(byte);
         let secs = timer3.to_seconds();
         if secs == 0 {
             // Deactivated timer value: block until restart
-            warn!(
-                "Back-off timer deactivated for {key:?}: establishment blocked until restart"
-            );
+            warn!("Back-off timer deactivated for {key:?}: establishment blocked until restart");
             self.backoff.insert(key, BackoffEntry { timer: None });
             return;
         }
         let mut timer = UeTimer::new(SM_TIMER_BACKOFF, false, secs);
         timer.start(true);
         info!("Back-off timer started for {key:?}: {secs}s");
-        self.backoff.insert(key, BackoffEntry { timer: Some(timer) });
+        self.backoff
+            .insert(key, BackoffEntry { timer: Some(timer) });
     }
 
     /// PDU Session Modification Command (TS 24.501 6.3.2 network-initiated
@@ -1088,11 +1109,9 @@ impl SmOrchestrator {
 
     /// PDU Session Modification Reject (TS 24.501 6.4.2.4)
     fn handle_modification_reject(&mut self, body: &[u8], psi: u8, pti: u8) -> Vec<SmOutput> {
-        if let Err(cause) = self.validate_response_pt(
-            pti,
-            psi,
-            PtMessageType::PduSessionModificationRequest,
-        ) {
+        if let Err(cause) =
+            self.validate_response_pt(pti, psi, PtMessageType::PduSessionModificationRequest)
+        {
             warn!("Modification Reject with invalid PTI {pti} / PSI {psi}");
             return self.send_sm_status(psi, pti, cause);
         }
@@ -1104,7 +1123,10 @@ impl SmOrchestrator {
             }
         };
         let cause = SmCause::try_from(rej.cause() as u8).unwrap_or_default();
-        warn!("PDU Session Modification Reject: cause {:?} (#{})", cause, cause as u8);
+        warn!(
+            "PDU Session Modification Reject: cause {:?} (#{})",
+            cause, cause as u8
+        );
 
         self.pt.abort(pti);
         self.pending.remove(&pti);
@@ -1121,7 +1143,9 @@ impl SmOrchestrator {
             | SmCause::InsufficientResourcesForSliceAndDnn
             | SmCause::InsufficientResourcesForSlice
             | SmCause::MissingOrUnknownDnnInSlice => {
-                let params = self.sessions[psi as usize].as_ref().map(|s| s.params.clone());
+                let params = self.sessions[psi as usize]
+                    .as_ref()
+                    .map(|s| s.params.clone());
                 if let Some(p) = params {
                     self.arm_backoff(cause, &p, rej.back_off_timer_value);
                 }
@@ -1154,7 +1178,10 @@ impl SmOrchestrator {
             }
         };
         let cause = SmCause::try_from(cmd.cause() as u8).unwrap_or_default();
-        info!("PDU Session Release Command: PSI={psi}, cause {:?} (#{})", cause, cause as u8);
+        info!(
+            "PDU Session Release Command: PSI={psi}, cause {:?} (#{})",
+            cause, cause as u8
+        );
 
         // If this answers our UE-initiated release, stop T3582
         if pti != 0
@@ -1206,7 +1233,10 @@ impl SmOrchestrator {
             }
         };
         let cause = SmCause::try_from(rej.cause() as u8).unwrap_or_default();
-        warn!("PDU Session Release Reject: cause {:?} (#{})", cause, cause as u8);
+        warn!(
+            "PDU Session Release Reject: cause {:?} (#{})",
+            cause, cause as u8
+        );
 
         self.pt.abort(pti);
         self.pending.remove(&pti);
@@ -1250,7 +1280,10 @@ impl SmOrchestrator {
         let mut sm_pdu = Vec::new();
         PlainSmHeader::new(psi, pti, NasSmMessageType::FiveGSmStatus).encode(&mut sm_pdu);
         sm_pdu.push(cause as u8);
-        info!("Sending 5GSM Status: PSI={psi}, PTI={pti}, cause #{}", cause as u8);
+        info!(
+            "Sending 5GSM Status: PSI={psi}, PTI={pti}, cause #{}",
+            cause as u8
+        );
         vec![SmOutput::SendNasPdu(build_ul_transport(
             sm_pdu, psi, None, None, None,
         ))]
@@ -1375,7 +1408,10 @@ mod tests {
 
         // TS 24.501 5.4.5.2.2: container type 1, PSI, request type,
         // S-NSSAI and DNN IEs
-        assert_eq!(t.payload_container_type, PayloadContainerType::N1SmInformation);
+        assert_eq!(
+            t.payload_container_type,
+            PayloadContainerType::N1SmInformation
+        );
         assert_eq!(t.pdu_session_id, Some(1), "first PSI allocated must be 1");
         assert_eq!(t.request_type, Some(RequestType::InitialRequest));
         assert_eq!(t.s_nssai, Some(vec![0x01]));
@@ -1675,7 +1711,10 @@ mod tests {
 
         // Expiries 1-4: retransmission of the identical UL PDU
         for n in 1..MAX_T3580_RETRIES {
-            let outs = { force_expire(&mut orch, pti); orch.handle_procedure_timer_expiry(pti) };
+            let outs = {
+                force_expire(&mut orch, pti);
+                orch.handle_procedure_timer_expiry(pti)
+            };
             assert_eq!(
                 outs,
                 vec![SmOutput::SendNasPdu(original.clone())],
@@ -1685,7 +1724,10 @@ mod tests {
         }
 
         // Fifth expiry: abort, release PSI and PTI
-        let outs = { force_expire(&mut orch, pti); orch.handle_procedure_timer_expiry(pti) };
+        let outs = {
+            force_expire(&mut orch, pti);
+            orch.handle_procedure_timer_expiry(pti)
+        };
         assert_eq!(
             outs,
             vec![SmOutput::SessionEstablishmentFailed {
@@ -1728,10 +1770,16 @@ mod tests {
         let rel_pti = inner[2];
 
         for _ in 1..MAX_T3582_RETRIES {
-            let outs = { force_expire(&mut orch, rel_pti); orch.handle_procedure_timer_expiry(rel_pti) };
+            let outs = {
+                force_expire(&mut orch, rel_pti);
+                orch.handle_procedure_timer_expiry(rel_pti)
+            };
             assert!(matches!(outs[0], SmOutput::SendNasPdu(_)));
         }
-        let outs = { force_expire(&mut orch, rel_pti); orch.handle_procedure_timer_expiry(rel_pti) };
+        let outs = {
+            force_expire(&mut orch, rel_pti);
+            orch.handle_procedure_timer_expiry(rel_pti)
+        };
         // TS 24.501 6.4.3.6 c): release locally
         assert_eq!(outs, vec![SmOutput::SessionReleased { psi }]);
         assert!(orch.session(psi).is_none());
@@ -1745,12 +1793,21 @@ mod tests {
         let outs = orch.start_modification(psi);
         let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
         let mod_pti = inner[2];
-        assert_eq!(orch.session(psi).unwrap().state, PsState::ModificationPending);
+        assert_eq!(
+            orch.session(psi).unwrap().state,
+            PsState::ModificationPending
+        );
 
         for _ in 1..MAX_T3581_RETRIES {
-            { force_expire(&mut orch, mod_pti); orch.handle_procedure_timer_expiry(mod_pti) };
+            {
+                force_expire(&mut orch, mod_pti);
+                orch.handle_procedure_timer_expiry(mod_pti)
+            };
         }
-        let outs = { force_expire(&mut orch, mod_pti); orch.handle_procedure_timer_expiry(mod_pti) };
+        let outs = {
+            force_expire(&mut orch, mod_pti);
+            orch.handle_procedure_timer_expiry(mod_pti)
+        };
         assert_eq!(
             outs,
             vec![SmOutput::SessionModificationFailed {

@@ -481,7 +481,10 @@ mod tests {
         assert_eq!(decoded.rrc_transaction_id, 1);
         assert_eq!(decoded.containers.len(), 1);
         assert_eq!(decoded.containers[0].rat_type, RatType::Nr);
-        assert_eq!(decoded.containers[0].container, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            decoded.containers[0].container,
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
     }
 
     #[test]

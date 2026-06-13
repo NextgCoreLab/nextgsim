@@ -1303,10 +1303,7 @@ async fn process_mm_outputs(
                 }
             }
             MmOutput::RegistrationFailed(cause) => {
-                warn!(
-                    "Registration failed: {:?} (#{})",
-                    cause, cause as u8
-                );
+                warn!("Registration failed: {:?} (#{})", cause, cause as u8);
                 plmn_selector.set_registered_plmn(None);
                 notify_rel18_registration(task_base, false).await;
             }
@@ -1458,7 +1455,12 @@ async fn process_secondary_mm_outputs(
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         let sm_outs = sub.sm.establish_default_sessions(&params);
                         process_secondary_sm_outputs(
-                            index, sm_outs, mint_secondary, task_base, tun_tx, pdu_counter,
+                            index,
+                            sm_outs,
+                            mint_secondary,
+                            task_base,
+                            tun_tx,
+                            pdu_counter,
                         )
                         .await;
                     }
@@ -1484,7 +1486,12 @@ async fn process_secondary_mm_outputs(
                         if let Some(sub) = mint_secondary.get_mut(index) {
                             let sm_outs = sub.sm.handle_dl_nas_transport(&dl);
                             process_secondary_sm_outputs(
-                                index, sm_outs, mint_secondary, task_base, tun_tx, pdu_counter,
+                                index,
+                                sm_outs,
+                                mint_secondary,
+                                task_base,
+                                tun_tx,
+                                pdu_counter,
                             )
                             .await;
                         }
@@ -1508,8 +1515,7 @@ async fn process_secondary_downlink(
         Some(sub) => sub.mm.handle_downlink(pdu),
         None => return,
     };
-    process_secondary_mm_outputs(index, outs, mint_secondary, task_base, tun_tx, pdu_counter)
-        .await;
+    process_secondary_mm_outputs(index, outs, mint_secondary, task_base, tun_tx, pdu_counter).await;
 }
 
 /// Deliver a MINT secondary subscription's SM outputs: protect the UL NAS
@@ -1585,7 +1591,9 @@ async fn process_secondary_sm_outputs(
                         .await;
                 }
                 let _ = tun_tx
-                    .send(TunMessage::DestroyInterface { psi: i32::from(psi) })
+                    .send(TunMessage::DestroyInterface {
+                        psi: i32::from(psi),
+                    })
                     .await;
             }
             SmOutput::SessionModified { psi } => {
@@ -1698,8 +1706,7 @@ async fn handle_unmanaged_mm_message(
     use nextgsim_nas::enums::MmMessageType;
     use nextgsim_nas::ies::RegistrationType;
     use nextgsim_nas::messages::mm::{
-        DlNasTransport, Ie5gsMobileIdentity, IdentityRequest, IdentityResponse,
-        MobileIdentityType,
+        DlNasTransport, IdentityRequest, IdentityResponse, Ie5gsMobileIdentity, MobileIdentityType,
     };
     use nextgsim_ue::nas::mm::{MmOutput, MmSubState};
 
@@ -1811,8 +1818,7 @@ async fn handle_unmanaged_mm_message(
                 info!("ConfigurationUpdate: re-registration requested");
                 orch.state_mut()
                     .switch_mm_state(MmSubState::RegisteredUpdateNeeded);
-                let outs =
-                    orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+                let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
                 for out in outs {
                     if let MmOutput::SendNasPdu(nas_pdu) = out {
                         *pdu_counter += 1;

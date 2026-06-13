@@ -125,9 +125,7 @@ fn tunnel_to_asn(tunnel: GtpTunnelInfo) -> UPTransportLayerInformation {
     })
 }
 
-fn tunnel_from_asn(
-    info: &UPTransportLayerInformation,
-) -> Result<GtpTunnelInfo, PathSwitchError> {
+fn tunnel_from_asn(info: &UPTransportLayerInformation) -> Result<GtpTunnelInfo, PathSwitchError> {
     let tunnel = match info {
         UPTransportLayerInformation::GTPTunnel(t) => t,
         UPTransportLayerInformation::Choice_Extensions(_) => {
@@ -327,9 +325,10 @@ pub fn build_path_switch_request(
     for session in &params.sessions {
         items.push(PDUSessionResourceToBeSwitchedDLItem {
             pdu_session_id: PDUSessionID(session.pdu_session_id),
-            path_switch_request_transfer: PDUSessionResourceToBeSwitchedDLItemPathSwitchRequestTransfer(
-                encode_path_switch_request_transfer(session)?,
-            ),
+            path_switch_request_transfer:
+                PDUSessionResourceToBeSwitchedDLItemPathSwitchRequestTransfer(
+                    encode_path_switch_request_transfer(session)?,
+                ),
             ie_extensions: None,
         });
     }
@@ -351,9 +350,7 @@ pub fn build_path_switch_request(
 }
 
 /// Parse a Path Switch Request from an NGAP PDU
-pub fn parse_path_switch_request(
-    pdu: &NGAP_PDU,
-) -> Result<PathSwitchRequestData, PathSwitchError> {
+pub fn parse_path_switch_request(pdu: &NGAP_PDU) -> Result<PathSwitchRequestData, PathSwitchError> {
     let initiating = match pdu {
         NGAP_PDU::InitiatingMessage(msg) => msg,
         _ => {
@@ -415,8 +412,9 @@ pub fn parse_path_switch_request(
             .ok_or(PathSwitchError::MissingMandatoryIe("RAN-UE-NGAP-ID"))?,
         source_amf_ue_ngap_id: source_amf_ue_ngap_id
             .ok_or(PathSwitchError::MissingMandatoryIe("SourceAMF-UE-NGAP-ID"))?,
-        ue_security_capabilities: ue_security_capabilities
-            .ok_or(PathSwitchError::MissingMandatoryIe("UESecurityCapabilities"))?,
+        ue_security_capabilities: ue_security_capabilities.ok_or(
+            PathSwitchError::MissingMandatoryIe("UESecurityCapabilities"),
+        )?,
         sessions: sessions.ok_or(PathSwitchError::MissingMandatoryIe(
             "PDUSessionResourceToBeSwitchedDLList",
         ))?,
@@ -466,9 +464,7 @@ pub struct PathSwitchRequestAcknowledgeData {
     pub switched_sessions: Vec<SwitchedSessionItem>,
 }
 
-fn encode_path_switch_ack_transfer(
-    item: &SwitchedSessionItem,
-) -> Result<Vec<u8>, PathSwitchError> {
+fn encode_path_switch_ack_transfer(item: &SwitchedSessionItem) -> Result<Vec<u8>, PathSwitchError> {
     let transfer = PathSwitchRequestAcknowledgeTransfer {
         ul_ngu_up_tnl_information: item.ul_tunnel.map(tunnel_to_asn),
         security_indication: None,
@@ -729,9 +725,7 @@ pub fn encode_path_switch_request(
 }
 
 /// Decode and parse a Path Switch Request from bytes
-pub fn decode_path_switch_request(
-    bytes: &[u8],
-) -> Result<PathSwitchRequestData, PathSwitchError> {
+pub fn decode_path_switch_request(bytes: &[u8]) -> Result<PathSwitchRequestData, PathSwitchError> {
     let pdu = decode_ngap_pdu(bytes)?;
     parse_path_switch_request(&pdu)
 }

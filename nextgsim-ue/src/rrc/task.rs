@@ -424,7 +424,12 @@ impl RrcTask {
             // SNPN (Rel-17, TS 23.501 §5.30): the simulated cell broadcasts the
             // configured SNPN NID (the gNB SIB1 npn-IdentityInfoList in a real
             // deployment); None for a public cell.
-            nid: self.task_base.config.snpn_config.as_ref().map(|s| s.nid.clone()),
+            nid: self
+                .task_base
+                .config
+                .snpn_config
+                .as_ref()
+                .map(|s| s.nid.clone()),
         };
         self.cell_selector.update_sib1(cell_id, sib1);
 
@@ -884,7 +889,10 @@ impl RrcTask {
                     }
                 }
             } else {
-                debug!("UECapabilityEnquiry for unsupported RAT {:?} — skipping", rat);
+                debug!(
+                    "UECapabilityEnquiry for unsupported RAT {:?} — skipping",
+                    rat
+                );
             }
         }
 

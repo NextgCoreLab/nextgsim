@@ -630,7 +630,12 @@ pub fn decode_modify_response_transfer(
 
     let modified_qfis = transfer
         .qos_flow_add_or_modify_response_list
-        .map(|list| list.0.iter().map(|item| item.qos_flow_identifier.0).collect())
+        .map(|list| {
+            list.0
+                .iter()
+                .map(|item| item.qos_flow_identifier.0)
+                .collect()
+        })
         .unwrap_or_default();
 
     let failed_qos_flows = transfer
@@ -683,9 +688,7 @@ pub fn decode_modify_unsuccessful_transfer(
 // ============================================================================
 
 /// Decode a PDU Session Resource Release Command Transfer, returning the cause
-pub fn decode_release_command_transfer(
-    bytes: &[u8],
-) -> Result<NgSetupFailureCause, TransferError> {
+pub fn decode_release_command_transfer(bytes: &[u8]) -> Result<NgSetupFailureCause, TransferError> {
     let transfer: PDUSessionResourceReleaseCommandTransfer = decode_aper(bytes)?;
     Ok(parse_cause(&transfer.cause))
 }
@@ -695,7 +698,9 @@ pub fn decode_release_command_transfer(
 /// The Rel-15 type only carries optional iE-Extensions, so the strict encoding
 /// is a single preamble octet (`0x00`).
 pub fn encode_release_response_transfer() -> Result<Vec<u8>, TransferError> {
-    let transfer = PDUSessionResourceReleaseResponseTransfer { ie_extensions: None };
+    let transfer = PDUSessionResourceReleaseResponseTransfer {
+        ie_extensions: None,
+    };
     Ok(encode_aper(&transfer)?)
 }
 
@@ -842,11 +847,14 @@ mod tests {
                 PDUSessionType(PDUSessionType::IPV4),
             ),
         }];
-        let bytes = encode_aper(&PDUSessionResourceSetupRequestTransferProtocolIEs(entries)).unwrap();
+        let bytes =
+            encode_aper(&PDUSessionResourceSetupRequestTransferProtocolIEs(entries)).unwrap();
         let result = decode_setup_request_transfer(&bytes);
         assert!(matches!(
             result,
-            Err(TransferError::MissingMandatoryIe("UL-NGU-UP-TNLInformation"))
+            Err(TransferError::MissingMandatoryIe(
+                "UL-NGU-UP-TNLInformation"
+            ))
         ));
     }
 

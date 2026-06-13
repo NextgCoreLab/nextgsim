@@ -38,7 +38,9 @@ pub const PROTECTION_SCHEME_PROFILE_B: u8 = 2;
 #[derive(Debug, Error)]
 pub enum SuciBuildError {
     /// The configured protection scheme is not supported
-    #[error("unsupported SUCI protection scheme {0} (supported: 0=null, 1=Profile A, 2=Profile B)")]
+    #[error(
+        "unsupported SUCI protection scheme {0} (supported: 0=null, 1=Profile A, 2=Profile B)"
+    )]
     UnsupportedScheme(u8),
     /// ECIES schemes require a non-zero home network public key identifier
     #[error("home network public key id {key_id} is invalid for protection scheme {scheme} (must be 1-255)")]
@@ -184,11 +186,7 @@ fn encode_routing_indicator(ri: &str) -> Result<[u8; 2], SuciBuildError> {
     if ri.is_empty() || ri.len() > 4 || !ri.bytes().all(|b| b.is_ascii_digit()) {
         return Err(SuciBuildError::InvalidRoutingIndicator(ri.to_string()));
     }
-    let digit = |i: usize| -> u8 {
-        ri.as_bytes()
-            .get(i)
-            .map_or(0xF, |b| b - b'0')
-    };
+    let digit = |i: usize| -> u8 { ri.as_bytes().get(i).map_or(0xF, |b| b - b'0') };
     Ok([(digit(1) << 4) | digit(0), (digit(3) << 4) | digit(2)])
 }
 

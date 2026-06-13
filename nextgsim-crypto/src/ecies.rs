@@ -605,7 +605,10 @@ mod tests {
 
         // Sanity: the home network public key derives from the private key
         let hn_keypair = EciesProfileBKeyPair::from_secret_bytes(&hn_priv).expect("hn key");
-        assert_eq!(&hn_keypair.public_key_compressed()[..], &hn_pub_compressed[..]);
+        assert_eq!(
+            &hn_keypair.public_key_compressed()[..],
+            &hn_pub_compressed[..]
+        );
 
         // UE-side encryption with the fixed ephemeral key
         let hn_pub = parse_p256_public_key(&hn_pub_compressed).expect("parse hn pub");
