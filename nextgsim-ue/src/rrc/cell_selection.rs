@@ -113,6 +113,10 @@ pub struct Sib1Info {
     pub q_rx_lev_min: i8, // Minimum required RX level
     pub q_rx_lev_min_offset: Option<u8>,
     pub q_qual_min: Option<i8>, // Minimum quality level
+    /// Broadcast SNPN NID (Rel-17, TS 23.501 §5.30). When the cell is an SNPN
+    /// cell, SIB1 advertises the Network Identifier (`npn-IdentityInfoList`).
+    /// `None` for a public (PLMN) cell.
+    pub nid: Option<String>,
 }
 
 /// Description of a detected cell
@@ -260,6 +264,10 @@ pub struct CellSelector {
     current_cell: ActiveCellInfo,
     /// Selected PLMN (from NAS)
     selected_plmn: Option<Plmn>,
+    /// Required SNPN NID (Rel-17, TS 23.501 §5.30). When set (SNPN mode), only
+    /// a cell whose broadcast NID matches is treated as suitable; cells with a
+    /// different or absent NID are rejected.
+    required_nid: Option<String>,
     /// Forbidden TAIs for roaming
     forbidden_tai_roaming: Vec<Tai>,
     /// Forbidden TAIs for regional provision of service
@@ -278,6 +286,7 @@ impl CellSelector {
             cells: HashMap::new(),
             current_cell: ActiveCellInfo::default(),
             selected_plmn: None,
+            required_nid: None,
             forbidden_tai_roaming: Vec::new(),
             forbidden_tai_rps: Vec::new(),
             started_time: Instant::now(),
@@ -304,6 +313,18 @@ impl CellSelector {
     /// Get the selected PLMN
     pub fn selected_plmn(&self) -> Option<Plmn> {
         self.selected_plmn
+    }
+
+    /// Set the required SNPN NID for NID-qualified cell selection (Rel-17,
+    /// TS 23.501 §5.30). When `Some`, only cells broadcasting the matching NID
+    /// are selectable; clears SNPN gating when `None`.
+    pub fn set_required_nid(&mut self, nid: Option<String>) {
+        self.required_nid = nid;
+    }
+
+    /// Get the required SNPN NID, if SNPN-qualified selection is active.
+    pub fn required_nid(&self) -> Option<&str> {
+        self.required_nid.as_deref()
     }
 
     /// Add a TAI to the forbidden roaming list
@@ -610,6 +631,21 @@ impl CellSelector {
                 continue;
             }
 
+            // SNPN NID-qualified selection (Rel-17, TS 23.501 §5.30): in SNPN
+            // mode only a cell broadcasting the configured NID is suitable.
+            if let Some(ref required_nid) = self.required_nid {
+                if cell.sib1.nid.as_deref() != Some(required_nid.as_str()) {
+                    report.out_of_plmn_cells += 1;
+                    tracing::debug!(
+                        "Cell {} rejected: SNPN NID mismatch (required={}, broadcast={:?})",
+                        cell_id,
+                        required_nid,
+                        cell.sib1.nid
+                    );
+                    continue;
+                }
+            }
+
             // Check barred
             if cell.mib.is_barred {
                 report.barred_cells += 1;
@@ -644,7 +680,7 @@ impl CellSelector {
         }
 
         // Sort by signal strength (highest first)
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
         let selected_id = candidates[0].0;
         let selected_cell = &self.cells[&selected_id];
@@ -707,10 +743,10 @@ impl CellSelector {
         }
 
         // Sort by signal strength first
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
         // Then prioritize cells matching selected PLMN (stable sort)
-        candidates.sort_by(|a, b| b.2.cmp(&a.2));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
 
         let selected_id = candidates[0].0;
         let selected_cell = &self.cells[&selected_id];
@@ -742,6 +778,290 @@ pub enum CellChangeEvent {
     SignalUpdated(i32, i32),
 }
 
+// ============================================================================
+// PLMN Selection (3GPP TS 23.122 Section 4.4)
+// ============================================================================
+
+/// Default higher-priority PLMN periodic search interval in seconds
+/// (TS 23.122 Section 4.4.3.3: timer T, default 60 minutes when the SIM
+/// does not configure a value; allowed range 6 minutes to 8 hours)
+pub const DEFAULT_HP_PLMN_SEARCH_INTERVAL_SECS: u32 = 60 * 60;
+
+/// PLMN selection mode (TS 23.122 Section 3.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlmnSelectionMode {
+    /// Automatic network selection mode
+    #[default]
+    Automatic,
+    /// Manual network selection mode
+    Manual,
+}
+
+/// Decode a 3-octet BCD PLMN (TS 24.501 Section 9.11.3.4 layout, as kept
+/// in the MM orchestrator's forbidden-PLMN list) into a [`Plmn`].
+pub fn plmn_from_bcd(bcd: &[u8; 3]) -> Plmn {
+    let mcc1 = u16::from(bcd[0] & 0x0F);
+    let mcc2 = u16::from(bcd[0] >> 4);
+    let mcc3 = u16::from(bcd[1] & 0x0F);
+    let mnc3 = bcd[1] >> 4;
+    let mnc1 = u16::from(bcd[2] & 0x0F);
+    let mnc2 = u16::from(bcd[2] >> 4);
+    let mcc = mcc1 * 100 + mcc2 * 10 + mcc3;
+    if mnc3 == 0x0F {
+        Plmn::new(mcc, mnc1 * 10 + mnc2, false)
+    } else {
+        Plmn::new(mcc, mnc1 * 100 + mnc2 * 10 + u16::from(mnc3), true)
+    }
+}
+
+/// PLMN selector implementing the TS 23.122 Section 4.4.3 network
+/// selection procedures.
+///
+/// In automatic mode candidates are evaluated in the priority order of
+/// Section 4.4.3.1.1:
+///
+/// 1. the registered PLMN (RPLMN) or a PLMN equivalent to it,
+/// 2. HPLMN or the highest-priority EHPLMN (when an EHPLMN list exists),
+/// 3. user-controlled preferred PLMNs (in priority order),
+/// 4. operator-controlled preferred PLMNs (in priority order),
+/// 5. any other available PLMN.
+///
+/// PLMNs in the "forbidden PLMNs" list are excluded in automatic mode;
+/// in manual mode the user-chosen PLMN may be attempted even when
+/// forbidden (Section 4.4.3.1.2).
+///
+/// The selector also runs the higher-priority PLMN periodic search timer
+/// of Section 4.4.3.3: while roaming on a lower-priority PLMN, `tick()`
+/// returns `true` whenever a background scan for higher-priority PLMNs
+/// is due.
+#[derive(Debug)]
+pub struct PlmnSelector {
+    mode: PlmnSelectionMode,
+    hplmn: Plmn,
+    /// Equivalent HPLMN list (when present, replaces the HPLMN for
+    /// selection priority, TS 23.122 Section 1.2)
+    ehplmn: Vec<Plmn>,
+    /// Registered PLMN, if any
+    registered_plmn: Option<Plmn>,
+    /// Equivalent PLMN list signalled by the network for the RPLMN
+    equivalent_plmns: Vec<Plmn>,
+    /// User-controlled PLMN selector list (priority order)
+    user_preferred: Vec<Plmn>,
+    /// Operator-controlled PLMN selector list (priority order)
+    operator_preferred: Vec<Plmn>,
+    /// Forbidden PLMN list (TS 23.122 Section 3.1)
+    forbidden: Vec<Plmn>,
+    /// Manually chosen PLMN (manual mode)
+    manual_selection: Option<Plmn>,
+    /// Higher-priority PLMN search interval (timer T) in seconds
+    hp_search_interval_secs: u32,
+    /// Seconds elapsed since the last higher-priority search
+    hp_search_elapsed_secs: u32,
+}
+
+impl PlmnSelector {
+    /// Create a selector for the given home PLMN with the default
+    /// higher-priority search interval.
+    pub fn new(hplmn: Plmn) -> Self {
+        Self {
+            mode: PlmnSelectionMode::Automatic,
+            hplmn,
+            ehplmn: Vec::new(),
+            registered_plmn: None,
+            equivalent_plmns: Vec::new(),
+            user_preferred: Vec::new(),
+            operator_preferred: Vec::new(),
+            forbidden: Vec::new(),
+            manual_selection: None,
+            hp_search_interval_secs: DEFAULT_HP_PLMN_SEARCH_INTERVAL_SECS,
+            hp_search_elapsed_secs: 0,
+        }
+    }
+
+    /// Current selection mode
+    pub fn mode(&self) -> PlmnSelectionMode {
+        self.mode
+    }
+
+    /// Switch to automatic network selection mode
+    pub fn set_automatic(&mut self) {
+        self.mode = PlmnSelectionMode::Automatic;
+        self.manual_selection = None;
+    }
+
+    /// Manual mode hook: select the given PLMN manually
+    /// (TS 23.122 Section 4.4.3.1.2)
+    pub fn select_manual(&mut self, plmn: Plmn) {
+        self.mode = PlmnSelectionMode::Manual;
+        self.manual_selection = Some(plmn);
+    }
+
+    /// Set the EHPLMN list (priority order)
+    pub fn set_ehplmn_list(&mut self, ehplmn: Vec<Plmn>) {
+        self.ehplmn = ehplmn;
+    }
+
+    /// Set the user-controlled preferred PLMN list (priority order)
+    pub fn set_user_preferred(&mut self, plmns: Vec<Plmn>) {
+        self.user_preferred = plmns;
+    }
+
+    /// Set the operator-controlled preferred PLMN list (priority order)
+    pub fn set_operator_preferred(&mut self, plmns: Vec<Plmn>) {
+        self.operator_preferred = plmns;
+    }
+
+    /// Record a successful registration on the given PLMN
+    pub fn set_registered_plmn(&mut self, plmn: Option<Plmn>) {
+        self.registered_plmn = plmn;
+        if plmn.is_none() || self.is_home_plmn(plmn.unwrap_or_default()) {
+            self.hp_search_elapsed_secs = 0;
+        }
+    }
+
+    /// Registered PLMN, if any
+    pub fn registered_plmn(&self) -> Option<Plmn> {
+        self.registered_plmn
+    }
+
+    /// Set the equivalent-PLMN list received from the network
+    pub fn set_equivalent_plmns(&mut self, plmns: Vec<Plmn>) {
+        self.equivalent_plmns = plmns;
+    }
+
+    /// Replace the forbidden PLMN list (e.g. with the MM orchestrator's
+    /// BCD-encoded list converted via [`plmn_from_bcd`])
+    pub fn set_forbidden(&mut self, plmns: Vec<Plmn>) {
+        self.forbidden = plmns;
+    }
+
+    /// Add a PLMN to the forbidden list
+    pub fn add_forbidden(&mut self, plmn: Plmn) {
+        if !self.forbidden.contains(&plmn) {
+            self.forbidden.push(plmn);
+        }
+    }
+
+    /// Remove a PLMN from the forbidden list (e.g. after a successful
+    /// manual registration, TS 23.122 Section 3.1)
+    pub fn remove_forbidden(&mut self, plmn: Plmn) {
+        self.forbidden.retain(|p| *p != plmn);
+    }
+
+    /// Whether the given PLMN is in the forbidden list
+    pub fn is_forbidden(&self, plmn: Plmn) -> bool {
+        self.forbidden.contains(&plmn)
+    }
+
+    /// Whether the given PLMN is the HPLMN or an EHPLMN
+    pub fn is_home_plmn(&self, plmn: Plmn) -> bool {
+        if self.ehplmn.is_empty() {
+            plmn == self.hplmn
+        } else {
+            self.ehplmn.contains(&plmn)
+        }
+    }
+
+    /// Run PLMN selection over the available PLMNs and return the chosen
+    /// PLMN, if any (TS 23.122 Section 4.4.3.1).
+    pub fn select(&self, available: &[Plmn]) -> Option<Plmn> {
+        match self.mode {
+            PlmnSelectionMode::Manual => {
+                // Manual mode: only the user-chosen PLMN is attempted; the
+                // forbidden list does not prevent the attempt
+                // (TS 23.122 Section 4.4.3.1.2)
+                let manual = self.manual_selection?;
+                available.iter().copied().find(|p| *p == manual)
+            }
+            PlmnSelectionMode::Automatic => self.select_automatic(available),
+        }
+    }
+
+    fn select_automatic(&self, available: &[Plmn]) -> Option<Plmn> {
+        let allowed: Vec<Plmn> = available
+            .iter()
+            .copied()
+            .filter(|p| !self.is_forbidden(*p))
+            .collect();
+
+        // 1) RPLMN or an equivalent PLMN
+        if let Some(rplmn) = self.registered_plmn {
+            if allowed.contains(&rplmn) {
+                return Some(rplmn);
+            }
+            if let Some(eq) = self
+                .equivalent_plmns
+                .iter()
+                .copied()
+                .find(|p| allowed.contains(p))
+            {
+                return Some(eq);
+            }
+        }
+
+        // 2) HPLMN / highest-priority EHPLMN
+        if self.ehplmn.is_empty() {
+            if allowed.contains(&self.hplmn) {
+                return Some(self.hplmn);
+            }
+        } else if let Some(e) = self.ehplmn.iter().copied().find(|p| allowed.contains(p)) {
+            return Some(e);
+        }
+
+        // 3) User-controlled preferred list (priority order)
+        if let Some(p) = self
+            .user_preferred
+            .iter()
+            .copied()
+            .find(|p| allowed.contains(p))
+        {
+            return Some(p);
+        }
+
+        // 4) Operator-controlled preferred list (priority order)
+        if let Some(p) = self
+            .operator_preferred
+            .iter()
+            .copied()
+            .find(|p| allowed.contains(p))
+        {
+            return Some(p);
+        }
+
+        // 5) Any other allowed PLMN
+        allowed.first().copied()
+    }
+
+    /// Drive the higher-priority PLMN periodic search timer; call roughly
+    /// once a second. Returns `true` when a periodic higher-priority
+    /// search is due (TS 23.122 Section 4.4.3.3): only while registered
+    /// on a PLMN that is neither the HPLMN/EHPLMN nor a higher-priority
+    /// preferred PLMN, and only in automatic mode.
+    pub fn tick(&mut self) -> bool {
+        let Some(rplmn) = self.registered_plmn else {
+            self.hp_search_elapsed_secs = 0;
+            return false;
+        };
+        if self.mode != PlmnSelectionMode::Automatic || self.is_home_plmn(rplmn) {
+            self.hp_search_elapsed_secs = 0;
+            return false;
+        }
+        self.hp_search_elapsed_secs += 1;
+        if self.hp_search_elapsed_secs >= self.hp_search_interval_secs {
+            self.hp_search_elapsed_secs = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Override the higher-priority search interval (timer T). Values are
+    /// clamped to the TS 23.122 Section 4.4.3.3 range (6 minutes to
+    /// 8 hours).
+    pub fn set_hp_search_interval(&mut self, secs: u32) {
+        self.hp_search_interval_secs = secs.clamp(6 * 60, 8 * 60 * 60);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +1090,7 @@ mod tests {
                 q_rx_lev_min: -70,
                 q_rx_lev_min_offset: None,
                 q_qual_min: None,
+                nid: None,
             },
         }
     }
@@ -792,6 +1113,48 @@ mod tests {
         let cell = result.unwrap();
         assert_eq!(cell.cell_id, 1);
         assert_eq!(cell.category, CellCategory::SuitableCell);
+    }
+
+    #[test]
+    fn test_cell_selection_snpn_nid_match_suitable() {
+        // SNPN (Rel-17, TS 23.501 §5.30): with a required NID, a cell whose
+        // broadcast NID matches is suitable.
+        let mut selector = CellSelector::new();
+        let plmn = Plmn::new(999, 70, false);
+        selector.set_selected_plmn(Some(plmn));
+        selector.set_required_nid(Some("7AB01234567".to_string()));
+
+        let mut cell = make_cell_with_sib1(-80, plmn, 1, false, false);
+        cell.sib1.nid = Some("7AB01234567".to_string());
+        selector.cells.insert(1, cell);
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+
+        let result = selector.perform_cell_selection();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().category, CellCategory::SuitableCell);
+    }
+
+    #[test]
+    fn test_cell_selection_snpn_nid_mismatch_rejected() {
+        // SNPN (Rel-17, TS 23.501 §5.30): a cell broadcasting a different NID
+        // is not suitable and must be rejected (falls back to acceptable-cell
+        // search, which on the same PLMN yields an acceptable, not suitable,
+        // selection).
+        let mut selector = CellSelector::new();
+        let plmn = Plmn::new(999, 70, false);
+        selector.set_selected_plmn(Some(plmn));
+        selector.set_required_nid(Some("7AB01234567".to_string()));
+
+        let mut cell = make_cell_with_sib1(-80, plmn, 1, false, false);
+        cell.sib1.nid = Some("FFFFFFFFFFF".to_string());
+        selector.cells.insert(1, cell);
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+
+        let result = selector.perform_cell_selection();
+        // Not selected as a suitable (NID-matching) cell.
+        if let Some(info) = result {
+            assert_ne!(info.category, CellCategory::SuitableCell);
+        }
     }
 
     #[test]
@@ -867,6 +1230,134 @@ mod tests {
         let event = selector.handle_signal_change(1, -125);
         assert!(matches!(event, CellChangeEvent::CellLost(1)));
         assert!(!selector.has_signal_to_cell(1));
+    }
+
+    // ========================================================================
+    // PLMN selection tests (TS 23.122 Section 4.4.3)
+    // ========================================================================
+
+    const HOME: Plmn = Plmn {
+        mcc: 999,
+        mnc: 70,
+        long_mnc: false,
+    };
+    const VISITED: Plmn = Plmn {
+        mcc: 999,
+        mnc: 71,
+        long_mnc: false,
+    };
+    const OTHER: Plmn = Plmn {
+        mcc: 310,
+        mnc: 410,
+        long_mnc: true,
+    };
+
+    #[test]
+    fn test_plmn_selection_prefers_hplmn() {
+        let selector = PlmnSelector::new(HOME);
+        assert_eq!(selector.select(&[VISITED, HOME, OTHER]), Some(HOME));
+    }
+
+    #[test]
+    fn test_plmn_selection_ehplmn_replaces_hplmn() {
+        let mut selector = PlmnSelector::new(HOME);
+        // EHPLMN list present: HPLMN itself is no longer used directly
+        selector.set_ehplmn_list(vec![OTHER, VISITED]);
+        assert_eq!(selector.select(&[VISITED, HOME, OTHER]), Some(OTHER));
+        // Highest-priority available EHPLMN wins
+        assert_eq!(selector.select(&[VISITED, HOME]), Some(VISITED));
+    }
+
+    #[test]
+    fn test_plmn_selection_registered_plmn_first() {
+        let mut selector = PlmnSelector::new(HOME);
+        selector.set_registered_plmn(Some(VISITED));
+        // RPLMN outranks even the HPLMN per Section 4.4.3.1.1 step 0
+        assert_eq!(selector.select(&[HOME, VISITED]), Some(VISITED));
+    }
+
+    #[test]
+    fn test_plmn_selection_equivalent_plmn_of_rplmn() {
+        let mut selector = PlmnSelector::new(HOME);
+        selector.set_registered_plmn(Some(VISITED));
+        selector.set_equivalent_plmns(vec![OTHER]);
+        // RPLMN not available, but its equivalent is
+        assert_eq!(selector.select(&[HOME, OTHER]), Some(OTHER));
+    }
+
+    #[test]
+    fn test_plmn_selection_consults_forbidden_list() {
+        let mut selector = PlmnSelector::new(HOME);
+        selector.add_forbidden(HOME);
+        assert!(selector.is_forbidden(HOME));
+        assert_eq!(selector.select(&[HOME, VISITED]), Some(VISITED));
+        // Everything forbidden: no selection
+        selector.add_forbidden(VISITED);
+        assert_eq!(selector.select(&[HOME, VISITED]), None);
+        // Removing restores selectability
+        selector.remove_forbidden(HOME);
+        assert_eq!(selector.select(&[HOME, VISITED]), Some(HOME));
+    }
+
+    #[test]
+    fn test_plmn_selection_preferred_lists_in_order() {
+        let mut selector = PlmnSelector::new(HOME);
+        selector.set_user_preferred(vec![OTHER]);
+        selector.set_operator_preferred(vec![VISITED]);
+        // HPLMN absent: user-preferred outranks operator-preferred
+        assert_eq!(selector.select(&[VISITED, OTHER]), Some(OTHER));
+        // Only the operator-preferred is available
+        assert_eq!(selector.select(&[VISITED]), Some(VISITED));
+    }
+
+    #[test]
+    fn test_plmn_selection_manual_mode_overrides_forbidden() {
+        let mut selector = PlmnSelector::new(HOME);
+        selector.add_forbidden(VISITED);
+        selector.select_manual(VISITED);
+        assert_eq!(selector.mode(), PlmnSelectionMode::Manual);
+        // Manual selection may attempt a forbidden PLMN
+        assert_eq!(selector.select(&[HOME, VISITED]), Some(VISITED));
+        // Manual PLMN not available: nothing is selected (no fallback)
+        assert_eq!(selector.select(&[HOME]), None);
+        // Back to automatic
+        selector.set_automatic();
+        assert_eq!(selector.select(&[HOME, VISITED]), Some(HOME));
+    }
+
+    #[test]
+    fn test_plmn_higher_priority_periodic_search_timer() {
+        let mut selector = PlmnSelector::new(HOME);
+        selector.set_hp_search_interval(10 * 60);
+        assert_eq!(selector.hp_search_interval_secs, 10 * 60);
+        // Interval clamped to the 6-minute lower bound
+        selector.set_hp_search_interval(1);
+        assert_eq!(selector.hp_search_interval_secs, 6 * 60);
+
+        // Not registered: no periodic search
+        assert!(!selector.tick());
+
+        // Registered on the HPLMN: no periodic search
+        selector.set_registered_plmn(Some(HOME));
+        assert!(!selector.tick());
+
+        // Roaming on a visited PLMN: the search fires after the interval
+        selector.set_registered_plmn(Some(VISITED));
+        for _ in 0..(6 * 60 - 1) {
+            assert!(!selector.tick());
+        }
+        assert!(selector.tick(), "search must be due after the interval");
+        // ... and the timer restarts
+        assert!(!selector.tick());
+    }
+
+    #[test]
+    fn test_plmn_from_bcd_roundtrip() {
+        // 999/70 (2-digit MNC): MCC digits 9,9,9; MNC digits 7,0
+        // byte0 = 0x99, byte1 = 0xF9, byte2 = 0x07
+        assert_eq!(plmn_from_bcd(&[0x99, 0xF9, 0x07]), HOME);
+        // 310/410 (3-digit MNC): byte0 = 0x13, byte1 = 0x00, byte2 = 0x14
+        assert_eq!(plmn_from_bcd(&[0x13, 0x00, 0x14]), OTHER);
     }
 
     #[test]

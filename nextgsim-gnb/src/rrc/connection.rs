@@ -481,6 +481,7 @@ impl RrcConnectionManager {
     fn build_rrc_release(&self, transaction_id: u8) -> OctetString {
         let params = RrcReleaseParams {
             rrc_transaction_id: transaction_id,
+            cell_reselection_priorities: None,
             redirected_carrier_info: None,
             suspend_config: None,
             deprioritisation_req: None,

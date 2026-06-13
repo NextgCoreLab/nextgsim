@@ -862,6 +862,48 @@ pub struct MintConfig {
     /// Allow simultaneous registration on multiple PLMNs
     #[serde(default)]
     pub simultaneous_registration: bool,
+    /// DNN → subscription-index routing. A PDU session whose DNN matches an
+    /// entry's `dnn` is established on the named subscription's SUPI (e.g. an
+    /// "enterprise" DNN on secondary SUPI index 1). DNNs absent from this map
+    /// default to the primary subscription (index 0). (TS 23.761 §4.2: the UE
+    /// selects which subscription serves a given service/DNN.)
+    #[serde(default)]
+    pub dnn_subscription_map: Vec<DnnSubscription>,
+    /// Disaster-roaming indication (TS 23.761 §4.2 / TS 24.501): when true the
+    /// UE sets the disaster-roaming registration indication in its secondary
+    /// SUPI Registration Request so the AMF can apply MINT handling.
+    #[serde(default)]
+    pub disaster_roaming: bool,
+}
+
+/// Maps a DNN to the MINT subscription index that should serve it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DnnSubscription {
+    /// Data Network Name (e.g. "enterprise")
+    pub dnn: String,
+    /// Subscription index (0 = primary SUPI, 1 = first secondary SUPI, ...)
+    pub subscription_index: u8,
+}
+
+impl MintConfig {
+    /// Resolve which subscription index serves the given DNN. DNNs not present
+    /// in `dnn_subscription_map` default to the primary subscription (0).
+    pub fn subscription_for_dnn(&self, dnn: Option<&str>) -> u8 {
+        let Some(dnn) = dnn else { return 0 };
+        self.dnn_subscription_map
+            .iter()
+            .find(|m| m.dnn.eq_ignore_ascii_case(dnn))
+            .map_or(0, |m| m.subscription_index)
+    }
+
+    /// The SUPI string for a subscription index (0 = primary). Index 1 maps to
+    /// `secondary_supis[0]`, etc. Returns `None` for an out-of-range index.
+    pub fn supi_for_index(&self, primary: &str, index: u8) -> Option<String> {
+        if index == 0 {
+            return Some(primary.to_string());
+        }
+        self.secondary_supis.get((index - 1) as usize).cloned()
+    }
 }
 
 // ============================================================================
@@ -918,6 +960,31 @@ pub struct SessionConfig {
     pub apn: Option<String>,
     /// Whether this is an emergency session
     pub is_emergency: bool,
+    /// Requested 5QI for this session (optional, TS 23.501 §5.7).
+    ///
+    /// When set to an XR delay-critical GBR value (82-85, Rel-18) the UE
+    /// requests an XR PDU session: if no XR APN/DNN is explicitly configured,
+    /// a default XR DNN is selected so the SMF maps the session to the XR 5QI
+    /// and installs the XR QoS flow end to end.
+    #[serde(default)]
+    pub requested_5qi: Option<u8>,
+}
+
+impl SessionConfig {
+    /// Whether this session requests an XR delay-critical GBR 5QI (82-85).
+    pub fn is_xr(&self) -> bool {
+        matches!(self.requested_5qi, Some(q) if (82..=85).contains(&q))
+    }
+
+    /// DNN the SMF uses to derive the XR 5QI when no explicit APN is set.
+    /// Mirrors the SMF-side `xr_5qi_for_dnn` mapping.
+    pub fn xr_dnn_for_5qi(five_qi: u8) -> &'static str {
+        match five_qi {
+            84 => "xr-split",
+            85 => "xr-haptic",
+            _ => "xr",
+        }
+    }
 }
 
 impl Default for SessionConfig {
@@ -927,6 +994,7 @@ impl Default for SessionConfig {
             s_nssai: None,
             apn: None,
             is_emergency: false,
+            requested_5qi: None,
         }
     }
 }
@@ -1683,5 +1751,40 @@ configured_nssai:
         assert!(config.pqc_config.enabled);
         assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber1024);
         assert_eq!(config.pqc_config.sign_algorithm, SignAlgorithm::Dilithium5);
+    }
+
+    #[test]
+    fn test_mint_dnn_subscription_routing() {
+        // MINT (Rel-18, TS 23.761): a DNN in the map routes to its subscription
+        // index; unmapped DNNs and None default to the primary subscription.
+        let mint = MintConfig {
+            enabled: true,
+            secondary_supis: vec!["999700000000002".to_string()],
+            active_subscription: 0,
+            simultaneous_registration: true,
+            dnn_subscription_map: vec![DnnSubscription {
+                dnn: "enterprise".to_string(),
+                subscription_index: 1,
+            }],
+            disaster_roaming: true,
+        };
+
+        assert_eq!(mint.subscription_for_dnn(Some("enterprise")), 1);
+        // Case-insensitive match
+        assert_eq!(mint.subscription_for_dnn(Some("ENTERPRISE")), 1);
+        // Unmapped / absent DNN → primary
+        assert_eq!(mint.subscription_for_dnn(Some("internet")), 0);
+        assert_eq!(mint.subscription_for_dnn(None), 0);
+
+        // supi_for_index: 0 = primary, 1 = first secondary, out-of-range = None
+        assert_eq!(
+            mint.supi_for_index("999700000000001", 0).as_deref(),
+            Some("999700000000001")
+        );
+        assert_eq!(
+            mint.supi_for_index("999700000000001", 1).as_deref(),
+            Some("999700000000002")
+        );
+        assert_eq!(mint.supi_for_index("999700000000001", 2), None);
     }
 }

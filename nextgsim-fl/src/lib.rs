@@ -209,6 +209,17 @@ impl PrivacyBudgetTracker {
     pub fn remaining_epsilon(&self) -> f32 {
         (self.target_epsilon - self.spent_epsilon).max(0.0)
     }
+
+    /// Returns `true` if running one more round would push the cumulative
+    /// epsilon past the target budget.
+    ///
+    /// Used to *enforce* the budget before a round starts (rather than only
+    /// detecting exhaustion after the fact): if the next round cannot fit
+    /// within the remaining budget, it must not run, or the differential-privacy
+    /// guarantee is violated.
+    pub fn would_exceed_after_next_round(&self) -> bool {
+        self.spent_epsilon + self.epsilon_per_round > self.target_epsilon
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +661,26 @@ impl FederatedAggregator {
     pub fn start_round(&mut self) -> Result<u64, String> {
         if self.current_round.is_some() {
             return Err("Round already in progress".to_string());
+        }
+
+        // Enforce the differential-privacy budget: refuse to start a round
+        // whose privacy cost would push cumulative epsilon past the target.
+        // The tracker was previously only updated after aggregation and never
+        // checked, so rounds could run indefinitely past the budget, silently
+        // breaking the DP guarantee.
+        if self.dp_config.enabled {
+            if let Some(ref tracker) = self.privacy_tracker {
+                if tracker.would_exceed_after_next_round() {
+                    return Err(format!(
+                        "Privacy budget exhausted: spent {:.4} of {:.4} epsilon over {} rounds \
+                         ({:.4} per round); refusing to start a round that would exceed the budget",
+                        tracker.spent_epsilon,
+                        tracker.target_epsilon,
+                        tracker.rounds_tracked,
+                        tracker.epsilon_per_round,
+                    ));
+                }
+            }
         }
 
         let active_participants: Vec<String> = self
@@ -2327,6 +2358,56 @@ mod tests {
         assert!(
             tracker.remaining_epsilon() < tracker.target_epsilon,
             "Budget should decrease"
+        );
+    }
+
+    #[test]
+    fn test_privacy_budget_is_enforced() {
+        // With these params epsilon_per_round ≈ 4.85, so a target of 8.0 only
+        // affords a single round; the second start_round must be refused.
+        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2)
+            .with_dp_config(DifferentialPrivacyConfig {
+                enabled: true,
+                noise_multiplier: 1.0,
+                clipping_threshold: 1.0,
+                target_epsilon: 8.0,
+                target_delta: 1e-5,
+            });
+        aggregator.initialize_model(vec![0.0; 5]);
+        aggregator.register_participant("ue-1", 100);
+        aggregator.register_participant("ue-2", 100);
+
+        let run_round = |agg: &mut FederatedAggregator| -> Result<(), String> {
+            agg.start_round()?;
+            for id in ["ue-1", "ue-2"] {
+                agg.submit_update(ModelUpdate {
+                    participant_id: id.to_string(),
+                    base_version: 1,
+                    gradients: vec![0.1; 5],
+                    num_samples: 100,
+                    loss: 0.5,
+                    timestamp_ms: timestamp_now(),
+                })?;
+            }
+            agg.aggregate().map(|_| ())
+        };
+
+        // First round fits within the budget.
+        run_round(&mut aggregator).expect("first round should run");
+
+        // Budget is now (nearly) spent; the next round would exceed it and must
+        // be refused — previously start_round ignored the tracker entirely.
+        let err = run_round(&mut aggregator).expect_err("second round must be refused");
+        assert!(
+            err.contains("Privacy budget"),
+            "expected budget-exhaustion error, got: {err}"
+        );
+
+        // The refused round must not have consumed additional budget.
+        let tracker = aggregator.privacy_tracker().expect("tracker");
+        assert_eq!(
+            tracker.rounds_tracked, 1,
+            "refused round must not be tracked"
         );
     }
 

@@ -66,6 +66,24 @@ pub fn decode_ngap_pdu(bytes: &[u8]) -> Result<NGAP_PDU, NgapCodecError> {
     NGAP_PDU::aper_decode(&mut data).map_err(|e| NgapCodecError::DecodeError(format!("{e:?}")))
 }
 
+/// Encode any generated NGAP type to bytes using APER
+///
+/// Used for standalone IEs and transfer containers that are carried as
+/// opaque OCTET STRING payloads inside NGAP messages.
+pub fn encode_aper<T: AperCodec>(value: &T) -> Result<Vec<u8>, NgapCodecError> {
+    let mut data = PerCodecData::new_aper();
+    value
+        .aper_encode(&mut data)
+        .map_err(|e| NgapCodecError::EncodeError(format!("{e:?}")))?;
+    Ok(data.into_bytes())
+}
+
+/// Decode any generated NGAP type from bytes using APER
+pub fn decode_aper<T: AperCodec<Output = T>>(bytes: &[u8]) -> Result<T, NgapCodecError> {
+    let mut data = PerCodecData::from_slice_aper(bytes);
+    T::aper_decode(&mut data).map_err(|e| NgapCodecError::DecodeError(format!("{e:?}")))
+}
+
 // ============================================================================
 // Multi-SCTP Stream Management
 // ============================================================================
@@ -460,6 +478,18 @@ mod tests {
         assert_eq!(stream, StreamId::NON_UE_ASSOCIATED);
         assert!(stream.is_non_ue_associated());
     }
+
+    #[test]
+    fn test_sixg_extension_is_not_a_valid_ngap_pdu() {
+        // Pins the transport-isolation invariant: the 6G research container
+        // is rejected by the standard NGAP decoder, so it must never be sent
+        // on the NG-C association where a conformant peer would drop it.
+        let ext = super::encode_sixg_ngap_extension(
+            super::sixg_procedure_codes::ISAC_MEASUREMENT_REPORT,
+            &[0x01, 0x02, 0x03],
+        );
+        assert!(super::decode_ngap_pdu(&ext).is_err());
+    }
 }
 
 // ============================================================================
@@ -471,6 +501,16 @@ mod tests {
 /// These are provisional procedure codes for 6G extensions not yet
 /// standardized in 3GPP TS 38.413. They use the vendor extension range
 /// to avoid conflicts with standard NGAP procedures.
+///
+/// # IMPORTANT: transport isolation
+///
+/// The 6G research extension containers below are **not** valid NGAP PDUs
+/// and MUST NOT be sent on the standard NG-C SCTP association: a conformant
+/// APER peer (e.g. the nextgcore amfd) rejects the whole datagram. They are
+/// reserved for a dedicated research side-channel (separate SCTP/TCP
+/// association or internal task channels). See
+/// `tests::test_sixg_extension_is_not_a_valid_ngap_pdu` which pins this
+/// invariant.
 pub mod sixg_procedure_codes {
     /// ISAC Measurement Configuration (gNB ↔ AMF)
     pub const ISAC_MEASUREMENT_CONFIG: u16 = 0xF000;

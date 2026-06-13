@@ -4,8 +4,9 @@
 //! When no ONNX models are loaded, falls back to the existing mean-pooling encoder.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use nextgsim_ai::config::ExecutionProvider;
 use nextgsim_ai::error::ModelError;
@@ -39,6 +40,23 @@ pub enum CodecError {
     },
 }
 
+/// Emits a one-time `warn!` (then `debug!` on subsequent calls) when a codec
+/// falls back to its non-neural path because no ONNX model is loaded.
+///
+/// `encode`/`decode` run per message, so an unconditional `warn!` would flood
+/// the logs; this surfaces the (otherwise easy-to-miss) quality degradation
+/// loudly exactly once per codec instance.
+fn warn_fallback_once(flag: &AtomicBool, role: &str, method: &str) {
+    if flag.swap(true, Ordering::Relaxed) {
+        debug!("No {role} model loaded, using {method} fallback");
+    } else {
+        warn!(
+            "No {role} model loaded — using {method} fallback; semantic codec output is \
+             degraded (not neural). Load a model via load_model() to silence this warning."
+        );
+    }
+}
+
 /// Neural encoder that compresses feature vectors using an ONNX model.
 ///
 /// Falls back to mean-pooling when no model is loaded.
@@ -49,6 +67,9 @@ pub struct NeuralEncoder {
     target_dim: usize,
     /// Whether the ONNX model is loaded and ready
     model_loaded: bool,
+    /// Tracks whether the mean-pooling fallback warning has been emitted yet,
+    /// so it is logged loudly once instead of on every `encode` call.
+    fallback_warned: AtomicBool,
 }
 
 impl NeuralEncoder {
@@ -65,6 +86,7 @@ impl NeuralEncoder {
             engine,
             target_dim,
             model_loaded: false,
+            fallback_warned: AtomicBool::new(false),
         })
     }
 
@@ -81,6 +103,7 @@ impl NeuralEncoder {
             engine,
             target_dim,
             model_loaded: false,
+            fallback_warned: AtomicBool::new(false),
         })
     }
 
@@ -120,7 +143,7 @@ impl NeuralEncoder {
         if self.model_loaded {
             self.encode_neural(data, task)
         } else {
-            debug!("No encoder model loaded, using mean-pooling fallback");
+            warn_fallback_once(&self.fallback_warned, "encoder", "mean-pooling");
             Ok(self.encode_fallback(data, task))
         }
     }
@@ -189,6 +212,9 @@ pub struct NeuralDecoder {
     engine: OnnxEngine,
     /// Whether the ONNX model is loaded and ready
     model_loaded: bool,
+    /// Tracks whether the nearest-neighbor fallback warning has been emitted
+    /// yet, so it is logged loudly once instead of on every `decode` call.
+    fallback_warned: AtomicBool,
 }
 
 impl NeuralDecoder {
@@ -204,6 +230,7 @@ impl NeuralDecoder {
         Ok(Self {
             engine,
             model_loaded: false,
+            fallback_warned: AtomicBool::new(false),
         })
     }
 
@@ -216,6 +243,7 @@ impl NeuralDecoder {
         Ok(Self {
             engine,
             model_loaded: false,
+            fallback_warned: AtomicBool::new(false),
         })
     }
 
@@ -250,7 +278,7 @@ impl NeuralDecoder {
         if self.model_loaded {
             self.decode_neural(features)
         } else {
-            debug!("No decoder model loaded, using nearest-neighbor fallback");
+            warn_fallback_once(&self.fallback_warned, "decoder", "nearest-neighbor");
             Ok(self.decode_fallback(features))
         }
     }

@@ -303,6 +303,44 @@ pub struct PlmnIdentityInfo {
     pub cell_identity: u64,
 }
 
+/// UE timers and constants broadcast in SIB1 (TS 38.331 §6.3.2, §7.1.1)
+///
+/// All timer values are in milliseconds; counters are plain counts. Values
+/// must be members of the enumerated sets defined in TS 38.331 (e.g. t300 in
+/// {100, 200, 300, 400, 600, 1000, 1500, 2000} ms), otherwise the build fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UeTimersAndConstantsParams {
+    /// T300: RRCSetupRequest supervision timer (ms)
+    pub t300_ms: u16,
+    /// T301: RRCReestablishmentRequest supervision timer (ms)
+    pub t301_ms: u16,
+    /// T310: radio link failure detection timer (ms)
+    pub t310_ms: u16,
+    /// N310: consecutive out-of-sync indications before starting T310
+    pub n310: u8,
+    /// T311: re-establishment cell selection timer (ms)
+    pub t311_ms: u16,
+    /// N311: consecutive in-sync indications stopping T310
+    pub n311: u8,
+    /// T319: RRCResumeRequest supervision timer (ms)
+    pub t319_ms: u16,
+}
+
+impl Default for UeTimersAndConstantsParams {
+    fn default() -> Self {
+        // Common deployment defaults per TS 38.331 §7.1.1
+        Self {
+            t300_ms: 1000,
+            t301_ms: 1000,
+            t310_ms: 1000,
+            n310: 10,
+            t311_ms: 30000,
+            n311: 1,
+            t319_ms: 1000,
+        }
+    }
+}
+
 /// Parameters for building a SIB1 message
 #[derive(Debug, Clone)]
 pub struct Sib1Params {
@@ -314,7 +352,20 @@ pub struct Sib1Params {
     pub ims_emergency_support: bool,
     /// eCall over IMS support
     pub ecall_over_ims_support: bool,
+    /// UE timers and constants (optional)
+    pub ue_timers_and_constants: Option<UeTimersAndConstantsParams>,
+    /// `intraFreqReselectionRedCap` (Rel-17, TS 38.331 §6.3.2 SIB1-v1700-IEs):
+    /// controls whether RedCap UEs are allowed to perform intra-frequency cell
+    /// reselection. The Rel-15.6 ASN.1 schema predates the v1700 IE group, so
+    /// the flag is broadcast via the spec-legal `lateNonCriticalExtension`
+    /// OCTET STRING container (the same octet-container pattern used elsewhere
+    /// to ride later-release IEs over the Rel-15 schema).
+    pub intra_freq_reselection_redcap: bool,
 }
+
+/// Tag for the `intraFreqReselectionRedCap` TLV inside SIB1
+/// `lateNonCriticalExtension`.
+const SIB1_REDCAP_LNCE_TAG: u8 = 0x52; // 'R'
 
 /// Parsed SIB1 data
 #[derive(Debug, Clone)]
@@ -327,6 +378,11 @@ pub struct Sib1Data {
     pub ims_emergency_support: bool,
     /// eCall over IMS support
     pub ecall_over_ims_support: bool,
+    /// UE timers and constants
+    pub ue_timers_and_constants: Option<UeTimersAndConstantsParams>,
+    /// `intraFreqReselectionRedCap` (Rel-17), recovered from the SIB1
+    /// `lateNonCriticalExtension` octet container (see [`Sib1Params`]).
+    pub intra_freq_reselection_redcap: bool,
 }
 
 /// Build a SIB1 message
@@ -382,10 +438,24 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
         } else {
             None
         },
-        ue_timers_and_constants: None,
+        ue_timers_and_constants: params
+            .ue_timers_and_constants
+            .as_ref()
+            .map(build_ue_timers_and_constants)
+            .transpose()?,
         uac_barring_info: None,
         use_full_resume_id: None,
-        late_non_critical_extension: None,
+        // intraFreqReselectionRedCap (Rel-17): broadcast as a minimal TLV in the
+        // spec-legal lateNonCriticalExtension OCTET STRING when allowed.
+        late_non_critical_extension: if params.intra_freq_reselection_redcap {
+            Some(SIB1LateNonCriticalExtension(vec![
+                SIB1_REDCAP_LNCE_TAG,
+                1, // length
+                1, // value: intra-freq reselection allowed for RedCap
+            ]))
+        } else {
+            None
+        },
         non_critical_extension: None,
     };
 
@@ -487,11 +557,240 @@ pub fn parse_sib1(msg: &BCCH_DL_SCH_Message) -> Result<Sib1Data, SystemInformati
     // Parse eCall over IMS support
     let ecall_over_ims_support = sib1.e_call_over_ims_support.is_some();
 
+    // Parse UE timers and constants
+    let ue_timers_and_constants = sib1
+        .ue_timers_and_constants
+        .as_ref()
+        .map(parse_ue_timers_and_constants)
+        .transpose()?;
+
+    // intraFreqReselectionRedCap (Rel-17): recovered from the SIB1
+    // lateNonCriticalExtension octet container TLV.
+    let intra_freq_reselection_redcap = sib1
+        .late_non_critical_extension
+        .as_ref()
+        .map(|lnce| parse_redcap_lnce(&lnce.0))
+        .unwrap_or(false);
+
     Ok(Sib1Data {
         cell_selection_info,
         plmn_identity_info_list,
         ims_emergency_support,
         ecall_over_ims_support,
+        ue_timers_and_constants,
+        intra_freq_reselection_redcap,
+    })
+}
+
+/// Scan a SIB1 `lateNonCriticalExtension` octet container for the
+/// `intraFreqReselectionRedCap` TLV (`SIB1_REDCAP_LNCE_TAG`, len, value).
+/// Returns true when present and set.
+fn parse_redcap_lnce(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let tag = bytes[i];
+        let len = bytes[i + 1] as usize;
+        let val_start = i + 2;
+        if val_start + len > bytes.len() {
+            break;
+        }
+        if tag == SIB1_REDCAP_LNCE_TAG {
+            return bytes.get(val_start).copied().unwrap_or(0) != 0;
+        }
+        i = val_start + len;
+    }
+    false
+}
+
+/// Build the generated `UE_TimersAndConstants` from millisecond/count values
+fn build_ue_timers_and_constants(
+    params: &UeTimersAndConstantsParams,
+) -> Result<UE_TimersAndConstants, SystemInformationError> {
+    let invalid = |field: &str, value: u32| {
+        SystemInformationError::InvalidFieldValue(format!(
+            "{field} value {value} is not in the TS 38.331 enumerated set"
+        ))
+    };
+
+    let t300 = match params.t300_ms {
+        100 => UE_TimersAndConstantsT300::MS100,
+        200 => UE_TimersAndConstantsT300::MS200,
+        300 => UE_TimersAndConstantsT300::MS300,
+        400 => UE_TimersAndConstantsT300::MS400,
+        600 => UE_TimersAndConstantsT300::MS600,
+        1000 => UE_TimersAndConstantsT300::MS1000,
+        1500 => UE_TimersAndConstantsT300::MS1500,
+        2000 => UE_TimersAndConstantsT300::MS2000,
+        v => return Err(invalid("t300", v as u32)),
+    };
+    let t301 = match params.t301_ms {
+        100 => UE_TimersAndConstantsT301::MS100,
+        200 => UE_TimersAndConstantsT301::MS200,
+        300 => UE_TimersAndConstantsT301::MS300,
+        400 => UE_TimersAndConstantsT301::MS400,
+        600 => UE_TimersAndConstantsT301::MS600,
+        1000 => UE_TimersAndConstantsT301::MS1000,
+        1500 => UE_TimersAndConstantsT301::MS1500,
+        2000 => UE_TimersAndConstantsT301::MS2000,
+        v => return Err(invalid("t301", v as u32)),
+    };
+    let t310 = match params.t310_ms {
+        0 => UE_TimersAndConstantsT310::MS0,
+        50 => UE_TimersAndConstantsT310::MS50,
+        100 => UE_TimersAndConstantsT310::MS100,
+        200 => UE_TimersAndConstantsT310::MS200,
+        500 => UE_TimersAndConstantsT310::MS500,
+        1000 => UE_TimersAndConstantsT310::MS1000,
+        2000 => UE_TimersAndConstantsT310::MS2000,
+        v => return Err(invalid("t310", v as u32)),
+    };
+    let n310 = match params.n310 {
+        1 => UE_TimersAndConstantsN310::N1,
+        2 => UE_TimersAndConstantsN310::N2,
+        3 => UE_TimersAndConstantsN310::N3,
+        4 => UE_TimersAndConstantsN310::N4,
+        6 => UE_TimersAndConstantsN310::N6,
+        8 => UE_TimersAndConstantsN310::N8,
+        10 => UE_TimersAndConstantsN310::N10,
+        20 => UE_TimersAndConstantsN310::N20,
+        v => return Err(invalid("n310", v as u32)),
+    };
+    let t311 = match params.t311_ms {
+        1000 => UE_TimersAndConstantsT311::MS1000,
+        3000 => UE_TimersAndConstantsT311::MS3000,
+        5000 => UE_TimersAndConstantsT311::MS5000,
+        10000 => UE_TimersAndConstantsT311::MS10000,
+        15000 => UE_TimersAndConstantsT311::MS15000,
+        20000 => UE_TimersAndConstantsT311::MS20000,
+        30000 => UE_TimersAndConstantsT311::MS30000,
+        v => return Err(invalid("t311", v as u32)),
+    };
+    let n311 = match params.n311 {
+        1 => UE_TimersAndConstantsN311::N1,
+        2 => UE_TimersAndConstantsN311::N2,
+        3 => UE_TimersAndConstantsN311::N3,
+        4 => UE_TimersAndConstantsN311::N4,
+        5 => UE_TimersAndConstantsN311::N5,
+        6 => UE_TimersAndConstantsN311::N6,
+        8 => UE_TimersAndConstantsN311::N8,
+        10 => UE_TimersAndConstantsN311::N10,
+        v => return Err(invalid("n311", v as u32)),
+    };
+    let t319 = match params.t319_ms {
+        100 => UE_TimersAndConstantsT319::MS100,
+        200 => UE_TimersAndConstantsT319::MS200,
+        300 => UE_TimersAndConstantsT319::MS300,
+        400 => UE_TimersAndConstantsT319::MS400,
+        600 => UE_TimersAndConstantsT319::MS600,
+        1000 => UE_TimersAndConstantsT319::MS1000,
+        1500 => UE_TimersAndConstantsT319::MS1500,
+        2000 => UE_TimersAndConstantsT319::MS2000,
+        v => return Err(invalid("t319", v as u32)),
+    };
+
+    Ok(UE_TimersAndConstants {
+        t300: UE_TimersAndConstantsT300(t300),
+        t301: UE_TimersAndConstantsT301(t301),
+        t310: UE_TimersAndConstantsT310(t310),
+        n310: UE_TimersAndConstantsN310(n310),
+        t311: UE_TimersAndConstantsT311(t311),
+        n311: UE_TimersAndConstantsN311(n311),
+        t319: UE_TimersAndConstantsT319(t319),
+    })
+}
+
+/// Parse the generated `UE_TimersAndConstants` into millisecond/count values
+fn parse_ue_timers_and_constants(
+    timers: &UE_TimersAndConstants,
+) -> Result<UeTimersAndConstantsParams, SystemInformationError> {
+    let invalid = |field: &'static str| {
+        SystemInformationError::InvalidFieldValue(format!("Unknown {field} enumerated value"))
+    };
+
+    let t300_ms = match timers.t300.0 {
+        UE_TimersAndConstantsT300::MS100 => 100,
+        UE_TimersAndConstantsT300::MS200 => 200,
+        UE_TimersAndConstantsT300::MS300 => 300,
+        UE_TimersAndConstantsT300::MS400 => 400,
+        UE_TimersAndConstantsT300::MS600 => 600,
+        UE_TimersAndConstantsT300::MS1000 => 1000,
+        UE_TimersAndConstantsT300::MS1500 => 1500,
+        UE_TimersAndConstantsT300::MS2000 => 2000,
+        _ => return Err(invalid("t300")),
+    };
+    let t301_ms = match timers.t301.0 {
+        UE_TimersAndConstantsT301::MS100 => 100,
+        UE_TimersAndConstantsT301::MS200 => 200,
+        UE_TimersAndConstantsT301::MS300 => 300,
+        UE_TimersAndConstantsT301::MS400 => 400,
+        UE_TimersAndConstantsT301::MS600 => 600,
+        UE_TimersAndConstantsT301::MS1000 => 1000,
+        UE_TimersAndConstantsT301::MS1500 => 1500,
+        UE_TimersAndConstantsT301::MS2000 => 2000,
+        _ => return Err(invalid("t301")),
+    };
+    let t310_ms = match timers.t310.0 {
+        UE_TimersAndConstantsT310::MS0 => 0,
+        UE_TimersAndConstantsT310::MS50 => 50,
+        UE_TimersAndConstantsT310::MS100 => 100,
+        UE_TimersAndConstantsT310::MS200 => 200,
+        UE_TimersAndConstantsT310::MS500 => 500,
+        UE_TimersAndConstantsT310::MS1000 => 1000,
+        UE_TimersAndConstantsT310::MS2000 => 2000,
+        _ => return Err(invalid("t310")),
+    };
+    let n310 = match timers.n310.0 {
+        UE_TimersAndConstantsN310::N1 => 1,
+        UE_TimersAndConstantsN310::N2 => 2,
+        UE_TimersAndConstantsN310::N3 => 3,
+        UE_TimersAndConstantsN310::N4 => 4,
+        UE_TimersAndConstantsN310::N6 => 6,
+        UE_TimersAndConstantsN310::N8 => 8,
+        UE_TimersAndConstantsN310::N10 => 10,
+        UE_TimersAndConstantsN310::N20 => 20,
+        _ => return Err(invalid("n310")),
+    };
+    let t311_ms = match timers.t311.0 {
+        UE_TimersAndConstantsT311::MS1000 => 1000,
+        UE_TimersAndConstantsT311::MS3000 => 3000,
+        UE_TimersAndConstantsT311::MS5000 => 5000,
+        UE_TimersAndConstantsT311::MS10000 => 10000,
+        UE_TimersAndConstantsT311::MS15000 => 15000,
+        UE_TimersAndConstantsT311::MS20000 => 20000,
+        UE_TimersAndConstantsT311::MS30000 => 30000,
+        _ => return Err(invalid("t311")),
+    };
+    let n311 = match timers.n311.0 {
+        UE_TimersAndConstantsN311::N1 => 1,
+        UE_TimersAndConstantsN311::N2 => 2,
+        UE_TimersAndConstantsN311::N3 => 3,
+        UE_TimersAndConstantsN311::N4 => 4,
+        UE_TimersAndConstantsN311::N5 => 5,
+        UE_TimersAndConstantsN311::N6 => 6,
+        UE_TimersAndConstantsN311::N8 => 8,
+        UE_TimersAndConstantsN311::N10 => 10,
+        _ => return Err(invalid("n311")),
+    };
+    let t319_ms = match timers.t319.0 {
+        UE_TimersAndConstantsT319::MS100 => 100,
+        UE_TimersAndConstantsT319::MS200 => 200,
+        UE_TimersAndConstantsT319::MS300 => 300,
+        UE_TimersAndConstantsT319::MS400 => 400,
+        UE_TimersAndConstantsT319::MS600 => 600,
+        UE_TimersAndConstantsT319::MS1000 => 1000,
+        UE_TimersAndConstantsT319::MS1500 => 1500,
+        UE_TimersAndConstantsT319::MS2000 => 2000,
+        _ => return Err(invalid("t319")),
+    };
+
+    Ok(UeTimersAndConstantsParams {
+        t300_ms,
+        t301_ms,
+        t310_ms,
+        n310,
+        t311_ms,
+        n311,
+        t319_ms,
     })
 }
 
@@ -712,6 +1011,7 @@ mod tests {
 
     fn create_test_sib1_params() -> Sib1Params {
         Sib1Params {
+            ue_timers_and_constants: None,
             cell_selection_info: Some(CellSelectionInfo {
                 q_rx_lev_min: -70,
                 q_rx_lev_min_offset: None,
@@ -729,7 +1029,30 @@ mod tests {
             }],
             ims_emergency_support: false,
             ecall_over_ims_support: false,
+            intra_freq_reselection_redcap: false,
         }
+    }
+
+    #[test]
+    fn test_sib1_intra_freq_reselection_redcap_roundtrip() {
+        // intraFreqReselectionRedCap set: survives UPER encode/decode via the
+        // SIB1 lateNonCriticalExtension octet container.
+        let params = Sib1Params {
+            intra_freq_reselection_redcap: true,
+            ..create_test_sib1_params()
+        };
+        let bytes = encode_sib1(&params).unwrap();
+        let data = decode_sib1(&bytes).unwrap();
+        assert!(
+            data.intra_freq_reselection_redcap,
+            "intraFreqReselectionRedCap must round-trip"
+        );
+
+        // Not set: default decode yields false.
+        let params_off = create_test_sib1_params();
+        let bytes_off = encode_sib1(&params_off).unwrap();
+        let data_off = decode_sib1(&bytes_off).unwrap();
+        assert!(!data_off.intra_freq_reselection_redcap);
     }
 
     #[test]
@@ -816,5 +1139,51 @@ mod tests {
         let msg = build_sib1(&params).unwrap();
         let data = parse_sib1(&msg).unwrap();
         assert_eq!(data.plmn_identity_info_list[0].plmn_identity_list.len(), 2);
+    }
+
+    #[test]
+    fn test_sib1_with_ue_timers_and_constants_roundtrip() {
+        let timers = UeTimersAndConstantsParams {
+            t300_ms: 400,
+            t301_ms: 600,
+            t310_ms: 2000,
+            n310: 6,
+            t311_ms: 5000,
+            n311: 2,
+            t319_ms: 1500,
+        };
+        let params = Sib1Params {
+            ue_timers_and_constants: Some(timers),
+            ..create_test_sib1_params()
+        };
+        let bytes = encode_sib1(&params).unwrap();
+        let data = decode_sib1(&bytes).unwrap();
+        assert_eq!(data.ue_timers_and_constants, Some(timers));
+    }
+
+    #[test]
+    fn test_sib1_default_ue_timers_roundtrip() {
+        let params = Sib1Params {
+            ue_timers_and_constants: Some(UeTimersAndConstantsParams::default()),
+            ..create_test_sib1_params()
+        };
+        let msg = build_sib1(&params).unwrap();
+        let data = parse_sib1(&msg).unwrap();
+        assert_eq!(
+            data.ue_timers_and_constants,
+            Some(UeTimersAndConstantsParams::default())
+        );
+    }
+
+    #[test]
+    fn test_sib1_rejects_invalid_timer_value() {
+        let params = Sib1Params {
+            ue_timers_and_constants: Some(UeTimersAndConstantsParams {
+                t300_ms: 123, // not in the enumerated set
+                ..UeTimersAndConstantsParams::default()
+            }),
+            ..create_test_sib1_params()
+        };
+        assert!(build_sib1(&params).is_err());
     }
 }

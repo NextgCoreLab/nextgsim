@@ -65,6 +65,12 @@ pub struct RrcUeContext {
     pub state: RrcState,
     /// RedCap processor for this UE (Rel-17)
     pub redcap: RedCapProcessor,
+    /// Scheduler PRB ceiling enforced for this UE. `None` for a normal UE
+    /// (full cell bandwidth); `Some(prb)` for a RedCap UE whose serving
+    /// bandwidth has been clamped to its narrowband RF capability (Rel-17).
+    pub redcap_max_prb: Option<u32>,
+    /// UPER-encoded UE-NR-Capability container from UECapabilityInformation
+    pub nr_capability: Option<Vec<u8>>,
 }
 
 impl RrcUeContext {
@@ -78,7 +84,25 @@ impl RrcUeContext {
             s_tmsi: None,
             state: RrcState::Idle,
             redcap: RedCapProcessor::new(),
+            redcap_max_prb: None,
+            nr_capability: None,
         }
+    }
+
+    /// Stores the UE-NR-Capability container received in UECapabilityInformation
+    pub fn set_nr_capability(&mut self, container: Vec<u8>) {
+        self.nr_capability = Some(container);
+    }
+
+    /// Stores the scheduler PRB ceiling enforced for a RedCap UE (Rel-17).
+    pub fn set_redcap_max_prb(&mut self, max_prb: u32) {
+        self.redcap_max_prb = Some(max_prb);
+    }
+
+    /// Returns the scheduler PRB ceiling for this UE: the RedCap-restricted
+    /// value when set, otherwise the full cell PRB count (normal UE).
+    pub fn scheduler_max_prb(&self, cell_max_prb: u32) -> u32 {
+        self.redcap_max_prb.unwrap_or(cell_max_prb)
     }
 
     /// Sets the initial UE identity

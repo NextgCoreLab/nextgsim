@@ -143,11 +143,35 @@ pub enum ResumeError {
 // Parameter Structs
 // ============================================================================
 
-/// Parameters for building an `RRCResumeRequest`.
+/// Resume identity assigned by the network in the suspend configuration
+/// (TS 38.331 §6.3.2 SuspendConfig: fullI-RNTI and shortI-RNTI).
+///
+/// `RRCResumeRequest` (UL-CCCH) carries the 24-bit short form;
+/// `RRCResumeRequest1` (UL-CCCH1) carries the full 40-bit I-RNTI and is used
+/// when SIB1 signals `useFullResumeID`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeIdentity {
+    /// Short I-RNTI (24 bits)
+    Short(u32),
+    /// Full I-RNTI (40 bits)
+    Full(u64),
+}
+
+impl ResumeIdentity {
+    /// Returns true when the identity fits its declared bit width
+    pub fn is_valid(&self) -> bool {
+        match self {
+            ResumeIdentity::Short(v) => *v <= 0x00FF_FFFF,
+            ResumeIdentity::Full(v) => *v <= 0xFF_FFFF_FFFF,
+        }
+    }
+}
+
+/// Parameters for building an `RRCResumeRequest` / `RRCResumeRequest1`.
 #[derive(Debug, Clone)]
 pub struct ResumeRequestParams {
-    /// Short I-RNTI (24 bits), uniquely identifies the UE in INACTIVE
-    pub resume_identity: u32,
+    /// I-RNTI identifying the UE in INACTIVE (short 24-bit or full 40-bit)
+    pub resume_identity: ResumeIdentity,
     /// Resume MAC-I (16 bits), computed from AS security context
     pub resume_mac_i: u16,
     /// Cause for resuming
@@ -229,17 +253,17 @@ impl ResumeProcedure {
     ///
     /// # Arguments
     /// * `cause` - Reason for resuming the connection
-    /// * `resume_identity` - Short I-RNTI (24-bit value)
+    /// * `resume_identity` - I-RNTI (short 24-bit or full 40-bit form)
     /// * `resume_mac_i` - 16-bit MAC computed with AS security key
     /// * `rrc_sm` - UE RRC state machine (validated, not yet transitioned)
     ///
     /// # Returns
-    /// * `Ok(ResumeRequestParams)` - Parameters for building `RRCResumeRequest`
+    /// * `Ok(ResumeRequestParams)` - Parameters for building the resume request
     /// * `Err(error)` - If cannot initiate
     pub fn initiate(
         &mut self,
         cause: ResumeCause,
-        resume_identity: u32,
+        resume_identity: ResumeIdentity,
         resume_mac_i: u16,
         rrc_sm: &RrcStateMachine,
     ) -> Result<ResumeRequestParams, ResumeError> {
@@ -250,6 +274,10 @@ impl ResumeProcedure {
 
         if self.is_in_progress() {
             return Err(ResumeError::AlreadyInProgress);
+        }
+
+        if !resume_identity.is_valid() {
+            return Err(ResumeError::NoResumeIdentity);
         }
 
         tracing::info!("RRC Resume initiated: cause={}", cause);
@@ -397,14 +425,19 @@ mod tests {
         let sm = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
 
-        let result = proc.initiate(ResumeCause::MoData, 0x123456, 0xABCD, &sm);
+        let result = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x123456),
+            0xABCD,
+            &sm,
+        );
 
         assert!(result.is_ok());
         assert_eq!(proc.state(), ResumeProcedureState::WaitingForResponse);
         assert!(proc.is_in_progress());
 
         let params = result.unwrap();
-        assert_eq!(params.resume_identity, 0x123456);
+        assert_eq!(params.resume_identity, ResumeIdentity::Short(0x123456));
         assert_eq!(params.resume_mac_i, 0xABCD);
         assert!(matches!(params.cause, ResumeCause::MoData));
     }
@@ -415,7 +448,12 @@ mod tests {
         sm.transition(RrcStateTransition::SetupComplete).unwrap(); // CONNECTED
         let mut proc = ResumeProcedure::new();
 
-        let result = proc.initiate(ResumeCause::MoData, 0x000001, 0x0001, &sm);
+        let result = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm,
+        );
 
         assert!(matches!(result, Err(ResumeError::NotInactive(_))));
     }
@@ -425,7 +463,12 @@ mod tests {
         let sm = RrcStateMachine::new(); // IDLE
         let mut proc = ResumeProcedure::new();
 
-        let result = proc.initiate(ResumeCause::MoSignalling, 0x000002, 0x0002, &sm);
+        let result = proc.initiate(
+            ResumeCause::MoSignalling,
+            ResumeIdentity::Short(0x000002),
+            0x0002,
+            &sm,
+        );
 
         assert!(matches!(result, Err(ResumeError::NotInactive(_))));
     }
@@ -435,10 +478,20 @@ mod tests {
         let sm = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
 
-        let _ = proc.initiate(ResumeCause::MoData, 0x111111, 0x0001, &sm);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x111111),
+            0x0001,
+            &sm,
+        );
 
         let sm2 = setup_inactive_sm();
-        let result = proc.initiate(ResumeCause::MoData, 0x222222, 0x0002, &sm2);
+        let result = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x222222),
+            0x0002,
+            &sm2,
+        );
 
         assert!(matches!(result, Err(ResumeError::AlreadyInProgress)));
     }
@@ -447,7 +500,12 @@ mod tests {
     fn test_on_resume_received_happy_path() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, 0x123456, 0xABCD, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x123456),
+            0xABCD,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         let result = proc.on_resume_received(1, None, &mut sm);
@@ -464,7 +522,12 @@ mod tests {
     fn test_on_resume_received_with_nas_message() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoSignalling, 0x000001, 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoSignalling,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         let nas_msg = vec![0x7E, 0x00, 0x46]; // dummy NAS service request
@@ -488,7 +551,12 @@ mod tests {
     fn test_on_release_received_moves_to_idle() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MtAccess, 0x000001, 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MtAccess,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         proc.on_release_received(&mut sm);
@@ -501,7 +569,12 @@ mod tests {
     fn test_on_setup_fallback() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, 0x000001, 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         proc.on_setup_fallback();
         assert_eq!(proc.state(), ResumeProcedureState::Failed);
@@ -511,7 +584,12 @@ mod tests {
     fn test_on_t319_expired() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, 0x000001, 0x0001, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x000001),
+            0x0001,
+            &sm_ref,
+        );
 
         let mut sm = setup_inactive_sm();
         proc.on_t319_expired(&mut sm);
@@ -524,7 +602,12 @@ mod tests {
     fn test_reset_clears_state() {
         let sm_ref = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
-        let _ = proc.initiate(ResumeCause::MoData, 0x123456, 0xABCD, &sm_ref);
+        let _ = proc.initiate(
+            ResumeCause::MoData,
+            ResumeIdentity::Short(0x123456),
+            0xABCD,
+            &sm_ref,
+        );
 
         proc.reset();
 

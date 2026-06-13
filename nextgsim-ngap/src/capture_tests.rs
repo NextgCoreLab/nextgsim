@@ -488,4 +488,289 @@ mod tests {
 
         assert!(matches!(decoded, NGAP_PDU::InitiatingMessage(_)));
     }
+
+    // ========================================================================
+    // Cross-codec NG Setup regression guards (E2E NGAP reconciliation)
+    // ========================================================================
+    //
+    // These pin the wire bytes that the independent ogs-ngap (nextgcore) codec
+    // produces and accepts for the NG Setup Request and Response against the
+    // bytes this generated nextgsim-ngap codec produces and accepts. The
+    // matching test on the core side
+    // (`ogs-ngap/src/builder.rs::ng_setup_cross_codec`) re-encodes the same
+    // vectors; together they guarantee both directions round-trip across the
+    // two stacks. See that module for the root-cause description.
+    //
+    // The vectors were captured by encoding the identical logical message with
+    // each stack and confirming byte equality after the two X.691 fixes on the
+    // ogs side (PrintableString AMFName/RANNodeName, and the message-SEQUENCE
+    // extension-marker bit before the IE container).
+
+    /// NG Setup Response as produced by ogs-ngap `build_ng_setup_response`
+    /// (AMFName "nextgcore-amf", one GUAMI 001-01/region 2/set 1/pointer 1,
+    /// capacity 255, one PLMN 001-01 with S-NSSAI sst=1).
+    const CORE_NG_SETUP_RESPONSE: [u8; 55] = [
+        0x20, 0x15, 0x00, 0x33, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x0f, 0x06, 0x00, 0x6e, 0x65,
+        0x78, 0x74, 0x67, 0x63, 0x6f, 0x72, 0x65, 0x2d, 0x61, 0x6d, 0x66, 0x00, 0x60, 0x00, 0x08,
+        0x00, 0x00, 0x00, 0xf1, 0x10, 0x02, 0x00, 0x41, 0x00, 0x56, 0x40, 0x01, 0xff, 0x00, 0x50,
+        0x00, 0x08, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x08,
+    ];
+
+    /// Decode-direction guard: the sim (gNB) must parse the AMF's NG Setup
+    /// Response produced by the strict core codec.
+    #[test]
+    fn ng_setup_response_from_core_decodes() {
+        let decoded = decode_ngap_pdu(&CORE_NG_SETUP_RESPONSE)
+            .expect("sim must decode core NG Setup Response");
+        match decoded {
+            NGAP_PDU::SuccessfulOutcome(outcome) => {
+                assert_eq!(outcome.procedure_code.0, 21, "NGSetup procedure code");
+            }
+            other => panic!("expected SuccessfulOutcome, got {other:?}"),
+        }
+    }
+
+    /// The sim's own NG Setup Response encoding must be byte-identical to the
+    /// core's, so the gNB and AMF agree on the wire in both directions.
+    #[test]
+    fn ng_setup_response_sim_matches_core_bytes() {
+        use crate::codec::generated::*;
+        use bitvec::prelude::*;
+
+        fn bits(value: u64, n: usize) -> bitvec::vec::BitVec<u8, Msb0> {
+            let mut bv: bitvec::vec::BitVec<u8, Msb0> = bitvec::vec::BitVec::with_capacity(n);
+            for i in (0..n).rev() {
+                bv.push((value >> i) & 1 == 1);
+            }
+            bv
+        }
+
+        let ies = vec![
+            NGSetupResponseProtocolIEs_Entry {
+                id: ProtocolIE_ID(1),
+                criticality: Criticality(Criticality::REJECT),
+                value: NGSetupResponseProtocolIEs_EntryValue::Id_AMFName(AMFName(
+                    "nextgcore-amf".to_string(),
+                )),
+            },
+            NGSetupResponseProtocolIEs_Entry {
+                id: ProtocolIE_ID(96),
+                criticality: Criticality(Criticality::REJECT),
+                value: NGSetupResponseProtocolIEs_EntryValue::Id_ServedGUAMIList(ServedGUAMIList(
+                    vec![ServedGUAMIItem {
+                        guami: GUAMI {
+                            plmn_identity: PLMNIdentity(vec![0x00, 0xf1, 0x10]),
+                            amf_region_id: AMFRegionID(bits(0x02, 8)),
+                            amf_set_id: AMFSetID(bits(0x001, 10)),
+                            amf_pointer: AMFPointer(bits(0x01, 6)),
+                            ie_extensions: None,
+                        },
+                        backup_amf_name: None,
+                        ie_extensions: None,
+                    }],
+                )),
+            },
+            NGSetupResponseProtocolIEs_Entry {
+                id: ProtocolIE_ID(86),
+                criticality: Criticality(Criticality::IGNORE),
+                value: NGSetupResponseProtocolIEs_EntryValue::Id_RelativeAMFCapacity(
+                    RelativeAMFCapacity(255),
+                ),
+            },
+            NGSetupResponseProtocolIEs_Entry {
+                id: ProtocolIE_ID(80),
+                criticality: Criticality(Criticality::REJECT),
+                value: NGSetupResponseProtocolIEs_EntryValue::Id_PLMNSupportList(PLMNSupportList(
+                    vec![PLMNSupportItem {
+                        plmn_identity: PLMNIdentity(vec![0x00, 0xf1, 0x10]),
+                        slice_support_list: SliceSupportList(vec![SliceSupportItem {
+                            s_nssai: S_NSSAI {
+                                sst: SST(vec![0x01]),
+                                sd: None,
+                                ie_extensions: None,
+                            },
+                            ie_extensions: None,
+                        }]),
+                        ie_extensions: None,
+                    }],
+                )),
+            },
+        ];
+        let pdu = NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            procedure_code: ProcedureCode(21),
+            criticality: Criticality(Criticality::REJECT),
+            value: SuccessfulOutcomeValue::Id_NGSetup(NGSetupResponse {
+                protocol_i_es: NGSetupResponseProtocolIEs(ies),
+            }),
+        });
+        let bytes = encode_ngap_pdu(&pdu).unwrap();
+        assert_eq!(
+            bytes,
+            CORE_NG_SETUP_RESPONSE.to_vec(),
+            "sim NG Setup Response must match the strict core codec byte-for-byte"
+        );
+    }
+
+    /// NG Setup Request as produced by ogs-ngap `build_ng_setup_request`
+    /// (GlobalGNB-ID 001-01/gnb-id len 32, RANNodeName "nextgsim-gnb",
+    /// one TAC 000001 with PLMN 001-01 / S-NSSAI sst=1).
+    const CORE_NG_SETUP_REQUEST: [u8; 60] = [
+        0x00, 0x15, 0x00, 0x38, 0x00, 0x00, 0x04, 0x00, 0x1b, 0x00, 0x09, 0x00, 0x00, 0xf1, 0x10,
+        0x50, 0x00, 0x00, 0x00, 0x08, 0x00, 0x52, 0x40, 0x0e, 0x05, 0x80, 0x6e, 0x65, 0x78, 0x74,
+        0x67, 0x73, 0x69, 0x6d, 0x2d, 0x67, 0x6e, 0x62, 0x00, 0x66, 0x00, 0x0d, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x08, 0x00, 0x15, 0x40, 0x01, 0x40,
+    ];
+
+    /// Decode-direction guard: the sim must parse an NG Setup Request encoded
+    /// by the strict core codec (the same direction the core decodes from the
+    /// sim — symmetric, since both NG Setup messages share the framing fix).
+    #[test]
+    fn ng_setup_request_from_core_decodes() {
+        let decoded =
+            decode_ngap_pdu(&CORE_NG_SETUP_REQUEST).expect("sim must decode core NG Setup Request");
+        match decoded {
+            NGAP_PDU::InitiatingMessage(msg) => {
+                assert_eq!(msg.procedure_code.0, 21, "NGSetup procedure code");
+            }
+            other => panic!("expected InitiatingMessage, got {other:?}"),
+        }
+    }
+
+    /// The sim's own NG Setup Request encoding (gnb-id value 1) shares the
+    /// framing of the core's (gnb-id value 8): both carry the message-SEQUENCE
+    /// extension-marker bit and the PrintableString RANNodeName, so the
+    /// structural prefix and the RANNodeName IE bytes are identical.
+    #[test]
+    fn ng_setup_request_sim_shares_core_framing() {
+        let params = NgSetupRequestParams {
+            gnb_id: GnbId {
+                plmn_identity: [0x00, 0xF1, 0x10],
+                gnb_id_value: 1,
+                gnb_id_length: 32,
+            },
+            ran_node_name: Some("nextgsim-gnb".to_string()),
+            supported_ta_list: vec![SupportedTaItem {
+                tac: [0x00, 0x00, 0x01],
+                broadcast_plmn_list: vec![BroadcastPlmnItem {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    slice_support_list: vec![SNssai { sst: 1, sd: None }],
+                }],
+            }],
+            default_paging_drx: PagingDrx::V128,
+        };
+        let pdu = build_ng_setup_request(&params).unwrap();
+        let bytes = encode_ngap_pdu(&pdu).unwrap();
+        // Outer framing: SuccessfulOutcome/InitiatingMessage header, open-type
+        // length, and the container preamble + count "00 00 04".
+        assert_eq!(&bytes[0..7], &CORE_NG_SETUP_REQUEST[0..7]);
+        // RANNodeName IE (id 82 = 0x52) encoded as PrintableString with the
+        // extension-bit + constrained-length framing "05 80" before the chars.
+        assert_eq!(&bytes[20..38], &CORE_NG_SETUP_REQUEST[20..38]);
+    }
+
+    /// ICS Request (AMF → gNB): the gNB must decode the AMF's encode. Pinned
+    /// vector is the strict core's (ogs-ngap) output after the ICS fixes
+    /// (BitRate extensible-constrained, UESecurityCapabilities size-ext bits,
+    /// AllowedNSSAI bare S-NSSAI). The matching core test
+    /// (builder.rs::ics_request_matches_sim_wire_bytes) re-encodes it.
+    const CORE_ICS_REQUEST: [u8; 99] = [
+        0x00, 0x0e, 0x00, 0x5f, 0x00, 0x00, 0x07, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, 0x00, 0x55,
+        0x00, 0x02, 0x00, 0x01, 0x00, 0x1c, 0x00, 0x07, 0x00, 0x00, 0xf1, 0x10, 0x02, 0x00, 0x41,
+        0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x77, 0x00, 0x09, 0x10, 0x00, 0x08, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x5e, 0x00, 0x20, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x00, 0x6e, 0x00, 0x0a, 0x0c,
+        0x3b, 0x9a, 0xca, 0x00, 0x30, 0x1d, 0xcd, 0x65, 0x00,
+    ];
+
+    #[test]
+    fn ics_request_from_core_decodes() {
+        let decoded = decode_ngap_pdu(&CORE_ICS_REQUEST).expect("sim must decode core ICS Request");
+        match decoded {
+            NGAP_PDU::InitiatingMessage(msg) => {
+                assert_eq!(
+                    msg.procedure_code.0, 14,
+                    "InitialContextSetup procedure code"
+                );
+            }
+            other => panic!("expected InitiatingMessage, got {other:?}"),
+        }
+    }
+
+    /// PDU Session Resource Setup Request (AMF → gNB) outer NGAP envelope: the
+    /// gNB must decode the core's encode (the inner N2 transfer is opaque and
+    /// covered by the transfer tests). Pinned vector is the core's output.
+    const CORE_PDU_SESSION_SETUP_REQUEST: [u8; 33] = [
+        0x00, 0x1d, 0x00, 0x1d, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, 0x00, 0x55,
+        0x00, 0x02, 0x00, 0x01, 0x00, 0x4a, 0x00, 0x0a, 0x00, 0x00, 0x05, 0x00, 0x20, 0x04, 0x00,
+        0x01, 0x02, 0x03,
+    ];
+
+    #[test]
+    fn pdu_session_setup_request_from_core_decodes() {
+        let decoded = decode_ngap_pdu(&CORE_PDU_SESSION_SETUP_REQUEST)
+            .expect("sim must decode core PDU Session Setup Request envelope");
+        match decoded {
+            NGAP_PDU::InitiatingMessage(msg) => {
+                assert_eq!(
+                    msg.procedure_code.0, 29,
+                    "PDUSessionResourceSetup procedure code"
+                );
+            }
+            other => panic!("expected InitiatingMessage, got {other:?}"),
+        }
+    }
+
+    /// N2 SM `PDUSessionResourceSetupRequestTransfer` as emitted by the core
+    /// smfd `build_setup_request_transfer` via ogs-ngap `transfer.rs`
+    /// (UPF F-TEID 0x00010001, addr 10.45.0.1, QFI 1, 5QI 9, ARP 8). The gNB's
+    /// strict nextgsim-ngap transfer decoder must read it (the PDU-session
+    /// data-plane blocker was the smfd's old hand-rolled 12-byte layout).
+    const SMFD_SETUP_REQUEST_TRANSFER: [u8; 32] = [
+        0x00, 0x03, 0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0, 0x0a, 0x2d, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x86, 0x00, 0x01, 0x00, 0x00, 0x88, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x09,
+        0x1c, 0x00,
+    ];
+
+    #[test]
+    fn smfd_setup_request_transfer_decodes_in_gnb() {
+        use crate::procedures::transfer::decode_setup_request_transfer;
+        let data =
+            decode_setup_request_transfer(&SMFD_SETUP_REQUEST_TRANSFER).expect("gNB must decode");
+        // UPF N3 F-TEID carried for the uplink tunnel
+        assert_eq!(data.ul_tunnel.teid, 0x0001_0001);
+        assert_eq!(data.ul_tunnel.address.to_string(), "10.45.0.1");
+        assert_eq!(data.qos_flows.len(), 1);
+        assert_eq!(data.qos_flows[0].qfi, 1);
+        assert_eq!(data.qos_flows[0].five_qi, Some(9));
+    }
+
+    /// The gNB's `PDUSessionResourceSetupResponseTransfer` (real APER) must
+    /// decode in the core. This dumps the sim's encoding so the matching core
+    /// test (smfd) can pin and decode it; here we assert it self-decodes and
+    /// carries the gNB DL F-TEID the SMF needs for the PFCP DL FAR.
+    #[test]
+    fn gnb_setup_response_transfer_roundtrips() {
+        use crate::procedures::transfer::{
+            decode_setup_response_transfer, encode_setup_response_transfer, GtpTunnelInfo,
+            SetupResponseTransferParams,
+        };
+        let params = SetupResponseTransferParams {
+            dl_tunnel: GtpTunnelInfo {
+                address: "10.46.0.1".parse().unwrap(),
+                teid: 0x0002_0002,
+            },
+            accepted_qfis: vec![1],
+            failed_qos_flows: vec![],
+        };
+        let bytes = encode_setup_response_transfer(&params).expect("gNB encodes response transfer");
+        let decoded = decode_setup_response_transfer(&bytes).expect("self-decode");
+        assert_eq!(decoded.dl_tunnel.teid, 0x0002_0002);
+        assert_eq!(decoded.accepted_qfis, vec![1]);
+        // Pin the wire bytes so the core smfd cross-codec test can decode them.
+        assert_eq!(
+            bytes,
+            vec![0x00, 0x03, 0xe0, 0x0a, 0x2e, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01,]
+        );
+    }
 }

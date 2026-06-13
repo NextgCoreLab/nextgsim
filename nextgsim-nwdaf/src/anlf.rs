@@ -378,7 +378,11 @@ impl Anlf {
         let fallback = OnnxPredictor::new().ok();
 
         Self {
-            anomaly_detector: AnomalyDetector::new(2.5, 200).with_min_samples(10),
+            // Robust (median/MAD) scoring: network KPIs (load, latency,
+            // throughput) are skewed, so the Gaussian z-score over-flags.
+            anomaly_detector: AnomalyDetector::new(2.5, 200)
+                .with_min_samples(10)
+                .with_robust_scoring(),
             fallback_predictor: fallback,
             supported_analytics: vec![
                 AnalyticsId::UeMobility,

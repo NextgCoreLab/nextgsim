@@ -258,6 +258,7 @@ The UE sends heartbeat messages to all addresses in this list and connects to th
 | `sessions[].s_nssai.sst` | u8 | Yes | - | Slice/Service Type |
 | `sessions[].s_nssai.sd` | [u8; 3] | No | null | Slice Differentiator |
 | `sessions[].is_emergency` | bool | No | false | Whether this is an emergency session |
+| `sessions[].requested_5qi` | u8 | No | null | Requested 5QI for the session. Set to an XR delay-critical GBR 5QI (`82`-`85`, Rel-18) to request an XR flow; with no `apn`, the UE auto-selects the matching XR DNN (`xr`/`xr-split`/`xr-haptic`) so the SMF installs an XR QoS flow. See [Rel-17/18 Features](#rel-1718-feature-configuration-ue). |
 
 #### Network Slicing
 
@@ -273,6 +274,32 @@ The UE sends heartbeat messages to all addresses in this list and connects to th
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `tun_name` | string | No | null | Name for the TUN interface (e.g., `uesimtun0`). If not specified, a name is auto-generated |
+
+#### Rel-17/18 Feature Configuration (UE)
+
+These optional UE fields drive the Rel-17/18 features that are integrated end-to-end with nextgcore. Each is inert unless set.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `redcap` | bool | false | **RedCap** (Reduced Capability, Rel-17 / TS 38.101). When `true`, the UE signals a reduced-capability indication in the Registration Request (NAS IE `0xA9`); the AMF caps UE-AMBR and the SMF reduces the session-AMBR (default 150 Mbps DL / 50 Mbps UL, overridable on the SMF via `REDCAP_SESS_AMBR_DL_BPS` / `REDCAP_SESS_AMBR_UL_BPS`). |
+| `snpn_config` | object | null | **SNPN** access (Rel-17 / TS 23.501 §5.30). Presence makes the UE include the NID in the Registration Request and gate cell selection to a matching broadcast NID. |
+| `snpn_config.nid` | string | - | 11-hex-char Network Identifier (e.g. `"7AB01234567"`). Must match the gNB's broadcast NID; the AMF accepts it only if it is in `AMF_SNPN_ALLOWED_NIDS` (or that env is unset = accept any), otherwise rejects with 5GMM cause #75. |
+| `snpn_config.cag_ids` | [u32] | [] | Closed Access Group IDs. |
+| `snpn_config.onboarding_enabled` | bool | false | Request SNPN onboarding / credentials provisioning. |
+| `mint_config` | object | null | **MINT** / disaster roaming (Rel-18 / TS 23.761). Models a multi-SUPI UE that, after the primary registers, runs a simultaneous registration per secondary SUPI carrying the disaster-roaming indication (NAS IE `0xA7`). |
+| `mint_config.enabled` | bool | false | Enable the MINT secondary-subscription driver. |
+| `mint_config.secondary_supis` | [string] | [] | Secondary SUPIs (each must be provisioned in the core's subscriber DB). |
+| `mint_config.simultaneous_registration` | bool | false | Register secondaries alongside the primary. |
+| `mint_config.disaster_roaming` | bool | false | Set the disaster-roaming indication on secondary registrations. |
+| `mint_config.dnn_subscription_map` | array | [] | Map a session DNN to a secondary subscription index, so that DNN's PDU session is established under the secondary SUPI. |
+| `uav_config` | object | null | **UAV** (Rel-18 / TS 23.256). Registers the UE as an aerial UE and periodically sends a UAV tracking report the AMF checks against its geofence. |
+| `uav_config.is_aerial_ue` | bool | false | Register as an aerial UE (includes UAV indication NAS IE `0xA8`). |
+| `uav_config.uav_id` | string | null | UAV CAA-level identifier. |
+| `uav_config.max_altitude_meters` | f64 | - | Reported flight altitude. Above the AMF geofence ceiling (`AMF_UAV_GEOFENCE`, default 120 m) → the AMF revokes authorization (geofence deny); within bounds → allow. |
+| `uav_config.remote_id_enabled` | bool | false | Include Remote-ID in tracking reports. |
+| `uav_config.c2_link_required` | bool | false | Request a command-and-control link (modelled). |
+
+> The corresponding nextgcore env knobs (`AMF_SNPN_ALLOWED_NIDS`, `AMF_UAV_GEOFENCE`, `REDCAP_SESS_AMBR_DL_BPS`/`_UL_BPS`, the XR DNN→5QI mapping) and ready-to-run example configs are documented in `nextgcore/docker/rust/README.md` and `nextgsim/config/features/`.
 
 ---
 

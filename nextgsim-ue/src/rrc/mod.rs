@@ -45,6 +45,7 @@ pub mod measurement;
 pub mod redcap;
 pub mod reestablishment;
 pub mod resume;
+pub mod security;
 pub mod state;
 pub mod task;
 pub mod uav;
@@ -70,9 +71,10 @@ pub use reestablishment::{
     N310_DEFAULT, N311_DEFAULT, T301_DEFAULT_MS, T311_DEFAULT_MS,
 };
 pub use resume::{
-    ResumeCause, ResumeCompleteParams, ResumeError, ResumeProcedure, ResumeProcedureState,
-    ResumeRequestParams, T319_DEFAULT_MS,
+    ResumeCause, ResumeCompleteParams, ResumeError, ResumeIdentity, ResumeProcedure,
+    ResumeProcedureState, ResumeRequestParams, T319_DEFAULT_MS,
 };
+pub use security::{compute_short_mac_i, AsSecurityContext, IntegrityAlgorithm, ShortMacError};
 pub use state::{RrcState, RrcStateError, RrcStateMachine, RrcStateTransition};
 pub use task::RrcTask;
 pub use uav::{

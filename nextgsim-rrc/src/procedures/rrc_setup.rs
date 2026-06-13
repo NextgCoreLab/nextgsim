@@ -345,6 +345,30 @@ pub enum Ng5gSTmsiValue {
     Part2(u16),
 }
 
+/// RegisteredAMF for RRC Setup Complete (TS 38.331 §6.2.2)
+///
+/// Identifies the AMF the UE is registered with from a previous registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredAmfParams {
+    /// PLMN identity as MCC digits (optional) and MNC digits (2 or 3)
+    pub plmn: Option<RegisteredAmfPlmn>,
+    /// AMF Region ID (8 bits)
+    pub amf_region_id: u8,
+    /// AMF Set ID (10 bits)
+    pub amf_set_id: u16,
+    /// AMF Pointer (6 bits)
+    pub amf_pointer: u8,
+}
+
+/// PLMN digits for the RegisteredAMF IE
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredAmfPlmn {
+    /// MCC digits (exactly 3, each 0-9), optional in PLMN-Identity
+    pub mcc: Option<[u8; 3]>,
+    /// MNC digits (2 or 3, each 0-9)
+    pub mnc: Vec<u8>,
+}
+
 /// Parameters for building an RRC Setup Complete message
 #[derive(Debug, Clone)]
 pub struct RrcSetupCompleteParams {
@@ -352,6 +376,8 @@ pub struct RrcSetupCompleteParams {
     pub rrc_transaction_id: u8,
     /// Selected PLMN Identity index (1-12)
     pub selected_plmn_identity: u8,
+    /// Registered AMF from a previous registration (optional)
+    pub registered_amf: Option<RegisteredAmfParams>,
     /// GUAMI type (optional)
     pub guami_type: Option<GuamiType>,
     /// S-NSSAI list (optional)
@@ -360,7 +386,17 @@ pub struct RrcSetupCompleteParams {
     pub dedicated_nas_message: Vec<u8>,
     /// 5G-S-TMSI value (optional)
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
+    /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.331 §6.2.2
+    /// `redCapIndication` in RRCSetupComplete-v1700-IEs). The Rel-15.6 ASN.1
+    /// schema used here predates the v1700 IE group, so the indication is
+    /// carried as a minimal TLV inside the spec-legal `lateNonCriticalExtension`
+    /// OCTET STRING container (the same octet-container pattern used to
+    /// ride later-release IEs over the Rel-15 schema).
+    pub redcap_indication: bool,
 }
+
+/// Tag for the RedCap indication TLV inside `lateNonCriticalExtension`.
+const REDCAP_LNCE_TAG: u8 = 0x52; // 'R'
 
 /// Parsed RRC Setup Complete data
 #[derive(Debug, Clone)]
@@ -369,6 +405,8 @@ pub struct RrcSetupCompleteData {
     pub rrc_transaction_id: u8,
     /// Selected PLMN Identity index
     pub selected_plmn_identity: u8,
+    /// Registered AMF
+    pub registered_amf: Option<RegisteredAmfParams>,
     /// GUAMI type
     pub guami_type: Option<GuamiType>,
     /// S-NSSAI list
@@ -377,6 +415,9 @@ pub struct RrcSetupCompleteData {
     pub dedicated_nas_message: Vec<u8>,
     /// 5G-S-TMSI value
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
+    /// RedCap (Reduced Capability) UE indication (Rel-17), recovered from the
+    /// `lateNonCriticalExtension` octet container (see [`RrcSetupCompleteParams`]).
+    pub redcap_indication: bool,
 }
 
 /// Build an RRC Setup Complete message
@@ -452,16 +493,35 @@ pub fn build_rrc_setup_complete(
         }
     });
 
+    // Build RegisteredAMF if present (TS 38.331 §6.2.2)
+    let registered_amf = params
+        .registered_amf
+        .as_ref()
+        .map(build_registered_amf)
+        .transpose()?;
+
+    // RedCap indication (Rel-17): carried as a minimal TLV in the spec-legal
+    // lateNonCriticalExtension OCTET STRING when set.
+    let late_non_critical_extension = if params.redcap_indication {
+        Some(RRCSetupComplete_IEsLateNonCriticalExtension(vec![
+            REDCAP_LNCE_TAG,
+            1, // length
+            1, // value: RedCap = true
+        ]))
+    } else {
+        None
+    };
+
     let rrc_setup_complete_ies = RRCSetupComplete_IEs {
         selected_plmn_identity: RRCSetupComplete_IEsSelectedPLMN_Identity(
             params.selected_plmn_identity,
         ),
-        registered_amf: None, // Simplified - not including RegisteredAMF for now
+        registered_amf,
         guami_type,
         s_nssai_list,
         dedicated_nas_message: DedicatedNAS_Message(params.dedicated_nas_message.clone()),
         ng_5g_s_tmsi_value,
-        late_non_critical_extension: None,
+        late_non_critical_extension,
         non_critical_extension: None,
     };
 
@@ -548,14 +608,118 @@ pub fn parse_rrc_setup_complete(
         }
     });
 
+    // Parse RegisteredAMF
+    let registered_amf = ies.registered_amf.as_ref().map(parse_registered_amf);
+
+    // RedCap indication (Rel-17): recovered from the lateNonCriticalExtension
+    // octet container TLV emitted by the UE.
+    let redcap_indication = ies
+        .late_non_critical_extension
+        .as_ref()
+        .map(|lnce| parse_redcap_lnce(&lnce.0))
+        .unwrap_or(false);
+
     Ok(RrcSetupCompleteData {
         rrc_transaction_id: rrc_setup_complete.rrc_transaction_identifier.0,
         selected_plmn_identity: ies.selected_plmn_identity.0,
+        registered_amf,
         guami_type,
         s_nssai_list,
         dedicated_nas_message: ies.dedicated_nas_message.0.clone(),
         ng_5g_s_tmsi_value,
+        redcap_indication,
     })
+}
+
+/// Scan a `lateNonCriticalExtension` octet container for the RedCap indication
+/// TLV (`REDCAP_LNCE_TAG`, len, value). Returns true when present and set.
+fn parse_redcap_lnce(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let tag = bytes[i];
+        let len = bytes[i + 1] as usize;
+        let val_start = i + 2;
+        if val_start + len > bytes.len() {
+            break;
+        }
+        if tag == REDCAP_LNCE_TAG {
+            return bytes.get(val_start).copied().unwrap_or(0) != 0;
+        }
+        i = val_start + len;
+    }
+    false
+}
+
+/// Build a generated `RegisteredAMF` from typed parameters
+fn build_registered_amf(params: &RegisteredAmfParams) -> Result<RegisteredAMF, RrcSetupError> {
+    if params.amf_set_id > 0x3FF {
+        return Err(RrcSetupError::InvalidFieldValue(
+            "AMF Set ID must fit in 10 bits".to_string(),
+        ));
+    }
+    if params.amf_pointer > 0x3F {
+        return Err(RrcSetupError::InvalidFieldValue(
+            "AMF Pointer must fit in 6 bits".to_string(),
+        ));
+    }
+
+    let plmn_identity = params
+        .plmn
+        .as_ref()
+        .map(|plmn| -> Result<PLMN_Identity, RrcSetupError> {
+            if plmn.mnc.len() != 2 && plmn.mnc.len() != 3 {
+                return Err(RrcSetupError::InvalidFieldValue(
+                    "MNC must have 2 or 3 digits".to_string(),
+                ));
+            }
+            let mcc = plmn.mcc.map(|digits| {
+                MCC(vec![
+                    MCC_MNC_Digit(digits[0]),
+                    MCC_MNC_Digit(digits[1]),
+                    MCC_MNC_Digit(digits[2]),
+                ])
+            });
+            let mnc: Vec<MCC_MNC_Digit> = plmn.mnc.iter().map(|&d| MCC_MNC_Digit(d)).collect();
+            Ok(PLMN_Identity { mcc, mnc: MNC(mnc) })
+        })
+        .transpose()?;
+
+    // AMF-Identifier ::= BIT STRING (SIZE(24)): region(8) | set(10) | pointer(6)
+    let amf_identifier: u32 = ((params.amf_region_id as u32) << 16)
+        | ((params.amf_set_id as u32 & 0x3FF) << 6)
+        | (params.amf_pointer as u32 & 0x3F);
+    let mut amf_id_bv: BitVec<u8, Msb0> = BitVec::with_capacity(24);
+    for i in (0..24).rev() {
+        amf_id_bv.push((amf_identifier >> i) & 1 == 1);
+    }
+
+    Ok(RegisteredAMF {
+        plmn_identity,
+        amf_identifier: AMF_Identifier(amf_id_bv),
+    })
+}
+
+/// Parse a generated `RegisteredAMF` into typed parameters
+fn parse_registered_amf(registered: &RegisteredAMF) -> RegisteredAmfParams {
+    let plmn = registered.plmn_identity.as_ref().map(|plmn| {
+        let mcc = plmn.mcc.as_ref().and_then(|mcc| {
+            if mcc.0.len() == 3 {
+                Some([mcc.0[0].0, mcc.0[1].0, mcc.0[2].0])
+            } else {
+                None
+            }
+        });
+        let mnc = plmn.mnc.0.iter().map(|d| d.0).collect();
+        RegisteredAmfPlmn { mcc, mnc }
+    });
+
+    let amf_identifier = bitvec_to_u64(&registered.amf_identifier.0) as u32;
+    RegisteredAmfParams {
+        plmn,
+        amf_region_id: ((amf_identifier >> 16) & 0xFF) as u8,
+        amf_set_id: ((amf_identifier >> 6) & 0x3FF) as u16,
+        amf_pointer: (amf_identifier & 0x3F) as u8,
+    }
 }
 
 // ============================================================================
@@ -717,13 +881,34 @@ mod tests {
 
     fn create_test_setup_complete_params() -> RrcSetupCompleteParams {
         RrcSetupCompleteParams {
+            registered_amf: None,
             rrc_transaction_id: 0,
             selected_plmn_identity: 1,
             guami_type: None,
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E, 0x00, 0x41], // Sample NAS message
             ng_5g_s_tmsi_value: None,
+            redcap_indication: false,
         }
+    }
+
+    #[test]
+    fn test_rrc_setup_complete_redcap_roundtrip() {
+        // RedCap set: indication survives UPER encode/decode via the
+        // lateNonCriticalExtension octet container.
+        let mut params = create_test_setup_complete_params();
+        params.redcap_indication = true;
+
+        let bytes = encode_rrc_setup_complete(&params).unwrap();
+        let data = decode_rrc_setup_complete(&bytes).unwrap();
+        assert!(data.redcap_indication, "RedCap indication must round-trip");
+        assert_eq!(data.dedicated_nas_message, params.dedicated_nas_message);
+
+        // RedCap not set: default decode yields false.
+        let params_off = create_test_setup_complete_params();
+        let bytes_off = encode_rrc_setup_complete(&params_off).unwrap();
+        let data_off = decode_rrc_setup_complete(&bytes_off).unwrap();
+        assert!(!data_off.redcap_indication);
     }
 
     #[test]
@@ -752,6 +937,7 @@ mod tests {
     #[test]
     fn test_rrc_setup_complete_with_optional_fields() {
         let params = RrcSetupCompleteParams {
+            registered_amf: None,
             rrc_transaction_id: 2,
             selected_plmn_identity: 3,
             guami_type: Some(GuamiType::Native),
@@ -764,6 +950,7 @@ mod tests {
             ]),
             dedicated_nas_message: vec![0x7E, 0x00, 0x41, 0x01, 0x02],
             ng_5g_s_tmsi_value: Some(Ng5gSTmsiValue::Full(0x123456789ABC)),
+            redcap_indication: false,
         };
 
         let msg = build_rrc_setup_complete(&params).unwrap();
@@ -795,12 +982,14 @@ mod tests {
     #[test]
     fn test_invalid_rrc_transaction_id() {
         let params = RrcSetupCompleteParams {
+            registered_amf: None,
             rrc_transaction_id: 5, // Invalid: must be 0-3
             selected_plmn_identity: 1,
             guami_type: None,
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: None,
+            redcap_indication: false,
         };
 
         let result = build_rrc_setup_complete(&params);
@@ -810,12 +999,14 @@ mod tests {
     #[test]
     fn test_invalid_selected_plmn_identity() {
         let params = RrcSetupCompleteParams {
+            registered_amf: None,
             rrc_transaction_id: 0,
             selected_plmn_identity: 0, // Invalid: must be 1-12
             guami_type: None,
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: None,
+            redcap_indication: false,
         };
 
         let result = build_rrc_setup_complete(&params);
@@ -825,16 +1016,52 @@ mod tests {
     #[test]
     fn test_5g_s_tmsi_part2() {
         let params = RrcSetupCompleteParams {
+            registered_amf: None,
             rrc_transaction_id: 0,
             selected_plmn_identity: 1,
             guami_type: None,
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: Some(Ng5gSTmsiValue::Part2(0x1FF)), // Max 9-bit value
+            redcap_indication: false,
         };
 
         let msg = build_rrc_setup_complete(&params).unwrap();
         let data = parse_rrc_setup_complete(&msg).unwrap();
         assert_eq!(data.ng_5g_s_tmsi_value, Some(Ng5gSTmsiValue::Part2(0x1FF)));
+    }
+
+    #[test]
+    fn test_setup_complete_with_registered_amf_roundtrip() {
+        let registered = RegisteredAmfParams {
+            plmn: Some(RegisteredAmfPlmn {
+                mcc: Some([0, 0, 1]),
+                mnc: vec![0, 1],
+            }),
+            amf_region_id: 0x02,
+            amf_set_id: 0x001,
+            amf_pointer: 0x01,
+        };
+        let params = RrcSetupCompleteParams {
+            registered_amf: Some(registered.clone()),
+            ..create_test_setup_complete_params()
+        };
+        let bytes = encode_rrc_setup_complete(&params).unwrap();
+        let data = decode_rrc_setup_complete(&bytes).unwrap();
+        assert_eq!(data.registered_amf, Some(registered));
+    }
+
+    #[test]
+    fn test_registered_amf_rejects_out_of_range() {
+        let params = RrcSetupCompleteParams {
+            registered_amf: Some(RegisteredAmfParams {
+                plmn: None,
+                amf_region_id: 1,
+                amf_set_id: 0x400, // 11 bits - invalid
+                amf_pointer: 0,
+            }),
+            ..create_test_setup_complete_params()
+        };
+        assert!(build_rrc_setup_complete(&params).is_err());
     }
 }

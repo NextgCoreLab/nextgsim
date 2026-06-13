@@ -15,8 +15,10 @@ pub mod nas_transport;
 pub mod ng_setup;
 pub mod ntn_support;
 pub mod paging;
+pub mod path_switch;
 pub mod pdu_session_resource;
 pub mod ran_configuration_update;
+pub mod transfer;
 pub mod ue_context_release;
 
 pub use error_indication::*;

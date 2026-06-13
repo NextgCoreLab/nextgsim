@@ -5,3 +5,7 @@
 
 # Build artifacts — regenerate via Dockerfile.builder
 /binaries/
+
+# Local tooling (GitNexus code-intelligence index + Claude Code local config)
+.gitnexus
+.claude/

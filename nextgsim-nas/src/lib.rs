@@ -124,9 +124,9 @@ pub use ies::{
     TypeOfSecurityContext,
 };
 pub use security::{
-    compute_nas_mac, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
+    compute_nas_mac, nas_cipher, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
     NasDirection, NasKeySetIdentifier, NasSecurityAlgorithms, SecuredNasMessage,
-    SecurityContextType, SecurityError, NAS_BEARER,
+    SecurityContextType, SecurityError, NAS_BEARER, NAS_BEARER_NON_3GPP,
 };
 
 // Re-export EAP types

@@ -998,10 +998,15 @@ impl NasCount {
     }
 }
 
-/// NAS bearer identity for integrity/ciphering
+/// NAS bearer identity for integrity/ciphering over 3GPP access
 ///
-/// For NAS messages, the bearer is always 0 as per 3GPP TS 33.501.
-pub const NAS_BEARER: u8 = 0;
+/// Per 3GPP TS 33.501 Section 6.4.3.1, the BEARER input for NAS security
+/// is the NAS connection identifier: 0x01 for 3GPP access, 0x02 for
+/// non-3GPP access.
+pub const NAS_BEARER: u8 = 0x01;
+
+/// NAS connection identifier for non-3GPP access (TS 33.501 Section 6.4.3.1)
+pub const NAS_BEARER_NON_3GPP: u8 = 0x02;
 
 /// Direction values for NAS security
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1166,6 +1171,43 @@ pub fn verify_nas_mac(
         Ok(())
     } else {
         Err(SecurityError::MacVerificationFailed)
+    }
+}
+
+/// Apply NAS ciphering (encryption or decryption) in place
+///
+/// Implements 5G NAS ciphering per 3GPP TS 33.501 Section 6.4.4 / Annex D.
+/// CTR-mode-style stream ciphers are symmetric, so the same function is used
+/// for both encryption and decryption.
+///
+/// # Parameters
+/// - `algorithm`: The ciphering algorithm (NEA0-NEA3)
+/// - `key`: 128-bit ciphering key (`KNASenc`)
+/// - `count`: NAS COUNT value
+/// - `bearer`: NAS connection identifier (`NAS_BEARER` for 3GPP access)
+/// - `direction`: Direction (uplink or downlink)
+/// - `data`: Payload to cipher/decipher in place
+pub fn nas_cipher(
+    algorithm: CipheringAlgorithm,
+    key: &[u8; KEY_SIZE],
+    count: &NasCount,
+    bearer: u8,
+    direction: NasDirection,
+    data: &mut [u8],
+) {
+    match algorithm {
+        CipheringAlgorithm::Nea0 => {
+            // NEA0 is null ciphering - data unchanged
+        }
+        CipheringAlgorithm::Nea1 => {
+            nextgsim_crypto::nea::nea1_encrypt(count.to_u32(), bearer, direction as u8, key, data);
+        }
+        CipheringAlgorithm::Nea2 => {
+            nextgsim_crypto::nea::nea2_encrypt(count.to_u32(), bearer, direction as u8, key, data);
+        }
+        CipheringAlgorithm::Nea3 => {
+            nextgsim_crypto::zuc::nea3_encrypt(count.to_u32(), bearer, direction as u8, key, data);
+        }
     }
 }
 
@@ -1755,8 +1797,10 @@ mod tests {
 
     #[test]
     fn test_nas_bearer_constant() {
-        // NAS bearer should always be 0 per 3GPP spec
-        assert_eq!(NAS_BEARER, 0);
+        // NAS connection identifier per TS 33.501 Section 6.4.3.1:
+        // 0x01 for 3GPP access, 0x02 for non-3GPP access
+        assert_eq!(NAS_BEARER, 0x01);
+        assert_eq!(NAS_BEARER_NON_3GPP, 0x02);
     }
 
     // ============================================
@@ -2167,14 +2211,14 @@ mod tests {
         // First derivation with Nea2/Nia2
         ctx.derive_nas_keys(CipheringAlgorithm::Nea2, IntegrityAlgorithm::Nia2)
             .unwrap();
-        let first_enc = ctx.keys().knas_enc().unwrap().clone();
-        let first_int = ctx.keys().knas_int().unwrap().clone();
+        let first_enc = *ctx.keys().knas_enc().unwrap();
+        let first_int = *ctx.keys().knas_int().unwrap();
 
         // Second derivation with Nea1/Nia1 (different algorithm IDs → different keys)
         ctx.derive_nas_keys(CipheringAlgorithm::Nea1, IntegrityAlgorithm::Nia1)
             .unwrap();
-        let second_enc = ctx.keys().knas_enc().unwrap().clone();
-        let second_int = ctx.keys().knas_int().unwrap().clone();
+        let second_enc = *ctx.keys().knas_enc().unwrap();
+        let second_int = *ctx.keys().knas_int().unwrap();
 
         // Keys should differ because algorithm ID is input to KDF
         assert_ne!(first_enc, second_enc);
@@ -2240,5 +2284,98 @@ mod tests {
         assert!(ctx.is_null());
         ctx.set_inactive();
         assert_eq!(ctx.state(), SecurityContextState::Inactive);
+    }
+
+    /// Cross-stack NAS-security regression vector (TS 33.501 + TS 33.401
+    /// Annex B.2.3). This vector is MIRRORED BYTE-FOR-BYTE in the nextgcore
+    /// AMF at bins/nextgcore-amfd/src/nas_security.rs
+    /// (`test_cross_stack_nas_security_reference_vector`). The expected
+    /// values below were computed by the core and must equal what the
+    /// simulator computes; if either side's KAMF / KNAS_int derivation or
+    /// NAS-MAC/NEA2 input layout drifts, one repo's copy of this test
+    /// fails. This is the guard against the direction-bit-position
+    /// divergence (UE used bit 2, the AMF erroneously used bit 0) that
+    /// stalled registration at the Security Mode Command.
+    ///
+    /// Inputs: fixed KSEAF, SUPI digits 999700000000001, ABBA [0,0],
+    /// NIA2/NEA2, a representative integrity-only SMC payload, COUNT 0,
+    /// BEARER 1 (3GPP, `NAS_BEARER`), DIRECTION downlink.
+    #[test]
+    fn test_cross_stack_nas_security_reference_vector() {
+        use nextgsim_crypto::kdf::{derive_kamf, derive_knas_enc, derive_knas_int};
+
+        // -- fixed inputs (shared with the core) --
+        let kseaf: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        // The UE feeds the digits-only SUPI to the KAMF KDF (matching the
+        // core's ogs_id_get_value("imsi-...") convention).
+        let supi = "999700000000001";
+        let abba = [0x00u8, 0x00];
+
+        // -- KAMF (TS 33.501 Annex A.7) --
+        let kamf = derive_kamf(&kseaf, supi.as_bytes(), &abba);
+        let expected_kamf: [u8; 32] = [
+            84, 220, 101, 65, 23, 243, 138, 4, 80, 226, 49, 139, 229, 104, 34, 238, 12, 174, 245,
+            76, 108, 223, 167, 207, 103, 220, 31, 103, 8, 43, 231, 105,
+        ];
+        assert_eq!(kamf, expected_kamf, "KAMF derivation drifted from the core");
+
+        // -- KNAS_int / KNAS_enc (TS 33.501 Annex A.8, NIA2/NEA2 = 0x02) --
+        let knas_int = derive_knas_int(&kamf, 0x02);
+        let knas_enc = derive_knas_enc(&kamf, 0x02);
+        let expected_knas_int: [u8; 16] = [
+            38, 115, 160, 80, 204, 200, 220, 83, 104, 212, 33, 203, 134, 23, 71, 52,
+        ];
+        let expected_knas_enc: [u8; 16] = [
+            68, 137, 172, 160, 32, 35, 251, 95, 219, 157, 215, 44, 26, 246, 150, 231,
+        ];
+        assert_eq!(
+            knas_int, expected_knas_int,
+            "KNAS_int derivation drifted from the core"
+        );
+        assert_eq!(
+            knas_enc, expected_knas_enc,
+            "KNAS_enc derivation drifted from the core"
+        );
+
+        // -- NAS-MAC over a representative SMC payload (TS 33.401 B.2.3) --
+        // COUNT 0, BEARER 1 (NAS_BEARER, 3GPP), DIRECTION downlink, NIA2.
+        let smc_payload: [u8; 8] = [0x7e, 0x03, 0x02, 0x00, 0x02, 0xe0, 0xe0, 0xe1];
+        // `compute_nas_mac(sqn=0, smc_payload)` MACs over SQN || payload
+        // (TS 24.501 Section 4.4.3.3), the same input the core's reference
+        // builds; the expected MAC therefore matches the core test.
+        let mac = compute_nas_mac(
+            IntegrityAlgorithm::Nia2,
+            &knas_int,
+            &NasCount::new(0, 0),
+            NasDirection::Downlink,
+            0,
+            &smc_payload,
+        );
+        let expected_mac: [u8; 4] = [197, 118, 67, 44];
+        assert_eq!(
+            mac, expected_mac,
+            "NAS-MAC (NIA2) input layout drifted from the core"
+        );
+
+        // -- NEA2 ciphering of the same payload (TS 33.501 Annex D.3) --
+        let mut ciphered = smc_payload.to_vec();
+        nas_cipher(
+            CipheringAlgorithm::Nea2,
+            &knas_enc,
+            &NasCount::new(0, 0),
+            NAS_BEARER,
+            NasDirection::Downlink,
+            &mut ciphered,
+        );
+        let expected_ciphered: [u8; 8] = [231, 2, 38, 222, 206, 212, 137, 8];
+        assert_eq!(
+            ciphered.as_slice(),
+            &expected_ciphered,
+            "NEA2 IV layout drifted from the core"
+        );
     }
 }

@@ -1,13 +1,14 @@
-# UE Configuration for local testing (host machine)
-# gNB is running locally at 127.0.0.1:4997
-
+# Rel-17/18 feature test — SNPN reject, Rel-17 (TS 23.501 §5.30).
+# UE carries a bogus NID 00000000000; gNB broadcasts that NID so the UE camps
+# (gnb-snpn-reject.yaml), but the AMF is started with
+# AMF_SNPN_ALLOWED_NIDS=7AB01234567, so the NID fails validation and the AMF
+# returns Registration Reject (5GMM cause #75). Exercises:
+#   UE  : "SNPN registration: including NID=00000000000"
+#   AMF : "SNPN registration rejected: NID=00000000000 not in allowed list"
 supi:
   supi_type: Imsi
   value: "999700000000001"
 
-# SUCI protection (TS 33.501 Annex C): 0=null, 1=Profile A, 2=Profile B.
-# See config/ue.yaml for the Annex C.4 test vector public keys matching the
-# nextgcore hnet provisioning (key id 1 = Profile A, key id 2 = Profile B).
 protection_scheme: 0
 home_network_public_key_id: 0
 home_network_public_key: []
@@ -18,13 +19,10 @@ hplmn:
   mnc: 70
   long_mnc: false
 
-# Test key and OPc
 key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
 op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
 op_type: Opc
-
 amf: [0x80, 0x00]
-
 imei: "356938035643803"
 imei_sv: null
 
@@ -36,9 +34,8 @@ supported_algs:
   nea2: true
   nea3: true
 
-# Local gNB (running on localhost)
 gnb_search_list:
-  - "127.0.0.1"
+  - "172.23.0.100"
 
 sessions:
   - type: Ipv4
@@ -54,3 +51,11 @@ configured_nssai:
       sd: null
 
 tun_name: "uesimtun0"
+
+redcap: false
+
+# --- Feature under test: SNPN with a NID NOT in the AMF allowed list ---
+snpn_config:
+  nid: "00000000000"
+  cag_ids: []
+  onboarding_enabled: false

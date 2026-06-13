@@ -21,6 +21,7 @@ pub mod rrc_setup;
 pub mod security_mode;
 pub mod sub_thz_config;
 pub mod system_information;
+pub mod ue_capability;
 pub mod xr_cdrx;
 
 pub use ai_ml_config::*;
@@ -46,4 +47,5 @@ pub use rrc_setup::*;
 pub use security_mode::*;
 pub use sub_thz_config::*;
 pub use system_information::*;
+pub use ue_capability::*;
 pub use xr_cdrx::*;

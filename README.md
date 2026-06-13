@@ -6,6 +6,7 @@ A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulato
 
 - **Pure Rust**: No C/C++ dependencies, fully memory-safe
 - **5G-SA Support**: Complete 5G Standalone network simulation
+- **Rel-17/18 features**: RedCap, XR 5QI, SNPN (NID), MINT/disaster-roaming, and UAV aerial-UE registration, integrated end-to-end with nextgcore (UE config knobs in `docs/configuration.md` → Rel-17/18 Feature Configuration; example configs in `config/features/`)
 - **6G AI-Native**: Full 6G AI architecture with ML inference, federated learning, and semantic communication
 - **Cryptography**: Milenage, SNOW3G, ZUC, AES-based NEA/NIA algorithms, ECIES
 - **Protocol Support**: NAS, NGAP (ASN.1 PER), RRC (ASN.1 UPER), GTP-U, SCTP

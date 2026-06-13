@@ -156,14 +156,19 @@ impl GprsTimer3Unit {
     }
 
     /// Create from the 3-bit unit field in GPRS Timer 3 IE
+    ///
+    /// Unit mapping per 3GPP TS 24.008 Section 10.5.7.4a (GPRS Timer 3):
+    /// 000 = 10 minutes, 001 = 1 hour, 010 = 10 hours, 011 = 2 seconds,
+    /// 100 = 30 seconds, 101 = 1 minute, 110 = 320 hours,
+    /// 111 = deactivated.
     pub fn from_bits(bits: u8) -> Self {
         match bits & 0x07 {
-            0 => GprsTimer3Unit::MultiplesOf2Sec,
-            1 => GprsTimer3Unit::MultiplesOf1Min,
-            2 => GprsTimer3Unit::MultiplesOf10Min,
-            3 => GprsTimer3Unit::MultiplesOf1Hour,
-            4 => GprsTimer3Unit::MultiplesOf10Hour,
-            5 => GprsTimer3Unit::MultiplesOf30Sec,
+            0 => GprsTimer3Unit::MultiplesOf10Min,
+            1 => GprsTimer3Unit::MultiplesOf1Hour,
+            2 => GprsTimer3Unit::MultiplesOf10Hour,
+            3 => GprsTimer3Unit::MultiplesOf2Sec,
+            4 => GprsTimer3Unit::MultiplesOf30Sec,
+            5 => GprsTimer3Unit::MultiplesOf1Min,
             6 => GprsTimer3Unit::MultiplesOf320Hour,
             _ => GprsTimer3Unit::Deactivated,
         }
@@ -903,11 +908,22 @@ mod tests {
 
     #[test]
     fn test_gprs_timer3_from_byte() {
-        // Unit = 1 (1 min), value = 10 -> byte = 0b001_01010 = 0x2A
-        let timer = GprsTimer3::from_byte(0x2A);
+        // TS 24.008 10.5.7.4a: unit = 101 (1 min), value = 10
+        // -> byte = 0b101_01010 = 0xAA
+        let timer = GprsTimer3::from_byte(0xAA);
         assert_eq!(timer.unit, GprsTimer3Unit::MultiplesOf1Min);
         assert_eq!(timer.timer_value, 10);
         assert_eq!(timer.to_seconds(), 600);
+
+        // unit = 000 (10 min), value = 9 -> 0x09 = 90 minutes
+        let timer = GprsTimer3::from_byte(0x09);
+        assert_eq!(timer.unit, GprsTimer3Unit::MultiplesOf10Min);
+        assert_eq!(timer.to_seconds(), 5400);
+
+        // unit = 111 -> deactivated
+        let timer = GprsTimer3::from_byte(0xE5);
+        assert_eq!(timer.unit, GprsTimer3Unit::Deactivated);
+        assert_eq!(timer.to_seconds(), 0);
     }
 
     #[test]

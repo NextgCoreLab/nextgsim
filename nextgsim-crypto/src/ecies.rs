@@ -481,6 +481,19 @@ pub fn generate_suci_profile_b(
     Ok(scheme_output)
 }
 
+/// Parse a P-256 public key from SEC1 bytes (compressed 33-byte or
+/// uncompressed 65-byte encoding).
+///
+/// # Errors
+/// Returns an error if the bytes are not a valid SEC1 encoding or the point
+/// is not on the P-256 curve.
+pub fn parse_p256_public_key(bytes: &[u8]) -> EciesResult<P256PublicKey> {
+    let point = EncodedPoint::from_bytes(bytes)
+        .map_err(|e| EciesError::InvalidPublicKey(format!("Invalid P-256 point encoding: {e}")))?;
+    Option::from(P256PublicKey::from_encoded_point(&point))
+        .ok_or_else(|| EciesError::InvalidPublicKey("Point not on P-256 curve".into()))
+}
+
 /// Decode SUCI scheme output for Profile B (P-256)
 ///
 /// Expects the format: `ephemeral_public_key_compressed (33 bytes) || ciphertext || mac_tag (8 bytes)`
@@ -508,6 +521,134 @@ pub fn decode_suci_profile_b(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// TS 33.501 Annex C.4.3 ECIES Profile A test vector.
+    ///
+    /// Proves the X9.63 KDF (SharedInfo = ephemeral public key), the
+    /// AES-128-CTR initial counter block, and the HMAC-SHA-256/64 tag are
+    /// wire-conformant. The fixed ephemeral key is injected via
+    /// [`ecies_encrypt_with_keypair`] for this test only.
+    #[test]
+    fn test_profile_a_ts33501_annex_c43_vector() {
+        let hn_priv: [u8; 32] =
+            unhex("c53c22208b61860b06c62e5406a7b330c2b577aa5558981510d128247d38bd1d")
+                .try_into()
+                .unwrap();
+        let hn_pub: [u8; 32] =
+            unhex("5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650")
+                .try_into()
+                .unwrap();
+        let eph_priv: [u8; 32] =
+            unhex("c80949f13ebe61af4ebdbd293ea4f942696b9e815d7e8f0096bbf6ed7de62256")
+                .try_into()
+                .unwrap();
+        let eph_pub_v = unhex("b2e92f836055a255837debf850b528997ce0201cb82adfe4be1f587d07d8457d");
+        let plaintext = unhex("00012080f6");
+        let expected_ciphertext = unhex("cb02352410");
+        let expected_mac = unhex("cddd9e730ef3fa87");
+
+        // Sanity: the home network public key derives from the private key
+        let hn_keypair = EciesKeyPair::from_seed(&hn_priv);
+        assert_eq!(&hn_keypair.public_key()[..], &hn_pub[..]);
+
+        // UE-side encryption with the fixed ephemeral key
+        let eph_keypair = EciesKeyPair::from_seed(&eph_priv);
+        assert_eq!(&eph_keypair.public_key()[..], &eph_pub_v[..]);
+        let (eph_pub, ciphertext, mac_tag) =
+            ecies_encrypt_with_keypair(&plaintext, &hn_pub, &eph_keypair).expect("encrypt");
+
+        assert_eq!(&eph_pub[..], &eph_pub_v[..], "ephemeral public key");
+        assert_eq!(&ciphertext[..], &expected_ciphertext[..], "ciphertext");
+        assert_eq!(&mac_tag[..], &expected_mac[..], "MAC tag");
+
+        // Exact scheme output bytes (TS 23.003 Section 2.2B layout)
+        let mut expected_scheme_output = Vec::new();
+        expected_scheme_output.extend_from_slice(&eph_pub_v);
+        expected_scheme_output.extend_from_slice(&expected_ciphertext);
+        expected_scheme_output.extend_from_slice(&expected_mac);
+        let mut scheme_output = Vec::new();
+        scheme_output.extend_from_slice(&eph_pub);
+        scheme_output.extend_from_slice(&ciphertext);
+        scheme_output.extend_from_slice(&mac_tag);
+        assert_eq!(scheme_output, expected_scheme_output, "scheme output");
+
+        // Home-network-side deconcealment recovers the plaintext
+        let decoded = decode_suci_profile_a(&scheme_output, &hn_priv).expect("decode");
+        assert_eq!(&decoded[..], &plaintext[..]);
+    }
+
+    /// TS 33.501 Annex C.4.4 ECIES Profile B test vector
+    /// (compressed ephemeral key variant).
+    #[test]
+    fn test_profile_b_ts33501_annex_c44_vector() {
+        let hn_priv: [u8; 32] =
+            unhex("f1ab1074477ebcc7f554ea1c5fc368b1616730155e0041ac447d6301975fecda")
+                .try_into()
+                .unwrap();
+        let hn_pub_compressed =
+            unhex("0272da71976234ce833a6907425867b82e074d44ef907dfb4b3e21c1c2256ebcd1");
+        let eph_priv: [u8; 32] =
+            unhex("99798858a1dc6a2c68637149a4b1dbfd1fdff5addd62a2142f06699ed7602529")
+                .try_into()
+                .unwrap();
+        let eph_pub_v = unhex("039aab8376597021e855679a9778ea0b67396e68c66df32c0f41e9acca2da9b9d1");
+        let plaintext = unhex("00012080f6");
+        let expected_ciphertext = unhex("46a33fc271");
+        let expected_mac = unhex("6ac7dae96aa30a4d");
+
+        // Sanity: the home network public key derives from the private key
+        let hn_keypair = EciesProfileBKeyPair::from_secret_bytes(&hn_priv).expect("hn key");
+        assert_eq!(
+            &hn_keypair.public_key_compressed()[..],
+            &hn_pub_compressed[..]
+        );
+
+        // UE-side encryption with the fixed ephemeral key
+        let hn_pub = parse_p256_public_key(&hn_pub_compressed).expect("parse hn pub");
+        let eph_keypair = EciesProfileBKeyPair::from_secret_bytes(&eph_priv).expect("eph key");
+        assert_eq!(&eph_keypair.public_key_compressed()[..], &eph_pub_v[..]);
+        let (eph_pub, ciphertext, mac_tag) =
+            ecies_profile_b_encrypt_with_keypair(&plaintext, &hn_pub, &eph_keypair)
+                .expect("encrypt");
+
+        assert_eq!(&eph_pub[..], &eph_pub_v[..], "ephemeral public key");
+        assert_eq!(&ciphertext[..], &expected_ciphertext[..], "ciphertext");
+        assert_eq!(&mac_tag[..], &expected_mac[..], "MAC tag");
+
+        // Exact scheme output bytes (TS 23.003 Section 2.2B layout)
+        let mut expected_scheme_output = Vec::new();
+        expected_scheme_output.extend_from_slice(&eph_pub_v);
+        expected_scheme_output.extend_from_slice(&expected_ciphertext);
+        expected_scheme_output.extend_from_slice(&expected_mac);
+        let mut scheme_output = Vec::new();
+        scheme_output.extend_from_slice(&eph_pub);
+        scheme_output.extend_from_slice(&ciphertext);
+        scheme_output.extend_from_slice(&mac_tag);
+        assert_eq!(scheme_output, expected_scheme_output, "scheme output");
+
+        // Home-network-side deconcealment recovers the plaintext
+        let hn_secret = hn_keypair.secret_key();
+        let decoded = decode_suci_profile_b(&scheme_output, hn_secret).expect("decode");
+        assert_eq!(&decoded[..], &plaintext[..]);
+    }
+
+    #[test]
+    fn test_parse_p256_public_key_invalid() {
+        // Not on curve / invalid encoding
+        assert!(parse_p256_public_key(&[0xFF; 33]).is_err());
+        // Wrong length
+        assert!(parse_p256_public_key(&[0x02; 16]).is_err());
+        // Valid compressed key parses
+        let kp = EciesProfileBKeyPair::generate();
+        assert!(parse_p256_public_key(&kp.public_key_compressed()).is_ok());
+    }
 
     #[test]
     fn test_x963_kdf_basic() {

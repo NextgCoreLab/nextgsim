@@ -685,7 +685,18 @@ pub struct ExtendedKalmanFilter {
     pub process_noise_accel: f64,
     /// Whether the filter has been initialised with a measurement.
     initialised: bool,
+    /// Normalized-innovation-squared (NIS) gate. A measurement whose
+    /// `y^T S^-1 y` exceeds this chi-square threshold is rejected as an outlier
+    /// rather than incorporated — preventing a single wild measurement from
+    /// yanking the state and destabilising the covariance. Default is generous
+    /// (`DEFAULT_NIS_GATE`); set [`f64::INFINITY`] to disable gating.
+    pub nis_gate: f64,
 }
+
+/// Default NIS gate. ~5-sigma for a 1-DOF measurement and well beyond the
+/// 3-DOF 99.9% chi-square bound (~16.3), so legitimate measurements pass while
+/// gross outliers are rejected.
+pub const DEFAULT_NIS_GATE: f64 = 25.0;
 
 impl ExtendedKalmanFilter {
     /// Creates a new EKF with a given initial position and velocity.
@@ -725,6 +736,7 @@ impl ExtendedKalmanFilter {
             covariance: p,
             process_noise_accel,
             initialised: true,
+            nis_gate: DEFAULT_NIS_GATE,
         }
     }
 
@@ -736,7 +748,23 @@ impl ExtendedKalmanFilter {
             covariance: Array2::eye(STATE_DIM) * 100.0,
             process_noise_accel,
             initialised: false,
+            nis_gate: DEFAULT_NIS_GATE,
         }
+    }
+
+    /// Sets the NIS outlier-rejection gate (chi-square threshold). Use
+    /// [`f64::INFINITY`] to accept every measurement.
+    pub fn with_nis_gate(mut self, nis_gate: f64) -> Self {
+        self.nis_gate = nis_gate;
+        self
+    }
+
+    /// Symmetrises the covariance in place: `P = (P + P^T) / 2`. Floating-point
+    /// round-off in the update steps can introduce tiny asymmetry that, left
+    /// unchecked, drives the filter to a non-physical (indefinite) covariance.
+    fn symmetrize_covariance(&mut self) {
+        let pt = self.covariance.t().to_owned();
+        self.covariance = (&self.covariance + &pt) * 0.5;
     }
 
     /// Returns whether the filter has received at least one measurement.
@@ -864,6 +892,12 @@ impl ExtendedKalmanFilter {
             return;
         }
 
+        // Reject gross outliers (normalized innovation squared) before they can
+        // yank the state / destabilise the covariance.
+        if (y * y) / s > self.nis_gate {
+            return;
+        }
+
         // Kalman gain K = P H^T / S   (6 x 1)
         let k = self.covariance.dot(&h.t()) / s;
 
@@ -895,6 +929,7 @@ impl ExtendedKalmanFilter {
             m
         };
         self.covariance = i_kh.dot(&self.covariance).dot(&i_kh.t()) + kr_kt;
+        self.symmetrize_covariance();
     }
 
     /// Update with a direct position measurement (e.g. from trilateration or
@@ -936,6 +971,12 @@ impl ExtendedKalmanFilter {
             None => return, // Singular innovation covariance; skip update
         };
 
+        // Reject gross outliers (Mahalanobis / normalized innovation squared).
+        let nis = y.dot(&s_inv.dot(&y));
+        if nis > self.nis_gate {
+            return;
+        }
+
         // K = P H^T S^{-1}  (6 x 3)
         let k = self.covariance.dot(&h.t()).dot(&s_inv);
 
@@ -949,6 +990,7 @@ impl ExtendedKalmanFilter {
         let i_kh = &eye - &kh;
         let kr_kt = k.dot(&r_mat).dot(&k.t());
         self.covariance = i_kh.dot(&self.covariance).dot(&i_kh.t()) + kr_kt;
+        self.symmetrize_covariance();
     }
 
     /// Update with an angle-of-arrival measurement.
@@ -993,6 +1035,11 @@ impl ExtendedKalmanFilter {
             return;
         }
 
+        // Reject gross outliers (normalized innovation squared).
+        if (innov * innov) / s > self.nis_gate {
+            return;
+        }
+
         let k = self.covariance.dot(&h.t()) / s;
 
         for i in 0..STATE_DIM {
@@ -1020,6 +1067,7 @@ impl ExtendedKalmanFilter {
             m
         };
         self.covariance = i_kh.dot(&self.covariance).dot(&i_kh.t()) + kr_kt;
+        self.symmetrize_covariance();
     }
 
     /// Update with a `ZoA` (elevation angle) measurement.
@@ -1067,6 +1115,11 @@ impl ExtendedKalmanFilter {
             return;
         }
 
+        // Reject gross outliers (normalized innovation squared).
+        if (innov * innov) / s > self.nis_gate {
+            return;
+        }
+
         let k = self.covariance.dot(&h.t()) / s;
 
         for i in 0..STATE_DIM {
@@ -1094,6 +1147,7 @@ impl ExtendedKalmanFilter {
             m
         };
         self.covariance = i_kh.dot(&self.covariance).dot(&i_kh.t()) + kr_kt;
+        self.symmetrize_covariance();
     }
 
     /// Update with a Doppler shift measurement (direct velocity observation).
@@ -1152,6 +1206,11 @@ impl ExtendedKalmanFilter {
             return;
         }
 
+        // Reject gross outliers (normalized innovation squared).
+        if (innov * innov) / s > self.nis_gate {
+            return;
+        }
+
         let k = self.covariance.dot(&h.t()) / s;
 
         for i in 0..STATE_DIM {
@@ -1179,6 +1238,7 @@ impl ExtendedKalmanFilter {
             m
         };
         self.covariance = i_kh.dot(&self.covariance).dot(&i_kh.t()) + kr_kt;
+        self.symmetrize_covariance();
     }
 }
 
@@ -2387,6 +2447,48 @@ mod tests {
         let pos = ekf.position();
         assert!((pos.x - 40.0).abs() < 1.0, "x: {} vs 40.0", pos.x);
         assert!((pos.y - 30.0).abs() < 1.0, "y: {} vs 30.0", pos.y);
+    }
+
+    #[test]
+    fn test_ekf_rejects_outlier_measurement() {
+        // Converge on a stable position with a tight covariance.
+        let make = || {
+            let mut ekf = ExtendedKalmanFilter::new(
+                Vector3::new(40.0, 30.0, 0.0),
+                Vector3::default(),
+                5.0,
+                1.0,
+                0.1,
+            );
+            let true_pos = Vector3::new(40.0, 30.0, 0.0);
+            for _ in 0..20 {
+                ekf.predict(0.1);
+                ekf.update_position(&true_pos, 1.0);
+            }
+            ekf
+        };
+        let outlier = Vector3::new(10_000.0, -8_000.0, 0.0);
+
+        // Default gating: the gross outlier is rejected, state barely moves.
+        let mut gated = make();
+        let before = gated.position();
+        gated.update_position(&outlier, 1.0);
+        let after = gated.position();
+        assert!(
+            (after.x - before.x).abs() < 5.0 && (after.y - before.y).abs() < 5.0,
+            "gated filter should reject the outlier: {before:?} -> {after:?}"
+        );
+
+        // Gating disabled: the same outlier visibly drags the state — proving the
+        // gate (not some other guard) is what protected the estimate.
+        let mut ungated = make().with_nis_gate(f64::INFINITY);
+        let before_u = ungated.position();
+        ungated.update_position(&outlier, 1.0);
+        let after_u = ungated.position();
+        assert!(
+            (after_u.x - before_u.x).abs() > 5.0,
+            "ungated filter should absorb the outlier: {before_u:?} -> {after_u:?}"
+        );
     }
 
     #[test]

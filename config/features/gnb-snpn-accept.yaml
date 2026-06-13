@@ -1,0 +1,40 @@
+# Rel-17/18 feature test — gNB for SNPN accept. Baseline gNB + broadcasts NID
+# 7AB01234567 so the SNPN UE (ue-snpn-accept.yaml) finds a suitable cell.
+nci: 0x000000010
+gnb_id_length: 32
+
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+tac: 1
+
+nssai:
+  - sst: 1
+    sd: null
+
+amf_configs:
+  - address: 172.23.0.5
+    port: 38412
+
+link_ip: 172.23.0.100
+ngap_ip: 172.23.0.100
+gtp_ip: 172.23.0.100
+ignore_stream_ids: false
+upf_addr: 172.23.0.7
+upf_port: 2152
+
+energy_saving_enabled: false
+she_enabled: false
+nwdaf_enabled: false
+nkef_enabled: false
+isac_enabled: false
+agent_enabled: false
+federated_learning_enabled: false
+
+# --- Feature under test: broadcast SNPN NID ---
+snpn_config:
+  nid: "7AB01234567"
+  cag_ids: []
+  onboarding_enabled: false

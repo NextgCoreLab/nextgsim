@@ -43,8 +43,9 @@ use nextgsim_ue::SemanticCodecTask;
 #[cfg(feature = "nextgsim-she")]
 use nextgsim_ue::SheClientTask;
 use nextgsim_ue::{
-    AppMessage, AppTask, NasMessage, RlsMessage, RlsTask, RrcMessage, Task, TaskManager,
-    TaskMessage, UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
+    AppMessage, AppTask, MintMessage, MintTask, NasMessage, RangingTask, RlsMessage, RlsTask,
+    RrcMessage, SidelinkMessage, SidelinkTask, Task, TaskManager, TaskMessage, UeRel18Receivers,
+    UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
 };
 
 /// nextgsim UE - 5G User Equipment Simulator
@@ -196,6 +197,13 @@ fn validate_ue_config(config: &UeConfig) -> Result<()> {
         bail!("Subscriber key K cannot be all zeros");
     }
 
+    // Validate the SUCI protection configuration (scheme, routing indicator,
+    // home network public key id and key material) by performing a trial
+    // build, so misconfiguration fails fast instead of inside the NAS task.
+    if let Err(e) = nextgsim_ue::nas::mm::build_suci(config) {
+        bail!("Invalid SUCI configuration: {e}");
+    }
+
     Ok(())
 }
 
@@ -230,8 +238,12 @@ impl UeApp {
         );
 
         // Create TaskManager with all channels
-        let (task_manager, app_rx, nas_rx, rrc_rx, rls_rx) =
+        let (mut task_manager, app_rx, nas_rx, rrc_rx, rls_rx) =
             TaskManager::new(config.clone(), DEFAULT_CHANNEL_CAPACITY);
+
+        // Install the Rel-18 task handles (Ranging, MINT, Sidelink) before any
+        // task base clone so every task can reach the Rel-18 actors.
+        let rel18_rxs = task_manager.init_rel18_tasks(DEFAULT_CHANNEL_CAPACITY);
 
         let task_base = task_manager.task_base();
         let shutdown_rx = task_manager.shutdown_receiver();
@@ -246,6 +258,7 @@ impl UeApp {
             nas_rx,
             rrc_rx,
             rls_rx,
+            rel18_rxs,
             disable_cmd,
             node_name,
         );
@@ -259,12 +272,14 @@ impl UeApp {
 
     /// Spawns all UE tasks
     #[allow(unused_mut)]
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tasks(
         mut task_base: UeTaskBase,
         app_rx: tokio::sync::mpsc::Receiver<TaskMessage<AppMessage>>,
         nas_rx: tokio::sync::mpsc::Receiver<TaskMessage<NasMessage>>,
         rrc_rx: tokio::sync::mpsc::Receiver<TaskMessage<RrcMessage>>,
         rls_rx: tokio::sync::mpsc::Receiver<TaskMessage<RlsMessage>>,
+        rel18_rxs: UeRel18Receivers,
         disable_cmd: bool,
         node_name: String,
     ) {
@@ -344,6 +359,24 @@ impl UeApp {
         let rrc_task_base = task_base.clone();
         tokio::spawn(async move { Self::run_rrc_task(rrc_task_base, rrc_rx).await });
         info!("RRC task spawned");
+
+        // Spawn Rel-18 5G-Advanced tasks (Ranging TS 23.586, MINT TS 23.761,
+        // Sidelink). The handles were installed by the TaskManager before the
+        // task base was cloned, so all tasks can reach these actors.
+        let UeRel18Receivers {
+            ranging_rx,
+            mint_rx,
+            sidelink_rx,
+        } = rel18_rxs;
+        let mut ranging_task = RangingTask::new(task_base.clone());
+        tokio::spawn(async move { ranging_task.run(ranging_rx).await });
+        info!("Ranging task spawned (Rel-18, TS 23.586)");
+        let mut mint_task = MintTask::new(task_base.clone());
+        tokio::spawn(async move { mint_task.run(mint_rx).await });
+        info!("MINT task spawned (Rel-18, TS 23.761)");
+        let mut sidelink_task = SidelinkTask::new(task_base.clone());
+        tokio::spawn(async move { sidelink_task.run(sidelink_rx).await });
+        info!("Sidelink task spawned (Rel-18 NR Sidelink)");
 
         // Spawn 6G AI-native network function tasks (Rel-20)
         #[cfg(any(
@@ -425,40 +458,168 @@ impl UeApp {
         mut rx: tokio::sync::mpsc::Receiver<TaskMessage<NasMessage>>,
         tun_tx: tokio::sync::mpsc::Sender<TunMessage>,
     ) {
-        use nextgsim_common::config::OpType;
-        use nextgsim_crypto::kdf::{derive_kamf, derive_kausf, derive_kseaf, derive_res_star};
-        use nextgsim_crypto::milenage::{compute_opc, Milenage};
-        use nextgsim_nas::enums::{MmMessageType, SmMessageType};
-        use nextgsim_nas::ies::{FollowOnRequest, Ie5gsRegistrationType, RegistrationType};
-        use nextgsim_nas::messages::mm::authentication::{
-            AuthenticationRequest as NasAuthRequest, AuthenticationResponse as NasAuthResponse,
-        };
-        use nextgsim_nas::messages::mm::security_mode::{
-            SecurityModeCommand as NasSecModeCmd, SecurityModeComplete as NasSecModeComplete,
-        };
-        use nextgsim_nas::messages::mm::{IdentityRequest, IdentityResponse};
-        use nextgsim_nas::messages::mm::{
-            Ie5gsMobileIdentity, MobileIdentityType, RegistrationRequest,
-        };
-        use nextgsim_nas::security::{
-            CipheringAlgorithm, IntegrityAlgorithm, NasKeySetIdentifier, NasSecurityContext,
-        };
-        use nextgsim_ue::nas::mm::{MmStateMachine, MmSubState};
-
-        use bytes::BufMut;
+        use nextgsim_nas::ies::ie1::ServiceType;
+        use nextgsim_nas::ies::RegistrationType;
+        use nextgsim_ue::nas::mm::{CmState, MmOrchestrator, MmUeIdentity};
+        use nextgsim_ue::nas::sm::{SmOrchestrator, SmSessionParams};
+        use nextgsim_ue::rrc::cell_selection::{Plmn, PlmnSelector};
 
         info!("NAS task started");
 
-        // Initialize MM state machine
-        let mut mm_state = MmStateMachine::new();
+        // MM procedure orchestrator: owns the MM state machine, the NAS
+        // timers and the NAS security context (TS 24.501 Section 5)
+        let suci = match build_suci_from_config(&task_base.config) {
+            Ok(suci) => suci,
+            Err(e) => {
+                // No fallback to the null scheme: a UE configured for ECIES
+                // must not reveal its SUPI (TS 33.501 Section 6.12)
+                error!("Cannot build SUCI from configuration: {e}; NAS task aborting");
+                return;
+            }
+        };
+        let identity = MmUeIdentity::from_config(&task_base.config, suci);
+        let mut orch = MmOrchestrator::new(identity);
+
+        // SM procedure orchestrator: owns the per-PSI session state, PSI /
+        // PTI allocation and the SM timers (TS 24.501 Section 6). The
+        // legacy-accept compatibility flag is enabled because the current
+        // nextgcore smfd still emits a non-conformant PDU Session
+        // Establishment Accept; strict TS 24.501 parsing is always
+        // attempted first. Drop the flag once the core-side emission is
+        // spec-conformant.
+        let mut sm_orch = SmOrchestrator::new(true);
+        let sm_session_params = SmSessionParams::from_config(&task_base.config);
+
+        // MINT secondary-subscription driver (Rel-18, TS 23.761). Inert unless
+        // the UE config enables MINT with secondary SUPIs; it owns each
+        // secondary subscription's MM/security context and SM sessions. Only
+        // the primary subscription's sessions (subscription_index 0) are
+        // established by the main `sm_orch`; secondary-SUPI sessions are routed
+        // here per the DNN→subscription map.
+        let mut mint_secondary =
+            nextgsim_ue::nas::mm::MintSecondary::from_config(&task_base.config, true);
+        if mint_secondary.is_active() {
+            info!(
+                "MINT enabled: {} secondary subscription(s), disaster_roaming={}",
+                "configured",
+                mint_secondary.disaster_roaming()
+            );
+        }
+
+        // TS 23.122 PLMN selector (automatic mode), consuming the MM
+        // orchestrator's forbidden-PLMN list
+        let home_plmn = Plmn::new(
+            task_base.config.hplmn.mcc,
+            task_base.config.hplmn.mnc,
+            task_base.config.hplmn.long_mnc,
+        );
+        let mut plmn_selector = PlmnSelector::new(home_plmn);
+
         let mut pdu_counter: u32 = 0;
-        let mut registration_sent = false;
-        let mut pdu_session_requested = false;
-        let mut pti_counter: u8 = 1; // Procedure Transaction Identity counter
-        let mut nas_security_ctx = NasSecurityContext::new_3gpp();
+
+        // UAV tracking-report cadence (Rel-18, TS 23.256). `uav_report_ticks`
+        // counts NAS timer ticks once the aerial UE is registered; the report
+        // position is the configured flight altitude at a fixed simulated
+        // coordinate so the AMF geofence is exercised end to end.
+        let mut uav_report_ticks: u64 = 0;
+        let uav_report_position: (f64, f64, f64) = task_base
+            .config
+            .uav_config
+            .as_ref()
+            .map(|u| (37.7749, -122.4194, u.max_altitude_meters))
+            .unwrap_or((0.0, 0.0, 0.0));
+
+        // 1-second tick driving the NAS timers (T3510/T3511/T3502/T3512/
+        // ..., T3580/T3581/T3582, SM back-off and the higher-priority PLMN
+        // periodic search)
+        let mut timer_tick = tokio::time::interval(Duration::from_secs(1));
+        timer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            match rx.recv().await {
+            tokio::select! {
+            _ = timer_tick.tick() => {
+                let outs = orch.tick();
+                process_mm_outputs(
+                    outs,
+                    &mut orch,
+                    &mut sm_orch,
+                    &sm_session_params,
+                    &mut plmn_selector,
+                    &task_base,
+                    &tun_tx,
+                    &mut pdu_counter,
+                )
+                .await;
+                let sm_outs = sm_orch.tick();
+                process_sm_outputs(sm_outs, &mut orch, &task_base, &tun_tx, &mut pdu_counter)
+                    .await;
+
+                // MINT secondary subscriptions (Rel-18, TS 23.761): start the
+                // secondary registrations once the primary is registered, then
+                // drive their MM/SM timers each tick.
+                if mint_secondary.is_active() && orch.state().is_registered() {
+                    let started = mint_secondary.start_secondary_registrations();
+                    for (index, outs) in started {
+                        process_secondary_mm_outputs(
+                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
+                            &mut pdu_counter,
+                        )
+                        .await;
+                    }
+                    let ticks = mint_secondary.tick();
+                    for (index, outs) in ticks {
+                        process_secondary_mm_outputs(
+                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
+                            &mut pdu_counter,
+                        )
+                        .await;
+                    }
+                }
+
+                // UAV tracking report (Rel-18, TS 23.256): once the aerial UE
+                // is registered, periodically report its position so the AMF
+                // can run the geofence and enforce flight authorization. The
+                // configured position is reported as a Remote ID / flight
+                // position; the gNB relays it to the AMF as Uplink NAS Transport.
+                if let Some(uav) = task_base.config.uav_config.as_ref().filter(|u| u.is_aerial_ue) {
+                    if orch.state().is_registered() {
+                        uav_report_ticks += 1;
+                        // Report at ~5 s cadence after registration.
+                        if uav_report_ticks.is_multiple_of(5) {
+                            let caa_id = uav.uav_id.clone().unwrap_or_default();
+                            // Default flight position: the configured max
+                            // altitude at a fixed simulated coordinate, so the
+                            // report exercises the AMF geofence end to end.
+                            let (lat, lon, alt) = uav_report_position;
+                            if let Some(pdu) =
+                                orch.build_uav_tracking_report(&caa_id, lat, lon, alt, 1)
+                            {
+                                pdu_counter += 1;
+                                let _ = task_base
+                                    .rrc_tx
+                                    .send(RrcMessage::UplinkNasDelivery {
+                                        pdu_id: pdu_counter,
+                                        pdu: pdu.into(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                // Higher-priority PLMN periodic search (TS 23.122 4.4.3.3)
+                if plmn_selector.tick() {
+                    perform_plmn_selection(
+                        &mut orch,
+                        &mut plmn_selector,
+                        home_plmn,
+                        &task_base,
+                        &mut pdu_counter,
+                    )
+                    .await;
+                }
+            }
+            recv = rx.recv() => match recv {
                 Some(TaskMessage::Message(msg)) => {
                     match msg {
                         NasMessage::NasNotify => {
@@ -467,723 +628,110 @@ impl UeApp {
                         NasMessage::NasDelivery { pdu } => {
                             info!("NAS delivery: len={}", pdu.len());
 
-                            // Decode the NAS message based on EPD
-                            if pdu.len() >= 4 {
-                                let epd = pdu.data()[0];
-
-                                // Check if this is a 5GMM message (EPD=0x7E) or 5GSM message (EPD=0x2E)
-                                if epd == 0x2E {
-                                    // 5GSM (Session Management) message
-                                    // Format: EPD (0x2E) + PSI + PTI + Message Type + IEs
-                                    let psi = pdu.data()[1];
-                                    let pti = pdu.data()[2];
-                                    let sm_msg_type = pdu.data()[3];
-
-                                    info!(
-                                        "Received 5GSM message: PSI={}, PTI={}, type=0x{:02x}",
-                                        psi, pti, sm_msg_type
-                                    );
-
-                                    if let Ok(sm_type) = SmMessageType::try_from(sm_msg_type) {
-                                        match sm_type {
-                                            SmMessageType::PduSessionEstablishmentAccept => {
-                                                info!("PDU Session Establishment Accept received!");
-                                                // Parse IP address from the response (simplified)
-                                                // In real implementation, decode QoS rules, session AMBR, etc.
-                                                let mut ue_ip: Option<Ipv4Addr> = None;
-                                                if pdu.len() > 8 {
-                                                    // Look for PDU address IE (IEI = 0x29)
-                                                    let pdu_data = pdu.data();
-                                                    for i in 4..pdu.len().saturating_sub(5) {
-                                                        if pdu_data[i] == 0x29 {
-                                                            // PDU address IE found
-                                                            let len = pdu_data[i + 1] as usize;
-                                                            if len >= 5 && i + 2 + len <= pdu.len()
-                                                            {
-                                                                let pdu_type = pdu_data[i + 2];
-                                                                if pdu_type == 0x01 {
-                                                                    // IPv4
-                                                                    ue_ip = Some(Ipv4Addr::new(
-                                                                        pdu_data[i + 3],
-                                                                        pdu_data[i + 4],
-                                                                        pdu_data[i + 5],
-                                                                        pdu_data[i + 6],
-                                                                    ));
-                                                                    info!("PDU Session {} established with IP: {}", psi, ue_ip.expect("value expected"));
-                                                                }
-                                                            }
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                info!("PDU Session {} is now ACTIVE", psi);
-
-                                                // Create TUN interface for this PDU session
-                                                if let Some(ip) = ue_ip {
-                                                    info!("Creating TUN interface for PDU Session {} with IP {}", psi, ip);
-                                                    let _ = tun_tx
-                                                        .send(TunMessage::CreateInterface {
-                                                            psi: psi as i32,
-                                                            address: ip,
-                                                            netmask: Ipv4Addr::new(
-                                                                255, 255, 255, 0,
-                                                            ),
-                                                        })
-                                                        .await;
-                                                }
-                                            }
-                                            SmMessageType::PduSessionEstablishmentReject => {
-                                                let cause =
-                                                    if pdu.len() > 4 { pdu.data()[4] } else { 0 };
-                                                warn!(
-                                                    "PDU Session Establishment Reject: cause={}",
-                                                    cause
-                                                );
-                                            }
-                                            SmMessageType::PduSessionReleaseCommand => {
-                                                // Network requests PDU session release
-                                                info!(
-                                                    "PDU Session Release Command received: PSI={}",
-                                                    psi
-                                                );
-
-                                                // Deactivate TUN interface for this session
-                                                let _ = tun_tx
-                                                    .send(TunMessage::WriteData {
-                                                        psi: psi as i32,
-                                                        data: vec![].into(), // empty = signal close
-                                                    })
-                                                    .await;
-
-                                                // Send PDU Session Release Complete
-                                                let release_complete = nextgsim_nas::messages::sm::PduSessionReleaseComplete::new(psi, pti);
-                                                let mut nas_pdu = Vec::new();
-                                                release_complete.encode(&mut nas_pdu);
-
-                                                info!("Sending PDU Session Release Complete: PSI={}, len={}", psi, nas_pdu.len());
-
-                                                pdu_counter += 1;
-                                                let _ = task_base
-                                                    .rrc_tx
-                                                    .send(RrcMessage::UplinkNasDelivery {
-                                                        pdu_id: pdu_counter,
-                                                        pdu: nas_pdu.into(),
-                                                    })
-                                                    .await;
-
-                                                if psi == 1 {
-                                                    pdu_session_requested = false;
-                                                }
-                                            }
-                                            SmMessageType::PduSessionModificationCommand => {
-                                                // Network modifies PDU session parameters
-                                                info!("PDU Session Modification Command received: PSI={}", psi);
-
-                                                // Send PDU Session Modification Complete
-                                                let mod_complete = nextgsim_nas::messages::sm::PduSessionModificationComplete::new(psi, pti);
-                                                let mut nas_pdu = Vec::new();
-                                                mod_complete.encode(&mut nas_pdu);
-
-                                                info!("Sending PDU Session Modification Complete: PSI={}, len={}", psi, nas_pdu.len());
-
-                                                pdu_counter += 1;
-                                                let _ = task_base
-                                                    .rrc_tx
-                                                    .send(RrcMessage::UplinkNasDelivery {
-                                                        pdu_id: pdu_counter,
-                                                        pdu: nas_pdu.into(),
-                                                    })
-                                                    .await;
-                                            }
-                                            SmMessageType::PduSessionReleaseReject => {
-                                                warn!("PDU Session Release Reject: PSI={}", psi);
-                                            }
-                                            SmMessageType::PduSessionModificationReject => {
-                                                warn!(
-                                                    "PDU Session Modification Reject: PSI={}",
-                                                    psi
-                                                );
-                                            }
-                                            _ => {
-                                                info!("Unhandled 5GSM message type: {:?}", sm_type);
-                                            }
-                                        }
-                                    } else {
-                                        warn!("Unknown 5GSM message type: 0x{:02x}", sm_msg_type);
-                                    }
-                                } else if epd == 0x7E {
-                                    // 5GMM (Mobility Management) message
-                                    let msg_type_byte = pdu.data()[2];
-                                    if let Ok(msg_type) = MmMessageType::try_from(msg_type_byte) {
-                                        info!(
-                                            "Received NAS message type: {:?} (0x{:02x})",
-                                            msg_type, msg_type_byte
-                                        );
-
-                                        match msg_type {
-                                            MmMessageType::IdentityRequest => {
-                                                // Decode Identity Request
-                                                let mut buf = pdu.data();
-                                                match IdentityRequest::decode(&mut buf) {
-                                                    Ok(id_req) => {
-                                                        info!(
-                                                            "Identity Request - Type: {:?}",
-                                                            id_req.identity_type.value
-                                                        );
-
-                                                        // Build SUCI for Identity Response
-                                                        let suci_data = build_suci_from_config(
-                                                            &task_base.config,
-                                                        );
-                                                        let mobile_identity =
-                                                            Ie5gsMobileIdentity::new(
-                                                                MobileIdentityType::Suci,
-                                                                suci_data,
-                                                            );
-
-                                                        // Build Identity Response
-                                                        let id_response =
-                                                            IdentityResponse::new(mobile_identity);
-                                                        let mut nas_pdu = Vec::new();
-                                                        id_response.encode(&mut nas_pdu);
-
-                                                        info!(
-                                                            "Sending Identity Response, PDU len={}",
-                                                            nas_pdu.len()
-                                                        );
-
-                                                        // Send to RRC for transmission
-                                                        pdu_counter += 1;
-                                                        let _ = task_base
-                                                            .rrc_tx
-                                                            .send(RrcMessage::UplinkNasDelivery {
-                                                                pdu_id: pdu_counter,
-                                                                pdu: nas_pdu.into(),
-                                                            })
-                                                            .await;
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to decode Identity Request: {:?}", e);
-                                                    }
-                                                }
-                                            }
-                                            MmMessageType::AuthenticationRequest => {
-                                                // Decode Authentication Request (skip 3-byte header)
-                                                let header_len = 3; // EPD + SecHdr + MsgType
-                                                match NasAuthRequest::decode(
-                                                    &mut &pdu.data()[header_len..],
-                                                ) {
-                                                    Ok(auth_req) => {
-                                                        info!("Authentication Request received: ngKSI={}", auth_req.ng_ksi.ksi);
-
-                                                        if let (Some(rand_ie), Some(autn_ie)) =
-                                                            (&auth_req.rand, &auth_req.autn)
-                                                        {
-                                                            // 5G-AKA authentication
-                                                            let rand = &rand_ie.value;
-                                                            let autn = &autn_ie.value;
-                                                            info!(
-                                                                "5G-AKA: RAND={:02x?}, AUTN len={}",
-                                                                &rand[..4],
-                                                                autn.len()
-                                                            );
-
-                                                            // Get K and OPc from UE config
-                                                            let config = &task_base.config;
-                                                            let opc = match config.op_type {
-                                                                OpType::Opc => config.op,
-                                                                OpType::Op => compute_opc(
-                                                                    &config.key,
-                                                                    &config.op,
-                                                                ),
-                                                            };
-
-                                                            // Run Milenage: compute RES, CK, IK, AK
-                                                            let m =
-                                                                Milenage::new(&config.key, &opc);
-                                                            let res = m.f2(rand);
-                                                            let ck = m.f3(rand);
-                                                            let ik = m.f4(rand);
-                                                            let ak = m.f5(rand);
-
-                                                            // Verify AUTN: AUTN = SQN⊕AK || AMF || MAC
-                                                            if autn.len() >= 16 {
-                                                                // Extract SQN⊕AK, AMF, MAC from AUTN
-                                                                let mut sqn_xor_ak = [0u8; 6];
-                                                                sqn_xor_ak
-                                                                    .copy_from_slice(&autn[0..6]);
-                                                                let mut amf_from_autn = [0u8; 2];
-                                                                amf_from_autn
-                                                                    .copy_from_slice(&autn[6..8]);
-                                                                let mac_from_autn = &autn[8..16];
-
-                                                                // Recover SQN = (SQN⊕AK) ⊕ AK
-                                                                let mut sqn = [0u8; 6];
-                                                                for i in 0..6 {
-                                                                    sqn[i] = sqn_xor_ak[i] ^ ak[i];
-                                                                }
-
-                                                                // Verify MAC: expected_mac = f1(K, RAND, SQN, AMF)
-                                                                let expected_mac = m.f1(
-                                                                    rand,
-                                                                    &sqn,
-                                                                    &amf_from_autn,
-                                                                );
-                                                                if expected_mac == mac_from_autn {
-                                                                    info!("AUTN MAC verified successfully");
-
-                                                                    // Compute RES* = KDF(CK||IK, FC=0x6B, SN_name, RAND, RES)
-                                                                    let sn_name = format!(
-                                                                    "5G:mnc{:03}.mcc{:03}.3gppnetwork.org",
-                                                                    config.hplmn.mnc, config.hplmn.mcc
-                                                                );
-                                                                    let res_star = derive_res_star(
-                                                                        &ck,
-                                                                        &ik,
-                                                                        sn_name.as_bytes(),
-                                                                        rand,
-                                                                        &res,
-                                                                    );
-                                                                    info!(
-                                                                        "RES* computed: {:02x?}",
-                                                                        &res_star[..4]
-                                                                    );
-
-                                                                    // Derive key hierarchy: Kausf → Kseaf → Kamf
-                                                                    let kausf = derive_kausf(
-                                                                        &ck,
-                                                                        &ik,
-                                                                        sn_name.as_bytes(),
-                                                                        &sqn_xor_ak,
-                                                                    );
-                                                                    let kseaf = derive_kseaf(
-                                                                        &kausf,
-                                                                        sn_name.as_bytes(),
-                                                                    );
-                                                                    let supi_str =
-                                                                        if let Some(ref supi) =
-                                                                            config.supi
-                                                                        {
-                                                                            supi.value.clone()
-                                                                        } else {
-                                                                            format!(
-                                                                            "{:03}{:02}0000000001",
-                                                                            config.hplmn.mcc,
-                                                                            config.hplmn.mnc
-                                                                        )
-                                                                        };
-                                                                    let abba = vec![0x00, 0x00]; // Default ABBA
-                                                                    let kamf = derive_kamf(
-                                                                        &kseaf,
-                                                                        supi_str.as_bytes(),
-                                                                        &abba,
-                                                                    );
-                                                                    nas_security_ctx
-                                                                        .keys_mut()
-                                                                        .set_kausf(&kausf);
-                                                                    nas_security_ctx
-                                                                        .keys_mut()
-                                                                        .set_kseaf(&kseaf);
-                                                                    nas_security_ctx
-                                                                        .keys_mut()
-                                                                        .set_kamf(&kamf);
-                                                                    nas_security_ctx
-                                                                        .begin_establishing();
-                                                                    info!("Key hierarchy derived: Kausf/Kseaf/Kamf set, security ctx establishing");
-
-                                                                    // Build and send Authentication Response
-                                                                    let auth_response = NasAuthResponse::with_res_star(res_star.to_vec());
-                                                                    let mut nas_pdu = Vec::new();
-                                                                    auth_response
-                                                                        .encode(&mut nas_pdu);
-
-                                                                    info!("Sending Authentication Response, PDU len={}", nas_pdu.len());
-                                                                    pdu_counter += 1;
-                                                                    let _ = task_base.rrc_tx.send(RrcMessage::UplinkNasDelivery {
-                                                                    pdu_id: pdu_counter,
-                                                                    pdu: nas_pdu.into(),
-                                                                }).await;
-                                                                } else {
-                                                                    warn!("AUTN MAC verification failed! expected={:02x?}, got={:02x?}",
-                                                                    expected_mac, mac_from_autn);
-                                                                }
-                                                            } else {
-                                                                warn!(
-                                                                    "AUTN too short: {} bytes",
-                                                                    autn.len()
-                                                                );
-                                                            }
-                                                        } else {
-                                                            warn!("Authentication Request missing RAND or AUTN (EAP-AKA not supported)");
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to decode Authentication Request: {:?}", e);
-                                                    }
-                                                }
-                                            }
-                                            MmMessageType::SecurityModeCommand => {
-                                                // Decode Security Mode Command (skip 3-byte header)
-                                                let header_len = 3;
-                                                match NasSecModeCmd::decode(
-                                                    &mut &pdu.data()[header_len..],
-                                                ) {
-                                                    Ok(smc) => {
-                                                        info!(
-                                                        "Security Mode Command: enc_alg={}, int_alg={}, ngKSI={}",
-                                                        smc.selected_nas_security_algorithms.ciphering,
-                                                        smc.selected_nas_security_algorithms.integrity,
-                                                        smc.ng_ksi.ksi
-                                                    );
-
-                                                        // Derive NAS keys from KAMF using selected algorithms
-                                                        let cipher_alg = CipheringAlgorithm::try_from(
-                                                        smc.selected_nas_security_algorithms.ciphering
-                                                    ).unwrap_or(CipheringAlgorithm::Nea0);
-                                                        let integ_alg = IntegrityAlgorithm::try_from(
-                                                        smc.selected_nas_security_algorithms.integrity
-                                                    ).unwrap_or(IntegrityAlgorithm::Nia0);
-
-                                                        nas_security_ctx.set_ng_ksi(smc.ng_ksi.ksi);
-                                                        if let Err(e) = nas_security_ctx
-                                                            .derive_nas_keys(cipher_alg, integ_alg)
-                                                        {
-                                                            warn!(
-                                                                "Failed to derive NAS keys: {}",
-                                                                e
-                                                            );
-                                                        } else {
-                                                            info!("NAS keys derived: cipher={:?}, integrity={:?}", cipher_alg, integ_alg);
-                                                        }
-
-                                                        // Activate security context
-                                                        nas_security_ctx.activate();
-
-                                                        // Encode plain SecurityModeComplete
-                                                        let smc_complete =
-                                                            NasSecModeComplete::new();
-                                                        let mut plain_pdu = Vec::new();
-                                                        smc_complete.encode(&mut plain_pdu);
-
-                                                        // Integrity-protect the SecurityModeComplete
-                                                        // SecurityHeaderType = IntegrityProtectedAndCipheredWithNewSecurityContext (0x04)
-                                                        let nas_pdu = if nas_security_ctx
-                                                            .is_active()
-                                                        {
-                                                            match nas_security_ctx
-                                                                .increment_uplink_count()
-                                                            {
-                                                                Ok(count) => {
-                                                                    let sqn = count.sqn;
-                                                                    match nas_security_ctx
-                                                                        .compute_uplink_mac(
-                                                                            sqn, &plain_pdu,
-                                                                        ) {
-                                                                        Ok(mac) => {
-                                                                            // Build secured NAS: EPD(1) + SHT(1) + MAC(4) + SQN(1) + plain
-                                                                            let mut secured =
-                                                                                Vec::with_capacity(
-                                                                                    7 + plain_pdu
-                                                                                        .len(),
-                                                                                );
-                                                                            secured.push(0x7E); // EPD: 5GMM
-                                                                            secured.push(0x04); // Security header: integrity + cipher + new ctx
-                                                                            secured
-                                                                                .extend_from_slice(
-                                                                                    &mac,
-                                                                                );
-                                                                            secured.push(sqn);
-                                                                            secured
-                                                                                .extend_from_slice(
-                                                                                    &plain_pdu,
-                                                                                );
-                                                                            info!("SecurityModeComplete integrity-protected, MAC={:02x?}", mac);
-                                                                            secured
-                                                                        }
-                                                                        Err(e) => {
-                                                                            warn!("MAC computation failed: {}, sending plain", e);
-                                                                            nas_security_ctx.rollback_uplink_count();
-                                                                            plain_pdu
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Err(e) => {
-                                                                    warn!("NAS count increment failed: {}, sending plain", e);
-                                                                    plain_pdu
-                                                                }
-                                                            }
-                                                        } else {
-                                                            plain_pdu
-                                                        };
-
-                                                        info!("Sending Security Mode Complete, PDU len={}", nas_pdu.len());
-                                                        pdu_counter += 1;
-                                                        let _ = task_base
-                                                            .rrc_tx
-                                                            .send(RrcMessage::UplinkNasDelivery {
-                                                                pdu_id: pdu_counter,
-                                                                pdu: nas_pdu.into(),
-                                                            })
-                                                            .await;
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to decode Security Mode Command: {:?}", e);
-                                                    }
-                                                }
-                                            }
-                                            MmMessageType::RegistrationAccept => {
-                                                info!("Received Registration Accept!");
-                                                mm_state.switch_mm_state(MmSubState::Registered);
-                                                info!(
-                                                    "UE is now REGISTERED, MM state: {}",
-                                                    mm_state
-                                                );
-
-                                                // Trigger PDU Session Establishment after registration
-                                                if !pdu_session_requested {
-                                                    tokio::time::sleep(
-                                                        tokio::time::Duration::from_millis(500),
-                                                    )
-                                                    .await;
-                                                    info!("Initiating PDU Session Establishment");
-
-                                                    // Build PDU Session Establishment Request
-                                                    // Format: SM Header (4 bytes) + IEs
-                                                    let psi: u8 = 1; // PDU Session Identity
-                                                    let pti = pti_counter;
-                                                    pti_counter = pti_counter.wrapping_add(1);
-                                                    if pti_counter == 0 {
-                                                        pti_counter = 1;
-                                                    }
-
-                                                    let mut nas_pdu = Vec::new();
-
-                                                    // SM Header: EPD (0x2E) + PSI + PTI + Message Type (0xC1)
-                                                    nas_pdu.put_u8(0x2E); // EPD: 5GSM
-                                                    nas_pdu.put_u8(psi); // PDU Session ID
-                                                    nas_pdu.put_u8(pti); // PTI
-                                                    nas_pdu.put_u8(0xC1); // Message Type: PDU Session Establishment Request
-
-                                                    // Mandatory IE: Integrity protection maximum data rate (9.11.4.7)
-                                                    // IEI is not present for mandatory IEs
-                                                    nas_pdu.put_u8(0xFF); // Max data rate UL: full rate
-                                                    nas_pdu.put_u8(0xFF); // Max data rate DL: full rate
-
-                                                    // Optional IE: PDU session type (9.11.4.11)
-                                                    nas_pdu.put_u8(0x91); // IEI for PDU session type
-                                                    nas_pdu.put_u8(0x01); // IPv4
-
-                                                    // Optional IE: SSC mode (9.11.4.16)
-                                                    nas_pdu.put_u8(0xA1); // IEI for SSC mode
-                                                    nas_pdu.put_u8(0x01); // SSC mode 1
-
-                                                    info!("Sending PDU Session Establishment Request: PSI={}, PTI={}, len={}",
-                                                      psi, pti, nas_pdu.len());
-
-                                                    pdu_session_requested = true;
-
-                                                    // Send to RRC for transmission
-                                                    pdu_counter += 1;
-                                                    let _ = task_base
-                                                        .rrc_tx
-                                                        .send(RrcMessage::UplinkNasDelivery {
-                                                            pdu_id: pdu_counter,
-                                                            pdu: nas_pdu.into(),
-                                                        })
-                                                        .await;
-                                                }
-                                            }
-                                            MmMessageType::RegistrationReject => {
-                                                warn!("Received Registration Reject");
-                                                mm_state.switch_mm_state(MmSubState::Deregistered);
-                                                registration_sent = false;
-                                            }
-                                            MmMessageType::ServiceAccept => {
-                                                info!(
-                                                    "Service Accept received - UE is now CONNECTED"
-                                                );
-                                                mm_state.switch_mm_state(MmSubState::Registered);
-                                                mm_state.switch_cm_state(
-                                                    nextgsim_ue::nas::mm::CmState::Connected,
-                                                );
-                                            }
-                                            MmMessageType::ServiceReject => {
-                                                let cause =
-                                                    if pdu.len() > 3 { pdu.data()[3] } else { 0 };
-                                                warn!("Service Reject received: cause={}", cause);
-                                                mm_state.switch_mm_state(MmSubState::Registered);
-                                            }
-                                            MmMessageType::DlNasTransport => {
-                                                // DL NAS Transport contains an embedded SM message
-                                                // Parse payload container to extract inner NAS PDU
-                                                if pdu.len() > 7 {
-                                                    let header_len = 3; // EPD + SecHdr + MsgType
-                                                    let payload_type = pdu.data()[header_len]; // Payload container type
-                                                    if payload_type == 0x01 {
-                                                        // N1 SM information
-                                                        let container_len = u16::from_be_bytes([
-                                                            pdu.data()[header_len + 1],
-                                                            pdu.data()[header_len + 2],
-                                                        ])
-                                                            as usize;
-                                                        if container_len > 0
-                                                            && header_len + 3 + container_len
-                                                                <= pdu.len()
-                                                        {
-                                                            // Forward the embedded SM PDU back through NAS delivery
-                                                            let inner_pdu = pdu.data()[header_len
-                                                                + 3
-                                                                ..header_len + 3 + container_len]
-                                                                .to_vec();
-                                                            info!("DL NAS Transport: forwarding embedded SM PDU, len={}", inner_pdu.len());
-                                                            let _ = task_base
-                                                                .nas_tx
-                                                                .send(NasMessage::NasDelivery {
-                                                                    pdu: inner_pdu.into(),
-                                                                })
-                                                                .await;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            MmMessageType::ConfigurationUpdateCommand => {
-                                                // Decode optional IEs (after the 3-byte NAS header)
-                                                let header_len = 3; // EPD + SecHdr + MsgType
-                                                use nextgsim_ue::nas::mm::{
-                                                    ConfigUpdateProcedure,
-                                                    ConfigurationUpdateCommand as CuCmd,
-                                                    ConfigurationUpdateComplete as CuComplete,
-                                                };
-                                                let cmd = if pdu.len() > header_len {
-                                                    CuCmd::decode(&mut &pdu.data()[header_len..])
-                                                        .unwrap_or_default()
-                                                } else {
-                                                    CuCmd::default()
-                                                };
-                                                let result =
-                                                    ConfigUpdateProcedure::process_command(&cmd);
-
-                                                // Store new GUTI if provided
-                                                if let Some(ref new_guti) = result.new_guti {
-                                                    info!(
-                                                    "ConfigurationUpdate: new GUTI received (type={:?})",
-                                                    new_guti.identity_type
-                                                );
-                                                    // In a full implementation the GUTI would be
-                                                    // persisted in the MM context; we log it here.
-                                                }
-                                                if let Some(t) = result.new_t3512_secs {
-                                                    info!(
-                                                        "ConfigurationUpdate: T3512 updated to {}s",
-                                                        t
-                                                    );
-                                                }
-                                                if result.re_register {
-                                                    info!("ConfigurationUpdate: re-registration requested");
-                                                    mm_state.switch_mm_state(
-                                                        MmSubState::RegisteredUpdateNeeded,
-                                                    );
-                                                }
-
-                                                // Send ConfigurationUpdateComplete if ACK bit was set
-                                                if result.send_complete {
-                                                    let mut nas_pdu = Vec::new();
-                                                    CuComplete::new().encode(&mut nas_pdu);
-                                                    info!(
-                                                    "Sending ConfigurationUpdateComplete, len={}",
-                                                    nas_pdu.len()
-                                                );
-                                                    pdu_counter += 1;
-                                                    let _ = task_base
-                                                        .rrc_tx
-                                                        .send(RrcMessage::UplinkNasDelivery {
-                                                            pdu_id: pdu_counter,
-                                                            pdu: nas_pdu.into(),
-                                                        })
-                                                        .await;
-                                                }
-                                            }
-                                            _ => {
-                                                info!("Unhandled NAS message type: {:?}", msg_type);
-                                            }
-                                        }
-                                    } else {
-                                        warn!("Unknown NAS message type: 0x{:02x}", msg_type_byte);
-                                    }
+                            // All downlink NAS arrives as 5GMM (EPD 0x7E):
+                            // 5GSM messages are carried inside DL NAS
+                            // Transport and dispatched to the SM
+                            // orchestrator via MmOutput::NotHandled. The
+                            // legacy raw-5GSM-over-RRC path was removed:
+                            // a strict peer always wraps N1 SM containers
+                            // (TS 24.501 Section 5.4.5).
+                            if pdu.len() >= 4 && pdu.data()[0] == 0x7E {
+                                // MINT (Rel-18, TS 23.761): on the shared radio
+                                // connection, route the downlink to a secondary
+                                // subscription's MM context when it owns the
+                                // in-flight procedure; otherwise to the primary.
+                                if let Some(index) = mint_secondary.owns_pending_downlink() {
+                                    process_secondary_downlink(
+                                        index,
+                                        pdu.data(),
+                                        &mut mint_secondary,
+                                        &task_base,
+                                        &tun_tx,
+                                        &mut pdu_counter,
+                                    )
+                                    .await;
                                 } else {
-                                    warn!("Unknown EPD: 0x{:02x}", epd);
+                                    let outs = orch.handle_downlink(pdu.data());
+                                    process_mm_outputs(
+                                        outs,
+                                        &mut orch,
+                                        &mut sm_orch,
+                                        &sm_session_params,
+                                        &mut plmn_selector,
+                                        &task_base,
+                                        &tun_tx,
+                                        &mut pdu_counter,
+                                    )
+                                    .await;
                                 }
+                            } else if pdu.len() >= 4 {
+                                warn!(
+                                    "Discarding NAS PDU with EPD 0x{:02x}: raw 5GSM over RRC is not accepted",
+                                    pdu.data()[0]
+                                );
                             } else {
                                 warn!("NAS PDU too short: {} bytes", pdu.len());
                             }
                         }
                         NasMessage::RrcConnectionSetup => {
                             info!("RRC connection setup complete");
-                            mm_state.switch_cm_state(nextgsim_ue::nas::mm::CmState::Connected);
+                            orch.state_mut().switch_cm_state(CmState::Connected);
                         }
                         NasMessage::RrcConnectionRelease => {
                             info!("RRC connection released");
-                            mm_state.switch_cm_state(nextgsim_ue::nas::mm::CmState::Idle);
-                            registration_sent = false;
+                            orch.state_mut().switch_cm_state(CmState::Idle);
                         }
                         NasMessage::RrcEstablishmentFailure => {
                             warn!("RRC establishment failure");
                         }
                         NasMessage::RadioLinkFailure => {
                             warn!("Radio link failure");
-                            mm_state.switch_cm_state(nextgsim_ue::nas::mm::CmState::Idle);
-                            registration_sent = false;
+                            orch.state_mut().switch_cm_state(CmState::Idle);
                         }
                         NasMessage::Paging { paging_tmsi } => {
                             info!("Paging received: {} TMSIs", paging_tmsi.len());
 
-                            // If registered and CM-IDLE, send Service Request to transition to CONNECTED
-                            if mm_state.is_registered() && mm_state.is_idle() {
-                                info!("Sending Service Request (paging-triggered)");
-
-                                use nextgsim_nas::ies::ie1::{IeServiceType, ServiceType};
-                                use nextgsim_nas::messages::mm::ServiceRequest;
-
-                                // Build 5G-S-TMSI: type (1) + AMF Set ID/Pointer (2) + TMSI (4)
-                                let tmsi_data = if let Some(first) = paging_tmsi.first() {
-                                    let mut data = vec![0xF4]; // TMSI type indicator
-                                                               // AMF Set ID (10 bits) + AMF Pointer (6 bits) = 2 bytes
-                                    let set_ptr = ((first.amf_set_id & 0x3FF) << 6)
-                                        | (first.amf_pointer as u16 & 0x3F);
-                                    data.extend_from_slice(&set_ptr.to_be_bytes());
-                                    data.extend_from_slice(&first.tmsi.to_be_bytes());
-                                    data
-                                } else {
-                                    vec![0xF4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-                                };
-
-                                let tmsi =
-                                    Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, tmsi_data);
-
-                                let svc_req = ServiceRequest::new(
-                                    NasKeySetIdentifier::no_key(),
-                                    IeServiceType::new(ServiceType::MobileTerminatedServices),
-                                    tmsi,
+                            // If registered and CM-IDLE, run the service request
+                            // procedure (the 5G-S-TMSI is derived from the
+                            // stored 5G-GUTI by the orchestrator)
+                            if orch.state().is_registered() && orch.state().is_idle() {
+                                let outs = orch.start_service_request(
+                                    ServiceType::MobileTerminatedServices,
+                                    None,
                                 );
-
-                                let mut nas_pdu = Vec::new();
-                                svc_req.encode(&mut nas_pdu);
-
-                                info!("Sending Service Request, PDU len={}", nas_pdu.len());
-                                mm_state.switch_mm_state(MmSubState::ServiceRequestInitiated);
-
-                                pdu_counter += 1;
-                                let _ = task_base
-                                    .rrc_tx
-                                    .send(RrcMessage::UplinkNasDelivery {
-                                        pdu_id: pdu_counter,
-                                        pdu: nas_pdu.into(),
-                                    })
-                                    .await;
+                                process_mm_outputs(
+                                    outs,
+                                    &mut orch,
+                                    &mut sm_orch,
+                                    &sm_session_params,
+                                    &mut plmn_selector,
+                                    &task_base,
+                                    &tun_tx,
+                                    &mut pdu_counter,
+                                )
+                                .await;
                             }
                         }
                         NasMessage::ActiveCellChanged { previous_tai } => {
                             info!("Active cell changed from TAI: {:?}", previous_tai);
+                            // Mobility registration update trigger
+                            // (TS 24.501 Section 5.5.1.3.2)
+                            if orch.state().is_registered() {
+                                let outs = orch.start_registration(
+                                    RegistrationType::MobilityRegistrationUpdating,
+                                );
+                                process_mm_outputs(
+                                    outs,
+                                    &mut orch,
+                                    &mut sm_orch,
+                                    &sm_session_params,
+                                    &mut plmn_selector,
+                                    &task_base,
+                                    &tun_tx,
+                                    &mut pdu_counter,
+                                )
+                                .await;
+                            }
                         }
                         NasMessage::RrcFallbackIndication => {
                             info!("RRC fallback indication");
@@ -1196,237 +744,183 @@ impl UeApp {
                         }
                         NasMessage::InitiateServiceRequest => {
                             // Data-triggered Service Request: UE has data to send while in IDLE
-                            if mm_state.is_registered() && mm_state.is_idle() {
+                            if orch.state().is_registered() && orch.state().is_idle() {
                                 info!("Initiating Service Request (data-triggered, IDLE -> CONNECTED)");
-
-                                use nextgsim_nas::ies::ie1::{IeServiceType, ServiceType};
-                                use nextgsim_nas::messages::mm::ServiceRequest;
-
-                                // Build 5G-S-TMSI with default values (real implementation
-                                // would use the stored GUTI from registration)
-                                let tmsi_data = vec![0xF4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-
-                                let tmsi =
-                                    Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, tmsi_data);
-
-                                let svc_req = ServiceRequest::new(
-                                    NasKeySetIdentifier::no_key(),
-                                    IeServiceType::new(ServiceType::Data),
-                                    tmsi,
-                                );
-
-                                let mut nas_pdu = Vec::new();
-                                svc_req.encode(&mut nas_pdu);
-
-                                info!("Sending Service Request (data), PDU len={}", nas_pdu.len());
-                                mm_state.switch_mm_state(MmSubState::ServiceRequestInitiated);
-
-                                pdu_counter += 1;
-                                let _ = task_base
-                                    .rrc_tx
-                                    .send(RrcMessage::UplinkNasDelivery {
-                                        pdu_id: pdu_counter,
-                                        pdu: nas_pdu.into(),
-                                    })
-                                    .await;
-                            } else if mm_state.is_registered() && mm_state.is_connected() {
+                                let outs =
+                                    orch.start_service_request(ServiceType::Data, Some(0x2000));
+                                process_mm_outputs(
+                                    outs,
+                                    &mut orch,
+                                    &mut sm_orch,
+                                    &sm_session_params,
+                                    &mut plmn_selector,
+                                    &task_base,
+                                    &tun_tx,
+                                    &mut pdu_counter,
+                                )
+                                .await;
+                            } else if orch.state().is_registered() && orch.state().is_connected() {
                                 debug!("Service Request not needed: already in CM-CONNECTED");
                             } else {
                                 warn!(
                                     "Cannot send Service Request: not registered (RM={}, CM={})",
-                                    mm_state.rm_state(),
-                                    mm_state.cm_state()
+                                    orch.state().rm_state(),
+                                    orch.state().cm_state()
                                 );
                             }
                         }
                         NasMessage::PerformMmCycle => {
-                            info!("PerformMmCycle received, MM state: {}", mm_state);
+                            info!("PerformMmCycle received, MM state: {}", orch.state());
 
-                            // If we're deregistered and haven't sent registration, send it
-                            if mm_state.is_deregistered() && !registration_sent {
+                            // If we're deregistered, start the initial registration
+                            if orch.state().is_deregistered() {
                                 // Wait a bit for gNB to complete NG Setup with AMF
                                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                                info!("Initiating initial registration");
-
-                                // Build SUCI (SUPI Concealed Identity) from UE config
-                                let suci_data = build_suci_from_config(&task_base.config);
-                                let mobile_identity =
-                                    Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci_data);
-
-                                // Build Registration Request
-                                let reg_request = RegistrationRequest::new(
-                                    Ie5gsRegistrationType::new(
-                                        FollowOnRequest::NoPending,
-                                        RegistrationType::InitialRegistration,
-                                    ),
-                                    NasKeySetIdentifier::no_key(),
-                                    mobile_identity,
-                                );
-
-                                // Encode the Registration Request
-                                let mut nas_pdu = Vec::new();
-                                reg_request.encode(&mut nas_pdu);
-
-                                info!("Sending Registration Request, PDU len={}", nas_pdu.len());
-
-                                // Update state
-                                mm_state.switch_mm_state(MmSubState::RegisteredInitiated);
-                                registration_sent = true;
-
-                                // Send to RRC for transmission
-                                pdu_counter += 1;
-                                let _ = task_base
-                                    .rrc_tx
-                                    .send(RrcMessage::UplinkNasDelivery {
-                                        pdu_id: pdu_counter,
-                                        pdu: nas_pdu.into(),
-                                    })
-                                    .await;
+                                let outs = orch
+                                    .start_registration(RegistrationType::InitialRegistration);
+                                process_mm_outputs(
+                                    outs,
+                                    &mut orch,
+                                    &mut sm_orch,
+                                    &sm_session_params,
+                                    &mut plmn_selector,
+                                    &task_base,
+                                    &tun_tx,
+                                    &mut pdu_counter,
+                                )
+                                .await;
                             }
                         }
                         NasMessage::NasTimerExpire { timer_id } => {
                             info!("NAS timer {} expired", timer_id);
                         }
                         NasMessage::InitiatePduSessionEstablishment {
-                            psi,
-                            pti,
+                            psi: _,
+                            pti: _,
                             session_type,
                             apn,
                         } => {
-                            info!(
-                                "Initiating PDU session establishment: PSI={}, PTI={}, type={}, apn={:?}",
-                                psi, pti, session_type, apn
-                            );
-
-                            // Build PDU Session Establishment Request NAS PDU
-                            let mut nas_pdu = Vec::new();
-
-                            // SM Header: EPD (0x2E) + PSI + PTI + Message Type (0xC1)
-                            nas_pdu.put_u8(0x2E); // EPD: 5GSM
-                            nas_pdu.put_u8(psi); // PDU Session ID
-                            nas_pdu.put_u8(pti); // PTI
-                            nas_pdu.put_u8(0xC1); // Message Type: PDU Session Establishment Request
-
-                            // Mandatory IE: Integrity protection maximum data rate (9.11.4.7)
-                            nas_pdu.put_u8(0xFF); // Max data rate UL: full rate
-                            nas_pdu.put_u8(0xFF); // Max data rate DL: full rate
-
-                            // Optional IE: PDU session type (9.11.4.11)
-                            let pdu_type = match session_type.as_str() {
-                                "IPv6" => 0x02,
-                                "IPv4v6" => 0x03,
-                                _ => 0x01, // IPv4
+                            // PSI and PTI are allocated by the SM
+                            // orchestrator (TS 24.501 6.1.3.2 / 9.6); the
+                            // CLI-provided hints are ignored
+                            use nextgsim_nas::messages::sm::{PduSessionTypeValue, SscModeValue};
+                            let requested_type = match session_type.as_str() {
+                                "IPv6" => PduSessionTypeValue::Ipv6,
+                                "IPv4v6" => PduSessionTypeValue::Ipv4v6,
+                                "Unstructured" => PduSessionTypeValue::Unstructured,
+                                "Ethernet" => PduSessionTypeValue::Ethernet,
+                                _ => PduSessionTypeValue::Ipv4,
                             };
-                            nas_pdu.put_u8(0x91); // IEI for PDU session type
-                            nas_pdu.put_u8(pdu_type);
-
-                            // Optional IE: SSC mode (9.11.4.16)
-                            nas_pdu.put_u8(0xA1); // IEI for SSC mode
-                            nas_pdu.put_u8(0x01); // SSC mode 1
-
-                            info!("Sending PDU Session Establishment Request: PSI={}, PTI={}, type={}, len={}",
-                                  psi, pti, session_type, nas_pdu.len());
-
-                            pdu_counter += 1;
-                            let _ = task_base
-                                .rrc_tx
-                                .send(RrcMessage::UplinkNasDelivery {
-                                    pdu_id: pdu_counter,
-                                    pdu: nas_pdu.into(),
-                                })
-                                .await;
-                        }
-                        NasMessage::InitiatePduSessionRelease { psi, pti } => {
-                            info!("Initiating PDU session release: PSI={}, PTI={}", psi, pti);
-
-                            // Build PDU Session Release Request NAS PDU
-                            let release_req =
-                                nextgsim_nas::messages::sm::PduSessionReleaseRequest::new(psi, pti);
-                            let mut nas_pdu = Vec::new();
-                            release_req.encode(&mut nas_pdu);
-
+                            let dnn = apn.clone().or_else(|| {
+                                sm_session_params.first().and_then(|p| p.dnn.clone())
+                            });
+                            // An XR DNN (xr/xr-split/xr-haptic) implies a
+                            // requested XR 5QI so the SM orchestrator marks the
+                            // session as XR (mirrors the SMF DNN→5QI mapping).
+                            let requested_5qi = dnn.as_deref().and_then(|d| {
+                                match d.to_ascii_lowercase().as_str() {
+                                    "xr" | "xr-cloud" | "xr-gaming" => Some(82),
+                                    "xr-split" => Some(84),
+                                    "xr-haptic" => Some(85),
+                                    _ => None,
+                                }
+                            });
+                            // MINT (Rel-18, TS 23.761): a CLI-triggered session
+                            // also routes to the subscription mapped to its DNN.
+                            let subscription_index = task_base
+                                .config
+                                .mint_config
+                                .as_ref()
+                                .map_or(0, |m| m.subscription_for_dnn(dnn.as_deref()));
+                            let params = SmSessionParams {
+                                session_type: requested_type,
+                                ssc_mode: SscModeValue::SscMode1,
+                                dnn,
+                                s_nssai: sm_session_params
+                                    .first()
+                                    .and_then(|p| p.s_nssai.clone()),
+                                emergency: false,
+                                requested_5qi,
+                                subscription_index,
+                            };
                             info!(
-                                "Sending PDU Session Release Request: PSI={}, PTI={}, len={}",
-                                psi,
-                                pti,
-                                nas_pdu.len()
+                                "Initiating PDU session establishment: type={}, dnn={:?}",
+                                session_type, params.dnn
                             );
-
-                            pdu_counter += 1;
-                            let _ = task_base
-                                .rrc_tx
-                                .send(RrcMessage::UplinkNasDelivery {
-                                    pdu_id: pdu_counter,
-                                    pdu: nas_pdu.into(),
-                                })
-                                .await;
+                            let outs = sm_orch.start_establishment(params);
+                            process_sm_outputs(
+                                outs,
+                                &mut orch,
+                                &task_base,
+                                &tun_tx,
+                                &mut pdu_counter,
+                            )
+                            .await;
+                        }
+                        NasMessage::InitiatePduSessionRelease { psi, pti: _ } => {
+                            info!("Initiating PDU session release: PSI={}", psi);
+                            let outs = sm_orch.start_release(psi);
+                            process_sm_outputs(
+                                outs,
+                                &mut orch,
+                                &task_base,
+                                &tun_tx,
+                                &mut pdu_counter,
+                            )
+                            .await;
                         }
                         NasMessage::InitiateDeregistration { switch_off } => {
                             info!("Initiating deregistration: switch_off={}", switch_off);
-
-                            use nextgsim_nas::ies::ie1::{
-                                DeRegistrationAccessType, IeDeRegistrationType,
-                                ReRegistrationRequired, SwitchOff as NasSwitchOff,
-                            };
-                            use nextgsim_nas::messages::mm::DeregistrationRequestUeOriginating;
-
-                            let switch_off_val = if switch_off {
-                                NasSwitchOff::SwitchOff
-                            } else {
-                                NasSwitchOff::NormalDeRegistration
-                            };
-
-                            let dereg_type = IeDeRegistrationType::new(
-                                DeRegistrationAccessType::ThreeGppAccess,
-                                ReRegistrationRequired::NotRequired,
-                                switch_off_val,
-                            );
-
-                            let suci_data = build_suci_from_config(&task_base.config);
-                            let mobile_identity =
-                                Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci_data);
-
-                            let dereg_req = DeregistrationRequestUeOriginating::new(
-                                dereg_type,
-                                NasKeySetIdentifier::no_key(),
-                                mobile_identity,
-                            );
-
-                            let mut nas_pdu = Vec::new();
-                            dereg_req.encode(&mut nas_pdu);
-
-                            info!(
-                                "Sending Deregistration Request: switch_off={}, len={}",
-                                switch_off,
-                                nas_pdu.len()
-                            );
-
-                            mm_state.switch_mm_state(MmSubState::DeregisteredInitiated);
-
-                            pdu_counter += 1;
-                            let _ = task_base
-                                .rrc_tx
-                                .send(RrcMessage::UplinkNasDelivery {
-                                    pdu_id: pdu_counter,
-                                    pdu: nas_pdu.into(),
-                                })
-                                .await;
+                            // Release the PDU sessions locally (the 5GMM
+                            // deregistration implicitly releases them,
+                            // TS 24.501 5.5.2.1)
+                            let sm_outs = sm_orch.release_all_locally();
+                            process_sm_outputs(
+                                sm_outs,
+                                &mut orch,
+                                &task_base,
+                                &tun_tx,
+                                &mut pdu_counter,
+                            )
+                            .await;
+                            let outs = orch.start_deregistration(switch_off);
+                            process_mm_outputs(
+                                outs,
+                                &mut orch,
+                                &mut sm_orch,
+                                &sm_session_params,
+                                &mut plmn_selector,
+                                &task_base,
+                                &tun_tx,
+                                &mut pdu_counter,
+                            )
+                            .await;
                         }
                         NasMessage::InitiateEmergencyRegistration => {
                             info!("Initiating emergency registration");
 
-                            use nextgsim_ue::nas::mm::EmergencyRegistrationProcedure;
+                            use nextgsim_nas::messages::mm::{
+                                Ie5gsMobileIdentity, MobileIdentityType,
+                            };
+                            use nextgsim_ue::nas::mm::{
+                                EmergencyRegistrationProcedure, MmState, MmSubState,
+                            };
 
                             let mut emerg_proc = EmergencyRegistrationProcedure::new();
 
                             // Use IMEI as identity if SUCI is not available (no USIM).
                             // Here we always build a SUCI — a full implementation would
                             // fall back to IMEI when no USIM is present.
-                            let suci_data = build_suci_from_config(&task_base.config);
+                            let suci_data = match build_suci_from_config(&task_base.config) {
+                                Ok(suci_data) => suci_data,
+                                Err(e) => {
+                                    warn!("Emergency registration aborted: cannot build SUCI: {e}");
+                                    continue;
+                                }
+                            };
                             let mobile_identity =
                                 Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci_data);
 
-                            use nextgsim_ue::nas::mm::MmState;
                             match emerg_proc.initiate(
                                 MmState::Deregistered,
                                 MmSubState::DeregisteredNormalService,
@@ -1441,8 +935,7 @@ impl UeApp {
                                         "Sending Emergency Registration Request, len={}, new_sub_state={:?}",
                                         nas_pdu.len(), new_sub_state
                                     );
-                                    mm_state.switch_mm_state(new_sub_state);
-                                    registration_sent = true;
+                                    orch.state_mut().switch_mm_state(new_sub_state);
                                     pdu_counter += 1;
                                     let _ = task_base
                                         .rrc_tx
@@ -1472,6 +965,7 @@ impl UeApp {
                     info!("NAS task channel closed");
                     break;
                 }
+            }
             }
         }
 
@@ -1747,96 +1241,616 @@ impl UeApp {
     }
 }
 
-/// Build SUCI with null protection scheme (scheme ID 0)
-/// Returns the raw SUCI data bytes for the 5GS Mobile Identity IE
-///
-/// Format: Type octet | SUPI Format | PLMN | Routing Indicator | Protection Scheme | Home Network Public Key ID | Scheme Output (MSIN)
-/// Build SUCI from UE config (extracts MCC/MNC/MSIN from config)
-fn build_suci_from_config(config: &nextgsim_common::config::UeConfig) -> Vec<u8> {
-    let mcc = format!("{:03}", config.hplmn.mcc);
-    let mnc = if config.hplmn.long_mnc {
-        format!("{:03}", config.hplmn.mnc)
-    } else {
-        format!("{:02}", config.hplmn.mnc)
-    };
-    let msin = if let Some(ref supi) = config.supi {
-        // IMSI = MCC + MNC + MSIN, extract MSIN by skipping MCC+MNC length
-        let plmn_len = mcc.len() + mnc.len();
-        if supi.value.len() > plmn_len {
-            supi.value[plmn_len..].to_string()
-        } else {
-            "0000000001".to_string()
+/// Deliver MM orchestrator outputs: transmit NAS PDUs, react to procedure
+/// outcomes and dispatch plain 5GMM messages the orchestrator does not own.
+#[allow(clippy::too_many_arguments)]
+async fn process_mm_outputs(
+    outputs: Vec<nextgsim_ue::nas::mm::MmOutput>,
+    orch: &mut nextgsim_ue::nas::mm::MmOrchestrator,
+    sm_orch: &mut nextgsim_ue::nas::sm::SmOrchestrator,
+    sm_session_params: &[nextgsim_ue::nas::sm::SmSessionParams],
+    plmn_selector: &mut nextgsim_ue::rrc::cell_selection::PlmnSelector,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_ue::nas::mm::MmOutput;
+    use nextgsim_ue::rrc::cell_selection::Plmn;
+
+    let home_plmn = Plmn::new(
+        task_base.config.hplmn.mcc,
+        task_base.config.hplmn.mnc,
+        task_base.config.hplmn.long_mnc,
+    );
+
+    for output in outputs {
+        match output {
+            MmOutput::SendNasPdu(nas_pdu) => {
+                *pdu_counter += 1;
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::UplinkNasDelivery {
+                        pdu_id: *pdu_counter,
+                        pdu: nas_pdu.into(),
+                    })
+                    .await;
+            }
+            MmOutput::RegistrationSucceeded => {
+                info!("Registration completed, MM state: {}", orch.state());
+                notify_rel18_registration(task_base, true).await;
+                // TS 23.122: record the registered PLMN (the camped cell
+                // broadcasts the configured PLMN in this simulation)
+                plmn_selector.set_registered_plmn(Some(home_plmn));
+
+                // Establish the configured default PDU sessions via the SM
+                // orchestrator (PSI/PTI allocation, T3580, UL NAS Transport
+                // wrapping all happen there)
+                if sm_orch.active_sessions().is_empty() {
+                    // Give the core a moment to finish the registration
+                    // path before requesting the PDU session
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // MINT (Rel-18, TS 23.761): the primary subscription only
+                    // establishes sessions routed to it (subscription_index 0);
+                    // secondary-SUPI sessions are established by the MINT driver
+                    // under their own SUPI's context.
+                    let primary_params: Vec<_> = sm_session_params
+                        .iter()
+                        .filter(|p| p.subscription_index == 0)
+                        .cloned()
+                        .collect();
+                    let outs = sm_orch.establish_default_sessions(&primary_params);
+                    process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;
+                }
+            }
+            MmOutput::RegistrationFailed(cause) => {
+                warn!("Registration failed: {:?} (#{})", cause, cause as u8);
+                plmn_selector.set_registered_plmn(None);
+                notify_rel18_registration(task_base, false).await;
+            }
+            MmOutput::AuthenticationRejected => {
+                warn!("Network rejected authentication: USIM considered invalid");
+                notify_rel18_registration(task_base, false).await;
+            }
+            MmOutput::PlmnSearchNeeded => {
+                // TS 23.122 Section 4.4.3.1: run PLMN selection with the
+                // MM orchestrator's forbidden-PLMN list
+                perform_plmn_selection(orch, plmn_selector, home_plmn, task_base, pdu_counter)
+                    .await;
+            }
+            MmOutput::NotHandled(plain) => {
+                handle_unmanaged_mm_message(plain, orch, sm_orch, task_base, tun_tx, pdu_counter)
+                    .await;
+            }
         }
-    } else {
-        "0000000001".to_string()
-    };
-    build_suci_null_scheme(&mcc, &mnc, &msin)
+    }
 }
 
-fn build_suci_null_scheme(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
-    let mut data = Vec::new();
+/// Deliver SM orchestrator outputs: protect and transmit UL NAS Transport
+/// PDUs through the MM security context and manage the TUN interfaces for
+/// session lifecycle events.
+async fn process_sm_outputs(
+    outputs: Vec<nextgsim_ue::nas::sm::SmOutput>,
+    orch: &mut nextgsim_ue::nas::mm::MmOrchestrator,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_ue::nas::sm::SmOutput;
 
-    // Type octet: SUCI = 0x01, SUPI format = IMSI (0)
-    // bits 2-0: type (001 = SUCI)
-    // bits 6-4: SUPI format (000 = IMSI)
-    // bit 3: spare
-    // bit 7: spare
-    data.push(0x01);
-
-    // PLMN (MCC + MNC) in BCD format (3 bytes)
-    // MCC digit 2 | MCC digit 1
-    // MNC digit 3 | MCC digit 3
-    // MNC digit 2 | MNC digit 1
-    let mcc_bytes: Vec<u8> = mcc
-        .chars()
-        .filter_map(|c| c.to_digit(10).map(|d| d as u8))
-        .collect();
-    let mnc_bytes: Vec<u8> = mnc
-        .chars()
-        .filter_map(|c| c.to_digit(10).map(|d| d as u8))
-        .collect();
-
-    // MCC digit 2 (high nibble) | MCC digit 1 (low nibble)
-    let byte1 =
-        (mcc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mcc_bytes.first().copied().unwrap_or(0xF);
-    data.push(byte1);
-
-    // MNC digit 3 (high nibble) | MCC digit 3 (low nibble)
-    // For 2-digit MNC, digit 3 is 0xF
-    let mnc_digit3 = if mnc_bytes.len() > 2 {
-        mnc_bytes[2]
-    } else {
-        0xF
-    };
-    let byte2 = (mnc_digit3 << 4) | mcc_bytes.get(2).copied().unwrap_or(0xF);
-    data.push(byte2);
-
-    // MNC digit 2 (high nibble) | MNC digit 1 (low nibble)
-    let byte3 =
-        (mnc_bytes.get(1).copied().unwrap_or(0xF) << 4) | mnc_bytes.first().copied().unwrap_or(0xF);
-    data.push(byte3);
-
-    // Routing indicator (4 digits in BCD, 2 bytes) - use 0000 for default
-    data.push(0x00); // digits 2,1
-    data.push(0xF0); // digits 4,3 (F = filler)
-
-    // Protection scheme ID (4 bits) + Home network public key ID (4 bits)
-    // Null scheme = 0, key ID = 0
-    data.push(0x00);
-
-    // Scheme output = MSIN in BCD (for null scheme, this is the unprotected MSIN)
-    // MSIN digits in BCD pairs
-    let msin_bytes: Vec<u8> = msin
-        .chars()
-        .filter_map(|c| c.to_digit(10).map(|d| d as u8))
-        .collect();
-    for chunk in msin_bytes.chunks(2) {
-        let low = chunk.first().copied().unwrap_or(0xF);
-        let high = chunk.get(1).copied().unwrap_or(0xF);
-        data.push((high << 4) | low);
+    for output in outputs {
+        match output {
+            SmOutput::SendNasPdu(plain) => {
+                // 5GSM messages travel inside UL NAS Transport and are
+                // protected with the MM NAS security context
+                // (TS 24.501 Sections 4.4 and 5.4.5)
+                let pdu = orch.protect_if_active(plain);
+                *pdu_counter += 1;
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::UplinkNasDelivery {
+                        pdu_id: *pdu_counter,
+                        pdu: pdu.into(),
+                    })
+                    .await;
+            }
+            SmOutput::SessionEstablished { psi, ipv4 } => {
+                info!("PDU session {psi} is now ACTIVE (IPv4: {ipv4:?})");
+                if let Some(ip) = ipv4 {
+                    let address = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                    info!("Creating TUN interface for PDU session {psi} with IP {address}");
+                    let _ = tun_tx
+                        .send(TunMessage::CreateInterface {
+                            psi: i32::from(psi),
+                            address,
+                            netmask: Ipv4Addr::new(255, 255, 255, 0),
+                        })
+                        .await;
+                }
+            }
+            SmOutput::SessionEstablishmentFailed { psi, cause } => {
+                warn!(
+                    "PDU session {psi} establishment failed: {:?} (#{})",
+                    cause, cause as u8
+                );
+            }
+            SmOutput::SessionReleased { psi } => {
+                info!("PDU session {psi} released");
+                let _ = tun_tx
+                    .send(TunMessage::DestroyInterface {
+                        psi: i32::from(psi),
+                    })
+                    .await;
+            }
+            SmOutput::SessionModified { psi } => {
+                info!("PDU session {psi} modification completed");
+            }
+            SmOutput::SessionModificationFailed { psi, cause } => {
+                warn!(
+                    "PDU session {psi} modification failed: {:?} (#{})",
+                    cause, cause as u8
+                );
+            }
+        }
     }
+}
 
-    data
+/// Deliver a MINT secondary subscription's MM outputs (Rel-18, TS 23.761):
+/// transmit its NAS PDUs over the shared radio connection, and on its
+/// registration success report the subscription to the MINT task and establish
+/// the PDU sessions routed to this subscription's SUPI under its own context.
+async fn process_secondary_mm_outputs(
+    index: u8,
+    outputs: Vec<nextgsim_ue::nas::mm::MmOutput>,
+    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_ue::nas::mm::MmOutput;
+
+    for output in outputs {
+        match output {
+            MmOutput::SendNasPdu(nas_pdu) => {
+                *pdu_counter += 1;
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::UplinkNasDelivery {
+                        pdu_id: *pdu_counter,
+                        pdu: nas_pdu.into(),
+                    })
+                    .await;
+            }
+            MmOutput::RegistrationSucceeded => {
+                info!("MINT: secondary subscription {index} registered");
+                // Report the secondary registration to the MINT task so it
+                // tracks per-SUPI state (TS 23.761).
+                if let Some(ref rel18) = task_base.rel18 {
+                    let supi = mint_secondary
+                        .get_mut(index)
+                        .map(|s| s.supi.clone())
+                        .unwrap_or_default();
+                    let _ = supi; // SUPI is tracked by index in the MINT task
+                    let _ = rel18
+                        .mint_tx
+                        .send(MintMessage::RegistrationUpdate {
+                            subscription_index: index,
+                            registered: true,
+                            serving_plmn: Some((
+                                task_base.config.hplmn.mcc,
+                                task_base.config.hplmn.mnc,
+                            )),
+                            guti: None,
+                        })
+                        .await;
+                }
+                // Establish this subscription's PDU sessions (routed by DNN to
+                // this SUPI) under its own MM/security context, so the SMF
+                // resolves SUPI-N's subscription in UDM/UDR.
+                let params = nextgsim_ue::nas::mm::MintSecondary::session_params_for(
+                    &task_base.config,
+                    index,
+                );
+                if let Some(sub) = mint_secondary.get_mut(index) {
+                    if sub.sm.active_sessions().is_empty() && !params.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let sm_outs = sub.sm.establish_default_sessions(&params);
+                        process_secondary_sm_outputs(
+                            index,
+                            sm_outs,
+                            mint_secondary,
+                            task_base,
+                            tun_tx,
+                            pdu_counter,
+                        )
+                        .await;
+                    }
+                }
+            }
+            MmOutput::RegistrationFailed(cause) => {
+                warn!("MINT: secondary subscription {index} registration failed: {cause:?}");
+            }
+            MmOutput::AuthenticationRejected => {
+                warn!("MINT: secondary subscription {index} authentication rejected");
+            }
+            MmOutput::PlmnSearchNeeded => {
+                warn!("MINT: secondary subscription {index} requested PLMN search (ignored)");
+            }
+            MmOutput::NotHandled(plain) => {
+                // Dispatch a plain 5GMM message the secondary orchestrator does
+                // not own (e.g. DL NAS Transport carrying its 5GSM responses).
+                if plain.len() >= 3
+                    && plain[2] == u8::from(nextgsim_nas::enums::MmMessageType::DlNasTransport)
+                {
+                    use nextgsim_nas::messages::mm::DlNasTransport;
+                    if let Ok(dl) = DlNasTransport::decode(&mut &plain[3..]) {
+                        if let Some(sub) = mint_secondary.get_mut(index) {
+                            let sm_outs = sub.sm.handle_dl_nas_transport(&dl);
+                            process_secondary_sm_outputs(
+                                index,
+                                sm_outs,
+                                mint_secondary,
+                                task_base,
+                                tun_tx,
+                                pdu_counter,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Process a downlink NAS PDU for a MINT secondary subscription's MM context.
+async fn process_secondary_downlink(
+    index: u8,
+    pdu: &[u8],
+    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    let outs = match mint_secondary.get_mut(index) {
+        Some(sub) => sub.mm.handle_downlink(pdu),
+        None => return,
+    };
+    process_secondary_mm_outputs(index, outs, mint_secondary, task_base, tun_tx, pdu_counter).await;
+}
+
+/// Deliver a MINT secondary subscription's SM outputs: protect the UL NAS
+/// Transport with that subscription's MM security context and transmit it,
+/// and manage TUN interfaces for its session lifecycle (Rel-18, TS 23.761).
+async fn process_secondary_sm_outputs(
+    index: u8,
+    outputs: Vec<nextgsim_ue::nas::sm::SmOutput>,
+    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_ue::nas::sm::SmOutput;
+
+    for output in outputs {
+        match output {
+            SmOutput::SendNasPdu(plain) => {
+                let pdu = match mint_secondary.get_mut(index) {
+                    Some(sub) => sub.mm.protect_if_active(plain),
+                    None => return,
+                };
+                *pdu_counter += 1;
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::UplinkNasDelivery {
+                        pdu_id: *pdu_counter,
+                        pdu: pdu.into(),
+                    })
+                    .await;
+            }
+            SmOutput::SessionEstablished { psi, ipv4 } => {
+                info!(
+                    "MINT: secondary subscription {index} PDU session {psi} ACTIVE (IPv4: {ipv4:?})"
+                );
+                // Report the session to the MINT task (per-SUPI session count).
+                if let Some(ref rel18) = task_base.rel18 {
+                    let _ = rel18
+                        .mint_tx
+                        .send(MintMessage::SessionUpdate {
+                            subscription_index: index,
+                            psi,
+                            active: true,
+                        })
+                        .await;
+                }
+                if let Some(ip) = ipv4 {
+                    let address = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                    let _ = tun_tx
+                        .send(TunMessage::CreateInterface {
+                            psi: i32::from(psi),
+                            address,
+                            netmask: Ipv4Addr::new(255, 255, 255, 0),
+                        })
+                        .await;
+                }
+            }
+            SmOutput::SessionEstablishmentFailed { psi, cause } => {
+                warn!(
+                    "MINT: secondary subscription {index} PDU session {psi} establishment failed: {cause:?}"
+                );
+            }
+            SmOutput::SessionReleased { psi } => {
+                info!("MINT: secondary subscription {index} PDU session {psi} released");
+                if let Some(ref rel18) = task_base.rel18 {
+                    let _ = rel18
+                        .mint_tx
+                        .send(MintMessage::SessionUpdate {
+                            subscription_index: index,
+                            psi,
+                            active: false,
+                        })
+                        .await;
+                }
+                let _ = tun_tx
+                    .send(TunMessage::DestroyInterface {
+                        psi: i32::from(psi),
+                    })
+                    .await;
+            }
+            SmOutput::SessionModified { psi } => {
+                info!("MINT: secondary subscription {index} PDU session {psi} modified");
+            }
+            SmOutput::SessionModificationFailed { psi, cause } => {
+                warn!(
+                    "MINT: secondary subscription {index} PDU session {psi} modification failed: {cause:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Run TS 23.122 automatic PLMN selection: feed the selector with the MM
+/// orchestrator's forbidden-PLMN list and either trigger a registration
+/// attempt on the selected PLMN or enter limited service.
+async fn perform_plmn_selection(
+    orch: &mut nextgsim_ue::nas::mm::MmOrchestrator,
+    plmn_selector: &mut nextgsim_ue::rrc::cell_selection::PlmnSelector,
+    home_plmn: nextgsim_ue::rrc::cell_selection::Plmn,
+    task_base: &UeTaskBase,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_nas::ies::RegistrationType;
+    use nextgsim_ue::nas::mm::MmOutput;
+    use nextgsim_ue::rrc::cell_selection::plmn_from_bcd;
+
+    // Consume the MM orchestrator's forbidden-PLMN list (TS 24.501 5.3.13)
+    let forbidden: Vec<_> = orch.forbidden_plmns().iter().map(plmn_from_bcd).collect();
+    plmn_selector.set_forbidden(forbidden);
+    plmn_selector.set_registered_plmn(None);
+
+    // Available PLMNs: in this simulation every cell in the gNB search
+    // list broadcasts the configured home PLMN
+    let available = [home_plmn];
+    match plmn_selector.select(&available) {
+        Some(plmn) => {
+            info!("PLMN selection chose {plmn}: attempting registration");
+            let outs = orch.start_registration(RegistrationType::InitialRegistration);
+            for out in outs {
+                if let MmOutput::SendNasPdu(nas_pdu) = out {
+                    *pdu_counter += 1;
+                    let _ = task_base
+                        .rrc_tx
+                        .send(RrcMessage::UplinkNasDelivery {
+                            pdu_id: *pdu_counter,
+                            pdu: nas_pdu.into(),
+                        })
+                        .await;
+                }
+            }
+        }
+        None => {
+            warn!(
+                "PLMN selection found no allowed PLMN ({} forbidden): limited service",
+                plmn_selector.is_forbidden(home_plmn)
+            );
+        }
+    }
+}
+
+/// Notify the Rel-18 actors of a registration-state change: the MINT task
+/// tracks the primary subscription's registration (TS 23.761) and, when
+/// ranging is configured, the Sidelink task starts/stops discovery.
+async fn notify_rel18_registration(task_base: &UeTaskBase, registered: bool) {
+    let Some(ref rel18) = task_base.rel18 else {
+        return;
+    };
+    let serving_plmn = if registered {
+        Some((task_base.config.hplmn.mcc, task_base.config.hplmn.mnc))
+    } else {
+        None
+    };
+    let _ = rel18
+        .mint_tx
+        .send(MintMessage::RegistrationUpdate {
+            subscription_index: 0,
+            registered,
+            serving_plmn,
+            guti: None,
+        })
+        .await;
+    let ranging_enabled = task_base
+        .config
+        .ranging_config
+        .as_ref()
+        .is_some_and(|c| c.enabled);
+    if ranging_enabled {
+        let msg = if registered {
+            SidelinkMessage::StartDiscovery
+        } else {
+            SidelinkMessage::StopDiscovery
+        };
+        let _ = rel18.sidelink_tx.send(msg).await;
+    }
+}
+
+/// Handle plain (already security-unwrapped) 5GMM messages that are not
+/// part of the orchestrator's procedures: identity request, DL NAS
+/// transport, configuration update.
+async fn handle_unmanaged_mm_message(
+    plain: Vec<u8>,
+    orch: &mut nextgsim_ue::nas::mm::MmOrchestrator,
+    sm_orch: &mut nextgsim_ue::nas::sm::SmOrchestrator,
+    task_base: &UeTaskBase,
+    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
+    pdu_counter: &mut u32,
+) {
+    use nextgsim_nas::enums::MmMessageType;
+    use nextgsim_nas::ies::RegistrationType;
+    use nextgsim_nas::messages::mm::{
+        DlNasTransport, IdentityRequest, IdentityResponse, Ie5gsMobileIdentity, MobileIdentityType,
+    };
+    use nextgsim_ue::nas::mm::{MmOutput, MmSubState};
+
+    let Ok(msg_type) = MmMessageType::try_from(plain[2]) else {
+        warn!("Unknown NAS message type: 0x{:02x}", plain[2]);
+        return;
+    };
+
+    match msg_type {
+        MmMessageType::IdentityRequest => {
+            // Decode Identity Request (decode consumes the full message)
+            match IdentityRequest::decode(&mut plain.as_slice()) {
+                Ok(id_req) => {
+                    info!("Identity Request - Type: {:?}", id_req.identity_type.value);
+
+                    // Build a fresh SUCI for the Identity Response (fresh
+                    // ephemeral key per concealment for the ECIES profiles)
+                    let suci_data = match build_suci_from_config(&task_base.config) {
+                        Ok(suci_data) => suci_data,
+                        Err(e) => {
+                            warn!("Cannot answer Identity Request: SUCI build failed: {e}");
+                            return;
+                        }
+                    };
+                    let mobile_identity =
+                        Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci_data);
+
+                    let id_response = IdentityResponse::new(mobile_identity);
+                    let mut nas_pdu = Vec::new();
+                    id_response.encode(&mut nas_pdu);
+                    let nas_pdu = orch.protect_if_active(nas_pdu);
+
+                    info!("Sending Identity Response, PDU len={}", nas_pdu.len());
+                    *pdu_counter += 1;
+                    let _ = task_base
+                        .rrc_tx
+                        .send(RrcMessage::UplinkNasDelivery {
+                            pdu_id: *pdu_counter,
+                            pdu: nas_pdu.into(),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    warn!("Failed to decode Identity Request: {:?}", e);
+                }
+            }
+        }
+        MmMessageType::DlNasTransport => {
+            // DL NAS Transport (TS 24.501 8.2.11): decode through the
+            // codec and hand N1 SM containers to the SM orchestrator
+            let header_len = 3; // EPD + SecHdr + MsgType
+            match DlNasTransport::decode(&mut &plain[header_len..]) {
+                Ok(dl) => {
+                    debug!(
+                        "DL NAS Transport: container type {:?}, PSI {:?}, len={}",
+                        dl.payload_container_type,
+                        dl.pdu_session_id,
+                        dl.payload_container.len()
+                    );
+                    let outs = sm_orch.handle_dl_nas_transport(&dl);
+                    process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;
+                }
+                Err(e) => {
+                    warn!("Failed to decode DL NAS Transport: {e:?}");
+                }
+            }
+        }
+        MmMessageType::ConfigurationUpdateCommand => {
+            use nextgsim_ue::nas::mm::{
+                ConfigUpdateProcedure, ConfigurationUpdateCommand as CuCmd,
+                ConfigurationUpdateComplete as CuComplete,
+            };
+            let header_len = 3; // EPD + SecHdr + MsgType
+            let cmd = if plain.len() > header_len {
+                CuCmd::decode(&mut &plain[header_len..]).unwrap_or_default()
+            } else {
+                CuCmd::default()
+            };
+            let result = ConfigUpdateProcedure::process_command(&cmd);
+
+            if let Some(ref new_guti) = result.new_guti {
+                info!(
+                    "ConfigurationUpdate: new GUTI received (type={:?})",
+                    new_guti.identity_type
+                );
+            }
+            if let Some(t) = result.new_t3512_secs {
+                info!("ConfigurationUpdate: T3512 updated to {}s", t);
+            }
+
+            // Send ConfigurationUpdateComplete if the ACK bit was set
+            if result.send_complete {
+                let mut nas_pdu = Vec::new();
+                CuComplete::new().encode(&mut nas_pdu);
+                let nas_pdu = orch.protect_if_active(nas_pdu);
+                info!("Sending ConfigurationUpdateComplete, len={}", nas_pdu.len());
+                *pdu_counter += 1;
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::UplinkNasDelivery {
+                        pdu_id: *pdu_counter,
+                        pdu: nas_pdu.into(),
+                    })
+                    .await;
+            }
+
+            // A re-registration request is a mobility registration trigger
+            if result.re_register {
+                info!("ConfigurationUpdate: re-registration requested");
+                orch.state_mut()
+                    .switch_mm_state(MmSubState::RegisteredUpdateNeeded);
+                let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+                for out in outs {
+                    if let MmOutput::SendNasPdu(nas_pdu) = out {
+                        *pdu_counter += 1;
+                        let _ = task_base
+                            .rrc_tx
+                            .send(RrcMessage::UplinkNasDelivery {
+                                pdu_id: *pdu_counter,
+                                pdu: nas_pdu.into(),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+        _ => {
+            info!("Unhandled NAS message type: {:?}", msg_type);
+        }
+    }
+}
+
+/// Build the SUCI 5GS mobile identity IE contents from the UE configuration
+/// (TS 24.501 Section 9.11.3.4).
+///
+/// Delegates to [`nextgsim_ue::nas::mm::build_suci`], which selects the
+/// protection scheme (null / ECIES Profile A / ECIES Profile B) from
+/// `config.protection_scheme` and conceals the MSIN with a fresh ephemeral
+/// key pair per call. Errors are fatal for identity signalling: there is no
+/// silent fallback to the null scheme.
+fn build_suci_from_config(
+    config: &nextgsim_common::config::UeConfig,
+) -> Result<Vec<u8>, nextgsim_ue::nas::mm::SuciBuildError> {
+    nextgsim_ue::nas::mm::build_suci(config)
 }
 
 /// Initializes the tracing subscriber for logging.
@@ -2153,52 +2167,15 @@ mod tests {
         assert_eq!(result, "001010000000006");
     }
 
-    // -- SUCI BCD encoding tests --
+    // -- SUCI encoding tests --
+    //
+    // The full SUCI wire-format coverage (null scheme byte layout, routing
+    // indicator, ECIES Profile A/B concealment + TS 33.501 Annex C vectors,
+    // error paths) lives in `nextgsim_ue::nas::mm::suci`; these verify the
+    // delegation and the config-driven scheme selection.
 
     #[test]
-    fn test_build_suci_null_scheme_2digit_mnc() {
-        let suci = build_suci_null_scheme("001", "01", "0000000001");
-        // Byte structure: Type(1) + PLMN(3) + RoutingInd(2) + SchemeId(1) + SchemeOutput(5)
-        assert!(!suci.is_empty());
-        // Type byte: SUCI = 0x01 (type 1, even/odd indicator varies)
-        // PLMN BCD: MCC=001 → 0x00,0xF1; MNC=01 → encoded in PLMN bytes
-        // At minimum verify we get the right length for null scheme
-        // SUCI format: type(1) + PLMN(3) + routing_indicator(2) + protection_scheme(1) + home_nw_pki(1) + scheme_output(5) = 13
-        assert!(
-            suci.len() >= 10,
-            "SUCI should be at least 10 bytes, got {}",
-            suci.len()
-        );
-    }
-
-    #[test]
-    fn test_build_suci_null_scheme_3digit_mnc() {
-        let suci = build_suci_null_scheme("999", "070", "0000000001");
-        assert!(suci.len() >= 10);
-        // Different MNC lengths should produce valid SUCI
-        let suci2 = build_suci_null_scheme("999", "70", "0000000001");
-        // 2-digit and 3-digit MNC encodings differ in the PLMN BCD bytes
-        // Both should be valid
-        assert!(suci.len() >= 10);
-        assert!(suci2.len() >= 10);
-    }
-
-    #[test]
-    fn test_build_suci_null_scheme_deterministic() {
-        let s1 = build_suci_null_scheme("999", "70", "0000000001");
-        let s2 = build_suci_null_scheme("999", "70", "0000000001");
-        assert_eq!(s1, s2, "Same input must produce identical SUCI bytes");
-    }
-
-    #[test]
-    fn test_build_suci_null_scheme_different_msin() {
-        let s1 = build_suci_null_scheme("999", "70", "0000000001");
-        let s2 = build_suci_null_scheme("999", "70", "0000000002");
-        assert_ne!(s1, s2, "Different MSIN must produce different SUCI");
-    }
-
-    #[test]
-    fn test_build_suci_from_config_standard() {
+    fn test_build_suci_from_config_null_scheme() {
         use nextgsim_common::config::{OpType, UeConfig};
         use nextgsim_common::types::{Plmn, Supi, SupiType};
 
@@ -2212,40 +2189,41 @@ mod tests {
                 supi_type: SupiType::Imsi,
                 value: "999700000000001".to_string(),
             }),
-            key: [0u8; 16],
-            op: [0u8; 16],
+            key: [0x11; 16],
+            op: [0x22; 16],
             op_type: OpType::Opc,
             ..Default::default()
         };
-        let suci = build_suci_from_config(&config);
-        // Should produce same result as direct call
-        let expected = build_suci_null_scheme("999", "70", "0000000001");
-        assert_eq!(suci, expected);
+        let suci = build_suci_from_config(&config).expect("null-scheme SUCI");
+        // type(1) | PLMN(3) | RI(2) | scheme(1) | key id(1) | MSIN TBCD(5)
+        assert_eq!(
+            suci,
+            vec![0x01, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]
+        );
     }
 
     #[test]
-    fn test_build_suci_from_config_3digit_mnc() {
+    fn test_build_suci_from_config_invalid_scheme_fails() {
         use nextgsim_common::config::{OpType, UeConfig};
-        use nextgsim_common::types::{Plmn, Supi, SupiType};
+        use nextgsim_common::types::Plmn;
 
         let config = UeConfig {
             hplmn: Plmn {
-                mcc: 1,
-                mnc: 1,
-                long_mnc: true,
+                mcc: 999,
+                mnc: 70,
+                long_mnc: false,
             },
-            supi: Some(Supi {
-                supi_type: SupiType::Imsi,
-                value: "0010010000000099".to_string(),
-            }),
-            key: [0u8; 16],
-            op: [0u8; 16],
+            supi: None,
+            protection_scheme: 7, // unsupported
+            key: [0x11; 16],
+            op: [0x22; 16],
             op_type: OpType::Opc,
             ..Default::default()
         };
-        let suci = build_suci_from_config(&config);
-        let expected = build_suci_null_scheme("001", "001", "0000000099");
-        assert_eq!(suci, expected);
+        // No fallback to the null scheme on bad configuration: both the
+        // builder and the startup validation must reject it
+        assert!(build_suci_from_config(&config).is_err());
+        assert!(validate_ue_config(&config).is_err());
     }
 
     #[test]
@@ -2260,14 +2238,17 @@ mod tests {
                 long_mnc: false,
             },
             supi: None, // no SUPI
-            key: [0u8; 16],
-            op: [0u8; 16],
+            key: [0x11; 16],
+            op: [0x22; 16],
             op_type: OpType::Opc,
             ..Default::default()
         };
-        let suci = build_suci_from_config(&config);
-        // Should fall back to default MSIN "0000000001"
-        let expected = build_suci_null_scheme("999", "70", "0000000001");
-        assert_eq!(suci, expected);
+        // Without a SUPI the builder falls back to the default MSIN
+        let suci = build_suci_from_config(&config).expect("default-MSIN SUCI");
+        assert_eq!(
+            &suci[8..],
+            &[0x00, 0x00, 0x00, 0x00, 0x10],
+            "default MSIN 0000000001 in TBCD"
+        );
     }
 }

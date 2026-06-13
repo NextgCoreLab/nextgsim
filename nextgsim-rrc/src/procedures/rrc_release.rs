@@ -62,6 +62,43 @@ pub struct DeprioritisationReq {
     pub deprioritisation_timer: DeprioritisationTimer,
 }
 
+/// T320 timer values for cell reselection priorities (TS 38.331 §6.3.2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum T320Value {
+    /// 5 minutes
+    Min5,
+    /// 10 minutes
+    Min10,
+    /// 20 minutes
+    Min20,
+    /// 30 minutes
+    Min30,
+    /// 60 minutes
+    Min60,
+    /// 120 minutes
+    Min120,
+    /// 180 minutes
+    Min180,
+}
+
+/// Dedicated NR frequency reselection priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreqPriorityNrParams {
+    /// NR ARFCN of the carrier
+    pub carrier_freq: u32,
+    /// Cell reselection priority (0-7)
+    pub priority: u8,
+}
+
+/// CellReselectionPriorities IE for RRC Release (TS 38.331 §6.3.2)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CellReselectionPrioritiesParams {
+    /// Dedicated NR frequency priorities
+    pub freq_priority_list_nr: Vec<FreqPriorityNrParams>,
+    /// T320 validity timer (optional)
+    pub t320: Option<T320Value>,
+}
+
 // ============================================================================
 // RRC Release
 // ============================================================================
@@ -73,6 +110,8 @@ pub struct RrcReleaseParams {
     pub rrc_transaction_id: u8,
     /// Redirected carrier info (encoded as bytes, optional)
     pub redirected_carrier_info: Option<Vec<u8>>,
+    /// Cell reselection priorities (optional)
+    pub cell_reselection_priorities: Option<CellReselectionPrioritiesParams>,
     /// Suspend configuration (encoded as bytes, optional)
     pub suspend_config: Option<Vec<u8>>,
     /// Deprioritisation request (optional)
@@ -88,6 +127,8 @@ pub struct RrcReleaseData {
     pub rrc_transaction_id: u8,
     /// Redirected carrier info (raw bytes)
     pub redirected_carrier_info: Option<Vec<u8>>,
+    /// Cell reselection priorities
+    pub cell_reselection_priorities: Option<CellReselectionPrioritiesParams>,
     /// Suspend configuration (raw bytes)
     pub suspend_config: Option<Vec<u8>>,
     /// Deprioritisation request
@@ -158,9 +199,16 @@ pub fn build_rrc_release(params: &RrcReleaseParams) -> Result<DL_DCCH_Message, R
         non_critical_extension: None,
     });
 
+    // Build cell reselection priorities if provided
+    let cell_reselection_priorities = params
+        .cell_reselection_priorities
+        .as_ref()
+        .map(build_cell_reselection_priorities)
+        .transpose()?;
+
     let rrc_release_ies = RRCRelease_IEs {
         redirected_carrier_info,
-        cell_reselection_priorities: None, // Simplified - not including for now
+        cell_reselection_priorities,
         suspend_config,
         deprioritisation_req,
         late_non_critical_extension: None,
@@ -261,13 +309,102 @@ pub fn parse_rrc_release(msg: &DL_DCCH_Message) -> Result<RrcReleaseData, RrcRel
         .as_ref()
         .and_then(|ext| ext.wait_time.as_ref().map(|wt| wt.0));
 
+    // Parse cell reselection priorities
+    let cell_reselection_priorities = ies
+        .cell_reselection_priorities
+        .as_ref()
+        .map(parse_cell_reselection_priorities);
+
     Ok(RrcReleaseData {
         rrc_transaction_id: rrc_release.rrc_transaction_identifier.0,
         redirected_carrier_info,
+        cell_reselection_priorities,
         suspend_config,
         deprioritisation_req,
         wait_time,
     })
+}
+
+/// Build the generated `CellReselectionPriorities` from typed parameters
+fn build_cell_reselection_priorities(
+    params: &CellReselectionPrioritiesParams,
+) -> Result<CellReselectionPriorities, RrcReleaseError> {
+    for entry in &params.freq_priority_list_nr {
+        if entry.priority > 7 {
+            return Err(RrcReleaseError::InvalidFieldValue(
+                "Cell reselection priority must be 0-7".to_string(),
+            ));
+        }
+    }
+
+    let freq_priority_list_nr = if params.freq_priority_list_nr.is_empty() {
+        None
+    } else {
+        Some(FreqPriorityListNR(
+            params
+                .freq_priority_list_nr
+                .iter()
+                .map(|entry| FreqPriorityNR {
+                    carrier_freq: ARFCN_ValueNR(entry.carrier_freq),
+                    cell_reselection_priority: CellReselectionPriority(entry.priority),
+                    cell_reselection_sub_priority: None,
+                })
+                .collect(),
+        ))
+    };
+
+    let t320 = params.t320.map(|t| {
+        CellReselectionPrioritiesT320(match t {
+            T320Value::Min5 => CellReselectionPrioritiesT320::MIN5,
+            T320Value::Min10 => CellReselectionPrioritiesT320::MIN10,
+            T320Value::Min20 => CellReselectionPrioritiesT320::MIN20,
+            T320Value::Min30 => CellReselectionPrioritiesT320::MIN30,
+            T320Value::Min60 => CellReselectionPrioritiesT320::MIN60,
+            T320Value::Min120 => CellReselectionPrioritiesT320::MIN120,
+            T320Value::Min180 => CellReselectionPrioritiesT320::MIN180,
+        })
+    });
+
+    Ok(CellReselectionPriorities {
+        freq_priority_list_eutra: None,
+        freq_priority_list_nr,
+        t320,
+    })
+}
+
+/// Parse the generated `CellReselectionPriorities` into typed parameters
+fn parse_cell_reselection_priorities(
+    priorities: &CellReselectionPriorities,
+) -> CellReselectionPrioritiesParams {
+    let freq_priority_list_nr = priorities
+        .freq_priority_list_nr
+        .as_ref()
+        .map(|list| {
+            list.0
+                .iter()
+                .map(|entry| FreqPriorityNrParams {
+                    carrier_freq: entry.carrier_freq.0,
+                    priority: entry.cell_reselection_priority.0,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let t320 = priorities.t320.as_ref().and_then(|t| match t.0 {
+        CellReselectionPrioritiesT320::MIN5 => Some(T320Value::Min5),
+        CellReselectionPrioritiesT320::MIN10 => Some(T320Value::Min10),
+        CellReselectionPrioritiesT320::MIN20 => Some(T320Value::Min20),
+        CellReselectionPrioritiesT320::MIN30 => Some(T320Value::Min30),
+        CellReselectionPrioritiesT320::MIN60 => Some(T320Value::Min60),
+        CellReselectionPrioritiesT320::MIN120 => Some(T320Value::Min120),
+        CellReselectionPrioritiesT320::MIN180 => Some(T320Value::Min180),
+        _ => None,
+    });
+
+    CellReselectionPrioritiesParams {
+        freq_priority_list_nr,
+        t320,
+    }
 }
 
 // ============================================================================
@@ -305,6 +442,7 @@ mod tests {
     fn create_test_release_params() -> RrcReleaseParams {
         RrcReleaseParams {
             rrc_transaction_id: 0,
+            cell_reselection_priorities: None,
             redirected_carrier_info: None,
             suspend_config: None,
             deprioritisation_req: None,
@@ -339,6 +477,7 @@ mod tests {
     fn test_rrc_release_with_deprioritisation() {
         let params = RrcReleaseParams {
             rrc_transaction_id: 1,
+            cell_reselection_priorities: None,
             redirected_carrier_info: None,
             suspend_config: None,
             deprioritisation_req: Some(DeprioritisationReq {
@@ -362,6 +501,7 @@ mod tests {
     fn test_rrc_release_with_wait_time() {
         let params = RrcReleaseParams {
             rrc_transaction_id: 2,
+            cell_reselection_priorities: None,
             redirected_carrier_info: None,
             suspend_config: None,
             deprioritisation_req: None,
@@ -395,6 +535,7 @@ mod tests {
     fn test_invalid_rrc_transaction_id() {
         let params = RrcReleaseParams {
             rrc_transaction_id: 5, // Invalid: must be 0-3
+            cell_reselection_priorities: None,
             redirected_carrier_info: None,
             suspend_config: None,
             deprioritisation_req: None,
@@ -411,6 +552,7 @@ mod tests {
         for id in 0..=3 {
             let params = RrcReleaseParams {
                 rrc_transaction_id: id,
+                cell_reselection_priorities: None,
                 redirected_carrier_info: None,
                 suspend_config: None,
                 deprioritisation_req: None,
@@ -426,6 +568,7 @@ mod tests {
     fn test_deprioritisation_type_nr() {
         let params = RrcReleaseParams {
             rrc_transaction_id: 0,
+            cell_reselection_priorities: None,
             redirected_carrier_info: None,
             suspend_config: None,
             deprioritisation_req: Some(DeprioritisationReq {
@@ -455,6 +598,7 @@ mod tests {
         for timer in timers {
             let params = RrcReleaseParams {
                 rrc_transaction_id: 0,
+                cell_reselection_priorities: None,
                 redirected_carrier_info: None,
                 suspend_config: None,
                 deprioritisation_req: Some(DeprioritisationReq {
@@ -471,5 +615,44 @@ mod tests {
                 timer
             );
         }
+    }
+
+    #[test]
+    fn test_release_with_cell_reselection_priorities_roundtrip() {
+        let priorities = CellReselectionPrioritiesParams {
+            freq_priority_list_nr: vec![
+                FreqPriorityNrParams {
+                    carrier_freq: 632628,
+                    priority: 5,
+                },
+                FreqPriorityNrParams {
+                    carrier_freq: 423170,
+                    priority: 3,
+                },
+            ],
+            t320: Some(T320Value::Min10),
+        };
+        let params = RrcReleaseParams {
+            cell_reselection_priorities: Some(priorities.clone()),
+            ..create_test_release_params()
+        };
+        let msg = build_rrc_release(&params).unwrap();
+        let data = parse_rrc_release(&msg).unwrap();
+        assert_eq!(data.cell_reselection_priorities, Some(priorities));
+    }
+
+    #[test]
+    fn test_cell_reselection_priorities_rejects_invalid_priority() {
+        let params = RrcReleaseParams {
+            cell_reselection_priorities: Some(CellReselectionPrioritiesParams {
+                freq_priority_list_nr: vec![FreqPriorityNrParams {
+                    carrier_freq: 1,
+                    priority: 8, // out of range 0-7
+                }],
+                t320: None,
+            }),
+            ..create_test_release_params()
+        };
+        assert!(build_rrc_release(&params).is_err());
     }
 }

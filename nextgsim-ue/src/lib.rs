@@ -126,10 +126,15 @@ pub use rls::{RlsTask, RlsTaskConfig, DEFAULT_RLS_PORT};
 
 // Re-export task types
 pub use tasks::{
-    AppMessage, CmState, NasMessage, RlsMessage, RrcMessage, Task, TaskHandle, TaskId, TaskManager,
-    TaskMessage, TaskState, UeCliCommand, UeCliCommandType, UeStatusUpdate, UeTaskBase,
-    DEFAULT_CHANNEL_CAPACITY,
+    AppMessage, CmState, MintMessage, NasMessage, RangingMessage, RlsMessage, RrcMessage,
+    SidelinkMessage, Task, TaskHandle, TaskId, TaskManager, TaskMessage, TaskState, UeCliCommand,
+    UeCliCommandType, UeRel18Receivers, UeStatusUpdate, UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
 };
+
+// Re-export Rel-18 5G-Advanced task types
+pub use mint::MintTask;
+pub use ranging::RangingTask;
+pub use sidelink::SidelinkTask;
 
 // Re-export App types
 pub use app::{
