@@ -222,12 +222,35 @@ If PDU session establishment fails:
    docker exec nextgsim-ue ip addr show uesimtun0
    ```
 
+## Rel-17/18 Feature Testing
+
+Beyond the baseline registration/PDU/ping flow, the integrated Rel-17/18 features
+(RedCap, XR 5QI, SNPN, MINT, UAV) are exercised end-to-end by an automated harness
+that lives in nextgcore and drives nextgsim with per-feature UE/gNB configs from
+`config/features/`:
+
+```bash
+# From nextgcore/docker/rust (with a built stack up, e.g. ./e2e-test.sh --keep)
+./feature-e2e-test.sh                       # all feature scenarios
+./feature-e2e-test.sh redcap xr snpn-accept # selected scenarios
+```
+
+Each scenario swaps the UE (and, for SNPN, the gNB + AMF) config via the
+`docker-compose.features.yml` overlay and asserts the per-NF log signatures. The
+matching UE-side config knobs (`redcap`, `requested_5qi`, `snpn_config`,
+`mint_config`, `uav_config`) are documented in
+[configuration.md](configuration.md#rel-1718-feature-configuration-ue); the
+nextgcore env knobs (`AMF_SNPN_ALLOWED_NIDS`, `AMF_UAV_GEOFENCE`,
+`REDCAP_SESS_AMBR_DL_BPS`/`_UL_BPS`) are documented in
+`nextgcore/docker/rust/README.md`. Example configs: `config/features/*.yaml`.
+
 ## File Reference
 
 | File | Purpose |
 |------|---------|
 | `config/gnb.yaml` | gNB configuration (PLMN, TAC, AMF address) |
 | `config/ue.yaml` | UE configuration (IMSI, keys, sessions) |
+| `config/features/*.yaml` | Per-feature UE/gNB configs for the Rel-17/18 feature E2E test |
 | `docker-compose.yaml` | Container orchestration |
 | `scripts/add-subscriber.js` | MongoDB subscriber provisioning |
 
