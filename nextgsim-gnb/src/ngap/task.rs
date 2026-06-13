@@ -54,6 +54,8 @@ use nextgsim_ngap::procedures::pdu_session_resource::{
     encode_pdu_session_resource_modify_response,
     encode_pdu_session_resource_release_response,
     encode_pdu_session_resource_setup_response,
+    PduSessionResourceFailedToModifyItem,
+    PduSessionResourceFailedToSetupItem,
     PduSessionResourceModifyRequestData,
     PduSessionResourceModifyResponseItem,
     PduSessionResourceModifyResponseParams,
@@ -64,9 +66,25 @@ use nextgsim_ngap::procedures::pdu_session_resource::{
     PduSessionResourceSetupResponseItem,
     PduSessionResourceSetupResponseParams,
 };
+use nextgsim_ngap::procedures::ng_setup::{
+    NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
+};
+use nextgsim_ngap::procedures::path_switch::{
+    decode_path_switch_request_acknowledge, decode_path_switch_request_failure,
+    encode_path_switch_request, PathSwitchRequestAcknowledgeData, PathSwitchRequestFailureData,
+    PathSwitchRequestParams, PathSwitchSessionItem, UeSecurityCapabilityBits,
+};
+use nextgsim_ngap::procedures::transfer::{
+    decode_modify_request_transfer, decode_release_command_transfer,
+    decode_setup_request_transfer, encode_modify_response_transfer,
+    encode_modify_unsuccessful_transfer, encode_release_response_transfer,
+    encode_setup_response_transfer, encode_setup_unsuccessful_transfer, GtpTunnelInfo,
+    ModifyResponseTransferParams, SetupResponseTransferParams,
+};
 use nextgsim_ngap::procedures::ue_context_release::{
     decode_ue_context_release_command, encode_ue_context_release_complete,
-    UeContextReleaseCompleteParams,
+    encode_ue_context_release_request, UeContextReleaseCompleteParams,
+    UeContextReleaseRequestParams,
 };
 use nextgsim_ngap::procedures::{
     build_ng_setup_request,
@@ -652,43 +670,49 @@ impl NgapTask {
         };
 
         let mut setup_response_items = Vec::new();
-        let gnb_ip = self.task_base.config.gtp_ip;
+        let mut failed_items = Vec::new();
+        let gnb_ip = self.task_base.config.gtp_advertise_ip.unwrap_or(self.task_base.config.gtp_ip);
 
         for item in &setup_req.pdu_session_resource_setup_list {
             let psi = item.pdu_session_id;
 
-            // Parse N2 SM transfer to extract UPF tunnel info
-            // Format: QFI(1) + TEID(4,BE) + addr_type(1) + IPv4(4) + 5QI(1) + priority(1)
-            let (upf_teid, upf_addr, qfi) = if item.transfer.len() >= 10 {
-                let qfi = item.transfer[0];
-                let teid = u32::from_be_bytes([
-                    item.transfer[1],
-                    item.transfer[2],
-                    item.transfer[3],
-                    item.transfer[4],
-                ]);
-                let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                    item.transfer[6],
-                    item.transfer[7],
-                    item.transfer[8],
-                    item.transfer[9],
-                ));
-                (teid, addr, qfi)
-            } else {
-                warn!(
-                    "PDU Session {} has insufficient transfer IE ({} bytes)",
-                    psi,
-                    item.transfer.len()
-                );
-                continue;
+            // Decode the APER PDUSessionResourceSetupRequestTransfer (TS 38.413 §9.3.4.1)
+            let request = match decode_setup_request_transfer(&item.transfer) {
+                Ok(req) => req,
+                Err(e) => {
+                    warn!(
+                        "PDU Session {}: failed to decode SetupRequestTransfer ({} bytes): {}",
+                        psi,
+                        item.transfer.len(),
+                        e
+                    );
+                    if let Ok(transfer) = encode_setup_unsuccessful_transfer(
+                        &NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError),
+                    ) {
+                        failed_items.push(PduSessionResourceFailedToSetupItem {
+                            pdu_session_id: psi,
+                            transfer,
+                        });
+                    }
+                    continue;
+                }
             };
 
-            // Allocate gNB uplink TEID
+            let upf_teid = request.ul_tunnel.teid;
+            let upf_addr = request.ul_tunnel.address;
+            // First QoS flow is the default flow for the session
+            let qfi = request.qos_flows[0].qfi;
+
+            // Allocate gNB DL TEID for the N3 tunnel
             let gnb_teid = self.next_downlink_teid();
 
             info!(
-                "PDU Session {}: UPF TEID=0x{:08x}, UPF addr={}, QFI={}, gNB TEID=0x{:08x}",
-                psi, upf_teid, upf_addr, qfi, gnb_teid
+                "PDU Session {}: UPF TEID=0x{:08x}, UPF addr={}, QFIs={:?}, gNB TEID=0x{:08x}",
+                psi,
+                upf_teid,
+                upf_addr,
+                request.qos_flows.iter().map(|f| f.qfi).collect::<Vec<_>>(),
+                gnb_teid
             );
 
             // Store PDU session in UE context
@@ -713,6 +737,19 @@ impl NgapTask {
             let msg = GtpMessage::SessionCreate { ue_id, resource };
             if let Err(e) = self.task_base.gtp_tx.send(msg).await {
                 error!("Failed to send SessionCreate to GTP: {}", e);
+                if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                    ctx.remove_pdu_session(psi);
+                }
+                if let Ok(transfer) = encode_setup_unsuccessful_transfer(
+                    &NgSetupFailureCause::RadioNetwork(
+                        RadioNetworkCause::RadioResourcesNotAvailable,
+                    ),
+                ) {
+                    failed_items.push(PduSessionResourceFailedToSetupItem {
+                        pdu_session_id: psi,
+                        transfer,
+                    });
+                }
                 continue;
             }
             info!(
@@ -731,20 +768,40 @@ impl NgapTask {
                 }
             }
 
-            // Build response transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
-            let mut response_transfer = Vec::with_capacity(10);
-            response_transfer.push(qfi);
-            response_transfer.extend_from_slice(&gnb_teid.to_be_bytes());
-            response_transfer.push(1); // IPv4
-            match gnb_ip {
-                std::net::IpAddr::V4(v4) => response_transfer.extend_from_slice(&v4.octets()),
-                std::net::IpAddr::V6(_) => response_transfer.extend_from_slice(&[127, 0, 0, 1]),
+            // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
+            // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
+            let transfer_params = SetupResponseTransferParams {
+                dl_tunnel: GtpTunnelInfo {
+                    address: gnb_ip,
+                    teid: gnb_teid,
+                },
+                accepted_qfis: request.qos_flows.iter().map(|f| f.qfi).collect(),
+                failed_qos_flows: vec![],
+            };
+            match encode_setup_response_transfer(&transfer_params) {
+                Ok(response_transfer) => {
+                    setup_response_items.push(PduSessionResourceSetupResponseItem {
+                        pdu_session_id: psi,
+                        transfer: response_transfer,
+                    });
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to encode SetupResponseTransfer for PSI {}: {}",
+                        psi, e
+                    );
+                    if let Ok(transfer) = encode_setup_unsuccessful_transfer(
+                        &NgSetupFailureCause::Misc(
+                            nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
+                        ),
+                    ) {
+                        failed_items.push(PduSessionResourceFailedToSetupItem {
+                            pdu_session_id: psi,
+                            transfer,
+                        });
+                    }
+                }
             }
-
-            setup_response_items.push(PduSessionResourceSetupResponseItem {
-                pdu_session_id: psi,
-                transfer: response_transfer,
-            });
         }
 
         // Build and send PDU Session Resource Setup Response
@@ -756,7 +813,11 @@ impl NgapTask {
             } else {
                 Some(setup_response_items)
             },
-            failed_list: None,
+            failed_list: if failed_items.is_empty() {
+                None
+            } else {
+                Some(failed_items)
+            },
         };
 
         match encode_pdu_session_resource_setup_response(&response_params) {
@@ -806,33 +867,68 @@ impl NgapTask {
         };
 
         let mut modify_response_items = Vec::new();
-        let gnb_ip = self.task_base.config.gtp_ip;
+        let mut failed_items = Vec::new();
+        let gnb_ip = self.task_base.config.gtp_advertise_ip.unwrap_or(self.task_base.config.gtp_ip);
 
         for item in &modify_req.pdu_session_resource_modify_list {
             let psi = item.pdu_session_id;
 
-            // Parse transfer IE for updated UPF tunnel info (same format as Setup)
-            let (upf_teid, upf_addr, qfi) = if item.transfer.len() >= 10 {
-                let qfi = item.transfer[0];
-                let teid = u32::from_be_bytes([
-                    item.transfer[1],
-                    item.transfer[2],
-                    item.transfer[3],
-                    item.transfer[4],
-                ]);
-                let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                    item.transfer[6],
-                    item.transfer[7],
-                    item.transfer[8],
-                    item.transfer[9],
-                ));
-                (teid, addr, qfi)
-            } else {
-                warn!("PDU Session {} modify: insufficient transfer IE", psi);
+            // Decode the APER PDUSessionResourceModifyRequestTransfer (§9.3.4.3)
+            let request = match decode_modify_request_transfer(&item.transfer) {
+                Ok(req) => req,
+                Err(e) => {
+                    warn!(
+                        "PDU Session {} modify: failed to decode ModifyRequestTransfer: {}",
+                        psi, e
+                    );
+                    if let Ok(transfer) = encode_modify_unsuccessful_transfer(
+                        &NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError),
+                    ) {
+                        failed_items.push(PduSessionResourceFailedToModifyItem {
+                            pdu_session_id: psi,
+                            transfer,
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            // The session must already exist to be modified
+            let existing = self
+                .ue_contexts
+                .get(&ue_id)
+                .and_then(|ctx| ctx.get_pdu_session(psi).cloned());
+            let Some(existing) = existing else {
+                warn!("PDU Session {} modify: session not established", psi);
+                if let Ok(transfer) = encode_modify_unsuccessful_transfer(
+                    &NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UnknownPduSessionId),
+                ) {
+                    failed_items.push(PduSessionResourceFailedToModifyItem {
+                        pdu_session_id: psi,
+                        transfer,
+                    });
+                }
                 continue;
             };
 
-            let gnb_teid = self.next_downlink_teid();
+            // Apply UL tunnel modification if requested, otherwise keep current
+            let (upf_teid, upf_addr) = match request.new_ul_tunnel {
+                Some(tunnel) => (tunnel.teid, tunnel.address),
+                None => (existing.downlink_teid, existing.upf_address),
+            };
+            let qfi = request
+                .qos_flows_add_or_modify
+                .first()
+                .copied()
+                .or(existing.qfi)
+                .unwrap_or(1);
+
+            // Re-allocate the gNB DL TEID only when the UL tunnel changed
+            let gnb_teid = if request.new_ul_tunnel.is_some() {
+                self.next_downlink_teid()
+            } else {
+                existing.uplink_teid
+            };
 
             info!(
                 "PDU Session {} modify: UPF TEID=0x{:08x}, gNB TEID=0x{:08x}",
@@ -862,6 +958,16 @@ impl NgapTask {
             let msg = GtpMessage::SessionModify { ue_id, resource };
             if let Err(e) = self.task_base.gtp_tx.send(msg).await {
                 error!("Failed to send SessionModify to GTP: {}", e);
+                if let Ok(transfer) = encode_modify_unsuccessful_transfer(
+                    &NgSetupFailureCause::RadioNetwork(
+                        RadioNetworkCause::RadioResourcesNotAvailable,
+                    ),
+                ) {
+                    failed_items.push(PduSessionResourceFailedToModifyItem {
+                        pdu_session_id: psi,
+                        transfer,
+                    });
+                }
                 continue;
             }
 
@@ -874,20 +980,30 @@ impl NgapTask {
                 let _ = self.task_base.rrc_tx.send(msg).await;
             }
 
-            // Build response transfer
-            let mut response_transfer = Vec::with_capacity(10);
-            response_transfer.push(qfi);
-            response_transfer.extend_from_slice(&gnb_teid.to_be_bytes());
-            response_transfer.push(1); // IPv4
-            match gnb_ip {
-                std::net::IpAddr::V4(v4) => response_transfer.extend_from_slice(&v4.octets()),
-                std::net::IpAddr::V6(_) => response_transfer.extend_from_slice(&[127, 0, 0, 1]),
+            // Build the APER PDUSessionResourceModifyResponseTransfer (§9.3.4.4)
+            let transfer_params = ModifyResponseTransferParams {
+                dl_tunnel: request.new_ul_tunnel.map(|_| GtpTunnelInfo {
+                    address: gnb_ip,
+                    teid: gnb_teid,
+                }),
+                ul_tunnel: None,
+                modified_qfis: request.qos_flows_add_or_modify.clone(),
+                failed_qos_flows: vec![],
+            };
+            match encode_modify_response_transfer(&transfer_params) {
+                Ok(response_transfer) => {
+                    modify_response_items.push(PduSessionResourceModifyResponseItem {
+                        pdu_session_id: psi,
+                        transfer: response_transfer,
+                    });
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to encode ModifyResponseTransfer for PSI {}: {}",
+                        psi, e
+                    );
+                }
             }
-
-            modify_response_items.push(PduSessionResourceModifyResponseItem {
-                pdu_session_id: psi,
-                transfer: response_transfer,
-            });
         }
 
         let response_params = PduSessionResourceModifyResponseParams {
@@ -898,7 +1014,11 @@ impl NgapTask {
             } else {
                 Some(modify_response_items)
             },
-            failed_list: None,
+            failed_list: if failed_items.is_empty() {
+                None
+            } else {
+                Some(failed_items)
+            },
         };
 
         match encode_pdu_session_resource_modify_response(&response_params) {
@@ -961,6 +1081,19 @@ impl NgapTask {
         for item in &release_cmd.pdu_session_resource_to_release_list {
             let psi = item.pdu_session_id;
 
+            // Decode the APER PDUSessionResourceReleaseCommandTransfer cause (§9.3.4.11)
+            match decode_release_command_transfer(&item.transfer) {
+                Ok(cause) => {
+                    info!("PDU Session {} release cause: {:?}", psi, cause);
+                }
+                Err(e) => {
+                    warn!(
+                        "PDU Session {}: failed to decode ReleaseCommandTransfer: {}",
+                        psi, e
+                    );
+                }
+            }
+
             // Remove from UE context
             if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
                 ctx.remove_pdu_session(psi);
@@ -977,9 +1110,18 @@ impl NgapTask {
 
             info!("PDU Session {} released for ue_id={}", psi, ue_id);
 
+            // Real APER PDUSessionResourceReleaseResponseTransfer (§9.3.4.12):
+            // a single SEQUENCE preamble octet
+            let transfer = match encode_release_response_transfer() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Failed to encode ReleaseResponseTransfer: {}", e);
+                    continue;
+                }
+            };
             released_items.push(PduSessionResourceReleasedItem {
                 pdu_session_id: psi,
-                transfer: vec![], // empty transfer for release
+                transfer,
             });
         }
 
@@ -1390,18 +1532,43 @@ impl NgapTask {
 
         // Send UE Context Release Request to AMF if we have the AMF UE NGAP ID
         if let Some(amf_id) = amf_ue_ngap_id {
-            info!(
-                "Sending UE Context Release Request: ue_id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={}, amf_ctx_id={}",
-                ue_id, ran_ue_ngap_id, amf_id, amf_ctx_id
-            );
+            // Map the local trigger to the NGAP cause (TS 38.413 §9.3.1.2)
+            let ngap_cause = match cause {
+                UeReleaseRequestCause::UserTriggered => NgSetupFailureCause::Nas(NasCause::NormalRelease),
+                UeReleaseRequestCause::RadioLinkFailure => NgSetupFailureCause::RadioNetwork(
+                    RadioNetworkCause::RadioConnectionWithUeLost,
+                ),
+                UeReleaseRequestCause::RanOriginated => NgSetupFailureCause::RadioNetwork(
+                    RadioNetworkCause::ReleaseDueToNgranGeneratedReason,
+                ),
+            };
 
-            // Build and send UE Context Release Request
-            // For now, we just clean up locally as the encoding is not yet implemented
-            // In a full implementation, we would encode and send the NGAP message here
-            debug!(
-                "UE Context Release Request would be sent on stream {} (encoding not yet implemented)",
-                stream
-            );
+            let params = UeContextReleaseRequestParams {
+                amf_ue_ngap_id: amf_id as u64,
+                ran_ue_ngap_id: ran_ue_ngap_id as u32,
+                cause: ngap_cause,
+            };
+
+            match encode_ue_context_release_request(&params) {
+                Ok(bytes) => {
+                    info!(
+                        "Sending UE Context Release Request: ue_id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={}, amf_ctx_id={}, cause={:?}",
+                        ue_id, ran_ue_ngap_id, amf_id, amf_ctx_id, cause
+                    );
+                    self.send_ngap_ue_associated(amf_ctx_id, stream, bytes).await;
+
+                    // Keep the context in Releasing state; cleanup happens when
+                    // the AMF answers with UE Context Release Command
+                    if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                        ctx.on_context_release();
+                    }
+                    return;
+                }
+                Err(e) => {
+                    error!("Failed to encode UE Context Release Request: {}", e);
+                    // Fall through to local cleanup
+                }
+            }
         } else {
             info!(
                 "UE context release without AMF UE NGAP ID: ue_id={}, ran_ue_ngap_id={}",
@@ -1409,7 +1576,7 @@ impl NgapTask {
             );
         }
 
-        // Clean up UE context
+        // Local cleanup (no AMF association for this UE, or encoding failed)
         self.delete_ue_context(ue_id);
 
         // Notify RRC of AN release
@@ -1484,6 +1651,12 @@ impl NgapTask {
                         .await;
                 } else if let Ok(ho_fail) = decode_handover_preparation_failure(pdu_bytes) {
                     self.handle_handover_preparation_failure(client_id, stream, ho_fail)
+                        .await;
+                } else if let Ok(ps_ack) = decode_path_switch_request_acknowledge(pdu_bytes) {
+                    self.handle_path_switch_request_acknowledge(client_id, stream, ps_ack)
+                        .await;
+                } else if let Ok(ps_fail) = decode_path_switch_request_failure(pdu_bytes) {
+                    self.handle_path_switch_request_failure(client_id, stream, ps_fail)
                         .await;
                 } else if let Ok(ics_req) = decode_initial_context_setup_request(pdu_bytes) {
                     self.handle_initial_context_setup_request(client_id, stream, ics_req)
@@ -1817,6 +1990,212 @@ impl NgapTask {
                 error!("Failed to encode Handover Notify: {}", e);
             }
         }
+    }
+
+    // ========================================================================
+    // Path Switch Procedure (TS 38.413 Section 8.4.4)
+    // ========================================================================
+
+    /// Sends a Path Switch Request to the AMF (target gNB side, Xn handover).
+    ///
+    /// Requests the 5GC to switch the DL GTP-U termination point to this gNB
+    /// for all PDU sessions of the given UE. The per-session
+    /// `PathSwitchRequestTransfer` carries the real DL F-TEID allocated here.
+    #[allow(dead_code)]
+    async fn send_path_switch_request(&mut self, ue_id: i32, source_amf_ue_ngap_id: u64) {
+        let gnb_ip = self
+            .task_base
+            .config
+            .gtp_advertise_ip
+            .unwrap_or(self.task_base.config.gtp_ip);
+
+        let (amf_ctx_id, ran_ue_ngap_id, stream, sessions) = {
+            let ctx = match self.ue_contexts.get(&ue_id) {
+                Some(c) => c,
+                None => {
+                    warn!("Cannot send Path Switch Request for unknown UE[{}]", ue_id);
+                    return;
+                }
+            };
+            let sessions: Vec<PathSwitchSessionItem> = ctx
+                .pdu_sessions
+                .values()
+                .map(|sess| PathSwitchSessionItem {
+                    pdu_session_id: sess.psi,
+                    dl_tunnel: GtpTunnelInfo {
+                        address: gnb_ip,
+                        teid: sess.uplink_teid,
+                    },
+                    accepted_qfis: vec![sess.qfi.unwrap_or(1)],
+                })
+                .collect();
+            (ctx.amf_ctx_id, ctx.ran_ue_ngap_id, ctx.stream_id, sessions)
+        };
+
+        if sessions.is_empty() {
+            warn!(
+                "Cannot send Path Switch Request for UE[{}]: no PDU sessions",
+                ue_id
+            );
+            return;
+        }
+
+        let config = &self.task_base.config;
+        let plmn_bytes = config.plmn.encode();
+        let tac_bytes = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+
+        let params = PathSwitchRequestParams {
+            ran_ue_ngap_id: ran_ue_ngap_id as u32,
+            source_amf_ue_ngap_id,
+            nr_cgi: NrCgi {
+                plmn_identity: plmn_bytes,
+                nr_cell_identity: config.nci,
+            },
+            tai: Tai {
+                plmn_identity: plmn_bytes,
+                tac: tac_bytes,
+            },
+            ue_security_capabilities: UeSecurityCapabilityBits::default(),
+            sessions,
+        };
+
+        match encode_path_switch_request(&params) {
+            Ok(bytes) => {
+                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes).await;
+                info!(
+                    "Sent Path Switch Request: ue_id={}, ran_ue_ngap_id={}, source_amf_ue_ngap_id={}",
+                    ue_id, ran_ue_ngap_id, source_amf_ue_ngap_id
+                );
+            }
+            Err(e) => {
+                error!("Failed to encode Path Switch Request: {}", e);
+            }
+        }
+    }
+
+    /// Handles Path Switch Request Acknowledge from AMF.
+    ///
+    /// Switches the UL GTP-U tunnels to the (possibly new) UPF endpoints and
+    /// adopts the fresh NH security context.
+    async fn handle_path_switch_request_acknowledge(
+        &mut self,
+        _client_id: i32,
+        _stream: u16,
+        ack: PathSwitchRequestAcknowledgeData,
+    ) {
+        info!(
+            "Path Switch Request Acknowledge: amf_ue_ngap_id={}, ran_ue_ngap_id={}, ncc={}, {} switched sessions",
+            ack.amf_ue_ngap_id,
+            ack.ran_ue_ngap_id,
+            ack.next_hop_chaining_count,
+            ack.switched_sessions.len()
+        );
+
+        let ue_id = match self.find_ue_by_ran_id(ack.ran_ue_ngap_id as i64) {
+            Some(ctx) => ctx.ue_id,
+            None => {
+                warn!(
+                    "Path Switch Request Acknowledge for unknown RAN-UE-NGAP-ID {}",
+                    ack.ran_ue_ngap_id
+                );
+                return;
+            }
+        };
+
+        // Adopt the AMF-assigned ID (it can change across the path switch)
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            ctx.amf_ue_ngap_id = Some(ack.amf_ue_ngap_id as i64);
+        }
+
+        // Update UL tunnels for switched sessions and notify the GTP task
+        for session in &ack.switched_sessions {
+            let updated = self.ue_contexts.get_mut(&ue_id).and_then(|ctx| {
+                ctx.pdu_sessions.get_mut(&session.pdu_session_id).map(|s| {
+                    if let Some(tunnel) = session.ul_tunnel {
+                        s.downlink_teid = tunnel.teid;
+                        s.upf_address = tunnel.address;
+                    }
+                    s.clone()
+                })
+            });
+
+            if let Some(s) = updated {
+                let resource = PduSessionResource {
+                    psi: s.psi as i32,
+                    qfi: s.qfi,
+                    uplink_teid: s.uplink_teid,
+                    downlink_teid: s.downlink_teid,
+                    upf_address: s.upf_address,
+                };
+                let msg = GtpMessage::SessionModify { ue_id, resource };
+                if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                    error!(
+                        "Failed to send SessionModify after path switch for PSI {}: {}",
+                        session.pdu_session_id, e
+                    );
+                }
+            } else {
+                warn!(
+                    "Path switch acknowledged unknown PDU session {}",
+                    session.pdu_session_id
+                );
+            }
+        }
+
+        info!("Path switch completed for UE[{}]", ue_id);
+    }
+
+    /// Handles Path Switch Request Failure from AMF.
+    ///
+    /// Per TS 38.413 §8.4.4.3 the gNB releases the UE-associated resources
+    /// when the path switch is rejected.
+    async fn handle_path_switch_request_failure(
+        &mut self,
+        _client_id: i32,
+        _stream: u16,
+        failure: PathSwitchRequestFailureData,
+    ) {
+        warn!(
+            "Path Switch Request Failure: amf_ue_ngap_id={}, ran_ue_ngap_id={}, released sessions={:?}",
+            failure.amf_ue_ngap_id, failure.ran_ue_ngap_id, failure.released_sessions
+        );
+
+        let ue_id = match self.find_ue_by_ran_id(failure.ran_ue_ngap_id as i64) {
+            Some(ctx) => ctx.ue_id,
+            None => {
+                warn!(
+                    "Path Switch Request Failure for unknown RAN-UE-NGAP-ID {}",
+                    failure.ran_ue_ngap_id
+                );
+                return;
+            }
+        };
+
+        // Release the sessions the 5GC reported as released (with cause)
+        for (psi, cause) in &failure.released_sessions {
+            info!(
+                "Releasing PDU session {} after path switch failure (cause: {:?})",
+                psi, cause
+            );
+            if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                ctx.remove_pdu_session(*psi);
+            }
+            let msg = GtpMessage::SessionRelease {
+                ue_id,
+                psi: *psi as i32,
+            };
+            if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                error!("Failed to send SessionRelease to GTP: {}", e);
+            }
+        }
+
+        // The UE context at the target gNB is released after a failed switch
+        self.handle_ue_context_release_request(ue_id, UeReleaseRequestCause::RanOriginated)
+            .await;
     }
 
     // ========================================================================

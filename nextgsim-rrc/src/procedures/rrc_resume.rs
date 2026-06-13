@@ -207,6 +207,161 @@ fn bitvec_to_u32(bv: &BitVec<u8, Msb0>) -> u32 {
     value
 }
 
+fn bitvec_to_u64(bv: &BitVec<u8, Msb0>) -> u64 {
+    let mut value: u64 = 0;
+    for bit in bv.iter() {
+        value = (value << 1) | (*bit as u64);
+    }
+    value
+}
+
+// ============================================================================
+// RRC Resume Request 1 (full 40-bit I-RNTI, TS 38.331 §6.2.2)
+// ============================================================================
+
+/// Parameters for building an RRC Resume Request 1 (UL-CCCH1)
+///
+/// Used when SIB1 signals `useFullResumeID`: the UE identifies itself with
+/// the full 40-bit I-RNTI instead of the 24-bit short form.
+#[derive(Debug, Clone)]
+pub struct RrcResumeRequest1Params {
+    /// Resume Identity (full I-RNTI, 40 bits, max value 0xFF_FFFF_FFFF)
+    pub resume_identity: u64,
+    /// Resume MAC-I (16 bits)
+    pub resume_mac_i: u16,
+    /// Resume cause
+    pub resume_cause: ResumeCauseValue,
+}
+
+/// Parsed RRC Resume Request 1 data
+#[derive(Debug, Clone)]
+pub struct RrcResumeRequest1Data {
+    /// Resume Identity (full I-RNTI, 40 bits)
+    pub resume_identity: u64,
+    /// Resume MAC-I
+    pub resume_mac_i: u16,
+    /// Resume cause
+    pub resume_cause: ResumeCauseValue,
+}
+
+fn build_resume_cause(value: ResumeCauseValue) -> ResumeCause {
+    match value {
+        ResumeCauseValue::Emergency => ResumeCause(ResumeCause::EMERGENCY),
+        ResumeCauseValue::HighPriorityAccess => ResumeCause(ResumeCause::HIGH_PRIORITY_ACCESS),
+        ResumeCauseValue::MtAccess => ResumeCause(ResumeCause::MT_ACCESS),
+        ResumeCauseValue::MoSignalling => ResumeCause(ResumeCause::MO_SIGNALLING),
+        ResumeCauseValue::MoData => ResumeCause(ResumeCause::MO_DATA),
+        ResumeCauseValue::MoVoiceCall => ResumeCause(ResumeCause::MO_VOICE_CALL),
+        ResumeCauseValue::MoVideoCall => ResumeCause(ResumeCause::MO_VIDEO_CALL),
+        ResumeCauseValue::MoSms => ResumeCause(ResumeCause::MO_SMS),
+        ResumeCauseValue::RnaUpdate => ResumeCause(ResumeCause::RNA_UPDATE),
+        ResumeCauseValue::MpsPriorityAccess => ResumeCause(ResumeCause::MPS_PRIORITY_ACCESS),
+        ResumeCauseValue::McsPriorityAccess => ResumeCause(ResumeCause::MCS_PRIORITY_ACCESS),
+    }
+}
+
+fn parse_resume_cause(cause: &ResumeCause) -> ResumeCauseValue {
+    match cause.0 {
+        ResumeCause::EMERGENCY => ResumeCauseValue::Emergency,
+        ResumeCause::HIGH_PRIORITY_ACCESS => ResumeCauseValue::HighPriorityAccess,
+        ResumeCause::MT_ACCESS => ResumeCauseValue::MtAccess,
+        ResumeCause::MO_SIGNALLING => ResumeCauseValue::MoSignalling,
+        ResumeCause::MO_DATA => ResumeCauseValue::MoData,
+        ResumeCause::MO_VOICE_CALL => ResumeCauseValue::MoVoiceCall,
+        ResumeCause::MO_VIDEO_CALL => ResumeCauseValue::MoVideoCall,
+        ResumeCause::MO_SMS => ResumeCauseValue::MoSms,
+        ResumeCause::RNA_UPDATE => ResumeCauseValue::RnaUpdate,
+        ResumeCause::MPS_PRIORITY_ACCESS => ResumeCauseValue::MpsPriorityAccess,
+        ResumeCause::MCS_PRIORITY_ACCESS => ResumeCauseValue::McsPriorityAccess,
+        _ => ResumeCauseValue::MoData,
+    }
+}
+
+/// Build an RRC Resume Request 1 message (UL-CCCH1)
+pub fn build_rrc_resume_request1(
+    params: &RrcResumeRequest1Params,
+) -> Result<UL_CCCH1_Message, RrcResumeError> {
+    if params.resume_identity > 0xFF_FFFF_FFFF {
+        return Err(RrcResumeError::InvalidFieldValue(
+            "Full I-RNTI must fit in 40 bits".to_string(),
+        ));
+    }
+
+    // Build Resume Identity (full I-RNTI, 40 bits)
+    let mut resume_id_bv: BitVec<u8, Msb0> = BitVec::with_capacity(40);
+    for i in (0..40).rev() {
+        resume_id_bv.push((params.resume_identity >> i) & 1 == 1);
+    }
+
+    // Build Resume MAC-I (16 bits)
+    let mut resume_mac_i_bv: BitVec<u8, Msb0> = BitVec::with_capacity(16);
+    for i in (0..16).rev() {
+        resume_mac_i_bv.push((params.resume_mac_i >> i) & 1 == 1);
+    }
+
+    // Build spare bit (1 bit)
+    let mut spare_bv: BitVec<u8, Msb0> = BitVec::new();
+    spare_bv.push(false);
+
+    let ies = RRCResumeRequest1_IEs {
+        resume_identity: I_RNTI_Value(resume_id_bv),
+        resume_mac_i: RRCResumeRequest1_IEsResumeMAC_I(resume_mac_i_bv),
+        resume_cause: build_resume_cause(params.resume_cause),
+        spare: RRCResumeRequest1_IEsSpare(spare_bv),
+    };
+
+    Ok(UL_CCCH1_Message {
+        message: UL_CCCH1_MessageType::C1(UL_CCCH1_MessageType_c1::RrcResumeRequest1(
+            RRCResumeRequest1 {
+                rrc_resume_request1: ies,
+            },
+        )),
+    })
+}
+
+/// Parse an RRC Resume Request 1 from a UL-CCCH1 message
+pub fn parse_rrc_resume_request1(
+    msg: &UL_CCCH1_Message,
+) -> Result<RrcResumeRequest1Data, RrcResumeError> {
+    let request = match &msg.message {
+        UL_CCCH1_MessageType::C1(UL_CCCH1_MessageType_c1::RrcResumeRequest1(req)) => req,
+        UL_CCCH1_MessageType::C1(_) => {
+            return Err(RrcResumeError::InvalidMessageType {
+                expected: "RRCResumeRequest1".to_string(),
+                actual: "spare c1 message".to_string(),
+            })
+        }
+        _ => {
+            return Err(RrcResumeError::InvalidMessageType {
+                expected: "c1".to_string(),
+                actual: "messageClassExtension".to_string(),
+            })
+        }
+    };
+
+    let ies = &request.rrc_resume_request1;
+
+    Ok(RrcResumeRequest1Data {
+        resume_identity: bitvec_to_u64(&ies.resume_identity.0),
+        resume_mac_i: bitvec_to_u16(&ies.resume_mac_i.0),
+        resume_cause: parse_resume_cause(&ies.resume_cause),
+    })
+}
+
+/// Build and encode an RRC Resume Request 1 to bytes
+pub fn encode_rrc_resume_request1(
+    params: &RrcResumeRequest1Params,
+) -> Result<Vec<u8>, RrcResumeError> {
+    let msg = build_rrc_resume_request1(params)?;
+    Ok(encode_rrc(&msg)?)
+}
+
+/// Decode and parse an RRC Resume Request 1 from bytes
+pub fn decode_rrc_resume_request1(bytes: &[u8]) -> Result<RrcResumeRequest1Data, RrcResumeError> {
+    let msg: UL_CCCH1_Message = decode_rrc(bytes)?;
+    parse_rrc_resume_request1(&msg)
+}
+
 fn bitvec_to_u16(bv: &BitVec<u8, Msb0>) -> u16 {
     let mut value: u16 = 0;
     for bit in bv.iter() {
@@ -447,5 +602,41 @@ mod tests {
             let data = parse_rrc_resume_request(&msg).unwrap();
             assert_eq!(data.resume_cause, cause);
         }
+    }
+
+    #[test]
+    fn test_resume_request1_full_irnti_roundtrip() {
+        // Full 40-bit I-RNTI exercising all bytes
+        let params = RrcResumeRequest1Params {
+            resume_identity: 0xAB_CDEF_0123,
+            resume_mac_i: 0x5A5A,
+            resume_cause: ResumeCauseValue::RnaUpdate,
+        };
+        let bytes = encode_rrc_resume_request1(&params).unwrap();
+        let data = decode_rrc_resume_request1(&bytes).unwrap();
+        assert_eq!(data.resume_identity, 0xAB_CDEF_0123);
+        assert_eq!(data.resume_mac_i, 0x5A5A);
+        assert_eq!(data.resume_cause, ResumeCauseValue::RnaUpdate);
+    }
+
+    #[test]
+    fn test_resume_request1_rejects_oversized_irnti() {
+        let params = RrcResumeRequest1Params {
+            resume_identity: 0x100_0000_0000, // 41 bits
+            resume_mac_i: 0,
+            resume_cause: ResumeCauseValue::MoData,
+        };
+        assert!(build_rrc_resume_request1(&params).is_err());
+    }
+
+    #[test]
+    fn test_resume_request1_rejects_truncated() {
+        let params = RrcResumeRequest1Params {
+            resume_identity: 0xFF_FFFF_FFFF,
+            resume_mac_i: 0xFFFF,
+            resume_cause: ResumeCauseValue::MoData,
+        };
+        let bytes = encode_rrc_resume_request1(&params).unwrap();
+        assert!(decode_rrc_resume_request1(&bytes[..3]).is_err());
     }
 }

@@ -314,7 +314,7 @@ pub fn parse_ue_context_release_command(
     for ie in &command.protocol_i_es.0 {
         match &ie.value {
             UEContextReleaseCommandProtocolIEs_EntryValue::Id_UE_NGAP_IDs(ids) => {
-                ue_ngap_ids = Some(parse_ue_ngap_ids(ids));
+                ue_ngap_ids = Some(parse_ue_ngap_ids(ids)?);
             }
             UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(c) => {
                 cause = Some(parse_cause(c));
@@ -330,17 +330,16 @@ pub fn parse_ue_context_release_command(
     })
 }
 
-fn parse_ue_ngap_ids(ids: &UE_NGAP_IDs) -> UeNgapIds {
+fn parse_ue_ngap_ids(ids: &UE_NGAP_IDs) -> Result<UeNgapIds, UeContextReleaseError> {
     match ids {
-        UE_NGAP_IDs::UE_NGAP_ID_pair(pair) => UeNgapIds::Pair {
+        UE_NGAP_IDs::UE_NGAP_ID_pair(pair) => Ok(UeNgapIds::Pair {
             amf_ue_ngap_id: pair.amf_ue_ngap_id.0,
             ran_ue_ngap_id: pair.ran_ue_ngap_id.0,
-        },
-        UE_NGAP_IDs::AMF_UE_NGAP_ID(amf_id) => UeNgapIds::AmfOnly(amf_id.0),
-        UE_NGAP_IDs::Choice_Extensions(_) => {
-            // Fallback for extensions - treat as AMF only with 0
-            UeNgapIds::AmfOnly(0)
-        }
+        }),
+        UE_NGAP_IDs::AMF_UE_NGAP_ID(amf_id) => Ok(UeNgapIds::AmfOnly(amf_id.0)),
+        UE_NGAP_IDs::Choice_Extensions(_) => Err(UeContextReleaseError::InvalidIeValue(
+            "Unsupported UE-NGAP-IDs choice extension".to_string(),
+        )),
     }
 }
 
@@ -471,7 +470,11 @@ pub fn parse_ue_context_release_complete(
 // Helper Functions
 // ============================================================================
 
-fn build_cause(cause: &UeContextReleaseCause) -> Cause {
+/// Build a generated NGAP `Cause` from the typed cause representation.
+///
+/// Shared across procedures that carry a Cause IE (UE context release,
+/// transfer containers, path switch failure handling).
+pub fn build_cause(cause: &UeContextReleaseCause) -> Cause {
     match cause {
         NgSetupFailureCause::RadioNetwork(rn) => Cause::RadioNetwork(build_radio_network_cause(rn)),
         NgSetupFailureCause::Transport(t) => Cause::Transport(build_transport_cause(t)),
@@ -601,7 +604,8 @@ fn build_misc_cause(cause: &MiscCause) -> CauseMisc {
     CauseMisc(value)
 }
 
-fn parse_cause(cause: &Cause) -> UeContextReleaseCause {
+/// Parse a generated NGAP `Cause` into the typed cause representation.
+pub fn parse_cause(cause: &Cause) -> UeContextReleaseCause {
     match cause {
         Cause::RadioNetwork(rn) => NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn)),
         Cause::Transport(t) => NgSetupFailureCause::Transport(parse_transport_cause(t)),

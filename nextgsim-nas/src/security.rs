@@ -998,10 +998,15 @@ impl NasCount {
     }
 }
 
-/// NAS bearer identity for integrity/ciphering
+/// NAS bearer identity for integrity/ciphering over 3GPP access
 ///
-/// For NAS messages, the bearer is always 0 as per 3GPP TS 33.501.
-pub const NAS_BEARER: u8 = 0;
+/// Per 3GPP TS 33.501 Section 6.4.3.1, the BEARER input for NAS security
+/// is the NAS connection identifier: 0x01 for 3GPP access, 0x02 for
+/// non-3GPP access.
+pub const NAS_BEARER: u8 = 0x01;
+
+/// NAS connection identifier for non-3GPP access (TS 33.501 Section 6.4.3.1)
+pub const NAS_BEARER_NON_3GPP: u8 = 0x02;
 
 /// Direction values for NAS security
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1166,6 +1171,43 @@ pub fn verify_nas_mac(
         Ok(())
     } else {
         Err(SecurityError::MacVerificationFailed)
+    }
+}
+
+/// Apply NAS ciphering (encryption or decryption) in place
+///
+/// Implements 5G NAS ciphering per 3GPP TS 33.501 Section 6.4.4 / Annex D.
+/// CTR-mode-style stream ciphers are symmetric, so the same function is used
+/// for both encryption and decryption.
+///
+/// # Parameters
+/// - `algorithm`: The ciphering algorithm (NEA0-NEA3)
+/// - `key`: 128-bit ciphering key (`KNASenc`)
+/// - `count`: NAS COUNT value
+/// - `bearer`: NAS connection identifier (`NAS_BEARER` for 3GPP access)
+/// - `direction`: Direction (uplink or downlink)
+/// - `data`: Payload to cipher/decipher in place
+pub fn nas_cipher(
+    algorithm: CipheringAlgorithm,
+    key: &[u8; KEY_SIZE],
+    count: &NasCount,
+    bearer: u8,
+    direction: NasDirection,
+    data: &mut [u8],
+) {
+    match algorithm {
+        CipheringAlgorithm::Nea0 => {
+            // NEA0 is null ciphering - data unchanged
+        }
+        CipheringAlgorithm::Nea1 => {
+            nextgsim_crypto::nea::nea1_encrypt(count.to_u32(), bearer, direction as u8, key, data);
+        }
+        CipheringAlgorithm::Nea2 => {
+            nextgsim_crypto::nea::nea2_encrypt(count.to_u32(), bearer, direction as u8, key, data);
+        }
+        CipheringAlgorithm::Nea3 => {
+            nextgsim_crypto::zuc::nea3_encrypt(count.to_u32(), bearer, direction as u8, key, data);
+        }
     }
 }
 
@@ -1755,8 +1797,10 @@ mod tests {
 
     #[test]
     fn test_nas_bearer_constant() {
-        // NAS bearer should always be 0 per 3GPP spec
-        assert_eq!(NAS_BEARER, 0);
+        // NAS connection identifier per TS 33.501 Section 6.4.3.1:
+        // 0x01 for 3GPP access, 0x02 for non-3GPP access
+        assert_eq!(NAS_BEARER, 0x01);
+        assert_eq!(NAS_BEARER_NON_3GPP, 0x02);
     }
 
     // ============================================
@@ -2167,14 +2211,14 @@ mod tests {
         // First derivation with Nea2/Nia2
         ctx.derive_nas_keys(CipheringAlgorithm::Nea2, IntegrityAlgorithm::Nia2)
             .unwrap();
-        let first_enc = ctx.keys().knas_enc().unwrap().clone();
-        let first_int = ctx.keys().knas_int().unwrap().clone();
+        let first_enc = *ctx.keys().knas_enc().unwrap();
+        let first_int = *ctx.keys().knas_int().unwrap();
 
         // Second derivation with Nea1/Nia1 (different algorithm IDs → different keys)
         ctx.derive_nas_keys(CipheringAlgorithm::Nea1, IntegrityAlgorithm::Nia1)
             .unwrap();
-        let second_enc = ctx.keys().knas_enc().unwrap().clone();
-        let second_int = ctx.keys().knas_int().unwrap().clone();
+        let second_enc = *ctx.keys().knas_enc().unwrap();
+        let second_int = *ctx.keys().knas_int().unwrap();
 
         // Keys should differ because algorithm ID is input to KDF
         assert_ne!(first_enc, second_enc);

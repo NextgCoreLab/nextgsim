@@ -5,10 +5,32 @@ supi:
   supi_type: Imsi
   value: "999700000000001"
 
+# SUCI protection (TS 33.501 Annex C):
+#   0 = null scheme, 1 = ECIES Profile A (X25519), 2 = ECIES Profile B (secp256r1)
+#
+# The home network keys below are the TS 33.501 Annex C.4.3/C.4.4 test
+# vector key pairs. The matching private keys are provisioned for udmd in
+# nextgcore docker/rust/configs/5gc/hnet/ (udm.yaml: key id 1 = Profile A
+# curve25519-1.key, key id 2 = Profile B secp256r1-2.key).
+#
+# For Profile A set:
+#   protection_scheme: 1
+#   home_network_public_key_id: 1
+#   home_network_public_key: [0x5A, 0x8D, 0x38, 0x86, 0x48, 0x20, 0x19, 0x7C, 0x33, 0x94, 0xB9, 0x26, 0x13, 0xB2, 0x0B, 0x91, 0x63, 0x3C, 0xBD, 0x89, 0x71, 0x19, 0x27, 0x3B, 0xF8, 0xE4, 0xA6, 0xF4, 0xEE, 0xC0, 0xA6, 0x50]
+#
+# For Profile B set:
+#   protection_scheme: 2
+#   home_network_public_key_id: 2
+#   home_network_public_key: [0x02, 0x72, 0xDA, 0x71, 0x97, 0x62, 0x34, 0xCE, 0x83, 0x3A, 0x69, 0x07, 0x42, 0x58, 0x67, 0xB8, 0x2E, 0x07, 0x4D, 0x44, 0xEF, 0x90, 0x7D, 0xFB, 0x4B, 0x3E, 0x21, 0xC1, 0xC2, 0x25, 0x6E, 0xBC, 0xD1]
+#
+# NOTE: the nextgcore AMF currently BCD-decodes the SUCI scheme output
+# (ngap_path.rs parse_suci_identity), which corrupts ECIES scheme outputs in
+# transit to udmd. Until that is fixed core-side, ECIES E2E will fail at the
+# AMF; the null scheme remains the working default.
 protection_scheme: 0
 home_network_public_key_id: 0
 home_network_public_key: []
-routing_indicator: null
+routing_indicator: "0000"
 
 hplmn:
   mcc: 999

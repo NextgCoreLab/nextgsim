@@ -9,18 +9,30 @@ supi:
   supi_type: Imsi
   value: "999700000000001"
 
-# SUCI Protection Scheme
+# SUCI Protection Scheme (TS 33.501 Annex C)
 # 0: Null scheme (no protection)
-# 1: Profile A (ECIES)
-# 2: Profile B (ECIES)
+# 1: Profile A (ECIES, X25519)
+# 2: Profile B (ECIES, secp256r1)
 protection_scheme: 0
 
-# Home network public key configuration (for SUCI protection)
+# Home network public key configuration (for SUCI protection).
+# The keys below (commented) are the TS 33.501 Annex C.4.3/C.4.4 test vector
+# key pairs; the matching private keys are provisioned for nextgcore udmd in
+# docker/rust/configs/5gc/hnet/ (udm.yaml: key id 1 = Profile A
+# curve25519-1.key, key id 2 = Profile B secp256r1-2.key).
+#
+# Profile A (protection_scheme: 1):
+#   home_network_public_key_id: 1
+#   home_network_public_key: [0x5A, 0x8D, 0x38, 0x86, 0x48, 0x20, 0x19, 0x7C, 0x33, 0x94, 0xB9, 0x26, 0x13, 0xB2, 0x0B, 0x91, 0x63, 0x3C, 0xBD, 0x89, 0x71, 0x19, 0x27, 0x3B, 0xF8, 0xE4, 0xA6, 0xF4, 0xEE, 0xC0, 0xA6, 0x50]
+#
+# Profile B (protection_scheme: 2, SEC1 compressed point):
+#   home_network_public_key_id: 2
+#   home_network_public_key: [0x02, 0x72, 0xDA, 0x71, 0x97, 0x62, 0x34, 0xCE, 0x83, 0x3A, 0x69, 0x07, 0x42, 0x58, 0x67, 0xB8, 0x2E, 0x07, 0x4D, 0x44, 0xEF, 0x90, 0x7D, 0xFB, 0x4B, 0x3E, 0x21, 0xC1, 0xC2, 0x25, 0x6E, 0xBC, 0xD1]
 home_network_public_key_id: 0
 home_network_public_key: []
 
-# Routing indicator (optional)
-routing_indicator: null
+# Routing indicator (1-4 decimal digits, TS 24.501 9.11.3.4)
+routing_indicator: "0000"
 
 # Home PLMN - Must match nextgcore configuration
 hplmn:

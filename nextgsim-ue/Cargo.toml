@@ -32,6 +32,7 @@ nextgsim-agent = { workspace = true, optional = true }
 nextgsim-fl = { workspace = true, optional = true }
 nextgsim-semantic = { workspace = true, optional = true }
 
+bitvec.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

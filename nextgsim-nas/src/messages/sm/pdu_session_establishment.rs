@@ -1,14 +1,15 @@
 //! PDU Session Establishment Messages (3GPP TS 24.501 Section 8.3.1)
 //!
 //! This module implements the PDU Session Establishment procedure messages:
-//! - PDU Session Establishment Request (UE to network)
-//! - PDU Session Establishment Accept (network to UE)
-//! - PDU Session Establishment Reject (network to UE)
+//! - PDU Session Establishment Request (UE to network, Section 8.3.1)
+//! - PDU Session Establishment Accept (network to UE, Section 8.3.2)
+//! - PDU Session Establishment Reject (network to UE, Section 8.3.3)
 
 use bytes::{Buf, BufMut};
 use thiserror::Error;
 
 use crate::enums::SmMessageType;
+use crate::header::PlainSmHeader;
 
 /// Error type for PDU Session Establishment message encoding/decoding
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -32,6 +33,9 @@ pub enum PduSessionEstablishmentError {
     /// Invalid IE value
     #[error("Invalid IE value: {0}")]
     InvalidIeValue(String),
+    /// Missing mandatory IE (TS 24.501 Section 7.7.2)
+    #[error("Missing mandatory IE: {0}")]
+    MissingMandatoryIe(&'static str),
     /// Unknown IEI
     #[error("Unknown IEI: 0x{0:02X}")]
     UnknownIei(u8),
@@ -92,6 +96,14 @@ pub enum SmCause {
     PduSessionTypeIpv6OnlyAllowed = 51,
     /// PDU session does not exist
     PduSessionDoesNotExist = 54,
+    /// PDU session type `IPv4v6` only allowed
+    PduSessionTypeIpv4v6OnlyAllowed = 57,
+    /// PDU session type Unstructured only allowed
+    PduSessionTypeUnstructuredOnlyAllowed = 58,
+    /// Unsupported 5QI value
+    Unsupported5qiValue = 59,
+    /// PDU session type Ethernet only allowed
+    PduSessionTypeEthernetOnlyAllowed = 61,
     /// Insufficient resources for specific slice and DNN
     InsufficientResourcesForSliceAndDnn = 67,
     /// Not supported SSC mode
@@ -156,6 +168,10 @@ impl TryFrom<u8> for SmCause {
             50 => Ok(SmCause::PduSessionTypeIpv4OnlyAllowed),
             51 => Ok(SmCause::PduSessionTypeIpv6OnlyAllowed),
             54 => Ok(SmCause::PduSessionDoesNotExist),
+            57 => Ok(SmCause::PduSessionTypeIpv4v6OnlyAllowed),
+            58 => Ok(SmCause::PduSessionTypeUnstructuredOnlyAllowed),
+            59 => Ok(SmCause::Unsupported5qiValue),
+            61 => Ok(SmCause::PduSessionTypeEthernetOnlyAllowed),
             67 => Ok(SmCause::InsufficientResourcesForSliceAndDnn),
             68 => Ok(SmCause::NotSupportedSscMode),
             69 => Ok(SmCause::InsufficientResourcesForSlice),
@@ -715,5 +731,1135 @@ impl IeDnn {
     /// Get encoded length (including 1-byte length field)
     pub fn encoded_len(&self) -> usize {
         1 + self.value.len()
+    }
+}
+
+// ============================================================================
+// IEI Constants for PDU Session Establishment Messages
+// ============================================================================
+
+/// IEI values for PDU Session Establishment Request optional IEs
+/// (3GPP TS 24.501 Table 8.3.1.1.1)
+mod establishment_request_iei {
+    /// PDU session type (Type 1 TV, IEI in high nibble)
+    pub const PDU_SESSION_TYPE_HIGH_NIBBLE: u8 = 0x9;
+    /// SSC mode (Type 1 TV, IEI in high nibble)
+    pub const SSC_MODE_HIGH_NIBBLE: u8 = 0xA;
+    /// Always-on PDU session requested (Type 1 TV, IEI in high nibble)
+    pub const ALWAYS_ON_REQUESTED_HIGH_NIBBLE: u8 = 0xB;
+    /// 5GSM capability (TLV)
+    pub const SM_CAPABILITY: u8 = 0x28;
+    /// Maximum number of supported packet filters (TV, 3 octets)
+    pub const MAX_PACKET_FILTERS: u8 = 0x55;
+    /// SM PDU DN request container (TLV)
+    pub const SM_PDU_DN_REQUEST_CONTAINER: u8 = 0x39;
+    /// Extended protocol configuration options (TLV-E)
+    pub const EXTENDED_PROTOCOL_CONFIG_OPTIONS: u8 = 0x7B;
+}
+
+/// IEI values for PDU Session Establishment Accept optional IEs
+/// (3GPP TS 24.501 Table 8.3.2.1.1)
+mod establishment_accept_iei {
+    /// 5GSM cause (TV, 2 octets)
+    pub const SM_CAUSE: u8 = 0x59;
+    /// PDU address (TLV)
+    pub const PDU_ADDRESS: u8 = 0x29;
+    /// RQ timer value (TV, 2 octets, GPRS timer)
+    pub const RQ_TIMER_VALUE: u8 = 0x56;
+    /// S-NSSAI (TLV)
+    pub const S_NSSAI: u8 = 0x22;
+    /// Always-on PDU session indication (Type 1 TV, IEI in high nibble)
+    pub const ALWAYS_ON_INDICATION_HIGH_NIBBLE: u8 = 0x8;
+    /// Mapped EPS bearer contexts (TLV-E)
+    pub const MAPPED_EPS_BEARER_CONTEXTS: u8 = 0x75;
+    /// EAP message (TLV-E)
+    pub const EAP_MESSAGE: u8 = 0x78;
+    /// Authorized `QoS` flow descriptions (TLV-E)
+    pub const AUTHORIZED_QOS_FLOW_DESCRIPTIONS: u8 = 0x79;
+    /// Extended protocol configuration options (TLV-E)
+    pub const EXTENDED_PROTOCOL_CONFIG_OPTIONS: u8 = 0x7B;
+    /// DNN (TLV)
+    pub const DNN: u8 = 0x25;
+}
+
+/// IEI values for PDU Session Establishment Reject optional IEs
+/// (3GPP TS 24.501 Table 8.3.3.1.1)
+mod establishment_reject_iei {
+    /// Back-off timer value (TLV, GPRS timer 3)
+    pub const BACK_OFF_TIMER_VALUE: u8 = 0x37;
+    /// Allowed SSC mode (Type 1 TV, IEI in high nibble)
+    pub const ALLOWED_SSC_MODE_HIGH_NIBBLE: u8 = 0xF;
+    /// EAP message (TLV-E)
+    pub const EAP_MESSAGE: u8 = 0x78;
+    /// Re-attempt indicator (TLV)
+    pub const RE_ATTEMPT_INDICATOR: u8 = 0x1D;
+    /// 5GSM congestion re-attempt indicator (TLV)
+    pub const CONGESTION_RE_ATTEMPT_INDICATOR: u8 = 0x61;
+    /// Extended protocol configuration options (TLV-E)
+    pub const EXTENDED_PROTOCOL_CONFIG_OPTIONS: u8 = 0x7B;
+}
+
+/// Skip an unknown optional IE: Type 1 TV IEIs known in 5GSM messages are
+/// consumed by the callers; everything else is assumed TLV (1-octet length)
+/// unless the IEI is in the TLV-E set.
+fn skip_unknown_ie<B: Buf>(buf: &mut B, iei: u8) {
+    buf.advance(1);
+    // TLV-E IEs in 5GSM messages (TS 24.501 Section 9.11.4)
+    let is_tlv_e = matches!(iei, 0x75 | 0x78 | 0x79 | 0x7A | 0x7B);
+    if is_tlv_e {
+        if buf.remaining() < 2 {
+            return;
+        }
+        let len = buf.get_u16() as usize;
+        if buf.remaining() >= len {
+            buf.advance(len);
+        }
+    } else {
+        if buf.remaining() < 1 {
+            return;
+        }
+        let len = buf.get_u8() as usize;
+        if buf.remaining() >= len {
+            buf.advance(len);
+        }
+    }
+}
+
+// ============================================================================
+// PDU Session Establishment Request (3GPP TS 24.501 Section 8.3.1)
+// ============================================================================
+
+/// PDU Session Establishment Request message (UE to network)
+///
+/// 3GPP TS 24.501 Section 8.3.1
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PduSessionEstablishmentRequest {
+    /// PDU Session ID (from header)
+    pub pdu_session_id: u8,
+    /// Procedure Transaction Identity (from header)
+    pub pti: u8,
+    /// Integrity protection maximum data rate (mandatory, V, 2 octets)
+    pub integrity_protection_max_data_rate: IeIntegrityProtectionMaxDataRate,
+    /// Requested PDU session type (optional, Type 1 TV, IEI 0x9)
+    pub pdu_session_type: Option<IeSelectedPduSessionType>,
+    /// Requested SSC mode (optional, Type 1 TV, IEI 0xA)
+    pub ssc_mode: Option<IeSelectedSscMode>,
+    /// 5GSM capability (optional, TLV, IEI 0x28)
+    pub sm_capability: Option<Vec<u8>>,
+    /// Maximum number of supported packet filters (optional, TV, IEI 0x55)
+    pub max_packet_filters: Option<u16>,
+    /// Always-on PDU session requested (optional, Type 1 TV, IEI 0xB)
+    pub always_on_requested: Option<bool>,
+    /// SM PDU DN request container (optional, TLV, IEI 0x39)
+    pub sm_pdu_dn_request_container: Option<Vec<u8>>,
+    /// Extended protocol configuration options (optional, TLV-E, IEI 0x7B)
+    pub extended_protocol_config_options: Option<Vec<u8>>,
+}
+
+impl PduSessionEstablishmentRequest {
+    /// Create a new PDU Session Establishment Request
+    pub fn new(
+        pdu_session_id: u8,
+        pti: u8,
+        integrity_protection_max_data_rate: IeIntegrityProtectionMaxDataRate,
+    ) -> Self {
+        Self {
+            pdu_session_id,
+            pti,
+            integrity_protection_max_data_rate,
+            ..Default::default()
+        }
+    }
+
+    /// Decode from bytes (after header has been parsed)
+    pub fn decode<B: Buf>(
+        buf: &mut B,
+        pdu_session_id: u8,
+        pti: u8,
+    ) -> Result<Self, PduSessionEstablishmentError> {
+        // Integrity protection maximum data rate (mandatory, V, 2 octets:
+        // octet 1 = uplink, octet 2 = downlink per TS 24.501 9.11.4.7)
+        if buf.remaining() < 2 {
+            return Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Integrity protection maximum data rate",
+            ));
+        }
+        let uplink = MaxDataRate::try_from(buf.get_u8())?;
+        let downlink = MaxDataRate::try_from(buf.get_u8())?;
+
+        let mut msg = Self::new(
+            pdu_session_id,
+            pti,
+            IeIntegrityProtectionMaxDataRate::new(uplink, downlink),
+        );
+
+        // Optional IEs
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match (iei >> 4) & 0x0F {
+                establishment_request_iei::PDU_SESSION_TYPE_HIGH_NIBBLE => {
+                    buf.advance(1);
+                    msg.pdu_session_type = Some(IeSelectedPduSessionType::decode(iei & 0x0F)?);
+                }
+                establishment_request_iei::SSC_MODE_HIGH_NIBBLE => {
+                    buf.advance(1);
+                    msg.ssc_mode = Some(IeSelectedSscMode::decode(iei & 0x0F)?);
+                }
+                establishment_request_iei::ALWAYS_ON_REQUESTED_HIGH_NIBBLE => {
+                    buf.advance(1);
+                    msg.always_on_requested = Some(iei & 0x01 == 0x01);
+                }
+                _ => match iei {
+                    establishment_request_iei::SM_CAPABILITY => {
+                        buf.advance(1);
+                        if buf.remaining() < 1 {
+                            break;
+                        }
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() < len {
+                            break;
+                        }
+                        let mut data = vec![0u8; len];
+                        buf.copy_to_slice(&mut data);
+                        msg.sm_capability = Some(data);
+                    }
+                    establishment_request_iei::MAX_PACKET_FILTERS => {
+                        buf.advance(1);
+                        if buf.remaining() < 2 {
+                            break;
+                        }
+                        let high = buf.get_u8() as u16;
+                        let low = buf.get_u8() as u16;
+                        msg.max_packet_filters = Some((high << 3) | ((low >> 5) & 0x07));
+                    }
+                    establishment_request_iei::SM_PDU_DN_REQUEST_CONTAINER => {
+                        buf.advance(1);
+                        if buf.remaining() < 1 {
+                            break;
+                        }
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() < len {
+                            break;
+                        }
+                        let mut data = vec![0u8; len];
+                        buf.copy_to_slice(&mut data);
+                        msg.sm_pdu_dn_request_container = Some(data);
+                    }
+                    establishment_request_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS => {
+                        buf.advance(1);
+                        if buf.remaining() < 2 {
+                            break;
+                        }
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() < len {
+                            break;
+                        }
+                        let mut data = vec![0u8; len];
+                        buf.copy_to_slice(&mut data);
+                        msg.extended_protocol_config_options = Some(data);
+                    }
+                    _ => skip_unknown_ie(buf, iei),
+                },
+            }
+        }
+
+        Ok(msg)
+    }
+
+    /// Encode to bytes (including header)
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        let header = PlainSmHeader::new(
+            self.pdu_session_id,
+            self.pti,
+            SmMessageType::PduSessionEstablishmentRequest,
+        );
+        header.encode(buf);
+
+        // Integrity protection maximum data rate (mandatory, V):
+        // octet 1 = uplink, octet 2 = downlink (TS 24.501 9.11.4.7)
+        buf.put_u8(self.integrity_protection_max_data_rate.uplink as u8);
+        buf.put_u8(self.integrity_protection_max_data_rate.downlink as u8);
+
+        // Optional IEs
+        if let Some(ref t) = self.pdu_session_type {
+            buf.put_u8(
+                (establishment_request_iei::PDU_SESSION_TYPE_HIGH_NIBBLE << 4) | t.encode(),
+            );
+        }
+        if let Some(ref m) = self.ssc_mode {
+            buf.put_u8((establishment_request_iei::SSC_MODE_HIGH_NIBBLE << 4) | m.encode());
+        }
+        if let Some(ref cap) = self.sm_capability {
+            buf.put_u8(establishment_request_iei::SM_CAPABILITY);
+            buf.put_u8(cap.len() as u8);
+            buf.put_slice(cap);
+        }
+        if let Some(max_filters) = self.max_packet_filters {
+            buf.put_u8(establishment_request_iei::MAX_PACKET_FILTERS);
+            buf.put_u8(((max_filters >> 3) & 0xFF) as u8);
+            buf.put_u8(((max_filters & 0x07) << 5) as u8);
+        }
+        if let Some(requested) = self.always_on_requested {
+            buf.put_u8(
+                (establishment_request_iei::ALWAYS_ON_REQUESTED_HIGH_NIBBLE << 4)
+                    | u8::from(requested),
+            );
+        }
+        if let Some(ref dn_req) = self.sm_pdu_dn_request_container {
+            buf.put_u8(establishment_request_iei::SM_PDU_DN_REQUEST_CONTAINER);
+            buf.put_u8(dn_req.len() as u8);
+            buf.put_slice(dn_req);
+        }
+        if let Some(ref epco) = self.extended_protocol_config_options {
+            buf.put_u8(establishment_request_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS);
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+    }
+
+    /// Get the message type
+    pub fn message_type() -> SmMessageType {
+        SmMessageType::PduSessionEstablishmentRequest
+    }
+}
+
+// ============================================================================
+// PDU Session Establishment Accept (3GPP TS 24.501 Section 8.3.2)
+// ============================================================================
+
+/// PDU Session Establishment Accept message (network to UE)
+///
+/// The decoder is strict per TS 24.501 Table 8.3.2.1.1: the mandatory
+/// selected PDU session type, selected SSC mode, authorized QoS rules and
+/// session AMBR must all be present and valid, otherwise decoding fails
+/// with [`PduSessionEstablishmentError::MissingMandatoryIe`].
+///
+/// 3GPP TS 24.501 Section 8.3.2
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PduSessionEstablishmentAccept {
+    /// PDU Session ID (from header)
+    pub pdu_session_id: u8,
+    /// Procedure Transaction Identity (from header)
+    pub pti: u8,
+    /// Selected PDU session type (mandatory, bits 1-3 of octet 5)
+    pub selected_pdu_session_type: IeSelectedPduSessionType,
+    /// Selected SSC mode (mandatory, bits 5-7 of octet 5)
+    pub selected_ssc_mode: IeSelectedSscMode,
+    /// Authorized `QoS` rules (mandatory, LV-E)
+    pub authorized_qos_rules: IeQosRules,
+    /// Session AMBR (mandatory, LV)
+    pub session_ambr: IeSessionAmbr,
+    /// 5GSM cause (optional, TV, IEI 0x59)
+    pub sm_cause: Option<Ie5gSmCause>,
+    /// PDU address (optional, TLV, IEI 0x29)
+    pub pdu_address: Option<IePduAddress>,
+    /// RQ timer value (optional, TV, IEI 0x56)
+    pub rq_timer_value: Option<u8>,
+    /// S-NSSAI (optional, TLV, IEI 0x22)
+    pub s_nssai: Option<Vec<u8>>,
+    /// Always-on PDU session indication (optional, Type 1 TV, IEI 0x8)
+    pub always_on_indication: Option<bool>,
+    /// Mapped EPS bearer contexts (optional, TLV-E, IEI 0x75)
+    pub mapped_eps_bearer_contexts: Option<Vec<u8>>,
+    /// EAP message (optional, TLV-E, IEI 0x78)
+    pub eap_message: Option<Vec<u8>>,
+    /// Authorized `QoS` flow descriptions (optional, TLV-E, IEI 0x79)
+    pub authorized_qos_flow_descriptions: Option<Vec<u8>>,
+    /// Extended protocol configuration options (optional, TLV-E, IEI 0x7B)
+    pub extended_protocol_config_options: Option<Vec<u8>>,
+    /// DNN (optional, TLV, IEI 0x25)
+    pub dnn: Option<IeDnn>,
+}
+
+impl PduSessionEstablishmentAccept {
+    /// Create a new PDU Session Establishment Accept with the mandatory IEs
+    pub fn new(
+        pdu_session_id: u8,
+        pti: u8,
+        selected_pdu_session_type: IeSelectedPduSessionType,
+        selected_ssc_mode: IeSelectedSscMode,
+        authorized_qos_rules: IeQosRules,
+        session_ambr: IeSessionAmbr,
+    ) -> Self {
+        Self {
+            pdu_session_id,
+            pti,
+            selected_pdu_session_type,
+            selected_ssc_mode,
+            authorized_qos_rules,
+            session_ambr,
+            ..Default::default()
+        }
+    }
+
+    /// Strict decode per TS 24.501 Table 8.3.2.1.1 (after the SM header).
+    ///
+    /// Fails with [`PduSessionEstablishmentError::MissingMandatoryIe`] when
+    /// any mandatory IE (selected PDU session type, selected SSC mode,
+    /// authorized QoS rules, session AMBR) is absent or malformed.
+    pub fn decode<B: Buf>(
+        buf: &mut B,
+        pdu_session_id: u8,
+        pti: u8,
+    ) -> Result<Self, PduSessionEstablishmentError> {
+        // Octet 5: selected PDU session type (bits 1-3) and selected SSC
+        // mode (bits 5-7) share one octet
+        if buf.remaining() < 1 {
+            return Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Selected PDU session type / SSC mode",
+            ));
+        }
+        let octet5 = buf.get_u8();
+        let selected_pdu_session_type =
+            IeSelectedPduSessionType::decode(octet5 & 0x0F).map_err(|_| {
+                PduSessionEstablishmentError::MissingMandatoryIe("Selected PDU session type")
+            })?;
+        let selected_ssc_mode = IeSelectedSscMode::decode((octet5 >> 4) & 0x0F)
+            .map_err(|_| PduSessionEstablishmentError::MissingMandatoryIe("Selected SSC mode"))?;
+
+        // Authorized QoS rules (mandatory, LV-E)
+        let authorized_qos_rules = IeQosRules::decode(buf).map_err(|_| {
+            PduSessionEstablishmentError::MissingMandatoryIe("Authorized QoS rules")
+        })?;
+        if authorized_qos_rules.data.is_empty() {
+            return Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Authorized QoS rules",
+            ));
+        }
+
+        // Session AMBR (mandatory, LV, length must be 6 per TS 24.501
+        // 9.11.4.14)
+        if buf.remaining() < 7 {
+            return Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Session AMBR",
+            ));
+        }
+        let ambr_len = buf.get_u8();
+        if ambr_len != 6 {
+            return Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Session AMBR",
+            ));
+        }
+        let session_ambr = IeSessionAmbr {
+            downlink_unit: buf.get_u8(),
+            downlink: buf.get_u16(),
+            uplink_unit: buf.get_u8(),
+            uplink: buf.get_u16(),
+        };
+
+        let mut msg = Self::new(
+            pdu_session_id,
+            pti,
+            selected_pdu_session_type,
+            selected_ssc_mode,
+            authorized_qos_rules,
+            session_ambr,
+        );
+
+        // Optional IEs
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            if (iei >> 4) & 0x0F == establishment_accept_iei::ALWAYS_ON_INDICATION_HIGH_NIBBLE {
+                buf.advance(1);
+                msg.always_on_indication = Some(iei & 0x01 == 0x01);
+                continue;
+            }
+            match iei {
+                establishment_accept_iei::SM_CAUSE => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    msg.sm_cause = Some(Ie5gSmCause::new(SmCause::try_from(buf.get_u8())?));
+                }
+                establishment_accept_iei::PDU_ADDRESS => {
+                    buf.advance(1);
+                    msg.pdu_address = Some(IePduAddress::decode(buf)?);
+                }
+                establishment_accept_iei::RQ_TIMER_VALUE => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    msg.rq_timer_value = Some(buf.get_u8());
+                }
+                establishment_accept_iei::S_NSSAI => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.s_nssai = Some(data);
+                }
+                establishment_accept_iei::MAPPED_EPS_BEARER_CONTEXTS
+                | establishment_accept_iei::EAP_MESSAGE
+                | establishment_accept_iei::AUTHORIZED_QOS_FLOW_DESCRIPTIONS
+                | establishment_accept_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    match iei {
+                        establishment_accept_iei::MAPPED_EPS_BEARER_CONTEXTS => {
+                            msg.mapped_eps_bearer_contexts = Some(data);
+                        }
+                        establishment_accept_iei::EAP_MESSAGE => msg.eap_message = Some(data),
+                        establishment_accept_iei::AUTHORIZED_QOS_FLOW_DESCRIPTIONS => {
+                            msg.authorized_qos_flow_descriptions = Some(data);
+                        }
+                        _ => msg.extended_protocol_config_options = Some(data),
+                    }
+                }
+                establishment_accept_iei::DNN => {
+                    buf.advance(1);
+                    msg.dnn = Some(IeDnn::decode(buf)?);
+                }
+                _ => skip_unknown_ie(buf, iei),
+            }
+        }
+
+        Ok(msg)
+    }
+
+    /// Decode the non-conformant PDU Session Establishment Accept shape
+    /// emitted by the current nextgcore smfd
+    /// (`policy::build_establishment_accept`):
+    ///
+    /// - selected PDU session type and SSC mode are sent as TWO separate
+    ///   octets (the spec packs both into octet 5);
+    /// - the authorized QoS rules are sent as a fixed 6-octet blob with a
+    ///   1-octet length marker instead of an LV-E.
+    ///
+    /// This is a documented transition leniency; remove once the core-side
+    /// emission is spec-conformant (tracked separately in TASKS.md).
+    pub fn decode_legacy_nextgcore(
+        buf: &[u8],
+        pdu_session_id: u8,
+        pti: u8,
+    ) -> Result<Self, PduSessionEstablishmentError> {
+        // Fixed part: type(1) + ssc(1) + qos blob(6) + ambr len(1) + ambr(6)
+        if buf.len() < 15 {
+            return Err(PduSessionEstablishmentError::BufferTooShort {
+                expected: 15,
+                actual: buf.len(),
+            });
+        }
+        let selected_pdu_session_type = IeSelectedPduSessionType::decode(buf[0] & 0x07)?;
+        let selected_ssc_mode = IeSelectedSscMode::decode(buf[1] & 0x07)?;
+        // QoS rules blob: 1-octet marker (0x06) + 5 opaque octets ending
+        // with the QFI
+        if buf[2] != 0x06 {
+            return Err(PduSessionEstablishmentError::InvalidIeValue(format!(
+                "legacy QoS rules marker: 0x{:02X}",
+                buf[2]
+            )));
+        }
+        let authorized_qos_rules = IeQosRules::new(buf[3..8].to_vec());
+        // Session AMBR: 1-octet length (6) + 6 octets
+        if buf[8] != 6 {
+            return Err(PduSessionEstablishmentError::InvalidIeValue(format!(
+                "legacy session AMBR length: {}",
+                buf[8]
+            )));
+        }
+        let session_ambr = IeSessionAmbr {
+            downlink_unit: buf[9],
+            downlink: u16::from_be_bytes([buf[10], buf[11]]),
+            uplink_unit: buf[12],
+            uplink: u16::from_be_bytes([buf[13], buf[14]]),
+        };
+
+        let mut msg = Self::new(
+            pdu_session_id,
+            pti,
+            selected_pdu_session_type,
+            selected_ssc_mode,
+            authorized_qos_rules,
+            session_ambr,
+        );
+
+        // Trailing TLVs (PDU address 0x29, DNN 0x25 are what the core emits)
+        let mut rest = &buf[15..];
+        while rest.remaining() > 0 {
+            let iei = rest.chunk()[0];
+            match iei {
+                establishment_accept_iei::PDU_ADDRESS => {
+                    rest.advance(1);
+                    msg.pdu_address = Some(IePduAddress::decode(&mut rest)?);
+                }
+                establishment_accept_iei::DNN => {
+                    rest.advance(1);
+                    msg.dnn = Some(IeDnn::decode(&mut rest)?);
+                }
+                _ => skip_unknown_ie(&mut rest, iei),
+            }
+        }
+
+        Ok(msg)
+    }
+
+    /// Encode to bytes (including header)
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        let header = PlainSmHeader::new(
+            self.pdu_session_id,
+            self.pti,
+            SmMessageType::PduSessionEstablishmentAccept,
+        );
+        header.encode(buf);
+
+        // Octet 5: SSC mode (bits 5-7) | PDU session type (bits 1-3)
+        buf.put_u8((self.selected_ssc_mode.encode() << 4) | self.selected_pdu_session_type.encode());
+
+        // Authorized QoS rules (mandatory, LV-E)
+        self.authorized_qos_rules.encode(buf);
+
+        // Session AMBR (mandatory, LV)
+        self.session_ambr.encode(buf);
+
+        // Optional IEs
+        if let Some(ref cause) = self.sm_cause {
+            buf.put_u8(establishment_accept_iei::SM_CAUSE);
+            buf.put_u8(cause.value as u8);
+        }
+        if let Some(ref addr) = self.pdu_address {
+            buf.put_u8(establishment_accept_iei::PDU_ADDRESS);
+            addr.encode(buf);
+        }
+        if let Some(timer) = self.rq_timer_value {
+            buf.put_u8(establishment_accept_iei::RQ_TIMER_VALUE);
+            buf.put_u8(timer);
+        }
+        if let Some(ref nssai) = self.s_nssai {
+            buf.put_u8(establishment_accept_iei::S_NSSAI);
+            buf.put_u8(nssai.len() as u8);
+            buf.put_slice(nssai);
+        }
+        if let Some(indication) = self.always_on_indication {
+            buf.put_u8(
+                (establishment_accept_iei::ALWAYS_ON_INDICATION_HIGH_NIBBLE << 4)
+                    | u8::from(indication),
+            );
+        }
+        if let Some(ref ctxs) = self.mapped_eps_bearer_contexts {
+            buf.put_u8(establishment_accept_iei::MAPPED_EPS_BEARER_CONTEXTS);
+            buf.put_u16(ctxs.len() as u16);
+            buf.put_slice(ctxs);
+        }
+        if let Some(ref eap) = self.eap_message {
+            buf.put_u8(establishment_accept_iei::EAP_MESSAGE);
+            buf.put_u16(eap.len() as u16);
+            buf.put_slice(eap);
+        }
+        if let Some(ref desc) = self.authorized_qos_flow_descriptions {
+            buf.put_u8(establishment_accept_iei::AUTHORIZED_QOS_FLOW_DESCRIPTIONS);
+            buf.put_u16(desc.len() as u16);
+            buf.put_slice(desc);
+        }
+        if let Some(ref epco) = self.extended_protocol_config_options {
+            buf.put_u8(establishment_accept_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS);
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+        if let Some(ref dnn) = self.dnn {
+            buf.put_u8(establishment_accept_iei::DNN);
+            dnn.encode(buf);
+        }
+    }
+
+    /// Get the message type
+    pub fn message_type() -> SmMessageType {
+        SmMessageType::PduSessionEstablishmentAccept
+    }
+}
+
+// ============================================================================
+// PDU Session Establishment Reject (3GPP TS 24.501 Section 8.3.3)
+// ============================================================================
+
+/// PDU Session Establishment Reject message (network to UE)
+///
+/// 3GPP TS 24.501 Section 8.3.3
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PduSessionEstablishmentReject {
+    /// PDU Session ID (from header)
+    pub pdu_session_id: u8,
+    /// Procedure Transaction Identity (from header)
+    pub pti: u8,
+    /// 5GSM cause (mandatory, V)
+    pub sm_cause: Ie5gSmCause,
+    /// Back-off timer value (optional, TLV, IEI 0x37, GPRS timer 3)
+    pub back_off_timer_value: Option<u8>,
+    /// Allowed SSC mode (optional, Type 1 TV, IEI 0xF)
+    pub allowed_ssc_mode: Option<u8>,
+    /// EAP message (optional, TLV-E, IEI 0x78)
+    pub eap_message: Option<Vec<u8>>,
+    /// Re-attempt indicator (optional, TLV, IEI 0x1D)
+    pub re_attempt_indicator: Option<u8>,
+    /// 5GSM congestion re-attempt indicator (optional, TLV, IEI 0x61)
+    pub congestion_re_attempt_indicator: Option<u8>,
+    /// Extended protocol configuration options (optional, TLV-E, IEI 0x7B)
+    pub extended_protocol_config_options: Option<Vec<u8>>,
+}
+
+impl Default for PduSessionEstablishmentReject {
+    fn default() -> Self {
+        Self {
+            pdu_session_id: 0,
+            pti: 0,
+            sm_cause: Ie5gSmCause::new(SmCause::ProtocolErrorUnspecified),
+            back_off_timer_value: None,
+            allowed_ssc_mode: None,
+            eap_message: None,
+            re_attempt_indicator: None,
+            congestion_re_attempt_indicator: None,
+            extended_protocol_config_options: None,
+        }
+    }
+}
+
+impl PduSessionEstablishmentReject {
+    /// Create a new PDU Session Establishment Reject
+    pub fn new(pdu_session_id: u8, pti: u8, cause: SmCause) -> Self {
+        Self {
+            pdu_session_id,
+            pti,
+            sm_cause: Ie5gSmCause::new(cause),
+            ..Default::default()
+        }
+    }
+
+    /// Decode from bytes (after header has been parsed)
+    pub fn decode<B: Buf>(
+        buf: &mut B,
+        pdu_session_id: u8,
+        pti: u8,
+    ) -> Result<Self, PduSessionEstablishmentError> {
+        // 5GSM cause (mandatory, V)
+        if buf.remaining() < 1 {
+            return Err(PduSessionEstablishmentError::MissingMandatoryIe("5GSM cause"));
+        }
+        let cause = SmCause::try_from(buf.get_u8())?;
+        let mut msg = Self::new(pdu_session_id, pti, cause);
+
+        // Optional IEs
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            if (iei >> 4) & 0x0F == establishment_reject_iei::ALLOWED_SSC_MODE_HIGH_NIBBLE {
+                buf.advance(1);
+                msg.allowed_ssc_mode = Some(iei & 0x07);
+                continue;
+            }
+            match iei {
+                establishment_reject_iei::BACK_OFF_TIMER_VALUE => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len || len < 1 {
+                        break;
+                    }
+                    msg.back_off_timer_value = Some(buf.get_u8());
+                    if len > 1 {
+                        buf.advance(len - 1);
+                    }
+                }
+                establishment_reject_iei::RE_ATTEMPT_INDICATOR => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len || len < 1 {
+                        break;
+                    }
+                    msg.re_attempt_indicator = Some(buf.get_u8());
+                    if len > 1 {
+                        buf.advance(len - 1);
+                    }
+                }
+                establishment_reject_iei::CONGESTION_RE_ATTEMPT_INDICATOR => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len || len < 1 {
+                        break;
+                    }
+                    msg.congestion_re_attempt_indicator = Some(buf.get_u8());
+                    if len > 1 {
+                        buf.advance(len - 1);
+                    }
+                }
+                establishment_reject_iei::EAP_MESSAGE
+                | establishment_reject_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    if iei == establishment_reject_iei::EAP_MESSAGE {
+                        msg.eap_message = Some(data);
+                    } else {
+                        msg.extended_protocol_config_options = Some(data);
+                    }
+                }
+                _ => skip_unknown_ie(buf, iei),
+            }
+        }
+
+        Ok(msg)
+    }
+
+    /// Encode to bytes (including header)
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        let header = PlainSmHeader::new(
+            self.pdu_session_id,
+            self.pti,
+            SmMessageType::PduSessionEstablishmentReject,
+        );
+        header.encode(buf);
+
+        // 5GSM cause (mandatory)
+        buf.put_u8(self.sm_cause.value as u8);
+
+        // Optional IEs
+        if let Some(timer) = self.back_off_timer_value {
+            buf.put_u8(establishment_reject_iei::BACK_OFF_TIMER_VALUE);
+            buf.put_u8(1);
+            buf.put_u8(timer);
+        }
+        if let Some(ssc) = self.allowed_ssc_mode {
+            buf.put_u8(
+                (establishment_reject_iei::ALLOWED_SSC_MODE_HIGH_NIBBLE << 4) | (ssc & 0x07),
+            );
+        }
+        if let Some(ref eap) = self.eap_message {
+            buf.put_u8(establishment_reject_iei::EAP_MESSAGE);
+            buf.put_u16(eap.len() as u16);
+            buf.put_slice(eap);
+        }
+        if let Some(rai) = self.re_attempt_indicator {
+            buf.put_u8(establishment_reject_iei::RE_ATTEMPT_INDICATOR);
+            buf.put_u8(1);
+            buf.put_u8(rai);
+        }
+        if let Some(cri) = self.congestion_re_attempt_indicator {
+            buf.put_u8(establishment_reject_iei::CONGESTION_RE_ATTEMPT_INDICATOR);
+            buf.put_u8(1);
+            buf.put_u8(cri);
+        }
+        if let Some(ref epco) = self.extended_protocol_config_options {
+            buf.put_u8(establishment_reject_iei::EXTENDED_PROTOCOL_CONFIG_OPTIONS);
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+    }
+
+    /// Get the message type
+    pub fn message_type() -> SmMessageType {
+        SmMessageType::PduSessionEstablishmentReject
+    }
+
+    /// Get the cause value
+    pub fn cause(&self) -> SmCause {
+        self.sm_cause.value
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // PDU Session Establishment Request Tests
+    // ========================================================================
+
+    #[test]
+    fn test_establishment_request_encode_decode_roundtrip() {
+        let mut msg = PduSessionEstablishmentRequest::new(
+            1,
+            1,
+            IeIntegrityProtectionMaxDataRate::full_rate(),
+        );
+        msg.pdu_session_type = Some(IeSelectedPduSessionType::new(PduSessionTypeValue::Ipv4v6));
+        msg.ssc_mode = Some(IeSelectedSscMode::new(SscModeValue::SscMode1));
+        msg.sm_capability = Some(vec![0x00]);
+        msg.max_packet_filters = Some(16);
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        // Header: EPD 0x2E, PSI 1, PTI 1, type 0xC1
+        assert_eq!(&buf[..4], &[0x2E, 1, 1, 0xC1]);
+        // Mandatory integrity protection maximum data rate (UL, DL)
+        assert_eq!(&buf[4..6], &[0xFF, 0xFF]);
+
+        let decoded = PduSessionEstablishmentRequest::decode(&mut &buf[4..], 1, 1).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_establishment_request_missing_mandatory_ie() {
+        // No integrity protection maximum data rate at all
+        let buf: &[u8] = &[0xFF];
+        let result = PduSessionEstablishmentRequest::decode(&mut &buf[..], 1, 1);
+        assert_eq!(
+            result,
+            Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Integrity protection maximum data rate"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_establishment_request_parsable_by_strict_core_shape() {
+        // The nextgcore smfd parser reads buf[4..6] as the data rate and
+        // half-octet IEIs 0x9 / 0xA for PDU type and SSC mode: verify our
+        // wire layout puts them exactly there.
+        let mut msg = PduSessionEstablishmentRequest::new(
+            5,
+            7,
+            IeIntegrityProtectionMaxDataRate::full_rate(),
+        );
+        msg.pdu_session_type = Some(IeSelectedPduSessionType::new(PduSessionTypeValue::Ipv4));
+        msg.ssc_mode = Some(IeSelectedSscMode::new(SscModeValue::SscMode1));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert_eq!(buf[4], 0xFF); // UL rate
+        assert_eq!(buf[5], 0xFF); // DL rate
+        assert_eq!(buf[6], 0x91); // PDU session type TV: IEI 0x9, IPv4
+        assert_eq!(buf[7], 0xA1); // SSC mode TV: IEI 0xA, SSC mode 1
+    }
+
+    // ========================================================================
+    // PDU Session Establishment Accept Tests
+    // ========================================================================
+
+    fn conformant_accept() -> PduSessionEstablishmentAccept {
+        let mut acc = PduSessionEstablishmentAccept::new(
+            1,
+            1,
+            IeSelectedPduSessionType::new(PduSessionTypeValue::Ipv4),
+            IeSelectedSscMode::new(SscModeValue::SscMode1),
+            IeQosRules::new(vec![0x01, 0x00, 0x06, 0x31, 0x31, 0x01, 0x01, 0x01, 0x01]),
+            IeSessionAmbr::new(0x06, 200, 0x06, 50),
+        );
+        acc.pdu_address = Some(IePduAddress::ipv4([10, 45, 0, 2]));
+        acc.s_nssai = Some(vec![0x01]);
+        acc.dnn = Some(IeDnn::from_string("internet"));
+        acc
+    }
+
+    #[test]
+    fn test_establishment_accept_encode_decode_roundtrip() {
+        let acc = conformant_accept();
+        let mut buf = Vec::new();
+        acc.encode(&mut buf);
+
+        assert_eq!(&buf[..4], &[0x2E, 1, 1, 0xC2]);
+        // Octet 5: SSC mode 1 in bits 5-7, PDU type IPv4 in bits 1-3
+        assert_eq!(buf[4], 0x11);
+
+        let decoded = PduSessionEstablishmentAccept::decode(&mut &buf[4..], 1, 1).unwrap();
+        assert_eq!(decoded, acc);
+    }
+
+    #[test]
+    fn test_establishment_accept_missing_session_ambr_rejected() {
+        // Encode a conformant accept, then truncate just before the AMBR
+        let acc = conformant_accept();
+        let mut buf = Vec::new();
+        acc.encode(&mut buf);
+        // header(4) + octet5(1) + qos LV-E (2 + 9) = 16; AMBR starts at 16
+        let truncated = &buf[4..16];
+        let result = PduSessionEstablishmentAccept::decode(&mut &truncated[..], 1, 1);
+        assert_eq!(
+            result,
+            Err(PduSessionEstablishmentError::MissingMandatoryIe("Session AMBR"))
+        );
+    }
+
+    #[test]
+    fn test_establishment_accept_missing_qos_rules_rejected() {
+        // Only octet 5 present
+        let buf: &[u8] = &[0x11];
+        let result = PduSessionEstablishmentAccept::decode(&mut &buf[..], 1, 1);
+        assert_eq!(
+            result,
+            Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Authorized QoS rules"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_establishment_accept_empty_qos_rules_rejected() {
+        // Octet 5 + zero-length QoS rules LV-E + valid AMBR
+        let buf: &[u8] = &[0x11, 0x00, 0x00, 0x06, 0x06, 0x00, 0xC8, 0x06, 0x00, 0x32];
+        let result = PduSessionEstablishmentAccept::decode(&mut &buf[..], 1, 1);
+        assert_eq!(
+            result,
+            Err(PduSessionEstablishmentError::MissingMandatoryIe(
+                "Authorized QoS rules"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_establishment_accept_invalid_ssc_mode_rejected() {
+        // SSC mode 0 (reserved) in the high nibble of octet 5
+        let buf: &[u8] = &[0x01, 0x00, 0x01, 0xAA, 0x06, 0x06, 0x00, 0xC8, 0x06, 0x00, 0x32];
+        let result = PduSessionEstablishmentAccept::decode(&mut &buf[..], 1, 1);
+        assert_eq!(
+            result,
+            Err(PduSessionEstablishmentError::MissingMandatoryIe("Selected SSC mode"))
+        );
+    }
+
+    #[test]
+    fn test_establishment_accept_wrong_ambr_length_rejected() {
+        // AMBR length 7 instead of 6 (the legacy nextgcore double-length bug)
+        let buf: &[u8] = &[
+            0x11, 0x00, 0x01, 0xAA, 0x07, 0x06, 0x06, 0x00, 0xC8, 0x06, 0x00, 0x32,
+        ];
+        let result = PduSessionEstablishmentAccept::decode(&mut &buf[..], 1, 1);
+        assert_eq!(
+            result,
+            Err(PduSessionEstablishmentError::MissingMandatoryIe("Session AMBR"))
+        );
+    }
+
+    /// External vector: the exact byte construction of nextgcore smfd's
+    /// `policy::build_establishment_accept(5, 3, IPV4, 1, 9, 200 Mbps,
+    /// 50 Mbps, 10.45.0.2, "internet")` replicated byte-for-byte.
+    fn nextgcore_legacy_accept_bytes() -> Vec<u8> {
+        let mut msg = vec![0x2E, 5, 3, 0xC2];
+        msg.push(0x01); // selected PDU session type (IPv4), SSC bits zero
+        msg.push(0x01); // selected SSC mode as a SEPARATE octet (non-spec)
+        msg.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]); // "QoS rules"
+        msg.push(0x06); // session AMBR length
+        msg.extend_from_slice(&[0x06, 0x00, 0xC8]); // DL: unit 1 Mbps, 200
+        msg.extend_from_slice(&[0x06, 0x00, 0x32]); // UL: unit 1 Mbps, 50
+        msg.extend_from_slice(&[0x29, 0x05, 0x01, 10, 45, 0, 2]); // PDU address
+        msg.extend_from_slice(&[0x25, 0x09, 0x08]); // DNN TLV
+        msg.extend_from_slice(b"internet");
+        msg
+    }
+
+    #[test]
+    fn test_strict_decode_rejects_current_nextgcore_emission() {
+        let bytes = nextgcore_legacy_accept_bytes();
+        // The strict parser misreads the legacy layout (separate SSC octet
+        // shifts the QoS rules LV-E length) and must fail.
+        let result = PduSessionEstablishmentAccept::decode(&mut &bytes[4..], 5, 3);
+        assert!(result.is_err(), "strict parser must reject the legacy core shape");
+    }
+
+    #[test]
+    fn test_legacy_decode_parses_current_nextgcore_emission() {
+        let bytes = nextgcore_legacy_accept_bytes();
+        let acc =
+            PduSessionEstablishmentAccept::decode_legacy_nextgcore(&bytes[4..], 5, 3).unwrap();
+        assert_eq!(acc.pdu_session_id, 5);
+        assert_eq!(acc.pti, 3);
+        assert_eq!(
+            acc.selected_pdu_session_type.value,
+            PduSessionTypeValue::Ipv4
+        );
+        assert_eq!(acc.selected_ssc_mode.value, SscModeValue::SscMode1);
+        assert_eq!(acc.session_ambr.downlink_unit, 0x06);
+        assert_eq!(acc.session_ambr.downlink, 200);
+        assert_eq!(acc.session_ambr.uplink, 50);
+        // QFI is the last opaque QoS byte
+        assert_eq!(acc.authorized_qos_rules.data.last(), Some(&0x09));
+        let addr = acc.pdu_address.unwrap();
+        assert_eq!(addr.address_type, PduAddressType::Ipv4);
+        assert_eq!(addr.address, vec![10, 45, 0, 2]);
+        assert_eq!(acc.dnn.unwrap().value, {
+            let mut v = vec![8u8];
+            v.extend_from_slice(b"internet");
+            v
+        });
+    }
+
+    // ========================================================================
+    // PDU Session Establishment Reject Tests
+    // ========================================================================
+
+    #[test]
+    fn test_establishment_reject_encode_decode_roundtrip() {
+        let mut rej =
+            PduSessionEstablishmentReject::new(1, 2, SmCause::InsufficientResourcesForSlice);
+        rej.back_off_timer_value = Some(0x21); // GPRS timer 3
+        rej.allowed_ssc_mode = Some(0x02);
+        rej.re_attempt_indicator = Some(0x01);
+
+        let mut buf = Vec::new();
+        rej.encode(&mut buf);
+        assert_eq!(&buf[..4], &[0x2E, 1, 2, 0xC3]);
+        assert_eq!(buf[4], 69);
+
+        let decoded = PduSessionEstablishmentReject::decode(&mut &buf[4..], 1, 2).unwrap();
+        assert_eq!(decoded, rej);
+    }
+
+    /// External vector: nextgcore smfd `policy::build_establishment_reject`
+    /// emits exactly `[0x2E, PSI, PTI, 0xC3, cause]`.
+    #[test]
+    fn test_establishment_reject_decodes_nextgcore_emission() {
+        let bytes = [0x2Eu8, 1, 2, 0xC3, 29];
+        let rej = PduSessionEstablishmentReject::decode(&mut &bytes[4..], 1, 2).unwrap();
+        assert_eq!(rej.cause(), SmCause::UserAuthenticationFailed);
+        assert!(rej.back_off_timer_value.is_none());
+    }
+
+    #[test]
+    fn test_establishment_reject_missing_cause() {
+        let buf: &[u8] = &[];
+        let result = PduSessionEstablishmentReject::decode(&mut &buf[..], 1, 1);
+        assert_eq!(
+            result,
+            Err(PduSessionEstablishmentError::MissingMandatoryIe("5GSM cause"))
+        );
+    }
+
+    #[test]
+    fn test_sm_cause_slice_values_roundtrip() {
+        for (raw, cause) in [
+            (26u8, SmCause::InsufficientResources),
+            (28, SmCause::UnknownPduSessionType),
+            (50, SmCause::PduSessionTypeIpv4OnlyAllowed),
+            (51, SmCause::PduSessionTypeIpv6OnlyAllowed),
+            (57, SmCause::PduSessionTypeIpv4v6OnlyAllowed),
+            (67, SmCause::InsufficientResourcesForSliceAndDnn),
+            (69, SmCause::InsufficientResourcesForSlice),
+            (70, SmCause::MissingOrUnknownDnnInSlice),
+        ] {
+            assert_eq!(SmCause::try_from(raw).unwrap(), cause);
+            assert_eq!(cause as u8, raw);
+        }
     }
 }

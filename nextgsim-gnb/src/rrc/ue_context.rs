@@ -65,6 +65,8 @@ pub struct RrcUeContext {
     pub state: RrcState,
     /// RedCap processor for this UE (Rel-17)
     pub redcap: RedCapProcessor,
+    /// UPER-encoded UE-NR-Capability container from UECapabilityInformation
+    pub nr_capability: Option<Vec<u8>>,
 }
 
 impl RrcUeContext {
@@ -78,7 +80,13 @@ impl RrcUeContext {
             s_tmsi: None,
             state: RrcState::Idle,
             redcap: RedCapProcessor::new(),
+            nr_capability: None,
         }
+    }
+
+    /// Stores the UE-NR-Capability container received in UECapabilityInformation
+    pub fn set_nr_capability(&mut self, container: Vec<u8>) {
+        self.nr_capability = Some(container);
     }
 
     /// Sets the initial UE identity

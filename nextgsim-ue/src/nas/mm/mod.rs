@@ -25,11 +25,15 @@
 mod config_update;
 mod deregistration;
 mod emergency;
+mod orchestrator;
 mod service_request;
 mod state;
+mod suci;
 
 pub use config_update::*;
 pub use deregistration::*;
 pub use emergency::*;
+pub use orchestrator::*;
 pub use service_request::*;
 pub use state::*;
+pub use suci::*;

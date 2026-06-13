@@ -12,6 +12,15 @@ use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_request, RrcEstablishmentCause as AsnEstablishmentCause, UeIdentity,
 };
+use nextgsim_rrc::procedures::ue_capability::{
+    decode_ue_capability_information, encode_ue_capability_enquiry, parse_nr_capability_bands,
+    RatType, UeCapabilityEnquiryParams,
+};
+
+/// Simplified DL/UL-DCCH envelope code: first byte 0x06 marks a UE capability
+/// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
+/// UECapabilityEnquiry (DL) / UECapabilityInformation (UL).
+const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
 
 use super::connection::RrcConnectionManager;
 use super::ue_context::RrcUeContextManager;
@@ -190,6 +199,10 @@ impl RrcTask {
             0x08 => self.handle_ul_information_transfer(ue_id, data).await,
             0x05 => self.handle_rrc_reestablishment_complete(ue_id, data).await,
             0x09 => self.handle_rrc_resume_complete(ue_id, data).await,
+            RRC_MSG_TYPE_UE_CAPABILITY => {
+                self.handle_ue_capability_information(ue_id, &bytes[1..])
+                    .await;
+            }
             _ => {
                 // Check if this looks like a raw NAS PDU
                 // EPD = 0x7E for 5GMM (Mobility Management), 0x2E for 5GSM (Session Management)
@@ -252,6 +265,70 @@ impl RrcTask {
                 result.s_tmsi,
             )
             .await;
+
+            // Enquire UE radio access capabilities (TS 38.331 §5.6.1)
+            self.send_ue_capability_enquiry(ue_id).await;
+        }
+    }
+
+    /// Sends a UECapabilityEnquiry to the UE (TS 38.331 §5.6.1)
+    async fn send_ue_capability_enquiry(&mut self, ue_id: i32) {
+        let params = UeCapabilityEnquiryParams {
+            rrc_transaction_id: 0,
+            rat_types: vec![RatType::Nr],
+        };
+        match encode_ue_capability_enquiry(&params) {
+            Ok(uper) => {
+                let mut pdu = Vec::with_capacity(uper.len() + 1);
+                pdu.push(RRC_MSG_TYPE_UE_CAPABILITY);
+                pdu.extend_from_slice(&uper);
+                info!("Sending UECapabilityEnquiry to UE[{}]", ue_id);
+                self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+                    .await;
+            }
+            Err(e) => {
+                error!("Failed to encode UECapabilityEnquiry: {}", e);
+            }
+        }
+    }
+
+    /// Handles a UECapabilityInformation from the UE (TS 38.331 §5.6.1)
+    async fn handle_ue_capability_information(&mut self, ue_id: i32, uper_bytes: &[u8]) {
+        let information = match decode_ue_capability_information(uper_bytes) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(
+                    "Failed to decode UECapabilityInformation from UE[{}]: {}",
+                    ue_id, e
+                );
+                return;
+            }
+        };
+
+        for container in &information.containers {
+            if container.rat_type == RatType::Nr {
+                match parse_nr_capability_bands(&container.container) {
+                    Ok(bands) => {
+                        info!(
+                            "UE[{}] NR capability received: supported bands {:?}",
+                            ue_id, bands
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "UE[{}] sent an undecodable UE-NR-Capability container: {}",
+                            ue_id, e
+                        );
+                    }
+                }
+                if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                    ctx.set_nr_capability(container.container.clone());
+                }
+            }
+        }
+
+        if information.containers.is_empty() {
+            info!("UE[{}] reported no radio access capabilities", ue_id);
         }
     }
 

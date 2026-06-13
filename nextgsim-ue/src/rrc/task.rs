@@ -27,6 +27,7 @@ use crate::rrc::reestablishment::{
     ReestablishmentProcedure, ReestablishmentState, ReestablishmentTrigger,
 };
 use crate::rrc::resume::ResumeProcedure;
+use crate::rrc::security::{compute_short_mac_i, AsSecurityContext};
 use crate::rrc::state::{RrcState, RrcStateMachine};
 #[cfg(feature = "nextgsim-she")]
 use crate::tasks::SheClientMessage;
@@ -43,6 +44,19 @@ use nextgsim_rrc::procedures::rrc_setup::{
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupRequestParams,
     UeIdentity,
 };
+use nextgsim_rrc::procedures::ue_capability::{
+    build_minimal_nr_capability_container, decode_ue_capability_enquiry,
+    encode_ue_capability_information, RatType, UeCapabilityInformationParams,
+    UeCapabilityRatContainer,
+};
+
+/// Simplified DL/UL-DCCH envelope code: first byte 0x06 marks a UE capability
+/// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
+/// UECapabilityEnquiry (DL) / UECapabilityInformation (UL).
+const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
+
+/// Default NR band advertised by the simulated UE (n78, 3.5 GHz TDD)
+const DEFAULT_NR_BAND: u16 = 78;
 
 /// UAC barring configuration per 3GPP TS 38.331
 /// Represents the uac-BarringInfoSetList from SIB1
@@ -111,6 +125,9 @@ pub struct RrcTask {
     reestablishment_proc: ReestablishmentProcedure,
     /// RRC resume procedure state
     resume_proc: ResumeProcedure,
+    /// AS security context (set after AS Security Mode Command); required for
+    /// ShortMAC-I derivation in re-establishment (TS 38.331 §5.3.7)
+    as_security: Option<AsSecurityContext>,
 }
 
 impl RrcTask {
@@ -137,7 +154,15 @@ impl RrcTask {
             uac_barring: UacBarringConfig::default(),
             reestablishment_proc: ReestablishmentProcedure::new(),
             resume_proc: ResumeProcedure::new(),
+            as_security: None,
         }
+    }
+
+    /// Installs the AS security context (called once the AS Security Mode
+    /// procedure derives KRRCint). Enables re-establishment with a real
+    /// ShortMAC-I per TS 38.331 §5.3.7.4.
+    pub fn set_as_security_context(&mut self, ctx: AsSecurityContext) {
+        self.as_security = Some(ctx);
     }
 
     /// Get the next PDU ID for RRC message tracking
@@ -537,6 +562,11 @@ impl RrcTask {
                 debug!("Received RRC Reconfiguration from cell {}", cell_id);
                 self.handle_rrc_reconfiguration(cell_id, pdu).await;
             }
+            RRC_MSG_TYPE_UE_CAPABILITY => {
+                // UECapabilityEnquiry: envelope byte + ASN.1 UPER message
+                info!("Received UECapabilityEnquiry from cell {}", cell_id);
+                self.handle_ue_capability_enquiry(&bytes[1..]).await;
+            }
             0x08 => {
                 // RRCResume (first byte 0x28; low nibble 0x08)
                 // gNB encodes: bytes[0]=0x28, bytes[1]=transaction_id
@@ -638,6 +668,7 @@ impl RrcTask {
         let nas_data = nas_pdu.data().to_vec();
 
         let params = RrcSetupCompleteParams {
+            registered_amf: None,
             rrc_transaction_id: 0,
             selected_plmn_identity: 1,
             guami_type: None,
@@ -809,6 +840,60 @@ impl RrcTask {
         }
     }
 
+    /// Handles a UECapabilityEnquiry (TS 38.331 §5.6.1) and responds with
+    /// UECapabilityInformation carrying a real UE-NR-Capability container.
+    async fn handle_ue_capability_enquiry(&mut self, uper_bytes: &[u8]) {
+        let enquiry = match decode_ue_capability_enquiry(uper_bytes) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to decode UECapabilityEnquiry: {}", e);
+                return;
+            }
+        };
+
+        // Provide a capability container for each requested RAT we support
+        // (NR only for this UE)
+        let mut containers = Vec::new();
+        for rat in &enquiry.rat_types {
+            if *rat == RatType::Nr {
+                match build_minimal_nr_capability_container(DEFAULT_NR_BAND) {
+                    Ok(container) => containers.push(UeCapabilityRatContainer {
+                        rat_type: RatType::Nr,
+                        container,
+                    }),
+                    Err(e) => {
+                        error!("Failed to build UE-NR-Capability container: {}", e);
+                    }
+                }
+            } else {
+                debug!("UECapabilityEnquiry for unsupported RAT {:?} — skipping", rat);
+            }
+        }
+
+        let params = UeCapabilityInformationParams {
+            rrc_transaction_id: enquiry.rrc_transaction_id,
+            containers,
+        };
+
+        match encode_ue_capability_information(&params) {
+            Ok(uper) => {
+                let mut rrc_pdu = Vec::with_capacity(uper.len() + 1);
+                rrc_pdu.push(RRC_MSG_TYPE_UE_CAPABILITY);
+                rrc_pdu.extend_from_slice(&uper);
+                info!(
+                    "Sending UECapabilityInformation (transaction {}, {} containers)",
+                    params.rrc_transaction_id,
+                    params.containers.len()
+                );
+                self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&rrc_pdu))
+                    .await;
+            }
+            Err(e) => {
+                error!("Failed to encode UECapabilityInformation: {}", e);
+            }
+        }
+    }
+
     /// Forward NAS PDU to NAS task
     async fn forward_nas_to_nas_task(&self, pdu: OctetString) {
         if let Err(e) = self
@@ -924,13 +1009,45 @@ impl RrcTask {
             }
         };
 
-        // Only attempt re-establishment if we have connection context
-        if self.state_machine.state().has_connection_context()
+        // Per TS 38.331 §5.3.7.2 re-establishment is only initiated when AS
+        // security has been activated; otherwise the UE goes to RRC_IDLE.
+        let security = if self.state_machine.state().has_connection_context()
             && !self.reestablishment_proc.is_in_progress()
         {
-            let c_rnti = 0x0001u16; // placeholder — real impl would store the allocated C-RNTI
+            self.as_security.clone()
+        } else {
+            None
+        };
+        if let Some(security) = security {
+            let c_rnti = security.c_rnti;
             let pci = self.serving_cell_id.unwrap_or(0) as u16;
-            let short_mac_i = 0x0000u16; // placeholder — real impl derives from AS security
+
+            // Target cell identity: the cell we re-establish on (the serving
+            // cell in this simulation, looked up from its SIB1 NCI)
+            let target_cell_identity = self
+                .serving_cell_id
+                .and_then(|id| self.cell_selector.get_cell(id))
+                .map(|cell| cell.sib1.nci as u64)
+                .unwrap_or(0);
+
+            // ShortMAC-I derived from the AS security context (TS 38.331 §5.3.7.4)
+            let short_mac_i = match compute_short_mac_i(&security, pci, target_cell_identity) {
+                Ok(mac) => mac,
+                Err(e) => {
+                    error!("ShortMAC-I derivation failed: {} — going to idle", e);
+                    let _ = self.state_machine.on_rrc_release();
+                    self.serving_cell_id = None;
+                    if let Err(ne) = self
+                        .task_base
+                        .nas_tx
+                        .send(NasMessage::RadioLinkFailure)
+                        .await
+                    {
+                        error!("Failed to notify NAS of radio link failure: {}", ne);
+                    }
+                    return;
+                }
+            };
 
             match self.reestablishment_proc.initiate(
                 trigger,
@@ -984,7 +1101,8 @@ impl RrcTask {
                 }
             }
         } else {
-            // Already idle or re-establishment in progress — just notify NAS
+            // Already idle, re-establishment in progress, or AS security never
+            // activated (TS 38.331 §5.3.7.2: go to RRC_IDLE) — just notify NAS
             let _ = self.state_machine.on_rrc_release();
             self.serving_cell_id = None;
             if let Err(e) = self

@@ -1696,6 +1696,15 @@ impl TaskManager {
         self.task_base.clone()
     }
 
+    /// Initialize the Rel-18 task handles (Ranging, MINT, Sidelink) on the
+    /// manager's task base and return the receivers for the task loops.
+    ///
+    /// Must be called before [`TaskManager::task_base`] so every task clone
+    /// carries the Rel-18 handles and `shutdown_all()` reaches the actors.
+    pub fn init_rel18_tasks(&mut self, channel_capacity: usize) -> UeRel18Receivers {
+        self.task_base.init_rel18_tasks(channel_capacity)
+    }
+
     /// Returns a receiver for the shutdown signal.
     ///
     /// Tasks can use this to detect when shutdown has been requested.

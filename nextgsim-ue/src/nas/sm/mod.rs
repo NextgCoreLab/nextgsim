@@ -13,8 +13,11 @@
 //!
 //! # Reference
 //!
-//! Based on UERANSIM's `src/ue/nas/sm/` implementation.
+//! Based on 3GPP TS 24.501 Section 6 and UERANSIM's `src/ue/nas/sm/`
+//! implementation.
 
+mod orchestrator;
 mod procedure;
 
+pub use orchestrator::*;
 pub use procedure::*;

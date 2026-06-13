@@ -5,10 +5,13 @@ supi:
   supi_type: Imsi
   value: "999700000000001"
 
+# SUCI protection (TS 33.501 Annex C): 0=null, 1=Profile A, 2=Profile B.
+# See config/ue.yaml for the Annex C.4 test vector public keys matching the
+# nextgcore hnet provisioning (key id 1 = Profile A, key id 2 = Profile B).
 protection_scheme: 0
 home_network_public_key_id: 0
 home_network_public_key: []
-routing_indicator: null
+routing_indicator: "0000"
 
 hplmn:
   mcc: 999
