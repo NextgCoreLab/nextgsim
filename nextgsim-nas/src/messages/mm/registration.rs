@@ -534,6 +534,10 @@ mod registration_request_iei {
     /// by the UAV CAA-level ID string, so the AMF can grant and track UAV
     /// flight authorization (geofence) for this registration.
     pub const UAV_INDICATION: u8 = 0xA8;
+    /// RedCap (Reduced Capability) indication (Rel-17, TS 38.101): TLV whose
+    /// single value octet carries bit 0 = reduced-capability device, so the AMF
+    /// can apply a reduced UE/session-AMBR.
+    pub const REDCAP_INDICATION: u8 = 0xA9;
 }
 
 /// Registration Request message (UE to network)
@@ -594,6 +598,12 @@ pub struct RegistrationRequest {
     /// identifier (may be empty when only the aerial-UE capability is signalled)
     /// used by the AMF to create the UAV flight-authorization context.
     pub uav_indication: Option<String>,
+    /// RedCap (Reduced Capability) indication (optional, Type 4, IEI 0xA9) -
+    /// Rel-17 (TS 38.101). Set when the UE is a reduced-capability device so
+    /// the AMF can apply a reduced UE/session-AMBR. (The RRCSetupComplete AS
+    /// signalling is modelled separately; this NAS indication is what reaches
+    /// the core in the simulator's runtime registration path.)
+    pub redcap: bool,
 }
 
 impl Default for RegistrationRequest {
@@ -622,6 +632,7 @@ impl Default for RegistrationRequest {
             snpn_nid: None,
             disaster_roaming: false,
             uav_indication: None,
+            redcap: false,
         }
     }
 }
@@ -892,6 +903,22 @@ impl RegistrationRequest {
                         msg.uav_indication = Some(String::from_utf8(data).unwrap_or_default());
                     }
                 }
+                // RedCap indication (Rel-17, TS 38.101): TLV with a single
+                // value octet; bit 0 is the reduced-capability flag.
+                registration_request_iei::REDCAP_INDICATION => {
+                    buf.advance(1);
+                    if buf.remaining() == 0 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len || len < 1 {
+                        break;
+                    }
+                    msg.redcap = buf.get_u8() & 0x01 == 0x01;
+                    if len > 1 {
+                        buf.advance(len - 1);
+                    }
+                }
                 _ => {
                     // Skip unknown IEs
                     buf.advance(1);
@@ -1034,6 +1061,14 @@ impl RegistrationRequest {
             buf.put_u8((1 + caa_id.len()) as u8);
             buf.put_u8(0x01); // aerial-UE flag
             buf.put_slice(caa_id.as_bytes());
+        }
+
+        // RedCap (Reduced Capability) indication (Rel-17, TS 38.101): TLV with
+        // a single value octet; bit 0 set means reduced-capability device.
+        if self.redcap {
+            buf.put_u8(registration_request_iei::REDCAP_INDICATION);
+            buf.put_u8(1);
+            buf.put_u8(0x01);
         }
     }
 

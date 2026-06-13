@@ -142,6 +142,10 @@ pub struct MmUeIdentity {
     /// flag plus the UAV CAA-level ID so the AMF creates the UAV flight
     /// authorization (geofence) context.
     pub uav_indication: Option<String>,
+    /// RedCap (Reduced Capability) indication (Rel-17, TS 38.101). Set from the
+    /// UE config so the Registration Request carries the reduced-capability NAS
+    /// indication and the AMF/SMF apply a reduced session-AMBR.
+    pub redcap: bool,
 }
 
 impl MmUeIdentity {
@@ -222,6 +226,9 @@ impl MmUeIdentity {
                 .as_ref()
                 .filter(|u| u.is_aerial_ue)
                 .map(|u| u.uav_id.clone().unwrap_or_default()),
+            // RedCap (Rel-17, TS 38.101): carry the reduced-capability flag from
+            // config so the Registration Request signals it to the AMF.
+            redcap: config.redcap,
         }
     }
 
@@ -644,6 +651,15 @@ impl MmOrchestrator {
         if let Some(ref caa_id) = self.identity.uav_indication {
             req.uav_indication = Some(caa_id.clone());
             info!("UAV registration: including aerial-UE indication (CAA-ID={caa_id})");
+        }
+        // RedCap (Rel-17, TS 38.101): a reduced-capability UE advertises the
+        // indication so the AMF caps UE-AMBR and the SMF reduces session-AMBR.
+        // (The RRCSetupComplete AS signalling is modelled in the lib RrcTask but
+        // the runtime binary's RRC path does not exercise it; this NAS
+        // indication is what actually reaches the core.)
+        if self.identity.redcap {
+            req.redcap = true;
+            info!("RedCap registration: including reduced-capability indication");
         }
 
         let mut plain = Vec::new();
@@ -1684,6 +1700,7 @@ mod tests {
             snpn_nid: None,
             disaster_roaming: false,
             uav_indication: None,
+            redcap: false,
         }
     }
 
