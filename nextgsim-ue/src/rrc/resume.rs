@@ -38,6 +38,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::security::{compute_resume_mac_i, AsSecurityContext, ShortMacError};
 use super::state::{RrcState, RrcStateMachine, RrcStateTransition};
 
 // ============================================================================
@@ -137,6 +138,15 @@ pub enum ResumeError {
     /// No resume identity available (short I-RNTI)
     #[error("No resume identity (I-RNTI) available")]
     NoResumeIdentity,
+    /// resumeMAC-I derivation from the AS security context failed
+    #[error("resumeMAC-I derivation failed: {0}")]
+    MacComputation(String),
+}
+
+impl From<ShortMacError> for ResumeError {
+    fn from(e: ShortMacError) -> Self {
+        ResumeError::MacComputation(e.to_string())
+    }
 }
 
 // ============================================================================
@@ -172,7 +182,8 @@ impl ResumeIdentity {
 pub struct ResumeRequestParams {
     /// I-RNTI identifying the UE in INACTIVE (short 24-bit or full 40-bit)
     pub resume_identity: ResumeIdentity,
-    /// Resume MAC-I (16 bits), computed from AS security context
+    /// resumeMAC-I (16 bits), derived from the AS security context by
+    /// [`ResumeProcedure::initiate`] (TS 38.331 §5.3.13.3)
     pub resume_mac_i: u16,
     /// Cause for resuming
     pub cause: ResumeCause,
@@ -247,24 +258,35 @@ impl ResumeProcedure {
 
     /// Initiates the RRC Resume procedure.
     ///
-    /// Per 3GPP TS 38.331 Section 5.3.13.2:
+    /// Per 3GPP TS 38.331 Section 5.3.13.2 / 5.3.13.3:
     /// - UE must be in `RRC_INACTIVE` state
-    /// - UE includes its short I-RNTI and computed resume MAC-I
+    /// - UE includes its I-RNTI and a resumeMAC-I it derives itself from the
+    ///   stored AS security context (the resumeMAC-I is *not* supplied by the
+    ///   caller; it is the 16 LSBs of the MAC-I computed over the
+    ///   `VarResumeMAC-Input` with KRRCint and COUNT/BEARER/DIRECTION set to
+    ///   binary ones).
     ///
     /// # Arguments
     /// * `cause` - Reason for resuming the connection
     /// * `resume_identity` - I-RNTI (short 24-bit or full 40-bit form)
-    /// * `resume_mac_i` - 16-bit MAC computed with AS security key
+    /// * `sec_ctx` - AS security context of the source PCell (KRRCint, NIA,
+    ///   source C-RNTI) used to derive the resumeMAC-I
+    /// * `source_pci` - Physical cell identity of the source PCell (0..1007)
+    /// * `target_cell_identity` - 36-bit NR Cell Identity of the cell the UE is
+    ///   resuming on
     /// * `rrc_sm` - UE RRC state machine (validated, not yet transitioned)
     ///
     /// # Returns
-    /// * `Ok(ResumeRequestParams)` - Parameters for building the resume request
-    /// * `Err(error)` - If cannot initiate
+    /// * `Ok(ResumeRequestParams)` - Parameters for building the resume request,
+    ///   carrying the derived resumeMAC-I
+    /// * `Err(error)` - If cannot initiate or the MAC derivation fails
     pub fn initiate(
         &mut self,
         cause: ResumeCause,
         resume_identity: ResumeIdentity,
-        resume_mac_i: u16,
+        sec_ctx: &AsSecurityContext,
+        source_pci: u16,
+        target_cell_identity: u64,
         rrc_sm: &RrcStateMachine,
     ) -> Result<ResumeRequestParams, ResumeError> {
         // Must be in INACTIVE
@@ -280,7 +302,15 @@ impl ResumeProcedure {
             return Err(ResumeError::NoResumeIdentity);
         }
 
-        tracing::info!("RRC Resume initiated: cause={}", cause);
+        // Derive the resumeMAC-I from the AS security context (TS 38.331
+        // §5.3.13.3); never trust a caller-supplied value.
+        let resume_mac_i = compute_resume_mac_i(sec_ctx, source_pci, target_cell_identity)?;
+
+        tracing::info!(
+            "RRC Resume initiated: cause={}, resumeMAC-I={:#06x}",
+            cause,
+            resume_mac_i
+        );
 
         let params = ResumeRequestParams {
             resume_identity,
@@ -413,6 +443,8 @@ impl ResumeProcedure {
 mod tests {
     use super::*;
 
+    use super::super::security::IntegrityAlgorithm;
+
     fn setup_inactive_sm() -> RrcStateMachine {
         let mut sm = RrcStateMachine::new();
         sm.transition(RrcStateTransition::SetupComplete).unwrap();
@@ -420,15 +452,34 @@ mod tests {
         sm
     }
 
+    /// Source-PCell AS security context used to derive the resumeMAC-I.
+    fn test_sec_ctx() -> AsSecurityContext {
+        AsSecurityContext {
+            k_rrc_int: [
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                0x0E, 0x0F,
+            ],
+            integrity_algorithm: IntegrityAlgorithm::Nia2,
+            c_rnti: 0x1234,
+        }
+    }
+
+    // Fixed source PCI / target cell identity for the deterministic tests.
+    const SRC_PCI: u16 = 100;
+    const TGT_CELL: u64 = 0x10;
+
     #[test]
     fn test_initiate_from_inactive() {
         let sm = setup_inactive_sm();
         let mut proc = ResumeProcedure::new();
 
+        let ctx = test_sec_ctx();
         let result = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x123456),
-            0xABCD,
+            &ctx,
+            SRC_PCI,
+            TGT_CELL,
             &sm,
         );
 
@@ -438,8 +489,43 @@ mod tests {
 
         let params = result.unwrap();
         assert_eq!(params.resume_identity, ResumeIdentity::Short(0x123456));
-        assert_eq!(params.resume_mac_i, 0xABCD);
+        // The resumeMAC-I is derived (not passed in) and matches the direct
+        // computation over VarResumeMAC-Input.
+        let expected = compute_resume_mac_i(&ctx, SRC_PCI, TGT_CELL).unwrap();
+        assert_eq!(params.resume_mac_i, expected);
         assert!(matches!(params.cause, ResumeCause::MoData));
+    }
+
+    #[test]
+    fn test_initiate_derives_mac_not_supplied() {
+        // The caller no longer supplies a resumeMAC-I; it is derived from the
+        // AS security context (TS 38.331 §5.3.13.3) and is deterministic for a
+        // given context + cell pair.
+        let sm = setup_inactive_sm();
+        let mut proc = ResumeProcedure::new();
+        let ctx = test_sec_ctx();
+
+        let params = proc
+            .initiate(
+                ResumeCause::MoSignalling,
+                ResumeIdentity::Short(0x010203),
+                &ctx,
+                SRC_PCI,
+                TGT_CELL,
+                &sm,
+            )
+            .unwrap();
+
+        // Known-vector round-trip: same key/algorithm/PCI/cell yields the same
+        // 16-bit MAC; different inputs change it.
+        assert_eq!(
+            params.resume_mac_i,
+            compute_resume_mac_i(&ctx, SRC_PCI, TGT_CELL).unwrap()
+        );
+        assert_ne!(
+            params.resume_mac_i,
+            compute_resume_mac_i(&ctx, SRC_PCI + 1, TGT_CELL).unwrap()
+        );
     }
 
     #[test]
@@ -451,7 +537,9 @@ mod tests {
         let result = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x000001),
-            0x0001,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm,
         );
 
@@ -466,7 +554,9 @@ mod tests {
         let result = proc.initiate(
             ResumeCause::MoSignalling,
             ResumeIdentity::Short(0x000002),
-            0x0002,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm,
         );
 
@@ -481,7 +571,9 @@ mod tests {
         let _ = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x111111),
-            0x0001,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm,
         );
 
@@ -489,7 +581,9 @@ mod tests {
         let result = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x222222),
-            0x0002,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm2,
         );
 
@@ -503,7 +597,9 @@ mod tests {
         let _ = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x123456),
-            0xABCD,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm_ref,
         );
 
@@ -525,7 +621,9 @@ mod tests {
         let _ = proc.initiate(
             ResumeCause::MoSignalling,
             ResumeIdentity::Short(0x000001),
-            0x0001,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm_ref,
         );
 
@@ -554,7 +652,9 @@ mod tests {
         let _ = proc.initiate(
             ResumeCause::MtAccess,
             ResumeIdentity::Short(0x000001),
-            0x0001,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm_ref,
         );
 
@@ -572,7 +672,9 @@ mod tests {
         let _ = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x000001),
-            0x0001,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm_ref,
         );
 
@@ -587,7 +689,9 @@ mod tests {
         let _ = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x000001),
-            0x0001,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm_ref,
         );
 
@@ -605,7 +709,9 @@ mod tests {
         let _ = proc.initiate(
             ResumeCause::MoData,
             ResumeIdentity::Short(0x123456),
-            0xABCD,
+            &test_sec_ctx(),
+            SRC_PCI,
+            TGT_CELL,
             &sm_ref,
         );
 

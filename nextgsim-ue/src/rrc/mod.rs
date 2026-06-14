@@ -74,7 +74,9 @@ pub use resume::{
     ResumeCause, ResumeCompleteParams, ResumeError, ResumeIdentity, ResumeProcedure,
     ResumeProcedureState, ResumeRequestParams, T319_DEFAULT_MS,
 };
-pub use security::{compute_short_mac_i, AsSecurityContext, IntegrityAlgorithm, ShortMacError};
+pub use security::{
+    compute_resume_mac_i, compute_short_mac_i, AsSecurityContext, IntegrityAlgorithm, ShortMacError,
+};
 pub use state::{RrcState, RrcStateError, RrcStateMachine, RrcStateTransition};
 pub use task::RrcTask;
 pub use uav::{

@@ -95,6 +95,12 @@ pub enum MmOutput {
     SendNasPdu(Vec<u8>),
     /// The registration procedure completed successfully
     RegistrationSucceeded,
+    /// The equivalent-PLMN list was (re)signalled by the network in the
+    /// Registration Accept (TS 24.501 §5.5.1.2.4). Each entry is a 3-octet
+    /// BCD-encoded PLMN in the network-supplied priority order; an empty
+    /// vector means the list was deleted. The caller wires this into the
+    /// TS 23.122 PLMN selector so subsequent selection honours it.
+    EquivalentPlmnsUpdated(Vec<[u8; 3]>),
     /// The registration procedure failed terminally with the given cause
     RegistrationFailed(MmCause),
     /// The network rejected authentication; the USIM is considered invalid
@@ -341,6 +347,11 @@ pub struct MmOrchestrator {
     tai_list: Option<Vec<u8>>,
     allowed_nssai: Option<Vec<u8>>,
     current_tai: Option<[u8; 6]>,
+    /// Equivalent PLMN list signalled in the last Registration Accept
+    /// (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). Each entry is a 3-octet
+    /// BCD-encoded PLMN, in the network-supplied priority order. Replaced
+    /// on every Registration Accept (deleted when the IE is absent).
+    equivalent_plmns: Vec<[u8; 3]>,
     /// T3502 value signalled by the network (used at attempt exhaustion)
     t3502_value: Option<GprsTimer3>,
 
@@ -379,6 +390,7 @@ impl MmOrchestrator {
             tai_list: None,
             allowed_nssai: None,
             current_tai: None,
+            equivalent_plmns: Vec::new(),
             t3502_value: None,
             forbidden_plmns: Vec::new(),
             forbidden_tais_roaming: Vec::new(),
@@ -430,6 +442,13 @@ impl MmOrchestrator {
     /// Registration area (TAI list) assigned by the network, if any
     pub fn tai_list(&self) -> Option<&[u8]> {
         self.tai_list.as_deref()
+    }
+
+    /// Equivalent PLMN list (TS 24.501 §5.5.1.2.4) signalled in the last
+    /// Registration Accept, as 3-octet BCD PLMNs in priority order. Empty when
+    /// the network never signalled one (or deleted it).
+    pub fn equivalent_plmns(&self) -> &[[u8; 3]] {
+        &self.equivalent_plmns
     }
 
     /// Allowed NSSAI assigned by the network, if any
@@ -768,6 +787,23 @@ impl MmOrchestrator {
             warn!("Registration Accept without Allowed NSSAI (network not strict)");
         }
 
+        // Equivalent PLMN list (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). The list
+        // is replaced on every Registration Accept; an absent IE deletes it.
+        // The IE value is a sequence of 3-octet BCD PLMNs.
+        let new_equivalent_plmns: Vec<[u8; 3]> = acc
+            .equivalent_plmns
+            .as_deref()
+            .map(parse_equivalent_plmns)
+            .unwrap_or_default();
+        let equivalent_plmns_changed = new_equivalent_plmns != self.equivalent_plmns;
+        if equivalent_plmns_changed {
+            self.equivalent_plmns = new_equivalent_plmns;
+            info!(
+                "Registration Accept signalled {} equivalent PLMN(s)",
+                self.equivalent_plmns.len()
+            );
+        }
+
         // Periodic registration timer (T3512, GPRS timer 3)
         if let Some(t3512_byte) = acc.t3512_value {
             let timer3 = GprsTimer3::from_byte(t3512_byte);
@@ -798,6 +834,16 @@ impl MmOrchestrator {
             let pdu = self.protect_if_active(complete);
             info!("Sending Registration Complete");
             outs.push(MmOutput::SendNasPdu(pdu));
+        }
+        // Surface the equivalent-PLMN list so the caller can wire it into the
+        // TS 23.122 PLMN selector. Emitted only when the list changed (a list
+        // becomes non-empty, or a previously signalled list is cleared by a
+        // list-less Registration Accept), so a UE that never receives the IE
+        // produces no spurious output.
+        if equivalent_plmns_changed {
+            outs.push(MmOutput::EquivalentPlmnsUpdated(
+                self.equivalent_plmns.clone(),
+            ));
         }
         outs.push(MmOutput::RegistrationSucceeded);
         outs
@@ -1696,6 +1742,15 @@ fn parse_first_tai(tai_list: &[u8]) -> Option<[u8; 6]> {
     Some(tai)
 }
 
+/// Parse the Equivalent PLMNs IE value (TS 24.501 §9.11.3.45): a sequence of
+/// 3-octet BCD-encoded PLMNs. A trailing partial octet group is ignored.
+fn parse_equivalent_plmns(value: &[u8]) -> Vec<[u8; 3]> {
+    value
+        .chunks_exact(3)
+        .map(|c| [c[0], c[1], c[2]])
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1977,6 +2032,103 @@ mod tests {
         let outs = orch.handle_downlink(&protected);
         assert_eq!(outs, vec![MmOutput::RegistrationSucceeded]);
         assert!(orch.stored_guti().is_none());
+    }
+
+    /// Build a Registration Accept (no GUTI) carrying an Equivalent PLMNs IE
+    /// with the given 3-octet BCD PLMNs.
+    fn build_registration_accept_with_equivalent_plmns(plmns: &[[u8; 3]]) -> Vec<u8> {
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        let mut eq = Vec::new();
+        for p in plmns {
+            eq.extend_from_slice(p);
+        }
+        acc.equivalent_plmns = Some(eq);
+        let mut pdu = Vec::new();
+        acc.encode(&mut pdu);
+        pdu
+    }
+
+    #[test]
+    fn test_registration_accept_equivalent_plmns_parsed_and_emitted() {
+        let mut orch = establish_security_context();
+        // 999/71 BCD = [0x99, 0xF9, 0x17]; 310/410 (3-digit MNC) = [0x13, 0x00, 0x14]
+        let plmn_a = [0x99u8, 0xF9, 0x17];
+        let plmn_b = [0x13u8, 0x00, 0x14];
+        let plain_acc = build_registration_accept_with_equivalent_plmns(&[plmn_a, plmn_b]);
+        let protected = protect_downlink(&orch, &plain_acc, 1);
+
+        let outs = orch.handle_downlink(&protected);
+
+        // The orchestrator stored the decoded equivalent-PLMN list...
+        assert_eq!(orch.equivalent_plmns(), &[plmn_a, plmn_b]);
+        // ...and surfaced it to the caller before RegistrationSucceeded.
+        assert!(outs.contains(&MmOutput::EquivalentPlmnsUpdated(vec![plmn_a, plmn_b])));
+        assert!(outs.contains(&MmOutput::RegistrationSucceeded));
+        let eq_idx = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::EquivalentPlmnsUpdated(_)));
+        let ok_idx = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::RegistrationSucceeded));
+        assert!(eq_idx < ok_idx, "equivalent PLMNs must precede success");
+    }
+
+    #[test]
+    fn test_registration_accept_without_equivalent_plmns_no_emit() {
+        // A Registration Accept without the IE on a fresh UE leaves the list
+        // empty and produces no EquivalentPlmnsUpdated output.
+        let mut orch = establish_security_context();
+        let plain_acc = build_registration_accept_pdu(false);
+        let protected = protect_downlink(&orch, &plain_acc, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(orch.equivalent_plmns().is_empty());
+        assert!(!outs
+            .iter()
+            .any(|o| matches!(o, MmOutput::EquivalentPlmnsUpdated(_))));
+    }
+
+    #[test]
+    fn test_equivalent_plmn_from_accept_is_honored_by_selection() {
+        // End-to-end of T3.7a: an equivalent PLMN signalled in Registration
+        // Accept, parsed by the orchestrator, decoded into a Plmn and fed to
+        // the TS 23.122 PLMN selector, is chosen ahead of the HPLMN when the
+        // RPLMN is unavailable (TS 23.122 §4.4.3.1.1 step 1).
+        use crate::rrc::cell_selection::{plmn_from_bcd, Plmn, PlmnSelector};
+
+        let mut orch = establish_security_context();
+        // RPLMN = 999/71 (the visited network), equivalent PLMN = 310/410.
+        let rplmn_bcd = [0x99u8, 0xF9, 0x17]; // 999/71
+        let equiv_bcd = [0x13u8, 0x00, 0x14]; // 310/410
+        let plain_acc = build_registration_accept_with_equivalent_plmns(&[equiv_bcd]);
+        let protected = protect_downlink(&orch, &plain_acc, 1);
+        let outs = orch.handle_downlink(&protected);
+
+        // Extract the equivalent-PLMN list exactly as main.rs does.
+        let bcd_plmns = outs
+            .iter()
+            .find_map(|o| match o {
+                MmOutput::EquivalentPlmnsUpdated(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("EquivalentPlmnsUpdated output present");
+
+        let home = Plmn::new(999, 70, false);
+        let rplmn = plmn_from_bcd(&rplmn_bcd);
+        let equiv = plmn_from_bcd(&equiv_bcd);
+        assert_eq!(equiv, Plmn::new(310, 410, true));
+
+        let mut selector = PlmnSelector::new(home);
+        selector.set_registered_plmn(Some(rplmn));
+        selector.set_equivalent_plmns(bcd_plmns.iter().map(plmn_from_bcd).collect());
+
+        // RPLMN not in coverage; HPLMN and the equivalent PLMN are. The
+        // equivalent PLMN (of the RPLMN) outranks the HPLMN.
+        assert_eq!(selector.select(&[home, equiv]), Some(equiv));
     }
 
     #[test]

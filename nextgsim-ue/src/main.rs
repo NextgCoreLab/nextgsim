@@ -511,6 +511,11 @@ impl UeApp {
             task_base.config.hplmn.long_mnc,
         );
         let mut plmn_selector = PlmnSelector::new(home_plmn);
+        // TS 23.122 §3.1: the EHPLMN list is read from the USIM (EF_EHPLMN). In
+        // this simulation the USIM provides the configured HPLMN; when no
+        // explicit EF_EHPLMN list is configured the HPLMN derived from the IMSI
+        // is the (single) equivalent-HPLMN entry, so seed the selector with it.
+        plmn_selector.set_ehplmn_list(vec![home_plmn]);
 
         let mut pdu_counter: u32 = 0;
 
@@ -1299,6 +1304,27 @@ async fn process_mm_outputs(
                     process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;
                 }
             }
+            MmOutput::EquivalentPlmnsUpdated(bcd_plmns) => {
+                // TS 23.122 §4.4.3.1.1: the equivalent-PLMN list signalled in
+                // Registration Accept is consulted (after the RPLMN) by
+                // subsequent automatic PLMN selection. Convert the BCD triplets
+                // into PLMNs and hand them to the selector.
+                use nextgsim_ue::rrc::cell_selection::plmn_from_bcd;
+                let plmns: Vec<Plmn> = bcd_plmns.iter().map(plmn_from_bcd).collect();
+                if plmns.is_empty() {
+                    info!("Equivalent-PLMN list cleared by the network");
+                } else {
+                    info!(
+                        "Equivalent-PLMN list updated: {}",
+                        plmns
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                plmn_selector.set_equivalent_plmns(plmns);
+            }
             MmOutput::RegistrationFailed(cause) => {
                 warn!("Registration failed: {:?} (#{})", cause, cause as u8);
                 plmn_selector.set_registered_plmn(None);
@@ -1462,6 +1488,15 @@ async fn process_secondary_mm_outputs(
                         .await;
                     }
                 }
+            }
+            MmOutput::EquivalentPlmnsUpdated(plmns) => {
+                // A MINT secondary subscription does not drive the primary
+                // PLMN selector; its equivalent-PLMN list is tracked per-SUPI
+                // by the secondary context only (TS 23.761 / TS 23.122).
+                tracing::debug!(
+                    "MINT: secondary subscription {index} equivalent-PLMN list ({} entries)",
+                    plmns.len()
+                );
             }
             MmOutput::RegistrationFailed(cause) => {
                 warn!("MINT: secondary subscription {index} registration failed: {cause:?}");
