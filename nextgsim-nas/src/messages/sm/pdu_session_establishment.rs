@@ -1230,83 +1230,6 @@ impl PduSessionEstablishmentAccept {
         Ok(msg)
     }
 
-    /// Decode the non-conformant PDU Session Establishment Accept shape
-    /// emitted by the current nextgcore smfd
-    /// (`policy::build_establishment_accept`):
-    ///
-    /// - selected PDU session type and SSC mode are sent as TWO separate
-    ///   octets (the spec packs both into octet 5);
-    /// - the authorized QoS rules are sent as a fixed 6-octet blob with a
-    ///   1-octet length marker instead of an LV-E.
-    ///
-    /// This is a documented transition leniency; remove once the core-side
-    /// emission is spec-conformant (tracked separately in TASKS.md).
-    pub fn decode_legacy_nextgcore(
-        buf: &[u8],
-        pdu_session_id: u8,
-        pti: u8,
-    ) -> Result<Self, PduSessionEstablishmentError> {
-        // Fixed part: type(1) + ssc(1) + qos blob(6) + ambr len(1) + ambr(6)
-        if buf.len() < 15 {
-            return Err(PduSessionEstablishmentError::BufferTooShort {
-                expected: 15,
-                actual: buf.len(),
-            });
-        }
-        let selected_pdu_session_type = IeSelectedPduSessionType::decode(buf[0] & 0x07)?;
-        let selected_ssc_mode = IeSelectedSscMode::decode(buf[1] & 0x07)?;
-        // QoS rules blob: 1-octet marker (0x06) + 5 opaque octets ending
-        // with the QFI
-        if buf[2] != 0x06 {
-            return Err(PduSessionEstablishmentError::InvalidIeValue(format!(
-                "legacy QoS rules marker: 0x{:02X}",
-                buf[2]
-            )));
-        }
-        let authorized_qos_rules = IeQosRules::new(buf[3..8].to_vec());
-        // Session AMBR: 1-octet length (6) + 6 octets
-        if buf[8] != 6 {
-            return Err(PduSessionEstablishmentError::InvalidIeValue(format!(
-                "legacy session AMBR length: {}",
-                buf[8]
-            )));
-        }
-        let session_ambr = IeSessionAmbr {
-            downlink_unit: buf[9],
-            downlink: u16::from_be_bytes([buf[10], buf[11]]),
-            uplink_unit: buf[12],
-            uplink: u16::from_be_bytes([buf[13], buf[14]]),
-        };
-
-        let mut msg = Self::new(
-            pdu_session_id,
-            pti,
-            selected_pdu_session_type,
-            selected_ssc_mode,
-            authorized_qos_rules,
-            session_ambr,
-        );
-
-        // Trailing TLVs (PDU address 0x29, DNN 0x25 are what the core emits)
-        let mut rest = &buf[15..];
-        while rest.remaining() > 0 {
-            let iei = rest.chunk()[0];
-            match iei {
-                establishment_accept_iei::PDU_ADDRESS => {
-                    rest.advance(1);
-                    msg.pdu_address = Some(IePduAddress::decode(&mut rest)?);
-                }
-                establishment_accept_iei::DNN => {
-                    rest.advance(1);
-                    msg.dnn = Some(IeDnn::decode(&mut rest)?);
-                }
-                _ => skip_unknown_ie(&mut rest, iei),
-            }
-        }
-
-        Ok(msg)
-    }
-
     /// Encode to bytes (including header)
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
         let header = PlainSmHeader::new(
@@ -1791,23 +1714,66 @@ mod tests {
         );
     }
 
+    /// Cross-stack guard: the EXACT octet layout the conformant nextgcore
+    /// smfd `policy::build_establishment_accept(5, 3, IPV4, ssc2, 9,
+    /// 200 Mbps, 50 Mbps, 10.45.0.2, "internet")` now emits per TS 24.501
+    /// Table 8.3.2.1.1, replicated byte-for-byte. Keeping this in lock-step
+    /// with the core builder proves both stacks agree on the wire format.
+    fn nextgcore_conformant_accept_bytes() -> Vec<u8> {
+        let mut msg = vec![0x2E, 5, 3, 0xC2];
+        // Octet 5: SSC mode (high nibble) | PDU type (low nibble).
+        // SSC mode 2 (0b010) << 4 | IPv4 (0b001) = 0x21
+        msg.push(0x21);
+        // Authorized QoS rules as LV-E (2-octet length). One default CREATE
+        // rule with a match-all packet filter, precedence 255, QFI 9:
+        //   [qfi=9][rule_len_hi=0][rule_len_lo=6][op+flags=0x31]
+        //   [pf_hdr=0x31][pf_len=1][match-all=0x01][prec=0xFF][qfi=9]
+        let qos_rule = [0x09u8, 0x00, 0x06, 0x31, 0x31, 0x01, 0x01, 0xFF, 0x09];
+        msg.extend_from_slice(&(qos_rule.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&qos_rule);
+        // Session-AMBR LV (1-octet length = 6).
+        msg.push(0x06);
+        msg.extend_from_slice(&[0x06, 0x00, 0xC8]); // DL: unit 1 Mbps, 200
+        msg.extend_from_slice(&[0x06, 0x00, 0x32]); // UL: unit 1 Mbps, 50
+        msg.extend_from_slice(&[0x29, 0x05, 0x01, 10, 45, 0, 2]); // PDU address
+        msg.extend_from_slice(&[0x25, 0x09, 0x08]); // DNN TLV
+        msg.extend_from_slice(b"internet");
+        msg
+    }
+
     #[test]
-    fn test_legacy_decode_parses_current_nextgcore_emission() {
-        let bytes = nextgcore_legacy_accept_bytes();
-        let acc =
-            PduSessionEstablishmentAccept::decode_legacy_nextgcore(&bytes[4..], 5, 3).unwrap();
+    fn test_strict_decode_accepts_conformant_nextgcore_emission() {
+        let bytes = nextgcore_conformant_accept_bytes();
+        // Decode via the strict (non-legacy) parser, after the SM header.
+        let acc = PduSessionEstablishmentAccept::decode(&mut &bytes[4..], 5, 3)
+            .expect("strict parser must accept the conformant core shape");
+
         assert_eq!(acc.pdu_session_id, 5);
         assert_eq!(acc.pti, 3);
+        // SSC mode and PDU session type both decode from the packed octet 5.
         assert_eq!(
             acc.selected_pdu_session_type.value,
             PduSessionTypeValue::Ipv4
         );
-        assert_eq!(acc.selected_ssc_mode.value, SscModeValue::SscMode1);
+        assert_eq!(acc.selected_ssc_mode.value, SscModeValue::SscMode2);
+
+        // Authorized QoS rule decoded from the LV-E body.
+        assert_eq!(
+            acc.authorized_qos_rules.data,
+            vec![0x09, 0x00, 0x06, 0x31, 0x31, 0x01, 0x01, 0xFF, 0x09]
+        );
+        // QoS rule identifier and the trailing QFI are both 9.
+        assert_eq!(acc.authorized_qos_rules.data.first(), Some(&0x09));
+        assert_eq!(acc.authorized_qos_rules.data.last(), Some(&0x09));
+
+        // Session-AMBR decoded from the single-octet-length LV (no double
+        // length): DL 200 / UL 50, both at unit 0x06 (1 Mbps).
         assert_eq!(acc.session_ambr.downlink_unit, 0x06);
         assert_eq!(acc.session_ambr.downlink, 200);
+        assert_eq!(acc.session_ambr.uplink_unit, 0x06);
         assert_eq!(acc.session_ambr.uplink, 50);
-        // QFI is the last opaque QoS byte
-        assert_eq!(acc.authorized_qos_rules.data.last(), Some(&0x09));
+
+        // Optional IEs still parse.
         let addr = acc.pdu_address.unwrap();
         assert_eq!(addr.address_type, PduAddressType::Ipv4);
         assert_eq!(addr.address, vec![10, 45, 0, 2]);

@@ -295,27 +295,27 @@ pub struct SmOrchestrator {
     /// PDU session type override per DNN after cause #50/#51/#57
     /// (TS 24.501 Section 6.4.1.4.2)
     type_override: HashMap<Option<String>, PduSessionTypeValue>,
-    /// Accept transition leniency for the current nextgcore smfd emission
-    /// (see [`PduSessionEstablishmentAccept::decode_legacy_nextgcore`]);
-    /// strict parsing is always attempted first
-    legacy_core_accept_compat: bool,
+}
+
+impl Default for SmOrchestrator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SmOrchestrator {
     /// Create a new orchestrator.
     ///
-    /// `legacy_core_accept_compat` enables the documented transition
-    /// leniency for the non-conformant PDU Session Establishment Accept
-    /// currently emitted by nextgcore smfd. Strict TS 24.501 parsing is
-    /// always attempted first.
-    pub fn new(legacy_core_accept_compat: bool) -> Self {
+    /// The UE only accepts the spec-conformant PDU Session Establishment
+    /// Accept wire format (TS 24.501 Table 8.3.2.1.1); there is no legacy
+    /// compatibility path.
+    pub fn new() -> Self {
         Self {
             sessions: Default::default(),
             pt: ProcedureTransactionManager::new(),
             pending: HashMap::new(),
             backoff: HashMap::new(),
             type_override: HashMap::new(),
-            legacy_core_accept_compat,
         }
     }
 
@@ -855,29 +855,12 @@ impl SmOrchestrator {
         let acc = match PduSessionEstablishmentAccept::decode(&mut &body[..], psi, pti) {
             Ok(acc) => acc,
             Err(e) => {
-                // Documented transition leniency: when enabled, retry with
-                // the legacy nextgcore decoder before giving up
-                let legacy = if self.legacy_core_accept_compat {
-                    PduSessionEstablishmentAccept::decode_legacy_nextgcore(body, psi, pti).ok()
-                } else {
-                    None
-                };
-                match legacy {
-                    Some(acc) => {
-                        warn!(
-                            "Establishment Accept parsed via the legacy nextgcore \
-                             compatibility decoder (strict parse failed: {e:?})"
-                        );
-                        acc
-                    }
-                    None => {
-                        // TS 24.501 7.7.2: missing/invalid mandatory IE ->
-                        // 5GSM Status with cause #96; the procedure keeps
-                        // running (T3580 will retransmit the request)
-                        warn!("Establishment Accept failed strict decoding: {e:?}");
-                        return self.send_sm_status(psi, pti, SmCause::InvalidMandatoryInformation);
-                    }
-                }
+                // TS 24.501 7.7.2: missing/invalid mandatory IE -> 5GSM
+                // Status with cause #96; the procedure keeps running (T3580
+                // will retransmit the request). Only the spec-conformant wire
+                // format (Table 8.3.2.1.1) is accepted.
+                warn!("Establishment Accept failed strict decoding: {e:?}");
+                return self.send_sm_status(psi, pti, SmCause::InvalidMandatoryInformation);
             }
         };
 
@@ -1342,7 +1325,7 @@ mod tests {
     }
 
     fn new_orch() -> SmOrchestrator {
-        SmOrchestrator::new(false)
+        SmOrchestrator::new()
     }
 
     /// Extract the single sent NAS PDU from the outputs
@@ -1514,8 +1497,11 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_core_accept_requires_compat_flag() {
-        // The current nextgcore emission only parses with the compat flag
+    fn test_legacy_core_accept_now_rejected() {
+        // Regression guard: the old non-conformant nextgcore emission (SSC
+        // mode as a SEPARATE octet, QoS rules as a 6-octet blob behind a
+        // 1-octet marker) must NOT parse under the strict-only parser. The UE
+        // responds with 5GSM Status #96 and the session stays pending.
         fn legacy_accept(psi: u8, pti: u8) -> Vec<u8> {
             let mut msg = vec![0x2E, psi, pti, 0xC2, 0x01, 0x01];
             msg.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]);
@@ -1524,26 +1510,12 @@ mod tests {
             msg
         }
 
-        // Without compat: 5GSM Status #96, session stays pending
         let (mut orch, psi, pti) = started_establishment();
         let outs = orch.handle_dl_nas_transport(&dl_with_container(legacy_accept(psi, pti), psi));
         let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
-        assert_eq!(inner[3], 0xD6);
+        assert_eq!(inner[3], 0xD6); // 5GSM Status
+        assert_eq!(inner[4], SmCause::InvalidMandatoryInformation as u8);
         assert_eq!(orch.session(psi).unwrap().state, PsState::ActivePending);
-
-        // With compat: the session activates
-        let mut orch = SmOrchestrator::new(true);
-        let outs = orch.start_establishment(test_params());
-        let (t, inner) = unwrap_ul(first_sent_pdu(&outs));
-        let (psi, pti) = (t.pdu_session_id.unwrap(), inner[2]);
-        let outs = orch.handle_dl_nas_transport(&dl_with_container(legacy_accept(psi, pti), psi));
-        assert_eq!(
-            outs,
-            vec![SmOutput::SessionEstablished {
-                psi,
-                ipv4: Some([10, 45, 0, 2])
-            }]
-        );
     }
 
     // ========================================================================

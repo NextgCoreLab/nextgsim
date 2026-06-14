@@ -481,13 +481,10 @@ impl UeApp {
         let mut orch = MmOrchestrator::new(identity);
 
         // SM procedure orchestrator: owns the per-PSI session state, PSI /
-        // PTI allocation and the SM timers (TS 24.501 Section 6). The
-        // legacy-accept compatibility flag is enabled because the current
-        // nextgcore smfd still emits a non-conformant PDU Session
-        // Establishment Accept; strict TS 24.501 parsing is always
-        // attempted first. Drop the flag once the core-side emission is
-        // spec-conformant.
-        let mut sm_orch = SmOrchestrator::new(true);
+        // PTI allocation and the SM timers (TS 24.501 Section 6). The UE only
+        // accepts the spec-conformant PDU Session Establishment Accept wire
+        // format (TS 24.501 Table 8.3.2.1.1); there is no legacy compat path.
+        let mut sm_orch = SmOrchestrator::new();
         let sm_session_params = SmSessionParams::from_config(&task_base.config);
 
         // MINT secondary-subscription driver (Rel-18, TS 23.761). Inert unless
@@ -497,7 +494,7 @@ impl UeApp {
         // established by the main `sm_orch`; secondary-SUPI sessions are routed
         // here per the DNN→subscription map.
         let mut mint_secondary =
-            nextgsim_ue::nas::mm::MintSecondary::from_config(&task_base.config, true);
+            nextgsim_ue::nas::mm::MintSecondary::from_config(&task_base.config);
         if mint_secondary.is_active() {
             info!(
                 "MINT enabled: {} secondary subscription(s), disaster_roaming={}",
