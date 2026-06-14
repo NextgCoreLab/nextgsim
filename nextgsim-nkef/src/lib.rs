@@ -472,12 +472,16 @@ impl KnowledgeGraph {
         self.temporal_relationships.add(relationship);
     }
 
-    /// Gets entities by type
+    /// Gets entities by type.
+    ///
+    /// Returns an empty `Vec` when no entities of the given type have been
+    /// indexed. This is a query path reachable from remote callers, so an
+    /// unknown type must yield an empty result rather than panicking.
     pub fn get_entities_by_type(&self, entity_type: EntityType) -> Vec<&Entity> {
         self.type_index
             .get(&entity_type)
             .map(|ids| ids.iter().filter_map(|id| self.entities.get(id)).collect())
-            .expect("value expected")
+            .unwrap_or_default()
     }
 
     /// Gets (non-temporal) relationships for an entity
@@ -909,6 +913,50 @@ mod tests {
 
         let gnbs = graph.get_entities_by_type(EntityType::Gnb);
         assert_eq!(gnbs.len(), 1);
+    }
+
+    #[test]
+    fn test_get_entities_by_type_unknown_returns_empty() {
+        // Regression: get_entities_by_type must not panic for a type that has
+        // never been indexed (reachable from remote callers / DoS vector).
+        let graph = KnowledgeGraph::new();
+        let result = graph.get_entities_by_type(EntityType::Upf);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_entities_by_type_unindexed_type_after_other_inserts() {
+        // Inserting entities of one type must not cause a panic when querying
+        // a different, unindexed type.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb));
+        graph.add_entity(Entity::new("gnb-002", EntityType::Gnb));
+
+        // Known type returns the indexed entities.
+        let gnbs = graph.get_entities_by_type(EntityType::Gnb);
+        assert_eq!(gnbs.len(), 2);
+
+        // Unknown (never-inserted) type returns an empty Vec, not a panic.
+        let upfs = graph.get_entities_by_type(EntityType::Upf);
+        assert!(upfs.is_empty());
+        let intents = graph.get_entities_by_type(EntityType::Intent);
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn test_get_entities_by_type_known_returns_entities() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_entity(Entity::new("ue-001", EntityType::Ue).with_property("imsi", "1"));
+        graph.add_entity(Entity::new("ue-002", EntityType::Ue).with_property("imsi", "2"));
+        graph.add_entity(Entity::new("gnb-001", EntityType::Gnb));
+
+        let ues = graph.get_entities_by_type(EntityType::Ue);
+        assert_eq!(ues.len(), 2);
+        assert!(ues.iter().all(|e| e.entity_type == EntityType::Ue));
+
+        let gnbs = graph.get_entities_by_type(EntityType::Gnb);
+        assert_eq!(gnbs.len(), 1);
+        assert_eq!(gnbs[0].id, "gnb-001");
     }
 
     #[test]

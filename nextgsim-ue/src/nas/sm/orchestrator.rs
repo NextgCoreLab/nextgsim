@@ -323,12 +323,47 @@ impl SmOrchestrator {
     // Accessors
     // ========================================================================
 
+    /// Whether `psi` is a valid PDU session identity (1..=15, TS 24.501
+    /// Section 9.4). Wire-driven PSIs MUST be checked with this before they
+    /// index [`SmOrchestrator::sessions`]: the array has 16 slots and an
+    /// attacker-controlled PSI > 15 would otherwise panic the UE (remote DoS).
+    #[inline]
+    fn psi_in_range(psi: u8) -> bool {
+        psi != 0 && psi <= PSI_MAX
+    }
+
     /// Get a session by PSI
     pub fn session(&self, psi: u8) -> Option<&PduSession> {
-        if psi == 0 || psi > PSI_MAX {
+        if !Self::psi_in_range(psi) {
             return None;
         }
         self.sessions[psi as usize].as_ref()
+    }
+
+    /// Get the session slot for a PSI, mutably, with a PSI bounds check.
+    /// Returns `None` for an out-of-range PSI (never panics) or an empty slot.
+    fn session_mut(&mut self, psi: u8) -> Option<&mut PduSession> {
+        if !Self::psi_in_range(psi) {
+            return None;
+        }
+        self.sessions[psi as usize].as_mut()
+    }
+
+    /// Clear (release) the session slot for a PSI, with a PSI bounds check.
+    /// A no-op for an out-of-range PSI (never panics).
+    fn clear_session(&mut self, psi: u8) {
+        if Self::psi_in_range(psi) {
+            self.sessions[psi as usize] = None;
+        }
+    }
+
+    /// Take (remove and return) the session for a PSI, with a PSI bounds
+    /// check. Returns `None` for an out-of-range PSI (never panics).
+    fn take_session(&mut self, psi: u8) -> Option<PduSession> {
+        if !Self::psi_in_range(psi) {
+            return None;
+        }
+        self.sessions[psi as usize].take()
     }
 
     /// All sessions currently not inactive
@@ -738,20 +773,30 @@ impl SmOrchestrator {
         }
         let psi = container[1];
         let pti = container[2];
+        // `psi` is taken straight off the wire (TS 24.501 Section 9.4: valid
+        // range 1..=15). Reject an out-of-range PSI before any
+        // `self.sessions[psi]` access: the array has only 16 slots and a
+        // remote PSI > 15 would panic the UE (remote DoS). The procedure
+        // transaction is identified by the PTI alone, so an out-of-range PSI
+        // here is a malformed/forged echo and is dropped.
+        if !Self::psi_in_range(psi) {
+            warn!("Payload-not-forwarded echo carries out-of-range PSI {psi}: dropping");
+            return Vec::new();
+        }
         let Some((msg_type, _)) = self.pt.abort(pti) else {
             return Vec::new();
         };
         self.pending.remove(&pti);
         match msg_type {
             PtMessageType::PduSessionEstablishmentRequest => {
-                self.sessions[psi as usize] = None;
+                self.clear_session(psi);
                 vec![SmOutput::SessionEstablishmentFailed {
                     psi,
                     cause: SmCause::NetworkFailure,
                 }]
             }
             PtMessageType::PduSessionModificationRequest => {
-                if let Some(s) = self.sessions[psi as usize].as_mut() {
+                if let Some(s) = self.session_mut(psi) {
                     s.state = PsState::Active;
                 }
                 vec![SmOutput::SessionModificationFailed {
@@ -760,7 +805,7 @@ impl SmOrchestrator {
                 }]
             }
             PtMessageType::PduSessionReleaseRequest => {
-                self.sessions[psi as usize] = None;
+                self.clear_session(psi);
                 vec![SmOutput::SessionReleased { psi }]
             }
         }
@@ -887,7 +932,7 @@ impl SmOrchestrator {
                 _ => None,
             });
 
-        if let Some(s) = self.sessions[psi as usize].as_mut() {
+        if let Some(s) = self.session_mut(psi) {
             s.state = PsState::Active;
             s.selected_type = Some(acc.selected_pdu_session_type.value);
             s.selected_ssc_mode = Some(acc.selected_ssc_mode.value);
@@ -933,7 +978,7 @@ impl SmOrchestrator {
         // Stop T3580, release the PTI and the allocated PSI
         self.pt.abort(pti);
         self.pending.remove(&pti);
-        let session = self.sessions[psi as usize].take();
+        let session = self.take_session(psi);
         let params = session.map(|s| s.params);
 
         let mut outs = Vec::new();
@@ -1118,7 +1163,7 @@ impl SmOrchestrator {
         match cause {
             // 6.4.2.4: #43 "invalid PDU session identity" -> release locally
             SmCause::InvalidPduSessionIdentity => {
-                self.sessions[psi as usize] = None;
+                self.clear_session(psi);
                 outs.push(SmOutput::SessionReleased { psi });
             }
             // #26 / #67 / #69 / #70 with a back-off timer IE
@@ -1126,18 +1171,16 @@ impl SmOrchestrator {
             | SmCause::InsufficientResourcesForSliceAndDnn
             | SmCause::InsufficientResourcesForSlice
             | SmCause::MissingOrUnknownDnnInSlice => {
-                let params = self.sessions[psi as usize]
-                    .as_ref()
-                    .map(|s| s.params.clone());
+                let params = self.session(psi).map(|s| s.params.clone());
                 if let Some(p) = params {
                     self.arm_backoff(cause, &p, rej.back_off_timer_value);
                 }
-                if let Some(s) = self.sessions[psi as usize].as_mut() {
+                if let Some(s) = self.session_mut(psi) {
                     s.state = PsState::Active;
                 }
             }
             _ => {
-                if let Some(s) = self.sessions[psi as usize].as_mut() {
+                if let Some(s) = self.session_mut(psi) {
                     s.state = PsState::Active;
                 }
             }
@@ -1227,12 +1270,12 @@ impl SmOrchestrator {
         match cause {
             // 6.4.3.4: #43 / #54 -> release the PDU session locally
             SmCause::InvalidPduSessionIdentity | SmCause::PduSessionDoesNotExist => {
-                self.sessions[psi as usize] = None;
+                self.clear_session(psi);
                 vec![SmOutput::SessionReleased { psi }]
             }
             _ => {
                 // Any other cause: the session stays active
-                if let Some(s) = self.sessions[psi as usize].as_mut() {
+                if let Some(s) = self.session_mut(psi) {
                     s.state = PsState::Active;
                 }
                 Vec::new()
@@ -1964,6 +2007,82 @@ mod tests {
         dl.pdu_session_id = Some(psi);
         dl.mm_cause = Some(90);
         let outs = orch.handle_dl_nas_transport(&dl);
+        assert_eq!(
+            outs,
+            vec![SmOutput::SessionEstablishmentFailed {
+                psi,
+                cause: SmCause::NetworkFailure
+            }]
+        );
+        assert!(orch.session(psi).is_none());
+    }
+
+    /// Build a DL NAS Transport that echoes an N1 SM container with the given
+    /// wire PSI/PTI back to the UE carrying a 5GMM cause ("payload not
+    /// forwarded", TS 24.501 5.4.5.3.1).
+    fn payload_not_forwarded_dl(psi: u8, pti: u8) -> DlNasTransport {
+        // [EPD=0x2E, PSI, PTI, msg_type] — only the first four octets are
+        // inspected by handle_payload_not_forwarded; the message type byte is
+        // a placeholder (establishment request 0xC1).
+        let container = vec![0x2E, psi, pti, 0xC1];
+        let mut dl = DlNasTransport::new(PayloadContainerType::N1SmInformation, container);
+        dl.pdu_session_id = Some(psi);
+        dl.mm_cause = Some(90);
+        dl
+    }
+
+    #[test]
+    fn test_payload_not_forwarded_out_of_range_psi_does_not_panic() {
+        // A pending establishment exists (PTI matches), but the echoed
+        // container carries a forged PSI = 200 (> PSI_MAX). The wire PSI must
+        // not index self.sessions[200] (16-slot array) — that would panic the
+        // UE (remote DoS). The malformed echo is dropped gracefully.
+        let (mut orch, _psi, pti) = started_establishment();
+        let outs = orch.handle_dl_nas_transport(&payload_not_forwarded_dl(200, pti));
+        assert!(
+            outs.is_empty(),
+            "out-of-range PSI echo must be dropped, got {outs:?}"
+        );
+        // The real session 1 is untouched, the transaction still pending.
+        assert_eq!(orch.session(1).unwrap().state, PsState::ActivePending);
+        assert!(orch.pt.get(pti).unwrap().is_pending());
+    }
+
+    #[test]
+    fn test_payload_not_forwarded_psi_255_does_not_panic() {
+        // Boundary: PSI = 255 (max u8) must not panic.
+        let (mut orch, _psi, pti) = started_establishment();
+        let outs = orch.handle_dl_nas_transport(&payload_not_forwarded_dl(255, pti));
+        assert!(outs.is_empty());
+        assert_eq!(orch.session(1).unwrap().state, PsState::ActivePending);
+    }
+
+    #[test]
+    fn test_payload_not_forwarded_zero_psi_does_not_panic() {
+        // PSI = 0 is reserved/invalid (TS 24.501 Section 9.4); it must be
+        // rejected before any session access, no panic.
+        let (mut orch, _psi, pti) = started_establishment();
+        let outs = orch.handle_dl_nas_transport(&payload_not_forwarded_dl(0, pti));
+        assert!(outs.is_empty());
+        assert_eq!(orch.session(1).unwrap().state, PsState::ActivePending);
+    }
+
+    #[test]
+    fn test_payload_not_forwarded_psi_16_boundary_does_not_panic() {
+        // PSI = 16 is exactly one past the 1..=15 valid range and exactly the
+        // array length: the off-by-one that would panic sessions[16].
+        let (mut orch, _psi, pti) = started_establishment();
+        let outs = orch.handle_dl_nas_transport(&payload_not_forwarded_dl(16, pti));
+        assert!(outs.is_empty());
+        assert_eq!(orch.session(1).unwrap().state, PsState::ActivePending);
+    }
+
+    #[test]
+    fn test_payload_not_forwarded_valid_psi_still_aborts() {
+        // Regression: the in-range, matching-PSI path is unchanged — the
+        // pending establishment is still aborted with NetworkFailure.
+        let (mut orch, psi, pti) = started_establishment();
+        let outs = orch.handle_dl_nas_transport(&payload_not_forwarded_dl(psi, pti));
         assert_eq!(
             outs,
             vec![SmOutput::SessionEstablishmentFailed {
