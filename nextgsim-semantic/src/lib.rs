@@ -40,7 +40,7 @@
 //!
 //! | Module | Description |
 //! |--------|-------------|
-//! | [`codec`] | ONNX-based neural encoder / decoder with mean-pooling fallback |
+//! | [`codec`] | Mean-pooling encoder / nearest-neighbor decoder (operational); optional ONNX |
 //! | [`jscc`] | Joint Source-Channel Coding with channel-adaptive symbols |
 //! | [`metrics`] | Cosine similarity, MSE, PSNR, top-k accuracy |
 //! | [`rate_distortion`] | Rate-distortion optimisation controller |
@@ -51,7 +51,8 @@ use std::collections::HashMap;
 
 // ── New modules ──────────────────────────────────────────────────────────────
 
-/// ONNX-based neural codec (encoder + decoder) with mean-pooling fallback.
+/// Semantic codec. Operational path: mean-pooling encoder + nearest-neighbor
+/// decoder (no ONNX model ships); optional ONNX model loading is supported.
 pub mod codec;
 
 /// Joint Source-Channel Coding: channel-adaptive encoding in one step.

@@ -67,11 +67,19 @@ pub const SQN_DELTA: u64 = 1 << 28;
 /// (same default as UERANSIM)
 const DEFAULT_IMEISV: &str = "4370816125816151";
 
-/// AMF-private 5GMM message type for the UAV tracking report (Rel-18,
-/// TS 23.256). The standard does not allocate a UE-originated tracking-report
-/// 5GMM message type; this simulator uses an unassigned 5GMM message-type code
-/// (the AMF dispatches it in its Uplink NAS Transport handler). Kept in sync
-/// with `nextgcore-amfd`'s `gmm_build::message_type::UAV_TRACKING_REPORT`.
+/// Sim-private message type for the UAV tracking report.
+///
+/// NOT 3GPP-conformant (Wave 4, T4.3 — honest reframe). Verified against
+/// TS 24.501 v18 §8.2.10 / §9.11.3.40: **there is no UE-originated UAV
+/// position/tracking NAS message** — real-time UAV tracking / Remote-ID is an
+/// **application-layer** function (USS/UTM "Network Remote ID" over the user
+/// plane), and network-based UAV location would use LCS (TS 23.273). This
+/// simulator models the telemetry over an unassigned 5GMM message-type code for
+/// a self-contained geofence demo; it has no conformant NAS equivalent and a
+/// real network would not accept it. (Conformant UAS *registration/UUAA* uses
+/// the Service-level-AA container — IEI 0x72 — which IS implemented.) Kept in
+/// sync with `nextgcore-amfd`'s `gmm_build::message_type::UAV_TRACKING_REPORT`.
+/// See `.context/WAVE6-DOWNGRADED-FEATURES.md` §6.
 pub const UAV_TRACKING_REPORT_MSG_TYPE: u8 = 0x6A;
 
 /// Decode a GPRS Timer 2 IE value octet (3GPP TS 24.008 Section 10.5.7.4)

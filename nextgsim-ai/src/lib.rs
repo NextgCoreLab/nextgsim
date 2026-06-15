@@ -1,7 +1,10 @@
 //! AI/ML Infrastructure for nextgsim
 //!
-//! This crate provides the core AI/ML infrastructure for 6G AI-native network functions,
-//! implementing production-quality inference engines using ONNX Runtime.
+//! This crate provides the core AI/ML infrastructure for 6G AI-native network functions.
+//! The **only operational inference backend** is `OnnxEngine` (ONNX Runtime). No `.onnx`
+//! model files ship with the repository, so callers that do not load a model at runtime
+//! receive non-neural fallback results from the using crate (e.g. mean-pooling in
+//! `nextgsim-semantic`, linear extrapolation in `nextgsim-nwdaf`).
 //!
 //! # Architecture
 //!
@@ -17,9 +20,9 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Supported Inference Backends
+//! # Operational Inference Backend
 //!
-//! - **ONNX Runtime**: Primary inference backend with GPU acceleration support
+//! - **ONNX Runtime** (`OnnxEngine`): the sole operational backend.
 //!   - CPU execution provider (default)
 //!   - CUDA execution provider (NVIDIA GPUs)
 //!   - `CoreML` execution provider (Apple Silicon)
@@ -59,7 +62,6 @@ pub mod model;
 pub mod nr_models;
 pub mod semantic_pipeline;
 pub mod tensor;
-pub mod tflite;
 pub mod xr_traffic;
 
 // Re-export main types
@@ -76,7 +78,6 @@ pub use semantic_pipeline::{
     SemanticDecoding, SemanticEncoding, SemanticError, SemanticPipeline, SemanticPipelineBuilder,
 };
 pub use tensor::{TensorData, TensorShape};
-pub use tflite::TfLiteEngine;
 pub use xr_traffic::{
     CdrxState, PduSet, PduSetManager, Xr5Qi, XrCdrxController, XrFrame, XrQosFlow, XrTrafficModel,
 };

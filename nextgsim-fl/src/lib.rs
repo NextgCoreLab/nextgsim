@@ -104,20 +104,23 @@ pub struct AggregatedModel {
 }
 
 /// Aggregation algorithm
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum AggregationAlgorithm {
     /// Federated Averaging (`FedAvg`) - `McMahan` et al. 2017
+    #[default]
     FedAvg,
     /// Federated Proximal (`FedProx`) - Li et al. 2020
     FedProx,
     /// Secure Aggregation - Bonawitz et al. 2017
     SecAgg,
-}
-
-impl Default for AggregationAlgorithm {
-    fn default() -> Self {
-        Self::FedAvg
-    }
+    /// Krum: selects the single update closest to its neighbours (Byzantine-robust)
+    Krum { num_byzantine: usize },
+    /// Multi-Krum: averages the top-`m` Krum selections (Byzantine-robust)
+    MultiKrum { num_byzantine: usize, m: usize },
+    /// Trimmed Mean: removes the top/bottom `trim_ratio` fraction and averages
+    TrimmedMean { trim_ratio: f32 },
+    /// Coordinate-wise Median (Byzantine-robust)
+    Median,
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +547,7 @@ fn sample_gaussian<R: Rng>(rng: &mut R, sigma: f32) -> f32 {
 // FederatedAggregator (synchronous)
 // ---------------------------------------------------------------------------
 
-/// FL aggregator supporting `FedAvg`, `FedProx`, and `SecAgg`.
+/// FL aggregator supporting `FedAvg`, `FedProx`, `SecAgg`, and Byzantine-robust algorithms.
 #[derive(Debug)]
 pub struct FederatedAggregator {
     /// Current global model
@@ -559,8 +562,10 @@ pub struct FederatedAggregator {
     algorithm: AggregationAlgorithm,
     /// Differential privacy config
     dp_config: DifferentialPrivacyConfig,
-    /// Privacy budget tracker
+    /// Privacy budget tracker (basic linear composition — kept for backward compat)
     privacy_tracker: Option<PrivacyBudgetTracker>,
+    /// RDP-based privacy tracker (Rényi-DP moments accountant — authoritative ε for live path)
+    privacy_tracker_renyi: Option<RenyiDPTracker>,
     /// Minimum participants required
     min_participants: usize,
     /// Round timeout (seconds)
@@ -582,6 +587,7 @@ impl FederatedAggregator {
             algorithm,
             dp_config: DifferentialPrivacyConfig::default(),
             privacy_tracker: None,
+            privacy_tracker_renyi: None,
             min_participants,
             round_timeout_secs: 60,
             fedprox_config: FedProxConfig::default(),
@@ -590,10 +596,17 @@ impl FederatedAggregator {
     }
 
     /// Sets differential privacy configuration and initialises the budget
-    /// tracker.
+    /// trackers.
+    ///
+    /// Both the legacy linear-composition tracker (`privacy_tracker`) and the
+    /// Rényi-DP moments accountant (`privacy_tracker_renyi`) are initialised when
+    /// DP is enabled.  The RDP tracker is authoritative for the live path; the
+    /// linear tracker is kept for backward compatibility.
     pub fn with_dp_config(mut self, config: DifferentialPrivacyConfig) -> Self {
         if config.enabled {
             self.privacy_tracker = Some(PrivacyBudgetTracker::new(&config));
+            self.privacy_tracker_renyi =
+                Some(RenyiDPTracker::new(config.target_epsilon, config.target_delta));
         }
         self.dp_config = config;
         self
@@ -608,6 +621,14 @@ impl FederatedAggregator {
     /// Returns a reference to the privacy budget tracker, if DP is enabled.
     pub fn privacy_tracker(&self) -> Option<&PrivacyBudgetTracker> {
         self.privacy_tracker.as_ref()
+    }
+
+    /// Returns a reference to the Rényi-DP moments accountant, if DP is enabled.
+    ///
+    /// This tracker uses tighter RDP composition and is the authoritative source
+    /// of the privacy-loss ε for the live aggregation path.
+    pub fn privacy_tracker_renyi(&self) -> Option<&RenyiDPTracker> {
+        self.privacy_tracker_renyi.as_ref()
     }
 
     /// Returns a reference to the `FedProx` config.
@@ -820,10 +841,53 @@ impl FederatedAggregator {
             AggregationAlgorithm::FedAvg => self.fedavg_aggregate(&updates_clone),
             AggregationAlgorithm::FedProx => self.fedprox_aggregate(&updates_clone),
             AggregationAlgorithm::SecAgg => self.secagg_aggregate_internal(&updates_clone),
+            AggregationAlgorithm::Krum { num_byzantine } => {
+                // Extract gradients in a deterministic (sorted-key) order.
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> =
+                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                krum_aggregate(&grads, num_byzantine)
+            }
+            AggregationAlgorithm::MultiKrum { num_byzantine, m } => {
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> =
+                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                multi_krum_aggregate(&grads, num_byzantine, m)
+            }
+            AggregationAlgorithm::TrimmedMean { trim_ratio } => {
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> =
+                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                trimmed_mean_aggregate(&grads, trim_ratio)
+            }
+            AggregationAlgorithm::Median => {
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> =
+                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                median_aggregate(&grads)
+            }
         };
 
-        // Track privacy budget if DP is enabled
+        // Track privacy budget if DP is enabled.
+        // The RDP moments accountant (Rényi-DP) is the authoritative ε — it
+        // records the Gaussian noise σ for this round and computes a tighter
+        // cumulative ε than naive linear composition.  The legacy linear tracker
+        // is also updated for backward compatibility.
         if self.dp_config.enabled {
+            let sigma = self.dp_config.noise_multiplier;
+            if let Some(ref mut rdp) = self.privacy_tracker_renyi {
+                rdp.record_gaussian(sigma);
+                tracing::debug!(
+                    rdp_epsilon = rdp.get_epsilon(),
+                    sigma,
+                    delta = rdp.target_delta,
+                    "RDP accountant updated after aggregation round",
+                );
+            }
             if let Some(ref mut tracker) = self.privacy_tracker {
                 tracker.record_round();
             }
@@ -2027,7 +2091,7 @@ pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mid = values.len() / 2;
-        *result_val = if values.len() % 2 == 0 {
+        *result_val = if values.len().is_multiple_of(2) {
             (values[mid - 1] + values[mid]) / 2.0
         } else {
             values[mid]
@@ -2835,6 +2899,151 @@ mod tests {
         assert_eq!(
             aggregator.get_participant_tier("client1"),
             Some(FLTier::Edge)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T5.2-A: RDP numeric test — moments accountant < naive linear composition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rdp_composition_tighter_than_linear() {
+        // k rounds at σ=1.0.  Linear composition gives k * single-round ε.
+        let sigma = 1.0_f32;
+        let k = 10_u64;
+        let target_epsilon = 8.0_f32;
+        let target_delta = 1e-5_f32;
+
+        // Compute single-round linear ε via PrivacyBudgetTracker.
+        let dp_config = DifferentialPrivacyConfig {
+            enabled: true,
+            noise_multiplier: sigma,
+            clipping_threshold: 1.0,
+            target_epsilon,
+            target_delta,
+        };
+        let linear_tracker = PrivacyBudgetTracker::new(&dp_config);
+        let linear_epsilon_per_round = linear_tracker.epsilon_per_round;
+        let linear_total = linear_epsilon_per_round * k as f32;
+
+        // RDP tracker over k rounds.
+        let mut rdp = RenyiDPTracker::new(target_epsilon, target_delta);
+        for _ in 0..k {
+            rdp.record_gaussian(sigma);
+        }
+        let rdp_epsilon = rdp.get_epsilon();
+
+        assert!(rdp_epsilon.is_finite(), "RDP ε must be finite");
+        assert!(rdp_epsilon > 0.0, "RDP ε must be positive after {k} rounds");
+        assert!(
+            rdp_epsilon < linear_total,
+            "RDP ε ({rdp_epsilon:.4}) must be STRICTLY less than naive linear sum \
+             ({linear_total:.4}) for k={k} rounds — demonstrating tighter accounting"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T5.2-B: Byzantine dispatch reachability via FederatedAggregator
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an aggregator with the given algorithm, register 5 participants
+    /// (IDs "c0".."c4"), initialise a global model, start a round, submit 5 updates
+    /// where c3 and c4 are Byzantine outliers (value 50.0 vs honest ~1.0), and
+    /// aggregate.  Returns the aggregated weight vector.
+    fn run_byzantine_aggregation(algorithm: AggregationAlgorithm) -> Vec<f32> {
+        let mut agg = FederatedAggregator::new(algorithm, 5);
+        agg.initialize_model(vec![0.0; 3]);
+        for i in 0..5_u64 {
+            agg.register_participant(format!("c{i}"), 100);
+        }
+        agg.start_round().expect("start_round failed");
+
+        // Honest cluster: c0, c1, c2 all submit ~1.0
+        let honest: Vec<f32> = vec![1.0, 1.0, 1.0];
+        // Byzantine outliers: c3, c4 submit 50.0
+        let byzantine: Vec<f32> = vec![50.0, 50.0, 50.0];
+
+        for i in 0..3_u64 {
+            agg.submit_update(ModelUpdate {
+                participant_id: format!("c{i}"),
+                gradients: honest.clone(),
+                num_samples: 100,
+                loss: 0.1,
+                base_version: 1,
+                timestamp_ms: 0,
+            })
+            .expect("submit honest update failed");
+        }
+        for i in 3..5_u64 {
+            agg.submit_update(ModelUpdate {
+                participant_id: format!("c{i}"),
+                gradients: byzantine.clone(),
+                num_samples: 100,
+                loss: 0.1,
+                base_version: 1,
+                timestamp_ms: 0,
+            })
+            .expect("submit byzantine update failed");
+        }
+
+        let model = agg.aggregate().expect("aggregate() failed");
+        model.weights
+    }
+
+    #[test]
+    fn test_krum_dispatch_reachable() {
+        // Plain mean of 3 honest (1.0) + 2 Byzantine (50.0) = (3+100)/5 = 20.6
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        let result = run_byzantine_aggregation(AggregationAlgorithm::Krum { num_byzantine: 2 });
+        assert_eq!(result.len(), 3, "Krum result must have correct dimension");
+        // Krum selects the best single update (one of the honest ones ≈ 1.0)
+        assert!(
+            result[0] < plain_mean,
+            "Krum[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_multi_krum_dispatch_reachable() {
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        let result = run_byzantine_aggregation(AggregationAlgorithm::MultiKrum {
+            num_byzantine: 2,
+            m: 3,
+        });
+        assert_eq!(result.len(), 3);
+        assert!(
+            result[0] < plain_mean,
+            "MultiKrum[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_trimmed_mean_dispatch_reachable() {
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        // trim_ratio=0.4 removes 1 from each tail (floor(5*0.4/2)=1), leaving 3 middle values
+        let result = run_byzantine_aggregation(AggregationAlgorithm::TrimmedMean {
+            trim_ratio: 0.4,
+        });
+        assert_eq!(result.len(), 3);
+        assert!(
+            result[0] < plain_mean,
+            "TrimmedMean[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_median_dispatch_reachable() {
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        let result = run_byzantine_aggregation(AggregationAlgorithm::Median);
+        assert_eq!(result.len(), 3);
+        // Coordinate-wise median of [1,1,1,50,50] = 1.0
+        assert!(
+            result[0] < plain_mean,
+            "Median[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
         );
     }
 }

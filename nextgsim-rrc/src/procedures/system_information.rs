@@ -356,16 +356,22 @@ pub struct Sib1Params {
     pub ue_timers_and_constants: Option<UeTimersAndConstantsParams>,
     /// `intraFreqReselectionRedCap` (Rel-17, TS 38.331 §6.3.2 SIB1-v1700-IEs):
     /// controls whether RedCap UEs are allowed to perform intra-frequency cell
-    /// reselection. The Rel-15.6 ASN.1 schema predates the v1700 IE group, so
-    /// the flag is broadcast via the spec-legal `lateNonCriticalExtension`
-    /// OCTET STRING container (the same octet-container pattern used elsewhere
-    /// to ride later-release IEs over the Rel-15 schema).
+    /// reselection.
+    ///
+    /// NOT WIRE-CONFORMANT (Wave 4 honest-defer): the `rrc-15.6.0` SIB1 schema
+    /// predates the Rel-17 field, so this flag is broadcast as a sim-internal
+    /// private marker TLV inside the opaque SIB1 `lateNonCriticalExtension`
+    /// OCTET STRING (see [`SIB1_REDCAP_LNCE_TAG`]). A real UE will not parse it;
+    /// conformant SIB1 RedCap signalling requires a Rel-17 RRC codec.
     pub intra_freq_reselection_redcap: bool,
 }
 
-/// Tag for the `intraFreqReselectionRedCap` TLV inside SIB1
-/// `lateNonCriticalExtension`.
-const SIB1_REDCAP_LNCE_TAG: u8 = 0x52; // 'R'
+/// Private, sim-internal marker tag for the `intraFreqReselectionRedCap` TLV
+/// inside the opaque SIB1 `lateNonCriticalExtension` OCTET STRING. NOT a 3GPP
+/// IEI; chosen in the 0xF0-0xFF private range (it previously aliased NAS IEI
+/// 0x52). Kept consistent with `REDCAP_LNCE_TAG` in the `rrc_setup` module.
+/// Conformant SIB1 RedCap signalling requires a Rel-17 RRC codec.
+const SIB1_REDCAP_LNCE_TAG: u8 = 0xFE;
 
 /// Parsed SIB1 data
 #[derive(Debug, Clone)]

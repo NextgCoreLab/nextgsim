@@ -387,16 +387,28 @@ pub struct RrcSetupCompleteParams {
     /// 5G-S-TMSI value (optional)
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
     /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.331 §6.2.2
-    /// `redCapIndication` in RRCSetupComplete-v1700-IEs). The Rel-15.6 ASN.1
-    /// schema used here predates the v1700 IE group, so the indication is
-    /// carried as a minimal TLV inside the spec-legal `lateNonCriticalExtension`
-    /// OCTET STRING container (the same octet-container pattern used to
-    /// ride later-release IEs over the Rel-15 schema).
+    /// `redCapIndication` in RRCSetupComplete-v1700-IEs).
+    ///
+    /// NOT WIRE-CONFORMANT (Wave 4 honest-defer): the `rrc-15.6.0` ASN.1 schema
+    /// used here predates the v1700 IE group, so there is no conformant slot for
+    /// `redCapIndication`. As a sim-internal stand-in it is carried as a private
+    /// marker TLV inside the structurally-opaque `lateNonCriticalExtension`
+    /// OCTET STRING (see [`REDCAP_LNCE_TAG`]). A real/independent gNB or UE will
+    /// NOT understand this marker; conformant AS-layer RedCap signalling requires
+    /// upgrading the RRC codec to Rel-17. The RedCap indication that actually
+    /// reaches the 5GC at runtime travels in the NAS path (Registration Request
+    /// RedCap IE 0xA9), independently of this field.
     pub redcap_indication: bool,
 }
 
-/// Tag for the RedCap indication TLV inside `lateNonCriticalExtension`.
-const REDCAP_LNCE_TAG: u8 = 0x52; // 'R'
+/// Private, sim-internal marker tag for the RedCap indication TLV carried inside
+/// the opaque `lateNonCriticalExtension` OCTET STRING. This is NOT a 3GPP IEI —
+/// `lateNonCriticalExtension` has no defined internal TLV structure at Rel-15.
+/// The value is chosen in the 0xF0-0xFF private range so it cannot be mistaken
+/// for a real RRC/NAS IE identifier (it previously aliased NAS IEI 0x52). True
+/// conformance requires a Rel-17 RRC codec; see
+/// [`RrcSetupCompleteParams::redcap_indication`].
+const REDCAP_LNCE_TAG: u8 = 0xFE;
 
 /// Parsed RRC Setup Complete data
 #[derive(Debug, Clone)]
@@ -500,8 +512,9 @@ pub fn build_rrc_setup_complete(
         .map(build_registered_amf)
         .transpose()?;
 
-    // RedCap indication (Rel-17): carried as a minimal TLV in the spec-legal
-    // lateNonCriticalExtension OCTET STRING when set.
+    // RedCap indication (Rel-17): carried as a sim-internal private-marker TLV
+    // inside the opaque lateNonCriticalExtension OCTET STRING when set. NOT 3GPP
+    // wire-conformant (see REDCAP_LNCE_TAG); a real peer ignores it.
     let late_non_critical_extension = if params.redcap_indication {
         Some(RRCSetupComplete_IEsLateNonCriticalExtension(vec![
             REDCAP_LNCE_TAG,

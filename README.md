@@ -1,17 +1,17 @@
 # nextgsim - Pure Rust 5G/6G UE and gNB Simulator
 
-A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulator with full 6G AI-native capabilities, converted from [UERANSIM](https://github.com/aligungr/UERANSIM). This implementation has **zero C library dependencies**.
+A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulator with 6G research/exploration prototypes, converted from [UERANSIM](https://github.com/aligungr/UERANSIM). This implementation has **zero C library dependencies**. (3GPP Rel-20/6G has no frozen stage-3 spec; the 6G features are research concepts informed by TR 22.870 use cases and are disabled by default.)
 
 ## Features
 
 - **Pure Rust**: No C/C++ dependencies, fully memory-safe
 - **5G-SA Support**: Complete 5G Standalone network simulation
 - **Rel-17/18 features**: RedCap, XR 5QI, SNPN (NID), MINT/disaster-roaming, and UAV aerial-UE registration, integrated end-to-end with nextgcore (UE config knobs in `docs/configuration.md` → Rel-17/18 Feature Configuration; example configs in `config/features/`)
-- **6G AI-Native**: Full 6G AI architecture with ML inference, federated learning, and semantic communication
+- **6G Exploration**: Research-grade AI/ML prototypes (ISAC, federated learning, semantic communication) — not conformant to any frozen 3GPP spec (Rel-20 is in discussion; disabled by default)
 - **Cryptography**: Milenage, SNOW3G, ZUC, AES-based NEA/NIA algorithms, ECIES
 - **Protocol Support**: NAS, NGAP (ASN.1 PER), RRC (ASN.1 UPER), GTP-U, SCTP
 - **Radio Simulation**: RLS protocol for UE-gNB communication over UDP
-- **ML Inference**: ONNX Runtime integration for production AI workloads
+- **ML Inference**: ONNX Runtime (`ort`) integration available; no models ship, so the operational AI paths use TF-IDF / mean-pooling / linear-extrapolation fallbacks
 - **Async Runtime**: Built on Tokio for high-performance concurrent operations
 
 ## Quickstart

@@ -115,6 +115,10 @@ pub struct GnbConfig {
     pub energy_saving_enabled: bool,
     // ========================================================================
     // Rel-20 6G feature flags
+    //
+    // NOTE: "Rel-20" here is a research label, not a conformance claim — 3GPP
+    // Rel-20 (6G) has no frozen stage-3 spec. The flags below gate non-normative
+    // prototypes (design informed by TR 22.870 use cases); disabled by default.
     // ========================================================================
     /// Service Hosting Environment (SHE) task enabled (Rel-20)
     #[serde(default)]
@@ -1079,6 +1083,10 @@ pub struct UeConfig {
     pub v2x_config: Option<V2xConfig>,
     // ========================================================================
     // Rel-20 6G feature flags
+    //
+    // NOTE: "Rel-20" here is a research label, not a conformance claim — 3GPP
+    // Rel-20 (6G) has no frozen stage-3 spec. The flags below gate non-normative
+    // prototypes (design informed by TR 22.870 use cases); disabled by default.
     // ========================================================================
     /// Service Hosting Environment (SHE) client task enabled (Rel-20)
     #[serde(default)]

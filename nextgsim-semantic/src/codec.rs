@@ -1,7 +1,19 @@
-//! Neural codec interface wrapping nextgsim-ai's InferenceEngine
+//! Semantic codec for nextgsim: operational path is mean-pooling encoder + nearest-neighbor decoder.
 //!
-//! Provides ONNX-based neural encoding and decoding for semantic features.
-//! When no ONNX models are loaded, falls back to the existing mean-pooling encoder.
+//! # Operational path
+//!
+//! **No `.onnx` model ships with the repository.** Unless a caller explicitly
+//! loads a model via [`NeuralEncoder::load_model`] / [`NeuralDecoder::load_model`],
+//! every encode/decode call uses the non-neural fallback algorithms:
+//!
+//! - **Encode**: stride-based **mean-pooling** of the input vector, producing
+//!   per-chunk means with variance-derived importance weights.
+//! - **Decode**: **nearest-neighbor upsampling** — each compressed feature value
+//!   is repeated `stride` times to reconstruct the original length.
+//!
+//! ONNX-based neural inference is supported as an optional upgrade when a
+//! compatible model file is provided at runtime; it is not the default or
+//! shipped path.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,9 +69,15 @@ fn warn_fallback_once(flag: &AtomicBool, role: &str, method: &str) {
     }
 }
 
-/// Neural encoder that compresses feature vectors using an ONNX model.
+/// Semantic encoder for feature vector compression.
 ///
-/// Falls back to mean-pooling when no model is loaded.
+/// **Operational algorithm**: stride-based **mean-pooling** — the input is
+/// divided into `target_dim` equal-sized chunks; each chunk is summarised by
+/// its mean value and variance-derived importance weight.
+///
+/// ONNX-based neural encoding is an optional upgrade: call [`Self::load_model`]
+/// with a compatible `.onnx` encoder model to enable it. No model ships with
+/// the repository, so the mean-pooling path is always the default.
 pub struct NeuralEncoder {
     /// ONNX inference engine for the encoder model
     engine: OnnxEngine,
@@ -134,8 +152,10 @@ impl NeuralEncoder {
 
     /// Encodes raw feature data into a compressed representation.
     ///
-    /// If an ONNX model is loaded, runs the model. Otherwise, falls back
-    /// to mean-pooling compression (the original behavior).
+    /// **Operational path**: stride-based **mean-pooling** (see struct doc).
+    /// If an ONNX model has been loaded via [`Self::load_model`], that model
+    /// is used instead; otherwise the mean-pooling fallback runs and a one-time
+    /// warning is logged.
     ///
     /// # Errors
     /// Returns `CodecError::Inference` if ONNX inference fails.
@@ -204,9 +224,14 @@ impl NeuralEncoder {
     }
 }
 
-/// Neural decoder that reconstructs feature vectors from compressed representations.
+/// Semantic decoder that reconstructs feature vectors from compressed representations.
 ///
-/// Falls back to nearest-neighbor upsampling when no model is loaded.
+/// **Operational algorithm**: **nearest-neighbor upsampling** — each compressed
+/// feature value is repeated `stride` times to fill the original output length.
+///
+/// ONNX-based neural decoding is an optional upgrade: call [`Self::load_model`]
+/// with a compatible `.onnx` decoder model to enable it. No model ships with
+/// the repository, so the nearest-neighbor path is always the default.
 pub struct NeuralDecoder {
     /// ONNX inference engine for the decoder model
     engine: OnnxEngine,
@@ -269,8 +294,10 @@ impl NeuralDecoder {
 
     /// Decodes compressed features back to the original dimension.
     ///
-    /// If an ONNX model is loaded, runs the model. Otherwise, falls back
-    /// to nearest-neighbor upsampling (the original behavior).
+    /// **Operational path**: **nearest-neighbor upsampling** (see struct doc).
+    /// If an ONNX model has been loaded via [`Self::load_model`], that model
+    /// is used instead; otherwise the nearest-neighbor fallback runs and a
+    /// one-time warning is logged.
     ///
     /// # Errors
     /// Returns `CodecError::Inference` if ONNX inference fails.
