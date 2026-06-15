@@ -105,13 +105,28 @@ unprotected initial message now carries cleartext IEs only (reg type, ngKSI, 5GS
 mobile identity, UE security capability, NID); the full request (all IEs) was
 already replayed in the Security Mode Complete NAS message container.
 
-**PDU session / data plane — IN PROGRESS.** The PDU Session Establishment
-Request reaches the real SMF (`UE SUPI[...] DNN[internet] ... smContextRef`, SM
-context created), but completion is blocked by a **sim-internal UE↔gNB RLS bug**
-— the UE loses its serving cell every ~13 s (`Cell lost` → `SignalLostToConnected
-Cell` → new `cell_id`, `dbm=-1`), unrelated to Open5GS. Next: fix RLS cell
-tracking/heartbeat in `nextgsim-ue/src/rls/task.rs` / the gNB RLS, then PDU
-completion + `ping` UE↔DN through the real UPF. See `.context/EXIT-GATE-RUNBOOK.md`.
+### One real UE-side RLS bug this gate found + fixed
+First data-plane attempt: the UE lost its serving cell every ~13 s (`Cell lost` →
+`SignalLostToConnectedCell` → new `cell_id`, `dbm=-1`), spiralling right after
+registration. An RLS UDP capture on the gNB netns proved the gNB *always* acks,
+but the UE's heartbeats had systematic ~2 s gaps. Root cause: **double rate-
+limiting** — `send_heartbeats` was paced by a 1 s tokio `interval` *and* gated by
+`should_send_heartbeats()` (a second wall-clock 1 s limiter). Under scheduling
+jitter a tick landed <1 s after the last send, got gated out, and slipped the
+next heartbeat to ~2 s — exceeding the 2 s cell-lost threshold. Fixed in
+`nextgsim-ue/src/rls/task.rs` by letting the tokio timer be the sole pacer.
+Post-fix: **0 radio-link failures, cell stable**.
+
+**PDU session / data plane — IN PROGRESS (blocked one step deeper, in the core
+N2/SM signalling).** With the cell stable, registration is rock-solid and the
+**real SMF allocates a UE IP** (`UE SUPI[...] DNN[internet] IPv4[10.45.0.6]`). But
+the UE's **PDU Session Establishment Accept never arrives** (`T3580 expired …
+retransmitting`). The AMF's `createSmContext` succeeds (201, IP allocated) yet it
+emits **no `PDUSessionResourceSetupRequest`** to the gNB (only `InitialContext
+Setup`), and retransmits hit `DUPLICATED_PDU_SESSION_ID`. The gNB *has* a
+`handle_pdu_session_resource_setup` handler, so the next investigation is the
+AMF↔gNB N2 PDU-session-resource-setup path (why the N2 isn't sent/acted on), then
+DRB + GTP-U + `ping` UE↔DN through the real UPF. See `.context/EXIT-GATE-RUNBOOK.md`.
 
 ## Config issues already surfaced + fixed (this run)
 - Open5GS 2.7 AMF requires `amf.time.t3512.value` (added to `open5gs/amf.yaml`).
