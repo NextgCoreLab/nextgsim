@@ -31,8 +31,10 @@ use std::time::{Duration, Instant};
 
 /// Measurement quantity types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum MeasQuantity {
     /// SS-RSRP (Reference Signal Received Power)
+    #[default]
     SsRsrp,
     /// SS-RSRQ (Reference Signal Received Quality)
     SsRsrq,
@@ -40,11 +42,6 @@ pub enum MeasQuantity {
     SsSinr,
 }
 
-impl Default for MeasQuantity {
-    fn default() -> Self {
-        Self::SsRsrp
-    }
-}
 
 /// Measurement event types for event-triggered reporting
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -222,7 +222,7 @@ impl TrainingDashboard {
     /// Returns top contributors by total samples
     pub fn top_contributors(&self, k: usize) -> Vec<ParticipantContribution> {
         let mut contributions: Vec<_> = self.contributions.values().cloned().collect();
-        contributions.sort_by(|a, b| b.total_samples.cmp(&a.total_samples));
+        contributions.sort_by_key(|c| std::cmp::Reverse(c.total_samples));
         contributions.truncate(k);
         contributions
     }

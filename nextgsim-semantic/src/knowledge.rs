@@ -170,7 +170,7 @@ impl KnowledgeGraph {
     /// Returns the most frequent concepts
     pub fn top_concepts(&self, k: usize) -> Vec<&ConceptNode> {
         let mut concepts: Vec<_> = self.concepts.values().collect();
-        concepts.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        concepts.sort_by_key(|c| std::cmp::Reverse(c.frequency));
         concepts.truncate(k);
         concepts
     }

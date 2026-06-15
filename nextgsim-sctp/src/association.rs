@@ -1217,18 +1217,15 @@ pub enum NgapStreamCategory {
 
 /// Stream allocation policy for NGAP
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum StreamAllocationPolicy {
     /// Round-robin across available streams
     RoundRobin,
     /// Use stream 0 for non-UE, stream 1+ for UE-associated (hash-based)
+    #[default]
     CategoryBased,
 }
 
-impl Default for StreamAllocationPolicy {
-    fn default() -> Self {
-        Self::CategoryBased
-    }
-}
 
 /// SCTP stream manager for NGAP multi-stream transport
 ///
@@ -1388,8 +1385,10 @@ impl StreamManager {
 /// (e.g. real-time data) may be discarded if they cannot be delivered
 /// within timing or retransmission constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum PartialReliabilityPolicy {
     /// Fully reliable transfer (standard SCTP behavior)
+    #[default]
     ReliableTransfer,
     /// Timed reliability: message may be discarded after the given duration
     /// since first transmission attempt
@@ -1420,11 +1419,6 @@ impl PartialReliabilityPolicy {
     }
 }
 
-impl Default for PartialReliabilityPolicy {
-    fn default() -> Self {
-        Self::ReliableTransfer
-    }
-}
 
 /// Forward TSN chunk information for PR-SCTP
 ///

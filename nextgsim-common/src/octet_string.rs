@@ -98,7 +98,7 @@ impl OctetString {
     /// `Some(OctetString)` if the hex string is valid, `None` otherwise.
     pub fn from_hex(hex: &str) -> Option<Self> {
         let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return None;
         }
 

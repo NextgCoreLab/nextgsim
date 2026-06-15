@@ -461,11 +461,10 @@ pub fn parse_initial_ue_message(
             InitialUEMessageProtocolIEs_EntryValue::Id_AMFSetID(id) => {
                 amf_set_id = Some(parse_amf_set_id(id));
             }
-            InitialUEMessageProtocolIEs_EntryValue::Id_UEContextRequest(req) => {
-                if req.0 == UEContextRequest::REQUESTED {
+            InitialUEMessageProtocolIEs_EntryValue::Id_UEContextRequest(req)
+                if req.0 == UEContextRequest::REQUESTED => {
                     ue_context_request = Some(UeContextRequestValue::Requested);
                 }
-            }
             _ => {
                 // Ignore other IEs
             }

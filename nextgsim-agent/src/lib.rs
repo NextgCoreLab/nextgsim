@@ -751,21 +751,18 @@ impl AgentCoordinator {
         let caps = &registration.capabilities;
 
         match intent.intent_type {
-            IntentType::Query => {
-                if !caps.read_state {
+            IntentType::Query
+                if !caps.read_state => {
                     return Err("Agent lacks read_state capability".to_string());
                 }
-            }
-            IntentType::TriggerHandover | IntentType::AdjustQos => {
-                if !caps.trigger_actions {
+            IntentType::TriggerHandover | IntentType::AdjustQos
+                if !caps.trigger_actions => {
                     return Err("Agent lacks trigger_actions capability".to_string());
                 }
-            }
-            IntentType::OptimizeResources | IntentType::CreateSlice | IntentType::ModifySlice => {
-                if !caps.modify_config {
+            IntentType::OptimizeResources | IntentType::CreateSlice | IntentType::ModifySlice
+                if !caps.modify_config => {
                     return Err("Agent lacks modify_config capability".to_string());
                 }
-            }
             _ => {}
         }
 
@@ -833,7 +830,7 @@ impl AgentCoordinator {
     pub fn process_intents_full(&mut self) -> Vec<IntentExecutionResult> {
         // Sort by priority (highest first)
         self.pending_intents
-            .sort_by(|a, b| b.priority.cmp(&a.priority));
+            .sort_by_key(|i| std::cmp::Reverse(i.priority));
 
         let intents: Vec<Intent> = self.pending_intents.drain(..).collect();
         // Also drain the intent queue so it stays in sync.

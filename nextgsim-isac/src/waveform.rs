@@ -510,8 +510,7 @@ impl JointWaveformDesign {
         self.subcarrier_allocation = vec![false; self.num_subcarriers];
 
         // Distribute sensing subcarriers evenly across bandwidth
-        if sensing_count > 0 {
-            let step = self.num_subcarriers / sensing_count;
+        if let Some(step) = self.num_subcarriers.checked_div(sensing_count) {
             for i in 0..sensing_count {
                 let idx = (i * step).min(self.num_subcarriers - 1);
                 self.subcarrier_allocation[idx] = true;

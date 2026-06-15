@@ -359,7 +359,7 @@ pub fn uia2_f9(
     let q = ((z[2] as u64) << 32) | (z[3] as u64);
 
     // Calculate D (number of 64-bit blocks)
-    let d = if length % 64 == 0 {
+    let d = if length.is_multiple_of(64) {
         (length / 64) + 1
     } else {
         (length / 64) + 2

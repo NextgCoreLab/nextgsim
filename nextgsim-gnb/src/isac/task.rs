@@ -106,7 +106,7 @@ impl Task for IsacTask {
                                 // Forward fused position to NWDAF for analytics
                                 if let Some(ref sixg) = self.task_base.sixg {
                                     let nwdaf_msg = NwdafMessage::UeMeasurement {
-                                        ue_id: ue_id as i32,
+                                        ue_id,
                                         rsrp: 0.0,
                                         rsrq: 0.0,
                                         position: (

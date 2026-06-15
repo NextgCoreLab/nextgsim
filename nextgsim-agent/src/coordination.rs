@@ -15,8 +15,10 @@ use std::collections::{HashMap, VecDeque};
 ///
 /// Higher-level agents can override or coordinate lower-level ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum AgentRole {
     /// Manages a single cell.
+    #[default]
     CellLevel = 0,
     /// Manages a region of cells.
     RegionLevel = 1,
@@ -36,11 +38,6 @@ impl AgentRole {
     }
 }
 
-impl Default for AgentRole {
-    fn default() -> Self {
-        Self::CellLevel
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Agent-to-agent messages

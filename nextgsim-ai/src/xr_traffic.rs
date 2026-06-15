@@ -169,7 +169,7 @@ impl XrTrafficModel {
 
     /// Generates the next frame in the traffic model.
     pub fn generate_frame(&mut self) -> XrFrame {
-        let is_keyframe = self.sequence % self.i_frame_interval as u64 == 0;
+        let is_keyframe = self.sequence.is_multiple_of(self.i_frame_interval as u64);
         let base_size = if is_keyframe {
             self.i_frame_size
         } else {
