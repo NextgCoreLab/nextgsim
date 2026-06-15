@@ -1,0 +1,56 @@
+# Strict-peer EXIT GATE (T6.3), direction (a): our kernel-SCTP gNB -> real
+# Open5GS AMF. Milestone 1 = NGAP NG Setup. PLMN 999-70 (Open5GS default).
+#   docker compose -f docker-compose.yml up --build
+networks:
+  exit-gate:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+services:
+  mongodb:
+    image: mongo:6
+    container_name: eg-mongodb
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.2
+
+  nrf:
+    image: openverso/open5gs:2.7.0
+    container_name: eg-nrf
+    command: ["/opt/open5gs/bin/open5gs-nrfd", "-c", "/etc/open5gs/nrf.yaml"]
+    environment:
+      DB_URI: mongodb://172.30.0.2/open5gs
+    volumes:
+      - ./open5gs/nrf.yaml:/etc/open5gs/nrf.yaml:ro
+    depends_on: [mongodb]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.10
+
+  amf:
+    image: openverso/open5gs:2.7.0
+    container_name: eg-amf
+    command: ["/opt/open5gs/bin/open5gs-amfd", "-c", "/etc/open5gs/amf.yaml"]
+    environment:
+      DB_URI: mongodb://172.30.0.2/open5gs
+    volumes:
+      - ./open5gs/amf.yaml:/etc/open5gs/amf.yaml:ro
+    depends_on: [nrf]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.5
+
+  gnb:
+    build:
+      context: ../..
+      dockerfile: docker/exit-gate/Dockerfile.gnb-kernel
+    image: nextgsim-gnb-kernel:latest
+    container_name: eg-gnb
+    command: ["-c", "/etc/nextgsim/gnb.yaml"]
+    volumes:
+      - ./gnb.yaml:/etc/nextgsim/gnb.yaml:ro
+    depends_on: [amf]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.100

@@ -1,0 +1,43 @@
+# gNB config for the strict-peer EXIT GATE: our sim gNB -> real Open5GS AMF
+# over KERNEL SCTP (IP proto 132). PLMN 999-70 matches Open5GS defaults.
+# Network: exit-gate bridge 172.30.0.0/24 (see docker-compose.yml).
+
+nci: 0x000000010
+gnb_id_length: 32
+
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+tac: 1
+
+nssai:
+  - sst: 1
+    sd: null
+
+# Point at the Open5GS AMF container (static IP on the exit-gate network).
+amf_configs:
+  - address: 172.30.0.5
+    port: 38412
+
+# REAL kernel SCTP — required to associate with Open5GS. Effective only on a
+# Linux build compiled with --features kernel-sctp (this image is).
+sctp_backend: kernel
+
+link_ip: 172.30.0.100
+ngap_ip: 172.30.0.100
+gtp_ip: 172.30.0.100
+ignore_stream_ids: false
+
+# Open5GS UPF (only needed once we reach the data-plane milestone).
+upf_addr: 172.30.0.7
+upf_port: 2152
+
+energy_saving_enabled: false
+she_enabled: false
+nwdaf_enabled: false
+nkef_enabled: false
+isac_enabled: false
+agent_enabled: false
+federated_learning_enabled: false
