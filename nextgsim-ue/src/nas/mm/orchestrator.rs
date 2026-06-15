@@ -656,7 +656,7 @@ impl MmOrchestrator {
         let mut req = RegistrationRequest::new(
             Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
             ng_ksi,
-            mobile_identity,
+            mobile_identity.clone(),
         );
         // Mandatory-for-security IEs: UE security capability (replayed by
         // the network in the Security Mode Command) and requested NSSAI
@@ -699,19 +699,47 @@ impl MmOrchestrator {
         let mut plain = Vec::new();
         req.encode(&mut plain);
 
+        // The FULL request (all IEs) is replayed in the Security Mode Complete
+        // NAS message container once security is up (TS 24.501 §4.4.6).
         self.last_registration_request = Some(plain.clone());
         self.pending_reg_type = reg_type;
         self.state.switch_mm_state(MmSubState::RegisteredInitiated);
         self.timers.start(TIMER_T3510, true);
         self.timers.stop(TIMER_T3511, true);
 
+        // TS 24.501 §4.4.6: an initial registration request sent WITHOUT
+        // integrity protection must carry cleartext IEs only. Non-cleartext IEs
+        // (requested NSSAI, last visited TAI, the Rel-17/18 indications) are
+        // deferred to the Security Mode Complete container above; a real AMF
+        // (Open5GS) rejects them in the clear with 5GMM cause #95 "semantically
+        // incorrect message". UE security capability and the NID *are* cleartext
+        // IEs, so they stay. When a security context is already active the full
+        // request is sent integrity-protected and all IEs are allowed.
+        let wire = if self.sec.is_active() {
+            plain
+        } else {
+            let mut ct = RegistrationRequest::new(
+                Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
+                NasKeySetIdentifier::no_key(),
+                mobile_identity,
+            );
+            ct.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
+            if let Some(ref nid) = self.identity.snpn_nid {
+                ct.snpn_nid = Some(nid.clone());
+            }
+            let mut ct_bytes = Vec::new();
+            ct.encode(&mut ct_bytes);
+            ct_bytes
+        };
+
         info!(
-            "Sending Registration Request ({:?}), len={}, T3510 started",
+            "Sending Registration Request ({:?}), len={}, cleartext_only={}, T3510 started",
             reg_type,
-            plain.len()
+            wire.len(),
+            !self.sec.is_active()
         );
 
-        let pdu = self.protect_if_active(plain);
+        let pdu = self.protect_if_active(wire);
         vec![MmOutput::SendNasPdu(pdu)]
     }
 
@@ -1993,15 +2021,30 @@ mod tests {
         assert!(orch.timers().t3510.is_running());
         assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
 
-        // Round-trip: the request must contain the UE security capability
-        // and the requested NSSAI
+        // TS 24.501 §4.4.6: the initial *unprotected* request carries cleartext
+        // IEs only. UE security capability is a cleartext IE (present); the
+        // requested NSSAI is non-cleartext and must NOT appear here (it is
+        // deferred to the Security Mode Complete NAS message container).
         let decoded = RegistrationRequest::decode(&mut &pdu[3..]).unwrap();
         assert_eq!(decoded.ue_security_capability, Some(vec![0xF0, 0x70]));
-        assert_eq!(decoded.requested_nssai, Some(vec![0x01, 0x01]));
+        assert_eq!(
+            decoded.requested_nssai, None,
+            "requested NSSAI is non-cleartext; it must not be sent in the clear"
+        );
         assert_eq!(
             decoded.mobile_identity.identity_type,
             MobileIdentityType::Suci
         );
+
+        // The FULL request (including the non-cleartext IEs) is stashed for
+        // replay inside the Security Mode Complete NAS message container.
+        let full = orch
+            .last_registration_request
+            .as_ref()
+            .expect("full registration request stashed for the SMC container");
+        let full_decoded = RegistrationRequest::decode(&mut &full[3..]).unwrap();
+        assert_eq!(full_decoded.requested_nssai, Some(vec![0x01, 0x01]));
+        assert_eq!(full_decoded.ue_security_capability, Some(vec![0xF0, 0x70]));
     }
 
     #[test]

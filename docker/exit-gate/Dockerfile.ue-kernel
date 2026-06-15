@@ -1,0 +1,16 @@
+# UE runtime image for the exit gate: pre-built nr-ue binary + TUN/route tools.
+# Build context = the nextgsim repo root (so binaries/ is in context):
+#   docker build -f docker/exit-gate/Dockerfile.ue-kernel -t nextgsim-ue-kernel:latest .
+# The binary at binaries/nr-ue-linux must be a Linux build of
+#   cargo build -p nextgsim-ue
+# Base must match the builder's glibc (rust:latest = Debian trixie, glibc 2.38).
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates iproute2 iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+COPY binaries/nr-ue-linux /usr/local/bin/nr-ue
+RUN mkdir -p /etc/nextgsim
+WORKDIR /etc/nextgsim
+ENV RUST_LOG=info,nextgsim_ue=debug
+ENTRYPOINT ["nr-ue"]
+CMD ["-c", "/etc/nextgsim/ue.yaml"]

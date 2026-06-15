@@ -1,26 +1,48 @@
-# Strict-peer EXIT GATE (T6.3), direction (a): our kernel-SCTP gNB -> real
-# Open5GS AMF. Milestone 1 = NGAP NG Setup. PLMN 999-70 (Open5GS default).
-#   docker compose -f docker-compose.yml up --build
+# Strict-peer EXIT GATE (T6.3), direction (a): our kernel-SCTP gNB (+ UE) -> a
+# REAL Open5GS 2.7 5G SA core. PLMN 999-70 (Open5GS default).
+#   docker compose up -d            # bring up core + gNB
+# Milestone 2 (NG Setup) PASSED; Milestone 3 = full Registration / PDU / data
+# plane against the real core (add the `ue` service + provision the subscriber).
+#
+# Open5GS NFs use the openverso image's default configs (PLMN 999-70, S-NSSAI
+# sst:1, DNN subnet 10.45.0.0/16 — all match our UE). Peers are discovered by
+# service name; SCP is the SBI hub. Only udr/pcf mount a patched config (db_uri
+# -> the mongo container IP). amf/nrf keep our own configs (debug logging + the
+# NGAP/GUAMI/TAI the gNB expects); amf uses direct-NRF discovery, which coexists
+# with the SCP-routed NFs because NRF is the common registry.
+#
+# IMPORTANT: every service is pinned to a static IP. Docker IPAM hands out
+# dynamic addresses from the low end of the subnet, which collides with pinned
+# services (amf .5 / upf .7) if any unpinned NF grabs them first. Pin them all.
 networks:
   exit-gate:
     ipam:
       config:
         - subnet: 172.30.0.0/24
 
+x-open5gs: &open5gs
+  image: openverso/open5gs:2.7.0
+  restart: on-failure:5
+
 services:
   mongodb:
     image: mongo:6
     container_name: eg-mongodb
+    restart: on-failure:5
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 3s
+      timeout: 4s
+      retries: 10
+      start_period: 5s
     networks:
       exit-gate:
         ipv4_address: 172.30.0.2
 
   nrf:
-    image: openverso/open5gs:2.7.0
+    <<: *open5gs
     container_name: eg-nrf
     command: ["/opt/open5gs/bin/open5gs-nrfd", "-c", "/etc/open5gs/nrf.yaml"]
-    environment:
-      DB_URI: mongodb://172.30.0.2/open5gs
     volumes:
       - ./open5gs/nrf.yaml:/etc/open5gs/nrf.yaml:ro
     depends_on: [mongodb]
@@ -28,18 +50,133 @@ services:
       exit-gate:
         ipv4_address: 172.30.0.10
 
-  amf:
-    image: openverso/open5gs:2.7.0
-    container_name: eg-amf
-    command: ["/opt/open5gs/bin/open5gs-amfd", "-c", "/etc/open5gs/amf.yaml"]
-    environment:
-      DB_URI: mongodb://172.30.0.2/open5gs
-    volumes:
-      - ./open5gs/amf.yaml:/etc/open5gs/amf.yaml:ro
+  scp:
+    <<: *open5gs
+    container_name: eg-scp
+    command: ["/opt/open5gs/bin/open5gs-scpd"]
     depends_on: [nrf]
     networks:
       exit-gate:
+        ipv4_address: 172.30.0.3
+
+  amf:
+    <<: *open5gs
+    container_name: eg-amf
+    command: ["/opt/open5gs/bin/open5gs-amfd", "-c", "/etc/open5gs/amf.yaml"]
+    volumes:
+      - ./open5gs/amf.yaml:/etc/open5gs/amf.yaml:ro
+    depends_on: [nrf, scp]
+    networks:
+      exit-gate:
         ipv4_address: 172.30.0.5
+
+  ausf:
+    <<: *open5gs
+    container_name: eg-ausf
+    command: ["/opt/open5gs/bin/open5gs-ausfd"]
+    depends_on: [scp]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.8
+
+  udm:
+    <<: *open5gs
+    container_name: eg-udm
+    command: ["/opt/open5gs/bin/open5gs-udmd"]
+    depends_on: [scp]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.9
+
+  udr:
+    <<: *open5gs
+    container_name: eg-udr
+    command: ["/opt/open5gs/bin/open5gs-udrd", "-c", "/etc/open5gs/udr.yaml"]
+    # Open5GS reads DB_URI from the environment and it OVERRIDES the config
+    # file; the openverso image bakes in DB_URI=mongodb://mongo/open5gs, so set
+    # it explicitly to our mongo container.
+    environment:
+      DB_URI: mongodb://172.30.0.2/open5gs
+    volumes:
+      - ./open5gs/udr.yaml:/etc/open5gs/udr.yaml:ro
+    depends_on:
+      scp:
+        condition: service_started
+      mongodb:
+        condition: service_healthy
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.11
+
+  pcf:
+    <<: *open5gs
+    container_name: eg-pcf
+    command: ["/opt/open5gs/bin/open5gs-pcfd", "-c", "/etc/open5gs/pcf.yaml"]
+    environment:
+      DB_URI: mongodb://172.30.0.2/open5gs
+    volumes:
+      - ./open5gs/pcf.yaml:/etc/open5gs/pcf.yaml:ro
+    depends_on:
+      scp:
+        condition: service_started
+      mongodb:
+        condition: service_healthy
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.12
+
+  bsf:
+    <<: *open5gs
+    container_name: eg-bsf
+    command: ["/opt/open5gs/bin/open5gs-bsfd"]
+    depends_on: [scp]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.6
+
+  nssf:
+    <<: *open5gs
+    container_name: eg-nssf
+    command: ["/opt/open5gs/bin/open5gs-nssfd"]
+    depends_on: [scp]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.4
+
+  upf:
+    <<: *open5gs
+    container_name: eg-upf
+    command: ["/opt/open5gs/bin/open5gs-upfd"]
+    # privileged so the entrypoint can create ogstun AND run `sysctl -w
+    # net.ipv6.conf.all.disable_ipv6` (NET_ADMIN alone is denied for that sysctl
+    # under set -e, which aborts the entrypoint).
+    privileged: true
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      IPV4_TUN_ADDR: 10.45.0.1/16
+      IPV6_TUN_ADDR: 2001:db8:cafe::1/48
+      IPV4_TUN_SUBNET: 10.45.0.0/16
+      ENABLE_NAT: "true"
+    depends_on: [nrf]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.7
+
+  smf:
+    <<: *open5gs
+    container_name: eg-smf
+    # Patched config points the PFCP client at the UPF's IP (172.30.0.7) instead
+    # of the hostname `upf`: Open5GS's ogs_getaddrinfo on a hostname at PFCP
+    # config-parse returns EINVAL in this Docker env (numeric IPs are fine).
+    command: ["/opt/open5gs/bin/open5gs-smfd", "-c", "/etc/open5gs/smf.yaml"]
+    volumes:
+      - ./open5gs/smf.yaml:/etc/open5gs/smf.yaml:ro
+    depends_on: [scp, upf]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.13
 
   gnb:
     build:
@@ -54,3 +191,20 @@ services:
     networks:
       exit-gate:
         ipv4_address: 172.30.0.100
+
+  ue:
+    build:
+      context: ../..
+      dockerfile: docker/exit-gate/Dockerfile.ue-kernel
+    image: nextgsim-ue-kernel:latest
+    container_name: eg-ue
+    command: ["-c", "/etc/nextgsim/ue.yaml"]
+    volumes:
+      - ./ue.yaml:/etc/nextgsim/ue.yaml:ro
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on: [gnb]
+    networks:
+      exit-gate:
+        ipv4_address: 172.30.0.101

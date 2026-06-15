@@ -1,23 +1,37 @@
-# Strict-Peer Exit Gate (T6.3) — direction (a): our kernel-SCTP gNB → real Open5GS AMF
+# Strict-Peer Exit Gate (T6.3) — direction (a): our gNB+UE → a real Open5GS 2.7 5G SA core
 
 Self-contained Docker setup that runs our sim gNB (kernel SCTP, `--features
-kernel-sctp`) against a **real Open5GS 2.7 AMF** — the independent peer that
-proves the matched-simulator crutch is gone. PLMN 999-70 (Open5GS default,
-matches our gNB).
+kernel-sctp`) and sim UE against a **real, full Open5GS 2.7 5G SA core**
+(nrf/scp/amf/ausf/udm/udr/pcf/bsf/nssf/smf/upf + mongo) — the independent peer
+that proves the matched-simulator crutch is gone. PLMN 999-70, DNN `internet`,
+S-NSSAI sst:1 (Open5GS defaults, matched by our gNB/UE).
+
+The Open5GS NFs use the openverso image's default configs; only udr/pcf (db_uri)
+and smf (UPF IP + Diameter off) are patched (`open5gs/*.yaml`). Every service is
+pinned to a static IP (Docker IPAM otherwise hands a dynamic NF the amf/upf
+addresses). The subscriber (IMSI 999700000000001, Open5GS test K/OPc) is seeded
+into mongo via `mongosh` (no `open5gs-dbctl` in the image).
 
 ## Run
 ```bash
-# 1. Build the kernel-SCTP gNB Linux binary (writes binaries/nr-gnb-kernel, gitignored):
+# 1. Build the Linux binaries (gitignored under binaries/):
 cd ../..   # nextgsim root
-docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/tmp/t rust:latest \
-  bash -c 'export PATH=/usr/local/cargo/bin:$PATH; apt-get update -qq && \
-    apt-get install -y -qq libsctp-dev; cargo build -p nextgsim-gnb --features kernel-sctp && \
-    cp /tmp/t/debug/nr-gnb binaries/nr-gnb-kernel'
-# 2. Bring up Open5GS + gNB:
+CACHE=~/.cache/nextgsim-docker-build; mkdir -p "$CACHE"/{target,registry,git}
+docker run --rm -v "$PWD":/work -w /work -v "$CACHE/target":/target \
+  -v "$CACHE/registry":/usr/local/cargo/registry -v "$CACHE/git":/usr/local/cargo/git \
+  -e CARGO_TARGET_DIR=/target rust:latest bash -c \
+  'apt-get update -qq && apt-get install -y -qq libsctp-dev && \
+   cargo build -p nextgsim-gnb --features kernel-sctp && cp /target/debug/nr-gnb binaries/nr-gnb-kernel && \
+   cargo build -p nextgsim-ue && cp /target/debug/nr-ue binaries/nr-ue-linux'
+# 2. Bring up the full core + gNB:
 cd docker/exit-gate
-docker compose up -d --build
-docker logs eg-gnb -f      # gNB side
-docker logs eg-amf -f      # Open5GS AMF side
+docker compose up -d --build nrf scp amf ausf udm udr pcf bsf nssf upf smf gnb
+# 3. Provision the subscriber (IMSI 999700000000001, K/OPc test keys):
+docker exec eg-mongodb mongosh open5gs --quiet --eval '<see git history / runbook>'
+# 4. Bring up the UE:
+docker compose up -d --build ue
+docker logs eg-ue -f       # UE: registration / PDU / data plane
+docker logs eg-amf -f      # Open5GS AMF
 docker compose down        # teardown
 ```
 
@@ -73,9 +87,31 @@ Post-fix the gNB logs `Kernel SCTP received 54 bytes on stream 0 with PPID 60`
 and `Received NG Setup Response from AMF 0: name=open5gs-amf0`, no warnings.
 **T0.2 kernel-SCTP is now runtime-proven on both send AND receive.**
 
-**Next (Milestone 3+):** bring up Open5GS SMF/UPF/AUSF/UDM/UDR/PCF + a
-provisioned subscriber and the sim UE for Registration → PDU session → data
-plane. See `.context/EXIT-GATE-RUNBOOK.md`.
+**MILESTONE 3 (Registration + 5G-AKA + NAS security) — PASSED.** The sim UE
+registers against the full real Open5GS core:
+`RegistrationAccept (protected=true)` → `5GMM-REGISTERED.NORMAL-SERVICE` →
+5G-GUTI assigned → `Registration Complete`. This exercises **5G-AKA (Milenage
+with the provisioned K/OPc) against the real AUSF/UDM, plus NAS integrity +
+ciphering** — the control-plane matched-sim crutch is gone.
+
+### One real UE-side NAS bug this gate found + fixed
+First attempt: Open5GS rejected our Registration Request with 5GMM cause #95
+("semantically incorrect message"), logging `Non cleartext IEs is included
+[0xc]`. Per **TS 24.501 §4.4.6** the initial *unprotected* Registration Request
+must carry **cleartext IEs only**; our UE sent non-cleartext IEs (Requested
+NSSAI, …) in the clear. Our lenient sim AMF had accepted it. Fixed in
+`nextgsim-ue/src/nas/mm/orchestrator.rs` (`build_and_send_registration`): the
+unprotected initial message now carries cleartext IEs only (reg type, ngKSI, 5GS
+mobile identity, UE security capability, NID); the full request (all IEs) was
+already replayed in the Security Mode Complete NAS message container.
+
+**PDU session / data plane — IN PROGRESS.** The PDU Session Establishment
+Request reaches the real SMF (`UE SUPI[...] DNN[internet] ... smContextRef`, SM
+context created), but completion is blocked by a **sim-internal UE↔gNB RLS bug**
+— the UE loses its serving cell every ~13 s (`Cell lost` → `SignalLostToConnected
+Cell` → new `cell_id`, `dbm=-1`), unrelated to Open5GS. Next: fix RLS cell
+tracking/heartbeat in `nextgsim-ue/src/rls/task.rs` / the gNB RLS, then PDU
+completion + `ping` UE↔DN through the real UPF. See `.context/EXIT-GATE-RUNBOOK.md`.
 
 ## Config issues already surfaced + fixed (this run)
 - Open5GS 2.7 AMF requires `amf.time.t3512.value` (added to `open5gs/amf.yaml`).

@@ -9,6 +9,10 @@
 # Exit-gate packet captures — diagnostic artifacts, regenerate by running the gate
 /docker/exit-gate/captures/
 
+# Exit-gate: verbatim Open5GS default configs extracted from the openverso image
+# for reference (regenerate via `docker cp <image>:/opt/open5gs/etc/open5gs/`).
+/docker/exit-gate/open5gs/defaults/
+
 # Local tooling (GitNexus code-intelligence index + Claude Code local config)
 .gitnexus
 .claude/
