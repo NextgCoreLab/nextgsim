@@ -31,21 +31,51 @@ docker compose down        # teardown
 - **Open5GS accepted us**: `gNB-N2 accepted[172.30.0.100]` · `[Added] Number of
   gNBs is now 1` · `max_num_of_ostreams: 2`. The transport crutch is gone.
 
-**MILESTONE 2 (NG Setup procedure) — OPEN.** The gNB sends the 60-byte NG Setup
-Request over the established association, but Open5GS logs nothing after accepting
-the association (no NGAP processing, no decode error, no NG Setup Response), and
-the gNB waits. **Next step:** packet-capture the N2 link to disambiguate:
+**MILESTONE 2 (NG Setup procedure) — PASSED.** Validated end-to-end against a
+real Open5GS 2.7 AMF over kernel SCTP. Capture the N2 link with:
 ```bash
-# does the SCTP DATA chunk (PPID 60, the NG Setup) actually reach the AMF?
-docker run --rm --net container:eg-amf nicolaka/netshoot \
-  tshark -i any -d 'sctp.ppi==60,ngap' -Y 'sctp || ngap' -V
+docker run -d --name eg-cap --net container:eg-amf -v "$PWD/captures":/cap \
+  nicolaka/netshoot tshark -i any -f sctp -w /cap/n2.pcap   # then bring up gNB
+docker run --rm -v "$PWD/captures":/cap nicolaka/netshoot \
+  tshark -r /cap/n2.pcap -d 'sctp.ppi==60,ngap' -V          # dissect
 ```
-- If the DATA chunk never arrives → an SCTP send issue in `nextgsim-sctp/src/kernel.rs`
-  (e.g. `sctp_sendmsg` flags/stream, or send before COMM_UP fully settled).
-- If it arrives but Open5GS drops it silently → an **NGAP encoding delta** in our
-  ogs-ngap codec vs Open5GS's strict APER decoder — i.e. a real conformance bug,
-  which is exactly what this gate exists to find. (Raise Open5GS log level to
-  `debug` in `open5gs/amf.yaml` to see the decode path.)
+The capture (written to `captures/`, gitignored — regenerate by re-running the
+gate) shows the full exchange:
+- gNB → AMF **NGSetupRequest** (PPID 60) — all 4 IEs decode under Open5GS's
+  strict APER decoder (GlobalRANNodeID gNB-ID=1 PLMN 999/70, RANNodeName,
+  SupportedTAList TAC=1 SST=01, DefaultPagingDRX). **Our NGAP encoder is
+  wire-conformant to an independent peer.**
+- AMF → gNB **NGSetupResponse** (PPID 60, successfulOutcome, AMFName
+  `open5gs-amf0`) → the gNB marks the AMF context **Connected**.
+- Steady bidirectional SCTP HEARTBEAT/HEARTBEAT_ACK — stable association.
+
+### Two real gNB-side bugs this gate found + fixed
+The earlier "Open5GS doesn't process our NG Setup" conclusion was an artifact of
+reading info-level AMF logs *without a wire capture* — Open5GS **did** respond.
+The capture redirected the hunt to the gNB receive path:
+1. **Kernel-SCTP receive path was never driven**
+   (`nextgsim-gnb/src/sctp/amf_connection.rs`). The SCTP task polls every backend
+   through a 10 ms `poll_connections → try_recv` loop, but the kernel backend's
+   `try_recv` returned `Ok(None)` unconditionally (`poll` a no-op), so the socket
+   was never read — the NGSetupResponse sat unread (kernel SACKed it; the app
+   never consumed it). Fixed by adding a real non-blocking
+   `KernelSctpAssociation::try_recv` (`nextgsim-sctp/src/kernel.rs`) and wiring
+   the kernel arm to it.
+2. **Received PPID read as 0** (`nextgsim-sctp/src/kernel.rs`). We enabled the
+   modern `SCTP_RECVRCVINFO`, but lksctp's `sctp_recvmsg()` fills `sinfo` only
+   from the legacy `SCTP_SNDRCV` cmsg, delivered when `sctp_data_io_event` is set
+   via `SCTP_EVENTS`. Without it `sinfo_ppid` stayed 0 (NG Setup still worked — we
+   route by content — but the PPID was unvalidated). Fixed by subscribing
+   `SCTP_EVENTS` with data_io + association + shutdown events, mirroring Open5GS's
+   `ogs_sctp_socket`.
+
+Post-fix the gNB logs `Kernel SCTP received 54 bytes on stream 0 with PPID 60`
+and `Received NG Setup Response from AMF 0: name=open5gs-amf0`, no warnings.
+**T0.2 kernel-SCTP is now runtime-proven on both send AND receive.**
+
+**Next (Milestone 3+):** bring up Open5GS SMF/UPF/AUSF/UDM/UDR/PCF + a
+provisioned subscriber and the sim UE for Registration → PDU session → data
+plane. See `.context/EXIT-GATE-RUNBOOK.md`.
 
 ## Config issues already surfaced + fixed (this run)
 - Open5GS 2.7 AMF requires `amf.time.t3512.value` (added to `open5gs/amf.yaml`).

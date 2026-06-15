@@ -6,6 +6,9 @@
 # Build artifacts — regenerate via Dockerfile.builder
 /binaries/
 
+# Exit-gate packet captures — diagnostic artifacts, regenerate by running the gate
+/docker/exit-gate/captures/
+
 # Local tooling (GitNexus code-intelligence index + Claude Code local config)
 .gitnexus
 .claude/

@@ -1,5 +1,5 @@
 logger:
-  level: info
+  level: debug
 global:
 amf:
   sbi:

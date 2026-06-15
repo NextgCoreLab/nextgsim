@@ -84,12 +84,14 @@ impl AssociationKind {
         match self {
             Self::Single(a) => a.try_recv(),
             Self::Multihome(a) => a.try_recv(),
-            // Kernel SCTP has no non-blocking buffered-read path separate from
-            // `recv`; the SCTP task's `try_recv` poll loop relies on `recv`
-            // being awaited elsewhere. Return None so the poll loop is a no-op
-            // for kernel associations (blocking `recv` is used instead).
+            // Real kernel SCTP: one non-blocking `sctp_recvmsg`. The socket is
+            // non-blocking, so this returns `Ok(None)` (EWOULDBLOCK) when no PDU
+            // is pending, letting the read side run from the same 10 ms poll
+            // loop as the userspace backends instead of a separate awaited
+            // `recv`. Without this the NG Setup Response (and all AMF→gNB PDUs)
+            // would sit unread in the socket buffer forever.
             #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
-            Self::Kernel(_) => Ok(None),
+            Self::Kernel(a) => a.try_recv(),
         }
     }
 

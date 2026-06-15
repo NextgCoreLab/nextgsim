@@ -100,14 +100,66 @@ struct SctpInitMsg {
     sinit_max_init_timeo: u16,
 }
 
+/// lksctp `struct sctp_event_subscribe` (from `<netinet/sctp.h>`), used with
+/// the `SCTP_EVENTS` socket option. Every field is a `__u8` flag (0/1). The
+/// struct has grown across kernel versions; the kernel copies
+/// `min(optlen, sizeof(kernel struct))` bytes and leaves the rest at its
+/// default, so passing this stable prefix (through `sctp_stream_change_event`)
+/// is forward-compatible. We only enable the three we depend on:
+/// `sctp_data_io_event` (fills `sctp_sndrcvinfo` on recv — the PPID/stream),
+/// and `sctp_association_event` / `sctp_shutdown_event` (so
+/// [`KernelSctpAssociation::handle_notification_state`] can observe
+/// COMM_LOST / SHUTDOWN and tear the association down).
+///
+/// ```c
+/// struct sctp_event_subscribe {
+///     __u8 sctp_data_io_event;
+///     __u8 sctp_association_event;
+///     __u8 sctp_address_event;
+///     __u8 sctp_send_failure_event;
+///     __u8 sctp_peer_error_event;
+///     __u8 sctp_shutdown_event;
+///     __u8 sctp_partial_delivery_event;
+///     __u8 sctp_adaptation_layer_event;
+///     __u8 sctp_authentication_event;
+///     __u8 sctp_sender_dry_event;
+///     __u8 sctp_stream_reset_event;
+///     __u8 sctp_assoc_reset_event;
+///     __u8 sctp_stream_change_event;
+/// };
+/// ```
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct SctpEventSubscribe {
+    sctp_data_io_event: u8,
+    sctp_association_event: u8,
+    sctp_address_event: u8,
+    sctp_send_failure_event: u8,
+    sctp_peer_error_event: u8,
+    sctp_shutdown_event: u8,
+    sctp_partial_delivery_event: u8,
+    sctp_adaptation_layer_event: u8,
+    sctp_authentication_event: u8,
+    sctp_sender_dry_event: u8,
+    sctp_stream_reset_event: u8,
+    sctp_assoc_reset_event: u8,
+    sctp_stream_change_event: u8,
+}
+
 // SCTP socket-option level and names (from <netinet/sctp.h>). These are stable
 // UAPI constants; libc does not always export them, so we define them locally.
 /// `IPPROTO_SCTP` socket option level for `setsockopt` (== 132).
 const SOL_SCTP: c_int = 132;
 /// `SCTP_INITMSG` socket option: request outbound/inbound stream counts.
 const SCTP_INITMSG: c_int = 2;
-/// `SCTP_RECVRCVINFO` socket option: deliver `sctp_rcvinfo` ancillary data.
-const SCTP_RECVRCVINFO: c_int = 32;
+/// `SCTP_EVENTS` socket option: subscribe to SCTP events. Critically, enabling
+/// `sctp_data_io_event` makes the kernel attach the legacy `SCTP_SNDRCV`
+/// ancillary message that lksctp's `sctp_recvmsg()` parses to fill
+/// `sctp_sndrcvinfo` (PPID + stream). This is the same setup Open5GS uses
+/// (`ogs_sctp_socket`). The newer `SCTP_RECVRCVINFO` delivers a *different*
+/// cmsg (`SCTP_RCVINFO`) that `sctp_recvmsg()` does not read, which left the
+/// received PPID/stream zeroed.
+const SCTP_EVENTS: c_int = 11;
 
 // libsctp helper functions. We link against `-lsctp` (libsctp-dev). These are
 // the classic one-to-one helpers that carry the PPID/stream out-of-band so we
@@ -228,25 +280,34 @@ impl KernelSctpAssociation {
             )));
         }
 
-        // 2b. SCTP_RECVRCVINFO: ask the kernel to deliver receive info so that
-        //     sctp_recvmsg fills sinfo (including sinfo_ppid). Enable = 1.
-        let on: c_int = 1;
-        // SAFETY: same invariants as above; `&on` is a valid `c_int`.
+        // 2b. SCTP_EVENTS: enable the legacy SCTP_SNDRCV ancillary data
+        //     (sctp_data_io_event) so lksctp's sctp_recvmsg fills sinfo —
+        //     including sinfo_ppid and sinfo_stream — and subscribe to the
+        //     association + shutdown notifications we act on. Mirrors Open5GS's
+        //     ogs_sctp_socket. (The newer SCTP_RECVRCVINFO delivers a cmsg that
+        //     sctp_recvmsg ignores, which made the received PPID read as 0.)
+        let events = SctpEventSubscribe {
+            sctp_data_io_event: 1,
+            sctp_association_event: 1,
+            sctp_shutdown_event: 1,
+            ..Default::default()
+        };
+        // SAFETY: `fd` is a valid open socket; `&events` points to a properly
+        // sized `sctp_event_subscribe`; we pass its exact byte length.
         let rc = unsafe {
             libc::setsockopt(
                 fd,
                 SOL_SCTP,
-                SCTP_RECVRCVINFO,
-                std::ptr::addr_of!(on).cast::<c_void>(),
-                std::mem::size_of::<c_int>() as socklen_t,
+                SCTP_EVENTS,
+                std::ptr::addr_of!(events).cast::<c_void>(),
+                std::mem::size_of::<SctpEventSubscribe>() as socklen_t,
             )
         };
         if rc != 0 {
-            // Not fatal in itself, but the PPID would be unreadable; older
-            // kernels may instead need SCTP_EVENTS/sctp_data_io_event. Surface
-            // a clear error so the operator can diagnose the kernel/libsctp.
+            // The PPID/stream would be unreadable without the SCTP_SNDRCV cmsg.
+            // Surface a clear error so the operator can diagnose kernel/libsctp.
             return Err(SctpError::ConnectionFailed(format!(
-                "setsockopt(SCTP_RECVRCVINFO): {} (kernel too old? enable SCTP_EVENTS)",
+                "setsockopt(SCTP_EVENTS): {}",
                 io::Error::last_os_error()
             )));
         }
@@ -454,6 +515,101 @@ impl KernelSctpAssociation {
         }
     }
 
+    /// Non-blocking receive: attempt a single `sctp_recvmsg` and return at once.
+    ///
+    /// The gNB's SCTP task drives every backend through one 10 ms poll loop
+    /// (`poll_connections` → `try_recv`) rather than awaiting [`recv`](Self::recv)
+    /// directly. The kernel socket is non-blocking, so this performs exactly one
+    /// `sctp_recvmsg`:
+    /// * a data PDU → `Ok(Some(..))`;
+    /// * nothing pending (`EWOULDBLOCK`) → `Ok(None)`;
+    /// * an SCTP notification → drained, `Ok(None)` (a terminal SHUTDOWN /
+    ///   COMM_LOST flips `established`, so the next poll reports closure);
+    /// * orderly peer shutdown (`recvmsg` returns 0) or an already-closed
+    ///   association → `Err(AssociationClosed)`, which the poll loop turns into
+    ///   an association-down teardown.
+    ///
+    /// Unlike [`recv`](Self::recv) this never awaits readiness — the periodic
+    /// poll supplies the cadence. PPID handling is identical (network byte order
+    /// on the wire, converted with `u32::from_be`).
+    pub fn try_recv(&mut self) -> Result<Option<ReceivedMessage>> {
+        if !self.established {
+            return Err(SctpError::AssociationClosed);
+        }
+
+        let fd = self.fd;
+        let cap = self.max_recv.max(1);
+        let mut buf = vec![0u8; cap];
+        let mut sinfo = SctpSndRcvInfo::default();
+        let mut msg_flags: c_int = 0;
+
+        // SAFETY: `fd` is a valid SCTP socket; `buf` has `cap` bytes;
+        // `sinfo`/`msg_flags` are valid out-params; from/fromlen NULL. The
+        // socket is non-blocking, so this returns EWOULDBLOCK instead of
+        // blocking when no message is ready.
+        let n = unsafe {
+            sctp_recvmsg(
+                fd,
+                buf.as_mut_ptr().cast::<c_void>(),
+                cap as size_t,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(sinfo),
+                std::ptr::addr_of_mut!(msg_flags),
+            )
+        };
+
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                // No PDU buffered this tick; the next poll will retry.
+                return Ok(None);
+            }
+            return Err(SctpError::Io(err));
+        }
+        let n = n as usize;
+
+        // MSG_NOTIFICATION: an SCTP event, not user data. Update association
+        // state and report "nothing to deliver" for this tick.
+        if (msg_flags & libc::MSG_NOTIFICATION) != 0 {
+            trace!("Kernel SCTP notification received ({} bytes), skipping", n);
+            self.handle_notification_state(&buf[..n.min(buf.len())]);
+            if !self.established {
+                return Err(SctpError::AssociationClosed);
+            }
+            return Ok(None);
+        }
+
+        if n == 0 {
+            // Peer performed an orderly shutdown.
+            debug!("Kernel SCTP peer shut down the association");
+            self.established = false;
+            return Err(SctpError::AssociationClosed);
+        }
+
+        buf.truncate(n);
+        // CRITICAL: sinfo_ppid arrives in network byte order; convert back.
+        let ppid = u32::from_be(sinfo.sinfo_ppid);
+        let stream_id = sinfo.sinfo_stream;
+
+        debug!(
+            "Kernel SCTP received {} bytes on stream {} with PPID {} (wire be: {:#010x})",
+            n, stream_id, ppid, sinfo.sinfo_ppid
+        );
+        if ppid != NGAP_PPID {
+            warn!(
+                "Kernel SCTP received non-NGAP PPID {} (expected {})",
+                ppid, NGAP_PPID
+            );
+        }
+
+        Ok(Some(ReceivedMessage {
+            stream_id,
+            data: Bytes::from(buf),
+            ppid,
+        }))
+    }
+
     /// Inspect an SCTP notification body and update `established` if it
     /// indicates the association is gone (SHUTDOWN / COMM_LOST).
     ///
@@ -476,18 +632,16 @@ impl KernelSctpAssociation {
                 info!("Kernel SCTP SHUTDOWN_EVENT — association closing");
                 self.established = false;
             }
-            SCTP_ASSOC_CHANGE => {
-                // struct sctp_assoc_change: sn_type(u16), sn_flags(u16),
-                // sn_length(u32), sac_state(u16), ...
-                if body.len() >= 10 {
-                    let sac_state = u16::from_ne_bytes([body[8], body[9]]);
-                    if sac_state == SCTP_COMM_LOST || sac_state == SCTP_SHUTDOWN_COMP {
-                        info!(
-                            "Kernel SCTP ASSOC_CHANGE state={} — association lost",
-                            sac_state
-                        );
-                        self.established = false;
-                    }
+            // struct sctp_assoc_change: sn_type(u16), sn_flags(u16),
+            // sn_length(u32), sac_state(u16), ...
+            SCTP_ASSOC_CHANGE if body.len() >= 10 => {
+                let sac_state = u16::from_ne_bytes([body[8], body[9]]);
+                if sac_state == SCTP_COMM_LOST || sac_state == SCTP_SHUTDOWN_COMP {
+                    info!(
+                        "Kernel SCTP ASSOC_CHANGE state={} — association lost",
+                        sac_state
+                    );
+                    self.established = false;
                 }
             }
             _ => {}
