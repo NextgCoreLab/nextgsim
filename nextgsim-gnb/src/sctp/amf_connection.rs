@@ -12,20 +12,28 @@ use tracing::{debug, info, warn};
 
 use nextgsim_common::OctetString;
 use nextgsim_sctp::{
-    MultihomeSctpAssociation, MultihomingConfig, ReceivedMessage, SctpAssociation, SctpConfig,
-    SctpError,
+    MultihomeSctpAssociation, MultihomingConfig, ReceivedMessage, SctpAssociation, SctpBackend,
+    SctpConfig, SctpError,
 };
+
+#[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+use nextgsim_sctp::KernelSctpAssociation;
 
 // ---------------------------------------------------------------------------
 // Internal association abstraction
 // ---------------------------------------------------------------------------
 
-/// Thin enum that lets `AmfConnection` hold either a plain SCTP association
-/// or a multi-homed one without boxing.  Both variants expose the same
-/// async API (`send`, `recv`, `shutdown`, `poll`, `try_recv`).
+/// Thin enum that lets `AmfConnection` hold either a plain SCTP association,
+/// a multi-homed one, or (on Linux + `kernel-sctp`) a real kernel-SCTP one,
+/// without boxing.  Every variant exposes the same async API
+/// (`send`, `recv`, `shutdown`, `poll`, `try_recv`).
 enum AssociationKind {
     Single(SctpAssociation),
     Multihome(MultihomeSctpAssociation),
+    /// Real kernel SCTP (IP proto 132). Only on Linux builds with the
+    /// `kernel-sctp` feature; selected when `SctpBackend::Kernel` is configured.
+    #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+    Kernel(KernelSctpAssociation),
 }
 
 impl AssociationKind {
@@ -33,6 +41,8 @@ impl AssociationKind {
         match self {
             Self::Single(a) => a.send(stream_id, data).await,
             Self::Multihome(a) => a.send(stream_id, data).await,
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(a) => a.send(stream_id, data).await,
         }
     }
 
@@ -40,6 +50,8 @@ impl AssociationKind {
         match self {
             Self::Single(a) => a.recv().await,
             Self::Multihome(a) => a.recv().await,
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(a) => a.recv().await,
         }
     }
 
@@ -47,6 +59,13 @@ impl AssociationKind {
         match self {
             Self::Single(a) => a.shutdown().await,
             Self::Multihome(a) => a.shutdown().await,
+            // Kernel SCTP has no async graceful-shutdown handshake to drive;
+            // `close()` performs the shutdown(2) and the fd is closed on drop.
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(a) => {
+                a.close();
+                Ok(())
+            }
         }
     }
 
@@ -54,6 +73,10 @@ impl AssociationKind {
         match self {
             Self::Single(a) => a.poll().await,
             Self::Multihome(a) => a.poll().await,
+            // Kernel SCTP is reactor-driven; there is no UDP datagram pump to
+            // service, so polling is a no-op (recv awaits readiness directly).
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(_) => Ok(()),
         }
     }
 
@@ -61,6 +84,12 @@ impl AssociationKind {
         match self {
             Self::Single(a) => a.try_recv(),
             Self::Multihome(a) => a.try_recv(),
+            // Kernel SCTP has no non-blocking buffered-read path separate from
+            // `recv`; the SCTP task's `try_recv` poll loop relies on `recv`
+            // being awaited elsewhere. Return None so the poll loop is a no-op
+            // for kernel associations (blocking `recv` is used instead).
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(_) => Ok(None),
         }
     }
 
@@ -68,6 +97,8 @@ impl AssociationKind {
         match self {
             Self::Single(a) => a.local_addr(),
             Self::Multihome(a) => a.local_addr(),
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(a) => a.local_addr(),
         }
     }
 }
@@ -201,8 +232,35 @@ impl AmfConnection {
 
         self.state = AmfConnectionState::Connecting;
 
-        let kind = if config.secondary_addresses.is_empty() {
-            // Plain single-homed SCTP association.
+        let kind = if config.sctp_config.backend == SctpBackend::Kernel {
+            // Real kernel SCTP (IP proto 132) — required to associate with a
+            // real / Open5GS AMF.  Only available on Linux builds compiled with
+            // the `kernel-sctp` feature.  Multi-homing for the kernel backend
+            // is configured via SCTP_INITMSG/bindx at the OS level and is not
+            // wired through the userspace MultihomeSctpAssociation, so we ignore
+            // `secondary_addresses` here and use the primary path.
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            {
+                let association = KernelSctpAssociation::connect(
+                    self.local_address,
+                    self.remote_address,
+                    &config.sctp_config,
+                )
+                .await?;
+                self.local_address = association.local_addr();
+                AssociationKind::Kernel(association)
+            }
+            // Misconfiguration must fail loud, never silently fall back to the
+            // userspace (sim-only) transport.
+            #[cfg(not(all(target_os = "linux", feature = "kernel-sctp")))]
+            {
+                self.state = AmfConnectionState::Closed;
+                return Err(SctpError::InvalidState(
+                    "kernel SCTP requires a Linux build with --features kernel-sctp".to_string(),
+                ));
+            }
+        } else if config.secondary_addresses.is_empty() {
+            // Plain single-homed SCTP association (userspace, sctp-proto/UDP).
             let association = SctpAssociation::connect_with_local(
                 self.local_address,
                 self.remote_address,

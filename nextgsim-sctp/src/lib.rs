@@ -55,8 +55,18 @@
 //! ```
 
 pub mod association;
+/// Kernel SCTP transport backend (Linux + `kernel-sctp` feature).
+///
+/// Speaks real SCTP (IP proto 132) via lksctp/libsctp so the gNB can associate
+/// with a real / Open5GS AMF. Gated to Linux builds with the `kernel-sctp`
+/// cargo feature; compiled out on all other targets.
+#[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+pub mod kernel;
 pub mod quic;
 pub mod server;
+
+#[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+pub use kernel::KernelSctpAssociation;
 
 // Re-export main types
 pub use association::{
@@ -76,6 +86,7 @@ pub use association::{
     PrSctpTracker,
     ReceivedMessage,
     SctpAssociation,
+    SctpBackend,
     SctpConfig,
     SctpError,
     SctpEvent,

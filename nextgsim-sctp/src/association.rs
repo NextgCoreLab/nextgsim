@@ -56,6 +56,30 @@ pub enum AssociationState {
     ShuttingDown,
 }
 
+/// Selects which SCTP transport backend an association uses.
+///
+/// The two backends are wire-distinct:
+///
+/// * [`SctpBackend::Userspace`] (default) runs the `sctp-proto` state machine
+///   over a UDP socket. It interoperates with the matching nextgcore
+///   simulator (which also uses sctp-proto-over-UDP) but **not** with a real
+///   AMF, because the bytes on the wire are UDP, not IP-proto-132 SCTP.
+/// * [`SctpBackend::Kernel`] uses the host OS kernel SCTP stack (IP proto 132)
+///   via lksctp/libsctp. This is what lets the gNB associate with a real /
+///   Open5GS AMF. It is only available on Linux builds compiled with the
+///   `kernel-sctp` cargo feature.
+///
+/// `Default` is [`SctpBackend::Userspace`] so existing behavior is unchanged
+/// unless a deployment explicitly opts in to kernel SCTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SctpBackend {
+    /// Userspace `sctp-proto` over UDP (default; sim-to-sim only).
+    #[default]
+    Userspace,
+    /// Kernel SCTP (IP proto 132) via lksctp/libsctp (Linux + `kernel-sctp`).
+    Kernel,
+}
+
 /// Configuration for SCTP association
 #[derive(Debug, Clone)]
 pub struct SctpConfig {
@@ -67,6 +91,9 @@ pub struct SctpConfig {
     pub rto_initial_ms: u64,
     pub rto_min_ms: u64,
     pub rto_max_ms: u64,
+    /// Which transport backend to use. Defaults to
+    /// [`SctpBackend::Userspace`] so all existing call sites are unchanged.
+    pub backend: SctpBackend,
 }
 
 impl Default for SctpConfig {
@@ -80,6 +107,7 @@ impl Default for SctpConfig {
             rto_initial_ms: 3000,
             rto_min_ms: 1000,
             rto_max_ms: 60000,
+            backend: SctpBackend::Userspace,
         }
     }
 }
@@ -1660,6 +1688,27 @@ mod tests {
         assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
         assert_eq!(config.max_receive_buffer_size, DEFAULT_RECEIVE_BUFFER_SIZE);
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_sctp_backend_default_is_userspace() {
+        // The default backend must remain Userspace so that selecting the
+        // default config keeps the existing sctp-proto-over-UDP behavior.
+        assert_eq!(SctpBackend::default(), SctpBackend::Userspace);
+        let config = SctpConfig::default();
+        assert_eq!(config.backend, SctpBackend::Userspace);
+    }
+
+    #[test]
+    fn test_sctp_backend_selection() {
+        // Userspace selection is the no-change path.
+        let mut config = SctpConfig::default();
+        assert_eq!(config.backend, SctpBackend::Userspace);
+
+        // Kernel can be selected explicitly; it remains distinct from Userspace.
+        config.backend = SctpBackend::Kernel;
+        assert_eq!(config.backend, SctpBackend::Kernel);
+        assert_ne!(SctpBackend::Userspace, SctpBackend::Kernel);
     }
 
     #[test]

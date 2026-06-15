@@ -10,6 +10,12 @@ description = "5G gNB (gNodeB) simulator binary"
 [lints]
 workspace = true
 
+[features]
+# Off by default. Enables the kernel-SCTP transport backend in nextgsim-sctp
+# so the gNB can associate with a real / Open5GS AMF over kernel SCTP (proto
+# 132). Only effective on Linux; requires libsctp (`-lsctp`) at link time.
+kernel-sctp = ["nextgsim-sctp/kernel-sctp"]
+
 [[bin]]
 name = "nr-gnb"
 path = "src/main.rs"
