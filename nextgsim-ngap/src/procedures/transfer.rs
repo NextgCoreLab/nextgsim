@@ -11,16 +11,15 @@
 //! - `PDUSessionResourceReleaseCommandTransfer` (SMF → gNB, decode)
 //! - `PDUSessionResourceReleaseResponseTransfer` (gNB → SMF, encode)
 //!
-//! # Wire-format note (interop with the nextgcore strict peer)
+//! # Wire-format note (interop with the nextgcore peer)
 //!
-//! The container-based request transfers (`...SetupRequestTransfer`,
-//! `...ModifyRequestTransfer`) are encoded by the core's `ogs-ngap` codec as a
-//! bare `ProtocolIE-Container` **without** the outer SEQUENCE extension bit.
-//! To stay byte-compatible we decode the generated `...ProtocolIEs` container
-//! type directly instead of the outer transfer SEQUENCE. The response-direction
-//! transfers are plain extensible SEQUENCEs whose strict X.691 APER encoding
-//! (produced by the generated types here) matches the core's decoder bit for
-//! bit.
+//! The request transfers (`...SetupRequestTransfer`, `...ModifyRequestTransfer`)
+//! are extensible SEQUENCEs (TS 38.413 §9.3.4.x, `...`), so their conformant
+//! X.691 Aligned-PER encoding begins with one outer-SEQUENCE extension-presence
+//! bit. As of ngap-04 the core's `ogs-ngap` codec emits that bit, so we decode
+//! (and encode) the full outer transfer SEQUENCE here, matching the core bit
+//! for bit. The response-direction transfers are likewise plain extensible
+//! SEQUENCEs whose encoding matches the core's decoder.
 
 use std::net::IpAddr;
 
@@ -179,12 +178,14 @@ pub struct SetupRequestTransferData {
 
 /// Decode a PDU Session Resource Setup Request Transfer.
 ///
-/// The bytes are the bare `ProtocolIE-Container` as emitted by the strict
-/// nextgcore peer (see module docs).
+/// The bytes are the full extensible outer SEQUENCE (TS 38.413 §9.3.4.1): a
+/// leading APER extension-presence bit followed by the `ProtocolIE-Container`
+/// (see module docs).
 pub fn decode_setup_request_transfer(
     bytes: &[u8],
 ) -> Result<SetupRequestTransferData, TransferError> {
-    let container: PDUSessionResourceSetupRequestTransferProtocolIEs = decode_aper(bytes)?;
+    let transfer: PDUSessionResourceSetupRequestTransfer = decode_aper(bytes)?;
+    let container = transfer.protocol_i_es;
 
     let mut ambr_dl = None;
     let mut ambr_ul = None;
@@ -330,9 +331,9 @@ pub fn encode_setup_request_transfer(
         ),
     });
 
-    Ok(encode_aper(
-        &PDUSessionResourceSetupRequestTransferProtocolIEs(entries),
-    )?)
+    Ok(encode_aper(&PDUSessionResourceSetupRequestTransfer {
+        protocol_i_es: PDUSessionResourceSetupRequestTransferProtocolIEs(entries),
+    })?)
 }
 
 // ============================================================================
@@ -506,11 +507,15 @@ pub struct ModifyRequestTransferData {
 
 /// Decode a PDU Session Resource Modify Request Transfer.
 ///
-/// The bytes are the bare `ProtocolIE-Container` (see module docs).
+/// The bytes are the full extensible outer SEQUENCE (TS 38.413 §9.3.4.3): a
+/// leading APER extension-presence bit followed by the `ProtocolIE-Container`
+/// (see module docs). The core's shared `ogs-ngap` encode/decode helper emits
+/// this bit for the Modify transfer too (ngap-04).
 pub fn decode_modify_request_transfer(
     bytes: &[u8],
 ) -> Result<ModifyRequestTransferData, TransferError> {
-    let container: PDUSessionResourceModifyRequestTransferProtocolIEs = decode_aper(bytes)?;
+    let transfer: PDUSessionResourceModifyRequestTransfer = decode_aper(bytes)?;
+    let container = transfer.protocol_i_es;
 
     let mut data = ModifyRequestTransferData::default();
 
@@ -847,8 +852,10 @@ mod tests {
                 PDUSessionType(PDUSessionType::IPV4),
             ),
         }];
-        let bytes =
-            encode_aper(&PDUSessionResourceSetupRequestTransferProtocolIEs(entries)).unwrap();
+        let bytes = encode_aper(&PDUSessionResourceSetupRequestTransfer {
+            protocol_i_es: PDUSessionResourceSetupRequestTransferProtocolIEs(entries),
+        })
+        .unwrap();
         let result = decode_setup_request_transfer(&bytes);
         assert!(matches!(
             result,
@@ -921,8 +928,10 @@ mod tests {
                 ),
             },
         ];
-        let bytes =
-            encode_aper(&PDUSessionResourceModifyRequestTransferProtocolIEs(entries)).unwrap();
+        let bytes = encode_aper(&PDUSessionResourceModifyRequestTransfer {
+            protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(entries),
+        })
+        .unwrap();
         let decoded = decode_modify_request_transfer(&bytes).unwrap();
         assert_eq!(decoded.new_ul_tunnel, Some(sample_tunnel()));
         assert_eq!(decoded.qos_flows_add_or_modify, vec![2]);
