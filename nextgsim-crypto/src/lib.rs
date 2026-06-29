@@ -6,7 +6,8 @@
 //! - ZUC (NEA3/NIA3)
 //! - ZUC-256 (256-bit security variant)
 //! - AES-based (NEA2/NIA2)
-//! - Key derivation functions
+//! - Key derivation functions (5G key hierarchy, TS 33.501 Annex A)
+//! - EAP-AKA' key derivation (RFC 9048 / TS 33.501 §6.1.3.1)
 //! - ECIES for SUPI concealment (Profile A and Profile B)
 //! - ML-KEM (CRYSTALS-Kyber) post-quantum key encapsulation
 //! - ML-DSA (CRYSTALS-Dilithium) post-quantum digital signatures
@@ -14,6 +15,7 @@
 //! - SNOW5G (next-gen stream cipher, placeholder)
 
 pub mod aes;
+pub mod eap_aka_prime;
 pub mod ecies;
 pub mod hybrid;
 pub mod kdf;
