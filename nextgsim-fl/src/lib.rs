@@ -1803,8 +1803,15 @@ impl RenyiDPTracker {
         }
     }
 
-    /// Records a Gaussian mechanism with noise multiplier sigma
+    /// Records a Gaussian mechanism with noise multiplier sigma.
+    ///
     /// RDP guarantee at order alpha: `epsilon_alpha` = alpha / (2 * sigma^2)
+    /// (Mironov 2017, full-batch Gaussian mechanism).
+    ///
+    /// NOTE: **no privacy amplification by subsampling is modeled** — this is the
+    /// full-batch RDP bound, so the reported epsilon is a conservative
+    /// (upper-bound) estimate. Pass the effective noise multiplier for the
+    /// full-batch case. Subsampled DP-SGD would yield a tighter (smaller) epsilon.
     pub fn record_gaussian(&mut self, sigma: f32) {
         for (i, &alpha) in self.orders.iter().enumerate() {
             let epsilon_alpha = alpha / (2.0 * sigma * sigma);
@@ -1860,8 +1867,14 @@ impl ZCDPTracker {
         }
     }
 
-    /// Records a Gaussian mechanism with noise multiplier sigma
-    /// zCDP guarantee: rho = 1 / (2 * sigma^2)
+    /// Records a Gaussian mechanism with noise multiplier sigma.
+    ///
+    /// zCDP guarantee: rho = 1 / (2 * sigma^2) (Bun & Steinke 2016).
+    ///
+    /// NOTE: **no privacy amplification by subsampling is modeled** — this is the
+    /// full-batch zCDP bound, so the reported epsilon is a conservative
+    /// (upper-bound) estimate. Pass the effective noise multiplier for the
+    /// full-batch case.
     pub fn record_gaussian(&mut self, sigma: f32) {
         self.rho += 1.0 / (2.0 * sigma * sigma);
     }
