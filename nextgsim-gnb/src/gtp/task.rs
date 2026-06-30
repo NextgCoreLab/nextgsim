@@ -470,22 +470,27 @@ impl GtpTask {
     /// Handle downlink G-PDU (user data from UPF)
     async fn handle_downlink_gpdu(&self, header: &GtpHeader) {
         match self.tunnel_manager.decapsulate_downlink(header) {
-            Ok((ue_id, psi, payload)) => {
-                // Forward to RLS task for delivery to UE
+            Ok(dl) => {
+                // amfg-09: the DL QFI/RQI from the PDU Session Container drive
+                // DRB/QoS-flow selection toward the UE. Until the SDAP/DRB layer
+                // is wired (amfg-04/AS), the session is selected by PSI and the
+                // QoS metadata is surfaced for diagnostics / reflective QoS.
                 let msg = RlsMessage::DownlinkData {
-                    ue_id: ue_id as i32,
-                    psi: psi as i32,
-                    pdu: payload.to_vec().into(),
+                    ue_id: dl.ue_id as i32,
+                    psi: dl.psi as i32,
+                    pdu: dl.payload.to_vec().into(),
                 };
 
                 if let Err(e) = self.task_base.rls_tx.send(msg).await {
                     error!("Failed to send downlink data to RLS: {}", e);
                 } else {
                     debug!(
-                        "Forwarded downlink data: ue_id={}, psi={}, {} bytes",
-                        ue_id,
-                        psi,
-                        payload.len()
+                        "Forwarded downlink data: ue_id={}, psi={}, qfi={:?}, rqi={}, {} bytes",
+                        dl.ue_id,
+                        dl.psi,
+                        dl.qfi,
+                        dl.rqi,
+                        dl.payload.len()
                     );
                 }
             }
