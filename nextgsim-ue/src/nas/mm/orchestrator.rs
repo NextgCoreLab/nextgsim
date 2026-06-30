@@ -727,6 +727,13 @@ impl MmOrchestrator {
             if let Some(ref nid) = self.identity.snpn_nid {
                 ct.snpn_nid = Some(nid.clone());
             }
+            // ue-05: "UE determined PLMN with disaster condition" is a permitted
+            // cleartext IE (TS 24.501 §4.4.6), so when MINT disaster roaming is
+            // active it stays in the unprotected initial request rather than
+            // being deferred to the Security Mode Complete container.
+            if self.identity.disaster_roaming {
+                ct.disaster_roaming = true;
+            }
             let mut ct_bytes = Vec::new();
             ct.encode(&mut ct_bytes);
             ct_bytes
@@ -2524,6 +2531,63 @@ mod tests {
         assert!(
             !outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
             "NSSCI=not-changed alone must not send Registration Complete"
+        );
+    }
+
+    /// Locate a contiguous byte subsequence; returns the start index if found.
+    fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|w| w == needle)
+    }
+
+    #[test]
+    fn test_cleartext_registration_omits_disaster_ie_by_default() {
+        // ue-05 baseline: with disaster roaming inactive, the unprotected
+        // initial Registration Request carries no disaster-condition IE.
+        let mut orch = new_orch();
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        let wire = first_sent_pdu(&outs).to_vec();
+        // Not security-protected yet, so the wire is the raw cleartext request.
+        assert_eq!(wire[1], 0x00, "initial request must be plain (SHT 0)");
+        let decoded = RegistrationRequest::decode(&mut &wire[3..]).unwrap();
+        assert!(!decoded.disaster_roaming);
+        // MINT disaster-roaming IE (IEI 0xA7, TLV) must be absent.
+        assert!(
+            find_subseq(&wire, &[0xA7, 0x01, 0x01]).is_none(),
+            "no disaster-condition IE expected by default"
+        );
+    }
+
+    #[test]
+    fn test_cleartext_registration_includes_disaster_ie_when_active() {
+        // ue-05: when MINT disaster roaming is active the "UE determined PLMN
+        // with disaster condition" IE is a permitted cleartext IE (TS 24.501
+        // §4.4.6) and must appear in the unprotected initial request, which
+        // must remain decodable.
+        let mut id = test_identity();
+        id.disaster_roaming = true;
+        let mut orch = MmOrchestrator::new(id);
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        let wire = first_sent_pdu(&outs).to_vec();
+        assert_eq!(wire[1], 0x00, "initial request must be plain (SHT 0)");
+        let decoded = RegistrationRequest::decode(&mut &wire[3..]).unwrap();
+        assert!(decoded.disaster_roaming, "decoded request must carry the IE");
+        let ie_pos = find_subseq(&wire, &[0xA7, 0x01, 0x01])
+            .expect("disaster-condition IE must be present in the cleartext request");
+
+        // "Byte-identical to today" guarantee: the ONLY difference from the
+        // disaster-inactive cleartext request is the inserted 3-byte IE.
+        let mut baseline = new_orch();
+        let baseline_wire = first_sent_pdu(
+            &baseline.start_registration(RegistrationType::InitialRegistration),
+        )
+        .to_vec();
+        let mut without_ie = wire.clone();
+        without_ie.drain(ie_pos..ie_pos + 3);
+        assert_eq!(
+            without_ie, baseline_wire,
+            "disaster IE must be the sole addition to the cleartext request"
         );
     }
 
