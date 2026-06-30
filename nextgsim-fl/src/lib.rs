@@ -36,7 +36,7 @@
 //! |  +---------------------------------------------------------------+   |
 //! |  +---------------------------------------------------------------+   |
 //! |  | Aggregation Server                                             |   |
-//! |  |  - FedAvg, FedProx, SecAgg                                    |   |
+//! |  |  - FedAvg, FedProx, MaskedSumDemo (masking demo, not SecAgg) |   |
 //! |  |  - Async FL with staleness weighting                          |   |
 //! |  |  - Byzantine-tolerant (Krum, trimmed mean)                    |   |
 //! |  +---------------------------------------------------------------+   |
@@ -52,7 +52,8 @@
 //! |  | Communication                                                  |   |
 //! |  |  - Top-k gradient compression                                  |   |
 //! |  |  - 1-bit and ternary quantization                              |   |
-//! |  |  - Secure aggregation (x25519 key exchange)                    |   |
+//! |  |  - Pairwise additive masking demo (x25519-derived masks) -    |   |
+//! |  |    simulation only, NOT server-blind secure aggregation       |   |
 //! |  +---------------------------------------------------------------+   |
 //! +-----------------------------------------------------------------------+
 //! ```
@@ -122,8 +123,15 @@ pub enum AggregationAlgorithm {
     FedAvg,
     /// Federated Proximal (`FedProx`) - Li et al. 2020
     FedProx,
-    /// Secure Aggregation - Bonawitz et al. 2017
-    SecAgg,
+    /// Pairwise-masked sum demonstration of Bonawitz-style mask cancellation.
+    ///
+    /// SECURITY: this is **NOT** a privacy-preserving secure-aggregation
+    /// protocol. In this simulation the aggregator mints every participant's
+    /// keypair and applies the masks itself over plaintext it already received,
+    /// so it provides **zero privacy against the aggregator** and is not the
+    /// Bonawitz et al. 2017 protocol. It only illustrates that antisymmetric
+    /// pairwise masks cancel in the summation.
+    MaskedSumDemo,
     /// Krum: selects the single update closest to its neighbours (Byzantine-robust)
     Krum { num_byzantine: usize },
     /// Multi-Krum: averages the top-`m` Krum selections (Byzantine-robust)
@@ -406,12 +414,26 @@ pub fn topk_decompress(compressed: &CompressedGradient) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Secure Aggregation (Bonawitz et al.)
+// Pairwise-masked sum demonstration (NOT Bonawitz secure aggregation)
 // ---------------------------------------------------------------------------
+//
+// SECURITY / TRUST MODEL: The Bonawitz et al. 2017 secure-aggregation protocol
+// keeps every participant's secret on the client; the server only ever sees
+// masked vectors and never holds secrets or plaintext. This module INVERTS that
+// trust model for simulation convenience: `register_participant` mints each
+// participant's x25519 keypair on the server, and `secagg_aggregate_internal`
+// applies the masks server-side over plaintext gradients the server already
+// received. It therefore provides NO privacy against the aggregator and is NOT
+// the Bonawitz protocol. It exists only to demonstrate that antisymmetric
+// pairwise masks cancel in the summation. Do not use as a privacy mechanism.
 
-/// A participant's keypair and public key for the `SecAgg` protocol.
+/// A participant's keypair and public key for the masking demo.
 ///
 /// Uses x25519 Diffie-Hellman for pairwise key agreement.
+///
+/// SECURITY: in this simulation the server (the [`FederatedAggregator`]) holds
+/// these secrets and applies the masks itself, so this is NOT honest-but-curious
+/// server safe and is NOT the Bonawitz et al. 2017 secure-aggregation protocol.
 pub struct SecAggParticipant {
     /// Participant identifier
     pub id: String,
@@ -431,7 +453,7 @@ impl std::fmt::Debug for SecAggParticipant {
 }
 
 impl SecAggParticipant {
-    /// Creates a new `SecAgg` participant with a fresh x25519 keypair.
+    /// Creates a new masking-demo participant with a fresh x25519 keypair.
     pub fn new(id: impl Into<String>) -> Self {
         let mut rng = rand::thread_rng();
         let secret = x25519_dalek::StaticSecret::random_from_rng(&mut rng);
@@ -515,9 +537,12 @@ impl SecAggParticipant {
     }
 }
 
-/// Server-side secure aggregation: simply sums masked updates. Because the
-/// pairwise masks cancel (`mask(i,j) + mask(j,i) = 0`), the result is the
-/// true (weighted) sum of the original gradients.
+/// Server-side masked sum: simply sums masked updates. Because the pairwise
+/// masks cancel (`mask(i,j) + mask(j,i) = 0`), the result is the true (weighted)
+/// sum of the original gradients.
+///
+/// SECURITY: this is the server side of the masking demo, NOT server-blind
+/// secure aggregation — see the module note above.
 pub fn secagg_aggregate(masked_updates: &[Vec<f32>], weights: &[f32]) -> Vec<f32> {
     if masked_updates.is_empty() {
         return Vec::new();
@@ -558,7 +583,10 @@ fn sample_gaussian<R: Rng>(rng: &mut R, sigma: f32) -> f32 {
 // FederatedAggregator (synchronous)
 // ---------------------------------------------------------------------------
 
-/// FL aggregator supporting `FedAvg`, `FedProx`, `SecAgg`, and Byzantine-robust algorithms.
+/// FL aggregator supporting `FedAvg`, `FedProx`, the `MaskedSumDemo`
+/// pairwise-masking demonstration (see [`AggregationAlgorithm::MaskedSumDemo`];
+/// the demo is NOT server-blind secure aggregation), and Byzantine-robust
+/// algorithms.
 #[derive(Debug)]
 pub struct FederatedAggregator {
     /// Current global model
@@ -583,7 +611,9 @@ pub struct FederatedAggregator {
     round_timeout_secs: u64,
     /// `FedProx` configuration (used when algorithm == `FedProx`)
     fedprox_config: FedProxConfig,
-    /// `SecAgg` participants (`participant_id` -> `SecAggParticipant`)
+    /// Masking-demo participants (`participant_id` -> `SecAggParticipant`).
+    /// SECURITY: the server holds these per-participant secrets, which is why
+    /// `MaskedSumDemo` is a demo and not server-blind secure aggregation.
     secagg_participants: HashMap<String, SecAggParticipant>,
 }
 
@@ -649,8 +679,9 @@ impl FederatedAggregator {
 
     /// Registers a participant.
     ///
-    /// When using `SecAgg`, this also generates an x25519 keypair for the
-    /// participant.
+    /// When using `MaskedSumDemo`, this also generates an x25519 keypair for the
+    /// participant. SECURITY: the server mints and holds this secret, which is
+    /// why the masking demo provides no privacy against the aggregator.
     pub fn register_participant(&mut self, id: impl Into<String>, num_samples: u64) {
         let id = id.into();
         self.participants.insert(
@@ -663,13 +694,13 @@ impl FederatedAggregator {
                 is_active: true,
             },
         );
-        if self.algorithm == AggregationAlgorithm::SecAgg {
+        if self.algorithm == AggregationAlgorithm::MaskedSumDemo {
             let sa_participant = SecAggParticipant::new(&id);
             self.secagg_participants.insert(id, sa_participant);
         }
     }
 
-    /// Returns the public keys of all registered `SecAgg` participants.
+    /// Returns the public keys of all registered masking-demo participants.
     pub fn secagg_public_keys(&self) -> Vec<(String, x25519_dalek::PublicKey)> {
         self.secagg_participants
             .values()
@@ -813,8 +844,9 @@ impl FederatedAggregator {
     /// - **`FedProx`**: FedAvg-style weighted average with an additional
     ///   proximal correction term that penalises deviation from the global
     ///   model.
-    /// - **`SecAgg`**: secure aggregation with pairwise masking (the masks
-    ///   cancel in the sum, yielding the true aggregate).
+    /// - **`MaskedSumDemo`**: pairwise-masking demonstration (the masks cancel
+    ///   in the sum, yielding the true aggregate). NOT server-blind secure
+    ///   aggregation — the server holds the secrets and sees plaintext.
     pub fn aggregate(&mut self) -> Result<AggregatedModel, String> {
         // First, check conditions and extract needed data
         let (num_updates, round_num, updates_clone, total_samples, avg_loss) = {
@@ -851,7 +883,7 @@ impl FederatedAggregator {
         let aggregated = match self.algorithm {
             AggregationAlgorithm::FedAvg => self.fedavg_aggregate(&updates_clone),
             AggregationAlgorithm::FedProx => self.fedprox_aggregate(&updates_clone),
-            AggregationAlgorithm::SecAgg => self.secagg_aggregate_internal(&updates_clone),
+            AggregationAlgorithm::MaskedSumDemo => self.secagg_aggregate_internal(&updates_clone),
             AggregationAlgorithm::Krum { num_byzantine } => {
                 // Extract gradients in a deterministic (sorted-key) order.
                 let mut keys: Vec<&String> = updates_clone.keys().collect();
@@ -999,13 +1031,16 @@ impl FederatedAggregator {
             .collect()
     }
 
-    /// `SecAgg` aggregation using pairwise x25519 masking.
+    /// `MaskedSumDemo` aggregation using pairwise x25519 masking.
     ///
-    /// Each participant masks their gradient with pairwise random masks
-    /// derived from DH shared secrets. The masks are antisymmetric
-    /// (`mask(i,j) = -mask(j,i)`), so they cancel when summed. The server
-    /// performs a simple weighted sum of the masked gradients to recover the
-    /// true aggregate.
+    /// Each gradient is masked with pairwise random masks derived from DH
+    /// shared secrets. The masks are antisymmetric (`mask(i,j) = -mask(j,i)`),
+    /// so they cancel when summed; the server then recovers the true aggregate.
+    ///
+    /// SECURITY: this is NOT the Bonawitz et al. 2017 secure-aggregation
+    /// protocol. The aggregator mints every keypair (see `register_participant`)
+    /// and applies the masks here, server-side, over plaintext gradients it
+    /// already received — so it provides no privacy against the aggregator.
     fn secagg_aggregate_internal(&self, updates: &HashMap<String, ModelUpdate>) -> Vec<f32> {
         if updates.is_empty() {
             return Vec::new();
@@ -1021,7 +1056,7 @@ impl FederatedAggregator {
             let weight = update.num_samples as f32 / total_samples as f32;
             weights.push(weight);
 
-            // If this participant has a SecAgg identity, mask the gradient
+            // If this participant has a masking-demo identity, mask the gradient
             if let Some(sa_participant) = self.secagg_participants.get(&update.participant_id) {
                 let masked = sa_participant.mask_gradient(&update.gradients, &all_keys);
                 masked_updates.push(masked);
@@ -2488,7 +2523,7 @@ mod tests {
 
     #[test]
     fn test_secagg_masks_cancel() {
-        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::SecAgg, 2);
+        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::MaskedSumDemo, 2);
 
         aggregator.initialize_model(vec![0.0; 10]);
         aggregator.register_participant("ue-1", 100);
@@ -2525,9 +2560,32 @@ mod tests {
         for &w in &model.weights {
             assert!(
                 (w - 0.2).abs() < 0.01,
-                "SecAgg result should match FedAvg: got {w}, expected ~0.2"
+                "MaskedSumDemo result should match FedAvg: got {w}, expected ~0.2"
             );
         }
+    }
+
+    /// Codifies the limitation of `MaskedSumDemo`: the aggregator (server) mints
+    /// and holds every participant's key material, so it is NOT server-blind
+    /// secure aggregation (Bonawitz et al. 2017) — it provides no privacy
+    /// against the aggregator. If this assertion ever flips, the demo would have
+    /// to be re-reviewed against the secure-aggregation trust model.
+    #[test]
+    fn secagg_demo_is_not_blind() {
+        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::MaskedSumDemo, 2);
+        aggregator.register_participant("ue-1", 100);
+        aggregator.register_participant("ue-2", 100);
+
+        // The server itself holds public keys it minted locally for every
+        // participant (and, in `secagg_participants`, the matching secrets).
+        // In a real Bonawitz protocol the server would never possess these.
+        let server_held_keys = aggregator.secagg_public_keys();
+        assert_eq!(
+            server_held_keys.len(),
+            2,
+            "server mints/holds participant key material in the masking demo \
+             (inverted trust model) — this is not server-blind SecAgg"
+        );
     }
 
     #[test]
