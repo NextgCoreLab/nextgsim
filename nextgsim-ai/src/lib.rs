@@ -45,12 +45,23 @@
 //! let output = engine.infer(&input)?;
 //! ```
 //!
-//! # 3GPP Compliance
+//! # Design alignment (non-conformant)
 //!
-//! This implementation supports the AI/ML framework requirements from:
+//! This crate provides inference infrastructure conceptually aligned with the
+//! AI/ML frameworks described in (not conformant to, not tested against):
 //! - 3GPP TS 23.288: Network Data Analytics Function (NWDAF)
 //! - 3GPP TR 23.700-80: Study on AI/ML for 5G System
 //! - 3GPP TS 23.558: Edge Computing
+//!
+//! No `.onnx` model ships; no analytics procedure of these specs is implemented.
+//!
+//! # TR 22.870 mapping
+//!
+//! Prototypes the AI/ML-service use cases of TR 22.870 (e.g. §6.12 6G System
+//! supporting AI model training service, §6.25 AI/ML model training and
+//! inference). TR 22.870 is a Stage-1 study; these are potential requirements
+//! with no Stage-3 wire spec — this crate is a research prototype, not a
+//! conformant implementation.
 
 pub mod config;
 pub mod error;
