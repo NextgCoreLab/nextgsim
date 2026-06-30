@@ -5,6 +5,16 @@
 //! - Joint source-channel coding
 //! - Semantic importance weighting
 //!
+//! # TR 22.870 mapping
+//!
+//! TR 22.870 does not define a dedicated semantic-communication use case;
+//! semantic communication appears only illustratively in the study body. This
+//! crate therefore prototypes, at the concept level, the AI-service use-case
+//! family it most naturally supports — TR 22.870 §6.24 (distributed 6G network
+//! for AI computing) and §6.25 (AI/ML model training and inference). TR 22.870
+//! is a Stage-1 study; these are potential requirements with no Stage-3 wire
+//! spec — this crate is a research prototype, not a conformant implementation.
+//!
 //! # Architecture
 //!
 //! ```text

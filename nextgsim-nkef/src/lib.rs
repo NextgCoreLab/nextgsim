@@ -7,6 +7,13 @@
 //! - Temporal knowledge tracking
 //! - Event-driven real-time updates
 //!
+//! # TR 22.870 mapping
+//!
+//! Prototypes TR 22.870 §6.13 (network knowledge as part of Retrieval Augmented
+//! Generation). TR 22.870 is a Stage-1 study; these are potential requirements
+//! with no Stage-3 wire spec — this crate is a research prototype, not a
+//! conformant implementation.
+//!
 //! # Architecture
 //!
 //! ```text
