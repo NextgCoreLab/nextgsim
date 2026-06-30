@@ -1,7 +1,8 @@
 //! Cryptographic algorithms for nextgsim
 //!
 //! Implements 5G/6G security algorithms:
-//! - Milenage (5G-AKA)
+//! - Milenage (5G-AKA, TS 35.206)
+//! - TUAK (alternative 5G-AKA set on Keccak, TS 35.231)
 //! - SNOW3G (NEA1/NIA1)
 //! - ZUC (NEA3/NIA3)
 //! - ZUC-256 (256-bit security variant)
@@ -26,5 +27,6 @@ pub mod pqc_kem;
 pub mod pqc_sign;
 pub mod snow3g;
 pub mod snow5g;
+pub mod tuak;
 pub mod zuc;
 pub mod zuc256;
