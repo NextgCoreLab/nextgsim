@@ -1266,6 +1266,12 @@ impl MmOrchestrator {
     // Security mode control (TS 24.501 Section 5.4.2, TS 33.501 6.7.2)
     // ========================================================================
 
+    /// Whether the UE is operating in an emergency-services context, in which
+    /// the network is permitted to select NIA0 / NEA0 (TS 33.501 5.5.2).
+    fn in_emergency_context(&self) -> bool {
+        self.pending_reg_type == RegistrationType::EmergencyRegistration
+    }
+
     /// Handle a Security Mode Command received with a "new security
     /// context" security header (SHT 0x03/0x04). The NAS-MAC is verified
     /// with the *new* keys before the context is activated.
@@ -1318,6 +1324,14 @@ impl MmOrchestrator {
             );
             return self.send_security_mode_reject(MmCause::UeSecurityCapabilitiesMismatch);
         };
+        // TS 33.501 5.5.2 / TS 24.501 5.4.2.3: NIA0 (null integrity) may be
+        // selected only for an emergency-services / unauthenticated UE. Outside an
+        // emergency context an SMC selecting NIA0 is out-of-capability and must be
+        // rejected (otherwise it would silently drop NAS integrity protection).
+        if integ_alg == IntegrityAlgorithm::Nia0 && !self.in_emergency_context() {
+            warn!("SMC selected NIA0 (null integrity) outside an emergency context: rejecting");
+            return self.send_security_mode_reject(MmCause::UeSecurityCapabilitiesMismatch);
+        }
         if !alg_in_capability(self.identity.ea_cap, cipher_alg as u8)
             || (integ_alg != IntegrityAlgorithm::Nia0
                 && !alg_in_capability(self.identity.ia_cap, integ_alg as u8))
@@ -2354,6 +2368,37 @@ mod tests {
         assert!(!first.is_empty(), "first delivery must be processed");
         let second = orch.handle_downlink(&accept);
         assert!(second.is_empty(), "replayed downlink PDU must be discarded");
+    }
+
+    #[test]
+    fn test_smc_nia0_rejected_outside_emergency() {
+        // ue-04: an SMC selecting NIA0 (null integrity) in a normal registration
+        // is rejected and does not activate the context (TS 33.501 5.5.2).
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let auth_pdu = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        orch.handle_downlink(&auth_pdu);
+        let smc = build_protected_smc(&orch, 2, 0, None); // NEA2 / NIA0
+        let outs = orch.handle_downlink(&smc);
+        let resp = first_sent_pdu(&outs);
+        assert_eq!(resp[2], u8::from(MmMessageType::SecurityModeReject));
+        assert!(!orch.security_context().is_active());
+    }
+
+    #[test]
+    fn test_smc_nia0_accepted_in_emergency() {
+        // ue-04: NIA0 is permitted during an emergency registration.
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::EmergencyRegistration);
+        let auth_pdu = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        orch.handle_downlink(&auth_pdu);
+        let smc = build_protected_smc(&orch, 2, 0, None); // NEA2 / NIA0
+        let outs = orch.handle_downlink(&smc);
+        let resp = first_sent_pdu(&outs);
+        // The SMC Complete is returned protected with the new context (SHT 0x04);
+        // an active context proves the NIA0 selection was accepted.
+        assert_eq!(resp[1], 0x04, "SMC Complete must use SHT 0x04");
+        assert!(orch.security_context().is_active());
     }
 
     #[test]
