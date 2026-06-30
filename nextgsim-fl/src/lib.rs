@@ -57,6 +57,18 @@
 //! |  +---------------------------------------------------------------+   |
 //! +-----------------------------------------------------------------------+
 //! ```
+//!
+//! # Standards positioning
+//!
+//! This crate is the federated-learning **training engine/process**, not a
+//! TS 28.105 management-services (MnS) producer. In the TS 28.105 AI/ML
+//! training-management information model the engine maps to the *process* that
+//! runs under an `MLTrainingFunction` (§7.3a.1.2.1); the IOCs that a producer
+//! exposes above it are `MLTrainingRequest` (§7.3a.1.2.2),
+//! `MLTrainingProcess` (§7.3a.1.2.3) and `MLTrainingReport` (§7.3a.1.2.4).
+//! The thin [`mns_adapter`] module maps this engine's round/metrics onto those
+//! IOCs' field concepts for illustration only — it is NOT a conformant
+//! YANG/JSON MnS schema.
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -76,6 +88,9 @@ pub mod semantic_integration;
 
 /// Integration with Service Hosting Environment for FL workload placement
 pub mod she_integration;
+
+/// Conceptual adapter onto the TS 28.105 AI/ML training-management IOCs
+pub mod mns_adapter;
 
 // ---------------------------------------------------------------------------
 // Core data structures
