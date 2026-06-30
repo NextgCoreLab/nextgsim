@@ -1069,6 +1069,13 @@ impl FederatedAggregator {
     /// protocol. The aggregator mints every keypair (see `register_participant`)
     /// and applies the masks here, server-side, over plaintext gradients it
     /// already received — so it provides no privacy against the aggregator.
+    ///
+    /// Weighting invariant: each client's sample weight is folded into the value
+    /// **before** masking (we mask `w_i * gradient_i`), and the server then takes
+    /// a *plain unweighted sum* and divides by `sum_i w_i`. This keeps the mask
+    /// coefficient at 1 on both sides of every pair, so `mask(i,j) + mask(j,i)`
+    /// cancels exactly even under unequal sample weights. (A weighted sum of
+    /// unweighted-masked values does NOT cancel: it leaves `(w_i - w_j)*mask`.)
     fn secagg_aggregate_internal(&self, updates: &HashMap<String, ModelUpdate>) -> Vec<f32> {
         if updates.is_empty() {
             return Vec::new();
@@ -1076,25 +1083,33 @@ impl FederatedAggregator {
 
         let all_keys = self.secagg_public_keys();
         let total_samples: u64 = updates.values().map(|u| u.num_samples).sum();
+        if total_samples == 0 {
+            return Vec::new();
+        }
 
         let mut masked_updates = Vec::new();
-        let mut weights = Vec::new();
 
         for update in updates.values() {
-            let weight = update.num_samples as f32 / total_samples as f32;
-            weights.push(weight);
+            // Fold the sample weight into the value BEFORE masking.
+            let weight = update.num_samples as f32;
+            let weighted: Vec<f32> = update.gradients.iter().map(|g| g * weight).collect();
 
-            // If this participant has a masking-demo identity, mask the gradient
+            // If this participant has a masking-demo identity, mask the
+            // weight-folded gradient; the unweighted pairwise masks then cancel.
             if let Some(sa_participant) = self.secagg_participants.get(&update.participant_id) {
-                let masked = sa_participant.mask_gradient(&update.gradients, &all_keys);
-                masked_updates.push(masked);
+                masked_updates.push(sa_participant.mask_gradient(&weighted, &all_keys));
             } else {
                 // Fallback: unmasked (should not happen in a proper setup)
-                masked_updates.push(update.gradients.clone());
+                masked_updates.push(weighted);
             }
         }
 
-        secagg_aggregate(&masked_updates, &weights)
+        // Plain unweighted sum (coefficient 1 each) so masks cancel exactly,
+        // then divide by the total weight to recover the weighted average.
+        let ones = vec![1.0f32; masked_updates.len()];
+        let summed = secagg_aggregate(&masked_updates, &ones);
+        let inv_total = 1.0 / total_samples as f32;
+        summed.iter().map(|v| v * inv_total).collect()
     }
 
     /// Gets the current global model
@@ -2636,6 +2651,58 @@ mod tests {
 
         // Determinism: same secret -> same mask.
         assert_eq!(m1, demo_mask_from_secret(&s1, 16));
+    }
+
+    /// Under UNEQUAL sample weights, the pairwise masks must still cancel so the
+    /// recovered aggregate equals the plaintext weighted average. The previous
+    /// implementation masked unweighted gradients then took a weighted sum,
+    /// leaving a residual `(w_i - w_j)*mask` whenever weights differed.
+    #[test]
+    fn masked_sum_cancels_with_unequal_weights() {
+        let samples = [10u64, 50, 200];
+        let grads = [
+            vec![1.0f32, -2.0, 0.5, 3.0],
+            vec![3.0f32, 4.0, -1.0, 0.25],
+            vec![-5.0f32, 6.0, 2.0, -0.75],
+        ];
+        let dim = grads[0].len();
+
+        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::MaskedSumDemo, 3);
+        aggregator.initialize_model(vec![0.0; dim]);
+        aggregator.register_participant("ue-1", samples[0]);
+        aggregator.register_participant("ue-2", samples[1]);
+        aggregator.register_participant("ue-3", samples[2]);
+        aggregator.start_round().expect("start round");
+
+        for (idx, g) in grads.iter().enumerate() {
+            aggregator
+                .submit_update(ModelUpdate {
+                    participant_id: format!("ue-{}", idx + 1),
+                    base_version: 1,
+                    gradients: g.clone(),
+                    num_samples: samples[idx],
+                    loss: 0.1,
+                    timestamp_ms: timestamp_now(),
+                })
+                .expect("submit");
+        }
+
+        let model = aggregator.aggregate().expect("aggregate");
+
+        let total: f32 = samples.iter().map(|&s| s as f32).sum();
+        for k in 0..dim {
+            let expected: f32 = samples
+                .iter()
+                .zip(grads.iter())
+                .map(|(&s, g)| s as f32 * g[k])
+                .sum::<f32>()
+                / total;
+            assert!(
+                (model.weights[k] - expected).abs() < 1e-3,
+                "weighted masked sum failed at coord {k}: got {}, expected {expected}",
+                model.weights[k]
+            );
+        }
     }
 
     #[test]
