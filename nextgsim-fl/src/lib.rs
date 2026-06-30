@@ -832,12 +832,26 @@ impl FederatedAggregator {
         Ok(())
     }
 
-    /// Applies differential privacy to an update using the Gaussian mechanism.
+    /// Applies differential privacy to an update using the Gaussian mechanism,
+    /// drawing noise from the thread-local RNG.
     ///
     /// 1. Clip the gradient to `clipping_threshold` (L2 norm).
     /// 2. Add per-parameter Gaussian noise N(0, sigma^2) where
     ///    sigma = `clipping_threshold` * `noise_multiplier`.
+    ///
+    /// Thin wrapper over [`apply_dp_with_rng`](Self::apply_dp_with_rng); use that
+    /// directly with a seeded RNG for reproducible DP tests.
     fn apply_dp(&self, update: &ModelUpdate) -> ModelUpdate {
+        let mut rng = rand::thread_rng();
+        self.apply_dp_with_rng(update, &mut rng)
+    }
+
+    /// Applies the Gaussian-mechanism DP step using a caller-supplied RNG.
+    ///
+    /// Ordering is clip-then-noise (the noise is added to the clipped gradient).
+    /// Passing a seeded RNG (e.g. `StdRng::seed_from_u64`) makes the noised
+    /// output deterministic, which lets DP behaviour be unit-tested reproducibly.
+    pub fn apply_dp_with_rng<R: Rng>(&self, update: &ModelUpdate, rng: &mut R) -> ModelUpdate {
         let mut processed = update.clone();
 
         // Clip gradients (L2 norm clipping)
@@ -857,9 +871,8 @@ impl FederatedAggregator {
         // Add proper Gaussian noise: N(0, sigma^2)
         // sigma = clipping_threshold * noise_multiplier
         let sigma = self.dp_config.clipping_threshold * self.dp_config.noise_multiplier;
-        let mut rng = rand::thread_rng();
         for g in &mut processed.gradients {
-            *g += sample_gaussian(&mut rng, sigma);
+            *g += sample_gaussian(rng, sigma);
         }
 
         processed
@@ -2479,6 +2492,52 @@ mod tests {
             processed.gradients[0].abs() < 1.5,
             "Clipped gradient should be near 1.0, got {}",
             processed.gradients[0]
+        );
+    }
+
+    #[test]
+    fn test_apply_dp_with_seeded_rng_is_deterministic() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2).with_dp_config(
+            DifferentialPrivacyConfig {
+                enabled: true,
+                noise_multiplier: 0.5,
+                clipping_threshold: 1.0,
+                target_epsilon: 8.0,
+                target_delta: 1e-5,
+            },
+        );
+
+        // A gradient already within the clip threshold so we isolate the noise.
+        let update = ModelUpdate {
+            participant_id: "ue-1".to_string(),
+            base_version: 1,
+            gradients: vec![0.1, -0.2, 0.05, 0.0],
+            num_samples: 100,
+            loss: 0.5,
+            timestamp_ms: timestamp_now(),
+        };
+
+        // Same seed -> identical noised output (reproducible).
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let out_a = aggregator.apply_dp_with_rng(&update, &mut rng_a);
+        let mut rng_b = StdRng::seed_from_u64(42);
+        let out_b = aggregator.apply_dp_with_rng(&update, &mut rng_b);
+        assert_eq!(out_a.gradients, out_b.gradients, "seeded DP must be deterministic");
+
+        // Noise was actually added (clip-then-Gaussian ordering applied).
+        assert_ne!(
+            out_a.gradients, update.gradients,
+            "DP must perturb the gradient"
+        );
+
+        // A different seed yields a different draw.
+        let mut rng_c = StdRng::seed_from_u64(43);
+        let out_c = aggregator.apply_dp_with_rng(&update, &mut rng_c);
+        assert_ne!(
+            out_a.gradients, out_c.gradients,
+            "different seed should give different noise"
         );
     }
 
