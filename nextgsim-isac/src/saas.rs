@@ -41,6 +41,122 @@ impl std::fmt::Display for SensingServiceType {
     }
 }
 
+/// Identity and consent state of a sensing-service consumer.
+///
+/// Carries the caller identity, an explicit user/operator consent flag and the
+/// set of sensing service types the consumer is authorized for. Modeled after
+/// TR 22.837 §7.1.2 "Configuration and authorization" — the TR pervasively
+/// frames sensing as "subject to user consent, regulation and operator's
+/// policy … authorized". This is a research-grade model, not a wire format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SensingConsumer {
+    /// Consumer identity (e.g. application / third-party id).
+    pub consumer_id: String,
+    /// Whether user/operator consent has been granted to this consumer.
+    pub consent_granted: bool,
+    /// Sensing service types this consumer is authorized for (its scopes).
+    pub scopes: Vec<SensingServiceType>,
+}
+
+impl SensingConsumer {
+    /// Creates a new consumer with the given identity, consent flag and scopes.
+    pub fn new(
+        consumer_id: impl Into<String>,
+        consent_granted: bool,
+        scopes: Vec<SensingServiceType>,
+    ) -> Self {
+        Self {
+            consumer_id: consumer_id.into(),
+            consent_granted,
+            scopes,
+        }
+    }
+
+    /// An anonymous consumer with no consent and no scopes.
+    ///
+    /// Used as a backwards-compatible default for callers that do not supply an
+    /// identity. Under a [`ConsentRequiredPolicy`] such a consumer is denied.
+    pub fn anonymous() -> Self {
+        Self::default()
+    }
+}
+
+/// Outcome of an authorization decision by a [`SensingPolicy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDecision {
+    /// The request is authorized.
+    Allow,
+    /// The request is denied, with a human-readable reason.
+    Deny {
+        /// Reason the request was denied (surfaced as the 403 error message).
+        reason: String,
+    },
+}
+
+/// Authorization decision point for sensing requests (TR 22.837 §7.1.2/§7.1.4-2).
+///
+/// A pluggable policy that decides whether a [`SensingConsumer`] may perform a
+/// given [`SensingApiRequest`]. The TR repeats authorization/consent/operator-
+/// policy gating on nearly every requirement; this trait makes that concept
+/// present and testable. It is NOT a 3GPP-defined interface.
+pub trait SensingPolicy: std::fmt::Debug + Send + Sync {
+    /// Returns the authorization decision for `consumer` performing `req`.
+    fn authorize(&self, consumer: &SensingConsumer, req: &SensingApiRequest) -> PolicyDecision;
+}
+
+/// Research stub policy that authorizes every request.
+///
+/// This is the default wired by [`SensingAsAService::new`]. It exists so the
+/// authorization concept is present without changing existing behavior; it is
+/// explicitly NOT a real access-control policy.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultAllowPolicy;
+
+impl SensingPolicy for DefaultAllowPolicy {
+    fn authorize(&self, _consumer: &SensingConsumer, _req: &SensingApiRequest) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+}
+
+/// Policy that requires explicit consent and that the requested service type is
+/// within the consumer's authorized scopes (TR 22.837 §7.1.2 / §7.1.4-2).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConsentRequiredPolicy;
+
+impl SensingPolicy for ConsentRequiredPolicy {
+    fn authorize(&self, consumer: &SensingConsumer, req: &SensingApiRequest) -> PolicyDecision {
+        if !consumer.consent_granted {
+            return PolicyDecision::Deny {
+                reason: "consent not granted".to_string(),
+            };
+        }
+        if let Some(service_type) = req.service_type() {
+            if !consumer.scopes.contains(&service_type) {
+                return PolicyDecision::Deny {
+                    reason: format!("service type {service_type} not in authorized scopes"),
+                };
+            }
+        }
+        PolicyDecision::Allow
+    }
+}
+
+/// Lifecycle status of a sensing subscription.
+///
+/// Models TR 22.837 §7.1.2 CPR 7.1.2-2's authorize/**revoke** concept: an
+/// authorized subscription may be suspended or revoked subject to operator
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SubscriptionStatus {
+    /// Active and delivering results.
+    #[default]
+    Active,
+    /// Temporarily suspended (authorization retained).
+    Suspended,
+    /// Revoked (authorization withdrawn); queries are rejected.
+    Revoked,
+}
+
 /// Sensing service subscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensingSubscription {
@@ -58,6 +174,15 @@ pub struct SensingSubscription {
     pub callback_url: Option<String>,
     /// Creation timestamp (milliseconds since epoch)
     pub created_at_ms: u64,
+    /// Identity of the consumer that created this subscription.
+    #[serde(default)]
+    pub consumer_id: Option<String>,
+    /// Whether consent was granted at subscription time.
+    #[serde(default)]
+    pub consent_granted: bool,
+    /// Lifecycle status (TR 22.837 §7.1.2-2 authorize/revoke).
+    #[serde(default)]
+    pub status: SubscriptionStatus,
 }
 
 /// Geographic area for sensing
@@ -110,6 +235,9 @@ impl Default for SensingQos {
 pub enum SensingApiRequest {
     /// Subscribe to a sensing service
     Subscribe {
+        /// Identity/consent of the requesting consumer (authorization input).
+        #[serde(default)]
+        consumer: SensingConsumer,
         service_type: SensingServiceType,
         target_area: Option<GeographicArea>,
         qos: SensingQos,
@@ -119,6 +247,9 @@ pub enum SensingApiRequest {
     Unsubscribe { subscription_id: u64 },
     /// Query current sensing data
     Query {
+        /// Identity/consent of the requesting consumer (authorization input).
+        #[serde(default)]
+        consumer: SensingConsumer,
         service_type: SensingServiceType,
         target_area: Option<GeographicArea>,
     },
@@ -127,6 +258,33 @@ pub enum SensingApiRequest {
         subscription_id: u64,
         qos: SensingQos,
     },
+    /// Revoke a subscription's authorization (TR 22.837 §7.1.2-2).
+    Revoke { subscription_id: u64 },
+    /// Re-activate a suspended subscription.
+    Activate { subscription_id: u64 },
+    /// Suspend an active subscription without revoking it.
+    Deactivate { subscription_id: u64 },
+}
+
+impl SensingApiRequest {
+    /// Returns the consumer identity for requests that carry one
+    /// (`Subscribe`/`Query`), used at the authorization decision point.
+    pub fn consumer(&self) -> Option<&SensingConsumer> {
+        match self {
+            SensingApiRequest::Subscribe { consumer, .. }
+            | SensingApiRequest::Query { consumer, .. } => Some(consumer),
+            _ => None,
+        }
+    }
+
+    /// Returns the requested service type for requests that target one.
+    pub fn service_type(&self) -> Option<SensingServiceType> {
+        match self {
+            SensingApiRequest::Subscribe { service_type, .. }
+            | SensingApiRequest::Query { service_type, .. } => Some(*service_type),
+            _ => None,
+        }
+    }
 }
 
 /// Sensing API response
@@ -143,6 +301,11 @@ pub enum SensingApiResponse {
     QueryResult { results: Vec<SensingResult> },
     /// `QoS` updated
     QosUpdated { subscription_id: u64 },
+    /// Subscription lifecycle status changed (revoke/activate/deactivate).
+    StatusUpdated {
+        subscription_id: u64,
+        status: SubscriptionStatus,
+    },
     /// Error
     Error { code: u32, message: String },
 }
@@ -177,23 +340,43 @@ pub struct SensingAsAService {
     cached_results: HashMap<SensingServiceType, Vec<SensingResult>>,
     /// Maximum cache size per service type
     max_cache_size: usize,
+    /// Authorization decision point for Subscribe/Query (TR 22.837 §7.1.2).
+    policy: Box<dyn SensingPolicy>,
 }
 
 impl SensingAsAService {
-    /// Creates a new `SaaS` manager
+    /// Creates a new `SaaS` manager wired with the [`DefaultAllowPolicy`].
     pub fn new() -> Self {
+        Self::with_policy(Box::new(DefaultAllowPolicy))
+    }
+
+    /// Creates a new `SaaS` manager with a custom authorization policy.
+    pub fn with_policy(policy: Box<dyn SensingPolicy>) -> Self {
         Self {
             subscriptions: HashMap::new(),
             next_subscription_id: 1,
             cached_results: HashMap::new(),
             max_cache_size: 1000,
+            policy,
         }
     }
 
     /// Handles an API request
     pub fn handle_request(&mut self, request: SensingApiRequest) -> SensingApiResponse {
+        // Authorization decision point (TR 22.837 §7.1.2 / §7.1.4-2): gate the
+        // consumer-bearing requests (Subscribe/Query) through the policy.
+        if let Some(consumer) = request.consumer() {
+            if let PolicyDecision::Deny { reason } = self.policy.authorize(consumer, &request) {
+                return SensingApiResponse::Error {
+                    code: 403,
+                    message: reason,
+                };
+            }
+        }
+
         match request {
             SensingApiRequest::Subscribe {
+                consumer,
                 service_type,
                 target_area,
                 qos,
@@ -213,6 +396,10 @@ impl SensingAsAService {
                         .duration_since(std::time::UNIX_EPOCH)
                         .expect("value expected")
                         .as_millis() as u64,
+                    consumer_id: (!consumer.consumer_id.is_empty())
+                        .then_some(consumer.consumer_id),
+                    consent_granted: consumer.consent_granted,
+                    status: SubscriptionStatus::Active,
                 };
 
                 self.subscriptions.insert(subscription_id, subscription);
@@ -227,9 +414,23 @@ impl SensingAsAService {
                 SensingApiResponse::Unsubscribed { subscription_id }
             }
             SensingApiRequest::Query {
+                consumer,
                 service_type,
                 target_area,
             } => {
+                // Reject if this consumer holds a revoked subscription for the
+                // requested service type (TR 22.837 §7.1.2-2 revoke).
+                let revoked = self.subscriptions.values().any(|s| {
+                    s.service_type == service_type
+                        && s.status == SubscriptionStatus::Revoked
+                        && s.consumer_id.as_deref() == Some(consumer.consumer_id.as_str())
+                });
+                if revoked {
+                    return SensingApiResponse::Error {
+                        code: 403,
+                        message: "subscription revoked".to_string(),
+                    };
+                }
                 let results = self.query_sensing_data(service_type, target_area.as_ref());
                 SensingApiResponse::QueryResult { results }
             }
@@ -246,6 +447,35 @@ impl SensingAsAService {
                         message: "Subscription not found".to_string(),
                     }
                 }
+            }
+            SensingApiRequest::Revoke { subscription_id } => {
+                self.set_subscription_status(subscription_id, SubscriptionStatus::Revoked)
+            }
+            SensingApiRequest::Activate { subscription_id } => {
+                self.set_subscription_status(subscription_id, SubscriptionStatus::Active)
+            }
+            SensingApiRequest::Deactivate { subscription_id } => {
+                self.set_subscription_status(subscription_id, SubscriptionStatus::Suspended)
+            }
+        }
+    }
+
+    /// Sets a subscription's lifecycle status (TR 22.837 §7.1.2-2).
+    fn set_subscription_status(
+        &mut self,
+        subscription_id: u64,
+        status: SubscriptionStatus,
+    ) -> SensingApiResponse {
+        if let Some(sub) = self.subscriptions.get_mut(&subscription_id) {
+            sub.status = status;
+            SensingApiResponse::StatusUpdated {
+                subscription_id,
+                status,
+            }
+        } else {
+            SensingApiResponse::Error {
+                code: 404,
+                message: "Subscription not found".to_string(),
             }
         }
     }
@@ -344,6 +574,7 @@ mod tests {
         let mut saas = SensingAsAService::new();
 
         let request = SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::anonymous(),
             service_type: SensingServiceType::Positioning,
             target_area: None,
             qos: SensingQos::default(),
@@ -372,6 +603,7 @@ mod tests {
 
         // Subscribe first
         let request = SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::anonymous(),
             service_type: SensingServiceType::Positioning,
             target_area: None,
             qos: SensingQos::default(),
@@ -412,6 +644,7 @@ mod tests {
 
         // Query
         let request = SensingApiRequest::Query {
+            consumer: SensingConsumer::anonymous(),
             service_type: SensingServiceType::Positioning,
             target_area: None,
         };
@@ -455,6 +688,7 @@ mod tests {
         // Query with area filter
         let area = GeographicArea::new(Vector3::new(0.0, 0.0, 0.0), 50.0);
         let request = SensingApiRequest::Query {
+            consumer: SensingConsumer::anonymous(),
             service_type: SensingServiceType::Positioning,
             target_area: Some(area),
         };
@@ -476,6 +710,7 @@ mod tests {
 
         // Subscribe
         let request = SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::anonymous(),
             service_type: SensingServiceType::Positioning,
             target_area: None,
             qos: SensingQos::default(),
@@ -507,5 +742,141 @@ mod tests {
 
         let sub = saas.subscriptions.get(&1).unwrap();
         assert!((sub.qos.accuracy_m - 0.5).abs() < 0.01);
+    }
+
+    // ----- isac-02: authorization / consent / operator-policy gating -----
+
+    #[test]
+    fn test_default_allow_policy_allows() {
+        let mut saas = SensingAsAService::new();
+        let request = SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::anonymous(),
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+        };
+        assert!(matches!(
+            saas.handle_request(request),
+            SensingApiResponse::Subscribed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_consent_required_policy_denies_without_consent() {
+        let mut saas = SensingAsAService::with_policy(Box::new(ConsentRequiredPolicy));
+        // consent_granted = false
+        let request = SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::new("app-1", false, vec![SensingServiceType::Positioning]),
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+        };
+        match saas.handle_request(request) {
+            SensingApiResponse::Error { code, .. } => assert_eq!(code, 403),
+            other => panic!("expected 403 Error, got {other:?}"),
+        }
+        assert_eq!(saas.subscription_count(), 0);
+    }
+
+    #[test]
+    fn test_consent_required_policy_allows_with_consent_and_scope() {
+        let mut saas = SensingAsAService::with_policy(Box::new(ConsentRequiredPolicy));
+        let request = SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::new("app-1", true, vec![SensingServiceType::Positioning]),
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+        };
+        assert!(matches!(
+            saas.handle_request(request),
+            SensingApiResponse::Subscribed { .. }
+        ));
+        assert_eq!(saas.subscription_count(), 1);
+    }
+
+    #[test]
+    fn test_consent_required_policy_denies_out_of_scope() {
+        let mut saas = SensingAsAService::with_policy(Box::new(ConsentRequiredPolicy));
+        // Consent granted but ObjectDetection not in scopes.
+        let request = SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::new("app-1", true, vec![SensingServiceType::Positioning]),
+            service_type: SensingServiceType::ObjectDetection,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+        };
+        match saas.handle_request(request) {
+            SensingApiResponse::Error { code, .. } => assert_eq!(code, 403),
+            other => panic!("expected 403 Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_revoked_subscription_rejected_on_query() {
+        let mut saas = SensingAsAService::new();
+        let consumer = SensingConsumer::new("app-1", true, vec![SensingServiceType::Positioning]);
+
+        // Subscribe.
+        let sub_id = match saas.handle_request(SensingApiRequest::Subscribe {
+            consumer: consumer.clone(),
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+        }) {
+            SensingApiResponse::Subscribed {
+                subscription_id, ..
+            } => subscription_id,
+            other => panic!("expected Subscribed, got {other:?}"),
+        };
+
+        // Query before revoke succeeds.
+        assert!(matches!(
+            saas.handle_request(SensingApiRequest::Query {
+                consumer: consumer.clone(),
+                service_type: SensingServiceType::Positioning,
+                target_area: None,
+            }),
+            SensingApiResponse::QueryResult { .. }
+        ));
+
+        // Revoke.
+        match saas.handle_request(SensingApiRequest::Revoke {
+            subscription_id: sub_id,
+        }) {
+            SensingApiResponse::StatusUpdated { status, .. } => {
+                assert_eq!(status, SubscriptionStatus::Revoked)
+            }
+            other => panic!("expected StatusUpdated, got {other:?}"),
+        }
+
+        // Query after revoke is rejected.
+        match saas.handle_request(SensingApiRequest::Query {
+            consumer,
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+        }) {
+            SensingApiResponse::Error { code, .. } => assert_eq!(code, 403),
+            other => panic!("expected 403 Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_subscription_persists_consumer_and_status() {
+        let mut saas = SensingAsAService::new();
+        saas.handle_request(SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::new("app-7", true, vec![SensingServiceType::Positioning]),
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+        });
+        let sub = saas.subscriptions.get(&1).unwrap();
+        assert_eq!(sub.consumer_id.as_deref(), Some("app-7"));
+        assert!(sub.consent_granted);
+        assert_eq!(sub.status, SubscriptionStatus::Active);
     }
 }
