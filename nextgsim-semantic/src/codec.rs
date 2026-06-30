@@ -425,6 +425,18 @@ pub fn task_to_id(task: SemanticTask) -> u32 {
 mod tests {
     use super::*;
 
+    /// Honesty guard: the codec must stay labelled as falling back to
+    /// mean-pooling when no model is loaded, so the caveat cannot be silently
+    /// dropped. If this fails, restore the label rather than deleting the test.
+    #[test]
+    fn honesty_mean_pooling_fallback_label_present() {
+        let src = include_str!("codec.rs");
+        assert!(
+            src.contains("mean-pooling fallback"),
+            "the mean-pooling fallback label must remain present"
+        );
+    }
+
     #[test]
     fn test_neural_encoder_fallback() {
         let encoder = NeuralEncoder::new(32).expect("Failed to create encoder");

@@ -230,6 +230,18 @@ fn hash_sign(term: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Honesty guard: the neural embedder must stay labelled as a mock so the
+    /// caveat cannot be silently dropped. If this fails, restore the label
+    /// rather than deleting the test.
+    #[test]
+    fn honesty_mock_embedder_label_present() {
+        let src = include_str!("embedder.rs");
+        assert!(
+            src.contains("mock_neural_embedding"),
+            "the mock neural-embedder label must remain present"
+        );
+    }
+
     #[test]
     fn test_tokenize() {
         let tokens = tokenize("Hello, World! This is a test.");

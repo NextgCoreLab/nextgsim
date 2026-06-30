@@ -364,6 +364,20 @@ impl SecurityManager {
 mod tests {
     use super::*;
 
+    /// Honesty guard: the attestation verification must stay labelled as
+    /// simplified/non-production so the caveat cannot be silently dropped (it is
+    /// consistent with the crate-header 'research model, non-conformant' note).
+    /// If this fails, restore the caveat rather than deleting the test.
+    #[test]
+    fn honesty_attestation_caveat_present() {
+        let src = include_str!("security.rs");
+        assert!(
+            src.contains("Simplified attestation")
+                && src.contains("In production, this would verify signatures"),
+            "the simplified-attestation caveat must remain present"
+        );
+    }
+
     #[test]
     fn test_tee_type_display() {
         assert_eq!(format!("{}", TeeType::IntelSgx), "Intel SGX");
