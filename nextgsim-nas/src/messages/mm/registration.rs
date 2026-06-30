@@ -1198,6 +1198,8 @@ mod registration_accept_iei {
     pub const MICO_INDICATION: u8 = 0xB;
     /// Network slicing indication
     pub const NETWORK_SLICING_INDICATION: u8 = 0x9;
+    /// Pending NSSAI (TS 24.501 Table 8.2.7.1.1, IEI 0x39, TLV, 9.11.3.37)
+    pub const PENDING_NSSAI: u8 = 0x39;
     /// Service area list
     pub const SERVICE_AREA_LIST: u8 = 0x27;
     /// T3512 value
@@ -1269,6 +1271,13 @@ pub struct RegistrationAccept {
     pub nssai_inclusion_mode: Option<NssaiInclusionMode>,
     /// Negotiated DRX parameters (optional, Type 4, IEI 0x51)
     pub negotiated_drx_parameters: Option<u8>,
+    /// Pending NSSAI (optional, Type 4, IEI 0x39, TS 24.501 9.11.3.37)
+    pub pending_nssai: Option<Vec<u8>>,
+    /// Network slicing subscription change indication (NSSCI bit, octet 1 bit 1)
+    /// of the Network slicing indication IE (Type 1, IEI nibble 0x9,
+    /// TS 24.501 9.11.3.36). `Some(true)` => "Network slicing subscription
+    /// changed".
+    pub network_slicing_subscription_change: Option<bool>,
     /// MICO indication (optional, Type 1, IEI 0xB)
     pub mico_indication: Option<IeMicoIndication>,
     /// LADN information (optional, Type 6, IEI 0x79)
@@ -1318,7 +1327,11 @@ impl RegistrationAccept {
                     continue;
                 }
                 0x9 => {
-                    // Network slicing indication
+                    // Network slicing indication (Type 1, TS 24.501 9.11.3.36).
+                    // octet 1 bit 1 = NSSCI (Network slicing subscription change
+                    // indication): 1 => "subscription changed". Bit 2 (DCNI) is
+                    // spare in the network-to-UE direction.
+                    msg.network_slicing_subscription_change = Some((iei & 0x01) != 0);
                     buf.advance(1);
                     continue;
                 }
@@ -1500,6 +1513,20 @@ impl RegistrationAccept {
                         buf.advance(len - 1);
                     }
                 }
+                registration_accept_iei::PENDING_NSSAI => {
+                    // Pending NSSAI (Type 4 TLV, TS 24.501 9.11.3.37)
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.pending_nssai = Some(data);
+                }
                 registration_accept_iei::LADN_INFORMATION => {
                     buf.advance(1);
                     if buf.remaining() < 2 {
@@ -1655,6 +1682,21 @@ impl RegistrationAccept {
             buf.put_u8(registration_accept_iei::NEGOTIATED_DRX_PARAMETERS);
             buf.put_u8(1);
             buf.put_u8(drx);
+        }
+
+        if let Some(ref nssai) = self.pending_nssai {
+            buf.put_u8(registration_accept_iei::PENDING_NSSAI);
+            buf.put_u8(nssai.len() as u8);
+            buf.put_slice(nssai);
+        }
+
+        if let Some(changed) = self.network_slicing_subscription_change {
+            // Network slicing indication (Type 1, TS 24.501 9.11.3.36):
+            // high nibble = IEI, octet 1 bit 1 = NSSCI.
+            buf.put_u8(
+                (registration_accept_iei::NETWORK_SLICING_INDICATION << 4)
+                    | (changed as u8 & 0x01),
+            );
         }
 
         if let Some(ref mico) = self.mico_indication {

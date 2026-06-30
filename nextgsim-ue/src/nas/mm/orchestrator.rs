@@ -858,12 +858,15 @@ impl MmOrchestrator {
 
         let mut outs = Vec::new();
         // TS 24.501 5.5.1.2.4: the UE acknowledges with Registration Complete
-        // whenever the Accept assigns a new 5G-GUTI OR carries negotiated DRX
-        // parameters (the spec also lists pending NSSAI and network-slicing-
-        // subscription-change, which are not yet decoded here). The AMF runs
-        // T3550 awaiting the acknowledgement, so gating the Complete on the GUTI
-        // alone would leave that timer to expire on a DRX-only Accept.
-        let needs_ack = acc.guti.is_some() || acc.negotiated_drx_parameters.is_some();
+        // whenever the Accept assigns a new 5G-GUTI, carries a Pending NSSAI IE,
+        // a Network slicing indication IE with the subscription-change indication
+        // set to "changed", or negotiated DRX parameters. The AMF runs T3550
+        // awaiting the acknowledgement, so gating the Complete on the GUTI alone
+        // would leave that timer to expire on any of these other Accepts.
+        let needs_ack = acc.guti.is_some()
+            || acc.pending_nssai.is_some()
+            || acc.network_slicing_subscription_change == Some(true)
+            || acc.negotiated_drx_parameters.is_some();
         if let Some(guti) = acc.guti {
             info!(
                 "Registration Accept assigned a new 5G-GUTI ({} bytes)",
@@ -2442,6 +2445,85 @@ mod tests {
         assert!(
             !outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
             "Accept without an ack-triggering IE must not send Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_registration_complete_on_pending_nssai_without_guti() {
+        // ue-03-tail: a Registration Accept carrying a Pending NSSAI IE
+        // (TS 24.501 Table 8.2.7.1.1, IEI 0x39) but no new 5G-GUTI must still
+        // trigger Registration Complete (TS 24.501 5.5.1.2.4).
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        // One S-NSSAI (length 2: length-of-SST + SST)
+        acc.pending_nssai = Some(vec![0x02, 0x01, 0x01]);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        // The IE survives a round-trip (correct IEI framing, trailing IEs intact)
+        let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
+        assert_eq!(decoded.pending_nssai, Some(vec![0x02, 0x01, 0x01]));
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "Pending-NSSAI Accept must trigger Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_registration_complete_on_network_slicing_subscription_change() {
+        // ue-03-tail: a Network slicing indication IE with NSSCI = "changed"
+        // (TS 24.501 9.11.3.36, IEI nibble 0x9, octet-1 bit 1) triggers
+        // Registration Complete (TS 24.501 5.5.1.2.4 item a).
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        acc.network_slicing_subscription_change = Some(true);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        // 0x91 = IEI nibble 0x9 in the high nibble + NSSCI bit set
+        assert!(plain.contains(&0x91), "encoded NSSCI octet must be 0x91");
+        let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
+        assert_eq!(decoded.network_slicing_subscription_change, Some(true));
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "NSSCI=changed Accept must trigger Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_no_registration_complete_on_slicing_indication_not_changed() {
+        // ue-03-tail: a Network slicing indication IE present but with NSSCI = 0
+        // ("not changed") and no other ack-triggering IE must NOT send a
+        // Registration Complete.
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        acc.network_slicing_subscription_change = Some(false);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
+        assert_eq!(decoded.network_slicing_subscription_change, Some(false));
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            !outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "NSSCI=not-changed alone must not send Registration Complete"
         );
     }
 
