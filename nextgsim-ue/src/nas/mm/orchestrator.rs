@@ -1605,6 +1605,15 @@ impl MmOrchestrator {
         };
 
         if sht == SecurityHeaderType::NotProtected {
+            // TS 24.501 4.4.4.2 (last paragraph): once a secure exchange of NAS
+            // messages has been established, the UE shall discard any NAS
+            // signalling message received without integrity protection.
+            if self.sec.is_active() {
+                warn!(
+                    "Unprotected NAS message received after security activation: discarded (TS 24.501 4.4.4.2)"
+                );
+                return Vec::new();
+            }
             return self.handle_plain(raw.to_vec(), false);
         }
 
@@ -1689,6 +1698,17 @@ impl MmOrchestrator {
         };
         debug!("5GMM message {:?} (protected={protected})", msg_type);
 
+        // TS 24.501 4.4.4.2: before a secure exchange is established, only a
+        // closed allow-list of messages may be processed without integrity
+        // protection. Anything else (e.g. REGISTRATION ACCEPT, SERVICE ACCEPT,
+        // CONFIGURATION UPDATE COMMAND) is discarded when received in the clear.
+        if !protected && !self.allowed_when_plain(msg_type, &plain) {
+            warn!(
+                "Plain (unprotected) {msg_type:?} not on the TS 24.501 4.4.4.2 allow-list: discarded"
+            );
+            return Vec::new();
+        }
+
         match msg_type {
             MmMessageType::AuthenticationRequest => self.handle_authentication_request(&plain),
             MmMessageType::AuthenticationReject => self.handle_authentication_reject(),
@@ -1704,6 +1724,41 @@ impl MmOrchestrator {
                 Vec::new()
             }
             _ => vec![MmOutput::NotHandled(plain)],
+        }
+    }
+
+    /// TS 24.501 4.4.4.2 allow-list: messages the UE may process when received
+    /// without integrity protection (before a secure exchange is established).
+    ///
+    /// `plain` is the inner 5GMM message (`plain[2]` = message type, `plain[3]`
+    /// = the first mandatory IE octet — the 5GMM cause for reject messages, or
+    /// the 5GS identity type for IDENTITY REQUEST).
+    fn allowed_when_plain(&self, msg_type: MmMessageType, plain: &[u8]) -> bool {
+        match msg_type {
+            // Authentication exchange runs before security is established.
+            MmMessageType::AuthenticationRequest
+            | MmMessageType::AuthenticationReject
+            | MmMessageType::AuthenticationResult => true,
+            // IDENTITY REQUEST is acceptable in the clear only when it requests
+            // the SUCI (5GS identity type 0b001); any other requested identity
+            // would leak a persistent identifier and must be protected.
+            MmMessageType::IdentityRequest => {
+                plain.get(3).is_some_and(|b| b & 0x0F == 0x01)
+            }
+            // A UE-originating DEREGISTRATION ACCEPT (non switch-off) is allowed.
+            MmMessageType::DeregistrationAcceptUeOriginating => true,
+            // REGISTRATION REJECT is processable in the clear only if its 5GMM
+            // cause is not #76/#78/#81/#82 (those drive persistent forbidden-list
+            // / SNPN state and must be integrity protected).
+            MmMessageType::RegistrationReject => {
+                !matches!(plain.get(3), Some(76 | 78 | 81 | 82))
+            }
+            // SERVICE REJECT is processable in the clear only if its 5GMM cause
+            // is not #76/#78.
+            MmMessageType::ServiceReject => !matches!(plain.get(3), Some(76 | 78)),
+            // Everything else (REGISTRATION ACCEPT, SERVICE ACCEPT, CONFIGURATION
+            // UPDATE COMMAND, SECURITY MODE COMMAND, ...) must be protected.
+            _ => false,
         }
     }
 
@@ -2214,6 +2269,67 @@ mod tests {
             orch.state().mm_substate(),
             MmSubState::DeregisteredPlmnSearch
         );
+    }
+
+    // ---- TS 24.501 4.4.4.2 downlink integrity-protection gating (ue-01) ----
+
+    #[test]
+    fn test_plain_registration_accept_discarded() {
+        // REGISTRATION ACCEPT is not on the 4.4.4.2 plain allow-list; received
+        // unprotected it must be discarded (no Registration Complete emitted).
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let plain_accept = build_registration_accept_pdu(true);
+        let outs = orch.handle_downlink(&plain_accept);
+        assert!(outs.is_empty(), "plain RegistrationAccept must be discarded");
+    }
+
+    #[test]
+    fn test_plain_registration_reject_cause76_discarded() {
+        // 4.4.4.2: a plain REGISTRATION REJECT with 5GMM cause #76 is discarded.
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let pdu = build_registration_reject_pdu(MmCause::NotAuthorizedForCag, None);
+        assert_eq!(pdu[3], 76, "cause octet should be #76");
+        let outs = orch.handle_downlink(&pdu);
+        assert!(outs.is_empty(), "plain RegistrationReject #76 must be discarded");
+        assert!(!outs.contains(&MmOutput::PlmnSearchNeeded));
+    }
+
+    #[test]
+    fn test_plain_registration_reject_cause11_processed() {
+        // 4.4.4.2: cause #11 (PLMN not allowed) is not in the excluded set, so a
+        // plain REGISTRATION REJECT carrying it is still processed.
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let pdu = build_registration_reject_pdu(MmCause::PlmnNotAllowed, None);
+        assert_eq!(pdu[3], 11);
+        let outs = orch.handle_downlink(&pdu);
+        assert!(outs.contains(&MmOutput::PlmnSearchNeeded));
+    }
+
+    #[test]
+    fn test_unprotected_discarded_after_security_activation() {
+        // 4.4.4.2 (last paragraph): after a secure exchange is established, ANY
+        // unprotected NAS message is discarded - even one otherwise on the plain
+        // allow-list (e.g. AUTHENTICATION REQUEST).
+        let mut orch = establish_security_context();
+        let plain_auth = build_auth_request_pdu([0, 0, 0, 0, 0, 2], [0x80, 0x00]);
+        assert!(orch.handle_downlink(&plain_auth).is_empty());
+        let plain_accept = build_registration_accept_pdu(true);
+        assert!(orch.handle_downlink(&plain_accept).is_empty());
+    }
+
+    #[test]
+    fn test_plain_auth_request_still_processed() {
+        // 4.4.4.2: AUTHENTICATION REQUEST stays processable before security is
+        // established (it is on the plain allow-list).
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let auth = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        let outs = orch.handle_downlink(&auth);
+        let resp = first_sent_pdu(&outs);
+        assert_eq!(resp[2], u8::from(MmMessageType::AuthenticationResponse));
     }
 
     #[test]
