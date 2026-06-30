@@ -857,14 +857,21 @@ impl MmOrchestrator {
         }
 
         let mut outs = Vec::new();
+        // TS 24.501 5.5.1.2.4: the UE acknowledges with Registration Complete
+        // whenever the Accept assigns a new 5G-GUTI OR carries negotiated DRX
+        // parameters (the spec also lists pending NSSAI and network-slicing-
+        // subscription-change, which are not yet decoded here). The AMF runs
+        // T3550 awaiting the acknowledgement, so gating the Complete on the GUTI
+        // alone would leave that timer to expire on a DRX-only Accept.
+        let needs_ack = acc.guti.is_some() || acc.negotiated_drx_parameters.is_some();
         if let Some(guti) = acc.guti {
             info!(
                 "Registration Accept assigned a new 5G-GUTI ({} bytes)",
                 guti.data.len()
             );
             self.stored_guti = Some(guti);
-            // TS 24.501 5.5.1.2.4: a new 5G-GUTI assignment must be
-            // acknowledged with Registration Complete (the AMF runs T3550)
+        }
+        if needs_ack {
             let mut complete = Vec::new();
             RegistrationComplete::new().encode(&mut complete);
             let pdu = self.protect_if_active(complete);
@@ -2399,6 +2406,43 @@ mod tests {
         // an active context proves the NIA0 selection was accepted.
         assert_eq!(resp[1], 0x04, "SMC Complete must use SHT 0x04");
         assert!(orch.security_context().is_active());
+    }
+
+    #[test]
+    fn test_registration_complete_on_drx_without_guti() {
+        // ue-03: a Registration Accept that carries negotiated DRX parameters
+        // but assigns no new 5G-GUTI still triggers Registration Complete
+        // (TS 24.501 5.5.1.2.4); previously only a GUTI did.
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        acc.negotiated_drx_parameters = Some(0x01);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "DRX-only Accept must trigger Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_no_registration_complete_without_ack_ie() {
+        // ue-03: an Accept with neither a new GUTI nor any ack-triggering IE
+        // sends no Registration Complete.
+        let mut orch = establish_security_context();
+        let plain = build_registration_accept_pdu(false); // no GUTI, no DRX
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            !outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "Accept without an ack-triggering IE must not send Registration Complete"
+        );
     }
 
     #[test]
