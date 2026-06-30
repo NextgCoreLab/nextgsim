@@ -30,7 +30,12 @@ use super::amf_context::{AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{NgapPduSession, NgapUeContext};
 
-use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu};
+use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu, NGAP_PDU};
+use nextgsim_ngap::procedures::error_indication::{
+    encode_error_indication, error_indication_abstract_syntax_error,
+    error_indication_transfer_syntax_error, CriticalityDiagnosticsInfo, ErrorIndicationParams,
+    TriggeringMessageValue,
+};
 use nextgsim_ngap::procedures::handover::{
     decode_handover_command, decode_handover_preparation_failure, decode_handover_request,
     encode_handover_notify, encode_handover_request_acknowledge, encode_handover_required,
@@ -1677,11 +1682,10 @@ impl NgapTask {
                     self.handle_initial_context_setup_request(client_id, stream, ics_req)
                         .await;
                 } else {
-                    debug!(
-                        "Received operational NGAP PDU on stream {} (not yet handled, first bytes: {:02x?})",
-                        stream,
-                        &pdu_bytes[..pdu_bytes.len().min(16)]
-                    );
+                    // amfg-05: this operational PDU could not be routed to a
+                    // handler. Per TS 38.413 §8.7.5 / §10, answer with an NGAP
+                    // Error Indication rather than silently dropping it.
+                    self.handle_unroutable_pdu(client_id, pdu_bytes).await;
                 }
             }
             _ => {
@@ -2221,6 +2225,48 @@ impl NgapTask {
     // Helper Methods
     // ========================================================================
 
+    /// Handles an operational NGAP PDU that could not be routed to a handler.
+    ///
+    /// Per TS 38.413 §8.7.5 (Error Indication) and §10 (handling of
+    /// unknown/erroneous messages) the NG-RAN node answers with an Error
+    /// Indication. We distinguish two cases:
+    ///   * the PDU did not APER-decode at all → transfer-syntax-error (no
+    ///     CriticalityDiagnostics, since the procedure code is unknown);
+    ///   * the PDU decoded but no handler exists for the procedure →
+    ///     abstract-syntax-error (ignore-and-notify) with CriticalityDiagnostics
+    ///     carrying the offending procedure code.
+    async fn handle_unroutable_pdu(&self, amf_id: i32, pdu_bytes: &[u8]) {
+        let params = unroutable_error_params(pdu_bytes);
+        match decode_ngap_pdu(pdu_bytes) {
+            Ok(_) => warn!(
+                "Unsupported NGAP procedure from AMF[{}]; sending Error Indication \
+                 (abstract syntax error)",
+                amf_id
+            ),
+            Err(e) => warn!(
+                "Undecodable NGAP PDU from AMF[{}] ({}); sending Error Indication \
+                 (transfer syntax error)",
+                amf_id, e
+            ),
+        }
+        self.send_error_indication(amf_id, params).await;
+    }
+
+    /// Encodes and sends an NGAP Error Indication to the AMF.
+    ///
+    /// Error Indication is non-UE-associated here (the offending PDU could not
+    /// be tied to a known UE context), so it is sent on stream 0.
+    async fn send_error_indication(&self, amf_id: i32, params: ErrorIndicationParams) {
+        match encode_error_indication(&params) {
+            Ok(data) => {
+                self.send_ngap_non_ue(amf_id, 0, data).await;
+            }
+            Err(e) => {
+                error!("Failed to encode Error Indication: {}", e);
+            }
+        }
+    }
+
     /// Sends an NGAP PDU for non-UE-associated signaling (stream 0)
     async fn send_ngap_non_ue(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
         let msg = SctpMessage::SendMessage {
@@ -2460,6 +2506,47 @@ impl NgapTask {
                 "Cannot leave MBS session: TMGI {:02x?} not found",
                 tmgi_bytes
             );
+        }
+    }
+}
+
+/// Builds the Error Indication parameters for an NGAP PDU that the gNB could
+/// not route (TS 38.413 §8.7.5 / §10).
+///
+/// * undecodable PDU → transfer-syntax-error (no CriticalityDiagnostics);
+/// * decoded but unsupported procedure → abstract-syntax-error
+///   (ignore-and-notify) with CriticalityDiagnostics carrying the procedure
+///   code and triggering-message kind.
+fn unroutable_error_params(pdu_bytes: &[u8]) -> ErrorIndicationParams {
+    match decode_ngap_pdu(pdu_bytes) {
+        Ok(pdu) => {
+            let (proc_code, trigger) = ngap_procedure_code(&pdu);
+            let mut p = error_indication_abstract_syntax_error(None, None, false);
+            p.criticality_diagnostics = Some(CriticalityDiagnosticsInfo {
+                procedure_code: Some(proc_code),
+                triggering_message: Some(trigger),
+                procedure_criticality: None,
+                ies_criticality_diagnostics: Vec::new(),
+            });
+            p
+        }
+        Err(_) => error_indication_transfer_syntax_error(None, None),
+    }
+}
+
+/// Extracts the NGAP procedure code and triggering-message kind from a decoded
+/// PDU, for populating CriticalityDiagnostics in an Error Indication
+/// (TS 38.413 §9.3.1.3).
+fn ngap_procedure_code(pdu: &NGAP_PDU) -> (u8, TriggeringMessageValue) {
+    match pdu {
+        NGAP_PDU::InitiatingMessage(m) => {
+            (m.procedure_code.0, TriggeringMessageValue::InitiatingMessage)
+        }
+        NGAP_PDU::SuccessfulOutcome(m) => {
+            (m.procedure_code.0, TriggeringMessageValue::SuccessfulOutcome)
+        }
+        NGAP_PDU::UnsuccessfulOutcome(m) => {
+            (m.procedure_code.0, TriggeringMessageValue::UnsuccessfulOutcome)
         }
     }
 }
@@ -2736,5 +2823,82 @@ mod tests {
         // Delete
         task.delete_ue_context(10);
         assert!(task.find_ue_context(10).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // amfg-05: Error Indication generation for unroutable PDUs
+    // ------------------------------------------------------------------
+
+    use nextgsim_ngap::codec::ID_ERROR_INDICATION;
+    use nextgsim_ngap::procedures::error_indication::decode_error_indication;
+    use nextgsim_ngap::procedures::ng_setup::{NgSetupFailureCause, ProtocolCause};
+
+    /// A garbage byte stream that does not APER-decode as an NGAP PDU must
+    /// yield a transfer-syntax-error Error Indication with no
+    /// CriticalityDiagnostics (the procedure code is unknown).
+    #[test]
+    fn test_unroutable_undecodable_yields_transfer_syntax_error() {
+        let garbage = [0xFFu8, 0xFE, 0xAB, 0xCD, 0x12, 0x34];
+        let params = unroutable_error_params(&garbage);
+        assert!(matches!(
+            params.cause,
+            Some(NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError))
+        ));
+        assert!(params.criticality_diagnostics.is_none());
+
+        // Round-trip: the produced Error Indication encodes and decodes.
+        let bytes = encode_error_indication(&params).expect("encode");
+        let decoded = decode_error_indication(&bytes).expect("decode");
+        assert!(matches!(
+            decoded.cause,
+            Some(NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError))
+        ));
+    }
+
+    /// A well-formed-but-unhandled NGAP PDU must yield an
+    /// abstract-syntax-error (ignore-and-notify) Error Indication whose
+    /// CriticalityDiagnostics carries the offending procedure code.
+    #[test]
+    fn test_unroutable_decodable_yields_abstract_syntax_error_with_proc_code() {
+        // Use an Error Indication PDU (procedure code 9) as a stand-in for a
+        // valid-but-unhandled inbound procedure: it decodes cleanly yet has no
+        // gNB inbound handler.
+        let valid_pdu_bytes =
+            encode_error_indication(&ErrorIndicationParams::default()).expect("encode sample pdu");
+
+        let params = unroutable_error_params(&valid_pdu_bytes);
+        assert!(matches!(
+            params.cause,
+            Some(NgSetupFailureCause::Protocol(
+                ProtocolCause::AbstractSyntaxErrorIgnoreAndNotify
+            ))
+        ));
+        let diag = params
+            .criticality_diagnostics
+            .as_ref()
+            .expect("criticality diagnostics present");
+        assert_eq!(diag.procedure_code, Some(ID_ERROR_INDICATION));
+        assert_eq!(
+            diag.triggering_message,
+            Some(TriggeringMessageValue::InitiatingMessage)
+        );
+
+        // Strict APER round-trip of the generated Error Indication.
+        let bytes = encode_error_indication(&params).expect("encode");
+        let decoded = decode_error_indication(&bytes).expect("decode");
+        assert_eq!(
+            decoded.criticality_diagnostics.and_then(|d| d.procedure_code),
+            Some(ID_ERROR_INDICATION)
+        );
+    }
+
+    /// ngap_procedure_code reports the correct triggering-message kind.
+    #[test]
+    fn test_ngap_procedure_code_initiating() {
+        let bytes = encode_error_indication(&ErrorIndicationParams::default()).expect("encode");
+        let pdu = decode_ngap_pdu(&bytes).expect("decode");
+        let (code, trigger) = ngap_procedure_code(&pdu);
+        assert_eq!(code, ID_ERROR_INDICATION);
+        assert_eq!(trigger, TriggeringMessageValue::InitiatingMessage);
     }
 }

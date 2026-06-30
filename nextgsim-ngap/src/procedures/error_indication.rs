@@ -653,7 +653,9 @@ fn parse_criticality_diagnostics(
                 .collect::<Result<Vec<_>, ErrorIndicationError>>()
         })
         .transpose()?
-        .expect("value expected");
+        // iE-Extensions / iEsCriticalityDiagnostics is OPTIONAL in the ASN.1
+        // (TS 38.413 §9.3.1.3); absent means "no per-IE diagnostics".
+        .unwrap_or_default();
 
     Ok(CriticalityDiagnosticsInfo {
         procedure_code,
