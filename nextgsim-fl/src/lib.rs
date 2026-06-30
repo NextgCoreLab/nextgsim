@@ -2132,7 +2132,11 @@ pub fn multi_krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize, m: usize
     result
 }
 
-/// Trimmed mean: removes top and bottom `trim_ratio` of values per coordinate
+/// Trimmed mean: removes top and bottom `trim_ratio` of values per coordinate.
+///
+/// Byzantine-robust coordinate-wise trimmed mean per Yin et al. 2018,
+/// "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates"
+/// (ICML 2018).
 pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32> {
     if updates.is_empty() {
         return vec![];
@@ -2163,7 +2167,11 @@ pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32>
     result
 }
 
-/// Coordinate-wise median aggregation
+/// Coordinate-wise median aggregation.
+///
+/// Byzantine-robust coordinate-wise median per Yin et al. 2018,
+/// "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates"
+/// (ICML 2018).
 pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
     if updates.is_empty() {
         return vec![];
