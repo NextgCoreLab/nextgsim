@@ -9,6 +9,10 @@ use crate::codec::{decode_ngap_pdu, encode_ngap_pdu, NgapCodecError};
 use crate::procedures::ng_setup::{
     MiscCause, NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause, TransportCause,
 };
+use crate::procedures::pdu_session_resource::{
+    PduSessionResourceFailedToSetupItem, PduSessionResourceSetupItem,
+    PduSessionResourceSetupResponseItem, SnssaiValue,
+};
 use bitvec::prelude::*;
 use thiserror::Error;
 
@@ -102,6 +106,10 @@ pub struct InitialContextSetupRequestData {
     pub security_key: [u8; 32],
     /// NAS PDU (optional)
     pub nas_pdu: Option<Vec<u8>>,
+    /// PDU sessions carried in the request via
+    /// `PDUSessionResourceSetupListCxtReq` (TS 38.413 §9.2.2.1). Empty when the
+    /// IE is absent. amfg-01.
+    pub pdu_session_setup_list: Vec<PduSessionResourceSetupItem>,
 }
 
 /// Parameters for building an Initial Context Setup Response
@@ -111,6 +119,13 @@ pub struct InitialContextSetupResponseParams {
     pub amf_ue_ngap_id: u64,
     /// RAN UE NGAP ID
     pub ran_ue_ngap_id: u32,
+    /// Successfully set-up PDU sessions carried in the ICS Request, reported via
+    /// `PDUSessionResourceSetupListCxtRes` (TS 38.413 §9.2.2.2). `None` when no
+    /// PDU sessions were carried. amfg-01.
+    pub setup_list: Option<Vec<PduSessionResourceSetupResponseItem>>,
+    /// PDU sessions that failed to set up, reported via
+    /// `PDUSessionResourceFailedToSetupListCxtRes`. amfg-01.
+    pub failed_list: Option<Vec<PduSessionResourceFailedToSetupItem>>,
 }
 
 /// Parsed Initial Context Setup Response data
@@ -191,6 +206,7 @@ pub fn parse_initial_context_setup_request(
     let mut ue_security_capabilities: Option<UeSecurityCapabilitiesValue> = None;
     let mut security_key: Option<[u8; 32]> = None;
     let mut nas_pdu: Option<Vec<u8>> = None;
+    let mut pdu_session_setup_list: Vec<PduSessionResourceSetupItem> = Vec::new();
 
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
@@ -223,6 +239,13 @@ pub fn parse_initial_context_setup_request(
             InitialContextSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(pdu) => {
                 nas_pdu = Some(pdu.0.clone());
             }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtReq(
+                list,
+            ) => {
+                // amfg-01: PDU sessions carried in the ICS Request
+                // (TS 38.413 §9.2.2.1 PDUSessionResourceSetupListCxtReq).
+                pdu_session_setup_list = parse_setup_list_cxt_req(list);
+            }
             _ => {
                 // Ignore other IEs
             }
@@ -250,7 +273,34 @@ pub fn parse_initial_context_setup_request(
             InitialContextSetupError::MissingMandatoryIe("SecurityKey".to_string())
         })?,
         nas_pdu,
+        pdu_session_setup_list,
     })
+}
+
+/// amfg-01: map a `PDUSessionResourceSetupListCxtReq` (TS 38.413 §9.2.2.1) into
+/// the shared `PduSessionResourceSetupItem` wrapper so the gNB can set each
+/// carried PDU session up exactly like the dedicated PDU Session Resource Setup
+/// procedure (TS 38.413 §8.3.1.2).
+fn parse_setup_list_cxt_req(
+    list: &PDUSessionResourceSetupListCxtReq,
+) -> Vec<PduSessionResourceSetupItem> {
+    list.0
+        .iter()
+        .map(|item| {
+            let sst = item.s_nssai.sst.0.first().copied().unwrap_or(0);
+            let sd = item
+                .s_nssai
+                .sd
+                .as_ref()
+                .and_then(|sd| sd.0.as_slice().try_into().ok());
+            PduSessionResourceSetupItem {
+                pdu_session_id: item.pdu_session_id.0,
+                nas_pdu: item.nas_pdu.as_ref().map(|p| p.0.clone()),
+                s_nssai: SnssaiValue { sst, sd },
+                transfer: item.pdu_session_resource_setup_request_transfer.0.clone(),
+            }
+        })
+        .collect()
 }
 
 fn parse_ue_aggregate_max_bit_rate(rate: &UEAggregateMaximumBitRate) -> UeAggregateMaxBitRate {
@@ -392,7 +442,7 @@ fn parse_security_key(key: &SecurityKey) -> [u8; 32] {
 pub fn build_initial_context_setup_response(
     params: &InitialContextSetupResponseParams,
 ) -> Result<NGAP_PDU, InitialContextSetupError> {
-    let protocol_ies = vec![
+    let mut protocol_ies = vec![
         // IE: AMF-UE-NGAP-ID (mandatory)
         InitialContextSetupResponseProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
@@ -411,6 +461,31 @@ pub fn build_initial_context_setup_response(
         },
     ];
 
+    // IE: PDUSessionResourceSetupListCxtRes (optional, criticality ignore per
+    // TS 38.413 §9.2.2.2) — amfg-01.
+    if let Some(ref setup_list) = params.setup_list {
+        if !setup_list.is_empty() {
+            let list = build_setup_list_cxt_res(setup_list);
+            protocol_ies.push(InitialContextSetupResponseProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_SETUP_LIST_CXT_RES),
+                criticality: Criticality(Criticality::IGNORE),
+                value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtRes(list),
+            });
+        }
+    }
+
+    // IE: PDUSessionResourceFailedToSetupListCxtRes (optional) — amfg-01.
+    if let Some(ref failed_list) = params.failed_list {
+        if !failed_list.is_empty() {
+            let list = build_failed_to_setup_list_cxt_res(failed_list);
+            protocol_ies.push(InitialContextSetupResponseProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_CXT_RES),
+                criticality: Criticality(Criticality::IGNORE),
+                value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceFailedToSetupListCxtRes(list),
+            });
+        }
+    }
+
     let response = InitialContextSetupResponse {
         protocol_i_es: InitialContextSetupResponseProtocolIEs(protocol_ies),
     };
@@ -422,6 +497,44 @@ pub fn build_initial_context_setup_response(
     };
 
     Ok(NGAP_PDU::SuccessfulOutcome(successful_outcome))
+}
+
+/// amfg-01: build the `PDUSessionResourceSetupListCxtRes` IE value from the
+/// per-session response items (each carrying the gNB DL F-TEID inside the opaque
+/// PDU Session Resource Setup Response Transfer, TS 38.413 §9.3.4.2).
+fn build_setup_list_cxt_res(
+    items: &[PduSessionResourceSetupResponseItem],
+) -> PDUSessionResourceSetupListCxtRes {
+    let list: Vec<PDUSessionResourceSetupItemCxtRes> = items
+        .iter()
+        .map(|item| PDUSessionResourceSetupItemCxtRes {
+            pdu_session_id: PDUSessionID(item.pdu_session_id),
+            pdu_session_resource_setup_response_transfer:
+                PDUSessionResourceSetupItemCxtResPDUSessionResourceSetupResponseTransfer(
+                    item.transfer.clone(),
+                ),
+            ie_extensions: None,
+        })
+        .collect();
+    PDUSessionResourceSetupListCxtRes(list)
+}
+
+/// amfg-01: build the `PDUSessionResourceFailedToSetupListCxtRes` IE value.
+fn build_failed_to_setup_list_cxt_res(
+    items: &[PduSessionResourceFailedToSetupItem],
+) -> PDUSessionResourceFailedToSetupListCxtRes {
+    let list: Vec<PDUSessionResourceFailedToSetupItemCxtRes> = items
+        .iter()
+        .map(|item| PDUSessionResourceFailedToSetupItemCxtRes {
+            pdu_session_id: PDUSessionID(item.pdu_session_id),
+            pdu_session_resource_setup_unsuccessful_transfer:
+                PDUSessionResourceFailedToSetupItemCxtResPDUSessionResourceSetupUnsuccessfulTransfer(
+                    item.transfer.clone(),
+                ),
+            ie_extensions: None,
+        })
+        .collect();
+    PDUSessionResourceFailedToSetupListCxtRes(list)
 }
 
 /// Parse an Initial Context Setup Response from an NGAP PDU
@@ -971,6 +1084,8 @@ mod tests {
         InitialContextSetupResponseParams {
             amf_ue_ngap_id: 12345,
             ran_ue_ngap_id: 1,
+            setup_list: None,
+            failed_list: None,
         }
     }
 
@@ -1409,6 +1524,161 @@ mod tests {
         assert!(is_initial_context_setup_request(&pdu));
         assert!(!is_initial_context_setup_response(&pdu));
         assert!(!is_initial_context_setup_failure(&pdu));
+    }
+
+    // ============================================
+    // amfg-01: ICS-carried PDU session setup list
+    // ============================================
+
+    /// Build an ICS Request PDU that additionally carries a
+    /// `PDUSessionResourceSetupListCxtReq` with a single PDU session
+    /// (TS 38.413 §9.2.2.1).
+    fn build_test_request_pdu_with_cxt_req(
+        pdu_session_id: u8,
+        transfer: Vec<u8>,
+        session_nas: Option<Vec<u8>>,
+    ) -> NGAP_PDU {
+        // Start from a fully-formed request, then append the CxtReq IE.
+        let mut pdu = build_test_request_pdu(7777, 7, None);
+        if let NGAP_PDU::InitiatingMessage(ref mut im) = pdu {
+            if let InitiatingMessageValue::Id_InitialContextSetup(ref mut req) = im.value {
+                let item = PDUSessionResourceSetupItemCxtReq {
+                    pdu_session_id: PDUSessionID(pdu_session_id),
+                    nas_pdu: session_nas.map(NAS_PDU),
+                    s_nssai: S_NSSAI {
+                        sst: SST(vec![1]),
+                        sd: Some(SD(vec![0x00, 0x00, 0x01])),
+                        ie_extensions: None,
+                    },
+                    pdu_session_resource_setup_request_transfer:
+                        PDUSessionResourceSetupItemCxtReqPDUSessionResourceSetupRequestTransfer(
+                            transfer,
+                        ),
+                    ie_extensions: None,
+                };
+                req.protocol_i_es
+                    .0
+                    .push(InitialContextSetupRequestProtocolIEs_Entry {
+                        id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_SETUP_LIST_CXT_REQ),
+                        criticality: Criticality(Criticality::REJECT),
+                        value:
+                            InitialContextSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtReq(
+                                PDUSessionResourceSetupListCxtReq(vec![item]),
+                            ),
+                    });
+            }
+        }
+        pdu
+    }
+
+    #[test]
+    fn test_ics_request_parses_carried_pdu_session_list() {
+        // Opaque PDU Session Resource Setup Request Transfer bytes; the gNB
+        // decodes the inner UPF F-TEID/QFI later — at this wrapper layer the
+        // transfer round-trips verbatim.
+        let transfer = vec![0x00, 0x01, 0x02, 0x03, 0xAA, 0xBB, 0xCC, 0xDD];
+        let session_nas = vec![0x7E, 0x00, 0x68];
+        let pdu =
+            build_test_request_pdu_with_cxt_req(5, transfer.clone(), Some(session_nas.clone()));
+
+        // Byte-vector round-trip through strict APER.
+        let encoded = encode_ngap_pdu(&pdu).expect("encode ICS request");
+        let parsed = decode_initial_context_setup_request(&encoded).expect("decode ICS request");
+
+        assert_eq!(parsed.pdu_session_setup_list.len(), 1);
+        let s = &parsed.pdu_session_setup_list[0];
+        assert_eq!(s.pdu_session_id, 5);
+        assert_eq!(s.transfer, transfer);
+        assert_eq!(s.nas_pdu, Some(session_nas));
+        assert_eq!(s.s_nssai.sst, 1);
+        assert_eq!(s.s_nssai.sd, Some([0x00, 0x00, 0x01]));
+    }
+
+    #[test]
+    fn test_ics_request_without_cxt_req_yields_empty_list() {
+        let pdu = build_test_request_pdu(12345, 1, None);
+        let encoded = encode_ngap_pdu(&pdu).expect("encode");
+        let parsed = decode_initial_context_setup_request(&encoded).expect("decode");
+        assert!(parsed.pdu_session_setup_list.is_empty());
+    }
+
+    #[test]
+    fn test_ics_response_with_setup_list_cxt_res_roundtrip() {
+        // gNB DL F-TEID carried opaquely inside the response transfer.
+        let dl_transfer = vec![0x10, 0x20, 0x30, 0x40];
+        let params = InitialContextSetupResponseParams {
+            amf_ue_ngap_id: 12345,
+            ran_ue_ngap_id: 1,
+            setup_list: Some(vec![PduSessionResourceSetupResponseItem {
+                pdu_session_id: 5,
+                transfer: dl_transfer.clone(),
+            }]),
+            failed_list: None,
+        };
+
+        let encoded =
+            encode_initial_context_setup_response(&params).expect("encode ICS response");
+        // Strict APER decode of the produced response.
+        let decoded = decode_ngap_pdu(&encoded).expect("decode ICS response");
+
+        let resp = match decoded {
+            NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+                value: SuccessfulOutcomeValue::Id_InitialContextSetup(resp),
+                ..
+            }) => resp,
+            other => panic!("expected ICS SuccessfulOutcome, got {other:?}"),
+        };
+
+        let mut found = false;
+        for ie in &resp.protocol_i_es.0 {
+            if let InitialContextSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtRes(list) = &ie.value {
+                assert_eq!(list.0.len(), 1);
+                assert_eq!(list.0[0].pdu_session_id.0, 5);
+                assert_eq!(
+                    list.0[0].pdu_session_resource_setup_response_transfer.0,
+                    dl_transfer
+                );
+                found = true;
+            }
+        }
+        assert!(found, "PDUSessionResourceSetupListCxtRes IE must be present");
+    }
+
+    #[test]
+    fn test_ics_response_with_failed_list_cxt_res_roundtrip() {
+        let unsucc = vec![0x05, 0x06];
+        let params = InitialContextSetupResponseParams {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 1,
+            setup_list: None,
+            failed_list: Some(vec![PduSessionResourceFailedToSetupItem {
+                pdu_session_id: 9,
+                transfer: unsucc.clone(),
+            }]),
+        };
+
+        let encoded = encode_initial_context_setup_response(&params).expect("encode");
+        let decoded = decode_ngap_pdu(&encoded).expect("decode");
+        let resp = match decoded {
+            NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+                value: SuccessfulOutcomeValue::Id_InitialContextSetup(resp),
+                ..
+            }) => resp,
+            other => panic!("expected ICS SuccessfulOutcome, got {other:?}"),
+        };
+        let mut found = false;
+        for ie in &resp.protocol_i_es.0 {
+            if let InitialContextSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceFailedToSetupListCxtRes(list) = &ie.value {
+                assert_eq!(list.0.len(), 1);
+                assert_eq!(list.0[0].pdu_session_id.0, 9);
+                assert_eq!(
+                    list.0[0].pdu_session_resource_setup_unsuccessful_transfer.0,
+                    unsucc
+                );
+                found = true;
+            }
+        }
+        assert!(found, "FailedToSetupListCxtRes IE must be present");
     }
 
     #[test]

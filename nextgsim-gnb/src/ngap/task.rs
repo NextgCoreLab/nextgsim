@@ -46,7 +46,8 @@ use nextgsim_ngap::procedures::handover::{
     UserLocationInfoNr as HandoverUserLocationInfoNr,
 };
 use nextgsim_ngap::procedures::initial_context_setup::{
-    decode_initial_context_setup_request, encode_initial_context_setup_response,
+    decode_initial_context_setup_request, encode_initial_context_setup_failure,
+    encode_initial_context_setup_response, InitialContextSetupFailureParams,
     InitialContextSetupResponseParams,
 };
 use nextgsim_ngap::procedures::ng_reset::{
@@ -81,6 +82,7 @@ use nextgsim_ngap::procedures::pdu_session_resource::{
     PduSessionResourceReleaseCommandData,
     PduSessionResourceReleaseResponseParams,
     PduSessionResourceReleasedItem,
+    PduSessionResourceSetupItem,
     PduSessionResourceSetupRequestData,
     PduSessionResourceSetupResponseItem,
     PduSessionResourceSetupResponseParams,
@@ -623,10 +625,63 @@ impl NgapTask {
             info!("UE {} context setup complete, state={}", ue_id, ctx.state);
         }
 
-        // Send Initial Context Setup Response
+        // amfg-01: set up any PDU sessions carried inside the ICS Request
+        // (PDUSessionResourceSetupListCxtReq). Real AMFs (e.g. Open5GS) deliver
+        // the first PDU session this way during registration+PDU, so the N3
+        // tunnel must be established here, not only on the dedicated PDU Session
+        // Resource Setup procedure.
+        let carried_sessions = ics_req.pdu_session_setup_list.len();
+        let gnb_ip = self
+            .task_base
+            .config
+            .gtp_advertise_ip
+            .unwrap_or(self.task_base.config.gtp_ip);
+        let mut cxt_res_items = Vec::new();
+        let mut cxt_failed_items = Vec::new();
+        for item in &ics_req.pdu_session_setup_list {
+            match self.setup_one_pdu_session(ue_id, item, gnb_ip).await {
+                Ok(resp) => cxt_res_items.push(resp),
+                Err(failed) => cxt_failed_items.push(failed),
+            }
+        }
+
+        // If the ICS Request carried PDU sessions but none could be set up,
+        // answer with InitialContextSetupFailure (TS 38.413 §8.3.1.4) instead of
+        // a bare success.
+        if carried_sessions > 0 && cxt_res_items.is_empty() {
+            warn!(
+                "ICS carried {} PDU session(s) but none set up; sending InitialContextSetupFailure",
+                carried_sessions
+            );
+            let fail_params = InitialContextSetupFailureParams {
+                amf_ue_ngap_id: ics_req.amf_ue_ngap_id,
+                ran_ue_ngap_id: ics_req.ran_ue_ngap_id,
+                cause: NgSetupFailureCause::RadioNetwork(
+                    RadioNetworkCause::RadioResourcesNotAvailable,
+                ),
+            };
+            match encode_initial_context_setup_failure(&fail_params) {
+                Ok(bytes) => self.send_ngap_ue_associated(amf_id, stream, bytes).await,
+                Err(e) => error!("Failed to encode InitialContextSetupFailure: {}", e),
+            }
+            return;
+        }
+
+        // Send Initial Context Setup Response (with the CxtRes / FailedToSetup
+        // lists when the ICS Request carried PDU sessions).
         let response_params = InitialContextSetupResponseParams {
             amf_ue_ngap_id: ics_req.amf_ue_ngap_id,
             ran_ue_ngap_id: ics_req.ran_ue_ngap_id,
+            setup_list: if cxt_res_items.is_empty() {
+                None
+            } else {
+                Some(cxt_res_items)
+            },
+            failed_list: if cxt_failed_items.is_empty() {
+                None
+            } else {
+                Some(cxt_failed_items)
+            },
         };
         match encode_initial_context_setup_response(&response_params) {
             Ok(response_bytes) => {
@@ -639,6 +694,148 @@ impl NgapTask {
             }
             Err(e) => {
                 error!("Failed to encode Initial Context Setup Response: {}", e);
+            }
+        }
+    }
+
+    /// amfg-01: set up a single PDU session and return its per-session result.
+    ///
+    /// Decodes the APER PDUSessionResourceSetupRequestTransfer (TS 38.413
+    /// §9.3.4.1), allocates the gNB DL F-TEID, stores the session in the UE
+    /// context, creates the GTP-U N3 tunnel, forwards any piggybacked NAS, and
+    /// builds the PDUSessionResourceSetupResponseTransfer (§9.3.4.2).
+    ///
+    /// Shared by the dedicated PDU Session Resource Setup procedure and the PDU
+    /// sessions carried inside an INITIAL CONTEXT SETUP REQUEST
+    /// (`PDUSessionResourceSetupListCxtReq`, TS 38.413 §8.3.1.2). Returns the
+    /// success item, or a FailedToSetup item (with an APER unsuccessful-transfer)
+    /// on any error.
+    async fn setup_one_pdu_session(
+        &mut self,
+        ue_id: i32,
+        item: &PduSessionResourceSetupItem,
+        gnb_ip: std::net::IpAddr,
+    ) -> Result<PduSessionResourceSetupResponseItem, PduSessionResourceFailedToSetupItem> {
+        let psi = item.pdu_session_id;
+
+        // Decode the APER PDUSessionResourceSetupRequestTransfer (TS 38.413 §9.3.4.1)
+        let request = match decode_setup_request_transfer(&item.transfer) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!(
+                    "PDU Session {}: failed to decode SetupRequestTransfer ({} bytes): {}",
+                    psi,
+                    item.transfer.len(),
+                    e
+                );
+                let transfer = encode_setup_unsuccessful_transfer(&NgSetupFailureCause::Protocol(
+                    ProtocolCause::TransferSyntaxError,
+                ))
+                .unwrap_or_default();
+                return Err(PduSessionResourceFailedToSetupItem {
+                    pdu_session_id: psi,
+                    transfer,
+                });
+            }
+        };
+
+        let upf_teid = request.ul_tunnel.teid;
+        let upf_addr = request.ul_tunnel.address;
+        // First QoS flow is the default flow for the session
+        let qfi = request.qos_flows[0].qfi;
+
+        // Allocate gNB DL TEID for the N3 tunnel
+        let gnb_teid = self.next_downlink_teid();
+
+        info!(
+            "PDU Session {}: UPF TEID=0x{:08x}, UPF addr={}, QFIs={:?}, gNB TEID=0x{:08x}",
+            psi,
+            upf_teid,
+            upf_addr,
+            request.qos_flows.iter().map(|f| f.qfi).collect::<Vec<_>>(),
+            gnb_teid
+        );
+
+        // Store PDU session in UE context
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            ctx.add_pdu_session(NgapPduSession {
+                psi,
+                qfi: Some(qfi),
+                uplink_teid: gnb_teid,
+                downlink_teid: upf_teid,
+                upf_address: upf_addr,
+            });
+        }
+
+        // Send GTP SessionCreate to GTP task
+        let resource = PduSessionResource {
+            psi: psi as i32,
+            qfi: Some(qfi),
+            // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
+            // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
+            uplink_teid: upf_teid,
+            downlink_teid: gnb_teid,
+            upf_address: upf_addr,
+        };
+        let msg = GtpMessage::SessionCreate { ue_id, resource };
+        if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+            error!("Failed to send SessionCreate to GTP: {}", e);
+            if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                ctx.remove_pdu_session(psi);
+            }
+            let transfer = encode_setup_unsuccessful_transfer(&NgSetupFailureCause::RadioNetwork(
+                RadioNetworkCause::RadioResourcesNotAvailable,
+            ))
+            .unwrap_or_default();
+            return Err(PduSessionResourceFailedToSetupItem {
+                pdu_session_id: psi,
+                transfer,
+            });
+        }
+        info!(
+            "GTP session created for PSI={}, gNB TEID=0x{:08x}",
+            psi, gnb_teid
+        );
+
+        // If NAS PDU present, forward to RRC
+        if let Some(ref nas_pdu) = item.nas_pdu {
+            let msg = RrcMessage::NasDelivery {
+                ue_id,
+                pdu: OctetString::from_slice(nas_pdu),
+            };
+            if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                error!("Failed to forward NAS PDU from Setup Request to RRC: {}", e);
+            }
+        }
+
+        // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
+        // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
+        let transfer_params = SetupResponseTransferParams {
+            dl_tunnel: GtpTunnelInfo {
+                address: gnb_ip,
+                teid: gnb_teid,
+            },
+            accepted_qfis: request.qos_flows.iter().map(|f| f.qfi).collect(),
+            failed_qos_flows: vec![],
+        };
+        match encode_setup_response_transfer(&transfer_params) {
+            Ok(response_transfer) => Ok(PduSessionResourceSetupResponseItem {
+                pdu_session_id: psi,
+                transfer: response_transfer,
+            }),
+            Err(e) => {
+                error!(
+                    "Failed to encode SetupResponseTransfer for PSI {}: {}",
+                    psi, e
+                );
+                let transfer = encode_setup_unsuccessful_transfer(&NgSetupFailureCause::Misc(
+                    nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
+                ))
+                .unwrap_or_default();
+                Err(PduSessionResourceFailedToSetupItem {
+                    pdu_session_id: psi,
+                    transfer,
+                })
             }
         }
     }
@@ -689,135 +886,9 @@ impl NgapTask {
             .unwrap_or(self.task_base.config.gtp_ip);
 
         for item in &setup_req.pdu_session_resource_setup_list {
-            let psi = item.pdu_session_id;
-
-            // Decode the APER PDUSessionResourceSetupRequestTransfer (TS 38.413 §9.3.4.1)
-            let request = match decode_setup_request_transfer(&item.transfer) {
-                Ok(req) => req,
-                Err(e) => {
-                    warn!(
-                        "PDU Session {}: failed to decode SetupRequestTransfer ({} bytes): {}",
-                        psi,
-                        item.transfer.len(),
-                        e
-                    );
-                    if let Ok(transfer) = encode_setup_unsuccessful_transfer(
-                        &NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError),
-                    ) {
-                        failed_items.push(PduSessionResourceFailedToSetupItem {
-                            pdu_session_id: psi,
-                            transfer,
-                        });
-                    }
-                    continue;
-                }
-            };
-
-            let upf_teid = request.ul_tunnel.teid;
-            let upf_addr = request.ul_tunnel.address;
-            // First QoS flow is the default flow for the session
-            let qfi = request.qos_flows[0].qfi;
-
-            // Allocate gNB DL TEID for the N3 tunnel
-            let gnb_teid = self.next_downlink_teid();
-
-            info!(
-                "PDU Session {}: UPF TEID=0x{:08x}, UPF addr={}, QFIs={:?}, gNB TEID=0x{:08x}",
-                psi,
-                upf_teid,
-                upf_addr,
-                request.qos_flows.iter().map(|f| f.qfi).collect::<Vec<_>>(),
-                gnb_teid
-            );
-
-            // Store PDU session in UE context
-            if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
-                ctx.add_pdu_session(NgapPduSession {
-                    psi,
-                    qfi: Some(qfi),
-                    uplink_teid: gnb_teid,
-                    downlink_teid: upf_teid,
-                    upf_address: upf_addr,
-                });
-            }
-
-            // Send GTP SessionCreate to GTP task
-            let resource = PduSessionResource {
-                psi: psi as i32,
-                qfi: Some(qfi),
-                // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
-                // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
-                uplink_teid: upf_teid,
-                downlink_teid: gnb_teid,
-                upf_address: upf_addr,
-            };
-            let msg = GtpMessage::SessionCreate { ue_id, resource };
-            if let Err(e) = self.task_base.gtp_tx.send(msg).await {
-                error!("Failed to send SessionCreate to GTP: {}", e);
-                if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
-                    ctx.remove_pdu_session(psi);
-                }
-                if let Ok(transfer) =
-                    encode_setup_unsuccessful_transfer(&NgSetupFailureCause::RadioNetwork(
-                        RadioNetworkCause::RadioResourcesNotAvailable,
-                    ))
-                {
-                    failed_items.push(PduSessionResourceFailedToSetupItem {
-                        pdu_session_id: psi,
-                        transfer,
-                    });
-                }
-                continue;
-            }
-            info!(
-                "GTP session created for PSI={}, gNB TEID=0x{:08x}",
-                psi, gnb_teid
-            );
-
-            // If NAS PDU present, forward to RRC
-            if let Some(ref nas_pdu) = item.nas_pdu {
-                let msg = RrcMessage::NasDelivery {
-                    ue_id,
-                    pdu: OctetString::from_slice(nas_pdu),
-                };
-                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
-                    error!("Failed to forward NAS PDU from Setup Request to RRC: {}", e);
-                }
-            }
-
-            // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
-            // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
-            let transfer_params = SetupResponseTransferParams {
-                dl_tunnel: GtpTunnelInfo {
-                    address: gnb_ip,
-                    teid: gnb_teid,
-                },
-                accepted_qfis: request.qos_flows.iter().map(|f| f.qfi).collect(),
-                failed_qos_flows: vec![],
-            };
-            match encode_setup_response_transfer(&transfer_params) {
-                Ok(response_transfer) => {
-                    setup_response_items.push(PduSessionResourceSetupResponseItem {
-                        pdu_session_id: psi,
-                        transfer: response_transfer,
-                    });
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to encode SetupResponseTransfer for PSI {}: {}",
-                        psi, e
-                    );
-                    if let Ok(transfer) =
-                        encode_setup_unsuccessful_transfer(&NgSetupFailureCause::Misc(
-                            nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
-                        ))
-                    {
-                        failed_items.push(PduSessionResourceFailedToSetupItem {
-                            pdu_session_id: psi,
-                            transfer,
-                        });
-                    }
-                }
+            match self.setup_one_pdu_session(ue_id, item, gnb_ip).await {
+                Ok(resp) => setup_response_items.push(resp),
+                Err(failed) => failed_items.push(failed),
             }
         }
 
