@@ -54,6 +54,7 @@ use nextgsim_ngap::procedures::ng_reset::{
     encode_ng_reset_acknowledge, AmfConfigurationUpdateAcknowledgeParams, NgResetAcknowledgeParams,
     NgResetScope, UeAssociation,
 };
+use nextgsim_ngap::procedures::paging::{decode_paging, PagingData, UePagingIdentityValue};
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
 use nextgsim_ngap::procedures::ng_setup::{
     NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
@@ -1691,6 +1692,8 @@ impl NgapTask {
                 } else if let Ok(update) = decode_amf_configuration_update(pdu_bytes) {
                     self.handle_amf_configuration_update(client_id, stream, update)
                         .await;
+                } else if let Ok(paging) = decode_paging(pdu_bytes) {
+                    self.handle_paging(client_id, paging).await;
                 } else {
                     // amfg-05: this operational PDU could not be routed to a
                     // handler. Per TS 38.413 §8.7.5 / §10, answer with an NGAP
@@ -1836,6 +1839,72 @@ impl NgapTask {
                 );
             }
             Err(e) => error!("Failed to encode AMF Configuration Update Acknowledge: {}", e),
+        }
+    }
+
+    // ========================================================================
+    // Paging (amfg-06)
+    // ========================================================================
+
+    /// Handles an inbound PAGING from the AMF (TS 38.413 §8.6.1 / §9.2.3.1).
+    ///
+    /// Matches the TAIListForPaging against this gNB's served TAI and, on a
+    /// match, triggers RRC Paging toward the air interface carrying the
+    /// 5G-S-TMSI. PagingPriority / PagingDRX are honored on a best-effort
+    /// (logged) basis.
+    async fn handle_paging(&mut self, client_id: i32, paging: PagingData) {
+        let config = &self.task_base.config;
+        let served_plmn = config.plmn.encode();
+        let served_tac = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+
+        // Collect the TAIs from the paging list that this gNB serves.
+        let matching: Vec<&nextgsim_ngap::procedures::initial_ue_message::Tai> = paging
+            .tai_list_for_paging
+            .iter()
+            .filter(|tai| tai.plmn_identity == served_plmn && tai.tac == served_tac)
+            .collect();
+
+        if matching.is_empty() {
+            debug!(
+                "PAGING from AMF[{}] not for a served TAI (served plmn={:02x?} tac={:02x?}); ignoring",
+                client_id, served_plmn, served_tac
+            );
+            return;
+        }
+
+        if paging.paging_priority.is_some() || paging.paging_drx.is_some() {
+            debug!(
+                "PAGING QoS hints: priority={:?}, drx={:?}",
+                paging.paging_priority, paging.paging_drx
+            );
+        }
+
+        // Serialize the 5G-S-TMSI for the RRC Paging record.
+        let ue_paging_tmsi = serialize_five_g_s_tmsi(&paging.ue_paging_identity);
+
+        // Serialize the matching TAIs (plmn(3) + tac(3) per entry).
+        let mut tai_list_for_paging = Vec::with_capacity(matching.len() * 6);
+        for tai in &matching {
+            tai_list_for_paging.extend_from_slice(&tai.plmn_identity);
+            tai_list_for_paging.extend_from_slice(&tai.tac);
+        }
+
+        info!(
+            "PAGING from AMF[{}]: matched {} served TAI(s); triggering RRC Paging",
+            client_id,
+            matching.len()
+        );
+
+        let msg = RrcMessage::Paging {
+            ue_paging_tmsi,
+            tai_list_for_paging,
+        };
+        if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+            error!("Failed to forward Paging to RRC: {}", e);
         }
     }
 
@@ -2679,6 +2748,22 @@ fn unroutable_error_params(pdu_bytes: &[u8]) -> ErrorIndicationParams {
     }
 }
 
+/// Serializes a 5G-S-TMSI UE paging identity into the canonical 48-bit form
+/// for an RRC Paging record (TS 23.003 §2.10.1): AMF Set ID (10 bits) +
+/// AMF Pointer (6 bits) packed into 2 octets, followed by the 32-bit 5G-TMSI.
+fn serialize_five_g_s_tmsi(identity: &UePagingIdentityValue) -> Vec<u8> {
+    match identity {
+        UePagingIdentityValue::FiveGSTmsi(tmsi) => {
+            let mut out = Vec::with_capacity(6);
+            // AMF Set ID is 10 bits, AMF Pointer is 6 bits -> 16 bits.
+            let packed = ((tmsi.amf_set_id & 0x3FF) << 6) | (tmsi.amf_pointer as u16 & 0x3F);
+            out.extend_from_slice(&packed.to_be_bytes());
+            out.extend_from_slice(&tmsi.five_g_tmsi);
+            out
+        }
+    }
+}
+
 /// Extracts the NGAP procedure code and triggering-message kind from a decoded
 /// PDU, for populating CriticalityDiagnostics in an Error Indication
 /// (TS 38.413 §9.3.1.3).
@@ -2968,6 +3053,98 @@ mod tests {
         // Delete
         task.delete_ue_context(10);
         assert!(task.find_ue_context(10).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // amfg-06: inbound Paging
+    // ------------------------------------------------------------------
+
+    use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi as PagingTmsi, Tai};
+    use nextgsim_ngap::procedures::paging::PagingData;
+
+    fn sample_tmsi() -> PagingTmsi {
+        PagingTmsi {
+            amf_set_id: 0x155,
+            amf_pointer: 0x2A,
+            five_g_tmsi: [0xDE, 0xAD, 0xBE, 0xEF],
+        }
+    }
+
+    #[test]
+    fn test_serialize_five_g_s_tmsi_packing() {
+        let id = UePagingIdentityValue::FiveGSTmsi(sample_tmsi());
+        let bytes = serialize_five_g_s_tmsi(&id);
+        assert_eq!(bytes.len(), 6);
+        // packed = (0x155 << 6) | 0x2A = 0x556A
+        assert_eq!(&bytes[0..2], &[0x55, 0x6A]);
+        assert_eq!(&bytes[2..6], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[tokio::test]
+    async fn test_paging_matching_tai_triggers_rrc() {
+        let config = test_config();
+        let served_plmn = config.plmn.encode();
+        let served_tac = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+        let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+
+        let paging = PagingData {
+            ue_paging_identity: UePagingIdentityValue::FiveGSTmsi(sample_tmsi()),
+            tai_list_for_paging: vec![Tai {
+                plmn_identity: served_plmn,
+                tac: served_tac,
+            }],
+            paging_drx: None,
+            paging_priority: None,
+            paging_origin: None,
+        };
+        task.handle_paging(1, paging).await;
+
+        match rrc_rx.try_recv() {
+            Ok(TaskMessage::Message(RrcMessage::Paging {
+                ue_paging_tmsi,
+                tai_list_for_paging,
+            })) => {
+                assert_eq!(ue_paging_tmsi.len(), 6);
+                assert_eq!(tai_list_for_paging.len(), 6); // one matching TAI
+                assert_eq!(&tai_list_for_paging[0..3], &served_plmn);
+                assert_eq!(&tai_list_for_paging[3..6], &served_tac);
+            }
+            other => panic!("expected RRC Paging, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paging_non_matching_tai_is_ignored() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+
+        let paging = PagingData {
+            ue_paging_identity: UePagingIdentityValue::FiveGSTmsi(sample_tmsi()),
+            // A TAI this gNB does not serve.
+            tai_list_for_paging: vec![Tai {
+                plmn_identity: [0x99, 0x99, 0x99],
+                tac: [0x12, 0x34, 0x56],
+            }],
+            paging_drx: None,
+            paging_priority: None,
+            paging_origin: None,
+        };
+        task.handle_paging(1, paging).await;
+
+        assert!(
+            rrc_rx.try_recv().is_err(),
+            "no RRC Paging should be emitted for an unserved TAI"
+        );
     }
 
     // ------------------------------------------------------------------
