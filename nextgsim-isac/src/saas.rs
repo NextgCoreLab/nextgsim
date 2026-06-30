@@ -226,6 +226,14 @@ pub struct SensingQos {
     pub min_confidence: f64,
     /// Update rate (Hz)
     pub update_rate_hz: f64,
+    /// TR 22.837 §7.2 KPI: target maximum missed-detection probability
+    /// (fraction in 0.0..=1.0). `None` if not specified.
+    #[serde(default)]
+    pub missed_detection_rate: Option<f64>,
+    /// TR 22.837 §7.2 KPI: target maximum false-alarm probability
+    /// (fraction in 0.0..=1.0). `None` if not specified.
+    #[serde(default)]
+    pub false_alarm_rate: Option<f64>,
 }
 
 impl Default for SensingQos {
@@ -235,6 +243,8 @@ impl Default for SensingQos {
             max_latency_ms: 100,
             min_confidence: 0.8,
             update_rate_hz: 10.0,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
         }
     }
 }
@@ -334,6 +344,14 @@ pub struct SensingResult {
     pub confidence: f64,
     /// Timestamp
     pub timestamp_ms: u64,
+    /// TR 22.837 §7.2 KPI: achieved missed-detection rate for this result
+    /// (fraction in 0.0..=1.0). `None` if not estimated.
+    #[serde(default)]
+    pub missed_detection_rate: Option<f64>,
+    /// TR 22.837 §7.2 KPI: achieved false-alarm rate for this result
+    /// (fraction in 0.0..=1.0). `None` if not estimated.
+    #[serde(default)]
+    pub false_alarm_rate: Option<f64>,
     /// Additional metadata
     pub metadata: HashMap<String, String>,
 }
@@ -566,6 +584,8 @@ impl SensingAsAService {
             velocity: Some(fused.velocity),
             confidence: fused.confidence as f64,
             timestamp_ms: fused.timestamp_ms,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
             metadata: HashMap::new(),
         }
     }
@@ -657,6 +677,8 @@ mod tests {
             velocity: None,
             confidence: 0.9,
             timestamp_ms: 1000,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
             metadata: HashMap::new(),
         };
 
@@ -692,6 +714,8 @@ mod tests {
             velocity: None,
             confidence: 0.9,
             timestamp_ms: 1000,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
             metadata: HashMap::new(),
         });
 
@@ -702,6 +726,8 @@ mod tests {
             velocity: None,
             confidence: 0.9,
             timestamp_ms: 1000,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
             metadata: HashMap::new(),
         });
 
@@ -744,6 +770,8 @@ mod tests {
             max_latency_ms: 50,
             min_confidence: 0.95,
             update_rate_hz: 20.0,
+            missed_detection_rate: Some(0.01),
+            false_alarm_rate: Some(0.02),
         };
 
         let request = SensingApiRequest::UpdateQos {
@@ -913,6 +941,8 @@ mod tests {
             velocity: None,
             confidence: 0.9,
             timestamp_ms: 1000,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
             metadata: HashMap::new(),
         });
         saas.publish_result(SensingResult {
@@ -922,6 +952,8 @@ mod tests {
             velocity: None,
             confidence: 0.9,
             timestamp_ms: 1000,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
             metadata: HashMap::new(),
         });
 
@@ -947,5 +979,45 @@ mod tests {
             SensingApiResponse::QueryResult { results } => assert!(results.is_empty()),
             other => panic!("expected empty QueryResult, got {other:?}"),
         }
+    }
+
+    // ----- isac-03: §7.2 missed-detection / false-alarm KPI fields -----
+
+    #[test]
+    fn test_kpi_fields_serde_round_trip() {
+        let qos = SensingQos {
+            missed_detection_rate: Some(0.05),
+            false_alarm_rate: Some(0.03),
+            ..SensingQos::default()
+        };
+        let json = serde_json::to_string(&qos).unwrap();
+        let back: SensingQos = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.missed_detection_rate, Some(0.05));
+        assert_eq!(back.false_alarm_rate, Some(0.03));
+
+        let result = SensingResult {
+            service_type: SensingServiceType::ObjectDetection,
+            target_id: Some(9),
+            position: None,
+            velocity: None,
+            confidence: 0.7,
+            timestamp_ms: 42,
+            missed_detection_rate: Some(0.1),
+            false_alarm_rate: None,
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: SensingResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.missed_detection_rate, Some(0.1));
+        assert_eq!(back.false_alarm_rate, None);
+    }
+
+    #[test]
+    fn test_kpi_fields_default_to_none_for_legacy_json() {
+        // A legacy QoS payload without the new KPI fields still deserializes.
+        let legacy = r#"{"accuracy_m":1.0,"max_latency_ms":100,"min_confidence":0.8,"update_rate_hz":10.0}"#;
+        let qos: SensingQos = serde_json::from_str(legacy).unwrap();
+        assert_eq!(qos.missed_detection_rate, None);
+        assert_eq!(qos.false_alarm_rate, None);
     }
 }
