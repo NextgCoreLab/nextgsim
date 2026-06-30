@@ -1,13 +1,24 @@
-//! Federated Learning Infrastructure for 6G Networks
+//! Federated Learning research engine for 6G Networks
 //!
-//! Implements federated learning per 3GPP TR 23.700-80:
-//! - Secure aggregation protocols (Bonawitz et al.)
+//! This crate is a **research prototype**. It is architecturally aligned with the
+//! federated-learning concepts described in 3GPP TR 23.700-80 (SA2 study) and the
+//! AI/ML training-management information model of TS 28.105 §6.2b.2.15, but it does
+//! **not** implement any 3GPP procedure and is not conformance-tested.
+//!
+//! Scope boundary: TS 28.105 §6.2b.2.15.1 NOTE 2 states that the FL algorithms,
+//! differential-privacy mechanisms and secure-aggregation schemes are *outside the
+//! scope of standardization*. The implementations below (FedAvg/FedProx, the masking
+//! demo, DP accounting, compression and Byzantine-robust rules) are therefore
+//! literature-faithful research code, not normative 3GPP wire behaviour.
+//!
+//! Capabilities:
+//! - Pairwise-masking aggregation demo (x25519-derived masks) — simulation only
 //! - Differential privacy support (Gaussian mechanism, Renyi DP, zCDP)
 //! - Model versioning and distribution
 //! - Asynchronous federated learning
 //! - Gradient compression (top-k, 1-bit, ternary quantization)
 //! - Hierarchical FL (edge->regional->cloud)
-//! - Byzantine-robust aggregation (Krum, trimmed mean)
+//! - Byzantine-robust aggregation (Krum, trimmed mean, median)
 
 #![allow(missing_docs)]
 //! - Personalization (local fine-tuning)

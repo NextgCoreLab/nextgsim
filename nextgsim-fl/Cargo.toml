@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Federated Learning Infrastructure - 3GPP TR 23.700-80 compliant distributed training for 6G networks"
+description = "Federated Learning research engine - aligned with FL concepts in 3GPP TR 23.700-80 / TS 28.105 6.2b.2.15 (research prototype; FL algorithms outside 3GPP standardization scope)"
 
 [dependencies]
 tokio = { workspace = true }
