@@ -452,6 +452,47 @@ impl std::fmt::Debug for SecAggParticipant {
     }
 }
 
+/// Deterministically derives a length-`dim` mask from a 32-byte shared secret.
+///
+/// Folds **all 32 bytes** of the secret into a `splitmix64` seed (so the mask
+/// depends on the entire secret, not just a prefix) and expands it to `dim`
+/// samples in `[-1.0, 1.0)`.
+///
+/// SECURITY: `splitmix64` is a **non-cryptographic** PRG (Steele, Lea & Flood
+/// 2014). This routine has no cryptographic mask strength and is only used to
+/// demonstrate pairwise mask cancellation in the [`AggregationAlgorithm::MaskedSumDemo`]
+/// simulation. The output range is irrelevant to cancellation, which holds
+/// exactly by antisymmetric negation.
+fn demo_mask_from_secret(secret_bytes: &[u8; 32], dim: usize) -> Vec<f32> {
+    // Fold every 8-byte word of the secret into the seed with the splitmix64
+    // finalizer so any byte (including bytes past the first 8) affects the seed.
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for chunk in secret_bytes.chunks_exact(8) {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(chunk);
+        seed ^= u64::from_le_bytes(w);
+        seed = seed.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        seed ^= seed >> 27;
+        seed = seed.wrapping_mul(0x94D0_49BB_1331_11EB);
+        seed ^= seed >> 31;
+    }
+
+    let mut state = seed;
+    (0..dim)
+        .map(|_| {
+            // splitmix64 step
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            // Map the top 53 bits to a unit double in [0, 1), then to [-1, 1).
+            let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
+            (2.0 * unit - 1.0) as f32
+        })
+        .collect()
+}
+
 impl SecAggParticipant {
     /// Creates a new masking-demo participant with a fresh x25519 keypair.
     pub fn new(id: impl Into<String>) -> Self {
@@ -465,15 +506,21 @@ impl SecAggParticipant {
         }
     }
 
-    /// Derives a pairwise shared secret with another participant and uses it
-    /// to produce a deterministic pseudo-random mask of length `dim`.
+    /// Derives a pairwise shared secret with another participant and uses it to
+    /// produce a deterministic mask of length `dim`.
     ///
-    /// The mask is derived by seeding a simple PRNG with the first 8 bytes of
-    /// the shared secret. Because the DH shared secret is symmetric (A->B ==
-    /// B->A), we use the lexicographic ordering of participant IDs to decide
-    /// the sign: the participant with the "smaller" ID *adds* the mask while
-    /// the one with the "larger" ID *subtracts* it. This ensures the masks
-    /// cancel out upon summation.
+    /// The mask is derived by folding the **full 32-byte** DH shared secret into
+    /// a `splitmix64` PRG seed (see [`demo_mask_from_secret`]). Because the DH
+    /// shared secret is symmetric (A->B == B->A), we use the lexicographic
+    /// ordering of participant IDs to decide the sign: the participant with the
+    /// "smaller" ID *adds* the mask while the one with the "larger" ID
+    /// *subtracts* it. This makes the masks antisymmetric so they cancel exactly
+    /// upon summation (cancellation is exact in f32 by negation, independent of
+    /// the mask magnitude).
+    ///
+    /// SECURITY: `splitmix64` is a fast **non-cryptographic** PRG. This mask
+    /// provides no cryptographic strength and must not be relied on for privacy;
+    /// it exists only to demonstrate mask cancellation in the simulation.
     fn pairwise_mask(
         &self,
         other_id: &str,
@@ -481,26 +528,7 @@ impl SecAggParticipant {
         dim: usize,
     ) -> Vec<f32> {
         let shared_secret = self.secret.diffie_hellman(other_public_key);
-        let secret_bytes = shared_secret.as_bytes();
-
-        // Derive a u64 seed from the shared secret
-        let mut seed_bytes = [0u8; 8];
-        seed_bytes.copy_from_slice(&secret_bytes[..8]);
-        let seed = u64::from_le_bytes(seed_bytes);
-
-        // Use the seed to generate deterministic mask values via a simple
-        // splitmix64-style PRNG (fast, deterministic, sufficient for masking).
-        let mut state = seed;
-        let mask: Vec<f32> = (0..dim)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                // Map to small float in [-0.01, 0.01]
-                let bits = ((state >> 33) as i32) % 10000;
-                bits as f32 / 1_000_000.0
-            })
-            .collect();
+        let mask = demo_mask_from_secret(shared_secret.as_bytes(), dim);
 
         // Determine sign based on lexicographic ordering of IDs
         if self.id.as_str() < other_id {
@@ -2586,6 +2614,28 @@ mod tests {
             "server mints/holds participant key material in the masking demo \
              (inverted trust model) — this is not server-blind SecAgg"
         );
+    }
+
+    /// The demo mask must depend on the FULL 32-byte shared secret, not just a
+    /// prefix. Two secrets that differ only past byte 8 must yield different
+    /// masks (the old implementation seeded only from the first 8 bytes).
+    #[test]
+    fn demo_mask_uses_full_secret() {
+        let s1 = [7u8; 32];
+        let mut s2 = [7u8; 32];
+        s2[20] = 8; // differ only well past the first 8 bytes
+
+        let m1 = demo_mask_from_secret(&s1, 16);
+        let m2 = demo_mask_from_secret(&s2, 16);
+
+        assert_eq!(m1.len(), 16);
+        assert_ne!(
+            m1, m2,
+            "mask must depend on all 32 secret bytes, not just the first 8"
+        );
+
+        // Determinism: same secret -> same mask.
+        assert_eq!(m1, demo_mask_from_secret(&s1, 16));
     }
 
     #[test]
