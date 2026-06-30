@@ -635,7 +635,13 @@ pub fn parse_ng_setup_failure(pdu: &NGAP_PDU) -> Result<NgSetupFailureData, NgSe
     })
 }
 
-fn parse_cause(cause: &Cause) -> NgSetupFailureCause {
+/// Map a generated NGAP `Cause` CHOICE into the hand-written
+/// `NgSetupFailureCause` enum. Shared across procedures (e.g. NG Reset).
+///
+/// `pub(crate)` (not `pub`) so it is reachable from other procedure modules
+/// without colliding with `ue_context_release::parse_cause` in the public glob
+/// re-export.
+pub(crate) fn parse_cause(cause: &Cause) -> NgSetupFailureCause {
     match cause {
         Cause::RadioNetwork(rn) => NgSetupFailureCause::RadioNetwork(parse_radio_network_cause(rn)),
         Cause::Transport(t) => NgSetupFailureCause::Transport(parse_transport_cause(t)),

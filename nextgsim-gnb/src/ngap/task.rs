@@ -49,6 +49,11 @@ use nextgsim_ngap::procedures::initial_context_setup::{
     decode_initial_context_setup_request, encode_initial_context_setup_response,
     InitialContextSetupResponseParams,
 };
+use nextgsim_ngap::procedures::ng_reset::{
+    decode_amf_configuration_update, decode_ng_reset, encode_amf_configuration_update_acknowledge,
+    encode_ng_reset_acknowledge, AmfConfigurationUpdateAcknowledgeParams, NgResetAcknowledgeParams,
+    NgResetScope, UeAssociation,
+};
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
 use nextgsim_ngap::procedures::ng_setup::{
     NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
@@ -1681,6 +1686,11 @@ impl NgapTask {
                 } else if let Ok(ics_req) = decode_initial_context_setup_request(pdu_bytes) {
                     self.handle_initial_context_setup_request(client_id, stream, ics_req)
                         .await;
+                } else if let Ok(reset) = decode_ng_reset(pdu_bytes) {
+                    self.handle_ng_reset(client_id, stream, reset).await;
+                } else if let Ok(update) = decode_amf_configuration_update(pdu_bytes) {
+                    self.handle_amf_configuration_update(client_id, stream, update)
+                        .await;
                 } else {
                     // amfg-05: this operational PDU could not be routed to a
                     // handler. Per TS 38.413 §8.7.5 / §10, answer with an NGAP
@@ -1691,6 +1701,141 @@ impl NgapTask {
             _ => {
                 warn!("Received NGAP PDU in unexpected AMF state: {:?}", amf_state);
             }
+        }
+    }
+
+    // ========================================================================
+    // NG Reset / AMF Configuration Update (amfg-07)
+    // ========================================================================
+
+    /// Handles an inbound NG Reset (TS 38.413 §8.7.4.2).
+    ///
+    /// Clears the indicated UE-associated logical NG-connections — all of them
+    /// for a `NG Interface` reset, or the listed subset for a
+    /// `Part of NG Interface` reset — and replies with an NG Reset Acknowledge
+    /// echoing the associations actually released.
+    async fn handle_ng_reset(
+        &mut self,
+        client_id: i32,
+        stream: u16,
+        reset: nextgsim_ngap::procedures::ng_reset::NgResetData,
+    ) {
+        info!(
+            "NG Reset received from AMF[{}]: scope={:?}, cause={:?}",
+            client_id, reset.scope, reset.cause
+        );
+
+        // Collect the UE ids to release, recording the released associations.
+        let mut ue_ids: Vec<i32> = Vec::new();
+        let mut released: Vec<UeAssociation> = Vec::new();
+
+        match &reset.scope {
+            NgResetScope::All => {
+                for ctx in self.ue_contexts.values() {
+                    if ctx.amf_ctx_id == client_id {
+                        ue_ids.push(ctx.ue_id);
+                        released.push(UeAssociation {
+                            amf_ue_ngap_id: ctx.amf_ue_ngap_id.map(|v| v as u64),
+                            ran_ue_ngap_id: Some(ctx.ran_ue_ngap_id as u32),
+                        });
+                    }
+                }
+            }
+            NgResetScope::Part(list) => {
+                for assoc in list {
+                    // Match by RAN UE NGAP ID first, then AMF UE NGAP ID.
+                    let found = self.ue_contexts.values().find(|ctx| {
+                        ctx.amf_ctx_id == client_id
+                            && ((assoc.ran_ue_ngap_id.is_some()
+                                && Some(ctx.ran_ue_ngap_id as u32) == assoc.ran_ue_ngap_id)
+                                || (assoc.amf_ue_ngap_id.is_some()
+                                    && ctx.amf_ue_ngap_id.map(|v| v as u64)
+                                        == assoc.amf_ue_ngap_id))
+                    });
+                    if let Some(ctx) = found {
+                        ue_ids.push(ctx.ue_id);
+                        released.push(UeAssociation {
+                            amf_ue_ngap_id: ctx.amf_ue_ngap_id.map(|v| v as u64),
+                            ran_ue_ngap_id: Some(ctx.ran_ue_ngap_id as u32),
+                        });
+                    } else {
+                        // Echo back the requested association even if unknown,
+                        // so the AMF can complete its bookkeeping.
+                        released.push(assoc.clone());
+                    }
+                }
+            }
+        }
+
+        for ue_id in ue_ids {
+            self.release_ue_for_reset(ue_id).await;
+        }
+
+        // Build the Acknowledge. Always include the (possibly empty) released
+        // list so the AMF sees exactly which associations were cleared.
+        let params = NgResetAcknowledgeParams {
+            released: Some(released),
+        };
+        match encode_ng_reset_acknowledge(&params) {
+            Ok(data) => {
+                self.send_ngap_non_ue(client_id, stream, data).await;
+                info!("Sent NG Reset Acknowledge to AMF[{}]", client_id);
+            }
+            Err(e) => error!("Failed to encode NG Reset Acknowledge: {}", e),
+        }
+    }
+
+    /// Releases a UE context as part of an NG Reset: drop the NGAP context and
+    /// notify the RRC and GTP tasks (no UE Context Release Complete is sent —
+    /// NG Reset is acknowledged at the interface level).
+    async fn release_ue_for_reset(&mut self, ue_id: i32) {
+        self.delete_ue_context(ue_id);
+        self.send_an_release(ue_id).await;
+        let msg = GtpMessage::UeContextRelease { ue_id };
+        if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+            error!("Failed to send UE context release to GTP: {}", e);
+        }
+    }
+
+    /// Handles an inbound AMF Configuration Update (TS 38.413 §8.7.3).
+    ///
+    /// Updates the stored AMF configuration (name, relative capacity, served
+    /// GUAMI count) and replies with an AMF Configuration Update Acknowledge.
+    async fn handle_amf_configuration_update(
+        &mut self,
+        client_id: i32,
+        stream: u16,
+        update: nextgsim_ngap::procedures::ng_reset::AmfConfigurationUpdateData,
+    ) {
+        info!(
+            "AMF Configuration Update from AMF[{}]: name={:?}, served_guami={}, capacity={:?}, \
+             plmn_support={}",
+            client_id,
+            update.amf_name,
+            update.served_guami_count,
+            update.relative_amf_capacity,
+            update.has_plmn_support_list
+        );
+
+        if let Some(ctx) = self.amf_contexts.get_mut(&client_id) {
+            if let Some(ref name) = update.amf_name {
+                ctx.amf_name = Some(name.clone());
+            }
+            if let Some(cap) = update.relative_amf_capacity {
+                ctx.relative_capacity = cap;
+            }
+        }
+
+        let params = AmfConfigurationUpdateAcknowledgeParams::default();
+        match encode_amf_configuration_update_acknowledge(&params) {
+            Ok(data) => {
+                self.send_ngap_non_ue(client_id, stream, data).await;
+                info!(
+                    "Sent AMF Configuration Update Acknowledge to AMF[{}]",
+                    client_id
+                );
+            }
+            Err(e) => error!("Failed to encode AMF Configuration Update Acknowledge: {}", e),
         }
     }
 
@@ -2823,6 +2968,69 @@ mod tests {
         // Delete
         task.delete_ue_context(10);
         assert!(task.find_ue_context(10).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // amfg-07: NG Reset handler clears exactly the listed UE contexts
+    // ------------------------------------------------------------------
+
+    use nextgsim_ngap::procedures::ng_reset::NgResetData;
+
+    #[tokio::test]
+    async fn test_ng_reset_partial_clears_listed_contexts() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+
+        // Two UE contexts on AMF[1]; give them distinct RAN UE NGAP IDs.
+        let ran1 = task.create_ue_context(10, 1).expect("ue1");
+        let ran2 = task.create_ue_context(20, 1).expect("ue2");
+        assert_ne!(ran1, ran2);
+
+        // Reset only UE[10] by its RAN UE NGAP ID.
+        let reset = NgResetData {
+            cause: None,
+            scope: NgResetScope::Part(vec![UeAssociation {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: Some(ran1 as u32),
+            }]),
+        };
+        task.handle_ng_reset(1, 0, reset).await;
+
+        assert!(task.find_ue_context(10).is_none(), "UE[10] should be cleared");
+        assert!(task.find_ue_context(20).is_some(), "UE[20] must remain");
+    }
+
+    #[tokio::test]
+    async fn test_ng_reset_all_clears_all_contexts_for_amf() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(10, 1).expect("ue1");
+        task.create_ue_context(20, 1).expect("ue2");
+
+        let reset = NgResetData {
+            cause: None,
+            scope: NgResetScope::All,
+        };
+        task.handle_ng_reset(1, 0, reset).await;
+
+        assert!(task.find_ue_context(10).is_none());
+        assert!(task.find_ue_context(20).is_none());
     }
 
     // ------------------------------------------------------------------
