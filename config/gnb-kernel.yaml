@@ -1,0 +1,61 @@
+# gNB Configuration for NextGSim — NATIVE KERNEL SCTP variant (T0.2b)
+#
+# Identical to gnb.yaml except `sctp_backend: kernel`, so the gNB associates
+# with the AMF over real kernel SCTP (IP proto 132) instead of sctp-proto over
+# UDP. Used by docker-compose.kernel-sctp.yml to validate the nextgcore AMF's
+# native kernel-SCTP NGAP backend (no Open5GS — our own gNB <-> our own AMF).
+# Requires an nr-gnb built with `--features kernel-sctp` + libsctp at runtime.
+#
+# Network: PLMN 999-70 (matches nextgcore AMF configuration)
+# AMF Address: 172.23.0.5:38412 (nextgcore-amf container)
+
+# NR Cell Identity (36-bit value)
+nci: 0x000000010
+
+# gNB ID length in bits (22-32)
+gnb_id_length: 32
+
+# PLMN - Must match nextgcore AMF configuration
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+# Tracking Area Code (24-bit) - Must match nextgcore AMF TAI
+tac: 1
+
+# Network Slice Selection Assistance Information
+nssai:
+  - sst: 1
+    sd: null  # No SD specified (default slice)
+
+# AMF Configuration - Points to nextgcore AMF
+amf_configs:
+  - address: 172.23.0.5
+    port: 38412
+
+# NGAP SCTP transport backend: native kernel SCTP (IP proto 132).
+sctp_backend: kernel
+
+# IP addresses for gNB interfaces
+link_ip: 172.23.0.100
+ngap_ip: 172.23.0.100
+gtp_ip: 172.23.0.100
+
+# Whether to ignore SCTP stream IDs (for compatibility)
+ignore_stream_ids: false
+
+# UPF Address for GTP-U data plane forwarding
+upf_addr: 172.23.0.7
+upf_port: 2152
+
+# Rel-18 5G-Advanced features
+energy_saving_enabled: false
+
+# Rel-20 6G AI-native network function features (disabled)
+she_enabled: false
+nwdaf_enabled: false
+nkef_enabled: false
+isac_enabled: false
+agent_enabled: false
+federated_learning_enabled: false
