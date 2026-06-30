@@ -1,6 +1,7 @@
 //! OFDM-radar waveform modeling for joint sensing-communication
 //!
-//! Implements joint ISAC waveform design per 6G requirements.
+//! Illustrative OFDM-radar signal model for ISAC research (waveform/PHY design
+//! is RAN1 scope, outside 3GPP TR 22.837).
 
 use serde::{Deserialize, Serialize};
 

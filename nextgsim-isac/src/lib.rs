@@ -1,6 +1,23 @@
 //! Integrated Sensing and Communication (ISAC) for 6G Networks
 //!
-//! Implements ISAC per 3GPP TR 22.837:
+//! Models ISAC concepts from 3GPP TR 22.837 (a Stage-1 feasibility study — no
+//! normative procedures/encodings exist; the TR foreword states it "shall not
+//! be implemented"). This crate is therefore a research prototype, NOT a
+//! conformance implementation.
+//!
+//! # Scope & honesty
+//!
+//! - The fusion / positioning / tracking core (trilateration, EKF, Bayesian
+//!   fusion, OFDM-radar signal model) is research-faithful.
+//! - The SaaS exposure API, the SHE workload integration, and the ML
+//!   positioning model are illustrative stubs (see their module docs).
+//! - Authorization / consent / operator-policy gating is modeled only as a
+//!   pluggable, default-allow research stub (see [`saas::SensingPolicy`]).
+//! - Charging for sensing service (TR 22.837 §7.1.5) and on-the-wire
+//!   security/privacy of sensing data (§7.1.4-1/-3 encryption, integrity) are
+//!   out of scope for this in-process prototype.
+//!
+//! Concepts drawn from 3GPP TR 22.837:
 //! - RAN-level sensing data collection
 //! - Core aggregation and fusion
 //! - Edge inference for positioning/tracking
@@ -1511,7 +1528,7 @@ pub fn fuse_multi_sensor(
 
 // ─── 4. 3GPP TR 22.837 Sensing Use Cases ─────────────────────────────────────
 
-/// Object detection result per 3GPP TR 22.837 use case 1.
+/// Object detection result, modeling the 3GPP TR 22.837 use case 1 scenario.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectDetectionResult {
     /// Whether an object is detected as present.
@@ -1578,7 +1595,7 @@ pub fn detect_object(
     }
 }
 
-/// Velocity estimation result from Doppler measurements per 3GPP TR 22.837.
+/// Velocity estimation result from Doppler measurements, modeling a 3GPP TR 22.837 use case.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VelocityEstimate {
     /// Radial velocity towards/away from anchor (m/s). Positive = moving away.
@@ -1711,7 +1728,7 @@ pub fn estimate_velocity_doppler(
     })
 }
 
-/// Range estimation result from RTT measurements per 3GPP TR 22.837.
+/// Range estimation result from RTT measurements, modeling a 3GPP TR 22.837 use case.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeEstimate {
     /// Estimated range in meters.

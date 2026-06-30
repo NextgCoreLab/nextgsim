@@ -1,6 +1,8 @@
-//! Sensing-as-a-Service API per 3GPP TR 22.837
+//! Sensing-as-a-Service exposure API — models concepts from 3GPP TR 22.837
+//! (a Stage-1 feasibility study — no normative procedures/encodings exist).
 //!
-//! Exposure interface for 6G sensing capabilities.
+//! Illustrative in-process exposure interface for 6G sensing capabilities;
+//! NOT a conformance implementation.
 
 #![allow(missing_docs)]
 
