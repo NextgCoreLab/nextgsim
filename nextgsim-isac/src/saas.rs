@@ -3,6 +3,15 @@
 //!
 //! Illustrative in-process exposure interface for 6G sensing capabilities;
 //! NOT a conformance implementation.
+//!
+//! # Security & privacy of sensing data (TR 22.837 §7.1.4)
+//!
+//! Only authorization gating (§7.1.4-2: limit exposure of results to authorized
+//! consumers/scopes) is modeled here, via [`SensingPolicy`] and per-consumer
+//! scope filtering on `Query`. On-the-wire protection of sensing data and
+//! results (§7.1.4-1/-3: encryption, integrity, eavesdropping protection) is a
+//! transport concern that does not apply to this in-process struct API and is
+//! therefore out of scope for this prototype.
 
 #![allow(missing_docs)]
 
@@ -431,7 +440,8 @@ impl SensingAsAService {
                         message: "subscription revoked".to_string(),
                     };
                 }
-                let results = self.query_sensing_data(service_type, target_area.as_ref());
+                let results =
+                    self.query_sensing_data(&consumer, service_type, target_area.as_ref());
                 SensingApiResponse::QueryResult { results }
             }
             SensingApiRequest::UpdateQos {
@@ -480,12 +490,22 @@ impl SensingAsAService {
         }
     }
 
-    /// Queries sensing data
+    /// Queries sensing data, scoping results to the consumer's authorization.
+    ///
+    /// TR 22.837 §7.1.4-2: limit exposure of sensing results to authorized
+    /// consumers. A consumer with a non-empty `scopes` set only sees results
+    /// for service types within its scopes; an unscoped (empty-scopes) consumer
+    /// is unrestricted (backwards-compatible default).
     fn query_sensing_data(
         &self,
+        consumer: &SensingConsumer,
         service_type: SensingServiceType,
         target_area: Option<&GeographicArea>,
     ) -> Vec<SensingResult> {
+        // §7.1.4-2 result-exposure scoping.
+        if !consumer.scopes.is_empty() && !consumer.scopes.contains(&service_type) {
+            return Vec::new();
+        }
         if let Some(cached) = self.cached_results.get(&service_type) {
             // Filter by target area if specified
             if let Some(area) = target_area {
@@ -878,5 +898,54 @@ mod tests {
         assert_eq!(sub.consumer_id.as_deref(), Some("app-7"));
         assert!(sub.consent_granted);
         assert_eq!(sub.status, SubscriptionStatus::Active);
+    }
+
+    // ----- isac-04: §7.1.4-2 result-exposure scoping on Query -----
+
+    #[test]
+    fn test_query_scoped_to_consumer_scopes() {
+        let mut saas = SensingAsAService::new();
+        // Cache results for two service types.
+        saas.publish_result(SensingResult {
+            service_type: SensingServiceType::Positioning,
+            target_id: Some(1),
+            position: Some(Vector3::new(10.0, 20.0, 0.0)),
+            velocity: None,
+            confidence: 0.9,
+            timestamp_ms: 1000,
+            metadata: HashMap::new(),
+        });
+        saas.publish_result(SensingResult {
+            service_type: SensingServiceType::ObjectDetection,
+            target_id: Some(2),
+            position: Some(Vector3::new(5.0, 5.0, 0.0)),
+            velocity: None,
+            confidence: 0.9,
+            timestamp_ms: 1000,
+            metadata: HashMap::new(),
+        });
+
+        // Consumer scoped to Positioning only.
+        let consumer = SensingConsumer::new("app-1", true, vec![SensingServiceType::Positioning]);
+
+        // Querying an in-scope type returns results.
+        match saas.handle_request(SensingApiRequest::Query {
+            consumer: consumer.clone(),
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+        }) {
+            SensingApiResponse::QueryResult { results } => assert_eq!(results.len(), 1),
+            other => panic!("expected QueryResult, got {other:?}"),
+        }
+
+        // Querying an out-of-scope type returns no results (§7.1.4-2).
+        match saas.handle_request(SensingApiRequest::Query {
+            consumer,
+            service_type: SensingServiceType::ObjectDetection,
+            target_area: None,
+        }) {
+            SensingApiResponse::QueryResult { results } => assert!(results.is_empty()),
+            other => panic!("expected empty QueryResult, got {other:?}"),
+        }
     }
 }
