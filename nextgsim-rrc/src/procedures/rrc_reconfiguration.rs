@@ -139,6 +139,132 @@ fn build_v1530_extension(params: &RrcReconfigurationParams) -> RRCReconfiguratio
     }
 }
 
+// ============================================================================
+// amfg-04: structured RadioBearerConfig / DRB / SDAP / CellGroupConfig builders
+// ============================================================================
+//
+// TS 38.331 §5.3.5.6.5/§6.3.2: an RRCReconfiguration that establishes a PDU
+// session's user plane carries a RadioBearerConfig with one DRB-ToAddMod per
+// PDU session; the DRB's cn-Association is an SDAP-Config keyed to the PDU
+// session id with the accepted QoS flows (QFIs) mapped via
+// mappedQoS-FlowsToAdd, plus a matching CellGroupConfig (one RLC bearer per
+// DRB). Previously these were passed as opaque pre-encoded bytes and only the
+// first QoS flow was honoured; these constructors build the real structured
+// config from the full accepted-QFI set.
+
+/// Build a `RadioBearerConfig` carrying a single DRB for one PDU session.
+///
+/// * `pdu_session_id` — the 5GS PDU session id the DRB serves.
+/// * `drb_id` — the data radio bearer identity (1..=32).
+/// * `qfis` — every accepted QoS Flow Identifier to map in SDAP
+///   (`mappedQoS-FlowsToAdd`); when empty the field is omitted (the ASN.1
+///   SEQUENCE-OF has a lower bound of 1).
+/// * `default_drb` — whether this DRB is the SDAP default DRB for the session.
+///
+/// The SDAP header for DL and UL is set to PRESENT (3-byte SDAP header), which
+/// is required when QoS flow remapping/QFI carriage is in use.
+pub fn build_drb_radio_bearer_config(
+    pdu_session_id: u8,
+    drb_id: u8,
+    qfis: &[u8],
+    default_drb: bool,
+) -> RadioBearerConfig {
+    let mapped_qo_s_flows_to_add = if qfis.is_empty() {
+        None
+    } else {
+        Some(SDAP_ConfigMappedQoS_FlowsToAdd(
+            qfis.iter().map(|q| QFI(*q)).collect(),
+        ))
+    };
+
+    let sdap_config = SDAP_Config {
+        pdu_session: PDU_SessionID(pdu_session_id),
+        sdap_header_dl: SDAP_ConfigSdap_HeaderDL(SDAP_ConfigSdap_HeaderDL::PRESENT),
+        sdap_header_ul: SDAP_ConfigSdap_HeaderUL(SDAP_ConfigSdap_HeaderUL::PRESENT),
+        default_drb: SDAP_ConfigDefaultDRB(default_drb),
+        mapped_qo_s_flows_to_add,
+        mapped_qo_s_flows_to_release: None,
+    };
+
+    // Minimal but valid PDCP-Config (all optional sub-fields absent).
+    let pdcp_config = PDCP_Config {
+        drb: None,
+        more_than_one_rlc: None,
+        t_reordering: None,
+    };
+
+    let drb = DRB_ToAddMod {
+        cn_association: Some(DRB_ToAddModCnAssociation::Sdap_Config(sdap_config)),
+        drb_identity: DRB_Identity(drb_id),
+        reestablish_pdcp: None,
+        recover_pdcp: None,
+        pdcp_config: Some(pdcp_config),
+    };
+
+    RadioBearerConfig {
+        srb_to_add_mod_list: None,
+        srb3_to_release: None,
+        drb_to_add_mod_list: Some(DRB_ToAddModList(vec![drb])),
+        drb_to_release_list: None,
+        security_config: None,
+    }
+}
+
+/// Build a `CellGroupConfig` (master cell group) with one RLC bearer for the
+/// given DRB. `lcid` is the logical channel identity carrying the DRB.
+pub fn build_cell_group_config(drb_id: u8, lcid: u8) -> CellGroupConfig {
+    let rlc_bearer = RLC_BearerConfig {
+        logical_channel_identity: LogicalChannelIdentity(lcid),
+        served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Drb_Identity(DRB_Identity(
+            drb_id,
+        ))),
+        reestablish_rlc: None,
+        rlc_config: None,
+        mac_logical_channel_config: None,
+    };
+
+    CellGroupConfig {
+        cell_group_id: CellGroupId(0),
+        rlc_bearer_to_add_mod_list: Some(CellGroupConfigRlc_BearerToAddModList(vec![rlc_bearer])),
+        rlc_bearer_to_release_list: None,
+        mac_cell_group_config: None,
+        physical_cell_group_config: None,
+        sp_cell_config: None,
+        s_cell_to_add_mod_list: None,
+        s_cell_to_release_list: None,
+    }
+}
+
+/// amfg-04: build a fully-structured `RrcReconfigurationParams` for bringing up
+/// one PDU session's DRB. The structured `RadioBearerConfig` and
+/// `CellGroupConfig` are UPER-encoded into the existing byte-carrying param
+/// fields (`radio_bearer_config` is decoded back and embedded structurally by
+/// `build_rrc_reconfiguration`; `master_cell_group` is carried as the
+/// `OCTET STRING (CONTAINING CellGroupConfig)` masterCellGroup IE). The opaque
+/// byte path is preserved for callers that already have pre-encoded config.
+pub fn build_drb_reconfiguration_params(
+    rrc_transaction_id: u8,
+    pdu_session_id: u8,
+    drb_id: u8,
+    lcid: u8,
+    qfis: &[u8],
+    default_drb: bool,
+) -> Result<RrcReconfigurationParams, RrcReconfigurationError> {
+    let rbc = build_drb_radio_bearer_config(pdu_session_id, drb_id, qfis, default_drb);
+    let cgc = build_cell_group_config(drb_id, lcid);
+
+    let radio_bearer_config = encode_rrc(&rbc)?;
+    let master_cell_group = encode_rrc(&cgc)?;
+
+    Ok(RrcReconfigurationParams {
+        rrc_transaction_id,
+        radio_bearer_config: Some(radio_bearer_config),
+        secondary_cell_group: None,
+        master_cell_group: Some(master_cell_group),
+        full_config: false,
+    })
+}
+
 /// Parse an RRC Reconfiguration from a DL-DCCH message
 pub fn parse_rrc_reconfiguration(
     msg: &DL_DCCH_Message,
@@ -496,5 +622,133 @@ mod tests {
             let data = parse_rrc_reconfiguration_complete(&msg).unwrap();
             assert_eq!(data.rrc_transaction_id, id);
         }
+    }
+
+    // ========================================================================
+    // amfg-04: structured DRB / SDAP / CellGroup tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_drb_radio_bearer_config_maps_all_qfis() {
+        let qfis = [1u8, 5, 9];
+        let rbc = build_drb_radio_bearer_config(2, 1, &qfis, true);
+
+        let drb_list = rbc
+            .drb_to_add_mod_list
+            .as_ref()
+            .expect("DRB-ToAddModList present");
+        assert_eq!(drb_list.0.len(), 1);
+        let drb = &drb_list.0[0];
+        assert_eq!(drb.drb_identity.0, 1);
+
+        let sdap = match drb.cn_association.as_ref().expect("cn-Association present") {
+            DRB_ToAddModCnAssociation::Sdap_Config(s) => s,
+            _ => panic!("expected SDAP-Config cn-Association"),
+        };
+        assert_eq!(sdap.pdu_session.0, 2);
+        assert!(sdap.default_drb.0);
+        let mapped = sdap
+            .mapped_qo_s_flows_to_add
+            .as_ref()
+            .expect("mappedQoS-FlowsToAdd present");
+        let mapped_vals: Vec<u8> = mapped.0.iter().map(|q| q.0).collect();
+        assert_eq!(mapped_vals, vec![1, 5, 9]);
+    }
+
+    #[test]
+    fn test_build_drb_radio_bearer_config_empty_qfis_omits_mapping() {
+        let rbc = build_drb_radio_bearer_config(1, 1, &[], false);
+        let drb = &rbc.drb_to_add_mod_list.as_ref().unwrap().0[0];
+        let sdap = match drb.cn_association.as_ref().unwrap() {
+            DRB_ToAddModCnAssociation::Sdap_Config(s) => s,
+            _ => panic!("expected SDAP-Config"),
+        };
+        assert!(sdap.mapped_qo_s_flows_to_add.is_none());
+    }
+
+    #[test]
+    fn test_radio_bearer_config_uper_roundtrip() {
+        let qfis = [1u8, 2, 3];
+        let rbc = build_drb_radio_bearer_config(4, 2, &qfis, true);
+        let bytes = encode_rrc(&rbc).expect("encode RadioBearerConfig");
+        let decoded: RadioBearerConfig = decode_rrc(&bytes).expect("decode RadioBearerConfig");
+        assert_eq!(decoded, rbc);
+
+        // Confirm the decoded SDAP carries the same QFIs.
+        let drb = &decoded.drb_to_add_mod_list.unwrap().0[0];
+        let sdap = match drb.cn_association.as_ref().unwrap() {
+            DRB_ToAddModCnAssociation::Sdap_Config(s) => s,
+            _ => panic!("expected SDAP-Config"),
+        };
+        let mapped: Vec<u8> = sdap
+            .mapped_qo_s_flows_to_add
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .map(|q| q.0)
+            .collect();
+        assert_eq!(mapped, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_cell_group_config_uper_roundtrip() {
+        let cgc = build_cell_group_config(2, 4);
+        let bytes = encode_rrc(&cgc).expect("encode CellGroupConfig");
+        let decoded: CellGroupConfig = decode_rrc(&bytes).expect("decode CellGroupConfig");
+        assert_eq!(decoded, cgc);
+
+        let rlc_list = decoded
+            .rlc_bearer_to_add_mod_list
+            .expect("RLC bearer list present");
+        assert_eq!(rlc_list.0.len(), 1);
+        assert_eq!(rlc_list.0[0].logical_channel_identity.0, 4);
+        match rlc_list.0[0].served_radio_bearer.as_ref().unwrap() {
+            RLC_BearerConfigServedRadioBearer::Drb_Identity(d) => assert_eq!(d.0, 2),
+            _ => panic!("expected served DRB identity"),
+        }
+    }
+
+    #[test]
+    fn test_build_drb_reconfiguration_params_full_message_roundtrip() {
+        let qfis = [1u8, 6, 7];
+        let params = build_drb_reconfiguration_params(1, 5, 1, 4, &qfis, true)
+            .expect("build structured reconfig params");
+
+        // Build the full RRCReconfiguration and round-trip through UPER.
+        let encoded = encode_rrc_reconfiguration(&params).expect("encode RRCReconfiguration");
+        let data = decode_rrc_reconfiguration(&encoded).expect("decode RRCReconfiguration");
+
+        // The carried radio_bearer_config decodes back to the structured DRB.
+        let rbc_bytes = data
+            .radio_bearer_config
+            .expect("radio_bearer_config present after roundtrip");
+        let rbc: RadioBearerConfig = decode_rrc(&rbc_bytes).expect("decode RBC");
+        let drb_list = rbc.drb_to_add_mod_list.expect("DRB list");
+        assert_eq!(drb_list.0.len(), 1);
+        let sdap = match drb_list.0[0].cn_association.as_ref().unwrap() {
+            DRB_ToAddModCnAssociation::Sdap_Config(s) => s,
+            _ => panic!("expected SDAP-Config"),
+        };
+        assert_eq!(sdap.pdu_session.0, 5);
+        let mapped: Vec<u8> = sdap
+            .mapped_qo_s_flows_to_add
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .map(|q| q.0)
+            .collect();
+        assert_eq!(mapped, vec![1, 6, 7]);
+
+        // The masterCellGroup octet string decodes back to the structured cell group.
+        let mcg_bytes = data.master_cell_group.expect("master_cell_group present");
+        let cgc: CellGroupConfig = decode_rrc(&mcg_bytes).expect("decode CGC");
+        assert_eq!(
+            cgc.rlc_bearer_to_add_mod_list.unwrap().0[0]
+                .logical_channel_identity
+                .0,
+            4
+        );
     }
 }
