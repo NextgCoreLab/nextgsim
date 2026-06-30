@@ -1667,6 +1667,17 @@ impl MmOrchestrator {
             warn!("Downlink NAS-MAC verification failed ({e}): message discarded");
             return Vec::new();
         }
+        // TS 24.501 4.4.3.1 / 4.4.4.2: after a successful integrity check the
+        // estimated downlink NAS COUNT must be strictly greater than the last
+        // accepted one; a replayed or non-monotonic COUNT is discarded.
+        if !self.sec.is_acceptable_downlink_count(&count) {
+            warn!(
+                "Downlink NAS COUNT {} not greater than last accepted {}: replay / non-monotonic, discarded",
+                count.to_u32(),
+                self.sec.downlink_count().to_u32()
+            );
+            return Vec::new();
+        }
         self.sec.update_downlink_count(&count);
 
         let mut plain = payload.to_vec();
@@ -2330,6 +2341,19 @@ mod tests {
         let outs = orch.handle_downlink(&auth);
         let resp = first_sent_pdu(&outs);
         assert_eq!(resp[2], u8::from(MmMessageType::AuthenticationResponse));
+    }
+
+    #[test]
+    fn test_duplicate_downlink_pdu_replay_rejected() {
+        // TS 24.501 4.4.3.1 / 4.4.4.2 (ue-02): a replayed (duplicated) protected
+        // downlink message is discarded on the second delivery (non-monotonic
+        // NAS COUNT), producing no further MmOutput.
+        let mut orch = establish_security_context();
+        let accept = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        let first = orch.handle_downlink(&accept);
+        assert!(!first.is_empty(), "first delivery must be processed");
+        let second = orch.handle_downlink(&accept);
+        assert!(second.is_empty(), "replayed downlink PDU must be discarded");
     }
 
     #[test]
