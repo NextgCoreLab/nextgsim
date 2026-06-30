@@ -261,6 +261,11 @@ pub enum SensingApiRequest {
         target_area: Option<GeographicArea>,
         qos: SensingQos,
         update_interval_ms: u32,
+        /// Advisory callback URL for result notifications. Stored on the
+        /// subscription; in-process delivery uses
+        /// [`SensingAsAService::register_result_sink`] (no wire callback).
+        #[serde(default)]
+        callback_url: Option<String>,
     },
     /// Unsubscribe from a service
     Unsubscribe { subscription_id: u64 },
@@ -369,6 +374,12 @@ pub struct SensingAsAService {
     max_cache_size: usize,
     /// Authorization decision point for Subscribe/Query (TR 22.837 §7.1.2).
     policy: Box<dyn SensingPolicy>,
+    /// In-process push sinks keyed by subscription id (TR 22.837 §7.1.3-3).
+    ///
+    /// Optional notify path: a consumer may register an mpsc sender for a
+    /// subscription; matching `publish_result`s are pushed to it. This is the
+    /// in-process equivalent of a callback and is NOT a wire callback.
+    result_sinks: HashMap<u64, std::sync::mpsc::Sender<SensingResult>>,
 }
 
 impl SensingAsAService {
@@ -385,7 +396,20 @@ impl SensingAsAService {
             cached_results: HashMap::new(),
             max_cache_size: 1000,
             policy,
+            result_sinks: HashMap::new(),
         }
+    }
+
+    /// Registers an in-process push sink for a subscription (TR 22.837 §7.1.3-3).
+    ///
+    /// Matching results published via [`Self::publish_result`] are delivered to
+    /// `sink`. Dropped receivers are pruned automatically on the next publish.
+    pub fn register_result_sink(
+        &mut self,
+        subscription_id: u64,
+        sink: std::sync::mpsc::Sender<SensingResult>,
+    ) {
+        self.result_sinks.insert(subscription_id, sink);
     }
 
     /// Handles an API request
@@ -408,6 +432,7 @@ impl SensingAsAService {
                 target_area,
                 qos,
                 update_interval_ms,
+                callback_url,
             } => {
                 let subscription_id = self.next_subscription_id;
                 self.next_subscription_id += 1;
@@ -418,7 +443,7 @@ impl SensingAsAService {
                     target_area,
                     update_interval_ms,
                     qos,
-                    callback_url: None,
+                    callback_url,
                     created_at_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .expect("value expected")
@@ -438,6 +463,7 @@ impl SensingAsAService {
             }
             SensingApiRequest::Unsubscribe { subscription_id } => {
                 self.subscriptions.remove(&subscription_id);
+                self.result_sinks.remove(&subscription_id);
                 SensingApiResponse::Unsubscribed { subscription_id }
             }
             SensingApiRequest::Query {
@@ -547,19 +573,46 @@ impl SensingAsAService {
     }
 
     /// Publishes sensing results (called by sensing system)
+    ///
+    /// Caches the result and pushes it to any registered in-process sinks whose
+    /// Active subscription matches the result's service type and target area
+    /// (TR 22.837 §7.1.3-3). Sinks whose receiver has been dropped are pruned.
     pub fn publish_result(&mut self, result: SensingResult) {
         let service_type = result.service_type;
-        let cache = self.cached_results.entry(service_type).or_default();
 
+        // Fan out to matching subscribers before caching (avoids cloning the
+        // cached copy). Only Active subscriptions with a registered sink and a
+        // matching service type / target area are notified.
+        let mut dropped: Vec<u64> = Vec::new();
+        for (sub_id, sink) in &self.result_sinks {
+            let Some(sub) = self.subscriptions.get(sub_id) else {
+                continue;
+            };
+            if sub.status != SubscriptionStatus::Active || sub.service_type != service_type {
+                continue;
+            }
+            // Respect the subscription's target area, if any.
+            if let (Some(area), Some(pos)) = (&sub.target_area, &result.position) {
+                if !area.contains(pos) {
+                    continue;
+                }
+            }
+            if sink.send(result.clone()).is_err() {
+                // Receiver dropped — schedule the sink for pruning.
+                dropped.push(*sub_id);
+            }
+        }
+        for sub_id in dropped {
+            self.result_sinks.remove(&sub_id);
+        }
+
+        let cache = self.cached_results.entry(service_type).or_default();
         cache.push(result);
 
         // Trim cache
         if cache.len() > self.max_cache_size {
             cache.drain(0..cache.len() - self.max_cache_size);
         }
-
-        // Notify subscribers (in a real implementation)
-        // This would trigger callbacks for active subscriptions
     }
 
     /// Returns active subscriptions
@@ -619,6 +672,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         };
 
         let response = saas.handle_request(request);
@@ -648,6 +702,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         };
         saas.handle_request(request);
 
@@ -761,6 +816,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         };
         saas.handle_request(request);
 
@@ -803,6 +859,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         };
         assert!(matches!(
             saas.handle_request(request),
@@ -820,6 +877,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         };
         match saas.handle_request(request) {
             SensingApiResponse::Error { code, .. } => assert_eq!(code, 403),
@@ -837,6 +895,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         };
         assert!(matches!(
             saas.handle_request(request),
@@ -855,6 +914,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         };
         match saas.handle_request(request) {
             SensingApiResponse::Error { code, .. } => assert_eq!(code, 403),
@@ -874,6 +934,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         }) {
             SensingApiResponse::Subscribed {
                 subscription_id, ..
@@ -921,6 +982,7 @@ mod tests {
             target_area: None,
             qos: SensingQos::default(),
             update_interval_ms: 100,
+            callback_url: None,
         });
         let sub = saas.subscriptions.get(&1).unwrap();
         assert_eq!(sub.consumer_id.as_deref(), Some("app-7"));
@@ -1019,5 +1081,117 @@ mod tests {
         let qos: SensingQos = serde_json::from_str(legacy).unwrap();
         assert_eq!(qos.missed_detection_rate, None);
         assert_eq!(qos.false_alarm_rate, None);
+    }
+
+    // ----- isac-07: in-process subscription notify path (§7.1.3-3) -----
+
+    fn subscribe_returning_id(
+        saas: &mut SensingAsAService,
+        service_type: SensingServiceType,
+    ) -> u64 {
+        match saas.handle_request(SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::anonymous(),
+            service_type,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+            callback_url: None,
+        }) {
+            SensingApiResponse::Subscribed {
+                subscription_id, ..
+            } => subscription_id,
+            other => panic!("expected Subscribed, got {other:?}"),
+        }
+    }
+
+    fn make_result(service_type: SensingServiceType) -> SensingResult {
+        SensingResult {
+            service_type,
+            target_id: Some(1),
+            position: None,
+            velocity: None,
+            confidence: 0.9,
+            timestamp_ms: 1,
+            missed_detection_rate: None,
+            false_alarm_rate: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_publish_pushes_to_matching_sink() {
+        let mut saas = SensingAsAService::new();
+        let sub_id = subscribe_returning_id(&mut saas, SensingServiceType::Positioning);
+        let (tx, rx) = std::sync::mpsc::channel();
+        saas.register_result_sink(sub_id, tx);
+
+        // Matching service type -> delivered.
+        saas.publish_result(make_result(SensingServiceType::Positioning));
+        let got = rx.try_recv().expect("expected a pushed result");
+        assert_eq!(got.service_type, SensingServiceType::Positioning);
+
+        // Non-matching service type -> not delivered.
+        saas.publish_result(make_result(SensingServiceType::ObjectDetection));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_publish_respects_subscription_target_area() {
+        let mut saas = SensingAsAService::new();
+        let sub_id = match saas.handle_request(SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::anonymous(),
+            service_type: SensingServiceType::Positioning,
+            target_area: Some(GeographicArea::new(Vector3::new(0.0, 0.0, 0.0), 50.0)),
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+            callback_url: None,
+        }) {
+            SensingApiResponse::Subscribed {
+                subscription_id, ..
+            } => subscription_id,
+            other => panic!("expected Subscribed, got {other:?}"),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        saas.register_result_sink(sub_id, tx);
+
+        // Inside the area -> delivered.
+        let mut inside = make_result(SensingServiceType::Positioning);
+        inside.position = Some(Vector3::new(10.0, 10.0, 0.0));
+        saas.publish_result(inside);
+        assert!(rx.try_recv().is_ok());
+
+        // Outside the area -> not delivered.
+        let mut outside = make_result(SensingServiceType::Positioning);
+        outside.position = Some(Vector3::new(500.0, 500.0, 0.0));
+        saas.publish_result(outside);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_publish_prunes_dropped_sink() {
+        let mut saas = SensingAsAService::new();
+        let sub_id = subscribe_returning_id(&mut saas, SensingServiceType::Positioning);
+        let (tx, rx) = std::sync::mpsc::channel();
+        saas.register_result_sink(sub_id, tx);
+
+        // Drop the receiver; the next publish should prune the sink.
+        drop(rx);
+        saas.publish_result(make_result(SensingServiceType::Positioning));
+        assert!(!saas.result_sinks.contains_key(&sub_id));
+    }
+
+    #[test]
+    fn test_callback_url_wired_from_request() {
+        let mut saas = SensingAsAService::new();
+        saas.handle_request(SensingApiRequest::Subscribe {
+            consumer: SensingConsumer::anonymous(),
+            service_type: SensingServiceType::Positioning,
+            target_area: None,
+            qos: SensingQos::default(),
+            update_interval_ms: 100,
+            callback_url: Some("inproc://app-1".to_string()),
+        });
+        let sub = saas.subscriptions.get(&1).unwrap();
+        assert_eq!(sub.callback_url.as_deref(), Some("inproc://app-1"));
     }
 }
