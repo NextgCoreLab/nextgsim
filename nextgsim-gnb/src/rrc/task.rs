@@ -693,6 +693,16 @@ impl Task for RrcTask {
                                 );
                                 self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
                             }
+                            RrcMessage::RrcReconfiguration { ue_id, pdu } => {
+                                // TS 38.331 §5.3.5.6: deliver the RRCReconfiguration
+                                // (DRB setup) on SRB1 (DL-DCCH).
+                                info!(
+                                    "Sending RRC Reconfiguration to UE {} ({} bytes)",
+                                    ue_id,
+                                    pdu.len()
+                                );
+                                self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                            }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
                             }

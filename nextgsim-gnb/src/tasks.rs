@@ -406,6 +406,15 @@ pub enum RrcMessage {
         /// Encoded DL-DCCH SecurityModeCommand PDU
         pdu: OctetString,
     },
+    /// RRC Reconfiguration delivery on DL-DCCH (from NGAP, on PDU Session
+    /// Resource Setup — TS 38.331 §5.3.5.6) establishing a PDU session's DRB.
+    /// Carries the encoded DL-DCCH RRCReconfiguration PDU.
+    RrcReconfiguration {
+        /// UE ID
+        ue_id: i32,
+        /// Encoded DL-DCCH RRCReconfiguration PDU
+        pdu: OctetString,
+    },
     /// AN release request (from NGAP)
     AnRelease {
         /// UE ID

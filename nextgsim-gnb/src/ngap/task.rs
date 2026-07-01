@@ -29,6 +29,9 @@ use nextgsim_common::OctetString;
 use super::amf_context::{AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
+use nextgsim_rrc::procedures::rrc_reconfiguration::{
+    build_drb_reconfiguration_params, encode_rrc_reconfiguration,
+};
 use nextgsim_rrc::procedures::security_mode::{
     encode_security_mode_command, CipheringAlgorithmType, IntegrityAlgorithmType,
     SecurityAlgorithms, SecurityModeCommandParams,
@@ -811,6 +814,58 @@ impl NgapTask {
     /// (`PDUSessionResourceSetupListCxtReq`, TS 38.413 §8.3.1.2). Returns the
     /// success item, or a FailedToSetup item (with an APER unsuccessful-transfer)
     /// on any error.
+    /// TS 38.331 §5.3.5.6 / TS 38.300 §16.1.4: establish the user-plane DRB for
+    /// a PDU session by sending an RRCReconfiguration carrying a
+    /// RadioBearerConfig (one DRB-ToAddMod with an SDAP-Config keyed to the PDU
+    /// session id and the accepted QFIs in mappedQoS-FlowsToAdd) plus the
+    /// matching CellGroupConfig (one RLC bearer). Requires AS security to be
+    /// active (established at Initial Context Setup, C5).
+    async fn establish_drb(&mut self, ue_id: i32, psi: u8, qfis: &[u8]) {
+        if !self
+            .ue_contexts
+            .values()
+            .any(|c| c.ue_id == ue_id && c.as_security.is_some())
+        {
+            warn!(
+                "Establishing DRB for PDU session {} on UE {} without active AS security",
+                psi, ue_id
+            );
+        }
+        // One DRB per PDU session; DRB identity 1..=32, DTCH LCID above the SRBs.
+        let drb_id = psi.clamp(1, 32);
+        let lcid = (3 + drb_id).min(32);
+        let params = match build_drb_reconfiguration_params(0, psi, drb_id, lcid, qfis, true) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    "Failed to build DRB reconfiguration for PDU session {}: {}",
+                    psi, e
+                );
+                return;
+            }
+        };
+        match encode_rrc_reconfiguration(&params) {
+            Ok(pdu) => {
+                let msg = RrcMessage::RrcReconfiguration {
+                    ue_id,
+                    pdu: OctetString::from_slice(&pdu),
+                };
+                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                    error!("Failed to hand RRCReconfiguration to RRC task: {}", e);
+                } else {
+                    info!(
+                        "Sent RRCReconfiguration establishing DRB {} for PDU session {} (QFIs {:?})",
+                        drb_id, psi, qfis
+                    );
+                }
+            }
+            Err(e) => error!(
+                "Failed to encode RRCReconfiguration for PDU session {}: {}",
+                psi, e
+            ),
+        }
+    }
+
     async fn setup_one_pdu_session(
         &mut self,
         ue_id: i32,
@@ -909,6 +964,11 @@ impl NgapTask {
             }
         }
 
+        // TS 38.331 §5.3.5.6: establish the PDU session's user-plane DRB via an
+        // RRCReconfiguration carrying the accepted QoS flows (QFIs).
+        let accepted_qfis: Vec<u8> = request.qos_flows.iter().map(|f| f.qfi).collect();
+        self.establish_drb(ue_id, psi, &accepted_qfis).await;
+
         // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
         // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
         let transfer_params = SetupResponseTransferParams {
@@ -916,7 +976,7 @@ impl NgapTask {
                 address: gnb_ip,
                 teid: gnb_teid,
             },
-            accepted_qfis: request.qos_flows.iter().map(|f| f.qfi).collect(),
+            accepted_qfis,
             failed_qos_flows: vec![],
         };
         match encode_setup_response_transfer(&transfer_params) {
@@ -3151,6 +3211,22 @@ mod tests {
         assert_ne!(k_rrc_enc, [0u8; 16]);
         assert_ne!(k_rrc_enc, k_rrc_int);
         assert_ne!(k_rrc_enc, k_up_enc);
+    }
+
+    #[test]
+    fn test_gnb_drb_reconfiguration_is_valid_and_carries_qfis() {
+        use nextgsim_rrc::codec::decode_rrc;
+        use nextgsim_rrc::codec::generated::DL_DCCH_Message;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::is_rrc_reconfiguration;
+
+        // The exact call establish_drb makes: PDU session 5, DRB 5, LCID 8,
+        // accepted QFIs 1 & 9. The result must be a decodable DL-DCCH
+        // RRCReconfiguration.
+        let params = build_drb_reconfiguration_params(0, 5, 5, 8, &[1, 9], true).unwrap();
+        let bytes = encode_rrc_reconfiguration(&params).unwrap();
+        assert!(!bytes.is_empty());
+        let msg: DL_DCCH_Message = decode_rrc(&bytes).unwrap();
+        assert!(is_rrc_reconfiguration(&msg));
     }
 
     #[test]
