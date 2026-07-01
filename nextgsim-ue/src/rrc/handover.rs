@@ -24,8 +24,7 @@
 use std::time::{Duration, Instant};
 
 /// Handover states
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandoverState {
     /// No handover in progress
     #[default]
@@ -39,7 +38,6 @@ pub enum HandoverState {
     /// Handover failed
     Failed,
 }
-
 
 /// Handover failure cause
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

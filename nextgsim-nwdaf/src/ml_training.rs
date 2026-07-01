@@ -402,8 +402,7 @@ impl Default for MlModelTrainingService {
 // ============================================================================
 
 /// Federated learning aggregation strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FederatedStrategy {
     /// `FedAvg`: Weighted average of model parameters
     #[default]
@@ -413,7 +412,6 @@ pub enum FederatedStrategy {
     /// `FedSGD`: Stochastic gradient aggregation
     FedSgd,
 }
-
 
 /// Model update from a participant NWDAF instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]

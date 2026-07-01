@@ -30,8 +30,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Measurement quantity types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum MeasQuantity {
     /// SS-RSRP (Reference Signal Received Power)
     #[default]
@@ -41,7 +40,6 @@ pub enum MeasQuantity {
     /// SS-SINR (Signal-to-Interference-plus-Noise Ratio)
     SsSinr,
 }
-
 
 /// Measurement event types for event-triggered reporting
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

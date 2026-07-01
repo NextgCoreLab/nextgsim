@@ -448,8 +448,7 @@ impl SensingAsAService {
                         .duration_since(std::time::UNIX_EPOCH)
                         .expect("value expected")
                         .as_millis() as u64,
-                    consumer_id: (!consumer.consumer_id.is_empty())
-                        .then_some(consumer.consumer_id),
+                    consumer_id: (!consumer.consumer_id.is_empty()).then_some(consumer.consumer_id),
                     consent_granted: consumer.consent_granted,
                     status: SubscriptionStatus::Active,
                 };
@@ -1077,7 +1076,8 @@ mod tests {
     #[test]
     fn test_kpi_fields_default_to_none_for_legacy_json() {
         // A legacy QoS payload without the new KPI fields still deserializes.
-        let legacy = r#"{"accuracy_m":1.0,"max_latency_ms":100,"min_confidence":0.8,"update_rate_hz":10.0}"#;
+        let legacy =
+            r#"{"accuracy_m":1.0,"max_latency_ms":100,"min_confidence":0.8,"update_rate_hz":10.0}"#;
         let qos: SensingQos = serde_json::from_str(legacy).unwrap();
         assert_eq!(qos.missed_detection_rate, None);
         assert_eq!(qos.false_alarm_rate, None);

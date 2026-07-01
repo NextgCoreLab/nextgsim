@@ -325,21 +325,18 @@ pub fn parse_ue_cli_command(input: &str) -> Result<UeCliCommandType, String> {
             let mut i = 1;
             while i < tokens.len() {
                 match tokens[i] {
-                    "--type" | "-t"
-                        if i + 1 < tokens.len() => {
-                            session_type = Some(tokens[i + 1].to_string());
-                            i += 1;
-                        }
-                    "--apn" | "-a"
-                        if i + 1 < tokens.len() => {
-                            apn = Some(tokens[i + 1].to_string());
-                            i += 1;
-                        }
-                    "--sst" | "-s"
-                        if i + 1 < tokens.len() => {
-                            s_nssai = Some(tokens[i + 1].to_string());
-                            i += 1;
-                        }
+                    "--type" | "-t" if i + 1 < tokens.len() => {
+                        session_type = Some(tokens[i + 1].to_string());
+                        i += 1;
+                    }
+                    "--apn" | "-a" if i + 1 < tokens.len() => {
+                        apn = Some(tokens[i + 1].to_string());
+                        i += 1;
+                    }
+                    "--sst" | "-s" if i + 1 < tokens.len() => {
+                        s_nssai = Some(tokens[i + 1].to_string());
+                        i += 1;
+                    }
                     _ => {}
                 }
                 i += 1;

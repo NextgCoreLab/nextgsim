@@ -476,7 +476,10 @@ mod tests {
         let q = pipeline
             .estimate_quality(&input, &perturbed)
             .expect("comparable tensors should be measurable");
-        assert!(q > 0.0 && q < 1.0, "expected measured quality in (0,1), got {q}");
+        assert!(
+            q > 0.0 && q < 1.0,
+            "expected measured quality in (0,1), got {q}"
+        );
 
         // A compressing model (different element count) is not measurable here.
         let compressed = TensorData::float32(vec![1.0], vec![1]);

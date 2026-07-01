@@ -689,8 +689,10 @@ impl FederatedAggregator {
     pub fn with_dp_config(mut self, config: DifferentialPrivacyConfig) -> Self {
         if config.enabled {
             self.privacy_tracker = Some(PrivacyBudgetTracker::new(&config));
-            self.privacy_tracker_renyi =
-                Some(RenyiDPTracker::new(config.target_epsilon, config.target_delta));
+            self.privacy_tracker_renyi = Some(RenyiDPTracker::new(
+                config.target_epsilon,
+                config.target_delta,
+            ));
         }
         self.dp_config = config;
         self
@@ -944,29 +946,37 @@ impl FederatedAggregator {
                 // Extract gradients in a deterministic (sorted-key) order.
                 let mut keys: Vec<&String> = updates_clone.keys().collect();
                 keys.sort();
-                let grads: Vec<Vec<f32>> =
-                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
                 krum_aggregate(&grads, num_byzantine)
             }
             AggregationAlgorithm::MultiKrum { num_byzantine, m } => {
                 let mut keys: Vec<&String> = updates_clone.keys().collect();
                 keys.sort();
-                let grads: Vec<Vec<f32>> =
-                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
                 multi_krum_aggregate(&grads, num_byzantine, m)
             }
             AggregationAlgorithm::TrimmedMean { trim_ratio } => {
                 let mut keys: Vec<&String> = updates_clone.keys().collect();
                 keys.sort();
-                let grads: Vec<Vec<f32>> =
-                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
                 trimmed_mean_aggregate(&grads, trim_ratio)
             }
             AggregationAlgorithm::Median => {
                 let mut keys: Vec<&String> = updates_clone.keys().collect();
                 keys.sort();
-                let grads: Vec<Vec<f32>> =
-                    keys.iter().map(|k| updates_clone[*k].gradients.clone()).collect();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
                 median_aggregate(&grads)
             }
         };
@@ -2539,7 +2549,10 @@ mod tests {
         let out_a = aggregator.apply_dp_with_rng(&update, &mut rng_a);
         let mut rng_b = StdRng::seed_from_u64(42);
         let out_b = aggregator.apply_dp_with_rng(&update, &mut rng_b);
-        assert_eq!(out_a.gradients, out_b.gradients, "seeded DP must be deterministic");
+        assert_eq!(
+            out_a.gradients, out_b.gradients,
+            "seeded DP must be deterministic"
+        );
 
         // Noise was actually added (clip-then-Gaussian ordering applied).
         assert_ne!(
@@ -3304,9 +3317,8 @@ mod tests {
     fn test_trimmed_mean_dispatch_reachable() {
         let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
         // trim_ratio=0.4 removes 1 from each tail (floor(5*0.4/2)=1), leaving 3 middle values
-        let result = run_byzantine_aggregation(AggregationAlgorithm::TrimmedMean {
-            trim_ratio: 0.4,
-        });
+        let result =
+            run_byzantine_aggregation(AggregationAlgorithm::TrimmedMean { trim_ratio: 0.4 });
         assert_eq!(result.len(), 3);
         assert!(
             result[0] < plain_mean,

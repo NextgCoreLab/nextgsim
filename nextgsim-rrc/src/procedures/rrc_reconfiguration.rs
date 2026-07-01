@@ -215,9 +215,9 @@ pub fn build_drb_radio_bearer_config(
 pub fn build_cell_group_config(drb_id: u8, lcid: u8) -> CellGroupConfig {
     let rlc_bearer = RLC_BearerConfig {
         logical_channel_identity: LogicalChannelIdentity(lcid),
-        served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Drb_Identity(DRB_Identity(
-            drb_id,
-        ))),
+        served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Drb_Identity(
+            DRB_Identity(drb_id),
+        )),
         reestablish_rlc: None,
         rlc_config: None,
         mac_logical_channel_config: None,

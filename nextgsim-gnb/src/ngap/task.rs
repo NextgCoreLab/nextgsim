@@ -57,16 +57,16 @@ use nextgsim_ngap::procedures::initial_context_setup::{
     encode_initial_context_setup_response, InitialContextSetupFailureParams,
     InitialContextSetupResponseParams,
 };
+use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
 use nextgsim_ngap::procedures::ng_reset::{
     decode_amf_configuration_update, decode_ng_reset, encode_amf_configuration_update_acknowledge,
     encode_ng_reset_acknowledge, AmfConfigurationUpdateAcknowledgeParams, NgResetAcknowledgeParams,
     NgResetScope, UeAssociation,
 };
-use nextgsim_ngap::procedures::paging::{decode_paging, PagingData, UePagingIdentityValue};
-use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
 use nextgsim_ngap::procedures::ng_setup::{
     NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
 };
+use nextgsim_ngap::procedures::paging::{decode_paging, PagingData, UePagingIdentityValue};
 use nextgsim_ngap::procedures::path_switch::{
     decode_path_switch_request_acknowledge, decode_path_switch_request_failure,
     encode_path_switch_request, PathSwitchRequestAcknowledgeData, PathSwitchRequestFailureData,
@@ -701,8 +701,12 @@ impl NgapTask {
         // AS keys from KgNB, select algorithms from the UE Security
         // Capabilities, and send the RRC SecurityModeCommand — before
         // completing the context.
-        self.activate_as_security(ue_id, ics_req.security_key, &ics_req.ue_security_capabilities)
-            .await;
+        self.activate_as_security(
+            ue_id,
+            ics_req.security_key,
+            &ics_req.ue_security_capabilities,
+        )
+        .await;
 
         // Forward piggybacked NAS PDU (e.g., SecurityModeCommand) to UE via RRC
         if let Some(nas_pdu) = &ics_req.nas_pdu {
@@ -2070,7 +2074,10 @@ impl NgapTask {
                     client_id
                 );
             }
-            Err(e) => error!("Failed to encode AMF Configuration Update Acknowledge: {}", e),
+            Err(e) => error!(
+                "Failed to encode AMF Configuration Update Acknowledge: {}",
+                e
+            ),
         }
     }
 
@@ -3001,15 +3008,18 @@ fn serialize_five_g_s_tmsi(identity: &UePagingIdentityValue) -> Vec<u8> {
 /// (TS 38.413 §9.3.1.3).
 fn ngap_procedure_code(pdu: &NGAP_PDU) -> (u8, TriggeringMessageValue) {
     match pdu {
-        NGAP_PDU::InitiatingMessage(m) => {
-            (m.procedure_code.0, TriggeringMessageValue::InitiatingMessage)
-        }
-        NGAP_PDU::SuccessfulOutcome(m) => {
-            (m.procedure_code.0, TriggeringMessageValue::SuccessfulOutcome)
-        }
-        NGAP_PDU::UnsuccessfulOutcome(m) => {
-            (m.procedure_code.0, TriggeringMessageValue::UnsuccessfulOutcome)
-        }
+        NGAP_PDU::InitiatingMessage(m) => (
+            m.procedure_code.0,
+            TriggeringMessageValue::InitiatingMessage,
+        ),
+        NGAP_PDU::SuccessfulOutcome(m) => (
+            m.procedure_code.0,
+            TriggeringMessageValue::SuccessfulOutcome,
+        ),
+        NGAP_PDU::UnsuccessfulOutcome(m) => (
+            m.procedure_code.0,
+            TriggeringMessageValue::UnsuccessfulOutcome,
+        ),
     }
 }
 
@@ -3471,7 +3481,10 @@ mod tests {
         };
         task.handle_ng_reset(1, 0, reset).await;
 
-        assert!(task.find_ue_context(10).is_none(), "UE[10] should be cleared");
+        assert!(
+            task.find_ue_context(10).is_none(),
+            "UE[10] should be cleared"
+        );
         assert!(task.find_ue_context(20).is_some(), "UE[20] must remain");
     }
 
@@ -3517,7 +3530,9 @@ mod tests {
         let params = unroutable_error_params(&garbage);
         assert!(matches!(
             params.cause,
-            Some(NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError))
+            Some(NgSetupFailureCause::Protocol(
+                ProtocolCause::TransferSyntaxError
+            ))
         ));
         assert!(params.criticality_diagnostics.is_none());
 
@@ -3526,7 +3541,9 @@ mod tests {
         let decoded = decode_error_indication(&bytes).expect("decode");
         assert!(matches!(
             decoded.cause,
-            Some(NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError))
+            Some(NgSetupFailureCause::Protocol(
+                ProtocolCause::TransferSyntaxError
+            ))
         ));
     }
 
@@ -3562,7 +3579,9 @@ mod tests {
         let bytes = encode_error_indication(&params).expect("encode");
         let decoded = decode_error_indication(&bytes).expect("decode");
         assert_eq!(
-            decoded.criticality_diagnostics.and_then(|d| d.procedure_code),
+            decoded
+                .criticality_diagnostics
+                .and_then(|d| d.procedure_code),
             Some(ID_ERROR_INDICATION)
         );
     }

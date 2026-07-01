@@ -838,18 +838,17 @@ impl AgentCoordinator {
         let caps = &registration.capabilities;
 
         match intent.intent_type {
-            IntentType::Query
-                if !caps.read_state => {
-                    return Err("Agent lacks read_state capability".to_string());
-                }
-            IntentType::TriggerHandover | IntentType::AdjustQos
-                if !caps.trigger_actions => {
-                    return Err("Agent lacks trigger_actions capability".to_string());
-                }
+            IntentType::Query if !caps.read_state => {
+                return Err("Agent lacks read_state capability".to_string());
+            }
+            IntentType::TriggerHandover | IntentType::AdjustQos if !caps.trigger_actions => {
+                return Err("Agent lacks trigger_actions capability".to_string());
+            }
             IntentType::OptimizeResources | IntentType::CreateSlice | IntentType::ModifySlice
-                if !caps.modify_config => {
-                    return Err("Agent lacks modify_config capability".to_string());
-                }
+                if !caps.modify_config =>
+            {
+                return Err("Agent lacks modify_config capability".to_string());
+            }
             _ => {}
         }
 

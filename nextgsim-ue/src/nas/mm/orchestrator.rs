@@ -1784,17 +1784,13 @@ impl MmOrchestrator {
             // IDENTITY REQUEST is acceptable in the clear only when it requests
             // the SUCI (5GS identity type 0b001); any other requested identity
             // would leak a persistent identifier and must be protected.
-            MmMessageType::IdentityRequest => {
-                plain.get(3).is_some_and(|b| b & 0x0F == 0x01)
-            }
+            MmMessageType::IdentityRequest => plain.get(3).is_some_and(|b| b & 0x0F == 0x01),
             // A UE-originating DEREGISTRATION ACCEPT (non switch-off) is allowed.
             MmMessageType::DeregistrationAcceptUeOriginating => true,
             // REGISTRATION REJECT is processable in the clear only if its 5GMM
             // cause is not #76/#78/#81/#82 (those drive persistent forbidden-list
             // / SNPN state and must be integrity protected).
-            MmMessageType::RegistrationReject => {
-                !matches!(plain.get(3), Some(76 | 78 | 81 | 82))
-            }
+            MmMessageType::RegistrationReject => !matches!(plain.get(3), Some(76 | 78 | 81 | 82)),
             // SERVICE REJECT is processable in the clear only if its 5GMM cause
             // is not #76/#78.
             MmMessageType::ServiceReject => !matches!(plain.get(3), Some(76 | 78)),
@@ -1878,10 +1874,7 @@ fn parse_first_tai(tai_list: &[u8]) -> Option<[u8; 6]> {
 /// Parse the Equivalent PLMNs IE value (TS 24.501 §9.11.3.45): a sequence of
 /// 3-octet BCD-encoded PLMNs. A trailing partial octet group is ignored.
 fn parse_equivalent_plmns(value: &[u8]) -> Vec<[u8; 3]> {
-    value
-        .chunks_exact(3)
-        .map(|c| [c[0], c[1], c[2]])
-        .collect()
+    value.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
 }
 
 #[cfg(test)]
@@ -2323,7 +2316,10 @@ mod tests {
         orch.start_registration(RegistrationType::InitialRegistration);
         let plain_accept = build_registration_accept_pdu(true);
         let outs = orch.handle_downlink(&plain_accept);
-        assert!(outs.is_empty(), "plain RegistrationAccept must be discarded");
+        assert!(
+            outs.is_empty(),
+            "plain RegistrationAccept must be discarded"
+        );
     }
 
     #[test]
@@ -2334,7 +2330,10 @@ mod tests {
         let pdu = build_registration_reject_pdu(MmCause::NotAuthorizedForCag, None);
         assert_eq!(pdu[3], 76, "cause octet should be #76");
         let outs = orch.handle_downlink(&pdu);
-        assert!(outs.is_empty(), "plain RegistrationReject #76 must be discarded");
+        assert!(
+            outs.is_empty(),
+            "plain RegistrationReject #76 must be discarded"
+        );
         assert!(!outs.contains(&MmOutput::PlmnSearchNeeded));
     }
 
@@ -2536,9 +2535,7 @@ mod tests {
 
     /// Locate a contiguous byte subsequence; returns the start index if found.
     fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|w| w == needle)
+        haystack.windows(needle.len()).position(|w| w == needle)
     }
 
     #[test]
@@ -2572,17 +2569,19 @@ mod tests {
         let wire = first_sent_pdu(&outs).to_vec();
         assert_eq!(wire[1], 0x00, "initial request must be plain (SHT 0)");
         let decoded = RegistrationRequest::decode(&mut &wire[3..]).unwrap();
-        assert!(decoded.disaster_roaming, "decoded request must carry the IE");
+        assert!(
+            decoded.disaster_roaming,
+            "decoded request must carry the IE"
+        );
         let ie_pos = find_subseq(&wire, &[0xA7, 0x01, 0x01])
             .expect("disaster-condition IE must be present in the cleartext request");
 
         // "Byte-identical to today" guarantee: the ONLY difference from the
         // disaster-inactive cleartext request is the inserted 3-byte IE.
         let mut baseline = new_orch();
-        let baseline_wire = first_sent_pdu(
-            &baseline.start_registration(RegistrationType::InitialRegistration),
-        )
-        .to_vec();
+        let baseline_wire =
+            first_sent_pdu(&baseline.start_registration(RegistrationType::InitialRegistration))
+                .to_vec();
         let mut without_ie = wire.clone();
         without_ie.drain(ie_pos..ie_pos + 3);
         assert_eq!(

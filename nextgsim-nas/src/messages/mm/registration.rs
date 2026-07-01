@@ -1694,8 +1694,7 @@ impl RegistrationAccept {
             // Network slicing indication (Type 1, TS 24.501 9.11.3.36):
             // high nibble = IEI, octet 1 bit 1 = NSSCI.
             buf.put_u8(
-                (registration_accept_iei::NETWORK_SLICING_INDICATION << 4)
-                    | (changed as u8 & 0x01),
+                (registration_accept_iei::NETWORK_SLICING_INDICATION << 4) | (changed as u8 & 0x01),
             );
         }
 
@@ -2180,9 +2179,7 @@ mod tests {
         msg.uav_indication = Some("FAA-N12345".to_string());
         let mut buf = Vec::new();
         msg.encode(&mut buf);
-        assert!(buf
-            .windows(5)
-            .any(|w| w == [0x72, 0x00, 12, 0x10, 10]));
+        assert!(buf.windows(5).any(|w| w == [0x72, 0x00, 12, 0x10, 10]));
         let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
         assert_eq!(decoded.uav_indication.as_deref(), Some("FAA-N12345"));
     }

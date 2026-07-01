@@ -14,8 +14,9 @@ use std::collections::{HashMap, VecDeque};
 /// Hierarchical role that determines an agent's authority scope.
 ///
 /// Higher-level agents can override or coordinate lower-level ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum AgentRole {
     /// Manages a single cell.
     #[default]
@@ -37,7 +38,6 @@ impl AgentRole {
         self.outranks(subordinate) || self == subordinate
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Agent-to-agent messages

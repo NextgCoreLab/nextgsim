@@ -1616,8 +1616,7 @@ mod tests {
             failed_list: None,
         };
 
-        let encoded =
-            encode_initial_context_setup_response(&params).expect("encode ICS response");
+        let encoded = encode_initial_context_setup_response(&params).expect("encode ICS response");
         // Strict APER decode of the produced response.
         let decoded = decode_ngap_pdu(&encoded).expect("decode ICS response");
 
@@ -1641,7 +1640,10 @@ mod tests {
                 found = true;
             }
         }
-        assert!(found, "PDUSessionResourceSetupListCxtRes IE must be present");
+        assert!(
+            found,
+            "PDUSessionResourceSetupListCxtRes IE must be present"
+        );
     }
 
     #[test]

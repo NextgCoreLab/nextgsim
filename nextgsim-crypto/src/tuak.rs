@@ -198,7 +198,12 @@ impl Tuak {
     }
 
     /// f1: network authentication code MAC-A (length = `cfg.mac_bits`).
-    pub fn f1(&self, rand: &[u8; RAND_SIZE], sqn: &[u8; SQN_SIZE], amf: &[u8; AMF_SIZE]) -> Vec<u8> {
+    pub fn f1(
+        &self,
+        rand: &[u8; RAND_SIZE],
+        sqn: &[u8; SQN_SIZE],
+        amf: &[u8; AMF_SIZE],
+    ) -> Vec<u8> {
         let instance = instance_f1(self.cfg.mac_bits, self.k256(), false);
         let out = self.run(instance, rand, Some((amf, sqn)));
         take_rev(&out, 0, self.cfg.mac_bits / 8)
@@ -599,7 +604,10 @@ mod tests {
         let rand = arr16("01 23 45 67 89 ab cd ef 01 23 45 67 89 ab cd ef");
         let sqn = arr6("01 23 45 67 89 ab");
         let amf = arr2("ab cd");
-        assert_eq!(t.f1(&rand, &sqn, &amf), h("c0b8c2d4 148ec7aa 5f1d78a9 7e4d1d58"));
+        assert_eq!(
+            t.f1(&rand, &sqn, &amf),
+            h("c0b8c2d4 148ec7aa 5f1d78a9 7e4d1d58")
+        );
         assert_eq!(
             t.f1_star(&rand, &sqn, &amf),
             h("ef81af72 90f7842c 6ceafa53 7fa0745b")
@@ -655,7 +663,10 @@ mod tests {
         let rand = arr16("68 87 e5 54 25 a9 66 bd 86 c9 66 1a 5f a7 2b e8");
         let sqn = arr6("0d ea 2e e2 c5 af");
         let amf = arr2("df 1e");
-        assert_eq!(t.f1(&rand, &sqn, &amf), h("74921408 7958dd8f 58bfcdf8 69d8ae3f"));
+        assert_eq!(
+            t.f1(&rand, &sqn, &amf),
+            h("74921408 7958dd8f 58bfcdf8 69d8ae3f")
+        );
         assert_eq!(
             t.f1_star(&rand, &sqn, &amf),
             h("619e865a fe80e382 aee13063 f9dfb56d")
@@ -906,6 +917,9 @@ mod tests {
             Tuak::new([0u8; 32], &[0u8; 16], cfg),
             Err(TuakError::InvalidOutputLength { param: "MAC", .. })
         ));
-        assert_eq!(compute_topc(&[0u8; 32], &[0u8; 16], 0), Err(TuakError::InvalidIterations));
+        assert_eq!(
+            compute_topc(&[0u8; 32], &[0u8; 16], 0),
+            Err(TuakError::InvalidIterations)
+        );
     }
 }

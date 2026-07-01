@@ -413,11 +413,12 @@ impl ChoCandidateCell {
                 }
             }
             ChoCondition::AiAssisted(ai)
-                if (ai.decision_threshold < 0.0 || ai.decision_threshold > 1.0) => {
-                    return Err(ConditionalHandoverError::InvalidConfig(
-                        "Decision threshold must be in range [0.0, 1.0]".to_string(),
-                    ));
-                }
+                if (ai.decision_threshold < 0.0 || ai.decision_threshold > 1.0) =>
+            {
+                return Err(ConditionalHandoverError::InvalidConfig(
+                    "Decision threshold must be in range [0.0, 1.0]".to_string(),
+                ));
+            }
             _ => {}
         }
 

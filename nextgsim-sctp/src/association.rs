@@ -1244,8 +1244,7 @@ pub enum NgapStreamCategory {
 }
 
 /// Stream allocation policy for NGAP
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamAllocationPolicy {
     /// Round-robin across available streams
     RoundRobin,
@@ -1253,7 +1252,6 @@ pub enum StreamAllocationPolicy {
     #[default]
     CategoryBased,
 }
-
 
 /// SCTP stream manager for NGAP multi-stream transport
 ///
@@ -1412,8 +1410,7 @@ impl StreamManager {
 /// PR-SCTP allows per-message reliability configuration. Some messages
 /// (e.g. real-time data) may be discarded if they cannot be delivered
 /// within timing or retransmission constraints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PartialReliabilityPolicy {
     /// Fully reliable transfer (standard SCTP behavior)
     #[default]
@@ -1446,7 +1443,6 @@ impl PartialReliabilityPolicy {
         }
     }
 }
-
 
 /// Forward TSN chunk information for PR-SCTP
 ///

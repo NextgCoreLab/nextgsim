@@ -53,8 +53,7 @@ pub enum HandoverDecision {
 }
 
 /// Handover state for a UE
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UeHandoverState {
     /// No handover in progress
     #[default]
@@ -68,7 +67,6 @@ pub enum UeHandoverState {
     /// Handover failed
     Failed,
 }
-
 
 /// Handover context for a UE
 #[derive(Debug, Clone)]

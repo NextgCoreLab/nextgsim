@@ -240,7 +240,10 @@ impl KernelSctpAssociation {
         remote: SocketAddr,
         config: &SctpConfig,
     ) -> Result<Self> {
-        info!("Connecting to kernel SCTP endpoint at {} (proto 132)", remote);
+        info!(
+            "Connecting to kernel SCTP endpoint at {} (proto 132)",
+            remote
+        );
 
         // 1. Create the SCTP socket. Protocol::from(132) == IPPROTO_SCTP.
         //    (libc::IPPROTO_SCTP is available on Linux, but we go through
@@ -250,8 +253,12 @@ impl KernelSctpAssociation {
         } else {
             Domain::IPV4
         };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::from(libc::IPPROTO_SCTP)))
-            .map_err(|e| SctpError::ConnectionFailed(format!("socket(SCTP): {e}")))?;
+        let socket = Socket::new(
+            domain,
+            Type::STREAM,
+            Some(Protocol::from(libc::IPPROTO_SCTP)),
+        )
+        .map_err(|e| SctpError::ConnectionFailed(format!("socket(SCTP): {e}")))?;
 
         let fd = socket.as_raw_fd();
 
@@ -259,7 +266,7 @@ impl KernelSctpAssociation {
         let initmsg = SctpInitMsg {
             sinit_num_ostreams: config.max_outbound_streams,
             sinit_max_instreams: config.max_inbound_streams,
-            sinit_max_attempts: 0, // 0 = kernel default
+            sinit_max_attempts: 0,   // 0 = kernel default
             sinit_max_init_timeo: 0, // 0 = kernel default
         };
         // SAFETY: `fd` is a valid open socket; `&initmsg` points to a properly
