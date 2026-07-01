@@ -801,6 +801,69 @@ pub fn is_rrc_setup_complete(msg: &UL_DCCH_Message) -> bool {
     )
 }
 
+// ============================================================================
+// SRB1 Radio Bearer and Cell Group Config Builders (TS 38.331 §5.3.5.6.3)
+// ============================================================================
+
+/// Build a `RadioBearerConfig` that establishes SRB1.
+///
+/// Per TS 38.331 §5.3.5.6.3, RRCSetup SHALL include SRB1 in
+/// `srb-ToAddModList`. The SRB-Identity for SRB1 is 1
+/// (TS 38.331 §6.3.2: `SRB-Identity ::= INTEGER(1..3)`).
+/// All PDCP-Config fields are OPTIONAL and left absent for a
+/// minimal-valid configuration.
+///
+/// Note: wiring into `build_rrc_setup` / `connection.rs` requires a
+/// paired UE-side real-ASN.1 DL-CCCH decode (the UE currently uses a
+/// nibble dispatcher that would misroute the altered leading byte).
+/// That wiring is deferred under E2E validation.
+pub fn build_srb1_radio_bearer_config() -> RadioBearerConfig {
+    let srb1 = SRB_ToAddMod {
+        srb_identity: SRB_Identity(1),
+        reestablish_pdcp: None,
+        discard_on_pdcp: None,
+        pdcp_config: None,
+    };
+    RadioBearerConfig {
+        srb_to_add_mod_list: Some(SRB_ToAddModList(vec![srb1])),
+        srb3_to_release: None,
+        drb_to_add_mod_list: None,
+        drb_to_release_list: None,
+        security_config: None,
+    }
+}
+
+/// Build a minimal-valid `CellGroupConfig` for SRB1.
+///
+/// Carries one `RLC_BearerConfig` with `logicalChannelIdentity = 1`
+/// serving `srb-Identity = 1` (TS 38.331 §6.3.2). The optional
+/// mac-CellGroupConfig, physicalCellGroupConfig, and spCellConfig are
+/// left absent — OPTIONAL fields in the ASN.1, and omitting them avoids
+/// fabricating deployment-specific PHY/MAC parameters.
+///
+/// Note: same wiring deferral as [`build_srb1_radio_bearer_config`].
+pub fn build_srb1_cell_group_config() -> CellGroupConfig {
+    let rlc_bearer = RLC_BearerConfig {
+        logical_channel_identity: LogicalChannelIdentity(1),
+        served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Srb_Identity(
+            SRB_Identity(1),
+        )),
+        reestablish_rlc: None,
+        rlc_config: None,
+        mac_logical_channel_config: None,
+    };
+    CellGroupConfig {
+        cell_group_id: CellGroupId(0),
+        rlc_bearer_to_add_mod_list: Some(CellGroupConfigRlc_BearerToAddModList(vec![rlc_bearer])),
+        rlc_bearer_to_release_list: None,
+        mac_cell_group_config: None,
+        physical_cell_group_config: None,
+        sp_cell_config: None,
+        s_cell_to_add_mod_list: None,
+        s_cell_to_release_list: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,5 +1139,51 @@ mod tests {
             ..create_test_setup_complete_params()
         };
         assert!(build_rrc_setup_complete(&params).is_err());
+    }
+
+    // ========================================================================
+    // SRB1 Builder Tests (TS 38.331 §5.3.5.6.3)
+    // ========================================================================
+
+    #[test]
+    fn test_srb1_radio_bearer_config_roundtrip() {
+        let rbc = build_srb1_radio_bearer_config();
+        let bytes = encode_rrc(&rbc).expect("encode RadioBearerConfig");
+        let decoded: RadioBearerConfig = decode_rrc(&bytes).expect("decode RadioBearerConfig");
+        let srb_list = decoded
+            .srb_to_add_mod_list
+            .expect("srb_to_add_mod_list must be present");
+        assert_eq!(srb_list.0.len(), 1, "exactly one SRB-ToAddMod");
+        assert_eq!(srb_list.0[0].srb_identity.0, 1, "SRB-Identity must be 1");
+        // All optional fields must remain absent (no fabricated PDCP-Config)
+        assert!(decoded.drb_to_add_mod_list.is_none());
+        assert!(decoded.security_config.is_none());
+    }
+
+    #[test]
+    fn test_srb1_cell_group_config_roundtrip() {
+        let cgc = build_srb1_cell_group_config();
+        let bytes = encode_rrc(&cgc).expect("encode CellGroupConfig");
+        let decoded: CellGroupConfig = decode_rrc(&bytes).expect("decode CellGroupConfig");
+        assert_eq!(decoded.cell_group_id.0, 0, "cellGroupId must be 0");
+        let bearer_list = decoded
+            .rlc_bearer_to_add_mod_list
+            .expect("rlc_bearer_to_add_mod_list must be present");
+        assert_eq!(bearer_list.0.len(), 1, "exactly one RLC bearer");
+        let bearer = &bearer_list.0[0];
+        assert_eq!(bearer.logical_channel_identity.0, 1, "LCID must be 1");
+        match bearer
+            .served_radio_bearer
+            .as_ref()
+            .expect("servedRadioBearer must be present")
+        {
+            RLC_BearerConfigServedRadioBearer::Srb_Identity(id) => {
+                assert_eq!(id.0, 1, "served SRB-Identity must be 1");
+            }
+            other => panic!("expected Srb_Identity, got {other:?}"),
+        }
+        // Optional PHY/MAC fields must remain absent
+        assert!(decoded.mac_cell_group_config.is_none());
+        assert!(decoded.sp_cell_config.is_none());
     }
 }
