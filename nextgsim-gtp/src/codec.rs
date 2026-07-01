@@ -221,22 +221,22 @@ impl PduSessionInfo {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(8);
 
-        // First octet: PDU Type (4 bits) | spare (4 bits)
-        // Bit layout per TS 38.415:
-        //   Octet 1: PDU Type (4 bits) | QFI (6 bits) spread across octets 1-2
-        // Simplified encoding:
-        //   Octet 1: [PDU Type (4b)] [RQI (1b)] [QFI high 3 bits]
-        //   Octet 2: [QFI low 3 bits] [PPP (1b)] [PPI (3b)] [spare (1b)]
-
+        // TS 38.415 §5.5.2.1 Figure 5.5.2.1-1 (DL PDU SESSION INFORMATION):
+        //   Octet 1: PDU Type (bits 8-5) | spare (QMP/SNP/MSNP/spare, bits 4-1)
+        //   Octet 2: PPP (bit 8) | RQI (bit 7) | QFI (bits 6-1, 6 contiguous bits)
+        //   Octet 3 (present when PPP=1): spare (bits 8-4) | PPI (bits 3-1)
         let pdu_type_val = self.pdu_type as u8;
         let rqi_val: u8 = if self.rqi { 1 } else { 0 };
         let ppp_val: u8 = if self.ppp { 1 } else { 0 };
 
-        let octet1 = (pdu_type_val << 4) | (rqi_val << 3) | ((self.qfi >> 3) & 0x07);
-        let octet2 = ((self.qfi & 0x07) << 5) | (ppp_val << 4) | ((self.ppi & 0x07) << 1);
+        let octet1 = pdu_type_val << 4;
+        let octet2 = (ppp_val << 7) | (rqi_val << 6) | (self.qfi & 0x3F);
 
         buf.put_u8(octet1);
         buf.put_u8(octet2);
+        if self.ppp {
+            buf.put_u8(self.ppi & 0x07);
+        }
 
         if let Some(ts) = self.dl_sending_timestamp {
             buf.put_u32(ts);
@@ -266,15 +266,28 @@ impl PduSessionInfo {
         let pdu_type = PduSessionType::from_u8(pdu_type_val)
             .ok_or(GtpError::InvalidExtHeaderType(pdu_type_val))?;
 
-        let rqi = ((octet1 >> 3) & 0x01) != 0;
-        let qfi_high = octet1 & 0x07;
-        let qfi_low = (octet2 >> 5) & 0x07;
-        let qfi = (qfi_high << 3) | qfi_low;
-        let ppp = ((octet2 >> 4) & 0x01) != 0;
-        let ppi = (octet2 >> 1) & 0x07;
+        // TS 38.415: octet 2 = PPP(bit8) | RQI(bit7) | QFI(bits6-1); octet 3
+        // (present when PPP=1) carries the Paging Policy Indicator in bits 3-1.
+        let ppp = ((octet2 >> 7) & 0x01) != 0;
+        let rqi = ((octet2 >> 6) & 0x01) != 0;
+        let qfi = octet2 & 0x3F;
 
-        let dl_sending_timestamp = if data.len() >= 6 {
-            Some(u32::from_be_bytes([data[2], data[3], data[4], data[5]]))
+        let mut offset = 2;
+        let ppi = if ppp && data.len() > offset {
+            let v = data[offset] & 0x07;
+            offset += 1;
+            v
+        } else {
+            0
+        };
+
+        let dl_sending_timestamp = if data.len() >= offset + 4 {
+            Some(u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]))
         } else {
             None
         };
@@ -1683,6 +1696,20 @@ mod tests {
         assert!(decoded.ppp);
         assert_eq!(decoded.ppi, 3);
         assert!(decoded.dl_sending_timestamp.is_none());
+    }
+
+    #[test]
+    fn test_pdu_session_info_wire_layout_golden() {
+        // TS 38.415 §5.5.2.1: DL, QFI=5, no RQI/PPP -> octet1 = 0x00 (PDU Type
+        // DL = 0), octet2 = 0x05 (QFI contiguous in bits 6-1). 2 octets only.
+        let bytes = PduSessionInfo::downlink(5).encode();
+        assert_eq!(&bytes[..], &[0x00, 0x05]);
+        // With RQI set: octet2 = RQI(bit7=0x40) | QFI(5) = 0x45.
+        let bytes = PduSessionInfo::downlink(5).with_rqi(true).encode();
+        assert_eq!(&bytes[..], &[0x00, 0x45]);
+        // With PPP+PPI: octet2 = PPP(bit8=0x80) | QFI(5) = 0x85, octet3 = PPI.
+        let bytes = PduSessionInfo::downlink(5).with_paging_policy(2).encode();
+        assert_eq!(&bytes[..], &[0x00, 0x85, 0x02]);
     }
 
     #[test]
