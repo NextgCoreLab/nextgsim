@@ -853,7 +853,7 @@ impl RegistrationRequest {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.uplink_data_status = Some(buf.get_u16());
+                    msg.uplink_data_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -867,7 +867,7 @@ impl RegistrationRequest {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_status = Some(buf.get_u16());
+                    msg.pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -1069,13 +1069,13 @@ impl RegistrationRequest {
         if let Some(status) = self.uplink_data_status {
             buf.put_u8(registration_request_iei::UPLINK_DATA_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(status) = self.pdu_session_status {
             buf.put_u8(registration_request_iei::PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(ref container) = self.nas_message_container {
@@ -1439,7 +1439,7 @@ impl RegistrationAccept {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_status = Some(buf.get_u16());
+                    msg.pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -1453,7 +1453,7 @@ impl RegistrationAccept {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_reactivation_result = Some(buf.get_u16());
+                    msg.pdu_session_reactivation_result = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -1647,13 +1647,13 @@ impl RegistrationAccept {
         if let Some(status) = self.pdu_session_status {
             buf.put_u8(registration_accept_iei::PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(result) = self.pdu_session_reactivation_result {
             buf.put_u8(registration_accept_iei::PDU_SESSION_REACTIVATION_RESULT);
             buf.put_u8(2);
-            buf.put_u16(result);
+            buf.put_u16_le(result);
         }
 
         if let Some(value) = self.t3512_value {

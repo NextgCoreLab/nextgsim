@@ -187,7 +187,7 @@ impl ServiceRequest {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.uplink_data_status = Some(buf.get_u16());
+                    msg.uplink_data_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -201,7 +201,7 @@ impl ServiceRequest {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_status = Some(buf.get_u16());
+                    msg.pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -215,7 +215,7 @@ impl ServiceRequest {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.allowed_pdu_session_status = Some(buf.get_u16());
+                    msg.allowed_pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -266,19 +266,19 @@ impl ServiceRequest {
         if let Some(status) = self.uplink_data_status {
             buf.put_u8(service_request_iei::UPLINK_DATA_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(status) = self.pdu_session_status {
             buf.put_u8(service_request_iei::PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(status) = self.allowed_pdu_session_status {
             buf.put_u8(service_request_iei::ALLOWED_PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(ref container) = self.nas_message_container {
@@ -338,7 +338,7 @@ impl ServiceAccept {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_status = Some(buf.get_u16());
+                    msg.pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -352,7 +352,7 @@ impl ServiceAccept {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_reactivation_result = Some(buf.get_u16());
+                    msg.pdu_session_reactivation_result = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -409,13 +409,13 @@ impl ServiceAccept {
         if let Some(status) = self.pdu_session_status {
             buf.put_u8(service_accept_iei::PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(result) = self.pdu_session_reactivation_result {
             buf.put_u8(service_accept_iei::PDU_SESSION_REACTIVATION_RESULT);
             buf.put_u8(2);
-            buf.put_u16(result);
+            buf.put_u16_le(result);
         }
 
         if let Some(ref cause) = self.pdu_session_reactivation_result_error_cause {
@@ -502,7 +502,7 @@ impl ServiceReject {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_status = Some(buf.get_u16());
+                    msg.pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -563,7 +563,7 @@ impl ServiceReject {
         if let Some(status) = self.pdu_session_status {
             buf.put_u8(service_reject_iei::PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(value) = self.t3346_value {
@@ -642,6 +642,31 @@ mod tests {
         let decoded = ServiceRequest::decode(&mut &buf[3..]).unwrap();
         assert_eq!(decoded.uplink_data_status, Some(0x00FF));
         assert_eq!(decoded.pdu_session_status, Some(0xFF00));
+    }
+
+    // TS 24.501 §9.11.3.44: octet 3 carries PSI(0)-PSI(7). With bit n == PSI n in the
+    // u16 bitmap, the wire bytes are little-endian. PSI 1 active (0x0002) -> IEI 0x50,
+    // len 0x02, then 0x02 0x00. Locks interop with a conformant AMF (and the fixed core).
+    #[test]
+    fn test_service_request_psi_bitmap_wire_golden() {
+        let tmsi =
+            Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, vec![0xF4, 0x01, 0x02, 0x03, 0x04]);
+        let mut msg = ServiceRequest::new(
+            NasKeySetIdentifier::new(SecurityContextType::Native, 2),
+            IeServiceType::new(ServiceType::Signalling),
+            tmsi,
+        );
+        msg.pdu_session_status = Some(0x0002); // PSI 1 active
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        // Locate the PDU session status IE (IEI 0x50) and assert LE wire layout.
+        let pos = buf
+            .windows(4)
+            .position(|w| w == [0x50, 0x02, 0x02, 0x00])
+            .expect("PSI bitmap must be little-endian on the wire (02 00 for PSI 1)");
+        assert!(pos >= 3);
     }
 
     #[test]
