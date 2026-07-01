@@ -1116,9 +1116,17 @@ impl MmOrchestrator {
         // Store the network-signalled ABBA (TS 33.501 Annex A.7)
         self.abba = req.abba.value.clone();
 
-        let (Some(rand_ie), Some(autn_ie)) = (&req.rand, &req.autn) else {
-            warn!("Authentication Request without RAND/AUTN (EAP-AKA' not supported)");
-            return Vec::new();
+        let (rand_ie, autn_ie) = match (&req.rand, &req.autn) {
+            (Some(r), Some(a)) => (r, a),
+            _ => {
+                // EAP-AKA' primary auth (TS 24.501 5.4.1.2, TS 33.501 6.1.3.1):
+                // RAND/AUTN are carried inside the EAP-Request/AKA'-Challenge.
+                if let Some(ref eap_ie) = req.eap_message {
+                    return self.handle_eap_aka_prime_challenge(&eap_ie.data, req.ng_ksi);
+                }
+                warn!("Authentication Request without RAND/AUTN and without EAP message: ignored");
+                return Vec::new();
+            }
         };
         let rand = &rand_ie.value;
         let autn = &autn_ie.value;
@@ -1216,6 +1224,138 @@ impl MmOrchestrator {
         response.encode(&mut pdu);
         let pdu = self.protect_if_active(pdu);
         vec![MmOutput::SendNasPdu(pdu)]
+    }
+
+    /// EAP-AKA' primary authentication (TS 24.501 5.4.1.2, TS 33.501 6.1.3.1,
+    /// RFC 9048): called when an AUTHENTICATION REQUEST carries the EAP-message
+    /// IE instead of RAND/AUTN. Extracts AT_RAND/AT_AUTN/AT_KDF_INPUT from the
+    /// EAP-Request/AKA'-Challenge, verifies the AUTN MAC, checks the SQN, builds
+    /// an EAP-Response/AKA'-Challenge with AT_RES and AT_MAC, and derives the
+    /// KAUSF/KSEAF/KAMF key hierarchy.
+    fn handle_eap_aka_prime_challenge(
+        &mut self,
+        eap_bytes: &[u8],
+        ng_ksi: NasKeySetIdentifier,
+    ) -> Vec<MmOutput> {
+        use nextgsim_crypto::eap_aka_prime::run_eap_aka_prime;
+        use nextgsim_crypto::kdf::hmac_sha256;
+        use nextgsim_nas::{
+            decode_eap, encode_eap_to_vec, Eap, EapAkaPrime, EapAkaSubType, EapCode,
+        };
+
+        let Ok(eap) = decode_eap(&mut &eap_bytes[..]) else {
+            warn!("EAP-AKA': failed to decode EAP message");
+            return Vec::new();
+        };
+        let Eap::AkaPrime(ch) = eap else {
+            warn!("EAP-AKA': EAP message is not AKA'");
+            return Vec::new();
+        };
+        if ch.sub_type != EapAkaSubType::AkaChallenge {
+            warn!("EAP-AKA': expected AKA-Challenge, got {:?}", ch.sub_type);
+            return Vec::new();
+        }
+        let (Some(rand_v), Some(autn_v), Some(net_name)) = (
+            ch.attributes.get_rand(),
+            ch.attributes.get_autn(),
+            ch.attributes.get_kdf_input(),
+        ) else {
+            warn!("EAP-AKA' Challenge missing AT_RAND/AT_AUTN/AT_KDF_INPUT");
+            return Vec::new();
+        };
+        if rand_v.len() != 16 || autn_v.len() != 16 {
+            warn!(
+                "EAP-AKA' RAND/AUTN length mismatch: rand={}, autn={}",
+                rand_v.len(),
+                autn_v.len()
+            );
+            return Vec::new();
+        }
+        let mut rand = [0u8; 16];
+        rand.copy_from_slice(&rand_v);
+        let autn = &autn_v;
+
+        let m = Milenage::new(&self.identity.k, &self.identity.opc);
+        let ak = m.f5(&rand);
+        let mut sqn = [0u8; 6];
+        for i in 0..6 {
+            sqn[i] = autn[i] ^ ak[i];
+        }
+        let mut amf_autn = [0u8; 2];
+        amf_autn.copy_from_slice(&autn[6..8]);
+        let mac_autn = &autn[8..16];
+
+        if m.f1(&rand, &sqn, &amf_autn) != mac_autn {
+            warn!("EAP-AKA' AUTN MAC failure");
+            let rej = EapAkaPrime::authentication_reject(EapCode::Response, ch.id);
+            let resp =
+                AuthenticationResponse::with_eap_message(encode_eap_to_vec(&Eap::AkaPrime(rej)));
+            let mut pdu = Vec::new();
+            resp.encode(&mut pdu);
+            return vec![MmOutput::SendNasPdu(self.protect_if_active(pdu))];
+        }
+
+        if !self.sqn_in_range(&sqn) {
+            warn!(
+                "EAP-AKA' SQN out of range (received {:02x?}, SQN_MS {:02x?}): synch failure",
+                sqn, self.sqn_ms
+            );
+            let auts = self.compute_auts(&m, &rand);
+            let mut sync = EapAkaPrime::synchronization_failure(EapCode::Response, ch.id);
+            sync.attributes.put_auts(auts);
+            let resp =
+                AuthenticationResponse::with_eap_message(encode_eap_to_vec(&Eap::AkaPrime(sync)));
+            let mut pdu = Vec::new();
+            resp.encode(&mut pdu);
+            return vec![MmOutput::SendNasPdu(self.protect_if_active(pdu))];
+        }
+
+        self.sqn_ms = sqn;
+        let res = m.f2(&rand);
+        let ck = m.f3(&rand);
+        let ik = m.f4(&rand);
+
+        // SQN xor AK is the first 6 octets of AUTN (before MAC computation)
+        let mut sqn_xor_ak = [0u8; 6];
+        sqn_xor_ak.copy_from_slice(&autn[0..6]);
+
+        let (keys, kausf) = run_eap_aka_prime(
+            &ck,
+            &ik,
+            &net_name,
+            &sqn_xor_ak,
+            self.identity.supi.as_bytes(),
+        );
+
+        // Build EAP-Response/AKA'-Challenge with AT_RES and AT_MAC (RFC 9048 §9.4)
+        let mut resp_eap = EapAkaPrime::new(EapCode::Response, ch.id, EapAkaSubType::AkaChallenge);
+        resp_eap.attributes.put_res(&res);
+        resp_eap.attributes.put_mac(&[0u8; 16]); // placeholder for MAC computation
+        let mut eap_msg = Eap::AkaPrime(resp_eap);
+        // MAC covers the full EAP packet with AT_MAC zeroed, keyed by K_aut (RFC 9048 §6.3)
+        let full_mac = hmac_sha256(&keys.k_aut, &encode_eap_to_vec(&eap_msg));
+        if let Eap::AkaPrime(ref mut a) = eap_msg {
+            a.attributes.replace_mac(&full_mac[..16]);
+        }
+        let eap_response = encode_eap_to_vec(&eap_msg);
+
+        let kseaf = derive_kseaf(&kausf, &net_name);
+        let kamf = derive_kamf(&kseaf, self.identity.supi.as_bytes(), &self.abba);
+        self.sec.keys_mut().set_kausf(&kausf);
+        self.sec.keys_mut().set_kseaf(&kseaf);
+        self.sec.keys_mut().set_kamf(&kamf);
+        self.sec.keys_mut().abba = self.abba.clone();
+        self.sec.set_nas_ksi(ng_ksi);
+        self.sec.begin_establishing();
+        self.auth_failure_count = 0;
+
+        info!(
+            "EAP-AKA' challenge accepted; EAP-Response/AKA'-Challenge built, key hierarchy derived"
+        );
+        let resp = AuthenticationResponse::with_eap_message(eap_response);
+        let mut pdu = Vec::new();
+        resp.encode(&mut pdu);
+        vec![MmOutput::SendNasPdu(self.protect_if_active(pdu))]
     }
 
     /// SQN acceptance check (TS 33.102 Annex C.2.1): the received SQN must
@@ -3408,5 +3548,156 @@ mod tests {
         // ia_cap 0x70 -> IA1..IA3, no IA0
         assert!(!alg_in_capability(0x70, 0));
         assert!(alg_in_capability(0x70, 2));
+    }
+
+    // ========================================================================
+    // EAP-AKA' authentication tests
+    // ========================================================================
+
+    /// Build an EAP-Request/AKA'-Challenge using the TS 35.207 Test Set 1
+    /// credentials. The AUTN is computed so it passes the f1 MAC check.
+    fn build_eap_aka_challenge(sqn: [u8; 6], amf: [u8; 2], net_name: &[u8]) -> Vec<u8> {
+        use nextgsim_nas::{
+            encode_eap_to_vec, Eap, EapAkaPrime, EapAkaSubType, EapAttributeType, EapCode,
+        };
+
+        let autn_v = build_autn(sqn, amf);
+        let mut ch = EapAkaPrime::new(EapCode::Request, 42, EapAkaSubType::AkaChallenge);
+
+        // AT_RAND: 2 reserved bytes + 16 RAND bytes (RFC 4187 §10.6)
+        let mut rand_attr = vec![0u8, 0u8];
+        rand_attr.extend_from_slice(&TEST_RAND);
+        ch.attributes
+            .put_raw_attribute(EapAttributeType::AtRand, rand_attr);
+
+        // AT_AUTN: 2 reserved bytes + 16 AUTN bytes (RFC 4187 §10.7)
+        let mut autn_attr = vec![0u8, 0u8];
+        autn_attr.extend_from_slice(&autn_v);
+        ch.attributes
+            .put_raw_attribute(EapAttributeType::AtAutn, autn_attr);
+
+        // AT_KDF_INPUT: 2-byte big-endian length + network name bytes (RFC 9048 §6.3.1)
+        let name_len = (net_name.len() as u16).to_be_bytes();
+        let mut kdf_input = vec![name_len[0], name_len[1]];
+        kdf_input.extend_from_slice(net_name);
+        ch.attributes
+            .put_raw_attribute(EapAttributeType::AtKdfInput, kdf_input);
+
+        // AT_KDF = 1 (RFC 9048 §3.3 key derivation function)
+        ch.attributes.put_kdf(1);
+
+        // AT_MAC: zero placeholder (UE implementation does not verify challenge AT_MAC)
+        ch.attributes.put_mac(&[0u8; 16]);
+
+        encode_eap_to_vec(&Eap::AkaPrime(ch))
+    }
+
+    #[test]
+    fn test_eap_aka_prime_challenge_success() {
+        use nextgsim_crypto::eap_aka_prime::run_eap_aka_prime;
+        use nextgsim_crypto::kdf::hmac_sha256;
+        use nextgsim_nas::{
+            decode_eap, encode_eap_to_vec, Eap, EapAkaPrime, EapAkaSubType, EapAttributeType,
+            EapCode,
+        };
+
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+
+        let sqn: [u8; 6] = [0, 0, 0, 0, 0, 1];
+        let amf: [u8; 2] = [0x80, 0x00]; // separation bit must be set
+        let net_name = b"5G:mnc070.mcc999.3gppnetwork.org";
+        let eap_challenge = build_eap_aka_challenge(sqn, amf, net_name);
+
+        let req = AuthenticationRequest::for_eap_aka(
+            NasKeySetIdentifier::new(nextgsim_nas::security::SecurityContextType::Native, 0),
+            Abba::new(vec![0x00, 0x00]),
+            eap_challenge,
+        );
+        let mut pdu = Vec::new();
+        req.encode(&mut pdu);
+
+        let outs = orch.handle_downlink(&pdu);
+        let resp_bytes = first_sent_pdu(&outs);
+
+        // Response must be an AuthenticationResponse
+        assert_eq!(
+            resp_bytes[2],
+            u8::from(MmMessageType::AuthenticationResponse),
+            "expected AuthenticationResponse message type"
+        );
+
+        let decoded_resp = AuthenticationResponse::decode(&mut &resp_bytes[3..]).unwrap();
+        let eap_resp_data = decoded_resp
+            .eap_message
+            .expect("EAP message missing in response")
+            .data;
+
+        // Decode the EAP-Response/AKA'-Challenge
+        let resp_eap = decode_eap(&mut &eap_resp_data[..]).unwrap();
+        let Eap::AkaPrime(resp_aka) = resp_eap else {
+            panic!("expected EAP AKA' response");
+        };
+        assert_eq!(
+            resp_aka.code,
+            EapCode::Response,
+            "EAP code must be Response"
+        );
+        assert_eq!(
+            resp_aka.sub_type,
+            EapAkaSubType::AkaChallenge,
+            "EAP subtype must be AKA-Challenge"
+        );
+
+        // Derive expected values independently from TS 35.207 Test Set 1
+        let m = Milenage::new(&TEST_K, &compute_opc(&TEST_K, &TEST_OP));
+        let expected_res = m.f2(&TEST_RAND);
+        let ck = m.f3(&TEST_RAND);
+        let ik = m.f4(&TEST_RAND);
+        let ak = m.f5(&TEST_RAND);
+        let mut sqn_xor_ak = [0u8; 6];
+        for i in 0..6 {
+            sqn_xor_ak[i] = sqn[i] ^ ak[i];
+        }
+        let supi = "999700000000001";
+        let (keys, _kausf) = run_eap_aka_prime(&ck, &ik, net_name, &sqn_xor_ak, supi.as_bytes());
+
+        // AT_RES: put_res stores 2-byte bit-length prefix then the RES bytes
+        let (_, res_raw) = resp_aka
+            .attributes
+            .iter_ordered()
+            .find(|(k, _)| *k == EapAttributeType::AtRes)
+            .expect("AT_RES missing in EAP response");
+        assert_eq!(
+            &res_raw[2..],
+            &expected_res[..],
+            "AT_RES must equal Milenage f2(RAND)"
+        );
+
+        // AT_MAC: rebuild the response with MAC zeroed (same attribute order as impl)
+        // and recompute HMAC-SHA-256, truncated to 128 bits (RFC 9048 §6.3)
+        let mut verify_msg =
+            EapAkaPrime::new(EapCode::Response, resp_aka.id, EapAkaSubType::AkaChallenge);
+        verify_msg.attributes.put_res(&expected_res);
+        verify_msg.attributes.put_mac(&[0u8; 16]);
+        let zeroed_bytes = encode_eap_to_vec(&Eap::AkaPrime(verify_msg));
+        let computed_mac = hmac_sha256(&keys.k_aut, &zeroed_bytes);
+
+        // get_mac() strips the 2-byte reserved prefix and returns the 16-byte MAC
+        let received_mac = resp_aka
+            .attributes
+            .get_mac()
+            .expect("AT_MAC missing in EAP response");
+        assert_eq!(
+            received_mac,
+            &computed_mac[..16],
+            "AT_MAC must be HMAC-SHA-256(K_aut, zeroed_packet)[..16]"
+        );
+
+        // Key hierarchy must be derived after EAP-AKA'
+        assert!(
+            orch.security_context().keys().has_kamf(),
+            "KAMF must be derived after EAP-AKA' challenge"
+        );
     }
 }
