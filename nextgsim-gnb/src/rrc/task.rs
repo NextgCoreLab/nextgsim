@@ -683,6 +683,16 @@ impl Task for RrcTask {
                             RrcMessage::NasDelivery { ue_id, pdu } => {
                                 self.handle_nas_delivery(ue_id, pdu).await;
                             }
+                            RrcMessage::SecurityModeCommand { ue_id, pdu } => {
+                                // TS 38.331 §5.3.4: deliver the SecurityModeCommand
+                                // on SRB1 (DL-DCCH).
+                                info!(
+                                    "Sending RRC SecurityModeCommand to UE {} ({} bytes)",
+                                    ue_id,
+                                    pdu.len()
+                                );
+                                self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                            }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
                             }

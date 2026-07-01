@@ -49,6 +49,38 @@ pub struct NgapPduSession {
     pub upf_address: std::net::IpAddr,
 }
 
+/// Access-Stratum security context established at Initial Context Setup
+/// (TS 33.501 §6.7 / Annex A.8). Derived from the `KgNB` (SecurityKey IE) and
+/// the algorithms selected from the UE Security Capabilities. The AS keys feed
+/// PDCP ciphering/integrity for SRBs/DRBs.
+#[derive(Clone)]
+pub struct AsSecurityContext {
+    /// KgNB received in the InitialContextSetupRequest SecurityKey IE.
+    pub kgnb: [u8; 32],
+    /// K_RRCenc (128-bit) — SRB ciphering.
+    pub k_rrc_enc: [u8; 16],
+    /// K_RRCint (128-bit) — SRB integrity.
+    pub k_rrc_int: [u8; 16],
+    /// K_UPenc (128-bit) — DRB ciphering.
+    pub k_up_enc: [u8; 16],
+    /// K_UPint (128-bit) — DRB integrity.
+    pub k_up_int: [u8; 16],
+    /// Selected NR ciphering algorithm identity (0=NEA0 .. 3=NEA3).
+    pub ciphering_alg_id: u8,
+    /// Selected NR integrity algorithm identity (0=NIA0 .. 3=NIA3).
+    pub integrity_alg_id: u8,
+}
+
+impl std::fmt::Debug for AsSecurityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key material.
+        f.debug_struct("AsSecurityContext")
+            .field("ciphering_alg_id", &self.ciphering_alg_id)
+            .field("integrity_alg_id", &self.integrity_alg_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// NGAP UE context
 #[derive(Debug, Clone)]
 pub struct NgapUeContext {
@@ -68,6 +100,8 @@ pub struct NgapUeContext {
     pub pdu_sessions: HashMap<u8, NgapPduSession>,
     /// Requested NSSAI (slice type)
     pub requested_nssai: Option<i32>,
+    /// AS security context (established at Initial Context Setup).
+    pub as_security: Option<AsSecurityContext>,
 }
 
 impl NgapUeContext {
@@ -82,6 +116,7 @@ impl NgapUeContext {
             state: UeState::Initial,
             pdu_sessions: HashMap::new(),
             requested_nssai: None,
+            as_security: None,
         }
     }
 

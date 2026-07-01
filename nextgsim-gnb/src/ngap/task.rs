@@ -28,7 +28,11 @@ use nextgsim_common::OctetString;
 
 use super::amf_context::{AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
-use super::ue_context::{NgapPduSession, NgapUeContext};
+use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
+use nextgsim_rrc::procedures::security_mode::{
+    encode_security_mode_command, CipheringAlgorithmType, IntegrityAlgorithmType,
+    SecurityAlgorithms, SecurityModeCommandParams,
+};
 
 use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu, NGAP_PDU};
 use nextgsim_ngap::procedures::error_indication::{
@@ -556,6 +560,96 @@ impl NgapTask {
 
     /// Handles Initial Context Setup Request from AMF
     ///
+    /// Select the NR ciphering + integrity algorithms from the UE Security
+    /// Capabilities (TS 38.413 §9.3.1.86 bitmaps: MSB / 0x8000 = 128-xEA1).
+    /// gNB priority: prefer algorithm 2 (AES) > 1 (SNOW3G) > 3 (ZUC) > 0 (null).
+    /// Integrity never falls back to NIA0 (TS 33.501 §5.11.2): NIA2 is
+    /// mandatory-to-support, so an empty integrity bitmap defaults to NIA2.
+    fn select_as_algorithms(
+        caps: &nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue,
+    ) -> ((u8, CipheringAlgorithmType), (u8, IntegrityAlgorithmType)) {
+        let ciph = {
+            let m = caps.nr_encryption_algorithms;
+            if m & 0x4000 != 0 {
+                (2, CipheringAlgorithmType::Nea2)
+            } else if m & 0x8000 != 0 {
+                (1, CipheringAlgorithmType::Nea1)
+            } else if m & 0x2000 != 0 {
+                (3, CipheringAlgorithmType::Nea3)
+            } else {
+                (0, CipheringAlgorithmType::Nea0)
+            }
+        };
+        let integ = {
+            let m = caps.nr_integrity_algorithms;
+            if m & 0x4000 != 0 {
+                (2, IntegrityAlgorithmType::Nia2)
+            } else if m & 0x8000 != 0 {
+                (1, IntegrityAlgorithmType::Nia1)
+            } else if m & 0x2000 != 0 {
+                (3, IntegrityAlgorithmType::Nia3)
+            } else {
+                (2, IntegrityAlgorithmType::Nia2)
+            }
+        };
+        (ciph, integ)
+    }
+
+    /// Establish AS security at Initial Context Setup (TS 33.501 §6.7 / §6.9,
+    /// TS 38.331 §5.3.4): select algorithms from the UE Security Capabilities,
+    /// derive the AS keys (K_RRCenc/int, K_UPenc/int) from KgNB (SecurityKey IE)
+    /// per TS 33.501 Annex A.8, store the security context, and send the RRC
+    /// SecurityModeCommand to the UE on SRB1.
+    async fn activate_as_security(
+        &mut self,
+        ue_id: i32,
+        kgnb: [u8; 32],
+        caps: &nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue,
+    ) {
+        use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+
+        let ((ciph_id, ciph_alg), (int_id, int_alg)) = Self::select_as_algorithms(caps);
+
+        // Derive the four AS keys from KgNB (TS 33.501 Annex A.8, FC=0x69).
+        let sec_ctx = AsSecurityContext {
+            kgnb,
+            k_rrc_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcEnc, ciph_id),
+            k_rrc_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, int_id),
+            k_up_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpEnc, ciph_id),
+            k_up_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpInt, int_id),
+            ciphering_alg_id: ciph_id,
+            integrity_alg_id: int_id,
+        };
+        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
+            ctx.as_security = Some(sec_ctx);
+        }
+        info!(
+            "AS security established for UE {}: ciphering=NEA{}, integrity=NIA{}",
+            ue_id, ciph_id, int_id
+        );
+
+        // Encode + send the RRC SecurityModeCommand (SRB1, DL-DCCH).
+        let params = SecurityModeCommandParams {
+            rrc_transaction_id: 0,
+            security_algorithms: SecurityAlgorithms {
+                ciphering_algorithm: ciph_alg,
+                integrity_algorithm: Some(int_alg),
+            },
+        };
+        match encode_security_mode_command(&params) {
+            Ok(pdu) => {
+                let msg = RrcMessage::SecurityModeCommand {
+                    ue_id,
+                    pdu: OctetString::from_slice(&pdu),
+                };
+                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                    error!("Failed to hand RRC SecurityModeCommand to RRC task: {}", e);
+                }
+            }
+            Err(e) => error!("Failed to encode RRC SecurityModeCommand: {}", e),
+        }
+    }
+
     /// Establishes UE security context (KgNB), stores security capabilities,
     /// forwards piggybacked NAS PDU to UE, and sends response back to AMF.
     async fn handle_initial_context_setup_request(
@@ -599,6 +693,13 @@ impl NgapTask {
                 return;
             }
         };
+
+        // TS 33.501 §6.7 / TS 38.331 §5.3.4: establish AS security — derive the
+        // AS keys from KgNB, select algorithms from the UE Security
+        // Capabilities, and send the RRC SecurityModeCommand — before
+        // completing the context.
+        self.activate_as_security(ue_id, ics_req.security_key, &ics_req.ue_security_capabilities)
+            .await;
 
         // Forward piggybacked NAS PDU (e.g., SecurityModeCommand) to UE via RRC
         if let Some(nas_pdu) = &ics_req.nas_pdu {
@@ -3008,6 +3109,48 @@ mod tests {
             snpn_config: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_select_as_algorithms_prefers_aes_and_derives_distinct_keys() {
+        use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+        use nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue;
+
+        // Caps: NEA1|NEA2 (0xC000), NIA1|NIA2 (0xC000) — MSB (0x8000) = 128-xEA1.
+        let caps = UeSecurityCapabilitiesValue {
+            nr_encryption_algorithms: 0xC000,
+            nr_integrity_algorithms: 0xC000,
+            eutra_encryption_algorithms: None,
+            eutra_integrity_algorithms: None,
+        };
+        let ((ciph_id, ciph), (int_id, integ)) = NgapTask::select_as_algorithms(&caps);
+        // gNB prefers AES (NEA2/NIA2).
+        assert_eq!(ciph_id, 2);
+        assert_eq!(int_id, 2);
+        assert_eq!(ciph, CipheringAlgorithmType::Nea2);
+        assert_eq!(integ, IntegrityAlgorithmType::Nia2);
+
+        // Empty bitmaps: no encryption -> NEA0, but integrity never falls back
+        // to NIA0 (TS 33.501 §5.11.2) — defaults to mandatory-to-support NIA2.
+        let caps0 = UeSecurityCapabilitiesValue {
+            nr_encryption_algorithms: 0,
+            nr_integrity_algorithms: 0,
+            eutra_encryption_algorithms: None,
+            eutra_integrity_algorithms: None,
+        };
+        let ((c0, _), (i0, _)) = NgapTask::select_as_algorithms(&caps0);
+        assert_eq!(c0, 0);
+        assert_eq!(i0, 2);
+
+        // AS keys derived from KgNB are distinct per algorithm-type distinguisher
+        // and non-zero (TS 33.501 Annex A.8).
+        let kgnb = [0x11u8; 32];
+        let k_rrc_enc = derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcEnc, 2);
+        let k_rrc_int = derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, 2);
+        let k_up_enc = derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpEnc, 2);
+        assert_ne!(k_rrc_enc, [0u8; 16]);
+        assert_ne!(k_rrc_enc, k_rrc_int);
+        assert_ne!(k_rrc_enc, k_up_enc);
     }
 
     #[test]

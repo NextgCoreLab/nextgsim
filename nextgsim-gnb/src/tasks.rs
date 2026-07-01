@@ -397,6 +397,15 @@ pub enum RrcMessage {
         /// NAS PDU
         pdu: OctetString,
     },
+    /// RRC Security Mode Command delivery on DL-DCCH (from NGAP, at Initial
+    /// Context Setup — TS 38.331 §5.3.4). Carries the encoded DL-DCCH
+    /// SecurityModeCommand PDU.
+    SecurityModeCommand {
+        /// UE ID
+        ue_id: i32,
+        /// Encoded DL-DCCH SecurityModeCommand PDU
+        pdu: OctetString,
+    },
     /// AN release request (from NGAP)
     AnRelease {
         /// UE ID
