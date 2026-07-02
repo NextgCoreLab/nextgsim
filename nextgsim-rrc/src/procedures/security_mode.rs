@@ -608,4 +608,84 @@ mod tests {
             assert_eq!(data.rrc_transaction_id, id);
         }
     }
+
+    // ========================================================================
+    // Wave-6 C5 — hand-derived golden byte vectors (TS 38.331 §6.2.1 DL-DCCH /
+    // UL-DCCH classes, §5.3.4, UPER per X.691). Derived BY HAND from
+    // tools/rrc-15.6.0.asn1, NOT produced by the encoder — a reviewer can
+    // re-derive every bit below. The encoder output MUST equal the literal.
+    // ========================================================================
+
+    /// SecurityModeCommand on DL-DCCH, tid 0, cipheringAlgorithm=nea0,
+    /// integrityProtAlgorithm=nia2 (the exact algorithms the gNB NGAP task
+    /// selects at Initial Context Setup), 21 bits:
+    ///
+    /// ```text
+    /// DL-DCCH-Message ::= SEQUENCE { message DL-DCCH-MessageType }
+    /// DL-DCCH-MessageType CHOICE {c1, messageClassExtension} — 1 bit, c1     0
+    ///   c1 CHOICE (16 alts) — 4 bits, securityModeCommand = index 4       0100
+    /// SecurityModeCommand ::= SEQUENCE { tid, criticalExtensions }  (no ext)
+    ///   rrc-TransactionIdentifier INTEGER(0..3) — 2 bits, 0                  00
+    ///   criticalExtensions CHOICE {securityModeCommand, future} — 1 bit      0
+    /// SecurityModeCommand-IEs ::= SEQUENCE { 2 OPTIONAL fields } (no ext)
+    ///   presence (lateNonCritical|nonCritical)                              00
+    ///   securityConfigSMC ::= SEQUENCE { ..., } (extensible) ext bit         0
+    ///     securityAlgorithmConfig ::= SEQUENCE { integ OPTIONAL, ... } (ext)
+    ///       ext bit                                                          0
+    ///       presence (integrityProtAlgorithm)                               1
+    ///       cipheringAlgorithm ENUMERATED{nea0..spare1,...} (ext) ext bit    0
+    ///         root index 3 bits, nea0 = 0                                  000
+    ///       integrityProtAlgorithm ENUMERATED{nia0..spare1,...}(ext) ext bit 0
+    ///         root index 3 bits, nia2 = 2                                  010
+    /// = 0 0100 00 0 00 0 0 1 0 000 0 010  (21 bits) + 3 pad
+    /// = 0010 0000 | 0000 1000 | 0001 0000 -> 0x20 0x08 0x10
+    /// ```
+    const GOLDEN_SMC_TID0_NEA0_NIA2: [u8; 3] = [0x20, 0x08, 0x10];
+
+    /// SecurityModeComplete on UL-DCCH, tid 0, 10 bits:
+    ///
+    /// ```text
+    /// UL-DCCH-MessageType CHOICE {c1, mce} — 1 bit, c1                       0
+    ///   c1 CHOICE (16 alts) — 4 bits, securityModeComplete = index 5      0101
+    /// SecurityModeComplete ::= SEQUENCE { tid, criticalExtensions } (no ext)
+    ///   rrc-TransactionIdentifier — 2 bits, 0                               00
+    ///   criticalExtensions CHOICE {securityModeComplete, future} — 1 bit     0
+    /// SecurityModeComplete-IEs ::= SEQUENCE { 2 OPTIONAL fields } (no ext)
+    ///   presence (lateNonCritical|nonCritical)                              00
+    /// = 0 0101 00 0 00  (10 bits) + 6 pad = 0010 1000 | 0000 0000 -> 0x28 0x00
+    /// ```
+    const GOLDEN_SM_COMPLETE_TID0: [u8; 2] = [0x28, 0x00];
+
+    #[test]
+    fn golden_security_mode_command_bytes() {
+        let bytes = encode_security_mode_command(&SecurityModeCommandParams {
+            rrc_transaction_id: 0,
+            security_algorithms: SecurityAlgorithms {
+                ciphering_algorithm: CipheringAlgorithmType::Nea0,
+                integrity_algorithm: Some(IntegrityAlgorithmType::Nia2),
+            },
+        })
+        .expect("encode SecurityModeCommand");
+        assert_eq!(
+            bytes,
+            GOLDEN_SMC_TID0_NEA0_NIA2.to_vec(),
+            "SecurityModeCommand(tid 0, nea0, nia2) must match the hand-derived UPER bytes"
+        );
+        // byte0 low nibble 0x0: this is why a non-zero tid or the untyped UE
+        // dispatcher misroutes it (Wave-6 C4/C5 wire-safety gate).
+        assert_eq!(bytes[0] & 0x0F, 0x0);
+    }
+
+    #[test]
+    fn golden_security_mode_complete_bytes() {
+        let bytes = encode_security_mode_complete(&SecurityModeCompleteParams {
+            rrc_transaction_id: 0,
+        })
+        .expect("encode SecurityModeComplete");
+        assert_eq!(
+            bytes,
+            GOLDEN_SM_COMPLETE_TID0.to_vec(),
+            "SecurityModeComplete(tid 0) must match the hand-derived UPER bytes"
+        );
+    }
 }

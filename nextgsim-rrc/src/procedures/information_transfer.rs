@@ -440,4 +440,84 @@ mod tests {
         assert_eq!(data.rrc_transaction_id, 2);
         assert_eq!(data.dedicated_nas_message, Some(large_nas_message));
     }
+
+    // ========================================================================
+    // Wave-6 C5 — hand-derived golden byte vectors (TS 38.331 §6.2.1/§5.7.2,
+    // UPER per X.691). Derived BY HAND from tools/rrc-15.6.0.asn1, NOT produced
+    // by the encoder. Uses a fixed 3-octet NAS payload [0x7E,0x00,0x42].
+    // ========================================================================
+
+    /// Fixed NAS payload for the golden vectors (5GMM EPD 0x7E, arbitrary body).
+    const GOLDEN_NAS: [u8; 3] = [0x7E, 0x00, 0x42];
+
+    /// DLInformationTransfer on DL-DCCH, tid 0, carrying GOLDEN_NAS, 43 bits:
+    ///
+    /// ```text
+    /// DL-DCCH-MessageType CHOICE {c1, mce} — 1 bit, c1                       0
+    ///   c1 CHOICE (16 alts) — 4 bits, dlInformationTransfer = index 5     0101
+    /// DLInformationTransfer ::= SEQUENCE { tid, criticalExtensions } (no ext)
+    ///   rrc-TransactionIdentifier — 2 bits, 0                               00
+    ///   criticalExtensions CHOICE {dlInformationTransfer, future} — 1 bit    0
+    /// DLInformationTransfer-IEs ::= SEQUENCE { 3 OPTIONAL fields } (no ext)
+    ///   presence (dedicatedNAS-Message|lateNonCritical|nonCritical)        100
+    ///   dedicatedNAS-Message ::= OCTET STRING (unconstrained):
+    ///     length determinant, 1 octet (<128), value 3               0000 0011
+    ///     content 0x7E 0x00 0x42          0111 1110 0000 0000 0100 0010
+    /// = 0 0101 00 0 100 00000011 011111100000000001000010  (43 bits) + 5 pad
+    /// = 0010 1000|1000 0000|0110 1111|1100 0000|0000 1000|0100 0000
+    /// = 0x28 0x80 0x6F 0xC0 0x08 0x40
+    /// ```
+    const GOLDEN_DL_INFO_TRANSFER_TID0: [u8; 6] = [0x28, 0x80, 0x6F, 0xC0, 0x08, 0x40];
+
+    /// ULInformationTransfer on UL-DCCH, carrying GOLDEN_NAS, 41 bits.
+    /// Note: ULInformationTransfer has NO rrc-TransactionIdentifier.
+    ///
+    /// ```text
+    /// UL-DCCH-MessageType CHOICE {c1, mce} — 1 bit, c1                       0
+    ///   c1 CHOICE (16 alts) — 4 bits, ulInformationTransfer = index 7     0111
+    /// ULInformationTransfer ::= SEQUENCE { criticalExtensions } (no ext)
+    ///   criticalExtensions CHOICE {ulInformationTransfer, future} — 1 bit    0
+    /// ULInformationTransfer-IEs ::= SEQUENCE { 3 OPTIONAL fields } (no ext)
+    ///   presence (dedicatedNAS-Message|lateNonCritical|nonCritical)        100
+    ///   dedicatedNAS-Message OCTET STRING:
+    ///     length octet, value 3                                     0000 0011
+    ///     content 0x7E 0x00 0x42          0111 1110 0000 0000 0100 0010
+    /// = 0 0111 0 100 00000011 011111100000000001000010  (41 bits) + 7 pad
+    /// = 0011 1010|0000 0001|1011 1111|0000 0000|0010 0001|0000 0000
+    /// = 0x3A 0x01 0xBF 0x00 0x21 0x00
+    /// ```
+    const GOLDEN_UL_INFO_TRANSFER: [u8; 6] = [0x3A, 0x01, 0xBF, 0x00, 0x21, 0x00];
+
+    #[test]
+    fn golden_dl_information_transfer_bytes() {
+        let bytes = encode_dl_information_transfer(&DlInformationTransferParams {
+            rrc_transaction_id: 0,
+            dedicated_nas_message: Some(GOLDEN_NAS.to_vec()),
+        })
+        .expect("encode DLInformationTransfer");
+        assert_eq!(
+            bytes,
+            GOLDEN_DL_INFO_TRANSFER_TID0.to_vec(),
+            "DLInformationTransfer(tid 0, NAS) must match the hand-derived UPER bytes"
+        );
+        // Cross-decode: the NAS survives byte-for-byte.
+        let data = decode_dl_information_transfer(&GOLDEN_DL_INFO_TRANSFER_TID0).expect("decode");
+        assert_eq!(data.rrc_transaction_id, 0);
+        assert_eq!(data.dedicated_nas_message, Some(GOLDEN_NAS.to_vec()));
+    }
+
+    #[test]
+    fn golden_ul_information_transfer_bytes() {
+        let bytes = encode_ul_information_transfer(&UlInformationTransferParams {
+            dedicated_nas_message: Some(GOLDEN_NAS.to_vec()),
+        })
+        .expect("encode ULInformationTransfer");
+        assert_eq!(
+            bytes,
+            GOLDEN_UL_INFO_TRANSFER.to_vec(),
+            "ULInformationTransfer(NAS) must match the hand-derived UPER bytes"
+        );
+        let data = decode_ul_information_transfer(&GOLDEN_UL_INFO_TRANSFER).expect("decode");
+        assert_eq!(data.dedicated_nas_message, Some(GOLDEN_NAS.to_vec()));
+    }
 }

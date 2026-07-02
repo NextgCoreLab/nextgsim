@@ -1293,6 +1293,25 @@ mod tests {
         );
     }
 
+    /// Wave-6 H6 tier-2 — decoder golden for the standalone SRB1
+    /// RadioBearerConfig: the frozen bytes decode to exactly the builder's
+    /// struct, guarding decode-side drift independently of the encoder test.
+    #[test]
+    fn golden_srb1_radio_bearer_config_cross_decode() {
+        let decoded: RadioBearerConfig =
+            decode_rrc(&GOLDEN_SRB1_RADIO_BEARER_CONFIG).expect("decode RBC");
+        assert_eq!(decoded, build_srb1_radio_bearer_config());
+    }
+
+    /// Wave-6 H6 tier-2 — decoder golden for the standalone SRB1
+    /// CellGroupConfig.
+    #[test]
+    fn golden_srb1_cell_group_config_cross_decode() {
+        let decoded: CellGroupConfig =
+            decode_rrc(&GOLDEN_SRB1_CELL_GROUP_CONFIG).expect("decode CGC");
+        assert_eq!(decoded, build_srb1_cell_group_config());
+    }
+
     #[test]
     fn golden_rrc_setup_srb1_bytes() {
         // Encoder output must equal the hand-derived literal (NOT a roundtrip).

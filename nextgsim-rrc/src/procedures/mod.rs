@@ -5,6 +5,7 @@
 
 pub mod ai_ml_config;
 pub mod conditional_handover;
+pub mod dcch_dispatch;
 pub mod information_transfer;
 pub mod isac_config;
 pub mod isl_handover;
@@ -26,6 +27,7 @@ pub mod xr_cdrx;
 
 pub use ai_ml_config::*;
 pub use conditional_handover::*;
+pub use dcch_dispatch::*;
 pub use information_transfer::*;
 pub use isac_config::*;
 pub use isl_handover::{
