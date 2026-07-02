@@ -69,15 +69,19 @@ pub fn dispatch_ul_dcch(bytes: &[u8]) -> Result<UlDcchMessage, RrcCodecError> {
         UL_DCCH_MessageType_c1::SecurityModeComplete(_) => {
             UlDcchMessage::SecurityModeComplete(parse_error(parse_security_mode_complete(&msg))?)
         }
-        UL_DCCH_MessageType_c1::RrcReconfigurationComplete(_) => UlDcchMessage::RrcReconfigurationComplete(
-            parse_error(parse_rrc_reconfiguration_complete(&msg))?,
-        ),
+        UL_DCCH_MessageType_c1::RrcReconfigurationComplete(_) => {
+            UlDcchMessage::RrcReconfigurationComplete(parse_error(
+                parse_rrc_reconfiguration_complete(&msg),
+            )?)
+        }
         UL_DCCH_MessageType_c1::UlInformationTransfer(_) => {
             UlDcchMessage::UlInformationTransfer(parse_error(parse_ul_information_transfer(&msg))?)
         }
-        UL_DCCH_MessageType_c1::UeCapabilityInformation(_) => UlDcchMessage::UeCapabilityInformation(
-            parse_error(parse_ue_capability_information(&msg))?,
-        ),
+        UL_DCCH_MessageType_c1::UeCapabilityInformation(_) => {
+            UlDcchMessage::UeCapabilityInformation(parse_error(parse_ue_capability_information(
+                &msg,
+            ))?)
+        }
         _ => UlDcchMessage::Unsupported,
     };
 

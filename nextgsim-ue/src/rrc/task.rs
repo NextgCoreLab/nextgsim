@@ -246,7 +246,9 @@ impl RrcTask {
 
         // Integrity protection is mandatory for AS security.
         let Some(integ_alg) = smc.security_algorithms.integrity_algorithm else {
-            warn!("AS SecurityModeCommand (tid {tid}) carries no integrity algorithm; not activating");
+            warn!(
+                "AS SecurityModeCommand (tid {tid}) carries no integrity algorithm; not activating"
+            );
             return;
         };
         let integrity = IntegrityAlgorithm::from(integ_alg);
@@ -576,7 +578,12 @@ impl RrcTask {
     /// Public because it is a real message-handler entry point
     /// (`RrcMessage::DownlinkRrcDelivery`) also driven directly by the
     /// in-process strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
-    pub async fn handle_downlink_rrc(&mut self, cell_id: i32, channel: RrcChannel, pdu: OctetString) {
+    pub async fn handle_downlink_rrc(
+        &mut self,
+        cell_id: i32,
+        channel: RrcChannel,
+        pdu: OctetString,
+    ) {
         if pdu.is_empty() {
             warn!("Empty downlink RRC PDU");
             return;
@@ -707,7 +714,10 @@ impl RrcTask {
         // matched-sim path is unchanged (this whole block is skipped).
         if I5_UE_AS_SECURITY {
             if let Ok(smc) = decode_security_mode_command(bytes) {
-                info!("Received AS SecurityModeCommand from cell {} (tid {})", cell_id, smc.rrc_transaction_id);
+                info!(
+                    "Received AS SecurityModeCommand from cell {} (tid {})",
+                    cell_id, smc.rrc_transaction_id
+                );
                 self.handle_as_security_mode_command(smc).await;
                 return;
             }
@@ -860,7 +870,10 @@ impl RrcTask {
         let radio_bearer_config: RadioBearerConfig = match decode_rrc(&setup.radio_bearer_config) {
             Ok(config) => config,
             Err(e) => {
-                warn!("RRCSetup radioBearerConfig not decodable ({}); tolerated", e);
+                warn!(
+                    "RRCSetup radioBearerConfig not decodable ({}); tolerated",
+                    e
+                );
                 return;
             }
         };
@@ -1752,8 +1765,7 @@ mod tests {
     /// handling, and emits an RRCSetupComplete with tid 0.
     #[test]
     fn test_rrc_setup_golden_srb1_decoded_connected_tid0_echo() {
-        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
-            UeTaskBase::new(test_config(), 32);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
         let mut task = RrcTask::new(task_base);
 
         run_async(async {
@@ -1799,7 +1811,10 @@ mod tests {
             assert_eq!(ch, RrcChannel::UlDcch);
             let decoded =
                 decode_rrc_setup_complete(complete.data()).expect("ASN.1 RRCSetupComplete");
-            assert_eq!(decoded.rrc_transaction_id, 0, "tid echo pinned to 0 until C5");
+            assert_eq!(
+                decoded.rrc_transaction_id, 0,
+                "tid echo pinned to 0 until C5"
+            );
             assert_eq!(decoded.dedicated_nas_message, nas);
         });
     }
@@ -1809,8 +1824,7 @@ mod tests {
     /// with a warning and no SRB1 recorded.
     #[test]
     fn test_rrc_setup_legacy_placeholder_tolerated() {
-        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
-            UeTaskBase::new(test_config(), 32);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
         let mut task = RrcTask::new(task_base);
 
         run_async(async {

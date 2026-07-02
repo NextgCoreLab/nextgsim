@@ -200,7 +200,10 @@ impl<'a> Reader<'a> {
         if self.remaining() != 0 {
             return Err(UePolicyError::LengthScope {
                 scope,
-                msg: format!("{} unconsumed trailing octet(s) inside length scope", self.remaining()),
+                msg: format!(
+                    "{} unconsumed trailing octet(s) inside length scope",
+                    self.remaining()
+                ),
             });
         }
         Ok(())
@@ -457,10 +460,11 @@ impl RouteSelectionDescriptorComponent {
                         msg: "spare bits 8..4 set".into(),
                     });
                 }
-                let mode = SscMode::try_from(b & 0x07).map_err(|_| UePolicyError::InvalidValue {
-                    scope: "RSD SSC mode",
-                    msg: format!("invalid SSC mode value {}", b & 0x07),
-                })?;
+                let mode =
+                    SscMode::try_from(b & 0x07).map_err(|_| UePolicyError::InvalidValue {
+                        scope: "RSD SSC mode",
+                        msg: format!("invalid SSC mode value {}", b & 0x07),
+                    })?;
                 Self::SscMode(mode)
             }
             RSD_ID_SNSSAI => {
@@ -937,10 +941,11 @@ impl ManageUePolicyCommandReject {
                     msg: "must contain at least one result (Table D.6.3.1)".into(),
                 });
             }
-            let count = u8::try_from(sub.results.len()).map_err(|_| UePolicyError::InvalidValue {
-                scope: "UE policy section management subresult",
-                msg: "holds more than 255 results (1-octet count)".into(),
-            })?;
+            let count =
+                u8::try_from(sub.results.len()).map_err(|_| UePolicyError::InvalidValue {
+                    scope: "UE policy section management subresult",
+                    msg: "holds more than 255 results (1-octet count)".into(),
+                })?;
             contents.push(count);
             contents.extend_from_slice(&sub.plmn_id.encode());
             for res in &sub.results {
@@ -1143,9 +1148,7 @@ mod tests {
         // + UPSC(00 01) + order(00 01) + cause(6F)
         assert_eq!(
             reject.encode().unwrap(),
-            vec![
-                0x80, 0x03, 0x00, 0x09, 0x01, 0x00, 0xF1, 0x10, 0x00, 0x01, 0x00, 0x01, 0x6F,
-            ]
+            vec![0x80, 0x03, 0x00, 0x09, 0x01, 0x00, 0xF1, 0x10, 0x00, 0x01, 0x00, 0x01, 0x6F,]
         );
     }
 

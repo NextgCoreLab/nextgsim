@@ -303,10 +303,7 @@ impl RrcTask {
                 true
             }
             Ok(UlDcchMessage::RrcReconfigurationComplete(complete)) => {
-                self.handle_rrc_reconfiguration_complete_asn1(
-                    ue_id,
-                    complete.rrc_transaction_id,
-                );
+                self.handle_rrc_reconfiguration_complete_asn1(ue_id, complete.rrc_transaction_id);
                 true
             }
             Ok(UlDcchMessage::UlInformationTransfer(transfer)) => {
@@ -1352,7 +1349,8 @@ mod tests {
             {
                 let ctx = task.ue_manager.create_ue(1);
                 assert_eq!(
-                    ctx.transactions.allocate_cycling(RrcProcedure::SecurityMode),
+                    ctx.transactions
+                        .allocate_cycling(RrcProcedure::SecurityMode),
                     0
                 );
             }
@@ -1399,12 +1397,11 @@ mod tests {
             GnbTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
         run_async(async {
-            let reconf_complete = encode_rrc_reconfiguration_complete(
-                &RrcReconfigurationCompleteParams {
+            let reconf_complete =
+                encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
                     rrc_transaction_id: 0,
-                },
-            )
-            .unwrap();
+                })
+                .unwrap();
             assert!(
                 task.try_dispatch_typed_ul_dcch(3, &reconf_complete).await,
                 "typed dispatch must handle RRCReconfigurationComplete"

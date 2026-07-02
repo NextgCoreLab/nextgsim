@@ -1086,8 +1086,7 @@ impl UeApp {
                             // otherwise misread as a raw NAS PDU and dropped.
                             // Default-off: the block is skipped and the
                             // matched-sim path is byte-for-byte unchanged.
-                            if nextgsim_ue::rrc::I5_UE_AS_SECURITY
-                                && channel == RrcChannel::DlDcch
+                            if nextgsim_ue::rrc::I5_UE_AS_SECURITY && channel == RrcChannel::DlDcch
                             {
                                 use nextgsim_rrc::procedures::security_mode::{
                                     decode_security_mode_command, encode_security_mode_complete,

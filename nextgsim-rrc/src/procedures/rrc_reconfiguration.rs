@@ -953,7 +953,13 @@ mod tests {
         }
     }
 
-    fn bderive_drb_reconfiguration(tid: u64, psi: u64, drb_id: u64, lcid: u64, qfis: &[u64]) -> Vec<u8> {
+    fn bderive_drb_reconfiguration(
+        tid: u64,
+        psi: u64,
+        drb_id: u64,
+        lcid: u64,
+        qfis: &[u64],
+    ) -> Vec<u8> {
         let mut w = BitW::new();
         // DL-DCCH-MessageType CHOICE {c1, messageClassExtension} (2 alts)
         w.cint(0, 0, 1); // c1 = index 0
@@ -1009,8 +1015,7 @@ mod tests {
     /// = 0001 0000 0000 1001 1010 0000 0001 0010 0000 0000 0010 0000
     ///   + 4 pad -> 10 09 A0 12 00 20 00
     /// ```
-    const GOLDEN_DRB_RADIO_BEARER_CONFIG_PSI1: [u8; 7] =
-        [0x10, 0x09, 0xA0, 0x12, 0x00, 0x20, 0x00];
+    const GOLDEN_DRB_RADIO_BEARER_CONFIG_PSI1: [u8; 7] = [0x10, 0x09, 0xA0, 0x12, 0x00, 0x20, 0x00];
 
     /// DRB CellGroupConfig standalone (the live masterCellGroup octet-string
     /// contents), UPER, 31 bits (drb_id=1, lcid=4):
@@ -1178,7 +1183,11 @@ mod tests {
             decode_rrc(&data.master_cell_group.expect("masterCellGroup")).expect("CGC");
         let bearer = &cgc.rlc_bearer_to_add_mod_list.expect("RLC list").0[0];
         assert_eq!(bearer.logical_channel_identity.0, 4);
-        match bearer.served_radio_bearer.as_ref().expect("servedRadioBearer") {
+        match bearer
+            .served_radio_bearer
+            .as_ref()
+            .expect("servedRadioBearer")
+        {
             RLC_BearerConfigServedRadioBearer::Drb_Identity(d) => assert_eq!(d.0, 1),
             _ => panic!("expected served DRB identity"),
         }

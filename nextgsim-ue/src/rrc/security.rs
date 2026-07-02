@@ -633,7 +633,11 @@ mod tests {
             .protect_srb(1, SRB1_BEARER, DIRECTION_UPLINK, &msg)
             .unwrap();
         assert_eq!(prot.as_slice(), GOLDEN_SRB_NEA2_UL_COUNT1);
-        assert_eq!(prot.len(), msg.len() + 4, "SRB PDCP appends a 4-octet MAC-I");
+        assert_eq!(
+            prot.len(),
+            msg.len() + 4,
+            "SRB PDCP appends a 4-octet MAC-I"
+        );
     }
 
     #[test]

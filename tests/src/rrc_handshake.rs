@@ -221,10 +221,9 @@ async fn gnb_ue_rrc_setup_handshake_delivers_initial_nas_byte_equal() {
 
     // Wave-6 C2: the UE decoded the live RRCSetup and recorded SRB1
     // (TS 38.331 §5.3.3.4 / §5.3.5.6.3) before any DL-DCCH handling.
-    let srb1 = h
-        .ue
-        .srb1_config()
-        .expect("UE must record SRB1 from the live RRCSetup (C2)");
+    let srb1 =
+        h.ue.srb1_config()
+            .expect("UE must record SRB1 from the live RRCSetup (C2)");
     assert_eq!(srb1.rrc_transaction_id, 0);
 
     // Pin the C3 finding: the UE's PRIMARY encoding is the real ASN.1
