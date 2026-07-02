@@ -9,7 +9,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 > conformance suite. The 6G research crates (ISAC / FL / SHE / NKEF / agent) are prototypes,
 > disabled by default; there is no frozen 3GPP Rel-20 stage-3 spec.
 
-## [Unreleased] — proposed v0.1.0
+## [Unreleased]
+
+_Nothing yet._
+
+## [0.1.0] — 2026-07-02
 
 First release aligning the simulator with the 3GPP Rel-15/16/17/18 procedures so it
 interoperates end-to-end with `nextgcore`. Zero C dependencies; derived from UERANSIM.

@@ -42,8 +42,8 @@ Full data-plane E2E (from the nextgcore repo): `cd ../nextgcore/docker/rust && .
 1. Green CI + matched-sim E2E (via nextgcore `e2e.sh`).
 2. Bump versions in the workspace `Cargo.toml`(s). Current: `0.1.0`.
 3. Promote `## [Unreleased]` in `CHANGELOG.md` to a dated `## [X.Y.Z]`; add a fresh Unreleased.
-4. Commit (`Signed-off-by: Murat Parlakisik <parlakisik@gmail.com>`), tag `vX.Y.Z`, push the tag.
-5. `gh release create vX.Y.Z --repo NextgCoreLab/nextgsim --title "NextgSim vX.Y.Z" --notes-file …`
+4. Commit (`Signed-off-by: Murat Parlakisik <parlakisik@gmail.com>`), tag `X.Y.Z`, push the tag.
+5. `gh release create X.Y.Z --repo NextgCoreLab/nextgsim --title "NextgSim X.Y.Z" --notes-file …`
    using the CHANGELOG section as notes.
 
 > Keep the honest framing: matched-sim validated (not real-peer / not certified); 6G crates are
