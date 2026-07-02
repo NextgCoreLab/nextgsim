@@ -7,7 +7,7 @@ This document describes how to connect NextGSim (5G UE/gNB Simulator) to NextGCo
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                      Docker Network: nextgcore-network                       │
-│                           Subnet: 172.22.0.0/24                              │
+│                           Subnet: 172.23.0.0/24                              │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
@@ -42,7 +42,7 @@ This document describes how to connect NextGSim (5G UE/gNB Simulator) to NextGCo
 │  │                                                                         │ │
 │  │  ┌───────────────────┐              ┌───────────────────┐             │ │
 │  │  │        gNB        │◄─── RLS ────►│         UE        │             │ │
-│  │  │    172.22.0.100   │   (Radio)    │    172.22.0.101   │             │ │
+│  │  │    172.23.0.100   │   (Radio)    │    172.23.0.101   │             │ │
 │  │  │                   │              │                   │             │ │
 │  │  │  • NGAP → AMF     │              │  • NAS signaling  │             │ │
 │  │  │  • GTP-U → UPF    │              │  • PDU sessions   │             │ │
@@ -93,8 +93,8 @@ This document describes how to connect NextGSim (5G UE/gNB Simulator) to NextGCo
 | PLMN | 999-70 | MCC=999, MNC=70 |
 | TAC | 1 | Tracking Area Code |
 | S-NSSAI | SST=1 | Default network slice |
-| AMF Address | 172.22.0.17:38412 | NGAP/SCTP endpoint |
-| UPF Address | 172.22.0.19:2152 | GTP-U endpoint |
+| AMF Address | 172.23.0.5:38412 | NGAP/SCTP endpoint (userspace SCTP over UDP) |
+| UPF Address | 172.23.0.7:2152 | GTP-U endpoint |
 | UE IP Pool | 10.45.0.0/16 | Assigned to UEs |
 
 ### Subscriber Credentials
@@ -125,11 +125,27 @@ This document describes how to connect NextGSim (5G UE/gNB Simulator) to NextGCo
    ```
 
 ## Quick Start
+> **Fastest path (recommended):** the entire matched-sim E2E — our gNB+UE against
+> our 22-NF 5GC, full registration + PDU session + data-plane ping (UE gets
+> 10.45.0.2, `uesimtun0` up, ping through the GTP-U tunnel) — is driven by one
+> command from the nextgcore repo. It bundles disk preflight (hazard #269), image
+> build, and the assertion run:
+>
+> ```bash
+> cd /path/to/nextgcore/docker/rust
+> ./e2e.sh                 # preflight -> build -> E2E (exit 0/1/2)
+> ./e2e.sh --quick --keep  # reuse prebuilt binaries, leave the stack up
+> ```
+>
+> See `nextgcore/docker/rust/CI.md`. The nextgsim-only compose below
+> (`docker/docker-compose.yml`, gNB + UE only) is for attaching the simulator to an
+> already-running core — run its `docker compose` commands from the `docker/`
+> subdirectory, not the repo root.
 
 ### 1. Build NextGSim Images
 
 ```bash
-cd /path/to/nextgsim
+cd /path/to/nextgsim/docker
 docker compose build
 ```
 
@@ -162,7 +178,7 @@ docker exec nextgsim-gnb nr-cli gnb status
 docker exec nextgsim-ue nr-cli ue status
 
 # Ping from UE through the core
-docker exec nextgsim-ue ping -I uesimtun0 8.8.8.8
+docker exec nextgsim-ue ping -I uesimtun0 10.45.0.1
 ```
 
 ## Troubleshooting
@@ -173,7 +189,7 @@ If gNB fails to connect to AMF:
 
 1. **Check network connectivity**
    ```bash
-   docker exec nextgsim-gnb ping 172.22.0.17
+   docker exec nextgsim-gnb ping 172.23.0.5
    ```
 
 2. **Verify PLMN matches**
@@ -214,7 +230,7 @@ If PDU session establishment fails:
 
 2. **Verify UPF is reachable from SMF**
    ```bash
-   docker exec nextgcore-smf ping 172.22.0.19
+   docker exec nextgcore-smf ping 172.23.0.7
    ```
 
 3. **Check TUN device exists in UE**
@@ -251,6 +267,12 @@ nextgcore env knobs (`AMF_SNPN_ALLOWED_NIDS`, `AMF_UAV_GEOFENCE`,
 | `config/gnb.yaml` | gNB configuration (PLMN, TAC, AMF address) |
 | `config/ue.yaml` | UE configuration (IMSI, keys, sessions) |
 | `config/features/*.yaml` | Per-feature UE/gNB configs for the Rel-17/18 feature E2E test |
+
+Beyond the feature configs above, URSP/UE-Policy delivery is now exercised on the
+baseline path: PCF delivers URSP rules via the TS 24.501 Annex D UPDP codec over
+the N1 chain, and the UE consumes them in `nextgsim-ue` (NAS MM UE-policy
+handling in `nas/mm/orchestrator.rs`). SUCI de-concealment (SIDF) is performed and
+logged at the core's UDM per TS 33.501 §6.12; UDR only ever sees the SUPI.
 | `docker-compose.yaml` | Container orchestration |
 | `scripts/add-subscriber.js` | MongoDB subscriber provisioning |
 

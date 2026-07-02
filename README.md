@@ -21,20 +21,20 @@ A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulato
 The fastest way to get started is using Docker with the nextgcore 5G core.
 
 ```bash
-# 1. Start the 5G Core (from nextgcore repository)
+# 1. Run the full matched-sim E2E: our gNB + UE vs the 22-NF core.
+#    e2e.sh runs a disk preflight, builds the images, then the E2E suite
+#    (registration + PDU session + data-plane ping over the GTP-U tunnel).
 cd ../nextgcore/docker/rust
-docker compose -f docker-compose-5gc-optimized.yml up -d
+./e2e.sh                          # add --keep to leave the stack running
 
-# 2. Build and start the simulators
-cd ../../nextgsim
-docker compose build
-docker compose up -d
+# Or bring the stack up manually (the gNB + UE ship in the SAME compose file):
+docker compose -f docker-compose.yml up -d
 
-# 3. Verify UE registration
-docker logs nextgsim-ue 2>&1 | grep -E "(REGISTERED|PDU Session)"
+# 2. Verify UE registration and the PDU session
+docker logs nextgsim-ue 2>&1 | grep -E "UE is now REGISTERED|is now ACTIVE"
 # Expected output:
-# UE is now REGISTERED
-# PDU Session 1 established with IP: 10.45.0.2
+# Registration Accept: UE is now REGISTERED
+# PDU session 1 is now ACTIVE (IPv4: 10.45.0.2)
 ```
 
 ### Option 2: Build from Source
@@ -102,7 +102,7 @@ cargo test --test pdu_session        # PDU session tests
 |------|---------|
 | `config/gnb.yaml` | gNB configuration (AMF address, PLMN, TAC, NCI) |
 | `config/ue.yaml` | UE configuration (SUPI, keys, APN, slices) |
-| `docker-compose.yaml` | Simulator container orchestration |
+| `docker/docker-compose.yml` | Simulator-only container orchestration (the full 5GC + gNB + UE E2E stack lives in `../nextgcore/docker/rust/docker-compose.yml`) |
 
 ### Environment Variables
 
@@ -145,7 +145,7 @@ nextgsim/
 
 ## 6G AI Architecture
 
-The simulator implements a comprehensive 6G AI-native architecture following 3GPP specifications:
+The simulator includes a set of 6G/AI research prototypes (disabled by default and not conformant to any frozen 3GPP spec — Rel-20/6G has no stage-3 wire spec). The 3GPP documents referenced below are design inspiration, not a conformance claim:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
