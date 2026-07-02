@@ -17,12 +17,14 @@ The end-to-end data-plane validation lives in the **nextgcore** repo
 
 ### `pages.yml`
 
-Deploys `docs/` to GitHub Pages.
+Deploys `docs/` to GitHub Pages **only when a release is published** (`on: release: [published]`,
+plus `workflow_dispatch` for manual re-deploys) — not on every `docs/**` push.
 
 ## Branch triggers
 
-Both workflows run on the default release branch **`main`** and on the development branch
-**`first_implementation`** (`branches: [first_implementation, main]`).
+`ci.yml` runs on push + PR to the default release branch **`main`** and the development branch
+**`first_implementation`** (`branches: [first_implementation, main]`). `pages.yml` is not
+branch-triggered — it deploys the docs site when a release is published.
 
 ## Local pre-push gate (mirror of CI)
 
