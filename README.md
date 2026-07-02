@@ -287,6 +287,12 @@ cargo audit
 4. Write unit tests in the crate
 5. Add integration tests in `tests/src/`
 
+## Documentation
+
+- [CHANGELOG.md](CHANGELOG.md) — release notes and version history
+- [docs/ci-and-release.md](docs/ci-and-release.md) — CI pipeline and release process
+- [docs/architecture.md](docs/architecture.md) · [docs/nextgcore-integration.md](docs/nextgcore-integration.md) — design and the matched-sim E2E with nextgcore
+
 ## Contributing
 
 We welcome contributions! Here's how to get started:
