@@ -15,6 +15,7 @@ use nextgsim_rrc::procedures::{
     rrc_setup::{encode_rrc_setup, srb1_rrc_setup_params},
 };
 
+use super::transaction::{RrcProcedure, TidVerification};
 use super::ue_context::RrcUeContextManager;
 use crate::tasks::GutiMobileIdentity;
 
@@ -108,11 +109,12 @@ pub struct RrcResumeCompleteResult {
 /// RRC connection manager
 #[derive(Debug)]
 pub struct RrcConnectionManager {
-    /// Transaction ID counter
+    /// Transaction ID counter for the DL-CCCH/DL-DCCH procedures that are NOT
+    /// yet per-UE (RRC Release / Reestablishment / Resume). RRCSetup and the
+    /// four C4-final sender procedures allocate from the per-UE
+    /// [`RrcTransactionAllocator`](super::transaction::RrcTransactionAllocator)
+    /// on the UE context instead.
     tid_counter: u8,
-    /// Parity toggle for the nibble-safe RRCSetup transaction id
-    /// (Wave-6 C4-interim, see [`Self::next_rrc_setup_tid`])
-    setup_tid_parity: bool,
     /// Whether the cell is barred
     is_barred: bool,
 }
@@ -128,34 +130,15 @@ impl RrcConnectionManager {
     pub fn new() -> Self {
         Self {
             tid_counter: 0,
-            setup_tid_parity: false,
             is_barred: true, // Initially barred until radio power on
         }
     }
 
-    /// Gets the next transaction ID (cycles 0-3)
+    /// Gets the next transaction ID (cycles 0-3) for the not-yet-per-UE
+    /// DL procedures (RRC Release / Reestablishment / Resume).
     pub fn next_tid(&mut self) -> u8 {
         let tid = self.tid_counter;
         self.tid_counter = (self.tid_counter + 1) % 4;
-        tid
-    }
-
-    /// Allocates the RRCSetup transaction id, PINNED to the nibble-0-safe
-    /// values {0, 2} (Wave-6 C4-interim).
-    ///
-    /// WHY (do not "clean up" back to [`Self::next_tid`] — that re-introduces
-    /// a silent multi-connection bug): the UE's DL-CCCH dispatcher is still
-    /// the legacy nibble matcher (`bytes[0] & 0x0F`,
-    /// nextgsim-ue/src/rrc/task.rs `handle_dl_ccch_message`). The RRCSetup
-    /// UPER leading byte is `[0|01|tid|0|00]`, so tid 1/3 yields 0x28/0x38
-    /// whose low nibble 0x8 has NO dispatch arm at the UE — every 2nd/4th
-    /// RRC connection served by one gNB process would have its RRCSetup
-    /// silently dropped. tid 0/2 keep the low nibble at 0x0 (leading byte
-    /// 0x20/0x30). Full per-UE 0..3 cycling lands in C4-final, after C5
-    /// replaces both nibble dispatchers with typed ASN.1 dispatch.
-    fn next_rrc_setup_tid(&mut self) -> u8 {
-        let tid = if self.setup_tid_parity { 2 } else { 0 };
-        self.setup_tid_parity = !self.setup_tid_parity;
         tid
     }
 
@@ -206,9 +189,14 @@ impl RrcConnectionManager {
         ctx.set_establishment_cause(establishment_cause);
         ctx.on_setup_request();
 
-        // Wave-6 C4-interim: nibble-safe {0, 2} allocation, NOT next_tid()
-        // — see next_rrc_setup_tid for why tid 1/3 breaks the UE dispatcher.
-        let transaction_id = self.next_rrc_setup_tid();
+        // Wave-6 C4-final: allocate the RRCSetup transaction id from THIS UE's
+        // per-context allocator (TS 38.331 §6.3.2), NOT a gNB-global counter.
+        // Because the context is fresh, the allocation is deterministically tid
+        // 0 (nibble-safe on DL-CCCH) while C5_TYPED_DCCH_DISPATCH is off — this
+        // retires the former global cycler's latent 2nd/4th-connection RRCSetup
+        // drop without the {0,2} parity hack. The tid is recorded as
+        // outstanding so process_rrc_setup_complete can verify the UE's echo.
+        let transaction_id = ctx.transactions.allocate(RrcProcedure::Setup);
 
         // Build RRC Setup message
         let rrc_setup_pdu = self.build_rrc_setup(transaction_id);
@@ -238,11 +226,28 @@ impl RrcConnectionManager {
         &mut self,
         ue_mgr: &mut RrcUeContextManager,
         ue_id: i32,
-        _transaction_id: u8,
+        transaction_id: u8,
         nas_pdu: OctetString,
         s_tmsi_value: Option<GutiMobileIdentity>,
     ) -> Option<RrcSetupCompleteResult> {
         let ctx = ue_mgr.try_find_ue_mut(ue_id)?;
+
+        // Wave-6 C4-final: verify the tid the UE echoed against the outstanding
+        // RRCSetup transaction (TS 38.331 §5.3.3). Fail-closed — discard a
+        // Complete carrying the wrong tid instead of pairing it to the wrong
+        // procedure. NoOutstanding (a context auto-created on a raw-NAS uplink
+        // with no gNB-sent RRCSetup) is tolerated: there is nothing to match.
+        match ctx.transactions.verify(RrcProcedure::Setup, transaction_id) {
+            TidVerification::Mismatch { expected } => {
+                warn!(
+                    "Discarding RRCSetupComplete for UE[{}]: echoed tid {} != \
+                     outstanding {} (TS 38.331 §5.3.3)",
+                    ue_id, transaction_id, expected
+                );
+                return None;
+            }
+            TidVerification::Match | TidVerification::NoOutstanding => {}
+        }
 
         // Handle 5G-S-TMSI if provided
         if let Some(stmsi) = s_tmsi_value.clone() {
@@ -481,12 +486,19 @@ impl RrcConnectionManager {
     /// CellGroupConfig with one RLC-BearerConfig (LCID 1) serving SRB1
     /// (TS 38.331 §5.3.3.4 / §6.3.2).
     fn build_rrc_setup(&self, transaction_id: u8) -> OctetString {
-        // Wave-6 C4-interim: RRCSetup tids must stay nibble-0-safe ({0, 2})
-        // while the UE DL-CCCH dispatcher is still the legacy nibble matcher
-        // — see next_rrc_setup_tid.
+        // Wave-6 C4-final: RRC-TransactionIdentifier is INTEGER(0..3)
+        // (TS 38.331 §6.3.2). Until C5 types the UE's DL-CCCH dispatcher, the
+        // per-UE allocator pins gNB→UE tids to the nibble-0-safe value 0
+        // (leading byte 0x20); flipping C5_TYPED_DCCH_DISPATCH enables the full
+        // per-UE 0..3 cycle. Guard both invariants.
         debug_assert!(
-            transaction_id == 0 || transaction_id == 2,
-            "RRCSetup tid must be nibble-safe ({{0,2}}) until C5, got {transaction_id}"
+            transaction_id <= 3,
+            "RRC-TransactionIdentifier is INTEGER(0..3), got {transaction_id}"
+        );
+        debug_assert!(
+            super::transaction::C5_TYPED_DCCH_DISPATCH || transaction_id == 0,
+            "RRCSetup tid must be 0 (nibble-safe on the legacy UE DL-CCCH \
+             dispatcher) until C5, got {transaction_id}"
         );
 
         match srb1_rrc_setup_params(transaction_id).and_then(|params| encode_rrc_setup(&params)) {
@@ -625,35 +637,109 @@ mod tests {
         );
     }
 
-    /// Wave-6 C4-interim: RRCSetup tids are PINNED to the nibble-0-safe
-    /// values {0, 2}. WHY: the UE DL-CCCH dispatcher matches on
-    /// `bytes[0] & 0x0F`; RRCSetup byte0 is [0|01|tid|0|00], so tid 1/3
-    /// (0x28/0x38, low nibble 0x8) has no arm and the RRCSetup is silently
-    /// dropped — the pre-existing gNB-global 0..3 cycler lost every 2nd/4th
-    /// connection. Do NOT restore next_tid() here before C5.
+    /// Wave-6 C4-final: RRCSetup tids come from the PER-UE allocator, not the
+    /// former gNB-global cycler. Each UE context is fresh, so every UE's
+    /// RRCSetup is deterministically tid 0 — nibble-0-safe on the UE's legacy
+    /// DL-CCCH dispatcher (byte0 0x20, low nibble 0x0) — with no {0,2} parity
+    /// hack and no 2nd/4th-connection drop (TS 38.331 §6.3.2). One UE's
+    /// allocations no longer shift another UE's tids.
     #[test]
-    fn test_rrc_setup_tid_pinned_nibble_safe() {
+    fn test_rrc_setup_tid_per_ue_is_nibble_safe_zero() {
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
         conn_mgr.set_barred(false);
 
-        let mut expected_tid = [0u8, 2, 0, 2].iter().copied();
         for ue_id in 1..=4 {
             let result = conn_mgr
                 .process_rrc_setup_request(&mut ue_mgr, ue_id, 0x1000 + i64::from(ue_id), false, 3)
                 .expect("setup must succeed");
-            assert_eq!(result.transaction_id, expected_tid.next().unwrap());
+            assert_eq!(
+                result.transaction_id, 0,
+                "each fresh per-UE allocator's first RRCSetup tid is 0"
+            );
             let byte0 = result.rrc_setup_pdu.data()[0];
             assert_eq!(
-                byte0 & 0x0F,
-                0x00,
-                "RRCSetup leading byte low nibble must stay 0x0 (got 0x{byte0:02x})"
+                byte0, 0x20,
+                "RRCSetup(tid 0) leading byte must be 0x20 (low nibble 0x0), got 0x{byte0:02x}"
             );
-            assert!(
-                byte0 == 0x20 || byte0 == 0x30,
-                "RRCSetup leading byte must be 0x20 (tid 0) or 0x30 (tid 2), got 0x{byte0:02x}"
+            // The tid is recorded as outstanding on THIS UE's context.
+            assert_eq!(
+                ue_mgr
+                    .try_find_ue(ue_id)
+                    .unwrap()
+                    .transactions
+                    .outstanding(RrcProcedure::Setup),
+                Some(0)
             );
         }
+    }
+
+    /// Wave-6 C4-final: the gNB verifies the tid the UE echoes in
+    /// RRCSetupComplete against the outstanding RRCSetup transaction and
+    /// discards a mismatched Complete fail-closed, rather than pairing it to
+    /// the wrong procedure (TS 38.331 §5.3.3).
+    #[test]
+    fn test_rrc_setup_complete_tid_mismatch_is_discarded() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+
+        let setup = conn_mgr
+            .process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3)
+            .expect("setup must succeed");
+        assert_eq!(setup.transaction_id, 0, "outstanding setup tid is 0");
+
+        // A Complete echoing the WRONG tid is discarded (fail-closed) and must
+        // not advance the UE to Connected.
+        let bad = conn_mgr.process_rrc_setup_complete(
+            &mut ue_mgr,
+            1,
+            1, // != outstanding 0
+            OctetString::from_slice(&[0x7E, 0x00, 0x41]),
+            None,
+        );
+        assert!(
+            bad.is_none(),
+            "mismatched RRCSetupComplete must be discarded"
+        );
+        assert!(
+            !ue_mgr.try_find_ue(1).unwrap().is_connected(),
+            "a discarded Complete must not move the UE to Connected"
+        );
+
+        // The correctly-echoed tid is still accepted afterwards.
+        let good = conn_mgr.process_rrc_setup_complete(
+            &mut ue_mgr,
+            1,
+            0,
+            OctetString::from_slice(&[0x7E, 0x00, 0x41]),
+            None,
+        );
+        assert!(good.is_some(), "the correct echoed tid must be accepted");
+        assert!(ue_mgr.try_find_ue(1).unwrap().is_connected());
+    }
+
+    /// A raw-NAS-auto-created context (no gNB-sent RRCSetup, so no outstanding
+    /// transaction) must NOT be rejected by the tid check — there is nothing to
+    /// verify against (NoOutstanding is tolerated).
+    #[test]
+    fn test_rrc_setup_complete_no_outstanding_is_tolerated() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+
+        // Context created directly (mirrors the raw-NAS UL-DCCH auto-create).
+        ue_mgr.create_ue(7);
+        let result = conn_mgr.process_rrc_setup_complete(
+            &mut ue_mgr,
+            7,
+            0,
+            OctetString::from_slice(&[0x7E]),
+            None,
+        );
+        assert!(
+            result.is_some(),
+            "no outstanding transaction -> tolerate, do not reject"
+        );
     }
 
     #[test]

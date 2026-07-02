@@ -29,6 +29,7 @@ use nextgsim_common::OctetString;
 use super::amf_context::{AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
+use crate::rrc::transaction::RrcProcedure;
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
     build_drb_reconfiguration_params, encode_rrc_reconfiguration,
 };
@@ -623,9 +624,19 @@ impl NgapTask {
             ciphering_alg_id: ciph_id,
             integrity_alg_id: int_id,
         };
-        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
-            ctx.as_security = Some(sec_ctx);
-        }
+        // Wave-6 C4-final: allocate the SecurityModeCommand tid from THIS UE's
+        // per-context allocator (TS 38.331 §5.3.4 / §6.3.2). Pinned to 0 on the
+        // wire while C5_TYPED_DCCH_DISPATCH is off (the UE DL-DCCH dispatcher is
+        // still the legacy nibble matcher, on which a non-zero tid shuffles the
+        // routed leading-byte nibble); becomes the per-UE 0..3 cycle once C5
+        // types both DL dispatchers.
+        let rrc_transaction_id =
+            if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
+                ctx.as_security = Some(sec_ctx);
+                ctx.transactions.allocate(RrcProcedure::SecurityMode)
+            } else {
+                0
+            };
         info!(
             "AS security established for UE {}: ciphering=NEA{}, integrity=NIA{}",
             ue_id, ciph_id, int_id
@@ -633,11 +644,7 @@ impl NgapTask {
 
         // Encode + send the RRC SecurityModeCommand (SRB1, DL-DCCH).
         let params = SecurityModeCommandParams {
-            // Wave-6 C4-interim: DL-DCCH sender tids stay PINNED to 0 — the
-            // UE DL-DCCH dispatcher is still the legacy nibble matcher and a
-            // non-zero tid shuffles the leading-byte nibble it routes on.
-            // Per-UE 0..3 cycling lands in C4-final, after C5.
-            rrc_transaction_id: 0,
+            rrc_transaction_id,
             security_algorithms: SecurityAlgorithms {
                 ciphering_algorithm: ciph_alg,
                 integrity_algorithm: Some(int_alg),
@@ -842,12 +849,26 @@ impl NgapTask {
         // One DRB per PDU session; DRB identity 1..=32, DTCH LCID above the SRBs.
         let drb_id = psi.clamp(1, 32);
         let lcid = (3 + drb_id).min(32);
-        // Wave-6 C4-interim: the RRCReconfiguration tid (first arg) stays
-        // PINNED to 0 — a non-zero tid shuffles the leading-byte nibble the
-        // UE's legacy DL-DCCH dispatcher routes on (e.g. tid 2 -> byte0 0x04
-        // -> misrouted into the UE's DL-information-transfer arm). Per-UE
-        // 0..3 cycling lands in C4-final, after C5.
-        let params = match build_drb_reconfiguration_params(0, psi, drb_id, lcid, qfis, true) {
+        // Wave-6 C4-final: allocate the RRCReconfiguration tid from THIS UE's
+        // per-context allocator (TS 38.331 §5.3.5 / §6.3.2). Pinned to 0 on the
+        // wire while C5_TYPED_DCCH_DISPATCH is off (a non-zero tid shuffles the
+        // leading-byte nibble the UE's legacy DL-DCCH dispatcher routes on, e.g.
+        // tid 2 -> byte0 0x04 -> misrouted into the DL-information-transfer arm);
+        // becomes the per-UE 0..3 cycle once C5 types both DL dispatchers.
+        let rrc_transaction_id = self
+            .ue_contexts
+            .values_mut()
+            .find(|c| c.ue_id == ue_id)
+            .map(|c| c.transactions.allocate(RrcProcedure::Reconfiguration))
+            .unwrap_or(0);
+        let params = match build_drb_reconfiguration_params(
+            rrc_transaction_id,
+            psi,
+            drb_id,
+            lcid,
+            qfis,
+            true,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 error!(

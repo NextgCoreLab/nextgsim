@@ -24,6 +24,7 @@ use nextgsim_rrc::procedures::ue_capability::{
 const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
 
 use super::connection::RrcConnectionManager;
+use super::transaction::{RrcProcedure, TidVerification};
 use super::ue_context::RrcUeContextManager;
 
 /// NTN configuration stored at RRC level
@@ -321,8 +322,14 @@ impl RrcTask {
             nas_pdu.len()
         );
 
-        self.finish_rrc_setup_complete(ue_id, transaction_id, nas_pdu, redcap_indication, "bespoke-fallback")
-            .await;
+        self.finish_rrc_setup_complete(
+            ue_id,
+            transaction_id,
+            nas_pdu,
+            redcap_indication,
+            "bespoke-fallback",
+        )
+        .await;
     }
 
     /// Common tail for both RRCSetupComplete decode paths: transitions the UE
@@ -414,12 +421,19 @@ impl RrcTask {
 
     /// Sends a UECapabilityEnquiry to the UE (TS 38.331 §5.6.1)
     async fn send_ue_capability_enquiry(&mut self, ue_id: i32) {
+        // Wave-6 C4-final: allocate the UECapabilityEnquiry tid from THIS UE's
+        // per-context allocator (TS 38.331 §5.6.1 / §6.3.2), recorded as
+        // outstanding so the tid echoed in UECapabilityInformation is verified.
+        // The wire value is pinned to 0 while C5_TYPED_DCCH_DISPATCH is off (the
+        // UE DL-DCCH dispatcher is still the legacy nibble matcher); it becomes
+        // the full per-UE 0..3 cycle when C5 lands.
+        let rrc_transaction_id = self
+            .ue_manager
+            .try_find_ue_mut(ue_id)
+            .map(|ctx| ctx.transactions.allocate(RrcProcedure::UeCapability))
+            .unwrap_or(0);
         let params = UeCapabilityEnquiryParams {
-            // Wave-6 C4-interim: DL-DCCH sender tids stay PINNED to 0 — the
-            // UE DL-DCCH dispatcher is still the legacy nibble matcher and a
-            // non-zero tid shuffles the leading-byte nibble it routes on.
-            // Per-UE 0..3 cycling lands in C4-final, after C5.
-            rrc_transaction_id: 0,
+            rrc_transaction_id,
             rat_types: vec![RatType::Nr],
         };
         match encode_ue_capability_enquiry(&params) {
@@ -449,6 +463,26 @@ impl RrcTask {
                 return;
             }
         };
+
+        // Wave-6 C4-final: verify the tid the UE echoed against the outstanding
+        // UECapabilityEnquiry transaction (TS 38.331 §5.6.1). Fail-closed on a
+        // mismatch; tolerate NoOutstanding (no enquiry recorded for this UE).
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            match ctx
+                .transactions
+                .verify(RrcProcedure::UeCapability, information.rrc_transaction_id)
+            {
+                TidVerification::Mismatch { expected } => {
+                    warn!(
+                        "Discarding UECapabilityInformation from UE[{}]: echoed tid \
+                         {} != outstanding {} (TS 38.331 §5.6.1)",
+                        ue_id, information.rrc_transaction_id, expected
+                    );
+                    return;
+                }
+                TidVerification::Match | TidVerification::NoOutstanding => {}
+            }
+        }
 
         for container in &information.containers {
             if container.rat_type == RatType::Nr {

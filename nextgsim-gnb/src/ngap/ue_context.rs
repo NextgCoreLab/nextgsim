@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use crate::rrc::transaction::RrcTransactionAllocator;
+
 /// UE state within NGAP
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UeState {
@@ -102,6 +104,11 @@ pub struct NgapUeContext {
     pub requested_nssai: Option<i32>,
     /// AS security context (established at Initial Context Setup).
     pub as_security: Option<AsSecurityContext>,
+    /// Per-UE RRC transaction-identifier allocator (TS 38.331 §6.3.2, Wave-6
+    /// C4-final) for the DL-DCCH procedures the NGAP task drives:
+    /// SecurityModeCommand and RRCReconfiguration. Independent per UE — never a
+    /// gNB-global counter.
+    pub transactions: RrcTransactionAllocator,
 }
 
 impl NgapUeContext {
@@ -117,6 +124,7 @@ impl NgapUeContext {
             pdu_sessions: HashMap::new(),
             requested_nssai: None,
             as_security: None,
+            transactions: RrcTransactionAllocator::new(),
         }
     }
 

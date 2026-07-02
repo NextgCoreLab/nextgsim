@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use super::redcap::RedCapProcessor;
+use super::transaction::RrcTransactionAllocator;
 use crate::tasks::GutiMobileIdentity;
 
 /// RRC connection state
@@ -71,6 +72,11 @@ pub struct RrcUeContext {
     pub redcap_max_prb: Option<u32>,
     /// UPER-encoded UE-NR-Capability container from UECapabilityInformation
     pub nr_capability: Option<Vec<u8>>,
+    /// Per-UE RRC transaction-identifier allocator (TS 38.331 §6.3.2, Wave-6
+    /// C4-final). Cycles 0..3 for THIS UE and records the outstanding tid per
+    /// procedure so the gNB can verify the UE's echoed tid — replaces the
+    /// former gNB-global counter.
+    pub transactions: RrcTransactionAllocator,
 }
 
 impl RrcUeContext {
@@ -86,6 +92,7 @@ impl RrcUeContext {
             redcap: RedCapProcessor::new(),
             redcap_max_prb: None,
             nr_capability: None,
+            transactions: RrcTransactionAllocator::new(),
         }
     }
 
