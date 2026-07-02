@@ -188,10 +188,14 @@ async fn run_setup_handshake(h: &mut Harness) -> (OctetString, Vec<u8>) {
     let (gnb_ue, ch, rrc_setup) = next_gnb_downlink_rrc(&mut h.gnb_rls_rx);
     assert_eq!(gnb_ue, UE_ID);
     assert_eq!(ch, RrcChannel::DlCcch, "RRCSetup must go on DL-CCCH");
+    // Wave-6 C1: the live RRCSetup must be EXACTLY the hand-derived golden
+    // UPER PDU carrying the SRB1 configuration (TS 38.331 §5.3.5.6.3;
+    // leading byte 0x20 = DL-CCCH c1=rrcSetup, tid 0). Bit-by-bit derivation:
+    // nextgsim-rrc rrc_setup.rs `golden_rrc_setup_srb1_bytes`.
     assert_eq!(
-        rrc_setup.data()[0],
-        0x20,
-        "RRCSetup: DL-CCCH c1=rrcSetup, tid=0 -> leading byte 0x20"
+        rrc_setup.data(),
+        &[0x20, 0x40, 0x00, 0x22, 0x00, 0x04, 0x00, 0x00][..],
+        "RRCSetup must be the C1 golden SRB1 PDU (tid 0)"
     );
 
     // UE: DL-CCCH -> Connected; emits RRCSetupComplete on UL-DCCH.
@@ -214,6 +218,14 @@ async fn run_setup_handshake(h: &mut Harness) -> (OctetString, Vec<u8>) {
 async fn gnb_ue_rrc_setup_handshake_delivers_initial_nas_byte_equal() {
     let mut h = harness();
     let (setup_complete, nas) = run_setup_handshake(&mut h).await;
+
+    // Wave-6 C2: the UE decoded the live RRCSetup and recorded SRB1
+    // (TS 38.331 §5.3.3.4 / §5.3.5.6.3) before any DL-DCCH handling.
+    let srb1 = h
+        .ue
+        .srb1_config()
+        .expect("UE must record SRB1 from the live RRCSetup (C2)");
+    assert_eq!(srb1.rrc_transaction_id, 0);
 
     // Pin the C3 finding: the UE's PRIMARY encoding is the real ASN.1
     // UL-DCCH-Message (c1 index 2 = rrcSetupComplete, tid 0 -> leading byte
