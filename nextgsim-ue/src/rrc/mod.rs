@@ -78,7 +78,7 @@ pub use security::{
     compute_resume_mac_i, compute_short_mac_i, AsSecurityContext, IntegrityAlgorithm, ShortMacError,
 };
 pub use state::{RrcState, RrcStateError, RrcStateMachine, RrcStateTransition};
-pub use task::RrcTask;
+pub use task::{RrcTask, Srb1Config};
 pub use uav::{
     C2LinkQuality, FlightPathConfig, FlightWaypoint, GeoPosition, RemoteIdBroadcast,
     UavAuthorizationState, UavIdentity, UavRegistrationContext,
