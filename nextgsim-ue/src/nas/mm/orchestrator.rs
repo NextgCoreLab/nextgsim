@@ -21,14 +21,22 @@
 //! procedures and drive `tick()` once a second; it returns [`MmOutput`]
 //! values describing NAS PDUs to transmit and procedure outcomes.
 
+use std::collections::HashMap;
+
 use tracing::{debug, info, warn};
 
 use nextgsim_common::config::{OpType, UeConfig};
-use nextgsim_crypto::kdf::{derive_kamf, derive_kausf, derive_kseaf, derive_res_star};
+use nextgsim_crypto::kdf::{derive_kamf, derive_kausf, derive_kgnb, derive_kseaf, derive_res_star};
 use nextgsim_crypto::milenage::{compute_opc, Milenage};
 use nextgsim_nas::enums::{MmMessageType, SecurityHeaderType};
 use nextgsim_nas::ies::ie1::{
     FollowOnRequest, Ie5gsRegistrationType, IeServiceType, RegistrationType, ServiceType,
+};
+use nextgsim_nas::messages::mm::ue_policy::{
+    ManageUePolicyCommand, ManageUePolicyCommandReject, ManageUePolicyComplete, PlmnId,
+    UePolicyError, UePolicyPart, UePolicyPartType, UePolicyResult, UePolicySectionManagementResult,
+    UePolicySectionManagementSubresult, UrspRule, CAUSE_PROTOCOL_ERROR_UNSPECIFIED, PCF_PTI_MAX,
+    PCF_PTI_MIN, UPDP_MSG_MANAGE_UE_POLICY_COMMAND,
 };
 use nextgsim_nas::messages::mm::{
     AuthenticationFailure, AuthenticationRequest, AuthenticationResponse,
@@ -119,6 +127,12 @@ pub enum MmOutput {
     /// the caller should dispatch it (identity, transport, config update,
     /// session management piggybacks, ...)
     NotHandled(Vec<u8>),
+    /// KgNB for AS-security activation, derived from KAMF and the uplink NAS
+    /// COUNT (TS 33.501 §6.9.4.1). Emitted once NAS security is active so the
+    /// caller hands it to the RRC plane (`RrcMessage::AsSecurityKey`) to derive
+    /// K_RRCint/K_RRCenc when the AS SecurityModeCommand arrives (Wave-6 I5).
+    /// Only produced when the `I5_UE_AS_SECURITY` wire gate is on.
+    AsSecurityKgnb([u8; 32]),
 }
 
 /// UE identity and credential material used by the MM procedures.
@@ -327,6 +341,38 @@ fn sqn_to_u64(sqn: &[u8; 6]) -> u64 {
     v
 }
 
+/// A stored UE policy section: the UE policy parts installed for one
+/// `(PLMN, UPSC)` key (TS 24.501 D.2.1.3 / D.3). Owned by the MM plane
+/// (never the SM orchestrator, which owns PDU-session logic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredUePolicySection {
+    /// The UE policy parts of the section (URSP, ANDSP, ...), as delivered.
+    pub parts: Vec<UePolicyPart>,
+}
+
+impl StoredUePolicySection {
+    /// The decoded URSP rules of the section's URSP part, if it carries one.
+    pub fn ursp_rules(&self) -> Option<Vec<UrspRule>> {
+        self.parts
+            .iter()
+            .find(|p| p.part_type == UePolicyPartType::Ursp)
+            .and_then(|p| p.decode_ursp().ok())
+    }
+}
+
+/// Result of handling a received "UE policy container": the UE policy delivery
+/// service message content to carry uplink (or nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UePolicyReaction {
+    /// Encoded MANAGE UE POLICY COMPLETE / COMMAND REJECT content to send in a
+    /// UL NAS TRANSPORT with payload container type "UE policy container"
+    /// (0b0101).
+    Reply(Vec<u8>),
+    /// The command was too malformed to even echo a PCF PTI: drop it without
+    /// replying (never a panic — remote-DoS caution).
+    Ignore,
+}
+
 /// 5GMM procedure orchestrator (UE side).
 pub struct MmOrchestrator {
     identity: MmUeIdentity,
@@ -377,6 +423,10 @@ pub struct MmOrchestrator {
 
     // -- deregistration state --
     dereg_pdu: Option<Vec<u8>>,
+
+    // -- UE policy delivery service (UPDP, TS 24.501 Annex D) --
+    /// UE policy sections stored by `(PLMN, UPSC)` (TS 24.501 D.2.1.3 / D.3).
+    ue_policy_sections: HashMap<(PlmnId, u16), StoredUePolicySection>,
 }
 
 impl MmOrchestrator {
@@ -408,6 +458,7 @@ impl MmOrchestrator {
             usim_invalid: false,
             n1_mode_disabled: false,
             dereg_pdu: None,
+            ue_policy_sections: HashMap::new(),
         }
     }
 
@@ -1576,7 +1627,30 @@ impl MmOrchestrator {
             plain,
             SecurityHeaderType::IntegrityProtectedAndCipheredWithNewSecurityContext,
         );
-        vec![MmOutput::SendNasPdu(pdu)]
+        let mut outs = vec![MmOutput::SendNasPdu(pdu)];
+        // Wave-6 I5: once NAS security is active, hand the derived KgNB to the
+        // RRC plane so it can derive K_RRCint/K_RRCenc when the AS
+        // SecurityModeCommand arrives (TS 33.501 §6.9.4.1). Gated behind the
+        // AS-security wire knob; the exact uplink NAS COUNT the AMF uses for the
+        // KgNB derivation is a cross-stack detail verified in the docker E2E
+        // sign-off (hazard #269, host-only).
+        if crate::rrc::security::I5_UE_AS_SECURITY {
+            if let Some(kgnb) = self.derive_kgnb_for_as_security() {
+                outs.push(MmOutput::AsSecurityKgnb(kgnb));
+            }
+        }
+        outs
+    }
+
+    /// Derive KgNB for AS security from the active NAS context (TS 33.501
+    /// §6.9.4.1: `KgNB = KDF(KAMF, uplink NAS COUNT, 3GPP-access)`). Returns
+    /// `None` when no KAMF is available (NAS security not established). The gNB
+    /// receives the same KgNB from the AMF in the NGAP InitialContextSetupRequest
+    /// SecurityKey IE, so both ends derive identical K_RRCint/K_RRCenc.
+    pub fn derive_kgnb_for_as_security(&self) -> Option<[u8; 32]> {
+        let kamf = self.sec.keys().kamf()?;
+        let ul_count = self.sec.uplink_count().to_u32();
+        Some(derive_kgnb(kamf, ul_count, 0x01))
     }
 
     fn send_security_mode_reject(&mut self, cause: MmCause) -> Vec<MmOutput> {
@@ -1937,6 +2011,180 @@ impl MmOrchestrator {
             // Everything else (REGISTRATION ACCEPT, SERVICE ACCEPT, CONFIGURATION
             // UPDATE COMMAND, SECURITY MODE COMMAND, ...) must be protected.
             _ => false,
+        }
+    }
+
+    // ========================================================================
+    // UE policy delivery service (UPDP) — TS 24.501 Annex D (Wave-6 E8)
+    // ========================================================================
+
+    /// Number of UE policy sections currently stored (test/observability hook).
+    pub fn ue_policy_section_count(&self) -> usize {
+        self.ue_policy_sections.len()
+    }
+
+    /// The stored UE policy section for `(plmn, upsc)`, if any (test hook).
+    pub fn ue_policy_section(&self, plmn: PlmnId, upsc: u16) -> Option<&StoredUePolicySection> {
+        self.ue_policy_sections.get(&(plmn, upsc))
+    }
+
+    /// Handle a received "UE policy container" payload (the MANAGE UE POLICY
+    /// COMMAND content carried in a DL NAS TRANSPORT, TS 24.501 D.2.1.3).
+    ///
+    /// Decodes the command, installs/replaces/deletes the addressed sections
+    /// keyed by `(PLMN, UPSC)` and returns the UE policy delivery service
+    /// message content to send back uplink:
+    ///
+    /// - all instructions stored → MANAGE UE POLICY COMPLETE (echoing the PTI);
+    /// - one or more instructions unstorable → MANAGE UE POLICY COMMAND REJECT
+    ///   with a per-instruction D.6.3 result (fail-closed: the UE never
+    ///   COMPLETEs a section it did not store);
+    /// - a malformed command still carrying a recoverable PCF PTI → REJECT
+    ///   (never a panic — remote-DoS caution mirroring the SM plane);
+    /// - a command too short to carry a PTI → [`UePolicyReaction::Ignore`].
+    pub fn handle_ue_policy_command(&mut self, container: &[u8]) -> UePolicyReaction {
+        match ManageUePolicyCommand::decode(container) {
+            Ok(cmd) => self.apply_ue_policy_command(&cmd),
+            Err(e) => {
+                warn!("MANAGE UE POLICY COMMAND decode failed ({e}); rejecting");
+                self.reject_unparseable_command(container)
+            }
+        }
+    }
+
+    /// Install/replace/delete the sections of a decoded command and build the
+    /// COMPLETE or COMMAND REJECT reply.
+    fn apply_ue_policy_command(&mut self, cmd: &ManageUePolicyCommand) -> UePolicyReaction {
+        let mut subresults: Vec<UePolicySectionManagementSubresult> = Vec::new();
+        for sublist in &cmd.sublists {
+            let mut failed: Vec<UePolicyResult> = Vec::new();
+            for (idx, instr) in sublist.instructions.iter().enumerate() {
+                // 1-based instruction order within the sublist contents (D.6.3).
+                let order = (idx + 1) as u16;
+                if instr.parts.is_empty() {
+                    // D.2.1.3: an instruction with no parts deletes the section.
+                    self.ue_policy_sections
+                        .remove(&(sublist.plmn_id, instr.upsc));
+                    debug!(
+                        "UE policy: deleted section (PLMN {:?}, UPSC {})",
+                        sublist.plmn_id, instr.upsc
+                    );
+                    continue;
+                }
+                // Fail-closed: validate every URSP part BEFORE storing anything
+                // for this instruction — never store a half-decoded section.
+                let storable = instr.parts.iter().all(|part| {
+                    if part.part_type == UePolicyPartType::Ursp {
+                        match part.decode_ursp() {
+                            Ok(_) => true,
+                            Err(e) => {
+                                warn!(
+                                    "UE policy: URSP part of (PLMN {:?}, UPSC {}) is \
+                                     undecodable: {e}",
+                                    sublist.plmn_id, instr.upsc
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        // Non-URSP part types are stored opaquely (framing was
+                        // already validated by the command decoder).
+                        true
+                    }
+                });
+                if storable {
+                    self.ue_policy_sections.insert(
+                        (sublist.plmn_id, instr.upsc),
+                        StoredUePolicySection {
+                            parts: instr.parts.clone(),
+                        },
+                    );
+                    debug!(
+                        "UE policy: stored section (PLMN {:?}, UPSC {}, {} part(s))",
+                        sublist.plmn_id,
+                        instr.upsc,
+                        instr.parts.len()
+                    );
+                } else {
+                    failed.push(UePolicyResult {
+                        upsc: instr.upsc,
+                        failed_instruction_order: order,
+                        cause: CAUSE_PROTOCOL_ERROR_UNSPECIFIED,
+                    });
+                }
+            }
+            if !failed.is_empty() {
+                subresults.push(UePolicySectionManagementSubresult {
+                    plmn_id: sublist.plmn_id,
+                    results: failed,
+                });
+            }
+        }
+
+        if subresults.is_empty() {
+            self.encode_updp_reply(
+                ManageUePolicyComplete { pti: cmd.pti }.encode(),
+                "MANAGE UE POLICY COMPLETE",
+            )
+        } else {
+            self.encode_updp_reply(
+                ManageUePolicyCommandReject {
+                    pti: cmd.pti,
+                    result: UePolicySectionManagementResult { subresults },
+                }
+                .encode(),
+                "MANAGE UE POLICY COMMAND REJECT",
+            )
+        }
+    }
+
+    /// Best-effort REJECT for a command that failed to frame-decode. Recovers
+    /// the PTI (octet 1) only when the message is at least PTI + message type,
+    /// is a MANAGE UE POLICY COMMAND and carries a PCF-allocated PTI; otherwise
+    /// a spec-valid (PTI 80H-FEH) REJECT cannot be formed and the command is
+    /// dropped.
+    fn reject_unparseable_command(&self, container: &[u8]) -> UePolicyReaction {
+        if container.len() < 2
+            || container[1] != UPDP_MSG_MANAGE_UE_POLICY_COMMAND
+            || !(PCF_PTI_MIN..=PCF_PTI_MAX).contains(&container[0])
+        {
+            return UePolicyReaction::Ignore;
+        }
+        let pti = container[0];
+        // The specific failed instruction cannot be identified in an
+        // unparseable command; report the home PLMN, UPSC 0, order 1.
+        let Ok(plmn_id) = PlmnId::from_bcd(self.identity.plmn_bcd) else {
+            return UePolicyReaction::Ignore;
+        };
+        let reject = ManageUePolicyCommandReject {
+            pti,
+            result: UePolicySectionManagementResult {
+                subresults: vec![UePolicySectionManagementSubresult {
+                    plmn_id,
+                    results: vec![UePolicyResult {
+                        upsc: 0,
+                        failed_instruction_order: 1,
+                        cause: CAUSE_PROTOCOL_ERROR_UNSPECIFIED,
+                    }],
+                }],
+            },
+        };
+        self.encode_updp_reply(reject.encode(), "MANAGE UE POLICY COMMAND REJECT")
+    }
+
+    /// Wrap an encoder result into a [`UePolicyReaction`]; an (unexpected)
+    /// encode failure drops the reply rather than sending malformed bytes.
+    fn encode_updp_reply(
+        &self,
+        encoded: Result<Vec<u8>, UePolicyError>,
+        what: &str,
+    ) -> UePolicyReaction {
+        match encoded {
+            Ok(bytes) => UePolicyReaction::Reply(bytes),
+            Err(e) => {
+                warn!("UE policy: failed to encode {what}: {e}");
+                UePolicyReaction::Ignore
+            }
         }
     }
 
@@ -3698,6 +3946,146 @@ mod tests {
         assert!(
             orch.security_context().keys().has_kamf(),
             "KAMF must be derived after EAP-AKA' challenge"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // UE policy delivery service (UPDP) — Wave-6 E8
+    // ------------------------------------------------------------------------
+
+    /// E1 vector (f): complete MANAGE UE POLICY COMMAND content, re-cited
+    /// verbatim from the hand-derived E1 golden vectors in
+    /// nextgcore/src/libs/nextgcore-nas/tests/ue_policy_golden_vectors/data.rs.
+    /// These bytes are the exact output of the INDEPENDENT nextgcore encoder,
+    /// so decoding them here is the cross-stack strict-peer oracle: the two
+    /// codecs must agree byte-for-byte. (PTI 0x80; one PLMN 001/01 sublist; one
+    /// UPSC-1 instruction; one URSP part = catch-all rule → internet.)
+    const E1_VEC_F_COMMAND: &[u8] = &[
+        0x80, 0x01, 0x00, 0x2B, 0x00, 0x29, 0x00, 0xF1, 0x10, 0x00, 0x24, 0x00, 0x01, 0x00, 0x20,
+        0x01, 0x00, 0x1D, 0xFF, 0x00, 0x01, 0x01, 0x00, 0x17, 0x00, 0x15, 0xFF, 0x00, 0x12, 0x01,
+        0x01, 0x02, 0x01, 0x01, 0x04, 0x09, 0x08, 0x69, 0x6E, 0x74, 0x65, 0x72, 0x6E, 0x65, 0x74,
+        0x08, 0x03,
+    ];
+
+    fn plmn_001_01() -> PlmnId {
+        PlmnId {
+            mcc: [0, 0, 1],
+            mnc: [0, 1, 0],
+            mnc_len: 2,
+        }
+    }
+
+    #[test]
+    fn test_ue_policy_command_stores_and_completes() {
+        use nextgsim_nas::messages::mm::ue_policy::TrafficDescriptorComponent;
+        let mut orch = new_orch();
+        let reaction = orch.handle_ue_policy_command(E1_VEC_F_COMMAND);
+        // COMPLETE echoes the command PTI (0x80) + message type 0x02.
+        assert_eq!(reaction, UePolicyReaction::Reply(vec![0x80, 0x02]));
+        // Exactly one section stored, at (PLMN 001/01, UPSC 1).
+        assert_eq!(orch.ue_policy_section_count(), 1);
+        let section = orch
+            .ue_policy_section(plmn_001_01(), 1)
+            .expect("section (001/01, UPSC 1) must be stored");
+        let rules = section.ursp_rules().expect("URSP rules present");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].precedence, 255);
+        assert_eq!(
+            rules[0].traffic_descriptor,
+            vec![TrafficDescriptorComponent::MatchAll]
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_complete_pti_is_echoed() {
+        // A different PCF PTI must be echoed verbatim in the COMPLETE.
+        let mut cmd = E1_VEC_F_COMMAND.to_vec();
+        cmd[0] = 0xC7;
+        let mut orch = new_orch();
+        assert_eq!(
+            orch.handle_ue_policy_command(&cmd),
+            UePolicyReaction::Reply(vec![0xC7, 0x02])
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_malformed_command_rejects_not_crash() {
+        let mut orch = new_orch();
+        // Truncate the command anywhere past its PTI/type/length header: the
+        // declared list length no longer matches the bytes present, so the UE
+        // must answer a REJECT (never panic) and must NOT store anything.
+        for cut in 4..E1_VEC_F_COMMAND.len() {
+            match orch.handle_ue_policy_command(&E1_VEC_F_COMMAND[..cut]) {
+                UePolicyReaction::Reply(bytes) => {
+                    assert_eq!(bytes[0], 0x80, "REJECT must echo the PTI");
+                    assert_eq!(bytes[1], 0x03, "message type must be COMMAND REJECT");
+                }
+                UePolicyReaction::Ignore => {}
+            }
+        }
+        assert_eq!(
+            orch.ue_policy_section_count(),
+            0,
+            "a rejected command stores nothing (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_delete_section() {
+        let mut orch = new_orch();
+        assert_eq!(
+            orch.handle_ue_policy_command(E1_VEC_F_COMMAND),
+            UePolicyReaction::Reply(vec![0x80, 0x02])
+        );
+        assert_eq!(orch.ue_policy_section_count(), 1);
+        // A command with a single instruction carrying UPSC 1 and NO parts
+        // deletes the section (TS 24.501 D.2.1.3).
+        let delete_cmd = [
+            0x80u8, 0x01, 0x00, 0x09, 0x00, 0x07, 0x00, 0xF1, 0x10, 0x00, 0x02, 0x00, 0x01,
+        ];
+        assert_eq!(
+            orch.handle_ue_policy_command(&delete_cmd),
+            UePolicyReaction::Reply(vec![0x80, 0x02])
+        );
+        assert_eq!(
+            orch.ue_policy_section_count(),
+            0,
+            "an empty-parts instruction deletes the section"
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_too_short_is_ignored() {
+        let mut orch = new_orch();
+        // < 2 octets: no PTI can be recovered → dropped (no reply, no crash).
+        assert_eq!(
+            orch.handle_ue_policy_command(&[0x80]),
+            UePolicyReaction::Ignore
+        );
+        assert_eq!(orch.handle_ue_policy_command(&[]), UePolicyReaction::Ignore);
+        assert_eq!(orch.ue_policy_section_count(), 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Wave-6 I5 — NAS-plane KgNB derivation for AS security
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_kgnb_for_as_security() {
+        use nextgsim_crypto::kdf::derive_kgnb;
+        let mut orch = new_orch();
+        // No KAMF yet → None (NAS security not established).
+        assert!(orch.derive_kgnb_for_as_security().is_none());
+
+        // Seed a KAMF; KgNB must equal derive_kgnb(KAMF, uplink NAS COUNT,
+        // 3GPP-access) — the same value the AMF sends the gNB as SecurityKey
+        // (TS 33.501 §6.9.4.1).
+        let kamf = [0x22u8; 32];
+        orch.sec.keys_mut().set_kamf(&kamf);
+        let ul = orch.sec.uplink_count().to_u32();
+        assert_eq!(
+            orch.derive_kgnb_for_as_security(),
+            Some(derive_kgnb(&kamf, ul, 0x01))
         );
     }
 }

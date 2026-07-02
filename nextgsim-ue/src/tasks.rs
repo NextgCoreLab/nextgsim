@@ -435,6 +435,13 @@ pub enum RrcMessage {
     },
     /// RRC notify (from NAS)
     RrcNotify,
+    /// KgNB handed down from the NAS plane once NAS security is active
+    /// (TS 33.501 §6.9.4.1). The RRC task stores it and derives K_RRCint/
+    /// K_RRCenc when the AS SecurityModeCommand arrives (Wave-6 I5).
+    AsSecurityKey {
+        /// 256-bit KgNB derived from KAMF and the uplink NAS COUNT.
+        kgnb: [u8; 32],
+    },
     /// Perform UAC (from NAS)
     PerformUac {
         /// UAC access category
