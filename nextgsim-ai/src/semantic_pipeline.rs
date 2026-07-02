@@ -9,8 +9,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Once;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Emits the "quality not measured" warning at most once per process.
+static QUALITY_UNMEASURED_WARN: Once = Once::new();
 
 use crate::config::SemanticConfig;
 use crate::error::ModelError;
@@ -54,8 +58,10 @@ pub struct SemanticEncoding {
     pub original_shape: Vec<i64>,
     /// Compression ratio achieved
     pub compression_ratio: f32,
-    /// Quality score (0.0 to 1.0)
-    pub quality_score: f32,
+    /// Measured quality score in `[0.0, 1.0]`, or `None` when the pipeline could
+    /// not measure quality (e.g. no model / no round-trip available). `None` is
+    /// distinct from "measured high" and must not be treated as a passing KPI.
+    pub quality_score: Option<f32>,
     /// Metadata about the encoding
     pub metadata: HashMap<String, String>,
 }
@@ -65,8 +71,9 @@ pub struct SemanticEncoding {
 pub struct SemanticDecoding {
     /// Reconstructed data
     pub data: TensorData,
-    /// Quality score (0.0 to 1.0)
-    pub quality_score: f32,
+    /// Measured quality score in `[0.0, 1.0]`, or `None` when not measured
+    /// (carried over from the encoding).
+    pub quality_score: Option<f32>,
     /// Metadata from the encoding
     pub metadata: HashMap<String, String>,
 }
@@ -86,8 +93,12 @@ pub struct SemanticPipeline {
     total_encodings: usize,
     /// Total compression ratio sum (for averaging)
     total_compression: f32,
-    /// Total quality score sum (for averaging)
+    /// Total measured quality score sum (for averaging)
     total_quality: f32,
+    /// Count of encodings whose quality was actually measured (the divisor for
+    /// the average — unmeasured encodings are excluded so the average is not
+    /// diluted toward zero).
+    total_measured: usize,
 }
 
 impl SemanticPipeline {
@@ -100,6 +111,7 @@ impl SemanticPipeline {
             total_encodings: 0,
             total_compression: 0.0,
             total_quality: 0.0,
+            total_measured: 0,
         }
     }
 
@@ -166,31 +178,53 @@ impl SemanticPipeline {
             1.0
         };
 
-        // Estimate quality (placeholder - would use actual quality metric in production)
+        // Measure quality if possible (None = not measurable here).
         let quality_score = self.estimate_quality(input, &encoded);
 
-        // Check if quality meets threshold
-        if quality_score < self.config.quality_threshold {
-            return Err(SemanticError::QualityBelowThreshold {
-                expected: self.config.quality_threshold,
-                actual: quality_score,
-            });
+        // Only enforce the quality gate on a MEASURED score. When quality is not
+        // measured we skip the gate (with a one-time warning) rather than letting
+        // a fabricated constant silently pass it.
+        match quality_score {
+            Some(q) if q < self.config.quality_threshold => {
+                return Err(SemanticError::QualityBelowThreshold {
+                    expected: self.config.quality_threshold,
+                    actual: q,
+                });
+            }
+            None => {
+                QUALITY_UNMEASURED_WARN.call_once(|| {
+                    warn!(
+                        "semantic encode: quality not measured (no decoder round-trip / \
+                         comparable tensor) — skipping quality-threshold gate"
+                    );
+                });
+            }
+            _ => {}
         }
 
-        // Update statistics
+        // Update statistics. Only measured scores feed the quality average.
         self.total_encodings += 1;
         self.total_compression += compression_ratio;
-        self.total_quality += quality_score;
+        if let Some(q) = quality_score {
+            self.total_quality += q;
+            self.total_measured += 1;
+        }
 
         let mut metadata = HashMap::new();
         metadata.insert("encoder_version".to_string(), "1.0".to_string());
         metadata.insert("original_dtype".to_string(), input.dtype().to_string());
 
-        info!(
-            "Encoding complete: compression {:.2}%, quality {:.2}",
-            compression_ratio * 100.0,
-            quality_score
-        );
+        match quality_score {
+            Some(q) => info!(
+                "Encoding complete: compression {:.2}%, quality {:.2}",
+                compression_ratio * 100.0,
+                q
+            ),
+            None => info!(
+                "Encoding complete: compression {:.2}%, quality not measured",
+                compression_ratio * 100.0
+            ),
+        }
 
         Ok(SemanticEncoding {
             features: encoded,
@@ -254,16 +288,24 @@ impl SemanticPipeline {
         Ok((encoding, decoding))
     }
 
-    /// Estimates quality of encoding (placeholder implementation)
+    /// Estimates the quality of an encoding, or `None` when it cannot be
+    /// measured.
     ///
-    /// In production, this would compute metrics like:
-    /// - PSNR (Peak Signal-to-Noise Ratio)
-    /// - SSIM (Structural Similarity Index)
-    /// - Perceptual quality metrics
-    fn estimate_quality(&self, _original: &TensorData, _encoded: &TensorData) -> f32 {
-        // Placeholder: return a high quality score
-        // In production, this would compare the decoded output with the original
-        0.95
+    /// Quality is only *measurable* when we can compare like-for-like, i.e. when
+    /// the encoded tensor has the same element count as the input (e.g. an
+    /// identity / round-trip path), in which case we return a cosine-similarity
+    /// score mapped to `[0, 1]`. For a genuinely compressing model (different
+    /// dimensionality) or no model, quality cannot be measured here without a
+    /// decoder round-trip, so we return `None` ("not measured") rather than a
+    /// fabricated constant. (A fuller implementation would compute PSNR/SSIM on
+    /// the decoded reconstruction.)
+    fn estimate_quality(&self, original: &TensorData, encoded: &TensorData) -> Option<f32> {
+        let o: Vec<f32> = original.as_f32_array()?.iter().copied().collect();
+        let e: Vec<f32> = encoded.as_f32_array()?.iter().copied().collect();
+        if o.is_empty() || o.len() != e.len() {
+            return None;
+        }
+        Some(cosine_quality(&o, &e))
     }
 
     /// Returns average compression ratio across all encodings
@@ -275,13 +317,21 @@ impl SemanticPipeline {
         }
     }
 
-    /// Returns average quality score across all encodings
+    /// Returns the average of the *measured* quality scores, or `0.0` when no
+    /// encoding has had its quality measured. Encodings whose quality was not
+    /// measured are excluded from the divisor (they neither raise nor dilute the
+    /// average).
     pub fn avg_quality_score(&self) -> f32 {
-        if self.total_encodings > 0 {
-            self.total_quality / self.total_encodings as f32
+        if self.total_measured > 0 {
+            self.total_quality / self.total_measured as f32
         } else {
             0.0
         }
+    }
+
+    /// Number of encodings whose quality was actually measured.
+    pub fn measured_quality_count(&self) -> usize {
+        self.total_measured
     }
 
     /// Returns the total number of encodings performed
@@ -304,7 +354,22 @@ impl SemanticPipeline {
         self.total_encodings = 0;
         self.total_compression = 0.0;
         self.total_quality = 0.0;
+        self.total_measured = 0;
     }
+}
+
+/// Cosine similarity of two equal-length vectors mapped to `[0, 1]`
+/// (`0.5 * (1 + cos)`). Returns `0.5` (orthogonal/degenerate) when either
+/// vector has zero norm.
+fn cosine_quality(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        return 0.5;
+    }
+    let cos = (dot / (na * nb)).clamp(-1.0, 1.0);
+    0.5 * (1.0 + cos)
 }
 
 /// Builder for creating a semantic pipeline with custom configuration
@@ -380,18 +445,53 @@ mod tests {
     fn test_pipeline_statistics() {
         let mut pipeline = SemanticPipeline::new(SemanticConfig::default());
 
-        // Simulate some encodings
+        // Simulate some encodings (all three had their quality measured).
         pipeline.total_encodings = 3;
         pipeline.total_compression = 0.3; // 0.1 each
-        pipeline.total_quality = 2.85; // 0.95 each
+        pipeline.total_quality = 2.7; // 0.9 each
+        pipeline.total_measured = 3;
 
         assert_eq!(pipeline.total_encodings(), 3);
         assert!((pipeline.avg_compression_ratio() - 0.1).abs() < 0.01);
-        assert!((pipeline.avg_quality_score() - 0.95).abs() < 0.01);
+        // Average is over the MEASURED count, not the total encodings.
+        assert!((pipeline.avg_quality_score() - 0.9).abs() < 0.01);
+        assert_eq!(pipeline.measured_quality_count(), 3);
 
         pipeline.reset_statistics();
         assert_eq!(pipeline.total_encodings(), 0);
         assert_eq!(pipeline.avg_compression_ratio(), 0.0);
+        assert_eq!(pipeline.measured_quality_count(), 0);
+        // No measured scores -> average is 0.0, not a fabricated constant.
+        assert_eq!(pipeline.avg_quality_score(), 0.0);
+    }
+
+    #[test]
+    fn estimate_quality_measures_when_comparable_else_none() {
+        let pipeline = SemanticPipeline::new(SemanticConfig::default());
+        let input = TensorData::float32(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+
+        // Same length but perturbed -> a measured score strictly inside (0, 1)
+        // (no longer the hardcoded 0.95 constant).
+        let perturbed = TensorData::float32(vec![1.0, 2.0, 3.0, -4.0], vec![4]);
+        let q = pipeline
+            .estimate_quality(&input, &perturbed)
+            .expect("comparable tensors should be measurable");
+        assert!(
+            q > 0.0 && q < 1.0,
+            "expected measured quality in (0,1), got {q}"
+        );
+
+        // A compressing model (different element count) is not measurable here.
+        let compressed = TensorData::float32(vec![1.0], vec![1]);
+        assert_eq!(
+            pipeline.estimate_quality(&input, &compressed),
+            None,
+            "non-comparable shapes must yield not-measured"
+        );
+
+        // Identical tensors -> cosine 1 -> quality 1.0 (computed, not a constant).
+        let same = TensorData::float32(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+        assert_eq!(pipeline.estimate_quality(&input, &same), Some(1.0));
     }
 
     #[test]
@@ -403,13 +503,13 @@ mod tests {
             features,
             original_shape: original_shape.clone(),
             compression_ratio: 0.03, // 3 / 100
-            quality_score: 0.95,
+            quality_score: Some(0.95),
             metadata: HashMap::new(),
         };
 
         assert_eq!(encoding.original_shape, original_shape);
         assert!((encoding.compression_ratio - 0.03).abs() < 0.01);
-        assert!((encoding.quality_score - 0.95).abs() < 0.01);
+        assert!((encoding.quality_score.unwrap() - 0.95).abs() < 0.01);
     }
 
     #[test]
@@ -446,7 +546,7 @@ mod tests {
             features: TensorData::float32(vec![1.0, 2.0, 3.0], vec![3]),
             original_shape: vec![10],
             compression_ratio: 0.3,
-            quality_score: 0.95,
+            quality_score: Some(0.95),
             metadata: HashMap::new(),
         };
 

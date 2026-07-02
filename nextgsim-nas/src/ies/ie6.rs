@@ -152,14 +152,12 @@ impl IeLadnInformation {
         }
 
         let mut entries = Vec::new();
-        let mut remaining = total_len;
 
-        // Create a sub-slice to limit reading
-        let mut sub_buf = &buf.chunk()[..remaining];
+        // Create a sub-slice bounded to the IE's declared length.
+        let mut sub_buf = &buf.chunk()[..total_len];
 
         while sub_buf.remaining() > 0 {
             let entry = LadnEntry::decode(&mut sub_buf)?;
-            remaining -= entry.encoded_len();
             entries.push(entry);
         }
 

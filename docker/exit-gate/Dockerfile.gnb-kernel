@@ -1,0 +1,18 @@
+# gNB runtime image for the exit gate: pre-built kernel-SCTP binary + libsctp1.
+# Build context = the nextgsim repo root (so binaries/ is in context):
+#   docker build -f docker/exit-gate/Dockerfile.gnb-kernel -t nextgsim-gnb-kernel:latest .
+# The binary at binaries/nr-gnb-kernel must be a Linux build of
+#   cargo build -p nextgsim-gnb --features kernel-sctp
+# NOTE: base must match the builder's glibc (rust:latest = Debian trixie, glibc
+# 2.38); bookworm-slim (2.36) is too old for the rust:latest-built binary.
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libsctp1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY binaries/nr-gnb-kernel /usr/local/bin/nr-gnb
+RUN mkdir -p /etc/nextgsim
+WORKDIR /etc/nextgsim
+EXPOSE 38412/sctp 2152/udp
+ENV RUST_LOG=info,nextgsim_gnb=debug,nextgsim_sctp=debug
+ENTRYPOINT ["nr-gnb"]
+CMD ["-c", "/etc/nextgsim/gnb.yaml"]

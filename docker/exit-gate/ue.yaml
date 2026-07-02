@@ -1,0 +1,185 @@
+# UE Configuration for NextGSim
+# Connects to gNB which connects to NextGCore 5G Core Network
+#
+# IMSI: 999700000000001 (PLMN 999-70 + MSIN 0000000001)
+# This subscriber must be provisioned in nextgcore MongoDB
+
+# Subscription Permanent Identifier (IMSI format)
+supi:
+  supi_type: Imsi
+  value: "999700000000001"
+
+# SUCI Protection Scheme (TS 33.501 Annex C)
+# 0: Null scheme (no protection)
+# 1: Profile A (ECIES, X25519)
+# 2: Profile B (ECIES, secp256r1)
+protection_scheme: 0
+
+# Home network public key configuration (for SUCI protection).
+# The keys below (commented) are the TS 33.501 Annex C.4.3/C.4.4 test vector
+# key pairs; the matching private keys are provisioned for nextgcore udmd in
+# docker/rust/configs/5gc/hnet/ (udm.yaml: key id 1 = Profile A
+# curve25519-1.key, key id 2 = Profile B secp256r1-2.key).
+#
+# Profile A (protection_scheme: 1):
+#   home_network_public_key_id: 1
+#   home_network_public_key: [0x5A, 0x8D, 0x38, 0x86, 0x48, 0x20, 0x19, 0x7C, 0x33, 0x94, 0xB9, 0x26, 0x13, 0xB2, 0x0B, 0x91, 0x63, 0x3C, 0xBD, 0x89, 0x71, 0x19, 0x27, 0x3B, 0xF8, 0xE4, 0xA6, 0xF4, 0xEE, 0xC0, 0xA6, 0x50]
+#
+# Profile B (protection_scheme: 2, SEC1 compressed point):
+#   home_network_public_key_id: 2
+#   home_network_public_key: [0x02, 0x72, 0xDA, 0x71, 0x97, 0x62, 0x34, 0xCE, 0x83, 0x3A, 0x69, 0x07, 0x42, 0x58, 0x67, 0xB8, 0x2E, 0x07, 0x4D, 0x44, 0xEF, 0x90, 0x7D, 0xFB, 0x4B, 0x3E, 0x21, 0xC1, 0xC2, 0x25, 0x6E, 0xBC, 0xD1]
+home_network_public_key_id: 0
+home_network_public_key: []
+
+# Routing indicator (1-4 decimal digits, TS 24.501 9.11.3.4)
+routing_indicator: "0000"
+
+# Home PLMN - Must match nextgcore configuration
+hplmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+# Subscriber authentication key K (128-bit)
+# Default test key from Open5GS/UERANSIM examples
+key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+
+# Operator key OPc (128-bit)
+# Default test OPc from Open5GS/UERANSIM examples
+op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+
+# Type of operator key
+op_type: Opc
+
+# Authentication Management Field (16-bit)
+# 0x8000 = separation bit set (5G)
+amf: [0x80, 0x00]
+
+# International Mobile Equipment Identity (optional)
+imei: "356938035643803"
+
+# IMEI Software Version (optional)
+imei_sv: null
+
+# Supported NAS security algorithms
+supported_algs:
+  nia1: true   # SNOW3G integrity
+  nia2: true   # AES integrity
+  nia3: true   # ZUC integrity
+  nea1: true   # SNOW3G ciphering
+  nea2: true   # AES ciphering
+  nea3: true   # ZUC ciphering
+
+# Post-Quantum Cryptography (Rel-20 research)
+pqc:
+  enabled: false           # Enable PQC algorithm support
+  prefer_pqc: false        # Prefer PQC over classical when available
+  # nea4: X25519 + ML-KEM-768 hybrid key exchange (FIPS 203)
+  # nia4: ML-DSA-65 integrity protection (FIPS 204)
+
+# gNB addresses to search for (RLS protocol)
+# When running in Docker, use the gNB container hostname or IP
+# Note: Port is optional - defaults to 4997
+gnb_search_list:
+  - "172.30.0.100"
+
+# Default PDU sessions to establish after registration
+sessions:
+  - type: Ipv4
+    s_nssai:
+      sst: 1
+      sd: null
+    apn: "internet"
+    is_emergency: false
+  # Optional XR (Extended Reality) PDU session, Rel-18 (TS 23.501 5.7.4).
+  # Set requested_5qi to an XR delay-critical GBR 5QI (82-85) to request an
+  # XR session. With no explicit apn the UE selects an XR DNN (xr / xr-split /
+  # xr-haptic) so the SMF maps the session to the XR 5QI and installs the XR
+  # QoS flow (dedicated GBR QER, EF/AF41 DSCP) end to end.
+  # - type: Ipv4
+  #   s_nssai:
+  #     sst: 1
+  #     sd: null
+  #   apn: "xr"
+  #   is_emergency: false
+  #   requested_5qi: 82
+
+# MINT (Multi-IMSI / multi-USIM) configuration, Rel-18 (TS 23.761).
+# Models a UE holding more than one subscription (SUPI). After the primary
+# subscription registers, the UE initiates a simultaneous registration for each
+# secondary SUPI (its own SUCI/GUTI/security context). A PDU session whose DNN
+# matches dnn_subscription_map is established under the mapped subscription's
+# SUPI, so the core resolves that SUPI's subscription in UDM/UDR.
+#
+# To demonstrate: provision the secondary subscriber in nextgcore MongoDB
+# (docs/assets/webui/mongo-init.js seeds IMSI 999700000000002), add an
+# "enterprise" session below, and enable the block:
+#
+# mint_config:
+#   enabled: true
+#   secondary_supis:
+#     - "999700000000002"      # SUPI-2, same home PLMN (999-70)
+#   active_subscription: 0
+#   simultaneous_registration: true
+#   disaster_roaming: true     # set the MINT disaster-roaming indication
+#   dnn_subscription_map:
+#     - dnn: "enterprise"      # the enterprise DNN uses SUPI-2's subscription
+#       subscription_index: 1
+#
+# Then add the enterprise session to the `sessions` list above:
+#   - type: Ipv4
+#     s_nssai:
+#       sst: 1
+#       sd: null
+#     apn: "enterprise"
+#     is_emergency: false
+
+# UAV (Uncrewed Aerial Vehicle) configuration (Rel-18, TS 23.256).
+# When is_aerial_ue is true the UE registers as an aerial UE: it includes the
+# UAV indication IE (IEI 0xA8, aerial-UE flag + CAA-level ID) in the
+# Registration Request, the AMF creates a UAV flight-authorization context with
+# its configured geofence (AMF_UAV_GEOFENCE="min_lat,max_lat,min_lon,max_lon,
+# min_alt,max_alt"; default permissive area capped at 120 m), and once
+# registered the UE periodically sends a UAV tracking report (position /
+# Remote ID) that the AMF checks against the geofence (allow/deny). The PCF
+# additionally gates a UAV PDU session (DNN in PCF_UAV_DNN, default "uav")
+# against altitude/flight-zone limits. The C2-link RRC configuration is modelled
+# in nextgsim-ue/src/uav.rs but not yet wired into the RRC reconfiguration
+# (documented stub). The external UTM/USS interface is a log-only stub.
+#
+# To demonstrate the allow case (in-zone position):
+# uav_config:
+#   is_aerial_ue: true
+#   uav_id: "FAA-N12345"          # UAV CAA-level identifier
+#   uss_address: null             # external USS/UTM (stub; logged only)
+#   max_altitude_meters: 100.0    # reported flight altitude (<= 120 m → allow)
+#   remote_id_enabled: true
+#   c2_link_required: false
+#
+# To demonstrate the deny case, set max_altitude_meters above the AMF geofence
+# ceiling (e.g. 200.0 with the default 120 m ceiling) so the tracking report
+# triggers an altitude geofence violation and the AMF revokes authorization.
+
+# Configured NSSAI (network slices)
+configured_nssai:
+  slices:
+    - sst: 1
+      sd: null
+
+# TUN interface name (optional, for user plane)
+tun_name: "uesimtun0"
+
+# RedCap (Reduced Capability) UE indication (Rel-17, TS 38.101).
+# When true the UE signals redcapIndication in RRCSetupComplete; the gNB caps
+# this UE's serving bandwidth (20 MHz / reduced PRB) and the core reduces the
+# session-AMBR (default 150 Mbps DL / 50 Mbps UL, override via
+# REDCAP_SESS_AMBR_DL_BPS / REDCAP_SESS_AMBR_UL_BPS on the SMF).
+redcap: false
+
+# Rel-20 6G AI-native network function features
+# All disabled by default; enable for 6G research deployments
+she_enabled: false              # SHE Client - edge inference offloading (Rel-20)
+ai_ml_enabled: false            # NWDAF Reporter - AI/ML data reporting (Rel-20)
+isac_enabled: false             # ISAC Sensor - sensing and communication (Rel-20)
+federated_learning_enabled: false  # FL Participant - federated learning (Rel-20)
+semantic_comm_enabled: false    # Semantic Codec - semantic communication (Rel-20)

@@ -33,6 +33,15 @@ amf_configs:
   - address: 172.23.0.5
     port: 38412
 
+# NGAP SCTP transport backend (optional, default: userspace)
+#   userspace - in-process sctp-proto over UDP. Interoperates with the
+#               nextgcore simulator AMF, but NOT a real AMF (wire is UDP).
+#   kernel    - real kernel SCTP (IP proto 132) via lksctp/libsctp; required
+#               to associate with a real / Open5GS AMF. Only effective on a
+#               Linux build compiled with `--features kernel-sctp`; otherwise
+#               the connection fails loud at runtime.
+sctp_backend: userspace
+
 # IP addresses for gNB interfaces
 # These should be on the Docker network that can reach nextgcore
 

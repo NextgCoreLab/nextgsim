@@ -137,9 +137,13 @@ impl RlsTask {
     }
 
     async fn send_heartbeats(&mut self) {
-        if !self.cell_search.should_send_heartbeats() {
-            return;
-        }
+        // Paced solely by `heartbeat_timer` (1 s tokio interval). The previous
+        // `should_send_heartbeats()` wall-clock gate double-rate-limited against
+        // that timer: under scheduling jitter (e.g. the registration RRC burst) a
+        // tick could land <1 s after the last send, get gated out, and push the
+        // next heartbeat ~2 s out — exceeding the 2 s cell-lost threshold and
+        // spuriously dropping the serving cell (SignalLostToConnectedCell) right
+        // after registration, before the PDU session could complete.
         for (addr, heartbeat) in self.cell_search.create_heartbeats() {
             self.send_rls_message(addr, &RlsProtocolMessage::Heartbeat(heartbeat))
                 .await;

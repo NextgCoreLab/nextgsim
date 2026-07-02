@@ -1,12 +1,22 @@
 //! AI Agent Framework (AAF) for 6G Networks
 //!
-//! Implements multi-agent coordination for 6G networks:
-//! - OAuth 2.0 agent authentication
+//! Research prototype for multi-agent coordination in 6G networks:
+//! - OAuth 2.0 agent authentication (modeled; token issuance/validation are
+//!   local stubs for simulation, NOT real IdP verification)
 //! - Intent-based networking with real execution
 //! - Conflict detection and resolution between competing intents
 //! - Safety constraints and guardrails
 //! - Multi-agent coordination protocol with role hierarchy
 //! - Decision audit trail
+//!
+//! # TR 22.870 mapping
+//!
+//! Prototypes the AI-Agent use cases of TR 22.870 §6.41 (authentication and
+//! authorisation for AI Agents), §6.45 (flexible UE-Network coordination through
+//! AI Agent(s)) and §6.46 (AI Agent management). TR 22.870 is a Stage-1 study;
+//! these are potential requirements with no Stage-3 wire spec — this crate is a
+//! research prototype, not a conformant implementation. OAuth2/introspection are
+//! NOT mandated by the TR.
 //!
 //! # Architecture
 //!
@@ -276,10 +286,31 @@ pub struct TokenResponse {
     pub scope: String,
 }
 
+/// Emits the simulated-validate warning at most once per process.
+static SIMULATED_VALIDATE_WARN: std::sync::Once = std::sync::Once::new();
+
+/// Authentication mode for [`OAuth2Client`].
+///
+/// SECURITY: this crate does not talk to a real IdP. `Strict` (the default)
+/// therefore default-denies any token the client did not itself issue, so an
+/// attacker cannot authenticate with an arbitrary `oauth2_`-prefixed string.
+/// `Simulated` additionally accepts any well-formed `oauth2_`-prefixed token
+/// (emitting a loud one-time runtime warning) and must only be used in clearly
+/// simulated environments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AuthMode {
+    /// Default-deny: only client-issued, unexpired tokens validate.
+    #[default]
+    Strict,
+    /// Simulation: also accept any `oauth2_`-prefixed token (loud warning).
+    Simulated,
+}
+
 /// OAuth 2.0 Identity Provider client
 ///
-/// Provides integration with external OAuth 2.0 Identity Providers
-/// for proper authentication and authorization.
+/// Models OAuth 2.0 flows for simulation. Token issuance and validation are
+/// LOCAL STUBS — there is no real IdP, signature check or introspection. See
+/// [`AuthMode`]; `validate_token` default-denies tokens the client did not issue.
 pub struct OAuth2Client {
     /// `IdP` authorization endpoint
     _auth_endpoint: String,
@@ -291,10 +322,15 @@ pub struct OAuth2Client {
     _client_secret: String,
     /// Cached tokens by agent ID
     token_cache: std::sync::Mutex<HashMap<AgentId, TokenResponse>>,
+    /// Tokens this client has issued: access_token -> absolute expiry (epoch s).
+    /// `validate_token` only trusts tokens recorded here (and unexpired).
+    issued_tokens: std::sync::Mutex<HashMap<String, u64>>,
+    /// Authentication mode (default [`AuthMode::Strict`]).
+    auth_mode: AuthMode,
 }
 
 impl OAuth2Client {
-    /// Creates a new OAuth 2.0 client
+    /// Creates a new OAuth 2.0 client in the default-deny [`AuthMode::Strict`].
     pub fn new(
         auth_endpoint: impl Into<String>,
         token_endpoint: impl Into<String>,
@@ -307,7 +343,23 @@ impl OAuth2Client {
             client_id: client_id.into(),
             _client_secret: client_secret.into(),
             token_cache: std::sync::Mutex::new(HashMap::new()),
+            issued_tokens: std::sync::Mutex::new(HashMap::new()),
+            auth_mode: AuthMode::Strict,
         }
+    }
+
+    /// Sets the [`AuthMode`] (builder-style). `Simulated` loosens validation to
+    /// also accept any `oauth2_`-prefixed token; use only in simulated setups.
+    pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
+        self.auth_mode = mode;
+        self
+    }
+
+    /// Records an issued access token and its absolute expiry so
+    /// `validate_token` can later trust it.
+    fn record_issued(&self, access_token: &str, expires_at: u64) {
+        let mut issued = self.issued_tokens.lock().unwrap();
+        issued.insert(access_token.to_string(), expires_at);
     }
 
     /// Requests an access token using client credentials flow
@@ -338,31 +390,62 @@ impl OAuth2Client {
             scope: scopes.join(" "),
         };
 
+        let expires_at = now + token_response.expires_in;
+
         // Cache the response
         {
             let mut cache = self.token_cache.lock().unwrap();
             cache.insert(agent_id.clone(), token_response.clone());
         }
+        // Record so validate_token can later trust this token.
+        self.record_issued(&token_response.access_token, expires_at);
 
         Ok(AgentToken {
             token: token_response.access_token,
             agent_id: agent_id.clone(),
-            expires_at: now + token_response.expires_in,
+            expires_at,
             scopes,
         })
     }
 
-    /// Validates a token with the `IdP`
+    /// Validates a token.
     ///
-    /// In production, this would make an introspection request to the `IdP`
+    /// SECURITY: there is no real IdP introspection here. By default
+    /// ([`AuthMode::Strict`]) this **default-denies**: only a token this client
+    /// itself issued (recorded in `issued_tokens`) and still unexpired returns
+    /// `Ok(true)`. A token never issued by this client — even a well-formed
+    /// `oauth2_`-prefixed string — is rejected. Under [`AuthMode::Simulated`] an
+    /// unrecognised `oauth2_`-prefixed token is additionally accepted, but only
+    /// after emitting a loud one-time runtime warning so the stub path is
+    /// obvious. Expired client-issued tokens are always rejected.
     pub fn validate_token(&self, token: &str) -> Result<bool, String> {
-        // Placeholder implementation - in production this would:
-        // 1. Make HTTP POST to introspection endpoint
-        // 2. Parse the response
-        // 3. Return whether the token is active
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-        // For now, just check if it starts with our prefix
-        Ok(token.starts_with("oauth2_"))
+        // Trust only tokens this client issued, and only while unexpired.
+        if let Some(&expires_at) = self.issued_tokens.lock().unwrap().get(token) {
+            return Ok(expires_at > now);
+        }
+
+        match self.auth_mode {
+            // Default-deny anything we did not issue.
+            AuthMode::Strict => Ok(false),
+            // Simulation-only: accept a well-formed prefix, loudly.
+            AuthMode::Simulated => {
+                if token.starts_with("oauth2_") {
+                    SIMULATED_VALIDATE_WARN.call_once(|| {
+                        tracing::warn!(
+                            "agent OAuth validate_token: SIMULATED accept — NOT real IdP introspection"
+                        );
+                    });
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
     }
 
     /// Refreshes a token using a refresh token
@@ -389,16 +472,20 @@ impl OAuth2Client {
             scope: "read write".to_string(),
         };
 
+        let expires_at = now + token_response.expires_in;
+
         // Update cache
         {
             let mut cache = self.token_cache.lock().unwrap();
             cache.insert(agent_id.clone(), token_response.clone());
         }
+        // Record so validate_token can later trust the refreshed token.
+        self.record_issued(&token_response.access_token, expires_at);
 
         Ok(AgentToken {
             token: token_response.access_token,
             agent_id: agent_id.clone(),
-            expires_at: now + token_response.expires_in,
+            expires_at,
             scopes: vec!["read".to_string(), "write".to_string()],
         })
     }
@@ -751,20 +838,16 @@ impl AgentCoordinator {
         let caps = &registration.capabilities;
 
         match intent.intent_type {
-            IntentType::Query => {
-                if !caps.read_state {
-                    return Err("Agent lacks read_state capability".to_string());
-                }
+            IntentType::Query if !caps.read_state => {
+                return Err("Agent lacks read_state capability".to_string());
             }
-            IntentType::TriggerHandover | IntentType::AdjustQos => {
-                if !caps.trigger_actions {
-                    return Err("Agent lacks trigger_actions capability".to_string());
-                }
+            IntentType::TriggerHandover | IntentType::AdjustQos if !caps.trigger_actions => {
+                return Err("Agent lacks trigger_actions capability".to_string());
             }
-            IntentType::OptimizeResources | IntentType::CreateSlice | IntentType::ModifySlice => {
-                if !caps.modify_config {
-                    return Err("Agent lacks modify_config capability".to_string());
-                }
+            IntentType::OptimizeResources | IntentType::CreateSlice | IntentType::ModifySlice
+                if !caps.modify_config =>
+            {
+                return Err("Agent lacks modify_config capability".to_string());
             }
             _ => {}
         }
@@ -833,7 +916,7 @@ impl AgentCoordinator {
     pub fn process_intents_full(&mut self) -> Vec<IntentExecutionResult> {
         // Sort by priority (highest first)
         self.pending_intents
-            .sort_by(|a, b| b.priority.cmp(&a.priority));
+            .sort_by_key(|i| std::cmp::Reverse(i.priority));
 
         let intents: Vec<Intent> = self.pending_intents.drain(..).collect();
         // Also drain the intent queue so it stays in sync.
@@ -1376,20 +1459,60 @@ mod tests {
         assert!(token.has_scope("write"));
     }
 
-    #[test]
-    fn test_oauth2_validate_token() {
-        let client = OAuth2Client::new(
+    fn test_client() -> OAuth2Client {
+        OAuth2Client::new(
             "https://idp.example.com/oauth2/authorize",
             "https://idp.example.com/oauth2/token",
             "client-id-123",
             "client-secret-456",
-        );
+        )
+    }
 
-        let valid_token = "oauth2_client-id-123_some-token-id";
-        assert!(client.validate_token(valid_token).unwrap());
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 
-        let invalid_token = "invalid-token";
-        assert!(!client.validate_token(invalid_token).unwrap());
+    #[test]
+    fn test_oauth2_validate_token_default_denies_unissued() {
+        let client = test_client();
+
+        // A random oauth2_-prefixed string the client never issued is REJECTED
+        // in the default (Strict) mode — no prefix-accept trap.
+        assert!(!client
+            .validate_token("oauth2_client-id-123_some-token-id")
+            .unwrap());
+        assert!(!client.validate_token("invalid-token").unwrap());
+
+        // A token actually issued by the client validates while unexpired.
+        let agent_id = AgentId::new("test-agent");
+        let issued = client
+            .request_token_client_credentials(&agent_id, vec!["read".to_string()])
+            .unwrap();
+        assert!(client.validate_token(&issued.token).unwrap());
+    }
+
+    #[test]
+    fn test_oauth2_validate_token_rejects_expired() {
+        let client = test_client();
+        // Inject an already-expired client-issued token.
+        client.record_issued("oauth2_expired_token", now_secs().saturating_sub(10));
+        assert!(!client.validate_token("oauth2_expired_token").unwrap());
+
+        // And an unexpired one validates.
+        client.record_issued("oauth2_live_token", now_secs() + 3600);
+        assert!(client.validate_token("oauth2_live_token").unwrap());
+    }
+
+    #[test]
+    fn test_oauth2_validate_token_simulated_mode_accepts_prefix() {
+        let client = test_client().with_auth_mode(AuthMode::Simulated);
+        // Simulated mode accepts a well-formed prefix (with a loud one-time
+        // runtime warning) but still rejects malformed tokens.
+        assert!(client.validate_token("oauth2_anything").unwrap());
+        assert!(!client.validate_token("not-a-token").unwrap());
     }
 
     #[test]

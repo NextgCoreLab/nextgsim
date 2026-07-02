@@ -14,9 +14,12 @@ use std::collections::{HashMap, VecDeque};
 /// Hierarchical role that determines an agent's authority scope.
 ///
 /// Higher-level agents can override or coordinate lower-level ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum AgentRole {
     /// Manages a single cell.
+    #[default]
     CellLevel = 0,
     /// Manages a region of cells.
     RegionLevel = 1,
@@ -33,12 +36,6 @@ impl AgentRole {
     /// Returns true if `self` can coordinate agents at the given level.
     pub fn can_coordinate(self, subordinate: AgentRole) -> bool {
         self.outranks(subordinate) || self == subordinate
-    }
-}
-
-impl Default for AgentRole {
-    fn default() -> Self {
-        Self::CellLevel
     }
 }
 

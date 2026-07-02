@@ -666,6 +666,19 @@ impl NasSecurityContext {
         self.downlink_count = *validated_count;
     }
 
+    /// Whether an estimated downlink NAS COUNT is acceptable for processing.
+    ///
+    /// Per TS 24.501 4.4.3.1 (NAS COUNT monotonicity) and 4.4.4.2 (replay
+    /// discard), an accepted downlink message must carry a COUNT strictly greater
+    /// than the last accepted downlink COUNT. The Security Mode Command resets the
+    /// downlink COUNT to 0 and records it, so the first subsequent protected
+    /// message (SQN 1, COUNT 1) is the first value this gate sees — strict ">" is
+    /// therefore correct and rejects both replays (equal COUNT) and stale/old
+    /// SQNs (lower COUNT).
+    pub fn is_acceptable_downlink_count(&self, candidate: &NasCount) -> bool {
+        candidate.to_u32() > self.downlink_count.to_u32()
+    }
+
     /// Estimate the downlink count from a received sequence number
     pub fn estimate_downlink_count(&self, sequence_number: u8) -> NasCount {
         self.downlink_count.estimate_from_sqn(sequence_number)
@@ -988,15 +1001,31 @@ impl NasCount {
     pub fn estimate_from_sqn(&self, received_sqn: u8) -> NasCount {
         let mut estimated = *self;
 
-        // If received SQN is less than current SQN, overflow has occurred
-        if self.sqn > received_sqn {
-            estimated.overflow = self.overflow.wrapping_add(1);
+        // A received SQN below the stored SQN is interpreted as a forward
+        // wrap-around (overflow + 1) ONLY when the implied forward distance is
+        // within the estimation window (half the 8-bit SQN space). A larger
+        // backward gap is treated as an old / replayed SQN: the overflow is kept
+        // so the estimated COUNT stays <= the stored COUNT and is then rejected
+        // by the monotonicity check (see SecurityContext::is_acceptable_downlink_count).
+        // Previously the overflow was rolled on ANY backward SQN, which let a
+        // replayed old SQN estimate into the next overflow window and be accepted
+        // as if newer (TS 24.501 4.4.3.1).
+        if received_sqn < self.sqn {
+            let forward_distance = received_sqn.wrapping_sub(self.sqn);
+            if forward_distance <= NAS_SQN_ESTIMATION_WINDOW {
+                estimated.overflow = self.overflow.wrapping_add(1);
+            }
         }
         estimated.sqn = received_sqn;
 
         estimated
     }
 }
+
+/// Half the 8-bit SQN space: the maximum forward distance over which a received
+/// SQN below the stored SQN is treated as a wrap-around rather than a replay
+/// (TS 24.501 4.4.3.1 NAS COUNT estimation).
+const NAS_SQN_ESTIMATION_WINDOW: u8 = 128;
 
 /// NAS bearer identity for integrity/ciphering over 3GPP access
 ///
@@ -2025,6 +2054,55 @@ mod tests {
         ctx.reset_counts();
         assert_eq!(ctx.uplink_count().sqn, 0);
         assert_eq!(ctx.downlink_count().sqn, 0);
+    }
+
+    #[test]
+    fn test_estimate_from_sqn_wrap_vs_replay() {
+        // Legitimate wrap 0xFF -> 0x00: overflow increments, COUNT advances.
+        let stored = NasCount::new(0, 0xFF);
+        let wrapped = stored.estimate_from_sqn(0x00);
+        assert_eq!(wrapped, NasCount::new(1, 0x00));
+        assert!(wrapped.to_u32() > stored.to_u32());
+
+        // Small backward step (10 -> 8) is NOT a wrap: overflow kept, COUNT
+        // goes backward (so the monotonicity gate will reject it).
+        let stored = NasCount::new(3, 10);
+        let back = stored.estimate_from_sqn(8);
+        assert_eq!(back, NasCount::new(3, 8));
+        assert!(back.to_u32() < stored.to_u32());
+
+        // Replayed old SQN far behind must NOT roll into the next overflow
+        // window (the pre-fix bug). forward distance (3-5) mod 256 = 254 > 128.
+        let stored = NasCount::new(0, 5);
+        let replay = stored.estimate_from_sqn(3);
+        assert_eq!(replay, NasCount::new(0, 3));
+        assert!(replay.to_u32() < stored.to_u32());
+
+        // A genuine wrap from near the top (250 -> 5, forward distance 11) does
+        // roll the overflow.
+        let stored = NasCount::new(7, 250);
+        let wrap = stored.estimate_from_sqn(5);
+        assert_eq!(wrap, NasCount::new(8, 5));
+        assert!(wrap.to_u32() > stored.to_u32());
+    }
+
+    #[test]
+    fn test_is_acceptable_downlink_count_monotonic() {
+        let mut ctx = NasSecurityContext::new();
+        // After reset the last accepted COUNT is 0; the first message (COUNT 1)
+        // is acceptable.
+        assert!(ctx.is_acceptable_downlink_count(&NasCount::new(0, 1)));
+        ctx.update_downlink_count(&NasCount::new(0, 1));
+
+        // Replay of the same COUNT is rejected.
+        assert!(!ctx.is_acceptable_downlink_count(&NasCount::new(0, 1)));
+        // A lower COUNT (backwards) is rejected.
+        assert!(!ctx.is_acceptable_downlink_count(&NasCount::new(0, 0)));
+        // A strictly greater COUNT is accepted.
+        assert!(ctx.is_acceptable_downlink_count(&NasCount::new(0, 2)));
+        // A wrap into the next overflow window is accepted.
+        ctx.update_downlink_count(&NasCount::new(0, 0xFF));
+        assert!(ctx.is_acceptable_downlink_count(&NasCount::new(1, 0x00)));
     }
 
     #[test]

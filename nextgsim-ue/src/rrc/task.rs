@@ -27,7 +27,10 @@ use crate::rrc::reestablishment::{
     ReestablishmentProcedure, ReestablishmentState, ReestablishmentTrigger,
 };
 use crate::rrc::resume::ResumeProcedure;
-use crate::rrc::security::{compute_short_mac_i, AsSecurityContext};
+use crate::rrc::security::{
+    compute_short_mac_i, AsSecurityContext, CipheringAlgorithm, IntegrityAlgorithm,
+    I5_UE_AS_SECURITY,
+};
 use crate::rrc::state::{RrcState, RrcStateMachine};
 #[cfg(feature = "nextgsim-she")]
 use crate::tasks::SheClientMessage;
@@ -39,16 +42,27 @@ use crate::tasks::{SemanticCodecMessage, SemanticTaskType};
 use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
+use nextgsim_rrc::codec::{decode_rrc, CellGroupConfig, RadioBearerConfig};
 use nextgsim_rrc::procedures::rrc_setup::{
-    encode_rrc_setup_complete, encode_rrc_setup_request,
-    RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupRequestParams,
-    UeIdentity,
+    decode_rrc_setup, encode_rrc_setup_complete, encode_rrc_setup_request,
+    RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
+    RrcSetupRequestParams, UeIdentity,
+};
+use nextgsim_rrc::procedures::security_mode::{
+    decode_security_mode_command, encode_security_mode_complete, SecurityModeCommandData,
+    SecurityModeCompleteParams,
 };
 use nextgsim_rrc::procedures::ue_capability::{
     build_minimal_nr_capability_container, decode_ue_capability_enquiry,
     encode_ue_capability_information, RatType, UeCapabilityInformationParams,
     UeCapabilityRatContainer,
 };
+
+/// C-RNTI recorded in the AS security context for re-establishment ShortMAC-I
+/// (TS 38.331 §5.3.7.4). The sim has no MAC-layer C-RNTI allocation, so a fixed
+/// non-zero value is used; it only feeds the re-establishment MAC and is never
+/// signalled on the wire.
+const AS_SECURITY_C_RNTI: u16 = 0x4601;
 
 /// Simplified DL/UL-DCCH envelope code: first byte 0x06 marks a UE capability
 /// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
@@ -96,6 +110,23 @@ pub struct UeNtnTiming {
     pub max_doppler_hz: f64,
 }
 
+/// SRB1 state recorded from a decoded RRCSetup (Wave-6 C2).
+///
+/// Per TS 38.331 §5.3.3.4 the UE shall apply the RRCSetup's
+/// radioBearerConfig and masterCellGroup; per §5.3.5.6.3 the RRCSetup
+/// establishes SRB1 (SRB-Identity 1). All subsequent DCCH signalling
+/// (SecurityModeCommand, RRCReconfiguration, ...) rides SRB1.
+#[derive(Debug, Clone)]
+pub struct Srb1Config {
+    /// rrc-TransactionIdentifier of the RRCSetup that established SRB1
+    pub rrc_transaction_id: u8,
+    /// Decoded radioBearerConfig (carries srb-ToAddModList with SRB1)
+    pub radio_bearer_config: RadioBearerConfig,
+    /// Decoded masterCellGroup (`OCTET STRING (CONTAINING CellGroupConfig)`),
+    /// when parseable — carries the RLC-BearerConfig (LCID 1) serving SRB1
+    pub cell_group_config: Option<CellGroupConfig>,
+}
+
 /// RRC Task for managing cell selection and RRC connections
 pub struct RrcTask {
     task_base: UeTaskBase,
@@ -128,6 +159,14 @@ pub struct RrcTask {
     /// AS security context (set after AS Security Mode Command); required for
     /// ShortMAC-I derivation in re-establishment (TS 38.331 §5.3.7)
     as_security: Option<AsSecurityContext>,
+    /// KgNB handed down from the NAS plane once NAS security is active
+    /// (TS 33.501 §6.9.4.1: KgNB = KDF(KAMF, uplink NAS COUNT)). Consumed by the
+    /// AS SecurityModeCommand handler to derive K_RRCint/K_RRCenc (Wave-6 I5).
+    pending_kgnb: Option<[u8; 32]>,
+    /// SRB1 configuration decoded from the RRCSetup (Wave-6 C2); `Some` once
+    /// the RRCSetup's radioBearerConfig established SRB1 (TS 38.331
+    /// §5.3.5.6.3) — recorded BEFORE any DL-DCCH (SRB1) message is handled
+    srb1_config: Option<Srb1Config>,
 }
 
 impl RrcTask {
@@ -160,7 +199,15 @@ impl RrcTask {
             reestablishment_proc: ReestablishmentProcedure::new(),
             resume_proc: ResumeProcedure::new(),
             as_security: None,
+            pending_kgnb: None,
+            srb1_config: None,
         }
+    }
+
+    /// Returns the SRB1 configuration recorded from the RRCSetup, if the
+    /// serving gNB established SRB1 (Wave-6 C2, TS 38.331 §5.3.5.6.3).
+    pub fn srb1_config(&self) -> Option<&Srb1Config> {
+        self.srb1_config.as_ref()
     }
 
     /// Installs the AS security context (called once the AS Security Mode
@@ -168,6 +215,85 @@ impl RrcTask {
     /// ShortMAC-I per TS 38.331 §5.3.7.4.
     pub fn set_as_security_context(&mut self, ctx: AsSecurityContext) {
         self.as_security = Some(ctx);
+    }
+
+    /// Installs the KgNB derived by the NAS plane once NAS security is active
+    /// (TS 33.501 §6.9.4.1). The AS SecurityModeCommand handler consumes it to
+    /// derive the RRC keys (Wave-6 I5). Called via `RrcMessage::AsSecurityKey`.
+    pub fn set_pending_kgnb(&mut self, kgnb: [u8; 32]) {
+        self.pending_kgnb = Some(kgnb);
+    }
+
+    /// Returns the installed AS security context, if AS security has been
+    /// activated (test/observability hook, Wave-6 I5).
+    #[cfg(test)]
+    pub fn as_security(&self) -> Option<&AsSecurityContext> {
+        self.as_security.as_ref()
+    }
+
+    /// Handle the AS SecurityModeCommand (TS 38.331 §5.3.4, TS 33.501 §6.7):
+    /// derive K_RRCint/K_RRCenc from the pending KgNB and the gNB-selected
+    /// algorithms (byte-identical to the gNB's own `derive_rrc_up_key`),
+    /// install the AS security context, and reply SecurityModeComplete on SRB1.
+    ///
+    /// Fail-closed (TS 33.501 §6.7.2): with no integrity algorithm, an
+    /// unsupported cipher (NEA3 has no keystream in the sim), or no KgNB yet,
+    /// the UE does NOT activate AS security and sends no SecurityModeComplete
+    /// (the network's SMC transaction times out). Only reached when the
+    /// `I5_UE_AS_SECURITY` wire gate is on.
+    async fn handle_as_security_mode_command(&mut self, smc: SecurityModeCommandData) {
+        let tid = smc.rrc_transaction_id;
+
+        // Integrity protection is mandatory for AS security.
+        let Some(integ_alg) = smc.security_algorithms.integrity_algorithm else {
+            warn!(
+                "AS SecurityModeCommand (tid {tid}) carries no integrity algorithm; not activating"
+            );
+            return;
+        };
+        let integrity = IntegrityAlgorithm::from(integ_alg);
+        let ciphering = CipheringAlgorithm::from(smc.security_algorithms.ciphering_algorithm);
+
+        // NEA3 keystream is not implemented by nextgsim-crypto: fail closed
+        // rather than derive a key we cannot use to cipher SRBs.
+        if ciphering == CipheringAlgorithm::Nea3 {
+            warn!("AS SecurityModeCommand (tid {tid}) selected NEA3 (unsupported keystream); not activating");
+            return;
+        }
+
+        let Some(kgnb) = self.pending_kgnb else {
+            warn!(
+                "AS SecurityModeCommand (tid {tid}) received before KgNB is available \
+                 (NAS security not active?); not activating (TS 33.501 §6.7)"
+            );
+            return;
+        };
+
+        let ctx =
+            AsSecurityContext::derive_from_kgnb(&kgnb, ciphering, integrity, AS_SECURITY_C_RNTI);
+        info!(
+            "AS security activated: integrity=NIA{}, ciphering=NEA{}, tid={}",
+            integrity.id(),
+            ciphering.id(),
+            tid
+        );
+        self.set_as_security_context(ctx);
+        self.send_security_mode_complete(tid).await;
+    }
+
+    /// Build and send the RRC SecurityModeComplete (UL-DCCH, SRB1) echoing the
+    /// SecurityModeCommand transaction id (TS 38.331 §5.3.4.3).
+    async fn send_security_mode_complete(&mut self, tid: u8) {
+        match encode_security_mode_complete(&SecurityModeCompleteParams {
+            rrc_transaction_id: tid,
+        }) {
+            Ok(bytes) => {
+                info!("Sending AS SecurityModeComplete (tid={tid})");
+                self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&bytes))
+                    .await;
+            }
+            Err(e) => error!("Failed to encode SecurityModeComplete: {e}"),
+        }
     }
 
     /// Get the next PDU ID for RRC message tracking
@@ -185,7 +311,11 @@ impl RrcTask {
     }
 
     /// Perform the RRC cycle (cell selection in idle, measurements in connected)
-    async fn perform_cycle(&mut self) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::TriggerCycle`) also driven directly by the in-process
+    /// strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn perform_cycle(&mut self) {
         match self.state_machine.state() {
             RrcState::Idle | RrcState::Inactive => {
                 self.perform_cell_selection().await;
@@ -364,7 +494,11 @@ impl RrcTask {
     }
 
     /// Handle signal change from RLS
-    async fn handle_signal_changed(&mut self, cell_id: i32, dbm: i32) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::SignalChanged`) also driven directly by the in-process
+    /// strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_signal_changed(&mut self, cell_id: i32, dbm: i32) {
         let event = self.cell_selector.handle_signal_change(cell_id, dbm);
 
         match event {
@@ -440,7 +574,16 @@ impl RrcTask {
     }
 
     /// Handle downlink RRC message from RLS
-    async fn handle_downlink_rrc(&mut self, cell_id: i32, channel: RrcChannel, pdu: OctetString) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::DownlinkRrcDelivery`) also driven directly by the
+    /// in-process strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_downlink_rrc(
+        &mut self,
+        cell_id: i32,
+        channel: RrcChannel,
+        pdu: OctetString,
+    ) {
         if pdu.is_empty() {
             warn!("Empty downlink RRC PDU");
             return;
@@ -545,9 +688,39 @@ impl RrcTask {
             return;
         }
 
+        // Wave-6 C2 model assertion: DCCH signalling rides SRB1, which the
+        // RRCSetup must have established (TS 38.331 §5.3.5.6.3) and which
+        // handle_rrc_setup records BEFORE any DL-DCCH message (e.g. the
+        // SecurityModeCommand) is handled. Tolerated as a warning until
+        // C5/C6 make DCCH framing fail-closed.
+        if self.srb1_config.is_none() {
+            warn!(
+                "DL-DCCH message from cell {} but no SRB1 was recorded from \
+                 the RRCSetup (peer sent no srb-ToAddModList?)",
+                cell_id
+            );
+        }
+
         let bytes = pdu.data();
         if bytes.is_empty() {
             return;
+        }
+
+        // Wave-6 I5 (TS 38.331 §5.3.4): when the AS-security wire gate is on,
+        // recognise the AS SecurityModeCommand by a typed DL-DCCH decode BEFORE
+        // the legacy nibble dispatcher. The gNB sends the SMC as raw UPER whose
+        // leading byte 0x20 has low-nibble 0x0 — which the legacy matcher below
+        // would misroute to the RRCReconfiguration arm. Default-off: the
+        // matched-sim path is unchanged (this whole block is skipped).
+        if I5_UE_AS_SECURITY {
+            if let Ok(smc) = decode_security_mode_command(bytes) {
+                info!(
+                    "Received AS SecurityModeCommand from cell {} (tid {})",
+                    cell_id, smc.rrc_transaction_id
+                );
+                self.handle_as_security_mode_command(smc).await;
+                return;
+            }
         }
 
         let msg_type = bytes[0] & 0x0F;
@@ -643,7 +816,21 @@ impl RrcTask {
     }
 
     /// Handle RRC Setup message
-    async fn handle_rrc_setup(&mut self, cell_id: i32, _pdu: &OctetString) {
+    async fn handle_rrc_setup(&mut self, cell_id: i32, pdu: &OctetString) {
+        // Wave-6 C2: decode the RRCSetup payload — per TS 38.331 §5.3.3.4
+        // the UE shall apply the radioBearerConfig (SRB1 establishment,
+        // §5.3.5.6.3) and the masterCellGroup. Decode failure is TOLERATED
+        // (warn + verbatim legacy behavior below) so the matched sim stays
+        // default-safe — no config flag.
+        match decode_rrc_setup(pdu.data()) {
+            Ok(setup) => self.apply_rrc_setup_config(&setup),
+            Err(e) => warn!(
+                "RRCSetup payload not decodable as ASN.1 DL-CCCH ({}); \
+                 proceeding with legacy connection setup",
+                e
+            ),
+        }
+
         // Transition to connected state
         if let Err(e) = self.state_machine.on_rrc_setup() {
             warn!("Failed to transition to connected state: {}", e);
@@ -671,6 +858,72 @@ impl RrcTask {
         }
     }
 
+    /// Applies the decoded RRCSetup configuration (Wave-6 C2, TS 38.331
+    /// §5.3.3.4): records the transaction id, the SRB1 RadioBearerConfig and
+    /// the decoded CellGroupConfig on the UE RRC state — BEFORE any SRB1
+    /// (DL-DCCH) message can be handled.
+    ///
+    /// Tolerance: a decodable RRCSetup that does NOT establish SRB1 (e.g. the
+    /// pre-Wave-6 placeholder `[0x20, 0x00, 0x04, 0x00]`) is warned about and
+    /// records nothing; external behavior is unchanged.
+    fn apply_rrc_setup_config(&mut self, setup: &RrcSetupData) {
+        let radio_bearer_config: RadioBearerConfig = match decode_rrc(&setup.radio_bearer_config) {
+            Ok(config) => config,
+            Err(e) => {
+                warn!(
+                    "RRCSetup radioBearerConfig not decodable ({}); tolerated",
+                    e
+                );
+                return;
+            }
+        };
+
+        let has_srb1 = radio_bearer_config
+            .srb_to_add_mod_list
+            .as_ref()
+            .is_some_and(|list| list.0.iter().any(|srb| srb.srb_identity.0 == 1));
+        if !has_srb1 {
+            warn!(
+                "RRCSetup radioBearerConfig does not establish SRB1 \
+                 (TS 38.331 §5.3.5.6.3 violation by the peer); tolerated, no SRB1 recorded"
+            );
+            return;
+        }
+
+        // masterCellGroup is OCTET STRING (CONTAINING CellGroupConfig).
+        let cell_group_config: Option<CellGroupConfig> = match decode_rrc(&setup.master_cell_group)
+        {
+            Ok(config) => Some(config),
+            Err(e) => {
+                warn!(
+                    "RRCSetup masterCellGroup not decodable as CellGroupConfig ({}); \
+                     SRB1 recorded from radioBearerConfig only",
+                    e
+                );
+                None
+            }
+        };
+
+        let lcid = cell_group_config.as_ref().and_then(|cgc| {
+            cgc.rlc_bearer_to_add_mod_list
+                .as_ref()
+                .and_then(|list| list.0.first())
+                .map(|bearer| bearer.logical_channel_identity.0)
+        });
+
+        info!(
+            "SRB1 established (LCID {}), rrc_transaction_id={}",
+            lcid.unwrap_or(1),
+            setup.rrc_transaction_id
+        );
+
+        self.srb1_config = Some(Srb1Config {
+            rrc_transaction_id: setup.rrc_transaction_id,
+            radio_bearer_config,
+            cell_group_config,
+        });
+    }
+
     /// Send RRC Setup Complete message using proper ASN.1 UPER encoding
     async fn send_rrc_setup_complete(&mut self) {
         let nas_pdu = if let Some(pdu) = self.initial_nas_pdu.take() {
@@ -691,6 +944,13 @@ impl RrcTask {
 
         let params = RrcSetupCompleteParams {
             registered_amf: None,
+            // Wave-6 C2/C4-interim: the echoed tid stays PINNED to 0 until C5
+            // lands typed UL-DCCH dispatch on both peers. Echoing a received
+            // tid of 2 would make the ASN.1 UL-DCCH leading byte 0x14, whose
+            // low nibble 0x4 hits the gNB's bespoke fallback
+            // handle_rrc_setup_complete arm if the ASN.1-first decode is ever
+            // bypassed, mis-extracting garbage NAS from bytes[3..]. Unpinned
+            // in C4-final (after C5); the gNB ignores the echoed tid today.
             rrc_transaction_id: 0,
             selected_plmn_identity: 1,
             guami_type: None,
@@ -933,7 +1193,11 @@ impl RrcTask {
     }
 
     /// Handle uplink NAS delivery from NAS task
-    async fn handle_uplink_nas_delivery(&mut self, pdu_id: u32, pdu: OctetString) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::UplinkNasDelivery`) also driven directly by the
+    /// in-process strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_uplink_nas_delivery(&mut self, pdu_id: u32, pdu: OctetString) {
         // If not connected, this is initial NAS - start connection establishment
         if self.state_machine.state() == RrcState::Idle {
             self.initial_nas_pdu = Some(pdu.clone());
@@ -1321,6 +1585,10 @@ impl Task for RrcTask {
                             RrcMessage::RrcNotify => {
                                 debug!("RRC notify received");
                             }
+                            RrcMessage::AsSecurityKey { kgnb } => {
+                                debug!("Received KgNB for AS security from NAS plane");
+                                self.set_pending_kgnb(kgnb);
+                            }
                             RrcMessage::PerformUac { access_category, access_identities } => {
                                 let allowed = self.perform_uac_check(access_category, access_identities);
                                 debug!("UAC check: category={}, identities={}, allowed={}", access_category, access_identities, allowed);
@@ -1429,5 +1697,278 @@ mod tests {
         task.serving_cell_id = Some(1);
         assert!(task.is_active_cell(1));
         assert!(!task.is_active_cell(2));
+    }
+
+    // ========================================================================
+    // Wave-6 C2: UE-side RRCSetup ASN.1 decode + tolerance verification.
+    // The golden literal is the C1 hand-derived RRCSetup(SRB1, tid 0) — see
+    // nextgsim-rrc rrc_setup.rs `golden_rrc_setup_srb1_bytes` for the
+    // bit-by-bit derivation from tools/rrc-15.6.0.asn1.
+    // ========================================================================
+
+    use nextgsim_rrc::procedures::rrc_setup::decode_rrc_setup_complete;
+
+    /// C1 golden RRCSetup: SRB1 RadioBearerConfig + CellGroupConfig(LCID 1),
+    /// tid 0 (hand-derived, strict-peer fixture).
+    const GOLDEN_RRC_SETUP_SRB1_TID0: [u8; 8] = [0x20, 0x40, 0x00, 0x22, 0x00, 0x04, 0x00, 0x00];
+
+    /// The pre-Wave-6 gNB placeholder RRCSetup: valid ASN.1 (empty
+    /// RadioBearerConfig, 1-byte garbage masterCellGroup) but establishes NO
+    /// SRB1 — the C2 tolerance fixture.
+    const LEGACY_PLACEHOLDER_RRC_SETUP: [u8; 4] = [0x20, 0x00, 0x04, 0x00];
+
+    fn run_async<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(fut)
+    }
+
+    /// Pops the next uplink RRC PDU handed to the RLS (skipping non-PDU RLS
+    /// traffic such as cell assignment).
+    fn next_uplink_rrc(
+        rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) -> (RrcChannel, OctetString) {
+        loop {
+            match rx.try_recv() {
+                Ok(TaskMessage::Message(RlsMessage::RrcPduDelivery { channel, pdu, .. })) => {
+                    return (channel, pdu)
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("expected an uplink RRC PDU, got none: {e}"),
+            }
+        }
+    }
+
+    /// Camps the UE on cell 1 via the real cell-detection path and hands it
+    /// the initial NAS so a real RRCSetupRequest goes out (the same
+    /// real-handler flow as the strict-peer harness in
+    /// tests/src/rrc_handshake.rs). Returns the initial NAS bytes.
+    async fn camp_and_request(
+        task: &mut RrcTask,
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) -> Vec<u8> {
+        task.handle_signal_changed(1, -60).await;
+        task.perform_cycle().await;
+
+        let nas = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+        task.handle_uplink_nas_delivery(1, OctetString::from_slice(&nas))
+            .await;
+        let (ch, _setup_req) = next_uplink_rrc(rls_rx);
+        assert_eq!(ch, RrcChannel::UlCcch, "RRCSetupRequest must go on UL-CCCH");
+        nas
+    }
+
+    /// C2 gate: feeding the C1 golden RRCSetup bytes transitions the UE to
+    /// Connected, records SRB1 (srb-Identity 1, LCID 1) BEFORE any DL-DCCH
+    /// handling, and emits an RRCSetupComplete with tid 0.
+    #[test]
+    fn test_rrc_setup_golden_srb1_decoded_connected_tid0_echo() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            let nas = camp_and_request(&mut task, &mut rls_rx).await;
+
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlCcch,
+                OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+            )
+            .await;
+
+            assert_eq!(task.state_machine.state(), RrcState::Connected);
+
+            // SRB1 recorded — and recorded BEFORE any SRB1-labelled DL-DCCH
+            // (e.g. SecurityModeCommand) could be handled.
+            let srb1 = task
+                .srb1_config
+                .as_ref()
+                .expect("SRB1 must be recorded from the golden RRCSetup");
+            assert_eq!(srb1.rrc_transaction_id, 0);
+            let srbs = srb1
+                .radio_bearer_config
+                .srb_to_add_mod_list
+                .as_ref()
+                .expect("srb-ToAddModList present");
+            assert_eq!(srbs.0.len(), 1);
+            assert_eq!(srbs.0[0].srb_identity.0, 1, "SRB-Identity must be 1");
+            let cgc = srb1
+                .cell_group_config
+                .as_ref()
+                .expect("masterCellGroup must decode as CellGroupConfig");
+            let bearer = &cgc
+                .rlc_bearer_to_add_mod_list
+                .as_ref()
+                .expect("rlc-BearerToAddModList present")
+                .0[0];
+            assert_eq!(bearer.logical_channel_identity.0, 1, "SRB1 LCID must be 1");
+
+            // RRCSetupComplete emitted on UL-DCCH, tid echo pinned to 0
+            // (Wave-6 C4-interim; unpinned after C5), NAS intact.
+            let (ch, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(ch, RrcChannel::UlDcch);
+            let decoded =
+                decode_rrc_setup_complete(complete.data()).expect("ASN.1 RRCSetupComplete");
+            assert_eq!(
+                decoded.rrc_transaction_id, 0,
+                "tid echo pinned to 0 until C5"
+            );
+            assert_eq!(decoded.dedicated_nas_message, nas);
+        });
+    }
+
+    /// C2 tolerance gate: the pre-Wave-6 placeholder RRCSetup (no SRB1) must
+    /// produce IDENTICAL external behavior — Connected + RRCSetupComplete —
+    /// with a warning and no SRB1 recorded.
+    #[test]
+    fn test_rrc_setup_legacy_placeholder_tolerated() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            let nas = camp_and_request(&mut task, &mut rls_rx).await;
+
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlCcch,
+                OctetString::from_slice(&LEGACY_PLACEHOLDER_RRC_SETUP),
+            )
+            .await;
+
+            // Identical external behavior: Connected + SetupComplete...
+            assert_eq!(task.state_machine.state(), RrcState::Connected);
+            let (ch, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(ch, RrcChannel::UlDcch);
+            let decoded =
+                decode_rrc_setup_complete(complete.data()).expect("ASN.1 RRCSetupComplete");
+            assert_eq!(decoded.rrc_transaction_id, 0);
+            assert_eq!(decoded.dedicated_nas_message, nas);
+
+            // ...but no SRB1 recorded (warn logged on the tolerance path).
+            assert!(
+                task.srb1_config.is_none(),
+                "placeholder RRCSetup establishes no SRB1"
+            );
+        });
+    }
+
+    // ========================================================================
+    // Wave-6 I5: UE AS-security activation. The SMC is built with the gNB's
+    // OWN encoder (nextgsim-rrc `encode_security_mode_command`, called by
+    // nextgsim-gnb `activate_as_security`) and the derived keys are checked
+    // against the gNB's OWN `derive_rrc_up_key` — a genuine strict-peer oracle
+    // over the shared libs, and the SecurityModeComplete is decoded by the
+    // gNB's OWN typed UL-DCCH dispatcher (`dispatch_ul_dcch`, C5).
+    // ========================================================================
+
+    use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+    use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_ul_dcch, UlDcchMessage};
+    use nextgsim_rrc::procedures::security_mode::{
+        decode_security_mode_complete, encode_security_mode_command, CipheringAlgorithmType,
+        IntegrityAlgorithmType, SecurityAlgorithms, SecurityModeCommandParams,
+    };
+
+    const TEST_KGNB: [u8; 32] = [0x11u8; 32];
+
+    fn gnb_smc_bytes(tid: u8) -> Vec<u8> {
+        // The exact algorithms nextgsim-gnb selects at Initial Context Setup
+        // for the matched sim: NEA0 ciphering, NIA2 integrity.
+        encode_security_mode_command(&SecurityModeCommandParams {
+            rrc_transaction_id: tid,
+            security_algorithms: SecurityAlgorithms {
+                ciphering_algorithm: CipheringAlgorithmType::Nea0,
+                integrity_algorithm: Some(IntegrityAlgorithmType::Nia2),
+            },
+        })
+        .expect("gNB encodes SecurityModeCommand")
+    }
+
+    #[test]
+    fn test_as_smc_derives_keys_and_completes_strict_peer() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            // NAS plane handed us KgNB (TS 33.501 §6.9.4.1).
+            task.set_pending_kgnb(TEST_KGNB);
+
+            let smc = decode_security_mode_command(&gnb_smc_bytes(0)).expect("decode SMC");
+            task.handle_as_security_mode_command(smc).await;
+
+            // AS security context installed; keys byte-identical to the gNB's
+            // own derive_rrc_up_key(KgNB, ...) (TS 33.501 Annex A.8).
+            let ctx = task.as_security().expect("AS security must be active");
+            assert_eq!(
+                ctx.k_rrc_int,
+                derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcInt, 2)
+            );
+            assert_eq!(
+                ctx.k_rrc_enc,
+                derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcEnc, 0)
+            );
+
+            // SecurityModeComplete emitted on UL-DCCH, decodable by the gNB's
+            // OWN typed UL-DCCH dispatcher (C5) with the echoed tid.
+            let (ch, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(ch, RrcChannel::UlDcch);
+            match dispatch_ul_dcch(complete.data()).expect("gNB typed dispatch") {
+                UlDcchMessage::SecurityModeComplete(d) => assert_eq!(d.rrc_transaction_id, 0),
+                other => panic!("expected SecurityModeComplete, got {other:?}"),
+            }
+            assert_eq!(
+                decode_security_mode_complete(complete.data())
+                    .unwrap()
+                    .rrc_transaction_id,
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn test_as_smc_echoes_tid() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            let smc = decode_security_mode_command(&gnb_smc_bytes(3)).unwrap();
+            task.handle_as_security_mode_command(smc).await;
+            let (_ch, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(
+                decode_security_mode_complete(complete.data())
+                    .unwrap()
+                    .rrc_transaction_id,
+                3,
+                "SecurityModeComplete must echo the SMC transaction id (TS 38.331 §5.3.4.3)"
+            );
+        });
+    }
+
+    #[test]
+    fn test_as_smc_without_kgnb_fails_closed() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            // No KgNB installed → must NOT activate and must send nothing.
+            let smc = decode_security_mode_command(&gnb_smc_bytes(1)).unwrap();
+            task.handle_as_security_mode_command(smc).await;
+
+            assert!(task.as_security().is_none(), "no KgNB → no activation");
+            assert!(
+                rls_rx.try_recv().is_err(),
+                "fail-closed: no SecurityModeComplete without KgNB"
+            );
+        });
+    }
+
+    #[test]
+    fn test_as_security_key_message_stores_kgnb() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        assert!(task.pending_kgnb.is_none());
+        task.set_pending_kgnb(TEST_KGNB);
+        assert_eq!(task.pending_kgnb, Some(TEST_KGNB));
     }
 }

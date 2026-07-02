@@ -28,9 +28,22 @@ use nextgsim_common::OctetString;
 
 use super::amf_context::{AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
-use super::ue_context::{NgapPduSession, NgapUeContext};
+use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
+use crate::rrc::transaction::RrcProcedure;
+use nextgsim_rrc::procedures::rrc_reconfiguration::{
+    build_drb_reconfiguration_params, encode_rrc_reconfiguration,
+};
+use nextgsim_rrc::procedures::security_mode::{
+    encode_security_mode_command, CipheringAlgorithmType, IntegrityAlgorithmType,
+    SecurityAlgorithms, SecurityModeCommandParams,
+};
 
-use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu};
+use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu, NGAP_PDU};
+use nextgsim_ngap::procedures::error_indication::{
+    encode_error_indication, error_indication_abstract_syntax_error,
+    error_indication_transfer_syntax_error, CriticalityDiagnosticsInfo, ErrorIndicationParams,
+    TriggeringMessageValue,
+};
 use nextgsim_ngap::procedures::handover::{
     decode_handover_command, decode_handover_preparation_failure, decode_handover_request,
     encode_handover_notify, encode_handover_request_acknowledge, encode_handover_required,
@@ -41,13 +54,20 @@ use nextgsim_ngap::procedures::handover::{
     UserLocationInfoNr as HandoverUserLocationInfoNr,
 };
 use nextgsim_ngap::procedures::initial_context_setup::{
-    decode_initial_context_setup_request, encode_initial_context_setup_response,
+    decode_initial_context_setup_request, encode_initial_context_setup_failure,
+    encode_initial_context_setup_response, InitialContextSetupFailureParams,
     InitialContextSetupResponseParams,
 };
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
+use nextgsim_ngap::procedures::ng_reset::{
+    decode_amf_configuration_update, decode_ng_reset, encode_amf_configuration_update_acknowledge,
+    encode_ng_reset_acknowledge, AmfConfigurationUpdateAcknowledgeParams, NgResetAcknowledgeParams,
+    NgResetScope, UeAssociation,
+};
 use nextgsim_ngap::procedures::ng_setup::{
     NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
 };
+use nextgsim_ngap::procedures::paging::{decode_paging, PagingData, UePagingIdentityValue};
 use nextgsim_ngap::procedures::path_switch::{
     decode_path_switch_request_acknowledge, decode_path_switch_request_failure,
     encode_path_switch_request, PathSwitchRequestAcknowledgeData, PathSwitchRequestFailureData,
@@ -70,6 +90,7 @@ use nextgsim_ngap::procedures::pdu_session_resource::{
     PduSessionResourceReleaseCommandData,
     PduSessionResourceReleaseResponseParams,
     PduSessionResourceReleasedItem,
+    PduSessionResourceSetupItem,
     PduSessionResourceSetupRequestData,
     PduSessionResourceSetupResponseItem,
     PduSessionResourceSetupResponseParams,
@@ -543,6 +564,106 @@ impl NgapTask {
 
     /// Handles Initial Context Setup Request from AMF
     ///
+    /// Select the NR ciphering + integrity algorithms from the UE Security
+    /// Capabilities (TS 38.413 §9.3.1.86 bitmaps: MSB / 0x8000 = 128-xEA1).
+    /// gNB priority: prefer algorithm 2 (AES) > 1 (SNOW3G) > 3 (ZUC) > 0 (null).
+    /// Integrity never falls back to NIA0 (TS 33.501 §5.11.2): NIA2 is
+    /// mandatory-to-support, so an empty integrity bitmap defaults to NIA2.
+    fn select_as_algorithms(
+        caps: &nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue,
+    ) -> ((u8, CipheringAlgorithmType), (u8, IntegrityAlgorithmType)) {
+        let ciph = {
+            let m = caps.nr_encryption_algorithms;
+            if m & 0x4000 != 0 {
+                (2, CipheringAlgorithmType::Nea2)
+            } else if m & 0x8000 != 0 {
+                (1, CipheringAlgorithmType::Nea1)
+            } else if m & 0x2000 != 0 {
+                (3, CipheringAlgorithmType::Nea3)
+            } else {
+                (0, CipheringAlgorithmType::Nea0)
+            }
+        };
+        let integ = {
+            let m = caps.nr_integrity_algorithms;
+            if m & 0x4000 != 0 {
+                (2, IntegrityAlgorithmType::Nia2)
+            } else if m & 0x8000 != 0 {
+                (1, IntegrityAlgorithmType::Nia1)
+            } else if m & 0x2000 != 0 {
+                (3, IntegrityAlgorithmType::Nia3)
+            } else {
+                (2, IntegrityAlgorithmType::Nia2)
+            }
+        };
+        (ciph, integ)
+    }
+
+    /// Establish AS security at Initial Context Setup (TS 33.501 §6.7 / §6.9,
+    /// TS 38.331 §5.3.4): select algorithms from the UE Security Capabilities,
+    /// derive the AS keys (K_RRCenc/int, K_UPenc/int) from KgNB (SecurityKey IE)
+    /// per TS 33.501 Annex A.8, store the security context, and send the RRC
+    /// SecurityModeCommand to the UE on SRB1.
+    async fn activate_as_security(
+        &mut self,
+        ue_id: i32,
+        kgnb: [u8; 32],
+        caps: &nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue,
+    ) {
+        use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+
+        let ((ciph_id, ciph_alg), (int_id, int_alg)) = Self::select_as_algorithms(caps);
+
+        // Derive the four AS keys from KgNB (TS 33.501 Annex A.8, FC=0x69).
+        let sec_ctx = AsSecurityContext {
+            kgnb,
+            k_rrc_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcEnc, ciph_id),
+            k_rrc_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, int_id),
+            k_up_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpEnc, ciph_id),
+            k_up_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpInt, int_id),
+            ciphering_alg_id: ciph_id,
+            integrity_alg_id: int_id,
+        };
+        // Wave-6 C4-final: allocate the SecurityModeCommand tid from THIS UE's
+        // per-context allocator (TS 38.331 §5.3.4 / §6.3.2). Pinned to 0 on the
+        // wire while C5_TYPED_DCCH_DISPATCH is off (the UE DL-DCCH dispatcher is
+        // still the legacy nibble matcher, on which a non-zero tid shuffles the
+        // routed leading-byte nibble); becomes the per-UE 0..3 cycle once C5
+        // types both DL dispatchers.
+        let rrc_transaction_id =
+            if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
+                ctx.as_security = Some(sec_ctx);
+                ctx.transactions.allocate(RrcProcedure::SecurityMode)
+            } else {
+                0
+            };
+        info!(
+            "AS security established for UE {}: ciphering=NEA{}, integrity=NIA{}",
+            ue_id, ciph_id, int_id
+        );
+
+        // Encode + send the RRC SecurityModeCommand (SRB1, DL-DCCH).
+        let params = SecurityModeCommandParams {
+            rrc_transaction_id,
+            security_algorithms: SecurityAlgorithms {
+                ciphering_algorithm: ciph_alg,
+                integrity_algorithm: Some(int_alg),
+            },
+        };
+        match encode_security_mode_command(&params) {
+            Ok(pdu) => {
+                let msg = RrcMessage::SecurityModeCommand {
+                    ue_id,
+                    pdu: OctetString::from_slice(&pdu),
+                };
+                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                    error!("Failed to hand RRC SecurityModeCommand to RRC task: {}", e);
+                }
+            }
+            Err(e) => error!("Failed to encode RRC SecurityModeCommand: {}", e),
+        }
+    }
+
     /// Establishes UE security context (KgNB), stores security capabilities,
     /// forwards piggybacked NAS PDU to UE, and sends response back to AMF.
     async fn handle_initial_context_setup_request(
@@ -587,6 +708,17 @@ impl NgapTask {
             }
         };
 
+        // TS 33.501 §6.7 / TS 38.331 §5.3.4: establish AS security — derive the
+        // AS keys from KgNB, select algorithms from the UE Security
+        // Capabilities, and send the RRC SecurityModeCommand — before
+        // completing the context.
+        self.activate_as_security(
+            ue_id,
+            ics_req.security_key,
+            &ics_req.ue_security_capabilities,
+        )
+        .await;
+
         // Forward piggybacked NAS PDU (e.g., SecurityModeCommand) to UE via RRC
         if let Some(nas_pdu) = &ics_req.nas_pdu {
             debug!(
@@ -612,10 +744,63 @@ impl NgapTask {
             info!("UE {} context setup complete, state={}", ue_id, ctx.state);
         }
 
-        // Send Initial Context Setup Response
+        // amfg-01: set up any PDU sessions carried inside the ICS Request
+        // (PDUSessionResourceSetupListCxtReq). Real AMFs (e.g. Open5GS) deliver
+        // the first PDU session this way during registration+PDU, so the N3
+        // tunnel must be established here, not only on the dedicated PDU Session
+        // Resource Setup procedure.
+        let carried_sessions = ics_req.pdu_session_setup_list.len();
+        let gnb_ip = self
+            .task_base
+            .config
+            .gtp_advertise_ip
+            .unwrap_or(self.task_base.config.gtp_ip);
+        let mut cxt_res_items = Vec::new();
+        let mut cxt_failed_items = Vec::new();
+        for item in &ics_req.pdu_session_setup_list {
+            match self.setup_one_pdu_session(ue_id, item, gnb_ip).await {
+                Ok(resp) => cxt_res_items.push(resp),
+                Err(failed) => cxt_failed_items.push(failed),
+            }
+        }
+
+        // If the ICS Request carried PDU sessions but none could be set up,
+        // answer with InitialContextSetupFailure (TS 38.413 §8.3.1.4) instead of
+        // a bare success.
+        if carried_sessions > 0 && cxt_res_items.is_empty() {
+            warn!(
+                "ICS carried {} PDU session(s) but none set up; sending InitialContextSetupFailure",
+                carried_sessions
+            );
+            let fail_params = InitialContextSetupFailureParams {
+                amf_ue_ngap_id: ics_req.amf_ue_ngap_id,
+                ran_ue_ngap_id: ics_req.ran_ue_ngap_id,
+                cause: NgSetupFailureCause::RadioNetwork(
+                    RadioNetworkCause::RadioResourcesNotAvailable,
+                ),
+            };
+            match encode_initial_context_setup_failure(&fail_params) {
+                Ok(bytes) => self.send_ngap_ue_associated(amf_id, stream, bytes).await,
+                Err(e) => error!("Failed to encode InitialContextSetupFailure: {}", e),
+            }
+            return;
+        }
+
+        // Send Initial Context Setup Response (with the CxtRes / FailedToSetup
+        // lists when the ICS Request carried PDU sessions).
         let response_params = InitialContextSetupResponseParams {
             amf_ue_ngap_id: ics_req.amf_ue_ngap_id,
             ran_ue_ngap_id: ics_req.ran_ue_ngap_id,
+            setup_list: if cxt_res_items.is_empty() {
+                None
+            } else {
+                Some(cxt_res_items)
+            },
+            failed_list: if cxt_failed_items.is_empty() {
+                None
+            } else {
+                Some(cxt_failed_items)
+            },
         };
         match encode_initial_context_setup_response(&response_params) {
             Ok(response_bytes) => {
@@ -628,6 +813,224 @@ impl NgapTask {
             }
             Err(e) => {
                 error!("Failed to encode Initial Context Setup Response: {}", e);
+            }
+        }
+    }
+
+    /// amfg-01: set up a single PDU session and return its per-session result.
+    ///
+    /// Decodes the APER PDUSessionResourceSetupRequestTransfer (TS 38.413
+    /// §9.3.4.1), allocates the gNB DL F-TEID, stores the session in the UE
+    /// context, creates the GTP-U N3 tunnel, forwards any piggybacked NAS, and
+    /// builds the PDUSessionResourceSetupResponseTransfer (§9.3.4.2).
+    ///
+    /// Shared by the dedicated PDU Session Resource Setup procedure and the PDU
+    /// sessions carried inside an INITIAL CONTEXT SETUP REQUEST
+    /// (`PDUSessionResourceSetupListCxtReq`, TS 38.413 §8.3.1.2). Returns the
+    /// success item, or a FailedToSetup item (with an APER unsuccessful-transfer)
+    /// on any error.
+    /// TS 38.331 §5.3.5.6 / TS 38.300 §16.1.4: establish the user-plane DRB for
+    /// a PDU session by sending an RRCReconfiguration carrying a
+    /// RadioBearerConfig (one DRB-ToAddMod with an SDAP-Config keyed to the PDU
+    /// session id and the accepted QFIs in mappedQoS-FlowsToAdd) plus the
+    /// matching CellGroupConfig (one RLC bearer). Requires AS security to be
+    /// active (established at Initial Context Setup, C5).
+    async fn establish_drb(&mut self, ue_id: i32, psi: u8, qfis: &[u8]) {
+        if !self
+            .ue_contexts
+            .values()
+            .any(|c| c.ue_id == ue_id && c.as_security.is_some())
+        {
+            warn!(
+                "Establishing DRB for PDU session {} on UE {} without active AS security",
+                psi, ue_id
+            );
+        }
+        // One DRB per PDU session; DRB identity 1..=32, DTCH LCID above the SRBs.
+        let drb_id = psi.clamp(1, 32);
+        let lcid = (3 + drb_id).min(32);
+        // Wave-6 C4-final: allocate the RRCReconfiguration tid from THIS UE's
+        // per-context allocator (TS 38.331 §5.3.5 / §6.3.2). Pinned to 0 on the
+        // wire while C5_TYPED_DCCH_DISPATCH is off (a non-zero tid shuffles the
+        // leading-byte nibble the UE's legacy DL-DCCH dispatcher routes on, e.g.
+        // tid 2 -> byte0 0x04 -> misrouted into the DL-information-transfer arm);
+        // becomes the per-UE 0..3 cycle once C5 types both DL dispatchers.
+        let rrc_transaction_id = self
+            .ue_contexts
+            .values_mut()
+            .find(|c| c.ue_id == ue_id)
+            .map(|c| c.transactions.allocate(RrcProcedure::Reconfiguration))
+            .unwrap_or(0);
+        let params = match build_drb_reconfiguration_params(
+            rrc_transaction_id,
+            psi,
+            drb_id,
+            lcid,
+            qfis,
+            true,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    "Failed to build DRB reconfiguration for PDU session {}: {}",
+                    psi, e
+                );
+                return;
+            }
+        };
+        match encode_rrc_reconfiguration(&params) {
+            Ok(pdu) => {
+                let msg = RrcMessage::RrcReconfiguration {
+                    ue_id,
+                    pdu: OctetString::from_slice(&pdu),
+                };
+                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                    error!("Failed to hand RRCReconfiguration to RRC task: {}", e);
+                } else {
+                    info!(
+                        "Sent RRCReconfiguration establishing DRB {} for PDU session {} (QFIs {:?})",
+                        drb_id, psi, qfis
+                    );
+                }
+            }
+            Err(e) => error!(
+                "Failed to encode RRCReconfiguration for PDU session {}: {}",
+                psi, e
+            ),
+        }
+    }
+
+    async fn setup_one_pdu_session(
+        &mut self,
+        ue_id: i32,
+        item: &PduSessionResourceSetupItem,
+        gnb_ip: std::net::IpAddr,
+    ) -> Result<PduSessionResourceSetupResponseItem, PduSessionResourceFailedToSetupItem> {
+        let psi = item.pdu_session_id;
+
+        // Decode the APER PDUSessionResourceSetupRequestTransfer (TS 38.413 §9.3.4.1)
+        let request = match decode_setup_request_transfer(&item.transfer) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!(
+                    "PDU Session {}: failed to decode SetupRequestTransfer ({} bytes): {}",
+                    psi,
+                    item.transfer.len(),
+                    e
+                );
+                let transfer = encode_setup_unsuccessful_transfer(&NgSetupFailureCause::Protocol(
+                    ProtocolCause::TransferSyntaxError,
+                ))
+                .unwrap_or_default();
+                return Err(PduSessionResourceFailedToSetupItem {
+                    pdu_session_id: psi,
+                    transfer,
+                });
+            }
+        };
+
+        let upf_teid = request.ul_tunnel.teid;
+        let upf_addr = request.ul_tunnel.address;
+        // First QoS flow is the default flow for the session
+        let qfi = request.qos_flows[0].qfi;
+
+        // Allocate gNB DL TEID for the N3 tunnel
+        let gnb_teid = self.next_downlink_teid();
+
+        info!(
+            "PDU Session {}: UPF TEID=0x{:08x}, UPF addr={}, QFIs={:?}, gNB TEID=0x{:08x}",
+            psi,
+            upf_teid,
+            upf_addr,
+            request.qos_flows.iter().map(|f| f.qfi).collect::<Vec<_>>(),
+            gnb_teid
+        );
+
+        // Store PDU session in UE context
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            ctx.add_pdu_session(NgapPduSession {
+                psi,
+                qfi: Some(qfi),
+                uplink_teid: gnb_teid,
+                downlink_teid: upf_teid,
+                upf_address: upf_addr,
+            });
+        }
+
+        // Send GTP SessionCreate to GTP task
+        let resource = PduSessionResource {
+            psi: psi as i32,
+            qfi: Some(qfi),
+            // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
+            // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
+            uplink_teid: upf_teid,
+            downlink_teid: gnb_teid,
+            upf_address: upf_addr,
+        };
+        let msg = GtpMessage::SessionCreate { ue_id, resource };
+        if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+            error!("Failed to send SessionCreate to GTP: {}", e);
+            if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                ctx.remove_pdu_session(psi);
+            }
+            let transfer = encode_setup_unsuccessful_transfer(&NgSetupFailureCause::RadioNetwork(
+                RadioNetworkCause::RadioResourcesNotAvailable,
+            ))
+            .unwrap_or_default();
+            return Err(PduSessionResourceFailedToSetupItem {
+                pdu_session_id: psi,
+                transfer,
+            });
+        }
+        info!(
+            "GTP session created for PSI={}, gNB TEID=0x{:08x}",
+            psi, gnb_teid
+        );
+
+        // If NAS PDU present, forward to RRC
+        if let Some(ref nas_pdu) = item.nas_pdu {
+            let msg = RrcMessage::NasDelivery {
+                ue_id,
+                pdu: OctetString::from_slice(nas_pdu),
+            };
+            if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                error!("Failed to forward NAS PDU from Setup Request to RRC: {}", e);
+            }
+        }
+
+        // TS 38.331 §5.3.5.6: establish the PDU session's user-plane DRB via an
+        // RRCReconfiguration carrying the accepted QoS flows (QFIs).
+        let accepted_qfis: Vec<u8> = request.qos_flows.iter().map(|f| f.qfi).collect();
+        self.establish_drb(ue_id, psi, &accepted_qfis).await;
+
+        // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
+        // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
+        let transfer_params = SetupResponseTransferParams {
+            dl_tunnel: GtpTunnelInfo {
+                address: gnb_ip,
+                teid: gnb_teid,
+            },
+            accepted_qfis,
+            failed_qos_flows: vec![],
+        };
+        match encode_setup_response_transfer(&transfer_params) {
+            Ok(response_transfer) => Ok(PduSessionResourceSetupResponseItem {
+                pdu_session_id: psi,
+                transfer: response_transfer,
+            }),
+            Err(e) => {
+                error!(
+                    "Failed to encode SetupResponseTransfer for PSI {}: {}",
+                    psi, e
+                );
+                let transfer = encode_setup_unsuccessful_transfer(&NgSetupFailureCause::Misc(
+                    nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
+                ))
+                .unwrap_or_default();
+                Err(PduSessionResourceFailedToSetupItem {
+                    pdu_session_id: psi,
+                    transfer,
+                })
             }
         }
     }
@@ -678,135 +1081,9 @@ impl NgapTask {
             .unwrap_or(self.task_base.config.gtp_ip);
 
         for item in &setup_req.pdu_session_resource_setup_list {
-            let psi = item.pdu_session_id;
-
-            // Decode the APER PDUSessionResourceSetupRequestTransfer (TS 38.413 §9.3.4.1)
-            let request = match decode_setup_request_transfer(&item.transfer) {
-                Ok(req) => req,
-                Err(e) => {
-                    warn!(
-                        "PDU Session {}: failed to decode SetupRequestTransfer ({} bytes): {}",
-                        psi,
-                        item.transfer.len(),
-                        e
-                    );
-                    if let Ok(transfer) = encode_setup_unsuccessful_transfer(
-                        &NgSetupFailureCause::Protocol(ProtocolCause::TransferSyntaxError),
-                    ) {
-                        failed_items.push(PduSessionResourceFailedToSetupItem {
-                            pdu_session_id: psi,
-                            transfer,
-                        });
-                    }
-                    continue;
-                }
-            };
-
-            let upf_teid = request.ul_tunnel.teid;
-            let upf_addr = request.ul_tunnel.address;
-            // First QoS flow is the default flow for the session
-            let qfi = request.qos_flows[0].qfi;
-
-            // Allocate gNB DL TEID for the N3 tunnel
-            let gnb_teid = self.next_downlink_teid();
-
-            info!(
-                "PDU Session {}: UPF TEID=0x{:08x}, UPF addr={}, QFIs={:?}, gNB TEID=0x{:08x}",
-                psi,
-                upf_teid,
-                upf_addr,
-                request.qos_flows.iter().map(|f| f.qfi).collect::<Vec<_>>(),
-                gnb_teid
-            );
-
-            // Store PDU session in UE context
-            if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
-                ctx.add_pdu_session(NgapPduSession {
-                    psi,
-                    qfi: Some(qfi),
-                    uplink_teid: gnb_teid,
-                    downlink_teid: upf_teid,
-                    upf_address: upf_addr,
-                });
-            }
-
-            // Send GTP SessionCreate to GTP task
-            let resource = PduSessionResource {
-                psi: psi as i32,
-                qfi: Some(qfi),
-                // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
-                // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
-                uplink_teid: upf_teid,
-                downlink_teid: gnb_teid,
-                upf_address: upf_addr,
-            };
-            let msg = GtpMessage::SessionCreate { ue_id, resource };
-            if let Err(e) = self.task_base.gtp_tx.send(msg).await {
-                error!("Failed to send SessionCreate to GTP: {}", e);
-                if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
-                    ctx.remove_pdu_session(psi);
-                }
-                if let Ok(transfer) =
-                    encode_setup_unsuccessful_transfer(&NgSetupFailureCause::RadioNetwork(
-                        RadioNetworkCause::RadioResourcesNotAvailable,
-                    ))
-                {
-                    failed_items.push(PduSessionResourceFailedToSetupItem {
-                        pdu_session_id: psi,
-                        transfer,
-                    });
-                }
-                continue;
-            }
-            info!(
-                "GTP session created for PSI={}, gNB TEID=0x{:08x}",
-                psi, gnb_teid
-            );
-
-            // If NAS PDU present, forward to RRC
-            if let Some(ref nas_pdu) = item.nas_pdu {
-                let msg = RrcMessage::NasDelivery {
-                    ue_id,
-                    pdu: OctetString::from_slice(nas_pdu),
-                };
-                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
-                    error!("Failed to forward NAS PDU from Setup Request to RRC: {}", e);
-                }
-            }
-
-            // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
-            // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
-            let transfer_params = SetupResponseTransferParams {
-                dl_tunnel: GtpTunnelInfo {
-                    address: gnb_ip,
-                    teid: gnb_teid,
-                },
-                accepted_qfis: request.qos_flows.iter().map(|f| f.qfi).collect(),
-                failed_qos_flows: vec![],
-            };
-            match encode_setup_response_transfer(&transfer_params) {
-                Ok(response_transfer) => {
-                    setup_response_items.push(PduSessionResourceSetupResponseItem {
-                        pdu_session_id: psi,
-                        transfer: response_transfer,
-                    });
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to encode SetupResponseTransfer for PSI {}: {}",
-                        psi, e
-                    );
-                    if let Ok(transfer) =
-                        encode_setup_unsuccessful_transfer(&NgSetupFailureCause::Misc(
-                            nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
-                        ))
-                    {
-                        failed_items.push(PduSessionResourceFailedToSetupItem {
-                            pdu_session_id: psi,
-                            transfer,
-                        });
-                    }
-                }
+            match self.setup_one_pdu_session(ue_id, item, gnb_ip).await {
+                Ok(resp) => setup_response_items.push(resp),
+                Err(failed) => failed_items.push(failed),
             }
         }
 
@@ -1676,17 +1953,227 @@ impl NgapTask {
                 } else if let Ok(ics_req) = decode_initial_context_setup_request(pdu_bytes) {
                     self.handle_initial_context_setup_request(client_id, stream, ics_req)
                         .await;
+                } else if let Ok(reset) = decode_ng_reset(pdu_bytes) {
+                    self.handle_ng_reset(client_id, stream, reset).await;
+                } else if let Ok(update) = decode_amf_configuration_update(pdu_bytes) {
+                    self.handle_amf_configuration_update(client_id, stream, update)
+                        .await;
+                } else if let Ok(paging) = decode_paging(pdu_bytes) {
+                    self.handle_paging(client_id, paging).await;
                 } else {
-                    debug!(
-                        "Received operational NGAP PDU on stream {} (not yet handled, first bytes: {:02x?})",
-                        stream,
-                        &pdu_bytes[..pdu_bytes.len().min(16)]
-                    );
+                    // amfg-05: this operational PDU could not be routed to a
+                    // handler. Per TS 38.413 §8.7.5 / §10, answer with an NGAP
+                    // Error Indication rather than silently dropping it.
+                    self.handle_unroutable_pdu(client_id, pdu_bytes).await;
                 }
             }
             _ => {
                 warn!("Received NGAP PDU in unexpected AMF state: {:?}", amf_state);
             }
+        }
+    }
+
+    // ========================================================================
+    // NG Reset / AMF Configuration Update (amfg-07)
+    // ========================================================================
+
+    /// Handles an inbound NG Reset (TS 38.413 §8.7.4.2).
+    ///
+    /// Clears the indicated UE-associated logical NG-connections — all of them
+    /// for a `NG Interface` reset, or the listed subset for a
+    /// `Part of NG Interface` reset — and replies with an NG Reset Acknowledge
+    /// echoing the associations actually released.
+    async fn handle_ng_reset(
+        &mut self,
+        client_id: i32,
+        stream: u16,
+        reset: nextgsim_ngap::procedures::ng_reset::NgResetData,
+    ) {
+        info!(
+            "NG Reset received from AMF[{}]: scope={:?}, cause={:?}",
+            client_id, reset.scope, reset.cause
+        );
+
+        // Collect the UE ids to release, recording the released associations.
+        let mut ue_ids: Vec<i32> = Vec::new();
+        let mut released: Vec<UeAssociation> = Vec::new();
+
+        match &reset.scope {
+            NgResetScope::All => {
+                for ctx in self.ue_contexts.values() {
+                    if ctx.amf_ctx_id == client_id {
+                        ue_ids.push(ctx.ue_id);
+                        released.push(UeAssociation {
+                            amf_ue_ngap_id: ctx.amf_ue_ngap_id.map(|v| v as u64),
+                            ran_ue_ngap_id: Some(ctx.ran_ue_ngap_id as u32),
+                        });
+                    }
+                }
+            }
+            NgResetScope::Part(list) => {
+                for assoc in list {
+                    // Match by RAN UE NGAP ID first, then AMF UE NGAP ID.
+                    let found = self.ue_contexts.values().find(|ctx| {
+                        ctx.amf_ctx_id == client_id
+                            && ((assoc.ran_ue_ngap_id.is_some()
+                                && Some(ctx.ran_ue_ngap_id as u32) == assoc.ran_ue_ngap_id)
+                                || (assoc.amf_ue_ngap_id.is_some()
+                                    && ctx.amf_ue_ngap_id.map(|v| v as u64)
+                                        == assoc.amf_ue_ngap_id))
+                    });
+                    if let Some(ctx) = found {
+                        ue_ids.push(ctx.ue_id);
+                        released.push(UeAssociation {
+                            amf_ue_ngap_id: ctx.amf_ue_ngap_id.map(|v| v as u64),
+                            ran_ue_ngap_id: Some(ctx.ran_ue_ngap_id as u32),
+                        });
+                    } else {
+                        // Echo back the requested association even if unknown,
+                        // so the AMF can complete its bookkeeping.
+                        released.push(assoc.clone());
+                    }
+                }
+            }
+        }
+
+        for ue_id in ue_ids {
+            self.release_ue_for_reset(ue_id).await;
+        }
+
+        // Build the Acknowledge. Always include the (possibly empty) released
+        // list so the AMF sees exactly which associations were cleared.
+        let params = NgResetAcknowledgeParams {
+            released: Some(released),
+        };
+        match encode_ng_reset_acknowledge(&params) {
+            Ok(data) => {
+                self.send_ngap_non_ue(client_id, stream, data).await;
+                info!("Sent NG Reset Acknowledge to AMF[{}]", client_id);
+            }
+            Err(e) => error!("Failed to encode NG Reset Acknowledge: {}", e),
+        }
+    }
+
+    /// Releases a UE context as part of an NG Reset: drop the NGAP context and
+    /// notify the RRC and GTP tasks (no UE Context Release Complete is sent —
+    /// NG Reset is acknowledged at the interface level).
+    async fn release_ue_for_reset(&mut self, ue_id: i32) {
+        self.delete_ue_context(ue_id);
+        self.send_an_release(ue_id).await;
+        let msg = GtpMessage::UeContextRelease { ue_id };
+        if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+            error!("Failed to send UE context release to GTP: {}", e);
+        }
+    }
+
+    /// Handles an inbound AMF Configuration Update (TS 38.413 §8.7.3).
+    ///
+    /// Updates the stored AMF configuration (name, relative capacity, served
+    /// GUAMI count) and replies with an AMF Configuration Update Acknowledge.
+    async fn handle_amf_configuration_update(
+        &mut self,
+        client_id: i32,
+        stream: u16,
+        update: nextgsim_ngap::procedures::ng_reset::AmfConfigurationUpdateData,
+    ) {
+        info!(
+            "AMF Configuration Update from AMF[{}]: name={:?}, served_guami={}, capacity={:?}, \
+             plmn_support={}",
+            client_id,
+            update.amf_name,
+            update.served_guami_count,
+            update.relative_amf_capacity,
+            update.has_plmn_support_list
+        );
+
+        if let Some(ctx) = self.amf_contexts.get_mut(&client_id) {
+            if let Some(ref name) = update.amf_name {
+                ctx.amf_name = Some(name.clone());
+            }
+            if let Some(cap) = update.relative_amf_capacity {
+                ctx.relative_capacity = cap;
+            }
+        }
+
+        let params = AmfConfigurationUpdateAcknowledgeParams::default();
+        match encode_amf_configuration_update_acknowledge(&params) {
+            Ok(data) => {
+                self.send_ngap_non_ue(client_id, stream, data).await;
+                info!(
+                    "Sent AMF Configuration Update Acknowledge to AMF[{}]",
+                    client_id
+                );
+            }
+            Err(e) => error!(
+                "Failed to encode AMF Configuration Update Acknowledge: {}",
+                e
+            ),
+        }
+    }
+
+    // ========================================================================
+    // Paging (amfg-06)
+    // ========================================================================
+
+    /// Handles an inbound PAGING from the AMF (TS 38.413 §8.6.1 / §9.2.3.1).
+    ///
+    /// Matches the TAIListForPaging against this gNB's served TAI and, on a
+    /// match, triggers RRC Paging toward the air interface carrying the
+    /// 5G-S-TMSI. PagingPriority / PagingDRX are honored on a best-effort
+    /// (logged) basis.
+    async fn handle_paging(&mut self, client_id: i32, paging: PagingData) {
+        let config = &self.task_base.config;
+        let served_plmn = config.plmn.encode();
+        let served_tac = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+
+        // Collect the TAIs from the paging list that this gNB serves.
+        let matching: Vec<&nextgsim_ngap::procedures::initial_ue_message::Tai> = paging
+            .tai_list_for_paging
+            .iter()
+            .filter(|tai| tai.plmn_identity == served_plmn && tai.tac == served_tac)
+            .collect();
+
+        if matching.is_empty() {
+            debug!(
+                "PAGING from AMF[{}] not for a served TAI (served plmn={:02x?} tac={:02x?}); ignoring",
+                client_id, served_plmn, served_tac
+            );
+            return;
+        }
+
+        if paging.paging_priority.is_some() || paging.paging_drx.is_some() {
+            debug!(
+                "PAGING QoS hints: priority={:?}, drx={:?}",
+                paging.paging_priority, paging.paging_drx
+            );
+        }
+
+        // Serialize the 5G-S-TMSI for the RRC Paging record.
+        let ue_paging_tmsi = serialize_five_g_s_tmsi(&paging.ue_paging_identity);
+
+        // Serialize the matching TAIs (plmn(3) + tac(3) per entry).
+        let mut tai_list_for_paging = Vec::with_capacity(matching.len() * 6);
+        for tai in &matching {
+            tai_list_for_paging.extend_from_slice(&tai.plmn_identity);
+            tai_list_for_paging.extend_from_slice(&tai.tac);
+        }
+
+        info!(
+            "PAGING from AMF[{}]: matched {} served TAI(s); triggering RRC Paging",
+            client_id,
+            matching.len()
+        );
+
+        let msg = RrcMessage::Paging {
+            ue_paging_tmsi,
+            tai_list_for_paging,
+        };
+        if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+            error!("Failed to forward Paging to RRC: {}", e);
         }
     }
 
@@ -2221,6 +2708,48 @@ impl NgapTask {
     // Helper Methods
     // ========================================================================
 
+    /// Handles an operational NGAP PDU that could not be routed to a handler.
+    ///
+    /// Per TS 38.413 §8.7.5 (Error Indication) and §10 (handling of
+    /// unknown/erroneous messages) the NG-RAN node answers with an Error
+    /// Indication. We distinguish two cases:
+    ///   * the PDU did not APER-decode at all → transfer-syntax-error (no
+    ///     CriticalityDiagnostics, since the procedure code is unknown);
+    ///   * the PDU decoded but no handler exists for the procedure →
+    ///     abstract-syntax-error (ignore-and-notify) with CriticalityDiagnostics
+    ///     carrying the offending procedure code.
+    async fn handle_unroutable_pdu(&self, amf_id: i32, pdu_bytes: &[u8]) {
+        let params = unroutable_error_params(pdu_bytes);
+        match decode_ngap_pdu(pdu_bytes) {
+            Ok(_) => warn!(
+                "Unsupported NGAP procedure from AMF[{}]; sending Error Indication \
+                 (abstract syntax error)",
+                amf_id
+            ),
+            Err(e) => warn!(
+                "Undecodable NGAP PDU from AMF[{}] ({}); sending Error Indication \
+                 (transfer syntax error)",
+                amf_id, e
+            ),
+        }
+        self.send_error_indication(amf_id, params).await;
+    }
+
+    /// Encodes and sends an NGAP Error Indication to the AMF.
+    ///
+    /// Error Indication is non-UE-associated here (the offending PDU could not
+    /// be tied to a known UE context), so it is sent on stream 0.
+    async fn send_error_indication(&self, amf_id: i32, params: ErrorIndicationParams) {
+        match encode_error_indication(&params) {
+            Ok(data) => {
+                self.send_ngap_non_ue(amf_id, 0, data).await;
+            }
+            Err(e) => {
+                error!("Failed to encode Error Indication: {}", e);
+            }
+        }
+    }
+
     /// Sends an NGAP PDU for non-UE-associated signaling (stream 0)
     async fn send_ngap_non_ue(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
         let msg = SctpMessage::SendMessage {
@@ -2464,6 +2993,66 @@ impl NgapTask {
     }
 }
 
+/// Builds the Error Indication parameters for an NGAP PDU that the gNB could
+/// not route (TS 38.413 §8.7.5 / §10).
+///
+/// * undecodable PDU → transfer-syntax-error (no CriticalityDiagnostics);
+/// * decoded but unsupported procedure → abstract-syntax-error
+///   (ignore-and-notify) with CriticalityDiagnostics carrying the procedure
+///   code and triggering-message kind.
+fn unroutable_error_params(pdu_bytes: &[u8]) -> ErrorIndicationParams {
+    match decode_ngap_pdu(pdu_bytes) {
+        Ok(pdu) => {
+            let (proc_code, trigger) = ngap_procedure_code(&pdu);
+            let mut p = error_indication_abstract_syntax_error(None, None, false);
+            p.criticality_diagnostics = Some(CriticalityDiagnosticsInfo {
+                procedure_code: Some(proc_code),
+                triggering_message: Some(trigger),
+                procedure_criticality: None,
+                ies_criticality_diagnostics: Vec::new(),
+            });
+            p
+        }
+        Err(_) => error_indication_transfer_syntax_error(None, None),
+    }
+}
+
+/// Serializes a 5G-S-TMSI UE paging identity into the canonical 48-bit form
+/// for an RRC Paging record (TS 23.003 §2.10.1): AMF Set ID (10 bits) +
+/// AMF Pointer (6 bits) packed into 2 octets, followed by the 32-bit 5G-TMSI.
+fn serialize_five_g_s_tmsi(identity: &UePagingIdentityValue) -> Vec<u8> {
+    match identity {
+        UePagingIdentityValue::FiveGSTmsi(tmsi) => {
+            let mut out = Vec::with_capacity(6);
+            // AMF Set ID is 10 bits, AMF Pointer is 6 bits -> 16 bits.
+            let packed = ((tmsi.amf_set_id & 0x3FF) << 6) | (tmsi.amf_pointer as u16 & 0x3F);
+            out.extend_from_slice(&packed.to_be_bytes());
+            out.extend_from_slice(&tmsi.five_g_tmsi);
+            out
+        }
+    }
+}
+
+/// Extracts the NGAP procedure code and triggering-message kind from a decoded
+/// PDU, for populating CriticalityDiagnostics in an Error Indication
+/// (TS 38.413 §9.3.1.3).
+fn ngap_procedure_code(pdu: &NGAP_PDU) -> (u8, TriggeringMessageValue) {
+    match pdu {
+        NGAP_PDU::InitiatingMessage(m) => (
+            m.procedure_code.0,
+            TriggeringMessageValue::InitiatingMessage,
+        ),
+        NGAP_PDU::SuccessfulOutcome(m) => (
+            m.procedure_code.0,
+            TriggeringMessageValue::SuccessfulOutcome,
+        ),
+        NGAP_PDU::UnsuccessfulOutcome(m) => (
+            m.procedure_code.0,
+            TriggeringMessageValue::UnsuccessfulOutcome,
+        ),
+    }
+}
+
 // ============================================================================
 // Task Implementation
 // ============================================================================
@@ -2623,6 +3212,64 @@ mod tests {
     }
 
     #[test]
+    fn test_select_as_algorithms_prefers_aes_and_derives_distinct_keys() {
+        use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+        use nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue;
+
+        // Caps: NEA1|NEA2 (0xC000), NIA1|NIA2 (0xC000) — MSB (0x8000) = 128-xEA1.
+        let caps = UeSecurityCapabilitiesValue {
+            nr_encryption_algorithms: 0xC000,
+            nr_integrity_algorithms: 0xC000,
+            eutra_encryption_algorithms: None,
+            eutra_integrity_algorithms: None,
+        };
+        let ((ciph_id, ciph), (int_id, integ)) = NgapTask::select_as_algorithms(&caps);
+        // gNB prefers AES (NEA2/NIA2).
+        assert_eq!(ciph_id, 2);
+        assert_eq!(int_id, 2);
+        assert_eq!(ciph, CipheringAlgorithmType::Nea2);
+        assert_eq!(integ, IntegrityAlgorithmType::Nia2);
+
+        // Empty bitmaps: no encryption -> NEA0, but integrity never falls back
+        // to NIA0 (TS 33.501 §5.11.2) — defaults to mandatory-to-support NIA2.
+        let caps0 = UeSecurityCapabilitiesValue {
+            nr_encryption_algorithms: 0,
+            nr_integrity_algorithms: 0,
+            eutra_encryption_algorithms: None,
+            eutra_integrity_algorithms: None,
+        };
+        let ((c0, _), (i0, _)) = NgapTask::select_as_algorithms(&caps0);
+        assert_eq!(c0, 0);
+        assert_eq!(i0, 2);
+
+        // AS keys derived from KgNB are distinct per algorithm-type distinguisher
+        // and non-zero (TS 33.501 Annex A.8).
+        let kgnb = [0x11u8; 32];
+        let k_rrc_enc = derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcEnc, 2);
+        let k_rrc_int = derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, 2);
+        let k_up_enc = derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpEnc, 2);
+        assert_ne!(k_rrc_enc, [0u8; 16]);
+        assert_ne!(k_rrc_enc, k_rrc_int);
+        assert_ne!(k_rrc_enc, k_up_enc);
+    }
+
+    #[test]
+    fn test_gnb_drb_reconfiguration_is_valid_and_carries_qfis() {
+        use nextgsim_rrc::codec::decode_rrc;
+        use nextgsim_rrc::codec::generated::DL_DCCH_Message;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::is_rrc_reconfiguration;
+
+        // The exact call establish_drb makes: PDU session 5, DRB 5, LCID 8,
+        // accepted QFIs 1 & 9. The result must be a decodable DL-DCCH
+        // RRCReconfiguration.
+        let params = build_drb_reconfiguration_params(0, 5, 5, 8, &[1, 9], true).unwrap();
+        let bytes = encode_rrc_reconfiguration(&params).unwrap();
+        assert!(!bytes.is_empty());
+        let msg: DL_DCCH_Message = decode_rrc(&bytes).unwrap();
+        assert!(is_rrc_reconfiguration(&msg));
+    }
+
+    #[test]
     fn test_ngap_task_creation() {
         let config = test_config();
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
@@ -2736,5 +3383,246 @@ mod tests {
         // Delete
         task.delete_ue_context(10);
         assert!(task.find_ue_context(10).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // amfg-06: inbound Paging
+    // ------------------------------------------------------------------
+
+    use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi as PagingTmsi, Tai};
+    use nextgsim_ngap::procedures::paging::PagingData;
+
+    fn sample_tmsi() -> PagingTmsi {
+        PagingTmsi {
+            amf_set_id: 0x155,
+            amf_pointer: 0x2A,
+            five_g_tmsi: [0xDE, 0xAD, 0xBE, 0xEF],
+        }
+    }
+
+    #[test]
+    fn test_serialize_five_g_s_tmsi_packing() {
+        let id = UePagingIdentityValue::FiveGSTmsi(sample_tmsi());
+        let bytes = serialize_five_g_s_tmsi(&id);
+        assert_eq!(bytes.len(), 6);
+        // packed = (0x155 << 6) | 0x2A = 0x556A
+        assert_eq!(&bytes[0..2], &[0x55, 0x6A]);
+        assert_eq!(&bytes[2..6], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[tokio::test]
+    async fn test_paging_matching_tai_triggers_rrc() {
+        let config = test_config();
+        let served_plmn = config.plmn.encode();
+        let served_tac = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+        let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+
+        let paging = PagingData {
+            ue_paging_identity: UePagingIdentityValue::FiveGSTmsi(sample_tmsi()),
+            tai_list_for_paging: vec![Tai {
+                plmn_identity: served_plmn,
+                tac: served_tac,
+            }],
+            paging_drx: None,
+            paging_priority: None,
+            paging_origin: None,
+        };
+        task.handle_paging(1, paging).await;
+
+        match rrc_rx.try_recv() {
+            Ok(TaskMessage::Message(RrcMessage::Paging {
+                ue_paging_tmsi,
+                tai_list_for_paging,
+            })) => {
+                assert_eq!(ue_paging_tmsi.len(), 6);
+                assert_eq!(tai_list_for_paging.len(), 6); // one matching TAI
+                assert_eq!(&tai_list_for_paging[0..3], &served_plmn);
+                assert_eq!(&tai_list_for_paging[3..6], &served_tac);
+            }
+            other => panic!("expected RRC Paging, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paging_non_matching_tai_is_ignored() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+
+        let paging = PagingData {
+            ue_paging_identity: UePagingIdentityValue::FiveGSTmsi(sample_tmsi()),
+            // A TAI this gNB does not serve.
+            tai_list_for_paging: vec![Tai {
+                plmn_identity: [0x99, 0x99, 0x99],
+                tac: [0x12, 0x34, 0x56],
+            }],
+            paging_drx: None,
+            paging_priority: None,
+            paging_origin: None,
+        };
+        task.handle_paging(1, paging).await;
+
+        assert!(
+            rrc_rx.try_recv().is_err(),
+            "no RRC Paging should be emitted for an unserved TAI"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // amfg-07: NG Reset handler clears exactly the listed UE contexts
+    // ------------------------------------------------------------------
+
+    use nextgsim_ngap::procedures::ng_reset::NgResetData;
+
+    #[tokio::test]
+    async fn test_ng_reset_partial_clears_listed_contexts() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+
+        // Two UE contexts on AMF[1]; give them distinct RAN UE NGAP IDs.
+        let ran1 = task.create_ue_context(10, 1).expect("ue1");
+        let ran2 = task.create_ue_context(20, 1).expect("ue2");
+        assert_ne!(ran1, ran2);
+
+        // Reset only UE[10] by its RAN UE NGAP ID.
+        let reset = NgResetData {
+            cause: None,
+            scope: NgResetScope::Part(vec![UeAssociation {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: Some(ran1 as u32),
+            }]),
+        };
+        task.handle_ng_reset(1, 0, reset).await;
+
+        assert!(
+            task.find_ue_context(10).is_none(),
+            "UE[10] should be cleared"
+        );
+        assert!(task.find_ue_context(20).is_some(), "UE[20] must remain");
+    }
+
+    #[tokio::test]
+    async fn test_ng_reset_all_clears_all_contexts_for_amf() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(10, 1).expect("ue1");
+        task.create_ue_context(20, 1).expect("ue2");
+
+        let reset = NgResetData {
+            cause: None,
+            scope: NgResetScope::All,
+        };
+        task.handle_ng_reset(1, 0, reset).await;
+
+        assert!(task.find_ue_context(10).is_none());
+        assert!(task.find_ue_context(20).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // amfg-05: Error Indication generation for unroutable PDUs
+    // ------------------------------------------------------------------
+
+    use nextgsim_ngap::codec::ID_ERROR_INDICATION;
+    use nextgsim_ngap::procedures::error_indication::decode_error_indication;
+    use nextgsim_ngap::procedures::ng_setup::{NgSetupFailureCause, ProtocolCause};
+
+    /// A garbage byte stream that does not APER-decode as an NGAP PDU must
+    /// yield a transfer-syntax-error Error Indication with no
+    /// CriticalityDiagnostics (the procedure code is unknown).
+    #[test]
+    fn test_unroutable_undecodable_yields_transfer_syntax_error() {
+        let garbage = [0xFFu8, 0xFE, 0xAB, 0xCD, 0x12, 0x34];
+        let params = unroutable_error_params(&garbage);
+        assert!(matches!(
+            params.cause,
+            Some(NgSetupFailureCause::Protocol(
+                ProtocolCause::TransferSyntaxError
+            ))
+        ));
+        assert!(params.criticality_diagnostics.is_none());
+
+        // Round-trip: the produced Error Indication encodes and decodes.
+        let bytes = encode_error_indication(&params).expect("encode");
+        let decoded = decode_error_indication(&bytes).expect("decode");
+        assert!(matches!(
+            decoded.cause,
+            Some(NgSetupFailureCause::Protocol(
+                ProtocolCause::TransferSyntaxError
+            ))
+        ));
+    }
+
+    /// A well-formed-but-unhandled NGAP PDU must yield an
+    /// abstract-syntax-error (ignore-and-notify) Error Indication whose
+    /// CriticalityDiagnostics carries the offending procedure code.
+    #[test]
+    fn test_unroutable_decodable_yields_abstract_syntax_error_with_proc_code() {
+        // Use an Error Indication PDU (procedure code 9) as a stand-in for a
+        // valid-but-unhandled inbound procedure: it decodes cleanly yet has no
+        // gNB inbound handler.
+        let valid_pdu_bytes =
+            encode_error_indication(&ErrorIndicationParams::default()).expect("encode sample pdu");
+
+        let params = unroutable_error_params(&valid_pdu_bytes);
+        assert!(matches!(
+            params.cause,
+            Some(NgSetupFailureCause::Protocol(
+                ProtocolCause::AbstractSyntaxErrorIgnoreAndNotify
+            ))
+        ));
+        let diag = params
+            .criticality_diagnostics
+            .as_ref()
+            .expect("criticality diagnostics present");
+        assert_eq!(diag.procedure_code, Some(ID_ERROR_INDICATION));
+        assert_eq!(
+            diag.triggering_message,
+            Some(TriggeringMessageValue::InitiatingMessage)
+        );
+
+        // Strict APER round-trip of the generated Error Indication.
+        let bytes = encode_error_indication(&params).expect("encode");
+        let decoded = decode_error_indication(&bytes).expect("decode");
+        assert_eq!(
+            decoded
+                .criticality_diagnostics
+                .and_then(|d| d.procedure_code),
+            Some(ID_ERROR_INDICATION)
+        );
+    }
+
+    /// ngap_procedure_code reports the correct triggering-message kind.
+    #[test]
+    fn test_ngap_procedure_code_initiating() {
+        let bytes = encode_error_indication(&ErrorIndicationParams::default()).expect("encode");
+        let pdu = decode_ngap_pdu(&bytes).expect("decode");
+        let (code, trigger) = ngap_procedure_code(&pdu);
+        assert_eq!(code, ID_ERROR_INDICATION);
+        assert_eq!(trigger, TriggeringMessageValue::InitiatingMessage);
     }
 }

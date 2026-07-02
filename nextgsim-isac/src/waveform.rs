@@ -1,6 +1,7 @@
 //! OFDM-radar waveform modeling for joint sensing-communication
 //!
-//! Implements joint ISAC waveform design per 6G requirements.
+//! Illustrative OFDM-radar signal model for ISAC research (waveform/PHY design
+//! is RAN1 scope, outside 3GPP TR 22.837).
 
 use serde::{Deserialize, Serialize};
 
@@ -510,8 +511,7 @@ impl JointWaveformDesign {
         self.subcarrier_allocation = vec![false; self.num_subcarriers];
 
         // Distribute sensing subcarriers evenly across bandwidth
-        if sensing_count > 0 {
-            let step = self.num_subcarriers / sensing_count;
+        if let Some(step) = self.num_subcarriers.checked_div(sensing_count) {
             for i in 0..sensing_count {
                 let idx = (i * step).min(self.num_subcarriers - 1);
                 self.subcarrier_allocation[idx] = true;

@@ -52,8 +52,10 @@ impl Task for AgentTask {
                                 "slicing" => AgentType::Slicing,
                                 _ => AgentType::Custom,
                             };
-                            let mut caps = AgentCapabilities::default();
-                            caps.allowed_intents = capabilities.clone();
+                            let caps = AgentCapabilities {
+                                allowed_intents: capabilities.clone(),
+                                ..Default::default()
+                            };
                             self.coordinator.register_agent(a_id, a_type, caps);
                             self.agents.insert(agent_id, capabilities);
                         }

@@ -8,7 +8,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use thiserror::Error;
 
-use crate::codec::{GtpError, GtpHeader, GtpMessageType};
+use crate::codec::{GtpError, GtpHeader, GtpMessageType, PduSessionInfo};
+
+/// Default QoS Flow Identifier used for uplink G-PDUs when a PDU session has no
+/// QFI assigned yet (TS 38.415: the UL PDU SESSION INFORMATION QFI field is
+/// mandatory, so a value must always be sent).
+const DEFAULT_UPLINK_QFI: u8 = 1;
 
 /// GTP-U default port
 pub const GTP_U_PORT: u16 = 2152;
@@ -232,17 +237,38 @@ impl TunnelManager {
             .get_session(ue_id, psi)
             .ok_or(TunnelError::SessionNotFound { ue_id, psi })?;
 
-        let header = GtpHeader::g_pdu(session.uplink_tunnel.teid, data);
+        // amfg-02: every uplink G-PDU MUST carry a UL PDU SESSION INFORMATION
+        // container (TS 38.415 §5.5.2.2) conveyed via the PDU Session Container
+        // GTP-U extension header (type 0x85, TS 29.281 §5.2.2.7). The QFI field
+        // is mandatory, so fall back to a default flow when none is assigned.
+        let qfi = match session.qfi {
+            Some(qfi) => qfi,
+            None => {
+                tracing::debug!(
+                    "uplink G-PDU for UE {} PSI {} has no QFI; defaulting to QFI {}",
+                    ue_id,
+                    psi,
+                    DEFAULT_UPLINK_QFI
+                );
+                DEFAULT_UPLINK_QFI
+            }
+        };
+
+        let header = GtpHeader::g_pdu(session.uplink_tunnel.teid, data)
+            .with_pdu_session_info(PduSessionInfo::uplink(qfi));
         Ok((header, session.uplink_tunnel.address))
     }
 
     /// Decapsulate received downlink data
     ///
-    /// Extracts the payload from a GTP-U message and identifies the target session.
+    /// Extracts the payload from a GTP-U message and identifies the target
+    /// session. The DL PDU SESSION INFORMATION container (TS 38.415 §5.5.2.1),
+    /// when present, also yields the QFI (for DRB/QoS-flow selection) and the
+    /// Reflective QoS Indicator (RQI).
     pub fn decapsulate_downlink<'a>(
         &self,
         header: &'a GtpHeader,
-    ) -> Result<(u32, u8, &'a Bytes), TunnelError> {
+    ) -> Result<DecapsulatedDownlink<'a>, TunnelError> {
         // Only handle G-PDU messages
         if header.message_type != GtpMessageType::GPdu {
             return Err(TunnelError::TunnelNotFound(header.teid));
@@ -252,8 +278,40 @@ impl TunnelManager {
             .find_by_downlink_teid(header.teid)
             .ok_or(TunnelError::TunnelNotFound(header.teid))?;
 
-        Ok((session.ue_id, session.psi, &header.payload))
+        // amfg-09: extract the DL QFI / RQI from the PDU Session Container, if
+        // the UPF included one.
+        let (qfi, rqi) = match header.pdu_session_info() {
+            Some(info) => (Some(info.qfi), info.rqi),
+            None => (None, false),
+        };
+
+        Ok(DecapsulatedDownlink {
+            ue_id: session.ue_id,
+            psi: session.psi,
+            qfi,
+            rqi,
+            payload: &header.payload,
+        })
     }
+}
+
+/// Result of decapsulating a downlink G-PDU.
+///
+/// Carries the identifying session keys plus the QoS metadata extracted from
+/// the DL PDU SESSION INFORMATION container (TS 38.415 §5.5.2.1) so the gNB can
+/// map the SDU onto the correct DRB / QoS flow toward the UE.
+#[derive(Debug, Clone)]
+pub struct DecapsulatedDownlink<'a> {
+    /// Target UE identifier.
+    pub ue_id: u32,
+    /// PDU session identifier.
+    pub psi: u8,
+    /// QoS Flow Identifier from the DL PDU Session Container, if present.
+    pub qfi: Option<u8>,
+    /// Reflective QoS Indicator (DL only).
+    pub rqi: bool,
+    /// Decapsulated user-plane payload.
+    pub payload: &'a Bytes,
 }
 
 #[cfg(test)]
@@ -442,6 +500,45 @@ mod tests {
         assert_eq!(header.teid, 0x1000);
         assert_eq!(header.payload, data);
         assert_eq!(addr, upf_addr);
+
+        // amfg-02: with no QFI assigned, the UL PDU SESSION INFORMATION
+        // container is present with the default flow QFI.
+        let info = header
+            .pdu_session_info()
+            .expect("uplink G-PDU must carry a PDU Session Container");
+        assert_eq!(info.qfi, DEFAULT_UPLINK_QFI);
+    }
+
+    #[test]
+    fn test_encapsulate_uplink_qfi_container_roundtrip() {
+        let mut manager = TunnelManager::new();
+        let upf_addr = make_test_addr(GTP_U_PORT);
+        let session = PduSession::new(
+            1,
+            5,
+            GtpTunnel::new(0x1000, upf_addr),
+            GtpTunnel::new(0x2000, make_test_addr(GTP_U_PORT)),
+        )
+        .with_qfi(9);
+        manager.create_session(session).unwrap();
+
+        let data = Bytes::from_static(b"qos payload");
+        let (header, _addr) = manager.encapsulate_uplink(1, 5, data.clone()).unwrap();
+
+        // The session QFI is carried in the UL PDU SESSION INFORMATION.
+        assert_eq!(header.pdu_session_info().unwrap().qfi, 9);
+
+        // Wire round-trip: encode the G-PDU and decode it back; the PDU Session
+        // Container (type 0x85) survives with the same QFI (TS 38.415).
+        let bytes = header.encode();
+        let decoded = GtpHeader::decode(&bytes).expect("decode G-PDU");
+        assert_eq!(decoded.message_type, GtpMessageType::GPdu);
+        assert_eq!(decoded.teid, 0x1000);
+        let info = decoded
+            .pdu_session_info()
+            .expect("decoded G-PDU must carry a PDU Session Container");
+        assert_eq!(info.qfi, 9);
+        assert_eq!(decoded.payload, data);
     }
 
     #[test]
@@ -460,10 +557,44 @@ mod tests {
         let payload = Bytes::from_static(b"downlink data");
         let header = GtpHeader::g_pdu(0x2000, payload.clone());
 
-        let (ue_id, psi, data) = manager.decapsulate_downlink(&header).unwrap();
-        assert_eq!(ue_id, 1);
-        assert_eq!(psi, 5);
-        assert_eq!(*data, payload);
+        let dl = manager.decapsulate_downlink(&header).unwrap();
+        assert_eq!(dl.ue_id, 1);
+        assert_eq!(dl.psi, 5);
+        assert_eq!(*dl.payload, payload);
+        // No PDU Session Container on this G-PDU.
+        assert_eq!(dl.qfi, None);
+        assert!(!dl.rqi);
+    }
+
+    #[test]
+    fn test_decapsulate_downlink_with_qfi_container() {
+        use crate::codec::PduSessionInfo;
+
+        let mut manager = TunnelManager::new();
+        let session = PduSession::new(
+            1,
+            5,
+            GtpTunnel::new(0x1000, make_test_addr(GTP_U_PORT)),
+            GtpTunnel::new(0x2000, make_test_addr(GTP_U_PORT)),
+        );
+        manager.create_session(session).unwrap();
+
+        // amfg-09: a DL G-PDU carrying a PDU Session Container with QFI 7 and
+        // the Reflective QoS Indicator set.
+        let payload = Bytes::from_static(b"qos downlink");
+        let info = PduSessionInfo::downlink(7).with_rqi(true);
+        let header = GtpHeader::g_pdu(0x2000, payload.clone()).with_pdu_session_info(info);
+
+        // Round-trip through the wire to prove the container survives encode.
+        let bytes = header.encode();
+        let decoded = GtpHeader::decode(&bytes).expect("decode DL G-PDU");
+
+        let dl = manager.decapsulate_downlink(&decoded).unwrap();
+        assert_eq!(dl.ue_id, 1);
+        assert_eq!(dl.psi, 5);
+        assert_eq!(dl.qfi, Some(7));
+        assert!(dl.rqi);
+        assert_eq!(*dl.payload, payload);
     }
 
     #[test]

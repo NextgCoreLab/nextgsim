@@ -521,19 +521,22 @@ mod registration_request_iei {
     /// NTN access barring (6G extension)
     pub const NTN_ACCESS_BARRING: u8 = 0xA5;
     /// SNPN NID (Rel-17, TS 23.501 §5.30 / TS 24.501). UE-included Network
-    /// Identifier of the SNPN being accessed, carried as a TLV value holding
-    /// the 11-hex-char NID string (44 bits per TS 23.003 §12.7).
+    /// Identifier of the SNPN being accessed, carried as a TLV whose value is
+    /// the 44-bit packed NID of TS 23.003 §12.7 (6 octets: assignment-mode
+    /// nibble first, then the 10-digit NID value MSB-first, trailing nibble
+    /// spare). See [`encode_nid_44bit`] / [`decode_nid_44bit`].
     pub const SNPN_NID: u8 = 0xA6;
     /// MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2 / TS 24.501).
     /// Type-4 TLV; a single value octet whose bit 1 carries the
     /// disaster-roaming registration indication so the AMF applies MINT /
     /// minimization-of-service-interruption handling for this subscription.
     pub const MINT_DISASTER_ROAMING: u8 = 0xA7;
-    /// UAV (aerial UE) indication (Rel-18, TS 23.256 / TS 24.501). Type-4 TLV
-    /// whose value carries bit 1 (aerial-UE flag) in the first octet followed
-    /// by the UAV CAA-level ID string, so the AMF can grant and track UAV
-    /// flight authorization (geofence) for this registration.
-    pub const UAV_INDICATION: u8 = 0xA8;
+    /// Service-level-AA container (Rel-17/18, TS 24.501 §9.11.2.10 / §8.2.6).
+    /// Type 6 (TLV-E) IE included when a UAS-capable UE registers for UAS
+    /// services; carries the CAA-level UAV ID as the Service-level device ID
+    /// parameter (§9.11.2.11, param IEI 0x10, UTF-8) so the AMF can grant and
+    /// geofence UAV flight authorization. (Replaces the prior bespoke 0xA8 TLV.)
+    pub const SERVICE_LEVEL_AA_CONTAINER: u8 = 0x72;
     /// RedCap (Reduced Capability) indication (Rel-17, TS 38.101): TLV whose
     /// single value octet carries bit 0 = reduced-capability device, so the AMF
     /// can apply a reduced UE/session-AMBR.
@@ -593,10 +596,12 @@ pub struct RegistrationRequest {
     /// (TS 23.761 §4.2). Set when this registration is for a MINT secondary
     /// subscription requesting disaster-roaming / service-continuity handling.
     pub disaster_roaming: bool,
-    /// UAV indication (optional, Type 4, IEI 0xA8) - Rel-18 (TS 23.256). When
-    /// `Some`, the UE registers as an aerial UE; the value is the UAV CAA-level
-    /// identifier (may be empty when only the aerial-UE capability is signalled)
-    /// used by the AMF to create the UAV flight-authorization context.
+    /// UAV CAA-level ID (optional) — Rel-17/18 (TS 24.501 §9.11.2.10). When
+    /// `Some`, the UE registers for UAS services; the value is the CAA-level
+    /// UAV ID (may be empty when only the UAS-capability is signalled), carried
+    /// on the wire as the Service-level device ID parameter inside the
+    /// Service-level-AA container (IEI 0x72). Drives the AMF's UAV
+    /// flight-authorization (geofence) context.
     pub uav_indication: Option<String>,
     /// RedCap (Reduced Capability) indication (optional, Type 4, IEI 0xA9) -
     /// Rel-17 (TS 38.101). Set when the UE is a reduced-capability device so
@@ -604,6 +609,86 @@ pub struct RegistrationRequest {
     /// signalling is modelled separately; this NAS indication is what reaches
     /// the core in the simulator's runtime registration path.)
     pub redcap: bool,
+}
+
+/// Encode an 11-hex-digit SNPN NID into the 44-bit packed form of TS 23.003
+/// §12.7: the assignment-mode nibble first, then the 10-digit NID value,
+/// MSB-first (high nibble of each octet carries the earlier digit). The result
+/// is 6 octets; the low nibble of the 6th octet is spare and set to 0. Returns
+/// `None` if `nid` is not exactly 11 hexadecimal digits.
+pub(crate) fn encode_nid_44bit(nid: &str) -> Option<[u8; 6]> {
+    let digits: Vec<u8> = nid
+        .chars()
+        .map(|c| c.to_digit(16).map(|d| d as u8))
+        .collect::<Option<Vec<u8>>>()?;
+    if digits.len() != 11 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, slot) in out.iter_mut().take(5).enumerate() {
+        *slot = (digits[2 * i] << 4) | digits[2 * i + 1];
+    }
+    out[5] = digits[10] << 4; // 11th nibble; low nibble spare (0)
+    Some(out)
+}
+
+/// Decode the 44-bit packed SNPN NID (TS 23.003 §12.7) back to its canonical
+/// 11-uppercase-hex-digit string. Requires at least 6 octets; only the first
+/// 44 bits are significant (the trailing nibble is spare and ignored).
+pub(crate) fn decode_nid_44bit(octets: &[u8]) -> Option<String> {
+    if octets.len() < 6 {
+        return None;
+    }
+    let mut s = String::with_capacity(11);
+    for &b in &octets[..5] {
+        s.push(char::from_digit((b >> 4) as u32, 16)?.to_ascii_uppercase());
+        s.push(char::from_digit((b & 0x0F) as u32, 16)?.to_ascii_uppercase());
+    }
+    s.push(char::from_digit((octets[5] >> 4) as u32, 16)?.to_ascii_uppercase());
+    Some(s)
+}
+
+/// Service-level-AA parameter IEI for the Service-level device ID (TS 24.501
+/// §9.11.2.10 Table 9.11.2.10.1 / §9.11.2.11) — a type-4 parameter whose value
+/// is the CAA-level UAV ID encoded as a UTF-8 string.
+pub(crate) const SLAA_PARAM_SERVICE_LEVEL_DEVICE_ID: u8 = 0x10;
+
+/// Encode the *contents* of a Service-level-AA container (TS 24.501 §9.11.2.10)
+/// carrying the UAS CAA-level UAV ID as the Service-level device ID parameter
+/// (§9.11.2.11, type-4: param-IEI 0x10, 1-octet length, UTF-8 value). The
+/// returned bytes are placed after the container IEI + 2-octet TLV-E length.
+pub(crate) fn encode_service_level_aa_container(caa_id: &str) -> Vec<u8> {
+    let id = caa_id.as_bytes();
+    let len = id.len().min(255); // Service-level device ID length field is 1 octet
+    let mut out = Vec::with_capacity(2 + len);
+    out.push(SLAA_PARAM_SERVICE_LEVEL_DEVICE_ID);
+    out.push(len as u8);
+    out.extend_from_slice(&id[..len]);
+    out
+}
+
+/// Parse a Service-level-AA container's contents (TS 24.501 §9.11.2.10) and
+/// return the CAA-level UAV ID from the Service-level device ID parameter
+/// (param-IEI 0x10, type-4). Unknown leading type-4 parameters are skipped per
+/// the spec's "ignore unknown IEI" rule. Only the Service-level device ID is
+/// consumed (the only parameter produced on the registration path); the broader
+/// UUAA UL-NAS-TRANSPORT parameters (payload/payload-type/response) are not yet
+/// handled here — see `WAVE6-DOWNGRADED-FEATURES.md` §6.
+pub(crate) fn decode_service_level_aa_container(bytes: &[u8]) -> Option<String> {
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        let ptype = bytes[i];
+        let plen = bytes[i + 1] as usize;
+        let start = i + 2;
+        if start + plen > bytes.len() {
+            break;
+        }
+        if ptype == SLAA_PARAM_SERVICE_LEVEL_DEVICE_ID {
+            return String::from_utf8(bytes[start..start + plen].to_vec()).ok();
+        }
+        i = start + plen;
+    }
+    None
 }
 
 impl Default for RegistrationRequest {
@@ -768,7 +853,7 @@ impl RegistrationRequest {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.uplink_data_status = Some(buf.get_u16());
+                    msg.uplink_data_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -782,7 +867,7 @@ impl RegistrationRequest {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_status = Some(buf.get_u16());
+                    msg.pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -850,7 +935,8 @@ impl RegistrationRequest {
                         msg.ntn_access_barring = Some(ie);
                     }
                 }
-                // SNPN NID (Rel-17, TS 23.501 §5.30): TLV string value
+                // SNPN NID (Rel-17, TS 23.501 §5.30): TLV carrying the 44-bit
+                // packed NID per TS 23.003 §12.7 (6 octets).
                 registration_request_iei::SNPN_NID => {
                     buf.advance(1);
                     if buf.remaining() == 0 {
@@ -862,7 +948,7 @@ impl RegistrationRequest {
                     }
                     let mut data = vec![0u8; len];
                     buf.copy_to_slice(&mut data);
-                    if let Ok(nid) = String::from_utf8(data) {
+                    if let Some(nid) = decode_nid_44bit(&data) {
                         msg.snpn_nid = Some(nid);
                     }
                 }
@@ -882,26 +968,21 @@ impl RegistrationRequest {
                         buf.advance(len - 1);
                     }
                 }
-                // UAV indication (Rel-18, TS 23.256): TLV with a flags octet
-                // (bit 1 = aerial UE) followed by the optional CAA-level ID.
-                registration_request_iei::UAV_INDICATION => {
+                // Service-level-AA container (Rel-17/18, TS 24.501 §9.11.2.10):
+                // type-6 (TLV-E, 2-octet length) container carrying the UAS
+                // CAA-level UAV ID as the Service-level device ID parameter.
+                registration_request_iei::SERVICE_LEVEL_AA_CONTAINER => {
                     buf.advance(1);
-                    if buf.remaining() == 0 {
+                    if buf.remaining() < 2 {
                         break;
                     }
-                    let len = buf.get_u8() as usize;
-                    if buf.remaining() < len || len < 1 {
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
                         break;
                     }
-                    let flags = buf.get_u8();
-                    let id_len = len - 1;
-                    let mut data = vec![0u8; id_len];
-                    if id_len > 0 {
-                        buf.copy_to_slice(&mut data);
-                    }
-                    if flags & 0x01 == 0x01 {
-                        msg.uav_indication = Some(String::from_utf8(data).unwrap_or_default());
-                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.uav_indication = decode_service_level_aa_container(&data);
                 }
                 // RedCap indication (Rel-17, TS 38.101): TLV with a single
                 // value octet; bit 0 is the reduced-capability flag.
@@ -988,13 +1069,13 @@ impl RegistrationRequest {
         if let Some(status) = self.uplink_data_status {
             buf.put_u8(registration_request_iei::UPLINK_DATA_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(status) = self.pdu_session_status {
             buf.put_u8(registration_request_iei::PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(ref container) = self.nas_message_container {
@@ -1039,11 +1120,15 @@ impl RegistrationRequest {
             ie.encode(buf);
         }
 
-        // SNPN NID (Rel-17, TS 23.501 §5.30): TLV with the NID string value
+        // SNPN NID (Rel-17, TS 23.501 §5.30 / TS 24.501): TLV carrying the NID
+        // in the 44-bit packed form of TS 23.003 §12.7 (6 octets). A NID that
+        // is not 11 hex digits is invalid and simply omitted.
         if let Some(ref nid) = self.snpn_nid {
-            buf.put_u8(registration_request_iei::SNPN_NID);
-            buf.put_u8(nid.len() as u8);
-            buf.put_slice(nid.as_bytes());
+            if let Some(packed) = encode_nid_44bit(nid) {
+                buf.put_u8(registration_request_iei::SNPN_NID);
+                buf.put_u8(packed.len() as u8);
+                buf.put_slice(&packed);
+            }
         }
 
         // MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2): TLV with
@@ -1054,13 +1139,15 @@ impl RegistrationRequest {
             buf.put_u8(0x01);
         }
 
-        // UAV indication (Rel-18, TS 23.256): TLV with a flags octet (bit 1 =
-        // aerial UE set) followed by the UAV CAA-level ID string, if any.
+        // Service-level-AA container (Rel-17/18, TS 24.501 §9.11.2.10 / §8.2.6):
+        // a UAS-capable UE registering for UAS services carries its CAA-level
+        // UAV ID as the Service-level device ID parameter (IEI 0x10) inside the
+        // type-6 (TLV-E, 2-octet length) container.
         if let Some(ref caa_id) = self.uav_indication {
-            buf.put_u8(registration_request_iei::UAV_INDICATION);
-            buf.put_u8((1 + caa_id.len()) as u8);
-            buf.put_u8(0x01); // aerial-UE flag
-            buf.put_slice(caa_id.as_bytes());
+            let contents = encode_service_level_aa_container(caa_id);
+            buf.put_u8(registration_request_iei::SERVICE_LEVEL_AA_CONTAINER);
+            buf.put_u16(contents.len() as u16);
+            buf.put_slice(&contents);
         }
 
         // RedCap (Reduced Capability) indication (Rel-17, TS 38.101): TLV with
@@ -1111,6 +1198,8 @@ mod registration_accept_iei {
     pub const MICO_INDICATION: u8 = 0xB;
     /// Network slicing indication
     pub const NETWORK_SLICING_INDICATION: u8 = 0x9;
+    /// Pending NSSAI (TS 24.501 Table 8.2.7.1.1, IEI 0x39, TLV, 9.11.3.37)
+    pub const PENDING_NSSAI: u8 = 0x39;
     /// Service area list
     pub const SERVICE_AREA_LIST: u8 = 0x27;
     /// T3512 value
@@ -1182,6 +1271,13 @@ pub struct RegistrationAccept {
     pub nssai_inclusion_mode: Option<NssaiInclusionMode>,
     /// Negotiated DRX parameters (optional, Type 4, IEI 0x51)
     pub negotiated_drx_parameters: Option<u8>,
+    /// Pending NSSAI (optional, Type 4, IEI 0x39, TS 24.501 9.11.3.37)
+    pub pending_nssai: Option<Vec<u8>>,
+    /// Network slicing subscription change indication (NSSCI bit, octet 1 bit 1)
+    /// of the Network slicing indication IE (Type 1, IEI nibble 0x9,
+    /// TS 24.501 9.11.3.36). `Some(true)` => "Network slicing subscription
+    /// changed".
+    pub network_slicing_subscription_change: Option<bool>,
     /// MICO indication (optional, Type 1, IEI 0xB)
     pub mico_indication: Option<IeMicoIndication>,
     /// LADN information (optional, Type 6, IEI 0x79)
@@ -1231,7 +1327,11 @@ impl RegistrationAccept {
                     continue;
                 }
                 0x9 => {
-                    // Network slicing indication
+                    // Network slicing indication (Type 1, TS 24.501 9.11.3.36).
+                    // octet 1 bit 1 = NSSCI (Network slicing subscription change
+                    // indication): 1 => "subscription changed". Bit 2 (DCNI) is
+                    // spare in the network-to-UE direction.
+                    msg.network_slicing_subscription_change = Some((iei & 0x01) != 0);
                     buf.advance(1);
                     continue;
                 }
@@ -1339,7 +1439,7 @@ impl RegistrationAccept {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_status = Some(buf.get_u16());
+                    msg.pdu_session_status = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -1353,7 +1453,7 @@ impl RegistrationAccept {
                     if buf.remaining() < len || len < 2 {
                         break;
                     }
-                    msg.pdu_session_reactivation_result = Some(buf.get_u16());
+                    msg.pdu_session_reactivation_result = Some(buf.get_u16_le());
                     if len > 2 {
                         buf.advance(len - 2);
                     }
@@ -1412,6 +1512,20 @@ impl RegistrationAccept {
                     if len > 1 {
                         buf.advance(len - 1);
                     }
+                }
+                registration_accept_iei::PENDING_NSSAI => {
+                    // Pending NSSAI (Type 4 TLV, TS 24.501 9.11.3.37)
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.pending_nssai = Some(data);
                 }
                 registration_accept_iei::LADN_INFORMATION => {
                     buf.advance(1);
@@ -1533,13 +1647,13 @@ impl RegistrationAccept {
         if let Some(status) = self.pdu_session_status {
             buf.put_u8(registration_accept_iei::PDU_SESSION_STATUS);
             buf.put_u8(2);
-            buf.put_u16(status);
+            buf.put_u16_le(status);
         }
 
         if let Some(result) = self.pdu_session_reactivation_result {
             buf.put_u8(registration_accept_iei::PDU_SESSION_REACTIVATION_RESULT);
             buf.put_u8(2);
-            buf.put_u16(result);
+            buf.put_u16_le(result);
         }
 
         if let Some(value) = self.t3512_value {
@@ -1568,6 +1682,20 @@ impl RegistrationAccept {
             buf.put_u8(registration_accept_iei::NEGOTIATED_DRX_PARAMETERS);
             buf.put_u8(1);
             buf.put_u8(drx);
+        }
+
+        if let Some(ref nssai) = self.pending_nssai {
+            buf.put_u8(registration_accept_iei::PENDING_NSSAI);
+            buf.put_u8(nssai.len() as u8);
+            buf.put_slice(nssai);
+        }
+
+        if let Some(changed) = self.network_slicing_subscription_change {
+            // Network slicing indication (Type 1, TS 24.501 9.11.3.36):
+            // high nibble = IEI, octet 1 bit 1 = NSSCI.
+            buf.put_u8(
+                (registration_accept_iei::NETWORK_SLICING_INDICATION << 4) | (changed as u8 & 0x01),
+            );
         }
 
         if let Some(ref mico) = self.mico_indication {
@@ -1997,17 +2125,39 @@ mod tests {
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 
-        // IEI 0xA6 + length 11 + the NID bytes must appear in the encoding.
-        assert!(buf.windows(2).any(|w| w[0] == 0xA6 && w[1] == 11));
+        // IEI 0xA6 + length 6 (the 44-bit packed NID per TS 23.003 §12.7).
+        assert!(buf.windows(2).any(|w| w[0] == 0xA6 && w[1] == 6));
 
         let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
         assert_eq!(decoded.snpn_nid.as_deref(), Some("7AB01234567"));
     }
 
     #[test]
-    fn test_registration_request_uav_indication_roundtrip() {
-        // UAV (Rel-18, TS 23.256): the aerial-UE indication plus CAA-level ID
-        // must survive an encode/decode roundtrip and only emit when set.
+    fn test_nid_44bit_codec() {
+        // TS 23.003 §12.7: 11 hex digits pack MSB-first into 6 octets, the
+        // last nibble spare. Verify the exact wire bytes and round-trip.
+        let packed = encode_nid_44bit("7AB01234567").unwrap();
+        assert_eq!(packed, [0x7A, 0xB0, 0x12, 0x34, 0x56, 0x70]);
+        assert_eq!(decode_nid_44bit(&packed).as_deref(), Some("7AB01234567"));
+
+        for nid in ["7AB01234567", "0A000000000", "FFFFFFFFFFF", "00000000000"] {
+            let p = encode_nid_44bit(nid).unwrap();
+            assert_eq!(p.len(), 6);
+            assert_eq!(decode_nid_44bit(&p).as_deref(), Some(nid));
+        }
+
+        // Non-conformant inputs are rejected (strict).
+        assert!(encode_nid_44bit("SHORT").is_none());
+        assert!(encode_nid_44bit("ZZZZZZZZZZ1").is_none());
+        assert!(encode_nid_44bit("7AB012345678").is_none()); // 12 digits
+        assert!(decode_nid_44bit(&[0x00; 5]).is_none()); // too short
+    }
+
+    #[test]
+    fn test_registration_request_uav_slaa_container_roundtrip() {
+        // UAS (Rel-17/18, TS 24.501 §9.11.2.10): the CAA-level UAV ID rides in
+        // the Service-level-AA container (IEI 0x72, TLV-E) as the Service-level
+        // device ID parameter (0x10, UTF-8). Must round-trip; emit only when set.
         let reg_type = Ie5gsRegistrationType::new(
             FollowOnRequest::NoPending,
             RegistrationType::InitialRegistration,
@@ -2015,22 +2165,45 @@ mod tests {
         let ng_ksi = NasKeySetIdentifier::no_key();
         let mobile_id = Ie5gsMobileIdentity::new(MobileIdentityType::Suci, vec![0x01, 0x02, 0x03]);
 
-        // Not set: IEI 0xA8 must be absent.
+        // Not set: container IEI 0x72 must be absent.
         let mut msg = RegistrationRequest::new(reg_type.clone(), ng_ksi.clone(), mobile_id.clone());
         msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
         let mut buf = Vec::new();
         msg.encode(&mut buf);
-        assert!(!buf.contains(&0xA8));
+        assert!(!buf.contains(&0x72));
 
-        // Set: IEI 0xA8, flags octet 0x01 then the CAA-level ID must roundtrip.
+        // Set: container IEI 0x72 + 2-octet length (0x000C=12) + contents
+        // [0x10, 10, "FAA-N12345"].
         let mut msg = RegistrationRequest::new(reg_type, ng_ksi, mobile_id);
         msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
         msg.uav_indication = Some("FAA-N12345".to_string());
         let mut buf = Vec::new();
         msg.encode(&mut buf);
-        assert!(buf.windows(2).any(|w| w[0] == 0xA8 && w[1] == 11));
+        assert!(buf.windows(5).any(|w| w == [0x72, 0x00, 12, 0x10, 10]));
         let decoded = RegistrationRequest::decode(&mut buf[3..].as_ref()).unwrap();
         assert_eq!(decoded.uav_indication.as_deref(), Some("FAA-N12345"));
+    }
+
+    #[test]
+    fn test_service_level_aa_container_codec() {
+        // TS 24.501 §9.11.2.10/§9.11.2.11: Service-level device ID param (0x10).
+        let c = encode_service_level_aa_container("FAA-N12345");
+        assert_eq!(c[0], 0x10);
+        assert_eq!(c[1], 10);
+        assert_eq!(&c[2..], b"FAA-N12345");
+        assert_eq!(
+            decode_service_level_aa_container(&c).as_deref(),
+            Some("FAA-N12345")
+        );
+        // Empty CAA-ID (UAS-capability signalled without an ID) round-trips.
+        let e = encode_service_level_aa_container("");
+        assert_eq!(decode_service_level_aa_container(&e).as_deref(), Some(""));
+        // An unknown leading type-4 parameter is skipped; device ID still found.
+        let mixed = [0x30, 0x02, 0xAA, 0xBB, 0x10, 0x03, b'A', b'B', b'C'];
+        assert_eq!(
+            decode_service_level_aa_container(&mixed).as_deref(),
+            Some("ABC")
+        );
     }
 
     #[test]

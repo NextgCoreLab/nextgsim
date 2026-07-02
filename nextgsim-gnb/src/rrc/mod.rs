@@ -79,6 +79,7 @@ pub mod handover;
 pub mod ntn_gnb;
 pub mod redcap;
 pub mod task;
+pub mod transaction;
 pub mod ue_context;
 
 // Re-export main types
@@ -103,4 +104,7 @@ pub use redcap::{
     RedCapUeCapabilities,
 };
 pub use task::RrcTask;
+pub use transaction::{
+    RrcProcedure, RrcTransactionAllocator, TidVerification, C5_TYPED_DCCH_DISPATCH,
+};
 pub use ue_context::{RrcState, RrcUeContext, RrcUeContextManager};

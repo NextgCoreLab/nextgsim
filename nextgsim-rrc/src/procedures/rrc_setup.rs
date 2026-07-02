@@ -387,16 +387,28 @@ pub struct RrcSetupCompleteParams {
     /// 5G-S-TMSI value (optional)
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
     /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.331 §6.2.2
-    /// `redCapIndication` in RRCSetupComplete-v1700-IEs). The Rel-15.6 ASN.1
-    /// schema used here predates the v1700 IE group, so the indication is
-    /// carried as a minimal TLV inside the spec-legal `lateNonCriticalExtension`
-    /// OCTET STRING container (the same octet-container pattern used to
-    /// ride later-release IEs over the Rel-15 schema).
+    /// `redCapIndication` in RRCSetupComplete-v1700-IEs).
+    ///
+    /// NOT WIRE-CONFORMANT (Wave 4 honest-defer): the `rrc-15.6.0` ASN.1 schema
+    /// used here predates the v1700 IE group, so there is no conformant slot for
+    /// `redCapIndication`. As a sim-internal stand-in it is carried as a private
+    /// marker TLV inside the structurally-opaque `lateNonCriticalExtension`
+    /// OCTET STRING (see [`REDCAP_LNCE_TAG`]). A real/independent gNB or UE will
+    /// NOT understand this marker; conformant AS-layer RedCap signalling requires
+    /// upgrading the RRC codec to Rel-17. The RedCap indication that actually
+    /// reaches the 5GC at runtime travels in the NAS path (Registration Request
+    /// RedCap IE 0xA9), independently of this field.
     pub redcap_indication: bool,
 }
 
-/// Tag for the RedCap indication TLV inside `lateNonCriticalExtension`.
-const REDCAP_LNCE_TAG: u8 = 0x52; // 'R'
+/// Private, sim-internal marker tag for the RedCap indication TLV carried inside
+/// the opaque `lateNonCriticalExtension` OCTET STRING. This is NOT a 3GPP IEI —
+/// `lateNonCriticalExtension` has no defined internal TLV structure at Rel-15.
+/// The value is chosen in the 0xF0-0xFF private range so it cannot be mistaken
+/// for a real RRC/NAS IE identifier (it previously aliased NAS IEI 0x52). True
+/// conformance requires a Rel-17 RRC codec; see
+/// [`RrcSetupCompleteParams::redcap_indication`].
+const REDCAP_LNCE_TAG: u8 = 0xFE;
 
 /// Parsed RRC Setup Complete data
 #[derive(Debug, Clone)]
@@ -500,8 +512,9 @@ pub fn build_rrc_setup_complete(
         .map(build_registered_amf)
         .transpose()?;
 
-    // RedCap indication (Rel-17): carried as a minimal TLV in the spec-legal
-    // lateNonCriticalExtension OCTET STRING when set.
+    // RedCap indication (Rel-17): carried as a sim-internal private-marker TLV
+    // inside the opaque lateNonCriticalExtension OCTET STRING when set. NOT 3GPP
+    // wire-conformant (see REDCAP_LNCE_TAG); a real peer ignores it.
     let late_non_critical_extension = if params.redcap_indication {
         Some(RRCSetupComplete_IEsLateNonCriticalExtension(vec![
             REDCAP_LNCE_TAG,
@@ -788,6 +801,90 @@ pub fn is_rrc_setup_complete(msg: &UL_DCCH_Message) -> bool {
     )
 }
 
+// ============================================================================
+// SRB1 Radio Bearer and Cell Group Config Builders (TS 38.331 §5.3.5.6.3)
+// ============================================================================
+
+/// Build a `RadioBearerConfig` that establishes SRB1.
+///
+/// Per TS 38.331 §5.3.5.6.3, RRCSetup SHALL include SRB1 in
+/// `srb-ToAddModList`. The SRB-Identity for SRB1 is 1
+/// (TS 38.331 §6.3.2: `SRB-Identity ::= INTEGER(1..3)`).
+/// All PDCP-Config fields are OPTIONAL and left absent for a
+/// minimal-valid configuration.
+///
+/// Wired into the gNB `build_rrc_setup` (Wave-6 C1). Wiring is
+/// leading-byte-invariant for the UE DL-CCCH dispatcher: the
+/// radioBearerConfig/masterCellGroup payload begins at bit 8 of the UPER
+/// stream, so byte 0 depends only on the CHOICE indices and the
+/// transaction id (0x20 for tid 0).
+pub fn build_srb1_radio_bearer_config() -> RadioBearerConfig {
+    let srb1 = SRB_ToAddMod {
+        srb_identity: SRB_Identity(1),
+        reestablish_pdcp: None,
+        discard_on_pdcp: None,
+        pdcp_config: None,
+    };
+    RadioBearerConfig {
+        srb_to_add_mod_list: Some(SRB_ToAddModList(vec![srb1])),
+        srb3_to_release: None,
+        drb_to_add_mod_list: None,
+        drb_to_release_list: None,
+        security_config: None,
+    }
+}
+
+/// Build a minimal-valid `CellGroupConfig` for SRB1.
+///
+/// Carries one `RLC_BearerConfig` with `logicalChannelIdentity = 1`
+/// serving `srb-Identity = 1` (TS 38.331 §6.3.2). The optional
+/// mac-CellGroupConfig, physicalCellGroupConfig, and spCellConfig are
+/// left absent — OPTIONAL fields in the ASN.1, and omitting them avoids
+/// fabricating deployment-specific PHY/MAC parameters.
+///
+/// Wired into the gNB `build_rrc_setup` (Wave-6 C1) via
+/// [`srb1_rrc_setup_params`].
+pub fn build_srb1_cell_group_config() -> CellGroupConfig {
+    let rlc_bearer = RLC_BearerConfig {
+        logical_channel_identity: LogicalChannelIdentity(1),
+        served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Srb_Identity(
+            SRB_Identity(1),
+        )),
+        reestablish_rlc: None,
+        rlc_config: None,
+        mac_logical_channel_config: None,
+    };
+    CellGroupConfig {
+        cell_group_id: CellGroupId(0),
+        rlc_bearer_to_add_mod_list: Some(CellGroupConfigRlc_BearerToAddModList(vec![rlc_bearer])),
+        rlc_bearer_to_release_list: None,
+        mac_cell_group_config: None,
+        physical_cell_group_config: None,
+        sp_cell_config: None,
+        s_cell_to_add_mod_list: None,
+        s_cell_to_release_list: None,
+    }
+}
+
+/// Build [`RrcSetupParams`] carrying the real SRB1 configuration
+/// (Wave-6 C1, TS 38.331 §5.3.3.4 / §5.3.5.6.3).
+///
+/// `radio_bearer_config` is the UPER encoding of
+/// [`build_srb1_radio_bearer_config`]; `master_cell_group` is the UPER
+/// encoding of [`build_srb1_cell_group_config`] — the RRCSetup-IEs field is
+/// `OCTET STRING (CONTAINING CellGroupConfig)` (TS 38.331 §6.2.2), so the
+/// CellGroupConfig is encoded standalone and wrapped as opaque octets by
+/// [`build_rrc_setup`].
+pub fn srb1_rrc_setup_params(rrc_transaction_id: u8) -> Result<RrcSetupParams, RrcSetupError> {
+    let radio_bearer_config = encode_rrc(&build_srb1_radio_bearer_config())?;
+    let master_cell_group = encode_rrc(&build_srb1_cell_group_config())?;
+    Ok(RrcSetupParams {
+        rrc_transaction_id,
+        radio_bearer_config,
+        master_cell_group,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,5 +1160,212 @@ mod tests {
             ..create_test_setup_complete_params()
         };
         assert!(build_rrc_setup_complete(&params).is_err());
+    }
+
+    // ========================================================================
+    // SRB1 Builder Tests (TS 38.331 §5.3.5.6.3)
+    // ========================================================================
+
+    #[test]
+    fn test_srb1_radio_bearer_config_roundtrip() {
+        let rbc = build_srb1_radio_bearer_config();
+        let bytes = encode_rrc(&rbc).expect("encode RadioBearerConfig");
+        let decoded: RadioBearerConfig = decode_rrc(&bytes).expect("decode RadioBearerConfig");
+        let srb_list = decoded
+            .srb_to_add_mod_list
+            .expect("srb_to_add_mod_list must be present");
+        assert_eq!(srb_list.0.len(), 1, "exactly one SRB-ToAddMod");
+        assert_eq!(srb_list.0[0].srb_identity.0, 1, "SRB-Identity must be 1");
+        // All optional fields must remain absent (no fabricated PDCP-Config)
+        assert!(decoded.drb_to_add_mod_list.is_none());
+        assert!(decoded.security_config.is_none());
+    }
+
+    #[test]
+    fn test_srb1_cell_group_config_roundtrip() {
+        let cgc = build_srb1_cell_group_config();
+        let bytes = encode_rrc(&cgc).expect("encode CellGroupConfig");
+        let decoded: CellGroupConfig = decode_rrc(&bytes).expect("decode CellGroupConfig");
+        assert_eq!(decoded.cell_group_id.0, 0, "cellGroupId must be 0");
+        let bearer_list = decoded
+            .rlc_bearer_to_add_mod_list
+            .expect("rlc_bearer_to_add_mod_list must be present");
+        assert_eq!(bearer_list.0.len(), 1, "exactly one RLC bearer");
+        let bearer = &bearer_list.0[0];
+        assert_eq!(bearer.logical_channel_identity.0, 1, "LCID must be 1");
+        match bearer
+            .served_radio_bearer
+            .as_ref()
+            .expect("servedRadioBearer must be present")
+        {
+            RLC_BearerConfigServedRadioBearer::Srb_Identity(id) => {
+                assert_eq!(id.0, 1, "served SRB-Identity must be 1");
+            }
+            other => panic!("expected Srb_Identity, got {other:?}"),
+        }
+        // Optional PHY/MAC fields must remain absent
+        assert!(decoded.mac_cell_group_config.is_none());
+        assert!(decoded.sp_cell_config.is_none());
+    }
+
+    // ========================================================================
+    // Wave-6 C1 — hand-derived golden byte vectors (TS 38.331 §6.2.2/§6.3.2,
+    // UPER per X.691). Derived BY HAND from tools/rrc-15.6.0.asn1, NOT
+    // produced by the encoder — a reviewer can re-derive every bit below.
+    // ========================================================================
+
+    /// RadioBearerConfig establishing SRB1, standalone UPER (13 bits):
+    ///
+    /// ```text
+    /// RadioBearerConfig ::= SEQUENCE { 5 OPTIONAL fields, ... }   (extensible)
+    ///   ext bit                       0
+    ///   presence (srb|srb3|drbAdd|drbRel|sec)   1 0 0 0 0
+    /// SRB-ToAddModList ::= SEQUENCE (SIZE(1..2)) — range 2 -> 1-bit length
+    ///   count 1 -> offset 0           0
+    /// SRB-ToAddMod ::= SEQUENCE { 3 OPTIONAL fields, ... }        (extensible)
+    ///   ext bit                       0
+    ///   presence (reestPDCP|discardPDCP|pdcp)   0 0 0
+    /// srb-Identity ::= INTEGER (1..3) — range 3 -> 2 bits
+    ///   value 1 -> offset 0           0 0
+    /// = 0100 0000 0000 0 + 3 pad bits -> 0x40 0x00
+    /// ```
+    const GOLDEN_SRB1_RADIO_BEARER_CONFIG: [u8; 2] = [0x40, 0x00];
+
+    /// CellGroupConfig with one RLC bearer (LCID 1) serving SRB1, standalone
+    /// UPER (28 bits):
+    ///
+    /// ```text
+    /// CellGroupConfig ::= SEQUENCE { 7 OPTIONAL fields, ... }     (extensible)
+    ///   ext bit                       0
+    ///   presence (rlcAdd|rlcRel|mac|phy|spCell|sCellAdd|sCellRel) 1 0 0 0 0 0 0
+    /// cellGroupId ::= INTEGER (0..3) — 2 bits, value 0            0 0
+    /// rlc-BearerToAddModList ::= SEQUENCE (SIZE(1..32)) — 5-bit length
+    ///   count 1 -> offset 0           0 0 0 0 0
+    /// RLC-BearerConfig ::= SEQUENCE { 4 OPTIONAL fields, ... }    (extensible)
+    ///   ext bit                       0
+    ///   presence (served|reestRLC|rlcCfg|macLch) 1 0 0 0
+    /// logicalChannelIdentity ::= INTEGER (1..32) — 5 bits, value 1 0 0 0 0 0
+    /// servedRadioBearer CHOICE {srb, drb} — 1 bit, srb-Identity   0
+    /// srb-Identity ::= INTEGER (1..3) — 2 bits, value 1           0 0
+    /// = 0100 0000 0000 0000 1000 0000 0000 + 4 pad -> 0x40 0x00 0x80 0x00
+    /// ```
+    const GOLDEN_SRB1_CELL_GROUP_CONFIG: [u8; 4] = [0x40, 0x00, 0x80, 0x00];
+
+    /// Full DL-CCCH RRCSetup with the SRB1 configuration, tid 0 (61 bits):
+    ///
+    /// ```text
+    /// DL-CCCH-Message ::= SEQUENCE { message DL-CCCH-MessageType }
+    /// DL-CCCH-MessageType ::= CHOICE {c1, ext} — 1 bit, c1        0
+    ///   c1 CHOICE {rrcReject, rrcSetup, spare2, spare1} — 2 bits,
+    ///   rrcSetup = index 1                                        0 1
+    /// rrc-TransactionIdentifier ::= INTEGER (0..3) — 2 bits, 0    0 0
+    /// criticalExtensions CHOICE {rrcSetup, future} — 1 bit        0
+    /// RRCSetup-IEs ::= SEQUENCE { 2 OPTIONAL ext fields } (NOT extensible)
+    ///   presence (lateNonCritical|nonCritical)                    0 0
+    ///   => byte0 = [0|01|00|0|00] = 0x20
+    /// radioBearerConfig: the 13 GOLDEN_SRB1_RADIO_BEARER_CONFIG bits (inline,
+    ///   unpadded)                     0100 0000 0000 0
+    /// masterCellGroup ::= OCTET STRING (CONTAINING CellGroupConfig):
+    ///   unconstrained length determinant, 1 octet (<128), value 4 0000 0100
+    ///   contents = GOLDEN_SRB1_CELL_GROUP_CONFIG (4 octets, unaligned)
+    ///                                 0100 0000 0000 0000 1000 0000 0000 0000
+    /// = 61 bits + 3 pad -> 0x20 0x40 0x00 0x22 0x00 0x04 0x00 0x00
+    /// ```
+    const GOLDEN_RRC_SETUP_SRB1_TID0: [u8; 8] = [0x20, 0x40, 0x00, 0x22, 0x00, 0x04, 0x00, 0x00];
+
+    #[test]
+    fn golden_srb1_radio_bearer_config_bytes() {
+        let bytes = encode_rrc(&build_srb1_radio_bearer_config()).expect("encode");
+        assert_eq!(
+            bytes,
+            GOLDEN_SRB1_RADIO_BEARER_CONFIG.to_vec(),
+            "SRB1 RadioBearerConfig must match the hand-derived UPER bytes"
+        );
+    }
+
+    #[test]
+    fn golden_srb1_cell_group_config_bytes() {
+        let bytes = encode_rrc(&build_srb1_cell_group_config()).expect("encode");
+        assert_eq!(
+            bytes,
+            GOLDEN_SRB1_CELL_GROUP_CONFIG.to_vec(),
+            "SRB1 CellGroupConfig must match the hand-derived UPER bytes"
+        );
+    }
+
+    /// Wave-6 H6 tier-2 — decoder golden for the standalone SRB1
+    /// RadioBearerConfig: the frozen bytes decode to exactly the builder's
+    /// struct, guarding decode-side drift independently of the encoder test.
+    #[test]
+    fn golden_srb1_radio_bearer_config_cross_decode() {
+        let decoded: RadioBearerConfig =
+            decode_rrc(&GOLDEN_SRB1_RADIO_BEARER_CONFIG).expect("decode RBC");
+        assert_eq!(decoded, build_srb1_radio_bearer_config());
+    }
+
+    /// Wave-6 H6 tier-2 — decoder golden for the standalone SRB1
+    /// CellGroupConfig.
+    #[test]
+    fn golden_srb1_cell_group_config_cross_decode() {
+        let decoded: CellGroupConfig =
+            decode_rrc(&GOLDEN_SRB1_CELL_GROUP_CONFIG).expect("decode CGC");
+        assert_eq!(decoded, build_srb1_cell_group_config());
+    }
+
+    #[test]
+    fn golden_rrc_setup_srb1_bytes() {
+        // Encoder output must equal the hand-derived literal (NOT a roundtrip).
+        let params = srb1_rrc_setup_params(0).expect("srb1 params");
+        let bytes = encode_rrc_setup(&params).expect("encode RRCSetup");
+        assert_eq!(
+            bytes,
+            GOLDEN_RRC_SETUP_SRB1_TID0.to_vec(),
+            "RRCSetup(SRB1, tid 0) must match the hand-derived UPER bytes"
+        );
+
+        // tid occupies bits 3..4 of byte 0 only: tid 2 -> byte0 0x30, rest
+        // identical (the Wave-6 C4-interim nibble-safe alternate value).
+        let params_tid2 = srb1_rrc_setup_params(2).expect("srb1 params tid 2");
+        let bytes_tid2 = encode_rrc_setup(&params_tid2).expect("encode RRCSetup tid 2");
+        let mut expected_tid2 = GOLDEN_RRC_SETUP_SRB1_TID0;
+        expected_tid2[0] = 0x30;
+        assert_eq!(bytes_tid2, expected_tid2.to_vec());
+    }
+
+    #[test]
+    fn golden_rrc_setup_srb1_cross_decode() {
+        // decode_rrc_setup(golden) must prove SRB1 present (srb-Identity 1)
+        // and a masterCellGroup that parses as CellGroupConfig with an RLC
+        // bearer LCID 1 serving SRB1.
+        let setup = decode_rrc_setup(&GOLDEN_RRC_SETUP_SRB1_TID0).expect("decode RRCSetup");
+        assert_eq!(setup.rrc_transaction_id, 0);
+
+        let rbc: RadioBearerConfig =
+            decode_rrc(&setup.radio_bearer_config).expect("decode RadioBearerConfig");
+        let srb_list = rbc
+            .srb_to_add_mod_list
+            .expect("srb-ToAddModList must be present (TS 38.331 §5.3.5.6.3)");
+        assert_eq!(srb_list.0.len(), 1);
+        assert_eq!(srb_list.0[0].srb_identity.0, 1, "SRB-Identity must be 1");
+
+        let cgc: CellGroupConfig =
+            decode_rrc(&setup.master_cell_group).expect("decode CellGroupConfig");
+        assert_eq!(cgc.cell_group_id.0, 0);
+        let bearers = cgc
+            .rlc_bearer_to_add_mod_list
+            .expect("rlc-BearerToAddModList must be present");
+        assert_eq!(bearers.0.len(), 1);
+        assert_eq!(
+            bearers.0[0].logical_channel_identity.0, 1,
+            "logicalChannelIdentity must be 1 for SRB1"
+        );
+        match bearers.0[0]
+            .served_radio_bearer
+            .as_ref()
+            .expect("servedRadioBearer must be present")
+        {
+            RLC_BearerConfigServedRadioBearer::Srb_Identity(id) => assert_eq!(id.0, 1),
+            other => panic!("expected Srb_Identity, got {other:?}"),
+        }
     }
 }

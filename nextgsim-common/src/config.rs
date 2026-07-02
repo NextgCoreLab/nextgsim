@@ -115,6 +115,10 @@ pub struct GnbConfig {
     pub energy_saving_enabled: bool,
     // ========================================================================
     // Rel-20 6G feature flags
+    //
+    // NOTE: "Rel-20" here is a research label, not a conformance claim — 3GPP
+    // Rel-20 (6G) has no frozen stage-3 spec. The flags below gate non-normative
+    // prototypes (design informed by TR 22.870 use cases); disabled by default.
     // ========================================================================
     /// Service Hosting Environment (SHE) task enabled (Rel-20)
     #[serde(default)]
@@ -151,6 +155,32 @@ pub struct GnbConfig {
     /// integrated.
     #[serde(default)]
     pub quic_enabled: bool,
+    /// NGAP SCTP transport backend: `"userspace"` (default) or `"kernel"`.
+    ///
+    /// * `"userspace"` — the in-process `sctp-proto`-over-UDP transport. This
+    ///   is the default and interoperates with the matching nextgcore
+    ///   simulator, but not with a real AMF (the wire is UDP, not SCTP).
+    /// * `"kernel"` — real kernel SCTP (IP protocol 132) via lksctp/libsctp,
+    ///   which is what lets the gNB associate with a real / Open5GS AMF. Only
+    ///   effective on a Linux build compiled with the gNB `kernel-sctp`
+    ///   feature; otherwise the connection fails loud at runtime.
+    #[serde(default)]
+    pub sctp_backend: SctpBackendKind,
+}
+
+/// gNB NGAP SCTP transport backend selector (deserialized from
+/// `sctp_backend: "userspace"|"kernel"` in the gNB YAML).
+///
+/// Defaults to [`SctpBackendKind::Userspace`] so existing configs and behavior
+/// are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SctpBackendKind {
+    /// Userspace `sctp-proto` over UDP (default; sim-to-sim only).
+    #[default]
+    Userspace,
+    /// Kernel SCTP (IP proto 132) via lksctp/libsctp (Linux + `kernel-sctp`).
+    Kernel,
 }
 
 fn default_gtp_port() -> u16 {
@@ -198,6 +228,7 @@ impl Default for GnbConfig {
             agent_enabled: false,
             federated_learning_enabled: false,
             quic_enabled: false,
+            sctp_backend: SctpBackendKind::Userspace,
         }
     }
 }
@@ -1079,6 +1110,10 @@ pub struct UeConfig {
     pub v2x_config: Option<V2xConfig>,
     // ========================================================================
     // Rel-20 6G feature flags
+    //
+    // NOTE: "Rel-20" here is a research label, not a conformance claim — 3GPP
+    // Rel-20 (6G) has no frozen stage-3 spec. The flags below gate non-normative
+    // prototypes (design informed by TR 22.870 use cases); disabled by default.
     // ========================================================================
     /// Service Hosting Environment (SHE) client task enabled (Rel-20)
     #[serde(default)]

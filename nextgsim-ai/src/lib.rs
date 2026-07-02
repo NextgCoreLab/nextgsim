@@ -1,7 +1,10 @@
 //! AI/ML Infrastructure for nextgsim
 //!
-//! This crate provides the core AI/ML infrastructure for 6G AI-native network functions,
-//! implementing production-quality inference engines using ONNX Runtime.
+//! This crate provides the core AI/ML infrastructure for 6G AI-native network functions.
+//! The **only operational inference backend** is `OnnxEngine` (ONNX Runtime). No `.onnx`
+//! model files ship with the repository, so callers that do not load a model at runtime
+//! receive non-neural fallback results from the using crate (e.g. mean-pooling in
+//! `nextgsim-semantic`, linear extrapolation in `nextgsim-nwdaf`).
 //!
 //! # Architecture
 //!
@@ -17,9 +20,9 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Supported Inference Backends
+//! # Operational Inference Backend
 //!
-//! - **ONNX Runtime**: Primary inference backend with GPU acceleration support
+//! - **ONNX Runtime** (`OnnxEngine`): the sole operational backend.
 //!   - CPU execution provider (default)
 //!   - CUDA execution provider (NVIDIA GPUs)
 //!   - `CoreML` execution provider (Apple Silicon)
@@ -42,12 +45,23 @@
 //! let output = engine.infer(&input)?;
 //! ```
 //!
-//! # 3GPP Compliance
+//! # Design alignment (non-conformant)
 //!
-//! This implementation supports the AI/ML framework requirements from:
+//! This crate provides inference infrastructure conceptually aligned with the
+//! AI/ML frameworks described in (not conformant to, not tested against):
 //! - 3GPP TS 23.288: Network Data Analytics Function (NWDAF)
 //! - 3GPP TR 23.700-80: Study on AI/ML for 5G System
 //! - 3GPP TS 23.558: Edge Computing
+//!
+//! No `.onnx` model ships; no analytics procedure of these specs is implemented.
+//!
+//! # TR 22.870 mapping
+//!
+//! Prototypes the AI/ML-service use cases of TR 22.870 (e.g. §6.12 6G System
+//! supporting AI model training service, §6.25 AI/ML model training and
+//! inference). TR 22.870 is a Stage-1 study; these are potential requirements
+//! with no Stage-3 wire spec — this crate is a research prototype, not a
+//! conformant implementation.
 
 pub mod config;
 pub mod error;
@@ -59,7 +73,6 @@ pub mod model;
 pub mod nr_models;
 pub mod semantic_pipeline;
 pub mod tensor;
-pub mod tflite;
 pub mod xr_traffic;
 
 // Re-export main types
@@ -76,7 +89,6 @@ pub use semantic_pipeline::{
     SemanticDecoding, SemanticEncoding, SemanticError, SemanticPipeline, SemanticPipelineBuilder,
 };
 pub use tensor::{TensorData, TensorShape};
-pub use tflite::TfLiteEngine;
 pub use xr_traffic::{
     CdrxState, PduSet, PduSetManager, Xr5Qi, XrCdrxController, XrFrame, XrQosFlow, XrTrafficModel,
 };

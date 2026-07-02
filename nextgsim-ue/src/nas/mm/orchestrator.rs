@@ -21,14 +21,22 @@
 //! procedures and drive `tick()` once a second; it returns [`MmOutput`]
 //! values describing NAS PDUs to transmit and procedure outcomes.
 
+use std::collections::HashMap;
+
 use tracing::{debug, info, warn};
 
 use nextgsim_common::config::{OpType, UeConfig};
-use nextgsim_crypto::kdf::{derive_kamf, derive_kausf, derive_kseaf, derive_res_star};
+use nextgsim_crypto::kdf::{derive_kamf, derive_kausf, derive_kgnb, derive_kseaf, derive_res_star};
 use nextgsim_crypto::milenage::{compute_opc, Milenage};
 use nextgsim_nas::enums::{MmMessageType, SecurityHeaderType};
 use nextgsim_nas::ies::ie1::{
     FollowOnRequest, Ie5gsRegistrationType, IeServiceType, RegistrationType, ServiceType,
+};
+use nextgsim_nas::messages::mm::ue_policy::{
+    ManageUePolicyCommand, ManageUePolicyCommandReject, ManageUePolicyComplete, PlmnId,
+    UePolicyError, UePolicyPart, UePolicyPartType, UePolicyResult, UePolicySectionManagementResult,
+    UePolicySectionManagementSubresult, UrspRule, CAUSE_PROTOCOL_ERROR_UNSPECIFIED, PCF_PTI_MAX,
+    PCF_PTI_MIN, UPDP_MSG_MANAGE_UE_POLICY_COMMAND,
 };
 use nextgsim_nas::messages::mm::{
     AuthenticationFailure, AuthenticationRequest, AuthenticationResponse,
@@ -67,11 +75,19 @@ pub const SQN_DELTA: u64 = 1 << 28;
 /// (same default as UERANSIM)
 const DEFAULT_IMEISV: &str = "4370816125816151";
 
-/// AMF-private 5GMM message type for the UAV tracking report (Rel-18,
-/// TS 23.256). The standard does not allocate a UE-originated tracking-report
-/// 5GMM message type; this simulator uses an unassigned 5GMM message-type code
-/// (the AMF dispatches it in its Uplink NAS Transport handler). Kept in sync
-/// with `nextgcore-amfd`'s `gmm_build::message_type::UAV_TRACKING_REPORT`.
+/// Sim-private message type for the UAV tracking report.
+///
+/// NOT 3GPP-conformant (Wave 4, T4.3 — honest reframe). Verified against
+/// TS 24.501 v18 §8.2.10 / §9.11.3.40: **there is no UE-originated UAV
+/// position/tracking NAS message** — real-time UAV tracking / Remote-ID is an
+/// **application-layer** function (USS/UTM "Network Remote ID" over the user
+/// plane), and network-based UAV location would use LCS (TS 23.273). This
+/// simulator models the telemetry over an unassigned 5GMM message-type code for
+/// a self-contained geofence demo; it has no conformant NAS equivalent and a
+/// real network would not accept it. (Conformant UAS *registration/UUAA* uses
+/// the Service-level-AA container — IEI 0x72 — which IS implemented.) Kept in
+/// sync with `nextgcore-amfd`'s `gmm_build::message_type::UAV_TRACKING_REPORT`.
+/// See `.context/WAVE6-DOWNGRADED-FEATURES.md` §6.
 pub const UAV_TRACKING_REPORT_MSG_TYPE: u8 = 0x6A;
 
 /// Decode a GPRS Timer 2 IE value octet (3GPP TS 24.008 Section 10.5.7.4)
@@ -95,6 +111,12 @@ pub enum MmOutput {
     SendNasPdu(Vec<u8>),
     /// The registration procedure completed successfully
     RegistrationSucceeded,
+    /// The equivalent-PLMN list was (re)signalled by the network in the
+    /// Registration Accept (TS 24.501 §5.5.1.2.4). Each entry is a 3-octet
+    /// BCD-encoded PLMN in the network-supplied priority order; an empty
+    /// vector means the list was deleted. The caller wires this into the
+    /// TS 23.122 PLMN selector so subsequent selection honours it.
+    EquivalentPlmnsUpdated(Vec<[u8; 3]>),
     /// The registration procedure failed terminally with the given cause
     RegistrationFailed(MmCause),
     /// The network rejected authentication; the USIM is considered invalid
@@ -105,6 +127,12 @@ pub enum MmOutput {
     /// the caller should dispatch it (identity, transport, config update,
     /// session management piggybacks, ...)
     NotHandled(Vec<u8>),
+    /// KgNB for AS-security activation, derived from KAMF and the uplink NAS
+    /// COUNT (TS 33.501 §6.9.4.1). Emitted once NAS security is active so the
+    /// caller hands it to the RRC plane (`RrcMessage::AsSecurityKey`) to derive
+    /// K_RRCint/K_RRCenc when the AS SecurityModeCommand arrives (Wave-6 I5).
+    /// Only produced when the `I5_UE_AS_SECURITY` wire gate is on.
+    AsSecurityKgnb([u8; 32]),
 }
 
 /// UE identity and credential material used by the MM procedures.
@@ -313,6 +341,38 @@ fn sqn_to_u64(sqn: &[u8; 6]) -> u64 {
     v
 }
 
+/// A stored UE policy section: the UE policy parts installed for one
+/// `(PLMN, UPSC)` key (TS 24.501 D.2.1.3 / D.3). Owned by the MM plane
+/// (never the SM orchestrator, which owns PDU-session logic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredUePolicySection {
+    /// The UE policy parts of the section (URSP, ANDSP, ...), as delivered.
+    pub parts: Vec<UePolicyPart>,
+}
+
+impl StoredUePolicySection {
+    /// The decoded URSP rules of the section's URSP part, if it carries one.
+    pub fn ursp_rules(&self) -> Option<Vec<UrspRule>> {
+        self.parts
+            .iter()
+            .find(|p| p.part_type == UePolicyPartType::Ursp)
+            .and_then(|p| p.decode_ursp().ok())
+    }
+}
+
+/// Result of handling a received "UE policy container": the UE policy delivery
+/// service message content to carry uplink (or nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UePolicyReaction {
+    /// Encoded MANAGE UE POLICY COMPLETE / COMMAND REJECT content to send in a
+    /// UL NAS TRANSPORT with payload container type "UE policy container"
+    /// (0b0101).
+    Reply(Vec<u8>),
+    /// The command was too malformed to even echo a PCF PTI: drop it without
+    /// replying (never a panic — remote-DoS caution).
+    Ignore,
+}
+
 /// 5GMM procedure orchestrator (UE side).
 pub struct MmOrchestrator {
     identity: MmUeIdentity,
@@ -341,6 +401,11 @@ pub struct MmOrchestrator {
     tai_list: Option<Vec<u8>>,
     allowed_nssai: Option<Vec<u8>>,
     current_tai: Option<[u8; 6]>,
+    /// Equivalent PLMN list signalled in the last Registration Accept
+    /// (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). Each entry is a 3-octet
+    /// BCD-encoded PLMN, in the network-supplied priority order. Replaced
+    /// on every Registration Accept (deleted when the IE is absent).
+    equivalent_plmns: Vec<[u8; 3]>,
     /// T3502 value signalled by the network (used at attempt exhaustion)
     t3502_value: Option<GprsTimer3>,
 
@@ -358,6 +423,10 @@ pub struct MmOrchestrator {
 
     // -- deregistration state --
     dereg_pdu: Option<Vec<u8>>,
+
+    // -- UE policy delivery service (UPDP, TS 24.501 Annex D) --
+    /// UE policy sections stored by `(PLMN, UPSC)` (TS 24.501 D.2.1.3 / D.3).
+    ue_policy_sections: HashMap<(PlmnId, u16), StoredUePolicySection>,
 }
 
 impl MmOrchestrator {
@@ -379,6 +448,7 @@ impl MmOrchestrator {
             tai_list: None,
             allowed_nssai: None,
             current_tai: None,
+            equivalent_plmns: Vec::new(),
             t3502_value: None,
             forbidden_plmns: Vec::new(),
             forbidden_tais_roaming: Vec::new(),
@@ -388,6 +458,7 @@ impl MmOrchestrator {
             usim_invalid: false,
             n1_mode_disabled: false,
             dereg_pdu: None,
+            ue_policy_sections: HashMap::new(),
         }
     }
 
@@ -430,6 +501,13 @@ impl MmOrchestrator {
     /// Registration area (TAI list) assigned by the network, if any
     pub fn tai_list(&self) -> Option<&[u8]> {
         self.tai_list.as_deref()
+    }
+
+    /// Equivalent PLMN list (TS 24.501 §5.5.1.2.4) signalled in the last
+    /// Registration Accept, as 3-octet BCD PLMNs in priority order. Empty when
+    /// the network never signalled one (or deleted it).
+    pub fn equivalent_plmns(&self) -> &[[u8; 3]] {
+        &self.equivalent_plmns
     }
 
     /// Allowed NSSAI assigned by the network, if any
@@ -629,7 +707,7 @@ impl MmOrchestrator {
         let mut req = RegistrationRequest::new(
             Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
             ng_ksi,
-            mobile_identity,
+            mobile_identity.clone(),
         );
         // Mandatory-for-security IEs: UE security capability (replayed by
         // the network in the Security Mode Command) and requested NSSAI
@@ -672,19 +750,54 @@ impl MmOrchestrator {
         let mut plain = Vec::new();
         req.encode(&mut plain);
 
+        // The FULL request (all IEs) is replayed in the Security Mode Complete
+        // NAS message container once security is up (TS 24.501 §4.4.6).
         self.last_registration_request = Some(plain.clone());
         self.pending_reg_type = reg_type;
         self.state.switch_mm_state(MmSubState::RegisteredInitiated);
         self.timers.start(TIMER_T3510, true);
         self.timers.stop(TIMER_T3511, true);
 
+        // TS 24.501 §4.4.6: an initial registration request sent WITHOUT
+        // integrity protection must carry cleartext IEs only. Non-cleartext IEs
+        // (requested NSSAI, last visited TAI, the Rel-17/18 indications) are
+        // deferred to the Security Mode Complete container above; a real AMF
+        // (Open5GS) rejects them in the clear with 5GMM cause #95 "semantically
+        // incorrect message". UE security capability and the NID *are* cleartext
+        // IEs, so they stay. When a security context is already active the full
+        // request is sent integrity-protected and all IEs are allowed.
+        let wire = if self.sec.is_active() {
+            plain
+        } else {
+            let mut ct = RegistrationRequest::new(
+                Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
+                NasKeySetIdentifier::no_key(),
+                mobile_identity,
+            );
+            ct.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
+            if let Some(ref nid) = self.identity.snpn_nid {
+                ct.snpn_nid = Some(nid.clone());
+            }
+            // ue-05: "UE determined PLMN with disaster condition" is a permitted
+            // cleartext IE (TS 24.501 §4.4.6), so when MINT disaster roaming is
+            // active it stays in the unprotected initial request rather than
+            // being deferred to the Security Mode Complete container.
+            if self.identity.disaster_roaming {
+                ct.disaster_roaming = true;
+            }
+            let mut ct_bytes = Vec::new();
+            ct.encode(&mut ct_bytes);
+            ct_bytes
+        };
+
         info!(
-            "Sending Registration Request ({:?}), len={}, T3510 started",
+            "Sending Registration Request ({:?}), len={}, cleartext_only={}, T3510 started",
             reg_type,
-            plain.len()
+            wire.len(),
+            !self.sec.is_active()
         );
 
-        let pdu = self.protect_if_active(plain);
+        let pdu = self.protect_if_active(wire);
         vec![MmOutput::SendNasPdu(pdu)]
     }
 
@@ -768,6 +881,23 @@ impl MmOrchestrator {
             warn!("Registration Accept without Allowed NSSAI (network not strict)");
         }
 
+        // Equivalent PLMN list (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). The list
+        // is replaced on every Registration Accept; an absent IE deletes it.
+        // The IE value is a sequence of 3-octet BCD PLMNs.
+        let new_equivalent_plmns: Vec<[u8; 3]> = acc
+            .equivalent_plmns
+            .as_deref()
+            .map(parse_equivalent_plmns)
+            .unwrap_or_default();
+        let equivalent_plmns_changed = new_equivalent_plmns != self.equivalent_plmns;
+        if equivalent_plmns_changed {
+            self.equivalent_plmns = new_equivalent_plmns;
+            info!(
+                "Registration Accept signalled {} equivalent PLMN(s)",
+                self.equivalent_plmns.len()
+            );
+        }
+
         // Periodic registration timer (T3512, GPRS timer 3)
         if let Some(t3512_byte) = acc.t3512_value {
             let timer3 = GprsTimer3::from_byte(t3512_byte);
@@ -785,19 +915,39 @@ impl MmOrchestrator {
         }
 
         let mut outs = Vec::new();
+        // TS 24.501 5.5.1.2.4: the UE acknowledges with Registration Complete
+        // whenever the Accept assigns a new 5G-GUTI, carries a Pending NSSAI IE,
+        // a Network slicing indication IE with the subscription-change indication
+        // set to "changed", or negotiated DRX parameters. The AMF runs T3550
+        // awaiting the acknowledgement, so gating the Complete on the GUTI alone
+        // would leave that timer to expire on any of these other Accepts.
+        let needs_ack = acc.guti.is_some()
+            || acc.pending_nssai.is_some()
+            || acc.network_slicing_subscription_change == Some(true)
+            || acc.negotiated_drx_parameters.is_some();
         if let Some(guti) = acc.guti {
             info!(
                 "Registration Accept assigned a new 5G-GUTI ({} bytes)",
                 guti.data.len()
             );
             self.stored_guti = Some(guti);
-            // TS 24.501 5.5.1.2.4: a new 5G-GUTI assignment must be
-            // acknowledged with Registration Complete (the AMF runs T3550)
+        }
+        if needs_ack {
             let mut complete = Vec::new();
             RegistrationComplete::new().encode(&mut complete);
             let pdu = self.protect_if_active(complete);
             info!("Sending Registration Complete");
             outs.push(MmOutput::SendNasPdu(pdu));
+        }
+        // Surface the equivalent-PLMN list so the caller can wire it into the
+        // TS 23.122 PLMN selector. Emitted only when the list changed (a list
+        // becomes non-empty, or a previously signalled list is cleared by a
+        // list-less Registration Accept), so a UE that never receives the IE
+        // produces no spurious output.
+        if equivalent_plmns_changed {
+            outs.push(MmOutput::EquivalentPlmnsUpdated(
+                self.equivalent_plmns.clone(),
+            ));
         }
         outs.push(MmOutput::RegistrationSucceeded);
         outs
@@ -1017,9 +1167,17 @@ impl MmOrchestrator {
         // Store the network-signalled ABBA (TS 33.501 Annex A.7)
         self.abba = req.abba.value.clone();
 
-        let (Some(rand_ie), Some(autn_ie)) = (&req.rand, &req.autn) else {
-            warn!("Authentication Request without RAND/AUTN (EAP-AKA' not supported)");
-            return Vec::new();
+        let (rand_ie, autn_ie) = match (&req.rand, &req.autn) {
+            (Some(r), Some(a)) => (r, a),
+            _ => {
+                // EAP-AKA' primary auth (TS 24.501 5.4.1.2, TS 33.501 6.1.3.1):
+                // RAND/AUTN are carried inside the EAP-Request/AKA'-Challenge.
+                if let Some(ref eap_ie) = req.eap_message {
+                    return self.handle_eap_aka_prime_challenge(&eap_ie.data, req.ng_ksi);
+                }
+                warn!("Authentication Request without RAND/AUTN and without EAP message: ignored");
+                return Vec::new();
+            }
         };
         let rand = &rand_ie.value;
         let autn = &autn_ie.value;
@@ -1119,6 +1277,138 @@ impl MmOrchestrator {
         vec![MmOutput::SendNasPdu(pdu)]
     }
 
+    /// EAP-AKA' primary authentication (TS 24.501 5.4.1.2, TS 33.501 6.1.3.1,
+    /// RFC 9048): called when an AUTHENTICATION REQUEST carries the EAP-message
+    /// IE instead of RAND/AUTN. Extracts AT_RAND/AT_AUTN/AT_KDF_INPUT from the
+    /// EAP-Request/AKA'-Challenge, verifies the AUTN MAC, checks the SQN, builds
+    /// an EAP-Response/AKA'-Challenge with AT_RES and AT_MAC, and derives the
+    /// KAUSF/KSEAF/KAMF key hierarchy.
+    fn handle_eap_aka_prime_challenge(
+        &mut self,
+        eap_bytes: &[u8],
+        ng_ksi: NasKeySetIdentifier,
+    ) -> Vec<MmOutput> {
+        use nextgsim_crypto::eap_aka_prime::run_eap_aka_prime;
+        use nextgsim_crypto::kdf::hmac_sha256;
+        use nextgsim_nas::{
+            decode_eap, encode_eap_to_vec, Eap, EapAkaPrime, EapAkaSubType, EapCode,
+        };
+
+        let Ok(eap) = decode_eap(&mut &eap_bytes[..]) else {
+            warn!("EAP-AKA': failed to decode EAP message");
+            return Vec::new();
+        };
+        let Eap::AkaPrime(ch) = eap else {
+            warn!("EAP-AKA': EAP message is not AKA'");
+            return Vec::new();
+        };
+        if ch.sub_type != EapAkaSubType::AkaChallenge {
+            warn!("EAP-AKA': expected AKA-Challenge, got {:?}", ch.sub_type);
+            return Vec::new();
+        }
+        let (Some(rand_v), Some(autn_v), Some(net_name)) = (
+            ch.attributes.get_rand(),
+            ch.attributes.get_autn(),
+            ch.attributes.get_kdf_input(),
+        ) else {
+            warn!("EAP-AKA' Challenge missing AT_RAND/AT_AUTN/AT_KDF_INPUT");
+            return Vec::new();
+        };
+        if rand_v.len() != 16 || autn_v.len() != 16 {
+            warn!(
+                "EAP-AKA' RAND/AUTN length mismatch: rand={}, autn={}",
+                rand_v.len(),
+                autn_v.len()
+            );
+            return Vec::new();
+        }
+        let mut rand = [0u8; 16];
+        rand.copy_from_slice(&rand_v);
+        let autn = &autn_v;
+
+        let m = Milenage::new(&self.identity.k, &self.identity.opc);
+        let ak = m.f5(&rand);
+        let mut sqn = [0u8; 6];
+        for i in 0..6 {
+            sqn[i] = autn[i] ^ ak[i];
+        }
+        let mut amf_autn = [0u8; 2];
+        amf_autn.copy_from_slice(&autn[6..8]);
+        let mac_autn = &autn[8..16];
+
+        if m.f1(&rand, &sqn, &amf_autn) != mac_autn {
+            warn!("EAP-AKA' AUTN MAC failure");
+            let rej = EapAkaPrime::authentication_reject(EapCode::Response, ch.id);
+            let resp =
+                AuthenticationResponse::with_eap_message(encode_eap_to_vec(&Eap::AkaPrime(rej)));
+            let mut pdu = Vec::new();
+            resp.encode(&mut pdu);
+            return vec![MmOutput::SendNasPdu(self.protect_if_active(pdu))];
+        }
+
+        if !self.sqn_in_range(&sqn) {
+            warn!(
+                "EAP-AKA' SQN out of range (received {:02x?}, SQN_MS {:02x?}): synch failure",
+                sqn, self.sqn_ms
+            );
+            let auts = self.compute_auts(&m, &rand);
+            let mut sync = EapAkaPrime::synchronization_failure(EapCode::Response, ch.id);
+            sync.attributes.put_auts(auts);
+            let resp =
+                AuthenticationResponse::with_eap_message(encode_eap_to_vec(&Eap::AkaPrime(sync)));
+            let mut pdu = Vec::new();
+            resp.encode(&mut pdu);
+            return vec![MmOutput::SendNasPdu(self.protect_if_active(pdu))];
+        }
+
+        self.sqn_ms = sqn;
+        let res = m.f2(&rand);
+        let ck = m.f3(&rand);
+        let ik = m.f4(&rand);
+
+        // SQN xor AK is the first 6 octets of AUTN (before MAC computation)
+        let mut sqn_xor_ak = [0u8; 6];
+        sqn_xor_ak.copy_from_slice(&autn[0..6]);
+
+        let (keys, kausf) = run_eap_aka_prime(
+            &ck,
+            &ik,
+            &net_name,
+            &sqn_xor_ak,
+            self.identity.supi.as_bytes(),
+        );
+
+        // Build EAP-Response/AKA'-Challenge with AT_RES and AT_MAC (RFC 9048 §9.4)
+        let mut resp_eap = EapAkaPrime::new(EapCode::Response, ch.id, EapAkaSubType::AkaChallenge);
+        resp_eap.attributes.put_res(&res);
+        resp_eap.attributes.put_mac(&[0u8; 16]); // placeholder for MAC computation
+        let mut eap_msg = Eap::AkaPrime(resp_eap);
+        // MAC covers the full EAP packet with AT_MAC zeroed, keyed by K_aut (RFC 9048 §6.3)
+        let full_mac = hmac_sha256(&keys.k_aut, &encode_eap_to_vec(&eap_msg));
+        if let Eap::AkaPrime(ref mut a) = eap_msg {
+            a.attributes.replace_mac(&full_mac[..16]);
+        }
+        let eap_response = encode_eap_to_vec(&eap_msg);
+
+        let kseaf = derive_kseaf(&kausf, &net_name);
+        let kamf = derive_kamf(&kseaf, self.identity.supi.as_bytes(), &self.abba);
+        self.sec.keys_mut().set_kausf(&kausf);
+        self.sec.keys_mut().set_kseaf(&kseaf);
+        self.sec.keys_mut().set_kamf(&kamf);
+        self.sec.keys_mut().abba = self.abba.clone();
+        self.sec.set_nas_ksi(ng_ksi);
+        self.sec.begin_establishing();
+        self.auth_failure_count = 0;
+
+        info!(
+            "EAP-AKA' challenge accepted; EAP-Response/AKA'-Challenge built, key hierarchy derived"
+        );
+        let resp = AuthenticationResponse::with_eap_message(eap_response);
+        let mut pdu = Vec::new();
+        resp.encode(&mut pdu);
+        vec![MmOutput::SendNasPdu(self.protect_if_active(pdu))]
+    }
+
     /// SQN acceptance check (TS 33.102 Annex C.2.1): the received SQN must
     /// be greater than the highest previously accepted SQN and within the
     /// wrap-around window delta.
@@ -1184,6 +1474,12 @@ impl MmOrchestrator {
     // Security mode control (TS 24.501 Section 5.4.2, TS 33.501 6.7.2)
     // ========================================================================
 
+    /// Whether the UE is operating in an emergency-services context, in which
+    /// the network is permitted to select NIA0 / NEA0 (TS 33.501 5.5.2).
+    fn in_emergency_context(&self) -> bool {
+        self.pending_reg_type == RegistrationType::EmergencyRegistration
+    }
+
     /// Handle a Security Mode Command received with a "new security
     /// context" security header (SHT 0x03/0x04). The NAS-MAC is verified
     /// with the *new* keys before the context is activated.
@@ -1236,6 +1532,14 @@ impl MmOrchestrator {
             );
             return self.send_security_mode_reject(MmCause::UeSecurityCapabilitiesMismatch);
         };
+        // TS 33.501 5.5.2 / TS 24.501 5.4.2.3: NIA0 (null integrity) may be
+        // selected only for an emergency-services / unauthenticated UE. Outside an
+        // emergency context an SMC selecting NIA0 is out-of-capability and must be
+        // rejected (otherwise it would silently drop NAS integrity protection).
+        if integ_alg == IntegrityAlgorithm::Nia0 && !self.in_emergency_context() {
+            warn!("SMC selected NIA0 (null integrity) outside an emergency context: rejecting");
+            return self.send_security_mode_reject(MmCause::UeSecurityCapabilitiesMismatch);
+        }
         if !alg_in_capability(self.identity.ea_cap, cipher_alg as u8)
             || (integ_alg != IntegrityAlgorithm::Nia0
                 && !alg_in_capability(self.identity.ia_cap, integ_alg as u8))
@@ -1300,7 +1604,7 @@ impl MmOrchestrator {
         // TS 24.501 5.4.1.3.3: stop T3516 on Security Mode Command
         self.timers.stop(TIMER_T3516, true);
         info!(
-            "Security context activated: NEA{} / NIA{}, ngKSI {}",
+            "Security Mode Command accepted: security context activated (NEA{} / NIA{}, ngKSI {})",
             cipher_alg as u8, integ_alg as u8, smc.ng_ksi.ksi
         );
 
@@ -1323,7 +1627,30 @@ impl MmOrchestrator {
             plain,
             SecurityHeaderType::IntegrityProtectedAndCipheredWithNewSecurityContext,
         );
-        vec![MmOutput::SendNasPdu(pdu)]
+        let mut outs = vec![MmOutput::SendNasPdu(pdu)];
+        // Wave-6 I5: once NAS security is active, hand the derived KgNB to the
+        // RRC plane so it can derive K_RRCint/K_RRCenc when the AS
+        // SecurityModeCommand arrives (TS 33.501 §6.9.4.1). Gated behind the
+        // AS-security wire knob; the exact uplink NAS COUNT the AMF uses for the
+        // KgNB derivation is a cross-stack detail verified in the docker E2E
+        // sign-off (hazard #269, host-only).
+        if crate::rrc::security::I5_UE_AS_SECURITY {
+            if let Some(kgnb) = self.derive_kgnb_for_as_security() {
+                outs.push(MmOutput::AsSecurityKgnb(kgnb));
+            }
+        }
+        outs
+    }
+
+    /// Derive KgNB for AS security from the active NAS context (TS 33.501
+    /// §6.9.4.1: `KgNB = KDF(KAMF, uplink NAS COUNT, 3GPP-access)`). Returns
+    /// `None` when no KAMF is available (NAS security not established). The gNB
+    /// receives the same KgNB from the AMF in the NGAP InitialContextSetupRequest
+    /// SecurityKey IE, so both ends derive identical K_RRCint/K_RRCenc.
+    pub fn derive_kgnb_for_as_security(&self) -> Option<[u8; 32]> {
+        let kamf = self.sec.keys().kamf()?;
+        let ul_count = self.sec.uplink_count().to_u32();
+        Some(derive_kgnb(kamf, ul_count, 0x01))
     }
 
     fn send_security_mode_reject(&mut self, cause: MmCause) -> Vec<MmOutput> {
@@ -1523,6 +1850,15 @@ impl MmOrchestrator {
         };
 
         if sht == SecurityHeaderType::NotProtected {
+            // TS 24.501 4.4.4.2 (last paragraph): once a secure exchange of NAS
+            // messages has been established, the UE shall discard any NAS
+            // signalling message received without integrity protection.
+            if self.sec.is_active() {
+                warn!(
+                    "Unprotected NAS message received after security activation: discarded (TS 24.501 4.4.4.2)"
+                );
+                return Vec::new();
+            }
             return self.handle_plain(raw.to_vec(), false);
         }
 
@@ -1576,6 +1912,17 @@ impl MmOrchestrator {
             warn!("Downlink NAS-MAC verification failed ({e}): message discarded");
             return Vec::new();
         }
+        // TS 24.501 4.4.3.1 / 4.4.4.2: after a successful integrity check the
+        // estimated downlink NAS COUNT must be strictly greater than the last
+        // accepted one; a replayed or non-monotonic COUNT is discarded.
+        if !self.sec.is_acceptable_downlink_count(&count) {
+            warn!(
+                "Downlink NAS COUNT {} not greater than last accepted {}: replay / non-monotonic, discarded",
+                count.to_u32(),
+                self.sec.downlink_count().to_u32()
+            );
+            return Vec::new();
+        }
         self.sec.update_downlink_count(&count);
 
         let mut plain = payload.to_vec();
@@ -1607,6 +1954,17 @@ impl MmOrchestrator {
         };
         debug!("5GMM message {:?} (protected={protected})", msg_type);
 
+        // TS 24.501 4.4.4.2: before a secure exchange is established, only a
+        // closed allow-list of messages may be processed without integrity
+        // protection. Anything else (e.g. REGISTRATION ACCEPT, SERVICE ACCEPT,
+        // CONFIGURATION UPDATE COMMAND) is discarded when received in the clear.
+        if !protected && !self.allowed_when_plain(msg_type, &plain) {
+            warn!(
+                "Plain (unprotected) {msg_type:?} not on the TS 24.501 4.4.4.2 allow-list: discarded"
+            );
+            return Vec::new();
+        }
+
         match msg_type {
             MmMessageType::AuthenticationRequest => self.handle_authentication_request(&plain),
             MmMessageType::AuthenticationReject => self.handle_authentication_reject(),
@@ -1622,6 +1980,211 @@ impl MmOrchestrator {
                 Vec::new()
             }
             _ => vec![MmOutput::NotHandled(plain)],
+        }
+    }
+
+    /// TS 24.501 4.4.4.2 allow-list: messages the UE may process when received
+    /// without integrity protection (before a secure exchange is established).
+    ///
+    /// `plain` is the inner 5GMM message (`plain[2]` = message type, `plain[3]`
+    /// = the first mandatory IE octet — the 5GMM cause for reject messages, or
+    /// the 5GS identity type for IDENTITY REQUEST).
+    fn allowed_when_plain(&self, msg_type: MmMessageType, plain: &[u8]) -> bool {
+        match msg_type {
+            // Authentication exchange runs before security is established.
+            MmMessageType::AuthenticationRequest
+            | MmMessageType::AuthenticationReject
+            | MmMessageType::AuthenticationResult => true,
+            // IDENTITY REQUEST is acceptable in the clear only when it requests
+            // the SUCI (5GS identity type 0b001); any other requested identity
+            // would leak a persistent identifier and must be protected.
+            MmMessageType::IdentityRequest => plain.get(3).is_some_and(|b| b & 0x0F == 0x01),
+            // A UE-originating DEREGISTRATION ACCEPT (non switch-off) is allowed.
+            MmMessageType::DeregistrationAcceptUeOriginating => true,
+            // REGISTRATION REJECT is processable in the clear only if its 5GMM
+            // cause is not #76/#78/#81/#82 (those drive persistent forbidden-list
+            // / SNPN state and must be integrity protected).
+            MmMessageType::RegistrationReject => !matches!(plain.get(3), Some(76 | 78 | 81 | 82)),
+            // SERVICE REJECT is processable in the clear only if its 5GMM cause
+            // is not #76/#78.
+            MmMessageType::ServiceReject => !matches!(plain.get(3), Some(76 | 78)),
+            // Everything else (REGISTRATION ACCEPT, SERVICE ACCEPT, CONFIGURATION
+            // UPDATE COMMAND, SECURITY MODE COMMAND, ...) must be protected.
+            _ => false,
+        }
+    }
+
+    // ========================================================================
+    // UE policy delivery service (UPDP) — TS 24.501 Annex D (Wave-6 E8)
+    // ========================================================================
+
+    /// Number of UE policy sections currently stored (test/observability hook).
+    pub fn ue_policy_section_count(&self) -> usize {
+        self.ue_policy_sections.len()
+    }
+
+    /// The stored UE policy section for `(plmn, upsc)`, if any (test hook).
+    pub fn ue_policy_section(&self, plmn: PlmnId, upsc: u16) -> Option<&StoredUePolicySection> {
+        self.ue_policy_sections.get(&(plmn, upsc))
+    }
+
+    /// Handle a received "UE policy container" payload (the MANAGE UE POLICY
+    /// COMMAND content carried in a DL NAS TRANSPORT, TS 24.501 D.2.1.3).
+    ///
+    /// Decodes the command, installs/replaces/deletes the addressed sections
+    /// keyed by `(PLMN, UPSC)` and returns the UE policy delivery service
+    /// message content to send back uplink:
+    ///
+    /// - all instructions stored → MANAGE UE POLICY COMPLETE (echoing the PTI);
+    /// - one or more instructions unstorable → MANAGE UE POLICY COMMAND REJECT
+    ///   with a per-instruction D.6.3 result (fail-closed: the UE never
+    ///   COMPLETEs a section it did not store);
+    /// - a malformed command still carrying a recoverable PCF PTI → REJECT
+    ///   (never a panic — remote-DoS caution mirroring the SM plane);
+    /// - a command too short to carry a PTI → [`UePolicyReaction::Ignore`].
+    pub fn handle_ue_policy_command(&mut self, container: &[u8]) -> UePolicyReaction {
+        match ManageUePolicyCommand::decode(container) {
+            Ok(cmd) => self.apply_ue_policy_command(&cmd),
+            Err(e) => {
+                warn!("MANAGE UE POLICY COMMAND decode failed ({e}); rejecting");
+                self.reject_unparseable_command(container)
+            }
+        }
+    }
+
+    /// Install/replace/delete the sections of a decoded command and build the
+    /// COMPLETE or COMMAND REJECT reply.
+    fn apply_ue_policy_command(&mut self, cmd: &ManageUePolicyCommand) -> UePolicyReaction {
+        let mut subresults: Vec<UePolicySectionManagementSubresult> = Vec::new();
+        for sublist in &cmd.sublists {
+            let mut failed: Vec<UePolicyResult> = Vec::new();
+            for (idx, instr) in sublist.instructions.iter().enumerate() {
+                // 1-based instruction order within the sublist contents (D.6.3).
+                let order = (idx + 1) as u16;
+                if instr.parts.is_empty() {
+                    // D.2.1.3: an instruction with no parts deletes the section.
+                    self.ue_policy_sections
+                        .remove(&(sublist.plmn_id, instr.upsc));
+                    debug!(
+                        "UE policy: deleted section (PLMN {:?}, UPSC {})",
+                        sublist.plmn_id, instr.upsc
+                    );
+                    continue;
+                }
+                // Fail-closed: validate every URSP part BEFORE storing anything
+                // for this instruction — never store a half-decoded section.
+                let storable = instr.parts.iter().all(|part| {
+                    if part.part_type == UePolicyPartType::Ursp {
+                        match part.decode_ursp() {
+                            Ok(_) => true,
+                            Err(e) => {
+                                warn!(
+                                    "UE policy: URSP part of (PLMN {:?}, UPSC {}) is \
+                                     undecodable: {e}",
+                                    sublist.plmn_id, instr.upsc
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        // Non-URSP part types are stored opaquely (framing was
+                        // already validated by the command decoder).
+                        true
+                    }
+                });
+                if storable {
+                    self.ue_policy_sections.insert(
+                        (sublist.plmn_id, instr.upsc),
+                        StoredUePolicySection {
+                            parts: instr.parts.clone(),
+                        },
+                    );
+                    debug!(
+                        "UE policy: stored section (PLMN {:?}, UPSC {}, {} part(s))",
+                        sublist.plmn_id,
+                        instr.upsc,
+                        instr.parts.len()
+                    );
+                } else {
+                    failed.push(UePolicyResult {
+                        upsc: instr.upsc,
+                        failed_instruction_order: order,
+                        cause: CAUSE_PROTOCOL_ERROR_UNSPECIFIED,
+                    });
+                }
+            }
+            if !failed.is_empty() {
+                subresults.push(UePolicySectionManagementSubresult {
+                    plmn_id: sublist.plmn_id,
+                    results: failed,
+                });
+            }
+        }
+
+        if subresults.is_empty() {
+            self.encode_updp_reply(
+                ManageUePolicyComplete { pti: cmd.pti }.encode(),
+                "MANAGE UE POLICY COMPLETE",
+            )
+        } else {
+            self.encode_updp_reply(
+                ManageUePolicyCommandReject {
+                    pti: cmd.pti,
+                    result: UePolicySectionManagementResult { subresults },
+                }
+                .encode(),
+                "MANAGE UE POLICY COMMAND REJECT",
+            )
+        }
+    }
+
+    /// Best-effort REJECT for a command that failed to frame-decode. Recovers
+    /// the PTI (octet 1) only when the message is at least PTI + message type,
+    /// is a MANAGE UE POLICY COMMAND and carries a PCF-allocated PTI; otherwise
+    /// a spec-valid (PTI 80H-FEH) REJECT cannot be formed and the command is
+    /// dropped.
+    fn reject_unparseable_command(&self, container: &[u8]) -> UePolicyReaction {
+        if container.len() < 2
+            || container[1] != UPDP_MSG_MANAGE_UE_POLICY_COMMAND
+            || !(PCF_PTI_MIN..=PCF_PTI_MAX).contains(&container[0])
+        {
+            return UePolicyReaction::Ignore;
+        }
+        let pti = container[0];
+        // The specific failed instruction cannot be identified in an
+        // unparseable command; report the home PLMN, UPSC 0, order 1.
+        let Ok(plmn_id) = PlmnId::from_bcd(self.identity.plmn_bcd) else {
+            return UePolicyReaction::Ignore;
+        };
+        let reject = ManageUePolicyCommandReject {
+            pti,
+            result: UePolicySectionManagementResult {
+                subresults: vec![UePolicySectionManagementSubresult {
+                    plmn_id,
+                    results: vec![UePolicyResult {
+                        upsc: 0,
+                        failed_instruction_order: 1,
+                        cause: CAUSE_PROTOCOL_ERROR_UNSPECIFIED,
+                    }],
+                }],
+            },
+        };
+        self.encode_updp_reply(reject.encode(), "MANAGE UE POLICY COMMAND REJECT")
+    }
+
+    /// Wrap an encoder result into a [`UePolicyReaction`]; an (unexpected)
+    /// encode failure drops the reply rather than sending malformed bytes.
+    fn encode_updp_reply(
+        &self,
+        encoded: Result<Vec<u8>, UePolicyError>,
+        what: &str,
+    ) -> UePolicyReaction {
+        match encoded {
+            Ok(bytes) => UePolicyReaction::Reply(bytes),
+            Err(e) => {
+                warn!("UE policy: failed to encode {what}: {e}");
+                UePolicyReaction::Ignore
+            }
         }
     }
 
@@ -1694,6 +2257,12 @@ fn parse_first_tai(tai_list: &[u8]) -> Option<[u8; 6]> {
     let mut tai = [0u8; 6];
     tai.copy_from_slice(&tai_list[1..7]);
     Some(tai)
+}
+
+/// Parse the Equivalent PLMNs IE value (TS 24.501 §9.11.3.45): a sequence of
+/// 3-octet BCD-encoded PLMNs. A trailing partial octet group is ignored.
+fn parse_equivalent_plmns(value: &[u8]) -> Vec<[u8; 3]> {
+    value.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
 }
 
 #[cfg(test)]
@@ -1930,15 +2499,30 @@ mod tests {
         assert!(orch.timers().t3510.is_running());
         assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
 
-        // Round-trip: the request must contain the UE security capability
-        // and the requested NSSAI
+        // TS 24.501 §4.4.6: the initial *unprotected* request carries cleartext
+        // IEs only. UE security capability is a cleartext IE (present); the
+        // requested NSSAI is non-cleartext and must NOT appear here (it is
+        // deferred to the Security Mode Complete NAS message container).
         let decoded = RegistrationRequest::decode(&mut &pdu[3..]).unwrap();
         assert_eq!(decoded.ue_security_capability, Some(vec![0xF0, 0x70]));
-        assert_eq!(decoded.requested_nssai, Some(vec![0x01, 0x01]));
+        assert_eq!(
+            decoded.requested_nssai, None,
+            "requested NSSAI is non-cleartext; it must not be sent in the clear"
+        );
         assert_eq!(
             decoded.mobile_identity.identity_type,
             MobileIdentityType::Suci
         );
+
+        // The FULL request (including the non-cleartext IEs) is stashed for
+        // replay inside the Security Mode Complete NAS message container.
+        let full = orch
+            .last_registration_request
+            .as_ref()
+            .expect("full registration request stashed for the SMC container");
+        let full_decoded = RegistrationRequest::decode(&mut &full[3..]).unwrap();
+        assert_eq!(full_decoded.requested_nssai, Some(vec![0x01, 0x01]));
+        assert_eq!(full_decoded.ue_security_capability, Some(vec![0xF0, 0x70]));
     }
 
     #[test]
@@ -1979,6 +2563,103 @@ mod tests {
         assert!(orch.stored_guti().is_none());
     }
 
+    /// Build a Registration Accept (no GUTI) carrying an Equivalent PLMNs IE
+    /// with the given 3-octet BCD PLMNs.
+    fn build_registration_accept_with_equivalent_plmns(plmns: &[[u8; 3]]) -> Vec<u8> {
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        let mut eq = Vec::new();
+        for p in plmns {
+            eq.extend_from_slice(p);
+        }
+        acc.equivalent_plmns = Some(eq);
+        let mut pdu = Vec::new();
+        acc.encode(&mut pdu);
+        pdu
+    }
+
+    #[test]
+    fn test_registration_accept_equivalent_plmns_parsed_and_emitted() {
+        let mut orch = establish_security_context();
+        // 999/71 BCD = [0x99, 0xF9, 0x17]; 310/410 (3-digit MNC) = [0x13, 0x00, 0x14]
+        let plmn_a = [0x99u8, 0xF9, 0x17];
+        let plmn_b = [0x13u8, 0x00, 0x14];
+        let plain_acc = build_registration_accept_with_equivalent_plmns(&[plmn_a, plmn_b]);
+        let protected = protect_downlink(&orch, &plain_acc, 1);
+
+        let outs = orch.handle_downlink(&protected);
+
+        // The orchestrator stored the decoded equivalent-PLMN list...
+        assert_eq!(orch.equivalent_plmns(), &[plmn_a, plmn_b]);
+        // ...and surfaced it to the caller before RegistrationSucceeded.
+        assert!(outs.contains(&MmOutput::EquivalentPlmnsUpdated(vec![plmn_a, plmn_b])));
+        assert!(outs.contains(&MmOutput::RegistrationSucceeded));
+        let eq_idx = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::EquivalentPlmnsUpdated(_)));
+        let ok_idx = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::RegistrationSucceeded));
+        assert!(eq_idx < ok_idx, "equivalent PLMNs must precede success");
+    }
+
+    #[test]
+    fn test_registration_accept_without_equivalent_plmns_no_emit() {
+        // A Registration Accept without the IE on a fresh UE leaves the list
+        // empty and produces no EquivalentPlmnsUpdated output.
+        let mut orch = establish_security_context();
+        let plain_acc = build_registration_accept_pdu(false);
+        let protected = protect_downlink(&orch, &plain_acc, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(orch.equivalent_plmns().is_empty());
+        assert!(!outs
+            .iter()
+            .any(|o| matches!(o, MmOutput::EquivalentPlmnsUpdated(_))));
+    }
+
+    #[test]
+    fn test_equivalent_plmn_from_accept_is_honored_by_selection() {
+        // End-to-end of T3.7a: an equivalent PLMN signalled in Registration
+        // Accept, parsed by the orchestrator, decoded into a Plmn and fed to
+        // the TS 23.122 PLMN selector, is chosen ahead of the HPLMN when the
+        // RPLMN is unavailable (TS 23.122 §4.4.3.1.1 step 1).
+        use crate::rrc::cell_selection::{plmn_from_bcd, Plmn, PlmnSelector};
+
+        let mut orch = establish_security_context();
+        // RPLMN = 999/71 (the visited network), equivalent PLMN = 310/410.
+        let rplmn_bcd = [0x99u8, 0xF9, 0x17]; // 999/71
+        let equiv_bcd = [0x13u8, 0x00, 0x14]; // 310/410
+        let plain_acc = build_registration_accept_with_equivalent_plmns(&[equiv_bcd]);
+        let protected = protect_downlink(&orch, &plain_acc, 1);
+        let outs = orch.handle_downlink(&protected);
+
+        // Extract the equivalent-PLMN list exactly as main.rs does.
+        let bcd_plmns = outs
+            .iter()
+            .find_map(|o| match o {
+                MmOutput::EquivalentPlmnsUpdated(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("EquivalentPlmnsUpdated output present");
+
+        let home = Plmn::new(999, 70, false);
+        let rplmn = plmn_from_bcd(&rplmn_bcd);
+        let equiv = plmn_from_bcd(&equiv_bcd);
+        assert_eq!(equiv, Plmn::new(310, 410, true));
+
+        let mut selector = PlmnSelector::new(home);
+        selector.set_registered_plmn(Some(rplmn));
+        selector.set_equivalent_plmns(bcd_plmns.iter().map(plmn_from_bcd).collect());
+
+        // RPLMN not in coverage; HPLMN and the equivalent PLMN are. The
+        // equivalent PLMN (of the RPLMN) outranks the HPLMN.
+        assert_eq!(selector.select(&[home, equiv]), Some(equiv));
+    }
+
     #[test]
     fn test_registration_reject_cause_3_terminal() {
         let mut orch = new_orch();
@@ -2010,6 +2691,290 @@ mod tests {
         assert_eq!(
             orch.state().mm_substate(),
             MmSubState::DeregisteredPlmnSearch
+        );
+    }
+
+    // ---- TS 24.501 4.4.4.2 downlink integrity-protection gating (ue-01) ----
+
+    #[test]
+    fn test_plain_registration_accept_discarded() {
+        // REGISTRATION ACCEPT is not on the 4.4.4.2 plain allow-list; received
+        // unprotected it must be discarded (no Registration Complete emitted).
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let plain_accept = build_registration_accept_pdu(true);
+        let outs = orch.handle_downlink(&plain_accept);
+        assert!(
+            outs.is_empty(),
+            "plain RegistrationAccept must be discarded"
+        );
+    }
+
+    #[test]
+    fn test_plain_registration_reject_cause76_discarded() {
+        // 4.4.4.2: a plain REGISTRATION REJECT with 5GMM cause #76 is discarded.
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let pdu = build_registration_reject_pdu(MmCause::NotAuthorizedForCag, None);
+        assert_eq!(pdu[3], 76, "cause octet should be #76");
+        let outs = orch.handle_downlink(&pdu);
+        assert!(
+            outs.is_empty(),
+            "plain RegistrationReject #76 must be discarded"
+        );
+        assert!(!outs.contains(&MmOutput::PlmnSearchNeeded));
+    }
+
+    #[test]
+    fn test_plain_registration_reject_cause11_processed() {
+        // 4.4.4.2: cause #11 (PLMN not allowed) is not in the excluded set, so a
+        // plain REGISTRATION REJECT carrying it is still processed.
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let pdu = build_registration_reject_pdu(MmCause::PlmnNotAllowed, None);
+        assert_eq!(pdu[3], 11);
+        let outs = orch.handle_downlink(&pdu);
+        assert!(outs.contains(&MmOutput::PlmnSearchNeeded));
+    }
+
+    #[test]
+    fn test_unprotected_discarded_after_security_activation() {
+        // 4.4.4.2 (last paragraph): after a secure exchange is established, ANY
+        // unprotected NAS message is discarded - even one otherwise on the plain
+        // allow-list (e.g. AUTHENTICATION REQUEST).
+        let mut orch = establish_security_context();
+        let plain_auth = build_auth_request_pdu([0, 0, 0, 0, 0, 2], [0x80, 0x00]);
+        assert!(orch.handle_downlink(&plain_auth).is_empty());
+        let plain_accept = build_registration_accept_pdu(true);
+        assert!(orch.handle_downlink(&plain_accept).is_empty());
+    }
+
+    #[test]
+    fn test_plain_auth_request_still_processed() {
+        // 4.4.4.2: AUTHENTICATION REQUEST stays processable before security is
+        // established (it is on the plain allow-list).
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let auth = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        let outs = orch.handle_downlink(&auth);
+        let resp = first_sent_pdu(&outs);
+        assert_eq!(resp[2], u8::from(MmMessageType::AuthenticationResponse));
+    }
+
+    #[test]
+    fn test_duplicate_downlink_pdu_replay_rejected() {
+        // TS 24.501 4.4.3.1 / 4.4.4.2 (ue-02): a replayed (duplicated) protected
+        // downlink message is discarded on the second delivery (non-monotonic
+        // NAS COUNT), producing no further MmOutput.
+        let mut orch = establish_security_context();
+        let accept = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        let first = orch.handle_downlink(&accept);
+        assert!(!first.is_empty(), "first delivery must be processed");
+        let second = orch.handle_downlink(&accept);
+        assert!(second.is_empty(), "replayed downlink PDU must be discarded");
+    }
+
+    #[test]
+    fn test_smc_nia0_rejected_outside_emergency() {
+        // ue-04: an SMC selecting NIA0 (null integrity) in a normal registration
+        // is rejected and does not activate the context (TS 33.501 5.5.2).
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let auth_pdu = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        orch.handle_downlink(&auth_pdu);
+        let smc = build_protected_smc(&orch, 2, 0, None); // NEA2 / NIA0
+        let outs = orch.handle_downlink(&smc);
+        let resp = first_sent_pdu(&outs);
+        assert_eq!(resp[2], u8::from(MmMessageType::SecurityModeReject));
+        assert!(!orch.security_context().is_active());
+    }
+
+    #[test]
+    fn test_smc_nia0_accepted_in_emergency() {
+        // ue-04: NIA0 is permitted during an emergency registration.
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::EmergencyRegistration);
+        let auth_pdu = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        orch.handle_downlink(&auth_pdu);
+        let smc = build_protected_smc(&orch, 2, 0, None); // NEA2 / NIA0
+        let outs = orch.handle_downlink(&smc);
+        let resp = first_sent_pdu(&outs);
+        // The SMC Complete is returned protected with the new context (SHT 0x04);
+        // an active context proves the NIA0 selection was accepted.
+        assert_eq!(resp[1], 0x04, "SMC Complete must use SHT 0x04");
+        assert!(orch.security_context().is_active());
+    }
+
+    #[test]
+    fn test_registration_complete_on_drx_without_guti() {
+        // ue-03: a Registration Accept that carries negotiated DRX parameters
+        // but assigns no new 5G-GUTI still triggers Registration Complete
+        // (TS 24.501 5.5.1.2.4); previously only a GUTI did.
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        acc.negotiated_drx_parameters = Some(0x01);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "DRX-only Accept must trigger Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_no_registration_complete_without_ack_ie() {
+        // ue-03: an Accept with neither a new GUTI nor any ack-triggering IE
+        // sends no Registration Complete.
+        let mut orch = establish_security_context();
+        let plain = build_registration_accept_pdu(false); // no GUTI, no DRX
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            !outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "Accept without an ack-triggering IE must not send Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_registration_complete_on_pending_nssai_without_guti() {
+        // ue-03-tail: a Registration Accept carrying a Pending NSSAI IE
+        // (TS 24.501 Table 8.2.7.1.1, IEI 0x39) but no new 5G-GUTI must still
+        // trigger Registration Complete (TS 24.501 5.5.1.2.4).
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        // One S-NSSAI (length 2: length-of-SST + SST)
+        acc.pending_nssai = Some(vec![0x02, 0x01, 0x01]);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        // The IE survives a round-trip (correct IEI framing, trailing IEs intact)
+        let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
+        assert_eq!(decoded.pending_nssai, Some(vec![0x02, 0x01, 0x01]));
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "Pending-NSSAI Accept must trigger Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_registration_complete_on_network_slicing_subscription_change() {
+        // ue-03-tail: a Network slicing indication IE with NSSCI = "changed"
+        // (TS 24.501 9.11.3.36, IEI nibble 0x9, octet-1 bit 1) triggers
+        // Registration Complete (TS 24.501 5.5.1.2.4 item a).
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        acc.network_slicing_subscription_change = Some(true);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        // 0x91 = IEI nibble 0x9 in the high nibble + NSSCI bit set
+        assert!(plain.contains(&0x91), "encoded NSSCI octet must be 0x91");
+        let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
+        assert_eq!(decoded.network_slicing_subscription_change, Some(true));
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "NSSCI=changed Accept must trigger Registration Complete"
+        );
+    }
+
+    #[test]
+    fn test_no_registration_complete_on_slicing_indication_not_changed() {
+        // ue-03-tail: a Network slicing indication IE present but with NSSCI = 0
+        // ("not changed") and no other ack-triggering IE must NOT send a
+        // Registration Complete.
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        acc.network_slicing_subscription_change = Some(false);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
+        assert_eq!(decoded.network_slicing_subscription_change, Some(false));
+        let protected = protect_downlink(&orch, &plain, 1);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            !outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "NSSCI=not-changed alone must not send Registration Complete"
+        );
+    }
+
+    /// Locate a contiguous byte subsequence; returns the start index if found.
+    fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn test_cleartext_registration_omits_disaster_ie_by_default() {
+        // ue-05 baseline: with disaster roaming inactive, the unprotected
+        // initial Registration Request carries no disaster-condition IE.
+        let mut orch = new_orch();
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        let wire = first_sent_pdu(&outs).to_vec();
+        // Not security-protected yet, so the wire is the raw cleartext request.
+        assert_eq!(wire[1], 0x00, "initial request must be plain (SHT 0)");
+        let decoded = RegistrationRequest::decode(&mut &wire[3..]).unwrap();
+        assert!(!decoded.disaster_roaming);
+        // MINT disaster-roaming IE (IEI 0xA7, TLV) must be absent.
+        assert!(
+            find_subseq(&wire, &[0xA7, 0x01, 0x01]).is_none(),
+            "no disaster-condition IE expected by default"
+        );
+    }
+
+    #[test]
+    fn test_cleartext_registration_includes_disaster_ie_when_active() {
+        // ue-05: when MINT disaster roaming is active the "UE determined PLMN
+        // with disaster condition" IE is a permitted cleartext IE (TS 24.501
+        // §4.4.6) and must appear in the unprotected initial request, which
+        // must remain decodable.
+        let mut id = test_identity();
+        id.disaster_roaming = true;
+        let mut orch = MmOrchestrator::new(id);
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        let wire = first_sent_pdu(&outs).to_vec();
+        assert_eq!(wire[1], 0x00, "initial request must be plain (SHT 0)");
+        let decoded = RegistrationRequest::decode(&mut &wire[3..]).unwrap();
+        assert!(
+            decoded.disaster_roaming,
+            "decoded request must carry the IE"
+        );
+        let ie_pos = find_subseq(&wire, &[0xA7, 0x01, 0x01])
+            .expect("disaster-condition IE must be present in the cleartext request");
+
+        // "Byte-identical to today" guarantee: the ONLY difference from the
+        // disaster-inactive cleartext request is the inserted 3-byte IE.
+        let mut baseline = new_orch();
+        let baseline_wire =
+            first_sent_pdu(&baseline.start_registration(RegistrationType::InitialRegistration))
+                .to_vec();
+        let mut without_ie = wire.clone();
+        without_ie.drain(ie_pos..ie_pos + 3);
+        assert_eq!(
+            without_ie, baseline_wire,
+            "disaster IE must be the sole addition to the cleartext request"
         );
     }
 
@@ -2831,5 +3796,296 @@ mod tests {
         // ia_cap 0x70 -> IA1..IA3, no IA0
         assert!(!alg_in_capability(0x70, 0));
         assert!(alg_in_capability(0x70, 2));
+    }
+
+    // ========================================================================
+    // EAP-AKA' authentication tests
+    // ========================================================================
+
+    /// Build an EAP-Request/AKA'-Challenge using the TS 35.207 Test Set 1
+    /// credentials. The AUTN is computed so it passes the f1 MAC check.
+    fn build_eap_aka_challenge(sqn: [u8; 6], amf: [u8; 2], net_name: &[u8]) -> Vec<u8> {
+        use nextgsim_nas::{
+            encode_eap_to_vec, Eap, EapAkaPrime, EapAkaSubType, EapAttributeType, EapCode,
+        };
+
+        let autn_v = build_autn(sqn, amf);
+        let mut ch = EapAkaPrime::new(EapCode::Request, 42, EapAkaSubType::AkaChallenge);
+
+        // AT_RAND: 2 reserved bytes + 16 RAND bytes (RFC 4187 §10.6)
+        let mut rand_attr = vec![0u8, 0u8];
+        rand_attr.extend_from_slice(&TEST_RAND);
+        ch.attributes
+            .put_raw_attribute(EapAttributeType::AtRand, rand_attr);
+
+        // AT_AUTN: 2 reserved bytes + 16 AUTN bytes (RFC 4187 §10.7)
+        let mut autn_attr = vec![0u8, 0u8];
+        autn_attr.extend_from_slice(&autn_v);
+        ch.attributes
+            .put_raw_attribute(EapAttributeType::AtAutn, autn_attr);
+
+        // AT_KDF_INPUT: 2-byte big-endian length + network name bytes (RFC 9048 §6.3.1)
+        let name_len = (net_name.len() as u16).to_be_bytes();
+        let mut kdf_input = vec![name_len[0], name_len[1]];
+        kdf_input.extend_from_slice(net_name);
+        ch.attributes
+            .put_raw_attribute(EapAttributeType::AtKdfInput, kdf_input);
+
+        // AT_KDF = 1 (RFC 9048 §3.3 key derivation function)
+        ch.attributes.put_kdf(1);
+
+        // AT_MAC: zero placeholder (UE implementation does not verify challenge AT_MAC)
+        ch.attributes.put_mac(&[0u8; 16]);
+
+        encode_eap_to_vec(&Eap::AkaPrime(ch))
+    }
+
+    #[test]
+    fn test_eap_aka_prime_challenge_success() {
+        use nextgsim_crypto::eap_aka_prime::run_eap_aka_prime;
+        use nextgsim_crypto::kdf::hmac_sha256;
+        use nextgsim_nas::{
+            decode_eap, encode_eap_to_vec, Eap, EapAkaPrime, EapAkaSubType, EapAttributeType,
+            EapCode,
+        };
+
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+
+        let sqn: [u8; 6] = [0, 0, 0, 0, 0, 1];
+        let amf: [u8; 2] = [0x80, 0x00]; // separation bit must be set
+        let net_name = b"5G:mnc070.mcc999.3gppnetwork.org";
+        let eap_challenge = build_eap_aka_challenge(sqn, amf, net_name);
+
+        let req = AuthenticationRequest::for_eap_aka(
+            NasKeySetIdentifier::new(nextgsim_nas::security::SecurityContextType::Native, 0),
+            Abba::new(vec![0x00, 0x00]),
+            eap_challenge,
+        );
+        let mut pdu = Vec::new();
+        req.encode(&mut pdu);
+
+        let outs = orch.handle_downlink(&pdu);
+        let resp_bytes = first_sent_pdu(&outs);
+
+        // Response must be an AuthenticationResponse
+        assert_eq!(
+            resp_bytes[2],
+            u8::from(MmMessageType::AuthenticationResponse),
+            "expected AuthenticationResponse message type"
+        );
+
+        let decoded_resp = AuthenticationResponse::decode(&mut &resp_bytes[3..]).unwrap();
+        let eap_resp_data = decoded_resp
+            .eap_message
+            .expect("EAP message missing in response")
+            .data;
+
+        // Decode the EAP-Response/AKA'-Challenge
+        let resp_eap = decode_eap(&mut &eap_resp_data[..]).unwrap();
+        let Eap::AkaPrime(resp_aka) = resp_eap else {
+            panic!("expected EAP AKA' response");
+        };
+        assert_eq!(
+            resp_aka.code,
+            EapCode::Response,
+            "EAP code must be Response"
+        );
+        assert_eq!(
+            resp_aka.sub_type,
+            EapAkaSubType::AkaChallenge,
+            "EAP subtype must be AKA-Challenge"
+        );
+
+        // Derive expected values independently from TS 35.207 Test Set 1
+        let m = Milenage::new(&TEST_K, &compute_opc(&TEST_K, &TEST_OP));
+        let expected_res = m.f2(&TEST_RAND);
+        let ck = m.f3(&TEST_RAND);
+        let ik = m.f4(&TEST_RAND);
+        let ak = m.f5(&TEST_RAND);
+        let mut sqn_xor_ak = [0u8; 6];
+        for i in 0..6 {
+            sqn_xor_ak[i] = sqn[i] ^ ak[i];
+        }
+        let supi = "999700000000001";
+        let (keys, _kausf) = run_eap_aka_prime(&ck, &ik, net_name, &sqn_xor_ak, supi.as_bytes());
+
+        // AT_RES: put_res stores 2-byte bit-length prefix then the RES bytes
+        let (_, res_raw) = resp_aka
+            .attributes
+            .iter_ordered()
+            .find(|(k, _)| *k == EapAttributeType::AtRes)
+            .expect("AT_RES missing in EAP response");
+        assert_eq!(
+            &res_raw[2..],
+            &expected_res[..],
+            "AT_RES must equal Milenage f2(RAND)"
+        );
+
+        // AT_MAC: rebuild the response with MAC zeroed (same attribute order as impl)
+        // and recompute HMAC-SHA-256, truncated to 128 bits (RFC 9048 §6.3)
+        let mut verify_msg =
+            EapAkaPrime::new(EapCode::Response, resp_aka.id, EapAkaSubType::AkaChallenge);
+        verify_msg.attributes.put_res(&expected_res);
+        verify_msg.attributes.put_mac(&[0u8; 16]);
+        let zeroed_bytes = encode_eap_to_vec(&Eap::AkaPrime(verify_msg));
+        let computed_mac = hmac_sha256(&keys.k_aut, &zeroed_bytes);
+
+        // get_mac() strips the 2-byte reserved prefix and returns the 16-byte MAC
+        let received_mac = resp_aka
+            .attributes
+            .get_mac()
+            .expect("AT_MAC missing in EAP response");
+        assert_eq!(
+            received_mac,
+            &computed_mac[..16],
+            "AT_MAC must be HMAC-SHA-256(K_aut, zeroed_packet)[..16]"
+        );
+
+        // Key hierarchy must be derived after EAP-AKA'
+        assert!(
+            orch.security_context().keys().has_kamf(),
+            "KAMF must be derived after EAP-AKA' challenge"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // UE policy delivery service (UPDP) — Wave-6 E8
+    // ------------------------------------------------------------------------
+
+    /// E1 vector (f): complete MANAGE UE POLICY COMMAND content, re-cited
+    /// verbatim from the hand-derived E1 golden vectors in
+    /// nextgcore/src/libs/nextgcore-nas/tests/ue_policy_golden_vectors/data.rs.
+    /// These bytes are the exact output of the INDEPENDENT nextgcore encoder,
+    /// so decoding them here is the cross-stack strict-peer oracle: the two
+    /// codecs must agree byte-for-byte. (PTI 0x80; one PLMN 001/01 sublist; one
+    /// UPSC-1 instruction; one URSP part = catch-all rule → internet.)
+    const E1_VEC_F_COMMAND: &[u8] = &[
+        0x80, 0x01, 0x00, 0x2B, 0x00, 0x29, 0x00, 0xF1, 0x10, 0x00, 0x24, 0x00, 0x01, 0x00, 0x20,
+        0x01, 0x00, 0x1D, 0xFF, 0x00, 0x01, 0x01, 0x00, 0x17, 0x00, 0x15, 0xFF, 0x00, 0x12, 0x01,
+        0x01, 0x02, 0x01, 0x01, 0x04, 0x09, 0x08, 0x69, 0x6E, 0x74, 0x65, 0x72, 0x6E, 0x65, 0x74,
+        0x08, 0x03,
+    ];
+
+    fn plmn_001_01() -> PlmnId {
+        PlmnId {
+            mcc: [0, 0, 1],
+            mnc: [0, 1, 0],
+            mnc_len: 2,
+        }
+    }
+
+    #[test]
+    fn test_ue_policy_command_stores_and_completes() {
+        use nextgsim_nas::messages::mm::ue_policy::TrafficDescriptorComponent;
+        let mut orch = new_orch();
+        let reaction = orch.handle_ue_policy_command(E1_VEC_F_COMMAND);
+        // COMPLETE echoes the command PTI (0x80) + message type 0x02.
+        assert_eq!(reaction, UePolicyReaction::Reply(vec![0x80, 0x02]));
+        // Exactly one section stored, at (PLMN 001/01, UPSC 1).
+        assert_eq!(orch.ue_policy_section_count(), 1);
+        let section = orch
+            .ue_policy_section(plmn_001_01(), 1)
+            .expect("section (001/01, UPSC 1) must be stored");
+        let rules = section.ursp_rules().expect("URSP rules present");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].precedence, 255);
+        assert_eq!(
+            rules[0].traffic_descriptor,
+            vec![TrafficDescriptorComponent::MatchAll]
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_complete_pti_is_echoed() {
+        // A different PCF PTI must be echoed verbatim in the COMPLETE.
+        let mut cmd = E1_VEC_F_COMMAND.to_vec();
+        cmd[0] = 0xC7;
+        let mut orch = new_orch();
+        assert_eq!(
+            orch.handle_ue_policy_command(&cmd),
+            UePolicyReaction::Reply(vec![0xC7, 0x02])
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_malformed_command_rejects_not_crash() {
+        let mut orch = new_orch();
+        // Truncate the command anywhere past its PTI/type/length header: the
+        // declared list length no longer matches the bytes present, so the UE
+        // must answer a REJECT (never panic) and must NOT store anything.
+        for cut in 4..E1_VEC_F_COMMAND.len() {
+            match orch.handle_ue_policy_command(&E1_VEC_F_COMMAND[..cut]) {
+                UePolicyReaction::Reply(bytes) => {
+                    assert_eq!(bytes[0], 0x80, "REJECT must echo the PTI");
+                    assert_eq!(bytes[1], 0x03, "message type must be COMMAND REJECT");
+                }
+                UePolicyReaction::Ignore => {}
+            }
+        }
+        assert_eq!(
+            orch.ue_policy_section_count(),
+            0,
+            "a rejected command stores nothing (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_delete_section() {
+        let mut orch = new_orch();
+        assert_eq!(
+            orch.handle_ue_policy_command(E1_VEC_F_COMMAND),
+            UePolicyReaction::Reply(vec![0x80, 0x02])
+        );
+        assert_eq!(orch.ue_policy_section_count(), 1);
+        // A command with a single instruction carrying UPSC 1 and NO parts
+        // deletes the section (TS 24.501 D.2.1.3).
+        let delete_cmd = [
+            0x80u8, 0x01, 0x00, 0x09, 0x00, 0x07, 0x00, 0xF1, 0x10, 0x00, 0x02, 0x00, 0x01,
+        ];
+        assert_eq!(
+            orch.handle_ue_policy_command(&delete_cmd),
+            UePolicyReaction::Reply(vec![0x80, 0x02])
+        );
+        assert_eq!(
+            orch.ue_policy_section_count(),
+            0,
+            "an empty-parts instruction deletes the section"
+        );
+    }
+
+    #[test]
+    fn test_ue_policy_too_short_is_ignored() {
+        let mut orch = new_orch();
+        // < 2 octets: no PTI can be recovered → dropped (no reply, no crash).
+        assert_eq!(
+            orch.handle_ue_policy_command(&[0x80]),
+            UePolicyReaction::Ignore
+        );
+        assert_eq!(orch.handle_ue_policy_command(&[]), UePolicyReaction::Ignore);
+        assert_eq!(orch.ue_policy_section_count(), 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Wave-6 I5 — NAS-plane KgNB derivation for AS security
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_kgnb_for_as_security() {
+        use nextgsim_crypto::kdf::derive_kgnb;
+        let mut orch = new_orch();
+        // No KAMF yet → None (NAS security not established).
+        assert!(orch.derive_kgnb_for_as_security().is_none());
+
+        // Seed a KAMF; KgNB must equal derive_kgnb(KAMF, uplink NAS COUNT,
+        // 3GPP-access) — the same value the AMF sends the gNB as SecurityKey
+        // (TS 33.501 §6.9.4.1).
+        let kamf = [0x22u8; 32];
+        orch.sec.keys_mut().set_kamf(&kamf);
+        let ul = orch.sec.uplink_count().to_u32();
+        assert_eq!(
+            orch.derive_kgnb_for_as_security(),
+            Some(derive_kgnb(&kamf, ul, 0x01))
+        );
     }
 }

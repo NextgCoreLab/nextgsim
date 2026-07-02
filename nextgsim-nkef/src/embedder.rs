@@ -1,11 +1,13 @@
-//! Text embedding generation using TF-IDF and ONNX models
+//! Text embedding generation (TF-IDF; optional ONNX)
 //!
-//! Provides embedding generation through two methods:
-//! - `TextEmbedder`: TF-IDF based embeddings (fast, lightweight, no external model needed)
-//! - `OnnxEmbedder`: Neural network embeddings using ONNX models (higher quality)
-//!
-//! For production deployments, `OnnxEmbedder` can load sentence-transformer models
-//! via `nextgsim-ai` for semantic embeddings.
+//! OPERATIONAL PATH: the simulator ships no ONNX model, so the embeddings that
+//! actually run are:
+//! - `TextEmbedder`: TF-IDF embeddings (fast, lightweight, no external model) —
+//!   the primary operational embedder.
+//! - `OnnxEmbedder`: with no model loaded (the default) it falls back to a
+//!   deterministic hash-based multi-scale mock (`mock_neural_embedding`), NOT a
+//!   neural network. It can load a sentence-transformer model via `nextgsim-ai`
+//!   if one is provided, but none is shipped with the simulator.
 
 use std::collections::{HashMap, HashSet};
 
@@ -228,6 +230,18 @@ fn hash_sign(term: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Honesty guard: the neural embedder must stay labelled as a mock so the
+    /// caveat cannot be silently dropped. If this fails, restore the label
+    /// rather than deleting the test.
+    #[test]
+    fn honesty_mock_embedder_label_present() {
+        let src = include_str!("embedder.rs");
+        assert!(
+            src.contains("mock_neural_embedding"),
+            "the mock neural-embedder label must remain present"
+        );
+    }
+
     #[test]
     fn test_tokenize() {
         let tokens = tokenize("Hello, World! This is a test.");
@@ -359,11 +373,13 @@ mod tests {
 // ONNX-based Neural Embeddings (Rel-19)
 // ---------------------------------------------------------------------------
 
-/// ONNX-based neural embedder using sentence-transformer models
+/// Embedder with optional ONNX sentence-transformer support.
 ///
-/// Provides high-quality semantic embeddings via pre-trained neural networks
-/// loaded through ONNX runtime. Suitable for production deployments requiring
-/// better semantic understanding than TF-IDF.
+/// OPERATIONAL PATH: no ONNX model ships, so by default this runs
+/// `mock_neural_embedding` — a deterministic hash-based multi-scale embedding,
+/// NOT a neural network. If a pre-trained sentence-transformer model is loaded
+/// through the ONNX runtime it will be used instead, giving genuinely neural
+/// embeddings; the example models below are what such a deployment could load.
 ///
 /// # Example Models
 ///
@@ -471,18 +487,21 @@ impl OnnxEmbedder {
         self.fallback = None;
     }
 
-    /// Neural-quality embedding via multi-scale hash simulation.
+    /// OPERATIONAL PATH: hash-based multi-scale embedding (NOT a neural net).
+    /// This is what `OnnxEmbedder` actually runs when no ONNX model is loaded,
+    /// which is the default since the simulator ships no model.
     ///
-    /// Simulates sentence-transformer behavior by:
+    /// Approximates sentence-transformer behavior by:
     /// 1. Word-piece tokenization (splitting on subwords)
     /// 2. Per-token positional encoding
     /// 3. Multi-scale n-gram feature hashing (unigrams + bigrams + trigrams)
     /// 4. Attention-like weighting (IDF-inspired term importance)
     /// 5. L2 normalization
     ///
-    /// This produces higher-quality embeddings than the simple byte-hash approach,
-    /// with better semantic similarity properties. In production, would be replaced
-    /// by actual ONNX inference via sentence-transformers.
+    /// This produces higher-quality embeddings than a simple byte-hash approach,
+    /// with better semantic similarity properties, but it is still a
+    /// deterministic hash — not learned. A real deployment would load an ONNX
+    /// sentence-transformer to replace it.
     fn mock_neural_embedding(&self, text: &str) -> Vec<f32> {
         let mut embedding = vec![0.0f32; self.dim];
         let tokens = wordpiece_tokenize(text);

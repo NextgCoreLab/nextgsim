@@ -481,13 +481,10 @@ impl UeApp {
         let mut orch = MmOrchestrator::new(identity);
 
         // SM procedure orchestrator: owns the per-PSI session state, PSI /
-        // PTI allocation and the SM timers (TS 24.501 Section 6). The
-        // legacy-accept compatibility flag is enabled because the current
-        // nextgcore smfd still emits a non-conformant PDU Session
-        // Establishment Accept; strict TS 24.501 parsing is always
-        // attempted first. Drop the flag once the core-side emission is
-        // spec-conformant.
-        let mut sm_orch = SmOrchestrator::new(true);
+        // PTI allocation and the SM timers (TS 24.501 Section 6). The UE only
+        // accepts the spec-conformant PDU Session Establishment Accept wire
+        // format (TS 24.501 Table 8.3.2.1.1); there is no legacy compat path.
+        let mut sm_orch = SmOrchestrator::new();
         let sm_session_params = SmSessionParams::from_config(&task_base.config);
 
         // MINT secondary-subscription driver (Rel-18, TS 23.761). Inert unless
@@ -497,7 +494,7 @@ impl UeApp {
         // established by the main `sm_orch`; secondary-SUPI sessions are routed
         // here per the DNN→subscription map.
         let mut mint_secondary =
-            nextgsim_ue::nas::mm::MintSecondary::from_config(&task_base.config, true);
+            nextgsim_ue::nas::mm::MintSecondary::from_config(&task_base.config);
         if mint_secondary.is_active() {
             info!(
                 "MINT enabled: {} secondary subscription(s), disaster_roaming={}",
@@ -514,6 +511,11 @@ impl UeApp {
             task_base.config.hplmn.long_mnc,
         );
         let mut plmn_selector = PlmnSelector::new(home_plmn);
+        // TS 23.122 §3.1: the EHPLMN list is read from the USIM (EF_EHPLMN). In
+        // this simulation the USIM provides the configured HPLMN; when no
+        // explicit EF_EHPLMN list is configured the HPLMN derived from the IMSI
+        // is the (single) equivalent-HPLMN entry, so seed the selector with it.
+        plmn_selector.set_ehplmn_list(vec![home_plmn]);
 
         let mut pdu_counter: u32 = 0;
 
@@ -988,6 +990,10 @@ impl UeApp {
         let mut serving_cell: Option<i32> = None;
         let mut rrc_state_machine = RrcStateMachine::new();
         let mut registration_triggered = false;
+        // Wave-6 I5: KgNB handed down by the NAS plane once NAS security is
+        // active; consumed by the AS SecurityModeCommand path below when the
+        // I5_UE_AS_SECURITY wire gate is on.
+        let mut pending_kgnb: Option<[u8; 32]> = None;
 
         loop {
             match rx.recv().await {
@@ -1073,6 +1079,71 @@ impl UeApp {
                                 );
                             }
 
+                            // Wave-6 I5 (TS 38.331 §5.3.4): when the AS-security
+                            // wire gate is on, recognise the AS
+                            // SecurityModeCommand on SRB1 (DL-DCCH) BEFORE the
+                            // raw-NAS heuristic below — its leading byte 0x20 is
+                            // otherwise misread as a raw NAS PDU and dropped.
+                            // Default-off: the block is skipped and the
+                            // matched-sim path is byte-for-byte unchanged.
+                            if nextgsim_ue::rrc::I5_UE_AS_SECURITY && channel == RrcChannel::DlDcch
+                            {
+                                use nextgsim_rrc::procedures::security_mode::{
+                                    decode_security_mode_command, encode_security_mode_complete,
+                                    SecurityModeCompleteParams,
+                                };
+                                use nextgsim_ue::rrc::{
+                                    AsSecurityContext, CipheringAlgorithm, IntegrityAlgorithm,
+                                };
+                                if let Ok(smc) = decode_security_mode_command(pdu.data()) {
+                                    match (
+                                        smc.security_algorithms.integrity_algorithm,
+                                        pending_kgnb,
+                                    ) {
+                                        (Some(integ), Some(kgnb)) => {
+                                            let ciph = CipheringAlgorithm::from(
+                                                smc.security_algorithms.ciphering_algorithm,
+                                            );
+                                            if ciph == CipheringAlgorithm::Nea3 {
+                                                warn!("AS SMC selected NEA3 (unsupported keystream); not activating");
+                                            } else {
+                                                // Derive + install the AS keys (byte-identical to
+                                                // the gNB's derive_rrc_up_key); SRB PDCP
+                                                // integrity/ciphering enforcement rides these keys.
+                                                let _as_ctx = AsSecurityContext::derive_from_kgnb(
+                                                    &kgnb,
+                                                    ciph,
+                                                    IntegrityAlgorithm::from(integ),
+                                                    0x4601,
+                                                );
+                                                if let Ok(bytes) = encode_security_mode_complete(
+                                                    &SecurityModeCompleteParams {
+                                                        rrc_transaction_id: smc.rrc_transaction_id,
+                                                    },
+                                                ) {
+                                                    let _ = task_base
+                                                        .rls_tx
+                                                        .send(RlsMessage::RrcPduDelivery {
+                                                            channel: RrcChannel::UlDcch,
+                                                            pdu_id: 0,
+                                                            pdu: OctetString::from_slice(&bytes),
+                                                        })
+                                                        .await;
+                                                }
+                                                info!(
+                                                    "AS security activated (tid {}); SecurityModeComplete sent",
+                                                    smc.rrc_transaction_id
+                                                );
+                                            }
+                                        }
+                                        _ => warn!(
+                                            "AS SMC received but no KgNB / integrity algorithm; not activating (fail-closed)"
+                                        ),
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Check if this is DL Information Transfer (0x04) which wraps NAS PDU
                             // Format: [0x04 (msg type), 0x00 (padding), 0x00 (padding), NAS PDU...]
                             let nas_pdu = if pdu.len() >= 3 && pdu.data()[0] == 0x04 {
@@ -1141,6 +1212,12 @@ impl UeApp {
                             }
                             // Notify NAS of the failure
                             let _ = task_base.nas_tx.send(NasMessage::RadioLinkFailure).await;
+                        }
+                        RrcMessage::AsSecurityKey { kgnb } => {
+                            // Wave-6 I5: store the KgNB from the NAS plane; used
+                            // to derive K_RRCint/K_RRCenc on the AS SMC.
+                            debug!("Received KgNB for AS security from NAS plane");
+                            pending_kgnb = Some(kgnb);
                         }
                         RrcMessage::TriggerCycle => {
                             // Trigger RRC state machine cycle
@@ -1302,6 +1379,27 @@ async fn process_mm_outputs(
                     process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;
                 }
             }
+            MmOutput::EquivalentPlmnsUpdated(bcd_plmns) => {
+                // TS 23.122 §4.4.3.1.1: the equivalent-PLMN list signalled in
+                // Registration Accept is consulted (after the RPLMN) by
+                // subsequent automatic PLMN selection. Convert the BCD triplets
+                // into PLMNs and hand them to the selector.
+                use nextgsim_ue::rrc::cell_selection::plmn_from_bcd;
+                let plmns: Vec<Plmn> = bcd_plmns.iter().map(plmn_from_bcd).collect();
+                if plmns.is_empty() {
+                    info!("Equivalent-PLMN list cleared by the network");
+                } else {
+                    info!(
+                        "Equivalent-PLMN list updated: {}",
+                        plmns
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                plmn_selector.set_equivalent_plmns(plmns);
+            }
             MmOutput::RegistrationFailed(cause) => {
                 warn!("Registration failed: {:?} (#{})", cause, cause as u8);
                 plmn_selector.set_registered_plmn(None);
@@ -1319,6 +1417,14 @@ async fn process_mm_outputs(
             }
             MmOutput::NotHandled(plain) => {
                 handle_unmanaged_mm_message(plain, orch, sm_orch, task_base, tun_tx, pdu_counter)
+                    .await;
+            }
+            MmOutput::AsSecurityKgnb(kgnb) => {
+                // Wave-6 I5: hand the KgNB to the RRC plane for AS-security key
+                // derivation on the next AS SecurityModeCommand (TS 33.501 §6.7).
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::AsSecurityKey { kgnb })
                     .await;
             }
         }
@@ -1466,6 +1572,15 @@ async fn process_secondary_mm_outputs(
                     }
                 }
             }
+            MmOutput::EquivalentPlmnsUpdated(plmns) => {
+                // A MINT secondary subscription does not drive the primary
+                // PLMN selector; its equivalent-PLMN list is tracked per-SUPI
+                // by the secondary context only (TS 23.761 / TS 23.122).
+                tracing::debug!(
+                    "MINT: secondary subscription {index} equivalent-PLMN list ({} entries)",
+                    plmns.len()
+                );
+            }
             MmOutput::RegistrationFailed(cause) => {
                 warn!("MINT: secondary subscription {index} registration failed: {cause:?}");
             }
@@ -1497,6 +1612,14 @@ async fn process_secondary_mm_outputs(
                         }
                     }
                 }
+            }
+            MmOutput::AsSecurityKgnb(_kgnb) => {
+                // A MINT secondary subscription shares the primary UE's AS/RRC
+                // security context; it never drives an independent AS
+                // SecurityModeCommand, so its KgNB is not plumbed to RRC.
+                tracing::debug!(
+                    "MINT: secondary subscription {index} KgNB derived (not used for AS security)"
+                );
             }
         }
     }
@@ -1755,8 +1878,13 @@ async fn handle_unmanaged_mm_message(
             }
         }
         MmMessageType::DlNasTransport => {
-            // DL NAS Transport (TS 24.501 8.2.11): decode through the
-            // codec and hand N1 SM containers to the SM orchestrator
+            use nextgsim_nas::ies::ie1::PayloadContainerType;
+            use nextgsim_nas::messages::mm::UlNasTransport;
+            use nextgsim_ue::nas::mm::UePolicyReaction;
+            // DL NAS Transport (TS 24.501 8.2.11): decode through the codec.
+            // A "UE policy container" (0b0101) is UPDP (TS 24.501 Annex D) and
+            // is handled on the MM plane BEFORE the SM hand-off; everything
+            // else (N1 SM information, etc.) goes to the SM orchestrator.
             let header_len = 3; // EPD + SecHdr + MsgType
             match DlNasTransport::decode(&mut &plain[header_len..]) {
                 Ok(dl) => {
@@ -1766,8 +1894,40 @@ async fn handle_unmanaged_mm_message(
                         dl.pdu_session_id,
                         dl.payload_container.len()
                     );
-                    let outs = sm_orch.handle_dl_nas_transport(&dl);
-                    process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;
+                    if dl.payload_container_type == PayloadContainerType::UePolicyContainer {
+                        // MANAGE UE POLICY COMMAND: decode, store sections and
+                        // answer COMPLETE/REJECT (Wave-6 E8).
+                        match orch.handle_ue_policy_command(&dl.payload_container) {
+                            UePolicyReaction::Reply(updp) => {
+                                let ul = UlNasTransport::new(
+                                    PayloadContainerType::UePolicyContainer,
+                                    updp,
+                                );
+                                let mut nas_pdu = Vec::new();
+                                ul.encode(&mut nas_pdu);
+                                let nas_pdu = orch.protect_if_active(nas_pdu);
+                                info!(
+                                    "Sending UE policy delivery reply ({} sections stored), len={}",
+                                    orch.ue_policy_section_count(),
+                                    nas_pdu.len()
+                                );
+                                *pdu_counter += 1;
+                                let _ = task_base
+                                    .rrc_tx
+                                    .send(RrcMessage::UplinkNasDelivery {
+                                        pdu_id: *pdu_counter,
+                                        pdu: nas_pdu.into(),
+                                    })
+                                    .await;
+                            }
+                            UePolicyReaction::Ignore => {
+                                warn!("UE policy container undecodable and unrecoverable: dropped");
+                            }
+                        }
+                    } else {
+                        let outs = sm_orch.handle_dl_nas_transport(&dl);
+                        process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to decode DL NAS Transport: {e:?}");

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Integrated Sensing and Communication (ISAC) - 3GPP TR 22.837 compliant sensing for 6G networks"
+description = "Integrated Sensing and Communication (ISAC) - research prototype inspired by the use cases in 3GPP TR 22.837 (Rel-19 study); not a conformance implementation"
 
 [dependencies]
 tokio = { workspace = true }

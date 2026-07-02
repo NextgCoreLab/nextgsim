@@ -53,6 +53,7 @@ mod registration;
 pub mod security_mode;
 mod service;
 mod status;
+pub mod ue_policy;
 
 pub use authentication::*;
 pub use deregistration::*;

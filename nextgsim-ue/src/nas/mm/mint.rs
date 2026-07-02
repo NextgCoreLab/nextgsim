@@ -59,7 +59,7 @@ impl MintSecondary {
     /// Build the driver from the UE configuration. Returns an empty driver
     /// (no secondary subscriptions) when MINT is disabled or no secondary
     /// SUPIs are configured.
-    pub fn from_config(config: &UeConfig, legacy_core_accept_compat: bool) -> Self {
+    pub fn from_config(config: &UeConfig) -> Self {
         let Some(mint) = config.mint_config.as_ref() else {
             return Self {
                 subs: Vec::new(),
@@ -101,7 +101,7 @@ impl MintSecondary {
                 index,
                 supi: secondary_supi.clone(),
                 mm: MmOrchestrator::new(identity),
-                sm: SmOrchestrator::new(legacy_core_accept_compat),
+                sm: SmOrchestrator::new(),
                 started: false,
             });
         }

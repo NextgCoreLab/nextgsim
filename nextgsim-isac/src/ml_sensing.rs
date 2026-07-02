@@ -7,16 +7,22 @@ use std::collections::HashMap;
 
 use crate::{SensingMeasurement, Vector3};
 
-/// ML model type for sensing
+/// ML model type for sensing.
+///
+/// NOTE (honesty): these neural variants are placeholders for model selection.
+/// Inference today is always a kNN surrogate over the training cache regardless
+/// of the selected variant (see [`MlPositioningEngine::infer`]); the variant is
+/// retained only as the *requested* model type. The actual algorithm that ran
+/// is reported in [`MlPositioningResult::actual_algorithm`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MlModelType {
-    /// Deep neural network for positioning
+    /// Deep neural network for positioning (placeholder — runs kNN surrogate).
     DeepPositioning,
-    /// LSTM for trajectory prediction
+    /// LSTM for trajectory prediction (placeholder — runs kNN surrogate).
     TrajectoryLstm,
-    /// Transformer for multi-target tracking
+    /// Transformer for multi-target tracking (placeholder — runs kNN surrogate).
     TransformerTracking,
-    /// CNN for environment fingerprinting
+    /// CNN for environment fingerprinting (placeholder — runs kNN surrogate).
     FingerprintCnn,
 }
 
@@ -38,12 +44,26 @@ pub struct MlPositioningResult {
     pub position: Vector3,
     /// Confidence score (0.0 to 1.0)
     pub confidence: f64,
-    /// Model used
+    /// Requested model type (as selected by the caller).
+    ///
+    /// NOTE: this echoes the *requested* model; it does not necessarily reflect
+    /// the algorithm that actually ran — see [`Self::actual_algorithm`].
     pub model_type: MlModelType,
+    /// The algorithm that actually produced this result.
+    ///
+    /// Currently always `"knn-surrogate"` because the neural [`MlModelType`]
+    /// variants are placeholders (honesty surface for isac-06).
+    #[serde(skip_deserializing, default = "default_actual_algorithm")]
+    pub actual_algorithm: &'static str,
     /// Latency (milliseconds)
     pub inference_latency_ms: f64,
     /// Feature vector dimension used
     pub feature_dim: usize,
+}
+
+/// Default value for [`MlPositioningResult::actual_algorithm`] (serde back-compat).
+fn default_actual_algorithm() -> &'static str {
+    "knn-surrogate"
 }
 
 /// Feature extractor for ML sensing
@@ -240,7 +260,10 @@ impl MlPositioningEngine {
         Some(MlPositioningResult {
             position,
             confidence,
+            // Echo the requested model for transparency, but report the
+            // algorithm that actually ran (a kNN surrogate) — isac-06.
             model_type: self.model_type,
+            actual_algorithm: "knn-surrogate",
             inference_latency_ms: 5.0, // Simulated edge inference latency
             feature_dim: features.len(),
         })
@@ -661,7 +684,45 @@ mod tests {
 
         let res = result.unwrap();
         assert!(res.confidence > 0.0 && res.confidence <= 1.0);
+        // The requested model is echoed for transparency...
         assert_eq!(res.model_type, MlModelType::DeepPositioning);
+        // ...but the algorithm that actually ran is the kNN surrogate (isac-06).
+        assert_eq!(res.actual_algorithm, "knn-surrogate");
+    }
+
+    #[test]
+    fn test_infer_reports_knn_surrogate_for_any_model() {
+        // Even when a neural variant is selected, inference is a kNN surrogate.
+        for model in [
+            MlModelType::DeepPositioning,
+            MlModelType::TrajectoryLstm,
+            MlModelType::TransformerTracking,
+            MlModelType::FingerprintCnn,
+        ] {
+            let mut engine = MlPositioningEngine::new(model);
+            for i in 0..150 {
+                let measurements = vec![SensingMeasurement {
+                    measurement_type: SensingType::ToA,
+                    anchor_id: 1,
+                    value: 100.0 + i as f64,
+                    uncertainty: 1.0,
+                    timestamp_ms: 1000,
+                }];
+                engine.add_training_sample(&measurements, Vector3::new(i as f64, 0.0, 0.0));
+            }
+            engine.train(1);
+            let res = engine
+                .infer(&[SensingMeasurement {
+                    measurement_type: SensingType::ToA,
+                    anchor_id: 1,
+                    value: 120.0,
+                    uncertainty: 1.0,
+                    timestamp_ms: 1000,
+                }])
+                .expect("trained engine should infer");
+            assert_eq!(res.model_type, model);
+            assert_eq!(res.actual_algorithm, "knn-surrogate");
+        }
     }
 
     #[test]

@@ -1,17 +1,17 @@
 # nextgsim - Pure Rust 5G/6G UE and gNB Simulator
 
-A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulator with full 6G AI-native capabilities, derived from the [UERANSIM](https://github.com/aligungr/UERANSIM). This implementation has **zero C library dependencies**.
+A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulator with 6G research/exploration prototypes, converted from [UERANSIM](https://github.com/aligungr/UERANSIM). This implementation has **zero C library dependencies**. (3GPP Rel-20/6G has no frozen stage-3 spec; the 6G features are research concepts informed by TR 22.870 use cases and are disabled by default.)
 
 ## Features
 
 - **Pure Rust**: No C/C++ dependencies, fully memory-safe
 - **5G-SA Support**: Complete 5G Standalone network simulation
 - **Rel-17/18 features**: RedCap, XR 5QI, SNPN (NID), MINT/disaster-roaming, and UAV aerial-UE registration, integrated end-to-end with nextgcore (UE config knobs in `docs/configuration.md` → Rel-17/18 Feature Configuration; example configs in `config/features/`)
-- **6G AI-Native**: Full 6G AI architecture with ML inference, federated learning, and semantic communication
+- **6G Exploration**: Research-grade AI/ML prototypes (ISAC, federated learning, semantic communication) — not conformant to any frozen 3GPP spec (Rel-20 is in discussion; disabled by default)
 - **Cryptography**: Milenage, SNOW3G, ZUC, AES-based NEA/NIA algorithms, ECIES
 - **Protocol Support**: NAS, NGAP (ASN.1 PER), RRC (ASN.1 UPER), GTP-U, SCTP
 - **Radio Simulation**: RLS protocol for UE-gNB communication over UDP
-- **ML Inference**: ONNX Runtime integration for production AI workloads
+- **ML Inference**: ONNX Runtime (`ort`) integration available; no models ship, so the operational AI paths use TF-IDF / mean-pooling / linear-extrapolation fallbacks
 - **Async Runtime**: Built on Tokio for high-performance concurrent operations
 
 ## Quickstart
@@ -21,20 +21,20 @@ A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulato
 The fastest way to get started is using Docker with the nextgcore 5G core.
 
 ```bash
-# 1. Start the 5G Core (from nextgcore repository)
+# 1. Run the full matched-sim E2E: our gNB + UE vs the 22-NF core.
+#    e2e.sh runs a disk preflight, builds the images, then the E2E suite
+#    (registration + PDU session + data-plane ping over the GTP-U tunnel).
 cd ../nextgcore/docker/rust
-docker compose -f docker-compose-5gc-optimized.yml up -d
+./e2e.sh                          # add --keep to leave the stack running
 
-# 2. Build and start the simulators
-cd ../../nextgsim
-docker compose build
-docker compose up -d
+# Or bring the stack up manually (the gNB + UE ship in the SAME compose file):
+docker compose -f docker-compose.yml up -d
 
-# 3. Verify UE registration
-docker logs nextgsim-ue 2>&1 | grep -E "(REGISTERED|PDU Session)"
+# 2. Verify UE registration and the PDU session
+docker logs nextgsim-ue 2>&1 | grep -E "UE is now REGISTERED|is now ACTIVE"
 # Expected output:
-# UE is now REGISTERED
-# PDU Session 1 established with IP: 10.45.0.2
+# Registration Accept: UE is now REGISTERED
+# PDU session 1 is now ACTIVE (IPv4: 10.45.0.2)
 ```
 
 ### Option 2: Build from Source
@@ -76,23 +76,23 @@ cargo test --test pdu_session        # PDU session tests
 │                         Subnet: 172.23.0.0/24                       │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  ┌─────────────┐    NGAP    ┌─────────────┐    SBI    ┌─────────┐   │
-│  │   nextgsim  │◄──────────►│     AMF     │◄─────────►│   NRF   │   │
-│  │     gNB     │  38412     │  172.23.0.5 │           │ et al.  │   │
-│  │ 172.23.0.100│            └──────┬──────┘           └─────────┘   │
-│  └──────┬──────┘                   │                                │
-│         │ RLS                      │ N11                            │
-│         │                          ▼                                │
-│  ┌──────┴──────┐            ┌─────────────┐                         │
-│  │   nextgsim  │            │     SMF     │                         │
-│  │     UE      │            │  172.23.0.4 │                         │
-│  │ 172.23.0.101│            └──────┬──────┘                         │
-│  └──────┬──────┘                   │ N4                             │
-│         │                          ▼                                │
-│         │ GTP-U             ┌─────────────┐                         │
-│         └──────────────────►│     UPF     │──────► Internet         │
-│                     2152    │  172.23.0.7 │                         │
-│                             └─────────────┘                         │
+│  ┌─────────────┐    NGAP    ┌─────────────┐    SBI    ┌─────────┐ │
+│  │   nextgsim  │◄──────────►│     AMF     │◄─────────►│   NRF   │ │
+│  │     gNB     │  38412     │  172.23.0.5 │           │ et al.  │ │
+│  │ 172.23.0.100│            └──────┬──────┘           └─────────┘ │
+│  └──────┬──────┘                   │                               │
+│         │ RLS                      │ N11                           │
+│         │                          ▼                               │
+│  ┌──────┴──────┐            ┌─────────────┐                       │
+│  │   nextgsim  │            │     SMF     │                       │
+│  │     UE      │            │  172.23.0.4 │                       │
+│  │ 172.23.0.101│            └──────┬──────┘                       │
+│  └──────┬──────┘                   │ N4                           │
+│         │                          ▼                               │
+│         │ GTP-U             ┌─────────────┐                       │
+│         └──────────────────►│     UPF     │──────► Internet       │
+│                     2152    │  172.23.0.7 │                       │
+│                             └─────────────┘                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -102,7 +102,7 @@ cargo test --test pdu_session        # PDU session tests
 |------|---------|
 | `config/gnb.yaml` | gNB configuration (AMF address, PLMN, TAC, NCI) |
 | `config/ue.yaml` | UE configuration (SUPI, keys, APN, slices) |
-| `docker-compose.yaml` | Simulator container orchestration |
+| `docker/docker-compose.yml` | Simulator-only container orchestration (the full 5GC + gNB + UE E2E stack lives in `../nextgcore/docker/rust/docker-compose.yml`) |
 
 ### Environment Variables
 
@@ -145,35 +145,35 @@ nextgsim/
 
 ## 6G AI Architecture
 
-The simulator implements a comprehensive 6G AI-native architecture following 3GPP specifications:
+The simulator includes a set of 6G/AI research prototypes (disabled by default and not conformant to any frozen 3GPP spec — Rel-20/6G has no stage-3 wire spec). The 3GPP documents referenced below are design inspiration, not a conformance claim:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         6G AI-Native Architecture                           │
+│                         6G AI-Native Architecture                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │   NWDAF      │    │    NKEF      │    │    Agent     │                   │
-│  │  Analytics   │◄──►│  Knowledge   │◄──►│  Framework   │                   │
-│  │              │    │   Graphs     │    │   (AAF)      │                   │
-│  └──────┬───────┘    └──────────────┘    └──────────────┘                   │
-│         │                                                                   │
-│         ▼                                                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                    Service Hosting Environment (SHE)                 │   │
-│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐               │   │
-│  │  │ Local Edge  │    │  Regional   │    │    Core     │               │   │
-│  │  │   <10ms     │◄──►│    Edge     │◄──►│   Cloud     │               │   │
-│  │  │  Inference  │    │   <20ms     │    │  Training   │               │   │
-│  │  └─────────────┘    └─────────────┘    └─────────────┘               │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│         │                                         │                         │
-│         ▼                                         ▼                         │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │    ISAC      │    │   Semantic   │    │  Federated   │                   │
-│  │   Sensing    │    │    Codec     │    │   Learning   │                   │
-│  └──────────────┘    └──────────────┘    └──────────────┘                   │
-│                                                                             │
+│                                                                              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
+│  │   NWDAF      │    │    NKEF      │    │    Agent     │                  │
+│  │  Analytics   │◄──►│  Knowledge   │◄──►│  Framework   │                  │
+│  │              │    │   Graphs     │    │   (AAF)      │                  │
+│  └──────┬───────┘    └──────────────┘    └──────────────┘                  │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                    Service Hosting Environment (SHE)                  │  │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐              │  │
+│  │  │ Local Edge  │    │  Regional   │    │    Core     │              │  │
+│  │  │   <10ms     │◄──►│    Edge     │◄──►│   Cloud     │              │  │
+│  │  │  Inference  │    │   <20ms     │    │  Training   │              │  │
+│  │  └─────────────┘    └─────────────┘    └─────────────┘              │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│         │                                         │                          │
+│         ▼                                         ▼                          │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
+│  │    ISAC      │    │   Semantic   │    │  Federated   │                  │
+│  │   Sensing    │    │    Codec     │    │   Learning   │                  │
+│  └──────────────┘    └──────────────┘    └──────────────┘                  │
+│                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 

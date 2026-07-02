@@ -1,13 +1,24 @@
-//! Federated Learning Infrastructure for 6G Networks
+//! Federated Learning research engine for 6G Networks
 //!
-//! Implements federated learning per 3GPP TR 23.700-80:
-//! - Secure aggregation protocols (Bonawitz et al.)
+//! This crate is a **research prototype**. It is architecturally aligned with the
+//! federated-learning concepts described in 3GPP TR 23.700-80 (SA2 study) and the
+//! AI/ML training-management information model of TS 28.105 §6.2b.2.15, but it does
+//! **not** implement any 3GPP procedure and is not conformance-tested.
+//!
+//! Scope boundary: TS 28.105 §6.2b.2.15.1 NOTE 2 states that the FL algorithms,
+//! differential-privacy mechanisms and secure-aggregation schemes are *outside the
+//! scope of standardization*. The implementations below (FedAvg/FedProx, the masking
+//! demo, DP accounting, compression and Byzantine-robust rules) are therefore
+//! literature-faithful research code, not normative 3GPP wire behaviour.
+//!
+//! Capabilities:
+//! - Pairwise-masking aggregation demo (x25519-derived masks) — simulation only
 //! - Differential privacy support (Gaussian mechanism, Renyi DP, zCDP)
 //! - Model versioning and distribution
 //! - Asynchronous federated learning
 //! - Gradient compression (top-k, 1-bit, ternary quantization)
 //! - Hierarchical FL (edge->regional->cloud)
-//! - Byzantine-robust aggregation (Krum, trimmed mean)
+//! - Byzantine-robust aggregation (Krum, trimmed mean, median)
 
 #![allow(missing_docs)]
 //! - Personalization (local fine-tuning)
@@ -25,7 +36,7 @@
 //! |  +---------------------------------------------------------------+   |
 //! |  +---------------------------------------------------------------+   |
 //! |  | Aggregation Server                                             |   |
-//! |  |  - FedAvg, FedProx, SecAgg                                    |   |
+//! |  |  - FedAvg, FedProx, MaskedSumDemo (masking demo, not SecAgg) |   |
 //! |  |  - Async FL with staleness weighting                          |   |
 //! |  |  - Byzantine-tolerant (Krum, trimmed mean)                    |   |
 //! |  +---------------------------------------------------------------+   |
@@ -41,10 +52,23 @@
 //! |  | Communication                                                  |   |
 //! |  |  - Top-k gradient compression                                  |   |
 //! |  |  - 1-bit and ternary quantization                              |   |
-//! |  |  - Secure aggregation (x25519 key exchange)                    |   |
+//! |  |  - Pairwise additive masking demo (x25519-derived masks) -    |   |
+//! |  |    simulation only, NOT server-blind secure aggregation       |   |
 //! |  +---------------------------------------------------------------+   |
 //! +-----------------------------------------------------------------------+
 //! ```
+//!
+//! # Standards positioning
+//!
+//! This crate is the federated-learning **training engine/process**, not a
+//! TS 28.105 management-services (MnS) producer. In the TS 28.105 AI/ML
+//! training-management information model the engine maps to the *process* that
+//! runs under an `MLTrainingFunction` (§7.3a.1.2.1); the IOCs that a producer
+//! exposes above it are `MLTrainingRequest` (§7.3a.1.2.2),
+//! `MLTrainingProcess` (§7.3a.1.2.3) and `MLTrainingReport` (§7.3a.1.2.4).
+//! The thin [`mns_adapter`] module maps this engine's round/metrics onto those
+//! IOCs' field concepts for illustration only — it is NOT a conformant
+//! YANG/JSON MnS schema.
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -64,6 +88,9 @@ pub mod semantic_integration;
 
 /// Integration with Service Hosting Environment for FL workload placement
 pub mod she_integration;
+
+/// Conceptual adapter onto the TS 28.105 AI/ML training-management IOCs
+pub mod mns_adapter;
 
 // ---------------------------------------------------------------------------
 // Core data structures
@@ -104,20 +131,30 @@ pub struct AggregatedModel {
 }
 
 /// Aggregation algorithm
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum AggregationAlgorithm {
     /// Federated Averaging (`FedAvg`) - `McMahan` et al. 2017
+    #[default]
     FedAvg,
     /// Federated Proximal (`FedProx`) - Li et al. 2020
     FedProx,
-    /// Secure Aggregation - Bonawitz et al. 2017
-    SecAgg,
-}
-
-impl Default for AggregationAlgorithm {
-    fn default() -> Self {
-        Self::FedAvg
-    }
+    /// Pairwise-masked sum demonstration of Bonawitz-style mask cancellation.
+    ///
+    /// SECURITY: this is **NOT** a privacy-preserving secure-aggregation
+    /// protocol. In this simulation the aggregator mints every participant's
+    /// keypair and applies the masks itself over plaintext it already received,
+    /// so it provides **zero privacy against the aggregator** and is not the
+    /// Bonawitz et al. 2017 protocol. It only illustrates that antisymmetric
+    /// pairwise masks cancel in the summation.
+    MaskedSumDemo,
+    /// Krum: selects the single update closest to its neighbours (Byzantine-robust)
+    Krum { num_byzantine: usize },
+    /// Multi-Krum: averages the top-`m` Krum selections (Byzantine-robust)
+    MultiKrum { num_byzantine: usize, m: usize },
+    /// Trimmed Mean: removes the top/bottom `trim_ratio` fraction and averages
+    TrimmedMean { trim_ratio: f32 },
+    /// Coordinate-wise Median (Byzantine-robust)
+    Median,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,12 +429,26 @@ pub fn topk_decompress(compressed: &CompressedGradient) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Secure Aggregation (Bonawitz et al.)
+// Pairwise-masked sum demonstration (NOT Bonawitz secure aggregation)
 // ---------------------------------------------------------------------------
+//
+// SECURITY / TRUST MODEL: The Bonawitz et al. 2017 secure-aggregation protocol
+// keeps every participant's secret on the client; the server only ever sees
+// masked vectors and never holds secrets or plaintext. This module INVERTS that
+// trust model for simulation convenience: `register_participant` mints each
+// participant's x25519 keypair on the server, and `secagg_aggregate_internal`
+// applies the masks server-side over plaintext gradients the server already
+// received. It therefore provides NO privacy against the aggregator and is NOT
+// the Bonawitz protocol. It exists only to demonstrate that antisymmetric
+// pairwise masks cancel in the summation. Do not use as a privacy mechanism.
 
-/// A participant's keypair and public key for the `SecAgg` protocol.
+/// A participant's keypair and public key for the masking demo.
 ///
 /// Uses x25519 Diffie-Hellman for pairwise key agreement.
+///
+/// SECURITY: in this simulation the server (the [`FederatedAggregator`]) holds
+/// these secrets and applies the masks itself, so this is NOT honest-but-curious
+/// server safe and is NOT the Bonawitz et al. 2017 secure-aggregation protocol.
 pub struct SecAggParticipant {
     /// Participant identifier
     pub id: String,
@@ -416,8 +467,49 @@ impl std::fmt::Debug for SecAggParticipant {
     }
 }
 
+/// Deterministically derives a length-`dim` mask from a 32-byte shared secret.
+///
+/// Folds **all 32 bytes** of the secret into a `splitmix64` seed (so the mask
+/// depends on the entire secret, not just a prefix) and expands it to `dim`
+/// samples in `[-1.0, 1.0)`.
+///
+/// SECURITY: `splitmix64` is a **non-cryptographic** PRG (Steele, Lea & Flood
+/// 2014). This routine has no cryptographic mask strength and is only used to
+/// demonstrate pairwise mask cancellation in the [`AggregationAlgorithm::MaskedSumDemo`]
+/// simulation. The output range is irrelevant to cancellation, which holds
+/// exactly by antisymmetric negation.
+fn demo_mask_from_secret(secret_bytes: &[u8; 32], dim: usize) -> Vec<f32> {
+    // Fold every 8-byte word of the secret into the seed with the splitmix64
+    // finalizer so any byte (including bytes past the first 8) affects the seed.
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for chunk in secret_bytes.chunks_exact(8) {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(chunk);
+        seed ^= u64::from_le_bytes(w);
+        seed = seed.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        seed ^= seed >> 27;
+        seed = seed.wrapping_mul(0x94D0_49BB_1331_11EB);
+        seed ^= seed >> 31;
+    }
+
+    let mut state = seed;
+    (0..dim)
+        .map(|_| {
+            // splitmix64 step
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            // Map the top 53 bits to a unit double in [0, 1), then to [-1, 1).
+            let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
+            (2.0 * unit - 1.0) as f32
+        })
+        .collect()
+}
+
 impl SecAggParticipant {
-    /// Creates a new `SecAgg` participant with a fresh x25519 keypair.
+    /// Creates a new masking-demo participant with a fresh x25519 keypair.
     pub fn new(id: impl Into<String>) -> Self {
         let mut rng = rand::thread_rng();
         let secret = x25519_dalek::StaticSecret::random_from_rng(&mut rng);
@@ -429,15 +521,21 @@ impl SecAggParticipant {
         }
     }
 
-    /// Derives a pairwise shared secret with another participant and uses it
-    /// to produce a deterministic pseudo-random mask of length `dim`.
+    /// Derives a pairwise shared secret with another participant and uses it to
+    /// produce a deterministic mask of length `dim`.
     ///
-    /// The mask is derived by seeding a simple PRNG with the first 8 bytes of
-    /// the shared secret. Because the DH shared secret is symmetric (A->B ==
-    /// B->A), we use the lexicographic ordering of participant IDs to decide
-    /// the sign: the participant with the "smaller" ID *adds* the mask while
-    /// the one with the "larger" ID *subtracts* it. This ensures the masks
-    /// cancel out upon summation.
+    /// The mask is derived by folding the **full 32-byte** DH shared secret into
+    /// a `splitmix64` PRG seed (see [`demo_mask_from_secret`]). Because the DH
+    /// shared secret is symmetric (A->B == B->A), we use the lexicographic
+    /// ordering of participant IDs to decide the sign: the participant with the
+    /// "smaller" ID *adds* the mask while the one with the "larger" ID
+    /// *subtracts* it. This makes the masks antisymmetric so they cancel exactly
+    /// upon summation (cancellation is exact in f32 by negation, independent of
+    /// the mask magnitude).
+    ///
+    /// SECURITY: `splitmix64` is a fast **non-cryptographic** PRG. This mask
+    /// provides no cryptographic strength and must not be relied on for privacy;
+    /// it exists only to demonstrate mask cancellation in the simulation.
     fn pairwise_mask(
         &self,
         other_id: &str,
@@ -445,26 +543,7 @@ impl SecAggParticipant {
         dim: usize,
     ) -> Vec<f32> {
         let shared_secret = self.secret.diffie_hellman(other_public_key);
-        let secret_bytes = shared_secret.as_bytes();
-
-        // Derive a u64 seed from the shared secret
-        let mut seed_bytes = [0u8; 8];
-        seed_bytes.copy_from_slice(&secret_bytes[..8]);
-        let seed = u64::from_le_bytes(seed_bytes);
-
-        // Use the seed to generate deterministic mask values via a simple
-        // splitmix64-style PRNG (fast, deterministic, sufficient for masking).
-        let mut state = seed;
-        let mask: Vec<f32> = (0..dim)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                // Map to small float in [-0.01, 0.01]
-                let bits = ((state >> 33) as i32) % 10000;
-                bits as f32 / 1_000_000.0
-            })
-            .collect();
+        let mask = demo_mask_from_secret(shared_secret.as_bytes(), dim);
 
         // Determine sign based on lexicographic ordering of IDs
         if self.id.as_str() < other_id {
@@ -501,9 +580,12 @@ impl SecAggParticipant {
     }
 }
 
-/// Server-side secure aggregation: simply sums masked updates. Because the
-/// pairwise masks cancel (`mask(i,j) + mask(j,i) = 0`), the result is the
-/// true (weighted) sum of the original gradients.
+/// Server-side masked sum: simply sums masked updates. Because the pairwise
+/// masks cancel (`mask(i,j) + mask(j,i) = 0`), the result is the true (weighted)
+/// sum of the original gradients.
+///
+/// SECURITY: this is the server side of the masking demo, NOT server-blind
+/// secure aggregation — see the module note above.
 pub fn secagg_aggregate(masked_updates: &[Vec<f32>], weights: &[f32]) -> Vec<f32> {
     if masked_updates.is_empty() {
         return Vec::new();
@@ -544,7 +626,10 @@ fn sample_gaussian<R: Rng>(rng: &mut R, sigma: f32) -> f32 {
 // FederatedAggregator (synchronous)
 // ---------------------------------------------------------------------------
 
-/// FL aggregator supporting `FedAvg`, `FedProx`, and `SecAgg`.
+/// FL aggregator supporting `FedAvg`, `FedProx`, the `MaskedSumDemo`
+/// pairwise-masking demonstration (see [`AggregationAlgorithm::MaskedSumDemo`];
+/// the demo is NOT server-blind secure aggregation), and Byzantine-robust
+/// algorithms.
 #[derive(Debug)]
 pub struct FederatedAggregator {
     /// Current global model
@@ -559,15 +644,19 @@ pub struct FederatedAggregator {
     algorithm: AggregationAlgorithm,
     /// Differential privacy config
     dp_config: DifferentialPrivacyConfig,
-    /// Privacy budget tracker
+    /// Privacy budget tracker (basic linear composition — kept for backward compat)
     privacy_tracker: Option<PrivacyBudgetTracker>,
+    /// RDP-based privacy tracker (Rényi-DP moments accountant — authoritative ε for live path)
+    privacy_tracker_renyi: Option<RenyiDPTracker>,
     /// Minimum participants required
     min_participants: usize,
     /// Round timeout (seconds)
     round_timeout_secs: u64,
     /// `FedProx` configuration (used when algorithm == `FedProx`)
     fedprox_config: FedProxConfig,
-    /// `SecAgg` participants (`participant_id` -> `SecAggParticipant`)
+    /// Masking-demo participants (`participant_id` -> `SecAggParticipant`).
+    /// SECURITY: the server holds these per-participant secrets, which is why
+    /// `MaskedSumDemo` is a demo and not server-blind secure aggregation.
     secagg_participants: HashMap<String, SecAggParticipant>,
 }
 
@@ -582,6 +671,7 @@ impl FederatedAggregator {
             algorithm,
             dp_config: DifferentialPrivacyConfig::default(),
             privacy_tracker: None,
+            privacy_tracker_renyi: None,
             min_participants,
             round_timeout_secs: 60,
             fedprox_config: FedProxConfig::default(),
@@ -590,10 +680,19 @@ impl FederatedAggregator {
     }
 
     /// Sets differential privacy configuration and initialises the budget
-    /// tracker.
+    /// trackers.
+    ///
+    /// Both the legacy linear-composition tracker (`privacy_tracker`) and the
+    /// Rényi-DP moments accountant (`privacy_tracker_renyi`) are initialised when
+    /// DP is enabled.  The RDP tracker is authoritative for the live path; the
+    /// linear tracker is kept for backward compatibility.
     pub fn with_dp_config(mut self, config: DifferentialPrivacyConfig) -> Self {
         if config.enabled {
             self.privacy_tracker = Some(PrivacyBudgetTracker::new(&config));
+            self.privacy_tracker_renyi = Some(RenyiDPTracker::new(
+                config.target_epsilon,
+                config.target_delta,
+            ));
         }
         self.dp_config = config;
         self
@@ -610,6 +709,14 @@ impl FederatedAggregator {
         self.privacy_tracker.as_ref()
     }
 
+    /// Returns a reference to the Rényi-DP moments accountant, if DP is enabled.
+    ///
+    /// This tracker uses tighter RDP composition and is the authoritative source
+    /// of the privacy-loss ε for the live aggregation path.
+    pub fn privacy_tracker_renyi(&self) -> Option<&RenyiDPTracker> {
+        self.privacy_tracker_renyi.as_ref()
+    }
+
     /// Returns a reference to the `FedProx` config.
     pub fn fedprox_config(&self) -> &FedProxConfig {
         &self.fedprox_config
@@ -617,8 +724,9 @@ impl FederatedAggregator {
 
     /// Registers a participant.
     ///
-    /// When using `SecAgg`, this also generates an x25519 keypair for the
-    /// participant.
+    /// When using `MaskedSumDemo`, this also generates an x25519 keypair for the
+    /// participant. SECURITY: the server mints and holds this secret, which is
+    /// why the masking demo provides no privacy against the aggregator.
     pub fn register_participant(&mut self, id: impl Into<String>, num_samples: u64) {
         let id = id.into();
         self.participants.insert(
@@ -631,13 +739,13 @@ impl FederatedAggregator {
                 is_active: true,
             },
         );
-        if self.algorithm == AggregationAlgorithm::SecAgg {
+        if self.algorithm == AggregationAlgorithm::MaskedSumDemo {
             let sa_participant = SecAggParticipant::new(&id);
             self.secagg_participants.insert(id, sa_participant);
         }
     }
 
-    /// Returns the public keys of all registered `SecAgg` participants.
+    /// Returns the public keys of all registered masking-demo participants.
     pub fn secagg_public_keys(&self) -> Vec<(String, x25519_dalek::PublicKey)> {
         self.secagg_participants
             .values()
@@ -741,12 +849,26 @@ impl FederatedAggregator {
         Ok(())
     }
 
-    /// Applies differential privacy to an update using the Gaussian mechanism.
+    /// Applies differential privacy to an update using the Gaussian mechanism,
+    /// drawing noise from the thread-local RNG.
     ///
     /// 1. Clip the gradient to `clipping_threshold` (L2 norm).
     /// 2. Add per-parameter Gaussian noise N(0, sigma^2) where
     ///    sigma = `clipping_threshold` * `noise_multiplier`.
+    ///
+    /// Thin wrapper over [`apply_dp_with_rng`](Self::apply_dp_with_rng); use that
+    /// directly with a seeded RNG for reproducible DP tests.
     fn apply_dp(&self, update: &ModelUpdate) -> ModelUpdate {
+        let mut rng = rand::thread_rng();
+        self.apply_dp_with_rng(update, &mut rng)
+    }
+
+    /// Applies the Gaussian-mechanism DP step using a caller-supplied RNG.
+    ///
+    /// Ordering is clip-then-noise (the noise is added to the clipped gradient).
+    /// Passing a seeded RNG (e.g. `StdRng::seed_from_u64`) makes the noised
+    /// output deterministic, which lets DP behaviour be unit-tested reproducibly.
+    pub fn apply_dp_with_rng<R: Rng>(&self, update: &ModelUpdate, rng: &mut R) -> ModelUpdate {
         let mut processed = update.clone();
 
         // Clip gradients (L2 norm clipping)
@@ -766,9 +888,8 @@ impl FederatedAggregator {
         // Add proper Gaussian noise: N(0, sigma^2)
         // sigma = clipping_threshold * noise_multiplier
         let sigma = self.dp_config.clipping_threshold * self.dp_config.noise_multiplier;
-        let mut rng = rand::thread_rng();
         for g in &mut processed.gradients {
-            *g += sample_gaussian(&mut rng, sigma);
+            *g += sample_gaussian(rng, sigma);
         }
 
         processed
@@ -781,8 +902,9 @@ impl FederatedAggregator {
     /// - **`FedProx`**: FedAvg-style weighted average with an additional
     ///   proximal correction term that penalises deviation from the global
     ///   model.
-    /// - **`SecAgg`**: secure aggregation with pairwise masking (the masks
-    ///   cancel in the sum, yielding the true aggregate).
+    /// - **`MaskedSumDemo`**: pairwise-masking demonstration (the masks cancel
+    ///   in the sum, yielding the true aggregate). NOT server-blind secure
+    ///   aggregation — the server holds the secrets and sees plaintext.
     pub fn aggregate(&mut self) -> Result<AggregatedModel, String> {
         // First, check conditions and extract needed data
         let (num_updates, round_num, updates_clone, total_samples, avg_loss) = {
@@ -819,11 +941,62 @@ impl FederatedAggregator {
         let aggregated = match self.algorithm {
             AggregationAlgorithm::FedAvg => self.fedavg_aggregate(&updates_clone),
             AggregationAlgorithm::FedProx => self.fedprox_aggregate(&updates_clone),
-            AggregationAlgorithm::SecAgg => self.secagg_aggregate_internal(&updates_clone),
+            AggregationAlgorithm::MaskedSumDemo => self.secagg_aggregate_internal(&updates_clone),
+            AggregationAlgorithm::Krum { num_byzantine } => {
+                // Extract gradients in a deterministic (sorted-key) order.
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
+                krum_aggregate(&grads, num_byzantine)
+            }
+            AggregationAlgorithm::MultiKrum { num_byzantine, m } => {
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
+                multi_krum_aggregate(&grads, num_byzantine, m)
+            }
+            AggregationAlgorithm::TrimmedMean { trim_ratio } => {
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
+                trimmed_mean_aggregate(&grads, trim_ratio)
+            }
+            AggregationAlgorithm::Median => {
+                let mut keys: Vec<&String> = updates_clone.keys().collect();
+                keys.sort();
+                let grads: Vec<Vec<f32>> = keys
+                    .iter()
+                    .map(|k| updates_clone[*k].gradients.clone())
+                    .collect();
+                median_aggregate(&grads)
+            }
         };
 
-        // Track privacy budget if DP is enabled
+        // Track privacy budget if DP is enabled.
+        // The RDP moments accountant (Rényi-DP) is the authoritative ε — it
+        // records the Gaussian noise σ for this round and computes a tighter
+        // cumulative ε than naive linear composition.  The legacy linear tracker
+        // is also updated for backward compatibility.
         if self.dp_config.enabled {
+            let sigma = self.dp_config.noise_multiplier;
+            if let Some(ref mut rdp) = self.privacy_tracker_renyi {
+                rdp.record_gaussian(sigma);
+                tracing::debug!(
+                    rdp_epsilon = rdp.get_epsilon(),
+                    sigma,
+                    delta = rdp.target_delta,
+                    "RDP accountant updated after aggregation round",
+                );
+            }
             if let Some(ref mut tracker) = self.privacy_tracker {
                 tracker.record_round();
             }
@@ -924,13 +1097,23 @@ impl FederatedAggregator {
             .collect()
     }
 
-    /// `SecAgg` aggregation using pairwise x25519 masking.
+    /// `MaskedSumDemo` aggregation using pairwise x25519 masking.
     ///
-    /// Each participant masks their gradient with pairwise random masks
-    /// derived from DH shared secrets. The masks are antisymmetric
-    /// (`mask(i,j) = -mask(j,i)`), so they cancel when summed. The server
-    /// performs a simple weighted sum of the masked gradients to recover the
-    /// true aggregate.
+    /// Each gradient is masked with pairwise random masks derived from DH
+    /// shared secrets. The masks are antisymmetric (`mask(i,j) = -mask(j,i)`),
+    /// so they cancel when summed; the server then recovers the true aggregate.
+    ///
+    /// SECURITY: this is NOT the Bonawitz et al. 2017 secure-aggregation
+    /// protocol. The aggregator mints every keypair (see `register_participant`)
+    /// and applies the masks here, server-side, over plaintext gradients it
+    /// already received — so it provides no privacy against the aggregator.
+    ///
+    /// Weighting invariant: each client's sample weight is folded into the value
+    /// **before** masking (we mask `w_i * gradient_i`), and the server then takes
+    /// a *plain unweighted sum* and divides by `sum_i w_i`. This keeps the mask
+    /// coefficient at 1 on both sides of every pair, so `mask(i,j) + mask(j,i)`
+    /// cancels exactly even under unequal sample weights. (A weighted sum of
+    /// unweighted-masked values does NOT cancel: it leaves `(w_i - w_j)*mask`.)
     fn secagg_aggregate_internal(&self, updates: &HashMap<String, ModelUpdate>) -> Vec<f32> {
         if updates.is_empty() {
             return Vec::new();
@@ -938,25 +1121,33 @@ impl FederatedAggregator {
 
         let all_keys = self.secagg_public_keys();
         let total_samples: u64 = updates.values().map(|u| u.num_samples).sum();
+        if total_samples == 0 {
+            return Vec::new();
+        }
 
         let mut masked_updates = Vec::new();
-        let mut weights = Vec::new();
 
         for update in updates.values() {
-            let weight = update.num_samples as f32 / total_samples as f32;
-            weights.push(weight);
+            // Fold the sample weight into the value BEFORE masking.
+            let weight = update.num_samples as f32;
+            let weighted: Vec<f32> = update.gradients.iter().map(|g| g * weight).collect();
 
-            // If this participant has a SecAgg identity, mask the gradient
+            // If this participant has a masking-demo identity, mask the
+            // weight-folded gradient; the unweighted pairwise masks then cancel.
             if let Some(sa_participant) = self.secagg_participants.get(&update.participant_id) {
-                let masked = sa_participant.mask_gradient(&update.gradients, &all_keys);
-                masked_updates.push(masked);
+                masked_updates.push(sa_participant.mask_gradient(&weighted, &all_keys));
             } else {
                 // Fallback: unmasked (should not happen in a proper setup)
-                masked_updates.push(update.gradients.clone());
+                masked_updates.push(weighted);
             }
         }
 
-        secagg_aggregate(&masked_updates, &weights)
+        // Plain unweighted sum (coefficient 1 each) so masks cancel exactly,
+        // then divide by the total weight to recover the weighted average.
+        let ones = vec![1.0f32; masked_updates.len()];
+        let summed = secagg_aggregate(&masked_updates, &ones);
+        let inv_total = 1.0 / total_samples as f32;
+        summed.iter().map(|v| v * inv_total).collect()
     }
 
     /// Gets the current global model
@@ -1650,8 +1841,15 @@ impl RenyiDPTracker {
         }
     }
 
-    /// Records a Gaussian mechanism with noise multiplier sigma
+    /// Records a Gaussian mechanism with noise multiplier sigma.
+    ///
     /// RDP guarantee at order alpha: `epsilon_alpha` = alpha / (2 * sigma^2)
+    /// (Mironov 2017, full-batch Gaussian mechanism).
+    ///
+    /// NOTE: **no privacy amplification by subsampling is modeled** — this is the
+    /// full-batch RDP bound, so the reported epsilon is a conservative
+    /// (upper-bound) estimate. Pass the effective noise multiplier for the
+    /// full-batch case. Subsampled DP-SGD would yield a tighter (smaller) epsilon.
     pub fn record_gaussian(&mut self, sigma: f32) {
         for (i, &alpha) in self.orders.iter().enumerate() {
             let epsilon_alpha = alpha / (2.0 * sigma * sigma);
@@ -1707,8 +1905,14 @@ impl ZCDPTracker {
         }
     }
 
-    /// Records a Gaussian mechanism with noise multiplier sigma
-    /// zCDP guarantee: rho = 1 / (2 * sigma^2)
+    /// Records a Gaussian mechanism with noise multiplier sigma.
+    ///
+    /// zCDP guarantee: rho = 1 / (2 * sigma^2) (Bun & Steinke 2016).
+    ///
+    /// NOTE: **no privacy amplification by subsampling is modeled** — this is the
+    /// full-batch zCDP bound, so the reported epsilon is a conservative
+    /// (upper-bound) estimate. Pass the effective noise multiplier for the
+    /// full-batch case.
     pub fn record_gaussian(&mut self, sigma: f32) {
         self.rho += 1.0 / (2.0 * sigma * sigma);
     }
@@ -1979,7 +2183,11 @@ pub fn multi_krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize, m: usize
     result
 }
 
-/// Trimmed mean: removes top and bottom `trim_ratio` of values per coordinate
+/// Trimmed mean: removes top and bottom `trim_ratio` of values per coordinate.
+///
+/// Byzantine-robust coordinate-wise trimmed mean per Yin et al. 2018,
+/// "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates"
+/// (ICML 2018).
 pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32> {
     if updates.is_empty() {
         return vec![];
@@ -2010,7 +2218,11 @@ pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32>
     result
 }
 
-/// Coordinate-wise median aggregation
+/// Coordinate-wise median aggregation.
+///
+/// Byzantine-robust coordinate-wise median per Yin et al. 2018,
+/// "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates"
+/// (ICML 2018).
 pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
     if updates.is_empty() {
         return vec![];
@@ -2027,7 +2239,7 @@ pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mid = values.len() / 2;
-        *result_val = if values.len() % 2 == 0 {
+        *result_val = if values.len().is_multiple_of(2) {
             (values[mid - 1] + values[mid]) / 2.0
         } else {
             values[mid]
@@ -2309,6 +2521,55 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_dp_with_seeded_rng_is_deterministic() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2).with_dp_config(
+            DifferentialPrivacyConfig {
+                enabled: true,
+                noise_multiplier: 0.5,
+                clipping_threshold: 1.0,
+                target_epsilon: 8.0,
+                target_delta: 1e-5,
+            },
+        );
+
+        // A gradient already within the clip threshold so we isolate the noise.
+        let update = ModelUpdate {
+            participant_id: "ue-1".to_string(),
+            base_version: 1,
+            gradients: vec![0.1, -0.2, 0.05, 0.0],
+            num_samples: 100,
+            loss: 0.5,
+            timestamp_ms: timestamp_now(),
+        };
+
+        // Same seed -> identical noised output (reproducible).
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let out_a = aggregator.apply_dp_with_rng(&update, &mut rng_a);
+        let mut rng_b = StdRng::seed_from_u64(42);
+        let out_b = aggregator.apply_dp_with_rng(&update, &mut rng_b);
+        assert_eq!(
+            out_a.gradients, out_b.gradients,
+            "seeded DP must be deterministic"
+        );
+
+        // Noise was actually added (clip-then-Gaussian ordering applied).
+        assert_ne!(
+            out_a.gradients, update.gradients,
+            "DP must perturb the gradient"
+        );
+
+        // A different seed yields a different draw.
+        let mut rng_c = StdRng::seed_from_u64(43);
+        let out_c = aggregator.apply_dp_with_rng(&update, &mut rng_c);
+        assert_ne!(
+            out_a.gradients, out_c.gradients,
+            "different seed should give different noise"
+        );
+    }
+
+    #[test]
     fn test_privacy_budget_tracking() {
         let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::FedAvg, 2)
             .with_dp_config(DifferentialPrivacyConfig {
@@ -2413,7 +2674,7 @@ mod tests {
 
     #[test]
     fn test_secagg_masks_cancel() {
-        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::SecAgg, 2);
+        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::MaskedSumDemo, 2);
 
         aggregator.initialize_model(vec![0.0; 10]);
         aggregator.register_participant("ue-1", 100);
@@ -2450,7 +2711,104 @@ mod tests {
         for &w in &model.weights {
             assert!(
                 (w - 0.2).abs() < 0.01,
-                "SecAgg result should match FedAvg: got {w}, expected ~0.2"
+                "MaskedSumDemo result should match FedAvg: got {w}, expected ~0.2"
+            );
+        }
+    }
+
+    /// Codifies the limitation of `MaskedSumDemo`: the aggregator (server) mints
+    /// and holds every participant's key material, so it is NOT server-blind
+    /// secure aggregation (Bonawitz et al. 2017) — it provides no privacy
+    /// against the aggregator. If this assertion ever flips, the demo would have
+    /// to be re-reviewed against the secure-aggregation trust model.
+    #[test]
+    fn secagg_demo_is_not_blind() {
+        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::MaskedSumDemo, 2);
+        aggregator.register_participant("ue-1", 100);
+        aggregator.register_participant("ue-2", 100);
+
+        // The server itself holds public keys it minted locally for every
+        // participant (and, in `secagg_participants`, the matching secrets).
+        // In a real Bonawitz protocol the server would never possess these.
+        let server_held_keys = aggregator.secagg_public_keys();
+        assert_eq!(
+            server_held_keys.len(),
+            2,
+            "server mints/holds participant key material in the masking demo \
+             (inverted trust model) — this is not server-blind SecAgg"
+        );
+    }
+
+    /// The demo mask must depend on the FULL 32-byte shared secret, not just a
+    /// prefix. Two secrets that differ only past byte 8 must yield different
+    /// masks (the old implementation seeded only from the first 8 bytes).
+    #[test]
+    fn demo_mask_uses_full_secret() {
+        let s1 = [7u8; 32];
+        let mut s2 = [7u8; 32];
+        s2[20] = 8; // differ only well past the first 8 bytes
+
+        let m1 = demo_mask_from_secret(&s1, 16);
+        let m2 = demo_mask_from_secret(&s2, 16);
+
+        assert_eq!(m1.len(), 16);
+        assert_ne!(
+            m1, m2,
+            "mask must depend on all 32 secret bytes, not just the first 8"
+        );
+
+        // Determinism: same secret -> same mask.
+        assert_eq!(m1, demo_mask_from_secret(&s1, 16));
+    }
+
+    /// Under UNEQUAL sample weights, the pairwise masks must still cancel so the
+    /// recovered aggregate equals the plaintext weighted average. The previous
+    /// implementation masked unweighted gradients then took a weighted sum,
+    /// leaving a residual `(w_i - w_j)*mask` whenever weights differed.
+    #[test]
+    fn masked_sum_cancels_with_unequal_weights() {
+        let samples = [10u64, 50, 200];
+        let grads = [
+            vec![1.0f32, -2.0, 0.5, 3.0],
+            vec![3.0f32, 4.0, -1.0, 0.25],
+            vec![-5.0f32, 6.0, 2.0, -0.75],
+        ];
+        let dim = grads[0].len();
+
+        let mut aggregator = FederatedAggregator::new(AggregationAlgorithm::MaskedSumDemo, 3);
+        aggregator.initialize_model(vec![0.0; dim]);
+        aggregator.register_participant("ue-1", samples[0]);
+        aggregator.register_participant("ue-2", samples[1]);
+        aggregator.register_participant("ue-3", samples[2]);
+        aggregator.start_round().expect("start round");
+
+        for (idx, g) in grads.iter().enumerate() {
+            aggregator
+                .submit_update(ModelUpdate {
+                    participant_id: format!("ue-{}", idx + 1),
+                    base_version: 1,
+                    gradients: g.clone(),
+                    num_samples: samples[idx],
+                    loss: 0.1,
+                    timestamp_ms: timestamp_now(),
+                })
+                .expect("submit");
+        }
+
+        let model = aggregator.aggregate().expect("aggregate");
+
+        let total: f32 = samples.iter().map(|&s| s as f32).sum();
+        for k in 0..dim {
+            let expected: f32 = samples
+                .iter()
+                .zip(grads.iter())
+                .map(|(&s, g)| s as f32 * g[k])
+                .sum::<f32>()
+                / total;
+            assert!(
+                (model.weights[k] - expected).abs() < 1e-3,
+                "weighted masked sum failed at coord {k}: got {}, expected {expected}",
+                model.weights[k]
             );
         }
     }
@@ -2835,6 +3193,150 @@ mod tests {
         assert_eq!(
             aggregator.get_participant_tier("client1"),
             Some(FLTier::Edge)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T5.2-A: RDP numeric test — moments accountant < naive linear composition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rdp_composition_tighter_than_linear() {
+        // k rounds at σ=1.0.  Linear composition gives k * single-round ε.
+        let sigma = 1.0_f32;
+        let k = 10_u64;
+        let target_epsilon = 8.0_f32;
+        let target_delta = 1e-5_f32;
+
+        // Compute single-round linear ε via PrivacyBudgetTracker.
+        let dp_config = DifferentialPrivacyConfig {
+            enabled: true,
+            noise_multiplier: sigma,
+            clipping_threshold: 1.0,
+            target_epsilon,
+            target_delta,
+        };
+        let linear_tracker = PrivacyBudgetTracker::new(&dp_config);
+        let linear_epsilon_per_round = linear_tracker.epsilon_per_round;
+        let linear_total = linear_epsilon_per_round * k as f32;
+
+        // RDP tracker over k rounds.
+        let mut rdp = RenyiDPTracker::new(target_epsilon, target_delta);
+        for _ in 0..k {
+            rdp.record_gaussian(sigma);
+        }
+        let rdp_epsilon = rdp.get_epsilon();
+
+        assert!(rdp_epsilon.is_finite(), "RDP ε must be finite");
+        assert!(rdp_epsilon > 0.0, "RDP ε must be positive after {k} rounds");
+        assert!(
+            rdp_epsilon < linear_total,
+            "RDP ε ({rdp_epsilon:.4}) must be STRICTLY less than naive linear sum \
+             ({linear_total:.4}) for k={k} rounds — demonstrating tighter accounting"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T5.2-B: Byzantine dispatch reachability via FederatedAggregator
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an aggregator with the given algorithm, register 5 participants
+    /// (IDs "c0".."c4"), initialise a global model, start a round, submit 5 updates
+    /// where c3 and c4 are Byzantine outliers (value 50.0 vs honest ~1.0), and
+    /// aggregate.  Returns the aggregated weight vector.
+    fn run_byzantine_aggregation(algorithm: AggregationAlgorithm) -> Vec<f32> {
+        let mut agg = FederatedAggregator::new(algorithm, 5);
+        agg.initialize_model(vec![0.0; 3]);
+        for i in 0..5_u64 {
+            agg.register_participant(format!("c{i}"), 100);
+        }
+        agg.start_round().expect("start_round failed");
+
+        // Honest cluster: c0, c1, c2 all submit ~1.0
+        let honest: Vec<f32> = vec![1.0, 1.0, 1.0];
+        // Byzantine outliers: c3, c4 submit 50.0
+        let byzantine: Vec<f32> = vec![50.0, 50.0, 50.0];
+
+        for i in 0..3_u64 {
+            agg.submit_update(ModelUpdate {
+                participant_id: format!("c{i}"),
+                gradients: honest.clone(),
+                num_samples: 100,
+                loss: 0.1,
+                base_version: 1,
+                timestamp_ms: 0,
+            })
+            .expect("submit honest update failed");
+        }
+        for i in 3..5_u64 {
+            agg.submit_update(ModelUpdate {
+                participant_id: format!("c{i}"),
+                gradients: byzantine.clone(),
+                num_samples: 100,
+                loss: 0.1,
+                base_version: 1,
+                timestamp_ms: 0,
+            })
+            .expect("submit byzantine update failed");
+        }
+
+        let model = agg.aggregate().expect("aggregate() failed");
+        model.weights
+    }
+
+    #[test]
+    fn test_krum_dispatch_reachable() {
+        // Plain mean of 3 honest (1.0) + 2 Byzantine (50.0) = (3+100)/5 = 20.6
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        let result = run_byzantine_aggregation(AggregationAlgorithm::Krum { num_byzantine: 2 });
+        assert_eq!(result.len(), 3, "Krum result must have correct dimension");
+        // Krum selects the best single update (one of the honest ones ≈ 1.0)
+        assert!(
+            result[0] < plain_mean,
+            "Krum[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_multi_krum_dispatch_reachable() {
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        let result = run_byzantine_aggregation(AggregationAlgorithm::MultiKrum {
+            num_byzantine: 2,
+            m: 3,
+        });
+        assert_eq!(result.len(), 3);
+        assert!(
+            result[0] < plain_mean,
+            "MultiKrum[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_trimmed_mean_dispatch_reachable() {
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        // trim_ratio=0.4 removes 1 from each tail (floor(5*0.4/2)=1), leaving 3 middle values
+        let result =
+            run_byzantine_aggregation(AggregationAlgorithm::TrimmedMean { trim_ratio: 0.4 });
+        assert_eq!(result.len(), 3);
+        assert!(
+            result[0] < plain_mean,
+            "TrimmedMean[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_median_dispatch_reachable() {
+        let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
+        let result = run_byzantine_aggregation(AggregationAlgorithm::Median);
+        assert_eq!(result.len(), 3);
+        // Coordinate-wise median of [1,1,1,50,50] = 1.0
+        assert!(
+            result[0] < plain_mean,
+            "Median[0]={} should be closer to honest cluster than plain mean={plain_mean}",
+            result[0]
         );
     }
 }

@@ -78,13 +78,13 @@ async fn test_gtp_decapsulation() {
     let gtp_header = GtpHeader::g_pdu(downlink_teid, user_data.clone());
 
     // Test decapsulation
-    let (session_ue_id, session_psi, payload) = tunnel_mgr
+    let dl = tunnel_mgr
         .decapsulate_downlink(&gtp_header)
         .expect("Failed to decapsulate downlink");
 
-    assert_eq!(session_ue_id, ue_id);
-    assert_eq!(session_psi, psi);
-    assert_eq!(*payload, user_data);
+    assert_eq!(dl.ue_id, ue_id);
+    assert_eq!(dl.psi, psi);
+    assert_eq!(*dl.payload, user_data);
 }
 
 /// Test tunnel management

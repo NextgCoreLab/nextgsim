@@ -35,7 +35,7 @@ nextgsim is organized as a Cargo workspace with multiple crates, each responsibl
 ## Workspace Structure
 
 ```
-rust_src/
+nextgsim/
 ├── Cargo.toml                    # Workspace manifest
 ├── nextgsim-gnb/                 # gNB binary crate
 ├── nextgsim-ue/                  # UE binary crate
@@ -46,6 +46,7 @@ rust_src/
 ├── nextgsim-rrc/                 # RRC protocol library
 ├── nextgsim-crypto/              # Cryptographic functions
 ├── nextgsim-rls/                 # Radio Link Simulation
+├── nextgsim-rlc/                 # RLC layer (UM/AM entities, SN12 DRB for user plane)
 ├── nextgsim-gtp/                 # GTP-U protocol
 ├── nextgsim-sctp/                # SCTP transport
 └── tests/                        # Integration tests
@@ -443,12 +444,12 @@ RUST_LOG=nextgsim_nas=trace,nextgsim_rrc=debug ./nextgsim-ue -c config.yaml
 | Level | Location | Description |
 |-------|----------|-------------|
 | Unit | Each crate's `src/` | Encoding/decoding, state transitions |
-| Integration | `rust_src/tests/` | UE-gNB-AMF message flows |
+| Integration | `tests/` | UE-gNB-AMF message flows |
 | Conformance | Crypto crates | 3GPP test vectors |
 
 Run tests:
 ```bash
-cd rust_src
+cd nextgsim
 cargo test                    # All tests
 cargo test -p nextgsim-crypto # Single crate
 cargo test --test integration # Integration tests only

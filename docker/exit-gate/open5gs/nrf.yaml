@@ -1,0 +1,12 @@
+logger:
+  level: info
+global:
+nrf:
+  serving:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+  sbi:
+    server:
+      - address: 0.0.0.0
+        port: 7777

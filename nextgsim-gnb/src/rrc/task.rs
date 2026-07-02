@@ -9,13 +9,17 @@ use crate::tasks::{
 };
 use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
+use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_ul_dcch, UlDcchMessage};
+use nextgsim_rrc::procedures::information_transfer::{
+    encode_dl_information_transfer, DlInformationTransferParams,
+};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_complete, decode_rrc_setup_request,
-    RrcEstablishmentCause as AsnEstablishmentCause, UeIdentity,
+    RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
 };
 use nextgsim_rrc::procedures::ue_capability::{
     decode_ue_capability_information, encode_ue_capability_enquiry, parse_nr_capability_bands,
-    RatType, UeCapabilityEnquiryParams,
+    RatType, UeCapabilityEnquiryParams, UeCapabilityInformationData,
 };
 
 /// Simplified DL/UL-DCCH envelope code: first byte 0x06 marks a UE capability
@@ -24,6 +28,7 @@ use nextgsim_rrc::procedures::ue_capability::{
 const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
 
 use super::connection::RrcConnectionManager;
+use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
 use super::ue_context::RrcUeContextManager;
 
 /// NTN configuration stored at RRC level
@@ -64,7 +69,12 @@ impl RrcTask {
         self.pdu_id_counter
     }
 
-    fn handle_radio_power_on(&mut self) {
+    /// Handles `RrcMessage::RadioPowerOn`: activates (unbars) the cell.
+    ///
+    /// Public because it is a real message-handler entry point also driven
+    /// directly by the in-process strict-peer harness
+    /// (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub fn handle_radio_power_on(&mut self) {
         info!("Radio power on - cell is now active");
         self.connection_manager.set_barred(false);
     }
@@ -73,7 +83,13 @@ impl RrcTask {
         debug!("Signal detected from UE[{}]", ue_id);
     }
 
-    async fn handle_uplink_rrc(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
+    /// Handles `RrcMessage::UplinkRrc`: dispatches an uplink RRC PDU by
+    /// logical channel (UL-CCCH / UL-DCCH).
+    ///
+    /// Public because it is a real message-handler entry point also driven
+    /// directly by the in-process strict-peer harness
+    /// (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_uplink_rrc(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
         debug!(
             "Uplink RRC: ue_id={}, channel={:?}, len={}",
             ue_id,
@@ -193,6 +209,36 @@ impl RrcTask {
         }
 
         let bytes = data.data();
+
+        // ASN.1-first UL-DCCH dispatch (TS 38.331 §6.2.2, Wave-6 C3): a
+        // conformant UE encodes RRCSetupComplete as a real UPER
+        // UL-DCCH-Message (c1 CHOICE index 2 → leading byte 0x10..=0x17,
+        // low nibble 0x0 for tid 0), which matches NO arm of the legacy
+        // nibble dispatcher below and was previously dropped — losing the
+        // registration NAS. This narrow RrcSetupComplete-only decode is
+        // collision-free against the matched-sim UE's bespoke framing, so it
+        // is always on. The BROAD typed dispatch (all c1 variants) is gated
+        // separately below.
+        if let Ok(complete) = decode_rrc_setup_complete(bytes) {
+            self.handle_rrc_setup_complete_asn1(ue_id, complete).await;
+            return;
+        }
+
+        // Wave-6 C5: full typed UL-DCCH-Message dispatch (TS 38.331 §6.2.1).
+        // Gated behind C5_TYPED_DCCH_DISPATCH: the matched-sim UE still emits
+        // bespoke framing whose leading bytes COLLIDE with real UPER (e.g. its
+        // uplink NAS `[0x08, 0x00, NAS…]` decodes as a well-formed
+        // RRCReconfigurationComplete and would swallow the NAS — see
+        // nextgsim-rrc dcch_dispatch tests). So the broad typed dispatch is
+        // only enabled once the peer UE is a conformant typed peer; until then
+        // the legacy nibble arms below preserve the matched-sim path.
+        if C5_TYPED_DCCH_DISPATCH && self.try_dispatch_typed_ul_dcch(ue_id, bytes).await {
+            return;
+        }
+
+        // Legacy nibble fallback (bespoke `bytes[0] & 0x0F` framing + raw-NAS
+        // heuristic). This is the sole non-typed dispatch path and is retired
+        // in Wave-6 C6 once the UE is a conformant typed peer.
         let message_type = bytes[0] & 0x0F;
 
         match message_type {
@@ -238,6 +284,143 @@ impl RrcTask {
         }
     }
 
+    /// Wave-6 C5: fully-typed UL-DCCH-Message dispatch (TS 38.331 §6.2.1).
+    ///
+    /// Decodes the UL-DCCH-Message once (nextgsim-rrc `dispatch_ul_dcch`) and
+    /// routes each concrete c1 message type by its typed fields — no
+    /// `bytes[0] & 0x0F` nibble matching, no `bytes[N..]` NAS slicing. Returns
+    /// `true` if the message was recognised and handled, `false` otherwise (so
+    /// the caller can fall through to the legacy path). Enabled on the wire
+    /// only behind `C5_TYPED_DCCH_DISPATCH`; unit tests call it directly.
+    async fn try_dispatch_typed_ul_dcch(&mut self, ue_id: i32, bytes: &[u8]) -> bool {
+        match dispatch_ul_dcch(bytes) {
+            Ok(UlDcchMessage::RrcSetupComplete(complete)) => {
+                self.handle_rrc_setup_complete_asn1(ue_id, complete).await;
+                true
+            }
+            Ok(UlDcchMessage::SecurityModeComplete(complete)) => {
+                self.handle_security_mode_complete(ue_id, complete.rrc_transaction_id);
+                true
+            }
+            Ok(UlDcchMessage::RrcReconfigurationComplete(complete)) => {
+                self.handle_rrc_reconfiguration_complete_asn1(ue_id, complete.rrc_transaction_id);
+                true
+            }
+            Ok(UlDcchMessage::UlInformationTransfer(transfer)) => {
+                if let Some(nas) = transfer.dedicated_nas_message {
+                    info!(
+                        "UL InformationTransfer (ASN.1) from UE[{}]: forwarding {} NAS bytes",
+                        ue_id,
+                        nas.len()
+                    );
+                    self.send_uplink_nas_delivery(ue_id, OctetString::from_slice(&nas))
+                        .await;
+                }
+                true
+            }
+            Ok(UlDcchMessage::UeCapabilityInformation(info)) => {
+                self.process_ue_capability_information(ue_id, info);
+                true
+            }
+            Ok(UlDcchMessage::Unsupported) => false,
+            Err(e) => {
+                debug!("UL-DCCH typed decode failed for UE[{}]: {}", ue_id, e);
+                false
+            }
+        }
+    }
+
+    /// Handles a typed SecurityModeComplete (TS 38.331 §5.3.4).
+    ///
+    /// Verifies the echoed tid against the UE's outstanding SecurityMode
+    /// transaction on the RRC context. NOTE: AS security is established on the
+    /// gNB NGAP task's UE context (the SMC tid is allocated there), so the RRC
+    /// context typically reports `NoOutstanding` and this handler confirms
+    /// framing/plumbing only. Full cross-task AS-security completion (notifying
+    /// the NGAP/AMF side and enforcing PDCP) is the paired UE-AS-security item
+    /// (residue I5) and is NOT claimed here.
+    fn handle_security_mode_complete(&mut self, ue_id: i32, echoed_tid: u8) {
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            match ctx
+                .transactions
+                .verify(RrcProcedure::SecurityMode, echoed_tid)
+            {
+                TidVerification::Mismatch { expected } => {
+                    warn!(
+                        "Discarding SecurityModeComplete from UE[{}]: echoed tid {} != \
+                         outstanding {} (TS 38.331 §5.3.4)",
+                        ue_id, echoed_tid, expected
+                    );
+                    return;
+                }
+                TidVerification::Match | TidVerification::NoOutstanding => {}
+            }
+        }
+        info!(
+            "SecurityModeComplete (ASN.1) from UE[{}], tid={} — AS security \
+             activation confirmed at RRC framing level (see residue I5 for full \
+             AS-security enforcement)",
+            ue_id, echoed_tid
+        );
+    }
+
+    /// Handles a typed RRCReconfigurationComplete (TS 38.331 §5.3.5).
+    ///
+    /// Verifies the echoed tid against the UE's outstanding Reconfiguration
+    /// transaction. Like SecurityModeComplete, the Reconfiguration tid is
+    /// allocated on the NGAP task context, so the RRC context typically reports
+    /// `NoOutstanding` (framing/plumbing confirmation only).
+    fn handle_rrc_reconfiguration_complete_asn1(&mut self, ue_id: i32, echoed_tid: u8) {
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            match ctx
+                .transactions
+                .verify(RrcProcedure::Reconfiguration, echoed_tid)
+            {
+                TidVerification::Mismatch { expected } => {
+                    warn!(
+                        "Discarding RRCReconfigurationComplete from UE[{}]: echoed tid {} != \
+                         outstanding {} (TS 38.331 §5.3.5)",
+                        ue_id, echoed_tid, expected
+                    );
+                    return;
+                }
+                TidVerification::Match | TidVerification::NoOutstanding => {}
+            }
+        }
+        info!(
+            "RRCReconfigurationComplete (ASN.1) from UE[{}], tid={}",
+            ue_id, echoed_tid
+        );
+    }
+
+    /// Handles a typed, ASN.1-decoded RRCSetupComplete (TS 38.331 §5.3.3.4).
+    ///
+    /// This is the primary path (Wave-6 C3): the UE's real UPER UL-DCCH
+    /// encoding carries the transaction id, the dedicated NAS message, and
+    /// the RedCap indication as typed fields — no byte-offset extraction.
+    async fn handle_rrc_setup_complete_asn1(&mut self, ue_id: i32, complete: RrcSetupCompleteData) {
+        info!(
+            "RRC Setup Complete (ASN.1 UL-DCCH) from UE[{}]: tid={}, nas_len={}, redcap={}",
+            ue_id,
+            complete.rrc_transaction_id,
+            complete.dedicated_nas_message.len(),
+            complete.redcap_indication
+        );
+
+        let nas_pdu = OctetString::from_slice(&complete.dedicated_nas_message);
+        self.finish_rrc_setup_complete(
+            ue_id,
+            complete.rrc_transaction_id,
+            nas_pdu,
+            complete.redcap_indication,
+            "ASN.1",
+        )
+        .await;
+    }
+
+    /// Handles a bespoke (non-ASN.1) RRCSetupComplete. Only reached when the
+    /// ASN.1-first decode in `handle_ul_dcch_message` failed — i.e. for the
+    /// UE's legacy fallback framing `[0x04, tid, 0x01, NAS...]` (retired in C6).
     async fn handle_rrc_setup_complete(&mut self, ue_id: i32, data: &OctetString) {
         let bytes = data.data();
         if bytes.len() < 3 {
@@ -260,6 +443,37 @@ impl RrcTask {
         let redcap_indication = decode_rrc_setup_complete(bytes)
             .map(|data| data.redcap_indication)
             .unwrap_or(false);
+
+        info!(
+            "RRC Setup Complete (bespoke fallback) from UE[{}]: tid={}, nas_len={}",
+            ue_id,
+            transaction_id,
+            nas_pdu.len()
+        );
+
+        self.finish_rrc_setup_complete(
+            ue_id,
+            transaction_id,
+            nas_pdu,
+            redcap_indication,
+            "bespoke-fallback",
+        )
+        .await;
+    }
+
+    /// Common tail for both RRCSetupComplete decode paths: transitions the UE
+    /// context to Connected, forwards the NAS PDU to NGAP as an Initial UE
+    /// Message, and enquires UE capabilities. `via` names the decode path in
+    /// the log line so the ASN.1 and bespoke-fallback paths are
+    /// distinguishable in an E2E log (Wave-6 C3 acceptance).
+    async fn finish_rrc_setup_complete(
+        &mut self,
+        ue_id: i32,
+        transaction_id: u8,
+        nas_pdu: OctetString,
+        redcap_indication: bool,
+        via: &str,
+    ) {
         if redcap_indication {
             self.apply_redcap_restrictions(ue_id);
         }
@@ -271,6 +485,12 @@ impl RrcTask {
             nas_pdu,
             None,
         ) {
+            info!(
+                "Initial UE Message via {} RRCSetupComplete path (ue_id={}, nas_len={})",
+                via,
+                result.ue_id,
+                result.nas_pdu.len()
+            );
             self.send_initial_nas_delivery(
                 result.ue_id,
                 result.nas_pdu,
@@ -330,15 +550,36 @@ impl RrcTask {
 
     /// Sends a UECapabilityEnquiry to the UE (TS 38.331 §5.6.1)
     async fn send_ue_capability_enquiry(&mut self, ue_id: i32) {
+        // Wave-6 C4-final: allocate the UECapabilityEnquiry tid from THIS UE's
+        // per-context allocator (TS 38.331 §5.6.1 / §6.3.2), recorded as
+        // outstanding so the tid echoed in UECapabilityInformation is verified.
+        // The wire value is pinned to 0 while C5_TYPED_DCCH_DISPATCH is off (the
+        // UE DL-DCCH dispatcher is still the legacy nibble matcher); it becomes
+        // the full per-UE 0..3 cycle when C5 lands.
+        let rrc_transaction_id = self
+            .ue_manager
+            .try_find_ue_mut(ue_id)
+            .map(|ctx| ctx.transactions.allocate(RrcProcedure::UeCapability))
+            .unwrap_or(0);
         let params = UeCapabilityEnquiryParams {
-            rrc_transaction_id: 0,
+            rrc_transaction_id,
             rat_types: vec![RatType::Nr],
         };
         match encode_ue_capability_enquiry(&params) {
             Ok(uper) => {
-                let mut pdu = Vec::with_capacity(uper.len() + 1);
-                pdu.push(RRC_MSG_TYPE_UE_CAPABILITY);
-                pdu.extend_from_slice(&uper);
+                // Wave-6 C5: `uper` is already a complete UPER DL-DCCH-Message
+                // (c1 = ueCapabilityEnquiry, TS 38.331 §6.2.1). When
+                // C5_TYPED_DCCH_DISPATCH is on, send it raw — no bespoke `0x06`
+                // envelope byte. While off, keep the `0x06` envelope the
+                // matched-sim UE dispatcher matches on (dropped in C6).
+                let pdu = if C5_TYPED_DCCH_DISPATCH {
+                    uper
+                } else {
+                    let mut framed = Vec::with_capacity(uper.len() + 1);
+                    framed.push(RRC_MSG_TYPE_UE_CAPABILITY);
+                    framed.extend_from_slice(&uper);
+                    framed
+                };
                 info!("Sending UECapabilityEnquiry to UE[{}]", ue_id);
                 self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
                     .await;
@@ -349,7 +590,10 @@ impl RrcTask {
         }
     }
 
-    /// Handles a UECapabilityInformation from the UE (TS 38.331 §5.6.1)
+    /// Handles a UECapabilityInformation from the UE (TS 38.331 §5.6.1),
+    /// decoding the legacy `0x06`-envelope framing. Delegates the tid
+    /// verification + capability handling to [`Self::process_ue_capability_information`],
+    /// which the C5 typed dispatch also uses.
     async fn handle_ue_capability_information(&mut self, ue_id: i32, uper_bytes: &[u8]) {
         let information = match decode_ue_capability_information(uper_bytes) {
             Ok(data) => data,
@@ -361,6 +605,37 @@ impl RrcTask {
                 return;
             }
         };
+        self.process_ue_capability_information(ue_id, information);
+    }
+
+    /// Common core for a decoded UECapabilityInformation (TS 38.331 §5.6.1):
+    /// verifies the echoed tid, parses the NR capability bands, and stores the
+    /// container. Reached from both the legacy `0x06`-envelope path and the C5
+    /// typed UL-DCCH dispatch.
+    fn process_ue_capability_information(
+        &mut self,
+        ue_id: i32,
+        information: UeCapabilityInformationData,
+    ) {
+        // Wave-6 C4-final: verify the tid the UE echoed against the outstanding
+        // UECapabilityEnquiry transaction (TS 38.331 §5.6.1). Fail-closed on a
+        // mismatch; tolerate NoOutstanding (no enquiry recorded for this UE).
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            match ctx
+                .transactions
+                .verify(RrcProcedure::UeCapability, information.rrc_transaction_id)
+            {
+                TidVerification::Mismatch { expected } => {
+                    warn!(
+                        "Discarding UECapabilityInformation from UE[{}]: echoed tid \
+                         {} != outstanding {} (TS 38.331 §5.6.1)",
+                        ue_id, information.rrc_transaction_id, expected
+                    );
+                    return;
+                }
+                TidVerification::Match | TidVerification::NoOutstanding => {}
+            }
+        }
 
         for container in &information.containers {
             if container.rat_type == RatType::Nr {
@@ -418,13 +693,43 @@ impl RrcTask {
             .await;
     }
 
+    /// Builds the downlink NAS transport PDU delivered to the UE on SRB1.
+    ///
+    /// Wave-6 C5: when `C5_TYPED_DCCH_DISPATCH` is on, emits the real UPER
+    /// DL-DCCH DLInformationTransfer (TS 38.331 §5.7.1 / §6.2.1). While off it
+    /// keeps the legacy bespoke `[0x04, 0x00, 0x00, NAS…]` framing the
+    /// matched-sim UE's nibble dispatcher expects (retired in C6).
     fn build_dl_information_transfer(&self, nas_pdu: &OctetString) -> OctetString {
-        let mut pdu = Vec::with_capacity(nas_pdu.len() + 4);
+        if C5_TYPED_DCCH_DISPATCH {
+            if let Some(bytes) = Self::build_dl_information_transfer_typed(nas_pdu) {
+                return OctetString::from_slice(&bytes);
+            }
+            // Typed encode failed — fall through to the legacy framing so the
+            // NAS is still delivered (fully fail-closed handling is C6).
+        }
+        let mut pdu = Vec::with_capacity(nas_pdu.len() + 3);
         pdu.push(0x04);
         pdu.push(0x00);
         pdu.push(0x00);
         pdu.extend_from_slice(nas_pdu.data());
         OctetString::from_slice(&pdu)
+    }
+
+    /// Encodes a real UPER DL-DCCH DLInformationTransfer (tid 0) carrying
+    /// `nas_pdu` (TS 38.331 §5.7.1). The typed encoder used on the wire when
+    /// C5 is enabled; exercised directly by unit tests regardless of the
+    /// compile-time gate.
+    fn build_dl_information_transfer_typed(nas_pdu: &OctetString) -> Option<Vec<u8>> {
+        match encode_dl_information_transfer(&DlInformationTransferParams {
+            rrc_transaction_id: 0,
+            dedicated_nas_message: Some(nas_pdu.data().to_vec()),
+        }) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                error!("Failed to encode typed DLInformationTransfer: {}", e);
+                None
+            }
+        }
     }
 
     async fn handle_rrc_reestablishment_request(&mut self, ue_id: i32, data: &OctetString) {
@@ -683,6 +988,26 @@ impl Task for RrcTask {
                             RrcMessage::NasDelivery { ue_id, pdu } => {
                                 self.handle_nas_delivery(ue_id, pdu).await;
                             }
+                            RrcMessage::SecurityModeCommand { ue_id, pdu } => {
+                                // TS 38.331 §5.3.4: deliver the SecurityModeCommand
+                                // on SRB1 (DL-DCCH).
+                                info!(
+                                    "Sending RRC SecurityModeCommand to UE {} ({} bytes)",
+                                    ue_id,
+                                    pdu.len()
+                                );
+                                self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                            }
+                            RrcMessage::RrcReconfiguration { ue_id, pdu } => {
+                                // TS 38.331 §5.3.5.6: deliver the RRCReconfiguration
+                                // (DRB setup) on SRB1 (DL-DCCH).
+                                info!(
+                                    "Sending RRC Reconfiguration to UE {} ({} bytes)",
+                                    ue_id,
+                                    pdu.len()
+                                );
+                                self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                            }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
                             }
@@ -816,5 +1141,322 @@ mod tests {
         let dl_info = task.build_dl_information_transfer(&nas_pdu);
         assert_eq!(dl_info.len(), 6);
         assert_eq!(dl_info.data()[0], 0x04);
+    }
+
+    // ========================================================================
+    // Wave-6 C3: UL-DCCH RRCSetupComplete dispatch — additive-accept.
+    // The gNB must accept BOTH the UE's primary ASN.1 UPER encoding
+    // (TS 38.331 §6.2.2, leading byte 0x10 for tid 0 — previously dropped by
+    // the nibble dispatcher) and the UE's bespoke fallback framing
+    // [0x04, tid, 0x01, NAS...]. One dedicated test per encoding.
+    // ========================================================================
+
+    fn run_async<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(fut)
+    }
+
+    /// Drives a real ASN.1 RRCSetupRequest through `handle_uplink_rrc` so the
+    /// gNB creates the UE context and emits the RRCSetup (fresh task → tid 0).
+    async fn establish_pending_setup(task: &mut RrcTask, ue_id: i32) {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_request, RrcSetupRequestParams,
+        };
+
+        task.handle_radio_power_on();
+        let req = encode_rrc_setup_request(&RrcSetupRequestParams {
+            ue_identity: UeIdentity::RandomValue(0x1234567890),
+            establishment_cause: AsnEstablishmentCause::MoSignalling,
+        })
+        .expect("encode RRCSetupRequest");
+        task.handle_uplink_rrc(ue_id, RrcChannel::UlCcch, OctetString::from_slice(&req))
+            .await;
+    }
+
+    /// Pops the next Initial UE Message from the NGAP channel, if any.
+    fn try_take_initial_nas(
+        ngap_rx: &mut mpsc::Receiver<TaskMessage<NgapMessage>>,
+    ) -> Option<(i32, OctetString)> {
+        while let Ok(msg) = ngap_rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::InitialNasDelivery { ue_id, pdu, .. }) = msg {
+                return Some((ue_id, pdu));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_ul_dcch_asn1_rrc_setup_complete_accepted() {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_complete, RrcSetupCompleteParams,
+        };
+
+        let config = test_config();
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 1).await;
+
+            let nas: Vec<u8> = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+            let complete = encode_rrc_setup_complete(&RrcSetupCompleteParams {
+                registered_amf: None,
+                rrc_transaction_id: 0,
+                selected_plmn_identity: 1,
+                guami_type: None,
+                s_nssai_list: None,
+                dedicated_nas_message: nas.clone(),
+                ng_5g_s_tmsi_value: None,
+                redcap_indication: false,
+            })
+            .expect("encode RRCSetupComplete");
+
+            // UL-DCCH-Message c1 index 2 (rrcSetupComplete), tid 0: leading
+            // byte 0x10, low nibble 0x0 — matches no legacy dispatch arm.
+            assert_eq!(complete[0], 0x10, "ASN.1 RRCSetupComplete leading byte");
+
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                .await;
+
+            let (ue_id, pdu) = try_take_initial_nas(&mut ngap_rx)
+                .expect("ASN.1 RRCSetupComplete must produce an Initial UE Message");
+            assert_eq!(ue_id, 1);
+            assert_eq!(pdu.data(), &nas[..], "NAS must be byte-for-byte identical");
+        });
+    }
+
+    #[test]
+    fn test_ul_dcch_bespoke_rrc_setup_complete_accepted() {
+        let config = test_config();
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 1).await;
+
+            let nas: Vec<u8> = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+            // Bespoke fallback framing from the UE (ue/rrc/task.rs
+            // send_rrc_setup_complete fallback): [0x04, tid, 0x01, NAS...].
+            let mut bespoke = vec![0x04, 0x00, 0x01];
+            bespoke.extend_from_slice(&nas);
+
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&bespoke))
+                .await;
+
+            let (ue_id, pdu) = try_take_initial_nas(&mut ngap_rx)
+                .expect("bespoke RRCSetupComplete must still produce an Initial UE Message");
+            assert_eq!(ue_id, 1);
+            assert_eq!(pdu.data(), &nas[..], "NAS must be byte-for-byte identical");
+        });
+    }
+
+    // ========================================================================
+    // Wave-6 C5: fully-typed UL-DCCH dispatch (TS 38.331 §6.2.1). The gNB
+    // routes every c1 message type from its typed fields — no `bytes[0] & 0x0F`
+    // nibble matching, no `bytes[N..]` NAS slicing. `try_dispatch_typed_ul_dcch`
+    // is exercised DIRECTLY (independent of the compile-time
+    // C5_TYPED_DCCH_DISPATCH wire gate), mirroring the transaction-allocator
+    // test pattern in transaction.rs.
+    // ========================================================================
+
+    /// Pops the next Uplink NAS Delivery from the NGAP channel, if any.
+    fn try_take_uplink_nas(
+        ngap_rx: &mut mpsc::Receiver<TaskMessage<NgapMessage>>,
+    ) -> Option<(i32, OctetString)> {
+        while let Ok(msg) = ngap_rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::UplinkNasDelivery { ue_id, pdu }) = msg {
+                return Some((ue_id, pdu));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_typed_ul_dcch_setup_complete_dispatched() {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_complete, RrcSetupCompleteParams,
+        };
+        let config = test_config();
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_pending_setup(&mut task, 1).await;
+            let nas = vec![0x7E, 0x00, 0x41, 0x02];
+            let complete = encode_rrc_setup_complete(&RrcSetupCompleteParams {
+                registered_amf: None,
+                rrc_transaction_id: 0,
+                selected_plmn_identity: 1,
+                guami_type: None,
+                s_nssai_list: None,
+                dedicated_nas_message: nas.clone(),
+                ng_5g_s_tmsi_value: None,
+                redcap_indication: false,
+            })
+            .unwrap();
+            assert!(
+                task.try_dispatch_typed_ul_dcch(1, &complete).await,
+                "typed dispatch must handle RRCSetupComplete"
+            );
+            let (ue_id, pdu) = try_take_initial_nas(&mut ngap_rx).expect("Initial UE Message");
+            assert_eq!(ue_id, 1);
+            assert_eq!(pdu.data(), &nas[..]);
+        });
+    }
+
+    #[test]
+    fn test_typed_ul_dcch_ul_information_transfer_forwards_nas() {
+        use nextgsim_rrc::procedures::information_transfer::{
+            encode_ul_information_transfer, UlInformationTransferParams,
+        };
+        let config = test_config();
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            let nas = vec![0x7E, 0x00, 0x55, 0xAB];
+            let ulit = encode_ul_information_transfer(&UlInformationTransferParams {
+                dedicated_nas_message: Some(nas.clone()),
+            })
+            .unwrap();
+            assert!(task.try_dispatch_typed_ul_dcch(9, &ulit).await);
+            let (ue_id, pdu) = try_take_uplink_nas(&mut ngap_rx).expect("Uplink NAS Delivery");
+            assert_eq!(ue_id, 9);
+            assert_eq!(
+                pdu.data(),
+                &nas[..],
+                "uplink NAS must survive typed dispatch byte-for-byte"
+            );
+        });
+    }
+
+    #[test]
+    fn test_typed_ul_dcch_security_mode_complete_tid_verified() {
+        use nextgsim_rrc::procedures::security_mode::{
+            encode_security_mode_complete, SecurityModeCompleteParams,
+        };
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            // Seed a UE context with an outstanding SecurityMode tid (0).
+            {
+                let ctx = task.ue_manager.create_ue(1);
+                assert_eq!(
+                    ctx.transactions
+                        .allocate_cycling(RrcProcedure::SecurityMode),
+                    0
+                );
+            }
+            // Mismatch (echo tid 1) — fail-closed: outstanding stays pending.
+            let bad = encode_security_mode_complete(&SecurityModeCompleteParams {
+                rrc_transaction_id: 1,
+            })
+            .unwrap();
+            assert!(task.try_dispatch_typed_ul_dcch(1, &bad).await);
+            assert_eq!(
+                task.ue_manager
+                    .try_find_ue(1)
+                    .unwrap()
+                    .transactions
+                    .outstanding(RrcProcedure::SecurityMode),
+                Some(0),
+                "mismatched SecurityModeComplete must not clear the outstanding tid"
+            );
+            // Correct echo (tid 0) — verified & cleared.
+            let good = encode_security_mode_complete(&SecurityModeCompleteParams {
+                rrc_transaction_id: 0,
+            })
+            .unwrap();
+            assert!(task.try_dispatch_typed_ul_dcch(1, &good).await);
+            assert_eq!(
+                task.ue_manager
+                    .try_find_ue(1)
+                    .unwrap()
+                    .transactions
+                    .outstanding(RrcProcedure::SecurityMode),
+                None,
+                "correct SecurityModeComplete tid clears the outstanding transaction"
+            );
+        });
+    }
+
+    #[test]
+    fn test_typed_ul_dcch_reconfiguration_complete_dispatched() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration_complete, RrcReconfigurationCompleteParams,
+        };
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            let reconf_complete =
+                encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+                    rrc_transaction_id: 0,
+                })
+                .unwrap();
+            assert!(
+                task.try_dispatch_typed_ul_dcch(3, &reconf_complete).await,
+                "typed dispatch must handle RRCReconfigurationComplete"
+            );
+        });
+    }
+
+    #[test]
+    fn test_typed_ul_dcch_unsupported_falls_through() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            // Leading bit 1 -> messageClassExtension: a well-formed but
+            // non-dispatched UL-DCCH-Message. The typed dispatcher returns false
+            // so the caller can fall through to the legacy path.
+            assert!(!task.try_dispatch_typed_ul_dcch(1, &[0x80]).await);
+        });
+    }
+
+    /// The C5-enabled typed DLInformationTransfer builder must produce the
+    /// hand-derived golden UPER bytes (TS 38.331 §5.7.1; see nextgsim-rrc
+    /// `golden_dl_information_transfer_bytes`). Exercised directly regardless
+    /// of the compile-time wire gate.
+    #[test]
+    fn test_build_dl_information_transfer_typed_golden() {
+        let nas = OctetString::from_slice(&[0x7E, 0x00, 0x42]);
+        let bytes = RrcTask::build_dl_information_transfer_typed(&nas)
+            .expect("typed DLInformationTransfer must encode");
+        assert_eq!(
+            bytes,
+            vec![0x28, 0x80, 0x6F, 0xC0, 0x08, 0x40],
+            "typed DLInformationTransfer(tid 0, NAS) must equal the golden UPER"
+        );
+    }
+
+    /// While the wire gate is OFF (default, matched-sim safe), the legacy
+    /// bespoke DL framing is preserved verbatim so the unchanged UE dispatcher
+    /// keeps routing.
+    #[test]
+    fn test_build_dl_information_transfer_legacy_while_c5_off() {
+        if C5_TYPED_DCCH_DISPATCH {
+            return;
+        }
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let task = RrcTask::new(task_base);
+        let nas = OctetString::from_slice(&[0x7E, 0x00, 0x42]);
+        let pdu = task.build_dl_information_transfer(&nas);
+        assert_eq!(
+            pdu.data(),
+            &[0x04, 0x00, 0x00, 0x7E, 0x00, 0x42][..],
+            "C5-off: legacy bespoke DL framing preserved for the matched-sim UE"
+        );
     }
 }

@@ -21,8 +21,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{GnbTaskBase, NgapMessage, SctpMessage, Task, TaskMessage};
+use nextgsim_common::config::SctpBackendKind;
 use nextgsim_common::OctetString;
-use nextgsim_sctp::SctpConfig;
+use nextgsim_sctp::{SctpBackend, SctpConfig};
 
 use super::amf_connection::{AmfConnection, AmfConnectionConfig, AmfConnectionEvent};
 
@@ -133,12 +134,23 @@ impl SctpTask {
             );
         }
 
+        // Map the gNB-level SCTP backend knob (`sctp_backend` in the YAML) onto
+        // the transport-level selector. Defaults to userspace so all existing
+        // deployments are unchanged.
+        let backend = match self.task_base.config.sctp_backend {
+            SctpBackendKind::Userspace => SctpBackend::Userspace,
+            SctpBackendKind::Kernel => SctpBackend::Kernel,
+        };
+
         // Build the full connection config.
         let conn_config = AmfConnectionConfig {
             local_address: local_addr,
             remote_address: remote_addr,
             secondary_addresses,
-            sctp_config: SctpConfig::default(),
+            sctp_config: SctpConfig {
+                backend,
+                ..SctpConfig::default()
+            },
         };
 
         // Create and connect.

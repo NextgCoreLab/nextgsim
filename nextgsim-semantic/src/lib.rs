@@ -5,6 +5,16 @@
 //! - Joint source-channel coding
 //! - Semantic importance weighting
 //!
+//! # TR 22.870 mapping
+//!
+//! TR 22.870 does not define a dedicated semantic-communication use case;
+//! semantic communication appears only illustratively in the study body. This
+//! crate therefore prototypes, at the concept level, the AI-service use-case
+//! family it most naturally supports — TR 22.870 §6.24 (distributed 6G network
+//! for AI computing) and §6.25 (AI/ML model training and inference). TR 22.870
+//! is a Stage-1 study; these are potential requirements with no Stage-3 wire
+//! spec — this crate is a research prototype, not a conformant implementation.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -40,7 +50,7 @@
 //!
 //! | Module | Description |
 //! |--------|-------------|
-//! | [`codec`] | ONNX-based neural encoder / decoder with mean-pooling fallback |
+//! | [`codec`] | Mean-pooling encoder / nearest-neighbor decoder (operational); optional ONNX |
 //! | [`jscc`] | Joint Source-Channel Coding with channel-adaptive symbols |
 //! | [`metrics`] | Cosine similarity, MSE, PSNR, top-k accuracy |
 //! | [`rate_distortion`] | Rate-distortion optimisation controller |
@@ -51,7 +61,8 @@ use std::collections::HashMap;
 
 // ── New modules ──────────────────────────────────────────────────────────────
 
-/// ONNX-based neural codec (encoder + decoder) with mean-pooling fallback.
+/// Semantic codec. Operational path: mean-pooling encoder + nearest-neighbor
+/// decoder (no ONNX model ships); optional ONNX model loading is supported.
 pub mod codec;
 
 /// Joint Source-Channel Coding: channel-adaptive encoding in one step.

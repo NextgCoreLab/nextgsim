@@ -24,9 +24,10 @@
 use std::time::{Duration, Instant};
 
 /// Handover states
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandoverState {
     /// No handover in progress
+    #[default]
     Idle,
     /// Handover preparation - received RRC Reconfiguration
     Preparing,
@@ -36,12 +37,6 @@ pub enum HandoverState {
     Completing,
     /// Handover failed
     Failed,
-}
-
-impl Default for HandoverState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 /// Handover failure cause

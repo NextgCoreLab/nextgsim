@@ -1,7 +1,9 @@
 //! Service Hosting Environment (SHE) for 6G Networks
 //!
-//! This crate implements the Service Hosting Environment per 3GPP TS 23.558,
-//! providing a three-tier distributed compute platform for AI/ML workloads.
+//! This crate is a **research model** for distributed AI/ML compute placement,
+//! inspired by the tiered-edge concepts of 3GPP TS 23.558 (EDGEAPP); it does
+//! **not** implement TS 23.558. It provides a three-tier (LocalEdge/RegionalEdge/
+//! CoreCloud) compute-placement scheduler for AI/ML workloads.
 //!
 //! # Architecture
 //!
@@ -31,11 +33,23 @@
 //! | Regional Edge  | <20ms   | Fine-tuning  | Cell handover, load prediction |
 //! | Core Cloud     | N/A     | Full training| Global model training, aggregation |
 //!
-//! # 3GPP Compliance
+//! # Design references (non-conformant)
 //!
-//! This implementation aligns with:
+//! Conceptual references only:
 //! - 3GPP TS 23.558: Architecture for enabling Edge Applications
 //! - 3GPP TS 29.558: Application layer support for Edge Computing
+//!
+//! No EDGEAPP entity (ECS/EES/EAS), reference point (EDGE-1..10) or SBI
+//! (T8/N33) is implemented; this is a 6G research prototype aligned at the
+//! concept level only. TR 22.870 is a Stage-1 study with no Stage-3 wire spec.
+//!
+//! # TR 22.870 mapping
+//!
+//! Prototypes the computing-service use cases of TR 22.870 clause 12 (e.g.
+//! §12.1 computing service for XR gaming acceleration, §12.2 computing service
+//! enabling personal AI Agent). TR 22.870 is a Stage-1 study; these are
+//! potential requirements with no Stage-3 wire spec — this crate is a research
+//! prototype, not a conformant implementation.
 //!
 //! # Example Usage
 //!

@@ -127,18 +127,23 @@ impl SheIsacClient {
         }
     }
 
-    /// Submits a sensing workload to SHE for processing
+    /// Allocates a workload id for a sensing request.
+    ///
+    /// NOTE: this is a stub — it does NOT dispatch the workload to a SHE
+    /// runtime (SHE transport is not implemented in this prototype); it only
+    /// mints a monotonic id for bookkeeping. The arguments are accepted to fix
+    /// the intended call shape but are not acted upon.
     ///
     /// # Arguments
     ///
-    /// * `sensing_data` - The sensing data to process
-    /// * `processing_type` - Type of processing to perform
+    /// * `sensing_data` - The sensing data that would be processed
+    /// * `processing_type` - Type of processing that would be performed
     /// * `latency_requirement_ms` - Maximum acceptable latency
     /// * `priority` - Priority level (0-10, higher is more urgent)
     ///
     /// # Returns
     ///
-    /// The workload ID assigned to this request
+    /// The workload ID allocated for this request
     pub fn submit_sensing_workload(
         &mut self,
         _sensing_data: SensingData,
@@ -146,6 +151,7 @@ impl SheIsacClient {
         _latency_requirement_ms: u32,
         _priority: u8,
     ) -> u64 {
+        // STUB: does NOT dispatch to a SHE runtime — only allocates an id.
         let workload_id = self.next_workload_id;
         self.next_workload_id += 1;
 

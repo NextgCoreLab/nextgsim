@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-The five node/infrastructure crates provide a solid 5G NR simulation baseline with fully implemented core protocol stacks (NGAP, RRC, NAS, GTP-U, RLS, SCTP). However, **all 6G AI-native network functions exist only as task ID definitions and message type stubs** -- no task implementations exist. RRC message encoding uses simplified byte formats rather than real ASN.1, and several NGAP procedures remain incomplete.
+The five node/infrastructure crates provide a solid 5G NR simulation baseline with fully implemented core protocol stacks (NGAP, RRC, NAS, GTP-U, RLS, SCTP). However, the node-level 6G AI-native functions (SHE/NWDAF/NKEF/ISAC/Agent/FL) are wired only as `TaskId` variants, message enums, and mpsc channel handles on `GnbTaskBase`/`UeTaskBase` -- no consumer `run()` loops are spawned (the actual algorithms live in the separate `nextgsim-isac`/`-fl`/`-she`/`-semantic`/`-nwdaf` crates). RRC Setup, Setup Complete, Setup Request, and Release now use real ASN.1 UPER via the `nextgsim-rrc` codec; only the Measurement Report path still uses a simplified byte format, and several secondary NGAP procedures remain incomplete.
 
 | Crate | Files | Lines (est.) | Completeness | 6G Readiness |
 |---|---|---|---|---|
@@ -47,7 +47,7 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 | Gap | Location | Details |
 |---|---|---|
-| **6G task stubs (SHE, NWDAF, NKEF, ISAC, Agent, FL)** | `src/tasks.rs:62-67` | `TaskId` enum defines 6 AI-native IDs. Message types (`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`, `FlAggregatorMessage`) are defined with detailed fields but **no task implementations exist**. `GnbTaskBase` only has handles for 6 core tasks. |
+| **6G task stubs (SHE, NWDAF, NKEF, ISAC, Agent, FL)** | `src/tasks.rs:62-67` | `TaskId` enum defines 6 AI-native IDs. Message types (`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`, `FlAggregatorMessage`) are defined with detailed fields but **no task implementations exist**. `GnbTaskBase` now also carries channel handles (`she_tx`/`nwdaf_tx`/`nkef_tx`/`isac_tx`/`agent_tx`/`fl_tx`) and their receivers for the 6G tasks, but no consumer `run()` loops are spawned. |
 | UE Context Release Request | `src/ngap/task.rs:752-755` | Comment: "encoding not yet implemented" -- local cleanup only, no NGAP message sent |
 | Unhandled NGAP messages | `src/ngap/task.rs` | Several NGAP message types have `_ => { tracing::warn!("not yet handled") }` match arms |
 | Inter-gNB handover | `src/rrc/handover.rs:48` | `InterGnb` variant exists in `HandoverType` but comment: "not implemented yet" |
@@ -94,7 +94,7 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 | **6G task stubs (SheClient, NwdafReporter, IsacSensor, FlParticipant, SemanticCodec)** | `src/tasks.rs:72-76` | 5 AI-native `TaskId` variants defined. Message types (`SheClientMessage`, `NwdafReporterMessage`, `IsacSensorMessage`, `FlParticipantMessage`, `SemanticCodecMessage`) have detailed fields (inference requests, sensing, FL training, semantic encode/decode) but **no task implementations**. `UeTaskBase` only has handles for 4 core tasks. |
 | 6G message routing | `src/tasks.rs:1441` | Uses `TaskId::App` as placeholder for 6G message routing |
 | ps-release-all incomplete | `src/app/cli_handler.rs:523-524` | Only releases first PDU session; comment: "In a full implementation, this would queue releases for all sessions" |
-| Simplified RRC messages | `src/rrc/task.rs:201,471,532,655` | Measurement reports, RRC Setup Complete, RRC Setup Request all use simplified byte encoding |
+| Simplified Measurement Report only | `src/rrc/task.rs` (`send_measurement_report`) | RRC Setup Complete and RRC Setup Request now use real UPER (`encode_rrc_setup_complete`/`encode_rrc_setup_request` from `nextgsim-rrc`); only the Measurement Report path still builds a simplified byte format. |
 | Simplified handover PDU | `src/rrc/handover.rs:255-304` | `parse_handover_command()` and `build_reconfiguration_complete()` use simplified format |
 | UAC always allows | `src/rrc/task.rs` | UAC (Unified Access Control) check always returns `true` |
 | Cell selection heuristic | `src/main.rs:780` | "Select the cell with best signal (or just the first one for now)" |

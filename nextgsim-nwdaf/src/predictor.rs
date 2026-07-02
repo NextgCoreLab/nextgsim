@@ -1,8 +1,10 @@
-//! Trajectory and load prediction using ONNX models
+//! Trajectory and load prediction (linear extrapolation; optional ONNX)
 //!
-//! Provides an `OnnxPredictor` that wraps the `nextgsim-ai` `InferenceEngine`
-//! for ML-based predictions, with automatic fallback to linear extrapolation
-//! when no model is loaded.
+//! OPERATIONAL PATH: the simulator ships no ONNX model, so `OnnxPredictor` runs
+//! linear extrapolation (`predict_linear`) — it fits a line through the recent
+//! position/time samples and projects forward. It wraps the `nextgsim-ai`
+//! `InferenceEngine` and will use a learned model if one is loaded, but since
+//! none is shipped, linear extrapolation is what actually runs.
 
 use std::path::Path;
 
@@ -32,12 +34,12 @@ pub struct PredictionOutput {
     pub method: PredictionMethod,
 }
 
-/// ONNX-based predictor with linear extrapolation fallback
+/// Predictor with optional ONNX support; linear extrapolation is operational.
 ///
-/// Wraps the `nextgsim-ai` `InferenceEngine` to run trajectory or load
-/// prediction models. When no model file has been loaded, it transparently
-/// falls back to a simple linear extrapolation so that callers always get
-/// a result.
+/// OPERATIONAL PATH: no ONNX model ships, so this runs `predict_linear` (a
+/// constant-velocity linear extrapolation over the recent samples). It wraps
+/// the `nextgsim-ai` `InferenceEngine` and will run a learned model if one is
+/// loaded, but since none is shipped, linear extrapolation is what executes.
 ///
 /// # Example
 ///
@@ -261,7 +263,8 @@ impl OnnxPredictor {
         })
     }
 
-    /// Linear extrapolation fallback
+    /// OPERATIONAL ALGORITHM: linear extrapolation (the path that actually runs,
+    /// since no ONNX model ships).
     ///
     /// Uses the last two position/timestamp pairs to compute velocity,
     /// then projects forward for the given horizon.

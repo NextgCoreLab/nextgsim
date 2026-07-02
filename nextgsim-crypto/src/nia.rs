@@ -386,6 +386,42 @@ mod tests {
         assert_ne!(mac1, mac2);
     }
 
+    /// 128-EIA2 (NIA2) known-answer vector (ngsc-05).
+    ///
+    /// Provenance: 128-EIA2 (TS 33.501 / TS 33.401 Annex B.2.3) is AES-128-CMAC
+    /// (RFC 4493 / NIST SP 800-38B) over the input
+    /// `COUNT[0..31] || BEARER[0..4] || DIRECTION || 0^26 || MESSAGE`. 3GPP's
+    /// published EIA2 test sets (TS 35.217) include non-octet-aligned message
+    /// lengths this octet-API cannot express, so the expected MAC below was
+    /// computed by an INDEPENDENT AES-128-CMAC reference that was first verified
+    /// against the RFC 4493 §4 published vectors (M0/M16/M40) byte-exact, then
+    /// applied to the octet-aligned NIA2 input. Key = the FIPS-197/RFC 4493 AES
+    /// test key 2b7e1516 28aed2a6 abf71588 09cf4f3c. Input bytes:
+    /// 38a6f056 2c000000 || "Hello, 5G World!"  (BEARER=5, DIRECTION=1 => 0x2c).
+    /// A BEARER or DIRECTION swap changes byte 4 and therefore the MAC.
+    #[test]
+    fn test_nia2_128eia2_kat() {
+        let key: [u8; 16] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let count = 0x38a6_f056u32;
+        let bearer = 0x05u8;
+        let direction = 1u8;
+        let message = b"Hello, 5G World!";
+
+        let mac = nia2_compute_mac(count, bearer, direction, &key, message);
+        let expected_mac: [u8; 4] = [0xbc, 0xe7, 0x6d, 0x3f];
+        assert_eq!(mac, expected_mac);
+
+        // A BEARER swap must change the MAC (proves BEARER occupies the high 5 bits).
+        let mac_bearer = nia2_compute_mac(count, 0x06, direction, &key, message);
+        assert_ne!(mac_bearer, expected_mac);
+        // A DIRECTION swap must change the MAC (proves DIRECTION occupies bit 2).
+        let mac_dir = nia2_compute_mac(count, bearer, 0, &key, message);
+        assert_ne!(mac_dir, expected_mac);
+    }
+
     #[test]
     fn test_nia3_compute_mac_roundtrip() {
         let key: [u8; 16] = [

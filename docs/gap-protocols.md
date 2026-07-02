@@ -41,8 +41,8 @@
 
 | Gap | Details |
 |-----|---------|
-| Missing 5GMM messages | DL/UL NAS Transport, Notification, 5GMM Status with cause | Partial |
-| 5GSM coverage | PDU Session Release (Request/Command/Complete/Reject) not implemented |
+| 5GMM message coverage | DL/UL NAS Transport (`src/messages/mm/nas_transport.rs`, ~637 lines, encode/decode for DlNasTransport + UlNasTransport), Notification (`notification.rs`), and UE policy / UPDP (`ue_policy.rs`, TS 24.501 Annex D + TS 24.526 URSP) are now implemented | Complete |
+| 5GSM coverage | PDU Session Release (Request/Command/Complete/Reject) now implemented in `src/messages/sm/pdu_session_release.rs` (~888 lines) |
 | Missing IEs | UE security capabilities, LADN info, MICO indication encoding |
 | No 6G NAS IEs | No AI/ML capability, ISAC, semantic comm, sub-THz parameters |
 | No NTN extensions | No satellite timing advance, NTN-specific access barring |
@@ -76,9 +76,9 @@ Strong 5GMM and 5GSM baseline with full security algorithms. Key missing: PDU Se
 
 | Gap | Details |
 |-----|---------|
-| Handover preparation failure | Missing HandoverPreparationFailure procedure |
-| AMF Status Indication | Not implemented |
-| RAN Configuration Update | Not implemented |
+| Handover preparation failure | Now implemented: `procedures/handover_preparation_failure.rs` (~541 lines) |
+| AMF Status Indication | Now implemented: `procedures/amf_status_indication.rs` (~387 lines) |
+| RAN Configuration Update | Now implemented: `procedures/ran_configuration_update.rs` (~501 lines); `ng_reset.rs` and `path_switch.rs` procedures also added |
 | NGAP over multiple SCTP streams | Stream management for parallel procedures not fully modeled |
 | No 6G NGAP extensions | No ISAC reporting, AI-native procedures, NTN-specific IEs |
 
@@ -108,10 +108,10 @@ Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) ar
 
 | Gap | Details |
 |-----|---------|
-| Measurement Report | Simplified byte encoding in gNB/UE (not in this crate directly) |
-| RRC Reestablishment | Not implemented |
-| RRC Resume | Not implemented (RRC Inactive state) |
-| Conditional Handover | Not implemented |
+| Measurement Report | `procedures/measurement_report.rs` codec now exists in this crate, but the gNB/UE tasks still emit/parse a simplified byte format (not yet wired to the codec) |
+| RRC Reestablishment | Now implemented: `procedures/rrc_reestablishment.rs` (~422 lines) |
+| RRC Resume | Now implemented: `procedures/rrc_resume.rs` (~642 lines) + UE-side `nextgsim-ue/src/rrc/resume.rs` (TS 38.331 5.3.13, T319) |
+| Conditional Handover | Now implemented: `procedures/conditional_handover.rs` (~803 lines) |
 | No 6G RRC extensions | No AI/ML configuration, ISAC measurement config, NTN timing advance, sub-THz band config |
 
 ### Completeness: **75%**
@@ -207,8 +207,8 @@ Production-quality SCTP with async tokio interface. Wire-compatible with nextgco
 
 ### Recommendations
 
-1. **Complete NAS 5GSM** -- PDU Session Release messages needed for full session lifecycle
-2. **Add RRC Reestablishment/Resume** -- Required for RRC Inactive state (power saving)
+1. **Complete NAS 5GSM** -- DONE: PDU Session Release messages implemented (`src/messages/sm/pdu_session_release.rs`)
+2. **Add RRC Reestablishment/Resume** -- DONE: both implemented (`rrc_reestablishment.rs`, `rrc_resume.rs`)
 3. **Add 6G NAS IEs** -- AI/ML capability negotiation, ISAC parameters
 4. **Add NTN support** -- Satellite timing advance in NAS/RRC
 5. **Implement QUIC transport** -- Future-proof alternative to SCTP

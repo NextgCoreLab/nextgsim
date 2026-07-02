@@ -129,6 +129,18 @@ pub fn x25519_shared_secret(
     *secret.diffie_hellman(&public).as_bytes()
 }
 
+/// Constant-time test for an all-zero byte slice (no data-dependent early exit).
+///
+/// Used to detect a contributory X25519 shared secret (RFC 7748 §6.1), which a
+/// small-order or all-zero ephemeral public key produces.
+fn is_all_zero_ct(bytes: &[u8]) -> bool {
+    let mut acc = 0u8;
+    for &b in bytes {
+        acc |= b;
+    }
+    acc == 0
+}
+
 /// ECIES Profile A encryption for SUPI concealment
 pub fn ecies_encrypt(
     plaintext: &[u8],
@@ -201,6 +213,17 @@ pub fn ecies_decrypt(
         .try_into()
         .map_err(|_| EciesError::InvalidPublicKey("Invalid key length".into()))?;
     let shared_secret = x25519_shared_secret(home_network_private_key, &ephemeral_pk);
+
+    // RFC 7748 §6.1 / TS 33.501 Annex C.3.2: reject contributory (all-zero) shared
+    // secrets. X25519 with a small-order or all-zero ephemeral public key produces an
+    // all-zero shared secret; deriving session keys from it would be insecure. The OR
+    // accumulation is constant-time (no early exit, always scans all 32 octets).
+    if is_all_zero_ct(&shared_secret) {
+        return Err(EciesError::InvalidPublicKey(
+            "Contributory (all-zero) X25519 shared secret from small-order ephemeral key".into(),
+        ));
+    }
+
     let derived_key = x963_kdf(&shared_secret, &ephemeral_pk, 64);
 
     // KDF output is guaranteed to be 64 bytes
@@ -766,6 +789,53 @@ mod tests {
             hn_keypair.private_key(),
         );
         assert!(matches!(result, Err(EciesError::MacVerificationFailed)));
+    }
+
+    /// ngsc-06: a small-order / all-zero X25519 ephemeral public key yields an
+    /// all-zero (contributory) shared secret, which decryption must reject before
+    /// deriving any session key (RFC 7748 §6.1, TS 33.501 Annex C.3.2).
+    #[test]
+    fn test_ecies_rejects_all_zero_ephemeral_key() {
+        // X25519(scalar, 0) == 0 for every scalar, so an all-zero ephemeral u-coord
+        // forces an all-zero shared secret regardless of the home-network key.
+        let hn_keypair = EciesKeyPair::from_seed(&[0x5Au8; 32]);
+        let all_zero_eph = [0u8; X25519_KEY_SIZE];
+        let result = ecies_decrypt(
+            &all_zero_eph,
+            &[0xAB, 0xCD, 0xEF],
+            &[0u8; MAC_TAG_SIZE],
+            hn_keypair.private_key(),
+        );
+        assert!(
+            matches!(result, Err(EciesError::InvalidPublicKey(_))),
+            "all-zero ephemeral key must be rejected, got {result:?}"
+        );
+
+        // Sanity: the shared secret really is all-zero for this input.
+        assert!(is_all_zero_ct(&x25519_shared_secret(
+            hn_keypair.private_key(),
+            &all_zero_eph
+        )));
+    }
+
+    /// ngsc-06: a malformed / off-curve P-256 ephemeral point must be rejected by
+    /// Profile B decryption (SEC1 point validation, TS 33.501 Annex C.3.2).
+    #[test]
+    fn test_profile_b_rejects_invalid_point() {
+        let hn_keypair = EciesProfileBKeyPair::generate();
+        // 0x02 prefix (compressed, even-y) but an X with no valid curve point.
+        let mut bad_point = [0xFFu8; P256_COMPRESSED_POINT_SIZE];
+        bad_point[0] = 0x02;
+        let result = ecies_profile_b_decrypt(
+            &bad_point,
+            &[0x01, 0x02, 0x03],
+            &[0u8; MAC_TAG_SIZE],
+            hn_keypair.secret_key(),
+        );
+        assert!(
+            matches!(result, Err(EciesError::InvalidPublicKey(_))),
+            "off-curve P-256 point must be rejected, got {result:?}"
+        );
     }
 
     #[test]

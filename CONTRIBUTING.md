@@ -1,6 +1,6 @@
 # Contributing to NextGSim
 
-NextGSim is a 5G UE and gNB simulator in Rust targeting 3GPP Rel-15 through Rel-20 (6G research).
+NextGSim is a 5G UE and gNB simulator in Rust implementing a 3GPP Rel-15 baseline with selected Rel-17/18 features and 6G exploration prototypes. 3GPP Rel-20 (6G) has no frozen stage-3 spec, so the 6G items are research-only (informed by TR 22.870 use cases) and disabled by default.
 
 ## Prerequisites
 
@@ -101,7 +101,9 @@ nextgsim/
 | Rel-16 | DAPS handover, URLLC, RedCap, V2X PC5 |
 | Rel-17 | MBS, ProSe, NTN, SNPN, UAV identity |
 | Rel-18 | XR traffic, Ambient IoT, RedCap R18, MINT |
-| Rel-20 | ISAC, Federated Learning, Semantic comms, Agent AI |
+| Rel-20* | ISAC, Federated Learning, Semantic comms, Agent AI |
+
+\* Rel-20 (6G) research exploration only — no frozen 3GPP stage-3 spec exists; these features are non-normative prototypes, disabled in the default config.
 
 ## 3GPP Specification References
 

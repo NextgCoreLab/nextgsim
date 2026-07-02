@@ -10,6 +10,14 @@ description = "SCTP transport layer for nextgsim"
 [lints]
 workspace = true
 
+[features]
+# Off by default. Enables the real kernel-SCTP transport backend
+# (`KernelSctpAssociation`) which speaks SCTP (IP proto 132) via the OS
+# kernel and lksctp/libsctp. Only meaningful on Linux; requires libsctp
+# (`libsctp-dev`, providing `-lsctp`) at link time. The userspace
+# sctp-proto-over-UDP backend remains the default regardless of this feature.
+kernel-sctp = ["dep:socket2", "dep:libc"]
+
 [dependencies]
 nextgsim-common.workspace = true
 tokio.workspace = true
@@ -20,3 +28,7 @@ sctp-proto.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+
+# Only used by the `kernel-sctp` feature (Linux kernel SCTP backend).
+socket2 = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
