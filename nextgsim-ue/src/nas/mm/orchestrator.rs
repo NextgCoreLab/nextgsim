@@ -1604,7 +1604,7 @@ impl MmOrchestrator {
         // TS 24.501 5.4.1.3.3: stop T3516 on Security Mode Command
         self.timers.stop(TIMER_T3516, true);
         info!(
-            "Security context activated: NEA{} / NIA{}, ngKSI {}",
+            "Security Mode Command accepted: security context activated (NEA{} / NIA{}, ngKSI {})",
             cipher_alg as u8, integ_alg as u8, smc.ng_ksi.ksi
         );
 

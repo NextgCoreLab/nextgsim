@@ -942,7 +942,7 @@ impl SmOrchestrator {
         }
 
         info!(
-            "PDU session {psi} established: type {:?}, SSC mode {:?}, IPv4 {:?}, \
+            "PDU Session Establishment Accept: PDU session {psi} established: type {:?}, SSC mode {:?}, IPv4 {:?}, \
              AMBR DL unit {} value {}",
             acc.selected_pdu_session_type.value,
             acc.selected_ssc_mode.value,
