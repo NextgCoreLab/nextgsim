@@ -2,7 +2,7 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [first_implementation]
+    branches: [first_implementation, main]
     paths:
       - 'docs/**'
 

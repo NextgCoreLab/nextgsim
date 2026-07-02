@@ -19,11 +19,10 @@ The end-to-end data-plane validation lives in the **nextgcore** repo
 
 Deploys `docs/` to GitHub Pages.
 
-## ⚠️ Branch triggers
+## Branch triggers
 
-Both workflows trigger on the **`first_implementation`** branch only. If the default/release
-branch is `main`, **CI and Pages will not run on `main`** — add `main` to the `branches:` lists
-before cutting a release from it.
+Both workflows run on the default release branch **`main`** and on the development branch
+**`first_implementation`** (`branches: [first_implementation, main]`).
 
 ## Local pre-push gate (mirror of CI)
 
