@@ -415,6 +415,10 @@ impl RrcTask {
     /// Sends a UECapabilityEnquiry to the UE (TS 38.331 §5.6.1)
     async fn send_ue_capability_enquiry(&mut self, ue_id: i32) {
         let params = UeCapabilityEnquiryParams {
+            // Wave-6 C4-interim: DL-DCCH sender tids stay PINNED to 0 — the
+            // UE DL-DCCH dispatcher is still the legacy nibble matcher and a
+            // non-zero tid shuffles the leading-byte nibble it routes on.
+            // Per-UE 0..3 cycling lands in C4-final, after C5.
             rrc_transaction_id: 0,
             rat_types: vec![RatType::Nr],
         };

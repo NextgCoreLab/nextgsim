@@ -12,7 +12,7 @@ use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::{
     rrc_release::{encode_rrc_release, RrcReleaseParams},
-    rrc_setup::{encode_rrc_setup, RrcSetupParams},
+    rrc_setup::{encode_rrc_setup, srb1_rrc_setup_params},
 };
 
 use super::ue_context::RrcUeContextManager;
@@ -110,6 +110,9 @@ pub struct RrcResumeCompleteResult {
 pub struct RrcConnectionManager {
     /// Transaction ID counter
     tid_counter: u8,
+    /// Parity toggle for the nibble-safe RRCSetup transaction id
+    /// (Wave-6 C4-interim, see [`Self::next_rrc_setup_tid`])
+    setup_tid_parity: bool,
     /// Whether the cell is barred
     is_barred: bool,
 }
@@ -125,6 +128,7 @@ impl RrcConnectionManager {
     pub fn new() -> Self {
         Self {
             tid_counter: 0,
+            setup_tid_parity: false,
             is_barred: true, // Initially barred until radio power on
         }
     }
@@ -133,6 +137,25 @@ impl RrcConnectionManager {
     pub fn next_tid(&mut self) -> u8 {
         let tid = self.tid_counter;
         self.tid_counter = (self.tid_counter + 1) % 4;
+        tid
+    }
+
+    /// Allocates the RRCSetup transaction id, PINNED to the nibble-0-safe
+    /// values {0, 2} (Wave-6 C4-interim).
+    ///
+    /// WHY (do not "clean up" back to [`Self::next_tid`] — that re-introduces
+    /// a silent multi-connection bug): the UE's DL-CCCH dispatcher is still
+    /// the legacy nibble matcher (`bytes[0] & 0x0F`,
+    /// nextgsim-ue/src/rrc/task.rs `handle_dl_ccch_message`). The RRCSetup
+    /// UPER leading byte is `[0|01|tid|0|00]`, so tid 1/3 yields 0x28/0x38
+    /// whose low nibble 0x8 has NO dispatch arm at the UE — every 2nd/4th
+    /// RRC connection served by one gNB process would have its RRCSetup
+    /// silently dropped. tid 0/2 keep the low nibble at 0x0 (leading byte
+    /// 0x20/0x30). Full per-UE 0..3 cycling lands in C4-final, after C5
+    /// replaces both nibble dispatchers with typed ASN.1 dispatch.
+    fn next_rrc_setup_tid(&mut self) -> u8 {
+        let tid = if self.setup_tid_parity { 2 } else { 0 };
+        self.setup_tid_parity = !self.setup_tid_parity;
         tid
     }
 
@@ -183,7 +206,9 @@ impl RrcConnectionManager {
         ctx.set_establishment_cause(establishment_cause);
         ctx.on_setup_request();
 
-        let transaction_id = self.next_tid();
+        // Wave-6 C4-interim: nibble-safe {0, 2} allocation, NOT next_tid()
+        // — see next_rrc_setup_tid for why tid 1/3 breaks the UE dispatcher.
+        let transaction_id = self.next_rrc_setup_tid();
 
         // Build RRC Setup message
         let rrc_setup_pdu = self.build_rrc_setup(transaction_id);
@@ -448,24 +473,28 @@ impl RrcConnectionManager {
         }
     }
 
-    /// Builds an RRC Setup message using proper ASN.1 UPER encoding
+    /// Builds an RRC Setup message using proper ASN.1 UPER encoding.
+    ///
+    /// Wave-6 C1: carries the REAL SRB1 configuration — a RadioBearerConfig
+    /// with srb-ToAddModList = { SRB-Identity 1 } (TS 38.331 §5.3.5.6.3:
+    /// RRCSetup shall establish SRB1) and a masterCellGroup CONTAINING a
+    /// CellGroupConfig with one RLC-BearerConfig (LCID 1) serving SRB1
+    /// (TS 38.331 §5.3.3.4 / §6.3.2).
     fn build_rrc_setup(&self, transaction_id: u8) -> OctetString {
-        // Build a minimal but valid RadioBearerConfig (empty SRB-to-add list)
-        let radio_bearer_config = vec![0x00];
-        // Minimal MasterCellGroup config
-        let master_cell_group = vec![0x00];
+        // Wave-6 C4-interim: RRCSetup tids must stay nibble-0-safe ({0, 2})
+        // while the UE DL-CCCH dispatcher is still the legacy nibble matcher
+        // — see next_rrc_setup_tid.
+        debug_assert!(
+            transaction_id == 0 || transaction_id == 2,
+            "RRCSetup tid must be nibble-safe ({{0,2}}) until C5, got {transaction_id}"
+        );
 
-        let params = RrcSetupParams {
-            rrc_transaction_id: transaction_id,
-            radio_bearer_config,
-            master_cell_group,
-        };
-
-        match encode_rrc_setup(&params) {
+        match srb1_rrc_setup_params(transaction_id).and_then(|params| encode_rrc_setup(&params)) {
             Ok(bytes) => OctetString::from_slice(&bytes),
             Err(e) => {
                 warn!("ASN.1 RRC Setup encoding failed ({}), using fallback", e);
-                // Fallback: simplified encoding for interop with simplified UE parser
+                // Fallback: simplified encoding for interop with simplified UE
+                // parser (retired in C6)
                 let mut pdu = Vec::with_capacity(16);
                 pdu.push(0x20);
                 pdu.push(transaction_id);
@@ -569,6 +598,62 @@ mod tests {
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert_eq!(ctx.initial_id, Some(0x1234567890));
         assert!(!ctx.is_initial_id_s_tmsi);
+    }
+
+    /// Wave-6 C1: the emitted RRCSetup must be EXACTLY the hand-derived
+    /// golden UPER PDU carrying the SRB1 configuration (TS 38.331
+    /// §5.3.5.6.3). The literal is derived by hand from
+    /// tools/rrc-15.6.0.asn1 — see nextgsim-rrc rrc_setup.rs
+    /// `golden_rrc_setup_srb1_bytes` for the bit-by-bit derivation.
+    #[test]
+    fn test_rrc_setup_request_emits_golden_srb1_pdu_tid0() {
+        const GOLDEN_RRC_SETUP_SRB1_TID0: [u8; 8] =
+            [0x20, 0x40, 0x00, 0x22, 0x00, 0x04, 0x00, 0x00];
+
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+
+        let result = conn_mgr
+            .process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3)
+            .expect("setup must succeed");
+        assert_eq!(result.transaction_id, 0, "fresh manager -> tid 0");
+        assert_eq!(
+            result.rrc_setup_pdu.data(),
+            &GOLDEN_RRC_SETUP_SRB1_TID0[..],
+            "RRCSetup(tid 0) must be the hand-derived SRB1 golden PDU"
+        );
+    }
+
+    /// Wave-6 C4-interim: RRCSetup tids are PINNED to the nibble-0-safe
+    /// values {0, 2}. WHY: the UE DL-CCCH dispatcher matches on
+    /// `bytes[0] & 0x0F`; RRCSetup byte0 is [0|01|tid|0|00], so tid 1/3
+    /// (0x28/0x38, low nibble 0x8) has no arm and the RRCSetup is silently
+    /// dropped — the pre-existing gNB-global 0..3 cycler lost every 2nd/4th
+    /// connection. Do NOT restore next_tid() here before C5.
+    #[test]
+    fn test_rrc_setup_tid_pinned_nibble_safe() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+
+        let mut expected_tid = [0u8, 2, 0, 2].iter().copied();
+        for ue_id in 1..=4 {
+            let result = conn_mgr
+                .process_rrc_setup_request(&mut ue_mgr, ue_id, 0x1000 + i64::from(ue_id), false, 3)
+                .expect("setup must succeed");
+            assert_eq!(result.transaction_id, expected_tid.next().unwrap());
+            let byte0 = result.rrc_setup_pdu.data()[0];
+            assert_eq!(
+                byte0 & 0x0F,
+                0x00,
+                "RRCSetup leading byte low nibble must stay 0x0 (got 0x{byte0:02x})"
+            );
+            assert!(
+                byte0 == 0x20 || byte0 == 0x30,
+                "RRCSetup leading byte must be 0x20 (tid 0) or 0x30 (tid 2), got 0x{byte0:02x}"
+            );
+        }
     }
 
     #[test]

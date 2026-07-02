@@ -633,6 +633,10 @@ impl NgapTask {
 
         // Encode + send the RRC SecurityModeCommand (SRB1, DL-DCCH).
         let params = SecurityModeCommandParams {
+            // Wave-6 C4-interim: DL-DCCH sender tids stay PINNED to 0 — the
+            // UE DL-DCCH dispatcher is still the legacy nibble matcher and a
+            // non-zero tid shuffles the leading-byte nibble it routes on.
+            // Per-UE 0..3 cycling lands in C4-final, after C5.
             rrc_transaction_id: 0,
             security_algorithms: SecurityAlgorithms {
                 ciphering_algorithm: ciph_alg,
@@ -838,6 +842,11 @@ impl NgapTask {
         // One DRB per PDU session; DRB identity 1..=32, DTCH LCID above the SRBs.
         let drb_id = psi.clamp(1, 32);
         let lcid = (3 + drb_id).min(32);
+        // Wave-6 C4-interim: the RRCReconfiguration tid (first arg) stays
+        // PINNED to 0 — a non-zero tid shuffles the leading-byte nibble the
+        // UE's legacy DL-DCCH dispatcher routes on (e.g. tid 2 -> byte0 0x04
+        // -> misrouted into the UE's DL-information-transfer arm). Per-UE
+        // 0..3 cycling lands in C4-final, after C5.
         let params = match build_drb_reconfiguration_params(0, psi, drb_id, lcid, qfis, true) {
             Ok(p) => p,
             Err(e) => {
