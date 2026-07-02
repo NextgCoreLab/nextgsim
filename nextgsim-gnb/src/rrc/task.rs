@@ -11,7 +11,7 @@ use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_complete, decode_rrc_setup_request,
-    RrcEstablishmentCause as AsnEstablishmentCause, UeIdentity,
+    RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
 };
 use nextgsim_rrc::procedures::ue_capability::{
     decode_ue_capability_information, encode_ue_capability_enquiry, parse_nr_capability_bands,
@@ -64,7 +64,12 @@ impl RrcTask {
         self.pdu_id_counter
     }
 
-    fn handle_radio_power_on(&mut self) {
+    /// Handles `RrcMessage::RadioPowerOn`: activates (unbars) the cell.
+    ///
+    /// Public because it is a real message-handler entry point also driven
+    /// directly by the in-process strict-peer harness
+    /// (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub fn handle_radio_power_on(&mut self) {
         info!("Radio power on - cell is now active");
         self.connection_manager.set_barred(false);
     }
@@ -73,7 +78,13 @@ impl RrcTask {
         debug!("Signal detected from UE[{}]", ue_id);
     }
 
-    async fn handle_uplink_rrc(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
+    /// Handles `RrcMessage::UplinkRrc`: dispatches an uplink RRC PDU by
+    /// logical channel (UL-CCCH / UL-DCCH).
+    ///
+    /// Public because it is a real message-handler entry point also driven
+    /// directly by the in-process strict-peer harness
+    /// (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_uplink_rrc(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
         debug!(
             "Uplink RRC: ue_id={}, channel={:?}, len={}",
             ue_id,
@@ -193,6 +204,20 @@ impl RrcTask {
         }
 
         let bytes = data.data();
+
+        // ASN.1-first UL-DCCH dispatch (TS 38.331 §6.2.2, Wave-6 C3): a
+        // conformant UE encodes RRCSetupComplete as a real UPER
+        // UL-DCCH-Message (c1 CHOICE index 2 → leading byte 0x10..=0x17,
+        // low nibble 0x0 for tid 0), which matches NO arm of the legacy
+        // nibble dispatcher below and was previously dropped — losing the
+        // registration NAS. Try the typed decode FIRST; the legacy
+        // byte-pattern match stays as a fallback for the bespoke encodings
+        // (retired in C6).
+        if let Ok(complete) = decode_rrc_setup_complete(bytes) {
+            self.handle_rrc_setup_complete_asn1(ue_id, complete).await;
+            return;
+        }
+
         let message_type = bytes[0] & 0x0F;
 
         match message_type {
@@ -238,6 +263,34 @@ impl RrcTask {
         }
     }
 
+    /// Handles a typed, ASN.1-decoded RRCSetupComplete (TS 38.331 §5.3.3.4).
+    ///
+    /// This is the primary path (Wave-6 C3): the UE's real UPER UL-DCCH
+    /// encoding carries the transaction id, the dedicated NAS message, and
+    /// the RedCap indication as typed fields — no byte-offset extraction.
+    async fn handle_rrc_setup_complete_asn1(&mut self, ue_id: i32, complete: RrcSetupCompleteData) {
+        info!(
+            "RRC Setup Complete (ASN.1 UL-DCCH) from UE[{}]: tid={}, nas_len={}, redcap={}",
+            ue_id,
+            complete.rrc_transaction_id,
+            complete.dedicated_nas_message.len(),
+            complete.redcap_indication
+        );
+
+        let nas_pdu = OctetString::from_slice(&complete.dedicated_nas_message);
+        self.finish_rrc_setup_complete(
+            ue_id,
+            complete.rrc_transaction_id,
+            nas_pdu,
+            complete.redcap_indication,
+            "ASN.1",
+        )
+        .await;
+    }
+
+    /// Handles a bespoke (non-ASN.1) RRCSetupComplete. Only reached when the
+    /// ASN.1-first decode in `handle_ul_dcch_message` failed — i.e. for the
+    /// UE's legacy fallback framing `[0x04, tid, 0x01, NAS...]` (retired in C6).
     async fn handle_rrc_setup_complete(&mut self, ue_id: i32, data: &OctetString) {
         let bytes = data.data();
         if bytes.len() < 3 {
@@ -260,6 +313,31 @@ impl RrcTask {
         let redcap_indication = decode_rrc_setup_complete(bytes)
             .map(|data| data.redcap_indication)
             .unwrap_or(false);
+
+        info!(
+            "RRC Setup Complete (bespoke fallback) from UE[{}]: tid={}, nas_len={}",
+            ue_id,
+            transaction_id,
+            nas_pdu.len()
+        );
+
+        self.finish_rrc_setup_complete(ue_id, transaction_id, nas_pdu, redcap_indication, "bespoke-fallback")
+            .await;
+    }
+
+    /// Common tail for both RRCSetupComplete decode paths: transitions the UE
+    /// context to Connected, forwards the NAS PDU to NGAP as an Initial UE
+    /// Message, and enquires UE capabilities. `via` names the decode path in
+    /// the log line so the ASN.1 and bespoke-fallback paths are
+    /// distinguishable in an E2E log (Wave-6 C3 acceptance).
+    async fn finish_rrc_setup_complete(
+        &mut self,
+        ue_id: i32,
+        transaction_id: u8,
+        nas_pdu: OctetString,
+        redcap_indication: bool,
+        via: &str,
+    ) {
         if redcap_indication {
             self.apply_redcap_restrictions(ue_id);
         }
@@ -271,6 +349,12 @@ impl RrcTask {
             nas_pdu,
             None,
         ) {
+            info!(
+                "Initial UE Message via {} RRCSetupComplete path (ue_id={}, nas_len={})",
+                via,
+                result.ue_id,
+                result.nas_pdu.len()
+            );
             self.send_initial_nas_delivery(
                 result.ue_id,
                 result.nas_pdu,
@@ -836,5 +920,117 @@ mod tests {
         let dl_info = task.build_dl_information_transfer(&nas_pdu);
         assert_eq!(dl_info.len(), 6);
         assert_eq!(dl_info.data()[0], 0x04);
+    }
+
+    // ========================================================================
+    // Wave-6 C3: UL-DCCH RRCSetupComplete dispatch — additive-accept.
+    // The gNB must accept BOTH the UE's primary ASN.1 UPER encoding
+    // (TS 38.331 §6.2.2, leading byte 0x10 for tid 0 — previously dropped by
+    // the nibble dispatcher) and the UE's bespoke fallback framing
+    // [0x04, tid, 0x01, NAS...]. One dedicated test per encoding.
+    // ========================================================================
+
+    fn run_async<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(fut)
+    }
+
+    /// Drives a real ASN.1 RRCSetupRequest through `handle_uplink_rrc` so the
+    /// gNB creates the UE context and emits the RRCSetup (fresh task → tid 0).
+    async fn establish_pending_setup(task: &mut RrcTask, ue_id: i32) {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_request, RrcSetupRequestParams,
+        };
+
+        task.handle_radio_power_on();
+        let req = encode_rrc_setup_request(&RrcSetupRequestParams {
+            ue_identity: UeIdentity::RandomValue(0x1234567890),
+            establishment_cause: AsnEstablishmentCause::MoSignalling,
+        })
+        .expect("encode RRCSetupRequest");
+        task.handle_uplink_rrc(ue_id, RrcChannel::UlCcch, OctetString::from_slice(&req))
+            .await;
+    }
+
+    /// Pops the next Initial UE Message from the NGAP channel, if any.
+    fn try_take_initial_nas(
+        ngap_rx: &mut mpsc::Receiver<TaskMessage<NgapMessage>>,
+    ) -> Option<(i32, OctetString)> {
+        while let Ok(msg) = ngap_rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::InitialNasDelivery { ue_id, pdu, .. }) = msg {
+                return Some((ue_id, pdu));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_ul_dcch_asn1_rrc_setup_complete_accepted() {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_complete, RrcSetupCompleteParams,
+        };
+
+        let config = test_config();
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 1).await;
+
+            let nas: Vec<u8> = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+            let complete = encode_rrc_setup_complete(&RrcSetupCompleteParams {
+                registered_amf: None,
+                rrc_transaction_id: 0,
+                selected_plmn_identity: 1,
+                guami_type: None,
+                s_nssai_list: None,
+                dedicated_nas_message: nas.clone(),
+                ng_5g_s_tmsi_value: None,
+                redcap_indication: false,
+            })
+            .expect("encode RRCSetupComplete");
+
+            // UL-DCCH-Message c1 index 2 (rrcSetupComplete), tid 0: leading
+            // byte 0x10, low nibble 0x0 — matches no legacy dispatch arm.
+            assert_eq!(complete[0], 0x10, "ASN.1 RRCSetupComplete leading byte");
+
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                .await;
+
+            let (ue_id, pdu) = try_take_initial_nas(&mut ngap_rx)
+                .expect("ASN.1 RRCSetupComplete must produce an Initial UE Message");
+            assert_eq!(ue_id, 1);
+            assert_eq!(pdu.data(), &nas[..], "NAS must be byte-for-byte identical");
+        });
+    }
+
+    #[test]
+    fn test_ul_dcch_bespoke_rrc_setup_complete_accepted() {
+        let config = test_config();
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 1).await;
+
+            let nas: Vec<u8> = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+            // Bespoke fallback framing from the UE (ue/rrc/task.rs
+            // send_rrc_setup_complete fallback): [0x04, tid, 0x01, NAS...].
+            let mut bespoke = vec![0x04, 0x00, 0x01];
+            bespoke.extend_from_slice(&nas);
+
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&bespoke))
+                .await;
+
+            let (ue_id, pdu) = try_take_initial_nas(&mut ngap_rx)
+                .expect("bespoke RRCSetupComplete must still produce an Initial UE Message");
+            assert_eq!(ue_id, 1);
+            assert_eq!(pdu.data(), &nas[..], "NAS must be byte-for-byte identical");
+        });
     }
 }

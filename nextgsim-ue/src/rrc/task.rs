@@ -185,7 +185,11 @@ impl RrcTask {
     }
 
     /// Perform the RRC cycle (cell selection in idle, measurements in connected)
-    async fn perform_cycle(&mut self) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::TriggerCycle`) also driven directly by the in-process
+    /// strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn perform_cycle(&mut self) {
         match self.state_machine.state() {
             RrcState::Idle | RrcState::Inactive => {
                 self.perform_cell_selection().await;
@@ -364,7 +368,11 @@ impl RrcTask {
     }
 
     /// Handle signal change from RLS
-    async fn handle_signal_changed(&mut self, cell_id: i32, dbm: i32) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::SignalChanged`) also driven directly by the in-process
+    /// strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_signal_changed(&mut self, cell_id: i32, dbm: i32) {
         let event = self.cell_selector.handle_signal_change(cell_id, dbm);
 
         match event {
@@ -440,7 +448,11 @@ impl RrcTask {
     }
 
     /// Handle downlink RRC message from RLS
-    async fn handle_downlink_rrc(&mut self, cell_id: i32, channel: RrcChannel, pdu: OctetString) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::DownlinkRrcDelivery`) also driven directly by the
+    /// in-process strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_downlink_rrc(&mut self, cell_id: i32, channel: RrcChannel, pdu: OctetString) {
         if pdu.is_empty() {
             warn!("Empty downlink RRC PDU");
             return;
@@ -933,7 +945,11 @@ impl RrcTask {
     }
 
     /// Handle uplink NAS delivery from NAS task
-    async fn handle_uplink_nas_delivery(&mut self, pdu_id: u32, pdu: OctetString) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::UplinkNasDelivery`) also driven directly by the
+    /// in-process strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
+    pub async fn handle_uplink_nas_delivery(&mut self, pdu_id: u32, pdu: OctetString) {
         // If not connected, this is initial NAS - start connection establishment
         if self.state_machine.state() == RrcState::Idle {
             self.initial_nas_pdu = Some(pdu.clone());
