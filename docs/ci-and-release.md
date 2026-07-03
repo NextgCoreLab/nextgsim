@@ -12,6 +12,8 @@
 | **Test** | `cargo test --workspace` | any failing test |
 | **Docker Build** | builds the Rust binaries, then the gNB and UE images; verifies images | build failures |
 
+> **Docker jobs are opt-in.** `docker-build` (and the dependent `docker-e2e`/`docker-e2e-epc`) run **only on manual `workflow_dispatch`** (Actions tab → Run workflow), not on push/PR — they recompile both workspaces in a container and need a cross-repo checkout, so they are too heavy/fragile for every commit. The fast gate (Check/Format/Clippy/Test) protects every push/PR.
+
 The end-to-end data-plane validation lives in the **nextgcore** repo
 (`nextgcore/docker/rust/e2e.sh`), which runs this simulator's gNB + UE against the 22-NF core.
 

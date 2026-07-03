@@ -5,6 +5,11 @@ on:
     branches: [first_implementation, main]
   pull_request:
     branches: [first_implementation, main]
+  # Heavy Docker image/E2E jobs are opt-in only (they recompile both
+  # workspaces in a container and need a cross-repo checkout). Trigger via the
+  # Actions tab "Run workflow". The fast gate (check/test/clippy/fmt) runs on
+  # every push/PR to the branches above.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,6 +66,7 @@ jobs:
 
   docker-build:
     name: Docker Build
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     needs: test
     steps:
