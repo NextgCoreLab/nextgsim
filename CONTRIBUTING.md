@@ -129,11 +129,11 @@ test(prose): add relay selection RSRP unit test
 ## Pull Request Process
 
 1. Fork the repository
-2. Create a feature branch from `first_implementation`
+2. Create a feature branch from `main`
 3. Implement your change with tests
 4. Ensure all CI checks pass
 5. Open a PR referencing the 3GPP TS item
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](LICENSE).
