@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NextGSim — Supported-Features Matrix</title>
+  <meta name="description" content="Per-component supported-features matrix generated from the live code: served services, procedures, 3GPP spec references, and implementation status.">
+  <link rel="stylesheet" href="css/style.css">
+
+<style>
+.fm-table{width:100%;border-collapse:collapse;margin:0.75rem 0 2rem;font-size:0.85rem;}
+.fm-table th,.fm-table td{border:1px solid var(--border,#2a2f3a);padding:0.45rem 0.6rem;text-align:left;vertical-align:top;}
+.fm-table th{background:rgba(127,127,127,0.12);white-space:nowrap;}
+.fm-table td:nth-child(3){white-space:nowrap;}
+.fm-status{display:inline-block;padding:0.1rem 0.5rem;border-radius:999px;font-size:0.75rem;font-weight:600;white-space:nowrap;}
+.fm-implemented{background:rgba(46,160,67,0.18);color:#3fb950;}
+.fm-partial{background:rgba(210,153,34,0.18);color:#d29922;}
+.fm-prototype{background:rgba(163,113,247,0.18);color:#a371f7;}
+.fm-notes{color:var(--text-secondary,#8b949e);font-size:0.8rem;margin:-1.5rem 0 2rem;}
+.fm-wrap{overflow-x:auto;}
+</style>
+
+</head>
+<body>
+<nav class="nav">
+  <a href="index.html" class="nav-logo">Next<span>GSim</span></a>
+  <ul class="nav-links">
+    <li><a href="index.html#features">Features</a></li>
+    <li><a href="features.html">Feature Matrix</a></li>
+    <li><a href="index.html#components">Components</a></li>
+    <li><a href="api.html">CLI &amp; API</a></li>
+    <li><a href="https://github.com/NextgCoreLab/nextgsim" class="btn btn-secondary" style="padding:0.4rem 1rem;font-size:0.8rem;">GitHub</a></li>
+  </ul>
+  <button class="mobile-menu-btn">&#9776;</button>
+</nav>
+<section>
+  <div class="container">
+    <h2 class="section-title">Supported-Features Matrix</h2>
+    <p class="section-subtitle">What the gNB and UE simulators actually implement — extracted from the live task/procedure code.</p>
+    <p class="section-subtitle"><strong>Status legend:</strong> <span class="fm-status fm-implemented">implemented</span> wired &amp; handled &middot; <span class="fm-status fm-partial">partial</span> some operations stubbed or gated &middot; <span class="fm-status fm-prototype">prototype</span> non-normative / off-wire research code. Validated against the matched NextGCore/NextGSim pair, not third-party certified. See the <a href="https://github.com/NextgCoreLab/nextgsim/blob/main/CHANGELOG.md">CHANGELOG</a> for version history.</p>
+<h3 class="group-heading">gNB (nr-gnb)</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>NGAP interface management</td><td>NGSetup req/resp/failure, association up/down, ErrorIndication, Paging</td><td>TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NGAP UE context/session</td><td>InitialContextSetup, DL/UL NAS transport, PDUSession setup/modify/release, UEContextRelease, APER transfers</td><td>TS 38.413 §8.3/§9.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>RRC connection (SRB1/SRB2/DRB)</td><td>RRCSetup, SecurityModeCommand, Reconfiguration w/ DRB, UECapability, typed UL/DL-DCCH UPER</td><td>TS 38.331 §5.3/§5.6/§6.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>AS security</td><td>KgNB-derived RRC/UP keys (FC=0x69), NEA/NIA selection, NIA0-never-fallback</td><td>TS 33.501 §6.7/A.8</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>RRC reestablishment/resume</td><td>ReestablishmentRequest/Complete, ResumeRequest/Complete handlers in live RRC task</td><td>TS 38.331 §5.3.7/§5.3.13</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>N2 handover + Xn handover</td><td>HandoverRequired/Request/Ack, PathSwitchRequest wired via NGAP; Xn structs+DAPS local-only</td><td>TS 38.300/38.413 §8.4</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>GTP-U / N3 user plane</td><td>UDP GTP-U tunnels, TEID mgmt, DL/UL forwarding to RLS; E2E-validated 0% loss</td><td>TS 29.281</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Kernel-SCTP NGAP transport</td><td>Real kernel SCTP (Linux, feature kernel-sctp) or userspace/multi-homed backends</td><td>RFC 4960 / TS 38.412</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>RedCap (Rel-17)</td><td>RedCap indication in RRCSetupComplete, BW clamp 20MHz, HD-FDD restriction — live in RRC task</td><td>TS 38.331/38.306</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NTN (Rel-17)</td><td>SIB19-style timing/HARQ/beam mgrs, ISL handover — module exported, not called by tasks</td><td>TS 38.331 / TR 38.821</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>MBS multicast (Rel-17)</td><td>MBS session activation/deactivation, TMGI, multicast tunnel context in NGAP task</td><td>TS 38.413/23.247</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>6G AI-native tasks (Rel-20)</td><td>ISAC sensing, SHE, NKEF, NWDAF, agent/FL, Rel-18 energy saving — config-gated spawned tasks</td><td>non-normative (no Stage-3)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<p class="fm-notes">Xn handover types/DAPS exist in nextgsim-gnb/src/rrc/handover.rs but no inter-gNB transport wiring found; NTN module only re-exported.</p>
+<h3 class="group-heading">UE (nr-ue)</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>5GMM registration/dereg/service request</td><td>initial/mobility/periodic registration, service request, UE/NW deregistration, config update, MM state machine</td><td>TS 24.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>5G-AKA auth + security mode</td><td>AUTH request/response/failure abnormal cases, RES*/KAUSF/KSEAF/KAMF/KgNB derivation, SMC</td><td>TS 24.501 / TS 33.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NAS receive-side security</td><td>TS 24.501 4.4.4.2 plain-message allow-list, anti-replay, integrity discard</td><td>TS 24.501 §4.4.4.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>5GSM PDU sessions</td><td>PDU session establishment/modification/release, PTI transaction handling</td><td>TS 24.501 §6</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>UPDP / URSP</td><td>Manage UE Policy Command, URSP rule decode, policy section mgmt in MM orchestrator</td><td>TS 24.501 Annex D</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>TUN user plane</td><td>per-PDU-session TUN device, uplink to GTP encap, downlink IP write</td><td>n/a (UERANSIM-style)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Multi-UE</td><td>num_ue CLI option, per-instance IMSI increment, per-UE task sets</td><td>n/a</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>RedCap + SNPN (Rel-17)</td><td>RedCap capability in RRC task/config; SNPN NID cell selection and MM integration</td><td>TS 38.331 / TS 23.501</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>MINT multi-IMSI (Rel-18)</td><td>MintTask spawned in main; per-IMSI NAS context, IMSI selection</td><td>TS 23.761</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Ranging/SL positioning (Rel-18)</td><td>RangingTask spawned; UE-UE RTT, carrier-phase, LMF reporting (sim-level)</td><td>TS 23.586</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>ProSe + sidelink</td><td>PC5 unicast, Model A/B discovery, L2 relay/RSC matching; library types, not task-wired</td><td>TS 23.303/23.304</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>UAV + Ambient IoT</td><td>UAV C2 link/geofence/UTM context, ambient IoT fleet manager; unwired contexts</td><td>TS 23.256 / TS 22.369</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+</table></div>
+<p class="fm-notes">MintTask/RangingTask are spawned in main.rs; prose.rs, uav.rs, ambient_iot/ are library-only (no task wiring found).</p>
+  </div>
+</section>
+<footer class="footer">
+  <div class="container">
+    <p><a href="index.html">Home</a> &middot; <a href="https://github.com/NextgCoreLab/nextgsim">GitHub</a> &middot; GPL-3.0 License</p>
+  </div>
+</footer>
+<script src="js/main.js"></script>
+</body>
+</html>
