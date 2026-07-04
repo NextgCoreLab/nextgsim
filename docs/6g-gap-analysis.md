@@ -78,7 +78,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 
 **6G Gaps:**
 - No RIS configuration types (panel geometry, reflection coefficients, phase control)
-- No NTN configuration (satellite orbit parameters, propagation delay models)
+- NTN configuration prototypes exist (gNB `ntn_config` YAML block, orbit/delay models in the rrc crate) but are logging-only/unwired
 - No sub-THz/THz channel configuration parameters
 - No ISAC sensing configuration types
 - No network slicing enhancement types for 6G (inter-slice coordination)
@@ -156,7 +156,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 
 **6G Gaps:**
 - No AI/ML-assisted NAS procedure signaling extensions
-- No NTN-specific NAS extensions (satellite timing advance, ephemeris data)
+- NTN NAS data models (satellite timing advance, ephemeris) exist as bespoke prototypes — not wire-conformant, no sender wired into live UE paths
 - No network slicing enhancement IEs for 6G
 - No support for zero-energy device simplified NAS procedures
 
@@ -183,7 +183,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 **6G Gaps:**
 - No NGAP extensions for ISAC sensing data transfer
 - No NGAP extensions for AI/ML model distribution
-- No NTN-specific NGAP procedures
+- NTN NGAP support module exists (off-wire, bespoke) — no wire-conformant NTN NGAP procedures
 - No RIS control plane signaling via NGAP
 - No multi-connectivity (DC/MC) enhanced procedures
 
@@ -220,9 +220,9 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 **6G Gaps:**
 - No AI/ML-based RRC procedure optimization (predictive handover)
 - No RIS beam management via RRC
-- No NTN-specific RRC signaling (satellite cell selection, Doppler pre-compensation)
+- NTN RRC prototypes exist (timing advance, link sim, constellation, ISL handover in nextgsim-rrc) but use bespoke encodings and are not wired into live signaling; no satellite cell selection or Doppler pre-compensation
 - No sub-THz beam tracking procedures
-- No sidelink/D2D RRC support (V2X, ProSe)
+- No wire-conformant sidelink/D2D RRC support (a UE-side ProSe/ranging prototype now exists, sim-internal only)
 - No dual connectivity (EN-DC, NR-DC) RRC procedures
 - No conditional handover (CHO) / DAPS handover support
 
@@ -244,7 +244,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 - **Channel modeling:** No 3GPP TR 38.901 channel models, no sub-THz channel models
 - **MIMO/Beamforming:** No massive MIMO simulation, no beam management
 - **RIS integration:** No reflective surface path modeling
-- **NTN propagation:** No satellite link budget, Doppler shift, delay modeling
+- **NTN propagation:** Prototype link simulation exists (delay/Doppler/link models in nextgsim-rrc) but is not integrated with the RLS channel path
 - **Spectrum:** No sub-THz/THz propagation models (molecular absorption, weather effects)
 - **Sensing:** No radar-like waveform simulation for ISAC
 - **D2D/Sidelink:** No direct UE-to-UE communication simulation
@@ -548,11 +548,11 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 | AI/ML native air interface | ai, nwdaf, she | Inference framework exists; no air interface integration | HIGH |
 | Integrated Sensing and Communication (ISAC) | isac | Basic tracking/fusion prototype | HIGH |
 | Reconfigurable Intelligent Surface (RIS) | NONE | Not started | CRITICAL |
-| Non-Terrestrial Networks (NTN) | NONE | Not started | CRITICAL |
+| Non-Terrestrial Networks (NTN) | rrc, ngap, gnb | Prototype modules present (timing advance, ephemeris, link sim, constellation, ISL handover, NAS/NGAP data models) — bespoke encodings, not wire-conformant, largely unwired from live UE/gNB paths | HIGH |
 | Sub-THz/THz communication | NONE | Not started | CRITICAL |
 | Semantic communication | semantic | Basic encoder/decoder prototype | HIGH |
 | Digital twin network | NONE | Not started | HIGH |
-| Zero-energy devices / ambient IoT | NONE | Not started | MEDIUM |
+| Zero-energy devices / ambient IoT | ue (ambient_iot) | Prototype exists (energy-harvesting model + fleet simulation), sim-internal only | MEDIUM |
 | Joint Communication and Computing (JCC) | NONE | Not started | HIGH |
 | Enhanced network slicing (6G) | agent (SliceCreate/Modify intents) | Intent types defined, no implementation | HIGH |
 | Federated learning | fl | FedAvg prototype with basic DP | MEDIUM |
@@ -617,15 +617,15 @@ These 5G gaps must be resolved before meaningful 6G simulation is possible:
 1. Implement channel models in RLS (3GPP TR 38.901, sub-THz extensions)
 2. Add massive MIMO / beamforming simulation
 3. Implement RIS channel modeling and control
-4. Add NTN link simulation (satellite propagation, Doppler, delay)
+4. Wire the existing NTN link-simulation prototypes (satellite propagation, Doppler, delay) into live paths and make encodings wire-conformant
 5. Implement semantic communication neural codecs (ONNX-based encoder/decoder)
 6. Add JSCC (Joint Source-Channel Coding) support
 
 ### Phase 4: 6G Advanced Features (Months 9-12) -- New Capabilities
-1. NTN support: satellite cell selection, NAS/RRC extensions, timing advance
+1. NTN support: prototype modules exist (timing advance, ephemeris, constellation, ISL handover) — remaining work is satellite cell selection, wire-conformant NAS/RRC encodings, and wiring into live signaling
 2. Post-quantum cryptography: Kyber/Dilithium integration
 3. Digital twin network framework
-4. Zero-energy device / ambient IoT simulation
+4. Zero-energy device / ambient IoT simulation (UE-side prototype exists: energy harvesting + fleet sim; extend beyond sim-internal)
 5. JCC (Joint Communication and Computing) framework
 6. Enhanced network slicing for 6G (inter-slice coordination, slice SLA)
 

@@ -45,7 +45,7 @@
 | 5GSM coverage | PDU Session Release (Request/Command/Complete/Reject) now implemented in `src/messages/sm/pdu_session_release.rs` (~888 lines) |
 | Missing IEs | UE security capabilities, LADN info, MICO indication encoding |
 | No 6G NAS IEs | No AI/ML capability, ISAC, semantic comm, sub-THz parameters |
-| No NTN extensions | No satellite timing advance, NTN-specific access barring |
+| NTN extensions unwired | NTN NAS IEs (satellite timing advance, NTN access barring) now exist as bespoke sim-only prototypes; the gap is wire conformance and wiring, not absence |
 
 ### Completeness: **80%**
 
@@ -80,7 +80,7 @@ Strong 5GMM and 5GSM baseline with full security algorithms. Key missing: PDU Se
 | AMF Status Indication | Now implemented: `procedures/amf_status_indication.rs` (~387 lines) |
 | RAN Configuration Update | Now implemented: `procedures/ran_configuration_update.rs` (~501 lines); `ng_reset.rs` and `path_switch.rs` procedures also added |
 | NGAP over multiple SCTP streams | Stream management for parallel procedures not fully modeled |
-| No 6G NGAP extensions | No ISAC reporting, AI-native procedures, NTN-specific IEs |
+| No 6G NGAP extensions | No ISAC reporting or AI-native procedures; an off-wire NTN support module now exists (bespoke, sim-only) but no wire-conformant NTN IEs |
 
 ### Completeness: **85%**
 
@@ -198,8 +198,8 @@ Production-quality SCTP with async tokio interface. Wire-compatible with nextgco
 
 | Layer | 5G Status | 6G Gaps |
 |-------|-----------|---------|
-| NAS (L5) | 80% | No AI/ML IEs, no ISAC, no NTN, no semantic comm parameters |
-| NGAP (L4) | 85% | No AI-native procedures, no ISAC reporting, no NTN IEs |
+| NAS (L5) | 80% | No AI/ML IEs, no ISAC, no semantic comm parameters; NTN IEs exist as bespoke sim-only prototypes (not wire-conformant) |
+| NGAP (L4) | 85% | No AI-native procedures, no ISAC reporting; off-wire NTN module exists (bespoke, sim-only) |
 | RRC (L3) | 75% | No AI config, no ISAC measurement, no sub-THz, no RRC Resume |
 | RLS (sim) | 95% | N/A (simulation protocol) |
 | GTP-U (L2) | 90% | No deterministic networking, no in-network computing |

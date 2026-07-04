@@ -123,6 +123,12 @@ Multiple AMFs can be configured for redundancy. The gNB will attempt to connect 
 |-----------|------|----------|---------|-------------|
 | `ignore_stream_ids` | bool | No | false | If `true`, ignore SCTP stream ID errors. Useful for compatibility with some core network implementations |
 
+#### NTN (research prototype)
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `ntn_config` | object | No | null | Optional NTN (Non-Terrestrial Network) block. **Currently logging-only/inert**: the gNB parses and stores it, but it is not wired into live RRC/NGAP signaling — the NTN modules are non-normative research prototypes |
+
 ---
 
 ## UE Configuration

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Service Hosting Environment (SHE) - 3-tier distributed compute for 6G networks per 3GPP TS 23.558"
+description = "Service Hosting Environment (SHE) - 3-tier distributed compute for 6G networks, inspired by 3GPP TS 23.558 (not an implementation of the spec)"
 
 [dependencies]
 # Async runtime

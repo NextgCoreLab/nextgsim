@@ -31,7 +31,7 @@
   <div class="container">
     <div class="hero-content">
       <div class="hero-badge">
-        <span>v0.1.0</span> &middot; 5G + 6G AI-Native &middot; Zero C Dependencies
+        <span>v0.1.0</span> &middot; 5G + 6G AI-Native &middot; Zero C Dependencies &middot; 6G = research prototypes
       </div>
       <h1>Agentic <span class="accent">6G</span> Simulator</h1>
       <p>The first AI-native 5G/6G UE and gNB simulator — with 8 dedicated 6G crates for ISAC, federated learning, semantic communication, autonomous AI agents, and knowledge graph-driven network intelligence. Pure Rust, zero C dependencies.</p>
@@ -64,7 +64,7 @@
       <div class="feature-card">
         <div class="feature-icon">&#128225;</div>
         <h3>Semantic Communication</h3>
-        <p>Neural encoder/decoder codecs that transmit meaning, not bits. ONNX-based learned compression with joint source-channel coding (JSCC) that adapts to SNR in real-time. 2-10x bandwidth reduction.</p>
+        <p>Neural encoder/decoder codecs that transmit meaning, not bits. ONNX-based learned compression with joint source-channel coding (JSCC) that adapts to SNR in real-time. The neural codec and the 2-10x bandwidth-reduction figures require user-supplied ONNX models — none ship; the default build uses a non-neural fallback.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">&#128752;</div>
@@ -86,6 +86,11 @@
         <h3>Pure Rust Stack</h3>
         <p>Zero C dependencies from SCTP to ASN.1 PER. Single static binary. NAS 5G, NGAP, RRC, GTP-U, SCTP — all implemented natively. Compile anywhere Rust runs.</p>
       </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#128246;</div>
+        <h3>Rel-17/18 Features</h3>
+        <p>RedCap UE indication and capability signaling. XR traffic and QoS (5QI 82&ndash;85). SNPN cell selection with NID and onboarding. MINT multi-SUPI disaster roaming. UAV Service-level-AA (IEI 0x72). Plus UE-side ProSe, ranging/sidelink, and ambient-IoT prototypes (sim-internal encodings where no wire spec is implemented).</p>
+      </div>
     </div>
   </div>
 </section>
@@ -95,6 +100,7 @@
   <div class="container">
     <h2 class="section-title">6G AI-Native Crates</h2>
     <p class="section-subtitle">8 specialized crates that bring intelligence to every layer of the network.</p>
+    <p class="section-subtitle"><strong>Honesty note:</strong> the 6G/AI crates are non-normative research prototypes of 3GPP Stage-1 studies — no frozen 6G Stage-3 specs exist. Validated against the matched NextGCore simulator, not third-party certified.</p>
 
     <!-- AI Data Flow Diagram -->
     <div class="ai-feature-block">
@@ -181,7 +187,7 @@
 
     <!-- Agent -->
     <div class="ai-feature-block">
-      <h3 class="group-heading">Agent — Intent-Based Autonomous Networking (TR 23.700-80)</h3>
+      <h3 class="group-heading">Agent — Intent-Based Autonomous Networking (TR 22.870, Stage-1 study)</h3>
       <div class="features-grid">
         <div class="feature-card">
           <h3>Intent System</h3>
@@ -196,6 +202,7 @@
           <p>Hierarchical roles (Network > Region > Cell). Agent types: Mobility, Resource, QoS, Security, Slicing. Composite intents for cooperative goals. Safety guardrails with forbidden rules.</p>
         </div>
       </div>
+      <p style="color:var(--text-secondary);font-size:0.9rem;margin-top:1rem;">Research prototype of the TR 22.870 Stage-1 AI-agent use cases (§6.41, §6.46) — agent authentication/OAuth is stubbed (local only), and no normative Stage-3 protocol exists yet.</p>
     </div>
 
     <!-- NAS/RRC Procedures -->
@@ -223,13 +230,14 @@
         </div>
         <div class="feature-card">
           <h3>ML Positioning</h3>
-          <p>4 model types: DeepPositioning (DNN), TrajectoryLstm, TransformerTracking, FingerprintCnn. Feature extraction across time and space dimensions. Multi-target tracking.</p>
+          <p>4 model types: DeepPositioning (DNN), TrajectoryLstm, TransformerTracking, FingerprintCnn — illustrative stubs (no trained models ship). Feature extraction across time and space dimensions. Multi-target tracking.</p>
         </div>
         <div class="feature-card">
           <h3>Environment Mapping</h3>
-          <p>SLAM-like occupancy grid mapping. Multi-sensor fusion with Extended Kalman Filter + Bayesian estimation. Sensing-as-a-Service API for application subscriptions.</p>
+          <p>SLAM-like occupancy grid mapping. Multi-sensor fusion with Extended Kalman Filter + Bayesian estimation. Sensing-as-a-Service API for application subscriptions (illustrative stub).</p>
         </div>
       </div>
+      <p style="color:var(--text-secondary);font-size:0.9rem;margin-top:1rem;">Prototype of the TR 22.837 study (study-only, no normative spec): the fusion/positioning/tracking core (trilateration, EKF, Bayesian fusion, OFDM-radar signal model) is research-faithful; the ML positioning models and the SaaS API are illustrative stubs.</p>
     </div>
 
     <!-- Semantic Communication -->
@@ -269,11 +277,11 @@
       <div class="features-grid">
         <div class="feature-card">
           <h3>Aggregation Strategies</h3>
-          <p><strong>FedAvg</strong> (weighted averaging), <strong>FedProx</strong> (regularized for heterogeneity), <strong>SecAgg</strong> (encrypted with x25519 key exchange). Asynchronous FL with staleness weighting.</p>
+          <p><strong>FedAvg</strong> (weighted averaging), <strong>FedProx</strong> (regularized for heterogeneity), <strong>SecAgg</strong> (pairwise-masking simulation demo with x25519 key exchange — not production secure aggregation). Asynchronous FL with staleness weighting.</p>
         </div>
         <div class="feature-card">
           <h3>Privacy Mechanisms</h3>
-          <p>Gaussian differential privacy with gradient clipping. Renyi DP composition tracking. Zero-concentrated DP (zCDP) accounting. UE gradients never leave the device unencrypted.</p>
+          <p>Gaussian differential privacy with gradient clipping. Renyi DP composition tracking. Zero-concentrated DP (zCDP) accounting. In the simulation, gradients are DP-noised and masked before upload (demo-grade, not a production privacy guarantee).</p>
         </div>
         <div class="feature-card">
           <h3>Byzantine Robustness</h3>
@@ -291,7 +299,7 @@
       <h3 class="group-heading">SHE &amp; NKEF — Compute Placement &amp; Knowledge Intelligence</h3>
       <div class="features-grid">
         <div class="feature-card">
-          <h3>SHE: 3-Tier Compute (TS 23.558)</h3>
+          <h3>SHE: 3-Tier Compute (TS 23.558-inspired, not an implementation)</h3>
           <p>LocalEdge (&lt;10ms), RegionalEdge (&lt;20ms), CoreCloud (unlimited). Workload placement by latency/compute constraints. Auto-scaling, SLA monitoring, TEE attestation. Scheduling: ClosestToEdge, OptimalLatency, LoadBalanced.</p>
         </div>
         <div class="feature-card">
@@ -470,9 +478,9 @@
       <div class="workflow-step"><span class="wf-actor">ISAC</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Feature extraction: range-Doppler map, angle spectrum, temporal features</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">ML Pipeline</span></div>
       <div class="workflow-step"><span class="wf-actor">ML</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">DeepPositioning CNN inference → (x, y, z) estimate with confidence</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Fusion</span></div>
       <div class="workflow-step"><span class="wf-actor">ML</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">TransformerTracking → velocity + trajectory prediction</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Fusion</span></div>
-      <div class="workflow-step"><span class="wf-actor">Fusion</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">EKF + Bayesian sensor fusion → refined position (sub-meter accuracy)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
+      <div class="workflow-step"><span class="wf-actor">Fusion</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">EKF + Bayesian sensor fusion → refined position (sub-meter accuracy is an illustrative target, not a validated result)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
       <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Analytics event: UE_LOCATION update → handover recommendation to RRC task</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">RRC / Agent</span></div>
-      <p class="wf-desc">Joint communication and sensing on shared 6G waveform. IsacTask channels all sensing data through IsacManager. ISAC engine runs radar processing in parallel with data demodulation. NWDAF position analytics feed directly to the RRC task for predictive handover decisions. ML models trained via federated learning across gNBs.</p>
+      <p class="wf-desc">Joint communication and sensing on shared 6G waveform (TR 22.837 study prototype). IsacTask channels all sensing data through IsacManager. ISAC engine runs radar processing in parallel with data demodulation. NWDAF position analytics feed directly to the RRC task for predictive handover decisions. The ML inference steps use illustrative stub models — no trained models ship.</p>
     </div>
 
     <h3 class="group-heading">Semantic Communication Pipeline (6G)</h3>
@@ -480,11 +488,11 @@
       <div class="workflow-step"><span class="wf-actor">UE App</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Raw data input (image 1920x1080, video frame, audio segment)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Semantic Tx</span></div>
       <div class="workflow-step"><span class="wf-actor">Encoder</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">ONNX neural codec: extract task-relevant semantic features only</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Latent Space</span></div>
       <div class="workflow-step"><span class="wf-actor">JSCC</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Joint source-channel coding: SNR-adaptive symbol mapping</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Modulator</span></div>
-      <div class="workflow-step"><span class="wf-actor">Channel</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Bandwidth: 2-10x reduction vs Shannon (task-oriented compression)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB Rx</span></div>
+      <div class="workflow-step"><span class="wf-actor">Channel</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Bandwidth: 2-10x reduction target (task-oriented compression; requires a user-supplied trained codec)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB Rx</span></div>
       <div class="workflow-step"><span class="wf-actor">JSCC Rx</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Adaptive demodulation (matched to channel state feedback)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Decoder</span></div>
       <div class="workflow-step"><span class="wf-actor">Decoder</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">ONNX neural decoder: reconstruct task output (not raw data)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB App</span></div>
       <div class="workflow-step"><span class="wf-actor">gNB App</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Semantic similarity metric: SSIM/BLEU → feedback to encoder rate control</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
-      <p class="wf-desc">Beyond-Shannon paradigm: transmit meaning, not bits. JSCC eliminates the separation between source and channel coding. Compression ratio adapts in real-time to channel conditions and task importance. ONNX runtime enables cross-platform model deployment.</p>
+      <p class="wf-desc">Beyond-Shannon paradigm: transmit meaning, not bits. JSCC eliminates the separation between source and channel coding. Compression ratio adapts in real-time to channel conditions and task importance. The neural encoder/decoder steps require user-supplied ONNX models — no models ship, and the default build falls back to a non-neural (mean-pooling) codec.</p>
     </div>
 
     <h3 class="group-heading">Federated Learning Round (6G)</h3>
@@ -499,7 +507,7 @@
       <div class="workflow-step"><span class="wf-actor">Regional</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">FedAvg (weighted by samples) or FedProx (proximal term mu=0.01)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">FL Server</span></div>
       <div class="workflow-step"><span class="wf-actor">FL Server</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">SecAgg verify → global model v(n+1) → convergence check</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
       <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Model registry update → redistribute to participating UEs/gNBs</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Network</span></div>
-      <p class="wf-desc">Privacy-preserving distributed ML across the RAN. Three-tier aggregation (UE → gNB → Regional → Cloud) minimizes backhaul. Byzantine filtering protects against poisoning attacks. SecAgg ensures server never sees individual updates.</p>
+      <p class="wf-desc">Privacy-preserving distributed ML across the RAN. Three-tier aggregation (UE → gNB → Regional → Cloud) minimizes backhaul. Byzantine filtering protects against poisoning attacks. The SecAgg step is a pairwise-masking simulation demo: individual updates are masked so the aggregator only sees sums, but it is not production secure aggregation.</p>
     </div>
 
     <h3 class="group-heading">Autonomous Agent Decision Loop (6G)</h3>
@@ -523,7 +531,7 @@
       <div class="workflow-step"><span class="wf-actor">SHE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Decision: Edge placement (meets deadline, minimizes energy)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB Edge</span></div>
       <div class="workflow-step"><span class="wf-actor">gNB Edge</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Execute inference → result (class=vehicle, confidence=0.94)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE App</span></div>
       <div class="workflow-step"><span class="wf-actor">SHE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Log: actual_latency=8ms, energy=0.3J → update placement model</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
-      <p class="wf-desc">Smart Heterogeneous Environment manager evaluates compute tiers (UE/Edge/Cloud) for each task based on latency budget, energy cost, and network conditions. Placement decisions improve over time via feedback loop.</p>
+      <p class="wf-desc">Service Hosting Environment manager (TS 23.558-inspired, not an implementation of the spec) evaluates compute tiers (UE/Edge/Cloud) for each task based on latency budget, energy cost, and network conditions. Placement decisions improve over time via feedback loop.</p>
     </div>
   </div>
 </section>
@@ -546,7 +554,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-rrc</span><span class="component-badge badge-proto">Proto</span></div>
-        <div class="component-desc">RRC — Setup, Reconfig, Measurement Reports, Handover, NTN extensions.</div>
+        <div class="component-desc">RRC — Setup, Reconfig, Measurement Reports, Handover. NTN timing/link-simulation prototypes (bespoke encodings, not wired into live signaling).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-gtp</span><span class="component-badge badge-proto">Proto</span></div>
@@ -559,6 +567,10 @@
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-rls</span><span class="component-badge badge-proto">Proto</span></div>
         <div class="component-desc">Radio Link Simulation — UE-gNB air interface over UDP.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-rlc</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">RLC (TS 38.322) — TM/UM/AM modes with segmentation, reassembly, and AM ARQ between MAC and PDCP.</div>
       </div>
     </div>
 
@@ -594,7 +606,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-she</span><span class="component-badge badge-6g">SHE</span></div>
-        <div class="component-desc">3-tier compute placement, auto-scaling, SLA monitoring, TEE attestation.</div>
+        <div class="component-desc">Service Hosting Environment — 3-tier compute placement, auto-scaling, SLA monitoring, TEE attestation. TS 23.558-inspired (not an implementation of the spec).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-nwdaf</span><span class="component-badge badge-6g">Analytics</span></div>
@@ -618,7 +630,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-semantic</span><span class="component-badge badge-6g">Semantic</span></div>
-        <div class="component-desc">Neural codecs, JSCC, rate-distortion optimization, multimodal support. ONNX inference delegated to <code>nextgsim-ai</code> (no direct <code>ort</code> dep).</div>
+        <div class="component-desc">Neural codecs, JSCC, rate-distortion optimization, multimodal support. ONNX inference delegated to <code>nextgsim-ai</code> (no direct <code>ort</code> dep). Neural paths need user-supplied ONNX models; default build uses a non-neural fallback.</div>
       </div>
     </div>
   </div>
