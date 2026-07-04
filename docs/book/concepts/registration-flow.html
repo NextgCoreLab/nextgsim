@@ -1,0 +1,668 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>UE Registration &amp; the RRC/NGAP/NAS Stack - NextGSim Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-2c146fd7.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-09918d46.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGSim Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgsim" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="ue-registration-and-the-rrcngapnas-stack"><a class="header" href="#ue-registration-and-the-rrcngapnas-stack">UE Registration and the RRC/NGAP/NAS Stack</a></h1>
+<p>This chapter traces 5G <strong>initial registration</strong> as the nextgsim simulator
+<em>actually</em> runs it — from the UE powering on and discovering a cell, through the
+gNB relaying the initial NAS message to the AMF, 5G-AKA authentication, NAS and
+AS security setup, and the piggybacked Registration Accept. It follows the code
+on <strong>both simulator sides</strong> (<code>nextgsim-ue</code> and <code>nextgsim-gnb</code>) and names the
+crate, file, and function for every step, so you can open the source and read
+along. The far side of the N2 association is the separate <strong>nextgcore</strong> core
+network (AMF/AUSF/UDM); here it appears only as the cooperative peer the
+simulator drives.</p>
+<p>The chapter assumes the layered picture from <a href="../architecture/gnb.html">gNB architecture</a>
+and <a href="../architecture/ue.html">UE architecture</a>, and the knobs from the
+<a href="../configuration.html">Configuration Reference</a>. The PDU-session/user-plane leg
+that follows registration is covered in
+<a href="pdu-session-userplane.html">PDU Sessions and the User Plane</a>.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> This flow is validated by nextgsim’s own per-crate unit
+tests, in-process strict-peer integration tests, and a <strong>matched-simulator</strong>
+docker E2E in which the project drives <em>its own</em> gNB/UE against nextgcore
+(UE→UPF GTP-U data plane verified end-to-end) — it is <strong>not</strong> third-party
+conformance certified, and the peer is cooperative rather than an arbitrary
+commercial core. The live registration path runs <strong>5G-AKA only</strong>. An EAP-AKA′
+path exists in <code>nextgsim-ue/src/nas/mm/orchestrator.rs</code>
+(<code>handle_eap_aka_prime_challenge</code>) but is entered <em>only</em> if the Authentication
+Request carries an EAP-message IE instead of RAND/AUTN; the matched core sends
+RAND/AUTN, so EAP-AKA′ is not exercised on the happy path. 3GPP TS numbers are
+quoted only where they appear in this repo’s source comments, phrased “per
+code comments”. The 6G/AI feature crates referenced elsewhere are
+non-normative research prototypes (no frozen Rel-20 Stage-3 exists).</p>
+</blockquote>
+<h2 id="components-involved"><a class="header" href="#components-involved">Components involved</a></h2>
+<p>Registration crosses six nextgsim crates plus the crypto library. The “radio”
+is simulated: RLS carries RRC and user-plane PDUs over UDP, and NGAP rides SCTP
+(userspace <code>sctp-proto</code> matched to nextgcore, or kernel SCTP).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Layer</th><th>Crate / module</th><th>Role in registration</th></tr>
+</thead>
+<tbody>
+<tr><td>RLS (sim radio)</td><td><code>nextgsim-rls</code>; <code>nextgsim-ue/src/rls/task.rs</code>, <code>nextgsim-gnb/src/rls/task.rs</code></td><td>Heartbeat cell discovery, dBm estimation, RRC/data PDU transport over UDP:4997</td></tr>
+<tr><td>Cell selection</td><td><code>nextgsim-ue/src/rrc/cell_selection.rs</code></td><td>TS 38.304-style suitable/acceptable cell selection; TS 23.122 PLMN selection</td></tr>
+<tr><td>RRC</td><td><code>nextgsim-rrc</code> (procedures); <code>nextgsim-ue/src/rrc/task.rs</code>, <code>nextgsim-gnb/src/rrc/{task.rs,connection.rs}</code></td><td>RRCSetupRequest / RRCSetup / RRCSetupComplete; SRB1; carries initial NAS</td></tr>
+<tr><td>NGAP</td><td><code>nextgsim-ngap</code> (procedures); <code>nextgsim-gnb/src/ngap/task.rs</code></td><td>InitialUEMessage, Downlink/UplinkNASTransport, InitialContextSetup</td></tr>
+<tr><td>NAS 5GMM</td><td><code>nextgsim-nas</code> (codec); <code>nextgsim-ue/src/nas/mm/orchestrator.rs</code></td><td>Registration Request build, SUCI, 5G-AKA, NAS security, 5GMM state machine</td></tr>
+<tr><td>Crypto</td><td><code>nextgsim-crypto</code></td><td>MILENAGE <code>f1..f5</code>, key hierarchy KDFs, ECIES SUCI, NAS ciphering</td></tr>
+</tbody>
+</table>
+</div>
+<p>Cross-links: the far-side handlers (AMF <code>handle_initial_ue_message</code>,
+<code>start_authentication</code>, <code>send_registration_accept</code>) live in nextgcore and are
+described in its own <em>UE Registration Call Flow</em> chapter — treat them as the
+peer here.</p>
+<h2 id="the-transport-underneath"><a class="header" href="#the-transport-underneath">The transport underneath</a></h2>
+<p>There is <strong>no real radio</strong>. The RLS protocol (<code>nextgsim-rls/src/protocol.rs</code>,
+version 3.2.7) defines four message types — <code>Heartbeat</code> (4), <code>HeartbeatAck</code> (5),
+<code>PduTransmission</code> (6), <code>PduTransmissionAck</code> (7) — sent as UDP datagrams on port
+<code>4997</code> (<code>DEFAULT_RLS_PORT</code>). RRC and user-plane bytes travel inside
+<code>PduTransmission</code> with a <code>PduType</code> of <code>Rrc</code> (1) or <code>Data</code> (2). Only user-plane
+<code>Data</code> PDUs are run through an RLC UM SN12 entity (<code>nextgsim-rlc</code>) for
+segmentation/reassembly — one entity per PDU Session ID (<code>rlc_entities</code>, keyed by
+PSI in <code>nextgsim-ue/src/rls/task.rs</code>, created on first use by <code>rlc_entity_for</code>).
+<strong>RRC PDUs bypass RLC entirely.</strong> On receive, <code>handle_pdu_transmission</code> routes
+<code>TransportEvent::RrcReceived</code> straight to RRC
+(<code>RrcMessage::DownlinkRrcDelivery</code>) with no RLC, while only
+<code>TransportEvent::DataReceived { psi, .. }</code> is fed through
+<code>rlc_entity_for(psi).receive_pdu(..)</code> for reassembly. On send, only
+<code>handle_data_pdu_delivery(psi, ..)</code> submits SDUs to RLC
+(<code>rlc_entity_for(psi).submit_sdu(..)</code> / <code>build_pdu(1500)</code>); the RRC transmit path
+(<code>handle_rrc_pdu_delivery</code>) never calls <code>rlc_entity_for</code>.</p>
+<p>NGAP rides SCTP to the AMF via <code>nextgsim-gnb/src/ngap/task.rs</code>; the AMF endpoint
+comes from <code>amf_configs</code> (default port <code>38412</code>). Everything from
+InitialUEMessage onward is UE-associated signalling over an SCTP stream.</p>
+<h2 id="step-by-step-flow"><a class="header" href="#step-by-step-flow">Step-by-step flow</a></h2>
+<p>The whole procedure as one ladder (initial registration, SUCI identity, matched
+peer):</p>
+<pre><code class="language-text"> UE (nextgsim-ue)        gNB (nextgsim-gnb)              AMF (nextgcore)
+   |                        |                                |
+ 1 |  Heartbeat (UDP 4997)  |                                |
+   |-----------------------&gt;| GnbCellTracker.process_hb      |
+ 2 |  HeartbeatAck (dBm)    |                                |
+   |&lt;-----------------------|                                |
+ 3 | cell select + fabricate SIB1                            |
+   | (CellSelector)         |                                |
+ 4 | RRCSetupRequest (UL-CCCH, random UE id)                 |
+   |-----------------------&gt;| process_rrc_setup_request      |
+ 5 | RRCSetup (DL-CCCH, SRB1)|                               |
+   |&lt;-----------------------|                                |
+ 6 | RRCSetupComplete (UL-DCCH) + [Registration Request NAS] |
+   |-----------------------&gt;| finish_rrc_setup_complete      |
+ 7 |                        | InitialUEMessage (NGAP/SCTP)   |
+   |                        |-------------------------------&gt;| handle_initial_ue_message
+ 8 |         Authentication Request (DL NAS Transport)       |
+   |&lt;-----------------------|&lt;-------------------------------| start_authentication
+ 9 |         Authentication Response (RES*) (UL NAS)         |
+   |-----------------------&gt;|-------------------------------&gt;| verify RES*
+10 |         NAS Security Mode Command (DL NAS)              |
+   |&lt;-----------------------|&lt;-------------------------------|
+11 | Security Mode Complete (+ replayed Reg Request) (UL NAS)|
+   |-----------------------&gt;|-------------------------------&gt;|
+12 |     InitialContextSetupRequest {KgNB, caps, [Reg Accept]}
+   |                        |&lt;-------------------------------| send_registration_accept
+   |  RRC SecurityModeCommand (SRB1)  +  Registration Accept |
+   |&lt;-----------------------| activate_as_security           |
+13 |                        | InitialContextSetupResponse    |
+   |                        |-------------------------------&gt;|
+14 | Registration Complete (if GUTI assigned) (UL NAS)       |
+   |-----------------------&gt;|-------------------------------&gt;|  REGISTERED
+</code></pre>
+<h3 id="12-rls-cell-discovery-heartbeat"><a class="header" href="#12-rls-cell-discovery-heartbeat">1–2. RLS cell discovery (heartbeat)</a></h3>
+<p>The UE’s <code>RlsTask</code> (<code>nextgsim-ue/src/rls/task.rs</code>) fires
+<code>send_heartbeats</code> on a 1 s tokio interval (<code>HEARTBEAT_INTERVAL_MS = 1000</code>),
+building one <code>RlsHeartbeat</code> per address in <code>gnb_search_list</code> via
+<code>UeCellSearch::create_heartbeats</code> (<code>nextgsim-rls/src/cell_search.rs</code>). Each
+heartbeat carries the UE’s random <code>sti</code> (Simulated Transmission Identifier, set
+in <code>RlsTask::new</code>) and a <code>Vector3</code> simulated position. Search-list entries with
+no port default to <code>4997</code>.</p>
+<p>The gNB’s <code>RlsTask</code> (<code>nextgsim-gnb/src/rls/task.rs</code>) receives it in
+<code>handle_heartbeat</code>, which calls <code>GnbCellTracker::process_heartbeat</code>. Signal
+strength is <em>modelled from geometry</em>: <code>estimate_dbm</code> returns <code>-distance</code> (the
+Euclidean distance between the gNB’s <code>phy_location</code> and the heartbeat’s
+<code>sim_pos</code>); anything weaker than <code>MIN_ALLOWED_DBM = -120</code> is dropped. A new STI
+allocates a UE id and emits <code>UeDetected</code> (→ <code>RrcMessage::SignalDetected</code>), then
+the gNB replies <code>RlsHeartbeatAck::with_dbm</code>. The gNB’s STI is its configured
+<code>nci</code> (<code>RlsTask::new</code>).</p>
+<p>Back on the UE, <code>handle_heartbeat_ack</code> → <code>UeCellSearch::process_heartbeat_ack</code>
+raises <code>CellDiscovered { cell_id, dbm }</code> and the RLS task forwards
+<code>RrcMessage::SignalChanged</code> to the RRC task. Loss detection is by timeout: a
+cell unseen for <code>heartbeat_threshold</code> (2000 ms) becomes <code>CellLost</code>, which — if
+it was the serving cell — raises a <code>RadioLinkFailure</code>.</p>
+<h3 id="3-cell-selection-and-fabricated-system-information"><a class="header" href="#3-cell-selection-and-fabricated-system-information">3. Cell selection and fabricated system information</a></h3>
+<p>The UE RRC task (<code>nextgsim-ue/src/rrc/task.rs</code>) handles <code>SignalChanged</code> in
+<code>handle_signal_changed</code> → <code>CellSelector::handle_signal_change</code>
+(<code>nextgsim-ue/src/rrc/cell_selection.rs</code>). On a newly detected cell it calls
+<code>provide_simulated_system_info</code>, which <strong>fabricates the MIB and SIB1 locally</strong>
+(not barred, not reserved, <code>q_rx_lev_min = -70</code>, PLMN = the UE’s configured
+HPLMN, and the SNPN NID only when <code>snpn_config</code> is set). This is a deliberate
+simplification: there is no on-air SIB broadcast, so the UE synthesises just
+enough system information to make the discovered cell selectable.</p>
+<p><code>perform_cell_selection</code> runs <code>CellSelector::perform_cell_selection</code> (cited
+against TS 38.304 §5.2 per code comments): after a 1 s startup delay it looks
+for a <em>suitable</em> cell (SIB1 present, PLMN matches the NAS-selected PLMN, not
+barred/reserved, TAI not forbidden, <code>meets_s_criteria</code> i.e. <code>Srxlev &gt; 0</code>), else
+an <em>acceptable</em> cell (any PLMN). The winner (highest <code>ranking_value</code>) is sent to
+RLS as <code>RlsMessage::AssignCurrentCell</code> and to NAS as
+<code>NasMessage::ActiveCellChanged</code>. PLMN selection itself is the TS 23.122 §4.4.3
+<code>PlmnSelector</code> in the same file; in the sim every cell broadcasts the home PLMN,
+so selection resolves to the HPLMN (<code>nextgsim-ue/src/main.rs</code>).</p>
+<h3 id="4-registration-request-build-nas-and-rrc-establishment-kickoff"><a class="header" href="#4-registration-request-build-nas-and-rrc-establishment-kickoff">4. Registration Request build (NAS) and RRC establishment kickoff</a></h3>
+<p>Registration is what <em>triggers</em> the RRC connection, not the reverse. After PLMN
+selection succeeds, <code>nextgsim-ue/src/main.rs</code> calls
+<code>orch.start_registration(RegistrationType::InitialRegistration)</code> on the MM
+orchestrator (<code>nextgsim-ue/src/nas/mm/orchestrator.rs</code>).</p>
+<p><code>build_and_send_registration</code> assembles a <code>RegistrationRequest</code>
+(<code>nextgsim-nas</code>): <code>ngKSI</code> = <code>NasKeySetIdentifier::no_key()</code> (no security yet),
+mobile identity = the <strong>SUCI</strong> (<code>Ie5gsMobileIdentity</code> of type <code>Suci</code>) unless a
+valid 5G-GUTI is stored, UE security capability <code>[ea_cap, ia_cap]</code>, requested
+NSSAI, and last-visited TAI. The SUCI itself is built by <code>build_suci</code>
+(<code>nextgsim-ue/src/nas/mm/suci.rs</code>) per TS 24.501 §9.11.3.4: the null scheme
+emits the cleartext MSIN in TBCD, while Profile A (X25519) and Profile B
+(secp256r1) conceal the MSIN via ECIES (<code>nextgsim-crypto/src/ecies.rs</code>) — the
+byte layout is golden-tested against TS 33.501 Annex C key pairs.</p>
+<p>The <strong>cleartext-IE gate</strong> (per code comments TS 24.501 §4.4.6) is enforced by
+the UE, not just the core: because this initial request is <em>unprotected</em>, only
+cleartext IEs go on the wire (UE security capability, and the SNPN NID / disaster
+indication when applicable). Requested NSSAI and last-visited TAI are stripped
+from the clear message but the <strong>full</strong> request is stashed in
+<code>self.last_registration_request</code> to be replayed inside Security Mode Complete
+(step 11). <code>T3510</code> is armed and the state moves to <code>RegisteredInitiated</code>. The
+resulting NAS PDU is emitted as <code>MmOutput::SendNasPdu</code> and handed to RRC as
+<code>RrcMessage::UplinkNasDelivery</code>.</p>
+<p>The UE RRC task’s <code>handle_uplink_nas_delivery</code> sees the RRC state is <code>Idle</code>,
+stores the PDU as <code>initial_nas_pdu</code>, and calls <code>start_connection_establishment</code>:
+it encodes an <code>RRCSetupRequest</code> via <code>encode_rrc_setup_request</code>
+(<code>nextgsim-rrc/src/procedures/rrc_setup.rs</code>) with a random 39-bit UE identity
+(<code>UeIdentity::RandomValue</code>) and establishment cause 3, which the encoder maps to
+<code>mo-Signalling</code>. It is sent on <strong>UL-CCCH</strong> over RLS.</p>
+<h3 id="5-gnb-answers-rrcsetup-srb1"><a class="header" href="#5-gnb-answers-rrcsetup-srb1">5. gNB answers RRCSetup (SRB1)</a></h3>
+<p>The gNB RRC task (<code>nextgsim-gnb/src/rrc/task.rs</code>) receives UL-CCCH in
+<code>handle_ul_ccch_message</code>, decodes the request with <code>decode_rrc_setup_request</code>,
+and calls <code>RrcConnectionManager::process_rrc_setup_request</code>
+(<code>nextgsim-gnb/src/rrc/connection.rs</code>). That creates the gNB-side UE context,
+allocates the RRC transaction id from the per-UE allocator (deterministically
+<code>0</code> on a fresh context), and builds the <strong>RRCSetup</strong> via <code>build_rrc_setup</code> →
+<code>srb1_rrc_setup_params</code> + <code>encode_rrc_setup</code>. Per code comments TS 38.331
+§5.3.5.6.3 this PDU establishes <strong>SRB1</strong> (a <code>RadioBearerConfig</code> with
+SRB-Identity 1 plus a masterCellGroup carrying one RLC-BearerConfig at LCID 1);
+the emitted bytes are pinned to a hand-derived golden UPER PDU
+(<code>[0x20,0x40,0x00,0x22,0x00,0x04,0x00,0x00]</code>, verified in
+<code>test_rrc_setup_request_emits_golden_srb1_pdu_tid0</code>). It is returned on
+<strong>DL-CCCH</strong>. The cell must be unbarred first (<code>RadioPowerOn</code> →
+<code>set_barred(false)</code>), otherwise the request is rejected.</p>
+<p>The UE handles DL-CCCH message type <code>0x00</code> in <code>handle_dl_ccch_message</code> →
+<code>handle_rrc_setup</code>: it decodes the payload with <code>decode_rrc_setup</code> and records
+SRB1 in <code>apply_rrc_setup_config</code> (a decode failure is <em>tolerated</em> with a warning,
+keeping the matched path default-safe), transitions the RRC state machine to
+<code>Connected</code>, and calls <code>send_rrc_setup_complete</code>.</p>
+<h3 id="6-rrcsetupcomplete-carries-the-initial-nas"><a class="header" href="#6-rrcsetupcomplete-carries-the-initial-nas">6. RRCSetupComplete carries the initial NAS</a></h3>
+<p><code>send_rrc_setup_complete</code> (UE RRC task) takes the stored <code>initial_nas_pdu</code> and
+encodes an <strong>RRCSetupComplete</strong> via <code>encode_rrc_setup_complete</code> with
+<code>dedicated_nas_message = &lt;Registration Request&gt;</code>, <code>selected_plmn_identity = 1</code>,
+and the echoed transaction id pinned to <code>0</code>. The RedCap indication rides here
+when <code>config.redcap</code> is set. It is sent on <strong>UL-DCCH</strong> (SRB1).</p>
+<p>The gNB’s <code>handle_ul_dcch_message</code> tries an <strong>ASN.1-first</strong> decode with
+<code>decode_rrc_setup_complete</code>; on success it routes to
+<code>handle_rrc_setup_complete_asn1</code> → <code>finish_rrc_setup_complete</code>. (This ASN.1-first
+path is the fix pinned by <code>tests/src/rrc_handshake.rs</code>: the UE’s real UPER
+RRCSetupComplete has leading byte <code>0x10</code>, which matched <em>no</em> arm of the legacy
+<code>bytes[0] &amp; 0x0F</code> nibble dispatcher and used to drop the registration NAS.) The
+bespoke fallback framing <code>[0x04, tid, 0x01, NAS…]</code> is still accepted by
+<code>handle_rrc_setup_complete</code>. <code>finish_rrc_setup_complete</code> calls
+<code>RrcConnectionManager::process_rrc_setup_complete</code> (verifies the echoed tid,
+marks the context Connected) and then <code>send_initial_nas_delivery</code>, and separately
+sends a <code>UECapabilityEnquiry</code>.</p>
+<h3 id="7-gnb--amf-initialuemessage-ngap"><a class="header" href="#7-gnb--amf-initialuemessage-ngap">7. gNB → AMF: InitialUEMessage (NGAP)</a></h3>
+<p><code>send_initial_nas_delivery</code> posts <code>NgapMessage::InitialNasDelivery</code> to the NGAP
+task, handled by <code>handle_initial_nas_delivery</code>
+(<code>nextgsim-gnb/src/ngap/task.rs</code>). It selects an AMF (<code>select_amf</code>), creates the
+NGAP UE context (allocating the RAN-UE-NGAP-ID), and fills
+<code>InitialUeMessageParams</code> (<code>nextgsim-ngap/src/procedures/initial_ue_message.rs</code>):
+the NAS PDU, <code>UserLocationInfoNr</code> (NR-CGI from <code>config.nci</code>, TAI from
+<code>config.plmn</code>/<code>config.tac</code>), the RRC establishment cause, and
+<code>UeContextRequest = Requested</code>. <code>encode_initial_ue_message</code> (cited against
+TS 38.413 §8.6.1 per code comments) produces the APER PDU, sent UE-associated
+over the SCTP stream. From here the AMF (nextgcore) drives the SBI side; the
+simulator is a relay.</p>
+<h3 id="89-authentication-5g-aka"><a class="header" href="#89-authentication-5g-aka">8–9. Authentication (5G-AKA)</a></h3>
+<p>The AMF’s Authentication Request comes back as an NGAP <strong>DownlinkNASTransport</strong>,
+handled by <code>handle_downlink_nas_transport</code> (<code>nextgsim-gnb/src/ngap/task.rs</code>),
+which forwards the inner NAS PDU to RRC as <code>RrcMessage::NasDelivery</code>; the gNB RRC
+task wraps it in a DL Information Transfer (<code>build_dl_information_transfer</code>,
+DL-DCCH) and RLS carries it to the UE.</p>
+<p>The UE NAS orchestrator dispatches every downlink NAS PDU through
+<code>handle_downlink</code> (<code>orchestrator.rs</code>), which reads the security-header type and,
+because security is not yet active, routes the plain message via <code>handle_plain</code>.
+An <code>AuthenticationRequest</code> (allowed unprotected by the TS 24.501 §4.4.4.2
+<code>allowed_when_plain</code> allow-list) reaches <code>handle_authentication_request</code>:</p>
+<pre><code class="language-text">AUTN = (SQN ⊕ AK) ‖ AMF ‖ MAC          (from the Authentication Request)
+AK      = MILENAGE.f5(RAND)            → recover SQN
+MAC?    = MILENAGE.f1(RAND, SQN, AMF)  → compare (mismatch ⇒ cause #20)
+sep bit : AMF[0] &amp; 0x80 must be 1      (else cause #26)
+SQN?    : sqn_in_range()               (else cause #21 + AUTS resync)
+RES     = MILENAGE.f2(RAND)
+CK      = MILENAGE.f3(RAND)
+IK      = MILENAGE.f4(RAND)
+RES*    = derive_res_star(CK, IK, SN-name, RAND, RES)
+</code></pre>
+<p>MILENAGE lives in <code>nextgsim-crypto/src/milenage.rs</code> (<code>Milenage::new(k, opc)</code>,
+<code>f1..f5</code>, plus <code>f1_star</code>/<code>f5_star</code> for the AUTS resync parameter computed by
+<code>compute_auts</code>). The key hierarchy is derived immediately —
+<code>derive_kausf</code> → <code>derive_kseaf</code> → <code>derive_kamf</code>
+(<code>nextgsim-crypto/src/kdf.rs</code>), folding in the network-signalled ABBA and the
+UE’s SUPI — and stored in the partial NAS security context. The UE replies with
+an <code>AuthenticationResponse</code> carrying <code>RES*</code>; the gNB relays it to the AMF as an
+<strong>UplinkNASTransport</strong> (<code>handle_uplink_nas_delivery</code>). The AMF/AUSF verify
+<code>RES*</code>. (TUAK is implemented in <code>nextgsim-crypto/src/tuak.rs</code> but the
+registration path calls MILENAGE.)</p>
+<h3 id="1011-nas-security-mode-command--complete"><a class="header" href="#1011-nas-security-mode-command--complete">10–11. NAS Security Mode Command / Complete</a></h3>
+<p>See <a href="#security-establishment">Security establishment</a> below — this is where the
+NAS security context is activated and the initial Registration Request is
+replayed.</p>
+<h3 id="12-initialcontextsetuprequest-with-the-piggybacked-registration-accept"><a class="header" href="#12-initialcontextsetuprequest-with-the-piggybacked-registration-accept">12. InitialContextSetupRequest with the piggybacked Registration Accept</a></h3>
+<p>Once NAS security is up and the AMF has run its registration SBI calls, it sends
+an <strong>InitialContextSetupRequest</strong> with the Registration Accept piggybacked as the
+NAS-PDU, plus the UE Security Capabilities and the <strong>Security Key (KgNB)</strong>. The
+gNB handles it in <code>handle_initial_context_setup_request</code>
+(<code>nextgsim-gnb/src/ngap/task.rs</code>), parsed from
+<code>nextgsim-ngap/src/procedures/initial_context_setup.rs</code>
+(<code>InitialContextSetupRequestData</code>). It calls <code>activate_as_security</code> (AS keys, see
+below), then forwards the piggybacked Registration Accept to the UE via
+<code>RrcMessage::NasDelivery</code>, transitions the UE context to active, sets up any PDU
+sessions carried in the ICS Request (<code>PDUSessionResourceSetupListCxtReq</code>), and
+replies <strong>InitialContextSetupResponse</strong> (<code>encode_initial_context_setup_response</code>).</p>
+<p>The UE NAS orchestrator receives the (now integrity-protected and ciphered)
+Registration Accept, decrypts/verifies it in <code>handle_downlink</code>, and dispatches to
+<code>handle_registration_accept</code>: it stops <code>T3510</code>, moves to
+<code>RegisteredNormalService</code>, and stores the assigned 5G-GUTI, TAI list, Allowed
+NSSAI, equivalent PLMNs, and <code>T3512</code>.</p>
+<h3 id="1314-registration-complete--registered"><a class="header" href="#1314-registration-complete--registered">13–14. Registration Complete → REGISTERED</a></h3>
+<p>If the Accept assigned a new 5G-GUTI (or a pending NSSAI / slicing-change / DRX
+parameters — the <code>needs_ack</code> condition), <code>handle_registration_accept</code> emits a
+<strong>Registration Complete</strong>, protected with the active context and relayed to the
+AMF as an UplinkNASTransport. The UE is now registered; the gNB’s
+InitialContextSetupResponse (step 13) confirms the RAN context. Basic
+registration is covered by <code>tests/src/ue_registration.rs</code>
+(<code>test_ue_registration_basic</code>).</p>
+<h2 id="security-establishment"><a class="header" href="#security-establishment">Security establishment</a></h2>
+<p>Registration activates <strong>two</strong> security contexts in sequence: NAS security
+(mandatory, fully live) and AS security (KgNB-derived; see the honesty caveat).</p>
+<h3 id="nas-security-mode-command--complete"><a class="header" href="#nas-security-mode-command--complete">NAS Security Mode Command → Complete</a></h3>
+<p>The AMF’s Security Mode Command arrives as a downlink NAS message with a
+<strong>new-security-context</strong> header. <code>handle_downlink</code> (<code>orchestrator.rs</code>)
+special-cases it: an SMC with <code>sht.is_new_security_context()</code> is verified with the
+keys signalled <em>inside</em> the message, so it routes straight to
+<code>handle_security_mode_command</code> even though the context is not yet active. That
+handler enforces, in order (cited against TS 24.501 §5.4.2.3 / TS 33.501 §6.7.2
+per code comments):</p>
+<ol>
+<li><strong>Anti-bidding-down</strong>: the <em>replayed</em> UE security capabilities must equal what
+the UE sent (<code>ea_cap</code>/<code>ia_cap</code>), else Security Mode Reject with cause <strong>#23</strong>
+(<code>UeSecurityCapabilitiesMismatch</code>).</li>
+<li><strong>Algorithm validity</strong>: the selected NEA/NIA must decode and be within the
+UE’s advertised capabilities; NIA0 (null integrity) is refused outside an
+emergency context.</li>
+<li><strong>Partial context present</strong>: a KAMF from authentication is required.</li>
+<li><strong>ABBA</strong>: if the SMC carries a different ABBA, KAMF is re-derived
+(<code>derive_kamf</code>).</li>
+<li><strong>Derive + verify before activating</strong>: <code>derive_nas_keys</code> produces
+<code>Knas_int</code>/<code>Knas_enc</code>, then <code>verify_nas_mac</code> checks the SMC’s NAS-MAC — and
+only on success is the context <code>activate</code>d. A MAC failure rejects with the keys
+<strong>not</strong> activated.</li>
+</ol>
+<p>The UE then builds <strong>Security Mode Complete</strong>, adding IMEISV when requested and —
+critically — the <strong>replayed initial Registration Request</strong> in the NAS message
+container (<code>complete.nas_message_container = self.last_registration_request</code>, the
+RINMR of TS 24.501 §5.4.2.3). This is what carries the non-cleartext IEs
+(requested NSSAI, last-visited TAI) that were withheld from the unprotected
+step-4 message. It is protected with header
+<code>IntegrityProtectedAndCipheredWithNewSecurityContext</code> via <code>protect_uplink</code>.
+After activation, <code>handle_downlink</code> discards any unprotected NAS message
+(TS 24.501 §4.4.4.2). Ciphering/integrity primitives are in
+<code>nextgsim-crypto</code> (<code>nia.rs</code>/<code>nea.rs</code>); the algorithm negotiation and MAC checks
+are exercised by <code>test_smc_success_activates_and_replays_registration_request</code>
+in <code>orchestrator.rs</code>.</p>
+<h3 id="as-security-kgnb--rrc-keys"><a class="header" href="#as-security-kgnb--rrc-keys">AS security (KgNB → RRC keys)</a></h3>
+<p>On the gNB side, <code>activate_as_security</code> (<code>nextgsim-gnb/src/ngap/task.rs</code>) selects
+the AS algorithms from the UE Security Capabilities bitmaps
+(<code>select_as_algorithms</code>: prefer NEA2/NIA2, and integrity never falls back to
+NIA0), derives the four AS keys — <code>K_RRCenc</code>, <code>K_RRCint</code>, <code>K_UPenc</code>, <code>K_UPint</code> —
+from the KgNB in the Security Key IE using <code>derive_rrc_up_key</code>
+(<code>nextgsim-crypto/src/kdf.rs</code>, cited against TS 33.501 Annex A.8 per code
+comments), stores them on the UE context, and sends an <strong>RRC SecurityModeCommand</strong>
+on SRB1 (DL-DCCH) via <code>encode_security_mode_command</code>.</p>
+<p>On the UE side, the KgNB is derived independently by the NAS plane —
+<code>derive_kgnb_for_as_security</code> (<code>orchestrator.rs</code>) computes
+<code>KgNB = derive_kgnb(KAMF, uplink-NAS-COUNT, 0x01)</code> (TS 33.501 §6.9.4.1 per code
+comments), so both ends arrive at identical RRC keys. The UE RRC handler
+<code>handle_as_security_mode_command</code> (<code>nextgsim-ue/src/rrc/task.rs</code>) then
+<code>derive_from_kgnb</code>s and replies SecurityModeComplete.</p>
+<blockquote>
+<p><strong>Caveat (honesty):</strong> the UE-side AS SecurityModeCommand handling is gated
+behind the compile-time flag <code>I5_UE_AS_SECURITY</code> (<code>nextgsim-ue/src/rrc/security.rs</code>),
+<strong>default off</strong>. With the flag off — the matched-sim default and the E2E path —
+the gNB still derives AS keys and emits the RRC SecurityModeCommand, but the
+UE’s legacy DL-DCCH nibble dispatcher misroutes the gNB’s ASN.1 SMC rather than
+completing typed AS security (this exact behavior is pinned as the red/green
+baseline in <code>tests/src/rrc_handshake.rs</code>). Because RLS/RLC do not actually
+cipher SRBs/DRBs in the sim, registration and the user plane still complete;
+full UE↔gNB AS-security completion is a tracked Wave-6 residue (I5), not a
+claim of this default path.</p>
+</blockquote>
+<h2 id="simplifications--known-gaps"><a class="header" href="#simplifications--known-gaps">Simplifications &amp; known gaps</a></h2>
+<p>Grounded in the code, these are the honest deviations from a textbook TS 23.502
+registration:</p>
+<ul>
+<li><strong>Simulated radio and system information.</strong> RLS models signal strength as
+<code>-distance</code> (<code>GnbCellTracker::estimate_dbm</code>) over UDP; there is no MIB/SIB
+broadcast. The UE <em>fabricates</em> SIB1/MIB locally in
+<code>provide_simulated_system_info</code> (<code>nextgsim-ue/src/rrc/task.rs</code>) so the cell is
+selectable — TS 38.304 cell selection runs, but on synthesised inputs.</li>
+<li><strong>5G-AKA only on the live path.</strong> <code>handle_authentication_request</code> runs
+MILENAGE-based 5G-AKA. <code>handle_eap_aka_prime_challenge</code> is only reached if the
+Authentication Request omits RAND/AUTN and carries an EAP-message IE, which the
+matched core does not do.</li>
+<li><strong>AS security default-off on the UE (I5).</strong> See the caveat above:
+<code>I5_UE_AS_SECURITY</code> gates the UE’s typed AS SMC handling; the default path
+leaves AS security key-derived-but-not-completed on the UE, tolerated because
+the simulated air interface does not cipher.</li>
+<li><strong>RRC transaction ids pinned to 0.</strong> Both the gNB’s RRCSetup/SMC tids and the
+UE’s echoed RRCSetupComplete tid are pinned to <code>0</code> while
+<code>C5_TYPED_DCCH_DISPATCH</code> (<code>nextgsim-gnb/src/rrc/transaction.rs</code>) is off, to stay
+nibble-safe on the legacy dispatchers. The full per-UE <code>0..3</code> cycle only lands
+with C5.</li>
+<li><strong>Bespoke DCCH framing alongside ASN.1.</strong> The gNB accepts both real UPER
+UL-DCCH and a bespoke fallback (<code>[0x04, tid, 0x01, NAS…]</code>), and emits DL NAS as
+a bespoke <code>[0x04,0x00,0x00,NAS…]</code> container unless C5 is on. These legacy paths
+are slated for retirement (C6) and exist for matched-sim interop.</li>
+<li><strong>Identity procedure normally skipped.</strong> The matched UE sends its SUCI directly
+in the initial Registration Request, so no Identity Request/Response runs on the
+happy path.</li>
+<li><strong>Cooperative peer.</strong> All of the above is exercised against nextgcore, not an
+arbitrary commercial core/RAN. The 6G/AI signalling routed by the RRC task
+(<code>SixgAiMlInference</code>, <code>SixgIsacSensingData</code>, …) is a non-normative research
+prototype and plays no part in registration.</li>
+</ul>
+<h2 id="how-it-is-validated"><a class="header" href="#how-it-is-validated">How it is validated</a></h2>
+<p><strong>Unit tests (per-crate <code>cargo test</code>).</strong> The wire builders and decision logic are
+tested independently of any network:</p>
+<ul>
+<li><code>nextgsim-rls/src/cell_search.rs</code> — <code>test_ue_cell_search_discovery</code>,
+<code>test_gnb_tracker_detection</code>, <code>test_gnb_tracker_weak_signal</code>, <code>test_best_cell</code>
+(heartbeat discovery, dBm gating, best-cell selection).</li>
+<li><code>nextgsim-ue/src/rrc/cell_selection.rs</code> — <code>test_cell_selection_suitable_cell</code>,
+<code>test_cell_selection_acceptable_cell</code>, <code>test_cell_selection_barred_cell_rejected</code>,
+plus the TS 23.122 PLMN-selection suite (<code>test_plmn_selection_*</code>).</li>
+<li><code>nextgsim-ue/src/nas/mm/orchestrator.rs</code> —
+<code>test_registration_request_arms_t3510_and_includes_capabilities</code>,
+<code>test_smc_success_activates_and_replays_registration_request</code>,
+<code>test_registration_accept_with_guti_sends_registration_complete</code>,
+<code>test_plain_registration_accept_discarded</code> (the §4.4.4.2 unprotected-message
+gate), and the reject-cause table tests.</li>
+<li><code>nextgsim-ue/src/nas/mm/suci.rs</code> — <code>test_null_scheme_exact_bytes</code>,
+<code>test_profile_a_conceals_and_deconceals</code>, <code>test_profile_b_conceals_and_deconceals</code>
+(golden SUCI bytes vs TS 33.501 Annex C vectors).</li>
+<li><code>nextgsim-gnb/src/rrc/connection.rs</code> —
+<code>test_rrc_setup_request_emits_golden_srb1_pdu_tid0</code>,
+<code>test_rrc_setup_complete_tid_mismatch_is_discarded</code>.</li>
+<li><code>nextgsim-gnb/src/rrc/task.rs</code> — <code>test_ul_dcch_asn1_rrc_setup_complete_accepted</code>,
+<code>test_ul_dcch_bespoke_rrc_setup_complete_accepted</code>, and the typed-dispatch tests.</li>
+<li><code>nextgsim-ngap/src/capture_tests.rs</code> — <code>test_initial_ue_message_encoding_structure</code>,
+<code>test_decode_initial_ue_message_capture</code>, <code>test_initial_ue_message_rrc_causes</code>,
+<code>test_initial_ue_message_large_nas_pdu</code> (APER encode/decode of InitialUEMessage).</li>
+</ul>
+<p><strong>In-process strict-peer integration.</strong> <code>tests/src/rrc_handshake.rs</code> drives the
+<strong>real</strong> gNB and UE RRC task handlers in one process (no mocks): UE
+RRCSetupRequest → gNB RRCSetup → UE RRCSetupComplete → the resulting
+<code>NgapMessage::InitialNasDelivery</code> whose NAS bytes are asserted byte-for-byte equal
+to the original Registration Request. <code>tests/src/ue_registration.rs</code> and
+<code>tests/src/e2e_scenario.rs</code> (<code>test_e2e_ue_registration_flow</code>) exercise the
+registration path through the task graph.</p>
+<p><strong>Matched-simulator docker E2E.</strong> <code>nextgsim/docker/docker-compose.yml</code> brings up
+the prebuilt <code>nr-gnb</code>/<code>nr-ue</code> (<code>docker/binaries/</code>) on the <code>nextgcore_core</code>
+network and runs them against nextgcore; the end-to-end driver script lives in
+the nextgcore repo (<code>nextgcore/docker/rust/e2e.sh</code>). That suite asserts the
+registration flow through source-anchored log lines (<code>Sending Registration Request</code> … <code>Registration Accept: UE is now …</code> … <code>Sending Registration Complete</code>)
+and then verifies the data plane by pinging <strong>through the UE’s GTP-U tunnel</strong>,
+finishing at an active PDU session — <strong>84/84 green</strong> as of the last baseline. This
+is functional validation against a cooperative peer; it is not third-party
+conformance certification. See <a href="../getting-started.html">Getting Started</a> for the
+run recipe and <a href="../configuration.html">Configuration Reference</a> for the knobs that
+must match between gNB and UE for registration to succeed.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/ue.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../concepts/pdu-session-userplane.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/ue.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../concepts/pdu-session-userplane.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,620 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>UE Architecture - NextGSim Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-2c146fd7.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-09918d46.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGSim Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgsim" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="ue-architecture"><a class="header" href="#ue-architecture">UE Architecture</a></h1>
+<p>This chapter is a component reference for the <strong>UE simulator</strong> — the <code>nextgsim-ue</code>
+crate that builds the <code>nr-ue</code> binary. It maps the binary’s internal modules,
+names the crates it composes, and traces how the NAS state machine drives
+registration and PDU-session setup and how user-plane packets reach the TUN
+device. Every structural and behavioural claim below names the file and the
+function, struct, or constant that backs it, so you can open the source and read
+along. For the message-by-message flows this component <em>participates in</em>, see the
+<a href="../concepts/registration-flow.html">registration flow</a> and
+<a href="../concepts/pdu-session-userplane.html">PDU session / user plane</a> concept chapters;
+this page is about how the UE itself is wired.</p>
+<blockquote>
+<p><strong>Honesty note:</strong> The <code>nextgsim-ue</code> behaviour described here is validated by
+per-crate unit tests and by the project’s <strong>matched-simulator docker E2E</strong> — the
+project drives <em>its own</em> gNB/UE against the NextGCore 5G core, and the UE→UPF
+GTP-U data plane is exercised end to end (84/84 green, 0% loss as of 2026-07-02).
+This proves internal consistency of the pair; it is <strong>not</strong> third-party
+conformance certification, and the peer is a cooperative simulator, not an
+arbitrary commercial network. The live authentication path supports <strong>5G-AKA and
+EAP-AKA′</strong> (both Milenage-based); the AS-security wire path is <strong>default-off</strong> (see
+<em>Simplifications &amp; known gaps</em>). The Rel-18 5G-Advanced tasks and the 6G/AI
+client tasks are <strong>non-normative research prototypes</strong> — no frozen Rel-20
+Stage-3 wire spec exists. 3GPP TS numbers below are quoted only where they
+appear in this repo’s source comments, phrased “per code comments”.</p>
+</blockquote>
+<h2 id="binary-and-startup"><a class="header" href="#binary-and-startup">Binary and startup</a></h2>
+<p>The crate declares one binary, <code>nr-ue</code>, in <code>nextgsim-ue/Cargo.toml</code>
+(<code>[[bin]] name = "nr-ue", path = "src/main.rs"</code>). Startup lives in
+<code>nextgsim-ue/src/main.rs</code>:</p>
+<ol>
+<li><strong>Parse CLI.</strong> <code>Args</code> (clap) accepts <code>-c/--config</code> (required), <code>-i/--imsi</code>
+(override), <code>-n/--num-of-UE</code> (1–512), <code>-t/--tempo</code> (ms between UE starts),
+<code>-l/--disable-cmd</code>, and <code>-r/--no-routing-config</code>. <code>Args</code> is validated into
+<code>UeOptions</code> via <code>TryFrom&lt;Args&gt;</code>; <code>normalize_imsi</code> strips an <code>imsi-</code> prefix and
+enforces exactly 15 digits. These flags are documented for operators in the
+<a href="../configuration.html#ue-cli-options">CLI section of Configuration</a>.</li>
+<li><strong>Load + validate config.</strong> <code>load_and_validate_ue_config</code> →
+<code>load_ue_config</code> (serde_yaml into <code>nextgsim_common::config::UeConfig</code>) then
+<code>validate_ue_config</code>, which checks HPLMN MCC/MNC ranges, a non-empty
+<code>gnb_search_list</code>, a non-zero subscriber key, and performs a <strong>trial</strong>
+<code>nextgsim_ue::nas::mm::build_suci(config)</code> so a bad SUCI configuration fails at
+startup rather than inside the NAS task.</li>
+<li><strong>Build the app.</strong> <code>UeApp::new</code> calls <code>TaskManager::new</code> (from <code>tasks.rs</code>) to
+mint the four core channels, then <code>task_manager.init_rel18_tasks(...)</code> to
+install the Rel-18 handles <em>before</em> the task base is cloned, and finally
+<code>UeApp::spawn_tasks</code>.</li>
+<li><strong>Spawn the actors.</strong> <code>spawn_tasks</code> launches, in order: the <strong>TUN</strong> task
+(<code>TunTask::run</code>) plus a small TUN→app handler closure; the <strong>App</strong> task
+(<code>AppTask</code>, with a CLI server unless <code>--disable-cmd</code>); the <strong>NAS</strong> task
+(<code>UeApp::run_nas_task</code>); the <strong>RRC</strong> task (<code>UeApp::run_rrc_task</code>); the Rel-18
+<strong>Ranging / MINT / Sidelink</strong> tasks; any enabled <strong>6G</strong> tasks; and last the
+<strong>RLS</strong> task (<code>RlsTask::from_ue_config</code>). <code>-n &gt; 1</code> spawns that many <code>UeApp</code>
+instances with incrementing IMSIs.</li>
+</ol>
+<p>All tasks are async actors created with a default queue depth of
+<code>DEFAULT_CHANNEL_CAPACITY = 256</code> (<code>tasks.rs</code>). Graceful shutdown is a
+<code>tokio::sync::watch</code> broadcast driven by <code>TaskManager::shutdown</code> →
+<code>UeTaskBase::shutdown_all</code>.</p>
+<h2 id="module-map"><a class="header" href="#module-map">Module map</a></h2>
+<p>The library surface is declared in <code>nextgsim-ue/src/lib.rs</code>. Each internal module
+and the crate that backs it:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module (path under <code>nextgsim-ue/src/</code>)</th><th>Backing crate(s)</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td><code>main.rs</code></td><td>—</td><td><code>nr-ue</code> entry: CLI, config load/validate, task spawning, the NAS and RRC task loops (<code>run_nas_task</code>, <code>run_rrc_task</code>) and the MM/SM output pumps (<code>process_mm_outputs</code>, <code>process_sm_outputs</code>)</td></tr>
+<tr><td><code>tasks.rs</code></td><td><code>nextgsim-common</code></td><td>Actor framework: <code>Task</code> trait, <code>TaskManager</code>, <code>UeTaskBase</code> (holds <code>app_tx/nas_tx/rrc_tx/rls_tx</code> <code>TaskHandle</code>s), the <code>TaskId</code> enum, and every inter-task <code>*Message</code> type</td></tr>
+<tr><td><code>app/</code></td><td><code>nextgsim-common</code></td><td>App task, CLI command parsing/handling (<code>parse_ue_cli_command</code>, <code>cli_handler.rs</code>), status/<code>info</code> reporting (<code>status.rs</code>), config loading (<code>config_loader.rs</code>)</td></tr>
+<tr><td><code>nas/mm/</code></td><td><code>nextgsim-nas</code>, <code>nextgsim-crypto</code></td><td>5GMM: <code>MmOrchestrator</code>, MM state machine, SUCI build, authentication, NAS security, deregistration/service-request/config-update/emergency/MINT procedures</td></tr>
+<tr><td><code>nas/sm/</code></td><td><code>nextgsim-nas</code></td><td>5GSM: <code>SmOrchestrator</code>, PDU-session establishment/modification/release, PSI/PTI allocation, T3580/T3581/T3582, UL/DL NAS Transport wrapping</td></tr>
+<tr><td><code>rrc/</code></td><td><code>nextgsim-rrc</code>, <code>nextgsim-crypto</code></td><td>RRC state machine, cell selection (TS 38.304), measurement, handover, RedCap, re-establishment, resume, AS security (<code>security.rs</code>), UAV RRC types</td></tr>
+<tr><td><code>rls/</code></td><td><code>nextgsim-rls</code>, <code>nextgsim-rlc</code></td><td>Radio Link Simulation transport: cell search over UDP, RRC + user-plane PDU transport, per-PSI RLC (UM SN12) segmentation/reassembly</td></tr>
+<tr><td><code>tun/</code></td><td><code>nextgsim-common</code>, <code>tun-rs</code></td><td>TUN device lifecycle and IP-packet I/O for the user plane (<code>TunTask</code>, <code>TunInterface</code>, <code>packet.rs</code>)</td></tr>
+<tr><td><code>timer.rs</code></td><td>—</td><td>NAS timer constants + <code>NasTimerManager</code>, <code>GprsTimer2/3</code> decoders</td></tr>
+<tr><td><code>daps.rs</code></td><td>—</td><td>Rel-17 DAPS handover UE state (<code>UeDapsState</code>) — dual-RLC handover model</td></tr>
+<tr><td><code>ambient_iot/</code>, <code>prose.rs</code>, <code>ranging/</code>, <code>sidelink/</code>, <code>uav.rs</code>, <code>mint/</code></td><td>(in-crate)</td><td>Rel-17/18 5G-Advanced prototypes (see <a href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes</a>)</td></tr>
+<tr><td><code>semantic_codec/</code>, <code>she_client/</code>, <code>isac_sensor/</code>, <code>fl_participant/</code>, <code>nwdaf_reporter/</code></td><td><code>nextgsim-semantic</code>, <code>nextgsim-she</code>, <code>nextgsim-isac</code>, <code>nextgsim-fl</code>, <code>nextgsim-nwdaf</code></td><td>Feature-gated 6G/AI client tasks (see <a href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes</a>)</td></tr>
+</tbody>
+</table>
+</div>
+<p>The composed crates (declared in <code>Cargo.toml</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Crate</th><th>What the UE uses it for</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nextgsim-common</code></td><td><code>UeConfig</code> + all config types, <code>OctetString</code>, <code>TaskMessage</code>, the CLI server, <code>Plmn</code>/<code>Tai</code>/<code>Supi</code> types</td></tr>
+<tr><td><code>nextgsim-nas</code></td><td>5GMM/5GSM message codecs, NAS headers, <code>security::{NasSecurityContext, compute_nas_mac, verify_nas_mac, nas_cipher, CipheringAlgorithm, IntegrityAlgorithm}</code></td></tr>
+<tr><td><code>nextgsim-crypto</code></td><td>Milenage, TUAK, NEA/NIA ciphers, ECIES SUCI concealment, and the 5G KDF hierarchy (<code>kdf::{derive_kausf, derive_kseaf, derive_kamf, derive_kgnb, derive_res_star}</code>)</td></tr>
+<tr><td><code>nextgsim-rrc</code></td><td>ASN.1 UPER RRC codec (<code>codec::generated</code>) and RRC procedures (<code>procedures::security_mode</code>)</td></tr>
+<tr><td><code>nextgsim-rls</code></td><td>The UDP RLS protocol: <code>UeCellSearch</code>, <code>RlsTransport</code>, <code>RrcChannel</code>, message codec</td></tr>
+<tr><td><code>nextgsim-rlc</code></td><td><code>RlcEntity</code> (TS 38.322) — UM SN12 segmentation/reassembly for the user plane</td></tr>
+<tr><td><code>nextgsim-gtp</code></td><td>GTP-U codec (linked as a workspace dependency). On the matched-sim path the UE’s user plane rides <strong>RLS</strong> to the gNB, and the <strong>gNB</strong> is the GTP-U (N3) endpoint toward the UPF — see <a href="gnb.html">gNB Architecture</a></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="task-topology"><a class="header" href="#task-topology">Task topology</a></h3>
+<pre><code class="language-text">                 ┌─────────────────────── UeTaskBase (clones of TaskHandles) ───────────────────────┐
+                 │                                                                                   │
+   CLI (nr-cli) ─┴─► App task ──► NAS task ──► RRC task ──► RLS task ══UDP══► gNB (nextgsim-gnb)
+                        ▲            │  ▲          │            │  ▲
+                        │           MM/SM      UL/DL RRC     per-PSI RLC
+                        │        orchestrators  wrapping     (UM, SN12)
+                        │            │                          │
+   TUN device ◄─────────┴──── TunTask ◄── downlink IP    uplink IP ──► (to RLS)
+</code></pre>
+<p>Every arrow is an <code>mpsc</code> channel carrying a <code>TaskMessage&lt;T&gt;</code>; the message enums
+(<code>AppMessage</code>, <code>NasMessage</code>, <code>RrcMessage</code>, <code>RlsMessage</code>, plus the Rel-18/6G
+variants) are all defined in <code>tasks.rs</code>.</p>
+<h2 id="nas--security-stack"><a class="header" href="#nas--security-stack">NAS &amp; security stack</a></h2>
+<p>The NAS layer is split into mobility management (<code>nas/mm/</code>) and session management
+(<code>nas/sm/</code>) per <code>nas/mod.rs</code>. Both orchestrators are <strong>sans-IO</strong>: the NAS task in
+<code>main.rs</code> (<code>run_nas_task</code>) feeds them downlink PDUs and a one-second <code>tick()</code>, and
+they return output vectors (<code>MmOutput</code> / <code>SmOutput</code>) describing PDUs to send and
+outcomes to act on. <code>process_mm_outputs</code> / <code>process_sm_outputs</code> in <code>main.rs</code>
+translate those into <code>RrcMessage::UplinkNasDelivery</code> and TUN commands.</p>
+<h3 id="the-mm-orchestrator-and-state-machine"><a class="header" href="#the-mm-orchestrator-and-state-machine">The MM orchestrator and state machine</a></h3>
+<p><code>MmOrchestrator</code> (<code>nas/mm/orchestrator.rs</code>) owns the MM procedure state, the NAS
+timers, and the NAS security context. It is seeded from <code>MmUeIdentity::from_config</code>,
+which precomputes: the SUPI string, the SUCI bytes, the subscriber key <code>k</code>, the
+operator key <code>opc</code> (via <code>nextgsim_crypto::milenage::compute_opc</code> when <code>op_type</code>
+is <code>Op</code>), the serving-network name, IMEISV, the advertised EA/IA capability
+octets, the encoded Requested NSSAI, and the Rel-17/18 indications
+(<code>snpn_nid</code>, <code>disaster_roaming</code>, <code>uav_indication</code>, <code>redcap</code>).</p>
+<p>The state machine (<code>nas/mm/state.rs</code>, <code>MmStateMachine</code>) tracks four orthogonal
+5GMM state axes per TS 24.501 §5.1.3 (per code comments):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Axis</th><th>Type</th><th>Values</th></tr>
+</thead>
+<tbody>
+<tr><td>Registration</td><td><code>RmState</code></td><td><code>Deregistered</code>, <code>Registered</code></td></tr>
+<tr><td>Connection</td><td><code>CmState</code></td><td><code>Idle</code>, <code>Connected</code></td></tr>
+<tr><td>Main MM</td><td><code>MmState</code></td><td><code>Null</code>, <code>Deregistered</code>, <code>RegisteredInitiated</code>, <code>Registered</code>, <code>DeregisteredInitiated</code>, <code>ServiceRequestInitiated</code></td></tr>
+<tr><td>Sub-state</td><td><code>MmSubState</code></td><td>e.g. <code>DeregisteredNormalService</code>, <code>RegisteredNormalService</code>, <code>RegisteredPlmnSearch</code>, …</td></tr>
+<tr><td>Update status</td><td><code>UpdateStatus</code></td><td><code>Updated</code>, <code>NotUpdated</code>, <code>RoamingNotAllowed</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>switch_mm_state</code> derives the <code>RmState</code> from the target <code>MmState</code>
+(<code>derive_rm_state</code>) so RM and MM never diverge.</p>
+<p><code>MmOutput</code> (<code>orchestrator.rs</code>) is the orchestrator’s vocabulary to the NAS task:
+<code>SendNasPdu</code>, <code>RegistrationSucceeded</code>, <code>EquivalentPlmnsUpdated</code>,
+<code>RegistrationFailed(MmCause)</code>, <code>AuthenticationRejected</code>, <code>PlmnSearchNeeded</code>,
+<code>NotHandled</code> (a plain 5GMM PDU the orchestrator does not own — e.g. a 5GSM
+piggyback, dispatched onward), and <code>AsSecurityKgnb</code> (only when the AS-security
+gate is on).</p>
+<h3 id="suci-construction"><a class="header" href="#suci-construction">SUCI construction</a></h3>
+<p><code>build_suci</code> (<code>nas/mm/suci.rs</code>) assembles the 5GS mobile-identity IE per
+TS 24.501 §9.11.3.4 (per code comments): SUPI-format/type octet, home-network
+PLMN (TBCD), routing indicator, protection-scheme id, key id, and the scheme
+output. Three schemes are implemented:</p>
+<ul>
+<li><strong>Null (scheme 0):</strong> cleartext MSIN in TBCD.</li>
+<li><strong>Profile A (scheme 1):</strong> ECIES over X25519 via
+<code>nextgsim_crypto::ecies::generate_suci_profile_a</code>.</li>
+<li><strong>Profile B (scheme 2):</strong> ECIES over secp256r1 via <code>generate_suci_profile_b</code>.</li>
+</ul>
+<p>A <strong>fresh ephemeral key pair is generated per call</strong> for the ECIES profiles, and
+there is deliberately <strong>no fall-back to the null scheme</strong> — a UE configured for
+ECIES that cannot conceal returns <code>SuciBuildError</code> rather than leaking the SUPI
+(source comment cites TS 33.501 §6.12). The module’s unit tests assert byte-exact
+output, including deconcealment against the TS 33.501 <strong>Annex C.4.3 (Profile A)</strong>
+and <strong>Annex C.4.4 (Profile B)</strong> home-network key pairs and a tampered-MAC
+rejection.</p>
+<h3 id="authentication-and-the-key-hierarchy"><a class="header" href="#authentication-and-the-key-hierarchy">Authentication and the key hierarchy</a></h3>
+<p>When an <code>AuthenticationRequest</code> arrives, <code>MmOrchestrator</code>
+(<code>orchestrator.rs</code>, <code>handle_authentication_request</code>) decodes it
+(<code>AuthenticationRequest::decode</code>) and runs Milenage:
+<code>Milenage::new(&amp;self.identity.k, &amp;self.identity.opc)</code> produces the vector, then
+the 5G key hierarchy is derived with <code>nextgsim-crypto</code>’s KDFs (TS 33.501 Annex A,
+per code comments):</p>
+<pre><code class="language-text">K ──Milenage──► CK, IK, RES, AK, MAC
+                 │
+   derive_res_star(ck, ik, sn_name, rand, res) ─► RES*  (Auth Response)
+   derive_kausf(ck, ik, sn_name, autn)          ─► KAUSF
+   derive_kseaf(kausf, sn_name)                 ─► KSEAF
+   derive_kamf(kseaf, supi, abba)               ─► KAMF
+                 │
+   nextgsim_nas::security  ─► Knas_int, Knas_enc  (NAS integrity + ciphering)
+   derive_kgnb(kamf, ul_count, 0x01)            ─► KgNB (AS security, gated)
+</code></pre>
+<p>NAS message protection is applied by <code>MmOrchestrator::protect_if_active</code>: once the
+security context is active, uplink PDUs are integrity-protected and ciphered
+(<code>nextgsim_nas::security::{compute_nas_mac, nas_cipher}</code>) before they leave as
+<code>MmOutput::SendNasPdu</code>; downlink MAC verification and deciphering happen in
+<code>handle_downlink</code>. The abnormal authentication cases — MAC failure (cause #20),
+non-5G network / separation-bit (#26), and SQN sync failure with a real Milenage
+f1*/f5* AUTS — are handled in the orchestrator (source comments cite TS 24.501
+§5.4.1.3.6).</p>
+<p><strong>What is real vs. what is available.</strong> The UE’s <strong>live</strong> authentication path
+supports both <strong>5G-AKA and EAP-AKA′</strong>, both of which are <strong>Milenage-based</strong>.
+<code>orchestrator.rs</code> imports <code>milenage::{compute_opc, Milenage}</code> for the 5G-AKA
+branch, and <code>handle_authentication_request</code> dispatches to
+<code>handle_eap_aka_prime_challenge</code> when an <code>AuthenticationRequest</code> carries an EAP
+message instead of RAND/AUTN; that handler calls
+<code>nextgsim_crypto::eap_aka_prime::run_eap_aka_prime</code> and derives the
+KAUSF/KSEAF/KAMF hierarchy. The <code>nextgsim-crypto</code> crate <em>also</em> ships <strong>TUAK</strong>,
+whose unit tests are <strong>validated byte-exact against the TS 35.232 Implementers’
+Test Data sets</strong> (source comment in <code>nextgsim-crypto/src/tuak.rs</code>: “Vectors:
+validated byte-exact against TS 35.232 Implementers’ Test Data sets”), and
+Milenage is checked against the TS 35.207 test sets — but <strong>TUAK</strong> is not wired
+into the UE’s live orchestrator.</p>
+<h3 id="the-sm-orchestrator"><a class="header" href="#the-sm-orchestrator">The SM orchestrator</a></h3>
+<p><code>SmOrchestrator</code> (<code>nas/sm/orchestrator.rs</code>) owns per-PSI session state, PSI (1–15)
+and PTI allocation, and the T3580/T3581/T3582 timers. <code>SmSessionParams::from_config</code>
+turns the configured <code>sessions</code> into request parameters (defaulting to a single
+IPv4 <code>internet</code> session on the first configured slice). <code>start_establishment</code>
+builds a <code>PduSessionEstablishmentRequest</code> and wraps it in a <code>UlNasTransport</code>
+(<code>PayloadContainerType::N1SmInformation</code>) per TS 24.501 §5.4.5 (per code comments);
+the plain PDU is then protected by the <strong>MM</strong> security context in
+<code>process_sm_outputs</code> (<code>orch.protect_if_active(plain)</code>) before transmission —
+5GSM never carries its own security. The XR-DNN→5QI mapping (Rel-18) and the MINT
+subscription routing are applied here too.</p>
+<h3 id="driving-registration-from-the-ue-side"><a class="header" href="#driving-registration-from-the-ue-side">Driving registration from the UE side</a></h3>
+<p>The end-to-end trigger chain, all in <code>main.rs</code> unless noted:</p>
+<ol>
+<li>The <strong>RRC task</strong> selects a serving cell on the first <code>RrcMessage::SignalChanged</code>
+and sends <code>NasMessage::PerformMmCycle</code> to the NAS task
+(<code>run_rrc_task</code>, <code>registration_triggered</code> latch).</li>
+<li><code>PerformMmCycle</code> in a <code>Deregistered</code> UE calls
+<code>orch.start_registration(RegistrationType::InitialRegistration)</code>.</li>
+<li>The resulting <code>MmOutput::SendNasPdu</code> becomes <code>RrcMessage::UplinkNasDelivery</code>
+→ RRC → RLS → gNB.</li>
+<li>Downlink NAS (<code>NasMessage::NasDelivery</code>, EPD <code>0x7E</code>) is fed to
+<code>orch.handle_downlink</code>, which walks Authentication → Security Mode Command →
+Registration Accept.</li>
+<li>On <code>MmOutput::RegistrationSucceeded</code>, <code>process_mm_outputs</code> establishes the
+configured default PDU sessions via <code>sm_orch.establish_default_sessions</code>.</li>
+</ol>
+<p>The message-level detail of the network side of this exchange is in the
+<a href="../concepts/registration-flow.html">registration flow</a> concept chapter.</p>
+<h2 id="rrc--radio-link"><a class="header" href="#rrc--radio-link">RRC &amp; radio-link</a></h2>
+<p>The RRC module (<code>rrc/mod.rs</code>) re-exports a broad procedure surface —
+<code>cell_selection</code>, <code>handover</code>, <code>measurement</code>, <code>redcap</code>, <code>reestablishment</code>,
+<code>resume</code>, <code>security</code>, <code>state</code>, <code>uav</code>. The live state machine is
+<code>RrcStateMachine</code> (<code>rrc/state.rs</code>): <code>Idle</code> / <code>Connected</code> / <code>Inactive</code> driven by
+<code>RrcStateTransition</code>.</p>
+<p>The RRC task loop (<code>run_rrc_task</code> in <code>main.rs</code>) is deliberately thin:</p>
+<ul>
+<li><strong>Cell selection.</strong> It tracks <code>discovered_cells: HashMap&lt;cell_id, dbm&gt;</code> and, on
+the first <code>SignalChanged</code> while <code>Idle</code>, picks the strongest cell
+(<code>max_by_key</code> on dBm), sends <code>RlsMessage::AssignCurrentCell</code>, and triggers NAS
+registration.</li>
+<li><strong>Uplink NAS.</strong> <code>UplinkNasDelivery</code> is wrapped in a simplified <strong>UL Information
+Transfer</strong> frame (<code>[0x08, 0x00, …NAS]</code>) once connected, or sent as a <strong>raw NAS
+PDU</strong> for initial access (the gNB auto-creates the UE context) — see the byte
+prefixes in <code>run_rrc_task</code>.</li>
+<li><strong>Downlink RRC.</strong> A <strong>DL Information Transfer</strong> frame (leading <code>0x04</code>) is
+unwrapped and the inner NAS PDU is forwarded to the NAS task as
+<code>NasMessage::NasDelivery</code>.</li>
+</ul>
+<p><strong>AS security is behind a wire gate.</strong> <code>rrc/security.rs</code> defines
+<code>pub const I5_UE_AS_SECURITY: bool = false;</code> — <strong>default-off</strong>. When false, the
+DL-DCCH handling is byte-for-byte the legacy path so the matched-sim E2E is
+unchanged. When flipped on, the RRC task decodes the AS <code>SecurityModeCommand</code>
+(<code>nextgsim_rrc::procedures::security_mode::decode_security_mode_command</code>), derives
+the AS keys (<code>AsSecurityContext::derive_from_kgnb</code>, using the <code>KgNB</code> handed down
+from the NAS plane via <code>RrcMessage::AsSecurityKey</code>), and replies with
+<code>SecurityModeComplete</code>. The derivation is <strong>fail-closed</strong> (no KgNB/algorithm →
+not activated) and explicitly refuses NEA3 (unsupported keystream). <code>security.rs</code>
+also implements the ShortMAC-I (TS 38.331 §5.3.7.4) and resumeMAC-I (§5.3.13.3)
+computations over the UPER-encoded <code>VarShortMAC_Input</code> / <code>VarResumeMAC_Input</code>
+ASN.1 types from <code>nextgsim-rrc</code>, using the NIA algorithms from <code>nextgsim-crypto</code>.</p>
+<p>Below RRC, the <strong>RLS task</strong> (<code>rls/task.rs</code>, <code>RlsTask::from_ue_config</code>) is the
+simulated radio. It binds a UDP socket, runs <code>UeCellSearch</code> (heartbeats every
+~1000 ms to every address in <code>gnb_search_list</code>, <code>DEFAULT_RLS_PORT = 4997</code>), and
+carries RRC and user-plane PDUs to the serving gNB through <code>RlsTransport</code>. There
+is no real PHY/MAC: RLS <em>is</em> the wire between UE and gNB.</p>
+<h2 id="user-plane--tun"><a class="header" href="#user-plane--tun">User-plane / TUN</a></h2>
+<p>Once a PDU session is active, the UE terminates its user plane on a TUN device.
+The lifecycle and packet paths (<code>main.rs</code>, <code>tun/task.rs</code>, <code>rls/task.rs</code>):</p>
+<p><strong>Interface lifecycle.</strong> <code>SmOutput::SessionEstablished { psi, ipv4 }</code> in
+<code>process_sm_outputs</code> sends <code>TunMessage::CreateInterface</code>, and <code>SessionReleased</code>
+sends <code>TunMessage::DestroyInterface</code>. <code>TunTask</code> (<code>tun/task.rs</code>) creates a
+<code>TunInterface</code> (a <code>tun-rs</code> <code>AsyncDevice</code>) named from <code>TunTaskConfig::default()</code>
+(prefix <code>uesimtun</code>, MTU 1400), keyed by PSI.</p>
+<p><strong>Uplink (TUN → gNB):</strong></p>
+<ol>
+<li>A reader task on the TUN device emits <code>TunAppMessage::UplinkData { psi, data }</code>.</li>
+<li>The handler in <code>spawn_tasks</code> (<code>main.rs</code>) does two things: sends
+<code>NasMessage::InitiateServiceRequest</code> (so a CM-IDLE UE wakes and runs Service
+Request), and forwards the packet as <code>RlsMessage::DataPduDelivery { psi, pdu }</code>
+straight to the RLS task.</li>
+<li><code>RlsTask::handle_data_pdu_delivery</code> submits the SDU to the <strong>per-PSI RLC
+entity</strong> — created as <code>RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12)</code>
+(<code>rlc_entity_for</code>) — segments it with <code>build_pdu(1500)</code>, and sends each RLC PDU
+as an <code>RlsProtocolMessage::PduTransmission</code> over UDP to the serving gNB.</li>
+</ol>
+<p><strong>Downlink (gNB → TUN):</strong></p>
+<ol>
+<li><code>RlsTask</code> receives a <code>PduTransmission</code>; <code>RlsTransport::process_pdu_transmission</code>
+yields a <code>TransportEvent::DataReceived { psi, data }</code>.</li>
+<li>The RLC entity reassembles (<code>receive_pdu</code> + <code>poll_reassembled</code>), and each SDU
+is sent to the NAS task as <code>NasMessage::UplinkDataDelivery { psi, data }</code>.</li>
+<li>The NAS task forwards it to the TUN task as <code>TunMessage::WriteData { psi, data }</code>,
+which writes the IP packet to the device.</li>
+</ol>
+<p>Note the naming quirk: the <code>NasMessage::UplinkDataDelivery</code> variant actually
+carries <strong>downlink</strong> data toward the TUN — its handler comment in <code>run_nas_task</code>
+says so explicitly (“This is actually downlink data (from network to UE)”).</p>
+<p>On the matched-sim path the gNB is the GTP-U (N3) endpoint to the UPF; the UE’s
+GTP-U tunnel is what the E2E ping traverses. The full data-plane trace across UE,
+gNB, and UPF is in <a href="../concepts/pdu-session-userplane.html">PDU session &amp; user plane</a>.</p>
+<h2 id="6g--ai-prototypes-pointers"><a class="header" href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes (pointers)</a></h2>
+<p>These modules are <strong>non-normative research prototypes</strong>. The Rel-18 tasks
+(Ranging, MINT, Sidelink) are always compiled and spawned; the 6G/AI client tasks
+are both Cargo-feature-gated (<code>nextgsim-she</code>, <code>nextgsim-nwdaf</code>, <code>nextgsim-isac</code>,
+<code>nextgsim-fl</code>, <code>nextgsim-semantic</code>) <strong>and</strong> config-gated
+(<code>she_enabled</code>, <code>ai_ml_enabled</code>, <code>isac_enabled</code>, <code>federated_learning_enabled</code>,
+<code>semantic_comm_enabled</code>) in <code>spawn_tasks</code>. For what they model and their status,
+see <a href="../concepts/ai-6g-stack.html">The 6G / AI stack</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module (<code>nextgsim-ue/src/…</code>)</th><th>One-line honest pointer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ambient_iot/</code></td><td>Rel-18 Ambient IoT fleet management model (TS 22.369) — device-group coordination, no wire protocol.</td></tr>
+<tr><td><code>prose.rs</code></td><td>ProSe PC5 proximity-services model (TS 23.303/23.304) — discovery + UE-to-UE relay state, prototype.</td></tr>
+<tr><td><code>ranging/</code></td><td>Rel-18 UE-to-UE ranging / carrier-phase positioning (TS 23.586) — RTT/phase model + LMF report, prototype.</td></tr>
+<tr><td><code>sidelink/</code></td><td>NR sidelink relay, PC5 link, sidelink positioning — prototype state machines.</td></tr>
+<tr><td><code>uav.rs</code></td><td>Rel-17/18 UAV context (TS 23.256) — wraps the RRC UAV types with NAS authorization/C2/geofence modelling.</td></tr>
+<tr><td><code>mint/</code></td><td>Rel-18 MINT / multi-USIM (TS 23.761) — multi-SUPI secondary-subscription driver, integrated with the NAS task.</td></tr>
+<tr><td><code>semantic_codec/</code></td><td>6G semantic-communication encode/decode task — research prototype.</td></tr>
+<tr><td><code>she_client/</code></td><td>6G Service-Hosting-Environment edge-inference/offload client — research prototype.</td></tr>
+<tr><td><code>isac_sensor/</code></td><td>6G Integrated Sensing &amp; Communication sensor task — research prototype.</td></tr>
+<tr><td><code>fl_participant/</code></td><td>6G Federated-Learning local-training participant — research prototype.</td></tr>
+<tr><td><code>nwdaf_reporter/</code></td><td>6G NWDAF measurement reporter / analytics client — research prototype.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="simplifications--known-gaps"><a class="header" href="#simplifications--known-gaps">Simplifications &amp; known gaps</a></h2>
+<p>Grounded in the code, these are the honest deviations from a textbook UE:</p>
+<ul>
+<li><strong>RLS is the radio; there is no PHY/MAC.</strong> UE↔gNB is UDP RLS
+(<code>rls/task.rs</code>); the only Layer-2 processing on the user plane is RLC in
+<strong>UM with SN12</strong> (<code>rlc_entity_for</code>) — no AM, no HARQ, no scheduler.</li>
+<li><strong>AS security is default-off.</strong> <code>I5_UE_AS_SECURITY = false</code>
+(<code>rrc/security.rs</code>): on the matched-sim path SRBs are <strong>not</strong> integrity-protected
+or ciphered at the AS layer. NAS-layer security (Knas_int/Knas_enc) <em>is</em> real
+and active. Flipping the gate on requires the docker A/B sign-off noted in the
+source (it mirrors the gNB’s <code>C5_TYPED_DCCH_DISPATCH</code> gate).</li>
+<li><strong>5G-AKA and EAP-AKA′ on the live path; TUAK unwired.</strong> The live orchestrator
+handles both <strong>5G-AKA</strong> and <strong>EAP-AKA′</strong>, which are both Milenage-based
+(<code>handle_eap_aka_prime_challenge</code> calls
+<code>nextgsim_crypto::eap_aka_prime::run_eap_aka_prime</code>). <strong>TUAK</strong> also exists in
+<code>nextgsim-crypto</code> (byte-exact vs TS 35.232 in its own tests) but is not wired
+into the UE orchestrator.</li>
+<li><strong>RRC framing is simplified.</strong> Uplink/downlink NAS is carried with fixed
+one/two/three-byte UL/DL Information Transfer prefixes (<code>0x08</code> / <code>0x04</code>) and a
+raw-NAS fallback for initial access, not full ASN.1 RRC containers
+(<code>run_rrc_task</code>).</li>
+<li><strong>UAV tracking uses a sim-private message type.</strong> The UE emits a UAV tracking
+report on 5GMM message type <code>0x6A</code> (<code>UAV_TRACKING_REPORT_MSG_TYPE</code>,
+<code>nas/mm/orchestrator.rs</code>); the source comment is explicit that <strong>no such
+UE-originated UAV NAS message exists in 3GPP</strong> — it is a self-contained geofence
+demo, kept in sync with the matched core.</li>
+<li><strong>6G RRC messages are logged and dropped in the binary.</strong> The <code>Sixg*</code> arms of
+<code>RrcMessage</code> in <code>run_nas_task</code>/<code>run_rrc_task</code> are handled only by the library’s
+<code>RrcTask</code>; in the <code>nr-ue</code> binary loop they are debug-logged and discarded.</li>
+<li><strong>Cooperative peer.</strong> Everything above is exercised against the matched
+nextgsim gNB and NextGCore core, not an arbitrary commercial network.</li>
+</ul>
+<h2 id="where-to-look-next"><a class="header" href="#where-to-look-next">Where to look next</a></h2>
+<ul>
+<li><a href="../configuration.html#ue-configuration">UE Configuration</a> — every field that
+seeds <code>UeConfig</code> (SUPI, keys, <code>protection_scheme</code>, <code>sessions</code>, <code>gnb_search_list</code>,
+<code>tun_name</code>, and the Rel-17/18 feature blocks).</li>
+<li><a href="../cli-reference.html">nr-cli Reference</a> — the <code>info</code>/<code>status</code>/<code>ps-establish</code>/
+<code>deregister</code> commands that drive the App and NAS tasks at runtime.</li>
+<li><a href="../concepts/registration-flow.html">UE Registration Call Flow</a> — the message-by-message
+registration exchange this UE participates in.</li>
+<li><a href="../concepts/pdu-session-userplane.html">PDU Session &amp; User Plane</a> — the end-to-end
+data-plane trace (TUN ↔ RLS ↔ gNB ↔ GTP-U ↔ UPF).</li>
+<li><a href="../concepts/ai-6g-stack.html">The 6G / AI Stack</a> — the prototype tasks summarised
+above.</li>
+<li><a href="gnb.html">gNB Architecture</a> — the peer that terminates RLS and owns GTP-U/N3.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/gnb.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../concepts/registration-flow.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/gnb.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../concepts/registration-flow.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

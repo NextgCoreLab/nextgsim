@@ -1,0 +1,599 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>The AI &amp; 6G Simulation Stack - NextGSim Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-2c146fd7.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-09918d46.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGSim Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgsim" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="the-ai-and-6g-simulation-stack"><a class="header" href="#the-ai-and-6g-simulation-stack">The AI and 6G Simulation Stack</a></h1>
+<p>nextgsim ships eight “AI-native 6G” crates — <code>nextgsim-ai</code>, <code>nextgsim-fl</code>,
+<code>nextgsim-isac</code>, <code>nextgsim-semantic</code>, <code>nextgsim-she</code>, <code>nextgsim-nwdaf</code>,
+<code>nextgsim-nkef</code>, <code>nextgsim-agent</code> — plus a set of UE- and gNB-side Rel-17/18
+prototype modules (ambient IoT, ProSe/sidelink, UAV, ranging, MINT, energy
+saving, MBS, NTN). This chapter is a deep dive into what those crates and modules
+<em>actually do when the code runs</em>, as opposed to what the acronyms suggest. It is
+the honesty-critical chapter of this book: the landing page and feature matrix
+already carry per-row honesty badges, and everything here is at least as blunt.</p>
+<p>The short version, which the rest of the chapter substantiates against source:
+<strong>“AI-native 6G” in nextgsim means a set of research-prototype network functions
+that are compiled into the binaries but are switched OFF by default and are not
+exercised by the validated end-to-end (E2E) path.</strong> The one genuinely
+operational piece of ML infrastructure is an ONNX Runtime inference wrapper
+(<code>nextgsim-ai</code>), and <strong>no <code>.onnx</code> model ships with the repository</strong>, so even when
+a 6G task is enabled it typically runs a non-neural fallback (mean-pooling,
+linear extrapolation, TF-IDF, a kNN surrogate).</p>
+<blockquote>
+<p><strong>Honesty note:</strong> These AI/6G modules are validated only by <strong>per-crate unit
+tests</strong> plus a <strong>channel-level integration test</strong>
+(<code>tests/src/sixg_task_integration.rs</code>); they are <strong>not</strong> third-party certified
+and <strong>not</strong> conformance-tested. The project’s headline validation — the matched
+simulator driving its own gNB/UE against the NextGCore 5G core over N2
+(NGAP/SCTP) and N3 (GTP-U), with the <strong>UE→UPF GTP-U data plane verified</strong>
+(84/84 docker E2E green as of 2026-07-02) — runs with <strong>every 6G/AI feature
+flag off</strong> (see <code>config/gnb.yaml</code>, <code>config/ue.yaml</code>,
+<code>docker/exit-gate/gnb.yaml</code>), so none of the crates below participate in that
+result. All 6G features are <strong>non-normative research prototypes</strong>: there is no
+frozen 3GPP Rel-20 / 6G Stage-3 wire specification to conform to. 3GPP TS/TR
+numbers appear below only where they are cited in this repo’s own source
+comments, phrased “per code comments”.</p>
+</blockquote>
+<h2 id="how-these-crates-are-wired-into-the-binaries"><a class="header" href="#how-these-crates-are-wired-into-the-binaries">How these crates are wired into the binaries</a></h2>
+<p>Understanding the honesty story requires understanding three independent gates,
+all of which default to “off”:</p>
+<ol>
+<li>
+<p><strong>Compile gate (UE only).</strong> In <code>nextgsim-ue/Cargo.toml</code> (lines 27-33) <strong>seven</strong>
+client crates (<code>nextgsim-she</code>, <code>-nwdaf</code>, <code>-nkef</code>, <code>-isac</code>, <code>-agent</code>, <code>-fl</code>,
+<code>-semantic</code>) are declared <code>optional = true</code>. There is <strong>no <code>[features]</code> section
+and no <code>default</code> feature</strong> enabling them, so a normal <code>cargo build</code>/<code>nr-ue</code>
+binary does not contain them at all — every UE-side 6G task type is behind
+<code>#[cfg(feature = "nextgsim-…")]</code> in <code>nextgsim-ue/src/tasks.rs</code>. Only <strong>five</strong> of
+the seven (<code>-she</code>, <code>-nwdaf</code>, <code>-isac</code>, <code>-fl</code>, <code>-semantic</code>) actually gate UE task
+types (<code>tasks.rs</code> lines 117-159 etc.); <code>-nkef</code> and <code>-agent</code> are declared
+optional but are not consumed by any UE task type. On the gNB
+side (<code>nextgsim-gnb/Cargo.toml</code>) the six crates are non-optional, so they are
+always compiled in, but that only affects binary size, not behaviour.</p>
+</li>
+<li>
+<p><strong>Spawn gate (config flag).</strong> Even when compiled, a 6G task loop is only
+<code>tokio::spawn</code>-ed if its config flag is set. On the gNB,
+<code>nextgsim-gnb/src/main.rs</code> computes <code>any_6g</code> from <code>she_enabled</code>,
+<code>nwdaf_enabled</code>, <code>nkef_enabled</code>, <code>isac_enabled</code>, <code>agent_enabled</code>,
+<code>federated_learning_enabled</code> and only then calls <code>init_6g_tasks</code>; each task is
+further guarded by its own flag. On the UE, <code>nextgsim-ue/src/main.rs</code>
+(<code>spawn_tasks</code>) does the same with <code>cfg!(feature = …) &amp;&amp; *_enabled</code>. Every one
+of these flags defaults to <code>false</code> in <code>nextgsim-common/src/config.rs</code>
+(gNB: lines ~223-229; UE <code>UeConfig</code>: lines ~1168-1172) and is written <code>false</code>
+in the shipped YAML.</p>
+</li>
+<li>
+<p><strong>Drive gate (a message actually arrives).</strong> A spawned task is an idle
+actor until something sends it a message. There are only <strong>four live
+send-sites</strong> across the gNB into these tasks (verified by grep): the RRC task
+routes UE-originated 6G RRC messages to SHE/ISAC/NKEF
+(<code>nextgsim-gnb/src/rrc/task.rs</code>, <code>route_6g_ai_ml</code> / <code>route_6g_isac</code> /
+<code>route_6g_semantic</code>), and the ISAC task forwards a fused position to NWDAF
+(<code>nextgsim-gnb/src/isac/task.rs</code>). Those RRC messages only exist if a UE with
+the (off-by-default) 6G features emits them.</p>
+</li>
+</ol>
+<pre><code>              compile gate            spawn gate              drive gate
+ UE 6G crate  cargo feature   →   config *_enabled   →   a 6G RRC msg arrives
+ (optional,       OFF             (false in YAML)          (none on E2E path)
+  no default)                                                     │
+                                                                  ▼
+                                                        task actor does work
+</code></pre>
+<p>Net effect: the AI/6G stack is <strong>opt-in plumbing</strong>. It is well-structured,
+unit-tested Rust, but on the standard registration + PDU-session + GTP-U ping
+path it is dormant.</p>
+<h2 id="what-is-real-vs-prototype"><a class="header" href="#what-is-real-vs-prototype">What is real vs prototype</a></h2>
+<p>Depth is graded <strong>full</strong> (operational, does real work), <strong>partial</strong> (real
+structure with a documented simplification on the operational path), or
+<strong>illustrative stub</strong> (exists to demonstrate a shape/flow; the “smart” part is a
+placeholder). “Drives a live path?” is answered for a <em>default</em> build/run.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>Crate / module</th><th>Depth</th><th>Drives a live path?</th><th>Validation</th></tr>
+</thead>
+<tbody>
+<tr><td>ONNX inference engine</td><td><code>nextgsim-ai</code> (<code>inference.rs</code> <code>OnnxEngine</code>)</td><td>full (as a wrapper)</td><td>Only if a task is enabled <em>and</em> a model is loaded; <strong>no model ships</strong></td><td>unit tests</td></tr>
+<tr><td>AI/ML NR air-interface models</td><td><code>nextgsim-ai/src/nr_models.rs</code></td><td>illustrative stub (lifecycle mgmt only)</td><td>No — library types, not wired to PHY</td><td>unit tests</td></tr>
+<tr><td>Federated learning</td><td><code>nextgsim-fl</code> + gNB <code>fl/task.rs</code>, UE <code>fl_participant/</code></td><td>partial (FedAvg/FedProx/Byzantine/DP real)</td><td>No — off by default</td><td>unit tests + integration test</td></tr>
+<tr><td>— “SecAgg” secure aggregation</td><td><code>nextgsim-fl</code> <code>AggregationAlgorithm::MaskedSumDemo</code></td><td><strong>illustrative stub</strong> (masking demo, NOT Bonawitz)</td><td>No</td><td>unit tests</td></tr>
+<tr><td>Semantic codec</td><td><code>nextgsim-semantic</code> + UE <code>semantic_codec/</code></td><td>illustrative stub (mean-pool / nearest-neighbour)</td><td>No — UE crate optional+off</td><td>unit tests (incl. honesty guard)</td></tr>
+<tr><td>ISAC (sensing)</td><td><code>nextgsim-isac</code> + gNB <code>isac/task.rs</code>, UE <code>isac_sensor/</code></td><td>partial (fusion core) / stub (ML, SaaS)</td><td>No — off by default</td><td>unit tests + integration test</td></tr>
+<tr><td>NWDAF analytics</td><td><code>nextgsim-nwdaf</code> + gNB <code>nwdaf/task.rs</code>, UE <code>nwdaf_reporter/</code></td><td>partial (linear extrapolation)</td><td>No — off by default</td><td>unit tests + integration test</td></tr>
+<tr><td>NKEF knowledge exposure</td><td><code>nextgsim-nkef</code> + gNB <code>nkef/task.rs</code></td><td>partial (TF-IDF) / stub (neural embed, LLM)</td><td>No — off by default</td><td>unit tests</td></tr>
+<tr><td>AI agent framework</td><td><code>nextgsim-agent</code> + gNB <code>agent/task.rs</code></td><td>partial (real intent executors, no LLM/RL)</td><td>No — off by default</td><td>unit tests + integration test</td></tr>
+<tr><td>Service Hosting Env (SHE)</td><td><code>nextgsim-she</code> + gNB <code>she/task.rs</code>, UE <code>she_client/</code></td><td>partial (placement scheduler, no orchestration)</td><td>No — off by default</td><td>unit tests</td></tr>
+<tr><td>UE ambient IoT</td><td><code>nextgsim-ue/src/ambient_iot/</code></td><td>illustrative stub (fleet + energy model)</td><td>No — sim-internal</td><td>unit tests</td></tr>
+<tr><td>UE ProSe / sidelink</td><td><code>nextgsim-ue/src/prose.rs</code>, <code>src/sidelink/</code></td><td>prototype (bespoke, not wire-conformant)</td><td>Task spawned but idle by default</td><td>unit tests</td></tr>
+<tr><td>UE ranging / MINT / UAV</td><td><code>nextgsim-ue/src/{ranging,mint,uav}.rs</code></td><td>prototype (bespoke encodings)</td><td>Task spawned but idle by default</td><td>unit tests</td></tr>
+<tr><td>gNB energy saving</td><td><code>nextgsim-gnb/src/energy/</code></td><td>prototype (cell sleep model)</td><td>No — <code>energy_saving_enabled=false</code></td><td>unit tests</td></tr>
+<tr><td>gNB MBS (NGAP)</td><td><code>nextgsim-gnb/src/mbs_ngap.rs</code></td><td>prototype (Rel-17 MBS)</td><td>No — <code>mbs_enabled=false</code></td><td>unit tests</td></tr>
+<tr><td>NTN (gNB/RRC)</td><td><code>nextgsim-gnb/src/rrc/ntn_gnb.rs</code></td><td>prototype, <strong>inert</strong></td><td>No — parsed but unwired</td><td>unit tests</td></tr>
+</tbody>
+</table>
+</div>
+<p>A note on scope: several Rel-17/18 features that <em>look</em> adjacent — <strong>RedCap,
+SNPN, MINT, UAV, XR</strong> — are a <strong>different maturity tier</strong>. Those carry real NAS
+IEs and are integrated end-to-end with NextGCore (documented in
+<a href="../configuration.html#rel-1718-feature-configuration-ue">Configuration</a>); they are
+not part of the “AI-native 6G” research stack this chapter covers. The <code>mint</code>,
+<code>uav</code>, and <code>sidelink</code> <em>UE modules</em> below are the sim-internal driver/context code
+behind some of those features.</p>
+<h2 id="component-deep-dives"><a class="header" href="#component-deep-dives">Component deep-dives</a></h2>
+<h3 id="nextgsim-ai--the-only-operational-ml-backend"><a class="header" href="#nextgsim-ai--the-only-operational-ml-backend">nextgsim-ai — the only operational ML backend</a></h3>
+<p><code>nextgsim-ai</code> is the shared inference substrate. Its crate doc
+(<code>nextgsim-ai/src/lib.rs</code>) states plainly that <strong><code>OnnxEngine</code> (ONNX Runtime) is
+the “only operational inference backend”</strong>. <code>inference.rs</code> binds the real <code>ort</code>
+crate (<code>ort::session::Session</code>, <code>session.run(ort::inputs![…])</code>) with selectable
+execution providers (CPU/CUDA/CoreML/DirectML/TensorRT) via <code>config.rs</code>
+<code>ExecutionProvider</code>. <code>tensor.rs</code> (<code>TensorData</code>) and <code>metrics.rs</code> round it out.</p>
+<p>The load-bearing caveat is repeated in the same doc comment: <strong>no <code>.onnx</code> model
+ships with the repository</strong>. So the engine works, but every downstream crate that
+“would use a model in production” falls back to a non-neural path when none is
+loaded. <code>nr_models.rs</code> (cited “per code comments” to TS 38.843 AI/ML for the NR
+air interface — CSI prediction, beam management, ML positioning) is a
+model-lifecycle bookkeeping module (<code>NrModelDomain</code>), not something wired to a
+physical layer; nextgsim has no PHY, so these are types without a live consumer.</p>
+<p>Depth: <strong>full</strong> as an inference wrapper; the surrounding “AI air interface” is
+lifecycle scaffolding.</p>
+<h3 id="nextgsim-fl--federated-learning-and-the-secagg-that-isnt"><a class="header" href="#nextgsim-fl--federated-learning-and-the-secagg-that-isnt">nextgsim-fl — federated learning, and the “SecAgg” that isn’t</a></h3>
+<p>This is the most built-out AI crate (<code>nextgsim-fl/src/lib.rs</code> is ~3.3k lines).
+The genuinely real parts:</p>
+<ul>
+<li><strong>FedAvg</strong> (<code>FederatedAggregator::fedavg_aggregate</code>) — sample-weighted average.</li>
+<li><strong>FedProx</strong> (<code>fedprox_aggregate</code>) — FedAvg plus a proximal correction toward
+the global model.</li>
+<li><strong>Byzantine-robust rules</strong> — <code>krum_aggregate</code>, <code>multi_krum_aggregate</code>,
+<code>trimmed_mean_aggregate</code>, <code>median_aggregate</code>.</li>
+<li><strong>Differential privacy</strong> — real Gaussian mechanism via Box-Muller
+(<code>sample_gaussian</code>), L2 clip-then-noise (<code>apply_dp_with_rng</code>), and an
+authoritative <strong>Rényi-DP moments accountant</strong> (<code>privacy_tracker_renyi</code>) that
+actually <strong>enforces</strong> the ε budget (<code>start_round</code> refuses to run once
+<code>would_exceed_after_next_round</code>).</li>
+<li><strong>Async FL</strong> with staleness weighting (<code>AsyncFederatedAggregator</code>), gradient
+compression (<code>topk_compress</code>), and hierarchical tiers (<code>FLTier</code>).</li>
+</ul>
+<p>The honesty flashpoint is <strong>secure aggregation</strong>. The enum variant is named
+<code>AggregationAlgorithm::MaskedSumDemo</code>, and both its doc comment and a dedicated
+module banner spell out that it is <strong>NOT the Bonawitz et al. 2017 protocol and
+provides zero privacy against the aggregator</strong>. Why: <code>register_participant</code> mints
+each participant’s x25519 keypair <em>on the server</em>, and <code>secagg_aggregate_internal</code>
+applies the pairwise masks server-side over plaintext gradients the server
+already received. The masks themselves are derived by <code>demo_mask_from_secret</code>
+using <strong><code>splitmix64</code>, a non-cryptographic PRG</strong> — the comment says so — so even
+the mask has no cryptographic strength. It exists only to demonstrate that
+antisymmetric pairwise masks cancel in the sum. In other words, an earlier audit’s
+“SecAgg falls through to FedAvg” is now stale: there <em>is</em> real pairwise-masking
+code, but it is deliberately labelled a demo, not secure aggregation.</p>
+<p>Standards positioning is in the crate doc: aligned “per code comments” with the
+FL concepts of TR 23.700-80 and the AI/ML training-management model of TS 28.105
+§6.2b.2.15, whose NOTE 2 places FL algorithms / DP / secure-aggregation <em>outside</em>
+the scope of standardization. The <code>mns_adapter</code> module is explicitly “illustrative
+only — NOT a conformant YANG/JSON MnS schema”.</p>
+<p>On a live run the gNB <code>FlAggregatorTask</code> (<code>nextgsim-gnb/src/fl/task.rs</code>) and UE
+<code>FlParticipantTask</code> are both <strong>off by default</strong>; the training round is exercised
+by <code>test_fl_task_full_training_round_via_channel</code> in the integration test.</p>
+<p>Depth: <strong>partial-to-full</strong> research engine; the “SecAgg” is an <strong>illustrative
+stub</strong> by design.</p>
+<h3 id="nextgsim-semantic--mean-pooling-wearing-a-neural-codec-label"><a class="header" href="#nextgsim-semantic--mean-pooling-wearing-a-neural-codec-label">nextgsim-semantic — mean-pooling wearing a neural-codec label</a></h3>
+<p>The operational path is stated in the first line of
+<code>nextgsim-semantic/src/codec.rs</code>: “operational path is mean-pooling encoder +
+nearest-neighbor decoder.” <code>NeuralEncoder::encode</code> calls the ONNX model <em>only</em> if
+<code>load_model</code> was called; otherwise it runs <code>encode_fallback</code> (stride-based
+<strong>mean-pooling</strong> with variance-derived importance weights) and emits a one-time
+<code>warn!</code> via <code>warn_fallback_once</code> (“semantic codec output is degraded (not
+neural)”). <code>NeuralDecoder::decode_fallback</code> is <strong>nearest-neighbour upsampling</strong>
+(repeat each value <code>stride</code> times). Because no model ships, this is always the
+path. There is even a self-guarding unit test
+(<code>honesty_mean_pooling_fallback_label_present</code>) that fails if the “mean-pooling
+fallback” label is ever removed from the source.</p>
+<p>The crate doc (<code>nextgsim-semantic/src/lib.rs</code>) is careful about provenance:
+“per code comments”, TR 22.870 <strong>does not define a dedicated semantic-communication
+use case</strong>; the crate prototypes at concept level the AI-service use-case family
+it most naturally maps to (TR 22.870 §6.24 distributed AI computing, §6.25 AI/ML
+training/inference), and TR 22.870 is a Stage-1 study with no Stage-3 wire spec.
+Modules like <code>jscc.rs</code>, <code>rate_distortion.rs</code>, <code>knowledge.rs</code>, and <code>goal.rs</code> are
+concept prototypes in the same spirit.</p>
+<p>The UE <code>SemanticCodecTask</code> (<code>nextgsim-ue/src/semantic_codec/</code>) is behind the
+optional <code>nextgsim-semantic</code> feature <em>and</em> <code>semantic_comm_enabled</code>, both off.
+Note a routing subtlety: when a UE does emit a “semantic” RRC message, the gNB has
+no semantic crate; <code>route_6g_semantic</code> records <strong>metadata only</strong> (source and
+<code>data_len</code>) into NKEF’s knowledge graph — it does not decode a payload.</p>
+<p>Depth: <strong>illustrative stub</strong>.</p>
+<h3 id="nextgsim-isac--a-research-fusion-core-with-stubbed-ml"><a class="header" href="#nextgsim-isac--a-research-fusion-core-with-stubbed-ml">nextgsim-isac — a research fusion core with stubbed ML</a></h3>
+<p><code>nextgsim-isac/src/lib.rs</code> opens with an unusually candid scope note: it models
+ISAC concepts from TR 22.837, “a Stage-1 feasibility study — no normative
+procedures/encodings exist; the TR foreword states it ‘shall not be
+implemented’”, and is therefore “a research prototype, NOT a conformance
+implementation.” It then separates real from stub:</p>
+<ul>
+<li><strong>Research-faithful:</strong> the fusion/positioning/tracking core — trilateration,
+an EKF, Bayesian fusion, and an OFDM-radar signal model (<code>mapping.rs</code>,
+<code>waveform.rs</code>, <code>saas.rs</code>).</li>
+<li><strong>Illustrative stubs:</strong> the Sensing-as-a-Service exposure API, the SHE workload
+integration, and — importantly — the <strong>ML positioning</strong>. In
+<code>ml_sensing.rs</code>, the <code>MlModelType</code> neural variants (<code>DeepPositioning</code>,
+<code>TrajectoryLstm</code>, <code>TransformerTracking</code>, <code>FingerprintCnn</code>) are labelled
+placeholders: “Inference today is always a <strong>kNN surrogate</strong> over the training
+cache regardless of the selected variant”, and <code>MlPositioningResult::actual_algorithm</code>
+reports what really ran.</li>
+<li><strong>Out of scope:</strong> authorization/consent is a default-allow research stub
+(<code>saas::SensingPolicy</code>); charging and on-the-wire sensing security are not
+modelled.</li>
+</ul>
+<p>Live wiring exists but is dormant by default: the gNB <code>IsacTask</code>
+(<code>nextgsim-gnb/src/isac/task.rs</code>) receives <code>SensingData</code>, and on producing a fused
+position forwards it to NWDAF as <code>NwdafMessage::UeMeasurement</code> — this is the
+one AI→AI cross-task edge in the codebase. The UE <code>IsacSensorTask</code> feeds it, both
+gated off. Exercised by <code>test_isac_task_sensing_data_recorded_via_channel</code>.</p>
+<p>Depth: <strong>partial</strong> (fusion) / <strong>illustrative stub</strong> (ML, SaaS).</p>
+<h3 id="nextgsim-nwdaf--analytics-with-linear-extrapolation-not-ml"><a class="header" href="#nextgsim-nwdaf--analytics-with-linear-extrapolation-not-ml">nextgsim-nwdaf — analytics with linear extrapolation, not ML</a></h3>
+<p><code>nextgsim-nwdaf</code> presents a four-layer analytics structure per TS 23.288 “per
+code comments” (data collection → real-time z-score anomaly → predictive →
+prescriptive → closed-loop), with MTLF/AnLF split (<code>mtlf.rs</code>, <code>anlf.rs</code>),
+analytics IDs (<code>analytics_id.rs</code>), event exposure, DCCF, and federation modules.
+That is a lot more surface than the acronym-existence level.</p>
+<p>The operational reality is in <code>predictor.rs</code>: the header says the simulator ships
+no ONNX model, so <code>OnnxPredictor</code> runs <code>predict_linear</code> — “it fits a line through
+the recent position/time samples and projects forward.” It wraps the
+<code>nextgsim-ai</code> engine and <em>will</em> use a learned model if one is loaded, but since
+none is shipped, <strong>constant-velocity linear extrapolation is what executes</strong>, and
+<code>PredictionMethod::LinearExtrapolation</code> is reported accordingly.</p>
+<p>The gNB <code>NwdafTask</code> (<code>nextgsim-gnb/src/nwdaf/task.rs</code>) can emit a handover
+recommendation back to RRC (<code>NwdafHandoverRecommendation</code>); the UE
+<code>NwdafReporterTask</code> reports measurements. Both off by default; exercised by
+<code>test_nwdaf_to_rrc_handover_recommendation_arrives</code> and
+<code>test_nwdaf_task_predict_trajectory_via_channel</code>.</p>
+<p>Depth: <strong>partial</strong> — real service structure, non-ML predictor.</p>
+<h3 id="nextgsim-nkef--tf-idf-and-a-hash-mock-not-an-llm"><a class="header" href="#nextgsim-nkef--tf-idf-and-a-hash-mock-not-an-llm">nextgsim-nkef — TF-IDF and a hash-mock, not an LLM</a></h3>
+<p><code>nextgsim-nkef</code> is the “network knowledge exposure” prototype: a knowledge graph
+(<code>storage.rs</code>, <code>ontology.rs</code>), keyword/vector query (<code>query.rs</code>, <code>vector.rs</code>),
+RAG context assembly (<code>rag.rs</code>), and access control (<code>access.rs</code>). Its embeddings
+are honest about themselves in <code>embedder.rs</code>: the <strong>operational</strong> embedder is
+<code>TextEmbedder</code>, computing <strong>TF-IDF</strong> vectors (no external model); the
+<code>OnnxEmbedder</code>, with no model loaded (the default), falls back to
+<code>mock_neural_embedding</code> — “a deterministic hash-based multi-scale mock, NOT a
+neural network.” It can load a sentence-transformer via <code>nextgsim-ai</code> if provided,
+but none ships. There is <strong>no LLM connection</strong> anywhere.</p>
+<p>The gNB <code>NkefTask</code> (<code>nextgsim-gnb/src/nkef/task.rs</code>) is off by default and is the
+sink for the gNB’s “semantic” RRC routing (metadata only, as noted above).</p>
+<p>Depth: <strong>partial</strong> (TF-IDF) / <strong>illustrative stub</strong> (neural embedding, LLM/RAG).</p>
+<h3 id="nextgsim-agent--real-intent-executors-no-llmrl"><a class="header" href="#nextgsim-agent--real-intent-executors-no-llmrl">nextgsim-agent — real intent executors, no LLM/RL</a></h3>
+<p>Here an earlier audit finding is genuinely out of date. The gap analysis said
+“all intents return success without actual execution (placeholder)”. The current
+<code>nextgsim-agent/src/execution.rs</code> header states it “perform[s] <strong>real computation
+for each intent type instead of returning placeholder successes</strong>”, via an
+<code>IntentExecutor</code> trait returning a rich <code>IntentExecutionResult</code>
+(<code>IntentStatus::{Success, PartialSuccess, Failed, Blocked}</code>, <code>affected_resources</code>,
+timing). The crate also has <code>conflict.rs</code> (multi-agent conflict resolution),
+<code>safety.rs</code> (guardrails), <code>audit.rs</code> (audit trail), <code>learning.rs</code>,
+<code>coordination.rs</code>, and <code>nwdaf_bridge.rs</code> / <code>nkef_bridge.rs</code>. Authentication is
+OAuth 2.0-style tokens (<code>lib.rs</code>). What is still <strong>not</strong> there: any LLM-based
+intent understanding, reinforcement learning, or an A2A/MCP protocol.</p>
+<p>The gNB <code>AgentTask</code> (<code>nextgsim-gnb/src/agent/task.rs</code>) is off by default;
+exercised by <code>test_agent_register_then_submit_intent</code>.</p>
+<p>Depth: <strong>partial</strong> — real deterministic executors, no learning/LLM layer.</p>
+<h3 id="nextgsim-she--a-placement-scheduler-not-an-orchestrator"><a class="header" href="#nextgsim-she--a-placement-scheduler-not-an-orchestrator">nextgsim-she — a placement scheduler, not an orchestrator</a></h3>
+<p><code>nextgsim-she/src/lib.rs</code> calls itself “a <strong>research model</strong> for distributed
+AI/ML compute placement, inspired by the tiered-edge concepts of TS 23.558
+(EDGEAPP); it does <strong>not</strong> implement TS 23.558.” It provides a three-tier
+(LocalEdge &lt;10 ms / RegionalEdge &lt;20 ms / CoreCloud) placement <code>scheduler.rs</code>
+with policies (ClosestToEdge / MostAvailable / LowestUtilization / PreferredFirst /
+EnergyAware), resource capacity
+tracking (<code>resource.rs</code>), workload lifecycle (<code>workload.rs</code>), plus <code>autoscale.rs</code>,
+<code>sla.rs</code>, and <code>security.rs</code>. Tier latencies are configured constants, not
+measured; there is no real container/VM orchestration. The gNB <code>SheTask</code> can load
+ONNX models per tier through <code>nextgsim-ai</code> (subject to the no-model-ships caveat).</p>
+<p>Depth: <strong>partial</strong> — real scheduling logic, simulated infrastructure.</p>
+<h3 id="ue--and-gnb-side-prototype-modules"><a class="header" href="#ue--and-gnb-side-prototype-modules">UE- and gNB-side prototype modules</a></h3>
+<p>These live in the binaries rather than the AI crates, and are sim-internal Rust
+logic with <strong>bespoke encodings that are not wire-conformant</strong> (consistent with
+<a href="../gaps/gap-protocols.html">gap-protocols</a> and
+<a href="../gaps/6g-gap-analysis.html">6g-gap-analysis</a>):</p>
+<ul>
+<li><strong>UE ambient IoT</strong> (<code>nextgsim-ue/src/ambient_iot/fleet.rs</code>, “Rel-18, TS 22.369”
+per code comments): energy-harvesting device model + <code>FleetManager</code>. No air
+interface; sim-internal.</li>
+<li><strong>UE ProSe / sidelink</strong> (<code>prose.rs</code>, <code>sidelink/pc5.rs</code>, <code>sidelink/positioning.rs</code>,
+“TS 23.303/23.304/23.586” per code comments): PC5 link management, direct
+discovery, L2/L3 relay, and SL-PRS/RTT/AoA positioning via multilateration.</li>
+<li><strong>UE ranging</strong> (<code>ranging/task.rs</code>, “TS 23.586”): RTT + multi-frequency carrier
+phase with ambiguity resolution.</li>
+<li><strong>UE MINT</strong> (<code>mint/task.rs</code>, “TS 23.761”): multi-IMSI/USIM context management.</li>
+<li><strong>UE UAV</strong> (<code>uav.rs</code>, wrapping <code>rrc/uav.rs</code>, “TS 23.256”): UAV authorization,
+C2 link quality thresholds, geofence, Remote-ID.</li>
+<li><strong>gNB energy saving</strong> (<code>energy/task.rs</code>, Rel-18): cell sleep/dormant modes and
+efficiency metrics — spawned only if <code>energy_saving_enabled</code>.</li>
+<li><strong>gNB MBS</strong> (<code>mbs_ngap.rs</code>, “Rel-17, TS 38.413 §8.21”): MBS session
+start/stop NGAP signalling — behind <code>mbs_enabled</code>.</li>
+<li><strong>NTN</strong> (<code>rrc/ntn_gnb.rs</code>): satellite timing-advance / HARQ / beam models that
+are <strong>parsed but inert</strong> — the gNB stores the <code>ntn_config</code> block and logs it but
+does not wire it into live RRC/NGAP signalling (see the NTN row in
+<a href="../configuration.html#ntn-research-prototype">Configuration</a>).</li>
+</ul>
+<p>The Rel-18 UE tasks (Ranging, MINT, Sidelink) are unusual: they are <strong>always
+compiled and always spawned</strong> (<code>nextgsim-ue/src/main.rs</code>, <code>spawn_tasks</code>), unlike
+the feature-gated AI tasks. But an always-spawned actor is still just an idle
+message loop until a CLI command or config drives it, so on the standard E2E run
+they sit waiting.</p>
+<h2 id="how-to-read-the-ai-native-claims"><a class="header" href="#how-to-read-the-ai-native-claims">How to read the AI-native claims</a></h2>
+<p>When you see “AI-native 6G” in nextgsim’s docs, banners, or crate names, translate
+it as follows, all verifiable against the files above:</p>
+<ul>
+<li><strong>“Supported” means “a crate/task exists and compiles”</strong>, not “runs on the
+default path.” Every AI/6G flag is <code>false</code> in the shipped YAML, and the UE
+crates are absent from a default build entirely.</li>
+<li><strong>“AI/ML” usually means a non-neural fallback.</strong> No <code>.onnx</code> model ships, so
+semantic → mean-pooling, NWDAF → linear extrapolation, NKEF → TF-IDF/hash-mock,
+ISAC ML → kNN surrogate. The ONNX engine is real; the models are BYO.</li>
+<li><strong>“Secure aggregation” is a mask-cancellation demo</strong>, explicitly not the
+Bonawitz protocol and with zero privacy against the aggregator.</li>
+<li><strong>The crates are self-honest.</strong> Read the crate-root and struct doc comments
+first — they carry the caveats (and one, semantic’s codec, has a unit test that
+fails if the caveat label is deleted). The 3GPP TS/TR citations in this chapter
+are quoted from those comments and are frequently qualified in-source (e.g.
+TR 22.837 “shall not be implemented”; TR 22.870 “does not define a dedicated
+semantic use case”).</li>
+<li><strong>Validation is unit-level, not conformance-level.</strong> The channel-level
+<code>sixg_task_integration.rs</code> proves the tasks spawn, exchange messages, and change
+state; it does not prove any 3GPP behaviour, and it is not part of the
+UE→UPF GTP-U docker E2E.</li>
+</ul>
+<p>To actually <em>run</em> any of this, set the corresponding <code>*_enabled</code> flag in the gNB
+YAML (<code>config/gnb.yaml</code>) and — for the UE — build with the matching cargo feature
+<em>and</em> set the UE flag. See <a href="../configuration.html">Configuration</a> for the flag list.</p>
+<h2 id="where-to-look-next"><a class="header" href="#where-to-look-next">Where to look next</a></h2>
+<ul>
+<li><a href="../gaps/6g-gap-analysis.html">6G Gap Analysis</a> — the package-by-package gap
+ledger this chapter is consistent with. Note: its LoC/percentage numbers
+predate the current, larger and more self-honest crates (e.g. FL’s
+<code>MaskedSumDemo</code>, agent’s real <code>IntentExecutor</code>), so trust the source over the
+older figures where they differ.</li>
+<li><a href="../gaps/gap-protocols.html">Protocol Crates 6G Gap Analysis</a> — the NAS/NGAP/RRC
+side, including where NTN/sidelink encodings are bespoke and unwired.</li>
+<li><a href="../configuration.html">Configuration</a> — every <code>*_enabled</code> flag, the NTN
+“logging-only/inert” note, and the Rel-17/18 UE features (RedCap/SNPN/MINT/UAV)
+that <em>are</em> integrated E2E and are a separate tier from this stack.</li>
+<li><a href="../architecture/gnb.html">gNB Architecture</a> and <a href="../architecture/ue.html">UE Architecture</a>
+— the actor/task model these 6G tasks plug into, and how spawning is gated.</li>
+<li><a href="registration-flow.html">Registration Call Flow</a> and
+<a href="pdu-session-userplane.html">PDU Session &amp; User Plane</a> — the validated live paths,
+which run with the AI/6G stack switched off.</li>
+<li><a href="../reference.html">Features &amp; APIs</a> — the honesty-badged feature matrix that
+summarises implemented / partial / prototype status per row.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../concepts/pdu-session-userplane.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../concepts/pdu-session-userplane.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
