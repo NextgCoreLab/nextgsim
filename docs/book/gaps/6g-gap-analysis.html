@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-2c146fd7.js";
+            window.path_to_searchindex_js = "../searchindex-a2637774.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -181,27 +181,6 @@
 <p><strong>Date:</strong> 2026-02-07
 <strong>Scope:</strong> All 21 workspace packages in the nextgsim Rust workspace
 <strong>Reference Standards:</strong> 3GPP Rel-18/19, ITU-R IMT-2030 Framework, 3GPP TS 23.288, TR 22.837, TR 23.700-80</p>
-<hr>
-<h2 id="executive-summary"><a class="header" href="#executive-summary">Executive Summary</a></h2>
-<p>nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently at approximately <strong>40-50% parity with UERANSIM</strong> for 5G functionality and approximately <strong>25-30% readiness for 6G</strong> simulation capabilities.</p>
-<p><strong>Strengths:</strong></p>
-<ul>
-<li>Solid 5G control plane foundation (NAS, NGAP, RRC, SCTP) with working registration and PDU session establishment</li>
-<li>Data plane operational (GTP-U tunneling, TUN interfaces, loopback mode, ping working)</li>
-<li>Full 5G crypto stack (Milenage, SNOW3G, ZUC, AES, ECIES)</li>
-<li>6G AI-native packages created with well-structured architectures (8 packages totaling ~8,400 LoC)</li>
-<li>ONNX Runtime integration for ML inference with GPU acceleration support</li>
-</ul>
-<p><strong>Critical Gaps:</strong></p>
-<ul>
-<li>RLC layer completely missing (blocks realistic air interface simulation)</li>
-<li>UE NAS MM/SM procedures ~60-70% incomplete</li>
-<li>UE RRC layer ~80% incomplete (handover, re-establishment, measurements)</li>
-<li>6G packages have structural frameworks but lack integration with the 5G stack</li>
-<li>No RIS, NTN, sub-THz, zero-energy device, digital twin, or JCC support</li>
-<li>No ORAN fronthaul or xApp/rApp interfaces</li>
-</ul>
-<p><strong>Estimated 6G readiness timeline:</strong> 12-18 months to reach baseline 6G simulation capability with current architecture.</p>
 <hr>
 <h2 id="package-by-package-analysis"><a class="header" href="#package-by-package-analysis">Package-by-Package Analysis</a></h2>
 <h3 id="summary-table"><a class="header" href="#summary-table">Summary Table</a></h3>
@@ -854,47 +833,11 @@
 <li>LLM integration for NKEF and agent framework</li>
 </ol>
 <hr>
-<h2 id="recommendations"><a class="header" href="#recommendations">Recommendations</a></h2>
-<h3 id="architecture-recommendations"><a class="header" href="#architecture-recommendations">Architecture Recommendations</a></h3>
-<ol>
-<li>
-<p><strong>Unified Vector3/Position type:</strong> The <code>Vector3</code> type is duplicated across nextgsim-nwdaf, nextgsim-isac, and nextgsim-rls. Create a shared type in nextgsim-common to avoid duplication and ensure consistency.</p>
-</li>
-<li>
-<p><strong>Event bus for 6G integration:</strong> The current task-based architecture with point-to-point message channels makes 6G integration complex. Consider adding a publish-subscribe event bus for cross-cutting concerns (measurements, analytics, sensing data).</p>
-</li>
-<li>
-<p><strong>Plugin architecture for 6G modules:</strong> Make 6G packages optional plugins that can be enabled/disabled. This keeps the 5G baseline lightweight while allowing 6G feature testing.</p>
-</li>
-<li>
-<p><strong>Channel model abstraction:</strong> Replace the simple distance-based signal model in RLS with a pluggable channel model interface. This enables adding 3GPP channel models, sub-THz models, RIS models, and NTN propagation models incrementally.</p>
-</li>
-<li>
-<p><strong>Model registry service:</strong> Create a centralized ONNX model registry that NWDAF, ISAC, semantic, and FL can share, with versioning and lifecycle management.</p>
-</li>
-</ol>
-<h3 id="technical-recommendations"><a class="header" href="#technical-recommendations">Technical Recommendations</a></h3>
-<ol>
-<li>
-<p><strong>Start with NWDAF integration:</strong> The highest-value 6G feature to integrate first is NWDAF with the gNB, as it unlocks AI-driven handover, load balancing, and network optimization without requiring PHY-layer changes.</p>
-</li>
-<li>
-<p><strong>Prioritize RLC before 6G PHY:</strong> Without RLC, any 6G air interface simulation will be unrealistic. RLC is the foundation for PDCP, MAC, and ultimately ISAC waveform simulation.</p>
-</li>
-<li>
-<p><strong>Use existing ONNX ecosystem:</strong> The nextgsim-ai ONNX Runtime integration is well-designed. Leverage it to create pre-trained models for NWDAF (trajectory prediction), ISAC (positioning), and semantic (encoding/decoding) rather than building custom ML frameworks.</p>
-</li>
-<li>
-<p><strong>Post-quantum crypto urgency:</strong> 3GPP SA3 is actively studying PQC migration. Adding Kyber and Dilithium support early positions the simulator for testing PQC-enabled procedures ahead of standardization.</p>
-</li>
-</ol>
-<h3 id="testing-recommendations"><a class="header" href="#testing-recommendations">Testing Recommendations</a></h3>
-<ol>
-<li>Add integration tests between 6G packages and the 5G stack</li>
-<li>Create conformance test suites against Open5GS and Free5GC</li>
-<li>Build performance benchmarks for concurrent UE scaling</li>
-<li>Add property-based testing for NAS/NGAP encoding/decoding</li>
-</ol>
+<h2 id="open-work"><a class="header" href="#open-work">Open work</a></h2>
+<p>Forward-looking work items from this analysis are tracked as
+<a href="https://github.com/NextgCoreLab/nextgsim/issues">GitHub issues</a> rather than as a
+roadmap here, so the code and the tracker stay the source of truth. Each issue
+records the verified current state, a bounded scope, and acceptance criteria.</p>
 <hr>
 <h2 id="code-metrics-summary"><a class="header" href="#code-metrics-summary">Code Metrics Summary</a></h2>
 <div class="table-wrapper">
