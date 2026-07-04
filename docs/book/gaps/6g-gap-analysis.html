@@ -1,0 +1,974 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Gap Analysis: 6G - NextGSim Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-0392ca55.css">
+        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-1a495950.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-33e2fae0.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGSim Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgsim" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="nextgsim-6g-gap-analysis-report"><a class="header" href="#nextgsim-6g-gap-analysis-report">nextgsim 6G Gap Analysis Report</a></h1>
+<p><strong>Date:</strong> 2026-02-07
+<strong>Scope:</strong> All 21 workspace packages in the nextgsim Rust workspace
+<strong>Reference Standards:</strong> 3GPP Rel-18/19, ITU-R IMT-2030 Framework, 3GPP TS 23.288, TR 22.837, TR 23.700-80</p>
+<hr>
+<h2 id="executive-summary"><a class="header" href="#executive-summary">Executive Summary</a></h2>
+<p>nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently at approximately <strong>40-50% parity with UERANSIM</strong> for 5G functionality and approximately <strong>25-30% readiness for 6G</strong> simulation capabilities.</p>
+<p><strong>Strengths:</strong></p>
+<ul>
+<li>Solid 5G control plane foundation (NAS, NGAP, RRC, SCTP) with working registration and PDU session establishment</li>
+<li>Data plane operational (GTP-U tunneling, TUN interfaces, loopback mode, ping working)</li>
+<li>Full 5G crypto stack (Milenage, SNOW3G, ZUC, AES, ECIES)</li>
+<li>6G AI-native packages created with well-structured architectures (8 packages totaling ~8,400 LoC)</li>
+<li>ONNX Runtime integration for ML inference with GPU acceleration support</li>
+</ul>
+<p><strong>Critical Gaps:</strong></p>
+<ul>
+<li>RLC layer completely missing (blocks realistic air interface simulation)</li>
+<li>UE NAS MM/SM procedures ~60-70% incomplete</li>
+<li>UE RRC layer ~80% incomplete (handover, re-establishment, measurements)</li>
+<li>6G packages have structural frameworks but lack integration with the 5G stack</li>
+<li>No RIS, NTN, sub-THz, zero-energy device, digital twin, or JCC support</li>
+<li>No ORAN fronthaul or xApp/rApp interfaces</li>
+</ul>
+<p><strong>Estimated 6G readiness timeline:</strong> 12-18 months to reach baseline 6G simulation capability with current architecture.</p>
+<hr>
+<h2 id="package-by-package-analysis"><a class="header" href="#package-by-package-analysis">Package-by-Package Analysis</a></h2>
+<h3 id="summary-table"><a class="header" href="#summary-table">Summary Table</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Package</th><th>Category</th><th>LoC</th><th>Completion</th><th>Status</th><th>Critical 6G Gaps</th></tr>
+</thead>
+<tbody>
+<tr><td>nextgsim-common</td><td>Core</td><td>5,154</td><td>85%</td><td>Functional</td><td>Needs 6G config types (RIS, NTN, ISAC params)</td></tr>
+<tr><td>nextgsim-crypto</td><td>Core</td><td>4,090</td><td>90%</td><td>Functional</td><td>Missing post-quantum crypto (Kyber, Dilithium)</td></tr>
+<tr><td>nextgsim-sctp</td><td>Core</td><td>1,330</td><td>75%</td><td>Functional</td><td>No multi-homing, path MTU, bundling</td></tr>
+<tr><td>nextgsim-nas</td><td>5G Protocol</td><td>10,252</td><td>60%</td><td>Partial</td><td>Missing config update, emergency, EAP-AKA’ reauth</td></tr>
+<tr><td>nextgsim-ngap</td><td>5G Protocol</td><td>~365K bytes</td><td>70%</td><td>Functional</td><td>Handover basic only, no AMF load balancing</td></tr>
+<tr><td>nextgsim-rrc</td><td>5G Protocol</td><td>~140K bytes</td><td>40%</td><td>Basic</td><td>No measurement report, handover, re-establishment, CA</td></tr>
+<tr><td>nextgsim-rls</td><td>5G Protocol</td><td>1,962</td><td>80%</td><td>Functional</td><td>No channel modeling, MIMO, beamforming sim</td></tr>
+<tr><td>nextgsim-gtp</td><td>5G Protocol</td><td>1,306</td><td>70%</td><td>Functional</td><td>Basic QoS/extension headers only</td></tr>
+<tr><td>nextgsim-gnb</td><td>Binary</td><td>12,051</td><td>55%</td><td>Working</td><td>No NWDAF/ISAC/agent integration</td></tr>
+<tr><td>nextgsim-ue</td><td>Binary</td><td>18,390</td><td>50%</td><td>Working</td><td>No FL/semantic integration, RRC ~80% missing</td></tr>
+<tr><td>nextgsim-cli</td><td>Binary</td><td>1,020</td><td>70%</td><td>Functional</td><td>No 6G-specific commands</td></tr>
+<tr><td>nextgsim-ai</td><td>6G AI</td><td>2,432</td><td>65%</td><td>Functional</td><td>No training, model lifecycle management</td></tr>
+<tr><td>nextgsim-she</td><td>6G AI</td><td>2,726</td><td>60%</td><td>Functional</td><td>No actual edge node deployment, no K8s integration</td></tr>
+<tr><td>nextgsim-nwdaf</td><td>6G AI</td><td>522</td><td>35%</td><td>Prototype</td><td>Linear extrapolation only, no ML models, no TS 23.288 services</td></tr>
+<tr><td>nextgsim-nkef</td><td>6G AI</td><td>476</td><td>30%</td><td>Prototype</td><td>Keyword search only, no real vector embeddings/LLM</td></tr>
+<tr><td>nextgsim-isac</td><td>6G AI</td><td>487</td><td>35%</td><td>Prototype</td><td>Simplified fusion, no real Kalman/particle filter</td></tr>
+<tr><td>nextgsim-agent</td><td>6G AI</td><td>608</td><td>40%</td><td>Prototype</td><td>Simplified intent processing, no real multi-agent coordination</td></tr>
+<tr><td>nextgsim-fl</td><td>6G AI</td><td>628</td><td>45%</td><td>Prototype</td><td>FedAvg only, simplified DP noise, no SecAgg crypto</td></tr>
+<tr><td>nextgsim-semantic</td><td>6G AI</td><td>527</td><td>30%</td><td>Prototype</td><td>Mean-pooling encoder only, no neural codec, no JSCC</td></tr>
+<tr><td>tests</td><td>Testing</td><td>-</td><td>20%</td><td>Basic</td><td>No integration tests, no conformance testing</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="detailed-package-analysis"><a class="header" href="#detailed-package-analysis">Detailed Package Analysis</a></h2>
+<h3 id="1-core-infrastructure"><a class="header" href="#1-core-infrastructure">1. Core Infrastructure</a></h3>
+<h4 id="nextgsim-common-5154-loc--85-complete"><a class="header" href="#nextgsim-common-5154-loc--85-complete">nextgsim-common (5,154 LoC) – 85% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>BitBuffer, BitString, OctetString, OctetView (binary data handling)</li>
+<li>GnbConfig, UeConfig, AmfConfig (configuration structures)</li>
+<li>CLI server with process table and command routing</li>
+<li>UDP transport layer</li>
+<li>Structured logging with hex dump and protocol-specific formatters</li>
+<li>Common types (PLMN, TAI, S-NSSAI, etc.)</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>No RLC-related configuration types</li>
+<li>Some optional NAS IEs not represented in types</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No RIS configuration types (panel geometry, reflection coefficients, phase control)</li>
+<li>NTN configuration prototypes exist (gNB <code>ntn_config</code> YAML block, orbit/delay models in the rrc crate) but are logging-only/unwired</li>
+<li>No sub-THz/THz channel configuration parameters</li>
+<li>No ISAC sensing configuration types</li>
+<li>No network slicing enhancement types for 6G (inter-slice coordination)</li>
+<li>No digital twin configuration</li>
+<li>No zero-energy device parameters</li>
+</ul>
+<h4 id="nextgsim-crypto-4090-loc--90-complete"><a class="header" href="#nextgsim-crypto-4090-loc--90-complete">nextgsim-crypto (4,090 LoC) – 90% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Milenage (5G-AKA) – 959 LoC, full implementation with test vectors</li>
+<li>SNOW3G (NEA1/NIA1) – 602 LoC</li>
+<li>ZUC (NEA3/NIA3) – 360 LoC, using external crate</li>
+<li>AES-based (NEA2/NIA2) – 315 LoC</li>
+<li>Key derivation functions (KDF) – 663 LoC</li>
+<li>ECIES for SUPI concealment – 376 LoC</li>
+<li>NIA (integrity algorithms) – 496 LoC</li>
+<li>NEA (ciphering algorithms) – 301 LoC</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Additional test vector validation needed</li>
+<li>EAP-AKA’ re-authentication not fully tested</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li><strong>Post-quantum cryptography (PQC):</strong> No Kyber (ML-KEM), Dilithium (ML-DSA), or SPHINCS+ support. 3GPP SA3 is studying PQC migration per TR 33.871. This is critical for 6G security.</li>
+<li><strong>Homomorphic encryption:</strong> No support for privacy-preserving computation needed for federated learning</li>
+<li><strong>Zero-knowledge proofs:</strong> Not implemented (useful for privacy-preserving authentication in 6G)</li>
+<li><strong>Quantum key distribution (QKD):</strong> No QKD integration framework</li>
+<li><strong>Physical layer security:</strong> No PLS primitives (channel-based key generation)</li>
+</ul>
+<h4 id="nextgsim-sctp-1330-loc--75-complete"><a class="header" href="#nextgsim-sctp-1330-loc--75-complete">nextgsim-sctp (1,330 LoC) – 75% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>SCTP association management (client mode)</li>
+<li>SCTP server mode (for accepting connections)</li>
+<li>Async tokio-based interface over sctp-proto Sans-IO</li>
+<li>Multi-stream support for NGAP (PPID 60)</li>
+<li>Graceful shutdown</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>No multi-homing support</li>
+<li>No path MTU discovery</li>
+<li>No bundling optimization</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No QUIC transport alternative (being studied for next-gen signaling)</li>
+<li>No transport layer support for NTN high-latency links</li>
+</ul>
+<hr>
+<h3 id="2-5g-protocol-stack"><a class="header" href="#2-5g-protocol-stack">2. 5G Protocol Stack</a></h3>
+<h4 id="nextgsim-nas-10252-loc--60-complete"><a class="header" href="#nextgsim-nas-10252-loc--60-complete">nextgsim-nas (10,252 LoC) – 60% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>NAS header encoding/decoding (plain MM, plain SM, security protected)</li>
+<li>Registration messages: Request, Accept, Reject, Complete (1,709 LoC)</li>
+<li>Authentication messages: Request, Response, Reject, Failure, Result (1,226 LoC)</li>
+<li>Deregistration messages (485 LoC)</li>
+<li>Security Mode messages (821 LoC)</li>
+<li>Service Request/Accept/Reject messages (767 LoC)</li>
+<li>Identity messages (362 LoC)</li>
+<li>5GMM Status messages (146 LoC)</li>
+<li>PDU Session Establishment messages (725 LoC)</li>
+<li>PDU Session Modification messages (1,041 LoC)</li>
+<li>EAP framework (EAP-AKA’)</li>
+<li>NAS security (ciphering, integrity, MAC computation) – 2,046 LoC</li>
+<li>Type 1 IEs (39,045 LoC) and Type 3 IEs (32,936 LoC)</li>
+<li>Capture tests for real packet validation</li>
+</ul>
+<p><strong>5G Gaps (from TODO.txt):</strong></p>
+<ul>
+<li>Missing NAS SM: PDU session release messages</li>
+<li>Missing NAS MM: Configuration update handling, emergency registration</li>
+<li>Optional IEs not fully implemented</li>
+<li>Some EAP-AKA’ edge cases untested</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No AI/ML-assisted NAS procedure signaling extensions</li>
+<li>NTN NAS data models (satellite timing advance, ephemeris) exist as bespoke prototypes — not wire-conformant, no sender wired into live UE paths</li>
+<li>No network slicing enhancement IEs for 6G</li>
+<li>No support for zero-energy device simplified NAS procedures</li>
+</ul>
+<h4 id="nextgsim-ngap-procedures-364k-bytes-across-10-files--70-complete"><a class="header" href="#nextgsim-ngap-procedures-364k-bytes-across-10-files--70-complete">nextgsim-ngap (procedures: ~364K bytes across 10 files) – 70% Complete</a></h4>
+<p><strong>Implemented (with ASN.1 PER encoding/decoding):</strong></p>
+<ul>
+<li>NG Setup procedure (32,363 bytes)</li>
+<li>Initial UE Message (28,049 bytes)</li>
+<li>Initial Context Setup (45,949 bytes)</li>
+<li>NAS Transport (UL/DL) (29,979 bytes)</li>
+<li>PDU Session Resource (53,058 bytes)</li>
+<li>UE Context Release (37,677 bytes)</li>
+<li>Error Indication (40,748 bytes)</li>
+<li>Handover procedure (73,652 bytes) – basic implementation</li>
+<li>Paging (22,395 bytes) – basic implementation</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Handover: Basic implementation only (no inter-AMF, no path switch)</li>
+<li>Paging: Needs optimization</li>
+<li>No AMF load balancing</li>
+<li>No UE TNLA binding update</li>
+<li>No secondary RAT data usage reporting</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No NGAP extensions for ISAC sensing data transfer</li>
+<li>No NGAP extensions for AI/ML model distribution</li>
+<li>NTN NGAP support module exists (off-wire, bespoke) — no wire-conformant NTN NGAP procedures</li>
+<li>No RIS control plane signaling via NGAP</li>
+<li>No multi-connectivity (DC/MC) enhanced procedures</li>
+</ul>
+<h4 id="nextgsim-rrc-procedures-126k-bytes-across-6-files--40-complete"><a class="header" href="#nextgsim-rrc-procedures-126k-bytes-across-6-files--40-complete">nextgsim-rrc (procedures: ~126K bytes across 6 files) – 40% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>RRC Setup procedure (29,177 bytes)</li>
+<li>RRC Release procedure (16,206 bytes)</li>
+<li>RRC Reconfiguration (17,564 bytes)</li>
+<li>Security Mode Command/Complete (20,633 bytes)</li>
+<li>System Information (26,968 bytes)</li>
+<li>Information Transfer (UL/DL) (15,607 bytes)</li>
+<li>ASN.1 UPER codec</li>
+</ul>
+<p><strong>In gNB RRC task (nextgsim-gnb/src/rrc/):</strong></p>
+<ul>
+<li>Connection management (472 LoC)</li>
+<li>Handover procedure (531 LoC) – recently added</li>
+<li>UE context management (440 LoC)</li>
+</ul>
+<p><strong>In UE RRC task (nextgsim-ue/src/rrc/):</strong></p>
+<ul>
+<li>Cell selection (815 LoC) – recently added</li>
+<li>Handover (403 LoC) – recently added</li>
+<li>Measurement reporting (580 LoC) – recently added</li>
+<li>RRC state machine (640 LoC)</li>
+<li>RRC task processing (825 LoC)</li>
+</ul>
+<p><strong>5G Gaps (critical - from TODO.txt):</strong></p>
+<ul>
+<li>Full ASN.1-based RRC message encoding uses placeholders in gNB</li>
+<li>RRC re-establishment not implemented</li>
+<li>Carrier aggregation not supported</li>
+<li>Proper measurement reporting events (A1-A6, B1-B2) partially implemented</li>
+<li>Cell reselection procedures incomplete</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No AI/ML-based RRC procedure optimization (predictive handover)</li>
+<li>No RIS beam management via RRC</li>
+<li>NTN RRC prototypes exist (timing advance, link sim, constellation, ISL handover in nextgsim-rrc) but use bespoke encodings and are not wired into live signaling; no satellite cell selection or Doppler pre-compensation</li>
+<li>No sub-THz beam tracking procedures</li>
+<li>No wire-conformant sidelink/D2D RRC support (a UE-side ProSe/ranging prototype now exists, sim-internal only)</li>
+<li>No dual connectivity (EN-DC, NR-DC) RRC procedures</li>
+<li>No conditional handover (CHO) / DAPS handover support</li>
+</ul>
+<h4 id="nextgsim-rls-1962-loc--80-complete"><a class="header" href="#nextgsim-rls-1962-loc--80-complete">nextgsim-rls (1,962 LoC) – 80% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>RLS protocol messages: Heartbeat, HeartbeatAck, PduTransmission, PduTransmissionAck</li>
+<li>Cell search (UE side): cell discovery with signal strength</li>
+<li>Cell tracking (gNB side): UE tracking with timeout management</li>
+<li>RRC and user plane data transport with PDU management</li>
+<li>Binary codec with full encode/decode</li>
+<li>Position-based signal strength simulation (Vector3)</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Simplified signal propagation model (distance-only)</li>
+<li>No fading/shadowing simulation</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li><strong>Channel modeling:</strong> No 3GPP TR 38.901 channel models, no sub-THz channel models</li>
+<li><strong>MIMO/Beamforming:</strong> No massive MIMO simulation, no beam management</li>
+<li><strong>RIS integration:</strong> No reflective surface path modeling</li>
+<li><strong>NTN propagation:</strong> Prototype link simulation exists (delay/Doppler/link models in nextgsim-rrc) but is not integrated with the RLS channel path</li>
+<li><strong>Spectrum:</strong> No sub-THz/THz propagation models (molecular absorption, weather effects)</li>
+<li><strong>Sensing:</strong> No radar-like waveform simulation for ISAC</li>
+<li><strong>D2D/Sidelink:</strong> No direct UE-to-UE communication simulation</li>
+</ul>
+<h4 id="nextgsim-gtp-1306-loc--70-complete"><a class="header" href="#nextgsim-gtp-1306-loc--70-complete">nextgsim-gtp (1,306 LoC) – 70% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>GTP-U header encoding/decoding (769 LoC) per TS 29.281</li>
+<li>GTP-U message types (G-PDU, Echo Req/Rsp, Error Indication, End Marker)</li>
+<li>Extension header support (PDU Session Container, basic)</li>
+<li>Tunnel management with UE/PSI session tracking (486 LoC)</li>
+<li>Sequence number handling</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Extension headers: Basic support only</li>
+<li>QoS flow handling: Simplified</li>
+<li>End marker handling: Basic</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No QoS flow identifier (QFI) based traffic differentiation for 6G slicing</li>
+<li>No GTP-U extensions for URLLC/time-sensitive networking</li>
+<li>No compute-aware forwarding extensions (JCC)</li>
+<li>No semantic-aware forwarding</li>
+<li>No network coding support</li>
+</ul>
+<hr>
+<h3 id="3-binary-applications"><a class="header" href="#3-binary-applications">3. Binary Applications</a></h3>
+<h4 id="nextgsim-gnb-12051-loc--55-complete"><a class="header" href="#nextgsim-gnb-12051-loc--55-complete">nextgsim-gnb (12,051 LoC) – 55% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Task-based actor architecture: App, NGAP, RRC, GTP, RLS, SCTP tasks</li>
+<li>NG Setup with AMF</li>
+<li>Initial UE message handling</li>
+<li>NAS transport (UL/DL) relay</li>
+<li>PDU session resource setup</li>
+<li>GTP-U tunneling with loopback mode</li>
+<li>RLS cell tracking and UE management</li>
+<li>CLI server for runtime commands</li>
+<li>YAML configuration loading</li>
+<li>Status reporting and monitoring</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Full ASN.1-based RRC encoding (uses placeholders)</li>
+<li>AMF load balancing</li>
+<li>Multiple AMF support</li>
+<li>Broadcast/system information handling incomplete</li>
+</ul>
+<p><strong>6G Integration Gaps:</strong></p>
+<ul>
+<li>No NWDAF task integration (analytics data collection/consumption)</li>
+<li>No ISAC task integration (sensing data processing)</li>
+<li>No agent framework integration (autonomous decision-making)</li>
+<li>No SHE task integration (edge compute orchestration)</li>
+<li>No RIS control integration</li>
+<li>No NTN-aware scheduling</li>
+<li>No xApp/rApp interface (ORAN)</li>
+</ul>
+<h4 id="nextgsim-ue-18390-loc--50-complete"><a class="header" href="#nextgsim-ue-18390-loc--50-complete">nextgsim-ue (18,390 LoC) – 50% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Task-based architecture: App, NAS (MM+SM), RRC, RLS, TUN tasks</li>
+<li>NAS MM state machine with registration, authentication, security mode</li>
+<li>NAS SM procedures for PDU session establishment</li>
+<li>Deregistration procedures (788 LoC)</li>
+<li>TUN interface management with async read/write split</li>
+<li>Timer framework (1,135 LoC) for NAS/RRC timers</li>
+<li>Cell selection (815 LoC)</li>
+<li>Handover support (403 LoC)</li>
+<li>Measurement reporting (580 LoC)</li>
+<li>CLI handler and status reporting</li>
+</ul>
+<p><strong>5G Gaps (from TODO.txt – critical):</strong></p>
+<ul>
+<li>NAS MM procedures ~70% missing: access, auth full flow, config, ecall, radio capability, slice selection</li>
+<li>NAS SM procedures ~60% missing: full PDU establishment flow, release, resource allocation</li>
+<li>RRC ~80% missing: re-establishment, full measurement events, cell reselection</li>
+<li>Multiple PDU sessions: Basic support only</li>
+</ul>
+<p><strong>6G Integration Gaps:</strong></p>
+<ul>
+<li>No FL participant integration (local training, model update submission)</li>
+<li>No semantic communication integration (task-oriented encoding)</li>
+<li>No ISAC measurement reporting</li>
+<li>No AI/ML-assisted mobility (predictive handover consumption from NWDAF)</li>
+<li>No sidelink/D2D support</li>
+<li>No NTN-aware procedures</li>
+<li>No zero-energy device emulation mode</li>
+</ul>
+<h4 id="nextgsim-cli-1020-loc--70-complete"><a class="header" href="#nextgsim-cli-1020-loc--70-complete">nextgsim-cli (1,020 LoC) – 70% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>CLI client with process table discovery</li>
+<li>Command routing to gNB/UE instances</li>
+<li>Protocol for CLI message exchange</li>
+<li>Interactive command interface</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No commands for 6G-specific operations (ISAC query, NWDAF analytics, FL status)</li>
+<li>No AI agent interaction commands</li>
+<li>No RIS configuration commands</li>
+<li>No network slice management commands</li>
+</ul>
+<hr>
+<h3 id="4-6g-ai-native-packages"><a class="header" href="#4-6g-ai-native-packages">4. 6G AI-Native Packages</a></h3>
+<h4 id="nextgsim-ai-2432-loc--65-complete"><a class="header" href="#nextgsim-ai-2432-loc--65-complete">nextgsim-ai (2,432 LoC) – 65% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>ONNX Runtime inference engine with full lifecycle (load, infer, batch_infer, warmup)</li>
+<li>Multi-execution-provider support (CPU, CUDA, CoreML, DirectML, TensorRT)</li>
+<li>TensorData abstraction (Float32, Float16, Int64, Int32, Int8, UInt8)</li>
+<li>Tensor shape management with dynamic dimensions</li>
+<li>Model metadata extraction from ONNX files</li>
+<li>Inference metrics (latency tracking, throughput, error counting)</li>
+<li>Configuration system (InferenceConfig, AiConfig)</li>
+<li>Error types (ModelError, InferenceError)</li>
+<li>GPU acceleration support</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Training:</strong> No on-device training or fine-tuning support (inference only)</li>
+<li><strong>Model lifecycle:</strong> No model versioning, A/B testing, rollback</li>
+<li><strong>Model compression:</strong> No quantization, pruning, or knowledge distillation utilities</li>
+<li><strong>Hardware optimization:</strong> No NPU/FPGA acceleration profiles</li>
+<li><strong>Streaming inference:</strong> No support for continuous/streaming model inputs</li>
+<li><strong>Model registry:</strong> No centralized model management/discovery</li>
+</ul>
+<h4 id="nextgsim-she-2726-loc--60-complete"><a class="header" href="#nextgsim-she-2726-loc--60-complete">nextgsim-she (2,726 LoC) – 60% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Three-tier compute model: Local Edge (&lt;10ms), Regional Edge (&lt;20ms), Core Cloud</li>
+<li>Workload scheduler with multiple policies (ClosestToEdge, MostAvailable, LeastUtilized)</li>
+<li>Resource capacity tracking (CPU, memory, GPU, FLOPS)</li>
+<li>Compute node management with capability tracking</li>
+<li>Workload lifecycle management (Pending, Placed, Running, Complete, Failed, Migrating)</li>
+<li>SHE task with inference engine integration (loads ONNX models per tier)</li>
+<li>Message-passing architecture (SheMessage/SheResponse)</li>
+<li>Placement decision engine with reason tracking</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Actual deployment:</strong> No real container/VM orchestration (Kubernetes, Docker)</li>
+<li><strong>Migration:</strong> Workload migration logic is framework-only, no live migration</li>
+<li><strong>Autoscaling:</strong> No dynamic scaling based on load</li>
+<li><strong>Multi-access edge computing (MEC):</strong> No ETSI MEC API compliance</li>
+<li><strong>Latency simulation:</strong> Tier latency is configured, not dynamically measured</li>
+<li><strong>Network-compute joint optimization:</strong> No JCC (Joint Communication and Computing)</li>
+<li><strong>Digital twin integration:</strong> No digital twin state synchronization</li>
+</ul>
+<h4 id="nextgsim-nwdaf-522-loc--35-complete"><a class="header" href="#nextgsim-nwdaf-522-loc--35-complete">nextgsim-nwdaf (522 LoC) – 35% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>UE measurement data structures (RSRP, RSRQ, SINR, position, velocity)</li>
+<li>Cell load data structures</li>
+<li>Measurement history management with circular buffer</li>
+<li>Trajectory prediction using linear extrapolation (comment: “Production would use LSTM/Transformer model via ONNX”)</li>
+<li>Handover recommendation with signal-based and predicted-mobility reasons</li>
+<li>Cell load recording and retrieval</li>
+<li>Automation action types (handover params, cell power, load balancing)</li>
+<li>Message/response types for async communication</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>ML Models:</strong> Uses linear extrapolation instead of actual ML models (LSTM, Transformer). Comment in code acknowledges this.</li>
+<li><strong>TS 23.288 Services:</strong> Missing NWDAF service operations:
+<ul>
+<li>Nnwdaf_AnalyticsSubscription (subscribe to analytics)</li>
+<li>Nnwdaf_AnalyticsInfo (on-demand analytics query)</li>
+<li>Nnwdaf_MLModelProvision (ML model distribution)</li>
+<li>Nnwdaf_DataManagement (data collection coordination)</li>
+</ul>
+</li>
+<li><strong>Analytics IDs:</strong> No support for standardized analytics IDs (UE mobility, NF load, service experience, abnormal behavior, etc.)</li>
+<li><strong>MTLF/AnLF split:</strong> No separation between Model Training Logical Function and Analytics Logical Function</li>
+<li><strong>Data collection:</strong> No integration with gNB/UE for real measurement collection</li>
+<li><strong>Closed-loop automation:</strong> Layer 4 automation is defined as enum but not implemented</li>
+<li><strong>Anomaly detection:</strong> Listed but no implementation</li>
+<li><strong>Federated analytics:</strong> No support for cross-domain analytics</li>
+</ul>
+<h4 id="nextgsim-nkef-476-loc--30-complete"><a class="header" href="#nextgsim-nkef-476-loc--30-complete">nextgsim-nkef (476 LoC) – 30% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Knowledge graph with entity/relationship management</li>
+<li>Entity types: Gnb, Ue, Cell, Amf, Upf, Slice, PduSession, Service</li>
+<li>Type-indexed entity lookup</li>
+<li>Keyword-based search (comment: “production would use vector similarity”)</li>
+<li>RAG context generation from knowledge graph</li>
+<li>Embedding field on entities (but no actual embedding generation)</li>
+<li>NKEF manager with query and context retrieval</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Vector embeddings:</strong> Field exists but no embedding model integration (no sentence transformers)</li>
+<li><strong>Semantic search:</strong> Uses keyword matching, not vector similarity search</li>
+<li><strong>LLM integration:</strong> No actual LLM connection for RAG</li>
+<li><strong>Ontology:</strong> No formal network ontology (OWL/RDF)</li>
+<li><strong>Real-time updates:</strong> No event-driven knowledge graph updates from network events</li>
+<li><strong>3GPP TS 23.288 integration:</strong> Not connected to NWDAF for analytics-informed knowledge</li>
+<li><strong>Intent translation:</strong> No NLP-based intent parsing from natural language</li>
+<li><strong>Temporal reasoning:</strong> No time-series aware knowledge graph</li>
+</ul>
+<h4 id="nextgsim-isac-487-loc--35-complete"><a class="header" href="#nextgsim-isac-487-loc--35-complete">nextgsim-isac (487 LoC) – 35% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Sensing measurement types: ToA, TDoA, AoA, ZoA, RSS, Doppler, RTT</li>
+<li>Sensing data aggregation from multiple cells</li>
+<li>Data source registration with anchor positions</li>
+<li>Simplified Kalman-like position tracking (update with gain calculation)</li>
+<li>Position prediction based on velocity</li>
+<li>Position fusion using weighted centroid (comment: “production would use proper trilateration”)</li>
+<li>Track lifecycle management (create, update, cleanup stale)</li>
+<li>ISAC manager with anchor registration and tracking state</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>3GPP TR 22.837 compliance:</strong> Missing sensing use cases:
+<ul>
+<li>Object detection and tracking beyond positioning</li>
+<li>Gesture/activity recognition</li>
+<li>Environmental sensing (weather, rain)</li>
+<li>Intrusion detection</li>
+<li>Automotive sensing (V2X)</li>
+</ul>
+</li>
+<li><strong>Waveform design:</strong> No joint communication-sensing waveform models (OFDM radar, FMCW)</li>
+<li><strong>Beamforming integration:</strong> No beam-based sensing</li>
+<li><strong>Proper algorithms:</strong> Uses centroid-based fusion instead of trilateration/multilateration</li>
+<li><strong>Extended Kalman Filter:</strong> Simplified linear Kalman, no EKF/UKF for non-linear models</li>
+<li><strong>Particle filter:</strong> Not implemented (mentioned in doc but absent)</li>
+<li><strong>Multi-sensor fusion:</strong> Basic aggregation only, no Bayesian/Dempster-Shafer fusion</li>
+<li><strong>Clutter/interference modeling:</strong> No realistic sensing environment simulation</li>
+<li><strong>Sensing-communication tradeoff:</strong> No resource sharing optimization</li>
+</ul>
+<h4 id="nextgsim-agent-608-loc--40-complete"><a class="header" href="#nextgsim-agent-608-loc--40-complete">nextgsim-agent (608 LoC) – 40% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Agent type classification: Mobility, Resource, QoS, Security, Slicing, Custom</li>
+<li>Agent capabilities system: read_state, modify_config, trigger_actions</li>
+<li>OAuth 2.0-style token authentication with expiration</li>
+<li>Intent framework: Query, OptimizeResources, TriggerHandover, AdjustQos, CreateSlice, ModifySlice</li>
+<li>Intent priority-based processing (1-10 scale)</li>
+<li>Agent coordinator for registration, token management, intent routing</li>
+<li>Capability-based access control (intent validation against agent capabilities)</li>
+<li>Resource limits (requests/second, concurrent ops, data scope)</li>
+<li>Heartbeat-based agent liveness tracking</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Intent processing:</strong> All intents return success without actual execution (placeholder)</li>
+<li><strong>Multi-agent coordination:</strong> No conflict resolution between competing intents</li>
+<li><strong>Reinforcement learning:</strong> No RL-based agent decision making</li>
+<li><strong>LLM integration:</strong> No LLM-based intent understanding or generation</li>
+<li><strong>A2A protocol:</strong> No agent-to-agent communication protocol</li>
+<li><strong>MCP integration:</strong> No Model Context Protocol for tool use</li>
+<li><strong>Safety constraints:</strong> No guardrails or safety bounds on agent actions</li>
+<li><strong>Explainability:</strong> No decision explanation or audit trail</li>
+<li><strong>Hierarchical agents:</strong> No multi-level agent hierarchy (cell-level, region-level, network-level)</li>
+<li><strong>Real-time constraints:</strong> No latency-aware agent scheduling</li>
+</ul>
+<h4 id="nextgsim-fl-628-loc--45-complete"><a class="header" href="#nextgsim-fl-628-loc--45-complete">nextgsim-fl (628 LoC) – 45% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Federated Averaging (FedAvg) aggregation with weighted averaging</li>
+<li>Training round management (start, collect, aggregate lifecycle)</li>
+<li>Participant registration and tracking</li>
+<li>Differential privacy: gradient clipping and noise injection</li>
+<li>Model versioning (version tracking across rounds)</li>
+<li>Round status tracking (WaitingForParticipants, Collecting, Aggregating, Complete, Failed)</li>
+<li>Timeout-based round management</li>
+<li>Algorithm enum: FedAvg, FedProx, SecAgg (though FedProx and SecAgg fall through to FedAvg)</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>FedProx:</strong> Listed but implementation falls through to FedAvg</li>
+<li><strong>SecAgg:</strong> Listed but implementation falls through to FedAvg (no actual Secure Aggregation crypto)</li>
+<li><strong>DP noise:</strong> Uses simplified deterministic noise instead of proper Gaussian sampling</li>
+<li><strong>Asynchronous FL:</strong> Only synchronous rounds supported</li>
+<li><strong>Heterogeneous models:</strong> No support for different model architectures per participant</li>
+<li><strong>Client selection:</strong> No intelligent participant selection (contribution-based, resource-aware)</li>
+<li><strong>Communication efficiency:</strong> No gradient compression, sparsification, or quantization</li>
+<li><strong>Model poisoning defense:</strong> No Byzantine fault tolerance</li>
+<li><strong>Split learning:</strong> Not supported</li>
+<li><strong>Over-the-air aggregation:</strong> No wireless channel-aware aggregation</li>
+</ul>
+<h4 id="nextgsim-semantic-527-loc--30-complete"><a class="header" href="#nextgsim-semantic-527-loc--30-complete">nextgsim-semantic (527 LoC) – 30% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Semantic feature representation with task ID, features, importance weights, compression ratio</li>
+<li>Feature importance-based pruning (top-k feature selection)</li>
+<li>Semantic task types: ImageClassification, ObjectDetection, SpeechRecognition, TextUnderstanding, SensorFusion, VideoAnalytics</li>
+<li>Channel quality model with SNR/bandwidth/PER and quality categories</li>
+<li>Channel-adaptive compression (recommended compression ratio from channel quality)</li>
+<li>Semantic encoder: mean-pooling with variance-based importance (comment: “would use ONNX model in production”)</li>
+<li>Semantic decoder: nearest-neighbor upsampling</li>
+<li>Task-aware decoding interface</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Neural codecs:</strong> Uses mean-pooling instead of actual learned codecs (autoencoder, VAE)</li>
+<li><strong>JSCC:</strong> No joint source-channel coding (just separate compression and transmission)</li>
+<li><strong>End-to-end training:</strong> No trainable encoder/decoder pipeline</li>
+<li><strong>Multi-modal:</strong> Limited to 1D data vectors, no image/video/audio specific pipelines</li>
+<li><strong>Semantic similarity metrics:</strong> No SSIM, LPIPS, or task-specific metrics</li>
+<li><strong>Knowledge base integration:</strong> No shared knowledge base between encoder/decoder</li>
+<li><strong>Generative AI integration:</strong> No diffusion model or GAN-based reconstruction</li>
+<li><strong>Rate-distortion optimization:</strong> No learned rate control</li>
+<li><strong>Cross-layer optimization:</strong> No PHY layer integration for semantic transmission</li>
+</ul>
+<hr>
+<h2 id="6g-feature-gap-matrix"><a class="header" href="#6g-feature-gap-matrix">6G Feature Gap Matrix</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>6G Feature (ITU-R IMT-2030)</th><th>Package(s)</th><th>Current State</th><th>Gap Severity</th></tr>
+</thead>
+<tbody>
+<tr><td>AI/ML native air interface</td><td>ai, nwdaf, she</td><td>Inference framework exists; no air interface integration</td><td>HIGH</td></tr>
+<tr><td>Integrated Sensing and Communication (ISAC)</td><td>isac</td><td>Basic tracking/fusion prototype</td><td>HIGH</td></tr>
+<tr><td>Reconfigurable Intelligent Surface (RIS)</td><td>NONE</td><td>Not started</td><td>CRITICAL</td></tr>
+<tr><td>Non-Terrestrial Networks (NTN)</td><td>rrc, ngap, gnb</td><td>Prototype modules present (timing advance, ephemeris, link sim, constellation, ISL handover, NAS/NGAP data models) — bespoke encodings, not wire-conformant, largely unwired from live UE/gNB paths</td><td>HIGH</td></tr>
+<tr><td>Sub-THz/THz communication</td><td>NONE</td><td>Not started</td><td>CRITICAL</td></tr>
+<tr><td>Semantic communication</td><td>semantic</td><td>Basic encoder/decoder prototype</td><td>HIGH</td></tr>
+<tr><td>Digital twin network</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+<tr><td>Zero-energy devices / ambient IoT</td><td>ue (ambient_iot)</td><td>Prototype exists (energy-harvesting model + fleet simulation), sim-internal only</td><td>MEDIUM</td></tr>
+<tr><td>Joint Communication and Computing (JCC)</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+<tr><td>Enhanced network slicing (6G)</td><td>agent (SliceCreate/Modify intents)</td><td>Intent types defined, no implementation</td><td>HIGH</td></tr>
+<tr><td>Federated learning</td><td>fl</td><td>FedAvg prototype with basic DP</td><td>MEDIUM</td></tr>
+<tr><td>Network data analytics (NWDAF)</td><td>nwdaf</td><td>Linear prediction, no ML models</td><td>HIGH</td></tr>
+<tr><td>Knowledge exposure (NKEF/LLM)</td><td>nkef</td><td>Knowledge graph prototype, no LLM</td><td>MEDIUM</td></tr>
+<tr><td>AI agent framework</td><td>agent</td><td>OAuth + intent framework, no real execution</td><td>MEDIUM</td></tr>
+<tr><td>Post-quantum cryptography</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+<tr><td>ORAN / xApp/rApp</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="missing-5g-features-that-block-6g"><a class="header" href="#missing-5g-features-that-block-6g">Missing 5G Features That Block 6G</a></h2>
+<p>These 5G gaps must be resolved before meaningful 6G simulation is possible:</p>
+<h3 id="priority-1-rlc-layer-critical-blocker"><a class="header" href="#priority-1-rlc-layer-critical-blocker">Priority 1: RLC Layer (CRITICAL BLOCKER)</a></h3>
+<ul>
+<li><strong>Status:</strong> Completely missing</li>
+<li><strong>Impact:</strong> Blocks realistic air interface simulation. Without RLC, there is no proper PDCP/MAC simulation, which means ISAC waveforms, semantic transmission, and AI/ML air interface features cannot be realistically tested.</li>
+<li><strong>Required:</strong> RLC AM, UM, TM entities; encoder/decoder; ARQ procedures</li>
+<li><strong>Estimated effort:</strong> 5,000-8,000 LoC</li>
+</ul>
+<h3 id="priority-2-ue-nas-mm-procedures-70-missing"><a class="header" href="#priority-2-ue-nas-mm-procedures-70-missing">Priority 2: UE NAS MM Procedures (~70% missing)</a></h3>
+<ul>
+<li><strong>Impact:</strong> Blocks advanced mobility scenarios needed for 6G (predictive handover, NTN mobility)</li>
+<li><strong>Required:</strong> Full authentication flow, configuration update, emergency procedures, slice selection, radio capability handling</li>
+<li><strong>Estimated effort:</strong> 3,000-5,000 LoC</li>
+</ul>
+<h3 id="priority-3-ue-nas-sm-procedures-60-missing"><a class="header" href="#priority-3-ue-nas-sm-procedures-60-missing">Priority 3: UE NAS SM Procedures (~60% missing)</a></h3>
+<ul>
+<li><strong>Impact:</strong> Blocks multi-PDU session scenarios, QoS-differentiated flows, network slicing</li>
+<li><strong>Required:</strong> Full PDU session lifecycle (establish, modify, release), resource allocation</li>
+<li><strong>Estimated effort:</strong> 2,000-3,000 LoC</li>
+</ul>
+<h3 id="priority-4-rrc-layer-80-missing-in-ue"><a class="header" href="#priority-4-rrc-layer-80-missing-in-ue">Priority 4: RRC Layer (~80% missing in UE)</a></h3>
+<ul>
+<li><strong>Impact:</strong> Blocks mobility simulation, measurement-based handover, carrier aggregation</li>
+<li><strong>Required:</strong> Full measurement events (A1-A6, B1-B2), RRC re-establishment, cell reselection, conditional handover</li>
+<li><strong>Estimated effort:</strong> 4,000-6,000 LoC</li>
+</ul>
+<h3 id="priority-5-gnb-rrc-improvements"><a class="header" href="#priority-5-gnb-rrc-improvements">Priority 5: gNB RRC Improvements</a></h3>
+<ul>
+<li><strong>Impact:</strong> Current ASN.1 encoding uses placeholders, limiting interoperability</li>
+<li><strong>Required:</strong> Full ASN.1 UPER encoding for all RRC messages, SIB broadcasting</li>
+<li><strong>Estimated effort:</strong> 2,000-3,000 LoC</li>
+</ul>
+<hr>
+<h2 id="prioritized-6g-implementation-roadmap"><a class="header" href="#prioritized-6g-implementation-roadmap">Prioritized 6G Implementation Roadmap</a></h2>
+<h3 id="phase-1-foundation-months-1-3--complete-5g-baseline"><a class="header" href="#phase-1-foundation-months-1-3--complete-5g-baseline">Phase 1: Foundation (Months 1-3) – Complete 5G Baseline</a></h3>
+<ol>
+<li>Implement RLC layer (AM/UM/TM)</li>
+<li>Complete UE NAS MM procedures (auth, config update, slice selection)</li>
+<li>Complete UE NAS SM procedures (full PDU session lifecycle)</li>
+<li>Improve RRC layer (measurement reporting, re-establishment)</li>
+<li>Integrate NWDAF with gNB/UE for real measurement collection</li>
+</ol>
+<h3 id="phase-2-aiml-integration-months-3-6--connect-6g-packages"><a class="header" href="#phase-2-aiml-integration-months-3-6--connect-6g-packages">Phase 2: AI/ML Integration (Months 3-6) – Connect 6G Packages</a></h3>
+<ol>
+<li>Integrate NWDAF task into gNB for analytics collection and consumption</li>
+<li>Replace linear prediction in NWDAF with ONNX model inference (via nextgsim-ai)</li>
+<li>Integrate ISAC with RLS for sensing simulation alongside communication</li>
+<li>Connect agent framework to gNB for autonomous decision-making</li>
+<li>Implement FL participant in UE (local training, model update)</li>
+<li>Add NWDAF TS 23.288 service APIs (AnalyticsSubscription, AnalyticsInfo)</li>
+</ol>
+<h3 id="phase-3-6g-air-interface-months-6-9--channel--phy-simulation"><a class="header" href="#phase-3-6g-air-interface-months-6-9--channel--phy-simulation">Phase 3: 6G Air Interface (Months 6-9) – Channel &amp; PHY Simulation</a></h3>
+<ol>
+<li>Implement channel models in RLS (3GPP TR 38.901, sub-THz extensions)</li>
+<li>Add massive MIMO / beamforming simulation</li>
+<li>Implement RIS channel modeling and control</li>
+<li>Wire the existing NTN link-simulation prototypes (satellite propagation, Doppler, delay) into live paths and make encodings wire-conformant</li>
+<li>Implement semantic communication neural codecs (ONNX-based encoder/decoder)</li>
+<li>Add JSCC (Joint Source-Channel Coding) support</li>
+</ol>
+<h3 id="phase-4-6g-advanced-features-months-9-12--new-capabilities"><a class="header" href="#phase-4-6g-advanced-features-months-9-12--new-capabilities">Phase 4: 6G Advanced Features (Months 9-12) – New Capabilities</a></h3>
+<ol>
+<li>NTN support: prototype modules exist (timing advance, ephemeris, constellation, ISL handover) — remaining work is satellite cell selection, wire-conformant NAS/RRC encodings, and wiring into live signaling</li>
+<li>Post-quantum cryptography: Kyber/Dilithium integration</li>
+<li>Digital twin network framework</li>
+<li>Zero-energy device / ambient IoT simulation (UE-side prototype exists: energy harvesting + fleet sim; extend beyond sim-internal)</li>
+<li>JCC (Joint Communication and Computing) framework</li>
+<li>Enhanced network slicing for 6G (inter-slice coordination, slice SLA)</li>
+</ol>
+<h3 id="phase-5-production-hardening-months-12-18--quality--scale"><a class="header" href="#phase-5-production-hardening-months-12-18--quality--scale">Phase 5: Production Hardening (Months 12-18) – Quality &amp; Scale</a></h3>
+<ol>
+<li>Conformance testing with Open5GS and Free5GC</li>
+<li>Performance benchmarking (100+ UEs, latency profiling)</li>
+<li>ORAN xApp/rApp interface for RAN intelligent controller</li>
+<li>Kubernetes deployment with Helm charts</li>
+<li>Prometheus metrics and OpenTelemetry tracing</li>
+<li>Real FL with SecAgg and proper DP</li>
+<li>LLM integration for NKEF and agent framework</li>
+</ol>
+<hr>
+<h2 id="recommendations"><a class="header" href="#recommendations">Recommendations</a></h2>
+<h3 id="architecture-recommendations"><a class="header" href="#architecture-recommendations">Architecture Recommendations</a></h3>
+<ol>
+<li>
+<p><strong>Unified Vector3/Position type:</strong> The <code>Vector3</code> type is duplicated across nextgsim-nwdaf, nextgsim-isac, and nextgsim-rls. Create a shared type in nextgsim-common to avoid duplication and ensure consistency.</p>
+</li>
+<li>
+<p><strong>Event bus for 6G integration:</strong> The current task-based architecture with point-to-point message channels makes 6G integration complex. Consider adding a publish-subscribe event bus for cross-cutting concerns (measurements, analytics, sensing data).</p>
+</li>
+<li>
+<p><strong>Plugin architecture for 6G modules:</strong> Make 6G packages optional plugins that can be enabled/disabled. This keeps the 5G baseline lightweight while allowing 6G feature testing.</p>
+</li>
+<li>
+<p><strong>Channel model abstraction:</strong> Replace the simple distance-based signal model in RLS with a pluggable channel model interface. This enables adding 3GPP channel models, sub-THz models, RIS models, and NTN propagation models incrementally.</p>
+</li>
+<li>
+<p><strong>Model registry service:</strong> Create a centralized ONNX model registry that NWDAF, ISAC, semantic, and FL can share, with versioning and lifecycle management.</p>
+</li>
+</ol>
+<h3 id="technical-recommendations"><a class="header" href="#technical-recommendations">Technical Recommendations</a></h3>
+<ol>
+<li>
+<p><strong>Start with NWDAF integration:</strong> The highest-value 6G feature to integrate first is NWDAF with the gNB, as it unlocks AI-driven handover, load balancing, and network optimization without requiring PHY-layer changes.</p>
+</li>
+<li>
+<p><strong>Prioritize RLC before 6G PHY:</strong> Without RLC, any 6G air interface simulation will be unrealistic. RLC is the foundation for PDCP, MAC, and ultimately ISAC waveform simulation.</p>
+</li>
+<li>
+<p><strong>Use existing ONNX ecosystem:</strong> The nextgsim-ai ONNX Runtime integration is well-designed. Leverage it to create pre-trained models for NWDAF (trajectory prediction), ISAC (positioning), and semantic (encoding/decoding) rather than building custom ML frameworks.</p>
+</li>
+<li>
+<p><strong>Post-quantum crypto urgency:</strong> 3GPP SA3 is actively studying PQC migration. Adding Kyber and Dilithium support early positions the simulator for testing PQC-enabled procedures ahead of standardization.</p>
+</li>
+</ol>
+<h3 id="testing-recommendations"><a class="header" href="#testing-recommendations">Testing Recommendations</a></h3>
+<ol>
+<li>Add integration tests between 6G packages and the 5G stack</li>
+<li>Create conformance test suites against Open5GS and Free5GC</li>
+<li>Build performance benchmarks for concurrent UE scaling</li>
+<li>Add property-based testing for NAS/NGAP encoding/decoding</li>
+</ol>
+<hr>
+<h2 id="code-metrics-summary"><a class="header" href="#code-metrics-summary">Code Metrics Summary</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Category</th><th>Packages</th><th>Total LoC</th><th>% of Codebase</th></tr>
+</thead>
+<tbody>
+<tr><td>Core Infrastructure</td><td>common, crypto, sctp</td><td>10,574</td><td>17%</td></tr>
+<tr><td>5G Protocol Stack</td><td>nas, ngap, rrc, rls, gtp</td><td>~18,000+</td><td>29%</td></tr>
+<tr><td>Binary Applications</td><td>gnb, ue, cli</td><td>31,461</td><td>50%</td></tr>
+<tr><td>6G AI-Native</td><td>ai, she, nwdaf, nkef, isac, agent, fl, semantic</td><td>8,406</td><td>13%</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>19 packages</strong></td><td><strong>~62,000</strong></td><td><strong>100%</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Note: NGAP and RRC LoC counts are estimated from file sizes as they contain large ASN.1 generated/derived code.</p>
+<hr>
+<p><em>Report generated from source code analysis of all 21 workspace members in the nextgsim Rust workspace.</em></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../gaps/gap-protocols.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../gaps/gap-protocols.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

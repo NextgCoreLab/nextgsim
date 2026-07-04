@@ -1,0 +1,2127 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>NextGSim Documentation</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-0392ca55.css">
+        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-1a495950.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-33e2fae0.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">NextGSim Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/NextgCoreLab/nextgsim" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<p><strong>NextGSim</strong> is a 5G UE and gNB simulator written in pure Rust — no C dependencies from SCTP to ASN.1 PER. It implements a 3GPP Rel-15 baseline with selected Rel-17/18 features, plus a set of 6G exploration prototypes (AI-native crates for sensing, learning, and autonomous agents) that are disabled by default.</p>
+<p>The workspace contains <strong>20 crates</strong> (~200k lines of Rust) producing <strong>3 binaries</strong>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Binary</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nr-gnb</code></td><td>gNodeB simulator — NGAP, RRC, GTP-U, cell management, UE contexts, handover</td></tr>
+<tr><td><code>nr-ue</code></td><td>UE simulator — NAS procedures, RRC state machine, PDU sessions, multi-UE (<code>--num-ues</code>)</td></tr>
+<tr><td><code>nr-cli</code></td><td>Interactive CLI — runtime control, status queries, scenario scripting</td></tr>
+</tbody>
+</table>
+</div>
+<p>NextGSim pairs with the <a href="../index.html">NextGCore</a> core network (AMF/SMF/UPF and friends) for end-to-end runs: full RLS → RRC → NGAP → NAS registration, 5G-AKA authentication, PDU session establishment with GTP-U user plane, and Xn handover (per the TS 23.502 procedure flows).</p>
+<h2 id="crate-layers"><a class="header" href="#crate-layers">Crate Layers</a></h2>
+<p>The workspace is layered from radio link up to AI intelligence:</p>
+<p><strong>Protocol crates</strong> — the wire stack:</p>
+<ul>
+<li><code>nextgsim-nas</code> — 5G NAS codec (registration, authentication, security mode, PDU session, deregistration)</li>
+<li><code>nextgsim-ngap</code> — NGAP ASN.1 PER encoder/decoder for gNB–AMF signaling over SCTP</li>
+<li><code>nextgsim-rrc</code> — RRC setup, reconfiguration, measurement reports, handover (plus unwired NTN prototypes with bespoke encodings)</li>
+<li><code>nextgsim-gtp</code> — GTP-U user-plane tunneling</li>
+<li><code>nextgsim-sctp</code> — pure Rust SCTP, no libsctp</li>
+<li><code>nextgsim-rls</code> — Radio Link Simulation: UE–gNB air interface over UDP</li>
+<li><code>nextgsim-rlc</code> — RLC TM/UM/AM (TS 38.322) with segmentation and AM ARQ</li>
+</ul>
+<p><strong>Core crates</strong> — <code>nextgsim-gnb</code>, <code>nextgsim-ue</code>, <code>nextgsim-cli</code>, <code>nextgsim-common</code> (shared types: SUPI, PLMN, S-NSSAI, QoS, config), and <code>nextgsim-crypto</code> (pure Rust MILENAGE, Snow3G, ZUC, AES, HMAC-SHA256).</p>
+<p><strong>6G AI crates (8)</strong> — research prototypes: <code>nextgsim-ai</code> (sole ONNX Runtime provider for the workspace), <code>nextgsim-she</code> (3-tier compute placement), <code>nextgsim-nwdaf</code> (4-layer analytics), <code>nextgsim-nkef</code> (knowledge graph / RAG context), <code>nextgsim-isac</code> (joint radar-comm sensing, EKF fusion), <code>nextgsim-agent</code> (intent-based RL agents), <code>nextgsim-fl</code> (FedAvg/FedProx, differential privacy), and <code>nextgsim-semantic</code> (JSCC semantic codecs).</p>
+<p>6G modules are opt-in twice over: gNB tasks are spawned only when config flags (<code>isac_enabled</code>, <code>agent_enabled</code>, <code>fl_enabled</code>, …) are set, and UE 6G modules are additionally gated behind Cargo features, so <code>--no-default-features</code> yields a lean 5G-only UE for large-scale load tests.</p>
+<h2 id="honesty-notes"><a class="header" href="#honesty-notes">Honesty Notes</a></h2>
+<p>Read these before quoting capability claims:</p>
+<ul>
+<li><strong>6G / Rel-20 crates are non-normative research prototypes.</strong> No frozen 6G Stage-3 specification exists; these crates prototype 3GPP Stage-1 study material (e.g. TR 22.870 AI-agent use cases, TR 22.837 ISAC, TR 23.700-80 FL) and are disabled by default.</li>
+<li><strong>Matched-sim validated, not third-party certified.</strong> End-to-end behavior is validated against the matched NextGCore simulator and against 3GPP/RFC test vectors — no external certification or interop lab has verified conformance.</li>
+<li><strong>Some ML paths are illustrative stubs.</strong> No trained models ship: the ISAC ML positioning models and the semantic neural codec require user-supplied ONNX models (the default semantic build uses a non-neural fallback), and FL SecAgg is a pairwise-masking simulation demo, not production secure aggregation.</li>
+<li><strong>Rel-17/18 items</strong> (RedCap, XR QoS, SNPN, MINT, UAV) are implemented, but some UE-side prototypes (ProSe, ranging/sidelink, ambient IoT) use sim-internal encodings where no wire spec is implemented.</li>
+</ul>
+<h2 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h2>
+<pre><code class="language-bash">git clone https://github.com/NextgCoreLab/nextgsim.git
+cd nextgsim
+cargo build --release          # builds all 20 crates
+
+./target/release/nr-gnb --config config/gnb.yaml   # terminal 1
+./target/release/nr-ue  --config config/ue.yaml    # terminal 2
+./target/release/nr-cli                            # terminal 3
+</code></pre>
+<p>A <code>docker-compose.yaml</code> is provided for a full RAN deployment ready to connect to a NextGCore AMF/UPF stack.</p>
+<h2 id="where-to-go-next"><a class="header" href="#where-to-go-next">Where to Go Next</a></h2>
+<ul>
+<li><a href="../index.html">Project landing page</a> — hero overview, architecture diagrams, workflows</li>
+<li><a href="../features.html">Feature matrix</a> — per-feature implementation status</li>
+<li><a href="../api.html">CLI &amp; API reference</a> — <code>nr-cli</code> commands and runtime APIs</li>
+</ul>
+<p>NextGSim is licensed under AGPL-3.0. Contributions are welcome — see the contributing guide for setup, the zero-warning style gate (<code>cargo fmt</code> + <code>cargo clippy -D warnings</code>), 3GPP spec-reference rules, and DCO sign-off requirements.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
+<p>NextGSim is a pure-Rust 5G UE and gNB simulator implementing a 3GPP Rel-15 baseline with selected Rel-17/18 features. Rel-20 (6G) items are <strong>non-normative research prototypes</strong> — no frozen 3GPP Stage-3 spec exists — and are disabled by default. NextGSim is validated against its companion core, NextGCore, in end-to-end tests; it is <strong>not</strong> third-party certified, and no conformance is claimed beyond what those tests exercise.</p>
+<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+<p>NextGSim is pure Rust — no C toolchain or external protocol libraries are required for the default build.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Rust (stable)</td><td>≥ 1.75</td><td>Build toolchain</td></tr>
+<tr><td>Docker + docker compose</td><td>≥ 24</td><td>Container runs and E2E testing with NextGCore</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-bash"># macOS (Homebrew)
+brew install rustup
+rustup toolchain install stable
+</code></pre>
+<h2 id="build"><a class="header" href="#build">Build</a></h2>
+<pre><code class="language-bash">git clone https://github.com/NextgCoreLab/nextgsim.git
+cd nextgsim
+
+cargo build --workspace            # debug
+cargo build --workspace --release  # release
+
+# Resulting binaries
+ls target/release/nr-*             # nr-gnb, nr-ue, nr-cli
+</code></pre>
+<p>Build a single component:</p>
+<pre><code class="language-bash">cargo build -p nextgsim-ue    # UE simulator
+cargo build -p nextgsim-gnb   # gNB simulator
+</code></pre>
+<h2 id="run-a-gnb-and-ue-against-a-core"><a class="header" href="#run-a-gnb-and-ue-against-a-core">Run a gNB and UE Against a Core</a></h2>
+<p>Sample configurations live in <code>config/</code>:</p>
+<ul>
+<li><code>gnb.yaml</code>, <code>ue.yaml</code> — defaults, pointed at a NextGCore stack (PLMN 999-70)</li>
+<li><code>gnb-local.yaml</code>, <code>ue-local.yaml</code> — local (non-Docker) addressing</li>
+<li><code>gnb-docker.yaml</code>, <code>ue-docker.yaml</code> — used by the Docker Compose deployment</li>
+<li><code>gnb-kernel.yaml</code> — kernel-SCTP variant (see below)</li>
+<li><code>config/features/</code> — per-feature scenario configs (RedCap, XR, MINT, SNPN accept/reject, UAV allow/deny)</li>
+</ul>
+<pre><code class="language-bash"># Terminal 1: gNB (connects to the AMF configured in gnb.yaml)
+./target/release/nr-gnb --config config/gnb.yaml
+
+# Terminal 2: UE
+./target/release/nr-ue --config config/ue.yaml
+
+# Terminal 3: interactive CLI
+./target/release/nr-cli
+</code></pre>
+<p>Key settings to align with your core (comments in <code>config/gnb.yaml</code> / <code>config/ue.yaml</code>):</p>
+<ul>
+<li><strong>PLMN / TAC / NSSAI</strong> in <code>gnb.yaml</code> must match the AMF configuration (default PLMN 999-70, TAC 1, SST 1).</li>
+<li><strong><code>amf_configs</code></strong> points at the AMF NGAP endpoint (default <code>172.23.0.5:38412</code>, the NextGCore AMF container).</li>
+<li><strong>UE subscriber</strong> (<code>supi</code>, <code>key</code>, <code>op</code>/<code>op_type</code>) must be provisioned in the core’s subscriber database. Default IMSI is <code>999700000000001</code> with well-known test K/OPc values.</li>
+<li><strong>SUCI protection</strong> (<code>protection_scheme</code>) defaults to the null scheme; Profile A/B ECIES key material (TS 33.501 Annex C test vectors, per the config comments) is included commented-out.</li>
+</ul>
+<h3 id="sctp-backend-note"><a class="header" href="#sctp-backend-note">SCTP backend note</a></h3>
+<p>The default NGAP transport is <code>sctp_backend: userspace</code> — an in-process SCTP-over-UDP that interoperates with the NextGCore simulator AMF but <strong>not</strong> a real AMF (the wire is UDP). To associate with a real kernel-SCTP AMF, use a Linux build with the gNB’s <code>kernel-sctp</code> cargo feature and set <code>sctp_backend: kernel</code> (see <code>config/gnb-kernel.yaml</code>); otherwise the connection fails loudly at runtime.</p>
+<h2 id="multi-ue-simulation"><a class="header" href="#multi-ue-simulation">Multi-UE Simulation</a></h2>
+<pre><code class="language-bash"># Simulate 10 UEs with auto-incrementing IMSI
+./target/release/nr-ue --config config/ue.yaml --num-ues 10
+
+# With debug logging
+RUST_LOG=debug ./target/release/nr-gnb --config config/gnb.yaml
+</code></pre>
+<h2 id="docker-compose-full-ran"><a class="header" href="#docker-compose-full-ran">Docker Compose (Full RAN)</a></h2>
+<p><code>docker/docker-compose.yml</code> brings up <code>nextgsim-gnb</code> and <code>nextgsim-ue</code> containers, mounting <code>config/gnb-docker.yaml</code> and <code>config/ue-docker.yaml</code>, pre-networked to reach a NextGCore AMF/UPF stack:</p>
+<pre><code class="language-bash">docker compose up          # start gNB + UE
+docker compose up --build  # rebuild images (e.g. after editing configs)
+</code></pre>
+<h2 id="lean-ue-builds-feature-gated-6g-crates"><a class="header" href="#lean-ue-builds-feature-gated-6g-crates">Lean UE Builds (Feature-Gated 6G Crates)</a></h2>
+<p>The UE binary’s 6G/AI client crates (<code>nextgsim-she</code>, <code>nextgsim-nwdaf</code>, <code>nextgsim-nkef</code>, <code>nextgsim-isac</code>, <code>nextgsim-agent</code>, <code>nextgsim-fl</code>, <code>nextgsim-semantic</code>) are <strong>optional dependencies</strong> — they are compiled in only when explicitly enabled, so the default build is already the lean 5G-only UE:</p>
+<pre><code class="language-bash"># Default: minimal 5G-only UE (no 6G crates compiled)
+cargo build --release -p nextgsim-ue
+
+# Opt into specific 6G research prototypes (crate-named feature flags)
+cargo build --release -p nextgsim-ue \
+  --features "nextgsim-isac,nextgsim-agent,nextgsim-fl"
+</code></pre>
+<p>These 6G features are research explorations only: enabling them compiles prototype code, not standardized protocol behavior.</p>
+<h2 id="testing-and-e2e-with-nextgcore"><a class="header" href="#testing-and-e2e-with-nextgcore">Testing and E2E with NextGCore</a></h2>
+<pre><code class="language-bash">cargo test --workspace          # all unit/integration tests
+cargo test -p nextgsim-ue       # UE only
+cargo test -- --nocapture       # with log output
+</code></pre>
+<p>End-to-end tests require a running NextGCore stack:</p>
+<pre><code class="language-bash"># 1. Start the core (from the sibling nextgcore checkout)
+cd ../nextgcore/docker/rust &amp;&amp; docker compose up -d
+
+# 2. Run the E2E suite
+cd ../../nextgsim
+cargo test -p nextgsim-tests --features e2e
+</code></pre>
+<p>The E2E suite validates the full flow — UE registration through the gNB to the core, PDU session establishment, and GTP-U user-plane traffic — against NextGCore. This is matched-simulator validation between the two projects, not interoperability certification against third-party equipment.</p>
+<h2 id="contributing-checklist"><a class="header" href="#contributing-checklist">Contributing Checklist</a></h2>
+<p>Before submitting changes:</p>
+<pre><code class="language-bash">cargo fmt --all
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+cargo audit    # cargo install cargo-audit
+</code></pre>
+<p>Each protocol module carries a doc comment citing its 3GPP spec (e.g. TS 38.331 NR RRC, TS 38.413 NGAP, TS 24.501 5G NAS); cite the relevant TS section in commits and PRs. See <code>CONTRIBUTING.md</code> for the full process. License: AGPL-3.0.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nextgsim-configuration-reference"><a class="header" href="#nextgsim-configuration-reference">nextgsim Configuration Reference</a></h1>
+<p>This document provides a comprehensive reference for all configuration options available in nextgsim for both gNB (gNodeB) and UE (User Equipment) simulators.</p>
+<h2 id="configuration-file-format"><a class="header" href="#configuration-file-format">Configuration File Format</a></h2>
+<p>Configuration files use YAML format. The configuration is loaded at startup and cannot be changed at runtime.</p>
+<pre><code class="language-bash"># gNB
+./nextgsim-gnb -c config/gnb.yaml
+
+# UE
+./nextgsim-ue -c config/ue.yaml
+</code></pre>
+<hr>
+<h2 id="gnb-configuration"><a class="header" href="#gnb-configuration">gNB Configuration</a></h2>
+<p>The gNB configuration defines parameters for the 5G base station simulator.</p>
+<h3 id="complete-example"><a class="header" href="#complete-example">Complete Example</a></h3>
+<pre><code class="language-yaml"># NR Cell Identity (36-bit value, hex or decimal)
+nci: '0x000000010'
+
+# gNB ID length in bits (22-32)
+gnb_id_length: 24
+
+# Public Land Mobile Network identifier
+plmn:
+  mcc: 001
+  mnc: 01
+  long_mnc: false
+
+# Tracking Area Code (24-bit)
+tac: 1
+
+# Network Slice Selection Assistance Information
+nssai:
+  - sst: 1
+    sd: [0, 0, 1]
+  - sst: 2
+
+# AMF connection configurations
+amf_configs:
+  - address: 127.0.0.5
+    port: 38412
+
+# IP addresses for interfaces
+link_ip: 127.0.0.1
+ngap_ip: 127.0.0.1
+gtp_ip: 127.0.0.1
+gtp_advertise_ip: null
+
+# SCTP stream handling
+ignore_stream_ids: false
+</code></pre>
+<h3 id="parameter-reference"><a class="header" href="#parameter-reference">Parameter Reference</a></h3>
+<h4 id="cell-identity"><a class="header" href="#cell-identity">Cell Identity</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nci</code></td><td>u64</td><td>Yes</td><td>-</td><td>NR Cell Identity (36-bit value). Can be specified in hex (<code>'0x000000010'</code>) or decimal. The NCI contains both the gNB ID and Cell ID.</td></tr>
+<tr><td><code>gnb_id_length</code></td><td>u8</td><td>Yes</td><td>-</td><td>Length of the gNB ID portion within the NCI, in bits. Valid range: 22-32. The Cell ID uses the remaining bits (36 - gnb_id_length).</td></tr>
+</tbody>
+</table>
+</div>
+<p>The NCI is split into:</p>
+<ul>
+<li><strong>gNB ID</strong>: Upper <code>gnb_id_length</code> bits</li>
+<li><strong>Cell ID</strong>: Lower <code>(36 - gnb_id_length)</code> bits</li>
+</ul>
+<p>Example: With <code>nci: 0x123456789</code> and <code>gnb_id_length: 24</code>:</p>
+<ul>
+<li>gNB ID = <code>0x123456</code> (upper 24 bits)</li>
+<li>Cell ID = <code>0x789</code> (lower 12 bits)</li>
+</ul>
+<h4 id="plmn-configuration"><a class="header" href="#plmn-configuration">PLMN Configuration</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>plmn.mcc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Mobile Country Code (3 digits, 000-999)</td></tr>
+<tr><td><code>plmn.mnc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Mobile Network Code (2 or 3 digits)</td></tr>
+<tr><td><code>plmn.long_mnc</code></td><td>bool</td><td>No</td><td>false</td><td>Set to <code>true</code> if MNC is 3 digits (e.g., MNC 001 vs MNC 01)</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="tracking-area"><a class="header" href="#tracking-area">Tracking Area</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tac</code></td><td>u32</td><td>Yes</td><td>-</td><td>Tracking Area Code (24-bit value, 0-16777215)</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="network-slicing-nssai"><a class="header" href="#network-slicing-nssai">Network Slicing (NSSAI)</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nssai</code></td><td>array</td><td>Yes</td><td>-</td><td>List of supported S-NSSAI (Single Network Slice Selection Assistance Information)</td></tr>
+<tr><td><code>nssai[].sst</code></td><td>u8</td><td>Yes</td><td>-</td><td>Slice/Service Type (0-255). Common values: 1=eMBB, 2=URLLC, 3=MIoT</td></tr>
+<tr><td><code>nssai[].sd</code></td><td>[u8; 3]</td><td>No</td><td>null</td><td>Slice Differentiator (24-bit). Specified as 3-byte array <code>[0, 0, 1]</code> or omitted</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="amf-configuration"><a class="header" href="#amf-configuration">AMF Configuration</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>amf_configs</code></td><td>array</td><td>Yes</td><td>-</td><td>List of AMF (Access and Mobility Management Function) endpoints</td></tr>
+<tr><td><code>amf_configs[].address</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>IP address of the AMF (IPv4 or IPv6)</td></tr>
+<tr><td><code>amf_configs[].port</code></td><td>u16</td><td>Yes</td><td>-</td><td>SCTP port of the AMF (typically 38412 per 3GPP)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Multiple AMFs can be configured for redundancy. The gNB will attempt to connect to each in order.</p>
+<h4 id="network-interfaces"><a class="header" href="#network-interfaces">Network Interfaces</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>link_ip</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>Local IP address for RLS (Radio Link Simulation) UDP interface</td></tr>
+<tr><td><code>ngap_ip</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>Local IP address for NGAP/SCTP interface (N2 interface to AMF)</td></tr>
+<tr><td><code>gtp_ip</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>Local IP address for GTP-U interface (N3 interface for user plane)</td></tr>
+<tr><td><code>gtp_advertise_ip</code></td><td>IpAddr</td><td>No</td><td>null</td><td>Advertised GTP IP address for NAT scenarios. If set, this IP is sent to the UPF instead of <code>gtp_ip</code></td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="sctp-options"><a class="header" href="#sctp-options">SCTP Options</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ignore_stream_ids</code></td><td>bool</td><td>No</td><td>false</td><td>If <code>true</code>, ignore SCTP stream ID errors. Useful for compatibility with some core network implementations</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="ntn-research-prototype"><a class="header" href="#ntn-research-prototype">NTN (research prototype)</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ntn_config</code></td><td>object</td><td>No</td><td>null</td><td>Optional NTN (Non-Terrestrial Network) block. <strong>Currently logging-only/inert</strong>: the gNB parses and stores it, but it is not wired into live RRC/NGAP signaling — the NTN modules are non-normative research prototypes</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="ue-configuration"><a class="header" href="#ue-configuration">UE Configuration</a></h2>
+<p>The UE configuration defines parameters for the 5G user equipment simulator.</p>
+<h3 id="complete-example-1"><a class="header" href="#complete-example-1">Complete Example</a></h3>
+<pre><code class="language-yaml"># Subscriber identity
+supi: 'imsi-001010000000001'
+
+# SUCI protection
+protection_scheme: 0
+home_network_public_key_id: 1
+home_network_public_key: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'
+routing_indicator: '0000'
+
+# Home PLMN
+hplmn:
+  mcc: 001
+  mnc: 01
+  long_mnc: false
+
+# Authentication credentials
+key: '465B5CE8B199B49FAA5F0A2EE238A6BC'
+op: 'E8ED289DEBA952E4283B54E88E6183CA'
+op_type: Opc
+amf: '8000'
+
+# Device identity
+imei: '356938035643803'
+imei_sv: '4370816125816151'
+
+# Security algorithms
+supported_algs:
+  nia1: true
+  nia2: true
+  nia3: true
+  nea1: true
+  nea2: true
+  nea3: true
+
+# gNB discovery
+gnb_search_list:
+  - 127.0.0.1
+
+# PDU sessions
+sessions:
+  - type: IPv4
+    apn: internet
+    s_nssai:
+      sst: 1
+    is_emergency: false
+
+# Network slicing
+configured_nssai:
+  slices:
+    - sst: 1
+      sd: [0, 0, 1]
+
+# TUN interface
+tun_name: uesimtun0
+</code></pre>
+<h3 id="parameter-reference-1"><a class="header" href="#parameter-reference-1">Parameter Reference</a></h3>
+<h4 id="subscriber-identity"><a class="header" href="#subscriber-identity">Subscriber Identity</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>supi</code></td><td>string</td><td>No</td><td>null</td><td>Subscription Permanent Identifier. Format: <code>imsi-&lt;15 digits&gt;</code> (e.g., <code>imsi-001010000000001</code>)</td></tr>
+<tr><td><code>imei</code></td><td>string</td><td>No</td><td>null</td><td>International Mobile Equipment Identity (15 digits). Used if SUPI is not provided</td></tr>
+<tr><td><code>imei_sv</code></td><td>string</td><td>No</td><td>null</td><td>IMEI Software Version (16 digits). Used if SUPI and IMEI are not provided</td></tr>
+</tbody>
+</table>
+</div>
+<p>At least one of <code>supi</code>, <code>imei</code>, or <code>imei_sv</code> should be provided for UE identification.</p>
+<h4 id="suci-protection-privacy"><a class="header" href="#suci-protection-privacy">SUCI Protection (Privacy)</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>protection_scheme</code></td><td>u8</td><td>No</td><td>0</td><td>SUCI protection scheme: <code>0</code> = Null scheme (no encryption), <code>1</code> = Profile A (ECIES), <code>2</code> = Profile B</td></tr>
+<tr><td><code>home_network_public_key_id</code></td><td>u8</td><td>No</td><td>0</td><td>Identifier for the home network public key (0-255)</td></tr>
+<tr><td><code>home_network_public_key</code></td><td>string</td><td>No</td><td>“”</td><td>Home network public key for SUCI calculation (hex string). Required for protection schemes 1 and 2</td></tr>
+<tr><td><code>routing_indicator</code></td><td>string</td><td>No</td><td>null</td><td>Routing Indicator for SUCI (4 digits, e.g., <code>"0000"</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="home-plmn"><a class="header" href="#home-plmn">Home PLMN</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>hplmn.mcc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Home PLMN Mobile Country Code (3 digits)</td></tr>
+<tr><td><code>hplmn.mnc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Home PLMN Mobile Network Code (2 or 3 digits)</td></tr>
+<tr><td><code>hplmn.long_mnc</code></td><td>bool</td><td>No</td><td>false</td><td>Set to <code>true</code> if MNC is 3 digits</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="authentication-credentials"><a class="header" href="#authentication-credentials">Authentication Credentials</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>key</code></td><td>string</td><td>Yes</td><td>-</td><td>Subscriber key K (128-bit, 32 hex characters). Shared secret with the network</td></tr>
+<tr><td><code>op</code></td><td>string</td><td>Yes</td><td>-</td><td>Operator key OP or OPc (128-bit, 32 hex characters)</td></tr>
+<tr><td><code>op_type</code></td><td>enum</td><td>No</td><td><code>Opc</code></td><td>Type of operator key: <code>Op</code> (needs conversion to OPc) or <code>Opc</code> (used directly)</td></tr>
+<tr><td><code>amf</code></td><td>string</td><td>No</td><td><code>"8000"</code></td><td>Authentication Management Field (16-bit, 4 hex characters). Default <code>8000</code> per 3GPP</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="security-algorithms"><a class="header" href="#security-algorithms">Security Algorithms</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>supported_algs.nia1</code></td><td>bool</td><td>No</td><td>true</td><td>Support NIA1 (SNOW3G-based integrity)</td></tr>
+<tr><td><code>supported_algs.nia2</code></td><td>bool</td><td>No</td><td>true</td><td>Support NIA2 (AES-based integrity)</td></tr>
+<tr><td><code>supported_algs.nia3</code></td><td>bool</td><td>No</td><td>true</td><td>Support NIA3 (ZUC-based integrity)</td></tr>
+<tr><td><code>supported_algs.nea1</code></td><td>bool</td><td>No</td><td>true</td><td>Support NEA1 (SNOW3G-based ciphering)</td></tr>
+<tr><td><code>supported_algs.nea2</code></td><td>bool</td><td>No</td><td>true</td><td>Support NEA2 (AES-based ciphering)</td></tr>
+<tr><td><code>supported_algs.nea3</code></td><td>bool</td><td>No</td><td>true</td><td>Support NEA3 (ZUC-based ciphering)</td></tr>
+</tbody>
+</table>
+</div>
+<p>The network selects algorithms based on UE capabilities and network policy. NIA0/NEA0 (null algorithms) are always supported.</p>
+<h4 id="gnb-discovery"><a class="header" href="#gnb-discovery">gNB Discovery</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>gnb_search_list</code></td><td>array</td><td>Yes</td><td>-</td><td>List of gNB IP addresses to search for via RLS heartbeats</td></tr>
+</tbody>
+</table>
+</div>
+<p>The UE sends heartbeat messages to all addresses in this list and connects to the gNB with the strongest signal.</p>
+<h4 id="pdu-sessions"><a class="header" href="#pdu-sessions">PDU Sessions</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sessions</code></td><td>array</td><td>No</td><td>[]</td><td>List of PDU sessions to establish after registration</td></tr>
+<tr><td><code>sessions[].type</code></td><td>enum</td><td>No</td><td><code>Ipv4</code></td><td>PDU session type: <code>Ipv4</code>, <code>Ipv6</code>, <code>Ipv4v6</code>, <code>Unstructured</code>, <code>Ethernet</code></td></tr>
+<tr><td><code>sessions[].apn</code></td><td>string</td><td>No</td><td>null</td><td>Access Point Name (Data Network Name)</td></tr>
+<tr><td><code>sessions[].s_nssai</code></td><td>object</td><td>No</td><td>null</td><td>S-NSSAI for the session</td></tr>
+<tr><td><code>sessions[].s_nssai.sst</code></td><td>u8</td><td>Yes</td><td>-</td><td>Slice/Service Type</td></tr>
+<tr><td><code>sessions[].s_nssai.sd</code></td><td>[u8; 3]</td><td>No</td><td>null</td><td>Slice Differentiator</td></tr>
+<tr><td><code>sessions[].is_emergency</code></td><td>bool</td><td>No</td><td>false</td><td>Whether this is an emergency session</td></tr>
+<tr><td><code>sessions[].requested_5qi</code></td><td>u8</td><td>No</td><td>null</td><td>Requested 5QI for the session. Set to an XR delay-critical GBR 5QI (<code>82</code>-<code>85</code>, Rel-18) to request an XR flow; with no <code>apn</code>, the UE auto-selects the matching XR DNN (<code>xr</code>/<code>xr-split</code>/<code>xr-haptic</code>) so the SMF installs an XR QoS flow. See <a href="#rel-1718-feature-configuration-ue">Rel-17/18 Features</a>.</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="network-slicing"><a class="header" href="#network-slicing">Network Slicing</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>configured_nssai</code></td><td>object</td><td>No</td><td>empty</td><td>Configured NSSAI for this UE by HPLMN</td></tr>
+<tr><td><code>configured_nssai.slices</code></td><td>array</td><td>No</td><td>[]</td><td>List of configured S-NSSAIs</td></tr>
+<tr><td><code>configured_nssai.slices[].sst</code></td><td>u8</td><td>Yes</td><td>-</td><td>Slice/Service Type</td></tr>
+<tr><td><code>configured_nssai.slices[].sd</code></td><td>[u8; 3]</td><td>No</td><td>null</td><td>Slice Differentiator</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="tun-interface"><a class="header" href="#tun-interface">TUN Interface</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tun_name</code></td><td>string</td><td>No</td><td>null</td><td>Name for the TUN interface (e.g., <code>uesimtun0</code>). If not specified, a name is auto-generated</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="rel-1718-feature-configuration-ue"><a class="header" href="#rel-1718-feature-configuration-ue">Rel-17/18 Feature Configuration (UE)</a></h4>
+<p>These optional UE fields drive the Rel-17/18 features that are integrated end-to-end with nextgcore. Each is inert unless set.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>redcap</code></td><td>bool</td><td>false</td><td><strong>RedCap</strong> (Reduced Capability, Rel-17 / TS 38.101). When <code>true</code>, the UE signals a reduced-capability indication in the Registration Request (NAS IE <code>0xA9</code>); the AMF caps UE-AMBR and the SMF reduces the session-AMBR (default 150 Mbps DL / 50 Mbps UL, overridable on the SMF via <code>REDCAP_SESS_AMBR_DL_BPS</code> / <code>REDCAP_SESS_AMBR_UL_BPS</code>).</td></tr>
+<tr><td><code>snpn_config</code></td><td>object</td><td>null</td><td><strong>SNPN</strong> access (Rel-17 / TS 23.501 §5.30). Presence makes the UE include the NID in the Registration Request and gate cell selection to a matching broadcast NID.</td></tr>
+<tr><td><code>snpn_config.nid</code></td><td>string</td><td>-</td><td>11-hex-char Network Identifier (e.g. <code>"7AB01234567"</code>). Must match the gNB’s broadcast NID; the AMF accepts it only if it is in <code>AMF_SNPN_ALLOWED_NIDS</code> (or that env is unset = accept any), otherwise rejects with 5GMM cause #75.</td></tr>
+<tr><td><code>snpn_config.cag_ids</code></td><td>[u32]</td><td>[]</td><td>Closed Access Group IDs.</td></tr>
+<tr><td><code>snpn_config.onboarding_enabled</code></td><td>bool</td><td>false</td><td>Request SNPN onboarding / credentials provisioning.</td></tr>
+<tr><td><code>mint_config</code></td><td>object</td><td>null</td><td><strong>MINT</strong> / disaster roaming (Rel-18 / TS 23.761). Models a multi-SUPI UE that, after the primary registers, runs a simultaneous registration per secondary SUPI carrying the disaster-roaming indication (NAS IE <code>0xA7</code>).</td></tr>
+<tr><td><code>mint_config.enabled</code></td><td>bool</td><td>false</td><td>Enable the MINT secondary-subscription driver.</td></tr>
+<tr><td><code>mint_config.secondary_supis</code></td><td>[string]</td><td>[]</td><td>Secondary SUPIs (each must be provisioned in the core’s subscriber DB).</td></tr>
+<tr><td><code>mint_config.simultaneous_registration</code></td><td>bool</td><td>false</td><td>Register secondaries alongside the primary.</td></tr>
+<tr><td><code>mint_config.disaster_roaming</code></td><td>bool</td><td>false</td><td>Set the disaster-roaming indication on secondary registrations.</td></tr>
+<tr><td><code>mint_config.dnn_subscription_map</code></td><td>array</td><td>[]</td><td>Map a session DNN to a secondary subscription index, so that DNN’s PDU session is established under the secondary SUPI.</td></tr>
+<tr><td><code>uav_config</code></td><td>object</td><td>null</td><td><strong>UAV</strong> (Rel-18 / TS 23.256). Registers the UE as an aerial UE and periodically sends a UAV tracking report the AMF checks against its geofence.</td></tr>
+<tr><td><code>uav_config.is_aerial_ue</code></td><td>bool</td><td>false</td><td>Register as an aerial UE (includes UAV indication NAS IE <code>0xA8</code>).</td></tr>
+<tr><td><code>uav_config.uav_id</code></td><td>string</td><td>null</td><td>UAV CAA-level identifier.</td></tr>
+<tr><td><code>uav_config.max_altitude_meters</code></td><td>f64</td><td>-</td><td>Reported flight altitude. Above the AMF geofence ceiling (<code>AMF_UAV_GEOFENCE</code>, default 120 m) → the AMF revokes authorization (geofence deny); within bounds → allow.</td></tr>
+<tr><td><code>uav_config.remote_id_enabled</code></td><td>bool</td><td>false</td><td>Include Remote-ID in tracking reports.</td></tr>
+<tr><td><code>uav_config.c2_link_required</code></td><td>bool</td><td>false</td><td>Request a command-and-control link (modelled).</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p>The corresponding nextgcore env knobs (<code>AMF_SNPN_ALLOWED_NIDS</code>, <code>AMF_UAV_GEOFENCE</code>, <code>REDCAP_SESS_AMBR_DL_BPS</code>/<code>_UL_BPS</code>, the XR DNN→5QI mapping) and ready-to-run example configs are documented in <code>nextgcore/docker/rust/README.md</code> and <code>nextgsim/config/features/</code>.</p>
+</blockquote>
+<hr>
+<h2 id="cli-options"><a class="header" href="#cli-options">CLI Options</a></h2>
+<h3 id="gnb-cli-options"><a class="header" href="#gnb-cli-options">gNB CLI Options</a></h3>
+<pre><code class="language-bash">nextgsim-gnb [OPTIONS] -c &lt;CONFIG&gt;
+
+Options:
+  -c, --config &lt;FILE&gt;    Path to gNB configuration file (required)
+  -l, --disable-cmd      Disable CLI command interface
+  -h, --help             Print help
+  -V, --version          Print version
+</code></pre>
+<h3 id="ue-cli-options"><a class="header" href="#ue-cli-options">UE CLI Options</a></h3>
+<pre><code class="language-bash">nextgsim-ue [OPTIONS] -c &lt;CONFIG&gt;
+
+Options:
+  -c, --config &lt;FILE&gt;    Path to UE configuration file (required)
+  -i, --imsi &lt;IMSI&gt;      Override IMSI from config file
+  -n, --num-of-UE &lt;NUM&gt;  Number of UEs to spawn (1-512, default: 1)
+  -t, --tempo &lt;MS&gt;       Delay in milliseconds between UE starts (default: 0)
+  -l, --disable-cmd      Disable CLI command interface
+  -r, --no-routing-config  Disable TUN routing configuration
+  -h, --help             Print help
+  -V, --version          Print version
+</code></pre>
+<p>When spawning multiple UEs (<code>-n</code>), each UE gets an incremented IMSI (last digits incremented).</p>
+<hr>
+<h2 id="example-configurations"><a class="header" href="#example-configurations">Example Configurations</a></h2>
+<h3 id="open5gs-core"><a class="header" href="#open5gs-core">Open5GS Core</a></h3>
+<p><strong>gNB</strong> (<code>config/open5gs-gnb.yaml</code>):</p>
+<pre><code class="language-yaml">nci: '0x000000010'
+gnb_id_length: 32
+plmn:
+  mcc: 999
+  mnc: 70
+tac: 1
+nssai:
+  - sst: 1
+amf_configs:
+  - address: 127.0.0.5
+    port: 38412
+link_ip: 127.0.0.1
+ngap_ip: 127.0.0.1
+gtp_ip: 127.0.0.1
+ignore_stream_ids: true
+</code></pre>
+<p><strong>UE</strong> (<code>config/open5gs-ue.yaml</code>):</p>
+<pre><code class="language-yaml">supi: 'imsi-999700000000001'
+hplmn:
+  mcc: 999
+  mnc: 70
+key: '465B5CE8B199B49FAA5F0A2EE238A6BC'
+op: 'E8ED289DEBA952E4283B54E88E6183CA'
+op_type: Opc
+amf: '8000'
+gnb_search_list:
+  - 127.0.0.1
+sessions:
+  - type: IPv4
+    apn: internet
+    s_nssai:
+      sst: 1
+configured_nssai:
+  slices:
+    - sst: 1
+</code></pre>
+<h3 id="free5gc-core"><a class="header" href="#free5gc-core">Free5GC Core</a></h3>
+<p><strong>gNB</strong> (<code>config/free5gc-gnb.yaml</code>):</p>
+<pre><code class="language-yaml">nci: '0x000000010'
+gnb_id_length: 32
+plmn:
+  mcc: 208
+  mnc: 93
+tac: 1
+nssai:
+  - sst: 1
+    sd: [0, 1, 2]
+amf_configs:
+  - address: 127.0.0.1
+    port: 38412
+link_ip: 127.0.0.1
+ngap_ip: 127.0.0.1
+gtp_ip: 127.0.0.1
+ignore_stream_ids: true
+</code></pre>
+<p><strong>UE</strong> (<code>config/free5gc-ue.yaml</code>):</p>
+<pre><code class="language-yaml">supi: 'imsi-208930000000001'
+hplmn:
+  mcc: 208
+  mnc: 93
+key: '8baf473f2f8fd09487cccbd7097c6862'
+op: '8e27b6af0e692e750f32667a3b14605d'
+op_type: Opc
+amf: '8000'
+gnb_search_list:
+  - 127.0.0.1
+sessions:
+  - type: IPv4
+    apn: internet
+    s_nssai:
+      sst: 1
+      sd: [0, 1, 2]
+configured_nssai:
+  slices:
+    - sst: 1
+      sd: [0, 1, 2]
+</code></pre>
+<hr>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<h3 id="common-configuration-issues"><a class="header" href="#common-configuration-issues">Common Configuration Issues</a></h3>
+<ol>
+<li>
+<p><strong>PLMN Mismatch</strong>: Ensure <code>plmn</code> (gNB) matches <code>hplmn</code> (UE) for the UE to register.</p>
+</li>
+<li>
+<p><strong>NSSAI Mismatch</strong>: The UE’s <code>configured_nssai</code> must include slices supported by the gNB’s <code>nssai</code>.</p>
+</li>
+<li>
+<p><strong>Authentication Failure</strong>: Verify <code>key</code>, <code>op</code>, and <code>op_type</code> match the subscriber profile in the core network.</p>
+</li>
+<li>
+<p><strong>Connection Timeout</strong>: Check that <code>amf_configs</code> addresses are reachable and the AMF is running.</p>
+</li>
+<li>
+<p><strong>gNB Not Found</strong>: Ensure <code>gnb_search_list</code> contains the correct gNB <code>link_ip</code> address.</p>
+</li>
+</ol>
+<h3 id="logging"><a class="header" href="#logging">Logging</a></h3>
+<p>Enable debug logging to troubleshoot configuration issues:</p>
+<pre><code class="language-bash">RUST_LOG=debug ./nextgsim-ue -c config.yaml
+RUST_LOG=nextgsim_nas=trace ./nextgsim-ue -c config.yaml
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nr-cli-reference"><a class="header" href="#nr-cli-reference">nr-cli Reference</a></h1>
+<p><code>nr-cli</code> is nextgsim’s control tool for inspecting and driving running UE and gNB instances, modeled on UERANSIM’s CLI (<code>nextgsim-cli/src/main.rs</code>). A second binary, <code>nr-loadtest</code>, provides multi-UE load testing (<code>src/loadtest_main.rs</code>).</p>
+<blockquote>
+<p><strong>Scope note:</strong> these commands drive the simulator’s own UE/gNB processes. Behavior is validated by the project’s tests and matched-simulator E2E runs, not third-party certified. Commands mentioning 6G features are non-normative research prototypes.</p>
+</blockquote>
+<h2 id="invocation"><a class="header" href="#invocation">Invocation</a></h2>
+<pre><code class="language-text">nr-cli [NODE] [-d|--dump] [-e|--exec &lt;COMMAND&gt;]
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument / flag</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NODE</code></td><td>Node name to connect to (e.g. <code>ue1</code>, <code>gnb1</code>); validated for min/max length</td></tr>
+<tr><td><code>-d</code>, <code>--dump</code></td><td>List all running nodes and exit</td></tr>
+<tr><td><code>-e</code>, <code>--exec &lt;COMMAND&gt;</code></td><td>Run a single node command non-interactively and exit (non-zero exit code on command error)</td></tr>
+</tbody>
+</table>
+</div>
+<p>With a node name and no <code>--exec</code>, <code>nr-cli</code> opens an interactive prompt (<code>&lt;node&gt;&gt; </code>); <code>help</code> prints command hints, <code>exit</code>/<code>quit</code> (or EOF) leaves.</p>
+<h3 id="how-discovery-and-transport-work"><a class="header" href="#how-discovery-and-transport-work">How discovery and transport work</a></h3>
+<p>Running gNB/UE instances register in a process-table directory (<code>/tmp/nextgsim.proc-table/</code>, see <code>src/proc_table.rs</code>). <code>nr-cli --dump</code> scans it; connecting resolves the node’s command port and talks to it over a local UDP socket on <code>127.0.0.1</code> (<code>src/client.rs</code>). Entries with a mismatched nextgsim version are skipped and reported.</p>
+<pre><code class="language-console">$ nr-cli --dump
+ue1
+gnb1
+$ nr-cli ue1 -e status
+$ nr-cli gnb1          # interactive session
+</code></pre>
+<h2 id="ue-node-commands"><a class="header" href="#ue-node-commands">UE node commands</a></h2>
+<p>Parsed in <code>nextgsim-ue/src/app/task.rs</code> (<code>parse_ue_cli_command</code>) and executed by <code>nextgsim-ue/src/app/cli_handler.rs</code>, which triggers the corresponding NAS procedures.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>info</code></td><td>UE information (SUPI, active PDU sessions, pending procedures) as YAML</td></tr>
+<tr><td><code>status</code></td><td>RM/MM state, MM sub-state, and PDU session list as YAML</td></tr>
+<tr><td><code>ps-list</code></td><td>Alias for <code>status</code> (shows PDU sessions)</td></tr>
+<tr><td><code>timers</code></td><td>Active NAS session-management timers (e.g. T3580/T3582)</td></tr>
+<tr><td><code>deregister [--switch-off|-s]</code></td><td>Initiate deregistration; <code>--switch-off</code> sends switch-off cause and does not wait for a response</td></tr>
+<tr><td><code>ps-establish [--type|-t &lt;ipv4|ipv6|ipv4v6|unstructured|ethernet&gt;] [--apn|-a &lt;apn&gt;] [--sst|-s &lt;sst&gt;]</code></td><td>Establish a PDU session (default type IPv4; PSI/PTI auto-allocated)</td></tr>
+<tr><td><code>ps-release &lt;psi&gt;</code></td><td>Release PDU session with PSI 1–15</td></tr>
+<tr><td><code>ps-release-all</code></td><td>Release all active PDU sessions</td></tr>
+<tr><td><code>emergency-register</code></td><td>Initiate emergency registration (only from DEREGISTERED state)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Preconditions are enforced: <code>deregister</code>, <code>ps-establish</code>, <code>ps-release</code>, and <code>ps-release-all</code> require the UE to be RM-REGISTERED (and MM-REGISTERED for session commands); violations return an <code>ERROR:</code> response instead of acting.</p>
+<pre><code class="language-console">$ nr-cli ue1 -e "ps-establish --type IPv4 --apn internet"
+OK: Initiating PDU session establishment (PSI: 1, PTI: 1, Type: IPv4)
+$ nr-cli ue1 -e "ps-release 1"
+$ nr-cli ue1 -e "deregister --switch-off"
+</code></pre>
+<h2 id="gnb-node-commands"><a class="header" href="#gnb-node-commands">gNB node commands</a></h2>
+<p>Parsed and handled in <code>nextgsim-gnb/src/app/cmd_handler.rs</code> (<code>parse_cli_command</code>).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>info</code></td><td>gNB configuration/information as YAML</td></tr>
+<tr><td><code>status</code></td><td>gNB runtime status as YAML</td></tr>
+<tr><td><code>amf-list</code></td><td>List connected AMFs</td></tr>
+<tr><td><code>ue-list</code></td><td>List UEs attached via this gNB</td></tr>
+<tr><td><code>ue-info &lt;ue-id&gt;</code></td><td>Details for one UE by numeric ID</td></tr>
+<tr><td><code>ue-release &lt;ue-id&gt;</code></td><td>Release the RRC/NGAP context of a UE by numeric ID</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-console">$ nr-cli gnb1 -e ue-list
+$ nr-cli gnb1 -e "ue-info 1"
+$ nr-cli gnb1 -e "ue-release 1"
+</code></pre>
+<h3 id="help-text-vs-accepted-commands"><a class="header" href="#help-text-vs-accepted-commands">Help text vs. accepted commands</a></h3>
+<p>The interactive <code>help</code> output in <code>main.rs</code> also advertises 6G-feature commands (<code>nwdaf-query</code>, <code>she-offload</code>, <code>isac-sense</code>, <code>fl-train</code>, <code>semantic-encode</code> for UEs; <code>nwdaf-status</code>, <code>she-status</code>, <code>isac-config</code>, <code>fl-status</code>, <code>semantic-status</code>, <code>amf-status</code> for gNBs). These are <strong>not present in the UE/gNB command parsers</strong> listed above and will return <code>Unknown command</code>; treat the tables above (grounded in the parser code) as authoritative.</p>
+<h2 id="nr-loadtest"><a class="header" href="#nr-loadtest">nr-loadtest</a></h2>
+<p>Multi-UE load-testing binary against a 5G core (<code>src/loadtest_main.rs</code>, <code>src/loadtest.rs</code>). Exits non-zero if the registration success rate is below 90%.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--ues &lt;N&gt;</code></td><td>10</td><td>Number of UEs to simulate</td></tr>
+<tr><td><code>--rate &lt;N&gt;</code></td><td>5</td><td>Registrations per second (0 = burst)</td></tr>
+<tr><td><code>--gnb-addr &lt;IP&gt;</code></td><td>127.0.0.100</td><td>gNB address</td></tr>
+<tr><td><code>--amf-addr &lt;IP&gt;</code></td><td>127.0.0.5</td><td>AMF address</td></tr>
+<tr><td><code>--base-imsi &lt;IMSI&gt;</code></td><td>999700000000001</td><td>Base IMSI, incremented per UE</td></tr>
+<tr><td><code>--dnn &lt;name&gt;</code></td><td>internet</td><td>DNN for PDU sessions</td></tr>
+<tr><td><code>--sst &lt;N&gt;</code></td><td>1</td><td>S-NSSAI SST</td></tr>
+<tr><td><code>--duration &lt;secs&gt;</code></td><td>0</td><td>Test duration limit (0 = unlimited)</td></tr>
+<tr><td><code>--skip-pdu</code></td><td>off</td><td>Skip PDU session establishment</td></tr>
+<tr><td><code>--ping</code></td><td>off</td><td>Ping test after PDU session setup</td></tr>
+<tr><td><code>--log-level &lt;lvl&gt;</code></td><td>info</td><td>Log verbosity</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-console">$ nr-loadtest --ues 100 --rate 20 --amf-addr 10.0.0.5 --ping
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="features--apis"><a class="header" href="#features--apis">Features &amp; APIs</a></h1>
+<h2 id="supported-features-matrix"><a class="header" href="#supported-features-matrix">Supported-Features Matrix</a></h2>
+<p>The <a href="../features.html">feature matrix</a> lists the gNB and UE feature surfaces actually wired into
+live task code — NGAP/RRC/NAS procedures, user plane, and Rel-17/18 + 6G prototype rows — each
+with its governing 3GPP spec and an honest status badge (<strong>implemented</strong> / <strong>partial</strong> /
+<strong>prototype</strong>).</p>
+<h2 id="cli--api"><a class="header" href="#cli--api">CLI &amp; API</a></h2>
+<p>The <a href="../api.html">CLI &amp; API page</a> documents the runtime control surface. See also the
+<a href="#nr-cli-reference">nr-cli Reference</a> chapter in this book.</p>
+<h2 id="validation-status"><a class="header" href="#validation-status">Validation status</a></h2>
+<p>E2E validation runs against the matched NextGCore 5G core (Docker recipe in
+<a href="#getting-started">Getting Started</a>). This proves internal consistency of the pair — it is
+<strong>not</strong> third-party conformance certification. The 6G/AI crates are non-normative research
+prototypes of 3GPP Stage-1 studies; several Rel-17/18 features use sim-internal encodings where
+no wire spec is implemented (see the feature matrix for per-row status).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nextgsim-6g-gap-analysis-report"><a class="header" href="#nextgsim-6g-gap-analysis-report">nextgsim 6G Gap Analysis Report</a></h1>
+<p><strong>Date:</strong> 2026-02-07
+<strong>Scope:</strong> All 21 workspace packages in the nextgsim Rust workspace
+<strong>Reference Standards:</strong> 3GPP Rel-18/19, ITU-R IMT-2030 Framework, 3GPP TS 23.288, TR 22.837, TR 23.700-80</p>
+<hr>
+<h2 id="executive-summary"><a class="header" href="#executive-summary">Executive Summary</a></h2>
+<p>nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently at approximately <strong>40-50% parity with UERANSIM</strong> for 5G functionality and approximately <strong>25-30% readiness for 6G</strong> simulation capabilities.</p>
+<p><strong>Strengths:</strong></p>
+<ul>
+<li>Solid 5G control plane foundation (NAS, NGAP, RRC, SCTP) with working registration and PDU session establishment</li>
+<li>Data plane operational (GTP-U tunneling, TUN interfaces, loopback mode, ping working)</li>
+<li>Full 5G crypto stack (Milenage, SNOW3G, ZUC, AES, ECIES)</li>
+<li>6G AI-native packages created with well-structured architectures (8 packages totaling ~8,400 LoC)</li>
+<li>ONNX Runtime integration for ML inference with GPU acceleration support</li>
+</ul>
+<p><strong>Critical Gaps:</strong></p>
+<ul>
+<li>RLC layer completely missing (blocks realistic air interface simulation)</li>
+<li>UE NAS MM/SM procedures ~60-70% incomplete</li>
+<li>UE RRC layer ~80% incomplete (handover, re-establishment, measurements)</li>
+<li>6G packages have structural frameworks but lack integration with the 5G stack</li>
+<li>No RIS, NTN, sub-THz, zero-energy device, digital twin, or JCC support</li>
+<li>No ORAN fronthaul or xApp/rApp interfaces</li>
+</ul>
+<p><strong>Estimated 6G readiness timeline:</strong> 12-18 months to reach baseline 6G simulation capability with current architecture.</p>
+<hr>
+<h2 id="package-by-package-analysis"><a class="header" href="#package-by-package-analysis">Package-by-Package Analysis</a></h2>
+<h3 id="summary-table"><a class="header" href="#summary-table">Summary Table</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Package</th><th>Category</th><th>LoC</th><th>Completion</th><th>Status</th><th>Critical 6G Gaps</th></tr>
+</thead>
+<tbody>
+<tr><td>nextgsim-common</td><td>Core</td><td>5,154</td><td>85%</td><td>Functional</td><td>Needs 6G config types (RIS, NTN, ISAC params)</td></tr>
+<tr><td>nextgsim-crypto</td><td>Core</td><td>4,090</td><td>90%</td><td>Functional</td><td>Missing post-quantum crypto (Kyber, Dilithium)</td></tr>
+<tr><td>nextgsim-sctp</td><td>Core</td><td>1,330</td><td>75%</td><td>Functional</td><td>No multi-homing, path MTU, bundling</td></tr>
+<tr><td>nextgsim-nas</td><td>5G Protocol</td><td>10,252</td><td>60%</td><td>Partial</td><td>Missing config update, emergency, EAP-AKA’ reauth</td></tr>
+<tr><td>nextgsim-ngap</td><td>5G Protocol</td><td>~365K bytes</td><td>70%</td><td>Functional</td><td>Handover basic only, no AMF load balancing</td></tr>
+<tr><td>nextgsim-rrc</td><td>5G Protocol</td><td>~140K bytes</td><td>40%</td><td>Basic</td><td>No measurement report, handover, re-establishment, CA</td></tr>
+<tr><td>nextgsim-rls</td><td>5G Protocol</td><td>1,962</td><td>80%</td><td>Functional</td><td>No channel modeling, MIMO, beamforming sim</td></tr>
+<tr><td>nextgsim-gtp</td><td>5G Protocol</td><td>1,306</td><td>70%</td><td>Functional</td><td>Basic QoS/extension headers only</td></tr>
+<tr><td>nextgsim-gnb</td><td>Binary</td><td>12,051</td><td>55%</td><td>Working</td><td>No NWDAF/ISAC/agent integration</td></tr>
+<tr><td>nextgsim-ue</td><td>Binary</td><td>18,390</td><td>50%</td><td>Working</td><td>No FL/semantic integration, RRC ~80% missing</td></tr>
+<tr><td>nextgsim-cli</td><td>Binary</td><td>1,020</td><td>70%</td><td>Functional</td><td>No 6G-specific commands</td></tr>
+<tr><td>nextgsim-ai</td><td>6G AI</td><td>2,432</td><td>65%</td><td>Functional</td><td>No training, model lifecycle management</td></tr>
+<tr><td>nextgsim-she</td><td>6G AI</td><td>2,726</td><td>60%</td><td>Functional</td><td>No actual edge node deployment, no K8s integration</td></tr>
+<tr><td>nextgsim-nwdaf</td><td>6G AI</td><td>522</td><td>35%</td><td>Prototype</td><td>Linear extrapolation only, no ML models, no TS 23.288 services</td></tr>
+<tr><td>nextgsim-nkef</td><td>6G AI</td><td>476</td><td>30%</td><td>Prototype</td><td>Keyword search only, no real vector embeddings/LLM</td></tr>
+<tr><td>nextgsim-isac</td><td>6G AI</td><td>487</td><td>35%</td><td>Prototype</td><td>Simplified fusion, no real Kalman/particle filter</td></tr>
+<tr><td>nextgsim-agent</td><td>6G AI</td><td>608</td><td>40%</td><td>Prototype</td><td>Simplified intent processing, no real multi-agent coordination</td></tr>
+<tr><td>nextgsim-fl</td><td>6G AI</td><td>628</td><td>45%</td><td>Prototype</td><td>FedAvg only, simplified DP noise, no SecAgg crypto</td></tr>
+<tr><td>nextgsim-semantic</td><td>6G AI</td><td>527</td><td>30%</td><td>Prototype</td><td>Mean-pooling encoder only, no neural codec, no JSCC</td></tr>
+<tr><td>tests</td><td>Testing</td><td>-</td><td>20%</td><td>Basic</td><td>No integration tests, no conformance testing</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="detailed-package-analysis"><a class="header" href="#detailed-package-analysis">Detailed Package Analysis</a></h2>
+<h3 id="1-core-infrastructure"><a class="header" href="#1-core-infrastructure">1. Core Infrastructure</a></h3>
+<h4 id="nextgsim-common-5154-loc--85-complete"><a class="header" href="#nextgsim-common-5154-loc--85-complete">nextgsim-common (5,154 LoC) – 85% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>BitBuffer, BitString, OctetString, OctetView (binary data handling)</li>
+<li>GnbConfig, UeConfig, AmfConfig (configuration structures)</li>
+<li>CLI server with process table and command routing</li>
+<li>UDP transport layer</li>
+<li>Structured logging with hex dump and protocol-specific formatters</li>
+<li>Common types (PLMN, TAI, S-NSSAI, etc.)</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>No RLC-related configuration types</li>
+<li>Some optional NAS IEs not represented in types</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No RIS configuration types (panel geometry, reflection coefficients, phase control)</li>
+<li>NTN configuration prototypes exist (gNB <code>ntn_config</code> YAML block, orbit/delay models in the rrc crate) but are logging-only/unwired</li>
+<li>No sub-THz/THz channel configuration parameters</li>
+<li>No ISAC sensing configuration types</li>
+<li>No network slicing enhancement types for 6G (inter-slice coordination)</li>
+<li>No digital twin configuration</li>
+<li>No zero-energy device parameters</li>
+</ul>
+<h4 id="nextgsim-crypto-4090-loc--90-complete"><a class="header" href="#nextgsim-crypto-4090-loc--90-complete">nextgsim-crypto (4,090 LoC) – 90% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Milenage (5G-AKA) – 959 LoC, full implementation with test vectors</li>
+<li>SNOW3G (NEA1/NIA1) – 602 LoC</li>
+<li>ZUC (NEA3/NIA3) – 360 LoC, using external crate</li>
+<li>AES-based (NEA2/NIA2) – 315 LoC</li>
+<li>Key derivation functions (KDF) – 663 LoC</li>
+<li>ECIES for SUPI concealment – 376 LoC</li>
+<li>NIA (integrity algorithms) – 496 LoC</li>
+<li>NEA (ciphering algorithms) – 301 LoC</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Additional test vector validation needed</li>
+<li>EAP-AKA’ re-authentication not fully tested</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li><strong>Post-quantum cryptography (PQC):</strong> No Kyber (ML-KEM), Dilithium (ML-DSA), or SPHINCS+ support. 3GPP SA3 is studying PQC migration per TR 33.871. This is critical for 6G security.</li>
+<li><strong>Homomorphic encryption:</strong> No support for privacy-preserving computation needed for federated learning</li>
+<li><strong>Zero-knowledge proofs:</strong> Not implemented (useful for privacy-preserving authentication in 6G)</li>
+<li><strong>Quantum key distribution (QKD):</strong> No QKD integration framework</li>
+<li><strong>Physical layer security:</strong> No PLS primitives (channel-based key generation)</li>
+</ul>
+<h4 id="nextgsim-sctp-1330-loc--75-complete"><a class="header" href="#nextgsim-sctp-1330-loc--75-complete">nextgsim-sctp (1,330 LoC) – 75% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>SCTP association management (client mode)</li>
+<li>SCTP server mode (for accepting connections)</li>
+<li>Async tokio-based interface over sctp-proto Sans-IO</li>
+<li>Multi-stream support for NGAP (PPID 60)</li>
+<li>Graceful shutdown</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>No multi-homing support</li>
+<li>No path MTU discovery</li>
+<li>No bundling optimization</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No QUIC transport alternative (being studied for next-gen signaling)</li>
+<li>No transport layer support for NTN high-latency links</li>
+</ul>
+<hr>
+<h3 id="2-5g-protocol-stack"><a class="header" href="#2-5g-protocol-stack">2. 5G Protocol Stack</a></h3>
+<h4 id="nextgsim-nas-10252-loc--60-complete"><a class="header" href="#nextgsim-nas-10252-loc--60-complete">nextgsim-nas (10,252 LoC) – 60% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>NAS header encoding/decoding (plain MM, plain SM, security protected)</li>
+<li>Registration messages: Request, Accept, Reject, Complete (1,709 LoC)</li>
+<li>Authentication messages: Request, Response, Reject, Failure, Result (1,226 LoC)</li>
+<li>Deregistration messages (485 LoC)</li>
+<li>Security Mode messages (821 LoC)</li>
+<li>Service Request/Accept/Reject messages (767 LoC)</li>
+<li>Identity messages (362 LoC)</li>
+<li>5GMM Status messages (146 LoC)</li>
+<li>PDU Session Establishment messages (725 LoC)</li>
+<li>PDU Session Modification messages (1,041 LoC)</li>
+<li>EAP framework (EAP-AKA’)</li>
+<li>NAS security (ciphering, integrity, MAC computation) – 2,046 LoC</li>
+<li>Type 1 IEs (39,045 LoC) and Type 3 IEs (32,936 LoC)</li>
+<li>Capture tests for real packet validation</li>
+</ul>
+<p><strong>5G Gaps (from TODO.txt):</strong></p>
+<ul>
+<li>Missing NAS SM: PDU session release messages</li>
+<li>Missing NAS MM: Configuration update handling, emergency registration</li>
+<li>Optional IEs not fully implemented</li>
+<li>Some EAP-AKA’ edge cases untested</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No AI/ML-assisted NAS procedure signaling extensions</li>
+<li>NTN NAS data models (satellite timing advance, ephemeris) exist as bespoke prototypes — not wire-conformant, no sender wired into live UE paths</li>
+<li>No network slicing enhancement IEs for 6G</li>
+<li>No support for zero-energy device simplified NAS procedures</li>
+</ul>
+<h4 id="nextgsim-ngap-procedures-364k-bytes-across-10-files--70-complete"><a class="header" href="#nextgsim-ngap-procedures-364k-bytes-across-10-files--70-complete">nextgsim-ngap (procedures: ~364K bytes across 10 files) – 70% Complete</a></h4>
+<p><strong>Implemented (with ASN.1 PER encoding/decoding):</strong></p>
+<ul>
+<li>NG Setup procedure (32,363 bytes)</li>
+<li>Initial UE Message (28,049 bytes)</li>
+<li>Initial Context Setup (45,949 bytes)</li>
+<li>NAS Transport (UL/DL) (29,979 bytes)</li>
+<li>PDU Session Resource (53,058 bytes)</li>
+<li>UE Context Release (37,677 bytes)</li>
+<li>Error Indication (40,748 bytes)</li>
+<li>Handover procedure (73,652 bytes) – basic implementation</li>
+<li>Paging (22,395 bytes) – basic implementation</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Handover: Basic implementation only (no inter-AMF, no path switch)</li>
+<li>Paging: Needs optimization</li>
+<li>No AMF load balancing</li>
+<li>No UE TNLA binding update</li>
+<li>No secondary RAT data usage reporting</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No NGAP extensions for ISAC sensing data transfer</li>
+<li>No NGAP extensions for AI/ML model distribution</li>
+<li>NTN NGAP support module exists (off-wire, bespoke) — no wire-conformant NTN NGAP procedures</li>
+<li>No RIS control plane signaling via NGAP</li>
+<li>No multi-connectivity (DC/MC) enhanced procedures</li>
+</ul>
+<h4 id="nextgsim-rrc-procedures-126k-bytes-across-6-files--40-complete"><a class="header" href="#nextgsim-rrc-procedures-126k-bytes-across-6-files--40-complete">nextgsim-rrc (procedures: ~126K bytes across 6 files) – 40% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>RRC Setup procedure (29,177 bytes)</li>
+<li>RRC Release procedure (16,206 bytes)</li>
+<li>RRC Reconfiguration (17,564 bytes)</li>
+<li>Security Mode Command/Complete (20,633 bytes)</li>
+<li>System Information (26,968 bytes)</li>
+<li>Information Transfer (UL/DL) (15,607 bytes)</li>
+<li>ASN.1 UPER codec</li>
+</ul>
+<p><strong>In gNB RRC task (nextgsim-gnb/src/rrc/):</strong></p>
+<ul>
+<li>Connection management (472 LoC)</li>
+<li>Handover procedure (531 LoC) – recently added</li>
+<li>UE context management (440 LoC)</li>
+</ul>
+<p><strong>In UE RRC task (nextgsim-ue/src/rrc/):</strong></p>
+<ul>
+<li>Cell selection (815 LoC) – recently added</li>
+<li>Handover (403 LoC) – recently added</li>
+<li>Measurement reporting (580 LoC) – recently added</li>
+<li>RRC state machine (640 LoC)</li>
+<li>RRC task processing (825 LoC)</li>
+</ul>
+<p><strong>5G Gaps (critical - from TODO.txt):</strong></p>
+<ul>
+<li>Full ASN.1-based RRC message encoding uses placeholders in gNB</li>
+<li>RRC re-establishment not implemented</li>
+<li>Carrier aggregation not supported</li>
+<li>Proper measurement reporting events (A1-A6, B1-B2) partially implemented</li>
+<li>Cell reselection procedures incomplete</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No AI/ML-based RRC procedure optimization (predictive handover)</li>
+<li>No RIS beam management via RRC</li>
+<li>NTN RRC prototypes exist (timing advance, link sim, constellation, ISL handover in nextgsim-rrc) but use bespoke encodings and are not wired into live signaling; no satellite cell selection or Doppler pre-compensation</li>
+<li>No sub-THz beam tracking procedures</li>
+<li>No wire-conformant sidelink/D2D RRC support (a UE-side ProSe/ranging prototype now exists, sim-internal only)</li>
+<li>No dual connectivity (EN-DC, NR-DC) RRC procedures</li>
+<li>No conditional handover (CHO) / DAPS handover support</li>
+</ul>
+<h4 id="nextgsim-rls-1962-loc--80-complete"><a class="header" href="#nextgsim-rls-1962-loc--80-complete">nextgsim-rls (1,962 LoC) – 80% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>RLS protocol messages: Heartbeat, HeartbeatAck, PduTransmission, PduTransmissionAck</li>
+<li>Cell search (UE side): cell discovery with signal strength</li>
+<li>Cell tracking (gNB side): UE tracking with timeout management</li>
+<li>RRC and user plane data transport with PDU management</li>
+<li>Binary codec with full encode/decode</li>
+<li>Position-based signal strength simulation (Vector3)</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Simplified signal propagation model (distance-only)</li>
+<li>No fading/shadowing simulation</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li><strong>Channel modeling:</strong> No 3GPP TR 38.901 channel models, no sub-THz channel models</li>
+<li><strong>MIMO/Beamforming:</strong> No massive MIMO simulation, no beam management</li>
+<li><strong>RIS integration:</strong> No reflective surface path modeling</li>
+<li><strong>NTN propagation:</strong> Prototype link simulation exists (delay/Doppler/link models in nextgsim-rrc) but is not integrated with the RLS channel path</li>
+<li><strong>Spectrum:</strong> No sub-THz/THz propagation models (molecular absorption, weather effects)</li>
+<li><strong>Sensing:</strong> No radar-like waveform simulation for ISAC</li>
+<li><strong>D2D/Sidelink:</strong> No direct UE-to-UE communication simulation</li>
+</ul>
+<h4 id="nextgsim-gtp-1306-loc--70-complete"><a class="header" href="#nextgsim-gtp-1306-loc--70-complete">nextgsim-gtp (1,306 LoC) – 70% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>GTP-U header encoding/decoding (769 LoC) per TS 29.281</li>
+<li>GTP-U message types (G-PDU, Echo Req/Rsp, Error Indication, End Marker)</li>
+<li>Extension header support (PDU Session Container, basic)</li>
+<li>Tunnel management with UE/PSI session tracking (486 LoC)</li>
+<li>Sequence number handling</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Extension headers: Basic support only</li>
+<li>QoS flow handling: Simplified</li>
+<li>End marker handling: Basic</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No QoS flow identifier (QFI) based traffic differentiation for 6G slicing</li>
+<li>No GTP-U extensions for URLLC/time-sensitive networking</li>
+<li>No compute-aware forwarding extensions (JCC)</li>
+<li>No semantic-aware forwarding</li>
+<li>No network coding support</li>
+</ul>
+<hr>
+<h3 id="3-binary-applications"><a class="header" href="#3-binary-applications">3. Binary Applications</a></h3>
+<h4 id="nextgsim-gnb-12051-loc--55-complete"><a class="header" href="#nextgsim-gnb-12051-loc--55-complete">nextgsim-gnb (12,051 LoC) – 55% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Task-based actor architecture: App, NGAP, RRC, GTP, RLS, SCTP tasks</li>
+<li>NG Setup with AMF</li>
+<li>Initial UE message handling</li>
+<li>NAS transport (UL/DL) relay</li>
+<li>PDU session resource setup</li>
+<li>GTP-U tunneling with loopback mode</li>
+<li>RLS cell tracking and UE management</li>
+<li>CLI server for runtime commands</li>
+<li>YAML configuration loading</li>
+<li>Status reporting and monitoring</li>
+</ul>
+<p><strong>5G Gaps:</strong></p>
+<ul>
+<li>Full ASN.1-based RRC encoding (uses placeholders)</li>
+<li>AMF load balancing</li>
+<li>Multiple AMF support</li>
+<li>Broadcast/system information handling incomplete</li>
+</ul>
+<p><strong>6G Integration Gaps:</strong></p>
+<ul>
+<li>No NWDAF task integration (analytics data collection/consumption)</li>
+<li>No ISAC task integration (sensing data processing)</li>
+<li>No agent framework integration (autonomous decision-making)</li>
+<li>No SHE task integration (edge compute orchestration)</li>
+<li>No RIS control integration</li>
+<li>No NTN-aware scheduling</li>
+<li>No xApp/rApp interface (ORAN)</li>
+</ul>
+<h4 id="nextgsim-ue-18390-loc--50-complete"><a class="header" href="#nextgsim-ue-18390-loc--50-complete">nextgsim-ue (18,390 LoC) – 50% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Task-based architecture: App, NAS (MM+SM), RRC, RLS, TUN tasks</li>
+<li>NAS MM state machine with registration, authentication, security mode</li>
+<li>NAS SM procedures for PDU session establishment</li>
+<li>Deregistration procedures (788 LoC)</li>
+<li>TUN interface management with async read/write split</li>
+<li>Timer framework (1,135 LoC) for NAS/RRC timers</li>
+<li>Cell selection (815 LoC)</li>
+<li>Handover support (403 LoC)</li>
+<li>Measurement reporting (580 LoC)</li>
+<li>CLI handler and status reporting</li>
+</ul>
+<p><strong>5G Gaps (from TODO.txt – critical):</strong></p>
+<ul>
+<li>NAS MM procedures ~70% missing: access, auth full flow, config, ecall, radio capability, slice selection</li>
+<li>NAS SM procedures ~60% missing: full PDU establishment flow, release, resource allocation</li>
+<li>RRC ~80% missing: re-establishment, full measurement events, cell reselection</li>
+<li>Multiple PDU sessions: Basic support only</li>
+</ul>
+<p><strong>6G Integration Gaps:</strong></p>
+<ul>
+<li>No FL participant integration (local training, model update submission)</li>
+<li>No semantic communication integration (task-oriented encoding)</li>
+<li>No ISAC measurement reporting</li>
+<li>No AI/ML-assisted mobility (predictive handover consumption from NWDAF)</li>
+<li>No sidelink/D2D support</li>
+<li>No NTN-aware procedures</li>
+<li>No zero-energy device emulation mode</li>
+</ul>
+<h4 id="nextgsim-cli-1020-loc--70-complete"><a class="header" href="#nextgsim-cli-1020-loc--70-complete">nextgsim-cli (1,020 LoC) – 70% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>CLI client with process table discovery</li>
+<li>Command routing to gNB/UE instances</li>
+<li>Protocol for CLI message exchange</li>
+<li>Interactive command interface</li>
+</ul>
+<p><strong>6G Gaps:</strong></p>
+<ul>
+<li>No commands for 6G-specific operations (ISAC query, NWDAF analytics, FL status)</li>
+<li>No AI agent interaction commands</li>
+<li>No RIS configuration commands</li>
+<li>No network slice management commands</li>
+</ul>
+<hr>
+<h3 id="4-6g-ai-native-packages"><a class="header" href="#4-6g-ai-native-packages">4. 6G AI-Native Packages</a></h3>
+<h4 id="nextgsim-ai-2432-loc--65-complete"><a class="header" href="#nextgsim-ai-2432-loc--65-complete">nextgsim-ai (2,432 LoC) – 65% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>ONNX Runtime inference engine with full lifecycle (load, infer, batch_infer, warmup)</li>
+<li>Multi-execution-provider support (CPU, CUDA, CoreML, DirectML, TensorRT)</li>
+<li>TensorData abstraction (Float32, Float16, Int64, Int32, Int8, UInt8)</li>
+<li>Tensor shape management with dynamic dimensions</li>
+<li>Model metadata extraction from ONNX files</li>
+<li>Inference metrics (latency tracking, throughput, error counting)</li>
+<li>Configuration system (InferenceConfig, AiConfig)</li>
+<li>Error types (ModelError, InferenceError)</li>
+<li>GPU acceleration support</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Training:</strong> No on-device training or fine-tuning support (inference only)</li>
+<li><strong>Model lifecycle:</strong> No model versioning, A/B testing, rollback</li>
+<li><strong>Model compression:</strong> No quantization, pruning, or knowledge distillation utilities</li>
+<li><strong>Hardware optimization:</strong> No NPU/FPGA acceleration profiles</li>
+<li><strong>Streaming inference:</strong> No support for continuous/streaming model inputs</li>
+<li><strong>Model registry:</strong> No centralized model management/discovery</li>
+</ul>
+<h4 id="nextgsim-she-2726-loc--60-complete"><a class="header" href="#nextgsim-she-2726-loc--60-complete">nextgsim-she (2,726 LoC) – 60% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Three-tier compute model: Local Edge (&lt;10ms), Regional Edge (&lt;20ms), Core Cloud</li>
+<li>Workload scheduler with multiple policies (ClosestToEdge, MostAvailable, LeastUtilized)</li>
+<li>Resource capacity tracking (CPU, memory, GPU, FLOPS)</li>
+<li>Compute node management with capability tracking</li>
+<li>Workload lifecycle management (Pending, Placed, Running, Complete, Failed, Migrating)</li>
+<li>SHE task with inference engine integration (loads ONNX models per tier)</li>
+<li>Message-passing architecture (SheMessage/SheResponse)</li>
+<li>Placement decision engine with reason tracking</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Actual deployment:</strong> No real container/VM orchestration (Kubernetes, Docker)</li>
+<li><strong>Migration:</strong> Workload migration logic is framework-only, no live migration</li>
+<li><strong>Autoscaling:</strong> No dynamic scaling based on load</li>
+<li><strong>Multi-access edge computing (MEC):</strong> No ETSI MEC API compliance</li>
+<li><strong>Latency simulation:</strong> Tier latency is configured, not dynamically measured</li>
+<li><strong>Network-compute joint optimization:</strong> No JCC (Joint Communication and Computing)</li>
+<li><strong>Digital twin integration:</strong> No digital twin state synchronization</li>
+</ul>
+<h4 id="nextgsim-nwdaf-522-loc--35-complete"><a class="header" href="#nextgsim-nwdaf-522-loc--35-complete">nextgsim-nwdaf (522 LoC) – 35% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>UE measurement data structures (RSRP, RSRQ, SINR, position, velocity)</li>
+<li>Cell load data structures</li>
+<li>Measurement history management with circular buffer</li>
+<li>Trajectory prediction using linear extrapolation (comment: “Production would use LSTM/Transformer model via ONNX”)</li>
+<li>Handover recommendation with signal-based and predicted-mobility reasons</li>
+<li>Cell load recording and retrieval</li>
+<li>Automation action types (handover params, cell power, load balancing)</li>
+<li>Message/response types for async communication</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>ML Models:</strong> Uses linear extrapolation instead of actual ML models (LSTM, Transformer). Comment in code acknowledges this.</li>
+<li><strong>TS 23.288 Services:</strong> Missing NWDAF service operations:
+<ul>
+<li>Nnwdaf_AnalyticsSubscription (subscribe to analytics)</li>
+<li>Nnwdaf_AnalyticsInfo (on-demand analytics query)</li>
+<li>Nnwdaf_MLModelProvision (ML model distribution)</li>
+<li>Nnwdaf_DataManagement (data collection coordination)</li>
+</ul>
+</li>
+<li><strong>Analytics IDs:</strong> No support for standardized analytics IDs (UE mobility, NF load, service experience, abnormal behavior, etc.)</li>
+<li><strong>MTLF/AnLF split:</strong> No separation between Model Training Logical Function and Analytics Logical Function</li>
+<li><strong>Data collection:</strong> No integration with gNB/UE for real measurement collection</li>
+<li><strong>Closed-loop automation:</strong> Layer 4 automation is defined as enum but not implemented</li>
+<li><strong>Anomaly detection:</strong> Listed but no implementation</li>
+<li><strong>Federated analytics:</strong> No support for cross-domain analytics</li>
+</ul>
+<h4 id="nextgsim-nkef-476-loc--30-complete"><a class="header" href="#nextgsim-nkef-476-loc--30-complete">nextgsim-nkef (476 LoC) – 30% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Knowledge graph with entity/relationship management</li>
+<li>Entity types: Gnb, Ue, Cell, Amf, Upf, Slice, PduSession, Service</li>
+<li>Type-indexed entity lookup</li>
+<li>Keyword-based search (comment: “production would use vector similarity”)</li>
+<li>RAG context generation from knowledge graph</li>
+<li>Embedding field on entities (but no actual embedding generation)</li>
+<li>NKEF manager with query and context retrieval</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Vector embeddings:</strong> Field exists but no embedding model integration (no sentence transformers)</li>
+<li><strong>Semantic search:</strong> Uses keyword matching, not vector similarity search</li>
+<li><strong>LLM integration:</strong> No actual LLM connection for RAG</li>
+<li><strong>Ontology:</strong> No formal network ontology (OWL/RDF)</li>
+<li><strong>Real-time updates:</strong> No event-driven knowledge graph updates from network events</li>
+<li><strong>3GPP TS 23.288 integration:</strong> Not connected to NWDAF for analytics-informed knowledge</li>
+<li><strong>Intent translation:</strong> No NLP-based intent parsing from natural language</li>
+<li><strong>Temporal reasoning:</strong> No time-series aware knowledge graph</li>
+</ul>
+<h4 id="nextgsim-isac-487-loc--35-complete"><a class="header" href="#nextgsim-isac-487-loc--35-complete">nextgsim-isac (487 LoC) – 35% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Sensing measurement types: ToA, TDoA, AoA, ZoA, RSS, Doppler, RTT</li>
+<li>Sensing data aggregation from multiple cells</li>
+<li>Data source registration with anchor positions</li>
+<li>Simplified Kalman-like position tracking (update with gain calculation)</li>
+<li>Position prediction based on velocity</li>
+<li>Position fusion using weighted centroid (comment: “production would use proper trilateration”)</li>
+<li>Track lifecycle management (create, update, cleanup stale)</li>
+<li>ISAC manager with anchor registration and tracking state</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>3GPP TR 22.837 compliance:</strong> Missing sensing use cases:
+<ul>
+<li>Object detection and tracking beyond positioning</li>
+<li>Gesture/activity recognition</li>
+<li>Environmental sensing (weather, rain)</li>
+<li>Intrusion detection</li>
+<li>Automotive sensing (V2X)</li>
+</ul>
+</li>
+<li><strong>Waveform design:</strong> No joint communication-sensing waveform models (OFDM radar, FMCW)</li>
+<li><strong>Beamforming integration:</strong> No beam-based sensing</li>
+<li><strong>Proper algorithms:</strong> Uses centroid-based fusion instead of trilateration/multilateration</li>
+<li><strong>Extended Kalman Filter:</strong> Simplified linear Kalman, no EKF/UKF for non-linear models</li>
+<li><strong>Particle filter:</strong> Not implemented (mentioned in doc but absent)</li>
+<li><strong>Multi-sensor fusion:</strong> Basic aggregation only, no Bayesian/Dempster-Shafer fusion</li>
+<li><strong>Clutter/interference modeling:</strong> No realistic sensing environment simulation</li>
+<li><strong>Sensing-communication tradeoff:</strong> No resource sharing optimization</li>
+</ul>
+<h4 id="nextgsim-agent-608-loc--40-complete"><a class="header" href="#nextgsim-agent-608-loc--40-complete">nextgsim-agent (608 LoC) – 40% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Agent type classification: Mobility, Resource, QoS, Security, Slicing, Custom</li>
+<li>Agent capabilities system: read_state, modify_config, trigger_actions</li>
+<li>OAuth 2.0-style token authentication with expiration</li>
+<li>Intent framework: Query, OptimizeResources, TriggerHandover, AdjustQos, CreateSlice, ModifySlice</li>
+<li>Intent priority-based processing (1-10 scale)</li>
+<li>Agent coordinator for registration, token management, intent routing</li>
+<li>Capability-based access control (intent validation against agent capabilities)</li>
+<li>Resource limits (requests/second, concurrent ops, data scope)</li>
+<li>Heartbeat-based agent liveness tracking</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Intent processing:</strong> All intents return success without actual execution (placeholder)</li>
+<li><strong>Multi-agent coordination:</strong> No conflict resolution between competing intents</li>
+<li><strong>Reinforcement learning:</strong> No RL-based agent decision making</li>
+<li><strong>LLM integration:</strong> No LLM-based intent understanding or generation</li>
+<li><strong>A2A protocol:</strong> No agent-to-agent communication protocol</li>
+<li><strong>MCP integration:</strong> No Model Context Protocol for tool use</li>
+<li><strong>Safety constraints:</strong> No guardrails or safety bounds on agent actions</li>
+<li><strong>Explainability:</strong> No decision explanation or audit trail</li>
+<li><strong>Hierarchical agents:</strong> No multi-level agent hierarchy (cell-level, region-level, network-level)</li>
+<li><strong>Real-time constraints:</strong> No latency-aware agent scheduling</li>
+</ul>
+<h4 id="nextgsim-fl-628-loc--45-complete"><a class="header" href="#nextgsim-fl-628-loc--45-complete">nextgsim-fl (628 LoC) – 45% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Federated Averaging (FedAvg) aggregation with weighted averaging</li>
+<li>Training round management (start, collect, aggregate lifecycle)</li>
+<li>Participant registration and tracking</li>
+<li>Differential privacy: gradient clipping and noise injection</li>
+<li>Model versioning (version tracking across rounds)</li>
+<li>Round status tracking (WaitingForParticipants, Collecting, Aggregating, Complete, Failed)</li>
+<li>Timeout-based round management</li>
+<li>Algorithm enum: FedAvg, FedProx, SecAgg (though FedProx and SecAgg fall through to FedAvg)</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>FedProx:</strong> Listed but implementation falls through to FedAvg</li>
+<li><strong>SecAgg:</strong> Listed but implementation falls through to FedAvg (no actual Secure Aggregation crypto)</li>
+<li><strong>DP noise:</strong> Uses simplified deterministic noise instead of proper Gaussian sampling</li>
+<li><strong>Asynchronous FL:</strong> Only synchronous rounds supported</li>
+<li><strong>Heterogeneous models:</strong> No support for different model architectures per participant</li>
+<li><strong>Client selection:</strong> No intelligent participant selection (contribution-based, resource-aware)</li>
+<li><strong>Communication efficiency:</strong> No gradient compression, sparsification, or quantization</li>
+<li><strong>Model poisoning defense:</strong> No Byzantine fault tolerance</li>
+<li><strong>Split learning:</strong> Not supported</li>
+<li><strong>Over-the-air aggregation:</strong> No wireless channel-aware aggregation</li>
+</ul>
+<h4 id="nextgsim-semantic-527-loc--30-complete"><a class="header" href="#nextgsim-semantic-527-loc--30-complete">nextgsim-semantic (527 LoC) – 30% Complete</a></h4>
+<p><strong>Implemented:</strong></p>
+<ul>
+<li>Semantic feature representation with task ID, features, importance weights, compression ratio</li>
+<li>Feature importance-based pruning (top-k feature selection)</li>
+<li>Semantic task types: ImageClassification, ObjectDetection, SpeechRecognition, TextUnderstanding, SensorFusion, VideoAnalytics</li>
+<li>Channel quality model with SNR/bandwidth/PER and quality categories</li>
+<li>Channel-adaptive compression (recommended compression ratio from channel quality)</li>
+<li>Semantic encoder: mean-pooling with variance-based importance (comment: “would use ONNX model in production”)</li>
+<li>Semantic decoder: nearest-neighbor upsampling</li>
+<li>Task-aware decoding interface</li>
+</ul>
+<p><strong>Gaps:</strong></p>
+<ul>
+<li><strong>Neural codecs:</strong> Uses mean-pooling instead of actual learned codecs (autoencoder, VAE)</li>
+<li><strong>JSCC:</strong> No joint source-channel coding (just separate compression and transmission)</li>
+<li><strong>End-to-end training:</strong> No trainable encoder/decoder pipeline</li>
+<li><strong>Multi-modal:</strong> Limited to 1D data vectors, no image/video/audio specific pipelines</li>
+<li><strong>Semantic similarity metrics:</strong> No SSIM, LPIPS, or task-specific metrics</li>
+<li><strong>Knowledge base integration:</strong> No shared knowledge base between encoder/decoder</li>
+<li><strong>Generative AI integration:</strong> No diffusion model or GAN-based reconstruction</li>
+<li><strong>Rate-distortion optimization:</strong> No learned rate control</li>
+<li><strong>Cross-layer optimization:</strong> No PHY layer integration for semantic transmission</li>
+</ul>
+<hr>
+<h2 id="6g-feature-gap-matrix"><a class="header" href="#6g-feature-gap-matrix">6G Feature Gap Matrix</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>6G Feature (ITU-R IMT-2030)</th><th>Package(s)</th><th>Current State</th><th>Gap Severity</th></tr>
+</thead>
+<tbody>
+<tr><td>AI/ML native air interface</td><td>ai, nwdaf, she</td><td>Inference framework exists; no air interface integration</td><td>HIGH</td></tr>
+<tr><td>Integrated Sensing and Communication (ISAC)</td><td>isac</td><td>Basic tracking/fusion prototype</td><td>HIGH</td></tr>
+<tr><td>Reconfigurable Intelligent Surface (RIS)</td><td>NONE</td><td>Not started</td><td>CRITICAL</td></tr>
+<tr><td>Non-Terrestrial Networks (NTN)</td><td>rrc, ngap, gnb</td><td>Prototype modules present (timing advance, ephemeris, link sim, constellation, ISL handover, NAS/NGAP data models) — bespoke encodings, not wire-conformant, largely unwired from live UE/gNB paths</td><td>HIGH</td></tr>
+<tr><td>Sub-THz/THz communication</td><td>NONE</td><td>Not started</td><td>CRITICAL</td></tr>
+<tr><td>Semantic communication</td><td>semantic</td><td>Basic encoder/decoder prototype</td><td>HIGH</td></tr>
+<tr><td>Digital twin network</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+<tr><td>Zero-energy devices / ambient IoT</td><td>ue (ambient_iot)</td><td>Prototype exists (energy-harvesting model + fleet simulation), sim-internal only</td><td>MEDIUM</td></tr>
+<tr><td>Joint Communication and Computing (JCC)</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+<tr><td>Enhanced network slicing (6G)</td><td>agent (SliceCreate/Modify intents)</td><td>Intent types defined, no implementation</td><td>HIGH</td></tr>
+<tr><td>Federated learning</td><td>fl</td><td>FedAvg prototype with basic DP</td><td>MEDIUM</td></tr>
+<tr><td>Network data analytics (NWDAF)</td><td>nwdaf</td><td>Linear prediction, no ML models</td><td>HIGH</td></tr>
+<tr><td>Knowledge exposure (NKEF/LLM)</td><td>nkef</td><td>Knowledge graph prototype, no LLM</td><td>MEDIUM</td></tr>
+<tr><td>AI agent framework</td><td>agent</td><td>OAuth + intent framework, no real execution</td><td>MEDIUM</td></tr>
+<tr><td>Post-quantum cryptography</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+<tr><td>ORAN / xApp/rApp</td><td>NONE</td><td>Not started</td><td>HIGH</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="missing-5g-features-that-block-6g"><a class="header" href="#missing-5g-features-that-block-6g">Missing 5G Features That Block 6G</a></h2>
+<p>These 5G gaps must be resolved before meaningful 6G simulation is possible:</p>
+<h3 id="priority-1-rlc-layer-critical-blocker"><a class="header" href="#priority-1-rlc-layer-critical-blocker">Priority 1: RLC Layer (CRITICAL BLOCKER)</a></h3>
+<ul>
+<li><strong>Status:</strong> Completely missing</li>
+<li><strong>Impact:</strong> Blocks realistic air interface simulation. Without RLC, there is no proper PDCP/MAC simulation, which means ISAC waveforms, semantic transmission, and AI/ML air interface features cannot be realistically tested.</li>
+<li><strong>Required:</strong> RLC AM, UM, TM entities; encoder/decoder; ARQ procedures</li>
+<li><strong>Estimated effort:</strong> 5,000-8,000 LoC</li>
+</ul>
+<h3 id="priority-2-ue-nas-mm-procedures-70-missing"><a class="header" href="#priority-2-ue-nas-mm-procedures-70-missing">Priority 2: UE NAS MM Procedures (~70% missing)</a></h3>
+<ul>
+<li><strong>Impact:</strong> Blocks advanced mobility scenarios needed for 6G (predictive handover, NTN mobility)</li>
+<li><strong>Required:</strong> Full authentication flow, configuration update, emergency procedures, slice selection, radio capability handling</li>
+<li><strong>Estimated effort:</strong> 3,000-5,000 LoC</li>
+</ul>
+<h3 id="priority-3-ue-nas-sm-procedures-60-missing"><a class="header" href="#priority-3-ue-nas-sm-procedures-60-missing">Priority 3: UE NAS SM Procedures (~60% missing)</a></h3>
+<ul>
+<li><strong>Impact:</strong> Blocks multi-PDU session scenarios, QoS-differentiated flows, network slicing</li>
+<li><strong>Required:</strong> Full PDU session lifecycle (establish, modify, release), resource allocation</li>
+<li><strong>Estimated effort:</strong> 2,000-3,000 LoC</li>
+</ul>
+<h3 id="priority-4-rrc-layer-80-missing-in-ue"><a class="header" href="#priority-4-rrc-layer-80-missing-in-ue">Priority 4: RRC Layer (~80% missing in UE)</a></h3>
+<ul>
+<li><strong>Impact:</strong> Blocks mobility simulation, measurement-based handover, carrier aggregation</li>
+<li><strong>Required:</strong> Full measurement events (A1-A6, B1-B2), RRC re-establishment, cell reselection, conditional handover</li>
+<li><strong>Estimated effort:</strong> 4,000-6,000 LoC</li>
+</ul>
+<h3 id="priority-5-gnb-rrc-improvements"><a class="header" href="#priority-5-gnb-rrc-improvements">Priority 5: gNB RRC Improvements</a></h3>
+<ul>
+<li><strong>Impact:</strong> Current ASN.1 encoding uses placeholders, limiting interoperability</li>
+<li><strong>Required:</strong> Full ASN.1 UPER encoding for all RRC messages, SIB broadcasting</li>
+<li><strong>Estimated effort:</strong> 2,000-3,000 LoC</li>
+</ul>
+<hr>
+<h2 id="prioritized-6g-implementation-roadmap"><a class="header" href="#prioritized-6g-implementation-roadmap">Prioritized 6G Implementation Roadmap</a></h2>
+<h3 id="phase-1-foundation-months-1-3--complete-5g-baseline"><a class="header" href="#phase-1-foundation-months-1-3--complete-5g-baseline">Phase 1: Foundation (Months 1-3) – Complete 5G Baseline</a></h3>
+<ol>
+<li>Implement RLC layer (AM/UM/TM)</li>
+<li>Complete UE NAS MM procedures (auth, config update, slice selection)</li>
+<li>Complete UE NAS SM procedures (full PDU session lifecycle)</li>
+<li>Improve RRC layer (measurement reporting, re-establishment)</li>
+<li>Integrate NWDAF with gNB/UE for real measurement collection</li>
+</ol>
+<h3 id="phase-2-aiml-integration-months-3-6--connect-6g-packages"><a class="header" href="#phase-2-aiml-integration-months-3-6--connect-6g-packages">Phase 2: AI/ML Integration (Months 3-6) – Connect 6G Packages</a></h3>
+<ol>
+<li>Integrate NWDAF task into gNB for analytics collection and consumption</li>
+<li>Replace linear prediction in NWDAF with ONNX model inference (via nextgsim-ai)</li>
+<li>Integrate ISAC with RLS for sensing simulation alongside communication</li>
+<li>Connect agent framework to gNB for autonomous decision-making</li>
+<li>Implement FL participant in UE (local training, model update)</li>
+<li>Add NWDAF TS 23.288 service APIs (AnalyticsSubscription, AnalyticsInfo)</li>
+</ol>
+<h3 id="phase-3-6g-air-interface-months-6-9--channel--phy-simulation"><a class="header" href="#phase-3-6g-air-interface-months-6-9--channel--phy-simulation">Phase 3: 6G Air Interface (Months 6-9) – Channel &amp; PHY Simulation</a></h3>
+<ol>
+<li>Implement channel models in RLS (3GPP TR 38.901, sub-THz extensions)</li>
+<li>Add massive MIMO / beamforming simulation</li>
+<li>Implement RIS channel modeling and control</li>
+<li>Wire the existing NTN link-simulation prototypes (satellite propagation, Doppler, delay) into live paths and make encodings wire-conformant</li>
+<li>Implement semantic communication neural codecs (ONNX-based encoder/decoder)</li>
+<li>Add JSCC (Joint Source-Channel Coding) support</li>
+</ol>
+<h3 id="phase-4-6g-advanced-features-months-9-12--new-capabilities"><a class="header" href="#phase-4-6g-advanced-features-months-9-12--new-capabilities">Phase 4: 6G Advanced Features (Months 9-12) – New Capabilities</a></h3>
+<ol>
+<li>NTN support: prototype modules exist (timing advance, ephemeris, constellation, ISL handover) — remaining work is satellite cell selection, wire-conformant NAS/RRC encodings, and wiring into live signaling</li>
+<li>Post-quantum cryptography: Kyber/Dilithium integration</li>
+<li>Digital twin network framework</li>
+<li>Zero-energy device / ambient IoT simulation (UE-side prototype exists: energy harvesting + fleet sim; extend beyond sim-internal)</li>
+<li>JCC (Joint Communication and Computing) framework</li>
+<li>Enhanced network slicing for 6G (inter-slice coordination, slice SLA)</li>
+</ol>
+<h3 id="phase-5-production-hardening-months-12-18--quality--scale"><a class="header" href="#phase-5-production-hardening-months-12-18--quality--scale">Phase 5: Production Hardening (Months 12-18) – Quality &amp; Scale</a></h3>
+<ol>
+<li>Conformance testing with Open5GS and Free5GC</li>
+<li>Performance benchmarking (100+ UEs, latency profiling)</li>
+<li>ORAN xApp/rApp interface for RAN intelligent controller</li>
+<li>Kubernetes deployment with Helm charts</li>
+<li>Prometheus metrics and OpenTelemetry tracing</li>
+<li>Real FL with SecAgg and proper DP</li>
+<li>LLM integration for NKEF and agent framework</li>
+</ol>
+<hr>
+<h2 id="recommendations"><a class="header" href="#recommendations">Recommendations</a></h2>
+<h3 id="architecture-recommendations"><a class="header" href="#architecture-recommendations">Architecture Recommendations</a></h3>
+<ol>
+<li>
+<p><strong>Unified Vector3/Position type:</strong> The <code>Vector3</code> type is duplicated across nextgsim-nwdaf, nextgsim-isac, and nextgsim-rls. Create a shared type in nextgsim-common to avoid duplication and ensure consistency.</p>
+</li>
+<li>
+<p><strong>Event bus for 6G integration:</strong> The current task-based architecture with point-to-point message channels makes 6G integration complex. Consider adding a publish-subscribe event bus for cross-cutting concerns (measurements, analytics, sensing data).</p>
+</li>
+<li>
+<p><strong>Plugin architecture for 6G modules:</strong> Make 6G packages optional plugins that can be enabled/disabled. This keeps the 5G baseline lightweight while allowing 6G feature testing.</p>
+</li>
+<li>
+<p><strong>Channel model abstraction:</strong> Replace the simple distance-based signal model in RLS with a pluggable channel model interface. This enables adding 3GPP channel models, sub-THz models, RIS models, and NTN propagation models incrementally.</p>
+</li>
+<li>
+<p><strong>Model registry service:</strong> Create a centralized ONNX model registry that NWDAF, ISAC, semantic, and FL can share, with versioning and lifecycle management.</p>
+</li>
+</ol>
+<h3 id="technical-recommendations"><a class="header" href="#technical-recommendations">Technical Recommendations</a></h3>
+<ol>
+<li>
+<p><strong>Start with NWDAF integration:</strong> The highest-value 6G feature to integrate first is NWDAF with the gNB, as it unlocks AI-driven handover, load balancing, and network optimization without requiring PHY-layer changes.</p>
+</li>
+<li>
+<p><strong>Prioritize RLC before 6G PHY:</strong> Without RLC, any 6G air interface simulation will be unrealistic. RLC is the foundation for PDCP, MAC, and ultimately ISAC waveform simulation.</p>
+</li>
+<li>
+<p><strong>Use existing ONNX ecosystem:</strong> The nextgsim-ai ONNX Runtime integration is well-designed. Leverage it to create pre-trained models for NWDAF (trajectory prediction), ISAC (positioning), and semantic (encoding/decoding) rather than building custom ML frameworks.</p>
+</li>
+<li>
+<p><strong>Post-quantum crypto urgency:</strong> 3GPP SA3 is actively studying PQC migration. Adding Kyber and Dilithium support early positions the simulator for testing PQC-enabled procedures ahead of standardization.</p>
+</li>
+</ol>
+<h3 id="testing-recommendations"><a class="header" href="#testing-recommendations">Testing Recommendations</a></h3>
+<ol>
+<li>Add integration tests between 6G packages and the 5G stack</li>
+<li>Create conformance test suites against Open5GS and Free5GC</li>
+<li>Build performance benchmarks for concurrent UE scaling</li>
+<li>Add property-based testing for NAS/NGAP encoding/decoding</li>
+</ol>
+<hr>
+<h2 id="code-metrics-summary"><a class="header" href="#code-metrics-summary">Code Metrics Summary</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Category</th><th>Packages</th><th>Total LoC</th><th>% of Codebase</th></tr>
+</thead>
+<tbody>
+<tr><td>Core Infrastructure</td><td>common, crypto, sctp</td><td>10,574</td><td>17%</td></tr>
+<tr><td>5G Protocol Stack</td><td>nas, ngap, rrc, rls, gtp</td><td>~18,000+</td><td>29%</td></tr>
+<tr><td>Binary Applications</td><td>gnb, ue, cli</td><td>31,461</td><td>50%</td></tr>
+<tr><td>6G AI-Native</td><td>ai, she, nwdaf, nkef, isac, agent, fl, semantic</td><td>8,406</td><td>13%</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>19 packages</strong></td><td><strong>~62,000</strong></td><td><strong>100%</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Note: NGAP and RRC LoC counts are estimated from file sizes as they contain large ASN.1 generated/derived code.</p>
+<hr>
+<p><em>Report generated from source code analysis of all 21 workspace members in the nextgsim Rust workspace.</em></p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="nextgsim-protocol-crates--6g-gap-analysis"><a class="header" href="#nextgsim-protocol-crates--6g-gap-analysis">nextgsim Protocol Crates – 6G Gap Analysis</a></h1>
+<blockquote>
+<p>Generated: 2026-02-07 | Scope: nextgsim-nas, nextgsim-ngap, nextgsim-rrc, nextgsim-rls, nextgsim-gtp, nextgsim-sctp</p>
+</blockquote>
+<hr>
+<h2 id="executive-summary-1"><a class="header" href="#executive-summary-1">Executive Summary</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Crate</th><th>Source Files</th><th>Role</th><th>Completeness</th><th>6G Readiness</th></tr>
+</thead>
+<tbody>
+<tr><td>nextgsim-nas</td><td>22</td><td>NAS 5GMM/5GSM encoding/decoding</td><td><strong>80%</strong></td><td>Low</td></tr>
+<tr><td>nextgsim-ngap</td><td>13</td><td>NGAP procedures (gNB-AMF)</td><td><strong>85%</strong></td><td>Low</td></tr>
+<tr><td>nextgsim-rrc</td><td>9</td><td>RRC procedures (UE-gNB)</td><td><strong>75%</strong></td><td>Low</td></tr>
+<tr><td>nextgsim-rls</td><td>5</td><td>Radio Link Simulation over UDP</td><td><strong>95%</strong></td><td>N/A</td></tr>
+<tr><td>nextgsim-gtp</td><td>3</td><td>GTP-U tunnel management</td><td><strong>90%</strong></td><td>Low</td></tr>
+<tr><td>nextgsim-sctp</td><td>3</td><td>SCTP transport for NGAP</td><td><strong>90%</strong></td><td>Low</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Zero <code>todo!()</code> or <code>unimplemented!()</code> macros found across all 6 crates.</strong> All gaps are marked with comments.</p>
+<hr>
+<h2 id="1-nextgsim-nas"><a class="header" href="#1-nextgsim-nas">1. nextgsim-nas</a></h2>
+<p><strong>Spec</strong>: 3GPP TS 24.501 | <strong>Files</strong>: 22 | <strong>Modules</strong>: codec, eap, enums, header, ies, messages (mm + sm), security</p>
+<h3 id="implemented"><a class="header" href="#implemented">Implemented</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>Key Types</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>Header encoding</td><td><code>PlainMmHeader</code>, <code>PlainSmHeader</code>, <code>SecuredHeader</code> (7 bytes)</td><td>Complete</td></tr>
+<tr><td>5GMM message types</td><td><code>MmMessageType</code> enum (24 variants)</td><td>Complete</td></tr>
+<tr><td>5GMM messages</td><td>Registration (Request/Accept/Reject/Complete), Authentication (Request/Response/Result/Reject), Security Mode (Command/Complete), Deregistration, Service (Request/Accept/Reject), Identity (Request/Response), Status, Configuration Update</td><td>Complete</td></tr>
+<tr><td>5GSM messages</td><td>PDU Session Establishment (Request/Accept/Reject), PDU Session Modification (Request/Command/Complete/Reject)</td><td>Complete</td></tr>
+<tr><td>Type 1 IEs</td><td>30+ IE types: RegistrationType, ServiceType, AccessType, PduSessionType, SscMode, IdentityType, etc.</td><td>Complete</td></tr>
+<tr><td>Type 3 IEs</td><td>Multiple variable-length IEs</td><td>Complete</td></tr>
+<tr><td>NAS Security</td><td>NIA1/2/3, NEA1/2/3, NAS count, MAC compute/verify, protect/unprotect</td><td>Complete</td></tr>
+<tr><td>EAP</td><td>EAP message parsing (Identity, AKA Challenge)</td><td>Complete</td></tr>
+<tr><td>Capture tests</td><td>Real pcap-based decode tests</td><td>Complete</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gaps"><a class="header" href="#gaps">Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>5GMM message coverage</td><td>DL/UL NAS Transport (<code>src/messages/mm/nas_transport.rs</code>, ~637 lines, encode/decode for DlNasTransport + UlNasTransport), Notification (<code>notification.rs</code>), and UE policy / UPDP (<code>ue_policy.rs</code>, TS 24.501 Annex D + TS 24.526 URSP) are now implemented</td></tr>
+<tr><td>5GSM coverage</td><td>PDU Session Release (Request/Command/Complete/Reject) now implemented in <code>src/messages/sm/pdu_session_release.rs</code> (~888 lines)</td></tr>
+<tr><td>Missing IEs</td><td>UE security capabilities, LADN info, MICO indication encoding</td></tr>
+<tr><td>No 6G NAS IEs</td><td>No AI/ML capability, ISAC, semantic comm, sub-THz parameters</td></tr>
+<tr><td>NTN extensions unwired</td><td>NTN NAS IEs (satellite timing advance, NTN access barring) now exist as bespoke sim-only prototypes; the gap is wire conformance and wiring, not absence</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-80"><a class="header" href="#completeness-80">Completeness: <strong>80%</strong></a></h3>
+<p>Strong 5GMM and 5GSM baseline with full security algorithms. Key missing: PDU Session Release messages, some advanced IEs, all 6G extensions.</p>
+<hr>
+<h2 id="2-nextgsim-ngap"><a class="header" href="#2-nextgsim-ngap">2. nextgsim-ngap</a></h2>
+<p><strong>Spec</strong>: 3GPP TS 38.413 | <strong>Files</strong>: 13 | <strong>Modules</strong>: codec, procedures (9 procedure modules)</p>
+<h3 id="implemented-1"><a class="header" href="#implemented-1">Implemented</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Procedure</th><th>File</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>NG Setup</td><td><code>ng_setup.rs</code></td><td>Complete (Request/Response/Failure)</td></tr>
+<tr><td>Initial UE Message</td><td><code>initial_ue_message.rs</code></td><td>Complete</td></tr>
+<tr><td>NAS Transport</td><td><code>nas_transport.rs</code></td><td>Complete (DL/UL)</td></tr>
+<tr><td>Initial Context Setup</td><td><code>initial_context_setup.rs</code></td><td>Complete (Request/Response/Failure)</td></tr>
+<tr><td>PDU Session Resource</td><td><code>pdu_session_resource.rs</code></td><td>Complete (Setup/Modify/Release Request/Response)</td></tr>
+<tr><td>UE Context Release</td><td><code>ue_context_release.rs</code></td><td>Complete (Command/Complete)</td></tr>
+<tr><td>Handover</td><td><code>handover.rs</code></td><td>Partial (Required/Request/Command/Ack/Notify)</td></tr>
+<tr><td>Paging</td><td><code>paging.rs</code></td><td>Complete</td></tr>
+<tr><td>Error Indication</td><td><code>error_indication.rs</code></td><td>Complete</td></tr>
+<tr><td>APER Codec</td><td><code>codec.rs</code></td><td>Complete (ASN.1 APER encode/decode)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gaps-1"><a class="header" href="#gaps-1">Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>Handover preparation failure</td><td>Now implemented: <code>procedures/handover_preparation_failure.rs</code> (~541 lines)</td></tr>
+<tr><td>AMF Status Indication</td><td>Now implemented: <code>procedures/amf_status_indication.rs</code> (~387 lines)</td></tr>
+<tr><td>RAN Configuration Update</td><td>Now implemented: <code>procedures/ran_configuration_update.rs</code> (~501 lines); <code>ng_reset.rs</code> and <code>path_switch.rs</code> procedures also added</td></tr>
+<tr><td>NGAP over multiple SCTP streams</td><td>Stream management for parallel procedures not fully modeled</td></tr>
+<tr><td>No 6G NGAP extensions</td><td>No ISAC reporting or AI-native procedures; an off-wire NTN support module now exists (bespoke, sim-only) but no wire-conformant NTN IEs</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-85"><a class="header" href="#completeness-85">Completeness: <strong>85%</strong></a></h3>
+<p>Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) are well implemented with proper APER encoding. Missing some secondary procedures.</p>
+<hr>
+<h2 id="3-nextgsim-rrc"><a class="header" href="#3-nextgsim-rrc">3. nextgsim-rrc</a></h2>
+<p><strong>Spec</strong>: 3GPP TS 38.331 | <strong>Files</strong>: 9 | <strong>Modules</strong>: codec, procedures (6 procedure modules)</p>
+<h3 id="implemented-2"><a class="header" href="#implemented-2">Implemented</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Procedure</th><th>File</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>RRC Setup</td><td><code>rrc_setup.rs</code></td><td>Complete (Request/Setup/Complete)</td></tr>
+<tr><td>RRC Release</td><td><code>rrc_release.rs</code></td><td>Complete</td></tr>
+<tr><td>RRC Reconfiguration</td><td><code>rrc_reconfiguration.rs</code></td><td>Complete (with NAS container)</td></tr>
+<tr><td>Security Mode</td><td><code>security_mode.rs</code></td><td>Complete (Command/Complete)</td></tr>
+<tr><td>System Information</td><td><code>system_information.rs</code></td><td>Complete (MIB/SIB1)</td></tr>
+<tr><td>Information Transfer</td><td><code>information_transfer.rs</code></td><td>Complete (DL/UL)</td></tr>
+<tr><td>UPER Codec</td><td><code>codec.rs</code></td><td>Complete (ASN.1 UPER encode/decode)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gaps-2"><a class="header" href="#gaps-2">Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>Measurement Report</td><td><code>procedures/measurement_report.rs</code> codec now exists in this crate, but the gNB/UE tasks still emit/parse a simplified byte format (not yet wired to the codec)</td></tr>
+<tr><td>RRC Reestablishment</td><td>Now implemented: <code>procedures/rrc_reestablishment.rs</code> (~422 lines)</td></tr>
+<tr><td>RRC Resume</td><td>Now implemented: <code>procedures/rrc_resume.rs</code> (~642 lines) + UE-side <code>nextgsim-ue/src/rrc/resume.rs</code> (TS 38.331 5.3.13, T319)</td></tr>
+<tr><td>Conditional Handover</td><td>Now implemented: <code>procedures/conditional_handover.rs</code> (~803 lines)</td></tr>
+<tr><td>No 6G RRC extensions</td><td>No AI/ML configuration, ISAC measurement config, NTN timing advance, sub-THz band config</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-75"><a class="header" href="#completeness-75">Completeness: <strong>75%</strong></a></h3>
+<p>Core RRC procedures implemented with UPER codec. Missing RRC Reestablishment/Resume and all 6G extensions.</p>
+<hr>
+<h2 id="4-nextgsim-rls"><a class="header" href="#4-nextgsim-rls">4. nextgsim-rls</a></h2>
+<p><strong>Role</strong>: Radio Link Simulation protocol (UERANSIM-compatible) | <strong>Files</strong>: 5</p>
+<h3 id="implemented-3"><a class="header" href="#implemented-3">Implemented</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>File</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>Protocol messages</td><td><code>protocol.rs</code></td><td>Complete (Heartbeat, HeartbeatAck, PduTransmission, PduTransmissionAck)</td></tr>
+<tr><td>Codec</td><td><code>codec.rs</code></td><td>Complete (encode/decode with version header)</td></tr>
+<tr><td>UE Cell Search</td><td><code>cell_search.rs</code></td><td>Complete (cell discovery, signal tracking, heartbeat management)</td></tr>
+<tr><td>gNB Cell Tracker</td><td><code>cell_search.rs</code></td><td>Complete (UE registration, signal strength)</td></tr>
+<tr><td>RRC/Data Transport</td><td><code>transport.rs</code></td><td>Complete (RRC message and user plane data transport)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-95"><a class="header" href="#completeness-95">Completeness: <strong>95%</strong></a></h3>
+<p>Fully functional simulation protocol. Not 3GPP-standardized, so no 6G relevance.</p>
+<hr>
+<h2 id="5-nextgsim-gtp"><a class="header" href="#5-nextgsim-gtp">5. nextgsim-gtp</a></h2>
+<p><strong>Spec</strong>: 3GPP TS 29.281 | <strong>Files</strong>: 3</p>
+<h3 id="implemented-4"><a class="header" href="#implemented-4">Implemented</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>File</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>GTP-U header</td><td><code>codec.rs</code></td><td>Complete (version, TEID, sequence number, extension headers, QFI)</td></tr>
+<tr><td>Message types</td><td><code>codec.rs</code></td><td>Complete (G-PDU, Echo Req/Resp, Error Indication, End Marker)</td></tr>
+<tr><td>Tunnel management</td><td><code>tunnel.rs</code></td><td>Complete (TunnelManager, PduSession, TEID allocation, session CRUD)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gaps-3"><a class="header" href="#gaps-3">Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No GTP-U extension header chaining</td><td>Single extension header only</td></tr>
+<tr><td>No PDU Session Container IE</td><td>Missing 5GC-specific GTP-U extension</td></tr>
+<tr><td>No 6G extensions</td><td>No deterministic networking, no in-network computing markers</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-90"><a class="header" href="#completeness-90">Completeness: <strong>90%</strong></a></h3>
+<p>Strong GTP-U implementation for simulation. Missing some 5GC-specific extension headers.</p>
+<hr>
+<h2 id="6-nextgsim-sctp"><a class="header" href="#6-nextgsim-sctp">6. nextgsim-sctp</a></h2>
+<p><strong>Spec</strong>: RFC 4960 | <strong>Files</strong>: 3 | <strong>Backend</strong>: sctp-proto (pure Rust)</p>
+<h3 id="implemented-5"><a class="header" href="#implemented-5">Implemented</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>File</th><th>Status</th></tr>
+</thead>
+<tbody>
+<tr><td>Association</td><td><code>association.rs</code></td><td>Complete (connect, send, recv, shutdown, state machine)</td></tr>
+<tr><td>Server</td><td><code>server.rs</code></td><td>Complete (accept connections, multi-association)</td></tr>
+<tr><td>Config</td><td><code>lib.rs</code></td><td>Complete (streams, buffer sizes, NGAP PPID)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gaps-4"><a class="header" href="#gaps-4">Gaps</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gap</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td>No multi-homing</td><td>Single address only</td></tr>
+<tr><td>No PR-SCTP</td><td>Partial reliability not supported</td></tr>
+<tr><td>No QUIC alternative</td><td>6G may move away from SCTP</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="completeness-90-1"><a class="header" href="#completeness-90-1">Completeness: <strong>90%</strong></a></h3>
+<p>Production-quality SCTP with async tokio interface. Wire-compatible with nextgcore.</p>
+<hr>
+<h2 id="cross-crate-6g-gap-summary"><a class="header" href="#cross-crate-6g-gap-summary">Cross-Crate 6G Gap Summary</a></h2>
+<h3 id="protocol-stack-readiness"><a class="header" href="#protocol-stack-readiness">Protocol Stack Readiness</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Layer</th><th>5G Status</th><th>6G Gaps</th></tr>
+</thead>
+<tbody>
+<tr><td>NAS (L5)</td><td>80%</td><td>No AI/ML IEs, no ISAC, no semantic comm parameters; NTN IEs exist as bespoke sim-only prototypes (not wire-conformant)</td></tr>
+<tr><td>NGAP (L4)</td><td>85%</td><td>No AI-native procedures, no ISAC reporting; off-wire NTN module exists (bespoke, sim-only)</td></tr>
+<tr><td>RRC (L3)</td><td>75%</td><td>No AI config, no ISAC measurement, no sub-THz, no RRC Resume</td></tr>
+<tr><td>RLS (sim)</td><td>95%</td><td>N/A (simulation protocol)</td></tr>
+<tr><td>GTP-U (L2)</td><td>90%</td><td>No deterministic networking, no in-network computing</td></tr>
+<tr><td>SCTP (L1)</td><td>90%</td><td>No QUIC alternative, no multi-homing</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="recommendations-1"><a class="header" href="#recommendations-1">Recommendations</a></h3>
+<ol>
+<li><strong>Complete NAS 5GSM</strong> – DONE: PDU Session Release messages implemented (<code>src/messages/sm/pdu_session_release.rs</code>)</li>
+<li><strong>Add RRC Reestablishment/Resume</strong> – DONE: both implemented (<code>rrc_reestablishment.rs</code>, <code>rrc_resume.rs</code>)</li>
+<li><strong>Add 6G NAS IEs</strong> – AI/ML capability negotiation, ISAC parameters</li>
+<li><strong>Add NTN support</strong> – Satellite timing advance in NAS/RRC</li>
+<li><strong>Implement QUIC transport</strong> – Future-proof alternative to SCTP</li>
+<li><strong>Add PDU Session Container</strong> – 5GC-specific GTP-U extension header</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="contributing-to-nextgsim"><a class="header" href="#contributing-to-nextgsim">Contributing to NextGSim</a></h1>
+<p>NextGSim is a 5G UE and gNB simulator in Rust implementing a 3GPP Rel-15 baseline with selected Rel-17/18 features and 6G exploration prototypes. 3GPP Rel-20 (6G) has no frozen stage-3 spec, so the 6G items are research-only (informed by TR 22.870 use cases) and disabled by default.</p>
+<h2 id="prerequisites-1"><a class="header" href="#prerequisites-1">Prerequisites</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
+<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing with NextGCore</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-bash"># macOS (Homebrew)
+brew install rustup
+rustup toolchain install stable
+</code></pre>
+<h2 id="building"><a class="header" href="#building">Building</a></h2>
+<pre><code class="language-bash">cd nextgsim
+cargo build --workspace            # debug
+cargo build --workspace --release  # release
+</code></pre>
+<p>To build a single component:</p>
+<pre><code class="language-bash">cargo build -p nextgsim-ue   # UE simulator
+cargo build -p nextgsim-gnb  # gNB simulator
+</code></pre>
+<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
+<pre><code class="language-bash">cargo test --workspace                 # all tests
+cargo test -p nextgsim-ue             # UE only
+cargo test -- --nocapture             # with log output
+</code></pre>
+<p>E2E tests require a running NextGCore stack:</p>
+<pre><code class="language-bash">cd ../nextgcore/docker/rust &amp;&amp; docker compose up -d
+cd ../../nextgsim
+cargo test -p nextgsim-tests --features e2e
+</code></pre>
+<h2 id="code-style"><a class="header" href="#code-style">Code Style</a></h2>
+<pre><code class="language-bash">cargo fmt --all
+cargo clippy --workspace -- -D warnings
+</code></pre>
+<p>Pre-commit checklist:</p>
+<ul>
+<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
+<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
+<li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
+<li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
+</ul>
+<h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
+<pre><code class="language-bash">cargo install cargo-audit
+cargo audit
+</code></pre>
+<h2 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h2>
+<pre><code>nextgsim/
+├── nextgsim-gnb/       # gNB (base station) simulator
+│   └── src/
+│       ├── ngap/       # NGAP (N2 interface to AMF)
+│       ├── rrc/        # NR RRC
+│       ├── gtp/        # GTP-U data plane
+│       ├── daps.rs     # DAPS handover (Rel-16)
+│       ├── mbs_ngap.rs # MBS NGAP (Rel-17)
+│       └── ...
+├── nextgsim-ue/        # UE simulator
+│   └── src/
+│       ├── nas/        # 5G NAS (N1 interface)
+│       ├── rrc/        # NR RRC
+│       ├── prose.rs    # ProSe PC5 (Rel-17)
+│       ├── uav.rs      # UAV context (Rel-18)
+│       ├── daps.rs     # DAPS (Rel-16)
+│       └── ...
+├── nextgsim-nas/       # Shared NAS codec
+├── nextgsim-ngap/      # NGAP ASN.1 codec (auto-generated)
+├── nextgsim-common/    # Config, types, utilities
+├── nextgsim-tests/     # Integration + E2E tests
+└── tools/              # ASN.1 grammars
+</code></pre>
+<h2 id="simulated-releases"><a class="header" href="#simulated-releases">Simulated Releases</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Release</th><th>Features</th></tr>
+</thead>
+<tbody>
+<tr><td>Rel-15</td><td>5G-NR baseline, SA registration, PDU sessions</td></tr>
+<tr><td>Rel-16</td><td>DAPS handover, URLLC, RedCap, V2X PC5</td></tr>
+<tr><td>Rel-17</td><td>MBS, ProSe, NTN, SNPN, UAV identity</td></tr>
+<tr><td>Rel-18</td><td>XR traffic, Ambient IoT, RedCap R18, MINT</td></tr>
+<tr><td>Rel-20*</td><td>ISAC, Federated Learning, Semantic comms, Agent AI</td></tr>
+</tbody>
+</table>
+</div>
+<p>* Rel-20 (6G) research exploration only — no frozen 3GPP stage-3 spec exists; these features are non-normative prototypes, disabled in the default config.</p>
+<h2 id="3gpp-specification-references"><a class="header" href="#3gpp-specification-references">3GPP Specification References</a></h2>
+<p>Each module includes a doc comment with the spec reference. When adding protocol logic, always cite:</p>
+<ul>
+<li><strong>TS 38.331</strong> — NR RRC</li>
+<li><strong>TS 38.413</strong> — NGAP</li>
+<li><strong>TS 24.501</strong> — 5G NAS</li>
+<li><strong>TS 23.256</strong> — UAV</li>
+<li><strong>TS 23.304</strong> — ProSe</li>
+</ul>
+<h2 id="commit-messages"><a class="header" href="#commit-messages">Commit Messages</a></h2>
+<pre><code>feat(gnb): add MBS NGAP session start procedure (TS 38.413 §8.21)
+fix(ue): apply NAS security after SecurityModeComplete
+test(prose): add relay selection RSRP unit test
+</code></pre>
+<ul>
+<li><strong>Never</strong> include <code>Co-Authored-By: Claude</code> or any AI attribution</li>
+<li>Sign commits: <code>Signed-off-by: Your Name &lt;email&gt;</code></li>
+</ul>
+<h2 id="pull-request-process"><a class="header" href="#pull-request-process">Pull Request Process</a></h2>
+<ol>
+<li>Fork the repository</li>
+<li>Create a feature branch from <code>main</code></li>
+<li>Implement your change with tests</li>
+<li>Ensure all CI checks pass</li>
+<li>Open a PR referencing the 3GPP TS item</li>
+</ol>
+<h2 id="license"><a class="header" href="#license">License</a></h2>
+<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
