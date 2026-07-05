@@ -10,28 +10,28 @@
 
 ### Summary Table
 
-| Package | Category | LoC | Completion | Status | Critical 6G Gaps |
-|---------|----------|-----|------------|--------|------------------|
-| nextgsim-common | Core | 5,154 | 85% | Functional | Needs 6G config types (RIS, NTN, ISAC params) |
-| nextgsim-crypto | Core | 4,090 | 90% | Functional | Missing post-quantum crypto (Kyber, Dilithium) |
-| nextgsim-sctp | Core | 1,330 | 75% | Functional | No multi-homing, path MTU, bundling |
-| nextgsim-nas | 5G Protocol | 10,252 | 60% | Partial | Missing config update, emergency, EAP-AKA' reauth |
-| nextgsim-ngap | 5G Protocol | ~365K bytes | 70% | Functional | Handover basic only, no AMF load balancing |
-| nextgsim-rrc | 5G Protocol | ~140K bytes | 40% | Basic | No measurement report, handover, re-establishment, CA |
-| nextgsim-rls | 5G Protocol | 1,962 | 80% | Functional | No channel modeling, MIMO, beamforming sim |
-| nextgsim-gtp | 5G Protocol | 1,306 | 70% | Functional | Basic QoS/extension headers only |
-| nextgsim-gnb | Binary | 12,051 | 55% | Working | No NWDAF/ISAC/agent integration |
-| nextgsim-ue | Binary | 18,390 | 50% | Working | No FL/semantic integration, RRC ~80% missing |
-| nextgsim-cli | Binary | 1,020 | 70% | Functional | No 6G-specific commands |
-| nextgsim-ai | 6G AI | 2,432 | 65% | Functional | No training, model lifecycle management |
-| nextgsim-she | 6G AI | 2,726 | 60% | Functional | No actual edge node deployment, no K8s integration |
-| nextgsim-nwdaf | 6G AI | 522 | 35% | Prototype | Linear extrapolation only, no ML models, no TS 23.288 services |
-| nextgsim-nkef | 6G AI | 476 | 30% | Prototype | Keyword search only, no real vector embeddings/LLM |
-| nextgsim-isac | 6G AI | 487 | 35% | Prototype | Simplified fusion, no real Kalman/particle filter |
-| nextgsim-agent | 6G AI | 608 | 40% | Prototype | Simplified intent processing, no real multi-agent coordination |
-| nextgsim-fl | 6G AI | 628 | 45% | Prototype | FedAvg only, simplified DP noise, no SecAgg crypto |
-| nextgsim-semantic | 6G AI | 527 | 30% | Prototype | Mean-pooling encoder only, no neural codec, no JSCC |
-| tests | Testing | - | 20% | Basic | No integration tests, no conformance testing |
+| Package | Category | Completion | Status | Critical 6G Gaps |
+|---------|----------|------------|--------|------------------|
+| nextgsim-common | Core | 85% | Functional | Needs 6G config types (RIS, NTN, ISAC params) |
+| nextgsim-crypto | Core | 90% | Functional | Missing post-quantum crypto (Kyber, Dilithium) |
+| nextgsim-sctp | Core | 75% | Functional | No multi-homing, path MTU, bundling |
+| nextgsim-nas | 5G Protocol | 60% | Partial | Missing config update, emergency, EAP-AKA' reauth |
+| nextgsim-ngap | 5G Protocol | 70% | Functional | Handover basic only, no AMF load balancing |
+| nextgsim-rrc | 5G Protocol | 40% | Basic | No measurement report, handover, re-establishment, CA |
+| nextgsim-rls | 5G Protocol | 80% | Functional | No channel modeling, MIMO, beamforming sim |
+| nextgsim-gtp | 5G Protocol | 70% | Functional | Basic QoS/extension headers only |
+| nextgsim-gnb | Binary | 55% | Working | No NWDAF/ISAC/agent integration |
+| nextgsim-ue | Binary | 50% | Working | No FL/semantic integration, RRC ~80% missing |
+| nextgsim-cli | Binary | 70% | Functional | No 6G-specific commands |
+| nextgsim-ai | 6G AI | 65% | Functional | No training, model lifecycle management |
+| nextgsim-she | 6G AI | 60% | Functional | No actual edge node deployment, no K8s integration |
+| nextgsim-nwdaf | 6G AI | 35% | Prototype | Linear extrapolation only, no ML models, no TS 23.288 services |
+| nextgsim-nkef | 6G AI | 30% | Prototype | Keyword search only, no real vector embeddings/LLM |
+| nextgsim-isac | 6G AI | 35% | Prototype | Simplified fusion, no real Kalman/particle filter |
+| nextgsim-agent | 6G AI | 40% | Prototype | Simplified intent processing, no real multi-agent coordination |
+| nextgsim-fl | 6G AI | 45% | Prototype | FedAvg only, simplified DP noise, no SecAgg crypto |
+| nextgsim-semantic | 6G AI | 30% | Prototype | Mean-pooling encoder only, no neural codec, no JSCC |
+| tests | Testing | 20% | Basic | No integration tests, no conformance testing |
 
 ---
 
@@ -39,7 +39,7 @@
 
 ### 1. Core Infrastructure
 
-#### nextgsim-common (5,154 LoC) -- 85% Complete
+#### nextgsim-common -- 85% Complete
 
 **Implemented:**
 - BitBuffer, BitString, OctetString, OctetView (binary data handling)
@@ -62,17 +62,17 @@
 - No digital twin configuration
 - No zero-energy device parameters
 
-#### nextgsim-crypto (4,090 LoC) -- 90% Complete
+#### nextgsim-crypto -- 90% Complete
 
 **Implemented:**
-- Milenage (5G-AKA) -- 959 LoC, full implementation with test vectors
-- SNOW3G (NEA1/NIA1) -- 602 LoC
-- ZUC (NEA3/NIA3) -- 360 LoC, using external crate
-- AES-based (NEA2/NIA2) -- 315 LoC
-- Key derivation functions (KDF) -- 663 LoC
-- ECIES for SUPI concealment -- 376 LoC
-- NIA (integrity algorithms) -- 496 LoC
-- NEA (ciphering algorithms) -- 301 LoC
+- Milenage (5G-AKA), full implementation with test vectors
+- SNOW3G (NEA1/NIA1)
+- ZUC (NEA3/NIA3), using external crate
+- AES-based (NEA2/NIA2)
+- Key derivation functions (KDF)
+- ECIES for SUPI concealment
+- NIA (integrity algorithms)
+- NEA (ciphering algorithms)
 
 **5G Gaps:**
 - Additional test vector validation needed
@@ -85,7 +85,7 @@
 - **Quantum key distribution (QKD):** No QKD integration framework
 - **Physical layer security:** No PLS primitives (channel-based key generation)
 
-#### nextgsim-sctp (1,330 LoC) -- 75% Complete
+#### nextgsim-sctp -- 75% Complete
 
 **Implemented:**
 - SCTP association management (client mode)
@@ -107,22 +107,22 @@
 
 ### 2. 5G Protocol Stack
 
-#### nextgsim-nas (10,252 LoC) -- 60% Complete
+#### nextgsim-nas -- 60% Complete
 
 **Implemented:**
 - NAS header encoding/decoding (plain MM, plain SM, security protected)
-- Registration messages: Request, Accept, Reject, Complete (1,709 LoC)
-- Authentication messages: Request, Response, Reject, Failure, Result (1,226 LoC)
-- Deregistration messages (485 LoC)
-- Security Mode messages (821 LoC)
-- Service Request/Accept/Reject messages (767 LoC)
-- Identity messages (362 LoC)
-- 5GMM Status messages (146 LoC)
-- PDU Session Establishment messages (725 LoC)
-- PDU Session Modification messages (1,041 LoC)
+- Registration messages: Request, Accept, Reject, Complete
+- Authentication messages: Request, Response, Reject, Failure, Result
+- Deregistration messages
+- Security Mode messages
+- Service Request/Accept/Reject messages
+- Identity messages
+- 5GMM Status messages
+- PDU Session Establishment messages
+- PDU Session Modification messages
 - EAP framework (EAP-AKA')
-- NAS security (ciphering, integrity, MAC computation) -- 2,046 LoC
-- Type 1 IEs (39,045 LoC) and Type 3 IEs (32,936 LoC)
+- NAS security (ciphering, integrity, MAC computation)
+- Type 1 IEs and Type 3 IEs
 - Capture tests for real packet validation
 
 **5G Gaps (from TODO.txt):**
@@ -140,15 +140,15 @@
 #### nextgsim-ngap (procedures: ~364K bytes across 10 files) -- 70% Complete
 
 **Implemented (with ASN.1 PER encoding/decoding):**
-- NG Setup procedure (32,363 bytes)
-- Initial UE Message (28,049 bytes)
-- Initial Context Setup (45,949 bytes)
-- NAS Transport (UL/DL) (29,979 bytes)
-- PDU Session Resource (53,058 bytes)
-- UE Context Release (37,677 bytes)
-- Error Indication (40,748 bytes)
-- Handover procedure (73,652 bytes) -- basic implementation
-- Paging (22,395 bytes) -- basic implementation
+- NG Setup procedure
+- Initial UE Message
+- Initial Context Setup
+- NAS Transport (UL/DL)
+- PDU Session Resource
+- UE Context Release
+- Error Indication
+- Handover procedure -- basic implementation
+- Paging -- basic implementation
 
 **5G Gaps:**
 - Handover: Basic implementation only (no inter-AMF, no path switch)
@@ -167,25 +167,25 @@
 #### nextgsim-rrc (procedures: ~126K bytes across 6 files) -- 40% Complete
 
 **Implemented:**
-- RRC Setup procedure (29,177 bytes)
-- RRC Release procedure (16,206 bytes)
-- RRC Reconfiguration (17,564 bytes)
-- Security Mode Command/Complete (20,633 bytes)
-- System Information (26,968 bytes)
-- Information Transfer (UL/DL) (15,607 bytes)
+- RRC Setup procedure
+- RRC Release procedure
+- RRC Reconfiguration
+- Security Mode Command/Complete
+- System Information
+- Information Transfer (UL/DL)
 - ASN.1 UPER codec
 
 **In gNB RRC task (nextgsim-gnb/src/rrc/):**
-- Connection management (472 LoC)
-- Handover procedure (531 LoC) -- recently added
-- UE context management (440 LoC)
+- Connection management
+- Handover procedure -- recently added
+- UE context management
 
 **In UE RRC task (nextgsim-ue/src/rrc/):**
-- Cell selection (815 LoC) -- recently added
-- Handover (403 LoC) -- recently added
-- Measurement reporting (580 LoC) -- recently added
-- RRC state machine (640 LoC)
-- RRC task processing (825 LoC)
+- Cell selection -- recently added
+- Handover -- recently added
+- Measurement reporting -- recently added
+- RRC state machine
+- RRC task processing
 
 **5G Gaps (critical - from TODO.txt):**
 - Full ASN.1-based RRC message encoding uses placeholders in gNB
@@ -203,7 +203,7 @@
 - No dual connectivity (EN-DC, NR-DC) RRC procedures
 - No conditional handover (CHO) / DAPS handover support
 
-#### nextgsim-rls (1,962 LoC) -- 80% Complete
+#### nextgsim-rls -- 80% Complete
 
 **Implemented:**
 - RLS protocol messages: Heartbeat, HeartbeatAck, PduTransmission, PduTransmissionAck
@@ -226,13 +226,13 @@
 - **Sensing:** No radar-like waveform simulation for ISAC
 - **D2D/Sidelink:** No direct UE-to-UE communication simulation
 
-#### nextgsim-gtp (1,306 LoC) -- 70% Complete
+#### nextgsim-gtp -- 70% Complete
 
 **Implemented:**
-- GTP-U header encoding/decoding (769 LoC) per TS 29.281
+- GTP-U header encoding/decoding per TS 29.281
 - GTP-U message types (G-PDU, Echo Req/Rsp, Error Indication, End Marker)
 - Extension header support (PDU Session Container, basic)
-- Tunnel management with UE/PSI session tracking (486 LoC)
+- Tunnel management with UE/PSI session tracking
 - Sequence number handling
 
 **5G Gaps:**
@@ -251,7 +251,7 @@
 
 ### 3. Binary Applications
 
-#### nextgsim-gnb (12,051 LoC) -- 55% Complete
+#### nextgsim-gnb -- 55% Complete
 
 **Implemented:**
 - Task-based actor architecture: App, NGAP, RRC, GTP, RLS, SCTP tasks
@@ -280,18 +280,18 @@
 - No NTN-aware scheduling
 - No xApp/rApp interface (ORAN)
 
-#### nextgsim-ue (18,390 LoC) -- 50% Complete
+#### nextgsim-ue -- 50% Complete
 
 **Implemented:**
 - Task-based architecture: App, NAS (MM+SM), RRC, RLS, TUN tasks
 - NAS MM state machine with registration, authentication, security mode
 - NAS SM procedures for PDU session establishment
-- Deregistration procedures (788 LoC)
+- Deregistration procedures
 - TUN interface management with async read/write split
-- Timer framework (1,135 LoC) for NAS/RRC timers
-- Cell selection (815 LoC)
-- Handover support (403 LoC)
-- Measurement reporting (580 LoC)
+- Timer framework for NAS/RRC timers
+- Cell selection
+- Handover support
+- Measurement reporting
 - CLI handler and status reporting
 
 **5G Gaps (from TODO.txt -- critical):**
@@ -309,7 +309,7 @@
 - No NTN-aware procedures
 - No zero-energy device emulation mode
 
-#### nextgsim-cli (1,020 LoC) -- 70% Complete
+#### nextgsim-cli -- 70% Complete
 
 **Implemented:**
 - CLI client with process table discovery
@@ -327,7 +327,7 @@
 
 ### 4. 6G AI-Native Packages
 
-#### nextgsim-ai (2,432 LoC) -- 65% Complete
+#### nextgsim-ai -- 65% Complete
 
 **Implemented:**
 - ONNX Runtime inference engine with full lifecycle (load, infer, batch_infer, warmup)
@@ -348,7 +348,7 @@
 - **Streaming inference:** No support for continuous/streaming model inputs
 - **Model registry:** No centralized model management/discovery
 
-#### nextgsim-she (2,726 LoC) -- 60% Complete
+#### nextgsim-she -- 60% Complete
 
 **Implemented:**
 - Three-tier compute model: Local Edge (<10ms), Regional Edge (<20ms), Core Cloud
@@ -369,7 +369,7 @@
 - **Network-compute joint optimization:** No JCC (Joint Communication and Computing)
 - **Digital twin integration:** No digital twin state synchronization
 
-#### nextgsim-nwdaf (522 LoC) -- 35% Complete
+#### nextgsim-nwdaf -- 35% Complete
 
 **Implemented:**
 - UE measurement data structures (RSRP, RSRQ, SINR, position, velocity)
@@ -395,7 +395,7 @@
 - **Anomaly detection:** Listed but no implementation
 - **Federated analytics:** No support for cross-domain analytics
 
-#### nextgsim-nkef (476 LoC) -- 30% Complete
+#### nextgsim-nkef -- 30% Complete
 
 **Implemented:**
 - Knowledge graph with entity/relationship management
@@ -416,7 +416,7 @@
 - **Intent translation:** No NLP-based intent parsing from natural language
 - **Temporal reasoning:** No time-series aware knowledge graph
 
-#### nextgsim-isac (487 LoC) -- 35% Complete
+#### nextgsim-isac -- 35% Complete
 
 **Implemented:**
 - Sensing measurement types: ToA, TDoA, AoA, ZoA, RSS, Doppler, RTT
@@ -444,7 +444,7 @@
 - **Clutter/interference modeling:** No realistic sensing environment simulation
 - **Sensing-communication tradeoff:** No resource sharing optimization
 
-#### nextgsim-agent (608 LoC) -- 40% Complete
+#### nextgsim-agent -- 40% Complete
 
 **Implemented:**
 - Agent type classification: Mobility, Resource, QoS, Security, Slicing, Custom
@@ -469,7 +469,7 @@
 - **Hierarchical agents:** No multi-level agent hierarchy (cell-level, region-level, network-level)
 - **Real-time constraints:** No latency-aware agent scheduling
 
-#### nextgsim-fl (628 LoC) -- 45% Complete
+#### nextgsim-fl -- 45% Complete
 
 **Implemented:**
 - Federated Averaging (FedAvg) aggregation with weighted averaging
@@ -493,7 +493,7 @@
 - **Split learning:** Not supported
 - **Over-the-air aggregation:** No wireless channel-aware aggregation
 
-#### nextgsim-semantic (527 LoC) -- 30% Complete
+#### nextgsim-semantic -- 30% Complete
 
 **Implemented:**
 - Semantic feature representation with task ID, features, importance weights, compression ratio
@@ -549,27 +549,22 @@ These 5G gaps must be resolved before meaningful 6G simulation is possible:
 - **Status:** Completely missing
 - **Impact:** Blocks realistic air interface simulation. Without RLC, there is no proper PDCP/MAC simulation, which means ISAC waveforms, semantic transmission, and AI/ML air interface features cannot be realistically tested.
 - **Required:** RLC AM, UM, TM entities; encoder/decoder; ARQ procedures
-- **Estimated effort:** 5,000-8,000 LoC
 
 ### Priority 2: UE NAS MM Procedures (~70% missing)
 - **Impact:** Blocks advanced mobility scenarios needed for 6G (predictive handover, NTN mobility)
 - **Required:** Full authentication flow, configuration update, emergency procedures, slice selection, radio capability handling
-- **Estimated effort:** 3,000-5,000 LoC
 
 ### Priority 3: UE NAS SM Procedures (~60% missing)
 - **Impact:** Blocks multi-PDU session scenarios, QoS-differentiated flows, network slicing
 - **Required:** Full PDU session lifecycle (establish, modify, release), resource allocation
-- **Estimated effort:** 2,000-3,000 LoC
 
 ### Priority 4: RRC Layer (~80% missing in UE)
 - **Impact:** Blocks mobility simulation, measurement-based handover, carrier aggregation
 - **Required:** Full measurement events (A1-A6, B1-B2), RRC re-establishment, cell reselection, conditional handover
-- **Estimated effort:** 4,000-6,000 LoC
 
 ### Priority 5: gNB RRC Improvements
 - **Impact:** Current ASN.1 encoding uses placeholders, limiting interoperability
 - **Required:** Full ASN.1 UPER encoding for all RRC messages, SIB broadcasting
-- **Estimated effort:** 2,000-3,000 LoC
 
 ---
 
@@ -623,20 +618,6 @@ Forward-looking work items from this analysis are tracked as
 [GitHub issues](https://github.com/NextgCoreLab/nextgsim/issues) rather than as a
 roadmap here, so the code and the tracker stay the source of truth. Each issue
 records the verified current state, a bounded scope, and acceptance criteria.
-
----
-
-## Code Metrics Summary
-
-| Category | Packages | Total LoC | % of Codebase |
-|----------|----------|-----------|---------------|
-| Core Infrastructure | common, crypto, sctp | 10,574 | 17% |
-| 5G Protocol Stack | nas, ngap, rrc, rls, gtp | ~18,000+ | 29% |
-| Binary Applications | gnb, ue, cli | 31,461 | 50% |
-| 6G AI-Native | ai, she, nwdaf, nkef, isac, agent, fl, semantic | 8,406 | 13% |
-| **Total** | **19 packages** | **~62,000** | **100%** |
-
-Note: NGAP and RRC LoC counts are estimated from file sizes as they contain large ASN.1 generated/derived code.
 
 ---
 

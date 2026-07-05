@@ -380,7 +380,7 @@ YAML (`config/gnb.yaml`) and — for the UE — build with the matching cargo fe
 ## Where to look next
 
 - [6G Gap Analysis](../gaps/6g-gap-analysis.md) — the package-by-package gap
-  ledger this chapter is consistent with. Note: its LoC/percentage numbers
+  ledger this chapter is consistent with. Note: its completion percentages
   predate the current, larger and more self-honest crates (e.g. FL's
   `MaskedSumDemo`, agent's real `IntentExecutor`), so trust the source over the
   older figures where they differ.

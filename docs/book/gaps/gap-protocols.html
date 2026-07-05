@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-a2637774.js";
+            window.path_to_searchindex_js = "../searchindex-5b985661.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -228,8 +228,8 @@
 <tr><th>Gap</th><th>Details</th></tr>
 </thead>
 <tbody>
-<tr><td>5GMM message coverage</td><td>DL/UL NAS Transport (<code>src/messages/mm/nas_transport.rs</code>, ~637 lines, encode/decode for DlNasTransport + UlNasTransport), Notification (<code>notification.rs</code>), and UE policy / UPDP (<code>ue_policy.rs</code>, TS 24.501 Annex D + TS 24.526 URSP) are now implemented</td></tr>
-<tr><td>5GSM coverage</td><td>PDU Session Release (Request/Command/Complete/Reject) now implemented in <code>src/messages/sm/pdu_session_release.rs</code> (~888 lines)</td></tr>
+<tr><td>5GMM message coverage</td><td>DL/UL NAS Transport (<code>src/messages/mm/nas_transport.rs</code>, encode/decode for DlNasTransport + UlNasTransport), Notification (<code>notification.rs</code>), and UE policy / UPDP (<code>ue_policy.rs</code>, TS 24.501 Annex D + TS 24.526 URSP) are now implemented</td></tr>
+<tr><td>5GSM coverage</td><td>PDU Session Release (Request/Command/Complete/Reject) now implemented in <code>src/messages/sm/pdu_session_release.rs</code></td></tr>
 <tr><td>Missing IEs</td><td>UE security capabilities, LADN info, MICO indication encoding</td></tr>
 <tr><td>No 6G NAS IEs</td><td>No AI/ML capability, ISAC, semantic comm, sub-THz parameters</td></tr>
 <tr><td>NTN extensions unwired</td><td>NTN NAS IEs (satellite timing advance, NTN access barring) now exist as bespoke sim-only prototypes; the gap is wire conformance and wiring, not absence</td></tr>
@@ -268,9 +268,9 @@
 <tr><th>Gap</th><th>Details</th></tr>
 </thead>
 <tbody>
-<tr><td>Handover preparation failure</td><td>Now implemented: <code>procedures/handover_preparation_failure.rs</code> (~541 lines)</td></tr>
-<tr><td>AMF Status Indication</td><td>Now implemented: <code>procedures/amf_status_indication.rs</code> (~387 lines)</td></tr>
-<tr><td>RAN Configuration Update</td><td>Now implemented: <code>procedures/ran_configuration_update.rs</code> (~501 lines); <code>ng_reset.rs</code> and <code>path_switch.rs</code> procedures also added</td></tr>
+<tr><td>Handover preparation failure</td><td>Now implemented: <code>procedures/handover_preparation_failure.rs</code></td></tr>
+<tr><td>AMF Status Indication</td><td>Now implemented: <code>procedures/amf_status_indication.rs</code></td></tr>
+<tr><td>RAN Configuration Update</td><td>Now implemented: <code>procedures/ran_configuration_update.rs</code>; <code>ng_reset.rs</code> and <code>path_switch.rs</code> procedures also added</td></tr>
 <tr><td>NGAP over multiple SCTP streams</td><td>Stream management for parallel procedures not fully modeled</td></tr>
 <tr><td>No 6G NGAP extensions</td><td>No ISAC reporting or AI-native procedures; an off-wire NTN support module now exists (bespoke, sim-only) but no wire-conformant NTN IEs</td></tr>
 </tbody>
@@ -306,9 +306,9 @@
 </thead>
 <tbody>
 <tr><td>Measurement Report</td><td><code>procedures/measurement_report.rs</code> codec now exists in this crate, but the gNB/UE tasks still emit/parse a simplified byte format (not yet wired to the codec)</td></tr>
-<tr><td>RRC Reestablishment</td><td>Now implemented: <code>procedures/rrc_reestablishment.rs</code> (~422 lines)</td></tr>
-<tr><td>RRC Resume</td><td>Now implemented: <code>procedures/rrc_resume.rs</code> (~642 lines) + UE-side <code>nextgsim-ue/src/rrc/resume.rs</code> (TS 38.331 5.3.13, T319)</td></tr>
-<tr><td>Conditional Handover</td><td>Now implemented: <code>procedures/conditional_handover.rs</code> (~803 lines)</td></tr>
+<tr><td>RRC Reestablishment</td><td>Now implemented: <code>procedures/rrc_reestablishment.rs</code></td></tr>
+<tr><td>RRC Resume</td><td>Now implemented: <code>procedures/rrc_resume.rs</code> + UE-side <code>nextgsim-ue/src/rrc/resume.rs</code> (TS 38.331 5.3.13, T319)</td></tr>
+<tr><td>Conditional Handover</td><td>Now implemented: <code>procedures/conditional_handover.rs</code></td></tr>
 <tr><td>No 6G RRC extensions</td><td>No AI/ML configuration, ISAC measurement config, NTN timing advance, sub-THz band config</td></tr>
 </tbody>
 </table>

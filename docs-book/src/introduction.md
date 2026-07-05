@@ -2,7 +2,7 @@
 
 **NextGSim** is a 5G UE and gNB simulator written in pure Rust — no C dependencies from SCTP to ASN.1 PER. It implements a 3GPP Rel-15 baseline with selected Rel-17/18 features, plus a set of 6G exploration prototypes (AI-native crates for sensing, learning, and autonomous agents) that are disabled by default.
 
-The workspace contains **20 crates** (~200k lines of Rust) producing **3 binaries**:
+The workspace contains **20 crates** producing **3 binaries**:
 
 | Binary | Role |
 |--------|------|
