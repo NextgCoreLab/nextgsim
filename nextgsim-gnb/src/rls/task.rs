@@ -20,7 +20,7 @@ use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
     codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
     RlsMessage as RlsProtocolMessage, RlsPduTransmission, RlsPduTransmissionAck, RrcChannel,
-    Vector3,
+    SimCoord,
 };
 
 /// Default RLS port for gNB
@@ -60,7 +60,7 @@ impl RlsTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         // Generate STI from gNB NCI
         let sti = task_base.config.nci;
-        let phy_location = Vector3::new(0, 0, 0);
+        let phy_location = SimCoord::new(0, 0, 0);
 
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
@@ -81,7 +81,7 @@ impl RlsTask {
     /// Creates a new RLS task with custom bind address
     pub fn with_bind_address(task_base: GnbTaskBase, bind_address: SocketAddr) -> Self {
         let sti = task_base.config.nci;
-        let phy_location = Vector3::new(0, 0, 0);
+        let phy_location = SimCoord::new(0, 0, 0);
 
         Self {
             task_base,
