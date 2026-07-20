@@ -417,6 +417,38 @@ pub fn is_ran_configuration_update(pdu: &NGAP_PDU) -> bool {
     )
 }
 
+/// Check if an NGAP PDU is a RAN Configuration Update Acknowledge.
+pub fn is_ran_configuration_update_acknowledge(pdu: &NGAP_PDU) -> bool {
+    matches!(
+        pdu,
+        NGAP_PDU::SuccessfulOutcome(msg)
+            if matches!(msg.value, SuccessfulOutcomeValue::Id_RANConfigurationUpdate(_))
+    )
+}
+
+/// Decode + validate a RAN Configuration Update Acknowledge from bytes.
+pub fn decode_ran_configuration_update_acknowledge(
+    bytes: &[u8],
+) -> Result<(), RanConfigurationUpdateError> {
+    let pdu = decode_ngap_pdu(bytes)?;
+    if is_ran_configuration_update_acknowledge(&pdu) {
+        Ok(())
+    } else {
+        Err(RanConfigurationUpdateError::InvalidMessageType {
+            expected: "RANConfigurationUpdateAcknowledge".to_string(),
+            actual: format!("{pdu:?}"),
+        })
+    }
+}
+
+/// Decode + parse a RAN Configuration Update Failure from bytes.
+pub fn decode_ran_configuration_update_failure(
+    bytes: &[u8],
+) -> Result<RanConfigurationUpdateFailureData, RanConfigurationUpdateError> {
+    let pdu = decode_ngap_pdu(bytes)?;
+    parse_ran_configuration_update_failure(&pdu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -104,6 +104,10 @@ use nextgsim_ngap::procedures::pdu_session_resource::{
     PduSessionResourceSetupResponseItem,
     PduSessionResourceSetupResponseParams,
 };
+use nextgsim_ngap::procedures::ran_configuration_update::{
+    decode_ran_configuration_update_acknowledge, decode_ran_configuration_update_failure,
+    encode_ran_configuration_update, RanConfigurationUpdateParams,
+};
 use nextgsim_ngap::procedures::transfer::{
     decode_modify_request_transfer, decode_release_command_transfer, decode_setup_request_transfer,
     encode_modify_response_transfer, encode_modify_unsuccessful_transfer,
@@ -2209,6 +2213,13 @@ impl NgapTask {
                     self.handle_overload_stop(client_id).await;
                 } else if let Ok(status) = decode_amf_status_indication(pdu_bytes) {
                     self.handle_amf_status_indication(client_id, status).await;
+                } else if decode_ran_configuration_update_acknowledge(pdu_bytes).is_ok() {
+                    info!("Received RAN Configuration Update Acknowledge from AMF[{client_id}]");
+                } else if let Ok(fail) = decode_ran_configuration_update_failure(pdu_bytes) {
+                    warn!(
+                        "Received RAN Configuration Update Failure from AMF[{}]: cause={:?}, time_to_wait={:?}",
+                        client_id, fail.cause, fail.time_to_wait
+                    );
                 } else if let Ok(err_ind) = decode_error_indication(pdu_bytes) {
                     // TS 38.413 §8.7.5: a received Error Indication is processed
                     // locally and MUST NOT be answered with another Error
@@ -2388,6 +2399,51 @@ impl NgapTask {
     ///
     /// Updates the stored AMF configuration (name, relative capacity, served
     /// GUAMI count) and replies with an AMF Configuration Update Acknowledge.
+    /// Initiate a RAN CONFIGURATION UPDATE toward the AMF (TS 38.413 §8.7.2) to
+    /// refresh this gNB's advertised RAN node name, TA/slice list and paging DRX.
+    /// The AMF replies with a RAN CONFIGURATION UPDATE ACKNOWLEDGE or FAILURE,
+    /// both handled in `handle_ngap_pdu`. On-demand: there is no automatic
+    /// trigger yet, so this is not called from the operational path.
+    #[allow(dead_code)]
+    async fn send_ran_configuration_update(&mut self, amf_id: i32) {
+        let config = &self.task_base.config;
+        let plmn_bytes = config.plmn.encode();
+        let slice_support: Vec<SNssai> = config
+            .nssai
+            .iter()
+            .map(|s| SNssai {
+                sst: s.sst,
+                sd: s.sd,
+            })
+            .collect();
+        let params = RanConfigurationUpdateParams {
+            ran_node_name: Some("nextgsim-gnb".to_string()),
+            supported_ta_list: Some(vec![SupportedTaItem {
+                tac: [
+                    ((config.tac >> 16) & 0xFF) as u8,
+                    ((config.tac >> 8) & 0xFF) as u8,
+                    (config.tac & 0xFF) as u8,
+                ],
+                broadcast_plmn_list: vec![BroadcastPlmnItem {
+                    plmn_identity: plmn_bytes,
+                    slice_support_list: if slice_support.is_empty() {
+                        vec![SNssai { sst: 1, sd: None }]
+                    } else {
+                        slice_support
+                    },
+                }],
+            }]),
+            default_paging_drx: Some(PagingDrx::V128),
+        };
+        match encode_ran_configuration_update(&params) {
+            Ok(bytes) => {
+                self.send_ngap_non_ue(amf_id, 0, bytes).await;
+                info!("Sent RAN Configuration Update to AMF[{amf_id}]");
+            }
+            Err(e) => error!("Failed to encode RAN Configuration Update: {e}"),
+        }
+    }
+
     async fn handle_amf_configuration_update(
         &mut self,
         client_id: i32,
@@ -4585,5 +4641,35 @@ mod tests {
             sctp_rx.try_recv().is_ok(),
             "must reply with an AMF Configuration Update Acknowledge"
         );
+    }
+
+    /// The gNB can initiate a RAN CONFIGURATION UPDATE (TS 38.413 §8.7.2): the
+    /// send path emits a well-formed RAN Configuration Update PDU on stream 0.
+    #[tokio::test]
+    async fn test_send_ran_configuration_update_emits_pdu() {
+        use nextgsim_ngap::procedures::ran_configuration_update::is_ran_configuration_update;
+
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+
+        task.send_ran_configuration_update(1).await;
+
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, stream, .. })) => {
+                assert_eq!(
+                    stream, 0,
+                    "RAN Config Update is non-UE-associated (stream 0)"
+                );
+                let pdu = decode_ngap_pdu(buffer.data()).expect("decode");
+                assert!(
+                    is_ran_configuration_update(&pdu),
+                    "expected a RAN Configuration Update, got {pdu:?}"
+                );
+            }
+            other => panic!("expected a RAN Configuration Update PDU, got {other:?}"),
+        }
     }
 }
