@@ -20,6 +20,7 @@ pub mod path_switch;
 pub mod pdu_session_resource;
 pub mod ran_configuration_update;
 pub mod transfer;
+pub mod ue_context_modification;
 pub mod ue_context_release;
 
 pub use error_indication::*;
@@ -40,4 +41,5 @@ pub use ntn_support::*;
 pub use paging::*;
 pub use pdu_session_resource::*;
 pub use ran_configuration_update::*;
+pub use ue_context_modification::*;
 pub use ue_context_release::*;

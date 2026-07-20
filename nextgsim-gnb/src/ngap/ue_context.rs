@@ -10,6 +10,9 @@
 use std::collections::HashMap;
 
 use crate::rrc::transaction::RrcTransactionAllocator;
+use nextgsim_ngap::procedures::initial_context_setup::{
+    UeAggregateMaxBitRate, UeSecurityCapabilitiesValue,
+};
 
 /// UE state within NGAP
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,6 +107,12 @@ pub struct NgapUeContext {
     pub requested_nssai: Option<i32>,
     /// AS security context (established at Initial Context Setup).
     pub as_security: Option<AsSecurityContext>,
+    /// UE Aggregate Maximum Bit Rate, as last provided by the AMF (at Initial
+    /// Context Setup and replaced by UE Context Modification, TS 38.413 §8.3.4).
+    pub ue_ambr: Option<UeAggregateMaxBitRate>,
+    /// UE Security Capabilities, as last provided by the AMF (at Initial Context
+    /// Setup and updated by UE Context Modification, TS 38.413 §8.3.4).
+    pub ue_security_capabilities: Option<UeSecurityCapabilitiesValue>,
     /// Per-UE RRC transaction-identifier allocator (TS 38.331 §6.3.2, Wave-6
     /// C4-final) for the DL-DCCH procedures the NGAP task drives:
     /// SecurityModeCommand and RRCReconfiguration. Independent per UE — never a
@@ -124,6 +133,8 @@ impl NgapUeContext {
             pdu_sessions: HashMap::new(),
             requested_nssai: None,
             as_security: None,
+            ue_ambr: None,
+            ue_security_capabilities: None,
             transactions: RrcTransactionAllocator::new(),
         }
     }
