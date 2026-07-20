@@ -40,6 +40,22 @@ impl std::fmt::Display for AmfState {
     }
 }
 
+/// Identity of an AMF within its AMF Set, derived from a served GUAMI
+/// (TS 23.003 §2.10.1: GUAMI = PLMN + AMF Region ID + AMF Set ID + AMF
+/// Pointer). Two SCTP associations (TNLAs, TS 38.412 §7) that advertise the
+/// same GUAMI are the same AMF, reached over multiple transport links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AmfIdentity {
+    /// PLMN Identity (3 bytes)
+    pub plmn_identity: [u8; 3],
+    /// AMF Region ID
+    pub amf_region_id: u8,
+    /// AMF Set ID (10 bits)
+    pub amf_set_id: u16,
+    /// AMF Pointer (6 bits)
+    pub amf_pointer: u8,
+}
+
 /// AMF context for tracking AMF connection state and capabilities
 #[derive(Debug, Clone)]
 pub struct NgapAmfContext {
@@ -209,6 +225,19 @@ impl NgapAmfContext {
             }
         }
         None
+    }
+
+    /// The identity of the AMF served over this association, taken from its
+    /// first served GUAMI. `None` until NG Setup (or an AMF Configuration
+    /// Update) has supplied a served GUAMI list. Associations that report the
+    /// same identity are the same AMF reached over multiple TNLAs.
+    pub fn amf_identity(&self) -> Option<AmfIdentity> {
+        self.served_guami_list.first().map(|item| AmfIdentity {
+            plmn_identity: item.guami.plmn_identity,
+            amf_region_id: item.guami.amf_region_id,
+            amf_set_id: item.guami.amf_set_id,
+            amf_pointer: item.guami.amf_pointer,
+        })
     }
 }
 
