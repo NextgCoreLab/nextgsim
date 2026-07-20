@@ -210,7 +210,11 @@ impl LlmAnalyticsEngine {
         // The keyword-templated mock consults no knowledge store, so it reports
         // no sources; `confidence` is a coarse placeholder (higher when the query
         // matched a known analytics template) and is NOT a computed model score.
-        let confidence = if related_analytics.is_empty() { 0.2 } else { 0.5 };
+        let confidence = if related_analytics.is_empty() {
+            0.2
+        } else {
+            0.5
+        };
         LlmAnalyticsResponse {
             response,
             confidence,

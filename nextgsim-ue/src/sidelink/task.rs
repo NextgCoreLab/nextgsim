@@ -1,10 +1,11 @@
 //! Sidelink Task for UE - NR relay, discovery, PC5, and sidelink positioning
 //!
-//! Implements Rel-18 sidelink features:
-//! - NR sidelink relay (UE-to-UE relay)
-//! - Sidelink discovery procedures
-//! - PC5 link establishment
-//! - Sidelink-based positioning (cooperative positioning between UEs)
+//! **Scaffold, not wired end-to-end.** Models the Rel-18 sidelink concepts of
+//! TS 23.304 (NR sidelink relay, discovery, PC5 link establishment, cooperative
+//! positioning), but only `StartDiscovery`/`StopDiscovery` are ever sent (and
+//! only when ranging is enabled). There is no PC5 OTA exchange and no RRC
+//! `SidelinkUEInformation` / `sl-Config`, so the PC5-link, relay and positioning
+//! handlers below are unreachable at runtime.
 
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -99,7 +100,7 @@ impl Task for SidelinkTask {
     type Message = SidelinkMessage;
 
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
-        info!("Sidelink task started (Rel-18 NR Sidelink)");
+        info!("Sidelink task started (scaffold: only discovery start/stop is reachable; PC5 link/relay/positioning handlers are unwired)");
         loop {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {
