@@ -136,6 +136,7 @@ use nextgsim_ngap::procedures::{
     is_ng_setup_response,
     parse_ng_setup_failure,
     parse_ng_setup_response,
+    AllowedSnssai,
     BroadcastPlmnItem,
     DownlinkNasTransportData,
     GnbId,
@@ -218,10 +219,38 @@ impl NgapTask {
         self.amf_contexts.get_mut(&client_id)
     }
 
-    /// Selects an AMF for a new UE based on capacity and slice support
-    fn select_amf(&self, _requested_nssai: Option<i32>) -> Option<i32> {
-        // Simple selection: pick the highest-capacity AMF that is Ready and not
-        // marked unavailable by an AMF Status Indication (TS 38.413 §8.7.6).
+    /// Selects an AMF for a new UE by slice support and capacity
+    /// (TS 38.413 §8.6.1.2, TS 23.501 §5.15.5.2.1).
+    ///
+    /// Candidates are AMFs that are `Ready` and not marked `unavailable` by an
+    /// AMF Status Indication (TS 38.413 §8.7.6). When the UE requested one or
+    /// more S-NSSAIs, an AMF is preferred only if it advertises support for
+    /// *every* requested slice on the serving `plmn` (its NG Setup / AMF
+    /// Configuration Update `plmn_support_list`); ties break on relative
+    /// capacity. An empty `requested` list imposes no slice constraint.
+    ///
+    /// If no Ready AMF serves the requested slices, selection falls back to the
+    /// highest-capacity Ready AMF so the UE can still attach (the AMF then
+    /// applies its own NSSAI policy) — this also preserves the pre-slice
+    /// behaviour for deployments whose AMFs advertise no slice support.
+    fn select_amf(&self, plmn: &[u8; 3], requested: &[SNssai]) -> Option<i32> {
+        if !requested.is_empty() {
+            if let Some(ctx_id) = self
+                .amf_contexts
+                .values()
+                .filter(|ctx| ctx.is_ready() && !ctx.unavailable)
+                .filter(|ctx| requested.iter().all(|s| ctx.supports_snssai(plmn, s)))
+                .max_by_key(|ctx| ctx.relative_capacity)
+                .map(|ctx| ctx.ctx_id)
+            {
+                return Some(ctx_id);
+            }
+            warn!(
+                "No Ready AMF advertises the requested S-NSSAI {:?} for PLMN {:02x?}; falling back to capacity-only AMF selection",
+                requested, plmn
+            );
+        }
+
         self.amf_contexts
             .values()
             .filter(|ctx| ctx.is_ready() && !ctx.unavailable)
@@ -1727,16 +1756,30 @@ impl NgapTask {
         pdu: OctetString,
         rrc_establishment_cause: i64,
         _s_tmsi: Option<crate::tasks::GutiMobileIdentity>,
+        s_nssai_list: Vec<nextgsim_common::SNssai>,
     ) {
         debug!(
-            "Initial NAS delivery: ue_id={}, cause={}, pdu_len={}",
+            "Initial NAS delivery: ue_id={}, cause={}, pdu_len={}, s_nssai_count={}",
             ue_id,
             rrc_establishment_cause,
-            pdu.len()
+            pdu.len(),
+            s_nssai_list.len()
         );
 
-        // Select an AMF for this UE
-        let amf_id = match self.select_amf(None) {
+        // The UE's requested S-NSSAI(s) (from RRCSetupComplete) drive slice-aware
+        // AMF selection and are echoed as the Allowed NSSAI in the Initial UE
+        // Message (TS 38.413 §8.6.1.2). Map the common S-NSSAI onto the NGAP type.
+        let requested_nssai: Vec<SNssai> = s_nssai_list
+            .iter()
+            .map(|s| SNssai {
+                sst: s.sst,
+                sd: s.sd,
+            })
+            .collect();
+        let serving_plmn = self.task_base.config.plmn.encode();
+
+        // Select an AMF for this UE, honouring the requested slice(s)
+        let amf_id = match self.select_amf(&serving_plmn, &requested_nssai) {
             Some(id) => id,
             None => {
                 warn!("No AMF available for UE {}", ue_id);
@@ -1813,7 +1856,21 @@ impl NgapTask {
             five_g_s_tmsi,
             amf_set_id: None,
             ue_context_request: Some(UeContextRequestValue::Requested),
-            allowed_nssai: None,
+            // Carry the UE's requested slice(s) as the Allowed NSSAI so the AMF
+            // sees the slice context used for selection (TS 38.413 §8.6.1.2).
+            allowed_nssai: if requested_nssai.is_empty() {
+                None
+            } else {
+                Some(
+                    requested_nssai
+                        .iter()
+                        .map(|s| AllowedSnssai {
+                            sst: s.sst,
+                            sd: s.sd,
+                        })
+                        .collect(),
+                )
+            },
         };
 
         match encode_initial_ue_message(&params) {
@@ -3478,12 +3535,14 @@ impl Task for NgapTask {
                         pdu,
                         rrc_establishment_cause,
                         s_tmsi,
+                        s_nssai_list,
                     } => {
                         self.handle_initial_nas_delivery(
                             ue_id,
                             pdu,
                             rrc_establishment_cause,
                             s_tmsi,
+                            s_nssai_list,
                         )
                         .await;
                     }
@@ -3711,13 +3770,14 @@ mod tests {
             GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
 
         let mut task = NgapTask::new(task_base);
+        let plmn = [0x00, 0xf1, 0x10];
 
         // No AMF available
-        assert!(task.select_amf(None).is_none());
+        assert!(task.select_amf(&plmn, &[]).is_none());
 
         // Add AMF but not ready
         task.create_amf_context(1);
-        assert!(task.select_amf(None).is_none());
+        assert!(task.select_amf(&plmn, &[]).is_none());
 
         // Make AMF ready
         if let Some(ctx) = task.find_amf_context_mut(1) {
@@ -3725,7 +3785,62 @@ mod tests {
             ctx.state = AmfState::Ready;
             ctx.relative_capacity = 100;
         }
-        assert_eq!(task.select_amf(None), Some(1));
+        assert_eq!(task.select_amf(&plmn, &[]), Some(1));
+    }
+
+    /// Slice-aware AMF selection (TS 38.413 §8.6.1.2, issue #41): a UE that
+    /// requests S-NSSAI X is routed to an AMF serving X even when another AMF
+    /// has higher capacity, and an empty request falls back to capacity.
+    #[test]
+    fn test_select_amf_slice_aware() {
+        use nextgsim_ngap::procedures::{PlmnSupportItem, SNssai};
+
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        let plmn = [0x00, 0xf1, 0x10];
+
+        // AMF 1: higher capacity, serves only SST=1.
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 4, 4);
+            ctx.state = AmfState::Ready;
+            ctx.relative_capacity = 200;
+            ctx.plmn_support_list = vec![PlmnSupportItem {
+                plmn_identity: plmn,
+                slice_support_list: vec![SNssai { sst: 1, sd: None }],
+            }];
+        }
+        // AMF 2: lower capacity, serves only SST=2.
+        task.create_amf_context(2);
+        if let Some(ctx) = task.find_amf_context_mut(2) {
+            ctx.on_association_up(101, 4, 4);
+            ctx.state = AmfState::Ready;
+            ctx.relative_capacity = 100;
+            ctx.plmn_support_list = vec![PlmnSupportItem {
+                plmn_identity: plmn,
+                slice_support_list: vec![SNssai { sst: 2, sd: None }],
+            }];
+        }
+
+        // Requesting SST=2 must route to AMF 2 despite AMF 1's higher capacity.
+        assert_eq!(
+            task.select_amf(&plmn, &[SNssai { sst: 2, sd: None }]),
+            Some(2)
+        );
+        // Requesting SST=1 routes to AMF 1.
+        assert_eq!(
+            task.select_amf(&plmn, &[SNssai { sst: 1, sd: None }]),
+            Some(1)
+        );
+        // No slice constraint → highest capacity (AMF 1).
+        assert_eq!(task.select_amf(&plmn, &[]), Some(1));
+        // A slice no AMF serves → capacity-only fallback (AMF 1), still attaches.
+        assert_eq!(
+            task.select_amf(&plmn, &[SNssai { sst: 9, sd: None }]),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4560,7 +4675,7 @@ mod tests {
             }];
         }
         // Ready + available → this AMF is selectable.
-        assert_eq!(task.select_amf(None), Some(1));
+        assert_eq!(task.select_amf(&[0x00, 0xf1, 0x10], &[]), Some(1));
 
         // AMF Status Indication marks that GUAMI unavailable.
         let params = AmfStatusIndicationParams {
@@ -4581,7 +4696,7 @@ mod tests {
         // The AMF is excluded from selection, and nothing was echoed.
         assert!(task.find_amf_context_mut(1).unwrap().unavailable);
         assert_eq!(
-            task.select_amf(None),
+            task.select_amf(&[0x00, 0xf1, 0x10], &[]),
             None,
             "an AMF with an unavailable GUAMI must not be selected"
         );

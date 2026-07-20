@@ -8,6 +8,7 @@ use crate::tasks::{
     SheMessage, Task, TaskMessage,
 };
 use nextgsim_common::OctetString;
+use nextgsim_common::SNssai;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_ul_dcch, UlDcchMessage};
 use nextgsim_rrc::procedures::information_transfer::{
@@ -274,8 +275,9 @@ impl RrcTask {
                         let ctx = self.ue_manager.create_ue(ue_id);
                         ctx.on_setup_complete(); // Mark as connected
                     }
-                    // Forward as Initial NAS
-                    self.send_initial_nas_delivery(ue_id, data.clone(), 3, None)
+                    // Forward as Initial NAS (bespoke UL-DCCH fallback: no
+                    // s-NSSAI-List is carried on this path).
+                    self.send_initial_nas_delivery(ue_id, data.clone(), 3, None, Vec::new())
                         .await; // cause=3 (mo-Data)
                 } else {
                     debug!("Unhandled UL-DCCH message type: {:#x}", message_type);
@@ -399,12 +401,29 @@ impl RrcTask {
     /// encoding carries the transaction id, the dedicated NAS message, and
     /// the RedCap indication as typed fields — no byte-offset extraction.
     async fn handle_rrc_setup_complete_asn1(&mut self, ue_id: i32, complete: RrcSetupCompleteData) {
+        // Requested S-NSSAI(s) the UE carried in RRCSetupComplete (TS 38.331
+        // §6.2.2), used downstream for slice-aware AMF selection. The RRC codec
+        // models SD as a u32; convert to the common S-NSSAI (3-byte SD).
+        let s_nssai_list: Vec<SNssai> = complete
+            .s_nssai_list
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .map(|s| match s.sd {
+                        Some(sd) => SNssai::with_sd_u32(s.sst, sd),
+                        None => SNssai::new(s.sst),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         info!(
-            "RRC Setup Complete (ASN.1 UL-DCCH) from UE[{}]: tid={}, nas_len={}, redcap={}",
+            "RRC Setup Complete (ASN.1 UL-DCCH) from UE[{}]: tid={}, nas_len={}, redcap={}, s_nssai_count={}",
             ue_id,
             complete.rrc_transaction_id,
             complete.dedicated_nas_message.len(),
-            complete.redcap_indication
+            complete.redcap_indication,
+            s_nssai_list.len()
         );
 
         let nas_pdu = OctetString::from_slice(&complete.dedicated_nas_message);
@@ -413,6 +432,7 @@ impl RrcTask {
             complete.rrc_transaction_id,
             nas_pdu,
             complete.redcap_indication,
+            s_nssai_list,
             "ASN.1",
         )
         .await;
@@ -456,6 +476,9 @@ impl RrcTask {
             transaction_id,
             nas_pdu,
             redcap_indication,
+            // The bespoke framing carries no s-NSSAI-List; slice-aware selection
+            // is only available on the ASN.1 path.
+            Vec::new(),
             "bespoke-fallback",
         )
         .await;
@@ -472,6 +495,7 @@ impl RrcTask {
         transaction_id: u8,
         nas_pdu: OctetString,
         redcap_indication: bool,
+        s_nssai_list: Vec<SNssai>,
         via: &str,
     ) {
         if redcap_indication {
@@ -496,6 +520,7 @@ impl RrcTask {
                 result.nas_pdu,
                 result.establishment_cause,
                 result.s_tmsi,
+                s_nssai_list,
             )
             .await;
 
@@ -863,12 +888,14 @@ impl RrcTask {
         pdu: OctetString,
         rrc_establishment_cause: i64,
         s_tmsi: Option<GutiMobileIdentity>,
+        s_nssai_list: Vec<SNssai>,
     ) {
         let msg = NgapMessage::InitialNasDelivery {
             ue_id,
             pdu,
             rrc_establishment_cause,
             s_tmsi,
+            s_nssai_list,
         };
         if let Err(e) = self.task_base.ngap_tx.send(msg).await {
             error!("Failed to send Initial NAS to NGAP: {}", e);

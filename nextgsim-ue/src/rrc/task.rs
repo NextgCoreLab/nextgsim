@@ -46,7 +46,7 @@ use nextgsim_rrc::codec::{decode_rrc, CellGroupConfig, RadioBearerConfig};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup, encode_rrc_setup_complete, encode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
-    RrcSetupRequestParams, UeIdentity,
+    RrcSetupRequestParams, SNssai as RrcSNssai, UeIdentity,
 };
 use nextgsim_rrc::procedures::security_mode::{
     decode_security_mode_command, encode_security_mode_complete, SecurityModeCommandData,
@@ -942,6 +942,30 @@ impl RrcTask {
             info!("Signalling RedCap (Reduced Capability) indication in RRCSetupComplete");
         }
 
+        // Advertise the UE's configured S-NSSAI(s) in RRCSetupComplete so the
+        // gNB can perform slice-aware AMF selection (TS 38.331 §6.2.2,
+        // TS 38.413 §8.6.1.2). An empty configured NSSAI signals none.
+        let configured = &self.task_base.config.configured_nssai.slices;
+        let s_nssai_list: Option<Vec<RrcSNssai>> = if configured.is_empty() {
+            None
+        } else {
+            Some(
+                configured
+                    .iter()
+                    .map(|s| RrcSNssai {
+                        sst: s.sst,
+                        sd: s.sd_as_u32(),
+                    })
+                    .collect(),
+            )
+        };
+        if let Some(ref list) = s_nssai_list {
+            info!(
+                "Signalling {} configured S-NSSAI(s) in RRCSetupComplete",
+                list.len()
+            );
+        }
+
         let params = RrcSetupCompleteParams {
             registered_amf: None,
             // Wave-6 C2/C4-interim: the echoed tid stays PINNED to 0 until C5
@@ -954,7 +978,7 @@ impl RrcTask {
             rrc_transaction_id: 0,
             selected_plmn_identity: 1,
             guami_type: None,
-            s_nssai_list: None,
+            s_nssai_list,
             dedicated_nas_message: nas_data.clone(),
             ng_5g_s_tmsi_value: None,
             redcap_indication,
