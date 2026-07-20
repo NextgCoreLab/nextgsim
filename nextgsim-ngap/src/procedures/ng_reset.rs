@@ -18,7 +18,10 @@
 
 use crate::codec::generated::*;
 use crate::codec::{decode_ngap_pdu, encode_ngap_pdu, NgapCodecError};
-use crate::procedures::ng_setup::{parse_cause, NgSetupFailureCause};
+use crate::procedures::ng_setup::{
+    parse_cause, parse_plmn_support_list, parse_served_guami_list, NgSetupFailureCause,
+    PlmnSupportItem, ServedGuamiItem,
+};
 use thiserror::Error;
 
 /// Errors that can occur during NG Reset / AMF Configuration Update handling.
@@ -252,12 +255,12 @@ pub fn decode_ng_reset_acknowledge(bytes: &[u8]) -> Result<NgResetAcknowledgePar
 pub struct AmfConfigurationUpdateData {
     /// Updated AMF name, if present.
     pub amf_name: Option<String>,
-    /// Number of served GUAMIs advertised (0 if the IE is absent).
-    pub served_guami_count: usize,
+    /// Updated served-GUAMI list (empty if the IE is absent).
+    pub served_guami_list: Vec<ServedGuamiItem>,
     /// Relative AMF capacity (0..255), if present.
     pub relative_amf_capacity: Option<u8>,
-    /// Whether a PLMN Support List IE was included.
-    pub has_plmn_support_list: bool,
+    /// Updated PLMN support list (empty if the IE is absent).
+    pub plmn_support_list: Vec<PlmnSupportItem>,
 }
 
 /// Parameters for building an AMF Configuration Update Acknowledge.
@@ -310,13 +313,13 @@ pub fn parse_amf_configuration_update(
                 data.amf_name = Some(name.0.clone());
             }
             AMFConfigurationUpdateProtocolIEs_EntryValue::Id_ServedGUAMIList(list) => {
-                data.served_guami_count = list.0.len();
+                data.served_guami_list = parse_served_guami_list(list);
             }
             AMFConfigurationUpdateProtocolIEs_EntryValue::Id_RelativeAMFCapacity(cap) => {
                 data.relative_amf_capacity = Some(cap.0);
             }
-            AMFConfigurationUpdateProtocolIEs_EntryValue::Id_PLMNSupportList(_) => {
-                data.has_plmn_support_list = true;
+            AMFConfigurationUpdateProtocolIEs_EntryValue::Id_PLMNSupportList(list) => {
+                data.plmn_support_list = parse_plmn_support_list(list);
             }
             _ => {}
         }

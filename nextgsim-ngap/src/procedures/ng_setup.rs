@@ -475,7 +475,7 @@ pub fn parse_ng_setup_response(pdu: &NGAP_PDU) -> Result<NgSetupResponseData, Ng
     })
 }
 
-fn parse_served_guami_list(list: &ServedGUAMIList) -> Vec<ServedGuamiItem> {
+pub(crate) fn parse_served_guami_list(list: &ServedGUAMIList) -> Vec<ServedGuamiItem> {
     list.0
         .iter()
         .map(|item| {
@@ -545,7 +545,7 @@ fn parse_guami(guami: &GUAMI) -> Guami {
     }
 }
 
-fn parse_plmn_support_list(list: &PLMNSupportList) -> Vec<PlmnSupportItem> {
+pub(crate) fn parse_plmn_support_list(list: &PLMNSupportList) -> Vec<PlmnSupportItem> {
     list.0
         .iter()
         .map(|item| {
