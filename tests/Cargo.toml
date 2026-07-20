@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# Enables the 6G AI-native integration tests (src/sixg_task_integration.rs),
+# which drive the optional 6G task types re-exported only from a `--features 6g`
+# build of nextgsim-gnb. Off by default so `cargo test --workspace` exercises the
+# lean gNB build. Run the 6G tests with:
+#   cargo test -p nextgsim-integration-tests --features 6g
+6g = ["nextgsim-gnb/6g"]
+
 [dependencies]
 # Internal crates
 nextgsim-common = { path = "../nextgsim-common" }

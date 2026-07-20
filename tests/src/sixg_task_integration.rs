@@ -7,7 +7,13 @@
 //! - Message delivery through mpsc channels to running task loops
 //! - State transitions inside each task (Agent, FL, ISAC, NWDAF)
 //! - NWDAF → RRC handover recommendation cross-task wiring
+//!
+//! The 6G task types (`AgentTask`/`FlAggregatorTask`/`IsacTask`/`NwdafTask`) are
+//! only re-exported from a `--features 6g` build of `nextgsim-gnb`, so this whole
+//! test binary is gated on the tests crate's `6g` feature (see Cargo.toml). Under
+//! a default (lean) `cargo test --workspace` it compiles to an empty binary.
 
+#![cfg(feature = "6g")]
 #![allow(unused_imports)]
 
 use std::time::Duration;

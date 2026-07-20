@@ -25,10 +25,23 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use nextgsim_gnb::{
-    load_and_validate_gnb_config, AgentTask, AppTask, EnergyTask, FlAggregatorTask, GtpTask,
-    IsacTask, NgapTask, NkefTask, NwdafTask, RlsTask, RrcTask, SctpMessage, SctpTask, SheTask,
-    Task, TaskError, TaskManager, TaskMessage, DEFAULT_CHANNEL_CAPACITY, NGAP_PPID,
+    load_and_validate_gnb_config, AppTask, EnergyTask, GtpTask, NgapTask, RlsTask, RrcTask,
+    SctpMessage, SctpTask, Task, TaskError, TaskManager, TaskMessage, DEFAULT_CHANNEL_CAPACITY,
+    NGAP_PPID,
 };
+// Optional 6G AI-native task types — only present when their crate feature is on.
+#[cfg(feature = "nextgsim-agent")]
+use nextgsim_gnb::AgentTask;
+#[cfg(feature = "nextgsim-fl")]
+use nextgsim_gnb::FlAggregatorTask;
+#[cfg(feature = "nextgsim-isac")]
+use nextgsim_gnb::IsacTask;
+#[cfg(feature = "nextgsim-nkef")]
+use nextgsim_gnb::NkefTask;
+#[cfg(feature = "nextgsim-nwdaf")]
+use nextgsim_gnb::NwdafTask;
+#[cfg(feature = "nextgsim-she")]
+use nextgsim_gnb::SheTask;
 
 /// nextgsim gNB - 5G gNodeB Simulator
 #[derive(Parser, Debug)]
@@ -189,69 +202,88 @@ impl GnbApp {
             info!("Energy task spawned");
         }
 
-        // Spawn 6G AI-native network function tasks (Rel-20)
-        let any_6g = task_base.config.she_enabled
-            || task_base.config.nwdaf_enabled
-            || task_base.config.nkef_enabled
-            || task_base.config.isac_enabled
-            || task_base.config.agent_enabled
-            || task_base.config.federated_learning_enabled;
+        // Spawn 6G AI-native network function tasks (Rel-20). The 6G crates are
+        // optional (off by default); the whole block compiles away when none of
+        // the `nextgsim-*` features are enabled. A `*_enabled` config flag set
+        // without its feature compiled in is a no-op — mirroring the UE side.
+        #[cfg(any(
+            feature = "nextgsim-she",
+            feature = "nextgsim-nwdaf",
+            feature = "nextgsim-nkef",
+            feature = "nextgsim-isac",
+            feature = "nextgsim-agent",
+            feature = "nextgsim-fl",
+        ))]
+        {
+            let any_6g = cfg!(feature = "nextgsim-she") && task_base.config.she_enabled
+                || cfg!(feature = "nextgsim-nwdaf") && task_base.config.nwdaf_enabled
+                || cfg!(feature = "nextgsim-nkef") && task_base.config.nkef_enabled
+                || cfg!(feature = "nextgsim-isac") && task_base.config.isac_enabled
+                || cfg!(feature = "nextgsim-agent") && task_base.config.agent_enabled
+                || cfg!(feature = "nextgsim-fl") && task_base.config.federated_learning_enabled;
 
-        if any_6g {
-            let sixg_rxs = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
+            if any_6g {
+                let sixg_rxs = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
 
-            if task_base.config.she_enabled {
-                let mut she_task = SheTask::new(task_base.clone());
-                tokio::spawn(async move {
-                    she_task.run(sixg_rxs.she_rx).await;
-                    Ok::<(), TaskError>(())
-                });
-                info!("SHE task spawned");
-            }
+                #[cfg(feature = "nextgsim-she")]
+                if task_base.config.she_enabled {
+                    let mut she_task = SheTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        she_task.run(sixg_rxs.she_rx).await;
+                        Ok::<(), TaskError>(())
+                    });
+                    info!("SHE task spawned");
+                }
 
-            if task_base.config.nwdaf_enabled {
-                let mut nwdaf_task = NwdafTask::new(task_base.clone());
-                tokio::spawn(async move {
-                    nwdaf_task.run(sixg_rxs.nwdaf_rx).await;
-                    Ok::<(), TaskError>(())
-                });
-                info!("NWDAF task spawned");
-            }
+                #[cfg(feature = "nextgsim-nwdaf")]
+                if task_base.config.nwdaf_enabled {
+                    let mut nwdaf_task = NwdafTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        nwdaf_task.run(sixg_rxs.nwdaf_rx).await;
+                        Ok::<(), TaskError>(())
+                    });
+                    info!("NWDAF task spawned");
+                }
 
-            if task_base.config.nkef_enabled {
-                let mut nkef_task = NkefTask::new(task_base.clone());
-                tokio::spawn(async move {
-                    nkef_task.run(sixg_rxs.nkef_rx).await;
-                    Ok::<(), TaskError>(())
-                });
-                info!("NKEF task spawned");
-            }
+                #[cfg(feature = "nextgsim-nkef")]
+                if task_base.config.nkef_enabled {
+                    let mut nkef_task = NkefTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        nkef_task.run(sixg_rxs.nkef_rx).await;
+                        Ok::<(), TaskError>(())
+                    });
+                    info!("NKEF task spawned");
+                }
 
-            if task_base.config.isac_enabled {
-                let mut isac_task = IsacTask::new(task_base.clone());
-                tokio::spawn(async move {
-                    isac_task.run(sixg_rxs.isac_rx).await;
-                    Ok::<(), TaskError>(())
-                });
-                info!("ISAC task spawned");
-            }
+                #[cfg(feature = "nextgsim-isac")]
+                if task_base.config.isac_enabled {
+                    let mut isac_task = IsacTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        isac_task.run(sixg_rxs.isac_rx).await;
+                        Ok::<(), TaskError>(())
+                    });
+                    info!("ISAC task spawned");
+                }
 
-            if task_base.config.agent_enabled {
-                let mut agent_task = AgentTask::new(task_base.clone());
-                tokio::spawn(async move {
-                    agent_task.run(sixg_rxs.agent_rx).await;
-                    Ok::<(), TaskError>(())
-                });
-                info!("Agent task spawned");
-            }
+                #[cfg(feature = "nextgsim-agent")]
+                if task_base.config.agent_enabled {
+                    let mut agent_task = AgentTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        agent_task.run(sixg_rxs.agent_rx).await;
+                        Ok::<(), TaskError>(())
+                    });
+                    info!("Agent task spawned");
+                }
 
-            if task_base.config.federated_learning_enabled {
-                let mut fl_task = FlAggregatorTask::new(task_base.clone());
-                tokio::spawn(async move {
-                    fl_task.run(sixg_rxs.fl_rx).await;
-                    Ok::<(), TaskError>(())
-                });
-                info!("FL Aggregator task spawned");
+                #[cfg(feature = "nextgsim-fl")]
+                if task_base.config.federated_learning_enabled {
+                    let mut fl_task = FlAggregatorTask::new(task_base.clone());
+                    tokio::spawn(async move {
+                        fl_task.run(sixg_rxs.fl_rx).await;
+                        Ok::<(), TaskError>(())
+                    });
+                    info!("FL Aggregator task spawned");
+                }
             }
         }
     }
