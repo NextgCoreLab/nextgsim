@@ -1,7 +1,10 @@
-//! LLM-based Analytics Integration
+//! Keyword-templated analytics mock (placeholder for LLM integration)
 //!
-//! Integrates Large Language Models for advanced network analytics using NKEF
-//! as the knowledge backend (RAG - Retrieval Augmented Generation).
+//! This module does **not** run a Large Language Model or perform NKEF-based
+//! RAG. `query()` pattern-matches substrings of the request and returns
+//! hardcoded narrative templates; it consults no knowledge store and computes
+//! no model score. A real LLM/RAG path would route through `nextgsim-ai` / NKEF
+//! behind a dedicated feature.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,10 +55,10 @@ pub struct LlmAnalyticsResponse {
     pub related_analytics: Vec<AnalyticsId>,
 }
 
-/// LLM analytics engine
+/// Analytics query engine (keyword-templated mock).
 ///
-/// Provides natural language interface to network analytics using LLMs
-/// with NKEF-based RAG for grounding responses in actual network state.
+/// Returns hardcoded narrative templates keyed off substrings of the query; it
+/// does not invoke an LLM or NKEF/RAG and grounds nothing in live state.
 #[derive(Debug)]
 pub struct LlmAnalyticsEngine {
     /// Whether engine is enabled
@@ -204,14 +207,14 @@ impl LlmAnalyticsEngine {
             )
         };
 
+        // The keyword-templated mock consults no knowledge store, so it reports
+        // no sources; `confidence` is a coarse placeholder (higher when the query
+        // matched a known analytics template) and is NOT a computed model score.
+        let confidence = if related_analytics.is_empty() { 0.2 } else { 0.5 };
         LlmAnalyticsResponse {
             response,
-            confidence: 0.75,
-            sources: vec![
-                "NKEF knowledge graph".to_string(),
-                "UE mobility analytics".to_string(),
-                "Cell load history".to_string(),
-            ],
+            confidence,
+            sources: Vec::new(),
             suggested_actions: actions,
             related_analytics,
         }
@@ -242,6 +245,31 @@ impl Default for LlmAnalyticsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mock_response_no_fabricated_provenance() {
+        let mut engine = LlmAnalyticsEngine::new(true);
+        let r1 = engine
+            .query(LlmAnalyticsQuery {
+                query: "mobility trends".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let r2 = engine
+            .query(LlmAnalyticsQuery {
+                query: "unclassified request".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        // The mock consults no knowledge store: no fabricated RAG provenance.
+        assert!(r1.sources.is_empty());
+        assert!(r2.sources.is_empty());
+        // Confidence is no longer the fabricated fixed 0.75 literal, and a
+        // matched template differs from the generic fallback.
+        assert_ne!(r1.confidence, 0.75);
+        assert_ne!(r2.confidence, 0.75);
+        assert_ne!(r1.confidence, r2.confidence);
+    }
 
     #[test]
     fn test_llm_engine_creation() {

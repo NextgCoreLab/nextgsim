@@ -1,6 +1,11 @@
 //! Network Data Analytics Function (NWDAF) for 6G Networks
 //!
-//! Implements NWDAF per 3GPP TS 23.288 with four-layer analytics:
+//! This crate is a **research prototype**. It is architecturally aligned with the
+//! NWDAF analytics concepts of 3GPP TS 23.288, but runs entirely in-process: it
+//! implements no Nnwdaf SBI surface, no TS 29.500 ProblemDetails error model and
+//! no notification correlation IDs, and it is not conformance-tested.
+//!
+//! It models a four-layer analytics stack:
 //! - Layer 1: Real-time anomaly detection
 //! - Layer 2: Predictive analytics (trajectory, load)
 //! - Layer 3: Prescriptive optimization
@@ -51,7 +56,7 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # 3GPP Compliance
+//! # 3GPP Alignment
 //!
 //! This implementation aligns with:
 //! - 3GPP TS 23.288: Network Data Analytics Services

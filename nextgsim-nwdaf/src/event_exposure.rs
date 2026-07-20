@@ -187,10 +187,14 @@ pub enum MobilityState {
 }
 
 /// Event exposure manager
+/// Upper bound on retained event notifications. Prevents unbounded growth on
+/// long-lived runs; the oldest entries are evicted first once the cap is hit.
+const MAX_NOTIFICATIONS: usize = 10_000;
+
 pub struct EventExposureManager {
     /// Active subscriptions
     subscriptions: HashMap<String, EventSubscription>,
-    /// Received event notifications
+    /// Received event notifications (bounded at `MAX_NOTIFICATIONS`)
     notifications: Vec<EventNotification>,
     /// Next subscription ID counter
     next_subscription_id: u64,
@@ -277,6 +281,10 @@ impl EventExposureManager {
             }
         })?;
 
+        // Drop notifications belonging to the removed subscription so they do
+        // not accumulate for a subscription that can no longer be queried.
+        self.notifications
+            .retain(|n| n.subscription_id != subscription_id);
         info!("Deleted event subscription: {}", subscription_id);
         Ok(())
     }
@@ -289,6 +297,11 @@ impl EventExposureManager {
         );
 
         self.notifications.push(notification);
+        // Bound the buffer: evict the oldest entries once the cap is exceeded.
+        if self.notifications.len() > MAX_NOTIFICATIONS {
+            let excess = self.notifications.len() - MAX_NOTIFICATIONS;
+            self.notifications.drain(0..excess);
+        }
     }
 
     /// Gets all notifications for a subscription
@@ -337,6 +350,38 @@ impl Default for EventExposureManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_notifications_bounded_and_pruned_on_delete() {
+        let mut manager = EventExposureManager::new();
+        let sub = manager.create_subscription(
+            EventType::LoadLevel,
+            NfType::Amf,
+            "http://nwdaf:8080/notify".to_string(),
+            Some(60),
+        );
+        let make = |id: &str| EventNotification {
+            subscription_id: id.to_string(),
+            event_type: EventType::LoadLevel,
+            nf_instance_id: "amf-001".to_string(),
+            event_data: EventData::LoadLevel {
+                load_percentage: 50,
+                registered_ues: 10,
+            },
+            timestamp_ms: 0,
+        };
+        // Bounded: pushing past the cap keeps the buffer within MAX_NOTIFICATIONS.
+        for _ in 0..(MAX_NOTIFICATIONS + 25) {
+            manager.receive_notification(make(&sub.subscription_id));
+        }
+        assert!(manager.notifications.len() <= MAX_NOTIFICATIONS);
+        // Pruned on delete: the deleted subscription's notifications are dropped.
+        manager.delete_subscription(&sub.subscription_id).unwrap();
+        assert!(manager
+            .notifications
+            .iter()
+            .all(|n| n.subscription_id != sub.subscription_id));
+    }
 
     #[test]
     fn test_create_subscription() {
