@@ -70,6 +70,9 @@ use nextgsim_ngap::procedures::ng_reset::{
 use nextgsim_ngap::procedures::ng_setup::{
     NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
 };
+use nextgsim_ngap::procedures::overload::{
+    decode_overload_start, decode_overload_stop, OverloadData,
+};
 use nextgsim_ngap::procedures::paging::{decode_paging, PagingData, UePagingIdentityValue};
 use nextgsim_ngap::procedures::path_switch::{
     decode_path_switch_request_acknowledge, decode_path_switch_request_failure,
@@ -2196,6 +2199,10 @@ impl NgapTask {
                         .await;
                 } else if let Ok(paging) = decode_paging(pdu_bytes) {
                     self.handle_paging(client_id, paging).await;
+                } else if let Ok(overload) = decode_overload_start(pdu_bytes) {
+                    self.handle_overload_start(client_id, overload).await;
+                } else if decode_overload_stop(pdu_bytes).is_ok() {
+                    self.handle_overload_stop(client_id).await;
                 } else if let Ok(err_ind) = decode_error_indication(pdu_bytes) {
                     // TS 38.413 §8.7.5: a received Error Indication is processed
                     // locally and MUST NOT be answered with another Error
@@ -2304,6 +2311,36 @@ impl NgapTask {
         let msg = GtpMessage::UeContextRelease { ue_id };
         if let Err(e) = self.task_base.gtp_tx.send(msg).await {
             error!("Failed to send UE context release to GTP: {}", e);
+        }
+    }
+
+    /// Handle an inbound OVERLOAD START (TS 38.413 §8.7.7): mark the AMF as
+    /// overloaded and record the traffic-load-reduction indication. Because
+    /// `select_amf` only picks `Ready` AMFs, an overloaded AMF is automatically
+    /// diverted from new UE routing. No reply is sent (Overload Start is a
+    /// class-2 procedure), and it is no longer answered with an Error Indication.
+    async fn handle_overload_start(&mut self, amf_id: i32, overload: OverloadData) {
+        if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
+            ctx.on_overload_start();
+            ctx.traffic_load_reduction = overload.traffic_load_reduction;
+            info!(
+                "AMF[{}] entered OVERLOAD (state={:?}, traffic_load_reduction={:?})",
+                amf_id, ctx.state, ctx.traffic_load_reduction
+            );
+        } else {
+            warn!("OVERLOAD START for unknown AMF association {}", amf_id);
+        }
+    }
+
+    /// Handle an inbound OVERLOAD STOP (TS 38.413 §8.7.8): clear the overload
+    /// state so the AMF is eligible for UE routing again.
+    async fn handle_overload_stop(&mut self, amf_id: i32) {
+        if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
+            ctx.on_overload_stop();
+            ctx.traffic_load_reduction = None;
+            info!("AMF[{}] cleared OVERLOAD (state={:?})", amf_id, ctx.state);
+        } else {
+            warn!("OVERLOAD STOP for unknown AMF association {}", amf_id);
         }
     }
 
@@ -4339,5 +4376,53 @@ mod tests {
             },
             other => panic!("expected InitiatingMessage, got {other:?}"),
         }
+    }
+
+    // ---- Overload Start / Stop (issue #41) ----------------------------------
+
+    /// OVERLOAD START drives the AMF context into `Overloaded` (which excludes it
+    /// from `select_amf`) and records the traffic-load-reduction; OVERLOAD STOP
+    /// clears it. Neither is echoed with an Error Indication (TS 38.413 §8.7.7/8).
+    #[tokio::test]
+    async fn test_overload_start_stop_marks_amf_without_echo() {
+        use nextgsim_ngap::procedures::overload::{encode_overload_start, encode_overload_stop};
+
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 4, 4);
+            ctx.state = AmfState::Ready;
+        }
+
+        // OVERLOAD START → Overloaded + reduction stored, no reply.
+        let start = encode_overload_start(Some(75)).expect("encode start");
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&start))
+            .await;
+        {
+            let ctx = task.find_amf_context_mut(1).unwrap();
+            assert_eq!(ctx.state, AmfState::Overloaded);
+            assert_eq!(ctx.traffic_load_reduction, Some(75));
+        }
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "Overload Start must not be answered with an Error Indication"
+        );
+
+        // OVERLOAD STOP → Ready, reduction cleared, no reply.
+        let stop = encode_overload_stop().expect("encode stop");
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&stop))
+            .await;
+        {
+            let ctx = task.find_amf_context_mut(1).unwrap();
+            assert_eq!(ctx.state, AmfState::Ready);
+            assert_eq!(ctx.traffic_load_reduction, None);
+        }
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "Overload Stop must not be answered with an Error Indication"
+        );
     }
 }
