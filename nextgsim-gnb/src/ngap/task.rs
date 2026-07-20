@@ -26,7 +26,7 @@ use crate::tasks::{
 };
 use nextgsim_common::OctetString;
 
-use super::amf_context::{AmfState, NgapAmfContext};
+use super::amf_context::{AmfIdentity, AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
 use crate::rrc::transaction::RrcProcedure;
@@ -219,43 +219,112 @@ impl NgapTask {
         self.amf_contexts.get_mut(&client_id)
     }
 
-    /// Selects an AMF for a new UE by slice support and capacity
-    /// (TS 38.413 §8.6.1.2, TS 23.501 §5.15.5.2.1).
+    /// Selects an AMF for a new UE by slice support and capacity, treating
+    /// multiple TNLAs of one AMF as a single AMF and load-balancing across them
+    /// (TS 38.413 §8.6.1.2, TS 38.412 §7, TS 23.501 §5.15.5.2.1).
     ///
-    /// Candidates are AMFs that are `Ready` and not marked `unavailable` by an
-    /// AMF Status Indication (TS 38.413 §8.7.6). When the UE requested one or
-    /// more S-NSSAIs, an AMF is preferred only if it advertises support for
-    /// *every* requested slice on the serving `plmn` (its NG Setup / AMF
-    /// Configuration Update `plmn_support_list`); ties break on relative
-    /// capacity. An empty `requested` list imposes no slice constraint.
+    /// Candidate TNLAs are `Ready`, not marked `unavailable` by an AMF Status
+    /// Indication (TS 38.413 §8.7.6), and — when the UE requested one or more
+    /// S-NSSAIs — advertise support for *every* requested slice on the serving
+    /// `plmn`. Candidates are grouped into logical AMFs by GUAMI identity so
+    /// two associations for the same AMF are not double-counted; the
+    /// highest-capacity AMF wins, and among that AMF's TNLAs the least-loaded
+    /// association is chosen. An empty `requested` list imposes no slice
+    /// constraint.
     ///
     /// If no Ready AMF serves the requested slices, selection falls back to the
     /// highest-capacity Ready AMF so the UE can still attach (the AMF then
     /// applies its own NSSAI policy) — this also preserves the pre-slice
     /// behaviour for deployments whose AMFs advertise no slice support.
+    ///
+    /// Returns the client_id of the chosen TNLA (the transport association the
+    /// UE binds to), or `None` if no AMF is available.
     fn select_amf(&self, plmn: &[u8; 3], requested: &[SNssai]) -> Option<i32> {
-        if !requested.is_empty() {
-            if let Some(ctx_id) = self
-                .amf_contexts
-                .values()
-                .filter(|ctx| ctx.is_ready() && !ctx.unavailable)
-                .filter(|ctx| requested.iter().all(|s| ctx.supports_snssai(plmn, s)))
-                .max_by_key(|ctx| ctx.relative_capacity)
-                .map(|ctx| ctx.ctx_id)
-            {
-                return Some(ctx_id);
-            }
-            warn!(
-                "No Ready AMF advertises the requested S-NSSAI {:?} for PLMN {:02x?}; falling back to capacity-only AMF selection",
-                requested, plmn
-            );
+        // A candidate TNLA is Ready, available, and (if a slice was requested)
+        // serves every requested S-NSSAI on the serving PLMN.
+        let is_candidate = |ctx: &&NgapAmfContext| {
+            ctx.is_ready()
+                && !ctx.unavailable
+                && (requested.is_empty() || requested.iter().all(|s| ctx.supports_snssai(plmn, s)))
+        };
+
+        // Group candidate TNLAs into logical AMFs by GUAMI identity so that
+        // multiple TNLAs serving one AMF (TS 38.412 §7) are one selection
+        // target. A TNLA with no served GUAMI yet is its own singleton AMF.
+        #[derive(PartialEq, Eq, Hash)]
+        enum AmfKey {
+            Guami(AmfIdentity),
+            Association(i32),
+        }
+        let mut instances: HashMap<AmfKey, Vec<i32>> = HashMap::new();
+        for ctx in self.amf_contexts.values().filter(is_candidate) {
+            let key = match ctx.amf_identity() {
+                Some(id) => AmfKey::Guami(id),
+                None => AmfKey::Association(ctx.ctx_id),
+            };
+            instances.entry(key).or_default().push(ctx.ctx_id);
         }
 
-        self.amf_contexts
+        if instances.is_empty() {
+            if !requested.is_empty() {
+                warn!(
+                    "No Ready AMF advertises the requested S-NSSAI {:?} for PLMN {:02x?}; falling back to capacity-only AMF selection",
+                    requested, plmn
+                );
+                return self.select_amf(plmn, &[]);
+            }
+            return None;
+        }
+
+        // Highest-capacity AMF wins (deterministic tie-break: lowest member
+        // TNLA id); then load-balance across that AMF's TNLAs by choosing the
+        // least-loaded association (tie-break: lowest TNLA id).
+        let best = instances.values().max_by_key(|tnlas| {
+            let capacity = tnlas
+                .iter()
+                .filter_map(|id| self.amf_contexts.get(id))
+                .map(|ctx| ctx.relative_capacity)
+                .max()
+                .unwrap_or(0);
+            let lowest_tnla = tnlas.iter().min().copied().unwrap_or(i32::MAX);
+            (capacity, std::cmp::Reverse(lowest_tnla))
+        })?;
+
+        best.iter()
+            .copied()
+            .min_by_key(|id| (self.ue_load(*id), *id))
+    }
+
+    /// Number of UE contexts currently bound to the given AMF association
+    /// (TNLA). Used to spread new UEs across the TNLAs of a multi-TNLA AMF.
+    fn ue_load(&self, amf_ctx_id: i32) -> usize {
+        self.ue_contexts
             .values()
-            .filter(|ctx| ctx.is_ready() && !ctx.unavailable)
-            .max_by_key(|ctx| ctx.relative_capacity)
-            .map(|ctx| ctx.ctx_id)
+            .filter(|ue| ue.amf_ctx_id == amf_ctx_id)
+            .count()
+    }
+
+    /// Groups AMF associations (TNLAs) by GUAMI identity so that multiple TNLAs
+    /// serving the same AMF (TS 38.412 §7) are reported as one AMF. Only
+    /// associations that carry a served GUAMI (post-NG-Setup) appear. Returned
+    /// as (identity, sorted TNLA ids), ordered by lowest TNLA id.
+    #[allow(dead_code)]
+    fn amf_instances(&self) -> Vec<(AmfIdentity, Vec<i32>)> {
+        let mut groups: HashMap<AmfIdentity, Vec<i32>> = HashMap::new();
+        for ctx in self.amf_contexts.values() {
+            if let Some(id) = ctx.amf_identity() {
+                groups.entry(id).or_default().push(ctx.ctx_id);
+            }
+        }
+        let mut out: Vec<(AmfIdentity, Vec<i32>)> = groups
+            .into_iter()
+            .map(|(id, mut tnlas)| {
+                tnlas.sort();
+                (id, tnlas)
+            })
+            .collect();
+        out.sort_by_key(|(_, tnlas)| tnlas.first().copied().unwrap_or(i32::MAX));
+        out
     }
 
     // ========================================================================
@@ -3841,6 +3910,112 @@ mod tests {
             task.select_amf(&plmn, &[SNssai { sst: 9, sd: None }]),
             Some(1)
         );
+    }
+
+    /// AMF identity by GUAMI (TS 38.412 §7, issue #41 criterion 8): two SCTP
+    /// associations advertising the same GUAMI are one AMF reached over two
+    /// TNLAs; a distinct GUAMI is a separate AMF.
+    #[test]
+    fn test_amf_instances_group_tnlas_by_guami() {
+        use nextgsim_ngap::procedures::{Guami, ServedGuamiItem};
+
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        let plmn = [0x00, 0xf1, 0x10];
+
+        // Two associations (TNLAs) advertising the SAME GUAMI = one AMF.
+        for client in [1, 2] {
+            task.create_amf_context(client);
+            if let Some(ctx) = task.find_amf_context_mut(client) {
+                ctx.on_association_up(100 + client, 4, 4);
+                ctx.state = AmfState::Ready;
+                ctx.served_guami_list = vec![ServedGuamiItem {
+                    guami: Guami {
+                        plmn_identity: plmn,
+                        amf_region_id: 1,
+                        amf_set_id: 2,
+                        amf_pointer: 3,
+                    },
+                    backup_amf_name: None,
+                }];
+            }
+        }
+        // A third association for a DIFFERENT AMF (different AMF Pointer).
+        task.create_amf_context(3);
+        if let Some(ctx) = task.find_amf_context_mut(3) {
+            ctx.on_association_up(103, 4, 4);
+            ctx.state = AmfState::Ready;
+            ctx.served_guami_list = vec![ServedGuamiItem {
+                guami: Guami {
+                    plmn_identity: plmn,
+                    amf_region_id: 1,
+                    amf_set_id: 2,
+                    amf_pointer: 9,
+                },
+                backup_amf_name: None,
+            }];
+        }
+
+        let instances = task.amf_instances();
+        assert_eq!(instances.len(), 2, "two GUAMIs => two logical AMFs");
+        let (id0, tnlas0) = &instances[0];
+        assert_eq!(id0.amf_pointer, 3);
+        assert_eq!(
+            tnlas0,
+            &vec![1, 2],
+            "same-GUAMI associations collapse to one AMF with two TNLAs"
+        );
+        let (id1, tnlas1) = &instances[1];
+        assert_eq!(id1.amf_pointer, 9);
+        assert_eq!(tnlas1, &vec![3]);
+    }
+
+    /// Multiple-TNLA load balancing (TS 38.412 §7, issue #41 criterion 8):
+    /// new UEs spread across the TNLAs of one AMF instead of piling on one.
+    #[test]
+    fn test_select_amf_load_balances_across_tnlas() {
+        use nextgsim_ngap::procedures::{Guami, ServedGuamiItem};
+
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        let plmn = [0x00, 0xf1, 0x10];
+
+        // Two TNLAs of the SAME AMF (same GUAMI), equal capacity.
+        for client in [1, 2] {
+            task.create_amf_context(client);
+            if let Some(ctx) = task.find_amf_context_mut(client) {
+                ctx.on_association_up(100 + client, 4, 4);
+                ctx.state = AmfState::Ready;
+                ctx.relative_capacity = 100;
+                ctx.served_guami_list = vec![ServedGuamiItem {
+                    guami: Guami {
+                        plmn_identity: plmn,
+                        amf_region_id: 1,
+                        amf_set_id: 2,
+                        amf_pointer: 3,
+                    },
+                    backup_amf_name: None,
+                }];
+            }
+        }
+
+        // First UE lands on the lower TNLA id (both idle).
+        let first = task.select_amf(&plmn, &[]).unwrap();
+        assert_eq!(first, 1);
+        task.create_ue_context(10, first);
+        // Next selection load-balances onto the other TNLA of the same AMF.
+        let second = task.select_amf(&plmn, &[]).unwrap();
+        assert_eq!(
+            second, 2,
+            "second UE load-balanced onto the other TNLA of the same AMF"
+        );
+        task.create_ue_context(11, second);
+        // Both TNLAs now at load 1 → tie breaks back to the lower id.
+        assert_eq!(task.select_amf(&plmn, &[]).unwrap(), 1);
     }
 
     #[test]
