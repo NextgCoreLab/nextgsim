@@ -52,7 +52,8 @@ use nextgsim_nas::security::{
 
 use crate::timer::{
     GprsTimer2, GprsTimer3, NasTimerManager, TimerExpiryEvent, TIMER_T3346, TIMER_T3502,
-    TIMER_T3510, TIMER_T3511, TIMER_T3512, TIMER_T3516, TIMER_T3517, TIMER_T3520, TIMER_T3521,
+    TIMER_T3510, TIMER_T3511, TIMER_T3512, TIMER_T3516, TIMER_T3517, TIMER_T3519, TIMER_T3520,
+    TIMER_T3521,
 };
 
 use super::deregistration::DeregistrationProcedure;
@@ -426,6 +427,12 @@ pub struct MmOrchestrator {
     // -- deregistration state --
     dereg_pdu: Option<Vec<u8>>,
 
+    // -- SUCI freshness (TS 24.501 §5.4.3.3 / §5.5.1.2.2) --
+    /// The last SUCI sent to the network. Reused while T3519 is running instead
+    /// of generating a fresh ECIES concealment on every IDENTITY/REGISTRATION
+    /// request (TS 33.501 §6.12.4 frequency limit).
+    stored_suci: Option<Vec<u8>>,
+
     // -- UE policy delivery service (UPDP, TS 24.501 Annex D) --
     /// UE policy sections stored by `(PLMN, UPSC)` (TS 24.501 D.2.1.3 / D.3).
     ue_policy_sections: HashMap<(PlmnId, u16), StoredUePolicySection>,
@@ -460,8 +467,29 @@ impl MmOrchestrator {
             usim_invalid: false,
             n1_mode_disabled: false,
             dereg_pdu: None,
+            stored_suci: None,
             ue_policy_sections: HashMap::new(),
         }
+    }
+
+    /// TS 24.501 §5.4.3.3 b): while T3519 is running the UE must reuse the SUCI
+    /// it last sent instead of generating a fresh concealment. Returns the
+    /// stored SUCI to reuse, or `None` when the caller must generate (and then
+    /// store, via [`Self::store_suci_and_arm_t3519`]) a fresh one.
+    pub fn stored_suci_while_t3519_running(&self) -> Option<Vec<u8>> {
+        if self.timers.is_running(TIMER_T3519) == Some(true) {
+            self.stored_suci.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Store a freshly generated SUCI and arm T3519 so subsequent
+    /// IDENTITY/REGISTRATION requests reuse it until the timer expires
+    /// (TS 24.501 §5.4.3.3 / §5.5.1.2.2, TS 33.501 §6.12.4).
+    pub fn store_suci_and_arm_t3519(&mut self, suci: Vec<u8>) {
+        self.stored_suci = Some(suci);
+        self.timers.start(TIMER_T3519, true);
     }
 
     // ========================================================================
@@ -611,6 +639,14 @@ impl MmOrchestrator {
                 self.res_star = None;
                 Vec::new()
             }
+            TIMER_T3519 => {
+                // TS 24.501 §5.4.3.3: once T3519 expires the stored SUCI may be
+                // regenerated, so drop it and let the next request build a fresh
+                // concealment.
+                debug!("T3519 expired: clearing stored SUCI");
+                self.stored_suci = None;
+                Vec::new()
+            }
             TIMER_T3520 => {
                 // TS 24.501 5.4.1.3.7: network failed to react to the
                 // authentication failure in time
@@ -699,11 +735,14 @@ impl MmOrchestrator {
         };
 
         // TS 24.501 5.5.1.2.2: use the valid 5G-GUTI when available,
-        // otherwise the SUCI
+        // otherwise the SUCI. A SUCI sent here is stored and T3519 armed so the
+        // identity/registration paths reuse it until the timer expires.
         let mobile_identity = if let Some(ref guti) = self.stored_guti {
             guti.clone()
         } else {
-            Ie5gsMobileIdentity::new(MobileIdentityType::Suci, self.identity.suci.clone())
+            let suci = self.identity.suci.clone();
+            self.store_suci_and_arm_t3519(suci.clone());
+            Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci)
         };
 
         let mut req = RegistrationRequest::new(
@@ -1796,7 +1835,10 @@ impl MmOrchestrator {
         let mobile_identity = if let Some(ref guti) = self.stored_guti {
             guti.clone()
         } else {
-            Ie5gsMobileIdentity::new(MobileIdentityType::Suci, self.identity.suci.clone())
+            // §5.5.2.2.2: store the SUCI and arm T3519 under the same rule.
+            let suci = self.identity.suci.clone();
+            self.store_suci_and_arm_t3519(suci.clone());
+            Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci)
         };
         let req = DeregistrationRequestUeOriginating::new(
             dereg_type,
@@ -3828,6 +3870,36 @@ mod tests {
             orch.state().mm_substate(),
             MmSubState::DeregisteredNormalService
         );
+    }
+
+    // TS 24.501 §5.4.3.3: the UE reuses a stored SUCI while T3519 runs and only
+    // regenerates once the timer has expired.
+    #[test]
+    fn test_suci_reuse_while_t3519_running() {
+        use crate::timer::{TimerExpiryEvent, TIMER_T3519};
+        let mut orch = new_orch();
+
+        // T3519 is not running initially, so there is nothing to reuse.
+        assert_eq!(orch.timers().is_running(TIMER_T3519), Some(false));
+        assert!(orch.stored_suci_while_t3519_running().is_none());
+
+        // First SUCI: store it and arm T3519.
+        let first = vec![0x01u8, 0x02, 0x03, 0x04];
+        orch.store_suci_and_arm_t3519(first.clone());
+        assert_eq!(orch.timers().is_running(TIMER_T3519), Some(true));
+
+        // While T3519 runs the stored SUCI is reused byte-for-byte.
+        assert_eq!(orch.stored_suci_while_t3519_running(), Some(first.clone()));
+        assert_eq!(orch.stored_suci_while_t3519_running(), Some(first));
+
+        // On T3519 expiry the stored SUCI is cleared -> caller regenerates.
+        let out = orch.handle_timer_expiry(TimerExpiryEvent {
+            timer_code: TIMER_T3519,
+            is_mm: true,
+            expiry_count: 1,
+        });
+        assert!(out.is_empty());
+        assert!(orch.stored_suci_while_t3519_running().is_none());
     }
 
     // TS 24.501 §5.5.2.3.2: a network-initiated (non switch-off) DEREGISTRATION

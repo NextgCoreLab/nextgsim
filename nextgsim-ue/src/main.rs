@@ -1845,13 +1845,22 @@ async fn handle_unmanaged_mm_message(
                 Ok(id_req) => {
                     info!("Identity Request - Type: {:?}", id_req.identity_type.value);
 
-                    // Build a fresh SUCI for the Identity Response (fresh
-                    // ephemeral key per concealment for the ECIES profiles)
-                    let suci_data = match build_suci_from_config(&task_base.config) {
-                        Ok(suci_data) => suci_data,
-                        Err(e) => {
-                            warn!("Cannot answer Identity Request: SUCI build failed: {e}");
-                            return;
+                    // TS 24.501 §5.4.3.3 b): reuse the stored SUCI while T3519 is
+                    // running; otherwise build a fresh one, store it and arm
+                    // T3519 so the frequency limit (TS 33.501 §6.12.4) applies.
+                    let suci_data = if let Some(stored) = orch.stored_suci_while_t3519_running() {
+                        debug!("Reusing stored SUCI for Identity Response (T3519 running)");
+                        stored
+                    } else {
+                        match build_suci_from_config(&task_base.config) {
+                            Ok(fresh) => {
+                                orch.store_suci_and_arm_t3519(fresh.clone());
+                                fresh
+                            }
+                            Err(e) => {
+                                warn!("Cannot answer Identity Request: SUCI build failed: {e}");
+                                return;
+                            }
                         }
                     };
                     let mobile_identity =
