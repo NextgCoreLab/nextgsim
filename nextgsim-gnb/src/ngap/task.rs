@@ -39,6 +39,9 @@ use nextgsim_rrc::procedures::security_mode::{
 };
 
 use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu, NGAP_PDU};
+use nextgsim_ngap::procedures::amf_status_indication::{
+    decode_amf_status_indication, AmfStatusIndicationData,
+};
 use nextgsim_ngap::procedures::error_indication::{
     decode_error_indication, encode_error_indication, error_indication_abstract_syntax_error,
     error_indication_transfer_syntax_error, CriticalityDiagnosticsInfo, ErrorIndicationData,
@@ -213,10 +216,11 @@ impl NgapTask {
 
     /// Selects an AMF for a new UE based on capacity and slice support
     fn select_amf(&self, _requested_nssai: Option<i32>) -> Option<i32> {
-        // Simple selection: pick the first ready AMF with highest capacity
+        // Simple selection: pick the highest-capacity AMF that is Ready and not
+        // marked unavailable by an AMF Status Indication (TS 38.413 §8.7.6).
         self.amf_contexts
             .values()
-            .filter(|ctx| ctx.is_ready())
+            .filter(|ctx| ctx.is_ready() && !ctx.unavailable)
             .max_by_key(|ctx| ctx.relative_capacity)
             .map(|ctx| ctx.ctx_id)
     }
@@ -2203,6 +2207,8 @@ impl NgapTask {
                     self.handle_overload_start(client_id, overload).await;
                 } else if decode_overload_stop(pdu_bytes).is_ok() {
                     self.handle_overload_stop(client_id).await;
+                } else if let Ok(status) = decode_amf_status_indication(pdu_bytes) {
+                    self.handle_amf_status_indication(client_id, status).await;
                 } else if let Ok(err_ind) = decode_error_indication(pdu_bytes) {
                     // TS 38.413 §8.7.5: a received Error Indication is processed
                     // locally and MUST NOT be answered with another Error
@@ -2342,6 +2348,40 @@ impl NgapTask {
         } else {
             warn!("OVERLOAD STOP for unknown AMF association {}", amf_id);
         }
+    }
+
+    /// Handle an inbound AMF STATUS INDICATION (TS 38.413 §8.7.6): mark every AMF
+    /// context that serves one of the reported unavailable GUAMIs as unavailable
+    /// for UE selection, so `select_amf` reselects toward another (backup) AMF.
+    /// No reply is sent, and it is no longer answered with an Error Indication.
+    /// Migrating already-connected UEs to the backup AMF is out of scope here;
+    /// they reselect on their next Initial UE Message.
+    async fn handle_amf_status_indication(&mut self, amf_id: i32, status: AmfStatusIndicationData) {
+        if status.unavailable_guami_list.is_empty() {
+            warn!("AMF Status Indication from AMF[{amf_id}] with empty unavailable GUAMI list");
+            return;
+        }
+        let mut marked = 0;
+        for ctx in self.amf_contexts.values_mut() {
+            let hit = status.unavailable_guami_list.iter().any(|u| {
+                ctx.served_guami_list.iter().any(|s| {
+                    u.guami.plmn_identity == s.guami.plmn_identity
+                        && u.guami.amf_region_id == s.guami.amf_region_id
+                        && u.guami.amf_set_id == s.guami.amf_set_id
+                        && u.guami.amf_pointer == s.guami.amf_pointer
+                })
+            });
+            if hit {
+                ctx.unavailable = true;
+                marked += 1;
+            }
+        }
+        info!(
+            "AMF Status Indication from AMF[{}]: {} unavailable GUAMI(s) -> {} AMF context(s) excluded from selection",
+            amf_id,
+            status.unavailable_guami_list.len(),
+            marked
+        );
     }
 
     /// Handles an inbound AMF Configuration Update (TS 38.413 §8.7.3).
@@ -4423,6 +4463,67 @@ mod tests {
         assert!(
             sctp_rx.try_recv().is_err(),
             "Overload Stop must not be answered with an Error Indication"
+        );
+    }
+
+    /// AMF STATUS INDICATION marking a served GUAMI unavailable excludes that AMF
+    /// from `select_amf`, with no Error Indication echo (TS 38.413 §8.7.6).
+    #[tokio::test]
+    async fn test_amf_status_indication_excludes_amf_from_selection() {
+        use nextgsim_ngap::procedures::amf_status_indication::{
+            encode_amf_status_indication, AmfStatusIndicationParams, UnavailableGuamiItem,
+        };
+        use nextgsim_ngap::procedures::initial_context_setup::GuamiValue;
+        use nextgsim_ngap::procedures::{Guami, ServedGuamiItem};
+
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 4, 4);
+            ctx.state = AmfState::Ready;
+            ctx.relative_capacity = 100;
+            ctx.served_guami_list = vec![ServedGuamiItem {
+                guami: Guami {
+                    plmn_identity: [0x00, 0xf1, 0x10],
+                    amf_region_id: 1,
+                    amf_set_id: 2,
+                    amf_pointer: 3,
+                },
+                backup_amf_name: None,
+            }];
+        }
+        // Ready + available → this AMF is selectable.
+        assert_eq!(task.select_amf(None), Some(1));
+
+        // AMF Status Indication marks that GUAMI unavailable.
+        let params = AmfStatusIndicationParams {
+            unavailable_guami_list: vec![UnavailableGuamiItem {
+                guami: GuamiValue {
+                    plmn_identity: [0x00, 0xf1, 0x10],
+                    amf_region_id: 1,
+                    amf_set_id: 2,
+                    amf_pointer: 3,
+                },
+                backup_amf_name: Some("backup-amf".into()),
+            }],
+        };
+        let inbound = encode_amf_status_indication(&params).expect("encode");
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&inbound))
+            .await;
+
+        // The AMF is excluded from selection, and nothing was echoed.
+        assert!(task.find_amf_context_mut(1).unwrap().unavailable);
+        assert_eq!(
+            task.select_amf(None),
+            None,
+            "an AMF with an unavailable GUAMI must not be selected"
+        );
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "AMF Status Indication must not be answered with an Error Indication"
         );
     }
 }
