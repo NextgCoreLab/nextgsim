@@ -3987,17 +3987,12 @@ mod tests {
         // REGISTRATION REQUEST goes out unprotected.
         let re_registers = outs.iter().any(|o| match o {
             MmOutput::SendNasPdu(p) => {
-                p.len() >= 3
-                    && p[1] == 0x00
-                    && p[2] == u8::from(MmMessageType::RegistrationRequest)
+                p.len() >= 3 && p[1] == 0x00 && p[2] == u8::from(MmMessageType::RegistrationRequest)
             }
             _ => false,
         });
         assert!(re_registers, "re-registration must be initiated");
-        assert_eq!(
-            orch.state().mm_substate(),
-            MmSubState::RegisteredInitiated
-        );
+        assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
     }
 
     // ========================================================================
