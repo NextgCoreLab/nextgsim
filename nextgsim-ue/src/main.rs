@@ -30,7 +30,6 @@ use tracing::{debug, error, info, warn};
 use std::net::Ipv4Addr;
 
 use nextgsim_common::config::UeConfig;
-use nextgsim_rls::RrcChannel;
 use nextgsim_ue::tun::{TunAppMessage, TunMessage, TunTask, TunTaskConfig};
 #[cfg(feature = "nextgsim-fl")]
 use nextgsim_ue::FlParticipantTask;
@@ -355,10 +354,16 @@ impl UeApp {
         tokio::spawn(async move { Self::run_nas_task(nas_task_base, nas_rx, tun_tx).await });
         info!("NAS task spawned");
 
-        // Spawn RRC task (handles RRC state machine and procedures)
+        // Spawn RRC task: the conformant library RrcTask (issue #30). It runs
+        // real RRC connection establishment (RRCSetupRequest on SRB0/CCCH →
+        // RRCSetup → RRCSetupComplete on SRB1/DCCH, TS 38.331 §5.3.3), cell
+        // selection, UAC, re-establishment, resume and AS-security — replacing
+        // the former inline loop that smuggled the initial NAS as a raw PDU on
+        // UL-DCCH and flipped Connected on any downlink RRC message.
         let rrc_task_base = task_base.clone();
-        tokio::spawn(async move { Self::run_rrc_task(rrc_task_base, rrc_rx).await });
-        info!("RRC task spawned");
+        let mut rrc_task = nextgsim_ue::rrc::RrcTask::new(rrc_task_base);
+        tokio::spawn(async move { rrc_task.run(rrc_rx).await });
+        info!("RRC task spawned (library RrcTask)");
 
         // Spawn Rel-18 5G-Advanced tasks (Ranging TS 23.586, MINT TS 23.761,
         // Sidelink). The handles were installed by the TaskManager before the
@@ -716,11 +721,45 @@ impl UeApp {
                         }
                         NasMessage::ActiveCellChanged { previous_tai } => {
                             info!("Active cell changed from TAI: {:?}", previous_tai);
-                            // Mobility registration update trigger
-                            // (TS 24.501 Section 5.5.1.3.2)
                             if orch.state().is_registered() {
+                                // Mobility registration update trigger
+                                // (TS 24.501 Section 5.5.1.3.2)
                                 let outs = orch.start_registration(
                                     RegistrationType::MobilityRegistrationUpdating,
+                                );
+                                process_mm_outputs(
+                                    outs,
+                                    &mut orch,
+                                    &mut sm_orch,
+                                    &sm_session_params,
+                                    &mut plmn_selector,
+                                    &task_base,
+                                    &tun_tx,
+                                    &mut pdu_counter,
+                                )
+                                .await;
+                            } else if orch.state().is_deregistered()
+                                && orch.state().mm_substate()
+                                    != nextgsim_ue::nas::mm::MmSubState::RegisteredInitiated
+                            {
+                                // Initial registration on first camp. The library
+                                // RrcTask emits ActiveCellChanged when it camps on
+                                // a cell; issue #30 removed the inline loop that
+                                // previously sent PerformMmCycle here, so this is
+                                // now the initial-attach trigger. The mm_substate
+                                // guard makes it one-shot: while a registration is
+                                // in flight (5GMM-REGISTERED-INITIATED still reports
+                                // rm_state DEREGISTERED) a re-entrant
+                                // ActiveCellChanged from a mid-attach cell
+                                // reselection is dropped here rather than blocking
+                                // the NAS loop on the sleep below (restores the
+                                // deleted loop's registration_triggered latch).
+                                // Give the gNB a moment to finish NG Setup with the
+                                // AMF first (matches the prior PerformMmCycle path).
+                                tokio::time::sleep(tokio::time::Duration::from_millis(1000))
+                                    .await;
+                                let outs = orch.start_registration(
+                                    RegistrationType::InitialRegistration,
                                 );
                                 process_mm_outputs(
                                     outs,
@@ -972,301 +1011,6 @@ impl UeApp {
         }
 
         info!("NAS task stopped");
-    }
-
-    /// Runs the RRC task (handles RRC state machine and procedures)
-    async fn run_rrc_task(
-        task_base: UeTaskBase,
-        mut rx: tokio::sync::mpsc::Receiver<TaskMessage<RrcMessage>>,
-    ) {
-        use nextgsim_common::OctetString;
-        use nextgsim_ue::rrc::{RrcState, RrcStateMachine, RrcStateTransition};
-        use std::collections::HashMap;
-
-        info!("RRC task started");
-
-        // Cell tracking
-        let mut discovered_cells: HashMap<i32, i32> = HashMap::new(); // cell_id -> dbm
-        let mut serving_cell: Option<i32> = None;
-        let mut rrc_state_machine = RrcStateMachine::new();
-        let mut registration_triggered = false;
-        // Wave-6 I5: KgNB handed down by the NAS plane once NAS security is
-        // active; consumed by the AS SecurityModeCommand path below when the
-        // I5_UE_AS_SECURITY wire gate is on.
-        let mut pending_kgnb: Option<[u8; 32]> = None;
-
-        loop {
-            match rx.recv().await {
-                Some(TaskMessage::Message(msg)) => {
-                    match msg {
-                        RrcMessage::LocalReleaseConnection { treat_barred } => {
-                            info!("Local release connection, treat_barred={}", treat_barred);
-                            serving_cell = None;
-                            registration_triggered = false;
-                            if rrc_state_machine.can_transition(RrcStateTransition::Release) {
-                                let _ = rrc_state_machine.transition(RrcStateTransition::Release);
-                            }
-                        }
-                        RrcMessage::UplinkNasDelivery { pdu_id, pdu } => {
-                            info!("Uplink NAS delivery: pdu_id={}, len={}", pdu_id, pdu.len());
-                            // Forward to RLS for transmission
-                            if serving_cell.is_some() {
-                                // Check if we have an RRC connection established
-                                // If connected, wrap in UL Information Transfer
-                                // If not (initial access), send raw NAS PDU for gNB fallback
-                                let wrapped_pdu = if rrc_state_machine.state().is_connected() {
-                                    // Wrap NAS PDU in UL Information Transfer format
-                                    // Format: [0x08 (msg type), 0x00 (padding), NAS PDU...]
-                                    let mut ul_info_transfer = Vec::with_capacity(pdu.len() + 2);
-                                    ul_info_transfer.push(0x08); // UL Information Transfer
-                                    ul_info_transfer.push(0x00); // Padding
-                                    ul_info_transfer.extend_from_slice(pdu.data());
-                                    ul_info_transfer.into()
-                                } else {
-                                    // Initial access: send raw NAS PDU
-                                    // gNB will auto-create UE context and send Initial UE Message
-                                    pdu
-                                };
-
-                                let _ = task_base
-                                    .rls_tx
-                                    .send(RlsMessage::RrcPduDelivery {
-                                        channel: RrcChannel::UlDcch,
-                                        pdu_id,
-                                        pdu: wrapped_pdu,
-                                    })
-                                    .await;
-                            } else {
-                                warn!("Cannot send uplink NAS: no serving cell");
-                            }
-                        }
-                        RrcMessage::RrcNotify => {
-                            info!("RRC notify received");
-                        }
-                        RrcMessage::PerformUac {
-                            access_category,
-                            access_identities,
-                        } => {
-                            info!(
-                                "Perform UAC: category={}, identities={}",
-                                access_category, access_identities
-                            );
-                        }
-                        RrcMessage::DownlinkRrcDelivery {
-                            cell_id,
-                            channel,
-                            pdu,
-                        } => {
-                            info!(
-                                "Downlink RRC: cell_id={}, channel={:?}, len={}",
-                                cell_id,
-                                channel,
-                                pdu.len()
-                            );
-
-                            // Receiving a downlink RRC message means RRC connection is established
-                            // Transition to Connected state if we're in Idle
-                            if rrc_state_machine.state().is_idle()
-                                && rrc_state_machine
-                                    .can_transition(RrcStateTransition::SetupComplete)
-                            {
-                                let _ =
-                                    rrc_state_machine.transition(RrcStateTransition::SetupComplete);
-                                info!(
-                                    "RRC state: {} -> {} (connection established)",
-                                    RrcState::Idle,
-                                    rrc_state_machine.state()
-                                );
-                            }
-
-                            // Wave-6 I5 (TS 38.331 §5.3.4): when the AS-security
-                            // wire gate is on, recognise the AS
-                            // SecurityModeCommand on SRB1 (DL-DCCH) BEFORE the
-                            // raw-NAS heuristic below — its leading byte 0x20 is
-                            // otherwise misread as a raw NAS PDU and dropped.
-                            // Default-off: the block is skipped and the
-                            // matched-sim path is byte-for-byte unchanged.
-                            if nextgsim_ue::rrc::I5_UE_AS_SECURITY && channel == RrcChannel::DlDcch
-                            {
-                                use nextgsim_rrc::procedures::security_mode::{
-                                    decode_security_mode_command, encode_security_mode_complete,
-                                    SecurityModeCompleteParams,
-                                };
-                                use nextgsim_ue::rrc::{
-                                    AsSecurityContext, CipheringAlgorithm, IntegrityAlgorithm,
-                                };
-                                if let Ok(smc) = decode_security_mode_command(pdu.data()) {
-                                    match (
-                                        smc.security_algorithms.integrity_algorithm,
-                                        pending_kgnb,
-                                    ) {
-                                        (Some(integ), Some(kgnb)) => {
-                                            let ciph = CipheringAlgorithm::from(
-                                                smc.security_algorithms.ciphering_algorithm,
-                                            );
-                                            if ciph == CipheringAlgorithm::Nea3 {
-                                                warn!("AS SMC selected NEA3 (unsupported keystream); not activating");
-                                            } else {
-                                                // Derive + install the AS keys (byte-identical to
-                                                // the gNB's derive_rrc_up_key); SRB PDCP
-                                                // integrity/ciphering enforcement rides these keys.
-                                                let _as_ctx = AsSecurityContext::derive_from_kgnb(
-                                                    &kgnb,
-                                                    ciph,
-                                                    IntegrityAlgorithm::from(integ),
-                                                    0x4601,
-                                                );
-                                                if let Ok(bytes) = encode_security_mode_complete(
-                                                    &SecurityModeCompleteParams {
-                                                        rrc_transaction_id: smc.rrc_transaction_id,
-                                                    },
-                                                ) {
-                                                    let _ = task_base
-                                                        .rls_tx
-                                                        .send(RlsMessage::RrcPduDelivery {
-                                                            channel: RrcChannel::UlDcch,
-                                                            pdu_id: 0,
-                                                            pdu: OctetString::from_slice(&bytes),
-                                                        })
-                                                        .await;
-                                                }
-                                                info!(
-                                                    "AS security activated (tid {}); SecurityModeComplete sent",
-                                                    smc.rrc_transaction_id
-                                                );
-                                            }
-                                        }
-                                        _ => warn!(
-                                            "AS SMC received but no KgNB / integrity algorithm; not activating (fail-closed)"
-                                        ),
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            // Check if this is DL Information Transfer (0x04) which wraps NAS PDU
-                            // Format: [0x04 (msg type), 0x00 (padding), 0x00 (padding), NAS PDU...]
-                            let nas_pdu = if pdu.len() >= 3 && pdu.data()[0] == 0x04 {
-                                // Extract NAS PDU from DL Information Transfer
-                                OctetString::from_slice(&pdu.data()[3..])
-                            } else {
-                                // Assume raw NAS PDU
-                                pdu
-                            };
-
-                            // Forward to NAS for processing
-                            let _ = task_base
-                                .nas_tx
-                                .send(NasMessage::NasDelivery { pdu: nas_pdu })
-                                .await;
-                        }
-                        RrcMessage::SignalChanged { cell_id, dbm } => {
-                            info!("Signal changed: cell_id={}, dbm={}", cell_id, dbm);
-
-                            // Track the cell
-                            discovered_cells.insert(cell_id, dbm);
-
-                            // If we don't have a serving cell yet and we're in IDLE state, select one
-                            if serving_cell.is_none() && rrc_state_machine.state().is_idle() {
-                                // Select the cell with best signal (or just the first one for now)
-                                let best_cell = discovered_cells
-                                    .iter()
-                                    .max_by_key(|(_, &signal)| signal)
-                                    .map(|(&id, _)| id);
-
-                                if let Some(best_cell_id) = best_cell {
-                                    info!("Selecting cell {} as serving cell", best_cell_id);
-                                    serving_cell = Some(best_cell_id);
-
-                                    // Tell RLS to camp on this cell
-                                    let _ = task_base
-                                        .rls_tx
-                                        .send(RlsMessage::AssignCurrentCell {
-                                            cell_id: best_cell_id,
-                                        })
-                                        .await;
-
-                                    // Trigger registration if not already done
-                                    if !registration_triggered {
-                                        info!("Triggering NAS registration procedure");
-                                        registration_triggered = true;
-                                        let _ =
-                                            task_base.nas_tx.send(NasMessage::PerformMmCycle).await;
-                                    }
-                                }
-                            }
-                        }
-                        RrcMessage::RadioLinkFailure { cause } => {
-                            warn!("Radio link failure: {:?}", cause);
-                            // Remove the lost cell from our tracking
-                            if let Some(cell_id) = serving_cell {
-                                discovered_cells.remove(&cell_id);
-                                serving_cell = None;
-                                registration_triggered = false;
-                            }
-                            if rrc_state_machine
-                                .can_transition(RrcStateTransition::RadioLinkFailure)
-                            {
-                                let _ = rrc_state_machine
-                                    .transition(RrcStateTransition::RadioLinkFailure);
-                            }
-                            // Notify NAS of the failure
-                            let _ = task_base.nas_tx.send(NasMessage::RadioLinkFailure).await;
-                        }
-                        RrcMessage::AsSecurityKey { kgnb } => {
-                            // Wave-6 I5: store the KgNB from the NAS plane; used
-                            // to derive K_RRCint/K_RRCenc on the AS SMC.
-                            debug!("Received KgNB for AS security from NAS plane");
-                            pending_kgnb = Some(kgnb);
-                        }
-                        RrcMessage::TriggerCycle => {
-                            // Trigger RRC state machine cycle
-                        }
-                        RrcMessage::NtnTimingAdvanceReceived {
-                            common_ta_us,
-                            k_offset,
-                            ..
-                        } => {
-                            info!("UE: NTN TA={}us, k_offset={}", common_ta_us, k_offset);
-                        }
-                        // 6G message routing - log and drop in main binary (handled by lib RrcTask)
-                        #[cfg(feature = "nextgsim-she")]
-                        RrcMessage::SixgInferenceRequest { model_id, .. } => {
-                            debug!(
-                                "6G inference request for model {}, not handled in main binary",
-                                model_id
-                            );
-                        }
-                        #[cfg(feature = "nextgsim-isac")]
-                        RrcMessage::SixgSensingMeasurement {
-                            measurement_type, ..
-                        } => {
-                            debug!(
-                                "6G sensing measurement type {}, not handled in main binary",
-                                measurement_type
-                            );
-                        }
-                        #[cfg(feature = "nextgsim-semantic")]
-                        RrcMessage::SixgSemanticData { content_type, .. } => {
-                            debug!(
-                                "6G semantic data type {}, not handled in main binary",
-                                content_type
-                            );
-                        }
-                    }
-                }
-                Some(TaskMessage::Shutdown) => {
-                    info!("RRC task received shutdown signal");
-                    break;
-                }
-                None => {
-                    info!("RRC task channel closed");
-                    break;
-                }
-            }
-        }
-
-        info!("RRC task stopped");
     }
 
     /// Runs the main event loop until shutdown
