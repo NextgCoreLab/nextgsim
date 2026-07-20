@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::protocol::{
     version, MessageType, PduType, RlsHeartbeat, RlsHeartbeatAck, RlsMessage, RlsPduTransmission,
-    RlsPduTransmissionAck, Vector3,
+    RlsPduTransmissionAck, SimCoord,
 };
 
 /// Maximum PDU length allowed (16KB)
@@ -174,7 +174,7 @@ fn decode_heartbeat(sti: u64, mut buf: &[u8]) -> Result<RlsMessage> {
 
     Ok(RlsMessage::Heartbeat(RlsHeartbeat::with_position(
         sti,
-        Vector3::new(x, y, z),
+        SimCoord::new(x, y, z),
     )))
 }
 
@@ -267,7 +267,7 @@ mod tests {
     fn test_heartbeat_roundtrip() {
         let msg = RlsMessage::Heartbeat(RlsHeartbeat::with_position(
             0x123456789ABCDEF0,
-            Vector3::new(100, -200, 300),
+            SimCoord::new(100, -200, 300),
         ));
 
         let encoded = encode(&msg);

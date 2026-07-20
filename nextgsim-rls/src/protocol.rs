@@ -80,9 +80,13 @@ impl PduType {
     }
 }
 
-/// 3D position vector for simulated radio positioning
+/// Integer 3D coordinate for the RLS ("Radio Link Simulation") wire protocol.
+///
+/// Serialized as three big-endian `i32`s (see [`crate::codec`]) and `Eq`/`Hash`
+/// compatible for use in `RlsMessage` / `RlsHeartbeat`. Distinct from the
+/// floating-point `nextgsim_common::Vector3` used for sensing/positioning math.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Vector3 {
+pub struct SimCoord {
     /// X coordinate
     pub x: i32,
     /// Y coordinate
@@ -91,14 +95,14 @@ pub struct Vector3 {
     pub z: i32,
 }
 
-impl Vector3 {
-    /// Creates a new Vector3 with the given coordinates
+impl SimCoord {
+    /// Creates a new SimCoord with the given coordinates
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
         Self { x, y, z }
     }
 }
 
-impl fmt::Display for Vector3 {
+impl fmt::Display for SimCoord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "({}, {}, {})", self.x, self.y, self.z)
     }
@@ -156,7 +160,7 @@ pub struct RlsHeartbeat {
     /// Simulated Transmission Identifier - unique identifier for the sender
     pub sti: u64,
     /// Simulated position of the UE
-    pub sim_pos: Vector3,
+    pub sim_pos: SimCoord,
 }
 
 impl RlsHeartbeat {
@@ -164,12 +168,12 @@ impl RlsHeartbeat {
     pub fn new(sti: u64) -> Self {
         Self {
             sti,
-            sim_pos: Vector3::default(),
+            sim_pos: SimCoord::default(),
         }
     }
 
     /// Creates a new heartbeat message with position
-    pub fn with_position(sti: u64, sim_pos: Vector3) -> Self {
+    pub fn with_position(sti: u64, sim_pos: SimCoord) -> Self {
         Self { sti, sim_pos }
     }
 }
@@ -341,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_vector3() {
-        let v = Vector3::new(1, 2, 3);
+        let v = SimCoord::new(1, 2, 3);
         assert_eq!(v.x, 1);
         assert_eq!(v.y, 2);
         assert_eq!(v.z, 3);
@@ -350,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_heartbeat() {
-        let hb = RlsHeartbeat::with_position(12345, Vector3::new(100, 200, 300));
+        let hb = RlsHeartbeat::with_position(12345, SimCoord::new(100, 200, 300));
         assert_eq!(hb.sti, 12345);
         assert_eq!(hb.sim_pos.x, 100);
     }

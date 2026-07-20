@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{RlsHeartbeat, RlsHeartbeatAck, Vector3};
+use crate::protocol::{RlsHeartbeat, RlsHeartbeatAck, SimCoord};
 
 /// Default heartbeat interval in milliseconds
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 1000;
@@ -95,7 +95,7 @@ pub struct UeCellSearch {
     /// UE's STI (Simulated Transmission Identifier)
     sti: u64,
     /// UE's simulated position
-    sim_pos: Vector3,
+    sim_pos: SimCoord,
     /// Search space (addresses to send heartbeats to)
     search_space: Vec<SocketAddr>,
     /// Discovered cells indexed by STI
@@ -117,7 +117,7 @@ impl UeCellSearch {
     pub fn new(sti: u64, search_space: Vec<SocketAddr>) -> Self {
         Self {
             sti,
-            sim_pos: Vector3::default(),
+            sim_pos: SimCoord::default(),
             search_space,
             cells: HashMap::new(),
             cell_id_to_sti: HashMap::new(),
@@ -129,7 +129,7 @@ impl UeCellSearch {
     }
 
     /// Sets the UE's simulated position
-    pub fn set_position(&mut self, pos: Vector3) {
+    pub fn set_position(&mut self, pos: SimCoord) {
         self.sim_pos = pos;
     }
 
@@ -264,7 +264,7 @@ pub struct GnbCellTracker {
     /// gNB's STI (Simulated Transmission Identifier)
     sti: u64,
     /// gNB's physical location for signal strength calculation
-    phy_location: Vector3,
+    phy_location: SimCoord,
     /// Tracked UEs indexed by STI
     ues: HashMap<u64, UeInfo>,
     /// Mapping from `ue_id` to STI
@@ -330,7 +330,7 @@ pub enum GnbTrackerEvent {
 
 impl GnbCellTracker {
     /// Creates a new gNB cell tracker
-    pub fn new(sti: u64, phy_location: Vector3) -> Self {
+    pub fn new(sti: u64, phy_location: SimCoord) -> Self {
         Self {
             sti,
             phy_location,
@@ -347,7 +347,7 @@ impl GnbCellTracker {
     }
 
     /// Estimates signal strength based on distance
-    pub fn estimate_dbm(&self, ue_pos: &Vector3) -> i32 {
+    pub fn estimate_dbm(&self, ue_pos: &SimCoord) -> i32 {
         let dx = self.phy_location.x - ue_pos.x;
         let dy = self.phy_location.y - ue_pos.y;
         let dz = self.phy_location.z - ue_pos.z;
@@ -497,9 +497,9 @@ mod tests {
 
     #[test]
     fn test_gnb_tracker_detection() {
-        let mut tracker = GnbCellTracker::new(67890, Vector3::new(0, 0, 0));
+        let mut tracker = GnbCellTracker::new(67890, SimCoord::new(0, 0, 0));
 
-        let heartbeat = RlsHeartbeat::with_position(12345, Vector3::new(10, 0, 0));
+        let heartbeat = RlsHeartbeat::with_position(12345, SimCoord::new(10, 0, 0));
         let (ack, events) = tracker.process_heartbeat(12345, test_addr(5000), &heartbeat);
 
         assert!(ack.is_some());
@@ -517,10 +517,10 @@ mod tests {
 
     #[test]
     fn test_gnb_tracker_weak_signal() {
-        let mut tracker = GnbCellTracker::new(67890, Vector3::new(0, 0, 0));
+        let mut tracker = GnbCellTracker::new(67890, SimCoord::new(0, 0, 0));
 
         // UE very far away
-        let heartbeat = RlsHeartbeat::with_position(12345, Vector3::new(1000, 0, 0));
+        let heartbeat = RlsHeartbeat::with_position(12345, SimCoord::new(1000, 0, 0));
         let (ack, events) = tracker.process_heartbeat(12345, test_addr(5000), &heartbeat);
 
         // Signal too weak, should be ignored
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn test_create_heartbeats() {
         let mut search = UeCellSearch::new(12345, vec![test_addr(4997), test_addr(4998)]);
-        search.set_position(Vector3::new(100, 200, 0));
+        search.set_position(SimCoord::new(100, 200, 0));
 
         let heartbeats = search.create_heartbeats();
 
