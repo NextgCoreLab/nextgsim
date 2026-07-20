@@ -61,6 +61,9 @@ pub struct NgapAmfContext {
     pub served_guami_list: Vec<ServedGuamiItem>,
     /// List of supported PLMNs with slice support
     pub plmn_support_list: Vec<PlmnSupportItem>,
+    /// AMF Traffic Load Reduction Indication (percentage) while overloaded
+    /// (TS 38.413 §8.7.7); set on OVERLOAD START, cleared on OVERLOAD STOP.
+    pub traffic_load_reduction: Option<u8>,
     /// Next available stream ID for UE-associated signaling
     next_stream: u16,
     /// Set of allocated stream IDs
@@ -80,6 +83,7 @@ impl NgapAmfContext {
             relative_capacity: 0,
             served_guami_list: Vec::new(),
             plmn_support_list: Vec::new(),
+            traffic_load_reduction: None,
             next_stream: 1, // Stream 0 is for non-UE-associated signaling
             allocated_streams: HashSet::new(),
         }
@@ -100,6 +104,7 @@ impl NgapAmfContext {
         self.amf_name = None;
         self.served_guami_list.clear();
         self.plmn_support_list.clear();
+        self.traffic_load_reduction = None;
         self.allocated_streams.clear();
         self.next_stream = 1;
     }
