@@ -1070,7 +1070,7 @@ impl Anlf {
         }
     }
 
-    /// Performs `QoS` Sustainability analytics (TS 23.288 6.6)
+    /// Performs `QoS` Sustainability analytics (TS 23.288 6.9)
     ///
     /// Predicts whether current `QoS` levels can be sustained given network conditions.
     ///

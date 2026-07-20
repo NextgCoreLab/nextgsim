@@ -30,7 +30,7 @@ pub enum AnalyticsId {
     /// including MOS scores and service-level KPIs.
     ServiceExperience,
 
-    /// Abnormal Behaviour analytics (clause 6.9)
+    /// Abnormal Behaviour analytics (clause 6.7, UE-related analytics)
     ///
     /// Detects anomalous behavior patterns in UEs or network elements,
     /// using statistical analysis and ML-based detection.
@@ -42,7 +42,7 @@ pub enum AnalyticsId {
     /// including per-cell and per-slice congestion levels.
     UserDataCongestion,
 
-    /// `QoS` Sustainability analytics (clause 6.6)
+    /// `QoS` Sustainability analytics (clause 6.9)
     ///
     /// Predicts whether current `QoS` levels can be maintained,
     /// considering network conditions and resource availability.
@@ -82,9 +82,9 @@ impl AnalyticsId {
             AnalyticsId::UeMobility => "6.7",
             AnalyticsId::NfLoad => "6.5",
             AnalyticsId::ServiceExperience => "6.4",
-            AnalyticsId::AbnormalBehavior => "6.9",
+            AnalyticsId::AbnormalBehavior => "6.7",
             AnalyticsId::UserDataCongestion => "6.8",
-            AnalyticsId::QosSustainability => "6.6",
+            AnalyticsId::QosSustainability => "6.9",
             AnalyticsId::EnergyEfficiency => "Rel-19",
             AnalyticsId::SliceOptimization => "Rel-19",
         }
@@ -186,6 +186,17 @@ pub enum AnalyticsOutputType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_clause_references_match_ts23288() {
+        // TS 23.288 §6.4–§6.9 mapping (the two swapped citations are corrected).
+        assert_eq!(AnalyticsId::ServiceExperience.clause_reference(), "6.4");
+        assert_eq!(AnalyticsId::NfLoad.clause_reference(), "6.5");
+        assert_eq!(AnalyticsId::UeMobility.clause_reference(), "6.7");
+        assert_eq!(AnalyticsId::AbnormalBehavior.clause_reference(), "6.7");
+        assert_eq!(AnalyticsId::UserDataCongestion.clause_reference(), "6.8");
+        assert_eq!(AnalyticsId::QosSustainability.clause_reference(), "6.9");
+    }
 
     #[test]
     fn test_analytics_id_all() {

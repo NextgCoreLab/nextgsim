@@ -1,6 +1,8 @@
 //! Cross-Operator Data Federation (TS 23.288 / TS 29.520)
 //!
-//! Implements privacy-preserving analytics sharing across PLMN boundaries.
+//! Research prototype modelling cross-PLMN analytics sharing. It applies
+//! k-anonymity thresholds, subscriber-ID stripping and location generalization,
+//! but provides **no** differential-privacy guarantee.
 //!
 //! # Architecture
 //!
@@ -11,7 +13,7 @@
 //! │  ┌─────────────────────┐      ┌─────────────────────────────────┐   │
 //! │  │ Federation Registry │      │ Privacy Controller               │   │
 //! │  │  • Peer operators    │      │  • K-anonymity enforcement       │   │
-//! │  │  • Trust levels      │      │  • Differential privacy noise    │   │
+//! │  │  • Trust levels      │      │  • Location generalization    │   │
 //! │  │  • Roaming partners  │      │  • Data minimization             │   │
 //! │  └─────────────────────┘      │  • Consent tracking              │   │
 //! │                                └─────────────────────────────────┘   │
@@ -112,8 +114,6 @@ pub struct FederationPeer {
 pub struct PrivacyPolicy {
     /// Minimum group size for k-anonymity (default: 5)
     pub k_anonymity_threshold: usize,
-    /// Epsilon parameter for differential privacy noise (default: 1.0)
-    pub dp_epsilon: f64,
     /// Whether to strip subscriber identities from shared data
     pub strip_subscriber_ids: bool,
     /// Whether to generalize location data (round to cell level)
@@ -128,7 +128,6 @@ impl Default for PrivacyPolicy {
     fn default() -> Self {
         Self {
             k_anonymity_threshold: 5,
-            dp_epsilon: 1.0,
             strip_subscriber_ids: true,
             generalize_location: true,
             retention_seconds: 86_400, // 24 hours
@@ -316,8 +315,8 @@ impl DataFederationManager {
     /// Updates the privacy policy.
     pub fn set_privacy_policy(&mut self, policy: PrivacyPolicy) {
         info!(
-            "Updating privacy policy (k={}, epsilon={:.2})",
-            policy.k_anonymity_threshold, policy.dp_epsilon
+            "Updating privacy policy (k={})",
+            policy.k_anonymity_threshold
         );
         self.privacy_policy = policy;
     }
@@ -750,12 +749,6 @@ impl DataFederationManager {
             .map(|r| {
                 let mut filtered = r.clone();
 
-                // Apply differential privacy noise to confidence scores
-                if trust_level <= TrustLevel::Basic {
-                    let noise = laplace_noise(self.privacy_policy.dp_epsilon);
-                    filtered.confidence = (filtered.confidence + noise as f32).clamp(0.0, 1.0);
-                }
-
                 // Generalize location data for lower trust levels
                 if self.privacy_policy.generalize_location && trust_level < TrustLevel::Full {
                     filtered.area = filtered.area.map(|mut a| {
@@ -807,20 +800,6 @@ impl DataFederationManager {
             entry.0 += 1;
         }
     }
-}
-
-/// Simple deterministic Laplace-like noise for differential privacy.
-///
-/// In production this would use a cryptographic PRNG; here we use a
-/// simplified version for simulation purposes.
-fn laplace_noise(epsilon: f64) -> f64 {
-    // Deterministic small perturbation scaled by 1/epsilon
-    // Real implementation would sample from Laplace(0, 1/epsilon)
-    let scale = 1.0 / epsilon;
-    // Use a simple hash of the current time for reproducible noise
-    let t = current_time_ms();
-    let pseudo_uniform = ((t % 1000) as f64 / 1000.0) - 0.5; // [-0.5, 0.5)
-    -scale * pseudo_uniform.signum() * (1.0 - 2.0 * pseudo_uniform.abs()).ln()
 }
 
 /// Returns the current time in milliseconds since epoch.
@@ -1188,7 +1167,6 @@ mod tests {
     fn test_privacy_policy_custom() {
         let policy = PrivacyPolicy {
             k_anonymity_threshold: 10,
-            dp_epsilon: 0.5,
             strip_subscriber_ids: true,
             generalize_location: true,
             retention_seconds: 3600,
@@ -1198,7 +1176,6 @@ mod tests {
         let mgr = DataFederationManager::with_privacy_policy(PlmnId::new("001", "01"), policy);
 
         assert_eq!(mgr.privacy_policy().k_anonymity_threshold, 10);
-        assert_eq!(mgr.privacy_policy().dp_epsilon, 0.5);
     }
 
     #[test]
