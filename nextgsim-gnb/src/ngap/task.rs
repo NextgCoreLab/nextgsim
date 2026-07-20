@@ -40,9 +40,9 @@ use nextgsim_rrc::procedures::security_mode::{
 
 use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu, NGAP_PDU};
 use nextgsim_ngap::procedures::error_indication::{
-    encode_error_indication, error_indication_abstract_syntax_error,
-    error_indication_transfer_syntax_error, CriticalityDiagnosticsInfo, ErrorIndicationParams,
-    TriggeringMessageValue,
+    decode_error_indication, encode_error_indication, error_indication_abstract_syntax_error,
+    error_indication_transfer_syntax_error, CriticalityDiagnosticsInfo, ErrorIndicationData,
+    ErrorIndicationParams, TriggeringMessageValue,
 };
 use nextgsim_ngap::procedures::handover::{
     decode_handover_command, decode_handover_preparation_failure, decode_handover_request,
@@ -59,6 +59,9 @@ use nextgsim_ngap::procedures::initial_context_setup::{
     InitialContextSetupResponseParams,
 };
 use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, NrCgi, Tai, UserLocationInfoNr};
+use nextgsim_ngap::procedures::nas_non_delivery_indication::{
+    encode_nas_non_delivery_indication, NasNonDeliveryIndicationParams,
+};
 use nextgsim_ngap::procedures::ng_reset::{
     decode_amf_configuration_update, decode_ng_reset, encode_amf_configuration_update_acknowledge,
     encode_ng_reset_acknowledge, AmfConfigurationUpdateAcknowledgeParams, NgResetAcknowledgeParams,
@@ -506,8 +509,8 @@ impl NgapTask {
     /// Handles Downlink NAS Transport from AMF
     async fn handle_downlink_nas_transport(
         &mut self,
-        _amf_id: i32,
-        _stream: u16,
+        amf_id: i32,
+        stream: u16,
         dl_nas: DownlinkNasTransportData,
     ) {
         info!(
@@ -537,9 +540,19 @@ impl NgapTask {
             }
             None => {
                 warn!(
-                    "No UE context found for RAN-UE-NGAP-ID {}",
+                    "No UE context found for RAN-UE-NGAP-ID {}; reporting NAS non-delivery",
                     dl_nas.ran_ue_ngap_id
                 );
+                // TS 38.413 §8.6.4: the DL NAS message cannot be delivered (no UE
+                // context), so report non-delivery to the AMF with the original
+                // NAS-PDU rather than dropping it silently.
+                self.send_nas_non_delivery_indication(
+                    amf_id,
+                    stream,
+                    &dl_nas,
+                    NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UnknownLocalUeNgapId),
+                )
+                .await;
                 return;
             }
         };
@@ -558,12 +571,42 @@ impl NgapTask {
 
         if let Err(e) = self.task_base.rrc_tx.send(msg).await {
             error!("Failed to send NAS delivery to RRC: {}", e);
+            // TS 38.413 §8.6.4: RRC could not accept the NAS-PDU for delivery to
+            // the UE — report non-delivery to the AMF.
+            self.send_nas_non_delivery_indication(
+                amf_id,
+                stream,
+                &dl_nas,
+                NgSetupFailureCause::RadioNetwork(RadioNetworkCause::RadioConnectionWithUeLost),
+            )
+            .await;
         } else {
             info!(
                 "Forwarded NAS PDU to RRC: ue_id={}, nas_len={}",
                 ue_id,
                 dl_nas.nas_pdu.len()
             );
+        }
+    }
+
+    /// Encode + send a NAS NON DELIVERY INDICATION (TS 38.413 §8.6.4) carrying
+    /// the original NAS-PDU and a cause, UE-associated on `stream`.
+    async fn send_nas_non_delivery_indication(
+        &self,
+        amf_id: i32,
+        stream: u16,
+        dl_nas: &DownlinkNasTransportData,
+        cause: NgSetupFailureCause,
+    ) {
+        let params = NasNonDeliveryIndicationParams {
+            amf_ue_ngap_id: dl_nas.amf_ue_ngap_id,
+            ran_ue_ngap_id: dl_nas.ran_ue_ngap_id,
+            nas_pdu: dl_nas.nas_pdu.clone(),
+            cause,
+        };
+        match encode_nas_non_delivery_indication(&params) {
+            Ok(bytes) => self.send_ngap_ue_associated(amf_id, stream, bytes).await,
+            Err(e) => error!("Failed to encode NAS Non Delivery Indication: {}", e),
         }
     }
 
@@ -2012,16 +2055,62 @@ impl NgapTask {
             );
         }
 
-        // Local cleanup (no AMF association for this UE, or encoding failed)
+        // Local cleanup (no AMF association for this UE, or encoding failed).
+        self.local_release_ue(ue_id).await;
+    }
+
+    /// Locally release a UE's NG-associated resources without sending any further
+    /// NGAP message to the AMF: delete the NGAP UE context, tell RRC to release
+    /// the access-network resources, and tell GTP-U to tear down the bearers.
+    ///
+    /// Used for AMF-less release, and for local release on a received ERROR
+    /// INDICATION (TS 38.413 §10.6, Handling of AP ID) — where echoing another
+    /// NGAP message back to the AMF would be wrong.
+    async fn local_release_ue(&mut self, ue_id: i32) {
         self.delete_ue_context(ue_id);
-
-        // Notify RRC of AN release
         self.send_an_release(ue_id).await;
-
-        // Notify GTP task
         let msg = GtpMessage::UeContextRelease { ue_id };
         if let Err(e) = self.task_base.gtp_tx.send(msg).await {
             error!("Failed to send UE context release to GTP: {}", e);
+        }
+    }
+
+    /// Handle an inbound ERROR INDICATION (TS 38.413 §8.7.5).
+    ///
+    /// A received Error Indication is processed locally and MUST NOT be answered
+    /// with a further Error Indication — doing so risks an on-wire ping-pong. When
+    /// it reports AP IDs that identify a UE-associated logical NG-connection, that
+    /// connection's resources are released locally (TS 38.413 §10.6, Handling of
+    /// AP ID). A non-UE-associated Error Indication (or one whose AP IDs match no
+    /// known UE) is logged and dropped.
+    async fn handle_error_indication(&mut self, amf_id: i32, err_ind: ErrorIndicationData) {
+        info!(
+            "Received ERROR INDICATION from AMF[{}]: amf_ue_ngap_id={:?}, ran_ue_ngap_id={:?}, cause={:?}",
+            amf_id, err_ind.amf_ue_ngap_id, err_ind.ran_ue_ngap_id, err_ind.cause
+        );
+
+        let ue_id = self
+            .ue_contexts
+            .values()
+            .find(|ctx| {
+                matches!(err_ind.ran_ue_ngap_id, Some(r) if ctx.ran_ue_ngap_id == r as i64)
+                    || matches!(err_ind.amf_ue_ngap_id, Some(a) if ctx.amf_ue_ngap_id == Some(a as i64))
+            })
+            .map(|ctx| ctx.ue_id);
+
+        match ue_id {
+            Some(id) => {
+                warn!(
+                    "ERROR INDICATION references UE {}; locally releasing its NG connection (TS 38.413 §10.6)",
+                    id
+                );
+                self.local_release_ue(id).await;
+            }
+            None => {
+                debug!(
+                    "ERROR INDICATION is not associated with a known UE context; processed with no local release and no reply"
+                );
+            }
         }
     }
 
@@ -2107,6 +2196,11 @@ impl NgapTask {
                         .await;
                 } else if let Ok(paging) = decode_paging(pdu_bytes) {
                     self.handle_paging(client_id, paging).await;
+                } else if let Ok(err_ind) = decode_error_indication(pdu_bytes) {
+                    // TS 38.413 §8.7.5: a received Error Indication is processed
+                    // locally and MUST NOT be answered with another Error
+                    // Indication (which would create an on-wire ping-pong).
+                    self.handle_error_indication(client_id, err_ind).await;
                 } else {
                     // amfg-05: this operational PDU could not be routed to a
                     // handler. Per TS 38.413 §8.7.5 / §10, answer with an NGAP
@@ -4100,5 +4194,150 @@ mod tests {
         // fields, so full-struct equality would be brittle).
         assert_eq!(stored.nr_encryption_algorithms, 0xA000);
         assert_eq!(stored.nr_integrity_algorithms, 0x8000);
+    }
+
+    // ---- Error Indication + NAS Non Delivery (issue #42) --------------------
+
+    /// A received ERROR INDICATION referencing a known UE locally releases that
+    /// UE's NG connection and does NOT echo another Error Indication back to the
+    /// AMF (TS 38.413 §8.7.5 / §10.6).
+    #[tokio::test]
+    async fn test_error_indication_releases_ue_and_does_not_echo() {
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        assert!(task.find_ue_context(10).is_some());
+
+        let params = ErrorIndicationParams {
+            amf_ue_ngap_id: None,
+            ran_ue_ngap_id: Some(ran as u32),
+            cause: Some(NgSetupFailureCause::RadioNetwork(
+                RadioNetworkCause::UnknownLocalUeNgapId,
+            )),
+            criticality_diagnostics: None,
+        };
+        let inbound = encode_error_indication(&params).expect("encode error indication");
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        // The UE context was locally released ...
+        assert!(
+            task.find_ue_context(10).is_none(),
+            "UE context must be locally released on Error Indication"
+        );
+        // ... and NO Error Indication (or any NGAP PDU) was echoed to the AMF.
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "must not reply to a received Error Indication (ping-pong)"
+        );
+    }
+
+    /// A received ERROR INDICATION whose AP IDs match no UE is processed with no
+    /// local release and, crucially, no reply.
+    #[tokio::test]
+    async fn test_error_indication_unknown_ue_is_silently_processed() {
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+
+        let params = ErrorIndicationParams {
+            amf_ue_ngap_id: None,
+            ran_ue_ngap_id: Some(4242), // matches no UE
+            cause: Some(NgSetupFailureCause::Protocol(ProtocolCause::SemanticError)),
+            criticality_diagnostics: None,
+        };
+        let inbound = encode_error_indication(&params).expect("encode");
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        assert!(task.find_ue_context(10).is_some(), "unrelated UE untouched");
+        assert!(sctp_rx.try_recv().is_err(), "no reply to Error Indication");
+    }
+
+    /// When RRC cannot accept the NAS-PDU for delivery to the UE (send failure),
+    /// the gNB still reports a NAS NON DELIVERY INDICATION (TS 38.413 §8.6.4).
+    #[tokio::test]
+    async fn test_downlink_nas_rrc_failure_emits_non_delivery() {
+        // `seed_task_with_ue` drops the RRC receiver, so `rrc_tx.send` fails —
+        // exercising the RRC-send-failure non-delivery path for a *known* UE.
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let nas_pdu = vec![0x7e, 0x00, 0x55];
+        let dl_nas = DownlinkNasTransportData {
+            amf_ue_ngap_id: 555,
+            ran_ue_ngap_id: ran as u32, // matches the seeded UE
+            nas_pdu: nas_pdu.clone(),
+            old_amf: None,
+            ran_paging_priority: None,
+            index_to_rfsp: None,
+            allowed_nssai: None,
+        };
+
+        task.handle_downlink_nas_transport(1, 3, dl_nas).await;
+
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                assert_eq!(nas_non_delivery_pdu(buffer.data()), nas_pdu);
+            }
+            other => panic!("expected NAS Non Delivery on RRC failure, got {other:?}"),
+        }
+    }
+
+    /// A DOWNLINK NAS TRANSPORT for an unknown UE is reported to the AMF as a NAS
+    /// NON DELIVERY INDICATION carrying the original NAS-PDU (TS 38.413 §8.6.4).
+    #[tokio::test]
+    async fn test_downlink_nas_unknown_ue_emits_non_delivery() {
+        use nextgsim_ngap::procedures::nas_non_delivery_indication::is_nas_non_delivery_indication;
+
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+        let nas_pdu = vec![0x7e, 0x00, 0x42, 0x11, 0x22];
+        let dl_nas = DownlinkNasTransportData {
+            amf_ue_ngap_id: 555,
+            ran_ue_ngap_id: 4242, // no UE has this RAN-UE-NGAP-ID
+            nas_pdu: nas_pdu.clone(),
+            old_amf: None,
+            ran_paging_priority: None,
+            index_to_rfsp: None,
+            allowed_nssai: None,
+        };
+
+        task.handle_downlink_nas_transport(1, 3, dl_nas).await;
+
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, stream, .. })) => {
+                assert_ne!(
+                    stream, 0,
+                    "UE-associated non-delivery must not use stream 0"
+                );
+                let pdu = decode_ngap_pdu(buffer.data()).expect("decode reply");
+                assert!(
+                    is_nas_non_delivery_indication(&pdu),
+                    "expected NAS Non Delivery Indication, got {pdu:?}"
+                );
+                // The original NAS-PDU is echoed back to the AMF.
+                let echoed = nas_non_delivery_pdu(buffer.data());
+                assert_eq!(echoed, nas_pdu);
+            }
+            other => panic!("expected NAS Non Delivery Indication, got {other:?}"),
+        }
+    }
+
+    /// Extract the NAS-PDU IE from a NAS Non Delivery Indication's bytes.
+    fn nas_non_delivery_pdu(bytes: &[u8]) -> Vec<u8> {
+        use nextgsim_ngap::codec::generated::{
+            InitiatingMessageValue, NASNonDeliveryIndicationProtocolIEs_EntryValue as Ie,
+        };
+        match decode_ngap_pdu(bytes).expect("decode") {
+            NGAP_PDU::InitiatingMessage(m) => match m.value {
+                InitiatingMessageValue::Id_NASNonDeliveryIndication(x) => x
+                    .protocol_i_es
+                    .0
+                    .iter()
+                    .find_map(|ie| match &ie.value {
+                        Ie::Id_NAS_PDU(p) => Some(p.0.clone()),
+                        _ => None,
+                    })
+                    .expect("NAS-PDU IE present"),
+                other => panic!("wrong variant: {other:?}"),
+            },
+            other => panic!("expected InitiatingMessage, got {other:?}"),
+        }
     }
 }
