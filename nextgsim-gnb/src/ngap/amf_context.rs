@@ -64,6 +64,10 @@ pub struct NgapAmfContext {
     /// AMF Traffic Load Reduction Indication (percentage) while overloaded
     /// (TS 38.413 §8.7.7); set on OVERLOAD START, cleared on OVERLOAD STOP.
     pub traffic_load_reduction: Option<u8>,
+    /// Marked unavailable for UE selection because an AMF STATUS INDICATION
+    /// reported one of this AMF's served GUAMIs as unavailable (TS 38.413
+    /// §8.7.6). Cleared on association-down and on a fresh NG Setup Response.
+    pub unavailable: bool,
     /// Next available stream ID for UE-associated signaling
     next_stream: u16,
     /// Set of allocated stream IDs
@@ -84,6 +88,7 @@ impl NgapAmfContext {
             served_guami_list: Vec::new(),
             plmn_support_list: Vec::new(),
             traffic_load_reduction: None,
+            unavailable: false,
             next_stream: 1, // Stream 0 is for non-UE-associated signaling
             allocated_streams: HashSet::new(),
         }
@@ -105,6 +110,7 @@ impl NgapAmfContext {
         self.served_guami_list.clear();
         self.plmn_support_list.clear();
         self.traffic_load_reduction = None;
+        self.unavailable = false;
         self.allocated_streams.clear();
         self.next_stream = 1;
     }
@@ -115,6 +121,7 @@ impl NgapAmfContext {
         self.relative_capacity = response.relative_amf_capacity;
         self.served_guami_list = response.served_guami_list;
         self.plmn_support_list = response.plmn_support_list;
+        self.unavailable = false;
         self.state = AmfState::Ready;
     }
 
