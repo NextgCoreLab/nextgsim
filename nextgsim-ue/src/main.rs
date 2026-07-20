@@ -370,7 +370,7 @@ impl UeApp {
         } = rel18_rxs;
         let mut ranging_task = RangingTask::new(task_base.clone());
         tokio::spawn(async move { ranging_task.run(ranging_rx).await });
-        info!("Ranging task spawned (Rel-18, TS 23.586)");
+        info!("Ranging task spawned (scaffold: no stimulus producer or UE->LMF transport)");
         let mut mint_task = MintTask::new(task_base.clone());
         tokio::spawn(async move { mint_task.run(mint_rx).await });
         info!("MINT task spawned (Rel-18, TS 23.761)");
