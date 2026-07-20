@@ -16,6 +16,19 @@ workspace = true
 # 132). Only effective on Linux; requires libsctp (`-lsctp`) at link time.
 kernel-sctp = ["nextgsim-sctp/kernel-sctp"]
 
+# Umbrella feature enabling all six optional 6G / AI-native research crates at
+# once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and
+# `cargo build -p nextgsim-gnb --features 6g` yields the full build. There is no
+# frozen 3GPP Rel-20/6G Stage-3 spec behind these crates.
+6g = [
+    "nextgsim-she",
+    "nextgsim-nwdaf",
+    "nextgsim-nkef",
+    "nextgsim-isac",
+    "nextgsim-agent",
+    "nextgsim-fl",
+]
+
 [[bin]]
 name = "nr-gnb"
 path = "src/main.rs"
@@ -34,13 +47,14 @@ nextgsim-rlc.workspace = true
 nextgsim-gtp.workspace = true
 nextgsim-sctp.workspace = true
 
-# 6G AI-native network function crates
-nextgsim-she.workspace = true
-nextgsim-nwdaf.workspace = true
-nextgsim-nkef.workspace = true
-nextgsim-isac.workspace = true
-nextgsim-agent.workspace = true
-nextgsim-fl.workspace = true
+# 6G AI-native network function crates (optional, off by default — gated behind
+# the `6g` umbrella feature above / the per-crate `nextgsim-*` features).
+nextgsim-she = { workspace = true, optional = true }
+nextgsim-nwdaf = { workspace = true, optional = true }
+nextgsim-nkef = { workspace = true, optional = true }
+nextgsim-isac = { workspace = true, optional = true }
+nextgsim-agent = { workspace = true, optional = true }
+nextgsim-fl = { workspace = true, optional = true }
 
 log.workspace = true
 tracing-log.workspace = true

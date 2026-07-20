@@ -80,12 +80,19 @@ pub mod rrc;
 pub mod sctp;
 pub mod tasks;
 
-// 6G AI-native network function modules
+// 6G AI-native network function modules (optional; each gated behind its crate
+// feature so a lean `cargo build -p nextgsim-gnb` excludes them).
+#[cfg(feature = "nextgsim-agent")]
 pub mod agent;
+#[cfg(feature = "nextgsim-fl")]
 pub mod fl;
+#[cfg(feature = "nextgsim-isac")]
 pub mod isac;
+#[cfg(feature = "nextgsim-nkef")]
 pub mod nkef;
+#[cfg(feature = "nextgsim-nwdaf")]
 pub mod nwdaf;
+#[cfg(feature = "nextgsim-she")]
 pub mod she;
 
 // Rel-18 5G-Advanced modules
@@ -135,12 +142,19 @@ pub use tasks::{
 // Re-export lifecycle management types
 pub use tasks::{TaskError, TaskId, TaskInfo, TaskManager, TaskState, DEFAULT_SHUTDOWN_TIMEOUT_MS};
 
-// Re-export 6G AI-native network function types
+// Re-export 6G AI-native network function types (feature-gated to match the
+// optional module declarations above).
+#[cfg(feature = "nextgsim-agent")]
 pub use agent::AgentTask;
+#[cfg(feature = "nextgsim-fl")]
 pub use fl::FlAggregatorTask;
+#[cfg(feature = "nextgsim-isac")]
 pub use isac::IsacTask;
+#[cfg(feature = "nextgsim-nkef")]
 pub use nkef::NkefTask;
+#[cfg(feature = "nextgsim-nwdaf")]
 pub use nwdaf::NwdafTask;
+#[cfg(feature = "nextgsim-she")]
 pub use she::SheTask;
 
 // Re-export Rel-18 5G-Advanced types
