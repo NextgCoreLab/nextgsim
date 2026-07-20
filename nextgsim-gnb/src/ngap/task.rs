@@ -102,6 +102,11 @@ use nextgsim_ngap::procedures::transfer::{
     encode_setup_unsuccessful_transfer, GtpTunnelInfo, ModifyResponseTransferParams,
     SetupResponseTransferParams,
 };
+use nextgsim_ngap::procedures::ue_context_modification::{
+    decode_ue_context_modification_request, encode_ue_context_modification_failure,
+    encode_ue_context_modification_response, UeContextModificationFailureCause,
+    UeContextModificationRequestData,
+};
 use nextgsim_ngap::procedures::ue_context_release::{
     decode_ue_context_release_command, encode_ue_context_release_complete,
     encode_ue_context_release_request, UeContextReleaseCompleteParams,
@@ -691,6 +696,12 @@ impl NgapTask {
                 if ctx.amf_ue_ngap_id.is_none() {
                     ctx.amf_ue_ngap_id = Some(ics_req.amf_ue_ngap_id as i64);
                 }
+                // Store the AMF-provided UE Security Capabilities and UE-AMBR as
+                // the baseline; UE Context Modification may later replace them.
+                ctx.ue_security_capabilities = Some(ics_req.ue_security_capabilities.clone());
+                if let Some(ambr) = ics_req.ue_aggregate_max_bit_rate.clone() {
+                    ctx.ue_ambr = Some(ambr);
+                }
                 // Transition UE state
                 ctx.on_initial_context_setup();
                 info!(
@@ -814,6 +825,139 @@ impl NgapTask {
             Err(e) => {
                 error!("Failed to encode Initial Context Setup Response: {}", e);
             }
+        }
+    }
+
+    /// Handle an inbound UE CONTEXT MODIFICATION REQUEST (TS 38.413 §8.3.4).
+    ///
+    /// Applies any updated UE Security Capabilities and replaced UE-AMBR to the
+    /// stored UE context, and — when a new Security Key IE is present — re-derives
+    /// the AS keys (TS 33.501 §6.9.2) by reusing [`Self::activate_as_security`].
+    /// Replies with a UE CONTEXT MODIFICATION RESPONSE on success, or a UE CONTEXT
+    /// MODIFICATION FAILURE — never an Error Indication — on error. Context state
+    /// is mutated only after every failure precondition has passed, so a failed
+    /// procedure leaves the UE context unchanged (TS 38.413 §8.3.4).
+    ///
+    /// Simulator simplification: the AS re-key is signalled to the UE by reusing
+    /// [`Self::activate_as_security`]'s RRC Security Mode Command (TS 38.331
+    /// §5.3.4), rather than the spec-conformant key-change-on-the-fly carrier — an
+    /// RRCReconfiguration with `masterKeyUpdate` (TS 38.331 §5.3.5.3). This mirrors
+    /// how Initial Context Setup treats the Security Key IE as the KgNB and is
+    /// deliberate: `masterKeyUpdate` is modelled on neither the gNB RRC builder nor
+    /// the UE. The four AS keys are still correctly re-derived from the new KgNB.
+    async fn handle_ue_context_modification_request(
+        &mut self,
+        amf_id: i32,
+        stream: u16,
+        ucm_req: UeContextModificationRequestData,
+    ) {
+        info!(
+            "UE Context Modification Request: amf_ue_ngap_id={}, ran_ue_ngap_id={}, rekey={}",
+            ucm_req.amf_ue_ngap_id,
+            ucm_req.ran_ue_ngap_id,
+            ucm_req.security_key.is_some()
+        );
+
+        // Phase 1 (read-only): locate the UE by RAN-UE-NGAP-ID and resolve the
+        // capabilities a possible AS re-key would use — the request's caps when
+        // present, otherwise the capabilities stored at Initial Context Setup. No
+        // context state is mutated here so that a failed procedure leaves the UE
+        // context unchanged.
+        let (ue_id, stored_caps) = match self
+            .ue_contexts
+            .values()
+            .find(|ctx| ctx.ran_ue_ngap_id == ucm_req.ran_ue_ngap_id as i64)
+        {
+            Some(ctx) => (ctx.ue_id, ctx.ue_security_capabilities.clone()),
+            None => {
+                warn!(
+                    "UE Context Modification for unknown RAN-UE-NGAP-ID {}; replying with UE CONTEXT MODIFICATION FAILURE",
+                    ucm_req.ran_ue_ngap_id
+                );
+                self.send_ue_context_modification_failure(
+                    amf_id,
+                    stream,
+                    ucm_req.amf_ue_ngap_id,
+                    ucm_req.ran_ue_ngap_id,
+                    UeContextModificationFailureCause::RadioNetwork(
+                        RadioNetworkCause::UnknownLocalUeNgapId,
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let rekey_caps = ucm_req.ue_security_capabilities.clone().or(stored_caps);
+
+        // Precondition: a Security Key re-key needs the UE Security Capabilities
+        // to select the AS algorithms. Fail BEFORE mutating any context state so
+        // the procedure is atomic.
+        if ucm_req.security_key.is_some() && rekey_caps.is_none() {
+            warn!(
+                "UE Context Modification for UE {ue_id} carried a Security Key but no UE Security Capabilities are available; replying with UE CONTEXT MODIFICATION FAILURE"
+            );
+            self.send_ue_context_modification_failure(
+                amf_id,
+                stream,
+                ucm_req.amf_ue_ngap_id,
+                ucm_req.ran_ue_ngap_id,
+                UeContextModificationFailureCause::Protocol(ProtocolCause::SemanticError),
+            )
+            .await;
+            return;
+        }
+
+        // Phase 2 (commit): every failure precondition has passed — apply the
+        // non-security updates (replaced UE-AMBR and updated UE Security
+        // Capabilities, TS 38.413 §8.3.4.2) to the stored UE context.
+        if let Some(ctx) = self.ue_contexts.values_mut().find(|ctx| ctx.ue_id == ue_id) {
+            if ctx.amf_ue_ngap_id.is_none() {
+                ctx.amf_ue_ngap_id = Some(ucm_req.amf_ue_ngap_id as i64);
+            }
+            if let Some(ambr) = ucm_req.ue_aggregate_max_bit_rate.clone() {
+                ctx.ue_ambr = Some(ambr);
+            }
+            if let Some(caps) = ucm_req.ue_security_capabilities.clone() {
+                ctx.ue_security_capabilities = Some(caps);
+            }
+        }
+
+        // AS re-keying (TS 33.501 §6.9.2): re-derive the AS key set from the new
+        // KgNB. `rekey_caps` is guaranteed present here by the precondition above.
+        if let (Some(new_kgnb), Some(caps)) = (ucm_req.security_key, rekey_caps.as_ref()) {
+            self.activate_as_security(ue_id, new_kgnb, caps).await;
+            info!("AS re-keying completed for UE {ue_id} via UE Context Modification");
+        }
+
+        // Success: UE CONTEXT MODIFICATION RESPONSE.
+        match encode_ue_context_modification_response(
+            ucm_req.amf_ue_ngap_id,
+            ucm_req.ran_ue_ngap_id,
+        ) {
+            Ok(bytes) => {
+                self.send_ngap_ue_associated(amf_id, stream, bytes).await;
+                info!(
+                    "UE Context Modification Response sent for RAN-UE-NGAP-ID {}",
+                    ucm_req.ran_ue_ngap_id
+                );
+            }
+            Err(e) => error!("Failed to encode UE Context Modification Response: {e}"),
+        }
+    }
+
+    /// Encode + send a UE-associated UE CONTEXT MODIFICATION FAILURE.
+    async fn send_ue_context_modification_failure(
+        &self,
+        amf_id: i32,
+        stream: u16,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        cause: UeContextModificationFailureCause,
+    ) {
+        match encode_ue_context_modification_failure(amf_ue_ngap_id, ran_ue_ngap_id, &cause) {
+            Ok(bytes) => self.send_ngap_ue_associated(amf_id, stream, bytes).await,
+            Err(e) => error!("Failed to encode UE Context Modification Failure: {e}"),
         }
     }
 
@@ -1952,6 +2096,9 @@ impl NgapTask {
                         .await;
                 } else if let Ok(ics_req) = decode_initial_context_setup_request(pdu_bytes) {
                     self.handle_initial_context_setup_request(client_id, stream, ics_req)
+                        .await;
+                } else if let Ok(ucm_req) = decode_ue_context_modification_request(pdu_bytes) {
+                    self.handle_ue_context_modification_request(client_id, stream, ucm_req)
                         .await;
                 } else if let Ok(reset) = decode_ng_reset(pdu_bytes) {
                     self.handle_ng_reset(client_id, stream, reset).await;
@@ -3185,6 +3332,7 @@ mod tests {
     use crate::tasks::{GnbTaskBase, DEFAULT_CHANNEL_CAPACITY};
     use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
+    use nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue;
 
     fn test_config() -> GnbConfig {
         GnbConfig {
@@ -3624,5 +3772,333 @@ mod tests {
         let (code, trigger) = ngap_procedure_code(&pdu);
         assert_eq!(code, ID_ERROR_INDICATION);
         assert_eq!(trigger, TriggeringMessageValue::InitiatingMessage);
+    }
+
+    // ---- UE Context Modification (issue #40) --------------------------------
+
+    /// Procedure code for UE Context Modification (TS 38.413).
+    const ID_UE_CONTEXT_MODIFICATION: u8 = 40;
+
+    /// Seed an NGAP task with a Ready AMF and one UE context; returns the task
+    /// (with `sctp_rx` bound to observe replies) and the UE's RAN-UE-NGAP-ID.
+    fn seed_task_with_ue() -> (
+        NgapTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<SctpMessage>>,
+        i64,
+    ) {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        let ran = task.create_ue_context(10, 1).expect("ue context");
+        (task, sctp_rx, ran)
+    }
+
+    fn caps(nea: u16, nia: u16) -> UeSecurityCapabilitiesValue {
+        UeSecurityCapabilitiesValue {
+            nr_encryption_algorithms: nea,
+            nr_integrity_algorithms: nia,
+            eutra_encryption_algorithms: None,
+            eutra_integrity_algorithms: None,
+        }
+    }
+
+    fn encode_ucm_request(data: &UeContextModificationRequestData) -> Vec<u8> {
+        nextgsim_ngap::procedures::ue_context_modification::encode_ue_context_modification_request(
+            data,
+        )
+        .expect("encode inbound request")
+    }
+
+    /// Decode a UE Context Modification RESPONSE and return the echoed
+    /// (AMF-UE-NGAP-ID, RAN-UE-NGAP-ID).
+    fn response_ids(bytes: &[u8]) -> (u64, u32) {
+        use nextgsim_ngap::codec::generated::{
+            SuccessfulOutcomeValue, UEContextModificationResponseProtocolIEs_EntryValue as RespIe,
+        };
+        match decode_ngap_pdu(bytes).expect("decode response") {
+            NGAP_PDU::SuccessfulOutcome(o) => match o.value {
+                SuccessfulOutcomeValue::Id_UEContextModification(r) => {
+                    let mut amf = None;
+                    let mut ran = None;
+                    for ie in &r.protocol_i_es.0 {
+                        match &ie.value {
+                            RespIe::Id_AMF_UE_NGAP_ID(id) => amf = Some(id.0),
+                            RespIe::Id_RAN_UE_NGAP_ID(id) => ran = Some(id.0),
+                            _ => {}
+                        }
+                    }
+                    (amf.expect("amf id"), ran.expect("ran id"))
+                }
+                other => panic!("expected UEContextModification response, got {other:?}"),
+            },
+            other => panic!("expected SuccessfulOutcome, got {other:?}"),
+        }
+    }
+
+    /// Decode a UE Context Modification FAILURE and return its Cause.
+    fn failure_cause(bytes: &[u8]) -> NgSetupFailureCause {
+        use nextgsim_ngap::codec::generated::{
+            UEContextModificationFailureProtocolIEs_EntryValue as FailIe, UnsuccessfulOutcomeValue,
+        };
+        use nextgsim_ngap::procedures::ue_context_release::parse_cause;
+        match decode_ngap_pdu(bytes).expect("decode failure") {
+            NGAP_PDU::UnsuccessfulOutcome(o) => match o.value {
+                UnsuccessfulOutcomeValue::Id_UEContextModification(f) => {
+                    for ie in &f.protocol_i_es.0 {
+                        if let FailIe::Id_Cause(c) = &ie.value {
+                            return parse_cause(c);
+                        }
+                    }
+                    panic!("no Cause IE in failure");
+                }
+                other => panic!("expected UEContextModification failure, got {other:?}"),
+            },
+            other => panic!("expected UnsuccessfulOutcome, got {other:?}"),
+        }
+    }
+
+    /// A UE CONTEXT MODIFICATION REQUEST carrying a new Security Key re-derives
+    /// the AS keys and the gNB replies with a RESPONSE (not an Error Indication).
+    #[tokio::test]
+    async fn test_ue_context_modification_rekeys_and_responds() {
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+
+        // Establish a baseline AS security context.
+        task.activate_as_security(10, [0x11u8; 32], &caps(0xC000, 0xC000))
+            .await;
+        let old = task
+            .find_ue_context(10)
+            .unwrap()
+            .as_security
+            .clone()
+            .unwrap();
+
+        // Inbound request with a *new* KgNB and updated capabilities.
+        let data = UeContextModificationRequestData {
+            amf_ue_ngap_id: 555,
+            ran_ue_ngap_id: ran as u32,
+            ue_aggregate_max_bit_rate: None,
+            ue_security_capabilities: Some(caps(0xC000, 0xC000)),
+            security_key: Some([0x22u8; 32]),
+        };
+        let inbound = encode_ucm_request(&data);
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        // (1) The reply is a UE CONTEXT MODIFICATION RESPONSE, not an Error
+        // Indication, and it echoes the request's AMF/RAN IDs.
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, stream, .. })) => {
+                assert_ne!(stream, 0, "UE-associated reply must not use stream 0");
+                let bytes = buffer.data();
+                match decode_ngap_pdu(bytes).expect("decode reply") {
+                    NGAP_PDU::SuccessfulOutcome(o) => {
+                        assert_eq!(o.procedure_code.0, ID_UE_CONTEXT_MODIFICATION);
+                    }
+                    other => panic!("expected UE Ctx Mod Response, got {other:?}"),
+                }
+                assert_eq!(response_ids(bytes), (555, ran as u32));
+            }
+            other => panic!("expected an outbound SCTP SendMessage, got {other:?}"),
+        }
+
+        // (2) The AS keys were refreshed from the new KgNB.
+        let new = task
+            .find_ue_context(10)
+            .unwrap()
+            .as_security
+            .clone()
+            .unwrap();
+        assert_eq!(new.kgnb, [0x22u8; 32]);
+        assert_ne!(new.k_rrc_enc, old.k_rrc_enc, "AS keys must be re-derived");
+    }
+
+    /// A UE CONTEXT MODIFICATION REQUEST without a Security Key applies the
+    /// replaced UE-AMBR, replies with a RESPONSE, and does not touch AS keys.
+    #[tokio::test]
+    async fn test_ue_context_modification_updates_ambr_without_rekey() {
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        task.activate_as_security(10, [0x11u8; 32], &caps(0xC000, 0xC000))
+            .await;
+        let old = task
+            .find_ue_context(10)
+            .unwrap()
+            .as_security
+            .clone()
+            .unwrap();
+
+        let data = UeContextModificationRequestData {
+            amf_ue_ngap_id: 555,
+            ran_ue_ngap_id: ran as u32,
+            ue_aggregate_max_bit_rate: Some(
+                nextgsim_ngap::procedures::initial_context_setup::UeAggregateMaxBitRate {
+                    dl: 300_000_000,
+                    ul: 100_000_000,
+                },
+            ),
+            ue_security_capabilities: None,
+            security_key: None,
+        };
+        let inbound = encode_ucm_request(&data);
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                let pdu = decode_ngap_pdu(buffer.data()).expect("decode reply");
+                assert!(matches!(pdu, NGAP_PDU::SuccessfulOutcome(_)));
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+
+        let ctx = task.find_ue_context(10).unwrap();
+        let ambr = ctx.ue_ambr.clone().expect("UE-AMBR applied");
+        assert_eq!(ambr.dl, 300_000_000);
+        assert_eq!(ambr.ul, 100_000_000);
+        // No re-key requested → AS keys unchanged.
+        let new = ctx.as_security.clone().unwrap();
+        assert_eq!(new.kgnb, old.kgnb);
+        assert_eq!(new.k_rrc_enc, old.k_rrc_enc);
+    }
+
+    /// A UE CONTEXT MODIFICATION REQUEST for an unknown UE is answered with a
+    /// UE CONTEXT MODIFICATION FAILURE — never an Error Indication.
+    #[tokio::test]
+    async fn test_ue_context_modification_unknown_ue_replies_failure() {
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+
+        let data = UeContextModificationRequestData {
+            amf_ue_ngap_id: 555,
+            ran_ue_ngap_id: 9999, // no UE has this RAN-UE-NGAP-ID
+            ue_aggregate_max_bit_rate: None,
+            ue_security_capabilities: None,
+            security_key: Some([0x22u8; 32]),
+        };
+        let inbound = encode_ucm_request(&data);
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                let bytes = buffer.data();
+                match decode_ngap_pdu(bytes).expect("decode reply") {
+                    NGAP_PDU::UnsuccessfulOutcome(o) => {
+                        assert_eq!(o.procedure_code.0, ID_UE_CONTEXT_MODIFICATION);
+                    }
+                    // An Error Indication would decode as an InitiatingMessage
+                    // (procedure code 9) — explicitly rejected here.
+                    other => panic!("expected UE Ctx Mod Failure, got {other:?}"),
+                }
+                assert_eq!(
+                    failure_cause(bytes),
+                    NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UnknownLocalUeNgapId)
+                );
+            }
+            other => panic!("expected a Failure, got {other:?}"),
+        }
+    }
+
+    /// A Security Key with no resolvable UE Security Capabilities is answered
+    /// with a FAILURE (Protocol/SemanticError), and — crucially — the procedure
+    /// is atomic: a co-carried UE-AMBR is NOT applied and AS keys are untouched.
+    #[tokio::test]
+    async fn test_ue_context_modification_no_caps_rekey_fails_atomically() {
+        // A freshly-created UE context has no stored UE Security Capabilities
+        // (they are set at Initial Context Setup, which we deliberately skip).
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        assert!(task
+            .find_ue_context(10)
+            .unwrap()
+            .ue_security_capabilities
+            .is_none());
+
+        let data = UeContextModificationRequestData {
+            amf_ue_ngap_id: 555,
+            ran_ue_ngap_id: ran as u32,
+            // Co-carried UE-AMBR must NOT be committed when the procedure fails.
+            ue_aggregate_max_bit_rate: Some(
+                nextgsim_ngap::procedures::initial_context_setup::UeAggregateMaxBitRate {
+                    dl: 1,
+                    ul: 1,
+                },
+            ),
+            ue_security_capabilities: None,
+            security_key: Some([0x22u8; 32]),
+        };
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&encode_ucm_request(&data)))
+            .await;
+
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                let bytes = buffer.data();
+                assert!(matches!(
+                    decode_ngap_pdu(bytes).expect("decode reply"),
+                    NGAP_PDU::UnsuccessfulOutcome(_)
+                ));
+                assert_eq!(
+                    failure_cause(bytes),
+                    NgSetupFailureCause::Protocol(ProtocolCause::SemanticError)
+                );
+            }
+            other => panic!("expected a Failure, got {other:?}"),
+        }
+
+        // Atomicity: nothing was applied on the failed procedure.
+        let ctx = task.find_ue_context(10).unwrap();
+        assert!(
+            ctx.ue_ambr.is_none(),
+            "UE-AMBR must not be applied on failure"
+        );
+        assert!(
+            ctx.as_security.is_none(),
+            "AS keys must be untouched on failure"
+        );
+    }
+
+    /// Updated UE Security Capabilities carried by the request are stored on the
+    /// UE context (TS 38.413 §8.3.4.2).
+    #[tokio::test]
+    async fn test_ue_context_modification_stores_updated_caps() {
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+
+        let data = UeContextModificationRequestData {
+            amf_ue_ngap_id: 555,
+            ran_ue_ngap_id: ran as u32,
+            ue_aggregate_max_bit_rate: None,
+            ue_security_capabilities: Some(caps(0xA000, 0x8000)),
+            security_key: None,
+        };
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&encode_ucm_request(&data)))
+            .await;
+
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                assert!(matches!(
+                    decode_ngap_pdu(buffer.data()).expect("decode reply"),
+                    NGAP_PDU::SuccessfulOutcome(_)
+                ));
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+
+        let stored = task
+            .find_ue_context(10)
+            .unwrap()
+            .ue_security_capabilities
+            .clone()
+            .expect("UE Security Capabilities applied");
+        // Assert the NR fields specifically (parse always fills the E-UTRA
+        // fields, so full-struct equality would be brittle).
+        assert_eq!(stored.nr_encryption_algorithms, 0xA000);
+        assert_eq!(stored.nr_integrity_algorithms, 0x8000);
     }
 }
