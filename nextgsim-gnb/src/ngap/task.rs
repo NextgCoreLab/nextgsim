@@ -2399,9 +2399,9 @@ impl NgapTask {
              plmn_support={}",
             client_id,
             update.amf_name,
-            update.served_guami_count,
+            update.served_guami_list.len(),
             update.relative_amf_capacity,
-            update.has_plmn_support_list
+            update.plmn_support_list.len()
         );
 
         if let Some(ctx) = self.amf_contexts.get_mut(&client_id) {
@@ -2410,6 +2410,14 @@ impl NgapTask {
             }
             if let Some(cap) = update.relative_amf_capacity {
                 ctx.relative_capacity = cap;
+            }
+            // TS 38.413 §8.7.3: apply the updated served-GUAMI and PLMN-support
+            // lists when present (an empty list means the IE was absent).
+            if !update.served_guami_list.is_empty() {
+                ctx.served_guami_list = update.served_guami_list.clone();
+            }
+            if !update.plmn_support_list.is_empty() {
+                ctx.plmn_support_list = update.plmn_support_list.clone();
             }
         }
 
@@ -4524,6 +4532,58 @@ mod tests {
         assert!(
             sctp_rx.try_recv().is_err(),
             "AMF Status Indication must not be answered with an Error Indication"
+        );
+    }
+
+    /// AMF CONFIGURATION UPDATE applies the served-GUAMI and PLMN-support lists
+    /// (not just their counts) to the stored AMF context and is acknowledged
+    /// (TS 38.413 §8.7.3).
+    #[tokio::test]
+    async fn test_amf_configuration_update_applies_guami_and_plmn_lists() {
+        use nextgsim_ngap::procedures::ng_reset::AmfConfigurationUpdateData;
+        use nextgsim_ngap::procedures::{Guami, PlmnSupportItem, SNssai, ServedGuamiItem};
+
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 4, 4);
+            ctx.state = AmfState::Ready;
+        }
+
+        let update = AmfConfigurationUpdateData {
+            amf_name: Some("amf-new".into()),
+            served_guami_list: vec![ServedGuamiItem {
+                guami: Guami {
+                    plmn_identity: [0x00, 0xf1, 0x10],
+                    amf_region_id: 1,
+                    amf_set_id: 2,
+                    amf_pointer: 3,
+                },
+                backup_amf_name: None,
+            }],
+            relative_amf_capacity: Some(200),
+            plmn_support_list: vec![PlmnSupportItem {
+                plmn_identity: [0x00, 0xf1, 0x10],
+                slice_support_list: vec![SNssai { sst: 1, sd: None }],
+            }],
+        };
+        task.handle_amf_configuration_update(1, 0, update).await;
+
+        let ctx = task.find_amf_context_mut(1).unwrap();
+        assert_eq!(ctx.amf_name.as_deref(), Some("amf-new"));
+        assert_eq!(ctx.relative_capacity, 200);
+        assert_eq!(ctx.served_guami_list.len(), 1);
+        assert_eq!(ctx.served_guami_list[0].guami.amf_set_id, 2);
+        assert_eq!(ctx.plmn_support_list.len(), 1);
+        assert_eq!(ctx.plmn_support_list[0].slice_support_list[0].sst, 1);
+
+        // An AMF Configuration Update Acknowledge was sent.
+        assert!(
+            sctp_rx.try_recv().is_ok(),
+            "must reply with an AMF Configuration Update Acknowledge"
         );
     }
 }
