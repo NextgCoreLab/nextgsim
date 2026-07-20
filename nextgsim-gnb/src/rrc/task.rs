@@ -510,8 +510,9 @@ impl RrcTask {
     /// The scheduler enforces a reduced serving bandwidth for a RedCap UE: the
     /// cell's PRB grid is clamped to the RedCap maximum bandwidth (20 MHz for
     /// Rel-17), so a RedCap UE is never granted more PRBs than its narrowband
-    /// RF supports. The enforced PRB ceiling is stored on the UE context and
-    /// observed by downstream resource allocation.
+    /// RF supports. This is modelled only: the functional simulator has no PRB
+    /// scheduler, so the computed ceiling is logged, not enforced on a resource
+    /// grid.
     fn apply_redcap_restrictions(&mut self, ue_id: i32) {
         // Cell serving bandwidth (FR1 normal UE baseline: 100 MHz / 273 PRB at
         // 30 kHz SCS, TS 38.101-1 Table 5.3.2-1).
@@ -527,14 +528,12 @@ impl RrcTask {
         ctx.redcap
             .configure(super::redcap::RedCapUeCapabilities::rel17());
 
-        // Scheduler enforcement: clamp the granted bandwidth to the RedCap
-        // ceiling and translate it to a hard PRB cap proportional to the
-        // bandwidth reduction. This is a real reduction applied to this UE's
-        // resource grid, not a log-only marker.
+        // Model the RedCap bandwidth restriction and derive the equivalent PRB
+        // ceiling for logging. This functional simulator has no PRB scheduler,
+        // so the ceiling is reported, not enforced on a resource grid.
         let enforced_bw_mhz = ctx.redcap.restrict_bandwidth(CELL_BANDWIDTH_MHZ);
         let enforced_max_prb =
             (CELL_MAX_PRB * enforced_bw_mhz as u32 / CELL_BANDWIDTH_MHZ as u32).max(1);
-        ctx.set_redcap_max_prb(enforced_max_prb);
 
         info!(
             "RedCap UE[{}]: scheduler bandwidth restricted to {} MHz ({} PRB max, \
