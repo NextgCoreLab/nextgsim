@@ -40,9 +40,10 @@ use nextgsim_nas::messages::mm::ue_policy::{
 };
 use nextgsim_nas::messages::mm::{
     AuthenticationFailure, AuthenticationRequest, AuthenticationResponse,
-    DeregistrationRequestUeOriginating, Ie5gsMobileIdentity, MmCause, MobileIdentityType,
-    RegistrationAccept, RegistrationComplete, RegistrationReject, RegistrationRequest,
-    SecurityModeCommand, SecurityModeComplete, SecurityModeReject, ServiceReject, ServiceRequest,
+    DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated, Ie5gsMobileIdentity,
+    MmCause, MobileIdentityType, RegistrationAccept, RegistrationComplete, RegistrationReject,
+    RegistrationRequest, SecurityModeCommand, SecurityModeComplete, SecurityModeReject,
+    ServiceReject, ServiceRequest,
 };
 use nextgsim_nas::security::{
     compute_nas_mac, nas_cipher, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
@@ -55,6 +56,7 @@ use crate::timer::{
     TIMER_T3521,
 };
 
+use super::deregistration::DeregistrationProcedure;
 use super::state::{CmState, MmStateMachine, MmSubState, UpdateStatus};
 
 /// Maximum registration attempts before falling back to T3502
@@ -1870,6 +1872,85 @@ impl MmOrchestrator {
         Vec::new()
     }
 
+    /// Handle a network-initiated DEREGISTRATION REQUEST (UE terminated, `0x47`).
+    ///
+    /// TS 24.501 §5.5.2.3.2: for a de-registration that is not "switch off" the
+    /// UE sends a DEREGISTRATION ACCEPT and enters `5GMM-DEREGISTERED`; when the
+    /// de-registration type indicates re-registration is required the UE locally
+    /// releases its resources and initiates a fresh registration. `plain` is the
+    /// deciphered 5GMM PDU (`plain[0..3]` = header, `plain[3..]` = the message
+    /// body). The message reaches this arm only when integrity protected — a
+    /// plain `0x47` is rejected earlier by the TS 24.501 §4.4.4.2 allow-list.
+    fn handle_network_deregistration(&mut self, plain: &[u8]) -> Vec<MmOutput> {
+        let mut body = &plain[3..];
+        let msg = match DeregistrationRequestUeTerminated::decode(&mut body) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Malformed network DEREGISTRATION REQUEST: {e}");
+                return Vec::new();
+            }
+        };
+
+        // Drive the TS 24.501 §5.5.2.3.2 receive-side procedure with the current
+        // registration state.
+        let rm_state = self.state.rm_state();
+        let mm_state = self.state.mm_state();
+        let mut proc = DeregistrationProcedure::new();
+        let result = match proc.receive_deregistration_request(&msg, rm_state, mm_state) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Network de-registration not processed: {e}");
+                return Vec::new();
+            }
+        };
+
+        // Apply the network-signalled context clearing.
+        if result.clear_guti {
+            self.stored_guti = None;
+        }
+        if result.clear_tai_list {
+            self.tai_list = None;
+            self.current_tai = None;
+        }
+        if result.clear_equivalent_plmn {
+            self.equivalent_plmns.clear();
+        }
+        if result.invalidate_usim {
+            self.usim_invalid = true;
+        }
+        if let Some(status) = result.new_update_status {
+            self.state.switch_update_status(status);
+        }
+
+        let mut outs = Vec::new();
+
+        // Send DEREGISTRATION ACCEPT unless the procedure suppressed it (e.g. a
+        // non-3GPP-access request, where an MM status is sent instead).
+        if let Some(accept) = result.accept {
+            let mut pdu = Vec::new();
+            accept.encode(&mut pdu);
+            info!("Network-initiated de-registration: sending Deregistration Accept");
+            outs.push(MmOutput::SendNasPdu(self.protect_if_active(pdu)));
+        }
+
+        if let Some(sub) = result.new_sub_state {
+            self.state.switch_mm_state(sub);
+        }
+        self.dereg_pdu = None;
+
+        // §5.5.2.3.2: re-registration required — release local resources and
+        // start a fresh initial registration (mirrors the implicit-dereg path).
+        if result.re_registration_required {
+            let _ = proc.perform_local_deregistration();
+            self.delete_registration_context();
+            self.state
+                .switch_mm_state(MmSubState::DeregisteredNormalService);
+            outs.extend(self.build_and_send_registration(RegistrationType::InitialRegistration));
+        }
+
+        outs
+    }
+
     // ========================================================================
     // Downlink NAS handling (TS 24.501 Section 4.4)
     // ========================================================================
@@ -2015,6 +2096,9 @@ impl MmOrchestrator {
             MmMessageType::ServiceAccept => self.handle_service_accept(),
             MmMessageType::ServiceReject => self.handle_service_reject(&plain),
             MmMessageType::DeregistrationAcceptUeOriginating => self.handle_deregistration_accept(),
+            MmMessageType::DeregistrationRequestUeTerminated => {
+                self.handle_network_deregistration(&plain)
+            }
             MmMessageType::SecurityModeCommand => {
                 // TS 24.501 4.4.4.2: an SMC must arrive integrity protected
                 // with a new-context security header; a plain SMC is discarded
@@ -3816,6 +3900,104 @@ mod tests {
         });
         assert!(out.is_empty());
         assert!(orch.stored_suci_while_t3519_running().is_none());
+    }
+
+    // TS 24.501 §5.5.2.3.2: a network-initiated (non switch-off) DEREGISTRATION
+    // REQUEST drives a DEREGISTRATION ACCEPT and moves the UE to
+    // 5GMM-DEREGISTERED. Driven through the MM dispatch entry point.
+    #[test]
+    fn test_network_deregistration_sends_accept_and_deregisters() {
+        use nextgsim_nas::ies::ie1::{
+            DeRegistrationAccessType, IeDeRegistrationType, ReRegistrationRequired, SwitchOff,
+        };
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        assert!(orch.state().is_registered());
+
+        let dereg_type = IeDeRegistrationType::new(
+            DeRegistrationAccessType::ThreeGppAccess,
+            ReRegistrationRequired::NotRequired,
+            SwitchOff::NormalDeRegistration,
+        );
+        let mut req = Vec::new();
+        nextgsim_nas::messages::mm::DeregistrationRequestUeTerminated::new(dereg_type)
+            .encode(&mut req);
+        let protected = protect_downlink(&orch, &req, 2);
+        let outs = orch.handle_downlink(&protected);
+
+        // Exactly one DEREGISTRATION ACCEPT is emitted.
+        let sent: Vec<&Vec<u8>> = outs
+            .iter()
+            .filter_map(|o| match o {
+                MmOutput::SendNasPdu(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 1, "expected exactly one Deregistration Accept");
+
+        // Decipher the (protected) accept and confirm its message type.
+        let sec = orch.security_context();
+        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+        let mut payload = sent[0][7..].to_vec();
+        nas_cipher(
+            sec.ciphering_algorithm(),
+            sec.keys().knas_enc().unwrap(),
+            &count,
+            NAS_BEARER,
+            NasDirection::Uplink,
+            &mut payload,
+        );
+        assert_eq!(
+            payload[2],
+            u8::from(MmMessageType::DeregistrationAcceptUeTerminated)
+        );
+        // Entered 5GMM-DEREGISTERED. A request with no 5GMM cause is the
+        // §5.5.2.3.4 item b) abnormal case, which lands in PLMN-SEARCH.
+        assert!(!orch.state().is_registered());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::DeregisteredPlmnSearch
+        );
+    }
+
+    // TS 24.501 §5.5.2.3.2: when re-registration is required the UE releases its
+    // context and initiates a fresh registration in addition to the accept.
+    #[test]
+    fn test_network_deregistration_re_registration_required() {
+        use nextgsim_nas::ies::ie1::{
+            DeRegistrationAccessType, IeDeRegistrationType, ReRegistrationRequired, SwitchOff,
+        };
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+
+        let dereg_type = IeDeRegistrationType::new(
+            DeRegistrationAccessType::ThreeGppAccess,
+            ReRegistrationRequired::Required,
+            SwitchOff::NormalDeRegistration,
+        );
+        let mut req = Vec::new();
+        nextgsim_nas::messages::mm::DeregistrationRequestUeTerminated::new(dereg_type)
+            .encode(&mut req);
+        let protected = protect_downlink(&orch, &req, 2);
+        let outs = orch.handle_downlink(&protected);
+
+        // A fresh registration is initiated: the context is reset first, so the
+        // REGISTRATION REQUEST goes out unprotected.
+        let re_registers = outs.iter().any(|o| match o {
+            MmOutput::SendNasPdu(p) => {
+                p.len() >= 3
+                    && p[1] == 0x00
+                    && p[2] == u8::from(MmMessageType::RegistrationRequest)
+            }
+            _ => false,
+        });
+        assert!(re_registers, "re-registration must be initiated");
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredInitiated
+        );
     }
 
     // ========================================================================
