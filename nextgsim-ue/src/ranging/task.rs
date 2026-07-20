@@ -1,10 +1,10 @@
 //! Ranging Task for UE - UE-to-UE distance measurement and carrier phase positioning
 //!
-//! Implements Rel-18 ranging service per TS 23.586:
-//! - Round-trip time (RTT) based ranging
-//! - Carrier phase measurement for cm-level accuracy
-//! - Phase ambiguity resolution via multi-frequency combining
-//! - Ranging result reporting to LMF
+//! **Scaffold, not wired end-to-end.** Models the Rel-18 ranging concepts of
+//! TS 23.586 (RTT ranging, carrier-phase measurement with multi-frequency
+//! ambiguity resolution, and LMF result reporting), but no `RangingMessage`
+//! producer, SL-PRS stimulus, or UE->LMF (SLPP/RSPP) transport is wired — so
+//! the measurement handlers below are not reached at runtime.
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -157,7 +157,7 @@ impl Task for RangingTask {
     type Message = RangingMessage;
 
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
-        info!("Ranging task started (Rel-18, TS 23.586)");
+        info!("Ranging task started (scaffold: the sidelink-positioning pipeline is not wired end-to-end)");
         loop {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {
