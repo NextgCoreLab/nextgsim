@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 
 use nextgsim_common::config::GnbConfig;
 use nextgsim_common::OctetString;
+use nextgsim_common::SNssai;
 use nextgsim_rls::RrcChannel;
 
 // ============================================================================
@@ -267,6 +268,11 @@ pub enum NgapMessage {
         rrc_establishment_cause: i64,
         /// S-TMSI if available
         s_tmsi: Option<GutiMobileIdentity>,
+        /// Requested S-NSSAI(s) the UE signalled in RRCSetupComplete
+        /// (TS 38.331 §6.2.2). The NGAP task uses these for slice-aware AMF
+        /// selection and echoes them as the Allowed NSSAI in the Initial UE
+        /// Message (TS 38.413 §8.6.1.2). Empty when the UE signalled none.
+        s_nssai_list: Vec<SNssai>,
     },
     /// Uplink NAS delivery from RRC
     UplinkNasDelivery {
