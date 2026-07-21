@@ -101,6 +101,10 @@ const RRC_CYCLE_INTERVAL_MS: u64 = 2500;
 /// Cell selection interval in milliseconds
 const CELL_SELECTION_INTERVAL_MS: u64 = 1000;
 
+/// T300: RRCSetupRequest supervision timer default (ms), TS 38.331 §5.3.3.2.
+/// SIB1 broadcasts the operative value (default 1000 ms); this is the fallback.
+const T300_DEFAULT_MS: u64 = 1000;
+
 /// UE-side NTN timing state
 #[derive(Debug, Clone)]
 pub struct UeNtnTiming {
@@ -167,6 +171,10 @@ pub struct RrcTask {
     /// the RRCSetup's radioBearerConfig established SRB1 (TS 38.331
     /// §5.3.5.6.3) — recorded BEFORE any DL-DCCH (SRB1) message is handled
     srb1_config: Option<Srb1Config>,
+    /// T300 establishment guard (TS 38.331 §5.3.3.2): deadline by which an
+    /// RRCSetup must arrive after an RRCSetupRequest. `Some` while establishment
+    /// is in flight; cleared on RRCSetup reception or on expiry.
+    t300_deadline: Option<tokio::time::Instant>,
 }
 
 impl RrcTask {
@@ -201,6 +209,7 @@ impl RrcTask {
             as_security: None,
             pending_kgnb: None,
             srb1_config: None,
+            t300_deadline: None,
         }
     }
 
@@ -817,6 +826,10 @@ impl RrcTask {
 
     /// Handle RRC Setup message
     async fn handle_rrc_setup(&mut self, cell_id: i32, pdu: &OctetString) {
+        // RRCSetup received: stop the T300 establishment guard (TS 38.331
+        // §5.3.3.4) before applying the configuration.
+        self.stop_t300();
+
         // Wave-6 C2: decode the RRCSetup payload — per TS 38.331 §5.3.3.4
         // the UE shall apply the radioBearerConfig (SRB1 establishment,
         // §5.3.5.6.3) and the masterCellGroup. Decode failure is TOLERATED
@@ -1008,6 +1021,12 @@ impl RrcTask {
 
     /// Handle RRC Reject message
     async fn handle_rrc_reject(&mut self, _cell_id: i32) {
+        // RRCReject ends the establishment attempt: stop T300 (TS 38.331
+        // §5.3.3.2 stops it on RRCReject, not only on RRCSetup) and drop the
+        // pending initial NAS so a later spurious expiry can't fire.
+        self.stop_t300();
+        self.initial_nas_pdu = None;
+
         // Notify NAS of establishment failure
         if let Err(e) = self
             .task_base
@@ -1298,6 +1317,10 @@ impl RrcTask {
         };
 
         self.send_uplink_rrc(RrcChannel::UlCcch, pdu).await;
+
+        // Start the T300 establishment guard (TS 38.331 §5.3.3.2): if no
+        // RRCSetup arrives before it expires, the run loop aborts the attempt.
+        self.start_t300();
     }
 
     /// Handle establishment failure
@@ -1310,6 +1333,40 @@ impl RrcTask {
         {
             error!("Failed to notify NAS of establishment failure: {}", e);
         }
+    }
+
+    /// Starts the T300 establishment guard on transmission of an
+    /// RRCSetupRequest (TS 38.331 §5.3.3.2).
+    fn start_t300(&mut self) {
+        self.t300_deadline =
+            Some(tokio::time::Instant::now() + Duration::from_millis(T300_DEFAULT_MS));
+        debug!("T300 started ({} ms)", T300_DEFAULT_MS);
+    }
+
+    /// Stops T300 on reception of RRCSetup (TS 38.331 §5.3.3.4).
+    fn stop_t300(&mut self) {
+        if self.t300_deadline.take().is_some() {
+            debug!("T300 stopped (RRCSetup received)");
+        }
+    }
+
+    /// True while the T300 establishment guard is running.
+    #[cfg(test)]
+    fn t300_running(&self) -> bool {
+        self.t300_deadline.is_some()
+    }
+
+    /// Handles T300 expiry (TS 38.331 §5.3.3.2): the RRC connection
+    /// establishment attempt is abandoned — the guard is cleared, the pending
+    /// initial NAS is dropped, and the upper layers (NAS) are informed of the
+    /// establishment failure so registration can be retried or failed. The RRC
+    /// state machine stays in RRC_IDLE (establishment does not leave Idle until
+    /// an RRCSetup is received), so no state transition is required here.
+    async fn on_t300_expiry(&mut self) {
+        warn!("T300 expired: RRC connection establishment failed (TS 38.331 §5.3.3.2)");
+        self.t300_deadline = None;
+        self.initial_nas_pdu = None;
+        self.handle_establishment_failure().await;
     }
 
     /// Handle radio link failure
@@ -1480,6 +1537,11 @@ impl RrcTask {
     async fn handle_local_release_connection(&mut self, _treat_barred: bool) {
         info!("Local release connection requested");
 
+        // Upper-layer abort of the connection: stop T300 if establishment was
+        // in flight (TS 38.331 §5.3.3.2 stops T300 on abort by upper layers) so
+        // the guard can't fire a spurious expiry after the attempt is dropped.
+        self.stop_t300();
+
         // Transition to idle
         let _ = self.state_machine.on_rrc_release();
         self.serving_cell_id = None;
@@ -1586,6 +1648,15 @@ impl RrcTask {
     }
 }
 
+/// Resolves when the T300 deadline is reached; pends forever when T300 is not
+/// running, so the RRC run loop's `select!` arm only fires on a real expiry.
+async fn wait_t300(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 #[async_trait::async_trait]
 impl Task for RrcTask {
     type Message = RrcMessage;
@@ -1671,6 +1742,9 @@ impl Task for RrcTask {
                 }
                 _ = cycle_timer.tick() => {
                     self.perform_cycle().await;
+                }
+                _ = wait_t300(self.t300_deadline) => {
+                    self.on_t300_expiry().await;
                 }
             }
         }
@@ -1782,6 +1856,118 @@ mod tests {
         let (ch, _setup_req) = next_uplink_rrc(rls_rx);
         assert_eq!(ch, RrcChannel::UlCcch, "RRCSetupRequest must go on UL-CCCH");
         nas
+    }
+
+    /// T300 establishment guard (issue #30, TS 38.331 §5.3.3.2 / §5.3.3.4):
+    /// started when the RRCSetupRequest is sent, stopped when RRCSetup arrives.
+    #[test]
+    fn test_t300_started_on_setup_request_stopped_on_rrc_setup() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            assert!(
+                !task.t300_running(),
+                "T300 not running before establishment"
+            );
+
+            camp_and_request(&mut task, &mut rls_rx).await;
+            assert!(
+                task.t300_running(),
+                "T300 started when the RRCSetupRequest is sent"
+            );
+
+            // RRCSetup arrives → Connected, T300 stopped.
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlCcch,
+                OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+            )
+            .await;
+            assert_eq!(task.state_machine.state(), RrcState::Connected);
+            assert!(
+                !task.t300_running(),
+                "T300 stopped when RRCSetup is received"
+            );
+        });
+    }
+
+    /// T300 expiry (issue #30, TS 38.331 §5.3.3.2): abandons the establishment
+    /// attempt — the guard clears, the pending initial NAS is dropped, the RRC
+    /// stays in RRC_IDLE, and NAS is told of the establishment failure.
+    #[test]
+    fn test_t300_expiry_aborts_establishment_and_notifies_nas() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camp_and_request(&mut task, &mut rls_rx).await;
+            assert!(task.t300_running());
+            assert!(
+                task.initial_nas_pdu.is_some(),
+                "initial NAS pending during establishment"
+            );
+
+            task.on_t300_expiry().await;
+
+            assert!(!task.t300_running(), "T300 cleared on expiry");
+            assert!(
+                task.initial_nas_pdu.is_none(),
+                "pending initial NAS dropped on expiry"
+            );
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Idle,
+                "RRC stays Idle (establishment never left Idle)"
+            );
+
+            let mut got_failure = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::RrcEstablishmentFailure) = msg {
+                    got_failure = true;
+                }
+            }
+            assert!(
+                got_failure,
+                "NAS informed of RrcEstablishmentFailure on T300 expiry"
+            );
+        });
+    }
+
+    /// T300 is also stopped when the establishment attempt ends by RRCReject or
+    /// by an upper-layer abort (TS 38.331 §5.3.3.2), not only on RRCSetup — so
+    /// no spurious expiry fires afterwards.
+    #[test]
+    fn test_t300_stopped_on_reject_and_local_release() {
+        // RRCReject (DL-CCCH msg type 0x01) stops T300.
+        {
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+                UeTaskBase::new(test_config(), 32);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                camp_and_request(&mut task, &mut rls_rx).await;
+                assert!(task.t300_running());
+                task.handle_downlink_rrc(1, RrcChannel::DlCcch, OctetString::from_slice(&[0x01]))
+                    .await;
+                assert!(!task.t300_running(), "T300 stopped on RRCReject");
+            });
+        }
+        // Upper-layer abort (LocalReleaseConnection) stops T300.
+        {
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+                UeTaskBase::new(test_config(), 32);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                camp_and_request(&mut task, &mut rls_rx).await;
+                assert!(task.t300_running());
+                task.handle_local_release_connection(false).await;
+                assert!(
+                    !task.t300_running(),
+                    "T300 stopped on upper-layer establishment abort"
+                );
+            });
+        }
     }
 
     /// C2 gate: feeding the C1 golden RRCSetup bytes transitions the UE to
