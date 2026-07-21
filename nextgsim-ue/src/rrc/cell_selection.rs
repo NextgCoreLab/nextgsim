@@ -851,6 +851,10 @@ pub struct PlmnSelector {
     operator_preferred: Vec<Plmn>,
     /// Forbidden PLMN list (TS 23.122 Section 3.1)
     forbidden: Vec<Plmn>,
+    /// PLMNs currently available on the radio, reported by the RRC
+    /// CellSelector; the candidate set for automatic selection (TS 23.122
+    /// §4.4.3).
+    available: Vec<Plmn>,
     /// Manually chosen PLMN (manual mode)
     manual_selection: Option<Plmn>,
     /// Higher-priority PLMN search interval (timer T) in seconds
@@ -872,6 +876,7 @@ impl PlmnSelector {
             user_preferred: Vec::new(),
             operator_preferred: Vec::new(),
             forbidden: Vec::new(),
+            available: Vec::new(),
             manual_selection: None,
             hp_search_interval_secs: DEFAULT_HP_PLMN_SEARCH_INTERVAL_SECS,
             hp_search_elapsed_secs: 0,
@@ -933,6 +938,17 @@ impl PlmnSelector {
     /// BCD-encoded list converted via [`plmn_from_bcd`])
     pub fn set_forbidden(&mut self, plmns: Vec<Plmn>) {
         self.forbidden = plmns;
+    }
+
+    /// Sets the PLMNs currently available on the radio (TS 23.122 §4.4.3),
+    /// reported by the RRC CellSelector; the candidate set for [`Self::select`].
+    pub fn set_available_plmns(&mut self, plmns: Vec<Plmn>) {
+        self.available = plmns;
+    }
+
+    /// The PLMNs currently reported as available on the radio.
+    pub fn available_plmns(&self) -> &[Plmn] {
+        &self.available
     }
 
     /// Add a PLMN to the forbidden list

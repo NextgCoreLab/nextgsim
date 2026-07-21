@@ -719,8 +719,17 @@ impl UeApp {
                                 .await;
                             }
                         }
-                        NasMessage::ActiveCellChanged { previous_tai } => {
+                        NasMessage::ActiveCellChanged {
+                            previous_tai,
+                            available_plmns: reported_plmns,
+                        } => {
                             info!("Active cell changed from TAI: {:?}", previous_tai);
+                            // Refresh the selector's available-PLMN candidate set
+                            // from the radio report (TS 23.122 §4.4.3); an empty
+                            // report leaves the last-known set in place.
+                            if !reported_plmns.is_empty() {
+                                plmn_selector.set_available_plmns(reported_plmns);
+                            }
                             if orch.state().is_registered() {
                                 // Mobility registration update trigger
                                 // (TS 24.501 Section 5.5.1.3.2)
@@ -1494,10 +1503,18 @@ async fn perform_plmn_selection(
     plmn_selector.set_forbidden(forbidden);
     plmn_selector.set_registered_plmn(None);
 
-    // Available PLMNs: in this simulation every cell in the gNB search
-    // list broadcasts the configured home PLMN
-    let available = [home_plmn];
-    match plmn_selector.select(&available) {
+    // Candidate PLMNs come from the live RRC available-PLMN report cached in
+    // the selector (CellSelector::available_plmns, TS 23.122 §4.4.3); fall back
+    // to the home PLMN when the radio has reported none yet.
+    let candidates: Vec<_> = {
+        let reported = plmn_selector.available_plmns();
+        if reported.is_empty() {
+            vec![home_plmn]
+        } else {
+            reported.to_vec()
+        }
+    };
+    match plmn_selector.select(&candidates) {
         Some(plmn) => {
             info!("PLMN selection chose {plmn}: attempting registration");
             let outs = orch.start_registration(RegistrationType::InitialRegistration);
