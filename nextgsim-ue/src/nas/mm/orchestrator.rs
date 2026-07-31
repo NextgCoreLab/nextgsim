@@ -907,7 +907,7 @@ impl MmOrchestrator {
         self.state
             .switch_mm_state(MmSubState::RegisteredNormalService);
         self.state.switch_update_status(UpdateStatus::Updated);
-        info!("Registration Accept: UE is now {}", self.state);
+        info!("Received Registration Accept: UE is now {}", self.state);
 
         // Mandatory registration area / slice assignment from the network
         if let Some(ref tai_list) = acc.tai_list {
@@ -1259,6 +1259,11 @@ impl MmOrchestrator {
             }
             return outs;
         }
+        // Log the success case too. This is where the UE decides the network
+        // proved knowledge of K (TS 33.501 §6.1.3.2), so it is as diagnostic as
+        // the failure branch above -- and previously only failures were visible,
+        // leaving a successful authentication with no positive marker.
+        info!("AUTN MAC verified");
 
         // 2) AMF separation bit check (TS 33.501 6.1.3.2: bit must be 1
         // for 5G authentication; cause #26 otherwise)
@@ -1315,6 +1320,10 @@ impl MmOrchestrator {
         let mut pdu = Vec::new();
         response.encode(&mut pdu);
         let pdu = self.protect_if_active(pdu);
+        info!(
+            "Sending Authentication Response (RES* {} bytes)",
+            res_star.len()
+        );
         vec![MmOutput::SendNasPdu(pdu)]
     }
 

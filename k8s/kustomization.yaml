@@ -1,0 +1,21 @@
+# Base kustomization for the nextgsim gNB + UE manifests.
+#
+# Written for Kind. This file only groups them as a kustomize base.
+#
+# NOTE: the config in configmap.yaml carries Service DNS names as
+# placeholders. They are NOT usable as-is - the simulator's config types are
+# `IpAddr` (nextgsim-common/src/config.rs), so a hostname either fails to
+# deserialize (gNB) or is silently dropped (UE, rls/task.rs:104). An init
+# container must rewrite them to literal IPs before the main container starts.
+# The gnb.yaml/ue.yaml manifests here do that with nslookup + sed;
+# nextgcore/deploy/eks/ replaces that with a stricter resolver.
+#
+# Rendered standalone:
+#   kubectl kustomize nextgsim/k8s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - configmap.yaml
+  - gnb.yaml
+  - ue.yaml

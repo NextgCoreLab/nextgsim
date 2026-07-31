@@ -16,3 +16,9 @@
 # Local tooling (GitNexus code-intelligence index + Claude Code local config)
 .gitnexus
 .claude/
+
+# Compiled simulator binaries consumed by Dockerfile.{gnb,ue}-local. Build
+# artifacts, not sources: regenerate with
+#   cargo build --release && cp target/release/nr-{gnb,ue} docker/binaries/
+# (/binaries/ above is already ignored; this is the docker build context copy.)
+/docker/binaries/

@@ -186,9 +186,17 @@ fn validate_ue_config(config: &UeConfig) -> Result<()> {
         );
     }
 
-    // Validate gNB search list
+    // Validate gNB search list. Checking the parsed form matters: the entries
+    // are Vec<String>, so a hostname deserializes cleanly and used to be
+    // dropped silently when converted to SocketAddr, leaving an empty search
+    // space and a UE that never finds a cell. Reject it here instead.
     if config.gnb_search_list.is_empty() {
         bail!("At least one gNB address must be specified in gnb_search_list");
+    }
+    for entry in &config.gnb_search_list {
+        if let Err(e) = nextgsim_ue::rls::task::parse_gnb_search_entry(entry) {
+            bail!("Invalid gnb_search_list entry: {e}");
+        }
     }
 
     // Validate key (must not be all zeros)
@@ -1213,9 +1221,12 @@ async fn process_sm_outputs(
                     .await;
             }
             SmOutput::SessionEstablished { psi, ipv4 } => {
-                info!("PDU session {psi} is now ACTIVE (IPv4: {ipv4:?})");
+                // "PDU Session" capitalised to match the 3GPP term used
+                // everywhere else in these logs (and in the E2E assertions).
+                info!("PDU Session {psi} is now ACTIVE (IPv4: {ipv4:?})");
                 if let Some(ip) = ipv4 {
                     let address = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+                    info!("PDU Session {psi} established with IP {address}");
                     info!("Creating TUN interface for PDU session {psi} with IP {address}");
                     let _ = tun_tx
                         .send(TunMessage::CreateInterface {
