@@ -260,8 +260,14 @@ impl Default for CellReselectionParams {
 pub struct CellSelector {
     /// Detected cells indexed by `cell_id`
     cells: HashMap<i32, CellDescription>,
-    /// Currently selected cell
-    current_cell: ActiveCellInfo,
+    /// Currently selected cell. `None` until the first successful selection.
+    ///
+    /// Deliberately an `Option` rather than an `ActiveCellInfo` whose
+    /// `cell_id == 0` means "none": cell ID 0 is a perfectly legal NR cell
+    /// identity (a gNB with `nci: 0x10` and `gnb_id_length: 32` has cell-ID
+    /// bits 0), so the old sentinel made a real cell indistinguishable from no
+    /// cell and camping on it silently failed.
+    current_cell: Option<ActiveCellInfo>,
     /// Selected PLMN (from NAS)
     selected_plmn: Option<Plmn>,
     /// Required SNPN NID (Rel-17, TS 23.501 §5.30). When set (SNPN mode), only
@@ -284,7 +290,7 @@ impl CellSelector {
     pub fn new() -> Self {
         Self {
             cells: HashMap::new(),
-            current_cell: ActiveCellInfo::default(),
+            current_cell: None,
             selected_plmn: None,
             required_nid: None,
             forbidden_tai_roaming: Vec::new(),
@@ -368,7 +374,10 @@ impl CellSelector {
         } else {
             if consider_lost {
                 // Cell lost
-                let was_active = self.current_cell.cell_id == cell_id;
+                let was_active = self
+                    .current_cell
+                    .as_ref()
+                    .is_some_and(|c| c.cell_id == cell_id);
                 self.cells.remove(&cell_id);
                 tracing::debug!(
                     "Cell lost: cell_id={}, was_active={}, total_cells={}",
@@ -377,8 +386,11 @@ impl CellSelector {
                     self.cells.len()
                 );
                 if was_active {
-                    let old_cell = std::mem::take(&mut self.current_cell);
-                    return CellChangeEvent::ActiveCellLost(old_cell);
+                    // `take` leaves None, i.e. "not camped", which is exactly the
+                    // post-condition of losing the active cell.
+                    if let Some(old_cell) = self.current_cell.take() {
+                        return CellChangeEvent::ActiveCellLost(old_cell);
+                    }
                 }
                 return CellChangeEvent::CellLost(cell_id);
             }
@@ -418,9 +430,9 @@ impl CellSelector {
         }
     }
 
-    /// Get the current active cell
-    pub fn current_cell(&self) -> &ActiveCellInfo {
-        &self.current_cell
+    /// Get the current active cell, or `None` while not camped on any cell.
+    pub fn current_cell(&self) -> Option<&ActiveCellInfo> {
+        self.current_cell.as_ref()
     }
 
     /// Get a cell description by ID
@@ -466,7 +478,7 @@ impl CellSelector {
         }
 
         let last_cell = self.current_cell.clone();
-        let should_log_errors = last_cell.cell_id != 0
+        let should_log_errors = last_cell.is_some()
             || self.last_failure_logged.is_none_or(|t| {
                 t.elapsed() >= Duration::from_millis(CELL_SELECTION_LOG_INTERVAL_MS)
             });
@@ -506,21 +518,29 @@ impl CellSelector {
             }
         }
 
+        // Nothing selectable this round. Leave any existing camp untouched:
+        // losing the serving cell is signalled by ActiveCellLost, not by a
+        // failed selection round.
+        if !cell_found {
+            return None;
+        }
+
         // Apply cell reselection with hysteresis if we already have a serving cell
-        if last_cell.cell_id != 0 && cell_found {
-            let should_reselect =
-                self.evaluate_cell_reselection(last_cell.cell_id, cell_info.cell_id);
+        if let Some(ref last) = last_cell {
+            let should_reselect = self.evaluate_cell_reselection(last.cell_id, cell_info.cell_id);
             if !should_reselect {
                 // Keep current cell, reset candidate
-                cell_info = last_cell.clone();
+                cell_info = last.clone();
             }
         }
 
+        let changed = last_cell.as_ref().map(|c| c.cell_id) != Some(cell_info.cell_id);
+
         // Update current cell
-        self.current_cell = cell_info.clone();
+        self.current_cell = Some(cell_info.clone());
 
         // Log if selection changed
-        if cell_info.cell_id != 0 && cell_info.cell_id != last_cell.cell_id {
+        if changed {
             tracing::info!(
                 "Cell reselection: id={}, plmn={}, tac={}, category={:?}",
                 cell_info.cell_id,
@@ -533,8 +553,13 @@ impl CellSelector {
             self.reselection_params.candidate_better_since = None;
         }
 
-        // Return new cell info if changed
-        if cell_info.cell_id != last_cell.cell_id {
+        // Return the cell only when the camp actually changed, so callers can
+        // treat Some(..) as "newly camped / reselected" and drive registration
+        // off that edge. Comparing Options rather than raw ids is what fixes the
+        // cell-ID-0 case: previously `0 != 0` made a successful first selection
+        // on cell 0 indistinguishable from "no cell found", so the UE camped
+        // internally but never told NAS, and registration never started.
+        if changed {
             Some(cell_info)
         } else {
             None
