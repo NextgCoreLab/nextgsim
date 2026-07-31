@@ -25,6 +25,31 @@ use nextgsim_rls::{
 /// Default RLS port for gNB
 pub const DEFAULT_RLS_PORT: u16 = 4997;
 
+/// Parse one `gnb_search_list` entry into a socket address.
+///
+/// Accepts a bare IP (`10.0.0.1`, port defaults to [`DEFAULT_RLS_PORT`]) or an
+/// explicit `IP:port` (`10.0.0.1:4997`). Hostnames are rejected: the entry is
+/// used as a UDP destination without a resolution step, so a name has no
+/// meaning here. The error names the offending entry so a misconfiguration is
+/// actionable from the message alone.
+pub fn parse_gnb_search_entry(entry: &str) -> Result<SocketAddr, String> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return Err("entry is empty".to_string());
+    }
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, DEFAULT_RLS_PORT));
+    }
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    Err(format!(
+        "{trimmed:?} is not a literal IP address or IP:port. Hostnames are not \
+         supported; resolve the name to an IP first (an init container or \
+         startup script can do this)."
+    ))
+}
+
 const HEARTBEAT_INTERVAL_MS: u64 = 1000;
 const LOST_CELL_CHECK_INTERVAL_MS: u64 = 500;
 const UDP_BUFFER_SIZE: usize = 65535;
@@ -97,13 +122,26 @@ impl RlsTask {
     }
 
     pub fn from_ue_config(task_base: UeTaskBase) -> Self {
-        let gnb_search_list: Vec<SocketAddr> = task_base
-            .config
-            .gnb_search_list
-            .iter()
-            .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
-            .map(|ip| SocketAddr::new(ip, DEFAULT_RLS_PORT))
-            .collect();
+        // Entries that do not parse are logged rather than dropped in silence.
+        // A bad entry used to vanish here, leaving an empty search space and a
+        // UE that never finds a cell with nothing in the log to explain why.
+        // `parse_gnb_search_entry` is also called from the UE's startup
+        // validation, so a malformed list normally fails before reaching this
+        // point; the warning covers callers that build a config directly.
+        let mut gnb_search_list = Vec::new();
+        for entry in &task_base.config.gnb_search_list {
+            match parse_gnb_search_entry(entry) {
+                Ok(addr) => gnb_search_list.push(addr),
+                Err(e) => warn!("ignoring gnb_search_list entry {entry:?}: {e}"),
+            }
+        }
+        if gnb_search_list.is_empty() && !task_base.config.gnb_search_list.is_empty() {
+            error!(
+                "no usable gNB addresses: all {} gnb_search_list entries were rejected. \
+                 The UE cannot find a cell.",
+                task_base.config.gnb_search_list.len()
+            );
+        }
         let config = RlsTaskConfig {
             gnb_search_list,
             ..Default::default()
@@ -618,6 +656,59 @@ mod tests {
         let task = RlsTask::from_ue_config(task_base);
         assert!(task.serving_cell.is_none());
         assert_eq!(task.config.gnb_search_list.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_gnb_search_entry_bare_ip_gets_default_port() {
+        let addr = parse_gnb_search_entry("10.0.0.1").expect("bare IP must parse");
+        assert_eq!(addr.ip().to_string(), "10.0.0.1");
+        assert_eq!(addr.port(), DEFAULT_RLS_PORT);
+    }
+
+    #[test]
+    fn test_parse_gnb_search_entry_explicit_port_is_preserved() {
+        // Previously dropped: the old filter_map only tried IpAddr, so an
+        // explicit IP:port never parsed and vanished.
+        let addr = parse_gnb_search_entry("10.0.0.1:5000").expect("IP:port must parse");
+        assert_eq!(addr.port(), 5000);
+    }
+
+    #[test]
+    fn test_parse_gnb_search_entry_rejects_hostname() {
+        // The regression this guards: a hostname used to be silently discarded,
+        // leaving an empty search space and a UE that never finds a cell.
+        let err = parse_gnb_search_entry("gnb.nextg-system.svc.cluster.local")
+            .expect_err("a hostname must be rejected, not dropped");
+        assert!(
+            err.contains("gnb.nextg-system.svc.cluster.local"),
+            "error must name the offending entry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_gnb_search_entry_rejects_empty_and_garbage() {
+        assert!(parse_gnb_search_entry("").is_err());
+        assert!(parse_gnb_search_entry("   ").is_err());
+        assert!(parse_gnb_search_entry("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn test_parse_gnb_search_entry_tolerates_surrounding_whitespace() {
+        let addr = parse_gnb_search_entry("  10.0.0.1  ").expect("whitespace must be trimmed");
+        assert_eq!(addr.ip().to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_from_ue_config_skips_bad_entries_but_keeps_good_ones() {
+        let mut config = test_config();
+        config.gnb_search_list = vec![
+            "gnb.example.svc.cluster.local".to_string(),
+            "10.0.0.7".to_string(),
+        ];
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let task = RlsTask::from_ue_config(task_base);
+        assert_eq!(task.config.gnb_search_list.len(), 1);
+        assert_eq!(task.config.gnb_search_list[0].ip().to_string(), "10.0.0.7");
     }
 
     #[test]
