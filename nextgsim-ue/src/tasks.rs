@@ -353,6 +353,10 @@ pub enum NasMessage {
     ActiveCellChanged {
         /// Previous TAI
         previous_tai: Tai,
+        /// PLMNs currently available on the radio (broadcast by the cells the
+        /// UE can detect), reported by the RRC CellSelector for TS 23.122
+        /// §4.4.3 automatic PLMN selection. Empty if none are known yet.
+        available_plmns: Vec<crate::rrc::cell_selection::Plmn>,
     },
     /// RRC fallback indication (from RRC)
     RrcFallbackIndication,

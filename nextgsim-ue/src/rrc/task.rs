@@ -381,6 +381,10 @@ impl RrcTask {
                     .nas_tx
                     .send(NasMessage::ActiveCellChanged {
                         previous_tai: old_tai,
+                        // Report the PLMNs the UE can currently see so NAS can
+                        // run TS 23.122 §4.4.3 selection over the real radio
+                        // rather than a hardcoded home-PLMN list.
+                        available_plmns: self.cell_selector.available_plmns(),
                     })
                     .await
                 {
@@ -1856,6 +1860,36 @@ mod tests {
         let (ch, _setup_req) = next_uplink_rrc(rls_rx);
         assert_eq!(ch, RrcChannel::UlCcch, "RRCSetupRequest must go on UL-CCCH");
         nas
+    }
+
+    /// On camping, the RRC task reports the radio's available PLMNs to NAS in
+    /// ActiveCellChanged (issue #49, TS 23.122 §4.4.3) — the production caller
+    /// of CellSelector::available_plmns — so NAS selects over the real radio
+    /// rather than a hardcoded home-PLMN list.
+    #[test]
+    fn test_active_cell_changed_reports_available_plmns() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_signal_changed(1, -60).await;
+            task.perform_cycle().await; // camps on cell 1 → emits ActiveCellChanged
+
+            let mut reported: Option<Vec<CellPlmn>> = None;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::ActiveCellChanged {
+                    available_plmns, ..
+                }) = msg
+                {
+                    reported = Some(available_plmns);
+                }
+            }
+            let reported = reported.expect("ActiveCellChanged emitted on camp");
+            assert!(
+                !reported.is_empty(),
+                "available PLMNs reported to NAS for selection (TS 23.122 §4.4.3)"
+            );
+        });
     }
 
     /// T300 establishment guard (issue #30, TS 38.331 §5.3.3.2 / §5.3.3.4):
