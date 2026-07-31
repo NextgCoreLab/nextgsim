@@ -41,7 +41,34 @@ spec:
       initContainers:
         - name: wait-amf
           image: busybox:1.36
-          command: ['sh', '-c', 'echo "Waiting for AMF deployment..."; sleep 5; echo "AMF should be ready (deploy.sh ensures ordering)"']
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # Waits on the AMF actually being reachable. The previous version
+              # slept 5s and printed that the AMF "should be ready", which is a
+              # guess: on a cold cluster pulling images 5s is not enough and the
+              # gNB then fails NG Setup against an AMF that is not listening.
+              echo "[wait-amf] waiting for AMF DNS..."
+              i=0
+              until nslookup amf.nextg-system.svc.cluster.local >/dev/null 2>&1; do
+                i=$((i+1))
+                [ "$i" -ge 60 ] && { echo "[wait-amf] FATAL: AMF DNS never resolved"; exit 1; }
+                sleep 2
+              done
+              echo "[wait-amf] AMF DNS resolves."
+              # NGAP is userspace SCTP over UDP, so a TCP connect check against
+              # 38412 would always fail. Probe the AMF SBI port instead: it is
+              # TCP and comes up in the same process.
+              i=0
+              until nc -z amf.nextg-system.svc.cluster.local 7777; do
+                i=$((i+1))
+                [ "$i" -ge 60 ] && { echo "[wait-amf] FATAL: AMF SBI never accepted"; exit 1; }
+                echo "[wait-amf] waiting for AMF SBI... ($i/60)"
+                sleep 2
+              done
+              echo "[wait-amf] AMF ready."
         - name: resolve-dns
           image: busybox:1.36
           env:
@@ -53,36 +80,75 @@ spec:
             - sh
             - -c
             - |
-              echo "[resolve-dns] Pod IP: $POD_IP"
-              echo "[resolve-dns] Resolving AMF and UPF service IPs..."
-              # Resolve AMF ClusterIP
-              AMF_IP=""
-              for i in $(seq 1 30); do
-                AMF_IP=$(nslookup amf.nextg-system.svc.cluster.local 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $2}' | head -1)
-                if [ -n "$AMF_IP" ]; then break; fi
-                echo "[resolve-dns] Waiting for AMF DNS... ($i/30)"
-                sleep 2
-              done
-              if [ -z "$AMF_IP" ]; then echo "[resolve-dns] FATAL: Could not resolve AMF"; exit 1; fi
-              echo "[resolve-dns] AMF IP: $AMF_IP"
-              # Resolve UPF ClusterIP
-              UPF_IP=""
-              for i in $(seq 1 30); do
-                UPF_IP=$(nslookup upf.nextg-system.svc.cluster.local 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $2}' | head -1)
-                if [ -n "$UPF_IP" ]; then break; fi
-                echo "[resolve-dns] Waiting for UPF DNS... ($i/30)"
-                sleep 2
-              done
-              if [ -z "$UPF_IP" ]; then echo "[resolve-dns] FATAL: Could not resolve UPF"; exit 1; fi
-              echo "[resolve-dns] UPF IP: $UPF_IP"
-              # Generate gnb.yaml with resolved IPs and pod IP for interfaces
+              set -eu
+
+              # busybox (this image) ships no getent, so nslookup is the only
+              # resolver available. The parse is anchored: skip everything until
+              # ^Name:, then take the first following Address:. The original
+              # `grep -A1 'Name:' | grep Address | awk` was fragile for two
+              # reasons -- it depended on exact Name:/Address line adjacency,
+              # and without the ^Name: anchor a bare `grep Address` returns the
+              # DNS server's own IP from the "Address: 172.20.0.10:53" preamble
+              # rather than the answer. That produced a plausible-looking but
+              # wrong IP, which the old `-z` empty-check could not catch.
+              resolve() {
+                _host="$1"; _ip=""; _i=0
+                while [ "$_i" -lt 60 ]; do
+                  _ip=$(nslookup "$_host" 2>/dev/null \
+                        | awk '/^Name:/{n=1;next} n&&/^Address( 1)?:/{print $NF; exit}')
+                  case "$_ip" in
+                    *.*.*.*) echo "$_ip"; return 0 ;;
+                  esac
+                  _i=$((_i+1))
+                  echo "[resolve-dns] waiting for $_host ($_i/60)" >&2
+                  sleep 2
+                done
+                echo "[resolve-dns] FATAL: could not resolve $_host" >&2
+                return 1
+              }
+
+              # The gNB's config fields are typed IpAddr, so a malformed value
+              # fails to deserialize and the reason ends up buried in a serde
+              # error. Fail here instead, naming the field.
+              assert_ip() {
+                case "$2" in
+                  *[0-9].[0-9]*) ;;
+                  *) echo "[resolve-dns] FATAL: $1 is not an IPv4 address: '$2'" >&2; exit 1 ;;
+                esac
+              }
+
+              echo "[resolve-dns] pod IP: $POD_IP"
+              assert_ip POD_IP "$POD_IP"
+
+              AMF_IP=$(resolve amf.nextg-system.svc.cluster.local)
+              UPF_IP=$(resolve upf.nextg-system.svc.cluster.local)
+              assert_ip AMF_IP "$AMF_IP"
+              assert_ip UPF_IP "$UPF_IP"
+              echo "[resolve-dns] AMF=$AMF_IP UPF=$UPF_IP"
+
               cp /tmp/config-template/gnb.yaml /etc/nextgsim/gnb.yaml
-              sed -i "s|amf.nextg-system.svc.cluster.local|$AMF_IP|g" /etc/nextgsim/gnb.yaml
-              sed -i "s|upf.nextg-system.svc.cluster.local|$UPF_IP|g" /etc/nextgsim/gnb.yaml
-              sed -i "s|link_ip: 0.0.0.0|link_ip: $POD_IP|g" /etc/nextgsim/gnb.yaml
-              sed -i "s|ngap_ip: 0.0.0.0|ngap_ip: $POD_IP|g" /etc/nextgsim/gnb.yaml
-              sed -i "s|gtp_ip: 0.0.0.0|gtp_ip: $POD_IP|g" /etc/nextgsim/gnb.yaml
-              echo "[resolve-dns] Generated gnb.yaml:"
+
+              # link_ip/ngap_ip/gtp_ip must be the pod IP, not 0.0.0.0: the gNB
+              # advertises these in NGAP and GTP-U, and a peer told 0.0.0.0 has
+              # nowhere to send return traffic. Anchored to the key so a bare
+              # 0.0.0.0 elsewhere in the file is not rewritten.
+              sed -i \
+                -e "s|amf\.nextg-system\.svc\.cluster\.local|$AMF_IP|g" \
+                -e "s|upf\.nextg-system\.svc\.cluster\.local|$UPF_IP|g" \
+                -e "s|^\( *link_ip:\).*|\1 $POD_IP|" \
+                -e "s|^\( *ngap_ip:\).*|\1 $POD_IP|" \
+                -e "s|^\( *gtp_ip:\).*|\1 $POD_IP|" \
+                /etc/nextgsim/gnb.yaml
+
+              # Nothing unresolved may survive: the gNB would start, fail to
+              # parse IpAddr, and bury the reason in a serde error.
+              if grep -qE 'svc\.cluster\.local|0\.0\.0\.0' /etc/nextgsim/gnb.yaml; then
+                echo "[resolve-dns] FATAL: unresolved values remain:" >&2
+                grep -nE 'svc\.cluster\.local|0\.0\.0\.0' /etc/nextgsim/gnb.yaml >&2
+                exit 1
+              fi
+
+              echo "[resolve-dns] final gnb.yaml:"
               cat /etc/nextgsim/gnb.yaml
           volumeMounts:
             - name: config-template
@@ -117,16 +183,27 @@ spec:
             - name: config-resolved
               mountPath: /etc/nextgsim
               readOnly: true
+          # `kill -0 1` only asked whether PID 1 exists, which is true for any
+          # process that has not exited -- including one wedged, deadlocked, or
+          # never having bound its socket. The RLS listener on UDP 4997 is the
+          # first thing a UE needs, so bind state is the useful signal.
+          #
+          # /proc/net/udp rather than netstat/ss: Dockerfile.gnb-local installs
+          # only ca-certificates and libsctp1, so neither net-tools nor
+          # iproute2 exists and a netstat probe would fail on a healthy pod and
+          # crash-loop it. 4997 = 0x1385.
           readinessProbe:
             exec:
-              command: ["sh", "-c", "kill -0 1"]
+              command: ["sh", "-c", "grep -qi ':1385' /proc/net/udp"]
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 6
           livenessProbe:
             exec:
-              command: ["sh", "-c", "kill -0 1"]
-            initialDelaySeconds: 15
+              command: ["sh", "-c", "grep -qi ':1385' /proc/net/udp"]
+            initialDelaySeconds: 30
             periodSeconds: 30
+            failureThreshold: 3
       volumes:
         - name: config-template
           configMap:
