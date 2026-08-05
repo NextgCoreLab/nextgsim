@@ -27,6 +27,14 @@ use nextgsim_nwdaf::{CellLoad, NwdafManager, NwdafResponse, UeMeasurement, Vecto
 
 use crate::tasks::{GnbTaskBase, NwdafMessage, RrcMessage, Task, TaskMessage};
 
+/// Nominal reference ceiling used to express PRB usage in Mbps-shaped units.
+///
+/// This is a placeholder, not a capacity model. The gNB config carries no cell
+/// bandwidth or numerology, so a real capacity cannot be derived here; a proper
+/// figure needs either a per-cell throughput counter on the data path or a
+/// bandwidth field to compute from.
+const NOMINAL_CELL_CAPACITY_MBPS: f32 = 1000.0;
+
 /// NWDAF Task for gNB
 ///
 /// Provides four-layer network data analytics with closed-loop automation.
@@ -59,14 +67,30 @@ impl NwdafTask {
         }
     }
 
-    /// Handles a UE measurement report
+    /// Handles a UE measurement report.
+    ///
+    /// A report without RSRP/RSRQ is **not** recorded as a measurement. The
+    /// analytics layer's `UeMeasurement` requires both as `f32`, so recording a
+    /// position-only report means inventing values, and there is no safe filler:
+    /// 0.0 reads as an implausibly strong signal, and any "typical" constant
+    /// makes the series artificially stable so the z-score anomaly detector can
+    /// never fire. Such reports are logged and dropped instead.
     fn handle_ue_measurement(
         &mut self,
         ue_id: i32,
-        rsrp: f32,
-        rsrq: f32,
+        rsrp: Option<f32>,
+        rsrq: Option<f32>,
         position: (f32, f32, f32),
     ) {
+        let (Some(rsrp), Some(rsrq)) = (rsrp, rsrq) else {
+            debug!(
+                "NWDAF: UE {ue_id} report carries no RSRP/RSRQ (pos=({}, {}, {})); \
+                 not recording a radio measurement",
+                position.0, position.1, position.2
+            );
+            return;
+        };
+
         debug!(
             "NWDAF: UE {} measurement - RSRP={} dBm, RSRQ={} dB, pos=({}, {}, {})",
             ue_id, rsrp, rsrq, position.0, position.1, position.2
@@ -112,7 +136,17 @@ impl NwdafTask {
             cell_id,
             prb_usage,
             connected_ues,
-            avg_throughput_mbps: prb_usage * 1000.0,
+            // NOT a measurement. The gNB keeps no per-cell throughput counter,
+            // and its config carries no cell bandwidth or numerology from which
+            // a capacity could be derived, so there is nothing to compute this
+            // from. It is PRB usage scaled by a nominal 1 Gbps reference
+            // ceiling: a restatement of prb_usage in Mbps-shaped units, not an
+            // independent signal.
+            //
+            // Kept rather than zeroed because the field is not Option and a 0
+            // would read as an idle cell. Any analytics treating this as
+            // observed throughput is reading prb_usage twice.
+            avg_throughput_mbps: prb_usage * NOMINAL_CELL_CAPACITY_MBPS,
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -290,12 +324,50 @@ mod tests {
         let mut task = NwdafTask::new(task_base);
 
         // Record measurement
-        task.handle_ue_measurement(1, -80.0, -10.0, (100.0, 200.0, 0.0));
+        task.handle_ue_measurement(1, Some(-80.0), Some(-10.0), (100.0, 200.0, 0.0));
 
         // Verify measurement was recorded
         let history = task.nwdaf.get_ue_history(1);
         assert!(history.is_some());
         assert_eq!(history.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_position_only_report_is_not_recorded_as_a_measurement() {
+        // Regression: the ISAC task is the only live producer of UeMeasurement
+        // and it has no serving-cell RSRP/RSRQ. It used to send 0.0 for both,
+        // so the analytics layer recorded a constant 0 dBm series -- physically
+        // implausible AND perfectly stable, meaning the z-score anomaly detector
+        // could never fire while appearing to have real data to work on.
+        //
+        // A report with no radio measurement must not become a measurement.
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        let mut task = NwdafTask::new(task_base);
+
+        // Position-only, exactly what ISAC forwards.
+        task.handle_ue_measurement(7, None, None, (10.0, 20.0, 0.0));
+        assert!(
+            task.nwdaf.get_ue_history(7).is_none(),
+            "a report without RSRP/RSRQ must not be recorded as a measurement"
+        );
+
+        // A partial report is equally unusable.
+        task.handle_ue_measurement(7, Some(-80.0), None, (10.0, 20.0, 0.0));
+        assert!(
+            task.nwdaf.get_ue_history(7).is_none(),
+            "a report missing RSRQ must not be recorded either"
+        );
+
+        // A complete report still is.
+        task.handle_ue_measurement(7, Some(-80.0), Some(-10.0), (10.0, 20.0, 0.0));
+        assert_eq!(
+            task.nwdaf.get_ue_history(7).map(|h| h.len()),
+            Some(1),
+            "a complete report must be recorded"
+        );
     }
 
     #[tokio::test]
@@ -327,7 +399,12 @@ mod tests {
 
         // Record measurements to build history
         for i in 0..10 {
-            task.handle_ue_measurement(1, -80.0, -10.0, (i as f32 * 10.0, i as f32 * 5.0, 0.0));
+            task.handle_ue_measurement(
+                1,
+                Some(-80.0),
+                Some(-10.0),
+                (i as f32 * 10.0, i as f32 * 5.0, 0.0),
+            );
         }
 
         // Request prediction

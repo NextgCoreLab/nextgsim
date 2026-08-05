@@ -767,10 +767,18 @@ pub enum NwdafMessage {
     UeMeasurement {
         /// UE identifier
         ue_id: i32,
-        /// Serving cell RSRP (dBm)
-        rsrp: f32,
-        /// Serving cell RSRQ (dB)
-        rsrq: f32,
+        /// Serving cell RSRP (dBm), or `None` when the sender has no radio
+        /// measurement to report.
+        ///
+        /// Optional rather than defaulting to 0.0: the only producer on the
+        /// live path is the ISAC task, which derives a fused *position* and has
+        /// no access to RSRP. It used to send 0.0, and 0 dBm is not a neutral
+        /// placeholder -- it is an implausibly strong signal that the
+        /// downstream z-score anomaly detector happily consumed as real data.
+        /// `None` cannot be mistaken for a measurement.
+        rsrp: Option<f32>,
+        /// Serving cell RSRQ (dB), or `None` when unavailable. See `rsrp`.
+        rsrq: Option<f32>,
         /// Position (x, y, z in meters)
         position: (f32, f32, f32),
     },
