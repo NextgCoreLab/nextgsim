@@ -433,8 +433,8 @@ async fn test_nwdaf_to_rrc_handover_recommendation_arrives() {
         sixg.nwdaf_tx
             .send(NwdafMessage::UeMeasurement {
                 ue_id: 1,
-                rsrp: -80.0 - (i as f32) * 5.0,
-                rsrq: -10.0 - (i as f32) * 1.0,
+                rsrp: Some(-80.0 - (i as f32) * 5.0),
+                rsrq: Some(-10.0 - (i as f32) * 1.0),
                 position: (i as f32 * 10.0, 0.0, 0.0),
             })
             .await
@@ -514,8 +514,8 @@ async fn test_nwdaf_task_predict_trajectory_via_channel() {
         sixg.nwdaf_tx
             .send(NwdafMessage::UeMeasurement {
                 ue_id: 5,
-                rsrp: -75.0 - (i as f32),
-                rsrq: -9.0 - (i as f32) * 0.5,
+                rsrp: Some(-75.0 - (i as f32)),
+                rsrq: Some(-9.0 - (i as f32) * 0.5),
                 position: (i as f32 * 5.0, i as f32 * 3.0, 0.0),
             })
             .await

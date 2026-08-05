@@ -103,12 +103,20 @@ impl Task for IsacTask {
                                     fused.position.z,
                                     fused.confidence
                                 );
-                                // Forward fused position to NWDAF for analytics
+                                // Forward the fused position to NWDAF for analytics.
+                                //
+                                // Position only: ISAC fuses ranging measurements
+                                // and has no serving-cell RSRP/RSRQ. This used to
+                                // send 0.0 for both, which the NWDAF anomaly
+                                // detector then treated as a real reading -- a
+                                // constant 0 dBm series, which is both physically
+                                // implausible and perfectly stable, so the z-score
+                                // detector could never flag anything.
                                 if let Some(ref sixg) = self.task_base.sixg {
                                     let nwdaf_msg = NwdafMessage::UeMeasurement {
                                         ue_id,
-                                        rsrp: 0.0,
-                                        rsrq: 0.0,
+                                        rsrp: None,
+                                        rsrq: None,
                                         position: (
                                             fused.position.x as f32,
                                             fused.position.y as f32,
