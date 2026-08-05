@@ -162,7 +162,18 @@ impl Ontology {
         }
     }
 
-    /// Creates a 3GPP-compliant ontology with standard entity and relationship schemas
+    /// Creates an ontology seeded with 3GPP-flavoured entity and relationship
+    /// schemas: UE, gNB, AMF and Slice entities plus an `attached_to`
+    /// relationship.
+    ///
+    /// The naming follows 3GPP terminology, but this is **not** a compliant or
+    /// complete model of any 3GPP information model — it is four entity types
+    /// and one relationship, enough to exercise the knowledge graph. The
+    /// `3GPP-R18` version string labels the vocabulary the names are drawn from,
+    /// not a conformance level.
+    ///
+    /// The name is kept for API compatibility; prefer reading it as
+    /// "3GPP-shaped" rather than "3GPP-compliant".
     pub fn new_3gpp_compliant() -> Self {
         let mut ontology = Self::new("3GPP-R18");
 
