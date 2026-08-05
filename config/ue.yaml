@@ -70,10 +70,21 @@ supported_algs:
   nea2: true   # AES ciphering
   nea3: true   # ZUC ciphering
 
-# Post-Quantum Cryptography (Rel-20 research)
+# Post-Quantum Cryptography (Rel-20 research; no frozen stage-3 spec exists)
+#
+# NOTE: the primitives in nextgsim-crypto are real (RustCrypto ml-kem / ml-dsa,
+# FIPS 203 / 204) but are NOT reachable from the nr-ue or nr-gnb binaries: no
+# NAS or RRC path consumes them. Setting enabled: true records intent; it does
+# not yet put PQC on the wire.
 pqc:
   enabled: false           # Enable PQC algorithm support
-  prefer_pqc: false        # Prefer PQC over classical when available
+  # Accepted values are the variant names verbatim (these enums set no
+  # serde rename_all), and only algorithms that are actually implemented:
+  #   kem_algorithm:  None | Kyber512 | Kyber768 | Kyber1024    (ML-KEM, FIPS 203)
+  #   sign_algorithm: None | Dilithium2 | Dilithium3 | Dilithium5 (ML-DSA, FIPS 204)
+  #   hybrid_mode:    ClassicalOnly | PqcOnly | HybridParallel
+  #                   | HybridConcatenate | HybridXor
+  #
   # nea4: X25519 + ML-KEM-768 hybrid key exchange (FIPS 203)
   # nia4: ML-DSA-65 integrity protection (FIPS 204)
 

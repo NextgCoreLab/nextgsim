@@ -77,8 +77,13 @@ pub struct GnbConfig {
     /// UPF GTP-U port (default: 2152)
     #[serde(default = "default_gtp_port")]
     pub upf_port: u16,
-    /// Post-quantum cryptography configuration
-    #[serde(default)]
+    /// Post-quantum cryptography configuration.
+    ///
+    /// Deserialised from the `pqc` key. Without the rename the field name
+    /// `pqc_config` would be the expected key, and because nothing in this
+    /// config sets `deny_unknown_fields`, a `pqc:` block would be silently
+    /// dropped instead of rejected.
+    #[serde(default, rename = "pqc", alias = "pqc_config")]
     pub pqc_config: PqcConfig,
     /// NTN (Non-Terrestrial Network) configuration (optional)
     #[serde(default)]
@@ -302,22 +307,26 @@ impl Default for SupportedAlgs {
 
 /// Post-quantum Key Encapsulation Mechanism (KEM) algorithm.
 ///
-/// Defines the KEM algorithm to use for post-quantum secure key exchange.
+/// Only algorithms `nextgsim-crypto` actually implements are selectable. The
+/// backing implementation is RustCrypto `ml-kem` (FIPS 203), whose parameter
+/// sets are ML-KEM-512/768/1024; the `Kyber*` names here are the pre-
+/// standardisation spelling of exactly those three.
+///
+/// `Ntru` and `Saber` were previously offered here with no implementation
+/// behind them, so selecting one silently produced no PQC at all. They are
+/// removed rather than left as traps: NIST did not standardise either, and
+/// SABER was not selected in the PQC process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum KemAlgorithm {
     /// No post-quantum KEM (classical only)
     #[default]
     None,
-    /// CRYSTALS-Kyber (NIST standard)
+    /// ML-KEM-512 (FIPS 203; formerly CRYSTALS-Kyber-512)
     Kyber512,
-    /// CRYSTALS-Kyber-768
+    /// ML-KEM-768 (FIPS 203; formerly CRYSTALS-Kyber-768)
     Kyber768,
-    /// CRYSTALS-Kyber-1024
+    /// ML-KEM-1024 (FIPS 203; formerly CRYSTALS-Kyber-1024)
     Kyber1024,
-    /// NTRU (alternative PQC algorithm)
-    Ntru,
-    /// SABER (alternative PQC algorithm)
-    Saber,
 }
 
 impl fmt::Display for KemAlgorithm {
@@ -327,32 +336,33 @@ impl fmt::Display for KemAlgorithm {
             KemAlgorithm::Kyber512 => write!(f, "kyber512"),
             KemAlgorithm::Kyber768 => write!(f, "kyber768"),
             KemAlgorithm::Kyber1024 => write!(f, "kyber1024"),
-            KemAlgorithm::Ntru => write!(f, "ntru"),
-            KemAlgorithm::Saber => write!(f, "saber"),
         }
     }
 }
 
 /// Post-quantum signature algorithm.
 ///
-/// Defines the signature algorithm to use for post-quantum secure authentication.
+/// Only algorithms `nextgsim-crypto` actually implements are selectable. The
+/// backing implementation is RustCrypto `ml-dsa` (FIPS 204), whose parameter
+/// sets are ML-DSA-44/65/87; the `Dilithium*` names here are the pre-
+/// standardisation spelling of exactly those three.
+///
+/// `Falcon512`, `Falcon1024` and `SphincsSha256` were previously offered here
+/// with no implementation behind them, so selecting one silently produced no
+/// PQC signatures at all. FN-DSA (Falcon) and SLH-DSA (SPHINCS+) are real NIST
+/// selections, so these can come back — but as variants with code behind them,
+/// not as config values that quietly do nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SignAlgorithm {
     /// No post-quantum signatures (classical only)
     #[default]
     None,
-    /// CRYSTALS-Dilithium (NIST standard)
+    /// ML-DSA-44 (FIPS 204; formerly CRYSTALS-Dilithium-2)
     Dilithium2,
-    /// CRYSTALS-Dilithium-3
+    /// ML-DSA-65 (FIPS 204; formerly CRYSTALS-Dilithium-3)
     Dilithium3,
-    /// CRYSTALS-Dilithium-5
+    /// ML-DSA-87 (FIPS 204; formerly CRYSTALS-Dilithium-5)
     Dilithium5,
-    /// FALCON (alternative PQC algorithm)
-    Falcon512,
-    /// FALCON-1024
-    Falcon1024,
-    /// SPHINCS+ (hash-based signatures)
-    SphincsSha256,
 }
 
 impl fmt::Display for SignAlgorithm {
@@ -362,9 +372,6 @@ impl fmt::Display for SignAlgorithm {
             SignAlgorithm::Dilithium2 => write!(f, "dilithium2"),
             SignAlgorithm::Dilithium3 => write!(f, "dilithium3"),
             SignAlgorithm::Dilithium5 => write!(f, "dilithium5"),
-            SignAlgorithm::Falcon512 => write!(f, "falcon512"),
-            SignAlgorithm::Falcon1024 => write!(f, "falcon1024"),
-            SignAlgorithm::SphincsSha256 => write!(f, "sphincs-sha256"),
         }
     }
 }
@@ -402,15 +409,24 @@ impl fmt::Display for HybridMode {
 /// Post-quantum cryptography configuration.
 ///
 /// Defines the PQC algorithms and modes to use for quantum-resistant security.
+///
+/// Every field is `#[serde(default)]` so a partial `pqc:` block is accepted —
+/// which the shipped `config/ue.yaml` relies on, since it sets only `enabled`.
+/// Without these, correcting the block's YAML key turned a silently-ignored
+/// section into a hard startup failure ("missing field `kem_algorithm`").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PqcConfig {
     /// Whether PQC is enabled
+    #[serde(default)]
     pub enabled: bool,
     /// KEM algorithm for key exchange
+    #[serde(default)]
     pub kem_algorithm: KemAlgorithm,
     /// Signature algorithm for authentication
+    #[serde(default)]
     pub sign_algorithm: SignAlgorithm,
     /// Hybrid mode for combining classical and PQC
+    #[serde(default)]
     pub hybrid_mode: HybridMode,
 }
 
@@ -1069,8 +1085,13 @@ pub struct UeConfig {
     pub configured_nssai: NetworkSlice,
     /// TUN interface name (optional)
     pub tun_name: Option<String>,
-    /// Post-quantum cryptography configuration
-    #[serde(default)]
+    /// Post-quantum cryptography configuration.
+    ///
+    /// Deserialised from the `pqc` key, which is what `config/ue.yaml` has
+    /// always used. Without this rename the expected key was `pqc_config`, so
+    /// the shipped `pqc:` block was silently discarded and setting
+    /// `enabled: true` had no effect whatsoever.
+    #[serde(default, rename = "pqc", alias = "pqc_config")]
     pub pqc_config: PqcConfig,
     /// `RedCap` (Reduced Capability) UE indication (Rel-17, TS 38.101)
     #[serde(default)]
@@ -1668,16 +1689,23 @@ configured_nssai:
 
     #[test]
     fn test_kem_algorithm_display() {
+        // Only the ML-KEM parameter sets nextgsim-crypto implements. The Ntru
+        // assertion this replaced covered a variant with no implementation.
+        assert_eq!(KemAlgorithm::None.to_string(), "none");
         assert_eq!(KemAlgorithm::Kyber512.to_string(), "kyber512");
         assert_eq!(KemAlgorithm::Kyber768.to_string(), "kyber768");
-        assert_eq!(KemAlgorithm::Ntru.to_string(), "ntru");
+        assert_eq!(KemAlgorithm::Kyber1024.to_string(), "kyber1024");
     }
 
     #[test]
     fn test_sign_algorithm_display() {
+        // Only the ML-DSA parameter sets nextgsim-crypto implements. The
+        // Falcon512 / SphincsSha256 assertions this replaced covered variants
+        // with no implementation.
+        assert_eq!(SignAlgorithm::None.to_string(), "none");
         assert_eq!(SignAlgorithm::Dilithium2.to_string(), "dilithium2");
-        assert_eq!(SignAlgorithm::Falcon512.to_string(), "falcon512");
-        assert_eq!(SignAlgorithm::SphincsSha256.to_string(), "sphincs-sha256");
+        assert_eq!(SignAlgorithm::Dilithium3.to_string(), "dilithium3");
+        assert_eq!(SignAlgorithm::Dilithium5.to_string(), "dilithium5");
     }
 
     #[test]
@@ -1694,6 +1722,124 @@ configured_nssai:
         assert_eq!(config.kem_algorithm, KemAlgorithm::None);
         assert_eq!(config.sign_algorithm, SignAlgorithm::None);
         assert_eq!(config.hybrid_mode, HybridMode::ClassicalOnly);
+    }
+
+    /// A full `pqc:` block body for embedding in a YAML fixture.
+    fn pqc_yaml_block(kem: &str, sign: &str, hybrid: &str) -> String {
+        format!(
+            "  enabled: true\n  kem_algorithm: {kem}\n  \
+             sign_algorithm: {sign}\n  hybrid_mode: {hybrid}\n"
+        )
+    }
+
+    #[test]
+    fn test_shipped_ue_yaml_parses_and_its_pqc_block_is_honoured() {
+        // Two regressions in one, both about the same block.
+        //
+        // 1. The field is `pqc_config` while every shipped YAML writes `pqc:`,
+        //    and nothing here sets deny_unknown_fields -- so the block was
+        //    silently discarded and `enabled: true` did nothing at all.
+        // 2. PqcConfig's fields were not individually #[serde(default)], so once
+        //    the key was corrected the shipped file (which sets only `enabled`)
+        //    stopped parsing outright: "missing field `kem_algorithm`".
+        //
+        // Parsing the REAL config/ue.yaml is what catches (2). A hand-rolled
+        // fixture with all four fields present passes either way, which is
+        // precisely how the second defect could have shipped behind a fix for
+        // the first. The sibling test_ue_config_with_pqc builds UeConfig
+        // struct-literally and so never exercises serde at all.
+        let shipped = include_str!("../../config/ue.yaml");
+        let config: UeConfig =
+            serde_yaml::from_str(shipped).expect("the shipped config/ue.yaml must parse");
+
+        // The shipped file sets enabled: false and omits the algorithm fields,
+        // which must fall back to their defaults rather than failing.
+        assert!(!config.pqc_config.enabled);
+        assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::None);
+        assert_eq!(config.pqc_config.sign_algorithm, SignAlgorithm::None);
+        assert_eq!(config.pqc_config.hybrid_mode, HybridMode::ClassicalOnly);
+    }
+
+    #[test]
+    fn test_ue_config_pqc_yaml_key_reaches_the_field() {
+        // The `pqc:` key must actually populate pqc_config. Uses the shipped
+        // file as the base with the PQC block overridden, so the assertion is
+        // about the real document shape.
+        // Strip the shipped `pqc:` block (its body is the indented lines that
+        // follow it) and substitute a fully-populated one. Appending a second
+        // `pqc:` key would be a duplicate-key parse error, not an override.
+        let shipped = include_str!("../../config/ue.yaml");
+        let without_pqc: String = {
+            let mut out = String::new();
+            let mut skipping = false;
+            for line in shipped.lines() {
+                if line.trim_start().starts_with("pqc:") {
+                    skipping = true;
+                    continue;
+                }
+                // The block ends at the next line that is neither indented nor
+                // blank nor a comment.
+                if skipping {
+                    let is_body = line.starts_with(' ') || line.trim().is_empty();
+                    if is_body {
+                        continue;
+                    }
+                    skipping = false;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        };
+        assert!(
+            !without_pqc.contains("pqc:"),
+            "the shipped pqc block must have been stripped"
+        );
+        let overridden = format!(
+            "{without_pqc}\npqc:\n{}",
+            pqc_yaml_block("Kyber768", "Dilithium3", "HybridParallel")
+        );
+
+        let config: UeConfig = serde_yaml::from_str(&overridden).expect("UE config must parse");
+        assert!(
+            config.pqc_config.enabled,
+            "the `pqc:` YAML key must populate pqc_config, not be dropped"
+        );
+        assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber768);
+        assert_eq!(config.pqc_config.sign_algorithm, SignAlgorithm::Dilithium3);
+        assert_eq!(config.pqc_config.hybrid_mode, HybridMode::HybridParallel);
+    }
+
+    #[test]
+    fn test_pqc_algorithms_are_limited_to_implemented_ones() {
+        // The enums used to offer Ntru, Saber, Falcon512, Falcon1024 and
+        // SphincsSha256, none of which nextgsim-crypto implements: selecting one
+        // silently produced no PQC. They must not deserialize.
+        for bad in ["Ntru", "Saber"] {
+            let yaml = pqc_yaml_block(bad, "Dilithium3", "HybridParallel");
+            assert!(
+                serde_yaml::from_str::<PqcConfig>(&yaml).is_err(),
+                "KEM {bad} must not be selectable: it has no implementation"
+            );
+        }
+        for bad in ["Falcon512", "Falcon1024", "SphincsSha256"] {
+            let yaml = pqc_yaml_block("Kyber768", bad, "HybridParallel");
+            assert!(
+                serde_yaml::from_str::<PqcConfig>(&yaml).is_err(),
+                "signature {bad} must not be selectable: it has no implementation"
+            );
+        }
+        // The implemented ones must still parse.
+        for good in ["Kyber512", "Kyber768", "Kyber1024"] {
+            let yaml = pqc_yaml_block(good, "Dilithium3", "HybridParallel");
+            serde_yaml::from_str::<PqcConfig>(&yaml)
+                .unwrap_or_else(|e| panic!("KEM {good} must parse: {e}"));
+        }
+        for good in ["Dilithium2", "Dilithium3", "Dilithium5"] {
+            let yaml = pqc_yaml_block("Kyber768", good, "HybridParallel");
+            serde_yaml::from_str::<PqcConfig>(&yaml)
+                .unwrap_or_else(|e| panic!("signature {good} must parse: {e}"));
+        }
     }
 
     #[test]
