@@ -295,6 +295,17 @@ impl Default for KnowledgeGraph {
 }
 
 impl KnowledgeGraph {
+    /// Minimum mapped relevance for a vector-search hit to be returned.
+    ///
+    /// Relevance is cosine similarity mapped from `[-1, 1]` to `[0, 1]`, so
+    /// 0.5 is "orthogonal / unrelated". The floor sits above that: TF-IDF
+    /// vectors over short entity documents are rarely truly orthogonal, so
+    /// without a cutoff every query matches the whole corpus.
+    ///
+    /// Deliberately conservative. Raising it trades recall for precision and
+    /// should be driven by a corpus large enough to measure the effect.
+    pub const MIN_VECTOR_RELEVANCE: f32 = 0.6;
+
     /// Creates a new knowledge graph with default embedding dimension (128).
     pub fn new() -> Self {
         Self::with_embedding_dim(128)
@@ -319,6 +330,13 @@ impl KnowledgeGraph {
     /// If an entity with the same ID already exists, it is replaced and the
     /// change is recorded in the entity history. An `EntityCreated` or
     /// `EntityUpdated` event is dispatched.
+    ///
+    /// Unless the entity arrives with an embedding already attached, this
+    /// refreshes the TF-IDF vocabulary and re-embeds the whole corpus, because
+    /// IDF is corpus-global. That is O(corpus) per insert, which suits the
+    /// incremental one-entity-per-message pattern the gNB NKEF task uses. For a
+    /// bulk load, prefer attaching embeddings yourself or inserting via a path
+    /// that defers to a single [`Self::rebuild_embeddings`] at the end.
     pub fn add_entity(&mut self, entity: Entity) {
         let id = entity.id.clone();
         let entity_type = entity.entity_type;
@@ -370,28 +388,29 @@ impl KnowledgeGraph {
                 .dispatch(KnowledgeEvent::entity_created(&id, now));
         }
 
-        // Generate embedding if not already present
-        let entity = if entity.embedding.is_some() {
-            entity
-        } else {
-            let text = TextEmbedder::entity_text(
-                &entity.id,
-                &format!("{:?}", entity.entity_type),
-                &entity.properties,
-            );
-            let emb = self.embedder.embed(&text);
-            Entity {
-                embedding: Some(emb),
-                ..entity
+        let caller_supplied_embedding = entity.embedding.clone();
+        self.entities.insert(id.clone(), entity);
+
+        match caller_supplied_embedding {
+            // The caller brought its own vector (e.g. a real neural embedder):
+            // index it verbatim and leave the TF-IDF corpus alone.
+            Some(emb) => {
+                self.vector_index.upsert(&id, emb);
             }
-        };
-
-        // Update vector index
-        if let Some(ref emb) = entity.embedding {
-            self.vector_index.upsert(&id, emb.clone());
+            // Otherwise derive one. TF-IDF is corpus-global -- adding a document
+            // changes every term's IDF -- so the vocabulary and all existing
+            // embeddings are refreshed rather than embedding this entity against
+            // a stale (or, on the first insert, EMPTY) vocabulary.
+            //
+            // Embedding against an empty vocabulary is what made the vector path
+            // dead in practice: TextEmbedder::embed returns an all-zero vector
+            // when the vocabulary is empty, so every entity was indexed as
+            // zeros. search() then passed its non-empty-index guard but found no
+            // non-zero query component and silently fell through to
+            // keyword_search forever. The gNB NKEF task only ever calls
+            // add_entity, so that was the only behaviour it could get.
+            None => self.rebuild_embeddings(),
         }
-
-        self.entities.insert(id, entity);
     }
 
     /// Gets an entity by ID
@@ -543,21 +562,31 @@ impl KnowledgeGraph {
             if has_nonzero {
                 let sim_results = self.vector_index.search_topk(&query_embedding, max_results);
 
-                if !sim_results.is_empty() {
-                    return sim_results
-                        .into_iter()
-                        .filter_map(|sr| {
-                            self.entities.get(&sr.id).map(|entity| {
-                                // Map cosine similarity [-1, 1] to relevance [0, 1]
-                                let relevance = (sr.score + 1.0) / 2.0;
-                                QueryResult {
-                                    entity: entity.clone(),
-                                    relevance,
-                                }
-                            })
+                // Cosine similarity ranks every indexed entity, so without a
+                // floor a query matches the entire corpus -- "Building A"
+                // returned all three entities in a three-entity graph, merely
+                // ordered correctly. Drop results below the cutoff so a search
+                // is a search and not a sorted dump.
+                let hits: Vec<QueryResult> = sim_results
+                    .into_iter()
+                    .filter_map(|sr| {
+                        // Map cosine similarity [-1, 1] to relevance [0, 1]
+                        let relevance = (sr.score + 1.0) / 2.0;
+                        if relevance < Self::MIN_VECTOR_RELEVANCE {
+                            return None;
+                        }
+                        self.entities.get(&sr.id).map(|entity| QueryResult {
+                            entity: entity.clone(),
+                            relevance,
                         })
-                        .collect();
+                    })
+                    .collect();
+
+                if !hits.is_empty() {
+                    return hits;
                 }
+                // Everything scored below the floor: fall through to keyword
+                // matching rather than returning nothing.
             }
         }
 
@@ -664,10 +693,15 @@ impl KnowledgeGraph {
 
     /// Rebuilds the TF-IDF vocabulary and all entity embeddings.
     ///
-    /// Call this after bulk-loading entities to ensure the vocabulary and
-    /// embeddings reflect the full corpus. Entities added via `add_entity`
-    /// get embeddings automatically, but the TF-IDF vocabulary is more
-    /// accurate when built from the full set of documents.
+    /// [`Self::add_entity`] now calls this for you whenever it has to derive an
+    /// embedding, so an explicit call is only needed after mutating entity
+    /// properties in place, or to re-embed a corpus loaded with
+    /// caller-supplied vectors.
+    ///
+    /// (The previous doc comment claimed entities added via `add_entity` "get
+    /// embeddings automatically" while the vocabulary merely became "more
+    /// accurate" after a rebuild. That understated it: without a rebuild the
+    /// vocabulary was empty, so those automatic embeddings were all zeros.)
     pub fn rebuild_embeddings(&mut self) {
         // Build corpus from all entities
         let documents: Vec<String> = self
@@ -1082,6 +1116,52 @@ mod tests {
 
         assert_eq!(graph.vector_index().len(), 2);
         assert!(graph.embedder().vocab_size() > 0);
+    }
+
+    #[test]
+    fn test_add_entity_alone_produces_usable_embeddings() {
+        // Regression: every other vector-search test in this file calls
+        // rebuild_embeddings() first, so none of them covered the path the gNB
+        // NKEF task actually takes -- add_entity, then search, and nothing else.
+        //
+        // On that path the vocabulary stayed empty, so TextEmbedder::embed
+        // returned an all-zero vector for every entity. add_entity then upserted
+        // those zeros, leaving a NON-EMPTY index full of useless vectors:
+        // search() passed its `!vector_index.is_empty()` guard, found
+        // `has_nonzero == false` for the query, and silently fell through to
+        // keyword_search on every call.
+        let mut graph = KnowledgeGraph::with_embedding_dim(64);
+
+        graph.add_entity(
+            Entity::new("gnb-001", EntityType::Gnb)
+                .with_property("name", "Alpha base station")
+                .with_property("status", "active"),
+        );
+        graph.add_entity(
+            Entity::new("ue-001", EntityType::Ue).with_property("name", "Mobile User Equipment"),
+        );
+
+        // No rebuild_embeddings() call: this is the production sequence.
+        assert!(
+            graph.embedder().vocab_size() > 0,
+            "add_entity must leave a usable TF-IDF vocabulary, not an empty one"
+        );
+
+        for id in ["gnb-001", "ue-001"] {
+            let entity = graph.get_entity(id).expect("entity must exist");
+            let emb = entity
+                .embedding
+                .as_ref()
+                .expect("add_entity must store an embedding");
+            assert!(
+                emb.iter().any(|&v| v != 0.0),
+                "{id} embedding must not be all zeros"
+            );
+        }
+
+        // And the vector path must actually be reached, not bypassed.
+        let results = graph.search("base station", 10);
+        assert!(!results.is_empty(), "search must return results");
     }
 
     #[test]
