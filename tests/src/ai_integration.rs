@@ -491,14 +491,37 @@ fn test_nkef_knowledge_graph_e2e() {
             .with_property("connected_gnb", "gnb-001"),
     );
 
-    // Search for gNBs - note: search also finds UE's "connected_gnb" property containing "gnb"
+    // `search` now runs real TF-IDF cosine similarity rather than substring
+    // keyword matching, because add_entity maintains the vocabulary. So these
+    // assert RANKING, not exact counts: cosine similarity scores every entity
+    // and the graph is tiny, so several near-identical documents legitimately
+    // clear the relevance floor. Asserting a count here would pin an artefact
+    // of corpus size rather than search behaviour.
+    //
+    // "gnb" matches both gNBs and, weakly, the UE whose connected_gnb property
+    // references one -- that last hit is a property VALUE match, which is
+    // correct; the previous keyword implementation matched the property NAME.
     let results = graph.search("gnb", 10);
-    assert_eq!(results.len(), 3); // 2 gNBs + 1 UE with connected_gnb property
+    assert!(!results.is_empty());
+    assert!(
+        results[0].entity.id.starts_with("gnb-"),
+        "a gNB must outrank the UE for the query 'gnb', got {:?}",
+        results[0].entity.id
+    );
+    assert!(
+        results.windows(2).all(|w| w[0].relevance >= w[1].relevance),
+        "results must be ordered by descending relevance"
+    );
 
-    // Search for specific building
+    // Search for a specific building: gnb-001 is the one in Building A, so it
+    // must rank first. gnb-002's document differs by a single token, so it
+    // scoring nearby is expected, not a defect.
     let building_a = graph.search("Building A", 10);
-    assert_eq!(building_a.len(), 1);
-    assert_eq!(building_a[0].entity.id, "gnb-001");
+    assert!(!building_a.is_empty());
+    assert_eq!(
+        building_a[0].entity.id, "gnb-001",
+        "the entity actually in Building A must rank first"
+    );
 }
 
 #[test]
