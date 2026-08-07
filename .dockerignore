@@ -1,0 +1,7 @@
+# Rust build artifacts. build.sh uses this directory as the docker build
+# context for Dockerfile.gnb-local / Dockerfile.ue-local, which need only
+# binaries/ -- without this, target/ (~22GB) ships to the daemon.
+target/
+**/target/
+
+.git/
