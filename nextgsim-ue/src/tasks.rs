@@ -367,8 +367,6 @@ pub enum NasMessage {
         /// User data
         data: OctetString,
     },
-    /// Perform MM cycle (internal)
-    PerformMmCycle,
     /// NAS timer expired (internal)
     NasTimerExpire {
         /// Timer ID
