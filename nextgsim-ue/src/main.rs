@@ -759,20 +759,22 @@ impl UeApp {
                                 && orch.state().mm_substate()
                                     != nextgsim_ue::nas::mm::MmSubState::RegisteredInitiated
                             {
-                                // Initial registration on first camp. The library
-                                // RrcTask emits ActiveCellChanged when it camps on
-                                // a cell; issue #30 removed the inline loop that
-                                // previously sent PerformMmCycle here, so this is
-                                // now the initial-attach trigger. The mm_substate
-                                // guard makes it one-shot: while a registration is
-                                // in flight (5GMM-REGISTERED-INITIATED still reports
-                                // rm_state DEREGISTERED) a re-entrant
-                                // ActiveCellChanged from a mid-attach cell
-                                // reselection is dropped here rather than blocking
-                                // the NAS loop on the sleep below (restores the
-                                // deleted loop's registration_triggered latch).
-                                // Give the gNB a moment to finish NG Setup with the
-                                // AMF first (matches the prior PerformMmCycle path).
+                                // Initial registration on first camp, and the ONLY
+                                // initial-attach trigger: the library RrcTask emits
+                                // ActiveCellChanged when it camps on a cell, and
+                                // issue #30 removed the inline loop that used to
+                                // drive the attach from a NasMessage::PerformMmCycle
+                                // self-message (that variant and its handler were
+                                // subsequently deleted as unreachable — nothing ever
+                                // sent it again). The mm_substate guard makes this
+                                // one-shot: while a registration is in flight
+                                // (5GMM-REGISTERED-INITIATED still reports rm_state
+                                // DEREGISTERED) a re-entrant ActiveCellChanged from a
+                                // mid-attach cell reselection is dropped here rather
+                                // than blocking the NAS loop on the sleep below
+                                // (restores the deleted loop's registration_triggered
+                                // latch). Give the gNB a moment to finish NG Setup
+                                // with the AMF first.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(1000))
                                     .await;
                                 let outs = orch.start_registration(
@@ -825,28 +827,6 @@ impl UeApp {
                                     orch.state().rm_state(),
                                     orch.state().cm_state()
                                 );
-                            }
-                        }
-                        NasMessage::PerformMmCycle => {
-                            info!("PerformMmCycle received, MM state: {}", orch.state());
-
-                            // If we're deregistered, start the initial registration
-                            if orch.state().is_deregistered() {
-                                // Wait a bit for gNB to complete NG Setup with AMF
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                                let outs = orch
-                                    .start_registration(RegistrationType::InitialRegistration);
-                                process_mm_outputs(
-                                    outs,
-                                    &mut orch,
-                                    &mut sm_orch,
-                                    &sm_session_params,
-                                    &mut plmn_selector,
-                                    &task_base,
-                                    &tun_tx,
-                                    &mut pdu_counter,
-                                )
-                                .await;
                             }
                         }
                         NasMessage::NasTimerExpire { timer_id } => {
