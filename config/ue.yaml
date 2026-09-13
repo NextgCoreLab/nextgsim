@@ -211,6 +211,16 @@ require_broadcast_sib1: false
 # with the wrong header shape. Empty means every bearer stays on UM SN12.
 rlc_am_psis: []
 
+# Conditional handover (TS 38.331 5.3.5.13): store the candidate target
+# configurations an RRCReconfiguration carries and execute one as soon as its
+# execution condition (condEventA3 / condEventA5) has held for its
+# time-to-trigger.
+# false: the container is decoded and logged but not stored, so only a network
+# handover command moves the UE -- mobility behaves exactly as before.
+# true: the UE may hand itself over without being told to, which changes any
+# scenario that expects the network to order every handover.
+conditional_handover: false
+
 # Rel-20 6G AI-native network function features
 # All disabled by default; enable for 6G research deployments
 she_enabled: false              # SHE Client - edge inference offloading (Rel-20)

@@ -96,6 +96,12 @@ pub struct HandoverManager {
     ho_start_time: Option<Instant>,
     /// Handover complete time
     ho_complete_time: Option<Instant>,
+    /// How long the last completed handover took.
+    ///
+    /// Recorded at completion rather than derived from the two timestamps above:
+    /// completing a handover clears `ho_start_time`, so a derived duration was
+    /// always `None` and the accessor could never report one.
+    last_duration: Option<Duration>,
 }
 
 impl HandoverManager {
@@ -108,6 +114,7 @@ impl HandoverManager {
             t304_duration: Duration::from_millis(100),
             ho_start_time: None,
             ho_complete_time: None,
+            last_duration: None,
         }
     }
 
@@ -176,6 +183,7 @@ impl HandoverManager {
             let target_cell_id = self.command.as_ref().map(|c| c.target_cell.cell_id);
 
             if let Some(start) = self.ho_start_time {
+                self.last_duration = Some(start.elapsed());
                 tracing::info!(
                     "Handover complete: target_cell_id={:?}, duration={:?}",
                     target_cell_id,
@@ -232,18 +240,10 @@ impl HandoverManager {
         self.t304_duration = duration;
     }
 
-    /// Get last handover duration (if completed)
+    /// How long the last completed handover took, or `None` if none has
+    /// completed since the manager was created.
     pub fn last_handover_duration(&self) -> Option<Duration> {
-        match (self.ho_complete_time, self.ho_start_time) {
-            (Some(end), Some(start)) => {
-                if end > start {
-                    Some(end - start)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
+        self.last_duration
     }
 }
 
@@ -354,6 +354,35 @@ mod tests {
         assert_eq!(target, Some(100));
         assert_eq!(manager.state(), HandoverState::Idle);
         assert!(!manager.is_in_progress());
+    }
+
+    /// The duration accessor reports a completed handover. It used to derive the
+    /// duration from `ho_start_time`, which `complete` clears, so it always
+    /// answered `None`.
+    #[test]
+    fn a_completed_handover_reports_its_duration() {
+        let mut manager = HandoverManager::new();
+        assert_eq!(manager.last_handover_duration(), None);
+
+        manager.start_handover(
+            1,
+            HandoverCommand {
+                target_cell: TargetCellInfo {
+                    pci: 2,
+                    cell_id: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        manager.start_synchronization();
+        manager.sync_complete();
+        assert_eq!(manager.complete(), Some(2));
+
+        assert!(
+            manager.last_handover_duration().is_some(),
+            "a completed handover has a duration"
+        );
     }
 
     #[test]
@@ -651,6 +680,7 @@ impl HandoverManager {
             self.ho_complete_time = Some(Instant::now());
 
             if let Some(start) = self.ho_start_time {
+                self.last_duration = Some(start.elapsed());
                 tracing::info!("DAPS handover complete: duration={:?}", start.elapsed());
             }
 
