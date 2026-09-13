@@ -1799,6 +1799,36 @@ async fn handle_unmanaged_mm_message(
                                 warn!("UE policy container undecodable and unrecoverable: dropped");
                             }
                         }
+                    } else if dl.payload_container_type == PayloadContainerType::ServiceLevelAa {
+                        // UUAA-MM (#58, TS 23.256 §5.2.2): a Service-level-AA
+                        // container is an MM-plane exchange with the UAS NF/USS
+                        // relayed by the AMF, so it must NOT reach the SM
+                        // orchestrator -- which would read it as N1 SM
+                        // information and reject a session that does not exist.
+                        use nextgsim_ue::nas::mm::UuaaReaction;
+                        match orch.handle_service_level_aa_container(&dl.payload_container) {
+                            UuaaReaction::SendUplink(nas_pdu) => {
+                                let nas_pdu = orch.protect_if_active(nas_pdu);
+                                info!(
+                                    "UUAA-MM: sending UL NAS TRANSPORT (Service-level-AA), len={}",
+                                    nas_pdu.len()
+                                );
+                                *pdu_counter += 1;
+                                let _ = task_base
+                                    .rrc_tx
+                                    .send(RrcMessage::UplinkNasDelivery {
+                                        pdu_id: *pdu_counter,
+                                        pdu: nas_pdu.into(),
+                                    })
+                                    .await;
+                            }
+                            UuaaReaction::Nothing => {
+                                debug!(
+                                    "UUAA-MM: container applied, nothing to send (state {:?})",
+                                    orch.uuaa_state()
+                                );
+                            }
+                        }
                     } else {
                         let outs = sm_orch.handle_dl_nas_transport(&dl);
                         process_sm_outputs(outs, orch, task_base, tun_tx, pdu_counter).await;

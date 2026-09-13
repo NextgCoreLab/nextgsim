@@ -31,6 +31,7 @@ mod persistence;
 mod service_request;
 mod state;
 mod suci;
+mod uuaa;
 
 pub use config_update::*;
 pub use deregistration::*;
@@ -41,3 +42,4 @@ pub use persistence::*;
 pub use service_request::*;
 pub use state::*;
 pub use suci::*;
+pub use uuaa::*;

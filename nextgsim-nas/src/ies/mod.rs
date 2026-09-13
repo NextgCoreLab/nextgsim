@@ -15,8 +15,10 @@ pub mod ie1;
 pub mod ie3;
 pub mod ie4;
 pub mod ie6;
+pub mod service_level_aa;
 
 pub use ie1::*;
 pub use ie3::*;
 pub use ie4::*;
 pub use ie6::*;
+pub use service_level_aa::*;

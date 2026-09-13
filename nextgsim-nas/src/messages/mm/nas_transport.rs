@@ -469,6 +469,7 @@ impl UlNasTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ies::service_level_aa::ServiceLevelAaContainer;
 
     // ========================================================================
     // DL NAS Transport Tests
@@ -633,5 +634,121 @@ mod tests {
 
         let decoded = UlNasTransport::decode(&mut &buf[3..]).unwrap();
         assert_eq!(decoded.payload_container.len(), 0);
+    }
+
+    // ========================================================================
+    // Service-level-AA container transport (UUAA, TS 23.256 §5.2.2)
+    // ========================================================================
+
+    /// The reference UL NAS TRANSPORT carrying a UUAA request, byte for byte.
+    ///
+    /// Derived from the spec rather than captured from a live USS — no external
+    /// UUAA capture exists for this tree, and that is recorded rather than
+    /// implied. Every octet is attributable:
+    ///
+    /// | Octets        | Value                    | Reference                     |
+    /// |---------------|--------------------------|-------------------------------|
+    /// | `7E 00 67`    | plain 5GMM UL NAS TRANSPORT | TS 24.501 §8.2.10, §9.3    |
+    /// | `09`          | payload container type = Service-level-AA | §9.11.3.40 |
+    /// | `00 09`       | payload container length = 9 (3 + 6)  | §9.11.3.39 (TLV-E) |
+    /// | `40 01 01`    | payload type = UUAA payload   | §9.11.2.15               |
+    /// | `70 00 03 A1 B2 C3` | payload, type-6 framing | §9.11.2.13              |
+    const UUAA_REQUEST_REFERENCE: &[u8] = &[
+        0x7E, 0x00, 0x67, 0x09, 0x00, 0x09, 0x40, 0x01, 0x01, 0x70, 0x00, 0x03, 0xA1, 0xB2, 0xC3,
+    ];
+
+    #[test]
+    fn a_uuaa_request_encodes_to_the_reference_octets() {
+        let container = ServiceLevelAaContainer::with_uuaa_payload(vec![0xA1, 0xB2, 0xC3]);
+        let msg = UlNasTransport::new(PayloadContainerType::ServiceLevelAa, container.encode());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        assert_eq!(
+            buf, UUAA_REQUEST_REFERENCE,
+            "UL NAS TRANSPORT UUAA encoding drifted from the spec-derived reference"
+        );
+    }
+
+    #[test]
+    fn the_reference_uuaa_request_decodes_back_to_its_container() {
+        let decoded = UlNasTransport::decode(&mut &UUAA_REQUEST_REFERENCE[3..]).unwrap();
+        assert_eq!(
+            decoded.payload_container_type,
+            PayloadContainerType::ServiceLevelAa
+        );
+
+        let container = ServiceLevelAaContainer::decode(&decoded.payload_container);
+        assert_eq!(
+            container.payload_type,
+            Some(crate::ies::service_level_aa::ServiceLevelAaPayloadType::Uuaa)
+        );
+        assert_eq!(container.payload.as_deref(), Some(&[0xA1, 0xB2, 0xC3][..]));
+        assert!(!container.truncated);
+    }
+
+    #[test]
+    fn a_uuaa_result_travels_downlink_as_container_type_nine() {
+        // The direction that matters for the UE: the network's UUAA outcome.
+        use crate::ies::service_level_aa::{ServiceLevelAaResponse, ServiceLevelAaResult};
+
+        let container = ServiceLevelAaContainer {
+            response: Some(ServiceLevelAaResponse {
+                slar: ServiceLevelAaResult::Successful,
+                c2ar: ServiceLevelAaResult::Successful,
+            }),
+            uas_services_enabled: Some(true),
+            ..Default::default()
+        };
+        let msg = DlNasTransport::new(PayloadContainerType::ServiceLevelAa, container.encode());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        // Octet 3 is the payload container type nibble: 9, not 1.
+        assert_eq!(buf[3], 0x09);
+
+        let decoded = DlNasTransport::decode(&mut &buf[3..]).unwrap();
+        assert_eq!(
+            decoded.payload_container_type,
+            PayloadContainerType::ServiceLevelAa
+        );
+        assert_eq!(
+            ServiceLevelAaContainer::decode(&decoded.payload_container),
+            container
+        );
+    }
+
+    #[test]
+    fn a_payload_container_over_255_octets_still_fits_the_service_level_aa_transport() {
+        // The payload container length is 2 octets (TLV-E) and so is the
+        // Service-level-AA payload parameter's, so a 400-octet UUAA payload has
+        // to survive both. A 1-octet length anywhere in that chain truncates it.
+        let payload = vec![0x33; 400];
+        let container = ServiceLevelAaContainer::with_uuaa_payload(payload.clone());
+        let msg = UlNasTransport::new(PayloadContainerType::ServiceLevelAa, container.encode());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        let decoded = UlNasTransport::decode(&mut &buf[3..]).unwrap();
+
+        assert_eq!(
+            ServiceLevelAaContainer::decode(&decoded.payload_container)
+                .payload
+                .as_deref(),
+            Some(payload.as_slice())
+        );
+    }
+
+    #[test]
+    fn service_level_aa_is_container_type_nine_on_the_wire() {
+        // §9.11.3.40 value 1001. Asserted on the primitive rather than only
+        // through a round trip, because both ends of this simulator share the
+        // enum and would agree on any wrong number.
+        assert_eq!(u8::from(PayloadContainerType::ServiceLevelAa), 0b1001);
+        assert_eq!(
+            PayloadContainerType::try_from(0b1001u8),
+            Ok(PayloadContainerType::ServiceLevelAa)
+        );
     }
 }

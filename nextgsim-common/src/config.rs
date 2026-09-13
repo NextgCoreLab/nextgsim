@@ -820,6 +820,34 @@ pub struct UavConfig {
     /// C2 (Command and Control) link `QoS` required
     #[serde(default)]
     pub c2_link_required: bool,
+    /// Opaque UUAA payload the UE sends when the network asks for the
+    /// service-level authentication and authorization procedure
+    /// (TS 24.501 §9.11.2.13, carried in a Service-level-AA container over
+    /// UL NAS TRANSPORT). Hex, e.g. `"a1b2c3"`.
+    ///
+    /// There is no default and none is synthesised: TS 23.256 puts the UUAA
+    /// credential exchange in the application layer between the UE's UAS
+    /// application and the USS, which this simulator does not model, so a
+    /// fabricated payload would look like a working UUAA while authenticating
+    /// nothing. Unset means the UE records a pending indication and does not
+    /// answer it.
+    #[serde(default)]
+    pub uuaa_payload_hex: Option<String>,
+}
+
+impl UavConfig {
+    /// The configured UUAA payload as bytes. `None` when unset, empty, or not
+    /// valid hex -- a half-decoded payload is not a payload.
+    pub fn uuaa_payload(&self) -> Option<Vec<u8>> {
+        let hex = self.uuaa_payload_hex.as_deref()?.trim();
+        if hex.is_empty() || !hex.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect()
+    }
 }
 
 fn default_uav_alt() -> f64 {
@@ -835,6 +863,7 @@ impl Default for UavConfig {
             max_altitude_meters: 120.0,
             remote_id_enabled: false,
             c2_link_required: false,
+            uuaa_payload_hex: None,
         }
     }
 }

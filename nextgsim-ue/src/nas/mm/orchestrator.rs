@@ -62,6 +62,8 @@ use super::config_update::ConfigUpdateResult;
 use super::deregistration::DeregistrationProcedure;
 use super::persistence::{SecurityContextSnapshot, UeStateSnapshot};
 use super::state::{CmState, MmStateMachine, MmSubState, UpdateStatus};
+use super::uuaa::{UuaaProcedure, UuaaReaction, UuaaState};
+use crate::uav::{UavAuthorizationState, UavContext, UavIdentity};
 
 /// Maximum registration attempts before falling back to T3502
 /// (TS 24.501 Section 5.5.1.2.7)
@@ -91,10 +93,14 @@ const DEFAULT_IMEISV: &str = "4370816125816151";
 /// plane), and network-based UAV location would use LCS (TS 23.273). This
 /// simulator models the telemetry over an unassigned 5GMM message-type code for
 /// a self-contained geofence demo; it has no conformant NAS equivalent and a
-/// real network would not accept it. (Conformant UAS *registration/UUAA* uses
-/// the Service-level-AA container — IEI 0x72 — which IS implemented.) Kept in
-/// sync with `nextgcore-amfd`'s `gmm_build::message_type::UAV_TRACKING_REPORT`.
-/// See `.context/WAVE6-DOWNGRADED-FEATURES.md` §6.
+/// real network would not accept it. (Conformant UAS *registration* uses the
+/// Service-level-AA container — IEI 0x72 — and conformant UUAA-MM uses the same
+/// container over UL/DL NAS TRANSPORT with payload container type `0b1001`
+/// (#58, [`super::UuaaProcedure`]); both are implemented.) Kept in sync with
+/// `nextgcore-amfd`'s `gmm_build::message_type::UAV_TRACKING_REPORT`.
+/// See §6 of `WAVE6-DOWNGRADED-FEATURES.md`, which lives in the `6g_docs`
+/// repository's `.context/` rather than this one's — the old bare
+/// `.context/...` path resolved to nothing from inside nextgsim.
 pub const UAV_TRACKING_REPORT_MSG_TYPE: u8 = 0x6A;
 
 /// Decode a GPRS Timer 2 IE value octet (3GPP TS 24.008 Section 10.5.7.4)
@@ -636,6 +642,14 @@ pub struct MmOrchestrator {
     /// through all of them, and any one missed would leave a stale GUTI on disk
     /// that a restart would then present to the network.
     state_file: Option<std::path::PathBuf>,
+
+    // -- UAS service-level authentication (UUAA-MM, TS 23.256 §5.2.2) --
+    /// The UE half of the UUAA exchange over UL/DL NAS TRANSPORT.
+    uuaa: UuaaProcedure,
+    /// NAS-level UAV context, present only for an aerial UE. This is what the
+    /// UUAA result is *applied to*: without it the outcome would live in a
+    /// private field and nothing about the aircraft would change.
+    uav: Option<UavContext>,
 }
 
 impl MmOrchestrator {
@@ -676,6 +690,11 @@ impl MmOrchestrator {
             ue_policy_sections: HashMap::new(),
             updp_pti: 0,
             state_file: None,
+            // No payload and no UAV context until `from_config` sees an aerial
+            // UE: a non-UAV UE that answered a UUAA pending indication would be
+            // claiming a UAS identity it does not have.
+            uuaa: UuaaProcedure::with_initiation(None, cfg!(feature = "uuaa-mm")),
+            uav: None,
         }
     }
 
@@ -698,6 +717,7 @@ impl MmOrchestrator {
     pub fn from_config(identity: MmUeIdentity, config: &UeConfig) -> Self {
         let mut orch = Self::new(identity);
         orch.racs_store_assigned_id = config.racs_store_assigned_id;
+        orch.configure_uav(config);
         let Some(ref path) = config.state_file else {
             return orch;
         };
@@ -714,6 +734,79 @@ impl MmOrchestrator {
             ),
         }
         orch
+    }
+
+    // ========================================================================
+    // UAS service-level authentication (UUAA-MM, TS 23.256 §5.2.2)
+    // ========================================================================
+
+    /// Build the NAS-level UAV context and the UUAA procedure for an aerial UE.
+    ///
+    /// Only an aerial UE gets either. The UUAA payload is an opaque blob from
+    /// configuration because TS 23.256 puts the credential exchange in the
+    /// application layer, between the UE's UAS application and the USS: this
+    /// simulator has no such application, so it carries what the operator
+    /// configured rather than synthesising something credential-shaped.
+    fn configure_uav(&mut self, config: &UeConfig) {
+        let Some(uav_config) = config.uav_config.as_ref().filter(|u| u.is_aerial_ue) else {
+            return;
+        };
+
+        // The UE config models the CAA-level ID only. The serial number,
+        // manufacturer and model are ASTM F3411 remote-ID fields with no
+        // configuration source in this tree, so they are left empty rather than
+        // invented -- an invented serial number is a different aircraft.
+        let mut identity = UavIdentity::new(String::new(), String::new(), String::new());
+        identity.caa_level_id = uav_config.uav_id.clone();
+        self.uav = Some(UavContext::new(identity));
+
+        let payload = uav_config.uuaa_payload();
+        if payload.is_none() && uav_config.uuaa_payload_hex.is_some() {
+            warn!(
+                "UAV config carries a uuaa_payload_hex that is not valid hex; UUAA uplinks will \
+                 not be sent"
+            );
+        }
+        self.uuaa = UuaaProcedure::with_initiation(payload, cfg!(feature = "uuaa-mm"));
+    }
+
+    /// Handle a Service-level-AA container that arrived in DL NAS TRANSPORT
+    /// (payload container type `0b1001`, TS 24.501 §9.11.3.40).
+    ///
+    /// The network's outcome is applied to [`UavContext::auth_state`] here and
+    /// not by the caller, so every path that consumes a container updates the
+    /// aircraft's authorization -- a caller that forgot would leave a revoked
+    /// UAV reading as authorized.
+    pub fn handle_service_level_aa_container(&mut self, container: &[u8]) -> UuaaReaction {
+        let reaction = self.uuaa.handle_downlink(container);
+        let authorization = self.uuaa.authorization_state();
+        if let Some(uav) = self.uav.as_mut() {
+            if uav.auth_state != authorization {
+                info!(
+                    "UAV authorization state: {:?} -> {:?} (UUAA-MM)",
+                    uav.auth_state, authorization
+                );
+                uav.auth_state = authorization;
+            }
+        } else {
+            // A container addressed to a UE that is not configured as an aerial
+            // UE. Recorded rather than acted on: there is no UAV to authorize.
+            warn!(
+                "UUAA-MM: Service-level-AA container received but this UE is not configured as an \
+                 aerial UE; state recorded only"
+            );
+        }
+        reaction
+    }
+
+    /// The UUAA exchange's state, for tests and status reporting.
+    pub fn uuaa_state(&self) -> UuaaState {
+        self.uuaa.state()
+    }
+
+    /// The UAV's authorization state, when this UE is an aerial UE.
+    pub fn uav_authorization_state(&self) -> Option<UavAuthorizationState> {
+        self.uav.as_ref().map(|uav| uav.auth_state)
     }
 
     /// Install a stored snapshot's 5GMM parameters (TS 24.501 Annex C.1).
@@ -3182,6 +3275,9 @@ mod tests {
     use super::*;
     use crate::nas::mm::config_update::{
         ConfigUpdateProcedure, ConfigurationUpdateCommand, RacsDeletionRequest,
+    };
+    use nextgsim_nas::ies::service_level_aa::{
+        ServiceLevelAaContainer, ServiceLevelAaResponse, ServiceLevelAaResult,
     };
     use nextgsim_nas::messages::mm::{
         Abba, Ie5gMmCause, Ie5gsRegistrationResult, IeNasSecurityAlgorithms,
@@ -6491,5 +6587,196 @@ mod tests {
             orch.derive_kgnb_for_as_security(),
             Some(derive_kgnb(&kamf, ul, 0x01))
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // UUAA-MM (#58, TS 23.256 §5.2.2 / TS 24.501 §9.11.2.10)
+    // ------------------------------------------------------------------------
+
+    /// A UE configured as an aerial UE with a UUAA payload available.
+    fn aerial_ue_config() -> UeConfig {
+        let mut config = UeConfig::default();
+        config.uav_config = Some(nextgsim_common::config::UavConfig {
+            is_aerial_ue: true,
+            uav_id: Some("FAA-N12345".to_string()),
+            uuaa_payload_hex: Some("a1b2c3".to_string()),
+            ..Default::default()
+        });
+        config
+    }
+
+    fn slaa_response_container(slar: ServiceLevelAaResult) -> Vec<u8> {
+        ServiceLevelAaContainer {
+            response: Some(ServiceLevelAaResponse {
+                slar,
+                c2ar: ServiceLevelAaResult::NoInformation,
+            }),
+            ..Default::default()
+        }
+        .encode()
+    }
+
+    #[test]
+    fn a_uuaa_success_reaches_the_uav_context_authorization_state() {
+        // The wiring the issue asks for: a DL NAS TRANSPORT Service-level-AA
+        // response must land on UavContext::auth_state, not in a private field.
+        let mut orch = MmOrchestrator::from_config(test_identity(), &aerial_ue_config());
+        assert_eq!(
+            orch.uav_authorization_state(),
+            Some(UavAuthorizationState::NotAuthorized)
+        );
+
+        orch.handle_service_level_aa_container(&slaa_response_container(
+            ServiceLevelAaResult::Successful,
+        ));
+
+        assert_eq!(orch.uuaa_state(), UuaaState::Authorized);
+        assert_eq!(
+            orch.uav_authorization_state(),
+            Some(UavAuthorizationState::Authorized)
+        );
+    }
+
+    #[test]
+    fn a_uuaa_revocation_reaches_the_uav_context_authorization_state() {
+        // The direction that matters for safety: an authorized UAV told its
+        // authorization is revoked must stop reading as authorized.
+        let mut orch = MmOrchestrator::from_config(test_identity(), &aerial_ue_config());
+        orch.handle_service_level_aa_container(&slaa_response_container(
+            ServiceLevelAaResult::Successful,
+        ));
+        assert_eq!(
+            orch.uav_authorization_state(),
+            Some(UavAuthorizationState::Authorized)
+        );
+
+        orch.handle_service_level_aa_container(&slaa_response_container(
+            ServiceLevelAaResult::NotSuccessfulOrRevoked,
+        ));
+
+        assert_eq!(orch.uuaa_state(), UuaaState::Rejected);
+        assert_eq!(
+            orch.uav_authorization_state(),
+            Some(UavAuthorizationState::Revoked)
+        );
+    }
+
+    #[test]
+    fn a_non_aerial_ue_has_no_uav_context_and_no_uuaa_payload() {
+        // A UE that is not a UAV must not answer a UUAA pending indication: it
+        // would be claiming a UAS identity it does not have.
+        let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+        assert_eq!(orch.uav_authorization_state(), None);
+
+        let pending = ServiceLevelAaContainer {
+            pending_indication: Some(true),
+            ..Default::default()
+        }
+        .encode();
+        assert_eq!(
+            orch.handle_service_level_aa_container(&pending),
+            UuaaReaction::Nothing
+        );
+    }
+
+    #[test]
+    fn an_aerial_ue_with_an_unparsable_uuaa_payload_sends_nothing() {
+        // "a1b2c" is odd-length hex: not a payload. The UE must not send a
+        // half-decoded or empty one.
+        let mut config = aerial_ue_config();
+        config.uav_config.as_mut().unwrap().uuaa_payload_hex = Some("a1b2c".to_string());
+        let mut orch = MmOrchestrator::from_config(test_identity(), &config);
+
+        let pending = ServiceLevelAaContainer {
+            pending_indication: Some(true),
+            ..Default::default()
+        }
+        .encode();
+        assert_eq!(
+            orch.handle_service_level_aa_container(&pending),
+            UuaaReaction::Nothing
+        );
+        assert_eq!(orch.uuaa_state(), UuaaState::Pending);
+        // The UAV is not authorized while an unanswerable request is pending.
+        assert_eq!(
+            orch.uav_authorization_state(),
+            Some(UavAuthorizationState::AuthorizationRequested)
+        );
+    }
+
+    /// The `uuaa-mm` gate, asserted from the live orchestrator in whichever
+    /// configuration is being built. Both arms exist so neither is compiled
+    /// without being checked -- the CI `uuaa-mm` job runs the enabled one.
+    #[cfg(feature = "uuaa-mm")]
+    #[test]
+    fn with_uuaa_mm_enabled_a_pending_indication_produces_an_uplink() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &aerial_ue_config());
+        let pending = ServiceLevelAaContainer {
+            pending_indication: Some(true),
+            ..Default::default()
+        }
+        .encode();
+
+        let UuaaReaction::SendUplink(pdu) = orch.handle_service_level_aa_container(&pending) else {
+            panic!("with uuaa-mm on, a pending indication must produce an uplink");
+        };
+        // Plain UL NAS TRANSPORT with payload container type 9, carrying the
+        // configured payload.
+        assert_eq!(&pdu[..4], &[0x7E, 0x00, 0x67, 0x09]);
+        assert_eq!(
+            ServiceLevelAaContainer::decode(&pdu[6..])
+                .payload
+                .as_deref(),
+            Some(&[0xA1, 0xB2, 0xC3][..])
+        );
+        assert_eq!(orch.uuaa_state(), UuaaState::Requested);
+    }
+
+    #[cfg(not(feature = "uuaa-mm"))]
+    #[test]
+    fn without_uuaa_mm_a_pending_indication_is_recorded_and_not_answered() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &aerial_ue_config());
+        let pending = ServiceLevelAaContainer {
+            pending_indication: Some(true),
+            ..Default::default()
+        }
+        .encode();
+
+        assert_eq!(
+            orch.handle_service_level_aa_container(&pending),
+            UuaaReaction::Nothing
+        );
+        // Recorded, so the default build is honest about having been asked.
+        assert_eq!(orch.uuaa_state(), UuaaState::Pending);
+        assert_eq!(
+            orch.uav_authorization_state(),
+            Some(UavAuthorizationState::AuthorizationRequested)
+        );
+    }
+
+    #[test]
+    fn the_configured_caa_id_reaches_the_uav_identity() {
+        let orch = MmOrchestrator::from_config(test_identity(), &aerial_ue_config());
+        assert_eq!(
+            orch.uav.as_ref().unwrap().identity.caa_level_id.as_deref(),
+            Some("FAA-N12345")
+        );
+    }
+
+    #[test]
+    fn a_uuaa_payload_hex_round_trips_through_the_config_accessor() {
+        let config = aerial_ue_config();
+        let uav = config.uav_config.as_ref().unwrap();
+        assert_eq!(uav.uuaa_payload(), Some(vec![0xA1, 0xB2, 0xC3]));
+
+        // Absent, empty, odd-length and non-hex all yield no payload rather
+        // than a partial one.
+        for hex in [None, Some(""), Some("a1b2c"), Some("zz")] {
+            let candidate = nextgsim_common::config::UavConfig {
+                uuaa_payload_hex: hex.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(candidate.uuaa_payload(), None, "hex={hex:?}");
+        }
     }
 }

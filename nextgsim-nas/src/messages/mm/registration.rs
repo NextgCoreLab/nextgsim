@@ -19,6 +19,7 @@ use crate::ies::ie4::{
     IeAiMlCapability, IeIsacParameter, IeNtnAccessBarring, IeNtnTimingAdvance,
     IeSemanticCommParameter, IeSubThzBandParameter,
 };
+use crate::ies::service_level_aa::ServiceLevelAaContainer;
 use crate::security::NasKeySetIdentifier;
 
 /// Error type for Registration message encoding/decoding
@@ -742,47 +743,29 @@ pub(crate) fn decode_nid_44bit(octets: &[u8]) -> Option<String> {
     Some(s)
 }
 
-/// Service-level-AA parameter IEI for the Service-level device ID (TS 24.501
-/// §9.11.2.10 Table 9.11.2.10.1 / §9.11.2.11) — a type-4 parameter whose value
-/// is the CAA-level UAV ID encoded as a UTF-8 string.
-pub(crate) const SLAA_PARAM_SERVICE_LEVEL_DEVICE_ID: u8 = 0x10;
-
 /// Encode the *contents* of a Service-level-AA container (TS 24.501 §9.11.2.10)
 /// carrying the UAS CAA-level UAV ID as the Service-level device ID parameter
 /// (§9.11.2.11, type-4: param-IEI 0x10, 1-octet length, UTF-8 value). The
 /// returned bytes are placed after the container IEI + 2-octet TLV-E length.
+///
+/// A thin wrapper over [`ServiceLevelAaContainer`] rather than its own encoder:
+/// the same container type also travels in UL/DL NAS TRANSPORT (payload
+/// container type `0b1001`), and two encoders for one wire format is how the
+/// registration path and the UUAA path would come to disagree about the bytes.
 pub(crate) fn encode_service_level_aa_container(caa_id: &str) -> Vec<u8> {
-    let id = caa_id.as_bytes();
-    let len = id.len().min(255); // Service-level device ID length field is 1 octet
-    let mut out = Vec::with_capacity(2 + len);
-    out.push(SLAA_PARAM_SERVICE_LEVEL_DEVICE_ID);
-    out.push(len as u8);
-    out.extend_from_slice(&id[..len]);
-    out
+    ServiceLevelAaContainer::with_device_id(caa_id).encode()
 }
 
 /// Parse a Service-level-AA container's contents (TS 24.501 §9.11.2.10) and
 /// return the CAA-level UAV ID from the Service-level device ID parameter
-/// (param-IEI 0x10, type-4). Unknown leading type-4 parameters are skipped per
-/// the spec's "ignore unknown IEI" rule. Only the Service-level device ID is
-/// consumed (the only parameter produced on the registration path); the broader
-/// UUAA UL-NAS-TRANSPORT parameters (payload/payload-type/response) are not yet
-/// handled here — see `WAVE6-DOWNGRADED-FEATURES.md` §6.
+/// (param-IEI 0x10, type-4). Unknown parameters are skipped per the spec's
+/// "ignore unknown IEI" rule.
+///
+/// Registration only ever needs the device ID, so this keeps its narrow return
+/// type; a caller that needs the other parameters (a UUAA exchange over NAS
+/// transport) decodes into [`ServiceLevelAaContainer`] directly.
 pub(crate) fn decode_service_level_aa_container(bytes: &[u8]) -> Option<String> {
-    let mut i = 0;
-    while i + 2 <= bytes.len() {
-        let ptype = bytes[i];
-        let plen = bytes[i + 1] as usize;
-        let start = i + 2;
-        if start + plen > bytes.len() {
-            break;
-        }
-        if ptype == SLAA_PARAM_SERVICE_LEVEL_DEVICE_ID {
-            return String::from_utf8(bytes[start..start + plen].to_vec()).ok();
-        }
-        i = start + plen;
-    }
-    None
+    ServiceLevelAaContainer::decode(bytes).device_id
 }
 
 impl Default for RegistrationRequest {
