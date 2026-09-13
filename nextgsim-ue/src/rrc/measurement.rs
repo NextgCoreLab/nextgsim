@@ -25,13 +25,18 @@
 //! - **B1/B2**: inter-RAT: an E-UTRA neighbour above a threshold, B2 also
 //!   requiring a weak PCell (§5.5.4.8, §5.5.4.9)
 //!
+//! # Triggering state machine
+//!
+//! Each event has an **entering** and a **leaving** inequality (§5.5.4), which
+//! differ by the sign of the hysteresis and so create a dead band: a cell that
+//! has entered stays triggered until its level has moved a full 2·Hys back the
+//! other way. Membership is tracked per cell in `cellsTriggeredList` (§5.5.4.1),
+//! so several neighbours can hold one `measId` triggered and one of them
+//! dropping out does not release the event. `timeToTrigger` gates both
+//! directions, per cell.
+//!
 //! # What this manager does not model
 //!
-//! - **Leaving conditions.** TS 38.331 §5.5.4 gives each event an entering *and*
-//!   a leaving inequality, which differ by the sign of the hysteresis and so
-//!   create a dead band. Here an event is triggered exactly while its entering
-//!   condition holds, and `cellsTriggeredList` is one cell rather than a set.
-//!   Issue #111 covers the dead band and the per-cell triggered list.
 //! - **Layer-3 filtering** (§5.5.3.2): a measurement is the level the radio last
 //!   reported, unfiltered.
 //! - **`cellIndividualOffset` for NR cells** (Ocn/Ocs): zero for every NR cell,
@@ -42,7 +47,7 @@
 //! - 3GPP TS 38.331: NR; RRC protocol specification, §5.5.4
 //! - 3GPP TS 38.215: NR; Physical layer measurements
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 /// Measurement quantity types
@@ -181,7 +186,7 @@ pub struct CellMeasResult {
 
 /// Identifies an inter-RAT (E-UTRA) cell: `measObjectEUTRA` is per carrier
 /// frequency, and the physical cell identity is unique within it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EutraCellKey {
     /// E-UTRA carrier frequency (EARFCN)
     pub earfcn: u32,
@@ -211,11 +216,14 @@ pub struct EutraMeasResult {
     pub cell_individual_offset: i32,
 }
 
-/// The cell that satisfied an event's entering condition.
+/// A cell in an event's `cellsTriggeredList` (TS 38.331 §5.5.4.1).
 ///
 /// Neighbour events name a cell, and an inter-RAT event names one that has no
-/// simulator cell id — hence the two arms rather than a bare `i32`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// simulator cell id — hence the two arms rather than a bare `i32`. `Ord` is
+/// derived so the list can be a set: the ordering is an arbitrary but stable
+/// key order, not a signal-strength order, which the report path applies
+/// separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TriggeringCell {
     /// An NR neighbour, by simulator cell id
     Nr(i32),
@@ -244,75 +252,143 @@ pub struct MeasurementReport {
     pub neighbor_cells: Vec<CellMeasResult>,
     /// Inter-RAT (E-UTRA) neighbour results, for a B1/B2 report
     pub eutra_neighbor_cells: Vec<EutraMeasResult>,
+    /// The event's `cellsTriggeredList` at the moment the report was generated,
+    /// strongest first (§5.5.4.1). Empty for a periodic report, which is not
+    /// triggered by any cell. The neighbour lists above lead with these cells.
+    pub triggered_cells: Vec<TriggeringCell>,
     /// Timestamp of the report
     pub timestamp: Instant,
 }
 
-/// The entering inequality of TS 38.331 §5.5.4 for one NR neighbour cell.
+/// Which of the two inequalities TS 38.331 §5.5.4 defines for an event.
+///
+/// They differ by the sign of the hysteresis, so a cell that has entered needs
+/// its level to move a full 2·Hys before it leaves again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Condition {
+    /// The entering inequality (`…-1`, and `…-2` for a two-part event), all
+    /// parts of which must hold.
+    Entering,
+    /// The leaving inequality. A two-part event leaves when *either* part holds
+    /// (§5.5.4.6 A5-3/A5-4, §5.5.4.9 B2-3/B2-4), not both.
+    Leaving,
+}
+
+/// Where one applicable cell stands against an event's two inequalities.
+struct CellVerdict {
+    /// The cell, as it appears in `cellsTriggeredList`
+    cell: TriggeringCell,
+    /// The level the event's inequality is written in terms of: Mn for an NR
+    /// cell, Mn + Ofn + Ocn for an inter-RAT one. Orders the report.
+    level: i32,
+    /// The entering inequality holds now
+    entering: bool,
+    /// The leaving inequality holds now
+    leaving: bool,
+}
+
+/// One of the two inequalities of TS 38.331 §5.5.4 for one NR neighbour cell.
 ///
 /// The single place the NR neighbour events' arithmetic lives: the per-event
-/// best-neighbour search and the conditional-reconfiguration runtime
+/// applicable-cell sweep and the conditional-reconfiguration runtime
 /// ([`MeasurementManager::candidate_condition_holds`]) both go through it, so a
 /// CHO candidate is judged by exactly the inequality its measurement event uses.
 ///
-/// `reference_rsrp` is the level the event compares against — Ms of the PCell for
-/// A3, Ms of the SCell for A6 (§5.5.4.7), Mp of the PCell for A5 — and is ignored
-/// by the threshold-only A4.
+/// `reference_rsrp` is the level the event compares against — Mp of the PCell for
+/// A3 and A5, Ms of the SCell for A6 (§5.5.4.7) — and is `None` for the
+/// threshold-only A4, which needs no reference. An event that *does* need one and
+/// has none cannot be entered, and cannot be sustained either, so it reports
+/// `false` for entering and `true` for leaving.
 ///
 /// Hysteresis is halved because `ReportTriggerConfig::hysteresis` is in the
 /// signalled 0.5 dB units. Ocn and Ocs are zero: no NR
 /// `cellIndividualOffset` is modelled, which §5.5.4 allows when it is not
-/// configured. Events that no neighbour cell can satisfy (A1, A2, and the
-/// inter-RAT B1/B2) return `false` rather than being silently accepted.
+/// configured. Events that no *neighbour* cell can satisfy (A1 and A2 measure
+/// the serving cell; B1/B2 are inter-RAT) never enter here and always leave,
+/// rather than being silently accepted.
 ///
-/// A threshold event whose threshold is absent does not trigger, which is also
-/// what an absent A5 threshold now does: the previous code substituted
-/// `i32::MIN`/`i32::MAX` and then subtracted the hysteresis from it, overflowing.
-fn nr_entering_condition(
+/// A threshold event whose threshold is absent does not trigger, and does not
+/// stay triggered: the code this replaced substituted `i32::MIN`/`i32::MAX` and
+/// then subtracted the hysteresis from it, overflowing.
+fn nr_condition(
+    which: Condition,
     event_type: MeasEventType,
     trigger: &ReportTriggerConfig,
-    reference_rsrp: i32,
+    reference_rsrp: Option<i32>,
     neighbour_rsrp: i32,
 ) -> bool {
     let hyst = trigger.hysteresis / 2;
+    let entering = which == Condition::Entering;
 
     match event_type {
         // A3-1: Mn + Ocn - Hys > Mp + Ofp + Ocp + Off
+        // A3-2: Mn + Ocn + Hys < Mp + Ofp + Ocp + Off
         MeasEventType::A3 => {
-            neighbour_rsrp > reference_rsrp + trigger.a3_offset.unwrap_or(0) + hyst
+            let off = trigger.a3_offset.unwrap_or(0);
+            match reference_rsrp {
+                Some(mp) if entering => neighbour_rsrp > mp + off + hyst,
+                Some(mp) => neighbour_rsrp < mp + off - hyst,
+                None => !entering,
+            }
         }
         // A4-1: Mn + Ocn - Hys > Thresh
-        MeasEventType::A4 => trigger
-            .threshold
-            .is_some_and(|thresh| neighbour_rsrp > thresh + hyst),
+        // A4-2: Mn + Ocn + Hys < Thresh
+        MeasEventType::A4 => match trigger.threshold {
+            Some(thresh) if entering => neighbour_rsrp > thresh + hyst,
+            Some(thresh) => neighbour_rsrp < thresh - hyst,
+            None => !entering,
+        },
         // A5-1 and A5-2: Mp + Hys < Thresh1 AND Mn + Ocn - Hys > Thresh2
-        MeasEventType::A5 => match (trigger.threshold1, trigger.threshold2) {
-            (Some(thresh1), Some(thresh2)) => {
-                reference_rsrp < thresh1 - hyst && neighbour_rsrp > thresh2 + hyst
+        // A5-3  or A5-4: Mp - Hys > Thresh1  OR Mn + Ocn + Hys < Thresh2
+        MeasEventType::A5 => match (reference_rsrp, trigger.threshold1, trigger.threshold2) {
+            (Some(mp), Some(thresh1), Some(thresh2)) if entering => {
+                mp < thresh1 - hyst && neighbour_rsrp > thresh2 + hyst
             }
-            _ => false,
+            (Some(mp), Some(thresh1), Some(thresh2)) => {
+                mp > thresh1 + hyst || neighbour_rsrp < thresh2 - hyst
+            }
+            _ => !entering,
         },
         // A6-1: Mn + Ocn - Hys > Ms + Ocs + Off, with Ms the SCell
+        // A6-2: Mn + Ocn + Hys < Ms + Ocs + Off
         MeasEventType::A6 => {
-            neighbour_rsrp > reference_rsrp + trigger.a6_offset.unwrap_or(0) + hyst
+            let off = trigger.a6_offset.unwrap_or(0);
+            match reference_rsrp {
+                Some(ms) if entering => neighbour_rsrp > ms + off + hyst,
+                Some(ms) => neighbour_rsrp < ms + off - hyst,
+                None => !entering,
+            }
         }
-        MeasEventType::A1 | MeasEventType::A2 | MeasEventType::B1 | MeasEventType::B2 => false,
+        MeasEventType::A1 | MeasEventType::A2 | MeasEventType::B1 | MeasEventType::B2 => !entering,
     }
 }
 
 /// Event state tracking for a single event
 #[derive(Debug, Clone, Default)]
 struct EventState {
-    /// Whether the event condition is currently met
-    condition_met: bool,
-    /// Cell that triggered the condition (for neighbor events)
-    triggering_cell: Option<TriggeringCell>,
-    /// Time when condition was first met
-    condition_met_since: Option<Instant>,
+    /// `cellsTriggeredList` (TS 38.331 §5.5.4.1): the cells currently holding
+    /// this `measId` triggered. The event is triggered while this is non-empty.
+    cells_triggered: BTreeSet<TriggeringCell>,
+    /// Per cell, when its entering condition first held while it was *not* in
+    /// `cells_triggered` — the start of `timeToTrigger`.
+    entering_since: BTreeMap<TriggeringCell, Instant>,
+    /// Per cell, when its leaving condition first held while it *was* in
+    /// `cells_triggered`. §5.5.4.1 applies `timeToTrigger` to both directions.
+    leaving_since: BTreeMap<TriggeringCell, Instant>,
     /// Number of reports sent for this event
     reports_sent: u32,
     /// Last report time
     last_report: Option<Instant>,
+}
+
+impl EventState {
+    /// Forget every cell, keeping the report counters: used when the reference
+    /// the events are measured against changes under them.
+    fn clear_triggers(&mut self) {
+        self.cells_triggered.clear();
+        self.entering_since.clear();
+        self.leaving_since.clear();
+    }
 }
 
 /// Measurement manager for handling RRC measurements
@@ -352,12 +428,14 @@ impl MeasurementManager {
 
     /// Set the serving cell
     pub fn set_serving_cell(&mut self, cell_id: Option<i32>) {
+        if self.serving_cell_id == cell_id {
+            return;
+        }
         self.serving_cell_id = cell_id;
-        // Reset event states on serving cell change
+        // Every event's inequality is written against the serving cell, so a
+        // change invalidates each cellsTriggeredList wholesale.
         for state in self.event_states.values_mut() {
-            state.condition_met = false;
-            state.condition_met_since = None;
-            state.triggering_cell = None;
+            state.clear_triggers();
         }
     }
 
@@ -482,11 +560,11 @@ impl MeasurementManager {
             None => return,
         };
 
-        let serving_rsrp = self
-            .measurements
-            .get(&serving_cell_id)
-            .and_then(|m| m.rsrp)
-            .unwrap_or(i32::MIN);
+        // `None` when the PCell has not been measured yet. Events written against
+        // Mp (A1, A2, A3, A5, B2) then have no applicable cell at all, rather
+        // than being evaluated against a substituted `i32::MIN` that overflows
+        // the moment a leaving inequality subtracts the hysteresis from it.
+        let serving_rsrp = self.measurements.get(&serving_cell_id).and_then(|m| m.rsrp);
 
         // Evaluate each measurement configuration
         let configs: Vec<_> = self.configs.values().cloned().collect();
@@ -495,186 +573,244 @@ impl MeasurementManager {
         }
     }
 
-    fn evaluate_event(&mut self, config: &MeasConfig, serving_cell_id: i32, serving_rsrp: i32) {
+    fn evaluate_event(
+        &mut self,
+        config: &MeasConfig,
+        serving_cell_id: i32,
+        serving_rsrp: Option<i32>,
+    ) {
         let meas_id = config.meas_id;
         let trigger = &config.trigger_config;
+        let ttt = Duration::from_millis(trigger.time_to_trigger);
 
-        let (condition_met, triggering_cell) = match trigger.trigger_type {
+        // A periodic report is not triggered by any cell, so it has no
+        // cellsTriggeredList and reports on its interval regardless.
+        let periodic = matches!(trigger.trigger_type, ReportTriggerType::Periodic);
+        let verdicts = match trigger.trigger_type {
+            ReportTriggerType::Periodic => Vec::new(),
             ReportTriggerType::Event(event_type) => {
-                self.check_event_condition(event_type, trigger, serving_cell_id, serving_rsrp)
+                self.cell_verdicts(event_type, trigger, serving_cell_id, serving_rsrp)
             }
-            ReportTriggerType::Periodic => (true, None),
         };
 
-        // Check if we need to generate a report
+        let now = Instant::now();
         let mut generate_report = false;
-        let mut report_params: Option<(u8, i32, Option<TriggeringCell>, u8)> = None;
+        let mut triggered_cells: Vec<TriggeringCell> = Vec::new();
 
         {
             let state = self.event_states.entry(meas_id).or_default();
 
-            if condition_met {
-                if !state.condition_met {
-                    // Condition just became true
-                    state.condition_met = true;
-                    state.triggering_cell = triggering_cell;
-                    state.condition_met_since = Some(Instant::now());
-                }
+            // A cell with no measurement this round is no longer applicable, and
+            // an inapplicable cell cannot hold the event triggered.
+            let applicable: BTreeSet<TriggeringCell> = verdicts.iter().map(|v| v.cell).collect();
+            state.cells_triggered.retain(|c| applicable.contains(c));
+            state.entering_since.retain(|c, _| applicable.contains(c));
+            state.leaving_since.retain(|c, _| applicable.contains(c));
 
-                // Check time-to-trigger
-                if let Some(since) = state.condition_met_since {
-                    if since.elapsed() >= Duration::from_millis(trigger.time_to_trigger) {
-                        // Check if we should send a report
-                        let should_report = state.last_report.is_none_or(|last| {
-                            last.elapsed() >= Duration::from_millis(config.report_interval)
-                        });
-
-                        let reports_remaining =
-                            config.report_amount == 0 || state.reports_sent < config.report_amount;
-
-                        if should_report && reports_remaining {
-                            generate_report = true;
-                            report_params = Some((
-                                meas_id,
-                                serving_cell_id,
-                                triggering_cell,
-                                config.max_report_cells,
-                            ));
-                            state.reports_sent += 1;
-                            state.last_report = Some(Instant::now());
-
-                            tracing::info!(
-                                "Measurement report generated: meas_id={}, event={:?}, reports_sent={}",
-                                meas_id, trigger.trigger_type, state.reports_sent
-                            );
+            // §5.5.4.1: include a cell once its entering condition has held for
+            // timeToTrigger, exclude it once its leaving condition has.
+            for verdict in &verdicts {
+                let cell = verdict.cell;
+                if state.cells_triggered.contains(&cell) {
+                    if verdict.leaving {
+                        let since = *state.leaving_since.entry(cell).or_insert(now);
+                        if now.duration_since(since) >= ttt {
+                            state.cells_triggered.remove(&cell);
+                            state.leaving_since.remove(&cell);
                         }
+                    } else {
+                        // Back inside the dead band: the leaving run is broken.
+                        state.leaving_since.remove(&cell);
                     }
+                } else if verdict.entering {
+                    let since = *state.entering_since.entry(cell).or_insert(now);
+                    if now.duration_since(since) >= ttt {
+                        state.cells_triggered.insert(cell);
+                        state.entering_since.remove(&cell);
+                    }
+                } else {
+                    state.entering_since.remove(&cell);
                 }
-            } else {
-                // Condition no longer met - reset
-                state.condition_met = false;
-                state.condition_met_since = None;
-                state.triggering_cell = None;
+            }
+
+            if periodic || !state.cells_triggered.is_empty() {
+                let should_report = state.last_report.is_none_or(|last| {
+                    last.elapsed() >= Duration::from_millis(config.report_interval)
+                });
+                let reports_remaining =
+                    config.report_amount == 0 || state.reports_sent < config.report_amount;
+
+                if should_report && reports_remaining {
+                    generate_report = true;
+                    // §5.5.5 orders the reported cells by the quantity the event
+                    // is written in, strongest first; ties keep the set's order
+                    // so the list is deterministic.
+                    let mut ranked: Vec<(TriggeringCell, i32)> = verdicts
+                        .iter()
+                        .filter(|v| state.cells_triggered.contains(&v.cell))
+                        .map(|v| (v.cell, v.level))
+                        .collect();
+                    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    triggered_cells = ranked.into_iter().map(|(cell, _)| cell).collect();
+
+                    state.reports_sent += 1;
+                    state.last_report = Some(now);
+
+                    tracing::info!(
+                        "Measurement report generated: meas_id={}, event={:?}, cells_triggered={}, reports_sent={}",
+                        meas_id,
+                        trigger.trigger_type,
+                        state.cells_triggered.len(),
+                        state.reports_sent
+                    );
+                }
             }
         }
 
         // Generate report outside the borrow scope
         if generate_report {
-            if let Some((meas_id, serving_cell_id, triggering_cell, max_cells)) = report_params {
-                let report =
-                    self.generate_report(meas_id, serving_cell_id, triggering_cell, max_cells);
-                self.pending_reports.push(report);
-            }
+            let report = self.generate_report(
+                meas_id,
+                serving_cell_id,
+                &triggered_cells,
+                config.max_report_cells,
+            );
+            self.pending_reports.push(report);
         }
     }
 
-    fn check_event_condition(
+    /// Where every cell applicable to `event_type` stands against its two
+    /// inequalities.
+    ///
+    /// "Applicable" is per event: A1/A2 measure the serving cell and nothing
+    /// else, A3-A5 the NR neighbours of the PCell, A6 the NR neighbours of the
+    /// SCell (and neither serving cell is a neighbour of itself), B1/B2 the
+    /// inter-RAT cells. An event whose reference level is missing has no
+    /// applicable cell rather than a substituted one.
+    fn cell_verdicts(
         &self,
         event_type: MeasEventType,
         trigger: &ReportTriggerConfig,
         serving_cell_id: i32,
-        serving_rsrp: i32,
-    ) -> (bool, Option<TriggeringCell>) {
+        serving_rsrp: Option<i32>,
+    ) -> Vec<CellVerdict> {
         let hyst = trigger.hysteresis / 2; // Convert to dB
 
         match event_type {
-            MeasEventType::A1 => {
-                // Serving > threshold
-                if let Some(thresh) = trigger.threshold {
-                    (serving_rsrp > thresh + hyst, None)
+            // A1-1: Ms - Hys > Thresh   A1-2: Ms + Hys < Thresh
+            // A2-1: Ms + Hys < Thresh   A2-2: Ms - Hys > Thresh
+            MeasEventType::A1 | MeasEventType::A2 => {
+                let (Some(ms), Some(thresh)) = (serving_rsrp, trigger.threshold) else {
+                    return Vec::new();
+                };
+                let (entering, leaving) = if event_type == MeasEventType::A1 {
+                    (ms > thresh + hyst, ms < thresh - hyst)
                 } else {
-                    (false, None)
-                }
+                    (ms < thresh - hyst, ms > thresh + hyst)
+                };
+                vec![CellVerdict {
+                    cell: TriggeringCell::Nr(serving_cell_id),
+                    level: ms,
+                    entering,
+                    leaving,
+                }]
             }
-            MeasEventType::A2 => {
-                // Serving < threshold
-                if let Some(thresh) = trigger.threshold {
-                    (serving_rsrp < thresh - hyst, None)
-                } else {
-                    (false, None)
-                }
-            }
-            MeasEventType::A3 | MeasEventType::A4 | MeasEventType::A5 => {
-                // The best NR neighbour satisfying the event, measured against
-                // the PCell (Ms/Mp of §5.5.4.4-.6).
-                self.best_nr_neighbour(event_type, trigger, serving_rsrp, |cell_id| {
+            // A3/A5 measure against Mp; A4 needs no reference at all.
+            MeasEventType::A3 | MeasEventType::A5 => {
+                self.nr_cell_verdicts(event_type, trigger, serving_rsrp, |cell_id| {
                     cell_id != serving_cell_id
                 })
             }
+            MeasEventType::A4 => self.nr_cell_verdicts(event_type, trigger, None, |cell_id| {
+                cell_id != serving_cell_id
+            }),
             MeasEventType::A6 => {
                 // §5.5.4.7: the reference is the SCell, not the PCell. Without an
                 // SCell there is nothing to compare against, so no A6 event.
-                let scell_id = match self.scell_id {
-                    Some(id) => id,
-                    None => return (false, None),
+                let Some(scell_id) = self.scell_id else {
+                    return Vec::new();
                 };
-                let scell_rsrp = match self.rsrp(scell_id) {
-                    Some(rsrp) => rsrp,
-                    None => return (false, None),
-                };
+                let scell_rsrp = self.rsrp(scell_id);
+                if scell_rsrp.is_none() {
+                    return Vec::new();
+                }
                 // Neither serving cell is a neighbour of itself.
-                self.best_nr_neighbour(event_type, trigger, scell_rsrp, |cell_id| {
+                self.nr_cell_verdicts(event_type, trigger, scell_rsrp, |cell_id| {
                     cell_id != serving_cell_id && cell_id != scell_id
                 })
             }
-            MeasEventType::B1 | MeasEventType::B2 => {
-                self.best_eutra_neighbour(event_type, trigger, serving_rsrp)
-            }
+            MeasEventType::B1 => self.eutra_cell_verdicts(event_type, trigger, None),
+            MeasEventType::B2 => self.eutra_cell_verdicts(event_type, trigger, serving_rsrp),
         }
     }
 
-    /// The strongest NR neighbour whose entering condition holds, among the cells
-    /// `is_neighbour` accepts.
+    /// Verdicts for every measured NR cell `is_neighbour` accepts.
     ///
     /// `reference_rsrp` is what the event compares against: the PCell for
     /// A3/A5, the SCell for A6, and nothing at all for A4.
-    fn best_nr_neighbour(
+    fn nr_cell_verdicts(
         &self,
         event_type: MeasEventType,
         trigger: &ReportTriggerConfig,
-        reference_rsrp: i32,
+        reference_rsrp: Option<i32>,
         is_neighbour: impl Fn(i32) -> bool,
-    ) -> (bool, Option<TriggeringCell>) {
-        let mut best: Option<(i32, i32)> = None;
+    ) -> Vec<CellVerdict> {
+        let mut verdicts = Vec::new();
 
         for (&cell_id, meas) in &self.measurements {
             if !is_neighbour(cell_id) {
                 continue;
             }
-            if let Some(rsrp) = meas.rsrp {
-                if nr_entering_condition(event_type, trigger, reference_rsrp, rsrp)
-                    && best.is_none_or(|(_, best_rsrp)| rsrp > best_rsrp)
-                {
-                    best = Some((cell_id, rsrp));
-                }
-            }
+            let Some(rsrp) = meas.rsrp else { continue };
+            verdicts.push(CellVerdict {
+                cell: TriggeringCell::Nr(cell_id),
+                level: rsrp,
+                entering: nr_condition(
+                    Condition::Entering,
+                    event_type,
+                    trigger,
+                    reference_rsrp,
+                    rsrp,
+                ),
+                leaving: nr_condition(
+                    Condition::Leaving,
+                    event_type,
+                    trigger,
+                    reference_rsrp,
+                    rsrp,
+                ),
+            });
         }
 
-        best.map_or((false, None), |(cell_id, _)| {
-            (true, Some(TriggeringCell::Nr(cell_id)))
-        })
+        verdicts
     }
 
-    /// The strongest inter-RAT neighbour whose B1/B2 entering condition holds.
+    /// Verdicts for every measured inter-RAT cell against B1/B2.
     ///
-    /// "Strongest" compares Mn + Ofn + Ocn, the same sum the inequality uses, so
-    /// the cell reported is the one the event is actually about.
-    fn best_eutra_neighbour(
+    /// The level compared is Mn + Ofn + Ocn, the same sum the inequalities use,
+    /// so the cell the report leads with is the one the event is about.
+    ///
+    /// B2's PCell half is not per cell: B2-1 (Mp + Hys < Thresh1) gates every
+    /// neighbour's entering condition, and B2-3 (Mp - Hys > Thresh1) releases
+    /// every triggered one on its own, since §5.5.4.9's leaving condition is
+    /// B2-3 *or* B2-4.
+    fn eutra_cell_verdicts(
         &self,
         event_type: MeasEventType,
         trigger: &ReportTriggerConfig,
-        pcell_rsrp: i32,
-    ) -> (bool, Option<TriggeringCell>) {
+        pcell_rsrp: Option<i32>,
+    ) -> Vec<CellVerdict> {
         let hyst = trigger.hysteresis / 2;
 
-        // B2-1 (entering condition 1): Mp + Hys < Thresh1. Checked once, before
-        // any neighbour: if the PCell is not weak enough, B2 cannot enter at all.
-        if event_type == MeasEventType::B2 {
-            match trigger.threshold1 {
-                Some(thresh1) if pcell_rsrp < thresh1 - hyst => {}
-                _ => return (false, None),
+        let (pcell_entering, pcell_leaving) = if event_type == MeasEventType::B2 {
+            match (pcell_rsrp, trigger.threshold1) {
+                (Some(mp), Some(thresh1)) => (mp < thresh1 - hyst, mp > thresh1 + hyst),
+                // No Mp or no threshold: B2 can neither enter nor be sustained.
+                _ => (false, true),
             }
-        }
+        } else {
+            (true, false)
+        };
 
         // B1 reads b1-ThresholdEUTRA from `threshold`, B2 b2-Threshold2EUTRA
         // from `threshold2`.
@@ -682,29 +818,41 @@ impl MeasurementManager {
             MeasEventType::B1 => trigger.threshold,
             _ => trigger.threshold2,
         };
-        let threshold = match threshold {
-            Some(t) => t,
-            None => return (false, None),
-        };
 
-        let mut best: Option<(EutraCellKey, i32)> = None;
+        let mut verdicts = Vec::new();
         for (&cell, meas) in &self.eutra_measurements {
             let Some(rsrp) = meas.rsrp else { continue };
-            // Mn + Ofn + Ocn - Hys > Thresh  (B1-1, B2-2)
             let ofn = self
                 .eutra_freq_offsets
                 .get(&cell.earfcn)
                 .copied()
                 .unwrap_or(0);
             let level = rsrp + ofn + meas.cell_individual_offset;
-            if level - hyst > threshold && best.is_none_or(|(_, best_level)| level > best_level) {
-                best = Some((cell, level));
-            }
+            // B1-1/B2-2: Mn + Ofn + Ocn - Hys > Thresh
+            // B1-2/B2-4: Mn + Ofn + Ocn + Hys < Thresh
+            let (neighbour_entering, neighbour_leaving) = match threshold {
+                Some(thresh) => (level - hyst > thresh, level + hyst < thresh),
+                None => (false, true),
+            };
+            verdicts.push(CellVerdict {
+                cell: TriggeringCell::Eutra(cell),
+                level,
+                entering: pcell_entering && neighbour_entering,
+                leaving: pcell_leaving || neighbour_leaving,
+            });
         }
 
-        best.map_or((false, None), |(cell, _)| {
-            (true, Some(TriggeringCell::Eutra(cell)))
-        })
+        verdicts
+    }
+
+    /// The cells currently holding `meas_id` triggered (`cellsTriggeredList`).
+    ///
+    /// Key order, not signal order — the report path ranks by level.
+    pub fn triggered_cells(&self, meas_id: u8) -> Vec<TriggeringCell> {
+        self.event_states
+            .get(&meas_id)
+            .map(|state| state.cells_triggered.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Whether an execution condition holds for one specific candidate cell.
@@ -751,22 +899,35 @@ impl MeasurementManager {
             return false;
         };
 
-        nr_entering_condition(event_type, trigger, reference_rsrp, candidate_rsrp)
+        nr_condition(
+            Condition::Entering,
+            event_type,
+            trigger,
+            Some(reference_rsrp),
+            candidate_rsrp,
+        )
     }
 
+    /// Build the report for `meas_id`, leading both neighbour lists with the
+    /// event's triggered cells in the order given (strongest first).
     fn generate_report(
         &self,
         meas_id: u8,
         serving_cell_id: i32,
-        triggering_cell: Option<TriggeringCell>,
+        triggered_cells: &[TriggeringCell],
         max_cells: u8,
     ) -> MeasurementReport {
-        // Get serving cell measurement
+        // The serving cell need not have been measured: A4, A6 and B1 are all
+        // written without Mp, so a report can be due before the PCell has a
+        // level. Report it as unmeasured rather than panicking.
         let serving_cell = self
             .measurements
             .get(&serving_cell_id)
             .cloned()
-            .expect("value expected");
+            .unwrap_or_else(|| CellMeasResult {
+                pci: serving_cell_id as u32,
+                ..Default::default()
+            });
 
         // Get neighbor cell measurements, sorted by RSRP
         let mut neighbors: Vec<_> = self
@@ -778,30 +939,42 @@ impl MeasurementManager {
 
         neighbors.sort_by(|a, b| b.rsrp.unwrap_or(i32::MIN).cmp(&a.rsrp.unwrap_or(i32::MIN)));
 
-        // If there's a triggering NR cell, put it first
-        if let Some(trig_id) = triggering_cell.and_then(|cell| cell.nr_cell_id()) {
-            if let Some(pos) = neighbors.iter().position(|m| m.pci == trig_id as u32) {
-                let trig = neighbors.remove(pos);
-                neighbors.insert(0, trig);
+        // Every triggered NR cell leads the list, in the given order — not just
+        // one of them: cellsTriggeredList is a set (§5.5.4.1).
+        let mut hoisted = Vec::with_capacity(neighbors.len());
+        for pci in triggered_cells
+            .iter()
+            .filter_map(TriggeringCell::nr_cell_id)
+            .map(|id| id as u32)
+        {
+            if let Some(pos) = neighbors.iter().position(|m| m.pci == pci) {
+                hoisted.push(neighbors.remove(pos));
             }
         }
+        hoisted.append(&mut neighbors);
+        let mut neighbors = hoisted;
 
         // Limit to max cells
         neighbors.truncate(max_cells as usize);
 
-        // Inter-RAT results, strongest first, with the triggering cell hoisted.
+        // Inter-RAT results, triggered cells first and then the rest by level.
         // The uplink MeasurementReport does not carry these yet: the UE's report
         // is a hand-rolled byte format (issue #107) and measResultListEUTRA needs
         // the real UPER encoder, so a B1/B2 report currently reaches the network
         // as its NR part only (issue #113).
         let mut eutra_neighbors: Vec<_> = self.eutra_measurements.values().cloned().collect();
         eutra_neighbors.sort_by(|a, b| b.rsrp.unwrap_or(i32::MIN).cmp(&a.rsrp.unwrap_or(i32::MIN)));
-        if let Some(TriggeringCell::Eutra(trig)) = triggering_cell {
+        let mut eutra_hoisted = Vec::with_capacity(eutra_neighbors.len());
+        for trig in triggered_cells.iter().filter_map(|cell| match cell {
+            TriggeringCell::Eutra(key) => Some(*key),
+            TriggeringCell::Nr(_) => None,
+        }) {
             if let Some(pos) = eutra_neighbors.iter().position(|m| m.cell == trig) {
-                let trig = eutra_neighbors.remove(pos);
-                eutra_neighbors.insert(0, trig);
+                eutra_hoisted.push(eutra_neighbors.remove(pos));
             }
         }
+        eutra_hoisted.append(&mut eutra_neighbors);
+        let mut eutra_neighbors = eutra_hoisted;
         eutra_neighbors.truncate(max_cells as usize);
 
         MeasurementReport {
@@ -809,6 +982,7 @@ impl MeasurementManager {
             serving_cell,
             neighbor_cells: neighbors,
             eutra_neighbor_cells: eutra_neighbors,
+            triggered_cells: triggered_cells.to_vec(),
             timestamp: Instant::now(),
         }
     }
@@ -833,6 +1007,12 @@ impl Default for MeasurementManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether an event is triggered: TS 38.331 §5.5.4.1 defines that as its
+    /// `cellsTriggeredList` being non-empty.
+    fn is_triggered(manager: &MeasurementManager, meas_id: u8) -> bool {
+        !manager.triggered_cells(meas_id).is_empty()
+    }
 
     #[test]
     fn test_measurement_manager_creation() {
@@ -879,9 +1059,7 @@ mod tests {
         manager.evaluate_events();
 
         // Check event state
-        let state = manager.event_states.get(&1).unwrap();
-        assert!(state.condition_met);
-        assert_eq!(state.triggering_cell, Some(TriggeringCell::Nr(2)));
+        assert_eq!(manager.triggered_cells(1), vec![TriggeringCell::Nr(2)]);
     }
 
     /// Builds a manager camped on cell 1 with an SCell on cell 2, so A6 has a
@@ -918,9 +1096,11 @@ mod tests {
 
         manager.evaluate_events();
 
-        let state = manager.event_states.get(&6).expect("A6 state");
-        assert!(state.condition_met, "-90 dBm beats the -91 dBm A6 bar");
-        assert_eq!(state.triggering_cell, Some(TriggeringCell::Nr(3)));
+        assert_eq!(
+            manager.triggered_cells(6),
+            vec![TriggeringCell::Nr(3)],
+            "-90 dBm beats the -91 dBm A6 bar"
+        );
     }
 
     #[test]
@@ -931,8 +1111,10 @@ mod tests {
 
         manager.evaluate_events();
 
-        let state = manager.event_states.get(&6).expect("A6 state");
-        assert!(!state.condition_met, "-92 dBm is below the -91 dBm A6 bar");
+        assert!(
+            !is_triggered(&manager, 6),
+            "-92 dBm is below the -91 dBm A6 bar"
+        );
     }
 
     /// A6 measures against the SCell, so the PCell — the strongest cell here —
@@ -944,9 +1126,8 @@ mod tests {
 
         manager.evaluate_events();
 
-        let state = manager.event_states.get(&6).expect("A6 state");
         assert!(
-            !state.condition_met,
+            !is_triggered(&manager, 6),
             "the PCell at -70 dBm would satisfy the inequality, but it is not a neighbour"
         );
     }
@@ -962,8 +1143,7 @@ mod tests {
 
         manager.evaluate_events();
 
-        let state = manager.event_states.get(&6).expect("A6 state");
-        assert!(!state.condition_met);
+        assert!(!is_triggered(&manager, 6));
     }
 
     fn inter_rat_config(event: MeasEventType) -> MeasConfig {
@@ -994,9 +1174,10 @@ mod tests {
 
         manager.evaluate_events();
 
-        let state = manager.event_states.get(&7).expect("B1 state");
-        assert!(state.condition_met);
-        assert_eq!(state.triggering_cell, Some(TriggeringCell::Eutra(eutra)));
+        assert_eq!(
+            manager.triggered_cells(7),
+            vec![TriggeringCell::Eutra(eutra)]
+        );
     }
 
     /// The offsets are part of the inequality: a neighbour one dB short of the
@@ -1015,7 +1196,7 @@ mod tests {
 
         manager.evaluate_events();
         assert!(
-            !manager.event_states[&7].condition_met,
+            !is_triggered(&manager, 7),
             "-101 dBm with no offsets is below the -99 dBm bar"
         );
 
@@ -1023,7 +1204,7 @@ mod tests {
         manager.set_eutra_cell_offset(eutra, 1); // Ocn
         manager.evaluate_events();
         assert!(
-            manager.event_states[&7].condition_met,
+            is_triggered(&manager, 7),
             "Ofn + Ocn = 3 dB lifts it to -98 dBm, over the bar"
         );
     }
@@ -1044,7 +1225,7 @@ mod tests {
         manager.update_eutra_measurement(eutra, -105);
         manager.add_config(config.clone());
         manager.evaluate_events();
-        assert!(!manager.event_states[&7].condition_met, "PCell is not weak");
+        assert!(!is_triggered(&manager, 7), "PCell is not weak");
 
         // Weak PCell, but no neighbour worth going to: B2-2 fails.
         let mut manager = MeasurementManager::new();
@@ -1054,7 +1235,7 @@ mod tests {
         manager.add_config(config.clone());
         manager.evaluate_events();
         assert!(
-            !manager.event_states[&7].condition_met,
+            !is_triggered(&manager, 7),
             "the inter-RAT neighbour is below threshold2"
         );
 
@@ -1065,10 +1246,67 @@ mod tests {
         manager.update_eutra_measurement(eutra, -105);
         manager.add_config(config);
         manager.evaluate_events();
-        assert!(manager.event_states[&7].condition_met);
+        assert!(is_triggered(&manager, 7));
         assert_eq!(
-            manager.event_states[&7].triggering_cell,
+            manager.triggered_cells(7).first().copied(),
             Some(TriggeringCell::Eutra(eutra))
+        );
+    }
+
+    /// §5.5.4.9's leaving condition is B2-3 *or* B2-4, so the PCell recovering
+    /// releases the event even while the inter-RAT neighbour is still strong.
+    #[test]
+    fn a_b2_event_leaves_when_the_pcell_recovers_alone() {
+        let eutra = EutraCellKey::new(1850, 7);
+        let mut config = inter_rat_config(MeasEventType::B2);
+        config.trigger_config.threshold1 = Some(-100); // PCell enters below -101
+        config.trigger_config.threshold2 = Some(-110); // neighbour enters above -109
+
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -115);
+        manager.update_eutra_measurement(eutra, -105);
+        manager.add_config(config);
+
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(7),
+            vec![TriggeringCell::Eutra(eutra)]
+        );
+
+        // B2-3: Mp - Hys > Thresh1. The neighbour has not moved.
+        manager.update_measurement(1, -98);
+        manager.evaluate_events();
+        assert!(
+            manager.triggered_cells(7).is_empty(),
+            "the PCell recovering satisfies B2-3 on its own"
+        );
+    }
+
+    /// The dead band applies to B2's PCell half too: a PCell between the
+    /// entering and leaving bars keeps the event triggered.
+    #[test]
+    fn a_b2_event_holds_while_the_pcell_is_inside_its_dead_band() {
+        let eutra = EutraCellKey::new(1850, 7);
+        let mut config = inter_rat_config(MeasEventType::B2);
+        config.trigger_config.hysteresis = 4; // Hys = 2 dB
+        config.trigger_config.threshold1 = Some(-100); // enters below -102, leaves above -98
+        config.trigger_config.threshold2 = Some(-110);
+
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -105);
+        manager.update_eutra_measurement(eutra, -105);
+        manager.add_config(config);
+
+        manager.evaluate_events();
+        assert!(is_triggered(&manager, 7));
+
+        manager.update_measurement(1, -100); // inside the band: neither B2-1 nor B2-3
+        manager.evaluate_events();
+        assert!(
+            is_triggered(&manager, 7),
+            "-100 dBm satisfies neither the entering nor the leaving half"
         );
     }
 
@@ -1103,6 +1341,361 @@ mod tests {
         assert_eq!(cells.len(), 2);
     }
 
+    /// An A4 measId, whose bar is a plain threshold, so a neighbour's level is
+    /// the only thing that moves it in or out.
+    fn a4_config(threshold_dbm: i32, hysteresis: i32) -> MeasConfig {
+        let mut config = MeasConfig {
+            meas_id: 4,
+            ..Default::default()
+        };
+        config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A4);
+        config.trigger_config.a3_offset = None;
+        config.trigger_config.threshold = Some(threshold_dbm);
+        config.trigger_config.hysteresis = hysteresis;
+        config.trigger_config.time_to_trigger = 0;
+        config.report_amount = 0; // report on every interval, not a fixed count
+        config.report_interval = 0;
+        config
+    }
+
+    /// The dead band, which is the whole point of a separate leaving inequality
+    /// (TS 38.331 §5.5.4.5): A4-1 is Mn - Hys > Thresh and A4-2 is
+    /// Mn + Hys < Thresh, so with Thresh -100 and Hys 2 dB a cell enters above
+    /// -98 dBm and does not leave until it falls below -102 dBm. Between those
+    /// it stays triggered, where an entering-only manager would toggle.
+    #[test]
+    fn a_triggered_cell_stays_triggered_inside_the_dead_band() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        manager.add_config(a4_config(-100, 4)); // Hys = 2 dB
+
+        manager.update_measurement(2, -97); // -97 - 2 > -100: enters
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "-97 dBm is over the -98 dBm entering bar"
+        );
+
+        manager.update_measurement(2, -101); // below entering, above leaving
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "-101 dBm is inside the dead band, so the cell stays in \
+             cellsTriggeredList"
+        );
+
+        manager.update_measurement(2, -103); // -103 + 2 < -100: leaves
+        manager.evaluate_events();
+        assert!(
+            manager.triggered_cells(4).is_empty(),
+            "-103 dBm satisfies A4-2, so the cell leaves"
+        );
+    }
+
+    /// A cell that never crossed the entering bar must not be triggered just
+    /// because it is inside the dead band: the band only holds cells that got in.
+    #[test]
+    fn a_cell_inside_the_dead_band_that_never_entered_stays_untriggered() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        manager.add_config(a4_config(-100, 4));
+
+        manager.update_measurement(2, -101);
+        manager.evaluate_events();
+
+        assert!(
+            manager.triggered_cells(4).is_empty(),
+            "-101 dBm satisfies neither A4-1 nor A4-2"
+        );
+    }
+
+    /// §5.5.4.1 keeps a *set* per measId: two neighbours over the bar both
+    /// belong to it, and one leaving does not release the event.
+    #[test]
+    fn two_neighbours_over_the_bar_are_both_triggered_and_one_can_drop_out() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        manager.add_config(a4_config(-100, 4));
+
+        manager.update_measurement(2, -95);
+        manager.update_measurement(3, -90);
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2), TriggeringCell::Nr(3)],
+            "both neighbours are over the -98 dBm bar"
+        );
+
+        // The stronger one collapses past the leaving bar; the weaker one holds.
+        manager.update_measurement(3, -110);
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "cell 3 left; cell 2 keeps the event triggered"
+        );
+    }
+
+    /// The report leads with every triggered cell, strongest first, rather than
+    /// with one of them (§5.5.5).
+    ///
+    /// The dead band is what makes triggered order differ from level order here:
+    /// cells 2 and 3 both entered and then sank into the band, while cell 4 —
+    /// stronger than either of them — never crossed the entering bar. A report
+    /// sorted purely by level would lead with cell 4, which the event did not
+    /// fire on.
+    #[test]
+    fn a_report_leads_with_all_triggered_cells_strongest_first() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        manager.update_measurement(2, -95);
+        manager.update_measurement(3, -95);
+        manager.add_config(a4_config(-100, 4)); // enters above -98, leaves below -102
+
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2), TriggeringCell::Nr(3)]
+        );
+        manager.take_pending_reports();
+
+        // Both sink into the dead band, cell 3 the stronger of the two; cell 4
+        // appears between them without ever entering.
+        manager.update_measurement(2, -101);
+        manager.update_measurement(3, -100);
+        manager.update_measurement(4, -99);
+        manager.evaluate_events();
+
+        let reports = manager.take_pending_reports();
+        assert_eq!(reports.len(), 1, "one A4 report");
+        assert_eq!(
+            reports[0].triggered_cells,
+            vec![TriggeringCell::Nr(3), TriggeringCell::Nr(2)],
+            "strongest triggered cell first"
+        );
+        let pcis: Vec<u32> = reports[0].neighbor_cells.iter().map(|m| m.pci).collect();
+        assert_eq!(
+            pcis,
+            vec![3, 2, 4],
+            "both triggered cells lead the neighbour list, ahead of the stronger \
+             cell 4 that the event never fired on"
+        );
+    }
+
+    /// A cell that stops being measured cannot keep an event triggered: it is no
+    /// longer an applicable cell (§5.5.4.1).
+    #[test]
+    fn an_unmeasured_cell_leaves_the_triggered_list() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        manager.update_measurement(2, -90);
+        manager.add_config(a4_config(-100, 4));
+
+        manager.evaluate_events();
+        assert_eq!(manager.triggered_cells(4), vec![TriggeringCell::Nr(2)]);
+
+        manager.remove_measurement(2);
+        manager.evaluate_events();
+        assert!(manager.triggered_cells(4).is_empty());
+    }
+
+    /// `timeToTrigger` gates both directions (§5.5.4.1): a cell over the
+    /// entering bar for less than it is not yet in the list, and a triggered
+    /// cell past the leaving bar for less than it is not yet out.
+    #[test]
+    fn time_to_trigger_gates_entering_and_leaving() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        let mut config = a4_config(-100, 4);
+        config.trigger_config.time_to_trigger = 50;
+        manager.add_config(config);
+
+        manager.update_measurement(2, -90);
+        manager.evaluate_events();
+        assert!(
+            manager.triggered_cells(4).is_empty(),
+            "the entering condition has not held for timeToTrigger yet"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "50 ms of an unbroken entering run puts the cell in"
+        );
+
+        manager.update_measurement(2, -110);
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "the leaving condition has not held for timeToTrigger yet"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        manager.evaluate_events();
+        assert!(
+            manager.triggered_cells(4).is_empty(),
+            "50 ms of an unbroken leaving run takes it out"
+        );
+    }
+
+    /// The UE re-declares its serving cell on every measurement cycle, so only a
+    /// *change* may reset the triggered state. Resetting unconditionally, as this
+    /// did, restarted `timeToTrigger` on every tick and no event could ever
+    /// accumulate one in a live run.
+    #[test]
+    fn redeclaring_the_same_serving_cell_does_not_restart_time_to_trigger() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        let mut config = a4_config(-100, 4);
+        config.trigger_config.time_to_trigger = 50;
+        manager.add_config(config);
+
+        manager.update_measurement(2, -90);
+        manager.evaluate_events(); // starts the entering run
+
+        std::thread::sleep(Duration::from_millis(60));
+        manager.set_serving_cell(Some(1)); // same cell, as the task does each cycle
+        manager.evaluate_events();
+
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "the entering run survives a no-op serving-cell declaration"
+        );
+    }
+
+    /// A real serving-cell change does invalidate every list: the inequalities
+    /// are written against the cell that just went away.
+    #[test]
+    fn a_serving_cell_change_clears_the_triggered_lists() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        manager.update_measurement(2, -90);
+        manager.add_config(a4_config(-100, 4));
+
+        manager.evaluate_events();
+        assert_eq!(manager.triggered_cells(4), vec![TriggeringCell::Nr(2)]);
+
+        manager.set_serving_cell(Some(2));
+        assert!(manager.triggered_cells(4).is_empty());
+    }
+
+    /// §5.5.4.1 requires the leaving condition to hold for *all* measurements
+    /// taken during `timeToTrigger`, so a level that recrosses the entering bar
+    /// discards the run rather than pausing it. The second run below must be
+    /// timed from scratch: if the first run's start survived, the cell would drop
+    /// on the very next evaluation, 60 ms of wall clock after it began.
+    #[test]
+    fn recrossing_the_entering_bar_restarts_the_leaving_run() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        let mut config = a4_config(-100, 4);
+        config.trigger_config.time_to_trigger = 50;
+        manager.add_config(config);
+
+        manager.update_measurement(2, -90);
+        manager.evaluate_events();
+        std::thread::sleep(Duration::from_millis(60));
+        manager.evaluate_events();
+        assert_eq!(manager.triggered_cells(4), vec![TriggeringCell::Nr(2)]);
+
+        manager.update_measurement(2, -110); // starts a leaving run
+        manager.evaluate_events();
+        std::thread::sleep(Duration::from_millis(60));
+        manager.update_measurement(2, -90); // breaks it, before it can expire
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "the cell is over the entering bar again, so it did not leave"
+        );
+
+        manager.update_measurement(2, -110); // a fresh leaving run
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(4),
+            vec![TriggeringCell::Nr(2)],
+            "the new run is timed from now, not from the abandoned one"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        manager.evaluate_events();
+        assert!(
+            manager.triggered_cells(4).is_empty(),
+            "and it does expire on its own 50 ms"
+        );
+    }
+
+    /// The PCell's own two events use the same dead band. A2-1 is
+    /// Ms + Hys < Thresh and A2-2 is Ms - Hys > Thresh, so with Thresh -90 and
+    /// Hys 1 dB the serving cell enters below -91 and leaves above -89.
+    #[test]
+    fn an_a2_event_has_a_dead_band_on_the_serving_cell() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        let mut config = MeasConfig {
+            meas_id: 2,
+            ..Default::default()
+        };
+        config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A2);
+        config.trigger_config.threshold = Some(-90);
+        config.trigger_config.time_to_trigger = 0;
+        manager.add_config(config);
+
+        manager.update_measurement(1, -95);
+        manager.evaluate_events();
+        assert_eq!(
+            manager.triggered_cells(2),
+            vec![TriggeringCell::Nr(1)],
+            "A2's applicable cell is the serving cell itself"
+        );
+
+        manager.update_measurement(1, -90); // inside the band
+        manager.evaluate_events();
+        assert!(is_triggered(&manager, 2), "-90 dBm is inside the dead band");
+
+        manager.update_measurement(1, -88); // -88 - 1 > -90: A2-2
+        manager.evaluate_events();
+        assert!(!is_triggered(&manager, 2));
+    }
+
+    /// An event written against Mp has no applicable cell before the PCell has
+    /// been measured. It used to be evaluated against `i32::MIN`, which A2
+    /// treated as "worse than any threshold" and which a leaving inequality
+    /// subtracting the hysteresis from would overflow.
+    #[test]
+    fn an_unmeasured_pcell_triggers_no_serving_cell_event() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        let mut config = MeasConfig {
+            meas_id: 2,
+            ..Default::default()
+        };
+        config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A2);
+        config.trigger_config.threshold = Some(-90);
+        config.trigger_config.time_to_trigger = 0;
+        manager.add_config(config);
+
+        manager.evaluate_events();
+
+        assert!(!is_triggered(&manager, 2));
+        assert!(manager.take_pending_reports().is_empty());
+    }
+
     /// An A5 config with no thresholds must simply not trigger. It used to
     /// substitute `i32::MIN` for the missing threshold1 and then subtract the
     /// hysteresis from it, which overflows.
@@ -1125,7 +1718,7 @@ mod tests {
 
         manager.evaluate_events();
 
-        assert!(!manager.event_states[&5].condition_met);
+        assert!(!is_triggered(&manager, 5));
     }
 
     /// Conditional reconfiguration judges a candidate by its own cell
@@ -1184,7 +1777,6 @@ mod tests {
         // Evaluate - should detect A2 event
         manager.evaluate_events();
 
-        let state = manager.event_states.get(&2).unwrap();
-        assert!(state.condition_met);
+        assert!(is_triggered(&manager, 2));
     }
 }
