@@ -221,6 +221,35 @@ rlc_am_psis: []
 # scenario that expects the network to order every handover.
 conditional_handover: false
 
+# Inter-RAT (E-UTRA) neighbour cells the UE measures: the source for measurement
+# events B1 and B2 (TS 38.331 5.5.4.8, 5.5.4.9). Empty (the default) means no
+# E-UTRA cell is measured and B1/B2 can never enter.
+#
+# THIS IS A STATIC STAND-IN, NOT A MODELLED RADIO. RLS carries NR cells only --
+# an RlsHeartbeatAck reports one dBm per NR cell -- so nothing in the simulator
+# can produce a measured E-UTRA level. An entry says "an LTE cell of this
+# strength is there": the level never changes with distance, fading or the
+# channel model.
+#
+# cell_individual_offset_db is Ocn and frequency_offset_db is Ofn
+# (eutra-Q-OffsetRange); both are part of the B1/B2 inequalities. Ofn is per
+# carrier, so keep it the same across cells sharing an EARFCN -- the last entry
+# for that EARFCN wins.
+#
+# A non-empty list also installs a default B1 measId using
+# eutra_b1_threshold_dbm, because a measurement source nothing evaluates is inert.
+# eutra_neighbours:
+#   - earfcn: 1850
+#     pci: 42
+#     rsrp_dbm: -95
+#     cell_individual_offset_db: 0
+#     frequency_offset_db: 0
+
+# b1-ThresholdEUTRA for that default B1 measId, in dBm. Only consulted when
+# eutra_neighbours is non-empty. -110 dBm is around the edge of a usable LTE
+# level, so a neighbour worth going to crosses it and a marginal one does not.
+eutra_b1_threshold_dbm: -110
+
 # Rel-20 6G AI-native network function features
 # All disabled by default; enable for 6G research deployments
 she_enabled: false              # SHE Client - edge inference offloading (Rel-20)

@@ -468,9 +468,11 @@ impl MeasurementManager {
 
     /// Record a measurement for an inter-RAT (E-UTRA) cell (events B1/B2).
     ///
-    /// The simulator has no E-UTRA radio: RLS carries NR cells only, so nothing
-    /// feeds this in a live run (issue #113). The trigger logic is here so that
-    /// an inter-RAT measurement source, once there is one, needs none.
+    /// The simulator has no E-UTRA radio — RLS carries NR cells only — so the
+    /// source is `UeConfig::eutra_neighbours`, a configured stand-in fed in by
+    /// `RrcTask::update_eutra_measurements` on every measurement cycle. The level
+    /// is therefore whatever the configuration says and never changes with
+    /// distance, fading or the channel model.
     pub fn update_eutra_measurement(&mut self, cell: EutraCellKey, rsrp: i32) {
         let result = self
             .eutra_measurements
@@ -958,10 +960,16 @@ impl MeasurementManager {
         neighbors.truncate(max_cells as usize);
 
         // Inter-RAT results, triggered cells first and then the rest by level.
-        // The uplink MeasurementReport does not carry these yet: the UE's report
-        // is a hand-rolled byte format (issue #107) and measResultListEUTRA needs
-        // the real UPER encoder, so a B1/B2 report currently reaches the network
-        // as its NR part only (issue #113).
+        //
+        // These do not reach the network. Two things stop them, and the second is
+        // the hard one: the UE's uplink report is a hand-rolled byte format with
+        // no inter-RAT section (issue #107), AND `measResultListEUTRA` is an
+        // extension arm of the `measResultNeighCells` CHOICE, which asn1-codecs
+        // 0.7 refuses to encode at all ("Encode of extended choice not yet
+        // implemented") -- see
+        // `nextgsim-rrc` `the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec`.
+        // So a B1/B2 report is UE-observable only, and #107 alone will not change
+        // that.
         let mut eutra_neighbors: Vec<_> = self.eutra_measurements.values().cloned().collect();
         eutra_neighbors.sort_by(|a, b| b.rsrp.unwrap_or(i32::MIN).cmp(&a.rsrp.unwrap_or(i32::MIN)));
         let mut eutra_hoisted = Vec::with_capacity(eutra_neighbors.len());
@@ -1311,7 +1319,8 @@ mod tests {
     }
 
     /// A B1 report carries the inter-RAT neighbour it triggered on. The uplink
-    /// PDU cannot yet carry it (issue #113); the report the manager produces can.
+    /// PDU cannot carry it (the CHOICE extension arm has no encoder); the report
+    /// the manager produces can.
     #[test]
     fn a_b1_report_carries_the_inter_rat_neighbour() {
         let eutra = EutraCellKey::new(1850, 42);

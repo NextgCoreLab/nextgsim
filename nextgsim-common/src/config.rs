@@ -253,6 +253,12 @@ pub enum SctpBackendKind {
     Kernel,
 }
 
+/// `b1-ThresholdEUTRA` default for the UE's default B1 measId, in dBm.
+/// Around the edge of a usable LTE level.
+fn default_eutra_b1_threshold_dbm() -> i32 {
+    -110
+}
+
 fn default_si_broadcast_period_ms() -> u64 {
     80
 }
@@ -578,6 +584,35 @@ pub struct SnpnConfig {
     /// Whether onboarding is allowed for non-subscribed UEs
     #[serde(default)]
     pub onboarding_enabled: bool,
+}
+
+/// One configured inter-RAT (E-UTRA) neighbour cell, the measurement source for
+/// events B1 and B2 (TS 38.331 §5.5.4.8, §5.5.4.9).
+///
+/// This is a **static stand-in, not a modelled radio.** RLS carries NR cells
+/// exclusively — an `RlsHeartbeatAck` reports one dBm per NR cell — so nothing in
+/// the simulator can produce a measured E-UTRA level. Configuring one says "an
+/// LTE cell of this strength is there", which is enough to exercise the inter-RAT
+/// trigger logic and honest about not being a propagation result: the level never
+/// changes with distance, fading or the channel model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EutraNeighbourConfig {
+    /// E-UTRA carrier frequency (EARFCN). `measObjectEUTRA` is per carrier, and
+    /// the physical cell identity is unique within one.
+    pub earfcn: u32,
+    /// E-UTRA physical cell identity (0-503)
+    pub pci: u16,
+    /// The level the UE reports for this cell, in dBm
+    pub rsrp_dbm: i32,
+    /// Ocn, the cell specific offset (`cellIndividualOffset`), in dB. Part of
+    /// the B1/B2 inequalities.
+    #[serde(default)]
+    pub cell_individual_offset_db: i32,
+    /// Ofn, the offset of the carrier frequency (`eutra-Q-OffsetRange`), in dB.
+    /// Applies to every configured cell on the same EARFCN; the last entry for a
+    /// given EARFCN wins, so keep it consistent across cells of one carrier.
+    #[serde(default)]
+    pub frequency_offset_db: i32,
 }
 
 /// UE Route Selection Policy rule (Rel-17, TS 24.526).
@@ -1229,6 +1264,28 @@ pub struct UeConfig {
     /// selectable.
     #[serde(default)]
     pub require_broadcast_sib1: bool,
+    /// Inter-RAT (E-UTRA) neighbour cells the UE measures, the source for
+    /// measurement events B1 and B2 (TS 38.331 §5.5.4.8, §5.5.4.9).
+    ///
+    /// **Empty (the default) means the UE measures no E-UTRA cell**, so a B1/B2
+    /// event can never enter — the pre-#113 behaviour. See
+    /// [`EutraNeighbourConfig`] for why these are configured rather than
+    /// measured.
+    ///
+    /// A non-empty list also installs a default B1 `measId` (see
+    /// `eutra_b1_threshold_dbm`), because a measurement source with nothing
+    /// evaluating it is inert.
+    #[serde(default)]
+    pub eutra_neighbours: Vec<EutraNeighbourConfig>,
+    /// `b1-ThresholdEUTRA` for the default B1 `measId`, in dBm: an E-UTRA
+    /// neighbour whose Mn + Ofn + Ocn beats this (plus the hysteresis) triggers a
+    /// report.
+    ///
+    /// Only consulted when `eutra_neighbours` is non-empty. The default of
+    /// -110 dBm is around the edge of a usable LTE level, so a configured
+    /// neighbour worth going to crosses it and a marginal one does not.
+    #[serde(default = "default_eutra_b1_threshold_dbm")]
+    pub eutra_b1_threshold_dbm: i32,
     /// Keep the network-assigned UE radio capability ID (RACS, Rel-16
     /// TS 23.003 §29 / TS 24.501 §9.11.3.68) that a CONFIGURATION UPDATE
     /// COMMAND assigns.
@@ -1347,6 +1404,8 @@ impl Default for UeConfig {
             ursp_evaluation: false,
             racs_store_assigned_id: false,
             require_broadcast_sib1: false,
+            eutra_neighbours: Vec::new(),
+            eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
@@ -1819,6 +1878,8 @@ configured_nssai:
             ursp_evaluation: false,
             racs_store_assigned_id: false,
             require_broadcast_sib1: false,
+            eutra_neighbours: Vec::new(),
+            eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
@@ -2103,6 +2164,8 @@ configured_nssai:
             ursp_evaluation: false,
             racs_store_assigned_id: false,
             require_broadcast_sib1: false,
+            eutra_neighbours: Vec::new(),
+            eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
