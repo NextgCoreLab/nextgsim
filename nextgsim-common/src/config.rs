@@ -101,6 +101,17 @@ pub struct GnbConfig {
     /// declared down (TS 23.007 §20.3.1 N3-REQUESTS). Default 3.
     #[serde(default = "default_gtpu_echo_max_misses")]
     pub gtpu_echo_max_misses: u32,
+    /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
+    /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
+    /// reporting, selective retransmission and the ARQ timers, at the cost of
+    /// feedback traffic and head-of-line blocking (AM delivers in order).
+    ///
+    /// Empty (the default) leaves every bearer on UM SN12, byte-for-byte as
+    /// before. **Both ends must list the same PSIs**: this simulator does not
+    /// signal the RLC mode over RRC, so a one-sided setting has the peers
+    /// parsing each other's PDUs with the wrong header shape.
+    #[serde(default)]
+    pub rlc_am_psis: Vec<u8>,
     /// File holding the GTP-U restart counter across restarts (TS 23.007).
     ///
     /// `None` (the default) means the Recovery IE advertises a fixed 0: honest,
@@ -260,6 +271,7 @@ impl Default for GnbConfig {
             gtpu_echo_period_secs: 0,
             gtpu_echo_max_misses: default_gtpu_echo_max_misses(),
             gtpu_restart_counter_path: None,
+            rlc_am_psis: Vec::new(),
             pqc_config: PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,
@@ -1146,6 +1158,17 @@ pub struct UeConfig {
     /// would ship without ever being compiled by the gate meant to cover it.
     #[serde(default)]
     pub ursp_evaluation: bool,
+    /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
+    /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
+    /// reporting, selective retransmission and the ARQ timers, at the cost of
+    /// feedback traffic and head-of-line blocking (AM delivers in order).
+    ///
+    /// Empty (the default) leaves every bearer on UM SN12, byte-for-byte as
+    /// before. **Both ends must list the same PSIs**: this simulator does not
+    /// signal the RLC mode over RRC, so a one-sided setting has the peers
+    /// parsing each other's PDUs with the wrong header shape.
+    #[serde(default)]
+    pub rlc_am_psis: Vec<u8>,
     /// Keep the network-assigned UE radio capability ID (RACS, Rel-16
     /// TS 23.003 §29 / TS 24.501 §9.11.3.68) that a CONFIGURATION UPDATE
     /// COMMAND assigns.
@@ -1263,6 +1286,7 @@ impl Default for UeConfig {
             tun_name: None,
             ursp_evaluation: false,
             racs_store_assigned_id: false,
+            rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
@@ -1732,6 +1756,7 @@ configured_nssai:
             tun_name: Some("tun0".to_string()),
             ursp_evaluation: false,
             racs_store_assigned_id: false,
+            rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
@@ -2013,6 +2038,7 @@ configured_nssai:
             tun_name: None,
             ursp_evaluation: false,
             racs_store_assigned_id: false,
+            rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::new(
                 KemAlgorithm::Kyber1024,

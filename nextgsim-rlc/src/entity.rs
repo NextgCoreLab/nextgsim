@@ -3,13 +3,13 @@
 //! One `RlcEntity` is created per RLC bearer (per logical channel).
 //! The same entity handles both the transmit and receive sides.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, trace, warn};
 
 use crate::error::RlcError;
-use crate::pdu::{RlcAmPdu, RlcStatusPdu, RlcUmPdu, SegmentationInfo};
+use crate::pdu::{RlcAmPdu, RlcStatusNack, RlcStatusPdu, RlcUmPdu, SegmentationInfo};
 use crate::{RlcMode, SnSize};
 
 /// Default `t-Reassembly` (TS 38.331 `t-Reassembly`, `ms50`).
@@ -19,6 +19,19 @@ use crate::{RlcMode, SnSize};
 /// well inside the enumerated range and far above the in-process RLS latency, so
 /// a lossless path never sees it fire.
 pub const DEFAULT_T_REASSEMBLY: Duration = Duration::from_millis(50);
+
+/// Default `t-PollRetransmit` (TS 38.331 `t-PollRetransmit`, `ms45`).
+///
+/// The AM sender restarts it whenever it sends a poll; expiry means the STATUS
+/// report never came back, so the poll is repeated. Without it a lost STATUS
+/// report stalls the bearer permanently, because nothing else asks again.
+pub const DEFAULT_T_POLL_RETRANSMIT: Duration = Duration::from_millis(45);
+
+/// Default `t-StatusProhibit` (TS 38.331 `t-StatusProhibit`, `ms10`).
+///
+/// Bounds how often the receiver may answer with a STATUS report, so a bearer
+/// losing many PDUs does not answer every poll with its own control PDU.
+pub const DEFAULT_T_STATUS_PROHIBIT: Duration = Duration::from_millis(10);
 
 // ── Reassembly bookkeeping ───────────────────────────────────────────────────
 
@@ -119,23 +132,40 @@ pub struct RlcEntity {
     /// How many bytes of `tx_current_sdu` have already been placed in PDUs
     tx_current_offset: usize,
 
-    // ── AM retransmit queue ───────────────────────────────────────────────────
+    // ── AM ARQ state (TS 38.322 §7.1) ────────────────────────────────────────
     /// PDUs that have been sent but not yet acknowledged, keyed by SN
     am_unacked: BTreeMap<u32, Vec<u8>>,
-    /// SNs pending retransmission (added on NACK / timer expiry)
+    /// SNs pending retransmission (added on NACK or `t-PollRetransmit` expiry)
     am_retx_queue: VecDeque<u32>,
-    /// Next SN the receiver expects (updated from STATUS PDUs)
-    pub rx_next: u32,
-    /// Poll-retransmit timer duration (AM only)
-    pub poll_retransmit_timer: Option<Duration>,
+    /// `TX_Next_Ack`: the lowest SN still awaiting acknowledgement
+    tx_next_ack: u32,
+    /// `RX_Next`: the next SN awaited in sequence on the AM receive side
+    am_rx_next: u32,
+    /// `RX_Next_Highest`: one past the highest SN received
+    am_rx_next_highest: u32,
+    /// `RX_Highest_Status`: the SN up to which a STATUS report reports
+    am_rx_highest_status: u32,
+    /// SNs whose SDU is fully received, above `RX_Next` (everything below it is
+    /// received by definition, so those are pruned)
+    am_received: BTreeSet<u32>,
+    /// `RX_Next_Status_Trigger`: the SN `t-Reassembly` is waiting past
+    am_rx_next_status_trigger: u32,
+    /// Whether a STATUS report has been triggered and not yet built
+    am_status_triggered: bool,
+    /// `t-PollRetransmit` duration (TS 38.331); `None` disables it
+    t_poll_retransmit: Option<Duration>,
+    /// Deadline of a running `t-PollRetransmit`
+    t_poll_retransmit_deadline: Option<Instant>,
+    /// `t-StatusProhibit` duration (TS 38.331); `None` reports on every trigger
+    t_status_prohibit: Option<Duration>,
+    /// Deadline of a running `t-StatusProhibit`
+    t_status_prohibit_deadline: Option<Instant>,
 
     // ── RX side ───────────────────────────────────────────────────────────────
     /// Reassembly state per SN: `BTreeMap<sn, Reassembly>`
     rx_reassembly: BTreeMap<u32, Reassembly>,
     /// Fully reassembled SDUs ready for PDCP
     rx_ready: VecDeque<Vec<u8>>,
-    /// Highest in-sequence SN delivered to PDCP (for window management)
-    pub rx_delivered_next: u32,
 
     // ── UM receive state variables (TS 38.322 §7.1) ──────────────────────────
     /// `RX_Next_Reassembly`: the SN of the earliest SDU still awaiting
@@ -181,11 +211,19 @@ impl RlcEntity {
             tx_current_offset: 0,
             am_unacked: BTreeMap::new(),
             am_retx_queue: VecDeque::new(),
-            rx_next: 0,
-            poll_retransmit_timer: None,
+            tx_next_ack: 0,
+            am_rx_next: 0,
+            am_rx_next_highest: 0,
+            am_rx_highest_status: 0,
+            am_received: BTreeSet::new(),
+            am_rx_next_status_trigger: 0,
+            am_status_triggered: false,
+            t_poll_retransmit: Some(DEFAULT_T_POLL_RETRANSMIT),
+            t_poll_retransmit_deadline: None,
+            t_status_prohibit: Some(DEFAULT_T_STATUS_PROHIBIT),
+            t_status_prohibit_deadline: None,
             rx_reassembly: BTreeMap::new(),
             rx_ready: VecDeque::new(),
-            rx_delivered_next: 0,
             rx_next_reassembly: 0,
             rx_next_highest: 0,
             rx_timer_trigger: 0,
@@ -546,6 +584,21 @@ impl RlcEntity {
         sn
     }
 
+    /// Drives whichever timers this entity's mode has, returning `true` when one
+    /// expired: `t-Reassembly` for UM, `t-PollRetransmit` and `t-Reassembly` for
+    /// AM, nothing for TM.
+    ///
+    /// The single entry point exists so a caller ticking a map of entities does
+    /// not have to know each one's mode — the reason the AM timers went unwired
+    /// before was that no caller had a reason to look.
+    pub fn poll_timers(&mut self, now: Instant) -> bool {
+        match self.mode {
+            RlcMode::UnacknowledgedMode => self.poll_t_reassembly(now),
+            RlcMode::AcknowledgedMode => self.poll_am_timers(now),
+            RlcMode::TransparentMode => false,
+        }
+    }
+
     /// Configure `t-Reassembly` (TS 38.331 `t-Reassembly`); `None` disables it,
     /// which leaves a partially received SDU buffered indefinitely.
     pub fn set_t_reassembly(&mut self, duration: Option<Duration>) {
@@ -585,6 +638,11 @@ impl RlcEntity {
     /// below it is discarded, and the timer restarts if reassembly is still
     /// outstanding.
     pub fn poll_t_reassembly(&mut self, now: Instant) -> bool {
+        if self.mode != RlcMode::UnacknowledgedMode {
+            // AM shares the timer field but not the state variables it advances;
+            // its expiry actions are in `poll_am_timers`.
+            return false;
+        }
         let Some(deadline) = self.t_reassembly_deadline else {
             return false;
         };
@@ -637,19 +695,32 @@ impl RlcEntity {
     }
 
     fn build_am_pdu(&mut self, max_size: usize) -> Option<Vec<u8>> {
-        // Prioritise retransmissions
-        if let Some(retx_sn) = self.am_retx_queue.front().copied() {
-            if let Some(orig) = self.am_unacked.get(&retx_sn) {
-                if orig.len() <= max_size {
-                    let pdu = orig.clone();
-                    self.am_retx_queue.pop_front();
-                    debug!(sn = retx_sn, "RLC AM retransmitting PDU");
-                    return Some(pdu);
-                }
-            } else {
+        // Prioritise retransmissions (TS 38.322 §5.2.3.1.1)
+        while let Some(retx_sn) = self.am_retx_queue.front().copied() {
+            let Some(orig) = self.am_unacked.get(&retx_sn) else {
                 // SN no longer unacked (got ACKed between enqueue and now)
                 self.am_retx_queue.pop_front();
+                continue;
+            };
+            if orig.len() > max_size {
+                // Re-segmentation of an oversized retransmission (§5.2.3.1.1) is
+                // not implemented; the PDU stays queued rather than being
+                // dropped, so a later, larger grant still carries it.
+                warn!(
+                    sn = retx_sn,
+                    len = orig.len(),
+                    max_size,
+                    "RLC AM: retransmission does not fit the grant, keeping it queued"
+                );
+                break;
             }
+            let pdu = orig.clone();
+            self.am_retx_queue.pop_front();
+            debug!(sn = retx_sn, "RLC AM retransmitting PDU");
+            // A retransmission carries a poll (§5.3.3.2), so the sender learns
+            // whether this copy arrived.
+            self.am_start_poll_retransmit();
+            return Some(pdu);
         }
 
         // New data
@@ -714,8 +785,22 @@ impl RlcEntity {
             self.tx_current_offset = 0;
         }
 
+        // TS 38.322 §5.3.3.2: sending a poll starts (restarts) t-PollRetransmit.
+        // Before this the timer field existed and was never read, so a lost
+        // STATUS report stalled the bearer with no recovery.
+        if p {
+            self.am_start_poll_retransmit();
+        }
+
         debug!(si = ?si, sn, payload_len, poll = p, "RLC AM build_pdu");
         Some(encoded)
+    }
+
+    /// Starts or restarts `t-PollRetransmit` (TS 38.322 §5.3.3.2).
+    fn am_start_poll_retransmit(&mut self) {
+        if let Some(duration) = self.t_poll_retransmit {
+            self.t_poll_retransmit_deadline = Some(Instant::now() + duration);
+        }
     }
 
     fn receive_am_pdu(&mut self, data: &[u8]) -> Result<(), RlcError> {
@@ -739,60 +824,359 @@ impl RlcEntity {
         };
 
         let sn = pdu.sn;
-        trace!(si = ?pdu.si, sn, poll = pdu.p, "RLC AM receive data PDU");
+        let polled = pdu.p;
+        trace!(si = ?pdu.si, sn, poll = polled, "RLC AM receive data PDU");
 
-        if pdu.si == SegmentationInfo::FullSdu {
+        let complete = if pdu.si == SegmentationInfo::FullSdu {
             self.rx_ready.push_back(pdu.data);
-            self.advance_rx_next(sn);
-            return Ok(());
-        }
+            self.rx_reassembly.remove(&sn);
+            true
+        } else {
+            let so = pdu.so.unwrap_or(0);
+            let is_last = pdu.si.is_last();
+            let seg = RlcSegment {
+                offset: so,
+                is_last,
+                data: pdu.data,
+            };
 
-        let so = pdu.so.unwrap_or(0);
-        let is_last = pdu.si.is_last();
-        let seg = RlcSegment {
-            offset: so,
-            is_last,
-            data: pdu.data,
+            let entry = self.rx_reassembly.entry(sn).or_insert_with(Reassembly::new);
+            if let Err(mut e) = entry.insert(seg) {
+                if let RlcError::DuplicateSegment { sn: ref mut s, .. } = e {
+                    *s = sn;
+                }
+                // A duplicate is not a protocol failure on the AM path: the peer
+                // retransmitted something already held. The STATUS trigger still
+                // has to be honoured, or a poll on a duplicate goes unanswered
+                // and the sender re-polls forever.
+                if polled {
+                    self.am_status_triggered = true;
+                }
+                return Err(e);
+            }
+
+            match entry.try_reassemble() {
+                Some(sdu) => {
+                    self.rx_reassembly.remove(&sn);
+                    self.rx_ready.push_back(sdu);
+                    true
+                }
+                None => false,
+            }
         };
 
-        let entry = self.rx_reassembly.entry(sn).or_insert_with(Reassembly::new);
-        if let Err(mut e) = entry.insert(seg) {
-            if let RlcError::DuplicateSegment { sn: ref mut s, .. } = e {
-                *s = sn;
-            }
-            return Err(e);
+        let modulus = self.sn_size.modulus();
+        // TS 38.322 §5.2.3.2.3: RX_Next_Highest is one past the highest SN
+        // received.
+        if self.am_sn_distance(self.am_rx_next_highest, sn) < self.sn_size.am_window_size() {
+            self.am_rx_next_highest = (sn + 1) % modulus;
         }
 
-        if let Some(sdu) = entry.try_reassemble() {
-            self.rx_reassembly.remove(&sn);
-            self.rx_ready.push_back(sdu);
-            self.advance_rx_next(sn);
+        if complete {
+            // §5.2.3.2.3 delivers each SDU AS IT COMPLETES — AM does not reorder
+            // in RLC (that is PDCP's t-Reordering, TS 38.323 §5.2.2). The state
+            // variables below are what makes the STATUS report right, not a
+            // delivery order.
+            self.am_received.insert(sn);
+            if sn == self.am_rx_highest_status % modulus {
+                self.am_rx_highest_status = self.am_first_not_received_after(sn + 1);
+            }
+            if sn == self.am_rx_next % modulus {
+                self.am_rx_next = self.am_first_not_received_after(sn + 1);
+                // Everything below RX_Next is received by definition, so the
+                // set only has to remember what arrived out of order above it.
+                let next = self.am_rx_next;
+                let window = self.sn_size.am_window_size();
+                let modulus = self.sn_size.modulus();
+                self.am_received
+                    .retain(|held| (held + modulus - next % modulus) % modulus < window);
+            }
         }
+
+        // §5.3.4: a poll triggers a STATUS report. The spec delays it until the
+        // polled SN is outside the receiving window (to let HARQ reordering
+        // finish); there is no HARQ here, so it is honoured immediately.
+        if polled {
+            self.am_status_triggered = true;
+        }
+        self.am_update_reassembly_timer();
         Ok(())
+    }
+
+    /// The first SN at or after `from` whose SDU is not fully received
+    /// (TS 38.322 §5.2.3.2.3 / §5.2.3.2.4), bounded by `RX_Next_Highest` because
+    /// nothing beyond it has arrived at all.
+    fn am_first_not_received_after(&self, from: u32) -> u32 {
+        let modulus = self.sn_size.modulus();
+        let mut sn = from % modulus;
+        while sn != self.am_rx_next_highest % modulus {
+            if !self.am_received.contains(&sn) {
+                return sn;
+            }
+            sn = (sn + 1) % modulus;
+        }
+        sn
+    }
+
+    /// Distance from `base` forward to `sn`, modulo the AM SN space.
+    fn am_sn_distance(&self, base: u32, sn: u32) -> u32 {
+        let modulus = self.sn_size.modulus();
+        (sn + modulus - base % modulus) % modulus
+    }
+
+    /// Starts or stops the AM `t-Reassembly` (TS 38.322 §5.2.3.2.3).
+    ///
+    /// It runs while an SDU at or above `RX_Next` is still missing: either more
+    /// than one SN separates `RX_Next` from `RX_Next_Highest`, or the SDU at
+    /// `RX_Next` is itself partly received.
+    fn am_update_reassembly_timer(&mut self) {
+        let modulus = self.sn_size.modulus();
+        if self.t_reassembly_deadline.is_some() {
+            // Stop when what the timer was waiting past has been reached.
+            let trigger_reached = self.am_rx_next_status_trigger % modulus
+                == self.am_rx_next % modulus
+                || (self.am_sn_distance(self.am_rx_next, self.am_rx_next_status_trigger) == 1
+                    && !self
+                        .rx_reassembly
+                        .contains_key(&(self.am_rx_next % modulus)));
+            if trigger_reached {
+                self.t_reassembly_deadline = None;
+            }
+        }
+        if self.t_reassembly_deadline.is_none() && self.am_reassembly_outstanding() {
+            if let Some(duration) = self.t_reassembly {
+                self.t_reassembly_deadline = Some(Instant::now() + duration);
+                self.am_rx_next_status_trigger = self.am_rx_next_highest;
+            }
+        }
+    }
+
+    /// Whether an SDU at or above `RX_Next` is still missing bytes
+    /// (TS 38.322 §5.2.3.2.3, the two `start t-Reassembly` conditions).
+    fn am_reassembly_outstanding(&self) -> bool {
+        let modulus = self.sn_size.modulus();
+        let gap = self.am_sn_distance(self.am_rx_next, self.am_rx_next_highest);
+        if gap > 1 {
+            return true;
+        }
+        gap == 1
+            && self
+                .rx_reassembly
+                .contains_key(&(self.am_rx_next % modulus))
+    }
+
+    /// Builds a STATUS PDU when one is due (TS 38.322 §5.3.4), or `None`.
+    ///
+    /// Returns `None` when no report is triggered or `t-StatusProhibit` is still
+    /// running — the prohibit timer is what stops a lossy bearer from answering
+    /// every poll with its own PDU. Submitting a report starts the timer.
+    pub fn build_status_pdu(&mut self) -> Option<Vec<u8>> {
+        if self.mode != RlcMode::AcknowledgedMode || !self.am_status_triggered {
+            return None;
+        }
+        let now = Instant::now();
+        if let Some(deadline) = self.t_status_prohibit_deadline {
+            if now < deadline {
+                return None;
+            }
+            self.t_status_prohibit_deadline = None;
+        }
+
+        let modulus = self.sn_size.modulus();
+        let mut nacks = Vec::new();
+        let mut sn = self.am_rx_next % modulus;
+        while sn != self.am_rx_highest_status % modulus {
+            if !self.am_received.contains(&sn) {
+                nacks.push(RlcStatusNack::sdu(sn));
+            }
+            sn = (sn + 1) % modulus;
+        }
+
+        // §6.2.3.10: ACK_SN is the next SN not received and not reported as
+        // missing, i.e. the top of the reported range.
+        let status = RlcStatusPdu::with_nacks(self.am_rx_highest_status % modulus, nacks);
+        let encoded = match self.sn_size {
+            SnSize::Sn12 => status.encode_sn12(),
+            SnSize::Sn18 => status.encode_sn18(),
+            SnSize::Sn6 => unreachable!("6-bit SN is UM only"),
+        };
+        debug!(
+            ack_sn = status.ack_sn,
+            nacks = status.nacks.len(),
+            "RLC AM: sending STATUS report"
+        );
+
+        self.am_status_triggered = false;
+        if let Some(duration) = self.t_status_prohibit {
+            self.t_status_prohibit_deadline = Some(now + duration);
+        }
+        Some(encoded)
+    }
+
+    /// Whether a STATUS report is pending (triggered and not yet built).
+    pub fn status_report_pending(&self) -> bool {
+        self.am_status_triggered
     }
 
     fn handle_status_pdu(&mut self, data: &[u8]) -> Result<(), RlcError> {
-        let status = RlcStatusPdu::decode_sn12(data)?;
+        let status = match self.sn_size {
+            SnSize::Sn12 => RlcStatusPdu::decode_sn12(data)?,
+            SnSize::Sn18 => RlcStatusPdu::decode_sn18(data)?,
+            // A 6-bit SN entity is UM, which has no STATUS PDU; reaching here
+            // means an entity was built with an illegal mode/SN pair, which
+            // `RlcEntity::new` rejects.
+            SnSize::Sn6 => unreachable!("6-bit SN is UM only"),
+        };
         let ack_sn = status.ack_sn;
-        debug!(ack_sn, "RLC AM received STATUS PDU");
+        debug!(
+            ack_sn,
+            nacks = status.nacks.len(),
+            "RLC AM received STATUS PDU"
+        );
 
-        // Remove all unacked PDUs with SN < ack_sn (they have been received)
-        let sn_mod = self.sn_size.modulus();
-        self.am_unacked
-            .retain(|&sn, _| (sn % sn_mod) >= (ack_sn % sn_mod));
-        self.rx_next = ack_sn;
+        // §6.2.3.10: everything below ACK_SN is acknowledged EXCEPT the NACKed
+        // SNs. Clearing them all would drop exactly the PDUs that need resending.
+        let nacked: Vec<u32> = status
+            .nacks
+            .iter()
+            .flat_map(|nack| {
+                let run = u32::from(nack.nack_range.unwrap_or(0)).max(1);
+                (0..run).map(move |offset| nack.nack_sn + offset)
+            })
+            .collect();
+        let modulus = self.sn_size.modulus();
+        let acked: Vec<u32> = self
+            .am_unacked
+            .keys()
+            .copied()
+            .filter(|sn| {
+                self.am_sn_distance(self.tx_next_ack, *sn)
+                    < self.am_sn_distance(self.tx_next_ack, ack_sn)
+                    && !nacked.contains(&(sn % modulus))
+            })
+            .collect();
+        for sn in acked {
+            self.am_unacked.remove(&sn);
+            self.am_retx_queue.retain(|queued| *queued != sn);
+        }
+
+        // §5.3.2: a negative acknowledgement schedules retransmission. Nothing
+        // else does: before this, `request_retransmit` had to be called by hand,
+        // so a running AM bearer never retransmitted at all.
+        for sn in nacked {
+            let sn = sn % modulus;
+            if self.am_unacked.contains_key(&sn) && !self.am_retx_queue.contains(&sn) {
+                debug!(sn, "RLC AM: NACK received, scheduling retransmission");
+                self.am_retx_queue.push_back(sn);
+            }
+        }
+
+        // TX_Next_Ack is the lowest SN still awaiting acknowledgement.
+        self.tx_next_ack = self
+            .am_unacked
+            .keys()
+            .copied()
+            .min_by_key(|sn| self.am_sn_distance(self.tx_next_ack, *sn))
+            .unwrap_or(ack_sn % modulus);
+
+        // A STATUS report answered the poll, so the poll retransmit timer stops.
+        self.t_poll_retransmit_deadline = None;
         Ok(())
     }
 
-    /// Advance `rx_delivered_next` past `sn` if appropriate (simplified).
-    fn advance_rx_next(&mut self, sn: u32) {
-        let modulus = self.sn_size.modulus();
-        if sn % modulus == self.rx_delivered_next % modulus {
-            self.rx_delivered_next = (self.rx_delivered_next + 1) % modulus;
+    /// Drives the AM timers (`t-PollRetransmit`, `t-Reassembly`). Call
+    /// periodically with the current time; returns `true` when a timer expired.
+    ///
+    /// `t-PollRetransmit` expiry re-offers an unacknowledged PDU with a poll
+    /// (TS 38.322 §5.3.3.4) — the recovery path when the STATUS report itself is
+    /// lost. `t-Reassembly` expiry advances `RX_Highest_Status` over the missing
+    /// SDU and triggers a STATUS report (§5.2.3.2.4, §5.3.4).
+    pub fn poll_am_timers(&mut self, now: Instant) -> bool {
+        if self.mode != RlcMode::AcknowledgedMode {
+            return false;
+        }
+        let mut expired = false;
+
+        if let Some(deadline) = self.t_poll_retransmit_deadline {
+            if now >= deadline {
+                self.t_poll_retransmit_deadline = None;
+                expired = true;
+                // §5.3.3.4: consider the highest-SN unacknowledged SDU for
+                // retransmission so the poll is repeated.
+                if let Some(&sn) = self.am_unacked.keys().next_back() {
+                    if !self.am_retx_queue.contains(&sn) {
+                        debug!(sn, "RLC AM: t-PollRetransmit expired, re-offering PDU");
+                        self.am_retx_queue.push_back(sn);
+                    }
+                    if let Some(duration) = self.t_poll_retransmit {
+                        self.t_poll_retransmit_deadline = Some(now + duration);
+                    }
+                }
+            }
+        }
+
+        if let Some(deadline) = self.t_reassembly_deadline {
+            if now >= deadline {
+                self.t_reassembly_deadline = None;
+                expired = true;
+                // §5.2.3.2.4: RX_Highest_Status moves to the first SDU at or
+                // after RX_Next_Status_Trigger that is not fully received, so the
+                // report that follows names every gap below it. §5.3.4 then
+                // triggers that report -- in this order, per its NOTE 2.
+                self.am_rx_highest_status =
+                    self.am_first_not_received_after(self.am_rx_next_status_trigger);
+                self.am_status_triggered = true;
+                debug!(
+                    rx_highest_status = self.am_rx_highest_status,
+                    "RLC AM: t-Reassembly expired, STATUS report triggered"
+                );
+                self.am_update_reassembly_timer();
+            }
+        }
+
+        expired
+    }
+
+    /// `RX_Next` (TS 38.322 §7.1): the SN of the next AM SDU awaited in
+    /// sequence.
+    pub fn am_rx_next(&self) -> u32 {
+        self.am_rx_next
+    }
+
+    /// `TX_Next_Ack` (TS 38.322 §7.1): the lowest SN still awaiting
+    /// acknowledgement.
+    pub fn tx_next_ack(&self) -> u32 {
+        self.tx_next_ack
+    }
+
+    /// Number of AM PDUs sent and not yet acknowledged.
+    pub fn unacked_len(&self) -> usize {
+        self.am_unacked.len()
+    }
+
+    /// Configure `t-PollRetransmit` (TS 38.331 `t-PollRetransmit`); `None`
+    /// disables it, leaving a lost STATUS report unrecovered.
+    pub fn set_t_poll_retransmit(&mut self, duration: Option<Duration>) {
+        self.t_poll_retransmit = duration;
+        if duration.is_none() {
+            self.t_poll_retransmit_deadline = None;
         }
     }
 
-    /// Request retransmission of a specific SN (e.g. on NACK from STATUS PDU).
+    /// Configure `t-StatusProhibit` (TS 38.331 `t-StatusProhibit`); `None`
+    /// sends a STATUS report for every trigger.
+    pub fn set_t_status_prohibit(&mut self, duration: Option<Duration>) {
+        self.t_status_prohibit = duration;
+        if duration.is_none() {
+            self.t_status_prohibit_deadline = None;
+        }
+    }
+
+    /// Request retransmission of a specific SN.
+    ///
+    /// Retransmission is normally driven by the NACK list of a received STATUS
+    /// PDU; this is the manual entry point for a caller that has its own reason
+    /// to resend (and the pre-#15 behaviour, when nothing else did).
     pub fn request_retransmit(&mut self, sn: u32) {
         if self.am_unacked.contains_key(&sn) {
             debug!(sn, "RLC AM: scheduling retransmission");
@@ -1270,6 +1654,228 @@ mod tests {
         // did not damage what was already buffered.
         rx.receive_pdu(&umd(SegmentationInfo::LastSegment, 0, Some(4), &[5, 6]));
         assert_eq!(rx.poll_reassembled(), Some(vec![1, 2, 3, 4, 5, 6]));
+    }
+
+    // ── AM ARQ: STATUS, auto-retransmission and timers (#15) ─────────────────
+
+    /// A pair of AM entities with instant timers, so expiry is deterministic
+    /// without sleeping, and no STATUS prohibit in the way of a report.
+    fn am_pair() -> (RlcEntity, RlcEntity) {
+        let mut tx = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
+        let mut rx = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
+        tx.set_t_poll_retransmit(Some(Duration::ZERO));
+        rx.set_t_status_prohibit(None);
+        rx.set_t_reassembly(Some(Duration::ZERO));
+        (tx, rx)
+    }
+
+    /// The whole point of AM: a dropped PDU is recovered **without any manual
+    /// `request_retransmit` call**. The receiver NACKs it, the sender resends it,
+    /// and the SDUs are delivered in order.
+    #[test]
+    fn a_dropped_am_pdu_is_recovered_by_status_and_retransmission() {
+        let (mut tx, mut rx) = am_pair();
+        let sdus: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0xA0 + i; 12]).collect();
+        for sdu in &sdus {
+            tx.submit_sdu(sdu.clone());
+        }
+
+        let pdus: Vec<Vec<u8>> = std::iter::from_fn(|| tx.build_pdu(64)).collect();
+        assert_eq!(pdus.len(), 3, "one PDU per SDU at this grant size");
+
+        // SN 1 is lost on the air.
+        rx.receive_pdu(&pdus[0]);
+        rx.receive_pdu(&pdus[2]);
+
+        assert_eq!(
+            rx.poll_reassembled(),
+            Some(sdus[0].clone()),
+            "SN 0 is delivered"
+        );
+        assert_eq!(
+            rx.poll_reassembled(),
+            Some(sdus[2].clone()),
+            "SN 2 is delivered as it completes: AM does not reorder in RLC \
+             (TS 38.322 §5.2.3.2.3), PDCP does"
+        );
+
+        // The poll on SN 2 triggers a report, but RX_Highest_Status has not moved
+        // past the gap yet, so this first report only ACKs SN 0
+        // (TS 38.322 §5.2.3.2.3: RX_Highest_Status advances only over SDUs that
+        // ARE received). Reporting SN 1 missing this early would be a guess.
+        let acked_only = RlcStatusPdu::decode_sn12(
+            &rx.build_status_pdu()
+                .expect("the poll must be answered with a report"),
+        )
+        .unwrap();
+        assert_eq!(acked_only.ack_sn, 1);
+        assert!(
+            acked_only.nacks.is_empty(),
+            "the gap is not reported until t-Reassembly says it is lost"
+        );
+
+        // t-Reassembly is what declares SN 1 lost (§5.2.3.2.4) and triggers the
+        // report that NACKs it (§5.3.4).
+        assert!(
+            rx.poll_am_timers(Instant::now()),
+            "t-Reassembly must expire over the gap"
+        );
+        let status = rx
+            .build_status_pdu()
+            .expect("the expiry must trigger a second report");
+        let decoded = RlcStatusPdu::decode_sn12(&status).unwrap();
+        assert_eq!(
+            decoded.nacks.iter().map(|n| n.nack_sn).collect::<Vec<_>>(),
+            vec![1],
+            "exactly the missing SN is NACKed"
+        );
+        assert_eq!(decoded.ack_sn, 3, "everything reported on, up to SN 3");
+
+        // The sender acts on the NACK by itself.
+        tx.receive_pdu(&status);
+        assert_eq!(
+            tx.unacked_len(),
+            1,
+            "SN 0 and SN 2 are acknowledged; only the NACKed SN remains"
+        );
+        let retx = tx
+            .build_pdu(64)
+            .expect("the NACK alone must schedule the retransmission");
+        assert_eq!(retx, pdus[1], "the retransmission is the lost PDU");
+
+        rx.receive_pdu(&retx);
+        assert_eq!(rx.poll_reassembled(), Some(sdus[1].clone()));
+        assert_eq!(rx.am_rx_next(), 3, "RX_Next is past all three SDUs");
+    }
+
+    /// An ACK_SN above a NACKed SN must not clear that SN: the NACK is the
+    /// exception ACK_SN carries (TS 38.322 §6.2.3.10). Clearing it would drop
+    /// exactly the PDU that has to be resent.
+    #[test]
+    fn a_nacked_sn_survives_an_ack_sn_above_it() {
+        let (mut tx, _rx) = am_pair();
+        for i in 0..3u8 {
+            tx.submit_sdu(vec![i; 8]);
+        }
+        let pdus: Vec<Vec<u8>> = std::iter::from_fn(|| tx.build_pdu(64)).collect();
+        assert_eq!(tx.unacked_len(), 3);
+
+        // ACK up to 3 (i.e. 0, 1 and 2 reported on) but NACK SN 1.
+        let status = RlcStatusPdu::with_nacks(3, vec![RlcStatusNack::sdu(1)]).encode_sn12();
+        tx.receive_pdu(&status);
+
+        assert_eq!(tx.unacked_len(), 1, "only the NACKed SN stays unacked");
+        let retx = tx.build_pdu(64).expect("the NACKed SN is retransmitted");
+        assert_eq!(retx, pdus[1]);
+    }
+
+    /// TS 38.322 §5.3.3.4: if no STATUS comes back, `t-PollRetransmit` expiry
+    /// re-offers an unacknowledged PDU. Without it a lost STATUS report stalls
+    /// the bearer, because the receiver has nothing left to answer.
+    #[test]
+    fn t_poll_retransmit_expiry_re_offers_the_unacknowledged_pdu() {
+        let (mut tx, _rx) = am_pair();
+        tx.submit_sdu(vec![0x5Au8; 16]);
+        let original = tx.build_pdu(64).expect("original PDU");
+        assert!(
+            tx.build_pdu(64).is_none(),
+            "nothing more to send until a timer fires"
+        );
+
+        assert!(
+            tx.poll_am_timers(Instant::now()),
+            "t-PollRetransmit must have expired"
+        );
+
+        let retx = tx
+            .build_pdu(64)
+            .expect("the expiry must re-offer the unacknowledged PDU");
+        assert_eq!(retx, original);
+    }
+
+    /// `t-StatusProhibit` bounds the report rate: two triggers while it runs
+    /// produce one report, not two.
+    #[test]
+    fn t_status_prohibit_collapses_repeated_triggers_into_one_report() {
+        let mut tx = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
+        let mut rx = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
+        // Long enough that it is still running for the second poll.
+        rx.set_t_status_prohibit(Some(Duration::from_secs(60)));
+
+        tx.submit_sdu(vec![1u8; 8]);
+        tx.submit_sdu(vec![2u8; 8]);
+        let first = tx.build_pdu(64).unwrap();
+        let second = tx.build_pdu(64).unwrap();
+
+        rx.receive_pdu(&first);
+        assert!(
+            rx.build_status_pdu().is_some(),
+            "the first poll is answered"
+        );
+
+        rx.receive_pdu(&second);
+        assert!(
+            rx.status_report_pending(),
+            "the second poll still triggers a report"
+        );
+        assert!(
+            rx.build_status_pdu().is_none(),
+            "but t-StatusProhibit holds it back"
+        );
+    }
+
+    /// An AM `t-Reassembly` expiry reports on the missing SDU instead of waiting
+    /// for a poll that may never come (TS 38.322 §5.2.3.2.4, §5.3.4).
+    #[test]
+    fn am_t_reassembly_expiry_triggers_a_status_report() {
+        let mut rx = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
+        rx.set_t_status_prohibit(None);
+        rx.set_t_reassembly(Some(Duration::ZERO));
+
+        // SN 1 arrives with no poll; SN 0 is missing.
+        let pdu = RlcAmPdu {
+            dc: true,
+            p: false,
+            si: SegmentationInfo::FullSdu,
+            sn: 1,
+            so: None,
+            data: vec![7, 7, 7],
+        }
+        .encode_sn12();
+        rx.receive_pdu(&pdu);
+        assert!(
+            !rx.status_report_pending(),
+            "no poll, so nothing is triggered yet"
+        );
+
+        assert!(
+            rx.poll_am_timers(Instant::now()),
+            "t-Reassembly must expire"
+        );
+        assert!(rx.status_report_pending());
+
+        let status = RlcStatusPdu::decode_sn12(&rx.build_status_pdu().unwrap()).unwrap();
+        assert_eq!(
+            status.nacks.iter().map(|n| n.nack_sn).collect::<Vec<_>>(),
+            vec![0],
+            "the report names the missing SDU"
+        );
+    }
+
+    /// A UM entity has no STATUS PDU at all, and an AM entity's timers must not
+    /// be driven by the UM helper — they advance different state variables.
+    #[test]
+    fn a_um_entity_never_produces_a_status_report() {
+        let mut um = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        um.receive_pdu(&umd(SegmentationInfo::FullSdu, 0, None, &[1, 2]));
+        assert!(um.build_status_pdu().is_none());
+        assert!(!um.poll_am_timers(Instant::now()));
+    }
+
+    #[test]
+    fn am_window_size_is_half_the_sn_space() {
+        assert_eq!(SnSize::Sn12.am_window_size(), 2048);
+        assert_eq!(SnSize::Sn18.am_window_size(), 131072);
     }
 
     #[test]

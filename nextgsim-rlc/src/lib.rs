@@ -40,9 +40,12 @@ pub mod entity;
 pub mod error;
 pub mod pdu;
 
-pub use entity::{RlcEntity, RlcSegment};
+pub use entity::{
+    RlcEntity, RlcSegment, DEFAULT_T_POLL_RETRANSMIT, DEFAULT_T_REASSEMBLY,
+    DEFAULT_T_STATUS_PROHIBIT,
+};
 pub use error::RlcError;
-pub use pdu::{RlcAmPdu, RlcUmPdu, SegmentationInfo};
+pub use pdu::{RlcAmPdu, RlcStatusNack, RlcStatusPdu, RlcUmPdu, SegmentationInfo};
 
 /// RLC operating mode (TS 38.322 §4.2)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +88,12 @@ impl SnSize {
             Self::Sn12 => 2,
             Self::Sn18 => unreachable!("18-bit SN is AM only"),
         }
+    }
+
+    /// `AM_Window_Size` for this SN size (TS 38.322 §7.2): half the SN space,
+    /// i.e. 2048 for a 12-bit SN and 131072 for an 18-bit SN.
+    pub fn am_window_size(self) -> u32 {
+        self.modulus() / 2
     }
 
     /// `UM_Window_Size` for this SN size (TS 38.322 §7.2): half the SN space,
