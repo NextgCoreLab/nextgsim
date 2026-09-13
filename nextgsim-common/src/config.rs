@@ -71,6 +71,16 @@ pub struct GnbConfig {
     pub gtp_advertise_ip: Option<IpAddr>,
     /// Whether to ignore SCTP stream IDs
     pub ignore_stream_ids: bool,
+    /// TNGRELOCoverall in seconds: how long the gNB waits for a UE Context Release
+    /// Command after sending a UE Context Release Request before releasing the context
+    /// locally (TS 38.413 §8.3.3.4). TS 38.413 names the timer and leaves the value to
+    /// the operator; 5 s is the default here.
+    #[serde(default = "default_tngreloc_overall_secs")]
+    pub ngap_tngreloc_overall_secs: u64,
+    /// TNGRELOCprep in seconds: how long handover preparation may stay in flight before
+    /// it is cancelled and the UE stays on the source cell (TS 38.413 §8.4.1.2).
+    #[serde(default = "default_tngreloc_prep_secs")]
+    pub ngap_tngreloc_prep_secs: u64,
     /// UPF GTP-U address for data plane forwarding (if None, uses loopback mode)
     #[serde(default)]
     pub upf_addr: Option<IpAddr>,
@@ -216,6 +226,14 @@ fn default_gtpu_echo_max_misses() -> u32 {
     3
 }
 
+fn default_tngreloc_overall_secs() -> u64 {
+    5
+}
+
+fn default_tngreloc_prep_secs() -> u64 {
+    10
+}
+
 fn default_isac_anchors() -> Vec<[f64; 3]> {
     // 100 m equilateral triangle at 10 m height
     vec![[0.0, 0.0, 10.0], [100.0, 0.0, 10.0], [50.0, 87.0, 10.0]]
@@ -235,6 +253,8 @@ impl Default for GnbConfig {
             gtp_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             gtp_advertise_ip: None,
             ignore_stream_ids: false,
+            ngap_tngreloc_overall_secs: default_tngreloc_overall_secs(),
+            ngap_tngreloc_prep_secs: default_tngreloc_prep_secs(),
             upf_addr: None,
             upf_port: 2152,
             gtpu_echo_period_secs: 0,

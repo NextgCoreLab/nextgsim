@@ -271,7 +271,10 @@ pub fn build_error_indication(
     Ok(NGAP_PDU::InitiatingMessage(initiating_message))
 }
 
-fn build_cause(cause: &NgSetupFailureCause) -> Cause {
+/// Map the hand-written `NgSetupFailureCause` enum into the generated NGAP `Cause`
+/// CHOICE. `pub(crate)`, mirroring `ng_setup::parse_cause` in the other direction, so
+/// sibling procedure modules do not each grow their own copy.
+pub(crate) fn build_cause(cause: &NgSetupFailureCause) -> Cause {
     match cause {
         NgSetupFailureCause::RadioNetwork(rn) => Cause::RadioNetwork(build_radio_network_cause(rn)),
         NgSetupFailureCause::Transport(t) => Cause::Transport(build_transport_cause(t)),

@@ -22,9 +22,11 @@
 mod amf_context;
 pub mod mbs_context;
 mod task;
+pub mod timers;
 mod ue_context;
 
 pub use amf_context::{AmfContextInfo, AmfState, NgapAmfContext};
 pub use mbs_context::{GnbMbsContext, MbsSessionState};
 pub use task::NgapTask;
+pub use timers::{GuardTimer, GuardTimers};
 pub use ue_context::{NgapUeContext, UeState};

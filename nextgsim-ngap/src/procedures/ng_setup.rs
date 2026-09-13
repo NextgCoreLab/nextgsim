@@ -279,6 +279,25 @@ pub enum TimeToWaitValue {
     V60s,
 }
 
+impl TimeToWaitValue {
+    /// The wait this value asks for (TS 38.413 §9.3.1.19).
+    ///
+    /// The enum is the whole of the IE's information -- these are the only six values
+    /// TS 38.413 defines -- so the mapping is exact rather than approximate, and a
+    /// receiver that waits this long has waited "at least for the indicated time" as
+    /// §8.7.1.3 requires.
+    pub fn as_duration(self) -> core::time::Duration {
+        core::time::Duration::from_secs(match self {
+            Self::V1s => 1,
+            Self::V2s => 2,
+            Self::V5s => 5,
+            Self::V10s => 10,
+            Self::V20s => 20,
+            Self::V60s => 60,
+        })
+    }
+}
+
 // ============================================================================
 // NG Setup Request Builder
 // ============================================================================
@@ -577,6 +596,82 @@ pub(crate) fn parse_plmn_support_list(list: &PLMNSupportList) -> Vec<PlmnSupport
             }
         })
         .collect()
+}
+
+// ============================================================================
+// NG Setup Failure Builder
+// ============================================================================
+
+/// Parameters for an NG Setup Failure
+#[derive(Debug, Clone)]
+pub struct NgSetupFailureParams {
+    /// Why the setup was refused
+    pub cause: NgSetupFailureCause,
+    /// How long the NG-RAN node must wait before retrying (TS 38.413 §9.3.1.19)
+    pub time_to_wait: Option<TimeToWaitValue>,
+}
+
+/// Build an NG Setup Failure PDU
+///
+/// The counterpart of [`parse_ng_setup_failure`]. A gNB never sends this message -- the
+/// AMF does -- so this exists to let the gNB's handling of it be tested against a PDU
+/// that has been through the real APER encoder, rather than against a hand-assembled
+/// byte string that could agree with a wrong parser.
+///
+/// # Errors
+///
+/// Returns [`NgSetupError`] if the PDU cannot be constructed.
+pub fn build_ng_setup_failure(params: &NgSetupFailureParams) -> Result<NGAP_PDU, NgSetupError> {
+    let mut protocol_ies = Vec::new();
+
+    // IE: Cause (mandatory)
+    protocol_ies.push(NGSetupFailureProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_CAUSE),
+        criticality: Criticality(Criticality::IGNORE),
+        value: NGSetupFailureProtocolIEs_EntryValue::Id_Cause(
+            crate::procedures::error_indication::build_cause(&params.cause),
+        ),
+    });
+
+    // IE: TimeToWait (optional)
+    if let Some(ttw) = params.time_to_wait {
+        protocol_ies.push(NGSetupFailureProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_TIME_TO_WAIT),
+            criticality: Criticality(Criticality::IGNORE),
+            value: NGSetupFailureProtocolIEs_EntryValue::Id_TimeToWait(build_time_to_wait(ttw)),
+        });
+    }
+
+    let failure = NGSetupFailure {
+        protocol_i_es: NGSetupFailureProtocolIEs(protocol_ies),
+    };
+
+    Ok(NGAP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome {
+        procedure_code: ProcedureCode(ID_NG_SETUP),
+        criticality: Criticality(Criticality::REJECT),
+        value: UnsuccessfulOutcomeValue::Id_NGSetup(failure),
+    }))
+}
+
+/// Build and encode an NG Setup Failure to bytes
+///
+/// # Errors
+///
+/// Returns [`NgSetupError`] if the PDU cannot be constructed or encoded.
+pub fn encode_ng_setup_failure(params: &NgSetupFailureParams) -> Result<Vec<u8>, NgSetupError> {
+    let pdu = build_ng_setup_failure(params)?;
+    Ok(encode_ngap_pdu(&pdu)?)
+}
+
+fn build_time_to_wait(value: TimeToWaitValue) -> TimeToWait {
+    TimeToWait(match value {
+        TimeToWaitValue::V1s => TimeToWait::V1S,
+        TimeToWaitValue::V2s => TimeToWait::V2S,
+        TimeToWaitValue::V5s => TimeToWait::V5S,
+        TimeToWaitValue::V10s => TimeToWait::V10S,
+        TimeToWaitValue::V20s => TimeToWait::V20S,
+        TimeToWaitValue::V60s => TimeToWait::V60S,
+    })
 }
 
 // ============================================================================
