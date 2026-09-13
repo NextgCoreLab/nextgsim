@@ -2353,13 +2353,20 @@ mod tests {
             conformant_accept_bytes(first_psi, pti),
             first_psi,
         ));
-        assert_eq!(orch.session(first_psi).map(|s| s.state), Some(PsState::Active));
+        assert_eq!(
+            orch.session(first_psi).map(|s| s.state),
+            Some(PsState::Active)
+        );
 
         let (reused_psi, outs) = orch.start_establishment_for_app(
             &super::super::ursp::ApplicationDescriptor::for_dnn("internet"),
             &base,
         );
-        assert_eq!(reused_psi, Some(first_psi), "the same session must serve it");
+        assert_eq!(
+            reused_psi,
+            Some(first_psi),
+            "the same session must serve it"
+        );
         assert!(
             outs.is_empty(),
             "reuse must send nothing, got {} output(s)",
@@ -2428,8 +2435,8 @@ mod tests {
     #[test]
     fn delivered_ursp_rules_influence_establishment() {
         use nextgsim_nas::messages::mm::ue_policy::{
-            RouteSelectionDescriptor, RouteSelectionDescriptorComponent, TrafficDescriptorComponent,
-            UrspRule,
+            RouteSelectionDescriptor, RouteSelectionDescriptorComponent,
+            TrafficDescriptorComponent, UrspRule,
         };
         let mut orch = new_orch();
         // The switch still governs delivered rules: a PCF cannot turn evaluation

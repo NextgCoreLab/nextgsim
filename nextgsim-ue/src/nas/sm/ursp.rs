@@ -135,9 +135,7 @@ impl ApplicationDescriptor {
                     (own[full] & mask) == (addr[full] & mask)
                 })
             }
-            TrafficDescriptorComponent::ProtocolIdentifier(proto) => {
-                self.protocol == Some(*proto)
-            }
+            TrafficDescriptorComponent::ProtocolIdentifier(proto) => self.protocol == Some(*proto),
             TrafficDescriptorComponent::SingleRemotePort(port) => self.port == Some(*port),
             TrafficDescriptorComponent::RemotePortRange { low, high } => {
                 self.port.is_some_and(|p| p >= *low && p <= *high)
@@ -303,8 +301,11 @@ impl UrspPolicy {
         // Network-delivered rules take priority over configured ones at equal
         // precedence: the PCF's policy outranks a local default. The sort is
         // stable, so ordering the sources this way is what expresses that.
-        let mut candidates: Vec<&UrspRule> =
-            self.delivered.iter().chain(self.configured.iter()).collect();
+        let mut candidates: Vec<&UrspRule> = self
+            .delivered
+            .iter()
+            .chain(self.configured.iter())
+            .collect();
         // §5.2: "in increasing order of precedence values".
         candidates.sort_by_key(|r| r.precedence);
 
@@ -599,7 +600,10 @@ mod tests {
         let pol = policy(false, vec![config_rule(1, "*", Some("steered"), Some(9))]);
         assert!(!pol.is_enabled());
         let base = base_params();
-        assert_eq!(pol.evaluate(&ApplicationDescriptor::for_dnn("internet")), None);
+        assert_eq!(
+            pol.evaluate(&ApplicationDescriptor::for_dnn("internet")),
+            None
+        );
         assert_eq!(
             pol.resolve(&ApplicationDescriptor::for_dnn("internet"), &base),
             base,
@@ -638,7 +642,9 @@ mod tests {
                 config_rule(30, "com.example.app", Some("app-route"), None),
             ],
         );
-        let dnn_match = pol.evaluate(&ApplicationDescriptor::for_dnn("ims")).unwrap();
+        let dnn_match = pol
+            .evaluate(&ApplicationDescriptor::for_dnn("ims"))
+            .unwrap();
         assert_eq!(
             dnn_match.apply_to(&base_params()).dnn.as_deref(),
             Some("ims-route")
@@ -740,7 +746,11 @@ mod tests {
         let mut base = base_params();
         base.ssc_mode = SscModeValue::SscMode2;
         let params = pol.resolve(&ApplicationDescriptor::for_dnn("internet"), &base);
-        assert_eq!(params.s_nssai, Some(vec![5]), "the valid part still applies");
+        assert_eq!(
+            params.s_nssai,
+            Some(vec![5]),
+            "the valid part still applies"
+        );
         assert_eq!(
             params.ssc_mode,
             SscModeValue::SscMode2,
