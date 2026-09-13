@@ -57,6 +57,7 @@ use crate::timer::{
 };
 
 use super::deregistration::DeregistrationProcedure;
+use super::persistence::{SecurityContextSnapshot, UeStateSnapshot};
 use super::state::{CmState, MmStateMachine, MmSubState, UpdateStatus};
 
 /// Maximum registration attempts before falling back to T3502
@@ -473,6 +474,20 @@ pub struct MmOrchestrator {
     // -- UE policy delivery service (UPDP, TS 24.501 Annex D) --
     /// UE policy sections stored by `(PLMN, UPSC)` (TS 24.501 D.2.1.3 / D.3).
     ue_policy_sections: HashMap<(PlmnId, u16), StoredUePolicySection>,
+
+    // -- non-volatile 5GMM parameters (TS 24.501 Annex C.1) --
+    /// Where the Annex C.1 parameters are stored across restarts, when the
+    /// operator configured a path. `None` disables persistence entirely.
+    ///
+    /// This is the one field that makes the orchestrator touch the filesystem.
+    /// It is here rather than at the caller because the two moments that matter
+    /// -- capturing on deregistration, and INVALIDATING when the registration
+    /// context is deleted -- are both inside `delete_registration_context`,
+    /// which is reached from a dozen reject paths that do not return outputs.
+    /// Surfacing it as an `MmOutput` would mean threading a return value
+    /// through all of them, and any one missed would leave a stale GUTI on disk
+    /// that a restart would then present to the network.
+    state_file: Option<std::path::PathBuf>,
 }
 
 impl MmOrchestrator {
@@ -506,6 +521,118 @@ impl MmOrchestrator {
             dereg_pdu: None,
             stored_suci: None,
             ue_policy_sections: HashMap::new(),
+            state_file: None,
+        }
+    }
+
+    // ========================================================================
+    // Non-volatile 5GMM parameters (TS 24.501 Annex C.1)
+    // ========================================================================
+
+    /// Build an orchestrator for `config`, rehydrating the Annex C.1 parameters
+    /// from `config.state_file` when one is configured and readable.
+    ///
+    /// With no `state_file` this is exactly [`Self::new`]: no file is read, no
+    /// file will be written, and the UE registers with a SUCI as before.
+    ///
+    /// A state file that exists but does not parse is reported and IGNORED
+    /// rather than fatal: a UE that cannot start because of a corrupt cache is
+    /// worse than one that registers from scratch, which is a spec-valid
+    /// procedure the network completes normally. The distinction that matters is
+    /// that it is never silently *replaced* -- it stays on disk for inspection
+    /// until the next successful registration overwrites it.
+    pub fn from_config(identity: MmUeIdentity, config: &UeConfig) -> Self {
+        let mut orch = Self::new(identity);
+        let Some(ref path) = config.state_file else {
+            return orch;
+        };
+        orch.state_file = Some(path.clone());
+        match UeStateSnapshot::load(path) {
+            Ok(Some(snapshot)) => orch.restore_stored_state(snapshot),
+            Ok(None) => info!(
+                "no stored 5GMM state at {} yet; registering with SUCI",
+                path.display()
+            ),
+            Err(e) => warn!(
+                "stored 5GMM state at {} not usable ({e}); registering with SUCI",
+                path.display()
+            ),
+        }
+        orch
+    }
+
+    /// Install a stored snapshot's 5GMM parameters (TS 24.501 Annex C.1).
+    ///
+    /// The security context is restored only if it restores CLEANLY. A GUTI
+    /// without a usable security context is still installed, and is still worth
+    /// having: §5.5.1.2.2 wants the GUTI presented whenever the UE has a valid
+    /// one, and the network then runs a fresh authentication -- which is the
+    /// pre-existing behaviour, not a regression.
+    pub fn restore_stored_state(&mut self, snapshot: UeStateSnapshot) {
+        if let Some(guti) = snapshot.guti_ie() {
+            info!(
+                "restored 5G-GUTI from non-volatile state: registration will be GUTI-first \
+                 (TS 24.501 §5.5.1.2.2)"
+            );
+            self.stored_guti = Some(guti);
+        }
+        if let Some(tai_list) = snapshot.tai_list.clone() {
+            self.current_tai = parse_first_tai(&tai_list);
+            self.tai_list = Some(tai_list);
+        }
+        if let Some(tai) = snapshot.last_visited_tai {
+            // The last visited registered TAI outranks whatever the TAI list's
+            // first entry happened to be: Annex C.1 stores it separately
+            // precisely because it is where the UE actually was.
+            self.current_tai = Some(tai);
+        }
+        self.state
+            .switch_update_status(UpdateStatus::from(snapshot.update_status));
+        if let Some(ref security) = snapshot.security {
+            match security.restore() {
+                Ok(sec) => {
+                    info!(
+                        "restored native 5G NAS security context (ngKSI {}) with NAS COUNT \
+                         continuity (TS 24.501 §4.4.2.1.3)",
+                        sec.ng_ksi()
+                    );
+                    self.sec = sec;
+                }
+                Err(e) => warn!(
+                    "stored 5G NAS security context not usable ({e}); a fresh primary \
+                     authentication will run"
+                ),
+            }
+        }
+    }
+
+    /// Capture the current Annex C.1 parameters.
+    pub fn state_snapshot(&self) -> UeStateSnapshot {
+        UeStateSnapshot {
+            guti: self.stored_guti.as_ref().map(|g| g.data.clone()),
+            tai_list: self.tai_list.clone(),
+            last_visited_tai: self.current_tai,
+            update_status: self.state.update_status().into(),
+            security: SecurityContextSnapshot::capture(&self.sec),
+        }
+    }
+
+    /// Persist the Annex C.1 parameters, if a state file is configured.
+    ///
+    /// Call on graceful shutdown and after deregistration. A snapshot with
+    /// neither a GUTI nor a security context is not written: the next start
+    /// would take the SUCI branch either way.
+    pub fn persist_state(&self) {
+        let Some(ref path) = self.state_file else {
+            return;
+        };
+        let snapshot = self.state_snapshot();
+        if snapshot.is_empty() {
+            return;
+        }
+        match snapshot.store(path) {
+            Ok(()) => info!("5GMM state persisted to {}", path.display()),
+            Err(e) => warn!("could not persist 5GMM state to {}: {e}", path.display()),
         }
     }
 
@@ -1235,6 +1362,20 @@ impl MmOrchestrator {
         self.stored_guti = None;
         self.tai_list = None;
         self.sec.reset();
+        // TS 24.501 Annex C.1: the stored copy goes with the in-memory one.
+        // Leaving the file behind would mean a restart presents a 5G-GUTI and a
+        // security context the network has just told this UE to forget -- which
+        // is worse than not persisting at all, because the UE would look
+        // registered to itself and be rejected on every attempt.
+        if let Some(ref path) = self.state_file {
+            if let Err(e) = UeStateSnapshot::remove(path) {
+                warn!(
+                    "registration context deleted but stored state at {} survives ({e}): a \
+                     restart may present a stale 5G-GUTI",
+                    path.display()
+                );
+            }
+        }
     }
 
     // ========================================================================
@@ -2532,6 +2673,211 @@ mod tests {
 
     fn new_orch() -> MmOrchestrator {
         MmOrchestrator::new(test_identity())
+    }
+
+    // ========================================================================
+    // Non-volatile 5GMM parameters (TS 24.501 Annex C.1) — #53
+    // ========================================================================
+
+    /// A UE config pointing at a private state file. PID- and
+    /// nanosecond-tagged: these tests run concurrently in one process, and a
+    /// shared path would have them read each other's snapshots.
+    fn state_file_config(name: &str) -> (UeConfig, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "nextgsim-mm-state-{}-{name}-{nanos}",
+                std::process::id()
+            ))
+            .join("state.json");
+        let mut config = UeConfig::default();
+        config.state_file = Some(path.clone());
+        (config, path)
+    }
+
+    /// The identity a UE presents in its Registration Request, decoded off the
+    /// PDU it actually emits, plus whether that PDU was security protected.
+    ///
+    /// Both forms have to be handled, and the difference is itself a result of
+    /// #53: a UE with no stored context sends a PLAIN request (there is no key),
+    /// while one that restored a native context sends an INTEGRITY-PROTECTED and
+    /// ciphered one. Decoding only the plain shape would have made the restored
+    /// case unreadable rather than wrong.
+    fn registration_identity(orch: &mut MmOrchestrator) -> (MobileIdentityType, u8, bool) {
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        let pdu = first_sent_pdu(&outs).to_vec();
+        let protected = pdu[1] != 0x00;
+        let body = if protected {
+            let sec = orch.security_context();
+            let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+            let mut payload = pdu[7..].to_vec();
+            nas_cipher(
+                sec.ciphering_algorithm(),
+                sec.keys().knas_enc().unwrap(),
+                &count,
+                NAS_BEARER,
+                NasDirection::Uplink,
+                &mut payload,
+            );
+            payload
+        } else {
+            pdu.clone()
+        };
+        let req = RegistrationRequest::decode(&mut &body[3..]).unwrap();
+        (req.mobile_identity.identity_type, req.ng_ksi.ksi, protected)
+    }
+
+    /// #53: a UE that completed registration, was persisted and restarted
+    /// registers GUTI-FIRST with the stored ngKSI (TS 24.501 Annex C.1,
+    /// §5.5.1.2.2), instead of falling back to SUCI as it did before.
+    ///
+    /// "Restart" is a genuinely fresh orchestrator built through
+    /// `from_config` — the same path `main` uses — so this exercises the load,
+    /// not an in-memory copy.
+    #[test]
+    fn a_restarted_ue_registers_guti_first_with_the_stored_ngksi() {
+        let (config, path) = state_file_config("guti-first");
+
+        // First life: register, receive a 5G-GUTI, persist.
+        let fresh = MmOrchestrator::from_config(test_identity(), &config);
+        assert!(
+            fresh.stored_guti().is_none(),
+            "precondition: nothing stored yet"
+        );
+        let orch = {
+            let mut orch = establish_security_context();
+            orch.state_file = Some(path.clone());
+            let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+            orch.handle_downlink(&acc);
+            assert!(orch.stored_guti().is_some(), "the Accept assigned a GUTI");
+            orch.persist_state();
+            orch
+        };
+        let stored_ksi = orch.security_context().ng_ksi();
+        assert!(path.exists(), "persist_state must have written the file");
+
+        // Second life: a fresh orchestrator loading that file.
+        let mut restarted = MmOrchestrator::from_config(test_identity(), &config);
+        assert!(
+            restarted.stored_guti().is_some(),
+            "the 5G-GUTI must be rehydrated BEFORE the first registration"
+        );
+        assert!(
+            restarted.security_context().is_active(),
+            "the native security context must come back active, or the ngKSI is meaningless"
+        );
+
+        let (identity_type, ng_ksi, protected) = registration_identity(&mut restarted);
+        assert_eq!(
+            identity_type,
+            MobileIdentityType::Guti,
+            "a restarted UE with a stored GUTI must not take the SUCI fallback"
+        );
+        assert_eq!(
+            ng_ksi, stored_ksi,
+            "the request must carry the STORED key set identifier, not 'no key'"
+        );
+        assert!(
+            protected,
+            "with a restored native context the request is integrity protected, not plain -- \
+             which is the point of storing the context rather than only the GUTI"
+        );
+
+        UeStateSnapshot::remove(&path).unwrap();
+    }
+
+    /// #53: with no state file the behaviour is unchanged — SUCI, no key.
+    ///
+    /// This is the default path, so it is the one that must not regress.
+    #[test]
+    fn without_a_state_file_the_ue_still_registers_with_suci() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+        let (identity_type, ng_ksi, protected) = registration_identity(&mut orch);
+        assert_eq!(identity_type, MobileIdentityType::Suci);
+        assert_eq!(ng_ksi, NasKeySetIdentifier::NO_KEY_AVAILABLE);
+        assert!(!protected, "no stored context means a plain request");
+    }
+
+    /// #53: a corrupt state file is ignored, not fatal, and the UE registers
+    /// cleanly with a SUCI.
+    ///
+    /// A UE that cannot start because of a damaged cache is worse than one that
+    /// re-registers, which is a spec-valid procedure the network completes.
+    #[test]
+    fn a_corrupt_state_file_falls_back_to_suci_without_panicking() {
+        let (config, path) = state_file_config("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"guti\": ").unwrap();
+
+        let mut orch = MmOrchestrator::from_config(test_identity(), &config);
+        assert!(orch.stored_guti().is_none());
+        let (identity_type, _, _) = registration_identity(&mut orch);
+        assert_eq!(identity_type, MobileIdentityType::Suci);
+
+        UeStateSnapshot::remove(&path).unwrap();
+    }
+
+    /// #53: deleting the registration context removes the stored copy, so a
+    /// restart cannot present a 5G-GUTI the network has told this UE to forget.
+    ///
+    /// Driven through a real reject (#3 ILLEGAL UE) rather than by calling the
+    /// private helper, so the wiring is what is under test.
+    #[test]
+    fn a_deleted_registration_context_takes_the_stored_state_with_it() {
+        let (config, path) = state_file_config("invalidate");
+
+        let mut orch = establish_security_context();
+        orch.state_file = Some(path.clone());
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.persist_state();
+        assert!(path.exists(), "precondition: state was persisted");
+
+        // ILLEGAL UE is one of the causes whose handling deletes the
+        // registration context (TS 24.501 §5.5.1.2.5).
+        let rej = build_registration_reject_pdu(MmCause::IllegalUe, None);
+        orch.handle_downlink(&protect_downlink(&orch, &rej, 2));
+
+        assert!(orch.stored_guti().is_none(), "in-memory GUTI is gone");
+        assert!(
+            !path.exists(),
+            "the stored copy must go with it, or a restart presents a stale 5G-GUTI"
+        );
+        // And a fresh start really does fall back to SUCI.
+        let mut restarted = MmOrchestrator::from_config(test_identity(), &config);
+        let (identity_type, _, _) = registration_identity(&mut restarted);
+        assert_eq!(identity_type, MobileIdentityType::Suci);
+    }
+
+    /// #53: NAS COUNT continuity across the restart.
+    ///
+    /// Asserted separately from the GUTI because it is the half that has a
+    /// security consequence: a restored context whose uplink COUNT went back to
+    /// zero reuses the keystream for COUNTs the network has already seen.
+    #[test]
+    fn a_restored_context_keeps_its_nas_counts() {
+        let (config, path) = state_file_config("counts");
+
+        let mut orch = establish_security_context();
+        orch.state_file = Some(path.clone());
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        let uplink = *orch.security_context().uplink_count();
+        let downlink = *orch.security_context().downlink_count();
+        assert!(
+            uplink.to_u32() > 0,
+            "the fixture must have sent something, or continuity is untestable"
+        );
+        orch.persist_state();
+
+        let restarted = MmOrchestrator::from_config(test_identity(), &config);
+        assert_eq!(restarted.security_context().uplink_count(), &uplink);
+        assert_eq!(restarted.security_context().downlink_count(), &downlink);
+
+        UeStateSnapshot::remove(&path).unwrap();
     }
 
     /// Build a valid AUTN for the test credentials with the given SQN and AMF

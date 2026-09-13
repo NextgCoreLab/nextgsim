@@ -1132,6 +1132,16 @@ pub struct UeConfig {
     pub configured_nssai: NetworkSlice,
     /// TUN interface name (optional)
     pub tun_name: Option<String>,
+    /// Path to the file holding the 5GMM parameters TS 24.501 Annex C.1 wants
+    /// kept in non-volatile memory: the 5G-GUTI, last visited registered TAI,
+    /// 5GS update status and native 5G NAS security context.
+    ///
+    /// `None` (the default) disables persistence entirely — nothing is read or
+    /// written and the UE registers with a SUCI after every restart, exactly as
+    /// before. Setting it is an explicit operator choice because the file holds
+    /// K_AMF and the NAS keys derived from it; it is created `0600` on Unix.
+    #[serde(default)]
+    pub state_file: Option<std::path::PathBuf>,
     /// Post-quantum cryptography configuration.
     ///
     /// Deserialised from the `pqc` key, which is what `config/ue.yaml` has
@@ -1220,6 +1230,7 @@ impl Default for UeConfig {
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
+            state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
             snpn_config: None,
@@ -1686,6 +1697,7 @@ configured_nssai:
             sessions: vec![SessionConfig::default()],
             configured_nssai: NetworkSlice::new(),
             tun_name: Some("tun0".to_string()),
+            state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
             snpn_config: None,
@@ -1964,6 +1976,7 @@ configured_nssai:
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
+            state_file: None,
             pqc_config: PqcConfig::new(
                 KemAlgorithm::Kyber1024,
                 SignAlgorithm::Dilithium5,
