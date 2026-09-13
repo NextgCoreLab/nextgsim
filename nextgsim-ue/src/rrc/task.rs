@@ -43,6 +43,9 @@ use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::codec::{decode_rrc, CellGroupConfig, RadioBearerConfig};
+use nextgsim_rrc::procedures::paging::{
+    decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
+};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup, encode_rrc_setup_complete, encode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
@@ -175,6 +178,11 @@ pub struct RrcTask {
     /// RRCSetup must arrive after an RRCSetupRequest. `Some` while establishment
     /// is in flight; cleared on RRCSetup reception or on expiry.
     t300_deadline: Option<tokio::time::Instant>,
+    /// The UE's own 5G-S-TMSI, handed down by the NAS plane once a 5G-GUTI is
+    /// assigned (`RrcMessage::PagingIdentity`). PCCH `PagingRecord`s are matched
+    /// against it (TS 38.331 §5.3.2.3). `None` until the UE has a GUTI, and no
+    /// paging record can match then — the AS has no identity to compare.
+    paging_s_tmsi: Option<[u8; FIVE_G_S_TMSI_LEN]>,
 }
 
 impl RrcTask {
@@ -210,6 +218,7 @@ impl RrcTask {
             pending_kgnb: None,
             srb1_config: None,
             t300_deadline: None,
+            paging_s_tmsi: None,
         }
     }
 
@@ -231,6 +240,21 @@ impl RrcTask {
     /// derive the RRC keys (Wave-6 I5). Called via `RrcMessage::AsSecurityKey`.
     pub fn set_pending_kgnb(&mut self, kgnb: [u8; 32]) {
         self.pending_kgnb = Some(kgnb);
+    }
+
+    /// Installs (or, with `None`, deletes) the 5G-S-TMSI the AS matches PCCH
+    /// paging records against. Called via `RrcMessage::PagingIdentity` when the
+    /// NAS plane is assigned or drops a 5G-GUTI (TS 24.501 §9.11.3.4).
+    ///
+    /// Public because it is a real message-handler entry point also driven
+    /// directly by the in-process paging harness
+    /// (`tests/src/paging_mt_service_request.rs`).
+    pub fn set_paging_identity(&mut self, s_tmsi: Option<[u8; FIVE_G_S_TMSI_LEN]>) {
+        match s_tmsi {
+            Some(tmsi) => debug!("Paging identity installed: 5G-S-TMSI {:02x?}", tmsi),
+            None => debug!("Paging identity deleted"),
+        }
+        self.paging_s_tmsi = s_tmsi;
     }
 
     /// Returns the installed AS security context, if AS security has been
@@ -616,9 +640,83 @@ impl RrcTask {
             RrcChannel::DlDcch => {
                 self.handle_dl_dcch_message(cell_id, &pdu).await;
             }
+            RrcChannel::Pcch => {
+                self.handle_pcch_message(cell_id, &pdu).await;
+            }
             _ => {
                 warn!("Unexpected downlink channel: {:?}", channel);
             }
+        }
+    }
+
+    /// Handles a PCCH `Paging` message (TS 38.331 §5.3.2.3).
+    ///
+    /// The UE monitors PCCH in RRC_IDLE and RRC_INACTIVE only (TS 38.304 §7.1);
+    /// a paging message received while RRC_CONNECTED is discarded, since a
+    /// connected UE is reached over its own SRB and answering it would start a
+    /// service request for a connection it already has.
+    ///
+    /// Each `PagingRecord` is compared with the UE's own 5G-S-TMSI, and only the
+    /// records that match are reported to NAS. A message with no matching record
+    /// is a normal event — PCCH is a broadcast channel, so most paging a UE
+    /// receives is for somebody else.
+    async fn handle_pcch_message(&mut self, cell_id: i32, pdu: &OctetString) {
+        let state = self.state_machine.state();
+        if state == RrcState::Connected {
+            debug!("PCCH Paging ignored: UE is RRC_CONNECTED");
+            return;
+        }
+
+        let records = match decode_paging(pdu.data()) {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Failed to decode PCCH Paging from cell {cell_id}: {e}");
+                return;
+            }
+        };
+
+        let Some(own_s_tmsi) = self.paging_s_tmsi else {
+            debug!(
+                "PCCH Paging with {} record(s) ignored: UE has no 5G-S-TMSI yet",
+                records.len()
+            );
+            return;
+        };
+
+        let matched: Vec<[u8; FIVE_G_S_TMSI_LEN]> = records
+            .iter()
+            .filter_map(|record| match record.ue_identity {
+                PagedUeIdentity::FiveGSTmsi(s_tmsi) if s_tmsi == own_s_tmsi => Some(s_tmsi),
+                // A full I-RNTI pages a UE in RRC_INACTIVE by an identity the
+                // NG-RAN allocated in the RRCRelease with suspendConfig, which
+                // this UE never receives (RRC_INACTIVE is not reachable yet), so
+                // it cannot be this UE.
+                _ => None,
+            })
+            .collect();
+
+        if matched.is_empty() {
+            debug!(
+                "PCCH Paging from cell {cell_id}: none of {} record(s) match this UE",
+                records.len().min(MAX_PAGE_RECORDS)
+            );
+            return;
+        }
+
+        info!(
+            "Paged by cell {cell_id} in {state}: 5G-S-TMSI {:02x?}",
+            own_s_tmsi
+        );
+
+        if let Err(e) = self
+            .task_base
+            .nas_tx
+            .send(NasMessage::Paging {
+                paging_s_tmsi: matched,
+            })
+            .await
+        {
+            error!("Failed to deliver paging indication to NAS: {}", e);
         }
     }
 
@@ -1698,6 +1796,9 @@ impl Task for RrcTask {
                                     }
                                 }
                             }
+                            RrcMessage::PagingIdentity { s_tmsi } => {
+                                self.set_paging_identity(s_tmsi);
+                            }
                             RrcMessage::DownlinkRrcDelivery { cell_id, channel, pdu } => {
                                 self.handle_downlink_rrc(cell_id, channel, pdu).await;
                             }
@@ -2214,5 +2315,176 @@ mod tests {
         assert!(task.pending_kgnb.is_none());
         task.set_pending_kgnb(TEST_KGNB);
         assert_eq!(task.pending_kgnb, Some(TEST_KGNB));
+    }
+
+    // ========================================================================
+    // Paging (#35): PCCH monitoring in RRC_IDLE (TS 38.331 §5.3.2.3)
+    // ========================================================================
+
+    use nextgsim_rrc::procedures::paging::{encode_paging, PagingRecordParams};
+
+    /// This UE's own 5G-S-TMSI, as the NAS plane derives it from the 5G-GUTI.
+    const OWN_S_TMSI: [u8; 6] = [0x55, 0x6A, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    /// Another subscriber's 5G-S-TMSI: same AMF (identical first two octets),
+    /// different 5G-TMSI — so a comparison that only checks the AMF part, or
+    /// one that ignores the identity altogether, cannot pass by accident.
+    const OTHER_S_TMSI: [u8; 6] = [0x55, 0x6A, 0x00, 0x00, 0x00, 0x01];
+
+    const PAGING_CELL: i32 = 1;
+
+    fn pcch_paging(identities: &[[u8; 6]]) -> OctetString {
+        let records: Vec<PagingRecordParams> = identities
+            .iter()
+            .map(|s_tmsi| PagingRecordParams::five_g_s_tmsi(*s_tmsi))
+            .collect();
+        OctetString::from_slice(&encode_paging(&records).expect("encode PCCH Paging"))
+    }
+
+    /// Pops the next paging indication the RRC layer handed to NAS.
+    fn try_take_paging(
+        nas_rx: &mut mpsc::Receiver<TaskMessage<NasMessage>>,
+    ) -> Option<Vec<[u8; FIVE_G_S_TMSI_LEN]>> {
+        while let Ok(msg) = nas_rx.try_recv() {
+            if let TaskMessage::Message(NasMessage::Paging { paging_s_tmsi }) = msg {
+                return Some(paging_s_tmsi);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_paging_record_matching_the_ues_own_5g_s_tmsi_reaches_nas() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.set_paging_identity(Some(OWN_S_TMSI));
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[OWN_S_TMSI]))
+                .await;
+        });
+
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![OWN_S_TMSI]),
+            "the matched 5G-S-TMSI must be reported to NAS"
+        );
+    }
+
+    /// PCCH is a broadcast channel, so a UE reads paging for other subscribers
+    /// constantly. Answering one would start a service request the network
+    /// never asked this UE for.
+    #[test]
+    fn a_paging_record_for_another_subscriber_is_not_reported() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.set_paging_identity(Some(OWN_S_TMSI));
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[OTHER_S_TMSI]))
+                .await;
+        });
+
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "a non-matching paging record must not reach NAS"
+        );
+    }
+
+    /// Only the matching record of a multi-UE paging message is reported: the
+    /// AS filters, so NAS never sees another subscriber's identity.
+    #[test]
+    fn only_the_matching_record_of_a_multi_ue_paging_message_is_reported() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.set_paging_identity(Some(OWN_S_TMSI));
+
+        run_async(async {
+            task.handle_downlink_rrc(
+                PAGING_CELL,
+                RrcChannel::Pcch,
+                pcch_paging(&[OTHER_S_TMSI, OWN_S_TMSI, OTHER_S_TMSI]),
+            )
+            .await;
+        });
+
+        assert_eq!(try_take_paging(&mut nas_rx), Some(vec![OWN_S_TMSI]));
+    }
+
+    /// TS 38.304 §7.1: PCCH is monitored in RRC_IDLE and RRC_INACTIVE only.
+    #[test]
+    fn a_connected_ue_ignores_its_own_paging_record() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.set_paging_identity(Some(OWN_S_TMSI));
+        task.state_machine
+            .transition(crate::rrc::state::RrcStateTransition::SetupComplete)
+            .expect("Idle -> Connected");
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[OWN_S_TMSI]))
+                .await;
+        });
+
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "a connected UE is reached on its own SRB, not by paging"
+        );
+    }
+
+    /// Before a 5G-GUTI is assigned the UE has no paging identity, so no record
+    /// can be for it — including one carrying all-zero octets.
+    #[test]
+    fn a_ue_without_a_paging_identity_reports_nothing() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_downlink_rrc(
+                PAGING_CELL,
+                RrcChannel::Pcch,
+                pcch_paging(&[[0u8; 6], OWN_S_TMSI]),
+            )
+            .await;
+        });
+
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "no identity installed → no match"
+        );
+    }
+
+    /// A deleted paging identity (deregistration) stops paging responses.
+    #[test]
+    fn a_cleared_paging_identity_stops_matching() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.set_paging_identity(Some(OWN_S_TMSI));
+        task.set_paging_identity(None);
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[OWN_S_TMSI]))
+                .await;
+        });
+
+        assert!(try_take_paging(&mut nas_rx).is_none());
+    }
+
+    #[test]
+    fn an_undecodable_pcch_pdu_is_dropped_without_reporting() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.set_paging_identity(Some(OWN_S_TMSI));
+
+        run_async(async {
+            task.handle_downlink_rrc(
+                PAGING_CELL,
+                RrcChannel::Pcch,
+                OctetString::from_slice(&[0xFF, 0xFF, 0xFF]),
+            )
+            .await;
+        });
+
+        assert!(try_take_paging(&mut nas_rx).is_none());
     }
 }

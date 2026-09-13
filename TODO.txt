@@ -186,7 +186,8 @@ KNOWN LIMITATIONS / INCOMPLETE FEATURES
 - [x] UE Context Release: Implemented
 - [x] Error Indication: Implemented
 - [ ] Handover procedures: Basic implementation only
-- [ ] Paging: Basic implementation, needs optimization
+- [x] Paging: NGAP decode, served-TAI match and PCCH broadcast to the UE
+      (paging occasion PF/PO still not derived — no frame clock in the sim)
 - [ ] AMF load balancing not implemented
 
 ## RRC Protocol

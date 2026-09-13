@@ -102,6 +102,7 @@ Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) ar
 | Security Mode | `security_mode.rs` | Complete (Command/Complete) |
 | System Information | `system_information.rs` | Complete (MIB/SIB1) |
 | Information Transfer | `information_transfer.rs` | Complete (DL/UL) |
+| Paging (PCCH) | `paging.rs` | Complete (PCCH-Message/Paging, 5G-S-TMSI and full I-RNTI records); broadcast by the gNB and matched by the UE end to end |
 | UPER Codec | `codec.rs` | Complete (ASN.1 UPER encode/decode) |
 
 ### Gaps
@@ -109,6 +110,7 @@ Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) ar
 | Gap | Details |
 |-----|---------|
 | Measurement Report | `procedures/measurement_report.rs` codec now exists in this crate, but the gNB/UE tasks still emit/parse a simplified byte format (not yet wired to the codec) |
+| Paging occasion (PF/PO) | Paging is broadcast immediately instead of at the UE's paging occasion. TS 38.304 §7.1 derives the PF/PO from the UE identity and the DRX cycle in radio frames, and the simulator maintains no SFN, so there is no frame clock to schedule against |
 | RRC Reestablishment | Now implemented: `procedures/rrc_reestablishment.rs` (~422 lines) |
 | RRC Resume | Now implemented: `procedures/rrc_resume.rs` (~642 lines) + UE-side `nextgsim-ue/src/rrc/resume.rs` (TS 38.331 5.3.13, T319) |
 | Conditional Handover | Now implemented: `procedures/conditional_handover.rs` (~803 lines) |

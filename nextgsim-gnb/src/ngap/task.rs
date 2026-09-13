@@ -400,7 +400,13 @@ impl NgapTask {
     // ========================================================================
 
     /// Handles SCTP association up event
-    async fn handle_association_up(
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`NgapMessage::SctpAssociationUp`) also driven directly by the in-process
+    /// paging harness (`tests/src/paging_mt_service_request.rs`), which brings
+    /// the AMF association up the way the SCTP task does rather than mutating
+    /// the AMF context state from outside.
+    pub async fn handle_association_up(
         &mut self,
         client_id: i32,
         association_id: i32,
@@ -2386,7 +2392,13 @@ impl NgapTask {
     // ========================================================================
 
     /// Handles received NGAP PDU from SCTP
-    async fn handle_ngap_pdu(&mut self, client_id: i32, stream: u16, pdu: OctetString) {
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`NgapMessage::ReceiveNgapPdu`) also driven directly by the in-process
+    /// paging harness (`tests/src/paging_mt_service_request.rs`), which feeds it
+    /// an AMF-encoded PDU so the NGAP decode is production code rather than a
+    /// hand-built `PagingData`.
+    pub async fn handle_ngap_pdu(&mut self, client_id: i32, stream: u16, pdu: OctetString) {
         debug!(
             "Received NGAP PDU: client_id={}, stream={}, len={}",
             client_id,

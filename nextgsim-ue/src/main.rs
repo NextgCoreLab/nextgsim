@@ -505,6 +505,10 @@ impl UeApp {
         // instead of running a fresh authentication. With no `state_file` this
         // is `MmOrchestrator::new` and nothing touches the filesystem.
         let mut orch = MmOrchestrator::from_config(identity, &task_base.config);
+        // A restored snapshot may already carry a 5G-GUTI, so the AS can have a
+        // paging identity before the first NAS procedure runs (TS 38.331
+        // §5.3.2.3). A no-op when there is no stored GUTI.
+        sync_paging_identity(&mut orch, &task_base).await;
 
         // SM procedure orchestrator: owns the per-PSI session state, PSI /
         // PTI allocation and the SM timers (TS 24.501 Section 6). The UE only
@@ -723,8 +727,12 @@ impl UeApp {
                             warn!("Radio link failure");
                             orch.state_mut().switch_cm_state(CmState::Idle);
                         }
-                        NasMessage::Paging { paging_tmsi } => {
-                            info!("Paging received: {} TMSIs", paging_tmsi.len());
+                        NasMessage::Paging { paging_s_tmsi } => {
+                            info!(
+                                "Paging received for {} of this UE's identities: {:02x?}",
+                                paging_s_tmsi.len(),
+                                paging_s_tmsi
+                            );
 
                             // If registered and CM-IDLE, run the service request
                             // procedure (the 5G-S-TMSI is derived from the
@@ -1229,6 +1237,32 @@ async fn process_mm_outputs(
                 }
             }
         }
+    }
+
+    // TS 38.331 §5.3.2.3: the AS matches paging records against the UE's
+    // 5G-S-TMSI, which only the NAS plane knows. Any output above may have
+    // assigned or deleted the 5G-GUTI it is derived from (Registration Accept,
+    // deregistration, a rejected registration), so the AS is re-synchronised
+    // here rather than at each of those sites; the orchestrator reports only a
+    // real change.
+    sync_paging_identity(orch, task_base).await;
+}
+
+/// Hands the AS the 5G-S-TMSI to match PCCH paging records against, when it
+/// changed since the last time it was signalled (TS 38.331 §5.3.2.3).
+async fn sync_paging_identity(
+    orch: &mut nextgsim_ue::nas::mm::MmOrchestrator,
+    task_base: &UeTaskBase,
+) {
+    if let Some(s_tmsi) = orch.take_paging_identity_update() {
+        match s_tmsi {
+            Some(tmsi) => info!("Handing paging identity to RRC: 5G-S-TMSI {:02x?}", tmsi),
+            None => info!("Clearing the paging identity held by RRC"),
+        }
+        let _ = task_base
+            .rrc_tx
+            .send(RrcMessage::PagingIdentity { s_tmsi })
+            .await;
     }
 }
 
