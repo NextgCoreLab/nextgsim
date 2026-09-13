@@ -123,6 +123,38 @@ impl NwdafTask {
         }
     }
 
+    /// Report one observation received from the 6G topic bus (issue #16).
+    ///
+    /// Logging only, deliberately: the analytics state is fed by the
+    /// `NwdafMessage` channel, and having the bus feed it as well would double
+    /// every sample. What this demonstrates is that the fan-out works — a second
+    /// consumer receives the ISAC task's observation without the ISAC task
+    /// knowing about it.
+    ///
+    /// A `Lagged` is reported at `warn` rather than swallowed: it means this
+    /// consumer fell behind and lost samples, which is the bus's documented
+    /// trade-off and worth seeing rather than guessing at.
+    #[cfg(feature = "event-bus")]
+    fn log_bus_event(
+        event: Result<nextgsim_common::bus::BusEvent, tokio::sync::broadcast::error::RecvError>,
+    ) {
+        use tokio::sync::broadcast::error::RecvError;
+        match event {
+            Ok(event) => debug!(
+                "NWDAF: bus event on {} from {}: {} = {:?}",
+                event.topic.name(),
+                event.source,
+                event.measurement_type,
+                event.measurements
+            ),
+            Err(RecvError::Lagged(skipped)) => warn!(
+                "NWDAF: lagged on the 6G topic bus, {} event(s) lost",
+                skipped
+            ),
+            Err(RecvError::Closed) => debug!("NWDAF: the 6G topic bus closed"),
+        }
+    }
+
     /// Handles a cell load report
     fn handle_cell_load(&mut self, cell_id: i32, prb_usage: f32, connected_ues: u32) {
         debug!(
@@ -225,8 +257,44 @@ impl Task for NwdafTask {
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
         info!("NWDAF task started");
 
+        // Subscribe to the topic bus (issue #16), which is the reference consumer
+        // for the reference producer in the ISAC task. This is a SECOND source of
+        // the same observations, not a replacement for the NwdafMessage channel:
+        // the direct channel is what the ISAC task's delivery depends on, and this
+        // is how a further consumer would be added without editing that task.
+        #[cfg(feature = "event-bus")]
+        let mut bus_rx = self
+            .task_base
+            .sixg
+            .as_ref()
+            .and_then(|sixg| sixg.bus.as_ref())
+            .map(|bus| bus.subscribe());
+        #[cfg(feature = "event-bus")]
+        if bus_rx.is_some() {
+            info!("NWDAF task subscribed to the 6G topic bus");
+        }
+
         loop {
-            match rx.recv().await {
+            // The bus arm is selected over only when a subscription exists, so a
+            // build with the feature on but no 6G task init behaves as before.
+            #[cfg(feature = "event-bus")]
+            let msg = {
+                if let Some(ref mut bus_rx) = bus_rx {
+                    tokio::select! {
+                        received = rx.recv() => received,
+                        bus_event = bus_rx.recv() => {
+                            Self::log_bus_event(bus_event);
+                            continue;
+                        }
+                    }
+                } else {
+                    rx.recv().await
+                }
+            };
+            #[cfg(not(feature = "event-bus"))]
+            let msg = rx.recv().await;
+
+            match msg {
                 Some(TaskMessage::Message(msg)) => match msg {
                     NwdafMessage::UeMeasurement {
                         ue_id,

@@ -64,6 +64,35 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+  event-bus:
+    name: Event bus (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `event-bus` feature (issue #16) is off by default, so the
+      # default-feature check/test/clippy jobs above never compile it. Without
+      # this job the module and its wiring would ship untested -- the failure mode
+      # this repo has recorded for feature-gated code more than once.
+      #
+      # The gNB's ISAC and NWDAF tasks live behind `6g`, so the reference
+      # producer/consumer path needs both features together.
+      - name: cargo test (bus core)
+        run: cargo test -p nextgsim-common --features event-bus
+      - name: cargo test (gNB reference path)
+        run: cargo test -p nextgsim-gnb --features event-bus,6g
+      - name: cargo test (UE wiring)
+        run: cargo test -p nextgsim-ue --features event-bus
+      - name: cargo clippy
+        run: |
+          cargo clippy -p nextgsim-common --features event-bus --all-targets
+          cargo clippy -p nextgsim-gnb --features event-bus,6g --all-targets
+          cargo clippy -p nextgsim-ue --features event-bus --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

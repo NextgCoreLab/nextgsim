@@ -1,6 +1,8 @@
 //! ISAC Task for gNB - Integrated Sensing and Communication
 
 use crate::tasks::{GnbTaskBase, IsacMessage, NwdafMessage, Task, TaskMessage};
+#[cfg(feature = "event-bus")]
+use nextgsim_common::bus::{BusEvent, Topic};
 use nextgsim_isac::{
     IsacManager, SensingData, SensingMeasurement, SensingType, TrackingState, Vector3,
 };
@@ -72,6 +74,30 @@ impl Task for IsacTask {
                                 timestamp_ms,
                             };
                             self.engine.record_sensing_data(data);
+
+                            // Publish the raw observation on the topic bus
+                            // (issue #16). This arm has no point-to-point
+                            // counterpart -- the sensing data goes into the
+                            // engine and no other task is told -- so the bus is
+                            // additive here in the strongest sense: it makes an
+                            // observation available that previously reached
+                            // nobody, without this task acquiring a handle to
+                            // whoever wants it.
+                            #[cfg(feature = "event-bus")]
+                            if let Some(bus) =
+                                self.task_base.sixg.as_ref().and_then(|s| s.bus.as_ref())
+                            {
+                                let delivered = bus.publish(BusEvent::new(
+                                    Topic::SensingData,
+                                    format!("gnb-isac-cell-{cell_id}"),
+                                    measurement_type.clone(),
+                                    measurements.clone(),
+                                ));
+                                debug!(
+                                    "ISAC: published {} sensing sample(s) from cell {} to {} bus subscriber(s)",
+                                    measurements.len(), cell_id, delivered
+                                );
+                            }
                         }
                         IsacMessage::FusionRequest { ue_id, source_ids } => {
                             debug!(
@@ -126,6 +152,31 @@ impl Task for IsacTask {
                                     if let Err(e) = sixg.nwdaf_tx.send(nwdaf_msg).await {
                                         warn!("ISAC: Failed to forward position to NWDAF: {}", e);
                                     }
+                                    // Additionally publish the same observation on
+                                    // the topic bus (issue #16). The
+                                    // point-to-point send above is unchanged and
+                                    // remains the delivery guarantee; the bus is
+                                    // how a *second* consumer -- the agent
+                                    // framework, say -- gets the fused position
+                                    // without this task growing another handle.
+                                    #[cfg(feature = "event-bus")]
+                                    if let Some(ref bus) = sixg.bus {
+                                        let delivered = bus.publish(BusEvent::new(
+                                            Topic::SensingData,
+                                            "gnb-isac",
+                                            "fused-position",
+                                            vec![
+                                                fused.position.x as f32,
+                                                fused.position.y as f32,
+                                                fused.position.z as f32,
+                                                fused.confidence,
+                                            ],
+                                        ));
+                                        debug!(
+                                            "ISAC: published fused position for UE {} to {} bus subscriber(s)",
+                                            ue_id, delivered
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -152,5 +203,156 @@ impl Task for IsacTask {
             }
         }
         info!("ISAC task stopped, {} tracked objects", self.trackers.len());
+    }
+}
+
+// ============================================================================
+// Topic-bus reference path (issue #16)
+// ============================================================================
+
+#[cfg(all(test, feature = "event-bus"))]
+mod bus_tests {
+    use super::*;
+    use nextgsim_common::config::GnbConfig;
+
+    /// The reference end-to-end path #16's criterion 4 asks for: an observation
+    /// the gNB ISAC task publishes reaches a bus subscriber, which is exactly how
+    /// the NWDAF task subscribes at the top of its run loop.
+    ///
+    /// A clone of the bus is held for the duration, because the only other sender
+    /// lives inside the `GnbTaskBase` that moves into the task -- when the task
+    /// ends, that sender drops and an un-cloned receiver reports `Closed` before
+    /// it can be read. The NWDAF task does not have this problem, since its own
+    /// `task_base` keeps a sender alive for as long as it is subscribed.
+    #[test]
+    fn a_sensing_observation_reaches_a_bus_subscriber() {
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(GnbConfig::default(), 32);
+        let _sixg_rx = task_base.init_6g_tasks(32);
+
+        let bus = task_base
+            .sixg
+            .as_ref()
+            .and_then(|sixg| sixg.bus.as_ref())
+            .expect("the bus exists with the feature on")
+            .clone();
+        let mut bus_rx = bus.subscribe();
+
+        let (isac_tx, isac_rx) = mpsc::channel(32);
+        let mut task = IsacTask::new(task_base);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(async move {
+                isac_tx
+                    .send(TaskMessage::Message(IsacMessage::SensingData {
+                        cell_id: 4,
+                        measurement_type: "Rtt".to_string(),
+                        measurements: vec![50.0, 55.5],
+                    }))
+                    .await
+                    .expect("send sensing data");
+                isac_tx.send(TaskMessage::Shutdown).await.expect("shutdown");
+                task.run(isac_rx).await;
+            });
+
+        let event = bus_rx
+            .try_recv()
+            .expect("the bus subscriber receives the ISAC observation");
+        assert_eq!(event.topic, Topic::SensingData);
+        assert_eq!(event.source, "gnb-isac-cell-4");
+        assert_eq!(event.measurement_type, "Rtt");
+        assert_eq!(event.measurements, vec![50.0, 55.5]);
+    }
+
+    /// The bus is additive: with nobody subscribed the ISAC task runs exactly as
+    /// it did, and publishing is a no-op rather than an error. This is the half
+    /// that keeps a default build honest -- a producer must not depend on a
+    /// consumer existing.
+    #[test]
+    fn publishing_with_no_subscriber_does_not_disturb_the_isac_task() {
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(GnbConfig::default(), 32);
+        let _sixg_rx = task_base.init_6g_tasks(32);
+        let bus = task_base
+            .sixg
+            .as_ref()
+            .and_then(|sixg| sixg.bus.as_ref())
+            .expect("bus")
+            .clone();
+        assert_eq!(bus.subscriber_count(), 0);
+
+        let (isac_tx, isac_rx) = mpsc::channel(32);
+        let mut task = IsacTask::new(task_base);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(async move {
+                for sample in [1.0f32, 2.0, 3.0] {
+                    isac_tx
+                        .send(TaskMessage::Message(IsacMessage::SensingData {
+                            cell_id: 1,
+                            measurement_type: "Rss".to_string(),
+                            measurements: vec![sample],
+                        }))
+                        .await
+                        .expect("send");
+                }
+                isac_tx.send(TaskMessage::Shutdown).await.expect("shutdown");
+                // The task completing at all is the assertion: a publish with no
+                // subscriber must not error out of the loop.
+                task.run(isac_rx).await;
+            });
+
+        assert_eq!(bus.subscriber_count(), 0, "still nobody listening");
+    }
+
+    /// Several consumers, one producer, no change to the producer -- which is the
+    /// ergonomics problem #16 exists to fix. With point-to-point channels this
+    /// would need a second `TaskHandle` and a second message variant.
+    #[test]
+    fn two_consumers_both_receive_one_isac_observation() {
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(GnbConfig::default(), 32);
+        let _sixg_rx = task_base.init_6g_tasks(32);
+        let bus = task_base
+            .sixg
+            .as_ref()
+            .and_then(|sixg| sixg.bus.as_ref())
+            .expect("bus")
+            .clone();
+        let mut analytics = bus.subscribe();
+        let mut agent = bus.subscribe();
+
+        let (isac_tx, isac_rx) = mpsc::channel(32);
+        let mut task = IsacTask::new(task_base);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(async move {
+                isac_tx
+                    .send(TaskMessage::Message(IsacMessage::SensingData {
+                        cell_id: 9,
+                        measurement_type: "AoA".to_string(),
+                        measurements: vec![42.0],
+                    }))
+                    .await
+                    .expect("send");
+                isac_tx.send(TaskMessage::Shutdown).await.expect("shutdown");
+                task.run(isac_rx).await;
+            });
+
+        for (label, rx) in [("analytics", &mut analytics), ("agent", &mut agent)] {
+            let event = rx
+                .try_recv()
+                .unwrap_or_else(|e| panic!("{label} must receive it, got {e:?}"));
+            assert_eq!(event.measurements, vec![42.0]);
+        }
     }
 }

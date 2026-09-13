@@ -1132,6 +1132,13 @@ pub struct GnbSixgHandles {
     pub agent_tx: TaskHandle<AgentMessage>,
     /// Handle to the FL (Federated Learning) Aggregator task
     pub fl_tx: TaskHandle<FlAggregatorMessage>,
+    /// Optional in-process topic bus for cross-cutting observations (issue #16).
+    ///
+    /// A **second** path, not a replacement: every producer below keeps its
+    /// point-to-point handle and publishes to the bus as well, so a default build
+    /// (feature off, field absent) behaves exactly as before.
+    #[cfg(feature = "event-bus")]
+    pub bus: Option<nextgsim_common::bus::EventBus>,
 }
 
 /// 6G task receivers for gNB
@@ -1202,6 +1209,8 @@ impl GnbTaskBase {
             isac_tx: TaskHandle::new(isac_tx),
             agent_tx: TaskHandle::new(agent_tx),
             fl_tx: TaskHandle::new(fl_tx),
+            #[cfg(feature = "event-bus")]
+            bus: Some(nextgsim_common::bus::EventBus::default()),
         });
 
         GnbSixgReceivers {
