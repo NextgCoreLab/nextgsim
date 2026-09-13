@@ -71,6 +71,23 @@ upf_port: 2152
 # UEs discovering cells from RLS heartbeats only (the pre-#21 behaviour).
 si_broadcast_period_ms: 80
 
+# Accept a raw NAS PDU on UL-DCCH from a UE that never sent an
+# RRCSetupComplete, auto-creating its context and forwarding the NAS as an
+# Initial UE Message.
+#
+# false (the default) is STRICT: TS 38.331 §5.3.3 carries the initial NAS inside
+# RRCSetupComplete, so a UE that skips the establishment handshake fails to
+# attach rather than being helped along. This gNB's own UE performs the real
+# handshake since #30 wired the library RrcTask into the UE binary, so the
+# leniency no longer serves the matched pair -- all it can do now is hide a
+# non-conformant peer, which is the opposite of what a conformance simulator is
+# for.
+#
+# Set true for interop with a third-party UE simulator that sends bare NAS on
+# DCCH. Transitional: the honest reading of a UE that needs it is that the UE
+# has a defect.
+accept_raw_nas_on_dcch: false
+
 # physCellId of a secondary cell to configure on each UE (sCellToAddModList,
 # TS 38.331 §5.3.5.5.9), sent once per UE after its first RRCReconfiguration.
 # Commented out means no SCell is added, which is the pre-#112 behaviour.
