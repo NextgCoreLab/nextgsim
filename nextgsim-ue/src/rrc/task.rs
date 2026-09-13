@@ -49,6 +49,11 @@ use nextgsim_rrc::procedures::conditional_handover::decode_cho_config;
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
 };
+use nextgsim_rrc::procedures::rrc_reestablishment::{
+    decode_rrc_reestablishment, encode_rrc_reestablishment_complete,
+    encode_rrc_reestablishment_request, phys_cell_id_from_nci, ReestablishmentCauseValue,
+    ReestablishmentUeIdentity, RrcReestablishmentCompleteParams, RrcReestablishmentRequestParams,
+};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup, encode_rrc_setup_complete, encode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
@@ -1042,47 +1047,11 @@ impl RrcTask {
                 warn!("Received RRC Reject from cell {}", cell_id);
                 self.handle_rrc_reject(cell_id).await;
             }
-            0x02 => {
-                // RRCReestablishment — network accepted re-establishment
-                info!("Received RRCReestablishment from cell {}", cell_id);
-                // Extract RRC transaction ID (byte 1, lower nibble)
-                let rrc_transaction_id = if bytes.len() > 1 { bytes[1] & 0x03 } else { 0 };
-
-                // If a re-establishment was not already in WaitingForResponse, the UE
-                // could have crashed and recovered; treat cell as found first.
-                if self.reestablishment_proc.state() == ReestablishmentState::CellSearch {
-                    let _ = self.reestablishment_proc.on_cell_found();
-                }
-
-                match self
-                    .reestablishment_proc
-                    .on_reestablishment_received(rrc_transaction_id, &mut self.state_machine)
-                {
-                    Ok(complete_params) => {
-                        // Send RRCReestablishmentComplete
-                        // Encoding: message type 0x02 | transaction_id in bits[1:0]
-                        let rrc_pdu = OctetString::from_slice(&[
-                            0x02 | (complete_params.rrc_transaction_id & 0x03)
-                        ]);
-                        self.send_uplink_rrc(RrcChannel::UlCcch, rrc_pdu).await;
-
-                        // Notify NAS that connection is restored
-                        if let Err(e) = self
-                            .task_base
-                            .nas_tx
-                            .send(NasMessage::RrcConnectionSetup)
-                            .await
-                        {
-                            error!("Failed to notify NAS after re-establishment: {}", e);
-                        }
-                        self.serving_cell_id = Some(cell_id);
-                        info!("RRC re-establishment complete on cell {}", cell_id);
-                    }
-                    Err(e) => {
-                        warn!("RRCReestablishment handling failed: {}", e);
-                    }
-                }
-            }
+            // No DL-CCCH arm for an RRCReestablishment. There was one, on low
+            // nibble 0x02, and it never matched: the gNB's bespoke reply led with
+            // 0x24, whose low nibble is 0x04. TS 38.331 §6.2.1 puts
+            // RRCReestablishment on DL-DCCH/SRB1 anyway, which is where it is
+            // handled now (issue #37).
             _ => {
                 debug!("Unhandled DL-CCCH message type: {:#x}", msg_type);
             }
@@ -1129,6 +1098,15 @@ impl RrcTask {
                 self.handle_as_security_mode_command(smc).await;
                 return;
             }
+        }
+
+        // RRCReestablishment (TS 38.331 §6.2.1: DL-DCCH / SRB1), decoded rather
+        // than nibble-matched. Tried before the legacy matcher because its real
+        // UPER leading byte would otherwise be misrouted.
+        if let Ok(reestablishment) = decode_rrc_reestablishment(bytes) {
+            self.handle_rrc_reestablishment(cell_id, &reestablishment)
+                .await;
+            return;
         }
 
         let msg_type = bytes[0] & 0x0F;
@@ -1434,6 +1412,69 @@ impl RrcTask {
             .await
         {
             error!("Failed to notify NAS of RRC reject: {}", e);
+        }
+    }
+
+    /// Handle an `RRCReestablishment` (TS 38.331 §5.3.7.5): the network verified
+    /// the `shortMAC-I` and restored the context.
+    ///
+    /// The reply arrives on **DL-DCCH / SRB1** and the completion goes out on
+    /// UL-DCCH, per §6.2.1 — only the preceding request rides CCCH. Both were on
+    /// CCCH before, in a bespoke framing neither end recognised.
+    ///
+    /// The `nextHopChainingCount` is recorded but not yet acted on: deriving the
+    /// new KgNB from the {NH, NCC} pair (TS 33.501 §6.9.4.1) needs the NH, which
+    /// only reaches a gNB through a Path Switch Request Acknowledge — a path that
+    /// is not wired (issue #39). The count is logged so a mismatch is visible.
+    async fn handle_rrc_reestablishment(
+        &mut self,
+        cell_id: i32,
+        reestablishment: &nextgsim_rrc::procedures::rrc_reestablishment::RrcReestablishmentData,
+    ) {
+        info!(
+            "Received RRCReestablishment from cell {} (tid {}, ncc {})",
+            cell_id, reestablishment.rrc_transaction_id, reestablishment.next_hop_chaining_count
+        );
+
+        // If a re-establishment was not already in WaitingForResponse, the UE
+        // could have crashed and recovered; treat cell as found first.
+        if self.reestablishment_proc.state() == ReestablishmentState::CellSearch {
+            let _ = self.reestablishment_proc.on_cell_found();
+        }
+
+        match self.reestablishment_proc.on_reestablishment_received(
+            reestablishment.rrc_transaction_id,
+            &mut self.state_machine,
+        ) {
+            Ok(complete_params) => {
+                match encode_rrc_reestablishment_complete(&RrcReestablishmentCompleteParams {
+                    rrc_transaction_id: complete_params.rrc_transaction_id,
+                }) {
+                    Ok(bytes) => {
+                        self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&bytes))
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("RRCReestablishmentComplete encoding failed: {}", e);
+                        return;
+                    }
+                }
+
+                // Notify NAS that connection is restored
+                if let Err(e) = self
+                    .task_base
+                    .nas_tx
+                    .send(NasMessage::RrcConnectionSetup)
+                    .await
+                {
+                    error!("Failed to notify NAS after re-establishment: {}", e);
+                }
+                self.serving_cell_id = Some(cell_id);
+                info!("RRC re-establishment complete on cell {}", cell_id);
+            }
+            Err(e) => {
+                warn!("RRCReestablishment handling failed: {}", e);
+            }
         }
     }
 
@@ -1939,7 +1980,6 @@ impl RrcTask {
         };
         if let Some(security) = security {
             let c_rnti = security.c_rnti;
-            let pci = self.serving_cell_id.unwrap_or(0) as u16;
 
             // Target cell identity: the cell we re-establish on (the serving
             // cell in this simulation, looked up from its SIB1 NCI)
@@ -1948,6 +1988,12 @@ impl RrcTask {
                 .and_then(|id| self.cell_selector.get_cell(id))
                 .map(|cell| cell.sib1.nci as u64)
                 .unwrap_or(0);
+            // The PCI is derived from that same NCI rather than from the UE's own
+            // cell index, which is a local counter the network cannot hold. See
+            // `phys_cell_id_from_nci`: with a real broadcast SIB1 both ends derive
+            // the same number, and without one the gNB answers with an RRCSetup,
+            // which is §5.3.3.1's behaviour for an unresolvable identity.
+            let pci = phys_cell_id_from_nci(target_cell_identity);
 
             // ShortMAC-I derived from the AS security context (TS 38.331 §5.3.7.4)
             let short_mac_i = match compute_short_mac_i(&security, pci, target_cell_identity) {
@@ -1983,24 +2029,54 @@ impl RrcTask {
                     // Immediately mark cell as found (re-use serving cell if still visible)
                     let _ = self.reestablishment_proc.on_cell_found();
 
-                    // Build a minimal RRCReestablishmentRequest
-                    // Encoding: [cause_byte, c_rnti_hi, c_rnti_lo, pci_hi, pci_lo, short_mac_hi, short_mac_lo]
-                    let cause_byte = match params.trigger {
-                        ReestablishmentTrigger::ReconfigurationFailure => 0x00,
-                        ReestablishmentTrigger::HandoverFailure => 0x01,
-                        _ => 0x03, // otherFailure
+                    // A real UPER UL-CCCH RRCReestablishmentRequest (TS 38.331
+                    // §6.2.2). The bespoke framing this replaced put 0x05 in the
+                    // first byte, which the gNB's dispatcher read as an
+                    // RRCSetupRequest -- and which actually DECODES as one, so
+                    // the network answered a re-establishment with an RRCSetup
+                    // built on a fabricated context and never saw the shortMAC-I
+                    // at all (issue #37).
+                    let cause = match params.trigger {
+                        ReestablishmentTrigger::ReconfigurationFailure => {
+                            ReestablishmentCauseValue::ReconfigurationFailure
+                        }
+                        ReestablishmentTrigger::HandoverFailure => {
+                            ReestablishmentCauseValue::HandoverFailure
+                        }
+                        _ => ReestablishmentCauseValue::OtherFailure,
                     };
-                    let rrc_pdu = OctetString::from_slice(&[
-                        0x05, // RRCReestablishmentRequest message type
-                        cause_byte,
-                        (params.c_rnti >> 8) as u8,
-                        params.c_rnti as u8,
-                        (params.pci >> 8) as u8,
-                        params.pci as u8,
-                        (params.short_mac_i >> 8) as u8,
-                        params.short_mac_i as u8,
-                    ]);
-                    self.send_uplink_rrc(RrcChannel::UlCcch, rrc_pdu).await;
+                    match encode_rrc_reestablishment_request(&RrcReestablishmentRequestParams {
+                        ue_identity: ReestablishmentUeIdentity {
+                            c_rnti: params.c_rnti,
+                            phys_cell_id: params.pci,
+                            short_mac_i: params.short_mac_i,
+                        },
+                        reestablishment_cause: cause,
+                    }) {
+                        Ok(bytes) => {
+                            self.send_uplink_rrc(
+                                RrcChannel::UlCcch,
+                                OctetString::from_slice(&bytes),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            error!(
+                                "RRCReestablishmentRequest encoding failed: {} -- going to idle",
+                                e
+                            );
+                            let _ = self.state_machine.on_rrc_release();
+                            self.serving_cell_id = None;
+                            if let Err(ne) = self
+                                .task_base
+                                .nas_tx
+                                .send(NasMessage::RadioLinkFailure)
+                                .await
+                            {
+                                error!("Failed to notify NAS of radio link failure: {}", ne);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(

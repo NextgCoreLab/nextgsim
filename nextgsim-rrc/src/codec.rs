@@ -24,6 +24,13 @@ pub mod generated {
 // Re-export commonly used types at the module level
 pub use generated::*;
 
+/// `PhysCellId ::= INTEGER (0..1007)` — TS 38.331 §6.3.2.
+///
+/// Defined once here rather than per procedure module, because the glob
+/// re-exports in `procedures::mod` would otherwise make two same-named constants
+/// ambiguous at the use site.
+pub const PHYS_CELL_ID_MAX: u16 = 1007;
+
 /// RRC codec error types
 #[derive(Debug, Error)]
 pub enum RrcCodecError {

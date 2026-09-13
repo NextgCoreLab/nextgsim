@@ -45,6 +45,55 @@ impl std::fmt::Display for RrcState {
     }
 }
 
+/// What the RRC task needs of the AS security context to verify a
+/// re-establishment (TS 38.331 §5.3.7.2).
+///
+/// The full AS context lives on the NGAP task, which derives it from the
+/// `SecurityKey` of the InitialContextSetupRequest. The RRC task is handed this
+/// subset over `RrcMessage::AsSecurityForReestablishment` because verifying a
+/// `shortMAC-I` needs `K_RRCint`, and answering with an `RRCReestablishment`
+/// needs the `nextHopChainingCount` — neither of which the RRC task could reach
+/// before.
+#[derive(Clone)]
+pub struct ReestablishmentSecurity {
+    /// K_RRCint (128-bit) of this UE's source PCell — what the `shortMAC-I` is
+    /// computed with.
+    pub k_rrc_int: [u8; 16],
+    /// Selected NR integrity algorithm identity (0 = NIA0 … 3 = NIA3). Must be
+    /// the same identity the UE used, or the MAC-I will not match.
+    pub integrity_alg_id: u8,
+    /// The C-RNTI the UE will present in an `RRCReestablishmentRequest`.
+    ///
+    /// This simulator has no MAC layer and therefore no C-RNTI allocation, so
+    /// both ends use the same well-known constant. The consequence, stated here
+    /// because it matters: `(C-RNTI, PCI)` does **not** distinguish two UEs on
+    /// one cell, so the lookup returns *candidates* and the `shortMAC-I`
+    /// verification is what resolves them — which it can, because each UE has a
+    /// different `K_RRCint`.
+    pub c_rnti: u16,
+    /// Physical cell identity of the PCell this context belongs to.
+    pub phys_cell_id: u16,
+    /// `nextHopChainingCount` of the current AS security context (0-7).
+    ///
+    /// TS 33.501 §6.8.2.1.1: the initial `KgNB` established at Initial Context
+    /// Setup has NCC 0, and a fresh {NH, NCC} pair arrives later in a Path Switch
+    /// Request Acknowledge. That path is not wired (issue #39), so this stays 0
+    /// in a live run — which is the spec's own initial value, not a placeholder.
+    pub next_hop_chaining_count: u8,
+}
+
+impl std::fmt::Debug for ReestablishmentSecurity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key material.
+        f.debug_struct("ReestablishmentSecurity")
+            .field("integrity_alg_id", &self.integrity_alg_id)
+            .field("c_rnti", &self.c_rnti)
+            .field("phys_cell_id", &self.phys_cell_id)
+            .field("next_hop_chaining_count", &self.next_hop_chaining_count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// RRC UE context
 ///
 /// Tracks RRC-specific information for a UE, including identity and connection state.
@@ -73,6 +122,11 @@ pub struct RrcUeContext {
     /// procedure so the gNB can verify the UE's echoed tid — replaces the
     /// former gNB-global counter.
     pub transactions: RrcTransactionAllocator,
+    /// AS security material for verifying an `RRCReestablishmentRequest`
+    /// (TS 38.331 §5.3.7.2). `None` until AS security is activated, and a
+    /// re-establishment then falls back to `RRCSetup` — a context the network
+    /// cannot verify is a context it must not restore.
+    pub reestablishment_security: Option<ReestablishmentSecurity>,
 }
 
 impl RrcUeContext {
@@ -88,7 +142,13 @@ impl RrcUeContext {
             redcap: RedCapProcessor::new(),
             nr_capability: None,
             transactions: RrcTransactionAllocator::new(),
+            reestablishment_security: None,
         }
+    }
+
+    /// Records the AS security material a re-establishment is verified against.
+    pub fn set_reestablishment_security(&mut self, security: ReestablishmentSecurity) {
+        self.reestablishment_security = Some(security);
     }
 
     /// Stores the UE-NR-Capability container received in UECapabilityInformation
@@ -241,6 +301,34 @@ impl RrcUeContextManager {
             .filter(|(_, ctx)| ctx.is_connected())
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// UE contexts whose stored AS security context matches the `(C-RNTI, PCI)`
+    /// a UE presents in an `RRCReestablishmentRequest` (TS 38.331 §5.3.7.2).
+    ///
+    /// Returns **candidates**, not one context, and in ascending `ue_id` order so
+    /// the caller's verification is deterministic. Two reasons it can be more than
+    /// one: the simulator has no C-RNTI allocation, so every UE presents the same
+    /// well-known constant (see [`ReestablishmentSecurity::c_rnti`]). The
+    /// `shortMAC-I` verification is what resolves the set — each UE has a
+    /// different `K_RRCint`, so at most one candidate can produce the presented
+    /// MAC.
+    ///
+    /// A context with no stored AS security is not a candidate: it cannot be
+    /// verified, and §5.3.3.1 says an unverifiable context means `RRCSetup`.
+    pub fn candidates_for_reestablishment(&self, c_rnti: u16, phys_cell_id: u16) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .contexts
+            .iter()
+            .filter(|(_, ctx)| {
+                ctx.reestablishment_security
+                    .as_ref()
+                    .is_some_and(|s| s.c_rnti == c_rnti && s.phys_cell_id == phys_cell_id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
