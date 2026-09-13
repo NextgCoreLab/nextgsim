@@ -259,6 +259,12 @@ fn default_eutra_b1_threshold_dbm() -> i32 {
     -110
 }
 
+/// A network-assigned UE radio capability ID is kept by default since #101 gave
+/// it a consumer (the RACS IE of the REGISTRATION REQUEST).
+fn default_racs_store_assigned_id() -> bool {
+    true
+}
+
 fn default_si_broadcast_period_ms() -> u64 {
     80
 }
@@ -1290,18 +1296,28 @@ pub struct UeConfig {
     /// TS 23.003 §29 / TS 24.501 §9.11.3.68) that a CONFIGURATION UPDATE
     /// COMMAND assigns.
     ///
-    /// `false` (the default) decodes the IE — so the command is still
-    /// acknowledged and the rest of it applied — and then discards the ID,
-    /// because nothing in this simulator signals a UE radio capability ID yet:
-    /// there is no RACS IE in the REGISTRATION REQUEST and no RRC or NGAP
-    /// consumer, so storing it by default would only add state no code reads.
-    /// Set it when a deployment wants the assignment observable (the CLI status
-    /// and the logs report it).
+    /// **`true` since #101**, because the ID now has a consumer: a stored ID is
+    /// presented back to the network in the UE radio capability ID IE of the next
+    /// REGISTRATION REQUEST (TS 24.501 §8.2.6), which is the whole point of RACS
+    /// — the UE offers an identifier and the network resolves the capability set
+    /// from the UCMF instead of asking for the full capability. It defaulted to
+    /// `false` while there was no consumer, when storing it would only have added
+    /// state no code reads.
+    ///
+    /// Set it to `false` to go back to decode-and-discard: the CONFIGURATION
+    /// UPDATE COMMAND is still acknowledged and the rest of it applied, and no
+    /// REGISTRATION REQUEST carries the IE.
+    ///
+    /// **Scope of what is modelled**: the UE side only. There is no UCMF in
+    /// nextgcore and no NGAP UE Radio Capability ID Mapping (TS 38.413 §8.9.5), so
+    /// the only way an ID arrives is an operator sending a CONFIGURATION UPDATE
+    /// COMMAND by hand. The UE's half is complete and testable; the network's
+    /// half is a cross-repo issue.
     ///
     /// A RUNTIME switch and not a cargo feature: CI runs `cargo test
     /// --workspace` with default features, so a feature-gated store would ship
     /// without ever being compiled by the gate meant to cover it.
-    #[serde(default)]
+    #[serde(default = "default_racs_store_assigned_id")]
     pub racs_store_assigned_id: bool,
     /// Path to the file holding the 5GMM parameters TS 24.501 Annex C.1 wants
     /// kept in non-volatile memory: the 5G-GUTI, last visited registered TAI,
@@ -1402,7 +1418,7 @@ impl Default for UeConfig {
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             ursp_evaluation: false,
-            racs_store_assigned_id: false,
+            racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
@@ -1876,7 +1892,7 @@ configured_nssai:
             configured_nssai: NetworkSlice::new(),
             tun_name: Some("tun0".to_string()),
             ursp_evaluation: false,
-            racs_store_assigned_id: false,
+            racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
@@ -2162,7 +2178,7 @@ configured_nssai:
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             ursp_evaluation: false,
-            racs_store_assigned_id: false,
+            racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),

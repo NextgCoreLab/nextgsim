@@ -503,6 +503,9 @@ mod registration_request_iei {
     pub const LADN_INDICATION: u8 = 0x74;
     /// Payload container
     pub const PAYLOAD_CONTAINER: u8 = 0x7B;
+    /// UE radio capability ID (RACS, TS 24.501 §8.2.6 Table 8.2.6.1.1,
+    /// §9.11.3.68). Type 4 TLV.
+    pub const UE_RADIO_CAPABILITY_ID: u8 = 0x67;
     /// Payload container type (Table 8.2.6.1.1 IEI `8-`: a type 1 TV IE, so the
     /// value shares the octet with the IEI in the low nibble)
     pub const PAYLOAD_CONTAINER_TYPE: u8 = 0x8;
@@ -622,6 +625,84 @@ pub struct RegistrationRequest {
     /// §8.2.6.18. Carries the UE STATE INDICATION message when the UE has
     /// stored UE policy sections for the selected PLMN (§5.5.1.2.2).
     pub payload_container: Option<Vec<u8>>,
+    /// UE radio capability ID (optional, Type 4 TLV, IEI 0x67) — RACS,
+    /// TS 24.501 §8.2.6 / §9.11.3.68, TS 23.501 §5.4.4.1a.
+    ///
+    /// The network-assigned identifier the UE presents *instead of* a full UE
+    /// radio capability, for the network to resolve via the UCMF. A string of
+    /// hexadecimal digits per TS 23.003 §29.2; packed low-nibble-first on the
+    /// wire by [`encode_ue_radio_capability_id`].
+    ///
+    /// **A non-cleartext IE** (§4.4.6): it must not appear in an initial
+    /// REGISTRATION REQUEST sent without integrity protection, only in the full
+    /// request replayed inside the SECURITY MODE COMPLETE NAS message container.
+    pub ue_radio_capability_id: Option<String>,
+}
+
+/// The filler nibble of a UE radio capability ID with an odd digit count
+/// (TS 24.501 §9.11.3.68).
+const RACS_ID_FILLER_NIBBLE: u8 = 0x0F;
+
+/// Pack a UE radio capability ID into the octets of TS 24.501 §9.11.3.68.
+///
+/// The digits go **low nibble first**: digit 0 in the low nibble of octet 0,
+/// digit 1 in its high nibble, and so on. An odd digit count is filled with
+/// `1111` in the last high nibble.
+///
+/// `None` when the string is empty or holds a non-hexadecimal character — an ID
+/// that cannot be packed must not go on the wire at all, because a truncated one
+/// resolves to some *other* UE's capability set at the UCMF.
+///
+/// This is the inverse of [`decode_ue_radio_capability_id`] and they live
+/// together deliberately: the UE decodes the ID the network assigns in a
+/// CONFIGURATION UPDATE COMMAND and encodes the same ID back in a REGISTRATION
+/// REQUEST, so a divergence between the two halves would be invisible until an
+/// interop run.
+pub fn encode_ue_radio_capability_id(id: &str) -> Option<Vec<u8>> {
+    if id.is_empty() {
+        return None;
+    }
+    let digits: Vec<u8> = id
+        .chars()
+        .map(|c| c.to_digit(16).map(|d| d as u8))
+        .collect::<Option<Vec<u8>>>()?;
+
+    let mut out = Vec::with_capacity(digits.len().div_ceil(2));
+    for pair in digits.chunks(2) {
+        let low = pair[0];
+        let high = pair.get(1).copied().unwrap_or(RACS_ID_FILLER_NIBBLE);
+        out.push((high << 4) | low);
+    }
+    Some(out)
+}
+
+/// Read a UE radio capability ID out of the octets of TS 24.501 §9.11.3.68.
+///
+/// The inverse of [`encode_ue_radio_capability_id`]: low nibble first, and a
+/// `1111` in the **last** high nibble is the odd-count filler rather than a digit.
+///
+/// `f` anywhere else is a digit. In the last octet the two readings are genuinely
+/// ambiguous and the IE's rule wins — which costs nothing for a conformant ID,
+/// because TS 23.003 §29.2 gives every UE radio capability ID an even number of
+/// digits (1 + 2 + 11 network-assigned, 1 + 8 + 11 manufacturer-assigned), so the
+/// filler should never appear.
+pub fn decode_ue_radio_capability_id(octets: &[u8]) -> String {
+    let mut id = String::with_capacity(octets.len() * 2);
+    for (index, octet) in octets.iter().enumerate() {
+        id.push(racs_hex_digit(octet & 0x0F));
+        let high = octet >> 4;
+        let is_last = index + 1 == octets.len();
+        if is_last && high == RACS_ID_FILLER_NIBBLE {
+            // Odd number of digits: the filler is not part of the ID.
+            continue;
+        }
+        id.push(racs_hex_digit(high));
+    }
+    id
+}
+
+fn racs_hex_digit(nibble: u8) -> char {
+    char::from_digit(u32::from(nibble), 16).unwrap_or('?')
 }
 
 /// Encode an 11-hex-digit SNPN NID into the 44-bit packed form of TS 23.003
@@ -733,6 +814,7 @@ impl Default for RegistrationRequest {
             redcap: false,
             payload_container_type: None,
             payload_container: None,
+            ue_radio_capability_id: None,
         }
     }
 }
@@ -921,6 +1003,23 @@ impl RegistrationRequest {
                     let mut data = vec![0u8; len];
                     buf.copy_to_slice(&mut data);
                     msg.ladn_indication = Some(data);
+                }
+                // UE radio capability ID (RACS, TS 24.501 §9.11.3.68). Type 4
+                // TLV: one length octet, then the low-nibble-first digits.
+                registration_request_iei::UE_RADIO_CAPABILITY_ID => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    if !data.is_empty() {
+                        msg.ue_radio_capability_id = Some(decode_ue_radio_capability_id(&data));
+                    }
                 }
                 registration_request_iei::PAYLOAD_CONTAINER => {
                     buf.advance(1);
@@ -1148,6 +1247,27 @@ impl RegistrationRequest {
             buf.put_u8(registration_request_iei::PAYLOAD_CONTAINER);
             buf.put_u16(container.len() as u16);
             buf.put_slice(container);
+        }
+
+        // UE radio capability ID (RACS, TS 24.501 §8.2.6 / §9.11.3.68). An ID
+        // whose digits cannot be packed is omitted rather than truncated onto the
+        // wire: a partial identifier resolves to the wrong capability set at the
+        // UCMF, which is worse than the network asking for the full capability.
+        if let Some(ref id) = self.ue_radio_capability_id {
+            match encode_ue_radio_capability_id(id) {
+                Some(octets) => {
+                    buf.put_u8(registration_request_iei::UE_RADIO_CAPABILITY_ID);
+                    buf.put_u8(octets.len() as u8);
+                    buf.put_slice(&octets);
+                }
+                None => {
+                    tracing::warn!(
+                        "Omitting UE radio capability ID {:?}: not a packable \
+                         hexadecimal identifier (TS 23.003 §29.2)",
+                        id
+                    );
+                }
+            }
         }
 
         // 6G extension IEs
@@ -2398,5 +2518,154 @@ mod tests {
             decoded.sor_transparent_container,
             Some(vec![0x01, 0x02, 0x03, 0x04])
         );
+    }
+
+    // ========================================================================
+    // UE radio capability ID (RACS, issue #101, TS 24.501 §9.11.3.68)
+    // ========================================================================
+
+    /// The packing is low-nibble-first: "123456" is 0x21 0x43 0x65, not
+    /// 0x12 0x34 0x56. Asserted on the octets, because a round trip alone passes
+    /// against a codec that is consistently wrong in both directions.
+    #[test]
+    fn a_ue_radio_capability_id_packs_low_nibble_first() {
+        assert_eq!(
+            encode_ue_radio_capability_id("123456"),
+            Some(vec![0x21, 0x43, 0x65])
+        );
+        assert_eq!(
+            encode_ue_radio_capability_id("abcdef"),
+            Some(vec![0xBA, 0xDC, 0xFE])
+        );
+    }
+
+    /// An odd digit count fills the last high nibble with 1111.
+    #[test]
+    fn an_odd_length_ue_radio_capability_id_is_filled() {
+        assert_eq!(encode_ue_radio_capability_id("123"), Some(vec![0x21, 0xF3]));
+        assert_eq!(decode_ue_radio_capability_id(&[0x21, 0xF3]), "123");
+    }
+
+    /// Encode and decode are inverses over the identifier shapes TS 23.003 §29.2
+    /// defines (14 and 20 digits) and the odd/short edges.
+    ///
+    /// No identifier ending in `f` here, for the reason
+    /// `an_identifier_ending_in_f_collides_with_the_odd_length_filler` pins.
+    #[test]
+    fn the_ue_radio_capability_id_codec_round_trips() {
+        for id in [
+            "1",
+            "12",
+            "123",
+            "f0",
+            "1f23",
+            // TS 23.003 §29.2: 1 + 2 + 11 network-assigned
+            "01234567890123",
+            // 1 + 8 + 11 manufacturer-assigned
+            "01234567890123456789",
+        ] {
+            let octets = encode_ue_radio_capability_id(id)
+                .unwrap_or_else(|| panic!("{id} must be packable"));
+            assert_eq!(
+                decode_ue_radio_capability_id(&octets),
+                id,
+                "{id} must survive the round trip"
+            );
+        }
+    }
+
+    /// An `f` that is not in the last high nibble is a digit, not a filler.
+    #[test]
+    fn an_f_that_is_not_the_last_high_nibble_is_a_digit() {
+        assert_eq!(decode_ue_radio_capability_id(&[0xF1, 0x32]), "1f23");
+    }
+
+    /// **A ceiling of the IE, not of this codec.** An identifier whose *last*
+    /// digit is `f` encodes to the same octets as the same identifier without it,
+    /// because `1111` in the last high nibble is the odd-length end mark
+    /// (TS 24.501 §9.11.3.68). Nothing in the encoding distinguishes them, so
+    /// "0f" comes back as "0".
+    ///
+    /// This costs nothing for a conformant identifier: TS 23.003 §29.2 gives every
+    /// UE radio capability ID an even number of digits, so the end mark should
+    /// never be emitted at all — and this tree reads the digits as hexadecimal
+    /// only because that is what the pre-existing decoder did. Pinned rather than
+    /// papered over, so a future change to BCD-only digits (which would remove the
+    /// ambiguity outright) shows up here.
+    #[test]
+    fn an_identifier_ending_in_f_collides_with_the_odd_length_filler() {
+        let with_f = encode_ue_radio_capability_id("0f").expect("packable");
+        let without = encode_ue_radio_capability_id("0").expect("packable");
+        assert_eq!(with_f, without, "the two encode identically");
+        assert_eq!(
+            decode_ue_radio_capability_id(&with_f),
+            "0",
+            "and the end-mark reading wins on decode"
+        );
+    }
+
+    /// An unpackable identifier yields `None` rather than a truncated one: a
+    /// partial ID resolves to some other capability set at the UCMF.
+    #[test]
+    fn an_unpackable_ue_radio_capability_id_is_rejected() {
+        for id in ["", "12g4", "hello", "12 34", "-1"] {
+            assert_eq!(
+                encode_ue_radio_capability_id(id),
+                None,
+                "{id:?} must not be packed"
+            );
+        }
+    }
+
+    /// The IE round-trips through the REGISTRATION REQUEST as IEI 0x67 + length.
+    #[test]
+    fn the_registration_request_carries_the_ue_radio_capability_id_ie() {
+        let mut msg = RegistrationRequest::new(
+            Ie5gsRegistrationType::new(
+                crate::ies::ie1::FollowOnRequest::NoPending,
+                crate::ies::ie1::RegistrationType::InitialRegistration,
+            ),
+            NasKeySetIdentifier::no_key(),
+            Ie5gsMobileIdentity::no_identity(),
+        );
+        msg.ue_radio_capability_id = Some("123456".to_string());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        assert!(
+            buf.windows(5).any(|w| w == [0x67, 0x03, 0x21, 0x43, 0x65]),
+            "IEI 0x67, length 3, then the packed digits; got {buf:02X?}"
+        );
+        assert_eq!(
+            RegistrationRequest::decode(&mut &buf[3..])
+                .expect("decode")
+                .ue_radio_capability_id
+                .as_deref(),
+            Some("123456")
+        );
+    }
+
+    /// An unpackable ID is omitted from the encoding rather than emitted broken,
+    /// and the rest of the message still encodes.
+    #[test]
+    fn an_unpackable_ue_radio_capability_id_is_omitted_from_the_wire() {
+        let mut msg = RegistrationRequest::new(
+            Ie5gsRegistrationType::new(
+                crate::ies::ie1::FollowOnRequest::NoPending,
+                crate::ies::ie1::RegistrationType::InitialRegistration,
+            ),
+            NasKeySetIdentifier::no_key(),
+            Ie5gsMobileIdentity::no_identity(),
+        );
+        msg.ue_radio_capability_id = Some("not-hex".to_string());
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        assert!(RegistrationRequest::decode(&mut &buf[3..])
+            .expect("the message still decodes")
+            .ue_radio_capability_id
+            .is_none());
     }
 }
