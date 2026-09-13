@@ -52,11 +52,23 @@ pub const UPDP_MSG_MANAGE_UE_POLICY_COMMAND: u8 = 0x01;
 pub const UPDP_MSG_MANAGE_UE_POLICY_COMPLETE: u8 = 0x02;
 /// MANAGE UE POLICY COMMAND REJECT (Table D.6.1.1).
 pub const UPDP_MSG_MANAGE_UE_POLICY_COMMAND_REJECT: u8 = 0x03;
+/// UE STATE INDICATION (Table D.6.1.1: bit pattern 0000 0100).
+pub const UPDP_MSG_UE_STATE_INDICATION: u8 = 0x04;
 
 /// PCF-initiated procedures use PTI 80H-FEH (TS 24.501 D.1.2).
 pub const PCF_PTI_MIN: u8 = 0x80;
 /// Upper bound of the PCF PTI range (FFH is reserved).
 pub const PCF_PTI_MAX: u8 = 0xFE;
+/// UE-initiated procedures use PTI 01H-77H (TS 24.501 D.1.2).
+///
+/// NOT zero: D.1.2 says "When the UE initiates a procedure, the UE shall use a
+/// PTI value in range between 01H and 77H", and D.2.2.2 a) says the UE "shall
+/// allocate a PTI value currently not used". PTI 0 means "no procedure
+/// transaction identity assigned" and would make the PCF unable to correlate a
+/// response.
+pub const UE_PTI_MIN: u8 = 0x01;
+/// Upper bound of the UE PTI range (TS 24.501 D.1.2).
+pub const UE_PTI_MAX: u8 = 0x77;
 
 /// D.6.3 result cause "Protocol error, unspecified" (0110 1111). The receiving
 /// entity treats any other value as this one (Table D.6.3.1).
@@ -125,6 +137,9 @@ pub enum UePolicyError {
     /// The PTI was outside the PCF-initiated 80H-FEH range (D.1.2).
     #[error("UPDP PTI {0:#04x} outside the PCF-initiated range 80H-FEH (TS 24.501 D.1.2)")]
     PtiOutOfRange(u8),
+    /// The PTI was outside the UE-initiated 01H-77H range (D.1.2).
+    #[error("UPDP PTI {0:#04x} outside the UE-initiated range 01H-77H (TS 24.501 D.1.2)")]
+    UePtiOutOfRange(u8),
 }
 
 type Result<T> = core::result::Result<T, UePolicyError>;
@@ -968,6 +983,198 @@ impl ManageUePolicyCommandReject {
 }
 
 // ============================================================================
+// UE STATE INDICATION (TS 24.501 D.5.4) — UE-initiated
+// ============================================================================
+
+/// One UPSI sublist (TS 24.501 Figure D.6.4.2): a PLMN plus the UPSCs of the
+/// sections stored for it.
+///
+/// A UPSI is the pair (PLMN ID, UPSC) — the PLMN is the sublist key and the
+/// UPSC is the per-section code the PCF assigned, so the sublist is how a UE
+/// reports "for this PLMN I hold sections 1, 4 and 9".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsiSublist {
+    /// The PLMN whose sections are listed.
+    pub plmn_id: PlmnId,
+    /// UPSCs of the stored sections for that PLMN.
+    pub upscs: Vec<u16>,
+}
+
+/// UE policy classmark (TS 24.501 D.6.5 octet 3).
+///
+/// Only the four defined bits are modelled; bits 5-8 of octet 3 and the whole
+/// of the optional octets 4-5 are spare and "shall be coded as zero", so they
+/// are not represented — a field that can only ever hold zero is a field that
+/// can disagree with the encoder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UePolicyClassmark {
+    /// SupportANDSP (bit 1): ANDSP supported by the UE.
+    pub andsp: bool,
+    /// EPSURSP (bit 2): URSP provisioning in EPS supported by the UE.
+    pub ursp_in_eps: bool,
+    /// SVPSU (bit 3): VPS URSP supported by the UE.
+    pub vps_ursp: bool,
+    /// SupportRURE (bit 4): reporting of URSP rule enforcement supported.
+    pub report_ursp_rule_enforcement: bool,
+}
+
+impl UePolicyClassmark {
+    /// Octet 3 of D.6.5: the four capability bits, spare bits 5-8 zero.
+    pub fn encode(&self) -> u8 {
+        u8::from(self.andsp)
+            | (u8::from(self.ursp_in_eps) << 1)
+            | (u8::from(self.vps_ursp) << 2)
+            | (u8::from(self.report_ursp_rule_enforcement) << 3)
+    }
+
+    /// Decode octet 3 of D.6.5, ignoring the spare bits.
+    pub fn decode(octet: u8) -> Self {
+        Self {
+            andsp: octet & 0x01 != 0,
+            ursp_in_eps: octet & 0x02 != 0,
+            vps_ursp: octet & 0x04 != 0,
+            report_ursp_rule_enforcement: octet & 0x08 != 0,
+        }
+    }
+}
+
+/// UE STATE INDICATION (TS 24.501 Table D.5.4.1.1): the UE reporting which UE
+/// policy sections it holds and what policy features it supports.
+///
+/// Sent inside the Payload container IE of a REGISTRATION REQUEST with the
+/// Payload container type set to "UE policy container" (§5.5.1.2.2), which is
+/// the only transport this version of the protocol defines for it — there is no
+/// UL NAS TRANSPORT path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UeStateIndication {
+    /// UE-allocated PTI, 01H-77H (D.1.2).
+    pub pti: u8,
+    /// The UPSI list: one sublist per PLMN with stored sections. **May be
+    /// empty** — D.2.2.2 NOTE 1 says a UE with no stored section sets the
+    /// length of UPSI list contents to zero rather than omitting the IE, since
+    /// the IE is mandatory (Table D.5.4.1.1).
+    pub upsi_list: Vec<UpsiSublist>,
+    /// The UE policy classmark (mandatory, D.6.5).
+    pub classmark: UePolicyClassmark,
+}
+
+impl UeStateIndication {
+    /// Encodes the UE policy delivery service message content: PTI, message
+    /// type, UPSI list (LV-E) and UE policy classmark (LV).
+    ///
+    /// The UE OS Id IE (IEI 41H, optional) is not emitted: this simulator has
+    /// no OS identity to report, and D.2.2.2 g) makes it a "may".
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if !(UE_PTI_MIN..=UE_PTI_MAX).contains(&self.pti) {
+            return Err(UePolicyError::UePtiOutOfRange(self.pti));
+        }
+
+        // UPSI list contents: the concatenated sublists (Figure D.6.4.1).
+        let mut upsi_contents: Vec<u8> = Vec::new();
+        for sublist in &self.upsi_list {
+            if sublist.upscs.is_empty() {
+                // Figure D.6.4.2 shows UPSC 1 as a non-optional octet pair, so
+                // a sublist with no UPSC is not representable. Reporting an
+                // empty UPSI LIST is how "nothing stored" is said (NOTE 1);
+                // an empty SUBLIST would claim a PLMN with no sections.
+                return Err(UePolicyError::InvalidValue {
+                    scope: "UPSI sublist",
+                    msg: "must carry at least one UPSC (Figure D.6.4.2)".into(),
+                });
+            }
+            // Length of UPSI sublist counts what follows it: PLMN (3) + 2 per UPSC.
+            let sublist_len = 3 + 2 * sublist.upscs.len();
+            let Ok(sublist_len) = u16::try_from(sublist_len) else {
+                return Err(UePolicyError::InvalidValue {
+                    scope: "UPSI sublist",
+                    msg: "sublist length exceeds 65535 octets".into(),
+                });
+            };
+            upsi_contents.extend_from_slice(&sublist_len.to_be_bytes());
+            upsi_contents.extend_from_slice(&sublist.plmn_id.encode());
+            for upsc in &sublist.upscs {
+                upsi_contents.extend_from_slice(&upsc.to_be_bytes());
+            }
+        }
+        let Ok(upsi_len) = u16::try_from(upsi_contents.len()) else {
+            return Err(UePolicyError::InvalidValue {
+                scope: "UPSI list",
+                msg: "contents exceed 65535 octets".into(),
+            });
+        };
+
+        let mut out: Vec<u8> = Vec::with_capacity(6 + upsi_contents.len());
+        out.push(self.pti);
+        out.push(UPDP_MSG_UE_STATE_INDICATION);
+        // UPSI list: LV-E, so a 2-octet length and no IEI (Table D.5.4.1.1).
+        out.extend_from_slice(&upsi_len.to_be_bytes());
+        out.extend_from_slice(&upsi_contents);
+        // UE policy classmark: LV, so a 1-octet length and no IEI. Length 1
+        // because only octet 3 is emitted; octets 4-5 are spare.
+        out.push(1);
+        out.push(self.classmark.encode());
+        Ok(out)
+    }
+
+    /// Decodes the message content [`Self::encode`] produces.
+    ///
+    /// Present for round-trip testing and for a peer implementation to use; the
+    /// UE itself never receives this message (Direction: UE to network).
+    pub fn decode(content: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(content);
+        let pti = r.u8()?;
+        if !(UE_PTI_MIN..=UE_PTI_MAX).contains(&pti) {
+            return Err(UePolicyError::UePtiOutOfRange(pti));
+        }
+        let msg_type = r.u8()?;
+        if msg_type != UPDP_MSG_UE_STATE_INDICATION {
+            return Err(UePolicyError::UnexpectedMessageType {
+                got: msg_type,
+                expected: UPDP_MSG_UE_STATE_INDICATION,
+            });
+        }
+
+        let upsi_len = usize::from(r.u16()?);
+        let mut upsi = r.sub(upsi_len, "UPSI list")?;
+        let mut upsi_list = Vec::new();
+        while upsi.remaining() > 0 {
+            let sublist_len = usize::from(upsi.u16()?);
+            let mut sublist = upsi.sub(sublist_len, "UPSI sublist")?;
+            let plmn_id = PlmnId::decode(sublist.take(3)?)?;
+            let mut upscs = Vec::new();
+            while sublist.remaining() > 0 {
+                upscs.push(sublist.u16()?);
+            }
+            sublist.finish("UPSI sublist")?;
+            if upscs.is_empty() {
+                return Err(UePolicyError::InvalidValue {
+                    scope: "UPSI sublist",
+                    msg: "carries no UPSC (Figure D.6.4.2)".into(),
+                });
+            }
+            upsi_list.push(UpsiSublist { plmn_id, upscs });
+        }
+        upsi.finish("UPSI list")?;
+
+        let classmark_len = usize::from(r.u8()?);
+        if classmark_len == 0 {
+            return Err(UePolicyError::InvalidValue {
+                scope: "UE policy classmark",
+                msg: "mandatory IE with zero-length contents (D.6.5 needs octet 3)".into(),
+            });
+        }
+        let classmark_bytes = r.take(classmark_len)?;
+        // Only octet 3 carries defined bits; any further octets are spare.
+        let classmark = UePolicyClassmark::decode(classmark_bytes[0]);
+        Ok(Self {
+            pti,
+            upsi_list,
+            classmark,
+        })
+    }
+}
+
+// ============================================================================
 // Tests — golden vectors (E1) re-cited verbatim + fail-closed decode
 // ============================================================================
 
@@ -1243,5 +1450,250 @@ mod tests {
         let cmd = ManageUePolicyCommand::decode(&content).unwrap();
         assert_eq!(cmd.sublists[0].instructions[0].upsc, 7);
         assert!(cmd.sublists[0].instructions[0].parts.is_empty());
+    }
+
+    // ========================================================================
+    // UE STATE INDICATION (TS 24.501 D.5.4) — #48
+    // ========================================================================
+
+    /// #48: the encoded UE STATE INDICATION is asserted BYTE FOR BYTE against a
+    /// buffer computed by hand from Table D.5.4.1.1 and figures D.6.4.1/D.6.4.2.
+    ///
+    /// A round trip alone would not catch a wrong layout: a self-consistent
+    /// encoder and decoder agree with each other while disagreeing with the PCF.
+    #[test]
+    fn ue_state_indication_encodes_the_d_5_4_layout_byte_for_byte() {
+        let msg = UeStateIndication {
+            pti: 0x05,
+            upsi_list: vec![UpsiSublist {
+                plmn_id: plmn_001_01(),
+                upscs: vec![1, 4],
+            }],
+            classmark: UePolicyClassmark {
+                andsp: true,
+                ursp_in_eps: false,
+                vps_ursp: false,
+                report_ursp_rule_enforcement: false,
+            },
+        };
+
+        assert_eq!(
+            msg.encode().expect("encodes"),
+            vec![
+                0x05, // PTI (V, 1 octet) — UE-initiated range 01H-77H
+                0x04, // UE STATE INDICATION message identity (Table D.6.1.1)
+                0x00, 0x09, // UPSI list: LV-E length = 9 (one sublist)
+                0x00, 0x07, // sublist length = 7 = PLMN 3 + 2 UPSCs x 2
+                0x00, 0xF1, 0x10, // PLMN 001/01 (MNC digit 3 = 1111)
+                0x00, 0x01, // UPSC 1
+                0x00, 0x04, // UPSC 4
+                0x01, // UE policy classmark: LV length = 1 (octet 3 only)
+                0x01, // SupportANDSP set, EPSURSP/SVPSU/SupportRURE clear
+            ]
+        );
+    }
+
+    /// #48: a UE holding nothing still sends the mandatory UPSI list with a
+    /// ZERO length (D.2.2.2 NOTE 1) rather than omitting it.
+    ///
+    /// The IE is mandatory in Table D.5.4.1.1, so omitting it produces a message
+    /// the PCF cannot parse; the length field is what says "nothing stored".
+    #[test]
+    fn an_empty_upsi_list_is_a_zero_length_not_an_absent_ie() {
+        let msg = UeStateIndication {
+            pti: 0x77,
+            upsi_list: Vec::new(),
+            classmark: UePolicyClassmark::default(),
+        };
+        assert_eq!(
+            msg.encode().expect("encodes"),
+            vec![0x77, 0x04, 0x00, 0x00, 0x01, 0x00]
+        );
+    }
+
+    /// #48: every classmark bit lands where D.6.5 Table D.6.5.1 puts it.
+    ///
+    /// Asserted bit by bit rather than on one combined value: a single "all set"
+    /// vector passes against an encoder that has two bits transposed.
+    #[test]
+    fn classmark_bits_are_at_their_d_6_5_positions() {
+        let bit = |cm: UePolicyClassmark| cm.encode();
+        assert_eq!(
+            bit(UePolicyClassmark {
+                andsp: true,
+                ..Default::default()
+            }),
+            0b0000_0001
+        );
+        assert_eq!(
+            bit(UePolicyClassmark {
+                ursp_in_eps: true,
+                ..Default::default()
+            }),
+            0b0000_0010
+        );
+        assert_eq!(
+            bit(UePolicyClassmark {
+                vps_ursp: true,
+                ..Default::default()
+            }),
+            0b0000_0100
+        );
+        assert_eq!(
+            bit(UePolicyClassmark {
+                report_ursp_rule_enforcement: true,
+                ..Default::default()
+            }),
+            0b0000_1000
+        );
+        // Spare bits 5-8 "shall be coded as zero".
+        assert_eq!(
+            bit(UePolicyClassmark {
+                andsp: true,
+                ursp_in_eps: true,
+                vps_ursp: true,
+                report_ursp_rule_enforcement: true,
+            }) & 0xF0,
+            0,
+        );
+        // And every bit survives a decode.
+        for octet in 0u8..16 {
+            assert_eq!(UePolicyClassmark::decode(octet).encode(), octet);
+        }
+    }
+
+    /// #48: decode is the inverse of encode over multi-PLMN and multi-UPSC
+    /// shapes, so a PCF-side parser reading these bytes recovers the state.
+    #[test]
+    fn ue_state_indication_round_trips() {
+        for msg in [
+            UeStateIndication {
+                pti: 0x01,
+                upsi_list: Vec::new(),
+                classmark: UePolicyClassmark::default(),
+            },
+            UeStateIndication {
+                pti: 0x42,
+                upsi_list: vec![
+                    UpsiSublist {
+                        plmn_id: plmn_001_01(),
+                        upscs: vec![9],
+                    },
+                    UpsiSublist {
+                        // 3-digit MNC, to exercise the MNC-digit-3 encoding.
+                        plmn_id: PlmnId::from_bcd([0x21, 0x63, 0x54]).expect("valid"),
+                        upscs: vec![1, 2, 0xFFFF],
+                    },
+                ],
+                classmark: UePolicyClassmark {
+                    andsp: true,
+                    ursp_in_eps: true,
+                    vps_ursp: true,
+                    report_ursp_rule_enforcement: true,
+                },
+            },
+        ] {
+            let bytes = msg.encode().expect("encodes");
+            assert_eq!(UeStateIndication::decode(&bytes).expect("decodes"), msg);
+        }
+    }
+
+    /// #48: the PTI range is the UE-initiated one, 01H-77H (D.1.2).
+    ///
+    /// PTI 0 is rejected explicitly, because the issue that asked for this
+    /// message suggested PTI 0 and D.1.2 forbids it — 0 means "no procedure
+    /// transaction identity assigned".
+    #[test]
+    fn a_pti_outside_the_ue_range_is_refused() {
+        let with_pti = |pti| UeStateIndication {
+            pti,
+            upsi_list: Vec::new(),
+            classmark: UePolicyClassmark::default(),
+        };
+        assert!(matches!(
+            with_pti(0x00).encode(),
+            Err(UePolicyError::UePtiOutOfRange(0x00))
+        ));
+        assert!(matches!(
+            with_pti(0x78).encode(),
+            Err(UePolicyError::UePtiOutOfRange(0x78))
+        ));
+        assert!(matches!(
+            with_pti(0x80).encode(),
+            Err(UePolicyError::UePtiOutOfRange(0x80))
+        ));
+        assert!(with_pti(0x01).encode().is_ok());
+        assert!(with_pti(0x77).encode().is_ok());
+    }
+
+    /// #48: a sublist with no UPSC is refused on encode and on decode.
+    ///
+    /// Figure D.6.4.2 makes UPSC 1 a non-optional octet pair, so such a sublist
+    /// is not representable. Saying "nothing stored" is a zero-length LIST, not
+    /// an empty sublist naming a PLMN that has no sections.
+    #[test]
+    fn a_sublist_with_no_upsc_is_refused_both_ways() {
+        let msg = UeStateIndication {
+            pti: 0x01,
+            upsi_list: vec![UpsiSublist {
+                plmn_id: plmn_001_01(),
+                upscs: Vec::new(),
+            }],
+            classmark: UePolicyClassmark::default(),
+        };
+        assert!(matches!(
+            msg.encode(),
+            Err(UePolicyError::InvalidValue {
+                scope: "UPSI sublist",
+                ..
+            })
+        ));
+
+        // Hand-built bytes for the same shape: a 3-octet sublist (PLMN only).
+        let bytes = [
+            0x01u8, 0x04, 0x00, 0x05, 0x00, 0x03, 0x00, 0xF1, 0x10, 0x01, 0x00,
+        ];
+        assert!(matches!(
+            UeStateIndication::decode(&bytes),
+            Err(UePolicyError::InvalidValue {
+                scope: "UPSI sublist",
+                ..
+            })
+        ));
+    }
+
+    /// #48: a zero-length UE policy classmark is refused — it is a mandatory IE
+    /// and D.6.5 needs octet 3, so an empty one carries no capability at all.
+    #[test]
+    fn a_zero_length_classmark_is_refused() {
+        let bytes = [0x01u8, 0x04, 0x00, 0x00, 0x00];
+        assert!(matches!(
+            UeStateIndication::decode(&bytes),
+            Err(UePolicyError::InvalidValue {
+                scope: "UE policy classmark",
+                ..
+            })
+        ));
+    }
+
+    /// #48: the wrong message type is refused rather than silently accepted as a
+    /// UE STATE INDICATION.
+    #[test]
+    fn a_non_ue_state_indication_message_type_is_refused() {
+        let bytes = [
+            0x01u8,
+            UPDP_MSG_MANAGE_UE_POLICY_COMPLETE,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+        ];
+        assert!(matches!(
+            UeStateIndication::decode(&bytes),
+            Err(UePolicyError::UnexpectedMessageType {
+                got: 0x02,
+                expected: 0x04
+            })
+        ));
     }
 }
