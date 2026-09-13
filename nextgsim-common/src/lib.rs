@@ -6,6 +6,16 @@
 
 pub mod bit_buffer;
 pub mod bit_string;
+/// In-process topic pub/sub bus for cross-cutting 6G measurements and events
+/// (issue #16). Off by default; enable with the `event-bus` cargo feature.
+///
+/// A cargo feature and not a runtime switch, unlike the other opt-ins in this
+/// tree: it adds a module and an optional handle field rather than changing the
+/// behaviour of a shipped code path, so a default build is unaffected by its
+/// existence. The cost is that `cargo test --workspace` does not compile it —
+/// which is why CI has an `event-bus` job.
+#[cfg(feature = "event-bus")]
+pub mod bus;
 pub mod cli_server;
 pub mod config;
 pub mod error;

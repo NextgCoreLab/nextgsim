@@ -1397,6 +1397,10 @@ pub struct UeSixgHandles {
     /// Handle to the Semantic Codec (task-oriented communication) task
     #[cfg(feature = "nextgsim-semantic")]
     pub semantic_codec_tx: TaskHandle<SemanticCodecMessage>,
+    /// Optional in-process topic bus for cross-cutting observations (issue #16).
+    /// A second path, not a replacement — see the gNB's field for the reasoning.
+    #[cfg(feature = "event-bus")]
+    pub bus: Option<nextgsim_common::bus::EventBus>,
 }
 
 /// 6G task receivers for UE
@@ -1513,6 +1517,8 @@ impl UeTaskBase {
             fl_participant_tx: TaskHandle::new(fl_participant_tx),
             #[cfg(feature = "nextgsim-semantic")]
             semantic_codec_tx: TaskHandle::new(semantic_codec_tx),
+            #[cfg(feature = "event-bus")]
+            bus: Some(nextgsim_common::bus::EventBus::default()),
         });
 
         UeSixgReceivers {

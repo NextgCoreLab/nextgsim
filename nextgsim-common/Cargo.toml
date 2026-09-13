@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "Common types and utilities for nextgsim"
 
+[features]
+default = []
+# In-process topic pub/sub bus for cross-cutting 6G measurements (issue #16).
+# Additive: producers keep their point-to-point channels and the bus is an
+# optional second path, so a default build is byte-for-byte unaffected.
+event-bus = []
+
 [lints]
 workspace = true
 

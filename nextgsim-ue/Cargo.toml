@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "5G UE (User Equipment) simulator binary"
 
+[features]
+default = []
+# In-process topic pub/sub bus for cross-cutting 6G observations (issue #16).
+# Off by default; forwards to nextgsim-common's own feature.
+event-bus = ["nextgsim-common/event-bus"]
+
 [lints]
 workspace = true
 

@@ -11,6 +11,9 @@ description = "5G gNB (gNodeB) simulator binary"
 workspace = true
 
 [features]
+# In-process topic pub/sub bus for cross-cutting 6G observations (issue #16).
+# Off by default; forwards to nextgsim-common's own feature.
+event-bus = ["nextgsim-common/event-bus"]
 # Off by default. Enables the kernel-SCTP transport backend in nextgsim-sctp
 # so the gNB can associate with a real / Open5GS AMF over kernel SCTP (proto
 # 132). Only effective on Linux; requires libsctp (`-lsctp`) at link time.
