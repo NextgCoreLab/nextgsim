@@ -31,6 +31,7 @@
 //! - [`InNetworkComputeMarker`] - Markers for in-network computing tasks
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::net::IpAddr;
 use thiserror::Error;
 
 /// GTP-U protocol version (always 1)
@@ -44,6 +45,71 @@ pub const EXT_HEADER_TYPE_TSN_MARKER: u8 = 0xE1;
 
 /// Custom extension header type for in-network compute markers (6G experimental range)
 pub const EXT_HEADER_TYPE_IN_NETWORK_COMPUTE: u8 = 0xE2;
+
+/// Recovery IE type — TV, one octet of restart counter (TS 29.281 §8.2)
+pub const IE_RECOVERY: u8 = 14;
+
+/// Tunnel Endpoint Identifier Data I IE type — TV, four octets (TS 29.281 §8.3)
+pub const IE_TEID_DATA_I: u8 = 16;
+
+/// GTP-U Peer Address IE type — TLV, 4 or 16 octets (TS 29.281 §8.4)
+pub const IE_GTPU_PEER_ADDRESS: u8 = 133;
+
+/// Walk the (type, value) IEs in a GTP-U signalling message payload.
+///
+/// GTP-U inherits GTP v1's two IE encodings (TS 29.060 §11.1, referenced by
+/// TS 29.281 §8.1): types 1..=127 are **TV** — one type octet then a value whose
+/// length is fixed by the type — and types 128..=255 are **TLV**, carrying their own
+/// two-octet length. Of the IEs GTP-U uses, only Recovery and Tunnel Endpoint
+/// Identifier Data I are TV and so need a length recorded here; GTP-U Peer Address
+/// and Private Extension are TLV and carry their own.
+///
+/// Iteration STOPS at the first TV type whose length this code does not know, and
+/// that is deliberate: a TV IE carries no length, so an unknown one makes every
+/// following octet unparseable. Guessing would silently produce IEs that were never
+/// sent, which is worse than stopping short of one that was.
+struct GtpuIeIter<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> GtpuIeIter<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self { rest: payload }
+    }
+
+    /// Value length of a known TV IE type, or `None` if this code cannot tell.
+    fn tv_len(ie_type: u8) -> Option<usize> {
+        match ie_type {
+            IE_RECOVERY => Some(1),
+            IE_TEID_DATA_I => Some(4),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> Iterator for GtpuIeIter<'a> {
+    type Item = (u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (&ie_type, tail) = self.rest.split_first()?;
+        if ie_type >= 128 {
+            // TLV: two-octet length follows the type.
+            if tail.len() < 2 {
+                self.rest = &[];
+                return None;
+            }
+            let len = u16::from_be_bytes([tail[0], tail[1]]) as usize;
+            let value = tail.get(2..2 + len)?;
+            self.rest = &tail[2 + len..];
+            Some((ie_type, value))
+        } else {
+            let len = Self::tv_len(ie_type)?;
+            let value = tail.get(..len)?;
+            self.rest = &tail[len..];
+            Some((ie_type, value))
+        }
+    }
+}
 
 /// GTP-U Message Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,6 +759,110 @@ impl GtpHeader {
     /// Create an Echo Response message
     pub fn echo_response(teid: u32) -> Self {
         Self::new(GtpMessageType::EchoResponse, teid, Bytes::new())
+    }
+
+    /// Create a GTP-U Error Indication (TS 29.281 §7.3.1).
+    ///
+    /// Sent when a G-PDU arrives for a TEID with no tunnel context, so the peer can
+    /// treat that tunnel as invalid and release it (TS 29.281 §4.4.2.4, TS 23.007).
+    ///
+    /// - The header TEID is **all zeros**: TS 29.281 §5.1 requires it for Echo
+    ///   Request/Response, Error Indication and Supported Extension Headers
+    ///   Notification. The offending TEID travels in the IE instead, which is why
+    ///   sending it in the header as well would be wrong rather than redundant.
+    /// - `teid_data_i` is the TEID from the *received* G-PDU — the one that could
+    ///   not be found.
+    /// - `peer` is the address of the node that sent that G-PDU, i.e. the
+    ///   destination of this Error Indication. Together the two IEs name the tunnel
+    ///   the receiver must invalidate; the TEID alone does not, because TEIDs are
+    ///   only unique per node.
+    ///
+    /// A sequence number is set: §5.1 has the S flag at 1 for these messages, and
+    /// says the receiver ignores the value.
+    pub fn error_indication(teid_data_i: u32, peer: IpAddr) -> Self {
+        let mut payload = BytesMut::with_capacity(24);
+        // Tunnel Endpoint Identifier Data I: TV, 4-octet value (TS 29.281 §8.3).
+        payload.put_u8(IE_TEID_DATA_I);
+        payload.put_u32(teid_data_i);
+        // GTP-U Peer Address: TLV, 4 or 16 octets of address (TS 29.281 §8.4).
+        payload.put_u8(IE_GTPU_PEER_ADDRESS);
+        match peer {
+            IpAddr::V4(v4) => {
+                payload.put_u16(4);
+                payload.put_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                payload.put_u16(16);
+                payload.put_slice(&v6.octets());
+            }
+        }
+        Self::new(GtpMessageType::ErrorIndication, 0, payload.freeze()).with_sequence_number(0)
+    }
+
+    /// Append a Recovery IE carrying `restart_counter` (TS 29.281 §8.2).
+    ///
+    /// Mandatory in an Echo Response (TS 29.281 Table 7.2.2-1). The value is the
+    /// sender's restart counter from non-volatile storage, so a peer that sees it
+    /// change knows this node restarted and can purge the affected contexts
+    /// (TS 23.007). A constant is therefore not a placeholder but a defect: it
+    /// makes every restart invisible.
+    pub fn with_recovery(mut self, restart_counter: u8) -> Self {
+        let mut payload = BytesMut::with_capacity(self.payload.len() + 2);
+        payload.put_slice(&self.payload);
+        payload.put_u8(IE_RECOVERY);
+        payload.put_u8(restart_counter);
+        self.payload = payload.freeze();
+        self
+    }
+
+    /// The Tunnel Endpoint Identifier Data I carried by an Error Indication.
+    ///
+    /// `None` when this is not an Error Indication or the IE is absent, so a
+    /// malformed message cannot be mistaken for one naming TEID 0.
+    pub fn error_indication_teid(&self) -> Option<u32> {
+        if self.message_type != GtpMessageType::ErrorIndication {
+            return None;
+        }
+        for (ie_type, value) in GtpuIeIter::new(&self.payload) {
+            if ie_type == IE_TEID_DATA_I && value.len() == 4 {
+                return Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+            }
+        }
+        None
+    }
+
+    /// The GTP-U Peer Address carried by an Error Indication (TS 29.281 §8.4).
+    pub fn error_indication_peer(&self) -> Option<IpAddr> {
+        if self.message_type != GtpMessageType::ErrorIndication {
+            return None;
+        }
+        for (ie_type, value) in GtpuIeIter::new(&self.payload) {
+            if ie_type != IE_GTPU_PEER_ADDRESS {
+                continue;
+            }
+            return match value.len() {
+                4 => Some(IpAddr::from([value[0], value[1], value[2], value[3]])),
+                16 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(value);
+                    Some(IpAddr::from(octets))
+                }
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// The peer's restart counter from a Recovery IE, if one is present.
+    ///
+    /// Read from an Echo Response to detect that the peer restarted (TS 23.007).
+    pub fn recovery_restart_counter(&self) -> Option<u8> {
+        for (ie_type, value) in GtpuIeIter::new(&self.payload) {
+            if ie_type == IE_RECOVERY && value.len() == 1 {
+                return Some(value[0]);
+            }
+        }
+        None
     }
 
     /// Set sequence number
@@ -2000,5 +2170,115 @@ mod tests {
             chain = chain.push(GtpExtHeader::UdpPort { port: i as u16 });
         }
         assert!(chain.validate().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // #43: Error Indication and the Recovery IE (TS 29.281 §7.3.1, §8.2)
+    // -----------------------------------------------------------------------
+
+    /// The wire form, asserted byte for byte, because the point of the message is that
+    /// a *different* implementation can read it.
+    #[test]
+    fn error_indication_encodes_the_ies_ts_29_281_names() {
+        let peer = IpAddr::from([10, 45, 0, 7]);
+        let encoded = GtpHeader::error_indication(0xDEAD_BEEF, peer).encode();
+
+        // flags: version 1, PT 1, S flag set -> 0b0011_0010 = 0x32
+        assert_eq!(encoded[0], 0x32, "the S flag must be set (TS 29.281 §5.1)");
+        assert_eq!(encoded[1], 26, "message type Error Indication");
+        // length counts everything after the TEID: 4 optional + 5 TV + 7 TLV = 16
+        assert_eq!(u16::from_be_bytes([encoded[2], encoded[3]]), 16);
+        assert_eq!(
+            u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]),
+            0,
+            "TS 29.281 §5.1: the header TEID of an Error Indication is all zeros -- the \
+             offending TEID travels in the IE"
+        );
+        // optional block: seq(2) + n_pdu(1) + next-ext(1)
+        assert_eq!(&encoded[8..12], &[0x00, 0x00, 0x00, 0x00]);
+        // Tunnel Endpoint Identifier Data I: TV, type 16 + 4 octets
+        assert_eq!(&encoded[12..17], &[16, 0xDE, 0xAD, 0xBE, 0xEF]);
+        // GTP-U Peer Address: TLV, type 133 + length 4 + the address
+        assert_eq!(&encoded[17..24], &[133, 0x00, 0x04, 10, 45, 0, 7]);
+        assert_eq!(encoded.len(), 24);
+    }
+
+    #[test]
+    fn error_indication_round_trips_both_ies() {
+        for peer in [
+            IpAddr::from([192, 168, 1, 1]),
+            IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]),
+        ] {
+            let encoded = GtpHeader::error_indication(0x0000_1234, peer).encode();
+            let decoded = GtpHeader::decode(&encoded).expect("decode");
+            assert_eq!(decoded.message_type, GtpMessageType::ErrorIndication);
+            assert_eq!(decoded.error_indication_teid(), Some(0x0000_1234));
+            assert_eq!(decoded.error_indication_peer(), Some(peer));
+        }
+    }
+
+    /// The accessors are typed to the message, so a G-PDU that happens to carry
+    /// look-alike bytes cannot be mistaken for an Error Indication naming TEID 0.
+    #[test]
+    fn error_indication_accessors_reject_other_message_types() {
+        let payload = Bytes::from_static(&[16, 0, 0, 0, 9]);
+        let gpdu = GtpHeader::g_pdu(0x1000, payload);
+        assert_eq!(gpdu.error_indication_teid(), None);
+        assert_eq!(gpdu.error_indication_peer(), None);
+    }
+
+    #[test]
+    fn a_recovery_ie_round_trips_its_restart_counter() {
+        for counter in [0u8, 1, 42, 255] {
+            let encoded = GtpHeader::echo_response(0).with_recovery(counter).encode();
+            let decoded = GtpHeader::decode(&encoded).expect("decode");
+            assert_eq!(decoded.recovery_restart_counter(), Some(counter));
+        }
+        assert_eq!(
+            GtpHeader::echo_response(0).recovery_restart_counter(),
+            None,
+            "absent is distinguishable from 0"
+        );
+    }
+
+    /// An Echo Response with the Recovery IE is byte-identical to the hardcoded
+    /// `[14, 0]` it replaces WHEN the counter is 0 -- so nothing on the wire changed for
+    /// a node that has never restarted, and everything changed for one that has.
+    #[test]
+    fn a_zero_recovery_counter_matches_the_previous_hardcoded_bytes() {
+        let with_helper = GtpHeader::echo_response(0)
+            .with_sequence_number(7)
+            .with_recovery(0)
+            .encode();
+        let mut hardcoded = GtpHeader::echo_response(0).with_sequence_number(7);
+        hardcoded.payload = Bytes::from_static(&[14, 0]);
+        assert_eq!(&with_helper[..], &hardcoded.encode()[..]);
+    }
+
+    /// A TV IE this code cannot measure stops the walk instead of resyncing onto
+    /// whatever follows and inventing IEs that were never sent.
+    #[test]
+    fn an_unknown_tv_ie_stops_the_ie_walk() {
+        // type 3 is a TV IE with a length this code does not record; the Recovery IE
+        // that follows is therefore unreachable, by design.
+        let payload = Bytes::from_static(&[3, 0xFF, IE_RECOVERY, 9]);
+        let mut msg = GtpHeader::echo_response(0);
+        msg.payload = payload;
+        assert_eq!(msg.recovery_restart_counter(), None);
+
+        // Reversed, the Recovery IE comes first and is read.
+        let mut msg = GtpHeader::echo_response(0);
+        msg.payload = Bytes::from_static(&[IE_RECOVERY, 9, 3, 0xFF]);
+        assert_eq!(msg.recovery_restart_counter(), Some(9));
+    }
+
+    /// A truncated TLV must not panic or read past the payload.
+    #[test]
+    fn a_truncated_tlv_ie_is_ignored_rather_than_panicking() {
+        let mut msg = GtpHeader::error_indication(1, IpAddr::from([1, 2, 3, 4]));
+        // Claim 16 octets of peer address and supply 2.
+        msg.payload = Bytes::from_static(&[16, 0, 0, 0, 1, 133, 0x00, 0x10, 0xAA, 0xBB]);
+        assert_eq!(msg.error_indication_teid(), Some(1));
+        assert_eq!(msg.error_indication_peer(), None);
     }
 }

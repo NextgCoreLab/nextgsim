@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 
 use crate::codec::{GtpError, GtpHeader, GtpMessageType, PduSessionInfo};
@@ -182,6 +182,34 @@ impl TunnelManager {
         self.downlink_teid_map
             .get(&teid)
             .and_then(|key| self.sessions.get(key))
+    }
+
+    /// Find a PDU session by the UPLINK TEID and the peer that owns it.
+    ///
+    /// This is the lookup a received Error Indication needs, and it is deliberately
+    /// not `find_by_downlink_teid`. An Error Indication arrives because a G-PDU **we
+    /// sent** could not be matched at the far end, so the Tunnel Endpoint Identifier
+    /// Data I it carries is the TEID we were sending TO — the uplink tunnel's TEID,
+    /// allocated by the UPF. Looking it up in the downlink map would compile, read
+    /// correctly, and never match.
+    ///
+    /// The peer address is part of the key because a TEID is only unique per node:
+    /// two UPFs may both use `0x1000`, and releasing the wrong session on the word of
+    /// whichever answered first would tear down a working tunnel. This mirrors the
+    /// (TEID, GTP-U Peer Address) pair TS 29.281 §7.3.1 puts in the message.
+    ///
+    /// There is no index for this: uplink TEIDs are not unique on their own, and the
+    /// scan is bounded by the session count, on a path that runs once per error rather
+    /// than once per packet.
+    pub fn find_by_uplink_teid(&self, teid: u32, peer: IpAddr) -> Option<&PduSession> {
+        self.sessions
+            .values()
+            .find(|s| s.uplink_tunnel.teid == teid && s.uplink_tunnel.address.ip() == peer)
+    }
+
+    /// Every active session, in unspecified order.
+    pub fn all_sessions(&self) -> impl Iterator<Item = &PduSession> {
+        self.sessions.values()
     }
 
     /// Get all sessions for a UE
