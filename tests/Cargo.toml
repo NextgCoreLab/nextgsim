@@ -99,3 +99,7 @@ path = "src/rrc_handshake.rs"
 [[test]]
 name = "paging_mt_service_request"
 path = "src/paging_mt_service_request.rs"
+
+[[test]]
+name = "rlc_two_session_user_plane"
+path = "src/rlc_two_session_user_plane.rs"

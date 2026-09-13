@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
@@ -50,9 +50,10 @@ pub struct RlsTask {
     socket: Option<Arc<UdpSocket>>,
     /// Local bind address
     bind_address: SocketAddr,
-    /// RLC entities keyed by UE ID.
-    /// Each entry is the primary DRB entity (UM, SN12) used for user-plane data.
-    rlc_entities: HashMap<i32, RlcEntity>,
+    /// RLC entities keyed by `(UE ID, PSI)` — one per radio bearer, as
+    /// TS 38.322 §4.2.1 requires, so each bearer owns its sequence-number space
+    /// and reassembly buffer.
+    rlc_entities: HashMap<(i32, i32), RlcEntity>,
 }
 
 impl RlsTask {
@@ -96,11 +97,39 @@ impl RlsTask {
         }
     }
 
-    /// Returns the RLC entity for a UE, creating a default UM DRB entity if absent.
-    fn rlc_entity_for(&mut self, ue_id: i32) -> &mut RlcEntity {
+    /// Returns the RLC entity for one UE's radio bearer, creating a UM entity on
+    /// first use.
+    ///
+    /// Keyed on `(ue_id, psi)` because TS 38.322 §4.2.1 gives every radio bearer
+    /// its own RLC entity, and therefore its own sequence-number space and
+    /// reassembly buffer. Keying on the UE alone interleaved every PDU session
+    /// into one SN counter while the UE demultiplexed them into per-PSI entities
+    /// each expecting a contiguous sequence — so a second PDU session corrupted
+    /// both sessions' numbering rather than failing cleanly.
+    ///
+    /// The PSI stands in for the DRB identity: this simulator maps one DRB per
+    /// PDU session (see `nextgsim-gnb/src/gtp`), so the two are one to one.
+    fn rlc_entity_for(&mut self, ue_id: i32, psi: i32) -> &mut RlcEntity {
         self.rlc_entities
-            .entry(ue_id)
+            .entry((ue_id, psi))
             .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
+    }
+
+    /// Drives `t-Reassembly` on every RLC entity (TS 38.322 §5.2.2.2.4), so a
+    /// partially received SDU whose missing segment never arrives is discarded
+    /// instead of occupying the reassembly buffer forever.
+    fn poll_rlc_timers(&mut self) {
+        let now = Instant::now();
+        for ((ue_id, psi), rlc) in &mut self.rlc_entities {
+            if rlc.poll_t_reassembly(now) {
+                debug!(
+                    "RLC t-Reassembly expired: ue_id={}, psi={}, rx_next_reassembly={}",
+                    ue_id,
+                    psi,
+                    rlc.rx_next_reassembly()
+                );
+            }
+        }
     }
 
     /// Initializes the UDP socket
@@ -279,7 +308,7 @@ impl RlsTask {
         // Feed the RLC PDU into the entity and collect any reassembled SDUs,
         // releasing the mutable borrow before the async send below.
         let reassembled_sdus = {
-            let rlc = self.rlc_entity_for(ue_id);
+            let rlc = self.rlc_entity_for(ue_id, psi);
             rlc.receive_pdu(&pdu.pdu);
             let mut sdus = Vec::new();
             while let Some(sdu) = rlc.poll_reassembled() {
@@ -433,7 +462,7 @@ impl RlsTask {
         // the mutable borrow so that self.sti and self.socket are accessible
         // again for transmission.
         let rlc_pdus = {
-            let rlc = self.rlc_entity_for(ue_id);
+            let rlc = self.rlc_entity_for(ue_id, psi);
             rlc.submit_sdu(data.data().to_vec());
             let mut pdus = Vec::new();
             while let Some(rlc_pdu) = rlc.build_pdu(1500) {
@@ -631,6 +660,7 @@ impl Task for RlsTask {
                 _ = heartbeat_timer.tick() => {
                     self.check_lost_ues().await;
                     self.send_pending_acks().await;
+                    self.poll_rlc_timers();
                 }
             }
         }
@@ -790,5 +820,195 @@ mod tests {
             .await;
 
         assert!(recv_rrc_pdu(&ue).await.is_none());
+    }
+
+    // ========================================================================
+    // Per-bearer RLC entities (#34, TS 38.322 §4.2.1)
+    // ========================================================================
+
+    /// Receives one datagram and returns the PSI it was sent on plus the decoded
+    /// UM PDU.
+    async fn recv_um_pdu(socket: &UdpSocket) -> Option<(u32, nextgsim_rlc::RlcUmPdu)> {
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        let len = tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        buf.truncate(len);
+        match codec::decode(&Bytes::from(buf)).ok()? {
+            RlsProtocolMessage::PduTransmission(pdu) => Some((
+                pdu.payload,
+                nextgsim_rlc::RlcUmPdu::decode_sn12(&pdu.pdu).ok()?,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Each PDU session is its own radio bearer, so each owns its sequence-number
+    /// space: the first SDU of BOTH sessions must be SN 0. Keyed on the UE alone,
+    /// the second session's first SDU went out as SN 1 into a UE entity that was
+    /// waiting for SN 0 — silent corruption rather than a clean failure.
+    #[tokio::test]
+    async fn two_pdu_sessions_get_independent_sequence_number_spaces() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let mut task = broadcasting_task().await;
+        task.ue_addresses.insert(1, ue.local_addr().unwrap());
+
+        task.handle_downlink_data(1, 1, OctetString::from_slice(&[0x11; 16]))
+            .await;
+        task.handle_downlink_data(1, 5, OctetString::from_slice(&[0x55; 16]))
+            .await;
+
+        let (first_psi, first) = recv_um_pdu(&ue).await.expect("PSI 1 PDU");
+        let (second_psi, second) = recv_um_pdu(&ue).await.expect("PSI 5 PDU");
+
+        assert_eq!((first_psi, second_psi), (1, 5));
+        assert_eq!(first.sn, 0, "PSI 1 starts its own SN space at 0");
+        assert_eq!(
+            second.sn, 0,
+            "PSI 5 must start at 0 too, not continue PSI 1's counter"
+        );
+        assert_eq!(
+            task.rlc_entities.len(),
+            2,
+            "one RLC entity per (UE, bearer)"
+        );
+    }
+
+    /// The `t-Reassembly` tick is wired into the task's run loop, not just
+    /// implemented on the entity: a partial SDU abandoned by the timer must NOT
+    /// be resurrected by a segment that arrives late.
+    ///
+    /// Drives the real run loop over loopback UDP with a test socket standing in
+    /// for the UE's radio, because the tick lives in the loop's periodic arm and
+    /// nothing else would exercise it.
+    #[tokio::test]
+    async fn a_late_segment_cannot_complete_an_sdu_t_reassembly_abandoned() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let gnb_addr = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe");
+            probe.local_addr().unwrap()
+        };
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, mut gtp_rx, rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 32);
+        let mut task = RlsTask::with_bind_address(task_base, gnb_addr);
+        tokio::spawn(async move { task.run(rls_rx).await });
+
+        // A heartbeat makes the cell tracker discover this "UE".
+        let heartbeat = codec::encode(&RlsProtocolMessage::Heartbeat(nextgsim_rls::RlsHeartbeat {
+            sti: 0xDEAD_BEEF,
+            sim_pos: SimCoord::new(0, 0, 0),
+        }));
+        ue.send_to(&heartbeat, gnb_addr).await.expect("heartbeat");
+
+        let data_pdu = |pdu: Vec<u8>| {
+            codec::encode(&RlsProtocolMessage::PduTransmission(RlsPduTransmission {
+                sti: 0xDEAD_BEEF,
+                pdu_type: PduType::Data,
+                pdu_id: 0,
+                payload: 1, // PSI 1
+                pdu: Bytes::from(pdu),
+            }))
+        };
+        let um = |si: nextgsim_rlc::SegmentationInfo, sn: u16, so: Option<u16>, data: Vec<u8>| {
+            nextgsim_rlc::RlcUmPdu { si, sn, so, data }.encode_sn12()
+        };
+
+        // POSITIVE CONTROL first: a complete SDU must arrive at GTP. Without it
+        // the negative assertion below would also pass if the heartbeat were
+        // rejected or the data path were broken for an unrelated reason.
+        ue.send_to(
+            &data_pdu(um(
+                nextgsim_rlc::SegmentationInfo::FullSdu,
+                0,
+                None,
+                vec![0xEE; 4],
+            )),
+            gnb_addr,
+        )
+        .await
+        .expect("complete SDU");
+        let delivered = tokio::time::timeout(Duration::from_secs(2), gtp_rx.recv())
+            .await
+            .expect("the data path must deliver a complete SDU");
+        assert!(
+            matches!(
+                delivered,
+                Some(TaskMessage::Message(GtpMessage::DataPduDelivery { .. }))
+            ),
+            "expected the complete SDU at GTP, got {delivered:?}"
+        );
+
+        // Now only the FIRST segment of SN 1: the rest never arrives.
+        ue.send_to(
+            &data_pdu(um(
+                nextgsim_rlc::SegmentationInfo::FirstSegment,
+                1,
+                None,
+                vec![1, 2, 3, 4],
+            )),
+            gnb_addr,
+        )
+        .await
+        .expect("first segment");
+
+        // The run loop's periodic arm ticks every 500 ms and t-Reassembly is
+        // 50 ms, so one tick is enough; two are allowed for scheduling slack.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // The last segment arrives after the SDU was abandoned.
+        ue.send_to(
+            &data_pdu(um(
+                nextgsim_rlc::SegmentationInfo::LastSegment,
+                1,
+                Some(4),
+                vec![5, 6],
+            )),
+            gnb_addr,
+        )
+        .await
+        .expect("last segment");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            gtp_rx.try_recv().is_err(),
+            "an SDU t-Reassembly abandoned must not be delivered by a late segment"
+        );
+    }
+
+    /// The uplink direction keys the same way, so two sessions reassembling at
+    /// once do not share one buffer: both hold their own SN 0 partial SDU.
+    #[tokio::test]
+    async fn two_pdu_sessions_reassemble_in_separate_buffers() {
+        let mut task = broadcasting_task().await;
+
+        let first_segment = nextgsim_rlc::RlcUmPdu {
+            si: nextgsim_rlc::SegmentationInfo::FirstSegment,
+            sn: 0,
+            so: None,
+            data: vec![1, 2, 3, 4],
+        }
+        .encode_sn12();
+
+        for psi in [1u32, 5u32] {
+            let pdu = RlsPduTransmission {
+                sti: 0,
+                pdu_type: PduType::Data,
+                pdu_id: 0,
+                payload: psi,
+                pdu: Bytes::from(first_segment.clone()),
+            };
+            task.handle_uplink_data(1, &pdu).await;
+        }
+
+        assert_eq!(task.rlc_entities.len(), 2, "one entity per (UE, bearer)");
+        for (key, entity) in &task.rlc_entities {
+            assert_eq!(
+                entity.reassembly_buffer_len(),
+                1,
+                "{key:?} must hold its own partial SDU"
+            );
+        }
     }
 }

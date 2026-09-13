@@ -32,7 +32,7 @@ matched simulator that drives it over N2 (NGAP/SCTP) and N3 (GTP-U).
 | UE 5GSM state machine | `nextgsim-ue` | `src/nas/sm/orchestrator.rs`, `src/nas/sm/procedure.rs` | Builds/parses PDU session messages; PSI/PTI allocation; T3580/T3581/T3582 |
 | UE TUN device | `nextgsim-ue` | `src/tun/interface.rs`, `src/tun/task.rs`, `src/tun/config.rs` | Creates `uesimtun<N>`, reads uplink / writes downlink IP packets |
 | UE↔gNB radio link | `nextgsim-rls` | `src/protocol.rs`, `src/transport.rs` | RLS-over-UDP frames for RRC and user data |
-| RLC segmentation | `nextgsim-rlc` | `src/entity.rs` | Per-session RLC-UM (SN12) segment/reassemble |
+| RLC segmentation | `nextgsim-rlc` | `src/entity.rs` | Per-bearer RLC-UM (SN12) segment/reassemble, with the reassembly window and `t-Reassembly` |
 | gNB NGAP / N2 | `nextgsim-gnb` | `src/ngap/task.rs` | `PDUSessionResourceSetup` + `InitialContextSetup`, DRB reconfig |
 | NGAP transfer codecs | `nextgsim-ngap` | `src/procedures/transfer.rs` | APER encode/decode of the N2 SM transfer containers |
 | gNB GTP-U / N3 | `nextgsim-gnb`, `nextgsim-gtp` | `src/gtp/task.rs`; `src/tunnel.rs`, `src/codec.rs` | GTP-U encap/decap, TEID/tunnel management |
@@ -241,7 +241,8 @@ tunnel (gNB↔UPF). They are stitched together inside the gNB.
    frame goes over UDP to the serving cell.
 4. **gNB RLS + RLC.** The gNB RLS task routes `PduType::Data` frames to
    `handle_uplink_data` (`nextgsim-gnb/src/rls/task.rs`), which reads
-   `psi = pdu.payload`, feeds the bytes into the per-UE RLC entity, and on each
+   `psi = pdu.payload`, feeds the bytes into the `(ue_id, psi)` RLC entity — one
+   per radio bearer, TS 38.322 §4.2.1 — and on each
    fully reassembled SDU sends `GtpMessage::DataPduDelivery { ue_id, psi, pdu }`
    to the GTP task.
 5. **gNB GTP-U encap.** `handle_uplink_data` (`nextgsim-gnb/src/gtp/task.rs`)
