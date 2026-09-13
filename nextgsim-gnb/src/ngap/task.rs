@@ -42,6 +42,9 @@ use nextgsim_ngap::codec::{decode_ngap_pdu, encode_ngap_pdu, NGAP_PDU};
 use nextgsim_ngap::procedures::amf_status_indication::{
     decode_amf_status_indication, AmfStatusIndicationData,
 };
+use std::time::{Duration, Instant};
+
+use crate::ngap::timers::{GuardTimer, GuardTimers};
 use nextgsim_ngap::procedures::error_indication::{
     decode_error_indication, encode_error_indication, error_indication_abstract_syntax_error,
     error_indication_transfer_syntax_error, CriticalityDiagnosticsInfo, ErrorIndicationData,
@@ -49,10 +52,11 @@ use nextgsim_ngap::procedures::error_indication::{
 };
 use nextgsim_ngap::procedures::handover::{
     decode_handover_command, decode_handover_preparation_failure, decode_handover_request,
-    encode_handover_notify, encode_handover_request_acknowledge, encode_handover_required,
-    HandoverCause, HandoverCommandData, HandoverNotifyParams, HandoverPreparationFailureData,
-    HandoverRequestAcknowledgeParams, HandoverRequestData, HandoverRequiredParams,
-    HandoverTypeValue, NrCgiValue as HandoverNrCgiValue, PduSessionResourceAdmittedItem,
+    encode_handover_cancel, encode_handover_notify, encode_handover_request_acknowledge,
+    encode_handover_required, HandoverCancelParams, HandoverCause, HandoverCommandData,
+    HandoverNotifyParams, HandoverPreparationFailureData, HandoverRequestAcknowledgeParams,
+    HandoverRequestData, HandoverRequiredParams, HandoverTypeValue,
+    NrCgiValue as HandoverNrCgiValue, PduSessionResourceAdmittedItem,
     PduSessionResourceHoRequiredItem, TaiValue, TargetIdValue,
     UserLocationInfoNr as HandoverUserLocationInfoNr,
 };
@@ -167,6 +171,9 @@ pub struct NgapTask {
     is_initialized: bool,
     /// MBS session manager (Rel-17)
     mbs_sessions: MbsSessionManager,
+    /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
+    /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
+    guard_timers: GuardTimers,
 }
 
 impl NgapTask {
@@ -180,6 +187,7 @@ impl NgapTask {
             downlink_teid_counter: 0,
             is_initialized: false,
             mbs_sessions: MbsSessionManager::new(),
+            guard_timers: GuardTimers::new(),
         }
     }
 
@@ -586,17 +594,27 @@ impl NgapTask {
                     amf_id, failure.cause
                 );
 
-                // Handle time_to_wait for retry
-                // The time_to_wait IE indicates the minimum time the NG-RAN node should wait
-                // before re-initiating the NG Setup procedure.
-                // Note: In the current implementation, we rely on the SCTP reconnection
-                // mechanism to handle retries. A more sophisticated implementation would
-                // parse the time_to_wait IE and schedule a retry after that duration.
+                // TS 38.413 §8.7.1.3: with a Time to Wait IE the gNB "shall wait at
+                // least for the indicated time before re-initiating the NG Setup
+                // procedure towards the same AMF". Scheduled as a guard timer rather
+                // than left to SCTP reconnection, which is not gated by the IE at all
+                // and would retry sooner than the AMF asked.
                 if let Some(time_to_wait) = failure.time_to_wait {
+                    let wait = time_to_wait.as_duration();
                     info!(
-                        "AMF {} requested wait time before retry: {:?}",
-                        amf_id, time_to_wait
+                        "AMF {} requested a {:?} wait before retry ({:?}); NG Setup retry scheduled",
+                        amf_id, wait, time_to_wait
                     );
+                    self.guard_timers.start(
+                        Instant::now(),
+                        wait,
+                        GuardTimer::NgSetupRetry { amf_id },
+                    );
+                } else {
+                    // No IE: no wait is mandated, so the existing SCTP reconnection
+                    // path governs. Not retried here, because retrying immediately
+                    // against an AMF that just refused is its own kind of wrong.
+                    debug!("NG Setup Failure from AMF {amf_id} carried no Time to Wait");
                 }
 
                 if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
@@ -1773,6 +1791,12 @@ impl NgapTask {
             }
         };
 
+        // The AMF answered, so TNGRELOCoverall has done its job (TS 38.413 §8.3.3.4).
+        // Cancelled rather than left to expire: an expiry after the release completed
+        // would act on a ue_id this release is about to free, and ids are reused.
+        self.guard_timers
+            .cancel(GuardTimer::UeContextRelease { ue_id });
+
         // Release all PDU sessions for this UE via GTP
         let msg = GtpMessage::UeContextRelease { ue_id };
         if let Err(e) = self.task_base.gtp_tx.send(msg).await {
@@ -2173,11 +2197,20 @@ impl NgapTask {
                     self.send_ngap_ue_associated(amf_ctx_id, stream, bytes)
                         .await;
 
-                    // Keep the context in Releasing state; cleanup happens when
-                    // the AMF answers with UE Context Release Command
+                    // Keep the context in Releasing state; cleanup happens when the
+                    // AMF answers with UE Context Release Command -- or when
+                    // TNGRELOCoverall expires, which is what stops "waiting for the
+                    // AMF" from meaning "forever" (TS 38.413 §8.3.3.4).
                     if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
                         ctx.on_context_release();
                     }
+                    let overall =
+                        Duration::from_secs(self.task_base.config.ngap_tngreloc_overall_secs);
+                    self.guard_timers.start(
+                        Instant::now(),
+                        overall,
+                        GuardTimer::UeContextRelease { ue_id },
+                    );
                     return;
                 }
                 Err(e) => {
@@ -2248,6 +2281,103 @@ impl NgapTask {
                     "ERROR INDICATION is not associated with a known UE context; processed with no local release and no reply"
                 );
             }
+        }
+    }
+
+    // ========================================================================
+    // NGAP guard timers (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3)
+    // ========================================================================
+
+    /// Act on every guard timer due at `now`.
+    ///
+    /// `now` is a parameter so the whole expiry path is testable without sleeping; the
+    /// run loop passes `Instant::now()`.
+    async fn process_expired_guard_timers(&mut self, now: Instant) {
+        for timer in self.guard_timers.expired(now) {
+            match timer {
+                GuardTimer::UeContextRelease { ue_id } => {
+                    // TS 38.413 §8.3.3.4: the AMF never answered the UE Context Release
+                    // Request. Release locally rather than leave the context in
+                    // `Releasing` forever -- every one that stays holds a
+                    // RAN-UE-NGAP-ID, and the id space is finite.
+                    warn!(
+                        "TNGRELOCoverall expired for UE[{ue_id}]: no UE Context Release \
+                         Command from the AMF, releasing locally"
+                    );
+                    self.local_release_ue(ue_id).await;
+                }
+                GuardTimer::HandoverPreparation { ue_id } => {
+                    // TS 38.413 §8.4.1.2: on expiry the source cancels the preparation.
+                    // Cancelling means SENDING Handover Cancel (§8.4.5), not just
+                    // dropping the wait: the AMF and the target may already hold
+                    // resources for this handover, and only the cancel releases them.
+                    // `encode_handover_cancel` existed in nextgsim-ngap with no
+                    // production caller -- this is it.
+                    warn!(
+                        "TNGRELOCprep expired for UE[{ue_id}]: cancelling handover \
+                         preparation, UE stays on the source cell"
+                    );
+                    self.send_handover_cancel(ue_id).await;
+                }
+                GuardTimer::NgSetupRetry { amf_id } => {
+                    // TS 38.413 §8.7.1.3: the Time to Wait has elapsed, so NG Setup may
+                    // be re-initiated toward this AMF.
+                    let still_known = self.amf_contexts.contains_key(&amf_id);
+                    if still_known {
+                        info!("Time to Wait elapsed, re-initiating NG Setup toward AMF {amf_id}");
+                        self.send_ng_setup_request(amf_id).await;
+                    } else {
+                        debug!(
+                            "Time to Wait elapsed for AMF {amf_id}, which is no longer \
+                             configured; no retry"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send Handover Cancel for `ue_id` (TS 38.413 §8.4.5).
+    ///
+    /// The cause is `tNGRELOCprep-expiry`, which is the value TS 38.413 defines for
+    /// exactly this: a preparation the source abandoned because its own supervision
+    /// timer ran out. (`tNGRELOCoverall-expiry` is the sibling value and belongs to the
+    /// other timer, so using it here would misreport which one fired.)
+    async fn send_handover_cancel(&mut self, ue_id: i32) {
+        let Some(ctx) = self.ue_contexts.get(&ue_id) else {
+            debug!("Handover Cancel for UE[{ue_id}]: the context is already gone");
+            return;
+        };
+        let (Some(amf_ue_ngap_id), ran_ue_ngap_id, amf_ctx_id, stream) = (
+            ctx.amf_ue_ngap_id,
+            ctx.ran_ue_ngap_id,
+            ctx.amf_ctx_id,
+            ctx.stream_id,
+        ) else {
+            // Without an AMF UE NGAP ID there is no UE-associated signalling connection
+            // to cancel on, and the IE is mandatory.
+            warn!(
+                "Handover Cancel for UE[{ue_id}] skipped: no AMF UE NGAP ID, so the \
+                 mandatory IE cannot be filled"
+            );
+            return;
+        };
+
+        let params = HandoverCancelParams {
+            amf_ue_ngap_id: amf_ue_ngap_id as u64,
+            ran_ue_ngap_id: ran_ue_ngap_id as u32,
+            cause: HandoverCause::RadioNetwork(RadioNetworkCause::TngrelocPrepExpiry),
+        };
+        match encode_handover_cancel(&params) {
+            Ok(bytes) => {
+                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes)
+                    .await;
+                info!(
+                    "Sent Handover Cancel: ue_id={ue_id}, ran_ue_ngap_id={ran_ue_ngap_id}, \
+                     cause=tNGRELOCprep-expiry"
+                );
+            }
+            Err(e) => error!("Failed to encode Handover Cancel for UE[{ue_id}]: {e}"),
         }
     }
 
@@ -2710,6 +2840,16 @@ impl NgapTask {
             .map(|ctx| ctx.ue_id);
 
         if let Some(ue_id) = ue_id {
+            // Preparation completed, so TNGRELOCprep is done (TS 38.413 §8.4.1.2).
+            if !self
+                .guard_timers
+                .cancel(GuardTimer::HandoverPreparation { ue_id })
+            {
+                warn!(
+                    "Handover Command for UE[{ue_id}] with no handover preparation \
+                     pending: either it already timed out or this gNB never started one"
+                );
+            }
             // Forward the Target-to-Source Transparent Container to UE via RRC
             // This contains the RRC Reconfiguration with mobility control info
             let container = OctetString::from_slice(&ho_cmd.target_to_source_transparent_container);
@@ -2824,12 +2964,16 @@ impl NgapTask {
             ho_fail.amf_ue_ngap_id, ho_fail.ran_ue_ngap_id, ho_fail.cause
         );
 
-        // Handover failed - UE stays on source gNB, no action needed
-        if let Some(ctx) = self.find_ue_by_ran_id(ho_fail.ran_ue_ngap_id as i64) {
-            info!(
-                "Handover preparation failed for UE[{}], staying on source cell",
-                ctx.ue_id
-            );
+        // Handover failed - UE stays on source gNB, no action needed beyond stopping
+        // the guard timer: the AMF answered, so TNGRELOCprep must not also fire and
+        // cancel a preparation that is already over.
+        if let Some(ue_id) = self
+            .find_ue_by_ran_id(ho_fail.ran_ue_ngap_id as i64)
+            .map(|ctx| ctx.ue_id)
+        {
+            info!("Handover preparation failed for UE[{ue_id}], staying on source cell");
+            self.guard_timers
+                .cancel(GuardTimer::HandoverPreparation { ue_id });
         }
     }
 
@@ -2913,7 +3057,7 @@ impl NgapTask {
 
     #[allow(clippy::too_many_arguments)]
     async fn send_handover_required(
-        &self,
+        &mut self,
         amf_client_id: i32,
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
@@ -2949,6 +3093,19 @@ impl NgapTask {
                     "Sent Handover Required: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
                     amf_ue_ngap_id, ran_ue_ngap_id
                 );
+                // TNGRELOCprep starts when preparation is actually on the wire, not
+                // when it was decided: an encode failure leaves nothing to supervise.
+                if let Some(ue_id) = self
+                    .find_ue_by_ran_id(ran_ue_ngap_id as i64)
+                    .map(|ctx| ctx.ue_id)
+                {
+                    let prep = Duration::from_secs(self.task_base.config.ngap_tngreloc_prep_secs);
+                    self.guard_timers.start(
+                        Instant::now(),
+                        prep,
+                        GuardTimer::HandoverPreparation { ue_id },
+                    );
+                }
             }
             Err(e) => {
                 error!("Failed to encode Handover Required: {}", e);
@@ -3572,8 +3729,22 @@ impl Task for NgapTask {
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
         info!("NGAP task started");
 
+        // Guard timers are polled rather than each armed as its own task: one tick
+        // handles every pending timer, and the granularity bounds the overshoot (a
+        // timer fires within one tick of its deadline, never before it -- `expired`
+        // compares deadlines, so the tick rate cannot make one fire early).
+        let mut guard_tick = tokio::time::interval(Duration::from_millis(500));
+        guard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
-            match rx.recv().await {
+            let msg = tokio::select! {
+                _ = guard_tick.tick() => {
+                    self.process_expired_guard_timers(Instant::now()).await;
+                    continue;
+                }
+                msg = rx.recv() => msg,
+            };
+            match msg {
                 Some(TaskMessage::Message(msg)) => match msg {
                     NgapMessage::SctpAssociationUp {
                         client_id,
@@ -4961,5 +5132,317 @@ mod tests {
             }
             other => panic!("expected a RAN Configuration Update PDU, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // #42 criteria 4-6: NGAP guard timers
+    // (TS 38.413 §8.3.3.4 TNGRELOCoverall, §8.4.1.2 TNGRELOCprep,
+    //  §8.7.1.3 NG Setup Failure Time to Wait)
+    //
+    // Every expiry is driven by passing an explicit `now` to
+    // `process_expired_guard_timers`, so these tests neither sleep nor depend on
+    // how promptly the host schedules a timer -- the "controllable clock"
+    // criterion 7(c) asks for.
+    // ------------------------------------------------------------------
+
+    use crate::ngap::timers::GuardTimer;
+    use crate::ngap::UeState;
+    use nextgsim_ngap::procedures::ng_setup::TimeToWaitValue;
+    use std::time::{Duration, Instant};
+
+    /// A task with one ready AMF and one UE context that has an AMF UE NGAP ID, i.e.
+    /// a UE whose UE-associated signalling connection is usable.
+    fn task_with_ue(
+        ue_id: i32,
+    ) -> (
+        NgapTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(ue_id, 1).expect("ue context");
+        if let Some(ctx) = task.find_ue_context_mut(ue_id) {
+            ctx.amf_ue_ngap_id = Some(4242);
+        }
+        (task, sctp_rx)
+    }
+
+    /// Criterion 4: a UE Context Release Request with no Command in reply must not leave
+    /// the context in `Releasing` forever.
+    #[tokio::test]
+    async fn tngreloc_overall_expiry_releases_a_stuck_ue_context() {
+        let (mut task, _sctp_rx) = task_with_ue(11);
+
+        task.handle_ue_context_release_request(11, UeReleaseRequestCause::UserTriggered)
+            .await;
+        assert!(
+            task.guard_timers
+                .is_pending(GuardTimer::UeContextRelease { ue_id: 11 }),
+            "sending the request must arm TNGRELOCoverall"
+        );
+        assert_eq!(
+            task.find_ue_context(11).map(|c| c.state),
+            Some(UeState::Releasing),
+            "precondition: the context is waiting on the AMF"
+        );
+
+        let overall = Duration::from_secs(test_config().ngap_tngreloc_overall_secs);
+        let base = Instant::now();
+        task.process_expired_guard_timers(base).await;
+        assert!(
+            task.find_ue_context(11).is_some(),
+            "it must not be released before the timer expires"
+        );
+
+        task.process_expired_guard_timers(base + overall).await;
+        assert!(
+            task.find_ue_context(11).is_none(),
+            "on expiry the context is released locally, or it holds a RAN-UE-NGAP-ID \
+             forever and the id space is finite"
+        );
+    }
+
+    /// The AMF answering must disarm the timer, or the expiry would later act on a
+    /// ue_id that has been freed and possibly reused.
+    #[tokio::test]
+    async fn a_release_command_cancels_tngreloc_overall() {
+        use nextgsim_ngap::procedures::ue_context_release::{
+            UeContextReleaseCommandData, UeNgapIds,
+        };
+        let (mut task, _sctp_rx) = task_with_ue(12);
+
+        task.handle_ue_context_release_request(12, UeReleaseRequestCause::UserTriggered)
+            .await;
+        assert!(task
+            .guard_timers
+            .is_pending(GuardTimer::UeContextRelease { ue_id: 12 }));
+
+        let ran_ue_ngap_id = task
+            .find_ue_context(12)
+            .map(|c| c.ran_ue_ngap_id)
+            .expect("ue context");
+        task.handle_ue_context_release_command(
+            1,
+            0,
+            UeContextReleaseCommandData {
+                ue_ngap_ids: UeNgapIds::Pair {
+                    amf_ue_ngap_id: 4242,
+                    ran_ue_ngap_id: ran_ue_ngap_id as u32,
+                },
+                cause: NgSetupFailureCause::Nas(NasCause::NormalRelease),
+            },
+        )
+        .await;
+        assert!(
+            !task
+                .guard_timers
+                .is_pending(GuardTimer::UeContextRelease { ue_id: 12 }),
+            "the AMF answered, so the guard timer must be cancelled"
+        );
+    }
+
+    /// Criterion 5: handover preparation that is never answered is cancelled, and
+    /// cancelling means SENDING Handover Cancel (TS 38.413 §8.4.5) -- the AMF and target
+    /// may hold resources that only the cancel releases.
+    #[tokio::test]
+    async fn tngreloc_prep_expiry_cancels_the_handover() {
+        let (mut task, mut sctp_rx) = task_with_ue(13);
+        let ran_ue_ngap_id = task
+            .find_ue_context(13)
+            .map(|c| c.ran_ue_ngap_id)
+            .expect("ue context") as u32;
+
+        task.send_handover_required(
+            1,
+            4242,
+            ran_ue_ngap_id,
+            &[0x00, 0xf1, 0x10],
+            0x1234,
+            &[0x00, 0x00, 0x01],
+            &[0x00],
+            &[],
+        )
+        .await;
+        assert!(
+            task.guard_timers
+                .is_pending(GuardTimer::HandoverPreparation { ue_id: 13 }),
+            "sending Handover Required must arm TNGRELOCprep"
+        );
+        // Drain the Handover Required so the assertion below is about the cancel.
+        while sctp_rx.try_recv().is_ok() {}
+
+        let prep = Duration::from_secs(test_config().ngap_tngreloc_prep_secs);
+        let base = Instant::now();
+        task.process_expired_guard_timers(base + prep - Duration::from_millis(1))
+            .await;
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "nothing may be sent before the timer expires"
+        );
+
+        task.process_expired_guard_timers(base + prep).await;
+        let sent = sctp_rx.try_recv().expect("a Handover Cancel must be sent");
+        let bytes = match sent {
+            TaskMessage::Message(crate::tasks::SctpMessage::SendMessage { buffer, .. }) => {
+                buffer.data().to_vec()
+            }
+            other => panic!("expected an NGAP PDU to the SCTP task, got {other:?}"),
+        };
+        let cancel = nextgsim_ngap::procedures::handover::decode_handover_cancel(&bytes)
+            .expect("the PDU must decode as Handover Cancel");
+        assert_eq!(cancel.amf_ue_ngap_id, 4242);
+        assert_eq!(cancel.ran_ue_ngap_id, ran_ue_ngap_id);
+        assert!(
+            task.find_ue_context(13).is_some(),
+            "the UE stays on the source cell: cancelling a handover does not release it"
+        );
+    }
+
+    /// A Handover Command disarms TNGRELOCprep, so a completed handover cannot later be
+    /// cancelled by its own guard timer.
+    #[tokio::test]
+    async fn a_handover_command_cancels_tngreloc_prep() {
+        let (mut task, mut sctp_rx) = task_with_ue(14);
+        let ran_ue_ngap_id = task
+            .find_ue_context(14)
+            .map(|c| c.ran_ue_ngap_id)
+            .expect("ue context") as u32;
+        task.send_handover_required(
+            1,
+            4242,
+            ran_ue_ngap_id,
+            &[0x00, 0xf1, 0x10],
+            0x1234,
+            &[0x00, 0x00, 0x01],
+            &[0x00],
+            &[],
+        )
+        .await;
+        while sctp_rx.try_recv().is_ok() {}
+
+        task.handle_handover_command(
+            1,
+            0,
+            HandoverCommandData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id,
+                handover_type: HandoverTypeValue::Intra5gs,
+                target_to_source_transparent_container: vec![0x01, 0x02],
+                pdu_session_resource_handover_list: None,
+                pdu_session_resource_to_release_list: None,
+            },
+        )
+        .await;
+        assert!(
+            !task
+                .guard_timers
+                .is_pending(GuardTimer::HandoverPreparation { ue_id: 14 }),
+            "preparation completed, so its guard timer must be cancelled"
+        );
+
+        // And no Handover Cancel is produced later.
+        while sctp_rx.try_recv().is_ok() {}
+        task.process_expired_guard_timers(Instant::now() + Duration::from_secs(3600))
+            .await;
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "a completed handover must never be cancelled by its own guard timer"
+        );
+    }
+
+    /// Criterion 6: an NG Setup Failure carrying Time to Wait schedules a retry, and the
+    /// retry does not fire before the indicated time.
+    #[tokio::test]
+    async fn ng_setup_failure_time_to_wait_gates_the_retry() {
+        use nextgsim_ngap::procedures::ng_setup::{build_ng_setup_failure, NgSetupFailureParams};
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+        }
+
+        let failure = build_ng_setup_failure(&NgSetupFailureParams {
+            cause: NgSetupFailureCause::Misc(
+                nextgsim_ngap::procedures::ng_setup::MiscCause::ControlProcessingOverload,
+            ),
+            time_to_wait: Some(TimeToWaitValue::V10s),
+        })
+        .expect("build failure");
+        let bytes = nextgsim_ngap::codec::encode_ngap_pdu(&failure).expect("encode");
+        assert!(
+            task.handle_ng_setup_failure(1, &bytes),
+            "the failure must be recognised"
+        );
+        assert!(
+            task.guard_timers
+                .is_pending(GuardTimer::NgSetupRetry { amf_id: 1 }),
+            "Time to Wait must schedule a retry rather than being logged and dropped"
+        );
+
+        while sctp_rx.try_recv().is_ok() {}
+        let base = Instant::now();
+        task.process_expired_guard_timers(base + Duration::from_secs(9))
+            .await;
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "TS 38.413 §8.7.1.3: the retry must wait AT LEAST the indicated 10s"
+        );
+
+        task.process_expired_guard_timers(base + Duration::from_secs(10))
+            .await;
+        assert!(
+            sctp_rx.try_recv().is_ok(),
+            "once the wait has elapsed the NG Setup is re-initiated"
+        );
+    }
+
+    /// The Time to Wait mapping is the whole of the IE's meaning, so it is asserted
+    /// value by value rather than at one sample.
+    #[test]
+    fn time_to_wait_maps_to_the_seconds_ts_38_413_defines() {
+        for (value, secs) in [
+            (TimeToWaitValue::V1s, 1),
+            (TimeToWaitValue::V2s, 2),
+            (TimeToWaitValue::V5s, 5),
+            (TimeToWaitValue::V10s, 10),
+            (TimeToWaitValue::V20s, 20),
+            (TimeToWaitValue::V60s, 60),
+        ] {
+            assert_eq!(value.as_duration(), Duration::from_secs(secs), "{value:?}");
+        }
+    }
+
+    /// An NG Setup Failure with NO Time to Wait must not schedule anything: there is no
+    /// mandated wait, and retrying on a timer this gNB invented would be worse than
+    /// leaving the existing SCTP reconnection path to govern.
+    #[tokio::test]
+    async fn ng_setup_failure_without_time_to_wait_schedules_no_retry() {
+        use nextgsim_ngap::procedures::ng_setup::{build_ng_setup_failure, NgSetupFailureParams};
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+
+        let failure = build_ng_setup_failure(&NgSetupFailureParams {
+            cause: NgSetupFailureCause::Misc(
+                nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
+            ),
+            time_to_wait: None,
+        })
+        .expect("build failure");
+        let bytes = nextgsim_ngap::codec::encode_ngap_pdu(&failure).expect("encode");
+        assert!(task.handle_ng_setup_failure(1, &bytes));
+        assert!(
+            task.guard_timers.is_empty(),
+            "no Time to Wait means no mandated wait and so no scheduled retry"
+        );
     }
 }
