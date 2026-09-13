@@ -270,6 +270,24 @@ impl UeTimer {
         self.is_running = true;
     }
 
+    /// Start the timer with an explicit interval in seconds.
+    ///
+    /// For callers that already hold a duration rather than a GPRS timer IE —
+    /// e.g. the T3512 value a Configuration Update Command carried, which is
+    /// decoded to seconds by the procedure that parses the message.
+    ///
+    /// # Arguments
+    /// * `interval_secs` - Interval to run for
+    /// * `clear_expiry_count` - Whether to reset the expiry count
+    pub fn start_with_interval(&mut self, interval_secs: u32, clear_expiry_count: bool) {
+        if clear_expiry_count {
+            self.reset_expiry_count();
+        }
+        self.interval_secs = interval_secs;
+        self.start_time = Some(Instant::now());
+        self.is_running = true;
+    }
+
     /// Start the timer with a GPRS Timer 2 value
     ///
     /// # Arguments
@@ -572,6 +590,28 @@ impl NasTimerManager {
     pub fn start(&mut self, code: u16, clear_expiry_count: bool) -> bool {
         if let Some(timer) = self.get_timer_mut(code) {
             timer.start(clear_expiry_count);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Start a timer with an explicit interval in seconds.
+    ///
+    /// # Arguments
+    /// * `code` - Timer code
+    /// * `interval_secs` - Interval to run for
+    /// * `clear_expiry_count` - Whether to reset the expiry count
+    ///
+    /// Returns `true` if the timer was found and started.
+    pub fn start_with_interval(
+        &mut self,
+        code: u16,
+        interval_secs: u32,
+        clear_expiry_count: bool,
+    ) -> bool {
+        if let Some(timer) = self.get_timer_mut(code) {
+            timer.start_with_interval(interval_secs, clear_expiry_count);
             true
         } else {
             false

@@ -574,10 +574,16 @@ These 5G gaps must be resolved before meaningful 6G simulation is possible:
 - **Required:** RLC AM, UM, TM entities; encoder/decoder; ARQ procedures
 - **Estimated effort:** 5,000-8,000 LoC
 
-### Priority 2: UE NAS MM Procedures (~70% missing)
-- **Impact:** Blocks advanced mobility scenarios needed for 6G (predictive handover, NTN mobility)
-- **Required:** Full authentication flow, configuration update, emergency procedures, slice selection, radio capability handling
-- **Estimated effort:** 3,000-5,000 LoC
+### Priority 2: UE NAS MM Procedures — SUPERSEDED
+- **Status (2026-09):** this priority is closed. Authentication, the generic UE
+  configuration update (parameters applied, not merely decoded), emergency
+  registration and slice-selection state (allowed / rejected / pending NSSAI,
+  with rejected S-NSSAIs excluded from the next requested NSSAI) are
+  implemented and tested. UE radio capability ID (RACS) IEs are decoded and
+  optionally stored; RACS is not yet *signalled* — see the tracking issue.
+- **Remaining:** tracked per item in
+  [`gaps/6g-gap-analysis.md`](gaps/6g-gap-analysis.md) (NGS-5G-*) rather than as
+  a percentage here.
 
 ### Priority 3: UE NAS SM Procedures (~60% missing)
 - **Impact:** Blocks multi-PDU session scenarios, QoS-differentiated flows, network slicing

@@ -1146,6 +1146,23 @@ pub struct UeConfig {
     /// would ship without ever being compiled by the gate meant to cover it.
     #[serde(default)]
     pub ursp_evaluation: bool,
+    /// Keep the network-assigned UE radio capability ID (RACS, Rel-16
+    /// TS 23.003 §29 / TS 24.501 §9.11.3.68) that a CONFIGURATION UPDATE
+    /// COMMAND assigns.
+    ///
+    /// `false` (the default) decodes the IE — so the command is still
+    /// acknowledged and the rest of it applied — and then discards the ID,
+    /// because nothing in this simulator signals a UE radio capability ID yet:
+    /// there is no RACS IE in the REGISTRATION REQUEST and no RRC or NGAP
+    /// consumer, so storing it by default would only add state no code reads.
+    /// Set it when a deployment wants the assignment observable (the CLI status
+    /// and the logs report it).
+    ///
+    /// A RUNTIME switch and not a cargo feature: CI runs `cargo test
+    /// --workspace` with default features, so a feature-gated store would ship
+    /// without ever being compiled by the gate meant to cover it.
+    #[serde(default)]
+    pub racs_store_assigned_id: bool,
     /// Path to the file holding the 5GMM parameters TS 24.501 Annex C.1 wants
     /// kept in non-volatile memory: the 5G-GUTI, last visited registered TAI,
     /// 5GS update status and native 5G NAS security context.
@@ -1245,6 +1262,7 @@ impl Default for UeConfig {
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             ursp_evaluation: false,
+            racs_store_assigned_id: false,
             state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
@@ -1713,6 +1731,7 @@ configured_nssai:
             configured_nssai: NetworkSlice::new(),
             tun_name: Some("tun0".to_string()),
             ursp_evaluation: false,
+            racs_store_assigned_id: false,
             state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
@@ -1993,6 +2012,7 @@ configured_nssai:
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             ursp_evaluation: false,
+            racs_store_assigned_id: false,
             state_file: None,
             pqc_config: PqcConfig::new(
                 KemAlgorithm::Kyber1024,
