@@ -63,6 +63,16 @@
 //! with no Stage-3 wire spec — this crate is a research prototype, not a
 //! conformant implementation.
 
+// # Models are not shipped
+//
+// No `.onnx` file is in this repository, and none is downloaded at build time. So
+// every consumer of this crate keeps a non-neural fallback -- mean pooling in the
+// semantic codec, linear extrapolation in the NWDAF predictor, a kNN surrogate in
+// ISAC -- and the AI paths are an upgrade a deployment provisions, not a
+// dependency. The `model-registry` feature (issue #17) makes that explicit: an
+// unprovisioned model id yields a typed `RegistryError::NotProvisioned` rather
+// than a failure, which is the signal to use the fallback.
+
 pub mod config;
 pub mod error;
 pub mod fl_training;
@@ -71,6 +81,15 @@ pub mod isac_pipeline;
 pub mod metrics;
 pub mod model;
 pub mod nr_models;
+/// Shared, reusable ONNX model registry: resolve a model by id and get an
+/// `Arc<OnnxEngine>`, so two consumers of one model share one session
+/// (issue #17). Off by default; enable with the `model-registry` feature.
+///
+/// No `.onnx` ships with this repo, so the registry degrades: an unprovisioned id
+/// yields a typed [`registry::RegistryError::NotProvisioned`] and the caller keeps
+/// its non-neural fallback.
+#[cfg(feature = "model-registry")]
+pub mod registry;
 pub mod semantic_pipeline;
 pub mod tensor;
 pub mod xr_traffic;
@@ -85,6 +104,10 @@ pub use isac_pipeline::{
 };
 pub use metrics::{InferenceMetrics, ModelMetrics};
 pub use model::{ModelInfo, ModelMetadata};
+#[cfg(feature = "model-registry")]
+pub use registry::{
+    version_is_newer, RegistryEntry, RegistryError, RegistryManifest, SharedModelRegistry,
+};
 pub use semantic_pipeline::{
     SemanticDecoding, SemanticEncoding, SemanticError, SemanticPipeline, SemanticPipelineBuilder,
 };

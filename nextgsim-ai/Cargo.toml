@@ -6,6 +6,13 @@ authors.workspace = true
 license.workspace = true
 description = "AI/ML inference infrastructure for nextgsim - 6G AI-native network functions"
 
+[features]
+default = []
+# Shared, reusable ONNX model registry (issue #17): load-by-id, versioning,
+# warmup, with engines shared as `Arc<OnnxEngine>`. Off by default; consumer
+# wiring is additive, so their existing direct `load_model` paths are untouched.
+model-registry = []
+
 [dependencies]
 # Async runtime
 tokio = { workspace = true }

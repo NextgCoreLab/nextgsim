@@ -93,6 +93,32 @@ jobs:
           cargo clippy -p nextgsim-gnb --features event-bus,6g --all-targets
           cargo clippy -p nextgsim-ue --features event-bus --all-targets
 
+  model-registry:
+    name: Model registry (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `model-registry` feature (issue #17) is off by default, so the
+      # default-feature jobs above never compile it -- the same gap the event-bus
+      # job closes. Both consumers are covered, since the sharing they get is the
+      # whole point of the registry.
+      - name: cargo test (registry core)
+        run: cargo test -p nextgsim-ai --features model-registry
+      - name: cargo test (consumers)
+        run: |
+          cargo test -p nextgsim-nwdaf --features model-registry
+          cargo test -p nextgsim-semantic --features model-registry
+      - name: cargo clippy
+        run: |
+          cargo clippy -p nextgsim-ai --features model-registry --all-targets
+          cargo clippy -p nextgsim-nwdaf --features model-registry --all-targets
+          cargo clippy -p nextgsim-semantic --features model-registry --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

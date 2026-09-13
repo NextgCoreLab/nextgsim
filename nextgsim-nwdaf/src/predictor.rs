@@ -55,8 +55,17 @@ pub struct PredictionOutput {
 /// let output = predictor.predict_trajectory(&positions, &timestamps, 1000, base_time)?;
 /// ```
 pub struct OnnxPredictor {
-    /// Underlying ONNX inference engine
+    /// Underlying ONNX inference engine, owned by this predictor.
     engine: OnnxEngine,
+    /// An engine resolved from the shared registry (issue #17), which takes
+    /// precedence over `engine` when present.
+    ///
+    /// Additive: `load_model` still works exactly as before and a predictor that
+    /// never touches the registry is unchanged. What this adds is the option of
+    /// sharing one warmed session with another consumer of the same model id
+    /// rather than loading the file a second time.
+    #[cfg(feature = "model-registry")]
+    shared_engine: Option<std::sync::Arc<OnnxEngine>>,
     /// Whether a model has been successfully loaded
     model_loaded: bool,
 }
@@ -65,7 +74,7 @@ impl std::fmt::Debug for OnnxPredictor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OnnxPredictor")
             .field("model_loaded", &self.model_loaded)
-            .field("is_ready", &self.engine.is_ready())
+            .field("is_ready", &self.active_engine().is_ready())
             .finish()
     }
 }
@@ -84,6 +93,8 @@ impl OnnxPredictor {
         })?;
         Ok(Self {
             engine,
+            #[cfg(feature = "model-registry")]
+            shared_engine: None,
             model_loaded: false,
         })
     }
@@ -99,6 +110,8 @@ impl OnnxPredictor {
         })?;
         Ok(Self {
             engine,
+            #[cfg(feature = "model-registry")]
+            shared_engine: None,
             model_loaded: false,
         })
     }
@@ -132,9 +145,69 @@ impl OnnxPredictor {
         Ok(())
     }
 
+    /// Resolve this predictor's model from the shared registry (issue #17)
+    /// instead of loading a file, so a second consumer of the same model id shares
+    /// one warmed session.
+    ///
+    /// # Errors
+    ///
+    /// `RegistryError::NotProvisioned` when the deployment has no model under
+    /// `id` — the expected case in a tree that ships no `.onnx`. A caller should
+    /// carry on with linear extrapolation, which is what this predictor does
+    /// anyway when no model is loaded.
+    #[cfg(feature = "model-registry")]
+    pub fn resolve_from_registry(
+        &mut self,
+        registry: &nextgsim_ai::SharedModelRegistry,
+        id: &str,
+    ) -> Result<(), nextgsim_ai::RegistryError> {
+        let engine = registry.load_by_id(id)?;
+        info!("Trajectory prediction resolved model {id} from the shared registry");
+        self.model_loaded = true;
+        self.shared_engine = Some(engine);
+        Ok(())
+    }
+
+    /// The engine predictions run against: the shared one when the registry
+    /// supplied it, else the one this predictor owns.
+    fn active_engine(&self) -> &dyn InferenceEngine {
+        #[cfg(feature = "model-registry")]
+        if let Some(ref shared) = self.shared_engine {
+            return shared.as_ref();
+        }
+        &self.engine
+    }
+
+    /// The identity of the engine [`Self::active_engine`] routes to.
+    ///
+    /// Exists because that routing is otherwise unobservable in this repo: with no
+    /// `.onnx` to load, an owned engine and a registry engine are both
+    /// `is_ready() == false`, so nothing in an inference result distinguishes
+    /// them. Comparing the pointer against `Arc::as_ptr` of the registry's engine
+    /// is what actually pins "the predictor uses the shared session".
+    #[cfg(feature = "model-registry")]
+    pub fn active_engine_ptr(&self) -> *const OnnxEngine {
+        #[cfg(feature = "model-registry")]
+        if let Some(ref shared) = self.shared_engine {
+            return std::sync::Arc::as_ptr(shared);
+        }
+        &self.engine as *const OnnxEngine
+    }
+
+    /// Whether a model has been recorded as loaded, irrespective of whether its
+    /// session is usable.
+    ///
+    /// Distinct from [`Self::has_model`], which also requires the engine to be
+    /// ready — so with no `.onnx` in the tree `has_model` is always false and
+    /// cannot show whether a resolution succeeded.
+    #[cfg(feature = "model-registry")]
+    pub fn model_is_recorded(&self) -> bool {
+        self.model_loaded
+    }
+
     /// Returns whether an ML model is loaded
     pub fn has_model(&self) -> bool {
-        self.model_loaded && self.engine.is_ready()
+        self.model_loaded && self.active_engine().is_ready()
     }
 
     /// Predicts a trajectory given a position history
@@ -354,7 +427,7 @@ impl OnnxPredictor {
                 load_values.to_vec(),
                 vec![1i64, load_values.len() as i64, 1],
             );
-            match self.engine.infer(&input) {
+            match self.active_engine().infer(&input) {
                 Ok(output) => {
                     if let Some(data) = output.as_f32_slice() {
                         let predictions: Vec<f32> = data
@@ -517,5 +590,81 @@ mod tests {
         let debug_str = format!("{predictor:?}");
         assert!(debug_str.contains("OnnxPredictor"));
         assert!(debug_str.contains("model_loaded: false"));
+    }
+}
+
+// ============================================================================
+// Shared model registry (issue #17)
+// ============================================================================
+
+#[cfg(all(test, feature = "model-registry"))]
+mod registry_tests {
+    use super::*;
+    use nextgsim_ai::SharedModelRegistry;
+    use std::sync::Arc;
+
+    /// The NWDAF predictor resolves its trajectory model by id, and a second
+    /// consumer of the same id shares the engine rather than loading it again.
+    #[test]
+    fn the_predictor_shares_a_registry_engine() {
+        let registry = SharedModelRegistry::new(ExecutionProvider::Cpu);
+        let engine = Arc::new(OnnxEngine::new(ExecutionProvider::Cpu).expect("engine"));
+        registry
+            .register_preloaded(
+                "nwdaf-trajectory",
+                "1.0.0",
+                "/models/trajectory.onnx",
+                Arc::clone(&engine),
+            )
+            .expect("register");
+
+        let mut first = OnnxPredictor::new().expect("predictor");
+        let mut second = OnnxPredictor::new().expect("predictor");
+        first
+            .resolve_from_registry(&registry, "nwdaf-trajectory")
+            .expect("first resolves");
+        second
+            .resolve_from_registry(&registry, "nwdaf-trajectory")
+            .expect("second resolves");
+
+        assert_eq!(
+            registry.loaded_count(),
+            1,
+            "one engine for one model id, whatever the consumer count"
+        );
+        // Exactly four holders: this test, the registry, and each predictor. An
+        // inequality would be satisfied by only one predictor having resolved.
+        assert_eq!(
+            Arc::strong_count(&engine),
+            4,
+            "this test, the registry and both predictors"
+        );
+        // And each predictor actually *routes* to that engine, which the counts
+        // above do not show: a predictor could hold the Arc and still run on its
+        // own engine.
+        assert_eq!(first.active_engine_ptr(), Arc::as_ptr(&engine));
+        assert_eq!(second.active_engine_ptr(), Arc::as_ptr(&engine));
+    }
+
+    /// An unprovisioned id leaves the predictor on linear extrapolation rather
+    /// than failing, which is what it does with no model anyway.
+    #[test]
+    fn an_unprovisioned_id_leaves_the_predictor_without_a_model() {
+        let registry = SharedModelRegistry::new(ExecutionProvider::Cpu);
+        let mut predictor = OnnxPredictor::new().expect("predictor");
+
+        let err = predictor
+            .resolve_from_registry(&registry, "absent")
+            .expect_err("nothing is provisioned");
+        assert!(err.is_not_provisioned(), "{err}");
+        assert!(
+            !predictor.model_is_recorded(),
+            "a failed resolution must not mark a model as loaded"
+        );
+        assert_eq!(
+            predictor.active_engine_ptr(),
+            &predictor.engine as *const OnnxEngine,
+            "and it still routes to its own engine"
+        );
     }
 }
