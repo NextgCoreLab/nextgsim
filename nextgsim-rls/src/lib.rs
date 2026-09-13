@@ -19,6 +19,12 @@
 //! - [`protocol`]: RLS message types and structures
 //! - [`codec`]: Message encoding and decoding
 //! - [`cell_search`]: Cell discovery and tracking for UE and gNB
+//! - [`channel`]: pluggable signal models behind the [`channel::ChannelModel`]
+//!   trait — the default [`channel::DistanceModel`] (negated distance, what the
+//!   tracker always did) and the opt-in [`channel::FreeSpaceModel`] (Friis path
+//!   loss). TR 38.901, sub-THz, RIS and NTN models are intended future
+//!   implementations of the same trait; the last three are non-normative, as no
+//!   frozen Rel-20 stage-3 specification exists.
 //! - [`transport`]: RRC and user plane data transport
 //!
 //! # Example
@@ -60,11 +66,13 @@
 //! ```
 
 pub mod cell_search;
+pub mod channel;
 pub mod codec;
 pub mod protocol;
 pub mod transport;
 
 // Re-export commonly used types from protocol
+pub use channel::{ChannelModel, DistanceModel, FreeSpaceModel};
 pub use codec::{decode, encode, RlsCodecError};
 pub use protocol::{
     MessageType, PduInfo, PduType, RlfCause, RlsHeartbeat, RlsHeartbeatAck, RlsMessage,

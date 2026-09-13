@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use crate::channel::{ChannelModel, DistanceModel};
 use crate::protocol::{RlsHeartbeat, RlsHeartbeatAck, SimCoord};
 
 /// Default heartbeat interval in milliseconds
@@ -265,6 +266,9 @@ pub struct GnbCellTracker {
     sti: u64,
     /// gNB's physical location for signal strength calculation
     phy_location: SimCoord,
+    /// Signal model turning geometry into a received level. `DistanceModel`
+    /// unless a caller injects another one, so existing behaviour is unchanged.
+    channel_model: Box<dyn ChannelModel>,
     /// Tracked UEs indexed by STI
     ues: HashMap<u64, UeInfo>,
     /// Mapping from `ue_id` to STI
@@ -329,11 +333,27 @@ pub enum GnbTrackerEvent {
 }
 
 impl GnbCellTracker {
-    /// Creates a new gNB cell tracker
+    /// Creates a new gNB cell tracker with the default [`DistanceModel`].
+    ///
+    /// The signature is unchanged from before the channel-model seam existed, so
+    /// every existing caller keeps the behaviour it was written against.
     pub fn new(sti: u64, phy_location: SimCoord) -> Self {
+        Self::with_channel_model(sti, phy_location, Box::new(DistanceModel))
+    }
+
+    /// Creates a gNB cell tracker with an injected channel model.
+    ///
+    /// The way to opt into [`FreeSpaceModel`] (or a future TR 38.901 model)
+    /// without changing what any other scenario measures.
+    pub fn with_channel_model(
+        sti: u64,
+        phy_location: SimCoord,
+        channel_model: Box<dyn ChannelModel>,
+    ) -> Self {
         Self {
             sti,
             phy_location,
+            channel_model,
             ues: HashMap::new(),
             ue_id_to_sti: HashMap::new(),
             next_ue_id: 0,
@@ -346,21 +366,10 @@ impl GnbCellTracker {
         self.heartbeat_threshold = threshold;
     }
 
-    /// Estimates signal strength based on distance
+    /// Estimates the received signal strength at `ue_pos` using this tracker's
+    /// channel model (default [`DistanceModel`], i.e. the negated distance).
     pub fn estimate_dbm(&self, ue_pos: &SimCoord) -> i32 {
-        let dx = self.phy_location.x - ue_pos.x;
-        let dy = self.phy_location.y - ue_pos.y;
-        let dz = self.phy_location.z - ue_pos.z;
-
-        let distance_sq =
-            (dx as i64 * dx as i64 + dy as i64 * dy as i64 + dz as i64 * dz as i64) as f64;
-        let distance = distance_sq.sqrt() as i32;
-
-        if distance == 0 {
-            -1 // 0 may be confusing
-        } else {
-            -distance
-        }
+        self.channel_model.estimate_dbm(&self.phy_location, ue_pos)
     }
 
     /// Processes a heartbeat from a UE
@@ -447,6 +456,7 @@ impl GnbCellTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::FreeSpaceModel;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn test_addr(port: u16) -> SocketAddr {
@@ -513,6 +523,68 @@ mod tests {
             }
         ));
         assert_eq!(tracker.ue_count(), 1);
+    }
+
+    /// The injected model is what decides the level a UE is told: the same
+    /// geometry that reads -100 dBm under the default reads far stronger under
+    /// free-space path loss, and the levels still fall with distance.
+    #[test]
+    fn an_injected_channel_model_decides_the_reported_level() {
+        let far = SimCoord::new(100, 0, 0);
+        let default_tracker = GnbCellTracker::new(1, SimCoord::new(0, 0, 0));
+        let free_space = GnbCellTracker::with_channel_model(
+            1,
+            SimCoord::new(0, 0, 0),
+            Box::new(FreeSpaceModel::new(3.5e9, 46.0)),
+        );
+
+        assert_eq!(
+            default_tracker.estimate_dbm(&far),
+            -100,
+            "the default model is unchanged: negated distance"
+        );
+        assert_ne!(
+            free_space.estimate_dbm(&far),
+            default_tracker.estimate_dbm(&far),
+            "an injected model must actually change the level"
+        );
+
+        let mut previous = i32::MAX;
+        for distance in [1, 10, 100, 1000] {
+            let level = free_space.estimate_dbm(&SimCoord::new(distance, 0, 0));
+            assert!(level < previous, "level must fall with distance");
+            previous = level;
+        }
+    }
+
+    /// A tracker with an injected model reports that model's level in the
+    /// heartbeat ack, so the model reaches the UE rather than stopping at the
+    /// tracker: with free-space loss a UE at 1 km is still heard, where the
+    /// default model's -1000 dBm is below `MIN_ALLOWED_DBM` and answered with
+    /// nothing at all.
+    #[test]
+    fn an_injected_model_changes_which_ues_are_detected() {
+        let heartbeat = RlsHeartbeat::with_position(12345, SimCoord::new(1000, 0, 0));
+
+        let mut default_tracker = GnbCellTracker::new(1, SimCoord::new(0, 0, 0));
+        let (default_ack, default_events) =
+            default_tracker.process_heartbeat(12345, test_addr(5000), &heartbeat);
+        assert!(default_ack.is_none(), "-1000 dBm is below the floor");
+        assert!(default_events.is_empty());
+
+        let mut free_space = GnbCellTracker::with_channel_model(
+            1,
+            SimCoord::new(0, 0, 0),
+            Box::new(FreeSpaceModel::new(3.5e9, 46.0)),
+        );
+        let (ack, events) = free_space.process_heartbeat(12345, test_addr(5000), &heartbeat);
+        let ack = ack.expect("free-space loss at 1 km is well above the floor");
+        assert!(
+            ack.dbm > MIN_ALLOWED_DBM,
+            "reported level {} must be above the floor",
+            ack.dbm
+        );
+        assert_eq!(events.len(), 1, "and the UE is detected");
     }
 
     #[test]
