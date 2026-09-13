@@ -1360,6 +1360,20 @@ impl MmOrchestrator {
             req.redcap = true;
             info!("RedCap registration: including reduced-capability indication");
         }
+        // RACS (Rel-16, TS 23.501 §5.4.4.1a / TS 24.501 §8.2.6): present the
+        // network-assigned UE radio capability ID so the AMF can resolve the
+        // capability set from the UCMF instead of asking for the full one.
+        //
+        // NON-CLEARTEXT (§4.4.6): this is set on `req` only, which is the full
+        // request replayed inside the SECURITY MODE COMPLETE NAS message
+        // container. The unprotected `ct` request built below does not carry it.
+        // The ID identifies the subscriber's device capabilities, so sending it in
+        // the clear would leak exactly what §4.4.6 exists to protect -- the trap
+        // #48 hit with the UE STATE INDICATION.
+        if let Some(racs_id) = self.racs_id() {
+            req.ue_radio_capability_id = Some(racs_id.to_string());
+            info!("RACS registration: presenting UE radio capability ID {racs_id}");
+        }
 
         let mut plain = Vec::new();
         req.encode(&mut plain);
@@ -5160,10 +5174,26 @@ mod tests {
         assert_eq!(orch.racs_id(), Some("123456"));
     }
 
-    /// Off by default: the ID is decoded (so the command is still processed and
-    /// acknowledged) and discarded, because nothing signals it yet.
+    /// Kept by default since #101: the ID has a consumer now, so the shipped
+    /// default stores it.
     #[test]
-    fn an_assigned_ue_radio_capability_id_is_discarded_by_default() {
+    fn an_assigned_ue_radio_capability_id_is_kept_by_default() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+        orch.apply_config_update(&config_update_result(command_with_racs_id(
+            "123456",
+            vec![],
+        )));
+        assert_eq!(
+            orch.racs_id(),
+            Some("123456"),
+            "racs_store_assigned_id defaults to true"
+        );
+    }
+
+    /// With the switch off the ID is decoded (so the command is still processed
+    /// and acknowledged) and discarded.
+    #[test]
+    fn an_assigned_ue_radio_capability_id_is_discarded_when_the_switch_is_off() {
         let mut orch = MmOrchestrator::from_config(test_identity(), &config_with_racs(false));
         let result = config_update_result(command_with_racs_id("123456", vec![]));
         orch.apply_config_update(&result);
@@ -5172,6 +5202,174 @@ mod tests {
             result.new_racs_id.as_deref(),
             Some("123456"),
             "the IE is still decoded and reported to the caller"
+        );
+    }
+
+    /// The point of #101: a stored ID is presented back to the network in the UE
+    /// radio capability ID IE, with the low-nibble-first packing of TS 24.501
+    /// §9.11.3.68 asserted **on the wire octets**.
+    ///
+    /// "123456" packs as 0x21 0x43 0x65: digit 1 in the low nibble of the first
+    /// octet, digit 2 in its high nibble, and so on.
+    #[test]
+    fn a_stored_ue_radio_capability_id_is_signalled_in_the_registration_request() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+        orch.apply_config_update(&config_update_result(command_with_racs_id(
+            "123456",
+            vec![],
+        )));
+        assert_eq!(orch.racs_id(), Some("123456"));
+
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let full = orch
+            .last_registration_request
+            .as_ref()
+            .expect("a registration request must have been built");
+
+        // The IE on the wire: IEI 0x67, length 3, then the packed digits.
+        let ie = [0x67u8, 0x03, 0x21, 0x43, 0x65];
+        assert!(
+            full.windows(ie.len()).any(|w| w == ie),
+            "the full request must carry the UE radio capability ID IE as \
+             {ie:02X?}; got {full:02X?}"
+        );
+
+        // And it decodes back to the same identifier.
+        assert_eq!(
+            RegistrationRequest::decode(&mut &full[3..])
+                .expect("decode")
+                .ue_radio_capability_id
+                .as_deref(),
+            Some("123456")
+        );
+    }
+
+    /// §4.4.6: the ID is a NON-cleartext IE, so it must be absent from the plain
+    /// unprotected initial REGISTRATION REQUEST and present in the full request
+    /// replayed inside the SECURITY MODE COMPLETE container. Both halves asserted,
+    /// because either alone passes against a wrong implementation.
+    #[test]
+    fn the_ue_radio_capability_id_is_not_a_cleartext_ie() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+        orch.apply_config_update(&config_update_result(command_with_racs_id(
+            "123456",
+            vec![],
+        )));
+
+        let outputs = orch.start_registration(RegistrationType::InitialRegistration);
+
+        // The emitted PDU is the cleartext-only request (no security context).
+        let wire = outputs
+            .iter()
+            .find_map(|out| match out {
+                MmOutput::SendNasPdu(pdu) => Some(pdu.clone()),
+                _ => None,
+            })
+            .expect("a NAS PDU is emitted");
+        assert!(
+            RegistrationRequest::decode(&mut &wire[3..])
+                .expect("decode")
+                .ue_radio_capability_id
+                .is_none(),
+            "the UE radio capability ID must not travel in the clear"
+        );
+        assert!(
+            !wire.contains(&0x67u8) || {
+                // Belt and braces: the IEI byte may occur inside another IE's
+                // value, so also check no 0x67 starts a well-formed RACS IE.
+                !wire.windows(5).any(|w| w == [0x67, 0x03, 0x21, 0x43, 0x65])
+            },
+            "no RACS IE may appear in the cleartext request"
+        );
+
+        // The stashed FULL request does carry it.
+        let full = orch
+            .last_registration_request
+            .as_ref()
+            .expect("the full request is stashed for the SMC container");
+        assert_eq!(
+            RegistrationRequest::decode(&mut &full[3..])
+                .expect("decode")
+                .ue_radio_capability_id
+                .as_deref(),
+            Some("123456"),
+            "the full request replayed in SECURITY MODE COMPLETE carries it"
+        );
+    }
+
+    /// With no ID stored, no IE is emitted — a UE that has never been assigned one
+    /// must not present an empty or placeholder identifier.
+    #[test]
+    fn no_stored_id_means_no_ue_radio_capability_id_ie() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+        assert_eq!(orch.racs_id(), None);
+
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let full = orch.last_registration_request.as_ref().expect("built");
+
+        assert!(RegistrationRequest::decode(&mut &full[3..])
+            .expect("decode")
+            .ue_radio_capability_id
+            .is_none());
+    }
+
+    /// With the switch off nothing is stored, so nothing is signalled either —
+    /// the pre-#101 wire, byte for byte.
+    #[test]
+    fn the_switch_off_signals_no_ue_radio_capability_id() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &config_with_racs(false));
+        orch.apply_config_update(&config_update_result(command_with_racs_id(
+            "123456",
+            vec![],
+        )));
+
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let full = orch.last_registration_request.as_ref().expect("built");
+
+        assert!(RegistrationRequest::decode(&mut &full[3..])
+            .expect("decode")
+            .ue_radio_capability_id
+            .is_none());
+    }
+
+    /// A deletion indication stops the ID being signalled, not just stored.
+    ///
+    /// Two orchestrators rather than one registering twice: the second
+    /// `start_registration` on one orchestrator is a no-op while T3510 runs, so
+    /// the stashed request would be the first one and the test would pass or fail
+    /// for the wrong reason. Both are driven from the same assignment so the only
+    /// difference is the deletion.
+    #[test]
+    fn a_deleted_ue_radio_capability_id_is_no_longer_signalled() {
+        let signalled_id = |delete: bool| {
+            let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+            orch.apply_config_update(&config_update_result(command_with_racs_id(
+                "123456",
+                vec![],
+            )));
+            if delete {
+                let mut deletion = ConfigurationUpdateCommand::new();
+                deletion.ue_radio_capability_id_deletion =
+                    Some(RacsDeletionRequest::NetworkAssigned);
+                orch.apply_config_update(&config_update_result(deletion));
+                assert_eq!(orch.racs_id(), None, "the deletion took effect");
+            }
+            orch.start_registration(RegistrationType::InitialRegistration);
+            RegistrationRequest::decode(
+                &mut &orch.last_registration_request.as_ref().expect("built")[3..],
+            )
+            .expect("decode")
+            .ue_radio_capability_id
+        };
+
+        assert_eq!(
+            signalled_id(false).as_deref(),
+            Some("123456"),
+            "without the deletion the ID is presented"
+        );
+        assert!(
+            signalled_id(true).is_none(),
+            "a deleted ID must not keep being presented"
         );
     }
 

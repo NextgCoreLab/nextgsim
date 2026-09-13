@@ -487,38 +487,14 @@ fn decode_gprs_timer3(byte: u8) -> u32 {
     GprsTimer3::from_byte(byte).to_seconds()
 }
 
-/// Decodes a UE radio capability ID IE value into its hexadecimal-digit string
-/// (TS 24.501 §9.11.3.68).
+/// Read the UE radio capability ID out of the IE octets (TS 24.501 §9.11.3.68).
 ///
-/// Each digit occupies a nibble, **low nibble first**: the first digit is in
-/// bits 4-1 of the first octet, the second in bits 8-5, and so on. A trailing
-/// high nibble of `1111` is the odd-length filler and is dropped. Reading the
-/// octets as-is would yield every digit pair reversed, which for an identifier
-/// the network assigns is silently the wrong ID rather than an obvious error.
-///
-/// The filler is only recognised in the LAST octet, where the IE defines it; an
-/// `f` anywhere else is a digit. In the last octet the two readings are
-/// genuinely ambiguous, and the IE's rule wins — which costs nothing for a
-/// conformant ID, because TS 23.003 §29.2 gives every UE radio capability ID an
-/// even number of digits (1 + 2 + 11 network-assigned, 1 + 8 + 11
-/// manufacturer-assigned), so the filler should never appear at all.
+/// Delegates to `nextgsim-nas`, which owns both halves of the packing: the UE
+/// decodes the ID a CONFIGURATION UPDATE COMMAND assigns and encodes the same ID
+/// back into a REGISTRATION REQUEST, so a divergence between the two would be
+/// invisible until an interop run (issue #101).
 fn decode_racs_id(octets: &[u8]) -> String {
-    let mut id = String::with_capacity(octets.len() * 2);
-    for (index, octet) in octets.iter().enumerate() {
-        id.push(hex_digit(octet & 0x0F));
-        let high = octet >> 4;
-        let is_last = index + 1 == octets.len();
-        if is_last && high == 0x0F {
-            // Odd number of digits: the filler is not part of the ID.
-            continue;
-        }
-        id.push(hex_digit(high));
-    }
-    id
-}
-
-fn hex_digit(nibble: u8) -> char {
-    char::from_digit(u32::from(nibble), 16).unwrap_or('?')
+    nextgsim_nas::messages::mm::decode_ue_radio_capability_id(octets)
 }
 
 // ============================================================================

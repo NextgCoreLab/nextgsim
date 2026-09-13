@@ -189,10 +189,18 @@ redcap: false
 
 # Keep the network-assigned UE radio capability ID (RACS, Rel-16; TS 24.501
 # §9.11.3.68) that a CONFIGURATION UPDATE COMMAND assigns.
-# false: the IE is decoded (so the command is still applied and acknowledged)
-# and the ID discarded, because nothing signals a UE radio capability ID yet --
-# there is no RACS IE in the REGISTRATION REQUEST and no RRC or NGAP consumer.
-racs_store_assigned_id: false
+# true (the default since #101): the ID is stored and presented back in the UE
+# radio capability ID IE of the next REGISTRATION REQUEST (TS 24.501 §8.2.6),
+# which is the point of RACS -- the UE offers an identifier and the network
+# resolves the capability set from the UCMF rather than asking for the full one.
+# It travels ONLY in the security-protected full request (§4.4.6 non-cleartext).
+# false: decode-and-discard, as before #101 -- the command is still acknowledged
+# and applied, and no REGISTRATION REQUEST carries the IE.
+#
+# UE side only: there is no UCMF in nextgcore and no NGAP UE Radio Capability ID
+# Mapping, so the only way an ID arrives is an operator sending a CONFIGURATION
+# UPDATE COMMAND by hand.
+racs_store_assigned_id: true
 
 # Require a decoded broadcast SIB1 before a cell is selectable.
 # false (default): on detecting a cell the UE fabricates its system information
