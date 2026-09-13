@@ -406,7 +406,16 @@ pub enum NasMessage {
     ///
     /// Triggered when UE has data to send while in CM-IDLE or CM-INACTIVE state.
     /// Sends NAS Service Request message (5GMM type 0x4C) via RRC.
-    InitiateServiceRequest,
+    InitiateServiceRequest {
+        /// PDU session the pending uplink data belongs to, which becomes the
+        /// Uplink data status bit the SERVICE REQUEST advertises (TS 24.501
+        /// §5.6.1.2, §9.11.3.44). `None` for a trigger that names no session,
+        /// in which case no Uplink data status IE is sent — an absent IE is
+        /// what the spec means by "no pending uplink data", whereas a
+        /// fabricated bitmap asks the network to reactivate a session the UE
+        /// has no data for.
+        psi: Option<u8>,
+    },
     /// Initiate emergency registration (from App/CLI).
     ///
     /// Builds a `RegistrationRequest` with `RegistrationType::EmergencyRegistration`

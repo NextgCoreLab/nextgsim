@@ -43,7 +43,7 @@ use nextgsim_nas::messages::mm::{
     DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated, Ie5gsMobileIdentity,
     MmCause, MobileIdentityType, RegistrationAccept, RegistrationComplete, RegistrationReject,
     RegistrationRequest, SecurityModeCommand, SecurityModeComplete, SecurityModeReject,
-    ServiceReject, ServiceRequest,
+    ServiceAccept, ServiceReject, ServiceRequest,
 };
 use nextgsim_nas::security::{
     compute_nas_mac, nas_cipher, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
@@ -137,6 +137,43 @@ pub enum MmOutput {
     /// K_RRCint/K_RRCenc when the AS SecurityModeCommand arrives (Wave-6 I5).
     /// Only produced when the `I5_UE_AS_SECURITY` wire gate is on.
     AsSecurityKgnb([u8; 32]),
+    /// The network signalled its view of PDU session state in a PDU session
+    /// status IE on REGISTRATION ACCEPT or SERVICE ACCEPT (TS 24.501
+    /// §5.5.1.3.4, §5.6.1.4.2 a): bit *n* set means PSI *n* is active in the
+    /// network.
+    ///
+    /// The UE must locally release every session that is active on the UE and
+    /// **not** set here. The diff is not computed in this orchestrator because
+    /// session state lives in the SM orchestrator; the caller hands the bitmap
+    /// to [`crate::nas::sm::SmOrchestrator::reconcile_pdu_session_status`],
+    /// which owns both the state and the teardown.
+    NetworkPduSessionStatus(u16),
+}
+
+/// The Uplink data status bit for `psi` (TS 24.501 §9.11.3.44).
+///
+/// Bit position *n* of the little-endian IE value corresponds to PSI *n*, so
+/// PSI 1 is `0x0002` and PSI 13 is `0x2000`. PSI 0 is spare and PSIs above 15
+/// do not exist (TS 24.501 §9.4), so both yield an empty bitmap rather than a
+/// wrapped or panicking shift.
+pub fn uplink_data_status_bit(psi: u8) -> u16 {
+    if psi == 0 || psi > 15 {
+        return 0;
+    }
+    1u16 << psi
+}
+
+/// The Uplink data status bitmap advertising pending uplink data for every PSI
+/// in `psis` (TS 24.501 §5.6.1.2).
+///
+/// Returns `None` when no in-range PSI was given, so the caller omits the IE
+/// entirely instead of sending an all-zero bitmap: zero means "no session has
+/// pending data", which contradicts the SERVICE REQUEST it would ride on.
+pub fn uplink_data_status(psis: &[u8]) -> Option<u16> {
+    let bitmap = psis
+        .iter()
+        .fold(0u16, |acc, &psi| acc | uplink_data_status_bit(psi));
+    (bitmap != 0).then_some(bitmap)
 }
 
 /// UE identity and credential material used by the MM procedures.
@@ -1117,6 +1154,17 @@ impl MmOrchestrator {
                 self.equivalent_plmns.clone(),
             ));
         }
+        // TS 24.501 §5.5.1.3.4: on a Registration Accept carrying a PDU session
+        // status IE the UE locally releases the sessions that are active on the
+        // UE but indicated as inactive by the network. Emitted BEFORE
+        // RegistrationSucceeded so the caller reconciles away the stale sessions
+        // before that arm establishes the configured default ones -- otherwise
+        // the establish gate (`active_sessions().is_empty()`) still sees the
+        // sessions the network just told us are gone, and the UE would neither
+        // release them nor re-establish anything.
+        if let Some(status) = acc.pdu_session_status {
+            outs.push(MmOutput::NetworkPduSessionStatus(status));
+        }
         outs.push(MmOutput::RegistrationSucceeded);
         outs
     }
@@ -1902,7 +1950,7 @@ impl MmOrchestrator {
         Some(Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, data))
     }
 
-    fn handle_service_accept(&mut self) -> Vec<MmOutput> {
+    fn handle_service_accept(&mut self, plain: &[u8]) -> Vec<MmOutput> {
         info!("Service Accept received");
         self.timers.stop(TIMER_T3517, true);
         self.timers.stop(TIMER_T3516, true);
@@ -1910,7 +1958,41 @@ impl MmOrchestrator {
         self.state
             .switch_mm_state(MmSubState::RegisteredNormalService);
         self.state.switch_cm_state(CmState::Connected);
-        Vec::new()
+
+        // TS 24.501 §5.6.1.4.2 a): the UE shall locally release every PDU
+        // session that is active on the UE but indicated as inactive in the
+        // PDU session status IE. Before this the handler took no message bytes
+        // at all, so the decoded IE was discarded and a session the network had
+        // released stayed up on the UE with a live TUN device, black-holing
+        // whatever was written to it.
+        //
+        // A decode failure must not undo the state transitions above: the
+        // Service Accept has already been accepted and integrity-verified by
+        // the time it reaches here, so the procedure completed. Only the
+        // optional reconciliation is lost.
+        let mut outs = Vec::new();
+        match ServiceAccept::decode(&mut &plain[3..]) {
+            Ok(acc) => {
+                if let Some(status) = acc.pdu_session_status {
+                    outs.push(MmOutput::NetworkPduSessionStatus(status));
+                }
+                // The reactivation result says which of the sessions the UE
+                // ASKED to reactivate the network actually brought up. It is
+                // reported rather than acted on: a session the network refused
+                // is still active on the UE per §5.6.1.4.2, and the PDU session
+                // status IE above is the member that decides releases.
+                if let Some(result) = acc.pdu_session_reactivation_result {
+                    info!("Service Accept PDU session reactivation result: {result:#06x}");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Service Accept accepted but its body did not decode ({e:?}); \
+                     PDU session status not reconciled"
+                );
+            }
+        }
+        outs
     }
 
     fn handle_service_reject(&mut self, plain: &[u8]) -> Vec<MmOutput> {
@@ -2243,7 +2325,7 @@ impl MmOrchestrator {
             MmMessageType::AuthenticationReject => self.handle_authentication_reject(),
             MmMessageType::RegistrationAccept => self.handle_registration_accept(&plain),
             MmMessageType::RegistrationReject => self.handle_registration_reject(&plain),
-            MmMessageType::ServiceAccept => self.handle_service_accept(),
+            MmMessageType::ServiceAccept => self.handle_service_accept(&plain),
             MmMessageType::ServiceReject => self.handle_service_reject(&plain),
             MmMessageType::DeregistrationAcceptUeOriginating => self.handle_deregistration_accept(),
             MmMessageType::DeregistrationRequestUeTerminated => {
@@ -4124,7 +4206,10 @@ mod tests {
         // Simulate CM-IDLE
         orch.state_mut().switch_cm_state(CmState::Idle);
 
-        let outs = orch.start_service_request(ServiceType::Data, Some(0x2000));
+        // PSI 3, so the expected IE value (0x0008) cannot coincide with the
+        // 0x2000 (PSI 13) constant this path used to hardcode, nor with the
+        // PSI-1 case the dedicated bitmap tests below cover.
+        let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[3]));
         let pdu = first_sent_pdu(&outs);
         assert_eq!(pdu[1], 0x02, "service request must be protected");
         assert!(orch.timers().t3517.is_running());
@@ -4148,7 +4233,169 @@ mod tests {
         let req = ServiceRequest::decode(&mut &payload[3..]).unwrap();
         // GUTI TMSI bytes were 0xDEADBEEF; the 5G-S-TMSI carries set/ptr + TMSI
         assert_eq!(&req.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(req.uplink_data_status, Some(0x2000));
+        assert_eq!(req.uplink_data_status, Some(0x0008), "PSI 3 is bit 3");
+    }
+
+    /// #51: PSI *n* maps to bit *n* of the Uplink data status IE
+    /// (TS 24.501 §9.11.3.44).
+    ///
+    /// Asserted over the whole domain rather than on one value, because the
+    /// defect being fixed was a CONSTANT: any single-value test passes against a
+    /// function that ignores its argument.
+    #[test]
+    fn uplink_data_status_maps_psi_n_to_bit_n() {
+        assert_eq!(uplink_data_status_bit(1), 0x0002);
+        assert_eq!(uplink_data_status_bit(3), 0x0008);
+        assert_eq!(uplink_data_status_bit(8), 0x0100);
+        assert_eq!(uplink_data_status_bit(13), 0x2000);
+        assert_eq!(uplink_data_status_bit(15), 0x8000);
+        // PSI 0 is spare and 16+ do not exist (TS 24.501 §9.4). Both must yield
+        // nothing rather than a wrapped shift -- `1u16 << 16` panics in debug.
+        assert_eq!(uplink_data_status_bit(0), 0);
+        assert_eq!(uplink_data_status_bit(16), 0);
+        assert_eq!(uplink_data_status_bit(u8::MAX), 0);
+
+        // The IE is omitted, not zeroed, when nothing has pending data: an
+        // all-zero bitmap would tell the network no session needs reactivating
+        // while asking it to reactivate one.
+        assert_eq!(uplink_data_status(&[]), None);
+        assert_eq!(uplink_data_status(&[0]), None);
+        assert_eq!(uplink_data_status(&[1]), Some(0x0002));
+        assert_eq!(uplink_data_status(&[1, 3]), Some(0x000A));
+    }
+
+    /// #51: a data-triggered SERVICE REQUEST for PSI 1 puts bit 1 on the wire.
+    ///
+    /// Decoded from the ciphered PDU rather than read back off the struct, so it
+    /// pins what the network actually receives.
+    #[test]
+    fn a_service_request_for_psi_1_advertises_bit_1_on_the_wire() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+
+        let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        let pdu = first_sent_pdu(&outs);
+
+        let sec = orch.security_context();
+        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+        let mut payload = pdu[7..].to_vec();
+        nas_cipher(
+            sec.ciphering_algorithm(),
+            sec.keys().knas_enc().unwrap(),
+            &count,
+            NAS_BEARER,
+            NasDirection::Uplink,
+            &mut payload,
+        );
+        let req = ServiceRequest::decode(&mut &payload[3..]).unwrap();
+        assert_eq!(
+            req.uplink_data_status,
+            Some(0x0002),
+            "PSI 1 is bit 1; 0x2000 was bit 13, a PSI no session ever allocates"
+        );
+    }
+
+    /// #51: a SERVICE ACCEPT carrying a PDU session status IE surfaces it, so the
+    /// caller can locally release the sessions the network reports inactive
+    /// (TS 24.501 §5.6.1.4.2 a).
+    ///
+    /// Before this the handler took no message bytes at all, so the decoded IE
+    /// was unreachable — which is why the assertion is on the emitted output and
+    /// not on a flag: the output is the only thing that can reach the SM
+    /// orchestrator.
+    #[test]
+    fn a_service_accept_surfaces_the_network_pdu_session_status() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+
+        // PSI 1 active, PSI 3 NOT: a UE holding both must release 3.
+        let mut accept = ServiceAccept::new();
+        accept.pdu_session_status = Some(0x0002);
+        let mut plain = Vec::new();
+        accept.encode(&mut plain);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+
+        assert!(
+            outs.contains(&MmOutput::NetworkPduSessionStatus(0x0002)),
+            "the PDU session status IE must reach the caller, got {outs:?}"
+        );
+        // The procedure itself still completed.
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert!(!orch.timers().t3517.is_running(), "T3517 must be stopped");
+    }
+
+    /// #51: a SERVICE ACCEPT with no PDU session status IE reconciles nothing.
+    ///
+    /// The negative case matters here: emitting a zero bitmap for an absent IE
+    /// would read as "the network says every session is inactive" and release
+    /// every session the UE holds.
+    #[test]
+    fn a_service_accept_without_the_ie_reconciles_nothing() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        orch.start_service_request(ServiceType::Data, None);
+
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, MmOutput::NetworkPduSessionStatus(_))),
+            "an absent IE must produce no reconciliation, got {outs:?}"
+        );
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService,
+            "the Service Accept is still accepted"
+        );
+    }
+
+    /// #51: a REGISTRATION ACCEPT carrying a PDU session status IE surfaces it
+    /// too (TS 24.501 §5.5.1.3.4), and does so BEFORE `RegistrationSucceeded`.
+    ///
+    /// The ordering is load-bearing, not stylistic: the caller's
+    /// `RegistrationSucceeded` arm establishes the configured default sessions
+    /// only when `active_sessions()` is empty, so a reconciliation arriving after
+    /// it would leave the stale sessions counted, and the UE would neither
+    /// release them nor establish anything.
+    #[test]
+    fn a_registration_accept_surfaces_the_status_before_success() {
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.pdu_session_status = Some(0x0002);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 1));
+
+        let status_at = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::NetworkPduSessionStatus(0x0002)))
+            .expect("the PDU session status IE must reach the caller");
+        let success_at = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::RegistrationSucceeded))
+            .expect("registration must still succeed");
+        assert!(
+            status_at < success_at,
+            "reconciliation must precede RegistrationSucceeded, got {outs:?}"
+        );
     }
 
     #[test]
