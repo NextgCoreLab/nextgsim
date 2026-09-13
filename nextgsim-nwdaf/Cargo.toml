@@ -6,6 +6,12 @@ authors.workspace = true
 license.workspace = true
 description = "Network Data Analytics Function (NWDAF) - analytics research prototype inspired by 3GPP TS 23.288; not a conformance implementation"
 
+[features]
+default = []
+# Resolve models from the shared nextgsim-ai registry (issue #17). Additive:
+# the existing direct load_model paths are untouched.
+model-registry = ["nextgsim-ai/model-registry"]
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }

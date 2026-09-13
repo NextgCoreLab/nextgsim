@@ -79,8 +79,16 @@ fn warn_fallback_once(flag: &AtomicBool, role: &str, method: &str) {
 /// with a compatible `.onnx` encoder model to enable it. No model ships with
 /// the repository, so the mean-pooling path is always the default.
 pub struct NeuralEncoder {
-    /// ONNX inference engine for the encoder model
+    /// ONNX inference engine for the encoder model, owned by this encoder.
     engine: OnnxEngine,
+    /// An engine resolved from the shared registry (issue #17), which takes
+    /// precedence over `engine` when present.
+    ///
+    /// This is where the sharing pays: an encoder and a decoder pointing at the
+    /// same `.onnx` used to load it twice and hold two `ort::Session`s. Resolving
+    /// one model id gives them one session. Additive — `load_model` is unchanged.
+    #[cfg(feature = "model-registry")]
+    shared_engine: Option<std::sync::Arc<OnnxEngine>>,
     /// Target feature dimension for the compressed representation
     target_dim: usize,
     /// Whether the ONNX model is loaded and ready
@@ -102,6 +110,8 @@ impl NeuralEncoder {
         let engine = OnnxEngine::new(ExecutionProvider::Cpu)?;
         Ok(Self {
             engine,
+            #[cfg(feature = "model-registry")]
+            shared_engine: None,
             target_dim,
             model_loaded: false,
             fallback_warned: AtomicBool::new(false),
@@ -119,10 +129,55 @@ impl NeuralEncoder {
         let engine = OnnxEngine::new(provider)?;
         Ok(Self {
             engine,
+            #[cfg(feature = "model-registry")]
+            shared_engine: None,
             target_dim,
             model_loaded: false,
             fallback_warned: AtomicBool::new(false),
         })
+    }
+
+    /// Resolve the encoder's model from the shared registry (issue #17), so an
+    /// encoder and decoder on the same model id share one warmed session instead
+    /// of loading the file twice.
+    ///
+    /// # Errors
+    ///
+    /// `RegistryError::NotProvisioned` when nothing is provisioned under `id` —
+    /// the expected case here, since no `.onnx` ships. The encoder then keeps its
+    /// mean-pooling fallback, which is what it does with no model anyway.
+    #[cfg(feature = "model-registry")]
+    pub fn resolve_from_registry(
+        &mut self,
+        registry: &nextgsim_ai::SharedModelRegistry,
+        id: &str,
+    ) -> Result<(), nextgsim_ai::RegistryError> {
+        let engine = registry.load_by_id(id)?;
+        self.shared_engine = Some(engine);
+        self.model_loaded = true;
+        Ok(())
+    }
+
+    /// The identity of the engine [`Self::active_engine`] routes to. Exists
+    /// because that routing is otherwise unobservable here: with no `.onnx` to
+    /// load, an owned engine and a registry engine are both not ready, so nothing
+    /// in an encode result distinguishes them.
+    #[cfg(feature = "model-registry")]
+    pub fn active_engine_ptr(&self) -> *const OnnxEngine {
+        if let Some(ref shared) = self.shared_engine {
+            return std::sync::Arc::as_ptr(shared);
+        }
+        &self.engine as *const OnnxEngine
+    }
+
+    /// The engine encoding runs against: the shared one when the registry
+    /// supplied it, else the one this encoder owns.
+    fn active_engine(&self) -> &dyn InferenceEngine {
+        #[cfg(feature = "model-registry")]
+        if let Some(ref shared) = self.shared_engine {
+            return shared.as_ref();
+        }
+        &self.engine
     }
 
     /// Loads an ONNX encoder model from the given file path.
@@ -175,7 +230,7 @@ impl NeuralEncoder {
         task: SemanticTask,
     ) -> Result<SemanticFeatures, CodecError> {
         let input = TensorData::float32(data.to_vec(), vec![1i64, data.len() as i64]);
-        let output = self.engine.infer(&input)?;
+        let output = self.active_engine().infer(&input)?;
 
         let compressed = output
             .as_f32_slice()
@@ -233,8 +288,12 @@ impl NeuralEncoder {
 /// with a compatible `.onnx` decoder model to enable it. No model ships with
 /// the repository, so the nearest-neighbor path is always the default.
 pub struct NeuralDecoder {
-    /// ONNX inference engine for the decoder model
+    /// ONNX inference engine for the decoder model, owned by this decoder.
     engine: OnnxEngine,
+    /// An engine resolved from the shared registry (issue #17). See
+    /// [`NeuralEncoder::shared_engine`] for why it exists.
+    #[cfg(feature = "model-registry")]
+    shared_engine: Option<std::sync::Arc<OnnxEngine>>,
     /// Whether the ONNX model is loaded and ready
     model_loaded: bool,
     /// Tracks whether the nearest-neighbor fallback warning has been emitted
@@ -254,6 +313,8 @@ impl NeuralDecoder {
         let engine = OnnxEngine::new(ExecutionProvider::Cpu)?;
         Ok(Self {
             engine,
+            #[cfg(feature = "model-registry")]
+            shared_engine: None,
             model_loaded: false,
             fallback_warned: AtomicBool::new(false),
         })
@@ -267,9 +328,50 @@ impl NeuralDecoder {
         let engine = OnnxEngine::new(provider)?;
         Ok(Self {
             engine,
+            #[cfg(feature = "model-registry")]
+            shared_engine: None,
             model_loaded: false,
             fallback_warned: AtomicBool::new(false),
         })
+    }
+
+    /// Resolve the decoder's model from the shared registry (issue #17). See
+    /// [`NeuralEncoder::resolve_from_registry`].
+    ///
+    /// # Errors
+    ///
+    /// `RegistryError::NotProvisioned` when nothing is provisioned under `id`; the
+    /// decoder then keeps its nearest-neighbour fallback.
+    #[cfg(feature = "model-registry")]
+    pub fn resolve_from_registry(
+        &mut self,
+        registry: &nextgsim_ai::SharedModelRegistry,
+        id: &str,
+    ) -> Result<(), nextgsim_ai::RegistryError> {
+        let engine = registry.load_by_id(id)?;
+        self.shared_engine = Some(engine);
+        self.model_loaded = true;
+        Ok(())
+    }
+
+    /// The identity of the engine [`Self::active_engine`] routes to. See
+    /// [`NeuralEncoder::active_engine_ptr`].
+    #[cfg(feature = "model-registry")]
+    pub fn active_engine_ptr(&self) -> *const OnnxEngine {
+        if let Some(ref shared) = self.shared_engine {
+            return std::sync::Arc::as_ptr(shared);
+        }
+        &self.engine as *const OnnxEngine
+    }
+
+    /// The engine decoding runs against: the shared one when the registry
+    /// supplied it, else the one this decoder owns.
+    fn active_engine(&self) -> &dyn InferenceEngine {
+        #[cfg(feature = "model-registry")]
+        if let Some(ref shared) = self.shared_engine {
+            return shared.as_ref();
+        }
+        &self.engine
     }
 
     /// Loads an ONNX decoder model from the given file path.
@@ -316,7 +418,7 @@ impl NeuralDecoder {
             features.features.clone(),
             vec![1i64, features.features.len() as i64],
         );
-        let output = self.engine.infer(&input)?;
+        let output = self.active_engine().infer(&input)?;
 
         let decoded = output
             .as_f32_slice()
@@ -493,5 +595,86 @@ mod tests {
         assert_eq!(task_to_id(SemanticTask::SensorFusion), 4);
         assert_eq!(task_to_id(SemanticTask::VideoAnalytics), 5);
         assert_eq!(task_to_id(SemanticTask::Custom(42)), 42);
+    }
+}
+
+// ============================================================================
+// Shared model registry (issue #17)
+// ============================================================================
+
+#[cfg(all(test, feature = "model-registry"))]
+mod registry_tests {
+    use super::*;
+    use nextgsim_ai::{ExecutionProvider, OnnxEngine, SharedModelRegistry};
+    use std::sync::Arc;
+
+    /// **The observable form of #17's payoff.** An encoder and a decoder are two
+    /// logical consumers of one model id, and before this each owned its own
+    /// `OnnxEngine` — so the same `.onnx` was loaded twice and two `ort::Session`s
+    /// were held. Resolving through the registry gives them one.
+    ///
+    /// The registry is seeded with `register_preloaded` because no `.onnx` ships
+    /// with this repo, so nothing can be loaded from disk. It populates exactly the
+    /// cache slot the loading path fills, so what is proven is the sharing.
+    #[test]
+    fn an_encoder_and_decoder_on_one_model_id_share_a_single_engine() {
+        let registry = SharedModelRegistry::new(ExecutionProvider::Cpu);
+        let engine = Arc::new(OnnxEngine::new(ExecutionProvider::Cpu).expect("engine"));
+        registry
+            .register_preloaded(
+                "semantic-codec",
+                "1.0.0",
+                "/models/codec.onnx",
+                Arc::clone(&engine),
+            )
+            .expect("register");
+
+        let mut encoder = NeuralEncoder::new(64).expect("encoder");
+        let mut decoder = NeuralDecoder::new().expect("decoder");
+
+        encoder
+            .resolve_from_registry(&registry, "semantic-codec")
+            .expect("the encoder resolves");
+        decoder
+            .resolve_from_registry(&registry, "semantic-codec")
+            .expect("the decoder resolves");
+
+        // One engine, held by the registry and by both consumers.
+        assert_eq!(
+            registry.loaded_count(),
+            1,
+            "one engine for one model id, not one per consumer"
+        );
+        // Exactly four holders: this test, the registry, the encoder and the
+        // decoder. An inequality would be satisfied by only one of them having
+        // resolved, which is the whole thing being asserted.
+        assert_eq!(
+            Arc::strong_count(&engine),
+            4,
+            "this test, the registry, the encoder and the decoder"
+        );
+        // And both actually *route* to it, which the counts do not show.
+        assert_eq!(encoder.active_engine_ptr(), Arc::as_ptr(&engine));
+        assert_eq!(decoder.active_engine_ptr(), Arc::as_ptr(&engine));
+    }
+
+    /// An unprovisioned id leaves both consumers on their existing fallbacks
+    /// rather than failing the deployment — which is the normal case here, since no
+    /// `.onnx` ships.
+    #[test]
+    fn an_unprovisioned_id_leaves_the_codec_on_its_fallback() {
+        let registry = SharedModelRegistry::new(ExecutionProvider::Cpu);
+        let mut encoder = NeuralEncoder::new(64).expect("encoder");
+
+        let err = encoder
+            .resolve_from_registry(&registry, "absent")
+            .expect_err("nothing is provisioned");
+        assert!(err.is_not_provisioned(), "{err}");
+
+        // And the encoder still works, on its mean-pooling fallback.
+        let encoded = encoder
+            .encode(&[1.0, 2.0, 3.0, 4.0], SemanticTask::SensorFusion)
+            .expect("the fallback still encodes");
+        assert!(!encoded.features.is_empty());
     }
 }

@@ -181,55 +181,6 @@ impl std::fmt::Display for ModelType {
     }
 }
 
-/// Model registry for managing multiple loaded models
-#[derive(Debug, Default)]
-pub struct ModelRegistry {
-    /// Registered models by name
-    models: HashMap<String, ModelInfo>,
-}
-
-impl ModelRegistry {
-    /// Creates a new empty registry
-    pub fn new() -> Self {
-        Self {
-            models: HashMap::new(),
-        }
-    }
-
-    /// Registers a model
-    pub fn register(&mut self, name: impl Into<String>, info: ModelInfo) {
-        self.models.insert(name.into(), info);
-    }
-
-    /// Gets a model by name
-    pub fn get(&self, name: &str) -> Option<&ModelInfo> {
-        self.models.get(name)
-    }
-
-    /// Removes a model by name
-    pub fn unregister(&mut self, name: &str) -> Option<ModelInfo> {
-        self.models.remove(name)
-    }
-
-    /// Lists all registered model names
-    pub fn list(&self) -> Vec<&str> {
-        self.models
-            .keys()
-            .map(std::string::String::as_str)
-            .collect()
-    }
-
-    /// Returns the number of registered models
-    pub fn len(&self) -> usize {
-        self.models.len()
-    }
-
-    /// Returns true if the registry is empty
-    pub fn is_empty(&self) -> bool {
-        self.models.is_empty()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,33 +243,5 @@ mod tests {
     fn test_model_type_display() {
         assert_eq!(format!("{}", ModelType::Onnx), "ONNX");
         assert_eq!(format!("{}", ModelType::TfLite), "TFLite");
-    }
-
-    #[test]
-    fn test_model_registry() {
-        let mut registry = ModelRegistry::new();
-        assert!(registry.is_empty());
-
-        registry.register(
-            "trajectory",
-            ModelInfo::new("/models/trajectory.onnx", ModelType::Onnx),
-        );
-        registry.register(
-            "handover",
-            ModelInfo::new("/models/handover.onnx", ModelType::Onnx),
-        );
-
-        assert_eq!(registry.len(), 2);
-        assert!(registry.get("trajectory").is_some());
-        assert!(registry.get("handover").is_some());
-        assert!(registry.get("nonexistent").is_none());
-
-        let names = registry.list();
-        assert!(names.contains(&"trajectory"));
-        assert!(names.contains(&"handover"));
-
-        let removed = registry.unregister("trajectory");
-        assert!(removed.is_some());
-        assert_eq!(registry.len(), 1);
     }
 }
