@@ -499,7 +499,12 @@ impl UeApp {
             }
         };
         let identity = MmUeIdentity::from_config(&task_base.config, suci);
-        let mut orch = MmOrchestrator::new(identity);
+        // TS 24.501 Annex C.1: rehydrate the 5G-GUTI, last visited TAI, update
+        // status and native NAS security context when the operator configured a
+        // state file, so a restart registers GUTI-first with the stored ngKSI
+        // instead of running a fresh authentication. With no `state_file` this
+        // is `MmOrchestrator::new` and nothing touches the filesystem.
+        let mut orch = MmOrchestrator::from_config(identity, &task_base.config);
 
         // SM procedure orchestrator: owns the per-PSI session state, PSI /
         // PTI allocation and the SM timers (TS 24.501 Section 6). The UE only
@@ -1035,6 +1040,15 @@ impl UeApp {
             }
         }
 
+        // TS 24.501 Annex C.1: persist the 5GMM parameters on the way out, so
+        // the next start can register GUTI-first with the stored security
+        // context. A no-op unless the operator configured `state_file`.
+        //
+        // Placed AFTER the loop rather than in the Shutdown arm on purpose: the
+        // loop also exits when the channel closes, and a UE whose task channel
+        // dropped has the same state worth keeping as one told to stop.
+        orch.persist_state();
+
         info!("NAS task stopped");
     }
 
@@ -1123,6 +1137,13 @@ async fn process_mm_outputs(
             }
             MmOutput::RegistrationSucceeded => {
                 info!("Registration completed, MM state: {}", orch.state());
+                // TS 24.501 Annex C.1: this is the moment the parameters worth
+                // storing exist -- the 5G-GUTI was just assigned and the
+                // security context is active. Waiting for shutdown would mean a
+                // UE killed rather than stopped loses them, which is exactly the
+                // power-cycling case the storage requirement is about. A no-op
+                // unless `state_file` is configured.
+                orch.persist_state();
                 notify_rel18_registration(task_base, true).await;
                 // TS 23.122: record the registered PLMN (the camped cell
                 // broadcasts the configured PLMN in this simulation)
