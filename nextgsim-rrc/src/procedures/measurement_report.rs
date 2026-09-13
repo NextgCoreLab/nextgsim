@@ -138,6 +138,39 @@ pub struct MeasResultServFreqNr {
     pub meas_result_best_neigh_cell: Option<MeasResultNr>,
 }
 
+/// Measurement result for one inter-RAT (E-UTRA) cell (`MeasResultEUTRA` in
+/// TS 38.331 §5.5.5), as reported for an event B1 or B2 measurement.
+///
+/// The quantities are the E-UTRA **ranges** of TS 36.133, not dBm:
+/// `RSRP-RangeEUTRA` is `INTEGER (0..97)`, `RSRQ-RangeEUTRA` `(0..34)` and
+/// `SINR-RangeEUTRA` `(0..127)`. Converting a level to a range is the caller's
+/// job, because the mapping is per quantity and this codec does not model
+/// measurement quantities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasResultEutra {
+    /// `eutra-PhysCellId` (0-1007)
+    pub eutra_phys_cell_id: u16,
+    /// `rsrpResultEUTRA`, an `RSRP-RangeEUTRA` (0-97)
+    pub rsrp: Option<u8>,
+    /// `rsrqResultEUTRA`, an `RSRQ-RangeEUTRA` (0-34)
+    pub rsrq: Option<u8>,
+    /// `sinr-ResultEUTRA`, a `SINR-RangeEUTRA` (0-127)
+    pub sinr: Option<u8>,
+}
+
+impl MeasResultEutra {
+    /// An E-UTRA result carrying RSRP only, which is what B1/B2 are configured
+    /// on in this simulator.
+    pub fn with_rsrp(eutra_phys_cell_id: u16, rsrp: u8) -> Self {
+        Self {
+            eutra_phys_cell_id,
+            rsrp: Some(rsrp),
+            rsrq: None,
+            sinr: None,
+        }
+    }
+}
+
 /// Measurement ID for identifying measurement configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeasIdValue(pub u8);
@@ -166,6 +199,10 @@ pub struct MeasurementReportData {
     pub serv_freq_results: Vec<MeasResultServFreqNr>,
     /// Neighbour cell measurements (per frequency)
     pub neigh_freq_results: Vec<MeasResult2Nr>,
+    /// Inter-RAT (E-UTRA) neighbour measurements, from the `measResultListEUTRA`
+    /// arm of `measResultNeighCells`. Empty for an intra-NR report: the IE is a
+    /// CHOICE, so a report carries NR results or E-UTRA results, never both.
+    pub eutra_neigh_results: Vec<MeasResultEutra>,
     /// 6G: Enhanced measurement quantities
     pub enhanced_quantities: Option<EnhancedMeasQuantities>,
 }
@@ -179,6 +216,12 @@ pub struct MeasurementReportParams {
     pub serv_freq_results: Vec<MeasResultServFreqNr>,
     /// Neighbour cell measurements
     pub neigh_freq_results: Vec<MeasResult2Nr>,
+    /// Inter-RAT (E-UTRA) neighbour measurements, for a B1/B2 report.
+    ///
+    /// `measResultNeighCells` is a CHOICE, so this and `neigh_freq_results` are
+    /// mutually exclusive: giving both is an error rather than a silent drop of
+    /// one of them.
+    pub eutra_neigh_results: Vec<MeasResultEutra>,
     /// 6G: Enhanced measurement quantities
     pub enhanced_quantities: Option<EnhancedMeasQuantities>,
 }
@@ -215,7 +258,8 @@ pub fn build_measurement_report(
 
     let meas_result_serv_mo_list = MeasResultServMOList(serv_mo_list_entries);
 
-    let meas_result_neigh_cells = build_neigh_cell_results(&params.neigh_freq_results);
+    let meas_result_neigh_cells =
+        build_neigh_cell_results(&params.neigh_freq_results, &params.eutra_neigh_results)?;
 
     let meas_results = MeasResults {
         meas_id,
@@ -320,22 +364,119 @@ fn build_meas_result_nr_value(nr: &MeasResultNr) -> MeasResultNR {
 }
 
 /// Build a list of neighbor cell results for the generated types
-fn build_neigh_cell_results(neigh: &[MeasResult2Nr]) -> Option<MeasResultsMeasResultNeighCells> {
-    if neigh.is_empty() {
-        return None;
-    }
+/// Build the `measResultNeighCells` CHOICE.
+///
+/// `MeasResults.measResultNeighCells` is
+/// `CHOICE { measResultListNR, ..., measResultListEUTRA }`, so exactly one arm
+/// can be present. A caller supplying both lists is rejected: dropping one
+/// silently is how an inter-RAT report would go out looking intra-NR.
+///
+/// The E-UTRA arm is an **extension** of the CHOICE (`..., measResultListEUTRA`),
+/// which is why `an_inter_rat_report_round_trips_through_the_choice_extension_arm`
+/// pins its encoding rather than assuming the generated codec handles the
+/// extension marker.
+fn build_neigh_cell_results(
+    neigh: &[MeasResult2Nr],
+    eutra: &[MeasResultEutra],
+) -> Result<Option<MeasResultsMeasResultNeighCells>, MeasurementReportError> {
     let mut nr_list = Vec::new();
     for freq in neigh {
         for cell in &freq.meas_result_list {
             nr_list.push(build_meas_result_nr_value(cell));
         }
     }
-    if nr_list.is_empty() {
-        return None;
+
+    if !nr_list.is_empty() && !eutra.is_empty() {
+        return Err(MeasurementReportError::InvalidFieldValue(format!(
+            "measResultNeighCells is a CHOICE: {} NR and {} E-UTRA neighbour \
+             results cannot both be reported for measId in one report",
+            nr_list.len(),
+            eutra.len()
+        )));
     }
-    Some(MeasResultsMeasResultNeighCells::MeasResultListNR(
-        MeasResultListNR(nr_list),
-    ))
+
+    if !nr_list.is_empty() {
+        return Ok(Some(MeasResultsMeasResultNeighCells::MeasResultListNR(
+            MeasResultListNR(nr_list),
+        )));
+    }
+
+    if eutra.is_empty() {
+        return Ok(None);
+    }
+
+    let mut eutra_list = Vec::with_capacity(eutra.len());
+    for cell in eutra {
+        eutra_list.push(build_meas_result_eutra_value(cell)?);
+    }
+    Ok(Some(MeasResultsMeasResultNeighCells::MeasResultListEUTRA(
+        MeasResultListEUTRA(eutra_list),
+    )))
+}
+
+/// `eutra-PhysCellId` is `PhysCellId ::= INTEGER (0..1007)`.
+const EUTRA_PHYS_CELL_ID_MAX: u16 = 1007;
+/// `RSRP-RangeEUTRA ::= INTEGER (0..97)` (TS 36.133).
+const RSRP_RANGE_EUTRA_MAX: u8 = 97;
+/// `RSRQ-RangeEUTRA ::= INTEGER (0..34)` (TS 36.133).
+const RSRQ_RANGE_EUTRA_MAX: u8 = 34;
+/// `SINR-RangeEUTRA ::= INTEGER (0..127)` (TS 36.133).
+const SINR_RANGE_EUTRA_MAX: u8 = 127;
+
+/// Build a `MeasResultEUTRA` value, rejecting anything outside the ASN.1
+/// constraints rather than letting the encoder truncate it onto the wire.
+fn build_meas_result_eutra_value(
+    cell: &MeasResultEutra,
+) -> Result<MeasResultEUTRA, MeasurementReportError> {
+    if cell.eutra_phys_cell_id > EUTRA_PHYS_CELL_ID_MAX {
+        return Err(MeasurementReportError::InvalidFieldValue(format!(
+            "eutra-PhysCellId {} is outside INTEGER (0..{EUTRA_PHYS_CELL_ID_MAX})",
+            cell.eutra_phys_cell_id
+        )));
+    }
+    for (name, value, max) in [
+        ("RSRP-RangeEUTRA", cell.rsrp, RSRP_RANGE_EUTRA_MAX),
+        ("RSRQ-RangeEUTRA", cell.rsrq, RSRQ_RANGE_EUTRA_MAX),
+        ("SINR-RangeEUTRA", cell.sinr, SINR_RANGE_EUTRA_MAX),
+    ] {
+        if let Some(value) = value {
+            if value > max {
+                return Err(MeasurementReportError::InvalidFieldValue(format!(
+                    "{name} {value} is outside INTEGER (0..{max})"
+                )));
+            }
+        }
+    }
+    if cell.rsrp.is_none() && cell.rsrq.is_none() && cell.sinr.is_none() {
+        return Err(MeasurementReportError::MissingMandatoryField(format!(
+            "MeasResultEUTRA for eutra-PhysCellId {} carries no measurement \
+             quantity at all",
+            cell.eutra_phys_cell_id
+        )));
+    }
+
+    Ok(MeasResultEUTRA {
+        eutra_phys_cell_id: PhysCellId(cell.eutra_phys_cell_id),
+        meas_result: MeasQuantityResultsEUTRA {
+            rsrp: cell.rsrp.map(RSRP_RangeEUTRA),
+            rsrq: cell.rsrq.map(RSRQ_RangeEUTRA),
+            sinr: cell.sinr.map(SINR_RangeEUTRA),
+        },
+        // cgi-Info needs a whole CGI_InfoEUTRA (PLMN, cell identity, tracking
+        // area code); nothing in this simulator reads an E-UTRA CGI, and the IE
+        // is optional.
+        cgi_info: None,
+    })
+}
+
+/// Read a `MeasResultEUTRA` back into the domain type.
+fn parse_meas_result_eutra(cell: &MeasResultEUTRA) -> MeasResultEutra {
+    MeasResultEutra {
+        eutra_phys_cell_id: cell.eutra_phys_cell_id.0,
+        rsrp: cell.meas_result.rsrp.as_ref().map(|r| r.0),
+        rsrq: cell.meas_result.rsrq.as_ref().map(|r| r.0),
+        sinr: cell.meas_result.sinr.as_ref().map(|r| r.0),
+    }
 }
 
 /// Parse a Measurement Report from a UL-DCCH message
@@ -388,28 +529,33 @@ pub fn parse_measurement_report(
         });
     }
 
-    // Parse neighbor cell results
-    let neigh_freq_results = match &ies.meas_results.meas_result_neigh_cells {
+    // Parse neighbor cell results. The IE is a CHOICE, so at most one of the two
+    // lists below is non-empty.
+    let mut neigh_freq_results = Vec::new();
+    let mut eutra_neigh_results = Vec::new();
+    match &ies.meas_results.meas_result_neigh_cells {
         Some(MeasResultsMeasResultNeighCells::MeasResultListNR(list)) => {
             // All neighbor cells reported as a flat list; group into single frequency entry
             let nr_results: Vec<MeasResultNr> = list.0.iter().map(parse_meas_result_nr).collect();
-            if nr_results.is_empty() {
-                Vec::new()
-            } else {
-                vec![MeasResult2Nr {
+            if !nr_results.is_empty() {
+                neigh_freq_results.push(MeasResult2Nr {
                     ssb_frequency_arfcn: None,
                     ref_freq_csi_rs: None,
                     meas_result_list: nr_results,
-                }]
+                });
             }
         }
-        _ => Vec::new(),
-    };
+        Some(MeasResultsMeasResultNeighCells::MeasResultListEUTRA(list)) => {
+            eutra_neigh_results = list.0.iter().map(parse_meas_result_eutra).collect();
+        }
+        None => {}
+    }
 
     Ok(MeasurementReportData {
         meas_id,
         serv_freq_results,
         neigh_freq_results,
+        eutra_neigh_results,
         enhanced_quantities: None,
     })
 }
@@ -653,6 +799,7 @@ mod tests {
                     rs_index_results: None,
                 }),
             }],
+            eutra_neigh_results: Vec::new(),
             neigh_freq_results: vec![],
             enhanced_quantities: None,
         }
@@ -742,6 +889,7 @@ mod tests {
                 meas_result_serving_cell: create_test_meas_result_nr(),
                 meas_result_best_neigh_cell: None,
             }],
+            eutra_neigh_results: Vec::new(),
             neigh_freq_results: vec![],
             enhanced_quantities: None,
         };
@@ -753,6 +901,7 @@ mod tests {
         let data = MeasurementReportData {
             meas_id: MeasIdValue(1),
             serv_freq_results: vec![],
+            eutra_neigh_results: Vec::new(),
             neigh_freq_results: vec![],
             enhanced_quantities: None,
         };
@@ -807,6 +956,7 @@ mod tests {
                     meas_result_best_neigh_cell: None,
                 },
             ],
+            eutra_neigh_results: Vec::new(),
             neigh_freq_results: vec![],
             enhanced_quantities: None,
         };
@@ -832,5 +982,216 @@ mod tests {
         };
         assert!(nr.cell_results.ssb_results.is_none());
         assert!(nr.cell_results.csi_rs_results.is_some());
+    }
+
+    // ========================================================================
+    // Inter-RAT reporting (issue #113, TS 38.331 §5.5.5 measResultListEUTRA)
+    // ========================================================================
+
+    /// Params for a B1/B2 report: a serving cell and inter-RAT neighbours, with
+    /// no NR neighbours, because `measResultNeighCells` is a CHOICE.
+    fn inter_rat_params(eutra: Vec<MeasResultEutra>) -> MeasurementReportParams {
+        MeasurementReportParams {
+            eutra_neigh_results: eutra,
+            neigh_freq_results: Vec::new(),
+            ..create_test_params()
+        }
+    }
+
+    /// Params with one NR neighbour, since `create_test_params` has none.
+    fn nr_neighbour_params() -> MeasurementReportParams {
+        MeasurementReportParams {
+            neigh_freq_results: vec![MeasResult2Nr {
+                ssb_frequency_arfcn: Some(620_000),
+                ref_freq_csi_rs: None,
+                meas_result_list: vec![create_test_meas_result_nr()],
+            }],
+            ..create_test_params()
+        }
+    }
+
+    /// The whole `MeasResultEUTRA` structure survives a build → parse round trip,
+    /// which is the half of the encoding that this crate owns: every quantity,
+    /// both bounds, and the CHOICE arm being the E-UTRA one.
+    ///
+    /// This is a **structure** round trip, not a byte one, because the UPER
+    /// encoder cannot reach the extension arm at all — see
+    /// `the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec`.
+    #[test]
+    fn an_inter_rat_report_round_trips_at_the_structure_level() {
+        let cells = vec![
+            MeasResultEutra {
+                eutra_phys_cell_id: 42,
+                rsrp: Some(50),
+                rsrq: Some(20),
+                sinr: Some(70),
+            },
+            MeasResultEutra::with_rsrp(1007, 97),
+        ];
+        let params = inter_rat_params(cells.clone());
+
+        let msg = build_measurement_report(&params).expect("build");
+        let decoded = parse_measurement_report(&msg).expect("parse");
+
+        assert_eq!(decoded.meas_id.0, params.meas_id);
+        assert_eq!(
+            decoded.eutra_neigh_results, cells,
+            "every E-UTRA quantity survives the CHOICE arm"
+        );
+        assert!(
+            decoded.neigh_freq_results.is_empty(),
+            "an inter-RAT report carries no NR neighbour list"
+        );
+    }
+
+    /// **The ceiling #113 asks to be recorded.** `measResultListEUTRA` is an
+    /// *extension* arm of the `measResultNeighCells` CHOICE
+    /// (`CHOICE { measResultListNR, ..., measResultListEUTRA }`), and
+    /// `asn1-codecs` 0.7 refuses outright to encode an extended choice index:
+    /// `per/common/encode/mod.rs` returns `EncodeNotSupported` with
+    /// "Encode of extended choice not yet implemented" whenever the selected arm
+    /// is past the extension marker. Decoding one *is* implemented, so this is an
+    /// encoder-only ceiling.
+    ///
+    /// So a UE cannot put an inter-RAT measurement result on the wire in real
+    /// UPER, whatever #107 does about the hand-rolled report — the block is one
+    /// layer below, in the codec crate.
+    ///
+    /// This test **fails when the limitation is lifted**, which is the signal to
+    /// replace `an_inter_rat_report_round_trips_at_the_structure_level` with a
+    /// byte round trip. It is pinned as a ceiling, not asserted as correct.
+    #[test]
+    fn the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec() {
+        let params = inter_rat_params(vec![MeasResultEutra::with_rsrp(42, 50)]);
+
+        // The structure builds fine: the refusal is in the encoder, not here.
+        build_measurement_report(&params).expect("the message structure is valid");
+
+        let err = encode_measurement_report(&params)
+            .expect_err("asn1-codecs 0.7 cannot encode an extended choice index");
+        let message = err.to_string();
+        assert!(
+            message.contains("extended choice"),
+            "expected the extended-choice refusal, got: {message}"
+        );
+
+        // An intra-NR report over the same code path encodes, so the failure is
+        // specific to the extension arm and not to measurement reports at large.
+        encode_measurement_report(&nr_neighbour_params()).expect("the non-extended NR arm encodes");
+    }
+
+    /// The two arms must not be confusable: an intra-NR report still encodes,
+    /// decodes as NR, and carries no E-UTRA list — so adding the extension arm
+    /// did not disturb the arm that was already there.
+    #[test]
+    fn an_intra_nr_report_still_round_trips_as_the_nr_arm() {
+        let encoded = encode_measurement_report(&nr_neighbour_params()).expect("encode");
+        let decoded = decode_measurement_report(&encoded).expect("decode");
+
+        assert!(
+            !decoded.neigh_freq_results.is_empty(),
+            "the NR arm is unaffected by the E-UTRA arm existing"
+        );
+        assert!(decoded.eutra_neigh_results.is_empty());
+    }
+
+    /// A CHOICE can carry one arm. Supplying both lists is rejected, because
+    /// dropping one silently is how an inter-RAT report would go out looking
+    /// intra-NR.
+    #[test]
+    fn nr_and_eutra_neighbours_in_one_report_are_rejected() {
+        let params = MeasurementReportParams {
+            eutra_neigh_results: vec![MeasResultEutra::with_rsrp(42, 50)],
+            ..nr_neighbour_params()
+        };
+
+        let err = build_measurement_report(&params).expect_err("the CHOICE cannot carry both");
+        assert!(
+            matches!(err, MeasurementReportError::InvalidFieldValue(ref m) if m.contains("CHOICE")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The E-UTRA quantities are the TS 36.133 ranges, with tighter bounds than
+    /// the NR ones — RSRQ is `INTEGER (0..34)`, not `(0..127)`. An out-of-range
+    /// value is an error rather than a field truncated on the wire.
+    #[test]
+    fn out_of_range_eutra_quantities_are_rejected() {
+        let cases = [
+            ("eutra-PhysCellId", MeasResultEutra::with_rsrp(1008, 50)),
+            ("RSRP-RangeEUTRA", MeasResultEutra::with_rsrp(1, 98)),
+            (
+                "RSRQ-RangeEUTRA",
+                MeasResultEutra {
+                    eutra_phys_cell_id: 1,
+                    rsrp: None,
+                    rsrq: Some(35),
+                    sinr: None,
+                },
+            ),
+            (
+                "SINR-RangeEUTRA",
+                MeasResultEutra {
+                    eutra_phys_cell_id: 1,
+                    rsrp: None,
+                    rsrq: None,
+                    sinr: Some(128),
+                },
+            ),
+        ];
+
+        for (constraint, cell) in cases {
+            let err = build_measurement_report(&inter_rat_params(vec![cell]))
+                .expect_err("an out-of-range value must not be encoded");
+            let message = err.to_string();
+            assert!(
+                message.contains(constraint),
+                "the error must name the constraint it violated; got: {message}"
+            );
+        }
+
+        // The bounds themselves are legal: the check rejects what is past them,
+        // not the edge.
+        build_measurement_report(&inter_rat_params(vec![MeasResultEutra {
+            eutra_phys_cell_id: 1007,
+            rsrp: Some(97),
+            rsrq: Some(34),
+            sinr: Some(127),
+        }]))
+        .expect("the upper bound of every range is encodable");
+    }
+
+    /// A `MeasResultEUTRA` with no quantity at all reports nothing: every member
+    /// of `MeasQuantityResultsEUTRA` is optional, so the encoding is legal and
+    /// useless.
+    #[test]
+    fn an_eutra_result_with_no_quantity_is_rejected() {
+        let params = inter_rat_params(vec![MeasResultEutra {
+            eutra_phys_cell_id: 42,
+            rsrp: None,
+            rsrq: None,
+            sinr: None,
+        }]);
+
+        let err = build_measurement_report(&params).expect_err("nothing measured");
+        assert!(matches!(
+            err,
+            MeasurementReportError::MissingMandatoryField(_)
+        ));
+    }
+
+    /// The `measResultListEUTRA` bound is `SEQUENCE (SIZE (1..8))`, so eight fit.
+    /// Structure-level, for the reason in
+    /// `the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec`.
+    #[test]
+    fn a_full_eutra_neighbour_list_round_trips_at_the_structure_level() {
+        let cells: Vec<_> = (0..8)
+            .map(|i| MeasResultEutra::with_rsrp(100 + i, 40 + i as u8))
+            .collect();
+
+        let msg = build_measurement_report(&inter_rat_params(cells.clone())).expect("build");
+        let decoded = parse_measurement_report(&msg).expect("parse");
+
+        assert_eq!(decoded.eutra_neigh_results, cells);
     }
 }

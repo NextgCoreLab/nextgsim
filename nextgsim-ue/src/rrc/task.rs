@@ -22,7 +22,8 @@ use crate::rrc::handover::{
     build_reconfiguration_complete, parse_handover_command, HandoverCommand, HandoverManager,
 };
 use crate::rrc::measurement::{
-    MeasConfig, MeasEventType, MeasurementManager, ReportTriggerConfig, ReportTriggerType,
+    EutraCellKey, MeasConfig, MeasEventType, MeasurementManager, ReportTriggerConfig,
+    ReportTriggerType,
 };
 use crate::rrc::reestablishment::{
     ReestablishmentProcedure, ReestablishmentState, ReestablishmentTrigger,
@@ -107,6 +108,11 @@ const RECONFIGURATION_WITH_SCELL: u8 = 0x0E;
 
 /// Where the `CellGroupConfig` starts in such a message.
 const SCELL_CONTAINER_OFFSET: usize = 2;
+
+/// `measId` of the default inter-RAT B1 measurement, installed when
+/// `UeConfig::eutra_neighbours` is non-empty. Distinct from the default A3
+/// `measId` 1.
+const DEFAULT_B1_MEAS_ID: u8 = 2;
 
 /// `q-RxLevMin` assumed for a cell whose SIB1 omits `cellSelectionInfo`
 /// (the IE is `OPTIONAL — Cond Standalone` in TS 38.331 §6.3.2).
@@ -536,6 +542,10 @@ impl RrcTask {
                 .update_measurement(cell_id, cell.dbm);
         }
 
+        // Inter-RAT (E-UTRA) measurements, for events B1/B2. Configured rather
+        // than measured: RLS carries NR cells only.
+        self.update_eutra_measurements();
+
         // Evaluate measurement events
         self.measurement_manager.evaluate_events();
 
@@ -662,6 +672,57 @@ impl RrcTask {
             max_report_cells: 4,
         };
         self.measurement_manager.add_config(config);
+
+        // A configured inter-RAT neighbour list needs something evaluating it, or
+        // the measurements are stored and never read. TS 38.331 §5.5.4.8: B1
+        // enters when an E-UTRA neighbour beats b1-ThresholdEUTRA.
+        if !self.task_base.config.eutra_neighbours.is_empty() {
+            let threshold = self.task_base.config.eutra_b1_threshold_dbm;
+            self.measurement_manager.add_config(MeasConfig {
+                meas_id: DEFAULT_B1_MEAS_ID,
+                meas_object_id: 2,
+                report_config_id: 2,
+                quantity: crate::rrc::measurement::MeasQuantity::SsRsrp,
+                trigger_config: ReportTriggerConfig {
+                    trigger_type: ReportTriggerType::Event(MeasEventType::B1),
+                    threshold: Some(threshold),
+                    threshold1: None,
+                    threshold2: None,
+                    a3_offset: None,
+                    a6_offset: None,
+                    hysteresis: 2,        // 1 dB
+                    time_to_trigger: 640, // as for the A3 measId
+                },
+                report_amount: 8,
+                report_interval: 480,
+                max_report_cells: 4,
+            });
+            info!(
+                "Inter-RAT measurement configured: {} E-UTRA neighbour(s), \
+                 b1-ThresholdEUTRA {} dBm",
+                self.task_base.config.eutra_neighbours.len(),
+                threshold
+            );
+        }
+    }
+
+    /// Feed the configured inter-RAT (E-UTRA) neighbours into the measurement
+    /// manager, so events B1 and B2 have a measurement source.
+    ///
+    /// A static stand-in, not a radio: RLS models NR cells only, so the level is
+    /// whatever the configuration says and never changes. The offsets are set on
+    /// every cycle alongside it because they are part of the B1/B2 inequalities
+    /// and the manager stores them per cell and per carrier, not per report.
+    fn update_eutra_measurements(&mut self) {
+        for neighbour in &self.task_base.config.eutra_neighbours {
+            let cell = EutraCellKey::new(neighbour.earfcn, neighbour.pci);
+            self.measurement_manager
+                .update_eutra_measurement(cell, neighbour.rsrp_dbm);
+            self.measurement_manager
+                .set_eutra_cell_offset(cell, neighbour.cell_individual_offset_db);
+            self.measurement_manager
+                .set_eutra_frequency_offset(neighbour.earfcn, neighbour.frequency_offset_db);
+        }
     }
 
     /// Handle signal change from RLS
@@ -2495,6 +2556,7 @@ mod tests {
     // ========================================================================
 
     use crate::rrc::TriggeringCell;
+    use nextgsim_common::config::EutraNeighbourConfig;
     use nextgsim_rrc::procedures::conditional_handover::{
         encode_cho_config, A3Offset, ChoCandidateCell, ChoCondition, ChoConfig,
         ChoTargetCellConfig, EventA3Condition, Hysteresis, TimeToTrigger,
@@ -2553,6 +2615,193 @@ mod tests {
         // as the answer to what it sends.
         let _setup_complete = next_uplink_rrc(rls_rx);
         task.handle_signal_changed(1, -90).await;
+    }
+
+    // ========================================================================
+    // Inter-RAT measurement source (issue #113, TS 38.331 §5.5.4.8/.9)
+    // ========================================================================
+
+    /// The whole point of #113: a B1 event that enters from the UE's *configured*
+    /// inter-RAT neighbour list, with no test call to `update_eutra_measurement`
+    /// and no test-installed measurement configuration either — the B1 `measId`
+    /// comes from `setup_default_measurements` because the list is non-empty.
+    #[test]
+    fn a_b1_event_enters_from_the_configured_inter_rat_neighbours() {
+        let mut config = test_config();
+        config.eutra_b1_threshold_dbm = -100;
+        config.eutra_neighbours = vec![
+            EutraNeighbourConfig {
+                earfcn: 1850,
+                pci: 42,
+                rsrp_dbm: -95, // -95 - 1 > -100: over the bar
+                cell_individual_offset_db: 0,
+                frequency_offset_db: 0,
+            },
+            EutraNeighbourConfig {
+                earfcn: 1850,
+                pci: 43,
+                rsrp_dbm: -115, // well below it
+                cell_individual_offset_db: 0,
+                frequency_offset_db: 0,
+            },
+        ];
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            // Two cycles: the first starts the 640 ms time-to-trigger run.
+            task.perform_cycle().await;
+            task.measurement_manager
+                .add_config(zero_ttt_b1_config(&task.task_base.config));
+            task.perform_cycle().await;
+
+            assert_eq!(
+                task.measurement_manager
+                    .triggered_cells(ZERO_TTT_B1_MEAS_ID),
+                vec![TriggeringCell::Eutra(EutraCellKey::new(1850, 42))],
+                "the stronger configured neighbour crossed b1-ThresholdEUTRA; \
+                 the weaker one did not"
+            );
+        });
+    }
+
+    /// A `measId` copy of the default B1 configuration with the time-to-trigger
+    /// removed, so a test does not have to sleep 640 ms. The *measurement source*
+    /// is still the configuration, which is what #113 is about; only the
+    /// trigger timing is shortened.
+    const ZERO_TTT_B1_MEAS_ID: u8 = 20;
+
+    fn zero_ttt_b1_config(config: &UeConfig) -> MeasConfig {
+        MeasConfig {
+            meas_id: ZERO_TTT_B1_MEAS_ID,
+            meas_object_id: 2,
+            report_config_id: 2,
+            quantity: crate::rrc::measurement::MeasQuantity::SsRsrp,
+            trigger_config: ReportTriggerConfig {
+                trigger_type: ReportTriggerType::Event(MeasEventType::B1),
+                threshold: Some(config.eutra_b1_threshold_dbm),
+                threshold1: None,
+                threshold2: None,
+                a3_offset: None,
+                a6_offset: None,
+                hysteresis: 2,
+                time_to_trigger: 0,
+            },
+            report_amount: 0,
+            report_interval: 0,
+            max_report_cells: 4,
+        }
+    }
+
+    /// A non-empty neighbour list installs the default B1 `measId` on its own: a
+    /// measurement source nothing evaluates would be inert.
+    #[test]
+    fn configured_inter_rat_neighbours_install_a_default_b1_meas_id() {
+        for neighbours in [0usize, 1] {
+            let mut config = test_config();
+            config.eutra_neighbours = (0..neighbours)
+                .map(|_| EutraNeighbourConfig {
+                    earfcn: 1850,
+                    pci: 42,
+                    rsrp_dbm: -95,
+                    cell_individual_offset_db: 0,
+                    frequency_offset_db: 0,
+                })
+                .collect();
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+            let mut task = RrcTask::new(task_base);
+
+            task.setup_default_measurements();
+
+            // measId 1 is the default A3; measId 2 the default B1.
+            assert_eq!(
+                task.measurement_manager.config_count(),
+                1 + neighbours,
+                "{neighbours} configured neighbour(s) -> B1 measId present = {}",
+                neighbours > 0
+            );
+        }
+    }
+
+    /// The per-carrier Ofn and per-cell Ocn from the configuration are part of the
+    /// B1 inequality (B1-1 is Mn + Ofn + Ocn - Hys > Thresh). The same level with
+    /// the offsets present crosses the bar and without them does not, so the test
+    /// fails if the offsets never reach the measurement manager.
+    #[test]
+    fn the_configured_inter_rat_offsets_are_applied() {
+        let cell = EutraCellKey::new(1850, 7);
+
+        // Ofn 3 + Ocn 3: -104 + 6 - 1 = -99 > -100, so it enters.
+        // Both zero:      -104 + 0 - 1 = -105, so it does not.
+        for (ofn, ocn, expect_triggered) in [(3, 3, true), (0, 0, false)] {
+            let mut config = test_config();
+            config.eutra_b1_threshold_dbm = -100;
+            config.eutra_neighbours = vec![EutraNeighbourConfig {
+                earfcn: cell.earfcn,
+                pci: cell.pci,
+                rsrp_dbm: -104,
+                cell_individual_offset_db: ocn,
+                frequency_offset_db: ofn,
+            }];
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+            let mut task = RrcTask::new(task_base);
+
+            run_async(async {
+                connect_on_cell_one(&mut task, &mut rls_rx).await;
+                task.measurement_manager
+                    .add_config(zero_ttt_b1_config(&task.task_base.config));
+                task.perform_cycle().await;
+
+                let stored = task
+                    .measurement_manager
+                    .eutra_measurements()
+                    .get(&cell)
+                    .expect("the configured neighbour is measured");
+                assert_eq!(stored.rsrp, Some(-104));
+                assert_eq!(
+                    stored.cell_individual_offset, ocn,
+                    "Ocn reached the measurement manager"
+                );
+
+                let triggered = task
+                    .measurement_manager
+                    .triggered_cells(ZERO_TTT_B1_MEAS_ID);
+                if expect_triggered {
+                    assert_eq!(
+                        triggered,
+                        vec![TriggeringCell::Eutra(cell)],
+                        "Ofn {ofn} + Ocn {ocn} lifts -104 dBm over the -99 dBm bar"
+                    );
+                } else {
+                    assert!(
+                        triggered.is_empty(),
+                        "with no offsets -104 dBm is below the bar"
+                    );
+                }
+            });
+        }
+    }
+
+    /// With no configured neighbours nothing is measured, so B1/B2 cannot enter —
+    /// the pre-#113 behaviour, unchanged.
+    #[test]
+    fn no_configured_inter_rat_neighbours_means_no_inter_rat_measurements() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.measurement_manager
+                .add_config(zero_ttt_b1_config(&task.task_base.config));
+            task.perform_cycle().await;
+
+            assert!(task.measurement_manager.eutra_measurements().is_empty());
+            assert!(task
+                .measurement_manager
+                .triggered_cells(ZERO_TTT_B1_MEAS_ID)
+                .is_empty());
+        });
     }
 
     /// An RRCReconfiguration adding one secondary cell, in the DL-DCCH envelope
