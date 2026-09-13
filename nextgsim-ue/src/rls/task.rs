@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
@@ -156,11 +156,33 @@ impl RlsTask {
         self.serving_cell
     }
 
-    /// Returns the RLC entity for a PSI bearer, creating a UM SN12 entity on first use.
+    /// Returns the RLC entity for a PSI bearer, creating a UM SN12 entity on
+    /// first use.
+    ///
+    /// One entity per bearer (TS 38.322 §4.2.1), so each PDU session has its own
+    /// sequence-number space and reassembly buffer. The PSI stands in for the
+    /// DRB identity: this simulator maps one DRB per PDU session, and the gNB
+    /// keys its own entities on `(ue_id, psi)` to match.
     fn rlc_entity_for(&mut self, psi: i32) -> &mut RlcEntity {
         self.rlc_entities
             .entry(psi)
             .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
+    }
+
+    /// Drives `t-Reassembly` on every RLC entity (TS 38.322 §5.2.2.2.4), so a
+    /// partially received SDU whose missing segment never arrives is discarded
+    /// instead of occupying the reassembly buffer forever.
+    fn poll_rlc_timers(&mut self) {
+        let now = Instant::now();
+        for (psi, rlc) in &mut self.rlc_entities {
+            if rlc.poll_t_reassembly(now) {
+                debug!(
+                    "RLC t-Reassembly expired: psi={}, rx_next_reassembly={}",
+                    psi,
+                    rlc.rx_next_reassembly()
+                );
+            }
+        }
     }
 
     async fn init_socket(&mut self) -> Result<(), std::io::Error> {
@@ -607,6 +629,7 @@ impl Task for RlsTask {
                     self.check_lost_cells().await;
                     self.send_pending_acks().await;
                     self.check_expired_pdus().await;
+                    self.poll_rlc_timers();
                 }
             }
         }

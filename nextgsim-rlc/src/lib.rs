@@ -86,4 +86,14 @@ impl SnSize {
             Self::Sn18 => unreachable!("18-bit SN is AM only"),
         }
     }
+
+    /// `UM_Window_Size` for this SN size (TS 38.322 §7.2): half the SN space,
+    /// i.e. 32 for a 6-bit SN and 2048 for a 12-bit SN.
+    ///
+    /// The reassembly window spans `RX_Next_Highest - UM_Window_Size` up to
+    /// (excluding) `RX_Next_Highest`, so half the SN space is what keeps a
+    /// wrapped SN unambiguous.
+    pub fn um_window_size(self) -> u32 {
+        self.modulus() / 2
+    }
 }

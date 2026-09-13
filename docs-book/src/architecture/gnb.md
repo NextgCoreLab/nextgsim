@@ -193,8 +193,12 @@ with four message types: `Heartbeat`, `HeartbeatAck`, `PduTransmission`,
 ### Supporting crates
 
 - **`nextgsim-rlc`** (`src/lib.rs`, cites TS 38.322): RLC TM/UM/AM entities. The
-  gNB RLS task creates one **UM, SN12** `RlcEntity` per UE for user-plane
-  reassembly (`src/rls/task.rs`, `rlc_entity_for`).
+  gNB RLS task creates one **UM, SN12** `RlcEntity` per **(UE, PDU session)** —
+  one per radio bearer, as TS 38.322 §4.2.1 requires, so each bearer has its own
+  sequence-number space and reassembly buffer (`src/rls/task.rs`,
+  `rlc_entity_for`). The receiving side enforces the reassembly window and runs
+  `t-Reassembly`, discarding a partially received SDU whose missing segment never
+  arrives (`poll_rlc_timers`, ticked from the task's run loop).
 - **`nextgsim-common`** (`src/config.rs`, `types.rs`): `GnbConfig`, the
   `TaskMessage<T>` envelope, `OctetString`, `Plmn`, and the SCTP backend enum.
 
