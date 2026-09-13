@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use nextgsim_gtp::codec::{GtpHeader, GtpMessageType};
-use nextgsim_gtp::tunnel::{GtpTunnel, PduSession, TunnelManager, GTP_U_PORT};
+use nextgsim_gtp::path::{EchoOutcome, PathSupervisor};
+use nextgsim_gtp::restart::RestartCounter;
+use nextgsim_gtp::tunnel::{GtpTunnel, PduSession, TunnelError, TunnelManager, GTP_U_PORT};
 
 use crate::tasks::{
     GnbTaskBase, GtpMessage, GtpUeContextUpdate, PduSessionResource, RlsMessage, Task, TaskMessage,
@@ -53,6 +55,13 @@ pub struct GtpTask {
     recv_buffer_size: usize,
     /// Enable loopback mode (for testing without UPF)
     loopback_mode: bool,
+    /// This node's GTP-U restart counter, advertised in every Echo Response
+    /// Recovery IE (TS 29.281 §8.2, TS 23.007).
+    restart_counter: RestartCounter,
+    /// N3 path supervision state (TS 29.281 §7.2.1). Present regardless of whether
+    /// the prober runs: it also records peer restart counters seen in Echo Responses,
+    /// which arrive whether or not this node probes.
+    path_supervisor: PathSupervisor,
 }
 
 impl GtpTask {
@@ -69,18 +78,42 @@ impl GtpTask {
                 task_base.config.upf_port
             );
         }
-        Self {
-            task_base,
-            udp_socket: None,
-            ue_contexts: HashMap::new(),
-            tunnel_manager: TunnelManager::new(),
-            recv_buffer_size: 65535,
-            loopback_mode,
-        }
+        Self::build(task_base, loopback_mode)
     }
 
     /// Create a new GTP task with loopback mode setting
     pub fn with_loopback(task_base: GnbTaskBase, loopback_mode: bool) -> Self {
+        Self::build(task_base, loopback_mode)
+    }
+
+    fn build(task_base: GnbTaskBase, loopback_mode: bool) -> Self {
+        // TS 23.007: the restart counter comes from non-volatile storage and advances
+        // once per process start, so a peer can tell this node restarted. Loaded here,
+        // at construction, so the very first Echo Response already carries it.
+        let restart_counter = match task_base.config.gtpu_restart_counter_path.as_ref() {
+            Some(path) => match RestartCounter::load_and_advance(path) {
+                Ok(counter) => {
+                    info!(
+                        "GTP-U restart counter {} (from {})",
+                        counter.value(),
+                        path.display()
+                    );
+                    counter
+                }
+                Err(e) => {
+                    // Named rather than swallowed: with no storage the counter is a
+                    // fixed 0, so no peer will ever detect a restart of this node.
+                    warn!(
+                        "GTP-U restart counter at {} unusable ({e}); advertising a fixed 0, so \
+                         peers cannot detect a restart of this gNB",
+                        path.display()
+                    );
+                    RestartCounter::in_memory()
+                }
+            },
+            None => RestartCounter::in_memory(),
+        };
+        let path_supervisor = PathSupervisor::new(task_base.config.gtpu_echo_max_misses);
         Self {
             task_base,
             udp_socket: None,
@@ -88,6 +121,8 @@ impl GtpTask {
             tunnel_manager: TunnelManager::new(),
             recv_buffer_size: 65535,
             loopback_mode,
+            restart_counter,
+            path_supervisor,
         }
     }
 
@@ -444,7 +479,7 @@ impl GtpTask {
     }
 
     /// Handle received GTP-U packet from network (UPF -> UE)
-    async fn handle_udp_receive(&self, data: &[u8], _source: SocketAddr) {
+    async fn handle_udp_receive(&mut self, data: &[u8], _source: SocketAddr) {
         // Decode GTP-U header
         let header = match GtpHeader::decode(data) {
             Ok(h) => h,
@@ -456,10 +491,16 @@ impl GtpTask {
 
         match header.message_type {
             GtpMessageType::GPdu => {
-                self.handle_downlink_gpdu(&header).await;
+                self.handle_downlink_gpdu(&header, _source).await;
             }
             GtpMessageType::EchoRequest => {
                 self.handle_echo_request(&header, _source).await;
+            }
+            GtpMessageType::EchoResponse => {
+                self.handle_echo_response(&header, _source);
+            }
+            GtpMessageType::ErrorIndication => {
+                self.handle_error_indication(&header, _source);
             }
             other => {
                 warn!("Unhandled GTP-U message type: {:?}", other);
@@ -468,7 +509,7 @@ impl GtpTask {
     }
 
     /// Handle downlink G-PDU (user data from UPF)
-    async fn handle_downlink_gpdu(&self, header: &GtpHeader) {
+    async fn handle_downlink_gpdu(&self, header: &GtpHeader, source: SocketAddr) {
         match self.tunnel_manager.decapsulate_downlink(header) {
             Ok(dl) => {
                 // amfg-09: the DL QFI/RQI from the PDU Session Container drive
@@ -494,8 +535,105 @@ impl GtpTask {
                     );
                 }
             }
+            Err(TunnelError::TunnelNotFound(teid)) => {
+                // TS 29.281 §7.3.1: discard the G-PDU and, for a non-zero TEID, tell
+                // the sender the tunnel is invalid so it can release it. An all-zeros
+                // TEID names no tunnel, so there is nothing to invalidate and the
+                // spec explicitly excludes it -- answering one would ask a peer to
+                // release a tunnel that does not exist.
+                if teid == 0 {
+                    debug!(
+                        "Discarded G-PDU on the all-zeros TEID from {source}: no Error \
+                            Indication is owed (TS 29.281 §7.3.1)"
+                    );
+                    return;
+                }
+                self.send_error_indication(teid, source).await;
+            }
             Err(e) => {
                 error!("Downlink decapsulation failed: {}", e);
+            }
+        }
+    }
+
+    /// Send a GTP-U Error Indication naming `teid` to `dest` (TS 29.281 §7.3.1).
+    async fn send_error_indication(&self, teid: u32, dest: SocketAddr) {
+        let Some(socket) = &self.udp_socket else {
+            return;
+        };
+        let indication = GtpHeader::error_indication(teid, dest.ip());
+        let encoded = indication.encode();
+        if let Err(e) = socket.send_to(&encoded, dest).await {
+            error!("Failed to send Error Indication to {dest}: {e}");
+        } else {
+            debug!(
+                "Sent Error Indication for unknown TEID {teid:#x} to {dest} \
+                 (TS 29.281 §7.3.1)"
+            );
+        }
+    }
+
+    /// Handle a received GTP-U Error Indication (TS 29.281 §4.4.2.4, TS 23.007).
+    ///
+    /// The peer could not match a G-PDU **this node sent**, so the tunnel is gone at
+    /// the far end and keeping it here only black-holes traffic. Release it.
+    fn handle_error_indication(&mut self, header: &GtpHeader, source: SocketAddr) {
+        let Some(teid) = header.error_indication_teid() else {
+            warn!(
+                "Error Indication from {source} carries no Tunnel Endpoint Identifier \
+                   Data I; nothing to release"
+            );
+            return;
+        };
+        // The GTP-U Peer Address IE names the tunnel together with the TEID. Prefer it
+        // over the datagram source: they agree on a direct path, and where they do not
+        // (a relay), the IE is the one that identifies the tunnel.
+        let peer = header
+            .error_indication_peer()
+            .unwrap_or_else(|| source.ip());
+
+        let Some(session) = self.tunnel_manager.find_by_uplink_teid(teid, peer) else {
+            debug!(
+                "Error Indication from {source} names uplink TEID {teid:#x} at {peer}, \
+                 which this gNB holds no session for; nothing to release"
+            );
+            return;
+        };
+        let (ue_id, psi) = (session.ue_id, session.psi);
+        match self.tunnel_manager.delete_session(ue_id, psi) {
+            Ok(_) => info!(
+                "Released PDU session ue_id={ue_id} psi={psi} on an Error Indication for \
+                 uplink TEID {teid:#x} from {peer} (TS 29.281 §4.4.2.4)"
+            ),
+            Err(e) => error!("Failed to release ue_id={ue_id} psi={psi}: {e}"),
+        }
+    }
+
+    /// Handle a received GTP-U Echo Response: the path is alive.
+    ///
+    /// Required by path supervision, not optional bookkeeping -- without it every
+    /// answered Echo Request stays outstanding and a live path is counted as missing.
+    fn handle_echo_response(&mut self, response: &GtpHeader, source: SocketAddr) {
+        match self
+            .path_supervisor
+            .note_echo_response(source, response.recovery_restart_counter())
+        {
+            EchoOutcome::Alive => {
+                debug!("GTP-U path to {source} confirmed alive");
+            }
+            EchoOutcome::Recovered => {
+                info!("GTP-U path to {source} recovered");
+            }
+            EchoOutcome::PeerRestarted { previous, current } => {
+                // Detected and reported, deliberately NOT acted on here. Purging this
+                // peer's tunnels is the peer-restart half of TS 23.007 §20, and it
+                // belongs with the UPF-side handling tracked in nextgcore#61 rather
+                // than being invented on one side. Recording the new counter means the
+                // next response does not report the same restart again.
+                warn!(
+                    "GTP-U peer {source} restarted: Recovery counter {previous:?} -> \
+                     {current}. Tunnels toward it may be stale (TS 23.007)"
+                );
             }
         }
     }
@@ -512,14 +650,71 @@ impl GtpTask {
         if let Some(seq) = request.sequence_number {
             response = response.with_sequence_number(seq);
         }
-        // Add recovery IE (type 14, value 0)
-        response.payload = Bytes::from_static(&[14, 0]);
+        // Recovery IE, mandatory in an Echo Response (TS 29.281 Table 7.2.2-1),
+        // carrying this node's real restart counter. It used to be a hardcoded
+        // `[14, 0]`, which encodes correctly and defeats the mechanism: a constant
+        // makes every restart of this gNB invisible to its peers (TS 23.007).
+        let response = response.with_recovery(self.restart_counter.value());
 
         let encoded = response.encode();
         if let Err(e) = socket.send_to(&encoded, source).await {
             error!("Failed to send Echo Response: {}", e);
         } else {
             debug!("Sent Echo Response to {}", source);
+        }
+    }
+
+    /// The peers whose N3 path is worth supervising: every distinct UPF address an
+    /// active uplink tunnel points at.
+    ///
+    /// Derived from live sessions rather than from config, so a path is probed exactly
+    /// while there is traffic that depends on it.
+    fn supervised_peers(&self) -> Vec<SocketAddr> {
+        let mut peers: Vec<SocketAddr> = Vec::new();
+        for session in self.tunnel_manager.all_sessions() {
+            let peer = session.uplink_tunnel.address;
+            if !peers.contains(&peer) {
+                peers.push(peer);
+            }
+        }
+        peers
+    }
+
+    /// One supervision period: close the previous one, then probe every peer.
+    ///
+    /// Closing first is what makes a miss a miss: anything still outstanding from the
+    /// last period went unanswered, and TS 23.007 §20.3.1 counts consecutive periods,
+    /// not elapsed wall-clock. Guarding on elapsed time alone would declare a path down
+    /// on liveness rather than on missed responses -- the defect nextgcore#61 records
+    /// on the UPF side.
+    async fn run_echo_supervision_period(&mut self) {
+        let peers = self.supervised_peers();
+        for peer in &peers {
+            if self.path_supervisor.note_period_elapsed(*peer) {
+                warn!(
+                    "GTP-U path to {peer} declared DOWN after {} consecutive unanswered \
+                     Echo Requests (TS 23.007 §20.3.1)",
+                    self.path_supervisor.consecutive_misses(peer)
+                );
+            }
+        }
+
+        let Some(socket) = self.udp_socket.clone() else {
+            return;
+        };
+        for peer in peers {
+            let seq = self.path_supervisor.next_sequence();
+            // TS 29.281 §5.1: TEID all zeros and the S flag set for an Echo Request.
+            let request = GtpHeader::echo_request(0).with_sequence_number(seq);
+            match socket.send_to(&request.encode(), peer).await {
+                Ok(_) => {
+                    self.path_supervisor.note_echo_sent(peer, seq);
+                    debug!("Sent GTP-U Echo Request seq={seq} to {peer}");
+                }
+                // Not recorded as outstanding: nothing was put on the wire, so counting
+                // it as a missed RESPONSE would blame the peer for a local failure.
+                Err(e) => error!("Failed to send Echo Request to {peer}: {e}"),
+            }
         }
     }
 }
@@ -548,10 +743,42 @@ impl Task for GtpTask {
             );
         }
 
+        // TS 29.281 §7.2.1 path supervision. A period of 0 disables it, and that is
+        // the default: the prober is opt-in so the shipped datapath is unchanged.
+        // `far_future` rather than an Option<Interval> because a `select!` branch must
+        // still be a valid expression when supervision is off; the branch then simply
+        // never fires.
+        let echo_period = self.task_base.config.gtpu_echo_period_secs;
+        let mut echo_interval = match echo_period {
+            0 => {
+                info!("GTP-U Echo path supervision disabled (gtpu_echo_period_secs = 0)");
+                tokio::time::interval_at(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(86_400 * 365),
+                    std::time::Duration::from_secs(86_400 * 365),
+                )
+            }
+            secs => {
+                info!(
+                    "GTP-U Echo path supervision every {secs}s, path down after {} misses",
+                    self.task_base.config.gtpu_echo_max_misses
+                );
+                let mut i = tokio::time::interval(std::time::Duration::from_secs(secs));
+                // The first tick fires immediately; skip probing before any session
+                // exists rather than sending to nobody.
+                i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                i
+            }
+        };
+
         info!("GTP task started");
 
         loop {
             tokio::select! {
+                // GTP-U Echo path supervision (never fires when disabled)
+                _ = echo_interval.tick(), if echo_period > 0 => {
+                    self.run_echo_supervision_period().await;
+                }
+
                 // Handle incoming messages from other tasks
                 msg = rx.recv() => {
                     match msg {
@@ -608,6 +835,7 @@ mod tests {
     use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
     use std::net::IpAddr;
+    use tokio::net::UdpSocket;
 
     fn test_config() -> GnbConfig {
         GnbConfig {
@@ -767,5 +995,288 @@ mod tests {
 
         assert!(!task.ue_contexts.contains_key(&1));
         assert_eq!(task.tunnel_manager.session_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #43: Error Indication, Recovery counter, path supervision
+    // -----------------------------------------------------------------------
+
+    /// Bind a gNB socket into the task and hand back a second socket standing in for
+    /// the UPF, so the assertions are about what actually leaves the process.
+    async fn task_with_sockets() -> (GtpTask, UdpSocket, SocketAddr) {
+        let (task_base, _ngap_rx, _rrc_rx, _rls_rx, _gtp_rx, _sctp_rx, _app_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = GtpTask::new(task_base);
+        let gnb = UdpSocket::bind("127.0.0.1:0").await.expect("bind gnb");
+        task.udp_socket = Some(Arc::new(gnb));
+        let upf = UdpSocket::bind("127.0.0.1:0").await.expect("bind upf");
+        let upf_addr = upf.local_addr().expect("upf addr");
+        (task, upf, upf_addr)
+    }
+
+    /// A session whose uplink tunnel points at EXACTLY `upf_addr`, port included.
+    ///
+    /// The production path (`handle_session_create`) pins the peer port to the
+    /// well-known 2152, which no test socket can bind, so a socket-level test of the
+    /// prober has to build the session directly. `find_by_uplink_teid` matches on the
+    /// IP, which is why the Error Indication tests can use the production path.
+    fn live_session_to(task: &mut GtpTask, upf_addr: SocketAddr) {
+        let gnb_addr = SocketAddr::new(task.task_base.config.gtp_ip, GTP_U_PORT);
+        task.tunnel_manager
+            .create_session(PduSession::new(
+                1,
+                1,
+                GtpTunnel::new(0x1000, upf_addr),
+                GtpTunnel::new(0x2000, gnb_addr),
+            ))
+            .expect("create session");
+        assert_eq!(task.tunnel_manager.session_count(), 1, "precondition");
+    }
+
+    fn live_session(task: &mut GtpTask, upf_addr: SocketAddr) {
+        task.handle_ue_context_update(
+            1,
+            GtpUeContextUpdate {
+                ue_id: 1,
+                amf_ue_ngap_id: None,
+            },
+        );
+        task.handle_session_create(
+            1,
+            PduSessionResource {
+                psi: 1,
+                qfi: Some(1),
+                uplink_teid: 0x1000,
+                downlink_teid: 0x2000,
+                upf_address: upf_addr.ip(),
+            },
+        );
+        assert_eq!(task.tunnel_manager.session_count(), 1, "precondition");
+    }
+
+    /// Criterion 1: an unknown, non-zero TEID must produce an Error Indication naming
+    /// that TEID and this node's peer address, sent to the source of the G-PDU.
+    #[tokio::test]
+    async fn an_unknown_teid_gpdu_returns_an_error_indication() {
+        let (mut task, upf, upf_addr) = task_with_sockets().await;
+        let gnb_addr = task
+            .udp_socket
+            .as_ref()
+            .expect("socket")
+            .local_addr()
+            .expect("addr");
+
+        let gpdu = GtpHeader::g_pdu(0x0BAD_F00D, Bytes::from_static(b"payload"));
+        task.handle_udp_receive(&gpdu.encode(), upf_addr).await;
+
+        let mut buf = [0u8; 256];
+        let (len, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), upf.recv_from(&mut buf))
+                .await
+                .expect("an Error Indication must be sent for an unknown non-zero TEID")
+                .expect("recv");
+        assert_eq!(from, gnb_addr, "it must come from the gNB GTP-U socket");
+
+        let decoded = GtpHeader::decode(&buf[..len]).expect("decode");
+        assert_eq!(decoded.message_type, GtpMessageType::ErrorIndication);
+        assert_eq!(
+            decoded.error_indication_teid(),
+            Some(0x0BAD_F00D),
+            "the Tunnel Endpoint Identifier Data I must name the TEID that was not found"
+        );
+        assert_eq!(
+            decoded.error_indication_peer(),
+            Some(upf_addr.ip()),
+            "the GTP-U Peer Address must name the node that sent the G-PDU"
+        );
+        assert_eq!(decoded.teid, 0, "TS 29.281 §5.1: header TEID all zeros");
+    }
+
+    /// Criterion 2: an all-zeros TEID names no tunnel, so nothing is owed and nothing
+    /// is sent.
+    ///
+    /// The non-zero case is driven FIRST in the same test, against the same socket and
+    /// the same timeout, so the silence that follows is calibrated: a bug that stopped
+    /// the sender working entirely would fail the first half rather than pass here by
+    /// never arriving.
+    #[tokio::test]
+    async fn an_all_zeros_teid_gpdu_is_discarded_silently() {
+        let (mut task, upf, upf_addr) = task_with_sockets().await;
+        let mut buf = [0u8; 256];
+
+        let nonzero = GtpHeader::g_pdu(0x4321, Bytes::from_static(b"x"));
+        task.handle_udp_receive(&nonzero.encode(), upf_addr).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), upf.recv_from(&mut buf))
+            .await
+            .expect("calibration: a non-zero unknown TEID DOES answer")
+            .expect("recv");
+
+        let zero = GtpHeader::g_pdu(0, Bytes::from_static(b"x"));
+        task.handle_udp_receive(&zero.encode(), upf_addr).await;
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            upf.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            quiet.is_err(),
+            "TS 29.281 §7.3.1 excludes the all-zeros TEID: it names no tunnel to invalidate"
+        );
+    }
+
+    /// Criterion 3: a received Error Indication releases the referenced session.
+    #[tokio::test]
+    async fn a_received_error_indication_releases_the_referenced_session() {
+        let (mut task, _upf, upf_addr) = task_with_sockets().await;
+        live_session(&mut task, upf_addr);
+
+        // The UPF could not match the UPLINK TEID we send to, so that is what it names.
+        let indication = GtpHeader::error_indication(0x1000, upf_addr.ip());
+        task.handle_udp_receive(&indication.encode(), upf_addr)
+            .await;
+
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            0,
+            "the session must be released: keeping it only black-holes traffic \
+             (TS 29.281 §4.4.2.4, TS 23.007)"
+        );
+    }
+
+    /// The same message naming a TEID this gNB does not hold must not release anything.
+    /// A handler that released "the first session it found" would pass the test above.
+    #[tokio::test]
+    async fn an_error_indication_for_an_unknown_teid_releases_nothing() {
+        let (mut task, _upf, upf_addr) = task_with_sockets().await;
+        live_session(&mut task, upf_addr);
+
+        let indication = GtpHeader::error_indication(0x7777, upf_addr.ip());
+        task.handle_udp_receive(&indication.encode(), upf_addr)
+            .await;
+        assert_eq!(task.tunnel_manager.session_count(), 1);
+
+        // And the right TEID from the WRONG peer must not match either: TEIDs are only
+        // unique per node.
+        let other_peer = GtpHeader::error_indication(0x1000, IpAddr::from([203, 0, 113, 9]));
+        task.handle_udp_receive(&other_peer.encode(), upf_addr)
+            .await;
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            1,
+            "the (TEID, peer) pair identifies the tunnel, not the TEID alone"
+        );
+    }
+
+    /// Criterion 4, the wire half: the Echo Response carries the task's restart counter.
+    #[tokio::test]
+    async fn the_echo_response_carries_the_restart_counter() {
+        let (mut task, upf, upf_addr) = task_with_sockets().await;
+        // A NON-ZERO counter, and that is the whole point: the value this replaces was a
+        // hardcoded `[14, 0]`, so a counter of 0 would satisfy the assertion below
+        // whether or not the fix is present. The revert-verify pass caught exactly that
+        // -- the first version of this test used `in_memory()` (value 0) and passed
+        // against the hardcoded bytes.
+        let seed = std::env::temp_dir().join(format!(
+            "nextgsim-echo-recovery-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&seed, "41").expect("seed the counter storage");
+        task.restart_counter = RestartCounter::load_and_advance(&seed).expect("load");
+        let _ = std::fs::remove_file(&seed);
+        assert_eq!(
+            task.restart_counter.value(),
+            42,
+            "precondition: the counter must differ from the 0 the old code hardcoded"
+        );
+
+        let request = GtpHeader::echo_request(0).with_sequence_number(99);
+        task.handle_udp_receive(&request.encode(), upf_addr).await;
+
+        let mut buf = [0u8; 256];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), upf.recv_from(&mut buf))
+                .await
+                .expect("an Echo Response must be sent")
+                .expect("recv");
+        let decoded = GtpHeader::decode(&buf[..len]).expect("decode");
+        assert_eq!(decoded.message_type, GtpMessageType::EchoResponse);
+        assert_eq!(
+            decoded.sequence_number,
+            Some(99),
+            "the request's sequence is echoed"
+        );
+        assert_eq!(
+            decoded.recovery_restart_counter(),
+            Some(task.restart_counter.value()),
+            "the Recovery IE is mandatory and must carry the real counter"
+        );
+    }
+
+    /// Criterion 6: with `gtpu_echo_period_secs` at its default of 0 the prober is off,
+    /// so a supervision period sends nothing even when sessions exist.
+    #[tokio::test]
+    async fn path_supervision_is_off_by_default() {
+        assert_eq!(
+            test_config().gtpu_echo_period_secs,
+            0,
+            "the shipped default must leave the datapath unchanged"
+        );
+
+        let (mut task, upf, upf_addr) = task_with_sockets().await;
+        live_session_to(&mut task, upf_addr);
+
+        // The period function itself is what the disabled interval never calls; calling
+        // it directly proves the prober WOULD probe, so the default's silence is a
+        // property of the switch rather than of an unimplemented sender.
+        task.run_echo_supervision_period().await;
+        let mut buf = [0u8; 256];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), upf.recv_from(&mut buf))
+                .await
+                .expect("the prober must send when it runs")
+                .expect("recv");
+        let decoded = GtpHeader::decode(&buf[..len]).expect("decode");
+        assert_eq!(decoded.message_type, GtpMessageType::EchoRequest);
+        assert_eq!(
+            decoded.teid, 0,
+            "TS 29.281 §5.1: Echo Request TEID all zeros"
+        );
+        assert!(decoded.sequence_number.is_some(), "the S flag must be set");
+    }
+
+    /// Criterion 5, the end-to-end half: a non-responding peer is declared down after
+    /// the configured number of periods, while a responding one stays alive.
+    #[tokio::test]
+    async fn a_silent_peer_is_declared_down_and_a_responding_one_is_not() {
+        let (mut task, upf, upf_addr) = task_with_sockets().await;
+        live_session_to(&mut task, upf_addr);
+        let misses = test_config().gtpu_echo_max_misses;
+        assert!(misses >= 2, "the default threshold must be worth testing");
+
+        let mut buf = [0u8; 256];
+        for _ in 0..misses {
+            task.run_echo_supervision_period().await;
+            // Drain the request without answering it: this is the silent peer.
+            tokio::time::timeout(std::time::Duration::from_secs(5), upf.recv_from(&mut buf))
+                .await
+                .expect("a request per period")
+                .expect("recv");
+        }
+        // The transition happens when the NEXT period closes on the last unanswered
+        // request.
+        task.run_echo_supervision_period().await;
+        assert!(
+            !task.path_supervisor.is_alive(&upf_addr),
+            "a peer that answered none of {misses} requests must be declared down"
+        );
+
+        // Now answer, and the path recovers.
+        let response = GtpHeader::echo_response(0).with_recovery(3);
+        task.handle_udp_receive(&response.encode(), upf_addr).await;
+        assert!(
+            task.path_supervisor.is_alive(&upf_addr),
+            "an answer must bring the path back"
+        );
     }
 }
