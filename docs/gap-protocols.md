@@ -100,7 +100,7 @@ Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) ar
 | RRC Release | `rrc_release.rs` | Complete |
 | RRC Reconfiguration | `rrc_reconfiguration.rs` | Complete (with NAS container) |
 | Security Mode | `security_mode.rs` | Complete (Command/Complete) |
-| System Information | `system_information.rs` | Complete (MIB/SIB1) |
+| System Information | `system_information.rs` | Complete (MIB/SIB1); broadcast by the gNB on BCCH and decoded by the UE |
 | Information Transfer | `information_transfer.rs` | Complete (DL/UL) |
 | Paging (PCCH) | `paging.rs` | Complete (PCCH-Message/Paging, 5G-S-TMSI and full I-RNTI records); broadcast by the gNB and matched by the UE end to end |
 | UPER Codec | `codec.rs` | Complete (ASN.1 UPER encode/decode) |
@@ -110,6 +110,7 @@ Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) ar
 | Gap | Details |
 |-----|---------|
 | Measurement Report | `procedures/measurement_report.rs` codec now exists in this crate, but the gNB/UE tasks still emit/parse a simplified byte format (not yet wired to the codec) |
+| Residual hand-rolled RRC PDUs | `RRCReestablishment`, `RRCResume`, the handover command and the measurement report are still emitted/parsed as bespoke byte formats rather than UPER (documented in-source); tracked separately from the SI broadcast |
 | Paging occasion (PF/PO) | Paging is broadcast immediately instead of at the UE's paging occasion. TS 38.304 §7.1 derives the PF/PO from the UE identity and the DRX cycle in radio frames, and the simulator maintains no SFN, so there is no frame clock to schedule against |
 | RRC Reestablishment | Now implemented: `procedures/rrc_reestablishment.rs` (~422 lines) |
 | RRC Resume | Now implemented: `procedures/rrc_resume.rs` (~642 lines) + UE-side `nextgsim-ue/src/rrc/resume.rs` (TS 38.331 5.3.13, T319) |

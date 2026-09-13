@@ -1,6 +1,9 @@
 //! RRC Task Implementation
 
+use std::time::Duration;
+
 use tokio::sync::mpsc;
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
@@ -29,11 +32,17 @@ use nextgsim_rrc::procedures::ue_capability::{
 /// UECapabilityEnquiry (DL) / UECapabilityInformation (UL).
 const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
 
+/// Period the system-information timer is parked at when the broadcast is
+/// disabled (`si_broadcast_period_ms == 0`). An hour: long enough never to matter,
+/// finite so the select! arm stays well-formed.
+const SI_PARKED_PERIOD_MS: u64 = 3_600_000;
+
 /// Octets per serialised TAI in an `RrcMessage::Paging` TAI list: a 3-octet
 /// PLMN identity followed by a 3-octet TAC (TS 38.413 §9.3.3.11).
 const TAI_OCTETS: usize = 6;
 
 use super::connection::RrcConnectionManager;
+use super::system_info::{encode_cell_mib, encode_cell_sib1};
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
 use super::ue_context::RrcUeContextManager;
 
@@ -936,6 +945,32 @@ impl RrcTask {
         }
     }
 
+    /// Broadcasts the cell's system information on BCCH (TS 38.331 §5.2.1): the
+    /// MIB on BCCH-BCH every call, SIB1 on BCCH-DL-SCH when `with_sib1`.
+    ///
+    /// Before this the MIB and SIB1 encoders existed with no caller anywhere, so
+    /// a UE never saw the cell's real PLMN, TAC or identity — it assumed them
+    /// (`provide_simulated_system_info` on the UE side).
+    async fn broadcast_system_information(&mut self, with_sib1: bool) {
+        match encode_cell_mib() {
+            Ok(mib) => {
+                self.broadcast_rrc_message(RrcChannel::BcchBch, OctetString::from_slice(&mib))
+                    .await;
+            }
+            Err(e) => error!("Failed to encode MIB: {e}"),
+        }
+        if !with_sib1 {
+            return;
+        }
+        match encode_cell_sib1(&self.task_base.config) {
+            Ok(sib1) => {
+                self.broadcast_rrc_message(RrcChannel::BcchDlSch, OctetString::from_slice(&sib1))
+                    .await;
+            }
+            Err(e) => error!("Failed to encode SIB1: {e}"),
+        }
+    }
+
     /// Broadcasts an RRC PDU on a downlink common channel (PCCH paging).
     ///
     /// `pdu_id` is 0: a broadcast has no addressee to acknowledge it, and a
@@ -1071,8 +1106,30 @@ impl Task for RrcTask {
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
         info!("RRC task started");
 
+        // System information broadcast (TS 38.331 §5.2.1): the MIB every period,
+        // SIB1 every second period — the spec's default 80 ms / 160 ms cadence.
+        // A configured period of 0 disables it, and the interval below is then a
+        // parked timer whose arm returns immediately.
+        let si_period_ms = self.task_base.config.si_broadcast_period_ms;
+        let mut si_timer = interval(Duration::from_millis(if si_period_ms == 0 {
+            SI_PARKED_PERIOD_MS
+        } else {
+            si_period_ms
+        }));
+        // `interval` fires its first tick immediately; broadcasting before any UE
+        // has been discovered has nothing to reach, and consuming it keeps the
+        // cadence at multiples of the period.
+        si_timer.tick().await;
+        let mut si_ticks: u64 = 0;
+
         loop {
             tokio::select! {
+                _ = si_timer.tick() => {
+                    if si_period_ms > 0 {
+                        si_ticks = si_ticks.wrapping_add(1);
+                        self.broadcast_system_information(si_ticks % 2 == 1).await;
+                    }
+                }
                 Some(msg) = rx.recv() => {
                     match msg {
                         TaskMessage::Message(rrc_msg) => match rrc_msg {
@@ -1554,6 +1611,62 @@ mod tests {
             &[0x04, 0x00, 0x00, 0x7E, 0x00, 0x42][..],
             "C5-off: legacy bespoke DL framing preserved for the matched-sim UE"
         );
+    }
+
+    // ========================================================================
+    // System information broadcast (#21, TS 38.331 §5.2.1)
+    // ========================================================================
+
+    /// The MIB goes out on BCCH-BCH on every period and decodes back to this
+    /// cell's values.
+    #[test]
+    fn the_mib_is_broadcast_on_bcch_bch() {
+        use nextgsim_rrc::procedures::system_information::decode_mib;
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.broadcast_system_information(false).await;
+        });
+
+        let (channel, _, pdu) = try_take_broadcast(&mut rls_rx).expect("a MIB broadcast");
+        assert_eq!(channel, RrcChannel::BcchBch);
+        decode_mib(pdu.data()).expect("the broadcast MIB must decode");
+        assert!(
+            try_take_broadcast(&mut rls_rx).is_none(),
+            "SIB1 is only sent on every second period"
+        );
+    }
+
+    /// SIB1 goes out on BCCH-DL-SCH and carries the configured PLMN, TAC and NCI —
+    /// the values a UE would otherwise have to assume.
+    #[test]
+    fn sib1_is_broadcast_on_bcch_dl_sch_with_this_cells_identity() {
+        use nextgsim_rrc::procedures::system_information::decode_sib1;
+
+        let config = test_config();
+        let (nci, tac) = (config.nci, config.tac);
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.broadcast_system_information(true).await;
+        });
+
+        let (mib_channel, _, _) = try_take_broadcast(&mut rls_rx).expect("the MIB comes first");
+        assert_eq!(mib_channel, RrcChannel::BcchBch);
+
+        let (channel, pdu_id, pdu) = try_take_broadcast(&mut rls_rx).expect("a SIB1 broadcast");
+        assert_eq!(channel, RrcChannel::BcchDlSch);
+        assert_eq!(pdu_id, 0, "broadcast PDUs are not acknowledged per UE");
+
+        let sib1 = decode_sib1(pdu.data()).expect("the broadcast SIB1 must decode");
+        let info = &sib1.plmn_identity_info_list[0];
+        assert_eq!(info.cell_identity, nci);
+        assert_eq!(info.tracking_area_code, Some(tac));
     }
 
     // ========================================================================

@@ -101,6 +101,14 @@ pub struct GnbConfig {
     /// declared down (TS 23.007 §20.3.1 N3-REQUESTS). Default 3.
     #[serde(default = "default_gtpu_echo_max_misses")]
     pub gtpu_echo_max_misses: u32,
+    /// Period in milliseconds at which the gNB broadcasts system information on
+    /// BCCH: the MIB every period and SIB1 every second period, matching the
+    /// TS 38.331 §5.2.1 default cadence (MIB 80 ms, SIB1 160 ms).
+    ///
+    /// **0 disables the broadcast**, which is the pre-#21 behaviour: no BCCH
+    /// traffic at all and UEs discovering cells from RLS heartbeats only.
+    #[serde(default = "default_si_broadcast_period_ms")]
+    pub si_broadcast_period_ms: u64,
     /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
     /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
     /// reporting, selective retransmission and the ARQ timers, at the cost of
@@ -229,6 +237,10 @@ pub enum SctpBackendKind {
     Kernel,
 }
 
+fn default_si_broadcast_period_ms() -> u64 {
+    80
+}
+
 fn default_gtp_port() -> u16 {
     2152
 }
@@ -272,6 +284,7 @@ impl Default for GnbConfig {
             gtpu_echo_max_misses: default_gtpu_echo_max_misses(),
             gtpu_restart_counter_path: None,
             rlc_am_psis: Vec::new(),
+            si_broadcast_period_ms: default_si_broadcast_period_ms(),
             pqc_config: PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,
@@ -1169,6 +1182,20 @@ pub struct UeConfig {
     /// parsing each other's PDUs with the wrong header shape.
     #[serde(default)]
     pub rlc_am_psis: Vec<u8>,
+    /// Require a decoded broadcast SIB1 before a cell is selectable.
+    ///
+    /// `false` (the default) keeps the pre-#21 behaviour: on detecting a cell the
+    /// UE fabricates its system information from its own configuration (the
+    /// PLMN it wants, TAC 1, the cell id as the NCI), so heartbeat-only
+    /// discovery still selects a cell. That is convenient and dishonest — it
+    /// cannot fail to match, because the UE invented the values it is checking.
+    ///
+    /// `true` makes the UE wait for the gNB's real BCCH broadcast and select on
+    /// what the cell actually advertises. Requires the gNB's
+    /// `si_broadcast_period_ms` to be non-zero, or no cell ever becomes
+    /// selectable.
+    #[serde(default)]
+    pub require_broadcast_sib1: bool,
     /// Keep the network-assigned UE radio capability ID (RACS, Rel-16
     /// TS 23.003 §29 / TS 24.501 §9.11.3.68) that a CONFIGURATION UPDATE
     /// COMMAND assigns.
@@ -1286,6 +1313,7 @@ impl Default for UeConfig {
             tun_name: None,
             ursp_evaluation: false,
             racs_store_assigned_id: false,
+            require_broadcast_sib1: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
@@ -1756,6 +1784,7 @@ configured_nssai:
             tun_name: Some("tun0".to_string()),
             ursp_evaluation: false,
             racs_store_assigned_id: false,
+            require_broadcast_sib1: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
@@ -2038,6 +2067,7 @@ configured_nssai:
             tun_name: None,
             ursp_evaluation: false,
             racs_store_assigned_id: false,
+            require_broadcast_sib1: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::new(

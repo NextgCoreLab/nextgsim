@@ -194,6 +194,15 @@ redcap: false
 # there is no RACS IE in the REGISTRATION REQUEST and no RRC or NGAP consumer.
 racs_store_assigned_id: false
 
+# Require a decoded broadcast SIB1 before a cell is selectable.
+# false (default): on detecting a cell the UE fabricates its system information
+# from its own configuration (the PLMN it wants, TAC 1, the cell id as the NCI),
+# so heartbeat-only discovery still works -- convenient, but the UE cannot fail
+# to match values it invented.
+# true: wait for the gNB's real BCCH broadcast and select on what the cell
+# actually advertises. Needs the gNB's si_broadcast_period_ms to be non-zero.
+require_broadcast_sib1: false
+
 # PDU sessions whose DRB uses RLC Acknowledged Mode (TS 38.322) instead of the
 # default Unacknowledged Mode: AM adds STATUS reporting, selective
 # retransmission and the ARQ timers, at the cost of feedback traffic.

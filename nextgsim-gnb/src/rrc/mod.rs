@@ -78,6 +78,7 @@ pub mod energy_saving;
 pub mod handover;
 pub mod ntn_gnb;
 pub mod redcap;
+pub mod system_info;
 pub mod task;
 pub mod transaction;
 pub mod ue_context;

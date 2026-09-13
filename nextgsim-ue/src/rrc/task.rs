@@ -55,6 +55,10 @@ use nextgsim_rrc::procedures::security_mode::{
     decode_security_mode_command, encode_security_mode_complete, SecurityModeCommandData,
     SecurityModeCompleteParams,
 };
+use nextgsim_rrc::procedures::system_information::{
+    decode_mib, decode_sib1, CellBarredStatus, IntraFreqReselection,
+    PlmnIdentity as SibPlmnIdentity,
+};
 use nextgsim_rrc::procedures::ue_capability::{
     build_minimal_nr_capability_container, decode_ue_capability_enquiry,
     encode_ue_capability_information, RatType, UeCapabilityInformationParams,
@@ -74,6 +78,33 @@ const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
 
 /// Default NR band advertised by the simulated UE (n78, 3.5 GHz TDD)
 const DEFAULT_NR_BAND: u16 = 78;
+
+/// `q-RxLevMin` assumed for a cell whose SIB1 omits `cellSelectionInfo`
+/// (the IE is `OPTIONAL — Cond Standalone` in TS 38.331 §6.3.2).
+const DEFAULT_Q_RX_LEV_MIN: i8 = -70;
+
+/// Converts a broadcast SIB1 PLMN identity into the cell-selection PLMN type.
+///
+/// `None` when the MCC is absent (TS 38.331 allows it to be omitted, meaning
+/// "same as the previous entry" — which this UE cannot resolve from a single
+/// entry) or the digit count is not one a PLMN can have.
+fn broadcast_plmn(identity: &SibPlmnIdentity) -> Option<CellPlmn> {
+    let mcc_digits = identity.mcc.as_ref()?;
+    let mcc =
+        u16::from(mcc_digits[0]) * 100 + u16::from(mcc_digits[1]) * 10 + u16::from(mcc_digits[2]);
+    let mnc = match identity.mnc.len() {
+        2 => u16::from(identity.mnc[0]) * 10 + u16::from(identity.mnc[1]),
+        3 => {
+            u16::from(identity.mnc[0]) * 100
+                + u16::from(identity.mnc[1]) * 10
+                + u16::from(identity.mnc[2])
+        }
+        _ => return None,
+    };
+    // A two-digit MNC is NOT a three-digit one with a leading zero: 001-01 and
+    // 001-001 are different networks, so the digit count is carried through.
+    Some(CellPlmn::new(mcc, mnc, identity.mnc.len() == 3))
+}
 
 /// UAC barring configuration per 3GPP TS 38.331
 /// Represents the uac-BarringInfoSetList from SIB1
@@ -178,6 +209,9 @@ pub struct RrcTask {
     /// RRCSetup must arrive after an RRCSetupRequest. `Some` while establishment
     /// is in flight; cleared on RRCSetup reception or on expiry.
     t300_deadline: Option<tokio::time::Instant>,
+    /// Cells whose system information came from a real BCCH broadcast, so the
+    /// simulated fallback must not overwrite it with the UE's own assumptions.
+    cells_with_broadcast_si: std::collections::HashSet<i32>,
     /// The UE's own 5G-S-TMSI, handed down by the NAS plane once a 5G-GUTI is
     /// assigned (`RrcMessage::PagingIdentity`). PCCH `PagingRecord`s are matched
     /// against it (TS 38.331 §5.3.2.3). `None` until the UE has a GUTI, and no
@@ -218,6 +252,7 @@ impl RrcTask {
             pending_kgnb: None,
             srb1_config: None,
             t300_deadline: None,
+            cells_with_broadcast_si: std::collections::HashSet::new(),
             paging_s_tmsi: None,
         }
     }
@@ -569,8 +604,30 @@ impl RrcTask {
         }
     }
 
-    /// Provide simulated system information for a cell
+    /// Provide simulated system information for a cell.
+    ///
+    /// A stand-in for the real broadcast: it invents the cell's PLMN (this UE's
+    /// own HPLMN), TAC and NCI, so the cell cannot fail to look suitable — the UE
+    /// is checking values it made up. Kept because heartbeat-only discovery has
+    /// nothing else to go on, and skipped in two cases:
+    ///
+    /// - the cell has broadcast real system information (#21), which must not be
+    ///   overwritten by an assumption;
+    /// - `require_broadcast_sib1` is configured, in which case the UE waits for
+    ///   the real broadcast instead and an un-broadcasting cell never becomes
+    ///   selectable.
     fn provide_simulated_system_info(&mut self, cell_id: i32) {
+        if self.cells_with_broadcast_si.contains(&cell_id) {
+            debug!("Cell {cell_id} broadcasts its own system info; not simulating it");
+            return;
+        }
+        if self.task_base.config.require_broadcast_sib1 {
+            debug!(
+                "Cell {cell_id} has no broadcast SIB1 yet and require_broadcast_sib1 is set: \
+                 waiting for the real broadcast"
+            );
+            return;
+        }
         // Get HPLMN from config to use for the cell
         let hplmn = self.task_base.config.hplmn;
 
@@ -643,10 +700,90 @@ impl RrcTask {
             RrcChannel::Pcch => {
                 self.handle_pcch_message(cell_id, &pdu).await;
             }
+            RrcChannel::BcchBch => self.handle_broadcast_mib(cell_id, &pdu),
+            RrcChannel::BcchDlSch => self.handle_broadcast_sib1(cell_id, &pdu),
             _ => {
                 warn!("Unexpected downlink channel: {:?}", channel);
             }
         }
+    }
+
+    /// Handles a broadcast MIB on BCCH-BCH (TS 38.331 §5.2.1).
+    ///
+    /// The decoded `cellBarred` and `intraFreqReselection` replace the values the
+    /// UE previously assumed for the cell.
+    fn handle_broadcast_mib(&mut self, cell_id: i32, pdu: &OctetString) {
+        let mib = match decode_mib(pdu.data()) {
+            Ok(mib) => mib,
+            Err(e) => {
+                warn!("Failed to decode broadcast MIB from cell {cell_id}: {e}");
+                return;
+            }
+        };
+        let barred = mib.cell_barred == CellBarredStatus::Barred;
+        debug!(
+            "MIB from cell {cell_id}: barred={barred}, sfn={}",
+            mib.system_frame_number
+        );
+        self.cells_with_broadcast_si.insert(cell_id);
+        self.cell_selector.update_mib(
+            cell_id,
+            MibInfo {
+                has_mib: true,
+                is_barred: barred,
+                is_intra_freq_reselect_allowed: mib.intra_freq_reselection
+                    == IntraFreqReselection::Allowed,
+            },
+        );
+    }
+
+    /// Handles a broadcast SIB1 on BCCH-DL-SCH (TS 38.331 §6.3.2).
+    ///
+    /// This is where the UE learns what the cell actually is: its PLMN, TAC and
+    /// NR Cell Identity, rather than the values `provide_simulated_system_info`
+    /// invents from the UE's own configuration.
+    fn handle_broadcast_sib1(&mut self, cell_id: i32, pdu: &OctetString) {
+        let sib1 = match decode_sib1(pdu.data()) {
+            Ok(sib1) => sib1,
+            Err(e) => {
+                warn!("Failed to decode broadcast SIB1 from cell {cell_id}: {e}");
+                return;
+            }
+        };
+        let Some(info) = sib1.plmn_identity_info_list.first() else {
+            warn!("Broadcast SIB1 from cell {cell_id} carries no PLMN identity info");
+            return;
+        };
+        let Some(plmn) = info.plmn_identity_list.first().and_then(broadcast_plmn) else {
+            warn!("Broadcast SIB1 from cell {cell_id} carries no usable PLMN");
+            return;
+        };
+
+        let q_rx_lev_min = sib1
+            .cell_selection_info
+            .as_ref()
+            .map_or(DEFAULT_Q_RX_LEV_MIN, |info| info.q_rx_lev_min);
+        info!(
+            "SIB1 from cell {cell_id}: plmn={}-{}, tac={:?}, nci={:#x}",
+            plmn.mcc, plmn.mnc, info.tracking_area_code, info.cell_identity
+        );
+        self.cells_with_broadcast_si.insert(cell_id);
+        self.cell_selector.update_sib1(
+            cell_id,
+            Sib1Info {
+                has_sib1: true,
+                is_reserved: false,
+                nci: info.cell_identity as i64,
+                tac: info.tracking_area_code.unwrap_or(0),
+                plmn,
+                q_rx_lev_min,
+                q_rx_lev_min_offset: None,
+                q_qual_min: None,
+                // SIB1 npn-IdentityInfoList (Rel-16 SNPN) is not in the Rel-15
+                // schema this tree compiles, so a broadcast cell is public here.
+                nid: None,
+            },
+        );
     }
 
     /// Handles a PCCH `Paging` message (TS 38.331 §5.3.2.3).
@@ -2315,6 +2452,284 @@ mod tests {
         assert!(task.pending_kgnb.is_none());
         task.set_pending_kgnb(TEST_KGNB);
         assert_eq!(task.pending_kgnb, Some(TEST_KGNB));
+    }
+
+    // ========================================================================
+    // Broadcast system information (#21, TS 38.331 §5.2.1)
+    // ========================================================================
+
+    /// The gNB's own encoders build the fixtures, so the test exercises the pair
+    /// the two sides actually use rather than a hand-rolled PDU.
+    fn broadcast_si(nci: u64, tac: u32, mcc: u16, mnc: u16, long_mnc: bool) -> (Vec<u8>, Vec<u8>) {
+        use nextgsim_rrc::procedures::system_information::{
+            encode_mib, encode_sib1, CellBarredStatus, CellSelectionInfo, DmrsTypeAPosition,
+            IntraFreqReselection, MibParams, PdcchConfigSib1Params, PlmnIdentityInfo, Sib1Params,
+            SubCarrierSpacingCommon,
+        };
+
+        let mib = encode_mib(&MibParams {
+            system_frame_number: 0,
+            sub_carrier_spacing_common: SubCarrierSpacingCommon::Scs30Or120,
+            ssb_subcarrier_offset: 0,
+            dmrs_type_a_position: DmrsTypeAPosition::Pos2,
+            pdcch_config_sib1: PdcchConfigSib1Params {
+                coreset_zero: 0,
+                search_space_zero: 0,
+            },
+            cell_barred: CellBarredStatus::NotBarred,
+            intra_freq_reselection: IntraFreqReselection::Allowed,
+        })
+        .expect("MIB");
+
+        let mnc_digits = if long_mnc {
+            vec![
+                ((mnc / 100) % 10) as u8,
+                ((mnc / 10) % 10) as u8,
+                (mnc % 10) as u8,
+            ]
+        } else {
+            vec![((mnc / 10) % 10) as u8, (mnc % 10) as u8]
+        };
+        let sib1 = encode_sib1(&Sib1Params {
+            cell_selection_info: Some(CellSelectionInfo {
+                q_rx_lev_min: -70,
+                q_rx_lev_min_offset: None,
+                q_rx_lev_min_sul: None,
+                q_qual_min: None,
+                q_qual_min_offset: None,
+            }),
+            plmn_identity_info_list: vec![PlmnIdentityInfo {
+                plmn_identity_list: vec![SibPlmnIdentity {
+                    mcc: Some([
+                        ((mcc / 100) % 10) as u8,
+                        ((mcc / 10) % 10) as u8,
+                        (mcc % 10) as u8,
+                    ]),
+                    mnc: mnc_digits,
+                }],
+                tracking_area_code: Some(tac),
+                cell_identity: nci,
+            }],
+            ims_emergency_support: false,
+            ecall_over_ims_support: false,
+            ue_timers_and_constants: None,
+            intra_freq_reselection_redcap: false,
+        })
+        .expect("SIB1");
+
+        (mib, sib1)
+    }
+
+    /// A broadcast SIB1 replaces the UE's assumptions with what the cell actually
+    /// advertises: PLMN, TAC and NCI all come off the air.
+    #[test]
+    fn a_broadcast_sib1_supplies_the_cells_real_identity() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        let (mib, sib1) = broadcast_si(0xABCD, 42, 262, 2, false);
+
+        run_async(async {
+            // The cell is discovered from its RLS heartbeat first, which is also
+            // what installs the fabricated system info the broadcast must replace.
+            task.handle_signal_changed(7, -60).await;
+            task.handle_downlink_rrc(7, RrcChannel::BcchBch, OctetString::from_slice(&mib))
+                .await;
+            task.handle_downlink_rrc(7, RrcChannel::BcchDlSch, OctetString::from_slice(&sib1))
+                .await;
+        });
+
+        let cell = task
+            .cell_selector
+            .get_cell(7)
+            .expect("the cell must be known from its broadcast");
+        assert!(cell.mib.has_mib && !cell.mib.is_barred);
+        assert!(cell.sib1.has_sib1);
+        assert_eq!(cell.sib1.nci, 0xABCD, "the NCI the cell broadcast");
+        assert_eq!(cell.sib1.tac, 42, "the TAC the cell broadcast");
+        assert_eq!(
+            cell.sib1.plmn,
+            CellPlmn::new(262, 2, false),
+            "a PLMN this UE did NOT configure -- it came off the air -- with the \
+             broadcast's TWO-digit MNC preserved (262-02 is not 262-002)"
+        );
+        assert_eq!(
+            cell.sib1.q_rx_lev_min, -70,
+            "q-RxLevMin from the broadcast cellSelectionInfo"
+        );
+    }
+
+    /// The broadcast MIB decides whether the cell is barred. The fabricated one
+    /// always says "not barred", so only a real broadcast can produce a barred
+    /// cell — which is why this asserts on `Barred` rather than on `has_mib`.
+    #[test]
+    fn a_broadcast_mib_can_bar_a_cell_the_fallback_called_usable() {
+        use nextgsim_rrc::procedures::system_information::{
+            encode_mib, CellBarredStatus, DmrsTypeAPosition, IntraFreqReselection, MibParams,
+            PdcchConfigSib1Params, SubCarrierSpacingCommon,
+        };
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        let barred = encode_mib(&MibParams {
+            system_frame_number: 0,
+            sub_carrier_spacing_common: SubCarrierSpacingCommon::Scs30Or120,
+            ssb_subcarrier_offset: 0,
+            dmrs_type_a_position: DmrsTypeAPosition::Pos2,
+            pdcch_config_sib1: PdcchConfigSib1Params {
+                coreset_zero: 0,
+                search_space_zero: 0,
+            },
+            cell_barred: CellBarredStatus::Barred,
+            intra_freq_reselection: IntraFreqReselection::NotAllowed,
+        })
+        .expect("MIB");
+
+        run_async(async {
+            task.handle_signal_changed(11, -60).await;
+            assert!(
+                !task.cell_selector.get_cell(11).unwrap().mib.is_barred,
+                "precondition: the fabricated MIB says the cell is usable"
+            );
+            task.handle_downlink_rrc(11, RrcChannel::BcchBch, OctetString::from_slice(&barred))
+                .await;
+        });
+
+        let mib = &task.cell_selector.get_cell(11).unwrap().mib;
+        assert!(mib.is_barred, "the broadcast MIB bars the cell");
+        assert!(
+            !mib.is_intra_freq_reselect_allowed,
+            "and forbids intra-frequency reselection"
+        );
+    }
+
+    /// A SIB1 whose PLMN identity omits the MCC cannot be resolved from a single
+    /// entry (TS 38.331 lets it mean "same as the previous entry"), so it must not
+    /// be stored as PLMN 000 — a UE would then treat the cell as a network that
+    /// does not exist.
+    #[test]
+    fn a_broadcast_plmn_without_an_mcc_is_not_stored() {
+        use nextgsim_rrc::procedures::system_information::{
+            encode_sib1, PlmnIdentityInfo, Sib1Params,
+        };
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        let sib1 = encode_sib1(&Sib1Params {
+            cell_selection_info: None,
+            plmn_identity_info_list: vec![PlmnIdentityInfo {
+                plmn_identity_list: vec![SibPlmnIdentity {
+                    mcc: None,
+                    mnc: vec![0, 1],
+                }],
+                tracking_area_code: Some(1),
+                cell_identity: 0x99,
+            }],
+            ims_emergency_support: false,
+            ecall_over_ims_support: false,
+            ue_timers_and_constants: None,
+            intra_freq_reselection_redcap: false,
+        })
+        .expect("SIB1");
+
+        run_async(async {
+            task.handle_signal_changed(12, -60).await;
+            task.handle_downlink_rrc(12, RrcChannel::BcchDlSch, OctetString::from_slice(&sib1))
+                .await;
+        });
+
+        assert!(
+            !task.cells_with_broadcast_si.contains(&12),
+            "an unusable PLMN must not count as system information"
+        );
+        assert_ne!(
+            task.cell_selector.get_cell(12).unwrap().sib1.nci,
+            0x99,
+            "and its cell identity must not be stored either"
+        );
+    }
+
+    /// Once a cell has broadcast its system information, the simulated fallback
+    /// must not overwrite it with the UE's own assumptions.
+    #[test]
+    fn the_simulated_fallback_does_not_overwrite_a_broadcast() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        let (_, sib1) = broadcast_si(0x1234, 9, 262, 2, false);
+
+        run_async(async {
+            task.handle_signal_changed(3, -60).await;
+            task.handle_downlink_rrc(3, RrcChannel::BcchDlSch, OctetString::from_slice(&sib1))
+                .await;
+        });
+        task.provide_simulated_system_info(3);
+
+        let cell = task.cell_selector.get_cell(3).expect("known cell");
+        assert_eq!(
+            cell.sib1.nci, 0x1234,
+            "still the broadcast NCI, not the cell id"
+        );
+        assert_eq!(
+            cell.sib1.tac, 9,
+            "still the broadcast TAC, not the default 1"
+        );
+    }
+
+    /// With `require_broadcast_sib1` set, a cell that broadcasts nothing never
+    /// gets fabricated system information, so it cannot be selected.
+    #[test]
+    fn requiring_a_broadcast_sib1_suppresses_the_simulated_fallback() {
+        let config = UeConfig {
+            require_broadcast_sib1: true,
+            ..test_config()
+        };
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async { task.handle_signal_changed(5, -60).await });
+
+        let cell = task
+            .cell_selector
+            .get_cell(5)
+            .expect("the cell is still detected from its heartbeat");
+        assert!(
+            !cell.sib1.has_sib1,
+            "no broadcast, no fabricated SIB1, so the cell is not selectable"
+        );
+    }
+
+    /// Default configuration keeps the pre-#21 behaviour: the fallback fabricates
+    /// system information so heartbeat-only discovery still selects a cell.
+    #[test]
+    fn by_default_the_simulated_fallback_still_applies() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async { task.handle_signal_changed(5, -60).await });
+
+        let cell = task.cell_selector.get_cell(5).expect("detected cell");
+        assert!(cell.sib1.has_sib1);
+        assert_eq!(cell.sib1.nci, 5, "the fabricated NCI is the cell id");
+    }
+
+    #[test]
+    fn an_undecodable_broadcast_is_dropped_without_marking_the_cell() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_signal_changed(4, -60).await;
+            task.handle_downlink_rrc(
+                4,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&[0xFF, 0xFF, 0xFF]),
+            )
+            .await;
+        });
+
+        assert!(
+            !task.cells_with_broadcast_si.contains(&4),
+            "garbage must not count as a broadcast"
+        );
     }
 
     // ========================================================================
