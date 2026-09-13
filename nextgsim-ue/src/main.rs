@@ -511,6 +511,13 @@ impl UeApp {
         // accepts the spec-conformant PDU Session Establishment Accept wire
         // format (TS 24.501 Table 8.3.2.1.1); there is no legacy compat path.
         let mut sm_orch = SmOrchestrator::new();
+        // URSP evaluation (TS 24.526 §5.2, #47): install the configured rules and
+        // the switch. Inert unless `ursp_evaluation` is set, in which case a
+        // matching rule's route selection descriptor overrides the static session
+        // parameters below.
+        sm_orch.set_ursp_policy(nextgsim_ue::nas::sm::UrspPolicy::from_config(
+            &task_base.config,
+        ));
         let sm_session_params = SmSessionParams::from_config(&task_base.config);
 
         // MINT secondary-subscription driver (Rel-18, TS 23.761). Inert unless
@@ -1732,9 +1739,17 @@ async fn handle_unmanaged_mm_message(
                                 let mut nas_pdu = Vec::new();
                                 ul.encode(&mut nas_pdu);
                                 let nas_pdu = orch.protect_if_active(nas_pdu);
+                                // TS 24.526 §5.2 (#47): the rules the PCF just
+                                // delivered become the URSP the SM orchestrator
+                                // evaluates. Installed on every command, including
+                                // a deletion, so a withdrawn section stops
+                                // steering rather than lingering.
+                                sm_orch.set_delivered_ursp_rules(orch.all_ursp_rules());
                                 info!(
-                                    "Sending UE policy delivery reply ({} sections stored), len={}",
+                                    "Sending UE policy delivery reply ({} sections stored, {} URSP \
+                                     rule(s) installed), len={}",
                                     orch.ue_policy_section_count(),
+                                    sm_orch.ursp_rule_count(),
                                     nas_pdu.len()
                                 );
                                 *pdu_counter += 1;

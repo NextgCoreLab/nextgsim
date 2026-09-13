@@ -1132,6 +1132,20 @@ pub struct UeConfig {
     pub configured_nssai: NetworkSlice,
     /// TUN interface name (optional)
     pub tun_name: Option<String>,
+    /// Whether URSP rules are EVALUATED to steer PDU session parameters
+    /// (TS 24.526 §5.2), rather than only decoded and stored.
+    ///
+    /// `false` (the default) keeps session establishment byte-for-byte as before:
+    /// DNN, S-NSSAI, SSC mode and PDU session type come from `sessions` alone.
+    /// With it on, a matching URSP rule's route selection descriptor overrides
+    /// those, which is a behaviour change for any deployment that has both
+    /// `sessions` and `ursp_rules` configured -- hence off by default.
+    ///
+    /// A RUNTIME switch and not a cargo feature, deliberately: CI runs
+    /// `cargo test --workspace` with default features, so a feature-gated engine
+    /// would ship without ever being compiled by the gate meant to cover it.
+    #[serde(default)]
+    pub ursp_evaluation: bool,
     /// Path to the file holding the 5GMM parameters TS 24.501 Annex C.1 wants
     /// kept in non-volatile memory: the 5G-GUTI, last visited registered TAI,
     /// 5GS update status and native 5G NAS security context.
@@ -1230,6 +1244,7 @@ impl Default for UeConfig {
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
+            ursp_evaluation: false,
             state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
@@ -1697,6 +1712,7 @@ configured_nssai:
             sessions: vec![SessionConfig::default()],
             configured_nssai: NetworkSlice::new(),
             tun_name: Some("tun0".to_string()),
+            ursp_evaluation: false,
             state_file: None,
             pqc_config: PqcConfig::default(),
             redcap: false,
@@ -1976,6 +1992,7 @@ configured_nssai:
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
+            ursp_evaluation: false,
             state_file: None,
             pqc_config: PqcConfig::new(
                 KemAlgorithm::Kyber1024,

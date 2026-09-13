@@ -288,6 +288,10 @@ pub struct SmOrchestrator {
     sessions: [Option<PduSession>; 16],
     /// Procedure transactions (PTI allocation + per-procedure timers)
     pt: ProcedureTransactionManager,
+    /// URSP rules and the evaluation switch (TS 24.526 §5.2, #47). Inert until
+    /// `ursp_evaluation` is set, in which case a matching rule's route selection
+    /// descriptor overrides the static session parameters.
+    ursp: super::ursp::UrspPolicy,
     /// Pending UL PDUs by PTI for retransmission
     pending: HashMap<u8, PendingProcedure>,
     /// T3396-class back-off timers per [S-NSSAI, DNN]
@@ -313,6 +317,7 @@ impl SmOrchestrator {
         Self {
             sessions: Default::default(),
             pt: ProcedureTransactionManager::new(),
+            ursp: super::ursp::UrspPolicy::default(),
             pending: HashMap::new(),
             backoff: HashMap::new(),
             type_override: HashMap::new(),
@@ -431,16 +436,114 @@ impl SmOrchestrator {
     pub fn establish_default_sessions(&mut self, params: &[SmSessionParams]) -> Vec<SmOutput> {
         let mut outs = Vec::new();
         for p in params {
+            // TS 24.526 §5.2 / TS 23.503 §6.6.2.3: resolve the parameters through
+            // URSP before deciding whether a session already serves them, so the
+            // reuse check compares against what would actually be established.
+            // Checking first and resolving second would reuse a session on the
+            // wrong slice. A no-op while `ursp_evaluation` is off.
+            let resolved = self.resolve_session_params(&self.application_for(p), p);
             let already = self
                 .sessions
                 .iter()
                 .flatten()
-                .any(|s| s.params == *p && s.state != PsState::Inactive);
+                .any(|s| s.params == resolved && s.state != PsState::Inactive);
             if !already {
-                outs.extend(self.start_establishment(p.clone()));
+                outs.extend(self.start_establishment(resolved));
             }
         }
         outs
+    }
+
+    // ========================================================================
+    // URSP evaluation (TS 24.526 §5.2) — #47
+    // ========================================================================
+
+    /// Install the URSP policy (configured rules + the evaluation switch).
+    pub fn set_ursp_policy(&mut self, policy: super::ursp::UrspPolicy) {
+        self.ursp = policy;
+    }
+
+    /// Install the network-delivered URSP rules, replacing any previous set.
+    pub fn set_delivered_ursp_rules(
+        &mut self,
+        rules: Vec<nextgsim_nas::messages::mm::ue_policy::UrspRule>,
+    ) {
+        self.ursp.set_delivered_rules(rules);
+    }
+
+    /// Whether URSP evaluation is switched on (observability / test hook).
+    pub fn ursp_enabled(&self) -> bool {
+        self.ursp.is_enabled()
+    }
+
+    /// Number of URSP rules across both sources (observability / test hook).
+    pub fn ursp_rule_count(&self) -> usize {
+        self.ursp.rule_count()
+    }
+
+    /// Resolve session parameters for `app`, applying a matching URSP rule's
+    /// route selection descriptor over `base`.
+    ///
+    /// Returns `base` unchanged when evaluation is off or nothing matches, so
+    /// every existing caller is byte-for-byte unaffected until the switch is set.
+    pub fn resolve_session_params(
+        &self,
+        app: &super::ursp::ApplicationDescriptor,
+        base: &SmSessionParams,
+    ) -> SmSessionParams {
+        self.ursp.resolve(app, base)
+    }
+
+    /// The application information a configured session offers for matching.
+    ///
+    /// A configured session names a DNN and nothing else -- there is no detected
+    /// application behind it -- so only DNN-keyed and match-all rules can steer
+    /// it. Rules keyed on an OS App Id or a flow 5-tuple need a real detection;
+    /// [`Self::start_establishment_for_app`] is the entry point for those.
+    fn application_for(&self, params: &SmSessionParams) -> super::ursp::ApplicationDescriptor {
+        super::ursp::ApplicationDescriptor {
+            dnn: params.dnn.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Establish (or reuse) a PDU session for a detected application, with the
+    /// parameters URSP selects (TS 23.503 §6.6.2.3).
+    ///
+    /// Returns `(psi, outputs)`. When an active session already carries the
+    /// resolved parameters its PSI is returned with no outputs — §6.6.2.3's
+    /// "can be associated with an existing PDU session" — so an application does
+    /// not establish a duplicate session for a route it already has.
+    pub fn start_establishment_for_app(
+        &mut self,
+        app: &super::ursp::ApplicationDescriptor,
+        base: &SmSessionParams,
+    ) -> (Option<u8>, Vec<SmOutput>) {
+        let resolved = self.resolve_session_params(app, base);
+        if let Some(psi) = self
+            .sessions
+            .iter()
+            .flatten()
+            .find(|s| s.params == resolved && s.state != PsState::Inactive)
+            .map(|s| s.psi)
+        {
+            debug!("URSP: application bound to existing PDU session {psi}");
+            return (Some(psi), Vec::new());
+        }
+        // `start_establishment` allocates the PSI internally and returns only
+        // outputs, so the new session has to be identified by DIFFERENCE. Finding
+        // "the session that is ActivePending" is wrong: an earlier establishment
+        // that has not been accepted yet is also ActivePending, so a second
+        // application would be told it got the first one's PSI.
+        let occupied: Vec<u8> = self.sessions.iter().flatten().map(|s| s.psi).collect();
+        let outs = self.start_establishment(resolved);
+        let psi = self
+            .sessions
+            .iter()
+            .flatten()
+            .map(|s| s.psi)
+            .find(|psi| !occupied.contains(psi));
+        (psi, outs)
     }
 
     /// Start a PDU session establishment procedure (TS 24.501 6.4.1.2).
@@ -2143,6 +2246,225 @@ mod tests {
         let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
         assert_eq!(inner[3], 0xD6);
         assert_eq!(inner[4], SmCause::MessageTypeNonExistent as u8);
+    }
+
+    // ========================================================================
+    // URSP-steered establishment (TS 24.526 §5.2, TS 23.503 §6.6.2.3) — #47
+    // ========================================================================
+
+    /// A UE config with one URSP rule steering everything to `dnn`/`sst`.
+    fn ursp_config(enabled: bool, descriptor: &str, dnn: &str, sst: u8) -> UeConfig {
+        use nextgsim_common::config::{RouteDescriptor, UrspRule as ConfigUrspRule};
+        use nextgsim_common::types::SNssai;
+        let mut config = UeConfig::default();
+        config.ursp_evaluation = enabled;
+        config.ursp_rules = vec![ConfigUrspRule {
+            precedence: 10,
+            traffic_descriptor: descriptor.to_string(),
+            route_descriptors: vec![RouteDescriptor {
+                s_nssai: Some(SNssai::new(sst)),
+                dnn: Some(dnn.to_string()),
+                session_type: None,
+                ssc_mode: None,
+            }],
+        }];
+        config
+    }
+
+    /// #47 criterion 2+5: with evaluation ON, a configured URSP rule steers the
+    /// established session's DNN and S-NSSAI — asserted on the UL NAS TRANSPORT
+    /// that goes out, not on the internal params.
+    ///
+    /// The DNN and S-NSSAI ride in the UL NAS Transport wrapper (TS 24.501
+    /// §5.4.5.2.2), so reading them off the encoded PDU is what proves the network
+    /// is actually asked for the steered route.
+    #[test]
+    fn an_enabled_ursp_rule_steers_the_established_session() {
+        let mut orch = new_orch();
+        orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&ursp_config(
+            true, "*", "ims", 3,
+        )));
+        assert!(orch.ursp_enabled());
+
+        let outs = orch.establish_default_sessions(&[test_params()]);
+        let (transport, _) = unwrap_ul(first_sent_pdu(&outs));
+        assert_eq!(
+            transport.dnn.as_deref(),
+            Some(encode_dnn_value("ims").as_slice()),
+            "the URSP route's DNN must be the one requested"
+        );
+        assert_eq!(
+            transport.s_nssai.as_deref(),
+            Some([3u8].as_slice()),
+            "the URSP route's S-NSSAI must be the one requested"
+        );
+
+        // And the stored session records the steered parameters, so a later reuse
+        // check compares against what was actually established.
+        let session = orch.session(1).expect("session on PSI 1");
+        assert_eq!(session.params.dnn.as_deref(), Some("ims"));
+        assert_eq!(session.params.s_nssai, Some(vec![3]));
+    }
+
+    /// #47: with evaluation OFF the same config establishes the STATIC session,
+    /// byte-for-byte as before.
+    ///
+    /// This is the default and the regression that matters: the switch being off
+    /// must be indistinguishable from the engine not existing.
+    #[test]
+    fn a_disabled_ursp_rule_leaves_the_static_session_alone() {
+        let mut orch = new_orch();
+        orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&ursp_config(
+            false, "*", "ims", 3,
+        )));
+        assert!(!orch.ursp_enabled());
+
+        let params = test_params();
+        let outs = orch.establish_default_sessions(&[params.clone()]);
+        let (transport, _) = unwrap_ul(first_sent_pdu(&outs));
+        assert_eq!(
+            transport.dnn.as_deref(),
+            params.dnn.as_deref().map(encode_dnn_value).as_deref(),
+            "the configured DNN, not the URSP route's"
+        );
+        assert_eq!(orch.session(1).unwrap().params, params);
+    }
+
+    /// #47: an application whose route already has a session REUSES it rather
+    /// than establishing a duplicate (TS 23.503 §6.6.2.3).
+    #[test]
+    fn an_application_reuses_a_session_that_already_carries_its_route() {
+        let mut orch = new_orch();
+        orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&ursp_config(
+            true, "*", "ims", 3,
+        )));
+        let base = test_params();
+
+        let (first_psi, outs) = orch.start_establishment_for_app(
+            &super::super::ursp::ApplicationDescriptor::for_dnn("internet"),
+            &base,
+        );
+        let first_psi = first_psi.expect("a session was established");
+        assert!(!outs.is_empty(), "the first application establishes one");
+
+        // Bring it fully ACTIVE, so the reuse path sees a real session.
+        let pti = unwrap_ul(first_sent_pdu(&outs)).1[2];
+        orch.handle_dl_nas_transport(&dl_with_container(
+            conformant_accept_bytes(first_psi, pti),
+            first_psi,
+        ));
+        assert_eq!(
+            orch.session(first_psi).map(|s| s.state),
+            Some(PsState::Active)
+        );
+
+        let (reused_psi, outs) = orch.start_establishment_for_app(
+            &super::super::ursp::ApplicationDescriptor::for_dnn("internet"),
+            &base,
+        );
+        assert_eq!(
+            reused_psi,
+            Some(first_psi),
+            "the same session must serve it"
+        );
+        assert!(
+            outs.is_empty(),
+            "reuse must send nothing, got {} output(s)",
+            outs.len()
+        );
+        assert_eq!(orch.active_sessions().len(), 1, "no duplicate session");
+    }
+
+    /// #47: a second application steered to a DIFFERENT route gets its OWN
+    /// session rather than being folded onto the first.
+    ///
+    /// Without this the reuse test above passes against an implementation that
+    /// reuses whatever session exists, which is exactly the defect URSP steering
+    /// is meant to prevent.
+    #[test]
+    fn a_differently_steered_application_gets_its_own_session() {
+        use nextgsim_common::config::{RouteDescriptor, UrspRule as ConfigUrspRule};
+        use nextgsim_common::types::SNssai;
+        let mut config = UeConfig::default();
+        config.ursp_evaluation = true;
+        config.ursp_rules = vec![
+            ConfigUrspRule {
+                precedence: 10,
+                traffic_descriptor: "dnn:internet".to_string(),
+                route_descriptors: vec![RouteDescriptor {
+                    s_nssai: Some(SNssai::new(1)),
+                    dnn: Some("internet".to_string()),
+                    session_type: None,
+                    ssc_mode: None,
+                }],
+            },
+            ConfigUrspRule {
+                precedence: 20,
+                traffic_descriptor: "dnn:ims".to_string(),
+                route_descriptors: vec![RouteDescriptor {
+                    s_nssai: Some(SNssai::new(2)),
+                    dnn: Some("ims".to_string()),
+                    session_type: None,
+                    ssc_mode: None,
+                }],
+            },
+        ];
+        let mut orch = new_orch();
+        orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&config));
+        let base = test_params();
+
+        let (first, _) = orch.start_establishment_for_app(
+            &super::super::ursp::ApplicationDescriptor::for_dnn("internet"),
+            &base,
+        );
+        let (second, outs) = orch.start_establishment_for_app(
+            &super::super::ursp::ApplicationDescriptor::for_dnn("ims"),
+            &base,
+        );
+        assert_ne!(first, second, "different routes need different sessions");
+        assert!(!outs.is_empty(), "the second route establishes its own");
+        assert_eq!(
+            orch.session(second.unwrap()).unwrap().params.s_nssai,
+            Some(vec![2]),
+            "the second session carries the second rule's slice"
+        );
+    }
+
+    /// #47 criterion 3: network-DELIVERED rules reach the evaluation source and
+    /// influence establishment.
+    #[test]
+    fn delivered_ursp_rules_influence_establishment() {
+        use nextgsim_nas::messages::mm::ue_policy::{
+            RouteSelectionDescriptor, RouteSelectionDescriptorComponent,
+            TrafficDescriptorComponent, UrspRule,
+        };
+        let mut orch = new_orch();
+        // The switch still governs delivered rules: a PCF cannot turn evaluation
+        // on for a UE whose operator has not.
+        let mut config = UeConfig::default();
+        config.ursp_evaluation = true;
+        orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&config));
+        orch.set_delivered_ursp_rules(vec![UrspRule {
+            precedence: 5,
+            traffic_descriptor: vec![TrafficDescriptorComponent::MatchAll],
+            route_selection_descriptors: vec![RouteSelectionDescriptor {
+                precedence: 1,
+                components: vec![
+                    RouteSelectionDescriptorComponent::Dnn("delivered".to_string()),
+                    RouteSelectionDescriptorComponent::SNssai { sst: 9, sd: None },
+                ],
+            }],
+            ureri: None,
+        }]);
+        assert_eq!(orch.ursp_rule_count(), 1);
+
+        let outs = orch.establish_default_sessions(&[test_params()]);
+        let (transport, _) = unwrap_ul(first_sent_pdu(&outs));
+        assert_eq!(
+            transport.dnn.as_deref(),
+            Some(encode_dnn_value("delivered").as_slice())
+        );
+        assert_eq!(transport.s_nssai.as_deref(), Some([9u8].as_slice()));
     }
 
     #[test]
