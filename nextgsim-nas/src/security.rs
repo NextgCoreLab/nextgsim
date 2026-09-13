@@ -666,6 +666,26 @@ impl NasSecurityContext {
         self.downlink_count = *validated_count;
     }
 
+    /// Set the uplink NAS COUNT outright.
+    ///
+    /// For RESTORING a stored context only (TS 24.501 Annex C.1): every other
+    /// caller must use [`Self::increment_uplink_count`], which is what keeps the
+    /// count monotonic. Reusing an uplink COUNT with the same key reuses the
+    /// keystream, so this must never be reachable from a protocol path.
+    pub fn set_uplink_count(&mut self, count: NasCount) {
+        self.uplink_count = count;
+    }
+
+    /// Set the downlink NAS COUNT outright.
+    ///
+    /// For RESTORING a stored context only (TS 24.501 Annex C.1). Distinct from
+    /// [`Self::update_downlink_count`] in intent rather than in effect: that one
+    /// records a count the replay gate has already accepted, this one installs
+    /// the floor the gate will compare against after a restart.
+    pub fn set_downlink_count(&mut self, count: NasCount) {
+        self.downlink_count = count;
+    }
+
     /// Whether an estimated downlink NAS COUNT is acceptable for processing.
     ///
     /// Per TS 24.501 4.4.3.1 (NAS COUNT monotonicity) and 4.4.4.2 (replay
