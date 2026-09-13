@@ -318,8 +318,16 @@ impl UeApp {
                         info!("TUN uplink data: PSI={}, len={}", psi, data.len());
                         // Trigger Service Request if UE is in IDLE state
                         // (NAS task will check actual state and only send if needed)
+                        //
+                        // The PSI travels with the trigger: it becomes the Uplink
+                        // data status bit the SERVICE REQUEST advertises
+                        // (TS 24.501 §5.6.1.2). Dropping it here, as before, meant
+                        // the request asked the network to reactivate a fixed PSI 13
+                        // that no session ever uses.
                         let _ = nas_tx_for_tun
-                            .send(NasMessage::InitiateServiceRequest)
+                            .send(NasMessage::InitiateServiceRequest {
+                                psi: u8::try_from(psi).ok(),
+                            })
                             .await;
                         // Forward uplink data to RLS for transmission to gNB
                         let _ = rls_tx_for_tun
@@ -802,12 +810,25 @@ impl UeApp {
                             debug!("Downlink data received: psi={}, len={}", psi, data.len());
                             let _ = tun_tx.send(TunMessage::WriteData { psi, data }).await;
                         }
-                        NasMessage::InitiateServiceRequest => {
+                        NasMessage::InitiateServiceRequest { psi } => {
                             // Data-triggered Service Request: UE has data to send while in IDLE
                             if orch.state().is_registered() && orch.state().is_idle() {
-                                info!("Initiating Service Request (data-triggered, IDLE -> CONNECTED)");
-                                let outs =
-                                    orch.start_service_request(ServiceType::Data, Some(0x2000));
+                                // TS 24.501 §5.6.1.2 / §9.11.3.44: the Uplink data
+                                // status IE names the session with pending uplink
+                                // data. Built from the PSI the TUN write arrived on,
+                                // not from the hardcoded 0x2000 (PSI 13) this used
+                                // to send -- sessions allocate from PSI 1, so that
+                                // constant never matched a real session and the
+                                // network reactivated the wrong one.
+                                let uplink_data_status = psi
+                                    .map(|psi| nextgsim_ue::nas::mm::uplink_data_status(&[psi]))
+                                    .unwrap_or(None);
+                                info!(
+                                    "Initiating Service Request (data-triggered, IDLE -> CONNECTED), \
+                                     uplink data status {uplink_data_status:?} for PSI {psi:?}"
+                                );
+                                let outs = orch
+                                    .start_service_request(ServiceType::Data, uplink_data_status);
                                 process_mm_outputs(
                                     outs,
                                     &mut orch,
@@ -1168,6 +1189,17 @@ async fn process_mm_outputs(
                     .send(RrcMessage::AsSecurityKey { kgnb })
                     .await;
             }
+            MmOutput::NetworkPduSessionStatus(status) => {
+                // TS 24.501 §5.5.1.3.4 / §5.6.1.4.2 a): the network's PDU session
+                // status IE decides which UE-active sessions must be released
+                // locally. The SM orchestrator owns the session state, so it
+                // computes the diff and returns a SessionReleased per casualty,
+                // which the normal SM output path turns into a TUN teardown.
+                let sm_outs = sm_orch.reconcile_pdu_session_status(status);
+                if !sm_outs.is_empty() {
+                    process_sm_outputs(sm_outs, orch, task_base, tun_tx, pdu_counter).await;
+                }
+            }
         }
     }
 }
@@ -1363,6 +1395,18 @@ async fn process_secondary_mm_outputs(
                 // SecurityModeCommand, so its KgNB is not plumbed to RRC.
                 tracing::debug!(
                     "MINT: secondary subscription {index} KgNB derived (not used for AS security)"
+                );
+            }
+            MmOutput::NetworkPduSessionStatus(status) => {
+                // A MINT secondary subscription's sessions live in its own
+                // SmOrchestrator, which this function does not hold -- it drives
+                // `mint_secondary`, whose sessions are reconciled by
+                // `process_secondary_sm_outputs`. Reconciling the PRIMARY
+                // orchestrator against a secondary's Accept would release the
+                // wrong UE's sessions, so this is recorded and not acted on.
+                tracing::debug!(
+                    "MINT: secondary subscription {index} PDU session status {status:#06x} \
+                     not reconciled (secondary session state is held separately)"
                 );
             }
         }

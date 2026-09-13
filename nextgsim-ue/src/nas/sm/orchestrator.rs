@@ -621,6 +621,48 @@ impl SmOrchestrator {
         vec![SmOutput::SendNasPdu(ul_pdu)]
     }
 
+    /// Reconcile UE session state against the network's PDU session status IE
+    /// (TS 24.501 §5.5.1.3.4 on REGISTRATION ACCEPT, §5.6.1.4.2 a) on SERVICE
+    /// ACCEPT): locally release every session that is active on the UE but
+    /// indicated as **inactive** by the network.
+    ///
+    /// `status` is the little-endian IE value, where bit *n* set means PSI *n*
+    /// is active in the network (TS 24.501 §9.11.2.2).
+    ///
+    /// Releases are LOCAL: no PDU SESSION RELEASE REQUEST is sent, because the
+    /// network has already released these sessions — that is what the IE is
+    /// telling us — so signalling a release for them would ask it to release a
+    /// session it does not have.
+    ///
+    /// Sessions in a *pending* state are reconciled too. A session the UE is
+    /// still establishing (`ActivePending`) that the network reports inactive is
+    /// one whose establishment the network has abandoned, and leaving it pending
+    /// would pin the PSI and its PTI until a timer the peer will never answer.
+    pub fn reconcile_pdu_session_status(&mut self, status: u16) -> Vec<SmOutput> {
+        let mut outs = Vec::new();
+        for psi in 1..=PSI_MAX {
+            let active_on_ue = self
+                .session(psi)
+                .is_some_and(|s| s.state != PsState::Inactive);
+            let active_in_network = status & (1u16 << psi) != 0;
+            if active_on_ue && !active_in_network {
+                warn!(
+                    "PDU session status IE marks PSI {psi} inactive while it is active on \
+                     the UE: releasing locally (TS 24.501 §5.6.1.4.2)"
+                );
+                self.clear_session(psi);
+                // Abort any in-flight procedure for this PSI so its PTI is
+                // returned and its timer stopped, rather than left retransmitting
+                // against a session that no longer exists.
+                for (pti, _) in self.pt.abort_by_psi(psi) {
+                    self.pending.remove(&pti);
+                }
+                outs.push(SmOutput::SessionReleased { psi });
+            }
+        }
+        outs
+    }
+
     /// Release all sessions locally (e.g. on deregistration).
     pub fn release_all_locally(&mut self) -> Vec<SmOutput> {
         let mut outs = Vec::new();
@@ -2110,6 +2152,73 @@ mod tests {
         assert_eq!(outs, vec![SmOutput::SessionReleased { psi }]);
         assert!(orch.session(psi).is_none());
         assert!(!orch.pt.has_pending());
+    }
+
+    /// #51: a session the network reports INACTIVE in the PDU session status IE
+    /// is released locally and its slot cleared (TS 24.501 §5.6.1.4.2 a).
+    ///
+    /// The bitmap deliberately has OTHER bits set (PSI 2 and 13): the release
+    /// must follow from this PSI's own bit being clear, not from the bitmap being
+    /// empty, which is what an `== 0` check would accept.
+    #[test]
+    fn a_session_the_network_reports_inactive_is_released_locally() {
+        let (mut orch, psi) = established();
+        assert!(orch.session(psi).is_some(), "precondition: session is up");
+        let elsewhere = (1u16 << 2) | (1u16 << 13);
+        assert_eq!(
+            elsewhere & (1u16 << psi),
+            0,
+            "the fixture must leave THIS psi's bit clear"
+        );
+
+        let outs = orch.reconcile_pdu_session_status(elsewhere);
+
+        assert_eq!(outs, vec![SmOutput::SessionReleased { psi }]);
+        assert!(
+            orch.session(psi).is_none(),
+            "the session slot must be cleared, not merely reported"
+        );
+        assert!(
+            !orch.pt.has_pending(),
+            "the released session's procedure transaction must be returned"
+        );
+    }
+
+    /// #51: a session the network reports ACTIVE survives reconciliation.
+    ///
+    /// Without this the previous test passes against a function that releases
+    /// unconditionally — which would black-hole every session on any Accept
+    /// carrying the IE.
+    #[test]
+    fn a_session_the_network_reports_active_survives() {
+        let (mut orch, psi) = established();
+        let outs = orch.reconcile_pdu_session_status(1u16 << psi);
+        assert!(outs.is_empty(), "nothing to release, got {outs:?}");
+        assert!(orch.session(psi).is_some());
+    }
+
+    /// #51: an establishment still in flight is reconciled too.
+    ///
+    /// A session in `ActivePending` that the network reports inactive is one whose
+    /// establishment the network abandoned. Leaving it pending would pin the PSI
+    /// and keep its T3580 retransmitting at a peer that has no such session.
+    #[test]
+    fn a_pending_establishment_the_network_does_not_know_is_released() {
+        let (mut orch, psi, _pti) = started_establishment();
+        assert_eq!(
+            orch.session(psi).map(|s| s.state),
+            Some(PsState::ActivePending)
+        );
+        assert!(orch.pt.has_pending(), "precondition: T3580 is running");
+
+        let outs = orch.reconcile_pdu_session_status(0);
+
+        assert_eq!(outs, vec![SmOutput::SessionReleased { psi }]);
+        assert!(orch.session(psi).is_none());
+        assert!(
+            !orch.pt.has_pending(),
+            "the aborted establishment must not leave a timer running"
+        );
     }
 
     // ========================================================================
