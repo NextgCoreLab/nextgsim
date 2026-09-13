@@ -109,6 +109,22 @@ pub struct GnbConfig {
     /// traffic at all and UEs discovering cells from RLS heartbeats only.
     #[serde(default = "default_si_broadcast_period_ms")]
     pub si_broadcast_period_ms: u64,
+    /// `physCellId` of a secondary cell to configure on each UE
+    /// (`sCellToAddModList`, TS 38.331 §5.3.5.5.9), sent once per UE after its
+    /// first RRCReconfiguration.
+    ///
+    /// **`None`, the default, adds no SCell**, which is the pre-#112 behaviour.
+    /// The only thing the UE does with an SCell is measure event A6 against it
+    /// (§5.5.4.7): carrier aggregation itself — per-SCell BWP, MAC/PHY
+    /// aggregation, `sCellState` activation, PUCCH SCell — is not modelled, so
+    /// this configures a measurement reference and not a second carrier. Point it
+    /// at the `physCellId` of another cell the UE can hear; pointing it at the
+    /// UE's own serving cell configures nothing, since no cell is its own SCell.
+    ///
+    /// A runtime switch rather than a cargo feature, for the reason already
+    /// recorded for `gtpu_echo_period_secs`: CI compiles default features only.
+    #[serde(default)]
+    pub scell_phys_cell_id: Option<u16>,
     /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
     /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
     /// reporting, selective retransmission and the ARQ timers, at the cost of
@@ -285,6 +301,7 @@ impl Default for GnbConfig {
             gtpu_restart_counter_path: None,
             rlc_am_psis: Vec::new(),
             si_broadcast_period_ms: default_si_broadcast_period_ms(),
+            scell_phys_cell_id: None,
             pqc_config: PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,

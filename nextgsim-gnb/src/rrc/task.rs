@@ -22,6 +22,7 @@ use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_complete, decode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
 };
+use nextgsim_rrc::procedures::scell_config::{encode_scell_config, ScellConfig};
 use nextgsim_rrc::procedures::ue_capability::{
     decode_ue_capability_information, encode_ue_capability_enquiry, parse_nr_capability_bands,
     RatType, UeCapabilityEnquiryParams, UeCapabilityInformationData,
@@ -31,6 +32,15 @@ use nextgsim_rrc::procedures::ue_capability::{
 /// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
 /// UECapabilityEnquiry (DL) / UECapabilityInformation (UL).
 const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
+
+/// Simplified DL-DCCH envelope code for an RRCReconfiguration carrying a
+/// secondary-cell configuration: `[0x0E][transaction id][UPER CellGroupConfig]`.
+/// The UE's matching constant is `nextgsim-ue/src/rrc/task.rs`.
+const RECONFIGURATION_WITH_SCELL: u8 = 0x0E;
+
+/// `sCellIndex` used for the one secondary cell this gNB can be configured with.
+/// `SCellIndex` is `INTEGER (1..31)` and 1 is its first value.
+const DEFAULT_SCELL_INDEX: u8 = 1;
 
 /// Period the system-information timer is parked at when the broadcast is
 /// disabled (`si_broadcast_period_ms == 0`). An hour: long enough never to matter,
@@ -63,6 +73,12 @@ pub struct RrcTask {
     connection_manager: RrcConnectionManager,
     pdu_id_counter: u32,
     ntn_config: Option<NtnRrcConfig>,
+    /// UEs that have already been sent the configured secondary cell
+    /// (`GnbConfig::scell_phys_cell_id`). `sCellToAddModList` is an add/modify
+    /// list, so resending is harmless, but a UE acknowledges each one and the
+    /// acknowledgement is what triggers the next reconfiguration — sending it
+    /// once per UE keeps that from becoming a loop.
+    scell_configured_ues: std::collections::HashSet<i32>,
 }
 
 impl RrcTask {
@@ -73,7 +89,48 @@ impl RrcTask {
             connection_manager: RrcConnectionManager::new(),
             pdu_id_counter: 0,
             ntn_config: None,
+            scell_configured_ues: std::collections::HashSet::new(),
         }
+    }
+
+    /// Send the configured secondary cell to a UE, once (TS 38.331 §5.3.5.5.9).
+    ///
+    /// No-op unless `GnbConfig::scell_phys_cell_id` is set. The envelope is the
+    /// simulator's hand-rolled DL-DCCH framing (issue #107); the container is a
+    /// real UPER `CellGroupConfig`, because `sCellToAddModList` is a Rel-15 IE.
+    async fn send_scell_configuration(&mut self, ue_id: i32) {
+        let Some(phys_cell_id) = self.task_base.config.scell_phys_cell_id else {
+            return;
+        };
+        if !self.scell_configured_ues.insert(ue_id) {
+            return;
+        }
+
+        let config = ScellConfig::add_one(DEFAULT_SCELL_INDEX, phys_cell_id);
+        let container = match encode_scell_config(&config) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(
+                    "Not sending SCell configuration to UE[{}]: {} (scell_phys_cell_id={})",
+                    ue_id, e, phys_cell_id
+                );
+                self.scell_configured_ues.remove(&ue_id);
+                return;
+            }
+        };
+
+        let transaction_id = self.connection_manager.next_tid();
+        let mut pdu = Vec::with_capacity(container.len() + 2);
+        pdu.push(RECONFIGURATION_WITH_SCELL);
+        pdu.push(transaction_id);
+        pdu.extend_from_slice(&container);
+
+        info!(
+            "Sending SCell configuration to UE[{}]: sCellIndex={}, physCellId={}, tid={}",
+            ue_id, DEFAULT_SCELL_INDEX, phys_cell_id, transaction_id
+        );
+        self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+            .await;
     }
 
     fn next_pdu_id(&mut self) -> u32 {
@@ -1160,6 +1217,11 @@ impl Task for RrcTask {
                                     pdu.len()
                                 );
                                 self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                                // §5.3.5.5.9: a secondary cell is added by a
+                                // reconfiguration too, and only makes sense once
+                                // the UE has a DRB-bearing configuration to add
+                                // it to. No-op unless one is configured.
+                                self.send_scell_configuration(ue_id).await;
                             }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
@@ -1748,6 +1810,113 @@ mod tests {
         assert!(
             try_take_broadcast(&mut rls_rx).is_none(),
             "a short 5G-S-TMSI must not be padded into a paging record"
+        );
+    }
+
+    // ========================================================================
+    // Secondary cell configuration (issue #112, TS 38.331 §5.3.5.5.9)
+    // ========================================================================
+
+    /// Pops the next dedicated downlink RRC PDU for `ue_id`, if any.
+    fn try_take_downlink_rrc(
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+        ue_id: i32,
+    ) -> Option<(RrcChannel, OctetString)> {
+        while let Ok(msg) = rls_rx.try_recv() {
+            if let TaskMessage::Message(RlsMessage::DownlinkRrc {
+                ue_id: id,
+                rrc_channel,
+                data,
+                ..
+            }) = msg
+            {
+                if id == ue_id {
+                    return Some((rrc_channel, data));
+                }
+            }
+        }
+        None
+    }
+
+    /// With no `scell_phys_cell_id` configured, nothing is transmitted: the
+    /// pre-#112 behaviour, byte for byte.
+    #[test]
+    fn no_scell_configuration_is_sent_by_default() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async { task.send_scell_configuration(1).await });
+
+        assert!(
+            try_take_downlink_rrc(&mut rls_rx, 1).is_none(),
+            "scell_phys_cell_id defaults to None, so no SCell is added"
+        );
+    }
+
+    /// A configured SCell is sent as `[0x0E][tid][UPER CellGroupConfig]`, and the
+    /// container decodes back to the configured `physCellId` — the two ends have
+    /// to agree on the bytes, which is what makes a real UPER container worth
+    /// having.
+    #[test]
+    fn a_configured_scell_is_sent_once_as_uper() {
+        use nextgsim_rrc::procedures::scell_config::decode_scell_config;
+
+        let mut config = test_config();
+        config.scell_phys_cell_id = Some(42);
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async { task.send_scell_configuration(7).await });
+
+        let (channel, pdu) =
+            try_take_downlink_rrc(&mut rls_rx, 7).expect("an SCell configuration is sent");
+        assert_eq!(channel, RrcChannel::DlDcch, "SRB1, not CCCH");
+        let bytes = pdu.data();
+        assert_eq!(bytes[0], RECONFIGURATION_WITH_SCELL);
+        let decoded = decode_scell_config(&bytes[2..]).expect("the container is real UPER");
+        assert_eq!(decoded.to_add.len(), 1);
+        assert_eq!(decoded.to_add[0].phys_cell_id, 42);
+        assert_eq!(decoded.to_add[0].scell_index, DEFAULT_SCELL_INDEX);
+        assert!(decoded.to_release.is_empty());
+
+        // Once per UE: the UE acknowledges each reconfiguration, and the
+        // acknowledgement is what would trigger the next one.
+        run_async(async { task.send_scell_configuration(7).await });
+        assert!(
+            try_take_downlink_rrc(&mut rls_rx, 7).is_none(),
+            "the same UE is not reconfigured a second time"
+        );
+
+        // A different UE still gets its own.
+        run_async(async { task.send_scell_configuration(8).await });
+        assert!(
+            try_take_downlink_rrc(&mut rls_rx, 8).is_some(),
+            "the once-per-UE guard is per UE, not global"
+        );
+    }
+
+    /// A `physCellId` outside `INTEGER (0..1007)` has no encoding. Nothing is
+    /// transmitted, and the UE is not marked as configured — so correcting the
+    /// configuration and reconnecting works rather than silently staying quiet.
+    #[test]
+    fn an_unencodable_scell_phys_cell_id_transmits_nothing() {
+        let mut config = test_config();
+        config.scell_phys_cell_id = Some(2000); // > 1007
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async { task.send_scell_configuration(1).await });
+
+        assert!(
+            try_take_downlink_rrc(&mut rls_rx, 1).is_none(),
+            "an out-of-range physCellId must not be truncated onto the wire"
+        );
+        assert!(
+            !task.scell_configured_ues.contains(&1),
+            "a UE that was never sent a configuration is not marked as configured"
         );
     }
 }
