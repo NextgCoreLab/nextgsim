@@ -71,6 +71,17 @@ upf_port: 2152
 # UEs discovering cells from RLS heartbeats only (the pre-#21 behaviour).
 si_broadcast_period_ms: 80
 
+# physCellId of a secondary cell to configure on each UE (sCellToAddModList,
+# TS 38.331 §5.3.5.5.9), sent once per UE after its first RRCReconfiguration.
+# Commented out means no SCell is added, which is the pre-#112 behaviour.
+#
+# The only thing the UE does with an SCell is measure event A6 against it
+# (§5.5.4.7): carrier aggregation itself -- per-SCell BWP, MAC/PHY aggregation,
+# sCellState activation, PUCCH SCell -- is not modelled, so this configures a
+# measurement reference, not a second carrier. Point it at the physCellId of
+# another cell the UE can hear; a cell is never its own SCell.
+# scell_phys_cell_id: 2
+
 # PDU sessions whose DRB uses RLC Acknowledged Mode (TS 38.322) instead of the
 # default Unacknowledged Mode: AM adds STATUS reporting, selective
 # retransmission and the ARQ timers, at the cost of feedback traffic.

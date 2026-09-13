@@ -53,6 +53,7 @@ use nextgsim_rrc::procedures::rrc_setup::{
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
     RrcSetupRequestParams, SNssai as RrcSNssai, UeIdentity,
 };
+use nextgsim_rrc::procedures::scell_config::decode_scell_config;
 use nextgsim_rrc::procedures::security_mode::{
     decode_security_mode_command, encode_security_mode_complete, SecurityModeCommandData,
     SecurityModeCompleteParams,
@@ -93,6 +94,19 @@ const RECONFIGURATION_WITH_CHO: u8 = 0x0D;
 /// Where the CHO container starts in such a message, after the envelope code and
 /// the transaction identifier.
 const CHO_CONTAINER_OFFSET: usize = 2;
+
+/// Simplified DL-DCCH envelope code for an RRCReconfiguration carrying a
+/// secondary-cell configuration: `[0x0E][transaction id][UPER CellGroupConfig]`.
+///
+/// Unlike the CHO container, the payload here is a **real UPER encoding**:
+/// `sCellToAddModList` and `sCellToReleaseList` are Rel-15 IEs, so the vendored
+/// schema models them (see `nextgsim_rrc::procedures::scell_config`). Only the
+/// envelope is hand-rolled, the same arrangement as the UE capability transfer
+/// (0x06). Issue #107 covers the envelope.
+const RECONFIGURATION_WITH_SCELL: u8 = 0x0E;
+
+/// Where the `CellGroupConfig` starts in such a message.
+const SCELL_CONTAINER_OFFSET: usize = 2;
 
 /// `q-RxLevMin` assumed for a cell whose SIB1 omits `cellSelectionInfo`
 /// (the IE is `OPTIONAL — Cond Standalone` in TS 38.331 §6.3.2).
@@ -242,6 +256,17 @@ pub struct RrcTask {
     /// against it (TS 38.331 §5.3.2.3). `None` until the UE has a GUTI, and no
     /// paging record can match then — the AS has no identity to compare.
     paging_s_tmsi: Option<[u8; FIVE_G_S_TMSI_LEN]>,
+    /// Configured secondary cells (TS 38.331 §5.3.5.5.9), `sCellIndex` -> the
+    /// simulator cell id its `physCellId` names. Released individually by
+    /// `sCellToReleaseList` and wholesale on going to RRC_IDLE (§5.3.11).
+    ///
+    /// A `BTreeMap` because the *lowest* configured index is the one handed to
+    /// the measurement manager: A6 is defined against the SCell of the
+    /// `measObjectNR` associated with the event (§5.5.4.7), and this simulator's
+    /// measurement configuration carries no measurement object, so it can model
+    /// one A6 reference and not one per event. That is the ceiling of #112's
+    /// "SCell half of CA, not the whole feature".
+    configured_scells: std::collections::BTreeMap<u8, i32>,
 }
 
 impl RrcTask {
@@ -281,6 +306,7 @@ impl RrcTask {
             cond_reconfig: CondReconfigStore::new(),
             cho_transaction_id: 0,
             paging_s_tmsi: None,
+            configured_scells: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1361,6 +1387,9 @@ impl RrcTask {
         // candidates were prepared by a cell the UE is no longer connected to,
         // and TS 38.331 §5.3.11 releases the RRC configuration on release.
         self.cond_reconfig.clear();
+        // Secondary cells are part of that configuration (§5.3.5.5.9), so they
+        // go the same way: A6 has no reference in RRC_IDLE.
+        self.release_all_scells();
 
         info!("RRC connection released");
 
@@ -1384,6 +1413,12 @@ impl RrcTask {
         // handover command.
         if bytes.first() == Some(&RECONFIGURATION_WITH_CHO) {
             self.handle_conditional_reconfiguration(bytes).await;
+            return;
+        }
+
+        // Secondary cell addition/release (TS 38.331 §5.3.5.5.9).
+        if bytes.first() == Some(&RECONFIGURATION_WITH_SCELL) {
+            self.handle_scell_reconfiguration(bytes).await;
             return;
         }
 
@@ -1449,6 +1484,87 @@ impl RrcTask {
         self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
     }
 
+    /// Handle an RRCReconfiguration carrying a secondary-cell configuration
+    /// (TS 38.331 §5.3.5.5.9).
+    ///
+    /// Releases are applied before additions, which is the order §5.3.5.5.9
+    /// itself uses, so a message that releases index 1 and adds a new cell at
+    /// index 1 ends with the new cell rather than nothing.
+    ///
+    /// A cell the UE has never measured is still recorded: RLS may report it on a
+    /// later heartbeat, and A6 simply cannot enter until it does — the same
+    /// posture as a CHO candidate targeting an unmeasured cell.
+    async fn handle_scell_reconfiguration(&mut self, bytes: &[u8]) {
+        let transaction_id = bytes.get(1).copied().unwrap_or(0);
+
+        match decode_scell_config(&bytes[SCELL_CONTAINER_OFFSET.min(bytes.len())..]) {
+            Ok(config) => {
+                for index in &config.to_release {
+                    match self.configured_scells.remove(index) {
+                        Some(cell_id) => {
+                            info!("SCell released: sCellIndex={}, cell={}", index, cell_id)
+                        }
+                        None => warn!(
+                            "sCellToReleaseList names sCellIndex {}, which is not configured",
+                            index
+                        ),
+                    }
+                }
+                for addition in &config.to_add {
+                    // physCellId is the simulator cell id throughout the UE
+                    // measurement path (see `candidate_cell_id`).
+                    let cell_id = i32::from(addition.phys_cell_id);
+                    self.configured_scells.insert(addition.scell_index, cell_id);
+                    info!(
+                        "SCell configured: sCellIndex={}, physCellId={}, measured={}",
+                        addition.scell_index,
+                        addition.phys_cell_id,
+                        self.measurement_manager.rsrp(cell_id).is_some()
+                    );
+                }
+                self.apply_scell_reference();
+            }
+            Err(e) => warn!("Failed to decode secondary cell configuration: {}", e),
+        }
+
+        let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
+        self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+    }
+
+    /// Point the measurement manager's A6 reference at the lowest-index
+    /// configured SCell, or at nothing when none is configured.
+    ///
+    /// See `configured_scells` for why it is the lowest index rather than a
+    /// per-event one.
+    fn apply_scell_reference(&mut self) {
+        let scell = self
+            .configured_scells
+            .values()
+            .next()
+            .copied()
+            .filter(|cell_id| Some(*cell_id) != self.serving_cell_id);
+        self.measurement_manager.set_scell(scell);
+    }
+
+    /// Release every configured secondary cell (TS 38.331 §5.3.11: the UE
+    /// releases the RRC configuration on going to RRC_IDLE).
+    fn release_all_scells(&mut self) {
+        if !self.configured_scells.is_empty() {
+            info!(
+                "Releasing {} configured SCell(s) on leaving RRC_CONNECTED",
+                self.configured_scells.len()
+            );
+            self.configured_scells.clear();
+        }
+        self.measurement_manager.set_scell(None);
+    }
+
+    /// The simulator cell ids of the configured secondary cells, lowest
+    /// `sCellIndex` first — for tests and status reporting.
+    pub fn configured_scells(&self) -> Vec<i32> {
+        self.configured_scells.values().copied().collect()
+    }
+
     /// Handle handover command from RRC Reconfiguration
     async fn handle_handover_command(&mut self, source_cell_id: i32, command: HandoverCommand) {
         let target_cell_id = command.target_cell.cell_id;
@@ -1474,6 +1590,11 @@ impl RrcTask {
 
                 // Update measurement manager
                 self.measurement_manager.set_serving_cell(Some(new_cell_id));
+
+                // §5.3.5.5.2: applying a reconfigurationWithSync replaces the
+                // cell group configuration, so the source cell's secondary cells
+                // are gone. The target names its own in a later reconfiguration.
+                self.release_all_scells();
 
                 // Notify RLS of new serving cell
                 if let Err(e) = self
@@ -2373,10 +2494,12 @@ mod tests {
     // Conditional handover (issue #20, TS 38.331 §5.3.5.13)
     // ========================================================================
 
+    use crate::rrc::TriggeringCell;
     use nextgsim_rrc::procedures::conditional_handover::{
         encode_cho_config, A3Offset, ChoCandidateCell, ChoCondition, ChoConfig,
         ChoTargetCellConfig, EventA3Condition, Hysteresis, TimeToTrigger,
     };
+    use nextgsim_rrc::procedures::scell_config::{encode_scell_config, ScellConfig};
 
     /// A container arming one A3 candidate on cell 2 with no time-to-trigger,
     /// wrapped in the DL-DCCH envelope the UE's reconfiguration handler expects.
@@ -2430,6 +2553,247 @@ mod tests {
         // as the answer to what it sends.
         let _setup_complete = next_uplink_rrc(rls_rx);
         task.handle_signal_changed(1, -90).await;
+    }
+
+    /// An RRCReconfiguration adding one secondary cell, in the DL-DCCH envelope
+    /// the UE's reconfiguration handler expects.
+    fn scell_reconfiguration_pdu(transaction_id: u8, config: &ScellConfig) -> OctetString {
+        let mut pdu = vec![RECONFIGURATION_WITH_SCELL, transaction_id];
+        pdu.extend_from_slice(&encode_scell_config(config).expect("encode SCell container"));
+        OctetString::from_slice(&pdu)
+    }
+
+    /// An A6 measurement configuration: `a6-Offset` 3 dB, hysteresis 1 dB, no
+    /// time-to-trigger. A neighbour must beat the SCell by 4 dB to enter.
+    fn a6_meas_config() -> MeasConfig {
+        MeasConfig {
+            meas_id: 6,
+            meas_object_id: 1,
+            report_config_id: 1,
+            quantity: crate::rrc::measurement::MeasQuantity::SsRsrp,
+            trigger_config: ReportTriggerConfig {
+                trigger_type: ReportTriggerType::Event(MeasEventType::A6),
+                threshold: None,
+                threshold1: None,
+                threshold2: None,
+                a3_offset: None,
+                a6_offset: Some(3),
+                hysteresis: 2, // 1 dB
+                time_to_trigger: 0,
+            },
+            report_amount: 0,
+            report_interval: 0,
+            max_report_cells: 4,
+        }
+    }
+
+    /// The whole point of #112: A6 measures against the SCell (TS 38.331
+    /// §5.5.4.7), and until an RRCReconfiguration names one the event cannot
+    /// enter however strong a neighbour is. The SCell here is configured over the
+    /// wire, not by calling `set_scell`.
+    #[test]
+    fn an_scell_from_a_reconfiguration_makes_event_a6_enter() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.measurement_manager.add_config(a6_meas_config());
+
+            // Cell 2 will be the SCell at -95 dBm; cell 3 beats it by 5 dB.
+            task.handle_signal_changed(2, -95).await;
+            task.handle_signal_changed(3, -90).await;
+            task.perform_cycle().await;
+            assert!(
+                task.measurement_manager.triggered_cells(6).is_empty(),
+                "with no SCell configured, A6 has no reference and cannot enter"
+            );
+
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(4, &ScellConfig::add_one(1, 2)),
+            )
+            .await;
+            assert_eq!(
+                task.configured_scells(),
+                vec![2],
+                "the reconfiguration configured cell 2 as the SCell"
+            );
+            let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlDcch);
+            assert_eq!(
+                pdu.data(),
+                &build_reconfiguration_complete(4)[..],
+                "RRCReconfigurationComplete echoes the transaction id"
+            );
+
+            task.perform_cycle().await;
+            assert_eq!(
+                task.measurement_manager.triggered_cells(6),
+                vec![TriggeringCell::Nr(3)],
+                "cell 3 at -90 dBm beats the -91 dBm A6 bar over the SCell"
+            );
+        });
+    }
+
+    /// §5.3.5.5.9: `sCellToReleaseList` removes it again, and A6 stops being
+    /// evaluable — the neighbour has not moved.
+    #[test]
+    fn releasing_the_scell_stops_event_a6_being_evaluable() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.measurement_manager.add_config(a6_meas_config());
+            task.handle_signal_changed(2, -95).await;
+            task.handle_signal_changed(3, -90).await;
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+            )
+            .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+            task.perform_cycle().await;
+            assert_eq!(
+                task.measurement_manager.triggered_cells(6),
+                vec![TriggeringCell::Nr(3)]
+            );
+
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(2, &ScellConfig::release_one(1)),
+            )
+            .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+
+            assert!(task.configured_scells().is_empty());
+            assert_eq!(task.measurement_manager.scell_id(), None);
+            task.perform_cycle().await;
+            assert!(
+                task.measurement_manager.triggered_cells(6).is_empty(),
+                "no SCell, no A6 -- cell 3 is still at -90 dBm"
+            );
+        });
+    }
+
+    /// §5.3.11: going to RRC_IDLE releases the RRC configuration, secondary
+    /// cells included.
+    #[test]
+    fn going_to_rrc_idle_releases_the_scell() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(2, -95).await;
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+            )
+            .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(task.configured_scells(), vec![2]);
+
+            task.handle_rrc_release().await;
+
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
+            assert!(task.configured_scells().is_empty());
+            assert_eq!(task.measurement_manager.scell_id(), None);
+        });
+    }
+
+    /// A release naming an unconfigured index is reported, not silently applied
+    /// to whatever SCell happens to be there.
+    #[test]
+    fn releasing_an_unconfigured_scell_index_leaves_the_configured_one_alone() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(2, -95).await;
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+            )
+            .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(2, &ScellConfig::release_one(9)),
+            )
+            .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+
+            assert_eq!(
+                task.configured_scells(),
+                vec![2],
+                "sCellIndex 9 was never configured, so index 1 survives"
+            );
+        });
+    }
+
+    /// A cell is not its own SCell: a configuration naming the serving cell
+    /// records it but must not make A6 measure the PCell against itself, which
+    /// would let any neighbour above the PCell trigger a handover event that
+    /// §5.5.4.7 says is about the secondary cell.
+    #[test]
+    fn the_serving_cell_is_not_accepted_as_its_own_scell_reference() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.measurement_manager.add_config(a6_meas_config());
+            task.handle_signal_changed(3, -50).await; // far stronger than the PCell
+
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 1)),
+            )
+            .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+
+            assert_eq!(task.measurement_manager.scell_id(), None);
+            task.perform_cycle().await;
+            assert!(
+                task.measurement_manager.triggered_cells(6).is_empty(),
+                "the serving cell is not an A6 reference, whatever cell 3 does"
+            );
+        });
+    }
+
+    /// A malformed container must not be applied and must not take the existing
+    /// configuration down with it; the reconfiguration is still acknowledged.
+    #[test]
+    fn a_malformed_scell_container_changes_nothing() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(2, -95).await;
+            task.handle_rrc_reconfiguration(
+                1,
+                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+            )
+            .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(task.configured_scells(), vec![2]);
+
+            let pdu = OctetString::from_slice(&[RECONFIGURATION_WITH_SCELL, 7, 0xFF]);
+            task.handle_rrc_reconfiguration(1, &pdu).await;
+
+            assert_eq!(
+                task.configured_scells(),
+                vec![2],
+                "a container that does not decode leaves the SCell configured"
+            );
+            let (_, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(complete.data(), &build_reconfiguration_complete(7)[..]);
+        });
     }
 
     /// The container is decoded and acknowledged either way, but the candidates
