@@ -138,16 +138,25 @@ raises `CellDiscovered { cell_id, dbm }` and the RLS task forwards
 cell unseen for `heartbeat_threshold` (2000 ms) becomes `CellLost`, which — if
 it was the serving cell — raises a `RadioLinkFailure`.
 
-### 3. Cell selection and fabricated system information
+### 3. Cell selection and system information
 
 The UE RRC task (`nextgsim-ue/src/rrc/task.rs`) handles `SignalChanged` in
 `handle_signal_changed` → `CellSelector::handle_signal_change`
-(`nextgsim-ue/src/rrc/cell_selection.rs`). On a newly detected cell it calls
+(`nextgsim-ue/src/rrc/cell_selection.rs`).
+
+The gNB **does broadcast** real UPER MIB and SIB1 on BCCH (TS 38.331 §5.2.1,
+`si_broadcast_period_ms`, default 80/160 ms), and the UE decodes them in
+`handle_broadcast_mib` / `handle_broadcast_sib1`, taking the cell's PLMN, TAC and
+NR Cell Identity off the air.
+
+Until a broadcast arrives, a newly detected cell still gets
 `provide_simulated_system_info`, which **fabricates the MIB and SIB1 locally**
 (not barred, not reserved, `q_rx_lev_min = -70`, PLMN = the UE's configured
-HPLMN, and the SNPN NID only when `snpn_config` is set). This is a deliberate
-simplification: there is no on-air SIB broadcast, so the UE synthesises just
-enough system information to make the discovered cell selectable.
+HPLMN, and the SNPN NID only when `snpn_config` is set) so heartbeat-only
+discovery keeps working. Two things suppress the fabrication: a cell that has
+broadcast its own system information (which must not be overwritten by an
+assumption), and `require_broadcast_sib1`, which makes the UE wait for the real
+broadcast and select on what the cell actually advertises.
 
 `perform_cell_selection` runs `CellSelector::perform_cell_selection` (cited
 against TS 38.304 §5.2 per code comments): after a 1 s startup delay it looks
@@ -399,11 +408,13 @@ comments), so both ends arrive at identical RRC keys. The UE RRC handler
 Grounded in the code, these are the honest deviations from a textbook TS 23.502
 registration:
 
-- **Simulated radio and system information.** RLS models signal strength as
-  `-distance` (`GnbCellTracker::estimate_dbm`) over UDP; there is no MIB/SIB
-  broadcast. The UE *fabricates* SIB1/MIB locally in
-  `provide_simulated_system_info` (`nextgsim-ue/src/rrc/task.rs`) so the cell is
-  selectable — TS 38.304 cell selection runs, but on synthesised inputs.
+- **Simulated radio, real system information.** RLS models signal strength as
+  `-distance` (`GnbCellTracker::estimate_dbm`) over UDP — there is no PHY. The
+  MIB/SIB1 broadcast IS real (UPER on BCCH, `si_broadcast_period_ms`), so TS
+  38.304 cell selection runs on the cell's advertised PLMN/TAC/NCI once a
+  broadcast has been received. Before that, or with the broadcast disabled, the UE
+  falls back to `provide_simulated_system_info`, which synthesises those values —
+  set `require_broadcast_sib1` to refuse the fallback.
 - **5G-AKA only on the live path.** `handle_authentication_request` runs
   MILENAGE-based 5G-AKA. `handle_eap_aka_prime_challenge` is only reached if the
   Authentication Request omits RAND/AUTN and carries an EAP-message IE, which the

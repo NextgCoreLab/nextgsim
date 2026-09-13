@@ -65,6 +65,12 @@ ignore_stream_ids: false
 upf_addr: 172.23.0.7
 upf_port: 2152
 
+# System information broadcast period in milliseconds (TS 38.331 §5.2.1): the
+# MIB every period and SIB1 every second period, i.e. the spec's 80/160 ms
+# cadence at the default. 0 disables the BCCH broadcast entirely, which leaves
+# UEs discovering cells from RLS heartbeats only (the pre-#21 behaviour).
+si_broadcast_period_ms: 80
+
 # PDU sessions whose DRB uses RLC Acknowledged Mode (TS 38.322) instead of the
 # default Unacknowledged Mode: AM adds STATUS reporting, selective
 # retransmission and the ARQ timers, at the cost of feedback traffic.

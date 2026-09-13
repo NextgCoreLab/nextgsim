@@ -886,6 +886,43 @@ mod tests {
         assert!(recv_rrc_pdu(&ue).await.is_none());
     }
 
+    /// System information must survive the transport, not just the codec: the
+    /// MIB and SIB1 are broadcast through the real RLS path and decoded on the
+    /// far side, on the BCCH channels TS 38.331 §5.2.1 assigns them.
+    #[tokio::test]
+    async fn system_information_reaches_a_ue_over_the_rls_transport() {
+        use crate::rrc::system_info::{encode_cell_mib, encode_cell_sib1};
+        use nextgsim_rrc::procedures::system_information::{decode_mib, decode_sib1};
+
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let config = test_config();
+        let (nci, tac) = (config.nci, config.tac);
+        let mib = encode_cell_mib().expect("MIB");
+        let sib1 = encode_cell_sib1(&config).expect("SIB1");
+
+        let mut task = broadcasting_task().await;
+        task.ue_addresses.insert(1, ue.local_addr().unwrap());
+
+        task.handle_broadcast_rrc(RrcChannel::BcchBch, 0, OctetString::from_slice(&mib))
+            .await;
+        task.handle_broadcast_rrc(RrcChannel::BcchDlSch, 0, OctetString::from_slice(&sib1))
+            .await;
+
+        let (mib_channel, mib_bytes) = recv_rrc_pdu(&ue).await.expect("the MIB must arrive");
+        assert_eq!(mib_channel, RrcChannel::BcchBch);
+        decode_mib(&mib_bytes).expect("the MIB must decode after the transport");
+
+        let (sib1_channel, sib1_bytes) = recv_rrc_pdu(&ue).await.expect("SIB1 must arrive");
+        assert_eq!(sib1_channel, RrcChannel::BcchDlSch);
+        let decoded = decode_sib1(&sib1_bytes).expect("SIB1 must decode after the transport");
+        let info = &decoded.plmn_identity_info_list[0];
+        assert_eq!(
+            (info.cell_identity, info.tracking_area_code),
+            (nci, Some(tac)),
+            "the cell's own identity survives the round trip"
+        );
+    }
+
     // ========================================================================
     // Per-bearer RLC entities (#34, TS 38.322 §4.2.1)
     // ========================================================================
