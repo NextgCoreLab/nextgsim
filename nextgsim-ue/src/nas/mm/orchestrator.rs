@@ -2235,6 +2235,24 @@ impl MmOrchestrator {
     // UE policy delivery service (UPDP) — TS 24.501 Annex D (Wave-6 E8)
     // ========================================================================
 
+    /// Every URSP rule across all stored UE policy sections (TS 24.526 §5.2).
+    ///
+    /// The rules were decoded and stored and had no reader other than a unit
+    /// test, so a PCF's URSP had no runtime effect at all (#47). This is what
+    /// hands them to the SM orchestrator's evaluation engine.
+    ///
+    /// Rules from ALL sections are returned together, not per section: a section
+    /// is a delivery/versioning unit (its UPSC is how the PCF replaces or deletes
+    /// it), while the URSP the UE evaluates is the union of what it holds. §5.2
+    /// orders by precedence across the whole policy, not within a section.
+    pub fn all_ursp_rules(&self) -> Vec<UrspRule> {
+        self.ue_policy_sections
+            .values()
+            .filter_map(|section| section.ursp_rules())
+            .flatten()
+            .collect()
+    }
+
     /// Number of UE policy sections currently stored (test/observability hook).
     pub fn ue_policy_section_count(&self) -> usize {
         self.ue_policy_sections.len()

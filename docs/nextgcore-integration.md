@@ -271,7 +271,16 @@ nextgcore env knobs (`AMF_SNPN_ALLOWED_NIDS`, `AMF_UAV_GEOFENCE`,
 Beyond the feature configs above, URSP/UE-Policy delivery is now exercised on the
 baseline path: PCF delivers URSP rules via the TS 24.501 Annex D UPDP codec over
 the N1 chain, and the UE consumes them in `nextgsim-ue` (NAS MM UE-policy
-handling in `nas/mm/orchestrator.rs`). SUCI de-concealment (SIDF) is performed and
+handling in `nas/mm/orchestrator.rs`).
+
+The UE also **evaluates** those rules per TS 24.526 §5.2 — walking them in
+ascending precedence, matching traffic descriptors against the detected
+application, and applying the selected route selection descriptor's DNN /
+S-NSSAI / SSC mode / PDU session type to the PDU session it establishes or
+reuses (`nas/sm/ursp.rs`). Evaluation is **off by default** because it changes
+which slice and data network a session uses; set `ursp_evaluation: true` in the
+UE config to turn it on. With it off, session parameters come from the static
+`sessions` config exactly as before. SUCI de-concealment (SIDF) is performed and
 logged at the core's UDM per TS 33.501 §6.12; UDR only ever sees the SUPI.
 | `docker-compose.yaml` | Container orchestration |
 | `scripts/add-subscriber.js` | MongoDB subscriber provisioning |
