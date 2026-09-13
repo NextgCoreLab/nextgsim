@@ -590,11 +590,15 @@ impl RrcTask {
         }
 
         let pdu = OctetString::from_slice(&rrc_pdu);
+        // `triggered_cells` is the event's cellsTriggeredList (TS 38.331
+        // §5.5.4.1); the neighbour list above leads with those cells, so the
+        // count says how many of the reported neighbours the event fired on.
         info!(
-            "Sending measurement report: meas_id={}, serving_rsrp={:?}, neighbors={}",
+            "Sending measurement report: meas_id={}, serving_rsrp={:?}, neighbors={}, triggered={}",
             report.meas_id,
             report.serving_cell.rsrp,
-            report.neighbor_cells.len()
+            report.neighbor_cells.len(),
+            report.triggered_cells.len()
         );
         self.send_uplink_rrc(RrcChannel::UlDcch, pdu).await;
     }
