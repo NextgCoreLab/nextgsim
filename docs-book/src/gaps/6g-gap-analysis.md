@@ -51,7 +51,7 @@ These bring the 5G baseline to the maturity the 6G work depends on. Each is a bo
 | Task ID | Component | Remaining work | Reference | Status | Tracking |
 |---|---|---|---|---|---|
 | NGS-5G-01 | RLC Acknowledged Mode | ARQ: STATUS with NACK list, automatic retransmission, timers; make AM selectable in the data path (TM/UM already work) | TS 38.322 | Partial | [#15](https://github.com/NextgCoreLab/nextgsim/issues/15) |
-| NGS-5G-02 | UE NAS MM | Configuration Update command handling (received parameters are decoded but not applied), rejected/pending NSSAI state, RACS | TS 24.501 | Partial | [#19](https://github.com/NextgCoreLab/nextgsim/issues/19) |
+| NGS-5G-02 | UE NAS MM | Done: Configuration Update parameters are applied (5G-GUTI, TAI list, allowed NSSAI, T3512), rejected/pending NSSAI are stored and rejected S-NSSAIs excluded from the next requested NSSAI, and the UE radio capability ID (RACS) IEs are decoded. RACS is not yet SIGNALLED (no IE in the REGISTRATION REQUEST, no RRC/NGAP consumer) | TS 24.501 | Complete | [#19](https://github.com/NextgCoreLab/nextgsim/issues/19) |
 | NGS-5G-03 | UE RRC | measurement event A6, conditional handover wiring, inter-RAT B1/B2 | TS 38.331 | Partial | [#20](https://github.com/NextgCoreLab/nextgsim/issues/20) |
 | NGS-5G-04 | gNB RRC | UPER-encoded MIB/SIB1 broadcast over BCCH and migration of residual simplified RRC PDUs to real ASN.1 | TS 38.331 | Partial | [#21](https://github.com/NextgCoreLab/nextgsim/issues/21) |
 

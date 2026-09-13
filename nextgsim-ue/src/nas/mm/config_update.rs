@@ -40,6 +40,7 @@ use nextgsim_nas::ies::ie1::{
 use nextgsim_nas::messages::mm::Ie5gsMobileIdentity;
 
 use super::state::MmSubState;
+use crate::timer::GprsTimer3;
 
 // ============================================================================
 // IEI constants for ConfigurationUpdateCommand optional IEs
@@ -68,6 +69,42 @@ mod config_update_iei {
     pub const OPERATOR_DEFINED_ACCESS_CATEGORY: u8 = 0x76;
     /// Configured NSSAI (Type 4, IEI 0x31)
     pub const CONFIGURED_NSSAI: u8 = 0x31;
+    /// Rejected NSSAI (Type 4, IEI 0x11)
+    pub const REJECTED_NSSAI: u8 = 0x11;
+    /// UE radio capability ID (Type 4, IEI 0x67) — RACS, TS 24.501 §9.11.3.68
+    pub const UE_RADIO_CAPABILITY_ID: u8 = 0x67;
+    /// UE radio capability ID deletion indication (Type 1, IEI 0xA)
+    /// — TS 24.501 §9.11.3.69
+    pub const UE_RADIO_CAPABILITY_ID_DELETION: u8 = 0xA0;
+}
+
+/// UE radio capability ID deletion indication (TS 24.501 §9.11.3.69).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RacsDeletionRequest {
+    /// Bits 3-1 = 000: no deletion requested
+    NotRequested,
+    /// Bits 3-1 = 001: delete the network-assigned UE radio capability IDs
+    NetworkAssigned,
+    /// A value the spec reserves. Reported rather than treated as a deletion,
+    /// because acting on an unknown code would delete state the network may not
+    /// have asked to lose.
+    Reserved(u8),
+}
+
+impl RacsDeletionRequest {
+    /// Decodes the 3-bit deletion-request field of the Type 1 IE.
+    pub fn from_bits(bits: u8) -> Self {
+        match bits & 0x07 {
+            0 => Self::NotRequested,
+            1 => Self::NetworkAssigned,
+            other => Self::Reserved(other),
+        }
+    }
+
+    /// Whether the UE must delete its network-assigned UE radio capability IDs.
+    pub fn deletes_network_assigned(&self) -> bool {
+        matches!(self, Self::NetworkAssigned)
+    }
 }
 
 // ============================================================================
@@ -94,10 +131,23 @@ pub struct ConfigurationUpdateCommand {
     pub full_name_for_network: Option<Vec<u8>>,
     /// Short name for network (optional, Type 4, IEI 0x45)
     pub short_name_for_network: Option<Vec<u8>>,
-    /// T3512 value in seconds (optional, decoded from GPRS Timer 3 IE)
+    /// T3512 value in seconds (optional, decoded from GPRS Timer 3 IE).
+    ///
+    /// `Some(0)` means the network deactivated the timer, matching
+    /// [`GprsTimer3::to_seconds`] and the REGISTRATION ACCEPT path.
     pub t3512_value_secs: Option<u32>,
     /// Configured NSSAI (optional, Type 4, IEI 0x31)
     pub configured_nssai: Option<Vec<u8>>,
+    /// Rejected NSSAI (optional, Type 4, IEI 0x11) — TS 24.501 §9.11.3.46
+    pub rejected_nssai: Option<Vec<u8>>,
+    /// Network-assigned UE radio capability ID (optional, Type 4, IEI 0x67).
+    ///
+    /// Decoded to its hexadecimal-digit string: the IE packs each digit into a
+    /// nibble, LOW nibble first (TS 24.501 §9.11.3.68), so the octets are not
+    /// the ID.
+    pub ue_radio_capability_id: Option<String>,
+    /// UE radio capability ID deletion indication (optional, Type 1, IEI 0xA)
+    pub ue_radio_capability_id_deletion: Option<RacsDeletionRequest>,
 }
 
 /// Error type for Configuration Update message encoding/decoding.
@@ -135,6 +185,15 @@ impl ConfigurationUpdateCommand {
                 let indication = IeConfigurationUpdateIndication::decode(iei & 0x0F)
                     .map_err(|e| ConfigUpdateError::InvalidIeValue(e.to_string()))?;
                 msg.config_update_indication = Some(indication);
+                continue;
+            }
+
+            // Type 1 IE: UE radio capability ID deletion indication (IEI 0xA in
+            // the high nibble, deletion request in bits 3-1).
+            if iei & 0xF0 == config_update_iei::UE_RADIO_CAPABILITY_ID_DELETION {
+                buf.advance(1);
+                msg.ue_radio_capability_id_deletion =
+                    Some(RacsDeletionRequest::from_bits(iei & 0x07));
                 continue;
             }
 
@@ -240,6 +299,29 @@ impl ConfigurationUpdateCommand {
                     }
                     msg.configured_nssai = Some(buf.copy_to_bytes(len).to_vec());
                 }
+                config_update_iei::REJECTED_NSSAI => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    msg.rejected_nssai = Some(buf.copy_to_bytes(len).to_vec());
+                }
+                config_update_iei::UE_RADIO_CAPABILITY_ID => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let octets = buf.copy_to_bytes(len).to_vec();
+                    msg.ue_radio_capability_id = Some(decode_racs_id(&octets));
+                }
                 config_update_iei::OPERATOR_DEFINED_ACCESS_CATEGORY => {
                     buf.advance(1);
                     if buf.remaining() < 2 {
@@ -327,8 +409,17 @@ pub struct ConfigUpdateResult {
     pub new_tai_list: Option<Vec<u8>>,
     /// New allowed NSSAI bytes (if provided)
     pub new_allowed_nssai: Option<Vec<u8>>,
-    /// New T3512 value in seconds (if provided)
+    /// New T3512 value in seconds (if provided); 0 means deactivated
     pub new_t3512_secs: Option<u32>,
+    /// New configured NSSAI bytes (if provided)
+    pub new_configured_nssai: Option<Vec<u8>>,
+    /// Rejected NSSAI bytes (if provided) — TS 24.501 §9.11.3.46
+    pub new_rejected_nssai: Option<Vec<u8>>,
+    /// Network-assigned UE radio capability ID (if provided), as its
+    /// hexadecimal-digit string
+    pub new_racs_id: Option<String>,
+    /// UE radio capability ID deletion request (if the IE was present)
+    pub racs_deletion: Option<RacsDeletionRequest>,
     /// Whether UE must send ConfigurationUpdateComplete
     pub send_complete: bool,
     /// Whether UE must initiate a new registration procedure
@@ -367,6 +458,10 @@ impl ConfigUpdateProcedure {
             new_tai_list: cmd.tai_list.clone(),
             new_allowed_nssai: cmd.allowed_nssai.clone(),
             new_t3512_secs: cmd.t3512_value_secs,
+            new_configured_nssai: cmd.configured_nssai.clone(),
+            new_rejected_nssai: cmd.rejected_nssai.clone(),
+            new_racs_id: cmd.ue_radio_capability_id.clone(),
+            racs_deletion: cmd.ue_radio_capability_id_deletion,
             send_complete,
             re_register,
             new_sub_state,
@@ -375,29 +470,55 @@ impl ConfigUpdateProcedure {
 }
 
 // ============================================================================
-// Helper: GPRS Timer 3 decoder
+// Helpers
 // ============================================================================
 
 /// Decodes a GPRS Timer 3 IE byte into a duration in seconds.
 ///
-/// Bits 7-5: unit, bits 4-0: value.
-/// Units: 0=2s, 1=30s, 2=1min, 3=10min, 4=1hr, 5=10hr, 6=320hr, 7=deactivated
+/// Delegates to [`GprsTimer3`], which carries the TS 24.008 §10.5.7.4a unit
+/// table (`000` = 10 minutes, `001` = 1 hour, `010` = 10 hours, `011` = 2
+/// seconds, `100` = 30 seconds, `101` = 1 minute, `110` = 320 hours, `111` =
+/// deactivated → 0 seconds). This module previously carried its own table with
+/// the units in ascending order, so every unit but 320 hours decoded to the
+/// wrong duration — a T3512 of `0x49` (unit `010`, value 9: 90 hours, which is
+/// what the core sends) came out as 540 seconds. One decoder, and it is the one
+/// the REGISTRATION ACCEPT path already uses.
 fn decode_gprs_timer3(byte: u8) -> u32 {
-    let unit = (byte >> 5) & 0x07;
-    let value = (byte & 0x1F) as u32;
+    GprsTimer3::from_byte(byte).to_seconds()
+}
 
-    let multiplier: u32 = match unit {
-        0 => 2,
-        1 => 30,
-        2 => 60,
-        3 => 600,
-        4 => 3600,
-        5 => 36_000,
-        6 => 1_152_000,       // 320 hours
-        _ => return u32::MAX, // deactivated
-    };
+/// Decodes a UE radio capability ID IE value into its hexadecimal-digit string
+/// (TS 24.501 §9.11.3.68).
+///
+/// Each digit occupies a nibble, **low nibble first**: the first digit is in
+/// bits 4-1 of the first octet, the second in bits 8-5, and so on. A trailing
+/// high nibble of `1111` is the odd-length filler and is dropped. Reading the
+/// octets as-is would yield every digit pair reversed, which for an identifier
+/// the network assigns is silently the wrong ID rather than an obvious error.
+///
+/// The filler is only recognised in the LAST octet, where the IE defines it; an
+/// `f` anywhere else is a digit. In the last octet the two readings are
+/// genuinely ambiguous, and the IE's rule wins — which costs nothing for a
+/// conformant ID, because TS 23.003 §29.2 gives every UE radio capability ID an
+/// even number of digits (1 + 2 + 11 network-assigned, 1 + 8 + 11
+/// manufacturer-assigned), so the filler should never appear at all.
+fn decode_racs_id(octets: &[u8]) -> String {
+    let mut id = String::with_capacity(octets.len() * 2);
+    for (index, octet) in octets.iter().enumerate() {
+        id.push(hex_digit(octet & 0x0F));
+        let high = octet >> 4;
+        let is_last = index + 1 == octets.len();
+        if is_last && high == 0x0F {
+            // Odd number of digits: the filler is not part of the ID.
+            continue;
+        }
+        id.push(hex_digit(high));
+    }
+    id
+}
 
-    value * multiplier
+fn hex_digit(nibble: u8) -> char {
+    char::from_digit(u32::from(nibble), 16).unwrap_or('?')
 }
 
 // ============================================================================
@@ -529,15 +650,167 @@ mod tests {
         assert_eq!(buf[2], MmMessageType::ConfigurationUpdateComplete as u8);
     }
 
+    /// The GPRS Timer 3 unit field is NOT an ascending list of durations
+    /// (TS 24.008 §10.5.7.4a table 10.5.163a): `000` is 10 minutes, `011` is 2
+    /// seconds. The previous version of this test pinned an ascending table
+    /// (`000` = 2 s, `001` = 30 s, `010` = 1 min, …), which is the defect it was
+    /// written against: it made a T3512 of `0x49` — unit `010`, value 9, i.e.
+    /// the 90 hours the core actually sends — decode as 540 seconds.
     #[test]
-    fn test_decode_gprs_timer3() {
-        // Unit 0 (2s), value 5 -> 10 seconds
-        assert_eq!(decode_gprs_timer3(0b000_00101), 10);
-        // Unit 1 (30s), value 6 -> 180 seconds
-        assert_eq!(decode_gprs_timer3(0b001_00110), 180);
-        // Unit 2 (1min=60s), value 3 -> 180 seconds
-        assert_eq!(decode_gprs_timer3(0b010_00011), 180);
-        // Unit 7 (deactivated) -> u32::MAX
-        assert_eq!(decode_gprs_timer3(0b111_00001), u32::MAX);
+    fn a_gprs_timer3_byte_decodes_with_the_ts_24_008_unit_table() {
+        // Unit 000 = multiples of 10 minutes
+        assert_eq!(decode_gprs_timer3(0b000_00101), 5 * 600);
+        // Unit 001 = multiples of 1 hour
+        assert_eq!(decode_gprs_timer3(0b001_00110), 6 * 3600);
+        // Unit 010 = multiples of 10 hours: 0x49 is what the core sends for T3512
+        assert_eq!(decode_gprs_timer3(0x49), 9 * 10 * 3600);
+        // Unit 011 = multiples of 2 seconds
+        assert_eq!(decode_gprs_timer3(0b011_00101), 10);
+        // Unit 100 = multiples of 30 seconds
+        assert_eq!(decode_gprs_timer3(0b100_00110), 180);
+        // Unit 101 = multiples of 1 minute
+        assert_eq!(decode_gprs_timer3(0b101_00011), 180);
+        // Unit 110 = multiples of 320 hours
+        assert_eq!(decode_gprs_timer3(0b110_00001), 320 * 3600);
+        // Unit 111 = deactivated, reported as 0 seconds like every other caller
+        // of GprsTimer3 sees it
+        assert_eq!(decode_gprs_timer3(0b111_00001), 0);
+    }
+
+    /// The T3512 IE of a Configuration Update Command goes through the same
+    /// decoder, so a command carrying the core's own byte yields the same value
+    /// a Registration Accept would.
+    #[test]
+    fn a_config_update_t3512_ie_decodes_to_the_same_value_as_a_registration_accept() {
+        let bytes = vec![0xD1, config_update_iei::T3512_VALUE, 0x01, 0x49];
+        let cmd = ConfigurationUpdateCommand::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(cmd.t3512_value_secs, Some(9 * 10 * 3600));
+        assert_eq!(
+            cmd.t3512_value_secs,
+            Some(GprsTimer3::from_byte(0x49).to_seconds())
+        );
+    }
+
+    // ========================================================================
+    // RACS: UE radio capability ID (#19)
+    // ========================================================================
+
+    /// TS 24.501 §9.11.3.68 packs the ID's hexadecimal digits one per nibble,
+    /// LOW nibble first, so reading the octets as-is reverses every digit pair.
+    #[test]
+    fn a_ue_radio_capability_id_decodes_low_nibble_first() {
+        // Digits "123456": 0x21, 0x43, 0x65
+        assert_eq!(decode_racs_id(&[0x21, 0x43, 0x65]), "123456");
+    }
+
+    /// An odd digit count fills the last high nibble with 1111, which is not
+    /// part of the ID.
+    #[test]
+    fn an_odd_length_ue_radio_capability_id_drops_the_filler_nibble() {
+        // Digits "abc": 0xBA, 0xFC
+        assert_eq!(decode_racs_id(&[0xBA, 0xFC]), "abc");
+    }
+
+    /// An `f` that is a real digit rather than the filler must survive: `1111`
+    /// is only a filler in the HIGH nibble of the LAST octet.
+    #[test]
+    fn an_f_digit_inside_the_id_is_not_mistaken_for_the_filler() {
+        // Digits "afb" (odd): 'a' then 'f' in the first octet, 'b' plus the
+        // filler in the second. The first octet's high nibble is also 1111, so a
+        // decoder that checks for the filler in every octet loses the real 'f'.
+        assert_eq!(decode_racs_id(&[0xFA, 0xFB]), "afb");
+    }
+
+    #[test]
+    fn a_command_carrying_a_ue_radio_capability_id_decodes_it() {
+        let mut bytes = vec![0xD1]; // config update indication, ACK requested
+        bytes.push(config_update_iei::UE_RADIO_CAPABILITY_ID);
+        bytes.push(3); // length
+        bytes.extend_from_slice(&[0x21, 0x43, 0x65]);
+
+        let cmd = ConfigurationUpdateCommand::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(cmd.ue_radio_capability_id.as_deref(), Some("123456"));
+        assert!(
+            cmd.acknowledgement_required(),
+            "the ID must not consume the indication that precedes it"
+        );
+    }
+
+    #[test]
+    fn a_ue_radio_capability_id_deletion_indication_decodes() {
+        // Type 1 IE: IEI 0xA in the high nibble, deletion request 001
+        let bytes = vec![0xA1];
+        let cmd = ConfigurationUpdateCommand::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(
+            cmd.ue_radio_capability_id_deletion,
+            Some(RacsDeletionRequest::NetworkAssigned)
+        );
+        assert!(cmd
+            .ue_radio_capability_id_deletion
+            .unwrap()
+            .deletes_network_assigned());
+    }
+
+    /// Deletion request 000 is "not requested": present in the message, but it
+    /// must not delete anything.
+    #[test]
+    fn a_zero_deletion_request_deletes_nothing() {
+        let bytes = vec![0xA0];
+        let cmd = ConfigurationUpdateCommand::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(
+            cmd.ue_radio_capability_id_deletion,
+            Some(RacsDeletionRequest::NotRequested)
+        );
+        assert!(!cmd
+            .ue_radio_capability_id_deletion
+            .unwrap()
+            .deletes_network_assigned());
+    }
+
+    /// A reserved code is reported and treated as "no deletion": acting on an
+    /// unknown code would delete IDs the network may not have asked to lose.
+    #[test]
+    fn a_reserved_deletion_request_is_not_treated_as_a_deletion() {
+        let bytes = vec![0xA5];
+        let cmd = ConfigurationUpdateCommand::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(
+            cmd.ue_radio_capability_id_deletion,
+            Some(RacsDeletionRequest::Reserved(5))
+        );
+        assert!(!cmd
+            .ue_radio_capability_id_deletion
+            .unwrap()
+            .deletes_network_assigned());
+    }
+
+    #[test]
+    fn a_command_carrying_a_rejected_nssai_decodes_it() {
+        let mut bytes = vec![0xD1];
+        bytes.push(config_update_iei::REJECTED_NSSAI);
+        bytes.push(2); // length of the IE value
+        bytes.extend_from_slice(&[0x10, 0x01]); // one entry: len 1, cause 0, SST 1
+
+        let cmd = ConfigurationUpdateCommand::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!(cmd.rejected_nssai, Some(vec![0x10, 0x01]));
+    }
+
+    /// Every new IE reaches the caller through the procedure result, not just
+    /// the decoded message.
+    #[test]
+    fn process_command_carries_the_new_ies_to_the_caller() {
+        let mut cmd = ConfigurationUpdateCommand::new();
+        cmd.rejected_nssai = Some(vec![0x10, 0x01]);
+        cmd.configured_nssai = Some(vec![0x01, 0x02]);
+        cmd.ue_radio_capability_id = Some("123456".to_string());
+        cmd.ue_radio_capability_id_deletion = Some(RacsDeletionRequest::NetworkAssigned);
+
+        let result = ConfigUpdateProcedure::process_command(&cmd);
+        assert_eq!(result.new_rejected_nssai, Some(vec![0x10, 0x01]));
+        assert_eq!(result.new_configured_nssai, Some(vec![0x01, 0x02]));
+        assert_eq!(result.new_racs_id.as_deref(), Some("123456"));
+        assert_eq!(
+            result.racs_deletion,
+            Some(RacsDeletionRequest::NetworkAssigned)
+        );
     }
 }

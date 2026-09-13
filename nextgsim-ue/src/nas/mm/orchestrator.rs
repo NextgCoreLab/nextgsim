@@ -58,6 +58,7 @@ use crate::timer::{
     TIMER_T3521,
 };
 
+use super::config_update::ConfigUpdateResult;
 use super::deregistration::DeregistrationProcedure;
 use super::persistence::{SecurityContextSnapshot, UeStateSnapshot};
 use super::state::{CmState, MmStateMachine, MmSubState, UpdateStatus};
@@ -180,6 +181,125 @@ pub fn uplink_data_status(psis: &[u8]) -> Option<u16> {
         .iter()
         .fold(0u16, |acc, &psi| acc | uplink_data_status_bit(psi));
     (bitmap != 0).then_some(bitmap)
+}
+
+/// Why the network rejected an S-NSSAI (TS 24.501 §9.11.3.46, cause value in
+/// bits 4-1 of a rejected S-NSSAI's first octet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectedSNssaiCause {
+    /// 0000: S-NSSAI not available in the current PLMN or SNPN. Scoped to the
+    /// PLMN, so it outlives a change of registration area.
+    NotAvailableInPlmn,
+    /// 0001: S-NSSAI not available in the current registration area. Dropped
+    /// when the registration area changes.
+    NotAvailableInRegistrationArea,
+    /// 0010: not available because network slice-specific authentication and
+    /// authorization failed or was revoked.
+    NssaaFailedOrRevoked,
+    /// A value the spec reserves. Kept (so the S-NSSAI is still excluded) but
+    /// never treated as registration-area scoped, because guessing the scope of
+    /// an unknown cause could re-request a slice the network refused.
+    Reserved(u8),
+}
+
+impl RejectedSNssaiCause {
+    /// Decodes the 4-bit cause value.
+    pub fn from_bits(bits: u8) -> Self {
+        match bits & 0x0F {
+            0 => Self::NotAvailableInPlmn,
+            1 => Self::NotAvailableInRegistrationArea,
+            2 => Self::NssaaFailedOrRevoked,
+            other => Self::Reserved(other),
+        }
+    }
+}
+
+/// One entry of a Rejected NSSAI IE (TS 24.501 §9.11.3.46).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectedSNssai {
+    /// Why it was rejected
+    pub cause: RejectedSNssaiCause,
+    /// Slice/Service Type
+    pub sst: u8,
+    /// Slice Differentiator, when the entry carried one
+    pub sd: Option<[u8; 3]>,
+}
+
+/// Parses a Rejected NSSAI IE value (TS 24.501 §9.11.3.46).
+///
+/// Each entry is one octet carrying the length of the rejected S-NSSAI in bits
+/// 8-5 and the cause value in bits 4-1, then the SST and (when the length says
+/// so) the 3-octet SD. A truncated trailing entry ends the parse rather than
+/// yielding a half-read S-NSSAI: an S-NSSAI read short is a *different* slice,
+/// and excluding the wrong one would silently drop a slice the network allows.
+pub fn parse_rejected_nssai(value: &[u8]) -> Vec<RejectedSNssai> {
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < value.len() {
+        let header = value[index];
+        let len = usize::from(header >> 4);
+        let cause = RejectedSNssaiCause::from_bits(header);
+        index += 1;
+        if len == 0 || index + len > value.len() {
+            break;
+        }
+        let contents = &value[index..index + len];
+        index += len;
+        let sd = if len >= 4 {
+            Some([contents[1], contents[2], contents[3]])
+        } else {
+            None
+        };
+        entries.push(RejectedSNssai {
+            cause,
+            sst: contents[0],
+            sd,
+        });
+    }
+    entries
+}
+
+/// One entry of a length-prefixed NSSAI IE (Requested / Allowed / Configured
+/// NSSAI: TS 24.501 §9.11.3.37, §9.11.3.28, §9.11.3.15), kept with its raw
+/// octets so a filtered list can be rebuilt without re-encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NssaiEntry {
+    sst: u8,
+    sd: Option<[u8; 3]>,
+    /// The entry exactly as it appeared, length octet included
+    raw: Vec<u8>,
+}
+
+/// Parses a length-prefixed NSSAI IE value into its entries.
+///
+/// An S-NSSAI's contents are 1, 2, 4, 5 or 8 octets (TS 24.501 §9.11.2.8): SST
+/// alone, SST plus a mapped HPLMN SST, SST plus SD, and the combinations with
+/// mapped values. The SD is present exactly when the contents are 4 octets or
+/// more, and any mapped values that follow are carried through untouched.
+fn parse_nssai_entries(value: &[u8]) -> Vec<NssaiEntry> {
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < value.len() {
+        let len = usize::from(value[index]);
+        let start = index;
+        index += 1;
+        if len == 0 || index + len > value.len() {
+            break;
+        }
+        let contents = &value[index..index + len];
+        index += len;
+        let sd = if len >= 4 {
+            Some([contents[1], contents[2], contents[3]])
+        } else {
+            None
+        };
+        entries.push(NssaiEntry {
+            sst: contents[0],
+            sd,
+            raw: value[start..index].to_vec(),
+        });
+    }
+    entries
 }
 
 /// UE identity and credential material used by the MM procedures.
@@ -452,6 +572,20 @@ pub struct MmOrchestrator {
     signalled_paging_identity: Option<[u8; FIVE_G_S_TMSI_OCTETS]>,
     tai_list: Option<Vec<u8>>,
     allowed_nssai: Option<Vec<u8>>,
+    /// S-NSSAIs the network has rejected (TS 24.501 §9.11.3.46), excluded from
+    /// the Requested NSSAI of subsequent registrations
+    rejected_nssai: Vec<RejectedSNssai>,
+    /// Pending NSSAI (TS 24.501 §9.11.3.39): S-NSSAIs awaiting network
+    /// slice-specific authentication and authorization. Stored as signalled;
+    /// NSSAA itself is not implemented, so this is what the UE knows is pending
+    /// rather than a procedure state.
+    pending_nssai: Option<Vec<u8>>,
+    /// Network-assigned UE radio capability ID (RACS, TS 24.501 §9.11.3.68),
+    /// only kept when `racs_store_assigned_id` is configured
+    racs_id: Option<String>,
+    /// Whether an assigned UE radio capability ID is kept at all
+    /// (`UeConfig::racs_store_assigned_id`)
+    racs_store_assigned_id: bool,
     current_tai: Option<[u8; 6]>,
     /// Equivalent PLMN list signalled in the last Registration Accept
     /// (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). Each entry is a 3-octet
@@ -523,6 +657,10 @@ impl MmOrchestrator {
             signalled_paging_identity: None,
             tai_list: None,
             allowed_nssai: None,
+            rejected_nssai: Vec::new(),
+            pending_nssai: None,
+            racs_id: None,
+            racs_store_assigned_id: false,
             current_tai: None,
             equivalent_plmns: Vec::new(),
             t3502_value: None,
@@ -559,6 +697,7 @@ impl MmOrchestrator {
     /// until the next successful registration overwrites it.
     pub fn from_config(identity: MmUeIdentity, config: &UeConfig) -> Self {
         let mut orch = Self::new(identity);
+        orch.racs_store_assigned_id = config.racs_store_assigned_id;
         let Some(ref path) = config.state_file else {
             return orch;
         };
@@ -700,6 +839,213 @@ impl MmOrchestrator {
     /// The 5G-GUTI assigned by the network, if any
     pub fn stored_guti(&self) -> Option<&Ie5gsMobileIdentity> {
         self.stored_guti.as_ref()
+    }
+
+    /// The S-NSSAIs the network has rejected, with their cause
+    /// (TS 24.501 §9.11.3.46). Excluded from the Requested NSSAI of subsequent
+    /// registrations.
+    pub fn rejected_nssai(&self) -> &[RejectedSNssai] {
+        &self.rejected_nssai
+    }
+
+    /// The Pending NSSAI IE value last signalled by the network
+    /// (TS 24.501 §9.11.3.39), if any.
+    pub fn pending_nssai(&self) -> Option<&[u8]> {
+        self.pending_nssai.as_deref()
+    }
+
+    /// The network-assigned UE radio capability ID (RACS), when one was
+    /// assigned and `racs_store_assigned_id` is configured.
+    pub fn racs_id(&self) -> Option<&str> {
+        self.racs_id.as_deref()
+    }
+
+    /// Stores the Rejected NSSAI IE value the network signalled
+    /// (TS 24.501 §9.11.3.46).
+    ///
+    /// The signalled set REPLACES the stored one for the causes it mentions and
+    /// is merged with entries of other causes, rather than replacing everything:
+    /// the registration-area and PLMN sets have different lifetimes (§4.6.2.2),
+    /// so a Registration Accept that rejects one slice for the current
+    /// registration area must not resurrect a slice the PLMN rejected earlier.
+    fn store_rejected_nssai(&mut self, value: &[u8]) {
+        let signalled = parse_rejected_nssai(value);
+        if signalled.is_empty() {
+            return;
+        }
+        for entry in signalled {
+            if !self.rejected_nssai.contains(&entry) {
+                // A slice can only be rejected for one reason at a time: drop a
+                // previous entry for the same S-NSSAI so the newest cause (and
+                // therefore the newest lifetime) is the one that applies.
+                self.rejected_nssai
+                    .retain(|stored| !(stored.sst == entry.sst && stored.sd == entry.sd));
+                self.rejected_nssai.push(entry);
+            }
+        }
+        info!(
+            "rejected NSSAI now holds {} S-NSSAI(s); they are excluded from the next requested NSSAI",
+            self.rejected_nssai.len()
+        );
+    }
+
+    /// Drops from the rejected set every S-NSSAI the network has just allowed
+    /// (TS 24.501 §4.6.2.2 a) 3): a slice in the new allowed NSSAI is no longer
+    /// rejected, and leaving it in would suppress it from every later Requested
+    /// NSSAI even though the network is offering it.
+    ///
+    /// Mapped S-NSSAIs are not modelled here, so the qualification about
+    /// entries associated with mapped S-NSSAIs does not apply.
+    fn drop_rejected_now_allowed(&mut self, allowed_nssai: &[u8]) {
+        let allowed = parse_nssai_entries(allowed_nssai);
+        if allowed.is_empty() {
+            return;
+        }
+        let before = self.rejected_nssai.len();
+        self.rejected_nssai.retain(|rejected| {
+            !allowed
+                .iter()
+                .any(|entry| entry.sst == rejected.sst && entry.sd == rejected.sd)
+        });
+        if self.rejected_nssai.len() != before {
+            info!(
+                "dropped {} rejected S-NSSAI(s) that the new allowed NSSAI includes",
+                before - self.rejected_nssai.len()
+            );
+        }
+    }
+
+    /// Drops the registration-area-scoped rejections when the registration area
+    /// changes (TS 24.501 §4.6.2.2: those entries are associated with the
+    /// tracking areas where the S-NSSAI is unavailable).
+    ///
+    /// PLMN-scoped and NSSAA rejections survive, because the PLMN and the
+    /// authorization outcome have not changed.
+    fn drop_registration_area_rejections(&mut self) {
+        let before = self.rejected_nssai.len();
+        self.rejected_nssai
+            .retain(|entry| entry.cause != RejectedSNssaiCause::NotAvailableInRegistrationArea);
+        if self.rejected_nssai.len() != before {
+            info!(
+                "registration area changed: {} registration-area-scoped rejection(s) dropped",
+                before - self.rejected_nssai.len()
+            );
+        }
+    }
+
+    /// The Requested NSSAI to send in the next REGISTRATION REQUEST: the
+    /// configured requested NSSAI minus every S-NSSAI in the rejected NSSAI
+    /// (TS 24.501 §4.6.2.2).
+    ///
+    /// Returns `None` when every configured S-NSSAI has been rejected — the IE
+    /// is then omitted rather than sent empty, since an empty Requested NSSAI
+    /// would ask the network for a slice set it just refused.
+    fn requested_nssai_for_registration(&self) -> Option<Vec<u8>> {
+        let configured = self.identity.requested_nssai.as_ref()?;
+        if self.rejected_nssai.is_empty() {
+            return Some(configured.clone());
+        }
+        let kept: Vec<u8> = parse_nssai_entries(configured)
+            .into_iter()
+            .filter(|entry| {
+                !self
+                    .rejected_nssai
+                    .iter()
+                    .any(|rejected| rejected.sst == entry.sst && rejected.sd == entry.sd)
+            })
+            .flat_map(|entry| entry.raw)
+            .collect();
+        if kept.is_empty() {
+            warn!(
+                "every configured S-NSSAI is in the rejected NSSAI: omitting the requested NSSAI"
+            );
+            return None;
+        }
+        Some(kept)
+    }
+
+    /// Applies a Generic UE Configuration Update (TS 24.501 §5.4.4.2): stores
+    /// the parameters the network updated and restarts T3512 when a new value
+    /// came with it.
+    ///
+    /// Before this the decoded parameters were logged and dropped, so a
+    /// network-initiated 5G-GUTI reallocation, registration-area change or
+    /// allowed-NSSAI update had no effect and the next REGISTRATION REQUEST
+    /// still carried the old identity.
+    ///
+    /// The Annex C.1 snapshot is rewritten when the 5G-GUTI or the registration
+    /// area changed, because those are exactly the parameters it exists to keep
+    /// (a no-op unless a `state_file` is configured).
+    pub fn apply_config_update(&mut self, result: &ConfigUpdateResult) {
+        let mut persist = false;
+
+        if let Some(ref guti) = result.new_guti {
+            info!(
+                "Configuration Update assigned a new 5G-GUTI ({} bytes)",
+                guti.data.len()
+            );
+            self.stored_guti = Some(guti.clone());
+            persist = true;
+        }
+
+        if let Some(ref tai_list) = result.new_tai_list {
+            let area_changed = self.tai_list.as_ref() != Some(tai_list);
+            self.current_tai = parse_first_tai(tai_list);
+            self.tai_list = Some(tai_list.clone());
+            if area_changed {
+                self.drop_registration_area_rejections();
+            }
+            persist = true;
+        }
+
+        if let Some(ref nssai) = result.new_allowed_nssai {
+            self.allowed_nssai = Some(nssai.clone());
+            self.drop_rejected_now_allowed(nssai);
+        }
+
+        if let Some(ref nssai) = result.new_rejected_nssai {
+            self.store_rejected_nssai(nssai);
+        }
+
+        if let Some(secs) = result.new_t3512_secs {
+            if secs > 0 {
+                self.timers.start_with_interval(TIMER_T3512, secs, true);
+                info!("T3512 (periodic registration) restarted by Configuration Update: {secs}s");
+            } else {
+                self.timers.stop(TIMER_T3512, true);
+                info!("T3512 deactivated by Configuration Update");
+            }
+        }
+
+        // RACS (TS 24.501 §5.4.4.2): the deletion indication is applied before
+        // an assignment in the same command, so a command that deletes the old
+        // IDs and assigns a new one ends with the new one.
+        if let Some(deletion) = result.racs_deletion {
+            if deletion.deletes_network_assigned() {
+                if self.racs_id.take().is_some() {
+                    info!(
+                        "Configuration Update deleted the network-assigned UE radio capability ID"
+                    );
+                }
+            } else {
+                debug!("UE radio capability ID deletion indication: {deletion:?}");
+            }
+        }
+        if let Some(ref racs_id) = result.new_racs_id {
+            if self.racs_store_assigned_id {
+                info!("Configuration Update assigned UE radio capability ID {racs_id}");
+                self.racs_id = Some(racs_id.clone());
+            } else {
+                debug!(
+                    "UE radio capability ID {racs_id} assigned but not kept \
+                     (racs_store_assigned_id is off)"
+                );
+            }
+        }
+
+        if persist {
+            self.persist_state();
+        }
     }
 
     /// The 5G-S-TMSI the access stratum must match PCCH paging records against,
@@ -968,7 +1314,10 @@ impl MmOrchestrator {
         // Mandatory-for-security IEs: UE security capability (replayed by
         // the network in the Security Mode Command) and requested NSSAI
         req.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
-        req.requested_nssai = self.identity.requested_nssai.clone();
+        // TS 24.501 §4.6.2.2: an S-NSSAI in the rejected NSSAI must not be
+        // requested again, so the configured set is filtered rather than sent
+        // verbatim.
+        req.requested_nssai = self.requested_nssai_for_registration();
         req.last_visited_tai = self.current_tai;
         // TS 24.501 §5.5.1.2.2: report the stored UE policy sections so the PCF
         // knows what this UE already holds. Before this the sections existed in
@@ -1135,15 +1484,35 @@ impl MmOrchestrator {
 
         // Mandatory registration area / slice assignment from the network
         if let Some(ref tai_list) = acc.tai_list {
+            let area_changed = self.tai_list.as_ref() != Some(tai_list);
             self.current_tai = parse_first_tai(tai_list);
             self.tai_list = Some(tai_list.clone());
+            if area_changed {
+                self.drop_registration_area_rejections();
+            }
         } else {
             warn!("Registration Accept without TAI list (network not strict)");
         }
         if let Some(ref nssai) = acc.allowed_nssai {
             self.allowed_nssai = Some(nssai.clone());
+            // TS 24.501 §4.6.2.2 a) 3): a slice the network now allows is no
+            // longer rejected.
+            self.drop_rejected_now_allowed(nssai);
         } else {
             warn!("Registration Accept without Allowed NSSAI (network not strict)");
+        }
+        // Slice-selection state the UE must keep (TS 24.501 §5.5.1.2.4): the
+        // rejected NSSAI decides what a later Requested NSSAI may ask for, and
+        // the pending NSSAI records what is awaiting NSSAA.
+        if let Some(ref nssai) = acc.rejected_nssai {
+            self.store_rejected_nssai(nssai);
+        }
+        if let Some(ref nssai) = acc.pending_nssai {
+            info!(
+                "Registration Accept signalled a pending NSSAI ({} octets): NSSAA outstanding",
+                nssai.len()
+            );
+            self.pending_nssai = Some(nssai.clone());
         }
 
         // Equivalent PLMN list (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). The list
@@ -1247,6 +1616,12 @@ impl MmOrchestrator {
         self.res_star = None;
         if let Some(t3502_byte) = rej.t3502_value {
             self.t3502_value = Some(GprsTimer3::from_byte(t3502_byte));
+        }
+        // A REGISTRATION REJECT may carry the rejected NSSAI too
+        // (TS 24.501 §8.2.7). Storing it matters most here: the registration
+        // that failed is the one whose requested NSSAI should not be repeated.
+        if let Some(ref nssai) = rej.rejected_nssai {
+            self.store_rejected_nssai(nssai);
         }
 
         match cause {
@@ -2791,6 +3166,9 @@ fn parse_equivalent_plmns(value: &[u8]) -> Vec<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nas::mm::config_update::{
+        ConfigUpdateProcedure, ConfigurationUpdateCommand, RacsDeletionRequest,
+    };
     use nextgsim_nas::messages::mm::{
         Abba, Ie5gMmCause, Ie5gsRegistrationResult, IeNasSecurityAlgorithms,
         IeUeSecurityCapability, RegistrationResultValue, SmsOverNasAllowed,
@@ -3082,7 +3460,12 @@ mod tests {
     /// Drive a full successful registration + authentication + SMC sequence;
     /// returns the orchestrator with an active security context.
     fn establish_security_context() -> MmOrchestrator {
-        let mut orch = new_orch();
+        establish_security_context_with(MmOrchestrator::new(test_identity()))
+    }
+
+    /// As [`establish_security_context`], for an orchestrator built with a
+    /// different identity (e.g. a multi-slice requested NSSAI).
+    fn establish_security_context_with(mut orch: MmOrchestrator) -> MmOrchestrator {
         let outs = orch.start_registration(RegistrationType::InitialRegistration);
         assert_eq!(outs.len(), 1);
         assert!(orch.timers().t3510.is_running());
@@ -4399,6 +4782,431 @@ mod tests {
         // GUTI TMSI bytes were 0xDEADBEEF; the 5G-S-TMSI carries set/ptr + TMSI
         assert_eq!(&req.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(req.uplink_data_status, Some(0x0008), "PSI 3 is bit 3");
+    }
+
+    // ========================================================================
+    // Generic UE configuration update + slice-selection state (#19)
+    // ========================================================================
+
+    /// A configured requested NSSAI with TWO slices: SST 1 without an SD and
+    /// SST 2 with SD AABBCC. Two entries so a filtering test can assert that the
+    /// rejected one is dropped AND the other survives — a single-slice fixture
+    /// passes against an implementation that drops everything.
+    const TWO_SLICE_REQUESTED_NSSAI: [u8; 7] = [0x01, 0x01, 0x04, 0x02, 0xAA, 0xBB, 0xCC];
+
+    /// A registered UE with a two-slice configured requested NSSAI and an active
+    /// security context, so the network messages under test (REGISTRATION
+    /// ACCEPT, REGISTRATION REJECT) can be integrity protected — an
+    /// unprotected one is discarded per TS 24.501 §4.4.4.2, which would make
+    /// every assertion below vacuous.
+    fn orch_with_two_slices() -> MmOrchestrator {
+        let mut identity = test_identity();
+        identity.requested_nssai = Some(TWO_SLICE_REQUESTED_NSSAI.to_vec());
+        establish_security_context_with(MmOrchestrator::new(identity))
+    }
+
+    /// The requested NSSAI the next REGISTRATION REQUEST carries.
+    ///
+    /// Read from the stashed FULL request rather than the emitted PDU: the
+    /// requested NSSAI is not a cleartext IE (TS 24.501 §4.4.6), so the plain
+    /// wire copy of an unprotected request omits it by design.
+    fn requested_nssai_in_the_next_request(orch: &mut MmOrchestrator) -> Option<Vec<u8>> {
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let full = orch
+            .last_registration_request
+            .as_ref()
+            .expect("a registration request must have been built");
+        RegistrationRequest::decode(&mut &full[3..])
+            .unwrap()
+            .requested_nssai
+    }
+
+    /// Runs the real procedure over a command, so the tests exercise the
+    /// message → result mapping rather than a hand-built result.
+    fn config_update_result(cmd: ConfigurationUpdateCommand) -> ConfigUpdateResult {
+        ConfigUpdateProcedure::process_command(&cmd)
+    }
+
+    fn command_with_guti(guti_data: Vec<u8>) -> ConfigurationUpdateCommand {
+        let mut cmd = ConfigurationUpdateCommand::new();
+        cmd.guti = Some(Ie5gsMobileIdentity::new(
+            MobileIdentityType::Guti,
+            guti_data,
+        ));
+        cmd
+    }
+
+    /// The 5G-GUTI a Configuration Update Command reallocates, distinct from the
+    /// Registration Accept fixture's GUTI in every octet that matters.
+    const CONFIG_UPDATE_GUTI: [u8; 11] = [
+        0xF2, 0x99, 0xF9, 0x07, 0x02, 0x00, 0x80, 0xC0, 0xFF, 0xEE, 0x01,
+    ];
+
+    #[test]
+    fn a_config_update_guti_is_stored_and_used_by_the_next_registration_request() {
+        let mut orch = new_orch();
+        assert!(orch.stored_guti().is_none(), "precondition: no GUTI yet");
+
+        orch.apply_config_update(&config_update_result(command_with_guti(
+            CONFIG_UPDATE_GUTI.to_vec(),
+        )));
+
+        assert_eq!(
+            orch.stored_guti().map(|g| g.data.clone()),
+            Some(CONFIG_UPDATE_GUTI.to_vec()),
+            "the reallocated 5G-GUTI must be stored, not logged and dropped"
+        );
+        let (identity_type, _, _) = registration_identity(&mut orch);
+        assert_eq!(
+            identity_type,
+            MobileIdentityType::Guti,
+            "the next Registration Request must identify the UE by the new GUTI"
+        );
+    }
+
+    #[test]
+    fn a_config_update_t3512_restarts_the_periodic_registration_timer() {
+        let mut orch = new_orch();
+        let mut cmd = ConfigurationUpdateCommand::new();
+        // Unit 000 (10 minutes), value 3 → 1800 s. Not a value any default
+        // could coincide with.
+        cmd.t3512_value_secs = Some(decode_config_update_timer(0b000_00011));
+        orch.apply_config_update(&config_update_result(cmd));
+
+        assert!(orch.timers().t3512.is_running());
+        assert_eq!(orch.timers().t3512.interval(), 1800);
+    }
+
+    #[test]
+    fn a_config_update_deactivating_t3512_stops_the_timer() {
+        let mut orch = new_orch();
+        let mut start = ConfigurationUpdateCommand::new();
+        start.t3512_value_secs = Some(1800);
+        orch.apply_config_update(&config_update_result(start));
+        assert!(orch.timers().t3512.is_running());
+
+        let mut stop = ConfigurationUpdateCommand::new();
+        stop.t3512_value_secs = Some(0); // unit 111: deactivated
+        orch.apply_config_update(&config_update_result(stop));
+
+        assert!(
+            !orch.timers().t3512.is_running(),
+            "a deactivated T3512 must stop the timer, not restart it at 0s"
+        );
+    }
+
+    /// Same decoder the message path uses, so the fixture cannot drift from it.
+    fn decode_config_update_timer(byte: u8) -> u32 {
+        GprsTimer3::from_byte(byte).to_seconds()
+    }
+
+    #[test]
+    fn a_config_update_tai_list_updates_the_registration_area() {
+        let mut orch = new_orch();
+        let mut cmd = ConfigurationUpdateCommand::new();
+        // TAI list: type 00, one entry, PLMN 999/70, TAC 0x000007
+        cmd.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x07]);
+        orch.apply_config_update(&config_update_result(cmd));
+
+        assert_eq!(
+            orch.current_tai,
+            Some([0x99, 0xF9, 0x07, 0x00, 0x00, 0x07]),
+            "the new registration area must be recorded for the Last visited TAI"
+        );
+    }
+
+    #[test]
+    fn a_config_update_allowed_nssai_replaces_the_stored_one() {
+        let mut orch = new_orch();
+        let mut cmd = ConfigurationUpdateCommand::new();
+        cmd.allowed_nssai = Some(vec![0x04, 0x02, 0xAA, 0xBB, 0xCC]);
+        orch.apply_config_update(&config_update_result(cmd));
+
+        assert_eq!(
+            orch.allowed_nssai(),
+            Some(&vec![0x04, 0x02, 0xAA, 0xBB, 0xCC][..])
+        );
+    }
+
+    #[test]
+    fn a_rejected_nssai_ie_parses_every_entry_with_its_cause() {
+        // SST 1 rejected for the PLMN, SST 2/AABBCC for the registration area,
+        // SST 3 for a failed NSSAA.
+        let value = [0x10, 0x01, 0x41, 0x02, 0xAA, 0xBB, 0xCC, 0x12, 0x03];
+        assert_eq!(
+            parse_rejected_nssai(&value),
+            vec![
+                RejectedSNssai {
+                    cause: RejectedSNssaiCause::NotAvailableInPlmn,
+                    sst: 1,
+                    sd: None,
+                },
+                RejectedSNssai {
+                    cause: RejectedSNssaiCause::NotAvailableInRegistrationArea,
+                    sst: 2,
+                    sd: Some([0xAA, 0xBB, 0xCC]),
+                },
+                RejectedSNssai {
+                    cause: RejectedSNssaiCause::NssaaFailedOrRevoked,
+                    sst: 3,
+                    sd: None,
+                },
+            ]
+        );
+    }
+
+    /// A truncated trailing entry is DROPPED, not half-read: an S-NSSAI read
+    /// short is a different slice, and excluding the wrong one would suppress a
+    /// slice the network allows.
+    #[test]
+    fn a_truncated_rejected_nssai_entry_is_dropped_rather_than_half_read() {
+        // First entry complete (SST 1); second claims an SD but supplies 2 of 3
+        // octets.
+        let value = [0x10, 0x01, 0x40, 0x02, 0xAA, 0xBB];
+        assert_eq!(
+            parse_rejected_nssai(&value),
+            vec![RejectedSNssai {
+                cause: RejectedSNssaiCause::NotAvailableInPlmn,
+                sst: 1,
+                sd: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rejected_s_nssai_is_omitted_from_the_next_requested_nssai() {
+        let mut orch = orch_with_two_slices();
+        // Reject SST 1 (no SD) for the current PLMN: entry length 1, cause 0000.
+        let acc = accept_with_rejected_nssai(&orch, &[0x10, 0x01]);
+        orch.handle_downlink(&acc);
+
+        assert_eq!(
+            orch.rejected_nssai(),
+            &[RejectedSNssai {
+                cause: RejectedSNssaiCause::NotAvailableInPlmn,
+                sst: 1,
+                sd: None,
+            }]
+        );
+        assert_eq!(
+            requested_nssai_in_the_next_request(&mut orch),
+            Some(vec![0x04, 0x02, 0xAA, 0xBB, 0xCC]),
+            "the rejected SST 1 must be gone and the other slice must remain"
+        );
+    }
+
+    /// An S-NSSAI with an SD is a DIFFERENT slice from the same SST without one,
+    /// so rejecting one must not exclude the other.
+    #[test]
+    fn a_rejection_matches_on_the_whole_s_nssai_not_just_the_sst() {
+        let mut orch = orch_with_two_slices();
+        // Reject SST 2 with a DIFFERENT SD (112233), not the configured AABBCC.
+        let acc = accept_with_rejected_nssai(&orch, &[0x40, 0x02, 0x11, 0x22, 0x33]);
+        orch.handle_downlink(&acc);
+
+        assert_eq!(
+            requested_nssai_in_the_next_request(&mut orch),
+            Some(TWO_SLICE_REQUESTED_NSSAI.to_vec()),
+            "a rejection for another SD must leave both configured slices requested"
+        );
+    }
+
+    #[test]
+    fn every_configured_slice_rejected_omits_the_requested_nssai_ie() {
+        let mut orch = orch_with_two_slices();
+        let acc = accept_with_rejected_nssai(&orch, &[0x10, 0x01, 0x40, 0x02, 0xAA, 0xBB, 0xCC]);
+        orch.handle_downlink(&acc);
+
+        assert_eq!(
+            requested_nssai_in_the_next_request(&mut orch),
+            None,
+            "an empty requested NSSAI would ask for the slice set just refused"
+        );
+    }
+
+    /// TS 24.501 §4.6.2.2 a) 3): a slice the network now allows is no longer
+    /// rejected. Without this a stale rejection suppresses the slice forever.
+    #[test]
+    fn a_newly_allowed_s_nssai_leaves_the_rejected_set() {
+        let mut orch = orch_with_two_slices();
+        let acc = accept_with_rejected_nssai(&orch, &[0x10, 0x01]);
+        orch.handle_downlink(&acc);
+        assert_eq!(orch.rejected_nssai().len(), 1);
+
+        // A later Accept allows SST 1 again.
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        let pdu = protect_downlink(&orch, &plain, 2);
+        orch.handle_downlink(&pdu);
+
+        assert!(
+            orch.rejected_nssai().is_empty(),
+            "the allowed NSSAI must clear the matching rejection"
+        );
+        assert_eq!(
+            requested_nssai_in_the_next_request(&mut orch),
+            Some(TWO_SLICE_REQUESTED_NSSAI.to_vec())
+        );
+    }
+
+    /// Registration-area rejections are scoped to the area (§4.6.2.2); PLMN ones
+    /// are not. A move must drop exactly the first kind.
+    #[test]
+    fn a_registration_area_change_drops_only_the_area_scoped_rejections() {
+        let mut orch = orch_with_two_slices();
+        // SST 1 rejected for the registration area (cause 0001), SST 2/AABBCC
+        // rejected for the PLMN (cause 0000).
+        let acc = accept_with_rejected_nssai(&orch, &[0x11, 0x01, 0x40, 0x02, 0xAA, 0xBB, 0xCC]);
+        orch.handle_downlink(&acc);
+        assert_eq!(orch.rejected_nssai().len(), 2);
+
+        // A second Accept with a different TAI list: the UE moved.
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x09]);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        let pdu = protect_downlink(&orch, &plain, 2);
+        orch.handle_downlink(&pdu);
+
+        assert_eq!(
+            orch.rejected_nssai(),
+            &[RejectedSNssai {
+                cause: RejectedSNssaiCause::NotAvailableInPlmn,
+                sst: 2,
+                sd: Some([0xAA, 0xBB, 0xCC]),
+            }],
+            "the PLMN-scoped rejection survives a move; the area-scoped one does not"
+        );
+    }
+
+    #[test]
+    fn a_rejected_nssai_in_a_registration_reject_is_stored() {
+        let mut orch = orch_with_two_slices();
+        let mut rej = RegistrationReject::new(Ie5gMmCause::new(MmCause::Congestion));
+        rej.rejected_nssai = Some(vec![0x10, 0x01]);
+        let mut plain = Vec::new();
+        rej.encode(&mut plain);
+        let pdu = protect_downlink(&orch, &plain, 1);
+        orch.handle_downlink(&pdu);
+
+        assert_eq!(
+            orch.rejected_nssai().len(),
+            1,
+            "the registration that failed is the one whose NSSAI must not be repeated"
+        );
+    }
+
+    #[test]
+    fn a_pending_nssai_is_stored_from_a_registration_accept() {
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.pending_nssai = Some(vec![0x01, 0x03]);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        let pdu = protect_downlink(&orch, &plain, 1);
+        orch.handle_downlink(&pdu);
+
+        assert_eq!(orch.pending_nssai(), Some(&[0x01, 0x03][..]));
+    }
+
+    /// An integrity-protected REGISTRATION ACCEPT carrying a rejected NSSAI.
+    /// Protected because an unprotected Accept is discarded by TS 24.501
+    /// §4.4.4.2, which would make every assertion that follows vacuous.
+    fn accept_with_rejected_nssai(orch: &MmOrchestrator, rejected: &[u8]) -> Vec<u8> {
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.rejected_nssai = Some(rejected.to_vec());
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        protect_downlink(orch, &plain, 1)
+    }
+
+    // ---- RACS ------------------------------------------------------------
+
+    fn config_with_racs(store: bool) -> UeConfig {
+        UeConfig {
+            racs_store_assigned_id: store,
+            ..UeConfig::default()
+        }
+    }
+
+    fn command_with_racs_id(id: &str, octets: Vec<u8>) -> ConfigurationUpdateCommand {
+        let mut cmd = ConfigurationUpdateCommand::new();
+        let _ = octets;
+        cmd.ue_radio_capability_id = Some(id.to_string());
+        cmd
+    }
+
+    #[test]
+    fn an_assigned_ue_radio_capability_id_is_kept_when_configured() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &config_with_racs(true));
+        orch.apply_config_update(&config_update_result(command_with_racs_id(
+            "123456",
+            vec![],
+        )));
+        assert_eq!(orch.racs_id(), Some("123456"));
+    }
+
+    /// Off by default: the ID is decoded (so the command is still processed and
+    /// acknowledged) and discarded, because nothing signals it yet.
+    #[test]
+    fn an_assigned_ue_radio_capability_id_is_discarded_by_default() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &config_with_racs(false));
+        let result = config_update_result(command_with_racs_id("123456", vec![]));
+        orch.apply_config_update(&result);
+        assert_eq!(orch.racs_id(), None);
+        assert_eq!(
+            result.new_racs_id.as_deref(),
+            Some("123456"),
+            "the IE is still decoded and reported to the caller"
+        );
+    }
+
+    #[test]
+    fn a_deletion_indication_removes_the_stored_ue_radio_capability_id() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &config_with_racs(true));
+        orch.apply_config_update(&config_update_result(command_with_racs_id(
+            "123456",
+            vec![],
+        )));
+        assert_eq!(orch.racs_id(), Some("123456"));
+
+        let mut cmd = ConfigurationUpdateCommand::new();
+        cmd.ue_radio_capability_id_deletion = Some(RacsDeletionRequest::NetworkAssigned);
+        orch.apply_config_update(&config_update_result(cmd));
+
+        assert_eq!(orch.racs_id(), None);
+    }
+
+    /// A command that deletes and reassigns in one message ends with the NEW ID:
+    /// applying the deletion after the assignment would leave the UE with none.
+    #[test]
+    fn a_command_that_deletes_and_reassigns_keeps_the_new_id() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &config_with_racs(true));
+        orch.apply_config_update(&config_update_result(command_with_racs_id(
+            "aaaaaa",
+            vec![],
+        )));
+
+        let mut cmd = ConfigurationUpdateCommand::new();
+        cmd.ue_radio_capability_id_deletion = Some(RacsDeletionRequest::NetworkAssigned);
+        cmd.ue_radio_capability_id = Some("bbbbbb".to_string());
+        orch.apply_config_update(&config_update_result(cmd));
+
+        assert_eq!(orch.racs_id(), Some("bbbbbb"));
     }
 
     // ========================================================================

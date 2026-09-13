@@ -1822,15 +1822,14 @@ async fn handle_unmanaged_mm_message(
             };
             let result = ConfigUpdateProcedure::process_command(&cmd);
 
-            if let Some(ref new_guti) = result.new_guti {
-                info!(
-                    "ConfigurationUpdate: new GUTI received (type={:?})",
-                    new_guti.identity_type
-                );
-            }
-            if let Some(t) = result.new_t3512_secs {
-                info!("ConfigurationUpdate: T3512 updated to {}s", t);
-            }
+            // TS 24.501 §5.4.4.2: the updated parameters are STORED. Before this
+            // they were only logged, so a network-initiated 5G-GUTI
+            // reallocation, registration-area change, allowed-NSSAI update or
+            // T3512 change was thrown away and the next Registration Request
+            // still carried the old identity.
+            orch.apply_config_update(&result);
+            // The paging identity follows the 5G-GUTI (TS 38.331 §5.3.2.3).
+            sync_paging_identity(orch, task_base).await;
 
             // Send ConfigurationUpdateComplete if the ACK bit was set
             if result.send_complete {

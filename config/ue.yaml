@@ -187,6 +187,13 @@ tun_name: "uesimtun0"
 # REDCAP_SESS_AMBR_DL_BPS / REDCAP_SESS_AMBR_UL_BPS on the SMF).
 redcap: false
 
+# Keep the network-assigned UE radio capability ID (RACS, Rel-16; TS 24.501
+# §9.11.3.68) that a CONFIGURATION UPDATE COMMAND assigns.
+# false: the IE is decoded (so the command is still applied and acknowledged)
+# and the ID discarded, because nothing signals a UE radio capability ID yet --
+# there is no RACS IE in the REGISTRATION REQUEST and no RRC or NGAP consumer.
+racs_store_assigned_id: false
+
 # Rel-20 6G AI-native network function features
 # All disabled by default; enable for 6G research deployments
 she_enabled: false              # SHE Client - edge inference offloading (Rel-20)
