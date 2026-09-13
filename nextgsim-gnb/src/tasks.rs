@@ -598,6 +598,22 @@ pub enum RlsMessage {
         /// RRC PDU data
         data: OctetString,
     },
+    /// Cell-wide broadcast of an RRC PDU on a common downlink channel
+    /// (from RRC).
+    ///
+    /// Unlike [`RlsMessage::DownlinkRrc`] this carries no UE ID: a broadcast
+    /// channel such as PCCH addresses every UE camped on the cell, and for
+    /// paging the gNB does not know which UE (if any) is listening — that is
+    /// what the paged identity inside the PDU is for (TS 38.331 §5.3.2.2).
+    BroadcastRrc {
+        /// RRC channel to broadcast on (a downlink common channel)
+        rrc_channel: RrcChannel,
+        /// PDU ID for acknowledgment tracking; 0 disables per-UE
+        /// acknowledgment, which is what a broadcast wants
+        pdu_id: u32,
+        /// RRC PDU data
+        data: OctetString,
+    },
     /// Downlink data PDU (from GTP)
     DownlinkData {
         /// UE ID

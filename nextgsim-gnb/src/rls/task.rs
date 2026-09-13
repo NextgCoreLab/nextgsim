@@ -349,6 +349,64 @@ impl RlsTask {
         self.send_rls_message(dest, &msg).await;
     }
 
+    /// Broadcasts an RRC PDU on a downlink common channel to every UE the cell
+    /// has discovered (TS 38.331 §5.3.2.2 for PCCH paging).
+    ///
+    /// The real air interface has one transmission that every camped UE can
+    /// receive; RLS is a unicast UDP transport, so the cell-wide broadcast is
+    /// simulated by sending the same PDU to each discovered UE address. Distinct
+    /// addresses are sent to once even when several UE IDs share one (a single
+    /// `nr-ue` process holding several UEs), because the receiving RLS layer
+    /// dispatches on the cell, not on the UE ID.
+    ///
+    /// Delivery is best-effort and unacknowledged, matching PCCH: there is no
+    /// per-UE ack, no retransmission and no queueing for a UE that is not
+    /// currently discovered.
+    async fn handle_broadcast_rrc(
+        &mut self,
+        rrc_channel: RrcChannel,
+        pdu_id: u32,
+        data: OctetString,
+    ) {
+        if !rrc_channel.is_downlink() {
+            warn!("Refusing to broadcast on uplink channel {rrc_channel:?}");
+            return;
+        }
+
+        let mut destinations: Vec<SocketAddr> = self.ue_addresses.values().copied().collect();
+        destinations.sort_unstable();
+        destinations.dedup();
+
+        if destinations.is_empty() {
+            debug!(
+                "Broadcast RRC on {:?} dropped: no UE discovered on this cell",
+                rrc_channel
+            );
+            return;
+        }
+
+        debug!(
+            "Broadcast RRC: channel={:?}, pdu_id={}, len={}, destinations={}",
+            rrc_channel,
+            pdu_id,
+            data.len(),
+            destinations.len()
+        );
+
+        let pdu = RlsPduTransmission {
+            sti: self.sti,
+            pdu_type: PduType::Rrc,
+            pdu_id,
+            payload: rrc_channel as u32,
+            pdu: Bytes::copy_from_slice(data.data()),
+        };
+        let msg = RlsProtocolMessage::PduTransmission(pdu);
+
+        for dest in destinations {
+            self.send_rls_message(dest, &msg).await;
+        }
+    }
+
     /// Handles downlink user plane data from GTP task.
     ///
     /// The SDU from GTP is submitted to the per-UE RLC entity (UM, SN12).
@@ -510,6 +568,9 @@ impl Task for RlsTask {
                                 RlsMessage::DownlinkRrc { ue_id, rrc_channel, pdu_id, data } => {
                                     self.handle_downlink_rrc(ue_id, rrc_channel, pdu_id, data).await;
                                 }
+                                RlsMessage::BroadcastRrc { rrc_channel, pdu_id, data } => {
+                                    self.handle_broadcast_rrc(rrc_channel, pdu_id, data).await;
+                                }
                                 RlsMessage::DownlinkData { ue_id, psi, pdu } => {
                                     self.handle_downlink_data(ue_id, psi, pdu).await;
                                 }
@@ -634,5 +695,100 @@ mod tests {
         let task = RlsTask::with_bind_address(task_base, bind_addr);
 
         assert_eq!(task.bind_address, bind_addr);
+    }
+
+    // ========================================================================
+    // Broadcast fan-out (#35): PCCH reaches every discovered UE, once each
+    // ========================================================================
+
+    /// A cell-side RLS task bound to an ephemeral port, with a live socket.
+    async fn broadcasting_task() -> RlsTask {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task =
+            RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind address"));
+        task.init_socket().await.expect("RLS socket");
+        task
+    }
+
+    /// Receives one datagram (with a bounded wait so a missing broadcast fails
+    /// the test instead of hanging) and returns the RRC channel and payload it
+    /// carries.
+    async fn recv_rrc_pdu(socket: &UdpSocket) -> Option<(RrcChannel, Vec<u8>)> {
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        let len = tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        buf.truncate(len);
+        match codec::decode(&Bytes::from(buf)).ok()? {
+            RlsProtocolMessage::PduTransmission(pdu) => {
+                Some((RrcChannel::from_u32(pdu.payload)?, pdu.pdu.to_vec()))
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pcch_broadcast_reaches_every_discovered_ue() {
+        let ue_a = UdpSocket::bind("127.0.0.1:0").await.expect("UE A socket");
+        let ue_b = UdpSocket::bind("127.0.0.1:0").await.expect("UE B socket");
+
+        let mut task = broadcasting_task().await;
+        task.ue_addresses.insert(1, ue_a.local_addr().unwrap());
+        task.ue_addresses.insert(2, ue_b.local_addr().unwrap());
+
+        let payload = OctetString::from_slice(&[0x20, 0x00, 0x48]);
+        task.handle_broadcast_rrc(RrcChannel::Pcch, 0, payload)
+            .await;
+
+        for (name, socket) in [("A", &ue_a), ("B", &ue_b)] {
+            let (channel, data) = recv_rrc_pdu(socket)
+                .await
+                .unwrap_or_else(|| panic!("UE {name} received no broadcast"));
+            assert_eq!(channel, RrcChannel::Pcch);
+            assert_eq!(data, vec![0x20, 0x00, 0x48]);
+        }
+    }
+
+    /// Two UE IDs behind one address (one `nr-ue` process holding several UEs)
+    /// must get ONE transmission, not one per UE: the receiving RLS layer
+    /// dispatches the PDU on the cell, so a duplicate would be processed twice
+    /// and a UE paged twice would start two service requests.
+    #[tokio::test]
+    async fn ue_ids_sharing_an_address_receive_one_transmission() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let addr = ue.local_addr().unwrap();
+
+        let mut task = broadcasting_task().await;
+        task.ue_addresses.insert(1, addr);
+        task.ue_addresses.insert(2, addr);
+
+        task.handle_broadcast_rrc(RrcChannel::Pcch, 0, OctetString::from_slice(&[0x20]))
+            .await;
+
+        assert!(
+            recv_rrc_pdu(&ue).await.is_some(),
+            "the shared address must receive the broadcast"
+        );
+        assert!(
+            recv_rrc_pdu(&ue).await.is_none(),
+            "and must not receive it a second time"
+        );
+    }
+
+    /// An uplink channel is not broadcastable; the guard exists so a wiring
+    /// mistake is refused rather than transmitted.
+    #[tokio::test]
+    async fn a_broadcast_on_an_uplink_channel_is_refused() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+
+        let mut task = broadcasting_task().await;
+        task.ue_addresses.insert(1, ue.local_addr().unwrap());
+
+        task.handle_broadcast_rrc(RrcChannel::UlDcch, 0, OctetString::from_slice(&[0x01]))
+            .await;
+
+        assert!(recv_rrc_pdu(&ue).await.is_none());
     }
 }

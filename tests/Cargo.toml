@@ -95,3 +95,7 @@ path = "src/sixg_task_integration.rs"
 [[test]]
 name = "rrc_handshake"
 path = "src/rrc_handshake.rs"
+
+[[test]]
+name = "paging_mt_service_request"
+path = "src/paging_mt_service_request.rs"

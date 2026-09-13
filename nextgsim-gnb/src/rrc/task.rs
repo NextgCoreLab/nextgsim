@@ -14,6 +14,7 @@ use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_ul_dcch, UlDcchMessage};
 use nextgsim_rrc::procedures::information_transfer::{
     encode_dl_information_transfer, DlInformationTransferParams,
 };
+use nextgsim_rrc::procedures::paging::{encode_paging, PagingRecordParams, FIVE_G_S_TMSI_LEN};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_complete, decode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
@@ -27,6 +28,10 @@ use nextgsim_rrc::procedures::ue_capability::{
 /// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
 /// UECapabilityEnquiry (DL) / UECapabilityInformation (UL).
 const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
+
+/// Octets per serialised TAI in an `RrcMessage::Paging` TAI list: a 3-octet
+/// PLMN identity followed by a 3-octet TAC (TS 38.413 §9.3.3.11).
+const TAI_OCTETS: usize = 6;
 
 use super::connection::RrcConnectionManager;
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
@@ -865,8 +870,57 @@ impl RrcTask {
         self.ue_manager.delete_ue(ue_id);
     }
 
-    async fn handle_paging(&mut self, _ue_paging_tmsi: Vec<u8>, _tai_list_for_paging: Vec<u8>) {
-        debug!("Paging request received");
+    /// Handles `RrcMessage::Paging`: builds the TS 38.331 §5.3.2.2 `Paging`
+    /// message from the NGAP-supplied 5G-S-TMSI and broadcasts it on PCCH.
+    ///
+    /// `ue_paging_tmsi` is the 48-bit 5G-S-TMSI serialised by the NGAP task
+    /// (TS 23.003 §2.10.1: AMF Set ID + AMF Pointer packed into two octets,
+    /// then the 32-bit 5G-TMSI). `tai_list_for_paging` is the set of served
+    /// TAIs the NGAP layer already matched against this gNB's own TAI — it is
+    /// what authorises the transmission, and it is not carried on the air
+    /// interface: the RRC `Paging` message has no TAI member, because a UE
+    /// reading PCCH is by definition in the cell.
+    ///
+    /// PAGING OCCASION: the PDU is broadcast immediately rather than at the
+    /// UE's paging occasion. TS 38.304 §7.1 derives the PF/PO from the UE
+    /// identity and the DRX cycle *in radio frames*, and this simulator has no
+    /// frame clock at all (no SFN is maintained anywhere; RLS is a UDP
+    /// transport with no slot timing), so a PF/PO computed here could not gate
+    /// anything without inventing a frame counter. Tracked as a follow-up
+    /// rather than faked.
+    ///
+    /// Public because it is a real message-handler entry point also driven
+    /// directly by the in-process strict-peer harness
+    /// (`tests/src/paging_mt_service_request.rs`).
+    pub async fn handle_paging(&mut self, ue_paging_tmsi: Vec<u8>, tai_list_for_paging: Vec<u8>) {
+        let s_tmsi: [u8; FIVE_G_S_TMSI_LEN] = match ue_paging_tmsi.as_slice().try_into() {
+            Ok(tmsi) => tmsi,
+            Err(_) => {
+                warn!(
+                    "Paging dropped: 5G-S-TMSI is {} octets, expected {}",
+                    ue_paging_tmsi.len(),
+                    FIVE_G_S_TMSI_LEN
+                );
+                return;
+            }
+        };
+
+        let pdu = match encode_paging(&[PagingRecordParams::five_g_s_tmsi(s_tmsi)]) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                error!("Failed to encode PCCH Paging: {e}");
+                return;
+            }
+        };
+
+        info!(
+            "Broadcasting PCCH Paging for 5G-S-TMSI {:02x?} ({} served TAI(s) matched)",
+            s_tmsi,
+            tai_list_for_paging.len() / TAI_OCTETS
+        );
+
+        self.broadcast_rrc_message(RrcChannel::Pcch, OctetString::from_slice(&pdu))
+            .await;
     }
 
     async fn send_rrc_message(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
@@ -879,6 +933,22 @@ impl RrcTask {
         };
         if let Err(e) = self.task_base.rls_tx.send(msg).await {
             error!("Failed to send RRC message to RLS: {}", e);
+        }
+    }
+
+    /// Broadcasts an RRC PDU on a downlink common channel (PCCH paging).
+    ///
+    /// `pdu_id` is 0: a broadcast has no addressee to acknowledge it, and a
+    /// non-zero PDU ID would make every receiving UE queue an ack for a PDU the
+    /// gNB is not tracking.
+    async fn broadcast_rrc_message(&mut self, channel: RrcChannel, data: OctetString) {
+        let msg = RlsMessage::BroadcastRrc {
+            rrc_channel: channel,
+            pdu_id: 0,
+            data,
+        };
+        if let Err(e) = self.task_base.rls_tx.send(msg).await {
+            error!("Failed to broadcast RRC message to RLS: {}", e);
         }
     }
 
@@ -1483,6 +1553,88 @@ mod tests {
             pdu.data(),
             &[0x04, 0x00, 0x00, 0x7E, 0x00, 0x42][..],
             "C5-off: legacy bespoke DL framing preserved for the matched-sim UE"
+        );
+    }
+
+    // ========================================================================
+    // Paging (#35): NGAP Paging -> PCCH broadcast
+    // ========================================================================
+
+    /// 5G-S-TMSI as the NGAP task serialises it: AMF Set ID 0x155 and AMF
+    /// Pointer 0x2A packed into 0x556A, then the 32-bit 5G-TMSI.
+    const PAGED_S_TMSI: [u8; 6] = [0x55, 0x6A, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    /// One served TAI serialised as `RrcMessage::Paging` carries it: 3-octet
+    /// PLMN identity followed by a 3-octet TAC.
+    fn served_tai_list() -> Vec<u8> {
+        vec![0x00, 0xF1, 0x10, 0x00, 0x00, 0x01]
+    }
+
+    /// Pops the next broadcast RRC PDU the gNB handed to its RLS.
+    fn try_take_broadcast(
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) -> Option<(RrcChannel, u32, OctetString)> {
+        while let Ok(msg) = rls_rx.try_recv() {
+            if let TaskMessage::Message(RlsMessage::BroadcastRrc {
+                rrc_channel,
+                pdu_id,
+                data,
+            }) = msg
+            {
+                return Some((rrc_channel, pdu_id, data));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_paged_5g_s_tmsi_is_broadcast_as_a_pcch_paging_record() {
+        use nextgsim_rrc::procedures::paging::{decode_paging, PagedUeIdentity};
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_paging(PAGED_S_TMSI.to_vec(), served_tai_list())
+                .await;
+        });
+
+        let (channel, pdu_id, pdu) =
+            try_take_broadcast(&mut rls_rx).expect("paging must be broadcast to RLS");
+        assert_eq!(channel, RrcChannel::Pcch, "paging goes out on PCCH");
+        assert_eq!(pdu_id, 0, "a broadcast is not per-UE acknowledged");
+
+        let records = decode_paging(pdu.data()).expect("the broadcast PDU must be a PCCH Paging");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].ue_identity,
+            PagedUeIdentity::FiveGSTmsi(PAGED_S_TMSI),
+            "the record must carry the 5G-S-TMSI the AMF paged"
+        );
+        assert!(
+            !records[0].non_3gpp_access,
+            "3GPP-access paging must not set accessType"
+        );
+    }
+
+    /// A 5G-S-TMSI of the wrong length cannot be encoded into the 48-bit
+    /// `NG-5G-S-TMSI` BIT STRING, and zero-padding one would page a different
+    /// UE. Nothing is transmitted.
+    #[test]
+    fn a_malformed_5g_s_tmsi_broadcasts_nothing() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_paging(vec![0xDE, 0xAD, 0xBE], served_tai_list())
+                .await;
+        });
+
+        assert!(
+            try_take_broadcast(&mut rls_rx).is_none(),
+            "a short 5G-S-TMSI must not be padded into a paging record"
         );
     }
 }

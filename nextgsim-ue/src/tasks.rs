@@ -34,29 +34,8 @@ use tokio::task::JoinHandle;
 use nextgsim_common::config::UeConfig;
 use nextgsim_common::types::Tai;
 use nextgsim_common::OctetString;
-use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
-
-// ============================================================================
-// Common Types
-// ============================================================================
-
-/// GUTI mobile identity for S-TMSI.
-///
-/// Based on 3GPP TS 24.501 Section 9.11.3.4.
-#[derive(Debug, Clone)]
-pub struct GutiMobileIdentity {
-    /// PLMN
-    pub plmn: Plmn,
-    /// AMF region ID
-    pub amf_region_id: u8,
-    /// AMF set ID (10 bits)
-    pub amf_set_id: u16,
-    /// AMF pointer (6 bits)
-    pub amf_pointer: u8,
-    /// 5G-TMSI
-    pub tmsi: u32,
-}
+use nextgsim_rrc::procedures::paging::FIVE_G_S_TMSI_LEN;
 
 // ============================================================================
 // Task Message Envelope
@@ -344,10 +323,16 @@ pub enum NasMessage {
     RrcEstablishmentFailure,
     /// Radio link failure (from RRC)
     RadioLinkFailure,
-    /// Paging indication (from RRC)
+    /// Paging indication (from RRC): the RRC layer received a PCCH `Paging`
+    /// message (TS 38.331 §5.3.2.2) whose `PagingRecord` matched this UE's own
+    /// 5G-S-TMSI, so the UE shall start the MT service request procedure
+    /// (TS 24.501 §5.6.1.1).
     Paging {
-        /// Paging TMSI list
-        paging_tmsi: Vec<GutiMobileIdentity>,
+        /// The matched 5G-S-TMSI(s), each 48 bits in the TS 23.003 §2.10.1
+        /// order: AMF Set ID (10 bits) + AMF Pointer (6 bits) packed into two
+        /// octets, then the 32-bit 5G-TMSI. Non-matching records are not
+        /// reported — the AS filters them.
+        paging_s_tmsi: Vec<[u8; FIVE_G_S_TMSI_LEN]>,
     },
     /// Active cell changed (from RRC)
     ActiveCellChanged {
@@ -452,6 +437,17 @@ pub enum RrcMessage {
     AsSecurityKey {
         /// 256-bit KgNB derived from KAMF and the uplink NAS COUNT.
         kgnb: [u8; 32],
+    },
+    /// The paging identity the AS shall match PCCH `PagingRecord`s against
+    /// (from NAS).
+    ///
+    /// The 5G-S-TMSI is derived by the NAS layer from the assigned 5G-GUTI
+    /// (TS 24.501 §9.11.3.4) and handed down because only the NAS plane knows
+    /// it. `None` deletes it — after deregistration or a GUTI deletion the UE
+    /// has no paging identity and must not respond to any paging record.
+    PagingIdentity {
+        /// 48-bit 5G-S-TMSI in TS 23.003 §2.10.1 order, or `None` to clear
+        s_tmsi: Option<[u8; FIVE_G_S_TMSI_LEN]>,
     },
     /// Perform UAC (from NAS)
     PerformUac {

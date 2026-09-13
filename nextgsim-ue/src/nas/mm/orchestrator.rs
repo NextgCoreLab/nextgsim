@@ -109,6 +109,10 @@ pub fn gprs_timer2_seconds(byte: u8) -> u32 {
     }
 }
 
+/// Octets of a 5G-S-TMSI (TS 23.003 §2.10.1): AMF Set ID (10 bits) and AMF
+/// Pointer (6 bits) packed into two octets, then the 32-bit 5G-TMSI.
+pub const FIVE_G_S_TMSI_OCTETS: usize = 6;
+
 /// Outputs produced by the orchestrator for the caller (NAS task) to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmOutput {
@@ -441,6 +445,11 @@ pub struct MmOrchestrator {
     pending_reg_type: RegistrationType,
     registration_attempt_counter: u32,
     stored_guti: Option<Ie5gsMobileIdentity>,
+    /// The paging identity last handed to the AS
+    /// ([`MmOrchestrator::take_paging_identity_update`]). Kept separately from
+    /// `stored_guti` so a change can be detected by difference rather than by
+    /// every GUTI-mutating path remembering to signal one.
+    signalled_paging_identity: Option<[u8; FIVE_G_S_TMSI_OCTETS]>,
     tai_list: Option<Vec<u8>>,
     allowed_nssai: Option<Vec<u8>>,
     current_tai: Option<[u8; 6]>,
@@ -511,6 +520,7 @@ impl MmOrchestrator {
             pending_reg_type: RegistrationType::InitialRegistration,
             registration_attempt_counter: 0,
             stored_guti: None,
+            signalled_paging_identity: None,
             tai_list: None,
             allowed_nssai: None,
             current_tai: None,
@@ -690,6 +700,41 @@ impl MmOrchestrator {
     /// The 5G-GUTI assigned by the network, if any
     pub fn stored_guti(&self) -> Option<&Ie5gsMobileIdentity> {
         self.stored_guti.as_ref()
+    }
+
+    /// The 5G-S-TMSI the access stratum must match PCCH paging records against,
+    /// derived from the stored 5G-GUTI (TS 24.501 §9.11.3.4, TS 23.003
+    /// §2.10.1): AMF Set ID (10 bits) + AMF Pointer (6 bits) in two octets,
+    /// then the 32-bit 5G-TMSI.
+    ///
+    /// `None` when the UE holds no 5G-GUTI, in which case it has no paging
+    /// identity at all and no paging record can be for it.
+    pub fn paging_identity(&self) -> Option<[u8; FIVE_G_S_TMSI_OCTETS]> {
+        let guti = self.stored_guti.as_ref()?;
+        // GUTI layout: type(1) + PLMN(3) + AMF region(1) + AMF set/ptr(2) + TMSI(4)
+        guti.data.get(5..11)?.try_into().ok()
+    }
+
+    /// Reports the paging identity to hand to the access stratum when it has
+    /// CHANGED since the last call, otherwise `None`.
+    ///
+    /// The outer `Option` is "did it change"; the inner one is the identity,
+    /// where `None` means *delete* — a UE whose GUTI was removed by
+    /// deregistration must stop answering paging, and leaving the old identity
+    /// installed in the AS would have it start a service request for an
+    /// identity it no longer owns.
+    ///
+    /// Detection is by difference against what was last signalled rather than
+    /// by each GUTI-mutating path emitting an output, so Registration Accept, a
+    /// restored non-volatile snapshot, network deregistration and a local
+    /// context delete are all covered without a per-site hook to forget.
+    pub fn take_paging_identity_update(&mut self) -> Option<Option<[u8; FIVE_G_S_TMSI_OCTETS]>> {
+        let current = self.paging_identity();
+        if current == self.signalled_paging_identity {
+            return None;
+        }
+        self.signalled_paging_identity = current;
+        Some(current)
     }
 
     /// The SUPI this orchestrator registers (used by MINT to report a
@@ -1954,14 +1999,10 @@ impl MmOrchestrator {
     /// Derive the 5G-S-TMSI mobile identity from the stored 5G-GUTI
     /// (TS 24.501 Section 9.11.3.4: AMF set ID + AMF pointer + 5G-TMSI).
     fn build_s_tmsi(&self) -> Option<Ie5gsMobileIdentity> {
-        let guti = self.stored_guti.as_ref()?;
-        // GUTI layout: type(1) + PLMN(3) + AMF region(1) + AMF set/ptr(2) + TMSI(4)
-        if guti.data.len() < 11 {
-            return None;
-        }
-        let mut data = Vec::with_capacity(7);
+        let s_tmsi = self.paging_identity()?;
+        let mut data = Vec::with_capacity(1 + FIVE_G_S_TMSI_OCTETS);
         data.push(0xF0 | (MobileIdentityType::Tmsi as u8));
-        data.extend_from_slice(&guti.data[5..11]);
+        data.extend_from_slice(&s_tmsi);
         Some(Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, data))
     }
 
@@ -4358,6 +4399,125 @@ mod tests {
         // GUTI TMSI bytes were 0xDEADBEEF; the 5G-S-TMSI carries set/ptr + TMSI
         assert_eq!(&req.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(req.uplink_data_status, Some(0x0008), "PSI 3 is bit 3");
+    }
+
+    // ========================================================================
+    // Paging identity handed to the AS (#35, TS 38.331 §5.3.2.3)
+    // ========================================================================
+
+    /// The 5G-S-TMSI of the fixture GUTI: AMF set/pointer octets 0x0040 then
+    /// the 5G-TMSI 0xDEADBEEF (`build_registration_accept_pdu`).
+    const FIXTURE_PAGING_IDENTITY: [u8; FIVE_G_S_TMSI_OCTETS] =
+        [0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    #[test]
+    fn a_ue_without_a_5g_guti_has_no_paging_identity_to_signal() {
+        let mut orch = new_orch();
+        assert_eq!(orch.paging_identity(), None);
+        assert_eq!(
+            orch.take_paging_identity_update(),
+            None,
+            "nothing to signal: the AS starts with no identity either"
+        );
+    }
+
+    #[test]
+    fn a_registration_accept_assigning_a_guti_signals_the_paging_identity_once() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+
+        assert_eq!(
+            orch.paging_identity(),
+            Some(FIXTURE_PAGING_IDENTITY),
+            "the 5G-S-TMSI is the GUTI's AMF set/pointer octets plus the 5G-TMSI"
+        );
+        assert_eq!(
+            orch.take_paging_identity_update(),
+            Some(Some(FIXTURE_PAGING_IDENTITY)),
+            "the assignment must be reported to the caller for the AS"
+        );
+        assert_eq!(
+            orch.take_paging_identity_update(),
+            None,
+            "an unchanged identity must not be re-signalled on every output batch"
+        );
+    }
+
+    /// A UE the network deregisters no longer owns its 5G-GUTI, so the AS must
+    /// be told to delete the paging identity — otherwise the UE keeps answering
+    /// paging for an identity it has given up.
+    #[test]
+    fn a_network_deregistration_signals_the_paging_identity_deletion() {
+        use nextgsim_nas::ies::ie1::{
+            DeRegistrationAccessType, IeDeRegistrationType, ReRegistrationRequired, SwitchOff,
+        };
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        assert_eq!(
+            orch.take_paging_identity_update(),
+            Some(Some(FIXTURE_PAGING_IDENTITY))
+        );
+
+        let dereg_type = IeDeRegistrationType::new(
+            DeRegistrationAccessType::ThreeGppAccess,
+            ReRegistrationRequired::NotRequired,
+            SwitchOff::NormalDeRegistration,
+        );
+        let mut req = Vec::new();
+        nextgsim_nas::messages::mm::DeregistrationRequestUeTerminated::new(dereg_type)
+            .encode(&mut req);
+        let protected = protect_downlink(&orch, &req, 2);
+        orch.handle_downlink(&protected);
+
+        assert_eq!(orch.paging_identity(), None, "the GUTI is gone");
+        assert_eq!(
+            orch.take_paging_identity_update(),
+            Some(None),
+            "the deletion must be signalled, not merely the assignment"
+        );
+    }
+
+    /// TS 24.501 §5.6.1.1: paging in 5GMM-IDLE starts a service request with
+    /// the mobile-terminated service type — the message the paging pipeline
+    /// exists to produce.
+    #[test]
+    fn a_paged_ue_sends_a_service_request_with_the_mt_service_type() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        assert!(orch.state().is_registered() && orch.state().is_idle());
+
+        let outs = orch.start_service_request(ServiceType::MobileTerminatedServices, None);
+        let pdu = first_sent_pdu(&outs);
+
+        let sec = orch.security_context();
+        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+        let mut payload = pdu[7..].to_vec();
+        nas_cipher(
+            sec.ciphering_algorithm(),
+            sec.keys().knas_enc().unwrap(),
+            &count,
+            NAS_BEARER,
+            NasDirection::Uplink,
+            &mut payload,
+        );
+        let req = ServiceRequest::decode(&mut &payload[3..]).unwrap();
+
+        assert_eq!(
+            req.service_type.service_type,
+            ServiceType::MobileTerminatedServices,
+            "an MT service request must not be sent as mo-data"
+        );
+        assert_eq!(
+            &req.tmsi.data[3..7],
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+            "the request identifies the UE by the 5G-S-TMSI it was paged with"
+        );
+        assert!(orch.timers().t3517.is_running());
     }
 
     /// #51: PSI *n* maps to bit *n* of the Uplink data status IE
