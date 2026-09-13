@@ -33,6 +33,7 @@ use crate::rrc::transaction::RrcProcedure;
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
     build_drb_reconfiguration_params, encode_rrc_reconfiguration,
 };
+use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
 use nextgsim_rrc::procedures::security_mode::{
     encode_security_mode_command, CipheringAlgorithmType, IntegrityAlgorithmType,
     SecurityAlgorithms, SecurityModeCommandParams,
@@ -842,6 +843,30 @@ impl NgapTask {
                 }
             }
             Err(e) => error!("Failed to encode RRC SecurityModeCommand: {}", e),
+        }
+
+        // The RRC task verifies an RRCReestablishmentRequest's shortMAC-I with
+        // K_RRCint (TS 38.331 §5.3.7.2) and answers with the AS context's
+        // nextHopChainingCount, neither of which it can reach on its own: the AS
+        // context lives here. Hand it the subset it needs (issue #37).
+        //
+        // NCC 0 is the spec's own initial value, not a placeholder: TS 33.501
+        // §6.8.2.1.1 gives the KgNB established at Initial Context Setup an NCC of
+        // 0, and a fresh {NH, NCC} pair only arrives in a Path Switch Request
+        // Acknowledge — a path that is not wired (issue #39).
+        let reestablishment_security = RrcMessage::AsSecurityForReestablishment {
+            ue_id,
+            k_rrc_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, int_id),
+            integrity_alg_id: int_id,
+            c_rnti: SIMULATED_C_RNTI,
+            phys_cell_id: phys_cell_id_from_nci(self.task_base.config.nci),
+            next_hop_chaining_count: 0,
+        };
+        if let Err(e) = self.task_base.rrc_tx.send(reestablishment_security).await {
+            error!(
+                "Failed to hand the re-establishment security context to the RRC task: {}",
+                e
+            );
         }
     }
 

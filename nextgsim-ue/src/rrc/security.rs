@@ -23,10 +23,12 @@ use bitvec::prelude::*;
 use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
 use nextgsim_crypto::nea::{nea1_encrypt, nea2_encrypt};
 use nextgsim_crypto::nia::{nia1_compute_mac, nia2_compute_mac, nia3_compute_mac};
-use nextgsim_rrc::codec::generated::{
-    CellIdentity, PhysCellId, RNTI_Value, VarResumeMAC_Input, VarShortMAC_Input,
-};
+use nextgsim_rrc::codec::generated::{CellIdentity, PhysCellId, RNTI_Value, VarResumeMAC_Input};
 use nextgsim_rrc::codec::{encode_rrc, RrcCodecError};
+use nextgsim_rrc::procedures::rrc_reestablishment::{
+    compute_short_mac_i as rrc_compute_short_mac_i, mac_i_lsb16 as rrc_mac_i_lsb16,
+    RrcReestablishmentError,
+};
 use nextgsim_rrc::procedures::security_mode::{CipheringAlgorithmType, IntegrityAlgorithmType};
 
 /// Wire-safety gate for UE AS-security (Wave-6 residue I5, TS 38.331 §5.3.4 /
@@ -364,6 +366,9 @@ pub enum ShortMacError {
     /// VarShortMAC-Input encoding failed
     #[error("VarShortMAC-Input encoding error: {0}")]
     EncodeError(#[from] RrcCodecError),
+    /// The shared derivation in `nextgsim-rrc` rejected the inputs
+    #[error("ShortMAC-I derivation error: {0}")]
+    DerivationError(#[from] RrcReestablishmentError),
 }
 
 /// Computes the ShortMAC-I per TS 38.331 §5.3.7.4.
@@ -387,14 +392,17 @@ pub fn compute_short_mac_i(
         cell_id_bv.push((target_cell_identity >> i) & 1 == 1);
     }
 
-    let input = VarShortMAC_Input {
-        source_phys_cell_id: PhysCellId(source_pci),
-        target_cell_identity: CellIdentity(cell_id_bv),
-        source_c_rnti: RNTI_Value(ctx.c_rnti),
-    };
-    let encoded = encode_rrc(&input)?;
-
-    Ok(mac_i_lsb16(ctx, &encoded))
+    let _ = cell_id_bv;
+    // The one implementation lives in nextgsim-rrc, the crate that owns
+    // VarShortMAC-Input, because the UE sets this value and the network verifies
+    // it -- two copies of the formula is a defect waiting to happen (issue #37).
+    Ok(rrc_compute_short_mac_i(
+        &ctx.k_rrc_int,
+        ctx.integrity_algorithm.id(),
+        ctx.c_rnti,
+        source_pci,
+        target_cell_identity,
+    )?)
 }
 
 /// Computes the resumeMAC-I per TS 38.331 §5.3.13.3.
@@ -449,22 +457,12 @@ fn mac_i_lsb16(ctx: &AsSecurityContext, encoded: &[u8]) -> u16 {
     const BEARER: u8 = 0x1F;
     const DIRECTION: u8 = 0x01;
 
-    let mac = match ctx.integrity_algorithm {
-        // NIA0 produces an all-zero MAC (TS 33.501 D.1)
-        IntegrityAlgorithm::Nia0 => [0u8; 4],
-        IntegrityAlgorithm::Nia1 => {
-            nia1_compute_mac(COUNT, BEARER, DIRECTION, &ctx.k_rrc_int, encoded)
-        }
-        IntegrityAlgorithm::Nia2 => {
-            nia2_compute_mac(COUNT, BEARER, DIRECTION, &ctx.k_rrc_int, encoded)
-        }
-        IntegrityAlgorithm::Nia3 => {
-            nia3_compute_mac(COUNT, BEARER, DIRECTION, &ctx.k_rrc_int, encoded)
-        }
-    };
-
-    // 16 least significant bits of the 32-bit MAC-I
-    u16::from_be_bytes([mac[2], mac[3]])
+    let _ = (COUNT, BEARER, DIRECTION);
+    // Delegated for the same reason as compute_short_mac_i: one formula. The
+    // identity is always one of NIA0..NIA3 here, since `IntegrityAlgorithm` has
+    // no other variant, so the shared function cannot reject it.
+    rrc_mac_i_lsb16(&ctx.k_rrc_int, ctx.integrity_algorithm.id(), encoded)
+        .expect("IntegrityAlgorithm::id() is always 0..=3")
 }
 
 #[cfg(test)]

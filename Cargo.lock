@@ -1773,6 +1773,7 @@ dependencies = [
  "bytes",
  "log",
  "nextgsim-common",
+ "nextgsim-crypto",
  "proptest",
  "thiserror 1.0.69",
  "tracing",

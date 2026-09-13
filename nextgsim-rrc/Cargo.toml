@@ -12,6 +12,11 @@ workspace = true
 
 [dependencies]
 nextgsim-common.workspace = true
+# For the shortMAC-I of TS 38.331 5.3.7.4: the NIA integrity algorithms. This
+# crate owns VarShortMAC-Input, so it is where the one implementation both the UE
+# and the gNB call belongs. nextgsim-crypto depends only on nextgsim-common, so
+# there is no cycle.
+nextgsim-crypto.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

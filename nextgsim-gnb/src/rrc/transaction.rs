@@ -40,8 +40,10 @@
 //! full per-UE cycling at every sender site with no other change — see
 //! `.context/remediation/wave6/WS-C-gnb-srb1.md` item C4.
 
-/// Number of RRC procedures tracked independently per UE.
-const PROC_COUNT: usize = 4;
+/// Number of RRC procedures tracked independently per UE. Must equal the number
+/// of `RrcProcedure` variants; `RrcProcedure::index` indexes into an array of
+/// this length.
+const PROC_COUNT: usize = 5;
 
 /// Wave-6 C4-final wire-safety gate.
 ///
@@ -67,6 +69,9 @@ pub enum RrcProcedure {
     Reconfiguration,
     /// UECapabilityEnquiry ↔ UECapabilityInformation (TS 38.331 §5.6.1).
     UeCapability,
+    /// RRCReestablishment ↔ RRCReestablishmentComplete (TS 38.331 §5.3.7,
+    /// DL-DCCH / SRB1).
+    Reestablishment,
 }
 
 impl RrcProcedure {
@@ -77,6 +82,7 @@ impl RrcProcedure {
             RrcProcedure::SecurityMode => 1,
             RrcProcedure::Reconfiguration => 2,
             RrcProcedure::UeCapability => 3,
+            RrcProcedure::Reestablishment => 4,
         }
     }
 }

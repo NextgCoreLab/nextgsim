@@ -32,16 +32,13 @@
 //!   `ServingCellConfigCommon`), §5.5.4.7 (event A6)
 
 use crate::codec::generated::*;
-use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
+use crate::codec::{decode_rrc, encode_rrc, RrcCodecError, PHYS_CELL_ID_MAX};
 use thiserror::Error;
 
 /// `SCellIndex ::= INTEGER (1..31)` — TS 38.331 §6.3.2.
 pub const SCELL_INDEX_MIN: u8 = 1;
 /// `maxNrofSCells`, the upper bound of `SCellIndex`.
 pub const SCELL_INDEX_MAX: u8 = 31;
-
-/// `PhysCellId ::= INTEGER (0..1007)` — TS 38.331 §6.3.2.
-pub const PHYS_CELL_ID_MAX: u16 = 1007;
 
 /// `dmrs-TypeA-Position` and `ss-PBCH-BlockPower` are mandatory in
 /// `ServingCellConfigCommon`, so a value has to be chosen even for a simulator

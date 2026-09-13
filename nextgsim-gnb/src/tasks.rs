@@ -412,6 +412,28 @@ pub enum RrcMessage {
         /// Encoded DL-DCCH SecurityModeCommand PDU
         pdu: OctetString,
     },
+    /// The AS security material the RRC task needs to verify an
+    /// `RRCReestablishmentRequest` (TS 38.331 §5.3.7.2), sent by NGAP alongside
+    /// the SecurityModeCommand at Initial Context Setup.
+    ///
+    /// The full AS context stays on the NGAP task, which owns it; the RRC task
+    /// gets the subset that a `shortMAC-I` verification and an
+    /// `RRCReestablishment` reply need. Before this the K_RRCint was derived and
+    /// never read by the path that has to use it.
+    AsSecurityForReestablishment {
+        /// UE ID
+        ue_id: i32,
+        /// K_RRCint (128-bit)
+        k_rrc_int: [u8; 16],
+        /// Selected NR integrity algorithm identity (0 = NIA0 … 3 = NIA3)
+        integrity_alg_id: u8,
+        /// C-RNTI the UE will present in a re-establishment request
+        c_rnti: u16,
+        /// Physical cell identity of the UE's PCell
+        phys_cell_id: u16,
+        /// `nextHopChainingCount` of the AS security context (0-7)
+        next_hop_chaining_count: u8,
+    },
     /// RRC Reconfiguration delivery on DL-DCCH (from NGAP, on PDU Session
     /// Resource Setup — TS 38.331 §5.3.5.6) establishing a PDU session's DRB.
     /// Carries the encoded DL-DCCH RRCReconfiguration PDU.

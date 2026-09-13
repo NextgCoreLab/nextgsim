@@ -18,6 +18,10 @@ use nextgsim_rrc::procedures::information_transfer::{
     encode_dl_information_transfer, DlInformationTransferParams,
 };
 use nextgsim_rrc::procedures::paging::{encode_paging, PagingRecordParams, FIVE_G_S_TMSI_LEN};
+use nextgsim_rrc::procedures::rrc_reestablishment::{
+    decode_rrc_reestablishment_complete, decode_rrc_reestablishment_request,
+    RrcReestablishmentRequestData,
+};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_complete, decode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
@@ -51,10 +55,10 @@ const SI_PARKED_PERIOD_MS: u64 = 3_600_000;
 /// PLMN identity followed by a 3-octet TAC (TS 38.413 §9.3.3.11).
 const TAI_OCTETS: usize = 6;
 
-use super::connection::RrcConnectionManager;
+use super::connection::{ReestablishmentRequest, RrcConnectionManager};
 use super::system_info::{encode_cell_mib, encode_cell_sib1};
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
-use super::ue_context::RrcUeContextManager;
+use super::ue_context::{ReestablishmentSecurity, RrcUeContextManager};
 
 /// NTN configuration stored at RRC level
 #[derive(Debug, Clone)]
@@ -188,6 +192,15 @@ impl RrcTask {
 
         let bytes = data.data();
 
+        // RRCReestablishmentRequest is tried FIRST, and the order is load-bearing
+        // for the legacy fallback below rather than for the ASN.1 decoders (which
+        // discriminate on the UL-CCCH c1 index and so reject each other's PDUs).
+        if let Ok(request) = decode_rrc_reestablishment_request(bytes) {
+            self.handle_rrc_reestablishment_request(ue_id, &request)
+                .await;
+            return;
+        }
+
         // Try ASN.1 UPER decoding first (proper 3GPP encoding)
         if let Ok(setup_req) = decode_rrc_setup_request(bytes) {
             let (initial_id, is_stmsi) = match setup_req.ue_identity {
@@ -260,10 +273,13 @@ impl RrcTask {
                         .await;
                 }
             }
-            // RRC Reestablishment Request (0x24)
-            0x24 => {
-                self.handle_rrc_reestablishment_request(ue_id, data).await;
-            }
+            // No legacy arm for an RRCReestablishmentRequest. There was one, on
+            // 0x24, and nothing ever reached it: the UE's bespoke framing put
+            // 0x05 in the first byte, which falls in the 0x00..=0x1F RRCSetupRequest
+            // range above — and worse, that bespoke PDU *decodes* as a UPER
+            // RRCSetupRequest, so a re-establishment was answered with an
+            // RRCSetup built on a fabricated context. Both ends now use the real
+            // UPER encoding, handled before this fallback ladder.
             // RRC Resume Request (0x28)
             0x28 => {
                 self.handle_rrc_resume_request(ue_id, data).await;
@@ -827,41 +843,130 @@ impl RrcTask {
         }
     }
 
-    async fn handle_rrc_reestablishment_request(&mut self, ue_id: i32, data: &OctetString) {
-        let bytes = data.data();
-        // Parse C-RNTI (2 bytes at offset 1-2) and PhysCellId (2 bytes at offset 3-4)
-        let c_rnti = if bytes.len() >= 3 {
-            u16::from_be_bytes([bytes[1], bytes[2]])
-        } else {
-            0
-        };
-        let phys_cell_id = if bytes.len() >= 5 {
-            u16::from_be_bytes([bytes[3], bytes[4]])
-        } else {
-            0
-        };
-        let cause = bytes.get(5).copied().unwrap_or(2); // Default: otherFailure
-
+    /// Handles a decoded `RRCReestablishmentRequest` (TS 38.331 §5.3.7.2).
+    ///
+    /// The identity and `shortMAC-I` come from the ASN.1 decode. On a failed or
+    /// unresolvable verification the gNB answers with an `RRCSetup` per §5.3.3.1
+    /// rather than reestablishing a UE it cannot authenticate.
+    async fn handle_rrc_reestablishment_request(
+        &mut self,
+        ue_id: i32,
+        request: &RrcReestablishmentRequestData,
+    ) {
         info!(
-            "RRC Reestablishment Request from UE[{}]: c_rnti={}, phys_cell_id={}, cause={}",
-            ue_id, c_rnti, phys_cell_id, cause
+            "RRC Reestablishment Request on UE[{}]: c_rnti={:#06x}, pci={}, \
+             shortMAC-I={:#06x}, cause={:?}",
+            ue_id,
+            request.ue_identity.c_rnti,
+            request.ue_identity.phys_cell_id,
+            request.ue_identity.short_mac_i,
+            request.reestablishment_cause
         );
 
-        if let Some(result) = self.connection_manager.process_rrc_reestablishment_request(
-            &mut self.ue_manager,
-            ue_id,
-            c_rnti,
-            phys_cell_id,
-            cause,
-        ) {
-            self.send_rrc_message(result.ue_id, result.channel, result.rrc_reestablishment_pdu)
-                .await;
+        let presented = ReestablishmentRequest {
+            c_rnti: request.ue_identity.c_rnti,
+            phys_cell_id: request.ue_identity.phys_cell_id,
+            short_mac_i: request.ue_identity.short_mac_i,
+            cause: request.reestablishment_cause,
+            target_cell_identity: self.cell_identity(),
+        };
+
+        match self
+            .connection_manager
+            .process_rrc_reestablishment_request(&mut self.ue_manager, &presented)
+        {
+            Ok(result) => {
+                self.send_rrc_message(result.ue_id, result.channel, result.rrc_reestablishment_pdu)
+                    .await;
+            }
+            Err(rejection) if rejection.falls_back_to_setup() => {
+                // §5.3.3.1: the network falls back to RRCSetup. The transport-level
+                // ue_id is the only identity available for a UE whose stored
+                // context could not be resolved, so the setup runs on that.
+                //
+                // Any context already on that ue_id is discarded first: §5.3.7.5
+                // has the UE leave RRC_IDLE through establishment, so the network
+                // starts a fresh context rather than reusing state it has just
+                // declined to restore. `process_rrc_setup_request` refuses
+                // outright when a context exists, so without this the fallback
+                // would send nothing at all.
+                if self.ue_manager.delete_ue(ue_id).is_some() {
+                    debug!(
+                        "Discarded the unverified context on UE[{}] before the \
+                         RRCSetup fallback",
+                        ue_id
+                    );
+                }
+                if let Some(result) = self.connection_manager.process_rrc_setup_request(
+                    &mut self.ue_manager,
+                    ue_id,
+                    0,
+                    false,
+                    // TS 38.413 §9.3.1.111 rrcCause: the UE is re-establishing an
+                    // existing connection, so mo-Signalling is the honest cause.
+                    3,
+                ) {
+                    info!(
+                        "RRCSetup fallback for UE[{}] after {:?} (TS 38.331 §5.3.3.1)",
+                        ue_id, rejection
+                    );
+                    self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu)
+                        .await;
+                }
+            }
+            Err(rejection) => {
+                warn!(
+                    "RRC Reestablishment Request from UE[{}] answered with nothing: {:?}",
+                    ue_id, rejection
+                );
+            }
         }
+    }
+
+    /// Records the AS security material a re-establishment is verified against
+    /// (TS 38.331 §5.3.7.2), handed over by the NGAP task when it derives the AS
+    /// keys at Initial Context Setup.
+    ///
+    /// A UE with no context yet is skipped rather than given a fresh one: the
+    /// material belongs to a connection the RRC task already knows about, and
+    /// inventing a context around it would be a context nothing established.
+    fn handle_as_security_for_reestablishment(
+        &mut self,
+        ue_id: i32,
+        security: ReestablishmentSecurity,
+    ) {
+        match self.ue_manager.try_find_ue_mut(ue_id) {
+            Some(ctx) => {
+                debug!(
+                    "Recorded re-establishment security for UE[{}]: c_rnti={:#06x}, \
+                     pci={}, ncc={}",
+                    ue_id, security.c_rnti, security.phys_cell_id, security.next_hop_chaining_count
+                );
+                ctx.set_reestablishment_security(security);
+            }
+            None => warn!(
+                "Dropping re-establishment security for UE[{}]: no RRC context",
+                ue_id
+            ),
+        }
+    }
+
+    /// The 36-bit NR Cell Identity of this gNB's cell, the third input of the
+    /// `VarShortMAC-Input` (TS 38.331 §5.3.7.4). `nci` is the 36-bit NR Cell
+    /// Identity from the configuration.
+    fn cell_identity(&self) -> u64 {
+        self.task_base.config.nci & 0xF_FFFF_FFFF
     }
 
     async fn handle_rrc_reestablishment_complete(&mut self, ue_id: i32, data: &OctetString) {
         let bytes = data.data();
-        let transaction_id = if bytes.len() >= 2 { bytes[1] } else { 0 };
+        // Prefer the real UPER encoding; fall back to the bespoke framing's
+        // second byte for a UE that has not been updated.
+        let transaction_id = match decode_rrc_reestablishment_complete(bytes) {
+            Ok(complete) => complete.rrc_transaction_id,
+            Err(_) if bytes.len() >= 2 => bytes[1],
+            Err(_) => 0,
+        };
 
         info!(
             "RRC Reestablishment Complete from UE[{}], tid={}",
@@ -1207,6 +1312,21 @@ impl Task for RrcTask {
                                     pdu.len()
                                 );
                                 self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                            }
+                            RrcMessage::AsSecurityForReestablishment {
+                                ue_id, k_rrc_int, integrity_alg_id, c_rnti,
+                                phys_cell_id, next_hop_chaining_count,
+                            } => {
+                                self.handle_as_security_for_reestablishment(
+                                    ue_id,
+                                    ReestablishmentSecurity {
+                                        k_rrc_int,
+                                        integrity_alg_id,
+                                        c_rnti,
+                                        phys_cell_id,
+                                        next_hop_chaining_count,
+                                    },
+                                );
                             }
                             RrcMessage::RrcReconfiguration { ue_id, pdu } => {
                                 // TS 38.331 §5.3.5.6: deliver the RRCReconfiguration
@@ -1895,6 +2015,190 @@ mod tests {
             try_take_downlink_rrc(&mut rls_rx, 8).is_some(),
             "the once-per-UE guard is per UE, not global"
         );
+    }
+
+    // ========================================================================
+    // RRC re-establishment dispatch (issue #37, TS 38.331 §5.3.7.2 / §5.3.3.1)
+    // ========================================================================
+
+    /// Drives a UE through setup and records its AS security context, as Initial
+    /// Context Setup does.
+    async fn establish_with_security(task: &mut RrcTask, ue_id: i32, k_rrc_int: [u8; 16], ncc: u8) {
+        use nextgsim_rrc::procedures::rrc_reestablishment::{
+            phys_cell_id_from_nci, SIMULATED_C_RNTI,
+        };
+
+        establish_pending_setup(task, ue_id).await;
+        task.handle_as_security_for_reestablishment(
+            ue_id,
+            ReestablishmentSecurity {
+                k_rrc_int,
+                integrity_alg_id: 2, // NIA2
+                c_rnti: SIMULATED_C_RNTI,
+                phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
+                next_hop_chaining_count: ncc,
+            },
+        );
+    }
+
+    /// A UPER `RRCReestablishmentRequest` as the UE builds it.
+    fn reestablishment_request_pdu(nci: u64, k_rrc_int: &[u8; 16], corrupt: bool) -> OctetString {
+        use nextgsim_rrc::procedures::rrc_reestablishment::{
+            compute_short_mac_i, encode_rrc_reestablishment_request, phys_cell_id_from_nci,
+            ReestablishmentCauseValue, ReestablishmentUeIdentity, RrcReestablishmentRequestParams,
+            SIMULATED_C_RNTI,
+        };
+
+        let pci = phys_cell_id_from_nci(nci);
+        let mut short_mac_i =
+            compute_short_mac_i(k_rrc_int, 2, SIMULATED_C_RNTI, pci, nci & 0xF_FFFF_FFFF)
+                .expect("compute");
+        if corrupt {
+            short_mac_i ^= 0xFFFF;
+        }
+        let bytes = encode_rrc_reestablishment_request(&RrcReestablishmentRequestParams {
+            ue_identity: ReestablishmentUeIdentity {
+                c_rnti: SIMULATED_C_RNTI,
+                phys_cell_id: pci,
+                short_mac_i,
+            },
+            reestablishment_cause: ReestablishmentCauseValue::OtherFailure,
+        })
+        .expect("encode");
+        OctetString::from_slice(&bytes)
+    }
+
+    /// The dispatch half of #37: a real UPER `RRCReestablishmentRequest` on
+    /// UL-CCCH reaches the re-establishment handler and is answered with an
+    /// `RRCReestablishment` on DL-DCCH.
+    ///
+    /// Before this the same logical message reached `process_rrc_setup_request`,
+    /// because the UE's bespoke framing decoded as an `RRCSetupRequest`.
+    #[test]
+    fn a_verified_reestablishment_request_is_answered_on_dl_dcch() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
+
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            // Drain the RRCSetup emitted by the setup above.
+            let _setup = try_take_downlink_rrc(&mut rls_rx, 1);
+
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+
+            let (channel, pdu) =
+                try_take_downlink_rrc(&mut rls_rx, 1).expect("a reply is transmitted");
+            assert_eq!(channel, RrcChannel::DlDcch, "SRB1, not CCCH");
+            let decoded = decode_rrc_reestablishment(pdu.data())
+                .expect("the reply is an RRCReestablishment, not an RRCSetup");
+            assert_eq!(
+                decoded.next_hop_chaining_count, 6,
+                "carrying the security context's NCC"
+            );
+        });
+    }
+
+    /// A `shortMAC-I` the network cannot reproduce falls back to `RRCSetup`
+    /// (§5.3.3.1) — on DL-CCCH, because that is where an `RRCSetup` belongs.
+    #[test]
+    fn an_unverifiable_reestablishment_request_is_answered_with_an_rrc_setup() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
+        use nextgsim_rrc::procedures::rrc_setup::decode_rrc_setup;
+
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 0).await;
+            let _setup = try_take_downlink_rrc(&mut rls_rx, 1);
+
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], true),
+            )
+            .await;
+
+            let (channel, pdu) =
+                try_take_downlink_rrc(&mut rls_rx, 1).expect("the fallback is transmitted");
+            assert_eq!(channel, RrcChannel::DlCcch, "an RRCSetup rides SRB0");
+            assert!(
+                decode_rrc_reestablishment(pdu.data()).is_err(),
+                "not a re-establishment"
+            );
+            decode_rrc_setup(pdu.data()).expect("an RRCSetup fallback");
+        });
+    }
+
+    /// A UE the network has no context for at all also gets the `RRCSetup`
+    /// fallback rather than a fabricated re-establishment.
+    #[test]
+    fn a_reestablishment_from_an_unknown_ue_is_answered_with_an_rrc_setup() {
+        use nextgsim_rrc::procedures::rrc_setup::decode_rrc_setup;
+
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_radio_power_on();
+
+            task.handle_uplink_rrc(
+                7,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+
+            let (channel, pdu) =
+                try_take_downlink_rrc(&mut rls_rx, 7).expect("the fallback is transmitted");
+            assert_eq!(channel, RrcChannel::DlCcch);
+            decode_rrc_setup(pdu.data()).expect("an RRCSetup fallback");
+            assert_eq!(
+                task.ue_manager.count(),
+                1,
+                "one fresh context, from the setup"
+            );
+        });
+    }
+
+    /// Security material for a UE the RRC task has no context for is dropped,
+    /// not used to invent one.
+    #[test]
+    fn security_for_an_unknown_ue_creates_no_context() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::SIMULATED_C_RNTI;
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        task.handle_as_security_for_reestablishment(
+            42,
+            ReestablishmentSecurity {
+                k_rrc_int: [0; 16],
+                integrity_alg_id: 2,
+                c_rnti: SIMULATED_C_RNTI,
+                phys_cell_id: 1,
+                next_hop_chaining_count: 0,
+            },
+        );
+
+        assert_eq!(task.ue_manager.count(), 0);
     }
 
     /// A `physCellId` outside `INTEGER (0..1007)` has no encoding. Nothing is

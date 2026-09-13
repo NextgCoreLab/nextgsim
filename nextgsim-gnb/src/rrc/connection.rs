@@ -11,6 +11,10 @@ use tracing::{debug, info, warn};
 use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::{
+    rrc_reestablishment::{
+        compute_short_mac_i, encode_rrc_reestablishment, ReestablishmentCauseValue,
+        RrcReestablishmentError, RrcReestablishmentParams,
+    },
     rrc_release::{encode_rrc_release, RrcReleaseParams},
     rrc_setup::{encode_rrc_setup, srb1_rrc_setup_params},
 };
@@ -58,6 +62,50 @@ pub struct RrcReleaseResult {
     pub channel: RrcChannel,
 }
 
+/// An `RRCReestablishmentRequest` as presented by the UE, plus the identity of
+/// the cell it arrived on.
+///
+/// The first three fields are the `ReestabUE-Identity` of TS 38.331 §6.2.2 and
+/// come from the ASN.1 decode, not from byte offsets. `target_cell_identity` is
+/// the 36-bit NR Cell Identity of the cell handling the request, which the
+/// `VarShortMAC-Input` needs and which the message itself does not carry.
+#[derive(Debug, Clone, Copy)]
+pub struct ReestablishmentRequest {
+    /// `ueIdentity.c-RNTI` — the C-RNTI in the source PCell
+    pub c_rnti: u16,
+    /// `ueIdentity.physCellId` — the PCI of the source PCell
+    pub phys_cell_id: u16,
+    /// `ueIdentity.shortMAC-I` — the 16 LSBs of the MAC-I the UE computed
+    pub short_mac_i: u16,
+    /// `reestablishmentCause`
+    pub cause: ReestablishmentCauseValue,
+    /// 36-bit NR Cell Identity of the cell the UE is re-establishing on
+    pub target_cell_identity: u64,
+}
+
+/// Why a re-establishment did not complete, i.e. why the caller must fall back
+/// to `RRCSetup` (TS 38.331 §5.3.3.1) or send nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReestablishmentRejection {
+    /// The cell is barred: nothing is sent at all.
+    CellBarred,
+    /// No stored context matches the presented `(C-RNTI, PCI)`.
+    UnknownIdentity,
+    /// A context matched the identity but no candidate's `K_RRCint` reproduced
+    /// the presented `shortMAC-I`.
+    MacVerificationFailed,
+    /// The context verified but the reply could not be encoded.
+    EncodingFailed,
+}
+
+impl ReestablishmentRejection {
+    /// Whether the network should answer with an `RRCSetup` (§5.3.3.1). A barred
+    /// cell answers with nothing at all, so it is the one case that does not.
+    pub fn falls_back_to_setup(self) -> bool {
+        !matches!(self, ReestablishmentRejection::CellBarred)
+    }
+}
+
 /// Result of processing an RRC Reestablishment Request
 #[derive(Debug)]
 pub struct RrcReestablishmentResult {
@@ -69,8 +117,8 @@ pub struct RrcReestablishmentResult {
     pub rrc_reestablishment_pdu: OctetString,
     /// RRC channel to use
     pub channel: RrcChannel,
-    /// Reestablishment cause
-    pub cause: u8,
+    /// Reestablishment cause, as decoded (no longer a raw byte offset)
+    pub cause: ReestablishmentCauseValue,
 }
 
 /// Result of processing an RRC Reestablishment Complete
@@ -306,64 +354,169 @@ impl RrcConnectionManager {
         })
     }
 
-    /// Processes an RRC Reestablishment Request
+    /// Processes an RRC Reestablishment Request (TS 38.331 §5.3.7.2, §5.3.3.1).
     ///
-    /// Called when a UE attempts to reestablish its RRC connection after
-    /// radio link failure, handover failure, or integrity check failure.
+    /// The network-side procedure proper:
+    ///
+    /// 1. Look the stored context up by the **presented** `(C-RNTI, PCI)`, not by
+    ///    the transport-level `ue_id`. The lookup returns candidates; see
+    ///    [`super::ue_context::ReestablishmentSecurity::c_rnti`] for why more than
+    ///    one is possible here.
+    /// 2. Recompute the `shortMAC-I` over the `VarShortMAC-Input` with each
+    ///    candidate's stored `K_RRCint` and compare the 16 least significant bits
+    ///    against the presented value. The candidate that matches is the context.
+    /// 3. **Fall back to `RRCSetup`** when no candidate matches, when none can be
+    ///    verified, or when the identity resolves to nothing — §5.3.3.1. No fresh
+    ///    `RRCReestablishment` context is fabricated: reestablishing a UE the
+    ///    network cannot authenticate is the defect this replaces.
+    ///
+    /// `target_cell_identity` is the 36-bit NR Cell Identity of the cell the UE is
+    /// re-establishing on, which is the third input of the `VarShortMAC-Input`.
+    ///
+    /// Returns `Ok` with the reply on success and `Err(ReestablishmentRejection)`
+    /// carrying the reason when the caller should send an `RRCSetup` instead.
     pub fn process_rrc_reestablishment_request(
         &mut self,
         ue_mgr: &mut RrcUeContextManager,
-        ue_id: i32,
-        c_rnti: u16,
-        phys_cell_id: u16,
-        cause: u8,
-    ) -> Option<RrcReestablishmentResult> {
+        request: &ReestablishmentRequest,
+    ) -> Result<RrcReestablishmentResult, ReestablishmentRejection> {
         if self.is_barred {
             warn!("Rejecting RRC Reestablishment: cell is barred");
-            return None;
+            return Err(ReestablishmentRejection::CellBarred);
         }
 
-        // Try to find existing UE context by C-RNTI
-        // If found, the UE is reestablishing on the same cell
-        let existing = ue_mgr.try_find_ue(ue_id);
-        if existing.is_none() {
-            // Create a new context for this UE (may be reestablishing from another cell)
-            let ctx = ue_mgr.create_ue(ue_id);
-            ctx.on_setup_request();
+        let candidates =
+            ue_mgr.candidates_for_reestablishment(request.c_rnti, request.phys_cell_id);
+        if candidates.is_empty() {
+            warn!(
+                "RRC Reestablishment falls back to RRCSetup: no stored context for \
+                 (c_rnti={:#06x}, pci={}) (TS 38.331 §5.3.3.1)",
+                request.c_rnti, request.phys_cell_id
+            );
+            return Err(ReestablishmentRejection::UnknownIdentity);
         }
 
-        let transaction_id = self.next_tid();
-        let rrc_reestablishment_pdu = self.build_rrc_reestablishment(transaction_id);
+        let verified = candidates.into_iter().find(|&candidate| {
+            let Some(security) = ue_mgr
+                .try_find_ue(candidate)
+                .and_then(|ctx| ctx.reestablishment_security.as_ref())
+            else {
+                return false;
+            };
+            match compute_short_mac_i(
+                &security.k_rrc_int,
+                security.integrity_alg_id,
+                security.c_rnti,
+                security.phys_cell_id,
+                request.target_cell_identity,
+            ) {
+                Ok(expected) => expected == request.short_mac_i,
+                Err(e) => {
+                    warn!(
+                        "ShortMAC-I derivation failed for candidate UE[{}]: {}",
+                        candidate, e
+                    );
+                    false
+                }
+            }
+        });
+
+        let Some(ue_id) = verified else {
+            warn!(
+                "RRC Reestablishment falls back to RRCSetup: shortMAC-I {:#06x} \
+                 verified against no stored context for (c_rnti={:#06x}, pci={}) \
+                 (TS 38.331 §5.3.7.2)",
+                request.short_mac_i, request.c_rnti, request.phys_cell_id
+            );
+            return Err(ReestablishmentRejection::MacVerificationFailed);
+        };
+
+        // The verified context supplies the nextHopChainingCount the reply carries
+        // (TS 33.501 §6.9.4.1) -- not a hardcoded zero.
+        let next_hop_chaining_count = ue_mgr
+            .try_find_ue(ue_id)
+            .and_then(|ctx| ctx.reestablishment_security.as_ref())
+            .map(|s| s.next_hop_chaining_count)
+            .unwrap_or(0);
+
+        let transaction_id = {
+            let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) else {
+                return Err(ReestablishmentRejection::UnknownIdentity);
+            };
+            ctx.transactions.allocate(RrcProcedure::Reestablishment)
+        };
+
+        let rrc_reestablishment_pdu =
+            match Self::build_rrc_reestablishment(transaction_id, next_hop_chaining_count) {
+                Ok(pdu) => pdu,
+                Err(e) => {
+                    warn!(
+                        "RRCReestablishment encoding failed: {} — falling back to RRCSetup",
+                        e
+                    );
+                    return Err(ReestablishmentRejection::EncodingFailed);
+                }
+            };
 
         if let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) {
             ctx.on_setup_sent();
         }
 
         info!(
-            "RRC Reestablishment for UE[{}], tid={}, c_rnti={}, phys_cell_id={}, cause={}",
-            ue_id, transaction_id, c_rnti, phys_cell_id, cause
+            "RRC Reestablishment for UE[{}], tid={}, c_rnti={:#06x}, pci={}, \
+             cause={:?}, ncc={} (shortMAC-I verified)",
+            ue_id,
+            transaction_id,
+            request.c_rnti,
+            request.phys_cell_id,
+            request.cause,
+            next_hop_chaining_count
         );
 
-        Some(RrcReestablishmentResult {
+        Ok(RrcReestablishmentResult {
             ue_id,
             transaction_id,
             rrc_reestablishment_pdu,
-            channel: RrcChannel::DlCcch,
-            cause,
+            // TS 38.331 §6.2.1: RRCReestablishment is a DL-DCCH / SRB1 message.
+            // Only the preceding RRCReestablishmentRequest rides SRB0 / UL-CCCH.
+            channel: RrcChannel::DlDcch,
+            cause: request.cause,
         })
     }
 
-    /// Processes an RRC Reestablishment Complete
+    /// Processes an RRC Reestablishment Complete.
+    ///
+    /// The echoed `rrc-TransactionIdentifier` is verified against the outstanding
+    /// Reestablishment transaction: a mismatch means the UE is completing a
+    /// different procedure, so it is discarded rather than transitioning the
+    /// context to Connected.
     pub fn process_rrc_reestablishment_complete(
         &mut self,
         ue_mgr: &mut RrcUeContextManager,
         ue_id: i32,
-        _transaction_id: u8,
+        transaction_id: u8,
     ) -> Option<RrcReestablishmentCompleteResult> {
         let ctx = ue_mgr.try_find_ue_mut(ue_id)?;
+        match ctx
+            .transactions
+            .verify(RrcProcedure::Reestablishment, transaction_id)
+        {
+            TidVerification::Mismatch { expected } => {
+                warn!(
+                    "Discarding RRCReestablishmentComplete from UE[{}]: echoed tid {} \
+                     != outstanding {} (TS 38.331 §5.3.7)",
+                    ue_id, transaction_id, expected
+                );
+                return None;
+            }
+            TidVerification::Match | TidVerification::NoOutstanding => {}
+        }
         ctx.on_setup_complete();
 
-        info!("RRC Reestablishment Complete for UE[{}]", ue_id);
+        info!(
+            "RRC Reestablishment Complete for UE[{}], tid={}",
+            ue_id, transaction_id
+        );
 
         Some(RrcReestablishmentCompleteResult {
             ue_id,
@@ -428,21 +581,23 @@ impl RrcConnectionManager {
         Some(RrcResumeCompleteResult { ue_id, nas_pdu })
     }
 
-    /// Builds an RRC Reestablishment message
+    /// Builds an `RRCReestablishment` (TS 38.331 §6.2.2) as real UPER on
+    /// DL-DCCH, carrying the `nextHopChainingCount` of the verified UE's AS
+    /// security context.
     ///
-    /// Note: The RRC procedures module provides UE-side RRCReestablishmentRequest
-    /// and RRCReestablishmentComplete. The gNB-side RRCReestablishment (DL-CCCH)
-    /// uses a simplified encoding since the ASN.1 gNB-side builder requires
-    /// nextHopChainingCount from security context which is not yet wired.
-    fn build_rrc_reestablishment(&self, transaction_id: u8) -> OctetString {
-        let mut pdu = Vec::with_capacity(16);
-        // DL-CCCH-Message with RRCReestablishment
-        pdu.push(0x24); // c1 choice = rrcReestablishment
-        pdu.push(transaction_id);
-        pdu.push(0x00); // criticalExtensions = rrcReestablishment
-                        // nextHopChainingCount (3 bits, set to 0)
-        pdu.push(0x00);
-        OctetString::from_slice(&pdu)
+    /// This replaces a hand-rolled four-byte DL-CCCH PDU with a hardcoded NCC of
+    /// 0; the comment there said the ASN.1 builder was unusable "since the ASN.1
+    /// gNB-side builder requires nextHopChainingCount from security context which
+    /// is not yet wired", which is now wired.
+    fn build_rrc_reestablishment(
+        transaction_id: u8,
+        next_hop_chaining_count: u8,
+    ) -> Result<OctetString, RrcReestablishmentError> {
+        let bytes = encode_rrc_reestablishment(&RrcReestablishmentParams {
+            rrc_transaction_id: transaction_id,
+            next_hop_chaining_count,
+        })?;
+        Ok(OctetString::from_slice(&bytes))
     }
 
     /// Builds an RRC Resume message
@@ -835,5 +990,261 @@ mod tests {
         // Verify UE is now releasing
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert!(!ctx.is_connected());
+    }
+
+    // ========================================================================
+    // RRC re-establishment verification and fallback (issue #37,
+    // TS 38.331 §5.3.7.2 / §5.3.3.1)
+    // ========================================================================
+
+    use super::super::ue_context::ReestablishmentSecurity;
+    use nextgsim_rrc::procedures::rrc_reestablishment::{
+        decode_rrc_reestablishment, SIMULATED_C_RNTI,
+    };
+
+    const TEST_PCI: u16 = 16;
+    const TEST_CELL_IDENTITY: u64 = 0x10;
+    const TEST_INTEGRITY_ALG: u8 = 2; // NIA2
+
+    fn key(seed: u8) -> [u8; 16] {
+        [seed; 16]
+    }
+
+    /// A connected UE whose AS security context has been recorded, as it is after
+    /// Initial Context Setup.
+    fn connected_ue_with_security(
+        conn_mgr: &mut RrcConnectionManager,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+        k_rrc_int: [u8; 16],
+        ncc: u8,
+    ) {
+        conn_mgr.process_rrc_setup_request(
+            ue_mgr,
+            ue_id,
+            0x1234567890 + i64::from(ue_id),
+            false,
+            3,
+        );
+        conn_mgr.process_rrc_setup_complete(
+            ue_mgr,
+            ue_id,
+            0,
+            OctetString::from_slice(&[0x7E]),
+            None,
+        );
+        ue_mgr
+            .try_find_ue_mut(ue_id)
+            .expect("context")
+            .set_reestablishment_security(ReestablishmentSecurity {
+                k_rrc_int,
+                integrity_alg_id: TEST_INTEGRITY_ALG,
+                c_rnti: SIMULATED_C_RNTI,
+                phys_cell_id: TEST_PCI,
+                next_hop_chaining_count: ncc,
+            });
+    }
+
+    /// The request a UE holding `k_rrc_int` would present.
+    fn request_for(k_rrc_int: &[u8; 16]) -> ReestablishmentRequest {
+        ReestablishmentRequest {
+            c_rnti: SIMULATED_C_RNTI,
+            phys_cell_id: TEST_PCI,
+            short_mac_i: compute_short_mac_i(
+                k_rrc_int,
+                TEST_INTEGRITY_ALG,
+                SIMULATED_C_RNTI,
+                TEST_PCI,
+                TEST_CELL_IDENTITY,
+            )
+            .expect("compute"),
+            cause: ReestablishmentCauseValue::OtherFailure,
+            target_cell_identity: TEST_CELL_IDENTITY,
+        }
+    }
+
+    /// A `shortMAC-I` computed with the matching `K_RRCint` for a known
+    /// `(C-RNTI, PCI)` yields an `RRCReestablishment` **on DL-DCCH** carrying the
+    /// context's own `nextHopChainingCount`.
+    #[test]
+    fn a_verified_reestablishment_replies_on_dl_dcch_with_the_contexts_ncc() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        connected_ue_with_security(&mut conn_mgr, &mut ue_mgr, 1, key(0xA1), 5);
+
+        let result = conn_mgr
+            .process_rrc_reestablishment_request(&mut ue_mgr, &request_for(&key(0xA1)))
+            .expect("the shortMAC-I verifies");
+
+        assert_eq!(result.ue_id, 1, "the stored context, not a fresh one");
+        assert_eq!(
+            result.channel,
+            RrcChannel::DlDcch,
+            "TS 38.331 §6.2.1: RRCReestablishment is an SRB1 message"
+        );
+        let decoded =
+            decode_rrc_reestablishment(result.rrc_reestablishment_pdu.data()).expect("real UPER");
+        assert_eq!(
+            decoded.next_hop_chaining_count, 5,
+            "the NCC comes from the security context, not a hardcoded 0"
+        );
+        assert_eq!(decoded.rrc_transaction_id, result.transaction_id);
+    }
+
+    /// A `shortMAC-I` computed with the wrong key does not verify, so §5.3.3.1's
+    /// `RRCSetup` fallback applies and **no** fresh re-establishment context is
+    /// fabricated: the stored one is untouched.
+    #[test]
+    fn an_invalid_short_mac_i_falls_back_to_setup() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        connected_ue_with_security(&mut conn_mgr, &mut ue_mgr, 1, key(0xA1), 0);
+
+        let mut request = request_for(&key(0xA1));
+        request.short_mac_i ^= 0xFFFF;
+
+        let rejection = conn_mgr
+            .process_rrc_reestablishment_request(&mut ue_mgr, &request)
+            .expect_err("a wrong MAC must not reestablish");
+
+        assert_eq!(rejection, ReestablishmentRejection::MacVerificationFailed);
+        assert!(rejection.falls_back_to_setup());
+        assert!(
+            ue_mgr.try_find_ue(1).expect("context").is_connected(),
+            "the stored context is left alone, not transitioned"
+        );
+        assert_eq!(ue_mgr.count(), 1, "no fresh context was fabricated");
+    }
+
+    /// An unresolvable `(C-RNTI, PCI)` also falls back — the identity names
+    /// nothing the network holds.
+    #[test]
+    fn an_unknown_identity_falls_back_to_setup() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        connected_ue_with_security(&mut conn_mgr, &mut ue_mgr, 1, key(0xA1), 0);
+
+        for (label, mut request) in [
+            ("a different PCI", request_for(&key(0xA1))),
+            ("a different C-RNTI", request_for(&key(0xA1))),
+        ] {
+            if label == "a different PCI" {
+                request.phys_cell_id = TEST_PCI + 1;
+            } else {
+                request.c_rnti = SIMULATED_C_RNTI + 1;
+            }
+            let rejection = conn_mgr
+                .process_rrc_reestablishment_request(&mut ue_mgr, &request)
+                .unwrap_err();
+            assert_eq!(
+                rejection,
+                ReestablishmentRejection::UnknownIdentity,
+                "{label} must not resolve"
+            );
+        }
+    }
+
+    /// A context with no AS security recorded cannot be verified, so it is not
+    /// even a candidate: an unverifiable context means `RRCSetup`.
+    #[test]
+    fn a_context_without_as_security_is_not_a_candidate() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
+
+        assert!(ue_mgr
+            .candidates_for_reestablishment(SIMULATED_C_RNTI, TEST_PCI)
+            .is_empty());
+        assert_eq!(
+            conn_mgr
+                .process_rrc_reestablishment_request(&mut ue_mgr, &request_for(&key(0xA1)))
+                .unwrap_err(),
+            ReestablishmentRejection::UnknownIdentity
+        );
+    }
+
+    /// The `(C-RNTI, PCI)` lookup returns candidates, because this simulator has
+    /// no C-RNTI allocation and every UE presents the same constant. The
+    /// `shortMAC-I` is what resolves them, and it does: the second UE's request
+    /// picks the second UE's context even though the first matched the identity.
+    #[test]
+    fn the_short_mac_i_resolves_two_candidates_sharing_one_identity() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        connected_ue_with_security(&mut conn_mgr, &mut ue_mgr, 1, key(0xA1), 1);
+        connected_ue_with_security(&mut conn_mgr, &mut ue_mgr, 2, key(0xB2), 2);
+
+        assert_eq!(
+            ue_mgr.candidates_for_reestablishment(SIMULATED_C_RNTI, TEST_PCI),
+            vec![1, 2],
+            "both UEs match the presented identity"
+        );
+
+        let result = conn_mgr
+            .process_rrc_reestablishment_request(&mut ue_mgr, &request_for(&key(0xB2)))
+            .expect("UE 2's MAC verifies");
+        assert_eq!(
+            result.ue_id, 2,
+            "the shortMAC-I selected the context whose K_RRCint produced it"
+        );
+        let decoded =
+            decode_rrc_reestablishment(result.rrc_reestablishment_pdu.data()).expect("UPER");
+        assert_eq!(decoded.next_hop_chaining_count, 2, "UE 2's NCC");
+    }
+
+    /// A barred cell answers nothing at all — not even an `RRCSetup`.
+    #[test]
+    fn a_barred_cell_answers_a_reestablishment_with_nothing() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        connected_ue_with_security(&mut conn_mgr, &mut ue_mgr, 1, key(0xA1), 0);
+        conn_mgr.set_barred(true);
+
+        let rejection = conn_mgr
+            .process_rrc_reestablishment_request(&mut ue_mgr, &request_for(&key(0xA1)))
+            .unwrap_err();
+
+        assert_eq!(rejection, ReestablishmentRejection::CellBarred);
+        assert!(!rejection.falls_back_to_setup());
+    }
+
+    /// The echoed transaction id is verified: a mismatch is discarded rather than
+    /// completing the procedure.
+    #[test]
+    fn a_mismatched_completion_transaction_id_is_discarded() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        connected_ue_with_security(&mut conn_mgr, &mut ue_mgr, 1, key(0xA1), 0);
+
+        let result = conn_mgr
+            .process_rrc_reestablishment_request(&mut ue_mgr, &request_for(&key(0xA1)))
+            .expect("verifies");
+        let tid = result.transaction_id;
+
+        assert!(
+            conn_mgr
+                .process_rrc_reestablishment_complete(&mut ue_mgr, 1, tid.wrapping_add(1) % 4)
+                .is_none(),
+            "a completion echoing the wrong tid is discarded"
+        );
+        assert!(
+            !ue_mgr.try_find_ue(1).expect("context").is_connected(),
+            "and the context is not moved to Connected"
+        );
+
+        assert!(
+            conn_mgr
+                .process_rrc_reestablishment_complete(&mut ue_mgr, 1, tid)
+                .is_some(),
+            "the right tid completes it"
+        );
+        assert!(ue_mgr.try_find_ue(1).expect("context").is_connected());
     }
 }
