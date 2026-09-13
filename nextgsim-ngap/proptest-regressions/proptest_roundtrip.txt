@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# PROVENANCE: these seeds come from the deliberate codec breakages used to
+# verify that the property tests discriminate (nextgsim #23, acceptance criterion
+# 5) -- NOT from a codec regression. No genuine counterexample has been found.
+#
+# They are kept rather than deleted because each one is a case already shown to
+# tell a broken codec from a working one: keeping them makes those inputs re-run
+# first on every test run instead of depending on the generator finding them
+# again.
+cc 5eb54280bc10990801d1dc728c9e656f73ea928b427f9d2aaf4f9f3ac1f64ed1 # shrinks to params = InitialUeMessageParams { ran_ue_ngap_id: 0, nas_pdu: [0, 0, 0], user_location_info: UserLocationInfoNr { nr_cgi: NrCgi { plmn_identity: [0, 240, 0], nr_cell_identity: 4294967296 }, tai: Tai { plmn_identity: [0, 240, 0], tac: [0, 0, 0] }, time_stamp: None }, rrc_establishment_cause: Emergency, five_g_s_tmsi: Some(FiveGSTmsi { amf_set_id: 717, amf_pointer: 33, five_g_tmsi: [104, 44, 246, 204] }), amf_set_id: None, ue_context_request: None, allowed_nssai: None }

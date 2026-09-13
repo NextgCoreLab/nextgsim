@@ -17,3 +17,6 @@ bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 num_enum.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

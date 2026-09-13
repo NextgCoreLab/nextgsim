@@ -1,0 +1,16 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# PROVENANCE: these seeds come from the deliberate codec breakages used to
+# verify that the property tests discriminate (nextgsim #23, acceptance criterion
+# 5) -- NOT from a codec regression. No genuine counterexample has been found.
+#
+# They are kept rather than deleted because each one is a case already shown to
+# tell a broken codec from a working one: keeping them makes those inputs re-run
+# first on every test run instead of depending on the generator finding them
+# again.
+cc 14a3f136a42b40697412f3d4209fc1ef2618315cf5d43cecd051cc45deeab5e7 # shrinks to params = RrcSetupCompleteParams { rrc_transaction_id: 0, selected_plmn_identity: 1, registered_amf: None, guami_type: None, s_nssai_list: None, dedicated_nas_message: [0], ng_5g_s_tmsi_value: None, redcap_indication: true }
+cc cec0f15a9982b60d72fee053abdbedefde8382017a735c5da89d0cca3536b98d # shrinks to params = RrcSetupRequestParams { ue_identity: RandomValue(1), establishment_cause: Emergency }

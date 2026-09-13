@@ -87,6 +87,9 @@ log = "0.4"
 env_logger = "0.11"
 asn1-compiler = "0.7"
 
+# Property-based testing (dev-dependency only: generator-driven codec round trips)
+proptest = "1"
+
 # Internal crates
 nextgsim-common = { path = "nextgsim-common" }
 nextgsim-crypto = { path = "nextgsim-crypto" }

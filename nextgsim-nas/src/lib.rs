@@ -51,6 +51,9 @@ pub mod security;
 #[cfg(test)]
 mod capture_tests;
 
+#[cfg(test)]
+mod proptest_roundtrip;
+
 // Re-export commonly used types
 pub use enums::{
     ExtendedProtocolDiscriminator, MessageType, MmMessageType, SecurityHeaderType, SmMessageType,

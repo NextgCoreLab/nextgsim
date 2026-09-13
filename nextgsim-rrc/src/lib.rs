@@ -10,3 +10,6 @@
 
 pub mod codec;
 pub mod procedures;
+
+#[cfg(test)]
+mod proptest_roundtrip;
