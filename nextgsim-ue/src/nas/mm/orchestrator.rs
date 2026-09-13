@@ -30,13 +30,15 @@ use nextgsim_crypto::kdf::{derive_kamf, derive_kausf, derive_kgnb, derive_kseaf,
 use nextgsim_crypto::milenage::{compute_opc, Milenage};
 use nextgsim_nas::enums::{MmMessageType, SecurityHeaderType};
 use nextgsim_nas::ies::ie1::{
-    FollowOnRequest, Ie5gsRegistrationType, IeServiceType, RegistrationType, ServiceType,
+    FollowOnRequest, Ie5gsRegistrationType, IeServiceType, PayloadContainerType, RegistrationType,
+    ServiceType,
 };
 use nextgsim_nas::messages::mm::ue_policy::{
-    ManageUePolicyCommand, ManageUePolicyCommandReject, ManageUePolicyComplete, PlmnId,
-    UePolicyError, UePolicyPart, UePolicyPartType, UePolicyResult, UePolicySectionManagementResult,
-    UePolicySectionManagementSubresult, UrspRule, CAUSE_PROTOCOL_ERROR_UNSPECIFIED, PCF_PTI_MAX,
-    PCF_PTI_MIN, UPDP_MSG_MANAGE_UE_POLICY_COMMAND,
+    self as ue_policy, ManageUePolicyCommand, ManageUePolicyCommandReject, ManageUePolicyComplete,
+    PlmnId, UePolicyClassmark, UePolicyError, UePolicyPart, UePolicyPartType, UePolicyResult,
+    UePolicySectionManagementResult, UePolicySectionManagementSubresult, UeStateIndication,
+    UpsiSublist, UrspRule, CAUSE_PROTOCOL_ERROR_UNSPECIFIED, PCF_PTI_MAX, PCF_PTI_MIN,
+    UPDP_MSG_MANAGE_UE_POLICY_COMMAND,
 };
 use nextgsim_nas::messages::mm::{
     AuthenticationFailure, AuthenticationRequest, AuthenticationResponse,
@@ -474,6 +476,9 @@ pub struct MmOrchestrator {
     // -- UE policy delivery service (UPDP, TS 24.501 Annex D) --
     /// UE policy sections stored by `(PLMN, UPSC)` (TS 24.501 D.2.1.3 / D.3).
     ue_policy_sections: HashMap<(PlmnId, u16), StoredUePolicySection>,
+    /// Last UE-initiated UPDP PTI used (TS 24.501 D.1.2 range 01H-77H). `0` means
+    /// none allocated yet, which is why it is not a valid PTI to send.
+    updp_pti: u8,
 
     // -- non-volatile 5GMM parameters (TS 24.501 Annex C.1) --
     /// Where the Annex C.1 parameters are stored across restarts, when the
@@ -521,6 +526,7 @@ impl MmOrchestrator {
             dereg_pdu: None,
             stored_suci: None,
             ue_policy_sections: HashMap::new(),
+            updp_pti: 0,
             state_file: None,
         }
     }
@@ -919,6 +925,15 @@ impl MmOrchestrator {
         req.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
         req.requested_nssai = self.identity.requested_nssai.clone();
         req.last_visited_tai = self.current_tai;
+        // TS 24.501 §5.5.1.2.2: report the stored UE policy sections so the PCF
+        // knows what this UE already holds. Before this the sections existed in
+        // `ue_policy_sections` and were never signalled back, so a PCF that
+        // optimises delivery on the reported UPSI list either re-pushed
+        // everything or withheld it.
+        if let Some(indication) = self.build_ue_state_indication() {
+            req.payload_container_type = Some(PayloadContainerType::UePolicyContainer);
+            req.payload_container = Some(indication);
+        }
         // SNPN access (Rel-17, TS 23.501 §5.30): when configured, advertise the
         // NID so the AMF can validate SNPN authorization (TS 24.501).
         if let Some(ref nid) = self.identity.snpn_nid {
@@ -2384,6 +2399,97 @@ impl MmOrchestrator {
     /// The stored UE policy section for `(plmn, upsc)`, if any (test hook).
     pub fn ue_policy_section(&self, plmn: PlmnId, upsc: u16) -> Option<&StoredUePolicySection> {
         self.ue_policy_sections.get(&(plmn, upsc))
+    }
+
+    /// The next UE-initiated UPDP PTI (TS 24.501 D.1.2: 01H-77H).
+    ///
+    /// D.2.2.2 a) wants "a PTI value currently not used", so this cycles the
+    /// whole range rather than reusing one value. **Not zero:** the issue that
+    /// asked for this suggested PTI 0, but D.1.2 reserves 01H-77H for the UE and
+    /// 0 means "no procedure transaction identity assigned".
+    fn next_ue_updp_pti(&mut self) -> u8 {
+        // Cycle 0x01..=0x77. UE STATE INDICATION draws no response (D.2.2.3), so
+        // nothing outstanding can collide; cycling is about not repeating a
+        // value the PCF has just seen.
+        self.updp_pti = if self.updp_pti >= ue_policy::UE_PTI_MAX {
+            ue_policy::UE_PTI_MIN
+        } else {
+            self.updp_pti + 1
+        };
+        self.updp_pti
+    }
+
+    /// The UE policy classmark this UE advertises (TS 24.501 D.6.5).
+    ///
+    /// ANDSP is claimed because the UPDP codec decodes and stores an ANDSP part
+    /// (`UePolicyPartType::Andsp`). The other three are **not**: there is no EPS
+    /// URSP path, no VPS URSP, and nothing reports URSP rule enforcement in this
+    /// tree, and claiming a capability the UE does not have is worse than not
+    /// claiming it — a PCF that trusts the bit withholds or mis-targets policy.
+    fn ue_policy_classmark(&self) -> UePolicyClassmark {
+        UePolicyClassmark {
+            andsp: true,
+            ursp_in_eps: false,
+            vps_ursp: false,
+            report_ursp_rule_enforcement: false,
+        }
+    }
+
+    /// Build the UE STATE INDICATION to carry in the REGISTRATION REQUEST
+    /// Payload container (TS 24.501 §5.5.1.2.2, D.5.4), or `None` when there is
+    /// nothing to report.
+    ///
+    /// Returns `None` — and so omits the Payload container entirely — when no
+    /// section is stored for the selected PLMN. §5.5.1.2.2's second paragraph
+    /// does allow a section-less indication, but only when "the UE needs to send
+    /// a UE policy container to the network", and this UE has no other reason
+    /// to: its classmark has not changed and it reports no OS Id. Sending one
+    /// anyway would make every clean first attach carry a container it has
+    /// nothing to say in.
+    fn build_ue_state_indication(&mut self) -> Option<Vec<u8>> {
+        // §5.5.1.2.2: sections identified by a UPSI whose PLMN ID part is the
+        // HPLMN or the selected PLMN. In this simulator the camped cell
+        // broadcasts the configured PLMN, so those are the same value.
+        let selected = PlmnId::from_bcd(self.identity.plmn_bcd).ok()?;
+        let mut upscs: Vec<u16> = self
+            .ue_policy_sections
+            .keys()
+            .filter(|(plmn, _)| *plmn == selected)
+            .map(|(_, upsc)| *upsc)
+            .collect();
+        if upscs.is_empty() {
+            return None;
+        }
+        // HashMap iteration order is arbitrary; sort so the encoded bytes are a
+        // function of the stored state and a test can assert them.
+        upscs.sort_unstable();
+
+        let indication = UeStateIndication {
+            pti: self.next_ue_updp_pti(),
+            upsi_list: vec![UpsiSublist {
+                plmn_id: selected,
+                upscs,
+            }],
+            classmark: self.ue_policy_classmark(),
+        };
+        match indication.encode() {
+            Ok(bytes) => {
+                info!(
+                    "REGISTRATION REQUEST will report {} stored UE policy section(s) in a UE \
+                     STATE INDICATION (TS 24.501 §5.5.1.2.2)",
+                    indication
+                        .upsi_list
+                        .iter()
+                        .map(|s| s.upscs.len())
+                        .sum::<usize>()
+                );
+                Some(bytes)
+            }
+            Err(e) => {
+                warn!("Cannot encode UE STATE INDICATION ({e}); omitting the Payload container");
+                None
+            }
+        }
     }
 
     /// Handle a received "UE policy container" payload (the MANAGE UE POLICY
@@ -4845,6 +4951,269 @@ mod tests {
             rules[0].traffic_descriptor,
             vec![TrafficDescriptorComponent::MatchAll]
         );
+    }
+
+    // ========================================================================
+    // UE STATE INDICATION in REGISTRATION REQUEST (TS 24.501 §5.5.1.2.2) — #48
+    // ========================================================================
+
+    /// The Payload container on the WIRE Registration Request, if any.
+    ///
+    /// Deciphers when the request is security protected, which is the case that
+    /// matters here: the Payload container is NOT a cleartext IE (TS 24.501
+    /// §4.4.6), so it only reaches the wire once a security context is active.
+    fn registration_payload_container(
+        orch: &mut MmOrchestrator,
+    ) -> (Option<PayloadContainerType>, Option<Vec<u8>>) {
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        let pdu = first_sent_pdu(&outs).to_vec();
+        let body = if pdu[1] == 0x00 {
+            pdu.clone()
+        } else {
+            let sec = orch.security_context();
+            let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+            let mut payload = pdu[7..].to_vec();
+            nas_cipher(
+                sec.ciphering_algorithm(),
+                sec.keys().knas_enc().unwrap(),
+                &count,
+                NAS_BEARER,
+                NasDirection::Uplink,
+                &mut payload,
+            );
+            payload
+        };
+        let req = RegistrationRequest::decode(&mut &body[3..]).expect("decodes");
+        (req.payload_container_type, req.payload_container)
+    }
+
+    /// The Payload container on the FULL request stashed for replay inside the
+    /// SECURITY MODE COMPLETE NAS message container (TS 24.501 §4.4.6 a) 1)).
+    fn stashed_payload_container(orch: &MmOrchestrator) -> Option<Vec<u8>> {
+        let full = orch
+            .last_registration_request
+            .as_ref()
+            .expect("the full request is stashed for the SMC container");
+        RegistrationRequest::decode(&mut &full[3..])
+            .expect("decodes")
+            .payload_container
+    }
+
+    /// An orchestrator with an ACTIVE security context, ready to start a fresh
+    /// registration -- which is what a RE-registration is, and the only case in
+    /// which the Payload container reaches the wire (§4.4.6).
+    ///
+    /// `establish_security_context` leaves the state machine mid-procedure, so it
+    /// is returned to DEREGISTERED; otherwise `start_registration` short-circuits
+    /// on its "already in progress" guard and emits nothing.
+    fn registered_orch() -> MmOrchestrator {
+        let mut orch = establish_security_context();
+        orch.state_mut().switch_mm_state(MmSubState::Deregistered);
+        orch
+    }
+
+    /// Store a UE policy section for THIS UE's PLMN (999/70), so §5.5.1.2.2's
+    /// "HPLMN or selected PLMN" condition is satisfied.
+    ///
+    /// The shipped E1 fixture stores at PLMN 001/01, which is deliberately NOT
+    /// this UE's PLMN — see `a_section_for_another_plmn_is_not_reported`.
+    fn store_section_for_own_plmn(orch: &mut MmOrchestrator, upsc: u16) {
+        let mut cmd = E1_VEC_F_COMMAND.to_vec();
+        // The command's sublist PLMN sits after PTI, type, list length (2) and
+        // sublist length (2): octets 6..9.
+        let own = encode_plmn_bcd(999, 70, false);
+        cmd[6..9].copy_from_slice(&own);
+        // ... and the instruction's UPSC after the PLMN: octets 11..13
+        // (instruction length is at 9..11).
+        cmd[11..13].copy_from_slice(&upsc.to_be_bytes());
+        let reaction = orch.handle_ue_policy_command(&cmd);
+        assert!(
+            matches!(reaction, UePolicyReaction::Reply(_)),
+            "the fixture must be accepted, got {reaction:?}"
+        );
+    }
+
+    /// #48: a REGISTRATION REQUEST from a UE holding a policy section for its own
+    /// PLMN carries the UE STATE INDICATION in the Payload container, with the
+    /// Payload container type set to "UE policy container" (§5.5.1.2.2).
+    #[test]
+    fn a_stored_policy_section_is_reported_in_the_registration_request() {
+        let mut orch = registered_orch();
+        store_section_for_own_plmn(&mut orch, 4);
+        assert_eq!(orch.ue_policy_section_count(), 1, "precondition");
+
+        let (container_type, container) = registration_payload_container(&mut orch);
+        assert_eq!(
+            container_type,
+            Some(PayloadContainerType::UePolicyContainer),
+            "§8.2.6.17A NOTE: the only value this IE takes in a REGISTRATION REQUEST"
+        );
+        let container = container.expect("the Payload container must be present");
+
+        // Decoded rather than byte-compared, so the assertion is about WHAT is
+        // reported; the byte layout is pinned in nextgsim-nas's own tests.
+        let indication =
+            UeStateIndication::decode(&container).expect("a valid UE STATE INDICATION");
+        assert!(
+            (ue_policy::UE_PTI_MIN..=ue_policy::UE_PTI_MAX).contains(&indication.pti),
+            "PTI {} must be in the UE-initiated range 01H-77H (D.1.2); 0 is not a PTI",
+            indication.pti
+        );
+        assert_eq!(indication.upsi_list.len(), 1);
+        assert_eq!(
+            indication.upsi_list[0].plmn_id,
+            PlmnId::from_bcd(encode_plmn_bcd(999, 70, false)).unwrap()
+        );
+        assert_eq!(
+            indication.upsi_list[0].upscs,
+            vec![4],
+            "the UPSC the PCF assigned must be the one reported"
+        );
+        assert!(
+            indication.classmark.andsp,
+            "the UPDP codec stores an ANDSP part, so ANDSP is claimed"
+        );
+        assert!(
+            !indication.classmark.ursp_in_eps
+                && !indication.classmark.vps_ursp
+                && !indication.classmark.report_ursp_rule_enforcement,
+            "capabilities this tree does not have must not be claimed"
+        );
+    }
+
+    /// #48: a clean first attach carries NO Payload container.
+    ///
+    /// This is the default path and the one that must not regress: §5.5.1.2.2's
+    /// obligation is conditional on holding a stored section, and a container
+    /// sent unconditionally would make every registration carry an IE with
+    /// nothing to report.
+    #[test]
+    fn a_clean_first_attach_carries_no_payload_container() {
+        let mut orch = registered_orch();
+        assert_eq!(orch.ue_policy_section_count(), 0, "precondition");
+        let (container_type, container) = registration_payload_container(&mut orch);
+        assert_eq!(container, None, "no stored section, no container");
+        assert_eq!(
+            container_type, None,
+            "§8.2.6.17A: the type IE exists only to describe a container"
+        );
+    }
+
+    /// #48: a section stored for a DIFFERENT PLMN is not reported.
+    ///
+    /// §5.5.1.2.2 scopes the report to sections whose UPSI names the HPLMN or the
+    /// selected PLMN. Reporting a foreign PLMN's UPSC would tell this PCF the UE
+    /// holds a section it did not issue — and the shipped E1 fixture stores at
+    /// 001/01 while this UE is on 999/70, so an unfiltered implementation passes
+    /// the positive test above and fails here.
+    #[test]
+    fn a_section_for_another_plmn_is_not_reported() {
+        let mut orch = registered_orch();
+        orch.handle_ue_policy_command(E1_VEC_F_COMMAND);
+        assert_eq!(
+            orch.ue_policy_section_count(),
+            1,
+            "precondition: a section IS stored, just not for this PLMN"
+        );
+        assert!(
+            orch.ue_policy_section(plmn_001_01(), 1).is_some(),
+            "precondition: stored at 001/01"
+        );
+
+        let (_, container) = registration_payload_container(&mut orch);
+        assert_eq!(
+            container, None,
+            "only HPLMN / selected-PLMN sections are reportable (§5.5.1.2.2)"
+        );
+    }
+
+    /// #48: two sections for this PLMN are reported as two UPSCs in one sublist,
+    /// in a deterministic order.
+    ///
+    /// The store is a `HashMap`, so without an explicit sort the encoded bytes
+    /// would vary run to run — which would make any byte-level assertion, here or
+    /// at a peer, flaky rather than wrong.
+    #[test]
+    fn multiple_sections_are_reported_in_a_stable_order() {
+        let mut orch = registered_orch();
+        // FOUR sections, stored in DESCENDING order. Two would make this guard a
+        // coin flip -- an unsorted HashMap walk yields ascending order half the
+        // time -- so it is four, where the odds of accidentally passing are 1/24.
+        for upsc in [9u16, 7, 4, 2] {
+            store_section_for_own_plmn(&mut orch, upsc);
+        }
+        assert_eq!(orch.ue_policy_section_count(), 4, "precondition");
+
+        let (_, container) = registration_payload_container(&mut orch);
+        let indication =
+            UeStateIndication::decode(&container.expect("container")).expect("valid indication");
+        assert_eq!(indication.upsi_list.len(), 1, "one PLMN, one sublist");
+        assert_eq!(
+            indication.upsi_list[0].upscs,
+            vec![2, 4, 7, 9],
+            "ascending UPSC: the encoded bytes must be a function of the stored state, not \
+             of HashMap iteration order"
+        );
+    }
+
+    /// #48: with NO security context the indication is NOT on the wire, but IS in
+    /// the full request stashed for the SECURITY MODE COMPLETE container.
+    ///
+    /// This is where §5.5.1.2.2 and §4.4.6 meet, and the answer is not obvious.
+    /// §5.5.1.2.2 says the *initial* REGISTRATION REQUEST shall carry the UE
+    /// STATE INDICATION; §4.4.6 enumerates the cleartext IEs of a REGISTRATION
+    /// REQUEST and **the Payload container is not among them**, so a UE with no
+    /// valid 5G NAS security context may not send it in the clear. §4.4.6 a) 1)
+    /// resolves it: the entire request, non-cleartext IEs included, is replayed
+    /// inside the NAS message container of SECURITY MODE COMPLETE.
+    ///
+    /// So the obligation is met without ever putting a UPSI list — which names
+    /// what policy this subscriber holds — on an unprotected radio link.
+    #[test]
+    fn without_security_the_indication_travels_in_the_smc_container_not_in_the_clear() {
+        let mut orch = new_orch();
+        store_section_for_own_plmn(&mut orch, 4);
+        assert!(
+            !orch.security_context().is_active(),
+            "precondition: no security context"
+        );
+
+        let (container_type, container) = registration_payload_container(&mut orch);
+        assert_eq!(
+            container, None,
+            "the Payload container is not a cleartext IE (§4.4.6): it must not be sent \
+             unprotected"
+        );
+        assert_eq!(container_type, None);
+
+        let stashed = stashed_payload_container(&orch)
+            .expect("the full request must carry it for the SMC container (§4.4.6 a) 1))");
+        let indication = UeStateIndication::decode(&stashed).expect("a valid indication");
+        assert_eq!(indication.upsi_list[0].upscs, vec![4]);
+    }
+
+    /// #48: successive registrations use DIFFERENT PTIs (D.2.2.2 a): "allocate a
+    /// PTI value currently not used").
+    #[test]
+    fn successive_indications_use_different_ptis() {
+        let mut orch = registered_orch();
+        store_section_for_own_plmn(&mut orch, 1);
+
+        let first =
+            UeStateIndication::decode(&registration_payload_container(&mut orch).1.unwrap())
+                .unwrap()
+                .pti;
+        // Return to a state from which another registration can be started
+        // (the same "already in progress" guard as in `registered_orch`).
+        orch.state_mut().switch_mm_state(MmSubState::Deregistered);
+        let second =
+            UeStateIndication::decode(&registration_payload_container(&mut orch).1.unwrap())
+                .unwrap()
+                .pti;
+        assert_ne!(first, second, "a reused PTI is not 'currently not used'");
+        for pti in [first, second] {
+            assert!((ue_policy::UE_PTI_MIN..=ue_policy::UE_PTI_MAX).contains(&pti));
+        }
     }
 
     #[test]

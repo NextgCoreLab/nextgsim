@@ -13,6 +13,7 @@ use crate::enums::MmMessageType;
 use crate::header::PlainMmHeader;
 use crate::ies::ie1::{
     Ie5gsRegistrationType, IeMicoIndication, InformationElement1, NssaiInclusionMode,
+    PayloadContainerType,
 };
 use crate::ies::ie4::{
     IeAiMlCapability, IeIsacParameter, IeNtnAccessBarring, IeNtnTimingAdvance,
@@ -502,6 +503,9 @@ mod registration_request_iei {
     pub const LADN_INDICATION: u8 = 0x74;
     /// Payload container
     pub const PAYLOAD_CONTAINER: u8 = 0x7B;
+    /// Payload container type (Table 8.2.6.1.1 IEI `8-`: a type 1 TV IE, so the
+    /// value shares the octet with the IEI in the low nibble)
+    pub const PAYLOAD_CONTAINER_TYPE: u8 = 0x8;
     /// Network slicing indication
     pub const NETWORK_SLICING_INDICATION: u8 = 0x9;
     /// 5GS update type
@@ -609,6 +613,15 @@ pub struct RegistrationRequest {
     /// signalling is modelled separately; this NAS indication is what reaches
     /// the core in the simulator's runtime registration path.)
     pub redcap: bool,
+    /// Payload container type (optional, Type 1 TV, IEI `8-`) — TS 24.501
+    /// §8.2.6.17A. "This IE shall be included if the UE includes the Payload
+    /// container IE", and in this version of the protocol its only value here is
+    /// `UePolicyContainer` (§8.2.6.17A NOTE).
+    pub payload_container_type: Option<PayloadContainerType>,
+    /// Payload container (optional, Type 6 TLV-E, IEI 0x7B) — TS 24.501
+    /// §8.2.6.18. Carries the UE STATE INDICATION message when the UE has
+    /// stored UE policy sections for the selected PLMN (§5.5.1.2.2).
+    pub payload_container: Option<Vec<u8>>,
 }
 
 /// Encode an 11-hex-digit SNPN NID into the 44-bit packed form of TS 23.003
@@ -718,6 +731,8 @@ impl Default for RegistrationRequest {
             disaster_roaming: false,
             uav_indication: None,
             redcap: false,
+            payload_container_type: None,
+            payload_container: None,
         }
     }
 }
@@ -784,6 +799,15 @@ impl RegistrationRequest {
                 0x9 => {
                     // Network slicing indication
                     buf.advance(1);
+                    continue;
+                }
+                registration_request_iei::PAYLOAD_CONTAINER_TYPE => {
+                    // Payload container type (Type 1 TV, IEI `8-`)
+                    let val = buf.get_u8() & 0x0F;
+                    // An unassigned type is skipped rather than fatal: the
+                    // container that follows is still length-delimited, so the
+                    // rest of the message stays decodable.
+                    msg.payload_container_type = PayloadContainerType::try_from(val).ok();
                     continue;
                 }
                 _ => {}
@@ -897,6 +921,19 @@ impl RegistrationRequest {
                     let mut data = vec![0u8; len];
                     buf.copy_to_slice(&mut data);
                     msg.ladn_indication = Some(data);
+                }
+                registration_request_iei::PAYLOAD_CONTAINER => {
+                    buf.advance(1);
+                    if buf.remaining() < 2 {
+                        break;
+                    }
+                    let len = buf.get_u16() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.payload_container = Some(data);
                 }
                 // 6G extension IEs
                 registration_request_iei::AI_ML_CAPABILITY => {
@@ -1092,6 +1129,25 @@ impl RegistrationRequest {
             buf.put_u8(registration_request_iei::LADN_INDICATION);
             buf.put_u16(ladn.len() as u16);
             buf.put_slice(ladn);
+        }
+
+        // Payload container type + Payload container (TS 24.501 §8.2.6.17A,
+        // §8.2.6.18). The type IE is a type 1 TV: IEI in the high nibble, value
+        // in the low one. §8.2.6.17A makes it mandatory whenever the container
+        // is present, so it is emitted from the container's own presence rather
+        // than independently -- a container with no type is undecodable, and a
+        // type with no container tells the AMF to look for something absent.
+        if let Some(ref container) = self.payload_container {
+            let container_type = self
+                .payload_container_type
+                .unwrap_or(PayloadContainerType::UePolicyContainer);
+            buf.put_u8(
+                (registration_request_iei::PAYLOAD_CONTAINER_TYPE << 4)
+                    | (u8::from(container_type) & 0x0F),
+            );
+            buf.put_u8(registration_request_iei::PAYLOAD_CONTAINER);
+            buf.put_u16(container.len() as u16);
+            buf.put_slice(container);
         }
 
         // 6G extension IEs
