@@ -1,12 +1,21 @@
 //! Conditional Handover (CHO) Configuration
 //!
-//! 6G extension: RRC procedure for Conditional Handover configuration
-//! as defined in 3GPP TS 38.331 Section 5.3.5.8 with enhancements for
-//! predictive and AI-assisted handover decisions.
+//! Conditional reconfiguration is TS 38.331 **Section 5.3.5.13** (§5.3.5.13.4
+//! evaluation, §5.3.5.13.5 execution); §5.3.5.8 is the reconfiguration-failure
+//! clause and was a misattribution. Rel-16 defines the execution conditions
+//! `condEventA3` and `condEventA5`; this module adds three non-normative
+//! research conditions (timer-based, predictive, AI-assisted) on top.
 //!
 //! This module implements:
 //! - `ChoConfig` - Conditional Handover configuration with conditions and target cell configs
 //! - Condition types: event-based (A3, A5), timer-based, and 6G predictive
+//! - The container codec: [`encode_cho_config`] / [`decode_cho_config`]
+//!
+//! The container is the simulator's own byte format, not UPER
+//! `ConditionalReconfiguration`: that IE arrived in Rel-16 and the vendored
+//! schema is Rel-15 (issue #105). The UE-side runtime that stores candidates and
+//! evaluates their execution conditions lives in
+//! `nextgsim-ue/src/rrc/conditional_handover.rs`.
 
 use thiserror::Error;
 
@@ -79,6 +88,53 @@ pub enum TimeToTrigger {
 }
 
 impl TimeToTrigger {
+    /// The wire code for this value: its index in the `TimeToTrigger` ENUMERATED
+    /// of TS 38.331 (`timeToTrigger`), which is the order declared above.
+    pub fn to_code(&self) -> u8 {
+        match self {
+            TimeToTrigger::Ms0 => 0,
+            TimeToTrigger::Ms40 => 1,
+            TimeToTrigger::Ms64 => 2,
+            TimeToTrigger::Ms80 => 3,
+            TimeToTrigger::Ms100 => 4,
+            TimeToTrigger::Ms128 => 5,
+            TimeToTrigger::Ms160 => 6,
+            TimeToTrigger::Ms256 => 7,
+            TimeToTrigger::Ms320 => 8,
+            TimeToTrigger::Ms480 => 9,
+            TimeToTrigger::Ms512 => 10,
+            TimeToTrigger::Ms640 => 11,
+            TimeToTrigger::Ms1024 => 12,
+            TimeToTrigger::Ms1280 => 13,
+            TimeToTrigger::Ms2560 => 14,
+            TimeToTrigger::Ms5120 => 15,
+        }
+    }
+
+    /// The value for a wire code, or `None` if the code is not one of the 16
+    /// `timeToTrigger` values.
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => TimeToTrigger::Ms0,
+            1 => TimeToTrigger::Ms40,
+            2 => TimeToTrigger::Ms64,
+            3 => TimeToTrigger::Ms80,
+            4 => TimeToTrigger::Ms100,
+            5 => TimeToTrigger::Ms128,
+            6 => TimeToTrigger::Ms160,
+            7 => TimeToTrigger::Ms256,
+            8 => TimeToTrigger::Ms320,
+            9 => TimeToTrigger::Ms480,
+            10 => TimeToTrigger::Ms512,
+            11 => TimeToTrigger::Ms640,
+            12 => TimeToTrigger::Ms1024,
+            13 => TimeToTrigger::Ms1280,
+            14 => TimeToTrigger::Ms2560,
+            15 => TimeToTrigger::Ms5120,
+            _ => return None,
+        })
+    }
+
     /// Get the time-to-trigger value in milliseconds
     pub fn to_ms(&self) -> u32 {
         match self {
@@ -169,7 +225,7 @@ impl A3Offset {
 /// Event A3 condition parameters
 ///
 /// Condition: Neighbour becomes amount of offset better than `SpCell`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventA3Condition {
     /// A3 offset value in dB
     pub a3_offset: A3Offset,
@@ -184,7 +240,7 @@ pub struct EventA3Condition {
 /// Event A5 condition parameters
 ///
 /// Condition: `SpCell` RSRP < threshold1 AND Neighbour RSRP > threshold2
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventA5Condition {
     /// Threshold 1 (for serving cell becoming worse)
     pub threshold1: RsrpThreshold,
@@ -206,7 +262,7 @@ pub struct TimerBasedCondition {
 }
 
 /// 6G: Predictive handover condition parameters
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PredictiveCondition {
     /// Predicted time until handover is needed (ms)
     pub predicted_handover_time_ms: u32,
@@ -221,7 +277,7 @@ pub struct PredictiveCondition {
 }
 
 /// 6G: AI-assisted condition evaluation parameters
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AiAssistedCondition {
     /// AI model ID used for evaluation
     pub model_id: String,
@@ -236,7 +292,7 @@ pub struct AiAssistedCondition {
 }
 
 /// CHO execution condition
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChoCondition {
     /// Event A3 based condition
     EventA3(EventA3Condition),
@@ -264,7 +320,7 @@ impl ChoCondition {
 }
 
 /// Target cell configuration for CHO
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChoTargetCellConfig {
     /// Physical Cell ID (0-1007)
     pub phys_cell_id: u16,
@@ -284,7 +340,7 @@ pub struct ChoTargetCellConfig {
 ///
 /// Contains one or more candidate cells with their execution conditions.
 /// When a condition is met, the UE performs handover to the corresponding target cell.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChoConfig {
     /// CHO configuration ID
     pub config_id: u8,
@@ -301,7 +357,7 @@ pub struct ChoConfig {
 }
 
 /// A candidate cell for conditional handover
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChoCandidateCell {
     /// Candidate cell index (unique within the CHO config)
     pub candidate_index: u8,
@@ -426,7 +482,54 @@ impl ChoCandidateCell {
     }
 }
 
-/// Encode a CHO configuration to bytes (simplified serialization)
+/// A dB value on the RRC 0.5 dB grid, as the half-dB integer the wire carries.
+///
+/// `a3-Offset` and `hysteresis` are `INTEGER (0..30)` in units of 0.5 dB in
+/// TS 38.331, so a value off that grid cannot be signalled and is rounded to it.
+fn to_half_db(db: f64) -> i16 {
+    (db * 2.0).round() as i16
+}
+
+/// The dB value a half-dB wire integer denotes.
+fn from_half_db(half_db: i16) -> f64 {
+    f64::from(half_db) / 2.0
+}
+
+/// Encode a CHO configuration to bytes.
+///
+/// # Wire layout
+///
+/// This is the simulator's own container, not UPER `ConditionalReconfiguration`
+/// (which needs the Rel-16 RRC schema — see the Rel-15 ceiling in issue #105).
+/// The three-byte header is unchanged from the original encoder, so
+/// [`decode_cho_config_header`] reads any version of this container:
+///
+/// ```text
+/// [0]      config_id
+/// [1]      candidate count
+/// [2]      flags: bit 0 report_cho_execution, bit 1 predictive_ho_enabled
+/// then per candidate:
+/// [0]      candidate_index
+/// [1]      condition type code (0 = A3, 1 = A5, 2 = timer)
+/// [2..4]   phys_cell_id (big endian)
+/// [4]      priority
+/// [5..7]   detail length (big endian) -- condition detail then target detail
+/// [7..]    detail
+/// ```
+///
+/// The per-candidate detail block is what the original encoder dropped: it wrote
+/// only index, condition type, PCI and priority, so a decoder could not
+/// reconstruct a candidate's execution condition or target configuration. The
+/// UE-side conditional-reconfiguration runtime (`nextgsim-ue`, issue #20) needs
+/// both, hence the completion. The length prefix keeps a decoder able to skip a
+/// candidate whose detail it does not understand.
+///
+/// # Conditions that cannot be carried
+///
+/// [`ChoCondition::Predictive`] and [`ChoCondition::AiAssisted`] are this
+/// simulator's research extensions (model identifiers, feature vectors, a boxed
+/// fallback condition); no wire encoding is defined for them, so encoding one is
+/// an error rather than a silent loss of the parameters.
 pub fn encode_cho_config(config: &ChoConfig) -> Result<Vec<u8>, ConditionalHandoverError> {
     config.validate()?;
     let mut bytes = Vec::with_capacity(64);
@@ -445,7 +548,6 @@ pub fn encode_cho_config(config: &ChoConfig) -> Result<Vec<u8>, ConditionalHando
     }
     bytes.push(flags);
 
-    // Encode each candidate cell (simplified: just condition type + phys_cell_id + priority)
     for candidate in &config.candidate_cells {
         bytes.push(candidate.candidate_index);
         bytes.push(match candidate.condition.condition_type() {
@@ -457,15 +559,304 @@ pub fn encode_cho_config(config: &ChoConfig) -> Result<Vec<u8>, ConditionalHando
         });
         bytes.extend_from_slice(&candidate.target_cell.phys_cell_id.to_be_bytes());
         bytes.push(candidate.priority);
+
+        let mut detail = encode_condition(&candidate.condition)?;
+        detail.extend_from_slice(&encode_target_cell(&candidate.target_cell));
+        let detail_len = u16::try_from(detail.len()).map_err(|_| {
+            ConditionalHandoverError::CodecError(format!(
+                "candidate {} detail is {} bytes, which does not fit the 16-bit length prefix",
+                candidate.candidate_index,
+                detail.len()
+            ))
+        })?;
+        bytes.extend_from_slice(&detail_len.to_be_bytes());
+        bytes.extend_from_slice(&detail);
     }
 
     Ok(bytes)
 }
 
-/// Decode a CHO configuration from bytes (simplified deserialization)
+/// Encode an execution condition's parameters.
+fn encode_condition(condition: &ChoCondition) -> Result<Vec<u8>, ConditionalHandoverError> {
+    let mut out = Vec::with_capacity(8);
+    match condition {
+        ChoCondition::EventA3(a3) => {
+            out.extend_from_slice(&to_half_db(a3.a3_offset.0).to_be_bytes());
+            out.push(to_half_db(a3.hysteresis.0) as u8);
+            out.push(a3.time_to_trigger.to_code());
+            out.push(u8::from(a3.use_rsrp));
+        }
+        ChoCondition::EventA5(a5) => {
+            out.extend_from_slice(&a5.threshold1.0.to_be_bytes());
+            out.extend_from_slice(&a5.threshold2.0.to_be_bytes());
+            out.push(to_half_db(a5.hysteresis.0) as u8);
+            out.push(a5.time_to_trigger.to_code());
+        }
+        ChoCondition::Timer(timer) => {
+            out.extend_from_slice(&timer.timer_ms.to_be_bytes());
+            out.push(u8::from(timer.restart_on_improvement));
+        }
+        ChoCondition::Predictive(_) | ChoCondition::AiAssisted(_) => {
+            return Err(ConditionalHandoverError::CodecError(format!(
+                "{:?} is a research extension with no wire encoding: its parameters \
+                 (model identifiers, feature vectors, fallback condition) cannot be \
+                 carried in the CHO container",
+                condition.condition_type()
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a target cell configuration.
+fn encode_target_cell(target: &ChoTargetCellConfig) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&target.ssb_frequency_arfcn.to_be_bytes());
+    out.extend_from_slice(&target.ssb_subcarrier_spacing_khz.to_be_bytes());
+
+    let mut flags: u8 = 0;
+    if target.nr_cell_identity.is_some() {
+        flags |= 0x01;
+    }
+    if target.plmn_identity.is_some() {
+        flags |= 0x02;
+    }
+    if target.rrc_reconfiguration.is_some() {
+        flags |= 0x04;
+    }
+    out.push(flags);
+
+    if let Some(nci) = target.nr_cell_identity {
+        // 36 bits in 5 octets, high nibble of the first octet unused
+        out.extend_from_slice(&nci.to_be_bytes()[3..8]);
+    }
+    if let Some(plmn) = target.plmn_identity {
+        out.extend_from_slice(&plmn);
+    }
+    if let Some(ref reconfig) = target.rrc_reconfiguration {
+        // Truncating at 65535 is not reachable: an RRCReconfiguration that long
+        // exceeds every PDCP SDU size the simulator uses.
+        let len = u16::try_from(reconfig.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&reconfig[..usize::from(len)]);
+    }
+    out
+}
+
+/// A cursor over a candidate's detail block that reports a short read rather
+/// than panicking on a slice out of range.
+struct DetailReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    candidate_index: u8,
+}
+
+impl<'a> DetailReader<'a> {
+    fn new(bytes: &'a [u8], candidate_index: u8) -> Self {
+        Self {
+            bytes,
+            pos: 0,
+            candidate_index,
+        }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ConditionalHandoverError> {
+        if self.pos + n > self.bytes.len() {
+            return Err(ConditionalHandoverError::CodecError(format!(
+                "candidate {}: detail block ends after {} bytes, {} more needed",
+                self.candidate_index,
+                self.bytes.len(),
+                self.pos + n - self.bytes.len()
+            )));
+        }
+        let slice = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, ConditionalHandoverError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, ConditionalHandoverError> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn i16(&mut self) -> Result<i16, ConditionalHandoverError> {
+        Ok(self.u16()? as i16)
+    }
+
+    fn u32(&mut self) -> Result<u32, ConditionalHandoverError> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+}
+
+/// Decode a CHO configuration from bytes.
 ///
-/// Note: This only decodes the simplified header fields. Full condition
-/// parameters require the complete RRC reconfiguration message.
+/// The inverse of [`encode_cho_config`], including each candidate's execution
+/// condition and target cell configuration. The container is the simulator's own
+/// (see that function for the layout and for why the two research conditions
+/// cannot be carried).
+///
+/// Values on the RRC 0.5 dB grid come back quantised: an `a3-Offset` of 3.3 dB
+/// encodes as 3.5 dB, because that is the resolution `INTEGER (0..30)` in units
+/// of 0.5 dB has.
+pub fn decode_cho_config(bytes: &[u8]) -> Result<ChoConfig, ConditionalHandoverError> {
+    let (config_id, num_candidates, report_cho_execution, predictive_ho_enabled) =
+        decode_cho_config_header(bytes)?;
+
+    let mut pos = 3;
+    let mut candidate_cells = Vec::with_capacity(usize::from(num_candidates));
+
+    for nth in 0..num_candidates {
+        if pos + 7 > bytes.len() {
+            return Err(ConditionalHandoverError::CodecError(format!(
+                "candidate {nth} of {num_candidates}: header needs 7 bytes, {} available",
+                bytes.len().saturating_sub(pos)
+            )));
+        }
+        let candidate_index = bytes[pos];
+        let condition_code = bytes[pos + 1];
+        let phys_cell_id = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]);
+        let priority = bytes[pos + 4];
+        let detail_len = usize::from(u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]));
+        pos += 7;
+
+        if pos + detail_len > bytes.len() {
+            return Err(ConditionalHandoverError::CodecError(format!(
+                "candidate {candidate_index}: detail claims {detail_len} bytes, {} available",
+                bytes.len() - pos
+            )));
+        }
+        let mut reader = DetailReader::new(&bytes[pos..pos + detail_len], candidate_index);
+        pos += detail_len;
+
+        let condition = decode_condition(condition_code, candidate_index, &mut reader)?;
+        let target_cell = decode_target_cell(phys_cell_id, &mut reader)?;
+
+        candidate_cells.push(ChoCandidateCell {
+            candidate_index,
+            condition,
+            target_cell,
+            priority,
+        });
+    }
+
+    let config = ChoConfig {
+        config_id,
+        candidate_cells,
+        // The container carries no maximum: the count itself bounds the list, and
+        // an absent maximum is what `validate` treats as unbounded.
+        max_candidate_cells: None,
+        report_cho_execution,
+        predictive_ho_enabled,
+        // ai_model_id is a String with no encoding in this container; a decoded
+        // config therefore never claims an AI model.
+        ai_model_id: None,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+/// Decode an execution condition from its type code and parameter bytes.
+fn decode_condition(
+    code: u8,
+    candidate_index: u8,
+    reader: &mut DetailReader<'_>,
+) -> Result<ChoCondition, ConditionalHandoverError> {
+    let time_to_trigger = |code: u8| {
+        TimeToTrigger::from_code(code).ok_or_else(|| {
+            ConditionalHandoverError::CodecError(format!(
+                "candidate {candidate_index}: {code} is not a timeToTrigger value"
+            ))
+        })
+    };
+
+    match code {
+        0 => {
+            let a3_offset = A3Offset::new(from_half_db(reader.i16()?))?;
+            let hysteresis = Hysteresis::new(from_half_db(i16::from(reader.u8()?)))?;
+            let ttt = time_to_trigger(reader.u8()?)?;
+            let use_rsrp = reader.u8()? != 0;
+            Ok(ChoCondition::EventA3(EventA3Condition {
+                a3_offset,
+                hysteresis,
+                time_to_trigger: ttt,
+                use_rsrp,
+            }))
+        }
+        1 => {
+            let threshold1 = RsrpThreshold::new(reader.i16()?)?;
+            let threshold2 = RsrpThreshold::new(reader.i16()?)?;
+            let hysteresis = Hysteresis::new(from_half_db(i16::from(reader.u8()?)))?;
+            let ttt = time_to_trigger(reader.u8()?)?;
+            Ok(ChoCondition::EventA5(EventA5Condition {
+                threshold1,
+                threshold2,
+                hysteresis,
+                time_to_trigger: ttt,
+            }))
+        }
+        2 => Ok(ChoCondition::Timer(TimerBasedCondition {
+            timer_ms: reader.u32()?,
+            restart_on_improvement: reader.u8()? != 0,
+        })),
+        3 | 4 => Err(ConditionalHandoverError::CodecError(format!(
+            "candidate {candidate_index}: condition type {code} (predictive / AI-assisted) \
+             has no wire encoding, so no container can carry one"
+        ))),
+        other => Err(ConditionalHandoverError::CodecError(format!(
+            "candidate {candidate_index}: unknown condition type {other}"
+        ))),
+    }
+}
+
+/// Decode a target cell configuration; `phys_cell_id` comes from the candidate
+/// header rather than the detail block.
+fn decode_target_cell(
+    phys_cell_id: u16,
+    reader: &mut DetailReader<'_>,
+) -> Result<ChoTargetCellConfig, ConditionalHandoverError> {
+    let ssb_frequency_arfcn = reader.u32()?;
+    let ssb_subcarrier_spacing_khz = reader.u16()?;
+    let flags = reader.u8()?;
+
+    let nr_cell_identity = if flags & 0x01 != 0 {
+        let b = reader.take(5)?;
+        Some(u64::from_be_bytes([0, 0, 0, b[0], b[1], b[2], b[3], b[4]]))
+    } else {
+        None
+    };
+    let plmn_identity = if flags & 0x02 != 0 {
+        let b = reader.take(3)?;
+        Some([b[0], b[1], b[2]])
+    } else {
+        None
+    };
+    let rrc_reconfiguration = if flags & 0x04 != 0 {
+        let len = usize::from(reader.u16()?);
+        Some(reader.take(len)?.to_vec())
+    } else {
+        None
+    };
+
+    Ok(ChoTargetCellConfig {
+        phys_cell_id,
+        ssb_frequency_arfcn,
+        ssb_subcarrier_spacing_khz,
+        nr_cell_identity,
+        plmn_identity,
+        rrc_reconfiguration,
+    })
+}
+
+/// Decode only the header of a CHO configuration
+///
+/// Reads `config_id`, the candidate count and the two flags — the three bytes
+/// every version of this container starts with. Use [`decode_cho_config`] for
+/// the candidates themselves.
 pub fn decode_cho_config_header(
     bytes: &[u8],
 ) -> Result<(u8, u8, bool, bool), ConditionalHandoverError> {
@@ -772,6 +1163,207 @@ mod tests {
         assert_eq!(num_candidates, 2);
         assert!(report);
         assert!(!predictive);
+    }
+
+    /// The completed container round-trips every candidate: conditions and
+    /// target cells, not just the header. This is what the UE-side runtime
+    /// (issue #20) needs, and what the original encoder dropped.
+    #[test]
+    fn a_cho_config_survives_a_container_round_trip() {
+        let config = create_test_cho_config();
+        let encoded = encode_cho_config(&config).expect("encode");
+        let decoded = decode_cho_config(&encoded).expect("decode");
+
+        assert_eq!(decoded.config_id, config.config_id);
+        assert_eq!(decoded.report_cho_execution, config.report_cho_execution);
+        assert_eq!(decoded.predictive_ho_enabled, config.predictive_ho_enabled);
+        assert_eq!(decoded.candidate_cells, config.candidate_cells);
+        // The container carries neither the maximum nor the AI model name.
+        assert_eq!(decoded.max_candidate_cells, None);
+        assert_eq!(decoded.ai_model_id, None);
+    }
+
+    #[test]
+    fn a_timer_condition_and_an_opaque_reconfiguration_round_trip() {
+        let config = ChoConfig {
+            config_id: 9,
+            candidate_cells: vec![ChoCandidateCell {
+                candidate_index: 3,
+                condition: ChoCondition::Timer(TimerBasedCondition {
+                    timer_ms: 5000,
+                    restart_on_improvement: true,
+                }),
+                target_cell: ChoTargetCellConfig {
+                    phys_cell_id: 1007,
+                    ssb_frequency_arfcn: 632628,
+                    ssb_subcarrier_spacing_khz: 120,
+                    nr_cell_identity: Some((1u64 << 36) - 1),
+                    plmn_identity: None,
+                    rrc_reconfiguration: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                },
+                priority: 7,
+            }],
+            max_candidate_cells: None,
+            report_cho_execution: false,
+            predictive_ho_enabled: true,
+            ai_model_id: None,
+        };
+
+        let decoded =
+            decode_cho_config(&encode_cho_config(&config).expect("encode")).expect("decode");
+        assert_eq!(decoded.candidate_cells, config.candidate_cells);
+        assert!(decoded.predictive_ho_enabled);
+    }
+
+    /// dB values are quantised onto the 0.5 dB grid `INTEGER (0..30)` in units of
+    /// 0.5 dB gives, so an off-grid offset comes back rounded rather than exact.
+    #[test]
+    fn an_off_grid_offset_comes_back_quantised_to_half_a_db() {
+        let config = ChoConfig {
+            config_id: 1,
+            candidate_cells: vec![ChoCandidateCell {
+                candidate_index: 0,
+                condition: ChoCondition::EventA3(EventA3Condition {
+                    a3_offset: A3Offset::new(3.3).unwrap(),
+                    hysteresis: Hysteresis::new(1.2).unwrap(),
+                    time_to_trigger: TimeToTrigger::Ms640,
+                    use_rsrp: true,
+                }),
+                target_cell: create_test_target_cell(100),
+                priority: 0,
+            }],
+            max_candidate_cells: None,
+            report_cho_execution: false,
+            predictive_ho_enabled: false,
+            ai_model_id: None,
+        };
+
+        let decoded =
+            decode_cho_config(&encode_cho_config(&config).expect("encode")).expect("decode");
+        match &decoded.candidate_cells[0].condition {
+            ChoCondition::EventA3(a3) => {
+                assert_eq!(a3.a3_offset, A3Offset(3.5));
+                assert_eq!(a3.hysteresis, Hysteresis(1.0));
+                assert_eq!(a3.time_to_trigger, TimeToTrigger::Ms640);
+            }
+            other => panic!("expected an A3 condition, got {other:?}"),
+        }
+    }
+
+    /// The header layout is unchanged by the completion, so the header decoder
+    /// still reads a container written by the extended encoder.
+    #[test]
+    fn the_header_decoder_still_reads_a_completed_container() {
+        let encoded = encode_cho_config(&create_test_cho_config()).expect("encode");
+        assert_eq!(encoded[0], 1, "config_id is still the first byte");
+        assert_eq!(encoded[1], 2, "candidate count is still the second");
+
+        let (config_id, num_candidates, report, predictive) =
+            decode_cho_config_header(&encoded).expect("decode header");
+        assert_eq!((config_id, num_candidates), (1, 2));
+        assert!(report);
+        assert!(!predictive);
+    }
+
+    /// The two research conditions carry model identifiers and feature vectors
+    /// with no wire encoding, so encoding one fails loudly instead of silently
+    /// dropping the parameters (which is what the original encoder did).
+    #[test]
+    fn a_research_condition_cannot_be_encoded() {
+        let config = ChoConfig {
+            config_id: 2,
+            candidate_cells: vec![ChoCandidateCell {
+                candidate_index: 0,
+                condition: ChoCondition::Predictive(PredictiveCondition {
+                    predicted_handover_time_ms: 5000,
+                    confidence_level: 0.85,
+                    min_confidence_threshold: 0.7,
+                    ue_speed_ms: None,
+                    ue_heading_deg: None,
+                }),
+                target_cell: create_test_target_cell(300),
+                priority: 0,
+            }],
+            max_candidate_cells: None,
+            report_cho_execution: false,
+            predictive_ho_enabled: true,
+            ai_model_id: None,
+        };
+
+        let err = encode_cho_config(&config).expect_err("predictive must not encode");
+        assert!(
+            format!("{err}").contains("no wire encoding"),
+            "the error must say why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_container_is_rejected_rather_than_panicking() {
+        let encoded = encode_cho_config(&create_test_cho_config()).expect("encode");
+
+        for cut in 3..encoded.len() {
+            assert!(
+                decode_cho_config(&encoded[..cut]).is_err(),
+                "a container cut to {cut} of {} bytes must not decode",
+                encoded.len()
+            );
+        }
+        assert!(
+            decode_cho_config(&encoded).is_ok(),
+            "the whole container does"
+        );
+    }
+
+    /// A candidate whose detail length runs past the container is rejected with
+    /// the mismatch named, rather than being read against a clamped slice and
+    /// failing later with a less useful message.
+    #[test]
+    fn a_detail_length_past_the_end_of_the_container_is_named() {
+        let mut encoded = encode_cho_config(&create_test_cho_config()).expect("encode");
+        // The first candidate's detail length prefix sits at 3 + 5.
+        encoded[8] = 0xFF;
+        encoded[9] = 0xFF;
+
+        let err = decode_cho_config(&encoded).expect_err("an over-long detail must not decode");
+        let text = format!("{err}");
+        assert!(
+            text.contains("detail claims 65535 bytes"),
+            "the error must name the mismatch: {text}"
+        );
+    }
+
+    /// The length prefix is what lets an older decoder read a container a newer
+    /// encoder wrote: detail bytes beyond the ones it knows are skipped, and the
+    /// next candidate is still found.
+    #[test]
+    fn detail_bytes_a_decoder_does_not_know_are_skipped() {
+        let original = create_test_cho_config();
+        let encoded = encode_cho_config(&original).expect("encode");
+
+        // Grow the first candidate's detail by three bytes of "future" fields.
+        let detail_len_at = 3 + 5;
+        let detail_len = usize::from(u16::from_be_bytes([encoded[8], encoded[9]]));
+        let detail_end = detail_len_at + 2 + detail_len;
+        let mut grown = encoded[..detail_end].to_vec();
+        grown.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        grown.extend_from_slice(&encoded[detail_end..]);
+        let grown_len = u16::try_from(detail_len + 3).unwrap().to_be_bytes();
+        grown[detail_len_at] = grown_len[0];
+        grown[detail_len_at + 1] = grown_len[1];
+
+        let decoded = decode_cho_config(&grown).expect("decode a grown container");
+        assert_eq!(
+            decoded.candidate_cells, original.candidate_cells,
+            "both candidates decode, the unknown bytes are skipped"
+        );
+    }
+
+    #[test]
+    fn an_unknown_condition_type_is_rejected() {
+        let mut encoded = encode_cho_config(&create_test_cho_config()).expect("encode");
+        encoded[4] = 9; // the first candidate's condition type code
+        let err = decode_cho_config(&encoded).expect_err("unknown type must not decode");
+        assert!(format!("{err}").contains("unknown condition type"), "{err}");
     }
 
     #[test]

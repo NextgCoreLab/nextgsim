@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::rrc::cell_selection::{
     CellChangeEvent, CellSelector, MibInfo, Plmn as CellPlmn, Sib1Info,
 };
+use crate::rrc::conditional_handover::{handover_command_for, CondReconfigStore};
 use crate::rrc::handover::{
     build_reconfiguration_complete, parse_handover_command, HandoverCommand, HandoverManager,
 };
@@ -43,6 +44,7 @@ use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::codec::{decode_rrc, CellGroupConfig, RadioBearerConfig};
+use nextgsim_rrc::procedures::conditional_handover::decode_cho_config;
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
 };
@@ -78,6 +80,19 @@ const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
 
 /// Default NR band advertised by the simulated UE (n78, 3.5 GHz TDD)
 const DEFAULT_NR_BAND: u16 = 78;
+
+/// Simplified DL-DCCH envelope code for an RRCReconfiguration carrying a
+/// conditional-reconfiguration container: `[0x0D][transaction id][container]`.
+///
+/// The same hand-rolled framing family as the handover (0x00) and DAPS (0x10)
+/// reconfigurations this task already parses; issue #107 covers replacing all of
+/// them with real UPER, which for `conditionalReconfiguration` also needs a
+/// Rel-16 RRC schema (issue #105).
+const RECONFIGURATION_WITH_CHO: u8 = 0x0D;
+
+/// Where the CHO container starts in such a message, after the envelope code and
+/// the transaction identifier.
+const CHO_CONTAINER_OFFSET: usize = 2;
 
 /// `q-RxLevMin` assumed for a cell whose SIB1 omits `cellSelectionInfo`
 /// (the IE is `OPTIONAL — Cond Standalone` in TS 38.331 §6.3.2).
@@ -212,6 +227,16 @@ pub struct RrcTask {
     /// Cells whose system information came from a real BCCH broadcast, so the
     /// simulated fallback must not overwrite it with the UE's own assumptions.
     cells_with_broadcast_si: std::collections::HashSet<i32>,
+    /// Stored conditional reconfigurations (TS 38.331 §5.3.5.13), populated only
+    /// when `UeConfig::conditional_handover` is set. Evaluated on every
+    /// measurement tick; a triggered candidate executes through
+    /// `handover_manager`.
+    cond_reconfig: CondReconfigStore,
+    /// The rrc-TransactionIdentifier of the RRCReconfiguration that carried the
+    /// stored CHO container. §5.3.5.13.5 applies the candidate's own
+    /// `condRRCReconfig`, whose transaction identifier this simulator's container
+    /// does not carry (issue #107), so the carrying message's is echoed instead.
+    cho_transaction_id: u8,
     /// The UE's own 5G-S-TMSI, handed down by the NAS plane once a 5G-GUTI is
     /// assigned (`RrcMessage::PagingIdentity`). PCCH `PagingRecord`s are matched
     /// against it (TS 38.331 §5.3.2.3). `None` until the UE has a GUTI, and no
@@ -253,6 +278,8 @@ impl RrcTask {
             srb1_config: None,
             t300_deadline: None,
             cells_with_broadcast_si: std::collections::HashSet::new(),
+            cond_reconfig: CondReconfigStore::new(),
+            cho_transaction_id: 0,
             paging_s_tmsi: None,
         }
     }
@@ -491,6 +518,47 @@ impl RrcTask {
         for report in reports {
             self.send_measurement_report(&report).await;
         }
+
+        // Conditional reconfiguration evaluation (TS 38.331 §5.3.5.13.4): a
+        // stored candidate whose execution condition has held for its
+        // time-to-trigger executes without the network ordering it.
+        self.evaluate_conditional_handover().await;
+    }
+
+    /// Evaluate the stored conditional reconfigurations and execute a triggered
+    /// candidate (TS 38.331 §5.3.5.13.4, §5.3.5.13.5).
+    ///
+    /// Nothing happens while a handover is already in progress: the UE is between
+    /// cells, and §5.3.5.13.5's selection is over candidates of the source cell.
+    async fn evaluate_conditional_handover(&mut self) {
+        if self.cond_reconfig.candidate_count() == 0 || self.handover_manager.is_in_progress() {
+            return;
+        }
+        let Some(triggered) = self.cond_reconfig.evaluate(&self.measurement_manager) else {
+            return;
+        };
+        let Some(source_cell_id) = self.serving_cell_id else {
+            return;
+        };
+
+        info!(
+            "Executing conditional handover: candidate {}/{} -> cell {}",
+            triggered.id.config_id,
+            triggered.id.candidate_index,
+            triggered.candidate.target_cell.phys_cell_id
+        );
+        let command = handover_command_for(&triggered.candidate, self.cho_transaction_id);
+        // §5.3.5.3: applying a reconfigurationWithSync releases every stored
+        // candidate, whether or not the execution below succeeds -- they were
+        // prepared by the source cell.
+        self.cond_reconfig.clear();
+        self.handle_handover_command(source_cell_id, command).await;
+    }
+
+    /// Stored conditional-reconfiguration candidates, for tests and status
+    /// reporting.
+    pub fn cho_candidate_count(&self) -> usize {
+        self.cond_reconfig.candidate_count()
     }
 
     /// Send measurement report to the network via RRC
@@ -554,7 +622,8 @@ impl RrcTask {
                 threshold: None,
                 threshold1: None,
                 threshold2: None,
-                a3_offset: Some(3),   // Neighbor 3dB better than serving
+                a3_offset: Some(3), // Neighbor 3dB better than serving
+                a6_offset: None,
                 hysteresis: 2,        // 1dB hysteresis
                 time_to_trigger: 640, // 640ms
             },
@@ -1284,6 +1353,11 @@ impl RrcTask {
             warn!("Failed to transition to idle state: {}", e);
         }
 
+        // Conditional reconfigurations belong to the released connection: the
+        // candidates were prepared by a cell the UE is no longer connected to,
+        // and TS 38.331 §5.3.11 releases the RRC configuration on release.
+        self.cond_reconfig.clear();
+
         info!("RRC connection released");
 
         // Notify NAS of connection release
@@ -1300,6 +1374,14 @@ impl RrcTask {
     /// Handle RRC Reconfiguration message (for handover)
     async fn handle_rrc_reconfiguration(&mut self, cell_id: i32, pdu: &OctetString) {
         let bytes = pdu.data();
+
+        // Conditional reconfiguration (TS 38.331 §5.3.5.13.3): the message
+        // carries candidate target configurations rather than an immediate
+        // handover command.
+        if bytes.first() == Some(&RECONFIGURATION_WITH_CHO) {
+            self.handle_conditional_reconfiguration(bytes).await;
+            return;
+        }
 
         // Check if this is a handover reconfiguration
         if let Some(ho_command) = parse_handover_command(bytes) {
@@ -1318,6 +1400,47 @@ impl RrcTask {
         let transaction_id = if bytes.len() > 1 { bytes[1] } else { 0 };
 
         // Build RRC Reconfiguration Complete
+        let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
+        self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+    }
+
+    /// Handle an RRCReconfiguration carrying a conditional-reconfiguration
+    /// container (TS 38.331 §5.3.5.13.3).
+    ///
+    /// The container is decoded whatever the configuration says, so a malformed
+    /// one is reported rather than silently ignored, and the message is always
+    /// acknowledged with an RRCReconfigurationComplete — the reconfiguration
+    /// itself is accepted. Whether the candidates are *stored* is what
+    /// `UeConfig::conditional_handover` gates.
+    async fn handle_conditional_reconfiguration(&mut self, bytes: &[u8]) {
+        let transaction_id = bytes.get(1).copied().unwrap_or(0);
+
+        match decode_cho_config(&bytes[CHO_CONTAINER_OFFSET.min(bytes.len())..]) {
+            Ok(config) => {
+                if self.task_base.config.conditional_handover {
+                    self.cho_transaction_id = transaction_id;
+                    let stored = self.cond_reconfig.add_config(&config);
+                    info!(
+                        "Conditional reconfiguration stored: config {} now holds {} candidate(s), {} not armed",
+                        config.config_id,
+                        stored,
+                        self.cond_reconfig.unevaluated_count()
+                    );
+                } else {
+                    info!(
+                        "Conditional reconfiguration ignored: config {} carries {} candidate(s) \
+                         but conditional_handover is off",
+                        config.config_id,
+                        config.candidate_cells.len()
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "Failed to decode conditional reconfiguration container: {}",
+                e
+            ),
+        }
+
         let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
         self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
     }
@@ -2240,6 +2363,206 @@ mod tests {
                 );
             });
         }
+    }
+
+    // ========================================================================
+    // Conditional handover (issue #20, TS 38.331 §5.3.5.13)
+    // ========================================================================
+
+    use nextgsim_rrc::procedures::conditional_handover::{
+        encode_cho_config, A3Offset, ChoCandidateCell, ChoCondition, ChoConfig,
+        ChoTargetCellConfig, EventA3Condition, Hysteresis, TimeToTrigger,
+    };
+
+    /// A container arming one A3 candidate on cell 2 with no time-to-trigger,
+    /// wrapped in the DL-DCCH envelope the UE's reconfiguration handler expects.
+    fn cho_reconfiguration_pdu(transaction_id: u8, target_pci: u16) -> OctetString {
+        let config = ChoConfig {
+            config_id: 3,
+            candidate_cells: vec![ChoCandidateCell {
+                candidate_index: 0,
+                condition: ChoCondition::EventA3(EventA3Condition {
+                    a3_offset: A3Offset::new(3.0).unwrap(),
+                    hysteresis: Hysteresis::new(1.0).unwrap(),
+                    time_to_trigger: TimeToTrigger::Ms0,
+                    use_rsrp: true,
+                }),
+                target_cell: ChoTargetCellConfig {
+                    phys_cell_id: target_pci,
+                    ssb_frequency_arfcn: 620000,
+                    ssb_subcarrier_spacing_khz: 30,
+                    nr_cell_identity: None,
+                    plmn_identity: None,
+                    rrc_reconfiguration: None,
+                },
+                priority: 0,
+            }],
+            max_candidate_cells: None,
+            report_cho_execution: false,
+            predictive_ho_enabled: false,
+            ai_model_id: None,
+        };
+
+        let mut pdu = vec![RECONFIGURATION_WITH_CHO, transaction_id];
+        pdu.extend_from_slice(&encode_cho_config(&config).expect("encode CHO container"));
+        OctetString::from_slice(&pdu)
+    }
+
+    /// Camps, connects (golden RRCSetup) and returns with the UE in Connected on
+    /// cell 1 at -90 dBm.
+    async fn connect_on_cell_one(
+        task: &mut RrcTask,
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) {
+        camp_and_request(task, rls_rx).await;
+        task.handle_downlink_rrc(
+            1,
+            RrcChannel::DlCcch,
+            OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+        )
+        .await;
+        assert_eq!(task.state_machine.state(), RrcState::Connected);
+        // Drain the RRCSetupComplete so a test can read the next uplink message
+        // as the answer to what it sends.
+        let _setup_complete = next_uplink_rrc(rls_rx);
+        task.handle_signal_changed(1, -90).await;
+    }
+
+    /// The container is decoded and acknowledged either way, but the candidates
+    /// are only stored when the runtime switch is on — with it off, mobility is
+    /// unchanged.
+    #[test]
+    fn a_cho_container_arms_the_store_only_when_the_switch_is_on() {
+        for enabled in [false, true] {
+            let mut config = test_config();
+            config.conditional_handover = enabled;
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+            let mut task = RrcTask::new(task_base);
+
+            run_async(async {
+                connect_on_cell_one(&mut task, &mut rls_rx).await;
+                task.handle_rrc_reconfiguration(1, &cho_reconfiguration_pdu(5, 2))
+                    .await;
+
+                assert_eq!(
+                    task.cho_candidate_count(),
+                    usize::from(enabled),
+                    "candidates stored only with conditional_handover = {enabled}"
+                );
+
+                // The reconfiguration itself is accepted in both cases.
+                let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+                assert_eq!(channel, RrcChannel::UlDcch);
+                assert_eq!(
+                    pdu.data(),
+                    &build_reconfiguration_complete(5)[..],
+                    "RRCReconfigurationComplete echoes the transaction id"
+                );
+            });
+        }
+    }
+
+    /// The end of the path: a candidate that arrived over the wire executes a
+    /// handover once its own cell beats the serving cell, with no handover
+    /// command from the network.
+    #[test]
+    fn a_stored_candidate_hands_the_ue_over_without_a_network_command() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.handle_rrc_reconfiguration(1, &cho_reconfiguration_pdu(9, 2))
+                .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(task.cho_candidate_count(), 1);
+
+            // Cell 2 is visible but no better than the serving cell: nothing fires.
+            task.handle_signal_changed(2, -91).await;
+            task.perform_cycle().await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(1),
+                "a candidate below the A3 bar must not trigger"
+            );
+            assert_eq!(task.cho_candidate_count(), 1, "and stays stored");
+
+            // Cell 2 pulls ahead by more than a3-Offset + hysteresis.
+            task.handle_signal_changed(2, -80).await;
+            task.perform_cycle().await;
+
+            assert_eq!(
+                task.serving_cell_id,
+                Some(2),
+                "the UE executed the conditional handover itself"
+            );
+            assert!(
+                task.handover_manager.last_handover_duration().is_some(),
+                "the handover ran through the handover manager"
+            );
+            assert_eq!(
+                task.cho_candidate_count(),
+                0,
+                "§5.3.5.3: applying the reconfigurationWithSync releases the candidates"
+            );
+
+            // An RRCReconfigurationComplete for the executed candidate, carrying
+            // the transaction id of the message that armed it.
+            let mut saw_complete = false;
+            while let Ok(msg) = rls_rx.try_recv() {
+                if let TaskMessage::Message(RlsMessage::RrcPduDelivery { pdu, .. }) = msg {
+                    if pdu.data() == &build_reconfiguration_complete(9)[..] {
+                        saw_complete = true;
+                    }
+                }
+            }
+            assert!(
+                saw_complete,
+                "the handover is completed towards the network"
+            );
+        });
+    }
+
+    /// §5.3.11: going to RRC_IDLE removes every entry in VarConditionalReconfig.
+    #[test]
+    fn releasing_the_connection_drops_the_stored_candidates() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.handle_rrc_reconfiguration(1, &cho_reconfiguration_pdu(1, 2))
+                .await;
+            assert_eq!(task.cho_candidate_count(), 1);
+
+            task.handle_rrc_release().await;
+            assert_eq!(task.cho_candidate_count(), 0);
+        });
+    }
+
+    /// A container the UE cannot decode is reported, not stored, and the
+    /// reconfiguration is still acknowledged.
+    #[test]
+    fn a_malformed_cho_container_stores_nothing() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            // Header claims two candidates and carries none.
+            let pdu = OctetString::from_slice(&[RECONFIGURATION_WITH_CHO, 4, 3, 2, 0]);
+            task.handle_rrc_reconfiguration(1, &pdu).await;
+
+            assert_eq!(task.cho_candidate_count(), 0);
+            let (_, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(complete.data(), &build_reconfiguration_complete(4)[..]);
+        });
     }
 
     /// C2 gate: feeding the C1 golden RRCSetup bytes transitions the UE to

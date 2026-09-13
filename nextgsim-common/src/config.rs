@@ -1182,6 +1182,22 @@ pub struct UeConfig {
     /// parsing each other's PDUs with the wrong header shape.
     #[serde(default)]
     pub rlc_am_psis: Vec<u8>,
+    /// Arm conditional handover (CHO): store the candidate target
+    /// configurations an `RRCReconfiguration` carries and execute one when its
+    /// execution condition holds (TS 38.331 §5.3.5.13).
+    ///
+    /// `false` (the default) leaves the container decoded and logged but not
+    /// stored, so no measurement can move the UE without a network handover
+    /// command — mobility behaves exactly as before. With it on, the UE may hand
+    /// itself over the moment a candidate's condition has held for its
+    /// time-to-trigger, which is a behaviour change for any scenario that expects
+    /// the network to order every handover.
+    ///
+    /// A RUNTIME switch and not a cargo feature: CI runs `cargo test
+    /// --workspace` with default features, so a feature-gated runtime would ship
+    /// without ever being compiled by the gate meant to cover it.
+    #[serde(default)]
+    pub conditional_handover: bool,
     /// Require a decoded broadcast SIB1 before a cell is selectable.
     ///
     /// `false` (the default) keeps the pre-#21 behaviour: on detecting a cell the
@@ -1314,6 +1330,7 @@ impl Default for UeConfig {
             ursp_evaluation: false,
             racs_store_assigned_id: false,
             require_broadcast_sib1: false,
+            conditional_handover: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
@@ -1785,6 +1802,7 @@ configured_nssai:
             ursp_evaluation: false,
             racs_store_assigned_id: false,
             require_broadcast_sib1: false,
+            conditional_handover: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
@@ -2068,6 +2086,7 @@ configured_nssai:
             ursp_evaluation: false,
             racs_store_assigned_id: false,
             require_broadcast_sib1: false,
+            conditional_handover: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::new(
