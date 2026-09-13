@@ -109,6 +109,26 @@ pub struct GnbConfig {
     /// traffic at all and UEs discovering cells from RLS heartbeats only.
     #[serde(default = "default_si_broadcast_period_ms")]
     pub si_broadcast_period_ms: u64,
+    /// Accept a raw NAS PDU on UL-DCCH from a UE that never sent an
+    /// `RRCSetupComplete`, auto-creating its context and forwarding the NAS as an
+    /// Initial UE Message (issue #30, criterion 6).
+    ///
+    /// **`false`, the default, is strict**: TS 38.331 §5.3.3 carries the initial
+    /// NAS inside `RRCSetupComplete`, so a UE that skips the establishment
+    /// handshake fails to attach rather than being helped along. This gNB's own UE
+    /// performs the real handshake since #30 wired the library `RrcTask` into the
+    /// binary, so the leniency no longer serves the matched pair — it only hides a
+    /// non-conformant peer, which is exactly what a conformance simulator must not
+    /// do.
+    ///
+    /// Set it to `true` for interop with a third-party UE simulator that sends
+    /// bare NAS on DCCH. A transitional switch: the honest reading of a UE that
+    /// needs it is that the UE has a defect.
+    ///
+    /// A runtime switch rather than a cargo feature, for the reason recorded for
+    /// `gtpu_echo_period_secs`: CI compiles default features only.
+    #[serde(default)]
+    pub accept_raw_nas_on_dcch: bool,
     /// `physCellId` of a secondary cell to configure on each UE
     /// (`sCellToAddModList`, TS 38.331 §5.3.5.5.9), sent once per UE after its
     /// first RRCReconfiguration.
@@ -313,6 +333,7 @@ impl Default for GnbConfig {
             gtpu_restart_counter_path: None,
             rlc_am_psis: Vec::new(),
             si_broadcast_period_ms: default_si_broadcast_period_ms(),
+            accept_raw_nas_on_dcch: false,
             scell_phys_cell_id: None,
             pqc_config: PqcConfig::default(),
             ntn_config: None,

@@ -339,10 +339,29 @@ impl RrcTask {
                     .await;
             }
             _ => {
-                // Check if this looks like a raw NAS PDU
-                // EPD = 0x7E for 5GMM (Mobility Management), 0x2E for 5GSM (Session Management)
-                // Some UE simulators send NAS directly without proper RRC encapsulation
+                // A raw NAS PDU on UL-DCCH, from a UE that never sent an
+                // RRCSetupComplete. EPD 0x7E is 5GMM, 0x2E is 5GSM.
+                //
+                // GATED, AND STRICT BY DEFAULT (issue #30, criterion 6). TS 38.331
+                // §5.3.3 carries the initial NAS inside RRCSetupComplete, so a UE
+                // that skips the establishment handshake must fail to attach
+                // rather than be helped along. This leniency existed because this
+                // gNB's own UE used to smuggle the initial NAS as raw DCCH; #30
+                // wired the conformant library RrcTask into the UE binary, so the
+                // matched pair no longer needs it and all it can do now is hide a
+                // non-conformant peer -- which is the opposite of what a
+                // conformance simulator is for.
                 let is_nas_pdu = bytes.len() >= 3 && (bytes[0] == 0x7E || bytes[0] == 0x2E);
+                if is_nas_pdu && !self.task_base.config.accept_raw_nas_on_dcch {
+                    warn!(
+                        "Discarding raw NAS PDU on UL-DCCH from UE[{}] (epd=0x{:02x}): \
+                         TS 38.331 §5.3.3 requires the initial NAS inside \
+                         RRCSetupComplete. Set accept_raw_nas_on_dcch to interop \
+                         with a UE that sends bare NAS on DCCH.",
+                        ue_id, bytes[0]
+                    );
+                    return;
+                }
                 if is_nas_pdu {
                     // Check if UE context already exists (meaning Initial UE Message was already sent)
                     if let Some(ctx) = self.ue_manager.try_find_ue(ue_id) {
@@ -2175,6 +2194,114 @@ mod tests {
                 "one fresh context, from the setup"
             );
         });
+    }
+
+    // ========================================================================
+    // Strict RRC: no raw NAS on UL-DCCH (issue #30 criterion 6, TS 38.331 §5.3.3)
+    // ========================================================================
+
+    /// A bare 5GMM NAS PDU, as a UE that skips the establishment handshake sends
+    /// it: EPD 0x7E, security header 0x00, then a Registration Request.
+    fn raw_nas_on_dcch() -> OctetString {
+        OctetString::from_slice(&[0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D])
+    }
+
+    /// **Strict by default.** TS 38.331 §5.3.3 carries the initial NAS inside
+    /// `RRCSetupComplete`, so a UE that sends bare NAS on DCCH fails to attach: no
+    /// Initial UE Message reaches NGAP and no context is fabricated for it.
+    #[test]
+    fn a_raw_nas_pdu_on_dcch_is_discarded_by_default() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        assert!(
+            !task.task_base.config.accept_raw_nas_on_dcch,
+            "the shipped default is strict"
+        );
+
+        run_async(async {
+            task.handle_radio_power_on();
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, raw_nas_on_dcch())
+                .await;
+        });
+
+        assert!(
+            try_take_initial_nas(&mut ngap_rx).is_none(),
+            "no Initial UE Message may be sent for a UE that skipped RRCSetup"
+        );
+        assert_eq!(
+            task.ue_manager.count(),
+            0,
+            "and no context is auto-created for it"
+        );
+    }
+
+    /// With the transitional switch on, the leniency behaves exactly as it did
+    /// before the gate: the context is auto-created and the NAS goes out as an
+    /// Initial UE Message. Asserted so the interop path is not silently lost.
+    #[test]
+    fn a_raw_nas_pdu_on_dcch_is_accepted_when_configured() {
+        let mut config = test_config();
+        config.accept_raw_nas_on_dcch = true;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_radio_power_on();
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, raw_nas_on_dcch())
+                .await;
+        });
+
+        let (ue_id, pdu) = try_take_initial_nas(&mut ngap_rx)
+            .expect("the leniency forwards the NAS as an Initial UE Message");
+        assert_eq!(ue_id, 1);
+        assert_eq!(pdu.data(), raw_nas_on_dcch().data());
+        assert_eq!(task.ue_manager.count(), 1, "the context is auto-created");
+    }
+
+    /// The strict discard is **specific to bare NAS**: an encapsulated uplink NAS
+    /// still delivers, so the gate does not touch the path a UE that did the
+    /// handshake uses.
+    ///
+    /// The fixture is the bespoke `[0x08, tid, NAS…]` UL-DCCH framing the gNB
+    /// actually dispatches, not a real UPER `ULInformationTransfer` — a real one is
+    /// **not routed today either**, because UL-DCCH c1 index 8 puts its leading
+    /// byte in `0x40..=0x47` and the nibble matcher reads `0x00..=0x07`. That is a
+    /// pre-existing gap in the hand-rolled dispatcher (issue #107), unrelated to
+    /// this gate, and asserting against it would have made this test fail for the
+    /// wrong reason.
+    #[test]
+    fn the_strict_default_does_not_affect_an_encapsulated_uplink_nas() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 1).await;
+            if let Some(ctx) = task.ue_manager.try_find_ue_mut(1) {
+                ctx.on_setup_complete();
+            }
+            // [0x08, transaction id, NAS…] — the encapsulated form.
+            let mut pdu = vec![0x08, 0x00];
+            pdu.extend_from_slice(raw_nas_on_dcch().data());
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+        });
+
+        let mut delivered = None;
+        while let Ok(msg) = ngap_rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::UplinkNasDelivery { ue_id, pdu, .. }) = msg {
+                delivered = Some((ue_id, pdu));
+            }
+        }
+        let (ue_id, pdu) = delivered.expect("an encapsulated uplink NAS must still reach NGAP");
+        assert_eq!(ue_id, 1);
+        assert_eq!(
+            pdu.data(),
+            raw_nas_on_dcch().data(),
+            "and with the envelope stripped"
+        );
     }
 
     /// Security material for a UE the RRC task has no context for is dropped,
