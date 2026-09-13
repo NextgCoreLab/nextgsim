@@ -8,7 +8,7 @@
 
 ## 1. Implemented components
 
-**Core infrastructure:** `nextgsim-common` (types, config, CLI, transport), `nextgsim-crypto` (Milenage/5G-AKA, SNOW3G, ZUC, AES, KDF, ECIES), `nextgsim-sctp` (N2 transport), `nextgsim-rlc` (RLC TM/UM; AM data path present).
+**Core infrastructure:** `nextgsim-common` (types, config, CLI, transport), `nextgsim-crypto` (Milenage/5G-AKA, SNOW3G, ZUC, AES, KDF, ECIES), `nextgsim-sctp` (N2 transport), `nextgsim-rlc` (RLC TM/UM/AM: AM carries STATUS reporting with NACKs, NACK-driven retransmission and the ARQ timers).
 
 **5G protocol stack:** `nextgsim-nas` (5GMM + 5GSM), `nextgsim-ngap` (NGAP with ASN.1 PER), `nextgsim-rrc` (RRC with ASN.1 UPER), `nextgsim-rls` (radio-link simulation), `nextgsim-gtp` (GTP-U).
 
@@ -50,7 +50,7 @@ These bring the 5G baseline to the maturity the 6G work depends on. Each is a bo
 
 | Task ID | Component | Remaining work | Reference | Status | Tracking |
 |---|---|---|---|---|---|
-| NGS-5G-01 | RLC Acknowledged Mode | ARQ: STATUS with NACK list, automatic retransmission, timers; make AM selectable in the data path (TM/UM already work) | TS 38.322 | Partial | [#15](https://github.com/NextgCoreLab/nextgsim/issues/15) |
+| NGS-5G-01 | RLC Acknowledged Mode | Done: STATUS reporting with an E1-chained NACK list, NACK-driven retransmission, `t-PollRetransmit` / `t-StatusProhibit` / `t-Reassembly`, and AM selectable per bearer via `rlc_am_psis` (UM SN12 stays the default). Re-segmentation of an oversized retransmission and SO-level NACK ranges are decode-only | TS 38.322 | Complete | [#15](https://github.com/NextgCoreLab/nextgsim/issues/15) |
 | NGS-5G-02 | UE NAS MM | Done: Configuration Update parameters are applied (5G-GUTI, TAI list, allowed NSSAI, T3512), rejected/pending NSSAI are stored and rejected S-NSSAIs excluded from the next requested NSSAI, and the UE radio capability ID (RACS) IEs are decoded. RACS is not yet SIGNALLED (no IE in the REGISTRATION REQUEST, no RRC/NGAP consumer) | TS 24.501 | Complete | [#19](https://github.com/NextgCoreLab/nextgsim/issues/19) |
 | NGS-5G-03 | UE RRC | measurement event A6, conditional handover wiring, inter-RAT B1/B2 | TS 38.331 | Partial | [#20](https://github.com/NextgCoreLab/nextgsim/issues/20) |
 | NGS-5G-04 | gNB RRC | UPER-encoded MIB/SIB1 broadcast over BCCH and migration of residual simplified RRC PDUs to real ASN.1 | TS 38.331 | Partial | [#21](https://github.com/NextgCoreLab/nextgsim/issues/21) |

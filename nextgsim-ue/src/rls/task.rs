@@ -54,6 +54,12 @@ const HEARTBEAT_INTERVAL_MS: u64 = 1000;
 const LOST_CELL_CHECK_INTERVAL_MS: u64 = 500;
 const UDP_BUFFER_SIZE: usize = 65535;
 
+/// MAC grant size handed to RLC when building PDUs.
+///
+/// This simulator has no MAC scheduler; a 1500-byte grant stands in for one so a
+/// typical IP packet fits in a single PDU.
+const MAC_GRANT_BYTES: usize = 1500;
+
 /// RLS task configuration
 #[derive(Debug, Clone)]
 pub struct RlsTaskConfig {
@@ -164,24 +170,67 @@ impl RlsTask {
     /// DRB identity: this simulator maps one DRB per PDU session, and the gNB
     /// keys its own entities on `(ue_id, psi)` to match.
     fn rlc_entity_for(&mut self, psi: i32) -> &mut RlcEntity {
+        let mode = if self.task_base.config.rlc_am_psis.contains(&(psi as u8)) {
+            RlcMode::AcknowledgedMode
+        } else {
+            RlcMode::UnacknowledgedMode
+        };
         self.rlc_entities
             .entry(psi)
-            .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
+            .or_insert_with(|| RlcEntity::new(mode, SnSize::Sn12))
+    }
+
+    /// Sends one RLC PDU (data or STATUS) to the serving cell.
+    async fn send_rlc_pdu(&mut self, psi: i32, pdu: Vec<u8>) {
+        let Some(dest) = self
+            .serving_cell
+            .and_then(|id| self.cell_addresses.get(&id).copied())
+        else {
+            warn!("Cannot send RLC PDU for psi={}: no serving cell", psi);
+            return;
+        };
+        let transmission = self
+            .transport
+            .create_data_transmission(psi as u32, Bytes::from(pdu));
+        self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
+            .await;
+    }
+
+    /// Sends the STATUS report an AM bearer owes its peer, if one is due
+    /// (TS 38.322 §5.3.4). A no-op for a UM bearer, which has no STATUS PDU.
+    async fn send_pending_status(&mut self, psi: i32) {
+        let status = self
+            .rlc_entities
+            .get_mut(&psi)
+            .and_then(RlcEntity::build_status_pdu);
+        if let Some(status) = status {
+            self.send_rlc_pdu(psi, status).await;
+        }
     }
 
     /// Drives `t-Reassembly` on every RLC entity (TS 38.322 §5.2.2.2.4), so a
     /// partially received SDU whose missing segment never arrives is discarded
     /// instead of occupying the reassembly buffer forever.
-    fn poll_rlc_timers(&mut self) {
+    async fn poll_rlc_timers(&mut self) {
         let now = Instant::now();
+        let mut outbound: Vec<(i32, Vec<u8>)> = Vec::new();
         for (psi, rlc) in &mut self.rlc_entities {
-            if rlc.poll_t_reassembly(now) {
+            if rlc.poll_timers(now) {
                 debug!(
-                    "RLC t-Reassembly expired: psi={}, rx_next_reassembly={}",
+                    "RLC timer expired: psi={}, rx_next_reassembly={}",
                     psi,
                     rlc.rx_next_reassembly()
                 );
             }
+            if let Some(status) = rlc.build_status_pdu() {
+                outbound.push((*psi, status));
+            }
+            while let Some(retx) = rlc.build_pdu(MAC_GRANT_BYTES) {
+                outbound.push((*psi, retx));
+            }
+        }
+        for (psi, pdu) in outbound {
+            self.send_rlc_pdu(psi, pdu).await;
         }
     }
 
@@ -347,6 +396,10 @@ impl RlsTask {
             }
         };
 
+        // Set when an AM bearer received data and may owe a STATUS report; the
+        // send happens after the loop so the entity borrow is released first.
+        let mut pending_status_psi: Option<i32> = None;
+
         // Collect events first so the transport borrow is released before we
         // mutate self.rlc_entities below.
         let events: Vec<TransportEvent> =
@@ -382,6 +435,11 @@ impl RlsTask {
                         }
                         sdus
                     };
+                    // An AM bearer answers a poll (or a detected gap) with a
+                    // STATUS report (TS 38.322 §5.3.4); without it the gNB's ARQ
+                    // never learns anything and re-polls forever.
+                    pending_status_psi = Some(psi_i32);
+
                     for sdu in reassembled {
                         debug!("RLC reassembled SDU: psi={}, len={}", psi_i32, sdu.len());
                         let octet = OctetString::from_slice(&sdu);
@@ -413,6 +471,10 @@ impl RlsTask {
                         .await;
                 }
             }
+        }
+
+        if let Some(psi) = pending_status_psi {
+            self.send_pending_status(psi).await;
         }
     }
 
@@ -518,7 +580,7 @@ impl RlsTask {
             let rlc = self.rlc_entity_for(psi);
             rlc.submit_sdu(pdu.data().to_vec());
             let mut pdus = Vec::new();
-            while let Some(rlc_pdu) = rlc.build_pdu(1500) {
+            while let Some(rlc_pdu) = rlc.build_pdu(MAC_GRANT_BYTES) {
                 pdus.push(rlc_pdu);
             }
             pdus
@@ -605,6 +667,13 @@ impl Task for RlsTask {
 
         let mut heartbeat_timer = interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
         let mut lost_cell_timer = interval(Duration::from_millis(LOST_CELL_CHECK_INTERVAL_MS));
+        // `interval` fires its first tick immediately; for this timer there is
+        // nothing to do at start-up (no cell known, no PDU pending, no RLC
+        // entity), and consuming it keeps the periodic work at predictable
+        // multiples of the period instead of racing the first packet. The
+        // heartbeat timer above deliberately keeps its immediate tick: that one
+        // starts cell discovery.
+        lost_cell_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -629,7 +698,7 @@ impl Task for RlsTask {
                     self.check_lost_cells().await;
                     self.send_pending_acks().await;
                     self.check_expired_pdus().await;
-                    self.poll_rlc_timers();
+                    self.poll_rlc_timers().await;
                 }
             }
         }
@@ -745,6 +814,40 @@ mod tests {
         let mut task = RlsTask::new(task_base, rls_config);
         task.handle_assign_current_cell(1);
         assert!(task.serving_cell.is_none()); // Unknown cell
+    }
+
+    // ── RLC mode selector (#15) ──────────────────────────────────────────────
+
+    /// A bearer listed in `rlc_am_psis` gets an AM entity; everything else keeps
+    /// the UM SN12 default, so a deployment that configures nothing is unchanged.
+    #[test]
+    fn only_a_configured_psi_gets_an_acknowledged_mode_entity() {
+        let config = UeConfig {
+            rlc_am_psis: vec![5],
+            ..test_config()
+        };
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RlsTask::new(task_base, RlsTaskConfig::default());
+
+        assert_eq!(
+            task.rlc_entity_for(5).mode,
+            RlcMode::AcknowledgedMode,
+            "PSI 5 is configured for AM"
+        );
+        assert_eq!(
+            task.rlc_entity_for(1).mode,
+            RlcMode::UnacknowledgedMode,
+            "an unlisted PSI keeps the UM default"
+        );
+    }
+
+    #[test]
+    fn with_no_configuration_every_bearer_is_unacknowledged_mode() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base, RlsTaskConfig::default());
+        for psi in [1, 5, 15] {
+            assert_eq!(task.rlc_entity_for(psi).mode, RlcMode::UnacknowledgedMode);
+        }
     }
 
     #[test]

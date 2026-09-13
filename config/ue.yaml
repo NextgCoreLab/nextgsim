@@ -194,6 +194,14 @@ redcap: false
 # there is no RACS IE in the REGISTRATION REQUEST and no RRC or NGAP consumer.
 racs_store_assigned_id: false
 
+# PDU sessions whose DRB uses RLC Acknowledged Mode (TS 38.322) instead of the
+# default Unacknowledged Mode: AM adds STATUS reporting, selective
+# retransmission and the ARQ timers, at the cost of feedback traffic.
+# BOTH ENDS MUST LIST THE SAME PSIs -- the RLC mode is not signalled over RRC in
+# this simulator, so a one-sided setting has the peers parsing each other's PDUs
+# with the wrong header shape. Empty means every bearer stays on UM SN12.
+rlc_am_psis: []
+
 # Rel-20 6G AI-native network function features
 # All disabled by default; enable for 6G research deployments
 she_enabled: false              # SHE Client - edge inference offloading (Rel-20)

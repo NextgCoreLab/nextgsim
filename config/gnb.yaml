@@ -65,6 +65,14 @@ ignore_stream_ids: false
 upf_addr: 172.23.0.7
 upf_port: 2152
 
+# PDU sessions whose DRB uses RLC Acknowledged Mode (TS 38.322) instead of the
+# default Unacknowledged Mode: AM adds STATUS reporting, selective
+# retransmission and the ARQ timers, at the cost of feedback traffic.
+# BOTH ENDS MUST LIST THE SAME PSIs -- the RLC mode is not signalled over RRC in
+# this simulator, so a one-sided setting has the peers parsing each other's PDUs
+# with the wrong header shape. Empty means every bearer stays on UM SN12.
+rlc_am_psis: []
+
 # Rel-18 5G-Advanced features
 energy_saving_enabled: false  # Cell sleep modes and energy efficiency (Rel-18)
 

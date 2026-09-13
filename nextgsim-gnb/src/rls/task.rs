@@ -32,6 +32,12 @@ const HEARTBEAT_CHECK_INTERVAL_MS: u64 = 500;
 /// Maximum UDP receive buffer size
 const UDP_BUFFER_SIZE: usize = 65535;
 
+/// MAC grant size handed to RLC when building PDUs.
+///
+/// This simulator has no MAC scheduler; a 1500-byte grant stands in for one so a
+/// typical IP packet fits in a single PDU.
+const MAC_GRANT_BYTES: usize = 1500;
+
 /// RLS Task for managing radio link simulation
 pub struct RlsTask {
     /// Task base for inter-task communication
@@ -110,25 +116,71 @@ impl RlsTask {
     /// The PSI stands in for the DRB identity: this simulator maps one DRB per
     /// PDU session (see `nextgsim-gnb/src/gtp`), so the two are one to one.
     fn rlc_entity_for(&mut self, ue_id: i32, psi: i32) -> &mut RlcEntity {
+        let mode = if self.task_base.config.rlc_am_psis.contains(&(psi as u8)) {
+            RlcMode::AcknowledgedMode
+        } else {
+            RlcMode::UnacknowledgedMode
+        };
         self.rlc_entities
             .entry((ue_id, psi))
-            .or_insert_with(|| RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12))
+            .or_insert_with(|| RlcEntity::new(mode, SnSize::Sn12))
     }
 
-    /// Drives `t-Reassembly` on every RLC entity (TS 38.322 §5.2.2.2.4), so a
-    /// partially received SDU whose missing segment never arrives is discarded
-    /// instead of occupying the reassembly buffer forever.
-    fn poll_rlc_timers(&mut self) {
+    /// Drives the RLC timers on every entity and transmits whatever they
+    /// produce: a UM `t-Reassembly` expiry discards a stranded SDU
+    /// (TS 38.322 §5.2.2.2.4), an AM `t-Reassembly` expiry triggers a STATUS
+    /// report (§5.2.3.2.4), and an AM `t-PollRetransmit` expiry re-offers an
+    /// unacknowledged PDU (§5.3.3.4).
+    async fn poll_rlc_timers(&mut self) {
         let now = Instant::now();
+        let mut outbound: Vec<(i32, i32, Vec<u8>)> = Vec::new();
         for ((ue_id, psi), rlc) in &mut self.rlc_entities {
-            if rlc.poll_t_reassembly(now) {
+            if rlc.poll_timers(now) {
                 debug!(
-                    "RLC t-Reassembly expired: ue_id={}, psi={}, rx_next_reassembly={}",
+                    "RLC timer expired: ue_id={}, psi={}, rx_next_reassembly={}",
                     ue_id,
                     psi,
                     rlc.rx_next_reassembly()
                 );
             }
+            if let Some(status) = rlc.build_status_pdu() {
+                outbound.push((*ue_id, *psi, status));
+            }
+            while let Some(retx) = rlc.build_pdu(MAC_GRANT_BYTES) {
+                outbound.push((*ue_id, *psi, retx));
+            }
+        }
+        for (ue_id, psi, pdu) in outbound {
+            self.send_rlc_pdu(ue_id, psi, pdu).await;
+        }
+    }
+
+    /// Sends one RLC PDU (data or STATUS) to a UE over RLS.
+    async fn send_rlc_pdu(&mut self, ue_id: i32, psi: i32, pdu: Vec<u8>) {
+        let Some(&dest) = self.ue_addresses.get(&ue_id) else {
+            warn!("RLC PDU for unknown UE[{}] dropped", ue_id);
+            return;
+        };
+        let transmission = RlsPduTransmission {
+            sti: self.sti,
+            pdu_type: PduType::Data,
+            pdu_id: 0,
+            payload: psi as u32,
+            pdu: Bytes::from(pdu),
+        };
+        self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
+            .await;
+    }
+
+    /// Sends the STATUS report an AM bearer owes its peer, if one is due
+    /// (TS 38.322 §5.3.4). A no-op for a UM bearer, which has no STATUS PDU.
+    async fn send_pending_status(&mut self, ue_id: i32, psi: i32) {
+        let status = self
+            .rlc_entities
+            .get_mut(&(ue_id, psi))
+            .and_then(RlcEntity::build_status_pdu);
+        if let Some(status) = status {
+            self.send_rlc_pdu(ue_id, psi, status).await;
         }
     }
 
@@ -317,6 +369,11 @@ impl RlsTask {
             sdus
         };
 
+        // An AM bearer answers a poll (or a detected gap) with a STATUS report
+        // (TS 38.322 §5.3.4); without this the peer's ARQ never learns anything
+        // and its t-PollRetransmit fires forever.
+        self.send_pending_status(ue_id, psi).await;
+
         for sdu in reassembled_sdus {
             debug!(
                 "RLC reassembled SDU: ue_id={}, psi={}, len={}",
@@ -465,7 +522,7 @@ impl RlsTask {
             let rlc = self.rlc_entity_for(ue_id, psi);
             rlc.submit_sdu(data.data().to_vec());
             let mut pdus = Vec::new();
-            while let Some(rlc_pdu) = rlc.build_pdu(1500) {
+            while let Some(rlc_pdu) = rlc.build_pdu(MAC_GRANT_BYTES) {
                 pdus.push(rlc_pdu);
             }
             pdus
@@ -583,6 +640,13 @@ impl Task for RlsTask {
         info!("RLS task started on {}", self.bind_address);
 
         let mut heartbeat_timer = interval(Duration::from_millis(HEARTBEAT_CHECK_INTERVAL_MS));
+        // `interval` fires its first tick immediately, and at start-up there is
+        // nothing for it to do: no UE is known, no ack is pending and no RLC
+        // entity exists. Consuming it here also makes the periodic work land at
+        // predictable multiples of the period — otherwise the immediate tick
+        // races the first received packet, so whether periodic work runs before
+        // or after it is chance.
+        heartbeat_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -660,7 +724,7 @@ impl Task for RlsTask {
                 _ = heartbeat_timer.tick() => {
                     self.check_lost_ues().await;
                     self.send_pending_acks().await;
-                    self.poll_rlc_timers();
+                    self.poll_rlc_timers().await;
                 }
             }
         }
@@ -975,6 +1039,211 @@ mod tests {
             gtp_rx.try_recv().is_err(),
             "an SDU t-Reassembly abandoned must not be delivered by a late segment"
         );
+    }
+
+    // ========================================================================
+    // AM ARQ through the real task (#15)
+    // ========================================================================
+
+    /// A gNB RLS task whose PSI 5 bearer is RLC AM, bound and running its loop.
+    fn am_config() -> GnbConfig {
+        GnbConfig {
+            rlc_am_psis: vec![5],
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn only_a_configured_psi_gets_an_acknowledged_mode_entity() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(am_config(), 16);
+        let mut task = RlsTask::new(task_base);
+
+        assert_eq!(
+            task.rlc_entity_for(1, 5).mode,
+            RlcMode::AcknowledgedMode,
+            "PSI 5 is configured for AM"
+        );
+        assert_eq!(
+            task.rlc_entity_for(1, 1).mode,
+            RlcMode::UnacknowledgedMode,
+            "an unlisted PSI keeps the UM default"
+        );
+    }
+
+    /// A poll must be answered from the receive path, not by waiting for the run
+    /// loop's periodic tick: the tick is 500 ms and the sender's
+    /// `t-PollRetransmit` is 45 ms, so a tick-only answer would have the sender
+    /// re-poll ten times before hearing anything.
+    #[tokio::test]
+    async fn a_poll_is_answered_without_waiting_for_the_timer_tick() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let gnb_addr = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe");
+            probe.local_addr().unwrap()
+        };
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, rls_rx, _sctp_rx) =
+            GnbTaskBase::new(am_config(), 32);
+        let mut task = RlsTask::with_bind_address(task_base, gnb_addr);
+        tokio::spawn(async move { task.run(rls_rx).await });
+
+        let heartbeat = codec::encode(&RlsProtocolMessage::Heartbeat(nextgsim_rls::RlsHeartbeat {
+            sti: 0x0BAD_CAFE,
+            sim_pos: SimCoord::new(0, 0, 0),
+        }));
+        ue.send_to(&heartbeat, gnb_addr).await.expect("heartbeat");
+
+        let mut ue_rlc = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
+        ue_rlc.submit_sdu(vec![0xD1u8; 16]);
+        let polled = ue_rlc.build_pdu(64).expect("a polled AM PDU");
+        let framed = codec::encode(&RlsProtocolMessage::PduTransmission(RlsPduTransmission {
+            sti: 0x0BAD_CAFE,
+            pdu_type: PduType::Data,
+            pdu_id: 0,
+            payload: 5,
+            pdu: Bytes::from(polled),
+        }));
+        ue.send_to(&framed, gnb_addr).await.unwrap();
+
+        // 150 ms: far above loopback latency, far below the 500 ms tick.
+        let status = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+                let len = ue.recv(&mut buf).await.expect("recv");
+                buf.truncate(len);
+                if let Ok(RlsProtocolMessage::PduTransmission(pdu)) =
+                    codec::decode(&Bytes::from(buf))
+                {
+                    if pdu.pdu_type == PduType::Data && (pdu.pdu[0] & 0x80) == 0 {
+                        return pdu.pdu.to_vec();
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the poll must be answered from the receive path");
+
+        let decoded = nextgsim_rlc::RlcStatusPdu::decode_sn12(&status).unwrap();
+        assert_eq!(decoded.ack_sn, 1, "the polled SDU is acknowledged");
+    }
+
+    /// The AM loop end to end through the running task, with a PDU dropped on
+    /// purpose: the gNB must NACK it, the peer must resend it on the strength of
+    /// that NACK alone, and the SDU must then reach GTP.
+    ///
+    /// The "UE" here is a plain socket plus its own `RlcEntity`, so both sides of
+    /// the ARQ exchange are real RLC code and only the loss is simulated.
+    #[tokio::test]
+    async fn an_am_bearer_recovers_a_dropped_pdu_through_the_task() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let gnb_addr = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe");
+            probe.local_addr().unwrap()
+        };
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, mut gtp_rx, rls_rx, _sctp_rx) =
+            GnbTaskBase::new(am_config(), 32);
+        let mut task = RlsTask::with_bind_address(task_base, gnb_addr);
+        tokio::spawn(async move { task.run(rls_rx).await });
+
+        // Discovery, so the gNB knows where to send the STATUS report back.
+        let heartbeat = codec::encode(&RlsProtocolMessage::Heartbeat(nextgsim_rls::RlsHeartbeat {
+            sti: 0x0BAD_F00D,
+            sim_pos: SimCoord::new(0, 0, 0),
+        }));
+        ue.send_to(&heartbeat, gnb_addr).await.expect("heartbeat");
+
+        // The UE side of the AM bearer, with its own entity.
+        let mut ue_rlc = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
+        let sdus: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0xC0 + i; 20]).collect();
+        for sdu in &sdus {
+            ue_rlc.submit_sdu(sdu.clone());
+        }
+        let pdus: Vec<Vec<u8>> = std::iter::from_fn(|| ue_rlc.build_pdu(64)).collect();
+        assert_eq!(pdus.len(), 3);
+
+        let wrap = |pdu: Vec<u8>| {
+            codec::encode(&RlsProtocolMessage::PduTransmission(RlsPduTransmission {
+                sti: 0x0BAD_F00D,
+                pdu_type: PduType::Data,
+                pdu_id: 0,
+                payload: 5, // PSI 5 — the AM bearer
+                pdu: Bytes::from(pdu),
+            }))
+        };
+
+        // Drop SN 1 on the way up.
+        ue.send_to(&wrap(pdus[0].clone()), gnb_addr).await.unwrap();
+        ue.send_to(&wrap(pdus[2].clone()), gnb_addr).await.unwrap();
+
+        // Two SDUs arrive; the third is the one that was lost.
+        for _ in 0..2 {
+            let delivered = tokio::time::timeout(Duration::from_secs(2), gtp_rx.recv())
+                .await
+                .expect("the received SDUs must reach GTP");
+            assert!(matches!(
+                delivered,
+                Some(TaskMessage::Message(GtpMessage::DataPduDelivery { .. }))
+            ));
+        }
+
+        // The poll on SN 2 is answered with an ACK-only report first: TS 38.322
+        // §5.2.3.2.3 advances RX_Highest_Status only over SDUs that ARE received,
+        // so the gap is not reported until the gNB's t-Reassembly declares it
+        // lost (§5.2.3.2.4) and the run loop's tick sends the second report.
+        let (reports, status) = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut reports = 0usize;
+            loop {
+                let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+                let len = ue.recv(&mut buf).await.expect("recv");
+                buf.truncate(len);
+                let Ok(RlsProtocolMessage::PduTransmission(pdu)) = codec::decode(&Bytes::from(buf))
+                else {
+                    continue;
+                };
+                if pdu.pdu_type != PduType::Data || (pdu.pdu[0] & 0x80) != 0 {
+                    continue;
+                }
+                reports += 1;
+                let decoded = nextgsim_rlc::RlcStatusPdu::decode_sn12(&pdu.pdu)
+                    .expect("a decodable STATUS report");
+                if !decoded.nacks.is_empty() {
+                    return (reports, pdu.pdu.to_vec());
+                }
+            }
+        })
+        .await
+        .expect("the gNB must send a STATUS report naming the gap");
+        assert!(
+            reports >= 2,
+            "the poll should be answered before the timer reports the gap, got {reports} report(s)"
+        );
+
+        let decoded = nextgsim_rlc::RlcStatusPdu::decode_sn12(&status).unwrap();
+        assert_eq!(
+            decoded.nacks.iter().map(|n| n.nack_sn).collect::<Vec<_>>(),
+            vec![1],
+            "the STATUS report must NACK exactly the dropped SN"
+        );
+
+        // The NACK alone drives the retransmission — no manual request.
+        ue_rlc.receive_pdu(&status);
+        let retx = ue_rlc
+            .build_pdu(64)
+            .expect("the NACK must schedule the retransmission");
+        ue.send_to(&wrap(retx), gnb_addr).await.unwrap();
+
+        let recovered = tokio::time::timeout(Duration::from_secs(2), gtp_rx.recv())
+            .await
+            .expect("the retransmitted SDU must reach GTP");
+        match recovered {
+            Some(TaskMessage::Message(GtpMessage::DataPduDelivery { psi, pdu, .. })) => {
+                assert_eq!(psi, 5);
+                assert_eq!(pdu.data(), &sdus[1][..], "the recovered SDU is intact");
+            }
+            other => panic!("expected the recovered SDU at GTP, got {other:?}"),
+        }
     }
 
     /// The uplink direction keys the same way, so two sessions reassembling at

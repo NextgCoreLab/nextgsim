@@ -350,48 +350,226 @@ impl RlcAmPdu {
 
 // ── STATUS PDU (AM control) ───────────────────────────────────────────────────
 
-/// RLC AM STATUS PDU (Control PDU) — TS 38.322 §6.2.3.6
+/// One negative acknowledgement inside a STATUS PDU (TS 38.322 §6.2.2.5).
 ///
-/// Minimal implementation: ACK_SN only, no NACK list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RlcStatusPdu {
-    /// Highest SN that the receiver has received in sequence (next expected)
-    pub ack_sn: u32,
+/// `so_range` and `nack_range` are the optional refinements the E2 and E3 bits
+/// announce. This tree's receiver only ever emits whole-SDU NACKs, but a
+/// conformant peer may send either, and a decoder that skipped them would read
+/// the following NACK_SN out of the middle of an SOstart field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RlcStatusNack {
+    /// SN of the RLC SDU (or SDU segment) detected as lost
+    pub nack_sn: u32,
+    /// `(SOstart, SOend)` when the NACK covers a byte range of a partly
+    /// received SDU (E2 = 1)
+    pub so_range: Option<(u16, u16)>,
+    /// Number of consecutively lost SDUs starting at `nack_sn` (E3 = 1)
+    pub nack_range: Option<u8>,
 }
 
+impl RlcStatusNack {
+    /// A whole-SDU NACK: no byte range, no run length.
+    pub fn sdu(nack_sn: u32) -> Self {
+        Self {
+            nack_sn,
+            so_range: None,
+            nack_range: None,
+        }
+    }
+}
+
+/// RLC AM STATUS PDU (Control PDU) — TS 38.322 §6.2.2.5
+///
+/// Wire layout, bit-packed and padded to an octet boundary:
+///
+/// ```text
+/// D/C(1) CPT(3) ACK_SN(12|18) E1(1)
+///   then, for each NACK: NACK_SN(12|18) E1(1) E2(1) E3(1)
+///                        [SOstart(16) SOend(16) if E2] [NACK range(8) if E3]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RlcStatusPdu {
+    /// SN of the next not-received RLC SDU that is not reported as missing:
+    /// everything below it is acknowledged, except the NACKed SNs
+    /// (TS 38.322 §6.2.3.10)
+    pub ack_sn: u32,
+    /// Negatively acknowledged SNs, in increasing SN order
+    pub nacks: Vec<RlcStatusNack>,
+}
+
+/// Control PDU type for a STATUS PDU (TS 38.322 §6.2.3.9)
+const CPT_STATUS: u8 = 0b000;
+
 impl RlcStatusPdu {
-    /// Create a new STATUS PDU acknowledging up to (but not including) `ack_sn`.
+    /// Create a STATUS PDU acknowledging up to (but not including) `ack_sn`,
+    /// with nothing negatively acknowledged.
     pub fn new(ack_sn: u32) -> Self {
-        Self { ack_sn }
+        Self {
+            ack_sn,
+            nacks: Vec::new(),
+        }
     }
 
-    /// Encode as 3 bytes (D/C=0, CPT=000, ACK_SN 12-bit, E1=0, padding).
-    ///
-    /// Wire (12-bit SN):
-    /// ```text
-    /// Byte 0: [D/C=0][CPT=000][ACK_SN[11:8]]
-    /// Byte 1: [ACK_SN[7:0]]
-    /// Byte 2: [E1=0][padding=0000000]
-    /// ```
+    /// Create a STATUS PDU with a NACK list.
+    pub fn with_nacks(ack_sn: u32, nacks: Vec<RlcStatusNack>) -> Self {
+        Self { ack_sn, nacks }
+    }
+
+    /// Encode with a 12-bit SN.
     pub fn encode_sn12(&self) -> Vec<u8> {
-        let sn = self.ack_sn & 0x0FFF;
-        vec![
-            ((sn >> 8) as u8) & 0x0F, // D/C=0, CPT=000, SN[11:8]
-            (sn & 0xFF) as u8,
-            0x00, // E1=0, no NACKs
-        ]
+        self.encode(12)
     }
 
-    /// Decode from bytes (12-bit SN STATUS PDU).
+    /// Encode with an 18-bit SN.
+    pub fn encode_sn18(&self) -> Vec<u8> {
+        self.encode(18)
+    }
+
+    /// Decode a 12-bit-SN STATUS PDU.
     pub fn decode_sn12(buf: &[u8]) -> Result<Self, RlcError> {
-        if buf.len() < 3 {
-            return Err(RlcError::PduTooShort {
-                need: 3,
-                got: buf.len(),
+        Self::decode(buf, 12)
+    }
+
+    /// Decode an 18-bit-SN STATUS PDU.
+    pub fn decode_sn18(buf: &[u8]) -> Result<Self, RlcError> {
+        Self::decode(buf, 18)
+    }
+
+    fn encode(&self, sn_bits: u32) -> Vec<u8> {
+        let mut out = BitWriter::new();
+        out.push_bits(0, 1); // D/C = 0 (control PDU)
+        out.push_bits(u32::from(CPT_STATUS), 3);
+        out.push_bits(self.ack_sn, sn_bits);
+
+        // One E1 after ACK_SN announces whether a NACK follows at all; after that
+        // each NACK carries its own E1 for the next one. Emitting a leading E1
+        // per NACK inserts an extra bit between entries, which a single-NACK
+        // fixture cannot see (there it coincides with the trailing E1 = 0).
+        out.push_bits(u32::from(!self.nacks.is_empty()), 1);
+        for (index, nack) in self.nacks.iter().enumerate() {
+            out.push_bits(nack.nack_sn, sn_bits);
+            let more = index + 1 < self.nacks.len();
+            out.push_bits(u32::from(more), 1); // E1: another NACK follows
+            out.push_bits(u32::from(nack.so_range.is_some()), 1); // E2
+            out.push_bits(u32::from(nack.nack_range.is_some()), 1); // E3
+            if let Some((so_start, so_end)) = nack.so_range {
+                out.push_bits(u32::from(so_start), 16);
+                out.push_bits(u32::from(so_end), 16);
+            }
+            if let Some(range) = nack.nack_range {
+                out.push_bits(u32::from(range), 8);
+            }
+        }
+        out.finish()
+    }
+
+    fn decode(buf: &[u8], sn_bits: u32) -> Result<Self, RlcError> {
+        let mut bits = BitReader::new(buf);
+        // D/C and CPT are consumed by the caller's dispatch but must still be
+        // stepped over here; a non-STATUS CPT is refused rather than parsed as
+        // one, because its payload has a different shape entirely.
+        bits.take(1)?;
+        let cpt = bits.take(3)? as u8;
+        if cpt != CPT_STATUS {
+            return Err(RlcError::InvalidSi(cpt));
+        }
+        let ack_sn = bits.take(sn_bits)?;
+
+        let mut nacks = Vec::new();
+        let mut more = bits.take(1)? == 1;
+        while more {
+            let nack_sn = bits.take(sn_bits)?;
+            more = bits.take(1)? == 1;
+            let has_so = bits.take(1)? == 1;
+            let has_range = bits.take(1)? == 1;
+            let so_range = if has_so {
+                let start = bits.take(16)? as u16;
+                let end = bits.take(16)? as u16;
+                Some((start, end))
+            } else {
+                None
+            };
+            let nack_range = if has_range {
+                Some(bits.take(8)? as u8)
+            } else {
+                None
+            };
+            nacks.push(RlcStatusNack {
+                nack_sn,
+                so_range,
+                nack_range,
             });
         }
-        let ack_sn = (((buf[0] & 0x0F) as u32) << 8) | buf[1] as u32;
-        Ok(Self { ack_sn })
+
+        Ok(Self { ack_sn, nacks })
+    }
+}
+
+/// Minimal MSB-first bit writer for the STATUS PDU's non-octet-aligned fields.
+struct BitWriter {
+    out: Vec<u8>,
+    /// Bits already written into the last octet of `out`
+    used: u32,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            used: 8,
+        }
+    }
+
+    fn push_bits(&mut self, value: u32, bits: u32) {
+        for shift in (0..bits).rev() {
+            if self.used == 8 {
+                self.out.push(0);
+                self.used = 0;
+            }
+            let bit = (value >> shift) & 1;
+            if bit == 1 {
+                let last = self.out.len() - 1;
+                self.out[last] |= 1 << (7 - self.used);
+            }
+            self.used += 1;
+        }
+    }
+
+    /// The encoded octets, the trailing partial octet zero-padded (the R bits of
+    /// TS 38.322 figure 6.2.2.5-1).
+    fn finish(self) -> Vec<u8> {
+        self.out
+    }
+}
+
+/// Minimal MSB-first bit reader, refusing to read past the buffer rather than
+/// returning zeros — a truncated STATUS PDU must be an error, not an ACK_SN of 0.
+struct BitReader<'a> {
+    buf: &'a [u8],
+    position: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, position: 0 }
+    }
+
+    fn take(&mut self, bits: u32) -> Result<u32, RlcError> {
+        let available = self.buf.len() as u32 * 8;
+        if self.position + bits > available {
+            return Err(RlcError::PduTooShort {
+                need: (self.position as usize + bits as usize).div_ceil(8),
+                got: self.buf.len(),
+            });
+        }
+        let mut value = 0u32;
+        for _ in 0..bits {
+            let byte = self.buf[(self.position / 8) as usize];
+            let bit = (byte >> (7 - (self.position % 8))) & 1;
+            value = (value << 1) | u32::from(bit);
+            self.position += 1;
+        }
+        Ok(value)
     }
 }
 
@@ -540,5 +718,100 @@ mod tests {
         assert_eq!(encoded.len(), 3);
         let decoded = RlcStatusPdu::decode_sn12(&encoded).unwrap();
         assert_eq!(decoded.ack_sn, 42);
+        assert!(decoded.nacks.is_empty());
+    }
+
+    // ── STATUS PDU with a NACK list (#15) ─────────────────────────────────────
+
+    /// The header bits are not octet-aligned, so the layout is asserted on the
+    /// wire bytes: D/C=0, CPT=000, ACK_SN(12), E1=1, then NACK_SN(12) E1 E2 E3.
+    #[test]
+    fn a_status_pdu_with_one_nack_matches_the_ts_38_322_bit_layout() {
+        let status = RlcStatusPdu::with_nacks(0x123, vec![RlcStatusNack::sdu(0x456)]);
+        let encoded = status.encode_sn12();
+
+        // byte 0: D/C=0 CPT=000 | ACK_SN[11:8] = 0001          -> 0x01
+        // byte 1: ACK_SN[7:0] = 0x23                             -> 0x23
+        // byte 2: E1=1 | NACK_SN[11:5] = 0100010                 -> 0xA2
+        // byte 3: NACK_SN[4:0] = 10110 | E1=0 E2=0 E3=0          -> 0xB0
+        assert_eq!(encoded, vec![0x01, 0x23, 0xA2, 0xB0]);
+        assert_eq!(RlcStatusPdu::decode_sn12(&encoded).unwrap(), status);
+    }
+
+    #[test]
+    fn a_status_pdu_round_trips_a_multi_nack_list() {
+        let status = RlcStatusPdu::with_nacks(
+            2048,
+            vec![
+                RlcStatusNack::sdu(7),
+                RlcStatusNack::sdu(9),
+                RlcStatusNack::sdu(4095),
+            ],
+        );
+        let decoded = RlcStatusPdu::decode_sn12(&status.encode_sn12()).unwrap();
+        assert_eq!(decoded, status, "every NACK must survive, in order");
+    }
+
+    /// The E2 and E3 refinements must survive too: a decoder that skipped them
+    /// would read the next NACK_SN out of the middle of an SOstart field.
+    #[test]
+    fn a_status_pdu_round_trips_so_ranges_and_nack_ranges() {
+        let status = RlcStatusPdu::with_nacks(
+            100,
+            vec![
+                RlcStatusNack {
+                    nack_sn: 10,
+                    so_range: Some((16, 47)),
+                    nack_range: None,
+                },
+                RlcStatusNack {
+                    nack_sn: 20,
+                    so_range: None,
+                    nack_range: Some(5),
+                },
+                RlcStatusNack {
+                    nack_sn: 30,
+                    so_range: Some((0, 0xFFFF)),
+                    nack_range: Some(3),
+                },
+                RlcStatusNack::sdu(40),
+            ],
+        );
+        assert_eq!(
+            RlcStatusPdu::decode_sn12(&status.encode_sn12()).unwrap(),
+            status
+        );
+    }
+
+    #[test]
+    fn a_status_pdu_round_trips_with_an_18_bit_sn() {
+        let status = RlcStatusPdu::with_nacks(
+            0x3_FFFF,
+            vec![RlcStatusNack::sdu(0x2_ABCD), RlcStatusNack::sdu(1)],
+        );
+        let decoded = RlcStatusPdu::decode_sn18(&status.encode_sn18()).unwrap();
+        assert_eq!(decoded, status);
+    }
+
+    /// A truncated STATUS PDU must be an error, not an ACK_SN of 0 — which the
+    /// sender would read as "nothing acknowledged" and act on.
+    #[test]
+    fn a_truncated_status_pdu_is_an_error() {
+        let full = RlcStatusPdu::with_nacks(5, vec![RlcStatusNack::sdu(2)]).encode_sn12();
+        for truncated in 0..full.len() {
+            assert!(
+                RlcStatusPdu::decode_sn12(&full[..truncated]).is_err(),
+                "{truncated} octets must not decode"
+            );
+        }
+    }
+
+    /// A control PDU of another type must be refused rather than parsed as a
+    /// STATUS report: its payload has a different shape entirely.
+    #[test]
+    fn a_control_pdu_of_another_type_is_refused() {
+        let mut bytes = RlcStatusPdu::new(5).encode_sn12();
+        bytes[0] |= 0b0001_0000; // CPT = 001, reserved
+        assert!(RlcStatusPdu::decode_sn12(&bytes).is_err());
     }
 }
