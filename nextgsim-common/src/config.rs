@@ -87,6 +87,26 @@ pub struct GnbConfig {
     /// UPF GTP-U port (default: 2152)
     #[serde(default = "default_gtp_port")]
     pub upf_port: u16,
+    /// GTP-U Echo Request period in seconds for N3 path supervision
+    /// (TS 29.281 §7.2.1). **0, the default, disables the prober**, so the
+    /// datapath is byte-for-byte unchanged until an operator asks for it.
+    ///
+    /// A runtime switch and not a cargo feature, deliberately: CI runs
+    /// `cargo test --workspace` with default features, so a feature-gated prober
+    /// would ship without ever being compiled by the gate that is supposed to
+    /// cover it.
+    #[serde(default)]
+    pub gtpu_echo_period_secs: u64,
+    /// Consecutive unanswered Echo supervision periods after which the N3 path is
+    /// declared down (TS 23.007 §20.3.1 N3-REQUESTS). Default 3.
+    #[serde(default = "default_gtpu_echo_max_misses")]
+    pub gtpu_echo_max_misses: u32,
+    /// File holding the GTP-U restart counter across restarts (TS 23.007).
+    ///
+    /// `None` (the default) means the Recovery IE advertises a fixed 0: honest,
+    /// because without storage this node genuinely cannot tell a peer it restarted.
+    #[serde(default)]
+    pub gtpu_restart_counter_path: Option<std::path::PathBuf>,
     /// Post-quantum cryptography configuration.
     ///
     /// Deserialised from the `pqc` key. Without the rename the field name
@@ -202,6 +222,10 @@ fn default_gtp_port() -> u16 {
     2152
 }
 
+fn default_gtpu_echo_max_misses() -> u32 {
+    3
+}
+
 fn default_tngreloc_overall_secs() -> u64 {
     5
 }
@@ -233,6 +257,9 @@ impl Default for GnbConfig {
             ngap_tngreloc_prep_secs: default_tngreloc_prep_secs(),
             upf_addr: None,
             upf_port: 2152,
+            gtpu_echo_period_secs: 0,
+            gtpu_echo_max_misses: default_gtpu_echo_max_misses(),
+            gtpu_restart_counter_path: None,
             pqc_config: PqcConfig::default(),
             ntn_config: None,
             mbs_enabled: false,

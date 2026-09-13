@@ -37,7 +37,9 @@
 //! ```
 
 pub mod codec;
+pub mod path;
 pub mod qos;
+pub mod restart;
 pub mod tunnel;
 
 // Re-export main types for convenience
@@ -62,7 +64,14 @@ pub use codec::{
     EXT_HEADER_TYPE_TSN_MARKER,
     GTP_PROTOCOL_TYPE,
     GTP_VERSION,
+    IE_GTPU_PEER_ADDRESS,
+    IE_RECOVERY,
+    IE_TEID_DATA_I,
 };
+
+pub use path::{EchoOutcome, PathSupervisor};
+
+pub use restart::RestartCounter;
 
 pub use tunnel::{
     get_psi, get_ue_id, make_session_key, GtpTunnel, PduSession, TunnelError, TunnelManager,
