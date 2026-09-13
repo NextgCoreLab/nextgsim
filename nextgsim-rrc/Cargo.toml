@@ -22,3 +22,6 @@ log.workspace = true
 
 [build-dependencies]
 asn1-compiler.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

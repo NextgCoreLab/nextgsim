@@ -14,3 +14,6 @@ pub mod procedures;
 
 #[cfg(test)]
 mod capture_tests;
+
+#[cfg(test)]
+mod proptest_roundtrip;

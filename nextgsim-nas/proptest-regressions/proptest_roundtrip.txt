@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# PROVENANCE: these seeds come from the deliberate codec breakages used to
+# verify that the property tests discriminate (nextgsim #23, acceptance criterion
+# 5) -- NOT from a codec regression. No genuine counterexample has been found.
+#
+# They are kept rather than deleted because each one is a case already shown to
+# tell a broken codec from a working one: keeping them makes those inputs re-run
+# first on every test run instead of depending on the generator finding them
+# again.
+cc 5df27bc3601cc10e80271e4798731421b2f3c2e0ac91a11464dff7cfbf554585 # shrinks to msg = RegistrationRequest { registration_type: Ie5gsRegistrationType { follow_on_request_pending: NoPending, registration_type: InitialRegistration }, ng_ksi: NasKeySetIdentifier { tsc: Native, ksi: 0 }, mobile_identity: Ie5gsMobileIdentity { identity_type: Suci, data: [241] }, non_current_ng_ksi: None, ue_security_capability: None, requested_nssai: None, last_visited_tai: None, ue_status: Some(0), additional_guti: None, uplink_data_status: None, pdu_session_status: None, nas_message_container: None, mico_indication: None, ladn_indication: None, ai_ml_capability: None, isac_parameter: None, semantic_comm_parameter: None, sub_thz_band_parameter: None, ntn_timing_advance: None, ntn_access_barring: None, snpn_nid: None, disaster_roaming: false, uav_indication: None, redcap: false, payload_container_type: None, payload_container: None }
+cc 0714740df1c22e4a931a879cdd8a15fa3c51c65807d212a2968b4705d01900c2 # shrinks to msg = RegistrationRequest { registration_type: Ie5gsRegistrationType { follow_on_request_pending: NoPending, registration_type: InitialRegistration }, ng_ksi: NasKeySetIdentifier { tsc: Native, ksi: 0 }, mobile_identity: Ie5gsMobileIdentity { identity_type: Suci, data: [241] }, non_current_ng_ksi: None, ue_security_capability: None, requested_nssai: None, last_visited_tai: None, ue_status: None, additional_guti: None, uplink_data_status: Some(1), pdu_session_status: None, nas_message_container: None, mico_indication: None, ladn_indication: None, ai_ml_capability: None, isac_parameter: None, semantic_comm_parameter: None, sub_thz_band_parameter: None, ntn_timing_advance: None, ntn_access_barring: None, snpn_nid: None, disaster_roaming: false, uav_indication: None, redcap: false, payload_container_type: None, payload_container: None }
+cc f7cf80431558f9ed25f72fe581368e7c5ff2893d32eeabd7cff73bf3593188dc # shrinks to msg = AuthenticationRequest { ng_ksi: NasKeySetIdentifier { tsc: Native, ksi: 0 }, abba: Abba { value: [0, 0] }, rand: None, autn: Some(AuthenticationParameterAutn { value: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }), eap_message: None }
