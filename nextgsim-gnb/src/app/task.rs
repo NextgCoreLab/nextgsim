@@ -116,6 +116,18 @@ impl AppTask {
         // Handle the command
         let response = handler.handle_command(&command, response_addr);
 
+        // Handle a RAN Configuration Update request (issue #41): this is the
+        // production caller `send_ran_configuration_update` did not have.
+        if let GnbCliCommandType::RanConfigUpdate { amf_id } = command {
+            if !response.is_error {
+                info!("RAN Configuration Update requested for AMF {amf_id:?}");
+                let msg = NgapMessage::SendRanConfigurationUpdate { amf_id };
+                if let Err(e) = self.task_base.ngap_tx.send(msg).await {
+                    error!("Failed to send RAN Configuration Update request to NGAP: {e}");
+                }
+            }
+        }
+
         // Handle UE release if requested
         if let GnbCliCommandType::UeRelease { ue_id } = command {
             if !response.is_error {

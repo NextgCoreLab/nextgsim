@@ -261,6 +261,144 @@ pub struct AmfConfigurationUpdateData {
     pub relative_amf_capacity: Option<u8>,
     /// Updated PLMN support list (empty if the IE is absent).
     pub plmn_support_list: Vec<PlmnSupportItem>,
+    /// TNL associations the AMF asks the NG-RAN node to ADD
+    /// (`AMF-TNLAssociationToAddList`, TS 38.413 §9.2.6.5 / §9.3.3.20).
+    pub tnla_to_add: Vec<AmfTnlAssociationToAdd>,
+    /// TNL associations the AMF asks the NG-RAN node to REMOVE.
+    pub tnla_to_remove: Vec<AmfTnlAssociationAddress>,
+    /// TNL associations whose usage or weight the AMF asks to UPDATE.
+    pub tnla_to_update: Vec<AmfTnlAssociationToUpdate>,
+}
+
+/// What a TNL association may be used for (TS 38.413 §9.3.3.22
+/// `TNLAssociationUsage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TnlAssociationUsage {
+    /// UE-associated signalling only
+    Ue,
+    /// Non-UE-associated signalling only
+    NonUe,
+    /// Both
+    Both,
+}
+
+impl TnlAssociationUsage {
+    fn from_asn(value: &TNLAssociationUsage) -> Option<Self> {
+        match value.0 {
+            TNLAssociationUsage::UE => Some(Self::Ue),
+            TNLAssociationUsage::NON_UE => Some(Self::NonUe),
+            TNLAssociationUsage::BOTH => Some(Self::Both),
+            // An unknown usage is dropped rather than guessed: `TNLAssociationUsage`
+            // is extensible, and defaulting an unrecognised value to `Both` would
+            // let UE traffic onto an association the AMF reserved for something
+            // else.
+            _ => None,
+        }
+    }
+}
+
+/// A TNL association address as the AMF gave it.
+///
+/// `CPTransportLayerInformation` is a CHOICE whose only Rel-15 alternative is an
+/// `endpointIPAddress` — a `TransportLayerAddress` BIT STRING of 32 or 128 bits.
+/// Decoded to an `IpAddr` here, following the same bit-by-bit conversion the
+/// GTP-tunnel path in `transfer.rs` uses, because a consumer that has to open an
+/// SCTP association needs an address rather than a bit string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmfTnlAssociationAddress {
+    /// The endpoint the AMF named
+    pub endpoint: std::net::IpAddr,
+}
+
+impl AmfTnlAssociationAddress {
+    /// `None` when the address is one this codec cannot turn into an endpoint:
+    /// a choice extension (a transport not modelled here) or a bit string that is
+    /// neither 32 nor 128 bits.
+    ///
+    /// Absent rather than a placeholder address, deliberately: a consumer handed
+    /// `0.0.0.0` would try to connect to it and report a transport failure, when
+    /// the truth is that the gNB never understood the request.
+    fn from_asn(info: &CPTransportLayerInformation) -> Option<Self> {
+        let CPTransportLayerInformation::EndpointIPAddress(addr) = info else {
+            return None;
+        };
+        let bits = &addr.0;
+        match bits.len() {
+            32 => {
+                let mut octets = [0u8; 4];
+                for (i, octet) in octets.iter_mut().enumerate() {
+                    for b in 0..8 {
+                        if bits[i * 8 + b] {
+                            *octet |= 1 << (7 - b);
+                        }
+                    }
+                }
+                Some(Self {
+                    endpoint: std::net::IpAddr::V4(octets.into()),
+                })
+            }
+            128 => {
+                let mut octets = [0u8; 16];
+                for (i, octet) in octets.iter_mut().enumerate() {
+                    for b in 0..8 {
+                        if bits[i * 8 + b] {
+                            *octet |= 1 << (7 - b);
+                        }
+                    }
+                }
+                Some(Self {
+                    endpoint: std::net::IpAddr::V6(octets.into()),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Encodes this address back into a `CPTransportLayerInformation`, for the
+    /// Acknowledge's setup / failed-to-setup lists.
+    fn to_asn(self) -> CPTransportLayerInformation {
+        let mut bits = bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::new();
+        match self.endpoint {
+            std::net::IpAddr::V4(v4) => {
+                for octet in v4.octets() {
+                    for b in 0..8 {
+                        bits.push(octet & (1 << (7 - b)) != 0);
+                    }
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                for octet in v6.octets() {
+                    for b in 0..8 {
+                        bits.push(octet & (1 << (7 - b)) != 0);
+                    }
+                }
+            }
+        }
+        CPTransportLayerInformation::EndpointIPAddress(TransportLayerAddress(bits))
+    }
+}
+
+/// A TNL association the AMF asks the NG-RAN node to add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmfTnlAssociationToAdd {
+    /// Where to connect
+    pub address: AmfTnlAssociationAddress,
+    /// What the association may carry, when the AMF said
+    pub usage: Option<TnlAssociationUsage>,
+    /// `TNLAddressWeightFactor` (0..255): the share of traffic this association
+    /// should take relative to the AMF's others.
+    pub weight_factor: u8,
+}
+
+/// A TNL association whose usage or weight the AMF asks to update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmfTnlAssociationToUpdate {
+    /// Which association
+    pub address: AmfTnlAssociationAddress,
+    /// New usage, when the AMF said
+    pub usage: Option<TnlAssociationUsage>,
+    /// New weight factor, when the AMF said
+    pub weight_factor: Option<u8>,
 }
 
 /// Parameters for building an AMF Configuration Update Acknowledge.
@@ -269,9 +407,16 @@ pub struct AmfConfigurationUpdateData {
 /// (no IEs) is the conformant minimal positive response.
 #[derive(Debug, Clone, Default)]
 pub struct AmfConfigurationUpdateAcknowledgeParams {
-    /// Placeholder for future TNL-association setup reporting. Currently the
-    /// gNB sends a bare acknowledge.
-    pub _reserved: (),
+    /// TNL associations the NG-RAN node DID set up, reported back in
+    /// `AMF-TNLAssociationSetupList` (TS 38.413 §9.2.6.6).
+    pub tnla_setup: Vec<AmfTnlAssociationAddress>,
+    /// TNL associations the NG-RAN node could NOT set up, reported in
+    /// `AMF-TNLAssociationFailedToSetupList` with a cause.
+    ///
+    /// Populated rather than left empty when a requested association cannot be
+    /// established: a bare acknowledge tells the AMF nothing went wrong, and the
+    /// AMF would then balance traffic onto an association that does not exist.
+    pub tnla_failed_to_setup: Vec<AmfTnlAssociationAddress>,
 }
 
 /// Decode an AMF Configuration Update message from APER bytes.
@@ -321,6 +466,54 @@ pub fn parse_amf_configuration_update(
             AMFConfigurationUpdateProtocolIEs_EntryValue::Id_PLMNSupportList(list) => {
                 data.plmn_support_list = parse_plmn_support_list(list);
             }
+            AMFConfigurationUpdateProtocolIEs_EntryValue::Id_AMF_TNLAssociationToAddList(list) => {
+                for item in &list.0 {
+                    // An item whose address this codec cannot model is SKIPPED, not
+                    // represented with an empty address: the consumer would try to
+                    // connect to it.
+                    if let Some(address) =
+                        AmfTnlAssociationAddress::from_asn(&item.amf_tnl_association_address)
+                    {
+                        data.tnla_to_add.push(AmfTnlAssociationToAdd {
+                            address,
+                            usage: item
+                                .tnl_association_usage
+                                .as_ref()
+                                .and_then(TnlAssociationUsage::from_asn),
+                            weight_factor: item.tnl_address_weight_factor.0,
+                        });
+                    }
+                }
+            }
+            AMFConfigurationUpdateProtocolIEs_EntryValue::Id_AMF_TNLAssociationToRemoveList(
+                list,
+            ) => {
+                for item in &list.0 {
+                    if let Some(address) =
+                        AmfTnlAssociationAddress::from_asn(&item.amf_tnl_association_address)
+                    {
+                        data.tnla_to_remove.push(address);
+                    }
+                }
+            }
+            AMFConfigurationUpdateProtocolIEs_EntryValue::Id_AMF_TNLAssociationToUpdateList(
+                list,
+            ) => {
+                for item in &list.0 {
+                    if let Some(address) =
+                        AmfTnlAssociationAddress::from_asn(&item.amf_tnl_association_address)
+                    {
+                        data.tnla_to_update.push(AmfTnlAssociationToUpdate {
+                            address,
+                            usage: item
+                                .tnl_association_usage
+                                .as_ref()
+                                .and_then(TnlAssociationUsage::from_asn),
+                            weight_factor: item.tnl_address_weight_factor.as_ref().map(|w| w.0),
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -330,10 +523,63 @@ pub fn parse_amf_configuration_update(
 
 /// Build an AMF Configuration Update Acknowledge PDU (bare positive response).
 pub fn build_amf_configuration_update_acknowledge(
-    _params: &AmfConfigurationUpdateAcknowledgeParams,
+    params: &AmfConfigurationUpdateAcknowledgeParams,
 ) -> Result<NGAP_PDU, NgResetError> {
+    let mut ies = Vec::new();
+
+    // Both lists are SIZE (1..32): an empty one is not encodable, so an empty
+    // request omits the IE. A bare acknowledge stays the conformant minimal
+    // positive response when the AMF asked for no TNLA change.
+    if !params.tnla_setup.is_empty() {
+        ies.push(AMFConfigurationUpdateAcknowledgeProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_AMF_TNL_ASSOCIATION_SETUP_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            value:
+                AMFConfigurationUpdateAcknowledgeProtocolIEs_EntryValue::Id_AMF_TNLAssociationSetupList(
+                    AMF_TNLAssociationSetupList(
+                        params
+                            .tnla_setup
+                            .iter()
+                            .map(|a| AMF_TNLAssociationSetupItem {
+                                amf_tnl_association_address: a.to_asn(),
+                                ie_extensions: None,
+                            })
+                            .collect(),
+                    ),
+                ),
+        });
+    }
+
+    if !params.tnla_failed_to_setup.is_empty() {
+        ies.push(AMFConfigurationUpdateAcknowledgeProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_AMF_TNL_ASSOCIATION_FAILED_TO_SETUP_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            value:
+                AMFConfigurationUpdateAcknowledgeProtocolIEs_EntryValue::Id_AMF_TNLAssociationFailedToSetupList(
+                    TNLAssociationList(
+                        params
+                            .tnla_failed_to_setup
+                            .iter()
+                            .map(|a| TNLAssociationItem {
+                                tnl_association_address: a.to_asn(),
+                                // transport-resource-unavailable: the NG-RAN node
+                                // could not bring the association up. A specific
+                                // cause rather than `unspecified`, because "the
+                                // transport did not come up" is what actually
+                                // happened and the AMF can act on it.
+                                cause: Cause::Transport(CauseTransport(
+                                    CauseTransport::TRANSPORT_RESOURCE_UNAVAILABLE,
+                                )),
+                                ie_extensions: None,
+                            })
+                            .collect(),
+                    ),
+                ),
+        });
+    }
+
     let ack = AMFConfigurationUpdateAcknowledge {
-        protocol_i_es: AMFConfigurationUpdateAcknowledgeProtocolIEs(Vec::new()),
+        protocol_i_es: AMFConfigurationUpdateAcknowledgeProtocolIEs(ies),
     };
 
     let successful_outcome = SuccessfulOutcome {
@@ -351,6 +597,60 @@ pub fn encode_amf_configuration_update_acknowledge(
 ) -> Result<Vec<u8>, NgResetError> {
     let pdu = build_amf_configuration_update_acknowledge(params)?;
     Ok(encode_ngap_pdu(&pdu)?)
+}
+
+/// What an AMF Configuration Update Acknowledge reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AmfConfigurationUpdateAcknowledgeData {
+    /// TNL associations the NG-RAN node set up
+    pub tnla_setup: Vec<AmfTnlAssociationAddress>,
+    /// TNL associations it could not set up
+    pub tnla_failed_to_setup: Vec<AmfTnlAssociationAddress>,
+}
+
+/// Decode an AMF Configuration Update Acknowledge, returning what it reported.
+pub fn parse_amf_configuration_update_acknowledge(
+    bytes: &[u8],
+) -> Result<AmfConfigurationUpdateAcknowledgeData, NgResetError> {
+    let pdu = decode_ngap_pdu(bytes)?;
+    let NGAP_PDU::SuccessfulOutcome(outcome) = pdu else {
+        return Err(NgResetError::InvalidMessageType {
+            expected: "SuccessfulOutcome".to_string(),
+            actual: format!("{pdu:?}"),
+        });
+    };
+    let SuccessfulOutcomeValue::Id_AMFConfigurationUpdate(ack) = outcome.value else {
+        return Err(NgResetError::InvalidMessageType {
+            expected: "AMFConfigurationUpdateAcknowledge".to_string(),
+            actual: format!("{:?}", outcome.value),
+        });
+    };
+
+    let mut data = AmfConfigurationUpdateAcknowledgeData::default();
+    for ie in &ack.protocol_i_es.0 {
+        match &ie.value {
+            AMFConfigurationUpdateAcknowledgeProtocolIEs_EntryValue::Id_AMF_TNLAssociationSetupList(
+                list,
+            ) => {
+                data.tnla_setup = list
+                    .0
+                    .iter()
+                    .filter_map(|i| AmfTnlAssociationAddress::from_asn(&i.amf_tnl_association_address))
+                    .collect();
+            }
+            AMFConfigurationUpdateAcknowledgeProtocolIEs_EntryValue::Id_AMF_TNLAssociationFailedToSetupList(
+                list,
+            ) => {
+                data.tnla_failed_to_setup = list
+                    .0
+                    .iter()
+                    .filter_map(|i| AmfTnlAssociationAddress::from_asn(&i.tnl_association_address))
+                    .collect();
+            }
+            AMFConfigurationUpdateAcknowledgeProtocolIEs_EntryValue::Id_CriticalityDiagnostics(_) => {}
+        }
+    }
+    Ok(data)
 }
 
 /// Decode an AMF Configuration Update Acknowledge (used in round-trip tests).
@@ -507,5 +807,157 @@ mod tests {
         let params = AmfConfigurationUpdateAcknowledgeParams::default();
         let bytes = encode_amf_configuration_update_acknowledge(&params).expect("encode");
         decode_amf_configuration_update_acknowledge(&bytes).expect("decode");
+    }
+
+    // ========================================================================
+    // TNL association lists (issue #41)
+    // ========================================================================
+
+    /// The three TNLA lists must actually be PARSED. Before this they were IEs the
+    /// decoder's catch-all arm dropped, so an AMF asking the gNB to add an
+    /// association got a bare acknowledge that reads as "done".
+    #[test]
+    fn the_tnl_association_lists_round_trip_through_an_amf_configuration_update() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let add_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let add_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let remove = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let update = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+
+        // Built with the generated types directly, because this crate encodes the
+        // ACKNOWLEDGE and only DECODES the update -- there is no gNB-side builder
+        // for an AMF-originated message to round trip through.
+        let ies = vec![
+            AMFConfigurationUpdateProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_AMF_TNL_ASSOCIATION_TO_ADD_LIST),
+                criticality: Criticality(Criticality::IGNORE),
+                value: AMFConfigurationUpdateProtocolIEs_EntryValue::Id_AMF_TNLAssociationToAddList(
+                    AMF_TNLAssociationToAddList(vec![
+                        AMF_TNLAssociationToAddItem {
+                            amf_tnl_association_address: AmfTnlAssociationAddress {
+                                endpoint: add_v4,
+                            }
+                            .to_asn(),
+                            tnl_association_usage: Some(TNLAssociationUsage(
+                                TNLAssociationUsage::BOTH,
+                            )),
+                            tnl_address_weight_factor: TNLAddressWeightFactor(50),
+                            ie_extensions: None,
+                        },
+                        AMF_TNLAssociationToAddItem {
+                            amf_tnl_association_address: AmfTnlAssociationAddress {
+                                endpoint: add_v6,
+                            }
+                            .to_asn(),
+                            tnl_association_usage: Some(TNLAssociationUsage(
+                                TNLAssociationUsage::NON_UE,
+                            )),
+                            tnl_address_weight_factor: TNLAddressWeightFactor(10),
+                            ie_extensions: None,
+                        },
+                    ]),
+                ),
+            },
+            AMFConfigurationUpdateProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_AMF_TNL_ASSOCIATION_TO_REMOVE_LIST),
+                criticality: Criticality(Criticality::IGNORE),
+                value:
+                    AMFConfigurationUpdateProtocolIEs_EntryValue::Id_AMF_TNLAssociationToRemoveList(
+                        AMF_TNLAssociationToRemoveList(vec![AMF_TNLAssociationToRemoveItem {
+                            amf_tnl_association_address: AmfTnlAssociationAddress {
+                                endpoint: remove,
+                            }
+                            .to_asn(),
+                            ie_extensions: None,
+                        }]),
+                    ),
+            },
+            AMFConfigurationUpdateProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_AMF_TNL_ASSOCIATION_TO_UPDATE_LIST),
+                criticality: Criticality(Criticality::IGNORE),
+                value:
+                    AMFConfigurationUpdateProtocolIEs_EntryValue::Id_AMF_TNLAssociationToUpdateList(
+                        AMF_TNLAssociationToUpdateList(vec![AMF_TNLAssociationToUpdateItem {
+                            amf_tnl_association_address: AmfTnlAssociationAddress {
+                                endpoint: update,
+                            }
+                            .to_asn(),
+                            tnl_association_usage: Some(TNLAssociationUsage(
+                                TNLAssociationUsage::UE,
+                            )),
+                            tnl_address_weight_factor: Some(TNLAddressWeightFactor(200)),
+                            ie_extensions: None,
+                        }]),
+                    ),
+            },
+        ];
+        let pdu = NGAP_PDU::InitiatingMessage(InitiatingMessage {
+            procedure_code: ProcedureCode(ID_AMF_CONFIGURATION_UPDATE),
+            criticality: Criticality(Criticality::REJECT),
+            value: InitiatingMessageValue::Id_AMFConfigurationUpdate(AMFConfigurationUpdate {
+                protocol_i_es: AMFConfigurationUpdateProtocolIEs(ies),
+            }),
+        });
+        let bytes = encode_ngap_pdu(&pdu).expect("encodes");
+        let data = decode_amf_configuration_update(&bytes).expect("decodes");
+
+        assert_eq!(data.tnla_to_add.len(), 2);
+        assert_eq!(data.tnla_to_add[0].address.endpoint, add_v4);
+        assert_eq!(data.tnla_to_add[0].usage, Some(TnlAssociationUsage::Both));
+        assert_eq!(data.tnla_to_add[0].weight_factor, 50);
+        assert_eq!(
+            data.tnla_to_add[1].address.endpoint, add_v6,
+            "an IPv6 endpoint must survive: the BIT STRING is 128 bits, not 32"
+        );
+        assert_eq!(data.tnla_to_add[1].usage, Some(TnlAssociationUsage::NonUe));
+
+        assert_eq!(data.tnla_to_remove.len(), 1);
+        assert_eq!(data.tnla_to_remove[0].endpoint, remove);
+
+        assert_eq!(data.tnla_to_update.len(), 1);
+        assert_eq!(data.tnla_to_update[0].address.endpoint, update);
+        assert_eq!(data.tnla_to_update[0].usage, Some(TnlAssociationUsage::Ue));
+        assert_eq!(data.tnla_to_update[0].weight_factor, Some(200));
+    }
+
+    /// The Acknowledge's setup and failed-to-setup lists round trip, and an
+    /// Acknowledge with nothing to report is still the bare positive response.
+    #[test]
+    fn the_acknowledge_reports_setup_and_failed_tnl_associations() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let ok = AmfTnlAssociationAddress {
+            endpoint: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        };
+        let bad = AmfTnlAssociationAddress {
+            endpoint: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
+        };
+
+        let bytes =
+            encode_amf_configuration_update_acknowledge(&AmfConfigurationUpdateAcknowledgeParams {
+                tnla_setup: vec![ok],
+                tnla_failed_to_setup: vec![bad],
+            })
+            .expect("encodes");
+        let data = parse_amf_configuration_update_acknowledge(&bytes).expect("decodes");
+        assert_eq!(data.tnla_setup, vec![ok]);
+        assert_eq!(
+            data.tnla_failed_to_setup,
+            vec![bad],
+            "a failure must be reported as a FAILURE; a bare acknowledge tells the \
+             AMF nothing went wrong and it would balance traffic onto an \
+             association that does not exist"
+        );
+
+        // Nothing to report: still a valid bare acknowledge, and the lists are
+        // OMITTED rather than encoded empty (both are SIZE (1..32)).
+        let bytes = encode_amf_configuration_update_acknowledge(
+            &AmfConfigurationUpdateAcknowledgeParams::default(),
+        )
+        .expect("encodes");
+        let data = parse_amf_configuration_update_acknowledge(&bytes).expect("decodes");
+        assert!(data.tnla_setup.is_empty() && data.tnla_failed_to_setup.is_empty());
+        assert!(decode_amf_configuration_update_acknowledge(&bytes).is_ok());
     }
 }

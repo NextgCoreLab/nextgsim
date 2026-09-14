@@ -161,6 +161,9 @@ impl<'a> GnbCmdHandler<'a> {
             GnbCliCommandType::UeList => self.handle_ue_list(response_addr),
             GnbCliCommandType::UeInfo { ue_id } => self.handle_ue_info(*ue_id, response_addr),
             GnbCliCommandType::UeRelease { ue_id } => self.handle_ue_release(*ue_id, response_addr),
+            GnbCliCommandType::RanConfigUpdate { amf_id } => {
+                self.handle_ran_config_update(*amf_id, response_addr)
+            }
         }
     }
 
@@ -249,6 +252,36 @@ impl<'a> GnbCmdHandler<'a> {
             response_addr,
         )
     }
+
+    /// Handles the RAN-CONFIG-UPDATE command (TS 38.413 §8.7.2, issue #41).
+    ///
+    /// Validates the target before the App task sends anything: an unknown AMF ID
+    /// is an operator typo, and answering "sent" for it would be a lie.
+    fn handle_ran_config_update(
+        &self,
+        amf_id: Option<i32>,
+        response_addr: Option<SocketAddr>,
+    ) -> CliResponse {
+        match amf_id {
+            Some(id) if !self.amf_contexts.contains_key(&id) => {
+                CliResponse::error(format!("AMF not found with ID: {id}"), response_addr)
+            }
+            Some(id) => CliResponse::success(
+                format!("Sending RAN Configuration Update to AMF {id}"),
+                response_addr,
+            ),
+            None if self.amf_contexts.is_empty() => {
+                CliResponse::error("No AMF is connected".to_string(), response_addr)
+            }
+            None => CliResponse::success(
+                format!(
+                    "Sending RAN Configuration Update to {} AMF(s)",
+                    self.amf_contexts.len()
+                ),
+                response_addr,
+            ),
+        }
+    }
 }
 
 /// Parses a CLI command string into a `GnbCliCommandType`.
@@ -261,6 +294,7 @@ impl<'a> GnbCmdHandler<'a> {
 /// - `ue-list` - List connected UEs
 /// - `ue-info <ue_id>` - Show UE details
 /// - `ue-release <ue_id>` - Release UE context
+/// - `ran-config-update [amf_id]` - Send a RAN Configuration Update (all AMFs if omitted)
 ///
 /// # Returns
 ///
@@ -295,6 +329,20 @@ pub fn parse_cli_command(input: &str) -> Result<GnbCliCommandType, String> {
                 .parse::<i32>()
                 .map_err(|_| format!("Invalid UE ID: {}", tokens[1]))?;
             Ok(GnbCliCommandType::UeRelease { ue_id })
+        }
+        // An optional AMF ID: with none, every Ready AMF is told. TS 38.413 §8.7.2
+        // is per-association, and an operator whose configuration changed means it
+        // changed for all of them.
+        "ran-config-update" => {
+            let amf_id = match tokens.get(1) {
+                None => None,
+                Some(token) => Some(
+                    token
+                        .parse::<i32>()
+                        .map_err(|_| format!("Invalid AMF ID: {token}"))?,
+                ),
+            };
+            Ok(GnbCliCommandType::RanConfigUpdate { amf_id })
         }
         _ => Err(format!("Unknown command: {}", tokens[0])),
     }
@@ -627,5 +675,47 @@ mod tests {
         assert!(parse_cli_command("INFO").is_ok());
         assert!(parse_cli_command("Status").is_ok());
         assert!(parse_cli_command("UE-LIST").is_ok());
+    }
+
+    /// #41, criterion 6: the operator-facing entry point for RAN CONFIGURATION
+    /// UPDATE parses, with and without an AMF ID.
+    #[test]
+    fn ran_config_update_parses_with_and_without_an_amf_id() {
+        assert!(matches!(
+            parse_cli_command("ran-config-update").expect("parses"),
+            GnbCliCommandType::RanConfigUpdate { amf_id: None }
+        ));
+        assert!(matches!(
+            parse_cli_command("ran-config-update 3").expect("parses"),
+            GnbCliCommandType::RanConfigUpdate { amf_id: Some(3) }
+        ));
+        // A non-numeric argument is an error rather than being read as "all AMFs",
+        // which would silently do something broader than the operator asked.
+        assert!(parse_cli_command("ran-config-update all").is_err());
+    }
+
+    /// An unknown AMF ID is refused before anything is sent: answering "sent" for
+    /// an AMF that does not exist would be a lie, and the App task only forwards
+    /// to NGAP when the response is not an error.
+    #[test]
+    fn ran_config_update_refuses_an_unknown_amf_and_an_empty_pool() {
+        let ue_contexts = HashMap::new();
+        let amf_contexts = HashMap::new();
+        let task_base = create_task_base(GnbConfig::default());
+        let status_info = GnbStatusInfo::new();
+        let handler = GnbCmdHandler::new(&task_base, &status_info, &ue_contexts, &amf_contexts);
+
+        let response = handler.handle_command(
+            &GnbCliCommandType::RanConfigUpdate { amf_id: Some(7) },
+            None,
+        );
+        assert!(response.is_error, "an unknown AMF ID must be refused");
+
+        let response =
+            handler.handle_command(&GnbCliCommandType::RanConfigUpdate { amf_id: None }, None);
+        assert!(
+            response.is_error,
+            "with no AMF connected there is nothing to update"
+        );
     }
 }

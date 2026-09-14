@@ -225,6 +225,17 @@ pub enum GnbCliCommandType {
     UeInfo { ue_id: i32 },
     /// Release UE context
     UeRelease { ue_id: i32 },
+    /// Send a RAN CONFIGURATION UPDATE to a connected AMF
+    /// (TS 38.413 §8.7.2, issue #41).
+    ///
+    /// Operator-triggered because that is what the procedure is FOR: it tells the
+    /// AMF that the NG-RAN node's application-level configuration changed, and
+    /// nothing changes a simulator's configuration except an operator. Inventing an
+    /// automatic trigger would mean inventing a configuration change.
+    RanConfigUpdate {
+        /// Which AMF (its SCTP client ID), or `None` for every Ready AMF
+        amf_id: Option<i32>,
+    },
 }
 
 // ============================================================================
@@ -293,6 +304,12 @@ pub enum NgapMessage {
         ue_id: i32,
         /// Release cause
         cause: UeReleaseRequestCause,
+    },
+    /// Send a RAN CONFIGURATION UPDATE (TS 38.413 §8.7.2, issue #41), from the
+    /// CLI.
+    SendRanConfigurationUpdate {
+        /// Which AMF, or `None` for every Ready AMF
+        amf_id: Option<i32>,
     },
     /// PDU Session Resource Notify (TS 38.413 §8.3.5, issue #98): tell the AMF
     /// that specific PDU sessions are released, or that specific QoS flows are no
