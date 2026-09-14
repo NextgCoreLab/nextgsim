@@ -71,6 +71,66 @@ upf_port: 2152
 # UEs discovering cells from RLS heartbeats only (the pre-#21 behaviour).
 si_broadcast_period_ms: 80
 
+# Idle-mode cell reselection parameters this cell broadcasts in SIB2/SIB3/SIB4
+# (TS 38.331 §6.3.1), i.e. the inputs to the TS 38.304 §5.2.4.6 R-criterion:
+#
+#   R_s = Q_meas,s + q_hyst        (serving cell)
+#   R_n = Q_meas,n - q_offset_db   (neighbour cell)
+#
+# and a neighbour is reselected once R_n > R_s has held for t_reselection_s.
+#
+# Before these were broadcast the UE took q_hyst and t_reselection from
+# compile-time constants and had no per-cell offset or reselection priority at
+# all, so a cell could not influence its own mobility. The defaults below
+# reproduce those constants, so leaving this block out broadcasts what the UE
+# used to assume.
+reselection:
+  # false restores the pre-#50 behaviour: no SIB2/3/4 on the air, and the UE
+  # falls back to its constants (and logs that it did).
+  broadcast: true
+  # dB. Must be one of the values TS 38.331 enumerates: 0-6 in 1 dB steps, then
+  # 8, 10, 12 ... 24. A value outside the set fails the SIB2 build rather than
+  # being rounded, so 7 is rejected instead of silently becoming 6 or 8.
+  q_hyst_db: 4
+  # Seconds, 0-7. 0 means no time-to-trigger: a better-ranked neighbour wins on
+  # the evaluation that first sees it.
+  t_reselection_s: 1
+  # This frequency's cellReselectionPriority, 0-7.
+  cell_reselection_priority: 4
+  # s-IntraSearchP in units of 2 dB, 0-31. 31 (62 dB) means "always measure
+  # intra-frequency neighbours".
+  s_intra_search_p: 31
+  # threshServingLowP in units of 2 dB, 0-31.
+  thresh_serving_low_p: 4
+  # SIB3 intraFreqNeighCellList: per-neighbour q-OffsetCell, SUBTRACTED from that
+  # neighbour's level in R_n, so a POSITIVE value makes it less attractive.
+  #
+  # phys_cell_id is the neighbour's PCI. This tree derives a cell's PCI from its
+  # NR Cell Identity (nci % 1008), because a real PCI comes from the SSB and
+  # there is no PHY here -- so for a neighbouring gNB with nci: 0x2000 the value
+  # is 0x2000 % 1008.
+  #
+  # Legal q_offset_db values: -24..-6 and 6..24 in 2 dB steps, -5..5 in 1 dB
+  # steps. Empty means no neighbour list, and every neighbour is ranked with
+  # Qoffset = 0.
+  intra_freq_neighbours: []
+  #  - phys_cell_id: 128
+  #    q_offset_db: -3
+  #
+  # SIB4 interFreqCarrierFreqList, and also the DEDICATED cellReselectionPriorities
+  # handed to a UE in RRCRelease. Empty means no SIB4 is broadcast at all (its
+  # list is SIZE (1..maxFreq), so a zero-length list is not encodable) and
+  # RRCRelease carries no dedicated priorities -- which is NOT the same as
+  # carrying an empty list, since an empty one tells the UE to DELETE its stored
+  # dedicated priorities (TS 38.304 §5.2.4.1).
+  inter_freq_carriers: []
+  #  - dl_carrier_freq: 632628
+  #    cell_reselection_priority: 3
+  #    thresh_x_high_p: 8
+  #    thresh_x_low_p: 4
+  #    q_rx_lev_min: -70
+  #    t_reselection_s: 1
+
 # Accept a raw NAS PDU on UL-DCCH from a UE that never sent an
 # RRCSetupComplete, auto-creating its context and forwarding the NAS as an
 # Initial UE Message.

@@ -353,6 +353,18 @@ pub enum NasMessage {
         /// on exactly that distinction, the TS 23.122 §4.4.3.3 higher-priority
         /// search could never fire.
         serving_plmn: Option<crate::rrc::cell_selection::Plmn>,
+        /// Whether the camped cell is SUITABLE (normal service) or only
+        /// ACCEPTABLE (limited service only) per TS 38.304 §4.4 (issue #50).
+        ///
+        /// This decides which registration NAS may attempt: TS 23.122 §3.3 allows
+        /// only EMERGENCY registration in the limited-service state, so a UE that
+        /// attempted normal initial registration on an acceptable-only cell would
+        /// be claiming a service the cell cannot give it.
+        ///
+        /// Carried on this message rather than queried from RRC because the
+        /// category is a property of the CAMP, decided by the selection that just
+        /// happened -- asking afterwards would race a subsequent reselection.
+        cell_category: crate::rrc::cell_selection::CellCategory,
     },
     /// Serving-cell measurements (from RRC), the raw material of an E-CID
     /// positioning report (issue #46, TS 37.355 §6.5.4).

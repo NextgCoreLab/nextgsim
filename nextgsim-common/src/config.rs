@@ -182,6 +182,15 @@ pub struct GnbConfig {
     /// NTN (Non-Terrestrial Network) configuration (optional)
     #[serde(default)]
     pub ntn_config: Option<NtnConfig>,
+    /// Idle-mode cell reselection parameters this cell broadcasts in SIB2/SIB3/
+    /// SIB4 (TS 38.331 §6.3.1, TS 38.304 §5.2.4.6). Issue #50.
+    ///
+    /// Deserialised from the `reselection` key. Defaults are the values the UE
+    /// previously hardcoded, so a config that says nothing broadcasts what the UE
+    /// used to assume — the point of the issue being that the UE should learn
+    /// them rather than assume them, not that they should change.
+    #[serde(default, rename = "reselection", alias = "reselection_config")]
+    pub reselection: CellReselectionBroadcastConfig,
     /// MBS (Multicast/Broadcast) support enabled (Rel-17, TS 23.247)
     #[serde(default)]
     pub mbs_enabled: bool,
@@ -382,6 +391,7 @@ impl Default for GnbConfig {
             scell_phys_cell_id: None,
             pqc_config: PqcConfig::default(),
             ntn_config: None,
+            reselection: CellReselectionBroadcastConfig::default(),
             mbs_enabled: false,
             prose_enabled: false,
             lcs_enabled: false,
@@ -668,6 +678,166 @@ pub struct SnpnConfig {
 /// LTE cell of this strength is there", which is enough to exercise the inter-RAT
 /// trigger logic and honest about not being a propagation result: the level never
 /// changes with distance, fading or the channel model.
+/// Idle-mode cell reselection parameters a cell broadcasts (issue #50).
+///
+/// These are the inputs to the TS 38.304 §5.2.4.6 R-criterion. The UE used to
+/// take `q_hyst_db` and `t_reselection_s` from compile-time constants
+/// (`DEFAULT_Q_HYST_DB`, `CELL_RESELECTION_TIME_TO_TRIGGER_MS`) and had no
+/// concept of the others; broadcasting them is what lets a cell decide its own
+/// mobility behaviour.
+///
+/// The defaults reproduce the constants the UE previously hardcoded, so an
+/// existing config broadcasts what the UE used to assume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellReselectionBroadcastConfig {
+    /// Whether to broadcast SIB2/SIB3/SIB4 at all.
+    ///
+    /// **`true` by default.** Unlike the switches this tree usually defaults off,
+    /// broadcasting these is what makes the UE's reselection parameters come from
+    /// the network instead of from a constant, and defaulting it off would leave
+    /// the headline defect unfixed in the shipped configuration. A cell that
+    /// genuinely wants the pre-#50 behaviour sets this to `false`, and the UE
+    /// then falls back to its constants with a log line saying so.
+    #[serde(default = "default_true")]
+    pub broadcast: bool,
+    /// `q-Hyst` in dB — added to the SERVING cell's level in `R_s`, so it is the
+    /// margin a neighbour must beat.
+    ///
+    /// Must be one of the values TS 38.331 enumerates (0-6 in 1 dB steps, then
+    /// 8-24 in 2 dB steps); anything else fails the SIB2 build rather than being
+    /// rounded, because a silently adjusted hysteresis surfaces as a flaky
+    /// margin comparison rather than as a configuration error.
+    #[serde(default = "default_q_hyst_db")]
+    pub q_hyst_db: i32,
+    /// `t-ReselectionNR` in seconds (0..7) — how long a neighbour must stay
+    /// better ranked before the UE reselects.
+    ///
+    /// The UE's old constant was 1000 ms, so the default is 1 s.
+    #[serde(default = "default_t_reselection_s")]
+    pub t_reselection_s: u8,
+    /// `cellReselectionPriority` of this cell's own frequency (0..7).
+    #[serde(default = "default_cell_reselection_priority")]
+    pub cell_reselection_priority: u8,
+    /// `s-IntraSearchP` in units of 2 dB (0..31) — the threshold below which the
+    /// UE starts measuring intra-frequency neighbours. The default of 31 (62 dB)
+    /// means "always measure", which is what the UE did before this existed.
+    #[serde(default = "default_s_intra_search_p")]
+    pub s_intra_search_p: u8,
+    /// `threshServingLowP` in units of 2 dB (0..31).
+    #[serde(default = "default_thresh_serving_low_p")]
+    pub thresh_serving_low_p: u8,
+    /// Intra-frequency neighbours and their per-cell `q-OffsetCell`, broadcast in
+    /// SIB3. Up to 16 (the `IntraFreqNeighCellList` bound).
+    ///
+    /// Empty (the default) means SIB3 carries no neighbour list, and every
+    /// neighbour is then ranked with `Qoffset = 0`.
+    #[serde(default)]
+    pub intra_freq_neighbours: Vec<IntraFreqNeighbourConfig>,
+    /// Other carriers and their reselection priorities, broadcast in SIB4.
+    ///
+    /// Empty (the default) means no SIB4 is broadcast at all, rather than a SIB4
+    /// with an empty list: `interFreqCarrierFreqList` is `SIZE (1..maxFreq)` and
+    /// a zero-length list is not encodable.
+    #[serde(default)]
+    pub inter_freq_carriers: Vec<InterFreqCarrierConfig>,
+}
+
+impl Default for CellReselectionBroadcastConfig {
+    fn default() -> Self {
+        Self {
+            broadcast: default_true(),
+            q_hyst_db: default_q_hyst_db(),
+            t_reselection_s: default_t_reselection_s(),
+            cell_reselection_priority: default_cell_reselection_priority(),
+            s_intra_search_p: default_s_intra_search_p(),
+            thresh_serving_low_p: default_thresh_serving_low_p(),
+            intra_freq_neighbours: Vec::new(),
+            inter_freq_carriers: Vec::new(),
+        }
+    }
+}
+
+/// One SIB3 `intraFreqNeighCellList` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntraFreqNeighbourConfig {
+    /// `physCellId` (0..1007) of the neighbour.
+    ///
+    /// This tree derives a cell's PCI from its NR Cell Identity
+    /// (`phys_cell_id_from_nci`, the convention recorded for #37, because a real
+    /// PCI comes from the SSB and there is no PHY here). So the value to put
+    /// here for a neighbouring gNB is `nci % 1008` of that gNB's `nci`.
+    pub phys_cell_id: u16,
+    /// `q-OffsetCell` in dB — SUBTRACTED from this neighbour's level in `R_n`,
+    /// so POSITIVE makes the neighbour less attractive.
+    ///
+    /// Must be one of the values TS 38.331 enumerates (-24..-6 and 6..24 in 2 dB
+    /// steps, -5..5 in 1 dB steps).
+    #[serde(default)]
+    pub q_offset_db: i32,
+}
+
+/// One SIB4 `interFreqCarrierFreqList` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterFreqCarrierConfig {
+    /// `dl-CarrierFreq` (ARFCN) of the other carrier
+    pub dl_carrier_freq: u32,
+    /// `cellReselectionPriority` for this carrier (0..7)
+    pub cell_reselection_priority: u8,
+    /// `threshX-HighP` in units of 2 dB (0..31)
+    #[serde(default = "default_thresh_x_high_p")]
+    pub thresh_x_high_p: u8,
+    /// `threshX-LowP` in units of 2 dB (0..31)
+    #[serde(default = "default_thresh_x_low_p")]
+    pub thresh_x_low_p: u8,
+    /// `q-RxLevMin` in units of 2 dBm
+    #[serde(default = "default_inter_freq_q_rx_lev_min")]
+    pub q_rx_lev_min: i8,
+    /// `t-ReselectionNR` for this carrier, in seconds (0..7)
+    #[serde(default = "default_t_reselection_s")]
+    pub t_reselection_s: u8,
+}
+
+/// 4 dB, the UE's former `DEFAULT_Q_HYST_DB`.
+fn default_q_hyst_db() -> i32 {
+    4
+}
+
+/// 1 s, the UE's former `CELL_RESELECTION_TIME_TO_TRIGGER_MS` of 1000 ms.
+fn default_t_reselection_s() -> u8 {
+    1
+}
+
+/// Mid-range. TS 38.304 §5.2.4.1 never reselects to a LOWER-priority frequency
+/// while the serving one is good enough, so a cell that gave itself 0 could not
+/// be left for an equal-priority neighbour under the priority rules.
+fn default_cell_reselection_priority() -> u8 {
+    4
+}
+
+/// 31 (62 dB), the maximum: "always measure intra-frequency neighbours", which is
+/// what the UE did before `s-IntraSearchP` existed here.
+fn default_s_intra_search_p() -> u8 {
+    31
+}
+
+fn default_thresh_serving_low_p() -> u8 {
+    4
+}
+
+fn default_thresh_x_high_p() -> u8 {
+    8
+}
+
+fn default_thresh_x_low_p() -> u8 {
+    4
+}
+
+/// -70 in units of 2 dBm, i.e. -140 dBm: the most permissive the range allows,
+/// matching the gNB's SIB1 `Q_RX_LEV_MIN` for the same reason.
+fn default_inter_freq_q_rx_lev_min() -> i8 {
+    -70
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EutraNeighbourConfig {
     /// E-UTRA carrier frequency (EARFCN). `measObjectEUTRA` is per carrier, and

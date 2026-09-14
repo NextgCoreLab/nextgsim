@@ -80,7 +80,10 @@ pub struct PagingSchedule {
 const TAI_OCTETS: usize = 6;
 
 use super::connection::{ReestablishmentRequest, RrcConnectionManager};
-use super::system_info::{encode_cell_mib, encode_cell_sib1};
+use super::system_info::{
+    encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
+    release_cell_reselection_priorities,
+};
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
 use super::ue_context::{ReestablishmentSecurity, RrcUeContextManager};
 
@@ -1074,10 +1077,11 @@ impl RrcTask {
     }
 
     async fn handle_an_release(&mut self, ue_id: i32) {
-        if let Some(result) = self
-            .connection_manager
-            .initiate_rrc_release(&mut self.ue_manager, ue_id)
-        {
+        if let Some(result) = self.connection_manager.initiate_rrc_release(
+            &mut self.ue_manager,
+            ue_id,
+            release_cell_reselection_priorities(&self.task_base.config),
+        ) {
             self.send_rrc_message(result.ue_id, result.channel, result.rrc_release_pdu)
                 .await;
         }
@@ -1264,6 +1268,22 @@ impl RrcTask {
                     .await;
             }
             Err(e) => error!("Failed to encode SIB1: {e}"),
+        }
+        // SIB2/SIB3/SIB4 (issue #50), on the SAME channel as SIB1 but the other
+        // arm of the BCCH-DL-SCH CHOICE. Scheduled with SIB1 rather than on their
+        // own cadence: TS 38.331 §5.2.1 lets a cell choose, and a UE that has
+        // just read SIB1 is exactly the UE that needs the reselection parameters.
+        //
+        // `None` means the operator turned the broadcast off, which is not an
+        // error -- the UE falls back to its constants and logs that it did.
+        if let Some(result) = encode_cell_system_information(&self.task_base.config) {
+            match result {
+                Ok(si) => {
+                    self.broadcast_rrc_message(RrcChannel::BcchDlSch, OctetString::from_slice(&si))
+                        .await;
+                }
+                Err(e) => error!("Failed to encode SIB2/3/4 SystemInformation: {e}"),
+            }
         }
     }
 

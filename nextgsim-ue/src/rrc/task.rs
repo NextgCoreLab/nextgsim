@@ -45,7 +45,7 @@ use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
-use nextgsim_rrc::codec::{decode_rrc, CellGroupConfig, RadioBearerConfig};
+use nextgsim_rrc::codec::{decode_rrc, BCCH_DL_SCH_Message, CellGroupConfig, RadioBearerConfig};
 use nextgsim_rrc::procedures::conditional_handover::decode_cho_config;
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
@@ -58,6 +58,7 @@ use nextgsim_rrc::procedures::rrc_reestablishment::{
     encode_rrc_reestablishment_request, phys_cell_id_from_nci, ReestablishmentCauseValue,
     ReestablishmentUeIdentity, RrcReestablishmentCompleteParams, RrcReestablishmentRequestParams,
 };
+use nextgsim_rrc::procedures::rrc_release::{decode_rrc_release, CellReselectionPrioritiesParams};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup, encode_rrc_setup_complete, encode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
@@ -69,8 +70,8 @@ use nextgsim_rrc::procedures::security_mode::{
     SecurityModeCompleteParams,
 };
 use nextgsim_rrc::procedures::system_information::{
-    decode_mib, decode_sib1, CellBarredStatus, IntraFreqReselection,
-    PlmnIdentity as SibPlmnIdentity,
+    decode_mib, is_system_information, parse_sib1, parse_system_information, CellBarredStatus,
+    IntraFreqReselection, PlmnIdentity as SibPlmnIdentity,
 };
 use nextgsim_rrc::procedures::ue_capability::{
     build_minimal_nr_capability_container, decode_ue_capability_enquiry,
@@ -488,6 +489,19 @@ impl RrcTask {
         }
     }
 
+    /// Clears the `CELL_SELECTION_INTERVAL_MS` throttle so the next
+    /// [`Self::perform_cycle`] re-evaluates immediately.
+    ///
+    /// Test-only. `perform_cell_selection` deliberately rate-limits itself, so
+    /// without this a reselection test would have to sleep for the interval
+    /// between every signal change — and a test that sleeps for real time is the
+    /// kind that becomes flaky under load. The alternative was to make the
+    /// interval configurable in production for a test's benefit, which is worse.
+    #[cfg(test)]
+    fn force_cell_selection_now(&mut self) {
+        self.last_cell_selection = None;
+    }
+
     /// Perform cell selection
     async fn perform_cell_selection(&mut self) {
         // Check if enough time has passed since last selection
@@ -544,6 +558,10 @@ impl RrcTask {
                         // SIB1 has not been read, so a selected cell's PLMN is one
                         // the cell BROADCAST rather than one the UE assumed.
                         serving_plmn: Some(selected_cell.plmn),
+                        // TS 38.304 §4.4: a SUITABLE cell gives normal service, an
+                        // ACCEPTABLE one only limited service. NAS decides which
+                        // registration to attempt from this (issue #50).
+                        cell_category: selected_cell.category,
                     })
                     .await
                 {
@@ -949,7 +967,7 @@ impl RrcTask {
                 self.handle_pcch_message(cell_id, &pdu).await;
             }
             RrcChannel::BcchBch => self.handle_broadcast_mib(cell_id, &pdu),
-            RrcChannel::BcchDlSch => self.handle_broadcast_sib1(cell_id, &pdu),
+            RrcChannel::BcchDlSch => self.handle_broadcast_bcch_dl_sch(cell_id, &pdu),
             _ => {
                 warn!("Unexpected downlink channel: {:?}", channel);
             }
@@ -1005,16 +1023,116 @@ impl RrcTask {
         );
     }
 
+    /// Dispatches a BCCH-DL-SCH PDU on the arm of its `BCCH-DL-SCH-Message`
+    /// CHOICE (issue #50).
+    ///
+    /// SIB1 and `SystemInformation` (which carries SIB2/SIB3/SIB4) share this
+    /// channel. Before SIB2/3/4 existed the handler called `decode_sib1`
+    /// unconditionally, so every `SystemInformation` broadcast would have been
+    /// logged as a SIB1 decode failure -- a warning per SI period, and the
+    /// reselection parameters silently never read.
+    fn handle_broadcast_bcch_dl_sch(&mut self, cell_id: i32, pdu: &OctetString) {
+        let msg: BCCH_DL_SCH_Message = match decode_rrc(pdu.data()) {
+            Ok(msg) => msg,
+            Err(e) => {
+                warn!("Failed to decode BCCH-DL-SCH PDU from cell {cell_id}: {e}");
+                return;
+            }
+        };
+        if is_system_information(&msg) {
+            self.handle_broadcast_system_information(cell_id, &msg);
+        } else {
+            self.handle_broadcast_sib1_message(cell_id, &msg);
+        }
+    }
+
+    /// Handles a broadcast `SystemInformation` carrying SIB2/SIB3/SIB4
+    /// (TS 38.331 §6.3.1, issue #50).
+    ///
+    /// This is where the UE stops assuming its reselection parameters. Before
+    /// this, `Q_hyst` and `Treselection` were the compile-time constants
+    /// `DEFAULT_Q_HYST_DB` and `CELL_RESELECTION_TIME_TO_TRIGGER_MS`, and there
+    /// was no per-cell `Qoffset` or reselection priority at all.
+    ///
+    /// Only the SERVING cell's SI is applied. A neighbour's SIB2 describes that
+    /// neighbour's reselection behaviour, and applying it would let whichever cell
+    /// broadcast most recently set this UE's hysteresis. While no cell is camped
+    /// the first SI read is applied, because a UE that has not camped yet has no
+    /// serving cell to prefer and needs some parameters to camp with.
+    fn handle_broadcast_system_information(&mut self, cell_id: i32, msg: &BCCH_DL_SCH_Message) {
+        let serving = self.serving_cell_id;
+        if serving.is_some_and(|serving| serving != cell_id) {
+            debug!(
+                "Ignoring SystemInformation from non-serving cell {cell_id} \
+                 (camped on {serving:?}): a neighbour's SIB2 describes that \
+                 neighbour's reselection behaviour, not this UE's"
+            );
+            return;
+        }
+
+        let si = match parse_system_information(msg) {
+            Ok(si) => si,
+            Err(e) => {
+                warn!("Failed to parse SystemInformation from cell {cell_id}: {e}");
+                return;
+            }
+        };
+        if si.is_empty() {
+            // Legal: a cell may schedule only SIB5..SIB9 in a message. Not a
+            // warning, or a cell that broadcast SIB5 would log an error per period.
+            debug!("SystemInformation from cell {cell_id} carried no SIB this UE models");
+            return;
+        }
+
+        if let Some(sib2) = si.sib2.as_ref() {
+            info!(
+                "SIB2 from cell {cell_id}: q-Hyst={} dB, t-ReselectionNR={} s, \
+                 cellReselectionPriority={} (reselection parameters now come from \
+                 the network, not from this UE's constants)",
+                sib2.q_hyst_db, sib2.t_reselection_s, sib2.cell_reselection_priority
+            );
+            self.cell_selector.apply_sib2(
+                sib2.q_hyst_db,
+                sib2.t_reselection_s,
+                sib2.cell_reselection_priority,
+            );
+        }
+        if let Some(sib3) = si.sib3.as_ref() {
+            let offsets: Vec<(u16, i32)> = sib3
+                .intra_freq_neighbours
+                .iter()
+                .map(|n| (n.phys_cell_id, n.q_offset_db))
+                .collect();
+            debug!(
+                "SIB3 from cell {cell_id}: {} intra-frequency neighbour offsets",
+                offsets.len()
+            );
+            self.cell_selector.apply_sib3(&offsets);
+        }
+        if let Some(sib4) = si.sib4.as_ref() {
+            let carriers: Vec<(u32, u8)> = sib4
+                .inter_freq_carriers
+                .iter()
+                .map(|c| (c.dl_carrier_freq, c.cell_reselection_priority))
+                .collect();
+            debug!(
+                "SIB4 from cell {cell_id}: {} inter-frequency carrier priorities",
+                carriers.len()
+            );
+            self.cell_selector.apply_sib4(&carriers);
+        }
+    }
+
     /// Handles a broadcast SIB1 on BCCH-DL-SCH (TS 38.331 §6.3.2).
     ///
     /// This is where the UE learns what the cell actually is: its PLMN, TAC and
     /// NR Cell Identity, rather than the values `provide_simulated_system_info`
     /// invents from the UE's own configuration.
-    fn handle_broadcast_sib1(&mut self, cell_id: i32, pdu: &OctetString) {
-        let sib1 = match decode_sib1(pdu.data()) {
+    fn handle_broadcast_sib1_message(&mut self, cell_id: i32, msg: &BCCH_DL_SCH_Message) {
+        let sib1 = match parse_sib1(msg) {
             Ok(sib1) => sib1,
             Err(e) => {
-                warn!("Failed to decode broadcast SIB1 from cell {cell_id}: {e}");
+                warn!("Failed to parse broadcast SIB1 from cell {cell_id}: {e}");
                 return;
             }
         };
@@ -1281,6 +1399,20 @@ impl RrcTask {
             0x0D => {
                 // RRC Release
                 info!("Received RRC Release from cell {}", cell_id);
+                // Dedicated cellReselectionPriorities, when the release carries
+                // them (TS 38.331 §6.3.2, TS 38.304 §5.2.4.1, issue #50). Applied
+                // BEFORE the release is processed, because the list governs the
+                // idle mode the UE is about to enter.
+                //
+                // A decode failure is not reported as an error: the gNB falls
+                // back to a hand-built byte PDU when UPER encoding fails, and that
+                // PDU is a legitimate release this UE must still act on. What is
+                // lost in that case is only the optional IE.
+                if let Ok(release) = decode_rrc_release(bytes) {
+                    self.apply_dedicated_reselection_priorities(
+                        release.cell_reselection_priorities,
+                    );
+                }
                 // If a resume was in progress, the network is rejecting it
                 if self.resume_proc.is_in_progress() {
                     self.resume_proc
@@ -1635,6 +1767,46 @@ impl RrcTask {
                 warn!("RRCReestablishment handling failed: {}", e);
             }
         }
+    }
+
+    /// Applies (or clears) the dedicated `cellReselectionPriorities` an RRCRelease
+    /// carried (TS 38.331 §6.3.2, TS 38.304 §5.2.4.1, issue #50).
+    ///
+    /// Three distinct cases, and conflating any two of them is the trap:
+    ///
+    /// - **IE absent** — the network said nothing about priorities, so the UE keeps
+    ///   whatever it has. NOT the same as being told to forget them.
+    /// - **IE present with entries** — dedicated priorities that override the
+    ///   broadcast ones while they are valid.
+    /// - **IE present and empty** — TS 38.304 has the UE DELETE its stored
+    ///   dedicated priorities and fall back to broadcast. This is why an empty list
+    ///   cannot be treated as absent.
+    fn apply_dedicated_reselection_priorities(
+        &mut self,
+        priorities: Option<CellReselectionPrioritiesParams>,
+    ) {
+        let Some(priorities) = priorities else {
+            debug!("RRCRelease carried no cellReselectionPriorities; keeping current priorities");
+            return;
+        };
+        let carriers: Vec<(u32, u8)> = priorities
+            .freq_priority_list_nr
+            .iter()
+            .map(|f| (f.carrier_freq, f.priority))
+            .collect();
+        if carriers.is_empty() {
+            info!(
+                "RRCRelease carried an EMPTY cellReselectionPriorities: deleting the \
+                 dedicated priorities and falling back to broadcast (TS 38.304 §5.2.4.1)"
+            );
+        } else {
+            info!(
+                "RRCRelease assigned {} dedicated carrier reselection priorities",
+                carriers.len()
+            );
+        }
+        self.cell_selector
+            .apply_dedicated_carrier_priorities(&carriers);
     }
 
     /// Handle RRC Release message
@@ -4349,5 +4521,394 @@ mod tests {
         });
 
         assert!(try_take_paging(&mut nas_rx).is_none());
+    }
+
+    // ========================================================================
+    // Idle-mode cell reselection from broadcast parameters (issue #50)
+    // ========================================================================
+
+    /// Encodes a `SystemInformation` carrying SIB2 (and optionally SIB3
+    /// neighbour offsets), the way the gNB broadcasts it.
+    fn broadcast_reselection_si(
+        q_hyst_db: i32,
+        t_reselection_s: u8,
+        neighbours: &[(u16, i32)],
+    ) -> Vec<u8> {
+        use nextgsim_rrc::procedures::system_information::{
+            encode_system_information, IntraFreqNeighbour, Sib2Params, Sib3Params,
+            SystemInformationParams,
+        };
+        encode_system_information(&SystemInformationParams {
+            sib2: Some(Sib2Params {
+                q_hyst_db,
+                t_reselection_s,
+                cell_reselection_priority: 6,
+                q_rx_lev_min: -70,
+                s_intra_search_p: 31,
+                thresh_serving_low_p: 4,
+            }),
+            sib3: if neighbours.is_empty() {
+                None
+            } else {
+                Some(Sib3Params {
+                    intra_freq_neighbours: neighbours
+                        .iter()
+                        .map(|&(phys_cell_id, q_offset_db)| IntraFreqNeighbour {
+                            phys_cell_id,
+                            q_offset_db,
+                        })
+                        .collect(),
+                })
+            },
+            sib4: None,
+        })
+        .expect("the reselection SI must encode")
+    }
+
+    /// #50, criterion 2 and criterion 3: a camped idle UE takes `Q_hyst` and
+    /// `Treselection` from BROADCAST SIB2 rather than from the compile-time
+    /// constants, and this runs on the production `RrcTask` path — not a
+    /// test-only construction of the reselection logic.
+    #[test]
+    fn a_camped_ue_takes_q_hyst_and_t_reselection_from_broadcast_sib2() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        // Values that are NOT the constants, so the assertion cannot pass on the
+        // defaults: DEFAULT_Q_HYST_DB is 4 and the default t_reselection is 1000 ms.
+        let si = broadcast_reselection_si(10, 3, &[]);
+
+        run_async(async {
+            task.handle_signal_changed(1, -60).await;
+            task.perform_cycle().await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(1),
+                "must camp before broadcasting"
+            );
+            task.handle_downlink_rrc(1, RrcChannel::BcchDlSch, OctetString::from_slice(&si))
+                .await;
+        });
+
+        let params = task.cell_selector.reselection_params();
+        assert!(
+            params.from_broadcast,
+            "the parameters must be marked as coming from the network"
+        );
+        assert_eq!(
+            params.q_hyst, 10,
+            "q-Hyst must come from SIB2, not DEFAULT_Q_HYST_DB"
+        );
+        assert_eq!(
+            params.t_reselection, 3000,
+            "t-ReselectionNR is in SECONDS on the wire and milliseconds here"
+        );
+        assert_eq!(params.serving_priority, Some(6));
+    }
+
+    /// The R-criterion itself: a neighbour better ranked than the serving cell by
+    /// more than the BROADCAST `Q_hyst`, held for longer than the BROADCAST
+    /// `Treselection`, causes a reselection — and one held for less does not.
+    ///
+    /// `t_reselection_s: 0` makes the time-to-trigger elapse immediately, so the
+    /// test asserts the criterion rather than sleeping. A separate assertion
+    /// covers the not-yet-elapsed case with a non-zero timer.
+    #[test]
+    fn a_camped_ue_reselects_a_neighbour_that_beats_r_s_for_t_reselection() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        // q-Hyst 6 dB, Treselection 0 s.
+        let si = broadcast_reselection_si(6, 0, &[]);
+
+        run_async(async {
+            task.handle_signal_changed(1, -80).await;
+            task.perform_cycle().await;
+            assert_eq!(task.serving_cell_id, Some(1));
+            task.handle_downlink_rrc(1, RrcChannel::BcchDlSch, OctetString::from_slice(&si))
+                .await;
+
+            // R_s = -80 + 6 = -74. A neighbour at -76 does NOT beat it.
+            task.handle_signal_changed(2, -76).await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(1),
+                "a neighbour inside the broadcast hysteresis must not win: \
+                 R_n = -76 is not > R_s = -80 + 6"
+            );
+
+            // A neighbour at -70 does: R_n = -70 > R_s = -74.
+            task.handle_signal_changed(2, -70).await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(2),
+                "R_n = -70 beats R_s = -74 and Treselection is 0 s, so the UE \
+                 must reselect"
+            );
+        });
+    }
+
+    /// `Treselection` is honoured: the same margin that reselected above does
+    /// nothing while the candidate has not been better for long enough.
+    #[test]
+    fn a_better_neighbour_does_not_win_before_t_reselection_elapses() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        // Same 6 dB hysteresis, but a 7 s timer that cannot elapse during the test.
+        let si = broadcast_reselection_si(6, 7, &[]);
+
+        run_async(async {
+            task.handle_signal_changed(1, -80).await;
+            task.perform_cycle().await;
+            task.handle_downlink_rrc(1, RrcChannel::BcchDlSch, OctetString::from_slice(&si))
+                .await;
+
+            task.handle_signal_changed(2, -70).await;
+            // Twice, because the first evaluation only ARMS the candidate.
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(1),
+                "the neighbour is better ranked but has not held it for the \
+                 broadcast Treselection of 7 s"
+            );
+        });
+    }
+
+    /// The `Qoffset` term of `R_n`, which did not exist before: the SAME signal
+    /// levels that reselect with no offset must NOT reselect once SIB3 gives the
+    /// neighbour a positive `q-OffsetCell`.
+    ///
+    /// This is the assertion the old `best_dbm > current_dbm + q_hyst`
+    /// comparison could not make, because it had no per-cell term at all.
+    #[test]
+    fn a_broadcast_q_offset_cell_makes_a_neighbour_less_attractive() {
+        // The neighbour's PCI is derived from the NCI its SIB1 broadcast, the
+        // same way the gNB derives it (the #37 convention). Its PLMN must be the
+        // UE's own configured one (the default config's 0-00), or the cell is
+        // out-of-PLMN and cell selection never considers it suitable -- which
+        // would make this test pass for the wrong reason.
+        let hplmn = test_config().hplmn;
+        let (mib2, sib1_cell2) = broadcast_si(0x2000, 42, hplmn.mcc, hplmn.mnc, hplmn.long_mnc);
+        let neighbour_pci = phys_cell_id_from_nci(0x2000);
+
+        // Control: no SIB3 offset, so R_n = -70 > R_s = -80 + 6 and it reselects.
+        let (task_base, _a, _n, _r, _l) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.handle_signal_changed(1, -80).await;
+            task.perform_cycle().await;
+            let si = broadcast_reselection_si(6, 0, &[]);
+            task.handle_downlink_rrc(1, RrcChannel::BcchDlSch, OctetString::from_slice(&si))
+                .await;
+            task.handle_signal_changed(2, -70).await;
+            task.handle_downlink_rrc(2, RrcChannel::BcchBch, OctetString::from_slice(&mib2))
+                .await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_cell2),
+            )
+            .await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+        });
+        assert_eq!(
+            task.serving_cell_id,
+            Some(2),
+            "control: with no q-OffsetCell the neighbour wins"
+        );
+
+        // Now the same levels, with the neighbour given a +8 dB q-OffsetCell:
+        // R_n = -70 - 8 = -78, which no longer beats R_s = -74.
+        let (task_base, _a, _n, _r, _l) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.handle_signal_changed(1, -80).await;
+            task.perform_cycle().await;
+            let si = broadcast_reselection_si(6, 0, &[(neighbour_pci, 8)]);
+            task.handle_downlink_rrc(1, RrcChannel::BcchDlSch, OctetString::from_slice(&si))
+                .await;
+            task.handle_signal_changed(2, -70).await;
+            task.handle_downlink_rrc(2, RrcChannel::BcchBch, OctetString::from_slice(&mib2))
+                .await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_cell2),
+            )
+            .await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+        });
+        assert_eq!(
+            task.cell_selector.q_offset_of(2),
+            8,
+            "the broadcast offset must be keyed to this cell by its derived PCI"
+        );
+        assert_eq!(
+            task.serving_cell_id,
+            Some(1),
+            "R_n = -70 - 8 = -78 does not beat R_s = -80 + 6 = -74, so the \
+             broadcast q-OffsetCell must keep the UE on cell 1"
+        );
+    }
+
+    /// A re-broadcast SIB3 REPLACES the stored offsets rather than merging into
+    /// them, so an offset the network withdrew stops being applied.
+    ///
+    /// Found by a revert round: making `apply_sib3` merge instead of replace left
+    /// every test green, because none of them re-broadcast a SIB3 with an entry
+    /// removed. A merge would keep applying a `Qoffset` the cell no longer
+    /// advertises, which is a stale-state defect no round trip can see.
+    #[test]
+    fn a_withdrawn_q_offset_cell_stops_being_applied() {
+        let hplmn = test_config().hplmn;
+        let (mib2, sib1_cell2) = broadcast_si(0x2000, 42, hplmn.mcc, hplmn.mnc, hplmn.long_mnc);
+        let neighbour_pci = phys_cell_id_from_nci(0x2000);
+
+        let (task_base, _a, _n, _r, _l) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_signal_changed(1, -80).await;
+            task.perform_cycle().await;
+            // The neighbour must be DISCOVERED before its broadcast can be
+            // recorded against it: `q_offset_of` keys on the PCI derived from the
+            // cell's SIB1, and a cell the UE has never heard has no entry to
+            // derive from.
+            task.handle_signal_changed(2, -70).await;
+            task.handle_downlink_rrc(2, RrcChannel::BcchBch, OctetString::from_slice(&mib2))
+                .await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_cell2),
+            )
+            .await;
+
+            // First broadcast names the neighbour with a +8 dB offset.
+            let with_offset = broadcast_reselection_si(6, 0, &[(neighbour_pci, 8)]);
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&with_offset),
+            )
+            .await;
+            assert_eq!(
+                task.cell_selector.q_offset_of(2),
+                8,
+                "positive control: the offset must be applied before its \
+                 withdrawal can be asserted"
+            );
+
+            // A later broadcast names a DIFFERENT neighbour, withdrawing the
+            // first one's offset.
+            let other_pci = neighbour_pci.wrapping_add(1) % 1008;
+            let withdrawn = broadcast_reselection_si(6, 0, &[(other_pci, 12)]);
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&withdrawn),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            task.cell_selector.q_offset_of(2),
+            0,
+            "the withdrawn q-OffsetCell must no longer be applied: SIB3 carries \
+             the cell's COMPLETE neighbour list, so merging would keep an offset \
+             the network stopped advertising"
+        );
+    }
+
+    /// A neighbour's `SystemInformation` must not set this UE's reselection
+    /// parameters: a SIB2 describes the reselection behaviour of the cell that
+    /// broadcast it. Otherwise whichever cell broadcast most recently would own
+    /// the camped UE's hysteresis.
+    #[test]
+    fn a_non_serving_cells_system_information_is_ignored() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_signal_changed(1, -60).await;
+            task.perform_cycle().await;
+            assert_eq!(task.serving_cell_id, Some(1));
+
+            // The serving cell's own SI is applied...
+            let serving_si = broadcast_reselection_si(10, 3, &[]);
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&serving_si),
+            )
+            .await;
+            assert_eq!(task.cell_selector.reselection_params().q_hyst, 10);
+
+            // ...and a neighbour's is not.
+            let neighbour_si = broadcast_reselection_si(24, 7, &[]);
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&neighbour_si),
+            )
+            .await;
+            assert_eq!(
+                task.cell_selector.reselection_params().q_hyst,
+                10,
+                "a neighbour's SIB2 must not overwrite the serving cell's"
+            );
+        });
+    }
+
+    /// A dedicated `cellReselectionPriorities` in RRCRelease is applied, and an
+    /// EMPTY one deletes the dedicated state rather than being treated as absent
+    /// (TS 38.304 §5.2.4.1).
+    #[test]
+    fn a_dedicated_reselection_priority_list_is_applied_and_an_empty_one_clears_it() {
+        use nextgsim_rrc::procedures::rrc_release::FreqPriorityNrParams;
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        // Absent: nothing stored, nothing dedicated.
+        task.apply_dedicated_reselection_priorities(None);
+        let (priorities, dedicated) = task.cell_selector.carrier_priorities();
+        assert!(priorities.is_empty() && !dedicated);
+
+        // Present with entries: stored and marked dedicated.
+        task.apply_dedicated_reselection_priorities(Some(CellReselectionPrioritiesParams {
+            freq_priority_list_nr: vec![FreqPriorityNrParams {
+                carrier_freq: 632628,
+                priority: 5,
+            }],
+            t320: None,
+        }));
+        let (priorities, dedicated) = task.cell_selector.carrier_priorities();
+        assert_eq!(priorities.get(&632628), Some(&5));
+        assert!(
+            dedicated,
+            "an assigned list is dedicated, overriding broadcast"
+        );
+
+        // Present and EMPTY: deletes the dedicated state. Distinct from absent,
+        // which is why the first case above is asserted separately.
+        task.apply_dedicated_reselection_priorities(Some(CellReselectionPrioritiesParams {
+            freq_priority_list_nr: Vec::new(),
+            t320: None,
+        }));
+        let (priorities, dedicated) = task.cell_selector.carrier_priorities();
+        assert!(
+            priorities.is_empty() && !dedicated,
+            "an empty dedicated list must delete the stored priorities and fall \
+             back to broadcast, not store an empty override"
+        );
     }
 }
