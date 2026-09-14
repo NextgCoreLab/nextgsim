@@ -824,10 +824,26 @@ pub enum NwdafMessage {
     CellLoad {
         /// Cell identifier
         cell_id: i32,
-        /// PRB usage ratio (0.0 - 1.0)
-        prb_usage: f32,
-        /// Number of connected UEs
+        /// Measured PRB occupancy ratio (0.0 - 1.0), or `None` when the sender
+        /// cannot measure one.
+        ///
+        /// Optional for the same reason `rsrp` above is: this simulator has no
+        /// PRB scheduler (see `rrc/task.rs`, where the RedCap PRB ceiling is
+        /// reported rather than enforced), so no producer can observe real PRB
+        /// occupancy. A fabricated constant is worse than `None` -- it is a
+        /// perfectly stable series that the downstream z-score detector can
+        /// never flag, and that load prediction would extrapolate as fact.
+        prb_usage: Option<f32>,
+        /// Number of UEs with a live radio association at the sender.
         connected_ues: u32,
+        /// User-plane throughput measured over the reporting window (Mbps), or
+        /// `None` when the sender counts no traffic.
+        ///
+        /// This is a *measured* quantity: the RLS task counts the uplink and
+        /// downlink data octets it actually moves. It is what lets the analytics
+        /// layer see a load series that varies with real traffic rather than one
+        /// derived from a placeholder.
+        throughput_mbps: Option<f32>,
     },
     /// Trajectory prediction request
     PredictTrajectory {
