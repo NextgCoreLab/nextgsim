@@ -222,6 +222,27 @@ pub struct GnbConfig {
     /// Integrated Sensing and Communication (ISAC) task enabled (Rel-20)
     #[serde(default)]
     pub isac_enabled: bool,
+    /// Track sensed objects with the Extended Kalman Filter instead of the
+    /// scalar-gain position smoother (issue #27).
+    ///
+    /// **`false`, the default, keeps the smoother**, so existing tracking
+    /// behaviour is unchanged. The EKF carries a real covariance and estimates
+    /// velocity as a state rather than differencing two noisy positions, and it
+    /// gates outliers on their normalised innovation -- better on a manoeuvring
+    /// or noisily-measured target, at the cost of needing a process-noise figure
+    /// that matches the target's dynamics.
+    ///
+    /// A runtime switch rather than a cargo feature, for the reason recorded for
+    /// `gtpu_echo_period_secs`: CI compiles default features only.
+    #[serde(default)]
+    pub isac_ekf_tracking: bool,
+    /// Acceleration process-noise spectral density for the ISAC EKF, in
+    /// (m/s^2)^2. `None` uses `nextgsim_isac::DEFAULT_EKF_PROCESS_NOISE_ACCEL`.
+    ///
+    /// Only consulted when `isac_ekf_tracking` is set. Too small and the filter
+    /// lags a manoeuvre; too large and it follows the measurement noise.
+    #[serde(default)]
+    pub isac_ekf_process_noise_accel: Option<f64>,
     /// ISAC anchor positions in metres [x, y, z].
     ///
     /// Defaults to a 100 m equilateral triangle at 10 m height:
@@ -351,6 +372,8 @@ impl Default for GnbConfig {
             nwdaf_enabled: false,
             nkef_enabled: false,
             isac_enabled: false,
+            isac_ekf_tracking: false,
+            isac_ekf_process_noise_accel: None,
             isac_anchors: default_isac_anchors(),
             agent_enabled: false,
             federated_learning_enabled: false,
