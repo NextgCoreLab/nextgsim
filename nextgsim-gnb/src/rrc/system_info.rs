@@ -14,10 +14,15 @@
 
 use nextgsim_common::config::GnbConfig;
 use nextgsim_common::frame_clock;
+use nextgsim_rrc::procedures::rrc_release::{
+    CellReselectionPrioritiesParams, FreqPriorityNrParams,
+};
 use nextgsim_rrc::procedures::system_information::{
-    encode_mib, encode_sib1, CellBarredStatus, CellSelectionInfo, DmrsTypeAPosition,
-    IntraFreqReselection, MibParams, PdcchConfigSib1Params, PlmnIdentity, PlmnIdentityInfo,
-    Sib1Params, SubCarrierSpacingCommon, SystemInformationError, UeTimersAndConstantsParams,
+    encode_mib, encode_sib1, encode_system_information, CellBarredStatus, CellSelectionInfo,
+    DmrsTypeAPosition, InterFreqCarrier, IntraFreqNeighbour, IntraFreqReselection, MibParams,
+    PdcchConfigSib1Params, PlmnIdentity, PlmnIdentityInfo, Sib1Params, Sib2Params, Sib3Params,
+    Sib4Params, SubCarrierSpacingCommon, SystemInformationError, SystemInformationParams,
+    UeTimersAndConstantsParams,
 };
 
 /// CORESET#0 index broadcast in the MIB's `pdcch-ConfigSIB1`.
@@ -155,6 +160,116 @@ fn mnc_digits(mnc: u16, long_mnc: bool) -> Vec<u8> {
     }
 }
 
+/// Builds the SIB2/SIB3/SIB4 this cell broadcasts, carrying the idle-mode
+/// reselection parameters of TS 38.304 §5.2.4.6 (issue #50).
+///
+/// SIB1 tells the UE what this cell is; these tell it when to leave. Before this
+/// the UE took `Q_hyst` and `Treselection` from compile-time constants and had no
+/// per-cell `Qoffset` or reselection priority at all, so a cell could not
+/// influence its own mobility.
+///
+/// Returns `None` when the operator turned the broadcast off
+/// (`reselection.broadcast = false`), which is the pre-#50 behaviour: the UE then
+/// falls back to its constants and says so.
+///
+/// SIB4 is omitted rather than emptied when no other carrier is configured:
+/// `interFreqCarrierFreqList` is `SIZE (1..maxFreq)`, so a zero-length list is
+/// not encodable.
+pub fn system_information_params(config: &GnbConfig) -> Option<SystemInformationParams> {
+    let r = &config.reselection;
+    if !r.broadcast {
+        return None;
+    }
+
+    Some(SystemInformationParams {
+        sib2: Some(Sib2Params {
+            q_hyst_db: r.q_hyst_db,
+            t_reselection_s: r.t_reselection_s,
+            cell_reselection_priority: r.cell_reselection_priority,
+            // The same value SIB1 broadcasts, and for the same reason: cell
+            // suitability here should be decided by the simulator's signal model
+            // rather than by a receive-level floor picked in this file. Two
+            // different floors on one cell would also be a conformance oddity.
+            q_rx_lev_min: Q_RX_LEV_MIN,
+            s_intra_search_p: r.s_intra_search_p,
+            thresh_serving_low_p: r.thresh_serving_low_p,
+        }),
+        sib3: Some(Sib3Params {
+            intra_freq_neighbours: r
+                .intra_freq_neighbours
+                .iter()
+                .map(|n| IntraFreqNeighbour {
+                    phys_cell_id: n.phys_cell_id,
+                    q_offset_db: n.q_offset_db,
+                })
+                .collect(),
+        }),
+        sib4: if r.inter_freq_carriers.is_empty() {
+            None
+        } else {
+            Some(Sib4Params {
+                inter_freq_carriers: r
+                    .inter_freq_carriers
+                    .iter()
+                    .map(|c| InterFreqCarrier {
+                        dl_carrier_freq: c.dl_carrier_freq,
+                        cell_reselection_priority: c.cell_reselection_priority,
+                        thresh_x_high_p: c.thresh_x_high_p,
+                        thresh_x_low_p: c.thresh_x_low_p,
+                        q_rx_lev_min: c.q_rx_lev_min,
+                        t_reselection_s: c.t_reselection_s,
+                    })
+                    .collect(),
+            })
+        },
+    })
+}
+
+/// The encoded `SystemInformation` (`BCCH-DL-SCH-Message`) carrying this cell's
+/// SIB2/SIB3/SIB4, or `None` when the broadcast is turned off.
+pub fn encode_cell_system_information(
+    config: &GnbConfig,
+) -> Option<Result<Vec<u8>, SystemInformationError>> {
+    system_information_params(config).map(|params| encode_system_information(&params))
+}
+
+/// The DEDICATED `cellReselectionPriorities` this cell hands a UE in RRCRelease
+/// (TS 38.331 §6.3.2, issue #50).
+///
+/// Built from the same `reselection` block SIB4 comes from, so a released UE gets
+/// the priorities this cell broadcasts rather than a second, divergent set.
+///
+/// Returns `None` when there is nothing dedicated to say — no configured other
+/// carriers — rather than an empty list. `freqPriorityListNR` is
+/// `SIZE (1..maxFreq)`, and more importantly an empty dedicated list is not the
+/// same message as an absent one: TS 38.304 §5.2.4.1 has the UE use the
+/// broadcast priorities when no dedicated ones were provided, and *delete* its
+/// stored dedicated priorities when it receives an empty list. Sending an empty
+/// list on every release would therefore keep wiping state the UE should keep.
+pub fn release_cell_reselection_priorities(
+    config: &GnbConfig,
+) -> Option<CellReselectionPrioritiesParams> {
+    let r = &config.reselection;
+    if r.inter_freq_carriers.is_empty() {
+        return None;
+    }
+    Some(CellReselectionPrioritiesParams {
+        freq_priority_list_nr: r
+            .inter_freq_carriers
+            .iter()
+            .map(|c| FreqPriorityNrParams {
+                carrier_freq: c.dl_carrier_freq,
+                priority: c.cell_reselection_priority,
+            })
+            .collect(),
+        // T320 bounds how long the dedicated priorities stay valid. Left unset:
+        // this simulator has no timer driving their expiry, and advertising a
+        // validity the UE would honour while the network forgot it would make the
+        // two disagree about which priorities are in force.
+        t320: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +346,192 @@ mod tests {
         assert!(
             decoded.system_frame_number <= 63,
             "the MIB field is 6 bits wide"
+        );
+    }
+    // ========================================================================
+    // SIB2/SIB3/SIB4 reselection broadcast (issue #50)
+    // ========================================================================
+
+    /// The `reselection` YAML key must actually be READ.
+    ///
+    /// Nothing in this config sets `deny_unknown_fields`, so a key that no field
+    /// claims is silently DROPPED rather than rejected -- the recorded failure
+    /// mode where a config block is shipped, looks configured, and is inert. This
+    /// asserts NON-DEFAULT values arrive, because a test using the defaults would
+    /// pass whether the key was parsed or ignored.
+    #[test]
+    fn the_reselection_config_key_is_deserialised_rather_than_dropped() {
+        let yaml = r#"
+nci: 1
+gnb_id_length: 24
+plmn:
+  mcc: 1
+  mnc: 1
+  long_mnc: false
+tac: 7
+nssai: []
+amf_configs: []
+link_ip: 127.0.0.1
+ngap_ip: 127.0.0.1
+gtp_ip: 127.0.0.1
+gtp_advertise_ip: null
+ignore_stream_ids: false
+reselection:
+  broadcast: true
+  q_hyst_db: 10
+  t_reselection_s: 3
+  cell_reselection_priority: 6
+  s_intra_search_p: 20
+  thresh_serving_low_p: 9
+  intra_freq_neighbours:
+    - phys_cell_id: 128
+      q_offset_db: -3
+  inter_freq_carriers:
+    - dl_carrier_freq: 632628
+      cell_reselection_priority: 2
+"#;
+        let parsed: GnbConfig = serde_yaml::from_str(yaml).expect("the sample must parse");
+        let r = &parsed.reselection;
+        assert_eq!(r.q_hyst_db, 10, "q_hyst_db was dropped (default is 4)");
+        assert_eq!(
+            r.t_reselection_s, 3,
+            "t_reselection_s was dropped (default is 1)"
+        );
+        assert_eq!(r.cell_reselection_priority, 6);
+        assert_eq!(r.s_intra_search_p, 20);
+        assert_eq!(r.thresh_serving_low_p, 9);
+        assert_eq!(r.intra_freq_neighbours.len(), 1);
+        assert_eq!(r.intra_freq_neighbours[0].phys_cell_id, 128);
+        assert_eq!(r.intra_freq_neighbours[0].q_offset_db, -3);
+        assert_eq!(r.inter_freq_carriers.len(), 1);
+        assert_eq!(r.inter_freq_carriers[0].dl_carrier_freq, 632628);
+        // Omitted per-carrier fields take their documented defaults rather than
+        // failing the parse.
+        assert_eq!(r.inter_freq_carriers[0].q_rx_lev_min, -70);
+    }
+
+    /// The shipped `config/gnb.yaml` must parse, and its `reselection` block must
+    /// be the one the parser reads. A sample config that no longer deserialises is
+    /// a defect an operator hits before any test does.
+    #[test]
+    fn the_shipped_gnb_sample_config_parses_with_its_reselection_block() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/gnb.yaml");
+        let text = std::fs::read_to_string(path).expect("the shipped sample must be readable");
+        let parsed: GnbConfig = serde_yaml::from_str(&text).expect("and must parse");
+        assert!(
+            parsed.reselection.broadcast,
+            "the shipped sample must broadcast SIB2/3/4, or the documented default \
+             and the shipped default disagree"
+        );
+        assert_eq!(parsed.reselection.q_hyst_db, 4);
+        assert_eq!(parsed.reselection.t_reselection_s, 1);
+    }
+
+    /// What the cell broadcasts is what the config says, asserted by DECODING the
+    /// emitted bytes rather than by reading the params struct back.
+    #[test]
+    fn the_broadcast_sib2_carries_the_configured_reselection_parameters() {
+        use nextgsim_common::config::{CellReselectionBroadcastConfig, IntraFreqNeighbourConfig};
+        use nextgsim_rrc::procedures::system_information::decode_system_information;
+
+        let cfg = GnbConfig {
+            reselection: CellReselectionBroadcastConfig {
+                q_hyst_db: 12,
+                t_reselection_s: 4,
+                cell_reselection_priority: 5,
+                intra_freq_neighbours: vec![IntraFreqNeighbourConfig {
+                    phys_cell_id: 300,
+                    q_offset_db: 6,
+                }],
+                ..Default::default()
+            },
+            ..config()
+        };
+
+        let encoded = encode_cell_system_information(&cfg)
+            .expect("the broadcast is on")
+            .expect("and must encode");
+        let decoded = decode_system_information(&encoded).expect("and decode");
+
+        let sib2 = decoded.sib2.expect("SIB2 must be broadcast");
+        assert_eq!(sib2.q_hyst_db, 12);
+        assert_eq!(sib2.t_reselection_s, 4);
+        assert_eq!(sib2.cell_reselection_priority, 5);
+        assert_eq!(
+            sib2.q_rx_lev_min, Q_RX_LEV_MIN,
+            "SIB2 must carry the SAME q-RxLevMin as SIB1: two different receive \
+             floors on one cell is a conformance oddity"
+        );
+
+        let sib3 = decoded.sib3.expect("SIB3 must be broadcast");
+        assert_eq!(sib3.intra_freq_neighbours.len(), 1);
+        assert_eq!(sib3.intra_freq_neighbours[0].phys_cell_id, 300);
+        assert_eq!(sib3.intra_freq_neighbours[0].q_offset_db, 6);
+
+        assert!(
+            decoded.sib4.is_none(),
+            "with no configured other carrier, SIB4 must be OMITTED rather than \
+             carrying an unencodable empty list"
+        );
+    }
+
+    /// `broadcast: false` restores the pre-#50 behaviour: nothing on the air.
+    #[test]
+    fn turning_the_broadcast_off_emits_no_system_information() {
+        use nextgsim_common::config::CellReselectionBroadcastConfig;
+
+        let cfg = GnbConfig {
+            reselection: CellReselectionBroadcastConfig {
+                broadcast: false,
+                ..Default::default()
+            },
+            ..config()
+        };
+        assert!(
+            encode_cell_system_information(&cfg).is_none(),
+            "an operator who turned the broadcast off must get no SI, and not an \
+             encode error either"
+        );
+        // And the SIB1/MIB broadcast is untouched by that switch.
+        assert!(encode_cell_sib1(&cfg).is_ok());
+    }
+
+    /// The DEDICATED priorities handed out in RRCRelease come from the same
+    /// configured carrier list as SIB4, so a released UE is not given a second,
+    /// divergent set.
+    #[test]
+    fn the_dedicated_release_priorities_mirror_the_configured_carriers() {
+        use nextgsim_common::config::{CellReselectionBroadcastConfig, InterFreqCarrierConfig};
+
+        // No carriers: nothing dedicated to say, and an ABSENT IE rather than an
+        // empty list -- an empty one would tell the UE to delete its stored
+        // dedicated priorities on every release.
+        assert!(release_cell_reselection_priorities(&config()).is_none());
+
+        let cfg = GnbConfig {
+            reselection: CellReselectionBroadcastConfig {
+                inter_freq_carriers: vec![InterFreqCarrierConfig {
+                    dl_carrier_freq: 632628,
+                    cell_reselection_priority: 3,
+                    thresh_x_high_p: 8,
+                    thresh_x_low_p: 4,
+                    q_rx_lev_min: -70,
+                    t_reselection_s: 1,
+                }],
+                ..Default::default()
+            },
+            ..config()
+        };
+        let dedicated =
+            release_cell_reselection_priorities(&cfg).expect("a configured carrier is dedicated");
+        assert_eq!(dedicated.freq_priority_list_nr.len(), 1);
+        assert_eq!(dedicated.freq_priority_list_nr[0].carrier_freq, 632628);
+        assert_eq!(dedicated.freq_priority_list_nr[0].priority, 3);
+        assert!(
+            dedicated.t320.is_none(),
+            "T320 must stay unset: nothing here expires the dedicated priorities, \
+             and advertising a validity the UE honours while the network forgets \
+             makes the two disagree"
         );
     }
 }

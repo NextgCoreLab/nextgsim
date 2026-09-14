@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 use std::net::Ipv4Addr;
 
 use nextgsim_common::config::UeConfig;
+use nextgsim_ue::nas::mm::registration_type_for_cell_category;
 use nextgsim_ue::tun::{TunAppMessage, TunMessage, TunTask, TunTaskConfig};
 #[cfg(feature = "nextgsim-fl")]
 use nextgsim_ue::FlParticipantTask;
@@ -830,6 +831,7 @@ impl UeApp {
                             previous_tai,
                             available_plmns: reported_plmns,
                             serving_plmn: reported_serving_plmn,
+                            cell_category,
                         } => {
                             info!("Active cell changed from TAI: {:?}", previous_tai);
                             // Refresh the selector's available-PLMN candidate set
@@ -883,9 +885,26 @@ impl UeApp {
                                 // with the AMF first.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(1000))
                                     .await;
-                                let outs = orch.start_registration(
-                                    RegistrationType::InitialRegistration,
-                                );
+                                // TS 38.304 §4.4 and TS 23.122 §3.3: on an
+                                // ACCEPTABLE-only cell the UE is in the
+                                // limited-service state and may perform only
+                                // EMERGENCY registration. It used to attempt normal
+                                // initial registration on any cell it could camp on,
+                                // claiming a service the cell cannot give it
+                                // (issue #50).
+                                let registration_type =
+                                    registration_type_for_cell_category(cell_category);
+                                if registration_type
+                                    != RegistrationType::InitialRegistration
+                                {
+                                    warn!(
+                                        "Camped on a {cell_category:?} cell: limited \
+                                         service, so attempting {registration_type:?} \
+                                         rather than normal initial registration \
+                                         (TS 38.304 §4.4, TS 23.122 §3.3)"
+                                    );
+                                }
+                                let outs = orch.start_registration(registration_type);
                                 process_mm_outputs(
                                     outs,
                                     &mut orch,

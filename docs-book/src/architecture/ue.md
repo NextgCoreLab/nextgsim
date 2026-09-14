@@ -255,12 +255,30 @@ The RRC module (`rrc/mod.rs`) re-exports a broad procedure surface —
 `RrcStateMachine` (`rrc/state.rs`): `Idle` / `Connected` / `Inactive` driven by
 `RrcStateTransition`.
 
-The RRC task loop (`run_rrc_task` in `main.rs`) is deliberately thin:
+The RRC task is the **library `RrcTask`** (`rrc/task.rs`), spawned by
+`UeApp::spawn_tasks`. Issue #30 replaced the thin inline `run_rrc_task` loop that
+used to live in `main.rs`, so the `CellSelector` procedure surface is on the live
+path rather than reachable only from tests.
 
-- **Cell selection.** It tracks `discovered_cells: HashMap<cell_id, dbm>` and, on
-  the first `SignalChanged` while `Idle`, picks the strongest cell
-  (`max_by_key` on dBm), sends `RlsMessage::AssignCurrentCell`, and triggers NAS
-  registration.
+- **Cell selection and reselection.** `RrcTask::perform_cycle` runs
+  `CellSelector::perform_cell_selection` every cycle while `Idle`, so a *camped*
+  UE keeps re-evaluating rather than holding its first choice until radio-link
+  failure. Reselection applies the TS 38.304 §5.2.4.6 R-criterion —
+  `R_s = Q_meas,s + Q_hyst` against `R_n = Q_meas,n - Qoffset` — and only reselects
+  once the neighbour has been better ranked for `Treselection`.
+
+  All three terms come from **broadcast system information** (issue #50): `Q_hyst`
+  and `t-ReselectionNR` from SIB2, the per-neighbour `q-OffsetCell` from SIB3
+  (keyed by `physCellId`, which this tree derives from the NR Cell Identity a
+  cell's SIB1 broadcast), and carrier reselection priorities from SIB4 or from a
+  dedicated `cellReselectionPriorities` list in `RRCRelease`. They used to be the
+  compile-time constants `DEFAULT_Q_HYST_DB` and
+  `CELL_RESELECTION_TIME_TO_TRIGGER_MS`, with no per-cell offset at all.
+
+  `NasMessage::ActiveCellChanged` carries the camped cell's `CellCategory`, so NAS
+  can honour TS 38.304 §4.4: camping on an **acceptable-only** cell puts the UE in
+  limited service and it attempts **emergency** registration
+  (`registration_type_for_cell_category`) rather than normal initial registration.
 - **Uplink NAS.** `UplinkNasDelivery` is wrapped in a simplified **UL Information
   Transfer** frame (`[0x08, 0x00, …NAS]`) once connected, or sent as a **raw NAS
   PDU** for initial access (the gNB auto-creates the UE context) — see the byte

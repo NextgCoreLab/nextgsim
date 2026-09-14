@@ -21,6 +21,7 @@
 //! - 3GPP TS 38.304: NR; User Equipment (UE) procedures in Idle mode and RRC Inactive state
 //! - UERANSIM: src/ue/rrc/idle.cpp
 
+use nextgsim_rrc::procedures::rrc_reestablishment::phys_cell_id_from_nci;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -243,6 +244,21 @@ pub struct CellReselectionParams {
     pub reselection_candidate: Option<i32>,
     /// Time when candidate first became better
     pub candidate_better_since: Option<Instant>,
+    /// Whether `q_hyst` and `t_reselection` came from broadcast SIB2 rather than
+    /// from [`DEFAULT_Q_HYST_DB`] / [`CELL_RESELECTION_TIME_TO_TRIGGER_MS`]
+    /// (issue #50).
+    ///
+    /// Tracked rather than inferred, because a cell may legitimately broadcast
+    /// exactly the default values and "the broadcast agrees with the constant"
+    /// must not be indistinguishable from "no broadcast was read". The UE logs
+    /// which it is, so an operator can tell a configured cell from an assuming UE.
+    pub from_broadcast: bool,
+    /// The serving frequency's `cellReselectionPriority` from SIB2 (0..7).
+    ///
+    /// `None` until a SIB2 is read. TS 38.304 §5.2.4.1 orders frequencies by
+    /// priority BEFORE ranking cells, so a UE with no priority information can
+    /// only rank.
+    pub serving_priority: Option<u8>,
 }
 
 impl Default for CellReselectionParams {
@@ -252,6 +268,8 @@ impl Default for CellReselectionParams {
             t_reselection: CELL_RESELECTION_TIME_TO_TRIGGER_MS,
             reselection_candidate: None,
             candidate_better_since: None,
+            from_broadcast: false,
+            serving_priority: None,
         }
     }
 }
@@ -284,6 +302,30 @@ pub struct CellSelector {
     last_failure_logged: Option<Instant>,
     /// Cell reselection parameters
     reselection_params: CellReselectionParams,
+    /// `q-OffsetCell` per neighbour, keyed by `physCellId`, from broadcast SIB3
+    /// (issue #50).
+    ///
+    /// Keyed by PCI and not by the simulator's `cell_id` because that is how
+    /// TS 38.331 keys `intraFreqNeighCellList`, and the UE derives a cell's PCI
+    /// from the NR Cell Identity its SIB1 broadcast — the convention recorded for
+    /// #37, since a real PCI comes from the SSB and there is no PHY here. A cell
+    /// whose SIB1 has not been read therefore has no PCI and gets `Qoffset = 0`,
+    /// which is the same treatment TS 38.304 gives a neighbour absent from the
+    /// list.
+    intra_freq_q_offset_by_pci: HashMap<u16, i32>,
+    /// `cellReselectionPriority` per carrier ARFCN, from broadcast SIB4 and from
+    /// a dedicated RRCRelease `cellReselectionPriorities` list.
+    ///
+    /// Stored but not yet used to order carriers: this simulator's RLS presents
+    /// one carrier, so every cell is intra-frequency and the priority ordering of
+    /// TS 38.304 §5.2.4.1 has nothing to order. Kept because it is what a
+    /// released UE was handed, and reporting it is how an operator can see the
+    /// dedicated list arrived.
+    carrier_priorities: HashMap<u32, u8>,
+    /// Whether [`Self::carrier_priorities`] came from a DEDICATED RRCRelease list
+    /// rather than from broadcast SIB4. TS 38.304 §5.2.4.1 has dedicated
+    /// priorities override broadcast ones while they are valid.
+    carrier_priorities_dedicated: bool,
 }
 
 impl CellSelector {
@@ -298,6 +340,9 @@ impl CellSelector {
             started_time: Instant::now(),
             last_failure_logged: None,
             reselection_params: CellReselectionParams::default(),
+            intra_freq_q_offset_by_pci: HashMap::new(),
+            carrier_priorities: HashMap::new(),
+            carrier_priorities_dedicated: false,
         }
     }
 
@@ -566,8 +611,111 @@ impl CellSelector {
         }
     }
 
-    /// Evaluate if cell reselection should occur based on hysteresis and time-to-trigger
-    /// Per 3GPP TS 38.304 Section 5.2.4
+    /// The `physCellId` this UE ascribes to a cell, or `None` when its SIB1 has
+    /// not been read.
+    ///
+    /// Derived from the broadcast NR Cell Identity via
+    /// `phys_cell_id_from_nci` — the same function the gNB uses, because both
+    /// ends have to compute the same number (the convention recorded for #37; a
+    /// real PCI comes from the SSB and there is no PHY here).
+    ///
+    /// `None` rather than a fabricated value for a cell with no SIB1: a made-up
+    /// PCI could collide with a real neighbour's entry in SIB3 and apply that
+    /// neighbour's `Qoffset` to the wrong cell.
+    pub fn phys_cell_id_of(&self, cell_id: i32) -> Option<u16> {
+        let cell = self.cells.get(&cell_id)?;
+        if !cell.sib1.has_sib1 {
+            return None;
+        }
+        Some(phys_cell_id_from_nci(cell.sib1.nci as u64))
+    }
+
+    /// `Qoffset` for a cell, in dB, from broadcast SIB3.
+    ///
+    /// Zero when SIB3 named no offset for it, when no SIB3 has been read, or when
+    /// the cell has no PCI to key on — all three being cases TS 38.304 treats the
+    /// same way, as a neighbour with no cell-specific offset.
+    pub fn q_offset_of(&self, cell_id: i32) -> i32 {
+        self.phys_cell_id_of(cell_id)
+            .and_then(|pci| self.intra_freq_q_offset_by_pci.get(&pci).copied())
+            .unwrap_or(0)
+    }
+
+    /// Applies a broadcast SIB2 (issue #50).
+    ///
+    /// This is what makes `Q_hyst` and `Treselection` come from the network
+    /// instead of from [`DEFAULT_Q_HYST_DB`] and
+    /// [`CELL_RESELECTION_TIME_TO_TRIGGER_MS`]. The in-flight candidate is
+    /// deliberately NOT reset: a cell re-broadcasting the same SIB2 every SI
+    /// period would otherwise restart the time-to-trigger on every broadcast and
+    /// reselection could never fire.
+    pub fn apply_sib2(&mut self, q_hyst_db: i32, t_reselection_s: u8, serving_priority: u8) {
+        self.reselection_params.q_hyst = q_hyst_db;
+        self.reselection_params.t_reselection = u64::from(t_reselection_s) * 1000;
+        self.reselection_params.serving_priority = Some(serving_priority);
+        self.reselection_params.from_broadcast = true;
+    }
+
+    /// Applies a broadcast SIB3's `intraFreqNeighCellList` (issue #50).
+    ///
+    /// REPLACES the stored map rather than merging into it: SIB3 carries the
+    /// cell's complete neighbour list, so an entry that disappeared from the
+    /// broadcast has had its offset withdrawn, and merging would keep applying a
+    /// `Qoffset` the network no longer advertises.
+    pub fn apply_sib3(&mut self, neighbours: &[(u16, i32)]) {
+        self.intra_freq_q_offset_by_pci = neighbours.iter().copied().collect();
+    }
+
+    /// Applies a broadcast SIB4's `interFreqCarrierFreqList` (issue #50).
+    ///
+    /// Ignored while a DEDICATED list from RRCRelease is in force, per
+    /// TS 38.304 §5.2.4.1: dedicated priorities override broadcast ones.
+    pub fn apply_sib4(&mut self, carriers: &[(u32, u8)]) {
+        if self.carrier_priorities_dedicated {
+            return;
+        }
+        self.carrier_priorities = carriers.iter().copied().collect();
+    }
+
+    /// Applies a DEDICATED `cellReselectionPriorities` list from an RRCRelease
+    /// (TS 38.331 §6.3.2, TS 38.304 §5.2.4.1).
+    ///
+    /// An EMPTY list is not the same as no list: TS 38.304 has the UE delete its
+    /// stored dedicated priorities when it receives one, falling back to the
+    /// broadcast values. So an empty slice clears the dedicated state rather than
+    /// storing an empty override.
+    pub fn apply_dedicated_carrier_priorities(&mut self, carriers: &[(u32, u8)]) {
+        if carriers.is_empty() {
+            self.carrier_priorities.clear();
+            self.carrier_priorities_dedicated = false;
+            return;
+        }
+        self.carrier_priorities = carriers.iter().copied().collect();
+        self.carrier_priorities_dedicated = true;
+    }
+
+    /// The carrier priorities currently in force, and whether they are dedicated.
+    pub fn carrier_priorities(&self) -> (&HashMap<u32, u8>, bool) {
+        (&self.carrier_priorities, self.carrier_priorities_dedicated)
+    }
+
+    /// Evaluate whether cell reselection should occur, per the TS 38.304 §5.2.4.6
+    /// R-criterion.
+    ///
+    /// ```text
+    /// R_s = Q_meas,s + Q_hyst          (serving cell)
+    /// R_n = Q_meas,n - Qoffset         (neighbour cell)
+    /// ```
+    ///
+    /// and the neighbour is reselected only once `R_n > R_s` has held for
+    /// `Treselection`.
+    ///
+    /// This used to compare `best_dbm > current_dbm + q_hyst` directly, which is
+    /// the same inequality **only when every `Qoffset` is zero** — and there was
+    /// no `Qoffset` at all, so the per-cell term of `R_n` was silently absent
+    /// rather than zero by configuration. `Q_hyst` and `Treselection` also came
+    /// from compile-time constants; both now come from SIB2 when a cell
+    /// broadcasts one (issue #50).
     fn evaluate_cell_reselection(&mut self, current_cell_id: i32, best_cell_id: i32) -> bool {
         // If best cell is same as current, no reselection needed
         if current_cell_id == best_cell_id {
@@ -576,48 +724,69 @@ impl CellSelector {
             return false;
         }
 
-        // Get signal strengths
-        let current_dbm = self
+        // R_s = Q_meas,s + Q_hyst. Expressed as `ranking_value(-q_hyst)` so the
+        // serving and neighbour sides go through ONE ranking function: two
+        // formulas is how a sign error hides.
+        let Some(r_s) = self
             .cells
             .get(&current_cell_id)
-            .map(|c| c.dbm)
-            .unwrap_or(i32::MIN);
-        let best_dbm = self
+            .map(|c| c.ranking_value(-self.reselection_params.q_hyst))
+        else {
+            // The serving cell is gone from the measurement set. That is
+            // ActiveCellLost's business, not reselection's; treating an absent
+            // serving cell as infinitely bad would reselect on a single missed
+            // measurement.
+            self.reselection_params.reselection_candidate = None;
+            self.reselection_params.candidate_better_since = None;
+            return false;
+        };
+
+        // R_n = Q_meas,n - Qoffset, with Qoffset from broadcast SIB3.
+        let q_offset_n = self.q_offset_of(best_cell_id);
+        let Some(r_n) = self
             .cells
             .get(&best_cell_id)
-            .map(|c| c.dbm)
-            .unwrap_or(i32::MIN);
+            .map(|c| c.ranking_value(q_offset_n))
+        else {
+            self.reselection_params.reselection_candidate = None;
+            self.reselection_params.candidate_better_since = None;
+            return false;
+        };
 
-        // Apply hysteresis: new cell must be better by q_hyst dB
-        let required_margin = self.reselection_params.q_hyst;
-        if best_dbm <= current_dbm + required_margin {
-            // Candidate is not sufficiently better
+        // Strictly better: TS 38.304 §5.2.4.6 says "better ranked", and equal
+        // ranking must not ping-pong between two cells.
+        if r_n <= r_s {
             self.reselection_params.reselection_candidate = None;
             self.reselection_params.candidate_better_since = None;
             return false;
         }
 
-        // Track how long this candidate has been better (time-to-trigger)
+        // Arm the Treselection timer for a newly better-ranked candidate.
         if self.reselection_params.reselection_candidate != Some(best_cell_id) {
-            // New candidate
             self.reselection_params.reselection_candidate = Some(best_cell_id);
             self.reselection_params.candidate_better_since = Some(Instant::now());
             tracing::debug!(
-                "Cell reselection candidate: cell_id={}, dbm={} (current: cell_id={}, dbm={})",
-                best_cell_id,
-                best_dbm,
-                current_cell_id,
-                current_dbm
+                "Cell reselection candidate: cell_id={best_cell_id} R_n={r_n} \
+                 (serving cell_id={current_cell_id} R_s={r_s}, q_hyst={} dB, \
+                 q_offset={q_offset_n} dB, t_reselection={} ms, from_broadcast={})",
+                self.reselection_params.q_hyst,
+                self.reselection_params.t_reselection,
+                self.reselection_params.from_broadcast,
             );
-            return false;
+            // Deliberately NOT an early return. Arming used to end the call, so a
+            // candidate could never win on the evaluation that first saw it --
+            // which made `t-ReselectionNR = 0` (a legal broadcast value meaning no
+            // time-to-trigger) still cost a whole CELL_SELECTION_INTERVAL_MS.
+            // Falling through lets the elapsed check below decide, and for a zero
+            // timer it is already satisfied.
         }
 
-        // Check if time-to-trigger has elapsed
         if let Some(since) = self.reselection_params.candidate_better_since {
             if since.elapsed() >= Duration::from_millis(self.reselection_params.t_reselection) {
                 tracing::debug!(
-                    "Cell reselection triggered: cell_id={} -> cell_id={} (margin: {}dB, elapsed: {:?})",
-                    current_cell_id, best_cell_id, best_dbm - current_dbm, since.elapsed()
+                    "Cell reselection triggered: cell_id={current_cell_id} -> \
+                     cell_id={best_cell_id} (R_n={r_n} > R_s={r_s}, elapsed {:?})",
+                    since.elapsed()
                 );
                 return true;
             }

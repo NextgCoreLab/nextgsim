@@ -15,7 +15,7 @@ use nextgsim_rrc::procedures::{
         compute_short_mac_i, encode_rrc_reestablishment, ReestablishmentCauseValue,
         RrcReestablishmentError, RrcReestablishmentParams,
     },
-    rrc_release::{encode_rrc_release, RrcReleaseParams},
+    rrc_release::{encode_rrc_release, CellReselectionPrioritiesParams, RrcReleaseParams},
     rrc_setup::{encode_rrc_setup, srb1_rrc_setup_params},
 };
 
@@ -323,11 +323,20 @@ impl RrcConnectionManager {
         })
     }
 
-    /// Initiates an RRC Release for a UE
+    /// Initiates an RRC Release for a UE.
+    ///
+    /// `cell_reselection_priorities` is the DEDICATED priority list the released
+    /// UE should use in idle (TS 38.331 §6.3.2 `cellReselectionPriorities`,
+    /// TS 38.304 §5.2.4.1). It is a parameter rather than read from a config here
+    /// because this manager holds no configuration; the caller builds it from the
+    /// cell's own `reselection` block. `None` omits the IE, which leaves the UE on
+    /// the broadcast priorities -- the pre-#50 behaviour, and the correct one when
+    /// the cell has nothing dedicated to say.
     pub fn initiate_rrc_release(
         &mut self,
         ue_mgr: &mut RrcUeContextManager,
         ue_id: i32,
+        cell_reselection_priorities: Option<CellReselectionPrioritiesParams>,
     ) -> Option<RrcReleaseResult> {
         let ctx = ue_mgr.try_find_ue_mut(ue_id)?;
 
@@ -339,7 +348,7 @@ impl RrcConnectionManager {
         let transaction_id = self.next_tid();
 
         // Build RRC Release message
-        let rrc_release_pdu = self.build_rrc_release(transaction_id);
+        let rrc_release_pdu = self.build_rrc_release(transaction_id, cell_reselection_priorities);
 
         // Transition to Releasing state
         ctx.on_release();
@@ -674,10 +683,14 @@ impl RrcConnectionManager {
     }
 
     /// Builds an RRC Release message using proper ASN.1 UPER encoding
-    fn build_rrc_release(&self, transaction_id: u8) -> OctetString {
+    fn build_rrc_release(
+        &self,
+        transaction_id: u8,
+        cell_reselection_priorities: Option<CellReselectionPrioritiesParams>,
+    ) -> OctetString {
         let params = RrcReleaseParams {
             rrc_transaction_id: transaction_id,
-            cell_reselection_priorities: None,
+            cell_reselection_priorities,
             redirected_carrier_info: None,
             suspend_config: None,
             deprioritisation_req: None,
@@ -954,8 +967,9 @@ mod tests {
             None,
         );
 
-        // Release
-        let result = conn_mgr.initiate_rrc_release(&mut ue_mgr, 1);
+        // Release with no dedicated priorities: the IE is absent, which leaves the
+        // UE on the broadcast ones (issue #50).
+        let result = conn_mgr.initiate_rrc_release(&mut ue_mgr, 1, None);
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.ue_id, 1);
@@ -964,6 +978,62 @@ mod tests {
         // Verify UE is now releasing
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert!(!ctx.is_connected());
+    }
+
+    /// #50, criterion 3: `build_rrc_release` no longer hardcodes
+    /// `cell_reselection_priorities: None`, and the dedicated list reaches the
+    /// encoded PDU rather than being accepted and dropped.
+    ///
+    /// Asserted by DECODING the emitted PDU, not by inspecting the params struct:
+    /// the defect being fixed was a value that never reached the wire, so reading
+    /// back the input would have passed against it.
+    #[test]
+    fn a_dedicated_reselection_priority_list_reaches_the_encoded_rrc_release() {
+        use nextgsim_rrc::procedures::rrc_release::{decode_rrc_release, FreqPriorityNrParams};
+
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        // The cell is barred by default, and a barred cell rejects the setup
+        // request, so without this the release below has no connected UE to
+        // release and returns None.
+        conn_mgr.set_barred(false);
+        conn_mgr.process_rrc_setup_request(&mut ue_mgr, 1, 0x1234567890, false, 3);
+        conn_mgr.process_rrc_setup_complete(
+            &mut ue_mgr,
+            1,
+            0,
+            OctetString::from_slice(&[0x7E]),
+            None,
+        );
+
+        let priorities = CellReselectionPrioritiesParams {
+            freq_priority_list_nr: vec![
+                FreqPriorityNrParams {
+                    carrier_freq: 632628,
+                    priority: 5,
+                },
+                FreqPriorityNrParams {
+                    carrier_freq: 500000,
+                    priority: 2,
+                },
+            ],
+            t320: None,
+        };
+
+        let result = conn_mgr
+            .initiate_rrc_release(&mut ue_mgr, 1, Some(priorities))
+            .expect("release emitted");
+
+        let decoded = decode_rrc_release(result.rrc_release_pdu.data())
+            .expect("the emitted RRCRelease must be decodable, not the byte fallback");
+        let carried = decoded
+            .cell_reselection_priorities
+            .expect("cellReselectionPriorities must be on the wire");
+        assert_eq!(carried.freq_priority_list_nr.len(), 2);
+        assert_eq!(carried.freq_priority_list_nr[0].carrier_freq, 632628);
+        assert_eq!(carried.freq_priority_list_nr[0].priority, 5);
+        assert_eq!(carried.freq_priority_list_nr[1].carrier_freq, 500000);
+        assert_eq!(carried.freq_priority_list_nr[1].priority, 2);
     }
 
     #[test]
