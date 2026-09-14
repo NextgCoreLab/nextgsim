@@ -13,6 +13,23 @@ use tracing::{debug, info, warn};
 
 use crate::tasks::{SidelinkMessage, Task, TaskMessage, UeTaskBase};
 
+/// The line the UE binary emits when it spawns the sidelink task.
+///
+/// A constant rather than a literal at the `info!` site because the site is in
+/// `main.rs`, inside a task closure no test can reach. Naming it here is what
+/// lets `the_startup_lines_advertise_no_active_sidelink_capability` pin the
+/// binary's wording: the only way to change what the binary logs is to change
+/// this string, and the test reads this string.
+///
+/// It must not present sidelink as an active Rel-18 capability — the surface is
+/// a facade (see the module docs). Issue #54.
+pub const SPAWN_LOG: &str =
+    "Sidelink task spawned (scaffold, feature-gated: no PC5 OTA exchange, no sl-Config)";
+
+/// The line [`SidelinkTask::run`] emits on entry. Same no-capability-claim
+/// contract as [`SPAWN_LOG`], and unlike it this one is reached by a test.
+pub const START_LOG: &str = "Sidelink task started (scaffold: only discovery start/stop is reachable; PC5 link/relay/positioning handlers are unwired)";
+
 /// PC5 link state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pc5LinkState {
@@ -100,7 +117,7 @@ impl Task for SidelinkTask {
     type Message = SidelinkMessage;
 
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
-        info!("Sidelink task started (scaffold: only discovery start/stop is reachable; PC5 link/relay/positioning handlers are unwired)");
+        info!("{}", START_LOG);
         loop {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {
@@ -246,6 +263,62 @@ impl SidelinkTask {
             Some((wx / total_weight, wy / total_weight, wz / total_weight))
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{capture_task_logs, task_base};
+
+    /// #54, criterion 2: with the feature on, the task must still not present
+    /// sidelink as an active Rel-18 capability — enabling the feature compiles
+    /// the facade back in, it does not make PC5 work.
+    ///
+    /// This test only exists in the `sidelink` build, so the default build's
+    /// guarantee is the stronger one: the task does not exist to log anything.
+    /// That half is asserted in `tasks.rs` by
+    /// `a_default_build_registers_no_sidelink_task`.
+    #[test]
+    fn the_task_logs_no_active_rel_18_sidelink_capability() {
+        let logged = capture_task_logs(SidelinkTask::new(task_base()));
+
+        // Positive control FIRST. The assertion that matters is an absence, and
+        // an absence is satisfied by every path that never arrives — a
+        // subscriber never installed, a task that never started. Pinning the
+        // scaffold line proves the buffer holds this task's own startup before
+        // anything is concluded from what is missing.
+        assert!(
+            logged.contains(START_LOG),
+            "the sidelink task's startup line is missing from the capture, so \
+             nothing can be concluded from what else is absent; captured: {logged:?}"
+        );
+
+        assert!(
+            !logged.contains("Rel-18 NR Sidelink"),
+            "the task advertised an active Rel-18 NR Sidelink capability; \
+             captured: {logged:?}"
+        );
+    }
+
+    /// The binary's spawn line is unreachable from a test (it is inside
+    /// `main.rs`'s task closure), so what is pinned instead is the constant it
+    /// logs. Changing the binary's wording means changing this string, and this
+    /// test reads this string.
+    #[test]
+    fn the_startup_lines_advertise_no_active_sidelink_capability() {
+        for line in [SPAWN_LOG, START_LOG] {
+            assert!(
+                line.contains("scaffold"),
+                "{line:?} must say it is a scaffold, or a reader takes the spawn \
+                 for a working feature"
+            );
+            assert!(
+                !line.contains("Rel-18 NR Sidelink"),
+                "{line:?} advertises an active Rel-18 NR Sidelink capability the \
+                 code does not deliver"
+            );
         }
     }
 }

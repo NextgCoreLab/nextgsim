@@ -190,6 +190,29 @@ jobs:
           cargo clippy -p nextgsim-gnb --features drb-pdcp --all-targets
           cargo clippy -p nextgsim-ue --features drb-pdcp --all-targets
 
+  sidelink:
+    name: Sidelink facade (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `sidelink` feature (issue #54) is off by default, and unlike the
+      # other feature jobs here it gates code that used to be UNCONDITIONAL.
+      # That inverts the usual risk: it is the ENABLED arm the default jobs above
+      # never compile, so without this job the whole sidelink and prose surface --
+      # the PC5 state machine, the positioning engine, ~20 existing tests --
+      # would silently stop being built by CI the moment it was gated. Both
+      # modules are on one feature because `prose.rs` uses
+      # `sidelink::Pc5RrcState`.
+      - name: cargo test (sidelink on)
+        run: cargo test -p nextgsim-ue --features sidelink
+      - name: cargo clippy
+        run: cargo clippy -p nextgsim-ue --features sidelink --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

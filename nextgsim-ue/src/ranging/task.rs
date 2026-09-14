@@ -267,50 +267,16 @@ impl Task for RangingTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::{AppMessage, NasMessage, RlsMessage, RrcMessage, TaskHandle};
+    use crate::test_support::{capture_task_logs, task_base};
     use nextgsim_common::config::UeConfig;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
 
-    /// A `MakeWriter` that appends every formatted log record to a shared
-    /// buffer, so a test can assert on what the runtime actually emitted
-    /// rather than on what the source appears to say.
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-    impl CapturedLog {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("log buffer not poisoned")).into_owned()
-        }
-    }
-
-    impl Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log buffer not poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLog {
-        type Writer = Self;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn task_base() -> UeTaskBase {
+    /// Runs `RangingTask` to completion under a capturing subscriber and returns
+    /// everything it logged.
+    fn run_ranging_task_capturing_logs() -> String {
         // `UeConfig::default()` is the default (ranging-disabled) start: the
         // criterion is about what a UE that was NOT asked for ranging logs.
-        // Read through the same `as_ref().is_some_and(..)` shape `main.rs`
-        // uses, so "disabled" here means what it means at the gate.
+        // Read through the same `as_ref().is_some_and(..)` shape `main.rs` uses,
+        // so "disabled" here means what it means at the gate.
         assert!(
             !UeConfig::default()
                 .ranging_config
@@ -319,59 +285,7 @@ mod tests {
             "the default UE config must leave ranging disabled, or this test \
              is asserting about the wrong start"
         );
-        let (app_tx, _app_rx) = mpsc::channel::<TaskMessage<AppMessage>>(1);
-        let (nas_tx, _nas_rx) = mpsc::channel::<TaskMessage<NasMessage>>(1);
-        let (rrc_tx, _rrc_rx) = mpsc::channel::<TaskMessage<RrcMessage>>(1);
-        let (rls_tx, _rls_rx) = mpsc::channel::<TaskMessage<RlsMessage>>(1);
-        UeTaskBase {
-            config: Arc::new(UeConfig::default()),
-            app_tx: TaskHandle::new(app_tx),
-            nas_tx: TaskHandle::new(nas_tx),
-            rrc_tx: TaskHandle::new(rrc_tx),
-            rls_tx: TaskHandle::new(rls_tx),
-            #[cfg(any(
-                feature = "nextgsim-she",
-                feature = "nextgsim-nwdaf",
-                feature = "nextgsim-isac",
-                feature = "nextgsim-fl",
-                feature = "nextgsim-semantic",
-            ))]
-            sixg: None,
-            rel18: None,
-        }
-    }
-
-    /// Runs `RangingTask` to completion under a capturing subscriber and
-    /// returns everything it logged.
-    ///
-    /// The task is driven directly rather than `tokio::spawn`ed, and on a
-    /// current-thread runtime, because `with_default` installs the dispatcher
-    /// in a *thread-local*: a spawned task could be polled on a worker thread
-    /// where the capture is not installed, and the buffer would come back
-    /// empty — which would satisfy the absence assertion for the wrong reason.
-    fn run_ranging_task_capturing_logs() -> String {
-        let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .finish();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("current-thread runtime builds");
-
-        tracing::subscriber::with_default(subscriber, || {
-            runtime.block_on(async {
-                let (tx, rx) = mpsc::channel::<TaskMessage<RangingMessage>>(1);
-                // Dropping the sender is what ends `run`: `rx.recv()` yields
-                // `None` and the loop breaks, so the task starts and stops
-                // without needing a shutdown message.
-                drop(tx);
-                RangingTask::new(task_base()).run(rx).await;
-            });
-        });
-
-        captured.text()
+        capture_task_logs(RangingTask::new(task_base()))
     }
 
     /// #55, criterion 3: a default (ranging-disabled) start must not log a
