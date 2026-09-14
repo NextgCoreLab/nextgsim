@@ -180,6 +180,30 @@ pub struct FusedPosition {
     pub timestamp_ms: u64,
 }
 
+/// Which filter drives [`IsacManager::update_tracking`] (issue #27).
+///
+/// Both filters were already implemented; only the scalar-gain smoother was
+/// reachable from a live path, so the EKF was built, tested and unused. This
+/// makes the choice explicit rather than implicit in which function a caller
+/// happens to call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackingFilter {
+    /// [`TrackingState::update`]: a scalar-gain position smoother with a
+    /// finite-difference velocity. The default, because it needs no tuning and
+    /// cannot diverge.
+    #[default]
+    Linear,
+    /// [`ExtendedKalmanFilter`]: a 6-state constant-velocity filter with a real
+    /// covariance, so velocity is an estimated state rather than a difference of
+    /// two noisy positions, and an outlier can be gated on its
+    /// normalised-innovation-squared.
+    ///
+    /// Better on a manoeuvring or noisily-measured target, and it needs a
+    /// process-noise figure that matches the target's dynamics: too small and it
+    /// lags a manoeuvre, too large and it follows the noise.
+    Ekf,
+}
+
 /// Tracking state for an object
 #[derive(Debug, Clone)]
 pub struct TrackingState {
@@ -210,28 +234,44 @@ impl TrackingState {
         }
     }
 
-    /// Updates state with new position measurement
+    /// Updates state with new position measurement.
+    ///
+    /// A scalar-gain smoother, not a Kalman filter: there is no state covariance
+    /// and no process model, so it cannot estimate velocity as a state the way
+    /// [`ExtendedKalmanFilter`] does. Kept as the default and as the EKF's
+    /// fallback (see [`TrackingFilter`]) because it needs no tuning and cannot
+    /// diverge.
     pub fn update(&mut self, measured_position: Vector3, measurement_uncertainty: f64) {
         let dt = self.last_update.elapsed().as_secs_f64();
         self.last_update = Instant::now();
 
         if dt > 0.0 {
-            // Simple Kalman-like update
             let kalman_gain =
                 self.position_uncertainty / (self.position_uncertainty + measurement_uncertainty);
 
-            // Update position
-            self.position.x += kalman_gain * (measured_position.x - self.position.x);
-            self.position.y += kalman_gain * (measured_position.y - self.position.y);
-            self.position.z += kalman_gain * (measured_position.z - self.position.z);
+            // The velocity is a finite difference over the position estimate, so
+            // it has to be taken against the PREVIOUS estimate -- captured here,
+            // before the position moves. It used to be read after the update,
+            // which made `old_pos` the new position and the "velocity"
+            // `(measurement - updated estimate) / dt`: the filter residual
+            // divided by dt, which shrinks towards zero as the estimate
+            // converges. A converging track therefore reported a target slowing
+            // to a stop, and one tracking a stationary target reported the
+            // measurement noise as motion.
+            let previous_position = self.position;
 
-            // Update velocity estimate
+            self.position.x += kalman_gain * (measured_position.x - previous_position.x);
+            self.position.y += kalman_gain * (measured_position.y - previous_position.y);
+            self.position.z += kalman_gain * (measured_position.z - previous_position.z);
+
+            // Only update velocity for reasonable time intervals: over a long
+            // gap a single difference is dominated by whatever the target did in
+            // between, so keeping the old estimate is better than replacing it
+            // with an average over an unknown manoeuvre.
             if dt < 1.0 {
-                // Only update velocity for reasonable time intervals
-                let old_pos = self.position;
-                self.velocity.x = (measured_position.x - old_pos.x) / dt;
-                self.velocity.y = (measured_position.y - old_pos.y) / dt;
-                self.velocity.z = (measured_position.z - old_pos.z) / dt;
+                self.velocity.x = (self.position.x - previous_position.x) / dt;
+                self.velocity.y = (self.position.y - previous_position.y) / dt;
+                self.velocity.z = (self.position.z - previous_position.z) / dt;
             }
 
             // Update uncertainty
@@ -714,6 +754,16 @@ pub struct ExtendedKalmanFilter {
 /// 3-DOF 99.9% chi-square bound (~16.3), so legitimate measurements pass while
 /// gross outliers are rejected.
 pub const DEFAULT_NIS_GATE: f64 = 25.0;
+
+/// Default acceleration process-noise spectral density for the EKF tracking
+/// path, in (m/s^2)^2.
+///
+/// 1.0 sits between the pedestrian and vehicle figures named on
+/// [`ExtendedKalmanFilter::new`] (0.1 .. 5.0): it tracks a walking or driving
+/// target without following measurement noise. A deployment that knows its
+/// targets' dynamics should set its own — too small lags a manoeuvre, too large
+/// follows the noise.
+pub const DEFAULT_EKF_PROCESS_NOISE_ACCEL: f64 = 1.0;
 
 impl ExtendedKalmanFilter {
     /// Creates a new EKF with a given initial position and velocity.
@@ -2048,6 +2098,11 @@ pub struct IsacManager {
     tracking: HashMap<u64, TrackingState>,
     /// Extended Kalman Filters per target (`object_id` -> EKF)
     ekf_states: HashMap<u64, ExtendedKalmanFilter>,
+    /// Which filter [`IsacManager::update_tracking`] drives (issue #27).
+    tracking_filter: TrackingFilter,
+    /// Acceleration process-noise spectral density the EKF path uses, in
+    /// (m/s^2)^2. Only consulted under [`TrackingFilter::Ekf`].
+    ekf_process_noise_accel: f64,
     /// Recent sensing data
     recent_data: HashMap<i32, SensingData>,
     /// Fusion interval (ms)
@@ -2062,6 +2117,10 @@ impl Default for IsacManager {
             anchors: HashMap::new(),
             tracking: HashMap::new(),
             ekf_states: HashMap::new(),
+            // Linear by default, so an existing deployment's tracking behaviour
+            // is byte-for-byte what it was.
+            tracking_filter: TrackingFilter::Linear,
+            ekf_process_noise_accel: DEFAULT_EKF_PROCESS_NOISE_ACCEL,
             recent_data: HashMap::new(),
             fusion_interval_ms: 50,
             resource_manager: SensingCommResourceManager::default(),
@@ -2171,14 +2230,79 @@ impl IsacManager {
         self.ekf_states.get(&object_id)
     }
 
-    /// Updates or creates a tracking state
-    pub fn update_tracking(&mut self, object_id: u64, position: Vector3, uncertainty: f64) {
-        let state = self
-            .tracking
-            .entry(object_id)
-            .or_insert_with(|| TrackingState::new(object_id, position));
+    /// Selects which filter [`Self::update_tracking`] drives (issue #27).
+    ///
+    /// Switching mid-track does not migrate state between the filters: the one
+    /// being switched to starts from whatever it last held, which for a fresh EKF
+    /// means initialising on the next measurement. Deliberate — copying a
+    /// scalar-gain estimate into a covariance-carrying filter would have to
+    /// invent the covariance, and an invented covariance is what makes a Kalman
+    /// filter trust the wrong thing.
+    pub fn set_tracking_filter(&mut self, filter: TrackingFilter) {
+        self.tracking_filter = filter;
+    }
 
-        state.update(position, uncertainty);
+    /// The filter currently driving [`Self::update_tracking`].
+    pub fn tracking_filter(&self) -> TrackingFilter {
+        self.tracking_filter
+    }
+
+    /// Sets the acceleration process-noise spectral density the EKF path uses,
+    /// in (m/s^2)^2. See [`DEFAULT_EKF_PROCESS_NOISE_ACCEL`].
+    pub fn set_ekf_process_noise_accel(&mut self, process_noise_accel: f64) {
+        self.ekf_process_noise_accel = process_noise_accel;
+    }
+
+    /// Updates or creates a tracking state, using the selected filter.
+    ///
+    /// Under [`TrackingFilter::Ekf`] the EKF is predicted forward by the elapsed
+    /// time and updated with the measured position, and its estimate is mirrored
+    /// into the [`TrackingState`] this returns through [`Self::get_tracking`] —
+    /// so every existing reader keeps working and sees the better estimate,
+    /// rather than the EKF becoming a second source of truth nobody reads. That
+    /// mirroring is the whole reason the EKF was unreachable before: it produced
+    /// estimates into `ekf_states` that no consumer looked at.
+    pub fn update_tracking(&mut self, object_id: u64, position: Vector3, uncertainty: f64) {
+        match self.tracking_filter {
+            TrackingFilter::Linear => {
+                let state = self
+                    .tracking
+                    .entry(object_id)
+                    .or_insert_with(|| TrackingState::new(object_id, position));
+                state.update(position, uncertainty);
+            }
+            TrackingFilter::Ekf => {
+                let state = self
+                    .tracking
+                    .entry(object_id)
+                    .or_insert_with(|| TrackingState::new(object_id, position));
+                // The elapsed time comes from the track, not from the EKF, so
+                // both filters measure dt the same way and a switch does not
+                // change the time base.
+                let dt = state.last_update.elapsed().as_secs_f64();
+                state.last_update = Instant::now();
+
+                let ekf = self.ekf_states.entry(object_id).or_insert_with(|| {
+                    ExtendedKalmanFilter::uninitialised(self.ekf_process_noise_accel)
+                });
+
+                // Predict only over a positive interval: `predict(0.0)` adds a
+                // zero-time process-noise term and does nothing useful, and a
+                // first measurement has no interval at all.
+                if dt > 0.0 {
+                    ekf.predict(dt);
+                }
+                ekf.update_position(&position, uncertainty.max(1e-3));
+
+                if ekf.is_initialised() {
+                    state.position = ekf.position();
+                    state.velocity = ekf.velocity();
+                    state.position_uncertainty = ekf.position_uncertainty();
+                    state.quality =
+                        (1.0 / (1.0 + state.position_uncertainty / 10.0)).min(1.0) as f32;
+                }
+            }
+        }
     }
 
     /// Gets tracking state for an object
@@ -2889,6 +3013,285 @@ mod tests {
             (fp.position.y - 30.0).abs() < 2.0,
             "Bayesian y: {}",
             fp.position.y
+        );
+    }
+
+    // --- Tracking filter selection and quality (issue #27) ---
+
+    /// Deterministic pseudo-noise, so a filter-quality comparison is repeatable.
+    /// A fixed LCG rather than `rand`: a flaky quality assertion is worse than a
+    /// less realistic one, and the sequence only has to be uncorrelated with the
+    /// motion.
+    fn pseudo_noise(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        // Top 32 bits mapped to [-1.0, 1.0].
+        ((*seed >> 32) as f64 / u32::MAX as f64) * 2.0 - 1.0
+    }
+
+    #[test]
+    fn the_ekf_tracks_a_noisy_constant_velocity_target_better_than_the_smoother() {
+        // The quality claim, with explicit dt so it does not depend on wall time.
+        // Ground truth: 10 m/s along +x from the origin, sampled every 100 ms,
+        // with +/-3 m of measurement noise.
+        const DT: f64 = 0.1;
+        const STEPS: usize = 40;
+        const TRUE_VX: f64 = 10.0;
+        const NOISE_M: f64 = 3.0;
+
+        let mut ekf = ExtendedKalmanFilter::uninitialised(1.0);
+        let mut smoother = TrackingState::new(1, Vector3::new(0.0, 0.0, 0.0));
+        let mut seed = 0x5EED_u64;
+
+        let mut ekf_error_sum = 0.0;
+        let mut smoother_error_sum = 0.0;
+        let mut scored = 0usize;
+
+        for step in 0..STEPS {
+            let t = step as f64 * DT;
+            let truth = Vector3::new(TRUE_VX * t, 0.0, 0.0);
+            let measured = Vector3::new(
+                truth.x + pseudo_noise(&mut seed) * NOISE_M,
+                truth.y + pseudo_noise(&mut seed) * NOISE_M,
+                truth.z + pseudo_noise(&mut seed) * NOISE_M,
+            );
+
+            ekf.predict(DT);
+            ekf.update_position(&measured, NOISE_M);
+
+            // The smoother's own `update` reads wall time for dt, so drive its
+            // position recursion directly with the same gain rule to compare the
+            // ESTIMATORS rather than the clocks.
+            let gain = smoother.position_uncertainty / (smoother.position_uncertainty + NOISE_M);
+            smoother.position.x += gain * (measured.x - smoother.position.x);
+            smoother.position.y += gain * (measured.y - smoother.position.y);
+            smoother.position.z += gain * (measured.z - smoother.position.z);
+            smoother.position_uncertainty = ((1.0 - gain) * smoother.position_uncertainty).max(0.1);
+
+            // Score the second half only: the first half is both filters
+            // converging from a cold start, which measures initialisation rather
+            // than steady-state tracking.
+            if step >= STEPS / 2 {
+                ekf_error_sum += ekf.position().distance_to(&truth);
+                smoother_error_sum += smoother.position.distance_to(&truth);
+                scored += 1;
+            }
+        }
+
+        let ekf_error = ekf_error_sum / scored as f64;
+        let smoother_error = smoother_error_sum / scored as f64;
+
+        // DOCUMENTED BOUND: with 3 m noise on a 10 m/s target sampled at 10 Hz,
+        // the EKF's mean steady-state position error stays under 3 m -- i.e. it
+        // does no worse than a single measurement, which is the least a filter
+        // must achieve.
+        assert!(
+            ekf_error < 3.0,
+            "EKF mean steady-state error {ekf_error:.2} m exceeds the 3 m bound"
+        );
+        // And it beats the smoother, which lags a constant-velocity target
+        // because it has no velocity state to predict with.
+        assert!(
+            ekf_error < smoother_error,
+            "EKF error {ekf_error:.2} m must beat the smoother's {smoother_error:.2} m"
+        );
+    }
+
+    #[test]
+    fn the_ekf_recovers_the_true_velocity_the_smoother_cannot_represent() {
+        // The EKF estimates velocity as a state. 10 m/s along +x, exact
+        // measurements, so any error is the filter's own.
+        const DT: f64 = 0.1;
+        let mut ekf = ExtendedKalmanFilter::uninitialised(1.0);
+        for step in 0..60 {
+            let t = step as f64 * DT;
+            ekf.predict(DT);
+            ekf.update_position(&Vector3::new(10.0 * t, 0.0, 0.0), 0.5);
+        }
+        let v = ekf.velocity();
+        assert!(
+            (v.x - 10.0).abs() < 1.0,
+            "EKF vx {:.3} must converge on the true 10 m/s",
+            v.x
+        );
+        assert!(
+            v.y.abs() < 1.0 && v.z.abs() < 1.0,
+            "no motion off-axis: {v:?}"
+        );
+    }
+
+    #[test]
+    fn the_manager_defaults_to_the_linear_filter_and_creates_no_ekf() {
+        let mut manager = IsacManager::new(50);
+        assert_eq!(manager.tracking_filter(), TrackingFilter::Linear);
+
+        manager.update_tracking(7, Vector3::new(10.0, 0.0, 0.0), 1.0);
+
+        assert!(manager.get_tracking(7).is_some(), "the track exists");
+        assert!(
+            manager.get_ekf(7).is_none(),
+            "the linear path must not spin up an EKF"
+        );
+    }
+
+    #[test]
+    fn selecting_the_ekf_makes_it_drive_the_track_readers_already_use() {
+        // The wiring that was missing: before this, the EKF produced estimates
+        // into `ekf_states` that no consumer read.
+        let mut manager = IsacManager::new(50);
+        manager.set_tracking_filter(TrackingFilter::Ekf);
+        assert_eq!(manager.tracking_filter(), TrackingFilter::Ekf);
+
+        // Several updates with a scattered measurement, and deliberately NOT one:
+        // a freshly initialised EKF sits exactly on the measurement it
+        // initialised with, so after a single update the EKF estimate, the raw
+        // measurement and an unmirrored track are all the same point and the
+        // assertion below would hold however the code was wired.
+        let measurements = [
+            Vector3::new(10.0, 20.0, 30.0),
+            Vector3::new(14.0, 18.0, 31.0),
+            Vector3::new(9.0, 23.0, 29.0),
+            Vector3::new(13.0, 19.0, 30.5),
+        ];
+        for m in &measurements {
+            manager.update_tracking(7, *m, 2.0);
+        }
+        let last = *measurements.last().unwrap();
+
+        let ekf_position = manager.get_ekf(7).expect("an EKF was created").position();
+        let track = manager.get_tracking(7).expect("the track exists");
+        assert!(
+            track.position.distance_to(&ekf_position) < 1e-9,
+            "get_tracking must report the EKF's estimate ({:?} vs {:?})",
+            track.position,
+            ekf_position
+        );
+        // And the EKF has smoothed, so the track is NOT simply the last
+        // measurement -- which is what an unmirrored track would report.
+        assert!(
+            track.position.distance_to(&last) > 1e-6,
+            "a smoothed estimate must differ from the raw measurement {last:?}"
+        );
+    }
+
+    #[test]
+    fn the_ekf_path_predicts_between_measurements_so_velocity_becomes_observable() {
+        // The manager's EKF path must predict forward, not only update: without a
+        // predict step the state never propagates and velocity stays at zero
+        // however the target moves.
+        let mut manager = IsacManager::new(50);
+        manager.set_tracking_filter(TrackingFilter::Ekf);
+
+        for step in 0..25 {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            manager.update_tracking(5, Vector3::new(step as f64 * 0.4, 0.0, 0.0), 0.5);
+        }
+
+        let velocity = manager.get_tracking(5).expect("the track exists").velocity;
+        assert!(
+            velocity.x > 1.0,
+            "a target moving along +x must show a positive vx, got {velocity:?}"
+        );
+    }
+
+    #[test]
+    fn the_ekf_track_carries_the_filter_uncertainty_rather_than_the_default() {
+        // A track whose uncertainty never moved off TrackingState::new's 10 m
+        // default would be reporting a placeholder as a covariance.
+        let mut manager = IsacManager::new(50);
+        manager.set_tracking_filter(TrackingFilter::Ekf);
+        for _ in 0..5 {
+            manager.update_tracking(3, Vector3::new(5.0, 5.0, 0.0), 0.5);
+        }
+        let track = manager.get_tracking(3).expect("the track exists");
+        let ekf_uncertainty = manager.get_ekf(3).unwrap().position_uncertainty();
+        assert!(
+            (track.position_uncertainty - ekf_uncertainty).abs() < 1e-9,
+            "track uncertainty {:.4} must be the EKF's {:.4}",
+            track.position_uncertainty,
+            ekf_uncertainty
+        );
+        assert!(
+            track.position_uncertainty < 10.0,
+            "repeated measurements must reduce uncertainty below the initial 10 m"
+        );
+    }
+
+    #[test]
+    fn the_reported_velocity_is_the_finite_difference_of_the_estimate() {
+        // The defect this fixes: the finite difference used to be taken against
+        // the position AFTER the update, making the reported "velocity" the
+        // filter residual over dt. In steady state that is the true velocity
+        // divided by the gain -- about 10x too large once the gain has converged
+        // -- so the claim to pin is the DEFINITION, not a magnitude.
+        let target = Vector3::new(100.0, 0.0, 0.0);
+        let mut state = TrackingState::new(1, Vector3::new(0.0, 0.0, 0.0));
+
+        // Warm up until the gain has converged, so the two readings differ by a
+        // large factor rather than the ~1.1x of the first couple of updates.
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            state.update(target, 1.0);
+        }
+
+        let before = state.position;
+        let started = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        state.update(target, 1.0);
+        // Measured here as well as inside `update`; the two differ by
+        // microseconds out of ten milliseconds.
+        let dt = started.elapsed().as_secs_f64();
+
+        let expected_vx = (state.position.x - before.x) / dt;
+        assert!(
+            (state.velocity.x - expected_vx).abs() <= 0.2 * expected_vx.abs().max(1e-9),
+            "reported vx {:.4} must be the estimate's own displacement rate {expected_vx:.4}",
+            state.velocity.x
+        );
+    }
+
+    #[test]
+    fn a_stationary_target_is_not_reported_as_moving() {
+        // Started ON the target, so there is no convergence transient: a filter
+        // closing a 64 m gap in 2 ms steps legitimately reports a large
+        // estimate-velocity, and that would make this test about convergence
+        // rather than about a still target.
+        //
+        // Measurements carry +/-0.5 m of noise, which is what makes this
+        // discriminating: the reported speed is the gain times the noise over dt,
+        // and the old formulation reported (1 - gain)/gain times as much -- about
+        // 10x once the gain has converged.
+        let target = Vector3::new(50.0, 40.0, 0.0);
+        let mut state = TrackingState::new(1, target);
+        let offsets = [0.5, -0.4, 0.3, -0.5, 0.45, -0.35, 0.2, -0.25];
+
+        // Converge the gain first.
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            state.update(target, 1.0);
+        }
+
+        let mut peak_speed = 0.0_f64;
+        for offset in offsets {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            state.update(
+                Vector3::new(target.x + offset, target.y - offset, target.z),
+                1.0,
+            );
+            let speed =
+                (state.velocity.x.powi(2) + state.velocity.y.powi(2) + state.velocity.z.powi(2))
+                    .sqrt();
+            peak_speed = peak_speed.max(speed);
+        }
+
+        assert!(
+            state.position.distance_to(&target) < 1.0,
+            "the estimate must stay on the target, got {:?}",
+            state.position
+        );
+        assert!(
+            peak_speed < 15.0,
+            "a still target measured to +/-0.5 m must not be reported at \
+             {peak_speed:.1} m/s"
         );
     }
 }

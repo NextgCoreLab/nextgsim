@@ -4,7 +4,7 @@ use crate::tasks::{GnbTaskBase, IsacMessage, NwdafMessage, Task, TaskMessage};
 #[cfg(feature = "event-bus")]
 use nextgsim_common::bus::{BusEvent, Topic};
 use nextgsim_isac::{
-    IsacManager, SensingData, SensingMeasurement, SensingType, TrackingState, Vector3,
+    IsacManager, SensingData, SensingMeasurement, SensingType, TrackingFilter, Vector3,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -12,16 +12,44 @@ use tracing::{debug, info, warn};
 pub struct IsacTask {
     task_base: GnbTaskBase,
     engine: IsacManager,
-    trackers: std::collections::HashMap<u64, TrackingState>,
 }
 
 impl IsacTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
-        Self {
-            task_base,
-            engine: IsacManager::new(50),
-            trackers: std::collections::HashMap::new(),
+        // Tracking lives in the engine and nowhere else (issue #27). This task
+        // used to keep its own `HashMap<u64, TrackingState>` beside the engine
+        // and update that, so the engine's tracking -- and therefore its EKF --
+        // had no live caller at all: the better filter existed, was tested, and
+        // could not be reached from a running gNB.
+        let mut engine = IsacManager::new(50);
+        let filter = if task_base.config.isac_ekf_tracking {
+            TrackingFilter::Ekf
+        } else {
+            TrackingFilter::Linear
+        };
+        engine.set_tracking_filter(filter);
+        if let Some(process_noise) = task_base.config.isac_ekf_process_noise_accel {
+            engine.set_ekf_process_noise_accel(process_noise);
         }
+        info!("ISAC: tracking filter is {filter:?}");
+
+        Self { task_base, engine }
+    }
+
+    /// Applies a tracking update through the engine (issue #27).
+    ///
+    /// A method rather than inline in the message loop so a test can drive the
+    /// same code the loop runs: the previous inline version could only be
+    /// exercised by starting the task, which is why the duplicate tracker map it
+    /// used to write went unnoticed.
+    fn handle_tracking_update(&mut self, object_id: u64, position: (f32, f32, f32)) {
+        debug!("ISAC: Tracking update for object {}", object_id);
+        let pos = Vector3::new(position.0 as f64, position.1 as f64, position.2 as f64);
+        // Measurement uncertainty is 1 m because the TrackingUpdate message
+        // carries none. Passing the real figure needs the message to grow a
+        // field, which no issue has asked for; recorded here rather than left as
+        // an unexplained literal.
+        self.engine.update_tracking(object_id, pos, 1.0);
     }
 }
 
@@ -185,16 +213,7 @@ impl Task for IsacTask {
                             position,
                             velocity: _,
                         } => {
-                            debug!("ISAC: Tracking update for object {}", object_id);
-                            let pos = Vector3::new(
-                                position.0 as f64,
-                                position.1 as f64,
-                                position.2 as f64,
-                            );
-                            self.trackers
-                                .entry(object_id)
-                                .and_modify(|t| t.update(pos, 1.0))
-                                .or_insert_with(|| TrackingState::new(object_id, pos));
+                            self.handle_tracking_update(object_id, position);
                         }
                     }
                 }
@@ -202,7 +221,10 @@ impl Task for IsacTask {
                 None => break,
             }
         }
-        info!("ISAC task stopped, {} tracked objects", self.trackers.len());
+        info!(
+            "ISAC task stopped, {} tracked objects",
+            self.engine.active_track_count()
+        );
     }
 }
 
@@ -354,5 +376,75 @@ mod bus_tests {
                 .unwrap_or_else(|e| panic!("{label} must receive it, got {e:?}"));
             assert_eq!(event.measurements, vec![42.0]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::DEFAULT_CHANNEL_CAPACITY;
+    use nextgsim_common::config::GnbConfig;
+
+    fn task_for(config: GnbConfig) -> IsacTask {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        IsacTask::new(task_base)
+    }
+
+    #[test]
+    fn the_gnb_isac_task_selects_the_ekf_when_configured() {
+        // Default: unchanged behaviour.
+        let default_task = task_for(GnbConfig::default());
+        assert_eq!(
+            default_task.engine.tracking_filter(),
+            TrackingFilter::Linear,
+            "the default build must keep the smoother"
+        );
+
+        let mut config = GnbConfig::default();
+        config.isac_ekf_tracking = true;
+        let ekf_task = task_for(config);
+        assert_eq!(ekf_task.engine.tracking_filter(), TrackingFilter::Ekf);
+    }
+
+    #[test]
+    fn the_gnb_isac_task_tracks_through_the_engine() {
+        // This task used to keep its own tracker map beside the engine, which is
+        // why the engine's EKF had no live caller. The engine must be the only
+        // place a track lives.
+        let mut task = task_for(GnbConfig::default());
+        assert_eq!(task.engine.active_track_count(), 0);
+
+        // Driven through the same handler the message loop calls, so this cannot
+        // pass while the loop writes somewhere else.
+        task.handle_tracking_update(42, (1.0, 2.0, 3.0));
+
+        assert_eq!(
+            task.engine.active_track_count(),
+            1,
+            "the track must live in the engine"
+        );
+        let track = task.engine.get_tracking(42).expect("the track exists");
+        assert!(track.position.distance_to(&Vector3::new(1.0, 2.0, 3.0)) < 1e-9);
+    }
+
+    #[test]
+    fn a_configured_process_noise_reaches_the_engine() {
+        // An EKF whose process noise never left the config would be tuned by
+        // nothing, which is indistinguishable from having no knob at all.
+        let mut config = GnbConfig::default();
+        config.isac_ekf_tracking = true;
+        config.isac_ekf_process_noise_accel = Some(0.05);
+        let mut task = task_for(config);
+
+        // Drive one update so the EKF is created, then read the value back off it.
+        task.engine
+            .update_tracking(1, Vector3::new(0.0, 0.0, 0.0), 1.0);
+        let ekf = task.engine.get_ekf(1).expect("an EKF was created");
+        assert!(
+            (ekf.process_noise_accel - 0.05).abs() < f64::EPSILON,
+            "configured process noise must reach the filter, got {}",
+            ekf.process_noise_accel
+        );
     }
 }
