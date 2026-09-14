@@ -133,6 +133,22 @@ pub enum PagingDrxValue {
     V256,
 }
 
+impl PagingDrxValue {
+    /// The DRX cycle in radio frames, which is the `T` of TS 38.304 §7.1.
+    ///
+    /// Exists so the paging occasion can actually be derived from what the AMF
+    /// signalled: before this the IE was decoded and logged and nothing consumed
+    /// it (issue #99).
+    pub fn radio_frames(self) -> u16 {
+        match self {
+            Self::V32 => 32,
+            Self::V64 => 64,
+            Self::V128 => 128,
+            Self::V256 => 256,
+        }
+    }
+}
+
 impl From<PagingDrxValue> for PagingDRX {
     fn from(drx: PagingDrxValue) -> Self {
         match drx {
@@ -483,6 +499,16 @@ pub fn is_paging(pdu: &NGAP_PDU) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The DRX cycle in radio frames is the `T` of TS 38.304 §7.1, so a wrong
+    /// mapping puts every paged UE's occasion in the wrong frame (issue #99).
+    #[test]
+    fn the_drx_cycle_converts_to_radio_frames() {
+        assert_eq!(PagingDrxValue::V32.radio_frames(), 32);
+        assert_eq!(PagingDrxValue::V64.radio_frames(), 64);
+        assert_eq!(PagingDrxValue::V128.radio_frames(), 128);
+        assert_eq!(PagingDrxValue::V256.radio_frames(), 256);
+    }
+
     use super::*;
 
     fn create_test_params() -> PagingParams {

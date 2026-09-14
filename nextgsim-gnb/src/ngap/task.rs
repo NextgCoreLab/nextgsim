@@ -2846,6 +2846,11 @@ impl NgapTask {
         let msg = RrcMessage::Paging {
             ue_paging_tmsi,
             tai_list_for_paging,
+            // The (default)PagingDRX the AMF signalled, converted to radio frames
+            // -- the `T` of TS 38.304 §7.1. Before issue #99 this IE was decoded,
+            // logged and dropped, so the paging occasion could not follow what the
+            // network asked for.
+            drx_cycle_frames: paging.paging_drx.map(|drx| drx.radio_frames()),
         };
         if let Err(e) = self.task_base.rrc_tx.send(msg).await {
             error!("Failed to forward Paging to RRC: {}", e);
@@ -4321,11 +4326,16 @@ mod tests {
             Ok(TaskMessage::Message(RrcMessage::Paging {
                 ue_paging_tmsi,
                 tai_list_for_paging,
+                drx_cycle_frames,
             })) => {
                 assert_eq!(ue_paging_tmsi.len(), 6);
                 assert_eq!(tai_list_for_paging.len(), 6); // one matching TAI
                 assert_eq!(&tai_list_for_paging[0..3], &served_plmn);
                 assert_eq!(&tai_list_for_paging[3..6], &served_tac);
+                // The AMF's (default)PagingDRX must REACH the RRC layer -- it was
+                // decoded and dropped before issue #99. This fixture sends none,
+                // so the absence is what carries through.
+                assert_eq!(drx_cycle_frames, None);
             }
             other => panic!("expected RRC Paging, got {other:?}"),
         }

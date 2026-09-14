@@ -38,6 +38,7 @@ use nextgsim_ngap::procedures::paging::{
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::paging::{decode_paging, PagedUeIdentity};
 use nextgsim_ue::{NasMessage, RrcTask as UeRrcTask, TaskMessage as UeTaskMessage, UeTaskBase};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 const AMF_CLIENT_ID: i32 = 1;
@@ -105,6 +106,26 @@ fn amf_paging_pdu(tai: Tai) -> Vec<u8> {
     .expect("encode NGAP Paging")
 }
 
+/// A UE configuration whose paging cycle MATCHES the gNB's.
+///
+/// Not optional: TS 38.304 §7.1's `T` is the same term on both sides, and this
+/// simulator does not signal `PCCH-Config` in SIB1, so the two ends agree by
+/// configuration. A UE left on the 128-frame default while the gNB pages on rf32
+/// computes a different paging frame and drops the paging -- which is what this
+/// test found the first time it ran.
+fn ue_config_matching_gnb_paging() -> UeConfig {
+    UeConfig {
+        paging_default_cycle_frames: PAGING_DRX_FRAMES,
+        ..UeConfig::default()
+    }
+}
+
+/// The DRX cycle these tests page on, in radio frames (TS 38.331 `rf32`).
+///
+/// The shortest `defaultPagingCycle` there is, chosen so the deferral to the UE's
+/// paging occasion bounds at 320 ms rather than the 1.28 s of the rf128 default.
+const PAGING_DRX_FRAMES: u16 = 32;
+
 fn served_tai() -> Tai {
     Tai {
         plmn_identity: SERVED_PLMN,
@@ -135,14 +156,15 @@ async fn ngap_task_with_ready_amf() -> (NgapTask, mpsc::Receiver<GnbTaskMessage<
 /// Pops the next `RrcMessage::Paging` the NGAP task forwarded to RRC.
 fn try_take_rrc_paging(
     rx: &mut mpsc::Receiver<GnbTaskMessage<GnbRrcMessage>>,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> Option<(Vec<u8>, Vec<u8>, Option<u16>)> {
     while let Ok(msg) = rx.try_recv() {
         if let GnbTaskMessage::Message(GnbRrcMessage::Paging {
             ue_paging_tmsi,
             tai_list_for_paging,
+            drx_cycle_frames,
         }) = msg
         {
-            return Some((ue_paging_tmsi, tai_list_for_paging));
+            return Some((ue_paging_tmsi, tai_list_for_paging, drx_cycle_frames));
         }
     }
     None
@@ -161,6 +183,29 @@ fn try_take_broadcast(
         }
     }
     None
+}
+
+/// Waits up to `budget` for the gNB to broadcast.
+///
+/// ISSUE #99 CHANGED THE TIMING of this whole chain: the PCCH Paging is now
+/// transmitted at the paged UE's paging frame (TS 38.304 §7.1) rather than
+/// immediately, so a `try_recv` straight after `handle_paging` is racing the
+/// occasion by design. The DRX cycle these tests use is rf32, which bounds the
+/// wait at 320 ms.
+async fn await_broadcast(
+    rx: &mut mpsc::Receiver<GnbTaskMessage<GnbRlsMessage>>,
+    budget: Duration,
+) -> Option<(RrcChannel, OctetString)> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some(found) = try_take_broadcast(rx) {
+            return Some(found);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Pops the next paging indication the UE RRC task handed to its NAS.
@@ -187,7 +232,7 @@ async fn an_amf_paging_reaches_the_idle_ue_as_a_nas_paging_indication() {
     )
     .await;
 
-    let (ue_paging_tmsi, tai_list) =
+    let (ue_paging_tmsi, tai_list, _drx) =
         try_take_rrc_paging(&mut gnb_rrc_rx).expect("the NGAP layer must forward an RRC Paging");
     assert_eq!(
         ue_paging_tmsi, PAGED_S_TMSI,
@@ -199,10 +244,35 @@ async fn an_amf_paging_reaches_the_idle_ue_as_a_nas_paging_indication() {
     let (gnb_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut gnb_rls_rx, _sctp_rx) =
         GnbTaskBase::new(gnb_config(), 32);
     let mut gnb_rrc = GnbRrcTask::new(gnb_base);
-    gnb_rrc.handle_paging(ue_paging_tmsi, tai_list).await;
+
+    // The paging occasion the gNB will use (issue #99), computed before the send
+    // so the test knows how long the transmission is legitimately deferred.
+    let schedule = gnb_rrc.schedule_paging(
+        &PAGED_S_TMSI,
+        Some(PAGING_DRX_FRAMES),
+        nextgsim_common::frame_clock::current_sfn(),
+    );
+    gnb_rrc
+        .handle_paging(ue_paging_tmsi, tai_list, Some(PAGING_DRX_FRAMES))
+        .await;
+
+    // CRITERION 4: nothing goes out before the occasion. Only asserted when the
+    // occasion is not the current frame -- roughly 31 runs in 32, and claiming it
+    // in the 1-in-32 case where the delay is genuinely zero would be false.
+    if !schedule.delay.is_zero() {
+        assert!(
+            try_take_broadcast(&mut gnb_rls_rx).is_none(),
+            "the PCCH Paging must not be transmitted before the UE's paging frame \
+             (SFN {}, {} ms away)",
+            schedule.paging_frame,
+            schedule.delay.as_millis()
+        );
+    }
 
     let (channel, pcch_pdu) =
-        try_take_broadcast(&mut gnb_rls_rx).expect("the gNB must broadcast the paging");
+        await_broadcast(&mut gnb_rls_rx, schedule.delay + Duration::from_millis(300))
+            .await
+            .expect("the gNB must broadcast the paging at the UE's paging frame");
     assert_eq!(channel, RrcChannel::Pcch, "paging is a PCCH transmission");
 
     let records = decode_paging(pcch_pdu.data()).expect("a decodable PCCH Paging message");
@@ -214,7 +284,7 @@ async fn an_amf_paging_reaches_the_idle_ue_as_a_nas_paging_indication() {
 
     // ---- UE leg: PCCH monitor and identity match -------------------------
     let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, _ue_rls_rx) =
-        UeTaskBase::new(UeConfig::default(), 32);
+        UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
     // What the UE's NAS plane hands down once a 5G-GUTI is assigned
     // (`RrcMessage::PagingIdentity`).
@@ -243,16 +313,27 @@ async fn a_ue_with_a_different_5g_s_tmsi_is_not_paged_by_the_same_broadcast() {
         OctetString::from_slice(&amf_paging_pdu(served_tai())),
     )
     .await;
-    let (ue_paging_tmsi, tai_list) = try_take_rrc_paging(&mut gnb_rrc_rx).expect("RRC Paging");
+    let (ue_paging_tmsi, tai_list, _drx) =
+        try_take_rrc_paging(&mut gnb_rrc_rx).expect("RRC Paging");
 
     let (gnb_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut gnb_rls_rx, _sctp_rx) =
         GnbTaskBase::new(gnb_config(), 32);
     let mut gnb_rrc = GnbRrcTask::new(gnb_base);
-    gnb_rrc.handle_paging(ue_paging_tmsi, tai_list).await;
-    let (_, pcch_pdu) = try_take_broadcast(&mut gnb_rls_rx).expect("PCCH broadcast");
+    let schedule = gnb_rrc.schedule_paging(
+        &PAGED_S_TMSI,
+        Some(PAGING_DRX_FRAMES),
+        nextgsim_common::frame_clock::current_sfn(),
+    );
+    gnb_rrc
+        .handle_paging(ue_paging_tmsi, tai_list, Some(PAGING_DRX_FRAMES))
+        .await;
+    let (_, pcch_pdu) =
+        await_broadcast(&mut gnb_rls_rx, schedule.delay + Duration::from_millis(300))
+            .await
+            .expect("PCCH broadcast");
 
     let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, _ue_rls_rx) =
-        UeTaskBase::new(UeConfig::default(), 32);
+        UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
     ue_rrc.set_paging_identity(Some(OTHER_S_TMSI));
 
@@ -286,5 +367,87 @@ async fn a_paging_for_an_unserved_tai_never_reaches_the_air_interface() {
     assert!(
         try_take_rrc_paging(&mut gnb_rrc_rx).is_none(),
         "a Paging for another tracking area must not reach RRC"
+    );
+}
+
+/// CRITERION 5 (issue #99): a record that matches this UE but arrives outside its
+/// own paging occasion produces no service request.
+///
+/// The occasion is chosen by picking the IDENTITY rather than by controlling the
+/// clock: `UE_ID` determines the paging frame, so searching for an identity whose
+/// frame is several frames away from the current one gives a deterministic
+/// "foreign occasion" against the live clock. Both directions are asserted, since
+/// a UE that dropped everything would pass the negative alone.
+#[tokio::test]
+async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_request() {
+    use nextgsim_rrc::procedures::paging::{encode_paging, PagingRecordParams};
+    use nextgsim_rrc::procedures::paging_occasion::{
+        paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig,
+    };
+
+    let cycle = PagingCycleConfig::with_default_spreading(PAGING_DRX_FRAMES).expect("valid cycle");
+    let now = nextgsim_common::frame_clock::current_sfn();
+
+    // An identity whose paging frame is the CURRENT frame, and one whose frame is
+    // at least 4 frames away -- comfortably outside the 2-frame tolerance.
+    let mut at_occasion: Option<[u8; 6]> = None;
+    let mut off_occasion: Option<[u8; 6]> = None;
+    for candidate in 0u32..4096 {
+        let s_tmsi = [
+            0x55,
+            0x6A,
+            0xDE,
+            0xAD,
+            (candidate >> 8) as u8,
+            (candidate & 0xFF) as u8,
+        ];
+        let occasion = paging_occasion(ue_id_from_s_tmsi(&s_tmsi), &cycle);
+        if at_occasion.is_none() && occasion.is_paging_frame(now) {
+            at_occasion = Some(s_tmsi);
+        }
+        // Clear the UE's whole acceptance window (T/8, floor 4), plus a frame.
+        let window = (cycle.t() / 8).max(4) + 1;
+        if off_occasion.is_none()
+            && !(0..=window).any(|back| occasion.is_paging_frame(now.wrapping_sub(back)))
+        {
+            off_occasion = Some(s_tmsi);
+        }
+        if at_occasion.is_some() && off_occasion.is_some() {
+            break;
+        }
+    }
+    let at_occasion = at_occasion.expect("some identity pages in the current frame");
+    let off_occasion = off_occasion.expect("some identity pages in another frame");
+
+    // ---- outside its occasion: dropped -----------------------------------
+    let pdu = encode_paging(&[PagingRecordParams::five_g_s_tmsi(off_occasion)])
+        .expect("encode PCCH Paging");
+    let (ue_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
+        UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
+    let mut ue_rrc = UeRrcTask::new(ue_base);
+    ue_rrc.set_paging_identity(Some(off_occasion));
+    ue_rrc
+        .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, OctetString::from_slice(&pdu))
+        .await;
+    assert!(
+        try_take_ue_paging(&mut nas_rx).is_none(),
+        "a record matching this UE but delivered outside its paging occasion must \
+         not start a service request"
+    );
+
+    // ---- inside its occasion: accepted (the positive control) ------------
+    let pdu = encode_paging(&[PagingRecordParams::five_g_s_tmsi(at_occasion)])
+        .expect("encode PCCH Paging");
+    let (ue_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
+        UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
+    let mut ue_rrc = UeRrcTask::new(ue_base);
+    ue_rrc.set_paging_identity(Some(at_occasion));
+    ue_rrc
+        .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, OctetString::from_slice(&pdu))
+        .await;
+    assert_eq!(
+        try_take_ue_paging(&mut nas_rx),
+        Some(vec![at_occasion]),
+        "a record delivered in this UE's own paging occasion must be acted on"
     );
 }

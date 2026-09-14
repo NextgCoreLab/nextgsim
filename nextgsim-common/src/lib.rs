@@ -19,6 +19,7 @@ pub mod bus;
 pub mod cli_server;
 pub mod config;
 pub mod error;
+pub mod frame_clock;
 pub mod logging;
 pub mod octet;
 pub mod octet_string;

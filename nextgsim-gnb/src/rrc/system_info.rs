@@ -13,6 +13,7 @@
 //! such below rather than being made configurable knobs nothing reads.
 
 use nextgsim_common::config::GnbConfig;
+use nextgsim_common::frame_clock;
 use nextgsim_rrc::procedures::system_information::{
     encode_mib, encode_sib1, CellBarredStatus, CellSelectionInfo, DmrsTypeAPosition,
     IntraFreqReselection, MibParams, PdcchConfigSib1Params, PlmnIdentity, PlmnIdentityInfo,
@@ -52,14 +53,20 @@ const Q_RX_LEV_MIN: i8 = -70;
 /// parameter this simulator does not model, so there is nothing cell-specific to
 /// read. SIB1 is where this cell's identity goes.
 ///
-/// SYSTEM FRAME NUMBER: always 0. The MIB carries the 6 most significant bits of
-/// the SFN, and this simulator maintains no frame clock at all (see the paging
-/// occasion discussion in issue #99), so a counter here would be a number that
-/// looks like frame timing while corresponding to nothing. Zero at least does not
-/// pretend otherwise.
+/// SYSTEM FRAME NUMBER: the 6 most significant bits of the live SFN, which is
+/// what TS 38.331 gives the MIB (the 4 LSBs travel on the PBCH payload, which this
+/// simulator does not model). It used to be a constant 0 because no frame clock
+/// existed; `nextgsim_common::frame_clock` now derives one from the wall clock on
+/// both sides (issue #99), so this field carries real timing.
+///
+/// It is deliberately NOT widened to the full 10 bits. A UE cannot recover the
+/// exact frame from the MIB alone -- the granularity is 16 frames -- so the MIB is
+/// a CROSS-CHECK on the shared clock rather than the clock itself. Putting 10 bits
+/// in a 6-bit field would make a decoder that trusts the field wrong about a real
+/// network.
 pub fn mib_params() -> MibParams {
     MibParams {
-        system_frame_number: 0,
+        system_frame_number: frame_clock::sfn_msb6(frame_clock::current_sfn()),
         sub_carrier_spacing_common: SubCarrierSpacingCommon::Scs30Or120,
         ssb_subcarrier_offset: SSB_SUBCARRIER_OFFSET,
         dmrs_type_a_position: DmrsTypeAPosition::Pos2,
@@ -207,6 +214,23 @@ mod tests {
             decoded.intra_freq_reselection,
             IntraFreqReselection::Allowed
         );
-        assert_eq!(decoded.system_frame_number, 0, "no frame clock exists");
+        // FLIPPED by issue #99. This asserted `== 0, "no frame clock exists"`,
+        // which pinned the absence of the clock. A clock now exists, so the MIB
+        // must carry the live SFN's 6 most significant bits -- and the assertion
+        // has to be against the clock rather than a constant, or it would only be
+        // pinning whatever number happened to be there.
+        let expected = frame_clock::sfn_msb6(frame_clock::current_sfn());
+        assert!(
+            decoded.system_frame_number == expected
+                || decoded.system_frame_number == expected.wrapping_sub(1) % 64,
+            "MIB SFN {} must be the live SFN's MSB6 ({expected}); a 16-frame \
+             boundary may fall between encode and assert, which is the only \
+             tolerated difference",
+            decoded.system_frame_number
+        );
+        assert!(
+            decoded.system_frame_number <= 63,
+            "the MIB field is 6 bits wide"
+        );
     }
 }
