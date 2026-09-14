@@ -305,6 +305,11 @@ impl UeApp {
         // Spawn TUN app message handler (logs TUN events)
         let rls_tx_for_tun = task_base.rls_tx.clone();
         let nas_tx_for_tun = task_base.nas_tx.clone();
+        // URSP traffic classification (issue #97), captured here because the TUN
+        // forwarding closure has no access to the config afterwards.
+        let ursp_classification_enabled = task_base.config.ursp_evaluation;
+        let (ursp_os_id, ursp_os_app_id) =
+            nextgsim_ue::nas::sm::ApplicationDescriptor::configured_os_identity(&task_base.config);
         tokio::spawn(async move {
             while let Some(msg) = tun_app_rx.recv().await {
                 match msg {
@@ -316,6 +321,24 @@ impl UeApp {
                     }
                     TunAppMessage::UplinkData { psi, data } => {
                         info!("TUN uplink data: PSI={}, len={}", psi, data.len());
+                        // Classify the flow for URSP evaluation (issue #97). Only
+                        // when the switch is on: classification is cheap but the
+                        // descriptor it produces drives session establishment, and
+                        // the default build must not start sessions a URSP rule
+                        // asked for when URSP is off.
+                        //
+                        // The packet itself still goes out on the tunnel it arrived
+                        // on -- see the ceiling note on the handler.
+                        let app = if ursp_classification_enabled {
+                            nextgsim_ue::nas::sm::ApplicationDescriptor::from_uplink_packet(
+                                data.data(),
+                            )
+                            .map(|app| {
+                                Box::new(app.with_os_identity(ursp_os_id, ursp_os_app_id.clone()))
+                            })
+                        } else {
+                            None
+                        };
                         // Trigger Service Request if UE is in IDLE state
                         // (NAS task will check actual state and only send if needed)
                         //
@@ -326,6 +349,7 @@ impl UeApp {
                         // that no session ever uses.
                         let _ = nas_tx_for_tun
                             .send(NasMessage::InitiateServiceRequest {
+                                app,
                                 psi: u8::try_from(psi).ok(),
                             })
                             .await;
@@ -830,7 +854,51 @@ impl UeApp {
                             debug!("Downlink data received: psi={}, len={}", psi, data.len());
                             let _ = tun_tx.send(TunMessage::WriteData { psi, data }).await;
                         }
-                        NasMessage::InitiateServiceRequest { psi } => {
+                        NasMessage::InitiateServiceRequest { app, psi } => {
+                            // URSP steering for the classified flow (issue #97,
+                            // TS 24.526 §5.2). This is the production caller
+                            // `start_establishment_for_app` never had: a session
+                            // matching the rule's route selection descriptor is
+                            // established, or an existing one carrying those
+                            // parameters is reused.
+                            //
+                            // CEILING: the packet that triggered this has already
+                            // been forwarded on the tunnel it arrived on. Steering
+                            // decides which session EXISTS and carries the rule's
+                            // parameters -- which is what TS 24.526 §5.2 selects and
+                            // what this issue's criterion asks for -- not which
+                            // tunnel this particular packet took. Re-tunnelling a
+                            // packet mid-flight would need a flow table on the data
+                            // path, which is a throughput change rather than a
+                            // policy one.
+                            if let Some(app) = app {
+                                // The FIRST configured session's parameters are the
+                                // base a URSP route selection descriptor overrides.
+                                // A UE with no configured session has nothing to
+                                // establish, and the classification is dropped
+                                // rather than a session being invented for it.
+                                let base = sm_session_params.first();
+                                let (selected, outs) = match base {
+                                    Some(base) => {
+                                        sm_orch.start_establishment_for_app(&app, base)
+                                    }
+                                    None => (None, Vec::new()),
+                                };
+                                if !outs.is_empty() || selected.is_some() {
+                                    info!(
+                                        "URSP: flow classified (proto={:?}, port={:?}) -> PSI {:?}",
+                                        app.protocol, app.port, selected
+                                    );
+                                }
+                                process_sm_outputs(
+                                    outs,
+                                    &mut orch,
+                                    &task_base,
+                                    &tun_tx,
+                                    &mut pdu_counter,
+                                )
+                                .await;
+                            }
                             // Data-triggered Service Request: UE has data to send while in IDLE
                             if orch.state().is_registered() && orch.state().is_idle() {
                                 // TS 24.501 §5.6.1.2 / §9.11.3.44: the Uplink data

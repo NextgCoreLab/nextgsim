@@ -70,6 +70,130 @@ pub struct ApplicationDescriptor {
 }
 
 impl ApplicationDescriptor {
+    /// Classify an uplink IP packet into the application information URSP matches
+    /// against (issue #97).
+    ///
+    /// This is the traffic-classification hook the URSP engine was missing. Before
+    /// it, the only descriptor production could build named a DNN and nothing else,
+    /// so five of the eight traffic-descriptor component types -- IPv4 and IPv6
+    /// remote address, protocol identifier, single remote port and port range --
+    /// could never match however the network configured them.
+    ///
+    /// Reads the **remote** (destination) address and port, which is what a
+    /// traffic descriptor names: TS 24.526 §5.2's descriptors are written from the
+    /// UE's point of view, so "remote" is the far end of an uplink packet.
+    ///
+    /// `None` when the bytes are not a packet this can classify: too short, an
+    /// unrecognised IP version, or a truncated transport header. `None` rather than
+    /// a partially-filled descriptor, because a descriptor with a plausible address
+    /// and a garbage port would match a rule the flow does not belong to.
+    ///
+    /// ## What it cannot fill, and why
+    ///
+    /// - **`fqdn`**: this UE performs no DNS interception, so a resolved name is
+    ///   not observable from a packet. `DestinationFqdn` components remain
+    ///   decode-and-match-only.
+    /// - **`os_id` / `os_app_id`**: not derivable from a packet at all. They come
+    ///   from configuration instead (`ursp_os_id`, `ursp_os_app_id`), which is the
+    ///   "pretend this app is running" hook -- an honest stand-in for an OS the
+    ///   simulator does not have, rather than a value invented per packet.
+    pub fn from_uplink_packet(packet: &[u8]) -> Option<Self> {
+        let version = packet.first()? >> 4;
+        let (protocol, remote_ipv4, remote_ipv6, transport) = match version {
+            4 => {
+                // IPv4 (RFC 791): IHL is the low nibble of octet 0, in 32-bit words.
+                let ihl = usize::from(packet[0] & 0x0F) * 4;
+                if ihl < 20 || packet.len() < ihl {
+                    return None;
+                }
+                let protocol = *packet.get(9)?;
+                let dst: [u8; 4] = packet.get(16..20)?.try_into().ok()?;
+                (protocol, Some(dst), None, &packet[ihl..])
+            }
+            6 => {
+                // IPv6 (RFC 8200): a fixed 40-octet header. Extension headers are
+                // NOT walked -- a packet carrying one is left unclassified rather
+                // than having its Next Header read as a transport protocol, which
+                // would report a routing header as if it were TCP.
+                if packet.len() < 40 {
+                    return None;
+                }
+                let protocol = packet[6];
+                let dst: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
+                (protocol, None, Some(dst), &packet[40..])
+            }
+            _ => return None,
+        };
+
+        // The destination port, for the transports that have one. Anything else
+        // classifies with a protocol and no port, which still matches a
+        // protocol-keyed rule.
+        const TCP: u8 = 6;
+        const UDP: u8 = 17;
+        let port = match protocol {
+            TCP | UDP if transport.len() >= 4 => {
+                Some(u16::from_be_bytes([transport[2], transport[3]]))
+            }
+            TCP | UDP => return None, // truncated transport header: not classifiable
+            _ => None,
+        };
+
+        Some(Self {
+            os_id: None,
+            os_app_id: None,
+            dnn: None,
+            fqdn: None,
+            ipv4: remote_ipv4,
+            ipv6: remote_ipv6,
+            protocol: Some(protocol),
+            port,
+        })
+    }
+
+    /// The OS identity the configuration declares, decoded (issue #97).
+    ///
+    /// Returns `(os_id, os_app_id)`. A `ursp_os_id` that is not 32 hex characters
+    /// yields `None` for the id with a warning rather than a partial UUID: half a
+    /// UUID identifies a different OS.
+    pub fn configured_os_identity(
+        config: &nextgsim_common::config::UeConfig,
+    ) -> (Option<[u8; 16]>, Option<Vec<u8>>) {
+        let os_app_id = config
+            .ursp_os_app_id
+            .as_ref()
+            .map(|id| id.as_bytes().to_vec());
+
+        let os_id = config.ursp_os_id.as_ref().and_then(|hex| {
+            let hex = hex.trim().replace('-', "");
+            if hex.len() != 32 {
+                tracing::warn!(
+                    "ursp_os_id must be 32 hex characters (a UUID); {} given -- OS Id not reported",
+                    hex.len()
+                );
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            for (index, octet) in octets.iter_mut().enumerate() {
+                *octet = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+            }
+            Some(octets)
+        });
+
+        (os_id, os_app_id)
+    }
+
+    /// Add the configured OS identity to a descriptor (issue #97).
+    ///
+    /// The simulator has no OS and detects no applications, so an `OsIdOsAppId`
+    /// component can only ever match something the operator declared. Applying it
+    /// here rather than inside [`Self::from_uplink_packet`] keeps the classifier a
+    /// pure function of the packet.
+    pub fn with_os_identity(mut self, os_id: Option<[u8; 16]>, os_app_id: Option<Vec<u8>>) -> Self {
+        self.os_id = os_id;
+        self.os_app_id = os_app_id;
+        self
+    }
+
     /// A descriptor naming only a DNN — what the configured default sessions
     /// have to offer, and enough to exercise DNN-keyed steering rules.
     pub fn for_dnn(dnn: impl Into<String>) -> Self {
@@ -395,11 +519,142 @@ fn select_route(rule: &UrspRule) -> Option<RouteSelectionDescriptor> {
 /// | `*` or `match-all` | `MatchAll` (makes this the default rule) |
 /// | `dnn:<name>` | `Dnn(<name>)` |
 /// | `fqdn:<name>` | `DestinationFqdn(<name>)` |
+/// | `ipv4:<a.b.c.d>` or `ipv4:<a.b.c.d>/<len>` | `Ipv4RemoteAddress` |
+/// | `ipv6:<addr>/<len>` | `Ipv6RemoteAddress` |
+/// | `proto:<0-255>` | `ProtocolIdentifier` |
+/// | `port:<n>` or `port:<lo>-<hi>` | `SingleRemotePort` / `RemotePortRange` |
 /// | anything else | `OsIdOsAppId` with a zero OS Id and the string as App Id |
+///
+/// The four flow-keyed spellings arrived with issue #97's traffic classification.
+/// Without them the newly-reachable matchers would serve only PCF-delivered rules,
+/// so an operator could not configure the steering the classifier makes possible.
 ///
 /// Returns `None` for a rule with no usable route selection descriptor: a rule
 /// that can match but cannot steer is not a rule, and silently keeping it would
 /// let it shadow a later rule that could have served the application.
+/// Parse an `ipv4:` config descriptor: `a.b.c.d` or `a.b.c.d/len`.
+///
+/// A bare address means an exact match, i.e. a full 32-bit mask. Defaulting a
+/// missing prefix to 0 instead would turn "this host" into "every host".
+fn parse_ipv4_descriptor(spec: &str) -> Option<TrafficDescriptorComponent> {
+    let (address, prefix) = match spec.trim().split_once('/') {
+        Some((address, len)) => (address, len.trim().parse::<u8>().ok()?),
+        None => (spec.trim(), 32),
+    };
+    if prefix > 32 {
+        return None;
+    }
+    let octets: Vec<u8> = address
+        .split('.')
+        .map(|part| part.trim().parse::<u8>().ok())
+        .collect::<Option<Vec<u8>>>()?;
+    let addr: [u8; 4] = octets.try_into().ok()?;
+
+    // A prefix length as a big-endian mask. Shifting a u32 by 32 is undefined, so
+    // the zero-prefix case is handled explicitly rather than by the shift.
+    let mask_bits: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    Some(TrafficDescriptorComponent::Ipv4RemoteAddress {
+        addr,
+        mask: mask_bits.to_be_bytes(),
+    })
+}
+
+/// Parse an `ipv6:` config descriptor: `<addr>/<len>`, or a bare address meaning
+/// an exact /128 match.
+///
+/// Accepts the full colon-hex form with at most one `::` run, which is what an
+/// operator writes. A malformed address yields `None` and the rule is dropped.
+fn parse_ipv6_descriptor(spec: &str) -> Option<TrafficDescriptorComponent> {
+    let (address, prefix) = match spec.trim().split_once('/') {
+        Some((address, len)) => (address, len.trim().parse::<u8>().ok()?),
+        None => (spec.trim(), 128),
+    };
+    if prefix > 128 {
+        return None;
+    }
+    let addr = parse_ipv6_address(address)?;
+    Some(TrafficDescriptorComponent::Ipv6RemoteAddress {
+        addr,
+        prefix_len: prefix,
+    })
+}
+
+/// Parse a colon-hex IPv6 address into its 16 octets.
+fn parse_ipv6_address(text: &str) -> Option<[u8; 16]> {
+    let text = text.trim();
+    // At most one "::" run, per RFC 4291 §2.2.
+    let (head, tail) = match text.split_once("::") {
+        Some((head, tail)) => {
+            if tail.contains("::") {
+                return None;
+            }
+            (head, Some(tail))
+        }
+        None => (text, None),
+    };
+
+    let parse_groups = |part: &str| -> Option<Vec<u16>> {
+        if part.is_empty() {
+            return Some(Vec::new());
+        }
+        part.split(':')
+            .map(|group| u16::from_str_radix(group, 16).ok())
+            .collect()
+    };
+
+    let head_groups = parse_groups(head)?;
+    let tail_groups = match tail {
+        Some(tail) => parse_groups(tail)?,
+        None => Vec::new(),
+    };
+
+    let mut groups = [0u16; 8];
+    if tail.is_none() {
+        if head_groups.len() != 8 {
+            return None;
+        }
+        groups.copy_from_slice(&head_groups);
+    } else {
+        if head_groups.len() + tail_groups.len() > 8 {
+            return None;
+        }
+        groups[..head_groups.len()].copy_from_slice(&head_groups);
+        let start = 8 - tail_groups.len();
+        groups[start..].copy_from_slice(&tail_groups);
+    }
+
+    let mut octets = [0u8; 16];
+    for (index, group) in groups.iter().enumerate() {
+        octets[index * 2..index * 2 + 2].copy_from_slice(&group.to_be_bytes());
+    }
+    Some(octets)
+}
+
+/// Parse a `port:` config descriptor: `<n>` or `<lo>-<hi>`.
+///
+/// A reversed range is rejected rather than swapped: `port:500-100` is a typo, and
+/// silently reading it as 100-500 applies a policy the operator did not write.
+fn parse_port_descriptor(spec: &str) -> Option<TrafficDescriptorComponent> {
+    let spec = spec.trim();
+    match spec.split_once('-') {
+        Some((low, high)) => {
+            let low = low.trim().parse::<u16>().ok()?;
+            let high = high.trim().parse::<u16>().ok()?;
+            if low > high {
+                return None;
+            }
+            Some(TrafficDescriptorComponent::RemotePortRange { low, high })
+        }
+        None => Some(TrafficDescriptorComponent::SingleRemotePort(
+            spec.parse::<u16>().ok()?,
+        )),
+    }
+}
+
 fn convert_config_rule(rule: &ConfigUrspRule) -> Option<UrspRule> {
     let descriptor = rule.traffic_descriptor.trim();
     let component = if descriptor == "*" || descriptor.eq_ignore_ascii_case("match-all") {
@@ -408,6 +663,41 @@ fn convert_config_rule(rule: &ConfigUrspRule) -> Option<UrspRule> {
         TrafficDescriptorComponent::Dnn(dnn.to_string())
     } else if let Some(fqdn) = descriptor.strip_prefix("fqdn:") {
         TrafficDescriptorComponent::DestinationFqdn(fqdn.to_string())
+    } else if let Some(spec) = descriptor.strip_prefix("ipv4:") {
+        // A rule whose address does not parse is DROPPED rather than widened to
+        // match-all: a malformed address in an allow-style rule that fell back to
+        // matching everything would steer every flow.
+        match parse_ipv4_descriptor(spec) {
+            Some(component) => component,
+            None => {
+                debug!("URSP config: ignoring rule with unparsable ipv4 descriptor '{spec}'");
+                return None;
+            }
+        }
+    } else if let Some(spec) = descriptor.strip_prefix("ipv6:") {
+        match parse_ipv6_descriptor(spec) {
+            Some(component) => component,
+            None => {
+                debug!("URSP config: ignoring rule with unparsable ipv6 descriptor '{spec}'");
+                return None;
+            }
+        }
+    } else if let Some(spec) = descriptor.strip_prefix("proto:") {
+        match spec.trim().parse::<u8>() {
+            Ok(proto) => TrafficDescriptorComponent::ProtocolIdentifier(proto),
+            Err(_) => {
+                debug!("URSP config: ignoring rule with unparsable protocol '{spec}'");
+                return None;
+            }
+        }
+    } else if let Some(spec) = descriptor.strip_prefix("port:") {
+        match parse_port_descriptor(spec) {
+            Some(component) => component,
+            None => {
+                debug!("URSP config: ignoring rule with unparsable port descriptor '{spec}'");
+                return None;
+            }
+        }
     } else {
         TrafficDescriptorComponent::OsIdOsAppId {
             os_id: [0u8; 16],
@@ -925,6 +1215,356 @@ mod tests {
                 ..Default::default()
             }),
             None
+        );
+    }
+
+    // --- Traffic classification (issue #97) ---
+
+    /// A minimal IPv4 + TCP packet to a given destination and port.
+    fn ipv4_tcp(dst: [u8; 4], dst_port: u16) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x45; // version 4, IHL 5 words
+        p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&[10, 0, 0, 2]); // source
+        p[16..20].copy_from_slice(&dst);
+        p[20..22].copy_from_slice(&1234u16.to_be_bytes()); // source port
+        p[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn an_ipv4_packet_classifies_to_its_remote_address_protocol_and_port() {
+        let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([93, 184, 216, 34], 443))
+            .expect("a classifiable packet");
+        assert_eq!(app.ipv4, Some([93, 184, 216, 34]));
+        assert_eq!(app.protocol, Some(6));
+        assert_eq!(app.port, Some(443));
+        // Not derivable from a packet, and therefore absent rather than guessed.
+        assert_eq!(app.ipv6, None);
+        assert_eq!(app.fqdn, None);
+        assert_eq!(app.os_app_id, None);
+    }
+
+    #[test]
+    fn the_remote_address_is_the_destination_not_the_source() {
+        // A traffic descriptor names the far end of an uplink packet. Reading the
+        // source would match every rule against the UE's own address.
+        let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([203, 0, 113, 5], 80))
+            .expect("classifiable");
+        assert_eq!(app.ipv4, Some([203, 0, 113, 5]));
+        assert_ne!(app.ipv4, Some([10, 0, 0, 2]), "that is the SOURCE address");
+        assert_eq!(app.port, Some(80));
+        assert_ne!(app.port, Some(1234), "that is the SOURCE port");
+    }
+
+    #[test]
+    fn an_ipv4_packet_with_options_reads_the_transport_header_at_the_right_offset() {
+        // IHL 6 words = 24 octets, so the ports start at 24 and not 20. Assuming a
+        // 20-octet header would read the option bytes as a port.
+        let mut p = ipv4_tcp([198, 51, 100, 1], 0);
+        p[0] = 0x46; // IHL 6
+        p[20..24].copy_from_slice(&[0x01, 0x01, 0x01, 0x00]); // options (NOPs)
+        p[24..26].copy_from_slice(&5555u16.to_be_bytes()); // source port
+        p[26..28].copy_from_slice(&8443u16.to_be_bytes()); // destination port
+
+        let app = ApplicationDescriptor::from_uplink_packet(&p).expect("classifiable");
+        assert_eq!(app.port, Some(8443));
+    }
+
+    #[test]
+    fn an_ipv6_packet_classifies_to_its_remote_address_and_port() {
+        let mut p = vec![0u8; 60];
+        p[0] = 0x60; // version 6
+        p[6] = 17; // UDP
+        let dst = [0x20u8, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        p[24..40].copy_from_slice(&dst);
+        p[40..42].copy_from_slice(&9000u16.to_be_bytes());
+        p[42..44].copy_from_slice(&53u16.to_be_bytes());
+
+        let app = ApplicationDescriptor::from_uplink_packet(&p).expect("classifiable");
+        assert_eq!(app.ipv6, Some(dst));
+        assert_eq!(app.ipv4, None);
+        assert_eq!(app.protocol, Some(17));
+        assert_eq!(app.port, Some(53));
+    }
+
+    #[test]
+    fn a_non_port_protocol_classifies_with_a_protocol_and_no_port() {
+        // ICMP has no ports. A protocol-keyed rule must still match.
+        let mut p = ipv4_tcp([192, 0, 2, 1], 0);
+        p[9] = 1; // ICMP
+        let app = ApplicationDescriptor::from_uplink_packet(&p).expect("classifiable");
+        assert_eq!(app.protocol, Some(1));
+        assert_eq!(app.port, None, "ICMP has no port to report");
+    }
+
+    #[test]
+    fn an_unclassifiable_packet_yields_nothing_rather_than_a_partial_descriptor() {
+        // A descriptor with a plausible address and a garbage port would match a
+        // rule the flow does not belong to.
+        assert!(ApplicationDescriptor::from_uplink_packet(&[]).is_none());
+        assert!(
+            ApplicationDescriptor::from_uplink_packet(&[0x45]).is_none(),
+            "truncated"
+        );
+        // An IHL below the 5-word minimum is malformed.
+        let mut bad_ihl = ipv4_tcp([192, 0, 2, 1], 80);
+        bad_ihl[0] = 0x44;
+        assert!(ApplicationDescriptor::from_uplink_packet(&bad_ihl).is_none());
+        // A TCP packet whose transport header is cut short.
+        let truncated = ipv4_tcp([192, 0, 2, 1], 80)[..22].to_vec();
+        assert!(ApplicationDescriptor::from_uplink_packet(&truncated).is_none());
+        // Neither IPv4 nor IPv6.
+        assert!(ApplicationDescriptor::from_uplink_packet(&[0x75; 40]).is_none());
+        // An IPv6 packet shorter than its fixed header.
+        assert!(ApplicationDescriptor::from_uplink_packet(&[0x60; 30]).is_none());
+    }
+
+    #[test]
+    fn a_classified_flow_matches_the_address_protocol_and_port_components() {
+        // The point of the whole change: components that could never match before
+        // now do, because production can finally report a flow.
+        let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([93, 184, 216, 34], 443))
+            .expect("classifiable");
+
+        assert!(
+            app.matches_component(&TrafficDescriptorComponent::Ipv4RemoteAddress {
+                addr: [93, 184, 216, 34],
+                mask: [255, 255, 255, 255],
+            })
+        );
+        assert!(app.matches_component(&TrafficDescriptorComponent::ProtocolIdentifier(6)));
+        assert!(app.matches_component(&TrafficDescriptorComponent::SingleRemotePort(443)));
+        assert!(
+            app.matches_component(&TrafficDescriptorComponent::RemotePortRange {
+                low: 440,
+                high: 450,
+            })
+        );
+        // And a rule for a different flow still does not match.
+        assert!(!app.matches_component(&TrafficDescriptorComponent::SingleRemotePort(80)));
+    }
+
+    #[test]
+    fn the_configured_os_identity_reaches_the_descriptor() {
+        let mut config = nextgsim_common::config::UeConfig::default();
+        config.ursp_os_app_id = Some("com.example.video".to_string());
+        config.ursp_os_id = Some("0123456789abcdef0123456789abcdef".to_string());
+
+        let (os_id, os_app_id) = ApplicationDescriptor::configured_os_identity(&config);
+        assert_eq!(os_app_id.as_deref(), Some(&b"com.example.video"[..]));
+        assert_eq!(os_id.map(|id| id[0]), Some(0x01));
+        assert_eq!(os_id.map(|id| id[15]), Some(0xef));
+
+        let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([1, 1, 1, 1], 443))
+            .expect("classifiable")
+            .with_os_identity(os_id, os_app_id.clone());
+        assert!(
+            app.matches_component(&TrafficDescriptorComponent::OsIdOsAppId {
+                os_id: os_id.expect("a valid configured OS Id"),
+                os_app_id: os_app_id.clone().unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_os_id_is_dropped_rather_than_truncated() {
+        // Half a UUID identifies a different OS.
+        let mut config = nextgsim_common::config::UeConfig::default();
+        config.ursp_os_id = Some("0123456789abcdef".to_string());
+        let (os_id, _) = ApplicationDescriptor::configured_os_identity(&config);
+        assert!(os_id.is_none());
+
+        // A dashed UUID is accepted, because that is how a UUID is usually written.
+        config.ursp_os_id = Some("01234567-89ab-cdef-0123-456789abcdef".to_string());
+        let (os_id, _) = ApplicationDescriptor::configured_os_identity(&config);
+        assert_eq!(os_id.map(|id| id[0]), Some(0x01));
+
+        // Non-hex is rejected, not read as zeroes.
+        config.ursp_os_id = Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string());
+        let (os_id, _) = ApplicationDescriptor::configured_os_identity(&config);
+        assert!(os_id.is_none());
+    }
+
+    #[test]
+    fn no_configured_os_identity_leaves_the_components_unmatchable() {
+        // The honest default: without a declared app identity, an OsIdOsAppId rule
+        // cannot fire, and this asserts it rather than leaving it implied.
+        let config = nextgsim_common::config::UeConfig::default();
+        let (os_id, os_app_id) = ApplicationDescriptor::configured_os_identity(&config);
+        assert!(os_id.is_none());
+        assert!(os_app_id.is_none());
+
+        let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([1, 1, 1, 1], 443))
+            .expect("classifiable")
+            .with_os_identity(os_id, os_app_id);
+        assert!(
+            !app.matches_component(&TrafficDescriptorComponent::OsIdOsAppId {
+                os_id: [0u8; 16],
+                os_app_id: b"com.example.video".to_vec(),
+            })
+        );
+    }
+
+    // --- Flow-keyed config descriptor spellings (issue #97) ---
+
+    fn rule_with(descriptor: &str) -> ConfigUrspRule {
+        use nextgsim_common::config::RouteDescriptor;
+        ConfigUrspRule {
+            precedence: 10,
+            traffic_descriptor: descriptor.to_string(),
+            route_descriptors: vec![RouteDescriptor {
+                s_nssai: None,
+                dnn: Some("video".to_string()),
+                session_type: None,
+                ssc_mode: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_configured_port_rule_matches_a_classified_flow() {
+        // The whole chain in one assertion: an operator writes `port:443`, the
+        // classifier reads 443 off a packet, and the rule fires. Before issue #97
+        // neither half existed.
+        let rule = convert_config_rule(&rule_with("port:443")).expect("a usable rule");
+        let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([93, 184, 216, 34], 443))
+            .expect("classifiable");
+        assert!(app.matches(&rule.traffic_descriptor));
+
+        let other = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([93, 184, 216, 34], 80))
+            .expect("classifiable");
+        assert!(!other.matches(&rule.traffic_descriptor));
+    }
+
+    #[test]
+    fn a_configured_port_range_matches_its_bounds_inclusively() {
+        let rule = convert_config_rule(&rule_with("port:8000-8100")).expect("usable");
+        for (port, expected) in [
+            (7999u16, false),
+            (8000, true),
+            (8050, true),
+            (8100, true),
+            (8101, false),
+        ] {
+            let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([1, 1, 1, 1], port))
+                .expect("classifiable");
+            assert_eq!(
+                app.matches(&rule.traffic_descriptor),
+                expected,
+                "port {port}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reversed_port_range_is_rejected_rather_than_swapped() {
+        // Reading `500-100` as 100-500 applies a policy nobody wrote.
+        assert!(convert_config_rule(&rule_with("port:500-100")).is_none());
+        assert!(convert_config_rule(&rule_with("port:not-a-port")).is_none());
+        assert!(convert_config_rule(&rule_with("port:70000")).is_none());
+    }
+
+    #[test]
+    fn a_configured_protocol_rule_matches_the_classified_protocol() {
+        let rule = convert_config_rule(&rule_with("proto:6")).expect("usable");
+        let tcp = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([1, 1, 1, 1], 443))
+            .expect("classifiable");
+        assert!(tcp.matches(&rule.traffic_descriptor));
+
+        let mut udp_packet = ipv4_tcp([1, 1, 1, 1], 443);
+        udp_packet[9] = 17;
+        let udp = ApplicationDescriptor::from_uplink_packet(&udp_packet).expect("classifiable");
+        assert!(!udp.matches(&rule.traffic_descriptor));
+
+        assert!(convert_config_rule(&rule_with("proto:300")).is_none());
+    }
+
+    #[test]
+    fn a_bare_configured_ipv4_address_is_an_exact_match_not_a_wildcard() {
+        // Defaulting a missing prefix to 0 would turn "this host" into "every
+        // host", which is the difference between a rule and a catch-all.
+        let rule = convert_config_rule(&rule_with("ipv4:93.184.216.34")).expect("usable");
+        let exact = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([93, 184, 216, 34], 443))
+            .expect("classifiable");
+        assert!(exact.matches(&rule.traffic_descriptor));
+        let neighbour =
+            ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([93, 184, 216, 35], 443))
+                .expect("classifiable");
+        assert!(!neighbour.matches(&rule.traffic_descriptor));
+    }
+
+    #[test]
+    fn a_configured_ipv4_prefix_matches_the_whole_subnet() {
+        let rule = convert_config_rule(&rule_with("ipv4:10.20.0.0/16")).expect("usable");
+        for (addr, expected) in [
+            ([10u8, 20, 0, 1], true),
+            ([10, 20, 255, 254], true),
+            ([10, 21, 0, 1], false),
+        ] {
+            let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp(addr, 443))
+                .expect("classifiable");
+            assert_eq!(app.matches(&rule.traffic_descriptor), expected, "{addr:?}");
+        }
+        // A /0 matches everything, which an operator may legitimately want -- but
+        // only when they write it.
+        let any = convert_config_rule(&rule_with("ipv4:0.0.0.0/0")).expect("usable");
+        let app = ApplicationDescriptor::from_uplink_packet(&ipv4_tcp([203, 0, 113, 9], 443))
+            .expect("classifiable");
+        assert!(app.matches(&any.traffic_descriptor));
+    }
+
+    #[test]
+    fn a_malformed_configured_address_drops_the_rule_rather_than_widening_it() {
+        // A rule that fell back to match-all would steer every flow.
+        for descriptor in [
+            "ipv4:999.1.1.1",
+            "ipv4:10.0.0",
+            "ipv4:10.0.0.1/33",
+            "ipv6:not:an:address",
+            "ipv6:2001:db8::1/129",
+            "ipv6:2001::db8::1",
+        ] {
+            assert!(
+                convert_config_rule(&rule_with(descriptor)).is_none(),
+                "{descriptor} must drop the rule"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_ipv6_prefix_matches_a_classified_ipv6_flow() {
+        let rule = convert_config_rule(&rule_with("ipv6:2001:db8::/32")).expect("usable");
+
+        let mut packet = vec![0u8; 60];
+        packet[0] = 0x60;
+        packet[6] = 6;
+        packet[24..40].copy_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99,
+        ]);
+        packet[42..44].copy_from_slice(&443u16.to_be_bytes());
+        let app = ApplicationDescriptor::from_uplink_packet(&packet).expect("classifiable");
+        assert!(app.matches(&rule.traffic_descriptor));
+
+        // A different /32 must not match.
+        packet[24..28].copy_from_slice(&[0x20, 0x02, 0x0d, 0xb8]);
+        let other = ApplicationDescriptor::from_uplink_packet(&packet).expect("classifiable");
+        assert!(!other.matches(&rule.traffic_descriptor));
+    }
+
+    #[test]
+    fn the_ipv6_parser_expands_a_double_colon_run() {
+        assert_eq!(
+            parse_ipv6_address("2001:db8::1"),
+            Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        );
+        assert_eq!(parse_ipv6_address("::1").map(|a| a[15]), Some(1));
+        assert_eq!(parse_ipv6_address("::"), Some([0u8; 16]));
+        // A full eight-group form needs all eight.
+        assert!(parse_ipv6_address("2001:db8:0:0:0:0:0").is_none());
+        assert_eq!(
+            parse_ipv6_address("2001:0db8:0000:0000:0000:0000:0000:0001"),
+            parse_ipv6_address("2001:db8::1")
         );
     }
 }
