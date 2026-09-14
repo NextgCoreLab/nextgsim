@@ -14,7 +14,9 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::tasks::{GnbTaskBase, GtpMessage, RlsMessage, RrcMessage, Task, TaskMessage};
+use crate::tasks::{
+    GnbTaskBase, GtpMessage, NwdafMessage, RlsMessage, RrcMessage, Task, TaskMessage,
+};
 use nextgsim_common::OctetString;
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
@@ -60,6 +62,15 @@ pub struct RlsTask {
     /// TS 38.322 §4.2.1 requires, so each bearer owns its sequence-number space
     /// and reassembly buffer.
     rlc_entities: HashMap<(i32, i32), RlcEntity>,
+    /// User-plane octets moved since the last cell-load report (uplink plus
+    /// downlink). Counted here because the RLS task is the only place in the gNB
+    /// that sees every user-plane PDU on the radio side, so it is the only
+    /// producer that can report a *measured* load rather than a guessed one.
+    load_window_octets: u64,
+    /// When the current cell-load reporting window opened. The report is a rate,
+    /// so the elapsed time has to be measured rather than assumed from the timer
+    /// period -- a busy task ticks late and would otherwise overstate throughput.
+    load_window_start: Instant,
 }
 
 impl RlsTask {
@@ -82,6 +93,8 @@ impl RlsTask {
             socket: None,
             bind_address,
             rlc_entities: HashMap::new(),
+            load_window_octets: 0,
+            load_window_start: Instant::now(),
         }
     }
 
@@ -100,6 +113,8 @@ impl RlsTask {
             socket: None,
             bind_address,
             rlc_entities: HashMap::new(),
+            load_window_octets: 0,
+            load_window_start: Instant::now(),
         }
     }
 
@@ -161,6 +176,10 @@ impl RlsTask {
             warn!("RLC PDU for unknown UE[{}] dropped", ue_id);
             return;
         };
+        // Downlink half of the cell-load measurement (issue #18). Counted here
+        // rather than at the GTP boundary so a PDU the RLC layer splits is
+        // counted as the two PDUs the radio actually carries.
+        self.load_window_octets += pdu.len() as u64;
         let transmission = RlsPduTransmission {
             sti: self.sti,
             pdu_type: PduType::Data,
@@ -265,7 +284,96 @@ impl RlsTask {
 
         // Send heartbeat acknowledgment
         if let Some(ack) = ack {
+            self.forward_measurement_to_nwdaf(sti, &ack, heartbeat)
+                .await;
             self.send_heartbeat_ack(source, &ack).await;
+        }
+    }
+
+    /// Forward a UE's radio measurement to NWDAF (issue #18).
+    ///
+    /// This is the gNB's only source of *real* per-UE radio data. The heartbeat
+    /// ack's `dbm` is what the cell tracker's channel model computed for this
+    /// UE's position, and `sim_pos` is the position the UE reported -- so both
+    /// values are observed rather than assumed. Before this, the only producer
+    /// was the ISAC task, which has a fused position but no RSRP at all, so the
+    /// analytics engine never saw a radio measurement.
+    ///
+    /// RSRQ stays `None`: the RLS channel model produces a single received-power
+    /// figure and models no interference, so there is nothing to derive a
+    /// quality ratio from. Sending a number would be inventing one.
+    async fn forward_measurement_to_nwdaf(
+        &self,
+        sti: u64,
+        ack: &RlsHeartbeatAck,
+        heartbeat: &nextgsim_rls::RlsHeartbeat,
+    ) {
+        let Some(ref sixg) = self.task_base.sixg else {
+            return;
+        };
+        // The UE id is assigned when the tracker first sees the STI, so a
+        // heartbeat from a UE the tracker has not admitted has no id to report
+        // under. Skipped rather than reported under a placeholder id, which
+        // would merge two UEs' measurement histories.
+        let Some(&ue_id) = self.sti_to_ue_id.get(&sti) else {
+            return;
+        };
+
+        let msg = NwdafMessage::UeMeasurement {
+            ue_id,
+            rsrp: Some(ack.dbm as f32),
+            rsrq: None,
+            position: (
+                heartbeat.sim_pos.x as f32,
+                heartbeat.sim_pos.y as f32,
+                heartbeat.sim_pos.z as f32,
+            ),
+        };
+        if let Err(e) = sixg.nwdaf_tx.send(msg).await {
+            warn!("RLS: failed to forward UE measurement to NWDAF: {}", e);
+        }
+    }
+
+    /// Report the cell's measured load to NWDAF and open a new window (issue #18).
+    ///
+    /// `connected_ues` is the number of UEs with a live radio association, which
+    /// the RLS task knows first-hand. `throughput_mbps` is derived from the
+    /// octets actually moved over the elapsed window, so the series varies with
+    /// real traffic -- which is the point: a constant load series is invisible to
+    /// the z-score anomaly detector and is extrapolated as fact by load
+    /// prediction.
+    ///
+    /// `prb_usage` is `None` because this simulator has no PRB scheduler; see the
+    /// field's own documentation on [`NwdafMessage::CellLoad`].
+    async fn report_cell_load_to_nwdaf(&mut self) {
+        let elapsed = self.load_window_start.elapsed();
+        let octets = self.load_window_octets;
+        // Open the next window before any early return, so a window whose report
+        // is dropped does not have its traffic counted twice in the next one.
+        self.load_window_octets = 0;
+        self.load_window_start = Instant::now();
+
+        let Some(ref sixg) = self.task_base.sixg else {
+            return;
+        };
+
+        // A zero-length window would divide by zero; a window with no traffic is
+        // a real measurement of zero and is reported as such.
+        let seconds = elapsed.as_secs_f32();
+        let throughput_mbps = if seconds > 0.0 {
+            Some((octets as f32 * 8.0) / seconds / 1_000_000.0)
+        } else {
+            None
+        };
+
+        let msg = NwdafMessage::CellLoad {
+            cell_id: self.task_base.config.cell_id() as i32,
+            prb_usage: None,
+            connected_ues: self.ue_addresses.len() as u32,
+            throughput_mbps,
+        };
+        if let Err(e) = sixg.nwdaf_tx.send(msg).await {
+            warn!("RLS: failed to forward cell load to NWDAF: {}", e);
         }
     }
 
@@ -356,6 +464,11 @@ impl RlsTask {
             psi,
             pdu.pdu.len()
         );
+
+        // Count the octets on the wire, not the reassembled SDU: the load being
+        // measured is radio occupancy, which the RLC header and a discarded
+        // duplicate both consume (issue #18).
+        self.load_window_octets += pdu.pdu.len() as u64;
 
         // Feed the RLC PDU into the entity and collect any reassembled SDUs,
         // releasing the mutable borrow before the async send below.
@@ -725,6 +838,10 @@ impl Task for RlsTask {
                     self.check_lost_ues().await;
                     self.send_pending_acks().await;
                     self.poll_rlc_timers().await;
+                    // Cell load rides the same tick rather than owning a timer:
+                    // it is a rate over the elapsed window, which is measured,
+                    // so the period only sets the reporting granularity.
+                    self.report_cell_load_to_nwdaf().await;
                 }
             }
         }
@@ -1316,5 +1433,161 @@ mod tests {
                 "{key:?} must hold its own partial SDU"
             );
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // NWDAF forwarding (issue #18)
+    // ------------------------------------------------------------------------
+
+    /// An RLS task with 6G handles wired, plus the NWDAF receiver to observe.
+    fn rls_task_with_nwdaf() -> (RlsTask, mpsc::Receiver<TaskMessage<NwdafMessage>>) {
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let sixg = task_base.init_6g_tasks(16);
+        (RlsTask::new(task_base), sixg.nwdaf_rx)
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_forwards_a_real_rsrp_and_position_to_nwdaf() {
+        let (mut task, mut nwdaf_rx) = rls_task_with_nwdaf();
+        // The UE has to be known to the tracker before its measurement has an id
+        // to be reported under.
+        task.sti_to_ue_id.insert(0xABCD, 7);
+
+        let heartbeat =
+            nextgsim_rls::RlsHeartbeat::with_position(0xABCD, SimCoord::new(10, 20, 30));
+        let ack = RlsHeartbeatAck::with_dbm(0xABCD, -87);
+        task.forward_measurement_to_nwdaf(0xABCD, &ack, &heartbeat)
+            .await;
+
+        let Some(TaskMessage::Message(NwdafMessage::UeMeasurement {
+            ue_id,
+            rsrp,
+            rsrq,
+            position,
+        })) = nwdaf_rx.recv().await
+        else {
+            panic!("a heartbeat must produce a UE measurement");
+        };
+        assert_eq!(ue_id, 7);
+        // The channel model's dBm, not a placeholder: -87 is what the ack carried.
+        assert_eq!(rsrp, Some(-87.0));
+        // RSRQ stays absent rather than invented -- RLS models no interference.
+        assert_eq!(rsrq, None);
+        assert_eq!(position, (10.0, 20.0, 30.0));
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_from_an_unadmitted_ue_reports_nothing() {
+        // Reporting under a placeholder id would merge two UEs' histories.
+        let (task, mut nwdaf_rx) = rls_task_with_nwdaf();
+        let heartbeat = nextgsim_rls::RlsHeartbeat::with_position(0x1111, SimCoord::new(1, 2, 3));
+        let ack = RlsHeartbeatAck::with_dbm(0x1111, -70);
+        task.forward_measurement_to_nwdaf(0x1111, &ack, &heartbeat)
+            .await;
+
+        assert!(nwdaf_rx.try_recv().is_err(), "no id, no measurement");
+    }
+
+    #[tokio::test]
+    async fn a_cell_load_report_carries_the_measured_traffic_and_the_live_ue_count() {
+        let (mut task, mut nwdaf_rx) = rls_task_with_nwdaf();
+        task.ue_addresses
+            .insert(1, "127.0.0.1:1000".parse().unwrap());
+        task.ue_addresses
+            .insert(2, "127.0.0.1:1001".parse().unwrap());
+        task.load_window_octets = 125_000; // 1 Mbit
+        task.load_window_start = Instant::now() - Duration::from_secs(1);
+
+        task.report_cell_load_to_nwdaf().await;
+
+        let Some(TaskMessage::Message(NwdafMessage::CellLoad {
+            cell_id,
+            prb_usage,
+            connected_ues,
+            throughput_mbps,
+        })) = nwdaf_rx.recv().await
+        else {
+            panic!("the load timer must produce a cell load report");
+        };
+        assert_eq!(cell_id, test_config().cell_id() as i32);
+        // No PRB scheduler exists, so this must NOT carry a fabricated figure.
+        assert_eq!(prb_usage, None);
+        assert_eq!(connected_ues, 2);
+        // 125 000 octets over ~1 s is ~1 Mbps. Bounded rather than exact because
+        // the window is real elapsed time.
+        let mbps = throughput_mbps.expect("measured throughput");
+        assert!(
+            (0.9..1.2).contains(&mbps),
+            "expected ~1 Mbps from 125 000 octets in ~1 s, got {mbps}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reported_window_is_not_counted_again_in_the_next_one() {
+        let (mut task, mut nwdaf_rx) = rls_task_with_nwdaf();
+        task.load_window_octets = 100_000;
+        task.load_window_start = Instant::now() - Duration::from_secs(1);
+        task.report_cell_load_to_nwdaf().await;
+        let _ = nwdaf_rx.recv().await;
+
+        // Second window, no traffic: the counter must have been reset, so this
+        // reports zero rather than re-reporting the first window's octets.
+        task.load_window_start = Instant::now() - Duration::from_secs(1);
+        task.report_cell_load_to_nwdaf().await;
+
+        let Some(TaskMessage::Message(NwdafMessage::CellLoad {
+            throughput_mbps, ..
+        })) = nwdaf_rx.recv().await
+        else {
+            panic!("a second report is due");
+        };
+        assert_eq!(throughput_mbps, Some(0.0), "the window must have reset");
+    }
+
+    #[tokio::test]
+    async fn user_plane_octets_are_counted_in_both_directions() {
+        let (mut task, _nwdaf_rx) = rls_task_with_nwdaf();
+        assert_eq!(task.load_window_octets, 0);
+
+        // Uplink: an RLC PDU arriving over RLS.
+        let psi = 1;
+        let mut rlc = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        rlc.submit_sdu(vec![0x42; 40]);
+        let pdu_bytes = rlc.build_pdu(MAC_GRANT_BYTES).expect("a PDU to send");
+        let uplink_len = pdu_bytes.len() as u64;
+        let pdu = RlsPduTransmission {
+            sti: 0,
+            pdu_type: PduType::Data,
+            pdu_id: 0,
+            payload: psi as u32,
+            pdu: Bytes::from(pdu_bytes.clone()),
+        };
+        task.handle_uplink_data(1, &pdu).await;
+        assert_eq!(task.load_window_octets, uplink_len, "uplink counted");
+
+        // Downlink: a PDU sent to a known UE.
+        task.ue_addresses
+            .insert(1, "127.0.0.1:1000".parse().unwrap());
+        task.send_rlc_pdu(1, psi, pdu_bytes.clone()).await;
+        assert_eq!(
+            task.load_window_octets,
+            uplink_len * 2,
+            "downlink counted too"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_6g_handles_nothing_is_forwarded_and_the_window_still_resets() {
+        // The default build has no 6G tasks; the counters must not grow without
+        // bound just because nobody is listening.
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base);
+        task.load_window_octets = 500_000;
+
+        task.report_cell_load_to_nwdaf().await;
+
+        assert_eq!(task.load_window_octets, 0);
     }
 }

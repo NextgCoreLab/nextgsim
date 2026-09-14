@@ -216,6 +216,18 @@ pub struct GnbConfig {
     /// Network Data Analytics Function (NWDAF) task enabled (Rel-20)
     #[serde(default)]
     pub nwdaf_enabled: bool,
+    /// Path to an ONNX trajectory-prediction model for the NWDAF task.
+    ///
+    /// Unset (the default) leaves the predictor on its documented linear
+    /// extrapolation fallback. No `.onnx` ships with this repository, so a
+    /// deployment that wants genuine inference supplies its own file — which is
+    /// why this is a path and not a bundled default.
+    ///
+    /// A path that does not load is reported and the task continues on the
+    /// fallback rather than failing to start: an analytics task that refuses to
+    /// run costs more than one running in a documented degraded mode.
+    #[serde(default)]
+    pub nwdaf_model_path: Option<std::path::PathBuf>,
     /// Network Knowledge Exposure Function (NKEF) task enabled (Rel-20)
     #[serde(default)]
     pub nkef_enabled: bool,
@@ -349,6 +361,7 @@ impl Default for GnbConfig {
             energy_saving_enabled: false,
             she_enabled: false,
             nwdaf_enabled: false,
+            nwdaf_model_path: None,
             nkef_enabled: false,
             isac_enabled: false,
             isac_anchors: default_isac_anchors(),

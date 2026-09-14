@@ -57,7 +57,30 @@ impl NwdafTask {
 
     /// Creates a new NWDAF task with specified history length
     pub fn with_history_length(task_base: GnbTaskBase, max_history_length: usize) -> Self {
-        let nwdaf = NwdafManager::new(max_history_length);
+        let mut nwdaf = NwdafManager::new(max_history_length);
+
+        // Load the configured ONNX trajectory model, if any (issue #18). Without
+        // this the working ONNX inference path in nextgsim-nwdaf was unreachable
+        // from the gNB: nothing ever called the (already public)
+        // NwdafManager::load_trajectory_model, so the operational path was always
+        // linear extrapolation no matter what was installed.
+        if let Some(ref path) = task_base.config.nwdaf_model_path {
+            match nwdaf.load_trajectory_model(path) {
+                Ok(()) => info!(
+                    "NWDAF: loaded ONNX trajectory model from {}; predictions will use the model",
+                    path.display()
+                ),
+                // Degrade, do not fail. The predictor's own fallback is
+                // documented behaviour, and a gNB that will not start because an
+                // optional analytics model is missing is worse than one that
+                // starts and says so.
+                Err(e) => warn!(
+                    "NWDAF: could not load ONNX trajectory model from {} ({e}); \
+                     continuing with linear extrapolation",
+                    path.display()
+                ),
+            }
+        }
 
         Self {
             task_base,
@@ -155,30 +178,70 @@ impl NwdafTask {
         }
     }
 
-    /// Handles a cell load report
-    fn handle_cell_load(&mut self, cell_id: i32, prb_usage: f32, connected_ues: u32) {
+    /// Handles a cell load report.
+    ///
+    /// `prb_usage` is what a producer *measured*, and there is no such producer
+    /// today because this simulator has no PRB scheduler. `throughput_mbps` is
+    /// measured, by the RLS task counting the user-plane octets it moves
+    /// (issue #18), so the occupancy figure the analytics layer sees is now
+    /// derived from real traffic:
+    ///
+    /// ```text
+    /// occupancy = measured throughput / NOMINAL_CELL_CAPACITY_MBPS
+    /// ```
+    ///
+    /// Only the *ceiling* in that ratio is nominal; the numerator is observed, so
+    /// the series varies with load. This inverts what the code used to do —
+    /// scale a supplied `prb_usage` by the same nominal ceiling to invent a
+    /// throughput — which meant any analytics reading throughput was reading PRB
+    /// usage twice. A real `prb_usage` still wins when a producer can supply one.
+    fn handle_cell_load(
+        &mut self,
+        cell_id: i32,
+        prb_usage: Option<f32>,
+        connected_ues: u32,
+        throughput_mbps: Option<f32>,
+    ) {
+        // A measured throughput is the only honest input to occupancy, so a
+        // report carrying neither it nor a real PRB figure says nothing about
+        // load. Dropping it beats recording a fabricated constant: a flat series
+        // is invisible to the z-score anomaly detector and is extrapolated as
+        // fact by load prediction.
+        let occupancy = match (prb_usage, throughput_mbps) {
+            (Some(measured_prb), _) => measured_prb.clamp(0.0, 1.0),
+            (None, Some(mbps)) => (mbps / NOMINAL_CELL_CAPACITY_MBPS).clamp(0.0, 1.0),
+            (None, None) => {
+                debug!(
+                    "NWDAF: Cell {} load report carries neither PRB usage nor throughput \
+                     (connected UEs={}); not recorded, because a fabricated load poisons the \
+                     anomaly detector and the load predictor",
+                    cell_id, connected_ues
+                );
+                return;
+            }
+        };
+
         debug!(
-            "NWDAF: Cell {} load - PRB usage={:.1}%, connected UEs={}",
+            "NWDAF: Cell {} load - occupancy={:.1}% ({}), throughput={:.3} Mbps, connected UEs={}",
             cell_id,
-            prb_usage * 100.0,
+            occupancy * 100.0,
+            if prb_usage.is_some() {
+                "measured PRB"
+            } else {
+                "traffic-derived, nominal ceiling"
+            },
+            throughput_mbps.unwrap_or(0.0),
             connected_ues
         );
 
         let load = CellLoad {
             cell_id,
-            prb_usage,
+            prb_usage: occupancy,
             connected_ues,
-            // NOT a measurement. The gNB keeps no per-cell throughput counter,
-            // and its config carries no cell bandwidth or numerology from which
-            // a capacity could be derived, so there is nothing to compute this
-            // from. It is PRB usage scaled by a nominal 1 Gbps reference
-            // ceiling: a restatement of prb_usage in Mbps-shaped units, not an
-            // independent signal.
-            //
-            // Kept rather than zeroed because the field is not Option and a 0
-            // would read as an idle cell. Any analytics treating this as
-            // observed throughput is reading prb_usage twice.
-            avg_throughput_mbps: prb_usage * NOMINAL_CELL_CAPACITY_MBPS,
+            // Measured when the producer counted traffic. Falls back to the old
+            // scaling only for a producer that supplies PRB usage and no
+            // throughput, where a restatement is the best available.
+            avg_throughput_mbps: throughput_mbps.unwrap_or(occupancy * NOMINAL_CELL_CAPACITY_MBPS),
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -308,8 +371,9 @@ impl Task for NwdafTask {
                         cell_id,
                         prb_usage,
                         connected_ues,
+                        throughput_mbps,
                     } => {
-                        self.handle_cell_load(cell_id, prb_usage, connected_ues);
+                        self.handle_cell_load(cell_id, prb_usage, connected_ues, throughput_mbps);
                     }
                     NwdafMessage::PredictTrajectory { ue_id, horizon_ms } => {
                         self.handle_predict_trajectory(ue_id, horizon_ms, None);
@@ -446,8 +510,8 @@ mod tests {
 
         let mut task = NwdafTask::new(task_base);
 
-        // Record cell load
-        task.handle_cell_load(1, 0.5, 10);
+        // Record cell load. A measured PRB figure wins over any derivation.
+        task.handle_cell_load(1, Some(0.5), 10, None);
 
         // Verify load was recorded
         assert_eq!(task.cell_loads.len(), 1);
@@ -455,6 +519,128 @@ mod tests {
         assert_eq!(load.cell_id, 1);
         assert_eq!(load.prb_usage, 0.5);
         assert_eq!(load.connected_ues, 10);
+    }
+
+    /// Build a bare NWDAF task for the load tests.
+    fn load_test_task() -> NwdafTask {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        NwdafTask::new(task_base)
+    }
+
+    #[tokio::test]
+    async fn a_measured_throughput_drives_the_load_series() {
+        // The point of issue #18: with no PRB scheduler, the occupancy series has
+        // to come from measured traffic or it is a fabricated constant.
+        let mut task = load_test_task();
+        task.handle_cell_load(1, None, 3, Some(250.0));
+
+        let load = task.cell_loads.get(&1).expect("load recorded");
+        // 250 Mbps against the nominal 1 Gbps ceiling.
+        assert!(
+            (load.prb_usage - 0.25).abs() < f32::EPSILON,
+            "occupancy must follow measured throughput, got {}",
+            load.prb_usage
+        );
+        assert!((load.avg_throughput_mbps - 250.0).abs() < f32::EPSILON);
+        assert_eq!(load.connected_ues, 3);
+        // NB: this assertion on avg_throughput_mbps cannot distinguish a measured
+        // throughput from the old `occupancy * nominal ceiling` restatement --
+        // they are equal by construction here. That distinction is made in
+        // `a_measured_prb_figure_wins_over_the_traffic_derivation`, and is noted
+        // here so a later reader does not mistake this for the guard.
+    }
+
+    #[tokio::test]
+    async fn a_load_series_varies_with_traffic_rather_than_staying_flat() {
+        // A flat series is invisible to the z-score detector, so "it varies" is
+        // the property that matters, not any single value.
+        let mut task = load_test_task();
+        let mut occupancies = Vec::new();
+        for mbps in [100.0, 400.0, 50.0] {
+            task.handle_cell_load(1, None, 2, Some(mbps));
+            // Sampled from what the analytics layer stored, not from the input,
+            // so a handler that recorded a constant would be caught here.
+            occupancies.push(
+                task.nwdaf
+                    .get_cell_load(1)
+                    .expect("load recorded")
+                    .prb_usage,
+            );
+        }
+
+        assert_eq!(occupancies.len(), 3);
+        assert!(
+            occupancies.windows(2).all(|w| w[0] != w[1]),
+            "the recorded occupancy series must track traffic: {occupancies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_with_neither_prb_nor_throughput_is_not_recorded() {
+        // Recording it would mean inventing a load figure, which the anomaly
+        // detector and the load predictor both consume as fact.
+        let mut task = load_test_task();
+        task.handle_cell_load(1, None, 5, None);
+
+        assert!(
+            task.cell_loads.is_empty(),
+            "a report with no measurement must not become a load sample"
+        );
+        assert!(
+            task.nwdaf.get_cell_load(1).is_none(),
+            "nothing must reach the analytics layer either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_measured_prb_figure_wins_over_the_traffic_derivation() {
+        // If a producer ever can measure PRB occupancy, that beats a proxy.
+        let mut task = load_test_task();
+        task.handle_cell_load(1, Some(0.80), 4, Some(100.0));
+
+        let load = task.cell_loads.get(&1).expect("load recorded");
+        assert!((load.prb_usage - 0.80).abs() < f32::EPSILON);
+        // This is also the one case that can tell a MEASURED throughput from the
+        // old restatement of occupancy through the nominal ceiling: those two are
+        // algebraically identical whenever occupancy was derived from throughput
+        // (mbps/1000*1000 == mbps), so only a report where PRB and throughput
+        // disagree distinguishes them. 0.80 * 1000 would be 800.
+        assert!(
+            (load.avg_throughput_mbps - 100.0).abs() < f32::EPSILON,
+            "throughput must be the measured 100 Mbps, not 0.80 x the nominal \
+             ceiling; got {}",
+            load.avg_throughput_mbps
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throughput_above_the_nominal_ceiling_clamps_to_full_occupancy() {
+        let mut task = load_test_task();
+        task.handle_cell_load(1, None, 9, Some(5_000.0));
+
+        let load = task.cell_loads.get(&1).expect("load recorded");
+        assert!((load.prb_usage - 1.0).abs() < f32::EPSILON);
+        // The throughput itself is NOT clamped: it is a measurement.
+        assert!((load.avg_throughput_mbps - 5_000.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn an_unloadable_model_path_is_reported_and_the_task_still_starts() {
+        // The ONNX flip itself is not verifiable here (no .onnx ships and CI has
+        // no ONNX Runtime), but the degradation path is, and it is the one that
+        // decides whether a gNB starts at all.
+        let mut config = test_config();
+        config.nwdaf_model_path = Some(std::path::PathBuf::from(
+            "/nonexistent/nwdaf-trajectory.onnx",
+        ));
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        let task = NwdafTask::new(task_base);
+        // Constructed, and still usable: the predictor keeps its documented
+        // linear fallback.
+        assert!(task.cell_loads.is_empty());
     }
 
     #[tokio::test]

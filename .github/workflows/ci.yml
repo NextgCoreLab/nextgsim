@@ -138,6 +138,28 @@ jobs:
       - name: cargo clippy
         run: cargo clippy -p nextgsim-ue --features uuaa-mm --all-targets
 
+  sixg:
+    name: 6G crates (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The gNB's 6G surface -- NWDAF, ISAC, SHE, NKEF, agent, FL -- lives behind
+      # the `6g` umbrella, so the default-feature jobs above compile none of it.
+      # It is not entirely uncovered: the event-bus job tests it in the
+      # `event-bus,6g` COMBINATION. This job covers `6g` on its own, which is the
+      # combination an operator actually enables, and keeps that coverage from
+      # depending on the event-bus job continuing to exist. Issue #18's work
+      # (nwdaf/task.rs and the rls/task.rs forwarding) lands here.
+      - name: cargo test (6g alone)
+        run: cargo test -p nextgsim-gnb --features 6g
+      - name: cargo clippy
+        run: cargo clippy -p nextgsim-gnb --features 6g --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}
