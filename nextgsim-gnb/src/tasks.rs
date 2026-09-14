@@ -454,6 +454,15 @@ pub enum RrcMessage {
         ue_paging_tmsi: Vec<u8>,
         /// TAI list for paging
         tai_list_for_paging: Vec<u8>,
+        /// DRX cycle in radio frames from the NGAP `(default)PagingDRX` IE
+        /// (TS 38.413 §9.3.1.90), i.e. the `T` of TS 38.304 §7.1.
+        ///
+        /// `None` when the AMF signalled none, in which case the RRC layer uses
+        /// the cell's configured default paging cycle. Carried at all because the
+        /// IE used to be decoded and logged and nothing consumed it, so the paging
+        /// occasion could not be derived from what the network actually asked for
+        /// (issue #99).
+        drx_cycle_frames: Option<u16>,
     },
     /// NTN timing advance configuration (from NGAP, to include in RRC Setup/Reconfiguration)
     NtnTimingAdvanceConfig {

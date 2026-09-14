@@ -145,6 +145,15 @@ pub struct GnbConfig {
     /// recorded for `gtpu_echo_period_secs`: CI compiles default features only.
     #[serde(default)]
     pub scell_phys_cell_id: Option<u16>,
+    /// Default paging cycle in radio frames (TS 38.331
+    /// `PCCH-Config.defaultPagingCycle`), used when the AMF's NGAP
+    /// `(default)PagingDRX` does not supply one. Must be 32, 64, 128 or 256.
+    ///
+    /// This is the `T` of TS 38.304 §7.1, so it bounds how long a paged UE waits:
+    /// up to `T` x 10 ms of mobile-terminated latency. 128 frames (1.28 s) matches
+    /// the `PagingDrx::V128` the gNB already advertises in NG Setup.
+    #[serde(default = "default_paging_cycle_frames")]
+    pub paging_default_cycle_frames: u16,
     /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
     /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
     /// reporting, selective retransmission and the ARQ timers, at the cost of
@@ -322,6 +331,10 @@ fn default_si_broadcast_period_ms() -> u64 {
     80
 }
 
+fn default_paging_cycle_frames() -> u16 {
+    128
+}
+
 fn default_gtp_port() -> u16 {
     2152
 }
@@ -364,6 +377,7 @@ impl Default for GnbConfig {
             gtpu_echo_period_secs: 0,
             gtpu_echo_max_misses: default_gtpu_echo_max_misses(),
             gtpu_restart_counter_path: None,
+            paging_default_cycle_frames: default_paging_cycle_frames(),
             rlc_am_psis: Vec::new(),
             si_broadcast_period_ms: default_si_broadcast_period_ms(),
             accept_raw_nas_on_dcch: false,
@@ -1315,6 +1329,16 @@ pub struct UeConfig {
     /// would ship without ever being compiled by the gate meant to cover it.
     #[serde(default)]
     pub ursp_evaluation: bool,
+    /// Default paging cycle in radio frames (TS 38.331
+    /// `PCCH-Config.defaultPagingCycle`): the `T` of TS 38.304 §7.1 this UE uses
+    /// to work out its own paging occasion. Must be 32, 64, 128 or 256.
+    ///
+    /// **It has to match the gNB's** `paging_default_cycle_frames`. This UE never
+    /// receives `PCCH-Config`, because SIB1's `pcch-Config` is not modelled, so the
+    /// two ends agree by configuration rather than by signalling -- and a mismatch
+    /// shows up as paging being dropped rather than as a configuration error.
+    #[serde(default = "default_paging_cycle_frames")]
+    pub paging_default_cycle_frames: u16,
     /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
     /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
     /// reporting, selective retransmission and the ARQ timers, at the cost of
@@ -1509,6 +1533,7 @@ impl Default for UeConfig {
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
+            paging_default_cycle_frames: default_paging_cycle_frames(),
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),

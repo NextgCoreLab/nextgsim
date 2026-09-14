@@ -15,6 +15,7 @@ pub mod ntn_integration_example;
 pub mod ntn_link_sim;
 pub mod ntn_timing;
 pub mod paging;
+pub mod paging_occasion;
 pub mod rrc_reconfiguration;
 pub mod rrc_reestablishment;
 pub mod rrc_release;

@@ -41,6 +41,7 @@ use crate::tasks::{IsacMeasurementType, IsacSensorMessage};
 use crate::tasks::{NasMessage, RlfCause, RlsMessage, RrcMessage, Task, TaskMessage, UeTaskBase};
 #[cfg(feature = "nextgsim-semantic")]
 use crate::tasks::{SemanticCodecMessage, SemanticTaskType};
+use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
@@ -48,6 +49,9 @@ use nextgsim_rrc::codec::{decode_rrc, CellGroupConfig, RadioBearerConfig};
 use nextgsim_rrc::procedures::conditional_handover::decode_cho_config;
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
+};
+use nextgsim_rrc::procedures::paging_occasion::{
+    paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig, PagingOccasion,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{
     decode_rrc_reestablishment, encode_rrc_reestablishment_complete,
@@ -73,6 +77,24 @@ use nextgsim_rrc::procedures::ue_capability::{
     encode_ue_capability_information, RatType, UeCapabilityInformationParams,
     UeCapabilityRatContainer,
 };
+
+/// Minimum acceptance window after a paging frame, in radio frames (issue #99).
+///
+/// The gNB transmits *in* the frame; the PDU then crosses a UDP transport, a
+/// channel and a task queue before this UE decodes it. A tolerance smaller than
+/// that delay drops conformant paging, and under load the delay is tens of
+/// milliseconds rather than one frame -- a 20 ms window was tight enough to be
+/// exceeded by scheduling jitter alone.
+const PAGING_OCCASION_MIN_TOLERANCE_FRAMES: u16 = 4;
+
+/// The acceptance window as a fraction of the DRX cycle: `T / 8`.
+///
+/// Proportional so the check's strictness is comparable across cycles -- a
+/// 40 ms window is generous against a 320 ms cycle and tight against a 2.56 s one
+/// -- with [`PAGING_OCCASION_MIN_TOLERANCE_FRAMES`] as the absolute floor for
+/// transport delay. It still rejects seven eighths of the cycle, so a paging from
+/// a foreign occasion is refused rather than the check being decorative.
+const PAGING_OCCASION_TOLERANCE_DIVISOR: u16 = 8;
 
 /// C-RNTI recorded in the AS security context for re-establishment ShortMAC-I
 /// (TS 38.331 §5.3.7.4). The sim has no MAC-layer C-RNTI allocation, so a fixed
@@ -886,10 +908,30 @@ impl RrcTask {
             }
         };
         let barred = mib.cell_barred == CellBarredStatus::Barred;
+        let local_sfn = frame_clock::current_sfn();
         debug!(
-            "MIB from cell {cell_id}: barred={barred}, sfn={}",
+            "MIB from cell {cell_id}: barred={barred}, sfn(msb6)={}, local sfn={local_sfn}",
             mib.system_frame_number
         );
+
+        // The broadcast SFN is the CROSS-CHECK on the shared frame clock
+        // (issue #99). Both ends derive the SFN from the wall clock, which is an
+        // assumption rather than a protocol; the MIB's 6 MSBs are the one place it
+        // can be tested at runtime, so a mismatch is reported loudly instead of
+        // leaving paging to fail silently at the occasion check.
+        if !frame_clock::msb6_matches(
+            mib.system_frame_number,
+            local_sfn,
+            PAGING_OCCASION_MIN_TOLERANCE_FRAMES,
+        ) {
+            warn!(
+                "Frame clock disagreement with cell {cell_id}: MIB says SFN>>4 = {}, this UE \
+                 derives {} from its own clock. Paging occasions will not line up; the two \
+                 processes are not sharing a clock (different hosts?).",
+                mib.system_frame_number,
+                frame_clock::sfn_msb6(local_sfn)
+            );
+        }
         self.cells_with_broadcast_si.insert(cell_id);
         self.cell_selector.update_mib(
             cell_id,
@@ -962,6 +1004,45 @@ impl RrcTask {
     /// records that match are reported to NAS. A message with no matching record
     /// is a normal event — PCCH is a broadcast channel, so most paging a UE
     /// receives is for somebody else.
+    /// This UE's paging occasion (TS 38.304 §7.1), or `None` before it has a
+    /// 5G-S-TMSI to derive `UE_ID` from.
+    ///
+    /// The DRX cycle comes from configuration, which has to match the cell's:
+    /// this UE never receives `PCCH-Config` because SIB1's `pcch-Config` is not
+    /// modelled, so the two ends agree by configuration rather than by signalling.
+    /// Recorded here because a mismatch would look like paging being dropped at
+    /// random.
+    fn paging_occasion(&self) -> Option<PagingOccasion> {
+        let s_tmsi = self.paging_s_tmsi?;
+        let t = self.task_base.config.paging_default_cycle_frames;
+        let config = PagingCycleConfig::with_default_spreading(t).ok()?;
+        Some(paging_occasion(ue_id_from_s_tmsi(&s_tmsi), &config))
+    }
+
+    /// Whether the current frame is within this UE's paging occasion.
+    fn is_own_paging_occasion(&self) -> bool {
+        self.is_own_paging_occasion_at(frame_clock::current_sfn())
+    }
+
+    /// Whether `sfn` is within this UE's paging occasion.
+    ///
+    /// The SFN is a parameter so the decision is deterministically testable; the
+    /// live-clock caller above is the only production path.
+    ///
+    /// A UE with no 5G-S-TMSI has no occasion, and answers `true`: it cannot be
+    /// the addressee of a matching record anyway (the identity check has already
+    /// returned), so refusing here would only mask that.
+    pub(crate) fn is_own_paging_occasion_at(&self, sfn: u16) -> bool {
+        match self.paging_occasion() {
+            Some(occasion) => {
+                let tolerance = (occasion.t() / PAGING_OCCASION_TOLERANCE_DIVISOR)
+                    .max(PAGING_OCCASION_MIN_TOLERANCE_FRAMES);
+                occasion.is_within_occasion(sfn, tolerance)
+            }
+            None => true,
+        }
+    }
+
     async fn handle_pcch_message(&mut self, cell_id: i32, pdu: &OctetString) {
         let state = self.state_machine.state();
         if state == RrcState::Connected {
@@ -1001,6 +1082,23 @@ impl RrcTask {
             debug!(
                 "PCCH Paging from cell {cell_id}: none of {} record(s) match this UE",
                 records.len().min(MAX_PAGE_RECORDS)
+            );
+            return;
+        }
+
+        // TS 38.304 §7.1: a UE monitors ONE paging occasion per DRX cycle, so a
+        // record addressed to this UE arriving outside its own occasion did not
+        // come from a conformant network and is not acted on (issue #99). Before
+        // this the UE accepted a matching record whenever it arrived, so the
+        // occasion could not be got wrong.
+        if !self.is_own_paging_occasion() {
+            let occasion = self.paging_occasion();
+            debug!(
+                "PCCH Paging from cell {cell_id} matched this UE but arrived outside its \
+                 paging occasion (SFN {}, PF residue {:?} mod {:?}); ignored",
+                frame_clock::current_sfn(),
+                occasion.map(|o| o.pf_residue()),
+                occasion.map(|o| o.t())
             );
             return;
         }
@@ -3757,6 +3855,37 @@ mod tests {
     /// This UE's own 5G-S-TMSI, as the NAS plane derives it from the 5G-GUTI.
     const OWN_S_TMSI: [u8; 6] = [0x55, 0x6A, 0xDE, 0xAD, 0xBE, 0xEF];
 
+    /// A 5G-S-TMSI whose paging occasion is the CURRENT radio frame.
+    ///
+    /// Issue #99 made the UE drop a matching record that arrives outside its own
+    /// paging occasion (TS 38.304 §7.1), so an identity-matching test needs an
+    /// identity that is actually being paged now -- otherwise it asserts the
+    /// occasion check by accident and fails on 127 frames out of 128.
+    ///
+    /// Chosen by searching identities rather than by controlling the clock: `UE_ID`
+    /// determines the frame, so this is deterministic against whatever the clock
+    /// reads.
+    fn s_tmsi_paged_in_the_current_frame(config: &UeConfig) -> [u8; 6] {
+        let cycle = PagingCycleConfig::with_default_spreading(config.paging_default_cycle_frames)
+            .expect("the configured paging cycle must be valid");
+        let now = frame_clock::current_sfn();
+        for candidate in 0u32..=0xFFFF {
+            let s_tmsi = [
+                0x55,
+                0x6A,
+                0xDE,
+                0xAD,
+                (candidate >> 8) as u8,
+                (candidate & 0xFF) as u8,
+            ];
+            let occasion = paging_occasion(ue_id_from_s_tmsi(&s_tmsi), &cycle);
+            if occasion.is_paging_frame(now) {
+                return s_tmsi;
+            }
+        }
+        panic!("no identity pages in frame {now}, which cannot happen for N = T");
+    }
+
     /// Another subscriber's 5G-S-TMSI: same AMF (identical first two octets),
     /// different 5G-TMSI — so a comparison that only checks the AMF part, or
     /// one that ignores the identity altogether, cannot pass by accident.
@@ -3786,18 +3915,20 @@ mod tests {
 
     #[test]
     fn a_paging_record_matching_the_ues_own_5g_s_tmsi_reaches_nas() {
-        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_current_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
-        task.set_paging_identity(Some(OWN_S_TMSI));
+        task.set_paging_identity(Some(own));
 
         run_async(async {
-            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[OWN_S_TMSI]))
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
                 .await;
         });
 
         assert_eq!(
             try_take_paging(&mut nas_rx),
-            Some(vec![OWN_S_TMSI]),
+            Some(vec![own]),
             "the matched 5G-S-TMSI must be reported to NAS"
         );
     }
@@ -3826,20 +3957,84 @@ mod tests {
     /// AS filters, so NAS never sees another subscriber's identity.
     #[test]
     fn only_the_matching_record_of_a_multi_ue_paging_message_is_reported() {
-        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_current_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
-        task.set_paging_identity(Some(OWN_S_TMSI));
+        task.set_paging_identity(Some(own));
 
         run_async(async {
             task.handle_downlink_rrc(
                 PAGING_CELL,
                 RrcChannel::Pcch,
-                pcch_paging(&[OTHER_S_TMSI, OWN_S_TMSI, OTHER_S_TMSI]),
+                pcch_paging(&[OTHER_S_TMSI, own, OTHER_S_TMSI]),
             )
             .await;
         });
 
-        assert_eq!(try_take_paging(&mut nas_rx), Some(vec![OWN_S_TMSI]));
+        assert_eq!(try_take_paging(&mut nas_rx), Some(vec![own]));
+    }
+
+    /// A UE with no 5G-S-TMSI has no occasion to be inside, and must not be
+    /// gated: the identity check in `handle_pcch_message` has already returned by
+    /// then, so gating here would only be able to mask that.
+    #[test]
+    fn a_ue_without_a_paging_identity_is_not_gated_by_the_occasion_check() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let task = RrcTask::new(task_base);
+        // No `set_paging_identity`.
+        for sfn in [0u16, 1, 17, 511, 1023] {
+            assert!(
+                task.is_own_paging_occasion_at(sfn),
+                "an identity-less UE must not be gated at SFN {sfn}"
+            );
+        }
+    }
+
+    /// CRITERION 5 (issue #99), at the unit level: the occasion decision itself.
+    ///
+    /// The end-to-end version lives in `tests/src/paging_mt_service_request.rs`;
+    /// this pins the predicate, including that it is not simply always true.
+    #[test]
+    fn the_occasion_check_admits_the_ues_own_frame_and_rejects_a_foreign_one() {
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_current_frame(&config);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config.clone(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.set_paging_identity(Some(own));
+
+        assert!(
+            task.is_own_paging_occasion(),
+            "an identity chosen for the current frame must be in its occasion"
+        );
+
+        // An identity whose paging frame is several frames away must not be.
+        let cycle = PagingCycleConfig::with_default_spreading(config.paging_default_cycle_frames)
+            .expect("valid cycle");
+        let now = frame_clock::current_sfn();
+        let foreign = (0u32..=0xFFFF)
+            .map(|candidate| {
+                [
+                    0x55,
+                    0x6A,
+                    0xDE,
+                    0xAD,
+                    (candidate >> 8) as u8,
+                    (candidate & 0xFF) as u8,
+                ]
+            })
+            .find(|s_tmsi| {
+                let occasion = paging_occasion(ue_id_from_s_tmsi(s_tmsi), &cycle);
+                // Clear the whole acceptance window, not just one frame.
+                let window = (occasion.t() / 8).max(4) + 1;
+                !(0..=window).any(|back| occasion.is_paging_frame(now.wrapping_sub(back)))
+            })
+            .expect("some identity pages in another frame");
+        task.set_paging_identity(Some(foreign));
+        assert!(
+            !task.is_own_paging_occasion(),
+            "an identity paged in another frame must be outside this occasion"
+        );
     }
 
     /// TS 38.304 §7.1: PCCH is monitored in RRC_IDLE and RRC_INACTIVE only.

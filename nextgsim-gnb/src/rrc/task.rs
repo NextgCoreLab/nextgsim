@@ -10,6 +10,7 @@ use crate::tasks::{
     GnbTaskBase, GutiMobileIdentity, IsacMessage, NgapMessage, NkefMessage, RlsMessage, RrcMessage,
     SheMessage, Task, TaskMessage,
 };
+use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
 use nextgsim_common::SNssai;
 use nextgsim_rls::RrcChannel;
@@ -18,6 +19,9 @@ use nextgsim_rrc::procedures::information_transfer::{
     encode_dl_information_transfer, DlInformationTransferParams,
 };
 use nextgsim_rrc::procedures::paging::{encode_paging, PagingRecordParams, FIVE_G_S_TMSI_LEN};
+use nextgsim_rrc::procedures::paging_occasion::{
+    self, paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig,
+};
 use nextgsim_rrc::procedures::rrc_reestablishment::{
     decode_rrc_reestablishment_complete, decode_rrc_reestablishment_request,
     RrcReestablishmentRequestData,
@@ -50,6 +54,26 @@ const DEFAULT_SCELL_INDEX: u8 = 1;
 /// disabled (`si_broadcast_period_ms == 0`). An hour: long enough never to matter,
 /// finite so the select! arm stays well-formed.
 const SI_PARKED_PERIOD_MS: u64 = 3_600_000;
+
+/// The cell's default paging cycle in radio frames when neither the AMF's
+/// `(default)PagingDRX` nor the configuration supplies one.
+///
+/// 128 frames (1.28 s) is the middle of `PCCH-Config.defaultPagingCycle`'s range
+/// and matches the `PagingDrx::V128` this gNB already advertises in its NG Setup.
+pub const DEFAULT_PAGING_CYCLE_FRAMES: u16 = 128;
+
+/// When a paged UE's paging frame falls (TS 38.304 §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagingSchedule {
+    /// `UE_ID` = 5G-S-TMSI mod 1024.
+    pub ue_id: u16,
+    /// The DRX cycle actually used, in radio frames.
+    pub t: u16,
+    /// The SFN the PCCH Paging will be transmitted in.
+    pub paging_frame: u16,
+    /// How long from now until that frame.
+    pub delay: std::time::Duration,
+}
 
 /// Octets per serialised TAI in an `RrcMessage::Paging` TAI list: a 3-octet
 /// PLMN identity followed by a 3-octet TAC (TS 38.413 §9.3.3.11).
@@ -1071,18 +1095,25 @@ impl RrcTask {
     /// interface: the RRC `Paging` message has no TAI member, because a UE
     /// reading PCCH is by definition in the cell.
     ///
-    /// PAGING OCCASION: the PDU is broadcast immediately rather than at the
-    /// UE's paging occasion. TS 38.304 §7.1 derives the PF/PO from the UE
-    /// identity and the DRX cycle *in radio frames*, and this simulator has no
-    /// frame clock at all (no SFN is maintained anywhere; RLS is a UDP
-    /// transport with no slot timing), so a PF/PO computed here could not gate
-    /// anything without inventing a frame counter. Tracked as a follow-up
-    /// rather than faked.
+    /// PAGING OCCASION (issue #99): the PDU is transmitted at the paged UE's
+    /// paging frame, derived per TS 38.304 §7.1 from its 5G-S-TMSI and the DRX
+    /// cycle. `drx_cycle_frames` is the NGAP `(default)PagingDRX` when the AMF
+    /// signalled one, otherwise the cell's configured default paging cycle.
+    ///
+    /// The wait is up to `T` radio frames (2.56 s at rf256), which is realistic
+    /// MT latency and is why this changes the timing of anything that pages. It is
+    /// spawned rather than awaited inline, because holding the RRC task for up to
+    /// 2.5 s would stall every other UE's signalling behind one paging.
     ///
     /// Public because it is a real message-handler entry point also driven
     /// directly by the in-process strict-peer harness
     /// (`tests/src/paging_mt_service_request.rs`).
-    pub async fn handle_paging(&mut self, ue_paging_tmsi: Vec<u8>, tai_list_for_paging: Vec<u8>) {
+    pub async fn handle_paging(
+        &mut self,
+        ue_paging_tmsi: Vec<u8>,
+        tai_list_for_paging: Vec<u8>,
+        drx_cycle_frames: Option<u16>,
+    ) {
         let s_tmsi: [u8; FIVE_G_S_TMSI_LEN] = match ue_paging_tmsi.as_slice().try_into() {
             Ok(tmsi) => tmsi,
             Err(_) => {
@@ -1103,14 +1134,98 @@ impl RrcTask {
             }
         };
 
+        let schedule = self.schedule_paging(&s_tmsi, drx_cycle_frames, frame_clock::current_sfn());
+
         info!(
-            "Broadcasting PCCH Paging for 5G-S-TMSI {:02x?} ({} served TAI(s) matched)",
+            "PCCH Paging for 5G-S-TMSI {:02x?} ({} served TAI(s) matched): UE_ID {}, \
+             paging frame SFN {} (T={}), waiting {} ms",
             s_tmsi,
-            tai_list_for_paging.len() / TAI_OCTETS
+            tai_list_for_paging.len() / TAI_OCTETS,
+            schedule.ue_id,
+            schedule.paging_frame,
+            schedule.t,
+            schedule.delay.as_millis()
         );
 
-        self.broadcast_rrc_message(RrcChannel::Pcch, OctetString::from_slice(&pdu))
-            .await;
+        if schedule.delay.is_zero() {
+            // Already in the occasion: transmit now rather than spawning a task
+            // to sleep for nothing.
+            self.broadcast_rrc_message(RrcChannel::Pcch, OctetString::from_slice(&pdu))
+                .await;
+            return;
+        }
+
+        // Deferred on its own task so the RRC task keeps serving other UEs. The
+        // handle is a channel clone, so a paging in flight at shutdown simply
+        // fails to send rather than blocking the shutdown.
+        let rls_tx = self.task_base.rls_tx.clone();
+        let delay = schedule.delay;
+        let target_frame = schedule.paging_frame;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let msg = RlsMessage::BroadcastRrc {
+                rrc_channel: RrcChannel::Pcch,
+                pdu_id: 0,
+                data: OctetString::from_slice(&pdu),
+            };
+            if let Err(e) = rls_tx.send(msg).await {
+                error!("Failed to broadcast deferred PCCH Paging: {e}");
+            } else {
+                debug!(
+                    "PCCH Paging transmitted at paging frame SFN {target_frame} \
+                     (now SFN {})",
+                    frame_clock::current_sfn()
+                );
+            }
+        });
+    }
+
+    /// Work out when a paged UE's next paging frame falls (TS 38.304 §7.1).
+    ///
+    /// Separated from the transmission so the decision is testable without a
+    /// clock-dependent send: everything here is a pure function of the 5G-S-TMSI,
+    /// the DRX cycle and the current SFN.
+    /// `current_sfn` is a parameter rather than read here so the whole mapping --
+    /// identity and DRX cycle to paging frame and delay -- is deterministically
+    /// testable. Reading the clock inside would make every assertion about it
+    /// depend on when the test ran.
+    pub fn schedule_paging(
+        &self,
+        s_tmsi: &[u8; FIVE_G_S_TMSI_LEN],
+        drx_cycle_frames: Option<u16>,
+        current_sfn: u16,
+    ) -> PagingSchedule {
+        let t = drx_cycle_frames.unwrap_or(self.task_base.config.paging_default_cycle_frames);
+        // An unusable T falls back to the cell default rather than dropping the
+        // paging: a UE that is not paged at all is worse off than one paged on a
+        // cycle the AMF did not ask for, and the mismatch is logged.
+        let config = PagingCycleConfig::with_default_spreading(t).unwrap_or_else(|e| {
+            warn!(
+                "Paging DRX cycle {t} unusable ({e}); falling back to {} frames",
+                DEFAULT_PAGING_CYCLE_FRAMES
+            );
+            PagingCycleConfig::with_default_spreading(DEFAULT_PAGING_CYCLE_FRAMES)
+                .expect("the built-in default paging cycle must be valid")
+        });
+
+        let ue_id = ue_id_from_s_tmsi(s_tmsi);
+        let occasion = paging_occasion(ue_id, &config);
+        let paging_frame = occasion.next_paging_frame_at_or_after(current_sfn);
+        // Frames ahead, not a clock difference: the delay has to follow from the
+        // SFN the caller passed, or the returned schedule would describe a
+        // different instant from the frame it names.
+        let frames_ahead = u64::from(
+            (u32::from(paging_frame) + u32::from(paging_occasion::SFN_CYCLE)
+                - u32::from(current_sfn))
+                % u32::from(paging_occasion::SFN_CYCLE),
+        );
+
+        PagingSchedule {
+            ue_id,
+            t: config.t(),
+            paging_frame,
+            delay: std::time::Duration::from_millis(frames_ahead * frame_clock::RADIO_FRAME_MS),
+        }
     }
 
     async fn send_rrc_message(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
@@ -1365,8 +1480,9 @@ impl Task for RrcTask {
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
                             }
-                            RrcMessage::Paging { ue_paging_tmsi, tai_list_for_paging } => {
-                                self.handle_paging(ue_paging_tmsi, tai_list_for_paging).await;
+                            RrcMessage::Paging { ue_paging_tmsi, tai_list_for_paging, drx_cycle_frames } => {
+                                self.handle_paging(ue_paging_tmsi, tai_list_for_paging, drx_cycle_frames)
+                                    .await;
                             }
                             RrcMessage::NtnTimingAdvanceConfig {
                                 satellite_type, common_ta_us, k_offset,
@@ -1901,6 +2017,85 @@ mod tests {
         None
     }
 
+    /// Waits up to `budget` for a broadcast to reach RLS.
+    ///
+    /// Needed because issue #99 made the PCCH Paging transmission DEFERRED to the
+    /// paged UE's paging frame, on its own task -- so a `try_recv` immediately
+    /// after `handle_paging` is racing the occasion by design.
+    async fn await_broadcast(
+        rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+        budget: Duration,
+    ) -> Option<(RrcChannel, u32, OctetString)> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if let Some(found) = try_take_broadcast(rx) {
+                return Some(found);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// CRITERION 4 (issue #99): the transmission is scheduled at the paged UE's
+    /// paging frame, not at whatever frame the paging arrived in.
+    ///
+    /// Asserted on the pure `schedule_paging` with a SYNTHETIC SFN, so it does not
+    /// depend on when the test ran. The awaiting broadcast test below cannot make
+    /// this claim: it passes just as well against a gNB that transmits
+    /// immediately.
+    #[test]
+    fn the_paging_transmission_is_scheduled_at_the_paged_ues_own_frame() {
+        use nextgsim_rrc::procedures::paging_occasion::{
+            paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig,
+        };
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let task = RrcTask::new(task_base);
+
+        let cycle = PagingCycleConfig::with_default_spreading(32).expect("valid cycle");
+        let occasion = paging_occasion(ue_id_from_s_tmsi(&PAGED_S_TMSI), &cycle);
+        let pf = occasion.pf_residue();
+
+        // From the UE's own frame: transmit now.
+        let at_occasion = task.schedule_paging(&PAGED_S_TMSI, Some(32), pf);
+        assert_eq!(at_occasion.paging_frame, pf);
+        assert!(at_occasion.delay.is_zero(), "already at the occasion");
+
+        // From one frame past it: the next occasion is a full cycle away, and the
+        // delay must be that many frames of 10 ms -- not zero.
+        let one_past = (pf + 1) % 1024;
+        let deferred = task.schedule_paging(&PAGED_S_TMSI, Some(32), one_past);
+        assert_ne!(
+            deferred.paging_frame, one_past,
+            "the paging frame must be the UE's, not the frame the paging arrived in"
+        );
+        assert!(occasion.is_paging_frame(deferred.paging_frame));
+        assert_eq!(
+            deferred.delay,
+            Duration::from_millis(31 * 10),
+            "31 frames at 10 ms each"
+        );
+        assert_eq!(deferred.t, 32, "the DRX cycle the AMF asked for");
+        assert_eq!(deferred.ue_id, ue_id_from_s_tmsi(&PAGED_S_TMSI));
+    }
+
+    /// An unusable DRX cycle falls back to the cell default rather than dropping
+    /// the paging: a UE not paged at all is worse off than one paged on a cycle
+    /// the AMF did not ask for.
+    #[test]
+    fn an_invalid_drx_cycle_falls_back_to_the_cell_default() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let task = RrcTask::new(task_base);
+
+        // 100 frames is not a `defaultPagingCycle` value.
+        let schedule = task.schedule_paging(&PAGED_S_TMSI, Some(100), 0);
+        assert_eq!(schedule.t, DEFAULT_PAGING_CYCLE_FRAMES);
+    }
+
     #[test]
     fn a_paged_5g_s_tmsi_is_broadcast_as_a_pcch_paging_record() {
         use nextgsim_rrc::procedures::paging::{decode_paging, PagedUeIdentity};
@@ -1909,13 +2104,17 @@ mod tests {
             GnbTaskBase::new(test_config(), 16);
         let mut task = RrcTask::new(task_base);
 
-        run_async(async {
-            task.handle_paging(PAGED_S_TMSI.to_vec(), served_tai_list())
+        // ISSUE #99 CHANGED THE TIMING: the PCCH Paging now goes out at the UE's
+        // paging frame, so the broadcast can be up to T radio frames away. rf32
+        // bounds that at 320 ms.
+        let (channel, pdu_id, pdu) = run_async(async {
+            let schedule =
+                task.schedule_paging(&PAGED_S_TMSI, Some(32), frame_clock::current_sfn());
+            task.handle_paging(PAGED_S_TMSI.to_vec(), served_tai_list(), Some(32))
                 .await;
-        });
-
-        let (channel, pdu_id, pdu) =
-            try_take_broadcast(&mut rls_rx).expect("paging must be broadcast to RLS");
+            await_broadcast(&mut rls_rx, schedule.delay + Duration::from_millis(200)).await
+        })
+        .expect("paging must be broadcast to RLS at the UE's paging frame");
         assert_eq!(channel, RrcChannel::Pcch, "paging goes out on PCCH");
         assert_eq!(pdu_id, 0, "a broadcast is not per-UE acknowledged");
 
@@ -1942,7 +2141,7 @@ mod tests {
         let mut task = RrcTask::new(task_base);
 
         run_async(async {
-            task.handle_paging(vec![0xDE, 0xAD, 0xBE], served_tai_list())
+            task.handle_paging(vec![0xDE, 0xAD, 0xBE], served_tai_list(), None)
                 .await;
         });
 
