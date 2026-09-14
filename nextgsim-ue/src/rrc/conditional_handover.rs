@@ -242,7 +242,7 @@ pub fn handover_command_for(candidate: &ChoCandidateCell, transaction_id: u8) ->
     HandoverCommand {
         target_cell: TargetCellInfo {
             pci: u32::from(candidate.target_cell.phys_cell_id),
-            cell_id: candidate_cell_id(candidate),
+            cell_id: Some(candidate_cell_id(candidate)),
             // The container carries no C-RNTI: the target assigns one, and this
             // simulator's RLS does not model a random-access exchange.
             new_ue_id: None,
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(triggered.id, CondReconfigId::new(1, 4));
 
         let command = handover_command_for(&triggered.candidate, 7);
-        assert_eq!(command.target_cell.cell_id, 3);
+        assert_eq!(command.target_cell.cell_id, Some(3));
         assert_eq!(command.target_cell.pci, 3);
         assert_eq!(command.target_cell.arfcn, Some(620000));
         assert_eq!(command.transaction_id, 7);

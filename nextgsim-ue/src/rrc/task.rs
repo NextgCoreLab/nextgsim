@@ -47,6 +47,11 @@ use nextgsim_common::Plmn;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::codec::{decode_rrc, BCCH_DL_SCH_Message, CellGroupConfig, RadioBearerConfig};
 use nextgsim_rrc::procedures::conditional_handover::decode_cho_config;
+use nextgsim_rrc::procedures::measurement_report::{
+    db_to_rsrq_range, db_to_sinr_range, dbm_to_eutra_rsrp_range, dbm_to_rsrp_range,
+    encode_measurement_report, MeasCellResults, MeasResult2Nr, MeasResultCellNr, MeasResultEutra,
+    MeasResultNr, MeasResultServFreqNr, MeasurementReportError, MeasurementReportParams,
+};
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
 };
@@ -307,6 +312,111 @@ pub struct RrcTask {
     /// one A6 reference and not one per event. That is the ceiling of #112's
     /// "SCell half of CA, not the whole feature".
     configured_scells: std::collections::BTreeMap<u8, i32>,
+}
+
+/// Converts this UE's measurement report into the UPER `MeasurementReport` of
+/// TS 38.331 §5.5.5 (issue #107).
+///
+/// A free function rather than a method: it is pure, and keeping it out of the
+/// task means the encoding can be tested without constructing an `RrcTask`.
+///
+/// # The two quantity systems
+///
+/// The UE measures in **dBm**; `MeasurementReport` carries **RSRP-Range**
+/// (`INTEGER (0..127)`, TS 38.133 Table 10.1.6.1-1). `dbm_to_rsrp_range` does the
+/// conversion, and it is the one already in `nextgsim-rrc` rather than a second
+/// copy — the gNB's parser uses `rsrp_range_to_dbm` to invert it, so a second
+/// mapping is how the two ends would disagree.
+///
+/// # An absent measurement is absent, not zero
+///
+/// `RSRP-Range` 0 means "below -156 dBm", a real and very weak measurement, so a
+/// cell whose RSRP the UE does not have reports **no** SSB results rather than
+/// range 0. The old byte format substituted -120 dBm, which reported a plausible
+/// level the UE had never measured.
+fn build_uper_measurement_report(
+    report: &crate::rrc::measurement::MeasurementReport,
+) -> Result<Vec<u8>, MeasurementReportError> {
+    fn cell_results(cell: &crate::rrc::measurement::CellMeasResult) -> Option<MeasCellResults> {
+        // Only the quantities the UE actually has. All three absent means no
+        // ssb-Results at all, which is what "not measured" looks like on the wire.
+        let rsrp = cell.rsrp.map(|dbm| dbm_to_rsrp_range(f64::from(dbm)));
+        let rsrq = cell.rsrq.map(|db| db_to_rsrq_range(f64::from(db)));
+        let sinr = cell.sinr.map(|db| db_to_sinr_range(f64::from(db)));
+        if rsrp.is_none() && rsrq.is_none() && sinr.is_none() {
+            return None;
+        }
+        Some(MeasCellResults { rsrp, rsrq, sinr })
+    }
+
+    fn meas_result_nr(cell: &crate::rrc::measurement::CellMeasResult) -> MeasResultNr {
+        MeasResultNr {
+            // PhysCellId is INTEGER (0..1007); the UE's own `pci` is a u32 local
+            // index, so a value past the ASN.1 bound would fail the encode. Reduced
+            // the same way `phys_cell_id_from_nci` does, for the same reason.
+            phys_cell_id: Some((cell.pci % 1008) as u16),
+            cell_results: MeasResultCellNr {
+                ssb_results: cell_results(cell),
+                csi_rs_results: None,
+            },
+            rs_index_results: None,
+        }
+    }
+
+    let serv_freq_results = vec![MeasResultServFreqNr {
+        // The serving cell is always servCellIndex 0 here: this simulator models
+        // one serving cell plus an optional SCell for measurement reference only
+        // (issue #112), and the SCell is never the report's serving entry.
+        serv_cell_index: 0,
+        meas_result_serving_cell: meas_result_nr(&report.serving_cell),
+        // `measResultBestNeighCell` is left absent rather than filled with the
+        // strongest neighbour: it is the best neighbour ON THE SERVING FREQUENCY,
+        // and the neighbour list below already carries every measured cell. Filling
+        // it would report the same cell twice.
+        meas_result_best_neigh_cell: None,
+    }];
+
+    // `measResultNeighCells` is a CHOICE, so a report carries NR results or E-UTRA
+    // results and never both (TS 38.331 §5.5.5). An E-UTRA report is a B1/B2
+    // report; anything else is intra-NR.
+    let (neigh_freq_results, eutra_neigh_results) = if report.eutra_neighbor_cells.is_empty() {
+        let nr = if report.neighbor_cells.is_empty() {
+            Vec::new()
+        } else {
+            vec![MeasResult2Nr {
+                ssb_frequency_arfcn: None,
+                ref_freq_csi_rs: None,
+                meas_result_list: report.neighbor_cells.iter().map(meas_result_nr).collect(),
+            }]
+        };
+        (nr, Vec::new())
+    } else {
+        (
+            Vec::new(),
+            report
+                .eutra_neighbor_cells
+                .iter()
+                .map(|c| {
+                    MeasResultEutra::with_rsrp(
+                        c.cell.pci,
+                        // An E-UTRA neighbour with no RSRP reports range 0, which
+                        // TS 36.133 defines as "below -140 dBm" -- the honest value
+                        // for a cell the UE detected but could not measure.
+                        c.rsrp
+                            .map_or(0, |dbm| dbm_to_eutra_rsrp_range(f64::from(dbm))),
+                    )
+                })
+                .collect(),
+        )
+    };
+
+    encode_measurement_report(&MeasurementReportParams {
+        meas_id: report.meas_id,
+        serv_freq_results,
+        neigh_freq_results,
+        eutra_neigh_results,
+        enhanced_quantities: None,
+    })
 }
 
 impl RrcTask {
@@ -665,30 +775,34 @@ impl RrcTask {
         &mut self,
         report: &crate::rrc::measurement::MeasurementReport,
     ) {
-        // Build simplified measurement report message
-        // In real implementation, this would be proper ASN.1 encoding
-        let mut rrc_pdu = Vec::with_capacity(32);
-        rrc_pdu.push(0x0B); // MeasurementReport message type
-        rrc_pdu.push(report.meas_id);
-
-        // Serving cell result
-        rrc_pdu.push((report.serving_cell.pci >> 8) as u8);
-        rrc_pdu.push(report.serving_cell.pci as u8);
-        let rsrp = report.serving_cell.rsrp.unwrap_or(-120) as i8;
-        rrc_pdu.push(rsrp as u8);
-
-        // Number of neighbor cells
-        rrc_pdu.push(report.neighbor_cells.len() as u8);
-
-        // Neighbor cell results
-        for neighbor in &report.neighbor_cells {
-            rrc_pdu.push((neighbor.pci >> 8) as u8);
-            rrc_pdu.push(neighbor.pci as u8);
-            let rsrp = neighbor.rsrp.unwrap_or(-120) as i8;
-            rrc_pdu.push(rsrp as u8);
-        }
-
-        let pdu = OctetString::from_slice(&rrc_pdu);
+        // A real UPER `MeasurementReport` on UL-DCCH (TS 38.331 §5.5.5,
+        // issue #107). This used to be a hand-built byte format --
+        // `[0x0B, meas_id, pci_hi, pci_lo, rsrp, n, ...]` -- whose own comment said
+        // "In real implementation, this would be proper ASN.1 encoding", while
+        // `nextgsim-rrc`'s complete `measurement_report` codec sat with zero
+        // callers. The gNB's parser flips in the SAME change, or measurements
+        // stop arriving.
+        let pdu = match build_uper_measurement_report(report) {
+            Ok(bytes) => OctetString::from_slice(&bytes),
+            Err(e) => {
+                // Not a silent drop: a report that cannot be encoded is a
+                // measurement the network will never see, and the event that
+                // triggered it has already been consumed.
+                // An inter-RAT (B1/B2) report reaches here every time: the
+                // `measResultListEUTRA` arm of `measResultNeighCells` is past the
+                // extension marker and `asn1-codecs` 0.7.2 refuses to encode an
+                // extended CHOICE (issue #117). Named in the log, because
+                // "measurement lost" without the reason reads as a transient fault
+                // rather than a codec ceiling.
+                error!(
+                    "Failed to encode MeasurementReport (meas_id={}): {e}. The \
+                     measurement is LOST. An inter-RAT (B1/B2) report cannot be \
+                     encoded by this codec version at all -- see issue #117",
+                    report.meas_id
+                );
+                return;
+            }
+        };
         // `triggered_cells` is the event's cellsTriggeredList (TS 38.331
         // §5.5.4.1); the neighbour list above leads with those cells, so the
         // count says how many of the reported neighbours the event fired on.
@@ -1858,8 +1972,8 @@ impl RrcTask {
         // Check if this is a handover reconfiguration
         if let Some(ho_command) = parse_handover_command(bytes) {
             info!(
-                "Received handover command: target_cell={}, target_pci={}",
-                ho_command.target_cell.cell_id, ho_command.target_cell.pci
+                "Received handover command: target_pci={} (local cell resolved later)",
+                ho_command.target_cell.pci
             );
             self.handle_handover_command(cell_id, ho_command).await;
             return;
@@ -1999,7 +2113,18 @@ impl RrcTask {
     }
 
     /// Handle handover command from RRC Reconfiguration
-    async fn handle_handover_command(&mut self, source_cell_id: i32, command: HandoverCommand) {
+    async fn handle_handover_command(&mut self, source_cell_id: i32, mut command: HandoverCommand) {
+        // Resolve the target's `physCellId` to a cell this UE can actually hear
+        // (issue #107). The command names the target by PCI, which is the 3GPP
+        // identity; the simulator's cell index is not on the wire and must not be,
+        // because a UE handed an index it cannot verify would trust a number the
+        // network invented. `phys_cell_id_of` derives each known cell's PCI from
+        // the NCI its SIB1 broadcast, which is the convention both ends share.
+        let target_pci = command.target_cell.pci;
+        command.target_cell.cell_id =
+            self.cell_selector.cells().keys().copied().find(|id| {
+                self.cell_selector.phys_cell_id_of(*id) == Some((target_pci % 1008) as u16)
+            });
         let target_cell_id = command.target_cell.cell_id;
         let transaction_id = command.transaction_id;
 
@@ -2007,8 +2132,10 @@ impl RrcTask {
         self.handover_manager
             .start_handover(source_cell_id, command);
 
-        // Check if we have signal to the target cell
-        if self.cell_selector.has_signal_to_cell(target_cell_id) {
+        // Check if we have signal to the target cell. An UNRESOLVED PCI takes the
+        // failure branch: a target the UE cannot identify is a target it cannot
+        // reach, which is exactly what TargetCellUnreachable means.
+        if target_cell_id.is_some_and(|id| self.cell_selector.has_signal_to_cell(id)) {
             // Start synchronization
             self.handover_manager.start_synchronization();
 
@@ -2055,8 +2182,8 @@ impl RrcTask {
         } else {
             // Target cell not reachable - handover failure
             warn!(
-                "Handover failed: target cell {} not in coverage",
-                target_cell_id
+                "Handover failed: target PCI {} not in coverage (local cell {:?})",
+                target_pci, target_cell_id
             );
             if let Some(source_cell) = self
                 .handover_manager
@@ -4909,6 +5036,222 @@ mod tests {
             priorities.is_empty() && !dedicated,
             "an empty dedicated list must delete the stored priorities and fall \
              back to broadcast, not store an empty override"
+        );
+    }
+
+    // ========================================================================
+    // MeasurementReport is real UPER now (issue #107, criterion 4)
+    // ========================================================================
+
+    fn measurement_report_fixture() -> crate::rrc::measurement::MeasurementReport {
+        use crate::rrc::measurement::{CellMeasResult, MeasurementReport};
+        MeasurementReport {
+            meas_id: 3,
+            serving_cell: CellMeasResult {
+                pci: 1,
+                nci: None,
+                rsrp: Some(-90),
+                rsrq: None,
+                sinr: None,
+            },
+            neighbor_cells: vec![CellMeasResult {
+                pci: 2,
+                nci: None,
+                rsrp: Some(-80),
+                rsrq: None,
+                sinr: None,
+            }],
+            eutra_neighbor_cells: Vec::new(),
+            triggered_cells: Vec::new(),
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// The UE emits a real UPER `MeasurementReport`, and the **gNB's own parser**
+    /// reads back the levels it put in.
+    ///
+    /// This is the criterion that matters: the two ends had to flip together, and a
+    /// test that only round-tripped through this crate would pass with the gNB still
+    /// expecting the hand-rolled bytes. `nextgsim-gnb` is not a dependency of
+    /// `nextgsim-ue`, so the shared surface asserted here is the codec both call —
+    /// `decode_measurement_report` is exactly what the gNB's
+    /// `parse_measurement_report` calls, and its own test asserts the dBm result.
+    #[test]
+    fn the_ue_emits_a_uper_measurement_report_the_shared_codec_decodes() {
+        use nextgsim_rrc::procedures::measurement_report::{
+            decode_measurement_report, rsrp_range_to_dbm,
+        };
+
+        let report = measurement_report_fixture();
+        let bytes = build_uper_measurement_report(&report).expect("the report must encode");
+
+        // Not the legacy format: that started with 0x0B and was 9 bytes here.
+        assert_ne!(
+            bytes.first(),
+            Some(&0x0Bu8),
+            "the hand-rolled leading byte must be gone"
+        );
+
+        let decoded = decode_measurement_report(&bytes).expect("the gNB's codec must decode it");
+        assert_eq!(decoded.meas_id.0, 3);
+
+        let serving = decoded
+            .serv_freq_results
+            .first()
+            .expect("a serving result must be present");
+        assert_eq!(serving.serv_cell_index, 0);
+        assert_eq!(serving.meas_result_serving_cell.phys_cell_id, Some(1));
+        let serving_rsrp = serving
+            .meas_result_serving_cell
+            .cell_results
+            .ssb_results
+            .as_ref()
+            .and_then(|r| r.rsrp)
+            .expect("the serving RSRP must be carried");
+        assert_eq!(
+            rsrp_range_to_dbm(serving_rsrp).round() as i32,
+            -90,
+            "the level must survive dBm -> RSRP-Range -> dBm"
+        );
+
+        let neigh = decoded
+            .neigh_freq_results
+            .first()
+            .expect("the neighbour frequency entry must be present");
+        assert_eq!(neigh.meas_result_list.len(), 1);
+        assert_eq!(neigh.meas_result_list[0].phys_cell_id, Some(2));
+        assert_eq!(
+            rsrp_range_to_dbm(
+                neigh.meas_result_list[0]
+                    .cell_results
+                    .ssb_results
+                    .as_ref()
+                    .and_then(|r| r.rsrp)
+                    .expect("neighbour RSRP")
+            )
+            .round() as i32,
+            -80
+        );
+        assert!(
+            decoded.eutra_neigh_results.is_empty(),
+            "an intra-NR report must not also carry E-UTRA results: \
+             measResultNeighCells is a CHOICE"
+        );
+    }
+
+    /// The **wiring**: `send_measurement_report` puts the UPER bytes on UL-DCCH.
+    ///
+    /// The test above exercises `build_uper_measurement_report` directly, so it
+    /// passes even if the sender never calls it — a revert round proved exactly
+    /// that by replacing the sender's call with legacy bytes and staying green.
+    /// This is the recorded pattern where the helper is tested and the wiring is
+    /// not, and the better the helper's test the more convincing the illusion.
+    #[test]
+    fn send_measurement_report_puts_the_uper_bytes_on_ul_dcch() {
+        use nextgsim_rrc::procedures::measurement_report::decode_measurement_report;
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        let report = measurement_report_fixture();
+
+        run_async(async {
+            task.send_measurement_report(&report).await;
+        });
+
+        let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+        assert_eq!(
+            channel,
+            RrcChannel::UlDcch,
+            "a MeasurementReport rides UL-DCCH"
+        );
+        let decoded = decode_measurement_report(pdu.data())
+            .expect("what the sender actually emitted must be a UPER MeasurementReport");
+        assert_eq!(decoded.meas_id.0, report.meas_id);
+        assert_ne!(
+            pdu.data().first(),
+            Some(&0x0Bu8),
+            "and not the legacy hand-rolled format"
+        );
+    }
+
+    /// A cell the UE detected but could not measure reports **no** ssb-Results.
+    ///
+    /// `RSRP-Range` 0 is a real measurement meaning "below -156 dBm", so
+    /// substituting it for "unknown" would report an implausibly weak level as a
+    /// measurement. The old byte format substituted **-120 dBm**, a plausible level
+    /// the UE had never measured, which is worse still.
+    #[test]
+    fn an_unmeasured_cell_reports_no_results_rather_than_range_zero() {
+        use nextgsim_rrc::procedures::measurement_report::decode_measurement_report;
+
+        let mut report = measurement_report_fixture();
+        report.serving_cell.rsrp = None;
+        report.neighbor_cells[0].rsrp = None;
+
+        let bytes = build_uper_measurement_report(&report).expect("encodes");
+        let decoded = decode_measurement_report(&bytes).expect("decodes");
+
+        assert!(
+            decoded.serv_freq_results[0]
+                .meas_result_serving_cell
+                .cell_results
+                .ssb_results
+                .is_none(),
+            "an unmeasured serving cell must carry no ssb-Results, not range 0"
+        );
+        assert!(
+            decoded.neigh_freq_results[0].meas_result_list[0]
+                .cell_results
+                .ssb_results
+                .is_none(),
+            "and neither must an unmeasured neighbour"
+        );
+    }
+
+    /// An inter-RAT (B1/B2) report **cannot be encoded by this codec version**, and
+    /// that is issue #117's ceiling reached from a new direction.
+    ///
+    /// `measResultNeighCells` is a CHOICE whose `measResultListEUTRA` alternative
+    /// sits past the extension marker, and `asn1-codecs` 0.7.2's
+    /// `encode_choice_idx_common` returns `EncodeNotSupported` for exactly that.
+    /// #113 pinned the refusal at the codec (`the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec`);
+    /// this pins its **consequence at the UE**: a B1/B2 report is not sent at all.
+    ///
+    /// Asserted rather than left to be discovered, because the alternative is a
+    /// measurement that vanishes with a log line. `send_measurement_report` names
+    /// #117 in that log so an operator is told why. When #117 is resolved this test
+    /// must be REPLACED by the success assertion, not deleted — the inter-RAT arm is
+    /// the thing it is about.
+    #[test]
+    fn an_inter_rat_report_cannot_be_encoded_by_this_codec_version() {
+        use crate::rrc::measurement::{EutraCellKey, EutraMeasResult};
+
+        let mut report = measurement_report_fixture();
+        report.eutra_neighbor_cells = vec![EutraMeasResult {
+            cell: EutraCellKey {
+                earfcn: 1850,
+                pci: 42,
+            },
+            rsrp: Some(-100),
+            cell_individual_offset: 0,
+        }];
+
+        let err = build_uper_measurement_report(&report)
+            .expect_err("issue #117: the extended CHOICE arm cannot be encoded");
+        let text = err.to_string();
+        assert!(
+            text.contains("extended choice") || text.contains("EncodeNotSupported"),
+            "the failure must be the codec's extended-CHOICE refusal (issue #117), \
+             not some other encode error that would hide it: {text}"
+        );
+
+        // The positive control: the SAME report without the E-UTRA results encodes
+        // fine, so the refusal is about the extension arm and not about the report.
+        report.eutra_neighbor_cells.clear();
+        assert!(
+            build_uper_measurement_report(&report).is_ok(),
+            "an intra-NR report must still encode; otherwise the assertion above \
+             says nothing about the E-UTRA arm"
         );
     }
 }

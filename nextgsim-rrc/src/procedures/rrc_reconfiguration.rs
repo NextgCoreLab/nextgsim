@@ -470,6 +470,134 @@ mod tests {
     use super::*;
 
     // ========================================================================
+    // Handover command golden bytes (issue #107, criterion 6)
+    // ========================================================================
+
+    /// Hand-derived handover command: `RRCReconfiguration`, tid 0, whose
+    /// `masterCellGroup` carries a `reconfigurationWithSync` to physCellId 16 with
+    /// `newUE-Identity` 1 and `t304` 1000 ms, and `fullConfig` set.
+    ///
+    /// Derivation of the framing from `tools/rrc-15.6.0.asn1`:
+    ///
+    /// ```text
+    /// bit 0      DL-DCCH-MessageType CHOICE, 2 alternatives -> 1 bit. c1 = 0
+    /// bits 1..4  c1 CHOICE, 16 alternatives -> 4 bits.
+    ///            rrcReconfiguration = 0 -> 0000
+    /// bits 5..6  RRC-TransactionIdentifier, INTEGER (0..3) -> 2 bits. tid 0 -> 00
+    /// bit 7      RRCReconfiguration criticalExtensions CHOICE -> 1 bit.
+    ///            rrcReconfiguration = 0
+    ///            => byte 0 = 0b0_0000_00_0 = 0x00
+    /// ```
+    ///
+    /// The tail is the `RRCReconfiguration-IEs` preamble, the v1530 extension
+    /// carrying `masterCellGroup` and `fullConfig`, and the embedded
+    /// `CellGroupConfig`. Those inner layers are pinned by this literal and
+    /// cross-checked by `golden_handover_command_cross_decode` rather than derived
+    /// bit by bit — stated plainly, because a wrong derivation in a comment is worse
+    /// than an honest "cross-checked".
+    const GOLDEN_HANDOVER_COMMAND_TID0: [u8; 13] = [
+        0x00, 0x0E, 0x00, 0x48, 0x20, 0x42, 0x40, 0x00, 0x20, 0x50, 0x00, 0x03, 0x40,
+    ];
+
+    fn golden_handover_params(rrc_transaction_id: u8) -> HandoverCommandParams {
+        HandoverCommandParams {
+            rrc_transaction_id,
+            target_phys_cell_id: 16,
+            new_ue_identity: 1,
+            t304_ms: 1000,
+            full_config: true,
+        }
+    }
+
+    #[test]
+    fn golden_handover_command_bytes() {
+        let bytes = encode_handover_command(&golden_handover_params(0)).expect("encode");
+        assert_eq!(
+            bytes,
+            GOLDEN_HANDOVER_COMMAND_TID0.to_vec(),
+            "the handover command must match the hand-derived UPER bytes, not a \
+             round trip through this codec"
+        );
+
+        // The tid occupies bits 5..6 of byte 0 only: tid 2 -> 0b0_0000_10_0 = 0x04.
+        let bytes_tid2 = encode_handover_command(&golden_handover_params(2)).expect("encode");
+        let mut expected = GOLDEN_HANDOVER_COMMAND_TID0;
+        expected[0] = 0x04;
+        assert_eq!(bytes_tid2, expected.to_vec());
+    }
+
+    #[test]
+    fn golden_handover_command_cross_decode() {
+        let data = decode_handover_command(&GOLDEN_HANDOVER_COMMAND_TID0)
+            .expect("the golden must decode as a handover command");
+        assert_eq!(data.rrc_transaction_id, 0);
+        assert_eq!(data.target_phys_cell_id, 16);
+        assert_eq!(data.new_ue_identity, 1);
+        assert_eq!(data.t304_ms, 1000);
+        assert!(data.full_config);
+
+        // And the reconfigurationWithSync really is there, which is what makes this
+        // a handover command rather than a plain reconfiguration.
+        let reconf = decode_rrc_reconfiguration(&GOLDEN_HANDOVER_COMMAND_TID0).expect("decode");
+        let cgc: CellGroupConfig = decode_rrc(
+            reconf
+                .master_cell_group
+                .as_ref()
+                .expect("masterCellGroup present"),
+        )
+        .expect("decode CellGroupConfig");
+        let sync = cgc
+            .sp_cell_config
+            .expect("spCellConfig present")
+            .reconfiguration_with_sync
+            .expect("reconfigurationWithSync present");
+        assert_eq!(
+            sync.sp_cell_config_common
+                .expect("spCellConfigCommon present")
+                .phys_cell_id
+                .expect("physCellId present")
+                .0,
+            16
+        );
+    }
+
+    /// A target PCI past the ASN.1 bound is refused rather than encoded.
+    #[test]
+    fn an_out_of_range_target_phys_cell_id_is_refused() {
+        let mut params = golden_handover_params(0);
+        params.target_phys_cell_id = 1008;
+        assert!(encode_handover_command(&params).is_err());
+    }
+
+    /// `t304` enumerates non-uniform values, so a value outside the set is refused
+    /// rather than rounded: it is the timer that decides when the UE declares
+    /// handover failure.
+    #[test]
+    fn a_non_enumerated_t304_is_refused_not_rounded() {
+        for legal in [50u16, 100, 150, 200, 500, 1000, 2000, 10000] {
+            let mut params = golden_handover_params(0);
+            params.t304_ms = legal;
+            assert!(
+                encode_handover_command(&params).is_ok(),
+                "t304 {legal} ms is enumerated and must encode"
+            );
+            assert_eq!(
+                t304_ms(t304_index(legal).expect("index")).expect("ms"),
+                legal
+            );
+        }
+        for illegal in [0u16, 300, 250, 1500, 9999] {
+            let mut params = golden_handover_params(0);
+            params.t304_ms = illegal;
+            assert!(
+                encode_handover_command(&params).is_err(),
+                "t304 {illegal} ms is NOT enumerated and must be refused, not \
+                 rounded to a deadline nobody configured"
+            );
+        }
+    }
+
+    // ========================================================================
     // RRC Reconfiguration Tests
     // ========================================================================
 
@@ -1192,4 +1320,223 @@ mod tests {
             _ => panic!("expected served DRB identity"),
         }
     }
+}
+
+// ============================================================================
+// Handover command: RRCReconfiguration with reconfigurationWithSync
+// (TS 38.331 §5.3.5.5.2, §6.3.2 — issue #107, criterion 3)
+// ============================================================================
+
+/// `t304` in milliseconds, and the ASN.1 enumeration index carrying it
+/// (TS 38.331 §6.3.2 `ReconfigurationWithSync.t304`).
+///
+/// A table rather than arithmetic: the values are not a uniform step (50, 100,
+/// 150, 200, 500, 1000, 2000, 10000), so any computed mapping is wrong above 200.
+const T304_MS_TO_INDEX: [(u16, u8); 8] = [
+    (50, 0),
+    (100, 1),
+    (150, 2),
+    (200, 3),
+    (500, 4),
+    (1000, 5),
+    (2000, 6),
+    (10000, 7),
+];
+
+/// Maps a `t304` in milliseconds onto its enumeration index, refusing a value the
+/// enumeration does not contain.
+///
+/// Refused rather than rounded to the nearest legal value: `t304` is the timer
+/// that decides when the UE declares handover failure, and a silently adjusted
+/// one makes a handover-failure test fire at a time nobody configured.
+pub fn t304_index(ms: u16) -> Result<u8, RrcReconfigurationError> {
+    T304_MS_TO_INDEX
+        .iter()
+        .find(|(value, _)| *value == ms)
+        .map(|(_, index)| *index)
+        .ok_or_else(|| {
+            RrcReconfigurationError::InvalidFieldValue(format!(
+                "t304 {ms} ms is not one of the values TS 38.331 enumerates \
+                 (50, 100, 150, 200, 500, 1000, 2000, 10000)"
+            ))
+        })
+}
+
+/// The inverse of [`t304_index`], in milliseconds.
+pub fn t304_ms(index: u8) -> Result<u16, RrcReconfigurationError> {
+    T304_MS_TO_INDEX
+        .iter()
+        .find(|(_, value)| *value == index)
+        .map(|(ms, _)| *ms)
+        .ok_or_else(|| {
+            RrcReconfigurationError::InvalidFieldValue(format!(
+                "t304 index {index} is out of range"
+            ))
+        })
+}
+
+/// `ss-PBCH-BlockPower` broadcast in a `ServingCellConfigCommon`.
+///
+/// A PHY parameter this simulator does not model (there is no PBCH). -20 dBm is
+/// inside the `INTEGER (-60..50)` range and unremarkable; documented here rather
+/// than made a knob nothing reads, the same treatment `mib_params` gives the
+/// MIB's physical-layer fields.
+const SS_PBCH_BLOCK_POWER_DBM: i8 = -20;
+
+/// Parameters for a handover command (issue #107, criterion 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoverCommandParams {
+    /// RRC-TransactionIdentifier (0..3)
+    pub rrc_transaction_id: u8,
+    /// `physCellId` of the target cell (0..1007). This is how the target is
+    /// identified on the wire — the simulator's own cell index has no IE, so the
+    /// receiving UE resolves the PCI against the cells it can hear.
+    pub target_phys_cell_id: u16,
+    /// `newUE-Identity`: the C-RNTI the UE is to use in the target cell.
+    pub new_ue_identity: u16,
+    /// `t304` in milliseconds; must be one of the enumerated values.
+    pub t304_ms: u16,
+    /// `fullConfig`: the UE releases its stored configuration and applies this one
+    /// whole.
+    pub full_config: bool,
+}
+
+/// What a handover command carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoverCommandData {
+    /// RRC-TransactionIdentifier
+    pub rrc_transaction_id: u8,
+    /// `physCellId` of the target cell
+    pub target_phys_cell_id: u16,
+    /// `newUE-Identity` (C-RNTI in the target)
+    pub new_ue_identity: u16,
+    /// `t304` in milliseconds
+    pub t304_ms: u16,
+    /// Whether `fullConfig` was set
+    pub full_config: bool,
+}
+
+/// Builds the `CellGroupConfig` carrying a `reconfigurationWithSync` for a
+/// handover to `target_phys_cell_id` (TS 38.331 §6.3.2).
+///
+/// `reconfigurationWithSync` is what makes an `RRCReconfiguration` a **handover
+/// command** rather than a plain reconfiguration: TS 38.331 §5.3.5.5.2 has the UE
+/// perform the synchronous reconfiguration — reset MAC, re-establish RLC/PDCP and
+/// access the target cell — only when this IE is present.
+pub fn build_handover_cell_group_config(
+    target_phys_cell_id: u16,
+    new_ue_identity: u16,
+    t304_ms: u16,
+) -> Result<CellGroupConfig, RrcReconfigurationError> {
+    if target_phys_cell_id > 1007 {
+        return Err(RrcReconfigurationError::InvalidFieldValue(format!(
+            "physCellId is INTEGER (0..1007), got {target_phys_cell_id}"
+        )));
+    }
+
+    let sp_cell_config_common = ServingCellConfigCommon {
+        phys_cell_id: Some(PhysCellId(target_phys_cell_id)),
+        // The target's frequency configuration is deliberately absent. This
+        // simulator's RLS presents one carrier, so a target cell is always on the
+        // UE's current frequency and `downlinkConfigCommon` would carry a
+        // `frequencyInfoDL` the UE already has. Absent is honest; a fabricated
+        // ARFCN would be a value the UE might act on.
+        downlink_config_common: None,
+        uplink_config_common: None,
+        supplementary_uplink_config: None,
+        n_timing_advance_offset: None,
+        ssb_positions_in_burst: None,
+        ssb_periodicity_serving_cell: None,
+        // Mandatory PHY fields with no counterpart in a simulator with no PHY,
+        // fixed at the values a 30 kHz FR1 cell would use — the same treatment
+        // `nextgsim-gnb`'s `mib_params` gives the MIB's physical-layer fields, and
+        // documented for the same reason.
+        dmrs_type_a_position: ServingCellConfigCommonDmrs_TypeA_Position(
+            ServingCellConfigCommonDmrs_TypeA_Position::POS2,
+        ),
+        lte_crs_to_match_around: None,
+        rate_match_pattern_to_add_mod_list: None,
+        rate_match_pattern_to_release_list: None,
+        ssb_subcarrier_spacing: None,
+        tdd_ul_dl_configuration_common: None,
+        ss_pbch_block_power: ServingCellConfigCommonSs_PBCH_BlockPower(SS_PBCH_BLOCK_POWER_DBM),
+    };
+
+    let sp_cell_config = SpCellConfig {
+        serv_cell_index: None,
+        reconfiguration_with_sync: Some(ReconfigurationWithSync {
+            sp_cell_config_common: Some(sp_cell_config_common),
+            new_ue_identity: RNTI_Value(new_ue_identity),
+            t304: ReconfigurationWithSyncT304(t304_index(t304_ms)?),
+            // No dedicated RACH preamble: this simulator has no RACH, so a
+            // contention-free preamble would name a resource that does not exist.
+            rach_config_dedicated: None,
+        }),
+        rlf_timers_and_constants: None,
+        rlm_in_sync_out_of_sync_threshold: None,
+        sp_cell_config_dedicated: None,
+    };
+
+    Ok(CellGroupConfig {
+        cell_group_id: CellGroupId(0),
+        rlc_bearer_to_add_mod_list: None,
+        rlc_bearer_to_release_list: None,
+        mac_cell_group_config: None,
+        physical_cell_group_config: None,
+        sp_cell_config: Some(sp_cell_config),
+        s_cell_to_add_mod_list: None,
+        s_cell_to_release_list: None,
+    })
+}
+
+/// Builds the `RrcReconfigurationParams` for a handover command.
+pub fn build_handover_command_params(
+    params: &HandoverCommandParams,
+) -> Result<RrcReconfigurationParams, RrcReconfigurationError> {
+    let cgc = build_handover_cell_group_config(
+        params.target_phys_cell_id,
+        params.new_ue_identity,
+        params.t304_ms,
+    )?;
+    Ok(RrcReconfigurationParams {
+        rrc_transaction_id: params.rrc_transaction_id,
+        radio_bearer_config: None,
+        secondary_cell_group: None,
+        master_cell_group: Some(encode_rrc(&cgc)?),
+        full_config: params.full_config,
+    })
+}
+
+/// Builds and encodes a handover command to UPER bytes.
+pub fn encode_handover_command(
+    params: &HandoverCommandParams,
+) -> Result<Vec<u8>, RrcReconfigurationError> {
+    encode_rrc_reconfiguration(&build_handover_command_params(params)?)
+}
+
+/// Decodes a handover command, i.e. an `RRCReconfiguration` whose
+/// `masterCellGroup` carries a `reconfigurationWithSync`.
+///
+/// Returns `None` for an `RRCReconfiguration` that is **not** a handover command —
+/// one with no `masterCellGroup`, or one whose cell group has no
+/// `reconfigurationWithSync`. That is not an error: a DRB-establishing
+/// reconfiguration is a perfectly good message that simply is not a handover, and
+/// a receiver has to be able to tell them apart.
+pub fn decode_handover_command(bytes: &[u8]) -> Option<HandoverCommandData> {
+    let data = decode_rrc_reconfiguration(bytes).ok()?;
+    let master_cell_group = data.master_cell_group.as_ref()?;
+    let cgc: CellGroupConfig = decode_rrc(master_cell_group).ok()?;
+    let sync = cgc.sp_cell_config?.reconfiguration_with_sync?;
+    let target_phys_cell_id = sync.sp_cell_config_common?.phys_cell_id?.0;
+    Some(HandoverCommandData {
+        rrc_transaction_id: data.rrc_transaction_id,
+        target_phys_cell_id,
+        new_ue_identity: sync.new_ue_identity.0,
+        // A t304 index outside the enumeration cannot occur from a successful
+        // decode (the ASN.1 type bounds it), so an unmappable one is treated as
+        // "not a usable handover command" rather than silently defaulted to a
+        // timer the network never set.
+        t304_ms: t304_ms(sync.t304.0).ok()?,
+        full_config: data.full_config,
+    })
 }

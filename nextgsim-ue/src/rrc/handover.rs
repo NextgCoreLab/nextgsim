@@ -21,6 +21,7 @@
 //! # Reference
 //! - 3GPP TS 38.331: NR; RRC protocol specification, Section 5.3.5
 
+use nextgsim_rrc::procedures::rrc_reconfiguration::decode_handover_command;
 use std::time::{Duration, Instant};
 
 /// Handover states
@@ -57,8 +58,13 @@ pub enum HandoverFailureCause {
 pub struct TargetCellInfo {
     /// Physical cell ID
     pub pci: u32,
-    /// Cell ID (NCI)
-    pub cell_id: i32,
+    /// The UE's own local index for the target cell, resolved from the
+    /// `physCellId` the command carried.
+    ///
+    /// `None` when the UE cannot match the PCI to a cell it can hear. Not a
+    /// sentinel like 0, because cell index 0 is a real cell here — the same
+    /// reasoning that made `CellSelector::current_cell` an `Option` (issue #30).
+    pub cell_id: Option<i32>,
     /// New C-RNTI assigned by target cell
     pub new_ue_id: Option<i32>,
     /// Target cell ARFCN (frequency)
@@ -141,7 +147,7 @@ impl HandoverManager {
     /// Start handover procedure
     pub fn start_handover(&mut self, source_cell: i32, command: HandoverCommand) {
         tracing::info!(
-            "Starting handover: source_cell={}, target_pci={}, target_cell_id={}",
+            "Starting handover: source_cell={}, target_pci={}, target_cell_id={:?}",
             source_cell,
             command.target_cell.pci,
             command.target_cell.cell_id
@@ -180,7 +186,11 @@ impl HandoverManager {
             self.t304_start = None;
             self.ho_complete_time = Some(Instant::now());
 
-            let target_cell_id = self.command.as_ref().map(|c| c.target_cell.cell_id);
+            // Flattened: an unresolved PCI (`cell_id: None`) and no command at all
+            // both mean "no target cell to move to", and the caller treats them the
+            // same way. Keeping them nested as Option<Option<i32>> would only invite
+            // a `.flatten()` at every call site.
+            let target_cell_id = self.command.as_ref().and_then(|c| c.target_cell.cell_id);
 
             if let Some(start) = self.ho_start_time {
                 self.last_duration = Some(start.elapsed());
@@ -253,50 +263,46 @@ impl Default for HandoverManager {
     }
 }
 
-/// Parse handover command from RRC Reconfiguration PDU (simplified)
+/// Parses a handover command: an `RRCReconfiguration` whose `masterCellGroup`
+/// carries a `reconfigurationWithSync` (TS 38.331 §5.3.5.5.2, issue #107).
 ///
-/// In a real implementation, this would use ASN.1 decoding.
-/// This simplified version extracts basic handover info from a simplified format.
+/// Replaces a hand-rolled byte parser whose comment said "In a real
+/// implementation, this would use ASN.1 decoding". The gNB's encoder flipped in
+/// the **same change** — a one-sided flip means the UE reads a UPER message as the
+/// old byte layout, and `pdu[0] != 0x00` would make every handover command look
+/// like "not a handover".
+///
+/// Returns `None` for an `RRCReconfiguration` that is not a handover command
+/// (no `reconfigurationWithSync`), which is how the caller distinguishes it from a
+/// DRB-establishing reconfiguration. Both are DL-DCCH `RRCReconfiguration`s.
+///
+/// # `cell_id` is resolved by the caller, not read off the wire
+///
+/// `TargetCellInfo::cell_id` used to come from four bytes the gNB put in its
+/// bespoke format. `reconfigurationWithSync` has no field for it, because the
+/// simulator's cell index is not a 3GPP identity — the target is named by
+/// `physCellId`. So this returns `cell_id: None` and the caller resolves the PCI
+/// against the cells the UE can actually hear. A UE that cannot find the PCI has
+/// learned something true: it cannot reach the target.
 pub fn parse_handover_command(pdu: &[u8]) -> Option<HandoverCommand> {
-    // Simplified format (not real ASN.1):
-    // [0] = message type (0x00 = RRC Reconfiguration with HO)
-    // [1] = transaction_id
-    // [2-3] = target PCI (big endian)
-    // [4-7] = target cell ID (big endian)
-    // [8] = flags (0x01 = has new_ue_id, 0x02 = full_config)
-    // [9-12] = new_ue_id (if flag set)
-
-    if pdu.len() < 9 {
-        return None;
-    }
-
-    // Check if this is a handover reconfiguration
-    if pdu[0] != 0x00 {
-        return None;
-    }
-
-    let transaction_id = pdu[1];
-    let target_pci = u16::from_be_bytes([pdu[2], pdu[3]]) as u32;
-    let target_cell_id = i32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
-    let flags = pdu[8];
-
-    let new_ue_id = if flags & 0x01 != 0 && pdu.len() >= 13 {
-        Some(i32::from_be_bytes([pdu[9], pdu[10], pdu[11], pdu[12]]))
-    } else {
-        None
-    };
-
+    let decoded = decode_handover_command(pdu)?;
     Some(HandoverCommand {
         target_cell: TargetCellInfo {
-            pci: target_pci,
-            cell_id: target_cell_id,
-            new_ue_id,
+            pci: u32::from(decoded.target_phys_cell_id),
+            // Unresolved: see the note above.
+            cell_id: None,
+            new_ue_id: Some(i32::from(decoded.new_ue_identity)),
+            // The target's frequency is absent from the command by design (this
+            // simulator is single-carrier), so the UE stays on its own.
             arfcn: None,
             ssb_offset: None,
         },
+        // `masterKeyUpdate` is the IE that says the UE re-keys, and it is NOT in
+        // the command this gNB builds -- KgNB* derivation does not exist here
+        // (issue #39). `false` is therefore the truth rather than a default.
         new_security_config: false,
-        full_config: flags & 0x02 != 0,
-        transaction_id,
+        full_config: decoded.full_config,
+        transaction_id: decoded.rrc_transaction_id,
     })
 }
 
@@ -327,7 +333,7 @@ mod tests {
         let command = HandoverCommand {
             target_cell: TargetCellInfo {
                 pci: 1,
-                cell_id: 100,
+                cell_id: Some(100),
                 new_ue_id: Some(1),
                 arfcn: None,
                 ssb_offset: None,
@@ -369,7 +375,7 @@ mod tests {
             HandoverCommand {
                 target_cell: TargetCellInfo {
                     pci: 2,
-                    cell_id: 2,
+                    cell_id: Some(2),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -392,7 +398,7 @@ mod tests {
         let command = HandoverCommand {
             target_cell: TargetCellInfo {
                 pci: 1,
-                cell_id: 100,
+                cell_id: Some(100),
                 ..Default::default()
             },
             ..Default::default()
@@ -406,23 +412,54 @@ mod tests {
         assert_eq!(manager.state(), HandoverState::Failed);
     }
 
+    /// #107, criterion 3: the UE parses a real `RRCReconfiguration` with
+    /// `reconfigurationWithSync`, built by the **shared encoder the gNB uses**.
+    ///
+    /// This test used to hand-build the byte layout the gNB used to emit. Rewritten
+    /// rather than deleted: the same facts, off the conformant wire. The bytes come
+    /// from `nextgsim-rrc`'s `encode_handover_command`, which is exactly what the
+    /// gNB calls — so a one-sided change to either end fails here.
     #[test]
     fn test_parse_handover_command() {
-        // Build a test handover command
-        let pdu = vec![
-            0x00, // message type
-            0x05, // transaction_id
-            0x00, 0x10, // target PCI = 16
-            0x00, 0x00, 0x00, 0x64, // target cell ID = 100
-            0x01, // flags (has new_ue_id)
-            0x00, 0x00, 0x00, 0x01, // new_ue_id = 1
-        ];
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_handover_command, HandoverCommandParams,
+        };
 
-        let cmd = parse_handover_command(&pdu).unwrap();
-        assert_eq!(cmd.transaction_id, 5);
-        assert_eq!(cmd.target_cell.pci, 16);
-        assert_eq!(cmd.target_cell.cell_id, 100);
+        let pdu = encode_handover_command(&HandoverCommandParams {
+            rrc_transaction_id: 3,
+            target_phys_cell_id: 16,
+            new_ue_identity: 1,
+            t304_ms: 1000,
+            full_config: true,
+        })
+        .expect("the shared encoder must produce a handover command");
+
+        let cmd = parse_handover_command(&pdu).expect("and the UE must parse it");
+        assert_eq!(cmd.transaction_id, 3);
+        assert_eq!(cmd.target_cell.pci, 16, "the target is named by physCellId");
+        assert_eq!(
+            cmd.target_cell.cell_id, None,
+            "the simulator's cell index is NOT on the wire; the caller resolves the \
+             PCI against the cells the UE can hear"
+        );
         assert_eq!(cmd.target_cell.new_ue_id, Some(1));
+        assert!(cmd.full_config);
+        assert!(
+            !cmd.new_security_config,
+            "masterKeyUpdate is absent from the command this gNB builds (no KgNB* \
+             derivation exists -- issue #39), so false is the truth and not a default"
+        );
+    }
+
+    /// The old byte format must not parse. A UE that still accepted it would let a
+    /// half-flipped pair keep working, which is what criterion 4's "flipped in the
+    /// same change" exists to prevent.
+    #[test]
+    fn the_legacy_byte_format_handover_command_no_longer_parses() {
+        let legacy = vec![
+            0x00, 0x05, 0x00, 0x10, 0x00, 0x00, 0x00, 0x64, 0x01, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert!(parse_handover_command(&legacy).is_none());
     }
 
     #[test]
@@ -693,37 +730,43 @@ impl HandoverManager {
     }
 }
 
-/// Parses DAPS RRC Reconfiguration message (simplified format).
+/// Parses a DAPS reconfiguration: the real `RRCReconfiguration` with
+/// `reconfigurationWithSync` the gNB now emits (issue #107).
 ///
-/// Simplified format:
-/// [0] = message type (0x10 = RRC Reconfiguration with DAPS)
-/// [1] = transaction_id
-/// [2-3] = source PCI (big endian)
-/// [4-5] = source C-RNTI (big endian)
-/// [6-7] = target PCI (big endian)
-/// [8-9] = target C-RNTI (big endian)
-/// [10-11] = T304daps (big endian, ms)
-/// [12] = flags (0x01 = data_forwarding_enabled)
-pub fn parse_daps_reconfiguration(pdu: &[u8]) -> Option<UeDapsContext> {
-    if pdu.len() < 13 || pdu[0] != 0x10 {
-        return None;
-    }
-
-    let _transaction_id = pdu[1];
-    let source_pci = u16::from_be_bytes([pdu[2], pdu[3]]) as u32;
-    let source_crnti = u16::from_be_bytes([pdu[4], pdu[5]]);
-    let target_pci = u16::from_be_bytes([pdu[6], pdu[7]]) as u32;
-    let target_crnti = u16::from_be_bytes([pdu[8], pdu[9]]);
-    let t304_daps_ms = u16::from_be_bytes([pdu[10], pdu[11]]) as u64;
-    let _flags = pdu[12];
-
+/// Replaces a 13-byte hand-rolled parser keyed on a `0x10` leading byte.
+///
+/// # The SOURCE half is a parameter, because it is not on the wire
+///
+/// DAPS keeps the source link up, so a conformant DAPS reconfiguration carries
+/// `daps-SourceRelease` and a per-DRB `daps-Config` — **neither of which is in the
+/// Rel-15 schema this tree compiles** (issue #105). The old byte format invented
+/// fields for the source PCI, source C-RNTI and a data-forwarding flag, and no
+/// conformant peer would ever have sent them.
+///
+/// So the source half comes from where the UE already knows it: the cell it is
+/// camped on. That is not a workaround, it is what "source cell" means — the UE
+/// does not need to be told which cell it is currently on.
+///
+/// Returns `None` for a reconfiguration that is not a handover command.
+pub fn parse_daps_reconfiguration(
+    pdu: &[u8],
+    source_pci: u32,
+    source_cell_id: i32,
+    source_crnti: u16,
+) -> Option<UeDapsContext> {
+    let command = decode_handover_command(pdu)?;
     Some(UeDapsContext::new(
         source_pci,
-        source_pci as i32, // Simplified: use PCI as cell_id
+        source_cell_id,
         source_crnti,
-        target_pci,
-        target_pci as i32,
-        target_crnti,
-        t304_daps_ms,
+        u32::from(command.target_phys_cell_id),
+        // The target's local cell index is unknown here for the same reason it is
+        // in `parse_handover_command`: the wire names the target by PCI. The PCI is
+        // used as the index, which is what the old parser did too -- but now it is
+        // the ONLY identity the message carried, rather than one of two that could
+        // disagree.
+        command.target_phys_cell_id as i32,
+        command.new_ue_identity,
+        u64::from(command.t304_ms),
     ))
 }
