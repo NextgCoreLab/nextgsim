@@ -190,6 +190,39 @@ jobs:
           cargo clippy -p nextgsim-gnb --features drb-pdcp --all-targets
           cargo clippy -p nextgsim-ue --features drb-pdcp --all-targets
 
+  up-security:
+    name: UP security (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `up-security` feature (issue #32) is off by default and implies
+      # `drb-pdcp`: without a PDCP entity there is no COUNT for ciphering and
+      # integrity to be keyed on. Both ends must be built the same way -- a gNB
+      # that protects against a UE that does not takes the user plane down rather
+      # than degrading it -- so this job builds and tests them together, including
+      # the end-to-end test that only compiles under the feature.
+      #
+      # `nextgsim-pdcp` needs no feature: the shared `UpSecurity` layer and its
+      # tests are always compiled, and only the wiring on each endpoint is gated.
+      - name: cargo test (shared layer)
+        run: cargo test -p nextgsim-pdcp
+      - name: cargo test (both ends)
+        run: |
+          cargo test -p nextgsim-gnb --features up-security
+          cargo test -p nextgsim-ue --features up-security
+      - name: cargo test (end to end)
+        run: cargo test -p nextgsim-integration-tests --features up-security
+      - name: cargo clippy
+        run: |
+          cargo clippy -p nextgsim-gnb --features up-security --all-targets
+          cargo clippy -p nextgsim-ue --features up-security --all-targets
+          cargo clippy -p nextgsim-integration-tests --features up-security --all-targets
+
   sidelink:
     name: Sidelink facade (feature-gated)
     runs-on: ubuntu-latest

@@ -193,6 +193,23 @@ impl RlsTask {
             .or_insert_with(|| Pdcp::new(PdcpConfig::default()))
     }
 
+    /// Install (or remove) user-plane security on one DRB (issue #32).
+    ///
+    /// Applied to the entity for `psi`, creating it if the DRB has not carried a
+    /// packet yet — the keys arrive from RRC before the first uplink packet does, and
+    /// an entity created later with no security would send the first packets in the
+    /// clear.
+    #[cfg(feature = "up-security")]
+    fn install_drb_security(&mut self, psi: i32, security: Option<nextgsim_pdcp::PdcpSecurity>) {
+        let protected = security.is_some();
+        self.pdcp_entity_for(psi).set_security(security);
+        info!(
+            "DRB user-plane security {} for PSI {}",
+            if protected { "installed" } else { "removed" },
+            psi
+        );
+    }
+
     /// Milliseconds since the task started, for the PDCP timers.
     ///
     /// A monotonic elapsed time rather than a wall clock: the PDCP timers measure
@@ -701,6 +718,10 @@ impl RlsTask {
     async fn handle_rls_message(&mut self, msg: RlsMessage) {
         match msg {
             RlsMessage::AssignCurrentCell { cell_id } => self.handle_assign_current_cell(cell_id),
+            #[cfg(feature = "up-security")]
+            RlsMessage::InstallDrbSecurity { psi, security } => {
+                self.install_drb_security(psi, security.map(|b| *b));
+            }
             RlsMessage::RrcPduDelivery {
                 channel,
                 pdu_id,

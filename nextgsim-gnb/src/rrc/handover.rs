@@ -1352,8 +1352,16 @@ mod tests {
             build_drb_reconfiguration_params, decode_handover_command, encode_rrc_reconfiguration,
         };
 
-        let params = build_drb_reconfiguration_params(0, 1, 1, 4, &[9], true)
-            .expect("a DRB reconfiguration builds");
+        let params = build_drb_reconfiguration_params(
+            0,
+            1,
+            1,
+            4,
+            &[9],
+            true,
+            nextgsim_rrc::procedures::rrc_reconfiguration::DrbIntegrityProtection::Disabled,
+        )
+        .expect("a DRB reconfiguration builds");
         let pdu = encode_rrc_reconfiguration(&params).expect("and encodes");
         assert!(
             decode_handover_command(&pdu).is_none(),

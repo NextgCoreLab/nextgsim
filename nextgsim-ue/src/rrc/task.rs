@@ -2076,12 +2076,114 @@ impl RrcTask {
         // Regular reconfiguration (no handover)
         debug!("RRC Reconfiguration (no handover) - sending RRC Reconfiguration Complete");
 
+        // Apply the DRBs' user-plane security before acknowledging, so the gNB's
+        // first protected downlink PDU -- which it may send as soon as the
+        // Complete arrives -- meets an entity that can verify it (issue #32).
+        self.apply_drb_user_plane_security(bytes).await;
+
         // Extract transaction ID (simplified)
         let transaction_id = if bytes.len() > 1 { bytes[1] } else { 0 };
 
         // Build RRC Reconfiguration Complete
         let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
         self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+    }
+
+    /// Apply the user-plane security configured for each DRB in an
+    /// RRCReconfiguration (TS 38.331 §6.3.2 `PDCP-Config.drb.integrityProtection`,
+    /// TS 33.501 §6.6.1; issue #32).
+    ///
+    /// The UE is **told** what to do rather than configured to match: the gNB derived
+    /// the policy from the SMF's `SecurityIndication` and put `integrityProtection`
+    /// in the DRB's `PDCP-Config`, and this reads it back. That is what makes the two
+    /// ends agree without a shared config file.
+    ///
+    /// Ciphering is not signalled and cannot be: `PDCP-Config.cipheringDisabled` is
+    /// in the Rel-15 schema's extension addition group and the generated codec
+    /// dropped the field (see the spec's ceiling). So the UE ciphers whenever it has
+    /// keys, which is the same decision the gNB makes from the same absent IE.
+    #[allow(unused_variables)]
+    async fn apply_drb_user_plane_security(&mut self, bytes: &[u8]) {
+        #[cfg(feature = "up-security")]
+        {
+            use nextgsim_pdcp::{PdcpSecurity, UpSecurity, DIRECTION_UPLINK};
+            use nextgsim_rrc::procedures::rrc_reconfiguration::{
+                decode_rrc_reconfiguration, drb_integrity_protection, DrbIntegrityProtection,
+            };
+
+            let Some(as_ctx) = self.as_security.clone() else {
+                // No AS security context means the reconfiguration arrived before
+                // the SecurityModeCommand. Nothing to key with, and nothing to say:
+                // a DRB set up before AS security is already covered by the gNB's
+                // own gate (issue #31).
+                return;
+            };
+            let Ok(data) = decode_rrc_reconfiguration(bytes) else {
+                return;
+            };
+            let Some(rbc_bytes) = data.radio_bearer_config else {
+                return;
+            };
+            let Ok(rbc) = nextgsim_rrc::codec::decode_rrc::<
+                nextgsim_rrc::codec::generated::RadioBearerConfig,
+            >(&rbc_bytes) else {
+                warn!("Could not decode the RadioBearerConfig; DRB security not applied");
+                return;
+            };
+            let Some(drbs) = rbc.drb_to_add_mod_list.as_ref() else {
+                return;
+            };
+            for drb in &drbs.0 {
+                let drb_id = drb.drb_identity.0;
+                // The PSI keys the UE's PDCP and RLC entities. It comes from the
+                // DRB's own SDAP config rather than from the DRB identity, because
+                // the two are only equal by this simulator's one-DRB-per-session
+                // convention and the wire carries both.
+                let psi = match drb.cn_association.as_ref() {
+                    Some(
+                        nextgsim_rrc::codec::generated::DRB_ToAddModCnAssociation::Sdap_Config(
+                            sdap,
+                        ),
+                    ) => i32::from(sdap.pdu_session.0),
+                    _ => i32::from(drb_id),
+                };
+                let integrity =
+                    drb_integrity_protection(&rbc, drb_id) == DrbIntegrityProtection::Enabled;
+                let security = match UpSecurity::new(
+                    as_ctx.k_up_enc,
+                    as_ctx.k_up_int,
+                    as_ctx.ciphering_algorithm.id(),
+                    integrity.then(|| as_ctx.integrity_algorithm.id()),
+                ) {
+                    Ok(sec) => sec,
+                    Err(e) => {
+                        error!("Refusing to key DRB {drb_id} (PSI {psi}): {e}");
+                        continue;
+                    }
+                };
+                info!(
+                    "DRB {drb_id} (PSI {psi}): user-plane integrity={}, ciphering=NEA{}",
+                    integrity,
+                    as_ctx.ciphering_algorithm.id()
+                );
+                let msg = RlsMessage::InstallDrbSecurity {
+                    psi,
+                    security: Some(Box::new(PdcpSecurity {
+                        security,
+                        // BEARER is the radio bearer identity minus one
+                        // (TS 33.501 Annex D.3.1.2) -- the `drb-Identity` the gNB put
+                        // on the wire, which is the only value both ends can agree on
+                        // without a shared convention. The gNB's `drb_identity_for`
+                        // computes the same number.
+                        bearer: drb_id.saturating_sub(1),
+                        tx_direction: DIRECTION_UPLINK,
+                    })),
+                };
+                if let Err(e) = self.task_base.rls_tx.send(msg).await {
+                    error!("Failed to install DRB security on the RLS task: {e}");
+                }
+            }
+        }
     }
 
     /// Handle an RRCReconfiguration carrying a conditional-reconfiguration
@@ -3049,6 +3151,177 @@ mod tests {
     /// On camping, the RRC task reports the radio's available PLMNs to NAS in
     /// ActiveCellChanged (issue #49, TS 23.122 §4.4.3) — the production caller
     /// of CellSelector::available_plmns — so NAS selects over the real radio
+    // ========================================================================
+    // User-plane security (issue #32)
+    // ========================================================================
+
+    /// #32, criterion 3 and 6 on the UE side: a reconfiguration carrying
+    /// `PDCP-Config.drb.integrityProtection` makes the UE key its DRB from
+    /// `K_UPenc`/`K_UPint`, and one without it does not.
+    ///
+    /// Reads what the task put on the RLS channel, not what it decided: the whole
+    /// point of the signalling is that the UE acts on the gNB's IE.
+    #[cfg(feature = "up-security")]
+    #[test]
+    fn a_reconfiguration_signalling_integrity_keys_the_ues_drb() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            build_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
+        };
+
+        // The keys the UE derives are the ones the gNB derives, so a mismatch here
+        // would be a mismatch on the wire.
+        let ctx = AsSecurityContext::derive_from_kgnb(
+            &[0x5A; 32],
+            CipheringAlgorithm::Nea2,
+            IntegrityAlgorithm::Nia2,
+            0x1234,
+        );
+
+        for (signalled, expect_mac_i) in [
+            (DrbIntegrityProtection::Enabled, true),
+            (DrbIntegrityProtection::Disabled, false),
+        ] {
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+                UeTaskBase::new(test_config(), 32);
+            let mut task = RrcTask::new(task_base);
+            task.set_as_security_context(ctx.clone());
+
+            // PSI 7 with DRB identity 3: deliberately DIFFERENT numbers. With the
+            // two equal (as this simulator's one-DRB-per-session convention makes
+            // them in production) a UE that read the DRB identity as the PSI would be
+            // indistinguishable from one that read the SDAP config -- a revert round
+            // proved exactly that when this test used 7 for both.
+            let params = build_drb_reconfiguration_params(0, 7, 3, 10, &[9], true, signalled)
+                .expect("build the reconfiguration");
+            let pdu = OctetString::from_slice(
+                &encode_rrc_reconfiguration(&params).expect("encode the reconfiguration"),
+            );
+
+            run_async(async {
+                task.handle_rrc_reconfiguration(1, &pdu).await;
+            });
+
+            let mut installed = None;
+            while let Ok(msg) = rls_rx.try_recv() {
+                if let TaskMessage::Message(RlsMessage::InstallDrbSecurity { psi, security }) = msg
+                {
+                    installed = Some((psi, security));
+                }
+            }
+            let (psi, security) = installed
+                .unwrap_or_else(|| panic!("{signalled:?}: the UE must key its DRB either way"));
+            assert_eq!(
+                psi, 7,
+                "the PSI comes from the DRB's SDAP config, which is what keys the                  UE's PDCP and RLC entities"
+            );
+            let security = security.expect("a binding, since ciphering is always keyed");
+            assert_eq!(
+                security.security.integrity_protected(),
+                expect_mac_i,
+                "{signalled:?}: the UE must follow the gNB's integrityProtection IE"
+            );
+            assert_eq!(
+                security.bearer, 2,
+                "BEARER is the DRB identity minus one -- 3 - 1, not the PSI's 7 - 1"
+            );
+            assert_eq!(
+                security.tx_direction,
+                nextgsim_pdcp::DIRECTION_UPLINK,
+                "a UE transmits uplink; the wrong bit fails every MAC with no other symptom"
+            );
+
+            // And it must be keyed with K_UPenc/K_UPint, NOT the RRC pair. Asserted
+            // through behaviour because `UpSecurity` keeps its keys private (which is
+            // the point): the installed binding must produce the same octets as one
+            // built from the UP keys, and different octets from the RRC pair.
+            //
+            // A revert round that passed `k_rrc_enc`/`k_rrc_int` here stayed green
+            // against every other test, including the end-to-end one -- which installs
+            // its bindings directly and so never exercises this choice at all.
+            let reference = nextgsim_pdcp::UpSecurity::new(
+                ctx.k_up_enc,
+                ctx.k_up_int,
+                ctx.ciphering_algorithm.id(),
+                signalled_integrity_alg(&ctx, signalled),
+            )
+            .expect("legal ids");
+            let wrong_keys = nextgsim_pdcp::UpSecurity::new(
+                ctx.k_rrc_enc,
+                ctx.k_rrc_int,
+                ctx.ciphering_algorithm.id(),
+                signalled_integrity_alg(&ctx, signalled),
+            )
+            .expect("legal ids");
+            let header = [0x80u8, 0x01];
+            let sample = b"user-plane-packet";
+            assert_eq!(
+                security
+                    .security
+                    .protect(1, 2, nextgsim_pdcp::DIRECTION_UPLINK, &header, sample),
+                reference.protect(1, 2, nextgsim_pdcp::DIRECTION_UPLINK, &header, sample),
+                "{signalled:?}: the DRB must be keyed with K_UPenc/K_UPint"
+            );
+            assert_ne!(
+                security
+                    .security
+                    .protect(1, 2, nextgsim_pdcp::DIRECTION_UPLINK, &header, sample),
+                wrong_keys.protect(1, 2, nextgsim_pdcp::DIRECTION_UPLINK, &header, sample),
+                "{signalled:?}: and NOT with the RRC keys, which are a different pair"
+            );
+        }
+    }
+
+    /// The NIA identity a DRB signalled `signalled` should be keyed with.
+    #[cfg(feature = "up-security")]
+    fn signalled_integrity_alg(
+        ctx: &AsSecurityContext,
+        signalled: nextgsim_rrc::procedures::rrc_reconfiguration::DrbIntegrityProtection,
+    ) -> Option<u8> {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::DrbIntegrityProtection;
+        match signalled {
+            DrbIntegrityProtection::Enabled => Some(ctx.integrity_algorithm.id()),
+            DrbIntegrityProtection::Disabled => None,
+        }
+    }
+
+    /// The UE and the gNB derive **identical** user-plane keys from one `KgNB`, and
+    /// they differ from the RRC pair.
+    ///
+    /// Criterion 6 in its literal form: `K_UPenc`/`K_UPint` now exist on the UE at
+    /// all, and they are not the RRC keys under another name — which is what a
+    /// distinguisher passed wrong would produce.
+    #[test]
+    fn the_ue_derives_the_same_user_plane_keys_as_the_gnb() {
+        use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+        let kgnb = [0x5A; 32];
+        let ctx = AsSecurityContext::derive_from_kgnb(
+            &kgnb,
+            CipheringAlgorithm::Nea2,
+            IntegrityAlgorithm::Nia2,
+            0x1234,
+        );
+        // The gNB's own calls, from `activate_as_security`.
+        assert_eq!(
+            ctx.k_up_enc,
+            derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpEnc, 2),
+            "K_UPenc must match the gNB's derivation, or nothing deciphers"
+        );
+        assert_eq!(
+            ctx.k_up_int,
+            derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpInt, 2),
+            "K_UPint must match the gNB's derivation, or every MAC fails"
+        );
+        assert_ne!(
+            ctx.k_up_enc, ctx.k_rrc_enc,
+            "the UP and RRC ciphering keys use different distinguishers"
+        );
+        assert_ne!(ctx.k_up_int, ctx.k_rrc_int, "and so do the integrity keys");
+        assert_ne!(
+            ctx.k_up_enc, ctx.k_up_int,
+            "and the UP pair is not one key used twice"
+        );
+    }
+
     /// rather than a hardcoded home-PLMN list.
     #[test]
     fn test_active_cell_changed_reports_available_plmns() {

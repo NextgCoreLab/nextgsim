@@ -213,6 +213,16 @@ pub enum RadioNetworkCause {
     UnkownQosFlowId,
     MultipleQosFlowIdInstances,
     UnknownMappedUeNgapId,
+    /// `up-integrity-protection-not-possible`: the NG-RAN node cannot provide the
+    /// user-plane integrity protection the SMF's `SecurityIndication` requires
+    /// (TS 38.413 §9.3.1.2, TS 33.501 §6.6.1).
+    UpIntegrityProtectionNotPossible,
+    /// `up-confidentiality-protection-not-possible`: likewise for confidentiality.
+    ///
+    /// A distinct cause from the integrity one because the SMF may relax one policy
+    /// and not the other, so collapsing them would deny it the information it needs
+    /// to retry.
+    UpConfidentialityProtectionNotPossible,
     Other(u8),
 }
 
@@ -803,6 +813,12 @@ fn parse_radio_network_cause(cause: &CauseRadioNetwork) -> RadioNetworkCause {
         CauseRadioNetwork::UNKOWN_QOS_FLOW_ID => RadioNetworkCause::UnkownQosFlowId,
         CauseRadioNetwork::MULTIPLE_QOS_FLOW_ID_INSTANCES => {
             RadioNetworkCause::MultipleQosFlowIdInstances
+        }
+        CauseRadioNetwork::UP_INTEGRITY_PROTECTION_NOT_POSSIBLE => {
+            RadioNetworkCause::UpIntegrityProtectionNotPossible
+        }
+        CauseRadioNetwork::UP_CONFIDENTIALITY_PROTECTION_NOT_POSSIBLE => {
+            RadioNetworkCause::UpConfidentialityProtectionNotPossible
         }
         other => RadioNetworkCause::Other(other),
     }

@@ -20,13 +20,21 @@
 //! - **ROHC / EHC header compression.** All ROHC profiles are advertised
 //!   unsupported by `nextgsim-rrc`, so compressing here would contradict the
 //!   capability on the wire.
-//! - **User-plane ciphering and integrity.** They belong to the separate UP
-//!   security work, for which this entity's COUNT is the prerequisite. The COUNT
-//!   is therefore exposed (`Pdcp::tx_count_for_next_sdu`, `PdcpPdu::count`) so that
-//!   work needs no change here.
 //! - **`outOfOrderDelivery`.** §5.2.2.1 allows immediate delivery when configured;
 //!   this entity always reorders, which is the behaviour a DRB gets by default.
 //!
+//! ## User-plane security (§5.8, §5.9)
+//!
+//! Optional and off until [`Pdcp::set_security`] installs it (issue #32). It has to
+//! live *inside* the entity rather than beside it: ciphering and integrity are keyed
+//! on the COUNT, and the COUNT is this entity's state — on transmit it is `TX_NEXT`,
+//! and on receive it is `RCVD_COUNT`, which only exists after the header has been
+//! parsed and the reordering window consulted. A caller outside the entity could
+//! only guess at it.
+//!
+//! [`UpSecurity`] owns the byte layout; this entity owns *when* it is applied:
+//! after the header is formed on transmit, and after the window and duplicate
+//! checks on receive, which is the order §5.2.2.1 gives.
 //! ## Time is a parameter, never read here
 //!
 //! Every method that could care about time takes a `now_ms`. A PDCP entity that
@@ -34,8 +42,11 @@
 //! whether a discard timer expired, and this crate has no business choosing the
 //! simulator's time source.
 
+pub mod algorithms;
 pub mod srb_security;
+pub mod up_security;
 pub use srb_security::{SrbSecurity, SrbSecurityError, MAC_I_LEN};
+pub use up_security::{UpSecurity, UpSecurityError, DIRECTION_DOWNLINK, DIRECTION_UPLINK};
 
 use std::collections::BTreeMap;
 
@@ -94,6 +105,13 @@ pub enum PdcpReceiveError {
     BelowDeliveryWindow,
     /// A PDU with this COUNT has already been received.
     Duplicate,
+    /// User-plane integrity verification failed, so the PDU was discarded
+    /// (TS 38.323 §5.2.2.1, TS 33.501 §6.6.3).
+    ///
+    /// Distinct from every other variant here: the others are ordering or framing
+    /// problems a well-behaved peer can cause, and this one cannot happen unless a
+    /// PDU was altered, forged, or protected with keys the two ends do not share.
+    IntegrityFailure(UpSecurityError),
 }
 
 /// A PDCP data PDU decoded far enough to place it in the reordering buffer.
@@ -141,6 +159,32 @@ impl Default for PdcpConfig {
     }
 }
 
+/// A DRB's user-plane security binding: the keys and layout, plus the two inputs
+/// that are properties of the bearer rather than of the PDU (issue #32).
+///
+/// `bearer` and `tx_direction` are held here rather than passed per call because
+/// getting either wrong is silent — the PDUs still round trip against an entity
+/// that made the same mistake, and only the peer notices. Binding them once, where
+/// the entity is created, is the only place the endpoint's identity is known.
+#[derive(Debug, Clone)]
+pub struct PdcpSecurity {
+    /// The keys, algorithms and byte layout (TS 38.323 §5.8, §5.9).
+    pub security: UpSecurity,
+    /// BEARER: the radio bearer identity minus one (TS 33.501 Annex D.3.1.2).
+    pub bearer: u8,
+    /// DIRECTION of PDUs this entity *transmits*: [`DIRECTION_UPLINK`] on a UE,
+    /// [`DIRECTION_DOWNLINK`] on a gNB. Received PDUs take the other value, which
+    /// is derived rather than configured so the two cannot be set inconsistently.
+    pub tx_direction: u8,
+}
+
+impl PdcpSecurity {
+    /// The DIRECTION of PDUs this entity receives — the opposite of what it sends.
+    fn rx_direction(&self) -> u8 {
+        1 - self.tx_direction
+    }
+}
+
 /// An SDU held on the transmit side awaiting submission to RLC.
 #[derive(Debug, Clone)]
 struct PendingSdu {
@@ -153,6 +197,9 @@ struct PendingSdu {
 #[derive(Debug)]
 pub struct Pdcp {
     config: PdcpConfig,
+    /// User-plane security, once activated. `None` is an unprotected DRB, which is
+    /// what every entity is until `set_security` is called.
+    security: Option<PdcpSecurity>,
 
     // -- transmit state (§5.2.1) --
     /// COUNT of the next PDCP SDU to be transmitted.
@@ -179,6 +226,7 @@ pub struct Pdcp {
     discarded_duplicates: u64,
     discarded_out_of_window: u64,
     discarded_on_expiry: u64,
+    discarded_integrity_failures: u64,
 }
 
 impl Pdcp {
@@ -186,6 +234,7 @@ impl Pdcp {
     pub fn new(config: PdcpConfig) -> Self {
         Self {
             config,
+            security: None,
             tx_next: 0,
             tx_pending: Vec::new(),
             rx_next: 0,
@@ -196,12 +245,37 @@ impl Pdcp {
             discarded_duplicates: 0,
             discarded_out_of_window: 0,
             discarded_on_expiry: 0,
+            discarded_integrity_failures: 0,
         }
     }
 
     /// The configuration in force.
     pub fn config(&self) -> &PdcpConfig {
         &self.config
+    }
+
+    /// Install user-plane security on this DRB (TS 33.501 §6.6.1, issue #32).
+    ///
+    /// Takes effect from the **next** PDU in each direction. It deliberately does
+    /// not reset `TX_NEXT` or `RX_DELIV`: the COUNT is the crypto input, so
+    /// restarting it here would let the first protected PDU reuse a COUNT an
+    /// unprotected one already spent. Activation mid-stream is therefore only safe
+    /// when both ends do it at the same COUNT, which is why the caller — not this
+    /// entity — decides when.
+    pub fn set_security(&mut self, security: Option<PdcpSecurity>) {
+        match &security {
+            Some(s) => debug!(
+                "PDCP: user-plane security installed (bearer {}, tx direction {}, {:?})",
+                s.bearer, s.tx_direction, s.security
+            ),
+            None => debug!("PDCP: user-plane security removed"),
+        }
+        self.security = security;
+    }
+
+    /// The user-plane security in force, if any.
+    pub fn security(&self) -> Option<&PdcpSecurity> {
+        self.security.as_ref()
     }
 
     /// The COUNT the next submitted SDU will be associated with (`TX_NEXT`).
@@ -252,6 +326,15 @@ impl Pdcp {
         self.discarded_on_expiry
     }
 
+    /// How many received PDUs were discarded for failing user-plane integrity.
+    ///
+    /// Worth its own counter rather than folding into the others: a non-zero value
+    /// means something forged or altered a PDU, or the two ends disagree about the
+    /// keys, and neither is an ordering problem.
+    pub fn discarded_integrity_failures(&self) -> u64 {
+        self.discarded_integrity_failures
+    }
+
     // ========================================================================
     // Transmit (TS 38.323 §5.2.1)
     // ========================================================================
@@ -271,8 +354,21 @@ impl Pdcp {
         // The SN is the COUNT's low bits, and `encode_header`'s masks are what
         // narrow it -- the modulo `sn_modulus` would express the same thing twice,
         // and a reader would then have to check the two agree.
-        let mut pdu = Self::encode_header(self.config.sn_size, count);
-        pdu.extend_from_slice(sdu);
+        let header = Self::encode_header(self.config.sn_size, count);
+        // §5.9 then §5.8: the MAC covers the header, and only the data part and the
+        // MAC-I are ciphered. Both need the header, so protection happens here
+        // rather than in `take_transmittable` -- and it happens before the
+        // discardTimer is armed, so a discarded SDU has still spent its COUNT.
+        let pdu = match &self.security {
+            Some(s) => s
+                .security
+                .protect(count, s.bearer, s.tx_direction, &header, sdu),
+            None => {
+                let mut pdu = header;
+                pdu.extend_from_slice(sdu);
+                pdu
+            }
+        };
 
         self.tx_pending.push(PendingSdu {
             count,
@@ -399,7 +495,32 @@ impl Pdcp {
             return Err(PdcpReceiveError::Duplicate);
         }
 
-        let sdu = pdu[sn_size.header_len()..].to_vec();
+        // §5.2.2.1 orders this after the window and duplicate checks and before
+        // the SDU is buffered: deciphering a PDU that is about to be discarded
+        // anyway would burn a COUNT's keystream, and buffering one that failed
+        // integrity would deliver it when the gap ahead of it closed.
+        let sdu = match &self.security {
+            Some(s) => match s.security.unprotect(
+                rcvd_count,
+                s.bearer,
+                s.rx_direction(),
+                pdu,
+                sn_size.header_len(),
+            ) {
+                Ok(sdu) => sdu,
+                Err(e) => {
+                    // Counted with the other discards so a caller sees it at all,
+                    // and warned rather than traced because on a correctly
+                    // configured pair this cannot happen.
+                    self.discarded_integrity_failures += 1;
+                    warn!(
+                        "PDCP RX: integrity verification failed at COUNT {rcvd_count},                          discarding the PDU: {e}"
+                    );
+                    return Err(PdcpReceiveError::IntegrityFailure(e));
+                }
+            },
+            None => pdu[sn_size.header_len()..].to_vec(),
+        };
         self.rx_buffer.insert(rcvd_count, sdu);
 
         if rcvd_count >= self.rx_next {
@@ -1152,5 +1273,211 @@ mod tests {
             "the second is discarded: its COUNT is below RX_DELIV"
         );
         assert_eq!(pdcp_rx.discarded_out_of_window(), 1);
+    }
+
+    // ========================================================================
+    // User-plane security through the entity (issue #32)
+    // ========================================================================
+
+    const UP_KEY_ENC: [u8; 16] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        0x00,
+    ];
+    const UP_KEY_INT: [u8; 16] = [
+        0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0x98, 0x76, 0x54, 0x32, 0x10, 0xFE, 0xDC,
+        0xBA,
+    ];
+
+    /// A pair of entities keyed identically, as the two ends of one DRB.
+    fn secured_pair(integrity: Option<u8>) -> (Pdcp, Pdcp) {
+        let mut ue = Pdcp::new(PdcpConfig::default());
+        let mut gnb = Pdcp::new(PdcpConfig::default());
+        let sec = || UpSecurity::new(UP_KEY_ENC, UP_KEY_INT, 2, integrity).expect("legal ids");
+        ue.set_security(Some(PdcpSecurity {
+            security: sec(),
+            bearer: 0,
+            tx_direction: DIRECTION_UPLINK,
+        }));
+        gnb.set_security(Some(PdcpSecurity {
+            security: sec(),
+            bearer: 0,
+            tx_direction: DIRECTION_DOWNLINK,
+        }));
+        (ue, gnb)
+    }
+
+    /// #32, criterion 3 end to end through the entity: the UE's uplink PDUs are
+    /// protected on the wire and the gNB's entity recovers them, with the COUNT
+    /// taken from each entity's own state rather than signalled.
+    #[test]
+    fn a_secured_drb_round_trips_between_two_entities() {
+        let (mut ue, mut gnb) = secured_pair(Some(2));
+        let packets: [&[u8]; 3] = [b"first-ip-packet", b"second", b"third-one-here"];
+        for (i, packet) in packets.iter().enumerate() {
+            ue.submit_sdu(packet, 0);
+            let pdus = ue.take_transmittable(0);
+            assert_eq!(pdus.len(), 1);
+            let pdu = &pdus[0];
+            assert_eq!(
+                pdu.len(),
+                PdcpSnSize::Sn12.header_len() + packet.len() + MAC_I_LEN,
+                "the PDU carries a header, the payload and a MAC-I"
+            );
+            assert!(
+                !pdu.windows(packet.len()).any(|w| w == *packet),
+                "packet {i} went out in the clear"
+            );
+            assert_eq!(
+                gnb.receive_pdu(pdu, 0).expect("must verify and deliver"),
+                vec![packet.to_vec()],
+                "packet {i} must arrive intact"
+            );
+        }
+        assert_eq!(gnb.discarded_integrity_failures(), 0);
+    }
+
+    /// An altered PDU is discarded by the entity and never reaches upper layers,
+    /// and the reordering state does not advance past it.
+    #[test]
+    fn a_forged_pdu_is_discarded_by_the_entity_and_the_window_does_not_advance() {
+        let (mut ue, mut gnb) = secured_pair(Some(2));
+        ue.submit_sdu(b"good-packet", 0);
+        let mut pdu = ue.take_transmittable(0).remove(0);
+        let payload_start = PdcpSnSize::Sn12.header_len();
+        pdu[payload_start] ^= 0x01;
+
+        let result = gnb.receive_pdu(&pdu, 0);
+        assert!(
+            matches!(
+                result,
+                Err(PdcpReceiveError::IntegrityFailure(
+                    UpSecurityError::IntegrityCheckFailed
+                ))
+            ),
+            "expected an integrity failure, got {result:?}"
+        );
+        assert_eq!(gnb.discarded_integrity_failures(), 1);
+        assert_eq!(
+            gnb.buffered_count(),
+            0,
+            "a PDU that failed integrity must not be buffered, or it would be \
+             delivered as soon as the gap ahead of it closed"
+        );
+        assert_eq!(
+            gnb.rx_deliv(),
+            0,
+            "RX_DELIV must not advance past a discard"
+        );
+        assert!(
+            !gnb.t_reordering_running(),
+            "and no reordering timer should be waiting for it"
+        );
+    }
+
+    /// A gNB entity whose peer is unsecured discards everything rather than
+    /// delivering ciphertext upward. This is the failure mode that makes
+    /// `up-security` a build-time feature: one end alone takes the data path down.
+    #[test]
+    fn a_secured_entity_rejects_an_unsecured_peers_pdus() {
+        let (_, mut gnb) = secured_pair(Some(2));
+        let mut unsecured = Pdcp::new(PdcpConfig::default());
+        unsecured.submit_sdu(b"plain-packet", 0);
+        let pdu = unsecured.take_transmittable(0).remove(0);
+        assert!(
+            gnb.receive_pdu(&pdu, 0).is_err(),
+            "an unprotected PDU must not be accepted on a protected bearer"
+        );
+        assert_eq!(gnb.discarded_integrity_failures(), 1);
+    }
+
+    /// The two DIRECTION bits are derived from one another, so a pair configured as
+    /// UE and gNB agrees while a pair configured the *same* way does not. Without
+    /// this, both ends could be built with `tx_direction` downlink and every test
+    /// above would still pass.
+    #[test]
+    fn two_entities_configured_with_the_same_direction_do_not_interoperate() {
+        let mut a = Pdcp::new(PdcpConfig::default());
+        let mut b = Pdcp::new(PdcpConfig::default());
+        for e in [&mut a, &mut b] {
+            e.set_security(Some(PdcpSecurity {
+                security: UpSecurity::new(UP_KEY_ENC, UP_KEY_INT, 2, Some(2)).expect("legal ids"),
+                bearer: 0,
+                tx_direction: DIRECTION_UPLINK,
+            }));
+        }
+        a.submit_sdu(b"packet", 0);
+        let pdu = a.take_transmittable(0).remove(0);
+        assert!(
+            b.receive_pdu(&pdu, 0).is_err(),
+            "two entities that both transmit uplink cannot verify each other, \
+             so `rx_direction` must be the opposite of `tx_direction`"
+        );
+    }
+
+    /// A DRB configured for ciphering without integrity carries no MAC-I, and the
+    /// entity must not strip four octets of payload looking for one.
+    #[test]
+    fn a_ciphering_only_drb_delivers_the_whole_payload() {
+        let (mut ue, mut gnb) = secured_pair(None);
+        let packet = b"exactly-this-payload";
+        ue.submit_sdu(packet, 0);
+        let pdu = ue.take_transmittable(0).remove(0);
+        assert_eq!(
+            pdu.len(),
+            PdcpSnSize::Sn12.header_len() + packet.len(),
+            "no integrity means no MAC-I on the wire"
+        );
+        assert_eq!(
+            gnb.receive_pdu(&pdu, 0).expect("must deliver"),
+            vec![packet.to_vec()]
+        );
+    }
+
+    /// Reordering still works through security: each PDU's COUNT is recovered from
+    /// its own header, so an out-of-order arrival deciphers with the right keystream
+    /// rather than the next expected one.
+    #[test]
+    fn out_of_order_protected_pdus_each_decipher_under_their_own_count() {
+        let (mut ue, mut gnb) = secured_pair(Some(2));
+        let mut wire = Vec::new();
+        for packet in [b"aaa".as_slice(), b"bbb", b"ccc"] {
+            ue.submit_sdu(packet, 0);
+            wire.push(ue.take_transmittable(0).remove(0));
+        }
+        // Deliver 2, then 0, then 1.
+        assert_eq!(
+            gnb.receive_pdu(&wire[2], 0).expect("verifies"),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            gnb.receive_pdu(&wire[0], 0).expect("verifies"),
+            vec![b"aaa".to_vec()]
+        );
+        assert_eq!(
+            gnb.receive_pdu(&wire[1], 0).expect("verifies"),
+            vec![b"bbb".to_vec(), b"ccc".to_vec()],
+            "the buffered COUNT 2 must have deciphered under COUNT 2, not COUNT 0"
+        );
+        assert_eq!(gnb.discarded_integrity_failures(), 0);
+    }
+
+    /// Installing security does not rewind the COUNT, so a bearer that carried
+    /// unprotected PDUs first cannot replay their COUNTs under keys.
+    #[test]
+    fn installing_security_does_not_rewind_the_count() {
+        let mut ue = Pdcp::new(PdcpConfig::default());
+        ue.submit_sdu(b"before", 0);
+        let _ = ue.take_transmittable(0);
+        assert_eq!(ue.tx_count_for_next_sdu(), 1);
+        ue.set_security(Some(PdcpSecurity {
+            security: UpSecurity::new(UP_KEY_ENC, UP_KEY_INT, 2, Some(2)).expect("legal ids"),
+            bearer: 0,
+            tx_direction: DIRECTION_UPLINK,
+        }));
+        assert_eq!(
+            ue.tx_count_for_next_sdu(),
+            1,
+            "the first protected PDU must not reuse a COUNT an unprotected one spent"
+        );
     }
 }

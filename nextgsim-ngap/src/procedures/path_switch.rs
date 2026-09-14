@@ -18,7 +18,9 @@ use crate::codec::generated::*;
 use crate::codec::{decode_aper, decode_ngap_pdu, encode_aper, encode_ngap_pdu, NgapCodecError};
 use crate::procedures::initial_ue_message::{build_nr_cgi, build_tai, NrCgi, Tai};
 use crate::procedures::ng_setup::NgSetupFailureCause;
-use crate::procedures::transfer::GtpTunnelInfo;
+use crate::procedures::transfer::{
+    up_security_policy_from_asn, up_security_policy_to_asn, GtpTunnelInfo, UpSecurityPolicy,
+};
 use crate::procedures::ue_context_release::parse_cause;
 use thiserror::Error;
 
@@ -432,6 +434,16 @@ pub struct SwitchedSessionItem {
     pub pdu_session_id: u8,
     /// New UL NG-U tunnel from the 5GC (optional in the transfer)
     pub ul_tunnel: Option<GtpTunnelInfo>,
+    /// The user-plane security the target gNB is actually applying to this
+    /// session's DRBs (TS 38.413 §9.3.4.10, issue #32).
+    ///
+    /// The target reports what it *did*, not what it was asked for: the source
+    /// gNB's policy came from the SMF, and after an Xn handover the AMF has to
+    /// learn whether the new serving node honoured it. `None` means the target
+    /// applies no user-plane protection, which is a real answer rather than a
+    /// missing one — and it is what a build without the `up-security` feature
+    /// reports, truthfully.
+    pub security_indication: Option<UpSecurityPolicy>,
 }
 
 /// Parameters for building a Path Switch Request Acknowledge
@@ -467,7 +479,10 @@ pub struct PathSwitchRequestAcknowledgeData {
 fn encode_path_switch_ack_transfer(item: &SwitchedSessionItem) -> Result<Vec<u8>, PathSwitchError> {
     let transfer = PathSwitchRequestAcknowledgeTransfer {
         ul_ngu_up_tnl_information: item.ul_tunnel.map(tunnel_to_asn),
-        security_indication: None,
+        security_indication: item
+            .security_indication
+            .as_ref()
+            .map(up_security_policy_to_asn),
         ie_extensions: None,
     };
     Ok(encode_aper(&transfer)?)
@@ -485,6 +500,10 @@ fn decode_path_switch_ack_transfer(
             .as_ref()
             .map(tunnel_from_asn)
             .transpose()?,
+        security_indication: transfer
+            .security_indication
+            .as_ref()
+            .map(up_security_policy_from_asn),
     })
 }
 
@@ -835,6 +854,7 @@ mod tests {
                     address: "10.45.0.1".parse().unwrap(),
                     teid: 0x1234,
                 }),
+                security_indication: None,
             }],
         };
         let bytes = encode_path_switch_request_acknowledge(&params).unwrap();
@@ -847,6 +867,68 @@ mod tests {
         );
         assert_eq!(decoded.next_hop_nh, params.next_hop_nh);
         assert_eq!(decoded.switched_sessions, params.switched_sessions);
+    }
+
+    /// #32, criterion 5: the Acknowledge transfer carries the target's real
+    /// user-plane security, not a hardcoded `None`.
+    ///
+    /// Two sessions with *different* policies in one message, because a single
+    /// session cannot tell an encoder that reads the policy from the item apart from
+    /// one that reads it from the first item and repeats it.
+    #[test]
+    fn the_acknowledge_reports_each_sessions_real_user_plane_security() {
+        use crate::procedures::transfer::{MaxIntegrityProtectedDataRate, UpProtectionPolicy};
+        let protected = UpSecurityPolicy {
+            integrity: UpProtectionPolicy::Required,
+            confidentiality: UpProtectionPolicy::Required,
+            max_integrity_protected_data_rate: Some(MaxIntegrityProtectedDataRate::MaximumUeRate),
+        };
+        let unprotected = UpSecurityPolicy {
+            integrity: UpProtectionPolicy::NotNeeded,
+            confidentiality: UpProtectionPolicy::NotNeeded,
+            max_integrity_protected_data_rate: None,
+        };
+        let params = PathSwitchRequestAcknowledgeParams {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            next_hop_chaining_count: 3,
+            next_hop_nh: [0x11; 32],
+            switched_sessions: vec![
+                SwitchedSessionItem {
+                    pdu_session_id: 1,
+                    ul_tunnel: None,
+                    security_indication: Some(protected),
+                },
+                SwitchedSessionItem {
+                    pdu_session_id: 2,
+                    ul_tunnel: None,
+                    security_indication: Some(unprotected),
+                },
+                SwitchedSessionItem {
+                    pdu_session_id: 3,
+                    ul_tunnel: None,
+                    security_indication: None,
+                },
+            ],
+        };
+        let bytes = encode_path_switch_request_acknowledge(&params).unwrap();
+        let decoded = decode_path_switch_request_acknowledge(&bytes).unwrap();
+        let by_psi = |psi: u8| {
+            decoded
+                .switched_sessions
+                .iter()
+                .find(|s| s.pdu_session_id == psi)
+                .unwrap_or_else(|| panic!("session {psi} must be in the Acknowledge"))
+                .security_indication
+        };
+        assert_eq!(by_psi(1), Some(protected));
+        assert_eq!(by_psi(2), Some(unprotected));
+        assert_eq!(
+            by_psi(3),
+            None,
+            "a session the target does not protect must report no SecurityIndication, \
+             not the previous session's"
+        );
     }
 
     #[test]

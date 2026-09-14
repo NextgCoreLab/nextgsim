@@ -168,6 +168,7 @@ pub fn build_drb_radio_bearer_config(
     drb_id: u8,
     qfis: &[u8],
     default_drb: bool,
+    integrity_protection: DrbIntegrityProtection,
 ) -> RadioBearerConfig {
     let mapped_qo_s_flows_to_add = if qfis.is_empty() {
         None
@@ -186,9 +187,31 @@ pub fn build_drb_radio_bearer_config(
         mapped_qo_s_flows_to_release: None,
     };
 
-    // Minimal but valid PDCP-Config (all optional sub-fields absent).
+    // `PDCP-Config.drb` is present only when there is something to say in it.
+    // Integrity protection is the one thing this simulator configures there
+    // (issue #32), so an unprotected DRB still gets the minimal config it had
+    // before -- which is what keeps the golden bytes below unchanged when the
+    // user plane is not protected.
+    let drb = match integrity_protection {
+        DrbIntegrityProtection::Disabled => None,
+        DrbIntegrityProtection::Enabled => Some(PDCP_ConfigDrb {
+            discard_timer: None,
+            pdcp_sn_size_ul: None,
+            pdcp_sn_size_dl: None,
+            // Mandatory in the SEQUENCE, and `notUsed` is the truth: every ROHC
+            // profile is advertised unsupported by this crate's UE capabilities.
+            header_compression: PDCP_ConfigDrbHeaderCompression::NotUsed(
+                PDCP_ConfigDrbHeaderCompression_notUsed,
+            ),
+            integrity_protection: Some(PDCP_ConfigDrbIntegrityProtection(
+                PDCP_ConfigDrbIntegrityProtection::ENABLED,
+            )),
+            status_report_required: None,
+            out_of_order_delivery: None,
+        }),
+    };
     let pdcp_config = PDCP_Config {
-        drb: None,
+        drb,
         more_than_one_rlc: None,
         t_reordering: None,
     };
@@ -249,8 +272,15 @@ pub fn build_drb_reconfiguration_params(
     lcid: u8,
     qfis: &[u8],
     default_drb: bool,
+    integrity_protection: DrbIntegrityProtection,
 ) -> Result<RrcReconfigurationParams, RrcReconfigurationError> {
-    let rbc = build_drb_radio_bearer_config(pdu_session_id, drb_id, qfis, default_drb);
+    let rbc = build_drb_radio_bearer_config(
+        pdu_session_id,
+        drb_id,
+        qfis,
+        default_drb,
+        integrity_protection,
+    );
     let cgc = build_cell_group_config(drb_id, lcid);
 
     let radio_bearer_config = encode_rrc(&rbc)?;
@@ -263,6 +293,48 @@ pub fn build_drb_reconfiguration_params(
         master_cell_group: Some(master_cell_group),
         full_config: false,
     })
+}
+
+/// Whether a DRB's PDCP entity integrity-protects user data
+/// (TS 38.331 `PDCP-Config.drb.integrityProtection`, TS 33.501 §6.6.1).
+///
+/// An enum and not a `bool` because it sits next to `default_drb` in the DRB
+/// builders' signatures, and two adjacent booleans is how a caller silently swaps
+/// "this is the default DRB" for "protect this DRB".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DrbIntegrityProtection {
+    /// No `integrityProtection` IE: the DRB carries no MAC-I.
+    #[default]
+    Disabled,
+    /// `integrityProtection: enabled`.
+    Enabled,
+}
+
+/// Read a DRB's configured integrity protection out of a `RadioBearerConfig`.
+///
+/// The UE half of the signalling: the gNB decides the policy from the SMF's
+/// `SecurityIndication` and puts it here, and this is how the UE learns it rather
+/// than being configured to match. Returns [`DrbIntegrityProtection::Disabled`]
+/// when the DRB, its `PDCP-Config`, or the IE itself is absent — all three mean the
+/// same thing on the wire (§6.3.2, `Cond ConnectedTo5GC1`: the IE is present only
+/// when protection is on).
+pub fn drb_integrity_protection(rbc: &RadioBearerConfig, drb_id: u8) -> DrbIntegrityProtection {
+    let Some(list) = rbc.drb_to_add_mod_list.as_ref() else {
+        return DrbIntegrityProtection::Disabled;
+    };
+    let protected = list
+        .0
+        .iter()
+        .find(|drb| drb.drb_identity.0 == drb_id)
+        .and_then(|drb| drb.pdcp_config.as_ref())
+        .and_then(|cfg| cfg.drb.as_ref())
+        .and_then(|drb| drb.integrity_protection.as_ref())
+        .is_some();
+    if protected {
+        DrbIntegrityProtection::Enabled
+    } else {
+        DrbIntegrityProtection::Disabled
+    }
 }
 
 /// Parse an RRC Reconfiguration from a DL-DCCH message
@@ -757,9 +829,99 @@ mod tests {
     // ========================================================================
 
     #[test]
+    /// #32, criterion 3 (the signalling half): the DRB's integrity protection is
+    /// carried in `PDCP-Config.drb.integrityProtection` and read back off the wire,
+    /// so the UE is *told* the policy rather than configured to match it.
+    #[test]
+    fn drb_integrity_protection_survives_a_uper_round_trip() {
+        for (configured, expected) in [
+            (
+                DrbIntegrityProtection::Disabled,
+                DrbIntegrityProtection::Disabled,
+            ),
+            (
+                DrbIntegrityProtection::Enabled,
+                DrbIntegrityProtection::Enabled,
+            ),
+        ] {
+            let rbc = build_drb_radio_bearer_config(2, 1, &[9], true, configured);
+            let bytes = encode_rrc(&rbc).expect("encode");
+            let decoded: RadioBearerConfig = decode_rrc(&bytes).expect("decode");
+            assert_eq!(
+                drb_integrity_protection(&decoded, 1),
+                expected,
+                "the {configured:?} setting must survive the wire"
+            );
+        }
+        // And the two encodings differ, or the IE is not actually on the wire.
+        assert_ne!(
+            encode_rrc(&build_drb_radio_bearer_config(
+                2,
+                1,
+                &[9],
+                true,
+                DrbIntegrityProtection::Enabled
+            ))
+            .unwrap(),
+            encode_rrc(&build_drb_radio_bearer_config(
+                2,
+                1,
+                &[9],
+                true,
+                DrbIntegrityProtection::Disabled
+            ))
+            .unwrap(),
+            "an `integrityProtection` that changed no bytes would be signalled nowhere"
+        );
+    }
+
+    /// An unprotected DRB's encoding is unchanged by issue #32, which is what keeps
+    /// the goldens below meaningful and the default build byte-identical.
+    #[test]
+    fn an_unprotected_drb_omits_the_pdcp_drb_config_entirely() {
+        let rbc = build_drb_radio_bearer_config(2, 1, &[9], true, DrbIntegrityProtection::Disabled);
+        let drb = &rbc.drb_to_add_mod_list.as_ref().unwrap().0[0];
+        assert!(
+            drb.pdcp_config.as_ref().unwrap().drb.is_none(),
+            "PDCP-Config.drb must stay absent when there is nothing to configure in it"
+        );
+    }
+
+    /// `drb_integrity_protection` answers about the DRB it was asked about, not the
+    /// first one in the list. Pinned because with one DRB per session the two are
+    /// indistinguishable, and a multi-DRB reconfiguration would silently protect the
+    /// wrong bearer.
+    #[test]
+    fn drb_integrity_protection_is_read_per_drb_and_not_from_the_first() {
+        let protected =
+            build_drb_radio_bearer_config(1, 1, &[1], true, DrbIntegrityProtection::Enabled);
+        let plain =
+            build_drb_radio_bearer_config(2, 2, &[2], false, DrbIntegrityProtection::Disabled);
+        let mut merged = protected.clone();
+        merged.drb_to_add_mod_list = Some(DRB_ToAddModList(vec![
+            protected.drb_to_add_mod_list.unwrap().0[0].clone(),
+            plain.drb_to_add_mod_list.unwrap().0[0].clone(),
+        ]));
+        assert_eq!(
+            drb_integrity_protection(&merged, 1),
+            DrbIntegrityProtection::Enabled
+        );
+        assert_eq!(
+            drb_integrity_protection(&merged, 2),
+            DrbIntegrityProtection::Disabled
+        );
+        assert_eq!(
+            drb_integrity_protection(&merged, 3),
+            DrbIntegrityProtection::Disabled,
+            "a DRB that is not in the list is not protected"
+        );
+    }
+
+    #[test]
     fn test_build_drb_radio_bearer_config_maps_all_qfis() {
         let qfis = [1u8, 5, 9];
-        let rbc = build_drb_radio_bearer_config(2, 1, &qfis, true);
+        let rbc =
+            build_drb_radio_bearer_config(2, 1, &qfis, true, DrbIntegrityProtection::Disabled);
 
         let drb_list = rbc
             .drb_to_add_mod_list
@@ -785,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_build_drb_radio_bearer_config_empty_qfis_omits_mapping() {
-        let rbc = build_drb_radio_bearer_config(1, 1, &[], false);
+        let rbc = build_drb_radio_bearer_config(1, 1, &[], false, DrbIntegrityProtection::Disabled);
         let drb = &rbc.drb_to_add_mod_list.as_ref().unwrap().0[0];
         let sdap = match drb.cn_association.as_ref().unwrap() {
             DRB_ToAddModCnAssociation::Sdap_Config(s) => s,
@@ -797,7 +959,8 @@ mod tests {
     #[test]
     fn test_radio_bearer_config_uper_roundtrip() {
         let qfis = [1u8, 2, 3];
-        let rbc = build_drb_radio_bearer_config(4, 2, &qfis, true);
+        let rbc =
+            build_drb_radio_bearer_config(4, 2, &qfis, true, DrbIntegrityProtection::Disabled);
         let bytes = encode_rrc(&rbc).expect("encode RadioBearerConfig");
         let decoded: RadioBearerConfig = decode_rrc(&bytes).expect("decode RadioBearerConfig");
         assert_eq!(decoded, rbc);
@@ -904,8 +1067,16 @@ mod tests {
     #[test]
     fn test_build_drb_reconfiguration_params_full_message_roundtrip() {
         let qfis = [1u8, 6, 7];
-        let params = build_drb_reconfiguration_params(1, 5, 1, 4, &qfis, true)
-            .expect("build structured reconfig params");
+        let params = build_drb_reconfiguration_params(
+            1,
+            5,
+            1,
+            4,
+            &qfis,
+            true,
+            DrbIntegrityProtection::Disabled,
+        )
+        .expect("build structured reconfig params");
 
         // Build the full RRCReconfiguration and round-trip through UPER.
         let encoded = encode_rrc_reconfiguration(&params).expect("encode RRCReconfiguration");
@@ -1224,7 +1395,14 @@ mod tests {
     /// standalone DRB RadioBearerConfig must equal the frozen bytes.
     #[test]
     fn golden_drb_radio_bearer_config_bytes() {
-        let bytes = encode_rrc(&build_drb_radio_bearer_config(1, 1, &[1], true)).expect("encode");
+        let bytes = encode_rrc(&build_drb_radio_bearer_config(
+            1,
+            1,
+            &[1],
+            true,
+            DrbIntegrityProtection::Disabled,
+        ))
+        .expect("encode");
         assert_eq!(
             bytes,
             GOLDEN_DRB_RADIO_BEARER_CONFIG_PSI1.to_vec(),
@@ -1238,7 +1416,10 @@ mod tests {
     fn golden_drb_radio_bearer_config_cross_decode() {
         let decoded: RadioBearerConfig =
             decode_rrc(&GOLDEN_DRB_RADIO_BEARER_CONFIG_PSI1).expect("decode RBC");
-        assert_eq!(decoded, build_drb_radio_bearer_config(1, 1, &[1], true));
+        assert_eq!(
+            decoded,
+            build_drb_radio_bearer_config(1, 1, &[1], true, DrbIntegrityProtection::Disabled)
+        );
     }
 
     /// Tier 1 — encoder golden for the standalone DRB CellGroupConfig.
@@ -1264,8 +1445,16 @@ mod tests {
     /// message (`establish_drb(psi=1)`): flipping any encoder bit fails here.
     #[test]
     fn golden_drb_rrc_reconfiguration_bytes() {
-        let params =
-            build_drb_reconfiguration_params(0, 1, 1, 4, &[1], true).expect("build DRB params");
+        let params = build_drb_reconfiguration_params(
+            0,
+            1,
+            1,
+            4,
+            &[1],
+            true,
+            DrbIntegrityProtection::Disabled,
+        )
+        .expect("build DRB params");
         let bytes = encode_rrc_reconfiguration(&params).expect("encode RRCReconfiguration");
         assert_eq!(
             bytes,
@@ -1279,8 +1468,16 @@ mod tests {
     /// SDAP mapping / masterCellGroup survive intact.
     #[test]
     fn golden_drb_rrc_reconfiguration_cross_decode() {
-        let params =
-            build_drb_reconfiguration_params(0, 1, 1, 4, &[1], true).expect("build DRB params");
+        let params = build_drb_reconfiguration_params(
+            0,
+            1,
+            1,
+            4,
+            &[1],
+            true,
+            DrbIntegrityProtection::Disabled,
+        )
+        .expect("build DRB params");
         let expected = build_rrc_reconfiguration(&params).expect("build message");
         let decoded: DL_DCCH_Message =
             decode_rrc(&GOLDEN_RECONFIG_DRB_PSI1).expect("decode DL-DCCH");

@@ -28,19 +28,13 @@
 //! round (cipher, then MAC the ciphertext) also "round trips", which is exactly
 //! why both ends must share this code rather than each implement the clause.
 
-use nextgsim_crypto::nea::{nea1_encrypt, nea2_encrypt};
-use nextgsim_crypto::nia::{nia1_compute_mac, nia2_compute_mac, nia3_compute_mac};
-use nextgsim_crypto::zuc::nea3_encrypt;
+use crate::algorithms::{apply_ciphering, compute_mac_i, ct_eq_mac};
 
-/// Length of the PDCP MAC-I in octets (TS 38.323 §6.3.4: 32 bits).
-pub const MAC_I_LEN: usize = 4;
-
-/// The 3GPP algorithm identity of null ciphering / null integrity
-/// (TS 33.501 §5.11.1).
-pub const ALG_ID_NULL: u8 = 0;
-
-/// The highest 3GPP ciphering / integrity algorithm identity this layer accepts.
-pub const ALG_ID_MAX: u8 = 3;
+// The algorithm table, the MAC length and the constant-time comparison live in
+// `crate::algorithms` and are shared with `UpSecurity`, so the SRB and DRB layouts
+// cannot drift onto different algorithm selections. Re-exported here because every
+// caller reaches them through this module.
+pub use crate::algorithms::{ALG_ID_MAX, ALG_ID_NULL, MAC_I_LEN};
 
 /// Errors from SRB PDCP protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -133,31 +127,26 @@ impl SrbSecurity {
         direction: u8,
         message: &[u8],
     ) -> [u8; MAC_I_LEN] {
-        match self.integrity_alg_id {
-            1 => nia1_compute_mac(count, bearer, direction, &self.k_rrc_int, message),
-            2 => nia2_compute_mac(count, bearer, direction, &self.k_rrc_int, message),
-            3 => nia3_compute_mac(count, bearer, direction, &self.k_rrc_int, message),
-            // NIA0: the null algorithm's MAC is all zeros (TS 33.501 §5.11.1).
-            _ => [0u8; MAC_I_LEN],
-        }
+        compute_mac_i(
+            self.integrity_alg_id,
+            &self.k_rrc_int,
+            count,
+            bearer,
+            direction,
+            message,
+        )
     }
 
     /// Applies the ciphering keystream in place (TS 38.323 §5.8).
-    ///
-    /// All three NEAs are stream ciphers, so this same routine deciphers — which
-    /// is why there is one function rather than an encrypt/decrypt pair.
     fn apply_ciphering(&self, count: u32, bearer: u8, direction: u8, data: &mut [u8]) {
-        match self.ciphering_alg_id {
-            1 => nea1_encrypt(count, bearer, direction, &self.k_rrc_enc, data),
-            2 => nea2_encrypt(count, bearer, direction, &self.k_rrc_enc, data),
-            // NEA3 (ZUC). This used to be refused as "no keystream in
-            // nextgsim-crypto", which was never true: `zuc::nea3_encrypt` is a
-            // complete implementation and `nextgsim-nas` has been using it for NAS
-            // ciphering all along (issue #31).
-            3 => nea3_encrypt(count, bearer, direction, &self.k_rrc_enc, data),
-            // NEA0: null ciphering leaves the PDU in the clear.
-            _ => {}
-        }
+        apply_ciphering(
+            self.ciphering_alg_id,
+            &self.k_rrc_enc,
+            count,
+            bearer,
+            direction,
+            data,
+        );
     }
 
     /// Protects an SRB RRC message for transmission.
@@ -198,22 +187,6 @@ impl SrbSecurity {
             Err(SrbSecurityError::IntegrityCheckFailed)
         }
     }
-}
-
-/// Constant-time 4-octet MAC comparison.
-///
-/// Constant time because a MAC check that short-circuits on the first differing
-/// octet leaks how much of a forgery was correct, which is enough to find the
-/// rest one octet at a time.
-fn ct_eq_mac(computed: &[u8; MAC_I_LEN], received: &[u8]) -> bool {
-    if received.len() != MAC_I_LEN {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..MAC_I_LEN {
-        diff |= computed[i] ^ received[i];
-    }
-    diff == 0
 }
 
 #[cfg(test)]

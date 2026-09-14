@@ -24,6 +24,12 @@ uuaa-mm = []
 # build keeps RLC wired straight to NAS. With it on, a DRB gains a PDCP header,
 # an SN, a 32-bit COUNT, in-order delivery and a discardTimer.
 drb-pdcp = []
+# User-plane (DRB) PDCP integrity protection and ciphering with K_UPenc/K_UPint
+# (issue #32, TS 38.323 5.8/5.9, TS 33.501 6.6). Off by default and implies
+# `drb-pdcp`, because the COUNT ciphering is keyed on is the PDCP entity's state:
+# without an entity there is nothing to protect. Both ends must agree -- a UE with
+# it on and a gNB with it off would cipher uplink the gNB reads as plaintext.
+up-security = ["drb-pdcp"]
 # Sidelink / ProSe PC5 surface (issue #54, TS 23.304). Off by default because the
 # surface is a FACADE: only `StartDiscovery`/`StopDiscovery` are ever sent, and
 # `EstablishPc5Link` flips straight to `Active` with no over-the-air exchange, so

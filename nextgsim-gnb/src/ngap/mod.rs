@@ -24,6 +24,7 @@ pub mod mbs_context;
 mod task;
 pub mod timers;
 mod ue_context;
+pub mod up_security;
 
 pub use amf_context::{AmfContextInfo, AmfState, NgapAmfContext};
 pub use mbs_context::{GnbMbsContext, MbsSessionState};

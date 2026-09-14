@@ -603,6 +603,20 @@ pub enum RlsMessage {
         /// Cell ID
         cell_id: i32,
     },
+    /// Install (or remove) user-plane security on one DRB, from RRC
+    /// (issue #32, TS 33.501 §6.6.1).
+    ///
+    /// The keys are derived in the RRC task from `KgNB`, and the PDCP entities live
+    /// in the RLS task where the data path is; this message is the seam. `security:
+    /// None` removes protection, so a released and re-established session cannot
+    /// inherit keys from the previous one.
+    #[cfg(feature = "up-security")]
+    InstallDrbSecurity {
+        /// PDU session ID, which is also the DRB identity here
+        psi: i32,
+        /// The keys, algorithms and bearer binding, or `None` to remove it
+        security: Option<Box<nextgsim_pdcp::PdcpSecurity>>,
+    },
     /// RRC PDU delivery (from RRC)
     RrcPduDelivery {
         /// RRC channel
