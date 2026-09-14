@@ -36,6 +36,7 @@ use tokio::task::JoinHandle;
 use nextgsim_common::config::GnbConfig;
 use nextgsim_common::OctetString;
 use nextgsim_common::SNssai;
+use nextgsim_ngap::procedures::pdu_session_resource_notify::{NotifiedQosFlow, NotifyCause};
 use nextgsim_rls::RrcChannel;
 
 // ============================================================================
@@ -292,6 +293,21 @@ pub enum NgapMessage {
         ue_id: i32,
         /// Release cause
         cause: UeReleaseRequestCause,
+    },
+    /// PDU Session Resource Notify (TS 38.413 §8.3.5, issue #98): tell the AMF
+    /// that specific PDU sessions are released, or that specific QoS flows are no
+    /// longer fulfilled, without the AMF having asked.
+    ///
+    /// Per-session granularity is the whole point. The alternative already wired
+    /// is `UeContextReleaseRequest`, which tears down the WHOLE UE context, so a
+    /// UE with a session on a healthy UPF loses that too.
+    PduSessionResourceNotify {
+        /// UE ID
+        ue_id: i32,
+        /// PDU sessions the RAN has released, each with a cause
+        released_sessions: Vec<(u8, NotifyCause)>,
+        /// Surviving sessions whose QoS flows changed state: (PSI, flows)
+        notified_sessions: Vec<(u8, Vec<NotifiedQosFlow>)>,
     },
     /// NTN timing info received from AMF (NTN extension IE in NG Setup Response)
     NtnTimingInfoReceived {
