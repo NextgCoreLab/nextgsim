@@ -5,6 +5,7 @@
 
 #![allow(missing_docs)]
 
+use crate::codec::mean_pool;
 use crate::SemanticFeatures;
 use serde::{Deserialize, Serialize};
 
@@ -171,20 +172,13 @@ impl IsacSemanticCompressor {
 
         let original_size_bytes = measurements.len() * std::mem::size_of::<f32>();
 
-        // Simulate compression: use mean pooling for simplicity
+        // Mean pooling via the codec's own `mean_pool` (issue #28), not a second
+        // copy of it. This site used to reimplement the algorithm -- and with a
+        // subtly different chunking rule: it computed `chunk_size` without the
+        // `.max(1)` the codec applies, so a target_compression asking for more
+        // features than there are samples divided by zero and produced NaN.
         let num_features = (measurements.len() as f32 / params.target_compression) as usize;
-        let num_features = num_features.max(1);
-
-        let mut compressed = Vec::with_capacity(num_features);
-        let chunk_size = measurements.len() / num_features;
-
-        for i in 0..num_features {
-            let start = i * chunk_size;
-            let end = ((i + 1) * chunk_size).min(measurements.len());
-            let chunk_mean: f32 =
-                measurements[start..end].iter().sum::<f32>() / (end - start) as f32;
-            compressed.push(chunk_mean);
-        }
+        let (compressed, _importance) = mean_pool(&measurements, num_features);
 
         let compressed_size_bytes = compressed.len() * std::mem::size_of::<f32>();
         let actual_compression = original_size_bytes as f32 / compressed_size_bytes as f32;
