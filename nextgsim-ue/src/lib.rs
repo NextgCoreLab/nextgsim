@@ -21,6 +21,11 @@ pub mod tasks;
 pub mod timer;
 pub mod tun;
 
+// Shared unit-test helpers: the `tracing` capture behind the honesty invariants
+// (#54, #55) and a `UeTaskBase` builder. Test-only, so it ships in no build.
+#[cfg(test)]
+mod test_support;
+
 // 6G AI-native network function client modules
 #[cfg(feature = "nextgsim-fl")]
 pub mod fl_participant;
@@ -37,11 +42,16 @@ pub mod she_client;
 pub mod ambient_iot;
 pub mod mint;
 pub mod ranging;
+// Off by default (issue #54): the sidelink surface is an inert facade, so a
+// default build must not carry it or advertise it. See the `sidelink` feature in
+// Cargo.toml for why `prose` is gated on the same flag.
+#[cfg(feature = "sidelink")]
 pub mod sidelink;
 
 // Rel-17 protocol extensions
 pub mod daps;
-pub mod prose; // ProSe PC5 proximity services (TS 23.303/23.304)
+#[cfg(feature = "sidelink")]
+pub mod prose; // ProSe PC5 proximity services (TS 23.303/23.304), needs sidelink::Pc5RrcState
 pub mod uav; // UAV identification and C2 link management (TS 23.256) // DAPS dual active protocol stack handover (TS 38.331)
 
 // Re-export commonly used types
@@ -125,15 +135,18 @@ pub use rrc::{
 pub use rls::{RlsTask, RlsTaskConfig, DEFAULT_RLS_PORT};
 
 // Re-export task types
+#[cfg(feature = "sidelink")]
+pub use tasks::SidelinkMessage;
 pub use tasks::{
-    AppMessage, CmState, MintMessage, NasMessage, RangingMessage, RlsMessage, RrcMessage,
-    SidelinkMessage, Task, TaskHandle, TaskId, TaskManager, TaskMessage, TaskState, UeCliCommand,
-    UeCliCommandType, UeRel18Receivers, UeStatusUpdate, UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
+    AppMessage, CmState, MintMessage, NasMessage, RangingMessage, RlsMessage, RrcMessage, Task,
+    TaskHandle, TaskId, TaskManager, TaskMessage, TaskState, UeCliCommand, UeCliCommandType,
+    UeRel18Receivers, UeStatusUpdate, UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
 };
 
 // Re-export Rel-18 5G-Advanced task types
 pub use mint::MintTask;
 pub use ranging::RangingTask;
+#[cfg(feature = "sidelink")]
 pub use sidelink::SidelinkTask;
 
 // Re-export App types

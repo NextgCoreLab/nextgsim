@@ -43,9 +43,11 @@ use nextgsim_ue::SemanticCodecTask;
 use nextgsim_ue::SheClientTask;
 use nextgsim_ue::{
     AppMessage, AppTask, MintMessage, MintTask, NasMessage, RangingTask, RlsMessage, RlsTask,
-    RrcMessage, SidelinkMessage, SidelinkTask, Task, TaskManager, TaskMessage, UeRel18Receivers,
-    UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
+    RrcMessage, Task, TaskManager, TaskMessage, UeRel18Receivers, UeTaskBase,
+    DEFAULT_CHANNEL_CAPACITY,
 };
+#[cfg(feature = "sidelink")]
+use nextgsim_ue::{SidelinkMessage, SidelinkTask};
 
 /// nextgsim UE - 5G User Equipment Simulator
 #[derive(Parser, Debug)]
@@ -411,6 +413,7 @@ impl UeApp {
         let UeRel18Receivers {
             ranging_rx,
             mint_rx,
+            #[cfg(feature = "sidelink")]
             sidelink_rx,
         } = rel18_rxs;
         let mut ranging_task = RangingTask::new(task_base.clone());
@@ -419,9 +422,14 @@ impl UeApp {
         let mut mint_task = MintTask::new(task_base.clone());
         tokio::spawn(async move { mint_task.run(mint_rx).await });
         info!("MINT task spawned (Rel-18, TS 23.761)");
-        let mut sidelink_task = SidelinkTask::new(task_base.clone());
-        tokio::spawn(async move { sidelink_task.run(sidelink_rx).await });
-        info!("Sidelink task spawned (Rel-18 NR Sidelink)");
+        // Issue #54: the sidelink surface is an inert facade, so a default build
+        // neither spawns it nor logs anything about it.
+        #[cfg(feature = "sidelink")]
+        {
+            let mut sidelink_task = SidelinkTask::new(task_base.clone());
+            tokio::spawn(async move { sidelink_task.run(sidelink_rx).await });
+            info!("{}", nextgsim_ue::sidelink::SPAWN_LOG);
+        }
 
         // Spawn 6G AI-native network function tasks (Rel-20)
         #[cfg(any(
@@ -1826,18 +1834,21 @@ async fn notify_rel18_registration(task_base: &UeTaskBase, registered: bool) {
             guti: None,
         })
         .await;
-    let ranging_enabled = task_base
-        .config
-        .ranging_config
-        .as_ref()
-        .is_some_and(|c| c.enabled);
-    if ranging_enabled {
-        let msg = if registered {
-            SidelinkMessage::StartDiscovery
-        } else {
-            SidelinkMessage::StopDiscovery
-        };
-        let _ = rel18.sidelink_tx.send(msg).await;
+    #[cfg(feature = "sidelink")]
+    {
+        let ranging_enabled = task_base
+            .config
+            .ranging_config
+            .as_ref()
+            .is_some_and(|c| c.enabled);
+        if ranging_enabled {
+            let msg = if registered {
+                SidelinkMessage::StartDiscovery
+            } else {
+                SidelinkMessage::StopDiscovery
+            };
+            let _ = rel18.sidelink_tx.send(msg).await;
+        }
     }
 }
 

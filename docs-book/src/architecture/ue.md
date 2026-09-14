@@ -50,7 +50,8 @@ The crate declares one binary, `nr-ue`, in `nextgsim-ue/Cargo.toml`
    (`TunTask::run`) plus a small TUN→app handler closure; the **App** task
    (`AppTask`, with a CLI server unless `--disable-cmd`); the **NAS** task
    (`UeApp::run_nas_task`); the **RRC** task (`UeApp::run_rrc_task`); the Rel-18
-   **Ranging / MINT / Sidelink** tasks; any enabled **6G** tasks; and last the
+   **Ranging / MINT** tasks (and **Sidelink** only under the off-by-default
+   `sidelink` Cargo feature); any enabled **6G** tasks; and last the
    **RLS** task (`RlsTask::from_ue_config`). `-n > 1` spawns that many `UeApp`
    instances with incrementing IMSIs.
 
@@ -76,7 +77,8 @@ and the crate that backs it:
 | `tun/` | `nextgsim-common`, `tun-rs` | TUN device lifecycle and IP-packet I/O for the user plane (`TunTask`, `TunInterface`, `packet.rs`) |
 | `timer.rs` | — | NAS timer constants + `NasTimerManager`, `GprsTimer2/3` decoders |
 | `daps.rs` | — | Rel-17 DAPS handover UE state (`UeDapsState`) — dual-RLC handover model |
-| `ambient_iot/`, `prose.rs`, `ranging/`, `sidelink/`, `uav.rs`, `mint/` | (in-crate) | Rel-17/18 5G-Advanced prototypes (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
+| `ambient_iot/`, `ranging/`, `uav.rs`, `mint/` | (in-crate) | Rel-17/18 5G-Advanced prototypes (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
+| `sidelink/`, `prose.rs` | (in-crate) | Rel-17/18 PC5 surface behind the off-by-default `sidelink` feature — an inert facade, absent from a default build (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
 | `semantic_codec/`, `she_client/`, `isac_sensor/`, `fl_participant/`, `nwdaf_reporter/` | `nextgsim-semantic`, `nextgsim-she`, `nextgsim-isac`, `nextgsim-fl`, `nextgsim-nwdaf` | Feature-gated 6G/AI client tasks (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
 
 The composed crates (declared in `Cargo.toml`):
@@ -328,8 +330,11 @@ gNB, and UPF is in [PDU session & user plane](../concepts/pdu-session-userplane.
 
 ## 6G & AI prototypes (pointers)
 
-These modules are **non-normative research prototypes**. The Rel-18 tasks
-(Ranging, MINT, Sidelink) are always compiled and spawned; the 6G/AI client tasks
+These modules are **non-normative research prototypes**. The Rel-18 Ranging and
+MINT tasks are always compiled and spawned; **Sidelink** (and `prose.rs` with it)
+sits behind the off-by-default `sidelink` Cargo feature, so a default build
+carries neither the task nor its types — see the `sidelink/` row below. The
+6G/AI client tasks
 are both Cargo-feature-gated (`nextgsim-she`, `nextgsim-nwdaf`, `nextgsim-isac`,
 `nextgsim-fl`, `nextgsim-semantic`) **and** config-gated
 (`she_enabled`, `ai_ml_enabled`, `isac_enabled`, `federated_learning_enabled`,
@@ -339,9 +344,9 @@ see [The 6G / AI stack](../concepts/ai-6g-stack.md).
 | Module (`nextgsim-ue/src/…`) | One-line honest pointer |
 |---|---|
 | `ambient_iot/` | Rel-18 Ambient IoT fleet management model (TS 22.369) — device-group coordination, no wire protocol. |
-| `prose.rs` | ProSe PC5 proximity-services model (TS 23.303/23.304) — discovery + UE-to-UE relay state, prototype. |
+| `prose.rs` | **Absent from a default build** (`sidelink` feature). ProSe PC5 proximity-services model (TS 23.303/23.304) — discovery + UE-to-UE relay state. It rides the `sidelink` feature because it uses `sidelink::Pc5RrcState`, and its own types have zero consumers anywhere in the workspace. |
 | `ranging/` | **Non-wired stub, not spec-compliant.** Models Rel-18 UE-to-UE ranging / carrier-phase positioning (TS 23.586) — RTT and phase maths plus an LMF report shape — but nothing drives it: no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF (SLPP/RSPP) transport, and no ranging service at the LMF, so every measurement handler is unreachable at runtime. The startup logs deliberately make no TS 23.586 claim. See issue #55 for the four increments that would make the claim true. |
-| `sidelink/` | NR sidelink relay, PC5 link, sidelink positioning — prototype state machines. |
+| `sidelink/` | **Absent from a default build** (off-by-default `sidelink` feature), because the surface is an inert facade. Only `StartDiscovery`/`StopDiscovery` have a sender anywhere in the tree; `EstablishPc5Link` flips straight to `Active` with no PC5-S `Direct Communication Request`/`Accept` (TS 23.304 §6.4.3.1); there is no RRC `SidelinkUEInformation` / `sl-Config` (TS 38.331), so a gNB peer reserves no sidelink resources; and `Pc5RrcConnection` is constructed only by its own unit test. Enabling the feature compiles the facade back in — it does not make PC5 work. Issue #54. |
 | `uav.rs` | Rel-17/18 UAV context (TS 23.256) — wraps the RRC UAV types with NAS authorization/C2/geofence modelling. |
 | `mint/` | Rel-18 MINT / multi-USIM (TS 23.761) — multi-SUPI secondary-subscription driver, integrated with the NAS task. |
 | `semantic_codec/` | 6G semantic-communication encode/decode task — research prototype. |

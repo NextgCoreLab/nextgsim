@@ -116,6 +116,7 @@ pub enum TaskId {
     /// MINT - Multi-IMSI terminal support (TS 23.761)
     Mint,
     /// Sidelink - NR relay, discovery, PC5, sidelink positioning
+    #[cfg(feature = "sidelink")]
     Sidelink,
 }
 
@@ -140,6 +141,7 @@ impl std::fmt::Display for TaskId {
             // Rel-18 5G-Advanced tasks
             TaskId::Ranging => write!(f, "Ranging"),
             TaskId::Mint => write!(f, "MINT"),
+            #[cfg(feature = "sidelink")]
             TaskId::Sidelink => write!(f, "Sidelink"),
         }
     }
@@ -1275,6 +1277,14 @@ pub enum MintMessage {
 /// Messages for the Sidelink task.
 ///
 /// Handles NR sidelink relay, discovery, PC5, and sidelink positioning.
+///
+/// Behind the off-by-default `sidelink` feature (issue #54): only
+/// `StartDiscovery`/`StopDiscovery` have a sender anywhere in the tree, so every
+/// other variant is an unreachable handler. Gating the enum is what makes
+/// criterion 1's "the sidelink types are absent from the default build" true —
+/// it lives here rather than in `sidelink/` because the actor framework owns
+/// every inter-task message type.
+#[cfg(feature = "sidelink")]
 #[derive(Debug)]
 pub enum SidelinkMessage {
     /// Start sidelink discovery
@@ -1476,6 +1486,7 @@ pub struct UeRel18Handles {
     /// Handle to the MINT (Multi-IMSI) task (TS 23.761)
     pub mint_tx: TaskHandle<MintMessage>,
     /// Handle to the Sidelink (NR relay, PC5, positioning) task
+    #[cfg(feature = "sidelink")]
     pub sidelink_tx: TaskHandle<SidelinkMessage>,
 }
 
@@ -1483,6 +1494,7 @@ pub struct UeRel18Handles {
 pub struct UeRel18Receivers {
     pub ranging_rx: mpsc::Receiver<TaskMessage<RangingMessage>>,
     pub mint_rx: mpsc::Receiver<TaskMessage<MintMessage>>,
+    #[cfg(feature = "sidelink")]
     pub sidelink_rx: mpsc::Receiver<TaskMessage<SidelinkMessage>>,
 }
 
@@ -1585,17 +1597,20 @@ impl UeTaskBase {
     pub fn init_rel18_tasks(&mut self, channel_capacity: usize) -> UeRel18Receivers {
         let (ranging_tx, ranging_rx) = mpsc::channel(channel_capacity);
         let (mint_tx, mint_rx) = mpsc::channel(channel_capacity);
+        #[cfg(feature = "sidelink")]
         let (sidelink_tx, sidelink_rx) = mpsc::channel(channel_capacity);
 
         self.rel18 = Some(UeRel18Handles {
             ranging_tx: TaskHandle::new(ranging_tx),
             mint_tx: TaskHandle::new(mint_tx),
+            #[cfg(feature = "sidelink")]
             sidelink_tx: TaskHandle::new(sidelink_tx),
         });
 
         UeRel18Receivers {
             ranging_rx,
             mint_rx,
+            #[cfg(feature = "sidelink")]
             sidelink_rx,
         }
     }
@@ -1631,6 +1646,7 @@ impl UeTaskBase {
         if let Some(ref rel18) = self.rel18 {
             let _ = rel18.ranging_tx.shutdown().await;
             let _ = rel18.mint_tx.shutdown().await;
+            #[cfg(feature = "sidelink")]
             let _ = rel18.sidelink_tx.shutdown().await;
         }
     }
@@ -1742,6 +1758,7 @@ impl TaskManager {
         // Rel-18 5G-Advanced tasks
         register_task!(TaskId::Ranging);
         register_task!(TaskId::Mint);
+        #[cfg(feature = "sidelink")]
         register_task!(TaskId::Sidelink);
 
         let manager = Self {
@@ -1935,6 +1952,64 @@ mod tests {
     /// Creates a test `UeConfig` for unit tests.
     fn test_config() -> UeConfig {
         UeConfig::default()
+    }
+
+    /// #54, criterion 4: the honesty invariant, asserted over the task registry
+    /// rather than over the source.
+    ///
+    /// `TaskManager::new` registers every task the build carries, so
+    /// `status_summary()` is the runtime answer to "does this build have a
+    /// sidelink task". In a default build the `TaskId::Sidelink` variant does not
+    /// exist, so this cannot be written as `get_task_state(TaskId::Sidelink)` —
+    /// it has to go through `Display`, which is also what an operator reads.
+    #[test]
+    #[cfg(not(feature = "sidelink"))]
+    fn a_default_build_registers_no_sidelink_task() {
+        let (manager, _app_rx, _nas_rx, _rrc_rx, _rls_rx) =
+            TaskManager::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let names: Vec<String> = manager
+            .status_summary()
+            .into_iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+
+        // Positive control first: an absence proves nothing unless the registry
+        // is populated at all. Ranging and MINT are the sidelink task's
+        // un-gated Rel-18 siblings, so their presence is what makes the
+        // following absence meaningful rather than vacuous.
+        assert!(
+            names.iter().any(|n| n == "Ranging") && names.iter().any(|n| n == "MINT"),
+            "the Rel-18 siblings are missing from the registry, so nothing can \
+             be concluded from Sidelink also being absent; registered: {names:?}"
+        );
+
+        assert!(
+            !names.iter().any(|n| n == "Sidelink"),
+            "a default build registered a sidelink task; registered: {names:?}"
+        );
+    }
+
+    /// The twin of [`a_default_build_registers_no_sidelink_task`]. Without this,
+    /// that test would still pass if `Sidelink` had simply been deleted from the
+    /// registry outright rather than gated — the two together pin the gate, not
+    /// just the absence.
+    #[test]
+    #[cfg(feature = "sidelink")]
+    fn the_sidelink_feature_registers_the_sidelink_task() {
+        let (manager, _app_rx, _nas_rx, _rrc_rx, _rls_rx) =
+            TaskManager::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let names: Vec<String> = manager
+            .status_summary()
+            .into_iter()
+            .map(|(id, _)| id.to_string())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "Sidelink"),
+            "the sidelink feature is on but no sidelink task is registered, so \
+             the feature-off test is asserting about a registry that never \
+             carries it; registered: {names:?}"
+        );
     }
 
     #[test]
@@ -2224,7 +2299,12 @@ mod tests {
         #[cfg(feature = "nextgsim-semantic")]
         manager.mark_task_started(TaskId::SemanticCodec);
         // Rel-18 5G-Advanced tasks
-        for task_id in [TaskId::Ranging, TaskId::Mint, TaskId::Sidelink] {
+        for task_id in [
+            TaskId::Ranging,
+            TaskId::Mint,
+            #[cfg(feature = "sidelink")]
+            TaskId::Sidelink,
+        ] {
             manager.mark_task_started(task_id);
         }
 
@@ -2251,7 +2331,9 @@ mod tests {
         manager.mark_task_started(TaskId::Nas);
 
         let summary = manager.status_summary();
-        // 4 core tasks + 3 Rel-18 tasks + however many 6G features are enabled
+        // 4 core tasks + the always-on Rel-18 tasks (Ranging, MINT) + Sidelink
+        // when its feature is on (issue #54 gated it off by default) + however
+        // many 6G features are enabled.
         let expected_6g: usize = [
             cfg!(feature = "nextgsim-she"),
             cfg!(feature = "nextgsim-nwdaf"),
@@ -2262,7 +2344,8 @@ mod tests {
         .iter()
         .filter(|&&x| x)
         .count();
-        assert_eq!(summary.len(), 4 + 3 + expected_6g);
+        let expected_rel18 = 2 + usize::from(cfg!(feature = "sidelink"));
+        assert_eq!(summary.len(), 4 + expected_rel18 + expected_6g);
 
         // Find App and Nas in summary
         let app_state = summary

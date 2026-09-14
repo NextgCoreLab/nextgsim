@@ -24,6 +24,21 @@ uuaa-mm = []
 # build keeps RLC wired straight to NAS. With it on, a DRB gains a PDCP header,
 # an SN, a 32-bit COUNT, in-order delivery and a discardTimer.
 drb-pdcp = []
+# Sidelink / ProSe PC5 surface (issue #54, TS 23.304). Off by default because the
+# surface is a FACADE: only `StartDiscovery`/`StopDiscovery` are ever sent, and
+# `EstablishPc5Link` flips straight to `Active` with no over-the-air exchange, so
+# every PC5-link, relay and cooperative-positioning handler is unreachable. There
+# is no PC5-S wire protocol and no RRC `SidelinkUEInformation` / `sl-Config`, so a
+# gNB peer reserves no sidelink resources.
+#
+# `prose` rides on this feature rather than getting its own: `prose.rs` uses
+# `crate::sidelink::Pc5RrcState`, so it cannot compile without the sidelink types,
+# and it is the same PC5 capability split across two files -- its own types have
+# zero consumers anywhere in the workspace.
+#
+# Turning this on compiles the facade back in; it does not make PC5 work. See #54
+# increment 2 for what would.
+sidelink = []
 
 [lints]
 workspace = true
