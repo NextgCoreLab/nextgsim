@@ -157,6 +157,15 @@ impl From<CipheringAlgorithmType> for CipheringAlgorithm {
 /// C-RNTI used for the re-establishment/resume ShortMAC-I.
 #[derive(Clone)]
 pub struct AsSecurityContext {
+    /// The `KgNB` these keys were derived from (256 bits).
+    ///
+    /// Retained because a handover re-keys **from it**: `KgNB* = KDF(KgNB, FC=0x70, PCI,
+    /// ARFCN-DL)` (TS 33.501 Annex A.11, issue #39). Without it the UE would have to
+    /// re-read `pending_kgnb`, which the SecurityModeCommand handler consumes — so a
+    /// second handover would have nothing to chain from and would derive from zeros.
+    ///
+    /// The gNB keeps the same field on its own `AsSecurityContext`, for the same reason.
+    pub kgnb: [u8; 32],
     /// KRRCint — RRC integrity protection key (128 bits), derived from KgNB
     /// with `AlgorithmTypeDistinguisher::RrcInt` (TS 33.501 Annex A.8).
     pub k_rrc_int: [u8; 16],
@@ -239,6 +248,7 @@ impl AsSecurityContext {
         c_rnti: u16,
     ) -> Self {
         Self {
+            kgnb: *kgnb,
             k_rrc_int: derive_rrc_up_key(
                 kgnb,
                 AlgorithmTypeDistinguisher::RrcInt,
@@ -442,6 +452,9 @@ mod tests {
 
     fn test_ctx(alg: IntegrityAlgorithm) -> AsSecurityContext {
         AsSecurityContext {
+            // A KgNB distinct from the keys derived from it, so a test cannot pass by
+            // chaining a handover from the wrong field.
+            kgnb: [0x5A; 32],
             k_rrc_int: [
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
                 0x0E, 0x0F,

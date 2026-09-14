@@ -91,6 +91,39 @@ pub struct AsSecurityContext {
     pub integrity_alg_id: u8,
 }
 
+impl AsSecurityContext {
+    /// Derive the four AS keys from a `KgNB` (TS 33.501 Annex A.8).
+    ///
+    /// Named because a handover re-keys from a `KgNB*` and an Initial Context Setup keys
+    /// from the AMF's `SecurityKey`, and both must produce the four keys the same way
+    /// (issue #39). Two copies of the four `derive_rrc_up_key` calls is how a re-keyed
+    /// UE ends up with a `K_RRCint` its peer does not hold.
+    ///
+    /// The algorithm identities come from the caller because a handover does **not**
+    /// renegotiate them (TS 33.501 §6.9.2.3.1): the UE keeps the NEA/NIA it agreed at
+    /// activation, and only the key underneath changes.
+    pub fn from_kgnb(kgnb: [u8; 32], ciphering_alg_id: u8, integrity_alg_id: u8) -> Self {
+        use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+        Self {
+            kgnb,
+            k_rrc_enc: derive_rrc_up_key(
+                &kgnb,
+                AlgorithmTypeDistinguisher::RrcEnc,
+                ciphering_alg_id,
+            ),
+            k_rrc_int: derive_rrc_up_key(
+                &kgnb,
+                AlgorithmTypeDistinguisher::RrcInt,
+                integrity_alg_id,
+            ),
+            k_up_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpEnc, ciphering_alg_id),
+            k_up_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpInt, integrity_alg_id),
+            ciphering_alg_id,
+            integrity_alg_id,
+        }
+    }
+}
+
 impl std::fmt::Debug for AsSecurityContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print key material.

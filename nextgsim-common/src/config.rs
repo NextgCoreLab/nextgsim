@@ -44,6 +44,15 @@ impl AmfConfig {
     }
 }
 
+/// Default downlink ARFCN: `absoluteFrequencySSB` of a 3.5 GHz n78 cell.
+///
+/// Named rather than `Default::default()`'s zero, because ARFCN 0 is a legal value that
+/// would bind every `KgNB*` to a frequency nobody configured — and both ends would
+/// still agree, so nothing would notice.
+fn default_dl_arfcn() -> u32 {
+    632_448
+}
+
 /// gNB (gNodeB) configuration.
 ///
 /// Contains all configuration parameters for a 5G base station.
@@ -205,6 +214,26 @@ pub struct GnbConfig {
     /// with it off would have the UE read a MAC-I as message content.
     #[serde(default)]
     pub as_security_enabled: bool,
+
+    /// Downlink `ARFCN-ValueNR` of this cell (0..3279165).
+    ///
+    /// Bound into the `KgNB*` derivation on handover alongside the target `physCellId`
+    /// (TS 33.501 Annex A.11, issue #39), so **both ends must hold the same value** or
+    /// every PDCP MAC on the target fails with no indication that a key, rather than the
+    /// radio, was the problem.
+    ///
+    /// Config rather than signalled, and that is a deliberate trade: carrying it in
+    /// `reconfigurationWithSync` means filling `FrequencyInfoDL`'s three other mandatory
+    /// fields — `frequencyBandList`, `absoluteFrequencyPointA` and
+    /// `scs-SpecificCarrierList` — none of which a simulator with no PHY has a real
+    /// value for. Inventing three fields to signal one is worse than a coupling the RLS
+    /// already has: it is single-carrier, so there is exactly one downlink frequency and
+    /// both ends are configured for the same cell.
+    ///
+    /// 632448 is the `absoluteFrequencySSB` of a 3.5 GHz n78 cell.
+    #[serde(default = "default_dl_arfcn")]
+    pub dl_arfcn: u32,
+
     /// Idle-mode cell reselection parameters this cell broadcasts in SIB2/SIB3/
     /// SIB4 (TS 38.331 §6.3.1, TS 38.304 §5.2.4.6). Issue #50.
     ///
@@ -415,6 +444,7 @@ impl Default for GnbConfig {
             pqc_config: PqcConfig::default(),
             ntn_config: None,
             as_security_enabled: false,
+            dl_arfcn: default_dl_arfcn(),
             reselection: CellReselectionBroadcastConfig::default(),
             mbs_enabled: false,
             prose_enabled: false,
@@ -1647,6 +1677,26 @@ pub struct UeConfig {
     /// with it off would have the UE read a MAC-I as message content.
     #[serde(default)]
     pub as_security_enabled: bool,
+
+    /// Downlink `ARFCN-ValueNR` of this cell (0..3279165).
+    ///
+    /// Bound into the `KgNB*` derivation on handover alongside the target `physCellId`
+    /// (TS 33.501 Annex A.11, issue #39), so **both ends must hold the same value** or
+    /// every PDCP MAC on the target fails with no indication that a key, rather than the
+    /// radio, was the problem.
+    ///
+    /// Config rather than signalled, and that is a deliberate trade: carrying it in
+    /// `reconfigurationWithSync` means filling `FrequencyInfoDL`'s three other mandatory
+    /// fields — `frequencyBandList`, `absoluteFrequencyPointA` and
+    /// `scs-SpecificCarrierList` — none of which a simulator with no PHY has a real
+    /// value for. Inventing three fields to signal one is worse than a coupling the RLS
+    /// already has: it is single-carrier, so there is exactly one downlink frequency and
+    /// both ends are configured for the same cell.
+    ///
+    /// 632448 is the `absoluteFrequencySSB` of a 3.5 GHz n78 cell.
+    #[serde(default = "default_dl_arfcn")]
+    pub dl_arfcn: u32,
+
     /// Keep the network-assigned UE radio capability ID (RACS, Rel-16
     /// TS 23.003 §29 / TS 24.501 §9.11.3.68) that a CONFIGURATION UPDATE
     /// COMMAND assigns.
@@ -1777,6 +1827,7 @@ impl Default for UeConfig {
             plmn_operator_preferred: Vec::new(),
             plmn_hp_search_interval_secs: None,
             as_security_enabled: false,
+            dl_arfcn: default_dl_arfcn(),
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),

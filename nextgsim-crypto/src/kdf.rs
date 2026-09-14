@@ -38,8 +38,11 @@ pub enum FcValue {
     /// FC = 0x6B: Derivation of RES* from CK || IK (5G-AKA, TS 33.501 Annex A.4)
     ResStar = 0x6B,
     /// FC = 0x6F: Derivation of NH (Next Hop) from KAMF and sync input
-    /// (TS 33.501 Annex A.10). 0x70 is KNG-RAN* target-gNB derivation (A.11).
+    /// (TS 33.501 Annex A.10)
     Nh = 0x6F,
+    /// FC = 0x70: Derivation of `KNG-RAN*` (`KgNB*`) for the target NG-RAN node on
+    /// handover, from the current `KgNB` or a fresh NH (TS 33.501 Annex A.11).
+    KngRanStar = 0x70,
 }
 
 /// Algorithm type distinguisher for NAS key derivation (TS 33.501 A.8)
@@ -328,6 +331,73 @@ pub fn derive_rrc_up_key(
 /// 256-bit NH
 pub fn derive_nh(kamf: &[u8; KEY_256_SIZE], sync_input: &[u8; KEY_256_SIZE]) -> [u8; KEY_256_SIZE] {
     calculate_kdf_key(kamf, FcValue::Nh as u8, &[sync_input])
+}
+
+/// Which key a `KgNB*` is chained from (TS 33.501 §6.9.2.3.1, issue #39).
+///
+/// The **only** difference on the wire is the `nextHopChainingCount` the AMF sends
+/// with the handover: an NCC the target has not seen before means a fresh NH is
+/// available and the derivation is *vertical*; an NCC it already holds means there is
+/// no fresh NH and the derivation is *horizontal*, from the currently active `KgNB`.
+///
+/// Modelled as an enum rather than an `Option<NH>` because the distinction is a
+/// **security property**, not a missing value: only the vertical case gives forward
+/// security against a compromised source gNB, and a caller that silently fell back to
+/// horizontal would lose that with nothing to show for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KgnbStarChaining {
+    /// Vertical: chained from a fresh NH the AMF supplied. Forward-secure.
+    Vertical,
+    /// Horizontal: chained from the currently active `KgNB`, because no fresh NH was
+    /// available. A source gNB that knows `KgNB` can compute the target's key.
+    Horizontal,
+}
+
+/// Length in octets of the ARFCN-DL input to the `KgNB*` derivation
+/// (TS 33.501 Annex A.11: P1 is the target `ARFCN-DL`, 3 octets — `ARFCN-ValueNR`
+/// spans 0..3279165, which needs 22 bits).
+pub const ARFCN_DL_LEN: usize = 3;
+
+/// Derive `KNG-RAN*` (`KgNB*`) for the target NG-RAN node on handover
+/// (3GPP TS 33.501 §6.9.2.3.1, Annex A.11).
+///
+/// `KgNB* = KDF(key, FC=0x70, P0 = target PCI, P1 = target ARFCN-DL)`
+///
+/// # The `key` argument decides forward security
+///
+/// Pass the fresh **NH** for a vertical derivation and the current **`KgNB`** for a
+/// horizontal one; [`KgnbStarChaining`] exists so a caller states which it meant.
+/// This function cannot tell them apart — both are 256-bit keys — which is exactly
+/// why the *caller* must decide from the `nextHopChainingCount` the AMF sent and not
+/// from whatever key it happens to have.
+///
+/// # Both ends must agree on the inputs
+///
+/// The UE derives this too (TS 38.331 §5.3.5.3, on `reconfigurationWithSync`), from
+/// the `physCellId` and frequency of the target cell it was told to go to. If the
+/// network binds the key to a different PCI or ARFCN than the one it signalled, every
+/// PDCP MAC on the target fails and the UE declares handover failure — with no
+/// indication that a key, rather than the radio, was the problem.
+///
+/// # Arguments
+/// * `key` - the 256-bit NH (vertical) or current `KgNB` (horizontal)
+/// * `target_phys_cell_id` - the target cell's `physCellId` (0..1007)
+/// * `target_arfcn_dl` - the target cell's downlink `ARFCN-ValueNR` (0..3279165)
+///
+/// # Returns
+/// The 256-bit `KgNB*` the target NG-RAN node will use as its `KgNB`.
+pub fn derive_kgnb_star(
+    key: &[u8; KEY_256_SIZE],
+    target_phys_cell_id: u16,
+    target_arfcn_dl: u32,
+) -> [u8; KEY_256_SIZE] {
+    let pci_bytes = target_phys_cell_id.to_be_bytes();
+    // Three octets, big-endian: the high octet of a `u32` is dropped because
+    // ARFCN-ValueNR never reaches it, and Annex A.11 fixes L1 at 3.
+    let arfcn_be = target_arfcn_dl.to_be_bytes();
+    let arfcn_bytes: [u8; ARFCN_DL_LEN] = [arfcn_be[1], arfcn_be[2], arfcn_be[3]];
+
+    calculate_kdf_key(key, FcValue::KngRanStar as u8, &[&pci_bytes, &arfcn_bytes])
 }
 
 /// Derive RES* from CK and IK for 5G-AKA (3GPP TS 33.501 Annex A.4)
@@ -830,5 +900,133 @@ mod tests {
         assert_eq!(knas_enc, expected_chain_knas_enc);
         assert_eq!(knas_int, expected_chain_knas_int);
         assert_eq!(kgnb, expected_chain_kgnb);
+    }
+
+    // ========================================================================
+    // KgNB* / KNG-RAN* target-gNB derivation (issue #39, TS 33.501 Annex A.11)
+    // ========================================================================
+
+    /// #39, criterion 4: `KgNB*` against a hand-computed vector, for both the
+    /// horizontal and the vertical case.
+    ///
+    /// The expected values are `HMAC-SHA256(key, S)` with
+    /// `S = FC(0x70) || PCI || L0(0x0002) || ARFCN-DL || L1(0x0003)` computed
+    /// independently, not captured from this implementation — otherwise the test would
+    /// agree with whatever the code does, including a wrong FC or a truncated ARFCN.
+    #[test]
+    fn kgnb_star_matches_a_hand_computed_annex_a11_vector() {
+        const PCI: u16 = 407;
+        const ARFCN_DL: u32 = 632_448;
+
+        // S = 70 0197 0002 09a680 0003
+        let kgnb = [0x5Au8; KEY_256_SIZE];
+        let horizontal = derive_kgnb_star(&kgnb, PCI, ARFCN_DL);
+        let expected_horizontal: [u8; KEY_256_SIZE] = [
+            0x17, 0x44, 0x77, 0xB5, 0x76, 0x93, 0x31, 0xCC, 0xA4, 0x57, 0x44, 0x81, 0xD3, 0xC8,
+            0xB5, 0xCF, 0x87, 0xEB, 0x51, 0x3B, 0x20, 0xFF, 0xC3, 0x5A, 0x24, 0x07, 0x1E, 0xE9,
+            0x37, 0x08, 0xE6, 0xE6,
+        ];
+        assert_eq!(
+            horizontal, expected_horizontal,
+            "horizontal KgNB* = HMAC-SHA256(KgNB, 70 0197 0002 09a680 0003)"
+        );
+
+        let nh = [0xA5u8; KEY_256_SIZE];
+        let vertical = derive_kgnb_star(&nh, PCI, ARFCN_DL);
+        let expected_vertical: [u8; KEY_256_SIZE] = [
+            0x09, 0xDA, 0xF5, 0xE1, 0x75, 0xFC, 0x5A, 0x28, 0x7B, 0x5A, 0x80, 0xCC, 0x74, 0x85,
+            0x62, 0xE8, 0x15, 0xBC, 0xE9, 0x92, 0x9C, 0xB5, 0x68, 0xEA, 0x8D, 0xCA, 0x57, 0x55,
+            0x1E, 0x9E, 0x2F, 0xA0,
+        ];
+        assert_eq!(
+            vertical, expected_vertical,
+            "vertical KgNB* = HMAC-SHA256(NH, the same S)"
+        );
+        assert_ne!(
+            horizontal, vertical,
+            "the two chainings must differ, or forward security is not being provided \
+             by the vertical one"
+        );
+    }
+
+    /// The S string is exactly Annex A.11's, built by hand and compared against the
+    /// shared `calculate_kdf_key`. This is what pins FC = 0x70 and the two lengths.
+    #[test]
+    fn the_kgnb_star_input_string_is_annex_a11s() {
+        const PCI: u16 = 407;
+        const ARFCN_DL: u32 = 632_448;
+        let key = [0x5Au8; KEY_256_SIZE];
+        // FC || P0(PCI, 2 octets) || L0 || P1(ARFCN-DL, 3 octets) || L1
+        let mut s = vec![FcValue::KngRanStar as u8];
+        s.extend_from_slice(&PCI.to_be_bytes());
+        s.extend_from_slice(&2u16.to_be_bytes());
+        s.extend_from_slice(&[0x09, 0xA6, 0x80]);
+        s.extend_from_slice(&3u16.to_be_bytes());
+        assert_eq!(
+            s,
+            vec![0x70, 0x01, 0x97, 0x00, 0x02, 0x09, 0xA6, 0x80, 0x00, 0x03],
+            "S = FC || PCI || L0 || ARFCN-DL || L1, exactly Annex A.11's"
+        );
+        assert_eq!(
+            derive_kgnb_star(&key, PCI, ARFCN_DL),
+            hmac_sha256(&key, &s),
+            "the derivation must be KDF over Annex A.11's S and nothing else"
+        );
+        assert_eq!(FcValue::KngRanStar as u8, 0x70);
+        assert_eq!(ARFCN_DL_LEN, 3);
+    }
+
+    /// Both inputs are bound into the key, so a target on a different cell or a
+    /// different frequency gets a different `KgNB*`.
+    ///
+    /// This is the property the handover relies on: without it a captured `KgNB*` would
+    /// be valid on every cell the operator runs.
+    #[test]
+    fn the_target_pci_and_arfcn_both_change_the_key() {
+        let key = [0x11u8; KEY_256_SIZE];
+        let base = derive_kgnb_star(&key, 100, 632_448);
+        assert_ne!(base, derive_kgnb_star(&key, 101, 632_448), "PCI");
+        assert_ne!(base, derive_kgnb_star(&key, 100, 632_449), "ARFCN-DL");
+        let mut other = key;
+        other[0] ^= 0xFF;
+        assert_ne!(
+            base,
+            derive_kgnb_star(&other, 100, 632_448),
+            "the key itself"
+        );
+    }
+
+    /// The ARFCN occupies three octets, so the full `ARFCN-ValueNR` range survives.
+    ///
+    /// Pinned because a 2-octet P1 would silently truncate every ARFCN above 65535 —
+    /// which is most of FR1 — and the two ends would still agree only if they made the
+    /// same mistake.
+    #[test]
+    fn the_full_arfcn_range_reaches_the_derivation() {
+        let key = [0x22u8; KEY_256_SIZE];
+        // 0x0A0000 and 0x0B0000 differ only above the low 16 bits.
+        assert_ne!(
+            derive_kgnb_star(&key, 1, 0x0A_0000),
+            derive_kgnb_star(&key, 1, 0x0B_0000),
+            "a 2-octet ARFCN would make these two frequencies derive the same key"
+        );
+        // And the top of the ARFCN-ValueNR range is representable.
+        let _ = derive_kgnb_star(&key, 1007, 3_279_165);
+    }
+
+    /// `KgNB*` is not any of the keys it could be confused with.
+    #[test]
+    fn kgnb_star_differs_from_the_kgnb_and_nh_it_chains_from() {
+        let kamf = [0x33u8; KEY_256_SIZE];
+        let kgnb = derive_kgnb(&kamf, 1, 0x01);
+        let nh = derive_nh(&kamf, &kgnb);
+        let star = derive_kgnb_star(&kgnb, 407, 632_448);
+        assert_ne!(star, kgnb, "the target must not reuse the source's KgNB");
+        assert_ne!(star, nh, "nor the NH unchanged");
+        assert_ne!(
+            star,
+            derive_kgnb_star(&nh, 407, 632_448),
+            "and horizontal must differ from vertical for the same target"
+        );
     }
 }

@@ -249,7 +249,11 @@ pub fn handover_command_for(candidate: &ChoCandidateCell, transaction_id: u8) ->
             arfcn: Some(candidate.target_cell.ssb_frequency_arfcn),
             ssb_offset: None,
         },
-        new_security_config: false,
+        // No `masterKeyUpdate`: a conditional-reconfiguration container carries the
+        // candidate's `condRRCReconfig`, and this simulator's container has no room for a
+        // key update (issue #107). So a CHO execution keeps the UE's current keys, which
+        // is what the container actually says.
+        key_update: None,
         full_config: false,
         transaction_id,
     }

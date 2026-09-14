@@ -7,8 +7,8 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
-    GnbTaskBase, GutiMobileIdentity, IsacMessage, NgapMessage, NkefMessage, RlsMessage, RrcMessage,
-    SheMessage, Task, TaskMessage,
+    GnbTaskBase, GutiMobileIdentity, HandoverInitiation, IsacMessage, NgapMessage, NkefMessage,
+    RlsMessage, RrcMessage, SheMessage, Task, TaskMessage,
 };
 use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
@@ -83,6 +83,7 @@ const TAI_OCTETS: usize = 6;
 use super::connection::{
     ReestablishmentRequest, ResumeRequestPresented, RrcConnectionManager, SuspendParams,
 };
+use super::handover::GnbHandoverManager;
 use super::system_info::{
     encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
     release_cell_reselection_priorities,
@@ -114,10 +115,22 @@ pub struct RrcTask {
     /// acknowledgement is what triggers the next reconfiguration — sending it
     /// once per UE keeps that from becoming a loop.
     scell_configured_ues: std::collections::HashSet<i32>,
+    /// Mobility state per UE (issue #39).
+    ///
+    /// Instantiated here because `GnbHandoverManager` had no owner at all: it was
+    /// exported from `rrc/mod.rs` and exercised only by a unit test, so an
+    /// NWDAF-recommended handover could log success and reach no handover machinery.
+    handover_manager: GnbHandoverManager,
 }
 
 /// PDCP BEARER for SRB1 (TS 38.323 §5.9: the SRB identity minus one, so 0).
 const SRB1_PDCP_BEARER: u8 = 0;
+
+/// The confidence below which an NWDAF handover recommendation is ignored.
+///
+/// Named because it is a policy the operator would want to see, and because a literal
+/// buried in a comparison reads as arbitrary.
+const NWDAF_HANDOVER_CONFIDENCE_THRESHOLD: f32 = 0.7;
 
 /// PDCP DIRECTION for downlink (TS 33.501 Annex D: 1).
 const PDCP_DIRECTION_DOWNLINK: u8 = 1;
@@ -137,6 +150,9 @@ const MAC_I_LEN_GNB: usize = nextgsim_pdcp::srb_security::MAC_I_LEN;
 
 impl RrcTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
+        // Keyed on this cell's own identity, which is what an intra-gNB handover
+        // decision compares a recommended target against. Read before `task_base` moves.
+        let own_cell = (task_base.config.nci & 0xF_FFFF_FFFF) as i32;
         Self {
             task_base,
             ue_manager: RrcUeContextManager::new(),
@@ -144,6 +160,7 @@ impl RrcTask {
             pdu_id_counter: 0,
             ntn_config: None,
             scell_configured_ues: std::collections::HashSet::new(),
+            handover_manager: GnbHandoverManager::new(own_cell),
         }
     }
 
@@ -1659,6 +1676,23 @@ impl RrcTask {
         }
     }
 
+    /// Act on an NWDAF handover recommendation (issue #39).
+    ///
+    /// This used to validate the UE, check the confidence, log
+    /// *"Initiating NWDAF-recommended handover"* and **return** — never touching the
+    /// `GnbHandoverManager` and sending nothing. The log claimed a handover the code did
+    /// not perform, which is worse than not having the feature.
+    ///
+    /// Now it does one of two real things, decided from this cell's own identity:
+    ///
+    /// - the recommended cell **is** this cell's neighbour on this gNB → an intra-gNB
+    ///   handover: `GnbHandoverManager::initiate_handover` and an `RRCReconfiguration`
+    ///   with `reconfigurationWithSync` (TS 38.331 §5.3.5.5.2);
+    /// - the recommended cell is **not** one of ours → an inter-gNB handover:
+    ///   `NgapMessage::InitiateHandover`, which sends HANDOVER REQUIRED
+    ///   (TS 38.413 §8.4.1.1).
+    ///
+    /// The two are alternatives. Doing both would hand the UE over twice.
     async fn handle_nwdaf_handover(&mut self, ue_id: i32, target_cell: i32, confidence: f32) {
         if self.ue_manager.try_find_ue(ue_id).is_none() {
             debug!(
@@ -1668,17 +1702,91 @@ impl RrcTask {
             return;
         }
         // A confidence threshold of 0.7 is used to avoid spurious handovers.
-        if confidence < 0.7 {
+        if confidence < NWDAF_HANDOVER_CONFIDENCE_THRESHOLD {
             debug!(
                 "RRC: Ignoring low-confidence ({:.2}) handover recommendation for UE {} to cell {}",
                 confidence, ue_id, target_cell
             );
             return;
         }
+        let own_cell = (self.task_base.config.nci & 0xF_FFFF_FFFF) as i32;
+        if target_cell == own_cell {
+            debug!(
+                "RRC: Ignoring NWDAF recommendation for UE {ue_id} to cell {target_cell}: \
+                 it is already the serving cell"
+            );
+            return;
+        }
         info!(
-            "RRC: Initiating NWDAF-recommended handover for UE {} to cell {}",
-            ue_id, target_cell
+            "RRC: NWDAF-recommended handover for UE {ue_id} to cell {target_cell} \
+             (confidence {confidence:.2})"
         );
+        self.execute_handover(ue_id, target_cell).await;
+    }
+
+    /// Hand a UE over to `target_cell`, intra-gNB or inter-gNB (issue #39).
+    ///
+    /// Shared by the NWDAF path and anything else that decides a UE should move, so the
+    /// intra/inter choice is made in one place.
+    async fn execute_handover(&mut self, ue_id: i32, target_cell: i32) {
+        let own_cell = (self.task_base.config.nci & 0xF_FFFF_FFFF) as i32;
+
+        // Intra-gNB when the target is a cell this gNB configured as its secondary;
+        // otherwise the target belongs to another node and the AMF has to be involved.
+        // A single-cell gNB therefore always takes the inter-gNB path, which is the truth
+        // rather than a fallback.
+        let is_own_cell = self
+            .task_base
+            .config
+            .scell_phys_cell_id
+            .is_some_and(|pci| i32::from(pci) == target_cell)
+            || target_cell == own_cell;
+
+        if is_own_cell {
+            let Some(command) =
+                self.handover_manager
+                    .initiate_handover(ue_id, own_cell, target_cell)
+            else {
+                warn!("RRC: the handover manager declined to prepare UE {ue_id}");
+                return;
+            };
+            let Some(pdu) = command.build_rrc_pdu() else {
+                warn!("RRC: could not encode the handover command for UE {ue_id}");
+                return;
+            };
+            // The RRCReconfiguration with reconfigurationWithSync -- what actually moves
+            // the UE (TS 38.331 §5.3.5.5.2). The old code emitted nothing at all.
+            self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+                .await;
+            self.handover_manager.mark_executing(ue_id);
+            info!("RRC: sent an intra-gNB handover command to UE {ue_id} for cell {target_cell}");
+            return;
+        }
+
+        // Inter-gNB: HANDOVER REQUIRED through NGAP. The UE's capability container comes
+        // from this context because the NGAP task does not hold it, and the target needs
+        // it to configure the UE at all.
+        let ue_nr_capability = self
+            .ue_manager
+            .try_find_ue(ue_id)
+            .and_then(|ctx| ctx.nr_capability.clone());
+        let msg = NgapMessage::InitiateHandover(Box::new(HandoverInitiation {
+            ue_id,
+            // The simulator has no inter-gNB topology, so the recommended cell's own
+            // identity stands in for the target node's. Stated rather than hidden: an
+            // AMF routes on the gNB ID, and with no neighbour table this is the only
+            // value this gNB has.
+            target_gnb_id: target_cell as u32,
+            target_tac: self.task_base.config.tac,
+            target_cell_identity: target_cell as u64,
+            ue_nr_capability,
+            // Time on the source cell is not tracked per UE, so 0 is reported: "no
+            // measured dwell time" rather than an invented one.
+            time_in_source_cell_s: 0,
+        }));
+        if let Err(e) = self.task_base.ngap_tx.send(msg).await {
+            error!("RRC: failed to ask NGAP to start the handover: {e}");
+        }
     }
 }
 
@@ -1894,6 +2002,129 @@ mod tests {
             snpn_config: None,
             ..Default::default()
         }
+    }
+
+    // ========================================================================
+    // NWDAF-driven handover (issue #39)
+    // ========================================================================
+
+    /// A gNB RRC task with a connected UE and every receiver alive.
+    #[allow(clippy::type_complexity)]
+    fn rrc_task_with_connected_ue(
+        config: GnbConfig,
+        ue_id: i32,
+    ) -> (
+        RrcTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<NgapMessage>>,
+        tokio::sync::mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) {
+        let (task_base, _app_rx, ngap_rx, _rrc_rx, _gtp_rx, rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+        task.handle_radio_power_on();
+        let ctx = task.ue_manager.create_ue(ue_id);
+        ctx.on_setup_request();
+        ctx.on_setup_sent();
+        ctx.on_setup_complete();
+        (task, ngap_rx, rls_rx)
+    }
+
+    /// #39, criterion 6: an NWDAF recommendation above the confidence threshold results
+    /// in a real `RRCReconfiguration` with `reconfigurationWithSync` — not a log line.
+    ///
+    /// The old handler validated the UE, checked the confidence, logged
+    /// *"Initiating NWDAF-recommended handover"* and returned.
+    #[test]
+    fn a_confident_nwdaf_recommendation_emits_a_reconfiguration_with_sync() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::decode_handover_command;
+
+        let mut config = test_config();
+        // A configured secondary cell makes the recommended target one of ours, so this is
+        // the intra-gNB arm. The inter-gNB arm is covered separately.
+        config.scell_phys_cell_id = Some(42);
+        let (mut task, _ngap_rx, mut rls_rx) = rrc_task_with_connected_ue(config, 1);
+
+        run_async(async {
+            task.handle_nwdaf_handover(1, 42, 0.95).await;
+        });
+
+        let pdu = loop {
+            match rls_rx.try_recv() {
+                Ok(TaskMessage::Message(RlsMessage::DownlinkRrc { data, .. })) => break data,
+                Ok(_) => continue,
+                Err(e) => panic!("no RRCReconfiguration was emitted: {e}"),
+            }
+        };
+        let command = decode_handover_command(pdu.data())
+            .expect("the emitted PDU must be a real handover command");
+        assert_eq!(
+            command.target_phys_cell_id, 42,
+            "and it must name the recommended cell"
+        );
+        assert!(
+            command.master_key_update.is_some(),
+            "with a masterKeyUpdate, or the UE keeps the source cell's keys \
+             (TS 33.501 §6.9.2.3.1)"
+        );
+    }
+
+    /// The negative controls: below the threshold, for an unknown UE, and for the serving
+    /// cell itself, nothing is emitted.
+    ///
+    /// Without these, a handler that fired unconditionally would pass the test above.
+    #[test]
+    fn a_recommendation_that_should_be_ignored_emits_nothing() {
+        let mut config = test_config();
+        config.scell_phys_cell_id = Some(42);
+        let own_cell = (config.nci & 0xF_FFFF_FFFF) as i32;
+        let (mut task, mut ngap_rx, mut rls_rx) = rrc_task_with_connected_ue(config, 1);
+
+        run_async(async {
+            // Below the 0.7 threshold.
+            task.handle_nwdaf_handover(1, 42, 0.69).await;
+            // Unknown UE.
+            task.handle_nwdaf_handover(99, 42, 0.99).await;
+            // Already the serving cell.
+            task.handle_nwdaf_handover(1, own_cell, 0.99).await;
+        });
+
+        assert!(
+            !matches!(
+                rls_rx.try_recv(),
+                Ok(TaskMessage::Message(RlsMessage::DownlinkRrc { .. }))
+            ),
+            "no handover command must be emitted for a recommendation that should be ignored"
+        );
+        assert!(
+            ngap_rx.try_recv().is_err(),
+            "and nothing must be asked of NGAP either"
+        );
+    }
+
+    /// #39, criterion 3: a recommendation naming a cell this gNB does **not** serve takes
+    /// the inter-gNB arm and asks NGAP to start the handover.
+    #[test]
+    fn a_recommendation_for_another_nodes_cell_asks_ngap_to_hand_over() {
+        let config = test_config();
+        // No secondary cell configured, so cell 777 belongs to another node.
+        let (mut task, mut ngap_rx, _rls_rx) = rrc_task_with_connected_ue(config, 1);
+
+        run_async(async {
+            task.handle_nwdaf_handover(1, 777, 0.9).await;
+        });
+
+        let request = loop {
+            match ngap_rx.try_recv() {
+                Ok(TaskMessage::Message(NgapMessage::InitiateHandover(r))) => break r,
+                Ok(_) => continue,
+                Err(e) => panic!("NGAP was not asked to start a handover: {e}"),
+            }
+        };
+        assert_eq!(request.ue_id, 1);
+        assert_eq!(
+            request.target_cell_identity, 777,
+            "the target the NWDAF named must reach NGAP unchanged"
+        );
     }
 
     #[test]

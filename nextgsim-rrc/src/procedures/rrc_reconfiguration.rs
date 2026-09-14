@@ -50,6 +50,27 @@ pub struct RrcReconfigurationParams {
     pub master_cell_group: Option<Vec<u8>>,
     /// Full configuration indicator
     pub full_config: bool,
+    /// `masterKeyUpdate`: the IE that tells the UE to re-derive `KgNB*`
+    /// (TS 38.331 §5.3.5.7, TS 33.501 §6.9.2.3.1; issue #39).
+    ///
+    /// `None` means the UE keeps its current keys, which is right for a reconfiguration
+    /// that is not a handover. Present on a handover command, and its
+    /// `keySetChangeIndicator` is what distinguishes a **vertical** re-key (from a fresh
+    /// NH the AMF supplied) from a **horizontal** one (from the current `KgNB`). Getting
+    /// that bit wrong makes the two ends derive different keys and every PDCP MAC on the
+    /// target fail, with nothing to say a key was the problem.
+    pub master_key_update: Option<MasterKeyUpdateParams>,
+}
+
+/// `masterKeyUpdate` as the network sets it and the UE reads it
+/// (TS 38.331 §6.3.2 `MasterKeyUpdate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasterKeyUpdateParams {
+    /// `keySetChangeIndicator`: `true` for a **vertical** derivation from a fresh NH,
+    /// `false` for a **horizontal** one from the current `KgNB`.
+    pub key_set_change_indicator: bool,
+    /// `nextHopChainingCount` (0..=7) the derivation chains on.
+    pub next_hop_chaining_count: u8,
 }
 
 /// Parsed RRC Reconfiguration data
@@ -65,6 +86,8 @@ pub struct RrcReconfigurationData {
     pub master_cell_group: Option<Vec<u8>>,
     /// Full configuration indicator
     pub full_config: bool,
+    /// `masterKeyUpdate`, when the message carried one (issue #39).
+    pub master_key_update: Option<MasterKeyUpdateParams>,
 }
 
 /// Build an RRC Reconfiguration message
@@ -131,7 +154,16 @@ fn build_v1530_extension(params: &RrcReconfigurationParams) -> RRCReconfiguratio
             None
         },
         dedicated_nas_message_list: None,
-        master_key_update: None,
+        master_key_update: params.master_key_update.map(|u| MasterKeyUpdate {
+            key_set_change_indicator: MasterKeyUpdateKeySetChangeIndicator(
+                u.key_set_change_indicator,
+            ),
+            next_hop_chaining_count: NextHopChainingCount(u.next_hop_chaining_count),
+            // The `nas-Container` carries an intra-5GC N2 handover's NAS security
+            // parameters. This gNB performs no NAS-level key change on handover, so
+            // sending one would describe a transform neither end applies.
+            nas_container: None,
+        }),
         dedicated_sib1_delivery: None,
         dedicated_system_information_delivery: None,
         other_config: None,
@@ -292,6 +324,8 @@ pub fn build_drb_reconfiguration_params(
         secondary_cell_group: None,
         master_cell_group: Some(master_cell_group),
         full_config: false,
+        // A DRB-establishing reconfiguration is not a handover, so the UE keeps its keys.
+        master_key_update: None,
     })
 }
 
@@ -379,14 +413,22 @@ pub fn parse_rrc_reconfiguration(
     // Extract secondary cell group
     let secondary_cell_group = ies.secondary_cell_group.as_ref().map(|scg| scg.0.clone());
 
-    // Extract master cell group and full_config from v1530 extension
-    let (master_cell_group, full_config) = if let Some(ref ext) = ies.non_critical_extension {
-        let mcg = ext.master_cell_group.as_ref().map(|m| m.0.clone());
-        let fc = ext.full_config.is_some();
-        (mcg, fc)
-    } else {
-        (None, false)
-    };
+    // Extract master cell group, full_config and masterKeyUpdate from the v1530 extension
+    let (master_cell_group, full_config, master_key_update) =
+        if let Some(ref ext) = ies.non_critical_extension {
+            let mcg = ext.master_cell_group.as_ref().map(|m| m.0.clone());
+            let fc = ext.full_config.is_some();
+            let mku = ext
+                .master_key_update
+                .as_ref()
+                .map(|u| MasterKeyUpdateParams {
+                    key_set_change_indicator: u.key_set_change_indicator.0,
+                    next_hop_chaining_count: u.next_hop_chaining_count.0,
+                });
+            (mcg, fc, mku)
+        } else {
+            (None, false, None)
+        };
 
     Ok(RrcReconfigurationData {
         rrc_transaction_id: rrc_reconfiguration.rrc_transaction_identifier.0,
@@ -394,6 +436,7 @@ pub fn parse_rrc_reconfiguration(
         secondary_cell_group,
         master_cell_group,
         full_config,
+        master_key_update,
     })
 }
 
@@ -578,6 +621,7 @@ mod tests {
             new_ue_identity: 1,
             t304_ms: 1000,
             full_config: true,
+            master_key_update: None,
         }
     }
 
@@ -680,6 +724,7 @@ mod tests {
             secondary_cell_group: None,
             master_cell_group: Some(vec![0x00, 0x01, 0x02]), // Sample cell group config
             full_config: false,
+            master_key_update: None,
         }
     }
 
@@ -714,6 +759,7 @@ mod tests {
             secondary_cell_group: None,
             master_cell_group: Some(vec![0xAA, 0xBB]),
             full_config: true,
+            master_key_update: None,
         };
 
         let msg = build_rrc_reconfiguration(&params).unwrap();
@@ -748,6 +794,7 @@ mod tests {
             secondary_cell_group: None,
             master_cell_group: None,
             full_config: false,
+            master_key_update: None,
         };
 
         let result = build_rrc_reconfiguration(&params);
@@ -1042,6 +1089,7 @@ mod tests {
             secondary_cell_group: None,
             master_cell_group: None,
             full_config: false,
+            master_key_update: None,
         })
         .expect("encode minimal RRCReconfiguration");
         assert_eq!(
@@ -1596,6 +1644,10 @@ pub struct HandoverCommandParams {
     /// `fullConfig`: the UE releases its stored configuration and applies this one
     /// whole.
     pub full_config: bool,
+    /// `masterKeyUpdate`: tells the UE to re-derive `KgNB*` for the target
+    /// (issue #39). `None` leaves the UE on its current keys, which is what this
+    /// simulator did before — and what made a handover lose forward security silently.
+    pub master_key_update: Option<MasterKeyUpdateParams>,
 }
 
 /// What a handover command carried.
@@ -1611,6 +1663,8 @@ pub struct HandoverCommandData {
     pub t304_ms: u16,
     /// Whether `fullConfig` was set
     pub full_config: bool,
+    /// `masterKeyUpdate`, when the command carried one.
+    pub master_key_update: Option<MasterKeyUpdateParams>,
 }
 
 /// Builds the `CellGroupConfig` carrying a `reconfigurationWithSync` for a
@@ -1701,6 +1755,7 @@ pub fn build_handover_command_params(
         secondary_cell_group: None,
         master_cell_group: Some(encode_rrc(&cgc)?),
         full_config: params.full_config,
+        master_key_update: params.master_key_update,
     })
 }
 
@@ -1735,5 +1790,6 @@ pub fn decode_handover_command(bytes: &[u8]) -> Option<HandoverCommandData> {
         // timer the network never set.
         t304_ms: t304_ms(sync.t304.0).ok()?,
         full_config: data.full_config,
+        master_key_update: data.master_key_update,
     })
 }

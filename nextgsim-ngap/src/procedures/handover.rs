@@ -9,8 +9,9 @@
 //! These procedures are used to manage UE handover between NG-RAN nodes.
 
 use crate::codec::generated::*;
-use crate::codec::{decode_ngap_pdu, encode_ngap_pdu, NgapCodecError};
+use crate::codec::{decode_aper, decode_ngap_pdu, encode_aper, encode_ngap_pdu, NgapCodecError};
 use crate::procedures::ng_setup::NgSetupFailureCause;
+use crate::procedures::pdu_session_resource::SnssaiValue;
 use thiserror::Error;
 
 /// Errors that can occur during Handover procedures
@@ -595,6 +596,61 @@ pub fn parse_handover_preparation_failure(
 // Handover Request (AMF -> Target gNB)
 // ============================================================================
 
+/// A PDU session the AMF asks the **target** to admit
+/// (`PDUSessionResourceSetupItemHOReq`, TS 38.413 §9.2.3.1; issue #39).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverRequestSetupItem {
+    /// PDU Session ID
+    pub pdu_session_id: u8,
+    /// S-NSSAI of the session
+    pub s_nssai: SnssaiValue,
+    /// The `handoverRequestTransfer`, which is an OCTET STRING **containing a
+    /// `PDUSessionResourceSetupRequestTransfer`** — the same container a normal PDU
+    /// Session Resource Setup carries.
+    ///
+    /// That is why the target can reuse its own setup path verbatim, including the
+    /// `SecurityIndication` handling issue #32 added: a handover-in is a session setup
+    /// whose QoS, tunnel and security policy arrive by a different route.
+    pub transfer: Vec<u8>,
+}
+
+/// The AS security context the AMF hands the target on handover
+/// (`SecurityContext`, TS 38.413 §9.3.1.28; TS 33.501 §6.9.2.3.1).
+///
+/// The `next_hop_chaining_count` is what decides whether the target derives its
+/// `KgNB*` **vertically** (from `next_hop_nh`, forward-secure) or **horizontally**
+/// (from the `KgNB` it already has). Both fields are mandatory in the IE, so a
+/// received context always carries an NH — but an NCC the target has seen before means
+/// that NH is not fresh, and using it anyway would claim forward security the AMF did
+/// not provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoverSecurityContext {
+    /// `nextHopChainingCount` (0..=7).
+    pub next_hop_chaining_count: u8,
+    /// The 256-bit NH.
+    pub next_hop_nh: [u8; 32],
+}
+
+impl std::fmt::Display for HandoverSecurityContext {
+    /// Prints the NCC and whether the NH is all zeros — never the key itself.
+    ///
+    /// "All zeros" is worth showing because it is the exact symptom of a peer that
+    /// ships a stale, never-incremented context, and printing the key would put it in
+    /// every handover log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SecurityContext {{ ncc: {}, nh: {} }}",
+            self.next_hop_chaining_count,
+            if self.next_hop_nh == [0u8; 32] {
+                "<all zeros>"
+            } else {
+                "<redacted>"
+            }
+        )
+    }
+}
+
 /// Parsed Handover Request data
 #[derive(Debug, Clone)]
 pub struct HandoverRequestData {
@@ -606,6 +662,18 @@ pub struct HandoverRequestData {
     pub cause: HandoverCause,
     /// Source to Target Transparent Container (opaque bytes)
     pub source_to_target_transparent_container: Vec<u8>,
+    /// The PDU sessions the AMF asks this target to admit (issue #39).
+    ///
+    /// Empty is legal on the wire but means the target has nothing to allocate, so the
+    /// handover would carry no user plane. Before this the IE was not parsed at all and
+    /// the gNB admitted a hardcoded session 1.
+    pub pdu_sessions: Vec<HandoverRequestSetupItem>,
+    /// The AS security context to chain the target's `KgNB*` from.
+    ///
+    /// `Option` because a peer may omit it, and the distinction matters: with no
+    /// context the target cannot re-key at all and must say so, rather than deriving
+    /// from a zero NH it invented.
+    pub security_context: Option<HandoverSecurityContext>,
 }
 
 /// Parse a Handover Request from an NGAP PDU
@@ -634,6 +702,8 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
     let mut handover_type: Option<HandoverTypeValue> = None;
     let mut cause: Option<HandoverCause> = None;
     let mut source_to_target_transparent_container: Option<Vec<u8>> = None;
+    let mut pdu_sessions: Vec<HandoverRequestSetupItem> = Vec::new();
+    let mut security_context: Option<HandoverSecurityContext> = None;
 
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
@@ -651,6 +721,12 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
             ) => {
                 source_to_target_transparent_container = Some(container.0.clone());
             }
+            HandoverRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListHOReq(list) => {
+                pdu_sessions = parse_setup_list_ho_req(list);
+            }
+            HandoverRequestProtocolIEs_EntryValue::Id_SecurityContext(ctx) => {
+                security_context = parse_handover_security_context(ctx);
+            }
             _ => {}
         }
     }
@@ -664,6 +740,310 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
         source_to_target_transparent_container: source_to_target_transparent_container.ok_or_else(
             || HandoverError::MissingMandatoryIe("SourceToTarget-TransparentContainer".to_string()),
         )?,
+        pdu_sessions,
+        security_context,
+    })
+}
+
+// ============================================================================
+// Source to Target NG-RAN Node Transparent Container (TS 38.413 §9.3.1.20)
+// ============================================================================
+
+/// What the source NG-RAN node puts in the container the AMF passes to the target
+/// (TS 38.413 §9.3.1.20, issue #39).
+///
+/// The AMF never looks inside; the **target** decodes it. Before this the source sent
+/// `vec![0x00]`, so a target learned nothing about the UE it was being handed — not the
+/// cell it was meant to be, not the UE's capabilities, not where it had been.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceToTargetContainerParams {
+    /// The `RRCContainer`, carrying a UPER `HandoverPreparationInformation`
+    /// (`nextgsim_rrc::procedures::handover_preparation`).
+    pub rrc_container: Vec<u8>,
+    /// The cell the source is handing the UE **to**.
+    pub target_cell: NrCgiValue,
+    /// The cell the UE is **on**, for the UE history.
+    pub source_cell: NrCgiValue,
+    /// How long the UE has been on the source cell, in seconds (0..=4095).
+    ///
+    /// Mandatory in `LastVisitedNGRANCellInformation` and genuinely known: the source
+    /// gNB has held this UE's context since it connected. Values above the range are
+    /// clamped, because §9.3.1.20 caps it and a UE that has been camped for longer is
+    /// reported as "at least this long" rather than refused.
+    pub time_in_source_cell_s: u16,
+}
+
+/// What the target reads out of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceToTargetContainerData {
+    /// The `RRCContainer` bytes.
+    pub rrc_container: Vec<u8>,
+    /// The cell the source intended as the target.
+    pub target_cell: NrCgiValue,
+    /// The cells the UE has visited, most recent first, when the source reported any.
+    pub visited_cells: Vec<NrCgiValue>,
+}
+
+/// The largest `timeUEStayedInCell` the IE can carry (TS 38.413 §9.3.1.20).
+pub const MAX_TIME_UE_STAYED_IN_CELL_S: u16 = 4095;
+
+fn nr_cgi_to_asn(cgi: &NrCgiValue) -> NR_CGI {
+    let mut bits: bitvec::vec::BitVec<u8, bitvec::order::Msb0> =
+        bitvec::vec::BitVec::with_capacity(36);
+    for i in (0..36).rev() {
+        bits.push((cgi.nr_cell_identity >> i) & 1 == 1);
+    }
+    NR_CGI {
+        plmn_identity: PLMNIdentity(cgi.plmn_identity.to_vec()),
+        nr_cell_identity: NRCellIdentity(bits),
+        ie_extensions: None,
+    }
+}
+
+fn nr_cgi_from_asn(cgi: &NR_CGI) -> NrCgiValue {
+    let mut plmn = [0u8; 3];
+    for (i, b) in cgi.plmn_identity.0.iter().take(3).enumerate() {
+        plmn[i] = *b;
+    }
+    NrCgiValue {
+        plmn_identity: plmn,
+        nr_cell_identity: cgi
+            .nr_cell_identity
+            .0
+            .iter()
+            .fold(0u64, |acc, b| (acc << 1) | u64::from(*b)),
+    }
+}
+
+/// Encode a `SourceNGRANNode-ToTargetNGRANNode-TransparentContainer`.
+pub fn encode_source_to_target_container(
+    params: &SourceToTargetContainerParams,
+) -> Result<Vec<u8>, HandoverError> {
+    let container = SourceNGRANNode_ToTargetNGRANNode_TransparentContainer {
+        rrc_container: RRCContainer(params.rrc_container.clone()),
+        // Per-session information is already in the `PDUSessionResourceListHORqd` of the
+        // HANDOVER REQUIRED itself; repeating it here would give a target two lists to
+        // reconcile, and §9.3.1.20 makes this one optional for that reason.
+        pdu_session_resource_information_list: None,
+        e_rab_information_list: None,
+        target_cell_id: NGRAN_CGI::NR_CGI(nr_cgi_to_asn(&params.target_cell)),
+        index_to_rfsp: None,
+        ue_history_information: UEHistoryInformation(vec![LastVisitedCellItem {
+            last_visited_cell_information: LastVisitedCellInformation::NGRANCell(
+                LastVisitedNGRANCellInformation {
+                    global_cell_id: NGRAN_CGI::NR_CGI(nr_cgi_to_asn(&params.source_cell)),
+                    cell_type: CellType {
+                        // `large` -- the widest `CellSize` this schema offers -- because
+                        // this simulator's cells have no coverage model, and a target
+                        // that read `verysmall` might weight the UE's history
+                        // differently for no reason.
+                        cell_size: CellSize(CellSize::LARGE),
+                        ie_extensions: None,
+                    },
+                    time_ue_stayed_in_cell: TimeUEStayedInCell(
+                        params
+                            .time_in_source_cell_s
+                            .min(MAX_TIME_UE_STAYED_IN_CELL_S),
+                    ),
+                    time_ue_stayed_in_cell_enhanced_granularity: None,
+                    ho_cause_value: None,
+                    ie_extensions: None,
+                },
+            ),
+            ie_extensions: None,
+        }]),
+        ie_extensions: None,
+    };
+    Ok(encode_aper(&container)?)
+}
+
+/// Decode a `SourceNGRANNode-ToTargetNGRANNode-TransparentContainer`.
+///
+/// A non-NR target cell yields an error rather than a zeroed CGI: an NR target handed a
+/// cell identity it cannot read must fail the handover, not admit the UE onto a cell it
+/// guessed at.
+pub fn decode_source_to_target_container(
+    bytes: &[u8],
+) -> Result<SourceToTargetContainerData, HandoverError> {
+    let container: SourceNGRANNode_ToTargetNGRANNode_TransparentContainer = decode_aper(bytes)?;
+    let target_cell = match &container.target_cell_id {
+        NGRAN_CGI::NR_CGI(cgi) => nr_cgi_from_asn(cgi),
+        _ => {
+            return Err(HandoverError::MissingMandatoryIe(
+                "targetCell-ID is not an NR-CGI".to_string(),
+            ))
+        }
+    };
+    let visited_cells = container
+        .ue_history_information
+        .0
+        .iter()
+        .filter_map(|item| match &item.last_visited_cell_information {
+            LastVisitedCellInformation::NGRANCell(cell) => match &cell.global_cell_id {
+                NGRAN_CGI::NR_CGI(cgi) => Some(nr_cgi_from_asn(cgi)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    Ok(SourceToTargetContainerData {
+        rrc_container: container.rrc_container.0,
+        target_cell,
+        visited_cells,
+    })
+}
+
+/// Parameters for building a Handover Request (the **AMF** side).
+///
+/// Present so this repo can drive its own target-side handler end to end and round-trip
+/// the IEs issue #39 added. nextgsim contains no AMF, so nothing in production builds
+/// one — but a target-side handler with no way to be fed a real HANDOVER REQUEST is
+/// exactly how `vec![0x00]` survived as an acknowledge transfer.
+#[derive(Debug, Clone)]
+pub struct HandoverRequestParams {
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: u64,
+    /// Handover type
+    pub handover_type: HandoverTypeValue,
+    /// Cause for the handover
+    pub cause: HandoverCause,
+    /// Source to Target Transparent Container
+    pub source_to_target_transparent_container: Vec<u8>,
+    /// The PDU sessions the target is asked to admit
+    pub pdu_sessions: Vec<HandoverRequestSetupItem>,
+    /// The AS security context to chain from
+    pub security_context: Option<HandoverSecurityContext>,
+}
+
+/// Build a Handover Request (AMF → target gNB, TS 38.413 §8.4.2.1).
+pub fn build_handover_request(params: &HandoverRequestParams) -> Result<NGAP_PDU, HandoverError> {
+    let mut protocol_ies = vec![
+        HandoverRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+            criticality: Criticality(Criticality::REJECT),
+            value: HandoverRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(
+                params.amf_ue_ngap_id,
+            )),
+        },
+        HandoverRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_HANDOVER_TYPE),
+            criticality: Criticality(Criticality::REJECT),
+            value: HandoverRequestProtocolIEs_EntryValue::Id_HandoverType(
+                params.handover_type.into(),
+            ),
+        },
+        HandoverRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CAUSE),
+            criticality: Criticality(Criticality::IGNORE),
+            value: HandoverRequestProtocolIEs_EntryValue::Id_Cause(build_cause(&params.cause)),
+        },
+        HandoverRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER),
+            criticality: Criticality(Criticality::REJECT),
+            value: HandoverRequestProtocolIEs_EntryValue::Id_SourceToTarget_TransparentContainer(
+                SourceToTarget_TransparentContainer(
+                    params.source_to_target_transparent_container.clone(),
+                ),
+            ),
+        },
+    ];
+
+    if !params.pdu_sessions.is_empty() {
+        let items: Vec<PDUSessionResourceSetupItemHOReq> = params
+            .pdu_sessions
+            .iter()
+            .map(|s| PDUSessionResourceSetupItemHOReq {
+                pdu_session_id: PDUSessionID(s.pdu_session_id),
+                s_nssai: S_NSSAI {
+                    sst: SST(vec![s.s_nssai.sst]),
+                    sd: s.s_nssai.sd.map(|sd| SD(sd.to_vec())),
+                    ie_extensions: None,
+                },
+                handover_request_transfer: PDUSessionResourceSetupItemHOReqHandoverRequestTransfer(
+                    s.transfer.clone(),
+                ),
+                ie_extensions: None,
+            })
+            .collect();
+        protocol_ies.push(HandoverRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ),
+            criticality: Criticality(Criticality::REJECT),
+            value: HandoverRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListHOReq(
+                PDUSessionResourceSetupListHOReq(items),
+            ),
+        });
+    }
+
+    if let Some(ctx) = params.security_context {
+        let mut nh_bits: bitvec::vec::BitVec<u8, bitvec::order::Msb0> =
+            bitvec::vec::BitVec::with_capacity(256);
+        for byte in ctx.next_hop_nh {
+            for bit in (0..8).rev() {
+                nh_bits.push((byte >> bit) & 1 == 1);
+            }
+        }
+        protocol_ies.push(HandoverRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_SECURITY_CONTEXT),
+            criticality: Criticality(Criticality::REJECT),
+            value: HandoverRequestProtocolIEs_EntryValue::Id_SecurityContext(SecurityContext {
+                next_hop_chaining_count: NextHopChainingCount(ctx.next_hop_chaining_count),
+                next_hop_nh: SecurityKey(nh_bits),
+                ie_extensions: None,
+            }),
+        });
+    }
+
+    Ok(NGAP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_HANDOVER_RESOURCE_ALLOCATION),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_HandoverResourceAllocation(HandoverRequest {
+            protocol_i_es: HandoverRequestProtocolIEs(protocol_ies),
+        }),
+    }))
+}
+
+/// Read the requested PDU sessions out of a `PDUSessionResourceSetupListHOReq`.
+fn parse_setup_list_ho_req(
+    list: &PDUSessionResourceSetupListHOReq,
+) -> Vec<HandoverRequestSetupItem> {
+    list.0
+        .iter()
+        .map(|item| HandoverRequestSetupItem {
+            pdu_session_id: item.pdu_session_id.0,
+            s_nssai: SnssaiValue {
+                sst: item.s_nssai.sst.0.first().copied().unwrap_or(0),
+                sd: item
+                    .s_nssai
+                    .sd
+                    .as_ref()
+                    .and_then(|sd| sd.0.as_slice().try_into().ok()),
+            },
+            transfer: item.handover_request_transfer.0.clone(),
+        })
+        .collect()
+}
+
+/// Read a `SecurityContext`, or `None` when the NH is not a 256-bit key.
+///
+/// A wrong-width NH is refused rather than padded: the target would derive a `KgNB*`
+/// from bytes the AMF never sent, and every PDCP MAC on the target would fail with no
+/// indication that a key was the problem.
+fn parse_handover_security_context(ctx: &SecurityContext) -> Option<HandoverSecurityContext> {
+    let bits = &ctx.next_hop_nh.0;
+    if bits.len() != 256 {
+        return None;
+    }
+    let mut nh = [0u8; 32];
+    for (i, byte) in nh.iter_mut().enumerate() {
+        let mut v = 0u8;
+        for bit in 0..8 {
+            v = (v << 1) | u8::from(bits[i * 8 + bit]);
+        }
+        *byte = v;
+    }
+    Some(HandoverSecurityContext {
+        next_hop_chaining_count: ctx.next_hop_chaining_count.0,
+        next_hop_nh: nh,
     })
 }
 
@@ -1912,5 +2292,250 @@ mod tests {
             let back: HandoverTypeValue = HandoverTypeValue::try_from(&converted).unwrap();
             assert_eq!(ht, back);
         }
+    }
+
+    // ========================================================================
+    // Handover Request: the requested session list and security context (#39)
+    // ========================================================================
+
+    fn ho_request_params() -> HandoverRequestParams {
+        use crate::procedures::transfer::{
+            encode_setup_request_transfer, GtpTunnelInfo, QosFlowSetupInfo,
+            SetupRequestTransferData,
+        };
+        let transfer = |teid: u32, qfi: u8| {
+            encode_setup_request_transfer(&SetupRequestTransferData {
+                ambr_dl: Some(1_000_000),
+                ambr_ul: Some(1_000_000),
+                ul_tunnel: GtpTunnelInfo {
+                    address: "10.45.0.1".parse().unwrap(),
+                    teid,
+                },
+                pdu_session_type: 0,
+                qos_flows: vec![QosFlowSetupInfo {
+                    qfi,
+                    five_qi: Some(9),
+                    arp_priority_level: 8,
+                }],
+                security_indication: None,
+            })
+            .expect("encode the inner setup transfer")
+        };
+        HandoverRequestParams {
+            amf_ue_ngap_id: 4242,
+            handover_type: HandoverTypeValue::Intra5gs,
+            cause: HandoverCause::RadioNetwork(RadioNetworkCause::HandoverDesirableForRadioReason),
+            source_to_target_transparent_container: vec![0x11, 0x22, 0x33],
+            pdu_sessions: vec![
+                HandoverRequestSetupItem {
+                    pdu_session_id: 5,
+                    s_nssai: SnssaiValue {
+                        sst: 1,
+                        sd: Some([0x00, 0x00, 0x7B]),
+                    },
+                    transfer: transfer(0x1111, 1),
+                },
+                HandoverRequestSetupItem {
+                    pdu_session_id: 6,
+                    s_nssai: SnssaiValue { sst: 2, sd: None },
+                    transfer: transfer(0x2222, 9),
+                },
+            ],
+            security_context: Some(HandoverSecurityContext {
+                next_hop_chaining_count: 3,
+                next_hop_nh: [0xA5; 32],
+            }),
+        }
+    }
+
+    /// #39, criterion 1: the requested PDU Session Resource Setup List reaches the
+    /// parsed data, per session, with its S-NSSAI and its inner transfer intact.
+    ///
+    /// **Two** sessions with different ids, S-NSSAIs and transfers, because a parser
+    /// that returned the first item twice — or the hardcoded session 1 this replaces —
+    /// would satisfy a single-session test.
+    #[test]
+    fn the_requested_pdu_session_list_reaches_the_parsed_handover_request() {
+        use crate::procedures::transfer::decode_setup_request_transfer;
+
+        let params = ho_request_params();
+        let pdu = build_handover_request(&params).expect("build");
+        let data = parse_handover_request(&pdu).expect("parse");
+
+        assert_eq!(data.pdu_sessions.len(), 2);
+        assert_eq!(data.pdu_sessions, params.pdu_sessions);
+        assert_eq!(data.pdu_sessions[0].pdu_session_id, 5);
+        assert_eq!(data.pdu_sessions[1].pdu_session_id, 6);
+        assert_eq!(data.pdu_sessions[0].s_nssai.sd, Some([0x00, 0x00, 0x7B]));
+        assert_eq!(
+            data.pdu_sessions[1].s_nssai.sd, None,
+            "an absent SD must stay absent, not become zeros"
+        );
+
+        // The inner transfer is a real `PDUSessionResourceSetupRequestTransfer`, which
+        // is what lets the target reuse its own setup path verbatim.
+        let inner = decode_setup_request_transfer(&data.pdu_sessions[0].transfer)
+            .expect("the handoverRequestTransfer CONTAINS a setup request transfer");
+        assert_eq!(inner.ul_tunnel.teid, 0x1111);
+        assert_eq!(inner.qos_flows[0].qfi, 1);
+        let inner2 = decode_setup_request_transfer(&data.pdu_sessions[1].transfer).expect("decode");
+        assert_eq!(
+            inner2.ul_tunnel.teid, 0x2222,
+            "each session carries its OWN transfer"
+        );
+    }
+
+    /// #39: the `SecurityContext` reaches the parsed data with both fields, and an
+    /// absent one is `None` rather than a zero NH.
+    #[test]
+    fn the_security_context_reaches_the_parsed_handover_request() {
+        let params = ho_request_params();
+        let data = parse_handover_request(&build_handover_request(&params).unwrap()).unwrap();
+        assert_eq!(
+            data.security_context,
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 3,
+                next_hop_nh: [0xA5; 32],
+            }),
+            "the NCC decides vertical vs horizontal and the NH is what vertical chains \
+             from; losing either loses forward security"
+        );
+
+        let mut without = ho_request_params();
+        without.security_context = None;
+        let data = parse_handover_request(&build_handover_request(&without).unwrap()).unwrap();
+        assert_eq!(
+            data.security_context, None,
+            "no context must be None, not a zero NH the target would derive from"
+        );
+    }
+
+    /// A HANDOVER REQUIRED with an **empty** PDU session list encodes but does **not
+    /// decode**, which is why the gNB refuses to build one.
+    ///
+    /// `PDUSessionResourceListHORqd` is `SIZE(1..maxnoofPDUSessions)`: the encoder emits a
+    /// length prefix the decoder cannot then satisfy, so the message reaches the wire and
+    /// no peer can read it. Pinned here rather than left as a comment on the gNB's
+    /// refusal, because it is the *reason* for that refusal and it is a property of this
+    /// codec — found by a gNB test failing for exactly this.
+    #[test]
+    fn a_handover_required_with_no_sessions_encodes_but_does_not_decode() {
+        use crate::codec::{decode_ngap_pdu, encode_ngap_pdu};
+        let mut params = HandoverRequiredParams {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 1,
+            handover_type: HandoverTypeValue::Intra5gs,
+            cause: HandoverCause::RadioNetwork(RadioNetworkCause::HandoverDesirableForRadioReason),
+            target_id: TargetIdValue::TargetRanNodeId {
+                global_ran_node_id: vec![0, 0, 0, 1],
+                selected_tai: TaiValue {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    tac: [0, 0, 1],
+                },
+            },
+            direct_forwarding_path_availability: None,
+            pdu_session_resource_list: Vec::new(),
+            source_to_target_transparent_container: vec![0x11],
+        };
+        let bytes = encode_ngap_pdu(&build_handover_required(&params).expect("build"))
+            .expect("the encoder does NOT refuse an empty list, which is the trap");
+        assert!(
+            decode_ngap_pdu(&bytes).is_err(),
+            "an empty PDUSessionResourceListHORqd produces an undecodable message, so a \
+             sender must refuse it rather than putting it on the wire"
+        );
+
+        // The positive control: one session encodes AND decodes, so the failure above is
+        // about the empty list and not about these params.
+        params.pdu_session_resource_list = vec![PduSessionResourceHoRequiredItem {
+            pdu_session_id: 5,
+            handover_required_transfer: vec![0x00],
+        }];
+        let bytes = encode_ngap_pdu(&build_handover_required(&params).expect("build")).unwrap();
+        let decoded = parse_handover_required(&decode_ngap_pdu(&bytes).expect("decode")).unwrap();
+        assert_eq!(decoded.pdu_session_resource_list.len(), 1);
+    }
+
+    /// An NH that is not 256 bits yields **no** security context, rather than one
+    /// zero-padded from whatever arrived.
+    ///
+    /// A revert round that padded it stayed green, because the round-trip test above only
+    /// ever supplies a correct NH — so nothing covered the refusal. A padded NH makes the
+    /// target derive a `KgNB*` from bytes the AMF never sent, and every PDCP MAC on the
+    /// target then fails with no indication that a key was the problem.
+    #[test]
+    fn an_nh_that_is_not_256_bits_yields_no_security_context() {
+        for width in [0usize, 8, 128, 255, 257, 512] {
+            let ctx = SecurityContext {
+                next_hop_chaining_count: NextHopChainingCount(3),
+                next_hop_nh: SecurityKey(bitvec::vec::BitVec::repeat(true, width)),
+                ie_extensions: None,
+            };
+            assert_eq!(
+                parse_handover_security_context(&ctx),
+                None,
+                "a {width}-bit NH must be refused, not padded to 256"
+            );
+        }
+        // The positive control: exactly 256 bits is accepted, so the refusals above are
+        // about the width and not about the function always returning None.
+        let ctx = SecurityContext {
+            next_hop_chaining_count: NextHopChainingCount(3),
+            next_hop_nh: SecurityKey(bitvec::vec::BitVec::repeat(true, 256)),
+            ie_extensions: None,
+        };
+        assert_eq!(
+            parse_handover_security_context(&ctx),
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 3,
+                next_hop_nh: [0xFF; 32],
+            })
+        );
+    }
+
+    /// A handover with no requested sessions parses to an empty list rather than
+    /// failing, and rather than the hardcoded session it used to admit.
+    #[test]
+    fn a_handover_request_with_no_sessions_parses_to_an_empty_list() {
+        let mut params = ho_request_params();
+        params.pdu_sessions.clear();
+        let data = parse_handover_request(&build_handover_request(&params).unwrap()).unwrap();
+        assert!(
+            data.pdu_sessions.is_empty(),
+            "no requested sessions means nothing to admit -- the target must not invent one"
+        );
+        // The mandatory IEs still arrive, so the handover itself is well-formed.
+        assert_eq!(data.amf_ue_ngap_id, 4242);
+        assert_eq!(
+            data.source_to_target_transparent_container,
+            vec![0x11, 0x22, 0x33]
+        );
+    }
+
+    /// The `HandoverSecurityContext` display never prints the key, and does flag an
+    /// all-zero NH — the exact symptom of a peer shipping a stale context.
+    #[test]
+    fn the_security_context_display_flags_a_zero_nh_and_never_prints_the_key() {
+        let real = HandoverSecurityContext {
+            next_hop_chaining_count: 5,
+            next_hop_nh: [0xA5; 32],
+        };
+        let text = format!("{real}");
+        assert!(text.contains("ncc: 5"));
+        assert!(
+            text.contains("redacted"),
+            "the NH must never be printed: {text}"
+        );
+        assert!(!text.contains("a5") && !text.contains("165"));
+
+        let stale = HandoverSecurityContext {
+            next_hop_chaining_count: 0,
+            next_hop_nh: [0u8; 32],
+        };
+        assert!(
+            format!("{stale}").contains("all zeros"),
+            "an all-zero NH must be visible in a log: it is what a never-incremented \
+             peer context looks like"
+        );
     }
 }

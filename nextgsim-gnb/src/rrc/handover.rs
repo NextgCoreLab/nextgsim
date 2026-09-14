@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use nextgsim_rrc::procedures::measurement_report::{decode_measurement_report, rsrp_range_to_dbm};
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
-    encode_handover_command, HandoverCommandParams,
+    encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::SIMULATED_C_RNTI;
 use tracing::{debug, info, warn};
@@ -1062,10 +1062,31 @@ impl DapsRrcReconfiguration {
             new_ue_identity: self.target_cell_config.crnti,
             t304_ms: nearest_enumerated_t304_ms(self.t304_daps_ms),
             full_config: true,
+            // `masterKeyUpdate` with `keySetChangeIndicator: false` — a HORIZONTAL
+            // re-key from the UE's current `KgNB` (TS 38.331 §5.3.5.7, TS 33.501
+            // §6.9.2.3.1, issue #39). Horizontal because an intra-gNB handover has no
+            // fresh NH: a vertical one needs the AMF's `{NH, NCC}`, which only arrives
+            // in a HANDOVER REQUEST or a PATH SWITCH REQUEST ACKNOWLEDGE.
+            //
+            // Present rather than omitted, which is the change: omitting it leaves the
+            // UE on the source cell's keys, so a handover would silently keep a key the
+            // source gNB holds — the forward-security loss this issue reports.
+            master_key_update: Some(MasterKeyUpdateParams {
+                key_set_change_indicator: false,
+                next_hop_chaining_count: HORIZONTAL_NCC,
+            }),
         })
         .ok()
     }
 }
+
+/// The `nextHopChainingCount` a horizontal re-key reports (TS 33.501 §6.9.2.3.1).
+///
+/// Zero, and that is the spec's own value rather than a placeholder: a horizontal
+/// derivation does not consume a fresh NH, so the chaining count does not advance. The
+/// UE compares it against the NCC it holds and derives horizontally when they match —
+/// which is exactly what this gNB means.
+const HORIZONTAL_NCC: u8 = 0;
 
 /// The `t304` this gNB uses for a handover command, in milliseconds.
 ///
@@ -1142,6 +1163,19 @@ impl HandoverCommand {
             // per-target delta, so a delta-on-nothing would leave the UE merging
             // into a configuration the target never described.
             full_config: true,
+            // `masterKeyUpdate` with `keySetChangeIndicator: false` — a HORIZONTAL
+            // re-key from the UE's current `KgNB` (TS 38.331 §5.3.5.7, TS 33.501
+            // §6.9.2.3.1, issue #39). Horizontal because an intra-gNB handover has no
+            // fresh NH: a vertical one needs the AMF's `{NH, NCC}`, which only arrives
+            // in a HANDOVER REQUEST or a PATH SWITCH REQUEST ACKNOWLEDGE.
+            //
+            // Present rather than omitted, which is the change: omitting it leaves the
+            // UE on the source cell's keys, so a handover would silently keep a key the
+            // source gNB holds — the forward-security loss this issue reports.
+            master_key_update: Some(MasterKeyUpdateParams {
+                key_set_change_indicator: false,
+                next_hop_chaining_count: HORIZONTAL_NCC,
+            }),
         })
         .ok()
     }
