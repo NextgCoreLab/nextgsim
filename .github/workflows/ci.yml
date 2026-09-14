@@ -119,6 +119,25 @@ jobs:
           cargo clippy -p nextgsim-nwdaf --features model-registry --all-targets
           cargo clippy -p nextgsim-semantic --features model-registry --all-targets
 
+  uuaa-mm:
+    name: UUAA-MM (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `uuaa-mm` feature (issue #58) is off by default, so the
+      # default-feature jobs above compile the UE with UUAA uplink initiation
+      # disabled. This job compiles and tests the enabled arm -- the one that
+      # puts a Service-level-AA container on the wire.
+      - name: cargo test (uuaa-mm on)
+        run: cargo test -p nextgsim-ue --features uuaa-mm
+      - name: cargo clippy
+        run: cargo clippy -p nextgsim-ue --features uuaa-mm --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

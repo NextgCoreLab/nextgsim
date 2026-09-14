@@ -12,6 +12,13 @@ default = []
 # In-process topic pub/sub bus for cross-cutting 6G observations (issue #16).
 # Off by default; forwards to nextgsim-common's own feature.
 event-bus = ["nextgsim-common/event-bus"]
+# UUAA-MM: originate UAS service-level authentication over UL NAS TRANSPORT
+# (issue #58, TS 23.256 §5.2.2). Off by default, so the default build keeps the
+# registration-marker-only behaviour. The gate is on ORIGINATING an exchange,
+# not on decoding one: a Service-level-AA container the network sends is always
+# understood and applied, because a UE that ignored a revocation because a cargo
+# feature was off would keep flying on a withdrawn authorization.
+uuaa-mm = []
 
 [lints]
 workspace = true

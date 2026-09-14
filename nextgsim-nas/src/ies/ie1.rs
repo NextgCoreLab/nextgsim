@@ -274,6 +274,11 @@ pub enum PayloadContainerType {
     UePolicyContainer = 0b0101,
     /// UE parameters update transparent container
     UeParametersUpdateTransparentContainer = 0b0110,
+    /// Service-level-AA container. The payload container contents are coded the
+    /// same way as a Service-level-AA container's contents (TS 24.501
+    /// §9.11.2.10) — see [`crate::ies::service_level_aa`] — and this is the
+    /// transport UUAA-MM uses (TS 23.256 §5.2.2).
+    ServiceLevelAa = 0b1001,
     /// Multiple payloads
     MultiplePayloads = 0b1111,
 }
