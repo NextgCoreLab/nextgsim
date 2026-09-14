@@ -182,6 +182,29 @@ pub struct GnbConfig {
     /// NTN (Non-Terrestrial Network) configuration (optional)
     #[serde(default)]
     pub ntn_config: Option<NtnConfig>,
+    /// Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
+    /// protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4, issue #31).
+    ///
+    /// **`false` by default**, which is a deliberate deviation from #31's own
+    /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
+    /// rule already carves out: default-ON *except where the behaviour drops
+    /// traffic*. Turning this on drops **all** UL-DCCH traffic today, because the
+    /// gNB's uplink dispatcher still routes on `bytes[0] & 0x0F` of the RAW PDU
+    /// (`C5_TYPED_DCCH_DISPATCH` is `false`), and a ciphered PDU has no meaningful
+    /// leading nibble. Enabling it by default therefore requires the C5 typed
+    /// dispatch flip as well, which is a separate call about when the peer UE is a
+    /// conformant typed peer.
+    ///
+    /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
+    /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
+    /// §5.3.4.2), the UE verifies it before replying, and every subsequent SRB1
+    /// PDU is integrity-protected and ciphered in both directions. A PDU failing
+    /// integrity is discarded.
+    ///
+    /// Both the gNB and the UE must be set the same way. A gNB with it on and a UE
+    /// with it off would have the UE read a MAC-I as message content.
+    #[serde(default)]
+    pub as_security_enabled: bool,
     /// Idle-mode cell reselection parameters this cell broadcasts in SIB2/SIB3/
     /// SIB4 (TS 38.331 §6.3.1, TS 38.304 §5.2.4.6). Issue #50.
     ///
@@ -391,6 +414,7 @@ impl Default for GnbConfig {
             scell_phys_cell_id: None,
             pqc_config: PqcConfig::default(),
             ntn_config: None,
+            as_security_enabled: false,
             reselection: CellReselectionBroadcastConfig::default(),
             mbs_enabled: false,
             prose_enabled: false,
@@ -1600,6 +1624,29 @@ pub struct UeConfig {
     /// neighbour worth going to crosses it and a marginal one does not.
     #[serde(default = "default_eutra_b1_threshold_dbm")]
     pub eutra_b1_threshold_dbm: i32,
+    /// Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
+    /// protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4, issue #31).
+    ///
+    /// **`false` by default**, which is a deliberate deviation from #31's own
+    /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
+    /// rule already carves out: default-ON *except where the behaviour drops
+    /// traffic*. Turning this on drops **all** UL-DCCH traffic today, because the
+    /// gNB's uplink dispatcher still routes on `bytes[0] & 0x0F` of the RAW PDU
+    /// (`C5_TYPED_DCCH_DISPATCH` is `false`), and a ciphered PDU has no meaningful
+    /// leading nibble. Enabling it by default therefore requires the C5 typed
+    /// dispatch flip as well, which is a separate call about when the peer UE is a
+    /// conformant typed peer.
+    ///
+    /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
+    /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
+    /// §5.3.4.2), the UE verifies it before replying, and every subsequent SRB1
+    /// PDU is integrity-protected and ciphered in both directions. A PDU failing
+    /// integrity is discarded.
+    ///
+    /// Both the gNB and the UE must be set the same way. A gNB with it on and a UE
+    /// with it off would have the UE read a MAC-I as message content.
+    #[serde(default)]
+    pub as_security_enabled: bool,
     /// Keep the network-assigned UE radio capability ID (RACS, Rel-16
     /// TS 23.003 §29 / TS 24.501 §9.11.3.68) that a CONFIGURATION UPDATE
     /// COMMAND assigns.
@@ -1729,6 +1776,7 @@ impl Default for UeConfig {
             plmn_user_preferred: Vec::new(),
             plmn_operator_preferred: Vec::new(),
             plmn_hp_search_interval_secs: None,
+            as_security_enabled: false,
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use super::redcap::RedCapProcessor;
 use super::transaction::RrcTransactionAllocator;
 use crate::tasks::GutiMobileIdentity;
+use nextgsim_pdcp::srb_security::SrbSecurity;
 
 /// RRC connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,12 +57,23 @@ impl std::fmt::Display for RrcState {
 /// before.
 #[derive(Clone)]
 pub struct ReestablishmentSecurity {
-    /// K_RRCint (128-bit) of this UE's source PCell — what the `shortMAC-I` is
-    /// computed with.
+    /// K_RRCint (128-bit) of this UE's source PCell — what the `shortMAC-I` and
+    /// the SRB PDCP MAC-I are computed with.
     pub k_rrc_int: [u8; 16],
+    /// K_RRCenc (128-bit) — SRB PDCP ciphering (issue #31).
+    ///
+    /// Added alongside `k_rrc_int` because the RRC plane is where SRB1 PDUs are
+    /// sent and received, so it is the plane that has to cipher and decipher them.
+    /// Before this the RRC task could verify a `shortMAC-I` and could not protect a
+    /// single PDU.
+    pub k_rrc_enc: [u8; 16],
     /// Selected NR integrity algorithm identity (0 = NIA0 … 3 = NIA3). Must be
     /// the same identity the UE used, or the MAC-I will not match.
     pub integrity_alg_id: u8,
+    /// Selected NR ciphering algorithm identity (0 = NEA0 … 3 = NEA3). Must be the
+    /// same identity the UE used, or the keystreams diverge and every PDU fails
+    /// integrity for the wrong reason.
+    pub ciphering_alg_id: u8,
     /// The C-RNTI the UE will present in an `RRCReestablishmentRequest`.
     ///
     /// This simulator has no MAC layer and therefore no C-RNTI allocation, so
@@ -127,6 +139,27 @@ pub struct RrcUeContext {
     /// re-establishment then falls back to `RRCSetup` — a context the network
     /// cannot verify is a context it must not restore.
     pub reestablishment_security: Option<ReestablishmentSecurity>,
+    /// Whether AS security is ACTIVE for this UE, i.e. the UE has answered the
+    /// SecurityModeCommand with a SecurityModeComplete (TS 38.331 §5.3.4.3,
+    /// issue #31).
+    ///
+    /// Distinct from `reestablishment_security.is_some()`, which only means the
+    /// keys arrived. The gNB must not protect a PDU before the UE has confirmed it
+    /// can verify one, and must not accept a protected PDU before it has sent the
+    /// command — so this is the state that gates both directions.
+    as_security_active: bool,
+    /// The next PDCP COUNT for a DOWNLINK protected SRB1 PDU.
+    ///
+    /// Starts at 1 because the SecurityModeCommand consumed COUNT 0
+    /// (`SMC_PDCP_COUNT`). Both ends count the same PDUs in the same order, which
+    /// is what lets them agree without signalling the COUNT — see the ceiling note
+    /// in the spec.
+    dl_pdcp_count: u32,
+    /// The next PDCP COUNT expected on an UPLINK protected SRB1 PDU.
+    ///
+    /// Starts at 0: the UE's first protected uplink PDU is the
+    /// SecurityModeComplete.
+    ul_pdcp_count: u32,
 }
 
 impl RrcUeContext {
@@ -143,12 +176,57 @@ impl RrcUeContext {
             nr_capability: None,
             transactions: RrcTransactionAllocator::new(),
             reestablishment_security: None,
+            as_security_active: false,
+            dl_pdcp_count: 1,
+            ul_pdcp_count: 0,
         }
     }
 
-    /// Records the AS security material a re-establishment is verified against.
+    /// Records the AS security material a re-establishment is verified against,
+    /// and which SRB PDCP protection uses (issue #31).
     pub fn set_reestablishment_security(&mut self, security: ReestablishmentSecurity) {
         self.reestablishment_security = Some(security);
+    }
+
+    /// Marks AS security ACTIVE, on the UE's SecurityModeComplete
+    /// (TS 38.331 §5.3.4.3).
+    pub fn on_as_security_activated(&mut self) {
+        self.as_security_active = true;
+    }
+
+    /// Whether AS security is active for this UE.
+    pub fn as_security_active(&self) -> bool {
+        self.as_security_active
+    }
+
+    /// The shared SRB PDCP security state, once the keys have arrived.
+    ///
+    /// `None` before the NGAP plane hands over the keys, and `None` for an
+    /// algorithm identity the shared layer refuses — fail-closed in both cases, so
+    /// a caller cannot protect a PDU with a half-built state.
+    pub fn srb_security(&self) -> Option<SrbSecurity> {
+        let s = self.reestablishment_security.as_ref()?;
+        SrbSecurity::new(
+            s.k_rrc_enc,
+            s.k_rrc_int,
+            s.ciphering_alg_id,
+            s.integrity_alg_id,
+        )
+        .ok()
+    }
+
+    /// Takes the next downlink PDCP COUNT.
+    pub fn next_dl_pdcp_count(&mut self) -> u32 {
+        let c = self.dl_pdcp_count;
+        self.dl_pdcp_count = self.dl_pdcp_count.wrapping_add(1);
+        c
+    }
+
+    /// Takes the next expected uplink PDCP COUNT.
+    pub fn next_ul_pdcp_count(&mut self) -> u32 {
+        let c = self.ul_pdcp_count;
+        self.ul_pdcp_count = self.ul_pdcp_count.wrapping_add(1);
+        c
     }
 
     /// Stores the UE-NR-Capability container received in UECapabilityInformation

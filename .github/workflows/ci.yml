@@ -213,6 +213,36 @@ jobs:
       - name: cargo clippy
         run: cargo clippy -p nextgsim-ue --features sidelink --all-targets
 
+  as-security:
+    name: AS security (config-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # AS security (issue #31) is a CONFIG switch, not a cargo feature, so the
+      # default jobs above DO compile every line of it -- unlike the feature jobs
+      # here. What they do not do is EXERCISE the activated arm: the tests that set
+      # `as_security_enabled: true` run under `cargo test --workspace` already, so
+      # this job exists for the layer they all rest on.
+      #
+      # `nextgsim-pdcp`'s `srb_security` is where the MAC-and-cipher layout lives,
+      # and it is the one thing both the gNB and the UE must agree on byte for byte.
+      # Running it on its own, plus both endpoints' security modules, makes a
+      # divergence fail here with a small blast radius rather than inside a
+      # whole-workspace run.
+      - name: cargo test (the shared SRB PDCP layer)
+        run: cargo test -p nextgsim-pdcp srb_security
+      - name: cargo test (both endpoints' AS security)
+        run: |
+          cargo test -p nextgsim-ue security
+          cargo test -p nextgsim-gnb as_security
+      - name: cargo clippy
+        run: cargo clippy -p nextgsim-pdcp --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

@@ -34,6 +34,9 @@
 //! whether a discard timer expired, and this crate has no business choosing the
 //! simulator's time source.
 
+pub mod srb_security;
+pub use srb_security::{SrbSecurity, SrbSecurityError, MAC_I_LEN};
+
 use std::collections::BTreeMap;
 
 use tracing::{debug, trace, warn};

@@ -149,7 +149,7 @@ pub enum MmOutput {
     /// COUNT (TS 33.501 §6.9.4.1). Emitted once NAS security is active so the
     /// caller hands it to the RRC plane (`RrcMessage::AsSecurityKey`) to derive
     /// K_RRCint/K_RRCenc when the AS SecurityModeCommand arrives (Wave-6 I5).
-    /// Only produced when the `I5_UE_AS_SECURITY` wire gate is on.
+    /// Only produced when the `UeConfig::as_security_enabled` wire gate is on.
     AsSecurityKgnb([u8; 32]),
     /// The network signalled its view of PDU session state in a PDU session
     /// status IE on REGISTRATION ACCEPT or SERVICE ACCEPT (TS 24.501
@@ -593,6 +593,13 @@ pub struct MmOrchestrator {
     /// Whether an assigned UE radio capability ID is kept at all
     /// (`UeConfig::racs_store_assigned_id`)
     racs_store_assigned_id: bool,
+    /// Whether AS security activation is enabled (`UeConfig::as_security_enabled`,
+    /// issue #31).
+    ///
+    /// A field read from config at construction rather than a compile-time
+    /// constant, which is what criterion 1 asks for: no shipping build could
+    /// activate AS security while the gate was `const false`.
+    as_security_enabled: bool,
     current_tai: Option<[u8; 6]>,
     /// Equivalent PLMN list signalled in the last Registration Accept
     /// (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). Each entry is a 3-octet
@@ -688,6 +695,7 @@ impl MmOrchestrator {
             pending_nssai: None,
             racs_id: None,
             racs_store_assigned_id: false,
+            as_security_enabled: false,
             current_tai: None,
             equivalent_plmns: Vec::new(),
             t3502_value: None,
@@ -735,6 +743,7 @@ impl MmOrchestrator {
     pub fn from_config(identity: MmUeIdentity, config: &UeConfig) -> Self {
         let mut orch = Self::new(identity);
         orch.racs_store_assigned_id = config.racs_store_assigned_id;
+        orch.as_security_enabled = config.as_security_enabled;
         orch.configure_uav(config);
         let Some(ref path) = config.state_file else {
             return orch;
@@ -2464,7 +2473,7 @@ impl MmOrchestrator {
         // AS-security wire knob; the exact uplink NAS COUNT the AMF uses for the
         // KgNB derivation is a cross-stack detail verified in the docker E2E
         // sign-off (hazard #269, host-only).
-        if crate::rrc::security::I5_UE_AS_SECURITY {
+        if self.as_security_enabled {
             if let Some(kgnb) = self.derive_kgnb_for_as_security() {
                 outs.push(MmOutput::AsSecurityKgnb(kgnb));
             }

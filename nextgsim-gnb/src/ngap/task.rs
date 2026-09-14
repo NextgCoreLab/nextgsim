@@ -892,7 +892,11 @@ impl NgapTask {
         let reestablishment_security = RrcMessage::AsSecurityForReestablishment {
             ue_id,
             k_rrc_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, int_id),
+            // K_RRCenc too (issue #31): the RRC plane sends and receives SRB1
+            // PDUs, so it is the plane that has to cipher them.
+            k_rrc_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcEnc, ciph_id),
             integrity_alg_id: int_id,
+            ciphering_alg_id: ciph_id,
             c_rnti: SIMULATED_C_RNTI,
             phys_cell_id: phys_cell_id_from_nci(self.task_base.config.nci),
             next_hop_chaining_count: 0,

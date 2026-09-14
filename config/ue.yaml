@@ -265,3 +265,22 @@ ai_ml_enabled: false            # NWDAF Reporter - AI/ML data reporting (Rel-20)
 isac_enabled: false             # ISAC Sensor - sensing and communication (Rel-20)
 federated_learning_enabled: false  # FL Participant - federated learning (Rel-20)
 semantic_comm_enabled: false    # Semantic Codec - semantic communication (Rel-20)
+
+# Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
+# protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4).
+#
+# false by default, and that is deliberate rather than caution. Turning it on
+# drops ALL UL-DCCH traffic today, because the gNB's uplink dispatcher still
+# routes on `bytes[0] & 0x0F` of the RAW PDU (C5_TYPED_DCCH_DISPATCH is false)
+# and a ciphered PDU has no meaningful leading nibble. Enabling it by default
+# therefore needs the C5 typed-dispatch flip as well.
+#
+# THE gNB AND THE UE MUST BE SET THE SAME WAY. A gNB with it on and a UE with it
+# off would have the UE read a MAC-I as message content.
+#
+# With it on (UE side): the SecurityModeCommand is integrity protected and not
+# ciphered (TS 38.331 §5.3.4.2), the UE verifies it before replying and answers
+# SecurityModeFailure if it does not verify, every later SRB1 PDU is integrity
+# protected and ciphered in both directions, a PDU failing integrity is
+# discarded, and no DRB is established until activation completes.
+as_security_enabled: false

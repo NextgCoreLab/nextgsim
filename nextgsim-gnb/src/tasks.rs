@@ -458,8 +458,12 @@ pub enum RrcMessage {
         ue_id: i32,
         /// K_RRCint (128-bit)
         k_rrc_int: [u8; 16],
+        /// K_RRCenc (128-bit) — SRB PDCP ciphering (issue #31)
+        k_rrc_enc: [u8; 16],
         /// Selected NR integrity algorithm identity (0 = NIA0 … 3 = NIA3)
         integrity_alg_id: u8,
+        /// Selected NR ciphering algorithm identity (0 = NEA0 … 3 = NEA3)
+        ciphering_alg_id: u8,
         /// C-RNTI the UE will present in a re-establishment request
         c_rnti: u16,
         /// Physical cell identity of the UE's PCell

@@ -1164,6 +1164,10 @@ mod tests {
             .expect("context")
             .set_reestablishment_security(ReestablishmentSecurity {
                 k_rrc_int,
+                // These two fixtures do not exercise ciphering; NEA0 with a zero key
+                // is the honest 'no ciphering configured' state (issue #31).
+                k_rrc_enc: [0u8; 16],
+                ciphering_alg_id: 0,
                 integrity_alg_id: TEST_INTEGRITY_ALG,
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: TEST_PCI,
