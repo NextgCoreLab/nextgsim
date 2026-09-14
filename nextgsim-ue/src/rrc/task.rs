@@ -530,6 +530,13 @@ impl RrcTask {
                         // run TS 23.122 §4.4.3 selection over the real radio
                         // rather than a hardcoded home-PLMN list.
                         available_plmns: self.cell_selector.available_plmns(),
+                        // The camped cell's own PLMN, which is what makes the
+                        // REGISTERED PLMN knowable (issue #49). Always Some here,
+                        // and that is a property of cell selection rather than an
+                        // assumption: `perform_cell_selection` skips any cell whose
+                        // SIB1 has not been read, so a selected cell's PLMN is one
+                        // the cell BROADCAST rather than one the UE assumed.
+                        serving_plmn: Some(selected_cell.plmn),
                     })
                     .await
                 {
@@ -2402,6 +2409,15 @@ impl Task for RrcTask {
                             RrcMessage::RrcNotify => {
                                 debug!("RRC notify received");
                             }
+                            RrcMessage::SetSelectedPlmn { plmn } => {
+                                // TS 23.122 §4.4.3 (issue #49): the PLMN NAS chose
+                                // becomes the one cell selection searches for. Before
+                                // this the RRC selector kept the configured home
+                                // PLMN forever, so a UE that selected another
+                                // available PLMN still could not camp on its cells.
+                                info!("Cell selection will now search for PLMN {plmn}");
+                                self.cell_selector.set_selected_plmn(Some(plmn));
+                            }
                             RrcMessage::AsSecurityKey { kgnb } => {
                                 debug!("Received KgNB for AS security from NAS plane");
                                 self.set_pending_kgnb(kgnb);
@@ -2611,6 +2627,74 @@ mod tests {
                 "available PLMNs reported to NAS for selection (TS 23.122 §4.4.3)"
             );
         });
+    }
+
+    /// The RRC task also reports the CAMPED cell's own PLMN (issue #49), which is
+    /// what makes the registered PLMN knowable — it used to be recorded as the
+    /// configured home PLMN unconditionally, which is why `PlmnSelector` could never
+    /// tell an HPLMN from a VPLMN.
+    #[test]
+    fn test_active_cell_changed_reports_the_serving_cell_plmn() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_signal_changed(1, -60).await;
+            task.perform_cycle().await;
+
+            let mut serving: Option<Option<CellPlmn>> = None;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::ActiveCellChanged {
+                    serving_plmn, ..
+                }) = msg
+                {
+                    serving = Some(serving_plmn);
+                }
+            }
+            let serving = serving
+                .expect("ActiveCellChanged emitted on camp")
+                .expect("a camped cell has read SIB1, so its PLMN is known");
+            // The camped cell broadcasts the configured PLMN in this fixture, so the
+            // value is checkable rather than merely present.
+            let expected = crate::rrc::cell_selection::Plmn::new(
+                test_config().hplmn.mcc,
+                test_config().hplmn.mnc,
+                test_config().hplmn.long_mnc,
+            );
+            assert_eq!(
+                serving, expected,
+                "the reported serving PLMN must be the one the cell broadcast"
+            );
+        });
+    }
+
+    /// `SetSelectedPlmn` makes the NAS selection drive cell selection (issue #49):
+    /// after it, the RRC selector searches for the chosen PLMN and no longer for the
+    /// configured home one.
+    #[test]
+    fn test_set_selected_plmn_redirects_cell_selection() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        let home = crate::rrc::cell_selection::Plmn::new(
+            test_config().hplmn.mcc,
+            test_config().hplmn.mnc,
+            test_config().hplmn.long_mnc,
+        );
+        assert_eq!(
+            task.cell_selector.selected_plmn(),
+            Some(home),
+            "RrcTask::new pins the configured home PLMN"
+        );
+
+        // A different PLMN, as automatic selection would choose after a rejection.
+        let chosen = crate::rrc::cell_selection::Plmn::new(262, 30, true);
+        task.cell_selector.set_selected_plmn(Some(chosen));
+        assert_eq!(
+            task.cell_selector.selected_plmn(),
+            Some(chosen),
+            "cell selection must now search for the PLMN NAS chose"
+        );
     }
 
     /// T300 establishment guard (issue #30, TS 38.331 §5.3.3.2 / §5.3.3.4):
