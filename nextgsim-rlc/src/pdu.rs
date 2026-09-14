@@ -86,18 +86,58 @@ pub struct RlcUmPdu {
 }
 
 impl RlcUmPdu {
+    /// Whether this PDU's header carries an SN field.
+    ///
+    /// TS 38.322 §6.2.2.3: only a **segmented** SDU does. A complete SDU needs no
+    /// SN because there is nothing to reassemble it with, and the receiver delivers
+    /// it immediately (§5.2.2.2.2's first branch).
+    pub fn carries_sn(&self) -> bool {
+        self.si != SegmentationInfo::FullSdu
+    }
+
+    /// Header length in octets for a 12-bit-SN UMD PDU with the given `si`.
+    ///
+    /// A free function of `si` alone so the transmitter can size a header before it
+    /// has a PDU to encode -- which it must, because whether the SDU fits depends on
+    /// the header length and the header length depends on whether it fits.
+    pub fn header_len_sn12(si: SegmentationInfo) -> usize {
+        let base = if si == SegmentationInfo::FullSdu {
+            1
+        } else {
+            2
+        };
+        base + if si.has_so() { 2 } else { 0 }
+    }
+
+    /// Header length in octets for a 6-bit-SN UMD PDU with the given `si`.
+    ///
+    /// Always one octet plus the SO, because a 6-bit SN shares its octet with the
+    /// SI: for a complete SDU those six bits become reserved rather than absent.
+    pub fn header_len_sn6(si: SegmentationInfo) -> usize {
+        1 + if si.has_so() { 2 } else { 0 }
+    }
+
     /// Encode this PDU into bytes using a 6-bit SN field.
     ///
     /// Header size: 1 byte (+ 2 bytes SO when present).
+    ///
+    /// A PDU carrying a **complete** SDU has no SN field at all
+    /// (TS 38.322 §6.2.2.3: *"An UMD PDU header contains the SN field only when
+    /// the corresponding RLC SDU is segmented"*). For a 6-bit SN the header stays
+    /// one octet and the SN bits become reserved zeros, so the difference is in the
+    /// contents rather than the length.
     pub fn encode_sn6(&self) -> Vec<u8> {
         let header_len = 1 + if self.si.has_so() { 2 } else { 0 };
         let mut out = Vec::with_capacity(header_len + self.data.len());
 
-        // Byte 0: R(1) | SI(2) | SN(5 of 6 — but 6-bit SN uses bits [5:0])
-        // Layout: [R][SI1][SI0][SN5][SN4][SN3][SN2][SN1][SN0]
-        // Packed into 1 byte: bits 7..6 = SI, bits 5..0 = SN
+        // Byte 0: [SI1][SI0][SN5][SN4][SN3][SN2][SN1][SN0], and for a complete SDU
+        // the six SN bits are reserved and coded as zero.
         let si_bits = (self.si as u8) << 6;
-        let sn_bits = (self.sn as u8) & 0x3F;
+        let sn_bits = if self.carries_sn() {
+            (self.sn as u8) & 0x3F
+        } else {
+            0
+        };
         out.push(si_bits | sn_bits);
 
         if let Some(so) = self.so {
@@ -111,18 +151,32 @@ impl RlcUmPdu {
 
     /// Encode this PDU into bytes using a 12-bit SN field.
     ///
-    /// Header size: 2 bytes (+ 2 bytes SO when present).
+    /// Header size: **1** byte for a complete SDU, 2 bytes for a segment
+    /// (+ 2 bytes SO when present).
+    ///
+    /// TS 38.322 §6.2.2.3: *"When an UMD PDU contains a complete RLC SDU, the UMD
+    /// PDU header only contains the SI and R fields"*, and *"An UMD PDU header
+    /// contains the SN field only when the corresponding RLC SDU is segmented"*.
+    /// This tree used to emit the SN unconditionally, so a complete-SDU PDU was two
+    /// octets of header where a conformant one is one -- and a conformant peer read
+    /// the extra octet as the first byte of the SDU (issue #103).
     pub fn encode_sn12(&self) -> Vec<u8> {
-        let header_len = 2 + if self.si.has_so() { 2 } else { 0 };
+        let header_len = Self::header_len_sn12(self.si);
         let mut out = Vec::with_capacity(header_len + self.data.len());
 
         // Byte 0: [R][R][SI1][SI0][SN11][SN10][SN9][SN8]
         // Byte 1: [SN7][SN6][SN5][SN4][SN3][SN2][SN1][SN0]
+        //
+        // For a complete SDU byte 0's low nibble is reserved and byte 1 is absent.
         let si_bits = (self.si as u8) << 4;
-        let sn_hi = ((self.sn >> 8) as u8) & 0x0F;
-        let sn_lo = (self.sn & 0xFF) as u8;
-        out.push(si_bits | sn_hi);
-        out.push(sn_lo);
+        if self.carries_sn() {
+            let sn_hi = ((self.sn >> 8) as u8) & 0x0F;
+            let sn_lo = (self.sn & 0xFF) as u8;
+            out.push(si_bits | sn_hi);
+            out.push(sn_lo);
+        } else {
+            out.push(si_bits);
+        }
 
         if let Some(so) = self.so {
             out.push((so >> 8) as u8);
@@ -139,7 +193,14 @@ impl RlcUmPdu {
             return Err(RlcError::PduTooShort { need: 1, got: 0 });
         }
         let si = SegmentationInfo::from_u8(buf[0] >> 6)?;
-        let sn = (buf[0] & 0x3F) as u16;
+        // No SN field on a complete SDU (TS 38.322 §6.2.2.3), so those bits are
+        // reserved. Reported as 0 rather than as whatever the reserved bits hold:
+        // a receiver that used them would be keying its window on padding.
+        let sn = if si == SegmentationInfo::FullSdu {
+            0
+        } else {
+            (buf[0] & 0x3F) as u16
+        };
 
         let (so, data_start) = if si.has_so() {
             if buf.len() < 3 {
@@ -164,14 +225,23 @@ impl RlcUmPdu {
 
     /// Decode a UM PDU from bytes using a 12-bit SN field.
     pub fn decode_sn12(buf: &[u8]) -> Result<Self, RlcError> {
-        if buf.len() < 2 {
+        // One octet is enough for a complete SDU, which has no SN field
+        // (TS 38.322 §6.2.2.3); a segment needs two.
+        if buf.is_empty() {
+            return Err(RlcError::PduTooShort { need: 1, got: 0 });
+        }
+        let si = SegmentationInfo::from_u8(buf[0] >> 4)?;
+        if si != SegmentationInfo::FullSdu && buf.len() < 2 {
             return Err(RlcError::PduTooShort {
                 need: 2,
                 got: buf.len(),
             });
         }
-        let si = SegmentationInfo::from_u8(buf[0] >> 4)?;
-        let sn = (((buf[0] & 0x0F) as u16) << 8) | buf[1] as u16;
+        let sn = if si == SegmentationInfo::FullSdu {
+            0
+        } else {
+            (((buf[0] & 0x0F) as u16) << 8) | buf[1] as u16
+        };
 
         let (so, data_start) = if si.has_so() {
             if buf.len() < 4 {
@@ -182,6 +252,8 @@ impl RlcUmPdu {
             }
             let so = ((buf[2] as u16) << 8) | buf[3] as u16;
             (Some(so), 4)
+        } else if si == SegmentationInfo::FullSdu {
+            (None, 1)
         } else {
             (None, 2)
         };
@@ -605,7 +677,16 @@ mod tests {
     // ── UM PDU (6-bit SN) ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_um_sn6_full_sdu_roundtrip() {
+    /// FLIPPED by issue #103. This round-tripped a complete-SDU PDU with SN 42 and
+    /// expected the SN back, which only worked while the header carried one in
+    /// violation of TS 38.322 §6.2.2.3.
+    ///
+    /// A complete SDU has no SN field, so the six bits it used to occupy are
+    /// reserved and the SN reads back as 0. Asserted **on the wire bytes**, because
+    /// a round trip cannot catch a header-length or field-placement error that both
+    /// halves of the codec make.
+    #[test]
+    fn a_complete_sdu_sn6_header_carries_no_sn() {
         let pdu = RlcUmPdu {
             si: SegmentationInfo::FullSdu,
             sn: 42,
@@ -613,9 +694,40 @@ mod tests {
             data: vec![1, 2, 3, 4],
         };
         let encoded = pdu.encode_sn6();
-        assert_eq!(encoded.len(), 1 + 4);
+
+        // One octet: SI in bits 8-7, the six SN bits reserved and zero.
+        assert_eq!(encoded.len(), 1 + 4, "a 6-bit-SN header stays one octet");
+        assert_eq!(
+            encoded[0],
+            (SegmentationInfo::FullSdu as u8) << 6,
+            "the SN bits must be reserved zeros, not SN 42"
+        );
+        assert_eq!(&encoded[1..], &[1, 2, 3, 4]);
+
         let decoded = RlcUmPdu::decode_sn6(&encoded).unwrap();
-        assert_eq!(decoded, pdu);
+        assert_eq!(decoded.si, SegmentationInfo::FullSdu);
+        assert_eq!(decoded.sn, 0, "there was no SN to recover");
+        assert_eq!(decoded.so, None);
+        assert_eq!(decoded.data, vec![1, 2, 3, 4]);
+    }
+
+    /// And a SEGMENT still carries its SN, on the wire, in the same octet.
+    #[test]
+    fn a_segmented_sn6_header_still_carries_its_sn() {
+        let pdu = RlcUmPdu {
+            si: SegmentationInfo::FirstSegment,
+            sn: 42,
+            so: None,
+            data: vec![1, 2, 3, 4],
+        };
+        let encoded = pdu.encode_sn6();
+        assert_eq!(encoded.len(), 1 + 4);
+        assert_eq!(
+            encoded[0],
+            ((SegmentationInfo::FirstSegment as u8) << 6) | 42,
+            "a segment's SN is in the low six bits"
+        );
+        assert_eq!(RlcUmPdu::decode_sn6(&encoded).unwrap(), pdu);
     }
 
     #[test]
@@ -633,7 +745,14 @@ mod tests {
     }
 
     #[test]
-    fn test_um_sn12_full_sdu_roundtrip() {
+    /// FLIPPED by issue #103. This expected a 2-octet header on a complete-SDU PDU;
+    /// TS 38.322 §6.2.2.3 gives it **one**, containing only the SI and R fields.
+    ///
+    /// The extra octet was the interop defect: a conformant peer read it as the
+    /// first byte of the SDU. Asserted on the wire bytes for that reason -- a round
+    /// trip is blind to a length both halves agree on.
+    #[test]
+    fn a_complete_sdu_sn12_header_is_one_octet_with_no_sn() {
         let pdu = RlcUmPdu {
             si: SegmentationInfo::FullSdu,
             sn: 0xABC,
@@ -641,9 +760,57 @@ mod tests {
             data: vec![0xFF; 10],
         };
         let encoded = pdu.encode_sn12();
-        assert_eq!(encoded.len(), 2 + 10);
+
+        assert_eq!(
+            encoded.len(),
+            1 + 10,
+            "one octet of header, not two -- the second was the defect"
+        );
+        assert_eq!(
+            encoded[0],
+            (SegmentationInfo::FullSdu as u8) << 4,
+            "SI only; the SN nibble is reserved and zero, not 0xA"
+        );
+        assert_eq!(&encoded[1..], &[0xFF; 10]);
+
         let decoded = RlcUmPdu::decode_sn12(&encoded).unwrap();
-        assert_eq!(decoded, pdu);
+        assert_eq!(decoded.si, SegmentationInfo::FullSdu);
+        assert_eq!(decoded.sn, 0, "there was no SN to recover");
+        assert_eq!(decoded.data, vec![0xFF; 10]);
+    }
+
+    /// And a SEGMENT still gets its two octets with the SN across both.
+    #[test]
+    fn a_segmented_sn12_header_still_carries_its_sn_across_two_octets() {
+        let pdu = RlcUmPdu {
+            si: SegmentationInfo::FirstSegment,
+            sn: 0xABC,
+            so: None,
+            data: vec![0xFF; 10],
+        };
+        let encoded = pdu.encode_sn12();
+        assert_eq!(encoded.len(), 2 + 10);
+        assert_eq!(
+            encoded[0],
+            ((SegmentationInfo::FirstSegment as u8) << 4) | 0x0A,
+            "SI plus the SN's high nibble"
+        );
+        assert_eq!(encoded[1], 0xBC, "the SN's low octet");
+        assert_eq!(RlcUmPdu::decode_sn12(&encoded).unwrap(), pdu);
+    }
+
+    /// A one-octet complete-SDU PDU must decode, where the old codec demanded two.
+    #[test]
+    fn a_one_octet_complete_sdu_pdu_decodes() {
+        // SI = FullSdu, no SN, no payload at all.
+        let bytes = [(SegmentationInfo::FullSdu as u8) << 4];
+        let decoded = RlcUmPdu::decode_sn12(&bytes).expect("one octet is a whole PDU");
+        assert_eq!(decoded.si, SegmentationInfo::FullSdu);
+        assert!(decoded.data.is_empty());
+
+        // A SEGMENT in one octet is still too short, because its SN needs the second.
+        let segment = [(SegmentationInfo::FirstSegment as u8) << 4];
+        assert!(RlcUmPdu::decode_sn12(&segment).is_err());
     }
 
     #[test]

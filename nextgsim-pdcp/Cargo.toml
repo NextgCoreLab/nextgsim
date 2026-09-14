@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 tracing = { workspace = true }
+
+[dev-dependencies]
+# RLC, for the ONE cross-layer test that shows the duplicate-suppression handover
+# issue #103 made: RLC delivers both copies of a replayed complete SDU (it has no
+# SN to tell), and PDCP discards the second. A dev-dependency, so the layering is
+# not inverted in the shipped crate.
+nextgsim-rlc = { workspace = true }

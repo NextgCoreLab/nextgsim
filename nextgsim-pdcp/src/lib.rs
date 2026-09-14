@@ -1091,4 +1091,63 @@ mod tests {
         assert_eq!(delivered, payloads, "payload intact and back in order");
         assert_eq!(rx.buffered_count(), 0);
     }
+
+    // --- The duplicate-suppression handover from RLC (issue #103) ---
+
+    /// CRITERION 3 of issue #103: a replayed **complete** SDU is delivered twice by
+    /// RLC — which has no SN on such a PDU to recognise a replay by — and PDCP
+    /// discards the second copy on its own SN.
+    ///
+    /// The one test that spans both layers, and the reason #103 had to land after
+    /// #33: removing the RLC SN before this entity existed would have reintroduced
+    /// duplicate delivery with nothing to catch it.
+    #[test]
+    fn rlc_delivers_a_replayed_complete_sdu_twice_and_pdcp_passes_one() {
+        use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
+
+        let payload = vec![0x33u8; 24];
+
+        // One PDCP PDU, carried whole by RLC.
+        let mut pdcp_tx = Pdcp::new(PdcpConfig::default());
+        pdcp_tx.submit_sdu(&payload, 0);
+        let pdcp_pdu = pdcp_tx
+            .take_transmittable(0)
+            .pop()
+            .expect("one PDU per SDU");
+
+        let mut rlc_tx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        rlc_tx.submit_sdu(pdcp_pdu.clone());
+        let rlc_pdu = rlc_tx.build_pdu(1500).expect("it fits whole");
+
+        // RLC receives the SAME PDU twice and hands BOTH copies up: a conformant
+        // complete-SDU UMD PDU has no SN, so there is nothing to dedupe on.
+        let mut rlc_rx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        rlc_rx.receive_pdu(&rlc_pdu);
+        rlc_rx.receive_pdu(&rlc_pdu);
+        let mut from_rlc = Vec::new();
+        while let Some(sdu) = rlc_rx.poll_reassembled() {
+            from_rlc.push(sdu);
+        }
+        assert_eq!(
+            from_rlc.len(),
+            2,
+            "RLC must deliver both copies -- it cannot tell them apart"
+        );
+        assert_eq!(from_rlc[0], pdcp_pdu);
+        assert_eq!(from_rlc[1], pdcp_pdu);
+
+        // PDCP passes the first and discards the second on its PDCP SN.
+        let mut pdcp_rx = Pdcp::new(PdcpConfig::default());
+        assert_eq!(
+            pdcp_rx.receive_pdu(&from_rlc[0], 0),
+            Ok(vec![payload.clone()]),
+            "the first copy is delivered"
+        );
+        assert_eq!(
+            pdcp_rx.receive_pdu(&from_rlc[1], 0),
+            Err(PdcpReceiveError::BelowDeliveryWindow),
+            "the second is discarded: its COUNT is below RX_DELIV"
+        );
+        assert_eq!(pdcp_rx.discarded_out_of_window(), 1);
+    }
 }
