@@ -109,6 +109,10 @@ use nextgsim_ngap::procedures::pdu_session_resource::{
     PduSessionResourceSetupResponseItem,
     PduSessionResourceSetupResponseParams,
 };
+use nextgsim_ngap::procedures::pdu_session_resource_notify::{
+    encode_pdu_session_resource_notify, NotifiedQosFlow, NotifiedSession, NotifyCause,
+    PduSessionResourceNotifyParams, ReleasedSession,
+};
 use nextgsim_ngap::procedures::ran_configuration_update::{
     decode_ran_configuration_update_acknowledge, decode_ran_configuration_update_failure,
     encode_ran_configuration_update, RanConfigurationUpdateParams,
@@ -2175,6 +2179,85 @@ impl NgapTask {
     }
 
     /// Handles UE Context Release Request (from App or RRC)
+    /// Sends a PDU Session Resource Notify (TS 38.413 §8.3.5, issue #98).
+    ///
+    /// The conformant way for the gNB to tell the AMF that specific PDU session
+    /// resources are released, or that specific QoS flows are no longer fulfilled,
+    /// without the AMF having asked. Per-SESSION granularity, unlike
+    /// `UE CONTEXT RELEASE REQUEST`, which tears down the whole UE context and so
+    /// takes down sessions on unaffected UPFs with it.
+    ///
+    /// There is **no response message** for this procedure, so nothing is queued
+    /// on a guard timer and no context state changes here. The gNB has already
+    /// released whatever it is reporting; this tells the 5GC so the SMF and AMF
+    /// stop believing otherwise. That also means delivery is best-effort: an AMF
+    /// that is down when this is sent never learns, and there is no retry (see the
+    /// ceiling in the spec).
+    async fn send_pdu_session_resource_notify(
+        &mut self,
+        ue_id: i32,
+        released_sessions: Vec<(u8, NotifyCause)>,
+        notified_sessions: Vec<(u8, Vec<NotifiedQosFlow>)>,
+    ) {
+        let Some(ctx) = self.ue_contexts.get(&ue_id) else {
+            warn!("UE context not found for PDU Session Resource Notify: ue_id={ue_id}");
+            return;
+        };
+        let amf_ctx_id = ctx.amf_ctx_id;
+        let ran_ue_ngap_id = ctx.ran_ue_ngap_id;
+        let stream = ctx.stream_id;
+        // The Notify is UE-associated and AMF-UE-NGAP-ID is MANDATORY, so a UE the
+        // AMF has not yet given an ID cannot be the subject of one. Reported rather
+        // than sent with a fabricated ID, which the AMF would fail to resolve.
+        let Some(amf_ue_ngap_id) = ctx.amf_ue_ngap_id else {
+            warn!(
+                "Cannot send PDU Session Resource Notify for ue_id={ue_id}: no \
+                 AMF-UE-NGAP-ID yet, and the IE is mandatory"
+            );
+            return;
+        };
+
+        let params = PduSessionResourceNotifyParams {
+            amf_ue_ngap_id: amf_ue_ngap_id as u64,
+            ran_ue_ngap_id: ran_ue_ngap_id as u32,
+            notified_sessions: notified_sessions
+                .into_iter()
+                .map(|(pdu_session_id, notified_flows)| NotifiedSession {
+                    pdu_session_id,
+                    notified_flows,
+                    // Per-flow release within a surviving session is not driven by
+                    // any caller yet; the encoder supports it.
+                    released_flows: Vec::new(),
+                })
+                .collect(),
+            released_sessions: released_sessions
+                .into_iter()
+                .map(|(pdu_session_id, cause)| ReleasedSession {
+                    pdu_session_id,
+                    cause,
+                })
+                .collect(),
+        };
+
+        match encode_pdu_session_resource_notify(&params) {
+            Ok(bytes) => {
+                info!(
+                    "Sending PDU Session Resource Notify: ue_id={ue_id}, \
+                     ran_ue_ngap_id={ran_ue_ngap_id}, amf_ue_ngap_id={amf_ue_ngap_id}, \
+                     released={}, notified={}",
+                    params.released_sessions.len(),
+                    params.notified_sessions.len()
+                );
+                self.send_ngap_ue_associated(amf_ctx_id, stream, bytes)
+                    .await;
+            }
+            // The encoder refuses a Notify that reports nothing, which is a caller
+            // bug rather than a peer problem -- so it is logged and dropped rather
+            // than escalated.
+            Err(e) => error!("Failed to encode PDU Session Resource Notify: {e}"),
+        }
+    }
+
     async fn handle_ue_context_release_request(
         &mut self,
         ue_id: i32,
@@ -3834,6 +3917,18 @@ impl Task for NgapTask {
                     NgapMessage::RadioLinkFailure { ue_id } => {
                         self.handle_radio_link_failure(ue_id).await;
                     }
+                    NgapMessage::PduSessionResourceNotify {
+                        ue_id,
+                        released_sessions,
+                        notified_sessions,
+                    } => {
+                        self.send_pdu_session_resource_notify(
+                            ue_id,
+                            released_sessions,
+                            notified_sessions,
+                        )
+                        .await;
+                    }
                     NgapMessage::UeContextReleaseRequest { ue_id, cause } => {
                         self.handle_ue_context_release_request(ue_id, cause).await;
                     }
@@ -5491,5 +5586,172 @@ mod tests {
             task.guard_timers.is_empty(),
             "no Time to Wait means no mandated wait and so no scheduled retry"
         );
+    }
+
+    // ========================================================================
+    // PDU Session Resource Notify (issue #98, TS 38.413 §8.3.5)
+    // ========================================================================
+
+    /// Pops the next NGAP PDU handed to SCTP.
+    fn next_ngap_pdu(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) -> Vec<u8> {
+        loop {
+            match rx.try_recv() {
+                Ok(TaskMessage::Message(crate::tasks::SctpMessage::SendMessage {
+                    buffer, ..
+                })) => return buffer.data().to_vec(),
+                Ok(_) => continue,
+                Err(e) => panic!("expected an NGAP PDU on SCTP, got none: {e}"),
+            }
+        }
+    }
+
+    /// #98: a released PDU session is reported to the AMF at PER-SESSION
+    /// granularity, and the emitted bytes decode as a real Notify.
+    ///
+    /// Asserted by DECODING what went to SCTP, not by inspecting the params: the
+    /// whole point of the issue is that the procedure reaches the wire.
+    #[tokio::test]
+    async fn a_released_pdu_session_is_reported_as_a_notify_on_the_wire() {
+        use nextgsim_ngap::procedures::pdu_session_resource_notify::decode_pdu_session_resource_notify;
+
+        let (mut task, mut sctp_rx) = task_with_ue(11);
+
+        task.send_pdu_session_resource_notify(
+            11,
+            vec![(5, NotifyCause::TransportResourceUnavailable)],
+            Vec::new(),
+        )
+        .await;
+
+        let bytes = next_ngap_pdu(&mut sctp_rx);
+        let decoded = decode_pdu_session_resource_notify(&bytes)
+            .expect("the emitted PDU must decode as a PDU Session Resource Notify");
+        assert_eq!(decoded.amf_ue_ngap_id, 4242, "the AMF's own UE identity");
+        assert_eq!(decoded.released_sessions.len(), 1);
+        assert_eq!(decoded.released_sessions[0].pdu_session_id, 5);
+        assert_eq!(
+            decoded.released_sessions[0].cause,
+            NotifyCause::TransportResourceUnavailable
+        );
+        assert!(
+            decoded.notified_sessions.is_empty(),
+            "reporting a release must not also claim a QoS-flow change"
+        );
+    }
+
+    /// A surviving session with a not-fulfilled QoS flow is reported without
+    /// releasing anything -- the distinction the two lists exist to make.
+    #[tokio::test]
+    async fn an_unfulfilled_qos_flow_is_reported_without_releasing_the_session() {
+        use nextgsim_ngap::procedures::pdu_session_resource_notify::{
+            decode_pdu_session_resource_notify, NotificationCauseValue,
+        };
+
+        let (mut task, mut sctp_rx) = task_with_ue(11);
+
+        task.send_pdu_session_resource_notify(
+            11,
+            Vec::new(),
+            vec![(
+                7,
+                vec![NotifiedQosFlow {
+                    qos_flow_identifier: 3,
+                    notification_cause: NotificationCauseValue::NotFulfilled,
+                }],
+            )],
+        )
+        .await;
+
+        let bytes = next_ngap_pdu(&mut sctp_rx);
+        let decoded = decode_pdu_session_resource_notify(&bytes).expect("decodes");
+        assert!(
+            decoded.released_sessions.is_empty(),
+            "the session survives; only the flow's state changed"
+        );
+        assert_eq!(decoded.notified_sessions.len(), 1);
+        assert_eq!(decoded.notified_sessions[0].pdu_session_id, 7);
+        assert_eq!(
+            decoded.notified_sessions[0].notified_flows[0].notification_cause,
+            NotificationCauseValue::NotFulfilled
+        );
+    }
+
+    /// The sender is reachable from the `NgapMessage` dispatch, not only by a
+    /// direct call. A sender with no dispatch arm is unreachable in the running
+    /// binary -- the recorded failure mode of a correct fix in an unreachable place.
+    #[tokio::test]
+    async fn the_notify_is_reachable_through_the_ngap_message_dispatch() {
+        use nextgsim_ngap::procedures::pdu_session_resource_notify::decode_pdu_session_resource_notify;
+
+        let (mut task, mut sctp_rx) = task_with_ue(11);
+        let (tx, rx) = tokio::sync::mpsc::channel::<TaskMessage<NgapMessage>>(4);
+
+        tx.send(TaskMessage::Message(
+            NgapMessage::PduSessionResourceNotify {
+                ue_id: 11,
+                released_sessions: vec![(9, NotifyCause::RadioResourcesNotAvailable)],
+                notified_sessions: Vec::new(),
+            },
+        ))
+        .await
+        .expect("queued");
+        tx.send(TaskMessage::Shutdown).await.expect("queued");
+        drop(tx);
+
+        task.run(rx).await;
+
+        let bytes = next_ngap_pdu(&mut sctp_rx);
+        let decoded = decode_pdu_session_resource_notify(&bytes)
+            .expect("the dispatched message must reach the wire as a Notify");
+        assert_eq!(decoded.released_sessions[0].pdu_session_id, 9);
+        assert_eq!(
+            decoded.released_sessions[0].cause,
+            NotifyCause::RadioResourcesNotAvailable
+        );
+    }
+
+    /// A UE with no AMF-UE-NGAP-ID cannot be the subject of a Notify: the IE is
+    /// mandatory, and a fabricated value is one the AMF would fail to resolve. The
+    /// sender must report and send NOTHING rather than emit an unresolvable PDU.
+    #[tokio::test]
+    async fn a_ue_without_an_amf_ue_ngap_id_emits_no_notify() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(12, 1).expect("ue context");
+        // Deliberately NOT setting amf_ue_ngap_id.
+
+        task.send_pdu_session_resource_notify(
+            12,
+            vec![(1, NotifyCause::TransportResourceUnavailable)],
+            Vec::new(),
+        )
+        .await;
+
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "no PDU may be emitted for a UE the AMF has not identified"
+        );
+    }
+
+    /// An unknown UE emits nothing either, rather than panicking or sending a PDU
+    /// with a fabricated RAN-UE-NGAP-ID.
+    #[tokio::test]
+    async fn an_unknown_ue_emits_no_notify() {
+        let (mut task, mut sctp_rx) = task_with_ue(11);
+        task.send_pdu_session_resource_notify(
+            999,
+            vec![(1, NotifyCause::TransportResourceUnavailable)],
+            Vec::new(),
+        )
+        .await;
+        assert!(sctp_rx.try_recv().is_err());
     }
 }
