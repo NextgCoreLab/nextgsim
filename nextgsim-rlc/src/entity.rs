@@ -1511,7 +1511,6 @@ mod tests {
         .encode_sn12()
     }
 
-    #[test]
     /// FLIPPED by issue #103. This asserted that a complete SDU advances
     /// `RX_Next_Highest` and `RX_Next_Reassembly`, which was true only while the
     /// PDU carried an SN in violation of TS 38.322 §6.2.2.3. It has no SN now, so

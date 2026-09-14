@@ -242,6 +242,12 @@ pub struct RrcTask {
     pdu_id_counter: u32,
     /// Current serving cell ID
     serving_cell_id: Option<i32>,
+    /// The last (PCI, RSRP dBm) pair reported to NAS for positioning (issue #46).
+    ///
+    /// Held so the report is sent on a CHANGE rather than once per RRC cycle. `None`
+    /// means nothing has been reported yet, which is distinct from "the same as last
+    /// time" -- the first measurement after a cell change must always go out.
+    reported_serving_measurement: Option<(u16, i32)>,
     /// Pending NAS PDU for initial message
     initial_nas_pdu: Option<OctetString>,
     /// RRC establishment cause
@@ -324,6 +330,7 @@ impl RrcTask {
             handover_manager: HandoverManager::new(),
             pdu_id_counter: 0,
             serving_cell_id: None,
+            reported_serving_measurement: None,
             initial_nas_pdu: None,
             establishment_cause: 3, // mo-Data
             last_cell_selection: None,
@@ -583,6 +590,10 @@ impl RrcTask {
         // Evaluate measurement events
         self.measurement_manager.evaluate_events();
 
+        // Report the serving cell to NAS, which is where an LPP E-CID request is
+        // answered from (issue #46).
+        self.report_serving_cell_measurement().await;
+
         // Process any pending measurement reports
         let reports = self.measurement_manager.take_pending_reports();
         for report in reports {
@@ -756,6 +767,49 @@ impl RrcTask {
                 .set_eutra_cell_offset(cell, neighbour.cell_individual_offset_db);
             self.measurement_manager
                 .set_eutra_frequency_offset(neighbour.earfcn, neighbour.frequency_offset_db);
+        }
+    }
+
+    /// Report the serving cell's PCI and level to NAS, when either has changed.
+    ///
+    /// The NAS task answers LPP location requests (TS 37.355 E-CID) and has no
+    /// measurements of its own -- they live here, in the `MeasurementManager`. Sending
+    /// only on a change keeps this to a trickle instead of one message per RRC cycle,
+    /// and means the cached value at the NAS end is never older than the last time the
+    /// radio actually moved.
+    ///
+    /// Nothing is sent while the serving cell has no measurement: NAS then reports no
+    /// RSRP at all, which is the honest answer, rather than a level left over from a
+    /// cell the UE is no longer on.
+    async fn report_serving_cell_measurement(&mut self) {
+        let Some(cell_id) = self.serving_cell_id else {
+            return;
+        };
+        let Some(rsrp_dbm) = self.measurement_manager.rsrp(cell_id) else {
+            return;
+        };
+        // The RLS cell id is the PCI throughout this simulator (see
+        // `MeasurementManager::update_measurement`), and physCellId is INTEGER(0..503)
+        // on the wire. A cell id outside that is reported once and then not sent,
+        // because truncating it would name a DIFFERENT cell in the report.
+        let Ok(phys_cell_id) = u16::try_from(cell_id) else {
+            warn!("Serving cell id {cell_id} is negative; not reported to NAS for positioning");
+            return;
+        };
+        if self.reported_serving_measurement == Some((phys_cell_id, rsrp_dbm)) {
+            return;
+        }
+        self.reported_serving_measurement = Some((phys_cell_id, rsrp_dbm));
+        if let Err(e) = self
+            .task_base
+            .nas_tx
+            .send(NasMessage::ServingCellMeasurement {
+                phys_cell_id,
+                rsrp_dbm,
+            })
+            .await
+        {
+            error!("Failed to report serving cell measurement to NAS: {}", e);
         }
     }
 
@@ -2626,6 +2680,105 @@ mod tests {
                 !reported.is_empty(),
                 "available PLMNs reported to NAS for selection (TS 23.122 §4.4.3)"
             );
+        });
+    }
+
+    /// The RRC task reports the serving cell's PCI and level to NAS (issue #46),
+    /// which is what an LPP E-CID positioning report is made of. Before this the NAS
+    /// task had no measurements at all, so a `ProvideLocationInformation` could only
+    /// have carried invented ones.
+    #[test]
+    fn test_serving_cell_measurement_is_reported_to_nas() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            // The report comes from the CONNECTED-state measurement cycle, which is
+            // also when an LPP request can arrive (it travels over NAS).
+            camp_and_request(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlCcch,
+                OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+            )
+            .await;
+            assert_eq!(task.state_machine.state(), RrcState::Connected);
+
+            task.handle_signal_changed(1, -71).await;
+            task.perform_cycle().await;
+
+            let mut reported = None;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::ServingCellMeasurement {
+                    phys_cell_id,
+                    rsrp_dbm,
+                }) = msg
+                {
+                    reported = Some((phys_cell_id, rsrp_dbm));
+                }
+            }
+            assert_eq!(
+                reported,
+                Some((1, -71)),
+                "the camped cell's id doubles as its PCI, and the level is the one RLS \
+                 reported"
+            );
+        });
+    }
+
+    /// The report goes out on a CHANGE, not once per RRC cycle: an unchanged serving
+    /// cell would otherwise put a message on the NAS channel every 2.5 s forever.
+    #[test]
+    fn test_serving_cell_measurement_is_not_repeated_unchanged() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camp_and_request(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlCcch,
+                OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+            )
+            .await;
+
+            let count_reports = |rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<NasMessage>>| {
+                let mut n = 0;
+                while let Ok(msg) = rx.try_recv() {
+                    if matches!(
+                        msg,
+                        TaskMessage::Message(NasMessage::ServingCellMeasurement { .. })
+                    ) {
+                        n += 1;
+                    }
+                }
+                n
+            };
+
+            task.handle_signal_changed(1, -71).await;
+            task.perform_cycle().await;
+            assert_eq!(
+                count_reports(&mut nas_rx),
+                1,
+                "the first measurement is sent"
+            );
+
+            // Two more cycles with the level unchanged.
+            task.perform_cycle().await;
+            task.perform_cycle().await;
+            assert_eq!(
+                count_reports(&mut nas_rx),
+                0,
+                "an unchanged measurement is not re-sent"
+            );
+
+            // A changed level IS sent, so the suppression is a comparison and not a
+            // one-shot latch.
+            task.handle_signal_changed(1, -80).await;
+            task.perform_cycle().await;
+            assert_eq!(count_reports(&mut nas_rx), 1, "a changed level is sent");
         });
     }
 

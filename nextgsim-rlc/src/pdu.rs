@@ -676,7 +676,6 @@ mod tests {
 
     // ── UM PDU (6-bit SN) ─────────────────────────────────────────────────────
 
-    #[test]
     /// FLIPPED by issue #103. This round-tripped a complete-SDU PDU with SN 42 and
     /// expected the SN back, which only worked while the header carried one in
     /// violation of TS 38.322 §6.2.2.3.
@@ -744,7 +743,6 @@ mod tests {
         assert_eq!(decoded, pdu);
     }
 
-    #[test]
     /// FLIPPED by issue #103. This expected a 2-octet header on a complete-SDU PDU;
     /// TS 38.322 §6.2.2.3 gives it **one**, containing only the SI and R fields.
     ///

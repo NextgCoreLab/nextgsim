@@ -352,6 +352,21 @@ pub enum NasMessage {
         /// search could never fire.
         serving_plmn: Option<crate::rrc::cell_selection::Plmn>,
     },
+    /// Serving-cell measurements (from RRC), the raw material of an E-CID
+    /// positioning report (issue #46, TS 37.355 §6.5.4).
+    ///
+    /// Sent only when a value actually changes, so it is a trickle rather than one
+    /// message per RRC cycle. NAS needs it because an LPP request arrives on the NAS
+    /// task while the measurements live on the RRC task's `MeasurementManager`.
+    ServingCellMeasurement {
+        /// Physical cell identity of the serving cell. The RLS cell id doubles as
+        /// the PCI throughout this simulator.
+        phys_cell_id: u16,
+        /// SS-RSRP of the serving cell, in dBm as the RLS reports it. Converted to
+        /// the TS 36.133 report value at the LPP layer rather than here, so the
+        /// message carries the measurement and not an encoding of it.
+        rsrp_dbm: i32,
+    },
     /// RRC fallback indication (from RRC)
     RrcFallbackIndication,
     /// Uplink data delivery (from App)

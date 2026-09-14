@@ -63,6 +63,7 @@ use super::deregistration::DeregistrationProcedure;
 use super::persistence::{SecurityContextSnapshot, UeStateSnapshot};
 use super::state::{CmState, MmStateMachine, MmSubState, UpdateStatus};
 use super::uuaa::{UuaaProcedure, UuaaReaction, UuaaState};
+use crate::nas::lpp::{LppEndpoint, LppUplink, ServingCellMeasurements};
 use crate::uav::{UavAuthorizationState, UavContext, UavIdentity};
 
 /// Maximum registration attempts before falling back to T3502
@@ -643,6 +644,18 @@ pub struct MmOrchestrator {
     /// that a restart would then present to the network.
     state_file: Option<std::path::PathBuf>,
 
+    // -- LPP positioning (TS 37.355, over the NAS payload container) --
+    /// The UE's LPP endpoint, which answers the LMF's capability and
+    /// location-information requests (issue #46).
+    lpp: LppEndpoint,
+    /// The serving cell's latest measurements, as the RRC layer last reported them.
+    ///
+    /// Cached rather than fetched, because an LPP request arrives on the NAS task and
+    /// the measurements live on the RRC task. The cost is staleness bounded by the
+    /// RRC cycle (`RRC_CYCLE_INTERVAL_MS`, 2500 ms) -- a real E-CID report is a
+    /// snapshot too, and one that old is still a measurement rather than a guess.
+    serving_cell_measurements: ServingCellMeasurements,
+
     // -- UAS service-level authentication (UUAA-MM, TS 23.256 §5.2.2) --
     /// The UE half of the UUAA exchange over UL/DL NAS TRANSPORT.
     uuaa: UuaaProcedure,
@@ -690,6 +703,11 @@ impl MmOrchestrator {
             ue_policy_sections: HashMap::new(),
             updp_pti: 0,
             state_file: None,
+            lpp: LppEndpoint::new(),
+            // Zero until RRC reports a camped cell. A location request answered
+            // before then carries no RSRP at all rather than a made-up one -- see
+            // `ServingCellMeasurements`.
+            serving_cell_measurements: ServingCellMeasurements::default(),
             // No payload and no UAV context until `from_config` sees an aerial
             // UE: a non-UAV UE that answered a UUAA pending indication would be
             // claiming a UAS identity it does not have.
@@ -797,6 +815,37 @@ impl MmOrchestrator {
             );
         }
         reaction
+    }
+
+    /// Handle an LPP payload container that arrived in DL NAS TRANSPORT (payload
+    /// container type `0b0011`, TS 24.501 §5.4.5.3) and return the UL NAS TRANSPORT
+    /// that answers it.
+    ///
+    /// Before issue #46 this container had no consumer at all: `main.rs` matched only
+    /// the UE-policy and Service-level-AA types and let everything else fall through
+    /// to the SM orchestrator, which owns N1 SM information and returns nothing for
+    /// anything else -- so the LMF's transaction timed out with no reply and no error.
+    pub fn handle_lpp_container(&mut self, container: &[u8]) -> LppUplink {
+        self.lpp
+            .handle_nas_container(container, &self.serving_cell_measurements)
+    }
+
+    /// Record the serving cell's measurements, as reported by the RRC layer.
+    ///
+    /// This is what an E-CID report is *made of*, so without it a location request
+    /// could only be answered with invented values.
+    pub fn set_serving_cell_measurements(&mut self, measurements: ServingCellMeasurements) {
+        self.serving_cell_measurements = measurements;
+    }
+
+    /// The serving cell's measurements as the LPP endpoint would report them.
+    pub fn serving_cell_measurements(&self) -> ServingCellMeasurements {
+        self.serving_cell_measurements
+    }
+
+    /// How many LPP replies this UE has sent, for tests and status reporting.
+    pub fn lpp_replies_sent(&self) -> u32 {
+        self.lpp.replies_sent()
     }
 
     /// The UUAA exchange's state, for tests and status reporting.
@@ -6778,5 +6827,137 @@ mod tests {
             };
             assert_eq!(candidate.uuaa_payload(), None, "hex={hex:?}");
         }
+    }
+    // ========================================================================
+    // LPP positioning over the NAS payload container (#46, TS 37.355)
+    // ========================================================================
+
+    /// The LMF's own hand-derived reference vector (see `nas::lpp`): a
+    /// `RequestLocationInformation` asking for RSRP and RSRQ, transaction 0.
+    const LMF_LOCATION_REQUEST: &[u8] = &[0x90, 0x01, 0x20, 0x09, 0x30];
+
+    #[test]
+    fn an_lpp_container_produces_a_ul_nas_transport_from_the_orchestrator() {
+        // The wiring the issue asks for: a DL NAS TRANSPORT LPP container must be
+        // answered here rather than falling through to the SM orchestrator, which
+        // returns nothing for it.
+        use crate::nas::lpp::{LppBody, LppMessage, LppUplink, ServingCellMeasurements};
+        use nextgsim_nas::ies::ie1::PayloadContainerType;
+        use nextgsim_nas::messages::mm::UlNasTransport;
+
+        let mut orch = new_orch();
+        orch.set_serving_cell_measurements(ServingCellMeasurements {
+            phys_cell_id: 7,
+            arfcn: 1850,
+            system_frame_number: Some(100),
+            rsrp_result: Some(60),
+            rsrq_result: None,
+        });
+
+        let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
+            panic!("an LPP location request must be answered");
+        };
+        assert_eq!(orch.lpp_replies_sent(), 1);
+
+        let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
+        assert_eq!(ul.payload_container_type, PayloadContainerType::LppMessage);
+        let reply = LppMessage::decode(&ul.payload_container).expect("decodes");
+        assert_eq!(reply.transaction_id.map(|t| t.transaction_number), Some(0));
+        assert!(reply.end_transaction);
+        match reply.body {
+            Some(LppBody::ProvideLocationInformation { measurements }) => {
+                let element = measurements.primary_cell.expect("primary");
+                assert_eq!(element.phys_cell_id, 7, "the cell RRC reported");
+                assert_eq!(element.arfcn, 1850);
+                assert_eq!(element.system_frame_number, Some(100));
+                assert_eq!(element.rsrp_result, Some(60));
+            }
+            other => panic!("expected ProvideLocationInformation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_lpp_report_carries_the_measurements_rrc_last_reported() {
+        // The cache is what makes the report a measurement rather than a guess, so a
+        // later report must supersede an earlier one.
+        use crate::nas::lpp::{LppBody, LppMessage, LppUplink, ServingCellMeasurements};
+        use nextgsim_nas::messages::mm::UlNasTransport;
+
+        let mut orch = new_orch();
+        let mut reported = Vec::new();
+        for (pci, rsrp) in [(1u16, 30u8), (2, 90)] {
+            orch.set_serving_cell_measurements(ServingCellMeasurements {
+                phys_cell_id: pci,
+                arfcn: 1850,
+                system_frame_number: None,
+                rsrp_result: Some(rsrp),
+                rsrq_result: None,
+            });
+            let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
+                panic!("answered");
+            };
+            let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
+            match LppMessage::decode(&ul.payload_container)
+                .expect("decodes")
+                .body
+            {
+                Some(LppBody::ProvideLocationInformation { measurements }) => {
+                    let element = measurements.primary_cell.expect("primary");
+                    reported.push((element.phys_cell_id, element.rsrp_result));
+                }
+                other => panic!("expected ProvideLocationInformation, got {other:?}"),
+            }
+        }
+        assert_eq!(reported, vec![(1, Some(30)), (2, Some(90))]);
+    }
+
+    #[test]
+    fn an_lpp_capability_request_is_answered_before_any_measurement_arrives() {
+        // A capability transfer does not depend on the radio, so it must not wait for
+        // one -- TS 37.355 §5.1.3 has the server ask this first.
+        use crate::nas::lpp::{LppBody, LppMessage, LppUplink};
+        use nextgsim_nas::messages::mm::UlNasTransport;
+
+        let mut orch = new_orch();
+        assert_eq!(
+            orch.serving_cell_measurements(),
+            crate::nas::lpp::ServingCellMeasurements::default(),
+            "nothing has been measured yet"
+        );
+        // requestCapabilities (c1 index 0) with the E-CID body, transaction 0.
+        let request = {
+            use crate::nas::lpp::UperWriter;
+            let mut w = UperWriter::new();
+            w.write_sequence_preamble(None, &[true, false, false, true]);
+            w.write_sequence_preamble(Some(false), &[]);
+            w.write_extensible_enumerated(0, 1).expect("root");
+            w.write_constrained(0, 0, 255).expect("in range");
+            w.write_bit(false);
+            w.write_choice_index(0, 2).expect("c1");
+            w.write_choice_index(0, 16).expect("requestCapabilities");
+            w.write_choice_index(0, 2).expect("critExt c1");
+            w.write_choice_index(0, 4).expect("r9");
+            w.write_sequence_preamble(Some(false), &[false, false, false, true, false]);
+            w.write_sequence_preamble(Some(false), &[]);
+            w.into_bytes()
+        };
+        let LppUplink::Send(pdu) = orch.handle_lpp_container(&request) else {
+            panic!("a capability request must be answered");
+        };
+        let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
+        assert!(matches!(
+            LppMessage::decode(&ul.payload_container)
+                .expect("decodes")
+                .body,
+            Some(LppBody::ProvideCapabilities { .. })
+        ));
+    }
+
+    #[test]
+    fn an_undecodable_lpp_container_sends_nothing() {
+        use crate::nas::lpp::LppUplink;
+        let mut orch = new_orch();
+        assert_eq!(orch.handle_lpp_container(&[0xFF; 6]), LppUplink::Nothing);
+        assert_eq!(orch.lpp_replies_sent(), 0);
     }
 }
