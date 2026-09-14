@@ -320,9 +320,21 @@ impl RlcEntity {
     // ── UM ────────────────────────────────────────────────────────────────────
 
     /// Header overhead for a UM PDU given the SN size and whether SO is needed.
-    fn um_header_overhead(&self, has_so: bool) -> usize {
-        let base = self.sn_size.um_header_bytes();
-        base + if has_so { 2 } else { 0 }
+    /// UMD header size in octets for a PDU with the given segmentation info.
+    ///
+    /// Takes the `si` rather than just `has_so` because a **complete** SDU has no SN
+    /// field at all (TS 38.322 §6.2.2.3), so a 12-bit-SN complete-SDU header is one
+    /// octet where a segment's is two. Getting this wrong understates the payload
+    /// capacity by an octet and segments an SDU that would have fit whole.
+    fn um_header_overhead(&self, si: SegmentationInfo) -> usize {
+        match self.sn_size {
+            SnSize::Sn6 => RlcUmPdu::header_len_sn6(si),
+            SnSize::Sn12 => RlcUmPdu::header_len_sn12(si),
+            // UM is configured with a 6- or 12-bit SN only (TS 38.322 §6.2.2.3);
+            // 18 bits is AM. Sized as a segment so a caller that got here anyway
+            // under-fills rather than overflowing the grant.
+            SnSize::Sn18 => 2 + if si.has_so() { 2 } else { 0 },
+        }
     }
 
     fn build_um_pdu(&mut self, max_size: usize) -> Option<Vec<u8>> {
@@ -337,9 +349,30 @@ impl RlcEntity {
         let remaining = &sdu[self.tx_current_offset..];
         let is_first = self.tx_current_offset == 0;
 
-        // Determine SI and header size
+        // The header size depends on the SI, and the SI depends on whether the whole
+        // remaining SDU fits -- which depends on the header size. Resolved by trying
+        // the COMPLETE-SDU header first: it is the smallest, so if the SDU does not
+        // fit under it, it does not fit at all.
         let has_so = !is_first; // SO only on non-first segments
-        let hdr = self.um_header_overhead(has_so);
+        let complete_si = if is_first {
+            SegmentationInfo::FullSdu
+        } else {
+            SegmentationInfo::LastSegment
+        };
+        let complete_hdr = self.um_header_overhead(complete_si);
+        let fits_whole = max_size > complete_hdr && remaining.len() <= max_size - complete_hdr;
+
+        let (si, hdr) = if fits_whole {
+            (complete_si, complete_hdr)
+        } else {
+            let si = if is_first {
+                SegmentationInfo::FirstSegment
+            } else {
+                SegmentationInfo::MiddleSegment
+            };
+            (si, self.um_header_overhead(si))
+        };
+
         if max_size <= hdr {
             // Not enough room even for the header
             return None;
@@ -347,13 +380,10 @@ impl RlcEntity {
         let payload_capacity = max_size - hdr;
         let payload_len = remaining.len().min(payload_capacity);
         let is_last = payload_len == remaining.len();
-
-        let si = match (is_first, is_last) {
-            (true, true) => SegmentationInfo::FullSdu,
-            (true, false) => SegmentationInfo::FirstSegment,
-            (false, true) => SegmentationInfo::LastSegment,
-            (false, false) => SegmentationInfo::MiddleSegment,
-        };
+        debug_assert_eq!(
+            is_last, fits_whole,
+            "the header choice and the segmentation decision must agree"
+        );
 
         let so = if has_so {
             Some(self.tx_current_offset as u16)
@@ -421,17 +451,24 @@ impl RlcEntity {
         let sn = pdu.sn as u32;
         trace!(si = ?pdu.si, sn, "RLC UM receive_pdu");
 
+        // TS 38.322 §5.2.2.2.2, FIRST branch: a UMD PDU whose header contains no SN
+        // — i.e. one carrying a complete SDU (§6.2.2.3) — is delivered to upper
+        // layers immediately. No window check, and no state variables to update:
+        // there is no SN to place in the reception buffer.
+        //
+        // This is also why duplicate suppression for whole SDUs is NOT RLC's job.
+        // A complete-SDU PDU carries nothing to recognise a replay by, so both
+        // copies go up and PDCP discards the second on its own SN
+        // (TS 38.323 §5.2.2.1) — which is why issue #103 was ordered after #33.
+        if pdu.si == SegmentationInfo::FullSdu {
+            self.rx_ready.push_back(pdu.data);
+            return Ok(());
+        }
+
         // TS 38.322 §5.2.2.2.2: discard the PDU when
         // `(RX_Next_Highest - UM_Window_Size) <= SN < RX_Next_Reassembly`, i.e.
         // when its SDU has already been delivered or discarded. That is also
-        // what suppresses a replay: UM has no ARQ, so an SN that comes back is a
-        // duplicate from below.
-        //
-        // Note this tree's UMD PDU carries an SN even when it holds a complete
-        // SDU, where TS 38.322 §6.2.2.3 has no SN field at all — so the "header
-        // does not contain an SN" branch of §5.2.2.2.2 (deliver immediately, no
-        // window check) is unreachable here, and complete SDUs go through the
-        // same window and state variables as segments.
+        // what suppresses a replay of a SEGMENT, which does carry an SN.
         let lower_edge = self.um_window_lower_edge();
         if self.um_sn_distance(lower_edge, sn)
             < self.um_sn_distance(lower_edge, self.rx_next_reassembly)
@@ -444,11 +481,7 @@ impl RlcEntity {
             return Err(RlcError::SnOutsideWindow { sn });
         }
 
-        let delivered = if pdu.si == SegmentationInfo::FullSdu {
-            self.rx_ready.push_back(pdu.data);
-            self.rx_reassembly.remove(&sn);
-            true
-        } else {
+        let delivered = {
             let so = pdu.so.unwrap_or(0);
             let is_last = pdu.si.is_last();
             let seg = RlcSegment {
@@ -493,11 +526,9 @@ impl RlcEntity {
         // permanently after a burst loss. Whatever then falls out of the bottom
         // is gone for good.
         //
-        // The spec runs this only when the PDU did NOT complete an SDU, because
-        // there a completed SDU always arrived as a later segment of an SN that
-        // had already advanced the window. Here it is unconditional, because a
-        // complete-SDU PDU in this tree carries its own SN (§6.2.2.3 deviation)
-        // and would otherwise never advance anything.
+        // Only segments reach this function -- a complete SDU has no SN and was
+        // delivered straight up by `receive_um_pdu` -- so the window advance runs on
+        // exactly the PDUs the spec means it for.
         if !self.um_sn_in_reassembly_window(sn) {
             self.rx_next_highest = (sn + 1) % modulus;
             let lower_edge = self.um_window_lower_edge();
@@ -1481,25 +1512,132 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_sdu_advances_the_um_state_variables() {
+    /// FLIPPED by issue #103. This asserted that a complete SDU advances
+    /// `RX_Next_Highest` and `RX_Next_Reassembly`, which was true only while the
+    /// PDU carried an SN in violation of TS 38.322 §6.2.2.3. It has no SN now, so
+    /// §5.2.2.2.2's first branch delivers it immediately and there is nothing to
+    /// place in the reception buffer -- the state variables must NOT move.
+    #[test]
+    fn a_complete_sdu_is_delivered_without_touching_the_um_state_variables() {
         let mut rx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
         rx.receive_pdu(&umd(SegmentationInfo::FullSdu, 0, None, &[1, 2, 3]));
 
         assert_eq!(rx.poll_reassembled(), Some(vec![1, 2, 3]));
-        assert_eq!(rx.rx_next_highest(), 1, "RX_Next_Highest is one past SN 0");
+        assert_eq!(
+            rx.rx_next_highest(),
+            0,
+            "a PDU with no SN cannot advance RX_Next_Highest"
+        );
         assert_eq!(
             rx.rx_next_reassembly(),
-            1,
-            "RX_Next_Reassembly moves past a delivered SDU"
+            0,
+            "nor RX_Next_Reassembly: there is no SN to have reassembled"
         );
         assert!(!rx.t_reassembly_running(), "nothing is outstanding");
+        assert_eq!(
+            rx.reassembly_buffer_len(),
+            0,
+            "a complete SDU is never buffered"
+        );
     }
 
-    /// TS 38.322 §5.2.2.2.2: an SN below `RX_Next_Reassembly` is discarded. UM
-    /// has no ARQ, so a repeated SN is a duplicate from below — and delivering it
-    /// again would hand PDCP the same packet twice.
+    /// CRITERION 4 (issue #103): the transmitter's size accounting follows the
+    /// SHORTER complete-SDU header, so an SDU that fits only with a 1-octet header
+    /// goes out whole instead of being segmented.
+    ///
+    /// This is the boundary the old accounting got wrong: it always reserved two
+    /// octets, so a grant of `len + 1` was one short and the SDU was split into two
+    /// PDUs — costing an extra PDU and, worse, making a complete SDU look segmented
+    /// to a peer.
     #[test]
-    fn a_replayed_complete_sdu_is_delivered_only_once() {
+    fn an_sdu_that_fits_only_under_the_short_header_is_sent_whole() {
+        let payload = vec![0x42u8; 20];
+
+        // A grant of exactly payload + 1: room for the complete-SDU header and not a
+        // byte more.
+        let mut tx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        tx.submit_sdu(payload.clone());
+        let pdu = tx.build_pdu(payload.len() + 1).expect("it must fit");
+        assert_eq!(
+            pdu.len(),
+            payload.len() + 1,
+            "the whole SDU plus a one-octet header"
+        );
+        let decoded = RlcUmPdu::decode_sn12(&pdu).expect("decodable");
+        assert_eq!(
+            decoded.si,
+            SegmentationInfo::FullSdu,
+            "it must go out as a COMPLETE SDU, not as a first segment"
+        );
+        assert_eq!(decoded.data, payload);
+        assert!(
+            tx.build_pdu(64).is_none(),
+            "nothing may be left over -- the SDU was sent whole"
+        );
+
+        // One octet less and it genuinely does not fit whole: the SDU is segmented,
+        // the header grows to two octets, and the first segment carries an SN.
+        let mut tx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        tx.submit_sdu(payload.clone());
+        let first = tx.build_pdu(payload.len()).expect("a first segment");
+        let decoded = RlcUmPdu::decode_sn12(&first).expect("decodable");
+        assert_eq!(decoded.si, SegmentationInfo::FirstSegment);
+        assert_eq!(
+            first.len(),
+            payload.len(),
+            "two octets of header, so two bytes fewer of payload"
+        );
+        assert_eq!(decoded.data.len(), payload.len() - 2);
+
+        // And the remainder arrives, so the boundary case loses nothing.
+        let rest = tx.build_pdu(64).expect("the last segment");
+        let rest_decoded = RlcUmPdu::decode_sn12(&rest).expect("decodable");
+        assert_eq!(rest_decoded.si, SegmentationInfo::LastSegment);
+        assert_eq!(
+            [decoded.data, rest_decoded.data].concat(),
+            payload,
+            "the two segments must reassemble to the original"
+        );
+    }
+
+    /// A complete SDU produced by the transmitter round-trips through the receiver
+    /// with no SN anywhere in between -- the two halves of the change agreeing.
+    #[test]
+    fn a_transmitted_complete_sdu_is_received_without_an_sn() {
+        let payload = vec![0x7Eu8; 30];
+        let mut tx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        tx.submit_sdu(payload.clone());
+        let pdu = tx.build_pdu(1500).expect("a complete-SDU PDU");
+        assert_eq!(pdu.len(), payload.len() + 1);
+
+        let mut rx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        rx.receive_pdu(&pdu);
+        assert_eq!(rx.poll_reassembled(), Some(payload));
+    }
+
+    /// And a SEGMENTED SDU still does advance them, which is what stops the
+    /// assertion above from being satisfied by an entity that tracks nothing.
+    #[test]
+    fn a_segmented_sdu_still_advances_the_um_state_variables() {
+        let mut rx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        rx.receive_pdu(&umd(SegmentationInfo::FirstSegment, 0, None, &[1, 2]));
+        rx.receive_pdu(&umd(SegmentationInfo::LastSegment, 0, Some(2), &[3, 4]));
+
+        assert_eq!(rx.poll_reassembled(), Some(vec![1, 2, 3, 4]));
+        assert_eq!(rx.rx_next_highest(), 1, "RX_Next_Highest is one past SN 0");
+        assert_eq!(rx.rx_next_reassembly(), 1);
+    }
+
+    /// FLIPPED by issue #103. This asserted that RLC suppresses a replayed complete
+    /// SDU, which it could do only because the PDU carried an SN it should not have.
+    ///
+    /// A conformant complete-SDU PDU has nothing to recognise a replay by, so
+    /// TS 38.322 §5.2.2.2.2 delivers BOTH copies and duplicate detection belongs to
+    /// PDCP, keyed on the PDCP SN (TS 38.323 §5.2.2.1). That is why #103 was ordered
+    /// after #33: removing the SN before PDCP existed would have reintroduced
+    /// duplicate delivery with nothing to catch it.
+    #[test]
+    fn a_replayed_complete_sdu_is_delivered_twice_because_rlc_cannot_tell() {
         let mut rx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
         let pdu = umd(SegmentationInfo::FullSdu, 0, None, &[0xAA; 8]);
 
@@ -1509,16 +1647,41 @@ mod tests {
         rx.receive_pdu(&pdu);
         assert_eq!(
             rx.poll_reassembled(),
-            None,
-            "the duplicate must not reach PDCP a second time"
+            Some(vec![0xAA; 8]),
+            "RLC has no SN on a complete SDU, so it cannot suppress the replay -- \
+             PDCP does, and `nextgsim-pdcp` has the test that proves it"
         );
+    }
+
+    /// A replayed SEGMENT is still suppressed by RLC, because a segment does carry
+    /// an SN. Without this, the test above would read as "RLC dedupes nothing".
+    #[test]
+    fn a_replayed_segment_is_still_suppressed_by_rlc() {
+        let mut rx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
+        rx.receive_pdu(&umd(SegmentationInfo::FirstSegment, 0, None, &[1, 2]));
+        rx.receive_pdu(&umd(SegmentationInfo::LastSegment, 0, Some(2), &[3, 4]));
+        assert_eq!(rx.poll_reassembled(), Some(vec![1, 2, 3, 4]));
+
+        // The same segments again: SN 0 is now below RX_Next_Reassembly.
+        let err = rx
+            .receive_pdu_checked(&umd(SegmentationInfo::FirstSegment, 0, None, &[1, 2]))
+            .expect_err("a replayed segment must be refused");
+        assert!(
+            matches!(err, RlcError::SnOutsideWindow { sn: 0 }),
+            "expected SnOutsideWindow, got {err:?}"
+        );
+        assert_eq!(rx.poll_reassembled(), None);
     }
 
     #[test]
     fn a_stale_sn_is_reported_as_outside_the_reassembly_window() {
         let mut rx = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
-        rx.receive_pdu(&umd(SegmentationInfo::FullSdu, 0, None, &[1]));
-        rx.receive_pdu(&umd(SegmentationInfo::FullSdu, 1, None, &[2]));
+        // Driven with SEGMENTS, not complete SDUs: after issue #103 a complete SDU
+        // has no SN and advances no state, so it cannot make an SN stale.
+        rx.receive_pdu(&umd(SegmentationInfo::FirstSegment, 0, None, &[1]));
+        rx.receive_pdu(&umd(SegmentationInfo::LastSegment, 0, Some(1), &[2]));
+        rx.receive_pdu(&umd(SegmentationInfo::FirstSegment, 1, None, &[3]));
+        rx.receive_pdu(&umd(SegmentationInfo::LastSegment, 1, Some(1), &[4]));
         while rx.poll_reassembled().is_some() {}
 
         // SN 0 has been delivered; a segment for it must not be buffered.
