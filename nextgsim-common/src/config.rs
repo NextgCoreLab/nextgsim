@@ -1335,6 +1335,24 @@ pub struct UeConfig {
     /// and a component that names one then matches on the App Id alone.
     #[serde(default)]
     pub ursp_os_id: Option<String>,
+    /// User-controlled preferred PLMN list, highest priority first, each as
+    /// `"<mcc>-<mnc>"` (TS 23.122 §4.4.3.1.1, issue #49).
+    ///
+    /// Consulted by automatic PLMN selection ahead of the operator list. Empty (the
+    /// default) leaves the selector's behaviour exactly as before.
+    #[serde(default)]
+    pub plmn_user_preferred: Vec<String>,
+    /// Operator-controlled preferred PLMN list, highest priority first, same
+    /// spelling as `plmn_user_preferred`.
+    #[serde(default)]
+    pub plmn_operator_preferred: Vec<String>,
+    /// Higher-priority PLMN search interval in seconds -- timer T of
+    /// TS 23.122 §4.4.3.3. `None` keeps the selector's own default.
+    ///
+    /// The selector clamps this to the spec's 6-minute-to-8-hour range, so a value
+    /// outside it is corrected rather than honoured.
+    #[serde(default)]
+    pub plmn_hp_search_interval_secs: Option<u32>,
     /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
     /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
     /// reporting, selective retransmission and the ARQ timers, at the cost of
@@ -1524,6 +1542,9 @@ impl Default for UeConfig {
             ursp_evaluation: false,
             ursp_os_app_id: None,
             ursp_os_id: None,
+            plmn_user_preferred: Vec::new(),
+            plmn_operator_preferred: Vec::new(),
+            plmn_hp_search_interval_secs: None,
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),
@@ -1999,6 +2020,9 @@ configured_nssai:
             ursp_evaluation: false,
             ursp_os_app_id: None,
             ursp_os_id: None,
+            plmn_user_preferred: Vec::new(),
+            plmn_operator_preferred: Vec::new(),
+            plmn_hp_search_interval_secs: None,
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),
@@ -2287,6 +2311,9 @@ configured_nssai:
             ursp_evaluation: false,
             ursp_os_app_id: None,
             ursp_os_id: None,
+            plmn_user_preferred: Vec::new(),
+            plmn_operator_preferred: Vec::new(),
+            plmn_hp_search_interval_secs: None,
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),

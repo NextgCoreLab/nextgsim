@@ -342,6 +342,15 @@ pub enum NasMessage {
         /// UE can detect), reported by the RRC CellSelector for TS 23.122
         /// §4.4.3 automatic PLMN selection. Empty if none are known yet.
         available_plmns: Vec<crate::rrc::cell_selection::Plmn>,
+        /// PLMN broadcast by the cell the UE is now camped on, when its SIB1 has
+        /// been read (issue #49).
+        ///
+        /// This is what makes the REGISTERED PLMN knowable. It used to be recorded
+        /// as the configured home PLMN unconditionally, so `PlmnSelector` could not
+        /// tell an HPLMN from a VPLMN -- and because its periodic-search guard turns
+        /// on exactly that distinction, the TS 23.122 §4.4.3.3 higher-priority
+        /// search could never fire.
+        serving_plmn: Option<crate::rrc::cell_selection::Plmn>,
     },
     /// RRC fallback indication (from RRC)
     RrcFallbackIndication,
@@ -426,6 +435,17 @@ pub enum NasMessage {
 /// Based on `NmUeNasToRrc`, `NmUeRlsToRrc`, `NmUeRrcToRrc` from `src/ue/nts.hpp`.
 #[derive(Debug)]
 pub enum RrcMessage {
+    /// The PLMN automatic selection chose (TS 23.122 §4.4.3, issue #49).
+    ///
+    /// Pushes the NAS-side selection result back into the RRC cell selector, which
+    /// is what `PlmnSelector::set_selected_plmn`'s own doc comment says should
+    /// happen ("called by NAS after PLMN selection") and which nothing did: cell
+    /// selection stayed pinned to the configured home PLMN, so a UE that selected
+    /// another available PLMN would still only camp on cells of its own.
+    SetSelectedPlmn {
+        /// The chosen PLMN.
+        plmn: crate::rrc::cell_selection::Plmn,
+    },
     /// Local release connection (from NAS)
     LocalReleaseConnection {
         /// Treat as barred

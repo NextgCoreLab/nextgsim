@@ -824,6 +824,34 @@ pub enum PlmnSelectionMode {
 
 /// Decode a 3-octet BCD PLMN (TS 24.501 Section 9.11.3.4 layout, as kept
 /// in the MM orchestrator's forbidden-PLMN list) into a [`Plmn`].
+/// Parse a configured PLMN written as `"<mcc>-<mnc>"`, e.g. `"001-01"` or
+/// `"262-030"` (issue #49).
+///
+/// The MNC's DIGIT COUNT is significant and is taken from the text: a 3-digit MNC
+/// is a different PLMN from the 2-digit one with the same value (TS 23.003 §2.2),
+/// and they encode differently on the wire. So `"262-03"` and `"262-030"` are not
+/// the same network, and writing one when the other was meant is a mistake this
+/// preserves rather than normalises away.
+///
+/// `None` for anything that is not two numeric fields with a 3-digit MCC and a
+/// 2- or 3-digit MNC.
+pub fn parse_configured_plmn(text: &str) -> Option<Plmn> {
+    let (mcc, mnc) = text.trim().split_once('-')?;
+    let mcc = mcc.trim();
+    let mnc = mnc.trim();
+    if mcc.len() != 3 || !matches!(mnc.len(), 2 | 3) {
+        return None;
+    }
+    if !mcc.chars().all(|c| c.is_ascii_digit()) || !mnc.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(Plmn::new(
+        mcc.parse().ok()?,
+        mnc.parse().ok()?,
+        mnc.len() == 3,
+    ))
+}
+
 pub fn plmn_from_bcd(bcd: &[u8; 3]) -> Plmn {
     let mcc1 = u16::from(bcd[0] & 0x0F);
     let mcc2 = u16::from(bcd[0] >> 4);
@@ -880,6 +908,11 @@ pub struct PlmnSelector {
     /// CellSelector; the candidate set for automatic selection (TS 23.122
     /// §4.4.3).
     available: Vec<Plmn>,
+    /// PLMN broadcast by the cell the UE is camped on (issue #49), which is what a
+    /// successful registration records as the RPLMN. `None` until a cell has been
+    /// selected -- and a cell is only selected once its SIB1 has been read, so this
+    /// is a broadcast value rather than an assumed one.
+    serving_plmn: Option<Plmn>,
     /// Manually chosen PLMN (manual mode)
     manual_selection: Option<Plmn>,
     /// Higher-priority PLMN search interval (timer T) in seconds
@@ -902,6 +935,7 @@ impl PlmnSelector {
             operator_preferred: Vec::new(),
             forbidden: Vec::new(),
             available: Vec::new(),
+            serving_plmn: None,
             manual_selection: None,
             hp_search_interval_secs: DEFAULT_HP_PLMN_SEARCH_INTERVAL_SECS,
             hp_search_elapsed_secs: 0,
@@ -939,6 +973,20 @@ impl PlmnSelector {
     /// Set the operator-controlled preferred PLMN list (priority order)
     pub fn set_operator_preferred(&mut self, plmns: Vec<Plmn>) {
         self.operator_preferred = plmns;
+    }
+
+    /// Record the PLMN broadcast by the cell the UE is camped on (issue #49).
+    ///
+    /// Held here rather than threaded through the MM output handler because the rest
+    /// of the selection state -- available, registered, selected, forbidden -- already
+    /// lives here, and a second home for one of them is how they drift apart.
+    pub fn set_serving_plmn(&mut self, plmn: Option<Plmn>) {
+        self.serving_plmn = plmn;
+    }
+
+    /// The PLMN of the camped cell, when one has been read from SIB1.
+    pub fn serving_plmn(&self) -> Option<Plmn> {
+        self.serving_plmn
     }
 
     /// Record a successful registration on the given PLMN
@@ -1364,6 +1412,136 @@ mod tests {
         // Back to automatic
         selector.set_automatic();
         assert_eq!(selector.select(&[HOME, VISITED]), Some(HOME));
+    }
+
+    // --- Issue #49: the wiring that was missing ---
+
+    /// CRITERION 6: with two PLMNs available on the radio and the HPLMN forbidden
+    /// (reject cause #11/#74), the UE selects the OTHER available PLMN rather than
+    /// staying in limited service.
+    ///
+    /// This is the case the hardcoded `[home_plmn]` candidate list made impossible:
+    /// with one forbidden candidate and nothing else to choose from, selection had
+    /// no answer however the radio looked.
+    #[test]
+    fn a_forbidden_hplmn_is_replaced_by_another_available_plmn() {
+        let mut selector = PlmnSelector::new(HOME);
+        // The radio reports two PLMNs, as `CellSelector::available_plmns` now does.
+        selector.set_available_plmns(vec![HOME, VISITED]);
+        assert_eq!(selector.available_plmns(), &[HOME, VISITED]);
+
+        // Before the rejection the HPLMN wins, which is the happy path.
+        assert_eq!(selector.select(selector.available_plmns()), Some(HOME));
+
+        // Reject cause #11 for the HPLMN.
+        selector.add_forbidden(HOME);
+        assert_eq!(
+            selector.select(selector.available_plmns()),
+            Some(VISITED),
+            "a forbidden HPLMN must not leave the UE in limited service when \
+             another PLMN is available"
+        );
+
+        // And with NOTHING else available it correctly has no answer -- so the
+        // assertion above is about the second candidate, not about ignoring the
+        // forbidden list.
+        assert_eq!(selector.select(&[HOME]), None);
+    }
+
+    /// CRITERION 7: registered on a VPLMN, the periodic higher-priority search
+    /// eventually fires; registered on the HPLMN it never does.
+    ///
+    /// Both halves matter. The guard was permanently taken because the RPLMN was
+    /// recorded as the HPLMN unconditionally, so `tick()` always returned false and
+    /// the call site that drives the search was dead code.
+    #[test]
+    fn the_periodic_higher_priority_search_fires_on_a_vplmn_and_not_on_the_hplmn() {
+        let interval = 6 * 60; // the spec's lower bound, so the loop stays short
+
+        // On a VPLMN: fires exactly on the interval, and not before.
+        let mut selector = PlmnSelector::new(HOME);
+        selector.set_hp_search_interval(interval);
+        selector.set_registered_plmn(Some(VISITED));
+        for elapsed in 1..interval {
+            assert!(
+                !selector.tick(),
+                "the search must not fire after only {elapsed}s"
+            );
+        }
+        assert!(selector.tick(), "it must fire once timer T elapses");
+
+        // On the HPLMN: never, however long it runs.
+        let mut selector = PlmnSelector::new(HOME);
+        selector.set_hp_search_interval(interval);
+        selector.set_registered_plmn(Some(HOME));
+        for _ in 0..(interval * 2) {
+            assert!(
+                !selector.tick(),
+                "a UE already on its HPLMN has no higher-priority PLMN to seek"
+            );
+        }
+    }
+
+    /// The serving PLMN is what a successful registration records as the RPLMN, so
+    /// the selector has to hold it (issue #49).
+    #[test]
+    fn the_serving_plmn_is_recorded_and_readable() {
+        let mut selector = PlmnSelector::new(HOME);
+        assert_eq!(
+            selector.serving_plmn(),
+            None,
+            "unknown until a cell is selected"
+        );
+        selector.set_serving_plmn(Some(VISITED));
+        assert_eq!(selector.serving_plmn(), Some(VISITED));
+
+        // And it is independent of the REGISTERED PLMN: the UE can be camped on a
+        // cell it has not registered through.
+        assert_eq!(selector.registered_plmn(), None);
+    }
+
+    #[test]
+    fn a_configured_plmn_parses_and_keeps_its_mnc_digit_count() {
+        assert_eq!(
+            parse_configured_plmn("001-01"),
+            Some(Plmn::new(1, 1, false))
+        );
+        assert_eq!(
+            parse_configured_plmn("262-030"),
+            Some(Plmn::new(262, 30, true)),
+            "a 3-digit MNC must stay a 3-digit MNC"
+        );
+        // The digit count is significant: these are DIFFERENT networks and they
+        // encode differently on the wire (TS 23.003 §2.2).
+        assert_ne!(
+            parse_configured_plmn("262-03"),
+            parse_configured_plmn("262-030")
+        );
+        // Whitespace is tolerated, because a YAML list invites it.
+        assert_eq!(
+            parse_configured_plmn(" 001 - 01 "),
+            Some(Plmn::new(1, 1, false))
+        );
+    }
+
+    #[test]
+    fn a_malformed_configured_plmn_is_rejected_rather_than_guessed() {
+        // A wrong entry in a PREFERENCE list sends the UE to the wrong network, so
+        // none of these may resolve to something plausible.
+        for text in [
+            "", "001", "001-", "-01", "01-01", "0001-01", "001-1", "001-0001", "abc-01", "001-0a",
+            "001/01",
+            // A SIGNED field is the case a length check alone lets through:
+            // `"+01".parse::<u16>()` is Ok(1), so without the explicit digit check
+            // this would silently resolve to MNC 01 -- a different network, from
+            // text nobody meant as one.
+            "001-+01", "+01-01", "001--1",
+        ] {
+            assert!(
+                parse_configured_plmn(text).is_none(),
+                "'{text}' must not parse"
+            );
+        }
     }
 
     #[test]

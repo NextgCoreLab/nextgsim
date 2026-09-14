@@ -507,7 +507,7 @@ impl UeApp {
         use nextgsim_nas::ies::RegistrationType;
         use nextgsim_ue::nas::mm::{CmState, MmOrchestrator, MmUeIdentity};
         use nextgsim_ue::nas::sm::{SmOrchestrator, SmSessionParams};
-        use nextgsim_ue::rrc::cell_selection::{Plmn, PlmnSelector};
+        use nextgsim_ue::rrc::cell_selection::{parse_configured_plmn, Plmn, PlmnSelector};
 
         info!("NAS task started");
 
@@ -577,6 +577,45 @@ impl UeApp {
         // explicit EF_EHPLMN list is configured the HPLMN derived from the IMSI
         // is the (single) equivalent-HPLMN entry, so seed the selector with it.
         plmn_selector.set_ehplmn_list(vec![home_plmn]);
+        // TS 23.122 §4.4.3.1.1 preference lists and §4.4.3.3 timer T from
+        // configuration (issue #49). The setters existed and had no production
+        // caller, so a configured preference could not influence selection and the
+        // periodic-search interval could not be changed at all.
+        //
+        // An unparsable entry is DROPPED with a warning rather than silently read as
+        // some other PLMN: a preference list is an ordering, and a wrong entry in it
+        // sends the UE to the wrong network.
+        let parse_plmn_list = |entries: &[String], label: &str| -> Vec<Plmn> {
+            entries
+                .iter()
+                .filter_map(|entry| match parse_configured_plmn(entry) {
+                    Some(plmn) => Some(plmn),
+                    None => {
+                        warn!("Ignoring unparsable {label} PLMN '{entry}' (expected <mcc>-<mnc>)");
+                        None
+                    }
+                })
+                .collect()
+        };
+        let user_preferred =
+            parse_plmn_list(&task_base.config.plmn_user_preferred, "user-preferred");
+        let operator_preferred = parse_plmn_list(
+            &task_base.config.plmn_operator_preferred,
+            "operator-preferred",
+        );
+        if !user_preferred.is_empty() || !operator_preferred.is_empty() {
+            info!(
+                "PLMN preferences: {} user-preferred, {} operator-preferred",
+                user_preferred.len(),
+                operator_preferred.len()
+            );
+        }
+        plmn_selector.set_user_preferred(user_preferred);
+        plmn_selector.set_operator_preferred(operator_preferred);
+        if let Some(secs) = task_base.config.plmn_hp_search_interval_secs {
+            plmn_selector.set_hp_search_interval(secs);
+            info!("Higher-priority PLMN search interval (timer T) set from config: {secs}s");
+        }
 
         let mut pdu_counter: u32 = 0;
 
@@ -782,6 +821,7 @@ impl UeApp {
                         NasMessage::ActiveCellChanged {
                             previous_tai,
                             available_plmns: reported_plmns,
+                            serving_plmn: reported_serving_plmn,
                         } => {
                             info!("Active cell changed from TAI: {:?}", previous_tai);
                             // Refresh the selector's available-PLMN candidate set
@@ -789,6 +829,12 @@ impl UeApp {
                             // report leaves the last-known set in place.
                             if !reported_plmns.is_empty() {
                                 plmn_selector.set_available_plmns(reported_plmns);
+                            }
+                            // Remember which PLMN the UE is actually camped on, so a
+                            // successful registration records the REAL RPLMN rather
+                            // than the configured home PLMN (issue #49).
+                            if let Some(plmn) = reported_serving_plmn {
+                                plmn_selector.set_serving_plmn(Some(plmn));
                             }
                             if orch.state().is_registered() {
                                 // Mobility registration update trigger
@@ -1221,9 +1267,25 @@ async fn process_mm_outputs(
                 // unless `state_file` is configured.
                 orch.persist_state();
                 notify_rel18_registration(task_base, true).await;
-                // TS 23.122: record the registered PLMN (the camped cell
-                // broadcasts the configured PLMN in this simulation)
-                plmn_selector.set_registered_plmn(Some(home_plmn));
+                // TS 23.122: record the REGISTERED PLMN as the one the camped cell
+                // broadcast (issue #49). It used to be the configured home PLMN
+                // unconditionally, which meant `PlmnSelector` could never tell an
+                // HPLMN from a VPLMN -- and since its periodic-search guard turns on
+                // exactly that distinction, the §4.4.3.3 higher-priority search was
+                // unreachable.
+                //
+                // The home PLMN remains the fallback for a registration that
+                // completed before any SIB1 was read, which is the one case where
+                // the radio has told the UE nothing better.
+                let rplmn = plmn_selector.serving_plmn().unwrap_or(home_plmn);
+                if plmn_selector.serving_plmn().is_none() {
+                    debug!(
+                        "No serving-cell PLMN reported yet; recording the home PLMN \
+                         {home_plmn} as the RPLMN"
+                    );
+                }
+                info!("Registered PLMN recorded as {rplmn}");
+                plmn_selector.set_registered_plmn(Some(rplmn));
 
                 // Establish the configured default PDU sessions via the SM
                 // orchestrator (PSI/PTI allocation, T3580, UL NAS Transport
@@ -1682,6 +1744,15 @@ async fn perform_plmn_selection(
     match plmn_selector.select(&candidates) {
         Some(plmn) => {
             info!("PLMN selection chose {plmn}: attempting registration");
+            // TS 23.122 §4.4.3: the chosen PLMN is what cell selection must now
+            // search for. Without this the RRC selector kept the configured home
+            // PLMN and the UE could not camp on the PLMN it had just selected
+            // (issue #49) -- which is what `set_selected_plmn`'s own doc comment
+            // said should happen and nothing did.
+            let _ = task_base
+                .rrc_tx
+                .send(RrcMessage::SetSelectedPlmn { plmn })
+                .await;
             let outs = orch.start_registration(RegistrationType::InitialRegistration);
             for out in outs {
                 if let MmOutput::SendNasPdu(nas_pdu) = out {
