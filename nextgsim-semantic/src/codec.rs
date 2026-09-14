@@ -69,6 +69,104 @@ fn warn_fallback_once(flag: &AtomicBool, role: &str, method: &str) {
     }
 }
 
+/// Which algorithm a codec is actually running (issue #28).
+///
+/// Reported rather than inferred: the module docs used to state in prose that the
+/// mean-pooling path is "always the default", which a caller could not check and
+/// a test could not assert. With no `.onnx` in the tree an ONNX-backed and a
+/// fallback codec produce differently-shaped output but nothing named which ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecAlgorithm {
+    /// Stride-based mean pooling with variance-derived importance weights.
+    MeanPooling,
+    /// Nearest-neighbour upsampling.
+    NearestNeighbour,
+    /// A learned model executed through ONNX Runtime.
+    Onnx,
+}
+
+impl CodecAlgorithm {
+    /// Whether this is a learned model rather than an analytic stand-in.
+    pub fn is_learned(self) -> bool {
+        matches!(self, Self::Onnx)
+    }
+}
+
+/// Compresses a signal into task-relevant semantic features.
+///
+/// The trait exists so a consumer can be written against "a semantic encoder"
+/// instead of against `NeuralEncoder` specifically -- which is what let
+/// `isac_integration` grow its own copy of mean pooling rather than reusing the
+/// codec's.
+pub trait SemanticEncode {
+    /// Encode `data` for `task`.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] when a loaded model fails to run or produces
+    /// output the caller cannot use. The analytic fallback cannot fail.
+    fn encode(&self, data: &[f32], task: SemanticTask) -> Result<SemanticFeatures, CodecError>;
+
+    /// The compressed feature dimension this encoder targets.
+    fn target_dim(&self) -> usize;
+
+    /// Which algorithm the next [`Self::encode`] will run.
+    fn algorithm(&self) -> CodecAlgorithm;
+}
+
+/// Reconstructs a signal from semantic features.
+pub trait SemanticDecode {
+    /// Decode `features` back to a signal of the original length.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] when a loaded model fails to run or produces
+    /// output the caller cannot use.
+    fn decode(&self, features: &SemanticFeatures) -> Result<Vec<f32>, CodecError>;
+
+    /// Which algorithm the next [`Self::decode`] will run.
+    fn algorithm(&self) -> CodecAlgorithm;
+}
+
+/// Stride-based mean pooling: the analytic encoder both the codec fallback and
+/// the ISAC measurement compressor use (issue #28).
+///
+/// Returns the per-chunk means and a variance-derived importance weight per
+/// chunk, normalised to a maximum of 1.0. ONE implementation, because two copies
+/// of a compression algorithm are two things a decoder can disagree with.
+///
+/// `feature_dim` is clamped to at least 1, and a `data` shorter than
+/// `feature_dim` yields one feature per available chunk rather than padding --
+/// padding would invent signal.
+pub fn mean_pool(data: &[f32], feature_dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let feature_dim = feature_dim.max(1);
+    let stride = (data.len() / feature_dim).max(1);
+    let mut features = Vec::with_capacity(feature_dim);
+    let mut importance = Vec::with_capacity(feature_dim);
+
+    for i in 0..feature_dim {
+        let start = i * stride;
+        let end = ((i + 1) * stride).min(data.len());
+
+        if start < data.len() {
+            let chunk = &data[start..end];
+            let mean: f32 = chunk.iter().sum::<f32>() / chunk.len() as f32;
+            let variance: f32 =
+                chunk.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / chunk.len() as f32;
+
+            features.push(mean);
+            importance.push((variance + 0.1).sqrt());
+        }
+    }
+
+    let max_importance = importance.iter().copied().fold(f32::MIN, f32::max);
+    if max_importance > 0.0 {
+        for imp in &mut importance {
+            *imp /= max_importance;
+        }
+    }
+
+    (features, importance)
+}
+
 /// Semantic encoder for feature vector compression.
 ///
 /// **Operational algorithm**: stride-based **mean-pooling** — the input is
@@ -244,36 +342,10 @@ impl NeuralEncoder {
         Ok(features)
     }
 
-    /// Mean-pooling fallback encoder (matches the original `SemanticEncoder::encode` logic).
+    /// Mean-pooling fallback encoder, via the shared [`mean_pool`] so the ISAC
+    /// measurement compressor and this path cannot drift apart.
     fn encode_fallback(&self, data: &[f32], task: SemanticTask) -> SemanticFeatures {
-        let feature_dim = self.target_dim;
-        let stride = (data.len() / feature_dim).max(1);
-        let mut features = Vec::with_capacity(feature_dim);
-        let mut importance = Vec::with_capacity(feature_dim);
-
-        for i in 0..feature_dim {
-            let start = i * stride;
-            let end = ((i + 1) * stride).min(data.len());
-
-            if start < data.len() {
-                let chunk = &data[start..end];
-                let mean: f32 = chunk.iter().sum::<f32>() / chunk.len() as f32;
-                let variance: f32 =
-                    chunk.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / chunk.len() as f32;
-
-                features.push(mean);
-                importance.push((variance + 0.1).sqrt());
-            }
-        }
-
-        // Normalize importance
-        let max_importance = importance.iter().copied().fold(f32::MIN, f32::max);
-        if max_importance > 0.0 {
-            for imp in &mut importance {
-                *imp /= max_importance;
-            }
-        }
-
+        let (features, importance) = mean_pool(data, self.target_dim);
         let task_id = task_to_id(task);
         SemanticFeatures::new(task_id, features, vec![data.len()]).with_importance(importance)
     }
@@ -452,6 +524,40 @@ impl NeuralDecoder {
     }
 }
 
+impl SemanticEncode for NeuralEncoder {
+    fn encode(&self, data: &[f32], task: SemanticTask) -> Result<SemanticFeatures, CodecError> {
+        NeuralEncoder::encode(self, data, task)
+    }
+
+    fn target_dim(&self) -> usize {
+        self.target_dim
+    }
+
+    fn algorithm(&self) -> CodecAlgorithm {
+        // Reads the same flag `encode` dispatches on, so this cannot claim ONNX
+        // while the fallback runs.
+        if self.model_loaded {
+            CodecAlgorithm::Onnx
+        } else {
+            CodecAlgorithm::MeanPooling
+        }
+    }
+}
+
+impl SemanticDecode for NeuralDecoder {
+    fn decode(&self, features: &SemanticFeatures) -> Result<Vec<f32>, CodecError> {
+        NeuralDecoder::decode(self, features)
+    }
+
+    fn algorithm(&self) -> CodecAlgorithm {
+        if self.model_loaded {
+            CodecAlgorithm::Onnx
+        } else {
+            CodecAlgorithm::NearestNeighbour
+        }
+    }
+}
+
 /// Combined neural codec holding both an encoder and a decoder.
 ///
 /// Provides a convenient single-object interface for encode/decode round-trips.
@@ -595,6 +701,193 @@ mod tests {
         assert_eq!(task_to_id(SemanticTask::SensorFusion), 4);
         assert_eq!(task_to_id(SemanticTask::VideoAnalytics), 5);
         assert_eq!(task_to_id(SemanticTask::Custom(42)), 42);
+    }
+
+    // --- Trait-based codec, fidelity and one mean-pooling implementation (#28) ---
+
+    #[test]
+    fn a_fallback_round_trip_preserves_the_signal_to_a_documented_fidelity() {
+        // The pre-existing round-trip test asserted only that the output LENGTH
+        // matched, which every codec including a constant-zero one satisfies.
+        // This asserts a task-relevant FIDELITY on a smooth signal, which is what
+        // mean pooling plus nearest-neighbour upsampling can actually preserve.
+        use crate::metrics::{cosine_similarity, mse};
+
+        let codec = NeuralCodec::new(32).expect("codec");
+        // A smooth ramp with a slow sinusoid: representative of a sensor trace,
+        // and band-limited enough that 4:1 mean pooling is a fair summary.
+        let data: Vec<f32> = (0..128)
+            .map(|i| {
+                let t = i as f32 / 127.0;
+                t + 0.2 * (t * std::f32::consts::TAU).sin()
+            })
+            .collect();
+
+        let features = codec
+            .encode(&data, SemanticTask::SensorFusion)
+            .expect("encode");
+        let decoded = codec.decode(&features).expect("decode");
+
+        assert_eq!(decoded.len(), data.len());
+        // DOCUMENTED BOUNDS for the analytic fallback at 4:1 compression on a
+        // smooth signal: cosine similarity above 0.99 and mean squared error
+        // below 0.01. They are bounds on the FALLBACK, not on semantic
+        // communication in general -- a learned codec would be judged on a task
+        // metric instead.
+        let similarity = cosine_similarity(&data, &decoded);
+        let error = mse(&data, &decoded);
+        assert!(
+            similarity > 0.99,
+            "cosine similarity {similarity:.4} below the 0.99 bound"
+        );
+        assert!(error < 0.01, "MSE {error:.5} above the 0.01 bound");
+    }
+
+    #[test]
+    fn a_round_trip_of_noise_is_not_claimed_to_be_faithful() {
+        // The counterpart that stops the bound above from being a tautology: mean
+        // pooling DISCARDS high-frequency content, so on alternating noise the
+        // same round trip must NOT clear the same bar. A codec that passed both
+        // would be preserving something it cannot.
+        use crate::metrics::mse;
+
+        let codec = NeuralCodec::new(32).expect("codec");
+        let data: Vec<f32> = (0..128)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+
+        let features = codec
+            .encode(&data, SemanticTask::SensorFusion)
+            .expect("encode");
+        let decoded = codec.decode(&features).expect("decode");
+
+        assert!(
+            mse(&data, &decoded) > 0.5,
+            "alternating noise cannot survive mean pooling; the fidelity bound \
+             above would then be measuring nothing"
+        );
+    }
+
+    #[test]
+    fn the_codec_reports_which_algorithm_it_will_run() {
+        // With no model loaded the encoder must SAY mean-pooling rather than
+        // leaving a caller to infer it from prose.
+        let encoder = NeuralEncoder::new(16).expect("encoder");
+        assert_eq!(
+            SemanticEncode::algorithm(&encoder),
+            CodecAlgorithm::MeanPooling
+        );
+        assert!(!SemanticEncode::algorithm(&encoder).is_learned());
+        assert_eq!(SemanticEncode::target_dim(&encoder), 16);
+
+        let decoder = NeuralDecoder::new().expect("decoder");
+        assert_eq!(
+            SemanticDecode::algorithm(&decoder),
+            CodecAlgorithm::NearestNeighbour
+        );
+        assert!(!SemanticDecode::algorithm(&decoder).is_learned());
+    }
+
+    #[test]
+    fn a_consumer_can_be_generic_over_any_semantic_encoder() {
+        // The point of the trait: a consumer written against `dyn SemanticEncode`
+        // rather than against NeuralEncoder. Without it, `isac_integration` grew
+        // its own copy of mean pooling.
+        fn compress(encoder: &dyn SemanticEncode, data: &[f32]) -> (usize, usize) {
+            // Both the encoder's declared dimension and what it actually
+            // produces, read through the trait: a consumer sizing a buffer off
+            // `target_dim` and then receiving a different count is the failure
+            // this pins.
+            let produced = encoder
+                .encode(data, SemanticTask::SensorFusion)
+                .map(|f| f.features.len())
+                .unwrap_or(0);
+            (encoder.target_dim(), produced)
+        }
+
+        let encoder = NeuralEncoder::new(8).expect("encoder");
+        let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        assert_eq!(compress(&encoder, &data), (8, 8));
+    }
+
+    #[test]
+    fn the_isac_compressor_and_the_codec_fallback_pool_identically() {
+        // One implementation, asserted rather than assumed: these are the two
+        // call sites that used to hold separate copies of the algorithm.
+        use crate::isac_integration::{
+            IsacSemanticCompressor, MeasurementMetadata, SensingCompressionParams,
+        };
+
+        let measurements: Vec<f32> = (0..120).map(|i| (i as f32) * 0.25).collect();
+        let mut compressor = IsacSemanticCompressor::new();
+        let params = SensingCompressionParams {
+            target_compression: 4.0,
+            ..Default::default()
+        };
+        let metadata = MeasurementMetadata {
+            measurement_types: vec!["ToA".to_string()],
+            anchor_ids: vec![1],
+            uncertainties: vec![0.5],
+            timestamp_ms: 0,
+        };
+        let compressed = compressor.compress_measurements(measurements.clone(), metadata, params);
+
+        let (expected, _) = mean_pool(&measurements, 30);
+        assert_eq!(
+            compressed.features.features, expected,
+            "the ISAC compressor must pool exactly as the codec does"
+        );
+    }
+
+    #[test]
+    fn mean_pool_survives_asking_for_more_features_than_samples() {
+        // The defect the deduplication removed: the ISAC copy computed its chunk
+        // size without a `.max(1)`, so this divided by zero and produced NaN.
+        let data = vec![1.0, 2.0, 3.0];
+        let (features, importance) = mean_pool(&data, 10);
+        assert!(
+            features.iter().all(|f| f.is_finite()),
+            "no NaN: {features:?}"
+        );
+        assert_eq!(
+            features.len(),
+            data.len(),
+            "one feature per available sample"
+        );
+        assert_eq!(importance.len(), features.len());
+    }
+
+    #[test]
+    fn mean_pool_normalises_importance_to_a_maximum_of_one() {
+        // Importance weights drive feature pruning elsewhere in this crate, so
+        // their SCALE is load-bearing: un-normalised weights make a pruning
+        // threshold mean something different for every input.
+        let data: Vec<f32> = (0..64)
+            .map(|i| if i < 32 { i as f32 * 10.0 } else { 5.0 })
+            .collect();
+        let (_, importance) = mean_pool(&data, 8);
+
+        let max = importance.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            (max - 1.0).abs() < 1e-6,
+            "the largest importance weight must be 1.0, got {max}"
+        );
+        // And the quiet half must weigh less than the varying half, or the
+        // normalisation has flattened the signal it exists to express.
+        assert!(
+            importance[7] < importance[0],
+            "a constant chunk must matter less: {importance:?}"
+        );
+    }
+
+    #[test]
+    fn mean_pool_clamps_a_zero_feature_dimension() {
+        let (features, _) = mean_pool(&[1.0, 2.0, 3.0, 4.0], 0);
+        assert_eq!(
+            features.len(),
+            1,
+            "a zero dimension must not panic or divide by zero"
+        );
     }
 }
 
