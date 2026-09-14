@@ -12,6 +12,10 @@ workspace = true
 
 [dependencies]
 tracing = { workspace = true }
+thiserror = { workspace = true }
+# SRB PDCP integrity and ciphering (TS 38.323 §5.8/§5.9) lives here because BOTH
+# the gNB and the UE must agree on the layout byte for byte -- see srb_security.rs.
+nextgsim-crypto = { workspace = true }
 
 [dev-dependencies]
 # RLC, for the ONE cross-layer test that shows the duplicate-suppression handover

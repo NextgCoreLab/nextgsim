@@ -689,3 +689,78 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// SecurityModeFailure (UE -> gNB, UL-DCCH) — TS 38.331 §5.3.4.4, issue #31
+// ============================================================================
+
+/// Parameters for a `SecurityModeFailure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecurityModeFailureParams {
+    /// RRC-TransactionIdentifier of the SecurityModeCommand being refused.
+    ///
+    /// Echoed rather than freshly allocated: TS 38.331 §5.3.4.4 makes this the
+    /// response to a specific command, and a fresh id would leave the gNB unable
+    /// to tell which command failed.
+    pub rrc_transaction_id: u8,
+}
+
+/// Builds a `SecurityModeFailure` (TS 38.331 §5.3.4.4).
+///
+/// # Why this message has to exist
+///
+/// TS 38.331 §5.3.4.2: on a SecurityModeCommand whose integrity check **fails**,
+/// the UE continues using the configuration it had *before* the command and
+/// replies `SecurityModeFailure`. Before this, the UE had no way to say so — an
+/// unverifiable command was silently ignored, and the gNB waited for a
+/// SecurityModeComplete that would never come. Silence and refusal look identical
+/// to the network, which is the honesty defect issue #31 is about.
+///
+/// The message carries **no** integrity protection of its own: the UE has just
+/// established that it cannot agree with the gNB on keys, so protecting the
+/// refusal with those keys would make it unverifiable too.
+pub fn build_security_mode_failure(
+    params: &SecurityModeFailureParams,
+) -> Result<UL_DCCH_Message, RrcSecurityModeError> {
+    if params.rrc_transaction_id > 3 {
+        return Err(RrcSecurityModeError::InvalidFieldValue(
+            "RRC Transaction ID must be 0-3".to_string(),
+        ));
+    }
+
+    let failure = SecurityModeFailure {
+        rrc_transaction_identifier: RRC_TransactionIdentifier(params.rrc_transaction_id),
+        critical_extensions: SecurityModeFailureCriticalExtensions::SecurityModeFailure(
+            SecurityModeFailure_IEs {
+                late_non_critical_extension: None,
+                non_critical_extension: None,
+            },
+        ),
+    };
+
+    Ok(UL_DCCH_Message {
+        message: UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::SecurityModeFailure(failure)),
+    })
+}
+
+/// Builds and encodes a `SecurityModeFailure` to UPER bytes.
+pub fn encode_security_mode_failure(
+    params: &SecurityModeFailureParams,
+) -> Result<Vec<u8>, RrcSecurityModeError> {
+    let msg = build_security_mode_failure(params)?;
+    Ok(encode_rrc(&msg)?)
+}
+
+/// Decodes a `SecurityModeFailure`, returning the transaction id it refuses.
+pub fn decode_security_mode_failure(bytes: &[u8]) -> Result<u8, RrcSecurityModeError> {
+    let msg: UL_DCCH_Message = decode_rrc(bytes)?;
+    let UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::SecurityModeFailure(failure)) =
+        &msg.message
+    else {
+        return Err(RrcSecurityModeError::InvalidMessageType {
+            expected: "SecurityModeFailure".to_string(),
+            actual: format!("{:?}", msg.message),
+        });
+    };
+    Ok(failure.rrc_transaction_identifier.0)
+}

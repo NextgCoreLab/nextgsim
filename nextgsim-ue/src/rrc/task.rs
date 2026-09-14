@@ -30,8 +30,8 @@ use crate::rrc::reestablishment::{
 };
 use crate::rrc::resume::ResumeProcedure;
 use crate::rrc::security::{
-    compute_short_mac_i, AsSecurityContext, CipheringAlgorithm, IntegrityAlgorithm,
-    I5_UE_AS_SECURITY,
+    as_security_enabled, compute_short_mac_i, AsSecurityContext, AsSecurityError,
+    CipheringAlgorithm, IntegrityAlgorithm, DIRECTION_DOWNLINK, SMC_PDCP_COUNT, SRB1_BEARER,
 };
 use crate::rrc::state::{RrcState, RrcStateMachine};
 #[cfg(feature = "nextgsim-she")]
@@ -44,6 +44,7 @@ use crate::tasks::{SemanticCodecMessage, SemanticTaskType};
 use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
 use nextgsim_common::Plmn;
+use nextgsim_pdcp::srb_security::MAC_I_LEN;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::codec::{decode_rrc, BCCH_DL_SCH_Message, CellGroupConfig, RadioBearerConfig};
 use nextgsim_rrc::procedures::conditional_handover::decode_cho_config;
@@ -71,8 +72,8 @@ use nextgsim_rrc::procedures::rrc_setup::{
 };
 use nextgsim_rrc::procedures::scell_config::decode_scell_config;
 use nextgsim_rrc::procedures::security_mode::{
-    decode_security_mode_command, encode_security_mode_complete, SecurityModeCommandData,
-    SecurityModeCompleteParams,
+    decode_security_mode_command, encode_security_mode_complete, encode_security_mode_failure,
+    SecurityModeCommandData, SecurityModeCompleteParams, SecurityModeFailureParams,
 };
 use nextgsim_rrc::procedures::system_information::{
     decode_mib, is_system_information, parse_sib1, parse_system_information, CellBarredStatus,
@@ -512,8 +513,13 @@ impl RrcTask {
     /// unsupported cipher (NEA3 has no keystream in the sim), or no KgNB yet,
     /// the UE does NOT activate AS security and sends no SecurityModeComplete
     /// (the network's SMC transaction times out). Only reached when the
-    /// `I5_UE_AS_SECURITY` wire gate is on.
-    async fn handle_as_security_mode_command(&mut self, smc: SecurityModeCommandData) {
+    /// `UeConfig::as_security_enabled` wire gate is on.
+    async fn handle_as_security_mode_command(
+        &mut self,
+        smc: SecurityModeCommandData,
+        protected_bytes: &[u8],
+        mac_i: [u8; 4],
+    ) {
         let tid = smc.rrc_transaction_id;
 
         // Integrity protection is mandatory for AS security.
@@ -526,12 +532,12 @@ impl RrcTask {
         let integrity = IntegrityAlgorithm::from(integ_alg);
         let ciphering = CipheringAlgorithm::from(smc.security_algorithms.ciphering_algorithm);
 
-        // NEA3 keystream is not implemented by nextgsim-crypto: fail closed
-        // rather than derive a key we cannot use to cipher SRBs.
-        if ciphering == CipheringAlgorithm::Nea3 {
-            warn!("AS SecurityModeCommand (tid {tid}) selected NEA3 (unsupported keystream); not activating");
-            return;
-        }
+        // NEA3 is accepted. It used to be refused here with "unsupported
+        // keystream", on the strength of a comment that was never true:
+        // `zuc::nea3_encrypt` is complete and `nextgsim-nas` has used it for NAS
+        // ciphering all along (issue #31, criterion 6). Refusing it aborted
+        // activation against any peer that legitimately selected NEA3, which both
+        // ends advertise.
 
         let Some(kgnb) = self.pending_kgnb else {
             warn!(
@@ -543,6 +549,32 @@ impl RrcTask {
 
         let ctx =
             AsSecurityContext::derive_from_kgnb(&kgnb, ciphering, integrity, AS_SECURITY_C_RNTI);
+
+        // TS 38.331 §5.3.4.2: verify the SecurityModeCommand's integrity with the
+        // FRESHLY DERIVED K_RRCint before replying. On failure the UE continues
+        // with its previous configuration and answers SecurityModeFailure
+        // (§5.3.4.4).
+        //
+        // Before this, the command was accepted unverified: any peer that could put
+        // bytes on SRB1 could activate AS security with keys of its choosing, and
+        // the UE logged "AS security activated" for it.
+        //
+        // The SMC is integrity protected and NOT ciphered (§5.3.4.2), so the MAC-I
+        // is verified over the plaintext with a null cipher — which is why the
+        // integrity-only context below is built rather than reusing `ctx` whole.
+        match self.verify_security_mode_command(&ctx, protected_bytes, mac_i) {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(
+                    "AS SecurityModeCommand (tid {tid}) failed integrity verification \
+                     ({e}); keeping the previous configuration and answering \
+                     SecurityModeFailure (TS 38.331 §5.3.4.4)"
+                );
+                self.send_security_mode_failure(tid).await;
+                return;
+            }
+        }
+
         info!(
             "AS security activated: integrity=NIA{}, ciphering=NEA{}, tid={}",
             integrity.id(),
@@ -551,6 +583,60 @@ impl RrcTask {
         );
         self.set_as_security_context(ctx);
         self.send_security_mode_complete(tid).await;
+    }
+
+    /// Verifies a SecurityModeCommand's MAC-I with the freshly derived
+    /// `K_RRCint` (TS 38.331 §5.3.4.2, issue #31 criterion 3).
+    ///
+    /// The SMC is integrity protected but **not ciphered**, so the check is run
+    /// with a null cipher over the plaintext. A `Nia0` command is refused rather
+    /// than accepted: NIA0's MAC is all zeros, so "the MAC verified" would prove
+    /// nothing, and TS 33.501 §5.11.1 does not permit NIA0 for SRBs outside
+    /// unauthenticated emergency service.
+    fn verify_security_mode_command(
+        &self,
+        ctx: &AsSecurityContext,
+        protected_bytes: &[u8],
+        mac_i: [u8; 4],
+    ) -> Result<(), AsSecurityError> {
+        if ctx.integrity_algorithm == IntegrityAlgorithm::Nia0 {
+            return Err(AsSecurityError::IntegrityCheckFailed);
+        }
+        // Integrity-only: the SMC is not ciphered, so the verifying context uses
+        // NEA0 whatever cipher the command selected for later PDUs.
+        let integrity_only = AsSecurityContext {
+            ciphering_algorithm: CipheringAlgorithm::Nea0,
+            ..ctx.clone()
+        };
+        let expected = integrity_only.compute_rrc_mac_i(
+            SMC_PDCP_COUNT,
+            SRB1_BEARER,
+            DIRECTION_DOWNLINK,
+            protected_bytes,
+        );
+        if expected == mac_i {
+            Ok(())
+        } else {
+            Err(AsSecurityError::IntegrityCheckFailed)
+        }
+    }
+
+    /// Sends a `SecurityModeFailure` (UL-DCCH, SRB1, TS 38.331 §5.3.4.4).
+    ///
+    /// Unprotected, deliberately: the UE has just established that it cannot agree
+    /// with the gNB on keys, so protecting the refusal with those keys would make
+    /// it unverifiable too.
+    async fn send_security_mode_failure(&mut self, tid: u8) {
+        match encode_security_mode_failure(&SecurityModeFailureParams {
+            rrc_transaction_id: tid,
+        }) {
+            Ok(pdu) => {
+                warn!("Sending AS SecurityModeFailure (tid={tid})");
+                self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                    .await;
+            }
+            Err(e) => error!("Failed to encode SecurityModeFailure: {e}"),
+        }
     }
 
     /// Build and send the RRC SecurityModeComplete (UL-DCCH, SRB1) echoing the
@@ -1480,13 +1566,21 @@ impl RrcTask {
         // leading byte 0x20 has low-nibble 0x0 — which the legacy matcher below
         // would misroute to the RRCReconfiguration arm. Default-off: the
         // matched-sim path is unchanged (this whole block is skipped).
-        if I5_UE_AS_SECURITY {
-            if let Ok(smc) = decode_security_mode_command(bytes) {
+        if as_security_enabled(&self.task_base.config) && bytes.len() > MAC_I_LEN {
+            // The SecurityModeCommand arrives INTEGRITY PROTECTED and unciphered
+            // (TS 38.331 §5.3.4.2), so the PDCP payload is `smc_uper || MAC-I`.
+            // Split explicitly rather than relying on the UPER decoder to tolerate
+            // trailing octets: the MAC-I must be verified over exactly the bytes the
+            // gNB signed, and "whatever the decoder did not consume" is not that.
+            let (pdu, mac) = bytes.split_at(bytes.len() - MAC_I_LEN);
+            if let Ok(smc) = decode_security_mode_command(pdu) {
                 info!(
                     "Received AS SecurityModeCommand from cell {} (tid {})",
                     cell_id, smc.rrc_transaction_id
                 );
-                self.handle_as_security_mode_command(smc).await;
+                let mac_i: [u8; MAC_I_LEN] =
+                    mac.try_into().expect("split_at yields exactly MAC_I_LEN");
+                self.handle_as_security_mode_command(smc, pdu, mac_i).await;
                 return;
             }
         }
@@ -4017,6 +4111,31 @@ mod tests {
         .expect("gNB encodes SecurityModeCommand")
     }
 
+    /// The MAC-I the **gNB** appends to a SecurityModeCommand (issue #31).
+    ///
+    /// Computed here the way the gNB computes it — through the shared
+    /// `nextgsim-pdcp` layer, with the keys derived from the same KgNB — so these
+    /// tests fail if the gNB's protect and the UE's verify ever disagree. That is
+    /// the whole point of hoisting the layer.
+    fn gnb_smc_mac_i(pdu: &[u8]) -> [u8; MAC_I_LEN] {
+        use nextgsim_pdcp::srb_security::SrbSecurity;
+        let k_rrc_int = derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcInt, 2);
+        let k_rrc_enc = derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcEnc, 0);
+        // Integrity only: the SMC is not ciphered (TS 38.331 §5.3.4.2).
+        SrbSecurity::new(k_rrc_enc, k_rrc_int, 0, 2)
+            .expect("legal ids")
+            .compute_mac_i(SMC_PDCP_COUNT, SRB1_BEARER, DIRECTION_DOWNLINK, pdu)
+    }
+
+    /// Hands the UE a SecurityModeCommand exactly as the gNB would: the UPER PDU
+    /// followed by its MAC-I.
+    async fn deliver_gnb_smc(task: &mut RrcTask, tid: u8) {
+        let pdu = gnb_smc_bytes(tid);
+        let mac = gnb_smc_mac_i(&pdu);
+        let smc = decode_security_mode_command(&pdu).expect("decode SMC");
+        task.handle_as_security_mode_command(smc, &pdu, mac).await;
+    }
+
     #[test]
     fn test_as_smc_derives_keys_and_completes_strict_peer() {
         let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
@@ -4026,8 +4145,7 @@ mod tests {
             // NAS plane handed us KgNB (TS 33.501 §6.9.4.1).
             task.set_pending_kgnb(TEST_KGNB);
 
-            let smc = decode_security_mode_command(&gnb_smc_bytes(0)).expect("decode SMC");
-            task.handle_as_security_mode_command(smc).await;
+            deliver_gnb_smc(&mut task, 0).await;
 
             // AS security context installed; keys byte-identical to the gNB's
             // own derive_rrc_up_key(KgNB, ...) (TS 33.501 Annex A.8).
@@ -4064,8 +4182,7 @@ mod tests {
         let mut task = RrcTask::new(task_base);
         run_async(async {
             task.set_pending_kgnb(TEST_KGNB);
-            let smc = decode_security_mode_command(&gnb_smc_bytes(3)).unwrap();
-            task.handle_as_security_mode_command(smc).await;
+            deliver_gnb_smc(&mut task, 3).await;
             let (_ch, complete) = next_uplink_rrc(&mut rls_rx);
             assert_eq!(
                 decode_security_mode_complete(complete.data())
@@ -4077,6 +4194,187 @@ mod tests {
         });
     }
 
+    /// #31, criterion 1: AS security activation is controlled by CONFIG, not by a
+    /// compile-time constant.
+    ///
+    /// It used to be `pub const I5_UE_AS_SECURITY: bool = false;`, so **no shipping
+    /// build could activate AS security at all**, whatever the operator set. This
+    /// asserts the predicate follows the config in both directions — a revert round
+    /// that pinned it back to `false` must fail here.
+    #[test]
+    fn as_security_activation_follows_the_config_not_a_constant() {
+        use crate::rrc::security::as_security_enabled;
+
+        let off = test_config();
+        assert!(
+            !as_security_enabled(&off),
+            "the default must stay off: enabling it drops all UL-DCCH traffic while \
+             the gNB dispatches on raw bytes"
+        );
+
+        let on = nextgsim_common::config::UeConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        assert!(
+            as_security_enabled(&on),
+            "an operator that turned it ON must get it: a hard-coded false made the \
+             configuration unactionable"
+        );
+    }
+
+    /// #31, criterion 3: a SecurityModeCommand whose MAC-I does not verify is
+    /// **refused**, the previous configuration is kept, and the UE answers
+    /// `SecurityModeFailure` (TS 38.331 §5.3.4.2, §5.3.4.4).
+    ///
+    /// Before this the command was accepted unverified: anything that could put
+    /// bytes on SRB1 could activate AS security with keys of its choosing, and the
+    /// UE logged "AS security activated" for it.
+    #[test]
+    fn a_security_mode_command_with_a_forged_mac_is_refused_with_a_failure() {
+        use nextgsim_rrc::procedures::security_mode::decode_security_mode_failure;
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+
+            let pdu = gnb_smc_bytes(2);
+            let mut mac = gnb_smc_mac_i(&pdu);
+            mac[0] ^= 0xFF; // forged
+            let smc = decode_security_mode_command(&pdu).expect("decode SMC");
+            task.handle_as_security_mode_command(smc, &pdu, mac).await;
+
+            assert!(
+                task.as_security().is_none(),
+                "a command that failed integrity must NOT activate AS security"
+            );
+            let (ch, failure) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(ch, RrcChannel::UlDcch);
+            assert_eq!(
+                decode_security_mode_failure(failure.data()).expect("a SecurityModeFailure"),
+                2,
+                "the failure must echo the refused command's transaction id, or the \
+                 gNB cannot tell which command failed"
+            );
+        });
+    }
+
+    /// The positive control for the test above: the SAME command with its real
+    /// MAC-I activates and answers Complete. Without it, "refused" could mean the
+    /// handler refuses everything.
+    #[test]
+    fn a_security_mode_command_with_a_valid_mac_activates_and_completes() {
+        use nextgsim_rrc::procedures::security_mode::decode_security_mode_failure;
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            deliver_gnb_smc(&mut task, 2).await;
+
+            assert!(
+                task.as_security().is_some(),
+                "the valid command must activate"
+            );
+            let (_ch, reply) = next_uplink_rrc(&mut rls_rx);
+            assert!(
+                decode_security_mode_failure(reply.data()).is_err(),
+                "and the reply must be a Complete, not a Failure"
+            );
+            assert_eq!(
+                decode_security_mode_complete(reply.data())
+                    .expect("SecurityModeComplete")
+                    .rrc_transaction_id,
+                2
+            );
+        });
+    }
+
+    /// NIA0 is refused: its MAC is all zeros, so "the MAC verified" would prove
+    /// nothing, and TS 33.501 §5.11.1 does not permit NIA0 for SRBs outside
+    /// unauthenticated emergency service.
+    #[test]
+    fn a_security_mode_command_selecting_nia0_is_refused() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            let pdu = encode_security_mode_command(&SecurityModeCommandParams {
+                rrc_transaction_id: 0,
+                security_algorithms: SecurityAlgorithms {
+                    ciphering_algorithm: CipheringAlgorithmType::Nea0,
+                    integrity_algorithm: Some(IntegrityAlgorithmType::Nia0),
+                },
+            })
+            .expect("encodes");
+            let smc = decode_security_mode_command(&pdu).expect("decode");
+            // An all-zero MAC, which is what NIA0 produces -- so this would verify
+            // if NIA0 were accepted.
+            task.handle_as_security_mode_command(smc, &pdu, [0u8; MAC_I_LEN])
+                .await;
+
+            assert!(
+                task.as_security().is_none(),
+                "NIA0 must not activate AS security: an all-zero MAC verifies for \
+                 anyone"
+            );
+            assert!(
+                rls_rx.try_recv().is_ok(),
+                "and the refusal must be answered, not silent"
+            );
+        });
+    }
+
+    /// NEA3 is accepted now (criterion 6). It used to abort activation here.
+    #[test]
+    fn a_security_mode_command_selecting_nea3_activates() {
+        use crate::rrc::security::DIRECTION_UPLINK;
+        use nextgsim_pdcp::srb_security::SrbSecurity;
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            let pdu = encode_security_mode_command(&SecurityModeCommandParams {
+                rrc_transaction_id: 1,
+                security_algorithms: SecurityAlgorithms {
+                    ciphering_algorithm: CipheringAlgorithmType::Nea3,
+                    integrity_algorithm: Some(IntegrityAlgorithmType::Nia2),
+                },
+            })
+            .expect("encodes");
+            // The gNB's MAC for a NEA3 command: integrity is still NIA2 and the SMC
+            // is unciphered, so the ciphering choice does not enter the MAC.
+            let k_int = derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcInt, 2);
+            let k_enc = derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcEnc, 3);
+            let mac = SrbSecurity::new(k_enc, k_int, 0, 2)
+                .expect("ids")
+                .compute_mac_i(SMC_PDCP_COUNT, SRB1_BEARER, DIRECTION_DOWNLINK, &pdu);
+            let smc = decode_security_mode_command(&pdu).expect("decode");
+            task.handle_as_security_mode_command(smc, &pdu, mac).await;
+
+            let ctx = task
+                .as_security()
+                .expect("NEA3 must activate, not abort (issue #31 criterion 6)");
+            assert_eq!(ctx.ciphering_algorithm, CipheringAlgorithm::Nea3);
+            // And the activated context can actually protect a PDU with NEA3.
+            let protected = ctx
+                .protect_srb(1, SRB1_BEARER, DIRECTION_UPLINK, &[0x20, 0x08])
+                .expect("NEA3 must protect");
+            assert_eq!(
+                ctx.unprotect_srb(1, SRB1_BEARER, DIRECTION_UPLINK, &protected)
+                    .expect("and verify"),
+                vec![0x20, 0x08]
+            );
+            let _ = next_uplink_rrc(&mut rls_rx);
+        });
+    }
+
     #[test]
     fn test_as_smc_without_kgnb_fails_closed() {
         let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
@@ -4084,8 +4382,7 @@ mod tests {
 
         run_async(async {
             // No KgNB installed → must NOT activate and must send nothing.
-            let smc = decode_security_mode_command(&gnb_smc_bytes(1)).unwrap();
-            task.handle_as_security_mode_command(smc).await;
+            deliver_gnb_smc(&mut task, 1).await;
 
             assert!(task.as_security().is_none(), "no KgNB → no activation");
             assert!(

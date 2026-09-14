@@ -21,8 +21,7 @@
 use bitvec::prelude::*;
 
 use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
-use nextgsim_crypto::nea::{nea1_encrypt, nea2_encrypt};
-use nextgsim_crypto::nia::{nia1_compute_mac, nia2_compute_mac, nia3_compute_mac};
+use nextgsim_pdcp::srb_security::{SrbSecurity, SrbSecurityError};
 use nextgsim_rrc::codec::generated::{CellIdentity, PhysCellId, RNTI_Value, VarResumeMAC_Input};
 use nextgsim_rrc::codec::{encode_rrc, RrcCodecError};
 use nextgsim_rrc::procedures::rrc_reestablishment::{
@@ -30,21 +29,23 @@ use nextgsim_rrc::procedures::rrc_reestablishment::{
     RrcReestablishmentError,
 };
 use nextgsim_rrc::procedures::security_mode::{CipheringAlgorithmType, IntegrityAlgorithmType};
-
-/// Wire-safety gate for UE AS-security (Wave-6 residue I5, TS 38.331 §5.3.4 /
-/// TS 33.501 §6.7). When `false` (the default) the UE keeps its legacy DL-DCCH
-/// handling verbatim, so the matched-sim registration/PDU/ping E2E is
-/// byte-for-byte unchanged: the gNB's RRC SecurityModeCommand is handled by the
-/// pre-I5 nibble dispatcher exactly as before.
+/// AS security activation is controlled by `UeConfig::as_security_enabled`
+/// (issue #31), not by this constant.
 ///
-/// Flipping this single const to `true` turns on real AS-security activation on
-/// the UE: typed decode of the AS SecurityModeCommand, `KgNB`→K_RRCint/K_RRCenc
-/// derivation, and PDCP SRB integrity/ciphering enforcement. The flip is a
-/// MANUAL host gate — it requires the docker matched-sim A/B E2E sign-off
-/// (hazard #269) because the paired gNB SMC sender and the AMF `KgNB`/uplink
-/// NAS COUNT must agree end-to-end. It mirrors the gNB's `C5_TYPED_DCCH_DISPATCH`
-/// wire-safety gate.
-pub const I5_UE_AS_SECURITY: bool = false;
+/// This used to be `pub const I5_UE_AS_SECURITY: bool = false;` — a compile-time
+/// gate, so **no shipping build could activate AS security at all**, whatever the
+/// operator configured. Criterion 1 of #31 is exactly that: the gate must be
+/// configuration, not a constant.
+///
+/// Kept as a named helper rather than an inline field read so the three call sites
+/// share one predicate and a reader searching for the old constant lands here.
+///
+/// See `UeConfig::as_security_enabled` for why the default is `false` and what
+/// enabling it requires.
+#[must_use]
+pub fn as_security_enabled(config: &nextgsim_common::config::UeConfig) -> bool {
+    config.as_security_enabled
+}
 
 /// 5G AS integrity protection algorithm (TS 33.501 §5.11.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +185,13 @@ impl std::fmt::Debug for AsSecurityContext {
             .finish_non_exhaustive()
     }
 }
+/// The PDCP COUNT the SecurityModeCommand is integrity-protected with.
+///
+/// Zero: AS security activation is the first protected PDU on SRB1, so the DL
+/// PDCP COUNT is still 0 (TS 38.323 §5.9 takes COUNT from the PDCP entity, which
+/// has just been keyed). Named rather than inlined because BOTH ends must use the
+/// same value and a mismatch fails the MAC with no other symptom (issue #31).
+pub const SMC_PDCP_COUNT: u32 = 0;
 
 /// BEARER identity for SRB1 fed to the PDCP security algorithms: the radio
 /// bearer identity minus one (TS 33.501 §6.5 referencing TS 33.401 §7); SRB1
@@ -209,21 +217,6 @@ pub enum AsSecurityError {
     /// processed — the caller must fail closed rather than pass it in clear.
     #[error("ciphering algorithm not supported (NEA3 keystream unavailable)")]
     UnsupportedCipheringAlgorithm,
-}
-
-/// Constant-time equality of a computed 4-byte MAC-I against a received one:
-/// folds all byte differences so the comparison time does not depend on where
-/// the first mismatch is (TS 33.501 §6.5 discard-on-failure must not leak a
-/// timing oracle).
-fn ct_eq_mac(computed: &[u8; 4], received: &[u8]) -> bool {
-    if received.len() != 4 {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..4 {
-        diff |= computed[i] ^ received[i];
-    }
-    diff == 0
 }
 
 impl AsSecurityContext {
@@ -273,50 +266,44 @@ impl AsSecurityContext {
         direction: u8,
         message: &[u8],
     ) -> [u8; 4] {
-        match self.integrity_algorithm {
-            IntegrityAlgorithm::Nia0 => [0u8; 4],
-            IntegrityAlgorithm::Nia1 => {
-                nia1_compute_mac(count, bearer, direction, &self.k_rrc_int, message)
-            }
-            IntegrityAlgorithm::Nia2 => {
-                nia2_compute_mac(count, bearer, direction, &self.k_rrc_int, message)
-            }
-            IntegrityAlgorithm::Nia3 => {
-                nia3_compute_mac(count, bearer, direction, &self.k_rrc_int, message)
-            }
+        // Delegated so the gNB computes the SAME MAC: the layer lives in
+        // `nextgsim-pdcp` because both ends must agree (issue #31). An all-zero MAC
+        // for an unknown algorithm cannot arise here -- `id()` only yields 0..=3 --
+        // and NIA0's MAC is legitimately all zeros anyway.
+        match self.srb_security() {
+            Ok(sec) => sec.compute_mac_i(count, bearer, direction, message),
+            Err(_) => [0u8; 4],
         }
     }
 
-    /// Apply the SRB ciphering keystream in place with `K_RRCenc` and the
-    /// negotiated NEA (TS 38.323 §5.8). NEA0 is a no-op. NEA is a stream
-    /// cipher (CTR), so this same routine deciphers. NEA3 has no keystream in
-    /// `nextgsim-crypto` and is reported as unsupported so the caller fails
-    /// closed.
-    fn apply_ciphering(
-        &self,
-        count: u32,
-        bearer: u8,
-        direction: u8,
-        data: &mut [u8],
-    ) -> Result<(), AsSecurityError> {
-        match self.ciphering_algorithm {
-            CipheringAlgorithm::Nea0 => Ok(()),
-            CipheringAlgorithm::Nea1 => {
-                nea1_encrypt(count, bearer, direction, &self.k_rrc_enc, data);
-                Ok(())
-            }
-            CipheringAlgorithm::Nea2 => {
-                nea2_encrypt(count, bearer, direction, &self.k_rrc_enc, data);
-                Ok(())
-            }
-            CipheringAlgorithm::Nea3 => Err(AsSecurityError::UnsupportedCipheringAlgorithm),
-        }
+    /// The shared SRB PDCP security state (TS 38.323 §5.8/§5.9).
+    ///
+    /// Built on demand rather than stored, so this context stays a plain
+    /// key-and-algorithm record and there is no second copy of the keys to keep in
+    /// step. The layer itself lives in `nextgsim-pdcp` because the **gNB verifies
+    /// what this produces**, and two implementations of one MAC-and-cipher layout
+    /// is a defect waiting to happen (issue #31).
+    ///
+    /// Fails only for an algorithm identity outside 0..=3, which cannot arise from
+    /// the enums above — kept as a `Result` because the shared constructor is
+    /// fail-closed and swallowing that here would defeat it.
+    pub fn srb_security(&self) -> Result<SrbSecurity, AsSecurityError> {
+        SrbSecurity::new(
+            self.k_rrc_enc,
+            self.k_rrc_int,
+            self.ciphering_algorithm.id(),
+            self.integrity_algorithm.id(),
+        )
+        .map_err(|_| AsSecurityError::UnsupportedCipheringAlgorithm)
     }
 
-    /// PDCP-protect an SRB RRC message for transmission (TS 38.323 §5.8/§5.9):
-    /// compute the 32-bit MAC-I over the plaintext, append it, then cipher the
-    /// concatenation `data || MAC-I` (NEA0 leaves it in the clear). Returns the
-    /// PDCP payload to place on the SRB.
+    /// PDCP-protect an SRB RRC message for transmission (TS 38.323 §5.8/§5.9).
+    ///
+    /// Delegates to the shared layer. **NEA3 works now**: this used to return
+    /// `UnsupportedCipheringAlgorithm` with a comment claiming NEA3 "has no
+    /// keystream in `nextgsim-crypto`", which was never true —
+    /// `zuc::nea3_encrypt` is complete and `nextgsim-nas` has been using it for
+    /// NAS ciphering all along (issue #31).
     pub fn protect_srb(
         &self,
         count: u32,
@@ -324,19 +311,15 @@ impl AsSecurityContext {
         direction: u8,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, AsSecurityError> {
-        let mac = self.compute_rrc_mac_i(count, bearer, direction, plaintext);
-        let mut out = Vec::with_capacity(plaintext.len() + 4);
-        out.extend_from_slice(plaintext);
-        out.extend_from_slice(&mac);
-        self.apply_ciphering(count, bearer, direction, &mut out)?;
-        Ok(out)
+        Ok(self
+            .srb_security()?
+            .protect(count, bearer, direction, plaintext))
     }
 
-    /// PDCP-unprotect a received SRB PDCP payload (TS 38.323 §5.8/§5.9):
-    /// decipher `data || MAC-I`, then verify the 32-bit MAC-I in constant time.
-    /// Fail-closed: a MAC mismatch, a too-short payload or an unsupported
-    /// cipher returns `Err` and the plaintext is never surfaced (TS 33.501
-    /// §6.5: a PDU failing integrity is discarded).
+    /// PDCP-unprotect a received SRB PDCP payload (TS 38.323 §5.8/§5.9).
+    ///
+    /// Fail-closed: a MAC mismatch or a too-short payload returns `Err` and the
+    /// plaintext is never surfaced (TS 33.501 §6.5).
     pub fn unprotect_srb(
         &self,
         count: u32,
@@ -344,19 +327,15 @@ impl AsSecurityContext {
         direction: u8,
         protected: &[u8],
     ) -> Result<Vec<u8>, AsSecurityError> {
-        if protected.len() < 4 {
-            return Err(AsSecurityError::PduTooShort);
-        }
-        let mut buf = protected.to_vec();
-        self.apply_ciphering(count, bearer, direction, &mut buf)?;
-        let split = buf.len() - 4;
-        let (data, mac_recv) = buf.split_at(split);
-        let mac_calc = self.compute_rrc_mac_i(count, bearer, direction, data);
-        if ct_eq_mac(&mac_calc, mac_recv) {
-            Ok(data.to_vec())
-        } else {
-            Err(AsSecurityError::IntegrityCheckFailed)
-        }
+        self.srb_security()?
+            .unprotect(count, bearer, direction, protected)
+            .map_err(|e| match e {
+                SrbSecurityError::PduTooShort => AsSecurityError::PduTooShort,
+                SrbSecurityError::IntegrityCheckFailed => AsSecurityError::IntegrityCheckFailed,
+                SrbSecurityError::UnknownAlgorithm(_) => {
+                    AsSecurityError::UnsupportedCipheringAlgorithm
+                }
+            })
     }
 }
 
@@ -706,14 +685,74 @@ mod tests {
         );
     }
 
+    /// #31, criterion 6: **NEA3 works.** This test used to be
+    /// `test_pdcp_nea3_unsupported_fails_closed`, asserting that NEA3 was refused
+    /// — it pinned the defect AS the requirement, on the strength of a comment
+    /// claiming NEA3 "has no keystream in `nextgsim-crypto`".
+    ///
+    /// That premise was false: `zuc::nea3_encrypt` is a complete ZUC
+    /// implementation and `nextgsim-nas` has used it for NAS ciphering all along.
+    /// Replaced rather than deleted, because the algorithm it names is the point.
     #[test]
-    fn test_pdcp_nea3_unsupported_fails_closed() {
+    fn test_pdcp_nea3_round_trips_and_ciphers() {
         let mut ctx = test_ctx(IntegrityAlgorithm::Nia2);
         ctx.ciphering_algorithm = CipheringAlgorithm::Nea3;
-        assert_eq!(
-            ctx.protect_srb(0, SRB1_BEARER, DIRECTION_UPLINK, &[0x20, 0x08, 0x10]),
-            Err(AsSecurityError::UnsupportedCipheringAlgorithm)
+        let msg = [0x20u8, 0x08, 0x10];
+
+        let protected = ctx
+            .protect_srb(0, SRB1_BEARER, DIRECTION_UPLINK, &msg)
+            .expect("NEA3 must protect, not fail closed");
+        assert_eq!(protected.len(), msg.len() + 4, "the MAC-I must be appended");
+        assert_ne!(
+            &protected[..msg.len()],
+            &msg[..],
+            "NEA3 must actually cipher: an apply_ciphering that silently did \
+             nothing would still round trip"
         );
+        assert_eq!(
+            ctx.unprotect_srb(0, SRB1_BEARER, DIRECTION_UPLINK, &protected)
+                .expect("and must verify"),
+            msg.to_vec()
+        );
+    }
+
+    /// The whole point of hoisting the layer: what the UE protects is what the
+    /// **gNB's** verifier accepts, because there is one implementation.
+    #[test]
+    fn the_ue_and_the_shared_gnb_layer_agree_on_every_algorithm() {
+        use nextgsim_pdcp::srb_security::SrbSecurity;
+
+        for (integ, ciph) in [
+            (IntegrityAlgorithm::Nia1, CipheringAlgorithm::Nea1),
+            (IntegrityAlgorithm::Nia2, CipheringAlgorithm::Nea2),
+            (IntegrityAlgorithm::Nia3, CipheringAlgorithm::Nea3),
+            (IntegrityAlgorithm::Nia2, CipheringAlgorithm::Nea0),
+        ] {
+            let mut ctx = test_ctx(integ);
+            ctx.ciphering_algorithm = ciph;
+            let msg = [0x20u8, 0x40, 0x00, 0x22];
+
+            // The UE protects uplink; the gNB's layer, built from the SAME keys and
+            // algorithm identities, must verify it.
+            let uplink = ctx
+                .protect_srb(3, SRB1_BEARER, DIRECTION_UPLINK, &msg)
+                .expect("protect");
+            let gnb = SrbSecurity::new(ctx.k_rrc_enc, ctx.k_rrc_int, ciph.id(), integ.id())
+                .expect("the gNB builds the same state");
+            assert_eq!(
+                gnb.unprotect(3, SRB1_BEARER, DIRECTION_UPLINK, &uplink)
+                    .unwrap_or_else(|e| panic!("{ciph:?}/{integ:?} must verify at the gNB: {e}")),
+                msg.to_vec()
+            );
+
+            // And the reverse direction: the gNB protects downlink, the UE verifies.
+            let downlink = gnb.protect(3, SRB1_BEARER, DIRECTION_DOWNLINK, &msg);
+            assert_eq!(
+                ctx.unprotect_srb(3, SRB1_BEARER, DIRECTION_DOWNLINK, &downlink)
+                    .expect("must verify at the UE"),
+                msg.to_vec()
+            );
+        }
     }
 
     #[test]
