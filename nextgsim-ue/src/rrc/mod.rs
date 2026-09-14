@@ -30,6 +30,26 @@
 //!         └──────────┘
 //! ```
 //!
+//! # RRC_INACTIVE (3GPP TS 38.331 §5.3.8.3, §5.3.13; TS 38.304 §5.5)
+//!
+//! The Inactive state above is reachable in production since issue #38, and what
+//! makes it reachable is worth naming because the state machine alone does not say it:
+//!
+//! - An `RRCRelease` **carrying a `suspendConfig`** drives Connected → Inactive; the
+//!   same message without one drives Connected → Idle. [`inactive::InactiveContext`]
+//!   holds the I-RNTI, the RAN Notification Area and the `t380` deadline.
+//! - The UE leaves Inactive on its own initiative, by sending an
+//!   `RRCResumeRequest1` whose `resumeMAC-I` it derives from the stored AS security
+//!   context. Three production triggers reach it: an MO NAS message, a PCCH page, and
+//!   an RNAU.
+//! - An RNAU is performed on `t380` expiry **or** on reselecting a cell outside the
+//!   RAN Notification Area, both with cause `rna-Update`
+//!   ([`inactive::RnauTrigger`]).
+//!
+//! What Inactive does **not** preserve is the radio bearer configuration: a resumed UE
+//! is given a fresh one with `fullConfig` set, so its DRBs need re-establishing. See
+//! `nextgsim_rrc::procedures::rrc_resume::fresh_rrc_resume_params`.
+//!
 //! # Cell Selection (3GPP TS 38.304)
 //!
 //! Cell selection is performed in Idle and Inactive states:
@@ -43,6 +63,7 @@
 pub mod cell_selection;
 pub mod conditional_handover;
 pub mod handover;
+pub mod inactive;
 pub mod measurement;
 pub mod redcap;
 pub mod reestablishment;

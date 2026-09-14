@@ -18,15 +18,11 @@
 //! ASN.1 types from `nextgsim-rrc`, and the MAC-I is computed with the NIA
 //! algorithms from `nextgsim-crypto`.
 
-use bitvec::prelude::*;
-
 use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
 use nextgsim_pdcp::srb_security::{SrbSecurity, SrbSecurityError};
-use nextgsim_rrc::codec::generated::{CellIdentity, PhysCellId, RNTI_Value, VarResumeMAC_Input};
-use nextgsim_rrc::codec::{encode_rrc, RrcCodecError};
+use nextgsim_rrc::codec::RrcCodecError;
 use nextgsim_rrc::procedures::rrc_reestablishment::{
-    compute_short_mac_i as rrc_compute_short_mac_i, mac_i_lsb16 as rrc_mac_i_lsb16,
-    RrcReestablishmentError,
+    compute_short_mac_i as rrc_compute_short_mac_i, RrcReestablishmentError,
 };
 use nextgsim_rrc::procedures::security_mode::{CipheringAlgorithmType, IntegrityAlgorithmType};
 /// AS security activation is controlled by `UeConfig::as_security_enabled`
@@ -368,6 +364,9 @@ pub enum ShortMacError {
     /// The shared derivation in `nextgsim-rrc` rejected the inputs
     #[error("ShortMAC-I derivation error: {0}")]
     DerivationError(#[from] RrcReestablishmentError),
+    /// The shared `resumeMAC-I` derivation in `nextgsim-rrc` rejected the inputs
+    #[error("resumeMAC-I derivation error: {0}")]
+    ResumeDerivationError(String),
 }
 
 /// Computes the ShortMAC-I per TS 38.331 §5.3.7.4.
@@ -385,13 +384,6 @@ pub fn compute_short_mac_i(
     source_pci: u16,
     target_cell_identity: u64,
 ) -> Result<u16, ShortMacError> {
-    // Build the 36-bit target cell identity
-    let mut cell_id_bv: BitVec<u8, Msb0> = BitVec::with_capacity(36);
-    for i in (0..36).rev() {
-        cell_id_bv.push((target_cell_identity >> i) & 1 == 1);
-    }
-
-    let _ = cell_id_bv;
     // The one implementation lives in nextgsim-rrc, the crate that owns
     // VarShortMAC-Input, because the UE sets this value and the network verifies
     // it -- two copies of the formula is a defect waiting to happen (issue #37).
@@ -430,38 +422,18 @@ pub fn compute_resume_mac_i(
     source_pci: u16,
     target_cell_identity: u64,
 ) -> Result<u16, ShortMacError> {
-    // Build the 36-bit target cell identity
-    let mut cell_id_bv: BitVec<u8, Msb0> = BitVec::with_capacity(36);
-    for i in (0..36).rev() {
-        cell_id_bv.push((target_cell_identity >> i) & 1 == 1);
-    }
-
-    let input = VarResumeMAC_Input {
-        source_phys_cell_id: PhysCellId(source_pci),
-        target_cell_identity: CellIdentity(cell_id_bv),
-        source_c_rnti: RNTI_Value(ctx.c_rnti),
-    };
-    let encoded = encode_rrc(&input)?;
-
-    Ok(mac_i_lsb16(ctx, &encoded))
-}
-
-/// Computes the 16 least significant bits of the 32-bit MAC-I over the
-/// UPER-encoded `VarShortMAC-Input` / `VarResumeMAC-Input` message, with the
-/// KRRCint key and the source PCell integrity algorithm, with COUNT, BEARER
-/// and DIRECTION all set to binary ones (TS 38.331 §5.3.7.4 / §5.3.13.3).
-fn mac_i_lsb16(ctx: &AsSecurityContext, encoded: &[u8]) -> u16 {
-    // COUNT, BEARER and DIRECTION all set to binary ones
-    const COUNT: u32 = 0xFFFF_FFFF;
-    const BEARER: u8 = 0x1F;
-    const DIRECTION: u8 = 0x01;
-
-    let _ = (COUNT, BEARER, DIRECTION);
-    // Delegated for the same reason as compute_short_mac_i: one formula. The
-    // identity is always one of NIA0..NIA3 here, since `IntegrityAlgorithm` has
-    // no other variant, so the shared function cannot reject it.
-    rrc_mac_i_lsb16(&ctx.k_rrc_int, ctx.integrity_algorithm.id(), encoded)
-        .expect("IntegrityAlgorithm::id() is always 0..=3")
+    // Delegated to `nextgsim-rrc` because the gNB has to compute the SAME value to
+    // verify it (issue #38). A UE-local copy is how the two ends come to disagree
+    // about what a `VarResumeMAC-Input` encodes to, and a disagreement here looks
+    // exactly like a forged resume.
+    nextgsim_rrc::procedures::rrc_resume::compute_resume_mac_i(
+        &ctx.k_rrc_int,
+        ctx.integrity_algorithm.id(),
+        ctx.c_rnti,
+        source_pci,
+        target_cell_identity,
+    )
+    .map_err(|e| ShortMacError::ResumeDerivationError(e.to_string()))
 }
 
 #[cfg(test)]

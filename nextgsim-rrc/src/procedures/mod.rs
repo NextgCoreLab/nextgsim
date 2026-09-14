@@ -24,6 +24,7 @@ pub mod rrc_setup;
 pub mod scell_config;
 pub mod security_mode;
 pub mod sub_thz_config;
+pub mod suspend_config;
 pub mod system_information;
 pub mod ue_capability;
 pub mod xr_cdrx;

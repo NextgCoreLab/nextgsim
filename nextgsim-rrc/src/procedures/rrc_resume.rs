@@ -11,9 +11,53 @@
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
+use crate::procedures::rrc_reestablishment::mac_i_lsb16;
 use crate::procedures::rrc_setup::srb1_rrc_setup_params;
+use crate::procedures::suspend_config::CELL_IDENTITY_BITS;
 use bitvec::prelude::*;
 use thiserror::Error;
+
+/// The `resumeMAC-I` a UE puts in its `RRCResumeRequest` and the gNB verifies
+/// (TS 38.331 §5.3.13.3).
+///
+/// The 16 least significant bits of a MAC-I over the UPER-encoded
+/// `VarResumeMAC-Input` — source PCell PCI, the 36-bit identity of the cell being
+/// resumed on, and the source C-RNTI — computed with `K_RRCint` and the source
+/// PCell's NIA, with COUNT, BEARER and DIRECTION all binary ones.
+///
+/// # Why this is here and not in either endpoint
+///
+/// The UE computes it and the **gNB verifies it**, so the two must agree byte for
+/// byte over the same `VarResumeMAC-Input` encoding (issue #38). Before this, the UE
+/// had its own copy and the gNB had none — which is exactly how a gNB comes to accept
+/// a resume it never authenticated. Same reasoning that put `compute_short_mac_i`
+/// beside it.
+///
+/// The gNB must supply the values from the **stored** context — the C-RNTI and PCI
+/// the UE had when it was suspended — not from the resuming cell, or every MAC fails.
+pub fn compute_resume_mac_i(
+    k_rrc_int: &[u8; 16],
+    integrity_alg_id: u8,
+    source_c_rnti: u16,
+    source_phys_cell_id: u16,
+    target_cell_identity: u64,
+) -> Result<u16, RrcResumeError> {
+    let mut cell_id_bv: BitVec<u8, Msb0> = BitVec::with_capacity(CELL_IDENTITY_BITS);
+    for i in (0..CELL_IDENTITY_BITS).rev() {
+        cell_id_bv.push((target_cell_identity >> i) & 1 == 1);
+    }
+
+    let input = VarResumeMAC_Input {
+        source_phys_cell_id: PhysCellId(source_phys_cell_id),
+        target_cell_identity: CellIdentity(cell_id_bv),
+        source_c_rnti: RNTI_Value(source_c_rnti),
+    };
+    let encoded = encode_rrc(&input)?;
+
+    mac_i_lsb16(k_rrc_int, integrity_alg_id, &encoded).map_err(|e| {
+        RrcResumeError::InvalidFieldValue(format!("resumeMAC-I could not be computed: {e}"))
+    })
+}
 
 /// Errors that can occur during RRC Resume procedures
 #[derive(Debug, Error)]
@@ -840,16 +884,17 @@ pub fn decode_rrc_resume(bytes: &[u8]) -> Result<RrcResumeData, RrcResumeError> 
     parse_rrc_resume(&msg)
 }
 
-/// The `RRCResume` a UE gets when the network holds **no** suspended context for
-/// it (issue #107, criterion 2 — "the 'what does a resumed UE get' decision").
+/// The `RRCResume` a resumed UE gets (issue #107, criterion 2 — "the 'what does a
+/// resumed UE get' decision"; revisited by issue #38).
 ///
 /// # The decision: a FRESH configuration with `fullConfig` set
 ///
 /// TS 38.331 §5.3.13.4 lets `RRCResume` carry a delta on the configuration the UE
-/// stored when it was suspended. This gNB cannot: RRC_INACTIVE is unreachable
-/// (issue #38), nothing ever sends a `suspendConfig`, and no suspended
-/// configuration is stored anywhere — so there is no stored configuration for a
-/// delta to be relative to.
+/// stored when it was suspended. This gNB does not, and since issue #38 that is a
+/// **choice** rather than a consequence: RRC_INACTIVE is now reachable and a
+/// suspended context IS stored (`SuspendedUeContext`), but what it stores is the AS
+/// security context and the RAN Notification Area — not the radio bearer
+/// configuration, because the gNB's RRC layer does not track DRBs at all.
 ///
 /// So the resumed UE is given the **same SRB1 configuration RRCSetup builds**,
 /// with `fullConfig` **set**, which is precisely what that IE is for: it tells the
@@ -858,9 +903,10 @@ pub fn decode_rrc_resume(bytes: &[u8]) -> Result<RrcResumeData, RrcResumeError> 
 /// would ask the UE to merge them into a stored configuration that does not exist,
 /// and a UE that had a real one would end up with a mixture neither side intended.
 ///
-/// This is honest rather than complete: a UE resumed this way loses whatever it
-/// had, which is what "the network forgot you" means. When #38 makes RRC_INACTIVE
-/// reachable and a suspended context is stored, this is the function to revisit.
+/// This is honest rather than complete: a UE resumed this way loses its bearers, so
+/// the user plane needs re-establishing after a resume. Storing the configuration
+/// alongside the security context is what a delta would need, and that is the next
+/// step here — not a different `fullConfig` decision.
 pub fn fresh_rrc_resume_params(rrc_transaction_id: u8) -> Result<RrcResumeParams, RrcResumeError> {
     let setup = srb1_rrc_setup_params(rrc_transaction_id)
         .map_err(|e| RrcResumeError::InvalidFieldValue(e.to_string()))?;

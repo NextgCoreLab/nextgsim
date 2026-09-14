@@ -21,6 +21,7 @@ use crate::rrc::conditional_handover::{handover_command_for, CondReconfigStore};
 use crate::rrc::handover::{
     build_reconfiguration_complete, parse_handover_command, HandoverCommand, HandoverManager,
 };
+use crate::rrc::inactive::InactiveContext;
 use crate::rrc::measurement::{
     EutraCellKey, MeasConfig, MeasEventType, MeasurementManager, ReportTriggerConfig,
     ReportTriggerType,
@@ -28,7 +29,7 @@ use crate::rrc::measurement::{
 use crate::rrc::reestablishment::{
     ReestablishmentProcedure, ReestablishmentState, ReestablishmentTrigger,
 };
-use crate::rrc::resume::ResumeProcedure;
+use crate::rrc::resume::{ResumeCause, ResumeIdentity, ResumeProcedure};
 use crate::rrc::security::{
     as_security_enabled, compute_short_mac_i, AsSecurityContext, AsSecurityError,
     CipheringAlgorithm, IntegrityAlgorithm, DIRECTION_DOWNLINK, SMC_PDCP_COUNT, SRB1_BEARER,
@@ -65,6 +66,9 @@ use nextgsim_rrc::procedures::rrc_reestablishment::{
     ReestablishmentUeIdentity, RrcReestablishmentCompleteParams, RrcReestablishmentRequestParams,
 };
 use nextgsim_rrc::procedures::rrc_release::{decode_rrc_release, CellReselectionPrioritiesParams};
+use nextgsim_rrc::procedures::rrc_resume::{
+    encode_rrc_resume_request1, ResumeCauseValue as AsnResumeCause, RrcResumeRequest1Params,
+};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup, encode_rrc_setup_complete, encode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
@@ -75,6 +79,7 @@ use nextgsim_rrc::procedures::security_mode::{
     decode_security_mode_command, encode_security_mode_complete, encode_security_mode_failure,
     SecurityModeCommandData, SecurityModeCompleteParams, SecurityModeFailureParams,
 };
+use nextgsim_rrc::procedures::suspend_config::{decode_suspend_config, RanNotificationArea};
 use nextgsim_rrc::procedures::system_information::{
     decode_mib, is_system_information, parse_sib1, parse_system_information, CellBarredStatus,
     IntraFreqReselection, PlmnIdentity as SibPlmnIdentity,
@@ -108,6 +113,27 @@ const PAGING_OCCASION_TOLERANCE_DIVISOR: u16 = 8;
 /// non-zero value is used; it only feeds the re-establishment MAC and is never
 /// signalled on the wire.
 const AS_SECURITY_C_RNTI: u16 = 0x4601;
+
+/// Map the UE's own [`ResumeCause`] onto the ASN.1 `ResumeCause` the wire carries.
+///
+/// A total match rather than a numeric cast: the two enumerations happen to list the
+/// causes in the same order today, and a cast would keep compiling — silently sending
+/// the wrong cause — the moment either gained a variant (issue #38).
+fn resume_cause_to_asn(cause: ResumeCause) -> AsnResumeCause {
+    match cause {
+        ResumeCause::Emergency => AsnResumeCause::Emergency,
+        ResumeCause::HighPriorityAccess => AsnResumeCause::HighPriorityAccess,
+        ResumeCause::MtAccess => AsnResumeCause::MtAccess,
+        ResumeCause::MoSignalling => AsnResumeCause::MoSignalling,
+        ResumeCause::MoData => AsnResumeCause::MoData,
+        ResumeCause::MoVoiceCall => AsnResumeCause::MoVoiceCall,
+        ResumeCause::MoVideoCall => AsnResumeCause::MoVideoCall,
+        ResumeCause::MoSms => AsnResumeCause::MoSms,
+        ResumeCause::RnaUpdate => AsnResumeCause::RnaUpdate,
+        ResumeCause::MpsPriorityAccess => AsnResumeCause::MpsPriorityAccess,
+        ResumeCause::McsPriorityAccess => AsnResumeCause::McsPriorityAccess,
+    }
+}
 
 /// Simplified DL/UL-DCCH envelope code: first byte 0x06 marks a UE capability
 /// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
@@ -269,6 +295,18 @@ pub struct RrcTask {
     reestablishment_proc: ReestablishmentProcedure,
     /// RRC resume procedure state
     resume_proc: ResumeProcedure,
+    /// What the UE remembers while suspended to RRC_INACTIVE (issue #38).
+    ///
+    /// `Some` exactly while `state_machine.state()` is `Inactive`: it is created from
+    /// an `RRCRelease` carrying a `suspendConfig` and cleared on resume or release,
+    /// because an I-RNTI the network has reassigned must not be presented again.
+    inactive: Option<InactiveContext>,
+    /// The 36-bit NCI of the cell the `suspendConfig` arrived in.
+    ///
+    /// Needed even when a RAN Notification Area *was* configured: TS 38.304 §5.5 makes
+    /// the serving cell the area when none was, so without this an unconfigured area
+    /// could not be evaluated at all.
+    suspended_in_cell_identity: Option<u64>,
     /// AS security context (set after AS Security Mode Command); required for
     /// ShortMAC-I derivation in re-establishment (TS 38.331 §5.3.7)
     as_security: Option<AsSecurityContext>,
@@ -450,6 +488,8 @@ impl RrcTask {
             uac_barring: UacBarringConfig::default(),
             reestablishment_proc: ReestablishmentProcedure::new(),
             resume_proc: ResumeProcedure::new(),
+            inactive: None,
+            suspended_in_cell_identity: None,
             as_security: None,
             pending_kgnb: None,
             srb1_config: None,
@@ -675,8 +715,19 @@ impl RrcTask {
     /// strict-peer harness (`tests/src/rrc_handshake.rs`, Wave-6 C3).
     pub async fn perform_cycle(&mut self) {
         match self.state_machine.state() {
-            RrcState::Idle | RrcState::Inactive => {
+            RrcState::Idle => {
                 self.perform_cell_selection().await;
+            }
+            RrcState::Inactive => {
+                // Cell selection first, then the RNAU check, so a reselection that
+                // crossed the RAN Notification Area is acted on in the same tick it
+                // happened rather than the next one (TS 38.304 §5.5, issue #38).
+                self.perform_cell_selection().await;
+                // `now` is passed rather than read inside, so a test can drive `t380`
+                // to its boundary without waiting minutes for it -- the same rule the
+                // PDCP entity and `InactiveContext` follow.
+                self.check_rnau(tokio::time::Instant::now().into_std())
+                    .await;
             }
             RrcState::Connected => {
                 // In connected state, perform measurements for handover
@@ -1497,6 +1548,15 @@ impl RrcTask {
         {
             error!("Failed to deliver paging indication to NAS: {}", e);
         }
+
+        // MT trigger for a resume (TS 38.331 §5.3.13.2, issue #38). A paged UE in
+        // RRC_INACTIVE resumes on its own rather than waiting for NAS to ask for a
+        // service request: RRC_INACTIVE exists so that answering a page is a resume and
+        // not a fresh establishment, and NAS is told either way so it can carry on with
+        // whatever the page was for.
+        if state == RrcState::Inactive {
+            self.initiate_resume(ResumeCause::MtAccess).await;
+        }
     }
 
     /// Handle DL-CCCH message (RRC Setup, RRC Reject)
@@ -1594,6 +1654,17 @@ impl RrcTask {
             return;
         }
 
+        // RRCRelease (TS 38.331 §6.2.1: DL-DCCH / SRB1), decoded rather than
+        // nibble-matched, for the same reason `RRCReestablishment` is: a real UPER
+        // release leads with 0x10, whose low nibble is 0x0, so the legacy matcher below
+        // routed EVERY conformant release into the RRCReconfiguration arm. Only the
+        // gNB's hand-built 0x0D fallback ever reached the release handler, which is why
+        // a `suspendConfig` could not be acted on at all (issue #38).
+        if decode_rrc_release(bytes).is_ok() {
+            self.handle_rrc_release_message(cell_id, bytes).await;
+            return;
+        }
+
         let msg_type = bytes[0] & 0x0F;
 
         match msg_type {
@@ -1605,29 +1676,11 @@ impl RrcTask {
                 }
             }
             0x0D => {
-                // RRC Release
-                info!("Received RRC Release from cell {}", cell_id);
-                // Dedicated cellReselectionPriorities, when the release carries
-                // them (TS 38.331 §6.3.2, TS 38.304 §5.2.4.1, issue #50). Applied
-                // BEFORE the release is processed, because the list governs the
-                // idle mode the UE is about to enter.
-                //
-                // A decode failure is not reported as an error: the gNB falls
-                // back to a hand-built byte PDU when UPER encoding fails, and that
-                // PDU is a legitimate release this UE must still act on. What is
-                // lost in that case is only the optional IE.
-                if let Ok(release) = decode_rrc_release(bytes) {
-                    self.apply_dedicated_reselection_priorities(
-                        release.cell_reselection_priorities,
-                    );
-                }
-                // If a resume was in progress, the network is rejecting it
-                if self.resume_proc.is_in_progress() {
-                    self.resume_proc
-                        .on_release_received(&mut self.state_machine);
-                } else {
-                    self.handle_rrc_release().await;
-                }
+                // The gNB's hand-built fallback release framing, which is the ONLY
+                // release the legacy nibble matcher ever saw: a real UPER `RRCRelease`
+                // leads with 0x10, whose low nibble is 0x0. The typed decode above
+                // handles the conformant one; this keeps the fallback working.
+                self.handle_rrc_release_message(cell_id, bytes).await;
             }
             0x00 => {
                 // RRC Reconfiguration
@@ -1651,6 +1704,14 @@ impl RrcTask {
                     &mut self.state_machine,
                 ) {
                     Ok(complete_params) => {
+                        // The suspend configuration is spent: the network has resumed
+                        // this UE and will assign a NEW I-RNTI if it suspends it again
+                        // (TS 38.331 §5.3.13.3). Keeping the old one would have the UE
+                        // authenticate a later resume against a context that no longer
+                        // exists -- or, worse, another UE's.
+                        self.inactive = None;
+                        self.suspended_in_cell_identity = None;
+                        self.serving_cell_id = Some(cell_id);
                         // Send RRCResumeComplete
                         // Encoding mirrors gNB: first byte indicates ResumeComplete
                         let mut rrc_complete = Vec::with_capacity(4);
@@ -2017,7 +2078,239 @@ impl RrcTask {
             .apply_dedicated_carrier_priorities(&carriers);
     }
 
-    /// Handle RRC Release message
+    /// Act on an `RRCRelease`: suspend to RRC_INACTIVE when it carries a
+    /// `suspendConfig`, otherwise go to RRC_IDLE (TS 38.331 §5.3.8.3).
+    ///
+    /// Reached from two places — the typed decode and the legacy `0x0D` framing — so
+    /// the two cannot diverge on what a release means.
+    async fn handle_rrc_release_message(&mut self, cell_id: i32, bytes: &[u8]) {
+        info!("Received RRC Release from cell {cell_id}");
+        // Dedicated cellReselectionPriorities, when the release carries them
+        // (TS 38.331 §6.3.2, TS 38.304 §5.2.4.1, issue #50). Applied BEFORE the release
+        // is processed, because the list governs the idle mode the UE is about to enter.
+        //
+        // A decode failure is not reported as an error: the gNB falls back to a
+        // hand-built byte PDU when UPER encoding fails, and that PDU is a legitimate
+        // release this UE must still act on. What is lost is only the optional IEs --
+        // including `suspendConfig`, so a fallback release always means RRC_IDLE.
+        let suspend_config = match decode_rrc_release(bytes) {
+            Ok(release) => {
+                self.apply_dedicated_reselection_priorities(release.cell_reselection_priorities);
+                release.suspend_config
+            }
+            Err(_) => None,
+        };
+        // If a resume was in progress, the network is rejecting it
+        if self.resume_proc.is_in_progress() {
+            self.resume_proc
+                .on_release_received(&mut self.state_machine);
+        } else if let Some(config) = suspend_config {
+            // TS 38.331 §5.3.8.3: a release CARRYING a suspendConfig moves the UE to
+            // RRC_INACTIVE; the same message without one moves it to RRC_IDLE. This
+            // branch is what made `RrcState::Inactive` reachable at all (issue #38).
+            self.enter_rrc_inactive(&config).await;
+        } else {
+            self.handle_rrc_release().await;
+        }
+    }
+
+    /// Enter RRC_INACTIVE from an `RRCRelease` carrying a `suspendConfig`
+    /// (TS 38.331 §5.3.8.3, issue #38).
+    ///
+    /// Falls through to a plain release when the `suspendConfig` cannot be read. That
+    /// is §5.3.8.3's own rule — a release the UE cannot act on as a suspension is a
+    /// release — and it is the safe direction: a UE that stayed CONNECTED would be
+    /// talking to a gNB that had already suspended it.
+    async fn enter_rrc_inactive(&mut self, suspend_config_bytes: &[u8]) {
+        let config = match decode_suspend_config(suspend_config_bytes) {
+            Ok(config) => config,
+            Err(e) => {
+                warn!("Could not read the suspendConfig ({e}); treating it as a release");
+                self.handle_rrc_release().await;
+                return;
+            }
+        };
+        let cell_identity = self.serving_cell_identity();
+        // The SOURCE PCI: the cell the suspendConfig arrived in, which is what the
+        // resumeMAC-I will cover. Derived from the NCI so both ends agree, the same way
+        // re-establishment does.
+        let source_pci = phys_cell_id_from_nci(cell_identity);
+
+        if let Err(e) = self.state_machine.on_rrc_suspend() {
+            // Only reachable from a state that is not CONNECTED. Reported and treated
+            // as a release rather than left half-applied: a UE holding an I-RNTI it
+            // never transitioned into INACTIVE for would resume from a state the
+            // network has no context for.
+            warn!("Cannot suspend to RRC_INACTIVE ({e}); treating it as a release");
+            self.handle_rrc_release().await;
+            return;
+        }
+
+        // The released connection's configuration goes, exactly as on a release: the
+        // candidates and SCells belonged to a connection that is over, and a resumed UE
+        // is given a fresh configuration with `fullConfig` (issue #107).
+        self.cond_reconfig.clear();
+        self.release_all_scells();
+
+        info!(
+            "Suspended to RRC_INACTIVE: I-RNTI={:#x}, t380={:?} min, RNA of {} cell(s), NCC={}",
+            config.full_i_rnti,
+            config.t380_minutes,
+            config
+                .ran_notification_area
+                .as_ref()
+                .map(RanNotificationArea::len)
+                .unwrap_or(0),
+            config.next_hop_chaining_count
+        );
+        self.suspended_in_cell_identity = Some(cell_identity);
+        self.inactive = Some(InactiveContext::new(
+            config,
+            source_pci,
+            tokio::time::Instant::now().into_std(),
+        ));
+
+        // NAS is told the RRC connection is gone, because it is: RRC_INACTIVE has no
+        // SRB1 to carry a NAS message. NAS stays CM-CONNECTED as far as the core is
+        // concerned, and that is the AMF's view, not the UE's RRC layer's.
+        if let Err(e) = self
+            .task_base
+            .nas_tx
+            .send(NasMessage::RrcConnectionRelease)
+            .await
+        {
+            error!("Failed to notify NAS of the suspension: {e}");
+        }
+    }
+
+    /// The 36-bit NCI of the serving cell, or 0 when there is none.
+    ///
+    /// 0 rather than an `Option` at the call sites because it feeds the
+    /// `VarResumeMAC-Input`: a UE with no serving cell cannot resume anyway, and the
+    /// network's own recomputation over cell 0 will simply not match.
+    fn serving_cell_identity(&self) -> u64 {
+        self.serving_cell_id
+            .and_then(|id| self.cell_selector.get_cell(id))
+            .map(|cell| cell.sib1.nci as u64)
+            .unwrap_or(0)
+    }
+
+    /// Evaluate the RNAU triggers while in RRC_INACTIVE (TS 38.304 §5.5, issue #38).
+    ///
+    /// Called from the INACTIVE arm of [`Self::perform_cycle`], after cell selection,
+    /// so a reselection that crossed the RAN Notification Area is seen in the same tick
+    /// it happened rather than on the next one.
+    async fn check_rnau(&mut self, now: std::time::Instant) {
+        // A resume already in flight is the RNAU; starting another would present the
+        // same single-use I-RNTI twice.
+        if self.resume_proc.is_in_progress() {
+            return;
+        }
+        let current = self.serving_cell_id.map(|_| self.serving_cell_identity());
+        let suspended_in = self.suspended_in_cell_identity.unwrap_or(0);
+        let Some(trigger) = self
+            .inactive
+            .as_ref()
+            .and_then(|ctx| ctx.rnau_trigger(now, current, suspended_in))
+        else {
+            return;
+        };
+        info!("RAN Notification Area Update triggered by {trigger}");
+        // Re-arm t380 now rather than on completion: TS 38.304 §5.5 restarts the timer
+        // when the update is *performed*, and a UE that only restarted it on a
+        // successful resume would re-trigger every tick while the resume was failing.
+        if let Some(ctx) = self.inactive.as_mut() {
+            ctx.restart_t380(now);
+        }
+        // Both triggers resume with `rna-Update` (TS 38.331 §5.3.13.2): the cause tells
+        // the network this is a location report and not user traffic, which is what
+        // lets it suspend the UE again immediately instead of keeping it connected.
+        // The trigger itself is only ever logged -- a periodic update and a crossing
+        // carry the same cause on the wire, and the log line is the only place the two
+        // can be told apart.
+        debug!("RNAU cause is rna-Update for both triggers; this one was {trigger}");
+        self.initiate_resume(ResumeCause::RnaUpdate).await;
+    }
+
+    /// Send an `RRCResumeRequest`, deriving the `resumeMAC-I` at run time
+    /// (TS 38.331 §5.3.13.3, issue #38).
+    ///
+    /// This is the production caller `ResumeProcedure::initiate` did not have, and
+    /// therefore the reason `compute_resume_mac_i` now runs outside tests.
+    async fn initiate_resume(&mut self, cause: ResumeCause) {
+        let Some(ctx) = self.inactive.as_ref() else {
+            warn!("Cannot resume: no suspend configuration stored");
+            return;
+        };
+        let Some(security) = self.as_security.clone() else {
+            // Without the AS security context there is no K_RRCint, so no resumeMAC-I
+            // and nothing the network could verify. Falling back to IDLE is §5.3.13.5's
+            // behaviour for a resume the UE cannot perform, and it is honest: an
+            // unauthenticatable resume is the defect this issue reports.
+            warn!("Cannot resume: no AS security context; falling back to RRC_IDLE");
+            self.leave_rrc_inactive_to_idle().await;
+            return;
+        };
+        // The identity the UE presents: the FULL form, because this simulator's SIB1
+        // carries no `useFullResumeID` for the network to signal the short one with, and
+        // the full identity is the one the gNB stores its context under. The short form
+        // is derivable from it, so a gNB that indexed either finds the same context.
+        let identity = ResumeIdentity::Full(ctx.full_i_rnti());
+        let source_pci = ctx.source_phys_cell_id();
+        // The TARGET cell identity is the cell the UE is resuming ON, which after a
+        // reselection is not the one it was suspended in -- and the network computes
+        // over the resuming cell too, so both ends agree.
+        let target_cell_identity = self.serving_cell_identity();
+
+        let params = match self.resume_proc.initiate(
+            cause,
+            identity,
+            &security,
+            source_pci,
+            target_cell_identity,
+            &self.state_machine,
+        ) {
+            Ok(params) => params,
+            Err(e) => {
+                warn!("RRC Resume could not be initiated: {e}");
+                return;
+            }
+        };
+
+        let request_params = RrcResumeRequest1Params {
+            resume_identity: ctx.full_i_rnti(),
+            resume_mac_i: params.resume_mac_i,
+            resume_cause: resume_cause_to_asn(cause),
+        };
+        let pdu = match encode_rrc_resume_request1(&request_params) {
+            Ok(bytes) => OctetString::from_slice(&bytes),
+            Err(e) => {
+                error!("Could not encode the RRCResumeRequest1: {e}");
+                self.resume_proc.reset();
+                return;
+            }
+        };
+        info!(
+            "Sending RRCResumeRequest1: cause={cause}, I-RNTI={:#x}, resumeMAC-I={:#06x}",
+            ctx.full_i_rnti(),
+            params.resume_mac_i
+        );
+        // UL-CCCH1, which is what carries `RRCResumeRequest1` (TS 38.331 §6.2.1).
+        self.send_uplink_rrc(RrcChannel::UlCcch1, pdu).await;
+    }
+
+    /// Leave RRC_INACTIVE for RRC_IDLE, discarding the stored suspend configuration.
+    ///
+    /// The I-RNTI goes with it: the network may reassign it, and a UE that kept
+    /// presenting a stale one would be authenticating against another UE's context.
+    async fn leave_rrc_inactive_to_idle(&mut self) {
+        self.inactive = None;
+        self.suspended_in_cell_identity = None;
+        if let Err(e) = self.state_machine.on_rrc_release() {
+            warn!("Could not leave RRC_INACTIVE for RRC_IDLE: {e}");
+        }
+    }
+
     async fn handle_rrc_release(&mut self) {
         // Transition to idle state
         if let Err(e) = self.state_machine.on_rrc_release() {
@@ -2488,6 +2781,14 @@ impl RrcTask {
         if self.state_machine.state() == RrcState::Idle {
             self.initial_nas_pdu = Some(pdu.clone());
             self.start_connection_establishment(pdu).await;
+        } else if self.state_machine.state() == RrcState::Inactive {
+            // MO trigger for a resume (TS 38.331 §5.3.13.2, issue #38): a suspended UE
+            // with something to send resumes rather than establishing afresh, which is
+            // the point of RRC_INACTIVE. The NAS PDU is kept so it can ride the
+            // `RRCResumeComplete` once the resume lands -- dropping it would lose the
+            // very message that caused the resume.
+            self.initial_nas_pdu = Some(pdu);
+            self.initiate_resume(ResumeCause::MoData).await;
         } else if self.state_machine.state() == RrcState::Connected {
             // Build UL Information Transfer
             let mut rrc_pdu = Vec::with_capacity(pdu.len() + 2);
@@ -3148,9 +3449,482 @@ mod tests {
         nas
     }
 
-    /// On camping, the RRC task reports the radio's available PLMNs to NAS in
-    /// ActiveCellChanged (issue #49, TS 23.122 §4.4.3) — the production caller
-    /// of CellSelector::available_plmns — so NAS selects over the real radio
+    // ========================================================================
+    // RRC_INACTIVE: suspend, resume and RNAU (issue #38)
+    // ========================================================================
+
+    /// An `RRCRelease` carrying a `suspendConfig` with the given parameters.
+    fn suspending_release(t380_minutes: Option<u16>, rna_cells: Vec<u64>) -> OctetString {
+        use nextgsim_rrc::procedures::rrc_release::{encode_rrc_release, RrcReleaseParams};
+        use nextgsim_rrc::procedures::suspend_config::{
+            encode_suspend_config, RanNotificationArea, SuspendConfigParams,
+        };
+        let suspend_config = encode_suspend_config(&SuspendConfigParams {
+            full_i_rnti: 0x12_3456_789A,
+            ran_paging_cycle_rf: 64,
+            ran_notification_area: Some(RanNotificationArea::CellList(rna_cells)),
+            t380_minutes,
+            next_hop_chaining_count: 3,
+        })
+        .expect("encode the suspendConfig");
+        OctetString::from_slice(
+            &encode_rrc_release(&RrcReleaseParams {
+                rrc_transaction_id: 0,
+                cell_reselection_priorities: None,
+                redirected_carrier_info: None,
+                suspend_config: Some(suspend_config),
+                deprioritisation_req: None,
+                wait_time: None,
+            })
+            .expect("encode the release"),
+        )
+    }
+
+    /// A plain `RRCRelease` with no `suspendConfig`.
+    fn plain_release() -> OctetString {
+        use nextgsim_rrc::procedures::rrc_release::{encode_rrc_release, RrcReleaseParams};
+        OctetString::from_slice(
+            &encode_rrc_release(&RrcReleaseParams {
+                rrc_transaction_id: 0,
+                cell_reselection_priorities: None,
+                redirected_carrier_info: None,
+                suspend_config: None,
+                deprioritisation_req: None,
+                wait_time: None,
+            })
+            .expect("encode the release"),
+        )
+    }
+
+    /// Camp, connect and install AS security, so the UE can be suspended.
+    async fn camped_connected_and_keyed(
+        task: &mut RrcTask,
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) {
+        camp_and_request(task, rls_rx).await;
+        // The real RRCSetup path, so the UE is CONNECTED for the reason production is.
+        task.handle_downlink_rrc(
+            1,
+            RrcChannel::DlCcch,
+            OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+        )
+        .await;
+        assert_eq!(
+            task.state_machine.state(),
+            RrcState::Connected,
+            "precondition: the UE is CONNECTED"
+        );
+        task.set_as_security_context(AsSecurityContext::derive_from_kgnb(
+            &[0x5A; 32],
+            CipheringAlgorithm::Nea2,
+            IntegrityAlgorithm::Nia2,
+            AS_SECURITY_C_RNTI,
+        ));
+    }
+
+    /// #38, criterion 5: an `RRCRelease` carrying a `suspendConfig` drives the UE into
+    /// RRC_INACTIVE through the **production** DL-DCCH handler, and a plain release
+    /// does not.
+    #[test]
+    fn a_release_with_a_suspend_config_reaches_rrc_inactive() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
+                .await;
+
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Inactive,
+                "a release carrying a suspendConfig moves the UE to RRC_INACTIVE \
+                 (TS 38.331 §5.3.8.3) -- this state used to be unreachable"
+            );
+            let ctx = task
+                .inactive
+                .as_ref()
+                .expect("the suspend configuration must be stored");
+            assert_eq!(ctx.full_i_rnti(), 0x12_3456_789A);
+            assert_eq!(ctx.short_i_rnti(), 0x0056_789A);
+            assert_eq!(ctx.t380_minutes(), Some(30));
+            assert_eq!(ctx.next_hop_chaining_count(), 3);
+            assert!(ctx.ran_notification_area().is_some());
+        });
+    }
+
+    /// The positive control: a release with **no** `suspendConfig` still goes to
+    /// RRC_IDLE. Without this, an `enter_rrc_inactive` that ran unconditionally would
+    /// pass the test above.
+    #[test]
+    fn a_release_without_a_suspend_config_still_goes_to_rrc_idle() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, plain_release())
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
+            assert!(
+                task.inactive.is_none(),
+                "and no I-RNTI is stored, or the UE would try to resume from IDLE"
+            );
+        });
+    }
+
+    /// #38, criterion 6: an MO NAS message from a suspended UE emits a real
+    /// `RRCResumeRequest1` on UL-CCCH1, with a `resumeMAC-I` derived at run time.
+    ///
+    /// Driven entirely through `handle_uplink_nas_delivery` — the production entry
+    /// point — so `ResumeProcedure::initiate` and `compute_resume_mac_i` are reached
+    /// without the test calling either.
+    #[test]
+    fn an_mo_nas_message_from_rrc_inactive_emits_a_real_resume_request() {
+        use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request1, ResumeCauseValue};
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Inactive);
+            // Drain whatever the suspension put on the RLS channel.
+            while rls_rx.try_recv().is_ok() {}
+
+            task.handle_uplink_nas_delivery(2, OctetString::from_slice(&[0x7E, 0x00, 0x4D]))
+                .await;
+
+            let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(
+                channel,
+                RrcChannel::UlCcch1,
+                "RRCResumeRequest1 rides UL-CCCH1 (TS 38.331 §6.2.1)"
+            );
+            let request = decode_rrc_resume_request1(pdu.data())
+                .expect("the emitted PDU must be a real UPER RRCResumeRequest1");
+            assert_eq!(request.resume_identity, 0x12_3456_789A);
+            assert_eq!(
+                request.resume_cause,
+                ResumeCauseValue::MoData,
+                "an MO NAS message resumes with mo-Data"
+            );
+
+            // The resumeMAC-I is the one the network will recompute. Asserted against a
+            // fresh derivation rather than against a literal, because a literal would
+            // pass even if BOTH sides computed something else.
+            let security = task
+                .as_security
+                .as_ref()
+                .expect("AS security was installed");
+            let expected = nextgsim_rrc::procedures::rrc_resume::compute_resume_mac_i(
+                &security.k_rrc_int,
+                security.integrity_algorithm.id(),
+                security.c_rnti,
+                task.inactive
+                    .as_ref()
+                    .expect("still suspended")
+                    .source_phys_cell_id(),
+                task.serving_cell_identity(),
+            )
+            .expect("derivation");
+            assert_eq!(
+                request.resume_mac_i, expected,
+                "the resumeMAC-I must be derived from the stored context at run time"
+            );
+            assert_ne!(request.resume_mac_i, 0, "and it must not be a placeholder");
+        });
+    }
+
+    /// A page received in RRC_INACTIVE resumes with `mt-Access`, which is what
+    /// RRC_INACTIVE exists for: answering a page is a resume, not a fresh setup.
+    #[test]
+    fn a_page_in_rrc_inactive_emits_a_resume_request_with_mt_access() {
+        use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request1, ResumeCauseValue};
+        let config = test_config();
+        // An identity that pages in the CURRENT frame, so the occasion check passes for
+        // the reason production's does rather than by disabling it.
+        let s_tmsi = s_tmsi_paged_in_the_current_frame(&config);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.set_paging_identity(Some(s_tmsi));
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
+                .await;
+            while rls_rx.try_recv().is_ok() {}
+
+            task.handle_downlink_rrc(1, RrcChannel::Pcch, pcch_paging(&[s_tmsi]))
+                .await;
+
+            let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch1);
+            assert_eq!(
+                decode_rrc_resume_request1(pdu.data())
+                    .expect("real UPER")
+                    .resume_cause,
+                ResumeCauseValue::MtAccess
+            );
+        });
+    }
+
+    /// #38, criterion 8: reselecting a cell outside the RAN Notification Area triggers
+    /// an RNAU with `rna-Update`, through the production `perform_cycle` tick.
+    #[test]
+    fn leaving_the_notification_area_triggers_an_rnau() {
+        use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request1, ResumeCauseValue};
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            // An RNA that does NOT contain the serving cell's NCI, which is what a UE
+            // that has already reselected away would find itself in. A no-t380 config,
+            // so only the crossing can fire.
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlDcch,
+                suspending_release(None, vec![0xDEAD_BEEF]),
+            )
+            .await;
+            assert_eq!(task.state_machine.state(), RrcState::Inactive);
+            while rls_rx.try_recv().is_ok() {}
+
+            task.perform_cycle().await;
+
+            let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch1);
+            assert_eq!(
+                decode_rrc_resume_request1(pdu.data())
+                    .expect("real UPER")
+                    .resume_cause,
+                ResumeCauseValue::RnaUpdate,
+                "an RNA crossing reports in with rna-Update (TS 38.304 §5.5)"
+            );
+        });
+    }
+
+    /// #38, criterion 7: `t380` expiry triggers a periodic RNAU.
+    ///
+    /// Driven by handing `check_rnau` a `now` past the deadline rather than by sleeping
+    /// for 30 minutes — which is why the timer takes its time as a parameter.
+    #[test]
+    fn t380_expiry_triggers_a_periodic_rnau() {
+        use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request1, ResumeCauseValue};
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let serving = task.serving_cell_identity();
+            // The serving cell IS in the area, so a crossing cannot fire and only the
+            // timer can. Without that, this test would pass on the crossing path.
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlDcch,
+                suspending_release(Some(5), vec![serving]),
+            )
+            .await;
+            assert_eq!(task.state_machine.state(), RrcState::Inactive);
+            while rls_rx.try_recv().is_ok() {}
+
+            let now = std::time::Instant::now();
+            task.check_rnau(now).await;
+            assert!(
+                rls_rx.try_recv().is_err(),
+                "nothing before t380 expires, or the timer is not being consulted"
+            );
+
+            task.check_rnau(now + std::time::Duration::from_secs(5 * 60))
+                .await;
+            let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch1);
+            assert_eq!(
+                decode_rrc_resume_request1(pdu.data())
+                    .expect("real UPER")
+                    .resume_cause,
+                ResumeCauseValue::RnaUpdate,
+                "a periodic RNAU reports in with rna-Update (TS 38.304 §5.5)"
+            );
+        });
+    }
+
+    /// A periodic RNAU restarts `t380`, so the *task* does not re-fire every tick.
+    ///
+    /// Distinct from `a_completed_rnau_restarts_t380`, which tests
+    /// `InactiveContext::restart_t380` in isolation: a revert round removed the task's
+    /// call to it and that test stayed green, because nothing covered the wiring.
+    #[test]
+    fn a_fired_rnau_does_not_fire_again_at_the_same_instant() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let serving = task.serving_cell_identity();
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlDcch,
+                suspending_release(Some(5), vec![serving]),
+            )
+            .await;
+            while rls_rx.try_recv().is_ok() {}
+
+            let expired = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+            task.check_rnau(expired).await;
+            let _ = next_uplink_rrc(&mut rls_rx);
+
+            // The resume is now in flight, which alone would stop a second one; so
+            // reset the procedure to isolate the timer. Without the restart, `t380`
+            // would still read as expired and a second RNAU would go out.
+            task.resume_proc.reset();
+            task.check_rnau(expired).await;
+            assert!(
+                rls_rx.try_recv().is_err(),
+                "t380 must have been restarted when the RNAU fired, or the UE resumes \
+                 on every tick for as long as it stays suspended"
+            );
+
+            // And it fires again a full period later — the positive control, without
+            // which a restart that simply disabled the timer would pass.
+            task.check_rnau(expired + std::time::Duration::from_secs(5 * 60))
+                .await;
+            let (channel, _) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch1);
+        });
+    }
+
+    /// A resumed UE discards its I-RNTI: it is single-use, and the network assigns a
+    /// new one if it suspends the UE again (TS 38.331 §5.3.13.3).
+    ///
+    /// A revert round that kept the spent I-RNTI matched no test at all.
+    #[test]
+    fn a_resumed_ue_discards_its_spent_i_rnti() {
+        use nextgsim_rrc::procedures::rrc_resume::{encode_rrc_resume, fresh_rrc_resume_params};
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
+                .await;
+            assert!(
+                task.inactive.is_some(),
+                "precondition: the UE holds a suspend configuration"
+            );
+            task.handle_uplink_nas_delivery(2, OctetString::from_slice(&[0x7E, 0x00, 0x4D]))
+                .await;
+            while rls_rx.try_recv().is_ok() {}
+
+            // The network's real `RRCResume`, built by the same function the gNB uses.
+            let resume =
+                encode_rrc_resume(&fresh_rrc_resume_params(0).expect("params")).expect("encode");
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&resume))
+                .await;
+
+            assert_eq!(task.state_machine.state(), RrcState::Connected);
+            assert!(
+                task.inactive.is_none(),
+                "the I-RNTI is single-use; keeping it would have a later resume \
+                 authenticate against a context that no longer exists"
+            );
+            assert_eq!(task.suspended_in_cell_identity, None);
+        });
+    }
+
+    /// A UE given **no** `t380` fires no periodic RNAU, however long it waits.
+    #[test]
+    fn a_ue_with_no_t380_never_fires_a_periodic_rnau() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let serving = task.serving_cell_identity();
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlDcch,
+                suspending_release(None, vec![serving]),
+            )
+            .await;
+            while rls_rx.try_recv().is_ok() {}
+            task.check_rnau(
+                std::time::Instant::now() + std::time::Duration::from_secs(720 * 60 * 10),
+            )
+            .await;
+            assert!(
+                rls_rx.try_recv().is_err(),
+                "an unconfigured t380 must never expire, or the UE resumes for no reason"
+            );
+        });
+    }
+
+    /// The typed release dispatch must not hijack other DL-DCCH messages.
+    ///
+    /// `decode_rrc_release` now runs before the nibble matcher, so if it accepted a
+    /// reconfiguration the UE would silently go to RRC_IDLE on every DRB setup. Pinned
+    /// because that failure would look like a network problem, not a dispatch bug.
+    #[test]
+    fn a_reconfiguration_is_not_dispatched_as_a_release() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            build_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
+        };
+        let reconfig = encode_rrc_reconfiguration(
+            &build_drb_reconfiguration_params(
+                0,
+                1,
+                1,
+                4,
+                &[9],
+                true,
+                DrbIntegrityProtection::Disabled,
+            )
+            .expect("build"),
+        )
+        .expect("encode");
+        assert!(
+            decode_rrc_release(&reconfig).is_err(),
+            "an RRCReconfiguration must NOT decode as an RRCRelease, or the typed \
+             dispatch would release the UE on every DRB setup"
+        );
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&reconfig))
+                .await;
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Connected,
+                "a reconfiguration must leave the UE connected"
+            );
+            assert!(task.inactive.is_none());
+        });
+    }
+
+    /// The positive control for the crossing test: a UE **inside** its area does not
+    /// RNAU. Without it, a `check_rnau` that fired unconditionally would pass above.
+    #[test]
+    fn staying_inside_the_notification_area_triggers_no_rnau() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let serving = task.serving_cell_identity();
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlDcch,
+                suspending_release(None, vec![serving]),
+            )
+            .await;
+            while rls_rx.try_recv().is_ok() {}
+
+            task.perform_cycle().await;
+
+            assert!(
+                rls_rx.try_recv().is_err(),
+                "a UE inside its RAN Notification Area must send nothing, or the area \
+                 serves no purpose"
+            );
+            assert_eq!(task.state_machine.state(), RrcState::Inactive);
+        });
+    }
+
     // ========================================================================
     // User-plane security (issue #32)
     // ========================================================================
@@ -3322,6 +4096,9 @@ mod tests {
         );
     }
 
+    /// On camping, the RRC task reports the radio's available PLMNs to NAS in
+    /// ActiveCellChanged (issue #49, TS 23.122 §4.4.3) — the production caller
+    /// of CellSelector::available_plmns — so NAS selects over the real radio
     /// rather than a hardcoded home-PLMN list.
     #[test]
     fn test_active_cell_changed_reports_available_plmns() {

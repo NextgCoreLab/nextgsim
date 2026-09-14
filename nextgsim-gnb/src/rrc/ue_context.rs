@@ -17,6 +17,7 @@ use super::redcap::RedCapProcessor;
 use super::transaction::RrcTransactionAllocator;
 use crate::tasks::GutiMobileIdentity;
 use nextgsim_pdcp::srb_security::SrbSecurity;
+use nextgsim_rrc::procedures::suspend_config::{short_i_rnti_of, RanNotificationArea};
 
 /// RRC connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -285,16 +286,75 @@ impl RrcUeContext {
     }
 }
 
+/// The identity an `RRCResumeRequest` presents (TS 38.331 §5.3.13.3).
+///
+/// Two forms of one identity, not two identities — see
+/// [`RrcUeContextManager::find_suspended`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendedIdentity {
+    /// Short 24-bit I-RNTI, from `RRCResumeRequest` on UL-CCCH.
+    Short(u32),
+    /// Full 40-bit I-RNTI, from `RRCResumeRequest1` on UL-CCCH1.
+    Full(u64),
+}
+
+/// A UE context retained across suspension to RRC_INACTIVE (TS 38.331 §5.3.8.3).
+///
+/// This is what makes RRC_INACTIVE a *state* rather than a message: before issue #38
+/// the gNB called `delete_ue` on every release, so an `RRCResumeRequest` had nothing
+/// to be resolved against and the resume handler fabricated a fresh context —
+/// accepting, unauthenticated, any UE that asked.
+///
+/// It deliberately carries no `Instant`: nothing here expires on the gNB's clock.
+/// The UE's `t380` governs when it comes back, and a gNB-side timeout would discard a
+/// context the UE still believes in, turning a resume into a silent setup fallback.
+#[derive(Debug, Clone)]
+pub struct SuspendedUeContext {
+    /// The `ue_id` the UE had while connected. Retained for logging and for
+    /// re-keying the restored context; the *lookup* key is the I-RNTI.
+    pub previous_ue_id: i32,
+    /// Full 40-bit I-RNTI, the key this context is stored under.
+    pub full_i_rnti: u64,
+    /// The AS security context of the source PCell, which is what lets the gNB
+    /// recompute the `resumeMAC-I` the UE will present (TS 38.331 §5.3.13.3).
+    ///
+    /// Carries `c_rnti` and `phys_cell_id` too, and those are exactly the values the
+    /// MAC covers — taking them from the *resuming* cell instead would fail every
+    /// verification.
+    pub security: ReestablishmentSecurity,
+    /// The RAN Notification Area the UE was given, so the gNB can tell whether an
+    /// arriving RNAU was one it configured (TS 38.304 §5.5).
+    pub ran_notification_area: Option<RanNotificationArea>,
+    /// `t380` in minutes, as signalled. Recorded, not enforced — see the type docs.
+    pub t380_minutes: Option<u16>,
+}
+
+// NOTE on what is deliberately NOT stored: the UE's radio bearer configuration.
+// `fresh_rrc_resume_params` gives a resumed UE the SRB1 configuration `RRCSetup`
+// builds with `fullConfig` set, which tells it to discard and rebuild rather than
+// merge a delta (issue #107 recorded that decision). Storing a configuration here
+// would only be worth it to send a delta, and the RRC context does not track DRBs at
+// all -- so the honest thing is to keep sending `fullConfig` and say so.
+
 /// RRC UE context manager
 ///
 /// Manages all UE contexts within the RRC task. Provides methods to create,
-/// find, and delete UE contexts.
+/// find, and delete UE contexts, plus the I-RNTI-keyed store of UEs suspended to
+/// RRC_INACTIVE (issue #38).
 ///
 /// Based on UERANSIM's UE management from `src/gnb/rrc/ues.cpp`.
 #[derive(Debug, Default)]
 pub struct RrcUeContextManager {
     /// UE contexts indexed by UE ID
     contexts: HashMap<i32, RrcUeContext>,
+    /// Suspended UE contexts, keyed by **full** I-RNTI (issue #38).
+    ///
+    /// A separate map, not a state flag on `contexts`, because a suspended UE has no
+    /// `ue_id` the network can use: the transport-level id belonged to the RRC
+    /// connection that has just gone away, and the next `RRCResumeRequest` may arrive
+    /// under a different one. The I-RNTI is the only identity that survives
+    /// suspension (TS 38.331 §5.3.8.3), so it has to be the key.
+    suspended: HashMap<u64, SuspendedUeContext>,
 }
 
 impl RrcUeContextManager {
@@ -302,6 +362,7 @@ impl RrcUeContextManager {
     pub fn new() -> Self {
         Self {
             contexts: HashMap::new(),
+            suspended: HashMap::new(),
         }
     }
 
@@ -379,6 +440,87 @@ impl RrcUeContextManager {
             .filter(|(_, ctx)| ctx.is_connected())
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Suspend a connected UE to RRC_INACTIVE: move its context out of the active
+    /// map and into the I-RNTI-keyed suspended store (TS 38.331 §5.3.8.3).
+    ///
+    /// `security` is passed in rather than read from the context here, and that is
+    /// deliberate: the caller must already have it to put the `nextHopChainingCount`
+    /// in the `suspendConfig`, so reading it again would make **two** places decide
+    /// whether a UE may be suspended. A revert round proved the second one could not
+    /// fail — breaking it changed nothing, because the caller had already refused —
+    /// and a guard that cannot fail is worse than none: it reads as protection.
+    ///
+    /// Refusing a UE with no AS security context is therefore the *caller's* job, and
+    /// [`RrcConnectionManager::initiate_rrc_suspend`](crate::rrc::connection::RrcConnectionManager::initiate_rrc_suspend)
+    /// does it — without `K_RRCint` the gNB could never verify the `resumeMAC-I`, so
+    /// suspending would create exactly the unauthenticatable resume issue #38 reports.
+    ///
+    /// Returns `None` when the UE is unknown.
+    pub fn suspend_ue(
+        &mut self,
+        ue_id: i32,
+        full_i_rnti: u64,
+        security: ReestablishmentSecurity,
+        ran_notification_area: Option<RanNotificationArea>,
+        t380_minutes: Option<u16>,
+    ) -> Option<&SuspendedUeContext> {
+        self.contexts.get(&ue_id)?;
+        // Removed from the active map, not merely flagged: the UE is no longer
+        // reachable by `ue_id`, and leaving it there would let a downlink send path
+        // address a UE that is not listening.
+        self.contexts.remove(&ue_id);
+        self.suspended.insert(
+            full_i_rnti,
+            SuspendedUeContext {
+                previous_ue_id: ue_id,
+                full_i_rnti,
+                security,
+                ran_notification_area,
+                t380_minutes,
+            },
+        );
+        self.suspended.get(&full_i_rnti)
+    }
+
+    /// Look a suspended context up by the identity an `RRCResumeRequest` presented.
+    ///
+    /// Both forms resolve to the same context: the short I-RNTI is the low 24 bits of
+    /// the full one ([`short_i_rnti_of`]), and which form the UE sends depends on
+    /// SIB1's `useFullResumeID`, not on the network's preference. A gNB that only
+    /// indexed one form would fail to find its own context half the time.
+    pub fn find_suspended(&self, identity: SuspendedIdentity) -> Option<&SuspendedUeContext> {
+        match identity {
+            SuspendedIdentity::Full(full) => self.suspended.get(&full),
+            SuspendedIdentity::Short(short) => self
+                .suspended
+                .values()
+                .find(|ctx| short_i_rnti_of(ctx.full_i_rnti) == short),
+        }
+    }
+
+    /// Take a suspended context out of the store, as a resume does.
+    ///
+    /// Removal is the point: an I-RNTI is single-use (TS 38.331 §5.3.13.3 — the
+    /// network assigns a new one if it suspends the UE again), so leaving it in place
+    /// would let the same `RRCResumeRequest` be replayed for as long as the context
+    /// lived.
+    pub fn take_suspended(&mut self, identity: SuspendedIdentity) -> Option<SuspendedUeContext> {
+        let full = self.find_suspended(identity)?.full_i_rnti;
+        self.suspended.remove(&full)
+    }
+
+    /// How many UEs are suspended in RRC_INACTIVE.
+    pub fn suspended_count(&self) -> usize {
+        self.suspended.len()
+    }
+
+    /// The full I-RNTIs of every suspended UE, ascending, for status reporting.
+    pub fn suspended_i_rntis(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.suspended.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// UE contexts whose stored AS security context matches the `(C-RNTI, PCI)`
