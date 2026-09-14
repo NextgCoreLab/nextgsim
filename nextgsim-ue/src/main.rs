@@ -891,6 +891,35 @@ impl UeApp {
                                 .await;
                             }
                         }
+                        NasMessage::ServingCellMeasurement {
+                            phys_cell_id,
+                            rsrp_dbm,
+                        } => {
+                            // The raw material of an LPP E-CID report (#46). Mapped to
+                            // the TS 36.133 report value here rather than at the RRC
+                            // end, so the message carries the measurement itself and
+                            // the encoding lives with the codec that needs it.
+                            use nextgsim_ue::nas::lpp::{
+                                rsrp_report_value, ServingCellMeasurements,
+                            };
+                            debug!(
+                                "Serving cell measurement: PCI {phys_cell_id}, {rsrp_dbm} dBm"
+                            );
+                            orch.set_serving_cell_measurements(ServingCellMeasurements {
+                                phys_cell_id,
+                                arfcn: task_base.config.lpp_arfcn_eutra,
+                                // A genuine value: #99's frame clock is the same one
+                                // the paging-occasion calculation uses, so the SFN in
+                                // a report is the SFN the UE is actually counting.
+                                system_frame_number: Some(
+                                    nextgsim_common::frame_clock::current_sfn(),
+                                ),
+                                rsrp_result: Some(rsrp_report_value(rsrp_dbm)),
+                                // Not measured anywhere in this UE; see
+                                // `nas::lpp`'s module documentation.
+                                rsrq_result: None,
+                            });
+                        }
                         NasMessage::RrcFallbackIndication => {
                             info!("RRC fallback indication");
                         }
@@ -1966,6 +1995,34 @@ async fn handle_unmanaged_mm_message(
                                     "UUAA-MM: container applied, nothing to send (state {:?})",
                                     orch.uuaa_state()
                                 );
+                            }
+                        }
+                    } else if dl.payload_container_type == PayloadContainerType::LppMessage {
+                        // LPP positioning (#46, TS 37.355 over TS 24.501 §5.4.5.3):
+                        // an LMF exchange relayed by the AMF. Like the two above it
+                        // must NOT reach the SM orchestrator, which owns N1 SM
+                        // information and returned an empty result for it -- so the
+                        // container was dropped and the LMF's transaction timed out.
+                        use nextgsim_ue::nas::lpp::LppUplink;
+                        match orch.handle_lpp_container(&dl.payload_container) {
+                            LppUplink::Send(nas_pdu) => {
+                                let nas_pdu = orch.protect_if_active(nas_pdu);
+                                info!(
+                                    "LPP: sending UL NAS TRANSPORT, len={} (reply {} for this UE)",
+                                    nas_pdu.len(),
+                                    orch.lpp_replies_sent()
+                                );
+                                *pdu_counter += 1;
+                                let _ = task_base
+                                    .rrc_tx
+                                    .send(RrcMessage::UplinkNasDelivery {
+                                        pdu_id: *pdu_counter,
+                                        pdu: nas_pdu.into(),
+                                    })
+                                    .await;
+                            }
+                            LppUplink::Nothing => {
+                                debug!("LPP: container needed no reply or could not be answered");
                             }
                         }
                     } else {

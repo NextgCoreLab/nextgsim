@@ -1321,6 +1321,20 @@ pub struct UeConfig {
     /// shows up as paging being dropped rather than as a configuration error.
     #[serde(default = "default_paging_cycle_frames")]
     pub paging_default_cycle_frames: u16,
+    /// `arfcnEUTRA` this UE puts in an LPP E-CID measurement report (issue #46,
+    /// TS 37.355 `MeasuredResultsElement`), an `ARFCN-ValueEUTRA` in 0..65535.
+    ///
+    /// **Configured, not measured, and it has to be**: the field is a MANDATORY
+    /// member of the report, while this is an NR UE with no E-UTRA carrier to
+    /// measure -- RLS carries NR cells exclusively. So the report has to name some
+    /// carrier and only the operator knows which. The default of 0 is a legal EARFCN
+    /// (band 1 starts there), not a "none" marker, so a run whose LMF cares about the
+    /// carrier must set this rather than read the default as "unknown".
+    ///
+    /// A value above 65535 cannot be encoded and the report is dropped rather than
+    /// truncated, because a truncated ARFCN names a different carrier.
+    #[serde(default)]
+    pub lpp_arfcn_eutra: u32,
     /// OS App Id this UE reports to URSP evaluation, as a UTF-8 string
     /// (issue #97). `None` means no `OsIdOsAppId` component can match.
     ///
@@ -1551,6 +1565,7 @@ impl Default for UeConfig {
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
             paging_default_cycle_frames: default_paging_cycle_frames(),
+            lpp_arfcn_eutra: 0,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),

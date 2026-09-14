@@ -9,10 +9,12 @@
 //! The NAS layer is organized into:
 //! - `mm`: Mobility Management procedures (registration, deregistration, authentication, etc.)
 //! - `sm`: Session Management procedures (PDU session establishment, modification, release)
+//! - `lpp`: LPP positioning procedures carried in the NAS payload container
 //!
 //! # Reference
 //!
 //! Based on 3GPP TS 24.501 and UERANSIM's `src/ue/nas/` implementation.
 
+pub mod lpp;
 pub mod mm;
 pub mod sm;
