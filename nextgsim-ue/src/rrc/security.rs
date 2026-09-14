@@ -167,6 +167,12 @@ pub struct AsSecurityContext {
     /// KRRCenc — RRC ciphering key (128 bits), derived from KgNB with
     /// `AlgorithmTypeDistinguisher::RrcEnc` (TS 33.501 Annex A.8).
     pub k_rrc_enc: [u8; 16],
+    /// KUPint — user-plane (DRB) integrity key (128 bits), derived from KgNB with
+    /// `AlgorithmTypeDistinguisher::UpInt` (TS 33.501 Annex A.8, issue #32).
+    pub k_up_int: [u8; 16],
+    /// KUPenc — user-plane (DRB) ciphering key (128 bits), derived from KgNB with
+    /// `AlgorithmTypeDistinguisher::UpEnc` (TS 33.501 Annex A.8, issue #32).
+    pub k_up_enc: [u8; 16],
     /// Integrity protection algorithm of the source PCell
     pub integrity_algorithm: IntegrityAlgorithm,
     /// Ciphering algorithm of the source PCell
@@ -245,6 +251,20 @@ impl AsSecurityContext {
             k_rrc_enc: derive_rrc_up_key(
                 kgnb,
                 AlgorithmTypeDistinguisher::RrcEnc,
+                ciphering_algorithm.id(),
+            ),
+            // The UP keys use different distinguishers and therefore differ from the
+            // RRC pair even though the algorithms are the same (issue #32). The gNB
+            // makes the same four calls in `activate_as_security`, so both ends hold
+            // identical keys without either signalling them.
+            k_up_int: derive_rrc_up_key(
+                kgnb,
+                AlgorithmTypeDistinguisher::UpInt,
+                integrity_algorithm.id(),
+            ),
+            k_up_enc: derive_rrc_up_key(
+                kgnb,
+                AlgorithmTypeDistinguisher::UpEnc,
                 ciphering_algorithm.id(),
             ),
             integrity_algorithm,
@@ -457,6 +477,17 @@ mod tests {
             k_rrc_enc: [
                 0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD,
                 0xFE, 0xFF,
+            ],
+            // Distinct from the RRC pair, as `derive_from_kgnb` produces them:
+            // a test that reused the RRC keys here would not notice a UP path keyed
+            // with the wrong one.
+            k_up_int: [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+                0x1E, 0x1F,
+            ],
+            k_up_enc: [
+                0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED,
+                0xEE, 0xEF,
             ],
             integrity_algorithm: alg,
             ciphering_algorithm: CipheringAlgorithm::Nea2,

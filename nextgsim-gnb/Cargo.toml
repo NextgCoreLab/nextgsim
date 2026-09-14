@@ -23,6 +23,13 @@ kernel-sctp = ["nextgsim-sctp/kernel-sctp"]
 # build keeps RLC wired straight to GTP-U. Both ends must agree -- a gNB with the
 # feature on and a UE with it off would have the UE read a PDCP header as payload.
 drb-pdcp = []
+# User-plane (DRB) PDCP integrity protection and ciphering with K_UPenc/K_UPint
+# (issue #32, TS 38.323 5.8/5.9, TS 33.501 6.6). Off by default and implies
+# `drb-pdcp`, because the COUNT ciphering is keyed on is the PDCP entity's state:
+# without an entity there is nothing to protect. Both ends must agree -- a gNB
+# with it on and a UE with it off has the UE read a MAC-I as payload and fail
+# every integrity check, which takes the user plane down rather than degrading it.
+up-security = ["drb-pdcp"]
 
 # Umbrella feature enabling all six optional 6G / AI-native research crates at
 # once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and

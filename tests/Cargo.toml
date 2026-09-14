@@ -17,6 +17,12 @@ publish = false
 # PDCP header as payload, so there is no configuration in which enabling one is
 # useful.
 drb-pdcp = ["nextgsim-gnb/drb-pdcp", "nextgsim-ue/drb-pdcp"]
+# Enables the user-plane security end-to-end test (src/up_security_user_plane.rs),
+# which needs K_UPenc/K_UPint applied on BOTH ends (issue #32). Forwarded to both
+# crates together for the same reason as `drb-pdcp`: a gNB that protects against a
+# UE that does not takes the user plane down rather than degrading it, and the test
+# asserts exactly that.
+up-security = ["nextgsim-gnb/up-security", "nextgsim-ue/up-security"]
 
 [dependencies]
 # Internal crates
@@ -114,3 +120,7 @@ path = "src/rlc_two_session_user_plane.rs"
 [[test]]
 name = "drb_pdcp_user_plane"
 path = "src/drb_pdcp_user_plane.rs"
+
+[[test]]
+name = "up_security_user_plane"
+path = "src/up_security_user_plane.rs"

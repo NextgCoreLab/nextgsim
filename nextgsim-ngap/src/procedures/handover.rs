@@ -1443,6 +1443,12 @@ fn build_radio_network_cause(cause: &RadioNetworkCause) -> CauseRadioNetwork {
             CauseRadioNetwork::MULTIPLE_QOS_FLOW_ID_INSTANCES
         }
         RadioNetworkCause::UnknownMappedUeNgapId => CauseRadioNetwork::UNSPECIFIED,
+        RadioNetworkCause::UpIntegrityProtectionNotPossible => {
+            CauseRadioNetwork::UP_INTEGRITY_PROTECTION_NOT_POSSIBLE
+        }
+        RadioNetworkCause::UpConfidentialityProtectionNotPossible => {
+            CauseRadioNetwork::UP_CONFIDENTIALITY_PROTECTION_NOT_POSSIBLE
+        }
         RadioNetworkCause::Other(v) => *v,
     };
     CauseRadioNetwork(value)
@@ -1572,6 +1578,12 @@ fn parse_radio_network_cause(cause: &CauseRadioNetwork) -> RadioNetworkCause {
         CauseRadioNetwork::UNKOWN_QOS_FLOW_ID => RadioNetworkCause::UnkownQosFlowId,
         CauseRadioNetwork::MULTIPLE_QOS_FLOW_ID_INSTANCES => {
             RadioNetworkCause::MultipleQosFlowIdInstances
+        }
+        CauseRadioNetwork::UP_INTEGRITY_PROTECTION_NOT_POSSIBLE => {
+            RadioNetworkCause::UpIntegrityProtectionNotPossible
+        }
+        CauseRadioNetwork::UP_CONFIDENTIALITY_PROTECTION_NOT_POSSIBLE => {
+            RadioNetworkCause::UpConfidentialityProtectionNotPossible
         }
         other => RadioNetworkCause::Other(other),
     }

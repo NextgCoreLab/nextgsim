@@ -9,10 +9,12 @@
 
 use std::collections::HashMap;
 
+use crate::ngap::up_security::DrbSecurityDecision;
 use crate::rrc::transaction::RrcTransactionAllocator;
 use nextgsim_ngap::procedures::initial_context_setup::{
     UeAggregateMaxBitRate, UeSecurityCapabilitiesValue,
 };
+use nextgsim_ngap::procedures::transfer::UpSecurityPolicy;
 
 /// UE state within NGAP
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -39,11 +41,24 @@ impl std::fmt::Display for UeState {
     }
 }
 
-/// PDU session information within NGAP UE context
+/// PDU session information within NGAP UE context, including the user-plane
+/// security the gNB applies to its DRB
 #[derive(Debug, Clone)]
 pub struct NgapPduSession {
     /// PDU Session ID (1-15)
     pub psi: u8,
+    /// The user-plane security policy in force for this session's DRB
+    /// (TS 38.413 §9.3.1.27, issue #32).
+    ///
+    /// The *effective* policy: the SMF's `SecurityIndication` when it sent one, and
+    /// [`UpSecurityPolicy::locally_configured_default`] when it did not. Resolved
+    /// once here rather than at each reader, because a reader that forgot the
+    /// fallback would treat a session the SMF said nothing about as unprotected.
+    pub up_security_policy: UpSecurityPolicy,
+    /// What the gNB actually applies to the DRB, after the negotiated algorithms
+    /// and this build's capability. Not derivable from `up_security_policy` alone —
+    /// a `preferred` policy with NEA0 selected protects nothing.
+    pub up_security: DrbSecurityDecision,
     /// `QoS` Flow Identifier
     pub qfi: Option<u8>,
     /// Uplink TEID (gNB -> UPF)
@@ -254,6 +269,8 @@ mod tests {
             uplink_teid: 0x12345678,
             downlink_teid: 0x87654321,
             upf_address: "10.0.0.1".parse().unwrap(),
+            up_security_policy: UpSecurityPolicy::locally_configured_default(),
+            up_security: DrbSecurityDecision::default(),
         };
 
         ctx.add_pdu_session(session.clone());

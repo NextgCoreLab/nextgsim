@@ -147,6 +147,155 @@ impl GtpTunnelInfo {
 }
 
 // ============================================================================
+// User-plane security policy (SecurityIndication, TS 38.413 §9.3.1.27)
+// ============================================================================
+
+/// How strongly the SMF wants one kind of user-plane protection
+/// (TS 38.413 §9.3.1.27; TS 33.501 §5.10.3, §6.6.1).
+///
+/// The three values are a real hierarchy of obligation, not a preference scale,
+/// and the NG-RAN node's duties differ at each one:
+///
+/// - `Required` — the gNB **must** protect the DRB, and must **reject** the PDU
+///   session if it cannot.
+/// - `Preferred` — protect if able; establish the session either way.
+/// - `NotNeeded` — the gNB should not protect the DRB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpProtectionPolicy {
+    /// `required`: protection is mandatory, and the session fails without it.
+    Required,
+    /// `preferred`: protect when possible.
+    Preferred,
+    /// `not-needed`: do not protect.
+    NotNeeded,
+}
+
+impl UpProtectionPolicy {
+    /// Whether a gNB unable to provide this protection must refuse the session.
+    pub fn is_mandatory(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// Whether the gNB should turn this protection on when it can.
+    pub fn wants_protection(self) -> bool {
+        matches!(self, Self::Required | Self::Preferred)
+    }
+}
+
+/// The maximum rate the UE will integrity-protect at
+/// (`MaximumIntegrityProtectedDataRate`, TS 38.413 §9.3.1.72).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxIntegrityProtectedDataRate {
+    /// `bitrate64kbs`: the UE can only integrity-protect a signalling-rate flow.
+    Bitrate64kbs,
+    /// `maximum-UE-rate`: no rate restriction beyond the UE's own capability.
+    MaximumUeRate,
+}
+
+/// The `SecurityIndication` IE: the SMF's user-plane security policy for one PDU
+/// session (TS 38.413 §9.3.1.27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpSecurityPolicy {
+    /// Integrity protection policy for the session's DRBs.
+    pub integrity: UpProtectionPolicy,
+    /// Confidentiality protection policy for the session's DRBs.
+    pub confidentiality: UpProtectionPolicy,
+    /// Present when integrity protection is not `not-needed`; the rate ceiling the
+    /// UE indicated it can integrity-protect at.
+    pub max_integrity_protected_data_rate: Option<MaxIntegrityProtectedDataRate>,
+}
+
+impl UpSecurityPolicy {
+    /// The policy a session with **no** `SecurityIndication` IE runs under.
+    ///
+    /// TS 33.501 §5.10.3: the IE is optional, and when the SMF omits it the
+    /// NG-RAN node applies its locally configured policy. `Preferred` for both is
+    /// that policy here — it protects when the negotiated algorithms allow and
+    /// never refuses a session, which is what a session the SMF said nothing about
+    /// should get. `Required` would refuse sessions no SMF asked to have refused,
+    /// and `NotNeeded` would silently leave user traffic in the clear.
+    pub fn locally_configured_default() -> Self {
+        Self {
+            integrity: UpProtectionPolicy::Preferred,
+            confidentiality: UpProtectionPolicy::Preferred,
+            max_integrity_protected_data_rate: None,
+        }
+    }
+}
+
+/// Decode a `SecurityIndication`.
+///
+/// An unknown enumeration value — one past this schema's extension marker — is
+/// read as `Preferred` rather than refused. It is the only value that cannot be
+/// wrong in a dangerous direction: `Required` would fail sessions on an IE we did
+/// not understand, and `NotNeeded` would drop protection on the SMF's say-so
+/// without knowing that is what it said.
+pub(crate) fn up_security_policy_from_asn(ind: &SecurityIndication) -> UpSecurityPolicy {
+    let integrity = match ind.integrity_protection_indication.0 {
+        IntegrityProtectionIndication::REQUIRED => UpProtectionPolicy::Required,
+        IntegrityProtectionIndication::NOT_NEEDED => UpProtectionPolicy::NotNeeded,
+        _ => UpProtectionPolicy::Preferred,
+    };
+    let confidentiality = match ind.confidentiality_protection_indication.0 {
+        ConfidentialityProtectionIndication::REQUIRED => UpProtectionPolicy::Required,
+        ConfidentialityProtectionIndication::NOT_NEEDED => UpProtectionPolicy::NotNeeded,
+        _ => UpProtectionPolicy::Preferred,
+    };
+    let max_integrity_protected_data_rate = ind
+        .maximum_integrity_protected_data_rate_ul
+        .as_ref()
+        .map(|rate| match rate.0 {
+            MaximumIntegrityProtectedDataRate::BITRATE64KBS => {
+                MaxIntegrityProtectedDataRate::Bitrate64kbs
+            }
+            _ => MaxIntegrityProtectedDataRate::MaximumUeRate,
+        });
+    UpSecurityPolicy {
+        integrity,
+        confidentiality,
+        max_integrity_protected_data_rate,
+    }
+}
+
+/// Encode a `SecurityIndication`.
+///
+/// `maximumIntegrityProtectedDataRate-UL` is **conditional**, not optional
+/// (TS 38.413 §9.3.1.27): it is present when integrity protection is not
+/// `not-needed`. So an encoder handed `None` with integrity wanted substitutes
+/// `maximum-UE-rate`, which is the "no restriction" value and the only one that
+/// does not invent a ceiling the UE never indicated.
+pub(crate) fn up_security_policy_to_asn(policy: &UpSecurityPolicy) -> SecurityIndication {
+    let integrity = IntegrityProtectionIndication(match policy.integrity {
+        UpProtectionPolicy::Required => IntegrityProtectionIndication::REQUIRED,
+        UpProtectionPolicy::Preferred => IntegrityProtectionIndication::PREFERRED,
+        UpProtectionPolicy::NotNeeded => IntegrityProtectionIndication::NOT_NEEDED,
+    });
+    let confidentiality = ConfidentialityProtectionIndication(match policy.confidentiality {
+        UpProtectionPolicy::Required => ConfidentialityProtectionIndication::REQUIRED,
+        UpProtectionPolicy::Preferred => ConfidentialityProtectionIndication::PREFERRED,
+        UpProtectionPolicy::NotNeeded => ConfidentialityProtectionIndication::NOT_NEEDED,
+    });
+    let rate = if policy.integrity == UpProtectionPolicy::NotNeeded {
+        None
+    } else {
+        Some(MaximumIntegrityProtectedDataRate(
+            match policy.max_integrity_protected_data_rate {
+                Some(MaxIntegrityProtectedDataRate::Bitrate64kbs) => {
+                    MaximumIntegrityProtectedDataRate::BITRATE64KBS
+                }
+                _ => MaximumIntegrityProtectedDataRate::MAXIMUM_UE_RATE,
+            },
+        ))
+    };
+    SecurityIndication {
+        integrity_protection_indication: integrity,
+        confidentiality_protection_indication: confidentiality,
+        maximum_integrity_protected_data_rate_ul: rate,
+        ie_extensions: None,
+    }
+}
+
+// ============================================================================
 // PDU Session Resource Setup Request Transfer (decode, TS 38.413 §9.3.4.1)
 // ============================================================================
 
@@ -174,6 +323,13 @@ pub struct SetupRequestTransferData {
     pub pdu_session_type: u8,
     /// QoS flows to set up (mandatory, at least one)
     pub qos_flows: Vec<QosFlowSetupInfo>,
+    /// The SMF's user-plane security policy for this session (optional IE).
+    ///
+    /// `None` means the SMF sent no `SecurityIndication`; see
+    /// [`UpSecurityPolicy::locally_configured_default`] for what a gNB then does.
+    /// Kept as `Option` rather than defaulted here so a consumer can tell "the SMF
+    /// asked for `preferred`" from "the SMF said nothing".
+    pub security_indication: Option<UpSecurityPolicy>,
 }
 
 /// Decode a PDU Session Resource Setup Request Transfer.
@@ -192,6 +348,7 @@ pub fn decode_setup_request_transfer(
     let mut ul_tunnel = None;
     let mut pdu_session_type = None;
     let mut qos_flows: Option<Vec<QosFlowSetupInfo>> = None;
+    let mut security_indication = None;
 
     for entry in &container.0 {
         match &entry.value {
@@ -227,6 +384,9 @@ pub fn decode_setup_request_transfer(
                         .collect(),
                 );
             }
+            PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_SecurityIndication(ind) => {
+                security_indication = Some(up_security_policy_from_asn(ind));
+            }
             _ => {} // Optional IEs we do not act on (criticality handled by sender)
         }
     }
@@ -250,6 +410,7 @@ pub fn decode_setup_request_transfer(
         ul_tunnel,
         pdu_session_type,
         qos_flows,
+        security_indication,
     })
 }
 
@@ -330,6 +491,23 @@ pub fn encode_setup_request_transfer(
             QosFlowSetupRequestList(items),
         ),
     });
+
+    // Appended last so a transfer with no policy is byte-identical to what this
+    // encoder produced before issue #32, which is what keeps the existing
+    // cross-decode tests against the core's codec meaningful.
+    if let Some(policy) = &data.security_indication {
+        entries.push(PDUSessionResourceSetupRequestTransferProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_SECURITY_INDICATION),
+            // REJECT, per TS 38.413 §9.3.4.1: a gNB that cannot act on the SMF's
+            // security policy must fail the session rather than establish it
+            // unprotected.
+            criticality: Criticality(Criticality::REJECT),
+            value:
+                PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_SecurityIndication(
+                    up_security_policy_to_asn(policy),
+                ),
+        });
+    }
 
     Ok(encode_aper(&PDUSessionResourceSetupRequestTransfer {
         protocol_i_es: PDUSessionResourceSetupRequestTransferProtocolIEs(entries),
@@ -830,6 +1008,7 @@ mod tests {
                 five_qi: Some(9),
                 arp_priority_level: 8,
             }],
+            security_indication: None,
         }
     }
 
@@ -839,6 +1018,74 @@ mod tests {
         let bytes = encode_setup_request_transfer(&data).unwrap();
         let decoded = decode_setup_request_transfer(&bytes).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    /// #32, criterion 1: every `SecurityIndication` the SMF can send survives a
+    /// round trip onto the parsed setup item.
+    #[test]
+    fn every_security_indication_round_trips_onto_the_parsed_item() {
+        use UpProtectionPolicy::*;
+        for integrity in [Required, Preferred, NotNeeded] {
+            for confidentiality in [Required, Preferred, NotNeeded] {
+                for rate in [
+                    None,
+                    Some(MaxIntegrityProtectedDataRate::Bitrate64kbs),
+                    Some(MaxIntegrityProtectedDataRate::MaximumUeRate),
+                ] {
+                    let mut data = sample_request();
+                    data.security_indication = Some(UpSecurityPolicy {
+                        integrity,
+                        confidentiality,
+                        max_integrity_protected_data_rate: rate,
+                    });
+                    let bytes = encode_setup_request_transfer(&data).unwrap();
+                    let decoded = decode_setup_request_transfer(&bytes)
+                        .expect("a transfer carrying a SecurityIndication must decode");
+                    let got = decoded
+                        .security_indication
+                        .expect("the policy must reach the parsed item");
+                    assert_eq!(got.integrity, integrity);
+                    assert_eq!(got.confidentiality, confidentiality);
+                    // The rate IE is conditional on integrity not being
+                    // `not-needed`, so it is absent exactly then -- and present
+                    // otherwise even when the caller supplied none.
+                    if integrity == NotNeeded {
+                        assert_eq!(
+                            got.max_integrity_protected_data_rate, None,
+                            "the rate IE must be absent when integrity is not needed"
+                        );
+                    } else {
+                        assert_eq!(
+                            got.max_integrity_protected_data_rate,
+                            Some(rate.unwrap_or(MaxIntegrityProtectedDataRate::MaximumUeRate)),
+                            "an absent rate must encode as maximum-UE-rate, not vanish"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A transfer with no `SecurityIndication` yields `None`, distinguishable from
+    /// an SMF that explicitly asked for `preferred`.
+    #[test]
+    fn an_absent_security_indication_is_none_and_not_a_default() {
+        let bytes = encode_setup_request_transfer(&sample_request()).unwrap();
+        let decoded = decode_setup_request_transfer(&bytes).unwrap();
+        assert_eq!(decoded.security_indication, None);
+        assert_ne!(
+            decoded.security_indication,
+            Some(UpSecurityPolicy::locally_configured_default()),
+            "\"the SMF said nothing\" must not be confused with \"the SMF said preferred\""
+        );
+        // And the local default is what a gNB then applies.
+        let fallback = UpSecurityPolicy::locally_configured_default();
+        assert!(fallback.integrity.wants_protection());
+        assert!(fallback.confidentiality.wants_protection());
+        assert!(
+            !fallback.integrity.is_mandatory() && !fallback.confidentiality.is_mandatory(),
+            "the local default must never refuse a session the SMF did not ask to refuse"
+        );
     }
 
     #[test]

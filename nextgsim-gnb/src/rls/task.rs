@@ -156,6 +156,29 @@ impl RlsTask {
             .or_insert_with(|| Pdcp::new(PdcpConfig::default()))
     }
 
+    /// Install (or remove) user-plane security on one UE's DRB (issue #32).
+    ///
+    /// Applied to the entity for `(ue_id, psi)`, creating it if the DRB has not
+    /// carried a packet yet — the keys arrive from NGAP before the first G-PDU does,
+    /// and an entity created later with no security would leave the first packets
+    /// unprotected.
+    #[cfg(feature = "up-security")]
+    fn install_drb_security(
+        &mut self,
+        ue_id: i32,
+        psi: i32,
+        security: Option<nextgsim_pdcp::PdcpSecurity>,
+    ) {
+        let protected = security.is_some();
+        self.pdcp_entity_for(ue_id, psi).set_security(security);
+        info!(
+            "DRB user-plane security {} for UE[{}] PSI {}",
+            if protected { "installed" } else { "removed" },
+            ue_id,
+            psi
+        );
+    }
+
     /// Milliseconds since the task started, for the PDCP timers.
     #[cfg(feature = "drb-pdcp")]
     fn pdcp_now_ms(&self) -> u64 {
@@ -879,6 +902,10 @@ impl Task for RlsTask {
                                 }
                                 RlsMessage::DownlinkData { ue_id, psi, pdu } => {
                                     self.handle_downlink_data(ue_id, psi, pdu).await;
+                                }
+                                #[cfg(feature = "up-security")]
+                                RlsMessage::InstallDrbSecurity { ue_id, psi, security } => {
+                                    self.install_drb_security(ue_id, psi, security.map(|b| *b));
                                 }
                                 RlsMessage::SignalDetected { ue_id } => {
                                     debug!("Signal detected notification for UE[{}]", ue_id);

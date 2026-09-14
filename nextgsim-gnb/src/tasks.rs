@@ -682,6 +682,23 @@ pub enum RlsMessage {
         /// RRC PDU data
         data: OctetString,
     },
+    /// Install (or remove) user-plane security on one UE's DRB, from NGAP
+    /// (issue #32, TS 33.501 §6.6.1).
+    ///
+    /// The keys live in the NGAP UE context because that is where the SMF's policy
+    /// and the `KgNB` arrive, and the PDCP entities live in the RLS task because
+    /// that is where the data path is. This message is the seam. `security: None`
+    /// removes protection, which is what a released session needs so the next UE to
+    /// be allocated the same id cannot inherit keys.
+    #[cfg(feature = "up-security")]
+    InstallDrbSecurity {
+        /// UE ID
+        ue_id: i32,
+        /// PDU session ID, which is also the DRB identity here
+        psi: i32,
+        /// The keys, algorithms and bearer binding, or `None` to remove it
+        security: Option<Box<nextgsim_pdcp::PdcpSecurity>>,
+    },
     /// Downlink data PDU (from GTP)
     DownlinkData {
         /// UE ID

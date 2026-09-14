@@ -211,6 +211,12 @@ fn build_radio_network_cause(cause: &RadioNetworkCause) -> CauseRadioNetwork {
             CauseRadioNetwork::NO_RADIO_RESOURCES_AVAILABLE_IN_TARGET_CELL
         }
         RadioNetworkCause::UnknownTargetId => CauseRadioNetwork::UNKNOWN_TARGET_ID,
+        RadioNetworkCause::UpIntegrityProtectionNotPossible => {
+            CauseRadioNetwork::UP_INTEGRITY_PROTECTION_NOT_POSSIBLE
+        }
+        RadioNetworkCause::UpConfidentialityProtectionNotPossible => {
+            CauseRadioNetwork::UP_CONFIDENTIALITY_PROTECTION_NOT_POSSIBLE
+        }
         RadioNetworkCause::Other(v) => *v,
         _ => CauseRadioNetwork::UNSPECIFIED,
     };

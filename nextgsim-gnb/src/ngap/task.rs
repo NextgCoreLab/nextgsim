@@ -30,9 +30,10 @@ use nextgsim_common::OctetString;
 use super::amf_context::{AmfIdentity, AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
+use super::up_security::{self, DrbSecurityDecision, UpSecurityRefusal};
 use crate::rrc::transaction::RrcProcedure;
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
-    build_drb_reconfiguration_params, encode_rrc_reconfiguration,
+    build_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
 use nextgsim_rrc::procedures::security_mode::{
@@ -123,7 +124,7 @@ use nextgsim_ngap::procedures::transfer::{
     encode_modify_response_transfer, encode_modify_unsuccessful_transfer,
     encode_release_response_transfer, encode_setup_response_transfer,
     encode_setup_unsuccessful_transfer, GtpTunnelInfo, ModifyResponseTransferParams,
-    SetupResponseTransferParams,
+    SetupResponseTransferParams, UpSecurityPolicy,
 };
 use nextgsim_ngap::procedures::ue_context_modification::{
     decode_ue_context_modification_request, encode_ue_context_modification_failure,
@@ -1219,7 +1220,13 @@ impl NgapTask {
     /// session id and the accepted QFIs in mappedQoS-FlowsToAdd) plus the
     /// matching CellGroupConfig (one RLC bearer). Requires AS security to be
     /// active (established at Initial Context Setup, C5).
-    async fn establish_drb(&mut self, ue_id: i32, psi: u8, qfis: &[u8]) {
+    async fn establish_drb(
+        &mut self,
+        ue_id: i32,
+        psi: u8,
+        qfis: &[u8],
+        integrity_protection: DrbIntegrityProtection,
+    ) {
         if !self
             .ue_contexts
             .values()
@@ -1231,7 +1238,7 @@ impl NgapTask {
             );
         }
         // One DRB per PDU session; DRB identity 1..=32, DTCH LCID above the SRBs.
-        let drb_id = psi.clamp(1, 32);
+        let drb_id = Self::drb_identity_for(psi);
         let lcid = (3 + drb_id).min(32);
         // Wave-6 C4-final: allocate the RRCReconfiguration tid from THIS UE's
         // per-context allocator (TS 38.331 §5.3.5 / §6.3.2). Pinned to 0 on the
@@ -1252,6 +1259,7 @@ impl NgapTask {
             lcid,
             qfis,
             true,
+            integrity_protection,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -1284,6 +1292,129 @@ impl NgapTask {
         }
     }
 
+    /// The DRB identity carrying one PDU session.
+    ///
+    /// This simulator maps one DRB per PDU session, so the identity is the PSI —
+    /// clamped into `DRB-Identity`'s 1..=32 range (TS 38.331 §6.3.2). Named because
+    /// **two** places need the same answer: the RRCReconfiguration that establishes
+    /// the DRB, and the BEARER input to user-plane ciphering, which TS 33.501
+    /// Annex D.3.1.2 defines as the radio bearer identity minus one. The UE derives
+    /// BEARER from the `drb-Identity` it was sent, so a gNB that derived it from the
+    /// PSI instead would agree only by coincidence.
+    fn drb_identity_for(psi: u8) -> u8 {
+        psi.clamp(1, 32)
+    }
+
+    /// Whether this build can protect a DRB at all: the `up-security` feature.
+    ///
+    /// A `const` read by [`up_security::resolve`] rather than a `cfg!` inside it, so
+    /// the refusal and protection paths are both compiled and unit-tested in every
+    /// build and only the *wiring* is feature-gated.
+    const UP_SECURITY_AVAILABLE: bool = cfg!(feature = "up-security");
+
+    /// Resolve the SMF's user-plane security policy for one session and log what the
+    /// gNB will do about it (issue #32, TS 33.501 §6.6.1).
+    fn resolve_up_security(
+        &self,
+        ue_id: i32,
+        psi: u8,
+        requested: Option<UpSecurityPolicy>,
+    ) -> Result<(UpSecurityPolicy, DrbSecurityDecision), UpSecurityRefusal> {
+        let policy = requested.unwrap_or_else(|| {
+            debug!(
+                "PDU session {psi} on UE {ue_id}: the SMF sent no SecurityIndication,                  applying the locally configured policy"
+            );
+            UpSecurityPolicy::locally_configured_default()
+        });
+        // With no AS security context there are no negotiated algorithms, so the
+        // null identities are the truth -- and a `required` policy then refuses,
+        // which is right: nothing has been keyed.
+        let (ciph, integ) = self
+            .ue_contexts
+            .values()
+            .find(|c| c.ue_id == ue_id)
+            .and_then(|c| c.as_security.as_ref())
+            .map(|s| (s.ciphering_alg_id, s.integrity_alg_id))
+            .unwrap_or((up_security::NULL_ALGORITHM, up_security::NULL_ALGORITHM));
+
+        let decision = up_security::resolve(&policy, ciph, integ, Self::UP_SECURITY_AVAILABLE)?;
+        info!(
+            "PDU session {psi} on UE {ue_id}: user-plane security integrity={}              ciphering={} (policy integrity={:?} confidentiality={:?}, NEA{ciph}/NIA{integ})",
+            decision.integrity, decision.ciphering, policy.integrity, policy.confidentiality
+        );
+        if !up_security::honours_confidentiality_policy(&policy, decision) {
+            info!(
+                "PDU session {psi} on UE {ue_id}: the SMF asked for no user-plane                  confidentiality, but PDCP-Config.cipheringDisabled is absent from this                  codec, so the DRB is ciphered anyway (issue #32 ceiling)"
+            );
+        }
+        Ok((policy, decision))
+    }
+
+    /// Hand a DRB's user-plane keys to the RLS task, which owns the PDCP entities.
+    ///
+    /// A no-op without the `up-security` feature, where there is no `PdcpSecurity`
+    /// to install and no `InstallDrbSecurity` variant to send.
+    #[allow(unused_variables)]
+    async fn install_drb_security(&self, ue_id: i32, psi: u8, decision: DrbSecurityDecision) {
+        #[cfg(feature = "up-security")]
+        {
+            use nextgsim_pdcp::{PdcpSecurity, UpSecurity, DIRECTION_DOWNLINK};
+
+            let security = if !decision.any() {
+                None
+            } else {
+                let Some(as_ctx) = self
+                    .ue_contexts
+                    .values()
+                    .find(|c| c.ue_id == ue_id)
+                    .and_then(|c| c.as_security.as_ref())
+                else {
+                    // Unreachable via `resolve_up_security`, which reports the null
+                    // algorithms when there is no context and so decides nothing to
+                    // apply. Logged rather than asserted because a future caller
+                    // could reach it, and an unprotected DRB is the safe outcome
+                    // only if somebody is told.
+                    warn!(
+                        "PDU session {psi} on UE {ue_id}: user-plane security was                          decided but there is no AS security context to key it with;                          leaving the DRB unprotected"
+                    );
+                    return;
+                };
+                match UpSecurity::new(
+                    as_ctx.k_up_enc,
+                    as_ctx.k_up_int,
+                    if decision.ciphering {
+                        as_ctx.ciphering_alg_id
+                    } else {
+                        up_security::NULL_ALGORITHM
+                    },
+                    decision.integrity.then_some(as_ctx.integrity_alg_id),
+                ) {
+                    Ok(sec) => Some(Box::new(PdcpSecurity {
+                        security: sec,
+                        // BEARER is the radio bearer identity minus one
+                        // (TS 33.501 Annex D.3.1.2), and the identity is the one
+                        // `establish_drb` puts on the wire -- not the PSI, which the
+                        // UE never sees in `drb-Identity`.
+                        bearer: Self::drb_identity_for(psi).saturating_sub(1),
+                        tx_direction: DIRECTION_DOWNLINK,
+                    })),
+                    Err(e) => {
+                        error!("PDU session {psi} on UE {ue_id}: refusing to key the DRB: {e}");
+                        return;
+                    }
+                }
+            };
+            let msg = crate::tasks::RlsMessage::InstallDrbSecurity {
+                ue_id,
+                psi: psi as i32,
+                security,
+            };
+            if let Err(e) = self.task_base.rls_tx.send(msg).await {
+                error!("Failed to install DRB security on the RLS task: {e}");
+            }
+        }
+    }
+
     async fn setup_one_pdu_session(
         &mut self,
         ue_id: i32,
@@ -1313,6 +1444,30 @@ impl NgapTask {
             }
         };
 
+        // TS 33.501 §6.6.1: a `required` policy this gNB cannot satisfy fails the
+        // session. Checked BEFORE any TEID is allocated or GTP is told anything, so
+        // a refused session leaves no state behind to clean up.
+        let (policy, decision) =
+            match self.resolve_up_security(ue_id, psi, request.security_indication) {
+                Ok(resolved) => resolved,
+                Err(refusal) => {
+                    warn!("PDU Session {psi} on UE {ue_id} refused: {refusal}");
+                    let cause = NgSetupFailureCause::RadioNetwork(match refusal {
+                        UpSecurityRefusal::IntegrityNotPossible => {
+                            RadioNetworkCause::UpIntegrityProtectionNotPossible
+                        }
+                        UpSecurityRefusal::ConfidentialityNotPossible => {
+                            RadioNetworkCause::UpConfidentialityProtectionNotPossible
+                        }
+                    });
+                    let transfer = encode_setup_unsuccessful_transfer(&cause).unwrap_or_default();
+                    return Err(PduSessionResourceFailedToSetupItem {
+                        pdu_session_id: psi,
+                        transfer,
+                    });
+                }
+            };
+
         let upf_teid = request.ul_tunnel.teid;
         let upf_addr = request.ul_tunnel.address;
         // First QoS flow is the default flow for the session
@@ -1338,6 +1493,8 @@ impl NgapTask {
                 uplink_teid: gnb_teid,
                 downlink_teid: upf_teid,
                 upf_address: upf_addr,
+                up_security_policy: policy,
+                up_security: decision,
             });
         }
 
@@ -1385,7 +1542,21 @@ impl NgapTask {
         // TS 38.331 §5.3.5.6: establish the PDU session's user-plane DRB via an
         // RRCReconfiguration carrying the accepted QoS flows (QFIs).
         let accepted_qfis: Vec<u8> = request.qos_flows.iter().map(|f| f.qfi).collect();
-        self.establish_drb(ue_id, psi, &accepted_qfis).await;
+        // Keys before the reconfiguration, deliberately: the RRCReconfiguration tells
+        // the UE to start protecting, so the gNB's own entity has to be able to
+        // verify by the time the UE's first protected uplink PDU arrives.
+        self.install_drb_security(ue_id, psi, decision).await;
+        self.establish_drb(
+            ue_id,
+            psi,
+            &accepted_qfis,
+            if decision.integrity {
+                DrbIntegrityProtection::Enabled
+            } else {
+                DrbIntegrityProtection::Disabled
+            },
+        )
+        .await;
 
         // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
         // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
@@ -1615,6 +1786,13 @@ impl NgapTask {
                     uplink_teid: gnb_teid,
                     downlink_teid: upf_teid,
                     upf_address: upf_addr,
+                    // The Modify Request Transfer carries no `SecurityIndication`
+                    // (TS 38.413 §9.3.4.3), so the session keeps the policy it was
+                    // set up with. Carried across from `existing` explicitly:
+                    // rebuilding the session with the local default would silently
+                    // downgrade a `required` session on any QoS change.
+                    up_security_policy: existing.up_security_policy,
+                    up_security: existing.up_security,
                 });
             }
 
@@ -2180,6 +2358,13 @@ impl NgapTask {
                 uplink_teid,
                 downlink_teid,
                 upf_address,
+                // No `SecurityIndication` reaches this path -- it adds a session
+                // from a handover or a context transfer, not from a Setup Request --
+                // so the local default applies and nothing is protected until an
+                // SMF states a policy. Stated rather than inherited, because there
+                // is no source session here to inherit from.
+                up_security_policy: UpSecurityPolicy::locally_configured_default(),
+                up_security: DrbSecurityDecision::default(),
             };
             ctx.add_pdu_session(session);
         }
@@ -3624,6 +3809,40 @@ impl NgapTask {
 
         // Update UL tunnels for switched sessions and notify the GTP task
         for session in &ack.switched_sessions {
+            // TS 38.413 §9.3.4.10: the Acknowledge transfer restates the SMF's
+            // user-plane security policy to the *new* serving node, which is this gNB
+            // after an Xn handover. Re-resolved against this gNB's own negotiated
+            // algorithms, because the source node's decision was made with keys and a
+            // build this one does not necessarily share (issue #32).
+            if let Some(policy) = session.security_indication {
+                match self.resolve_up_security(ue_id, session.pdu_session_id, Some(policy)) {
+                    Ok((policy, decision)) => {
+                        if let Some(s) = self
+                            .ue_contexts
+                            .get_mut(&ue_id)
+                            .and_then(|ctx| ctx.pdu_sessions.get_mut(&session.pdu_session_id))
+                        {
+                            s.up_security_policy = policy;
+                            s.up_security = decision;
+                        }
+                        self.install_drb_security(ue_id, session.pdu_session_id, decision)
+                            .await;
+                    }
+                    Err(refusal) => {
+                        // The path switch has already been acknowledged, so there is
+                        // no response left to refuse in. Warned and the session left
+                        // as it was rather than protected on a policy this gNB cannot
+                        // meet -- reporting success here would be the lie #32 is
+                        // about, and silently downgrading is the other one.
+                        warn!(
+                            "Path switch for PSI {} carries a user-plane security policy \
+                             this gNB cannot satisfy: {refusal}",
+                            session.pdu_session_id
+                        );
+                    }
+                }
+            }
+
             let updated = self.ue_contexts.get_mut(&ue_id).and_then(|ctx| {
                 ctx.pdu_sessions.get_mut(&session.pdu_session_id).map(|s| {
                     if let Some(tunnel) = session.ul_tunnel {
@@ -4317,7 +4536,16 @@ mod tests {
         // The exact call establish_drb makes: PDU session 5, DRB 5, LCID 8,
         // accepted QFIs 1 & 9. The result must be a decodable DL-DCCH
         // RRCReconfiguration.
-        let params = build_drb_reconfiguration_params(0, 5, 5, 8, &[1, 9], true).unwrap();
+        let params = build_drb_reconfiguration_params(
+            0,
+            5,
+            5,
+            8,
+            &[1, 9],
+            true,
+            DrbIntegrityProtection::Disabled,
+        )
+        .unwrap();
         let bytes = encode_rrc_reconfiguration(&params).unwrap();
         assert!(!bytes.is_empty());
         let msg: DL_DCCH_Message = decode_rrc(&bytes).unwrap();
@@ -5553,6 +5781,608 @@ mod tests {
             ctx.amf_ue_ngap_id = Some(4242);
         }
         (task, sctp_rx)
+    }
+
+    // ========================================================================
+    // User-plane security wiring (issue #32)
+    // ========================================================================
+
+    /// An NGAP task whose GTP, RRC and RLS receivers stay alive.
+    ///
+    /// `task_with_ue` drops them, which makes every `send` fail — and
+    /// `setup_one_pdu_session` reports a send failure as
+    /// `RadioResourcesNotAvailable`, so a security test built on it would see the
+    /// wrong refusal and pass for the wrong reason. Found exactly that way.
+    #[allow(clippy::type_complexity)]
+    fn task_with_live_receivers(
+        ue_id: i32,
+    ) -> (
+        NgapTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RrcMessage>>,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::GtpMessage>>,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RlsMessage>>,
+    ) {
+        let (task_base, _app_rx, _ngap_rx, rrc_rx, gtp_rx, rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(ue_id, 1).expect("ue context");
+        if let Some(ctx) = task.find_ue_context_mut(ue_id) {
+            ctx.amf_ue_ngap_id = Some(4242);
+        }
+        (task, rrc_rx, gtp_rx, rls_rx)
+    }
+
+    use nextgsim_ngap::procedures::transfer::MaxIntegrityProtectedDataRate;
+
+    /// A Setup Request item whose transfer carries `policy`.
+    fn setup_item_with_policy(
+        psi: u8,
+        policy: Option<nextgsim_ngap::procedures::transfer::UpSecurityPolicy>,
+    ) -> nextgsim_ngap::procedures::pdu_session_resource::PduSessionResourceSetupItem {
+        use nextgsim_ngap::procedures::pdu_session_resource::{
+            PduSessionResourceSetupItem, SnssaiValue,
+        };
+        use nextgsim_ngap::procedures::transfer::{
+            encode_setup_request_transfer, QosFlowSetupInfo, SetupRequestTransferData,
+        };
+        let transfer = encode_setup_request_transfer(&SetupRequestTransferData {
+            ambr_dl: Some(1_000_000),
+            ambr_ul: Some(1_000_000),
+            ul_tunnel: GtpTunnelInfo {
+                address: "10.45.0.1".parse().unwrap(),
+                teid: 0x1234,
+            },
+            pdu_session_type: 0,
+            qos_flows: vec![QosFlowSetupInfo {
+                qfi: 1,
+                five_qi: Some(9),
+                arp_priority_level: 8,
+            }],
+            security_indication: policy,
+        })
+        .expect("encode the setup transfer");
+        PduSessionResourceSetupItem {
+            pdu_session_id: psi,
+            nas_pdu: None,
+            s_nssai: SnssaiValue { sst: 1, sd: None },
+            transfer,
+        }
+    }
+
+    /// Give a UE the AS security context an Initial Context Setup would install.
+    fn key_ue(task: &mut NgapTask, ue_id: i32, ciphering_alg_id: u8, integrity_alg_id: u8) {
+        let ctx = task.find_ue_context_mut(ue_id).expect("ue context");
+        ctx.as_security = Some(AsSecurityContext {
+            kgnb: [0x33; 32],
+            k_rrc_enc: [0x01; 16],
+            k_rrc_int: [0x02; 16],
+            k_up_enc: [0x03; 16],
+            k_up_int: [0x04; 16],
+            ciphering_alg_id,
+            integrity_alg_id,
+        });
+    }
+
+    fn policy(
+        integrity: nextgsim_ngap::procedures::transfer::UpProtectionPolicy,
+        confidentiality: nextgsim_ngap::procedures::transfer::UpProtectionPolicy,
+    ) -> nextgsim_ngap::procedures::transfer::UpSecurityPolicy {
+        UpSecurityPolicy {
+            integrity,
+            confidentiality,
+            max_integrity_protected_data_rate: None,
+        }
+    }
+
+    /// #32, criterion 4: a `required` policy the gNB cannot satisfy fails the PDU
+    /// session, with the cause TS 38.413 §9.3.1.2 gives for it — and it fails
+    /// *before* any state is created.
+    #[tokio::test]
+    async fn a_required_up_policy_the_gnb_cannot_satisfy_refuses_the_session() {
+        use nextgsim_ngap::procedures::transfer::{
+            decode_setup_unsuccessful_transfer, UpProtectionPolicy,
+        };
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(21);
+        // NIA0/NEA0 selected: neither protection is possible whatever the build.
+        key_ue(&mut task, 21, 0, 0);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+        let item = setup_item_with_policy(
+            1,
+            Some(policy(
+                UpProtectionPolicy::Required,
+                UpProtectionPolicy::Preferred,
+            )),
+        );
+        let err = task
+            .setup_one_pdu_session(21, &item, gnb_ip)
+            .await
+            .expect_err("a required integrity policy with NIA0 must fail the session");
+        assert_eq!(err.pdu_session_id, 1);
+        assert_eq!(
+            decode_setup_unsuccessful_transfer(&err.transfer).expect("a real cause"),
+            NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UpIntegrityProtectionNotPossible),
+            "the SMF must be told WHICH protection was impossible, or it cannot relax \
+             the right half of its policy"
+        );
+        assert!(
+            task.find_ue_context(21)
+                .is_some_and(|c| c.pdu_session_count() == 0),
+            "a refused session must leave no PDU session behind"
+        );
+
+        // The confidentiality half yields the other cause.
+        let item = setup_item_with_policy(
+            2,
+            Some(policy(
+                UpProtectionPolicy::Preferred,
+                UpProtectionPolicy::Required,
+            )),
+        );
+        let err = task
+            .setup_one_pdu_session(21, &item, gnb_ip)
+            .await
+            .expect_err("a required confidentiality policy with NEA0 must fail");
+        assert_eq!(
+            decode_setup_unsuccessful_transfer(&err.transfer).expect("a real cause"),
+            NgSetupFailureCause::RadioNetwork(
+                RadioNetworkCause::UpConfidentialityProtectionNotPossible
+            )
+        );
+    }
+
+    /// The positive control for the refusal above: a session the gNB CAN satisfy is
+    /// established, and the SMF's policy is stored on it.
+    ///
+    /// Without this, a `setup_one_pdu_session` that refused every session carrying a
+    /// `SecurityIndication` would pass the test above. `preferred` deliberately,
+    /// because it is satisfiable in **both** feature arms — see
+    /// `without_the_feature_a_required_policy_is_refused` for the other half.
+    #[tokio::test]
+    async fn a_satisfiable_policy_establishes_the_session_and_is_stored_on_it() {
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(22);
+        key_ue(&mut task, 22, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+        let requested = policy(UpProtectionPolicy::Preferred, UpProtectionPolicy::Preferred);
+        let item = setup_item_with_policy(3, Some(requested));
+        task.setup_one_pdu_session(22, &item, gnb_ip)
+            .await
+            .expect("a preferred policy never refuses");
+
+        let session = task
+            .find_ue_context(22)
+            .and_then(|c| c.get_pdu_session(3).cloned())
+            .expect("the session must be established");
+        assert_eq!(
+            (
+                session.up_security_policy.integrity,
+                session.up_security_policy.confidentiality
+            ),
+            (requested.integrity, requested.confidentiality),
+            "the SMF's policy must reach the session context, not be discarded"
+        );
+        assert_eq!(
+            session.up_security_policy.max_integrity_protected_data_rate,
+            Some(MaxIntegrityProtectedDataRate::MaximumUeRate),
+            "the conditional rate IE is present whenever integrity is wanted, and an \
+             unsupplied one encodes as maximum-UE-rate rather than vanishing"
+        );
+        // Whether it is *applied* depends on the build; whether it was *asked for*
+        // does not, which is why the two are separate fields.
+        assert_eq!(
+            session.up_security.integrity,
+            cfg!(feature = "up-security"),
+            "the decision must follow this build's capability"
+        );
+        assert_eq!(session.up_security.ciphering, cfg!(feature = "up-security"));
+    }
+
+    /// Without the `up-security` feature the gNB cannot protect a DRB, so a
+    /// `required` policy is **refused** (TS 33.501 §6.6.1) rather than established
+    /// unprotected.
+    ///
+    /// This does not take the default build's user plane down: `nextgcore`'s SMF
+    /// sends `security_indication: None`, so the local `preferred` default applies
+    /// and nothing is refused. Pinned here so that stays a checked fact rather than
+    /// an assumption — if a core starts sending `required`, this is the test that
+    /// says what happens.
+    #[cfg(not(feature = "up-security"))]
+    #[tokio::test]
+    async fn without_the_feature_a_required_policy_is_refused() {
+        use nextgsim_ngap::procedures::transfer::{
+            decode_setup_unsuccessful_transfer, UpProtectionPolicy,
+        };
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(26);
+        // Real algorithms: the only reason protection is impossible is the build.
+        key_ue(&mut task, 26, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let item = setup_item_with_policy(
+            7,
+            Some(policy(
+                UpProtectionPolicy::Required,
+                UpProtectionPolicy::Preferred,
+            )),
+        );
+        let err = task
+            .setup_one_pdu_session(26, &item, gnb_ip)
+            .await
+            .expect_err("a build that cannot protect must not claim it did");
+        assert_eq!(
+            decode_setup_unsuccessful_transfer(&err.transfer).expect("a real cause"),
+            NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UpIntegrityProtectionNotPossible)
+        );
+    }
+
+    /// With the feature on, the same `required` policy is satisfied and both
+    /// protections are applied. The other half of the pair above: together they show
+    /// the refusal follows the *capability* and not the policy.
+    #[cfg(feature = "up-security")]
+    #[tokio::test]
+    async fn with_the_feature_a_required_policy_is_satisfied_and_both_protections_apply() {
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(27);
+        key_ue(&mut task, 27, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let item = setup_item_with_policy(
+            8,
+            Some(policy(
+                UpProtectionPolicy::Required,
+                UpProtectionPolicy::Required,
+            )),
+        );
+        task.setup_one_pdu_session(27, &item, gnb_ip)
+            .await
+            .expect("NEA2/NIA2 with the feature on can satisfy a required policy");
+        assert_eq!(
+            task.find_ue_context(27)
+                .and_then(|c| c.get_pdu_session(8))
+                .map(|s| s.up_security),
+            Some(DrbSecurityDecision {
+                integrity: true,
+                ciphering: true
+            })
+        );
+    }
+
+    /// A session the SMF sent no `SecurityIndication` for gets the locally configured
+    /// policy, and is still established.
+    #[tokio::test]
+    async fn a_session_with_no_security_indication_gets_the_local_default() {
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(23);
+        key_ue(&mut task, 23, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+        task.setup_one_pdu_session(23, &setup_item_with_policy(4, None), gnb_ip)
+            .await
+            .expect("a session with no policy must still come up");
+        assert_eq!(
+            task.find_ue_context(23)
+                .and_then(|c| c.get_pdu_session(4))
+                .map(|s| s.up_security_policy),
+            Some(UpSecurityPolicy::locally_configured_default()),
+            "no SecurityIndication means the local policy, not an unprotected session"
+        );
+    }
+
+    /// A `not-needed` integrity policy is honoured: nothing is protected, and the
+    /// session comes up. Pinned separately from the resolver's own unit test because
+    /// this is the path that reaches the RRC reconfiguration.
+    #[tokio::test]
+    async fn a_not_needed_integrity_policy_leaves_the_drb_without_a_mac_i() {
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(24);
+        key_ue(&mut task, 24, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+        let item = setup_item_with_policy(
+            5,
+            Some(policy(
+                UpProtectionPolicy::NotNeeded,
+                UpProtectionPolicy::Preferred,
+            )),
+        );
+        task.setup_one_pdu_session(24, &item, gnb_ip)
+            .await
+            .expect("not-needed never refuses");
+        let decision = task
+            .find_ue_context(24)
+            .and_then(|c| c.get_pdu_session(5))
+            .map(|s| s.up_security)
+            .expect("the session must exist");
+        assert!(
+            !decision.integrity,
+            "a `not-needed` integrity policy must not append a MAC-I"
+        );
+    }
+
+    /// A PDU Session Modify keeps the session's user-plane security policy.
+    ///
+    /// The Modify Request Transfer has no `SecurityIndication` (TS 38.413 §9.3.4.3),
+    /// and the modify path rebuilds the session record — so without carrying the
+    /// policy across, any QoS change would silently downgrade a protected session to
+    /// the local default.
+    #[tokio::test]
+    async fn a_pdu_session_modify_keeps_the_sessions_security_policy() {
+        use nextgsim_ngap::codec::generated::{
+            PDUSessionResourceModifyRequestTransfer,
+            PDUSessionResourceModifyRequestTransferProtocolIEs,
+        };
+        use nextgsim_ngap::procedures::pdu_session_resource::{
+            PduSessionResourceModifyRequestData, PduSessionResourceModifyRequestItem,
+        };
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(30);
+        key_ue(&mut task, 30, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        // `not-needed` integrity: distinguishable from the local `preferred` default
+        // in BOTH feature arms, which a `required` policy would not be.
+        let requested = policy(UpProtectionPolicy::NotNeeded, UpProtectionPolicy::Preferred);
+        task.setup_one_pdu_session(30, &setup_item_with_policy(11, Some(requested)), gnb_ip)
+            .await
+            .expect("setup");
+        let ran_ue_ngap_id = task
+            .find_ue_context(30)
+            .map(|c| c.ran_ue_ngap_id as u32)
+            .expect("ran id");
+
+        // An empty container: every IE in the Modify Request Transfer is optional, so
+        // this is a legal "nothing to change" modify and it still rebuilds the record.
+        let transfer =
+            nextgsim_ngap::codec::encode_aper(&PDUSessionResourceModifyRequestTransfer {
+                protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(vec![]),
+            })
+            .expect("encode an empty modify transfer");
+
+        task.handle_pdu_session_resource_modify(
+            1,
+            8,
+            PduSessionResourceModifyRequestData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id,
+                pdu_session_resource_modify_list: vec![PduSessionResourceModifyRequestItem {
+                    pdu_session_id: 11,
+                    nas_pdu: None,
+                    transfer,
+                }],
+            },
+        )
+        .await;
+
+        let after = task
+            .find_ue_context(30)
+            .and_then(|c| c.get_pdu_session(11))
+            .map(|s| s.up_security_policy)
+            .expect("the session must survive the modify");
+        assert_eq!(
+            after.integrity,
+            UpProtectionPolicy::NotNeeded,
+            "a modify must not reset the session's policy to the local default"
+        );
+        assert_ne!(
+            after.integrity,
+            UpSecurityPolicy::locally_configured_default().integrity,
+            "and the test must be able to tell the two apart"
+        );
+    }
+
+    /// The Path Switch Request Acknowledge's policy is applied to the session, not
+    /// only logged (TS 38.413 §9.3.4.10).
+    #[tokio::test]
+    async fn the_path_switch_acknowledges_policy_reaches_the_session() {
+        use nextgsim_ngap::procedures::path_switch::SwitchedSessionItem;
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(25);
+        key_ue(&mut task, 25, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        // Establish a session with NO policy, so the Acknowledge is the only source.
+        task.setup_one_pdu_session(25, &setup_item_with_policy(6, None), gnb_ip)
+            .await
+            .expect("setup");
+        let ran_ue_ngap_id = task
+            .find_ue_context(25)
+            .map(|c| c.ran_ue_ngap_id as u32)
+            .expect("ran id");
+
+        // `preferred`/`not-needed` so the Acknowledge is adopted in both feature arms;
+        // the refusal path a `required` policy would take is covered separately.
+        let switched = policy(UpProtectionPolicy::Preferred, UpProtectionPolicy::NotNeeded);
+        task.handle_path_switch_request_acknowledge(
+            1,
+            8,
+            PathSwitchRequestAcknowledgeData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id,
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0x77; 32],
+                switched_sessions: vec![SwitchedSessionItem {
+                    pdu_session_id: 6,
+                    ul_tunnel: None,
+                    security_indication: Some(switched),
+                }],
+            },
+        )
+        .await;
+
+        let adopted = task
+            .find_ue_context(25)
+            .and_then(|c| c.get_pdu_session(6))
+            .map(|s| s.up_security_policy)
+            .expect("the session must still exist");
+        assert_eq!(
+            (adopted.integrity, adopted.confidentiality),
+            (switched.integrity, switched.confidentiality),
+            "the target gNB must adopt the policy the 5GC restated, or an Xn handover \
+             silently drops user-plane protection"
+        );
+        assert_ne!(
+            (adopted.integrity, adopted.confidentiality),
+            (
+                UpSecurityPolicy::locally_configured_default().integrity,
+                UpSecurityPolicy::locally_configured_default().confidentiality
+            ),
+            "and the adopted policy must differ from the local default the session \
+             started with, or this test could not tell the two apart"
+        );
+    }
+
+    /// #32, criterion 3 and 6 on the gNB side: setting up a protected session both
+    /// hands the RLS task the `K_UPenc`/`K_UPint` binding **and** tells the UE to
+    /// protect, in the same procedure.
+    ///
+    /// Reads what the task actually sent on both channels rather than the decision it
+    /// recorded: a `up_security` field set to `true` with nothing on either channel is
+    /// exactly the failure this issue is about.
+    #[cfg(feature = "up-security")]
+    #[tokio::test]
+    async fn a_protected_session_keys_the_rls_entity_and_signals_the_ue() {
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            decode_rrc_reconfiguration, drb_integrity_protection, DrbIntegrityProtection,
+        };
+        let (mut task, mut rrc_rx, _gtp_rx, mut rls_rx) = task_with_live_receivers(28);
+        key_ue(&mut task, 28, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let item = setup_item_with_policy(
+            9,
+            Some(policy(
+                UpProtectionPolicy::Required,
+                UpProtectionPolicy::Required,
+            )),
+        );
+        task.setup_one_pdu_session(28, &item, gnb_ip)
+            .await
+            .expect("setup");
+
+        // 1. The RLS task was handed a binding for this DRB.
+        let mut installed = None;
+        while let Ok(msg) = rls_rx.try_recv() {
+            if let TaskMessage::Message(crate::tasks::RlsMessage::InstallDrbSecurity {
+                ue_id,
+                psi,
+                security,
+            }) = msg
+            {
+                installed = Some((ue_id, psi, security));
+            }
+        }
+        let (ue_id, psi, security) =
+            installed.expect("the RLS task must be handed the DRB's user-plane keys");
+        assert_eq!((ue_id, psi), (28, 9));
+        let security = security.expect("a protected DRB must carry a real binding");
+        assert!(
+            security.security.integrity_protected(),
+            "a `required` integrity policy must install a MAC-I"
+        );
+        assert_eq!(
+            security.security.ciphering_alg_id(),
+            2,
+            "and the negotiated NEA, not the null one"
+        );
+        assert_eq!(
+            security.bearer, 8,
+            "BEARER is the radio bearer identity minus one (TS 33.501 Annex D.3.1.2)"
+        );
+        assert_eq!(
+            security.tx_direction,
+            nextgsim_pdcp::DIRECTION_DOWNLINK,
+            "a gNB transmits downlink; the wrong bit fails every MAC with no other symptom"
+        );
+
+        // 2. The RRCReconfiguration told the UE to protect the same DRB.
+        let mut reconfig = None;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(crate::tasks::RrcMessage::RrcReconfiguration {
+                pdu, ..
+            }) = msg
+            {
+                reconfig = Some(pdu);
+            }
+        }
+        let pdu = reconfig.expect("the UE must be sent an RRCReconfiguration");
+        let data = decode_rrc_reconfiguration(pdu.data()).expect("real UPER");
+        let rbc: nextgsim_rrc::codec::generated::RadioBearerConfig =
+            nextgsim_rrc::codec::decode_rrc(
+                &data.radio_bearer_config.expect("a radio bearer config"),
+            )
+            .expect("decode the radio bearer config");
+        assert_eq!(
+            drb_integrity_protection(&rbc, 9),
+            DrbIntegrityProtection::Enabled,
+            "the UE must be TOLD to integrity-protect, or it never will"
+        );
+    }
+
+    /// The negative half: an unprotected session installs nothing and signals
+    /// nothing. Without this, a gNB that keyed and signalled unconditionally would
+    /// pass the test above.
+    #[cfg(feature = "up-security")]
+    #[tokio::test]
+    async fn a_not_needed_policy_neither_keys_integrity_nor_signals_it() {
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            decode_rrc_reconfiguration, drb_integrity_protection, DrbIntegrityProtection,
+        };
+        let (mut task, mut rrc_rx, _gtp_rx, mut rls_rx) = task_with_live_receivers(29);
+        key_ue(&mut task, 29, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let item = setup_item_with_policy(
+            10,
+            Some(policy(
+                UpProtectionPolicy::NotNeeded,
+                UpProtectionPolicy::NotNeeded,
+            )),
+        );
+        task.setup_one_pdu_session(29, &item, gnb_ip)
+            .await
+            .expect("setup");
+
+        let mut integrity_installed = None;
+        while let Ok(msg) = rls_rx.try_recv() {
+            if let TaskMessage::Message(crate::tasks::RlsMessage::InstallDrbSecurity {
+                security,
+                ..
+            }) = msg
+            {
+                integrity_installed =
+                    Some(security.is_some_and(|s| s.security.integrity_protected()));
+            }
+        }
+        assert_eq!(
+            integrity_installed,
+            Some(false),
+            "a `not-needed` integrity policy must not install a MAC-I -- ciphering is \
+             still installed, which is the stated cipheringDisabled ceiling"
+        );
+
+        let mut reconfig = None;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(crate::tasks::RrcMessage::RrcReconfiguration {
+                pdu, ..
+            }) = msg
+            {
+                reconfig = Some(pdu);
+            }
+        }
+        let data = decode_rrc_reconfiguration(reconfig.expect("a reconfiguration").data())
+            .expect("real UPER");
+        let rbc: nextgsim_rrc::codec::generated::RadioBearerConfig =
+            nextgsim_rrc::codec::decode_rrc(
+                &data.radio_bearer_config.expect("a radio bearer config"),
+            )
+            .expect("decode");
+        assert_eq!(
+            drb_integrity_protection(&rbc, 10),
+            DrbIntegrityProtection::Disabled,
+            "and the UE must not be told to protect a DRB the gNB will not verify"
+        );
     }
 
     /// Criterion 4: a UE Context Release Request with no Command in reply must not leave
