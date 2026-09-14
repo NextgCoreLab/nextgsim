@@ -19,6 +19,11 @@ event-bus = ["nextgsim-common/event-bus"]
 # understood and applied, because a UE that ignored a revocation because a cargo
 # feature was off would keep flying on a withdrawn authorization.
 uuaa-mm = []
+# Per-DRB PDCP entity on the user plane (issue #33, TS 38.323 §5.2). Off by
+# default: interposing a sublayer reshapes the live data path, so the default
+# build keeps RLC wired straight to NAS. With it on, a DRB gains a PDCP header,
+# an SN, a 32-bit COUNT, in-order delivery and a discardTimer.
+drb-pdcp = []
 
 [lints]
 workspace = true
@@ -34,6 +39,7 @@ nextgsim-nas.workspace = true
 nextgsim-rrc.workspace = true
 nextgsim-rls.workspace = true
 nextgsim-rlc.workspace = true
+nextgsim-pdcp.workspace = true
 nextgsim-gtp.workspace = true
 
 # 6G AI-native network function client crates (optional features for UE)

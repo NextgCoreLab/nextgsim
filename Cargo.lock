@@ -1608,6 +1608,7 @@ dependencies = [
  "nextgsim-ngap",
  "nextgsim-nkef",
  "nextgsim-nwdaf",
+ "nextgsim-pdcp",
  "nextgsim-rlc",
  "nextgsim-rls",
  "nextgsim-rrc",
@@ -1654,6 +1655,7 @@ dependencies = [
  "nextgsim-ngap",
  "nextgsim-nkef",
  "nextgsim-nwdaf",
+ "nextgsim-pdcp",
  "nextgsim-rls",
  "nextgsim-rrc",
  "nextgsim-sctp",
@@ -1739,6 +1741,13 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nextgsim-pdcp"
+version = "0.1.0"
+dependencies = [
  "tracing",
 ]
 
@@ -1844,6 +1853,7 @@ dependencies = [
  "nextgsim-nas",
  "nextgsim-nkef",
  "nextgsim-nwdaf",
+ "nextgsim-pdcp",
  "nextgsim-rlc",
  "nextgsim-rls",
  "nextgsim-rrc",

@@ -11,6 +11,12 @@ publish = false
 # lean gNB build. Run the 6G tests with:
 #   cargo test -p nextgsim-integration-tests --features 6g
 6g = ["nextgsim-gnb/6g"]
+# Enables the DRB PDCP end-to-end test (src/drb_pdcp_user_plane.rs), which needs
+# the sublayer interposed on BOTH ends (issue #33). Forwarded to both crates
+# together on purpose: a gNB with PDCP and a UE without would have the UE read a
+# PDCP header as payload, so there is no configuration in which enabling one is
+# useful.
+drb-pdcp = ["nextgsim-gnb/drb-pdcp", "nextgsim-ue/drb-pdcp"]
 
 [dependencies]
 # Internal crates
@@ -21,6 +27,7 @@ nextgsim-ngap = { path = "../nextgsim-ngap" }
 nextgsim-rrc = { path = "../nextgsim-rrc" }
 nextgsim-rls = { path = "../nextgsim-rls" }
 nextgsim-gtp = { path = "../nextgsim-gtp" }
+nextgsim-pdcp = { path = "../nextgsim-pdcp" }
 nextgsim-sctp = { path = "../nextgsim-sctp" }
 nextgsim-gnb = { path = "../nextgsim-gnb" }
 nextgsim-ue = { path = "../nextgsim-ue" }
@@ -103,3 +110,7 @@ path = "src/paging_mt_service_request.rs"
 [[test]]
 name = "rlc_two_session_user_plane"
 path = "src/rlc_two_session_user_plane.rs"
+
+[[test]]
+name = "drb_pdcp_user_plane"
+path = "src/drb_pdcp_user_plane.rs"

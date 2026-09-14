@@ -18,6 +18,8 @@ use crate::tasks::{
     GnbTaskBase, GtpMessage, NwdafMessage, RlsMessage, RrcMessage, Task, TaskMessage,
 };
 use nextgsim_common::OctetString;
+#[cfg(feature = "drb-pdcp")]
+use nextgsim_pdcp::{Pdcp, PdcpConfig};
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
     codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
@@ -62,6 +64,14 @@ pub struct RlsTask {
     /// TS 38.322 §4.2.1 requires, so each bearer owns its sequence-number space
     /// and reassembly buffer.
     rlc_entities: HashMap<(i32, i32), RlcEntity>,
+    /// PDCP entities keyed by `(UE ID, PSI)` -- one per DRB (TS 38.323 §5.2,
+    /// issue #33). Keyed the same way as the RLC entities, because a PDCP entity
+    /// and its RLC entity serve the same bearer.
+    #[cfg(feature = "drb-pdcp")]
+    pdcp_entities: HashMap<(i32, i32), Pdcp>,
+    /// When this task started, the origin for the PDCP timers.
+    #[cfg(feature = "drb-pdcp")]
+    started_at: Instant,
     /// User-plane octets moved since the last cell-load report (uplink plus
     /// downlink). Counted here because the RLS task is the only place in the gNB
     /// that sees every user-plane PDU on the radio side, so it is the only
@@ -93,6 +103,10 @@ impl RlsTask {
             socket: None,
             bind_address,
             rlc_entities: HashMap::new(),
+            #[cfg(feature = "drb-pdcp")]
+            pdcp_entities: HashMap::new(),
+            #[cfg(feature = "drb-pdcp")]
+            started_at: Instant::now(),
             load_window_octets: 0,
             load_window_start: Instant::now(),
         }
@@ -113,6 +127,10 @@ impl RlsTask {
             socket: None,
             bind_address,
             rlc_entities: HashMap::new(),
+            #[cfg(feature = "drb-pdcp")]
+            pdcp_entities: HashMap::new(),
+            #[cfg(feature = "drb-pdcp")]
+            started_at: Instant::now(),
             load_window_octets: 0,
             load_window_start: Instant::now(),
         }
@@ -130,6 +148,20 @@ impl RlsTask {
     ///
     /// The PSI stands in for the DRB identity: this simulator maps one DRB per
     /// PDU session (see `nextgsim-gnb/src/gtp`), so the two are one to one.
+    /// The PDCP entity for one UE's DRB, created on first use (issue #33).
+    #[cfg(feature = "drb-pdcp")]
+    fn pdcp_entity_for(&mut self, ue_id: i32, psi: i32) -> &mut Pdcp {
+        self.pdcp_entities
+            .entry((ue_id, psi))
+            .or_insert_with(|| Pdcp::new(PdcpConfig::default()))
+    }
+
+    /// Milliseconds since the task started, for the PDCP timers.
+    #[cfg(feature = "drb-pdcp")]
+    fn pdcp_now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
     fn rlc_entity_for(&mut self, ue_id: i32, psi: i32) -> &mut RlcEntity {
         let mode = if self.task_base.config.rlc_am_psis.contains(&(psi as u8)) {
             RlcMode::AcknowledgedMode
@@ -167,6 +199,38 @@ impl RlsTask {
         }
         for (ue_id, psi, pdu) in outbound {
             self.send_rlc_pdu(ue_id, psi, pdu).await;
+        }
+    }
+
+    /// Drive every PDCP entity's `t-Reordering` and deliver whatever expires
+    /// (TS 38.323 §5.2.2.2, issue #33).
+    ///
+    /// Needed because the timer is otherwise only evaluated when a PDU arrives, so
+    /// a gap at the END of a flow would hold the SDUs behind it indefinitely -- the
+    /// very case reordering exists to bound. Ticked from the same timer that drives
+    /// the RLC timers.
+    #[cfg(feature = "drb-pdcp")]
+    async fn poll_pdcp_timers(&mut self) {
+        let now_ms = self.pdcp_now_ms();
+        let mut delivered: Vec<(i32, i32, Vec<u8>)> = Vec::new();
+        for ((ue_id, psi), pdcp) in &mut self.pdcp_entities {
+            for sdu in pdcp.poll_t_reordering(now_ms) {
+                delivered.push((*ue_id, *psi, sdu));
+            }
+        }
+        for (ue_id, psi, sdu) in delivered {
+            debug!(
+                "PDCP t-Reordering released an SDU: ue_id={ue_id}, psi={psi}, len={}",
+                sdu.len()
+            );
+            let msg = GtpMessage::DataPduDelivery {
+                ue_id,
+                psi,
+                pdu: OctetString::from_slice(&sdu),
+            };
+            if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                error!("Failed to send a reordered uplink SDU to GTP: {e}");
+            }
         }
     }
 
@@ -487,9 +551,31 @@ impl RlsTask {
         // and its t-PollRetransmit fires forever.
         self.send_pending_status(ue_id, psi).await;
 
-        for sdu in reassembled_sdus {
+        // PDCP receive (issue #33): what RLC reassembled is a PDCP PDU, so it goes
+        // through the reordering entity and only in-order SDUs reach GTP-U. Without
+        // the feature the reassembled bytes go straight up, as before.
+        #[cfg(feature = "drb-pdcp")]
+        let to_gtp: Vec<Vec<u8>> = {
+            let now_ms = self.pdcp_now_ms();
+            let pdcp = self.pdcp_entity_for(ue_id, psi);
+            let mut delivered = Vec::new();
+            for sdu in reassembled_sdus {
+                match pdcp.receive_pdu(&sdu, now_ms) {
+                    Ok(sdus) => delivered.extend(sdus),
+                    Err(e) => {
+                        debug!("PDCP discarded an uplink PDU on ue {ue_id} psi {psi}: {e:?}")
+                    }
+                }
+            }
+            delivered.extend(pdcp.poll_t_reordering(now_ms));
+            delivered
+        };
+        #[cfg(not(feature = "drb-pdcp"))]
+        let to_gtp: Vec<Vec<u8>> = reassembled_sdus;
+
+        for sdu in to_gtp {
             debug!(
-                "RLC reassembled SDU: ue_id={}, psi={}, len={}",
+                "DRB SDU for GTP: ue_id={}, psi={}, len={}",
                 ue_id,
                 psi,
                 sdu.len()
@@ -632,8 +718,22 @@ impl RlsTask {
         // the mutable borrow so that self.sti and self.socket are accessible
         // again for transmission.
         let rlc_pdus = {
+            // PDCP first (issue #33): the GTP-delivered SDU gets a PDCP header, an
+            // SN and a discardTimer, and it is the PDCP PDU that RLC segments.
+            #[cfg(feature = "drb-pdcp")]
+            let to_rlc: Vec<Vec<u8>> = {
+                let now_ms = self.pdcp_now_ms();
+                let pdcp = self.pdcp_entity_for(ue_id, psi);
+                pdcp.submit_sdu(data.data(), now_ms);
+                pdcp.take_transmittable(now_ms)
+            };
+            #[cfg(not(feature = "drb-pdcp"))]
+            let to_rlc: Vec<Vec<u8>> = vec![data.data().to_vec()];
+
             let rlc = self.rlc_entity_for(ue_id, psi);
-            rlc.submit_sdu(data.data().to_vec());
+            for sdu in to_rlc {
+                rlc.submit_sdu(sdu);
+            }
             let mut pdus = Vec::new();
             while let Some(rlc_pdu) = rlc.build_pdu(MAC_GRANT_BYTES) {
                 pdus.push(rlc_pdu);
@@ -838,6 +938,8 @@ impl Task for RlsTask {
                     self.check_lost_ues().await;
                     self.send_pending_acks().await;
                     self.poll_rlc_timers().await;
+                    #[cfg(feature = "drb-pdcp")]
+                    self.poll_pdcp_timers().await;
                     // Cell load rides the same tick rather than owning a timer:
                     // it is a rate over the elapsed window, which is measured,
                     // so the period only sets the reporting granularity.
@@ -1100,6 +1202,35 @@ mod tests {
     /// Drives the real run loop over loopback UDP with a test socket standing in
     /// for the UE's radio, because the tick lives in the loop's periodic arm and
     /// nothing else would exercise it.
+    /// What a conformant peer puts in an RLC SDU on a DRB.
+    ///
+    /// With the `drb-pdcp` feature the DRB carries PDCP PDUs, so a test that
+    /// simulates a peer has to send one -- a bare payload would have its first two
+    /// octets read as a PDCP header. Without the feature it is the payload itself,
+    /// which is what the peer sent before issue #33.
+    ///
+    /// `sn` is the PDCP SN, and it matters: PDCP delivers in order, so two SDUs
+    /// sent with the same SN would be a duplicate and the second discarded.
+    #[cfg_attr(not(feature = "drb-pdcp"), allow(unused_variables))]
+    fn drb_sdu(payload: Vec<u8>, sn: u32) -> Vec<u8> {
+        #[cfg(feature = "drb-pdcp")]
+        {
+            let mut pdcp = nextgsim_pdcp::Pdcp::new(nextgsim_pdcp::PdcpConfig::default());
+            // Advance TX_NEXT to the requested SN so the PDU carries it.
+            for _ in 0..sn {
+                pdcp.submit_sdu(&[], 0);
+            }
+            pdcp.submit_sdu(&payload, 0);
+            pdcp.take_transmittable(0)
+                .pop()
+                .expect("one PDCP PDU per SDU")
+        }
+        #[cfg(not(feature = "drb-pdcp"))]
+        {
+            payload
+        }
+    }
+
     #[tokio::test]
     async fn a_late_segment_cannot_complete_an_sdu_t_reassembly_abandoned() {
         let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
@@ -1141,7 +1272,7 @@ mod tests {
                 nextgsim_rlc::SegmentationInfo::FullSdu,
                 0,
                 None,
-                vec![0xEE; 4],
+                drb_sdu(vec![0xEE; 4], 0),
             )),
             gnb_addr,
         )
@@ -1310,7 +1441,12 @@ mod tests {
 
         // The UE side of the AM bearer, with its own entity.
         let mut ue_rlc = RlcEntity::new(RlcMode::AcknowledgedMode, SnSize::Sn12);
-        let sdus: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0xC0 + i; 20]).collect();
+        // Each RLC SDU is what a DRB carries: a PDCP PDU with the feature on, the
+        // bare payload without it. Their PDCP SNs are 0, 1, 2, so PDCP delivers
+        // them in order rather than treating the second as a duplicate.
+        let sdus: Vec<Vec<u8>> = (0..3u8)
+            .map(|i| drb_sdu(vec![0xC0 + i; 20], u32::from(i)))
+            .collect();
         for sdu in &sdus {
             ue_rlc.submit_sdu(sdu.clone());
         }
@@ -1331,15 +1467,28 @@ mod tests {
         ue.send_to(&wrap(pdus[0].clone()), gnb_addr).await.unwrap();
         ue.send_to(&wrap(pdus[2].clone()), gnb_addr).await.unwrap();
 
-        // Two SDUs arrive; the third is the one that was lost.
-        for _ in 0..2 {
-            let delivered = tokio::time::timeout(Duration::from_secs(2), gtp_rx.recv())
+        // WITHOUT `drb-pdcp` two SDUs arrive now and the lost one follows after the
+        // retransmission -- so the upper layer sees 0, 2, 1, which is exactly the
+        // out-of-order delivery issue #33 exists to fix.
+        //
+        // WITH the feature PDCP delivers in COUNT order, so only SDU 0 arrives now
+        // and SDUs 1 and 2 both follow once the retransmission fills the gap.
+        //
+        // Rather than asserting a different count per configuration, the payloads
+        // are collected and their ORDER asserted at the end: that is the property
+        // that actually differs, and asserting it is the point.
+        let mut delivered_payloads: Vec<Vec<u8>> = Vec::new();
+        let expected_now = if cfg!(feature = "drb-pdcp") { 1 } else { 2 };
+        for _ in 0..expected_now {
+            let delivered = tokio::time::timeout(Duration::from_secs(3), gtp_rx.recv())
                 .await
                 .expect("the received SDUs must reach GTP");
-            assert!(matches!(
-                delivered,
-                Some(TaskMessage::Message(GtpMessage::DataPduDelivery { .. }))
-            ));
+            match delivered {
+                Some(TaskMessage::Message(GtpMessage::DataPduDelivery { pdu, .. })) => {
+                    delivered_payloads.push(pdu.data().to_vec());
+                }
+                other => panic!("expected an SDU at GTP, got {other:?}"),
+            }
         }
 
         // The poll on SN 2 is answered with an ACK-only report first: TS 38.322
@@ -1388,15 +1537,112 @@ mod tests {
             .expect("the NACK must schedule the retransmission");
         ue.send_to(&wrap(retx), gnb_addr).await.unwrap();
 
-        let recovered = tokio::time::timeout(Duration::from_secs(2), gtp_rx.recv())
-            .await
-            .expect("the retransmitted SDU must reach GTP");
-        match recovered {
-            Some(TaskMessage::Message(GtpMessage::DataPduDelivery { psi, pdu, .. })) => {
-                assert_eq!(psi, 5);
-                assert_eq!(pdu.data(), &sdus[1][..], "the recovered SDU is intact");
+        // The retransmission releases the rest: one SDU without the feature, two
+        // with it (the recovered one plus the one that was waiting behind it).
+        let expected_after = if cfg!(feature = "drb-pdcp") { 2 } else { 1 };
+        for _ in 0..expected_after {
+            let recovered = tokio::time::timeout(Duration::from_secs(3), gtp_rx.recv())
+                .await
+                .expect("the retransmitted SDU must reach GTP");
+            match recovered {
+                Some(TaskMessage::Message(GtpMessage::DataPduDelivery { psi, pdu, .. })) => {
+                    assert_eq!(psi, 5);
+                    delivered_payloads.push(pdu.data().to_vec());
+                }
+                other => panic!("expected the recovered SDU at GTP, got {other:?}"),
             }
-            other => panic!("expected the recovered SDU at GTP, got {other:?}"),
+        }
+
+        // Every SDU arrived intact, in both configurations.
+        assert_eq!(delivered_payloads.len(), 3);
+        let payload_of = |i: u8| vec![0xC0 + i; 20];
+        let mut sorted = delivered_payloads.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![payload_of(0), payload_of(1), payload_of(2)],
+            "all three payloads must arrive intact"
+        );
+
+        // AND THE ORDER IS THE POINT OF ISSUE #33.
+        #[cfg(feature = "drb-pdcp")]
+        assert_eq!(
+            delivered_payloads,
+            vec![payload_of(0), payload_of(1), payload_of(2)],
+            "PDCP must deliver in COUNT order even though SN 1 arrived last"
+        );
+        #[cfg(not(feature = "drb-pdcp"))]
+        assert_eq!(
+            delivered_payloads,
+            vec![payload_of(0), payload_of(2), payload_of(1)],
+            "without PDCP the upper layer sees the recovered SDU last -- the \
+             out-of-order delivery this feature fixes"
+        );
+    }
+
+    /// A gap at the END of a flow is released by the periodic PDCP tick, not by
+    /// the arrival of another PDU (issue #33).
+    ///
+    /// The case that needs a tick at all: PDCP's `t-Reordering` is otherwise only
+    /// evaluated inside `receive_pdu`, so an SDU stuck behind a lost one with no
+    /// traffic following it would be held forever -- the very thing the reordering
+    /// timer exists to bound.
+    #[cfg(feature = "drb-pdcp")]
+    #[tokio::test]
+    async fn a_trailing_reordering_gap_is_released_by_the_periodic_tick() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let gnb_addr = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe");
+            probe.local_addr().unwrap()
+        };
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, mut gtp_rx, rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 32);
+        let mut task = RlsTask::with_bind_address(task_base, gnb_addr);
+        tokio::spawn(async move { task.run(rls_rx).await });
+
+        let heartbeat = codec::encode(&RlsProtocolMessage::Heartbeat(nextgsim_rls::RlsHeartbeat {
+            sti: 0x0C0F_FEE0,
+            sim_pos: SimCoord::new(0, 0, 0),
+        }));
+        ue.send_to(&heartbeat, gnb_addr).await.expect("heartbeat");
+
+        // Send PDCP SN 1 only, and then nothing at all. SN 0 never arrives, so
+        // in-order delivery cannot release SN 1 until the timer gives up.
+        let rlc = nextgsim_rlc::RlcUmPdu {
+            si: nextgsim_rlc::SegmentationInfo::FullSdu,
+            sn: 0,
+            so: None,
+            data: drb_sdu(vec![0x7F; 16], 1),
+        }
+        .encode_sn12();
+        let framed = codec::encode(&RlsProtocolMessage::PduTransmission(RlsPduTransmission {
+            sti: 0x0C0F_FEE0,
+            pdu_type: PduType::Data,
+            pdu_id: 0,
+            payload: 1, // PSI 1
+            pdu: Bytes::from(rlc),
+        }));
+        ue.send_to(&framed, gnb_addr).await.expect("the lone PDU");
+
+        // Nothing may arrive before t-Reordering expires: the SDU is behind a gap.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), gtp_rx.recv())
+                .await
+                .is_err(),
+            "an SDU behind a gap must NOT be delivered before t-Reordering expires"
+        );
+
+        // The default t-Reordering is 1 s and the task ticks every 500 ms, so the
+        // release lands within about 1.5 s.
+        let released = tokio::time::timeout(Duration::from_secs(4), gtp_rx.recv())
+            .await
+            .expect("the periodic tick must release the SDU t-Reordering gave up on");
+        match released {
+            Some(TaskMessage::Message(GtpMessage::DataPduDelivery { pdu, .. })) => {
+                assert_eq!(pdu.data(), &vec![0x7F; 16][..], "released intact");
+            }
+            other => panic!("expected the released SDU at GTP, got {other:?}"),
         }
     }
 
