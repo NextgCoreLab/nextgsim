@@ -340,7 +340,7 @@ see [The 6G / AI stack](../concepts/ai-6g-stack.md).
 |---|---|
 | `ambient_iot/` | Rel-18 Ambient IoT fleet management model (TS 22.369) — device-group coordination, no wire protocol. |
 | `prose.rs` | ProSe PC5 proximity-services model (TS 23.303/23.304) — discovery + UE-to-UE relay state, prototype. |
-| `ranging/` | Rel-18 UE-to-UE ranging / carrier-phase positioning (TS 23.586) — RTT/phase model + LMF report, prototype. |
+| `ranging/` | **Non-wired stub, not spec-compliant.** Models Rel-18 UE-to-UE ranging / carrier-phase positioning (TS 23.586) — RTT and phase maths plus an LMF report shape — but nothing drives it: no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF (SLPP/RSPP) transport, and no ranging service at the LMF, so every measurement handler is unreachable at runtime. The startup logs deliberately make no TS 23.586 claim. See issue #55 for the four increments that would make the claim true. |
 | `sidelink/` | NR sidelink relay, PC5 link, sidelink positioning — prototype state machines. |
 | `uav.rs` | Rel-17/18 UAV context (TS 23.256) — wraps the RRC UAV types with NAS authorization/C2/geofence modelling. |
 | `mint/` | Rel-18 MINT / multi-USIM (TS 23.761) — multi-SUPI secondary-subscription driver, integrated with the NAS task. |

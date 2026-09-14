@@ -11,6 +11,25 @@ use tracing::{debug, info, warn};
 
 use crate::tasks::{RangingMessage, Task, TaskMessage, UeTaskBase};
 
+/// The line the UE binary emits when it spawns the ranging task.
+///
+/// A constant rather than a literal at the `info!` site because the site is in
+/// `main.rs`, inside a task closure no test can reach. Naming it here is what
+/// lets `the_startup_lines_make_no_ts_23_586_compliance_claim` pin the
+/// binary's wording too: the only way to change what the binary logs is to
+/// change this string, and the test reads this string.
+///
+/// It must not claim TS 23.586 compliance. The pipeline behind it is dead —
+/// see the module docs — so a spec citation here would be read as a
+/// capability. Issue #55.
+pub const SPAWN_LOG: &str =
+    "Ranging task spawned (scaffold: no stimulus producer or UE->LMF transport)";
+
+/// The line [`RangingTask::run`] emits on entry. Same no-compliance-claim
+/// contract as [`SPAWN_LOG`], and unlike it this one is reached by a test.
+pub const START_LOG: &str =
+    "Ranging task started (scaffold: the sidelink-positioning pipeline is not wired end-to-end)";
+
 /// Carrier phase measurement for a single frequency.
 #[derive(Debug, Clone)]
 struct CarrierPhaseMeasurement {
@@ -157,7 +176,7 @@ impl Task for RangingTask {
     type Message = RangingMessage;
 
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
-        info!("Ranging task started (scaffold: the sidelink-positioning pipeline is not wired end-to-end)");
+        info!("{}", START_LOG);
         loop {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {
@@ -242,6 +261,171 @@ impl Task for RangingTask {
             "Ranging task stopped, {} active sessions",
             self.sessions.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::{AppMessage, NasMessage, RlsMessage, RrcMessage, TaskHandle};
+    use nextgsim_common::config::UeConfig;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// A `MakeWriter` that appends every formatted log record to a shared
+    /// buffer, so a test can assert on what the runtime actually emitted
+    /// rather than on what the source appears to say.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer not poisoned")).into_owned()
+        }
+    }
+
+    impl Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn task_base() -> UeTaskBase {
+        // `UeConfig::default()` is the default (ranging-disabled) start: the
+        // criterion is about what a UE that was NOT asked for ranging logs.
+        // Read through the same `as_ref().is_some_and(..)` shape `main.rs`
+        // uses, so "disabled" here means what it means at the gate.
+        assert!(
+            !UeConfig::default()
+                .ranging_config
+                .as_ref()
+                .is_some_and(|c| c.enabled),
+            "the default UE config must leave ranging disabled, or this test \
+             is asserting about the wrong start"
+        );
+        let (app_tx, _app_rx) = mpsc::channel::<TaskMessage<AppMessage>>(1);
+        let (nas_tx, _nas_rx) = mpsc::channel::<TaskMessage<NasMessage>>(1);
+        let (rrc_tx, _rrc_rx) = mpsc::channel::<TaskMessage<RrcMessage>>(1);
+        let (rls_tx, _rls_rx) = mpsc::channel::<TaskMessage<RlsMessage>>(1);
+        UeTaskBase {
+            config: Arc::new(UeConfig::default()),
+            app_tx: TaskHandle::new(app_tx),
+            nas_tx: TaskHandle::new(nas_tx),
+            rrc_tx: TaskHandle::new(rrc_tx),
+            rls_tx: TaskHandle::new(rls_tx),
+            #[cfg(any(
+                feature = "nextgsim-she",
+                feature = "nextgsim-nwdaf",
+                feature = "nextgsim-isac",
+                feature = "nextgsim-fl",
+                feature = "nextgsim-semantic",
+            ))]
+            sixg: None,
+            rel18: None,
+        }
+    }
+
+    /// Runs `RangingTask` to completion under a capturing subscriber and
+    /// returns everything it logged.
+    ///
+    /// The task is driven directly rather than `tokio::spawn`ed, and on a
+    /// current-thread runtime, because `with_default` installs the dispatcher
+    /// in a *thread-local*: a spawned task could be polled on a worker thread
+    /// where the capture is not installed, and the buffer would come back
+    /// empty — which would satisfy the absence assertion for the wrong reason.
+    fn run_ranging_task_capturing_logs() -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let (tx, rx) = mpsc::channel::<TaskMessage<RangingMessage>>(1);
+                // Dropping the sender is what ends `run`: `rx.recv()` yields
+                // `None` and the loop breaks, so the task starts and stops
+                // without needing a shutdown message.
+                drop(tx);
+                RangingTask::new(task_base()).run(rx).await;
+            });
+        });
+
+        captured.text()
+    }
+
+    /// #55, criterion 3: a default (ranging-disabled) start must not log a
+    /// TS 23.586 compliance claim, because the pipeline behind the claim is
+    /// dead — no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF
+    /// transport, and no ranging service at the LMF.
+    #[test]
+    fn a_default_ranging_disabled_start_logs_no_ts_23_586_claim() {
+        let logged = run_ranging_task_capturing_logs();
+
+        // Positive control FIRST. The assertion that matters is an absence,
+        // and an absence is satisfied by every path that never arrives —
+        // including a capture that was never installed or a task that never
+        // started. Pinning the scaffold line proves the buffer holds this
+        // task's own startup before anything is concluded from what is
+        // missing.
+        assert!(
+            logged.contains(START_LOG),
+            "the ranging task's startup line is missing from the capture, so \
+             nothing can be concluded from what else is absent; captured: {logged:?}"
+        );
+
+        assert!(
+            !logged.contains("TS 23.586"),
+            "a default start claimed TS 23.586 compliance; captured: {logged:?}"
+        );
+        assert!(
+            !logged.contains("Rel-18"),
+            "a default start advertised the ranging scaffold as a Rel-18 \
+             capability; captured: {logged:?}"
+        );
+    }
+
+    /// The binary's spawn line is unreachable from a test (it is inside
+    /// `main.rs`'s task closure), so what is pinned instead is the constant it
+    /// logs. Changing the binary's wording means changing this string, and
+    /// this test reads this string.
+    #[test]
+    fn the_startup_lines_make_no_ts_23_586_compliance_claim() {
+        for line in [SPAWN_LOG, START_LOG] {
+            assert!(
+                line.contains("scaffold"),
+                "{line:?} must say it is a scaffold, or a reader takes the \
+                 spawn for a working feature"
+            );
+            assert!(
+                !line.contains("TS 23.586"),
+                "{line:?} cites TS 23.586, which reads as a compliance claim"
+            );
+            assert!(
+                !line.contains("Rel-18"),
+                "{line:?} advertises a Rel-18 capability the code does not deliver"
+            );
+        }
     }
 }
 
