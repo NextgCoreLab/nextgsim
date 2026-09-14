@@ -20,8 +20,8 @@ use crate::app::{
     UeContext,
 };
 use crate::tasks::{
-    AppMessage, GnbCliCommandType, GnbTaskBase, NgapMessage, StatusUpdate, Task, TaskMessage,
-    UeReleaseRequestCause,
+    AppMessage, GnbCliCommandType, GnbTaskBase, NgapMessage, RrcMessage, StatusUpdate, Task,
+    TaskMessage, UeReleaseRequestCause,
 };
 
 /// gNB Application Task
@@ -124,6 +124,26 @@ impl AppTask {
                 let msg = NgapMessage::SendRanConfigurationUpdate { amf_id };
                 if let Err(e) = self.task_base.ngap_tx.send(msg).await {
                     error!("Failed to send RAN Configuration Update request to NGAP: {e}");
+                }
+            }
+        }
+
+        // Handle a UE suspend request (issue #38): the production trigger for
+        // RRC_INACTIVE. Sent to RRC and not to NGAP, because suspension is RAN-local
+        // and the AMF is deliberately not told -- see `RrcMessage::SuspendUe`.
+        if let GnbCliCommandType::UeSuspend {
+            ue_id,
+            t380_minutes,
+        } = command
+        {
+            if !response.is_error {
+                info!("UE suspend to RRC_INACTIVE requested for UE {ue_id}");
+                let msg = RrcMessage::SuspendUe {
+                    ue_id,
+                    t380_minutes,
+                };
+                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                    error!("Failed to send UE suspend request to RRC: {e}");
                 }
             }
         }

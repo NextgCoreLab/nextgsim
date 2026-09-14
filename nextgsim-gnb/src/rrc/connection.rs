@@ -16,12 +16,13 @@ use nextgsim_rrc::procedures::{
         RrcReestablishmentError, RrcReestablishmentParams,
     },
     rrc_release::{encode_rrc_release, CellReselectionPrioritiesParams, RrcReleaseParams},
-    rrc_resume::{encode_rrc_resume, fresh_rrc_resume_params},
+    rrc_resume::{compute_resume_mac_i, encode_rrc_resume, fresh_rrc_resume_params},
     rrc_setup::{encode_rrc_setup, srb1_rrc_setup_params},
+    suspend_config::{encode_suspend_config, RanNotificationArea, SuspendConfigParams},
 };
 
 use super::transaction::{RrcProcedure, TidVerification};
-use super::ue_context::RrcUeContextManager;
+use super::ue_context::{RrcUeContextManager, SuspendedIdentity};
 use crate::tasks::GutiMobileIdentity;
 
 /// Result of processing an RRC Setup Request
@@ -61,6 +62,92 @@ pub struct RrcReleaseResult {
     pub rrc_release_pdu: OctetString,
     /// RRC channel to use
     pub channel: RrcChannel,
+}
+
+/// What the caller needs to send an `RRCRelease` carrying a `suspendConfig`.
+#[derive(Debug, Clone)]
+pub struct RrcSuspendResult {
+    /// UE ID being suspended
+    pub ue_id: i32,
+    /// Transaction ID used
+    pub transaction_id: u8,
+    /// The `RRCRelease` carrying the `suspendConfig`, encoded
+    pub rrc_release_pdu: OctetString,
+    /// RRC channel to use
+    pub channel: RrcChannel,
+    /// The full I-RNTI the suspended context is stored under
+    pub full_i_rnti: u64,
+}
+
+/// What the network chooses when it suspends a UE (TS 38.331 §6.3.2 `SuspendConfig`).
+///
+/// The I-RNTI and the NCC are **not** here: the gNB allocates the first and takes the
+/// second from the UE's own AS security context, and letting a caller supply either
+/// would let it hand two UEs one identity or a chaining count that does not match the
+/// key the UE holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspendParams {
+    /// `ran-PagingCycle` in radio frames: 32, 64, 128 or 256.
+    pub ran_paging_cycle_rf: u16,
+    /// `t380` in minutes, or `None` for no periodic RNAU.
+    pub t380_minutes: Option<u16>,
+    /// Cells besides the serving one that belong to the RAN Notification Area.
+    ///
+    /// The serving cell is always included by `initiate_rrc_suspend`, so an empty list
+    /// means "this cell only" — the UE then does an RNAU as soon as it reselects,
+    /// which is correct for a single-cell deployment.
+    pub additional_rna_cells: Vec<u64>,
+}
+
+impl Default for SuspendParams {
+    /// TS 38.331 offers rf32..rf256 for `ran-PagingCycle` and min5..min720 for `t380`.
+    ///
+    /// rf64 and 30 minutes: a middling paging cycle, and a periodic RNAU often enough
+    /// that a suspended UE in a test is not waiting hours, while still being one of
+    /// the enumerated values rather than a number invented for convenience.
+    fn default() -> Self {
+        Self {
+            ran_paging_cycle_rf: 64,
+            t380_minutes: Some(30),
+            additional_rna_cells: Vec::new(),
+        }
+    }
+}
+
+/// An `RRCResumeRequest` as presented by the UE, plus the identity of the cell it
+/// arrived on (TS 38.331 §5.3.13.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeRequestPresented {
+    /// The I-RNTI the UE presented, in whichever form it sent.
+    pub identity: SuspendedIdentity,
+    /// The `resumeMAC-I` the UE computed.
+    pub resume_mac_i: u16,
+    /// Resume cause, as an enumeration index.
+    pub cause: u8,
+    /// The 36-bit NCI of the cell the request arrived on. Part of the MAC input, so
+    /// it must be the resuming cell's identity and not the stored one.
+    pub resuming_cell_identity: u64,
+}
+
+/// Why a resume was refused, so the caller can log the truth rather than "failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResumeRejection {
+    /// The cell is barred.
+    #[error("the cell is barred")]
+    CellBarred,
+    /// No suspended context is stored under the presented I-RNTI.
+    #[error("no suspended context for the presented I-RNTI")]
+    UnknownIRnti,
+    /// The presented `resumeMAC-I` did not match the one recomputed from the stored
+    /// context.
+    #[error("resumeMAC-I verification failed")]
+    MacIMismatch,
+    /// The `resumeMAC-I` could not be recomputed at all.
+    #[error("resumeMAC-I could not be recomputed: {0}")]
+    MacIUncomputable(&'static str),
+    /// The `RRCResume` could not be built.
+    #[error("RRCResume could not be built")]
+    ResumeNotBuildable,
 }
 
 /// An `RRCReestablishmentRequest` as presented by the UE, plus the identity of
@@ -166,6 +253,14 @@ pub struct RrcConnectionManager {
     tid_counter: u8,
     /// Whether the cell is barred
     is_barred: bool,
+    /// The next full I-RNTI to allocate when suspending a UE (issue #38).
+    ///
+    /// A counter and not a random value: a suspended context is looked up by exactly
+    /// this number, so a collision would hand one UE's stored `K_RRCint` to another,
+    /// and a randomly-drawn 40-bit identity gives a birthday collision no test would
+    /// ever reproduce. Starts at 1 because 0 is what an uninitialised field reads as,
+    /// and a resume for I-RNTI 0 should not find a context by accident.
+    next_i_rnti: u64,
 }
 
 impl Default for RrcConnectionManager {
@@ -180,6 +275,7 @@ impl RrcConnectionManager {
         Self {
             tid_counter: 0,
             is_barred: true, // Initially barred until radio power on
+            next_i_rnti: 1,
         }
     }
 
@@ -534,6 +630,137 @@ impl RrcConnectionManager {
         })
     }
 
+    /// Suspend a connected UE to RRC_INACTIVE (TS 38.331 §5.3.8.3, issue #38).
+    ///
+    /// Sends an `RRCRelease` **carrying a `suspendConfig`**, which is the whole
+    /// difference between suspending and releasing: the same message without one puts
+    /// the UE in RRC_IDLE. The UE context moves into the I-RNTI-keyed suspended store
+    /// instead of being deleted, so the resume that follows has something to be
+    /// authenticated against.
+    ///
+    /// Returns `None` when the UE is not connected, has no AS security context, or the
+    /// `suspendConfig` cannot be built. **In every one of those cases the caller must
+    /// fall back to a plain release** — a UE told nothing at all would sit in
+    /// RRC_CONNECTED talking to a gNB that had moved on.
+    ///
+    /// `serving_cell_identity` is the 36-bit NCI of this cell. It goes into the RAN
+    /// Notification Area, and it is also what the UE will name as the target when it
+    /// computes its `resumeMAC-I` from a cell inside that area.
+    pub fn initiate_rrc_suspend(
+        &mut self,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+        serving_cell_identity: u64,
+        params: SuspendParams,
+    ) -> Option<RrcSuspendResult> {
+        let ctx = ue_mgr.try_find_ue(ue_id)?;
+        if !ctx.is_connected() {
+            debug!("UE[{ue_id}] not connected, cannot suspend to RRC_INACTIVE");
+            return None;
+        }
+        // No AS security context means no `K_RRCint`, and therefore no way to verify
+        // the `resumeMAC-I` the UE will present. Suspending anyway is precisely the
+        // unauthenticated-resume exposure issue #38 reports, so this refuses and the
+        // caller releases instead.
+        let security = match ctx.reestablishment_security.as_ref() {
+            Some(sec) => sec.clone(),
+            None => {
+                warn!(
+                    "Refusing to suspend UE[{ue_id}]: no AS security context, so a resumeMAC-I could never be verified. Releasing instead."
+                );
+                return None;
+            }
+        };
+        let ncc = security.next_hop_chaining_count;
+
+        let full_i_rnti = self.allocate_i_rnti();
+        // The RAN Notification Area always contains at least the serving cell, so a
+        // UE that stays put never does an RNAU. TS 38.304 §5.5 makes leaving the area
+        // the trigger; an area that excluded the cell the UE is camped on would fire
+        // an RNAU the instant the release landed.
+        let mut area_cells = vec![serving_cell_identity];
+        area_cells.extend(
+            params
+                .additional_rna_cells
+                .iter()
+                .copied()
+                .filter(|nci| *nci != serving_cell_identity),
+        );
+        let suspend_params = SuspendConfigParams {
+            full_i_rnti,
+            ran_paging_cycle_rf: params.ran_paging_cycle_rf,
+            ran_notification_area: Some(RanNotificationArea::CellList(area_cells.clone())),
+            t380_minutes: params.t380_minutes,
+            next_hop_chaining_count: ncc,
+        };
+        let suspend_bytes = match encode_suspend_config(&suspend_params) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Refusing to suspend UE[{ue_id}]: {e}. Releasing instead.");
+                return None;
+            }
+        };
+
+        let transaction_id = self.next_tid();
+        let release_params = RrcReleaseParams {
+            rrc_transaction_id: transaction_id,
+            cell_reselection_priorities: None,
+            redirected_carrier_info: None,
+            suspend_config: Some(suspend_bytes),
+            deprioritisation_req: None,
+            wait_time: None,
+        };
+        let rrc_release_pdu = match encode_rrc_release(&release_params) {
+            Ok(bytes) => OctetString::from_slice(&bytes),
+            Err(e) => {
+                // No byte fallback here, unlike `build_rrc_release`: a fallback PDU
+                // would carry no `suspendConfig`, so the UE would go to IDLE while
+                // the gNB kept a suspended context waiting for a resume that can
+                // never come. Refusing lets the caller send a real release.
+                warn!("Refusing to suspend UE[{ue_id}]: RRCRelease encoding failed ({e})");
+                return None;
+            }
+        };
+
+        let suspended = ue_mgr.suspend_ue(
+            ue_id,
+            full_i_rnti,
+            security,
+            Some(RanNotificationArea::CellList(area_cells)),
+            params.t380_minutes,
+        )?;
+        info!(
+            "UE[{ue_id}] suspended to RRC_INACTIVE: I-RNTI={:#x}, t380={:?} min, RNA of {} cell(s), NCC={ncc}",
+            suspended.full_i_rnti,
+            suspended.t380_minutes,
+            suspended
+                .ran_notification_area
+                .as_ref()
+                .map(RanNotificationArea::len)
+                .unwrap_or(0)
+        );
+
+        Some(RrcSuspendResult {
+            ue_id,
+            transaction_id,
+            rrc_release_pdu,
+            channel: RrcChannel::DlDcch,
+            full_i_rnti,
+        })
+    }
+
+    /// The next full I-RNTI, wrapping within the 40-bit field.
+    fn allocate_i_rnti(&mut self) -> u64 {
+        let i_rnti = self.next_i_rnti;
+        // Wrap back to 1, not 0: see `next_i_rnti`.
+        self.next_i_rnti = if self.next_i_rnti >= 0xFF_FFFF_FFFF {
+            1
+        } else {
+            self.next_i_rnti + 1
+        };
+        i_rnti
+    }
+
     /// Processes an RRC Resume Request
     ///
     /// Called when a UE in `RRC_INACTIVE` state resumes its connection.
@@ -541,39 +768,81 @@ impl RrcConnectionManager {
         &mut self,
         ue_mgr: &mut RrcUeContextManager,
         ue_id: i32,
-        resume_cause: u8,
-    ) -> Option<RrcResumeResult> {
+        request: ResumeRequestPresented,
+    ) -> Result<RrcResumeResult, ResumeRejection> {
         if self.is_barred {
             warn!("Rejecting RRC Resume: cell is barred");
-            return None;
+            return Err(ResumeRejection::CellBarred);
         }
 
-        // For resume, the UE may or may not have an existing context
-        if ue_mgr.try_find_ue(ue_id).is_none() {
-            let ctx = ue_mgr.create_ue(ue_id);
-            ctx.on_setup_request();
+        // 1. Retrieve the STORED context by the presented I-RNTI. This is the step
+        //    that used to be missing: `create_ue` fabricated a fresh context for any
+        //    UE that asked, so there was nothing to authenticate against and nothing
+        //    to restore (TS 38.331 §5.3.13.3).
+        let stored = ue_mgr
+            .find_suspended(request.identity)
+            .ok_or(ResumeRejection::UnknownIRnti)?
+            .clone();
+
+        // 2. Recompute the `resumeMAC-I` from the STORED C-RNTI and PCI -- the values
+        //    the UE had when it was suspended, which are what its own MAC covers --
+        //    and the identity of the cell the request arrived on.
+        let expected = compute_resume_mac_i(
+            &stored.security.k_rrc_int,
+            stored.security.integrity_alg_id,
+            stored.security.c_rnti,
+            stored.security.phys_cell_id,
+            request.resuming_cell_identity,
+        )
+        .map_err(|_| ResumeRejection::MacIUncomputable("VarResumeMAC-Input encoding failed"))?;
+
+        if expected != request.resume_mac_i {
+            // Not an error to be recovered from: TS 38.331 §5.3.13.3 has the network
+            // fall back to `RRCSetup`, which discards the stored context and starts
+            // over. The context is deliberately LEFT in the store here -- a failed
+            // verification may be a genuine UE on a stale key, and discarding on the
+            // first bad MAC would let anyone evict a suspended UE by guessing an
+            // I-RNTI.
+            warn!(
+                "Rejecting RRC Resume for I-RNTI {:#x}: resumeMAC-I {:#06x} does not match the {:#06x} computed from the stored context",
+                stored.full_i_rnti, request.resume_mac_i, expected
+            );
+            return Err(ResumeRejection::MacIMismatch);
         }
+
+        // 3. Verified. Take the context out of the store -- an I-RNTI is single-use --
+        //    and restore it under the `ue_id` the request arrived on, which need not
+        //    be the one the UE had before.
+        let stored = ue_mgr
+            .take_suspended(request.identity)
+            .ok_or(ResumeRejection::UnknownIRnti)?;
 
         let transaction_id = self.next_tid();
-        let rrc_resume_pdu = self.build_rrc_resume(transaction_id)?;
+        let rrc_resume_pdu = self
+            .build_rrc_resume(transaction_id)
+            .ok_or(ResumeRejection::ResumeNotBuildable)?;
 
-        if let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) {
-            ctx.on_setup_sent();
-        }
+        let ctx = ue_mgr.find_or_create_ue(ue_id);
+        ctx.on_setup_request();
+        // The AS security context comes back with the UE: it is what the resumed
+        // connection is keyed on, and dropping it here would leave a CONNECTED UE
+        // whose SRB1 could not be protected.
+        ctx.reestablishment_security = Some(stored.security);
+        ctx.on_setup_sent();
 
         info!(
-            "RRC Resume for UE[{}], tid={}, cause={}",
-            ue_id, transaction_id, resume_cause
+            "RRC Resume for UE[{ue_id}] (was UE[{}]), I-RNTI={:#x}, tid={transaction_id}, resumeMAC-I verified",
+            stored.previous_ue_id, stored.full_i_rnti
         );
 
-        Some(RrcResumeResult {
+        Ok(RrcResumeResult {
             ue_id,
             transaction_id,
             rrc_resume_pdu,
             // DL-DCCH, not DL-CCCH: `RRCResume` rides SRB1, which a suspended UE
             // already had (TS 38.331 §6.2.2, issue #107).
             channel: RrcChannel::DlDcch,
-            cause: resume_cause,
+            cause: request.cause,
         })
     }
 
@@ -997,6 +1266,352 @@ mod tests {
         assert!(!ctx.is_connected());
     }
 
+    // ========================================================================
+    // Suspend / resume (issue #38)
+    // ========================================================================
+
+    /// The AS security context a UE must have before it can be suspended.
+    fn test_as_security() -> super::super::ue_context::ReestablishmentSecurity {
+        super::super::ue_context::ReestablishmentSecurity {
+            k_rrc_int: [0x11; 16],
+            k_rrc_enc: [0x22; 16],
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: 0x4601,
+            phys_cell_id: 7,
+            next_hop_chaining_count: 3,
+        }
+    }
+
+    /// A connected, keyed UE ready to be suspended.
+    fn connected_keyed_ue(
+        conn_mgr: &mut RrcConnectionManager,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+    ) {
+        conn_mgr.set_barred(false);
+        let ctx = ue_mgr.create_ue(ue_id);
+        ctx.on_setup_request();
+        ctx.on_setup_sent();
+        ctx.on_setup_complete();
+        ctx.reestablishment_security = Some(test_as_security());
+        assert!(
+            ue_mgr
+                .try_find_ue(ue_id)
+                .is_some_and(super::super::ue_context::RrcUeContext::is_connected),
+            "precondition: the UE is connected"
+        );
+    }
+
+    /// Suspend a UE and return the I-RNTI the gNB allocated.
+    fn suspend(
+        conn_mgr: &mut RrcConnectionManager,
+        ue_mgr: &mut RrcUeContextManager,
+        ue_id: i32,
+        cell_identity: u64,
+    ) -> u64 {
+        conn_mgr
+            .initiate_rrc_suspend(ue_mgr, ue_id, cell_identity, SuspendParams::default())
+            .expect("a keyed, connected UE must be suspendable")
+            .full_i_rnti
+    }
+
+    /// #38, criterion 1: the emitted `RRCRelease` carries a real `suspendConfig`, and
+    /// a plain release does not.
+    #[test]
+    fn a_suspending_release_carries_a_suspend_config_and_a_plain_one_does_not() {
+        use nextgsim_rrc::procedures::rrc_release::decode_rrc_release;
+        use nextgsim_rrc::procedures::suspend_config::decode_suspend_config;
+
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 1);
+
+        let result = conn_mgr
+            .initiate_rrc_suspend(&mut ue_mgr, 1, 0x10, SuspendParams::default())
+            .expect("suspend");
+        assert_eq!(result.channel, RrcChannel::DlDcch);
+        let release = decode_rrc_release(result.rrc_release_pdu.data())
+            .expect("the release must be real UPER");
+        let bytes = release
+            .suspend_config
+            .expect("a suspending release MUST carry a suspendConfig, or the UE goes IDLE");
+        let config = decode_suspend_config(&bytes).expect("a real SuspendConfig");
+        assert_eq!(config.full_i_rnti, result.full_i_rnti);
+        assert_eq!(config.next_hop_chaining_count, 3, "the UE's own NCC");
+        assert_eq!(config.t380_minutes, Some(30));
+        assert!(
+            config
+                .ran_notification_area
+                .as_ref()
+                .is_some_and(|a| a.contains(0x10)),
+            "the serving cell must be in the RNA, or the UE does an RNAU the instant              the release lands"
+        );
+
+        // The positive control: a PLAIN release carries no suspendConfig, so the
+        // assertion above is about the suspension and not about every release.
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 2);
+        let plain = conn_mgr
+            .initiate_rrc_release(&mut ue_mgr, 2, None)
+            .expect("release");
+        assert_eq!(
+            decode_rrc_release(plain.rrc_release_pdu.data())
+                .expect("real UPER")
+                .suspend_config,
+            None,
+            "a release without a suspendConfig is what moves a UE to RRC_IDLE"
+        );
+    }
+
+    /// #38, criterion 2: the context is retained and retrievable by I-RNTI, in both
+    /// forms, instead of being deleted.
+    #[test]
+    fn a_suspended_context_is_retrievable_by_either_i_rnti_form() {
+        use nextgsim_rrc::procedures::suspend_config::short_i_rnti_of;
+
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 1);
+        let i_rnti = suspend(&mut conn_mgr, &mut ue_mgr, 1, 0x10);
+
+        assert!(
+            ue_mgr.try_find_ue(1).is_none(),
+            "the UE is no longer reachable by ue_id: the RRC connection is gone"
+        );
+        assert_eq!(ue_mgr.suspended_count(), 1);
+        let by_full = ue_mgr
+            .find_suspended(SuspendedIdentity::Full(i_rnti))
+            .expect("retrievable by the full I-RNTI");
+        assert_eq!(by_full.previous_ue_id, 1);
+        assert_eq!(
+            by_full.security.k_rrc_int,
+            test_as_security().k_rrc_int,
+            "the K_RRCint must survive, or no resumeMAC-I can ever be verified"
+        );
+        assert!(
+            ue_mgr
+                .find_suspended(SuspendedIdentity::Short(short_i_rnti_of(i_rnti)))
+                .is_some(),
+            "and by the short form, which is what a UL-CCCH RRCResumeRequest carries"
+        );
+        assert!(
+            ue_mgr
+                .find_suspended(SuspendedIdentity::Full(i_rnti + 1))
+                .is_none(),
+            "but not by an I-RNTI that was never allocated"
+        );
+    }
+
+    /// A UE with no AS security context is **not** suspended: without `K_RRCint` the
+    /// gNB could never verify a `resumeMAC-I`, which is the unauthenticated-resume
+    /// exposure this issue reports.
+    #[test]
+    fn a_ue_without_as_security_is_refused_suspension() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+        let ctx = ue_mgr.create_ue(1);
+        ctx.on_setup_request();
+        ctx.on_setup_sent();
+        ctx.on_setup_complete();
+        // No `reestablishment_security`.
+        assert!(
+            conn_mgr
+                .initiate_rrc_suspend(&mut ue_mgr, 1, 0x10, SuspendParams::default())
+                .is_none(),
+            "suspending an unkeyed UE would create a resume nobody could authenticate"
+        );
+        assert_eq!(ue_mgr.suspended_count(), 0, "and nothing is stored");
+        assert!(
+            ue_mgr.try_find_ue(1).is_some(),
+            "and the context is left intact for the caller to release properly"
+        );
+    }
+
+    /// #38, criterion 3: the resume is authenticated. A correct `resumeMAC-I` is
+    /// accepted; an unknown I-RNTI and a wrong MAC are both refused with **no
+    /// fabricated context**.
+    #[test]
+    fn a_resume_is_accepted_only_with_the_right_i_rnti_and_mac_i() {
+        let resuming_cell = 0x10u64;
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 1);
+        let i_rnti = suspend(&mut conn_mgr, &mut ue_mgr, 1, resuming_cell);
+
+        let sec = test_as_security();
+        let good_mac = compute_resume_mac_i(
+            &sec.k_rrc_int,
+            sec.integrity_alg_id,
+            sec.c_rnti,
+            sec.phys_cell_id,
+            resuming_cell,
+        )
+        .expect("the UE's own derivation");
+
+        // 1. An unknown I-RNTI is refused, and fabricates nothing.
+        assert_eq!(
+            conn_mgr
+                .process_rrc_resume_request(
+                    &mut ue_mgr,
+                    9,
+                    ResumeRequestPresented {
+                        identity: SuspendedIdentity::Full(i_rnti + 100),
+                        resume_mac_i: good_mac,
+                        cause: 0,
+                        resuming_cell_identity: resuming_cell,
+                    },
+                )
+                .err(),
+            Some(ResumeRejection::UnknownIRnti)
+        );
+        assert!(
+            ue_mgr.try_find_ue(9).is_none(),
+            "an unknown I-RNTI must NOT create a context -- that is the defect"
+        );
+
+        // 2. A wrong resumeMAC-I is refused, and the stored context survives so a
+        //    genuine UE can retry.
+        assert_eq!(
+            conn_mgr
+                .process_rrc_resume_request(
+                    &mut ue_mgr,
+                    9,
+                    ResumeRequestPresented {
+                        identity: SuspendedIdentity::Full(i_rnti),
+                        resume_mac_i: good_mac ^ 0xFFFF,
+                        cause: 0,
+                        resuming_cell_identity: resuming_cell,
+                    },
+                )
+                .err(),
+            Some(ResumeRejection::MacIMismatch)
+        );
+        assert!(
+            ue_mgr.try_find_ue(9).is_none(),
+            "still no fabricated context"
+        );
+        assert_eq!(
+            ue_mgr.suspended_count(),
+            1,
+            "and the stored context is NOT evicted: anyone could otherwise drop a              suspended UE by guessing an I-RNTI"
+        );
+
+        // 3. The correct MAC is accepted. The positive control for both refusals.
+        let result = conn_mgr
+            .process_rrc_resume_request(
+                &mut ue_mgr,
+                9,
+                ResumeRequestPresented {
+                    identity: SuspendedIdentity::Full(i_rnti),
+                    resume_mac_i: good_mac,
+                    cause: 4,
+                    resuming_cell_identity: resuming_cell,
+                },
+            )
+            .expect("a correctly authenticated resume must be accepted");
+        assert_eq!(result.ue_id, 9, "restored under the resuming ue_id");
+        assert_eq!(result.channel, RrcChannel::DlDcch);
+        assert_eq!(
+            ue_mgr
+                .try_find_ue(9)
+                .and_then(|c| c.reestablishment_security.as_ref())
+                .map(|s| s.k_rrc_int),
+            Some(sec.k_rrc_int),
+            "the AS security context comes back with the UE"
+        );
+        assert_eq!(
+            ue_mgr.suspended_count(),
+            0,
+            "and the I-RNTI is spent: leaving it would let the request be replayed"
+        );
+
+        // 4. Replaying the very same request now fails, which is what single-use means.
+        assert_eq!(
+            conn_mgr
+                .process_rrc_resume_request(
+                    &mut ue_mgr,
+                    9,
+                    ResumeRequestPresented {
+                        identity: SuspendedIdentity::Full(i_rnti),
+                        resume_mac_i: good_mac,
+                        cause: 4,
+                        resuming_cell_identity: resuming_cell,
+                    },
+                )
+                .err(),
+            Some(ResumeRejection::UnknownIRnti)
+        );
+    }
+
+    /// The MAC covers the **resuming** cell, so the same UE resuming on a different
+    /// cell presents a different MAC — and the gNB must verify against the cell the
+    /// request actually arrived on.
+    #[test]
+    fn the_resume_mac_i_is_bound_to_the_cell_the_request_arrives_on() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 1);
+        let i_rnti = suspend(&mut conn_mgr, &mut ue_mgr, 1, 0x10);
+
+        let sec = test_as_security();
+        // A MAC computed for cell 0x10, presented on cell 0x20.
+        let mac_for_other_cell = compute_resume_mac_i(
+            &sec.k_rrc_int,
+            sec.integrity_alg_id,
+            sec.c_rnti,
+            sec.phys_cell_id,
+            0x10,
+        )
+        .expect("derivation");
+        assert_eq!(
+            conn_mgr
+                .process_rrc_resume_request(
+                    &mut ue_mgr,
+                    9,
+                    ResumeRequestPresented {
+                        identity: SuspendedIdentity::Full(i_rnti),
+                        resume_mac_i: mac_for_other_cell,
+                        cause: 0,
+                        resuming_cell_identity: 0x20,
+                    },
+                )
+                .err(),
+            Some(ResumeRejection::MacIMismatch),
+            "a MAC bound to another cell must not verify"
+        );
+    }
+
+    /// Two suspended UEs get different I-RNTIs, so one cannot be resumed with the
+    /// other's identity.
+    #[test]
+    fn two_suspended_ues_get_distinct_i_rntis() {
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 1);
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 2);
+        let a = suspend(&mut conn_mgr, &mut ue_mgr, 1, 0x10);
+        let b = suspend(&mut conn_mgr, &mut ue_mgr, 2, 0x10);
+        assert_ne!(
+            a, b,
+            "one I-RNTI for two UEs would hand one UE's K_RRCint to the other"
+        );
+        assert_eq!(ue_mgr.suspended_count(), 2);
+        assert_eq!(ue_mgr.suspended_i_rntis(), vec![a.min(b), a.max(b)]);
+        assert_eq!(
+            ue_mgr
+                .find_suspended(SuspendedIdentity::Full(a))
+                .map(|c| c.previous_ue_id),
+            Some(1)
+        );
+        assert_eq!(
+            ue_mgr
+                .find_suspended(SuspendedIdentity::Full(b))
+                .map(|c| c.previous_ue_id),
+            Some(2)
+        );
+    }
+
     /// #107, criterion 2: the emitted `RRCResume` is a real UPER message on
     /// **DL-DCCH**, carrying the bearer configuration.
     ///
@@ -1007,12 +1622,34 @@ mod tests {
     fn the_emitted_rrc_resume_is_real_uper_on_dl_dcch() {
         use nextgsim_rrc::procedures::rrc_resume::decode_rrc_resume;
 
+        let resuming_cell = 0x10u64;
         let mut conn_mgr = RrcConnectionManager::new();
         let mut ue_mgr = RrcUeContextManager::new();
-        conn_mgr.set_barred(false);
+        // A real suspended context, because issue #38 made the resume authenticated:
+        // this test used to drive a handler that fabricated one.
+        connected_keyed_ue(&mut conn_mgr, &mut ue_mgr, 1);
+        let i_rnti = suspend(&mut conn_mgr, &mut ue_mgr, 1, resuming_cell);
+        let sec = test_as_security();
+        let mac = compute_resume_mac_i(
+            &sec.k_rrc_int,
+            sec.integrity_alg_id,
+            sec.c_rnti,
+            sec.phys_cell_id,
+            resuming_cell,
+        )
+        .expect("derivation");
 
         let result = conn_mgr
-            .process_rrc_resume_request(&mut ue_mgr, 1, 0)
+            .process_rrc_resume_request(
+                &mut ue_mgr,
+                1,
+                ResumeRequestPresented {
+                    identity: SuspendedIdentity::Full(i_rnti),
+                    resume_mac_i: mac,
+                    cause: 0,
+                    resuming_cell_identity: resuming_cell,
+                },
+            )
             .expect("a resume must be emitted");
 
         assert_eq!(

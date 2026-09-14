@@ -26,6 +26,7 @@ use nextgsim_rrc::procedures::rrc_reestablishment::{
     decode_rrc_reestablishment_complete, decode_rrc_reestablishment_request,
     RrcReestablishmentRequestData,
 };
+use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request, decode_rrc_resume_request1};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_complete, decode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
@@ -79,13 +80,15 @@ pub struct PagingSchedule {
 /// PLMN identity followed by a 3-octet TAC (TS 38.413 §9.3.3.11).
 const TAI_OCTETS: usize = 6;
 
-use super::connection::{ReestablishmentRequest, RrcConnectionManager};
+use super::connection::{
+    ReestablishmentRequest, ResumeRequestPresented, RrcConnectionManager, SuspendParams,
+};
 use super::system_info::{
     encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
     release_cell_reselection_priorities,
 };
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
-use super::ue_context::{ReestablishmentSecurity, RrcUeContextManager};
+use super::ue_context::{ReestablishmentSecurity, RrcUeContextManager, SuspendedIdentity};
 use nextgsim_pdcp::srb_security::SrbSecurity;
 
 /// NTN configuration stored at RRC level
@@ -1073,23 +1076,96 @@ impl RrcTask {
         }
     }
 
+    /// Handles an `RRCResumeRequest` (UL-CCCH) or `RRCResumeRequest1` (UL-CCCH1).
+    ///
+    /// The request is **decoded**, not sampled: before issue #38 this read
+    /// `bytes.get(1)` as a resume cause and ignored the `I-RNTI` and `resumeMAC-I`
+    /// entirely, so the gNB fabricated a context for whatever asked. Now the I-RNTI
+    /// selects a stored context and the `resumeMAC-I` authenticates it
+    /// (TS 38.331 §5.3.13.3).
+    ///
+    /// Both message forms are accepted because which one the UE sends depends on
+    /// SIB1's `useFullResumeID`, not on the network: `RRCResumeRequest1` carries the
+    /// full 40-bit identity and is tried first, because a UL-CCCH1 message decoded as
+    /// UL-CCCH would yield a plausible-looking but wrong short identity.
     async fn handle_rrc_resume_request(&mut self, ue_id: i32, data: &OctetString) {
         let bytes = data.data();
-        let resume_cause = bytes.get(1).copied().unwrap_or(0);
+        let presented = if let Ok(full) = decode_rrc_resume_request1(bytes) {
+            Some(ResumeRequestPresented {
+                identity: SuspendedIdentity::Full(full.resume_identity),
+                resume_mac_i: full.resume_mac_i,
+                cause: full.resume_cause as u8,
+                resuming_cell_identity: self.cell_identity(),
+            })
+        } else if let Ok(short) = decode_rrc_resume_request(bytes) {
+            Some(ResumeRequestPresented {
+                identity: SuspendedIdentity::Short(short.resume_identity),
+                resume_mac_i: short.resume_mac_i,
+                cause: short.resume_cause as u8,
+                resuming_cell_identity: self.cell_identity(),
+            })
+        } else {
+            None
+        };
+
+        let Some(presented) = presented else {
+            // Not decodable at all. Refused rather than guessed at: the old
+            // byte-sampling path is exactly what let an unauthenticated resume
+            // through, and a UE whose request we cannot read has to fall back to
+            // `RRCSetup` (§5.3.13.3).
+            warn!(
+                "Discarding an undecodable RRCResumeRequest from UE[{ue_id}] ({} bytes); \
+                 the UE must fall back to RRCSetup",
+                bytes.len()
+            );
+            return;
+        };
 
         info!(
-            "RRC Resume Request from UE[{}]: cause={}",
-            ue_id, resume_cause
+            "RRC Resume Request from UE[{ue_id}]: identity={:?}, cause={}",
+            presented.identity, presented.cause
         );
 
-        if let Some(result) = self.connection_manager.process_rrc_resume_request(
+        match self.connection_manager.process_rrc_resume_request(
             &mut self.ue_manager,
             ue_id,
-            resume_cause,
+            presented,
         ) {
-            self.send_rrc_message(result.ue_id, result.channel, result.rrc_resume_pdu)
-                .await;
+            Ok(result) => {
+                self.send_rrc_message(result.ue_id, result.channel, result.rrc_resume_pdu)
+                    .await;
+            }
+            Err(rejection) => {
+                // Nothing is sent. §5.3.13.3 leaves the UE to fall back to `RRCSetup`
+                // on T319 expiry, which is the honest outcome: answering an
+                // unauthenticated resume with anything at all is what this issue is
+                // about, and no `RRCReject` can be sent on a connection that was never
+                // resumed.
+                warn!("RRC Resume for UE[{ue_id}] refused: {rejection}");
+            }
         }
+    }
+
+    /// Suspends a UE to RRC_INACTIVE (TS 38.331 §5.3.8.3, issue #38).
+    ///
+    /// Falls back to a plain release when the UE cannot be suspended safely — see
+    /// [`RrcConnectionManager::initiate_rrc_suspend`] for what "safely" excludes.
+    /// The fallback matters: a UE told nothing would stay in RRC_CONNECTED talking to
+    /// a gNB that had already moved on.
+    async fn handle_suspend_ue(&mut self, ue_id: i32, params: SuspendParams) {
+        let cell_identity = self.cell_identity();
+        if let Some(result) = self.connection_manager.initiate_rrc_suspend(
+            &mut self.ue_manager,
+            ue_id,
+            cell_identity,
+            params,
+        ) {
+            self.send_rrc_message(result.ue_id, result.channel, result.rrc_release_pdu)
+                .await;
+            return;
+        }
+        warn!("UE[{ue_id}] could not be suspended; releasing instead");
+        self.handle_an_release(ue_id).await;
     }
 
     async fn handle_rrc_resume_complete(&mut self, ue_id: i32, data: &OctetString) {
@@ -1719,6 +1795,16 @@ impl Task for RrcTask {
                             }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
+                            }
+                            RrcMessage::SuspendUe { ue_id, t380_minutes } => {
+                                self.handle_suspend_ue(
+                                    ue_id,
+                                    SuspendParams {
+                                        t380_minutes,
+                                        ..SuspendParams::default()
+                                    },
+                                )
+                                .await;
                             }
                             RrcMessage::Paging { ue_paging_tmsi, tai_list_for_paging, drx_cycle_frames } => {
                                 self.handle_paging(ue_paging_tmsi, tai_list_for_paging, drx_cycle_frames)

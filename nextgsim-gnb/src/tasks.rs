@@ -225,6 +225,18 @@ pub enum GnbCliCommandType {
     UeInfo { ue_id: i32 },
     /// Release UE context
     UeRelease { ue_id: i32 },
+    /// Suspend a UE to RRC_INACTIVE (TS 38.331 §5.3.8.3, issue #38).
+    ///
+    /// Operator-triggered for the same reason `RanConfigUpdate` is: nothing in a
+    /// simulator decides a UE has gone quiet. A real gNB suspends on a data-inactivity
+    /// timer, and this RRC task has no data-activity signal to run one from — an
+    /// automatic trigger would have to invent the inactivity it was reacting to.
+    UeSuspend {
+        /// UE ID to suspend
+        ue_id: i32,
+        /// `t380` in minutes (one of 5, 10, 20, 30, 60, 120, 360, 720), or `None`
+        t380_minutes: Option<u16>,
+    },
     /// Send a RAN CONFIGURATION UPDATE to a connected AMF
     /// (TS 38.413 §8.7.2, issue #41).
     ///
@@ -484,6 +496,19 @@ pub enum RrcMessage {
     AnRelease {
         /// UE ID
         ue_id: i32,
+    },
+    /// Suspend a UE to RRC_INACTIVE (from the App task's CLI, issue #38).
+    ///
+    /// Deliberately NOT from NGAP. Suspension is a purely RAN-local decision: the UE
+    /// stays CM-CONNECTED and the AMF is told nothing, which is the whole point of
+    /// RRC_INACTIVE (TS 38.331 §5.3.8.3). An NGAP release means the opposite — the
+    /// core has finished with the UE — so routing suspension through `AnRelease` would
+    /// suspend a UE whose NGAP context had just been torn down.
+    SuspendUe {
+        /// UE ID to suspend
+        ue_id: i32,
+        /// `t380` in minutes, or `None` for no periodic RNAU
+        t380_minutes: Option<u16>,
     },
     /// Paging request (from NGAP)
     Paging {

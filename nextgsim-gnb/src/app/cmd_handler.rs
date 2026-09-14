@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 
 use super::status::GnbStatusInfo;
 use crate::tasks::{GnbCliCommandType, GnbTaskBase};
+use nextgsim_rrc::procedures::suspend_config::T380_MINUTES_TO_INDEX;
 
 /// Response from a CLI command.
 #[derive(Debug, Clone)]
@@ -161,6 +162,10 @@ impl<'a> GnbCmdHandler<'a> {
             GnbCliCommandType::UeList => self.handle_ue_list(response_addr),
             GnbCliCommandType::UeInfo { ue_id } => self.handle_ue_info(*ue_id, response_addr),
             GnbCliCommandType::UeRelease { ue_id } => self.handle_ue_release(*ue_id, response_addr),
+            GnbCliCommandType::UeSuspend {
+                ue_id,
+                t380_minutes,
+            } => self.handle_ue_suspend(*ue_id, *t380_minutes, response_addr),
             GnbCliCommandType::RanConfigUpdate { amf_id } => {
                 self.handle_ran_config_update(*amf_id, response_addr)
             }
@@ -253,6 +258,44 @@ impl<'a> GnbCmdHandler<'a> {
         )
     }
 
+    /// Handles the UE-SUSPEND command (TS 38.331 §5.3.8.3, issue #38).
+    ///
+    /// Validates the UE and the `t380` before the App task forwards anything: an
+    /// unknown UE is an operator typo, and a `t380` outside
+    /// `PeriodicRNAU-TimerValue` would be refused later by
+    /// `initiate_rrc_suspend` — which would then fall back to a plain *release*,
+    /// so the operator would have released the UE by asking to suspend it.
+    fn handle_ue_suspend(
+        &self,
+        ue_id: i32,
+        t380_minutes: Option<u16>,
+        response_addr: Option<SocketAddr>,
+    ) -> CliResponse {
+        if !self.ue_contexts.contains_key(&ue_id) {
+            return CliResponse::error(format!("UE not found with ID: {ue_id}"), response_addr);
+        }
+        if let Some(minutes) = t380_minutes {
+            if !T380_MINUTES_TO_INDEX.iter().any(|(m, _)| *m == minutes) {
+                let legal: Vec<String> = T380_MINUTES_TO_INDEX
+                    .iter()
+                    .map(|(m, _)| m.to_string())
+                    .collect();
+                return CliResponse::error(
+                    format!(
+                        "t380 of {minutes} minutes is not a PeriodicRNAU-TimerValue; \
+                         legal values are {}",
+                        legal.join(", ")
+                    ),
+                    response_addr,
+                );
+            }
+        }
+        CliResponse::success(
+            format!("Suspending UE {ue_id} to RRC_INACTIVE (t380={t380_minutes:?} min)"),
+            response_addr,
+        )
+    }
+
     /// Handles the RAN-CONFIG-UPDATE command (TS 38.413 §8.7.2, issue #41).
     ///
     /// Validates the target before the App task sends anything: an unknown AMF ID
@@ -294,6 +337,7 @@ impl<'a> GnbCmdHandler<'a> {
 /// - `ue-list` - List connected UEs
 /// - `ue-info <ue_id>` - Show UE details
 /// - `ue-release <ue_id>` - Release UE context
+/// - `ue-suspend <ue_id> [t380_minutes]` - Suspend a UE to RRC_INACTIVE
 /// - `ran-config-update [amf_id]` - Send a RAN Configuration Update (all AMFs if omitted)
 ///
 /// # Returns
@@ -329,6 +373,29 @@ pub fn parse_cli_command(input: &str) -> Result<GnbCliCommandType, String> {
                 .parse::<i32>()
                 .map_err(|_| format!("Invalid UE ID: {}", tokens[1]))?;
             Ok(GnbCliCommandType::UeRelease { ue_id })
+        }
+        // `ue-suspend <ue_id> [t380_minutes]`. The t380 is optional because a UE can be
+        // suspended with no periodic RNAU at all -- the RNA-crossing trigger still
+        // applies (TS 38.304 §5.5).
+        "ue-suspend" => {
+            if tokens.len() < 2 {
+                return Err("Usage: ue-suspend <ue_id> [t380_minutes]".to_string());
+            }
+            let ue_id = tokens[1]
+                .parse::<i32>()
+                .map_err(|_| format!("Invalid UE ID: {}", tokens[1]))?;
+            let t380_minutes = match tokens.get(2) {
+                None => None,
+                Some(token) => Some(
+                    token
+                        .parse::<u16>()
+                        .map_err(|_| format!("Invalid t380 minutes: {token}"))?,
+                ),
+            };
+            Ok(GnbCliCommandType::UeSuspend {
+                ue_id,
+                t380_minutes,
+            })
         }
         // An optional AMF ID: with none, every Ready AMF is told. TS 38.413 §8.7.2
         // is per-association, and an operator whose configuration changed means it
@@ -675,6 +742,101 @@ mod tests {
         assert!(parse_cli_command("INFO").is_ok());
         assert!(parse_cli_command("Status").is_ok());
         assert!(parse_cli_command("UE-LIST").is_ok());
+    }
+
+    /// #38: the operator-facing entry point for suspension parses, with and without a
+    /// `t380`.
+    #[test]
+    fn ue_suspend_parses_with_and_without_a_t380() {
+        assert!(matches!(
+            parse_cli_command("ue-suspend 7").expect("parses"),
+            GnbCliCommandType::UeSuspend {
+                ue_id: 7,
+                t380_minutes: None
+            }
+        ));
+        assert!(matches!(
+            parse_cli_command("ue-suspend 7 30").expect("parses"),
+            GnbCliCommandType::UeSuspend {
+                ue_id: 7,
+                t380_minutes: Some(30)
+            }
+        ));
+        assert!(
+            parse_cli_command("ue-suspend").is_err(),
+            "a UE ID is required: suspending 'the UE' is not a thing"
+        );
+        assert!(parse_cli_command("ue-suspend x").is_err());
+        assert!(parse_cli_command("ue-suspend 7 forever").is_err());
+    }
+
+    /// A `t380` outside `PeriodicRNAU-TimerValue` is refused at the CLI.
+    ///
+    /// This matters more than it looks: `initiate_rrc_suspend` refuses an unencodable
+    /// `t380` and the RRC task then falls back to a plain **release**, so without this
+    /// check an operator would have released the UE by asking to suspend it. A revert
+    /// round that disabled the validation matched no test at all.
+    #[test]
+    fn ue_suspend_refuses_an_unknown_ue_and_a_non_enumerated_t380() {
+        let mut ue_contexts = HashMap::new();
+        ue_contexts.insert(42, UeContext::new(42, 4200));
+        let amf_contexts = HashMap::new();
+        let task_base = create_task_base(GnbConfig::default());
+        let status_info = GnbStatusInfo::new();
+        let handler = GnbCmdHandler::new(&task_base, &status_info, &ue_contexts, &amf_contexts);
+
+        assert!(
+            handler
+                .handle_command(
+                    &GnbCliCommandType::UeSuspend {
+                        ue_id: 99,
+                        t380_minutes: Some(30)
+                    },
+                    None
+                )
+                .is_error,
+            "an unknown UE ID must be refused"
+        );
+        assert!(
+            handler
+                .handle_command(
+                    &GnbCliCommandType::UeSuspend {
+                        ue_id: 42,
+                        t380_minutes: Some(45)
+                    },
+                    None
+                )
+                .is_error,
+            "45 minutes is not a PeriodicRNAU-TimerValue, and accepting it would make \
+             the RRC task fall back to a RELEASE"
+        );
+        // The positive controls: every enumerated value is accepted, and so is none.
+        for (minutes, _) in T380_MINUTES_TO_INDEX {
+            assert!(
+                !handler
+                    .handle_command(
+                        &GnbCliCommandType::UeSuspend {
+                            ue_id: 42,
+                            t380_minutes: Some(*minutes)
+                        },
+                        None
+                    )
+                    .is_error,
+                "t380 of {minutes} min is enumerated and must be accepted"
+            );
+        }
+        assert!(
+            !handler
+                .handle_command(
+                    &GnbCliCommandType::UeSuspend {
+                        ue_id: 42,
+                        t380_minutes: None
+                    },
+                    None
+                )
+                .is_error,
+            "no periodic RNAU is a legal configuration: the crossing trigger remains"
+        );
     }
 
     /// #41, criterion 6: the operator-facing entry point for RAN CONFIGURATION
