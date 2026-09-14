@@ -84,6 +84,19 @@ pub struct NgapAmfContext {
     /// reported one of this AMF's served GUAMIs as unavailable (TS 38.413
     /// §8.7.6). Cleared on association-down and on a fresh NG Setup Response.
     pub unavailable: bool,
+    /// Accumulator implementing the `traffic_load_reduction` gate (issue #41).
+    ///
+    /// Deterministic rather than randomised, on purpose: a probabilistic gate
+    /// makes any test of it a coin flip, and this repo has already recorded a
+    /// nondeterminism guard that was itself a coin flip. See
+    /// [`Self::admit_initial_ue_message`] for the arithmetic.
+    admission_credit: u32,
+    /// TNL association addresses this AMF asked the NG-RAN node to ADD, that it
+    /// actually brought up (TS 38.413 §9.2.6.5, issue #41).
+    ///
+    /// Recorded so the Acknowledge can report them and so a later remove request
+    /// can be matched against something.
+    pub tnla_established: Vec<std::net::IpAddr>,
     /// Next available stream ID for UE-associated signaling
     next_stream: u16,
     /// Set of allocated stream IDs
@@ -105,6 +118,8 @@ impl NgapAmfContext {
             plmn_support_list: Vec::new(),
             traffic_load_reduction: None,
             unavailable: false,
+            admission_credit: 0,
+            tnla_established: Vec::new(),
             next_stream: 1, // Stream 0 is for non-UE-associated signaling
             allocated_streams: HashSet::new(),
         }
@@ -127,6 +142,8 @@ impl NgapAmfContext {
         self.plmn_support_list.clear();
         self.traffic_load_reduction = None;
         self.unavailable = false;
+        self.admission_credit = 0;
+        self.tnla_established.clear();
         self.allocated_streams.clear();
         self.next_stream = 1;
     }
@@ -158,11 +175,100 @@ impl NgapAmfContext {
         if self.state == AmfState::Overloaded {
             self.state = AmfState::Ready;
         }
+        // The credit is reset with the overload, not carried across: a reduction
+        // that ended should not leave a partial block behind.
+        self.admission_credit = 0;
+    }
+
+    /// Whether a NEW UE's Initial UE Message may be sent to this AMF, applying
+    /// the `AMFTrafficLoadReductionIndication` from OVERLOAD START
+    /// (TS 38.413 §8.7.7, §9.3.1.57, issue #41).
+    ///
+    /// The IE is a **percentage of signalling traffic to reduce**, so a value of
+    /// 75 must let roughly one message in four through — not block everything and
+    /// not nothing. Before this the value was stored and read only in a log line.
+    ///
+    /// # Why an accumulator and not a random draw
+    ///
+    /// Each call adds `reduction` to an accumulator; when it reaches 100 the
+    /// message is **blocked** and 100 is subtracted. So exactly `reduction` of
+    /// every 100 attempts are blocked, spread evenly rather than in a burst, and
+    /// the sequence is **deterministic**. A probabilistic gate would give the right
+    /// long-run rate and make every test of it a coin flip, which this repo has
+    /// already been bitten by.
+    ///
+    /// Counting BLOCKS rather than admissions matters at both ends of the range. A
+    /// 1% reduction admits the first attempt, which is what "reduce by 1%" should
+    /// feel like — an accumulator counting admissions blocks the first one, which a
+    /// revert round's positive control caught. And a reduction of 100 blocks
+    /// everything with no special case, because the accumulator reaches 100 on
+    /// every call.
+    ///
+    /// # Only new UEs
+    ///
+    /// This gates the Initial UE Message alone. Throttling an established UE's
+    /// signalling would break sessions that are already up, which is worse for the
+    /// AMF than the load it saves — TS 38.413's overload actions are about
+    /// rejecting NEW access, not about abandoning existing contexts.
+    pub fn admit_initial_ue_message(&mut self) -> bool {
+        let Some(reduction) = self.traffic_load_reduction else {
+            return true;
+        };
+        // The IE is INTEGER (1..99), so 0 and >=100 are out of range on the wire.
+        // Clamped rather than trusted, because a peer that sends 100 means "stop"
+        // and one that sends 0 means "nothing to reduce".
+        let reduction = u32::from(reduction.min(100));
+        if reduction == 0 {
+            return true;
+        }
+        self.admission_credit += reduction;
+        if self.admission_credit >= 100 {
+            self.admission_credit -= 100;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Records a TNL association this NG-RAN node brought up at the AMF's request.
+    pub fn on_tnla_established(&mut self, endpoint: std::net::IpAddr) {
+        if !self.tnla_established.contains(&endpoint) {
+            self.tnla_established.push(endpoint);
+        }
+    }
+
+    /// Forgets a TNL association the AMF asked to remove.
+    ///
+    /// Returns whether it was one this node had actually established: an AMF may
+    /// ask to remove an address that was never added, and reporting that as a
+    /// removal would tell it something untrue.
+    pub fn on_tnla_removed(&mut self, endpoint: &std::net::IpAddr) -> bool {
+        let before = self.tnla_established.len();
+        self.tnla_established.retain(|e| e != endpoint);
+        self.tnla_established.len() != before
     }
 
     /// Returns true if the AMF is ready for operation
     pub fn is_ready(&self) -> bool {
         self.state == AmfState::Ready
+    }
+
+    /// Whether this AMF may be SELECTED for a new UE (issue #41).
+    ///
+    /// An **overloaded** AMF is still a candidate. That is the correction, not a
+    /// relaxation: `AMFTrafficLoadReductionIndication` (TS 38.413 §9.3.1.57) asks
+    /// the NG-RAN node to reduce signalling by a PERCENTAGE, so excluding the AMF
+    /// from selection outright applies a 100% reduction whatever the AMF asked for
+    /// — and in a single-AMF deployment it stops the gNB serving anyone the moment
+    /// the AMF asks for a 10% cut.
+    ///
+    /// The proportional part is [`Self::admit_initial_ue_message`], which is only
+    /// reachable BECAUSE this returns true while overloaded. A revert round caught
+    /// exactly that: with the old `is_ready()` predicate the gate could never run,
+    /// and the test asserting a throttle passed because no AMF was selectable at
+    /// all.
+    pub fn is_selectable(&self) -> bool {
+        matches!(self.state, AmfState::Ready | AmfState::Overloaded)
     }
 
     /// Returns true if the AMF is connected (SCTP association up)

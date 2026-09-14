@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::tasks::{
     AppMessage, GnbTaskBase, GtpMessage, GtpUeContextUpdate, NgapMessage, PduSessionResource,
     RrcMessage, SctpMessage, StatusType, StatusUpdate, Task, TaskMessage, UeReleaseRequestCause,
+    NGAP_PPID,
 };
 use nextgsim_common::OctetString;
 
@@ -179,7 +180,31 @@ pub struct NgapTask {
     /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
     /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
     guard_timers: GuardTimers,
+    /// SCTP client IDs of TNL associations this node opened because an AMF
+    /// Configuration Update asked it to (TS 38.413 §9.2.6.5, issue #41).
+    ///
+    /// Keyed by endpoint so a later remove request can be matched to the
+    /// association it actually names. Separate from `amf_contexts` because the
+    /// question "did I open this on request" is not answerable from a context that
+    /// looks identical to a configured one.
+    tnla_client_ids: HashMap<std::net::IpAddr, i32>,
+    /// Next SCTP client ID for a dynamically added TNL association.
+    ///
+    /// Starts well above the configured range: `main.rs` assigns client IDs from
+    /// the `amf_configs` INDEX (0, 1, 2 ...), so a dynamic ID drawn from the same
+    /// space would collide with a configured AMF and the two would share a context.
+    next_dynamic_tnla_id: i32,
 }
+
+/// The first SCTP client ID used for a dynamically added TNL association.
+///
+/// Configured AMFs take 0..n from their `amf_configs` index, so this leaves room
+/// for far more configured AMFs than any deployment has.
+const DYNAMIC_TNLA_CLIENT_ID_BASE: i32 = 10_000;
+
+/// The NGAP SCTP port to use for a TNL association the AMF named without one
+/// (TS 38.412 §7: NGAP has no port IE, so the AMF can only give an address).
+const DEFAULT_NGAP_PORT: u16 = 38412;
 
 impl NgapTask {
     /// Creates a new NGAP task
@@ -193,6 +218,8 @@ impl NgapTask {
             is_initialized: false,
             mbs_sessions: MbsSessionManager::new(),
             guard_timers: GuardTimers::new(),
+            tnla_client_ids: HashMap::new(),
+            next_dynamic_tnla_id: DYNAMIC_TNLA_CLIENT_ID_BASE,
         }
     }
 
@@ -256,7 +283,11 @@ impl NgapTask {
         // A candidate TNLA is Ready, available, and (if a slice was requested)
         // serves every requested S-NSSAI on the serving PLMN.
         let is_candidate = |ctx: &&NgapAmfContext| {
-            ctx.is_ready()
+            // `is_selectable`, not `is_ready`: an OVERLOADED AMF is still a
+            // candidate, and the traffic-load-reduction percentage throttles it
+            // proportionally at admission (issue #41). Excluding it here applied a
+            // 100% reduction whatever the AMF asked for.
+            ctx.is_selectable()
                 && !ctx.unavailable
                 && (requested.is_empty() || requested.iter().all(|s| ctx.supports_snssai(plmn, s)))
         };
@@ -1915,6 +1946,28 @@ impl NgapTask {
             }
         };
 
+        // TS 38.413 §8.7.7: honour the AMFTrafficLoadReductionIndication the
+        // selected AMF gave in OVERLOAD START. Before this the percentage was
+        // stored and read only in a log line, so an AMF that asked for a 75%
+        // reduction kept receiving 100% of the gNB's Initial UE Messages
+        // (issue #41).
+        //
+        // The UE context is deliberately NOT created before this check: creating
+        // one and then abandoning it leaks a RAN UE NGAP ID and a stream for a UE
+        // the AMF never heard of.
+        if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
+            if !ctx.admit_initial_ue_message() {
+                warn!(
+                    "Initial UE Message for UE {} blocked: AMF[{}] asked for a {}% \
+                     traffic reduction (TS 38.413 §8.7.7)",
+                    ue_id,
+                    amf_id,
+                    ctx.traffic_load_reduction.unwrap_or(0)
+                );
+                return;
+            }
+        }
+
         // Create UE context
         let ran_ue_ngap_id = match self.create_ue_context(ue_id, amf_id) {
             Some(id) => id,
@@ -2778,9 +2831,15 @@ impl NgapTask {
     /// Initiate a RAN CONFIGURATION UPDATE toward the AMF (TS 38.413 §8.7.2) to
     /// refresh this gNB's advertised RAN node name, TA/slice list and paging DRX.
     /// The AMF replies with a RAN CONFIGURATION UPDATE ACKNOWLEDGE or FAILURE,
-    /// both handled in `handle_ngap_pdu`. On-demand: there is no automatic
-    /// trigger yet, so this is not called from the operational path.
-    #[allow(dead_code)]
+    /// both handled in `handle_ngap_pdu`.
+    ///
+    /// Triggered by the `ran-config-update` CLI command via
+    /// `NgapMessage::SendRanConfigurationUpdate` (issue #41). Operator-driven
+    /// rather than automatic, and that is not a shortcut: TS 38.413 §8.7.2 sends
+    /// this when the NG-RAN node's application-level configuration CHANGES, and
+    /// nothing changes a simulator's configuration except an operator. An automatic
+    /// trigger would have to invent a configuration change to have something to
+    /// report.
     async fn send_ran_configuration_update(&mut self, amf_id: i32) {
         let config = &self.task_base.config;
         let plmn_bytes = config.plmn.encode();
@@ -2853,7 +2912,17 @@ impl NgapTask {
             }
         }
 
-        let params = AmfConfigurationUpdateAcknowledgeParams::default();
+        // TS 38.413 §8.7.3: act on the TNL-association lists, and report the
+        // outcome. Before this they were not even parsed, so an AMF that asked the
+        // gNB to add a second TNLA got a bare acknowledge -- which reads as "done"
+        // -- and then balanced traffic onto an association that did not exist
+        // (issue #41).
+        let (tnla_setup, tnla_failed_to_setup) = self.apply_tnla_changes(client_id, &update).await;
+
+        let params = AmfConfigurationUpdateAcknowledgeParams {
+            tnla_setup,
+            tnla_failed_to_setup,
+        };
         match encode_amf_configuration_update_acknowledge(&params) {
             Ok(data) => {
                 self.send_ngap_non_ue(client_id, stream, data).await;
@@ -2867,6 +2936,151 @@ impl NgapTask {
                 e
             ),
         }
+    }
+
+    /// Allocates the next SCTP client ID for a dynamically added TNL association.
+    fn next_tnla_client_id(&mut self) -> i32 {
+        let id = self.next_dynamic_tnla_id;
+        self.next_dynamic_tnla_id += 1;
+        id
+    }
+
+    /// Applies an AMF Configuration Update's TNL-association lists
+    /// (TS 38.413 §8.7.3, §9.2.6.5, issue #41).
+    ///
+    /// Returns `(setup, failed_to_setup)` for the Acknowledge.
+    ///
+    /// # What "add" and "remove" mean here
+    ///
+    /// The gNB's TNLAs are SCTP associations it initiated, so adding one is a
+    /// `SctpMessage::ConnectionRequest` to the address the AMF named and removing
+    /// one is a `ConnectionClose`. Both are real actions, not bookkeeping.
+    ///
+    /// # Why an add is reported as SET UP before the association is confirmed
+    ///
+    /// `ConnectionRequest` is asynchronous: the SCTP task answers later with
+    /// `AssociationSetup` or nothing. The Acknowledge cannot wait for that without
+    /// holding the procedure open past its point. So an accepted request is
+    /// reported in the setup list and a *rejected* one — an address this gNB cannot
+    /// use, or a queue it could not reach — in the failed list. That is a real
+    /// distinction rather than optimism: the failure cases below are the ones the
+    /// gNB knows about at Acknowledge time, and they are the ones an AMF can act
+    /// on. An association that is accepted here and then fails to come up shows up
+    /// as an association that never reaches `Ready`, which `select_amf` already
+    /// excludes.
+    async fn apply_tnla_changes(
+        &mut self,
+        client_id: i32,
+        update: &nextgsim_ngap::procedures::ng_reset::AmfConfigurationUpdateData,
+    ) -> (
+        Vec<nextgsim_ngap::procedures::ng_reset::AmfTnlAssociationAddress>,
+        Vec<nextgsim_ngap::procedures::ng_reset::AmfTnlAssociationAddress>,
+    ) {
+        let mut setup = Vec::new();
+        let mut failed = Vec::new();
+
+        // REMOVE first. An update that removes an address and adds it back with a
+        // different usage would otherwise close the association it had just asked
+        // for.
+        for address in &update.tnla_to_remove {
+            // `tnla_client_ids` is the SINGLE source of truth for "did this gNB open
+            // this association on request". A second check against the AMF context's
+            // own record was redundant with it -- a revert round proved so by making
+            // that check always say yes and changing nothing -- so the context record
+            // is updated as bookkeeping and the decision rests here.
+            //
+            // The association carrying this very message is NOT in this map (it came
+            // from `amf_configs`), which is what stops a remove request tearing down
+            // the procedure mid-flight.
+            match self.tnla_client_ids.remove(&address.endpoint) {
+                Some(id) => {
+                    info!(
+                        "AMF[{client_id}] asked to remove TNL association {}; closing \
+                         it (AMF[{id}])",
+                        address.endpoint
+                    );
+                    if let Some(ctx) = self.amf_contexts.get_mut(&client_id) {
+                        ctx.on_tnla_removed(&address.endpoint);
+                    }
+                    let msg = SctpMessage::ConnectionClose { client_id: id };
+                    if let Err(e) = self.task_base.sctp_tx.send(msg).await {
+                        error!("Failed to close TNL association {}: {e}", address.endpoint);
+                    }
+                    self.amf_contexts.remove(&id);
+                }
+                None => warn!(
+                    "AMF[{client_id}] asked to remove TNL association {}, which this \
+                     gNB never opened on request; ignoring rather than closing \
+                     something else",
+                    address.endpoint
+                ),
+            }
+        }
+
+        for item in &update.tnla_to_add {
+            let endpoint = item.address.endpoint;
+            // Adding the association that carries this message is a no-op the AMF
+            // may legitimately send (it is describing its own pool); reported as
+            // set up, since it demonstrably is.
+            // Already opened on a previous request: report it as set up (it
+            // demonstrably is) rather than opening a second association to the same
+            // endpoint.
+            if self.tnla_client_ids.contains_key(&endpoint) {
+                setup.push(item.address);
+                continue;
+            }
+
+            let new_id = self.next_tnla_client_id();
+            let amf_port = self
+                .task_base
+                .config
+                .amf_configs
+                .first()
+                .map_or(DEFAULT_NGAP_PORT, |a| a.port);
+            let msg = SctpMessage::ConnectionRequest {
+                client_id: new_id,
+                local_address: self.task_base.config.ngap_ip.to_string(),
+                local_port: 0,
+                remote_address: endpoint.to_string(),
+                remote_port: amf_port,
+                ppid: NGAP_PPID,
+            };
+            match self.task_base.sctp_tx.send(msg).await {
+                Ok(()) => {
+                    info!(
+                        "AMF[{client_id}] asked to add TNL association {endpoint} \
+                         (usage={:?}, weight={}); connecting as AMF[{new_id}]",
+                        item.usage, item.weight_factor
+                    );
+                    self.create_amf_context(new_id);
+                    self.tnla_client_ids.insert(endpoint, new_id);
+                    if let Some(ctx) = self.amf_contexts.get_mut(&client_id) {
+                        ctx.on_tnla_established(endpoint);
+                    }
+                    setup.push(item.address);
+                }
+                Err(e) => {
+                    warn!("Cannot add TNL association {endpoint}: {e}");
+                    failed.push(item.address);
+                }
+            }
+        }
+
+        // UPDATE carries only usage and weight, neither of which this gNB acts on:
+        // it has no per-association traffic split to weight and no usage-based
+        // routing. Reported at INFO and NOT acknowledged as a setup, because
+        // acknowledging an update it did not apply is the misreport this issue is
+        // about.
+        for item in &update.tnla_to_update {
+            info!(
+                "AMF[{client_id}] updated TNL association {} (usage={:?}, weight={:?}); \
+                 recorded, not acted on: this gNB has no per-association traffic \
+                 split to weight",
+                item.address.endpoint, item.usage, item.weight_factor
+            );
+        }
+
+        (setup, failed)
     }
 
     // ========================================================================
@@ -3916,6 +4130,24 @@ impl Task for NgapTask {
                     }
                     NgapMessage::RadioLinkFailure { ue_id } => {
                         self.handle_radio_link_failure(ue_id).await;
+                    }
+                    NgapMessage::SendRanConfigurationUpdate { amf_id } => {
+                        // Per-association: RAN CONFIGURATION UPDATE is sent on the
+                        // NG-C interface instance whose configuration it describes,
+                        // so `None` fans out to every Ready AMF rather than picking
+                        // one arbitrarily.
+                        let targets: Vec<i32> = match amf_id {
+                            Some(id) => vec![id],
+                            None => self
+                                .amf_contexts
+                                .values()
+                                .filter(|c| c.is_ready())
+                                .map(|c| c.ctx_id)
+                                .collect(),
+                        };
+                        for id in targets {
+                            self.send_ran_configuration_update(id).await;
+                        }
                     }
                     NgapMessage::PduSessionResourceNotify {
                         ue_id,
@@ -5228,6 +5460,10 @@ mod tests {
                 plmn_identity: [0x00, 0xf1, 0x10],
                 slice_support_list: vec![SNssai { sst: 1, sd: None }],
             }],
+            // No TNLA change: this test is about the GUAMI/PLMN/capacity half.
+            tnla_to_add: Vec::new(),
+            tnla_to_remove: Vec::new(),
+            tnla_to_update: Vec::new(),
         };
         task.handle_amf_configuration_update(1, 0, update).await;
 
@@ -5753,5 +5989,339 @@ mod tests {
         )
         .await;
         assert!(sctp_rx.try_recv().is_err());
+    }
+
+    // ========================================================================
+    // AMF interface management remainder (issue #41)
+    // ========================================================================
+
+    /// #41, criterion 3: an AMF that asked for a traffic reduction must actually
+    /// receive less. The percentage used to be stored and read only in a log line.
+    ///
+    /// The gate is deterministic, so this asserts an EXACT count rather than a
+    /// statistical range — a probabilistic gate would make this test a coin flip.
+    #[test]
+    fn a_traffic_load_reduction_throttles_initial_ue_messages_in_proportion() {
+        let mut ctx = NgapAmfContext::new(1);
+        ctx.on_association_up(1, 4, 4);
+        ctx.state = AmfState::Ready;
+
+        // No overload: everything is admitted.
+        for i in 0..100 {
+            assert!(
+                ctx.admit_initial_ue_message(),
+                "attempt {i} must be admitted with no reduction in force"
+            );
+        }
+
+        // 75% reduction: exactly 25 of the next 100 attempts get through.
+        ctx.on_overload_start();
+        ctx.traffic_load_reduction = Some(75);
+        let admitted = (0..100).filter(|_| ctx.admit_initial_ue_message()).count();
+        assert_eq!(
+            admitted, 25,
+            "a 75% reduction must admit 25 of 100, not 0 and not 100"
+        );
+
+        // 1% reduction admits 99 -- the boundary that a naive "block if reduction
+        // > 0" gate would get wrong by blocking everything.
+        let mut ctx = NgapAmfContext::new(2);
+        ctx.state = AmfState::Ready;
+        ctx.on_overload_start();
+        ctx.traffic_load_reduction = Some(1);
+        assert_eq!(
+            (0..100).filter(|_| ctx.admit_initial_ue_message()).count(),
+            99,
+            "a 1% reduction must barely throttle"
+        );
+
+        // 99% admits 1 -- the other boundary.
+        let mut ctx = NgapAmfContext::new(3);
+        ctx.state = AmfState::Ready;
+        ctx.on_overload_start();
+        ctx.traffic_load_reduction = Some(99);
+        assert_eq!(
+            (0..100).filter(|_| ctx.admit_initial_ue_message()).count(),
+            1,
+            "a 99% reduction must still let one through: the IE is a REDUCTION, \
+             not a bar"
+        );
+    }
+
+    /// OVERLOAD STOP restores full admission and does not leave a partial block
+    /// behind.
+    #[test]
+    fn overload_stop_restores_full_admission() {
+        let mut ctx = NgapAmfContext::new(1);
+        ctx.state = AmfState::Ready;
+        ctx.on_overload_start();
+        ctx.traffic_load_reduction = Some(90);
+        // Consume a few attempts so the credit is mid-cycle.
+        for _ in 0..5 {
+            ctx.admit_initial_ue_message();
+        }
+        ctx.on_overload_stop();
+        ctx.traffic_load_reduction = None;
+        for i in 0..20 {
+            assert!(
+                ctx.admit_initial_ue_message(),
+                "attempt {i} after OVERLOAD STOP must be admitted"
+            );
+        }
+    }
+
+    /// The gate is on the ADMISSION path, not just on the context: an Initial UE
+    /// Message for a new UE must not reach SCTP while the AMF is throttling, and
+    /// no UE context may be created for it either -- creating one and abandoning it
+    /// leaks a RAN UE NGAP ID and a stream for a UE the AMF never heard of.
+    #[tokio::test]
+    async fn a_throttled_initial_ue_message_reaches_neither_sctp_nor_a_ue_context() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+            ctx.on_overload_start();
+            // 100 is out of the wire range (1..99) and means "stop"; the gate
+            // clamps it rather than looping on zero credit.
+            ctx.traffic_load_reduction = Some(100);
+        }
+
+        task.handle_initial_nas_delivery(
+            77,
+            OctetString::from_slice(&[0x7e, 0x00, 0x41]),
+            0,
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        assert!(
+            sctp_rx.try_recv().is_err(),
+            "a fully throttled AMF must receive no Initial UE Message"
+        );
+        assert!(
+            task.find_ue_context(77).is_none(),
+            "no UE context may be created for a UE whose Initial UE Message was \
+             never sent"
+        );
+    }
+
+    /// The positive control for the test above, and it exists because a revert
+    /// round needed it.
+    ///
+    /// Disabling the admission gate left that test GREEN: an `Overloaded` AMF was
+    /// excluded from `select_amf` outright (the old `is_ready()` predicate), so the
+    /// Initial UE Message was blocked for a completely different reason and the
+    /// gate could never run at all. This asserts the SAME overloaded AMF DOES get
+    /// the message when its reduction admits one — so "blocked" above means the
+    /// gate blocked it, not that no AMF was selectable.
+    #[tokio::test]
+    async fn an_overloaded_amf_still_receives_the_messages_its_reduction_admits() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+            ctx.on_overload_start();
+            // 1% reduction: the very first attempt is admitted.
+            ctx.traffic_load_reduction = Some(1);
+        }
+        assert_eq!(
+            task.find_amf_context(1).map(|c| c.state),
+            Some(AmfState::Overloaded),
+            "precondition: the AMF really is overloaded"
+        );
+
+        task.handle_initial_nas_delivery(
+            78,
+            OctetString::from_slice(&[0x7e, 0x00, 0x41]),
+            0,
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        assert!(
+            sctp_rx.try_recv().is_ok(),
+            "an overloaded AMF asking for a 1% reduction must still be SELECTED and \
+             still receive this message; excluding it from selection would apply a \
+             100% reduction whatever it asked for"
+        );
+        assert!(
+            task.find_ue_context(78).is_some(),
+            "and the admitted UE must get its context"
+        );
+    }
+
+    /// #41, criterion 5: a TNL association the AMF asks to ADD is connected, and
+    /// the Acknowledge reports it in `AMF-TNLAssociationSetupList` rather than
+    /// being a bare acknowledge that reads as "nothing to do".
+    #[tokio::test]
+    async fn an_amf_configuration_update_adds_a_tnl_association_and_reports_it() {
+        use nextgsim_ngap::procedures::ng_reset::{
+            parse_amf_configuration_update_acknowledge, AmfConfigurationUpdateData,
+            AmfTnlAssociationAddress, AmfTnlAssociationToAdd, TnlAssociationUsage,
+        };
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 4, 4);
+            ctx.state = AmfState::Ready;
+        }
+
+        let endpoint = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40));
+        let update = AmfConfigurationUpdateData {
+            amf_name: None,
+            served_guami_list: Vec::new(),
+            relative_amf_capacity: None,
+            plmn_support_list: Vec::new(),
+            tnla_to_add: vec![AmfTnlAssociationToAdd {
+                address: AmfTnlAssociationAddress { endpoint },
+                usage: Some(TnlAssociationUsage::Both),
+                weight_factor: 50,
+            }],
+            tnla_to_remove: Vec::new(),
+            tnla_to_update: Vec::new(),
+        };
+        task.handle_amf_configuration_update(1, 0, update).await;
+
+        // A ConnectionRequest to the named endpoint, and then the Acknowledge.
+        let mut connect_seen = false;
+        let mut ack_bytes = None;
+        while let Ok(TaskMessage::Message(msg)) = sctp_rx.try_recv() {
+            match msg {
+                crate::tasks::SctpMessage::ConnectionRequest {
+                    remote_address,
+                    remote_port,
+                    ..
+                } => {
+                    assert_eq!(remote_address, "10.20.30.40");
+                    assert_eq!(remote_port, 38412, "the NGAP SCTP port");
+                    connect_seen = true;
+                }
+                crate::tasks::SctpMessage::SendMessage { buffer, .. } => {
+                    ack_bytes = Some(buffer.data().to_vec());
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            connect_seen,
+            "the gNB must actually open the TNL association the AMF named, not \
+             just record it"
+        );
+
+        let ack = parse_amf_configuration_update_acknowledge(
+            &ack_bytes.expect("an Acknowledge must be sent"),
+        )
+        .expect("the Acknowledge must decode");
+        assert_eq!(
+            ack.tnla_setup,
+            vec![AmfTnlAssociationAddress { endpoint }],
+            "the Acknowledge must report the association it set up; a bare \
+             acknowledge reads as 'nothing to do' and the AMF would then balance \
+             traffic onto an association it was never told about"
+        );
+        assert!(ack.tnla_failed_to_setup.is_empty());
+    }
+
+    /// An AMF asking to remove an association this gNB never established must not
+    /// cause it to close something else -- notably not the association carrying
+    /// the very message.
+    #[tokio::test]
+    async fn removing_an_unknown_tnl_association_closes_nothing() {
+        use nextgsim_ngap::procedures::ng_reset::{
+            AmfConfigurationUpdateData, AmfTnlAssociationAddress,
+        };
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 4, 4);
+            ctx.state = AmfState::Ready;
+        }
+
+        let update = AmfConfigurationUpdateData {
+            amf_name: None,
+            served_guami_list: Vec::new(),
+            relative_amf_capacity: None,
+            plmn_support_list: Vec::new(),
+            tnla_to_add: Vec::new(),
+            tnla_to_remove: vec![AmfTnlAssociationAddress {
+                endpoint: IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+            }],
+            tnla_to_update: Vec::new(),
+        };
+        task.handle_amf_configuration_update(1, 0, update).await;
+
+        let mut closes = 0;
+        while let Ok(TaskMessage::Message(msg)) = sctp_rx.try_recv() {
+            if matches!(msg, crate::tasks::SctpMessage::ConnectionClose { .. }) {
+                closes += 1;
+            }
+        }
+        assert_eq!(
+            closes, 0,
+            "an unknown address must close nothing; the association carrying this \
+             very message is the one that would be torn down"
+        );
+        assert!(
+            task.find_amf_context(1).is_some(),
+            "and the AMF context must survive"
+        );
+    }
+
+    /// #41, criterion 6: RAN CONFIGURATION UPDATE has a real send path, reachable
+    /// from the `NgapMessage` dispatch. It used to carry `#[allow(dead_code)]` with
+    /// no caller at all.
+    #[tokio::test]
+    async fn a_ran_configuration_update_is_sent_from_the_ngap_dispatch() {
+        use nextgsim_ngap::procedures::ran_configuration_update::decode_ran_configuration_update;
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 4, 4);
+            ctx.state = AmfState::Ready;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<TaskMessage<NgapMessage>>(4);
+        tx.send(TaskMessage::Message(
+            NgapMessage::SendRanConfigurationUpdate { amf_id: None },
+        ))
+        .await
+        .expect("queued");
+        tx.send(TaskMessage::Shutdown).await.expect("queued");
+        drop(tx);
+        task.run(rx).await;
+
+        let mut sent = None;
+        while let Ok(TaskMessage::Message(msg)) = sctp_rx.try_recv() {
+            if let crate::tasks::SctpMessage::SendMessage { buffer, .. } = msg {
+                sent = Some(buffer.data().to_vec());
+            }
+        }
+        let bytes = sent.expect("a RAN Configuration Update must reach SCTP");
+        let decoded = decode_ran_configuration_update(&bytes)
+            .expect("and must decode as a RAN Configuration Update");
+        assert_eq!(
+            decoded.ran_node_name.as_deref(),
+            Some("nextgsim-gnb"),
+            "the update must carry this node's identity"
+        );
     }
 }
