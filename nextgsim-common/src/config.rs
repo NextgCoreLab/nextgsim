@@ -212,14 +212,12 @@ pub struct GnbConfig {
     /// Energy saving features enabled (Rel-18)
     #[serde(default)]
     pub energy_saving_enabled: bool,
-    // ========================================================================
-    // Rel-20 6G feature flags
+    // =================================================================    // Rel-20 6G feature flags
     //
     // NOTE: "Rel-20" here is a research label, not a conformance claim — 3GPP
     // Rel-20 (6G) has no frozen stage-3 spec. The flags below gate non-normative
     // prototypes (design informed by TR 22.870 use cases); disabled by default.
-    // ========================================================================
-    /// Service Hosting Environment (SHE) task enabled (Rel-20)
+    // =================================================================    /// Service Hosting Environment (SHE) task enabled (Rel-20)
     #[serde(default)]
     pub she_enabled: bool,
     /// Network Data Analytics Function (NWDAF) task enabled (Rel-20)
@@ -473,10 +471,8 @@ impl Default for SupportedAlgs {
     }
 }
 
-// ============================================================================
-// 6G Post-Quantum Cryptography (PQC) Configuration
-// ============================================================================
-
+// =====================================================================// 6G Post-Quantum Cryptography (PQC) Configuration
+// =====================================================================
 /// Post-quantum Key Encapsulation Mechanism (KEM) algorithm.
 ///
 /// Only algorithms `nextgsim-crypto` actually implements are selectable. The
@@ -727,10 +723,8 @@ pub enum PinRole {
     PinManagement,
 }
 
-// ============================================================================
-// Rel-18 XR (Extended Reality) Configuration (TS 26.928)
-// ============================================================================
-
+// =====================================================================// Rel-18 XR (Extended Reality) Configuration (TS 26.928)
+// =====================================================================
 /// XR traffic type for `QoS` differentiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum XrTrafficType {
@@ -795,10 +789,8 @@ impl Default for XrConfig {
     }
 }
 
-// ============================================================================
-// Rel-18 Ambient IoT Configuration (TS 22.369)
-// ============================================================================
-
+// =====================================================================// Rel-18 Ambient IoT Configuration (TS 22.369)
+// =====================================================================
 /// Ambient `IoT` device type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AmbientIotDeviceType {
@@ -847,10 +839,8 @@ impl Default for AmbientIotConfig {
     }
 }
 
-// ============================================================================
-// Rel-18 UAV (Unmanned Aerial Vehicle) Configuration (TS 23.256)
-// ============================================================================
-
+// =====================================================================// Rel-18 UAV (Unmanned Aerial Vehicle) Configuration (TS 23.256)
+// =====================================================================
 /// UAV UE configuration for aerial vehicle identification and tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UavConfig {
@@ -918,10 +908,8 @@ impl Default for UavConfig {
     }
 }
 
-// ============================================================================
-// Rel-16 V2X (Vehicle-to-Everything) Configuration (TS 23.287)
-// ============================================================================
-
+// =====================================================================// Rel-16 V2X (Vehicle-to-Everything) Configuration (TS 23.287)
+// =====================================================================
 /// V2X service type for differentiated QoS handling.
 ///
 /// Reference: 3GPP TS 23.287 Section 5.2
@@ -1060,10 +1048,8 @@ impl Default for V2xConfig {
     }
 }
 
-// ============================================================================
-// Rel-18 Ranging/Sidelink Positioning (TS 23.586)
-// ============================================================================
-
+// =====================================================================// Rel-18 Ranging/Sidelink Positioning (TS 23.586)
+// =====================================================================
 /// Ranging method for UE-to-UE positioning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RangingMethod {
@@ -1120,10 +1106,8 @@ impl Default for RangingConfig {
     }
 }
 
-// ============================================================================
-// Rel-18 MINT (Multi-IMSI/Multi-USIM) Configuration (TS 23.761)
-// ============================================================================
-
+// =====================================================================// Rel-18 MINT (Multi-IMSI/Multi-USIM) Configuration (TS 23.761)
+// =====================================================================
 /// MINT (Multi-IMSI) configuration for UEs with multiple subscriptions.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MintConfig {
@@ -1183,10 +1167,8 @@ impl MintConfig {
     }
 }
 
-// ============================================================================
-// Rel-18 Enhanced RedCap Configuration (TS 38.300 v18)
-// ============================================================================
-
+// =====================================================================// Rel-18 Enhanced RedCap Configuration (TS 38.300 v18)
+// =====================================================================
 /// Enhanced `RedCap` configuration (Rel-18 extends Rel-17 `RedCap`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedCapR18Config {
@@ -1339,6 +1321,20 @@ pub struct UeConfig {
     /// shows up as paging being dropped rather than as a configuration error.
     #[serde(default = "default_paging_cycle_frames")]
     pub paging_default_cycle_frames: u16,
+    /// OS App Id this UE reports to URSP evaluation, as a UTF-8 string
+    /// (issue #97). `None` means no `OsIdOsAppId` component can match.
+    ///
+    /// A "pretend this app is running" hook, and named as one: the simulator has
+    /// no OS and detects no applications, so an `OsIdOsAppId` traffic descriptor
+    /// can only match something the operator declared. Deriving one from a packet
+    /// would be inventing an application identity.
+    #[serde(default)]
+    pub ursp_os_app_id: Option<String>,
+    /// OS Id this UE reports to URSP evaluation, as a 32-character hex string
+    /// (an RFC 4122 UUID without dashes). `None` means the OS Id is not reported,
+    /// and a component that names one then matches on the App Id alone.
+    #[serde(default)]
+    pub ursp_os_id: Option<String>,
     /// PDU sessions whose DRB uses RLC **Acknowledged Mode** instead of the
     /// default Unacknowledged Mode (TS 38.322 §4.2.1): AM adds STATUS
     /// reporting, selective retransmission and the ARQ timers, at the cost of
@@ -1483,14 +1479,12 @@ pub struct UeConfig {
     /// V2X (Vehicle-to-Everything) configuration (Rel-16, TS 23.287)
     #[serde(default)]
     pub v2x_config: Option<V2xConfig>,
-    // ========================================================================
-    // Rel-20 6G feature flags
+    // =================================================================    // Rel-20 6G feature flags
     //
     // NOTE: "Rel-20" here is a research label, not a conformance claim — 3GPP
     // Rel-20 (6G) has no frozen stage-3 spec. The flags below gate non-normative
     // prototypes (design informed by TR 22.870 use cases); disabled by default.
-    // ========================================================================
-    /// Service Hosting Environment (SHE) client task enabled (Rel-20)
+    // =================================================================    /// Service Hosting Environment (SHE) client task enabled (Rel-20)
     #[serde(default)]
     pub she_enabled: bool,
     /// AI/ML NWDAF reporter task enabled (Rel-20)
@@ -1528,6 +1522,8 @@ impl Default for UeConfig {
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             ursp_evaluation: false,
+            ursp_os_app_id: None,
+            ursp_os_id: None,
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),
@@ -1558,10 +1554,8 @@ impl Default for UeConfig {
     }
 }
 
-// ============================================================================
-// YAML Configuration Parsing
-// ============================================================================
-
+// =====================================================================// YAML Configuration Parsing
+// =====================================================================
 use crate::error::Error;
 use std::fs;
 use std::path::Path;
@@ -2003,6 +1997,8 @@ configured_nssai:
             configured_nssai: NetworkSlice::new(),
             tun_name: Some("tun0".to_string()),
             ursp_evaluation: false,
+            ursp_os_app_id: None,
+            ursp_os_id: None,
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),
@@ -2289,6 +2285,8 @@ configured_nssai:
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
             ursp_evaluation: false,
+            ursp_os_app_id: None,
+            ursp_os_id: None,
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
             eutra_neighbours: Vec::new(),

@@ -392,6 +392,15 @@ pub enum NasMessage {
     /// Triggered when UE has data to send while in CM-IDLE or CM-INACTIVE state.
     /// Sends NAS Service Request message (5GMM type 0x4C) via RRC.
     InitiateServiceRequest {
+        /// Application information classified from the uplink packet that
+        /// triggered this, for URSP evaluation (TS 24.526 §5.2, issue #97).
+        ///
+        /// `None` when the packet could not be classified, or when
+        /// `ursp_evaluation` is off. This is what gives
+        /// `SmOrchestrator::start_establishment_for_app` a production caller: the
+        /// URSP matchers for remote address, protocol and port were correct and
+        /// unreachable, because nothing in the tree ever reported a flow.
+        app: Option<Box<crate::nas::sm::ApplicationDescriptor>>,
         /// PDU session the pending uplink data belongs to, which becomes the
         /// Uplink data status bit the SERVICE REQUEST advertises (TS 24.501
         /// §5.6.1.2, §9.11.3.44). `None` for a trigger that names no session,

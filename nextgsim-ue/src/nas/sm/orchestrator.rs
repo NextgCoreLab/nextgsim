@@ -2271,6 +2271,81 @@ mod tests {
         config
     }
 
+    /// CRITERION 4 (issue #97): a TUN uplink packet whose 5-tuple matches an
+    /// app-keyed URSP rule establishes a session carrying that rule's route.
+    ///
+    /// This is the test the issue said "cannot be written today", and the reason it
+    /// could not was that nothing produced a populated `ApplicationDescriptor`.
+    /// Asserted on the UL NAS TRANSPORT that goes out, not on the internal params:
+    /// the DNN and S-NSSAI ride in the wrapper (TS 24.501 §5.4.5.2.2), so reading
+    /// them off the encoded PDU is what proves the network is asked for the steered
+    /// route.
+    #[test]
+    fn a_classified_uplink_flow_establishes_a_session_carrying_the_rules_route() {
+        use super::super::ursp::ApplicationDescriptor;
+
+        // An operator rule for HTTPS traffic, steered to the "video" DNN on SST 4.
+        let mut orch = new_orch();
+        orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&ursp_config(
+            true, "port:443", "video", 4,
+        )));
+
+        // A real uplink IPv4 + TCP packet to port 443, classified exactly as the
+        // live TUN path classifies it.
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[10, 45, 0, 2]);
+        packet[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        packet[20..22].copy_from_slice(&51_000u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        let app =
+            ApplicationDescriptor::from_uplink_packet(&packet).expect("a classifiable packet");
+
+        let (psi, outs) = orch.start_establishment_for_app(&app, &test_params());
+        assert!(psi.is_some(), "a session must be established for the flow");
+
+        let (transport, _) = unwrap_ul(first_sent_pdu(&outs));
+        assert_eq!(
+            transport.dnn.as_deref(),
+            Some(encode_dnn_value("video").as_slice()),
+            "the session must request the DNN the port-keyed rule selected"
+        );
+        assert_eq!(
+            transport.s_nssai.as_deref(),
+            Some([4u8].as_slice()),
+            "and its S-NSSAI"
+        );
+    }
+
+    /// The counterpart: a flow the rule does not describe is not steered by it, so
+    /// the session carries the configured defaults instead. Without this, the test
+    /// above would pass against an implementation that steered everything.
+    #[test]
+    fn a_flow_that_matches_no_rule_keeps_the_configured_session_parameters() {
+        use super::super::ursp::ApplicationDescriptor;
+
+        let mut orch = new_orch();
+        orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&ursp_config(
+            true, "port:443", "video", 4,
+        )));
+
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[9] = 6;
+        packet[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        packet[22..24].copy_from_slice(&25u16.to_be_bytes()); // SMTP, not 443
+        let app = ApplicationDescriptor::from_uplink_packet(&packet).expect("classifiable");
+
+        let (_, outs) = orch.start_establishment_for_app(&app, &test_params());
+        let (transport, _) = unwrap_ul(first_sent_pdu(&outs));
+        assert_ne!(
+            transport.dnn.as_deref(),
+            Some(encode_dnn_value("video").as_slice()),
+            "a port-25 flow must not be steered by a port-443 rule"
+        );
+    }
+
     /// #47 criterion 2+5: with evaluation ON, a configured URSP rule steers the
     /// established session's DNN and S-NSSAI — asserted on the UL NAS TRANSPORT
     /// that goes out, not on the internal params.
