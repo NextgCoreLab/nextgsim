@@ -329,6 +329,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 - No ISAC measurement reporting
 - No AI/ML-assisted mobility (predictive handover consumption from NWDAF)
 - No sidelink/D2D support
+- Ranging / sidelink positioning (`ranging/`) is a non-wired stub, not spec-compliant: no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF SLPP/RSPP transport, no LMF ranging service (issue #55)
 - No NTN-aware procedures
 - No zero-energy device emulation mode
 
@@ -553,6 +554,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 | Semantic communication | semantic | Basic encoder/decoder prototype | HIGH |
 | Digital twin network | NONE | Not started | HIGH |
 | Zero-energy devices / ambient IoT | ue (ambient_iot) | Prototype exists (energy-harvesting model + fleet simulation), sim-internal only | MEDIUM |
+| Ranging / sidelink positioning (TS 23.586) | ue (ranging, sidelink) | Non-wired stub, not spec-compliant: RTT and carrier-phase maths and an LMF report shape exist, but no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF SLPP/RSPP transport and no LMF ranging service, so the measurement pipeline is unreachable end to end (issue #55) | MEDIUM |
 | Joint Communication and Computing (JCC) | NONE | Not started | HIGH |
 | Enhanced network slicing (6G) | agent (SliceCreate/Modify intents) | Intent types defined, no implementation | HIGH |
 | Federated learning | fl | FedAvg prototype with basic DP | MEDIUM |
