@@ -455,6 +455,9 @@ mod tests {
     /// Source-PCell AS security context used to derive the resumeMAC-I.
     fn test_sec_ctx() -> AsSecurityContext {
         AsSecurityContext {
+            // A KgNB distinct from the keys derived from it, so a test cannot pass by
+            // chaining a handover from the wrong field.
+            kgnb: [0x5A; 32],
             k_rrc_int: [
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
                 0x0E, 0x0F,

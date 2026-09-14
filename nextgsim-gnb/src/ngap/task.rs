@@ -21,9 +21,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
-    AppMessage, GnbTaskBase, GtpMessage, GtpUeContextUpdate, NgapMessage, PduSessionResource,
-    RrcMessage, SctpMessage, StatusType, StatusUpdate, Task, TaskMessage, UeReleaseRequestCause,
-    NGAP_PPID,
+    AppMessage, GnbTaskBase, GtpMessage, GtpUeContextUpdate, HandoverInitiation, NgapMessage,
+    PduSessionResource, RrcMessage, SctpMessage, StatusType, StatusUpdate, Task, TaskMessage,
+    UeReleaseRequestCause, NGAP_PPID,
 };
 use nextgsim_common::OctetString;
 
@@ -32,6 +32,9 @@ use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, 
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
 use super::up_security::{self, DrbSecurityDecision, UpSecurityRefusal};
 use crate::rrc::transaction::RrcProcedure;
+use nextgsim_rrc::procedures::handover_preparation::{
+    encode_handover_preparation_information, HandoverPreparationParams,
+};
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
     build_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
 };
@@ -56,11 +59,13 @@ use nextgsim_ngap::procedures::error_indication::{
 use nextgsim_ngap::procedures::handover::{
     decode_handover_command, decode_handover_preparation_failure, decode_handover_request,
     encode_handover_cancel, encode_handover_notify, encode_handover_request_acknowledge,
-    encode_handover_required, HandoverCancelParams, HandoverCause, HandoverCommandData,
-    HandoverNotifyParams, HandoverPreparationFailureData, HandoverRequestAcknowledgeParams,
-    HandoverRequestData, HandoverRequiredParams, HandoverTypeValue,
+    encode_handover_required, encode_source_to_target_container, HandoverCancelParams,
+    HandoverCause, HandoverCommandData, HandoverNotifyParams, HandoverPreparationFailureData,
+    HandoverRequestAcknowledgeParams, HandoverRequestData, HandoverRequestSetupItem,
+    HandoverRequiredParams, HandoverSecurityContext, HandoverTypeValue,
     NrCgiValue as HandoverNrCgiValue, PduSessionResourceAdmittedItem,
-    PduSessionResourceHoRequiredItem, TaiValue, TargetIdValue,
+    PduSessionResourceFailedToSetupHoAckItem, PduSessionResourceHoRequiredItem,
+    SourceToTargetContainerParams, TaiValue, TargetIdValue,
     UserLocationInfoNr as HandoverUserLocationInfoNr,
 };
 use nextgsim_ngap::procedures::initial_context_setup::{
@@ -121,10 +126,11 @@ use nextgsim_ngap::procedures::ran_configuration_update::{
 };
 use nextgsim_ngap::procedures::transfer::{
     decode_modify_request_transfer, decode_release_command_transfer, decode_setup_request_transfer,
+    encode_handover_ack_transfer, encode_handover_required_transfer,
     encode_modify_response_transfer, encode_modify_unsuccessful_transfer,
     encode_release_response_transfer, encode_setup_response_transfer,
-    encode_setup_unsuccessful_transfer, GtpTunnelInfo, ModifyResponseTransferParams,
-    SetupResponseTransferParams, UpSecurityPolicy,
+    encode_setup_unsuccessful_transfer, GtpTunnelInfo, HandoverAckTransferParams,
+    ModifyResponseTransferParams, SetupResponseTransferParams, UpSecurityPolicy, UpSecurityResult,
 };
 use nextgsim_ngap::procedures::ue_context_modification::{
     decode_ue_context_modification_request, encode_ue_context_modification_failure,
@@ -828,20 +834,13 @@ impl NgapTask {
         kgnb: [u8; 32],
         caps: &nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue,
     ) {
-        use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
-
         let ((ciph_id, ciph_alg), (int_id, int_alg)) = Self::select_as_algorithms(caps);
 
-        // Derive the four AS keys from KgNB (TS 33.501 Annex A.8, FC=0x69).
-        let sec_ctx = AsSecurityContext {
-            kgnb,
-            k_rrc_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcEnc, ciph_id),
-            k_rrc_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, int_id),
-            k_up_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpEnc, ciph_id),
-            k_up_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::UpInt, int_id),
-            ciphering_alg_id: ciph_id,
-            integrity_alg_id: int_id,
-        };
+        // Derive the four AS keys from KgNB (TS 33.501 Annex A.8). Shared with the
+        // handover re-keying path (issue #39), so a re-keyed UE's four keys come from the
+        // same four calls the initial activation made.
+        let sec_ctx = AsSecurityContext::from_kgnb(kgnb, ciph_id, int_id);
+        let (srb_k_int, srb_k_enc) = (sec_ctx.k_rrc_int, sec_ctx.k_rrc_enc);
         // Wave-6 C4-final: allocate the SecurityModeCommand tid from THIS UE's
         // per-context allocator (TS 38.331 §5.3.4 / §6.3.2). Pinned to 0 on the
         // wire while C5_TYPED_DCCH_DISPATCH is off (the UE DL-DCCH dispatcher is
@@ -887,15 +886,15 @@ impl NgapTask {
         // context lives here. Hand it the subset it needs (issue #37).
         //
         // NCC 0 is the spec's own initial value, not a placeholder: TS 33.501
-        // §6.8.2.1.1 gives the KgNB established at Initial Context Setup an NCC of
-        // 0, and a fresh {NH, NCC} pair only arrives in a Path Switch Request
-        // Acknowledge — a path that is not wired (issue #39).
+        // §6.8.2.1.1 gives the KgNB established at Initial Context Setup an NCC of 0. A
+        // fresh {NH, NCC} pair arrives in a Handover Request or a Path Switch Request
+        // Acknowledge, which issue #39 wired.
         let reestablishment_security = RrcMessage::AsSecurityForReestablishment {
             ue_id,
-            k_rrc_int: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcInt, int_id),
+            k_rrc_int: srb_k_int,
             // K_RRCenc too (issue #31): the RRC plane sends and receives SRB1
             // PDUs, so it is the plane that has to cipher them.
-            k_rrc_enc: derive_rrc_up_key(&kgnb, AlgorithmTypeDistinguisher::RrcEnc, ciph_id),
+            k_rrc_enc: srb_k_enc,
             integrity_alg_id: int_id,
             ciphering_alg_id: ciph_id,
             c_rnti: SIMULATED_C_RNTI,
@@ -1415,6 +1414,37 @@ impl NgapTask {
         }
     }
 
+    /// Key the DRB's PDCP entity and send the RRCReconfiguration that establishes it.
+    ///
+    /// Shared by the PDU Session Resource Setup path and the handover-in admission path
+    /// (issue #39): a handover-in *is* a session setup whose QoS, tunnel and security
+    /// policy arrived by a different route, so it must allocate the same way. Two copies
+    /// of this is how a handover comes to establish a DRB the gNB cannot decipher.
+    ///
+    /// Keys before the reconfiguration, deliberately: the RRCReconfiguration tells the
+    /// UE to start protecting, so the gNB's own entity has to be able to verify by the
+    /// time the UE's first protected uplink PDU arrives.
+    async fn key_and_establish_drb(
+        &mut self,
+        ue_id: i32,
+        psi: u8,
+        accepted_qfis: &[u8],
+        decision: DrbSecurityDecision,
+    ) {
+        self.install_drb_security(ue_id, psi, decision).await;
+        self.establish_drb(
+            ue_id,
+            psi,
+            accepted_qfis,
+            if decision.integrity {
+                DrbIntegrityProtection::Enabled
+            } else {
+                DrbIntegrityProtection::Disabled
+            },
+        )
+        .await;
+    }
+
     async fn setup_one_pdu_session(
         &mut self,
         ue_id: i32,
@@ -1542,21 +1572,8 @@ impl NgapTask {
         // TS 38.331 §5.3.5.6: establish the PDU session's user-plane DRB via an
         // RRCReconfiguration carrying the accepted QoS flows (QFIs).
         let accepted_qfis: Vec<u8> = request.qos_flows.iter().map(|f| f.qfi).collect();
-        // Keys before the reconfiguration, deliberately: the RRCReconfiguration tells
-        // the UE to start protecting, so the gNB's own entity has to be able to
-        // verify by the time the UE's first protected uplink PDU arrives.
-        self.install_drb_security(ue_id, psi, decision).await;
-        self.establish_drb(
-            ue_id,
-            psi,
-            &accepted_qfis,
-            if decision.integrity {
-                DrbIntegrityProtection::Enabled
-            } else {
-                DrbIntegrityProtection::Disabled
-            },
-        )
-        .await;
+        self.key_and_establish_drb(ue_id, psi, &accepted_qfis, decision)
+            .await;
 
         // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
         // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
@@ -3427,55 +3444,293 @@ impl NgapTask {
         ho_req: HandoverRequestData,
     ) {
         info!(
-            "Handover Request received (target gNB): amf_ue_ngap_id={}, type={:?}",
-            ho_req.amf_ue_ngap_id, ho_req.handover_type
+            "Handover Request received (target gNB): amf_ue_ngap_id={}, type={:?}, {} requested session(s)",
+            ho_req.amf_ue_ngap_id,
+            ho_req.handover_type,
+            ho_req.pdu_sessions.len()
         );
 
         // Allocate a new UE context for the incoming handover
-        if let Some(ran_ue_ngap_id) = self.create_ue_context(
+        let Some(ran_ue_ngap_id) = self.create_ue_context(
             self.ue_contexts.len() as i32 + 1000, // Handover UE IDs start from 1000
             client_id,
-        ) {
-            // Set AMF UE NGAP ID on the new context
-            let ue_id = self.find_ue_by_ran_id(ran_ue_ngap_id).map(|ctx| ctx.ue_id);
-
-            if let Some(ue_id) = ue_id {
-                if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
-                    ctx.amf_ue_ngap_id = Some(ho_req.amf_ue_ngap_id as i64);
-                }
-            }
-
-            // Build HandoverRequestAcknowledge - admit all PDU sessions
-            let admitted_list = vec![PduSessionResourceAdmittedItem {
-                pdu_session_id: 1,                         // Default PDU session
-                handover_request_ack_transfer: vec![0x00], // Minimal transfer
-            }];
-
-            let target_to_source_container = ho_req.source_to_target_transparent_container.clone();
-
-            match encode_handover_request_acknowledge(&HandoverRequestAcknowledgeParams {
-                amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
-                ran_ue_ngap_id: ran_ue_ngap_id as u32,
-                pdu_session_resource_admitted_list: admitted_list,
-                pdu_session_resource_failed_list: None,
-                target_to_source_transparent_container: target_to_source_container,
-            }) {
-                Ok(data) => {
-                    self.send_ngap_ue_associated(client_id, stream, data).await;
-                    info!(
-                        "Sent Handover Request Acknowledge: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
-                        ho_req.amf_ue_ngap_id, ran_ue_ngap_id
-                    );
-                }
-                Err(e) => {
-                    error!("Failed to encode Handover Request Acknowledge: {}", e);
-                }
-            }
-        } else {
+        ) else {
             error!(
                 "Failed to create UE context for handover, amf_ue_ngap_id={}",
                 ho_req.amf_ue_ngap_id
             );
+            return;
+        };
+        let Some(ue_id) = self.find_ue_by_ran_id(ran_ue_ngap_id).map(|ctx| ctx.ue_id) else {
+            error!("Handover UE context vanished immediately after creation");
+            return;
+        };
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            ctx.amf_ue_ngap_id = Some(ho_req.amf_ue_ngap_id as i64);
+        }
+
+        // TS 33.501 §6.9.2.3.1: derive this target's KgNB* BEFORE admitting any
+        // session, because the admitted DRBs are keyed from it. Doing it after would
+        // hand `install_drb_security` the source's keys, and every PDCP MAC on this
+        // cell would fail with nothing to say why.
+        self.adopt_handover_security_context(ue_id, ho_req.security_context);
+
+        // Admit the requested sessions -- each one allocating a real DL F-TEID, a GTP-U
+        // tunnel and a DRB through the SAME path a PDU Session Resource Setup uses
+        // (TS 38.413 §8.4.2.2: "shall attempt to execute the requested PDU session
+        // configuration and associated security"). Before this the gNB admitted a
+        // hardcoded session 1 with a `vec![0x00]` transfer and allocated nothing.
+        let gnb_ip = self
+            .task_base
+            .config
+            .gtp_advertise_ip
+            .unwrap_or(self.task_base.config.gtp_ip);
+        let mut admitted_list = Vec::new();
+        let mut failed_list = Vec::new();
+        for session in &ho_req.pdu_sessions {
+            match self
+                .admit_one_handover_session(ue_id, session, gnb_ip)
+                .await
+            {
+                Ok(item) => admitted_list.push(item),
+                Err(item) => failed_list.push(item),
+            }
+        }
+        if admitted_list.is_empty() && !ho_req.pdu_sessions.is_empty() {
+            warn!(
+                "Handover for amf_ue_ngap_id={}: no requested session could be admitted",
+                ho_req.amf_ue_ngap_id
+            );
+        }
+
+        let target_to_source_container = ho_req.source_to_target_transparent_container.clone();
+
+        match encode_handover_request_acknowledge(&HandoverRequestAcknowledgeParams {
+            amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
+            ran_ue_ngap_id: ran_ue_ngap_id as u32,
+            pdu_session_resource_admitted_list: admitted_list,
+            pdu_session_resource_failed_list: if failed_list.is_empty() {
+                None
+            } else {
+                Some(failed_list)
+            },
+            target_to_source_transparent_container: target_to_source_container,
+        }) {
+            Ok(data) => {
+                self.send_ngap_ue_associated(client_id, stream, data).await;
+                info!(
+                    "Sent Handover Request Acknowledge: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
+                    ho_req.amf_ue_ngap_id, ran_ue_ngap_id
+                );
+            }
+            Err(e) => {
+                error!("Failed to encode Handover Request Acknowledge: {}", e);
+            }
+        }
+    }
+
+    /// Admit one PDU session on a handover-in, allocating the same resources a PDU
+    /// Session Resource Setup would (TS 38.413 §8.4.2.2, issue #39).
+    ///
+    /// The `handoverRequestTransfer` **contains** a
+    /// `PDUSessionResourceSetupRequestTransfer`, so this decodes it with the same
+    /// function and resolves the same user-plane security policy — including the
+    /// `SecurityIndication` (issue #32). A handover-in that took a different path would
+    /// be a second place for the QoS, tunnel and security decisions to be made
+    /// differently.
+    async fn admit_one_handover_session(
+        &mut self,
+        ue_id: i32,
+        session: &HandoverRequestSetupItem,
+        gnb_ip: std::net::IpAddr,
+    ) -> Result<PduSessionResourceAdmittedItem, PduSessionResourceFailedToSetupHoAckItem> {
+        let psi = session.pdu_session_id;
+        let failed =
+            |cause: NgSetupFailureCause| PduSessionResourceFailedToSetupHoAckItem {
+                pdu_session_id: psi,
+                handover_resource_allocation_unsuccessful_transfer:
+                    encode_setup_unsuccessful_transfer(&cause).unwrap_or_default(),
+            };
+
+        let request = match decode_setup_request_transfer(&session.transfer) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Handover session {psi}: undecodable handoverRequestTransfer: {e}");
+                return Err(failed(NgSetupFailureCause::Protocol(
+                    ProtocolCause::TransferSyntaxError,
+                )));
+            }
+        };
+
+        let (policy, decision) =
+            match self.resolve_up_security(ue_id, psi, request.security_indication) {
+                Ok(resolved) => resolved,
+                Err(refusal) => {
+                    warn!("Handover session {psi} refused: {refusal}");
+                    return Err(failed(NgSetupFailureCause::RadioNetwork(match refusal {
+                        UpSecurityRefusal::IntegrityNotPossible => {
+                            RadioNetworkCause::UpIntegrityProtectionNotPossible
+                        }
+                        UpSecurityRefusal::ConfidentialityNotPossible => {
+                            RadioNetworkCause::UpConfidentialityProtectionNotPossible
+                        }
+                    })));
+                }
+            };
+
+        let upf_teid = request.ul_tunnel.teid;
+        let upf_addr = request.ul_tunnel.address;
+        let qfi = request.qos_flows[0].qfi;
+        let gnb_teid = self.next_downlink_teid();
+
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            ctx.add_pdu_session(NgapPduSession {
+                psi,
+                qfi: Some(qfi),
+                uplink_teid: gnb_teid,
+                downlink_teid: upf_teid,
+                upf_address: upf_addr,
+                up_security_policy: policy,
+                up_security: decision,
+            });
+        }
+
+        let resource = PduSessionResource {
+            psi: psi as i32,
+            qfi: Some(qfi),
+            uplink_teid: upf_teid,
+            downlink_teid: gnb_teid,
+            upf_address: upf_addr,
+        };
+        if let Err(e) = self
+            .task_base
+            .gtp_tx
+            .send(GtpMessage::SessionCreate { ue_id, resource })
+            .await
+        {
+            error!("Handover session {psi}: failed to create the GTP session: {e}");
+            if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+                ctx.remove_pdu_session(psi);
+            }
+            return Err(failed(NgSetupFailureCause::RadioNetwork(
+                RadioNetworkCause::RadioResourcesNotAvailable,
+            )));
+        }
+
+        let accepted_qfis: Vec<u8> = request.qos_flows.iter().map(|f| f.qfi).collect();
+        self.key_and_establish_drb(ue_id, psi, &accepted_qfis, decision)
+            .await;
+
+        let transfer = match encode_handover_ack_transfer(&HandoverAckTransferParams {
+            dl_tunnel: GtpTunnelInfo {
+                address: gnb_ip,
+                teid: gnb_teid,
+            },
+            admitted_qfis: accepted_qfis.clone(),
+            failed_qos_flows: vec![],
+            // What this target ACTUALLY applied, not what was asked for -- the AMF has
+            // to learn whether the new serving node honoured the policy (issue #32).
+            security_result: decision.any().then_some(UpSecurityResult {
+                integrity_performed: decision.integrity,
+                confidentiality_performed: decision.ciphering,
+            }),
+        }) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Handover session {psi}: failed to encode the ack transfer: {e}");
+                return Err(failed(NgSetupFailureCause::Misc(
+                    nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
+                )));
+            }
+        };
+        info!(
+            "Handover session {psi} admitted: gNB TEID=0x{gnb_teid:08x}, QFIs={accepted_qfis:?}, \
+             integrity={} ciphering={}",
+            decision.integrity, decision.ciphering
+        );
+        Ok(PduSessionResourceAdmittedItem {
+            pdu_session_id: psi,
+            handover_request_ack_transfer: transfer,
+        })
+    }
+
+    /// Adopt the AMF-supplied `{NH, NCC}` and derive this target's `KgNB*`
+    /// (TS 33.501 §6.9.2.3.1, Annex A.11; issue #39).
+    ///
+    /// Vertical when the AMF sent a context, horizontal from the UE's current `KgNB`
+    /// when it did not — and the log says which, because only the vertical case gives
+    /// forward security against a compromised source gNB, and a silent fallback would
+    /// lose that with nothing to show.
+    ///
+    /// With neither a context nor an existing `KgNB` there is nothing to chain from, and
+    /// this says so rather than deriving from zeros: a `KgNB*` built on an invented key
+    /// would make every DRB on this cell fail its MAC with no indication that a key was
+    /// the problem.
+    fn adopt_handover_security_context(
+        &mut self,
+        ue_id: i32,
+        context: Option<HandoverSecurityContext>,
+    ) {
+        use nextgsim_crypto::kdf::{derive_kgnb_star, KgnbStarChaining};
+
+        let target_pci = phys_cell_id_from_nci(self.task_base.config.nci);
+        let target_arfcn = self.task_base.config.dl_arfcn;
+        let existing = self
+            .ue_contexts
+            .values()
+            .find(|c| c.ue_id == ue_id)
+            .and_then(|c| c.as_security.as_ref())
+            .map(|s| s.kgnb);
+
+        let (chaining, source_key) = match (context, existing) {
+            (Some(ctx), _) => {
+                info!("Handover for UE {ue_id}: adopting {ctx}");
+                (KgnbStarChaining::Vertical, ctx.next_hop_nh)
+            }
+            (None, Some(kgnb)) => (KgnbStarChaining::Horizontal, kgnb),
+            (None, None) => {
+                warn!(
+                    "Handover for UE {ue_id}: the AMF sent no SecurityContext and this \
+                     target holds no KgNB, so no KgNB* can be derived. The admitted DRBs \
+                     will be unprotected."
+                );
+                return;
+            }
+        };
+
+        let kgnb_star = derive_kgnb_star(&source_key, target_pci, target_arfcn);
+        info!(
+            "Handover for UE {ue_id}: derived KgNB* {chaining:?} for PCI {target_pci}, \
+             ARFCN-DL {target_arfcn}"
+        );
+        if chaining == KgnbStarChaining::Horizontal {
+            warn!(
+                "Handover for UE {ue_id}: KgNB* derived HORIZONTALLY -- the source gNB \
+                 can compute this key, so forward security is not provided \
+                 (TS 33.501 §6.9.2.3.1)"
+            );
+        }
+
+        // Re-derive the AS keys from KgNB* and install them, which is what makes the
+        // adoption real rather than a log line: the RRC and UP keys the target protects
+        // with all hang off this KgNB.
+        let ((ciph_id, _), (int_id, _)) = match self
+            .ue_contexts
+            .values()
+            .find(|c| c.ue_id == ue_id)
+            .and_then(|c| c.as_security.as_ref())
+        {
+            // Keep the algorithms the UE already negotiated: a handover re-keys, it does
+            // not renegotiate (TS 33.501 §6.9.2.3.1).
+            Some(sec) => ((sec.ciphering_alg_id, ()), (sec.integrity_alg_id, ())),
+            // A fresh handover-in with no prior context: the algorithms come with the
+            // UE Security Capabilities in a later Initial Context Setup, so NEA0/NIA0
+            // until then rather than a guess.
+            None => ((0u8, ()), (0u8, ())),
+        };
+        let derived = AsSecurityContext::from_kgnb(kgnb_star, ciph_id, int_id);
+        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
+            ctx.as_security = Some(derived);
         }
     }
 
@@ -3505,85 +3760,130 @@ impl NgapTask {
         }
     }
 
-    /// Initiates a handover by sending `HandoverRequired` to AMF (source gNB side)
-    /// Called when measurement reports indicate better target cell
-    #[allow(dead_code)]
-    async fn initiate_handover(&mut self, ue_id: i32, target_gnb_id: u32, target_tac: u32) {
-        let ctx = match self.ue_contexts.get(&ue_id) {
-            Some(c) => c,
-            None => {
-                warn!("Cannot initiate handover for unknown UE[{}]", ue_id);
-                return;
-            }
+    /// Initiates a handover by sending HANDOVER REQUIRED to the AMF (source gNB side,
+    /// TS 38.413 §8.4.1.1).
+    ///
+    /// Reachable since issue #39: `NgapMessage::InitiateHandover` is what drives it, from
+    /// the RRC plane's measurement-report and NWDAF paths. Before this it carried
+    /// `#[allow(dead_code)]` and no caller.
+    ///
+    /// Returns `false` when nothing was sent, so a caller can report a handover that did
+    /// not start rather than logging one that did.
+    async fn initiate_handover(&mut self, request: HandoverInitiation) -> bool {
+        let ue_id = request.ue_id;
+        let Some(ctx) = self.ue_contexts.values().find(|c| c.ue_id == ue_id) else {
+            warn!("Cannot initiate handover for unknown UE[{ue_id}]");
+            return false;
         };
-
-        let amf_ue_ngap_id = match ctx.amf_ue_ngap_id {
-            Some(id) => id as u64,
-            None => {
-                warn!("UE[{}] has no AMF UE NGAP ID, cannot handover", ue_id);
-                return;
-            }
+        let Some(amf_ue_ngap_id) = ctx.amf_ue_ngap_id.map(|id| id as u64) else {
+            warn!("UE[{ue_id}] has no AMF UE NGAP ID, cannot hand over");
+            return false;
         };
+        let (amf_ctx_id, ran_ue_ngap_id) = (ctx.amf_ctx_id, ctx.ran_ue_ngap_id as u32);
 
         let config = &self.task_base.config;
         let plmn_bytes = config.plmn.encode();
-
         let target_tac_bytes = [
-            ((target_tac >> 16) & 0xFF) as u8,
-            ((target_tac >> 8) & 0xFF) as u8,
-            (target_tac & 0xFF) as u8,
+            ((request.target_tac >> 16) & 0xFF) as u8,
+            ((request.target_tac >> 8) & 0xFF) as u8,
+            (request.target_tac & 0xFF) as u8,
         ];
 
-        // Build source-to-target transparent container (simplified)
-        let source_container = vec![
-            0x00, // Placeholder - real implementation would include
-                 // RRC container with UE capabilities and measurement data
-        ];
+        // A real source-to-target transparent container (TS 38.413 §9.3.1.20): the UE's
+        // own capabilities in an RRC `HandoverPreparationInformation`, the cell the
+        // source means as the target, and where the UE has been. The `vec![0x00]` this
+        // replaces told the target nothing at all.
+        let rrc_container =
+            match encode_handover_preparation_information(&HandoverPreparationParams {
+                nr_capability: request.ue_nr_capability.clone(),
+            }) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("UE[{ue_id}]: cannot build the HandoverPreparationInformation: {e}");
+                    return false;
+                }
+            };
+        let source_container =
+            match encode_source_to_target_container(&SourceToTargetContainerParams {
+                rrc_container,
+                target_cell: HandoverNrCgiValue {
+                    plmn_identity: plmn_bytes,
+                    nr_cell_identity: request.target_cell_identity,
+                },
+                source_cell: HandoverNrCgiValue {
+                    plmn_identity: plmn_bytes,
+                    nr_cell_identity: config.nci & 0xF_FFFF_FFFF,
+                },
+                time_in_source_cell_s: request.time_in_source_cell_s,
+            }) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("UE[{ue_id}]: cannot build the source-to-target container: {e}");
+                    return false;
+                }
+            };
 
-        // Collect PDU sessions for handover
-        let pdu_sessions: Vec<PduSessionResourceHoRequiredItem> = ctx
-            .pdu_sessions
+        // Every session the UE actually has. An empty list means the UE has no user
+        // plane to move, which is a real state -- the placeholder "default entry" this
+        // replaces asked the target to admit a session that did not exist.
+        let pdu_sessions: Vec<PduSessionResourceHoRequiredItem> = self
+            .ue_contexts
             .values()
-            .map(|sess| PduSessionResourceHoRequiredItem {
-                pdu_session_id: sess.psi,
-                handover_required_transfer: vec![0x00], // Minimal transfer
+            .find(|c| c.ue_id == ue_id)
+            .map(|ctx| {
+                ctx.pdu_sessions
+                    .values()
+                    .map(|sess| PduSessionResourceHoRequiredItem {
+                        pdu_session_id: sess.psi,
+                        // TS 38.413 §9.3.4.12: the transfer's only member is
+                        // `directForwardingPathAvailability`, and this gNB forwards
+                        // nothing during a handover -- so an all-absent transfer is the
+                        // truthful encoding, not a placeholder.
+                        handover_required_transfer: encode_handover_required_transfer(false)
+                            .unwrap_or_default(),
+                    })
+                    .collect()
             })
-            .collect();
-
+            .unwrap_or_default();
         if pdu_sessions.is_empty() {
-            // Add at least a default entry
-            let pdu_sessions = vec![PduSessionResourceHoRequiredItem {
-                pdu_session_id: 1,
-                handover_required_transfer: vec![0x00],
-            }];
-
-            self.send_handover_required(
-                ctx.amf_ctx_id,
-                amf_ue_ngap_id,
-                ctx.ran_ue_ngap_id as u32,
-                &plmn_bytes,
-                target_gnb_id,
-                &target_tac_bytes,
-                &source_container,
-                &pdu_sessions,
-            )
-            .await;
-        } else {
-            self.send_handover_required(
-                ctx.amf_ctx_id,
-                amf_ue_ngap_id,
-                ctx.ran_ue_ngap_id as u32,
-                &plmn_bytes,
-                target_gnb_id,
-                &target_tac_bytes,
-                &source_container,
-                &pdu_sessions,
-            )
-            .await;
+            // `PDUSessionResourceListHORqd` is `SIZE(1..maxnoofPDUSessions)`, so an empty
+            // list is not encodable at all -- and refusing is the honest answer anyway: a
+            // UE with no PDU session has no user plane to move, and the old code's "add at
+            // least a default entry" asked the target to admit a session that did not
+            // exist.
+            //
+            // Found by a test: the encoder failed silently and `initiate_handover` still
+            // reported success, which is precisely the no-op-that-logs-success this issue
+            // is about.
+            warn!(
+                "UE[{ue_id}] has no PDU session, so there is nothing to hand over; \
+                 refusing rather than sending an unencodable HANDOVER REQUIRED"
+            );
+            return false;
         }
+
+        info!(
+            "Initiating handover for UE[{ue_id}] to gNB {} cell {:#x} ({} session(s))",
+            request.target_gnb_id,
+            request.target_cell_identity,
+            pdu_sessions.len()
+        );
+        self.send_handover_required(
+            amf_ctx_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            &plmn_bytes,
+            request.target_gnb_id,
+            &target_tac_bytes,
+            &source_container,
+            &pdu_sessions,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Returns whether the message actually reached the wire, so a caller cannot report
+    /// a handover that never started (issue #39).
     async fn send_handover_required(
         &mut self,
         amf_client_id: i32,
@@ -3594,7 +3894,7 @@ impl NgapTask {
         target_tac_bytes: &[u8; 3],
         source_container: &[u8],
         pdu_sessions: &[PduSessionResourceHoRequiredItem],
-    ) {
+    ) -> bool {
         let params = HandoverRequiredParams {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -3614,7 +3914,7 @@ impl NgapTask {
             source_to_target_transparent_container: source_container.to_vec(),
         };
 
-        match encode_handover_required(&params) {
+        let sent = match encode_handover_required(&params) {
             Ok(data) => {
                 self.send_ngap_ue_associated(amf_client_id, 1, data).await;
                 info!(
@@ -3634,16 +3934,18 @@ impl NgapTask {
                         GuardTimer::HandoverPreparation { ue_id },
                     );
                 }
+                true
             }
             Err(e) => {
                 error!("Failed to encode Handover Required: {}", e);
+                false
             }
-        }
+        };
+        sent
     }
 
     /// Sends Handover Notify to AMF (target gNB side)
     /// Called after UE has completed handover to target cell
-    #[allow(dead_code)]
     async fn send_handover_notify(
         &self,
         amf_client_id: i32,
@@ -3696,7 +3998,6 @@ impl NgapTask {
     /// Requests the 5GC to switch the DL GTP-U termination point to this gNB
     /// for all PDU sessions of the given UE. The per-session
     /// `PathSwitchRequestTransfer` carries the real DL F-TEID allocated here.
-    #[allow(dead_code)]
     async fn send_path_switch_request(&mut self, ue_id: i32, source_amf_ue_ngap_id: u64) {
         let gnb_ip = self
             .task_base
@@ -3775,8 +4076,15 @@ impl NgapTask {
 
     /// Handles Path Switch Request Acknowledge from AMF.
     ///
-    /// Switches the UL GTP-U tunnels to the (possibly new) UPF endpoints and
-    /// adopts the fresh NH security context.
+    /// Switches the UL GTP-U tunnels to the (possibly new) UPF endpoints, re-resolves
+    /// each session's user-plane security policy (issue #32), and **adopts the fresh
+    /// `{NH, NCC}`** by deriving this node's `KgNB*` from it (TS 33.501 §6.9.2.3.1,
+    /// issue #39).
+    ///
+    /// That last clause used to be in this comment and not in the code — the body
+    /// performed no key adoption at all. It does now, through the same
+    /// `adopt_handover_security_context` the HANDOVER REQUEST path uses, so a path switch
+    /// and an N2 handover cannot chain differently.
     async fn handle_path_switch_request_acknowledge(
         &mut self,
         _client_id: i32,
@@ -3806,6 +4114,18 @@ impl NgapTask {
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
             ctx.amf_ue_ngap_id = Some(ack.amf_ue_ngap_id as i64);
         }
+
+        // Adopt the fresh {NH, NCC} the AMF sent and re-key from it (TS 33.501
+        // §6.9.2.3.1, issue #39). The same function the HANDOVER REQUEST path uses, so a
+        // path switch and an N2 handover cannot chain differently -- and this is what the
+        // doc comment above used to claim while the body did nothing.
+        self.adopt_handover_security_context(
+            ue_id,
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: ack.next_hop_chaining_count,
+                next_hop_nh: ack.next_hop_nh,
+            }),
+        );
 
         // Update UL tunnels for switched sessions and notify the GTP task
         for session in &ack.switched_sessions {
@@ -4353,6 +4673,49 @@ impl Task for NgapTask {
                     }
                     NgapMessage::RadioLinkFailure { ue_id } => {
                         self.handle_radio_link_failure(ue_id).await;
+                    }
+                    NgapMessage::InitiateHandover(request) => {
+                        // The production caller `initiate_handover` never had (issue #39).
+                        if !self.initiate_handover(*request).await {
+                            // Reported rather than swallowed: a handover that did not
+                            // start must not look like one that did, which is the
+                            // no-op-that-logs-success failure this issue is about.
+                            warn!("Handover initiation did not send a HANDOVER REQUIRED");
+                        }
+                    }
+                    NgapMessage::HandoverAccessCompleted { ue_id } => {
+                        // TS 38.413 §8.4.3: the target tells the AMF the UE has arrived,
+                        // which is what makes the AMF switch the user plane. The
+                        // production caller `send_handover_notify` never had.
+                        let target = self
+                            .ue_contexts
+                            .values()
+                            .find(|c| c.ue_id == ue_id)
+                            .map(|c| (c.amf_ctx_id, c.amf_ue_ngap_id, c.ran_ue_ngap_id as u32));
+                        match target {
+                            Some((amf_ctx_id, Some(amf_ue_ngap_id), ran_ue_ngap_id)) => {
+                                self.send_handover_notify(
+                                    amf_ctx_id,
+                                    amf_ue_ngap_id as u64,
+                                    ran_ue_ngap_id,
+                                )
+                                .await;
+                            }
+                            Some((_, None, _)) => warn!(
+                                "UE[{ue_id}] arrived on this cell but has no AMF UE NGAP ID, \
+                                 so no HANDOVER NOTIFY can be sent"
+                            ),
+                            None => warn!("Handover access completed for unknown UE[{ue_id}]"),
+                        }
+                    }
+                    NgapMessage::SendPathSwitchRequest {
+                        ue_id,
+                        source_amf_ue_ngap_id,
+                    } => {
+                        // TS 38.413 §8.4.4, the Xn counterpart. The production caller
+                        // `send_path_switch_request` never had.
+                        self.send_path_switch_request(ue_id, source_amf_ue_ngap_id)
+                            .await;
                     }
                     NgapMessage::SendRanConfigurationUpdate { amf_id } => {
                         // Per-association: RAN CONFIGURATION UPDATE is sent on the
@@ -5781,6 +6144,416 @@ mod tests {
             ctx.amf_ue_ngap_id = Some(4242);
         }
         (task, sctp_rx)
+    }
+
+    // ========================================================================
+    // Inter-gNB handover (issue #39)
+    // ========================================================================
+
+    /// A task with every receiver alive, including the SCTP one the handover tests read.
+    ///
+    /// Separate from `task_with_live_receivers` rather than replacing it: that helper's
+    /// four-tuple is destructured by the issue #32 tests, and widening it there would be
+    /// churn for no gain.
+    #[allow(clippy::type_complexity)]
+    fn task_with_sctp(
+        ue_id: i32,
+    ) -> (
+        NgapTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RrcMessage>>,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::GtpMessage>>,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) {
+        let (task_base, _app_rx, _ngap_rx, rrc_rx, gtp_rx, _rls_rx, sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(ue_id, 1).expect("ue context");
+        if let Some(ctx) = task.find_ue_context_mut(ue_id) {
+            ctx.amf_ue_ngap_id = Some(7777);
+        }
+        (task, rrc_rx, gtp_rx, sctp_rx)
+    }
+
+    /// Every NGAP PDU the task put on the SCTP channel.
+    fn drain_sctp(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let TaskMessage::Message(SctpMessage::SendMessage { buffer, .. }) = msg {
+                out.push(buffer.data().to_vec());
+            }
+        }
+        out
+    }
+
+    /// A HANDOVER REQUEST asking this target to admit `psis`, with a security context.
+    fn handover_request(psis: &[u8], security: Option<HandoverSecurityContext>) -> NGAP_PDU {
+        use nextgsim_ngap::procedures::handover::{
+            build_handover_request, HandoverRequestParams, HandoverRequestSetupItem,
+        };
+        use nextgsim_ngap::procedures::pdu_session_resource::SnssaiValue;
+        use nextgsim_ngap::procedures::transfer::{
+            encode_setup_request_transfer, QosFlowSetupInfo, SetupRequestTransferData,
+        };
+        let pdu_sessions = psis
+            .iter()
+            .map(|&psi| HandoverRequestSetupItem {
+                pdu_session_id: psi,
+                s_nssai: SnssaiValue { sst: 1, sd: None },
+                transfer: encode_setup_request_transfer(&SetupRequestTransferData {
+                    ambr_dl: Some(1_000_000),
+                    ambr_ul: Some(1_000_000),
+                    ul_tunnel: GtpTunnelInfo {
+                        address: "10.45.0.1".parse().unwrap(),
+                        // A per-session UPF TEID, so a handler that admitted one session
+                        // and reused its tunnel for the rest would be visible.
+                        teid: 0x1000 + u32::from(psi),
+                    },
+                    pdu_session_type: 0,
+                    qos_flows: vec![QosFlowSetupInfo {
+                        qfi: psi,
+                        five_qi: Some(9),
+                        arp_priority_level: 8,
+                    }],
+                    security_indication: None,
+                })
+                .expect("encode the inner transfer"),
+            })
+            .collect();
+        build_handover_request(&HandoverRequestParams {
+            amf_ue_ngap_id: 7777,
+            handover_type: HandoverTypeValue::Intra5gs,
+            cause: HandoverCause::RadioNetwork(RadioNetworkCause::HandoverDesirableForRadioReason),
+            source_to_target_transparent_container: vec![0x11, 0x22],
+            pdu_sessions,
+            security_context: security,
+        })
+        .expect("build the handover request")
+    }
+
+    /// #39, criteria 1 and 2: the target admits **each** requested session, allocating a
+    /// real DL F-TEID and a GTP-U tunnel per session, and answers with a decodable
+    /// Handover Request Acknowledge Transfer — not the hardcoded session 1 with
+    /// `vec![0x00]`.
+    #[tokio::test]
+    async fn the_target_admits_every_requested_session_with_a_real_ack_transfer() {
+        use nextgsim_ngap::procedures::handover::parse_handover_request_acknowledge;
+        use nextgsim_ngap::procedures::transfer::decode_handover_ack_transfer;
+
+        let (mut task, _rrc_rx, mut gtp_rx, mut sctp_rx) = task_with_sctp(1);
+        // Two sessions with different ids, because a handler that admitted the first
+        // twice -- or a hardcoded 1 -- would satisfy a single-session test.
+        let pdu = handover_request(
+            &[5, 6],
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0xA5; 32],
+            }),
+        );
+        let ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
+            .expect("parse the request");
+
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        // The Acknowledge admits both, each with a real transfer naming its own tunnel.
+        let sent = drain_sctp(&mut sctp_rx);
+        let ack = sent
+            .iter()
+            .find_map(|bytes| {
+                nextgsim_ngap::codec::decode_ngap_pdu(bytes)
+                    .ok()
+                    .and_then(|pdu| parse_handover_request_acknowledge(&pdu).ok())
+            })
+            .expect("a Handover Request Acknowledge must be sent");
+        assert_eq!(ack.pdu_session_resource_admitted_list.len(), 2);
+        let mut teids = Vec::new();
+        for item in &ack.pdu_session_resource_admitted_list {
+            assert!(
+                [5u8, 6].contains(&item.pdu_session_id),
+                "admitted {} which was never requested",
+                item.pdu_session_id
+            );
+            let data = decode_handover_ack_transfer(&item.handover_request_ack_transfer)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "session {}'s ack transfer must be a real transfer, not vec![0x00]: {e}",
+                        item.pdu_session_id
+                    )
+                });
+            teids.push(data.dl_tunnel.teid);
+        }
+        assert_eq!(teids.len(), 2);
+        assert_ne!(
+            teids[0], teids[1],
+            "each admitted session needs its OWN DL F-TEID, or the UPF sends both \
+             sessions' downlink to one tunnel"
+        );
+
+        // And GTP was told to create a session for each -- the allocation the old handler
+        // performed for none of them.
+        let mut created: Vec<i32> = Vec::new();
+        while let Ok(msg) = gtp_rx.try_recv() {
+            if let TaskMessage::Message(GtpMessage::SessionCreate { resource, .. }) = msg {
+                created.push(resource.psi);
+            }
+        }
+        created.sort_unstable();
+        assert_eq!(
+            created,
+            vec![5, 6],
+            "a handover-in must allocate a data plane, or the UE arrives with none"
+        );
+    }
+
+    /// #39: the target derives its `KgNB*` from the AMF's `{NH, NCC}` — vertically — and
+    /// the resulting AS keys differ from the source's.
+    #[tokio::test]
+    async fn the_target_re_keys_vertically_from_the_amfs_next_hop() {
+        use nextgsim_crypto::kdf::derive_kgnb_star;
+
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1);
+        let nh = [0xA5u8; 32];
+        let pdu = handover_request(
+            &[5],
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 3,
+                next_hop_nh: nh,
+            }),
+        );
+        let ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).unwrap();
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        // The handover UE is the one with the AMF id from the request.
+        // The handover UE, not the pre-existing one: `handle_handover_request` allocates
+        // ids from 1000 up.
+        let ctx = task
+            .ue_contexts
+            .values()
+            .find(|c| c.ue_id >= 1000)
+            .expect("the handover UE context must exist");
+        let sec = ctx
+            .as_security
+            .as_ref()
+            .expect("the target must hold an AS security context after re-keying");
+
+        let expected_kgnb = derive_kgnb_star(
+            &nh,
+            phys_cell_id_from_nci(test_config().nci),
+            test_config().dl_arfcn,
+        );
+        assert_eq!(
+            sec.kgnb, expected_kgnb,
+            "KgNB* must be derived from the AMF's NH, bound to this cell's PCI and \
+             ARFCN-DL (TS 33.501 Annex A.11)"
+        );
+        assert_ne!(
+            sec.kgnb, nh,
+            "and it must not be the NH used unchanged: that is not a derivation"
+        );
+        // The four AS keys hang off it, which is what makes the adoption real.
+        assert_eq!(
+            sec.k_rrc_int,
+            AsSecurityContext::from_kgnb(expected_kgnb, sec.ciphering_alg_id, sec.integrity_alg_id)
+                .k_rrc_int
+        );
+    }
+
+    /// #39, criterion 3: `NgapMessage::InitiateHandover` drives a HANDOVER REQUIRED whose
+    /// source-to-target container is a real one, carrying the UE's capabilities and the
+    /// target cell — not `vec![0x00]`.
+    #[tokio::test]
+    async fn initiate_handover_sends_a_handover_required_with_a_real_container() {
+        use nextgsim_ngap::procedures::handover::{
+            decode_source_to_target_container, parse_handover_required,
+        };
+        use nextgsim_rrc::procedures::handover_preparation::decode_handover_preparation_information;
+
+        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(3);
+        // A PDU session, because `PDUSessionResourceListHORqd` is `SIZE(1..)` and a UE
+        // with none has no user plane to move.
+        if let Some(ctx) = task.find_ue_context_mut(3) {
+            ctx.add_pdu_session(NgapPduSession {
+                psi: 5,
+                qfi: Some(9),
+                uplink_teid: 1,
+                downlink_teid: 2,
+                upf_address: "10.45.0.1".parse().unwrap(),
+                up_security_policy: UpSecurityPolicy::locally_configured_default(),
+                up_security: DrbSecurityDecision::default(),
+            });
+        }
+        let capability = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        assert!(
+            task.initiate_handover(HandoverInitiation {
+                ue_id: 3,
+                target_gnb_id: 0x99,
+                target_tac: 7,
+                target_cell_identity: 0x0001_2345_6789,
+                ue_nr_capability: Some(capability.clone()),
+                time_in_source_cell_s: 42,
+            })
+            .await,
+            "a connected UE with an AMF id must produce a HANDOVER REQUIRED"
+        );
+
+        let sent = drain_sctp(&mut sctp_rx);
+        let required = sent
+            .iter()
+            .find_map(|bytes| {
+                nextgsim_ngap::codec::decode_ngap_pdu(bytes)
+                    .ok()
+                    .and_then(|pdu| parse_handover_required(&pdu).ok())
+            })
+            .expect("a HANDOVER REQUIRED must be sent");
+
+        let container =
+            decode_source_to_target_container(&required.source_to_target_transparent_container)
+                .expect("the container must be a real one, not vec![0x00]");
+        assert_eq!(
+            container.target_cell.nr_cell_identity, 0x0001_2345_6789,
+            "the target must be told which cell the source meant"
+        );
+        assert_eq!(
+            container.visited_cells.first().map(|c| c.nr_cell_identity),
+            Some(test_config().nci & 0xF_FFFF_FFFF),
+            "and where the UE has been"
+        );
+        assert_eq!(
+            decode_handover_preparation_information(&container.rrc_container)
+                .expect("the RRCContainer must be a real HandoverPreparationInformation")
+                .nr_capability,
+            Some(capability),
+            "the target needs the UE's capabilities before it can configure anything"
+        );
+    }
+
+    /// A UE with **no PDU session** is refused, because
+    /// `PDUSessionResourceListHORqd` is `SIZE(1..maxnoofPDUSessions)` and an empty list is
+    /// not encodable.
+    ///
+    /// Found by a test failing for the wrong reason: the encoder failed silently and
+    /// `initiate_handover` reported success anyway — the no-op-that-logs-success this
+    /// issue is about. The old code went further and invented a "default entry" for
+    /// session 1.
+    #[tokio::test]
+    async fn initiate_handover_refuses_a_ue_with_no_pdu_session() {
+        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(4);
+        assert!(
+            task.find_ue_context(4)
+                .is_some_and(|c| c.pdu_session_count() == 0),
+            "precondition: the UE has no PDU session"
+        );
+        assert!(
+            !task
+                .initiate_handover(HandoverInitiation {
+                    ue_id: 4,
+                    target_gnb_id: 1,
+                    target_tac: 1,
+                    target_cell_identity: 1,
+                    ue_nr_capability: None,
+                    time_in_source_cell_s: 0,
+                })
+                .await,
+            "a UE with no session has nothing to hand over"
+        );
+        assert!(
+            drain_sctp(&mut sctp_rx).is_empty(),
+            "and nothing must go on the wire, least of all an unencodable message"
+        );
+    }
+
+    /// #39, criterion 7: the Path Switch Request Acknowledge adopts the fresh `{NH, NCC}`
+    /// and re-keys from it — which the doc comment used to claim while the body did
+    /// nothing.
+    ///
+    /// A revert round removing the adoption stayed green against the issue #32 policy
+    /// test, because that one is about the user-plane policy and not about keys.
+    #[tokio::test]
+    async fn the_path_switch_acknowledge_re_keys_from_the_fresh_next_hop() {
+        use nextgsim_crypto::kdf::derive_kgnb_star;
+        use nextgsim_ngap::procedures::path_switch::SwitchedSessionItem;
+
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1);
+        let ran_ue_ngap_id = task
+            .find_ue_context(1)
+            .map(|c| c.ran_ue_ngap_id as u32)
+            .expect("ran id");
+        let nh = [0x77u8; 32];
+
+        task.handle_path_switch_request_acknowledge(
+            1,
+            8,
+            PathSwitchRequestAcknowledgeData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id,
+                next_hop_chaining_count: 4,
+                next_hop_nh: nh,
+                switched_sessions: vec![SwitchedSessionItem {
+                    pdu_session_id: 1,
+                    ul_tunnel: None,
+                    security_indication: None,
+                }],
+            },
+        )
+        .await;
+
+        let expected = derive_kgnb_star(
+            &nh,
+            phys_cell_id_from_nci(test_config().nci),
+            test_config().dl_arfcn,
+        );
+        assert_eq!(
+            task.find_ue_context(1)
+                .and_then(|c| c.as_security.as_ref())
+                .map(|s| s.kgnb),
+            Some(expected),
+            "a path switch must adopt the AMF's fresh NH and derive KgNB* from it \
+             (TS 33.501 §6.9.2.3.1) -- the same derivation the HANDOVER REQUEST path uses"
+        );
+    }
+
+    /// A UE with no AMF UE NGAP ID cannot be handed over, and that is reported rather
+    /// than logged as a handover that started.
+    #[tokio::test]
+    async fn initiate_handover_reports_a_ue_it_cannot_hand_over() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        task.create_ue_context(5, 1).expect("ue context");
+        // No `amf_ue_ngap_id`.
+        assert!(
+            !task
+                .initiate_handover(HandoverInitiation {
+                    ue_id: 5,
+                    target_gnb_id: 1,
+                    target_tac: 1,
+                    target_cell_identity: 1,
+                    ue_nr_capability: None,
+                    time_in_source_cell_s: 0,
+                })
+                .await,
+            "a UE the AMF does not know cannot be handed over"
+        );
+        assert!(
+            !task
+                .initiate_handover(HandoverInitiation {
+                    ue_id: 999,
+                    target_gnb_id: 1,
+                    target_tac: 1,
+                    target_cell_identity: 1,
+                    ue_nr_capability: None,
+                    time_in_source_cell_s: 0,
+                })
+                .await,
+            "nor an unknown one"
+        );
     }
 
     // ========================================================================

@@ -78,12 +78,31 @@ pub struct TargetCellInfo {
 pub struct HandoverCommand {
     /// Target cell information
     pub target_cell: TargetCellInfo,
-    /// New security configuration
-    pub new_security_config: bool,
+    /// The `masterKeyUpdate` the command carried, if any (issue #39).
+    ///
+    /// `None` means the UE keeps its current keys. This replaced a
+    /// `new_security_config: bool` that was hardcoded `false` and read by nothing —
+    /// a flag saying "re-key" with no derivation behind it is worse than no flag.
+    pub key_update: Option<KeyUpdate>,
     /// Full reconfiguration required
     pub full_config: bool,
     /// Transaction ID from RRC Reconfiguration
     pub transaction_id: u8,
+}
+
+/// What a `masterKeyUpdate` tells the UE to do (TS 38.331 §5.3.5.7,
+/// TS 33.501 §6.9.2.3.1; issue #39).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyUpdate {
+    /// `keySetChangeIndicator`: `true` for a **vertical** derivation from a fresh NH,
+    /// `false` for a **horizontal** one from the UE's current `KgNB`.
+    ///
+    /// A named field rather than a bare bool at the call site, because only the vertical
+    /// case gives forward security against a compromised source gNB — and the two derive
+    /// *different* keys, so guessing makes every PDCP MAC on the target fail.
+    pub vertical: bool,
+    /// `nextHopChainingCount` the derivation chains on.
+    pub next_hop_chaining_count: u8,
 }
 
 /// Handover manager for UE
@@ -297,10 +316,13 @@ pub fn parse_handover_command(pdu: &[u8]) -> Option<HandoverCommand> {
             arfcn: None,
             ssb_offset: None,
         },
-        // `masterKeyUpdate` is the IE that says the UE re-keys, and it is NOT in
-        // the command this gNB builds -- KgNB* derivation does not exist here
-        // (issue #39). `false` is therefore the truth rather than a default.
-        new_security_config: false,
+        // `masterKeyUpdate` is the IE that says the UE re-keys, and it IS in the command
+        // now (issue #39). Its `keySetChangeIndicator` decides vertical vs horizontal,
+        // which is a security property and not a flag -- see `KeyUpdate`.
+        key_update: decoded.master_key_update.map(|u| KeyUpdate {
+            vertical: u.key_set_change_indicator,
+            next_hop_chaining_count: u.next_hop_chaining_count,
+        }),
         full_config: decoded.full_config,
         transaction_id: decoded.rrc_transaction_id,
     })
@@ -338,7 +360,7 @@ mod tests {
                 arfcn: None,
                 ssb_offset: None,
             },
-            new_security_config: false,
+            key_update: None,
             full_config: false,
             transaction_id: 1,
         };
@@ -431,6 +453,7 @@ mod tests {
             new_ue_identity: 1,
             t304_ms: 1000,
             full_config: true,
+            master_key_update: None,
         })
         .expect("the shared encoder must produce a handover command");
 
@@ -444,11 +467,46 @@ mod tests {
         );
         assert_eq!(cmd.target_cell.new_ue_id, Some(1));
         assert!(cmd.full_config);
-        assert!(
-            !cmd.new_security_config,
-            "masterKeyUpdate is absent from the command this gNB builds (no KgNB* \
-             derivation exists -- issue #39), so false is the truth and not a default"
+        assert_eq!(
+            cmd.key_update, None,
+            "no masterKeyUpdate was asked for, so the UE keeps its keys"
         );
+    }
+
+    /// #39: a `masterKeyUpdate` on the wire reaches the parsed command, with the
+    /// `keySetChangeIndicator` that decides vertical vs horizontal.
+    ///
+    /// The IE used to be absent from every command this gNB built, so
+    /// `new_security_config` was hardcoded `false` and read by nothing.
+    #[test]
+    fn a_master_key_update_reaches_the_parsed_handover_command() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
+        };
+        for (vertical, ncc) in [(false, 0u8), (true, 5u8)] {
+            let pdu = encode_handover_command(&HandoverCommandParams {
+                rrc_transaction_id: 1,
+                target_phys_cell_id: 407,
+                new_ue_identity: 1,
+                t304_ms: 1000,
+                full_config: true,
+                master_key_update: Some(MasterKeyUpdateParams {
+                    key_set_change_indicator: vertical,
+                    next_hop_chaining_count: ncc,
+                }),
+            })
+            .expect("encode");
+            let cmd = parse_handover_command(&pdu).expect("parse");
+            assert_eq!(
+                cmd.key_update,
+                Some(KeyUpdate {
+                    vertical,
+                    next_hop_chaining_count: ncc
+                }),
+                "vertical={vertical} NCC={ncc}: both fields must survive, because the \
+                 two chainings derive DIFFERENT keys"
+            );
+        }
     }
 
     /// The old byte format must not parse. A UE that still accepted it would let a

@@ -6,6 +6,7 @@
 pub mod ai_ml_config;
 pub mod conditional_handover;
 pub mod dcch_dispatch;
+pub mod handover_preparation;
 pub mod information_transfer;
 pub mod isac_config;
 pub mod isl_handover;

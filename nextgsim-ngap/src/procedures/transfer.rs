@@ -665,6 +665,183 @@ pub fn decode_setup_unsuccessful_transfer(
 }
 
 // ============================================================================
+// Handover Required Transfer (encode, TS 38.413 §9.3.4.12)
+// ============================================================================
+
+/// Encode a `PDUSessionResourceInformationItem`'s `HandoverRequiredTransfer`.
+///
+/// Its only member is `directForwardingPathAvailability`, so an all-absent transfer is
+/// the truthful encoding for a node that forwards nothing during a handover — which is
+/// this one. `vec![0x00]`, which this replaces, is not a decodable transfer at all
+/// (issue #39).
+pub fn encode_handover_required_transfer(
+    direct_forwarding_available: bool,
+) -> Result<Vec<u8>, TransferError> {
+    let transfer = HandoverRequiredTransfer {
+        direct_forwarding_path_availability: direct_forwarding_available.then_some(
+            DirectForwardingPathAvailability(
+                DirectForwardingPathAvailability::DIRECT_PATH_AVAILABLE,
+            ),
+        ),
+        ie_extensions: None,
+    };
+    Ok(encode_aper(&transfer)?)
+}
+
+/// Decode one, reporting whether a direct forwarding path was offered.
+pub fn decode_handover_required_transfer(bytes: &[u8]) -> Result<bool, TransferError> {
+    let transfer: HandoverRequiredTransfer = decode_aper(bytes)?;
+    Ok(transfer.direct_forwarding_path_availability.is_some())
+}
+
+// ============================================================================
+// Handover Request Acknowledge Transfer (encode, TS 38.413 §9.3.4.13)
+// ============================================================================
+
+/// What the target NG-RAN node actually applied to a session's DRBs, reported back
+/// per admitted session (`SecurityResult`, TS 38.413 §9.3.1.59).
+///
+/// The counterpart of the `SecurityIndication` the SMF sent (issue #32): that states
+/// an obligation and this states an outcome. Two booleans rather than a reuse of
+/// `UpSecurityPolicy`, because `performed`/`not-performed` has no third value — a
+/// target does not report "preferred".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UpSecurityResult {
+    /// `integrityProtectionResult`: whether the DRBs are integrity protected.
+    pub integrity_performed: bool,
+    /// `confidentialityProtectionResult`: whether the DRBs are ciphered.
+    pub confidentiality_performed: bool,
+}
+
+/// Parameters for a per-session Handover Request Acknowledge Transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverAckTransferParams {
+    /// The DL NG-U tunnel the **target** allocated. Mandatory: this is the endpoint
+    /// the UPF will switch downlink traffic to, and it is the whole reason the AMF
+    /// asked.
+    pub dl_tunnel: GtpTunnelInfo,
+    /// QFIs the target admitted, with data forwarding accepted for each.
+    pub admitted_qfis: Vec<u8>,
+    /// QoS flows the target could not admit, with causes.
+    pub failed_qos_flows: Vec<FailedQosFlow>,
+    /// What user-plane security the target applied, when it applied any.
+    ///
+    /// `None` omits the IE, which is what a target with no user-plane security to
+    /// report should send — claiming `not-performed` for both would be a *decision* the
+    /// target had not actually made.
+    pub security_result: Option<UpSecurityResult>,
+}
+
+/// A decoded Handover Request Acknowledge Transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverAckTransferData {
+    /// The DL NG-U tunnel the target allocated.
+    pub dl_tunnel: GtpTunnelInfo,
+    /// QFIs the target admitted.
+    pub admitted_qfis: Vec<u8>,
+    /// What user-plane security the target applied, if it said.
+    pub security_result: Option<UpSecurityResult>,
+}
+
+/// Encode a `PDUSessionResourceHandoverRequestAckTransfer` (TS 38.413 §9.3.4.13).
+///
+/// This is what the target NG-RAN node returns per **admitted** session, and it is
+/// what makes the admission mean something: before issue #39 the gNB sent
+/// `vec![0x00]`, which is not a decodable transfer at all — so an AMF learned nothing
+/// about where to switch the downlink tunnel, and the data plane went nowhere.
+pub fn encode_handover_ack_transfer(
+    params: &HandoverAckTransferParams,
+) -> Result<Vec<u8>, TransferError> {
+    if params.admitted_qfis.is_empty() {
+        return Err(TransferError::InvalidIeValue(
+            "QosFlowListWithDataForwarding must contain at least one flow: a session \
+             admitted with no QoS flow carries nothing"
+                .to_string(),
+        ));
+    }
+    let admitted: Vec<QosFlowItemWithDataForwarding> = params
+        .admitted_qfis
+        .iter()
+        .map(|&qfi| QosFlowItemWithDataForwarding {
+            qos_flow_identifier: QosFlowIdentifier(qfi),
+            // The flow is admitted, so forwarding of its data to this target is
+            // accepted. Omitting the IE would leave the source unable to tell whether
+            // in-flight downlink data should be forwarded, and it would hold it.
+            data_forwarding_accepted: Some(DataForwardingAccepted(
+                DataForwardingAccepted::DATA_FORWARDING_ACCEPTED,
+            )),
+            ie_extensions: None,
+        })
+        .collect();
+
+    let failed = if params.failed_qos_flows.is_empty() {
+        None
+    } else {
+        Some(QosFlowListWithCause(
+            params
+                .failed_qos_flows
+                .iter()
+                .map(|f| QosFlowWithCauseItem {
+                    qos_flow_identifier: QosFlowIdentifier(f.qfi),
+                    cause: build_cause(&f.cause),
+                    ie_extensions: None,
+                })
+                .collect(),
+        ))
+    };
+
+    let transfer = HandoverRequestAcknowledgeTransfer {
+        dl_ngu_up_tnl_information: params.dl_tunnel.to_asn(),
+        // No separate data-forwarding tunnel: this simulator forwards nothing during a
+        // handover, and advertising an endpoint it would not read from is worse than
+        // advertising none.
+        dl_forwarding_up_tnl_information: None,
+        security_result: params.security_result.map(|r| SecurityResult {
+            integrity_protection_result: IntegrityProtectionResult(if r.integrity_performed {
+                IntegrityProtectionResult::PERFORMED
+            } else {
+                IntegrityProtectionResult::NOT_PERFORMED
+            }),
+            confidentiality_protection_result: ConfidentialityProtectionResult(
+                if r.confidentiality_performed {
+                    ConfidentialityProtectionResult::PERFORMED
+                } else {
+                    ConfidentialityProtectionResult::NOT_PERFORMED
+                },
+            ),
+            ie_extensions: None,
+        }),
+        qos_flow_setup_response_list: QosFlowListWithDataForwarding(admitted),
+        qos_flow_failed_to_setup_list: failed,
+        data_forwarding_response_drb_list: None,
+        ie_extensions: None,
+    };
+    Ok(encode_aper(&transfer)?)
+}
+
+/// Decode a `PDUSessionResourceHandoverRequestAckTransfer`.
+pub fn decode_handover_ack_transfer(
+    bytes: &[u8],
+) -> Result<HandoverAckTransferData, TransferError> {
+    let transfer: HandoverRequestAcknowledgeTransfer = decode_aper(bytes)?;
+    Ok(HandoverAckTransferData {
+        dl_tunnel: GtpTunnelInfo::from_asn(&transfer.dl_ngu_up_tnl_information)?,
+        admitted_qfis: transfer
+            .qos_flow_setup_response_list
+            .0
+            .iter()
+            .map(|item| item.qos_flow_identifier.0)
+            .collect(),
+        security_result: transfer.security_result.as_ref().map(|r| UpSecurityResult {
+            integrity_performed: r.integrity_protection_result.0
+                == IntegrityProtectionResult::PERFORMED,
+            confidentiality_performed: r.confidentiality_protection_result.0
+                == ConfidentialityProtectionResult::PERFORMED,
+        }),
+    })
+}
+
+// ============================================================================
 // PDU Session Resource Modify Request Transfer (decode, TS 38.413 §9.3.4.3)
 // ============================================================================
 
@@ -1010,6 +1187,81 @@ mod tests {
             }],
             security_indication: None,
         }
+    }
+
+    /// #39, criterion 2: the Handover Request Acknowledge Transfer is a real decodable
+    /// `PDUSessionResourceHandoverRequestAckTransfer`, not `vec![0x00]`.
+    #[test]
+    fn a_handover_ack_transfer_round_trips() {
+        let params = HandoverAckTransferParams {
+            dl_tunnel: GtpTunnelInfo {
+                address: "10.45.0.7".parse().unwrap(),
+                teid: 0xDEAD_BEEF,
+            },
+            admitted_qfis: vec![1, 9],
+            failed_qos_flows: vec![],
+            security_result: Some(UpSecurityResult {
+                integrity_performed: true,
+                confidentiality_performed: false,
+            }),
+        };
+        let bytes = encode_handover_ack_transfer(&params).expect("encode");
+        assert!(
+            bytes.len() > 1,
+            "the old placeholder was a single 0x00 byte, which decodes as nothing"
+        );
+        let data = decode_handover_ack_transfer(&bytes).expect("decode");
+        assert_eq!(
+            data.dl_tunnel, params.dl_tunnel,
+            "the DL tunnel is the whole point: it is where the UPF switches traffic to"
+        );
+        assert_eq!(data.admitted_qfis, vec![1, 9]);
+        assert_eq!(
+            data.security_result,
+            Some(UpSecurityResult {
+                integrity_performed: true,
+                confidentiality_performed: false
+            }),
+            "the two protections are reported independently, as the SMF asked for them \
+             independently (issue #32)"
+        );
+    }
+
+    /// The old placeholder is refused by the decoder, so "it decodes" is a real check.
+    #[test]
+    fn the_old_placeholder_ack_transfer_does_not_decode() {
+        assert!(
+            decode_handover_ack_transfer(&[0x00]).is_err(),
+            "vec![0x00] must NOT decode, or criterion 2's round trip proves nothing"
+        );
+        assert!(decode_handover_ack_transfer(&[]).is_err());
+    }
+
+    /// An absent `securityResult` stays absent, and a session admitted with no QoS flow
+    /// is refused rather than encoded as an empty list.
+    #[test]
+    fn an_absent_security_result_stays_absent_and_an_empty_flow_list_is_refused() {
+        let mut params = HandoverAckTransferParams {
+            dl_tunnel: GtpTunnelInfo {
+                address: "10.45.0.7".parse().unwrap(),
+                teid: 1,
+            },
+            admitted_qfis: vec![1],
+            failed_qos_flows: vec![],
+            security_result: None,
+        };
+        let data =
+            decode_handover_ack_transfer(&encode_handover_ack_transfer(&params).unwrap()).unwrap();
+        assert_eq!(
+            data.security_result, None,
+            "a target with nothing to report must not claim `not-performed` for both: \
+             that is a decision it did not make"
+        );
+        params.admitted_qfis.clear();
+        assert!(
+            encode_handover_ack_transfer(&params).is_err(),
+            "a session admitted with no QoS flow carries nothing"
+        );
     }
 
     #[test]

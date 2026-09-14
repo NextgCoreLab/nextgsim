@@ -20,6 +20,7 @@ use crate::rrc::cell_selection::{
 use crate::rrc::conditional_handover::{handover_command_for, CondReconfigStore};
 use crate::rrc::handover::{
     build_reconfiguration_complete, parse_handover_command, HandoverCommand, HandoverManager,
+    KeyUpdate,
 };
 use crate::rrc::inactive::InactiveContext;
 use crate::rrc::measurement::{
@@ -2602,6 +2603,61 @@ impl RrcTask {
     }
 
     /// Handle handover command from RRC Reconfiguration
+    /// Re-derive `KgNB*` and the four AS keys for a handover target
+    /// (TS 33.501 §6.9.2.3.1, Annex A.11; TS 38.331 §5.3.5.7; issue #39).
+    ///
+    /// The gNB derives the same key from the same two inputs — the target's `physCellId`,
+    /// which the command carried, and the target's downlink ARFCN, which is config on
+    /// both ends because the RLS is single-carrier (see `UeConfig::dl_arfcn`). If either
+    /// end binds a different value, every PDCP MAC on the target fails and the UE
+    /// declares handover failure with no indication that a key was the problem — which is
+    /// why this logs both inputs.
+    ///
+    /// **Horizontal only.** A vertical derivation chains from a fresh NH, and a UE never
+    /// receives an NH: TS 33.501 §6.9.2.3.1 has it derive vertically from the `KgNB` the
+    /// *NAS* layer refreshed, which this simulator does not do on handover. So a
+    /// `keySetChangeIndicator` of `true` is reported and treated as horizontal rather than
+    /// silently producing a key the network does not hold.
+    fn apply_master_key_update(&mut self, update: KeyUpdate, target_pci: u32) {
+        use nextgsim_crypto::kdf::derive_kgnb_star;
+
+        // The KgNB this handover chains from: the one the current AS security context was
+        // derived with. Refused rather than substituted when there is none — a `KgNB*`
+        // built on zeros would make every DRB and SRB on the target fail its MAC, with
+        // nothing to say a key was the problem.
+        let Some(current) = self.as_security.clone() else {
+            warn!(
+                "Handover carries a masterKeyUpdate but this UE has no AS security \
+                 context, so there is no KgNB to chain from; keeping the current keys"
+            );
+            return;
+        };
+        let kgnb = current.kgnb;
+        if update.vertical {
+            warn!(
+                "Handover asks for a VERTICAL key derivation (NCC {}), which needs an NH \
+                 this UE never receives; deriving horizontally instead \
+                 (TS 33.501 §6.9.2.3.1)",
+                update.next_hop_chaining_count
+            );
+        }
+        let pci = (target_pci % 1008) as u16;
+        let arfcn = self.task_base.config.dl_arfcn;
+        let kgnb_star = derive_kgnb_star(&kgnb, pci, arfcn);
+        info!(
+            "Handover: re-derived KgNB* for PCI {pci}, ARFCN-DL {arfcn} (NCC {})",
+            update.next_hop_chaining_count
+        );
+        // The next handover chains from `KgNB*`, which is now this context's own `kgnb` —
+        // so the chain advances rather than repeatedly re-deriving from the original.
+        self.as_security = Some(AsSecurityContext::derive_from_kgnb(
+            &kgnb_star,
+            current.ciphering_algorithm,
+            current.integrity_algorithm,
+            current.c_rnti,
+        ));
+    }
+
     async fn handle_handover_command(&mut self, source_cell_id: i32, mut command: HandoverCommand) {
         // Resolve the target's `physCellId` to a cell this UE can actually hear
         // (issue #107). The command names the target by PCI, which is the 3GPP
@@ -2616,10 +2672,20 @@ impl RrcTask {
             });
         let target_cell_id = command.target_cell.cell_id;
         let transaction_id = command.transaction_id;
+        let key_update = command.key_update;
 
         // Start handover in the handover manager
         self.handover_manager
             .start_handover(source_cell_id, command);
+
+        // TS 38.331 §5.3.5.5.2 / §5.3.5.7: applying a `reconfigurationWithSync` with a
+        // `masterKeyUpdate` re-derives `KgNB*` for the target BEFORE the UE uses the new
+        // cell, because everything it protects there hangs off that key. Done here rather
+        // than after the sync, so a UE that reaches the target already holds the right
+        // keys (issue #39).
+        if let Some(update) = key_update {
+            self.apply_master_key_update(update, target_pci);
+        }
 
         // Check if we have signal to the target cell. An UNRESOLVED PCI takes the
         // failure branch: a target the UE cannot identify is a target it cannot
@@ -3450,6 +3516,157 @@ mod tests {
     }
 
     // ========================================================================
+    // Inter-gNB handover key derivation (issue #39)
+    // ========================================================================
+
+    /// #39, criterion 5: after a handover the UE and the gNB hold the **same** keys.
+    ///
+    /// The gNB's side is computed here with `nextgsim_crypto::derive_kgnb_star` and
+    /// `nextgsim_gnb`'s own `AsSecurityContext::from_kgnb` shape, so this is a
+    /// cross-endpoint assertion and not a UE-only round trip: a one-sided change to
+    /// either derivation fails here. Both bind the target `physCellId` from the command
+    /// and the `dl_arfcn` from config.
+    #[test]
+    fn the_ue_and_the_gnb_derive_the_same_keys_after_a_handover() {
+        use nextgsim_crypto::kdf::{
+            derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+        };
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
+        };
+
+        const TARGET_PCI: u16 = 407;
+        let config = test_config();
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(config.clone(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let before = task
+                .as_security
+                .as_ref()
+                .expect("AS security was installed")
+                .clone();
+
+            let pdu = encode_handover_command(&HandoverCommandParams {
+                rrc_transaction_id: 0,
+                target_phys_cell_id: TARGET_PCI,
+                new_ue_identity: 1,
+                t304_ms: 1000,
+                full_config: true,
+                master_key_update: Some(MasterKeyUpdateParams {
+                    key_set_change_indicator: false,
+                    next_hop_chaining_count: 0,
+                }),
+            })
+            .expect("the gNB's own encoder");
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+
+            let after = task
+                .as_security
+                .as_ref()
+                .expect("the UE must still hold an AS security context")
+                .clone();
+
+            // What the gNB computes for the same target.
+            let expected_kgnb = derive_kgnb_star(&before.kgnb, TARGET_PCI, config.dl_arfcn);
+            assert_eq!(
+                after.kgnb, expected_kgnb,
+                "the UE's KgNB* must equal the gNB's, or every PDCP MAC on the target \
+                 fails with nothing to say a key was the problem"
+            );
+            assert_eq!(
+                after.k_rrc_int,
+                derive_rrc_up_key(
+                    &expected_kgnb,
+                    AlgorithmTypeDistinguisher::RrcInt,
+                    before.integrity_algorithm.id()
+                ),
+                "and so must K_RRCint, which is what actually protects SRB1"
+            );
+            assert_eq!(
+                after.k_up_enc,
+                derive_rrc_up_key(
+                    &expected_kgnb,
+                    AlgorithmTypeDistinguisher::UpEnc,
+                    before.ciphering_algorithm.id()
+                ),
+                "and K_UPenc, which protects the DRBs (issue #32) -- asserted in the \
+                 default build too, because the derivation is not feature-gated even \
+                 though its use on the data path is"
+            );
+
+            assert_ne!(
+                after.kgnb, before.kgnb,
+                "the handover must actually re-key: keeping the source's KgNB is the \
+                 forward-security loss this issue reports"
+            );
+            assert_ne!(after.k_rrc_int, before.k_rrc_int);
+            // The algorithms are NOT renegotiated (TS 33.501 §6.9.2.3.1).
+            assert_eq!(after.integrity_algorithm, before.integrity_algorithm);
+            assert_eq!(after.ciphering_algorithm, before.ciphering_algorithm);
+        });
+    }
+
+    /// A handover command with **no** `masterKeyUpdate` leaves the keys alone.
+    ///
+    /// The negative control: without it, an `apply_master_key_update` that ran
+    /// unconditionally would pass the test above.
+    #[test]
+    fn a_handover_without_a_master_key_update_keeps_the_ues_keys() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_handover_command, HandoverCommandParams,
+        };
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let before = task.as_security.as_ref().expect("keyed").clone();
+
+            let pdu = encode_handover_command(&HandoverCommandParams {
+                rrc_transaction_id: 0,
+                target_phys_cell_id: 407,
+                new_ue_identity: 1,
+                t304_ms: 1000,
+                full_config: true,
+                master_key_update: None,
+            })
+            .expect("encode");
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+
+            let after = task.as_security.as_ref().expect("still keyed").clone();
+            assert_eq!(
+                after.kgnb, before.kgnb,
+                "no masterKeyUpdate means no re-key (TS 38.331 §5.3.5.5.2)"
+            );
+            assert_eq!(after.k_rrc_int, before.k_rrc_int);
+        });
+    }
+
+    /// A UE with **no** AS security context refuses to re-key rather than deriving from
+    /// zeros — a `KgNB*` built on an invented key would fail every MAC on the target.
+    #[test]
+    fn a_handover_on_an_unkeyed_ue_does_not_invent_a_key() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        assert!(task.as_security.is_none(), "precondition: unkeyed");
+        task.apply_master_key_update(
+            crate::rrc::handover::KeyUpdate {
+                vertical: false,
+                next_hop_chaining_count: 0,
+            },
+            407,
+        );
+        assert!(
+            task.as_security.is_none(),
+            "an unkeyed UE must stay unkeyed rather than gain a context derived from zeros"
+        );
+    }
+
+    // ========================================================================
     // RRC_INACTIVE: suspend, resume and RNAU (issue #38)
     // ========================================================================
 
@@ -3641,18 +3858,22 @@ mod tests {
     fn a_page_in_rrc_inactive_emits_a_resume_request_with_mt_access() {
         use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request1, ResumeCauseValue};
         let config = test_config();
-        // An identity that pages in the CURRENT frame, so the occasion check passes for
-        // the reason production's does rather than by disabling it.
-        let s_tmsi = s_tmsi_paged_in_the_current_frame(&config);
-        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(config.clone(), 32);
         let mut task = RrcTask::new(task_base);
         run_async(async {
             camped_connected_and_keyed(&mut task, &mut rls_rx).await;
-            task.set_paging_identity(Some(s_tmsi));
             task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
                 .await;
             while rls_rx.try_recv().is_ok() {}
 
+            // The paging identity is chosen HERE, immediately before the page is
+            // delivered, rather than at the top of the test: it must page in the *current*
+            // SFN, and the RRC setup and suspension above take long enough that the frame
+            // can advance in between. Chosen late rather than by disabling the occasion
+            // check, so the check still passes for the reason production's does.
+            let s_tmsi = s_tmsi_paged_in_the_current_frame(&config);
+            task.set_paging_identity(Some(s_tmsi));
             task.handle_downlink_rrc(1, RrcChannel::Pcch, pcch_paging(&[s_tmsi]))
                 .await;
 

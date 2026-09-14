@@ -148,6 +148,25 @@ impl AppTask {
             }
         }
 
+        // Handle an Xn path switch request (issue #39): the production trigger
+        // `send_path_switch_request` never had.
+        if let GnbCliCommandType::XnPathSwitch {
+            ue_id,
+            source_amf_ue_ngap_id,
+        } = command
+        {
+            if !response.is_error {
+                info!("Xn PATH SWITCH REQUEST requested for UE {ue_id}");
+                let msg = NgapMessage::SendPathSwitchRequest {
+                    ue_id,
+                    source_amf_ue_ngap_id,
+                };
+                if let Err(e) = self.task_base.ngap_tx.send(msg).await {
+                    error!("Failed to send the path switch request to NGAP: {e}");
+                }
+            }
+        }
+
         // Handle UE release if requested
         if let GnbCliCommandType::UeRelease { ue_id } = command {
             if !response.is_error {

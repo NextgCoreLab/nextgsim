@@ -237,6 +237,17 @@ pub enum GnbCliCommandType {
         /// `t380` in minutes (one of 5, 10, 20, 30, 60, 120, 360, 720), or `None`
         t380_minutes: Option<u16>,
     },
+    /// Report an Xn handover-in by sending a PATH SWITCH REQUEST
+    /// (TS 38.413 §8.4.4, issue #39).
+    ///
+    /// Operator-triggered because there is no Xn interface here — see
+    /// [`NgapMessage::SendPathSwitchRequest`].
+    XnPathSwitch {
+        /// UE whose downlink tunnels move to this node
+        ue_id: i32,
+        /// The AMF UE NGAP ID the source node used
+        source_amf_ue_ngap_id: u64,
+    },
     /// Send a RAN CONFIGURATION UPDATE to a connected AMF
     /// (TS 38.413 §8.7.2, issue #41).
     ///
@@ -248,6 +259,30 @@ pub enum GnbCliCommandType {
         /// Which AMF (its SCTP client ID), or `None` for every Ready AMF
         amf_id: Option<i32>,
     },
+}
+
+/// What the RRC plane tells NGAP to start a handover with (issue #39).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverInitiation {
+    /// UE to hand over
+    pub ue_id: i32,
+    /// Global gNB ID of the target node
+    pub target_gnb_id: u32,
+    /// Tracking Area Code of the target
+    pub target_tac: u32,
+    /// 36-bit NR Cell Identity of the target cell.
+    ///
+    /// Distinct from `target_gnb_id`: the AMF routes on the gNB ID and the **target**
+    /// needs the cell, because that is what it compares against its own and what the UE
+    /// was told to go to.
+    pub target_cell_identity: u64,
+    /// The UE's `UE-CapabilityRAT-Container`, as the source RRC plane collected it.
+    ///
+    /// `None` when the source never ran a UE Capability Enquiry, which is a real state
+    /// and one the target should be able to see.
+    pub ue_nr_capability: Option<Vec<u8>>,
+    /// How long the UE has been on the source cell, in seconds, for the UE history.
+    pub time_in_source_cell_s: u16,
 }
 
 // ============================================================================
@@ -316,6 +351,43 @@ pub enum NgapMessage {
         ue_id: i32,
         /// Release cause
         cause: UeReleaseRequestCause,
+    },
+    /// Start an inter-gNB handover for a UE (TS 38.413 §8.4.1.1, issue #39).
+    ///
+    /// This is the trigger the source-side senders never had: `initiate_handover`,
+    /// `send_handover_required`, `send_handover_notify` and `send_path_switch_request`
+    /// were all `#[allow(dead_code)]` because no message could reach them.
+    ///
+    /// Sent from the RRC plane, which is where the decision belongs: RRC owns the
+    /// measurement reports and the NWDAF recommendation, and NGAP owns the AMF
+    /// association. The UE's capability container rides along because the source RRC
+    /// context holds it and the NGAP task does not.
+    InitiateHandover(Box<HandoverInitiation>),
+    /// The UE has successfully accessed this (target) cell after an N2 handover, so the
+    /// AMF must be told (HANDOVER NOTIFY, TS 38.413 §8.4.3; issue #39).
+    ///
+    /// From the RRC plane, because "the UE has arrived" is an RRC fact: it is the
+    /// `RRCReconfigurationComplete` on the target cell. NGAP cannot observe it.
+    HandoverAccessCompleted {
+        /// UE that arrived
+        ue_id: i32,
+    },
+    /// Ask the 5GC to switch the downlink GTP-U tunnels to this node
+    /// (PATH SWITCH REQUEST, TS 38.413 §8.4.4; issue #39).
+    ///
+    /// The **Xn** counterpart of `HandoverAccessCompleted`, and the two are alternatives
+    /// rather than a sequence: §8.4.3 is how a target reports an N2 handover and §8.4.4
+    /// is how it reports an Xn one, where the RAN nodes prepared directly and the AMF was
+    /// never involved.
+    ///
+    /// Operator-triggered, because this simulator has **no Xn interface**: the procedure
+    /// needs the *source's* AMF UE NGAP ID, and only an Xn peer could supply it. An
+    /// automatic trigger would have to invent the Xn handover it was reporting.
+    SendPathSwitchRequest {
+        /// UE whose tunnels move to this node
+        ue_id: i32,
+        /// The AMF UE NGAP ID the **source** node used, as the Xn peer would have given it
+        source_amf_ue_ngap_id: u64,
     },
     /// Send a RAN CONFIGURATION UPDATE (TS 38.413 §8.7.2, issue #41), from the
     /// CLI.

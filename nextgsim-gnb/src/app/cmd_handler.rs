@@ -166,6 +166,9 @@ impl<'a> GnbCmdHandler<'a> {
                 ue_id,
                 t380_minutes,
             } => self.handle_ue_suspend(*ue_id, *t380_minutes, response_addr),
+            GnbCliCommandType::XnPathSwitch { ue_id, .. } => {
+                self.handle_xn_path_switch(*ue_id, response_addr)
+            }
             GnbCliCommandType::RanConfigUpdate { amf_id } => {
                 self.handle_ran_config_update(*amf_id, response_addr)
             }
@@ -296,6 +299,20 @@ impl<'a> GnbCmdHandler<'a> {
         )
     }
 
+    /// Handles the XN-PATH-SWITCH command (TS 38.413 §8.4.4, issue #39).
+    ///
+    /// Validates the UE before the App task forwards anything: a PATH SWITCH REQUEST for
+    /// a UE this node does not hold would ask the 5GC to move tunnels that do not exist.
+    fn handle_xn_path_switch(&self, ue_id: i32, response_addr: Option<SocketAddr>) -> CliResponse {
+        if !self.ue_contexts.contains_key(&ue_id) {
+            return CliResponse::error(format!("UE not found with ID: {ue_id}"), response_addr);
+        }
+        CliResponse::success(
+            format!("Sending PATH SWITCH REQUEST for UE {ue_id}"),
+            response_addr,
+        )
+    }
+
     /// Handles the RAN-CONFIG-UPDATE command (TS 38.413 §8.7.2, issue #41).
     ///
     /// Validates the target before the App task sends anything: an unknown AMF ID
@@ -338,6 +355,7 @@ impl<'a> GnbCmdHandler<'a> {
 /// - `ue-info <ue_id>` - Show UE details
 /// - `ue-release <ue_id>` - Release UE context
 /// - `ue-suspend <ue_id> [t380_minutes]` - Suspend a UE to RRC_INACTIVE
+/// - `xn-path-switch <ue_id> <source_amf_ue_ngap_id>` - Report an Xn handover-in
 /// - `ran-config-update [amf_id]` - Send a RAN Configuration Update (all AMFs if omitted)
 ///
 /// # Returns
@@ -373,6 +391,24 @@ pub fn parse_cli_command(input: &str) -> Result<GnbCliCommandType, String> {
                 .parse::<i32>()
                 .map_err(|_| format!("Invalid UE ID: {}", tokens[1]))?;
             Ok(GnbCliCommandType::UeRelease { ue_id })
+        }
+        // `xn-path-switch <ue_id> <source_amf_ue_ngap_id>`. Both arguments are required:
+        // the source's AMF UE NGAP ID is what an Xn peer would have supplied, and there is
+        // no sensible default for it (see `NgapMessage::SendPathSwitchRequest`).
+        "xn-path-switch" => {
+            if tokens.len() < 3 {
+                return Err("Usage: xn-path-switch <ue_id> <source_amf_ue_ngap_id>".to_string());
+            }
+            let ue_id = tokens[1]
+                .parse::<i32>()
+                .map_err(|_| format!("Invalid UE ID: {}", tokens[1]))?;
+            let source_amf_ue_ngap_id = tokens[2]
+                .parse::<u64>()
+                .map_err(|_| format!("Invalid source AMF UE NGAP ID: {}", tokens[2]))?;
+            Ok(GnbCliCommandType::XnPathSwitch {
+                ue_id,
+                source_amf_ue_ngap_id,
+            })
         }
         // `ue-suspend <ue_id> [t380_minutes]`. The t380 is optional because a UE can be
         // suspended with no periodic RNAU at all -- the RNA-crossing trigger still
@@ -742,6 +778,65 @@ mod tests {
         assert!(parse_cli_command("INFO").is_ok());
         assert!(parse_cli_command("Status").is_ok());
         assert!(parse_cli_command("UE-LIST").is_ok());
+    }
+
+    /// #39: the Xn path-switch entry point parses, and both arguments are required.
+    #[test]
+    fn xn_path_switch_parses_and_requires_both_arguments() {
+        assert!(matches!(
+            parse_cli_command("xn-path-switch 7 4242").expect("parses"),
+            GnbCliCommandType::XnPathSwitch {
+                ue_id: 7,
+                source_amf_ue_ngap_id: 4242
+            }
+        ));
+        assert!(
+            parse_cli_command("xn-path-switch 7").is_err(),
+            "the source's AMF UE NGAP ID is what an Xn peer would supply; there is no \
+             sensible default for it"
+        );
+        assert!(parse_cli_command("xn-path-switch").is_err());
+        assert!(parse_cli_command("xn-path-switch x 1").is_err());
+        assert!(parse_cli_command("xn-path-switch 7 x").is_err());
+    }
+
+    /// A PATH SWITCH REQUEST for a UE this node does not hold is refused before anything
+    /// is sent: it would ask the 5GC to move tunnels that do not exist.
+    ///
+    /// A revert round that disabled the check matched no test at all.
+    #[test]
+    fn xn_path_switch_refuses_a_ue_this_node_does_not_hold() {
+        let mut ue_contexts = HashMap::new();
+        ue_contexts.insert(42, UeContext::new(42, 4200));
+        let amf_contexts = HashMap::new();
+        let task_base = create_task_base(GnbConfig::default());
+        let status_info = GnbStatusInfo::new();
+        let handler = GnbCmdHandler::new(&task_base, &status_info, &ue_contexts, &amf_contexts);
+
+        assert!(
+            handler
+                .handle_command(
+                    &GnbCliCommandType::XnPathSwitch {
+                        ue_id: 99,
+                        source_amf_ue_ngap_id: 1
+                    },
+                    None
+                )
+                .is_error,
+            "an unknown UE must be refused"
+        );
+        assert!(
+            !handler
+                .handle_command(
+                    &GnbCliCommandType::XnPathSwitch {
+                        ue_id: 42,
+                        source_amf_ue_ngap_id: 1
+                    },
+                    None
+                )
+                .is_error,
+            "and a known one accepted, or the refusal above proves nothing"
+        );
     }
 
     /// #38: the operator-facing entry point for suspension parses, with and without a
