@@ -16,6 +16,7 @@ use nextgsim_rrc::procedures::{
         RrcReestablishmentError, RrcReestablishmentParams,
     },
     rrc_release::{encode_rrc_release, CellReselectionPrioritiesParams, RrcReleaseParams},
+    rrc_resume::{encode_rrc_resume, fresh_rrc_resume_params},
     rrc_setup::{encode_rrc_setup, srb1_rrc_setup_params},
 };
 
@@ -554,7 +555,7 @@ impl RrcConnectionManager {
         }
 
         let transaction_id = self.next_tid();
-        let rrc_resume_pdu = self.build_rrc_resume(transaction_id);
+        let rrc_resume_pdu = self.build_rrc_resume(transaction_id)?;
 
         if let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) {
             ctx.on_setup_sent();
@@ -569,7 +570,9 @@ impl RrcConnectionManager {
             ue_id,
             transaction_id,
             rrc_resume_pdu,
-            channel: RrcChannel::DlCcch,
+            // DL-DCCH, not DL-CCCH: `RRCResume` rides SRB1, which a suspended UE
+            // already had (TS 38.331 §6.2.2, issue #107).
+            channel: RrcChannel::DlDcch,
             cause: resume_cause,
         })
     }
@@ -609,21 +612,35 @@ impl RrcConnectionManager {
         Ok(OctetString::from_slice(&bytes))
     }
 
-    /// Builds an RRC Resume message
+    /// Builds an `RRCResume` as real UPER on **DL-DCCH** (TS 38.331 §6.2.2,
+    /// issue #107).
     ///
-    /// Note: The RRC procedures module provides UE-side RRCResumeRequest
-    /// and RRCResumeComplete. The gNB-side RRCResume (DL-CCCH) uses a simplified
-    /// encoding since the ASN.1 gNB-side builder requires masterCellGroup and
-    /// radio bearer configuration from the suspended UE context.
-    fn build_rrc_resume(&self, transaction_id: u8) -> OctetString {
-        let mut pdu = Vec::with_capacity(16);
-        // DL-CCCH-Message with RRCResume
-        pdu.push(0x28); // c1 choice = rrcResume
-        pdu.push(transaction_id);
-        pdu.push(0x00); // criticalExtensions = rrcResume
-                        // Minimal masterCellGroup
-        pdu.extend_from_slice(&[0x00, 0x00]);
-        OctetString::from_slice(&pdu)
+    /// Two things this fixes. The bytes are now a real `RRCResume` carrying a
+    /// `radioBearerConfig` and a `masterCellGroup`, rather than a five-byte
+    /// hand-rolled PDU whose comment said the ASN.1 builder "requires
+    /// masterCellGroup and radio bearer configuration from the suspended UE
+    /// context" -- there is no suspended context, which is why
+    /// `fresh_rrc_resume_params` exists and records that decision. And the channel
+    /// is DL-DCCH: the old comment called the message "DL-CCCH", but `RRCResume`
+    /// rides SRB1 (`RRCResumeRequest` is the UL-CCCH half).
+    ///
+    /// A build failure falls back to `None` rather than to a byte PDU, so the
+    /// caller declines the resume instead of sending something the UE cannot parse.
+    fn build_rrc_resume(&self, transaction_id: u8) -> Option<OctetString> {
+        let params = match fresh_rrc_resume_params(transaction_id) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Cannot build RRCResume params: {e}");
+                return None;
+            }
+        };
+        match encode_rrc_resume(&params) {
+            Ok(bytes) => Some(OctetString::from_slice(&bytes)),
+            Err(e) => {
+                warn!("RRCResume encoding failed: {e}");
+                None
+            }
+        }
     }
 
     /// Handles radio link failure for a UE
@@ -978,6 +995,45 @@ mod tests {
         // Verify UE is now releasing
         let ctx = ue_mgr.try_find_ue(1).unwrap();
         assert!(!ctx.is_connected());
+    }
+
+    /// #107, criterion 2: the emitted `RRCResume` is a real UPER message on
+    /// **DL-DCCH**, carrying the bearer configuration.
+    ///
+    /// Added because a revert round found there was **no gNB-side test of the
+    /// resume PDU at all** — replacing the encoder's output with the old
+    /// hand-rolled bytes matched no test, which reads as a passing suite.
+    #[test]
+    fn the_emitted_rrc_resume_is_real_uper_on_dl_dcch() {
+        use nextgsim_rrc::procedures::rrc_resume::decode_rrc_resume;
+
+        let mut conn_mgr = RrcConnectionManager::new();
+        let mut ue_mgr = RrcUeContextManager::new();
+        conn_mgr.set_barred(false);
+
+        let result = conn_mgr
+            .process_rrc_resume_request(&mut ue_mgr, 1, 0)
+            .expect("a resume must be emitted");
+
+        assert_eq!(
+            result.channel,
+            RrcChannel::DlDcch,
+            "RRCResume rides SRB1, which a suspended UE already had; the old code \
+             called it DL-CCCH, which is where RRCResumeRequest goes"
+        );
+
+        let decoded = decode_rrc_resume(result.rrc_resume_pdu.data())
+            .expect("the emitted PDU must decode as a real RRCResume");
+        assert!(
+            decoded.radio_bearer_config.is_some(),
+            "the resumed UE must be given a bearer configuration"
+        );
+        assert!(decoded.master_cell_group.is_some());
+        assert!(
+            decoded.full_config,
+            "fullConfig must be set: this gNB stores no suspended context, so a \
+             delta would be relative to nothing"
+        );
     }
 
     /// #50, criterion 3: `build_rrc_release` no longer hardcodes

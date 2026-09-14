@@ -11,6 +11,7 @@
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
+use crate::procedures::rrc_setup::srb1_rrc_setup_params;
 use bitvec::prelude::*;
 use thiserror::Error;
 
@@ -506,6 +507,82 @@ pub fn decode_rrc_resume_complete(bytes: &[u8]) -> Result<RrcResumeCompleteData,
 mod tests {
     use super::*;
 
+    // ========================================================================
+    // RRCResume golden bytes (issue #107, criterion 6)
+    // ========================================================================
+
+    /// Hand-derived `RRCResume` on DL-DCCH, tid 0, carrying the SRB1
+    /// configuration with `fullConfig` set.
+    ///
+    /// Derivation of the framing from `tools/rrc-15.6.0.asn1`:
+    ///
+    /// ```text
+    /// bit 0      DL-DCCH-MessageType CHOICE, 2 alternatives, no extension
+    ///            marker -> 1 bit. c1 = 0
+    /// bits 1..4  c1 CHOICE, 16 alternatives -> 4 bits. rrcResume = 1 -> 0001
+    /// bits 5..6  RRC-TransactionIdentifier, INTEGER (0..3) -> 2 bits. tid 0 -> 00
+    /// bit 7      RRCResume criticalExtensions CHOICE, 2 alternatives -> 1 bit.
+    ///            rrcResume = 0
+    ///            => byte 0 = 0b0_0001_00_0 = 0x08
+    /// bits 8..13 RRCResume-IEs preamble, 6 OPTIONAL fields -> 6 presence bits:
+    ///            radioBearerConfig=1, masterCellGroup=1, measConfig=0,
+    ///            fullConfig=1, lateNonCriticalExtension=0,
+    ///            nonCriticalExtension=0  -> 110100
+    ///            byte 1 = 0b110100_01 = 0xD1, the trailing 01 being the first two
+    ///            bits of the embedded RadioBearerConfig
+    /// ```
+    ///
+    /// The tail is the SRB1 `RadioBearerConfig` and `CellGroupConfig` whose own
+    /// bit-by-bit derivation is in `rrc_setup.rs`'s `golden_rrc_setup_srb1_bytes`
+    /// — this builder reuses `srb1_rrc_setup_params`, so quoting that derivation
+    /// rather than repeating it is deliberate.
+    const GOLDEN_RRC_RESUME_TID0: [u8; 9] = [0x08, 0xD1, 0x00, 0x00, 0x88, 0x00, 0x10, 0x00, 0x00];
+
+    #[test]
+    fn golden_rrc_resume_bytes() {
+        // The encoder output must equal the hand-derived literal. NOT a round trip:
+        // a round trip through one codec passes however wrong the layout is.
+        let params = fresh_rrc_resume_params(0).expect("resume params");
+        let bytes = encode_rrc_resume(&params).expect("encode RRCResume");
+        assert_eq!(
+            bytes,
+            GOLDEN_RRC_RESUME_TID0.to_vec(),
+            "RRCResume(SRB1, fullConfig, tid 0) must match the hand-derived UPER bytes"
+        );
+
+        // The tid occupies bits 5..6 of byte 0 ONLY. tid 2 -> 0b0_0001_10_0 = 0x0C,
+        // every other byte identical. This is what makes the derivation above a
+        // derivation rather than a capture: it predicts the change.
+        let params_tid2 = fresh_rrc_resume_params(2).expect("resume params tid 2");
+        let bytes_tid2 = encode_rrc_resume(&params_tid2).expect("encode tid 2");
+        let mut expected = GOLDEN_RRC_RESUME_TID0;
+        expected[0] = 0x0C;
+        assert_eq!(bytes_tid2, expected.to_vec());
+    }
+
+    #[test]
+    fn golden_rrc_resume_cross_decode() {
+        let data = decode_rrc_resume(&GOLDEN_RRC_RESUME_TID0).expect("decode RRCResume");
+        assert_eq!(data.rrc_transaction_id, 0);
+        assert!(
+            data.full_config,
+            "fullConfig must be set: this gNB holds no suspended context, so the \
+             resumed UE applies the configuration whole rather than as a delta"
+        );
+        let rbc = data
+            .radio_bearer_config
+            .expect("radioBearerConfig must be carried");
+        let srbs = rbc
+            .srb_to_add_mod_list
+            .expect("the resumed UE gets SRB1 back");
+        assert_eq!(srbs.0.len(), 1);
+        assert_eq!(srbs.0[0].srb_identity.0, 1);
+        assert!(
+            data.master_cell_group.is_some(),
+            "masterCellGroup must be carried"
+        );
+    }
+
     fn create_test_resume_request_params() -> RrcResumeRequestParams {
         RrcResumeRequestParams {
             resume_identity: 0x123456, // 24 bits max
@@ -639,4 +716,158 @@ mod tests {
         let bytes = encode_rrc_resume_request1(&params).unwrap();
         assert!(decode_rrc_resume_request1(&bytes[..3]).is_err());
     }
+}
+
+// ============================================================================
+// RRCResume (gNB -> UE, DL-DCCH) — TS 38.331 §6.2.2
+// ============================================================================
+
+/// Parameters for the gNB-side `RRCResume` (issue #107, criterion 2).
+#[derive(Debug, Clone)]
+pub struct RrcResumeParams {
+    /// RRC-TransactionIdentifier (0..3)
+    pub rrc_transaction_id: u8,
+    /// The `radioBearerConfig` the resumed UE is to apply, already UPER encoded.
+    pub radio_bearer_config: Vec<u8>,
+    /// The `masterCellGroup`, already UPER encoded. Carried as an OCTET STRING
+    /// CONTAINING a `CellGroupConfig`, the same shape RRCSetup uses.
+    pub master_cell_group: Vec<u8>,
+    /// `fullConfig`: the UE is to apply a FULL configuration rather than a delta
+    /// on top of a stored one (TS 38.331 §5.3.13.4).
+    pub full_config: bool,
+}
+
+/// Parsed `RRCResume`.
+#[derive(Debug, Clone)]
+pub struct RrcResumeData {
+    /// RRC-TransactionIdentifier
+    pub rrc_transaction_id: u8,
+    /// The decoded `radioBearerConfig`, when present
+    pub radio_bearer_config: Option<RadioBearerConfig>,
+    /// The raw `masterCellGroup` octets, when present
+    pub master_cell_group: Option<Vec<u8>>,
+    /// Whether `fullConfig` was set
+    pub full_config: bool,
+}
+
+/// Builds an `RRCResume` on **DL-DCCH** (TS 38.331 §6.2.2, issue #107).
+///
+/// # DL-DCCH, not DL-CCCH
+///
+/// The hand-rolled builder this replaces produced what its own comment called a
+/// "DL-CCCH-Message with RRCResume". `RRCResume` is a **DL-DCCH** message: it
+/// rides SRB1, which the suspended UE already had. `RRCResumeRequest` is the
+/// CCCH half (UL-CCCH), and mixing the two up would put the resume on a channel
+/// the UE does not read it on.
+///
+/// # The bearer configuration is mandatory in practice
+///
+/// `radioBearerConfig` and `masterCellGroup` are both OPTIONAL in the ASN.1
+/// (they are a *delta* on the stored configuration in a normal resume). This
+/// builder requires them, because this gNB stores **no** suspended context — see
+/// the note on `full_config`.
+pub fn build_rrc_resume(params: &RrcResumeParams) -> Result<DL_DCCH_Message, RrcResumeError> {
+    if params.rrc_transaction_id > 3 {
+        return Err(RrcResumeError::InvalidFieldValue(
+            "RRC-TransactionIdentifier is INTEGER(0..3)".to_string(),
+        ));
+    }
+    if params.radio_bearer_config.is_empty() || params.master_cell_group.is_empty() {
+        return Err(RrcResumeError::InvalidFieldValue(
+            "RRCResume must carry a radioBearerConfig and a masterCellGroup: this \
+             gNB stores no suspended context, so a resumed UE has nothing to apply \
+             a delta to"
+                .to_string(),
+        ));
+    }
+
+    let radio_bearer_config: RadioBearerConfig = decode_rrc(&params.radio_bearer_config)?;
+
+    let ies = RRCResume_IEs {
+        radio_bearer_config: Some(radio_bearer_config),
+        master_cell_group: Some(RRCResume_IEsMasterCellGroup(
+            params.master_cell_group.clone(),
+        )),
+        meas_config: None,
+        full_config: if params.full_config {
+            Some(RRCResume_IEsFullConfig(RRCResume_IEsFullConfig::TRUE))
+        } else {
+            None
+        },
+        late_non_critical_extension: None,
+        non_critical_extension: None,
+    };
+
+    Ok(DL_DCCH_Message {
+        message: DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcResume(RRCResume {
+            rrc_transaction_identifier: RRC_TransactionIdentifier(params.rrc_transaction_id),
+            critical_extensions: RRCResumeCriticalExtensions::RrcResume(ies),
+        })),
+    })
+}
+
+/// Builds and encodes an `RRCResume` to UPER bytes.
+pub fn encode_rrc_resume(params: &RrcResumeParams) -> Result<Vec<u8>, RrcResumeError> {
+    let msg = build_rrc_resume(params)?;
+    Ok(encode_rrc(&msg)?)
+}
+
+/// Parses an `RRCResume` from a DL-DCCH message.
+pub fn parse_rrc_resume(msg: &DL_DCCH_Message) -> Result<RrcResumeData, RrcResumeError> {
+    let DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcResume(resume)) = &msg.message else {
+        return Err(RrcResumeError::InvalidMessageType {
+            expected: "RRCResume".to_string(),
+            actual: format!("{:?}", msg.message),
+        });
+    };
+    let RRCResumeCriticalExtensions::RrcResume(ies) = &resume.critical_extensions else {
+        return Err(RrcResumeError::InvalidMessageType {
+            expected: "rrcResume critical extension".to_string(),
+            actual: "criticalExtensionsFuture".to_string(),
+        });
+    };
+    Ok(RrcResumeData {
+        rrc_transaction_id: resume.rrc_transaction_identifier.0,
+        radio_bearer_config: ies.radio_bearer_config.clone(),
+        master_cell_group: ies.master_cell_group.as_ref().map(|m| m.0.clone()),
+        full_config: ies.full_config.is_some(),
+    })
+}
+
+/// Decodes and parses an `RRCResume` from UPER bytes.
+pub fn decode_rrc_resume(bytes: &[u8]) -> Result<RrcResumeData, RrcResumeError> {
+    let msg: DL_DCCH_Message = decode_rrc(bytes)?;
+    parse_rrc_resume(&msg)
+}
+
+/// The `RRCResume` a UE gets when the network holds **no** suspended context for
+/// it (issue #107, criterion 2 — "the 'what does a resumed UE get' decision").
+///
+/// # The decision: a FRESH configuration with `fullConfig` set
+///
+/// TS 38.331 §5.3.13.4 lets `RRCResume` carry a delta on the configuration the UE
+/// stored when it was suspended. This gNB cannot: RRC_INACTIVE is unreachable
+/// (issue #38), nothing ever sends a `suspendConfig`, and no suspended
+/// configuration is stored anywhere — so there is no stored configuration for a
+/// delta to be relative to.
+///
+/// So the resumed UE is given the **same SRB1 configuration RRCSetup builds**,
+/// with `fullConfig` **set**, which is precisely what that IE is for: it tells the
+/// UE to release its stored configuration and apply this one whole. The
+/// alternative — omitting `fullConfig` and sending the same bearers as a "delta" —
+/// would ask the UE to merge them into a stored configuration that does not exist,
+/// and a UE that had a real one would end up with a mixture neither side intended.
+///
+/// This is honest rather than complete: a UE resumed this way loses whatever it
+/// had, which is what "the network forgot you" means. When #38 makes RRC_INACTIVE
+/// reachable and a suspended context is stored, this is the function to revisit.
+pub fn fresh_rrc_resume_params(rrc_transaction_id: u8) -> Result<RrcResumeParams, RrcResumeError> {
+    let setup = srb1_rrc_setup_params(rrc_transaction_id)
+        .map_err(|e| RrcResumeError::InvalidFieldValue(e.to_string()))?;
+    Ok(RrcResumeParams {
+        rrc_transaction_id,
+        radio_bearer_config: setup.radio_bearer_config,
+        master_cell_group: setup.master_cell_group,
+        full_config: true,
+    })
 }

@@ -765,6 +765,135 @@ impl EnhancedMeasQuantities {
 mod tests {
     use super::*;
 
+    // ========================================================================
+    // MeasurementReport golden bytes (issue #107, criterion 6)
+    // ========================================================================
+
+    /// Hand-derived `MeasurementReport` on UL-DCCH: measId 1, one serving result
+    /// (physCellId 1, RSRP -90 dBm) and no neighbours.
+    ///
+    /// Derivation of the framing from `tools/rrc-15.6.0.asn1`:
+    ///
+    /// ```text
+    /// bit 0      UL-DCCH-MessageType CHOICE, 2 alternatives -> 1 bit. c1 = 0
+    /// bits 1..4  c1 CHOICE, 16 alternatives -> 4 bits.
+    ///            measurementReport = 0 -> 0000
+    /// bit 5      MeasurementReport criticalExtensions CHOICE -> 1 bit.
+    ///            measurementReport = 0
+    ///            => byte 0 starts 0b0_0000_0..., and with the following preamble
+    ///               bits still zero the byte is 0x00
+    /// ```
+    ///
+    /// `-90 dBm` is `RSRP-Range` 66 (`dbm_to_rsrp_range(-90) = -90 + 156`), and 66
+    /// is `0b1000010` — visible in the literal as the `0x52, 0x10` tail once the
+    /// preceding bits are accounted for. The inner `MeasResults` nesting is pinned
+    /// by this literal and cross-checked by
+    /// `golden_measurement_report_cross_decode`, not derived bit by bit; said
+    /// plainly rather than overclaimed.
+    const GOLDEN_MEASUREMENT_REPORT: [u8; 7] = [0x00, 0x00, 0x00, 0x04, 0x01, 0x52, 0x10];
+
+    fn golden_measurement_report_params() -> MeasurementReportParams {
+        MeasurementReportParams {
+            meas_id: 1,
+            serv_freq_results: vec![MeasResultServFreqNr {
+                serv_cell_index: 0,
+                meas_result_serving_cell: MeasResultNr {
+                    phys_cell_id: Some(1),
+                    cell_results: MeasResultCellNr {
+                        ssb_results: Some(MeasCellResults {
+                            rsrp: Some(dbm_to_rsrp_range(-90.0)),
+                            rsrq: None,
+                            sinr: None,
+                        }),
+                        csi_rs_results: None,
+                    },
+                    rs_index_results: None,
+                },
+                meas_result_best_neigh_cell: None,
+            }],
+            neigh_freq_results: Vec::new(),
+            eutra_neigh_results: Vec::new(),
+            enhanced_quantities: None,
+        }
+    }
+
+    #[test]
+    fn golden_measurement_report_bytes() {
+        let bytes = encode_measurement_report(&golden_measurement_report_params()).expect("encode");
+        assert_eq!(
+            bytes,
+            GOLDEN_MEASUREMENT_REPORT.to_vec(),
+            "the MeasurementReport must match the hand-derived UPER bytes, not a \
+             round trip through this codec"
+        );
+    }
+
+    #[test]
+    fn golden_measurement_report_cross_decode() {
+        let data = decode_measurement_report(&GOLDEN_MEASUREMENT_REPORT).expect("decode");
+        assert_eq!(data.meas_id.0, 1);
+        assert_eq!(data.serv_freq_results.len(), 1);
+        let serv = &data.serv_freq_results[0];
+        assert_eq!(serv.serv_cell_index, 0);
+        assert_eq!(serv.meas_result_serving_cell.phys_cell_id, Some(1));
+        let rsrp = serv
+            .meas_result_serving_cell
+            .cell_results
+            .ssb_results
+            .as_ref()
+            .and_then(|r| r.rsrp)
+            .expect("the serving RSRP must be carried");
+        assert_eq!(rsrp, 66, "-90 dBm is RSRP-Range 66");
+        assert_eq!(rsrp_range_to_dbm(rsrp).round() as i32, -90);
+        assert!(data.neigh_freq_results.is_empty());
+    }
+
+    /// The RSRP mapping's boundaries, because they are what a wrong offset would
+    /// move: range 0 is "below -156 dBm" and 127 is "at or above -31 dBm".
+    #[test]
+    fn the_nr_rsrp_range_mapping_saturates_at_both_ends() {
+        assert_eq!(dbm_to_rsrp_range(-156.0), 0);
+        assert_eq!(
+            dbm_to_rsrp_range(-200.0),
+            0,
+            "below the range saturates at 0"
+        );
+        assert_eq!(dbm_to_rsrp_range(-31.0), 125);
+        assert_eq!(
+            dbm_to_rsrp_range(0.0),
+            127,
+            "above the range saturates at 127"
+        );
+        assert_eq!(dbm_to_rsrp_range(-90.0), 66);
+    }
+
+    /// The E-UTRA table is a DIFFERENT one (TS 36.133 §9.1.4): offset 140, ceiling
+    /// 97, and range 0 means "below -140 dBm". Using the NR converter for an E-UTRA
+    /// level would report it about 16 ranges too high, which is why both exist.
+    #[test]
+    fn the_eutra_rsrp_range_mapping_differs_from_the_nr_one() {
+        assert_eq!(dbm_to_eutra_rsrp_range(-141.0), 0, "below -140 is range 0");
+        assert_eq!(dbm_to_eutra_rsrp_range(-140.0), 1);
+        assert_eq!(dbm_to_eutra_rsrp_range(-100.0), 41);
+        assert_eq!(dbm_to_eutra_rsrp_range(-44.0), 97);
+        assert_eq!(
+            dbm_to_eutra_rsrp_range(0.0),
+            97,
+            "above the range saturates at 97, not 127"
+        );
+        assert_ne!(
+            dbm_to_eutra_rsrp_range(-100.0),
+            dbm_to_rsrp_range(-100.0),
+            "the two tables must not agree, or one of them is wrong"
+        );
+        assert_eq!(eutra_rsrp_range_to_dbm(41).round() as i32, -100);
+        assert_eq!(
+            eutra_rsrp_range_to_dbm(0).round() as i32,
+            -141,
+            "range 0 has no single dBm value; it maps to the first level it covers"
+        );
+    }
+
     fn create_test_meas_result_nr() -> MeasResultNr {
         MeasResultNr {
             phys_cell_id: Some(100),
@@ -1194,4 +1323,37 @@ mod tests {
 
         assert_eq!(decoded.eutra_neigh_results, cells);
     }
+}
+
+/// Convert an E-UTRA RSRP measurement in dBm to `RSRP-RangeEUTRA`
+/// (`INTEGER (0..97)`, TS 36.133 §9.1.4).
+///
+/// The table is NOT the NR one: `RSRP_00` means "below -140 dBm", `RSRP_01` is
+/// `-140 <= RSRP < -139`, and so on to `RSRP_97` for "at or above -44 dBm". So the
+/// value is `1 + floor(dBm + 140)`, saturating at 97 — a different offset and a
+/// different ceiling from [`dbm_to_rsrp_range`], which is why reusing that one
+/// here would report an E-UTRA level roughly 16 ranges too high.
+///
+/// Note `nextgsim-ue`'s `nas::lpp::rsrp_report_value` computes the same TS 36.133
+/// table for the LPP E-CID report (issue #46). They are deliberately separate:
+/// that one lives in a UE-only NAS module behind an UNALIGNED PER codec and is not
+/// reachable from the gNB, while this one has to be, because the gNB inverts it
+/// with [`eutra_rsrp_range_to_dbm`] when it parses a B1/B2 report.
+pub fn dbm_to_eutra_rsrp_range(dbm: f64) -> u8 {
+    if dbm < -140.0 {
+        return 0;
+    }
+    let range = 1 + (dbm + 140.0).floor() as i32;
+    range.clamp(0, 97) as u8
+}
+
+/// The inverse of [`dbm_to_eutra_rsrp_range`], in dBm.
+///
+/// Range 0 has no single dBm value — it means "below -140 dBm" — so it maps to
+/// -141, the first level it covers, rather than to -140, which is range 1.
+pub fn eutra_rsrp_range_to_dbm(range: u8) -> f64 {
+    if range == 0 {
+        return -141.0;
+    }
+    -140.0 + f64::from(range - 1)
 }
