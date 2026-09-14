@@ -1,0 +1,14 @@
+[package]
+name = "nextgsim-pdcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NR PDCP entity for DRB user-plane bearers (3GPP TS 38.323)"
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }

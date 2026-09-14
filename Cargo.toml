@@ -9,6 +9,7 @@ members = [
     "nextgsim-rrc",
     "nextgsim-rls",
     "nextgsim-rlc",
+    "nextgsim-pdcp",
     "nextgsim-gtp",
     "nextgsim-sctp",
     "nextgsim-gnb",
@@ -98,6 +99,7 @@ nextgsim-ngap = { path = "nextgsim-ngap" }
 nextgsim-rrc = { path = "nextgsim-rrc" }
 nextgsim-rls = { path = "nextgsim-rls" }
 nextgsim-rlc = { path = "nextgsim-rlc" }
+nextgsim-pdcp = { path = "nextgsim-pdcp" }
 nextgsim-gtp = { path = "nextgsim-gtp" }
 nextgsim-sctp = { path = "nextgsim-sctp" }
 nextgsim-gnb = { path = "nextgsim-gnb" }

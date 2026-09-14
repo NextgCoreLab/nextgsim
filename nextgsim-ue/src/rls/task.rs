@@ -16,6 +16,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::tasks::{NasMessage, RlfCause, RlsMessage, RrcMessage, Task, TaskMessage, UeTaskBase};
 use nextgsim_common::OctetString;
+#[cfg(feature = "drb-pdcp")]
+use nextgsim_pdcp::{Pdcp, PdcpConfig};
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
     codec, CellSearchEvent, RlsMessage as RlsProtocolMessage, RlsTransport, RrcChannel,
@@ -93,6 +95,12 @@ pub struct RlsTask {
     /// RLC entities keyed by PSI (PDU Session ID).
     /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
     rlc_entities: HashMap<i32, RlcEntity>,
+    /// PDCP entities keyed by PSI -- one per DRB (TS 38.323 §5.2, issue #33).
+    #[cfg(feature = "drb-pdcp")]
+    pdcp_entities: HashMap<i32, Pdcp>,
+    /// When this task started, the origin for the PDCP timers.
+    #[cfg(feature = "drb-pdcp")]
+    started_at: std::time::Instant,
 }
 
 impl RlsTask {
@@ -124,6 +132,10 @@ impl RlsTask {
             config,
             sti,
             rlc_entities: HashMap::new(),
+            #[cfg(feature = "drb-pdcp")]
+            pdcp_entities: HashMap::new(),
+            #[cfg(feature = "drb-pdcp")]
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -169,6 +181,27 @@ impl RlsTask {
     /// sequence-number space and reassembly buffer. The PSI stands in for the
     /// DRB identity: this simulator maps one DRB per PDU session, and the gNB
     /// keys its own entities on `(ue_id, psi)` to match.
+    /// The PDCP entity for one DRB, created on first use (issue #33).
+    ///
+    /// Only compiled with the `drb-pdcp` feature: interposing a sublayer changes
+    /// the live data path, so the default build keeps RLC wired straight to NAS
+    /// exactly as before.
+    #[cfg(feature = "drb-pdcp")]
+    fn pdcp_entity_for(&mut self, psi: i32) -> &mut Pdcp {
+        self.pdcp_entities
+            .entry(psi)
+            .or_insert_with(|| Pdcp::new(PdcpConfig::default()))
+    }
+
+    /// Milliseconds since the task started, for the PDCP timers.
+    ///
+    /// A monotonic elapsed time rather than a wall clock: the PDCP timers measure
+    /// durations, and a wall-clock step would move them.
+    #[cfg(feature = "drb-pdcp")]
+    fn pdcp_now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
     fn rlc_entity_for(&mut self, psi: i32) -> &mut RlcEntity {
         let mode = if self.task_base.config.rlc_am_psis.contains(&(psi as u8)) {
             RlcMode::AcknowledgedMode
@@ -178,6 +211,37 @@ impl RlsTask {
         self.rlc_entities
             .entry(psi)
             .or_insert_with(|| RlcEntity::new(mode, SnSize::Sn12))
+    }
+
+    /// Drive every PDCP entity's `t-Reordering` and deliver whatever expires
+    /// (TS 38.323 §5.2.2.2, issue #33).
+    ///
+    /// Needed because the timer is otherwise only evaluated when a PDU arrives, so
+    /// a gap at the END of a flow would hold the SDUs behind it indefinitely -- the
+    /// very case reordering exists to bound.
+    #[cfg(feature = "drb-pdcp")]
+    async fn poll_pdcp_timers(&mut self) {
+        let now_ms = self.pdcp_now_ms();
+        let mut delivered: Vec<(i32, Vec<u8>)> = Vec::new();
+        for (psi, pdcp) in &mut self.pdcp_entities {
+            for sdu in pdcp.poll_t_reordering(now_ms) {
+                delivered.push((*psi, sdu));
+            }
+        }
+        for (psi, sdu) in delivered {
+            debug!(
+                "PDCP t-Reordering released an SDU: psi={psi}, len={}",
+                sdu.len()
+            );
+            let _ = self
+                .task_base
+                .nas_tx
+                .send(NasMessage::UplinkDataDelivery {
+                    psi,
+                    data: OctetString::from_slice(&sdu),
+                })
+                .await;
+        }
     }
 
     /// Sends one RLC PDU (data or STATUS) to the serving cell.
@@ -440,8 +504,31 @@ impl RlsTask {
                     // never learns anything and re-polls forever.
                     pending_status_psi = Some(psi_i32);
 
-                    for sdu in reassembled {
-                        debug!("RLC reassembled SDU: psi={}, len={}", psi_i32, sdu.len());
+                    // PDCP receive (issue #33): what RLC reassembled is a PDCP
+                    // PDU, so it goes through the reordering entity and only
+                    // in-order SDUs reach NAS. Without the feature the reassembled
+                    // bytes go straight up, as before.
+                    #[cfg(feature = "drb-pdcp")]
+                    let to_nas: Vec<Vec<u8>> = {
+                        let now_ms = self.pdcp_now_ms();
+                        let pdcp = self.pdcp_entity_for(psi_i32);
+                        let mut delivered = Vec::new();
+                        for sdu in reassembled {
+                            match pdcp.receive_pdu(&sdu, now_ms) {
+                                Ok(sdus) => delivered.extend(sdus),
+                                Err(e) => {
+                                    debug!("PDCP discarded a downlink PDU on psi {psi_i32}: {e:?}")
+                                }
+                            }
+                        }
+                        delivered.extend(pdcp.poll_t_reordering(now_ms));
+                        delivered
+                    };
+                    #[cfg(not(feature = "drb-pdcp"))]
+                    let to_nas: Vec<Vec<u8>> = reassembled;
+
+                    for sdu in to_nas {
+                        debug!("DRB SDU for NAS: psi={}, len={}", psi_i32, sdu.len());
                         let octet = OctetString::from_slice(&sdu);
                         let _ = self
                             .task_base
@@ -577,8 +664,24 @@ impl RlsTask {
         // the mutable borrow so that self.transport and self.socket are
         // accessible again for transmission.
         let rlc_pdus = {
+            // PDCP first (issue #33): the SDU gets a PDCP header, an SN and a
+            // discardTimer, and it is the PDCP PDU -- not the raw IP packet -- that
+            // RLC segments. Without the feature the IP packet goes to RLC directly,
+            // as before.
+            #[cfg(feature = "drb-pdcp")]
+            let to_rlc: Vec<Vec<u8>> = {
+                let now_ms = self.pdcp_now_ms();
+                let pdcp = self.pdcp_entity_for(psi);
+                pdcp.submit_sdu(pdu.data(), now_ms);
+                pdcp.take_transmittable(now_ms)
+            };
+            #[cfg(not(feature = "drb-pdcp"))]
+            let to_rlc: Vec<Vec<u8>> = vec![pdu.data().to_vec()];
+
             let rlc = self.rlc_entity_for(psi);
-            rlc.submit_sdu(pdu.data().to_vec());
+            for sdu in to_rlc {
+                rlc.submit_sdu(sdu);
+            }
             let mut pdus = Vec::new();
             while let Some(rlc_pdu) = rlc.build_pdu(MAC_GRANT_BYTES) {
                 pdus.push(rlc_pdu);
@@ -699,6 +802,8 @@ impl Task for RlsTask {
                     self.send_pending_acks().await;
                     self.check_expired_pdus().await;
                     self.poll_rlc_timers().await;
+                    #[cfg(feature = "drb-pdcp")]
+                    self.poll_pdcp_timers().await;
                 }
             }
         }

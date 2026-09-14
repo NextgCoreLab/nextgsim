@@ -18,6 +18,11 @@ event-bus = ["nextgsim-common/event-bus"]
 # so the gNB can associate with a real / Open5GS AMF over kernel SCTP (proto
 # 132). Only effective on Linux; requires libsctp (`-lsctp`) at link time.
 kernel-sctp = ["nextgsim-sctp/kernel-sctp"]
+# Per-DRB PDCP entity on the user plane (issue #33, TS 38.323 §5.2). Off by
+# default: interposing a sublayer reshapes the live data path, so the default
+# build keeps RLC wired straight to GTP-U. Both ends must agree -- a gNB with the
+# feature on and a UE with it off would have the UE read a PDCP header as payload.
+drb-pdcp = []
 
 # Umbrella feature enabling all six optional 6G / AI-native research crates at
 # once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and
@@ -47,6 +52,7 @@ nextgsim-ngap.workspace = true
 nextgsim-rrc.workspace = true
 nextgsim-rls.workspace = true
 nextgsim-rlc.workspace = true
+nextgsim-pdcp.workspace = true
 nextgsim-gtp.workspace = true
 nextgsim-sctp.workspace = true
 
