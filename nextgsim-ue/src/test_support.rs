@@ -57,6 +57,22 @@ pub(crate) fn task_base() -> UeTaskBase {
     }
 }
 
+/// A [`UeTaskBase`] over `config`, with every peer channel's receiver dropped.
+///
+/// Same shape as [`task_base`], for a task whose behaviour is driven by its
+/// configuration rather than by its peers.
+///
+/// Gated on `sidelink` because its only callers today are the SL-PRS ranging tests
+/// (issue #136), which are; widen the gate when something else needs it, rather
+/// than carrying it as dead code in a default build.
+#[cfg(feature = "sidelink")]
+pub(crate) fn task_base_with_config(config: UeConfig) -> UeTaskBase {
+    UeTaskBase {
+        config: Arc::new(config),
+        ..task_base()
+    }
+}
+
 /// A `MakeWriter` that appends every formatted log record to a shared buffer.
 #[derive(Clone, Default)]
 pub(crate) struct CapturedLog(Arc<Mutex<Vec<u8>>>);

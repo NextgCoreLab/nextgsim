@@ -1289,6 +1289,23 @@ pub enum RangingMethod {
     MultiRtt,
 }
 
+/// A peer or anchor UE this UE ranges against, and where it is.
+///
+/// The position is the source of truth the SL-PRS occasion measures against
+/// (issue #136). This simulator has no PC5 radio, so the propagation delay is
+/// **modelled** from geometry rather than observed: `RangingConfig::own_position`
+/// and this position give a true range, which becomes the round-trip time an
+/// SL-PRS exchange would have measured. Stated here rather than left implicit,
+/// because the accuracy a test reads back is the accuracy of that model and not
+/// of a radio.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangingAnchor {
+    /// The peer UE's sidelink identifier, as reported to the ranging session.
+    pub ue_id: u64,
+    /// Position in metres, local east/north/up.
+    pub position: [f64; 3],
+}
+
 /// Ranging/sidelink positioning configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangingConfig {
@@ -1306,6 +1323,28 @@ pub struct RangingConfig {
     /// Target accuracy (meters)
     #[serde(default = "default_ranging_accuracy")]
     pub target_accuracy_meters: f64,
+    /// This UE's own position in metres, local east/north/up (issue #136).
+    ///
+    /// Together with each [`RangingAnchor`]'s position this is what an SL-PRS
+    /// occasion measures. Defaults to the origin.
+    #[serde(default)]
+    pub own_position: [f64; 3],
+    /// The peers or anchors SL-PRS occasions measure against.
+    ///
+    /// Empty by default: a UE with ranging enabled but no anchors takes no
+    /// measurements, which is the honest outcome for "nothing to range against"
+    /// rather than an invented peer.
+    #[serde(default)]
+    pub anchors: Vec<RangingAnchor>,
+    /// Carrier frequencies in MHz used for carrier-phase measurement.
+    ///
+    /// **At least two are needed**, and they must differ: the widelane
+    /// combination that resolves the integer ambiguity is built from the
+    /// difference of two phases (`RangingSession::resolve_carrier_phase_ambiguity`),
+    /// so one frequency yields an RTT-only estimate. Defaults to the n78 pair
+    /// used by the ranging tests.
+    #[serde(default = "default_ranging_carrier_frequencies_mhz")]
+    pub carrier_frequencies_mhz: Vec<f64>,
 }
 
 fn default_ranging_distance() -> f64 {
@@ -1317,6 +1356,12 @@ fn default_ranging_interval() -> u32 {
 fn default_ranging_accuracy() -> f64 {
     0.3
 }
+/// Two n78 carriers 100 MHz apart. The gap sets the widelane wavelength
+/// (`c / Δf` = 3 m here), which bounds how far the RTT estimate may be off
+/// before the integer ambiguity resolves to the wrong cycle.
+fn default_ranging_carrier_frequencies_mhz() -> Vec<f64> {
+    vec![3500.0, 3600.0]
+}
 
 impl Default for RangingConfig {
     fn default() -> Self {
@@ -1326,6 +1371,9 @@ impl Default for RangingConfig {
             max_distance_meters: 200.0,
             interval_ms: 100,
             target_accuracy_meters: 0.3,
+            own_position: [0.0, 0.0, 0.0],
+            anchors: Vec::new(),
+            carrier_frequencies_mhz: default_ranging_carrier_frequencies_mhz(),
         }
     }
 }

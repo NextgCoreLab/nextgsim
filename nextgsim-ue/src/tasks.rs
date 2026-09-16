@@ -1364,6 +1364,18 @@ pub enum SidelinkMessage {
         /// Response: estimated position (x, y, z)
         response_tx: Option<tokio::sync::oneshot::Sender<Option<(f64, f64, f64)>>>,
     },
+    /// An SL-PRS transmission occasion has come round (TS 23.586 §5.3.3,
+    /// issue #136): measure every configured anchor and report the results to the
+    /// ranging task.
+    ///
+    /// This is the stimulus the ranging pipeline had none of. Sent by the UE
+    /// binary on the interval `RangingConfig::interval_ms` names, and only when
+    /// ranging is enabled.
+    SlPrsOccasion {
+        /// Occasion timestamp in milliseconds, carried through to the
+        /// measurements so a session can tell one occasion from the next.
+        timestamp_ms: u64,
+    },
 }
 
 // ============================================================================
