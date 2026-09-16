@@ -154,6 +154,29 @@ pub struct GnbConfig {
     /// recorded for `gtpu_echo_period_secs`: CI compiles default features only.
     #[serde(default)]
     pub scell_phys_cell_id: Option<u16>,
+    /// Arm conditional handover: nominate the configured intra-frequency neighbours as
+    /// CHO candidates (TS 38.331 §5.3.5.13, issue #160).
+    ///
+    /// Off by default, and a runtime switch rather than a cargo feature for the reason
+    /// already recorded for `scell_phys_cell_id`: CI compiles default features only.
+    /// Arming CHO changes what the UE does on its own -- it executes a handover with no
+    /// further signalling -- so it must be asked for.
+    ///
+    /// The candidates come from `reselection.intra_freq_neighbours`, the neighbours this
+    /// gNB already broadcasts in SIB3. A second list would let the two disagree about
+    /// which neighbours exist.
+    #[serde(default)]
+    pub conditional_handover: bool,
+    /// `a3-Offset` in dB for the CHO execution condition (TS 38.331 §5.5.4.4).
+    ///
+    /// The neighbour must beat the serving cell by this much. Defaults to 3 dB, the
+    /// value the UE's own A3 measurement configuration uses, so an armed candidate and
+    /// a measurement report agree about what "better" means.
+    #[serde(default = "default_cho_a3_offset_db")]
+    pub cho_a3_offset_db: f64,
+    /// Hysteresis in dB for the CHO execution condition. Defaults to 1 dB.
+    #[serde(default = "default_cho_hysteresis_db")]
+    pub cho_hysteresis_db: f64,
     /// Default paging cycle in radio frames (TS 38.331
     /// `PCCH-Config.defaultPagingCycle`), used when the AMF's NGAP
     /// `(default)PagingDRX` does not supply one. Must be 32, 64, 128 or 256.
@@ -441,6 +464,9 @@ impl Default for GnbConfig {
             si_broadcast_period_ms: default_si_broadcast_period_ms(),
             accept_raw_nas_on_dcch: false,
             scell_phys_cell_id: None,
+            conditional_handover: false,
+            cho_a3_offset_db: default_cho_a3_offset_db(),
+            cho_hysteresis_db: default_cho_hysteresis_db(),
             pqc_config: PqcConfig::default(),
             ntn_config: None,
             as_security_enabled: false,
@@ -864,6 +890,15 @@ fn default_t_reselection_s() -> u8 {
 /// Mid-range. TS 38.304 §5.2.4.1 never reselects to a LOWER-priority frequency
 /// while the serving one is good enough, so a cell that gave itself 0 could not
 /// be left for an equal-priority neighbour under the priority rules.
+/// 3 dB: the same A3 offset the UE's default measurement configuration uses, so an
+/// armed CHO candidate and a measurement report agree about what "better" means.
+fn default_cho_a3_offset_db() -> f64 {
+    3.0
+}
+/// 1 dB, matching the UE's default A3 hysteresis.
+fn default_cho_hysteresis_db() -> f64 {
+    1.0
+}
 fn default_cell_reselection_priority() -> u8 {
     4
 }
