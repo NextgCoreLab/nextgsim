@@ -133,3 +133,7 @@ path = "src/up_security_user_plane.rs"
 [[test]]
 name = "ranging_report_e2e"
 path = "src/ranging_report_e2e.rs"
+
+[[test]]
+name = "conditional_handover_e2e"
+path = "src/conditional_handover_e2e.rs"

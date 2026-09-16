@@ -216,7 +216,10 @@ impl RrcTask {
     /// The envelope is the simulator's hand-rolled DL-DCCH framing, because
     /// `conditionalReconfiguration` is a Rel-16 IE and the vendored schema is Rel-15
     /// (issues #107, #105).
-    async fn send_conditional_handover_configuration(&mut self, ue_id: i32) {
+    /// Public because the in-process gNB<->UE harness drives it directly
+    /// (`tests/src/conditional_handover_e2e.rs`, issue #165), the same reason
+    /// `handle_radio_power_on` and `handle_uplink_rrc` are.
+    pub async fn send_conditional_handover_configuration(&mut self, ue_id: i32) {
         if !self.task_base.config.conditional_handover {
             return;
         }
