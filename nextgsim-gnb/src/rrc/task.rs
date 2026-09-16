@@ -14,8 +14,12 @@ use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
 use nextgsim_common::SNssai;
 use nextgsim_rls::RrcChannel;
+use nextgsim_rrc::procedures::conditional_handover::{
+    encode_cho_config, A3Offset, ChoCandidateCell, ChoCondition, ChoConfig, ChoTargetCellConfig,
+    EventA3Condition, Hysteresis, TimeToTrigger,
+};
 use nextgsim_rrc::procedures::dcch_dispatch::{
-    dispatch_ul_dcch, UlDcchMessage, SIM_RECONFIGURATION_WITH_SCELL,
+    dispatch_ul_dcch, UlDcchMessage, SIM_RECONFIGURATION_WITH_CHO, SIM_RECONFIGURATION_WITH_SCELL,
 };
 use nextgsim_rrc::procedures::information_transfer::{
     encode_dl_information_transfer, DlInformationTransferParams,
@@ -121,6 +125,10 @@ pub struct RrcTask {
     /// exported from `rrc/mod.rs` and exercised only by a unit test, so an
     /// NWDAF-recommended handover could log success and reach no handover machinery.
     handover_manager: GnbHandoverManager,
+    /// UEs that have already been armed with conditional-handover candidates
+    /// (issue #160). Same reason as `scell_configured_ues`: the UE acknowledges each
+    /// reconfiguration, and the acknowledgement is what triggers the next one.
+    cho_configured_ues: std::collections::HashSet<i32>,
     /// UEs admitted on a handover-in whose arrival has not yet been reported to the
     /// AMF (TS 38.413 §8.4.3, issue #156).
     ///
@@ -129,6 +137,23 @@ pub struct RrcTask {
     /// arriving UE's first message to the target IS the RRCReconfigurationComplete.
     pending_handover_arrivals: std::collections::HashSet<i32>,
 }
+
+/// The `condReconfigId` this gNB uses. One configuration per UE, so a fixed value is
+/// enough; a counter would imply the UE can hold several, which #114's runtime cannot.
+const CHO_CONFIG_ID: u8 = 1;
+
+/// How many neighbours may be nominated as CHO candidates.
+///
+/// TS 38.331 allows 8 (`maxNrofCondCells-r16`). The container encoder is the binding
+/// limit in practice, and nominating more than the UE can hold would have it drop the
+/// tail silently.
+const MAX_CHO_CANDIDATES: u8 = 8;
+
+/// SSB subcarrier spacing advertised for a CHO candidate, in kHz.
+///
+/// 30 kHz: FR1 numerology µ=1, matching the value the rest of this tree assumes for the
+/// n78 band it defaults to. There is no PHY here to read it from.
+const CHO_SSB_SCS_KHZ: u16 = 30;
 
 /// PDCP BEARER for SRB1 (TS 38.323 §5.9: the SRB identity minus one, so 0).
 const SRB1_PDCP_BEARER: u8 = 0;
@@ -167,9 +192,154 @@ impl RrcTask {
             pdu_id_counter: 0,
             ntn_config: None,
             scell_configured_ues: std::collections::HashSet::new(),
+            cho_configured_ues: std::collections::HashSet::new(),
             pending_handover_arrivals: std::collections::HashSet::new(),
             handover_manager: GnbHandoverManager::new(own_cell),
         }
+    }
+
+    /// Arm conditional handover at a UE, once (TS 38.331 §5.3.5.13, issue #160).
+    ///
+    /// No-op unless `GnbConfig::conditional_handover` is set and at least one
+    /// intra-frequency neighbour is configured. The candidates are exactly the
+    /// neighbours this gNB broadcasts in SIB3 (`reselection.intra_freq_neighbours`):
+    /// a second CHO-only list would let the two disagree about which neighbours exist,
+    /// and the UE measures the ones it was told about.
+    ///
+    /// One `condEventA3` per candidate, from the configured offset and hysteresis, so
+    /// the condition the UE evaluates is the one a measurement report would use.
+    /// `condEventA5` is not offered: it needs two absolute thresholds this gNB has no
+    /// configuration for, and inventing them would arm a condition nobody chose.
+    /// Predictive and AI-assisted conditions are not offered either -- the container
+    /// encoder rejects them.
+    ///
+    /// The envelope is the simulator's hand-rolled DL-DCCH framing, because
+    /// `conditionalReconfiguration` is a Rel-16 IE and the vendored schema is Rel-15
+    /// (issues #107, #105).
+    async fn send_conditional_handover_configuration(&mut self, ue_id: i32) {
+        if !self.task_base.config.conditional_handover {
+            return;
+        }
+        let neighbours = &self.task_base.config.reselection.intra_freq_neighbours;
+        // Not the binding guard -- `encode_cho_config` refuses an empty candidate list
+        // and is what actually stops the send (pinned by
+        // `the_cho_encoder_refuses_an_empty_candidate_list`). This early return exists
+        // for the LOG: "no neighbour configured" is actionable and "the container failed
+        // to encode" is not. A revert round proved it cannot be verified on its own,
+        // which is why the codec fact is pinned instead of an assertion about this
+        // branch.
+        if neighbours.is_empty() {
+            debug!(
+                "Conditional handover is armed but no intra-frequency neighbour is \
+                 configured, so UE[{}] gets no candidates",
+                ue_id
+            );
+            return;
+        }
+        // Once per UE, for the reason `scell_configured_ues` records: the UE
+        // acknowledges each reconfiguration and the acknowledgement is what triggers
+        // the next one.
+        if !self.cho_configured_ues.insert(ue_id) {
+            return;
+        }
+
+        let (Ok(a3_offset), Ok(hysteresis)) = (
+            A3Offset::new(self.task_base.config.cho_a3_offset_db),
+            Hysteresis::new(self.task_base.config.cho_hysteresis_db),
+        ) else {
+            warn!(
+                "Not arming conditional handover for UE[{}]: a3Offset {} dB or \
+                 hysteresis {} dB is outside what TS 38.331 §6.3.2 allows",
+                ue_id,
+                self.task_base.config.cho_a3_offset_db,
+                self.task_base.config.cho_hysteresis_db
+            );
+            // Un-mark it: the configuration is wrong, not spent, so a corrected
+            // config on a later UE is not skipped.
+            self.cho_configured_ues.remove(&ue_id);
+            return;
+        };
+
+        let candidate_cells: Vec<ChoCandidateCell> = neighbours
+            .iter()
+            .enumerate()
+            .take(usize::from(MAX_CHO_CANDIDATES))
+            .map(|(index, neighbour)| ChoCandidateCell {
+                candidate_index: index as u8,
+                condition: ChoCondition::EventA3(EventA3Condition {
+                    a3_offset,
+                    hysteresis,
+                    // The UE executes as soon as the condition holds. A
+                    // time-to-trigger would need a timer per candidate at the UE,
+                    // which #114's runtime does not have.
+                    time_to_trigger: TimeToTrigger::Ms0,
+                    use_rsrp: true,
+                }),
+                target_cell: ChoTargetCellConfig {
+                    phys_cell_id: neighbour.phys_cell_id,
+                    ssb_frequency_arfcn: self.task_base.config.dl_arfcn,
+                    ssb_subcarrier_spacing_khz: CHO_SSB_SCS_KHZ,
+                    // Absent rather than derived: this gNB knows the neighbour's PCI
+                    // and nothing else about it, and a fabricated NCI or PLMN would
+                    // name a cell that may not exist.
+                    nr_cell_identity: None,
+                    plmn_identity: None,
+                    rrc_reconfiguration: None,
+                },
+                // Ranked by configuration order, which is also SIB3's order.
+                priority: index as u8,
+            })
+            .collect();
+        if neighbours.len() > usize::from(MAX_CHO_CANDIDATES) {
+            warn!(
+                "Nominating only the first {} of {} configured neighbours as CHO \
+                 candidates for UE[{}]",
+                MAX_CHO_CANDIDATES,
+                neighbours.len(),
+                ue_id
+            );
+        }
+
+        let config = ChoConfig {
+            config_id: CHO_CONFIG_ID,
+            candidate_cells,
+            max_candidate_cells: None,
+            // Not requested: the UE's runtime has no CHO-execution report to send, so
+            // asking for one would await a message that never comes.
+            report_cho_execution: false,
+            predictive_ho_enabled: false,
+            ai_model_id: None,
+        };
+        let container = match encode_cho_config(&config) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Not arming conditional handover for UE[{}]: {}", ue_id, e);
+                self.cho_configured_ues.remove(&ue_id);
+                return;
+            }
+        };
+
+        let transaction_id = self
+            .ue_manager
+            .try_find_ue_mut(ue_id)
+            .map(|ctx| ctx.transactions.allocate(RrcProcedure::Reconfiguration))
+            .unwrap_or(0);
+        let mut pdu = Vec::with_capacity(container.len() + 2);
+        pdu.push(SIM_RECONFIGURATION_WITH_CHO);
+        pdu.push(transaction_id);
+        pdu.extend_from_slice(&container);
+
+        info!(
+            "Arming conditional handover at UE[{}]: {} candidate(s), a3Offset={} dB, \
+             hysteresis={} dB, tid={}",
+            ue_id,
+            config.candidate_cells.len(),
+            self.task_base.config.cho_a3_offset_db,
+            self.task_base.config.cho_hysteresis_db,
+            transaction_id
+        );
+        self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+            .await;
     }
 
     /// Send the configured secondary cell to a UE, once (TS 38.331 §5.3.5.5.9).
@@ -1971,6 +2141,12 @@ impl Task for RrcTask {
                                 // the UE has a DRB-bearing configuration to add
                                 // it to. No-op unless one is configured.
                                 self.send_scell_configuration(ue_id).await;
+                                // §5.3.5.13: candidates are configured by a
+                                // reconfiguration too, and the UE needs a serving
+                                // configuration to compare them against. No-op
+                                // unless armed (issue #160).
+                                self.send_conditional_handover_configuration(ue_id)
+                                    .await;
                             }
                             RrcMessage::ExpectHandoverArrival { ue_id } => {
                                 self.handle_expect_handover_arrival(ue_id);
@@ -3508,6 +3684,213 @@ mod tests {
     // is what the typed dispatch buys, and the gNB verifies the echo FAIL-CLOSED
     // -- so the round trip needs a positive AND a negative control.
     // ========================================================================
+
+    // ========================================================================
+    // Conditional handover, gNB side (TS 38.331 §5.3.5.13, issue #160). The UE
+    // runtime for it has existed since #114 with no production stimulus.
+    // ========================================================================
+
+    /// A gNB with CHO armed and neighbours configured must send a conditional
+    /// reconfiguration whose container the REAL UE handler stores as a candidate.
+    ///
+    /// The UE end is what makes this an end-to-end assertion: decoding the container
+    /// with the same encoder that wrote it would pass for a container no UE accepts.
+    #[test]
+    fn an_armed_gnb_sends_candidates_the_ue_stores() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        config.reselection.intra_freq_neighbours = vec![
+            nextgsim_common::config::IntraFreqNeighbourConfig {
+                phys_cell_id: 42,
+                q_offset_db: 0,
+            },
+            nextgsim_common::config::IntraFreqNeighbourConfig {
+                phys_cell_id: 43,
+                q_offset_db: 0,
+            },
+        ];
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        let pdu = run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
+            task.send_conditional_handover_configuration(7).await;
+            let mut last = None;
+            while let Some(pdu) = try_take_downlink_rrc(&mut rls_rx, 7) {
+                last = Some(pdu);
+            }
+            last.expect("the gNB must send a conditional reconfiguration")
+                .1
+        });
+
+        assert_eq!(
+            pdu.data()[0],
+            SIM_RECONFIGURATION_WITH_CHO,
+            "the simulator's conditional-reconfiguration envelope (issue #107 retires it)"
+        );
+
+        // The REAL UE handler, from the other crate, is what has to accept it.
+        let decoded =
+            nextgsim_rrc::procedures::conditional_handover::decode_cho_config(&pdu.data()[2..])
+                .expect("the UE's decoder must accept the container");
+        assert_eq!(
+            decoded.candidate_cells.len(),
+            2,
+            "one candidate per configured intra-frequency neighbour"
+        );
+        assert_eq!(
+            decoded
+                .candidate_cells
+                .iter()
+                .map(|c| c.target_cell.phys_cell_id)
+                .collect::<Vec<_>>(),
+            vec![42, 43],
+            "the candidates are the SIB3 neighbours, in configuration order"
+        );
+        for candidate in &decoded.candidate_cells {
+            assert!(
+                matches!(candidate.condition, ChoCondition::EventA3(_)),
+                "condEventA3 only: the encoder rejects the predictive conditions and \
+                 A5 needs thresholds this gNB has no configuration for"
+            );
+        }
+    }
+
+    /// Negative control one: the gate off sends nothing, whatever is configured.
+    #[test]
+    fn a_gnb_with_conditional_handover_off_sends_no_candidates() {
+        let mut config = test_config();
+        config.conditional_handover = false;
+        config.reselection.intra_freq_neighbours =
+            vec![nextgsim_common::config::IntraFreqNeighbourConfig {
+                phys_cell_id: 42,
+                q_offset_db: 0,
+            }];
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
+            task.send_conditional_handover_configuration(7).await;
+            assert!(
+                try_take_downlink_rrc(&mut rls_rx, 7).is_none(),
+                "arming CHO changes what the UE does on its own, so it must be asked for"
+            );
+        });
+    }
+
+    /// The codec fact behind the no-neighbours case: an empty candidate list is
+    /// REFUSED, so a gNB with no neighbours cannot send a configuration naming no cell
+    /// even if every guard above it were removed. Pinned here because a revert round
+    /// showed the early return in the sender is not independently verifiable -- this is
+    /// what actually holds.
+    #[test]
+    fn the_cho_encoder_refuses_an_empty_candidate_list() {
+        let empty = ChoConfig {
+            config_id: CHO_CONFIG_ID,
+            candidate_cells: vec![],
+            max_candidate_cells: None,
+            report_cho_execution: false,
+            predictive_ho_enabled: false,
+            ai_model_id: None,
+        };
+        assert!(
+            encode_cho_config(&empty).is_err(),
+            "a conditional reconfiguration naming no candidate must not encode"
+        );
+    }
+
+    /// Negative control two: armed but with no neighbours sends nothing rather than an
+    /// empty candidate list, which would arm a configuration naming no cell.
+    #[test]
+    fn an_armed_gnb_with_no_neighbours_sends_no_candidates() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        config.reselection.intra_freq_neighbours = vec![];
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
+            task.send_conditional_handover_configuration(7).await;
+            assert!(
+                try_take_downlink_rrc(&mut rls_rx, 7).is_none(),
+                "no neighbours means no candidates, not an empty list"
+            );
+        });
+    }
+
+    /// Once per UE. A second call must send nothing: the UE acknowledges each
+    /// reconfiguration and the acknowledgement is what triggers the next one, so
+    /// resending is how a loop starts.
+    #[test]
+    fn conditional_handover_candidates_are_sent_once_per_ue() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        config.reselection.intra_freq_neighbours =
+            vec![nextgsim_common::config::IntraFreqNeighbourConfig {
+                phys_cell_id: 42,
+                q_offset_db: 0,
+            }];
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
+
+            task.send_conditional_handover_configuration(7).await;
+            assert!(
+                try_take_downlink_rrc(&mut rls_rx, 7).is_some(),
+                "the first call arms the UE"
+            );
+
+            task.send_conditional_handover_configuration(7).await;
+            assert!(
+                try_take_downlink_rrc(&mut rls_rx, 7).is_none(),
+                "the second must send nothing"
+            );
+        });
+    }
+
+    /// An offset TS 38.331 does not allow must be refused, and must NOT consume the
+    /// once-per-UE mark -- a corrected configuration on a later UE has to be tried.
+    #[test]
+    fn an_illegal_a3_offset_is_refused_and_does_not_spend_the_once_per_ue_mark() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        // A3Offset is INTEGER(-30..30) in half-dB steps; 99 dB is not a value.
+        config.cho_a3_offset_db = 99.0;
+        config.reselection.intra_freq_neighbours =
+            vec![nextgsim_common::config::IntraFreqNeighbourConfig {
+                phys_cell_id: 42,
+                q_offset_db: 0,
+            }];
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
+            task.send_conditional_handover_configuration(7).await;
+            assert!(
+                try_take_downlink_rrc(&mut rls_rx, 7).is_none(),
+                "an out-of-range offset must not be sent"
+            );
+            assert!(
+                !task.cho_configured_ues.contains(&7),
+                "and must not mark the UE as configured, or a fixed config is skipped"
+            );
+        });
+    }
 
     // ========================================================================
     // HANDOVER NOTIFY (TS 38.413 §8.4.3, issue #156). The message and its sender
