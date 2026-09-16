@@ -875,7 +875,6 @@ mod tests {
     // amfg-04: structured DRB / SDAP / CellGroup tests
     // ========================================================================
 
-    #[test]
     /// #32, criterion 3 (the signalling half): the DRB's integrity protection is
     /// carried in `PDCP-Config.drb.integrityProtection` and read back off the wire,
     /// so the UE is *told* the policy rather than configured to match it.

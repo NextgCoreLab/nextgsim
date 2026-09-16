@@ -328,13 +328,12 @@ pub fn parse_handover_command(pdu: &[u8]) -> Option<HandoverCommand> {
     })
 }
 
-/// Build RRC Reconfiguration Complete PDU (simplified)
-pub fn build_reconfiguration_complete(transaction_id: u8) -> Vec<u8> {
-    // Simplified format:
-    // [0] = message type (0x08 = RRC Reconfiguration Complete)
-    // [1] = transaction_id
-    vec![0x08, transaction_id]
-}
+// `build_reconfiguration_complete` used to live here and emitted the bespoke
+// `[0x08, transaction_id]`. That is a well-formed UPER RRCReconfigurationComplete
+// at tid 0 followed by a trailing octet, so the transaction identifier was carried
+// where no decoder reads it and every echo was really a 0. It is replaced by
+// `RrcTask::send_reconfiguration_complete`, which encodes the real message
+// (issue #151).
 
 #[cfg(test)]
 mod tests {
@@ -518,12 +517,6 @@ mod tests {
             0x00, 0x05, 0x00, 0x10, 0x00, 0x00, 0x00, 0x64, 0x01, 0x00, 0x00, 0x00, 0x01,
         ];
         assert!(parse_handover_command(&legacy).is_none());
-    }
-
-    #[test]
-    fn test_build_reconfiguration_complete() {
-        let pdu = build_reconfiguration_complete(5);
-        assert_eq!(pdu, vec![0x08, 0x05]);
     }
 }
 

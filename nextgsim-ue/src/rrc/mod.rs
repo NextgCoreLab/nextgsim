@@ -83,8 +83,8 @@ pub use conditional_handover::{
     candidate_cell_id, handover_command_for, CondReconfigId, CondReconfigStore, TriggeredCandidate,
 };
 pub use handover::{
-    build_reconfiguration_complete, parse_handover_command, HandoverCommand, HandoverFailureCause,
-    HandoverManager, HandoverState, TargetCellInfo,
+    parse_handover_command, HandoverCommand, HandoverFailureCause, HandoverManager, HandoverState,
+    TargetCellInfo,
 };
 pub use measurement::{
     CellMeasResult, EutraCellKey, EutraMeasResult, MeasConfig, MeasEventType, MeasQuantity,

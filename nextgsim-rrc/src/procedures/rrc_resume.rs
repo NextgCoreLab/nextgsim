@@ -435,6 +435,10 @@ pub struct RrcResumeCompleteParams {
 pub struct RrcResumeCompleteData {
     /// RRC Transaction Identifier
     pub rrc_transaction_id: u8,
+    /// `dedicatedNAS-Message`, when the UE piggybacked one (TS 38.331 §6.2.2)
+    pub dedicated_nas_message: Option<Vec<u8>>,
+    /// `selectedPLMN-Identity` (1..12), when present
+    pub selected_plmn_identity: Option<u8>,
 }
 
 /// Build an RRC Resume Complete message
@@ -500,8 +504,8 @@ pub fn parse_rrc_resume_complete(
         }
     };
 
-    match &complete.critical_extensions {
-        RRCResumeCompleteCriticalExtensions::RrcResumeComplete(_) => {}
+    let ies = match &complete.critical_extensions {
+        RRCResumeCompleteCriticalExtensions::RrcResumeComplete(ies) => ies,
         RRCResumeCompleteCriticalExtensions::CriticalExtensionsFuture(_) => {
             return Err(RrcResumeError::InvalidMessageType {
                 expected: "rrcResumeComplete".to_string(),
@@ -512,6 +516,12 @@ pub fn parse_rrc_resume_complete(
 
     Ok(RrcResumeCompleteData {
         rrc_transaction_id: complete.rrc_transaction_identifier.0,
+        // The NAS the UE piggybacks on the Complete when the resume was triggered
+        // by something it had to send (TS 38.331 §5.3.13.4, issue #38). It was
+        // built by the encoder and DROPPED here, which only went unnoticed while
+        // the peer recovered it by slicing the bespoke framing (issue #151).
+        dedicated_nas_message: ies.dedicated_nas_message.as_ref().map(|m| m.0.clone()),
+        selected_plmn_identity: ies.selected_plmn_identity.as_ref().map(|p| p.0),
     })
 }
 

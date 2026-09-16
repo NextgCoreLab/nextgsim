@@ -21,11 +21,13 @@
 //! Message. The gNB now decodes UL-DCCH ASN.1-first (additive-accept; the
 //! bespoke fallback framing is still accepted until C6).
 //!
-//! Also pins the CURRENT tolerated SMC-hop behavior as the C5 red/green
-//! baseline: the gNB's real ASN.1 SecurityModeCommand (DL-DCCH c1 index 4,
-//! tid 0 → leading byte 0x20, low nibble 0x0) is misrouted by the UE nibble
-//! dispatcher into its RRC-reconfiguration arm, which answers with the
-//! bespoke ReconfigurationComplete `[0x08, smc[1]]` that the gNB then drops.
+//! The SMC hop is the C5 green case (issue #151): the gNB's real ASN.1
+//! SecurityModeCommand (DL-DCCH c1 index 4, tid 0 → leading byte 0x20, low
+//! nibble 0x0) used to be misrouted by the UE's nibble dispatcher into its
+//! RRC-reconfiguration arm, which answered with the bespoke
+//! ReconfigurationComplete `[0x08, smc[1]]` that the gNB then dropped. Both ends
+//! now dispatch on the decoded message, so the command REACHES the UE's AS
+//! security handler and the UE's answer reaches the gNB.
 //!
 //! Reference: TS 38.331 §5.3.3 (RRC connection establishment), §6.2
 //! (UL-DCCH-Message / DL-DCCH-Message classes).
@@ -38,8 +40,8 @@ use nextgsim_gnb::tasks::{
 use nextgsim_gnb::RrcTask as GnbRrcTask;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::security_mode::{
-    encode_security_mode_command, CipheringAlgorithmType, IntegrityAlgorithmType,
-    SecurityAlgorithms, SecurityModeCommandParams,
+    decode_security_mode_failure, encode_security_mode_command, CipheringAlgorithmType,
+    IntegrityAlgorithmType, SecurityAlgorithms, SecurityModeCommandParams,
 };
 use nextgsim_ue::{
     NasMessage, RlsMessage as UeRlsMessage, RrcTask as UeRrcTask, TaskMessage as UeTaskMessage,
@@ -262,14 +264,23 @@ async fn gnb_ue_rrc_setup_handshake_delivers_initial_nas_byte_equal() {
     assert_eq!(cause, 3, "establishment cause must survive the chain");
 }
 
-/// SMC-hop pin (C3 step 4 — the C5 red/green baseline, NOT desired behavior):
-/// the gNB's real ASN.1 SecurityModeCommand is misrouted by the UE's DL-DCCH
-/// nibble dispatcher into its RRC-reconfiguration arm; the UE answers with
-/// the bespoke ReconfigurationComplete `[0x08, smc[1]]` (no
-/// SecurityModeComplete, no AS security activation) and the gNB then drops
-/// that response. C5 (typed DL/UL-DCCH dispatch) must flip this test.
+/// SMC hop, C5 green (issue #151): the gNB's real ASN.1 SecurityModeCommand
+/// reaches the UE's AS-security handler rather than its reconfiguration arm, and
+/// the UE's answer reaches the gNB rather than being dropped.
+///
+/// This test replaces `smc_hop_current_tolerated_behavior_pinned_for_c5_baseline`,
+/// which pinned the misroute: the UE answered `[0x08, smc[1]]` -- a bespoke
+/// ReconfigurationComplete -- and the gNB's UL-information-transfer arm discarded
+/// it as too short.
+///
+/// The harness UE runs with `as_security_enabled` OFF, which is the default, so the
+/// conformant answer is a `SecurityModeFailure`: the UE cannot verify the command's
+/// integrity without an AS context, and TS 38.331 §5.3.4.4 answers "unable to
+/// comply" with a failure rather than with silence. What matters here is that the
+/// hop is no longer silent in either direction; the ACTIVATION path is covered by
+/// the AS-security tests that set the flag.
 #[tokio::test]
-async fn smc_hop_current_tolerated_behavior_pinned_for_c5_baseline() {
+async fn the_smc_hop_reaches_the_ue_security_handler_and_answers_it() {
     let mut h = harness();
     let (setup_complete, _nas) = run_setup_handshake(&mut h).await;
     h.gnb
@@ -295,32 +306,38 @@ async fn smc_hop_current_tolerated_behavior_pinned_for_c5_baseline() {
         "SMC: DL-DCCH c1 index 4, tid 0 -> leading byte 0x20 (low nibble 0x0)"
     );
 
-    // UE: the nibble dispatcher has no SMC arm; nibble 0x0 lands in the
-    // RRC-reconfiguration arm which answers with the bespoke
-    // ReconfigurationComplete [0x08, bytes[1]].
+    // UE: the typed DL-DCCH dispatch resolves c1 index 4 to the SecurityModeCommand
+    // arm. With no AS context it answers a real SecurityModeFailure echoing the tid.
     h.ue.handle_downlink_rrc(CELL_ID, RrcChannel::DlDcch, OctetString::from_slice(&smc))
         .await;
     let (ch, response) = next_ue_uplink_rrc(&mut h.ue_rls_rx);
     assert_eq!(ch, RrcChannel::UlDcch);
     assert_eq!(
+        decode_security_mode_failure(response.data()).expect(
+            "the UE must answer a decodable SecurityModeFailure, not a bespoke \
+             ReconfigurationComplete"
+        ),
+        0,
+        "and it must refuse the tid the command carried"
+    );
+    assert_ne!(
         response.data(),
         &[0x08, smc[1]][..],
-        "current tolerated behavior: bespoke ReconfigurationComplete, \
-         NOT a SecurityModeComplete (C5 baseline)"
+        "the bespoke ReconfigurationComplete is exactly what the misroute produced; \
+         seeing it again means the SMC is being routed as a reconfiguration"
     );
     assert!(
         !ue_received_nas_delivery(&mut h.ue_nas_rx),
-        "the SMC misroute must not fabricate NAS toward the UE NAS task"
+        "the SMC must not fabricate NAS toward the UE NAS task"
     );
 
-    // gNB: the bespoke response hits the UL-information-transfer arm and is
-    // dropped as too short — no NGAP message results.
+    // gNB: the failure is RECOGNISED (its own message class, its own handler) and
+    // produces no NGAP traffic — it is an RRC-local outcome.
     h.gnb
         .handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, response)
         .await;
     assert!(
         h.gnb_ngap_rx.try_recv().is_err(),
-        "current tolerated behavior: the gNB ignores the UE's bespoke \
-         reconfiguration-complete (C5 baseline)"
+        "a SecurityModeFailure is an RRC-local outcome and must not reach NGAP"
     );
 }
