@@ -564,6 +564,18 @@ pub enum RrcMessage {
         /// Encoded DL-DCCH RRCReconfiguration PDU
         pdu: OctetString,
     },
+    /// A handover-in has been ADMITTED for this UE, so the next
+    /// `RRCReconfigurationComplete` from it means "the UE has landed" and not "the UE
+    /// applied a reconfiguration" (TS 38.413 §8.4.3, issue #156).
+    ///
+    /// Sent by the NGAP task after HANDOVER REQUEST ACKNOWLEDGE. The distinction
+    /// cannot be made in the RRC task alone: on the radio the two messages are
+    /// identical, and the target never sent the reconfiguration the UE is completing
+    /// -- the SOURCE delivered it.
+    ExpectHandoverArrival {
+        /// UE ID the admission allocated.
+        ue_id: i32,
+    },
     /// AN release request (from NGAP)
     AnRelease {
         /// UE ID
