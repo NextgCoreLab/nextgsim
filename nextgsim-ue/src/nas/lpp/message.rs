@@ -470,6 +470,16 @@ impl SidelinkRangingResult {
     }
 }
 
+/// Which extension-addition group of `ProvideLocationInformation-r9-IEs` carries the
+/// sidelink ranging report: the FOURTH, index 3.
+///
+/// TS 37.355 declares three groups on that sequence — G1(r13), G2(r16), G3(r19) — so
+/// a simulator-defined IE must sit past them rather than squat on one. G2 in
+/// particular is where the peer LMF reads nr-Multi-RTT and nr-DL-TDOA; G1 and G3 it
+/// ignores, which is exactly why putting the report in G1 would have looked like it
+/// worked from this end and delivered nothing.
+const SIDELINK_ADDITION_GROUP: usize = 3;
+
 /// The sidelink ranging report a UE sends to the LMF (issue #137).
 ///
 /// Carried as an **extension addition** of `ProvideLocationInformation-r9-IEs`,
@@ -636,8 +646,18 @@ impl LppBody {
                 measurements.write(w)?;
                 // Additions come after every root member, which is why this is here
                 // and not beside the preamble.
+                //
+                // The report is addition GROUP 4, not the first addition. TS 37.355
+                // declares three groups on this sequence -- G1(r13), G2(r16),
+                // G3(r19) -- and the peer LMF reads nr-Multi-RTT and nr-DL-TDOA out
+                // of G2 and *ignores* G1 and G3 (see nextgcore-asn1c
+                // `lpp::ecid::ProvideLocationInformationR9`). Writing the report as
+                // the first addition would put it in G1, where the LMF would drop it
+                // silently, and would also claim a group the spec defines.
                 if let Some(report) = sidelink {
-                    w.write_extension_additions(&[Some(report.encode()?)])?;
+                    let mut groups = vec![None; SIDELINK_ADDITION_GROUP];
+                    groups.push(Some(report.encode()?));
+                    w.write_extension_additions(&groups)?;
                 }
                 Ok(())
             }
@@ -716,11 +736,17 @@ impl LppBody {
                 if inner_additions {
                     r.skip_extension_additions()?;
                 }
-                // The sidelink ranging report rides in the FIRST extension addition
-                // of the -r9 IEs (issue #137). Read rather than skipped, because this
-                // decoder is also how a test proves the two ends agree on the bytes.
+                // The report rides addition GROUP 4 (see the encoder). Groups are
+                // read POSITIONALLY and a peer may send fewer -- the trailing-absent
+                // ones are trimmed (X.691 18.8) -- so a message carrying only the
+                // spec's G1..G3 decodes to no report rather than to an error.
                 let sidelink = if additions {
-                    match r.read_extension_additions()?.into_iter().next().flatten() {
+                    match r
+                        .read_extension_additions()?
+                        .into_iter()
+                        .nth(SIDELINK_ADDITION_GROUP)
+                        .flatten()
+                    {
                         Some(bytes) => Some(SidelinkRangingReport::decode(&bytes)?),
                         None => None,
                     }
