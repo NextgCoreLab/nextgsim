@@ -395,8 +395,12 @@ mod tests {
     fn an_sl_prs_occasion_gives_the_ranging_session_a_distance() {
         use crate::sidelink::SidelinkTask;
         use crate::tasks::{SidelinkMessage, TaskHandle, UeRel18Handles};
-        use crate::test_support::task_base_with_config;
+        use crate::test_support::{hold_capture_lock, task_base_with_config};
         use nextgsim_common::config::{RangingAnchor, RangingConfig};
+
+        // This drives BOTH the ranging and sidelink tasks, whose startup lines the
+        // honesty captures assert on. See `test_support`'s hazard 3.
+        let _capture_guard = hold_capture_lock();
 
         const ANCHOR_UE_ID: u64 = 42;
         const EXPECTED_RANGE_M: f64 = 50.0;
@@ -591,8 +595,11 @@ mod tests {
     fn an_sl_prs_occasion_measures_nothing_while_ranging_is_disabled() {
         use crate::sidelink::SidelinkTask;
         use crate::tasks::{SidelinkMessage, TaskHandle, UeRel18Handles};
-        use crate::test_support::task_base_with_config;
+        use crate::test_support::{hold_capture_lock, task_base_with_config};
         use nextgsim_common::config::{RangingAnchor, RangingConfig};
+
+        // Drives the sidelink task, whose startup line a capture asserts on.
+        let _capture_guard = hold_capture_lock();
 
         let config = UeConfig {
             ranging_config: Some(RangingConfig {

@@ -18,9 +18,46 @@
 //! 2. **An absence assertion needs a positive control.** These helpers return the
 //!    captured text and assert nothing; callers are expected to pin something
 //!    that *must* be present before concluding anything from what is missing.
+//! 3. **`tracing`'s callsite-interest cache is PROCESS-GLOBAL, while
+//!    `with_default` is per-THREAD.** Registering or dropping a dispatcher
+//!    rebuilds that cache for every callsite (`tracing_core::callsite::
+//!    register_dispatch`), so two captures running concurrently rebuild each
+//!    other's — and a callsite re-evaluated at the instant no dispatcher is
+//!    registered is cached as `Interest::never()` and stays off until the next
+//!    registration. One capture then loses a line while another capture's guard
+//!    was being dropped. [`capture_logs`] therefore takes [`CAPTURE_LOCK`] so only
+//!    one capture exists at a time.
+//!
+//!    This is not hypothetical: CI's sidelink job failed on issue #136's merge
+//!    commit with the ranging task's *stopped* line captured and its *started* line
+//!    missing — two `info!` calls in the same function, on the same thread, under
+//!    the same subscriber. The extra tests in that commit changed the timing; the
+//!    hazard was already there.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+
+/// Serialises log captures **and every task run that shares their callsites**.
+///
+/// Declared beside the helper that takes it rather than inside a `mod tests`,
+/// because what it guards is process-global state (`tracing`'s callsite-interest
+/// cache) and a second lock elsewhere would guard nothing. See hazard 3.
+static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`CAPTURE_LOCK`] for the caller's scope.
+///
+/// **Any test that drives a task whose `info!` lines a capture test asserts on must
+/// hold this**, not just the captures: the interest cache those lines live in is
+/// process-global, so a concurrent run of the same task can leave a callsite cached
+/// as `never` while a capture is reading it. Serialising the captures alone was
+/// tried first and still flaked 2 runs in 12 (issue #136).
+///
+/// Poisoning is tolerated for the same reason [`capture_logs`] tolerates it.
+pub(crate) fn hold_capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 use nextgsim_common::config::UeConfig;
 use tokio::sync::mpsc;
@@ -120,6 +157,10 @@ pub(crate) fn capture_logs<F: FnOnce()>(body: F) -> String {
         .with_ansi(false)
         .finish();
 
+    // Held for the whole capture: see hazard 3. Poisoning is tolerated rather than
+    // propagated -- one panicking capture test must not turn every other one into a
+    // failure whose message is about a mutex.
+    let _guard = hold_capture_lock();
     tracing::subscriber::with_default(subscriber, body);
 
     captured.text()
@@ -144,4 +185,61 @@ pub(crate) fn capture_task_logs<T: Task>(mut task: T) -> String {
             task.run(rx).await;
         });
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every capture must see its OWN events and all of them, even when several
+    /// captures are attempted at once. Serialised by [`CAPTURE_LOCK`]; this drives
+    /// the concurrency the lock exists for.
+    ///
+    /// It cannot fail deterministically without the lock -- the hazard is a race on
+    /// process-global state, and the CI failure it stands for was not reproducible on
+    /// demand. What it does do is exercise the path under contention, which nothing
+    /// else here did.
+    #[test]
+    fn concurrent_captures_each_see_their_own_events_in_full() {
+        const FIRST: &str = "capture probe one";
+        const SECOND: &str = "capture probe two";
+
+        let (a, b) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                capture_logs(|| {
+                    tracing::info!("{}", FIRST);
+                    tracing::info!("{} again", FIRST);
+                })
+            });
+            let second = scope.spawn(|| {
+                capture_logs(|| {
+                    tracing::info!("{}", SECOND);
+                    tracing::info!("{} again", SECOND);
+                })
+            });
+            (
+                first.join().expect("first capture thread"),
+                second.join().expect("second capture thread"),
+            )
+        });
+
+        assert_eq!(
+            a.matches(FIRST).count(),
+            2,
+            "the first capture must hold both of its own events; captured: {a:?}"
+        );
+        assert!(
+            !a.contains(SECOND),
+            "and none of the other thread's; captured: {a:?}"
+        );
+        assert_eq!(
+            b.matches(SECOND).count(),
+            2,
+            "the second capture must hold both of its own events; captured: {b:?}"
+        );
+        assert!(
+            !b.contains(FIRST),
+            "and none of the other thread's; captured: {b:?}"
+        );
+    }
 }
