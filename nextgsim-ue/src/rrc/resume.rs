@@ -428,6 +428,19 @@ impl ResumeProcedure {
     // ========================================================================
 
     /// Resets the procedure to idle state.
+    /// Back-dates the armed T319 so a test reaches the expiry without waiting out its
+    /// real 1000 ms.
+    ///
+    /// The deadline is a `std::time::Instant`, so `tokio::time::advance` cannot move
+    /// it -- and a test that slept for real would be slow AND unable to say which
+    /// timer fired. Test-only, so production cannot shorten a guard.
+    #[cfg(test)]
+    pub(crate) fn expire_t319_for_test(&mut self) {
+        if let Some(deadline) = self.t319_deadline {
+            self.t319_deadline = Some(deadline - Duration::from_millis(T319_DEFAULT_MS * 2));
+        }
+    }
+
     pub fn reset(&mut self) {
         self.state = ResumeProcedureState::Idle;
         self.last_request = None;

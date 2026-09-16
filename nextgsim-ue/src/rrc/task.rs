@@ -3095,6 +3095,46 @@ impl RrcTask {
         self.handle_establishment_failure().await;
     }
 
+    /// Check the guard timers armed inside the resume and re-establishment
+    /// procedures, and run each expiry's existing handler (issue #158).
+    ///
+    /// T319 (TS 38.331 §5.3.13.5) and T301/T311 (§5.3.7.6) were armed and never
+    /// checked, so a resume or re-establishment the network ignored left the UE stuck
+    /// in the procedure instead of falling back to RRC_IDLE -- the opposite of what a
+    /// guard timer is for. T300 already had its own `select!` arm; this is the same
+    /// job for the three that did not.
+    ///
+    /// Public because it is the run loop's timer entry point, and a test that had to
+    /// wait real seconds for a 1000 ms guard would be a slow test that still could not
+    /// say which timer fired.
+    pub async fn check_guard_timers(&mut self) {
+        // T319: the network never answered the RRCResumeRequest.
+        if self.resume_proc.t319_expired() {
+            warn!("T319 expired: the resume was not answered (TS 38.331 §5.3.13.5)");
+            self.resume_proc.on_t319_expired(&mut self.state_machine);
+            // The suspend configuration goes with it. A UE that kept its I-RNTI would
+            // present it on a later resume against a context the network has released
+            // -- the same reasoning `handle_rrc_resume` applies when a resume succeeds.
+            self.inactive = None;
+            self.suspended_in_cell_identity = None;
+            self.handle_establishment_failure().await;
+        }
+
+        // T301 (no RRCReestablishment arrived) and T311 (no suitable cell found) share
+        // one handler because §5.3.7.6 gives them one outcome: go to RRC_IDLE.
+        let t301 = self.reestablishment_proc.t301_expired();
+        let t311 = self.reestablishment_proc.t311_expired();
+        if t301 || t311 {
+            warn!(
+                "{} expired: re-establishment failed (TS 38.331 §5.3.7.6)",
+                if t301 { "T301" } else { "T311" }
+            );
+            self.reestablishment_proc
+                .on_timer_expired(&mut self.state_machine);
+            self.handle_establishment_failure().await;
+        }
+    }
+
     /// Handle radio link failure
     async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
         warn!("Radio link failure: {:?}", cause);
@@ -3409,6 +3449,20 @@ impl RrcTask {
     }
 }
 
+/// How often the RRC run loop checks the guard timers that are armed inside the
+/// resume and re-establishment procedures (issue #158).
+///
+/// A poll rather than a deadline-driven `select!` arm like T300's, because those
+/// deadlines live in `ResumeProcedure` and `ReestablishmentProcedure` behind their own
+/// predicates -- exposing three `Instant`s so the loop could take their minimum would
+/// spread one procedure's timing across two modules and let the two drift.
+///
+/// 100 ms against timers that default to 1000 ms (`T319_DEFAULT_MS`,
+/// `T301_DEFAULT_MS`, `T311_DEFAULT_MS`): a tenth of the shortest guard, so an expiry
+/// is acted on within 10% of its deadline. Not shorter, because this wakes the task
+/// with nothing to do the rest of the time.
+const GUARD_TIMER_POLL_MS: u64 = 100;
+
 /// Resolves when the T300 deadline is reached; pends forever when T300 is not
 /// running, so the RRC run loop's `select!` arm only fires on a real expiry.
 async fn wait_t300(deadline: Option<tokio::time::Instant>) {
@@ -3426,6 +3480,11 @@ impl Task for RrcTask {
         info!("RRC task started");
 
         let mut cycle_timer = interval(Duration::from_millis(RRC_CYCLE_INTERVAL_MS));
+        // The guard timers armed inside the resume and re-establishment procedures
+        // (issue #158). Separate from `cycle_timer`, whose 2500 ms would act on a
+        // 1000 ms guard up to 1.5 s late.
+        let mut guard_timer_poll = interval(Duration::from_millis(GUARD_TIMER_POLL_MS));
+        guard_timer_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -3518,6 +3577,9 @@ impl Task for RrcTask {
                 }
                 _ = wait_t300(self.t300_deadline) => {
                     self.on_t300_expiry().await;
+                }
+                _ = guard_timer_poll.tick() => {
+                    self.check_guard_timers().await;
                 }
             }
         }
@@ -7066,6 +7128,184 @@ mod tests {
                 !task.resume_proc.is_in_progress(),
                 "the resume procedure must NOT be entered by a NAS transport"
             );
+        });
+    }
+
+    // ========================================================================
+    // Guard timers (issue #158). T319, T301 and T311 were armed and never checked,
+    // so a resume or re-establishment the network ignored left the UE stuck in the
+    // procedure. Each test has a NEGATIVE control, because "the UE fell back" is
+    // also what a UE that always falls back would do.
+    // ========================================================================
+
+    /// T319 (TS 38.331 §5.3.13.5): a resume the network never answers must drop the UE
+    /// to RRC_IDLE, spend the suspend configuration, and tell NAS.
+    #[test]
+    fn an_unanswered_resume_expires_t319_and_falls_back_to_idle() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Inactive);
+            task.handle_uplink_nas_delivery(2, OctetString::from_slice(&[0x7E, 0x00, 0x4D]))
+                .await;
+            assert!(
+                task.resume_proc.is_in_progress(),
+                "precondition: a resume is in flight"
+            );
+            while nas_rx.try_recv().is_ok() {}
+
+            // Before the deadline: nothing fires. This is the negative control, and it
+            // runs FIRST so a poll that fired unconditionally could not pass.
+            task.check_guard_timers().await;
+            assert!(
+                task.resume_proc.is_in_progress(),
+                "T319 must not fire before its deadline"
+            );
+
+            task.resume_proc.expire_t319_for_test();
+            task.check_guard_timers().await;
+
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Idle,
+                "T319 expiry drops the UE to RRC_IDLE (§5.3.13.5)"
+            );
+            assert!(
+                task.inactive.is_none(),
+                "and spends the suspend configuration, or a later resume presents an \
+                 I-RNTI the network has released"
+            );
+            let mut told_nas = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::RrcEstablishmentFailure) = msg {
+                    told_nas = true;
+                }
+            }
+            assert!(told_nas, "and NAS is told the establishment failed");
+        });
+    }
+
+    /// T301 (TS 38.331 §5.3.7.6): a re-establishment whose `RRCReestablishment` never
+    /// arrives must drop the UE to RRC_IDLE and tell NAS.
+    #[test]
+    fn an_unanswered_reestablishment_expires_its_guard_and_falls_back_to_idle() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            assert!(
+                task.reestablishment_proc.is_in_progress(),
+                "precondition: a re-establishment is in flight"
+            );
+            while nas_rx.try_recv().is_ok() {}
+
+            // Negative control first.
+            task.check_guard_timers().await;
+            assert!(
+                task.reestablishment_proc.is_in_progress(),
+                "no guard may fire before its deadline"
+            );
+
+            task.reestablishment_proc.expire_guard_timers_for_test();
+            task.check_guard_timers().await;
+
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Idle,
+                "T301/T311 expiry drops the UE to RRC_IDLE (§5.3.7.6)"
+            );
+            let mut told_nas = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::RrcEstablishmentFailure) = msg {
+                    told_nas = true;
+                }
+            }
+            assert!(told_nas, "and NAS is told the establishment failed");
+        });
+    }
+
+    /// The WIRING, not the helper: the run loop must poll the guards on its own.
+    ///
+    /// Added because a revert round proved the gap -- deleting the `select!` arm left
+    /// every other guard-timer test green, since they all call `check_guard_timers`
+    /// directly. This one never calls it: it arms a resume, back-dates T319, hands the
+    /// task to `run`, and waits for the expiry to reach NAS by itself.
+    #[test]
+    fn the_run_loop_polls_the_guard_timers_without_being_asked() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
+                .await;
+            task.handle_uplink_nas_delivery(2, OctetString::from_slice(&[0x7E, 0x00, 0x4D]))
+                .await;
+            assert!(task.resume_proc.is_in_progress(), "precondition");
+            task.resume_proc.expire_t319_for_test();
+            while nas_rx.try_recv().is_ok() {}
+
+            // Hand it to the real run loop and wait. Several poll periods
+            // (GUARD_TIMER_POLL_MS = 100), so a slow machine does not make this flake,
+            // and real time rather than `tokio::time::advance` because the deadlines
+            // are `std::time::Instant`s the virtual clock cannot move.
+            let (tx, rx) = mpsc::channel::<TaskMessage<RrcMessage>>(4);
+            let runner = tokio::spawn(async move {
+                task.run(rx).await;
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(GUARD_TIMER_POLL_MS * 5)).await;
+            let _ = tx.send(TaskMessage::Shutdown).await;
+            runner.await.expect("the RRC task exits cleanly");
+
+            let mut told_nas = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::RrcEstablishmentFailure) = msg {
+                    told_nas = true;
+                }
+            }
+            assert!(
+                told_nas,
+                "the run loop must act on an expired guard with no prompting; without \
+                 the poll arm the timer is armed and never checked, which is the whole \
+                 defect"
+            );
+        });
+    }
+
+    /// The other negative control: an idle UE with nothing armed must not be dropped by
+    /// the poll. Without it, a `check_guard_timers` that fired unconditionally would
+    /// still satisfy both tests above.
+    #[test]
+    fn the_guard_timer_poll_does_nothing_when_no_procedure_is_running() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            while nas_rx.try_recv().is_ok() {}
+            let before = task.state_machine.state();
+
+            for _ in 0..5 {
+                task.check_guard_timers().await;
+            }
+
+            assert_eq!(
+                task.state_machine.state(),
+                before,
+                "polling with nothing armed must not move the state machine"
+            );
+            assert!(nas_rx.try_recv().is_err(), "and must tell NAS nothing");
         });
     }
 
