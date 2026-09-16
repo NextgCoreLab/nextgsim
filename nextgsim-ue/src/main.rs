@@ -680,6 +680,10 @@ impl UeApp {
                 // stimulus needs the `sidelink` feature as well as the runtime flag.
                 #[cfg(feature = "sidelink")]
                 if let Some(ref rel18) = task_base.rel18 {
+                    // Imported here rather than at the top: the only user is this
+                    // sidelink-gated block, and a default build would carry an
+                    // unused import.
+                    use nextgsim_ue::tasks::RangingMessage;
                     let timestamp_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -687,6 +691,16 @@ impl UeApp {
                     let _ = rel18
                         .sidelink_tx
                         .send(SidelinkMessage::SlPrsOccasion { timestamp_ms })
+                        .await;
+                    // Then ask the ranging task to publish what it holds toward the
+                    // LMF (issue #137). No response channel: the report goes to the
+                    // NAS task, which is where the LPP endpoint lives. It therefore
+                    // reflects the measurements that have ARRIVED, so it lags this
+                    // occasion's by one interval -- the two travel different channels
+                    // and a report cannot wait for them without blocking this loop.
+                    let _ = rel18
+                        .ranging_tx
+                        .send(RangingMessage::ReportToLmf { response_tx: None })
                         .await;
                 }
             }
@@ -988,6 +1002,18 @@ impl UeApp {
                                 // `nas::lpp`'s module documentation.
                                 rsrq_result: None,
                             });
+                        }
+                        NasMessage::SidelinkRangingReport { results } => {
+                            // The ranging task's report reaching the LPP endpoint
+                            // (TS 23.586 §5.3.3, issue #137). Held until an LMF asks
+                            // for location information, which is the direction the
+                            // procedure runs: the UE does not push a position at the
+                            // LMF unsolicited.
+                            debug!(
+                                "Sidelink ranging report: {} range(s) available to the LMF",
+                                results.len()
+                            );
+                            orch.set_sidelink_ranging_results(results);
                         }
                         NasMessage::RrcFallbackIndication => {
                             info!("RRC fallback indication");

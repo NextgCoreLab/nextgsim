@@ -40,7 +40,8 @@ mod uper;
 
 pub use message::{
     EcidMeasurementBits, EcidSignalMeasurementInformation, Initiator, LppBody, LppMessage,
-    LppTransactionId, MeasuredResultsElement,
+    LppTransactionId, MeasuredResultsElement, SidelinkRangingMethod, SidelinkRangingReport,
+    SidelinkRangingResult,
 };
 pub use uper::{UperError, UperReader, UperResult, UperWriter};
 
@@ -185,6 +186,7 @@ impl LppEndpoint {
         &mut self,
         pdu: &[u8],
         measurements: &ServingCellMeasurements,
+        sidelink_ranging: &[SidelinkRangingResult],
     ) -> LppReaction {
         let request = match LppMessage::decode(pdu) {
             Ok(message) => message,
@@ -240,6 +242,33 @@ impl LppEndpoint {
                     element.rsrp_result,
                     element.rsrq_result
                 );
+                // The sidelink ranging report rides along when this UE holds one
+                // (TS 23.586 §5.3.3, issue #137). `MeasuredResultsList` is
+                // SIZE(1..32), and so is the ranging list, so an EMPTY set of results
+                // must encode as an ABSENT report rather than an empty list -- an
+                // empty one encodes and then fails to decode.
+                let sidelink = match SidelinkRangingReport::fitting_an_addition(sidelink_ranging) {
+                    Some((report, 0)) => {
+                        info!(
+                            "LPP: reporting {} sidelink range(s) to the LMF",
+                            report.results.len()
+                        );
+                        Some(report)
+                    }
+                    Some((report, dropped)) => {
+                        // Named rather than silent: a truncated report looks exactly
+                        // like a complete one at the LMF.
+                        warn!(
+                            "LPP: reporting {} sidelink range(s) and DROPPING {}; an \
+                             extension addition carries at most {} octets",
+                            report.results.len(),
+                            dropped,
+                            SidelinkRangingReport::MAX_ADDITION_OCTETS
+                        );
+                        Some(report)
+                    }
+                    None => None,
+                };
                 LppBody::ProvideLocationInformation {
                     measurements: EcidSignalMeasurementInformation {
                         // The serving cell appears as the PRIMARY cell and as the
@@ -250,6 +279,7 @@ impl LppEndpoint {
                         primary_cell: Some(element.clone()),
                         measured_results: vec![element],
                     },
+                    sidelink,
                 }
             }
             LppBody::ProvideCapabilities { .. } | LppBody::ProvideLocationInformation { .. } => {
@@ -290,8 +320,9 @@ impl LppEndpoint {
         &mut self,
         container: &[u8],
         measurements: &ServingCellMeasurements,
+        sidelink_ranging: &[SidelinkRangingResult],
     ) -> LppUplink {
-        match self.handle_downlink(container, measurements) {
+        match self.handle_downlink(container, measurements, sidelink_ranging) {
             LppReaction::Reply(lpp_pdu) => {
                 let mut pdu = Vec::new();
                 UlNasTransport::new(PayloadContainerType::LppMessage, lpp_pdu).encode(&mut pdu);
@@ -465,6 +496,7 @@ mod tests {
                         ue_rx_tx_time_diff: Some(4095),
                     }],
                 },
+                sidelink: None,
             },
         ];
         for body in bodies {
@@ -501,6 +533,7 @@ mod tests {
                     primary_cell: None,
                     measured_results: vec![element.clone(); count],
                 },
+                sidelink: None,
             };
             let message = LppMessage {
                 transaction_id: None,
@@ -523,6 +556,7 @@ mod tests {
                         primary_cell: None,
                         measured_results: vec![element.clone(); count],
                     },
+                    sidelink: None,
                 }),
             };
             assert_eq!(
@@ -595,7 +629,7 @@ mod tests {
         //               MeasuredResultsElement (the same one again)
         let mut endpoint = LppEndpoint::new();
         let LppReaction::Reply(reply) =
-            endpoint.handle_downlink(LMF_REQUEST_LOCATION_INFORMATION, &measurements())
+            endpoint.handle_downlink(LMF_REQUEST_LOCATION_INFORMATION, &measurements(), &[])
         else {
             panic!("the peer's own request must be answered");
         };
@@ -631,6 +665,7 @@ mod tests {
         let element = match LppMessage::decode(&reply).expect("decodes").body {
             Some(LppBody::ProvideLocationInformation {
                 measurements: report,
+                sidelink: None,
             }) => report.primary_cell.expect("primary"),
             other => panic!("expected ProvideLocationInformation, got {other:?}"),
         };
@@ -693,7 +728,7 @@ mod tests {
             7,
         );
 
-        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements()) else {
+        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements(), &[]) else {
             panic!("a capability request must be answered");
         };
         let decoded = LppMessage::decode(&reply).expect("the reply decodes");
@@ -738,6 +773,7 @@ mod tests {
                 1,
             ),
             &measurements(),
+            &[],
         ) else {
             panic!("a capability request is answered");
         };
@@ -747,15 +783,17 @@ mod tests {
         };
 
         // Now ask for everything and see what actually arrives.
-        let LppReaction::Reply(reply) =
-            endpoint.handle_downlink(&request(asked_for(true, true, true), 2), &measurements())
-        else {
+        let LppReaction::Reply(reply) = endpoint.handle_downlink(
+            &request(asked_for(true, true, true), 2),
+            &measurements(),
+            &[],
+        ) else {
             panic!("a location request is answered");
         };
         let element = match LppMessage::decode(&reply).expect("decodes").body {
-            Some(LppBody::ProvideLocationInformation { measurements: r }) => {
-                r.primary_cell.expect("primary")
-            }
+            Some(LppBody::ProvideLocationInformation {
+                measurements: r, ..
+            }) => r.primary_cell.expect("primary"),
             other => panic!("expected ProvideLocationInformation, got {other:?}"),
         };
         assert_eq!(element.rsrp_result.is_some(), claimed.rsrp);
@@ -770,7 +808,7 @@ mod tests {
         let mut endpoint = LppEndpoint::new();
         let pdu = request(asked_for(true, false, false), 3);
 
-        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements()) else {
+        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements(), &[]) else {
             panic!("a location request must be answered");
         };
         let decoded = LppMessage::decode(&reply).expect("the reply decodes");
@@ -782,6 +820,7 @@ mod tests {
         match decoded.body {
             Some(LppBody::ProvideLocationInformation {
                 measurements: report,
+                ..
             }) => {
                 let element = report
                     .primary_cell
@@ -813,12 +852,14 @@ mod tests {
         let mut endpoint = LppEndpoint::new();
         for (rsrp_requested, expected) in [(true, Some(70)), (false, None)] {
             let pdu = request(asked_for(rsrp_requested, false, false), 1);
-            let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements()) else {
+            let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements(), &[])
+            else {
                 panic!("answered");
             };
             match LppMessage::decode(&reply).expect("decodes").body {
                 Some(LppBody::ProvideLocationInformation {
                     measurements: report,
+                    ..
                 }) => {
                     let element = report.primary_cell.expect("primary");
                     assert_eq!(
@@ -840,12 +881,13 @@ mod tests {
         // through as though they had been measured.
         let mut endpoint = LppEndpoint::new();
         let pdu = request(asked_for(false, true, true), 1);
-        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements()) else {
+        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements(), &[]) else {
             panic!("answered");
         };
         match LppMessage::decode(&reply).expect("decodes").body {
             Some(LppBody::ProvideLocationInformation {
                 measurements: report,
+                ..
             }) => {
                 let element = report.primary_cell.expect("primary");
                 assert_eq!(
@@ -873,12 +915,13 @@ mod tests {
             ..measurements()
         };
         let pdu = request(asked_for(true, true, false), 1);
-        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &unknown) else {
+        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &unknown, &[]) else {
             panic!("answered");
         };
         match LppMessage::decode(&reply).expect("decodes").body {
             Some(LppBody::ProvideLocationInformation {
                 measurements: report,
+                ..
             }) => {
                 let element = report.primary_cell.expect("primary");
                 assert_eq!(element.rsrp_result, None);
@@ -899,7 +942,7 @@ mod tests {
             ..measurements()
         };
         assert_eq!(
-            endpoint.handle_downlink(&pdu, &out_of_range),
+            endpoint.handle_downlink(&pdu, &out_of_range, &[]),
             LppReaction::Nothing
         );
         assert_eq!(endpoint.replies_sent(), 0);
@@ -910,7 +953,7 @@ mod tests {
             ..measurements()
         };
         assert!(matches!(
-            endpoint.handle_downlink(&pdu, &at_bound),
+            endpoint.handle_downlink(&pdu, &at_bound, &[]),
             LppReaction::Reply(_)
         ));
     }
@@ -923,7 +966,7 @@ mod tests {
         for pdu in [vec![], vec![0xFF], vec![0xFF; 4], vec![0x00; 8]] {
             // Either it fails to decode, or it decodes as something with no answer.
             // Neither may panic, and neither may produce a reply that claims a fix.
-            match endpoint.handle_downlink(&pdu, &measurements()) {
+            match endpoint.handle_downlink(&pdu, &measurements(), &[]) {
                 LppReaction::Nothing => {}
                 LppReaction::Reply(reply) => {
                     // If it did decode to a request, the reply must at least be
@@ -944,7 +987,7 @@ mod tests {
             9,
         );
         assert_eq!(
-            endpoint.handle_downlink(&pdu, &measurements()),
+            endpoint.handle_downlink(&pdu, &measurements(), &[]),
             LppReaction::Nothing
         );
         assert_eq!(endpoint.replies_sent(), 0);
@@ -961,7 +1004,7 @@ mod tests {
         .encode()
         .expect("encodes");
         assert_eq!(
-            endpoint.handle_downlink(&pdu, &measurements()),
+            endpoint.handle_downlink(&pdu, &measurements(), &[]),
             LppReaction::Nothing
         );
     }
@@ -1007,7 +1050,7 @@ mod tests {
                 let pdu = request_naming_method(c1_index, method_index);
                 let mut endpoint = LppEndpoint::new();
                 assert_eq!(
-                    endpoint.handle_downlink(&pdu, &measurements()),
+                    endpoint.handle_downlink(&pdu, &measurements(), &[]),
                     LppReaction::Nothing,
                     "c1 alternative {c1_index} naming root member {method_index} must not \
                      be answered with an E-CID report"
@@ -1064,7 +1107,7 @@ mod tests {
         let pdu = w.into_bytes();
         let mut endpoint = LppEndpoint::new();
         assert_eq!(
-            endpoint.handle_downlink(&pdu, &measurements()),
+            endpoint.handle_downlink(&pdu, &measurements(), &[]),
             LppReaction::Nothing
         );
     }
@@ -1082,7 +1125,8 @@ mod tests {
                 asked_for(true, false, false),
             ] {
                 let pdu = request(body, number);
-                let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements())
+                let LppReaction::Reply(reply) =
+                    endpoint.handle_downlink(&pdu, &measurements(), &[])
                 else {
                     panic!("answered");
                 };
@@ -1105,7 +1149,7 @@ mod tests {
         // it to the wrong consumer, which is the bug this issue is about in reverse.
         let mut endpoint = LppEndpoint::new();
         let LppUplink::Send(pdu) =
-            endpoint.handle_nas_container(LMF_REQUEST_LOCATION_INFORMATION, &measurements())
+            endpoint.handle_nas_container(LMF_REQUEST_LOCATION_INFORMATION, &measurements(), &[])
         else {
             panic!("the peer's request must produce an uplink");
         };
@@ -1138,7 +1182,7 @@ mod tests {
         // would be a protocol error at the LMF.
         let mut endpoint = LppEndpoint::new();
         assert_eq!(
-            endpoint.handle_nas_container(&[0xFF; 3], &measurements()),
+            endpoint.handle_nas_container(&[0xFF; 3], &measurements(), &[]),
             LppUplink::Nothing
         );
     }
@@ -1154,12 +1198,201 @@ mod tests {
         }
         .encode()
         .expect("encodes");
-        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements()) else {
+        let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements(), &[]) else {
             panic!("answered");
         };
         assert_eq!(
             LppMessage::decode(&reply).expect("decodes").transaction_id,
             None
         );
+    }
+
+    // ---- the sidelink ranging report (issue #137) ----
+
+    /// One measured range, in the units and bounds the IE carries.
+    fn ranging_result() -> SidelinkRangingResult {
+        SidelinkRangingResult {
+            peer_layer2_id: 0x00A5_A5A5,
+            // 50.00 m: the same geometry #136's SL-PRS stimulus test uses.
+            range_cm: 5_000,
+            accuracy_cm: 1,
+            method: SidelinkRangingMethod::CarrierPhase,
+            measurement_count: 3,
+        }
+    }
+
+    /// The report's open-type payload, derived bit by bit rather than captured from
+    /// this encoder -- a self round trip cannot catch a layout both halves get wrong,
+    /// and nextgcore's LMF has to read these bytes:
+    ///
+    /// ```text
+    ///   SidelinkRangingReport SEQUENCE, extensible, no additions:   0
+    ///   results count 1, SIZE(1..32) -> 5 bits of (1-1):            0 0000
+    ///   SidelinkRangingResult SEQUENCE, extensible, no additions:   0
+    ///   peerLayer2Id 0xA5A5A5, INTEGER(0..16777215) -> 24 bits:     1010 0101 1010 0101 1010 0101
+    ///   rangeCm 5000, INTEGER(0..1000000) -> 20 bits:               0000 0001 0011 1000 1000
+    ///   accuracyCm 1, INTEGER(0..65535) -> 16 bits:                 0000 0000 0000 0001
+    ///   method: extensible ENUMERATED, root value:                  0
+    ///          index 1 (carrierPhase), root max 1 -> 1 bit:         1
+    ///   measurementCount 3, INTEGER(0..65535) -> 16 bits:           0000 0000 0000 0011
+    ///                                                              = 85 bits, padded to 11 octets
+    /// ```
+    const GOLDEN_SIDELINK_RANGING_REPORT: &[u8] = &[
+        0x01, 0x4B, 0x4B, 0x4A, 0x02, 0x71, 0x00, 0x00, 0x28, 0x00, 0x18,
+    ];
+
+    #[test]
+    fn the_sidelink_ranging_report_matches_its_hand_derived_bytes() {
+        let report = SidelinkRangingReport {
+            results: vec![ranging_result()],
+        };
+        assert_eq!(
+            report.encode().expect("encodes"),
+            GOLDEN_SIDELINK_RANGING_REPORT
+        );
+        assert_eq!(
+            SidelinkRangingReport::decode(GOLDEN_SIDELINK_RANGING_REPORT).expect("decodes"),
+            report,
+            "and the hand-derived bytes decode back to the same report"
+        );
+    }
+
+    /// A report with sidelink results survives the whole message: it rides an
+    /// extension addition of the `-r9` IEs, and comes back out of a decode.
+    #[test]
+    fn a_provide_location_information_carries_the_ranging_report_through_a_round_trip() {
+        let mut endpoint = LppEndpoint::new();
+        let results = [ranging_result()];
+        let LppReaction::Reply(reply) =
+            endpoint.handle_downlink(LMF_REQUEST_LOCATION_INFORMATION, &measurements(), &results)
+        else {
+            panic!("the peer's request must be answered");
+        };
+
+        match LppMessage::decode(&reply).expect("decodes").body {
+            Some(LppBody::ProvideLocationInformation { sidelink, .. }) => {
+                assert_eq!(
+                    sidelink,
+                    Some(SidelinkRangingReport {
+                        results: vec![ranging_result()],
+                    }),
+                    "the ranging report must survive the extension addition"
+                );
+            }
+            other => panic!("expected ProvideLocationInformation, got {other:?}"),
+        }
+    }
+
+    /// With no ranging results the encoding is what it was before sidelink existed:
+    /// the extension bit stays CLEAR, so nextgcore's LMF -- which skips additions it
+    /// does not know -- sees an unchanged message rather than one it has to tolerate.
+    ///
+    /// The 40 pre-existing tests in this module are the other half of this guard:
+    /// they assert the exact reply bytes and still pass.
+    #[test]
+    fn a_reply_with_no_ranging_results_sets_no_extension_bit() {
+        let mut endpoint = LppEndpoint::new();
+        let LppReaction::Reply(without) =
+            endpoint.handle_downlink(LMF_REQUEST_LOCATION_INFORMATION, &measurements(), &[])
+        else {
+            panic!("answered");
+        };
+        let LppReaction::Reply(with) = endpoint.handle_downlink(
+            LMF_REQUEST_LOCATION_INFORMATION,
+            &measurements(),
+            &[ranging_result()],
+        ) else {
+            panic!("answered");
+        };
+
+        assert!(
+            with.len() > without.len(),
+            "the addition must add octets; without={without:02X?} with={with:02X?}"
+        );
+        // The two differ from the -r9 preamble onward, which is where the extension
+        // bit lives -- so the difference is not merely appended bytes.
+        assert_ne!(
+            with[..without.len()],
+            without[..],
+            "the extension bit sits INSIDE the message, so the shorter encoding \
+             cannot be a prefix of the longer one"
+        );
+        assert!(
+            matches!(
+                LppMessage::decode(&without).expect("decodes").body,
+                Some(LppBody::ProvideLocationInformation { sidelink: None, .. })
+            ),
+            "and it decodes back as carrying no report"
+        );
+    }
+
+    /// An EMPTY result set must encode as an ABSENT report, not an empty list:
+    /// `SEQUENCE (SIZE(1..32))` cannot be empty, and this codec's encoder would
+    /// refuse it -- but a caller that built one anyway would put bytes on the wire
+    /// that fail to decode at the LMF.
+    #[test]
+    fn an_empty_ranging_result_set_is_reported_as_absent_rather_than_as_an_empty_list() {
+        assert_eq!(
+            SidelinkRangingReport { results: vec![] }.encode(),
+            Err(UperError::InvalidLength(0)),
+            "the encoder must refuse an empty list"
+        );
+
+        let mut endpoint = LppEndpoint::new();
+        let LppReaction::Reply(reply) =
+            endpoint.handle_downlink(LMF_REQUEST_LOCATION_INFORMATION, &measurements(), &[])
+        else {
+            panic!("answered");
+        };
+        assert!(
+            matches!(
+                LppMessage::decode(&reply).expect("decodes").body,
+                Some(LppBody::ProvideLocationInformation { sidelink: None, .. })
+            ),
+            "and the endpoint must leave the report absent rather than build one"
+        );
+    }
+
+    /// More results than the IE can carry are TRUNCATED with a warning, not encoded:
+    /// 33 entries encode to bytes that then fail to decode, and the sender would see
+    /// no error at all.
+    #[test]
+    fn more_results_than_the_ie_can_carry_are_truncated_to_its_bound() {
+        let mut endpoint = LppEndpoint::new();
+        let many: Vec<SidelinkRangingResult> = (0..40)
+            .map(|index| SidelinkRangingResult {
+                peer_layer2_id: index,
+                ..ranging_result()
+            })
+            .collect();
+        let LppReaction::Reply(reply) =
+            endpoint.handle_downlink(LMF_REQUEST_LOCATION_INFORMATION, &measurements(), &many)
+        else {
+            panic!("answered");
+        };
+        match LppMessage::decode(&reply).expect("decodes").body {
+            Some(LppBody::ProvideLocationInformation {
+                sidelink: Some(report),
+                ..
+            }) => {
+                let encoded = report.encode().expect("the kept report encodes");
+                assert!(
+                    encoded.len() <= SidelinkRangingReport::MAX_ADDITION_OCTETS,
+                    "the kept report must fit an addition: {} octets",
+                    encoded.len()
+                );
+                assert!(
+                    report.results.len() < SidelinkRangingReport::MAX_RESULTS,
+                    "the binding bound is the 127-octet open type, NOT SIZE(1..32): \
+                     {} results kept",
+                    report.results.len()
+                );
+                assert_eq!(
+                    report.results[0].peer_layer2_id, 0,
+                    "and it is the FIRST results that are kept"
+                );
+            }
+            other => panic!("expected a report, got {other:?}"),
+        }
     }
 }

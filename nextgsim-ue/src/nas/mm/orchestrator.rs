@@ -63,7 +63,7 @@ use super::deregistration::DeregistrationProcedure;
 use super::persistence::{SecurityContextSnapshot, UeStateSnapshot};
 use super::state::{CmState, MmStateMachine, MmSubState, UpdateStatus};
 use super::uuaa::{UuaaProcedure, UuaaReaction, UuaaState};
-use crate::nas::lpp::{LppEndpoint, LppUplink, ServingCellMeasurements};
+use crate::nas::lpp::{LppEndpoint, LppUplink, ServingCellMeasurements, SidelinkRangingResult};
 use crate::uav::{UavAuthorizationState, UavContext, UavIdentity};
 
 /// Maximum registration attempts before falling back to T3502
@@ -662,6 +662,10 @@ pub struct MmOrchestrator {
     /// RRC cycle (`RRC_CYCLE_INTERVAL_MS`, 2500 ms) -- a real E-CID report is a
     /// snapshot too, and one that old is still a measurement rather than a guess.
     serving_cell_measurements: ServingCellMeasurements,
+    /// The sidelink ranging results the LPP endpoint reports to the LMF, pushed by
+    /// the ranging task (issue #137). Empty until it has measured something, which
+    /// is what a UE with no sidelink peers honestly holds.
+    sidelink_ranging_results: Vec<SidelinkRangingResult>,
 
     // -- UAS service-level authentication (UUAA-MM, TS 23.256 §5.2.2) --
     /// The UE half of the UUAA exchange over UL/DL NAS TRANSPORT.
@@ -712,6 +716,7 @@ impl MmOrchestrator {
             updp_pti: 0,
             state_file: None,
             lpp: LppEndpoint::new(),
+            sidelink_ranging_results: Vec::new(),
             // Zero until RRC reports a camped cell. A location request answered
             // before then carries no RSRP at all rather than a made-up one -- see
             // `ServingCellMeasurements`.
@@ -835,8 +840,26 @@ impl MmOrchestrator {
     /// to the SM orchestrator, which owns N1 SM information and returns nothing for
     /// anything else -- so the LMF's transaction timed out with no reply and no error.
     pub fn handle_lpp_container(&mut self, container: &[u8]) -> LppUplink {
-        self.lpp
-            .handle_nas_container(container, &self.serving_cell_measurements)
+        self.lpp.handle_nas_container(
+            container,
+            &self.serving_cell_measurements,
+            &self.sidelink_ranging_results,
+        )
+    }
+
+    /// Record the sidelink ranging results, as reported by the ranging task
+    /// (TS 23.586 §5.3.3, issue #137).
+    ///
+    /// Held rather than fetched for the same reason the serving-cell measurements
+    /// are: the LPP endpoint is synchronous, and a location request has to be
+    /// answered from what has already arrived.
+    pub fn set_sidelink_ranging_results(&mut self, results: Vec<SidelinkRangingResult>) {
+        self.sidelink_ranging_results = results;
+    }
+
+    /// The sidelink ranging results this UE would report to the LMF.
+    pub fn sidelink_ranging_results(&self) -> &[SidelinkRangingResult] {
+        &self.sidelink_ranging_results
     }
 
     /// Record the serving cell's measurements, as reported by the RRC layer.
@@ -6874,7 +6897,7 @@ mod tests {
         assert_eq!(reply.transaction_id.map(|t| t.transaction_number), Some(0));
         assert!(reply.end_transaction);
         match reply.body {
-            Some(LppBody::ProvideLocationInformation { measurements }) => {
+            Some(LppBody::ProvideLocationInformation { measurements, .. }) => {
                 let element = measurements.primary_cell.expect("primary");
                 assert_eq!(element.phys_cell_id, 7, "the cell RRC reported");
                 assert_eq!(element.arfcn, 1850);
@@ -6883,6 +6906,101 @@ mod tests {
             }
             other => panic!("expected ProvideLocationInformation, got {other:?}"),
         }
+    }
+
+    /// The sidelink ranging report LEAVES THE UE (issue #137): it rides the LPP
+    /// payload container of a real UL NAS TRANSPORT, which is what replaced the
+    /// in-process `oneshot` behind `RangingMessage::ReportToLmf`.
+    #[test]
+    fn a_sidelink_ranging_report_leaves_the_ue_in_an_ul_nas_transport() {
+        use crate::nas::lpp::{
+            LppBody, LppMessage, LppUplink, ServingCellMeasurements, SidelinkRangingMethod,
+            SidelinkRangingReport, SidelinkRangingResult,
+        };
+        use nextgsim_nas::ies::ie1::PayloadContainerType;
+        use nextgsim_nas::messages::mm::UlNasTransport;
+
+        let mut orch = new_orch();
+        orch.set_serving_cell_measurements(ServingCellMeasurements {
+            phys_cell_id: 7,
+            arfcn: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(60),
+            rsrq_result: None,
+        });
+        let measured = SidelinkRangingResult {
+            peer_layer2_id: 0x00A5_A5A5,
+            range_cm: 5_000,
+            accuracy_cm: 1,
+            method: SidelinkRangingMethod::CarrierPhase,
+            measurement_count: 3,
+        };
+        orch.set_sidelink_ranging_results(vec![measured]);
+
+        let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
+            panic!("an LPP location request must be answered");
+        };
+
+        // A real NAS message, announced as an LPP container: an AMF routes on that
+        // type, so a report in the wrong container would reach the wrong consumer.
+        let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
+        assert_eq!(ul.payload_container_type, PayloadContainerType::LppMessage);
+        match LppMessage::decode(&ul.payload_container)
+            .expect("decodes")
+            .body
+        {
+            Some(LppBody::ProvideLocationInformation {
+                measurements,
+                sidelink,
+            }) => {
+                assert_eq!(
+                    sidelink,
+                    Some(SidelinkRangingReport {
+                        results: vec![measured]
+                    }),
+                    "the measured range must survive the whole transport"
+                );
+                // And the E-CID half is still there: a UE that ranges over sidelink
+                // also has a serving cell.
+                assert_eq!(measurements.primary_cell.expect("primary").phys_cell_id, 7);
+            }
+            other => panic!("expected ProvideLocationInformation, got {other:?}"),
+        }
+    }
+
+    /// With nothing measured the reply carries no report at all, rather than an empty
+    /// one -- and the encoding is what it was before sidelink existed.
+    #[test]
+    fn a_ue_with_no_ranging_results_sends_the_same_report_it_always_did() {
+        use crate::nas::lpp::{LppBody, LppMessage, LppUplink, ServingCellMeasurements};
+        use nextgsim_nas::messages::mm::UlNasTransport;
+
+        let mut orch = new_orch();
+        orch.set_serving_cell_measurements(ServingCellMeasurements {
+            phys_cell_id: 7,
+            arfcn: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(60),
+            rsrq_result: None,
+        });
+        assert!(
+            orch.sidelink_ranging_results().is_empty(),
+            "precondition: nothing measured"
+        );
+
+        let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
+            panic!("answered");
+        };
+        let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
+        assert!(
+            matches!(
+                LppMessage::decode(&ul.payload_container)
+                    .expect("decodes")
+                    .body,
+                Some(LppBody::ProvideLocationInformation { sidelink: None, .. })
+            ),
+            "no report, not an empty one"
+        );
     }
 
     #[test]
@@ -6910,7 +7028,7 @@ mod tests {
                 .expect("decodes")
                 .body
             {
-                Some(LppBody::ProvideLocationInformation { measurements }) => {
+                Some(LppBody::ProvideLocationInformation { measurements, .. }) => {
                     let element = measurements.primary_cell.expect("primary");
                     reported.push((element.phys_cell_id, element.rsrp_result));
                 }

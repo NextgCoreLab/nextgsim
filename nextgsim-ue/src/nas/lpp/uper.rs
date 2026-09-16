@@ -197,6 +197,54 @@ impl UperWriter {
         self.write_constrained(value, 0, root_max)
     }
 
+    /// The extension-addition part of a SEQUENCE (X.691 18.7-18.9).
+    ///
+    /// Writes the bit-map length as a normally-small non-negative number (11.6),
+    /// then one presence bit per addition, then each present addition as an open
+    /// type: a short-form length determinant followed by its octets. The mirror of
+    /// [`UperReader::read_extension_additions`], and deliberately the same shape as
+    /// what that already skipped -- a writer that disagreed with the reader in this
+    /// codec would produce bytes only this codec could read.
+    ///
+    /// Each addition is a COMPLETE encoding of its type, padded to whole octets, as
+    /// an open type requires. Call [`Self::into_bytes`] on a nested writer to get
+    /// one.
+    ///
+    /// The caller must have written `true` as the SEQUENCE preamble's extension bit;
+    /// this does not write it, because the preamble comes before the root members
+    /// and the additions after them.
+    ///
+    /// # Errors
+    /// [`UperError::Unsupported`] for more than 64 additions or an addition of 128
+    /// octets or more, neither of which the matching reader can handle -- refused
+    /// rather than encoded into bytes that would not decode.
+    pub fn write_extension_additions(&mut self, additions: &[Option<Vec<u8>>]) -> UperResult<()> {
+        if additions.is_empty() || additions.len() > 64 {
+            return Err(UperError::Unsupported(
+                "extension-addition bit-map length outside 1..=64",
+            ));
+        }
+        // Normally-small non-negative number (X.691 11.6): a leading 0 bit then 6
+        // bits of (count - 1).
+        self.write_bit(false);
+        self.write_bits((additions.len() - 1) as u64, 6);
+        for addition in additions {
+            self.write_bit(addition.is_some());
+        }
+        for addition in additions.iter().flatten() {
+            if addition.len() >= 0x80 {
+                return Err(UperError::Unsupported(
+                    "long-form or fragmented open-type length",
+                ));
+            }
+            self.write_bits(addition.len() as u64, 8);
+            for byte in addition {
+                self.write_bits(u64::from(*byte), 8);
+            }
+        }
+        Ok(())
+    }
+
     /// A BIT STRING with a constrained size (X.691 16): the length as a constrained
     /// whole number, then the bits. `low == high` writes the bits alone.
     ///
@@ -349,6 +397,20 @@ impl<'a> UperReader<'a> {
     /// [`UperError::Unsupported`] for a fragmented or long-form open type, which
     /// this codec cannot skip correctly and must not pretend to.
     pub fn skip_extension_additions(&mut self) -> UperResult<()> {
+        self.read_extension_additions().map(|_| ())
+    }
+
+    /// Read the extension-addition part of a SEQUENCE (X.691 18.7-18.9) and return
+    /// each addition's octets, `None` where the bit-map says the addition is absent.
+    ///
+    /// [`Self::skip_extension_additions`] is this and a discard, so an addition
+    /// this codec reads and one it skips can never disagree about where the root
+    /// resumes.
+    ///
+    /// # Errors
+    /// [`UperError::Unsupported`] for a fragmented or long-form open type, which
+    /// this codec cannot read correctly and must not pretend to.
+    pub fn read_extension_additions(&mut self) -> UperResult<Vec<Option<Vec<u8>>>> {
         // Normally-small non-negative number (X.691 11.6): a leading 0 bit then 6
         // bits of (count - 1).
         if self.read_bit()? {
@@ -361,8 +423,10 @@ impl<'a> UperReader<'a> {
         for _ in 0..count {
             present.push(self.read_bit()?);
         }
+        let mut additions = Vec::with_capacity(count);
         for is_present in present {
             if !is_present {
+                additions.push(None);
                 continue;
             }
             // Open-type length determinant (X.691 11.9): the short form only, which
@@ -373,16 +437,20 @@ impl<'a> UperReader<'a> {
                     "long-form or fragmented open-type length",
                 ));
             }
-            let bits = (length as usize) * 8;
-            if self.remaining_bits() < bits {
+            let octets = length as usize;
+            if self.remaining_bits() < octets * 8 {
                 return Err(UperError::OutOfBits {
-                    needed: bits,
+                    needed: octets * 8,
                     available: self.remaining_bits(),
                 });
             }
-            self.position += bits;
+            let mut bytes = Vec::with_capacity(octets);
+            for _ in 0..octets {
+                bytes.push(self.read_bits(8)? as u8);
+            }
+            additions.push(Some(bytes));
         }
-        Ok(())
+        Ok(additions)
     }
 }
 
