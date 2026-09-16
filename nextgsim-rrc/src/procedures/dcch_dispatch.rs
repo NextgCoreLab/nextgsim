@@ -81,6 +81,7 @@ use super::information_transfer::{
     parse_dl_information_transfer, parse_ul_information_transfer, DlInformationTransferData,
     UlInformationTransferData,
 };
+use super::measurement_report::{parse_measurement_report, MeasurementReportData};
 use super::rrc_reconfiguration::{
     parse_rrc_reconfiguration, parse_rrc_reconfiguration_complete, RrcReconfigurationCompleteData,
     RrcReconfigurationData,
@@ -124,6 +125,9 @@ pub enum UlDcchMessage {
     RrcReestablishmentComplete(RrcReestablishmentCompleteData),
     /// `rrcResumeComplete` (c1 index 4) — may carry a piggybacked NAS message.
     RrcResumeComplete(RrcResumeCompleteData),
+    /// `measurementReport` (c1 index 0) — the measurements a handover decision is
+    /// made from (TS 38.331 §5.5.5).
+    MeasurementReport(MeasurementReportData),
     /// `securityModeFailure` (c1 index 6) — the UE refused the
     /// SecurityModeCommand with this transaction identifier (TS 38.331 §5.3.4.4).
     SecurityModeFailure {
@@ -131,7 +135,7 @@ pub enum UlDcchMessage {
         rrc_transaction_id: u8,
     },
     /// A well-formed UL-DCCH-Message the gNB does not dispatch on (e.g.
-    /// measurementReport, messageClassExtension).
+    /// locationMeasurementIndication, messageClassExtension).
     Unsupported,
 }
 
@@ -174,6 +178,9 @@ pub fn dispatch_ul_dcch(bytes: &[u8]) -> Result<UlDcchMessage, RrcCodecError> {
         }
         UL_DCCH_MessageType_c1::RrcResumeComplete(_) => {
             UlDcchMessage::RrcResumeComplete(parse_error(parse_rrc_resume_complete(&msg))?)
+        }
+        UL_DCCH_MessageType_c1::MeasurementReport(_) => {
+            UlDcchMessage::MeasurementReport(parse_error(parse_measurement_report(&msg))?)
         }
         UL_DCCH_MessageType_c1::SecurityModeFailure(failure) => {
             UlDcchMessage::SecurityModeFailure {

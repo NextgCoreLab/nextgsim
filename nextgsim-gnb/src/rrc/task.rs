@@ -24,6 +24,7 @@ use nextgsim_rrc::procedures::dcch_dispatch::{
 use nextgsim_rrc::procedures::information_transfer::{
     encode_dl_information_transfer, DlInformationTransferParams,
 };
+use nextgsim_rrc::procedures::measurement_report::MeasurementReportData;
 use nextgsim_rrc::procedures::paging::{encode_paging, PagingRecordParams, FIVE_G_S_TMSI_LEN};
 use nextgsim_rrc::procedures::paging_occasion::{
     self, paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig,
@@ -87,7 +88,7 @@ const TAI_OCTETS: usize = 6;
 use super::connection::{
     ReestablishmentRequest, ResumeRequestPresented, RrcConnectionManager, SuspendParams,
 };
-use super::handover::GnbHandoverManager;
+use super::handover::{measurement_report_from, GnbHandoverManager, HandoverDecision};
 use super::system_info::{
     encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
     release_cell_reselection_priorities,
@@ -693,6 +694,10 @@ impl RrcTask {
             }
             Ok(UlDcchMessage::RrcResumeComplete(complete)) => {
                 self.handle_rrc_resume_complete(ue_id, &complete).await;
+                true
+            }
+            Ok(UlDcchMessage::MeasurementReport(data)) => {
+                self.handle_measurement_report(ue_id, &data).await;
                 true
             }
             Ok(UlDcchMessage::SecurityModeFailure { rrc_transaction_id }) => {
@@ -1963,6 +1968,67 @@ impl RrcTask {
              (confidence {confidence:.2})"
         );
         self.execute_handover(ue_id, target_cell).await;
+    }
+
+    /// Act on a UE's `MeasurementReport` (TS 38.331 §5.5.5, issue #162).
+    ///
+    /// This is the production caller `parse_measurement_report` and
+    /// `GnbHandoverManager::process_measurement_report` never had: both existed, were
+    /// tested, and were reached by nothing, so a UE reporting a neighbour 10 dB better
+    /// than its serving cell was answered with silence. The report could not even be
+    /// routed here until the typed UL-DCCH dispatch landed (issue #151) -- a real
+    /// measurementReport is c1 index 0, whose leading byte the old nibble matcher read
+    /// as something else.
+    ///
+    /// The A3 evaluation and the intra/inter split are both reused rather than
+    /// reimplemented: `process_measurement_report` decides, and `execute_handover` moves
+    /// the UE, which is the same path the NWDAF recommendation takes. A second decision
+    /// site would let the two disagree about what "better" means.
+    async fn handle_measurement_report(&mut self, ue_id: i32, data: &MeasurementReportData) {
+        let (_meas_id, report) = measurement_report_from(data);
+        info!(
+            "MeasurementReport from UE[{}]: meas_id={}, serving={} dBm, {} neighbour(s)",
+            ue_id,
+            report.meas_id,
+            report.serving_rsrp,
+            report.neighbors.len()
+        );
+
+        // An unknown UE is reported and not acted on: handing over a context this gNB
+        // does not hold would allocate against nothing.
+        if self.ue_manager.try_find_ue(ue_id).is_none() {
+            debug!("Ignoring MeasurementReport for unknown UE[{}]", ue_id);
+            return;
+        }
+
+        match self
+            .handover_manager
+            .process_measurement_report(ue_id, &report)
+        {
+            HandoverDecision::NoHandover => {
+                debug!(
+                    "No neighbour beats UE[{}]'s serving cell by the A3 margin; staying",
+                    ue_id
+                );
+            }
+            HandoverDecision::IntraGnbHandover { target_cell_id } => {
+                info!(
+                    "UE[{}] measurement-triggered handover to cell {}",
+                    ue_id, target_cell_id
+                );
+                self.execute_handover(ue_id, target_cell_id).await;
+            }
+            other => {
+                // The manager models Xn and inter-gNB decisions its A3 evaluator does
+                // not currently produce. Named rather than silently ignored, so a later
+                // evaluator that does produce one is not lost here.
+                debug!(
+                    "Handover decision {:?} for UE[{}] is not driven from a measurement \
+                     report yet",
+                    other, ue_id
+                );
+            }
+        }
     }
 
     /// Hand a UE over to `target_cell`, intra-gNB or inter-gNB (issue #39).
@@ -3684,6 +3750,139 @@ mod tests {
     // is what the typed dispatch buys, and the gNB verifies the echo FAIL-CLOSED
     // -- so the round trip needs a positive AND a negative control.
     // ========================================================================
+
+    // ========================================================================
+    // Measurement-report-driven handover (TS 38.331 §5.5.5, issue #162). Both the
+    // parser and the A3 evaluator existed, were tested, and were reached by nothing.
+    // ========================================================================
+
+    /// A real UPER `MeasurementReport` with one serving cell and one neighbour.
+    fn measurement_report_pdu(serving_dbm: i32, neighbour_pci: u16, neighbour_dbm: i32) -> Vec<u8> {
+        use nextgsim_rrc::procedures::measurement_report::{
+            dbm_to_rsrp_range, encode_measurement_report, MeasCellResults, MeasResult2Nr,
+            MeasResultCellNr, MeasResultNr, MeasResultServFreqNr, MeasurementReportParams,
+        };
+        let cell = |pci: u16, dbm: i32| MeasResultNr {
+            phys_cell_id: Some(pci),
+            cell_results: MeasResultCellNr {
+                ssb_results: Some(MeasCellResults {
+                    rsrp: Some(dbm_to_rsrp_range(f64::from(dbm))),
+                    rsrq: None,
+                    sinr: None,
+                }),
+                csi_rs_results: None,
+            },
+            rs_index_results: None,
+        };
+        encode_measurement_report(&MeasurementReportParams {
+            meas_id: 1,
+            serv_freq_results: vec![MeasResultServFreqNr {
+                serv_cell_index: 0,
+                meas_result_serving_cell: cell(1, serving_dbm),
+                meas_result_best_neigh_cell: None,
+            }],
+            neigh_freq_results: vec![MeasResult2Nr {
+                ssb_frequency_arfcn: None,
+                ref_freq_csi_rs: None,
+                meas_result_list: vec![cell(neighbour_pci, neighbour_dbm)],
+            }],
+            eutra_neigh_results: Vec::new(),
+            enhanced_quantities: None,
+        })
+        .expect("encode MeasurementReport")
+    }
+
+    /// A neighbour comfortably better than the serving cell must move the UE. The target
+    /// is not one of this gNB's cells, so the handover leaves over NGAP as HANDOVER
+    /// REQUIRED -- which is the truth for a single-cell gNB, not a fallback (see
+    /// `execute_handover`).
+    #[test]
+    fn a_measurement_report_with_a_better_neighbour_triggers_a_handover() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                ctx.on_setup_complete();
+            }
+            while ngap_rx.try_recv().is_ok() {}
+
+            // Neighbour 20 dB better: past any plausible A3 offset plus hysteresis.
+            let pdu = measurement_report_pdu(-100, 42, -80);
+            task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+        });
+
+        let mut initiated = None;
+        while let Ok(msg) = ngap_rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::InitiateHandover(init)) = msg {
+                initiated = Some(init);
+            }
+        }
+        let init =
+            initiated.expect("a report naming a much better neighbour must start a handover");
+        assert_eq!(init.ue_id, 7);
+        assert_eq!(
+            init.target_cell_identity, 42,
+            "and it must target the cell the UE reported"
+        );
+    }
+
+    /// The negative control: a neighbour that does NOT beat the serving cell by the A3
+    /// margin must move nothing. Without it the test above would pass for a gNB that
+    /// handed over on any report at all.
+    #[test]
+    fn a_measurement_report_with_no_better_neighbour_triggers_nothing() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                ctx.on_setup_complete();
+            }
+            while ngap_rx.try_recv().is_ok() {}
+
+            // The neighbour is WORSE than the serving cell.
+            let pdu = measurement_report_pdu(-80, 42, -100);
+            task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+        });
+
+        while let Ok(msg) = ngap_rx.try_recv() {
+            assert!(
+                !matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_))),
+                "a worse neighbour is not a handover trigger"
+            );
+        }
+    }
+
+    /// A report for a UE this gNB does not hold is reported and not acted on: handing
+    /// over a context that does not exist would allocate against nothing.
+    #[test]
+    fn a_measurement_report_for_an_unknown_ue_triggers_nothing() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            task.handle_radio_power_on();
+            while ngap_rx.try_recv().is_ok() {}
+            let pdu = measurement_report_pdu(-100, 42, -80);
+            task.handle_uplink_rrc(99, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+        });
+
+        while let Ok(msg) = ngap_rx.try_recv() {
+            assert!(
+                !matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_))),
+                "an unknown UE must not be handed over"
+            );
+        }
+    }
 
     // ========================================================================
     // Conditional handover, gNB side (TS 38.331 §5.3.5.13, issue #160). The UE
