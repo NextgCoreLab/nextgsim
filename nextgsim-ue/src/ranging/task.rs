@@ -1,20 +1,32 @@
 //! Ranging Task for UE - UE-to-UE distance measurement and carrier phase positioning
 //!
-//! **Scaffold, not wired end-to-end.** Models the Rel-18 ranging concepts of
-//! TS 23.586 (RTT ranging, carrier-phase measurement with multi-frequency
-//! ambiguity resolution, and LMF result reporting).
+//! UE-to-UE distance measurement and carrier-phase positioning (TS 23.586 §5.3.3,
+//! §5.5): RTT ranging, carrier-phase measurement with multi-frequency ambiguity
+//! resolution, and reporting the result toward an LMF.
 //!
-//! What is wired, since issue #136: SL-PRS occasions from the sidelink task
-//! produce `RttMeasurement` and `CarrierPhaseMeasurement`, so the session maths
-//! below runs on live input. The propagation delay behind those measurements is
-//! MODELLED from configured geometry — there is no PC5 radio here — so the
-//! accuracy they report is the model's, not a radio's.
+//! **Wired end to end on the UE side, and exercised in CI** (issues #136, #137,
+//! #139): an SL-PRS occasion from the sidelink task produces `RttMeasurement` and
+//! `CarrierPhaseMeasurement`, the session maths below resolves a range from them, and
+//! `ReportToLmf` hands it to the NAS plane, which carries it to the LMF in the LPP
+//! payload container of an UL NAS TRANSPORT. `tests/src/ranging_report_e2e.rs` asserts
+//! the range recovered from the bytes that leave the UE.
 //!
-//! What is still missing: `ReportToLmf` ends at an in-process `oneshot` with no
-//! caller, because there is no SLPP/RSPP UE->LMF transport (issue #137) and no
-//! ranging service at the LMF to receive one (issue #138). Until both land and an
-//! end-to-end run produces a range at an LMF (issue #139), the startup lines below
-//! keep saying "scaffold".
+//! ## What is modelled rather than measured
+//!
+//! There is no PC5 radio here, so the propagation delay behind every measurement is
+//! computed from configured geometry (`RangingConfig::own_position` and its
+//! `anchors`). The accuracy reported is therefore the model's and not a radio's, and
+//! nothing exercises what the widelane does under phase noise or multipath.
+//!
+//! ## What has never run
+//!
+//! A **two-process** run. The LMF is nextgcore's `lmfd`, a separate product with no
+//! build-time link to this one, and CI checks out one repository; the Docker jobs that
+//! could run both binaries are `workflow_dispatch`-only. The LMF half is covered in
+//! its own repository (nextgcore, issue #138), where its LPP codec is held against
+//! this UE's hand-derived golden vector. So the two halves are proven against the same
+//! bytes, not against each other in flight — which is why the startup lines below name
+//! that limit instead of claiming a working end-to-end feature.
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -47,16 +59,16 @@ const RANGE_CM_MAX: u32 = 1_000_000;
 /// binary's wording too: the only way to change what the binary logs is to
 /// change this string, and the test reads this string.
 ///
-/// It must not claim TS 23.586 compliance. The pipeline behind it is dead —
-/// see the module docs — so a spec citation here would be read as a
-/// capability. Issue #55.
-pub const SPAWN_LOG: &str =
-    "Ranging task spawned (scaffold: SL-PRS measurements run, no UE->LMF transport)";
+/// It must name what has NOT run. The measurement and reporting path is wired and
+/// tested (see the module docs), but no two-process run against a real LMF has ever
+/// happened, so a bare capability claim would overstate it. Issues #55, #139.
+pub const SPAWN_LOG: &str = "Ranging task spawned (SL-PRS measurement and LPP \
+     reporting wired; range modelled from configured geometry, no two-process LMF run)";
 
-/// The line [`RangingTask::run`] emits on entry. Same no-compliance-claim
-/// contract as [`SPAWN_LOG`], and unlike it this one is reached by a test.
-pub const START_LOG: &str = "Ranging task started (scaffold: SL-PRS measurements reach the \
-     session maths; the report to the LMF has no transport)";
+/// The line [`RangingTask::run`] emits on entry. Same contract as [`SPAWN_LOG`], and
+/// unlike it this one is reached by a test.
+pub const START_LOG: &str = "Ranging task started (SL-PRS measurement and LPP reporting \
+     wired; range modelled from configured geometry, no two-process LMF run)";
 
 /// Carrier phase measurement for a single frequency.
 #[derive(Debug, Clone)]
@@ -440,10 +452,9 @@ mod tests {
         capture_task_logs(RangingTask::new(task_base()))
     }
 
-    /// #55, criterion 3: a default (ranging-disabled) start must not log a
-    /// TS 23.586 compliance claim, because the pipeline behind the claim is
-    /// dead — no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF
-    /// transport, and no ranging service at the LMF.
+    /// #55, criterion 3, still standing after #139: a **default** start must make no
+    /// compliance claim, because the pipeline stays default-off — a UE that was never
+    /// asked for ranging has measured nothing, whatever the code is capable of.
     #[test]
     fn a_default_ranging_disabled_start_logs_no_ts_23_586_claim() {
         let logged = run_ranging_task_capturing_logs();
@@ -475,21 +486,33 @@ mod tests {
     /// `main.rs`'s task closure), so what is pinned instead is the constant it
     /// logs. Changing the binary's wording means changing this string, and
     /// this test reads this string.
+    ///
+    /// UPDATED by #139 rather than deleted. It used to require the word "scaffold",
+    /// which stopped being true when the pipeline was wired; what it requires now is
+    /// that each line still names a LIMIT, because two limits remain — the range is
+    /// modelled from geometry rather than measured, and no two-process run against a
+    /// real LMF has happened. A line that named neither would read as a finished
+    /// feature, which is the same failure the "scaffold" requirement was guarding.
     #[test]
-    fn the_startup_lines_make_no_ts_23_586_compliance_claim() {
+    fn the_startup_lines_name_what_has_not_run() {
         for line in [SPAWN_LOG, START_LOG] {
             assert!(
-                line.contains("scaffold"),
-                "{line:?} must say it is a scaffold, or a reader takes the \
-                 spawn for a working feature"
+                line.contains("modelled from configured geometry"),
+                "{line:?} must say the range is modelled, not measured by a radio"
+            );
+            assert!(
+                line.contains("no two-process LMF run"),
+                "{line:?} must say no run against a real LMF has happened"
             );
             assert!(
                 !line.contains("TS 23.586"),
-                "{line:?} cites TS 23.586, which reads as a compliance claim"
+                "{line:?} cites TS 23.586, which reads as a compliance claim the \
+                 two-process gap does not support"
             );
             assert!(
                 !line.contains("Rel-18"),
-                "{line:?} advertises a Rel-18 capability the code does not deliver"
+                "{line:?} advertises a Rel-18 capability the code does not fully \
+                 deliver"
             );
         }
     }

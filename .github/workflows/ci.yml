@@ -276,6 +276,32 @@ jobs:
       - name: cargo clippy
         run: cargo clippy -p nextgsim-pdcp --all-targets
 
+  ranging:
+    name: Sidelink ranging (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The ranging pipeline sits behind BOTH the `sidelink` cargo feature (the
+      # SL-PRS stimulus and the positioning engine live in the module #54 gated off)
+      # and `ranging_config.enabled` at run time. So the default jobs above compile
+      # none of it and reach none of it -- the recorded failure mode for
+      # feature-gated code is shipping without CI ever compiling it (issue #139).
+      - name: cargo test (the ranging end-to-end)
+        run: cargo test -p nextgsim-integration-tests --features sidelink --test ranging_report_e2e
+      - name: cargo test (both ends of the pipeline)
+        run: |
+          cargo test -p nextgsim-ue --features sidelink ranging
+          cargo test -p nextgsim-ue --features sidelink nas::lpp
+      - name: cargo clippy
+        run: |
+          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
+          cargo clippy -p nextgsim-ue --features sidelink --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

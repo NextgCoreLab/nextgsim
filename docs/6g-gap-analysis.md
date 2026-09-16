@@ -222,7 +222,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 - No RIS beam management via RRC
 - NTN RRC prototypes exist (timing advance, link sim, constellation, ISL handover in nextgsim-rrc) but use bespoke encodings and are not wired into live signaling; no satellite cell selection or Doppler pre-compensation
 - No sub-THz beam tracking procedures
-- No wire-conformant sidelink/D2D RRC support (a UE-side ProSe/ranging prototype now exists, sim-internal only)
+- No wire-conformant sidelink/D2D RRC support: no PC5-S exchange and no `SidelinkUEInformation`/`sl-Config` (issue #141). The ranging path on top of it IS wired and CI-tested (#136-#139), but its measurements are computed from configured geometry rather than carried over a PC5 radio
 - No dual connectivity (EN-DC, NR-DC) RRC procedures
 - No conditional handover (CHO) / DAPS handover support
 
@@ -329,7 +329,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 - No ISAC measurement reporting
 - No AI/ML-assisted mobility (predictive handover consumption from NWDAF)
 - No sidelink/D2D support
-- Ranging / sidelink positioning (`ranging/`) is a non-wired stub, not spec-compliant: no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF SLPP/RSPP transport, no LMF ranging service (issue #55)
+- Ranging / sidelink positioning (`ranging/`) is wired on the UE side and exercised in CI (issues #136-#139): SL-PRS occasion → RTT and carrier-phase measurement → range → LPP report in an UL NAS TRANSPORT, with the LMF consumer in nextgcore (#138). Two limits: the range is computed from configured geometry rather than measured by a radio, and no two-process run against a real LMF has happened — the two halves are proven against the same golden bytes
 - No NTN-aware procedures
 - No zero-energy device emulation mode
 
@@ -554,7 +554,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 | Semantic communication | semantic | Basic encoder/decoder prototype | HIGH |
 | Digital twin network | NONE | Not started | HIGH |
 | Zero-energy devices / ambient IoT | ue (ambient_iot) | Prototype exists (energy-harvesting model + fleet simulation), sim-internal only | MEDIUM |
-| Ranging / sidelink positioning (TS 23.586) | ue (ranging, sidelink) | Non-wired stub, not spec-compliant: RTT and carrier-phase maths and an LMF report shape exist, but no `RangingMessage` producer, no SL-PRS stimulus, no UE→LMF SLPP/RSPP transport and no LMF ranging service, so the measurement pipeline is unreachable end to end (issue #55) | MEDIUM |
+| Ranging / sidelink positioning (TS 23.586) | ue (ranging, sidelink) | Wired on the UE side and exercised in CI (issues #136-#139): SL-PRS occasion → RTT + carrier-phase measurement → widelane range → LPP report in an UL NAS TRANSPORT; the LMF files it against the UE (nextgcore #138). Remaining: the range is computed from configured geometry rather than measured, and no two-process run against a real LMF has happened | LOW |
 | Joint Communication and Computing (JCC) | NONE | Not started | HIGH |
 | Enhanced network slicing (6G) | agent (SliceCreate/Modify intents) | Intent types defined, no implementation | HIGH |
 | Federated learning | fl | FedAvg prototype with basic DP | MEDIUM |
