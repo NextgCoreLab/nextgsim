@@ -2,9 +2,19 @@
 //!
 //! **Scaffold, not wired end-to-end.** Models the Rel-18 ranging concepts of
 //! TS 23.586 (RTT ranging, carrier-phase measurement with multi-frequency
-//! ambiguity resolution, and LMF result reporting), but no `RangingMessage`
-//! producer, SL-PRS stimulus, or UE->LMF (SLPP/RSPP) transport is wired — so
-//! the measurement handlers below are not reached at runtime.
+//! ambiguity resolution, and LMF result reporting).
+//!
+//! What is wired, since issue #136: SL-PRS occasions from the sidelink task
+//! produce `RttMeasurement` and `CarrierPhaseMeasurement`, so the session maths
+//! below runs on live input. The propagation delay behind those measurements is
+//! MODELLED from configured geometry — there is no PC5 radio here — so the
+//! accuracy they report is the model's, not a radio's.
+//!
+//! What is still missing: `ReportToLmf` ends at an in-process `oneshot` with no
+//! caller, because there is no SLPP/RSPP UE->LMF transport (issue #137) and no
+//! ranging service at the LMF to receive one (issue #138). Until both land and an
+//! end-to-end run produces a range at an LMF (issue #139), the startup lines below
+//! keep saying "scaffold".
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -23,12 +33,12 @@ use crate::tasks::{RangingMessage, Task, TaskMessage, UeTaskBase};
 /// see the module docs — so a spec citation here would be read as a
 /// capability. Issue #55.
 pub const SPAWN_LOG: &str =
-    "Ranging task spawned (scaffold: no stimulus producer or UE->LMF transport)";
+    "Ranging task spawned (scaffold: SL-PRS measurements run, no UE->LMF transport)";
 
 /// The line [`RangingTask::run`] emits on entry. Same no-compliance-claim
 /// contract as [`SPAWN_LOG`], and unlike it this one is reached by a test.
-pub const START_LOG: &str =
-    "Ranging task started (scaffold: the sidelink-positioning pipeline is not wired end-to-end)";
+pub const START_LOG: &str = "Ranging task started (scaffold: SL-PRS measurements reach the \
+     session maths; the report to the LMF has no transport)";
 
 /// Carrier phase measurement for a single frequency.
 #[derive(Debug, Clone)]
@@ -84,12 +94,27 @@ impl RangingSession {
     }
 
     /// Add a carrier phase measurement and resolve ambiguity if enough frequencies.
+    ///
+    /// One entry per frequency: a repeat on a frequency already measured REPLACES
+    /// it. Appending unconditionally was safe only while nothing produced
+    /// measurements — with a live SL-PRS stimulus (issue #136) it would grow the
+    /// vector without bound on a periodic path, and `resolve_carrier_phase_ambiguity`
+    /// reads indices 0 and 1, so every later occasion would have resolved against
+    /// the very first pair of phases and never moved.
     fn add_carrier_phase(&mut self, frequency_mhz: f64, phase_rad: f64, quality: f64) {
-        self.carrier_phases.push(CarrierPhaseMeasurement {
+        let measurement = CarrierPhaseMeasurement {
             frequency_mhz,
             phase_rad,
             quality,
-        });
+        };
+        match self
+            .carrier_phases
+            .iter_mut()
+            .find(|m| m.frequency_mhz == frequency_mhz)
+        {
+            Some(existing) => *existing = measurement,
+            None => self.carrier_phases.push(measurement),
+        }
 
         // Multi-frequency carrier phase combining for ambiguity resolution
         // Need at least 2 frequencies for widelane combination
@@ -115,9 +140,18 @@ impl RangingSession {
         let lambda1 = 300.0 / m1.frequency_mhz; // meters (c in m/s / f in MHz = m)
         let _lambda2 = 300.0 / m2.frequency_mhz;
 
-        // Widelane wavelength: lambda_w = c / (f1 - f2)
-        let freq_diff = (m1.frequency_mhz - m2.frequency_mhz).abs();
-        if freq_diff < 0.001 {
+        // Widelane wavelength: lambda_w = c / (f1 - f2), SIGNED.
+        //
+        // The sign matters and taking `.abs()` here was a defect: the widelane
+        // observable is `phase1 - phase2` in cycles, whose sign follows
+        // `f1 - f2`, so pairing a signed phase difference with an unsigned
+        // wavelength makes the integer ambiguity resolve to the wrong cycle
+        // whenever the first frequency is the LOWER one -- an error of up to a
+        // whole widelane wavelength (3 m for the default 100 MHz spacing). It was
+        // invisible while nothing produced measurements; the first end-to-end
+        // occasion recovered 48.97 m for a 50 m geometry (issue #136).
+        let freq_diff = m1.frequency_mhz - m2.frequency_mhz;
+        if freq_diff.abs() < 0.001 {
             return; // frequencies too close
         }
         let lambda_w = 300.0 / freq_diff;
@@ -340,6 +374,279 @@ mod tests {
                 "{line:?} advertises a Rel-18 capability the code does not deliver"
             );
         }
+    }
+
+    // ========================================================================
+    // The SL-PRS stimulus, end to end (issue #136). The pipeline used to have no
+    // producer at all: `RttMeasurement` and `CarrierPhaseMeasurement` were
+    // unreachable, so the RTT and widelane maths above were dead code.
+    // ========================================================================
+
+    /// An SL-PRS occasion reaches the ranging session and the session acquires a
+    /// distance. Driven through the real channels -- the sidelink task measures the
+    /// configured anchor and reports to the ranging task -- and asserted on the
+    /// COMPUTED DISTANCE the LMF report carries, not on a log line.
+    ///
+    /// The geometry is a 3-4-5 triangle scaled to 30/40/50 m, so the expected range
+    /// is exactly 50 m and a wrong axis or a squared/unsquared slip would not
+    /// coincide with it.
+    #[cfg(feature = "sidelink")]
+    #[test]
+    fn an_sl_prs_occasion_gives_the_ranging_session_a_distance() {
+        use crate::sidelink::SidelinkTask;
+        use crate::tasks::{SidelinkMessage, TaskHandle, UeRel18Handles};
+        use crate::test_support::{hold_capture_lock, task_base_with_config};
+        use nextgsim_common::config::{RangingAnchor, RangingConfig};
+
+        // This drives BOTH the ranging and sidelink tasks, whose startup lines the
+        // honesty captures assert on. See `test_support`'s hazard 3.
+        let _capture_guard = hold_capture_lock();
+
+        const ANCHOR_UE_ID: u64 = 42;
+        const EXPECTED_RANGE_M: f64 = 50.0;
+
+        let config = UeConfig {
+            ranging_config: Some(RangingConfig {
+                enabled: true,
+                own_position: [0.0, 0.0, 0.0],
+                anchors: vec![RangingAnchor {
+                    ue_id: ANCHOR_UE_ID,
+                    position: [30.0, 40.0, 0.0],
+                }],
+                ..RangingConfig::default()
+            }),
+            ..UeConfig::default()
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+
+        let results = runtime.block_on(async move {
+            let (sidelink_tx, sidelink_rx) = mpsc::channel::<TaskMessage<SidelinkMessage>>(16);
+            let (ranging_tx, ranging_rx) = mpsc::channel::<TaskMessage<RangingMessage>>(16);
+            let (mint_tx, _mint_rx) = mpsc::channel(1);
+
+            let sidelink_handle = TaskHandle::new(sidelink_tx);
+            let ranging_handle = TaskHandle::new(ranging_tx);
+            let rel18 = UeRel18Handles {
+                ranging_tx: ranging_handle.clone(),
+                mint_tx: TaskHandle::new(mint_tx),
+                sidelink_tx: sidelink_handle.clone(),
+            };
+
+            let mut base = task_base_with_config(config);
+            base.rel18 = Some(rel18);
+
+            let mut sidelink = SidelinkTask::new(base.clone());
+            assert_eq!(
+                sidelink.sl_prs_resource_count(),
+                1,
+                "one SL-PRS resource per configured anchor, built at construction"
+            );
+            let mut ranging = RangingTask::new(base);
+
+            let sidelink_run = tokio::spawn(async move { sidelink.run(sidelink_rx).await });
+            let ranging_run = tokio::spawn(async move { ranging.run(ranging_rx).await });
+
+            sidelink_handle
+                .send(SidelinkMessage::SlPrsOccasion {
+                    timestamp_ms: 1_000,
+                })
+                .await
+                .expect("the sidelink task accepts the occasion");
+            // Shut the producer down and JOIN it before asking for the report: its
+            // measurements and the report travel the same channel, so without this
+            // the report could overtake them and the test would race.
+            sidelink_handle.shutdown().await.expect("shutdown accepted");
+            sidelink_run.await.expect("the sidelink task exits cleanly");
+
+            let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+            ranging_handle
+                .send(RangingMessage::ReportToLmf {
+                    response_tx: Some(report_tx),
+                })
+                .await
+                .expect("the ranging task accepts the report request");
+            let results = report_rx.await.expect("the report answers");
+            ranging_handle.shutdown().await.expect("shutdown accepted");
+            ranging_run.await.expect("the ranging task exits cleanly");
+            results
+        });
+
+        assert_eq!(
+            results.len(),
+            1,
+            "the occasion must produce exactly one ranging result"
+        );
+        let result = &results[0];
+        assert_eq!(result.peer_ue_id, ANCHOR_UE_ID);
+        assert!(
+            (result.distance_m - EXPECTED_RANGE_M).abs() < 0.01,
+            "the session must recover the 50 m geometry to centimetre level, got \
+             {:.4}m -- the RTT estimate alone is 49.95m here (integer-nanosecond \
+             quantisation), so a looser bound would not distinguish the widelane \
+             result from the fallback",
+            result.distance_m
+        );
+        assert_eq!(
+            result.method, "carrier_phase",
+            "two carrier frequencies are configured by default, so the widelane \
+             combination must resolve and be preferred over the RTT estimate"
+        );
+        assert!(
+            result.measurement_count >= 1,
+            "and the RTT measurement must have been counted"
+        );
+    }
+
+    /// The widelane combination must resolve the same distance whichever way the
+    /// two frequencies are ordered. It did not: `lambda_w` took the ABSOLUTE
+    /// frequency difference while the phase difference kept its sign, so an
+    /// ascending pair resolved to the wrong cycle (issue #136).
+    #[test]
+    fn the_widelane_resolves_the_same_distance_for_either_frequency_ordering() {
+        const RANGE_M: f64 = 50.0;
+        // The measurement a phase detector actually gives: the fraction of a
+        // wavelength, i.e. ambiguous modulo one cycle.
+        let phase_for = |frequency_mhz: f64| {
+            let wavelength_m = 300.0 / frequency_mhz;
+            (RANGE_M / wavelength_m).fract() * std::f64::consts::TAU
+        };
+        // The RTT an integer-nanosecond clock would report for this range.
+        let rtt_ns = ((2.0 * RANGE_M) / 0.3).round() as u64;
+
+        for pair in [[3500.0, 3600.0], [3600.0, 3500.0]] {
+            let mut session = RangingSession::new(1);
+            session.update_rtt(rtt_ns, 0);
+            for frequency_mhz in pair {
+                session.add_carrier_phase(frequency_mhz, phase_for(frequency_mhz), 0.9);
+            }
+            let resolved = session
+                .carrier_phase_distance_m
+                .unwrap_or_else(|| panic!("{pair:?}: the widelane must resolve"));
+            assert!(
+                (resolved - RANGE_M).abs() < 0.01,
+                "{pair:?}: expected {RANGE_M}m, got {resolved:.4}m"
+            );
+        }
+    }
+
+    /// Repeated occasions on the same frequencies must REPLACE their measurements,
+    /// not accumulate. Two things break if they accumulate on a periodic path: the
+    /// vector grows without bound, and `resolve_carrier_phase_ambiguity` reads
+    /// indices 0 and 1, so every later occasion resolves against the first pair of
+    /// phases and the estimate never moves (issue #136).
+    #[test]
+    fn repeated_occasions_replace_their_carrier_phases_rather_than_accumulating() {
+        let phase_for = |range_m: f64, frequency_mhz: f64| {
+            (range_m / (300.0 / frequency_mhz)).fract() * std::f64::consts::TAU
+        };
+        let rtt_for = |range_m: f64| ((2.0 * range_m) / 0.3).round() as u64;
+
+        let mut session = RangingSession::new(1);
+        // Occasion 1 at 50 m, occasion 2 with the peer moved to 80 m.
+        for range_m in [50.0f64, 80.0] {
+            session.update_rtt(rtt_for(range_m), 0);
+            for frequency_mhz in [3500.0, 3600.0] {
+                session.add_carrier_phase(frequency_mhz, phase_for(range_m, frequency_mhz), 0.9);
+            }
+        }
+
+        assert_eq!(
+            session.carrier_phases.len(),
+            2,
+            "two frequencies measured twice must leave two entries, not four"
+        );
+        let resolved = session
+            .carrier_phase_distance_m
+            .expect("the widelane still resolves");
+        assert!(
+            (resolved - 80.0).abs() < 0.01,
+            "the estimate must follow the LATEST occasion (80m), got {resolved:.4}m"
+        );
+    }
+
+    /// One frequency cannot form a widelane, so the estimate stays the RTT one --
+    /// coarser, and reported as such. This is what makes the carrier-phase
+    /// assertion above about the carrier phase.
+    #[test]
+    fn a_single_carrier_frequency_leaves_the_estimate_at_the_rtt_precision() {
+        let mut session = RangingSession::new(1);
+        let rtt_ns = ((2.0f64 * 50.0) / 0.3).round() as u64;
+        session.update_rtt(rtt_ns, 0);
+        session.add_carrier_phase(3500.0, 1.0, 0.9);
+
+        assert!(
+            session.carrier_phase_distance_m.is_none(),
+            "a single frequency must not produce a carrier-phase distance"
+        );
+        let best = session.best_distance_m().expect("the RTT estimate stands");
+        assert!(
+            (best - 49.95).abs() < 0.001,
+            "the RTT estimate is 49.95m at integer-nanosecond resolution, got {best:.4}m"
+        );
+    }
+
+    /// The runtime gate: ranging disabled means an SL-PRS occasion measures
+    /// nothing, so a default UE is unchanged.
+    #[cfg(feature = "sidelink")]
+    #[test]
+    fn an_sl_prs_occasion_measures_nothing_while_ranging_is_disabled() {
+        use crate::sidelink::SidelinkTask;
+        use crate::tasks::{SidelinkMessage, TaskHandle, UeRel18Handles};
+        use crate::test_support::{hold_capture_lock, task_base_with_config};
+        use nextgsim_common::config::{RangingAnchor, RangingConfig};
+
+        // Drives the sidelink task, whose startup line a capture asserts on.
+        let _capture_guard = hold_capture_lock();
+
+        let config = UeConfig {
+            ranging_config: Some(RangingConfig {
+                // The anchor is configured; only the flag is off.
+                enabled: false,
+                anchors: vec![RangingAnchor {
+                    ue_id: 42,
+                    position: [30.0, 40.0, 0.0],
+                }],
+                ..RangingConfig::default()
+            }),
+            ..UeConfig::default()
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+
+        runtime.block_on(async move {
+            let (sidelink_tx, sidelink_rx) = mpsc::channel::<TaskMessage<SidelinkMessage>>(16);
+            let (ranging_tx, mut ranging_rx) = mpsc::channel::<TaskMessage<RangingMessage>>(16);
+            let (mint_tx, _mint_rx) = mpsc::channel(1);
+
+            let sidelink_handle = TaskHandle::new(sidelink_tx);
+            let mut base = task_base_with_config(config);
+            base.rel18 = Some(UeRel18Handles {
+                ranging_tx: TaskHandle::new(ranging_tx),
+                mint_tx: TaskHandle::new(mint_tx),
+                sidelink_tx: sidelink_handle.clone(),
+            });
+
+            let mut sidelink = SidelinkTask::new(base);
+            let sidelink_run = tokio::spawn(async move { sidelink.run(sidelink_rx).await });
+            sidelink_handle
+                .send(SidelinkMessage::SlPrsOccasion {
+                    timestamp_ms: 1_000,
+                })
+                .await
+                .expect("accepted");
+            sidelink_handle.shutdown().await.expect("shutdown accepted");
+            sidelink_run.await.expect("exits cleanly");
+
+            assert!(
+                ranging_rx.try_recv().is_err(),
+                "a disabled ranging config must produce no measurement at all"
+            );
+        });
     }
 }
 

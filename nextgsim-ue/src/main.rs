@@ -646,8 +646,50 @@ impl UeApp {
         let mut timer_tick = tokio::time::interval(Duration::from_secs(1));
         timer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // SL-PRS transmission occasions (TS 23.586 §5.3.3, issue #136): the
+        // stimulus the ranging pipeline had none of. Driven on the interval
+        // `RangingConfig::interval_ms` names -- the ranging task's own maths is
+        // per-occasion, so the cadence has to be the configured one and not the
+        // 1 s NAS tick.
+        //
+        // Only when ranging is ENABLED, which it is not by default: the select arm
+        // below carries the same condition as a guard, so a default UE never wakes
+        // for it. The interval is still constructed because a `select!` arm needs
+        // one; the parked period is long precisely so that construction costs
+        // nothing if the guard is ever removed by accident.
+        let sl_prs_period = task_base
+            .config
+            .ranging_config
+            .as_ref()
+            .filter(|c| c.enabled)
+            // A zero interval would panic inside `interval()`, so it is clamped
+            // rather than trusted.
+            .map(|c| Duration::from_millis(u64::from(c.interval_ms.max(1))));
+        let sl_prs_enabled = sl_prs_period.is_some();
+        let mut sl_prs_tick =
+            tokio::time::interval(sl_prs_period.unwrap_or(Duration::from_secs(3600)));
+        sl_prs_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+            _ = sl_prs_tick.tick(), if sl_prs_enabled => {
+                // The occasion itself is the sidelink task's business: it owns the
+                // SL-PRS resources and the positioning engine, and it reports what
+                // it measures to the ranging task. Feature-gated because that whole
+                // module is (issue #54's increment 1), which is why the ranging
+                // stimulus needs the `sidelink` feature as well as the runtime flag.
+                #[cfg(feature = "sidelink")]
+                if let Some(ref rel18) = task_base.rel18 {
+                    let timestamp_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let _ = rel18
+                        .sidelink_tx
+                        .send(SidelinkMessage::SlPrsOccasion { timestamp_ms })
+                        .await;
+                }
+            }
             _ = timer_tick.tick() => {
                 let outs = orch.tick();
                 process_mm_outputs(
