@@ -2687,6 +2687,15 @@ impl RrcTask {
 
     /// The simulator cell ids of the configured secondary cells, lowest
     /// `sCellIndex` first — for tests and status reporting.
+    /// The cell this UE is currently served by, for tests and status reporting.
+    ///
+    /// `None` before the first camp. Read-only: the field is set by cell selection,
+    /// handover and resume, and a setter would give a caller a way to claim a cell the
+    /// UE never selected.
+    pub fn serving_cell_id(&self) -> Option<i32> {
+        self.serving_cell_id
+    }
+
     pub fn configured_scells(&self) -> Vec<i32> {
         self.configured_scells.values().copied().collect()
     }
