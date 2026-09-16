@@ -3522,6 +3522,17 @@ impl NgapTask {
                     "Sent Handover Request Acknowledge: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
                     ho_req.amf_ue_ngap_id, ran_ue_ngap_id
                 );
+                // Arm the arrival detection (TS 38.413 §8.4.3, issue #156). Sent only
+                // after the acknowledge succeeds: an admission the AMF was never told
+                // about must not have the target report an arrival for it.
+                if let Err(e) = self
+                    .task_base
+                    .rrc_tx
+                    .send(RrcMessage::ExpectHandoverArrival { ue_id })
+                    .await
+                {
+                    error!("Could not arm the handover-arrival detection for UE[{ue_id}]: {e}");
+                }
             }
             Err(e) => {
                 error!("Failed to encode Handover Request Acknowledge: {}", e);

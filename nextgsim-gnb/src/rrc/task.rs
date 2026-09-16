@@ -121,6 +121,13 @@ pub struct RrcTask {
     /// exported from `rrc/mod.rs` and exercised only by a unit test, so an
     /// NWDAF-recommended handover could log success and reach no handover machinery.
     handover_manager: GnbHandoverManager,
+    /// UEs admitted on a handover-in whose arrival has not yet been reported to the
+    /// AMF (TS 38.413 §8.4.3, issue #156).
+    ///
+    /// A set rather than a flag on `RrcUeContext`, because the admission happens in
+    /// the NGAP task before this task has any context for the UE at all -- the
+    /// arriving UE's first message to the target IS the RRCReconfigurationComplete.
+    pending_handover_arrivals: std::collections::HashSet<i32>,
 }
 
 /// PDCP BEARER for SRB1 (TS 38.323 §5.9: the SRB identity minus one, so 0).
@@ -160,6 +167,7 @@ impl RrcTask {
             pdu_id_counter: 0,
             ntn_config: None,
             scell_configured_ues: std::collections::HashSet::new(),
+            pending_handover_arrivals: std::collections::HashSet::new(),
             handover_manager: GnbHandoverManager::new(own_cell),
         }
     }
@@ -488,7 +496,8 @@ impl RrcTask {
                 true
             }
             Ok(UlDcchMessage::RrcReconfigurationComplete(complete)) => {
-                self.handle_rrc_reconfiguration_complete_asn1(ue_id, complete.rrc_transaction_id);
+                self.handle_rrc_reconfiguration_complete_asn1(ue_id, complete.rrc_transaction_id)
+                    .await;
                 true
             }
             Ok(UlDcchMessage::UlInformationTransfer(transfer)) => {
@@ -620,7 +629,27 @@ impl RrcTask {
     /// transaction. Like SecurityModeComplete, the Reconfiguration tid is
     /// allocated on the NGAP task context, so the RRC context typically reports
     /// `NoOutstanding` (framing/plumbing confirmation only).
-    fn handle_rrc_reconfiguration_complete_asn1(&mut self, ue_id: i32, echoed_tid: u8) {
+    /// Handles `RrcMessage::ExpectHandoverArrival` (TS 38.413 §8.4.3, issue #156):
+    /// records that this UE was admitted on a handover-in, so the next
+    /// `RRCReconfigurationComplete` from it is an ARRIVAL.
+    ///
+    /// Public because it is a real message-handler entry point, like the others the
+    /// in-process tests drive directly.
+    pub fn handle_expect_handover_arrival(&mut self, ue_id: i32) {
+        info!(
+            "Expecting a handover arrival for UE[{}]: its next \
+             RRCReconfigurationComplete will be reported to the AMF",
+            ue_id
+        );
+        self.pending_handover_arrivals.insert(ue_id);
+    }
+
+    /// Whether a handover arrival is still expected for `ue_id`.
+    pub fn expects_handover_arrival(&self, ue_id: i32) -> bool {
+        self.pending_handover_arrivals.contains(&ue_id)
+    }
+
+    async fn handle_rrc_reconfiguration_complete_asn1(&mut self, ue_id: i32, echoed_tid: u8) {
         if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
             match ctx
                 .transactions
@@ -641,6 +670,24 @@ impl RrcTask {
             "RRCReconfigurationComplete (ASN.1) from UE[{}], tid={}",
             ue_id, echoed_tid
         );
+
+        // A handover ARRIVAL, not an ordinary acknowledgement (TS 38.413 §8.4.3,
+        // issue #156). `remove` rather than `contains`: an arrival is reported ONCE,
+        // and a later reconfiguration of the same UE must not notify again.
+        if self.pending_handover_arrivals.remove(&ue_id) {
+            info!(
+                "UE[{}] has accessed this target cell; reporting HANDOVER NOTIFY",
+                ue_id
+            );
+            if let Err(e) = self
+                .task_base
+                .ngap_tx
+                .send(NgapMessage::HandoverAccessCompleted { ue_id })
+                .await
+            {
+                error!("Could not report the handover arrival for UE[{ue_id}]: {e}");
+            }
+        }
     }
 
     /// Handles a typed, ASN.1-decoded RRCSetupComplete (TS 38.331 §5.3.3.4).
@@ -1924,6 +1971,9 @@ impl Task for RrcTask {
                                 // the UE has a DRB-bearing configuration to add
                                 // it to. No-op unless one is configured.
                                 self.send_scell_configuration(ue_id).await;
+                            }
+                            RrcMessage::ExpectHandoverArrival { ue_id } => {
+                                self.handle_expect_handover_arrival(ue_id);
                             }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
@@ -3458,6 +3508,142 @@ mod tests {
     // is what the typed dispatch buys, and the gNB verifies the echo FAIL-CLOSED
     // -- so the round trip needs a positive AND a negative control.
     // ========================================================================
+
+    // ========================================================================
+    // HANDOVER NOTIFY (TS 38.413 §8.4.3, issue #156). The message and its sender
+    // existed; nothing produced the DETECTION that a completed reconfiguration is
+    // a handover arrival.
+    // ========================================================================
+
+    /// An admitted handover-in, then the arriving UE's RRCReconfigurationComplete,
+    /// must report HANDOVER NOTIFY toward the AMF.
+    #[test]
+    fn an_admitted_handover_arrival_reports_handover_notify() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration_complete, RrcReconfigurationCompleteParams,
+        };
+
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while ngap_rx.try_recv().is_ok() {}
+
+            // The NGAP task arms the detection after HANDOVER REQUEST ACKNOWLEDGE.
+            task.handle_expect_handover_arrival(7);
+            assert!(task.expects_handover_arrival(7));
+
+            // The UE echoes the tid the SOURCE issued, which this target never
+            // allocated -- `verify` returns NoOutstanding and tolerates it. A target
+            // that rejected the echo would discard the arrival.
+            let complete = encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+                rrc_transaction_id: 2,
+            })
+            .expect("encode RRCReconfigurationComplete");
+            task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                .await;
+        });
+
+        let mut notified = false;
+        while let Ok(msg) = ngap_rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::HandoverAccessCompleted { ue_id }) = msg {
+                assert_eq!(ue_id, 7);
+                notified = true;
+            }
+        }
+        assert!(
+            notified,
+            "the target must report the arrival, or the AMF keeps the source path and \
+             the downlink black-holes"
+        );
+        assert!(
+            !task.expects_handover_arrival(7),
+            "and the expectation is spent"
+        );
+    }
+
+    /// The negative control: an ORDINARY RRCReconfigurationComplete, with no admission
+    /// pending, must report nothing. Without it the test above would pass for a gNB
+    /// that notified on every reconfiguration.
+    #[test]
+    fn an_ordinary_reconfiguration_complete_reports_no_handover_notify() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration_complete, RrcReconfigurationCompleteParams,
+        };
+
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while ngap_rx.try_recv().is_ok() {}
+            assert!(
+                !task.expects_handover_arrival(7),
+                "precondition: no admission pending"
+            );
+
+            let complete = encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+                rrc_transaction_id: 0,
+            })
+            .expect("encode RRCReconfigurationComplete");
+            task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                .await;
+        });
+
+        while let Ok(msg) = ngap_rx.try_recv() {
+            assert!(
+                !matches!(
+                    msg,
+                    TaskMessage::Message(NgapMessage::HandoverAccessCompleted { .. })
+                ),
+                "a reconfiguration acknowledgement is not an arrival"
+            );
+        }
+    }
+
+    /// An arrival is reported ONCE. A UE reconfigured again after landing must not
+    /// notify twice, or the AMF switches a path it has already switched.
+    #[test]
+    fn a_second_reconfiguration_complete_after_an_arrival_does_not_notify_again() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration_complete, RrcReconfigurationCompleteParams,
+        };
+
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        let notifies = run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            while ngap_rx.try_recv().is_ok() {}
+            task.handle_expect_handover_arrival(7);
+
+            for tid in [2u8, 3] {
+                let complete =
+                    encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+                        rrc_transaction_id: tid,
+                    })
+                    .expect("encode RRCReconfigurationComplete");
+                task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                    .await;
+            }
+
+            let mut count = 0;
+            while let Ok(msg) = ngap_rx.try_recv() {
+                if matches!(
+                    msg,
+                    TaskMessage::Message(NgapMessage::HandoverAccessCompleted { .. })
+                ) {
+                    count += 1;
+                }
+            }
+            count
+        });
+        assert_eq!(notifies, 1, "exactly one HANDOVER NOTIFY per arrival");
+    }
 
     /// A `SecurityModeFailure` is DISPATCHED to its own handler and clears the
     /// outstanding SecurityMode transaction. Before the typed dispatch it fell
