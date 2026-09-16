@@ -461,6 +461,19 @@ impl ReestablishmentProcedure {
     }
 
     /// Resets the procedure to idle state.
+    /// Back-dates whichever of T301/T311 is armed, so a test reaches the expiry
+    /// without waiting out its real 1000 ms. Same reasoning as
+    /// `ResumeProcedure::expire_t319_for_test`.
+    #[cfg(test)]
+    pub(crate) fn expire_guard_timers_for_test(&mut self) {
+        if let Some(deadline) = self.t301_deadline {
+            self.t301_deadline = Some(deadline - Duration::from_millis(T301_DEFAULT_MS * 2));
+        }
+        if let Some(deadline) = self.t311_deadline {
+            self.t311_deadline = Some(deadline - Duration::from_millis(T311_DEFAULT_MS * 2));
+        }
+    }
+
     pub fn reset(&mut self) {
         self.state = ReestablishmentState::Idle;
         self.trigger = None;
