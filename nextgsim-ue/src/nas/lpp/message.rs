@@ -374,6 +374,201 @@ fn read_critical_extensions(r: &mut UperReader<'_>) -> UperResult<()> {
     Ok(())
 }
 
+/// How a sidelink range was measured (issue #137).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidelinkRangingMethod {
+    /// Round-trip time over SL-PRS. Metre-level.
+    Rtt,
+    /// Multi-frequency carrier phase, ambiguity resolved against the RTT.
+    /// Centimetre-level.
+    CarrierPhase,
+}
+
+impl SidelinkRangingMethod {
+    /// Root index in the extensible ENUMERATED.
+    const ROOT_MAX: i64 = 1;
+
+    fn index(self) -> i64 {
+        match self {
+            Self::Rtt => 0,
+            Self::CarrierPhase => 1,
+        }
+    }
+
+    fn from_index(index: i64) -> UperResult<Self> {
+        match index {
+            0 => Ok(Self::Rtt),
+            1 => Ok(Self::CarrierPhase),
+            _ => Err(UperError::Unsupported("sidelink ranging method")),
+        }
+    }
+}
+
+/// One measured range to one sidelink peer (TS 23.586 §5.3.3, issue #137).
+///
+/// ## Why the units are centimetres
+///
+/// The carrier-phase estimate this carries is centimetre-level, so a range in
+/// whole metres would throw away the precision the whole widelane combination
+/// exists to produce, and an LMF could not tell an RTT fix from a carrier-phase one
+/// by looking at the number. Encoding a float was rejected: PER has no IEEE-754
+/// primitive here, and a scaled integer is what every other distance IE in this
+/// tree uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidelinkRangingResult {
+    /// The peer's PC5 Layer-2 identity, `INTEGER (0..16777215)` — 24 bits, which is
+    /// what TS 23.303 §8.2 gives a Layer-2 ID. A UE id wider than that is refused
+    /// rather than truncated onto another peer's identity.
+    pub peer_layer2_id: u32,
+    /// Range in centimetres, `INTEGER (0..1000000)`: 0..10 km at 1 cm resolution.
+    pub range_cm: u32,
+    /// Reported accuracy in centimetres, `INTEGER (0..65535)`.
+    pub accuracy_cm: u16,
+    /// How it was measured.
+    pub method: SidelinkRangingMethod,
+    /// How many measurements the estimate rests on, `INTEGER (0..65535)`.
+    ///
+    /// Carried because it is the difference between a range from one occasion and
+    /// one from fifty, and an LMF weighing two reports has nothing else to go on.
+    pub measurement_count: u16,
+}
+
+impl SidelinkRangingResult {
+    const PEER_ID_MAX: i64 = 16_777_215;
+    const RANGE_CM_MAX: i64 = 1_000_000;
+    const ACCURACY_CM_MAX: i64 = 65_535;
+    const COUNT_MAX: i64 = 65_535;
+
+    fn write(&self, w: &mut UperWriter) -> UperResult<()> {
+        w.write_sequence_preamble(Some(false), &[]);
+        w.write_constrained(i64::from(self.peer_layer2_id), 0, Self::PEER_ID_MAX)?;
+        w.write_constrained(i64::from(self.range_cm), 0, Self::RANGE_CM_MAX)?;
+        w.write_constrained(i64::from(self.accuracy_cm), 0, Self::ACCURACY_CM_MAX)?;
+        w.write_extensible_enumerated(self.method.index(), SidelinkRangingMethod::ROOT_MAX)?;
+        w.write_constrained(i64::from(self.measurement_count), 0, Self::COUNT_MAX)
+    }
+
+    fn read(r: &mut UperReader<'_>) -> UperResult<Self> {
+        let (additions, _) = r.read_sequence_preamble(true, 0)?;
+        let peer_layer2_id = r.read_constrained(0, Self::PEER_ID_MAX)? as u32;
+        let range_cm = r.read_constrained(0, Self::RANGE_CM_MAX)? as u32;
+        let accuracy_cm = r.read_constrained(0, Self::ACCURACY_CM_MAX)? as u16;
+        let method = SidelinkRangingMethod::from_index(
+            r.read_extensible_enumerated(SidelinkRangingMethod::ROOT_MAX)?,
+        )?;
+        let measurement_count = r.read_constrained(0, Self::COUNT_MAX)? as u16;
+        if additions {
+            r.skip_extension_additions()?;
+        }
+        Ok(Self {
+            peer_layer2_id,
+            range_cm,
+            accuracy_cm,
+            method,
+            measurement_count,
+        })
+    }
+}
+
+/// Which extension-addition group of `ProvideLocationInformation-r9-IEs` carries the
+/// sidelink ranging report: the FOURTH, index 3.
+///
+/// TS 37.355 declares three groups on that sequence — G1(r13), G2(r16), G3(r19) — so
+/// a simulator-defined IE must sit past them rather than squat on one. G2 in
+/// particular is where the peer LMF reads nr-Multi-RTT and nr-DL-TDOA; G1 and G3 it
+/// ignores, which is exactly why putting the report in G1 would have looked like it
+/// worked from this end and delivered nothing.
+const SIDELINK_ADDITION_GROUP: usize = 3;
+
+/// The sidelink ranging report a UE sends to the LMF (issue #137).
+///
+/// Carried as an **extension addition** of `ProvideLocationInformation-r9-IEs`,
+/// which is where a Rel-18 IE belongs in a Rel-9 root sequence: a root member
+/// cannot be added without changing the byte layout of every existing LPP message,
+/// and this codec's peer is nextgcore's LMF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidelinkRangingReport {
+    /// One entry per ranged peer, `SEQUENCE (SIZE(1..32))`.
+    pub results: Vec<SidelinkRangingResult>,
+}
+
+impl SidelinkRangingReport {
+    const MIN_RESULTS: usize = 1;
+    /// `SEQUENCE (SIZE(1..32))`. Public because the caller building a report has to
+    /// bound its own list to it: 33 results encode to bytes that then fail to
+    /// decode, and the sender would see no error.
+    pub const MAX_RESULTS: usize = 32;
+
+    /// Encode as a standalone open-type payload: a complete UPER encoding padded to
+    /// whole octets, which is what an extension addition is.
+    pub fn encode(&self) -> UperResult<Vec<u8>> {
+        if self.results.len() < Self::MIN_RESULTS || self.results.len() > Self::MAX_RESULTS {
+            return Err(UperError::InvalidLength(self.results.len()));
+        }
+        let mut w = UperWriter::new();
+        w.write_sequence_preamble(Some(false), &[]);
+        w.write_constrained(
+            self.results.len() as i64,
+            Self::MIN_RESULTS as i64,
+            Self::MAX_RESULTS as i64,
+        )?;
+        for result in &self.results {
+            result.write(&mut w)?;
+        }
+        Ok(w.into_bytes())
+    }
+
+    /// The most octets an extension addition can carry: an open type's length
+    /// determinant is written in the SHORT form here (one octet, values below 128),
+    /// which is all the matching reader can read.
+    pub const MAX_ADDITION_OCTETS: usize = 0x7F;
+
+    /// Build a report from `results`, dropping trailing entries until it fits an
+    /// extension addition, and say how many were dropped.
+    ///
+    /// The bound is found by ENCODING rather than by arithmetic over the field
+    /// widths, so it cannot drift from the layout: a result gained a field, and a
+    /// hand-computed capacity would silently become wrong while still looking
+    /// derived. Roughly 12 results fit today, which is well under the ASN.1
+    /// `SIZE(1..32)` — so the size bound is NOT the binding one, and a caller that
+    /// only checked it would emit an addition the peer cannot read.
+    ///
+    /// Returns `None` for an empty input, and for the case where even one result does
+    /// not fit — which cannot happen at the current field widths but is not asserted
+    /// away, because that is exactly what changes when a field is added.
+    pub fn fitting_an_addition(results: &[SidelinkRangingResult]) -> Option<(Self, usize)> {
+        let mut kept = results.len().min(Self::MAX_RESULTS).min(results.len());
+        while kept > 0 {
+            let candidate = Self {
+                results: results[..kept].to_vec(),
+            };
+            match candidate.encode() {
+                Ok(bytes) if bytes.len() <= Self::MAX_ADDITION_OCTETS => {
+                    return Some((candidate, results.len() - kept));
+                }
+                _ => kept -= 1,
+            }
+        }
+        None
+    }
+
+    /// Decode an open-type payload produced by [`Self::encode`].
+    pub fn decode(bytes: &[u8]) -> UperResult<Self> {
+        let mut r = UperReader::new(bytes);
+        let (additions, _) = r.read_sequence_preamble(true, 0)?;
+        let count =
+            r.read_constrained(Self::MIN_RESULTS as i64, Self::MAX_RESULTS as i64)? as usize;
+        let mut results = Vec::with_capacity(count);
+        for _ in 0..count {
+            results.push(SidelinkRangingResult::read(&mut r)?);
+        }
+        if additions {
+            r.skip_extension_additions()?;
+        }
+        Ok(Self { results })
+    }
+}
+
 /// The LPP message bodies this UE handles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LppBody {
@@ -394,8 +589,14 @@ pub enum LppBody {
     },
     /// `ProvideLocationInformation` (§5.3.3).
     ProvideLocationInformation {
-        /// The measurement report.
+        /// The E-CID measurement report. Always present: a UE that ranges over
+        /// sidelink also has a serving cell, so reporting both is accurate rather
+        /// than padding.
         measurements: EcidSignalMeasurementInformation,
+        /// The sidelink ranging report, when this UE has ranges to report
+        /// (issue #137). `None` leaves the encoding byte-for-byte what it was
+        /// before sidelink existed -- the extension bit stays clear.
+        sidelink: Option<SidelinkRangingReport>,
     },
 }
 
@@ -426,14 +627,39 @@ impl LppBody {
                 write_r9_body_preamble(w, true);
                 requested.write(w)
             }
-            Self::ProvideLocationInformation { measurements } => {
+            Self::ProvideLocationInformation {
+                measurements,
+                sidelink,
+            } => {
                 w.write_choice_index(c1::PROVIDE_LOCATION_INFORMATION, c1::ALTERNATIVES)?;
                 write_critical_extensions(w)?;
-                write_r9_body_preamble(w, true);
+                // The extension bit is set only when there is an addition to carry,
+                // so a report without sidelink results encodes exactly as it did
+                // before this existed.
+                w.write_sequence_preamble(
+                    Some(sidelink.is_some()),
+                    &[false, false, false, true, false],
+                );
                 // ECID-ProvideLocationInformation: [signalMeasurementInformation,
                 // ecid-Error], and only the measurements are produced here.
                 w.write_sequence_preamble(Some(false), &[true, false]);
-                measurements.write(w)
+                measurements.write(w)?;
+                // Additions come after every root member, which is why this is here
+                // and not beside the preamble.
+                //
+                // The report is addition GROUP 4, not the first addition. TS 37.355
+                // declares three groups on this sequence -- G1(r13), G2(r16),
+                // G3(r19) -- and the peer LMF reads nr-Multi-RTT and nr-DL-TDOA out
+                // of G2 and *ignores* G1 and G3 (see nextgcore-asn1c
+                // `lpp::ecid::ProvideLocationInformationR9`). Writing the report as
+                // the first addition would put it in G1, where the LMF would drop it
+                // silently, and would also claim a group the spec defines.
+                if let Some(report) = sidelink {
+                    let mut groups = vec![None; SIDELINK_ADDITION_GROUP];
+                    groups.push(Some(report.encode()?));
+                    w.write_extension_additions(&groups)?;
+                }
+                Ok(())
             }
         }
     }
@@ -510,10 +736,27 @@ impl LppBody {
                 if inner_additions {
                     r.skip_extension_additions()?;
                 }
-                if additions {
-                    r.skip_extension_additions()?;
-                }
-                Ok(Self::ProvideLocationInformation { measurements })
+                // The report rides addition GROUP 4 (see the encoder). Groups are
+                // read POSITIONALLY and a peer may send fewer -- the trailing-absent
+                // ones are trimmed (X.691 18.8) -- so a message carrying only the
+                // spec's G1..G3 decodes to no report rather than to an error.
+                let sidelink = if additions {
+                    match r
+                        .read_extension_additions()?
+                        .into_iter()
+                        .nth(SIDELINK_ADDITION_GROUP)
+                        .flatten()
+                    {
+                        Some(bytes) => Some(SidelinkRangingReport::decode(&bytes)?),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                Ok(Self::ProvideLocationInformation {
+                    measurements,
+                    sidelink,
+                })
             }
             other => Err(match other {
                 2 | 3 => UperError::Unsupported("LPP assistance-data transfer"),
