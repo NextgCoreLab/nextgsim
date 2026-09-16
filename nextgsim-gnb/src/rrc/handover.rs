@@ -36,7 +36,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use nextgsim_rrc::procedures::measurement_report::{decode_measurement_report, rsrp_range_to_dbm};
+use nextgsim_rrc::procedures::measurement_report::{
+    decode_measurement_report, rsrp_range_to_dbm, MeasurementReportData,
+};
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
     encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
 };
@@ -1202,7 +1204,16 @@ impl HandoverCommand {
 /// about what -100 dBm is.
 pub fn parse_measurement_report(pdu: &[u8]) -> Option<(i32, MeasurementReport)> {
     let data = decode_measurement_report(pdu).ok()?;
+    Some(measurement_report_from(&data))
+}
 
+/// The same conversion, from an ALREADY-DECODED report (issue #162).
+///
+/// The typed UL-DCCH dispatch decodes the `UL-DCCH-Message` once and hands the parsed
+/// `MeasurementReportData` on, so re-encoding it just to call the byte entry point
+/// above would be two decodes and two chances to disagree. One implementation, two
+/// entry points.
+pub fn measurement_report_from(data: &MeasurementReportData) -> (i32, MeasurementReport) {
     // The serving cell's RSRP. A report whose serving entry carries no ssb-Results
     // is one where the UE had no measurement to give; treated as the weakest
     // representable level rather than dropped, because the neighbour results are
@@ -1258,14 +1269,14 @@ pub fn parse_measurement_report(pdu: &[u8]) -> Option<(i32, MeasurementReport)> 
         );
     }
 
-    Some((
+    (
         i32::from(data.meas_id.0),
         MeasurementReport {
             meas_id: data.meas_id.0,
             serving_rsrp,
             neighbors,
         },
-    ))
+    )
 }
 
 /// The dBm level a measurement the UE did not provide is reported as.
