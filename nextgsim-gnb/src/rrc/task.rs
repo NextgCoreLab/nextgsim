@@ -14,7 +14,9 @@ use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
 use nextgsim_common::SNssai;
 use nextgsim_rls::RrcChannel;
-use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_ul_dcch, UlDcchMessage};
+use nextgsim_rrc::procedures::dcch_dispatch::{
+    dispatch_ul_dcch, UlDcchMessage, SIM_RECONFIGURATION_WITH_SCELL,
+};
 use nextgsim_rrc::procedures::information_transfer::{
     encode_dl_information_transfer, DlInformationTransferParams,
 };
@@ -23,29 +25,27 @@ use nextgsim_rrc::procedures::paging_occasion::{
     self, paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{
-    decode_rrc_reestablishment_complete, decode_rrc_reestablishment_request,
-    RrcReestablishmentRequestData,
+    decode_rrc_reestablishment_request, RrcReestablishmentRequestData,
 };
-use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request, decode_rrc_resume_request1};
+use nextgsim_rrc::procedures::rrc_resume::{
+    decode_rrc_resume_request, decode_rrc_resume_request1, RrcResumeCompleteData,
+};
 use nextgsim_rrc::procedures::rrc_setup::{
     decode_rrc_setup_complete, decode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
 };
 use nextgsim_rrc::procedures::scell_config::{encode_scell_config, ScellConfig};
 use nextgsim_rrc::procedures::ue_capability::{
-    decode_ue_capability_information, encode_ue_capability_enquiry, parse_nr_capability_bands,
-    RatType, UeCapabilityEnquiryParams, UeCapabilityInformationData,
+    encode_ue_capability_enquiry, parse_nr_capability_bands, RatType, UeCapabilityEnquiryParams,
+    UeCapabilityInformationData,
 };
 
-/// Simplified DL/UL-DCCH envelope code: first byte 0x06 marks a UE capability
-/// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
-/// UECapabilityEnquiry (DL) / UECapabilityInformation (UL).
-const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
-
-/// Simplified DL-DCCH envelope code for an RRCReconfiguration carrying a
-/// secondary-cell configuration: `[0x0E][transaction id][UPER CellGroupConfig]`.
-/// The UE's matching constant is `nextgsim-ue/src/rrc/task.rs`.
-const RECONFIGURATION_WITH_SCELL: u8 = 0x0E;
+// The `0x06` UE-capability envelope and the `0x0E` secondary-cell envelope used to
+// be declared here, duplicating the UE's own copies of the same two wire
+// constants. The secondary-cell code now lives once, beside the dispatch that has
+// to keep clear of it (`nextgsim_rrc::procedures::dcch_dispatch::
+// SIM_RECONFIGURATION_WITH_SCELL`); the UE-capability envelope is gone, because
+// `0x06` is also a conformant RRCReconfiguration at tid 3 (issue #151).
 
 /// `sCellIndex` used for the one secondary cell this gNB can be configured with.
 /// `SCellIndex` is `INTEGER (1..31)` and 1 is its first value.
@@ -192,7 +192,7 @@ impl RrcTask {
 
         let transaction_id = self.connection_manager.next_tid();
         let mut pdu = Vec::with_capacity(container.len() + 2);
-        pdu.push(RECONFIGURATION_WITH_SCELL);
+        pdu.push(SIM_RECONFIGURATION_WITH_SCELL);
         pdu.push(transaction_id);
         pdu.extend_from_slice(&container);
 
@@ -388,32 +388,29 @@ impl RrcTask {
             return;
         }
 
-        // Wave-6 C5: full typed UL-DCCH-Message dispatch (TS 38.331 §6.2.1).
-        // Gated behind C5_TYPED_DCCH_DISPATCH: the matched-sim UE still emits
-        // bespoke framing whose leading bytes COLLIDE with real UPER (e.g. its
-        // uplink NAS `[0x08, 0x00, NAS…]` decodes as a well-formed
-        // RRCReconfigurationComplete and would swallow the NAS — see
-        // nextgsim-rrc dcch_dispatch tests). So the broad typed dispatch is
-        // only enabled once the peer UE is a conformant typed peer; until then
-        // the legacy nibble arms below preserve the matched-sim path.
+        // Wave-6 C5: full typed UL-DCCH-Message dispatch (TS 38.331 §6.2.1). The
+        // UE is now a conformant typed peer -- every message it sends is a real
+        // UL-DCCH-Message, and the bespoke framing whose leading bytes collided
+        // with real UPER is gone (issue #151), so this is no longer gated.
         if C5_TYPED_DCCH_DISPATCH && self.try_dispatch_typed_ul_dcch(ue_id, bytes).await {
             return;
         }
 
-        // Legacy nibble fallback (bespoke `bytes[0] & 0x0F` framing + raw-NAS
-        // heuristic). This is the sole non-typed dispatch path and is retired
-        // in Wave-6 C6 once the UE is a conformant typed peer.
-        let message_type = bytes[0] & 0x0F;
-
-        match message_type {
-            0x04 => self.handle_rrc_setup_complete(ue_id, data).await,
-            0x08 => self.handle_ul_information_transfer(ue_id, data).await,
-            0x05 => self.handle_rrc_reestablishment_complete(ue_id, data).await,
-            0x09 => self.handle_rrc_resume_complete(ue_id, data).await,
-            RRC_MSG_TYPE_UE_CAPABILITY => {
-                self.handle_ue_capability_information(ue_id, &bytes[1..])
-                    .await;
-            }
+        // What is left is NOT a decodable UL-DCCH-Message. Two payloads reach
+        // here, and neither is nibble-routed any more:
+        //
+        //   * the UE's hand-built RRCSetupComplete fallback, emitted only when its
+        //     own UPER encode fails (`[0x04, 0x00, 0x01, NAS…]`), and
+        //   * a bare NAS PDU from a UE that skipped the establishment handshake,
+        //     which is refused unless `accept_raw_nas_on_dcch` is set.
+        //
+        // The 0x05 / 0x08 / 0x09 / 0x06 nibble arms that used to sit here are
+        // gone: each was written for a bespoke framing the UE no longer emits, and
+        // each ALSO matched a conformant message that belongs elsewhere -- 0x08 is
+        // the nibble of a real SecurityModeComplete at tid 0, which this arm would
+        // have handed to the UL-information-transfer slicer.
+        match bytes[0] {
+            0x04 if bytes.len() > 3 => self.handle_rrc_setup_complete(ue_id, data).await,
             _ => {
                 // A raw NAS PDU on UL-DCCH, from a UE that never sent an
                 // RRCSetupComplete. EPD 0x7E is 5GMM, 0x2E is 5GSM.
@@ -462,7 +459,11 @@ impl RrcTask {
                     self.send_initial_nas_delivery(ue_id, data.clone(), 3, None, Vec::new())
                         .await; // cause=3 (mo-Data)
                 } else {
-                    debug!("Unhandled UL-DCCH message type: {:#x}", message_type);
+                    debug!(
+                        "Unhandled UL-DCCH payload from UE[{}] (leading byte {:#04x}): \
+                         not a decodable UL-DCCH-Message and not a bare NAS PDU",
+                        ue_id, bytes[0]
+                    );
                 }
             }
         }
@@ -504,6 +505,19 @@ impl RrcTask {
             }
             Ok(UlDcchMessage::UeCapabilityInformation(info)) => {
                 self.process_ue_capability_information(ue_id, info);
+                true
+            }
+            Ok(UlDcchMessage::RrcReestablishmentComplete(complete)) => {
+                self.handle_rrc_reestablishment_complete(ue_id, complete.rrc_transaction_id)
+                    .await;
+                true
+            }
+            Ok(UlDcchMessage::RrcResumeComplete(complete)) => {
+                self.handle_rrc_resume_complete(ue_id, &complete).await;
+                true
+            }
+            Ok(UlDcchMessage::SecurityModeFailure { rrc_transaction_id }) => {
+                self.handle_security_mode_failure(ue_id, rrc_transaction_id);
                 true
             }
             Ok(UlDcchMessage::Unsupported) => false,
@@ -559,6 +573,44 @@ impl RrcTask {
                 "confirmed at RRC framing level only (as_security_enabled is off, so \
                  nothing is protected)"
             }
+        );
+    }
+
+    /// Handles a `SecurityModeFailure` (TS 38.331 §5.3.4.4): the UE could not
+    /// comply with the SecurityModeCommand and is continuing with its previous
+    /// configuration.
+    ///
+    /// AS security is explicitly NOT marked active, and the outstanding transaction
+    /// is cleared so a later Complete for the same tid cannot be paired to a
+    /// procedure the UE already refused. The gNB keeps the connection: §5.3.4.4
+    /// leaves the reaction to the network, and releasing a UE that answered
+    /// honestly is worse than carrying on unprotected and saying so.
+    ///
+    /// Before issue #151 a `SecurityModeFailure` could not reach here at all — its
+    /// leading byte's low nibble was read as an unhandled type and it was dropped
+    /// at debug level, so a refusing UE looked identical to a silent one.
+    fn handle_security_mode_failure(&mut self, ue_id: i32, echoed_tid: u8) {
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            match ctx
+                .transactions
+                .verify(RrcProcedure::SecurityMode, echoed_tid)
+            {
+                TidVerification::Mismatch { expected } => {
+                    warn!(
+                        "Discarding SecurityModeFailure from UE[{}]: refused tid {} != \
+                         outstanding {} (TS 38.331 §5.3.4.4)",
+                        ue_id, echoed_tid, expected
+                    );
+                    return;
+                }
+                TidVerification::Match | TidVerification::NoOutstanding => {}
+            }
+        }
+        warn!(
+            "SecurityModeFailure from UE[{}], tid={}: the UE refused AS security and \
+             keeps its previous configuration (TS 38.331 §5.3.4.4). SRB1 stays \
+             unprotected for this UE",
+            ue_id, echoed_tid
         );
     }
 
@@ -786,22 +838,17 @@ impl RrcTask {
             rat_types: vec![RatType::Nr],
         };
         match encode_ue_capability_enquiry(&params) {
+            // `uper` is already a complete UPER DL-DCCH-Message (c1 =
+            // ueCapabilityEnquiry, TS 38.331 §6.2.1), sent raw. The `0x06` envelope
+            // byte this used to prepend is gone with issue #151: the UE dispatches
+            // on the decoded message, and `0x06` is itself a conformant
+            // RRCReconfiguration at tid 3.
             Ok(uper) => {
-                // Wave-6 C5: `uper` is already a complete UPER DL-DCCH-Message
-                // (c1 = ueCapabilityEnquiry, TS 38.331 §6.2.1). When
-                // C5_TYPED_DCCH_DISPATCH is on, send it raw — no bespoke `0x06`
-                // envelope byte. While off, keep the `0x06` envelope the
-                // matched-sim UE dispatcher matches on (dropped in C6).
-                let pdu = if C5_TYPED_DCCH_DISPATCH {
-                    uper
-                } else {
-                    let mut framed = Vec::with_capacity(uper.len() + 1);
-                    framed.push(RRC_MSG_TYPE_UE_CAPABILITY);
-                    framed.extend_from_slice(&uper);
-                    framed
-                };
-                info!("Sending UECapabilityEnquiry to UE[{}]", ue_id);
-                self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+                info!(
+                    "Sending UECapabilityEnquiry to UE[{}] (tid {})",
+                    ue_id, rrc_transaction_id
+                );
+                self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&uper))
                     .await;
             }
             Err(e) => {
@@ -810,28 +857,12 @@ impl RrcTask {
         }
     }
 
-    /// Handles a UECapabilityInformation from the UE (TS 38.331 §5.6.1),
-    /// decoding the legacy `0x06`-envelope framing. Delegates the tid
-    /// verification + capability handling to [`Self::process_ue_capability_information`],
-    /// which the C5 typed dispatch also uses.
-    async fn handle_ue_capability_information(&mut self, ue_id: i32, uper_bytes: &[u8]) {
-        let information = match decode_ue_capability_information(uper_bytes) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(
-                    "Failed to decode UECapabilityInformation from UE[{}]: {}",
-                    ue_id, e
-                );
-                return;
-            }
-        };
-        self.process_ue_capability_information(ue_id, information);
-    }
-
-    /// Common core for a decoded UECapabilityInformation (TS 38.331 §5.6.1):
-    /// verifies the echoed tid, parses the NR capability bands, and stores the
-    /// container. Reached from both the legacy `0x06`-envelope path and the C5
-    /// typed UL-DCCH dispatch.
+    /// Handles a decoded UECapabilityInformation (TS 38.331 §5.6.1): verifies the
+    /// echoed tid, parses the NR capability bands, and stores the container.
+    ///
+    /// Reached from the typed UL-DCCH dispatch. The `0x06`-envelope wrapper that
+    /// used to feed it as well is gone with issue #151 -- that envelope byte is
+    /// also a conformant RRCReconfiguration at tid 3.
     fn process_ue_capability_information(
         &mut self,
         ue_id: i32,
@@ -884,15 +915,11 @@ impl RrcTask {
         }
     }
 
-    async fn handle_ul_information_transfer(&mut self, ue_id: i32, data: &OctetString) {
-        let bytes = data.data();
-        if bytes.len() <= 2 {
-            warn!("UL Information Transfer too short");
-            return;
-        }
-        let nas_pdu = OctetString::from_slice(&bytes[2..]);
-        self.send_uplink_nas_delivery(ue_id, nas_pdu).await;
-    }
+    // `handle_ul_information_transfer` used to live here and recovered the NAS by
+    // slicing `bytes[2..]` off the UE's bespoke `[0x08, 0x00, NAS…]` framing. The
+    // UE now sends a real ULInformationTransfer and the typed dispatch reads its
+    // `dedicatedNAS-Message`, so the slice -- which would have mangled any
+    // conformant peer's NAS -- is gone (issue #151).
 
     async fn handle_nas_delivery(&mut self, ue_id: i32, nas_pdu: OctetString) {
         let ctx = match self.ue_manager.try_find_ue(ue_id) {
@@ -908,38 +935,32 @@ impl RrcTask {
             return;
         }
 
-        let dl_info_transfer = self.build_dl_information_transfer(&nas_pdu);
-        self.send_rrc_message(ue_id, RrcChannel::DlDcch, dl_info_transfer)
-            .await;
+        let Some(dl_info_transfer) = Self::build_dl_information_transfer(&nas_pdu) else {
+            error!(
+                "Not delivering {} NAS octets to UE[{}]: the DLInformationTransfer \
+                 could not be encoded",
+                nas_pdu.len(),
+                ue_id
+            );
+            return;
+        };
+        self.send_rrc_message(
+            ue_id,
+            RrcChannel::DlDcch,
+            OctetString::from_slice(&dl_info_transfer),
+        )
+        .await;
     }
 
-    /// Builds the downlink NAS transport PDU delivered to the UE on SRB1.
+    /// Builds the downlink NAS transport PDU delivered to the UE on SRB1: a real
+    /// UPER DL-DCCH `DLInformationTransfer` (TS 38.331 §5.7.1 / §6.2.1).
     ///
-    /// Wave-6 C5: when `C5_TYPED_DCCH_DISPATCH` is on, emits the real UPER
-    /// DL-DCCH DLInformationTransfer (TS 38.331 §5.7.1 / §6.2.1). While off it
-    /// keeps the legacy bespoke `[0x04, 0x00, 0x00, NAS…]` framing the
-    /// matched-sim UE's nibble dispatcher expects (retired in C6).
-    fn build_dl_information_transfer(&self, nas_pdu: &OctetString) -> OctetString {
-        if C5_TYPED_DCCH_DISPATCH {
-            if let Some(bytes) = Self::build_dl_information_transfer_typed(nas_pdu) {
-                return OctetString::from_slice(&bytes);
-            }
-            // Typed encode failed — fall through to the legacy framing so the
-            // NAS is still delivered (fully fail-closed handling is C6).
-        }
-        let mut pdu = Vec::with_capacity(nas_pdu.len() + 3);
-        pdu.push(0x04);
-        pdu.push(0x00);
-        pdu.push(0x00);
-        pdu.extend_from_slice(nas_pdu.data());
-        OctetString::from_slice(&pdu)
-    }
-
-    /// Encodes a real UPER DL-DCCH DLInformationTransfer (tid 0) carrying
-    /// `nas_pdu` (TS 38.331 §5.7.1). The typed encoder used on the wire when
-    /// C5 is enabled; exercised directly by unit tests regardless of the
-    /// compile-time gate.
-    fn build_dl_information_transfer_typed(nas_pdu: &OctetString) -> Option<Vec<u8>> {
+    /// Returns `None` when the encode fails. The legacy bespoke
+    /// `[0x04, 0x00, 0x00, NAS…]` fallback is gone with issue #151: the UE now
+    /// dispatches on the decoded message, so that framing would be delivered to
+    /// nothing — and a NAS PDU that silently reaches no handler is worse than a
+    /// delivery the caller can report.
+    fn build_dl_information_transfer(nas_pdu: &OctetString) -> Option<Vec<u8>> {
         match encode_dl_information_transfer(&DlInformationTransferParams {
             rrc_transaction_id: 0,
             dedicated_nas_message: Some(nas_pdu.data().to_vec()),
@@ -1067,16 +1088,12 @@ impl RrcTask {
         self.task_base.config.nci & 0xF_FFFF_FFFF
     }
 
-    async fn handle_rrc_reestablishment_complete(&mut self, ue_id: i32, data: &OctetString) {
-        let bytes = data.data();
-        // Prefer the real UPER encoding; fall back to the bespoke framing's
-        // second byte for a UE that has not been updated.
-        let transaction_id = match decode_rrc_reestablishment_complete(bytes) {
-            Ok(complete) => complete.rrc_transaction_id,
-            Err(_) if bytes.len() >= 2 => bytes[1],
-            Err(_) => 0,
-        };
-
+    /// Handles an `RRCReestablishmentComplete` (TS 38.331 §5.3.7.4).
+    ///
+    /// `transaction_id` comes from the typed dispatch. The bespoke-framing
+    /// fallback that read it from `bytes[1]` is gone: that byte is
+    /// `RRCReestablishmentComplete-IEs` content, not the tid (issue #151).
+    async fn handle_rrc_reestablishment_complete(&mut self, ue_id: i32, transaction_id: u8) {
         info!(
             "RRC Reestablishment Complete from UE[{}], tid={}",
             ue_id, transaction_id
@@ -1185,18 +1202,25 @@ impl RrcTask {
         self.handle_an_release(ue_id).await;
     }
 
-    async fn handle_rrc_resume_complete(&mut self, ue_id: i32, data: &OctetString) {
-        let bytes = data.data();
-        let transaction_id = if bytes.len() >= 2 { bytes[1] } else { 0 };
-        let nas_pdu = if bytes.len() > 3 {
-            Some(OctetString::from_slice(&bytes[3..]))
-        } else {
-            None
-        };
+    /// Handles an `RRCResumeComplete` (TS 38.331 §5.3.13.4).
+    ///
+    /// Both the transaction identifier and the piggybacked NAS come from the
+    /// decoded message. They used to be sliced out of the bespoke framing as
+    /// `bytes[1]` and `bytes[3..]` -- offsets that hold IE content in a real
+    /// message, so a conformant peer's resume delivered a mangled NAS PDU and a
+    /// transaction identifier that was never the tid (issue #151).
+    async fn handle_rrc_resume_complete(&mut self, ue_id: i32, complete: &RrcResumeCompleteData) {
+        let transaction_id = complete.rrc_transaction_id;
+        let nas_pdu = complete
+            .dedicated_nas_message
+            .as_ref()
+            .map(|nas| OctetString::from_slice(nas));
 
         info!(
-            "RRC Resume Complete from UE[{}], tid={}",
-            ue_id, transaction_id
+            "RRC Resume Complete from UE[{}], tid={}, nas={}",
+            ue_id,
+            transaction_id,
+            nas_pdu.as_ref().map_or(0, OctetString::len)
         );
 
         if let Some(result) = self.connection_manager.process_rrc_resume_complete(
@@ -2158,16 +2182,27 @@ mod tests {
         assert_eq!(task.next_pdu_id(), 3);
     }
 
+    /// The downlink NAS transport the gNB puts on SRB1 must be a message the UE's
+    /// typed dispatch resolves to a DLInformationTransfer, carrying the NAS
+    /// unchanged. This is the assertion the old one could not make: it checked for
+    /// the bespoke `0x04` leading byte, which no decoder anywhere reads.
     #[test]
-    fn test_build_dl_information_transfer() {
-        let config = test_config();
-        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
-            GnbTaskBase::new(config, 16);
-        let task = RrcTask::new(task_base);
-        let nas_pdu = OctetString::from_slice(&[0x7E, 0x00, 0x41]);
-        let dl_info = task.build_dl_information_transfer(&nas_pdu);
-        assert_eq!(dl_info.len(), 6);
-        assert_eq!(dl_info.data()[0], 0x04);
+    fn the_downlink_nas_transport_dispatches_as_a_dl_information_transfer() {
+        use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_dl_dcch, DlDcchMessage};
+
+        let nas = vec![0x7E, 0x00, 0x41];
+        let bytes = RrcTask::build_dl_information_transfer(&OctetString::from_slice(&nas))
+            .expect("the DLInformationTransfer must encode");
+        match dispatch_dl_dcch(&bytes).expect("and decode as a DL-DCCH-Message") {
+            DlDcchMessage::DlInformationTransfer(transfer) => {
+                assert_eq!(
+                    transfer.dedicated_nas_message,
+                    Some(nas),
+                    "the NAS must survive the transport byte for byte"
+                );
+            }
+            other => panic!("expected DlInformationTransfer, got {other:?}"),
+        }
     }
 
     // ========================================================================
@@ -2177,6 +2212,10 @@ mod tests {
     // the nibble dispatcher) and the UE's bespoke fallback framing
     // [0x04, tid, 0x01, NAS...]. One dedicated test per encoding.
     // ========================================================================
+
+    use nextgsim_rrc::procedures::information_transfer::{
+        encode_ul_information_transfer, UlInformationTransferParams,
+    };
 
     fn run_async<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
@@ -2457,7 +2496,7 @@ mod tests {
     #[test]
     fn test_build_dl_information_transfer_typed_golden() {
         let nas = OctetString::from_slice(&[0x7E, 0x00, 0x42]);
-        let bytes = RrcTask::build_dl_information_transfer_typed(&nas)
+        let bytes = RrcTask::build_dl_information_transfer(&nas)
             .expect("typed DLInformationTransfer must encode");
         assert_eq!(
             bytes,
@@ -2466,24 +2505,21 @@ mod tests {
         );
     }
 
-    /// While the wire gate is OFF (default, matched-sim safe), the legacy
-    /// bespoke DL framing is preserved verbatim so the unchanged UE dispatcher
-    /// keeps routing.
+    /// The bespoke `[0x04, 0x00, 0x00, NAS…]` framing this builder used to emit
+    /// while the C5 wire gate was off is NOT a DL-DCCH-Message the UE can route,
+    /// which is why it was retired rather than kept as a fallback (issue #151).
     #[test]
-    fn test_build_dl_information_transfer_legacy_while_c5_off() {
-        if C5_TYPED_DCCH_DISPATCH {
-            return;
-        }
-        let config = test_config();
-        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
-            GnbTaskBase::new(config, 16);
-        let task = RrcTask::new(task_base);
-        let nas = OctetString::from_slice(&[0x7E, 0x00, 0x42]);
-        let pdu = task.build_dl_information_transfer(&nas);
-        assert_eq!(
-            pdu.data(),
-            &[0x04, 0x00, 0x00, 0x7E, 0x00, 0x42][..],
-            "C5-off: legacy bespoke DL framing preserved for the matched-sim UE"
+    fn the_retired_legacy_dl_framing_would_not_dispatch_at_the_ue() {
+        use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_dl_dcch, DlDcchMessage};
+
+        let legacy = [0x04u8, 0x00, 0x00, 0x7E, 0x00, 0x42];
+        assert!(
+            !matches!(
+                dispatch_dl_dcch(&legacy),
+                Ok(DlDcchMessage::DlInformationTransfer(_))
+            ),
+            "the legacy framing must NOT resolve to a DLInformationTransfer -- if it \
+             did, the retirement would have been unnecessary"
         );
     }
 
@@ -2769,7 +2805,7 @@ mod tests {
             try_take_downlink_rrc(&mut rls_rx, 7).expect("an SCell configuration is sent");
         assert_eq!(channel, RrcChannel::DlDcch, "SRB1, not CCCH");
         let bytes = pdu.data();
-        assert_eq!(bytes[0], RECONFIGURATION_WITH_SCELL);
+        assert_eq!(bytes[0], SIM_RECONFIGURATION_WITH_SCELL);
         let decoded = decode_scell_config(&bytes[2..]).expect("the container is real UPER");
         assert_eq!(decoded.to_add.len(), 1);
         assert_eq!(decoded.to_add[0].phys_cell_id, 42);
@@ -3024,13 +3060,11 @@ mod tests {
     /// still delivers, so the gate does not touch the path a UE that did the
     /// handshake uses.
     ///
-    /// The fixture is the bespoke `[0x08, tid, NAS…]` UL-DCCH framing the gNB
-    /// actually dispatches, not a real UPER `ULInformationTransfer` — a real one is
-    /// **not routed today either**, because UL-DCCH c1 index 8 puts its leading
-    /// byte in `0x40..=0x47` and the nibble matcher reads `0x00..=0x07`. That is a
-    /// pre-existing gap in the hand-rolled dispatcher (issue #107), unrelated to
-    /// this gate, and asserting against it would have made this test fail for the
-    /// wrong reason.
+    /// The fixture is a REAL UPER `ULInformationTransfer`. It used to be the bespoke
+    /// `[0x08, tid, NAS…]` framing, with a note that a conformant message "is not
+    /// routed today either" -- true then, and fixed by the typed dispatch
+    /// (issue #151). The bespoke form is now the one that does not route, and it
+    /// decoded as a well-formed RRCReconfigurationComplete while it did.
     #[test]
     fn the_strict_default_does_not_affect_an_encapsulated_uplink_nas() {
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
@@ -3042,9 +3076,10 @@ mod tests {
             if let Some(ctx) = task.ue_manager.try_find_ue_mut(1) {
                 ctx.on_setup_complete();
             }
-            // [0x08, transaction id, NAS…] — the encapsulated form.
-            let mut pdu = vec![0x08, 0x00];
-            pdu.extend_from_slice(raw_nas_on_dcch().data());
+            let pdu = encode_ul_information_transfer(&UlInformationTransferParams {
+                dedicated_nas_message: Some(raw_nas_on_dcch().data().to_vec()),
+            })
+            .expect("encode ULInformationTransfer");
             task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
                 .await;
         });
@@ -3366,7 +3401,13 @@ mod tests {
             while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
             while ngap_rx.try_recv().is_ok() {}
 
-            let nas = vec![0x08u8, 0x00, 0x7E, 0x00, 0x41];
+            // A real UL-DCCH ULInformationTransfer, integrity protected and ciphered
+            // as the UE sends it. Was the bespoke `[0x08, 0x00, NAS…]` framing until
+            // issue #151 made the UE a conformant typed peer.
+            let nas = encode_ul_information_transfer(&UlInformationTransferParams {
+                dedicated_nas_message: Some(vec![0x7E, 0x00, 0x41]),
+            })
+            .expect("encode ULInformationTransfer");
             let protected = ue_side_security().protect(0, 0, 0, &nas);
             task.handle_ul_dcch_message(7, &OctetString::from_slice(&protected))
                 .await;
@@ -3410,5 +3451,148 @@ mod tests {
             try_take_downlink_rrc(&mut rls_rx, 7).is_none(),
             "no DRB configuration may cross the radio before AS security is active"
         );
+    }
+
+    // ========================================================================
+    // Non-zero transaction identifiers on the wire (issue #151). Unpinning them
+    // is what the typed dispatch buys, and the gNB verifies the echo FAIL-CLOSED
+    // -- so the round trip needs a positive AND a negative control.
+    // ========================================================================
+
+    /// A `SecurityModeFailure` is DISPATCHED to its own handler and clears the
+    /// outstanding SecurityMode transaction. Before the typed dispatch it fell
+    /// through to the nibble fallback and was logged as an unhandled type, so a UE
+    /// refusing AS security looked exactly like one that answered nothing.
+    #[test]
+    fn a_security_mode_failure_is_dispatched_and_clears_the_transaction() {
+        use nextgsim_rrc::procedures::security_mode::{
+            encode_security_mode_failure, SecurityModeFailureParams,
+        };
+
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            let tid = task
+                .ue_manager
+                .try_find_ue_mut(7)
+                .expect("context")
+                .transactions
+                .allocate_cycling(RrcProcedure::SecurityMode);
+
+            let bytes = encode_security_mode_failure(&SecurityModeFailureParams {
+                rrc_transaction_id: tid,
+            })
+            .expect("encode SecurityModeFailure");
+            assert!(
+                task.try_dispatch_typed_ul_dcch(7, &bytes).await,
+                "the failure must be recognised, not fall through as an unhandled type"
+            );
+            assert_eq!(
+                task.ue_manager
+                    .try_find_ue(7)
+                    .and_then(|ctx| ctx.transactions.outstanding(RrcProcedure::SecurityMode)),
+                None,
+                "and the refused transaction must be cleared"
+            );
+            assert!(
+                ngap_rx.try_recv().is_err(),
+                "a SecurityModeFailure is RRC-local and must not reach NGAP"
+            );
+        });
+    }
+
+    /// The gNB allocates a NON-ZERO tid for the second procedure of a UE, the UE
+    /// echoes it, and the gNB accepts it. While the C5 gate was off every gNB->UE
+    /// tid was pinned to 0, so this cycle could not be exercised at all.
+    #[test]
+    fn a_non_zero_transaction_identifier_round_trips_and_is_accepted() {
+        use nextgsim_rrc::procedures::ue_capability::build_minimal_nr_capability_container;
+        use nextgsim_rrc::procedures::ue_capability::{
+            encode_ue_capability_information, UeCapabilityInformationParams,
+            UeCapabilityRatContainer,
+        };
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            // The RRCSetup consumed tid 0 for the Setup procedure; the capability
+            // enquiry is this UE's SECOND allocation.
+            task.send_ue_capability_enquiry(7).await;
+            let enquiry = {
+                let mut last = None;
+                while let Some(pdu) = try_take_downlink_rrc(&mut rls_rx, 7) {
+                    last = Some(pdu);
+                }
+                last.expect("the gNB must send a UECapabilityEnquiry")
+            };
+            let allocated = task
+                .ue_manager
+                .try_find_ue(7)
+                .and_then(|ctx| ctx.transactions.outstanding(RrcProcedure::UeCapability))
+                .expect("the enquiry must record an outstanding transaction");
+            assert_ne!(
+                allocated, 0,
+                "the second procedure for this UE must NOT be tid 0 -- if it is, the \
+                 allocator is still pinned and this test proves nothing"
+            );
+            // The enquiry on the wire carries that tid, in bits 5-6 of its leading
+            // byte -- not in a separate envelope octet.
+            assert_eq!(
+                enquiry.1.data()[0],
+                (6 << 3) | (allocated << 1),
+                "UECapabilityEnquiry is DL-DCCH c1 index 6: leading byte is \
+                 (index << 3) | (tid << 1)"
+            );
+
+            let container = build_minimal_nr_capability_container(78).expect("container");
+            let answer = |tid: u8| {
+                encode_ue_capability_information(&UeCapabilityInformationParams {
+                    rrc_transaction_id: tid,
+                    containers: vec![UeCapabilityRatContainer {
+                        rat_type: RatType::Nr,
+                        container: container.clone(),
+                    }],
+                })
+                .expect("encode UECapabilityInformation")
+            };
+
+            // NEGATIVE control first, so the positive one cannot pass on leftover
+            // state: a wrong tid is discarded and stores nothing.
+            let wrong = (allocated + 1) % 4;
+            task.handle_uplink_rrc(
+                7,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&answer(wrong)),
+            )
+            .await;
+            assert!(
+                task.ue_manager
+                    .try_find_ue(7)
+                    .and_then(|ctx| ctx.nr_capability.clone())
+                    .is_none(),
+                "an echo of tid {wrong} against outstanding {allocated} must be \
+                 DISCARDED (TS 38.331 §5.6.1)"
+            );
+
+            task.handle_uplink_rrc(
+                7,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&answer(allocated)),
+            )
+            .await;
+            assert_eq!(
+                task.ue_manager
+                    .try_find_ue(7)
+                    .and_then(|ctx| ctx.nr_capability.clone()),
+                Some(container),
+                "the correctly echoed tid must be accepted and the capability stored"
+            );
+        });
     }
 }

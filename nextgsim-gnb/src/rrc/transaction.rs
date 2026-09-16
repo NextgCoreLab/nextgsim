@@ -45,17 +45,20 @@
 /// this length.
 const PROC_COUNT: usize = 5;
 
-/// Wave-6 C4-final wire-safety gate.
+/// Wave-6 C4-final wire-safety gate — **satisfied** by issue #151.
 ///
-/// `false` until C5 (typed ASN.1 DL-DCCH/DL-CCCH dispatch at the UE): gNB→UE
-/// transaction ids are pinned to 0 on the wire because the UE's legacy nibble
-/// dispatcher only routes correctly on tid 0. Flip to `true` in the C5 commit
-/// to enable full per-UE 0..3 cycling at every sender site.
+/// `true` since both peers dispatch DCCH/CCCH on a decoded
+/// `DL-DCCH-MessageType` / `UL-DCCH-MessageType` (`nextgsim_rrc::procedures::
+/// dcch_dispatch`) rather than on `bytes[0] & 0x0F`. That is what makes the
+/// per-UE 0..3 transaction-identifier cycle safe: the nibble was a function of
+/// the message index AND the tid, so a non-zero tid moved a message into another
+/// message's arm — which is why every gNB→UE tid used to be pinned to 0.
 ///
-/// See the module docs and `WS-C-gnb-srb1.md` (C4 / C5 sequencing:
-/// "Do not reorder C4-final before C5 — non-zero tids break both nibble
-/// dispatchers by construction").
-pub const C5_TYPED_DCCH_DISPATCH: bool = false;
+/// Kept as a named constant rather than inlined because three senders and the
+/// allocator all have to agree, and because it records WHY the tid is free to
+/// cycle. Removing it is the Wave-6 C6 clean-up, together with the last two
+/// simulator envelopes (issue #107).
+pub const C5_TYPED_DCCH_DISPATCH: bool = true;
 
 /// The RRC procedures that allocate a downlink transaction id and expect the UE
 /// to echo it in the matching uplink message.

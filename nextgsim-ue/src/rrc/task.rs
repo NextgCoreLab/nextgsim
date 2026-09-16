@@ -18,10 +18,7 @@ use crate::rrc::cell_selection::{
     CellChangeEvent, CellSelector, MibInfo, Plmn as CellPlmn, Sib1Info,
 };
 use crate::rrc::conditional_handover::{handover_command_for, CondReconfigStore};
-use crate::rrc::handover::{
-    build_reconfiguration_complete, parse_handover_command, HandoverCommand, HandoverManager,
-    KeyUpdate,
-};
+use crate::rrc::handover::{parse_handover_command, HandoverCommand, HandoverManager, KeyUpdate};
 use crate::rrc::inactive::InactiveContext;
 use crate::rrc::measurement::{
     EutraCellKey, MeasConfig, MeasEventType, MeasurementManager, ReportTriggerConfig,
@@ -50,6 +47,13 @@ use nextgsim_pdcp::srb_security::MAC_I_LEN;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::codec::{decode_rrc, BCCH_DL_SCH_Message, CellGroupConfig, RadioBearerConfig};
 use nextgsim_rrc::procedures::conditional_handover::decode_cho_config;
+use nextgsim_rrc::procedures::dcch_dispatch::{
+    dispatch_dl_ccch, dispatch_dl_dcch, DlCcchMessage, DlDcchMessage, SIM_RECONFIGURATION_WITH_CHO,
+    SIM_RECONFIGURATION_WITH_SCELL,
+};
+use nextgsim_rrc::procedures::information_transfer::{
+    encode_ul_information_transfer, UlInformationTransferParams,
+};
 use nextgsim_rrc::procedures::measurement_report::{
     db_to_rsrq_range, db_to_sinr_range, dbm_to_eutra_rsrp_range, dbm_to_rsrp_range,
     encode_measurement_report, MeasCellResults, MeasResult2Nr, MeasResultCellNr, MeasResultEutra,
@@ -61,17 +65,21 @@ use nextgsim_rrc::procedures::paging::{
 use nextgsim_rrc::procedures::paging_occasion::{
     paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig, PagingOccasion,
 };
-use nextgsim_rrc::procedures::rrc_reestablishment::{
-    decode_rrc_reestablishment, encode_rrc_reestablishment_complete,
-    encode_rrc_reestablishment_request, phys_cell_id_from_nci, ReestablishmentCauseValue,
-    ReestablishmentUeIdentity, RrcReestablishmentCompleteParams, RrcReestablishmentRequestParams,
+use nextgsim_rrc::procedures::rrc_reconfiguration::{
+    encode_rrc_reconfiguration_complete, RrcReconfigurationCompleteParams, RrcReconfigurationData,
 };
-use nextgsim_rrc::procedures::rrc_release::{decode_rrc_release, CellReselectionPrioritiesParams};
+use nextgsim_rrc::procedures::rrc_reestablishment::{
+    encode_rrc_reestablishment_complete, encode_rrc_reestablishment_request, phys_cell_id_from_nci,
+    ReestablishmentCauseValue, ReestablishmentUeIdentity, RrcReestablishmentCompleteParams,
+    RrcReestablishmentRequestParams,
+};
+use nextgsim_rrc::procedures::rrc_release::{CellReselectionPrioritiesParams, RrcReleaseData};
 use nextgsim_rrc::procedures::rrc_resume::{
-    encode_rrc_resume_request1, ResumeCauseValue as AsnResumeCause, RrcResumeRequest1Params,
+    encode_rrc_resume_complete, encode_rrc_resume_request1, ResumeCauseValue as AsnResumeCause,
+    RrcResumeCompleteParams, RrcResumeData, RrcResumeRequest1Params,
 };
 use nextgsim_rrc::procedures::rrc_setup::{
-    decode_rrc_setup, encode_rrc_setup_complete, encode_rrc_setup_request,
+    encode_rrc_setup_complete, encode_rrc_setup_request,
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteParams, RrcSetupData,
     RrcSetupRequestParams, SNssai as RrcSNssai, UeIdentity,
 };
@@ -86,9 +94,8 @@ use nextgsim_rrc::procedures::system_information::{
     IntraFreqReselection, PlmnIdentity as SibPlmnIdentity,
 };
 use nextgsim_rrc::procedures::ue_capability::{
-    build_minimal_nr_capability_container, decode_ue_capability_enquiry,
-    encode_ue_capability_information, RatType, UeCapabilityInformationParams,
-    UeCapabilityRatContainer,
+    build_minimal_nr_capability_container, encode_ue_capability_information, RatType,
+    UeCapabilityEnquiryData, UeCapabilityInformationParams, UeCapabilityRatContainer,
 };
 
 /// Minimum acceptance window after a paging frame, in radio frames (issue #99).
@@ -136,36 +143,12 @@ fn resume_cause_to_asn(cause: ResumeCause) -> AsnResumeCause {
     }
 }
 
-/// Simplified DL/UL-DCCH envelope code: first byte 0x06 marks a UE capability
-/// transfer message; the remaining bytes are the real ASN.1 UPER encoding of
-/// UECapabilityEnquiry (DL) / UECapabilityInformation (UL).
-const RRC_MSG_TYPE_UE_CAPABILITY: u8 = 0x06;
-
 /// Default NR band advertised by the simulated UE (n78, 3.5 GHz TDD)
 const DEFAULT_NR_BAND: u16 = 78;
-
-/// Simplified DL-DCCH envelope code for an RRCReconfiguration carrying a
-/// conditional-reconfiguration container: `[0x0D][transaction id][container]`.
-///
-/// The same hand-rolled framing family as the handover (0x00) and DAPS (0x10)
-/// reconfigurations this task already parses; issue #107 covers replacing all of
-/// them with real UPER, which for `conditionalReconfiguration` also needs a
-/// Rel-16 RRC schema (issue #105).
-const RECONFIGURATION_WITH_CHO: u8 = 0x0D;
 
 /// Where the CHO container starts in such a message, after the envelope code and
 /// the transaction identifier.
 const CHO_CONTAINER_OFFSET: usize = 2;
-
-/// Simplified DL-DCCH envelope code for an RRCReconfiguration carrying a
-/// secondary-cell configuration: `[0x0E][transaction id][UPER CellGroupConfig]`.
-///
-/// Unlike the CHO container, the payload here is a **real UPER encoding**:
-/// `sCellToAddModList` and `sCellToReleaseList` are Rel-15 IEs, so the vendored
-/// schema models them (see `nextgsim_rrc::procedures::scell_config`). Only the
-/// envelope is hand-rolled, the same arrangement as the UE capability transfer
-/// (0x06). Issue #107 covers the envelope.
-const RECONFIGURATION_WITH_SCELL: u8 = 0x0E;
 
 /// Where the `CellGroupConfig` starts in such a message.
 const SCELL_CONTAINER_OFFSET: usize = 2;
@@ -319,6 +302,15 @@ pub struct RrcTask {
     /// the RRCSetup's radioBearerConfig established SRB1 (TS 38.331
     /// §5.3.5.6.3) — recorded BEFORE any DL-DCCH (SRB1) message is handled
     srb1_config: Option<Srb1Config>,
+    /// `rrc-TransactionIdentifier` the RRCSetup carried, to be echoed in the
+    /// RRCSetupComplete (TS 38.331 §5.3.3.4). `None` when the peer's RRCSetup was
+    /// not decodable, which is the only case that falls back to echoing 0.
+    ///
+    /// Distinct from `srb1_config.rrc_transaction_id`, which is only recorded
+    /// when the radioBearerConfig actually established SRB1: the gNB verifies the
+    /// echo fail-closed, so the tid has to survive a configuration this UE could
+    /// not apply (issue #151).
+    rrc_setup_transaction_id: Option<u8>,
     /// T300 establishment guard (TS 38.331 §5.3.3.2): deadline by which an
     /// RRCSetup must arrive after an RRCSetupRequest. `Some` while establishment
     /// is in flight; cleared on RRCSetup reception or on expiry.
@@ -494,6 +486,7 @@ impl RrcTask {
             as_security: None,
             pending_kgnb: None,
             srb1_config: None,
+            rrc_setup_transaction_id: None,
             t300_deadline: None,
             cells_with_broadcast_si: std::collections::HashSet::new(),
             cond_reconfig: CondReconfigStore::new(),
@@ -1567,31 +1560,56 @@ impl RrcTask {
             return;
         }
 
-        // Simplified parsing: check message type
-        let msg_type = bytes[0] & 0x0F;
-
-        match msg_type {
-            0x00 => {
-                // RRC Setup
-                info!("Received RRC Setup from cell {}", cell_id);
+        // TYPED dispatch on the decoded `DL-CCCH-MessageType.c1` (TS 38.331
+        // §6.2.1), not on `bytes[0] & 0x0F` (issue #151). The nibble it replaces
+        // read a real `RRCReject` -- which carries no transaction identifier and
+        // so leads with 0x00 -- as an `RRCSetup`, and would have dropped an
+        // `RRCSetup` at tid 1 or 3 outright once tids stopped being pinned.
+        //
+        // No DL-CCCH arm for an RRCReestablishment: TS 38.331 §6.2.1 puts it on
+        // DL-DCCH/SRB1, which is where it is handled (issue #37).
+        match dispatch_dl_ccch(bytes) {
+            Ok(DlCcchMessage::RrcSetup(setup)) => {
+                info!(
+                    "Received RRC Setup from cell {} (tid {})",
+                    cell_id, setup.rrc_transaction_id
+                );
                 // If a re-establishment was in progress, this is the fallback path
                 if self.reestablishment_proc.is_in_progress() {
                     self.reestablishment_proc.on_rrc_setup_fallback();
                 }
-                self.handle_rrc_setup(cell_id, pdu).await;
+                self.handle_rrc_setup(cell_id, Some(&setup)).await;
             }
-            0x01 => {
-                // RRC Reject
+            Ok(DlCcchMessage::RrcReject) => {
                 warn!("Received RRC Reject from cell {}", cell_id);
                 self.handle_rrc_reject(cell_id).await;
             }
-            // No DL-CCCH arm for an RRCReestablishment. There was one, on low
-            // nibble 0x02, and it never matched: the gNB's bespoke reply led with
-            // 0x24, whose low nibble is 0x04. TS 38.331 §6.2.1 puts
-            // RRCReestablishment on DL-DCCH/SRB1 anyway, which is where it is
-            // handled now (issue #37).
-            _ => {
-                debug!("Unhandled DL-CCCH message type: {:#x}", msg_type);
+            Ok(DlCcchMessage::Unsupported) => {
+                debug!(
+                    "Unhandled DL-CCCH message from cell {} (a spare or \
+                     messageClassExtension arm)",
+                    cell_id
+                );
+            }
+            Err(e) => {
+                // Not a decodable DL-CCCH-Message. The only such PDU in this tree
+                // is the gNB's hand-built RRCSetup fallback, emitted when the ASN.1
+                // encode fails (`build_rrc_setup`, retired with issue #107): keep
+                // establishment working rather than stranding the UE, and let
+                // `handle_rrc_setup` warn about the undecodable payload.
+                if bytes[0] & 0x80 == 0 {
+                    warn!(
+                        "DL-CCCH from cell {} is not a decodable DL-CCCH-Message \
+                         ({}); treating it as the peer's RRCSetup fallback framing",
+                        cell_id, e
+                    );
+                    if self.reestablishment_proc.is_in_progress() {
+                        self.reestablishment_proc.on_rrc_setup_fallback();
+                    }
+                    self.handle_rrc_setup(cell_id, None).await;
+                } else {
+                    debug!("Undecodable DL-CCCH message from cell {}: {}", cell_id, e);
+                }
             }
         }
     }
@@ -1621,12 +1639,13 @@ impl RrcTask {
             return;
         }
 
-        // Wave-6 I5 (TS 38.331 §5.3.4): when the AS-security wire gate is on,
-        // recognise the AS SecurityModeCommand by a typed DL-DCCH decode BEFORE
-        // the legacy nibble dispatcher. The gNB sends the SMC as raw UPER whose
-        // leading byte 0x20 has low-nibble 0x0 — which the legacy matcher below
-        // would misroute to the RRCReconfiguration arm. Default-off: the
-        // matched-sim path is unchanged (this whole block is skipped).
+        // The INTEGRITY-PROTECTED AS SecurityModeCommand is recognised before the
+        // typed dispatch below, and the reason is not routing: its PDCP payload is
+        // `smc_uper || MAC-I`, which is not a bare DL-DCCH-Message, so the typed
+        // decode would reject it (or, worse, accept a prefix). Default-off: with
+        // the AS-security wire gate off this whole block is skipped and an
+        // unprotected SMC is answered by the dispatch arm below (TS 38.331
+        // §5.3.4.2 requires the protection, so "unprotected" is not compliant).
         if as_security_enabled(&self.task_base.config) && bytes.len() > MAC_I_LEN {
             // The SecurityModeCommand arrives INTEGRITY PROTECTED and unciphered
             // (TS 38.331 §5.3.4.2), so the PDCP payload is `smc_uper || MAC-I`.
@@ -1646,139 +1665,222 @@ impl RrcTask {
             }
         }
 
-        // RRCReestablishment (TS 38.331 §6.2.1: DL-DCCH / SRB1), decoded rather
-        // than nibble-matched. Tried before the legacy matcher because its real
-        // UPER leading byte would otherwise be misrouted.
-        if let Ok(reestablishment) = decode_rrc_reestablishment(bytes) {
-            self.handle_rrc_reestablishment(cell_id, &reestablishment)
-                .await;
+        // Simulator framing, matched on the WHOLE first byte and before the typed
+        // dispatch. Both codes sit in the `messageClassExtension` space (top bit
+        // set), so neither can collide with a real `c1` message at any transaction
+        // identifier -- which the 0x0D/0x0E pair they replaced did, and which is
+        // what made unpinning the tid unsafe (issue #151). Issue #107 replaces the
+        // envelopes with real UPER; the CHO container also needs a Rel-16 schema
+        // (issue #105).
+        if bytes[0] == SIM_RECONFIGURATION_WITH_CHO {
+            self.handle_conditional_reconfiguration(bytes).await;
+            return;
+        }
+        if bytes[0] == SIM_RECONFIGURATION_WITH_SCELL {
+            self.handle_scell_reconfiguration(bytes).await;
             return;
         }
 
-        // RRCRelease (TS 38.331 §6.2.1: DL-DCCH / SRB1), decoded rather than
-        // nibble-matched, for the same reason `RRCReestablishment` is: a real UPER
-        // release leads with 0x10, whose low nibble is 0x0, so the legacy matcher below
-        // routed EVERY conformant release into the RRCReconfiguration arm. Only the
-        // gNB's hand-built 0x0D fallback ever reached the release handler, which is why
-        // a `suspendConfig` could not be acted on at all (issue #38).
-        if decode_rrc_release(bytes).is_ok() {
-            self.handle_rrc_release_message(cell_id, bytes).await;
-            return;
-        }
-
-        let msg_type = bytes[0] & 0x0F;
-
-        match msg_type {
-            0x04 => {
-                // DL Information Transfer - forward NAS to NAS task
-                if bytes.len() > 3 {
-                    let nas_pdu = OctetString::from_slice(&bytes[3..]);
-                    self.forward_nas_to_nas_task(nas_pdu).await;
+        // TYPED dispatch on the decoded `DL-DCCH-MessageType.c1` (TS 38.331
+        // §6.2.1), replacing `bytes[0] & 0x0F` (issue #151). The nibble was a
+        // function of the message index AND the transaction identifier, so it
+        // routed `DLInformationTransfer` (0x28) into the RRCResume arm -- dropping
+        // downlink NAS silently -- reached `UECapabilityEnquiry` only through a
+        // bespoke envelope byte, and forced every gNB->UE tid to 0.
+        match dispatch_dl_dcch(bytes) {
+            Ok(DlDcchMessage::RrcReconfiguration(reconfiguration)) => {
+                debug!(
+                    "Received RRC Reconfiguration from cell {} (tid {})",
+                    cell_id, reconfiguration.rrc_transaction_id
+                );
+                self.handle_rrc_reconfiguration(cell_id, bytes, &reconfiguration)
+                    .await;
+            }
+            Ok(DlDcchMessage::RrcResume(resume)) => {
+                self.handle_rrc_resume(cell_id, &resume).await;
+            }
+            Ok(DlDcchMessage::RrcRelease(release)) => {
+                self.handle_rrc_release_message(cell_id, Some(&release))
+                    .await;
+            }
+            Ok(DlDcchMessage::RrcReestablishment(reestablishment)) => {
+                self.handle_rrc_reestablishment(cell_id, &reestablishment)
+                    .await;
+            }
+            Ok(DlDcchMessage::SecurityModeCommand(smc)) => {
+                // An SMC that decodes as a BARE DL-DCCH-Message carried no MAC-I,
+                // so it was not integrity protected -- which TS 38.331 §5.3.4.2
+                // requires. The protected form is handled above. Either the peer
+                // sent it unprotected, or this UE's AS-security wire gate is off
+                // and it has no context to verify with; both are "unable to
+                // comply", which §5.3.4.3 answers with a SecurityModeFailure
+                // rather than with silence.
+                warn!(
+                    "Received an UNPROTECTED AS SecurityModeCommand from cell {} \
+                     (tid {}, as_security_enabled={}); answering SecurityModeFailure \
+                     (TS 38.331 §5.3.4.3)",
+                    cell_id,
+                    smc.rrc_transaction_id,
+                    as_security_enabled(&self.task_base.config)
+                );
+                self.send_security_mode_failure(smc.rrc_transaction_id)
+                    .await;
+            }
+            Ok(DlDcchMessage::DlInformationTransfer(transfer)) => {
+                match transfer.dedicated_nas_message {
+                    Some(nas) => {
+                        debug!(
+                            "DLInformationTransfer from cell {} (tid {}): forwarding \
+                             {} NAS octets",
+                            cell_id,
+                            transfer.rrc_transaction_id,
+                            nas.len()
+                        );
+                        self.forward_nas_to_nas_task(OctetString::from_slice(&nas))
+                            .await;
+                    }
+                    // `dedicatedNAS-Message` is OPTIONAL (TS 38.331 §6.2.2). An
+                    // empty transfer is well-formed and carries nothing to deliver.
+                    None => debug!(
+                        "DLInformationTransfer from cell {} carried no dedicatedNAS-Message",
+                        cell_id
+                    ),
                 }
             }
-            0x0D => {
-                // The gNB's hand-built fallback release framing, which is the ONLY
-                // release the legacy nibble matcher ever saw: a real UPER `RRCRelease`
-                // leads with 0x10, whose low nibble is 0x0. The typed decode above
-                // handles the conformant one; this keeps the fallback working.
-                self.handle_rrc_release_message(cell_id, bytes).await;
-            }
-            0x00 => {
-                // RRC Reconfiguration
-                debug!("Received RRC Reconfiguration from cell {}", cell_id);
-                self.handle_rrc_reconfiguration(cell_id, pdu).await;
-            }
-            RRC_MSG_TYPE_UE_CAPABILITY => {
-                // UECapabilityEnquiry: envelope byte + ASN.1 UPER message
+            Ok(DlDcchMessage::UeCapabilityEnquiry(enquiry)) => {
                 info!("Received UECapabilityEnquiry from cell {}", cell_id);
-                self.handle_ue_capability_enquiry(&bytes[1..]).await;
+                self.handle_ue_capability_enquiry(&enquiry).await;
             }
-            0x08 => {
-                // RRCResume (first byte 0x28; low nibble 0x08)
-                // gNB encodes: bytes[0]=0x28, bytes[1]=transaction_id
-                info!("Received RRCResume from cell {}", cell_id);
-                let rrc_transaction_id = if bytes.len() > 1 { bytes[1] } else { 0 };
-
-                match self.resume_proc.on_resume_received(
-                    rrc_transaction_id,
-                    None,
-                    &mut self.state_machine,
-                ) {
-                    Ok(complete_params) => {
-                        // The suspend configuration is spent: the network has resumed
-                        // this UE and will assign a NEW I-RNTI if it suspends it again
-                        // (TS 38.331 §5.3.13.3). Keeping the old one would have the UE
-                        // authenticate a later resume against a context that no longer
-                        // exists -- or, worse, another UE's.
-                        self.inactive = None;
-                        self.suspended_in_cell_identity = None;
-                        self.serving_cell_id = Some(cell_id);
-                        // Send RRCResumeComplete
-                        // Encoding mirrors gNB: first byte indicates ResumeComplete
-                        let mut rrc_complete = Vec::with_capacity(4);
-                        rrc_complete.push(0x08); // RRCResumeComplete message type
-                        rrc_complete.push(complete_params.rrc_transaction_id);
-                        rrc_complete.push(0x00); // criticalExtensions placeholder
-                        if let Some(nas) = complete_params.dedicated_nas_message {
-                            rrc_complete.extend_from_slice(&nas);
-                        }
-                        let rrc_pdu = OctetString::from_slice(&rrc_complete);
-                        self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
-
-                        // Notify NAS that connection is back
-                        if let Err(e) = self
-                            .task_base
-                            .nas_tx
-                            .send(NasMessage::RrcConnectionSetup)
-                            .await
-                        {
-                            error!("Failed to notify NAS after RRC resume: {}", e);
-                        }
-                        info!("RRC resume complete on cell {}", cell_id);
-                    }
-                    Err(e) => {
-                        warn!("RRCResume handling failed ({}), falling back to idle", e);
-                        // Resume failed; ensure NAS is told the connection is gone
-                        if let Err(ne) = self
-                            .task_base
-                            .nas_tx
-                            .send(NasMessage::RrcEstablishmentFailure)
-                            .await
-                        {
-                            error!("Failed to send RrcEstablishmentFailure: {}", ne);
-                        }
-                    }
-                }
+            Ok(DlDcchMessage::Unsupported) => {
+                debug!(
+                    "Unhandled DL-DCCH message from cell {}: counterCheck, \
+                     mobilityFromNRCommand, a spare or messageClassExtension",
+                    cell_id
+                );
             }
-            _ => {
-                // Check if this is a raw NAS PDU (EPD = 0x7E or 0x2E)
+            Err(e) => {
+                // Not a decodable DL-DCCH-Message. A raw NAS PDU (5GMM EPD 0x7E,
+                // 5GSM 0x2E) is the one such payload this tree still delivers.
                 if bytes.len() >= 2 && (bytes[0] == 0x7E || bytes[0] == 0x2E) {
                     debug!("Received raw NAS PDU, forwarding to NAS task");
                     self.forward_nas_to_nas_task(pdu.clone()).await;
                 } else {
-                    debug!("Unhandled DL-DCCH message type: {:#x}", msg_type);
+                    debug!(
+                        "Undecodable DL-DCCH message from cell {} (leading byte \
+                         {:#04x}): {}",
+                        cell_id, bytes[0], e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Act on an `RRCResume` (TS 38.331 §5.3.13.4): leave RRC_INACTIVE, spend the
+    /// suspend configuration and answer `RRCResumeComplete`.
+    ///
+    /// The transaction identifier comes from the DECODED message. The nibble
+    /// dispatcher read it from `bytes[1]`, which is a byte of `RRCResume-IEs`
+    /// content, not the tid -- the tid is in bits 5-6 of the leading byte.
+    async fn handle_rrc_resume(&mut self, cell_id: i32, resume: &RrcResumeData) {
+        info!(
+            "Received RRCResume from cell {} (tid {})",
+            cell_id, resume.rrc_transaction_id
+        );
+
+        // The NAS that TRIGGERED the resume rides the Complete (TS 38.331
+        // §5.3.13.4). `initiate_resume` stores it in `initial_nas_pdu` precisely so
+        // it can, and issue #38's comment there says so -- but the argument here was
+        // hardcoded `None`, so the MO data that caused the resume was never sent and
+        // the UE went to CONNECTED with nothing to show for it. Found by a test
+        // written for the encoding, which is the only reason it was visible at all:
+        // the bespoke framing appended a NAS that was always absent.
+        let pending_nas = self.initial_nas_pdu.take().map(|pdu| pdu.data().to_vec());
+        match self.resume_proc.on_resume_received(
+            resume.rrc_transaction_id,
+            pending_nas,
+            &mut self.state_machine,
+        ) {
+            Ok(complete_params) => {
+                // The suspend configuration is spent: the network has resumed
+                // this UE and will assign a NEW I-RNTI if it suspends it again
+                // (TS 38.331 §5.3.13.3). Keeping the old one would have the UE
+                // authenticate a later resume against a context that no longer
+                // exists -- or, worse, another UE's.
+                self.inactive = None;
+                self.suspended_in_cell_identity = None;
+                self.serving_cell_id = Some(cell_id);
+
+                // A real UPER `RRCResumeComplete` (TS 38.331 §6.2.2). It used to be
+                // hand-built as `[0x08, tid, 0x00, NAS…]`, which put the tid and the
+                // NAS at byte offsets no decoder reads: the gNB recovered the NAS
+                // only through its matching bespoke slice.
+                match encode_rrc_resume_complete(&RrcResumeCompleteParams {
+                    rrc_transaction_id: complete_params.rrc_transaction_id,
+                    dedicated_nas_message: complete_params.dedicated_nas_message.clone(),
+                    selected_plmn_identity: complete_params.selected_plmn_identity,
+                }) {
+                    Ok(bytes) => {
+                        self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&bytes))
+                            .await;
+                    }
+                    Err(e) => {
+                        error!("Failed to encode RRCResumeComplete: {e}");
+                        return;
+                    }
+                }
+
+                // Notify NAS that connection is back
+                if let Err(e) = self
+                    .task_base
+                    .nas_tx
+                    .send(NasMessage::RrcConnectionSetup)
+                    .await
+                {
+                    error!("Failed to notify NAS after RRC resume: {}", e);
+                }
+                info!("RRC resume complete on cell {}", cell_id);
+            }
+            Err(e) => {
+                warn!("RRCResume handling failed ({}), falling back to idle", e);
+                // Resume failed; ensure NAS is told the connection is gone
+                if let Err(ne) = self
+                    .task_base
+                    .nas_tx
+                    .send(NasMessage::RrcEstablishmentFailure)
+                    .await
+                {
+                    error!("Failed to send RrcEstablishmentFailure: {}", ne);
                 }
             }
         }
     }
 
     /// Handle RRC Setup message
-    async fn handle_rrc_setup(&mut self, cell_id: i32, pdu: &OctetString) {
+    ///
+    /// `setup` is the message the typed DL-CCCH dispatch already decoded, so it
+    /// is decoded ONCE; `None` means the peer sent its undecodable fallback
+    /// framing, which is tolerated (warn + legacy behaviour) so the matched sim
+    /// stays default-safe -- no config flag.
+    async fn handle_rrc_setup(&mut self, cell_id: i32, setup: Option<&RrcSetupData>) {
         // RRCSetup received: stop the T300 establishment guard (TS 38.331
         // §5.3.3.4) before applying the configuration.
         self.stop_t300();
 
-        // Wave-6 C2: decode the RRCSetup payload — per TS 38.331 §5.3.3.4
-        // the UE shall apply the radioBearerConfig (SRB1 establishment,
-        // §5.3.5.6.3) and the masterCellGroup. Decode failure is TOLERATED
-        // (warn + verbatim legacy behavior below) so the matched sim stays
-        // default-safe — no config flag.
-        match decode_rrc_setup(pdu.data()) {
-            Ok(setup) => self.apply_rrc_setup_config(&setup),
-            Err(e) => warn!(
-                "RRCSetup payload not decodable as ASN.1 DL-CCCH ({}); \
-                 proceeding with legacy connection setup",
-                e
+        // Wave-6 C2: per TS 38.331 §5.3.3.4 the UE shall apply the
+        // radioBearerConfig (SRB1 establishment, §5.3.5.6.3) and the
+        // masterCellGroup.
+        //
+        // The echoed transaction identifier is recorded even when the
+        // radioBearerConfig is unusable: the gNB verifies the echo fail-closed
+        // (TS 38.331 §5.3.3, `RrcProcedure::Setup`), so a UE that answered 0
+        // because SRB1 was missing would have its Complete DISCARDED and the
+        // establishment would fail for the wrong reason.
+        self.rrc_setup_transaction_id = setup.map(|s| s.rrc_transaction_id);
+        match setup {
+            Some(setup) => self.apply_rrc_setup_config(setup),
+            None => warn!(
+                "RRCSetup payload not decodable as ASN.1 DL-CCCH; \
+                 proceeding with legacy connection setup"
             ),
         }
 
@@ -1919,14 +2021,12 @@ impl RrcTask {
 
         let params = RrcSetupCompleteParams {
             registered_amf: None,
-            // Wave-6 C2/C4-interim: the echoed tid stays PINNED to 0 until C5
-            // lands typed UL-DCCH dispatch on both peers. Echoing a received
-            // tid of 2 would make the ASN.1 UL-DCCH leading byte 0x14, whose
-            // low nibble 0x4 hits the gNB's bespoke fallback
-            // handle_rrc_setup_complete arm if the ASN.1-first decode is ever
-            // bypassed, mis-extracting garbage NAS from bytes[3..]. Unpinned
-            // in C4-final (after C5); the gNB ignores the echoed tid today.
-            rrc_transaction_id: 0,
+            // The tid the RRCSetup carried, echoed as TS 38.331 §5.3.3.4
+            // requires. No longer pinned to 0 (issue #151): the gNB now cycles
+            // 0..3 per UE and verifies this echo FAIL-CLOSED, so a pinned 0
+            // would have its Complete discarded for every tid but one. 0 only
+            // when the peer's RRCSetup was undecodable and no tid was learned.
+            rrc_transaction_id: self.rrc_setup_transaction_id.unwrap_or(0),
             selected_plmn_identity: 1,
             guami_type: None,
             s_nssai_list,
@@ -2082,24 +2182,23 @@ impl RrcTask {
     /// Act on an `RRCRelease`: suspend to RRC_INACTIVE when it carries a
     /// `suspendConfig`, otherwise go to RRC_IDLE (TS 38.331 §5.3.8.3).
     ///
-    /// Reached from two places — the typed decode and the legacy `0x0D` framing — so
-    /// the two cannot diverge on what a release means.
-    async fn handle_rrc_release_message(&mut self, cell_id: i32, bytes: &[u8]) {
+    /// `release` is the message the typed dispatch already decoded. `None` means the
+    /// peer sent its hand-built fallback PDU, which is a legitimate release this UE
+    /// must still act on -- what is lost is only the optional IEs, including
+    /// `suspendConfig`, so a fallback release always means RRC_IDLE.
+    async fn handle_rrc_release_message(&mut self, cell_id: i32, release: Option<&RrcReleaseData>) {
         info!("Received RRC Release from cell {cell_id}");
         // Dedicated cellReselectionPriorities, when the release carries them
         // (TS 38.331 §6.3.2, TS 38.304 §5.2.4.1, issue #50). Applied BEFORE the release
         // is processed, because the list governs the idle mode the UE is about to enter.
-        //
-        // A decode failure is not reported as an error: the gNB falls back to a
-        // hand-built byte PDU when UPER encoding fails, and that PDU is a legitimate
-        // release this UE must still act on. What is lost is only the optional IEs --
-        // including `suspendConfig`, so a fallback release always means RRC_IDLE.
-        let suspend_config = match decode_rrc_release(bytes) {
-            Ok(release) => {
-                self.apply_dedicated_reselection_priorities(release.cell_reselection_priorities);
-                release.suspend_config
+        let suspend_config = match release {
+            Some(release) => {
+                self.apply_dedicated_reselection_priorities(
+                    release.cell_reselection_priorities.clone(),
+                );
+                release.suspend_config.clone()
             }
-            Err(_) => None,
+            None => None,
         };
         // If a resume was in progress, the network is rejecting it
         if self.resume_proc.is_in_progress() {
@@ -2340,23 +2439,15 @@ impl RrcTask {
     }
 
     /// Handle RRC Reconfiguration message (for handover)
-    async fn handle_rrc_reconfiguration(&mut self, cell_id: i32, pdu: &OctetString) {
-        let bytes = pdu.data();
-
-        // Conditional reconfiguration (TS 38.331 §5.3.5.13.3): the message
-        // carries candidate target configurations rather than an immediate
-        // handover command.
-        if bytes.first() == Some(&RECONFIGURATION_WITH_CHO) {
-            self.handle_conditional_reconfiguration(bytes).await;
-            return;
-        }
-
-        // Secondary cell addition/release (TS 38.331 §5.3.5.5.9).
-        if bytes.first() == Some(&RECONFIGURATION_WITH_SCELL) {
-            self.handle_scell_reconfiguration(bytes).await;
-            return;
-        }
-
+    /// The two simulator envelopes (conditional and secondary-cell
+    /// reconfiguration) are matched by the DL-DCCH dispatcher before this is
+    /// reached, because they are not `DL-DCCH-Message`s at all.
+    async fn handle_rrc_reconfiguration(
+        &mut self,
+        cell_id: i32,
+        bytes: &[u8],
+        reconfiguration: &RrcReconfigurationData,
+    ) {
         // Check if this is a handover reconfiguration
         if let Some(ho_command) = parse_handover_command(bytes) {
             info!(
@@ -2375,12 +2466,12 @@ impl RrcTask {
         // Complete arrives -- meets an entity that can verify it (issue #32).
         self.apply_drb_user_plane_security(bytes).await;
 
-        // Extract transaction ID (simplified)
-        let transaction_id = if bytes.len() > 1 { bytes[1] } else { 0 };
-
-        // Build RRC Reconfiguration Complete
-        let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
-        self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+        // The tid comes from the DECODED message. It used to be read from
+        // `bytes[1]`, which is a byte of RRCReconfiguration-IEs content: the real
+        // tid is in bits 5-6 of the leading byte, so the echo was wrong for every
+        // message and only worked because the gNB pinned the tid to 0 (issue #151).
+        self.send_reconfiguration_complete(reconfiguration.rrc_transaction_id)
+            .await;
     }
 
     /// Apply the user-plane security configured for each DRB in an
@@ -2517,8 +2608,7 @@ impl RrcTask {
             ),
         }
 
-        let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
-        self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+        self.send_reconfiguration_complete(transaction_id).await;
     }
 
     /// Handle an RRCReconfiguration carrying a secondary-cell configuration
@@ -2564,8 +2654,7 @@ impl RrcTask {
             Err(e) => warn!("Failed to decode secondary cell configuration: {}", e),
         }
 
-        let rrc_pdu = OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
-        self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+        self.send_reconfiguration_complete(transaction_id).await;
     }
 
     /// Point the measurement manager's A6 reference at the lowest-index
@@ -2730,9 +2819,7 @@ impl RrcTask {
                 );
 
                 // Send RRC Reconfiguration Complete
-                let rrc_pdu =
-                    OctetString::from_slice(&build_reconfiguration_complete(transaction_id));
-                self.send_uplink_rrc(RrcChannel::UlDcch, rrc_pdu).await;
+                self.send_reconfiguration_complete(transaction_id).await;
             }
         } else {
             // Target cell not reachable - handover failure
@@ -2768,17 +2855,36 @@ impl RrcTask {
         }
     }
 
+    /// Sends an `RRCReconfigurationComplete` echoing `transaction_id`
+    /// (TS 38.331 §5.3.5.3).
+    ///
+    /// One sender for all four reconfiguration paths -- ordinary, handover,
+    /// conditional and secondary-cell -- so they cannot diverge on the encoding.
+    /// It replaces `build_reconfiguration_complete`, which emitted the bespoke
+    /// `[0x08, tid]`: a well-formed RRCReconfigurationComplete at tid 0 followed by
+    /// a trailing octet, so the tid was carried where no decoder reads it and every
+    /// echo was really a 0 (issue #151).
+    async fn send_reconfiguration_complete(&mut self, transaction_id: u8) {
+        match encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+            rrc_transaction_id: transaction_id,
+        }) {
+            Ok(bytes) => {
+                self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&bytes))
+                    .await;
+            }
+            // Only reachable for a tid outside INTEGER(0..3), which a decoded
+            // message cannot carry. Reported rather than sent as a fallback: a
+            // reconfiguration the gNB cannot pair to its transaction is worse than
+            // one it retransmits.
+            Err(e) => {
+                error!("Failed to encode RRCReconfigurationComplete (tid {transaction_id}): {e}")
+            }
+        }
+    }
+
     /// Handles a UECapabilityEnquiry (TS 38.331 §5.6.1) and responds with
     /// UECapabilityInformation carrying a real UE-NR-Capability container.
-    async fn handle_ue_capability_enquiry(&mut self, uper_bytes: &[u8]) {
-        let enquiry = match decode_ue_capability_enquiry(uper_bytes) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!("Failed to decode UECapabilityEnquiry: {}", e);
-                return;
-            }
-        };
-
+    async fn handle_ue_capability_enquiry(&mut self, enquiry: &UeCapabilityEnquiryData) {
         // Provide a capability container for each requested RAT we support
         // (NR only for this UE)
         let mut containers = Vec::new();
@@ -2807,16 +2913,17 @@ impl RrcTask {
         };
 
         match encode_ue_capability_information(&params) {
+            // Sent as a bare UL-DCCH-Message. The `0x06` envelope byte this used to
+            // prepend was simulator framing that COLLIDED with a conformant
+            // RRCReconfiguration at tid 3 (issue #151), and the gNB reads the real
+            // encoding through its typed dispatch.
             Ok(uper) => {
-                let mut rrc_pdu = Vec::with_capacity(uper.len() + 1);
-                rrc_pdu.push(RRC_MSG_TYPE_UE_CAPABILITY);
-                rrc_pdu.extend_from_slice(&uper);
                 info!(
                     "Sending UECapabilityInformation (transaction {}, {} containers)",
                     params.rrc_transaction_id,
                     params.containers.len()
                 );
-                self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&rrc_pdu))
+                self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&uper))
                     .await;
             }
             Err(e) => {
@@ -2856,15 +2963,24 @@ impl RrcTask {
             self.initial_nas_pdu = Some(pdu);
             self.initiate_resume(ResumeCause::MoData).await;
         } else if self.state_machine.state() == RrcState::Connected {
-            // Build UL Information Transfer
-            let mut rrc_pdu = Vec::with_capacity(pdu.len() + 2);
-            rrc_pdu.push(0x08); // ULInformationTransfer message type
-            rrc_pdu.push(0x00); // Critical extensions
-            rrc_pdu.extend_from_slice(pdu.data());
-
-            let ul_info = OctetString::from_slice(&rrc_pdu);
-            self.send_uplink_rrc_with_id(RrcChannel::UlDcch, pdu_id, ul_info)
-                .await;
+            // A real UPER `ULInformationTransfer` (TS 38.331 §5.7.1 / §6.2.1). The
+            // bespoke `[0x08, 0x00, NAS…]` this replaces decoded as a well-formed
+            // `RRCReconfigurationComplete` (UL-DCCH c1 index 1, tid 0) at any peer
+            // that typed its dispatch -- so the uplink NAS was silently swallowed by
+            // the wrong handler, the mirror image of issue #151's downlink defect.
+            match encode_ul_information_transfer(&UlInformationTransferParams {
+                dedicated_nas_message: Some(pdu.data().to_vec()),
+            }) {
+                Ok(bytes) => {
+                    self.send_uplink_rrc_with_id(
+                        RrcChannel::UlDcch,
+                        pdu_id,
+                        OctetString::from_slice(&bytes),
+                    )
+                    .await;
+                }
+                Err(e) => error!("Failed to encode ULInformationTransfer: {e}"),
+            }
         }
     }
 
@@ -4017,6 +4133,7 @@ mod tests {
     /// A revert round that kept the spent I-RNTI matched no test at all.
     #[test]
     fn a_resumed_ue_discards_its_spent_i_rnti() {
+        use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_ul_dcch, UlDcchMessage};
         use nextgsim_rrc::procedures::rrc_resume::{encode_rrc_resume, fresh_rrc_resume_params};
         let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
         let mut task = RrcTask::new(task_base);
@@ -4045,6 +4162,27 @@ mod tests {
                  authenticate against a context that no longer exists"
             );
             assert_eq!(task.suspended_in_cell_identity, None);
+
+            // The answer is a real UPER RRCResumeComplete carrying the NAS that
+            // caused the resume. It used to be hand-built as
+            // `[0x08, tid, 0x00, NAS…]`, which put the tid and the NAS at offsets
+            // no decoder reads -- and whose leading byte is a conformant
+            // RRCReconfigurationComplete at tid 0 (issue #151).
+            let (channel, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlDcch);
+            match dispatch_ul_dcch(complete.data())
+                .expect("the Complete must be a decodable UL-DCCH-Message")
+            {
+                UlDcchMessage::RrcResumeComplete(d) => {
+                    assert_eq!(d.rrc_transaction_id, 0, "the tid the RRCResume carried");
+                    assert_eq!(
+                        d.dedicated_nas_message,
+                        Some(vec![0x7E, 0x00, 0x4D]),
+                        "the MO NAS that triggered the resume must ride the Complete"
+                    );
+                }
+                other => panic!("expected RrcResumeComplete, got {other:?}"),
+            }
         });
     }
 
@@ -4084,9 +4222,11 @@ mod tests {
         use nextgsim_rrc::procedures::rrc_reconfiguration::{
             build_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
         };
+        // tid 2, deliberately: for a real UPER reconfiguration `bytes[1]` is IE
+        // content, so an echo read from there cannot be the tid (issue #151).
         let reconfig = encode_rrc_reconfiguration(
             &build_drb_reconfiguration_params(
-                0,
+                2,
                 1,
                 1,
                 4,
@@ -4098,15 +4238,21 @@ mod tests {
         )
         .expect("encode");
         assert!(
-            decode_rrc_release(&reconfig).is_err(),
-            "an RRCReconfiguration must NOT decode as an RRCRelease, or the typed \
-             dispatch would release the UE on every DRB setup"
+            matches!(
+                dispatch_dl_dcch(&reconfig),
+                Ok(DlDcchMessage::RrcReconfiguration(_))
+            ),
+            "an RRCReconfiguration must dispatch as one and NOT as an RRCRelease, or \
+             the typed dispatch would release the UE on every DRB setup"
         );
 
         let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
         let mut task = RrcTask::new(task_base);
         run_async(async {
             camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            // Drain the establishment traffic so the next uplink message is the
+            // answer to the reconfiguration.
+            while rls_rx.try_recv().is_ok() {}
             task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&reconfig))
                 .await;
             assert_eq!(
@@ -4115,6 +4261,15 @@ mod tests {
                 "a reconfiguration must leave the UE connected"
             );
             assert!(task.inactive.is_none());
+
+            // And the acknowledgement echoes the tid the DECODED message carried.
+            let (_, complete) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(
+                complete.data(),
+                &reconfiguration_complete_pdu(2)[..],
+                "the RRCReconfigurationComplete must echo tid 2; reading the tid from \
+                 bytes[1] would echo an IE content byte instead"
+            );
         });
     }
 
@@ -4180,6 +4335,11 @@ mod tests {
                 UeTaskBase::new(test_config(), 32);
             let mut task = RrcTask::new(task_base);
             task.set_as_security_context(ctx.clone());
+            // Cell 1 is the serving cell, so the DL-DCCH is not discarded as
+            // arriving from a non-active cell. Needed because this drives the real
+            // `handle_downlink_rrc` entry point (and therefore the typed dispatch)
+            // rather than the reconfiguration handler directly.
+            task.serving_cell_id = Some(1);
 
             // PSI 7 with DRB identity 3: deliberately DIFFERENT numbers. With the
             // two equal (as this simulator's one-DRB-per-session convention makes
@@ -4193,7 +4353,7 @@ mod tests {
             );
 
             run_async(async {
-                task.handle_rrc_reconfiguration(1, &pdu).await;
+                task.handle_downlink_rrc(1, RrcChannel::DlDcch, pdu).await;
             });
 
             let mut installed = None;
@@ -4667,7 +4827,7 @@ mod tests {
             ai_model_id: None,
         };
 
-        let mut pdu = vec![RECONFIGURATION_WITH_CHO, transaction_id];
+        let mut pdu = vec![SIM_RECONFIGURATION_WITH_CHO, transaction_id];
         pdu.extend_from_slice(&encode_cho_config(&config).expect("encode CHO container"));
         OctetString::from_slice(&pdu)
     }
@@ -4879,10 +5039,24 @@ mod tests {
         });
     }
 
+    /// The real UPER `RRCReconfigurationComplete` a test expects back, echoing
+    /// `transaction_id` (TS 38.331 §5.3.5.3).
+    ///
+    /// Built with the shared encoder rather than as a byte literal, so a test
+    /// asserts on the message and not on one hand-written spelling of it. The tid
+    /// must be 0..3: the bespoke `[0x08, tid]` this replaced accepted any byte,
+    /// which is how tests came to assert echoes of 4, 5, 7 and 9 (issue #151).
+    fn reconfiguration_complete_pdu(transaction_id: u8) -> Vec<u8> {
+        encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+            rrc_transaction_id: transaction_id,
+        })
+        .expect("RRCReconfigurationComplete encodes for a tid in 0..3")
+    }
+
     /// An RRCReconfiguration adding one secondary cell, in the DL-DCCH envelope
     /// the UE's reconfiguration handler expects.
     fn scell_reconfiguration_pdu(transaction_id: u8, config: &ScellConfig) -> OctetString {
-        let mut pdu = vec![RECONFIGURATION_WITH_SCELL, transaction_id];
+        let mut pdu = vec![SIM_RECONFIGURATION_WITH_SCELL, transaction_id];
         pdu.extend_from_slice(&encode_scell_config(config).expect("encode SCell container"));
         OctetString::from_slice(&pdu)
     }
@@ -4933,9 +5107,10 @@ mod tests {
                 "with no SCell configured, A6 has no reference and cannot enter"
             );
 
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(4, &ScellConfig::add_one(1, 2)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(3, &ScellConfig::add_one(1, 2)),
             )
             .await;
             assert_eq!(
@@ -4947,7 +5122,7 @@ mod tests {
             assert_eq!(channel, RrcChannel::UlDcch);
             assert_eq!(
                 pdu.data(),
-                &build_reconfiguration_complete(4)[..],
+                &reconfiguration_complete_pdu(3)[..],
                 "RRCReconfigurationComplete echoes the transaction id"
             );
 
@@ -4972,9 +5147,10 @@ mod tests {
             task.measurement_manager.add_config(a6_meas_config());
             task.handle_signal_changed(2, -95).await;
             task.handle_signal_changed(3, -90).await;
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
             )
             .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
@@ -4984,9 +5160,10 @@ mod tests {
                 vec![TriggeringCell::Nr(3)]
             );
 
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(2, &ScellConfig::release_one(1)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(2, &ScellConfig::release_one(1)),
             )
             .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
@@ -5011,9 +5188,10 @@ mod tests {
         run_async(async {
             connect_on_cell_one(&mut task, &mut rls_rx).await;
             task.handle_signal_changed(2, -95).await;
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
             )
             .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
@@ -5037,16 +5215,18 @@ mod tests {
         run_async(async {
             connect_on_cell_one(&mut task, &mut rls_rx).await;
             task.handle_signal_changed(2, -95).await;
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
             )
             .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
 
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(2, &ScellConfig::release_one(9)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(2, &ScellConfig::release_one(9)),
             )
             .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
@@ -5073,9 +5253,10 @@ mod tests {
             task.measurement_manager.add_config(a6_meas_config());
             task.handle_signal_changed(3, -50).await; // far stronger than the PCell
 
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 1)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 1)),
             )
             .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
@@ -5099,16 +5280,17 @@ mod tests {
         run_async(async {
             connect_on_cell_one(&mut task, &mut rls_rx).await;
             task.handle_signal_changed(2, -95).await;
-            task.handle_rrc_reconfiguration(
+            task.handle_downlink_rrc(
                 1,
-                &scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
+                RrcChannel::DlDcch,
+                scell_reconfiguration_pdu(1, &ScellConfig::add_one(1, 2)),
             )
             .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
             assert_eq!(task.configured_scells(), vec![2]);
 
-            let pdu = OctetString::from_slice(&[RECONFIGURATION_WITH_SCELL, 7, 0xFF]);
-            task.handle_rrc_reconfiguration(1, &pdu).await;
+            let pdu = OctetString::from_slice(&[SIM_RECONFIGURATION_WITH_SCELL, 3, 0xFF]);
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, pdu).await;
 
             assert_eq!(
                 task.configured_scells(),
@@ -5116,7 +5298,7 @@ mod tests {
                 "a container that does not decode leaves the SCell configured"
             );
             let (_, complete) = next_uplink_rrc(&mut rls_rx);
-            assert_eq!(complete.data(), &build_reconfiguration_complete(7)[..]);
+            assert_eq!(complete.data(), &reconfiguration_complete_pdu(3)[..]);
         });
     }
 
@@ -5133,7 +5315,7 @@ mod tests {
 
             run_async(async {
                 connect_on_cell_one(&mut task, &mut rls_rx).await;
-                task.handle_rrc_reconfiguration(1, &cho_reconfiguration_pdu(5, 2))
+                task.handle_downlink_rrc(1, RrcChannel::DlDcch, cho_reconfiguration_pdu(3, 2))
                     .await;
 
                 assert_eq!(
@@ -5147,7 +5329,7 @@ mod tests {
                 assert_eq!(channel, RrcChannel::UlDcch);
                 assert_eq!(
                     pdu.data(),
-                    &build_reconfiguration_complete(5)[..],
+                    &reconfiguration_complete_pdu(3)[..],
                     "RRCReconfigurationComplete echoes the transaction id"
                 );
             });
@@ -5166,7 +5348,7 @@ mod tests {
 
         run_async(async {
             connect_on_cell_one(&mut task, &mut rls_rx).await;
-            task.handle_rrc_reconfiguration(1, &cho_reconfiguration_pdu(9, 2))
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, cho_reconfiguration_pdu(2, 2))
                 .await;
             let _complete = next_uplink_rrc(&mut rls_rx);
             assert_eq!(task.cho_candidate_count(), 1);
@@ -5205,7 +5387,7 @@ mod tests {
             let mut saw_complete = false;
             while let Ok(msg) = rls_rx.try_recv() {
                 if let TaskMessage::Message(RlsMessage::RrcPduDelivery { pdu, .. }) = msg {
-                    if pdu.data() == &build_reconfiguration_complete(9)[..] {
+                    if pdu.data() == &reconfiguration_complete_pdu(2)[..] {
                         saw_complete = true;
                     }
                 }
@@ -5227,7 +5409,7 @@ mod tests {
 
         run_async(async {
             connect_on_cell_one(&mut task, &mut rls_rx).await;
-            task.handle_rrc_reconfiguration(1, &cho_reconfiguration_pdu(1, 2))
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, cho_reconfiguration_pdu(1, 2))
                 .await;
             assert_eq!(task.cho_candidate_count(), 1);
 
@@ -5248,12 +5430,12 @@ mod tests {
         run_async(async {
             connect_on_cell_one(&mut task, &mut rls_rx).await;
             // Header claims two candidates and carries none.
-            let pdu = OctetString::from_slice(&[RECONFIGURATION_WITH_CHO, 4, 3, 2, 0]);
-            task.handle_rrc_reconfiguration(1, &pdu).await;
+            let pdu = OctetString::from_slice(&[SIM_RECONFIGURATION_WITH_CHO, 3, 3, 2, 0]);
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, pdu).await;
 
             assert_eq!(task.cho_candidate_count(), 0);
             let (_, complete) = next_uplink_rrc(&mut rls_rx);
-            assert_eq!(complete.data(), &build_reconfiguration_complete(4)[..]);
+            assert_eq!(complete.data(), &reconfiguration_complete_pdu(3)[..]);
         });
     }
 
@@ -6821,5 +7003,222 @@ mod tests {
             "an intra-NR report must still encode; otherwise the assertion above \
              says nothing about the E-UTRA arm"
         );
+    }
+
+    // ========================================================================
+    // Typed DL-DCCH / DL-CCCH dispatch (issue #151). The property under test is
+    // that a conformant message reaches ITS OWN handler and no other -- what the
+    // `bytes[0] & 0x0F` matcher could not do, because the low nibble is a
+    // function of the message index AND the transaction identifier.
+    // ========================================================================
+
+    /// The live interop defect: a conformant `DLInformationTransfer` (leading byte
+    /// 0x28) was routed by its low nibble 0x8 into the RRCResume arm, so downlink
+    /// NAS was handed to `ResumeProcedure::on_resume_received` and dropped. It must
+    /// now reach the NAS task, and the resume procedure must NOT be entered.
+    #[test]
+    fn a_conformant_dl_information_transfer_reaches_nas_and_not_the_resume_handler() {
+        use nextgsim_rrc::procedures::information_transfer::{
+            encode_dl_information_transfer, DlInformationTransferParams,
+        };
+
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            while nas_rx.try_recv().is_ok() {}
+
+            let nas = vec![0x7E, 0x00, 0x42, 0x11, 0x22];
+            let pdu = encode_dl_information_transfer(&DlInformationTransferParams {
+                rrc_transaction_id: 2,
+                dedicated_nas_message: Some(nas.clone()),
+            })
+            .expect("encode DLInformationTransfer");
+            assert_eq!(
+                pdu[0], 0x2C,
+                "DL-DCCH c1 index 5 at tid 2 -> 0x2C, whose low nibble 0xC matched NO \
+                 arm of the old dispatcher at all"
+            );
+
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+                .await;
+
+            let mut delivered = None;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::NasDelivery { pdu }) = msg {
+                    delivered = Some(pdu);
+                }
+            }
+            assert_eq!(
+                delivered.expect("the NAS must reach the NAS task").data(),
+                &nas[..],
+                "and byte for byte"
+            );
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Connected,
+                "the UE must still be CONNECTED: entering the resume handler would \
+                 have driven the state machine"
+            );
+            assert!(
+                !task.resume_proc.is_in_progress(),
+                "the resume procedure must NOT be entered by a NAS transport"
+            );
+        });
+    }
+
+    /// The uplink mirror of the same defect: a connected UE's NAS must leave as a
+    /// real `ULInformationTransfer`. The bespoke `[0x08, 0x00, NAS…]` framing it
+    /// used to emit decodes as a well-formed `RRCReconfigurationComplete` at tid 0,
+    /// so a peer that dispatches on the decoded message swallows the NAS silently.
+    #[test]
+    fn a_connected_ue_sends_its_uplink_nas_as_a_real_ul_information_transfer() {
+        use nextgsim_rrc::procedures::dcch_dispatch::{dispatch_ul_dcch, UlDcchMessage};
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            while rls_rx.try_recv().is_ok() {}
+
+            let nas = vec![0x7E, 0x00, 0x4C, 0x09, 0x08];
+            task.handle_uplink_nas_delivery(1, OctetString::from_slice(&nas))
+                .await;
+
+            let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlDcch);
+            assert_ne!(
+                pdu.data()[0],
+                0x08,
+                "0x08 is the bespoke framing's leading byte AND a conformant \
+                 RRCReconfigurationComplete at tid 0 -- the collision itself"
+            );
+            match dispatch_ul_dcch(pdu.data()).expect("must be a decodable UL-DCCH-Message") {
+                UlDcchMessage::UlInformationTransfer(transfer) => {
+                    assert_eq!(
+                        transfer.dedicated_nas_message,
+                        Some(nas),
+                        "and it must carry the NAS byte for byte"
+                    );
+                }
+                other => panic!("expected UlInformationTransfer, got {other:?}"),
+            }
+        });
+    }
+
+    /// A conformant `UECapabilityEnquiry` -- real UPER, no `0x06` envelope byte --
+    /// reaches the capability handler and is answered with a decodable
+    /// `UECapabilityInformation` echoing the tid.
+    #[test]
+    fn a_conformant_ue_capability_enquiry_is_answered_without_an_envelope_byte() {
+        use nextgsim_rrc::procedures::ue_capability::{
+            decode_ue_capability_information, encode_ue_capability_enquiry,
+            UeCapabilityEnquiryParams,
+        };
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+
+            let enquiry = encode_ue_capability_enquiry(&UeCapabilityEnquiryParams {
+                rrc_transaction_id: 3,
+                rat_types: vec![RatType::Nr],
+            })
+            .expect("encode UECapabilityEnquiry");
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&enquiry))
+                .await;
+
+            let (channel, response) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlDcch);
+            let information = decode_ue_capability_information(response.data())
+                .expect("the answer must be a bare UECapabilityInformation, no envelope");
+            assert_eq!(
+                information.rrc_transaction_id, 3,
+                "the echoed tid must be the one the enquiry carried"
+            );
+            assert!(
+                !information.containers.is_empty(),
+                "and it must carry a capability container"
+            );
+        });
+    }
+
+    /// The DL-CCCH half: an `RRCSetup` at a NON-ZERO transaction identifier is
+    /// dispatched and its tid is echoed in the `RRCSetupComplete`. The old nibble
+    /// dispatcher dropped tid 1 and tid 3 outright (leading bytes 0x28 and 0x38),
+    /// which is why gNB->UE tids were pinned to 0.
+    #[test]
+    fn an_rrc_setup_at_a_non_zero_tid_is_dispatched_and_echoed() {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            decode_rrc_setup_complete, encode_rrc_setup, srb1_rrc_setup_params,
+        };
+
+        for tid in 0u8..=3 {
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+                UeTaskBase::new(test_config(), 32);
+            let mut task = RrcTask::new(task_base);
+
+            run_async(async {
+                camp_and_request(&mut task, &mut rls_rx).await;
+                let setup = encode_rrc_setup(&srb1_rrc_setup_params(tid).expect("setup params"))
+                    .expect("encode RRCSetup");
+                task.handle_downlink_rrc(1, RrcChannel::DlCcch, OctetString::from_slice(&setup))
+                    .await;
+
+                assert_eq!(
+                    task.state_machine.state(),
+                    RrcState::Connected,
+                    "tid {tid}: the RRCSetup must be dispatched, whatever its tid"
+                );
+                let (_, complete) = next_uplink_rrc(&mut rls_rx);
+                let decoded = decode_rrc_setup_complete(complete.data())
+                    .expect("the Complete must be a decodable UL-DCCH message");
+                assert_eq!(
+                    decoded.rrc_transaction_id, tid,
+                    "tid {tid} must be echoed: the gNB verifies this FAIL-CLOSED, so a \
+                     pinned 0 would have its Complete discarded"
+                );
+            });
+        }
+    }
+
+    /// A conformant `RRCReject` leads with 0x00 -- the nibble the old dispatcher
+    /// read as `RRCSetup`, so a rejected UE was told it was set up. It must now
+    /// end the establishment attempt.
+    #[test]
+    fn a_conformant_rrc_reject_ends_the_establishment_attempt() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camp_and_request(&mut task, &mut rls_rx).await;
+            assert!(task.t300_running());
+            while nas_rx.try_recv().is_ok() {}
+
+            // A real RRCReject with no waitTime (see the codec test in
+            // nextgsim-rrc dcch_dispatch for the bit-by-bit derivation).
+            task.handle_downlink_rrc(1, RrcChannel::DlCcch, OctetString::from_slice(&[0x00]))
+                .await;
+
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Idle,
+                "a reject must NOT connect the UE -- that is what the misroute did"
+            );
+            assert!(!task.t300_running(), "and it stops the T300 guard");
+            let mut got_failure = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::RrcEstablishmentFailure) = msg {
+                    got_failure = true;
+                }
+            }
+            assert!(got_failure, "and NAS is told the establishment failed");
+        });
     }
 }
