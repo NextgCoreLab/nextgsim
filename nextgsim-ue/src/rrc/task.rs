@@ -27,7 +27,7 @@ use crate::rrc::measurement::{
     ReportTriggerType,
 };
 use crate::rrc::reestablishment::{
-    ReestablishmentProcedure, ReestablishmentState, ReestablishmentTrigger,
+    ReestablishmentProcedure, ReestablishmentState, ReestablishmentTrigger, RlfDetector,
 };
 use crate::rrc::resume::{ResumeCause, ResumeIdentity, ResumeProcedure};
 use crate::rrc::security::{
@@ -164,6 +164,32 @@ const DEFAULT_B1_MEAS_ID: u8 = 2;
 /// (the IE is `OPTIONAL — Cond Standalone` in TS 38.331 §6.3.2).
 const DEFAULT_Q_RX_LEV_MIN: i8 = -70;
 
+/// Serving-cell RSRP at or below which the UE reports **out-of-sync** (issue #168).
+///
+/// # Why this is an RSRP level and not Qout
+///
+/// TS 38.133 §8.1 defines Qout as the level at which the downlink radio link cannot be
+/// reliably received — a **hypothetical PDCCH BLER of 10%** — and Qin as the 2% point. Both
+/// are SINR-domain quantities derived from a PDCCH decode model, and this simulator has no
+/// PHY: there is no BLER, no SINR and no PDCCH to decode. So the RSRP the UE already
+/// measures stands in for the quality metric, and these two constants are the simulator's
+/// choice rather than the spec's numbers.
+///
+/// What IS taken from the spec is the shape: two thresholds with `QIN > QOUT`, so there is a
+/// dead band in which neither indication is produced. A single threshold would make a level
+/// drifting across it emit alternating in-sync and out-of-sync indications that reset each
+/// other's counters, and N310 would never be reached however bad the link got.
+///
+/// Chosen above `CELL_LOST_THRESHOLD_DBM` (-120 dBm), deliberately: below that the cell
+/// selector REMOVES the cell and the `ActiveCellLost` path takes over, so a Qout at or below
+/// it could never be observed — the cell would be gone before the link was declared bad.
+const QOUT_RSRP_DBM: i32 = -115;
+
+/// Serving-cell RSRP at or above which the UE reports **in-sync**, cancelling T310.
+///
+/// 5 dB above [`QOUT_RSRP_DBM`]; see that constant for why the gap exists.
+const QIN_RSRP_DBM: i32 = -110;
+
 /// Converts a broadcast SIB1 PLMN identity into the cell-selection PLMN type.
 ///
 /// `None` when the MCC is absent (TS 38.331 allows it to be omitted, meaning
@@ -288,6 +314,14 @@ pub struct RrcTask {
     /// the decision instead of narrowing the window.
     #[cfg(test)]
     pinned_sfn: Option<u16>,
+    /// N310/N311/T310 radio-link monitoring for the serving cell (TS 38.331 §5.3.10.3).
+    ///
+    /// Owned here because `RlfDetector` had NO owner at all (issue #168): it was exported
+    /// twice and instantiated only by its own unit tests, so N310 filtering, N311 recovery
+    /// and T310 never ran, and the only way this UE could declare RLF was the RLS task
+    /// reporting that the transport had stopped answering. A radio link that merely
+    /// DEGRADED never failed.
+    rlf_detector: RlfDetector,
     /// RRC resume procedure state
     resume_proc: ResumeProcedure,
     /// What the UE remembers while suspended to RRC_INACTIVE (issue #38).
@@ -493,6 +527,9 @@ impl RrcTask {
             reestablishment_proc: ReestablishmentProcedure::new(),
             #[cfg(test)]
             pinned_sfn: None,
+            // Starts on the TS 38.331 §7.1.1 defaults and is replaced by the serving cell's
+            // broadcast `ue-TimersAndConstants` when SIB1 arrives.
+            rlf_detector: RlfDetector::new(),
             resume_proc: ResumeProcedure::new(),
             inactive: None,
             suspended_in_cell_identity: None,
@@ -744,6 +781,11 @@ impl RrcTask {
                 self.retry_handover_synchronization().await;
                 // In connected state, perform measurements for handover
                 self.perform_measurements().await;
+                // Radio-link monitoring (TS 38.331 §5.3.10.3, issue #168). AFTER the
+                // measurements, so the indication is derived from this tick's level rather
+                // than the previous one. Produces the in-sync/out-of-sync indications only;
+                // T310's expiry is declared by `check_guard_timers`, with the other guards.
+                self.evaluate_radio_link_quality();
             }
         }
     }
@@ -1416,6 +1458,37 @@ impl RrcTask {
             "SIB1 from cell {cell_id}: plmn={}-{}, tac={:?}, nci={:#x}",
             plmn.mcc, plmn.mnc, info.tracking_area_code, info.cell_identity
         );
+        // `ue-TimersAndConstants` (TS 38.331 §7.1.1): the CELL decides these and SIB1
+        // carries them. Before #168 the UE read none of them -- the gNB broadcasts t310,
+        // n310 and n311 and the UE ran on its own constants, which agreed only because both
+        // sides happened to pick the same numbers.
+        //
+        // Applied for the serving cell, or during acquisition when there is no serving cell
+        // yet and this is the cell being selected. A neighbour's SIB1 must not reconfigure
+        // the timers of the link the UE is actually on.
+        //
+        // Only t310/n310/n311 are consumed, which are the three this issue owns. t300, t301,
+        // t311 and t319 are still on their hardcoded `*_DEFAULT_MS` constants -- they happen
+        // to equal what this gNB broadcasts, so nothing is currently wrong, but they are
+        // read from the wrong place. Filed rather than folded in here, because each one lives
+        // inside a different procedure and needs its own setter.
+        if self
+            .serving_cell_id
+            .is_none_or(|serving| serving == cell_id)
+        {
+            if let Some(timers) = sib1.ue_timers_and_constants.as_ref() {
+                self.rlf_detector.apply_broadcast_constants(
+                    u32::from(timers.n310),
+                    u32::from(timers.n311),
+                    u64::from(timers.t310_ms),
+                );
+                debug!(
+                    "Cell {cell_id} broadcasts n310={}, n311={}, t310={} ms (TS 38.331 §7.1.1)",
+                    timers.n310, timers.n311, timers.t310_ms
+                );
+            }
+        }
+
         self.cells_with_broadcast_si.insert(cell_id);
         self.cell_selector.update_sib1(
             cell_id,
@@ -2912,6 +2985,11 @@ impl RrcTask {
             // Update measurement manager
             self.measurement_manager.set_serving_cell(Some(new_cell_id));
 
+            // The N310/N311 counters describe the cell just left. Carrying them into the
+            // target would let a run of out-of-syncs on the source start T310 on a cell the
+            // UE has not measured yet (issue #168).
+            self.rlf_detector.reset();
+
             // §5.3.5.5.2: applying a reconfigurationWithSync replaces the
             // cell group configuration, so the source cell's secondary cells
             // are gone. The target names its own in a later reconfiguration.
@@ -3264,6 +3342,50 @@ impl RrcTask {
             // the target-unreachable path already takes, and it notifies NAS as well.
             self.handle_handover_failure().await;
         }
+
+        // T310 (TS 38.331 §5.3.10.3, issue #168): N310 consecutive out-of-sync indications
+        // started it and no run of N311 in-syncs cancelled it, so the radio link has failed.
+        // Polled here rather than from a `select!` arm of its own, for the reason #158 gives
+        // for T319/T301/T311: one clock in this path rather than two that can disagree.
+        if self.rlf_detector.check_t310_expired() {
+            warn!("T310 expired: radio link failure on the serving cell (TS 38.331 §5.3.10.3)");
+            // Reset BEFORE handling, or the next poll finds the same expired timer and
+            // declares a second failure for the same event.
+            self.rlf_detector.reset();
+            self.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+                .await;
+        }
+    }
+
+    /// Turn the serving cell's measured level into one in-sync or out-of-sync indication
+    /// (TS 38.331 §5.3.10.3, issue #168).
+    ///
+    /// This is the producer that did not exist. `RlfDetector` implements N310/N311 filtering
+    /// and T310 in full, and nothing ever called it, so the counters were never advanced by
+    /// anything.
+    ///
+    /// Reads `MeasurementManager`, not `CellSelector`, so the level driving RLF is the same
+    /// measurement of record the A3 evaluation uses — two sources could disagree about the
+    /// serving cell and only one of them would be the one reported to the network.
+    fn evaluate_radio_link_quality(&mut self) {
+        let Some(serving) = self.serving_cell_id else {
+            return;
+        };
+        let Some(rsrp) = self.measurement_manager.rsrp(serving) else {
+            // No measurement for the cell the UE is camped on at all. Out-of-sync by any
+            // reading: the UE cannot hear its serving cell. Not silently skipped, because
+            // "no sample" is the worst case, not a neutral one.
+            self.rlf_detector.on_out_of_sync();
+            return;
+        };
+
+        if rsrp <= QOUT_RSRP_DBM {
+            self.rlf_detector.on_out_of_sync();
+        } else if rsrp >= QIN_RSRP_DBM {
+            self.rlf_detector.on_in_sync();
+        }
+        // Between the two thresholds: neither indication, which is the whole point of
+        // having two. See `QOUT_RSRP_DBM`.
     }
 
     /// Handle radio link failure
@@ -3272,9 +3394,10 @@ impl RrcTask {
 
         // Map RLF cause to re-establishment trigger
         let trigger = match cause {
-            RlfCause::PduIdExists | RlfCause::PduIdFull | RlfCause::SignalLostToConnectedCell => {
-                ReestablishmentTrigger::RadioLinkFailure
-            }
+            RlfCause::PduIdExists
+            | RlfCause::PduIdFull
+            | RlfCause::SignalLostToConnectedCell
+            | RlfCause::RadioLinkQualityLost => ReestablishmentTrigger::RadioLinkFailure,
         };
 
         // Per TS 38.331 §5.3.7.2 re-establishment is only initiated when AS
@@ -7823,6 +7946,404 @@ mod tests {
                 Some(2),
                 "the run loop must retry the synchronisation with no prompting; without the \
                  call in the Connected arm the handover stays open until T304"
+            );
+        });
+    }
+
+    // ========================================================================
+    // T310 and radio-link monitoring (issue #168, TS 38.331 §5.3.10.3)
+    // ========================================================================
+
+    /// A broadcast SIB1 for cell 1 imposing `ue-TimersAndConstants` (TS 38.331 §7.1.1).
+    ///
+    /// Built with the gNB's own encoder, so this exercises the pair both sides use rather
+    /// than a hand-rolled PDU — the same reason `broadcast_si` does.
+    fn sib1_with_timers(n310: u8, n311: u8, t310_ms: u16) -> Vec<u8> {
+        use nextgsim_rrc::procedures::system_information::{
+            encode_sib1, CellSelectionInfo, PlmnIdentityInfo, Sib1Params,
+            UeTimersAndConstantsParams,
+        };
+        let hplmn = test_config().hplmn;
+        encode_sib1(&Sib1Params {
+            cell_selection_info: Some(CellSelectionInfo {
+                q_rx_lev_min: -70,
+                q_rx_lev_min_offset: None,
+                q_rx_lev_min_sul: None,
+                q_qual_min: None,
+                q_qual_min_offset: None,
+            }),
+            plmn_identity_info_list: vec![PlmnIdentityInfo {
+                plmn_identity_list: vec![SibPlmnIdentity {
+                    mcc: Some([
+                        ((hplmn.mcc / 100) % 10) as u8,
+                        ((hplmn.mcc / 10) % 10) as u8,
+                        (hplmn.mcc % 10) as u8,
+                    ]),
+                    mnc: vec![((hplmn.mnc / 10) % 10) as u8, (hplmn.mnc % 10) as u8],
+                }],
+                tracking_area_code: Some(1),
+                cell_identity: 1,
+            }],
+            ims_emergency_support: false,
+            ecall_over_ims_support: false,
+            ue_timers_and_constants: Some(UeTimersAndConstantsParams {
+                t300_ms: 1000,
+                t301_ms: 1000,
+                t310_ms,
+                n310,
+                t311_ms: 1000,
+                n311,
+                t319_ms: 1000,
+            }),
+            intra_freq_reselection_redcap: false,
+        })
+        .expect("the gNB's own SIB1 encoder")
+    }
+
+    /// Connects on cell 1, keys the UE, and lets that cell impose its
+    /// `ue-TimersAndConstants`.
+    ///
+    /// Keyed via `camped_connected_and_keyed` rather than merely connected, because
+    /// TS 38.331 §5.3.7.2 only initiates re-establishment once AS security is active — an
+    /// unkeyed UE would go to RRC_IDLE instead, and the expiry test would be asserting the
+    /// wrong outcome.
+    async fn connected_with_broadcast_timers(
+        task: &mut RrcTask,
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+        n310: u8,
+        n311: u8,
+        t310_ms: u16,
+    ) {
+        camped_connected_and_keyed(task, rls_rx).await;
+        task.handle_downlink_rrc(
+            1,
+            RrcChannel::BcchDlSch,
+            OctetString::from_slice(&sib1_with_timers(n310, n311, t310_ms)),
+        )
+        .await;
+    }
+
+    /// The cell's broadcast `ue-TimersAndConstants` must configure the RLF detector.
+    ///
+    /// The UE read NONE of this IE before #168: the gNB has always broadcast `t310`, `n310`
+    /// and `n311`, and the UE ran on its own constants. The two agreed only because both
+    /// sides happened to pick the same numbers, so nothing was visibly wrong and nothing
+    /// would have become visible until an operator changed the gNB's configuration.
+    ///
+    /// 500 ms is the fixture value because it is not the 1000 ms default either side uses.
+    #[test]
+    fn the_broadcast_ue_timers_and_constants_configure_the_rlf_detector() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            assert_eq!(
+                task.rlf_detector.t310_duration_ms(),
+                1000,
+                "precondition: the detector starts on the §7.1.1 default"
+            );
+
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_timers(3, 2, 500)),
+            )
+            .await;
+
+            assert_eq!(
+                task.rlf_detector.t310_duration_ms(),
+                500,
+                "the serving cell decides T310 (TS 38.331 §7.1.1); the UE used to ignore \
+                 the broadcast entirely"
+            );
+        });
+    }
+
+    /// N310 consecutive out-of-sync indications start T310 — and fewer than N310 do not.
+    ///
+    /// Driven entirely from the MEASUREMENT side: the test sets the serving cell's level and
+    /// runs the production cycle, and never calls `RlfDetector` itself. That is the seam that
+    /// did not exist — the detector was a complete N310/N311/T310 state machine with nothing
+    /// advancing its counters.
+    ///
+    /// N310 is 3 here, from the broadcast, precisely so the FILTER is under test. With the
+    /// default of 1 a single sample would start T310 and the test could not tell filtering
+    /// from a bare threshold comparison.
+    #[test]
+    fn n310_out_of_syncs_start_t310_and_fewer_do_not() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 3, 1, 2000).await;
+
+            // Below Qout (-115 dBm) but above CELL_LOST_THRESHOLD_DBM (-120), so the cell is
+            // still there to be measured — a level below the lost threshold would remove the
+            // cell and take the ActiveCellLost path instead.
+            task.handle_signal_changed(1, -118).await;
+
+            task.perform_cycle().await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "one out-of-sync must not start T310 when N310 is 3"
+            );
+            task.perform_cycle().await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "nor must two: N310 is the point of the counter"
+            );
+            task.perform_cycle().await;
+            assert!(
+                task.rlf_detector.t310_is_running(),
+                "the third consecutive out-of-sync starts T310 (§5.3.10.3); before #168 \
+                 nothing produced an indication at all"
+            );
+        });
+    }
+
+    /// N311 consecutive in-sync indications cancel T310 before it expires.
+    ///
+    /// The recovery case, and the one that proves the filter is in the loop rather than a
+    /// threshold crossing tearing the connection down on sight. T310 is 2000 ms — the longest
+    /// value TS 38.331 enumerates — so the cancellation cannot be confused with an expiry.
+    #[test]
+    fn n311_in_syncs_cancel_t310_before_it_expires() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 2, 2000).await;
+
+            task.handle_signal_changed(1, -118).await;
+            task.perform_cycle().await;
+            assert!(
+                task.rlf_detector.t310_is_running(),
+                "precondition: N310 is 1, so one out-of-sync starts T310"
+            );
+            while nas_rx.try_recv().is_ok() {}
+
+            // The link recovers above Qin (-110 dBm).
+            task.handle_signal_changed(1, -100).await;
+            task.perform_cycle().await;
+            assert!(
+                task.rlf_detector.t310_is_running(),
+                "one in-sync must not cancel T310 when N311 is 2"
+            );
+            task.perform_cycle().await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "the second consecutive in-sync cancels T310 (§5.3.10.3)"
+            );
+
+            task.check_guard_timers().await;
+            // Filtered for the failure specifically rather than asserting the channel is
+            // empty: `perform_measurements` legitimately sends `ServingCellMeasurement` on
+            // this same channel every cycle, so "nothing arrived" would be asserting about
+            // routine reporting instead of about the guard.
+            let mut declared_failure = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::RadioLinkFailure) = msg {
+                    declared_failure = true;
+                }
+            }
+            assert!(
+                !declared_failure,
+                "a cancelled T310 must never declare a failure: a UE that recovered has \
+                 nothing to tell NAS"
+            );
+            assert!(
+                !task.reestablishment_proc.is_in_progress(),
+                "and it must not have started re-establishing either"
+            );
+        });
+    }
+
+    /// A level between Qout and Qin produces neither indication.
+    ///
+    /// The dead band is why there are two thresholds. With one, a level drifting across it
+    /// would emit alternating in-sync and out-of-sync indications that reset each other's
+    /// counters, and N310 would never be reached however bad the link got.
+    ///
+    /// Carries its own control: the same UE at Qout DOES start T310, so this cannot pass by
+    /// the evaluation never running.
+    #[test]
+    fn a_level_inside_the_dead_band_produces_neither_indication() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 3, 1, 2000).await;
+
+            // The assertion has to distinguish "no indication" from "in-sync", and
+            // `t310_is_running()` cannot: both leave it stopped. A revert that collapsed the
+            // two thresholds into one passed a version of this test that only checked that.
+            //
+            // What separates them is the COUNTER: an in-sync resets `out_of_sync_count`. So
+            // the dead-band sample is placed in the MIDDLE of a run of N310 out-of-syncs. If
+            // it produces an in-sync the run is broken and T310 never starts; if it produces
+            // nothing, the run continues and the third out-of-sync starts T310.
+            task.handle_signal_changed(1, -118).await; // out-of-sync 1
+            task.perform_cycle().await;
+
+            task.handle_signal_changed(1, -112).await; // dead band: must be a no-op
+            task.perform_cycle().await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "a dead-band sample must not start T310 either"
+            );
+
+            task.handle_signal_changed(1, -118).await; // out-of-sync 2
+            task.perform_cycle().await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "still one short of N310"
+            );
+
+            task.handle_signal_changed(1, -118).await; // out-of-sync 3
+            task.perform_cycle().await;
+            assert!(
+                task.rlf_detector.t310_is_running(),
+                "the dead-band sample must not have reset the out-of-sync run: with one \
+                 threshold instead of two it would have counted as an in-sync and N310 \
+                 would never be reached"
+            );
+        });
+    }
+
+    /// T310 expiry declares a radio link failure and reaches re-establishment.
+    ///
+    /// The cause matters as much as the outcome: `RlfCause` had no variant for a degraded
+    /// radio link, only for the RLS transport going away, so this failure could not have been
+    /// reported honestly even if the timer had run.
+    #[test]
+    fn t310_expiry_declares_a_radio_link_failure_and_reaches_reestablishment() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 1, 2000).await;
+
+            task.handle_signal_changed(1, -118).await;
+            task.perform_cycle().await;
+            assert!(task.rlf_detector.t310_is_running(), "precondition");
+            // Drain the RRCSetupComplete so the next uplink message is the answer to the
+            // expiry rather than a leftover from the connection.
+            while rls_rx.try_recv().is_ok() {}
+            while nas_rx.try_recv().is_ok() {}
+
+            // Back-dated rather than slept out: a real 2 s wait would be slow AND could not
+            // say which timer fired.
+            task.rlf_detector.expire_t310_for_test();
+            task.check_guard_timers().await;
+
+            assert!(
+                task.reestablishment_proc.is_in_progress(),
+                "§5.3.10.3 declares RLF and §5.3.7.2 re-establishes on a keyed UE; before \
+                 #168 this failure could not happen at all"
+            );
+            // And it reached the WIRE: an RRCReestablishmentRequest on UL-CCCH. Asserted
+            // because the procedure state alone would be satisfied by an initiate() whose
+            // request never left.
+            let (channel, _bytes) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(
+                channel,
+                RrcChannel::UlCcch,
+                "the re-establishment request goes on UL-CCCH (TS 38.331 §6.2.2)"
+            );
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "and the detector is reset, or the next poll declares the same failure again"
+            );
+        });
+    }
+
+    /// A completed handover resets the N310 counter.
+    ///
+    /// The counters describe the cell the UE has LEFT. Carrying them across would let a run
+    /// of out-of-syncs on the source start T310 on a target the UE has not measured yet — the
+    /// UE would declare the new link bad on the old link's evidence.
+    ///
+    /// N310 is 3 and the source accumulates 2, so the first indication on the target is the
+    /// one that would have been the third. Without the reset it starts T310; with it, it does
+    /// not.
+    #[test]
+    fn a_completed_handover_resets_the_out_of_sync_counter() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 3, 1, 2000).await;
+
+            // Two out-of-syncs on the source: one short of N310.
+            task.handle_signal_changed(1, -118).await;
+            task.perform_cycle().await;
+            task.perform_cycle().await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "precondition: two of three, so T310 has not started"
+            );
+
+            // Hand over to cell 2, which is healthy.
+            task.handle_signal_changed(2, -70).await;
+            let pdu = handover_command_pdu(2, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(2),
+                "precondition: the handover completed"
+            );
+
+            // One out-of-sync on the TARGET. It is the third indication overall, and the
+            // first for this cell.
+            task.handle_signal_changed(2, -118).await;
+            task.perform_cycle().await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "the target's first out-of-sync must not inherit the source's count: T310 \
+                 would be started on evidence about a cell the UE has left"
+            );
+        });
+    }
+
+    /// The WIRING: the run loop must produce the sync indications on its own.
+    ///
+    /// Every test above drives `perform_cycle` directly, so deleting the
+    /// `evaluate_radio_link_quality` call from the `RrcState::Connected` arm would leave them
+    /// all green — the same shape as `the_run_loop_polls_the_guard_timers_without_being_asked`.
+    /// This one never calls it.
+    #[test]
+    fn the_run_loop_produces_the_sync_indications_without_being_asked() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 1, 2000).await;
+            task.handle_signal_changed(1, -118).await;
+            assert!(
+                !task.rlf_detector.t310_is_running(),
+                "precondition: nothing has evaluated the link yet"
+            );
+
+            let (tx, rx) = mpsc::channel::<TaskMessage<RrcMessage>>(4);
+            let runner = tokio::spawn(async move {
+                task.run(rx).await;
+                task
+            });
+            // `interval`'s first tick fires immediately, so one cycle is enough; the sleep is
+            // for the spawn to be scheduled. T310 is 2000 ms, well beyond this window, so the
+            // guard poll cannot reach an expiry and make a missing evaluation look like a pass.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = tx.send(TaskMessage::Shutdown).await;
+            let task = runner.await.expect("the RRC task exits cleanly");
+
+            assert!(
+                task.rlf_detector.t310_is_running(),
+                "the run loop must evaluate the radio link with no prompting; without the \
+                 call in the Connected arm the detector never sees an indication"
             );
         });
     }
