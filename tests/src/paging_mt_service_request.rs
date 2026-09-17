@@ -386,10 +386,23 @@ async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_req
     };
 
     let cycle = PagingCycleConfig::with_default_spreading(PAGING_DRX_FRAMES).expect("valid cycle");
-    let now = nextgsim_common::frame_clock::current_sfn();
 
-    // An identity whose paging frame is the CURRENT frame, and one whose frame is
-    // at least 4 frames away -- comfortably outside the 2-frame tolerance.
+    // The frame is PINNED, not read from the clock (issue #171). This used to take
+    // `now = current_sfn()` and then deliver the PCCH message some microseconds-to-
+    // milliseconds later, against a UE that re-read the clock. A radio frame is 10 ms, so
+    // the delivery could land in a LATER frame than the one the identities were chosen for
+    // -- and this test is the direction where that turns CORRECT behaviour into a failure:
+    // `off_occasion` drifting INTO the occasion means the record is rightly accepted and
+    // the negative assertion fails.
+    //
+    // It was worse than a 10 ms window, because the search only cleared frames BACKWARDS
+    // (`now.wrapping_sub(back)`), so a drift forwards was not covered at all. With the
+    // frame pinned, the occasion test below is exact and no window is needed.
+    const PINNED_SFN: u16 = 137;
+    let now = PINNED_SFN;
+
+    // An identity whose paging frame is the pinned frame, and one the pinned frame's
+    // acceptance window does not reach in either direction.
     let mut at_occasion: Option<[u8; 6]> = None;
     let mut off_occasion: Option<[u8; 6]> = None;
     for candidate in 0u32..4096 {
@@ -405,10 +418,14 @@ async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_req
         if at_occasion.is_none() && occasion.is_paging_frame(now) {
             at_occasion = Some(s_tmsi);
         }
-        // Clear the UE's whole acceptance window (T/8, floor 4), plus a frame.
+        // Clear the UE's whole acceptance window (T/8, floor 4) on BOTH sides, plus a
+        // frame. Symmetric now: a one-sided sweep was the second half of the defect.
         let window = (cycle.t() / 8).max(4) + 1;
         if off_occasion.is_none()
-            && !(0..=window).any(|back| occasion.is_paging_frame(now.wrapping_sub(back)))
+            && !(0..=window).any(|offset| {
+                occasion.is_paging_frame(now.wrapping_sub(offset))
+                    || occasion.is_paging_frame(now.wrapping_add(offset))
+            })
         {
             off_occasion = Some(s_tmsi);
         }
@@ -425,6 +442,7 @@ async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_req
     let (ue_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
         UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
+    ue_rrc.pin_sfn(PINNED_SFN);
     ue_rrc.set_paging_identity(Some(off_occasion));
     ue_rrc
         .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, OctetString::from_slice(&pdu))
@@ -441,6 +459,7 @@ async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_req
     let (ue_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
         UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
+    ue_rrc.pin_sfn(PINNED_SFN);
     ue_rrc.set_paging_identity(Some(at_occasion));
     ue_rrc
         .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, OctetString::from_slice(&pdu))

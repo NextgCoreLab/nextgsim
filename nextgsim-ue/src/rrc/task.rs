@@ -305,14 +305,21 @@ pub struct RrcTask {
     uac_barring: UacBarringConfig,
     /// RRC re-establishment procedure state
     reestablishment_proc: ReestablishmentProcedure,
-    /// The SFN the paging-occasion check reads, pinned for a test (issue #171).
+    /// The SFN the paging-occasion check reads, pinned by a harness (issue #171).
     ///
-    /// A radio frame is 10 ms. A test that chooses an identity for the CURRENT frame and
+    /// A radio frame is 10 ms. A test that chooses an identity for a particular frame and
     /// then delivers a PCCH message has to finish inside that frame, entered at a random
     /// offset into it, or the identity no longer matches — and the failure looks exactly
     /// like the AS dropping a page it should have reported. Pinning removes the clock from
     /// the decision instead of narrowing the window.
-    #[cfg(test)]
+    ///
+    /// NOT `#[cfg(test)]`: the cross-process harness in
+    /// `tests/src/paging_mt_service_request.rs` is a separate crate, where this crate's
+    /// `cfg(test)` is off, and it has the same race in the opposite direction — it picks a
+    /// frame OUTSIDE the occasion and asserts the record is dropped, so drift into the
+    /// occasion makes correct behaviour fail. Same reasoning as the `pub` on
+    /// `handle_radio_power_on`, `handle_uplink_rrc` and `perform_cycle`, which that harness
+    /// also drives. `None` in production, where nothing calls [`Self::pin_sfn`].
     pinned_sfn: Option<u16>,
     /// N310/N311/T310 radio-link monitoring for the serving cell (TS 38.331 §5.3.10.3).
     ///
@@ -525,7 +532,6 @@ impl RrcTask {
             ntn_timing: None,
             uac_barring: UacBarringConfig::default(),
             reestablishment_proc: ReestablishmentProcedure::new(),
-            #[cfg(test)]
             pinned_sfn: None,
             // Starts on the TS 38.331 §7.1.1 defaults and is replaced by the serving cell's
             // broadcast `ue-TimersAndConstants` when SIB1 arrives.
@@ -1545,16 +1551,18 @@ impl RrcTask {
     /// clock; the override exists only under `cfg(test)` and defaults to `None`, so the
     /// production path is byte-identical to reading `frame_clock::current_sfn()` directly.
     fn current_sfn(&self) -> u16 {
-        #[cfg(test)]
-        if let Some(sfn) = self.pinned_sfn {
-            return sfn;
+        match self.pinned_sfn {
+            Some(sfn) => sfn,
+            None => frame_clock::current_sfn(),
         }
-        frame_clock::current_sfn()
     }
 
     /// Pins the SFN [`Self::is_own_paging_occasion`] reads.
-    #[cfg(test)]
-    fn pin_sfn_for_test(&mut self, sfn: u16) {
+    ///
+    /// A harness hook, not a production knob: see [`Self::pinned_sfn`] for why it is not
+    /// `#[cfg(test)]`. Nothing in production calls it, so the occasion check reads the live
+    /// clock exactly as it did before.
+    pub fn pin_sfn(&mut self, sfn: u16) {
         self.pinned_sfn = Some(sfn);
     }
 
@@ -4305,7 +4313,7 @@ mod tests {
             // a 10 ms window entered at a random offset. Pinning removes the clock from the
             // decision, so the occasion check still passes for the reason production's does
             // and no longer depends on how fast the machine is.
-            task.pin_sfn_for_test(PINNED_SFN);
+            task.pin_sfn(PINNED_SFN);
             let s_tmsi = s_tmsi_paged_in_the_pinned_frame(&config);
             task.set_paging_identity(Some(s_tmsi));
             task.handle_downlink_rrc(1, RrcChannel::Pcch, pcch_paging(&[s_tmsi]))
@@ -6538,7 +6546,7 @@ mod tests {
         let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
-        task.pin_sfn_for_test(PINNED_SFN);
+        task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
         run_async(async {
@@ -6599,7 +6607,7 @@ mod tests {
             .expect("some frame must be outside a single identity's occasion");
 
         // NEGATIVE: outside the occasion, the record is dropped.
-        probe.pin_sfn_for_test(outside);
+        probe.pin_sfn(outside);
         run_async(async {
             probe
                 .handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
@@ -6615,7 +6623,7 @@ mod tests {
         // it the assertion above would pass for a UE that reports nothing at all.
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
-        task.pin_sfn_for_test(PINNED_SFN);
+        task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
         run_async(async {
             task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
@@ -6636,7 +6644,7 @@ mod tests {
         let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
-        task.pin_sfn_for_test(PINNED_SFN);
+        task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
         run_async(async {
@@ -6677,7 +6685,7 @@ mod tests {
         let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config.clone(), 16);
         let mut task = RrcTask::new(task_base);
-        task.pin_sfn_for_test(PINNED_SFN);
+        task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
         assert!(
