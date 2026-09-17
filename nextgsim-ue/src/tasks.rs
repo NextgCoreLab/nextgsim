@@ -598,6 +598,16 @@ pub enum RlfCause {
     PduIdFull,
     /// Signal lost to connected cell
     SignalLostToConnectedCell,
+    /// The measured downlink quality of the serving cell stayed below Qout for T310
+    /// (TS 38.331 §5.3.10.3).
+    ///
+    /// Distinct from [`RlfCause::SignalLostToConnectedCell`], which the RLS task raises when
+    /// the *transport* stops answering — i.e. the peer went away. This one is the radio
+    /// link degrading while the peer is still there, which is what N310/N311 filtering and
+    /// T310 exist for and what a real UE reaches RLF through. Reusing
+    /// `SignalLostToConnectedCell` would have made the log claim the transport failed
+    /// (issue #168).
+    RadioLinkQualityLost,
 }
 
 // ============================================================================

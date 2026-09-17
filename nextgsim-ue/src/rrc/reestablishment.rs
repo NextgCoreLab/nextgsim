@@ -191,6 +191,38 @@ impl RlfDetector {
         self.t310_running
     }
 
+    /// Applies the `ue-TimersAndConstants` the serving cell broadcast (TS 38.331 §7.1.1).
+    ///
+    /// The cell decides these, and SIB1 carries them. Before #168 the UE read none of them:
+    /// the gNB broadcast `t310`, `n310` and `n311` and the UE ran on its own constants,
+    /// which happened to agree only because both sides picked the same numbers.
+    pub fn apply_broadcast_constants(&mut self, n310: u32, n311: u32, t310_ms: u64) {
+        self.n310 = n310;
+        self.n311 = n311;
+        self.t310_duration_ms = t310_ms;
+    }
+
+    /// The T310 duration currently in force, in milliseconds.
+    ///
+    /// Exists so a test can assert the BROADCAST value reached the timer. Waiting the timer
+    /// out would pass identically for the hardcoded default and say nothing about where the
+    /// value came from.
+    pub fn t310_duration_ms(&self) -> u64 {
+        self.t310_duration_ms
+    }
+
+    /// Backdate T310 so the next [`Self::check_t310_expired`] finds it expired.
+    ///
+    /// Test-only, and the same shape as `ResumeProcedure::expire_t319_for_test`.
+    #[cfg(test)]
+    pub(crate) fn expire_t310_for_test(&mut self) {
+        if let Some(started) = self.t310_started {
+            self.t310_started = Some(
+                started - Duration::from_millis(self.t310_duration_ms) - Duration::from_millis(1),
+            );
+        }
+    }
+
     /// Resets the detector (called after re-establishment completes).
     pub fn reset(&mut self) {
         self.out_of_sync_count = 0;
