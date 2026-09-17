@@ -18,7 +18,9 @@ use crate::rrc::cell_selection::{
     CellChangeEvent, CellSelector, MibInfo, Plmn as CellPlmn, Sib1Info,
 };
 use crate::rrc::conditional_handover::{handover_command_for, CondReconfigStore};
-use crate::rrc::handover::{parse_handover_command, HandoverCommand, HandoverManager, KeyUpdate};
+use crate::rrc::handover::{
+    parse_handover_command, HandoverCommand, HandoverManager, HandoverState, KeyUpdate,
+};
 use crate::rrc::inactive::InactiveContext;
 use crate::rrc::measurement::{
     EutraCellKey, MeasConfig, MeasEventType, MeasurementManager, ReportTriggerConfig,
@@ -724,6 +726,11 @@ impl RrcTask {
                     .await;
             }
             RrcState::Connected => {
+                // A handover still trying to reach its target gets another attempt before
+                // anything else this tick (TS 38.331 §5.3.5.8.3). Before the measurements,
+                // because a handover that completes here changes the serving cell those
+                // measurements are relative to.
+                self.retry_handover_synchronization().await;
                 // In connected state, perform measurements for handover
                 self.perform_measurements().await;
             }
@@ -2763,14 +2770,22 @@ impl RrcTask {
         // because a UE handed an index it cannot verify would trust a number the
         // network invented. `phys_cell_id_of` derives each known cell's PCI from
         // the NCI its SIB1 broadcast, which is the convention both ends share.
+        //
+        // Resolved here for the log and the stored command, and resolved AGAIN on every
+        // synchronisation attempt: a PCI the UE cannot match yet is a target it has not
+        // acquired yet, not one that does not exist, and `cells` gains an entry the moment
+        // the cell becomes audible.
         let target_pci = command.target_cell.pci;
-        command.target_cell.cell_id =
-            self.cell_selector.cells().keys().copied().find(|id| {
-                self.cell_selector.phys_cell_id_of(*id) == Some((target_pci % 1008) as u16)
-            });
-        let target_cell_id = command.target_cell.cell_id;
-        let transaction_id = command.transaction_id;
+        command.target_cell.cell_id = self.resolve_target_cell(target_pci);
         let key_update = command.key_update;
+
+        // T304 comes from the command, not from `HandoverManager`'s default. The value is
+        // signalled in the `reconfigurationWithSync` and was being decoded and thrown
+        // away, so the UE ran on 100 ms while the gNB signalled 1000 ms -- see
+        // `HandoverCommand::t304_ms`. Set BEFORE `start_synchronization` arms the timer,
+        // or the first handover after a command would still use the previous duration.
+        self.handover_manager
+            .set_t304_duration(Duration::from_millis(u64::from(command.t304_ms)));
 
         // Start handover in the handover manager
         self.handover_manager
@@ -2785,68 +2800,126 @@ impl RrcTask {
             self.apply_master_key_update(update, target_pci);
         }
 
-        // Check if we have signal to the target cell. An UNRESOLVED PCI takes the
-        // failure branch: a target the UE cannot identify is a target it cannot
-        // reach, which is exactly what TargetCellUnreachable means.
-        if target_cell_id.is_some_and(|id| self.cell_selector.has_signal_to_cell(id)) {
-            // Start synchronization
-            self.handover_manager.start_synchronization();
+        // TS 38.331 §5.3.5.8.3: T304 starts when the UE begins synchronising with the
+        // target and runs until synchronisation succeeds or the timer expires. Armed
+        // unconditionally, whether or not the target is audible yet, which is the change.
+        //
+        // It used to be armed only on the branch that completed in the same breath, so it
+        // was cleared microseconds later and could never expire. The other branch failed
+        // the handover ON THE SPOT with an invented `TargetCellUnreachable` cause -- and
+        // note that the two branches tested the SAME condition, because
+        // `has_signal_to_cell` is `cells.contains_key` and the PCI was resolved out of
+        // `cells`. So "the UE cannot hear the target" was decided once, permanently, from
+        // one sample.
+        //
+        // §5.3.5.8.3 names exactly one failure for this phase: T304 expiry. A target the
+        // UE cannot hear on the first attempt is a target it has not ACQUIRED yet, and the
+        // network already said how long to keep trying.
+        self.handover_manager.start_synchronization();
+        self.attempt_target_synchronization().await;
+    }
 
-            // In simulation, we assume sync is instant
-            self.handover_manager.sync_complete();
+    /// Resolve a target `physCellId` to one of the cells this UE can currently hear.
+    ///
+    /// `None` when no detected cell carries that PCI, which means "not acquired yet"
+    /// rather than "does not exist" — see [`Self::attempt_target_synchronization`].
+    fn resolve_target_cell(&self, target_pci: u32) -> Option<i32> {
+        let pci = (target_pci % 1008) as u16;
+        self.cell_selector
+            .cells()
+            .keys()
+            .copied()
+            .find(|id| self.cell_selector.phys_cell_id_of(*id) == Some(pci))
+    }
 
-            // Complete handover
-            if let Some(new_cell_id) = self.handover_manager.complete() {
-                // Update serving cell
-                let old_cell_id = self.serving_cell_id;
-                self.serving_cell_id = Some(new_cell_id);
-
-                // Update measurement manager
-                self.measurement_manager.set_serving_cell(Some(new_cell_id));
-
-                // §5.3.5.5.2: applying a reconfigurationWithSync replaces the
-                // cell group configuration, so the source cell's secondary cells
-                // are gone. The target names its own in a later reconfiguration.
-                self.release_all_scells();
-
-                // Notify RLS of new serving cell
-                if let Err(e) = self
-                    .task_base
-                    .rls_tx
-                    .send(RlsMessage::AssignCurrentCell {
-                        cell_id: new_cell_id,
-                    })
-                    .await
-                {
-                    error!("Failed to notify RLS of handover: {}", e);
-                }
-
-                info!(
-                    "Handover successful: {} -> {}",
-                    old_cell_id.unwrap_or(-1),
-                    new_cell_id
-                );
-
-                // Send RRC Reconfiguration Complete
-                self.send_reconfiguration_complete(transaction_id).await;
-            }
-        } else {
-            // Target cell not reachable - handover failure
-            warn!(
-                "Handover failed: target PCI {} not in coverage (local cell {:?})",
-                target_pci, target_cell_id
+    /// One attempt to synchronise with the target cell of the handover in progress.
+    ///
+    /// §5.3.5.8.3 has the UE keep trying until synchronisation succeeds or T304 expires.
+    /// In this simulator "synchronised" means the target cell is audible, so an attempt is
+    /// a resolution of the target PCI against the detected cells — but it is an attempt PER
+    /// RRC CYCLE rather than a single pass/fail, and that is what makes T304 a real guard
+    /// instead of a decoration.
+    ///
+    /// Does nothing observable when the target is still silent: the UE stays in
+    /// `Synchronizing` with T304 running, and either a later cycle acquires the cell or
+    /// [`Self::check_guard_timers`] declares the failure.
+    async fn attempt_target_synchronization(&mut self) {
+        // Re-resolved rather than taken from the stored command, because that is the whole
+        // point of retrying: a cell that was not in `cells` when the command arrived can be
+        // there now. `handle_signal_change` inserts on detection and REMOVES below
+        // `CELL_LOST_THRESHOLD_DBM`, so the answer genuinely changes over time.
+        let Some(target_pci) = self.handover_manager.target_cell().map(|cell| cell.pci) else {
+            return;
+        };
+        let Some(target_cell_id) = self.resolve_target_cell(target_pci) else {
+            debug!(
+                "Handover: target PCI {target_pci} not acquired yet, T304 still running \
+                 (TS 38.331 §5.3.5.8.3)"
             );
-            if let Some(source_cell) = self
-                .handover_manager
-                .fail(crate::rrc::handover::HandoverFailureCause::TargetCellUnreachable)
+            return;
+        };
+
+        // Write the resolved index back: `complete()` returns the STORED one, and the
+        // command may have arrived before the UE could hear the cell.
+        self.handover_manager.resolve_target_cell(target_cell_id);
+
+        // Read before completing: `complete()` clears the stored command, so the identifier
+        // to echo has to be recovered first. On a retry this is also the only place it
+        // survives — the cycle that completes the handover is not the one that received
+        // the command.
+        let Some(transaction_id) = self.handover_manager.transaction_id() else {
+            return;
+        };
+
+        self.handover_manager.sync_complete();
+
+        // Complete handover
+        if let Some(new_cell_id) = self.handover_manager.complete() {
+            // Update serving cell
+            let old_cell_id = self.serving_cell_id;
+            self.serving_cell_id = Some(new_cell_id);
+
+            // Update measurement manager
+            self.measurement_manager.set_serving_cell(Some(new_cell_id));
+
+            // §5.3.5.5.2: applying a reconfigurationWithSync replaces the
+            // cell group configuration, so the source cell's secondary cells
+            // are gone. The target names its own in a later reconfiguration.
+            self.release_all_scells();
+
+            // Notify RLS of new serving cell
+            if let Err(e) = self
+                .task_base
+                .rls_tx
+                .send(RlsMessage::AssignCurrentCell {
+                    cell_id: new_cell_id,
+                })
+                .await
             {
-                // Stay on source cell
-                self.serving_cell_id = Some(source_cell);
+                error!("Failed to notify RLS of handover: {}", e);
             }
 
-            // Trigger RRC re-establishment
-            self.handle_handover_failure().await;
+            info!(
+                "Handover successful: {} -> {}",
+                old_cell_id.unwrap_or(-1),
+                new_cell_id
+            );
+
+            // Send RRC Reconfiguration Complete
+            self.send_reconfiguration_complete(transaction_id).await;
         }
+    }
+
+    /// Give a handover that is still synchronising another attempt (§5.3.5.8.3).
+    ///
+    /// Driven from [`Self::perform_cycle`] rather than from a timer of its own, because the
+    /// thing an attempt depends on — whether the target cell is audible — only changes when
+    /// the cycle re-reads the radio.
+    async fn retry_handover_synchronization(&mut self) {
+        if self.handover_manager.state() != HandoverState::Synchronizing {
+            return;
+        }
+        self.attempt_target_synchronization().await;
     }
 
     /// Handle handover failure - initiate re-establishment
@@ -3141,6 +3214,25 @@ impl RrcTask {
             self.reestablishment_proc
                 .on_timer_expired(&mut self.state_machine);
             self.handle_establishment_failure().await;
+        }
+
+        // T304 (TS 38.331 §5.3.5.8.3): the UE could not synchronise with the target within
+        // the time the network allowed. Read the source cell FIRST -- `check_t304_expired`
+        // calls `fail`, which clears `source_cell_id`, and §5.3.5.8.3's first action is to
+        // revert to the configuration used in the source PCell.
+        let handover_source = self.handover_manager.source_cell_id();
+        if self.handover_manager.check_t304_expired() {
+            warn!(
+                "T304 expired: could not synchronise with the target cell, reverting to the \
+                 source PCell (TS 38.331 §5.3.5.8.3)"
+            );
+            if let Some(source_cell) = handover_source {
+                self.serving_cell_id = Some(source_cell);
+            }
+            // §5.3.5.8.3 then initiates the re-establishment procedure. Reusing
+            // `handle_handover_failure` rather than a second copy: it is the same outcome
+            // the target-unreachable path already takes, and it notifies NAS as well.
+            self.handle_handover_failure().await;
         }
     }
 
@@ -7315,6 +7407,318 @@ mod tests {
                 "polling with nothing armed must not move the state machine"
             );
             assert!(nas_rx.try_recv().is_err(), "and must tell NAS nothing");
+        });
+    }
+
+    // ========================================================================
+    // T304, the handover synchronisation guard (issue #167, TS 38.331 §5.3.5.8.3)
+    // ========================================================================
+
+    /// A PCI no cell in these fixtures broadcasts, so the UE cannot acquire the target.
+    ///
+    /// `provide_simulated_system_info` sets each cell's `nci` to its own `cell_id`, and
+    /// `phys_cell_id_of` derives the PCI from that, so cells 1 and 2 carry PCIs 1 and 2.
+    const UNACQUIRABLE_PCI: u16 = 407;
+
+    /// A real `RRCReconfiguration` with `reconfigurationWithSync`, built by the gNB's own
+    /// encoder so `t304_ms` travels the way it does in production.
+    fn handover_command_pdu(target_pci: u16, t304_ms: u16) -> Vec<u8> {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_handover_command, HandoverCommandParams,
+        };
+        encode_handover_command(&HandoverCommandParams {
+            rrc_transaction_id: 0,
+            target_phys_cell_id: target_pci,
+            new_ue_identity: 1,
+            t304_ms,
+            full_config: true,
+            master_key_update: None,
+        })
+        .expect("the gNB's own encoder")
+    }
+
+    /// The T304 the network signalled must be the one the UE runs.
+    ///
+    /// `parse_handover_command` decoded `t304_ms` and dropped it, so the UE ran on
+    /// `HandoverManager`'s hardcoded 100 ms while the gNB signalled 1000. 500 ms is the
+    /// fixture value precisely because it is NEITHER — a fixture of 1000 would pass against
+    /// a hardcoded gNB default and one of 100 against the old bug.
+    #[test]
+    fn the_signalled_t304_reaches_the_handover_timer() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            assert_eq!(
+                task.handover_manager.t304_duration(),
+                Duration::from_millis(100),
+                "precondition: the manager starts on its own hardcoded default"
+            );
+
+            let pdu = handover_command_pdu(UNACQUIRABLE_PCI, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+
+            assert_eq!(
+                task.handover_manager.t304_duration(),
+                Duration::from_millis(500),
+                "the UE must run the T304 the reconfigurationWithSync carried, not its own \
+                 default: the two ends disagreeing on this timer is a handover that fails \
+                 at whichever end is stricter"
+            );
+        });
+    }
+
+    /// A target the UE has not acquired yet leaves the handover SYNCHRONISING, with T304
+    /// running, instead of failing on the spot.
+    ///
+    /// This is the behaviour change. The old code decided "unreachable" from a single
+    /// sample and went straight to re-establishment — and its two branches tested the same
+    /// condition, because `has_signal_to_cell` is `cells.contains_key` and the PCI was
+    /// resolved out of `cells`.
+    #[test]
+    fn an_unacquired_target_keeps_the_handover_synchronising_instead_of_failing_it() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            while nas_rx.try_recv().is_ok() {}
+
+            let pdu = handover_command_pdu(UNACQUIRABLE_PCI, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+
+            assert_eq!(
+                task.handover_manager.state(),
+                HandoverState::Synchronizing,
+                "the UE must keep trying for as long as the network allowed; the old code \
+                 failed here"
+            );
+            assert!(
+                task.handover_manager.is_in_progress(),
+                "and the handover is still in progress, which is what T304 guards"
+            );
+            assert_eq!(
+                task.serving_cell_id,
+                Some(1),
+                "it has not moved off the source cell"
+            );
+            assert!(
+                nas_rx.try_recv().is_err(),
+                "and NAS must NOT have been told the radio link failed: nothing has failed \
+                 yet, which is the difference between a guard and a verdict"
+            );
+        });
+    }
+
+    /// A target that becomes audible after the command completes the handover on a later
+    /// cycle.
+    ///
+    /// The positive half of the retry: without it, "stays in Synchronizing" would be
+    /// indistinguishable from a handover that can never finish.
+    #[test]
+    fn a_target_acquired_after_the_command_completes_the_handover_on_a_later_cycle() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+
+            // PCI 2 is cell 2's, and cell 2 has not been detected yet.
+            let pdu = handover_command_pdu(2, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(
+                task.handover_manager.state(),
+                HandoverState::Synchronizing,
+                "precondition: the target is not acquired at command time"
+            );
+            assert_eq!(task.serving_cell_id, Some(1));
+
+            // Now the UE hears it.
+            task.handle_signal_changed(2, -70).await;
+            task.perform_cycle().await;
+
+            assert_eq!(
+                task.serving_cell_id,
+                Some(2),
+                "the retry must complete the handover once the target is acquired; a UE \
+                 that only ever tried once would sit here until T304"
+            );
+            assert!(
+                task.handover_manager.last_handover_duration().is_some(),
+                "and it completed through the handover manager rather than by some other \
+                 route changing the serving cell"
+            );
+        });
+    }
+
+    /// T304 expiry reverts to the source PCell and initiates re-establishment
+    /// (§5.3.5.8.3).
+    ///
+    /// The cause matters as much as the outcome: `HandoverFailureCause::T304Expired` was
+    /// unreachable before this, so a handover that ran out of time had no way to say so.
+    #[test]
+    fn t304_expiry_reverts_to_the_source_pcell_and_re_establishes() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let pdu = handover_command_pdu(UNACQUIRABLE_PCI, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(task.handover_manager.state(), HandoverState::Synchronizing);
+            while nas_rx.try_recv().is_ok() {}
+
+            // Back-dated rather than slept out: a real 500 ms wait would be slow AND could
+            // not say which timer fired.
+            task.handover_manager.expire_t304_for_test();
+            task.check_guard_timers().await;
+
+            assert_eq!(
+                task.handover_manager.state(),
+                HandoverState::Failed,
+                "T304 expiry ends the handover"
+            );
+            assert!(
+                !task.handover_manager.is_in_progress(),
+                "and releases the in-progress interlock"
+            );
+            assert_eq!(
+                task.serving_cell_id,
+                Some(1),
+                "§5.3.5.8.3: the UE reverts to the configuration used in the source PCell"
+            );
+            let mut told_nas = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::RadioLinkFailure) = msg {
+                    told_nas = true;
+                }
+            }
+            assert!(
+                told_nas,
+                "§5.3.5.8.3 then initiates re-establishment, which is what tells NAS the \
+                 radio link failed"
+            );
+        });
+    }
+
+    /// Conditional handover is suppressed while a handover is synchronising, and resumes
+    /// once T304 has ended it.
+    ///
+    /// This is the consequence with no guard at all before #167, and it only became
+    /// REACHABLE once a handover could stay in progress across cycles: an armed candidate
+    /// that a stuck handover silently ignores is a UE that stops handing itself over with
+    /// nothing in the log to say why.
+    #[test]
+    fn conditional_handover_is_suppressed_while_syncing_and_resumes_after_a_t304_failure() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            connect_on_cell_one(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, cho_reconfiguration_pdu(2, 2))
+                .await;
+            let _complete = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(
+                task.cho_candidate_count(),
+                1,
+                "precondition: a candidate is armed"
+            );
+
+            // A network-ordered handover to a target the UE cannot acquire holds the
+            // handover open.
+            let pdu = handover_command_pdu(UNACQUIRABLE_PCI, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(task.handover_manager.state(), HandoverState::Synchronizing);
+
+            // Cell 2 pulls far ahead: the candidate's condition is now true. It must NOT
+            // execute — §5.3.5.13.5 selects among the SOURCE cell's candidates, and the UE
+            // is between cells.
+            task.handle_signal_changed(2, -60).await;
+            task.perform_cycle().await;
+            assert_eq!(
+                task.cho_candidate_count(),
+                1,
+                "a triggered candidate must not execute while a handover is in progress"
+            );
+
+            // T304 ends the handover, and the interlock with it.
+            task.handover_manager.expire_t304_for_test();
+            task.check_guard_timers().await;
+            assert_eq!(task.handover_manager.state(), HandoverState::Failed);
+
+            task.perform_cycle().await;
+            assert_eq!(
+                task.cho_candidate_count(),
+                0,
+                "§5.3.5.3: executing the candidate releases the stored set — so CHO \
+                 evaluation resumed. A handover left in progress forever would suppress \
+                 every candidate for the life of the process, silently"
+            );
+            assert_eq!(
+                task.serving_cell_id,
+                Some(2),
+                "and the UE actually moved to the candidate cell"
+            );
+        });
+    }
+
+    /// The WIRING, not the helper: the run loop must retry the synchronisation on its own.
+    ///
+    /// Same reasoning as `the_run_loop_polls_the_guard_timers_without_being_asked` — every
+    /// test above drives `perform_cycle` directly, so deleting the retry call from the
+    /// `RrcState::Connected` arm would leave them all green. This one never calls it.
+    #[test]
+    fn the_run_loop_retries_a_handover_that_could_not_sync() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let pdu = handover_command_pdu(2, 10_000);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(
+                task.handover_manager.state(),
+                HandoverState::Synchronizing,
+                "precondition: cell 2 is not acquired yet"
+            );
+            // Acquired BEFORE the run loop takes over, so the only thing left to do is the
+            // retry itself. T304 is 10 s so the guard poll cannot end the handover first
+            // and make a missing retry look like a pass.
+            task.handle_signal_changed(2, -70).await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(1),
+                "and acquiring the cell does not by itself complete the handover"
+            );
+
+            let (tx, rx) = mpsc::channel::<TaskMessage<RrcMessage>>(4);
+            let runner = tokio::spawn(async move {
+                task.run(rx).await;
+                task
+            });
+            // `interval`'s first tick fires immediately, so one cycle is enough; the sleep
+            // is for the spawn to be scheduled.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = tx.send(TaskMessage::Shutdown).await;
+            let task = runner.await.expect("the RRC task exits cleanly");
+
+            assert_eq!(
+                task.serving_cell_id,
+                Some(2),
+                "the run loop must retry the synchronisation with no prompting; without the \
+                 call in the Connected arm the handover stays open until T304"
+            );
         });
     }
 

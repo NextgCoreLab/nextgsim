@@ -256,8 +256,26 @@ pub fn handover_command_for(candidate: &ChoCandidateCell, transaction_id: u8) ->
         key_update: None,
         full_config: false,
         transaction_id,
+        // A conditional-reconfiguration container has NO t304: `ChoTargetCellConfig`
+        // carries `phys_cell_id`, `ssb_frequency_arfcn`, the subcarrier spacing, an
+        // optional NCI/PLMN and an opaque `rrc_reconfiguration`, and nothing else. A
+        // conformant `condRRCReconfig` would embed a whole `RRCReconfiguration` with its
+        // own `reconfigurationWithSync`, which needs the Rel-16 schema (#105).
+        //
+        // So a CHO execution uses this default rather than a network-signalled value, and
+        // it is stated here rather than inherited silently from `HandoverManager::new`:
+        // the reader needs to know the network did not choose it.
+        t304_ms: CHO_DEFAULT_T304_MS,
     }
 }
+
+/// T304 applied to a conditional handover, in milliseconds.
+///
+/// `DEFAULT_T304_MS` on the gNB side is the same 1000 ms, which is deliberate: the two
+/// ends should agree, and until a CHO container can carry a `t304` the only way for them
+/// to agree is for both to name the same default. If the gNB's changes, this must too —
+/// there is no wire field to reconcile them.
+const CHO_DEFAULT_T304_MS: u16 = 1000;
 
 /// Map an execution condition onto the measurement event that decides it.
 ///

@@ -41,16 +41,21 @@ pub enum HandoverState {
 }
 
 /// Handover failure cause
+///
+/// TS 38.331 §5.3.5.8.3 names exactly one failure for the synchronisation phase —
+/// T304 expiry — and that is the only cause production constructs. `TargetCellUnreachable`
+/// and `InvalidReconfiguration` used to sit here and are gone: the first was constructed on
+/// a branch that decided "the UE cannot hear the target" permanently from one sample, which
+/// is the defect T304 exists to prevent, and the second was never constructed at all.
+///
+/// `SyncFailure` is kept because [`HandoverManager::fail`] is public: a caller that aborts a
+/// handover for a reason other than the timer needs something to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandoverFailureCause {
     /// T304 timer expired
     T304Expired,
     /// Failed to sync with target cell
     SyncFailure,
-    /// Target cell not reachable
-    TargetCellUnreachable,
-    /// Invalid reconfiguration
-    InvalidReconfiguration,
 }
 
 /// Target cell information for handover
@@ -88,6 +93,18 @@ pub struct HandoverCommand {
     pub full_config: bool,
     /// Transaction ID from RRC Reconfiguration
     pub transaction_id: u8,
+    /// `t304` from the `reconfigurationWithSync`, in milliseconds (TS 38.331 §5.3.5.8.3).
+    ///
+    /// The network decides how long the UE may spend synchronising with the target, and
+    /// it is on the wire. This field exists because the value was being DECODED and then
+    /// dropped: `parse_handover_command` built this struct without it, so the UE ran on
+    /// [`HandoverManager`]'s hardcoded 100 ms while the gNB signalled 1000 ms
+    /// (`nextgsim-gnb`'s `DEFAULT_T304_MS`) and 150 ms for DAPS — a tenfold disagreement
+    /// on a timer both ends are supposed to share, with the right value one function away.
+    ///
+    /// `parse_daps_reconfiguration` always passed it through, which is why the non-DAPS
+    /// path was the one that lost it.
+    pub t304_ms: u16,
 }
 
 /// What a `masterKeyUpdate` tells the UE to do (TS 38.331 §5.3.5.7,
@@ -161,6 +178,30 @@ impl HandoverManager {
     /// Get the source cell ID
     pub fn source_cell_id(&self) -> Option<i32> {
         self.source_cell_id
+    }
+
+    /// The RRC transaction identifier of the handover in progress.
+    ///
+    /// Needed because synchronisation is retried across RRC cycles now, so the tick that
+    /// finally completes the handover is not the one that received the command and has to
+    /// recover the identifier to echo in the `RRCReconfigurationComplete`. Reading it back
+    /// from the stored command keeps one copy: a `transaction_id` cached beside the
+    /// handover in the task could disagree with the command's.
+    pub fn transaction_id(&self) -> Option<u8> {
+        self.command.as_ref().map(|c| c.transaction_id)
+    }
+
+    /// Record the target's local cell index once the UE has acquired the cell.
+    ///
+    /// The command names the target by `physCellId` only, and the index is resolved against
+    /// the cells the UE can hear — which changes over time, so the value stored when the
+    /// command arrived can be `None` while a later attempt succeeds. [`Self::complete`]
+    /// returns the STORED index, so an attempt that resolves the PCI has to write it back
+    /// or the handover completes with no cell to move to.
+    pub fn resolve_target_cell(&mut self, cell_id: i32) {
+        if let Some(command) = self.command.as_mut() {
+            command.target_cell.cell_id = Some(cell_id);
+        }
     }
 
     /// Start handover procedure
@@ -269,6 +310,27 @@ impl HandoverManager {
         self.t304_duration = duration;
     }
 
+    /// The T304 duration currently in force.
+    ///
+    /// Exists so a test can assert the SIGNALLED value reached the timer. Without it the
+    /// only way to check would be to wait out the timer, which would pass identically for
+    /// the hardcoded default and tell nothing about where the value came from.
+    pub fn t304_duration(&self) -> Duration {
+        self.t304_duration
+    }
+
+    /// Backdate T304 so the next [`Self::check_t304_expired`] finds it expired.
+    ///
+    /// Test-only, and the same shape as `ResumeProcedure::expire_t319_for_test`: a test
+    /// that slept out a real 1000 ms guard would be slow AND would still not be able to
+    /// say which timer fired.
+    #[cfg(test)]
+    pub(crate) fn expire_t304_for_test(&mut self) {
+        if let Some(start) = self.t304_start {
+            self.t304_start = Some(start - self.t304_duration - Duration::from_millis(1));
+        }
+    }
+
     /// How long the last completed handover took, or `None` if none has
     /// completed since the manager was created.
     pub fn last_handover_duration(&self) -> Option<Duration> {
@@ -325,6 +387,9 @@ pub fn parse_handover_command(pdu: &[u8]) -> Option<HandoverCommand> {
         }),
         full_config: decoded.full_config,
         transaction_id: decoded.rrc_transaction_id,
+        // Was dropped here. `decode_handover_command` has always produced it — see the
+        // field's own doc for what running on the wrong T304 cost.
+        t304_ms: decoded.t304_ms,
     })
 }
 
@@ -362,6 +427,7 @@ mod tests {
             key_update: None,
             full_config: false,
             transaction_id: 1,
+            t304_ms: 1000,
         };
 
         manager.start_handover(1, command);
