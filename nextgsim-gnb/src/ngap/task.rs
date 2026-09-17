@@ -781,7 +781,9 @@ impl NgapTask {
             cause,
         };
         match encode_nas_non_delivery_indication(&params) {
-            Ok(bytes) => self.send_ngap_ue_associated(amf_id, stream, bytes).await,
+            Ok(bytes) => {
+                let _ = self.send_ngap_ue_associated(amf_id, stream, bytes).await;
+            }
             Err(e) => error!("Failed to encode NAS Non Delivery Indication: {}", e),
         }
     }
@@ -1031,7 +1033,9 @@ impl NgapTask {
                 ),
             };
             match encode_initial_context_setup_failure(&fail_params) {
-                Ok(bytes) => self.send_ngap_ue_associated(amf_id, stream, bytes).await,
+                Ok(bytes) => {
+                    let _ = self.send_ngap_ue_associated(amf_id, stream, bytes).await;
+                }
                 Err(e) => error!("Failed to encode InitialContextSetupFailure: {}", e),
             }
             return;
@@ -1196,7 +1200,9 @@ impl NgapTask {
         cause: UeContextModificationFailureCause,
     ) {
         match encode_ue_context_modification_failure(amf_ue_ngap_id, ran_ue_ngap_id, &cause) {
-            Ok(bytes) => self.send_ngap_ue_associated(amf_id, stream, bytes).await,
+            Ok(bytes) => {
+                let _ = self.send_ngap_ue_associated(amf_id, stream, bytes).await;
+            }
             Err(e) => error!("Failed to encode UE Context Modification Failure: {e}"),
         }
     }
@@ -3517,13 +3523,27 @@ impl NgapTask {
             target_to_source_transparent_container: target_to_source_container,
         }) {
             Ok(data) => {
-                self.send_ngap_ue_associated(client_id, stream, data).await;
+                let delivered = self.send_ngap_ue_associated(client_id, stream, data).await;
+                if !delivered {
+                    // #169: the acknowledge ENCODED but never reached the SCTP task, so the
+                    // AMF has not been told this target admitted anything. Arming here would
+                    // have the target report a HANDOVER NOTIFY for a handover the AMF has no
+                    // record of -- exactly the hazard the arming was placed after the
+                    // acknowledge to avoid. The guard used to cover only the encode, and
+                    // `send_ngap_ue_associated` swallowed its own send error, so this branch
+                    // was indistinguishable from success.
+                    error!(
+                        "Handover Request Acknowledge for UE[{ue_id}] could not be delivered \
+                         to the AMF: NOT arming arrival detection (TS 38.413 §8.4.3)"
+                    );
+                    return;
+                }
                 info!(
                     "Sent Handover Request Acknowledge: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
                     ho_req.amf_ue_ngap_id, ran_ue_ngap_id
                 );
-                // Arm the arrival detection (TS 38.413 §8.4.3, issue #156). Sent only
-                // after the acknowledge succeeds: an admission the AMF was never told
+                // Arm the arrival detection (TS 38.413 §8.4.3, issue #156). Only once the
+                // acknowledge is encoded AND away: an admission the AMF was never told
                 // about must not have the target report an arrival for it.
                 if let Err(e) = self
                     .task_base
@@ -4321,8 +4341,13 @@ impl NgapTask {
         }
     }
 
-    /// Sends an NGAP PDU for UE-associated signaling (stream > 0)
-    async fn send_ngap_ue_associated(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
+    /// Sends an NGAP PDU for UE-associated signaling (stream > 0).
+    ///
+    /// Returns whether the PDU reached the SCTP task. Most callers have nothing to do
+    /// differently either way and ignore it — but a caller that goes on to act as though
+    /// the AMF has been told something does need to know, and used to have no way to ask
+    /// (issue #169).
+    async fn send_ngap_ue_associated(&self, amf_id: i32, stream: u16, data: Vec<u8>) -> bool {
         debug!(
             "Sending UE-associated NGAP PDU: amf_id={}, stream={}, len={}",
             amf_id,
@@ -4337,7 +4362,9 @@ impl NgapTask {
 
         if let Err(e) = self.task_base.sctp_tx.send(msg).await {
             error!("Failed to send NGAP PDU to SCTP: {}", e);
+            return false;
         }
+        true
     }
 
     /// Sends AN release to RRC
@@ -6319,6 +6346,116 @@ mod tests {
             created,
             vec![5, 6],
             "a handover-in must allocate a data plane, or the UE arrives with none"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #169: the handover-arrival arming, over the channel
+    // ------------------------------------------------------------------
+
+    /// The `ue_id` of the UE a handover-in created, found by the AMF id the request carried.
+    ///
+    /// Not the pre-existing fixture UE: `handle_handover_request` allocates ids from 1000 up.
+    fn handover_ue_id(task: &NgapTask) -> i32 {
+        task.ue_contexts
+            .values()
+            .find(|ctx| ctx.amf_ue_ngap_id == Some(7777) && ctx.ue_id >= 1000)
+            .map(|ctx| ctx.ue_id)
+            .expect("the handover-in must have created a UE context")
+    }
+
+    /// Every `ExpectHandoverArrival` on the RRC channel.
+    fn armed_arrivals(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RrcMessage>>,
+    ) -> Vec<i32> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let TaskMessage::Message(RrcMessage::ExpectHandoverArrival { ue_id }) = msg {
+                out.push(ue_id);
+            }
+        }
+        out
+    }
+
+    /// #169: the arming reaches the RRC task **over the channel**, for the right UE.
+    ///
+    /// #156 gave the target an arrival report and every test of it drove the RRC half by
+    /// calling the handler. Nothing asserted the NGAP task sends anything at all, so
+    /// deleting the send left the suite green — the same class as #151's R12/R13 and #158's
+    /// R4, both recorded in LEARNINGS: the helper is tested and the wiring is not.
+    #[tokio::test]
+    async fn the_target_arms_arrival_detection_over_the_channel() {
+        use nextgsim_ngap::procedures::handover::parse_handover_request_acknowledge;
+
+        let (mut task, mut rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(1);
+        let pdu = handover_request(&[5], None);
+        let ho_req =
+            nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).expect("parse");
+
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        // POSITIVE CONTROL: the acknowledge really went out. Without it, "arrival was
+        // armed" says nothing about the order it was armed in.
+        let sent = drain_sctp(&mut sctp_rx);
+        assert!(
+            sent.iter()
+                .any(|bytes| nextgsim_ngap::codec::decode_ngap_pdu(bytes)
+                    .ok()
+                    .and_then(|pdu| parse_handover_request_acknowledge(&pdu).ok())
+                    .is_some()),
+            "precondition: the Handover Request Acknowledge must have been sent"
+        );
+
+        assert_eq!(
+            armed_arrivals(&mut rrc_rx),
+            vec![handover_ue_id(&task)],
+            "the NGAP task must arm arrival detection for the handover UE on the RRC \
+             channel; nothing asserted this send existed before #169"
+        );
+    }
+
+    /// #169: an acknowledge that could not be DELIVERED arms nothing.
+    ///
+    /// This is the half that was broken rather than merely untested. The comment at the
+    /// arming site says "an admission the AMF was never told about must not have the target
+    /// report an arrival for it", but the guard covered only the ENCODE, and
+    /// `send_ngap_ue_associated` swallowed its own send error — so a target whose
+    /// acknowledge never left still armed, and would later report a HANDOVER NOTIFY for a
+    /// handover the AMF has no record of.
+    ///
+    /// The SCTP receiver is dropped to make the send fail, which is the only way this
+    /// branch is reachable from outside: `build_handover_request_acknowledge` cannot fail
+    /// (it returns `Ok` unconditionally) and both transparent containers are unconstrained
+    /// OCTET STRINGs, so the `Err(e)` encode arm cannot be provoked through the handler.
+    /// That is stated here rather than asserted around, because a test that claimed to
+    /// cover the encode arm would be claiming something untrue.
+    #[tokio::test]
+    async fn an_acknowledge_that_could_not_be_delivered_arms_nothing() {
+        let (mut task, mut rrc_rx, _gtp_rx, sctp_rx) = task_with_sctp(1);
+        // The SCTP task is gone: `sctp_tx.send` now fails, so the AMF is never told.
+        drop(sctp_rx);
+
+        let pdu = handover_request(&[5], None);
+        let ho_req =
+            nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).expect("parse");
+
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        // POSITIVE CONTROL first: the handler really ran the admission, so an empty RRC
+        // channel means "deliberately not armed" and not "never got there". LEARNINGS: a
+        // negative assertion is satisfied by every path that never arrives.
+        let ue_id = handover_ue_id(&task);
+        assert!(
+            task.ue_contexts
+                .get(&ue_id)
+                .is_some_and(|ctx| ctx.amf_ue_ngap_id == Some(7777)),
+            "precondition: the handover-in must have been processed as far as the acknowledge"
+        );
+
+        assert!(
+            armed_arrivals(&mut rrc_rx).is_empty(),
+            "an acknowledge the AMF never received must not arm arrival detection: the \
+             target would report a HANDOVER NOTIFY for a handover nobody asked it to admit"
         );
     }
 
