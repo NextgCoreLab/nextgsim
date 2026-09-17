@@ -279,6 +279,15 @@ pub struct RrcTask {
     uac_barring: UacBarringConfig,
     /// RRC re-establishment procedure state
     reestablishment_proc: ReestablishmentProcedure,
+    /// The SFN the paging-occasion check reads, pinned for a test (issue #171).
+    ///
+    /// A radio frame is 10 ms. A test that chooses an identity for the CURRENT frame and
+    /// then delivers a PCCH message has to finish inside that frame, entered at a random
+    /// offset into it, or the identity no longer matches — and the failure looks exactly
+    /// like the AS dropping a page it should have reported. Pinning removes the clock from
+    /// the decision instead of narrowing the window.
+    #[cfg(test)]
+    pinned_sfn: Option<u16>,
     /// RRC resume procedure state
     resume_proc: ResumeProcedure,
     /// What the UE remembers while suspended to RRC_INACTIVE (issue #38).
@@ -482,6 +491,8 @@ impl RrcTask {
             ntn_timing: None,
             uac_barring: UacBarringConfig::default(),
             reestablishment_proc: ReestablishmentProcedure::new(),
+            #[cfg(test)]
+            pinned_sfn: None,
             resume_proc: ResumeProcedure::new(),
             inactive: None,
             suspended_in_cell_identity: None,
@@ -1452,7 +1463,26 @@ impl RrcTask {
 
     /// Whether the current frame is within this UE's paging occasion.
     fn is_own_paging_occasion(&self) -> bool {
-        self.is_own_paging_occasion_at(frame_clock::current_sfn())
+        self.is_own_paging_occasion_at(self.current_sfn())
+    }
+
+    /// The current system frame number.
+    ///
+    /// One place, so a test can pin it (issue #171). In production this is always the live
+    /// clock; the override exists only under `cfg(test)` and defaults to `None`, so the
+    /// production path is byte-identical to reading `frame_clock::current_sfn()` directly.
+    fn current_sfn(&self) -> u16 {
+        #[cfg(test)]
+        if let Some(sfn) = self.pinned_sfn {
+            return sfn;
+        }
+        frame_clock::current_sfn()
+    }
+
+    /// Pins the SFN [`Self::is_own_paging_occasion`] reads.
+    #[cfg(test)]
+    fn pin_sfn_for_test(&mut self, sfn: u16) {
+        self.pinned_sfn = Some(sfn);
     }
 
     /// Whether `sfn` is within this UE's paging occasion.
@@ -4146,12 +4176,14 @@ mod tests {
                 .await;
             while rls_rx.try_recv().is_ok() {}
 
-            // The paging identity is chosen HERE, immediately before the page is
-            // delivered, rather than at the top of the test: it must page in the *current*
-            // SFN, and the RRC setup and suspension above take long enough that the frame
-            // can advance in between. Chosen late rather than by disabling the occasion
-            // check, so the check still passes for the reason production's does.
-            let s_tmsi = s_tmsi_paged_in_the_current_frame(&config);
+            // The SFN is PINNED rather than raced (issue #171). This used to choose the
+            // identity as late as possible, immediately before delivering the page, because
+            // it had to match the *current* frame and the setup above could outlast one —
+            // a 10 ms window entered at a random offset. Pinning removes the clock from the
+            // decision, so the occasion check still passes for the reason production's does
+            // and no longer depends on how fast the machine is.
+            task.pin_sfn_for_test(PINNED_SFN);
+            let s_tmsi = s_tmsi_paged_in_the_pinned_frame(&config);
             task.set_paging_identity(Some(s_tmsi));
             task.handle_downlink_rrc(1, RrcChannel::Pcch, pcch_paging(&[s_tmsi]))
                 .await;
@@ -6314,10 +6346,17 @@ mod tests {
     /// Chosen by searching identities rather than by controlling the clock: `UE_ID`
     /// determines the frame, so this is deterministic against whatever the clock
     /// reads.
-    fn s_tmsi_paged_in_the_current_frame(config: &UeConfig) -> [u8; 6] {
+    /// An identity paged in frame `sfn`, with `sfn` chosen by the caller.
+    ///
+    /// `sfn` is a parameter rather than read from the clock (issue #171). With the default
+    /// spreading (N = T) `paging_occasion` maps each identity to exactly ONE frame per
+    /// cycle, so an identity chosen for frame X stops matching at X+1 — a 10 ms window. A
+    /// fixture that read the clock itself forced every caller to finish inside that window,
+    /// from a random offset into it, and a caller that did not looked exactly like the AS
+    /// dropping a page it should have reported.
+    fn s_tmsi_paged_in_frame(config: &UeConfig, sfn: u16) -> [u8; 6] {
         let cycle = PagingCycleConfig::with_default_spreading(config.paging_default_cycle_frames)
             .expect("the configured paging cycle must be valid");
-        let now = frame_clock::current_sfn();
         for candidate in 0u32..=0xFFFF {
             let s_tmsi = [
                 0x55,
@@ -6328,11 +6367,19 @@ mod tests {
                 (candidate & 0xFF) as u8,
             ];
             let occasion = paging_occasion(ue_id_from_s_tmsi(&s_tmsi), &cycle);
-            if occasion.is_paging_frame(now) {
+            if occasion.is_paging_frame(sfn) {
                 return s_tmsi;
             }
         }
-        panic!("no identity pages in frame {now}, which cannot happen for N = T");
+        panic!("no identity pages in frame {sfn}, which cannot happen for N = T");
+    }
+
+    /// The frame these tests pin. Any legal SFN works; a fixed one keeps them reproducible.
+    const PINNED_SFN: u16 = 137;
+
+    /// An identity paged in [`PINNED_SFN`], for a task that has pinned the same frame.
+    fn s_tmsi_paged_in_the_pinned_frame(config: &UeConfig) -> [u8; 6] {
+        s_tmsi_paged_in_frame(config, PINNED_SFN)
     }
 
     /// Another subscriber's 5G-S-TMSI: same AMF (identical first two octets),
@@ -6365,9 +6412,10 @@ mod tests {
     #[test]
     fn a_paging_record_matching_the_ues_own_5g_s_tmsi_reaches_nas() {
         let config = test_config();
-        let own = s_tmsi_paged_in_the_current_frame(&config);
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
+        task.pin_sfn_for_test(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
         run_async(async {
@@ -6402,14 +6450,70 @@ mod tests {
         );
     }
 
+    /// **#171**: a record for the UE's own identity delivered OUTSIDE its paging occasion is
+    /// not reported.
+    ///
+    /// This behaviour was correct and completely untested end to end, which is why the frame
+    /// race read as a product defect: when the clock advanced past the identity's frame the
+    /// record was dropped — correctly — and the test that expected it reported a failure.
+    ///
+    /// Now it is asserted deliberately, from both sides of the boundary in one test, so
+    /// neither half can pass by the whole path being broken.
+    #[test]
+    fn a_record_delivered_outside_the_ues_paging_occasion_is_not_reported() {
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+
+        // A frame the identity's occasion does not cover. Found by search rather than
+        // assumed to be PINNED_SFN + 1: `is_own_paging_occasion_at` allows a tolerance
+        // window, so the next frame may still be inside it.
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
+            UeTaskBase::new(config.clone(), 16);
+        let mut probe = RrcTask::new(task_base);
+        probe.set_paging_identity(Some(own));
+        let outside = (0u16..1024)
+            .find(|sfn| !probe.is_own_paging_occasion_at(*sfn))
+            .expect("some frame must be outside a single identity's occasion");
+
+        // NEGATIVE: outside the occasion, the record is dropped.
+        probe.pin_sfn_for_test(outside);
+        run_async(async {
+            probe
+                .handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "a UE must not act on a page delivered outside its own occasion (TS 38.304 §7.1); \
+             SFN {outside} is not in the occasion of an identity paged in {PINNED_SFN}"
+        );
+
+        // POSITIVE CONTROL: the same identity and the same record, in the right frame. Without
+        // it the assertion above would pass for a UE that reports nothing at all.
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        task.pin_sfn_for_test(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![own]),
+            "and inside the occasion the very same record IS reported"
+        );
+    }
+
     /// Only the matching record of a multi-UE paging message is reported: the
     /// AS filters, so NAS never sees another subscriber's identity.
     #[test]
     fn only_the_matching_record_of_a_multi_ue_paging_message_is_reported() {
         let config = test_config();
-        let own = s_tmsi_paged_in_the_current_frame(&config);
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
+        task.pin_sfn_for_test(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
         run_async(async {
@@ -6447,20 +6551,21 @@ mod tests {
     #[test]
     fn the_occasion_check_admits_the_ues_own_frame_and_rejects_a_foreign_one() {
         let config = test_config();
-        let own = s_tmsi_paged_in_the_current_frame(&config);
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config.clone(), 16);
         let mut task = RrcTask::new(task_base);
+        task.pin_sfn_for_test(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
         assert!(
             task.is_own_paging_occasion(),
-            "an identity chosen for the current frame must be in its occasion"
+            "an identity chosen for the pinned frame must be in its occasion"
         );
 
         // An identity whose paging frame is several frames away must not be.
         let cycle = PagingCycleConfig::with_default_spreading(config.paging_default_cycle_frames)
             .expect("valid cycle");
-        let now = frame_clock::current_sfn();
+        let now = PINNED_SFN;
         let foreign = (0u32..=0xFFFF)
             .map(|candidate| {
                 [
