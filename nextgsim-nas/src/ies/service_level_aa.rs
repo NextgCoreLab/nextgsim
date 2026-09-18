@@ -170,22 +170,50 @@ impl ServiceLevelAaPayloadType {
 /// (TS 24.501 §9.11.2.14): the SLAR (bits 2-1) and the C2AR (bits 4-3) share
 /// this shape.
 ///
-/// ## Bit order, and why it is written down
+/// ## Bit order: SETTLED (#126), and how — because it used to be a judgement call
 ///
-/// The tables for SLAR and C2AR are the **only** two in TS 24.501 §9-§10 that
-/// print their bit columns low-bit-first ("1 | 2" and "3 | 4"); the other 45-odd
-/// multi-bit tables in the same document print MSB-first ("2 | 1", "4 | 3",
-/// "6 | 5"). Read literally, "0 1 → successful" would mean bit 1 clear and
-/// bit 2 set, i.e. field value `0b10`. Read by the document's dominant
-/// convention it means field value `0b01`.
+/// The tables for SLAR and C2AR are the **only** two in TS 24.501 §9-§10 that print
+/// their bit columns low-bit-first (`1 | 2` and `3 | 4`); the other 45-odd multi-bit
+/// tables print MSB-first (`2 | 1`, `4 | 3`, `6 | 5`). Read literally, "0 1 →
+/// successful" would mean bit 1 clear and bit 2 set, i.e. field value `0b10`. Read by
+/// the document's dominant convention it means `0b01`. The two are mutually exclusive:
+/// each reading's "success" is the other's "revoked".
 ///
-/// This codec takes the **MSB-first** reading — `Success` is `0b01`,
-/// `NotSuccessfulOrRevoked` is `0b10` — because a two-bit result field written
-/// `00/01/10/11` is a binary number everywhere else in the spec, and because
-/// treating two adjacent tables as an ordering erratum is a smaller claim than
-/// treating the whole document as one. The reading is a single pair of constants
-/// here, so an interop capture that disagrees is a two-line correction rather
-/// than a rewrite. Tracked for a human ruling as a `decision` issue.
+/// This codec takes **MSB-first** — `Successful` is `0b01`, `NotSuccessfulOrRevoked`
+/// is `0b10`. #126 filed that as needing a human ruling or an interop capture. It no
+/// longer does, and the evidence is recorded here rather than in the tracker because
+/// this is where someone tempted to "fix" it will look.
+///
+/// **1. It is not a revision-specific typo.** The ordering is identical in
+/// `24501-j62` and `24501-k00`, read from the `.docx` tables rather than the text
+/// conversions. So the "a later revision corrected it" hypothesis #126 offered is
+/// dead in the other direction too: an *earlier* one has it as well.
+///
+/// **2. The prose phrasing carries no information.** "(octet 3, bits 1 and 2)" looks
+/// like it endorses ascending order, but ascending prose is this document's norm: of
+/// 17 such phrases, 15 are ascending (`bits 1 to 4`, `bits 6 to 8`, …). Tables whose
+/// prose reads ascending still print their value columns MSB-first. So the prose is
+/// not a second witness for the literal reading — it is just how the spec writes
+/// ranges.
+///
+/// **3. The convention is confirmed against values known independently of this
+/// spec.** Two tables with the same ascending prose print MSB-first columns *and*
+/// have externally-known field values:
+///
+/// | table | prose | columns | row | means | known value |
+/// |---|---|---|---|---|---|
+/// | 5GS registration type | `bits 1 to 3` | `3 \| 2 \| 1` | `0 0 1` | initial registration | **1** |
+/// | 5GS registration result | `bits 1 to 3` | `3 \| 2 \| 1` | `0 0 1` | 3GPP access | **1** |
+///
+/// Both come out correct **only** when the bit row is read as a binary number
+/// MSB-first. That makes the convention a verified fact about the document rather
+/// than an inference from counting tables, which is what #126 was missing.
+///
+/// So the SLAR/C2AR `1 | 2` header row is an erratum in two adjacent tables, and the
+/// intended encoding is the one every other table uses. The reading is still a single
+/// pair of constants, so an interop capture that somehow disagrees remains a two-line
+/// correction — but it would now be contradicting a verified convention, not breaking
+/// a tie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ServiceLevelAaResult {
     /// No information (`0b00`).
@@ -609,6 +637,68 @@ mod tests {
         assert_eq!(c2ar_only.encode_value(), 0b0000_0100);
         // Spare bits 5-8 on receipt are ignored rather than read as a result.
         assert_eq!(ServiceLevelAaResponse::decode_value(0b1111_0001), slar_only);
+    }
+
+    /// #126, settled: the two-bit result fields are read MSB-first, and the two
+    /// readings are pinned APART so neither can be silently swapped for the other.
+    ///
+    /// What this adds over `response_bits_place_slar_and_c2ar_in_their_own_fields` above:
+    /// **not** swap detection. That was the expectation, and a revert round disproved
+    /// it — swapping the two readings fails that test too, because it encodes a
+    /// `Successful` SLAR and asserts the octet. Recorded because the opposite is easy to
+    /// assume.
+    ///
+    /// What it does add is the link from a **wire value** to the authorization decision:
+    /// `from_bits(0b10)` must not authorize. `only_an_explicit_success_authorizes` below
+    /// asserts that on the *enum variant*, which holds however the variants are encoded;
+    /// this asserts it on the two bits that actually arrive. Those are different claims,
+    /// and the one that matters for a UAV is this one.
+    ///
+    /// Why MSB-first is not a guess: two TS 24.501 tables with the same ascending prose
+    /// ("bits 1 to 3") print MSB-first columns AND have values known independently of
+    /// the document — 5GS registration type `0 0 1` = initial registration = **1**, and
+    /// 5GS registration result `0 0 1` = 3GPP access = **1**. Both are correct only when
+    /// the row is read as a binary number MSB-first, which makes the convention a
+    /// verified fact rather than a majority vote over table formatting. See the
+    /// `ServiceLevelAaResult` doc for the full argument.
+    ///
+    /// The consequence of getting it wrong is asymmetric and that is why this guard
+    /// exists: a revocation decoded as a success fails **open** for a UAV.
+    #[test]
+    fn the_result_bit_order_is_msb_first_and_success_is_not_revocation() {
+        assert_eq!(
+            ServiceLevelAaResult::Successful.bits(),
+            0b01,
+            "MSB-first: '0 1 -> successful' is the binary number 1, as in every other \
+             multi-bit table in TS 24.501 (#126)"
+        );
+        assert_eq!(
+            ServiceLevelAaResult::NotSuccessfulOrRevoked.bits(),
+            0b10,
+            "and 'not successful or revoked' is 2 — the LITERAL reading of the \
+             low-bit-first header row would swap these two, which is why they are \
+             asserted against their values rather than only against each other"
+        );
+
+        // The decode direction, because a codec can be right one way and wrong the other.
+        assert_eq!(
+            ServiceLevelAaResult::from_bits(0b01),
+            ServiceLevelAaResult::Successful
+        );
+        assert_eq!(
+            ServiceLevelAaResult::from_bits(0b10),
+            ServiceLevelAaResult::NotSuccessfulOrRevoked
+        );
+
+        // The failure that matters: a revocation must never decode as authorizing.
+        assert!(
+            !ServiceLevelAaResult::from_bits(0b10).is_authorized(),
+            "0b10 is a revocation; decoding it as authorized would fail OPEN for a UAV"
+        );
+        assert!(
+            ServiceLevelAaResult::from_bits(0b01).is_authorized(),
+            "0b01 is the success the network actually sent"
+        );
     }
 
     #[test]
