@@ -2,8 +2,8 @@
 //!
 //! Implements the GTP-U task for user plane data forwarding.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -16,8 +16,11 @@ use nextgsim_gtp::path::{EchoOutcome, PathSupervisor};
 use nextgsim_gtp::restart::RestartCounter;
 use nextgsim_gtp::tunnel::{GtpTunnel, PduSession, TunnelError, TunnelManager, GTP_U_PORT};
 
+use nextgsim_ngap::procedures::pdu_session_resource_notify::NotifyCause;
+
 use crate::tasks::{
-    GnbTaskBase, GtpMessage, GtpUeContextUpdate, PduSessionResource, RlsMessage, Task, TaskMessage,
+    GnbTaskBase, GtpMessage, GtpUeContextUpdate, NgapMessage, PduSessionResource, RlsMessage, Task,
+    TaskMessage,
 };
 
 /// GTP-U UE context
@@ -497,10 +500,10 @@ impl GtpTask {
                 self.handle_echo_request(&header, _source).await;
             }
             GtpMessageType::EchoResponse => {
-                self.handle_echo_response(&header, _source);
+                self.handle_echo_response(&header, _source).await;
             }
             GtpMessageType::ErrorIndication => {
-                self.handle_error_indication(&header, _source);
+                self.handle_error_indication(&header, _source).await;
             }
             other => {
                 warn!("Unhandled GTP-U message type: {:?}", other);
@@ -577,7 +580,7 @@ impl GtpTask {
     ///
     /// The peer could not match a G-PDU **this node sent**, so the tunnel is gone at
     /// the far end and keeping it here only black-holes traffic. Release it.
-    fn handle_error_indication(&mut self, header: &GtpHeader, source: SocketAddr) {
+    async fn handle_error_indication(&mut self, header: &GtpHeader, source: SocketAddr) {
         let Some(teid) = header.error_indication_teid() else {
             warn!(
                 "Error Indication from {source} carries no Tunnel Endpoint Identifier \
@@ -601,10 +604,20 @@ impl GtpTask {
         };
         let (ue_id, psi) = (session.ue_id, session.psi);
         match self.tunnel_manager.delete_session(ue_id, psi) {
-            Ok(_) => info!(
-                "Released PDU session ue_id={ue_id} psi={psi} on an Error Indication for \
-                 uplink TEID {teid:#x} from {peer} (TS 29.281 §4.4.2.4)"
-            ),
+            Ok(_) => {
+                info!(
+                    "Released PDU session ue_id={ue_id} psi={psi} on an Error Indication for \
+                     uplink TEID {teid:#x} from {peer} (TS 29.281 §4.4.2.4)"
+                );
+                // Report it northbound as well (#91). Releasing locally and saying
+                // nothing leaves the AMF and SMF holding a session the RAN has dropped,
+                // which is the same one-sided state this release exists to end -- just in
+                // the other direction. Added here rather than left for the restart path
+                // alone, because a module where one purge reports and its neighbour does
+                // not is worse than either behaviour on its own.
+                self.report_released_sessions(vec![(ue_id, psi)], "an Error Indication")
+                    .await;
+            }
             Err(e) => error!("Failed to release ue_id={ue_id} psi={psi}: {e}"),
         }
     }
@@ -613,7 +626,7 @@ impl GtpTask {
     ///
     /// Required by path supervision, not optional bookkeeping -- without it every
     /// answered Echo Request stays outstanding and a live path is counted as missing.
-    fn handle_echo_response(&mut self, response: &GtpHeader, source: SocketAddr) {
+    async fn handle_echo_response(&mut self, response: &GtpHeader, source: SocketAddr) {
         match self
             .path_supervisor
             .note_echo_response(source, response.recovery_restart_counter())
@@ -625,14 +638,107 @@ impl GtpTask {
                 info!("GTP-U path to {source} recovered");
             }
             EchoOutcome::PeerRestarted { previous, current } => {
-                // Detected and reported, deliberately NOT acted on here. Purging this
-                // peer's tunnels is the peer-restart half of TS 23.007 §20, and it
-                // belongs with the UPF-side handling tracked in nextgcore#61 rather
-                // than being invented on one side. Recording the new counter means the
-                // next response does not report the same restart again.
                 warn!(
                     "GTP-U peer {source} restarted: Recovery counter {previous:?} -> \
-                     {current}. Tunnels toward it may be stale (TS 23.007)"
+                     {current}; purging this gNB's tunnels toward it (TS 23.007 §20)"
+                );
+                // TS 23.007 §20: the peer of a restarted node purges the contexts it held
+                // for it. A restarted UPF has lost its side of every tunnel, so uplink
+                // G-PDUs into them are answered with an Error Indication at best and
+                // dropped silently at worst -- #43 made the inbound Error Indication
+                // converge the state one tunnel at a time, and only if the UPF bothers to
+                // answer. This is the same convergence in one step.
+                //
+                // Scoped to the restarted peer by uplink tunnel address: a gNB with
+                // sessions on two UPFs must not lose the healthy one's.
+                self.purge_peer_tunnels(source.ip(), "a peer restart").await;
+            }
+        }
+    }
+
+    /// Release every PDU session whose uplink tunnel points at `peer`, and report them
+    /// (TS 23.007 §20).
+    ///
+    /// The session list is collected before anything is deleted: `delete_session` needs
+    /// `&mut self` and the iterator from `all_sessions` borrows it immutably.
+    async fn purge_peer_tunnels(&mut self, peer: IpAddr, reason: &str) {
+        let doomed: Vec<(u32, u8)> = self
+            .tunnel_manager
+            .all_sessions()
+            .filter(|session| session.uplink_tunnel.address.ip() == peer)
+            .map(|session| (session.ue_id, session.psi))
+            .collect();
+
+        if doomed.is_empty() {
+            info!(
+                "GTP-U peer {peer}: {reason}, and this gNB holds no tunnels toward it; \
+                 nothing to purge"
+            );
+            return;
+        }
+
+        let mut released = Vec::with_capacity(doomed.len());
+        for (ue_id, psi) in doomed {
+            match self.tunnel_manager.delete_session(ue_id, psi) {
+                Ok(_) => released.push((ue_id, psi)),
+                // Kept going rather than returned: one session that cannot be deleted
+                // must not leave the rest of a restarted peer's tunnels in place.
+                Err(e) => error!(
+                    "Failed to purge ue_id={ue_id} psi={psi} toward {peer} after {reason}: {e}"
+                ),
+            }
+        }
+        info!(
+            "Purged {} PDU session(s) toward {peer} after {reason} (TS 23.007 §20)",
+            released.len()
+        );
+        self.report_released_sessions(released, reason).await;
+    }
+
+    /// Tell the AMF about PDU sessions this gNB has already released, so the 5GC stops
+    /// believing otherwise (TS 38.413 §8.3.5, PDU SESSION RESOURCE NOTIFY).
+    ///
+    /// This is the answer to #91's first criterion: **notify, do not release locally and
+    /// stay quiet**. The sessions exist in the 5GC too, so a purely local delete leaves
+    /// the AMF and SMF holding them -- the mirror image of the stale state being cleaned
+    /// up. `PDU SESSION RESOURCE NOTIFY` is the NG-RAN-initiated procedure for exactly
+    /// this, and unlike `UE CONTEXT RELEASE REQUEST` it has per-session granularity, so a
+    /// UE with a second session on a healthy UPF keeps it.
+    ///
+    /// `TransportResourceUnavailable` (TS 38.413 §9.3.1.2, `CauseTransport`) is the cause,
+    /// because that is what actually happened: the GTP-U path's state is gone. Reporting a
+    /// radio-network cause would tell the SMF the radio failed.
+    ///
+    /// Grouped per UE because the procedure is UE-associated -- one Notify per UE, however
+    /// many of its sessions were on the restarted peer. `BTreeMap` rather than `HashMap`
+    /// so the order is deterministic: a test reading two Notifies off a channel would
+    /// otherwise be asserting on hash iteration order.
+    ///
+    /// Delivery is best-effort and there is no retry: the procedure has no response
+    /// message, so an AMF that is down when this is sent never learns. That ceiling is
+    /// `send_pdu_session_resource_notify`'s and is recorded there; it is not made worse
+    /// here.
+    async fn report_released_sessions(&self, released: Vec<(u32, u8)>, reason: &str) {
+        let mut per_ue: BTreeMap<u32, Vec<(u8, NotifyCause)>> = BTreeMap::new();
+        for (ue_id, psi) in released {
+            per_ue
+                .entry(ue_id)
+                .or_default()
+                .push((psi, NotifyCause::TransportResourceUnavailable));
+        }
+
+        for (ue_id, released_sessions) in per_ue {
+            let msg = NgapMessage::PduSessionResourceNotify {
+                ue_id: ue_id as i32,
+                released_sessions,
+                // No surviving-session QoS changes to report: every session named here is
+                // gone, not degraded.
+                notified_sessions: Vec::new(),
+            };
+            if let Err(e) = self.task_base.ngap_tx.send(msg).await {
+                error!(
+                    "Could not report the sessions released for ue_id={ue_id} after \
+                     {reason} to the NGAP task: {e}"
                 );
             }
         }
@@ -834,7 +940,6 @@ mod tests {
     use super::*;
     use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
-    use std::net::IpAddr;
     use tokio::net::UdpSocket;
 
     fn test_config() -> GnbConfig {
@@ -1004,7 +1109,7 @@ mod tests {
     /// Bind a gNB socket into the task and hand back a second socket standing in for
     /// the UPF, so the assertions are about what actually leaves the process.
     async fn task_with_sockets() -> (GtpTask, UdpSocket, SocketAddr) {
-        let (task_base, _ngap_rx, _rrc_rx, _rls_rx, _gtp_rx, _sctp_rx, _app_rx) =
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(test_config(), 16);
         let mut task = GtpTask::new(task_base);
         let gnb = UdpSocket::bind("127.0.0.1:0").await.expect("bind gnb");
@@ -1031,6 +1136,76 @@ mod tests {
             ))
             .expect("create session");
         assert_eq!(task.tunnel_manager.session_count(), 1, "precondition");
+    }
+
+    /// A task whose NGAP receiver is KEPT, so a test can read the PDU Session Resource
+    /// Notify the purge sends (#91).
+    ///
+    /// `task_with_sockets` drops it, which is why the pre-#91 release paths could not be
+    /// observed northbound at all: the message went into a channel whose receiver had been
+    /// dropped, and `send` on a closed channel is an `Err` this code logs and moves past.
+    async fn task_with_ngap_channel() -> (
+        GtpTask,
+        mpsc::Receiver<TaskMessage<NgapMessage>>,
+        SocketAddr,
+    ) {
+        // `GnbTaskBase::new` returns its receivers in declaration order:
+        // app, ngap, rrc, gtp, rls, sctp.
+        let (task_base, _app_rx, ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = GtpTask::new(task_base);
+        let gnb = UdpSocket::bind("127.0.0.1:0").await.expect("bind gnb");
+        task.udp_socket = Some(Arc::new(gnb));
+        let upf = UdpSocket::bind("127.0.0.1:0").await.expect("bind upf");
+        let upf_addr = upf.local_addr().expect("upf addr");
+        // The socket itself is not needed -- these tests read the NGAP channel, not the
+        // wire -- but binding it is what makes `upf_addr` a real, unique address.
+        drop(upf);
+        (task, ngap_rx, upf_addr)
+    }
+
+    /// A session for `ue_id`/`psi` whose uplink tunnel points at `peer`.
+    ///
+    /// TEIDs are derived from the ids so two sessions never collide, which matters because
+    /// `create_session` keys on (ue_id, psi) but `find_by_uplink_teid` keys on (TEID, peer).
+    fn session_on_peer(task: &mut GtpTask, ue_id: u32, psi: u8, peer: SocketAddr) {
+        let gnb_addr = SocketAddr::new(task.task_base.config.gtp_ip, GTP_U_PORT);
+        let base = (u32::from(psi) << 8) | ue_id;
+        task.tunnel_manager
+            .create_session(PduSession::new(
+                ue_id,
+                psi,
+                GtpTunnel::new(0x1000 + base, peer),
+                GtpTunnel::new(0x2000 + base, gnb_addr),
+            ))
+            .expect("create session");
+    }
+
+    /// Drives two Echo Responses from `peer`: the first records `counter`, the second
+    /// reports the restart. One counter alone is `Alive`, never `PeerRestarted`.
+    async fn observe_restart(task: &mut GtpTask, peer: SocketAddr, before: u8, after: u8) {
+        let first = GtpHeader::echo_response(0).with_recovery(before);
+        task.handle_udp_receive(&first.encode(), peer).await;
+        let second = GtpHeader::echo_response(0).with_recovery(after);
+        task.handle_udp_receive(&second.encode(), peer).await;
+    }
+
+    /// Collects every PDU Session Resource Notify waiting on the NGAP channel.
+    fn drain_notifies(
+        rx: &mut mpsc::Receiver<TaskMessage<NgapMessage>>,
+    ) -> Vec<(i32, Vec<(u8, NotifyCause)>)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::PduSessionResourceNotify {
+                ue_id,
+                released_sessions,
+                ..
+            }) = msg
+            {
+                out.push((ue_id, released_sessions));
+            }
+        }
+        out
     }
 
     fn live_session(task: &mut GtpTask, upf_addr: SocketAddr) {
@@ -1164,6 +1339,184 @@ mod tests {
             task.tunnel_manager.session_count(),
             1,
             "the (TEID, peer) pair identifies the tunnel, not the TEID alone"
+        );
+    }
+
+    // ====================================================================
+    // #91: acting on a detected peer restart (TS 23.007 §20)
+    // ====================================================================
+
+    /// **#91**, the whole point: a detected peer restart purges that peer's tunnels AND
+    /// reports them to the AMF.
+    ///
+    /// #43 detected the restart and logged it. The reaction was missing, so the gNB kept
+    /// every PDU session pointing at a UPF that had demonstrably lost its side of them --
+    /// uplink G-PDUs into tunnels the UPF answers with an Error Indication at best and
+    /// drops silently at worst.
+    ///
+    /// Both halves are asserted because either alone is a defect. Purging without reporting
+    /// leaves the AMF and SMF holding sessions the RAN has dropped, which is the mirror
+    /// image of the stale state being cleaned up (#91's first criterion). Reporting without
+    /// purging leaves the black hole in place.
+    #[tokio::test]
+    async fn a_peer_restart_purges_that_peers_tunnels_and_reports_them() {
+        let (mut task, mut ngap_rx, upf_addr) = task_with_ngap_channel().await;
+        session_on_peer(&mut task, 1, 1, upf_addr);
+        assert_eq!(task.tunnel_manager.session_count(), 1, "precondition");
+
+        observe_restart(&mut task, upf_addr, 7, 8).await;
+
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            0,
+            "TS 23.007 §20: the peer of a restarted node purges the contexts it held for \
+             it; before #91 the restart was logged and nothing else"
+        );
+        let notifies = drain_notifies(&mut ngap_rx);
+        assert_eq!(
+            notifies,
+            vec![(1, vec![(1, NotifyCause::TransportResourceUnavailable)])],
+            "and the AMF is told, per session, with the cause that actually happened: the \
+             GTP-U transport resource is gone (TS 38.413 §9.3.1.2). A radio-network cause \
+             would tell the SMF the radio failed"
+        );
+    }
+
+    /// **#91** criterion 3: a restart of peer A leaves peer B's sessions alone.
+    ///
+    /// The purge is scoped by uplink tunnel address. A gNB with sessions on two UPFs that
+    /// dropped both on one restart would be worse than the defect: it would turn one peer's
+    /// restart into an outage for the other's traffic.
+    #[tokio::test]
+    async fn a_peer_restart_leaves_another_peers_sessions_alone() {
+        let (mut task, mut ngap_rx, restarted) = task_with_ngap_channel().await;
+        let healthy = SocketAddr::new(IpAddr::from([203, 0, 113, 9]), GTP_U_PORT);
+        session_on_peer(&mut task, 1, 1, restarted);
+        session_on_peer(&mut task, 2, 1, healthy);
+        assert_eq!(task.tunnel_manager.session_count(), 2, "precondition");
+
+        observe_restart(&mut task, restarted, 3, 4).await;
+
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            1,
+            "only the restarted peer's session may go"
+        );
+        assert!(
+            task.tunnel_manager.has_session(2, 1),
+            "and it must be the OTHER one that survives -- a purge that dropped the wrong \
+             session would leave the same count"
+        );
+        assert_eq!(
+            drain_notifies(&mut ngap_rx),
+            vec![(1, vec![(1, NotifyCause::TransportResourceUnavailable)])],
+            "and only the released session is reported: telling the AMF that a live session \
+             is gone would make the SMF tear it down"
+        );
+    }
+
+    /// **#91** criterion 4: the FIRST counter seen from a peer is not a restart.
+    ///
+    /// `EchoOutcome` already distinguishes this -- a first sighting is `Alive` -- and a
+    /// regression here would purge every session the first time supervision runs, which is
+    /// the worst possible failure mode for this feature: it would break a healthy network
+    /// the moment `gtpu_echo_period_secs` was set.
+    #[tokio::test]
+    async fn a_first_sighting_of_a_peers_counter_purges_nothing() {
+        let (mut task, mut ngap_rx, upf_addr) = task_with_ngap_channel().await;
+        session_on_peer(&mut task, 1, 1, upf_addr);
+
+        // One Echo Response, carrying a counter this gNB has never seen.
+        let first = GtpHeader::echo_response(0).with_recovery(9);
+        task.handle_udp_receive(&first.encode(), upf_addr).await;
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            1,
+            "a first counter is a baseline, not a restart"
+        );
+
+        // And the SAME counter again is not a restart either.
+        let repeat = GtpHeader::echo_response(0).with_recovery(9);
+        task.handle_udp_receive(&repeat.encode(), upf_addr).await;
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            1,
+            "an unchanged counter means the peer did not restart"
+        );
+        assert!(
+            drain_notifies(&mut ngap_rx).is_empty(),
+            "and nothing is reported to the AMF either"
+        );
+
+        // The control: a CHANGED counter does purge, so this test cannot pass by the
+        // purge never working at all.
+        let changed = GtpHeader::echo_response(0).with_recovery(10);
+        task.handle_udp_receive(&changed.encode(), upf_addr).await;
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            0,
+            "calibration: a changed counter IS a restart"
+        );
+    }
+
+    /// **#91**: every session of one UE on the restarted peer is reported in ONE Notify.
+    ///
+    /// The procedure is UE-associated, so one message carries the whole released list.
+    /// Sending one Notify per session would be conformant but wasteful, and — more to the
+    /// point — a per-session loop is where a `HashMap` iteration order becomes visible;
+    /// the grouping is a `BTreeMap` so the order is deterministic.
+    #[tokio::test]
+    async fn every_session_of_one_ue_on_the_restarted_peer_is_reported_in_one_notify() {
+        let (mut task, mut ngap_rx, upf_addr) = task_with_ngap_channel().await;
+        session_on_peer(&mut task, 1, 1, upf_addr);
+        session_on_peer(&mut task, 1, 5, upf_addr);
+        assert_eq!(task.tunnel_manager.session_count(), 2, "precondition");
+
+        observe_restart(&mut task, upf_addr, 1, 2).await;
+
+        assert_eq!(task.tunnel_manager.session_count(), 0);
+        let notifies = drain_notifies(&mut ngap_rx);
+        assert_eq!(notifies.len(), 1, "one UE, one Notify");
+        let (ue_id, mut released) = notifies.into_iter().next().expect("the Notify");
+        assert_eq!(ue_id, 1);
+        released.sort_by_key(|(psi, _)| *psi);
+        assert_eq!(
+            released,
+            vec![
+                (1, NotifyCause::TransportResourceUnavailable),
+                (5, NotifyCause::TransportResourceUnavailable),
+            ],
+            "and it names BOTH sessions: a Notify listing one of the two would leave the \
+             SMF holding the other"
+        );
+    }
+
+    /// **#91**: the Error Indication release is reported northbound too.
+    ///
+    /// #43 released the session locally and said nothing, so the AMF and SMF kept holding
+    /// it — the same one-sided state the release exists to end, in the other direction.
+    /// Folded in here rather than filed, because a module where the restart purge reports
+    /// and its neighbour does not is worse than either behaviour on its own.
+    #[tokio::test]
+    async fn an_error_indication_release_is_reported_northbound() {
+        let (mut task, mut ngap_rx, upf_addr) = task_with_ngap_channel().await;
+        session_on_peer(&mut task, 1, 1, upf_addr);
+        // `session_on_peer` derives the uplink TEID from (ue_id, psi): 0x1000 + (1<<8 | 1).
+        let uplink_teid = 0x1000 + ((1u32 << 8) | 1);
+
+        let indication = GtpHeader::error_indication(uplink_teid, upf_addr.ip());
+        task.handle_udp_receive(&indication.encode(), upf_addr)
+            .await;
+
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            0,
+            "precondition: #43's local release still happens"
+        );
+        assert_eq!(
+            drain_notifies(&mut ngap_rx),
+            vec![(1, vec![(1, NotifyCause::TransportResourceUnavailable)])],
+            "and it is now reported, so the SMF stops believing the session is up"
         );
     }
 
