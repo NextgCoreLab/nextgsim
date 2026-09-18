@@ -242,8 +242,14 @@ const RRC_CYCLE_INTERVAL_MS: u64 = 2500;
 /// Cell selection interval in milliseconds
 const CELL_SELECTION_INTERVAL_MS: u64 = 1000;
 
-/// T300: RRCSetupRequest supervision timer default (ms), TS 38.331 §5.3.3.2.
-/// SIB1 broadcasts the operative value (default 1000 ms); this is the fallback.
+/// T300: RRCSetupRequest supervision timer, the PRE-SIB1 default (ms),
+/// TS 38.331 §5.3.3.2.
+///
+/// The serving cell broadcasts the operative value in `ue-TimersAndConstants`
+/// (§7.1.1) and [`RrcTask::apply_broadcast_t300`] takes it. This constant is the
+/// fallback, and unlike the other three guards it is load-bearing in normal operation:
+/// T300 guards the RRCSetupRequest, so a UE setting up on a cell whose SIB1 it has not
+/// yet decoded has nothing else to guard with.
 const T300_DEFAULT_MS: u64 = 1000;
 
 /// UE-side NTN timing state
@@ -367,6 +373,11 @@ pub struct RrcTask {
     /// RRCSetup must arrive after an RRCSetupRequest. `Some` while establishment
     /// is in flight; cleared on RRCSetup reception or on expiry.
     t300_deadline: Option<tokio::time::Instant>,
+    /// T300 duration in force (ms): the serving cell's broadcast value once one has been
+    /// read, [`T300_DEFAULT_MS`] before that. T300 is owned by the task rather than by a
+    /// procedure module, so this field is its home; see
+    /// [`Self::apply_broadcast_t300`].
+    t300_duration_ms: u64,
     /// Cells whose system information came from a real BCCH broadcast, so the
     /// simulated fallback must not overwrite it with the UE's own assumptions.
     cells_with_broadcast_si: std::collections::HashSet<i32>,
@@ -544,6 +555,7 @@ impl RrcTask {
             srb1_config: None,
             rrc_setup_transaction_id: None,
             t300_deadline: None,
+            t300_duration_ms: T300_DEFAULT_MS,
             cells_with_broadcast_si: std::collections::HashSet::new(),
             cond_reconfig: CondReconfigStore::new(),
             cho_transaction_id: 0,
@@ -1465,19 +1477,19 @@ impl RrcTask {
             plmn.mcc, plmn.mnc, info.tracking_area_code, info.cell_identity
         );
         // `ue-TimersAndConstants` (TS 38.331 §7.1.1): the CELL decides these and SIB1
-        // carries them. Before #168 the UE read none of them -- the gNB broadcasts t310,
-        // n310 and n311 and the UE ran on its own constants, which agreed only because both
-        // sides happened to pick the same numbers.
+        // carries them. Before #168 the UE read none of them -- the gNB broadcasts all
+        // seven and the UE ran on its own constants, which agreed only because both sides
+        // happened to pick the same numbers. #168 took t310/n310/n311 and #176 the
+        // remaining four, so the whole IE is now consumed.
         //
         // Applied for the serving cell, or during acquisition when there is no serving cell
         // yet and this is the cell being selected. A neighbour's SIB1 must not reconfigure
         // the timers of the link the UE is actually on.
         //
-        // Only t310/n310/n311 are consumed, which are the three this issue owns. t300, t301,
-        // t311 and t319 are still on their hardcoded `*_DEFAULT_MS` constants -- they happen
-        // to equal what this gNB broadcasts, so nothing is currently wrong, but they are
-        // read from the wrong place. Filed rather than folded in here, because each one lives
-        // inside a different procedure and needs its own setter.
+        // Each timer goes through its OWNER's setter rather than being written into the
+        // owning struct's fields from here: T300 is the task's own guard, T301/T311 belong
+        // to the re-establishment procedure and T319 to the resume procedure, and each of
+        // those arms its deadline inside its own module.
         if self
             .serving_cell_id
             .is_none_or(|serving| serving == cell_id)
@@ -1488,9 +1500,21 @@ impl RrcTask {
                     u32::from(timers.n311),
                     u64::from(timers.t310_ms),
                 );
+                self.apply_broadcast_t300(u64::from(timers.t300_ms));
+                self.reestablishment_proc
+                    .apply_broadcast_timers(u64::from(timers.t301_ms), u64::from(timers.t311_ms));
+                self.resume_proc
+                    .apply_broadcast_t319(u64::from(timers.t319_ms));
                 debug!(
-                    "Cell {cell_id} broadcasts n310={}, n311={}, t310={} ms (TS 38.331 §7.1.1)",
-                    timers.n310, timers.n311, timers.t310_ms
+                    "Cell {cell_id} broadcasts t300={} ms, t301={} ms, t310={} ms, n310={}, \
+                     t311={} ms, n311={}, t319={} ms (TS 38.331 §7.1.1)",
+                    timers.t300_ms,
+                    timers.t301_ms,
+                    timers.t310_ms,
+                    timers.n310,
+                    timers.t311_ms,
+                    timers.n311,
+                    timers.t319_ms
                 );
             }
         }
@@ -3263,8 +3287,38 @@ impl RrcTask {
     /// RRCSetupRequest (TS 38.331 §5.3.3.2).
     fn start_t300(&mut self) {
         self.t300_deadline =
-            Some(tokio::time::Instant::now() + Duration::from_millis(T300_DEFAULT_MS));
-        debug!("T300 started ({} ms)", T300_DEFAULT_MS);
+            Some(tokio::time::Instant::now() + Duration::from_millis(self.t300_duration_ms));
+        debug!("T300 started ({} ms)", self.t300_duration_ms);
+    }
+
+    /// Applies the T300 value the serving cell broadcast in `ue-TimersAndConstants`
+    /// (TS 38.331 §7.1.1).
+    ///
+    /// T300 has no procedure module of its own -- the task arms it directly when the
+    /// RRCSetupRequest goes out -- so the setter lives here beside `start_t300` rather
+    /// than the SIB1 handler reaching into the field from across the impl.
+    fn apply_broadcast_t300(&mut self, t300_ms: u64) {
+        self.t300_duration_ms = t300_ms;
+    }
+
+    /// The T300 duration currently in force, in milliseconds.
+    ///
+    /// Exists so a test can assert the BROADCAST value reached the timer; waiting the
+    /// timer out would pass identically for the hardcoded default.
+    #[cfg(test)]
+    fn t300_duration_ms(&self) -> u64 {
+        self.t300_duration_ms
+    }
+
+    /// Time left on the armed T300, or `None` when it is not running.
+    ///
+    /// [`Self::t300_duration_ms`] alone cannot tell whether `start_t300` reads the field
+    /// or still reads [`T300_DEFAULT_MS`]: a stored value nobody arms from is exactly the
+    /// defect #176 exists to fix. This observes the DEADLINE.
+    #[cfg(test)]
+    fn t300_remaining(&self) -> Option<Duration> {
+        self.t300_deadline
+            .map(|d| d.saturating_duration_since(tokio::time::Instant::now()))
     }
 
     /// Stops T300 on reception of RRCSetup (TS 38.331 §5.3.3.4).
@@ -3723,6 +3777,15 @@ impl RrcTask {
 /// `T301_DEFAULT_MS`, `T311_DEFAULT_MS`): a tenth of the shortest guard, so an expiry
 /// is acted on within 10% of its deadline. Not shorter, because this wakes the task
 /// with nothing to do the rest of the time.
+///
+/// Since #176 those durations come from the serving cell's broadcast, and TS 38.331
+/// §7.1.1 enumerates values below the defaults -- T301 and T319 go down to 100 ms
+/// (T311's floor is 1000 ms). A cell imposing 100 ms therefore gets a guard whose
+/// expiry is acted on up to one full period late rather than within 10% of it. The
+/// timer still fires and the outcome is unchanged; only the latency is. Left as a
+/// poll rather than tracked as three deadlines for the reason above -- exposing the
+/// `Instant`s so this loop could take their minimum is what spreads one procedure's
+/// timing across two modules.
 const GUARD_TIMER_POLL_MS: u64 = 100;
 
 /// Resolves when the T300 deadline is reached; pends forever when T300 is not
@@ -3858,6 +3921,10 @@ impl Task for RrcTask {
 mod tests {
     use super::*;
     use nextgsim_common::config::UeConfig;
+    // The pre-SIB1 defaults, named in the #176 assertions so a reader can see that the
+    // fixture values are deliberately NOT them.
+    use super::super::reestablishment::{T301_DEFAULT_MS, T311_DEFAULT_MS};
+    use super::super::resume::T319_DEFAULT_MS;
 
     fn test_config() -> UeConfig {
         UeConfig::default()
@@ -7967,9 +8034,28 @@ mod tests {
     /// Built with the gNB's own encoder, so this exercises the pair both sides use rather
     /// than a hand-rolled PDU — the same reason `broadcast_si` does.
     fn sib1_with_timers(n310: u8, n311: u8, t310_ms: u16) -> Vec<u8> {
+        use nextgsim_rrc::procedures::system_information::UeTimersAndConstantsParams;
+        sib1_with_all_timers(UeTimersAndConstantsParams {
+            t300_ms: 1000,
+            t301_ms: 1000,
+            t310_ms,
+            n310,
+            t311_ms: 1000,
+            n311,
+            t319_ms: 1000,
+        })
+    }
+
+    /// A broadcast SIB1 for cell 1 imposing the whole `ue-TimersAndConstants` IE.
+    ///
+    /// The four guards #176 wired (T300, T301, T311, T319) each need a value of their own,
+    /// which `sib1_with_timers` cannot express -- it pins the other six members at the
+    /// 1000 ms default precisely so a T310 test cannot be perturbed by them.
+    fn sib1_with_all_timers(
+        timers: nextgsim_rrc::procedures::system_information::UeTimersAndConstantsParams,
+    ) -> Vec<u8> {
         use nextgsim_rrc::procedures::system_information::{
             encode_sib1, CellSelectionInfo, PlmnIdentityInfo, Sib1Params,
-            UeTimersAndConstantsParams,
         };
         let hplmn = test_config().hplmn;
         encode_sib1(&Sib1Params {
@@ -7994,15 +8080,7 @@ mod tests {
             }],
             ims_emergency_support: false,
             ecall_over_ims_support: false,
-            ue_timers_and_constants: Some(UeTimersAndConstantsParams {
-                t300_ms: 1000,
-                t301_ms: 1000,
-                t310_ms,
-                n310,
-                t311_ms: 1000,
-                n311,
-                t319_ms: 1000,
-            }),
+            ue_timers_and_constants: Some(timers),
             intra_freq_reselection_redcap: false,
         })
         .expect("the gNB's own SIB1 encoder")
@@ -8064,6 +8142,324 @@ mod tests {
                 500,
                 "the serving cell decides T310 (TS 38.331 §7.1.1); the UE used to ignore \
                  the broadcast entirely"
+            );
+        });
+    }
+
+    // ========================================================================
+    // T300, T301, T311 and T319 from the broadcast (issue #176, TS 38.331 §7.1.1)
+    // ========================================================================
+
+    /// The four guard timers #168 left on hardcoded constants, each with a value that is
+    /// **not** the 1000 ms both ends default to and not equal to any other value in play.
+    ///
+    /// Coinciding fixture values are what made this defect invisible for as long as it
+    /// lasted: both sides picked 1000 ms, so the UE ignoring the broadcast entirely looked
+    /// exactly like the UE honouring it. A fixture that repeats 1000 reproduces the
+    /// blindness rather than testing it.
+    ///
+    /// Each value is a member of that timer's own enumerated set, which differ
+    /// (`build_ue_timers_and_constants`): T300/T301/T319 take
+    /// {100,200,300,400,600,1000,1500,2000} ms while T311's floor is 1000 and its set is
+    /// {1000,3000,5000,10000,15000,20000,30000}. `t319_ms` is deliberately BELOW the
+    /// default where the other three are above it, so a timer armed from a fixed larger
+    /// number fails too.
+    fn broadcast_guard_timers(
+    ) -> nextgsim_rrc::procedures::system_information::UeTimersAndConstantsParams {
+        nextgsim_rrc::procedures::system_information::UeTimersAndConstantsParams {
+            t300_ms: 1500,
+            t301_ms: 2000,
+            t310_ms: 500,
+            n310: 3,
+            t311_ms: 5000,
+            n311: 2,
+            t319_ms: 600,
+        }
+    }
+
+    /// T300 comes from the serving cell's broadcast (TS 38.331 §7.1.1, §5.3.3.2).
+    ///
+    /// Two assertions, because the first alone is satisfied by a value nobody arms from —
+    /// which is the whole defect class #176 belongs to. The second reads the armed
+    /// DEADLINE, so a `start_t300` still using `T300_DEFAULT_MS` fails even though the
+    /// field holds 1500.
+    #[test]
+    fn the_broadcast_t300_guards_the_rrc_setup_request() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            // Camp WITHOUT requesting, so the broadcast lands before T300 is armed: T300
+            // is armed by the RRCSetupRequest, and a SIB1 read afterwards could not
+            // affect it.
+            task.handle_signal_changed(1, -60).await;
+            task.perform_cycle().await;
+            assert_eq!(
+                task.t300_duration_ms(),
+                T300_DEFAULT_MS,
+                "precondition: the task starts on the pre-SIB1 default"
+            );
+
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_all_timers(broadcast_guard_timers())),
+            )
+            .await;
+            assert_eq!(
+                task.t300_duration_ms(),
+                1500,
+                "the cell decides T300; before #176 the UE read its own constant"
+            );
+
+            task.handle_uplink_nas_delivery(
+                1,
+                OctetString::from_slice(&[0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D]),
+            )
+            .await;
+            let (ch, _) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(ch, RrcChannel::UlCcch, "precondition: the request went out");
+
+            // Bounded on BOTH sides, and the upper bound is what makes it discriminating:
+            // the deadline is `arm_instant + duration`, so `remaining` can only ever be at
+            // most the duration in force and a slow host moves it DOWN, never up. A
+            // one-sided `> default` would pass for a guard armed from the 1000 ms constant
+            // as soon as a fraction of a millisecond had elapsed.
+            let remaining = task.t300_remaining().expect("T300 is armed");
+            assert!(
+                remaining > Duration::from_millis(T300_DEFAULT_MS)
+                    && remaining <= Duration::from_millis(1500),
+                "the guard must be armed from the BROADCAST 1500 ms: {} ms left, which is \
+                 not inside (default {} ms, 1500 ms]",
+                remaining.as_millis(),
+                T300_DEFAULT_MS
+            );
+        });
+    }
+
+    /// T301 comes from the serving cell's broadcast (TS 38.331 §7.1.1, §5.3.7.6).
+    ///
+    /// T301 is armed by `on_cell_found`, one step further into re-establishment than T311,
+    /// so this drives the RLF and then the cell-found transition.
+    #[test]
+    fn the_broadcast_t301_guards_the_reestablishment_response() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            assert_eq!(
+                task.reestablishment_proc.t301_duration_ms(),
+                T301_DEFAULT_MS,
+                "precondition: the procedure starts on the pre-SIB1 default"
+            );
+
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_all_timers(broadcast_guard_timers())),
+            )
+            .await;
+            assert_eq!(
+                task.reestablishment_proc.t301_duration_ms(),
+                2000,
+                "the cell decides T301; before #176 the procedure read its own constant"
+            );
+
+            // The RLF path runs cell selection and reaches `on_cell_found`, which is where
+            // T301 is armed.
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            let remaining = task
+                .reestablishment_proc
+                .t301_remaining()
+                .expect("T301 is armed once a cell has been found");
+            assert!(
+                remaining > Duration::from_millis(T301_DEFAULT_MS)
+                    && remaining <= Duration::from_millis(2000),
+                "`on_cell_found` must arm from the BROADCAST 2000 ms: {} ms left, which is \
+                 not inside (default {} ms, 2000 ms]",
+                remaining.as_millis(),
+                T301_DEFAULT_MS
+            );
+        });
+    }
+
+    /// T311 comes from the serving cell's broadcast (TS 38.331 §7.1.1, §5.3.7.6).
+    ///
+    /// T311 is armed by `initiate` and cleared by `on_cell_found`, so it is observed on a
+    /// procedure driven through `initiate` alone rather than through the RLF path, which
+    /// finds a cell in the same call and replaces T311 with T301.
+    #[test]
+    fn the_broadcast_t311_guards_the_reestablishment_cell_search() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            assert_eq!(
+                task.reestablishment_proc.t311_duration_ms(),
+                T311_DEFAULT_MS,
+                "precondition: the procedure starts on the pre-SIB1 default"
+            );
+
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_all_timers(broadcast_guard_timers())),
+            )
+            .await;
+            assert_eq!(
+                task.reestablishment_proc.t311_duration_ms(),
+                5000,
+                "the cell decides T311; before #176 the procedure read its own constant"
+            );
+
+            task.reestablishment_proc
+                .initiate(
+                    ReestablishmentTrigger::RadioLinkFailure,
+                    0x1234,
+                    1,
+                    0xABCD,
+                    &mut task.state_machine,
+                )
+                .expect("a keyed, connected UE may re-establish");
+            let remaining = task
+                .reestablishment_proc
+                .t311_remaining()
+                .expect("T311 is armed by `initiate`");
+            assert!(
+                remaining > Duration::from_millis(T311_DEFAULT_MS)
+                    && remaining <= Duration::from_millis(5000),
+                "`initiate` must arm from the BROADCAST 5000 ms: {} ms left, which is not \
+                 inside (default {} ms, 5000 ms]",
+                remaining.as_millis(),
+                T311_DEFAULT_MS
+            );
+        });
+    }
+
+    /// T319 comes from the serving cell's broadcast (TS 38.331 §7.1.1, §5.3.13.5).
+    ///
+    /// The one fixture value BELOW the 1000 ms default (600 ms), so the deadline assertion
+    /// runs in the opposite direction from the other three: a procedure still arming from
+    /// its constant leaves MORE time than the cell allowed, which is the failure that
+    /// matters here — the UE would keep waiting after the network had given up.
+    #[test]
+    fn the_broadcast_t319_guards_the_resume_request() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            assert_eq!(
+                task.resume_proc.t319_duration_ms(),
+                T319_DEFAULT_MS,
+                "precondition: the procedure starts on the pre-SIB1 default"
+            );
+
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_all_timers(broadcast_guard_timers())),
+            )
+            .await;
+            assert_eq!(
+                task.resume_proc.t319_duration_ms(),
+                600,
+                "the cell decides T319; before #176 the procedure read its own constant"
+            );
+
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, suspending_release(Some(30), vec![1]))
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Inactive);
+            task.handle_uplink_nas_delivery(2, OctetString::from_slice(&[0x7E, 0x00, 0x4D]))
+                .await;
+            assert!(
+                task.resume_proc.is_in_progress(),
+                "precondition: a resume is in flight"
+            );
+
+            let remaining = task
+                .resume_proc
+                .t319_remaining()
+                .expect("T319 is armed by `initiate`");
+            // The UPPER bound is the whole assertion here, and getting it wrong is what a
+            // revert round caught: `remaining < T319_DEFAULT_MS` passes for a guard armed
+            // from the 1000 ms constant as soon as a fraction of a millisecond has elapsed,
+            // so the round came back green and the arming site read as covered. Bounding at
+            // the broadcast value cannot flake, because `remaining` only ever decreases.
+            assert!(
+                remaining <= Duration::from_millis(600),
+                "`initiate` must arm from the BROADCAST 600 ms: {} ms left, which is more \
+                 than the cell allowed, so the {} ms constant is still being read",
+                remaining.as_millis(),
+                T319_DEFAULT_MS
+            );
+        });
+    }
+
+    /// A guard armed from the broadcast is expired by the test helper that derives its
+    /// backdate from the value IN FORCE.
+    ///
+    /// This is the criterion behind `expire_guard_timers_for_test`, and it is the one that
+    /// can hide: with the broadcast T311 at 5000 ms, a helper subtracting `2 x
+    /// T311_DEFAULT_MS` (2000 ms) leaves the deadline **3 s in the future**, so
+    /// `check_guard_timers` finds nothing expired and the test reports success for a timer
+    /// that never fired.
+    ///
+    /// T311 is the only one of the four where this bites, and the reason is arithmetic: a
+    /// `2 x 1000 ms` backdate clears any deadline up to 2000 ms out, and T301/T319 both
+    /// enumerate 2000 ms as their MAXIMUM (`build_ue_timers_and_constants`). T311 goes to
+    /// 30000. So the other two helpers are correct by construction rather than by test.
+    #[test]
+    fn a_broadcast_t311_is_expired_by_the_helper_that_reads_the_value_in_force() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_all_timers(broadcast_guard_timers())),
+            )
+            .await;
+
+            // `initiate` alone, so T311 is the armed guard: the RLF path finds a cell in
+            // the same call and replaces T311 with T301.
+            task.reestablishment_proc
+                .initiate(
+                    ReestablishmentTrigger::RadioLinkFailure,
+                    0x1234,
+                    1,
+                    0xABCD,
+                    &mut task.state_machine,
+                )
+                .expect("a keyed, connected UE may re-establish");
+            while nas_rx.try_recv().is_ok() {}
+
+            // Negative control first: nothing may fire before the deadline.
+            task.check_guard_timers().await;
+            assert!(
+                task.reestablishment_proc.is_in_progress(),
+                "T311 must not fire before its deadline"
+            );
+
+            task.reestablishment_proc.expire_guard_timers_for_test();
+            task.check_guard_timers().await;
+
+            assert!(
+                !task.reestablishment_proc.is_in_progress(),
+                "a 5000 ms T311 must be reachable by the helper: backdating by \
+                 2 x {T311_DEFAULT_MS} ms leaves the deadline 3 s out and the expiry never \
+                 runs"
+            );
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Idle,
+                "and the expiry drops the UE to RRC_IDLE (§5.3.7.6)"
             );
         });
     }

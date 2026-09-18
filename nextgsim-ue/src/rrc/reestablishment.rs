@@ -41,10 +41,20 @@ use super::state::{RrcState, RrcStateMachine, RrcStateTransition};
 // Constants
 // ============================================================================
 
-/// T301: RRC re-establishment timer (ms). Default 1000 ms per TS 38.331.
+/// T301: RRC re-establishment timer (ms), the PRE-SIB1 default.
+///
+/// The serving cell decides the operative value and broadcasts it in
+/// `ue-TimersAndConstants` (TS 38.331 §7.1.1); see
+/// [`ReestablishmentProcedure::apply_broadcast_timers`]. This constant is what the
+/// procedure guards with until a SIB1 for the serving cell has been read -- which is a
+/// real window, because re-establishment can be triggered on a cell whose SIB1 the UE
+/// has not acquired.
 pub const T301_DEFAULT_MS: u64 = 1000;
 
-/// T311: RLF recovery timer (ms). Default 1000 ms per TS 38.331.
+/// T311: RLF recovery timer (ms), the PRE-SIB1 default.
+///
+/// Same provenance as [`T301_DEFAULT_MS`]: the cell broadcasts the operative value and
+/// this is the fallback until it has been read.
 pub const T311_DEFAULT_MS: u64 = 1000;
 
 /// N310: Out-of-sync indication count before RLF declared.
@@ -274,6 +284,11 @@ pub struct ReestablishmentProcedure {
     t311_deadline: Option<Instant>,
     /// T301 expiry instant (response deadline)
     t301_deadline: Option<Instant>,
+    /// T301 duration in force (ms): the serving cell's broadcast value once one has
+    /// been read, [`T301_DEFAULT_MS`] before that.
+    t301_duration_ms: u64,
+    /// T311 duration in force (ms), same provenance as [`Self::t301_duration_ms`].
+    t311_duration_ms: u64,
     /// Whether we received an `RRCReestablishment` (vs `RRCSetup` fallback)
     received_reestablishment: bool,
 }
@@ -295,8 +310,61 @@ impl ReestablishmentProcedure {
             short_mac_i: 0,
             t311_deadline: None,
             t301_deadline: None,
+            t301_duration_ms: T301_DEFAULT_MS,
+            t311_duration_ms: T311_DEFAULT_MS,
             received_reestablishment: false,
         }
+    }
+
+    /// Applies the T301 and T311 values the serving cell broadcast in
+    /// `ue-TimersAndConstants` (TS 38.331 §7.1.1).
+    ///
+    /// The cell decides these and SIB1 has always carried them; before #176 the UE read
+    /// its own [`T301_DEFAULT_MS`]/[`T311_DEFAULT_MS`] instead. The two agreed only
+    /// because both sides happened to pick 1000 ms, so raising `t301` at the gNB left the
+    /// UE giving up while the network still considered the procedure live -- the same
+    /// shape as #167's dropped T304.
+    ///
+    /// Deliberately NOT reset by [`Self::reset`]: these describe the CELL, not the
+    /// procedure, so they outlive any one re-establishment attempt on that cell.
+    pub fn apply_broadcast_timers(&mut self, t301_ms: u64, t311_ms: u64) {
+        self.t301_duration_ms = t301_ms;
+        self.t311_duration_ms = t311_ms;
+    }
+
+    /// The T301 duration currently in force, in milliseconds.
+    ///
+    /// Exists so a test can assert the BROADCAST value reached the timer; waiting the
+    /// timer out would pass identically for the hardcoded default and say nothing about
+    /// where the value came from. Not a product knob -- nothing in production reads it.
+    pub fn t301_duration_ms(&self) -> u64 {
+        self.t301_duration_ms
+    }
+
+    /// The T311 duration currently in force, in milliseconds. See
+    /// [`Self::t301_duration_ms`].
+    pub fn t311_duration_ms(&self) -> u64 {
+        self.t311_duration_ms
+    }
+
+    /// Time left on the armed T301, or `None` when it is not running.
+    ///
+    /// [`Self::t301_duration_ms`] alone cannot tell whether [`Self::on_cell_found`] reads
+    /// the field or still reads [`T301_DEFAULT_MS`]: a stored value nobody arms from is
+    /// exactly the defect #176 exists to fix. This observes the DEADLINE, so a broadcast
+    /// value that never reached the arming site is visible.
+    #[cfg(test)]
+    pub(crate) fn t301_remaining(&self) -> Option<Duration> {
+        self.t301_deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    /// Time left on the armed T311, or `None` when it is not running. See
+    /// [`Self::t301_remaining`].
+    #[cfg(test)]
+    pub(crate) fn t311_remaining(&self) -> Option<Duration> {
+        self.t311_deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
     }
 
     /// Returns the current procedure state.
@@ -367,7 +435,7 @@ impl ReestablishmentProcedure {
         self.ue_pci = pci;
         self.short_mac_i = short_mac_i;
         self.state = ReestablishmentState::CellSearch;
-        self.t311_deadline = Some(Instant::now() + Duration::from_millis(T311_DEFAULT_MS));
+        self.t311_deadline = Some(Instant::now() + Duration::from_millis(self.t311_duration_ms));
         self.received_reestablishment = false;
 
         Ok(ReestablishmentRequestParams {
@@ -392,7 +460,7 @@ impl ReestablishmentProcedure {
         }
 
         self.state = ReestablishmentState::WaitingForResponse;
-        self.t301_deadline = Some(Instant::now() + Duration::from_millis(T301_DEFAULT_MS));
+        self.t301_deadline = Some(Instant::now() + Duration::from_millis(self.t301_duration_ms));
         self.t311_deadline = None;
 
         tracing::debug!("Suitable cell found — sending RRCReestablishmentRequest (T301 started)");
@@ -492,20 +560,31 @@ impl ReestablishmentProcedure {
         }
     }
 
-    /// Resets the procedure to idle state.
     /// Back-dates whichever of T301/T311 is armed, so a test reaches the expiry
-    /// without waiting out its real 1000 ms. Same reasoning as
+    /// without waiting the guard out. Same reasoning as
     /// `ResumeProcedure::expire_t319_for_test`.
+    ///
+    /// The backdate comes from the duration IN FORCE, not from the `*_DEFAULT_MS`
+    /// constant. Reading the constant while the timer runs on a broadcast value is a
+    /// helper that expires the wrong timer: a cell broadcasting T311 = 5000 ms leaves a
+    /// deadline 5 s out, and subtracting 2 x 1000 ms lands 3 s in the FUTURE, so the
+    /// expiry never fires and the test reports nothing.
     #[cfg(test)]
     pub(crate) fn expire_guard_timers_for_test(&mut self) {
         if let Some(deadline) = self.t301_deadline {
-            self.t301_deadline = Some(deadline - Duration::from_millis(T301_DEFAULT_MS * 2));
+            self.t301_deadline = Some(deadline - Duration::from_millis(self.t301_duration_ms * 2));
         }
         if let Some(deadline) = self.t311_deadline {
-            self.t311_deadline = Some(deadline - Duration::from_millis(T311_DEFAULT_MS * 2));
+            self.t311_deadline = Some(deadline - Duration::from_millis(self.t311_duration_ms * 2));
         }
     }
 
+    /// Resets the procedure to idle state.
+    ///
+    /// The T301/T311 DURATIONS survive: they are the serving cell's configuration
+    /// (TS 38.331 §7.1.1), not state belonging to one attempt, and clearing them here
+    /// would silently put the UE back on its own defaults after every completed or
+    /// abandoned re-establishment.
     pub fn reset(&mut self) {
         self.state = ReestablishmentState::Idle;
         self.trigger = None;
