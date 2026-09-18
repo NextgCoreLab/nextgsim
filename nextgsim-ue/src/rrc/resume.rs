@@ -45,7 +45,12 @@ use super::state::{RrcState, RrcStateMachine, RrcStateTransition};
 // Constants
 // ============================================================================
 
-/// T319: RRC Resume timer duration in ms (default 1000 ms per TS 38.331).
+/// T319: RRC Resume supervision timer (ms), the PRE-SIB1 default.
+///
+/// The serving cell decides the operative value and broadcasts it in
+/// `ue-TimersAndConstants` (TS 38.331 §7.1.1); see
+/// [`ResumeProcedure::apply_broadcast_t319`]. This constant is what the procedure guards
+/// with until a SIB1 for the serving cell has been read.
 pub const T319_DEFAULT_MS: u64 = 1000;
 
 // ============================================================================
@@ -219,6 +224,9 @@ pub struct ResumeProcedure {
     last_request: Option<ResumeRequestParams>,
     /// T319 deadline
     t319_deadline: Option<Instant>,
+    /// T319 duration in force (ms): the serving cell's broadcast value once one has been
+    /// read, [`T319_DEFAULT_MS`] before that.
+    t319_duration_ms: u64,
 }
 
 impl Default for ResumeProcedure {
@@ -234,7 +242,41 @@ impl ResumeProcedure {
             state: ResumeProcedureState::Idle,
             last_request: None,
             t319_deadline: None,
+            t319_duration_ms: T319_DEFAULT_MS,
         }
+    }
+
+    /// Applies the T319 value the serving cell broadcast in `ue-TimersAndConstants`
+    /// (TS 38.331 §7.1.1).
+    ///
+    /// The cell decides it and SIB1 has always carried it; before #176 the UE read its
+    /// own [`T319_DEFAULT_MS`] instead, and the two agreed only because both sides
+    /// happened to pick 1000 ms.
+    ///
+    /// Deliberately NOT reset by [`Self::reset`]: this describes the CELL, not the
+    /// procedure.
+    pub fn apply_broadcast_t319(&mut self, t319_ms: u64) {
+        self.t319_duration_ms = t319_ms;
+    }
+
+    /// The T319 duration currently in force, in milliseconds.
+    ///
+    /// Exists so a test can assert the BROADCAST value reached the timer; waiting the
+    /// timer out would pass identically for the hardcoded default and say nothing about
+    /// where the value came from. Not a product knob -- nothing in production reads it.
+    pub fn t319_duration_ms(&self) -> u64 {
+        self.t319_duration_ms
+    }
+
+    /// Time left on the armed T319, or `None` when it is not running.
+    ///
+    /// [`Self::t319_duration_ms`] alone cannot tell whether [`Self::initiate`] reads the
+    /// field or still reads [`T319_DEFAULT_MS`]: a stored value nobody arms from is
+    /// exactly the defect #176 exists to fix. This observes the DEADLINE.
+    #[cfg(test)]
+    pub(crate) fn t319_remaining(&self) -> Option<Duration> {
+        self.t319_deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
     }
 
     /// Returns the current procedure state.
@@ -320,7 +362,7 @@ impl ResumeProcedure {
 
         self.last_request = Some(params.clone());
         self.state = ResumeProcedureState::WaitingForResponse;
-        self.t319_deadline = Some(Instant::now() + Duration::from_millis(T319_DEFAULT_MS));
+        self.t319_deadline = Some(Instant::now() + Duration::from_millis(self.t319_duration_ms));
 
         Ok(params)
     }
@@ -427,20 +469,28 @@ impl ResumeProcedure {
     // Reset
     // ========================================================================
 
-    /// Resets the procedure to idle state.
-    /// Back-dates the armed T319 so a test reaches the expiry without waiting out its
-    /// real 1000 ms.
+    /// Back-dates the armed T319 so a test reaches the expiry without waiting the guard
+    /// out.
     ///
     /// The deadline is a `std::time::Instant`, so `tokio::time::advance` cannot move
     /// it -- and a test that slept for real would be slow AND unable to say which
     /// timer fired. Test-only, so production cannot shorten a guard.
+    ///
+    /// The backdate comes from the duration IN FORCE, not from [`T319_DEFAULT_MS`]: a
+    /// cell broadcasting T319 = 2000 ms leaves a deadline 2 s out, and subtracting
+    /// 2 x 1000 ms lands exactly ON the arming instant, which is a race rather than an
+    /// expiry.
     #[cfg(test)]
     pub(crate) fn expire_t319_for_test(&mut self) {
         if let Some(deadline) = self.t319_deadline {
-            self.t319_deadline = Some(deadline - Duration::from_millis(T319_DEFAULT_MS * 2));
+            self.t319_deadline = Some(deadline - Duration::from_millis(self.t319_duration_ms * 2));
         }
     }
 
+    /// Resets the procedure to idle state.
+    ///
+    /// The T319 DURATION survives: it is the serving cell's configuration
+    /// (TS 38.331 §7.1.1), not state belonging to one resume attempt.
     pub fn reset(&mut self) {
         self.state = ResumeProcedureState::Idle;
         self.last_request = None;
