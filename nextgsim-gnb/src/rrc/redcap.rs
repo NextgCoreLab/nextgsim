@@ -252,7 +252,13 @@ impl RedCapRrcConfig {
         }
     }
 
-    /// Applies RedCap restrictions to a UE configuration
+    /// The full set of RedCap restrictions in force for this UE.
+    ///
+    /// Bundled deliberately: before #164 the RRC task reached for the bandwidth and the
+    /// HD-FDD flag through two separate accessors and never asked for the MIMO layer cap or
+    /// the HARQ timing offset at all — so two of the four ceilings this function computes
+    /// were derived and silently dropped. One call that returns all four is what stops them
+    /// drifting apart again. See [`RedCapRestrictions`] for what "in force" means here.
     pub fn apply_restrictions(&self) -> RedCapRestrictions {
         RedCapRestrictions {
             max_bandwidth_mhz: self.restricted_bandwidth_mhz,
@@ -270,7 +276,34 @@ impl RedCapRrcConfig {
     }
 }
 
-/// Applied RedCap restrictions for a UE
+/// The RedCap restrictions in force for one UE, as **reported**, not as enforced on a
+/// resource grid (#164).
+///
+/// # The ceiling, stated here because this is where a reader looks for it
+///
+/// Every field below is a real ceiling derived from the UE's declared capabilities
+/// (TS 38.306 §4.2.21.1), and the gNB reports all four at RRC Setup Complete. **None of
+/// them is enforced against a resource allocation, because this simulator has no PRB
+/// scheduler to enforce them against.** `restricted_bandwidth_mhz` clamps the cell's
+/// serving bandwidth and the equivalent PRB ceiling is derived from it, but nothing
+/// subsequently refuses a grant that exceeds it — there are no grants.
+///
+/// # Why the wire field is not emitted, which is #164's actual question
+///
+/// A conformance peer would look for this in `BWP-DownlinkCommon`'s
+/// `locationAndBandwidth`, inside the `spCellConfig` that
+/// `build_srb1_cell_group_config` omits **on purpose** (its own doc comment records
+/// `spCellConfig`, `mac-CellGroupConfig` and `physicalCellGroupConfig` as deliberately
+/// absent). Emitting it was considered and rejected: `grep` finds no PRB, carrier-bandwidth
+/// or `locationAndBandwidth` modelling anywhere in `nextgsim-gnb` or `nextgsim-ue`, so the
+/// field would be a number on the wire that neither end applies — one honest gap traded for
+/// a larger dishonest surface. That follows this project's recorded rule: **store a
+/// non-normative or unenforceable value and report it as inert, rather than inventing
+/// execution semantics for it.**
+///
+/// Enforcement needs two things this tree does not have, in this order: a BWP/carrier
+/// configuration surface in the RRCSetup, and a scheduler whose grants it constrains.
+/// Until both exist, a reported ceiling is the honest maximum.
 #[derive(Debug, Clone)]
 pub struct RedCapRestrictions {
     /// Maximum bandwidth in MHz

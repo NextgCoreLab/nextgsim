@@ -1002,15 +1002,19 @@ impl RrcTask {
         }
     }
 
-    /// Configures the UE's RedCap processor and applies the RedCap bandwidth /
-    /// HD-FDD scheduling restriction (Rel-17, TS 38.306 / TS 38.331).
+    /// Configures the UE's RedCap processor and reports the RedCap restrictions in force
+    /// (Rel-17, TS 38.306 §4.2.21.1 / TS 38.331).
     ///
-    /// The scheduler enforces a reduced serving bandwidth for a RedCap UE: the
-    /// cell's PRB grid is clamped to the RedCap maximum bandwidth (20 MHz for
-    /// Rel-17), so a RedCap UE is never granted more PRBs than its narrowband
-    /// RF supports. This is modelled only: the functional simulator has no PRB
-    /// scheduler, so the computed ceiling is logged, not enforced on a resource
-    /// grid.
+    /// The cell's serving bandwidth is clamped to the RedCap maximum (20 MHz for Rel-17)
+    /// and the equivalent PRB ceiling derived from it, so a reader can see what a RedCap
+    /// UE's narrowband RF would bound it to.
+    ///
+    /// **Reported, not enforced**, and #164 is the decision that says so: this simulator
+    /// has no PRB scheduler for a ceiling to constrain, and the wire field a conformance
+    /// peer would read it from (`locationAndBandwidth`, inside the `spCellConfig` that
+    /// `build_srb1_cell_group_config` deliberately omits) is not emitted because nothing at
+    /// either end models PRBs. See [`super::redcap::RedCapRestrictions`] for the full
+    /// reasoning and for what enforcement would require.
     fn apply_redcap_restrictions(&mut self, ue_id: i32) {
         // Cell serving bandwidth (FR1 normal UE baseline: 100 MHz / 273 PRB at
         // 30 kHz SCS, TS 38.101-1 Table 5.3.2-1).
@@ -1026,23 +1030,68 @@ impl RrcTask {
         ctx.redcap
             .configure(super::redcap::RedCapUeCapabilities::rel17());
 
-        // Model the RedCap bandwidth restriction and derive the equivalent PRB
-        // ceiling for logging. This functional simulator has no PRB scheduler,
-        // so the ceiling is reported, not enforced on a resource grid.
+        // #164: take the WHOLE restriction set, not the two ceilings this used to ask for.
+        // `get_restrictions` also carries the MIMO layer cap and the HARQ timing offset,
+        // both of which the RedCap config derives and both of which used to be computed and
+        // dropped on the floor -- the same "computed and never reported" defect #164 was
+        // filed about, one level further down.
+        let Some(restrictions) = ctx.redcap.get_restrictions() else {
+            // `configure` above installed a config, so this is unreachable; reported rather
+            // than unwrapped so a future change to `configure` cannot panic the RRC task.
+            warn!("RedCap UE[{ue_id}]: processor configured but reports no restrictions");
+            return;
+        };
+
+        // The clamp is against the CELL's bandwidth, which the restriction set does not
+        // know about -- it carries the UE's ceiling, not the minimum of the two.
         let enforced_bw_mhz = ctx.redcap.restrict_bandwidth(CELL_BANDWIDTH_MHZ);
-        let enforced_max_prb =
-            (CELL_MAX_PRB * enforced_bw_mhz as u32 / CELL_BANDWIDTH_MHZ as u32).max(1);
 
         info!(
-            "RedCap UE[{}]: scheduler bandwidth restricted to {} MHz ({} PRB max, \
-             was {} MHz / {} PRB); HD-FDD gaps={}",
-            ue_id,
-            enforced_bw_mhz,
-            enforced_max_prb,
-            CELL_BANDWIDTH_MHZ,
-            CELL_MAX_PRB,
-            ctx.redcap.needs_hd_fdd_gaps(),
+            "RedCap UE[{ue_id}]: {}",
+            Self::redcap_restriction_report(
+                CELL_BANDWIDTH_MHZ,
+                CELL_MAX_PRB,
+                enforced_bw_mhz,
+                &restrictions,
+            )
         );
+    }
+
+    /// The PRB ceiling equivalent to `bw_mhz` of the cell's serving bandwidth.
+    ///
+    /// Floors rather than rounds — a ceiling that rounded up would permit one PRB more than
+    /// the UE's RF supports — and never returns 0, because a bandwidth this small still
+    /// admits one PRB and a ceiling of zero would read as "no resources at all".
+    fn redcap_prb_ceiling(cell_max_prb: u32, cell_bw_mhz: u8, bw_mhz: u8) -> u32 {
+        (cell_max_prb * bw_mhz as u32 / cell_bw_mhz.max(1) as u32).max(1)
+    }
+
+    /// Render the RedCap restrictions in force as the line the operator sees.
+    ///
+    /// A pure function returning the text, rather than an `info!` buried in
+    /// [`Self::apply_redcap_restrictions`], for one reason: the claim #164 turns on is that
+    /// **all four** ceilings are reported, and a test of `get_restrictions` alone proves
+    /// only that the bundle *can* be obtained — the recorded trap where the helper is tested
+    /// and the wiring is not. Asserting this string is what pins the composition, so a
+    /// future edit cannot quietly drop the MIMO cap or the HARQ offset again.
+    fn redcap_restriction_report(
+        cell_bw_mhz: u8,
+        cell_max_prb: u32,
+        enforced_bw_mhz: u8,
+        restrictions: &super::redcap::RedCapRestrictions,
+    ) -> String {
+        format!(
+            "serving bandwidth restricted to {} MHz ({} PRB max, was {} MHz / {} PRB); \
+             MIMO layers <= {}, HD-FDD gaps={}, HARQ timing offset {} slot(s). Reported, \
+             not enforced: there is no PRB scheduler (see #164)",
+            enforced_bw_mhz,
+            Self::redcap_prb_ceiling(cell_max_prb, cell_bw_mhz, enforced_bw_mhz),
+            cell_bw_mhz,
+            cell_max_prb,
+            restrictions.max_mimo_layers,
+            restrictions.half_duplex_fdd,
+            restrictions.harq_timing_offset,
+        )
     }
 
     /// Sends a UECapabilityEnquiry to the UE (TS 38.331 §5.6.1)
@@ -2297,6 +2346,136 @@ mod tests {
     use super::*;
     use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
+
+    // ── #164: the RedCap restrictions are REPORTED, and the arithmetic is pinned ──
+
+    /// The PRB ceiling for each RedCap release, and for an unrestricted UE.
+    ///
+    /// Fixtures chosen so none can coincide with another: 273, 54 and 13 are three
+    /// distinct values, and 54 is not a round fraction of 273 — a ceiling that rounded
+    /// instead of flooring would give 55, and one that used a different cell PRB count
+    /// would not give 54 at all. A test using only the 100 MHz case would pass against a
+    /// clamp that did nothing.
+    #[test]
+    fn the_redcap_prb_ceiling_is_derived_from_the_clamped_bandwidth() {
+        assert_eq!(
+            RrcTask::redcap_prb_ceiling(273, 100, 100),
+            273,
+            "an unclamped 100 MHz cell keeps its full PRB grid (TS 38.101-1 Table 5.3.2-1)"
+        );
+        assert_eq!(
+            RrcTask::redcap_prb_ceiling(273, 100, 20),
+            54,
+            "Rel-17 RedCap is 20 MHz: 273 * 20 / 100 FLOORS to 54, not 55 — rounding up \
+             would permit one PRB more than the UE's RF supports"
+        );
+        assert_eq!(
+            RrcTask::redcap_prb_ceiling(273, 100, 5),
+            13,
+            "Rel-18 reduced RedCap is 5 MHz: 273 * 5 / 100 floors to 13"
+        );
+        assert_eq!(
+            RrcTask::redcap_prb_ceiling(273, 100, 0),
+            1,
+            "a ceiling of zero would read as 'no resources at all' rather than 'the \
+             narrowest possible allocation'"
+        );
+    }
+
+    /// The report names all four ceilings, and says it is not enforced.
+    ///
+    /// This is the assertion that pins the composition rather than the bundle: before #164
+    /// the reporting path asked for the bandwidth and the HD-FDD flag only, so a version
+    /// that obtained the bundle and then still printed two of its four fields would satisfy
+    /// every other test here.
+    #[test]
+    fn the_report_names_every_restriction_in_force() {
+        use crate::rrc::redcap::{RedCapProcessor, RedCapUeCapabilities};
+
+        let mut processor = RedCapProcessor::new();
+        processor.configure(RedCapUeCapabilities::rel17());
+        let r = processor.get_restrictions().expect("configured");
+        let report = RrcTask::redcap_restriction_report(100, 273, 20, &r);
+
+        assert!(
+            report.contains("20 MHz") && report.contains("54 PRB"),
+            "the clamped bandwidth and its PRB ceiling must be named: {report}"
+        );
+        assert!(
+            report.contains("MIMO layers <= 1"),
+            "the MIMO layer cap must be named -- it was derived and dropped before #164: \
+             {report}"
+        );
+        assert!(
+            report.contains("HD-FDD gaps=true"),
+            "the half-duplex FDD flag must be named: {report}"
+        );
+        assert!(
+            report.contains("HARQ timing offset")
+                && report.contains(&r.harq_timing_offset.to_string()),
+            "the HARQ timing offset must be named, and must be the value the restriction \
+             set carries rather than a hardcoded one -- also dropped before #164: {report}"
+        );
+        assert!(
+            report.contains("not enforced"),
+            "the report must say the ceiling is not enforced; a line that merely stated it \
+             would read as enforcement (#164): {report}"
+        );
+    }
+
+    /// All four restrictions reach the reporting path, not just the two it used to ask for.
+    ///
+    /// This is #164's substance: `max_mimo_layers` and `harq_timing_offset` were derived by
+    /// `apply_restrictions` and then dropped, which is the same computed-and-never-reported
+    /// defect the issue was filed about. Asserting the bundle is what stops the RRC task
+    /// silently reverting to two accessors.
+    #[test]
+    fn the_whole_redcap_restriction_set_is_available_to_the_reporting_path() {
+        use crate::rrc::redcap::{RedCapProcessor, RedCapUeCapabilities};
+
+        let mut processor = RedCapProcessor::new();
+        assert!(
+            processor.get_restrictions().is_none(),
+            "an unconfigured processor restricts nothing: a non-RedCap UE must not be clamped"
+        );
+        assert_eq!(
+            processor.restrict_bandwidth(100),
+            100,
+            "and its bandwidth is untouched"
+        );
+
+        processor.configure(RedCapUeCapabilities::rel17());
+        let r = processor
+            .get_restrictions()
+            .expect("a configured processor reports its restrictions");
+
+        assert_eq!(r.max_bandwidth_mhz, 20, "Rel-17 RedCap is a 20 MHz UE");
+        assert_eq!(
+            r.max_mimo_layers, 1,
+            "Rel-17 RedCap is single-layer — derived before #164 and never reported"
+        );
+        assert!(
+            r.half_duplex_fdd,
+            "Rel-17 RedCap is half-duplex FDD, so it needs scheduling gaps"
+        );
+        assert_ne!(
+            r.harq_timing_offset, 0,
+            "relaxed processing means a non-zero HARQ timing offset — also derived before \
+             #164 and never reported"
+        );
+
+        assert_eq!(
+            processor.restrict_bandwidth(100),
+            20,
+            "the clamp is against the CELL's bandwidth, which the restriction set does not \
+             carry: it holds the UE's ceiling, not the minimum of the two"
+        );
+        assert_eq!(
+            processor.restrict_bandwidth(10),
+            10,
+            "a cell narrower than the UE's ceiling is not widened to it"
+        );
+    }
 
     fn test_config() -> GnbConfig {
         GnbConfig {
