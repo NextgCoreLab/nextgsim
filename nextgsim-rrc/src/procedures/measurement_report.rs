@@ -1143,9 +1143,12 @@ mod tests {
     /// which is the half of the encoding that this crate owns: every quantity,
     /// both bounds, and the CHOICE arm being the E-UTRA one.
     ///
-    /// This is a **structure** round trip, not a byte one, because the UPER
-    /// encoder cannot reach the extension arm at all — see
-    /// `the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec`.
+    /// Kept as the **structure-level** trip even though #117 made the byte trip
+    /// possible: it isolates the build/parse mapping from the codec, so a failure
+    /// here means this crate's field mapping is wrong, while a failure in
+    /// `the_eutra_choice_arm_uper_round_trips_through_the_extension_encoder` (and
+    /// not here) points at the UPER encoding instead. Two tests, two fault
+    /// domains.
     #[test]
     fn an_inter_rat_report_round_trips_at_the_structure_level() {
         let cells = vec![
@@ -1173,39 +1176,65 @@ mod tests {
         );
     }
 
-    /// **The ceiling #113 asks to be recorded.** `measResultListEUTRA` is an
-    /// *extension* arm of the `measResultNeighCells` CHOICE
-    /// (`CHOICE { measResultListNR, ..., measResultListEUTRA }`), and
-    /// `asn1-codecs` 0.7 refuses outright to encode an extended choice index:
-    /// `per/common/encode/mod.rs` returns `EncodeNotSupported` with
-    /// "Encode of extended choice not yet implemented" whenever the selected arm
-    /// is past the extension marker. Decoding one *is* implemented, so this is an
-    /// encoder-only ceiling.
+    /// **The ceiling #113 recorded is lifted (#117); this is the round trip that
+    /// replaced the test which asserted the refusal.**
     ///
-    /// So a UE cannot put an inter-RAT measurement result on the wire in real
-    /// UPER, whatever #107 does about the hand-rolled report — the block is one
-    /// layer below, in the codec crate.
+    /// `measResultListEUTRA` is an *extension* arm of the `measResultNeighCells`
+    /// CHOICE (`CHOICE { measResultListNR, ..., measResultListEUTRA }`). Upstream
+    /// `asn1-codecs` 0.7.2 refused outright to encode an extended choice index —
+    /// `encode_choice_idx_common` returned `EncodeNotSupported` — so a UE could not
+    /// put an inter-RAT measurement result on the wire at all, whatever #107 did
+    /// about the hand-rolled report: the block was one layer below, in the codec
+    /// crate. The fork under `vendor/asn1-codecs` implements X.691 §23.6 (the
+    /// extension index as a normally small non-negative whole number) and §23.8
+    /// (the arm's value as a length-prefixed open type).
     ///
-    /// This test **fails when the limitation is lifted**, which is the signal to
-    /// replace `an_inter_rat_report_round_trips_at_the_structure_level` with a
-    /// byte round trip. It is pinned as a ceiling, not asserted as correct.
+    /// The predecessor test documented itself as failing "when the limitation is
+    /// lifted" and named this byte round trip as its replacement. It did fail, and
+    /// this is that replacement.
     #[test]
-    fn the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec() {
-        let params = inter_rat_params(vec![MeasResultEutra::with_rsrp(42, 50)]);
+    fn the_eutra_choice_arm_uper_round_trips_through_the_extension_encoder() {
+        let cells = vec![
+            MeasResultEutra {
+                eutra_phys_cell_id: 42,
+                rsrp: Some(50),
+                rsrq: Some(20),
+                sinr: Some(70),
+            },
+            MeasResultEutra::with_rsrp(1007, 97),
+        ];
+        let params = inter_rat_params(cells.clone());
 
-        // The structure builds fine: the refusal is in the encoder, not here.
-        build_measurement_report(&params).expect("the message structure is valid");
+        // Bytes, not a structure: this is the half that was impossible before.
+        let bytes = encode_measurement_report(&params)
+            .expect("the extension arm must now encode to real UPER");
+        let decoded = decode_measurement_report(&bytes).expect("and decode back from those bytes");
 
-        let err = encode_measurement_report(&params)
-            .expect_err("asn1-codecs 0.7 cannot encode an extended choice index");
-        let message = err.to_string();
+        assert_eq!(decoded.meas_id.0, params.meas_id);
+        assert_eq!(
+            decoded.eutra_neigh_results, cells,
+            "every E-UTRA quantity survives an encode -> bytes -> decode trip"
+        );
         assert!(
-            message.contains("extended choice"),
-            "expected the extended-choice refusal, got: {message}"
+            decoded.neigh_freq_results.is_empty(),
+            "an inter-RAT report carries no NR neighbour list"
         );
 
-        // An intra-NR report over the same code path encodes, so the failure is
-        // specific to the extension arm and not to measurement reports at large.
+        // Re-encoding what was decoded must reproduce the identical octets. This is
+        // what makes the round trip evidence of a CORRECT encoding rather than
+        // merely a self-consistent one: an open-type frame and a length determinant
+        // that were both wrong in the same direction would survive the structure
+        // comparison above, and would not survive this.
+        let reencoded =
+            encode_measurement_report(&inter_rat_params(decoded.eutra_neigh_results.clone()))
+                .expect("re-encode");
+        assert_eq!(
+            reencoded, bytes,
+            "encode(decode(x)) must be byte-identical to x"
+        );
+
+        // The non-extended arm over the same code path is unaffected, so the new
+        // extension path did not disturb the arm that already worked.
         encode_measurement_report(&nr_neighbour_params()).expect("the non-extended NR arm encodes");
     }
 
