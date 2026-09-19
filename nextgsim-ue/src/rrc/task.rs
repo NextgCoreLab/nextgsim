@@ -997,16 +997,17 @@ impl RrcTask {
                 // Not a silent drop: a report that cannot be encoded is a
                 // measurement the network will never see, and the event that
                 // triggered it has already been consumed.
-                // An inter-RAT (B1/B2) report reaches here every time: the
+                //
+                // An inter-RAT (B1/B2) report used to reach here EVERY time: the
                 // `measResultListEUTRA` arm of `measResultNeighCells` is past the
-                // extension marker and `asn1-codecs` 0.7.2 refuses to encode an
-                // extended CHOICE (issue #117). Named in the log, because
-                // "measurement lost" without the reason reads as a transient fault
-                // rather than a codec ceiling.
+                // extension marker and upstream `asn1-codecs` 0.7.2 refused to
+                // encode an extended CHOICE. #117 fixed that in the forked codec
+                // under `vendor/`, so this arm is now a genuine encode failure
+                // rather than a standing ceiling -- which is why the log no longer
+                // names a specific cause it can no longer assume.
                 error!(
                     "Failed to encode MeasurementReport (meas_id={}): {e}. The \
-                     measurement is LOST. An inter-RAT (B1/B2) report cannot be \
-                     encoded by this codec version at all -- see issue #117",
+                     measurement is LOST.",
                     report.meas_id
                 );
                 return;
@@ -7424,23 +7425,25 @@ mod tests {
         );
     }
 
-    /// An inter-RAT (B1/B2) report **cannot be encoded by this codec version**, and
-    /// that is issue #117's ceiling reached from a new direction.
+    /// An inter-RAT (B1/B2) report **is now encodable**, which is issue #117's
+    /// ceiling lifted as observed from the UE.
     ///
     /// `measResultNeighCells` is a CHOICE whose `measResultListEUTRA` alternative
-    /// sits past the extension marker, and `asn1-codecs` 0.7.2's
-    /// `encode_choice_idx_common` returns `EncodeNotSupported` for exactly that.
-    /// #113 pinned the refusal at the codec (`the_eutra_choice_arm_cannot_be_uper_encoded_by_this_codec`);
-    /// this pins its **consequence at the UE**: a B1/B2 report is not sent at all.
+    /// sits past the extension marker, and upstream `asn1-codecs` 0.7.2's
+    /// `encode_choice_idx_common` returned `EncodeNotSupported` for exactly that —
+    /// so a B1/B2 report was not sent at all, it vanished into the encode-failure
+    /// log in `send_measurement_report`. The forked codec under `vendor/`
+    /// implements X.691 §23.6/§23.8, and this asserts the UE-side consequence.
     ///
-    /// Asserted rather than left to be discovered, because the alternative is a
-    /// measurement that vanishes with a log line. `send_measurement_report` names
-    /// #117 in that log so an operator is told why. When #117 is resolved this test
-    /// must be REPLACED by the success assertion, not deleted — the inter-RAT arm is
-    /// the thing it is about.
+    /// The predecessor test asserted the refusal and instructed that it be
+    /// REPLACED by the success assertion rather than deleted, because the inter-RAT
+    /// arm is the thing it is about. This is that replacement, and the E-UTRA
+    /// content is asserted to survive the trip rather than merely to encode —
+    /// "it returned Ok" would also be true of an encoder that dropped the arm.
     #[test]
-    fn an_inter_rat_report_cannot_be_encoded_by_this_codec_version() {
+    fn an_inter_rat_report_encodes_and_carries_its_eutra_results() {
         use crate::rrc::measurement::{EutraCellKey, EutraMeasResult};
+        use nextgsim_rrc::procedures::measurement_report::decode_measurement_report;
 
         let mut report = measurement_report_fixture();
         report.eutra_neighbor_cells = vec![EutraMeasResult {
@@ -7452,22 +7455,28 @@ mod tests {
             cell_individual_offset: 0,
         }];
 
-        let err = build_uper_measurement_report(&report)
-            .expect_err("issue #117: the extended CHOICE arm cannot be encoded");
-        let text = err.to_string();
-        assert!(
-            text.contains("extended choice") || text.contains("EncodeNotSupported"),
-            "the failure must be the codec's extended-CHOICE refusal (issue #117), \
-             not some other encode error that would hide it: {text}"
+        let bytes = build_uper_measurement_report(&report)
+            .expect("#117: the extended CHOICE arm now encodes");
+        let decoded =
+            decode_measurement_report(&bytes).expect("and the gNB side can decode those bytes");
+
+        assert_eq!(
+            decoded.eutra_neigh_results.len(),
+            1,
+            "the E-UTRA arm must survive the encode, not be silently dropped"
+        );
+        assert_eq!(
+            decoded.eutra_neigh_results[0].eutra_phys_cell_id, 42,
+            "and it must be the cell that was measured"
         );
 
-        // The positive control: the SAME report without the E-UTRA results encodes
-        // fine, so the refusal is about the extension arm and not about the report.
+        // The positive control from the predecessor test, kept: the SAME report
+        // without E-UTRA results still encodes, so the assertion above is about the
+        // extension arm and not about reports in general.
         report.eutra_neighbor_cells.clear();
         assert!(
             build_uper_measurement_report(&report).is_ok(),
-            "an intra-NR report must still encode; otherwise the assertion above \
-             says nothing about the E-UTRA arm"
+            "an intra-NR report must still encode"
         );
     }
 

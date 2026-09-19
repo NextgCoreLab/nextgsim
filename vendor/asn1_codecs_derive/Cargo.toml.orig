@@ -1,0 +1,30 @@
+[package]
+name = "asn1_codecs_derive"
+description = "ASN.1 Codecs derive Macros"
+authors = ["Ystero Project Developers <hello@ystero.dev>"]
+keywords = ["asn1", "per"]
+version = "0.7.2"
+edition = "2018"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/gabhijit/hampi.git"
+homepage = "https://ystero.dev"
+readme = "README.md"
+include = ["tests/**/*.rs", "src/**/*.rs", "Cargo.toml", "LICENSE", "LICENSE-MIT", "LICENSE-Apache2", "README.md"]
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[lib]
+proc-macro = true
+
+[dependencies]
+log = { version = "0.4" }
+asn1-codecs = { path = "../codecs" , version = "=0.7.2"}
+bitvec = { version = "1.0" }
+proc-macro2 = { version = "1.0" }
+quote = { version = "1.0" }
+syn = { version = "1.0" , features = ["extra-traits"]}
+
+[dev-dependencies]
+trybuild = { version = "1.0" }
+hex =  { version = "0.4" }

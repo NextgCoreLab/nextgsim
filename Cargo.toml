@@ -80,9 +80,18 @@ num_enum = "0.7"
 hex = "0.4"
 async-trait = "0.1"
 
-# ASN.1 PER codec (for NGAP/RRC)
-asn1-codecs = "0.7"
-asn1_codecs_derive = "0.7"
+# ASN.1 PER codec (for NGAP/RRC).
+#
+# Forked under vendor/ (#117). Upstream 0.7.2 REFUSES to encode a CHOICE whose
+# selected alternative is past the ASN.1 extension marker -- `encode_choice_idx_common`
+# returns `EncodeNotSupported` -- so every extension-arm IE in the vendored
+# RRC/NGAP schemas was decode-only and `measResultListEUTRA` (inter-RAT
+# measurement reporting) could not go on the wire at all. The fork implements
+# X.691 §23.6 (extension index as a normally small non-negative whole number) and
+# §23.8 (the arm's value as a length-prefixed open type) in both the codec and the
+# derive macro. See specs/extended-choice-per-encode.md.
+asn1-codecs = { path = "vendor/asn1-codecs" }
+asn1_codecs_derive = { path = "vendor/asn1_codecs_derive" }
 bitvec = "1"
 log = "0.4"
 env_logger = "0.11"
@@ -138,3 +147,16 @@ flat_map_option = "warn"
 # Performance
 unnecessary_to_owned = "warn"
 inefficient_to_string = "warn"
+
+# Redirect the TRANSITIVE edge onto the fork as well (#117).
+#
+# The `path` entry in `[workspace.dependencies]` only rebinds what our own crates
+# name directly. `asn1-codecs` is ALSO a dependency of `asn1_codecs_derive` (pinned
+# `=0.7.2`) and of `asn1-compiler`, which the RRC/NGAP build scripts run. Without
+# this patch those edges resolve to the unfixed registry copy, so one build would
+# contain two different `asn1-codecs` -- the derive macro emitting calls against a
+# codec whose extended-CHOICE encoder still refuses. The symptom would be a type
+# error or, worse, a silent split where the fix appears not to take effect.
+[patch.crates-io]
+asn1-codecs = { path = "vendor/asn1-codecs" }
+asn1_codecs_derive = { path = "vendor/asn1_codecs_derive" }
