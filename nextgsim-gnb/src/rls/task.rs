@@ -60,15 +60,31 @@ pub struct RlsTask {
     socket: Option<Arc<UdpSocket>>,
     /// Local bind address
     bind_address: SocketAddr,
-    /// RLC entities keyed by `(UE ID, PSI)` — one per radio bearer, as
+    /// RLC entities keyed by `(UE ID, DRB identity)` — one per radio bearer, as
     /// TS 38.322 §4.2.1 requires, so each bearer owns its sequence-number space
     /// and reassembly buffer.
+    ///
+    /// Keyed on the DRB identity and not the PSI since issue #44: with
+    /// `sdap-dataplane` one PDU session has two DRBs, and a PSI key would make them
+    /// share an entity — interleaving two flows into one sequence-number space while
+    /// the UE demultiplexed them into two entities each expecting a contiguous
+    /// sequence, which is silent corruption rather than a clean failure. Without the
+    /// feature the DRB identity IS the PSI, so the keys are exactly as they were.
     rlc_entities: HashMap<(i32, i32), RlcEntity>,
-    /// PDCP entities keyed by `(UE ID, PSI)` -- one per DRB (TS 38.323 §5.2,
+    /// PDCP entities keyed by `(UE ID, DRB identity)` -- one per DRB (TS 38.323 §5.2,
     /// issue #33). Keyed the same way as the RLC entities, because a PDCP entity
     /// and its RLC entity serve the same bearer.
     #[cfg(feature = "drb-pdcp")]
     pdcp_entities: HashMap<(i32, i32), Pdcp>,
+    /// The PDU session each `(UE ID, DRB identity)` belongs to (issue #44).
+    ///
+    /// Needed because the radio side is per-DRB while GTP-U is per-session: an uplink
+    /// SDU arrives on a DRB and has to leave on that session's N3 tunnel, so the
+    /// forwarding needs the PSI back. Recorded when the bearer is first seen rather
+    /// than recomputed, because DRB→PSI is not a function this side can evaluate:
+    /// `allocate_drbs` wraps two identities into 1..=32, so inverting it would take a
+    /// search that can match the wrong session.
+    drb_to_psi: HashMap<(i32, i32), i32>,
     /// When this task started, the origin for the PDCP timers.
     #[cfg(feature = "drb-pdcp")]
     started_at: Instant,
@@ -105,6 +121,7 @@ impl RlsTask {
             rlc_entities: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
             pdcp_entities: HashMap::new(),
+            drb_to_psi: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
             started_at: Instant::now(),
             load_window_octets: 0,
@@ -129,6 +146,7 @@ impl RlsTask {
             rlc_entities: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
             pdcp_entities: HashMap::new(),
+            drb_to_psi: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
             started_at: Instant::now(),
             load_window_octets: 0,
@@ -136,46 +154,45 @@ impl RlsTask {
         }
     }
 
-    /// Returns the RLC entity for one UE's radio bearer, creating a UM entity on
-    /// first use.
-    ///
-    /// Keyed on `(ue_id, psi)` because TS 38.322 §4.2.1 gives every radio bearer
-    /// its own RLC entity, and therefore its own sequence-number space and
-    /// reassembly buffer. Keying on the UE alone interleaved every PDU session
-    /// into one SN counter while the UE demultiplexed them into per-PSI entities
-    /// each expecting a contiguous sequence — so a second PDU session corrupted
-    /// both sessions' numbering rather than failing cleanly.
-    ///
-    /// The PSI stands in for the DRB identity: this simulator maps one DRB per
-    /// PDU session (see `nextgsim-gnb/src/gtp`), so the two are one to one.
     /// The PDCP entity for one UE's DRB, created on first use (issue #33).
+    ///
+    /// Keyed on `drb_id`, not the PSI: TS 38.323 §5.2 gives every DRB its own entity,
+    /// and with `sdap-dataplane` a session has two of them. Sharing one would have the
+    /// two bearers share a COUNT, which under `up-security` means two flows ciphered
+    /// with the same keystream.
     #[cfg(feature = "drb-pdcp")]
-    fn pdcp_entity_for(&mut self, ue_id: i32, psi: i32) -> &mut Pdcp {
+    fn pdcp_entity_for(&mut self, ue_id: i32, drb_id: i32) -> &mut Pdcp {
         self.pdcp_entities
-            .entry((ue_id, psi))
+            .entry((ue_id, drb_id))
             .or_insert_with(|| Pdcp::new(PdcpConfig::default()))
     }
 
     /// Install (or remove) user-plane security on one UE's DRB (issue #32).
     ///
-    /// Applied to the entity for `(ue_id, psi)`, creating it if the DRB has not
+    /// Applied to the entity for `(ue_id, drb_id)`, creating it if the DRB has not
     /// carried a packet yet — the keys arrive from NGAP before the first G-PDU does,
     /// and an entity created later with no security would leave the first packets
     /// unprotected.
+    ///
+    /// `drb_id` and not the PSI since issue #44, and the distinction is load-bearing
+    /// under `up-security`: the `PdcpSecurity` NGAP builds binds BEARER to the DRB
+    /// identity minus one (TS 33.501 Annex D.3.1.2), so installing it on a
+    /// PSI-keyed entity would put the right BEARER on the wrong bearer's entity and
+    /// every MAC-I would fail with no other symptom.
     #[cfg(feature = "up-security")]
     fn install_drb_security(
         &mut self,
         ue_id: i32,
-        psi: i32,
+        drb_id: i32,
         security: Option<nextgsim_pdcp::PdcpSecurity>,
     ) {
         let protected = security.is_some();
-        self.pdcp_entity_for(ue_id, psi).set_security(security);
+        self.pdcp_entity_for(ue_id, drb_id).set_security(security);
         info!(
-            "DRB user-plane security {} for UE[{}] PSI {}",
+            "DRB user-plane security {} for UE[{}] DRB {}",
             if protected { "installed" } else { "removed" },
             ue_id,
-            psi
+            drb_id
         );
     }
 
@@ -185,15 +202,46 @@ impl RlsTask {
         self.started_at.elapsed().as_millis() as u64
     }
 
-    fn rlc_entity_for(&mut self, ue_id: i32, psi: i32) -> &mut RlcEntity {
+    /// Returns the RLC entity for one UE's radio bearer, creating a UM entity on
+    /// first use.
+    ///
+    /// Keyed on `(ue_id, drb_id)` because TS 38.322 §4.2.1 gives every radio bearer
+    /// its own RLC entity, and therefore its own sequence-number space and
+    /// reassembly buffer. Keying on the UE alone interleaved every PDU session
+    /// into one SN counter while the UE demultiplexed them into per-bearer entities
+    /// each expecting a contiguous sequence — so a second PDU session corrupted
+    /// both sessions' numbering rather than failing cleanly. Keying on the PSI has
+    /// the same failure one level down once `sdap-dataplane` gives a session two DRBs.
+    ///
+    /// `psi` comes along even though it is not the key, for two reasons. The RLC
+    /// **mode** is configured per PDU session (`rlc_am_psis` is a list of PSIs), so
+    /// the AM decision can only be made from the PSI; and the uplink has to find its
+    /// way back to a GTP-U tunnel, which is per session, so [`Self::drb_to_psi`] is
+    /// recorded here — the one place every bearer passes through.
+    fn rlc_entity_for(&mut self, ue_id: i32, drb_id: i32, psi: i32) -> &mut RlcEntity {
         let mode = if self.task_base.config.rlc_am_psis.contains(&(psi as u8)) {
             RlcMode::AcknowledgedMode
         } else {
             RlcMode::UnacknowledgedMode
         };
+        self.drb_to_psi.insert((ue_id, drb_id), psi);
         self.rlc_entities
-            .entry((ue_id, psi))
+            .entry((ue_id, drb_id))
             .or_insert_with(|| RlcEntity::new(mode, SnSize::Sn12))
+    }
+
+    /// The PDU session a `(ue_id, drb_id)` bearer belongs to (issue #44).
+    ///
+    /// Falls back to the DRB identity when the bearer has not been recorded, which is
+    /// the identity mapping the pre-SDAP path had and the right answer for the DEFAULT
+    /// DRB in every case (`allocate_drbs` keeps `default_drb_id == psi.clamp(1, 32)`).
+    /// A fallback rather than a drop because losing an uplink SDU to a bookkeeping gap
+    /// would be worse than sending it to the session it almost certainly belongs to.
+    fn psi_for_drb(&self, ue_id: i32, drb_id: i32) -> i32 {
+        self.drb_to_psi
+            .get(&(ue_id, drb_id))
+            .copied()
+            .unwrap_or(drb_id)
     }
 
     /// Drives the RLC timers on every entity and transmits whatever they
@@ -203,25 +251,29 @@ impl RlsTask {
     /// unacknowledged PDU (§5.3.3.4).
     async fn poll_rlc_timers(&mut self) {
         let now = Instant::now();
+        // `(ue_id, drb_id, pdu)`: the entity map is keyed by DRB identity since
+        // issue #44, and a re-offered PDU has to go back out on the bearer it came
+        // from -- a PSI here would put a retransmission on the wrong DRB when a
+        // session has two.
         let mut outbound: Vec<(i32, i32, Vec<u8>)> = Vec::new();
-        for ((ue_id, psi), rlc) in &mut self.rlc_entities {
+        for ((ue_id, drb_id), rlc) in &mut self.rlc_entities {
             if rlc.poll_timers(now) {
                 debug!(
-                    "RLC timer expired: ue_id={}, psi={}, rx_next_reassembly={}",
+                    "RLC timer expired: ue_id={}, drb_id={}, rx_next_reassembly={}",
                     ue_id,
-                    psi,
+                    drb_id,
                     rlc.rx_next_reassembly()
                 );
             }
             if let Some(status) = rlc.build_status_pdu() {
-                outbound.push((*ue_id, *psi, status));
+                outbound.push((*ue_id, *drb_id, status));
             }
             while let Some(retx) = rlc.build_pdu(MAC_GRANT_BYTES) {
-                outbound.push((*ue_id, *psi, retx));
+                outbound.push((*ue_id, *drb_id, retx));
             }
         }
-        for (ue_id, psi, pdu) in outbound {
-            self.send_rlc_pdu(ue_id, psi, pdu).await;
+        for (ue_id, drb_id, pdu) in outbound {
+            self.send_rlc_pdu(ue_id, drb_id, pdu).await;
         }
     }
 
@@ -236,19 +288,35 @@ impl RlsTask {
     async fn poll_pdcp_timers(&mut self) {
         let now_ms = self.pdcp_now_ms();
         let mut delivered: Vec<(i32, i32, Vec<u8>)> = Vec::new();
-        for ((ue_id, psi), pdcp) in &mut self.pdcp_entities {
+        for ((ue_id, drb_id), pdcp) in &mut self.pdcp_entities {
             for sdu in pdcp.poll_t_reordering(now_ms) {
-                delivered.push((*ue_id, *psi, sdu));
+                delivered.push((*ue_id, *drb_id, sdu));
             }
         }
-        for (ue_id, psi, sdu) in delivered {
+        for (ue_id, drb_id, sdu) in delivered {
             debug!(
-                "PDCP t-Reordering released an SDU: ue_id={ue_id}, psi={psi}, len={}",
+                "PDCP t-Reordering released an SDU: ue_id={ue_id}, drb_id={drb_id}, len={}",
                 sdu.len()
             );
+            // This is the SAME uplink SDU `handle_uplink_data` would have forwarded had
+            // t-Reordering not held it, so it owes the same SDAP strip (issue #44).
+            // Missing it here is the subtle half: only SDUs that arrived out of order
+            // take this path, so the header octet would leak into the UPF for exactly
+            // the packets a reordering bug is hardest to attribute to.
+            #[cfg(feature = "sdap-dataplane")]
+            let sdu = match nextgsim_pdcp::sdap::decode_ul_pdu(&sdu) {
+                Ok((_, payload)) => payload.to_vec(),
+                Err(e) => {
+                    warn!("Dropped a reordered uplink SDU with an undecodable SDAP header: {e}");
+                    continue;
+                }
+            };
+            // GTP-U is per PDU session, so the DRB the SDU was reordered on has to be
+            // resolved back to its PSI: the tunnel is named by the session, and a DRB
+            // identity here would miss the tunnel entirely once the two differ.
             let msg = GtpMessage::DataPduDelivery {
                 ue_id,
-                psi,
+                psi: self.psi_for_drb(ue_id, drb_id),
                 pdu: OctetString::from_slice(&sdu),
             };
             if let Err(e) = self.task_base.gtp_tx.send(msg).await {
@@ -258,7 +326,11 @@ impl RlsTask {
     }
 
     /// Sends one RLC PDU (data or STATUS) to a UE over RLS.
-    async fn send_rlc_pdu(&mut self, ue_id: i32, psi: i32, pdu: Vec<u8>) {
+    ///
+    /// `drb_id` goes on the wire in `payload`, which is what the UE demultiplexes its
+    /// own per-bearer entities on — so this is the field that has to name the DRB and
+    /// not the session, or the two ends key their entity maps differently.
+    async fn send_rlc_pdu(&mut self, ue_id: i32, drb_id: i32, pdu: Vec<u8>) {
         let Some(&dest) = self.ue_addresses.get(&ue_id) else {
             warn!("RLC PDU for unknown UE[{}] dropped", ue_id);
             return;
@@ -271,7 +343,7 @@ impl RlsTask {
             sti: self.sti,
             pdu_type: PduType::Data,
             pdu_id: 0,
-            payload: psi as u32,
+            payload: drb_id as u32,
             pdu: Bytes::from(pdu),
         };
         self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
@@ -280,13 +352,13 @@ impl RlsTask {
 
     /// Sends the STATUS report an AM bearer owes its peer, if one is due
     /// (TS 38.322 §5.3.4). A no-op for a UM bearer, which has no STATUS PDU.
-    async fn send_pending_status(&mut self, ue_id: i32, psi: i32) {
+    async fn send_pending_status(&mut self, ue_id: i32, drb_id: i32) {
         let status = self
             .rlc_entities
-            .get_mut(&(ue_id, psi))
+            .get_mut(&(ue_id, drb_id))
             .and_then(RlcEntity::build_status_pdu);
         if let Some(status) = status {
-            self.send_rlc_pdu(ue_id, psi, status).await;
+            self.send_rlc_pdu(ue_id, drb_id, status).await;
         }
     }
 
@@ -540,14 +612,21 @@ impl RlsTask {
     /// Handles uplink user plane data from UE.
     ///
     /// The raw bytes arriving over RLS are an RLC PDU (UM, SN12).  They are
-    /// fed into the per-UE RLC entity for reassembly; only complete SDUs are
+    /// fed into the per-bearer RLC entity for reassembly; only complete SDUs are
     /// forwarded to the GTP task.
     async fn handle_uplink_data(&mut self, ue_id: i32, pdu: &RlsPduTransmission) {
-        let psi = pdu.payload as i32;
+        // `payload` is the DRB identity the UE transmitted on (see `send_rlc_pdu` for
+        // the downlink half), so it keys the entity maps. Without `sdap-dataplane`
+        // that number IS the PSI, which is what this line meant before issue #44.
+        let drb_id = pdu.payload as i32;
+        // The PDU session the bearer belongs to, which is what GTP-U needs: the N3
+        // tunnel is per session, and the radio bearer is not.
+        let psi = self.psi_for_drb(ue_id, drb_id);
 
         debug!(
-            "Uplink data (RLC): ue_id={}, psi={}, len={}",
+            "Uplink data (RLC): ue_id={}, drb_id={}, psi={}, len={}",
             ue_id,
+            drb_id,
             psi,
             pdu.pdu.len()
         );
@@ -560,7 +639,7 @@ impl RlsTask {
         // Feed the RLC PDU into the entity and collect any reassembled SDUs,
         // releasing the mutable borrow before the async send below.
         let reassembled_sdus = {
-            let rlc = self.rlc_entity_for(ue_id, psi);
+            let rlc = self.rlc_entity_for(ue_id, drb_id, psi);
             rlc.receive_pdu(&pdu.pdu);
             let mut sdus = Vec::new();
             while let Some(sdu) = rlc.poll_reassembled() {
@@ -572,7 +651,7 @@ impl RlsTask {
         // An AM bearer answers a poll (or a detected gap) with a STATUS report
         // (TS 38.322 §5.3.4); without this the peer's ARQ never learns anything
         // and its t-PollRetransmit fires forever.
-        self.send_pending_status(ue_id, psi).await;
+        self.send_pending_status(ue_id, drb_id).await;
 
         // PDCP receive (issue #33): what RLC reassembled is a PDCP PDU, so it goes
         // through the reordering entity and only in-order SDUs reach GTP-U. Without
@@ -580,13 +659,13 @@ impl RlsTask {
         #[cfg(feature = "drb-pdcp")]
         let to_gtp: Vec<Vec<u8>> = {
             let now_ms = self.pdcp_now_ms();
-            let pdcp = self.pdcp_entity_for(ue_id, psi);
+            let pdcp = self.pdcp_entity_for(ue_id, drb_id);
             let mut delivered = Vec::new();
             for sdu in reassembled_sdus {
                 match pdcp.receive_pdu(&sdu, now_ms) {
                     Ok(sdus) => delivered.extend(sdus),
                     Err(e) => {
-                        debug!("PDCP discarded an uplink PDU on ue {ue_id} psi {psi}: {e:?}")
+                        debug!("PDCP discarded an uplink PDU on ue {ue_id} DRB {drb_id}: {e:?}")
                     }
                 }
             }
@@ -597,6 +676,31 @@ impl RlsTask {
         let to_gtp: Vec<Vec<u8>> = reassembled_sdus;
 
         for sdu in to_gtp {
+            // SDAP receive (TS 37.324 §5.2.2, issue #44): with the feature the UE
+            // prepends a one-octet UL header, and it MUST be stripped here. GTP-U
+            // encapsulates what it is handed verbatim, so leaving the octet on would
+            // send the UPF an IP packet whose first byte is an SDAP header -- a
+            // corrupt version/IHL nibble, which is a silent black hole rather than a
+            // failure. The UL QFI is decoded and logged but not used to select the
+            // tunnel: the session already determines that, and TS 38.415 has the gNB
+            // put the QFI in the uplink PDU Session Container, which `encapsulate_uplink`
+            // builds from the session's own QFI.
+            #[cfg(feature = "sdap-dataplane")]
+            let sdu = match nextgsim_pdcp::sdap::decode_ul_pdu(&sdu) {
+                Ok((qfi, payload)) => {
+                    debug!("SDAP UL: ue_id={ue_id}, drb_id={drb_id}, qfi={qfi}");
+                    payload.to_vec()
+                }
+                Err(e) => {
+                    // A malformed header means the peer is not speaking this sublayer
+                    // (a UE built without the feature) or sent a Control PDU, which
+                    // carries no user data at all. Dropped rather than forwarded,
+                    // because the alternative is handing the UPF the header octet.
+                    warn!("Dropped an uplink SDU with an undecodable SDAP header: {e}");
+                    continue;
+                }
+            };
+
             debug!(
                 "DRB SDU for GTP: ue_id={}, psi={}, len={}",
                 ue_id,
@@ -717,11 +821,17 @@ impl RlsTask {
 
     /// Handles downlink user plane data from GTP task.
     ///
-    /// The SDU from GTP is submitted to the per-UE RLC entity (UM, SN12).
-    /// One or more RLC PDUs are then built and sent over RLS to the UE.
-    /// A 1500-byte MTU is used as the MAC grant size so that typical IP
+    /// The SDU from GTP is submitted to the PDCP and RLC entities of the bearer
+    /// `drb_id` names (UM, SN12). One or more RLC PDUs are then built and sent over
+    /// RLS to the UE. A 1500-byte MTU is used as the MAC grant size so that typical IP
     /// packets fit in a single PDU.
-    async fn handle_downlink_data(&mut self, ue_id: i32, psi: i32, data: OctetString) {
+    ///
+    /// Takes BOTH `psi` and `drb_id` because they answer different questions and are
+    /// only the same number without `sdap-dataplane`: `drb_id` selects the entities and
+    /// goes on the wire, while `psi` is what the RLC mode is configured per
+    /// (`rlc_am_psis`) and what an uplink SDU on this bearer will need to reach its
+    /// GTP-U tunnel. Dropping `psi` would silently move every AM bearer to UM.
+    async fn handle_downlink_data(&mut self, ue_id: i32, psi: i32, drb_id: i32, data: OctetString) {
         let dest = match self.ue_addresses.get(&ue_id) {
             Some(&addr) => addr,
             None => {
@@ -731,9 +841,10 @@ impl RlsTask {
         };
 
         debug!(
-            "Downlink data (RLC): ue_id={}, psi={}, len={}",
+            "Downlink data (RLC): ue_id={}, psi={}, drb_id={}, len={}",
             ue_id,
             psi,
+            drb_id,
             data.len()
         );
 
@@ -742,18 +853,21 @@ impl RlsTask {
         // again for transmission.
         let rlc_pdus = {
             // PDCP first (issue #33): the GTP-delivered SDU gets a PDCP header, an
-            // SN and a discardTimer, and it is the PDCP PDU that RLC segments.
+            // SN and a discardTimer, and it is the PDCP PDU that RLC segments. With
+            // `sdap-dataplane` that SDU already carries its SDAP header, which GTP
+            // prepended -- SDAP is above PDCP (TS 37.324 §4.2), so the header is
+            // inside what PDCP protects and what RLC segments.
             #[cfg(feature = "drb-pdcp")]
             let to_rlc: Vec<Vec<u8>> = {
                 let now_ms = self.pdcp_now_ms();
-                let pdcp = self.pdcp_entity_for(ue_id, psi);
+                let pdcp = self.pdcp_entity_for(ue_id, drb_id);
                 pdcp.submit_sdu(data.data(), now_ms);
                 pdcp.take_transmittable(now_ms)
             };
             #[cfg(not(feature = "drb-pdcp"))]
             let to_rlc: Vec<Vec<u8>> = vec![data.data().to_vec()];
 
-            let rlc = self.rlc_entity_for(ue_id, psi);
+            let rlc = self.rlc_entity_for(ue_id, drb_id, psi);
             for sdu in to_rlc {
                 rlc.submit_sdu(sdu);
             }
@@ -770,7 +884,9 @@ impl RlsTask {
                 sti,
                 pdu_type: PduType::Data,
                 pdu_id: 0, // Data PDUs don't require RLS acknowledgment
-                payload: psi as u32,
+                // The DRB identity, matching `send_rlc_pdu`: this is what the UE keys
+                // its own entity maps on, so the two ends have to name the same thing.
+                payload: drb_id as u32,
                 pdu: Bytes::from(rlc_pdu),
             };
             let msg = RlsProtocolMessage::PduTransmission(transmission);
@@ -900,12 +1016,17 @@ impl Task for RlsTask {
                                 RlsMessage::BroadcastRrc { rrc_channel, pdu_id, data } => {
                                     self.handle_broadcast_rrc(rrc_channel, pdu_id, data).await;
                                 }
-                                RlsMessage::DownlinkData { ue_id, psi, pdu } => {
-                                    self.handle_downlink_data(ue_id, psi, pdu).await;
+                                RlsMessage::DownlinkData { ue_id, psi, drb_id, pdu } => {
+                                    self.handle_downlink_data(ue_id, psi, drb_id, pdu).await;
                                 }
                                 #[cfg(feature = "up-security")]
-                                RlsMessage::InstallDrbSecurity { ue_id, psi, security } => {
-                                    self.install_drb_security(ue_id, psi, security.map(|b| *b));
+                                RlsMessage::InstallDrbSecurity { ue_id, psi, drb_id, security } => {
+                                    // The PSI is recorded alongside the entity so an
+                                    // uplink SDU on this bearer can find its GTP-U
+                                    // tunnel even when the keys arrive before any
+                                    // traffic does -- which is the normal order.
+                                    self.drb_to_psi.insert((ue_id, drb_id), psi);
+                                    self.install_drb_security(ue_id, drb_id, security.map(|b| *b));
                                 }
                                 RlsMessage::SignalDetected { ue_id } => {
                                     debug!("Signal detected notification for UE[{}]", ue_id);
@@ -1201,9 +1322,11 @@ mod tests {
         let mut task = broadcasting_task().await;
         task.ue_addresses.insert(1, ue.local_addr().unwrap());
 
-        task.handle_downlink_data(1, 1, OctetString::from_slice(&[0x11; 16]))
+        // `drb_id == psi`: each session's default DRB keeps the identity the PSI
+        // produced, so this is the same pair of bearers with the feature on or off.
+        task.handle_downlink_data(1, 1, 1, OctetString::from_slice(&[0x11; 16]))
             .await;
-        task.handle_downlink_data(1, 5, OctetString::from_slice(&[0x55; 16]))
+        task.handle_downlink_data(1, 5, 5, OctetString::from_slice(&[0x55; 16]))
             .await;
 
         let (first_psi, first) = recv_um_pdu(&ue).await.expect("PSI 1 PDU");
@@ -1222,6 +1345,126 @@ mod tests {
         );
     }
 
+    /// The same property one level down, for the split issue #44 introduced: the TWO
+    /// DRBs of ONE PDU session must get independent sequence-number spaces, because
+    /// TS 38.322 §4.2.1 gives every radio bearer its own RLC entity and the session is
+    /// no longer the bearer.
+    ///
+    /// # Why this is a unit test and not an end-to-end one
+    ///
+    /// The corruption a shared entity causes needs both streams to be IN FLIGHT at
+    /// once: two segment streams interleaved into one SN counter, which the peer
+    /// demultiplexes into two entities each expecting a contiguous sequence. The
+    /// end-to-end harness cannot produce that, because
+    /// [`RlsTask::handle_downlink_data`] submits one SDU and then drains
+    /// `build_pdu` to exhaustion before it returns — so two sequential
+    /// `DownlinkData` messages segment, transmit and reassemble one at a time and
+    /// the two streams never coexist. `tests/src/sdap_user_plane.rs`'s
+    /// `two_drbs_of_one_session_carry_their_own_traffic` therefore covers addressing
+    /// and routing, and this test covers the numbering.
+    ///
+    /// Here the SDUs go to both entities BEFORE either is drained, and the drain then
+    /// takes one PDU per bearer per round the way a MAC scheduler would interleave
+    /// them. Keyed on the PSI both submissions land in one entity, so the second SDU
+    /// queues behind the first and goes out as SN 1 while the PDUs attributed to the
+    /// two bearers are whichever ones happened to be pulled on their turn — which is
+    /// what "reassembles into neither payload" means at the peer.
+    ///
+    /// Both payloads are segmented (over the 1500-byte grant) and of DIFFERENT
+    /// lengths, so a wholesale swap between the bearers cannot look correct either.
+    #[cfg(feature = "sdap-dataplane")]
+    #[test]
+    fn two_drbs_of_one_session_get_independent_sequence_number_spaces() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base);
+
+        // The identities the live path uses, taken from the allocator rather than
+        // written out, so a change to the numbering moves this test with it.
+        let psi = 1;
+        let alloc = nextgsim_gtp::qfi_drb::allocate_drbs(psi as u8);
+        let (default_drb, gbr_drb) = (i32::from(alloc.default_drb_id), i32::from(alloc.gbr_drb_id));
+        assert_ne!(
+            default_drb, gbr_drb,
+            "precondition: the session's two DRBs must be distinct, or this test is \
+             asserting about one bearer twice"
+        );
+
+        // Distinct fills and distinct lengths, both over `MAC_GRANT_BYTES` so each is
+        // segmented -- segmentation is what makes an interleave possible at all.
+        let on_default = vec![0xA5u8; 2000];
+        let on_gbr = vec![0x5Au8; 2400];
+
+        // BOTH bearers loaded before EITHER is drained. This is the state the
+        // end-to-end harness cannot reach, and the only state in which sharing an
+        // entity corrupts rather than merely renumbers.
+        //
+        // `psi` is the same for both calls on purpose: it is one PDU session, so the
+        // PSI cannot be what separates these two bearers.
+        task.rlc_entity_for(1, default_drb, psi)
+            .submit_sdu(on_default.clone());
+        task.rlc_entity_for(1, gbr_drb, psi)
+            .submit_sdu(on_gbr.clone());
+
+        // One PDU per bearer per round, until both bearers are empty -- the
+        // interleave a MAC scheduler would produce.
+        let mut produced: HashMap<i32, Vec<nextgsim_rlc::RlcUmPdu>> = HashMap::new();
+        loop {
+            let mut any = false;
+            for drb_id in [default_drb, gbr_drb] {
+                if let Some(bytes) = task
+                    .rlc_entity_for(1, drb_id, psi)
+                    .build_pdu(MAC_GRANT_BYTES)
+                {
+                    any = true;
+                    let pdu = nextgsim_rlc::RlcUmPdu::decode_sn12(&bytes)
+                        .expect("the entity's own PDU must decode");
+                    produced.entry(drb_id).or_default().push(pdu);
+                }
+            }
+            if !any {
+                break;
+            }
+        }
+
+        for (drb_id, expected) in [(default_drb, &on_default), (gbr_drb, &on_gbr)] {
+            let pdus = produced
+                .get(&drb_id)
+                .unwrap_or_else(|| panic!("DRB {drb_id} produced no PDU at all"));
+            assert!(
+                pdus.len() >= 2,
+                "DRB {drb_id}'s payload must be segmented, or the interleave this test \
+                 is about never happens -- got {} PDU(s)",
+                pdus.len()
+            );
+            // The first SDU of a bearer is SN 0, and all segments of one SDU share
+            // that SN (TS 38.322 §5.2.2.1), so EVERY PDU here is SN 0. A bearer that
+            // shared the other's entity would carry the other bearer's SN instead.
+            let sns: Vec<u16> = pdus.iter().map(|p| p.sn).collect();
+            assert!(
+                sns.iter().all(|&sn| sn == 0),
+                "DRB {drb_id} must number in its OWN sequence-number space, so its \
+                 first SDU's segments are all SN 0 -- got {sns:?}, which means the two \
+                 DRBs of PSI {psi} are sharing one counter"
+            );
+            // And the segments attributed to this bearer really are this bearer's SDU:
+            // a shared entity hands out the other flow's segments on this bearer's
+            // turn, and the peer then reassembles bytes belonging to neither payload.
+            let reassembled: Vec<u8> = pdus.iter().flat_map(|p| p.data.clone()).collect();
+            assert_eq!(
+                &reassembled, expected,
+                "DRB {drb_id}'s segments must reassemble into ITS payload"
+            );
+        }
+
+        assert_eq!(
+            task.rlc_entities.len(),
+            2,
+            "one RLC entity per (UE, DRB), so one PDU session's two DRBs are two \
+             entities -- a PSI key would make this 1"
+        );
+    }
+
     /// The `t-Reassembly` tick is wired into the task's run loop, not just
     /// implemented on the entity: a partial SDU abandoned by the timer must NOT
     /// be resurrected by a segment that arrives late.
@@ -1229,6 +1472,15 @@ mod tests {
     /// Drives the real run loop over loopback UDP with a test socket standing in
     /// for the UE's radio, because the tick lives in the loop's periodic arm and
     /// nothing else would exercise it.
+    /// The QFI the simulated UE puts in its uplink SDAP headers.
+    ///
+    /// Any value in 0..=63 does: the gNB logs the uplink QFI but does not route on it
+    /// (the PDU session already names the tunnel), so no assertion in this module
+    /// depends on which one. 1 matches the QFI the GTP task's auto-created sessions
+    /// use, so a reader is not led to think the number is arbitrary in the gNB too.
+    #[cfg(feature = "sdap-dataplane")]
+    const TEST_QFI: u8 = 1;
+
     /// What a conformant peer puts in an RLC SDU on a DRB.
     ///
     /// With the `drb-pdcp` feature the DRB carries PDCP PDUs, so a test that
@@ -1236,10 +1488,25 @@ mod tests {
     /// octets read as a PDCP header. Without the feature it is the payload itself,
     /// which is what the peer sent before issue #33.
     ///
+    /// With `sdap-dataplane` it additionally carries a one-octet UL SDAP header
+    /// (TS 37.324 §6.2.2.3), because that is what a conformant UE transmits and the
+    /// gNB's uplink path strips one. A helper that skipped it would have the gNB read
+    /// the payload's first octet as the header — which is not even a clean failure:
+    /// a first byte with the D/C bit set decodes as a plausible header and the SDU
+    /// arrives one octet short, while one with it clear is discarded as a Control PDU.
+    ///
     /// `sn` is the PDCP SN, and it matters: PDCP delivers in order, so two SDUs
     /// sent with the same SN would be a duplicate and the second discarded.
+    // `sn` is read only by the PDCP branch, so it is unused whenever that feature is
+    // off -- regardless of `sdap-dataplane`, which does not carry a sequence number.
     #[cfg_attr(not(feature = "drb-pdcp"), allow(unused_variables))]
     fn drb_sdu(payload: Vec<u8>, sn: u32) -> Vec<u8> {
+        // SDAP first, and PDCP second, because SDAP is ABOVE PDCP (TS 37.324 §4.2):
+        // the header has to end up INSIDE what PDCP protects, which is the order the
+        // gNB's own downlink path uses in `handle_downlink_data`.
+        #[cfg(feature = "sdap-dataplane")]
+        let payload = nextgsim_pdcp::sdap::build_ul_pdu(TEST_QFI, &payload)
+            .expect("a test QFI must fit the 6-bit SDAP field");
         #[cfg(feature = "drb-pdcp")]
         {
             let mut pdcp = nextgsim_pdcp::Pdcp::new(nextgsim_pdcp::PdcpConfig::default());
@@ -1371,13 +1638,15 @@ mod tests {
             GnbTaskBase::new(am_config(), 16);
         let mut task = RlsTask::new(task_base);
 
+        // `(ue_id, drb_id, psi)`: the mode is decided by the PSI even though the entity
+        // is keyed by the DRB identity, because `rlc_am_psis` is a list of sessions.
         assert_eq!(
-            task.rlc_entity_for(1, 5).mode,
+            task.rlc_entity_for(1, 5, 5).mode,
             RlcMode::AcknowledgedMode,
             "PSI 5 is configured for AM"
         );
         assert_eq!(
-            task.rlc_entity_for(1, 1).mode,
+            task.rlc_entity_for(1, 1, 1).mode,
             RlcMode::UnacknowledgedMode,
             "an unlisted PSI keeps the UM default"
         );

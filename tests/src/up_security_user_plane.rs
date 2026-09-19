@@ -49,8 +49,17 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 const PSI: i32 = 1;
+/// The DRB identity `PSI`'s session uses. Equal to the PSI because a session's
+/// DEFAULT DRB keeps the identity the PSI produced
+/// (`nextgsim_gtp::qfi_drb::allocate_drbs`), so this suite describes the same bearer
+/// with `sdap-dataplane` on or off (issue #44) — and `BEARER` below stays right.
+const DRB_ID: i32 = PSI;
 /// BEARER for DRB 1: the radio bearer identity minus one (TS 33.501 Annex D.3.1.2).
 const BEARER: u8 = 0;
+/// The QoS flow this session's traffic rides (issue #44). 5QI 9 is best-effort
+/// non-GBR, so the policy maps it to the session's **default** DRB — `DRB_ID`, the
+/// only bearer this suite establishes.
+const QFI_NON_GBR: u8 = 9;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Long enough for a PDU that WILL be delivered to arrive, short enough that a
@@ -171,11 +180,48 @@ fn binding(integrity_alg_id: Option<u8>, tx_direction: u8) -> Box<PdcpSecurity> 
 }
 
 /// Keys both ends of the DRB, as NGAP and RRC would after an Initial Context Setup.
+///
+/// With `sdap-dataplane` this also installs the QoS-flow-to-DRB mapping, because the
+/// same `RRCReconfiguration` that carries the DRB's security also carries its
+/// `SDAP-Config` — and the UPLINK half of this suite does not work without it. The UE
+/// stamps an uplink SDAP header only for a session it has a mapping for; with none it
+/// sends the SDU unstamped (a deliberate choice, so a packet that beats its
+/// reconfiguration is not lost), and a gNB built with the feature then discards it as
+/// an undecodable header. That is the whole uplink, silently gone — so the mapping is
+/// not decoration here, it is what makes the session sendable.
+///
+/// The downlink needs no such thing: the UE resolves a DRB back to a PSI via
+/// `psi_for_drb`, which falls back to the DRB identity, and `DRB_ID == PSI` here.
+#[cfg(feature = "sdap-dataplane")]
 async fn key_both_ends(h: &Harness, ue_id: i32, integrity_alg_id: Option<u8>) {
+    install_security(h, ue_id, integrity_alg_id).await;
+    h.ue_rls_tx
+        .send(UeRlsMessage::InstallSdapMapping {
+            psi: PSI,
+            drb_id: DRB_ID,
+            qfis: vec![QFI_NON_GBR],
+            // The session's default DRB, which is the bearer the UE's uplink rides:
+            // it has no per-packet classifier to pick another with.
+            default_drb: true,
+        })
+        .await
+        .expect("UE RLS task alive");
+}
+
+/// Without the feature there is no mapping to install, so keying is all there is —
+/// byte-identical to what this suite did before #44.
+#[cfg(not(feature = "sdap-dataplane"))]
+async fn key_both_ends(h: &Harness, ue_id: i32, integrity_alg_id: Option<u8>) {
+    install_security(h, ue_id, integrity_alg_id).await;
+}
+
+/// The keying itself, shared by both arms of `key_both_ends`.
+async fn install_security(h: &Harness, ue_id: i32, integrity_alg_id: Option<u8>) {
     h.gnb_rls_tx
         .send(GnbRlsMessage::InstallDrbSecurity {
             ue_id,
             psi: PSI,
+            drb_id: DRB_ID,
             security: Some(binding(integrity_alg_id, DIRECTION_DOWNLINK)),
         })
         .await
@@ -183,10 +229,49 @@ async fn key_both_ends(h: &Harness, ue_id: i32, integrity_alg_id: Option<u8>) {
     h.ue_rls_tx
         .send(UeRlsMessage::InstallDrbSecurity {
             psi: PSI,
+            drb_id: DRB_ID,
             security: Some(binding(integrity_alg_id, DIRECTION_UPLINK)),
         })
         .await
         .expect("UE RLS task alive");
+}
+
+/// What the gNB's RLS task expects in `DownlinkData.pdu`.
+///
+/// # Why a test about PDCP security has to know about SDAP
+///
+/// `RlsMessage::DownlinkData` is the boundary BELOW the SDAP sublayer: on the live
+/// path the gNB's GTP task has already prepended the one-octet header (TS 37.324
+/// §6.2.2) by the time it sends one. So with `sdap-dataplane` the field carries an
+/// SDAP Data PDU and without it a bare SDU, and a test that injects here is standing
+/// in for the GTP task — it owes the same framing. SDAP sits ABOVE PDCP (§4.2), so
+/// the header is inside what PDCP ciphers and integrity-protects, which is exactly
+/// what makes this the right place for the test to add it: the sublayer under test
+/// sees no difference.
+///
+/// Sending a bare SDU feature-on is not "testing the unprotected framing", it is
+/// sending a malformed PDU that the UE correctly refuses to deliver. Both symptoms
+/// showed up here: `0xD0`-filled and `b"protected"`-style payloads whose first octet
+/// has bit 8 set decode as a "valid" header and arrive one octet short, while a
+/// payload starting `0x00` (`(0..64u8).collect()`) reads as a Control PDU and is
+/// discarded outright (issue #44).
+///
+/// Built with the SHIPPED encoder, so a change to the octet layout moves this helper
+/// rather than leaving it encoding a stale format.
+#[cfg(feature = "sdap-dataplane")]
+fn framed(qfi: u8, sdu: &[u8]) -> Vec<u8> {
+    use nextgsim_pdcp::sdap::{build_dl_pdu, SdapHeader};
+    // RQI clear: reflective QoS (TS 23.501 §5.7.5.3) is orthogonal to user-plane
+    // security, and setting it would have the UE log a flow property this suite never
+    // established.
+    build_dl_pdu(SdapHeader { qfi, rqi: false }, sdu).expect("a legal QFI")
+}
+
+/// Without the feature the field is the bare SDU, exactly as before #44 — so what
+/// this suite puts on the wire is byte-identical to what it always did.
+#[cfg(not(feature = "sdap-dataplane"))]
+fn framed(_qfi: u8, sdu: &[u8]) -> Vec<u8> {
+    sdu.to_vec()
 }
 
 async fn collect_at_ue(
@@ -246,7 +331,8 @@ async fn protected_drb_traffic_survives_in_both_directions() {
             .send(GnbRlsMessage::DownlinkData {
                 ue_id,
                 psi: PSI,
-                pdu: OctetString::from_slice(payload),
+                drb_id: DRB_ID,
+                pdu: OctetString::from_slice(&framed(QFI_NON_GBR, payload)),
             })
             .await
             .expect("gNB RLS task alive");
@@ -293,6 +379,7 @@ async fn an_unprotected_peer_cannot_read_a_protected_drb() {
         .send(GnbRlsMessage::InstallDrbSecurity {
             ue_id,
             psi: PSI,
+            drb_id: DRB_ID,
             security: Some(binding(Some(2), DIRECTION_DOWNLINK)),
         })
         .await
@@ -303,7 +390,13 @@ async fn an_unprotected_peer_cannot_read_a_protected_drb() {
         .send(GnbRlsMessage::DownlinkData {
             ue_id,
             psi: PSI,
-            pdu: OctetString::from_slice(&payload),
+            // Framed like every other injection here even though this test's
+            // assertion is negative: what the mismatch must be shown to break is the
+            // REAL downlink, and a bare SDU would let the test pass for the wrong
+            // reason — the UE rejecting malformed framing rather than failing to
+            // decipher.
+            drb_id: DRB_ID,
+            pdu: OctetString::from_slice(&framed(QFI_NON_GBR, &payload)),
         })
         .await
         .expect("gNB RLS task alive");
@@ -346,6 +439,7 @@ async fn an_unprotected_gnb_does_not_recover_a_protected_uplink() {
     h.ue_rls_tx
         .send(UeRlsMessage::InstallDrbSecurity {
             psi: PSI,
+            drb_id: DRB_ID,
             security: Some(binding(Some(2), DIRECTION_UPLINK)),
         })
         .await
@@ -399,7 +493,8 @@ async fn a_ciphering_only_drb_delivers_the_whole_payload() {
         .send(GnbRlsMessage::DownlinkData {
             ue_id,
             psi: PSI,
-            pdu: OctetString::from_slice(&payload),
+            drb_id: DRB_ID,
+            pdu: OctetString::from_slice(&framed(QFI_NON_GBR, &payload)),
         })
         .await
         .expect("gNB RLS task alive");
@@ -422,7 +517,8 @@ async fn removing_the_binding_returns_the_drb_to_the_clear() {
         .send(GnbRlsMessage::DownlinkData {
             ue_id,
             psi: PSI,
-            pdu: OctetString::from_slice(b"protected"),
+            drb_id: DRB_ID,
+            pdu: OctetString::from_slice(&framed(QFI_NON_GBR, b"protected")),
         })
         .await
         .expect("gNB RLS task alive");
@@ -436,6 +532,7 @@ async fn removing_the_binding_returns_the_drb_to_the_clear() {
             .send(GnbRlsMessage::InstallDrbSecurity {
                 ue_id,
                 psi: PSI,
+                drb_id: DRB_ID,
                 security: None,
             })
             .await
@@ -443,6 +540,7 @@ async fn removing_the_binding_returns_the_drb_to_the_clear() {
         h.ue_rls_tx
             .send(UeRlsMessage::InstallDrbSecurity {
                 psi: PSI,
+                drb_id: DRB_ID,
                 security: None,
             })
             .await
@@ -453,7 +551,8 @@ async fn removing_the_binding_returns_the_drb_to_the_clear() {
         .send(GnbRlsMessage::DownlinkData {
             ue_id,
             psi: PSI,
-            pdu: OctetString::from_slice(b"in-the-clear"),
+            drb_id: DRB_ID,
+            pdu: OctetString::from_slice(&framed(QFI_NON_GBR, b"in-the-clear")),
         })
         .await
         .expect("gNB RLS task alive");

@@ -30,6 +30,14 @@ drb-pdcp = []
 # without an entity there is nothing to protect. Both ends must agree -- a UE with
 # it on and a gNB with it off would cipher uplink the gNB reads as plaintext.
 up-security = ["drb-pdcp"]
+# SDAP on the user plane: the UE strips the one-octet DL SDAP header and prepends
+# one on the uplink, and its DRBs are keyed by DRB identity rather than by PSI
+# (issue #44, TS 37.324 §5.1/§6.2.2). Off by default and for the same reason as on
+# the gNB: a UE that stripped a header a gNB never prepended would eat the first
+# octet of every downlink IP packet. The mapping is not recomputed here -- it is
+# read out of the `SDAP-Config` the network signalled, so the network's policy can
+# change without a matching UE change.
+sdap-dataplane = []
 # Sidelink / ProSe PC5 surface (issue #54, TS 23.304). Off by default because the
 # surface is a FACADE: only `StartDiscovery`/`StopDiscovery` are ever sent, and
 # `EstablishPc5Link` flips straight to `Active` with no over-the-air exchange, so

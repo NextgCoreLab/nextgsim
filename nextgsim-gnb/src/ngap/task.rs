@@ -36,8 +36,13 @@ use crate::rrc::transaction::RrcProcedure;
 use nextgsim_rrc::procedures::handover_preparation::{
     encode_handover_preparation_information, HandoverPreparationParams,
 };
+// The single-DRB builder is not imported here: `establish_drb` goes through
+// `build_multi_drb_reconfiguration_params` for one bearer as well as two (issue #44),
+// so the only remaining caller of the single-DRB one is a test, which imports it
+// itself rather than leaving an unused name in the production scope.
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
-    build_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
+    build_multi_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
+    DrbSpec,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
 use nextgsim_rrc::procedures::security_mode::{
@@ -1226,11 +1231,21 @@ impl NgapTask {
     /// session id and the accepted QFIs in mappedQoS-FlowsToAdd) plus the
     /// matching CellGroupConfig (one RLC bearer). Requires AS security to be
     /// active (established at Initial Context Setup, C5).
+    ///
+    /// # With `sdap-dataplane`: TWO DRBs, and the QFI decides which (issue #44)
+    ///
+    /// TS 37.324 §5.1 has an SDAP entity map each QoS flow onto a DRB. With the
+    /// feature on, the session gets a default DRB and a GBR DRB, each carrying the
+    /// subset of QFIs the policy in `nextgsim_gtp::qfi_drb` assigns it, and the UE
+    /// is **told** the mapping through each DRB's `mappedQoS-FlowsToAdd`.
+    ///
+    /// The default DRB keeps the identity the PSI produced, so a session with one
+    /// flow is numbered identically with the feature on or off.
     async fn establish_drb(
         &mut self,
         ue_id: i32,
         psi: u8,
-        qfis: &[u8],
+        accepted_flows: &[(u8, Option<u16>)],
         integrity_protection: DrbIntegrityProtection,
     ) {
         if !self
@@ -1243,6 +1258,7 @@ impl NgapTask {
                 psi, ue_id
             );
         }
+        let qfis: Vec<u8> = accepted_flows.iter().map(|(qfi, _)| *qfi).collect();
         // One DRB per PDU session; DRB identity 1..=32, DTCH LCID above the SRBs.
         let drb_id = Self::drb_identity_for(psi);
         let lcid = (3 + drb_id).min(32);
@@ -1267,14 +1283,15 @@ impl NgapTask {
         // `None` when the configured margin is not signallable: the DRB half of
         // this message still goes out. See `rrc::meas::a3_meas_config_params`.
         let meas_config = a3_meas_config_params(&self.task_base.config);
-        let params = match build_drb_reconfiguration_params(
+
+        // The DRB set this session gets. With `sdap-dataplane` the QFI→DRB policy
+        // decides it (issue #44); without, it is the single bearer keyed by PSI that
+        // the pre-SDAP path has always sent, byte for byte.
+        let specs = self.drb_specs_for(psi, accepted_flows, drb_id, lcid, integrity_protection);
+        let params = match build_multi_drb_reconfiguration_params(
             rrc_transaction_id,
             psi,
-            drb_id,
-            lcid,
-            qfis,
-            true,
-            integrity_protection,
+            &specs,
             meas_config,
         ) {
             Ok(p) => p,
@@ -1296,8 +1313,15 @@ impl NgapTask {
                     error!("Failed to hand RRCReconfiguration to RRC task: {}", e);
                 } else {
                     info!(
-                        "Sent RRCReconfiguration establishing DRB {} for PDU session {} (QFIs {:?})",
-                        drb_id, psi, qfis
+                        "Sent RRCReconfiguration establishing {} DRB(s) for PDU session {}: {} (all QFIs {:?})",
+                        specs.len(),
+                        psi,
+                        specs
+                            .iter()
+                            .map(|s| format!("DRB {} <- QFIs {:?}", s.drb_id, s.qfis))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        qfis
                     );
                 }
             }
@@ -1305,6 +1329,75 @@ impl NgapTask {
                 "Failed to encode RRCReconfiguration for PDU session {}: {}",
                 psi, e
             ),
+        }
+    }
+
+    /// The DRB set one PDU session gets, and which QFIs ride each (issue #44).
+    ///
+    /// Without `sdap-dataplane`: exactly the single bearer the pre-SDAP path sent —
+    /// all QFIs on one default DRB with the PSI-derived identity and LCID. The
+    /// `build_multi_drb_*` builders are byte-identical to the single-DRB ones for a
+    /// lone bearer (pinned by
+    /// `the_multi_drb_builder_matches_the_single_drb_one_for_a_lone_bearer`), so the
+    /// message is unchanged and the frozen golden vectors still describe it.
+    ///
+    /// With the feature: two bearers, split by the 5QI's resource type, and the
+    /// GBR one is **omitted when no admitted flow maps to it** — a DRB with no QoS
+    /// flow is an RLC and PDCP entity nothing would ever feed, and signalling it
+    /// would have the UE build the same pair of idle entities.
+    fn drb_specs_for(
+        &self,
+        psi: u8,
+        accepted_flows: &[(u8, Option<u16>)],
+        drb_id: u8,
+        lcid: u8,
+        integrity_protection: DrbIntegrityProtection,
+    ) -> Vec<DrbSpec> {
+        #[cfg(not(feature = "sdap-dataplane"))]
+        {
+            let _ = psi;
+            vec![DrbSpec {
+                drb_id,
+                lcid,
+                qfis: accepted_flows.iter().map(|(qfi, _)| *qfi).collect(),
+                default_drb: true,
+                integrity_protection,
+            }]
+        }
+        #[cfg(feature = "sdap-dataplane")]
+        {
+            use nextgsim_gtp::qfi_drb::{allocate_drbs, DrbChoice, QfiDrbMap};
+
+            let mut map = QfiDrbMap::new();
+            for &(qfi, five_qi) in accepted_flows {
+                map.admit_flow(qfi, five_qi);
+            }
+            let alloc = allocate_drbs(psi);
+            debug_assert_eq!(
+                alloc.default_drb_id, drb_id,
+                "the default DRB must keep the identity the PSI produced, or a \
+                 session's bearer is renumbered by a cargo feature"
+            );
+            debug_assert_eq!(alloc.default_lcid, lcid);
+
+            let mut specs = vec![DrbSpec {
+                drb_id: alloc.default_drb_id,
+                lcid: alloc.default_lcid,
+                qfis: map.qfis_for(DrbChoice::Default),
+                default_drb: true,
+                integrity_protection,
+            }];
+            let gbr_qfis = map.qfis_for(DrbChoice::Gbr);
+            if !gbr_qfis.is_empty() {
+                specs.push(DrbSpec {
+                    drb_id: alloc.gbr_drb_id,
+                    lcid: alloc.gbr_lcid,
+                    qfis: gbr_qfis,
+                    default_drb: false,
+                    integrity_protection,
+                });
+            }
+            specs
         }
     }
 
@@ -1423,6 +1516,14 @@ impl NgapTask {
             let msg = crate::tasks::RlsMessage::InstallDrbSecurity {
                 ue_id,
                 psi: psi as i32,
+                // The DEFAULT DRB, which is the bearer `bearer` above was derived from
+                // and the only one this function keys (issue #44). A session's GBR DRB
+                // is left unprotected by design for now: `PdcpSecurity::bearer` is
+                // per-bearer, so the second DRB needs its own binding with its own
+                // BEARER, and installing THIS one on it would cipher it with a BEARER
+                // the UE does not use -- silently failing every MAC-I on that DRB
+                // instead of leaving it visibly unprotected.
+                drb_id: Self::drb_identity_for(psi) as i32,
                 security,
             };
             if let Err(e) = self.task_base.rls_tx.send(msg).await {
@@ -1441,18 +1542,22 @@ impl NgapTask {
     /// Keys before the reconfiguration, deliberately: the RRCReconfiguration tells the
     /// UE to start protecting, so the gNB's own entity has to be able to verify by the
     /// time the UE's first protected uplink PDU arrives.
+    /// `accepted_flows` is `(qfi, five_qi)` per admitted QoS flow. The 5QI rides
+    /// along because it is what the QFI→DRB policy decides on (issue #44): a flow's
+    /// resource type comes from its 5QI, and the QFI alone says nothing about
+    /// whether the flow is GBR. `None` for a dynamic 5QI.
     async fn key_and_establish_drb(
         &mut self,
         ue_id: i32,
         psi: u8,
-        accepted_qfis: &[u8],
+        accepted_flows: &[(u8, Option<u16>)],
         decision: DrbSecurityDecision,
     ) {
         self.install_drb_security(ue_id, psi, decision).await;
         self.establish_drb(
             ue_id,
             psi,
-            accepted_qfis,
+            accepted_flows,
             if decision.integrity {
                 DrbIntegrityProtection::Enabled
             } else {
@@ -1519,6 +1624,17 @@ impl NgapTask {
         let upf_addr = request.ul_tunnel.address;
         // First QoS flow is the default flow for the session
         let qfi = request.qos_flows[0].qfi;
+        // The 5QI rides with the QFI because it is what the QFI→DRB policy decides
+        // on (issue #44): a flow's resource type comes from its 5QI, and the QFI
+        // alone says nothing about whether the flow is GBR. Built here, above the
+        // `SessionCreate`, because the GTP task's SDAP entity needs the same set the
+        // RRCReconfiguration below describes -- the two must agree on the mapping or
+        // the gNB sends an SDU down a bearer the UE was never told about.
+        let accepted_flows: Vec<(u8, Option<u16>)> = request
+            .qos_flows
+            .iter()
+            .map(|f| (f.qfi, f.five_qi))
+            .collect();
 
         // Allocate gNB DL TEID for the N3 tunnel
         let gnb_teid = self.next_downlink_teid();
@@ -1549,6 +1665,7 @@ impl NgapTask {
         let resource = PduSessionResource {
             psi: psi as i32,
             qfi: Some(qfi),
+            qos_flows: accepted_flows.clone(),
             // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
             // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
             uplink_teid: upf_teid,
@@ -1589,7 +1706,10 @@ impl NgapTask {
         // TS 38.331 §5.3.5.6: establish the PDU session's user-plane DRB via an
         // RRCReconfiguration carrying the accepted QoS flows (QFIs).
         let accepted_qfis: Vec<u8> = request.qos_flows.iter().map(|f| f.qfi).collect();
-        self.key_and_establish_drb(ue_id, psi, &accepted_qfis, decision)
+        // `accepted_flows` is the same set the `SessionCreate` above carried, by
+        // construction: one binding shared by both, so the GTP task's SDAP mapping and
+        // the mapping the UE is told cannot drift apart.
+        self.key_and_establish_drb(ue_id, psi, &accepted_flows, decision)
             .await;
 
         // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
@@ -1834,6 +1954,21 @@ impl NgapTask {
             let resource = PduSessionResource {
                 psi: psi as i32,
                 qfi: Some(qfi),
+                // The Modify Request Transfer's `qosFlowAddOrModifyRequestList`
+                // decodes to QFIs alone (`Vec<u8>`) -- this codec does not carry the
+                // per-flow `QosFlowLevelQosParameters`, so there is no 5QI to rebuild
+                // a mapping from. `None` each, which puts every modified flow on the
+                // default DRB (TS 37.324 §5.3.1's rule for a flow with no explicit
+                // mapping). That is a real ceiling: a GBR flow ADDED by a Modify would
+                // land on the default bearer rather than the GBR one until the codec
+                // surfaces the 5QI. Stated rather than papered over with a guessed
+                // 5QI, which would put flows on a GBR bearer the UE was never told
+                // about — the reconfiguration this path does not send.
+                qos_flows: request
+                    .qos_flows_add_or_modify
+                    .iter()
+                    .map(|&qfi| (qfi, None))
+                    .collect(),
                 // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
                 // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
                 uplink_teid: upf_teid,
@@ -2407,6 +2542,12 @@ impl NgapTask {
         let resource = PduSessionResource {
             psi: psi as i32,
             qfi,
+            // This path adds a session from a handover or context transfer and never
+            // sees a `QosFlowSetupInfo`, so the only flow it can name is the default
+            // one it was handed -- with no 5QI, since nothing told it one. Consistent
+            // with the local security default the same function applies just above:
+            // where no policy arrived, state the conservative one rather than invent.
+            qos_flows: qfi.map(|qfi| (qfi, None)).into_iter().collect(),
             uplink_teid,
             downlink_teid,
             upf_address,
@@ -3623,6 +3764,15 @@ impl NgapTask {
         let upf_teid = request.ul_tunnel.teid;
         let upf_addr = request.ul_tunnel.address;
         let qfi = request.qos_flows[0].qfi;
+        // See the same binding in `setup_one_pdu_session`: hoisted above the
+        // `SessionCreate` so the GTP task's SDAP entity and the RRCReconfiguration
+        // below describe one mapping. A handover-in that got this wrong would hand the
+        // UE a bearer set the target gNB does not route to.
+        let accepted_flows: Vec<(u8, Option<u16>)> = request
+            .qos_flows
+            .iter()
+            .map(|f| (f.qfi, f.five_qi))
+            .collect();
         let gnb_teid = self.next_downlink_teid();
 
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
@@ -3640,6 +3790,7 @@ impl NgapTask {
         let resource = PduSessionResource {
             psi: psi as i32,
             qfi: Some(qfi),
+            qos_flows: accepted_flows.clone(),
             uplink_teid: upf_teid,
             downlink_teid: gnb_teid,
             upf_address: upf_addr,
@@ -3660,7 +3811,7 @@ impl NgapTask {
         }
 
         let accepted_qfis: Vec<u8> = request.qos_flows.iter().map(|f| f.qfi).collect();
-        self.key_and_establish_drb(ue_id, psi, &accepted_qfis, decision)
+        self.key_and_establish_drb(ue_id, psi, &accepted_flows, decision)
             .await;
 
         let transfer = match encode_handover_ack_transfer(&HandoverAckTransferParams {
@@ -4219,6 +4370,15 @@ impl NgapTask {
                 let resource = PduSessionResource {
                     psi: s.psi as i32,
                     qfi: s.qfi,
+                    // Empty, and that is the correct value here rather than a gap: a
+                    // path switch moves the N3 tunnel and touches no QoS flow, and the
+                    // GTP task treats a modify's flow list as a delta (issue #44), so
+                    // an empty one leaves the session's SDAP mapping exactly as the
+                    // setup built it. Restating `s.qfi` here would be worse than
+                    // useless -- `NgapPduSession` keeps no 5QI, so it would re-admit
+                    // the default flow with `None` and demote a GBR flow to the
+                    // default DRB the UE is not using for it.
+                    qos_flows: Vec::new(),
                     // NgapPduSession stores UPF TEID in downlink_teid and gNB TEID in
                     // uplink_teid (internal convention); the GTP task expects the opposite
                     // (uplink_teid = UPF dest). Map across the boundary here.
@@ -4943,11 +5103,14 @@ mod tests {
     fn test_gnb_drb_reconfiguration_is_valid_and_carries_qfis() {
         use nextgsim_rrc::codec::decode_rrc;
         use nextgsim_rrc::codec::generated::DL_DCCH_Message;
-        use nextgsim_rrc::procedures::rrc_reconfiguration::is_rrc_reconfiguration;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            build_drb_reconfiguration_params, is_rrc_reconfiguration,
+        };
 
-        // The exact call establish_drb makes: PDU session 5, DRB 5, LCID 8,
-        // accepted QFIs 1 & 9, and the A3 measConfig from THIS gNB's configuration
-        // (issue #170). The result must be a decodable DL-DCCH RRCReconfiguration.
+        // The single-DRB shape `establish_drb` used before issue #44 and still produces
+        // byte for byte without `sdap-dataplane`: PDU session 5, DRB 5, LCID 8, accepted
+        // QFIs 1 & 9, and the A3 measConfig from THIS gNB's configuration (issue #170).
+        // The result must be a decodable DL-DCCH RRCReconfiguration.
         let params = build_drb_reconfiguration_params(
             0,
             5,
@@ -4985,7 +5148,9 @@ mod tests {
             GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
         let mut task = NgapTask::new(task_base);
 
-        task.establish_drb(1, 1, &[1], DrbIntegrityProtection::Disabled)
+        // One flow with no 5QI, so the QFI→DRB policy puts it on the default DRB and
+        // this measConfig assertion sees one bearer with `sdap-dataplane` on or off.
+        task.establish_drb(1, 1, &[(1, None)], DrbIntegrityProtection::Disabled)
             .await;
 
         let pdu = loop {
@@ -5025,7 +5190,9 @@ mod tests {
             GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
         let mut task = NgapTask::new(task_base);
 
-        task.establish_drb(1, 1, &[1], DrbIntegrityProtection::Disabled)
+        // One flow with no 5QI, so the QFI→DRB policy puts it on the default DRB and
+        // this measConfig assertion sees one bearer with `sdap-dataplane` on or off.
+        task.establish_drb(1, 1, &[(1, None)], DrbIntegrityProtection::Disabled)
             .await;
 
         let pdu = loop {
@@ -7283,15 +7450,21 @@ mod tests {
             if let TaskMessage::Message(crate::tasks::RlsMessage::InstallDrbSecurity {
                 ue_id,
                 psi,
+                drb_id,
                 security,
             }) = msg
             {
-                installed = Some((ue_id, psi, security));
+                installed = Some((ue_id, psi, drb_id, security));
             }
         }
-        let (ue_id, psi, security) =
+        let (ue_id, psi, drb_id, security) =
             installed.expect("the RLS task must be handed the DRB's user-plane keys");
         assert_eq!((ue_id, psi), (28, 9));
+        assert_eq!(
+            drb_id, 9,
+            "the keys must name the DRB whose identity BEARER was derived from \
+             (issue #44), not merely the session"
+        );
         let security = security.expect("a protected DRB must carry a real binding");
         assert!(
             security.security.integrity_protected(),

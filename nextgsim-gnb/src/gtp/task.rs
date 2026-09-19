@@ -13,6 +13,10 @@ use tracing::{debug, error, info, warn};
 
 use nextgsim_gtp::codec::{GtpHeader, GtpMessageType};
 use nextgsim_gtp::path::{EchoOutcome, PathSupervisor};
+#[cfg(feature = "sdap-dataplane")]
+use nextgsim_gtp::qfi_drb::{allocate_drbs, QfiDrbMap};
+#[cfg(feature = "sdap-dataplane")]
+use nextgsim_gtp::qos::{Dscp, QosFlowEnforcer};
 use nextgsim_gtp::restart::RestartCounter;
 use nextgsim_gtp::tunnel::{GtpTunnel, PduSession, TunnelError, TunnelManager, GTP_U_PORT};
 
@@ -42,6 +46,22 @@ impl GtpUeContext {
     }
 }
 
+/// The SDAP entity's per-PDU-session state (TS 37.324 §5.1, issue #44).
+///
+/// One struct rather than two maps so the mapping and the enforcement cannot fall
+/// out of step: both are populated from the same `QosFlowSetupInfo` and both are
+/// meaningless for a session the other does not know about. A downlink packet whose
+/// QFI the mapping knew but the enforcer did not would be forwarded with no DSCP
+/// resolved, which is the silent half-configured state this shape rules out.
+#[cfg(feature = "sdap-dataplane")]
+#[derive(Debug, Default)]
+struct SdapSessionState {
+    /// Which DRB each admitted QFI maps to — the SDAP entity §5.1 requires.
+    qfi_drb: QfiDrbMap,
+    /// Per-flow DSCP resolution and MBR policing (TS 23.501 §5.7.2.6).
+    enforcer: QosFlowEnforcer,
+}
+
 /// GTP Task
 ///
 /// Handles GTP-U tunnel management and user plane data forwarding.
@@ -65,6 +85,16 @@ pub struct GtpTask {
     /// the prober runs: it also records peer restart counters seen in Echo Responses,
     /// which arrive whether or not this node probes.
     path_supervisor: PathSupervisor,
+    /// SDAP state keyed by `(ue_id, psi)` — one entity per PDU session, which is
+    /// what TS 37.324 §5.1 asks for (issue #44).
+    ///
+    /// Held here and not in `TunnelManager`'s `PduSession` because it is a RAN
+    /// decision about the *radio* side: the tunnel is the N3 leg and knows nothing
+    /// about DRBs. Keyed on the pair and not on the session key so the reader does
+    /// not have to round-trip through `make_session_key` to look a flow up on the
+    /// hot downlink path.
+    #[cfg(feature = "sdap-dataplane")]
+    sdap_sessions: HashMap<(i32, u8), SdapSessionState>,
 }
 
 impl GtpTask {
@@ -126,6 +156,8 @@ impl GtpTask {
             loopback_mode,
             restart_counter,
             path_supervisor,
+            #[cfg(feature = "sdap-dataplane")]
+            sdap_sessions: HashMap::new(),
         }
     }
 
@@ -161,6 +193,13 @@ impl GtpTask {
         let deleted = self.tunnel_manager.delete_sessions_for_ue(ue_id as u32);
         debug!("Deleted {} PDU sessions for UE {}", deleted.len(), ue_id);
 
+        // The SDAP entities go with the sessions they belong to (issue #44). Dropped
+        // rather than left to be overwritten because `ue_id`s are reallocated: the
+        // next UE handed this id would inherit this one's QFI→DRB mapping, and a
+        // downlink packet could be steered onto a GBR bearer nobody established.
+        #[cfg(feature = "sdap-dataplane")]
+        self.sdap_sessions.retain(|(id, _), _| *id != ue_id);
+
         // Remove UE context
         self.ue_contexts.remove(&ue_id);
         debug!("UE context released: ue_id={}", ue_id);
@@ -168,12 +207,41 @@ impl GtpTask {
 
     /// Handle PDU session create from NGAP
     fn handle_session_create(&mut self, ue_id: i32, resource: PduSessionResource) {
+        let created = self.create_tunnel_session(ue_id, &resource);
+
+        // Stand up the session's SDAP entity from the flows the core admitted
+        // (issue #44), but only for a session that actually exists -- an entity for a
+        // session the tunnel layer refused would map flows onto bearers no downlink
+        // packet can reach, and would outlive the failed setup.
+        //
+        // Done here and not lazily on the first downlink packet because the mapping is
+        // a function of the 5QIs, and the 5QIs only ever arrive on this message -- a
+        // G-PDU carries a QFI and nothing else, so an entity built from downlink
+        // traffic would map every flow to the default DRB, and the GBR bearer the UE
+        // was just told to build would never carry anything.
+        #[cfg(feature = "sdap-dataplane")]
+        if created {
+            self.install_sdap_session(ue_id, resource.psi as u8, &resource.qos_flows);
+        }
+        #[cfg(not(feature = "sdap-dataplane"))]
+        let _ = created;
+    }
+
+    /// Create the N3 tunnel half of a PDU session; `false` if it could not be made.
+    ///
+    /// Split out from [`Self::handle_session_create`] because create and modify share
+    /// the tunnel work but must NOT share what they do to the SDAP entity: a create
+    /// states the session's whole flow set, while a Modify Request's
+    /// `qosFlowAddOrModifyRequestList` names only the flows it touches, so treating
+    /// the two alike would have a modify silently release every flow it did not
+    /// mention.
+    fn create_tunnel_session(&mut self, ue_id: i32, resource: &PduSessionResource) -> bool {
         if !self.ue_contexts.contains_key(&ue_id) {
             error!(
                 "PDU session create failed: UE context not found for ue_id={}",
                 ue_id
             );
-            return;
+            return false;
         }
 
         let gtp_ip = self.task_base.config.gtp_ip;
@@ -204,6 +272,72 @@ impl GtpTask {
                 error!("PDU session create failed: {}", e);
             }
         }
+        true
+    }
+
+    /// Build the SDAP entity for one PDU session from its admitted QoS flows
+    /// (TS 37.324 §5.1, issue #44).
+    ///
+    /// Replaces any previous entity for the same `(ue_id, psi)` outright: this is
+    /// called for a *create*, which states the session's whole flow set, and a flow
+    /// left over from a previous session on the same id would otherwise keep a DRB
+    /// assignment nothing established. See [`Self::amend_sdap_session`] for the
+    /// modify case, which must not replace.
+    #[cfg(feature = "sdap-dataplane")]
+    fn install_sdap_session(&mut self, ue_id: i32, psi: u8, qos_flows: &[(u8, Option<u16>)]) {
+        let mut state = SdapSessionState::default();
+        Self::admit_flows(&mut state, qos_flows);
+        debug!(
+            "SDAP entity for ue_id={ue_id} psi={psi}: {} QoS flow(s) admitted {qos_flows:?}",
+            qos_flows.len()
+        );
+        self.sdap_sessions.insert((ue_id, psi), state);
+    }
+
+    /// Add or update the named flows on an existing session's SDAP entity, leaving
+    /// the flows it does not name alone (issue #44).
+    ///
+    /// What a Modify Request means: `qosFlowAddOrModifyRequestList` (TS 38.413
+    /// §9.3.4.3) is a delta, not a restatement, so flows absent from it are still
+    /// admitted. Rebuilding the entity from the delta would release them — and since
+    /// `QfiDrbMap` answers `Default` for an unknown QFI, the release would be silent:
+    /// a GBR flow would quietly start taking the default bearer instead of the GBR one
+    /// the UE is still configured for.
+    #[cfg(feature = "sdap-dataplane")]
+    fn amend_sdap_session(&mut self, ue_id: i32, psi: u8, qos_flows: &[(u8, Option<u16>)]) {
+        let state = self.sdap_sessions.entry((ue_id, psi)).or_default();
+        Self::admit_flows(state, qos_flows);
+        debug!(
+            "SDAP entity for ue_id={ue_id} psi={psi} amended with {} QoS flow(s) {qos_flows:?}",
+            qos_flows.len()
+        );
+    }
+
+    /// Admit `qos_flows` into both halves of one session's SDAP state.
+    ///
+    /// Shared so the mapping and the enforcer can never be given different flow sets:
+    /// a QFI in one and not the other is the half-configured state
+    /// [`SdapSessionState`] exists to prevent.
+    #[cfg(feature = "sdap-dataplane")]
+    fn admit_flows(state: &mut SdapSessionState, qos_flows: &[(u8, Option<u16>)]) {
+        for &(qfi, five_qi) in qos_flows {
+            state.qfi_drb.admit_flow(qfi, five_qi);
+            // `mbr_kbps` 0 is unlimited, which is deliberate: NGAP's
+            // `QosFlowLevelQosParameters` carries the GBR/MBR only for a GBR flow
+            // (TS 38.413 §9.3.1.12) and this gNB does not plumb it through yet, so a
+            // made-up ceiling would police traffic the core never capped. With no
+            // limiter the enforcer resolves the DSCP and admits every packet, which
+            // is the honest behaviour -- and the drop path is still live for the day
+            // a real MBR is configured.
+            //
+            // 9 stands in for a dynamic 5QI (non-GBR, default-bearer best effort,
+            // TS 23.501 Table 5.7.4-1): the enforcer keys its DSCP lookup on a 5QI
+            // and has no "unknown" value, and refusing to configure the flow at all
+            // would make `enforce` return `None` for a flow the core DID admit.
+            state
+                .enforcer
+                .configure_flow(qfi, five_qi.unwrap_or(9), 0, 0);
+        }
     }
 
     /// Handle PDU session modify from NGAP (updated tunnel endpoints)
@@ -212,11 +346,26 @@ impl GtpTask {
         let _ = self
             .tunnel_manager
             .delete_session(ue_id as u32, resource.psi as u8);
-        self.handle_session_create(ue_id, resource);
+        let created = self.create_tunnel_session(ue_id, &resource);
+
+        // The SDAP entity survives the tunnel being rebuilt, and only the named flows
+        // change (issue #44). Deliberately NOT `install_sdap_session`: the modify's
+        // flow list is a delta and a replace would release every flow the SMF did not
+        // restate -- and because the tunnel endpoints are all that usually change, the
+        // common modify names no flows at all and must leave the mapping untouched.
+        #[cfg(feature = "sdap-dataplane")]
+        if created {
+            self.amend_sdap_session(ue_id, resource.psi as u8, &resource.qos_flows);
+        }
+        #[cfg(not(feature = "sdap-dataplane"))]
+        let _ = created;
     }
 
     /// Handle PDU session release from NGAP
     fn handle_session_release(&mut self, ue_id: i32, psi: i32) {
+        // See `handle_ue_context_release` for why this is dropped and not left.
+        #[cfg(feature = "sdap-dataplane")]
+        self.sdap_sessions.remove(&(ue_id, psi as u8));
         match self.tunnel_manager.delete_session(ue_id as u32, psi as u8) {
             Ok(_) => {
                 info!("PDU session released: ue_id={}, psi={}", ue_id, psi);
@@ -324,6 +473,11 @@ impl GtpTask {
                 error!("Failed to create loopback session: {}", e);
             }
         }
+
+        // See `auto_create_upf_session`: one invented flow matching the `with_qfi(1)`
+        // this session stamps on its uplink container.
+        #[cfg(feature = "sdap-dataplane")]
+        self.install_sdap_session(ue_id, psi as u8, &[(1, None)]);
     }
 
     /// Auto-create a PDU session to UPF for user plane forwarding
@@ -376,10 +530,20 @@ impl GtpTask {
                 error!("Failed to create UPF session: {}", e);
             }
         }
+
+        // Matches the `with_qfi(1)` above: this path invents the session because
+        // traffic arrived without one, so the only flow it can claim is the one it
+        // stamps on the uplink container. A dynamic 5QI, because nothing told it one.
+        #[cfg(feature = "sdap-dataplane")]
+        self.install_sdap_session(ue_id, psi as u8, &[(1, None)]);
     }
 
     /// Handle loopback data - echo packet back to UE
-    async fn handle_loopback_data(&self, ue_id: i32, psi: i32, pdu: Vec<u8>) {
+    ///
+    /// `&mut self` since issue #44: with `sdap-dataplane` the echo is a downlink SDU
+    /// like any other and goes through the SDAP transmit operation, which advances the
+    /// flow's token bucket.
+    async fn handle_loopback_data(&mut self, ue_id: i32, psi: i32, pdu: Vec<u8>) {
         // For ICMP echo request, swap source and destination and change type to echo reply
         let mut response = pdu.clone();
 
@@ -432,17 +596,46 @@ impl GtpTask {
             }
         }
 
+        // The loopback echo is a downlink SDU, so it takes the same SDAP path a real
+        // one does -- otherwise the loopback mode would be the one configuration in
+        // which the UE receives a bearer's PDUs without the header it was told to
+        // strip, and every loopback ping would lose its first payload octet.
+        //
+        // The session's own default QFI, because a locally generated echo has no PDU
+        // Session Container to read one from, and no RQI: reflective QoS is the core's
+        // instruction to the UE (TS 23.501 §5.7.5) and this packet never saw the core.
+        #[cfg(feature = "sdap-dataplane")]
+        let (drb_id, response) = {
+            let qfi = self
+                .tunnel_manager
+                .get_session(ue_id as u32, psi as u8)
+                .and_then(|s| s.qfi)
+                .unwrap_or(0);
+            let Some(resolved) = self.sdap_downlink(ue_id, psi as u8, qfi, false, &response) else {
+                return;
+            };
+            resolved
+        };
+        // Without the feature the bearer is the session, so the DRB id is the PSI and
+        // the payload is the bare IP packet -- unchanged from before #44.
+        #[cfg(not(feature = "sdap-dataplane"))]
+        let drb_id = psi;
+
         // Send the response back to the UE via RLS
         let msg = RlsMessage::DownlinkData {
             ue_id,
             psi,
+            drb_id,
             pdu: response.into(),
         };
 
         if let Err(e) = self.task_base.rls_tx.send(msg).await {
             error!("Failed to send loopback data to RLS: {}", e);
         } else {
-            debug!("Sent loopback data: ue_id={}, psi={}", ue_id, psi);
+            debug!(
+                "Sent loopback data: ue_id={}, psi={}, drb_id={}",
+                ue_id, psi, drb_id
+            );
         }
     }
 
@@ -512,26 +705,62 @@ impl GtpTask {
     }
 
     /// Handle downlink G-PDU (user data from UPF)
-    async fn handle_downlink_gpdu(&self, header: &GtpHeader, source: SocketAddr) {
+    async fn handle_downlink_gpdu(&mut self, header: &GtpHeader, source: SocketAddr) {
         match self.tunnel_manager.decapsulate_downlink(header) {
             Ok(dl) => {
-                // amfg-09: the DL QFI/RQI from the PDU Session Container drive
-                // DRB/QoS-flow selection toward the UE. Until the SDAP/DRB layer
-                // is wired (amfg-04/AS), the session is selected by PSI and the
-                // QoS metadata is surfaced for diagnostics / reflective QoS.
+                let ue_id = dl.ue_id as i32;
+                let psi = dl.psi as i32;
+
+                // amfg-09: the DL QFI/RQI arrive in the PDU Session Container
+                // (TS 38.415 §5.5.2.1) and are what selects the QoS flow toward the
+                // UE. Without `sdap-dataplane` there is no SDAP sublayer to act on
+                // them: the radio bearer is the one-per-session bearer keyed by PSI,
+                // so `drb_id` IS the PSI and the metadata only reaches the log. This
+                // is the pre-#44 path, byte for byte.
+                #[cfg(not(feature = "sdap-dataplane"))]
+                let (drb_id, pdu) = (psi, dl.payload.to_vec());
+
+                // With the feature the QFI does the two jobs TS 37.324 gives it: §5.1
+                // picks the DRB, and §6.2.2.2 puts the QFI and RQI on the wire so the
+                // UE can attribute the SDU to a flow (and act on reflective QoS)
+                // rather than inferring it from the bearer. Returns `None` for a
+                // packet the enforcer policed away, which must not be forwarded.
+                #[cfg(feature = "sdap-dataplane")]
+                let (drb_id, pdu) = {
+                    // A G-PDU may arrive with no PDU Session Container at all, and a
+                    // header still has to carry SOME QFI. The session's default flow
+                    // is the honest answer -- it is the flow the core set the session
+                    // up with -- and 0 only if even that is unknown, which keeps the
+                    // SDU on the default DRB per §5.3.1 rather than dropping it.
+                    let qfi = dl.qfi.or_else(|| {
+                        self.tunnel_manager
+                            .get_session(dl.ue_id, dl.psi)
+                            .and_then(|s| s.qfi)
+                    });
+                    let Some(resolved) =
+                        self.sdap_downlink(ue_id, dl.psi, qfi.unwrap_or(0), dl.rqi, dl.payload)
+                    else {
+                        return;
+                    };
+                    resolved
+                };
+
                 let msg = RlsMessage::DownlinkData {
-                    ue_id: dl.ue_id as i32,
-                    psi: dl.psi as i32,
-                    pdu: dl.payload.to_vec().into(),
+                    ue_id,
+                    psi,
+                    drb_id,
+                    pdu: pdu.into(),
                 };
 
                 if let Err(e) = self.task_base.rls_tx.send(msg).await {
                     error!("Failed to send downlink data to RLS: {}", e);
                 } else {
                     debug!(
-                        "Forwarded downlink data: ue_id={}, psi={}, qfi={:?}, rqi={}, {} bytes",
+                        "Forwarded downlink data: ue_id={}, psi={}, drb_id={}, qfi={:?}, rqi={}, \
+                         {} bytes",
                         dl.ue_id,
                         dl.psi,
+                        drb_id,
                         dl.qfi,
                         dl.rqi,
                         dl.payload.len()
@@ -557,6 +786,94 @@ impl GtpTask {
                 error!("Downlink decapsulation failed: {}", e);
             }
         }
+    }
+
+    /// The SDAP downlink transmit operation: police the flow, pick its DRB, and
+    /// prepend the header (TS 37.324 §5.2.1/§5.1/§6.2.2.2, issue #44).
+    ///
+    /// Returns the `(drb_id, sdap_pdu)` to forward, or `None` when the packet must be
+    /// discarded. The two decisions are made together because they read the same
+    /// per-session state, and splitting them would let a caller forward a packet the
+    /// enforcer refused.
+    #[cfg(feature = "sdap-dataplane")]
+    fn sdap_downlink(
+        &mut self,
+        ue_id: i32,
+        psi: u8,
+        qfi: u8,
+        rqi: bool,
+        payload: &[u8],
+    ) -> Option<(i32, Vec<u8>)> {
+        // The DRB identities are a pure function of the PSI (see
+        // `nextgsim_gtp::qfi_drb::allocate_drbs`), so both ends compute the same
+        // numbers from the same input and nothing has to be signalled to keep the
+        // gNB's and the UE's entity maps in agreement.
+        let alloc = allocate_drbs(psi);
+
+        // Enforcement before the header, so a policed packet costs no allocation.
+        //
+        // `None` from `enforce` means this QFI was never configured -- an unadmitted
+        // flow, or a session created on a path that carried no `QosFlowSetupInfo`.
+        // Forwarded, deliberately: the core is the authority on what it admitted, and
+        // dropping here would lose traffic the UPF accepted and already billed. The
+        // same reasoning is why `QfiDrbMap::drb_for` answers `Default` rather than
+        // erroring for an unknown QFI.
+        let (drb_choice, dscp) = match self.sdap_sessions.get_mut(&(ue_id, psi)) {
+            Some(state) => {
+                let choice = state.qfi_drb.drb_for(qfi);
+                match state.enforcer.enforce(qfi, payload.len()) {
+                    Some((false, _)) => {
+                        // Over the flow's MBR (TS 23.501 §5.7.2.6). Dropped at the
+                        // gNB rather than passed to RLC, because the point of a
+                        // per-flow ceiling is that the excess never reaches the air
+                        // interface -- forwarding it and letting the radio shed it
+                        // would police nothing.
+                        warn!(
+                            "Dropped a downlink SDU over its MBR: ue_id={ue_id}, psi={psi}, \
+                             qfi={qfi}, {} bytes",
+                            payload.len()
+                        );
+                        return None;
+                    }
+                    Some((true, dscp)) => (choice, Some(dscp)),
+                    None => (choice, None),
+                }
+            }
+            // No SDAP entity for this session at all: a session the auto-create
+            // paths stood up, or a downlink packet that beat its SessionCreate.
+            // Everything goes to the default DRB, which is §5.3.1's rule and keeps
+            // the SDU moving.
+            None => {
+                debug!(
+                    "No SDAP entity for ue_id={ue_id} psi={psi}; QFI {qfi} takes the default \
+                     DRB (TS 37.324 §5.3.1)"
+                );
+                (nextgsim_gtp::qfi_drb::DrbChoice::Default, None)
+            }
+        };
+
+        let drb_id = alloc.id_of(drb_choice);
+        // A QFI wider than the six-bit field cannot be signalled at all
+        // (TS 38.413 caps `QosFlowIdentifier` at 63, so this needs a non-conformant
+        // peer). Dropped rather than truncated: a truncated QFI would have the UE
+        // attribute the SDU to a DIFFERENT flow, which is worse than losing it.
+        let pdu = match nextgsim_pdcp::sdap::build_dl_pdu(
+            nextgsim_pdcp::SdapHeader { qfi, rqi },
+            payload,
+        ) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                warn!("Dropped a downlink SDU with an unencodable SDAP header: {e}");
+                return None;
+            }
+        };
+
+        debug!(
+            "SDAP DL: ue_id={ue_id}, psi={psi}, qfi={qfi}, rqi={rqi} -> DRB {drb_id} \
+             ({drb_choice:?}), dscp={}",
+            dscp.map_or_else(|| "unconfigured".to_string(), |d: Dscp| d.to_string())
+        );
+        Some((drb_id as i32, pdu))
     }
 
     /// Send a GTP-U Error Indication naming `teid` to `dest` (TS 29.281 §7.3.1).
@@ -1008,6 +1325,7 @@ mod tests {
         let resource = PduSessionResource {
             psi: 1,
             qfi: Some(1),
+            qos_flows: vec![(1, None)],
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1034,6 +1352,7 @@ mod tests {
         let resource = PduSessionResource {
             psi: 1,
             qfi: Some(1),
+            qos_flows: vec![(1, None)],
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1059,6 +1378,7 @@ mod tests {
         let resource = PduSessionResource {
             psi: 1,
             qfi: Some(1),
+            qos_flows: vec![(1, None)],
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1086,6 +1406,7 @@ mod tests {
             let resource = PduSessionResource {
                 psi,
                 qfi: Some(1),
+                qos_flows: vec![(1, None)],
                 uplink_teid: 0x1000 + psi as u32,
                 downlink_teid: 0x2000 + psi as u32,
                 upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1221,6 +1542,7 @@ mod tests {
             PduSessionResource {
                 psi: 1,
                 qfi: Some(1),
+                qos_flows: vec![(1, None)],
                 uplink_teid: 0x1000,
                 downlink_teid: 0x2000,
                 upf_address: upf_addr.ip(),

@@ -43,8 +43,10 @@
 //! simulator's time source.
 
 pub mod algorithms;
+pub mod sdap;
 pub mod srb_security;
 pub mod up_security;
+pub use sdap::{SdapError, SdapHeader, SDAP_HEADER_LEN};
 pub use srb_security::{SrbSecurity, SrbSecurityError, MAC_I_LEN};
 pub use up_security::{UpSecurity, UpSecurityError, DIRECTION_DOWNLINK, DIRECTION_UPLINK};
 

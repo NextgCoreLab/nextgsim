@@ -227,8 +227,22 @@ fn build_v1530_extension(params: &RrcReconfigurationParams) -> RRCReconfiguratio
 ///   SEQUENCE-OF has a lower bound of 1).
 /// * `default_drb` — whether this DRB is the SDAP default DRB for the session.
 ///
-/// The SDAP header for DL and UL is set to PRESENT (3-byte SDAP header), which
-/// is required when QoS flow remapping/QFI carriage is in use.
+/// The SDAP header for DL and UL is set to PRESENT, which is required when QoS
+/// flow remapping / QFI carriage is in use.
+///
+/// # The SDAP header is ONE octet
+///
+/// This comment used to say "3-byte SDAP header", and issue #44's criterion 2
+/// inherited the wrong number from it. **TS 37.324 §6.2.2 defines one octet**: D/C,
+/// then RQI (downlink) or R (uplink), then a **6-bit** QFI. A six-bit QFI is
+/// precisely why `QFI ::= INTEGER (1..maxNrofQFIs)` and
+/// `QosFlowIdentifier ::= INTEGER (0..63)` are what they are, two fields down in
+/// this very function.
+///
+/// Corrected here rather than only in the issue, because this comment is where the
+/// error propagated from — and a receiver built to skip three octets would read two
+/// octets of payload as header, which is the exact interop failure the criterion
+/// was filed about. The layout lives in `nextgsim_pdcp::sdap`.
 pub fn build_drb_radio_bearer_config(
     pdu_session_id: u8,
     drb_id: u8,
@@ -236,6 +250,36 @@ pub fn build_drb_radio_bearer_config(
     default_drb: bool,
     integrity_protection: DrbIntegrityProtection,
 ) -> RadioBearerConfig {
+    let drb = build_drb_to_add_mod(
+        pdu_session_id,
+        drb_id,
+        qfis,
+        default_drb,
+        integrity_protection,
+    );
+    RadioBearerConfig {
+        srb_to_add_mod_list: None,
+        srb3_to_release: None,
+        drb_to_add_mod_list: Some(DRB_ToAddModList(vec![drb])),
+        drb_to_release_list: None,
+        security_config: None,
+    }
+}
+
+/// One `DRB-ToAddMod` with its `SDAP-Config` and `PDCP-Config`.
+///
+/// Factored out of [`build_drb_radio_bearer_config`] so the single-DRB and
+/// multi-DRB builders produce byte-identical DRB entries (issue #44). That matters
+/// for more than tidiness: with two constructors, a DRB built by the multi-DRB path
+/// could differ in some absent-OPTIONAL detail from one built by the single path,
+/// and the golden byte vectors would only be testing one of them.
+fn build_drb_to_add_mod(
+    pdu_session_id: u8,
+    drb_id: u8,
+    qfis: &[u8],
+    default_drb: bool,
+    integrity_protection: DrbIntegrityProtection,
+) -> DRB_ToAddMod {
     let mapped_qo_s_flows_to_add = if qfis.is_empty() {
         None
     } else {
@@ -282,39 +326,146 @@ pub fn build_drb_radio_bearer_config(
         t_reordering: None,
     };
 
-    let drb = DRB_ToAddMod {
+    DRB_ToAddMod {
         cn_association: Some(DRB_ToAddModCnAssociation::Sdap_Config(sdap_config)),
         drb_identity: DRB_Identity(drb_id),
         reestablish_pdcp: None,
         recover_pdcp: None,
         pdcp_config: Some(pdcp_config),
-    };
+    }
+}
 
-    RadioBearerConfig {
+/// One DRB of a PDU session, as the network configures it (issue #44).
+///
+/// A session has more than one when its QoS flows do not all belong on the same
+/// bearer — TS 37.324 §5.1 maps each flow onto a DRB, and the mapping is what
+/// `mappedQoS-FlowsToAdd` carries per DRB. The **policy** that decides which flow
+/// goes where is `nextgsim_gtp::qfi_drb`, deliberately not here: this crate builds
+/// the message that *states* the mapping, and inventing one would put a second
+/// policy in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrbSpec {
+    /// `drb-Identity` (1..=32).
+    pub drb_id: u8,
+    /// `logicalChannelIdentity` of the DRB's RLC bearer.
+    pub lcid: u8,
+    /// Every QFI mapped to this DRB (`mappedQoS-FlowsToAdd`). When empty the field
+    /// is omitted, because the ASN.1 SEQUENCE-OF has a lower bound of 1.
+    pub qfis: Vec<u8>,
+    /// `defaultDRB`: the bearer an unmapped flow falls to (§5.3.1).
+    ///
+    /// Exactly one DRB of a session should set it. Not enforced here — the builder
+    /// states what it is given — but
+    /// [`build_multi_drb_radio_bearer_config`] refuses a list with none or several,
+    /// because a session with two default DRBs has no defined behaviour for an
+    /// unmapped flow.
+    pub default_drb: bool,
+    /// Whether this DRB's PDCP entity integrity-protects user data.
+    pub integrity_protection: DrbIntegrityProtection,
+}
+
+/// Build a `RadioBearerConfig` carrying **every** DRB of one PDU session
+/// (issue #44).
+///
+/// The multi-DRB generalisation of [`build_drb_radio_bearer_config`], which
+/// remains as the single-DRB path so the golden byte vectors below keep testing the
+/// exact message the pre-SDAP data path sends.
+///
+/// Refuses a `specs` list that is empty, or that does not name **exactly one**
+/// default DRB: an unmapped QoS flow goes to the default DRB (TS 37.324 §5.3.1), so
+/// a session with none has nowhere to put one and a session with two has a choice
+/// nothing resolves. Reported rather than defaulted, because picking one silently
+/// is how the two ends come to disagree about which bearer that is.
+pub fn build_multi_drb_radio_bearer_config(
+    pdu_session_id: u8,
+    specs: &[DrbSpec],
+) -> Result<RadioBearerConfig, RrcReconfigurationError> {
+    if specs.is_empty() {
+        return Err(RrcReconfigurationError::InvalidFieldValue(
+            "a PDU session needs at least one DRB".to_string(),
+        ));
+    }
+    let defaults = specs.iter().filter(|s| s.default_drb).count();
+    if defaults != 1 {
+        return Err(RrcReconfigurationError::InvalidFieldValue(format!(
+            "a PDU session must have exactly one default DRB, not {defaults}: an \
+             unmapped QoS flow has nowhere else to go (TS 37.324 §5.3.1)"
+        )));
+    }
+    // Two DRBs with one identity would share an RLC entity and interleave two
+    // flows' sequence-number spaces -- a silent corruption, so it is refused.
+    for (index, spec) in specs.iter().enumerate() {
+        if specs[..index].iter().any(|s| s.drb_id == spec.drb_id) {
+            return Err(RrcReconfigurationError::InvalidFieldValue(format!(
+                "DRB identity {} is used twice in one PDU session",
+                spec.drb_id
+            )));
+        }
+        if specs[..index].iter().any(|s| s.lcid == spec.lcid) {
+            return Err(RrcReconfigurationError::InvalidFieldValue(format!(
+                "logical channel identity {} is used twice in one PDU session",
+                spec.lcid
+            )));
+        }
+    }
+
+    let drbs: Vec<DRB_ToAddMod> = specs
+        .iter()
+        .map(|spec| {
+            build_drb_to_add_mod(
+                pdu_session_id,
+                spec.drb_id,
+                &spec.qfis,
+                spec.default_drb,
+                spec.integrity_protection,
+            )
+        })
+        .collect();
+
+    Ok(RadioBearerConfig {
         srb_to_add_mod_list: None,
         srb3_to_release: None,
-        drb_to_add_mod_list: Some(DRB_ToAddModList(vec![drb])),
+        drb_to_add_mod_list: Some(DRB_ToAddModList(drbs)),
         drb_to_release_list: None,
         security_config: None,
-    }
+    })
 }
 
 /// Build a `CellGroupConfig` (master cell group) with one RLC bearer for the
 /// given DRB. `lcid` is the logical channel identity carrying the DRB.
 pub fn build_cell_group_config(drb_id: u8, lcid: u8) -> CellGroupConfig {
-    let rlc_bearer = RLC_BearerConfig {
-        logical_channel_identity: LogicalChannelIdentity(lcid),
-        served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Drb_Identity(
-            DRB_Identity(drb_id),
-        )),
-        reestablish_rlc: None,
-        rlc_config: None,
-        mac_logical_channel_config: None,
-    };
+    build_multi_drb_cell_group_config(&[(drb_id, lcid)])
+}
+
+/// Build a `CellGroupConfig` with one RLC bearer per `(drb_id, lcid)` pair
+/// (issue #44).
+///
+/// One RLC bearer per DRB, which is what TS 38.331 §6.3.2 requires: a DRB with no
+/// `RLC-BearerConfig` naming it is configured at the SDAP and PDCP layers and has
+/// no logical channel to ride, so nothing would carry it.
+pub fn build_multi_drb_cell_group_config(bearers: &[(u8, u8)]) -> CellGroupConfig {
+    let rlc_bearers: Vec<RLC_BearerConfig> = bearers
+        .iter()
+        .map(|&(drb_id, lcid)| RLC_BearerConfig {
+            logical_channel_identity: LogicalChannelIdentity(lcid),
+            served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Drb_Identity(
+                DRB_Identity(drb_id),
+            )),
+            reestablish_rlc: None,
+            rlc_config: None,
+            mac_logical_channel_config: None,
+        })
+        .collect();
 
     CellGroupConfig {
         cell_group_id: CellGroupId(0),
-        rlc_bearer_to_add_mod_list: Some(CellGroupConfigRlc_BearerToAddModList(vec![rlc_bearer])),
+        // `None` for an empty list, not an empty SEQUENCE-OF: the ASN.1 has a
+        // lower bound of 1, so an empty vector would not encode.
+        rlc_bearer_to_add_mod_list: if rlc_bearers.is_empty() {
+            None
+        } else {
+            Some(CellGroupConfigRlc_BearerToAddModList(rlc_bearers))
+        },
         rlc_bearer_to_release_list: None,
         mac_cell_group_config: None,
         physical_cell_group_config: None,
@@ -322,6 +473,67 @@ pub fn build_cell_group_config(drb_id: u8, lcid: u8) -> CellGroupConfig {
         s_cell_to_add_mod_list: None,
         s_cell_to_release_list: None,
     }
+}
+
+/// Read every DRB of a `RadioBearerConfig` back as the mapping it states
+/// (issue #44).
+///
+/// The UE half: it is **told** which QFIs ride which bearer rather than
+/// recomputing the gNB's policy, which is what lets the policy change on the
+/// network side without a matching UE change. Returns one entry per
+/// `DRB-ToAddMod` whose `cn-Association` is an `SDAP-Config` for `pdu_session_id`.
+///
+/// The `lcid` is **not** in a `RadioBearerConfig` — it is in the `CellGroupConfig`
+/// — so it comes back as 0 here and the caller pairs the two. Stated rather than
+/// silently zero, because an LCID of 0 is not a value (`INTEGER (1..32)`).
+pub fn read_drb_specs(rbc: &RadioBearerConfig, pdu_session_id: u8) -> Vec<DrbSpec> {
+    let Some(list) = rbc.drb_to_add_mod_list.as_ref() else {
+        return Vec::new();
+    };
+    list.0
+        .iter()
+        .filter_map(|drb| {
+            let DRB_ToAddModCnAssociation::Sdap_Config(sdap) = drb.cn_association.as_ref()? else {
+                // An `eps-BearerIdentity` association is an EPS bearer, not a 5GS
+                // QoS-flow mapping, so it has no QFIs to read.
+                return None;
+            };
+            if sdap.pdu_session.0 != pdu_session_id {
+                return None;
+            }
+            Some(DrbSpec {
+                drb_id: drb.drb_identity.0,
+                // See the doc comment: the LCID lives in the CellGroupConfig.
+                lcid: 0,
+                qfis: sdap
+                    .mapped_qo_s_flows_to_add
+                    .as_ref()
+                    .map(|m| m.0.iter().map(|q| q.0).collect())
+                    .unwrap_or_default(),
+                default_drb: sdap.default_drb.0,
+                integrity_protection: drb_integrity_protection(rbc, drb.drb_identity.0),
+            })
+        })
+        .collect()
+}
+
+/// The `logicalChannelIdentity` serving `drb_id`, from a `CellGroupConfig`.
+///
+/// `None` when no RLC bearer names that DRB — which is a configuration the UE
+/// cannot act on, rather than a default to invent: a DRB with no logical channel
+/// has nothing to ride.
+pub fn lcid_for_drb(cgc: &CellGroupConfig, drb_id: u8) -> Option<u8> {
+    cgc.rlc_bearer_to_add_mod_list
+        .as_ref()?
+        .0
+        .iter()
+        .find(|b| {
+            matches!(
+                b.served_radio_bearer.as_ref(),
+                Some(RLC_BearerConfigServedRadioBearer::Drb_Identity(d)) if d.0 == drb_id
+            )
+        })
+        .map(|b| b.logical_channel_identity.0)
 }
 
 /// amfg-04: build a fully-structured `RrcReconfigurationParams` for bringing up
@@ -374,6 +586,38 @@ pub fn build_drb_reconfiguration_params(
         master_cell_group: Some(master_cell_group),
         full_config: false,
         // A DRB-establishing reconfiguration is not a handover, so the UE keeps its keys.
+        master_key_update: None,
+        meas_config,
+    })
+}
+
+/// Build the `RrcReconfigurationParams` establishing **every** DRB of one PDU
+/// session (issue #44).
+///
+/// The multi-DRB generalisation of [`build_drb_reconfiguration_params`]. Both the
+/// `RadioBearerConfig` and the `CellGroupConfig` carry one entry per DRB, so the UE
+/// receives the whole QFI→DRB mapping in one message and is told it rather than
+/// deriving it.
+///
+/// Identical to the single-DRB function when `specs` has one element — asserted by
+/// `the_multi_drb_builder_matches_the_single_drb_one_for_a_lone_bearer`, which is
+/// what lets the pre-SDAP golden byte vectors go on testing the live path.
+pub fn build_multi_drb_reconfiguration_params(
+    rrc_transaction_id: u8,
+    pdu_session_id: u8,
+    specs: &[DrbSpec],
+    meas_config: Option<A3MeasConfigParams>,
+) -> Result<RrcReconfigurationParams, RrcReconfigurationError> {
+    let rbc = build_multi_drb_radio_bearer_config(pdu_session_id, specs)?;
+    let bearers: Vec<(u8, u8)> = specs.iter().map(|s| (s.drb_id, s.lcid)).collect();
+    let cgc = build_multi_drb_cell_group_config(&bearers);
+
+    Ok(RrcReconfigurationParams {
+        rrc_transaction_id,
+        radio_bearer_config: Some(encode_rrc(&rbc)?),
+        secondary_cell_group: None,
+        master_cell_group: Some(encode_rrc(&cgc)?),
+        full_config: false,
         master_key_update: None,
         meas_config,
     })
@@ -638,6 +882,265 @@ pub fn is_rrc_reconfiguration_complete(msg: &UL_DCCH_Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // Multi-DRB signalling for the SDAP QFI->DRB mapping (issue #44).
+    // ========================================================================
+
+    /// The default DRB of a session, non-GBR flows on it.
+    fn default_spec(drb_id: u8, lcid: u8, qfis: Vec<u8>) -> DrbSpec {
+        DrbSpec {
+            drb_id,
+            lcid,
+            qfis,
+            default_drb: true,
+            integrity_protection: DrbIntegrityProtection::Disabled,
+        }
+    }
+
+    /// The GBR DRB of a session.
+    fn gbr_spec(drb_id: u8, lcid: u8, qfis: Vec<u8>) -> DrbSpec {
+        DrbSpec {
+            drb_id,
+            lcid,
+            qfis,
+            default_drb: false,
+            integrity_protection: DrbIntegrityProtection::Disabled,
+        }
+    }
+
+    /// The equivalence that lets the pre-SDAP golden byte vectors go on testing the
+    /// live path: for ONE bearer, the multi-DRB builders produce byte-identical
+    /// output to the single-DRB ones.
+    ///
+    /// Without this, the golden vectors would be testing a function the data path no
+    /// longer calls — the "correct but unreachable" trap, inverted.
+    #[test]
+    fn the_multi_drb_builder_matches_the_single_drb_one_for_a_lone_bearer() {
+        for integrity in [
+            DrbIntegrityProtection::Disabled,
+            DrbIntegrityProtection::Enabled,
+        ] {
+            let single = build_drb_radio_bearer_config(1, 1, &[9], true, integrity);
+            let multi = build_multi_drb_radio_bearer_config(
+                1,
+                &[DrbSpec {
+                    drb_id: 1,
+                    lcid: 4,
+                    qfis: vec![9],
+                    default_drb: true,
+                    integrity_protection: integrity,
+                }],
+            )
+            .expect("one default DRB is a legal session");
+            assert_eq!(multi, single, "{integrity:?}: the structures must be equal");
+            assert_eq!(
+                encode_rrc(&multi).expect("encode"),
+                encode_rrc(&single).expect("encode"),
+                "{integrity:?}: and byte-identical, or the golden vectors test a \
+                 function the data path no longer calls"
+            );
+        }
+        // The same for the cell group.
+        assert_eq!(
+            encode_rrc(&build_multi_drb_cell_group_config(&[(1, 4)])).expect("encode"),
+            encode_rrc(&build_cell_group_config(1, 4)).expect("encode")
+        );
+    }
+
+    /// Criterion 1 on the wire: two QFIs on ONE PDU session reach the UE mapped to
+    /// two DIFFERENT DRBs, and the mapping survives a byte round trip.
+    #[test]
+    fn two_qfis_on_one_session_are_signalled_on_distinct_drbs() {
+        let specs = [default_spec(1, 4, vec![9, 5]), gbr_spec(17, 20, vec![1, 2])];
+        let params = build_multi_drb_reconfiguration_params(0, 1, &specs, None)
+            .expect("two DRBs with one default is legal");
+        let bytes = encode_rrc_reconfiguration(&params).expect("encode");
+
+        // Byte round trip first: this message now carries two DRBs and two RLC
+        // bearers, so a length-determinant error in either SEQUENCE-OF would
+        // corrupt whatever follows.
+        let msg: DL_DCCH_Message = decode_rrc(&bytes).expect("decode");
+        assert_eq!(
+            encode_rrc(&msg).expect("re-encode"),
+            bytes,
+            "a two-DRB reconfiguration must byte round trip"
+        );
+
+        let data = decode_rrc_reconfiguration(&bytes).expect("parse");
+        let rbc: RadioBearerConfig =
+            decode_rrc(&data.radio_bearer_config.expect("present")).expect("decode RBC");
+        let cgc: CellGroupConfig =
+            decode_rrc(&data.master_cell_group.expect("present")).expect("decode CGC");
+
+        let read = read_drb_specs(&rbc, 1);
+        assert_eq!(read.len(), 2, "both DRBs must reach the UE");
+
+        // The QFI sets are disjoint and land on different bearers -- criterion 1.
+        let drb_for = |qfi: u8| -> u8 {
+            read.iter()
+                .find(|s| s.qfis.contains(&qfi))
+                .unwrap_or_else(|| panic!("QFI {qfi} must be mapped"))
+                .drb_id
+        };
+        assert_ne!(
+            drb_for(9),
+            drb_for(1),
+            "QFI 9 and QFI 1 are on one PDU session and MUST map to distinct DRBs"
+        );
+        assert_eq!(drb_for(9), 1, "the non-GBR flows on the default DRB");
+        assert_eq!(drb_for(1), 17, "and the GBR flows on the second");
+        assert_eq!(drb_for(5), 1, "QFI 5 rides with QFI 9");
+        assert_eq!(drb_for(2), 17);
+
+        // Exactly one default DRB, and it is the one carrying the unmapped-flow
+        // fallback.
+        let defaults: Vec<u8> = read
+            .iter()
+            .filter(|s| s.default_drb)
+            .map(|s| s.drb_id)
+            .collect();
+        assert_eq!(
+            defaults,
+            vec![1],
+            "exactly one default DRB (TS 37.324 §5.3.1)"
+        );
+
+        // And each DRB has its own logical channel, or nothing carries it.
+        assert_eq!(lcid_for_drb(&cgc, 1), Some(4));
+        assert_eq!(lcid_for_drb(&cgc, 17), Some(20));
+        assert_eq!(
+            lcid_for_drb(&cgc, 9),
+            None,
+            "a DRB the cell group does not name has no logical channel"
+        );
+    }
+
+    /// A session with no default DRB, or two, is REFUSED: an unmapped QoS flow goes
+    /// to the default DRB (§5.3.1), so neither shape has defined behaviour.
+    #[test]
+    fn a_session_without_exactly_one_default_drb_is_refused() {
+        // None.
+        assert!(build_multi_drb_radio_bearer_config(
+            1,
+            &[gbr_spec(1, 4, vec![1]), gbr_spec(17, 20, vec![2])]
+        )
+        .is_err());
+        // Two.
+        assert!(build_multi_drb_radio_bearer_config(
+            1,
+            &[default_spec(1, 4, vec![9]), default_spec(17, 20, vec![5])]
+        )
+        .is_err());
+        // Empty.
+        assert!(build_multi_drb_radio_bearer_config(1, &[]).is_err());
+        // And exactly one is accepted, so the check is a check and not a refusal of
+        // everything.
+        assert!(build_multi_drb_radio_bearer_config(
+            1,
+            &[default_spec(1, 4, vec![9]), gbr_spec(17, 20, vec![1])]
+        )
+        .is_ok());
+    }
+
+    /// A repeated DRB identity or LCID is refused. Two bearers sharing an identity
+    /// would share an RLC entity and interleave two flows' sequence-number spaces —
+    /// a silent corruption, not a failure, which is why it is caught at the builder.
+    #[test]
+    fn a_repeated_drb_identity_or_lcid_is_refused() {
+        assert!(build_multi_drb_radio_bearer_config(
+            1,
+            &[default_spec(1, 4, vec![9]), gbr_spec(1, 20, vec![1])]
+        )
+        .is_err());
+        assert!(build_multi_drb_radio_bearer_config(
+            1,
+            &[default_spec(1, 4, vec![9]), gbr_spec(17, 4, vec![1])]
+        )
+        .is_err());
+    }
+
+    /// A DRB with no QFIs omits `mappedQoS-FlowsToAdd` rather than encoding an empty
+    /// SEQUENCE-OF, whose ASN.1 lower bound is 1. This is the shape a GBR DRB has
+    /// when a session happens to admit no GBR flow.
+    #[test]
+    fn a_drb_with_no_qfis_omits_the_mapping_list() {
+        let rbc = build_multi_drb_radio_bearer_config(
+            1,
+            &[default_spec(1, 4, vec![9]), gbr_spec(17, 20, vec![])],
+        )
+        .expect("legal");
+        let bytes = encode_rrc(&rbc).expect("an empty QFI set must still encode");
+        let decoded: RadioBearerConfig = decode_rrc(&bytes).expect("decode");
+        assert_eq!(encode_rrc(&decoded).expect("re-encode"), bytes);
+
+        let read = read_drb_specs(&decoded, 1);
+        let gbr = read.iter().find(|s| s.drb_id == 17).expect("present");
+        assert!(
+            gbr.qfis.is_empty(),
+            "no QFIs, and no empty SEQUENCE-OF either"
+        );
+    }
+
+    /// `read_drb_specs` ignores a DRB belonging to a DIFFERENT PDU session, so a UE
+    /// with two sessions does not read one session's mapping into the other.
+    #[test]
+    fn a_drb_of_another_session_is_not_read() {
+        let mut rbc = build_multi_drb_radio_bearer_config(
+            1,
+            &[default_spec(1, 4, vec![9]), gbr_spec(17, 20, vec![1])],
+        )
+        .expect("legal");
+        // Re-point the GBR DRB at session 2.
+        if let Some(DRB_ToAddModCnAssociation::Sdap_Config(sdap)) = rbc
+            .drb_to_add_mod_list
+            .as_mut()
+            .expect("present")
+            .0
+            .iter_mut()
+            .find(|d| d.drb_identity.0 == 17)
+            .and_then(|d| d.cn_association.as_mut())
+        {
+            sdap.pdu_session = PDU_SessionID(2);
+        }
+        let read = read_drb_specs(&rbc, 1);
+        assert_eq!(read.len(), 1, "only session 1's DRB");
+        assert_eq!(read[0].drb_id, 1);
+        // And session 2's is readable on its own.
+        assert_eq!(read_drb_specs(&rbc, 2).len(), 1);
+    }
+
+    /// Per-DRB integrity protection is read back per DRB, not per session: the two
+    /// bearers of one session can differ, and a reader that took the first one's
+    /// answer for both would key one entity wrongly.
+    #[test]
+    fn integrity_protection_is_read_back_per_drb() {
+        let rbc = build_multi_drb_radio_bearer_config(
+            1,
+            &[
+                DrbSpec {
+                    integrity_protection: DrbIntegrityProtection::Disabled,
+                    ..default_spec(1, 4, vec![9])
+                },
+                DrbSpec {
+                    integrity_protection: DrbIntegrityProtection::Enabled,
+                    ..gbr_spec(17, 20, vec![1])
+                },
+            ],
+        )
+        .expect("legal");
+        let bytes = encode_rrc(&rbc).expect("encode");
+        let decoded: RadioBearerConfig = decode_rrc(&bytes).expect("decode");
+        let read = read_drb_specs(&decoded, 1);
+        let by_id = |id: u8| {
+            read.iter()
+                .find(|s| s.drb_id == id)
+                .expect("present")
+                .integrity_protection
+        };
+        assert_eq!(by_id(1), DrbIntegrityProtection::Disabled);
+        assert_eq!(by_id(17), DrbIntegrityProtection::Enabled);
+    }
 
     // ========================================================================
     // Handover command golden bytes (issue #107, criterion 6)

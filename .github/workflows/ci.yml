@@ -223,6 +223,51 @@ jobs:
           cargo clippy -p nextgsim-ue --features up-security --all-targets
           cargo clippy -p nextgsim-integration-tests --features up-security --all-targets
 
+  sdap-dataplane:
+    name: SDAP data plane (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `sdap-dataplane` feature (issue #44) is off by default because it
+      # interposes a sublayer on the live user-plane data path -- the same reason
+      # `drb-pdcp` and `up-security` are gated, one octet earlier in the stack. So
+      # the default-feature jobs above compile those paths WITHOUT it, and without
+      # this job the enabled arm would ship with CI never having built it, which is
+      # the recorded failure mode for feature-gated code here (issues #33, #139).
+      #
+      # Both ends together, never one alone: a gNB that prepends a one-octet SDAP
+      # header to a UE that does not strip it has the UE read the header as the
+      # first octet of its IP packet. There is no configuration in which enabling
+      # one side is useful, so there is none worth testing.
+      - name: cargo test (the shared header codec and the mapping policy)
+        run: |
+          cargo test -p nextgsim-pdcp sdap
+          cargo test -p nextgsim-gtp qfi_drb
+      - name: cargo test (both ends)
+        run: |
+          cargo test -p nextgsim-gnb --features sdap-dataplane
+          cargo test -p nextgsim-ue --features sdap-dataplane
+      - name: cargo test (end to end)
+        run: cargo test -p nextgsim-integration-tests --features sdap-dataplane
+      # The feature also has to compose with the sublayers it sits above: SDAP
+      # prepends its header BEFORE PDCP takes the SDU, so a mistake in that order is
+      # invisible until all three are on together.
+      - name: cargo test (with PDCP and user-plane security beneath it)
+        run: |
+          cargo test -p nextgsim-gnb --features sdap-dataplane,up-security
+          cargo test -p nextgsim-ue --features sdap-dataplane,up-security
+          cargo test -p nextgsim-integration-tests --features sdap-dataplane,up-security
+      - name: cargo clippy
+        run: |
+          cargo clippy -p nextgsim-gnb --features sdap-dataplane --all-targets
+          cargo clippy -p nextgsim-ue --features sdap-dataplane --all-targets
+          cargo clippy -p nextgsim-integration-tests --features sdap-dataplane --all-targets
+
   sidelink:
     name: Sidelink facade (feature-gated)
     runs-on: ubuntu-latest

@@ -28,6 +28,13 @@ sidelink = ["nextgsim-ue/sidelink"]
 # UE that does not takes the user plane down rather than degrading it, and the test
 # asserts exactly that.
 up-security = ["nextgsim-gnb/up-security", "nextgsim-ue/up-security"]
+# Enables the SDAP user-plane end-to-end test (src/sdap_user_plane.rs, issue #44),
+# which needs the sublayer on BOTH ends. Forwarded to both crates together for the
+# same reason as `drb-pdcp` and `up-security`: a gNB that prepends a one-octet SDAP
+# header to a UE that does not strip it has the UE read the header as the first
+# octet of its IP packet, so there is no configuration in which enabling one alone
+# is useful — and the test asserts exactly the QFI→DRB split the pair produces.
+sdap-dataplane = ["nextgsim-gnb/sdap-dataplane", "nextgsim-ue/sdap-dataplane"]
 
 [dependencies]
 # Internal crates
@@ -137,3 +144,7 @@ path = "src/ranging_report_e2e.rs"
 [[test]]
 name = "conditional_handover_e2e"
 path = "src/conditional_handover_e2e.rs"
+
+[[test]]
+name = "sdap_user_plane"
+path = "src/sdap_user_plane.rs"
