@@ -76,6 +76,7 @@
 pub mod connection;
 pub mod energy_saving;
 pub mod handover;
+pub mod meas;
 pub mod ntn_gnb;
 pub mod redcap;
 pub mod system_info;
@@ -96,6 +97,7 @@ pub use handover::{
     HandoverDecision, MeasurementReport, NeighborMeasurement, PathSwitchRequest, UeHandoverState,
     XnHandoverAcknowledge, XnHandoverCause, XnHandoverRequest, XnPduSessionContext, XnUeContext,
 };
+pub use meas::{a3_meas_config_params, A3_MEAS_ID};
 pub use ntn_gnb::{
     BeamManagementMode, NtnBeamCell, NtnGnbConfig, NtnGnbManager, NtnHarqManager,
     NtnTimingAdvanceManager,

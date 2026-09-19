@@ -11,6 +11,7 @@
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
+use crate::procedures::meas_config::{build_a3_meas_config, A3MeasConfigParams, MeasConfigError};
 use crate::procedures::rrc_reestablishment::mac_i_lsb16;
 use crate::procedures::rrc_setup::srb1_rrc_setup_params;
 use crate::procedures::suspend_config::CELL_IDENTITY_BITS;
@@ -82,6 +83,10 @@ pub enum RrcResumeError {
     /// Invalid field value
     #[error("Invalid field value: {0}")]
     InvalidFieldValue(String),
+
+    /// A `measConfig` whose field values TS 38.331 does not allow (issue #170).
+    #[error("Invalid measConfig: {0}")]
+    MeasConfig(#[from] MeasConfigError),
 }
 
 /// Resume cause
@@ -596,7 +601,9 @@ mod tests {
     fn golden_rrc_resume_bytes() {
         // The encoder output must equal the hand-derived literal. NOT a round trip:
         // a round trip through one codec passes however wrong the layout is.
-        let params = fresh_rrc_resume_params(0).expect("resume params");
+        // `None`: the frozen vector is the measConfig-ABSENT encoding, and
+        // `a_resume_measconfig_reaches_the_ue` below covers the present form.
+        let params = fresh_rrc_resume_params(0, None).expect("resume params");
         let bytes = encode_rrc_resume(&params).expect("encode RRCResume");
         assert_eq!(
             bytes,
@@ -607,11 +614,66 @@ mod tests {
         // The tid occupies bits 5..6 of byte 0 ONLY. tid 2 -> 0b0_0001_10_0 = 0x0C,
         // every other byte identical. This is what makes the derivation above a
         // derivation rather than a capture: it predicts the change.
-        let params_tid2 = fresh_rrc_resume_params(2).expect("resume params tid 2");
+        let params_tid2 = fresh_rrc_resume_params(2, None).expect("resume params tid 2");
         let bytes_tid2 = encode_rrc_resume(&params_tid2).expect("encode tid 2");
         let mut expected = GOLDEN_RRC_RESUME_TID0;
         expected[0] = 0x0C;
         assert_eq!(bytes_tid2, expected.to_vec());
+    }
+
+    /// The resumed UE's `measConfig` reaches it, and byte round trips
+    /// (issue #170). `RRCResume-IEs` puts `measConfig` at `optional_idx = 2` with
+    /// `fullConfig` at 3 AFTER it, so a decoder that mis-framed the measConfig
+    /// would read `fullConfig` wrong — and `fullConfig` is what tells the UE to
+    /// release its stored configuration, so getting it wrong is not cosmetic.
+    #[test]
+    fn a_resume_measconfig_reaches_the_ue() {
+        use crate::procedures::meas_config::read_a3_meas_configs;
+
+        let meas = A3MeasConfigParams {
+            meas_id: 1,
+            meas_object_id: 1,
+            report_config_id: 1,
+            ssb_frequency_arfcn: 632_628,
+            ssb_subcarrier_spacing_khz: 30,
+            a3_offset_db: 5.0,
+            hysteresis_db: 2.0,
+            time_to_trigger_ms: 320,
+            report_interval_ms: 640,
+            report_amount: Some(4),
+            max_report_cells: 2,
+        };
+        let params = fresh_rrc_resume_params(1, Some(meas)).expect("resume params");
+        let bytes = encode_rrc_resume(&params).expect("encode");
+
+        assert_ne!(
+            bytes,
+            {
+                let mut v = GOLDEN_RRC_RESUME_TID0.to_vec();
+                v[0] = 0x0A;
+                v
+            },
+            "a measConfig must reach the wire"
+        );
+
+        let msg: DL_DCCH_Message = decode_rrc(&bytes).expect("decode");
+        assert_eq!(
+            encode_rrc(&msg).expect("re-encode"),
+            bytes,
+            "the resume must byte round trip with a measConfig"
+        );
+
+        let data = decode_rrc_resume(&bytes).expect("parse");
+        assert!(
+            data.full_config,
+            "fullConfig sits AFTER measConfig in the IE order, so it is the field a \
+             framing error would corrupt"
+        );
+        let read = read_a3_meas_configs(&data.meas_config.expect("carried"));
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].a3_offset_db, 5, "5 dB, in whole dB");
+        assert_eq!(read[0].hysteresis_half_db, 4, "2 dB, in 0.5 dB units");
+        assert_eq!(read[0].time_to_trigger_ms, 320);
     }
 
     #[test]
@@ -789,6 +851,15 @@ pub struct RrcResumeParams {
     /// `fullConfig`: the UE is to apply a FULL configuration rather than a delta
     /// on top of a stored one (TS 38.331 §5.3.13.4).
     pub full_config: bool,
+    /// `measConfig`: the measurement configuration the resumed UE is to apply
+    /// (TS 38.331 §5.5.2; issue #170).
+    ///
+    /// A resume needs it for the same reason a reconfiguration does, and MORE so
+    /// here: `fresh_rrc_resume_params` sets `fullConfig`, which tells the UE to
+    /// release its stored configuration — including its measurement configuration
+    /// (§5.3.13.4). A resumed UE with no `measConfig` would therefore have no
+    /// measurement configuration at all.
+    pub meas_config: Option<A3MeasConfigParams>,
 }
 
 /// Parsed `RRCResume`.
@@ -802,6 +873,8 @@ pub struct RrcResumeData {
     pub master_cell_group: Option<Vec<u8>>,
     /// Whether `fullConfig` was set
     pub full_config: bool,
+    /// The decoded `measConfig`, when the message carried one (issue #170).
+    pub meas_config: Option<MeasConfig>,
 }
 
 /// Builds an `RRCResume` on **DL-DCCH** (TS 38.331 §6.2.2, issue #107).
@@ -842,7 +915,15 @@ pub fn build_rrc_resume(params: &RrcResumeParams) -> Result<DL_DCCH_Message, Rrc
         master_cell_group: Some(RRCResume_IEsMasterCellGroup(
             params.master_cell_group.clone(),
         )),
-        meas_config: None,
+        // A real generated-codec `MeasConfig` (issue #170), for the reason
+        // `RrcResumeParams::meas_config` records: `fullConfig` releases the UE's
+        // stored measurement configuration, so a resume that carries none leaves
+        // the UE measuring nothing.
+        meas_config: params
+            .meas_config
+            .as_ref()
+            .map(build_a3_meas_config)
+            .transpose()?,
         full_config: if params.full_config {
             Some(RRCResume_IEsFullConfig(RRCResume_IEsFullConfig::TRUE))
         } else {
@@ -885,6 +966,7 @@ pub fn parse_rrc_resume(msg: &DL_DCCH_Message) -> Result<RrcResumeData, RrcResum
         radio_bearer_config: ies.radio_bearer_config.clone(),
         master_cell_group: ies.master_cell_group.as_ref().map(|m| m.0.clone()),
         full_config: ies.full_config.is_some(),
+        meas_config: ies.meas_config.clone(),
     })
 }
 
@@ -917,7 +999,18 @@ pub fn decode_rrc_resume(bytes: &[u8]) -> Result<RrcResumeData, RrcResumeError> 
 /// the user plane needs re-establishing after a resume. Storing the configuration
 /// alongside the security context is what a delta would need, and that is the next
 /// step here — not a different `fullConfig` decision.
-pub fn fresh_rrc_resume_params(rrc_transaction_id: u8) -> Result<RrcResumeParams, RrcResumeError> {
+/// # The measurement configuration is not optional here
+///
+/// `meas_config` is threaded in rather than left `None` (issue #170) because
+/// `fullConfig` above releases the UE's stored configuration, measurement
+/// configuration included (§5.3.13.4). A resume that carried none would leave the
+/// resumed UE measuring nothing and reporting nothing — a strictly worse outcome
+/// than before, when the UE's own local default survived because nothing told it
+/// to release anything.
+pub fn fresh_rrc_resume_params(
+    rrc_transaction_id: u8,
+    meas_config: Option<A3MeasConfigParams>,
+) -> Result<RrcResumeParams, RrcResumeError> {
     let setup = srb1_rrc_setup_params(rrc_transaction_id)
         .map_err(|e| RrcResumeError::InvalidFieldValue(e.to_string()))?;
     Ok(RrcResumeParams {
@@ -925,5 +1018,6 @@ pub fn fresh_rrc_resume_params(rrc_transaction_id: u8) -> Result<RrcResumeParams
         radio_bearer_config: setup.radio_bearer_config,
         master_cell_group: setup.master_cell_group,
         full_config: true,
+        meas_config,
     })
 }

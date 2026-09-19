@@ -10,6 +10,7 @@ pub mod handover_preparation;
 pub mod information_transfer;
 pub mod isac_config;
 pub mod isl_handover;
+pub mod meas_config;
 pub mod measurement_report;
 pub mod ntn_constellation;
 pub mod ntn_integration_example;
@@ -41,6 +42,7 @@ pub use isl_handover::{
     IslHandoverManager,
     IslHandoverState,
 };
+pub use meas_config::*;
 pub use measurement_report::*;
 pub use ntn_constellation::*;
 pub use ntn_integration_example::*;
