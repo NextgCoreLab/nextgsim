@@ -61,6 +61,12 @@ use nextgsim_rrc::procedures::measurement_report::{
     encode_measurement_report, MeasCellResults, MeasResult2Nr, MeasResultCellNr, MeasResultEutra,
     MeasResultNr, MeasResultServFreqNr, MeasurementReportError, MeasurementReportParams,
 };
+// The generated ASN.1 `MeasConfig`, aliased: `crate::rrc::measurement::MeasConfig`
+// is the UE's own runtime configuration and is imported unqualified below. Two
+// same-named types on one measurement path is exactly how a conversion gets
+// skipped, so the wire one is named for what it is (issue #170).
+use nextgsim_rrc::codec::generated::MeasConfig as AsnMeasConfig;
+use nextgsim_rrc::procedures::meas_config::read_a3_meas_configs;
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
 };
@@ -1026,17 +1032,74 @@ impl RrcTask {
         self.send_uplink_rrc(RrcChannel::UlDcch, pdu).await;
     }
 
-    /// Configure measurements (called when receiving RRC Reconfiguration with measConfig)
-    #[allow(dead_code)]
-    fn configure_measurements(&mut self, config: MeasConfig) {
-        info!(
-            "Adding measurement config: meas_id={}, event={:?}",
-            config.meas_id, config.trigger_config.trigger_type
-        );
-        self.measurement_manager.add_config(config);
+    /// Apply a `measConfig` the network signalled (TS 38.331 §5.5.2, issue #170).
+    ///
+    /// Every A3 binding it carries replaces whatever the UE had under that `measId`
+    /// — `MeasurementManager::add_config` inserts by `measId`, which is §5.5.2.5's
+    /// "modify an existing entry" for free. Since the gNB signals `measId` 1, the
+    /// hard-coded default [`Self::setup_default_measurements`] installs is what gets
+    /// replaced, so the UE's A3 *reporting* trigger becomes the gNB's margin instead
+    /// of a number it chose for itself.
+    ///
+    /// # No conversion happens here, deliberately
+    ///
+    /// `A3MeasConfigRead` is in the **signalled** units — whole-dB offset, 0.5 dB
+    /// hysteresis — which are exactly the units `ReportTriggerConfig` works in. The
+    /// conditional-handover path converts (`conditional_handover.rs`) because its
+    /// container carries half-dB for *both*; this path has nothing to convert, and
+    /// a round trip through dB here would introduce rounding the wire did not have.
+    ///
+    /// Returns how many bindings were installed, for the caller's log and for the
+    /// tests: `0` means the message configured no A3 reporting, which is legal.
+    fn apply_signalled_meas_config(&mut self, signalled: &AsnMeasConfig) -> usize {
+        let bindings = read_a3_meas_configs(signalled);
+        for binding in &bindings {
+            info!(
+                "Applying signalled measConfig: measId={}, a3Offset={} dB, \
+                 hysteresis={} dB, timeToTrigger={} ms",
+                binding.meas_id,
+                binding.a3_offset_db,
+                f64::from(binding.hysteresis_half_db) / 2.0,
+                binding.time_to_trigger_ms
+            );
+            self.measurement_manager.add_config(MeasConfig {
+                meas_id: binding.meas_id,
+                meas_object_id: binding.meas_object_id,
+                report_config_id: binding.report_config_id,
+                quantity: crate::rrc::measurement::MeasQuantity::SsRsrp,
+                trigger_config: ReportTriggerConfig {
+                    trigger_type: ReportTriggerType::Event(MeasEventType::A3),
+                    threshold: None,
+                    threshold1: None,
+                    threshold2: None,
+                    a3_offset: Some(i32::from(binding.a3_offset_db)),
+                    a6_offset: None,
+                    hysteresis: i32::from(binding.hysteresis_half_db),
+                    time_to_trigger: u64::from(binding.time_to_trigger_ms),
+                },
+                // `reportAmount: infinity` is `None` on the wire and 0 here, which
+                // is what `MeasConfig::report_amount`'s own doc calls infinite.
+                report_amount: binding.report_amount.unwrap_or(0),
+                report_interval: u64::from(binding.report_interval_ms),
+                max_report_cells: binding.max_report_cells,
+            });
+        }
+        if bindings.is_empty() {
+            debug!(
+                "The signalled measConfig configures no intra-NR A3 reporting; the \
+                 UE's current measurement configuration is unchanged"
+            );
+        }
+        bindings.len()
     }
 
-    /// Setup default A3 measurement for handover
+    /// Setup default A3 measurement for handover.
+    ///
+    /// A **pre-signalling** default: it is what the UE measures on between
+    /// `RRCSetup` and the first `measConfig`. Since #170 the gNB signals `measId` 1
+    /// on the reconfiguration that establishes the user plane, which replaces this
+    /// entry — so these numbers govern only the window before that arrives, and
+    /// are not the UE's opinion about what the margin should be.
     fn setup_default_measurements(&mut self) {
         // Default A3 event configuration for handover
         let config = MeasConfig {
@@ -1953,6 +2016,17 @@ impl RrcTask {
                 self.suspended_in_cell_identity = None;
                 self.serving_cell_id = Some(cell_id);
 
+                // §5.3.13.4: apply the resume's `measConfig` (issue #170). The
+                // resume carries `fullConfig`, so this is not a nicety — the UE has
+                // just been told to release its stored configuration, and this is
+                // the measurement configuration it is to have instead.
+                if let Some(signalled) = resume.meas_config.as_ref() {
+                    self.apply_signalled_meas_config(signalled);
+                }
+                // And the serving cell the events are written against: the
+                // measurement manager's is stale after a suspend.
+                self.measurement_manager.set_serving_cell(Some(cell_id));
+
                 // A real UPER `RRCResumeComplete` (TS 38.331 §6.2.2). It used to be
                 // hand-built as `[0x08, tid, 0x00, NAS…]`, which put the tid and the
                 // NAS at byte offsets no decoder reads: the gNB recovered the NAS
@@ -2609,6 +2683,14 @@ impl RrcTask {
         // Complete arrives -- meets an entity that can verify it (issue #32).
         self.apply_drb_user_plane_security(bytes).await;
 
+        // §5.3.5.3: apply the `measConfig` if the message carried one (issue #170).
+        // BEFORE the acknowledgement, for the same reason the DRB security is: the
+        // Complete tells the gNB the configuration is in force, and a gNB that then
+        // acted on a report would be acting on the margin it believes it configured.
+        if let Some(signalled) = reconfiguration.meas_config.as_ref() {
+            self.apply_signalled_meas_config(signalled);
+        }
+
         // The tid comes from the DECODED message. It used to be read from
         // `bytes[1]`, which is a byte of RRCReconfiguration-IEs content: the real
         // tid is in bits 5-6 of the leading byte, so the echo was wrong for every
@@ -2841,6 +2923,27 @@ impl RrcTask {
 
     pub fn configured_scells(&self) -> Vec<i32> {
         self.configured_scells.values().copied().collect()
+    }
+
+    /// The A3 offset and hysteresis this UE is evaluating under `meas_id`, as
+    /// `(offset_db, hysteresis_half_db)` — the signalled units (issue #170).
+    ///
+    /// `None` when nothing is installed under that `measId` or its trigger is not
+    /// an A3. Read-only, and the single question #170 is about: after this change
+    /// the numbers here must be the **gNB's**, not the UE's own defaults, and only
+    /// an accessor makes an end-to-end test able to say so.
+    pub fn a3_margin(&self, meas_id: u8) -> Option<(i32, i32)> {
+        let config = self.measurement_manager.config(meas_id)?;
+        if !matches!(
+            config.trigger_config.trigger_type,
+            ReportTriggerType::Event(MeasEventType::A3)
+        ) {
+            return None;
+        }
+        Some((
+            config.trigger_config.a3_offset?,
+            config.trigger_config.hysteresis,
+        ))
     }
 
     /// Handle handover command from RRC Reconfiguration
@@ -4544,8 +4647,8 @@ mod tests {
             while rls_rx.try_recv().is_ok() {}
 
             // The network's real `RRCResume`, built by the same function the gNB uses.
-            let resume =
-                encode_rrc_resume(&fresh_rrc_resume_params(0).expect("params")).expect("encode");
+            let resume = encode_rrc_resume(&fresh_rrc_resume_params(0, None).expect("params"))
+                .expect("encode");
             task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&resume))
                 .await;
 
@@ -4627,6 +4730,7 @@ mod tests {
                 &[9],
                 true,
                 DrbIntegrityProtection::Disabled,
+                None,
             )
             .expect("build"),
         )
@@ -4740,7 +4844,7 @@ mod tests {
             // them in production) a UE that read the DRB identity as the PSI would be
             // indistinguishable from one that read the SDAP config -- a revert round
             // proved exactly that when this test used 7 for both.
-            let params = build_drb_reconfiguration_params(0, 7, 3, 10, &[9], true, signalled)
+            let params = build_drb_reconfiguration_params(0, 7, 3, 10, &[9], true, signalled, None)
                 .expect("build the reconfiguration");
             let pdu = OctetString::from_slice(
                 &encode_rrc_reconfiguration(&params).expect("encode the reconfiguration"),
@@ -5321,6 +5425,214 @@ mod tests {
             report_interval: 0,
             max_report_cells: 4,
         }
+    }
+
+    // ========================================================================
+    // A signalled `measConfig` (issue #170). The gNB's A3 margin was previously
+    // unreachable: `RRCReconfiguration.measConfig` was hardcoded `None`, so the
+    // UE's reporting trigger ran off the local default below and the gNB decided
+    // handovers on its own number.
+    // ========================================================================
+
+    /// The A3 `measConfig` a gNB signals, with a margin no default in this tree
+    /// holds — so a UE that ignored the wire and kept its own default could not
+    /// pass the assertions below.
+    fn signalled_a3(offset_db: f64, hysteresis_db: f64) -> AsnMeasConfig {
+        use nextgsim_rrc::procedures::meas_config::{build_a3_meas_config, A3MeasConfigParams};
+        build_a3_meas_config(&A3MeasConfigParams {
+            meas_id: 1,
+            meas_object_id: 1,
+            report_config_id: 1,
+            ssb_frequency_arfcn: 632_628,
+            ssb_subcarrier_spacing_khz: 30,
+            a3_offset_db: offset_db,
+            hysteresis_db,
+            time_to_trigger_ms: 320,
+            report_interval_ms: 1024,
+            report_amount: Some(4),
+            max_report_cells: 2,
+        })
+        .expect("a signallable margin")
+    }
+
+    /// A received `measConfig` REPLACES the UE's local default under `measId` 1,
+    /// and the numbers it installs are the signalled ones in the signalled units.
+    ///
+    /// The precondition is asserted first, so this cannot pass by the default
+    /// happening to equal the signalled value.
+    #[test]
+    fn a_signalled_meas_config_replaces_the_ue_local_a3_default() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.setup_default_measurements();
+
+        assert_eq!(
+            task.a3_margin(1),
+            Some((3, 2)),
+            "precondition: the UE's OWN default is 3 dB offset / 1 dB (2 half-dB) \
+             hysteresis -- which is what the signalled configuration must replace"
+        );
+        let before = task.measurement_manager.config_count();
+
+        let installed = task.apply_signalled_meas_config(&signalled_a3(11.0, 4.5));
+
+        assert_eq!(installed, 1, "one A3 binding was signalled");
+        assert_eq!(
+            task.a3_margin(1),
+            Some((11, 9)),
+            "the gNB's 11 dB offset and 4.5 dB (9 half-dB) hysteresis must now be \
+             what the UE evaluates"
+        );
+        assert_eq!(
+            task.measurement_manager.config_count(),
+            before,
+            "measId 1 is MODIFIED, not added beside the default -- two A3 measIds \
+             would have the looser of the two decide when the UE reported"
+        );
+        // The rest of the signalled configuration lands too, not just the margin.
+        let config = task
+            .measurement_manager
+            .config(1)
+            .expect("installed under measId 1");
+        assert_eq!(config.trigger_config.time_to_trigger, 320);
+        assert_eq!(config.report_interval, 1024);
+        assert_eq!(config.report_amount, 4);
+        assert_eq!(config.max_report_cells, 2);
+    }
+
+    /// `reportAmount: infinity` is `None` on the wire and 0 in the UE's runtime,
+    /// which is what its own doc calls infinite. Without this the `unwrap_or(0)`
+    /// could be `unwrap_or(8)` and nothing would notice until a UE stopped
+    /// reporting after eight.
+    #[test]
+    fn an_infinite_report_amount_installs_as_zero() {
+        use nextgsim_rrc::procedures::meas_config::{build_a3_meas_config, A3MeasConfigParams};
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        let signalled = build_a3_meas_config(&A3MeasConfigParams {
+            meas_id: 1,
+            meas_object_id: 1,
+            report_config_id: 1,
+            ssb_frequency_arfcn: 632_628,
+            ssb_subcarrier_spacing_khz: 30,
+            a3_offset_db: 3.0,
+            hysteresis_db: 1.0,
+            time_to_trigger_ms: 640,
+            report_interval_ms: 480,
+            report_amount: None,
+            max_report_cells: 4,
+        })
+        .expect("build");
+
+        assert_eq!(task.apply_signalled_meas_config(&signalled), 1);
+        assert_eq!(
+            task.measurement_manager
+                .config(1)
+                .expect("installed")
+                .report_amount,
+            0,
+            "infinity is 0 here"
+        );
+    }
+
+    /// The whole path: a real `RRCReconfiguration` off the wire, through the real
+    /// `handle_downlink_rrc` dispatch, installs the gNB's margin.
+    ///
+    /// The unit test above calls the installer directly; this one proves the
+    /// installer is REACHED — the "correct but unreachable" failure mode. A revert
+    /// of the `apply_signalled_meas_config` call in `handle_rrc_reconfiguration`
+    /// fails here and nowhere else.
+    #[test]
+    fn a_reconfiguration_off_the_wire_installs_the_gnbs_margin() {
+        use nextgsim_rrc::procedures::meas_config::A3MeasConfigParams;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration, RrcReconfigurationParams,
+        };
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            assert_eq!(
+                task.a3_margin(1),
+                Some((3, 2)),
+                "precondition: the UE is on its own default after RRCSetup"
+            );
+
+            let pdu = encode_rrc_reconfiguration(&RrcReconfigurationParams {
+                rrc_transaction_id: 0,
+                radio_bearer_config: None,
+                secondary_cell_group: None,
+                master_cell_group: None,
+                full_config: false,
+                master_key_update: None,
+                meas_config: Some(A3MeasConfigParams {
+                    meas_id: 1,
+                    meas_object_id: 1,
+                    report_config_id: 1,
+                    ssb_frequency_arfcn: 632_628,
+                    ssb_subcarrier_spacing_khz: 30,
+                    a3_offset_db: 13.0,
+                    hysteresis_db: 6.0,
+                    time_to_trigger_ms: 640,
+                    report_interval_ms: 480,
+                    report_amount: Some(8),
+                    max_report_cells: 4,
+                }),
+            })
+            .expect("encode");
+
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+                .await;
+
+            assert_eq!(
+                task.a3_margin(1),
+                Some((13, 12)),
+                "the margin the gNB put on the wire must be the one the UE evaluates"
+            );
+        });
+    }
+
+    /// A reconfiguration with NO `measConfig` must leave the UE's configuration
+    /// alone rather than clearing it. The negative control: without it the test
+    /// above would pass for an implementation that wiped the configuration on
+    /// every reconfiguration.
+    #[test]
+    fn a_reconfiguration_without_a_meas_config_changes_nothing() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration, RrcReconfigurationParams,
+        };
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            // Put a NON-default margin in place first, so "unchanged" is a claim
+            // about preservation rather than about the default surviving.
+            task.apply_signalled_meas_config(&signalled_a3(11.0, 4.5));
+            assert_eq!(task.a3_margin(1), Some((11, 9)), "precondition");
+
+            let pdu = encode_rrc_reconfiguration(&RrcReconfigurationParams {
+                rrc_transaction_id: 0,
+                radio_bearer_config: None,
+                secondary_cell_group: None,
+                master_cell_group: None,
+                full_config: false,
+                master_key_update: None,
+                meas_config: None,
+            })
+            .expect("encode");
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+                .await;
+
+            assert_eq!(
+                task.a3_margin(1),
+                Some((11, 9)),
+                "a reconfiguration carrying no measConfig must not disturb the one \
+                 in force"
+            );
+        });
     }
 
     /// A non-empty neighbour list installs the default B1 `measId` on its own: a

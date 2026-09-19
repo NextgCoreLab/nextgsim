@@ -22,6 +22,16 @@
 //!
 //! The whole path only became reachable recently: #151 made the DL-DCCH dispatch typed,
 //! #160 gave the container a production sender, and #114 built the UE runtime.
+//!
+//! # Since #170: the two margins AGREE, and this file asserts it
+//!
+//! The ceiling this file used to record — "the two A3 margins are still independent"
+//! — is gone. `RRCReconfiguration.measConfig` was hardcoded `None`, so the gNB could
+//! not configure the UE's A3 **reporting** trigger at all: it ran off a hard-coded
+//! UE-local default while only CHO *execution* used the gNB's number. #170 sends a
+//! real generated-codec `MeasConfig`, so one configured margin now governs both, and
+//! `the_gnbs_configured_margin_governs_the_ues_a3_reporting` below asserts the
+//! AGREEMENT rather than documenting the gap.
 
 use nextgsim_common::config::{GnbConfig, IntraFreqNeighbourConfig, UeConfig};
 use nextgsim_common::{OctetString, Plmn};
@@ -75,9 +85,14 @@ struct Harness {
 }
 
 fn harness() -> Harness {
+    harness_with(gnb_config())
+}
+
+/// A harness on a specific gNB configuration, so a test can use a margin that is NOT
+/// the default — which is what makes an agreement assertion mean anything (#170).
+fn harness_with(gnb: GnbConfig) -> Harness {
     let (ue_base, _app, _nas, _rrc, ue_rls_rx) = UeTaskBase::new(ue_config(), 32);
-    let (gnb_base, _gapp, _gngap, _grrc, _ggtp, gnb_rls_rx, _gsctp) =
-        GnbTaskBase::new(gnb_config(), 32);
+    let (gnb_base, _gapp, _gngap, _grrc, _ggtp, gnb_rls_rx, _gsctp) = GnbTaskBase::new(gnb, 32);
     Harness {
         ue: UeRrcTask::new(ue_base),
         gnb: GnbRrcTask::new(gnb_base),
@@ -185,6 +200,93 @@ async fn a_candidate_that_becomes_better_is_executed_by_the_ue_alone() {
         h.ue.serving_cell_id(),
         Some(CANDIDATE_CELL),
         "and the UE must now be on the candidate cell"
+    );
+}
+
+/// #170: the gNB's ONE configured A3 margin governs the UE's **reporting** trigger too,
+/// not just CHO execution — asserted as AGREEMENT, which is what replaced #165's
+/// recorded ceiling.
+///
+/// The margin is deliberately not the default (9 dB / 3.5 dB): a UE that ignored the
+/// wire and kept its own 3 dB / 1 dB default would pass a default-valued version of
+/// this test, which is exactly how the gap went unnoticed.
+///
+/// Both ends of the agreement are asserted from the SAME `GnbConfig`:
+/// * the reporting margin the UE ends up evaluating, via `a3_margin`;
+/// * the execution margin the CHO container carried, via the fact that the candidate
+///   the gNB armed executes at a level past that margin and not before it.
+#[tokio::test]
+async fn the_gnbs_configured_margin_governs_the_ues_a3_reporting() {
+    use nextgsim_gnb::rrc::meas::a3_meas_config_params;
+    use nextgsim_rrc::procedures::rrc_reconfiguration::{
+        build_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
+    };
+
+    let mut config = gnb_config();
+    config.cho_a3_offset_db = 9.0;
+    config.cho_hysteresis_db = 3.5;
+
+    let mut h = harness_with(config.clone());
+    arm_conditional_handover(&mut h).await;
+
+    assert_eq!(
+        h.ue.a3_margin(1),
+        Some((3, 2)),
+        "precondition: before the measConfig the UE is on its OWN default (3 dB / 1 dB \
+         = 2 half-dB), which is NOT the gNB's 9 dB / 3.5 dB"
+    );
+
+    // The gNB's live DRB reconfiguration, built from its own configuration by the same
+    // two functions `NgapTask::establish_drb` calls.
+    let params = build_drb_reconfiguration_params(
+        0,
+        1,
+        1,
+        4,
+        &[1],
+        true,
+        DrbIntegrityProtection::Disabled,
+        a3_meas_config_params(&config),
+    )
+    .expect("the gNB's DRB reconfiguration must build");
+    let pdu = encode_rrc_reconfiguration(&params).expect("and encode");
+    h.ue.handle_downlink_rrc(
+        SERVING_CELL,
+        RrcChannel::DlDcch,
+        OctetString::from_slice(&pdu),
+    )
+    .await;
+
+    // AGREEMENT: the reporting margin the UE now evaluates IS the gNB's configuration,
+    // derived from the same two config fields the CHO container was built from.
+    assert_eq!(
+        h.ue.a3_margin(1),
+        Some((
+            config.cho_a3_offset_db as i32,
+            (config.cho_hysteresis_db * 2.0) as i32
+        )),
+        "the UE's A3 REPORTING margin must equal the gNB's configured margin -- the \
+         independence #165's spec recorded as a ceiling"
+    );
+
+    // And the CHO execution margin is the same one: the candidate still executes only
+    // once it beats the serving cell by more than 9 dB + 3.5 dB hysteresis.
+    h.ue.handle_signal_changed(CANDIDATE_CELL, -80).await; // 10 dB better: inside 12.5
+    h.ue.perform_cycle().await;
+    assert_eq!(
+        h.ue.serving_cell_id(),
+        Some(SERVING_CELL),
+        "10 dB is short of the configured 9 dB offset + 3.5 dB hysteresis, so the \
+         candidate must NOT execute -- this is what proves the execution margin is the \
+         configured one and not the 3 dB default"
+    );
+
+    h.ue.handle_signal_changed(CANDIDATE_CELL, -70).await; // 20 dB better: past 12.5
+    h.ue.perform_cycle().await;
+    assert_eq!(
+        h.ue.serving_cell_id(),
+        Some(CANDIDATE_CELL),
+        "and 20 dB is past it, so it must"
     );
 }
 

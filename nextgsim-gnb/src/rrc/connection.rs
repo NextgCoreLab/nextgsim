@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use nextgsim_common::OctetString;
 use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::{
+    meas_config::A3MeasConfigParams,
     rrc_reestablishment::{
         compute_short_mac_i, encode_rrc_reestablishment, ReestablishmentCauseValue,
         RrcReestablishmentError, RrcReestablishmentParams,
@@ -764,11 +765,17 @@ impl RrcConnectionManager {
     /// Processes an RRC Resume Request
     ///
     /// Called when a UE in `RRC_INACTIVE` state resumes its connection.
+    ///
+    /// `meas_config` is the A3 measurement configuration the resumed UE is to apply
+    /// (issue #170), passed in rather than read from a config this manager does not
+    /// hold. Needed because the `RRCResume` this builds sets `fullConfig`, which
+    /// tells the UE to release its stored measurement configuration.
     pub fn process_rrc_resume_request(
         &mut self,
         ue_mgr: &mut RrcUeContextManager,
         ue_id: i32,
         request: ResumeRequestPresented,
+        meas_config: Option<A3MeasConfigParams>,
     ) -> Result<RrcResumeResult, ResumeRejection> {
         if self.is_barred {
             warn!("Rejecting RRC Resume: cell is barred");
@@ -819,7 +826,7 @@ impl RrcConnectionManager {
 
         let transaction_id = self.next_tid();
         let rrc_resume_pdu = self
-            .build_rrc_resume(transaction_id)
+            .build_rrc_resume(transaction_id, meas_config)
             .ok_or(ResumeRejection::ResumeNotBuildable)?;
 
         let ctx = ue_mgr.find_or_create_ue(ue_id);
@@ -895,8 +902,12 @@ impl RrcConnectionManager {
     ///
     /// A build failure falls back to `None` rather than to a byte PDU, so the
     /// caller declines the resume instead of sending something the UE cannot parse.
-    fn build_rrc_resume(&self, transaction_id: u8) -> Option<OctetString> {
-        let params = match fresh_rrc_resume_params(transaction_id) {
+    fn build_rrc_resume(
+        &self,
+        transaction_id: u8,
+        meas_config: Option<A3MeasConfigParams>,
+    ) -> Option<OctetString> {
+        let params = match fresh_rrc_resume_params(transaction_id, meas_config) {
             Ok(p) => p,
             Err(e) => {
                 warn!("Cannot build RRCResume params: {e}");
@@ -1461,6 +1472,7 @@ mod tests {
                         cause: 0,
                         resuming_cell_identity: resuming_cell,
                     },
+                    None,
                 )
                 .err(),
             Some(ResumeRejection::UnknownIRnti)
@@ -1483,6 +1495,7 @@ mod tests {
                         cause: 0,
                         resuming_cell_identity: resuming_cell,
                     },
+                    None,
                 )
                 .err(),
             Some(ResumeRejection::MacIMismatch)
@@ -1508,6 +1521,7 @@ mod tests {
                     cause: 4,
                     resuming_cell_identity: resuming_cell,
                 },
+                None,
             )
             .expect("a correctly authenticated resume must be accepted");
         assert_eq!(result.ue_id, 9, "restored under the resuming ue_id");
@@ -1538,6 +1552,7 @@ mod tests {
                         cause: 4,
                         resuming_cell_identity: resuming_cell,
                     },
+                    None,
                 )
                 .err(),
             Some(ResumeRejection::UnknownIRnti)
@@ -1575,6 +1590,7 @@ mod tests {
                         cause: 0,
                         resuming_cell_identity: 0x20,
                     },
+                    None,
                 )
                 .err(),
             Some(ResumeRejection::MacIMismatch),
@@ -1649,6 +1665,13 @@ mod tests {
                     cause: 0,
                     resuming_cell_identity: resuming_cell,
                 },
+                // A margin no default holds, so a reproduced default cannot pass
+                // for a signalled one (issue #170).
+                crate::rrc::meas::a3_meas_config_params(&nextgsim_common::config::GnbConfig {
+                    cho_a3_offset_db: 9.0,
+                    cho_hysteresis_db: 4.5,
+                    ..nextgsim_common::config::GnbConfig::default()
+                }),
             )
             .expect("a resume must be emitted");
 
@@ -1671,6 +1694,16 @@ mod tests {
             "fullConfig must be set: this gNB stores no suspended context, so a \
              delta would be relative to nothing"
         );
+
+        // And a measurement configuration, which `fullConfig` makes mandatory in
+        // practice: it tells the UE to release its stored one (issue #170).
+        let signalled = decoded
+            .meas_config
+            .expect("a fullConfig resume must carry a measConfig or the UE measures nothing");
+        let read = nextgsim_rrc::procedures::meas_config::read_a3_meas_configs(&signalled);
+        assert_eq!(read.len(), 1, "one A3 reporting binding");
+        assert_eq!(read[0].a3_offset_db, 9, "9 dB, in whole dB");
+        assert_eq!(read[0].hysteresis_half_db, 9, "4.5 dB, in 0.5 dB units");
     }
 
     /// #50, criterion 3: `build_rrc_release` no longer hardcodes

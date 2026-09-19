@@ -470,9 +470,10 @@ mod tests {
             master_cell_group: None,
             full_config: false,
             master_key_update: None,
+            meas_config: None,
         })
         .expect("encode RRCReconfiguration");
-        let resume = encode_rrc_resume(&fresh_rrc_resume_params(2).expect("resume params"))
+        let resume = encode_rrc_resume(&fresh_rrc_resume_params(2, None).expect("resume params"))
             .expect("encode RRCResume");
         let release = encode_rrc_release(&RrcReleaseParams {
             rrc_transaction_id: 3,
@@ -736,7 +737,7 @@ mod tests {
     #[test]
     fn the_old_simulator_envelope_codes_collided_with_a_conformant_rrc_resume() {
         use crate::procedures::rrc_resume::{encode_rrc_resume, fresh_rrc_resume_params};
-        let resume = encode_rrc_resume(&fresh_rrc_resume_params(3).expect("resume params"))
+        let resume = encode_rrc_resume(&fresh_rrc_resume_params(3, None).expect("resume params"))
             .expect("encode RRCResume");
         assert_eq!(
             resume[0], 0x0E,

@@ -1405,6 +1405,10 @@ mod tests {
             &[9],
             true,
             nextgsim_rrc::procedures::rrc_reconfiguration::DrbIntegrityProtection::Disabled,
+            // With a measConfig, which is what the live `establish_drb` now sends
+            // (issue #170): the distinguishing feature is `reconfigurationWithSync`,
+            // and a measConfig must not be mistaken for one.
+            crate::rrc::meas::a3_meas_config_params(&nextgsim_common::config::GnbConfig::default()),
         )
         .expect("a DRB reconfiguration builds");
         let pdu = encode_rrc_reconfiguration(&params).expect("and encodes");

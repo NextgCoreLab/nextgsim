@@ -31,6 +31,7 @@ use super::amf_context::{AmfIdentity, AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
 use super::up_security::{self, DrbSecurityDecision, UpSecurityRefusal};
+use crate::rrc::meas::a3_meas_config_params;
 use crate::rrc::transaction::RrcProcedure;
 use nextgsim_rrc::procedures::handover_preparation::{
     encode_handover_preparation_information, HandoverPreparationParams,
@@ -1257,6 +1258,15 @@ impl NgapTask {
             .find(|c| c.ue_id == ue_id)
             .map(|c| c.transactions.allocate(RrcProcedure::Reconfiguration))
             .unwrap_or(0);
+        // Configure the UE's A3 REPORTING measurement on this reconfiguration
+        // (issue #170). This is the message that establishes the user plane, so it
+        // is the first one a connected UE gets that can carry a `measConfig` — and
+        // a UE that is about to carry traffic is exactly the UE whose mobility
+        // reporting has to be on the gNB's margin rather than a local default.
+        //
+        // `None` when the configured margin is not signallable: the DRB half of
+        // this message still goes out. See `rrc::meas::a3_meas_config_params`.
+        let meas_config = a3_meas_config_params(&self.task_base.config);
         let params = match build_drb_reconfiguration_params(
             rrc_transaction_id,
             psi,
@@ -1265,6 +1275,7 @@ impl NgapTask {
             qfis,
             true,
             integrity_protection,
+            meas_config,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -4935,8 +4946,8 @@ mod tests {
         use nextgsim_rrc::procedures::rrc_reconfiguration::is_rrc_reconfiguration;
 
         // The exact call establish_drb makes: PDU session 5, DRB 5, LCID 8,
-        // accepted QFIs 1 & 9. The result must be a decodable DL-DCCH
-        // RRCReconfiguration.
+        // accepted QFIs 1 & 9, and the A3 measConfig from THIS gNB's configuration
+        // (issue #170). The result must be a decodable DL-DCCH RRCReconfiguration.
         let params = build_drb_reconfiguration_params(
             0,
             5,
@@ -4945,12 +4956,96 @@ mod tests {
             &[1, 9],
             true,
             DrbIntegrityProtection::Disabled,
+            a3_meas_config_params(&test_config()),
         )
         .unwrap();
         let bytes = encode_rrc_reconfiguration(&params).unwrap();
         assert!(!bytes.is_empty());
         let msg: DL_DCCH_Message = decode_rrc(&bytes).unwrap();
         assert!(is_rrc_reconfiguration(&msg));
+    }
+
+    /// `establish_drb`'s message must carry the gNB's A3 margin (issue #170).
+    ///
+    /// The PRODUCTION-caller assertion: `build_drb_reconfiguration_params` can take
+    /// a measConfig, and this is what says the live path passes one. Without it the
+    /// feature would be "correct but unreachable" — the gNB would still send a
+    /// measConfig-less reconfiguration and every test above would pass.
+    #[tokio::test]
+    async fn establish_drb_configures_the_ues_a3_reporting_margin() {
+        use nextgsim_rrc::procedures::meas_config::read_a3_meas_configs;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::decode_rrc_reconfiguration;
+
+        let mut config = test_config();
+        // A margin no default in this tree holds, so a reproduced default cannot
+        // pass for a signalled one.
+        config.cho_a3_offset_db = 11.0;
+        config.cho_hysteresis_db = 3.5;
+        let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+
+        task.establish_drb(1, 1, &[1], DrbIntegrityProtection::Disabled)
+            .await;
+
+        let pdu = loop {
+            match rrc_rx.try_recv() {
+                Ok(TaskMessage::Message(RrcMessage::RrcReconfiguration { pdu, .. })) => break pdu,
+                Ok(_) => continue,
+                Err(_) => panic!("establish_drb must hand an RRCReconfiguration to the RRC task"),
+            }
+        };
+
+        let data = decode_rrc_reconfiguration(pdu.data()).expect("a decodable reconfiguration");
+        let signalled = data
+            .meas_config
+            .expect("the live DRB reconfiguration must carry a measConfig");
+        let read = read_a3_meas_configs(&signalled);
+        assert_eq!(read.len(), 1, "one A3 reporting binding");
+        assert_eq!(
+            read[0].meas_id, 1,
+            "measId 1, which REPLACES the UE's pre-signalling default"
+        );
+        assert_eq!(read[0].a3_offset_db, 11, "the gNB's configured 11 dB");
+        assert_eq!(
+            read[0].hysteresis_half_db, 7,
+            "the gNB's configured 3.5 dB, in 0.5 dB units"
+        );
+    }
+
+    /// And a margin TS 38.331 cannot carry costs the UE its measConfig and
+    /// NOTHING else: the DRB half of the same message still goes out.
+    #[tokio::test]
+    async fn an_unsignallable_margin_still_establishes_the_drb() {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::decode_rrc_reconfiguration;
+
+        let mut config = test_config();
+        config.cho_a3_offset_db = 99.0;
+        let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+
+        task.establish_drb(1, 1, &[1], DrbIntegrityProtection::Disabled)
+            .await;
+
+        let pdu = loop {
+            match rrc_rx.try_recv() {
+                Ok(TaskMessage::Message(RrcMessage::RrcReconfiguration { pdu, .. })) => break pdu,
+                Ok(_) => continue,
+                Err(_) => {
+                    panic!("the DRB must still be established when the margin is unsignallable")
+                }
+            }
+        };
+        let data = decode_rrc_reconfiguration(pdu.data()).expect("a decodable reconfiguration");
+        assert!(
+            data.meas_config.is_none(),
+            "an unsignallable margin must be omitted, not clamped"
+        );
+        assert!(
+            data.radio_bearer_config.is_some(),
+            "and the DRB half must survive"
+        );
     }
 
     #[test]

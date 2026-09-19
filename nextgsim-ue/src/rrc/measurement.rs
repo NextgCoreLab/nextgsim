@@ -1000,6 +1000,16 @@ impl MeasurementManager {
         self.configs.len()
     }
 
+    /// The configuration installed under `meas_id`, if any.
+    ///
+    /// Read-only, and the single thing that answers "which A3 margin is this UE
+    /// actually evaluating?" — the question issue #170 was filed about. Public
+    /// rather than test-only because the CHO end-to-end test lives in another
+    /// crate, and because it is the kind of state an operator status view wants.
+    pub fn config(&self, meas_id: u8) -> Option<&MeasConfig> {
+        self.configs.get(&meas_id)
+    }
+
     /// Get all cell measurements
     pub fn measurements(&self) -> &HashMap<i32, CellMeasResult> {
         &self.measurements

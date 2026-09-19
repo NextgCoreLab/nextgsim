@@ -10,6 +10,7 @@
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
+use crate::procedures::meas_config::{build_a3_meas_config, A3MeasConfigParams, MeasConfigError};
 use thiserror::Error;
 
 /// Errors that can occur during RRC Reconfiguration procedures
@@ -31,6 +32,14 @@ pub enum RrcReconfigurationError {
     /// Invalid field value
     #[error("Invalid field value: {0}")]
     InvalidFieldValue(String),
+
+    /// A `measConfig` whose field values TS 38.331 does not allow (issue #170).
+    ///
+    /// Its own variant rather than folded into `InvalidFieldValue`: a caller that
+    /// wants to decline arming measurements but still send the bearer half of the
+    /// reconfiguration has to be able to tell the two apart.
+    #[error("Invalid measConfig: {0}")]
+    MeasConfig(#[from] MeasConfigError),
 }
 
 // ============================================================================
@@ -60,6 +69,15 @@ pub struct RrcReconfigurationParams {
     /// that bit wrong makes the two ends derive different keys and every PDCP MAC on the
     /// target fail, with nothing to say a key was the problem.
     pub master_key_update: Option<MasterKeyUpdateParams>,
+    /// `measConfig`: the measurement configuration the UE is to apply
+    /// (TS 38.331 §5.5.2, §6.3.2; issue #170).
+    ///
+    /// `None` leaves the UE's measurement configuration alone, which is right for a
+    /// reconfiguration that changes only bearers. `Some` carries the gNB's A3
+    /// margin, and is what makes the reporting trigger the UE evaluates the same
+    /// one the gNB decides handovers on — before this the field was hardcoded
+    /// `None`, so the two were independent with no wire path between them.
+    pub meas_config: Option<A3MeasConfigParams>,
 }
 
 /// `masterKeyUpdate` as the network sets it and the UE reads it
@@ -88,6 +106,13 @@ pub struct RrcReconfigurationData {
     pub full_config: bool,
     /// `masterKeyUpdate`, when the message carried one (issue #39).
     pub master_key_update: Option<MasterKeyUpdateParams>,
+    /// The **decoded** `measConfig`, when the message carried one (issue #170).
+    ///
+    /// The whole IE rather than the A3 parameters alone: a `measConfig` may carry
+    /// removals, a `quantityConfig` or a periodical report, and a receiver that
+    /// wanted any of those would have to re-decode the message to see them.
+    /// [`read_a3_meas_configs`] extracts the A3 bindings from it.
+    pub meas_config: Option<MeasConfig>,
 }
 
 /// Build an RRC Reconfiguration message
@@ -114,7 +139,16 @@ pub fn build_rrc_reconfiguration(
             .secondary_cell_group
             .as_ref()
             .map(|b| RRCReconfiguration_IEsSecondaryCellGroup(b.clone())),
-        meas_config: None, // Simplified - not including MeasConfig for now
+        // A real generated-codec `MeasConfig` (issue #170). This was hardcoded
+        // `None` with the comment "Simplified - not including MeasConfig for now",
+        // which made the gNB's A3 margin unreachable by the UE: it ran its
+        // reporting trigger off a hard-coded local default while the gNB decided
+        // handovers on the configured one.
+        meas_config: params
+            .meas_config
+            .as_ref()
+            .map(build_a3_meas_config)
+            .transpose()?,
         late_non_critical_extension: None,
         non_critical_extension: if params.master_cell_group.is_some() || params.full_config {
             Some(build_v1530_extension(params))
@@ -297,6 +331,20 @@ pub fn build_cell_group_config(drb_id: u8, lcid: u8) -> CellGroupConfig {
 /// `build_rrc_reconfiguration`; `master_cell_group` is carried as the
 /// `OCTET STRING (CONTAINING CellGroupConfig)` masterCellGroup IE). The opaque
 /// byte path is preserved for callers that already have pre-encoded config.
+///
+/// `meas_config` is the measurement configuration to carry, or `None` to leave the
+/// UE's alone (issue #170). Threaded through rather than defaulted here, because
+/// the margin is the **gNB's** configuration and this crate has no access to it —
+/// defaulting would put a second A3 margin in the tree, which is the defect #170
+/// is about.
+//
+// `too_many_arguments` (8, over the 7 threshold) is allowed rather than fixed by
+// bundling into a params struct. Every argument is a distinct IE that goes on the
+// wire, and the two that could be confused for each other are already newtyped
+// (`DrbIntegrityProtection` for exactly that reason — see its own doc). A wrapper
+// struct would add a type whose only job is to be destructured one line later, and
+// the eight call sites would each gain a field name without gaining a check.
+#[allow(clippy::too_many_arguments)]
 pub fn build_drb_reconfiguration_params(
     rrc_transaction_id: u8,
     pdu_session_id: u8,
@@ -305,6 +353,7 @@ pub fn build_drb_reconfiguration_params(
     qfis: &[u8],
     default_drb: bool,
     integrity_protection: DrbIntegrityProtection,
+    meas_config: Option<A3MeasConfigParams>,
 ) -> Result<RrcReconfigurationParams, RrcReconfigurationError> {
     let rbc = build_drb_radio_bearer_config(
         pdu_session_id,
@@ -326,6 +375,7 @@ pub fn build_drb_reconfiguration_params(
         full_config: false,
         // A DRB-establishing reconfiguration is not a handover, so the UE keeps its keys.
         master_key_update: None,
+        meas_config,
     })
 }
 
@@ -437,6 +487,11 @@ pub fn parse_rrc_reconfiguration(
         master_cell_group,
         full_config,
         master_key_update,
+        // Cloned rather than re-encoded, unlike `radio_bearer_config` above: the
+        // measurement configuration is CONSUMED by the receiver (it installs the
+        // margin), not forwarded, so a byte round trip would only add a way to
+        // lose it (issue #170).
+        meas_config: ies.meas_config.clone(),
     })
 }
 
@@ -725,6 +780,25 @@ mod tests {
             master_cell_group: Some(vec![0x00, 0x01, 0x02]), // Sample cell group config
             full_config: false,
             master_key_update: None,
+            meas_config: None,
+        }
+    }
+
+    /// The A3 `measConfig` a default-configured gNB signals: 3 dB offset, 1 dB
+    /// hysteresis (issue #170).
+    fn test_meas_config_params() -> A3MeasConfigParams {
+        A3MeasConfigParams {
+            meas_id: 1,
+            meas_object_id: 1,
+            report_config_id: 1,
+            ssb_frequency_arfcn: 632_628,
+            ssb_subcarrier_spacing_khz: 30,
+            a3_offset_db: 3.0,
+            hysteresis_db: 1.0,
+            time_to_trigger_ms: 640,
+            report_interval_ms: 480,
+            report_amount: Some(8),
+            max_report_cells: 4,
         }
     }
 
@@ -760,6 +834,7 @@ mod tests {
             master_cell_group: Some(vec![0xAA, 0xBB]),
             full_config: true,
             master_key_update: None,
+            meas_config: None,
         };
 
         let msg = build_rrc_reconfiguration(&params).unwrap();
@@ -795,6 +870,7 @@ mod tests {
             master_cell_group: None,
             full_config: false,
             master_key_update: None,
+            meas_config: None,
         };
 
         let result = build_rrc_reconfiguration(&params);
@@ -1089,6 +1165,7 @@ mod tests {
             master_cell_group: None,
             full_config: false,
             master_key_update: None,
+            meas_config: None,
         })
         .expect("encode minimal RRCReconfiguration");
         assert_eq!(
@@ -1096,6 +1173,118 @@ mod tests {
             GOLDEN_RECONFIG_MINIMAL_TID0.to_vec(),
             "minimal RRCReconfiguration(tid 0) must match the hand-derived UPER bytes"
         );
+    }
+
+    /// The golden bytes above are the `measConfig`-ABSENT encoding, and the
+    /// presence bit that says so is the third of the five in
+    /// `RRCReconfiguration-IEs`. So adding a `measConfig` must change the bytes —
+    /// if it did not, `optional_idx = 2` would not be being written and the field
+    /// would be silently dropped on the wire (issue #170).
+    ///
+    /// A POSITIVE assertion on the difference rather than on a hand-derived vector:
+    /// the message now embeds a whole `MeasConfig`, and the decoder is the
+    /// authority on that layout (the byte round trip in `meas_config.rs` pins it).
+    #[test]
+    fn a_meas_config_changes_the_reconfiguration_bytes_and_is_read_back() {
+        let params = RrcReconfigurationParams {
+            rrc_transaction_id: 0,
+            radio_bearer_config: None,
+            secondary_cell_group: None,
+            master_cell_group: None,
+            full_config: false,
+            master_key_update: None,
+            meas_config: Some(test_meas_config_params()),
+        };
+        let bytes = encode_rrc_reconfiguration(&params).expect("encode with a measConfig");
+        assert_ne!(
+            bytes,
+            GOLDEN_RECONFIG_MINIMAL_TID0.to_vec(),
+            "a measConfig must reach the wire"
+        );
+
+        // And it survives: the margin the gNB configured is the margin decoded.
+        let data = decode_rrc_reconfiguration(&bytes).expect("decode");
+        let signalled = data.meas_config.expect("the measConfig must be carried");
+        let read = crate::procedures::meas_config::read_a3_meas_configs(&signalled);
+        assert_eq!(read.len(), 1, "one A3 binding");
+        assert_eq!(read[0].meas_id, 1);
+        assert_eq!(read[0].a3_offset_db, 3, "3 dB, in whole dB");
+        assert_eq!(read[0].hysteresis_half_db, 2, "1 dB, in 0.5 dB units");
+    }
+
+    /// The whole message — `measConfig` and all — byte round trips.
+    ///
+    /// Load-bearing in the way #117's session learnt: an open-type framing bug
+    /// round-tripped to PLAUSIBLE garbage that both `is_ok()` and a structure
+    /// comparison accepted. Here the risk is the same in shape: `measConfig` is a
+    /// deeply nested OPTIONAL whose presence bit sits among four others, and a
+    /// decoder that consumed the wrong number of bits would mis-read whatever
+    /// followed. Nothing follows it in this vector, so the DRB one below carries a
+    /// `masterCellGroup` after it.
+    #[test]
+    fn a_reconfiguration_carrying_a_meas_config_byte_round_trips() {
+        for (label, params) in [
+            (
+                "measConfig alone",
+                RrcReconfigurationParams {
+                    rrc_transaction_id: 0,
+                    radio_bearer_config: None,
+                    secondary_cell_group: None,
+                    master_cell_group: None,
+                    full_config: false,
+                    master_key_update: None,
+                    meas_config: Some(test_meas_config_params()),
+                },
+            ),
+            (
+                // A `masterCellGroup` AFTER the measConfig: if the decoder stopped
+                // at the wrong bit, this is the field that would come back wrong.
+                "measConfig then masterCellGroup",
+                RrcReconfigurationParams {
+                    rrc_transaction_id: 3,
+                    radio_bearer_config: None,
+                    secondary_cell_group: None,
+                    master_cell_group: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                    full_config: true,
+                    master_key_update: None,
+                    meas_config: Some(test_meas_config_params()),
+                },
+            ),
+        ] {
+            let bytes = encode_rrc_reconfiguration(&params).expect("encode");
+            let msg: DL_DCCH_Message = decode_rrc(&bytes).expect("decode");
+            assert_eq!(
+                encode_rrc(&msg).expect("re-encode"),
+                bytes,
+                "{label} must byte round trip"
+            );
+            // And the field after it is intact, which byte identity alone would not
+            // distinguish from a symmetric bug.
+            let data = decode_rrc_reconfiguration(&bytes).expect("parse");
+            assert_eq!(
+                data.master_cell_group, params.master_cell_group,
+                "{label}: the masterCellGroup after the measConfig"
+            );
+            assert_eq!(data.rrc_transaction_id, params.rrc_transaction_id);
+        }
+    }
+
+    /// A margin TS 38.331 cannot carry fails the BUILD rather than encoding
+    /// something out of constraint. Named so the gNB's "decline the measConfig,
+    /// send the rest" behaviour has something to rest on.
+    #[test]
+    fn an_unsignallable_meas_config_fails_the_build() {
+        let result = encode_rrc_reconfiguration(&RrcReconfigurationParams {
+            meas_config: Some(A3MeasConfigParams {
+                a3_offset_db: 99.0,
+                ..test_meas_config_params()
+            }),
+            ..create_test_reconfiguration_params()
+        });
+        assert!(matches!(
+            result,
+            Err(RrcReconfigurationError::MeasConfig(_))
+        ));
     }
 
     #[test]
@@ -1122,6 +1311,9 @@ mod tests {
             &qfis,
             true,
             DrbIntegrityProtection::Disabled,
+            // No measConfig: this test is about the DRB half, and the golden
+            // byte vectors below are the no-measConfig encoding.
+            None,
         )
         .expect("build structured reconfig params");
 
@@ -1500,6 +1692,11 @@ mod tests {
             &[1],
             true,
             DrbIntegrityProtection::Disabled,
+            // The frozen vector is the measConfig-ABSENT encoding, so this is
+            // `None` deliberately: a measConfig would change every byte after the
+            // third presence bit. `a_meas_config_changes_the_reconfiguration_bytes`
+            // is what asserts the present form differs.
+            None,
         )
         .expect("build DRB params");
         let bytes = encode_rrc_reconfiguration(&params).expect("encode RRCReconfiguration");
@@ -1523,6 +1720,7 @@ mod tests {
             &[1],
             true,
             DrbIntegrityProtection::Disabled,
+            None,
         )
         .expect("build DRB params");
         let expected = build_rrc_reconfiguration(&params).expect("build message");
@@ -1755,6 +1953,13 @@ pub fn build_handover_command_params(
         master_cell_group: Some(encode_rrc(&cgc)?),
         full_config: params.full_config,
         master_key_update: params.master_key_update,
+        // A handover command carries no `measConfig` here (issue #170). The target
+        // cell's measurement configuration is what a conformant one would carry,
+        // and this gNB has one carrier: the frequency the UE already measures is
+        // the frequency it would be told to measure, so signalling it again would
+        // re-send the same configuration with a `reconfigurationWithSync` beside
+        // it. If this ever becomes multi-carrier, this is the site.
+        meas_config: None,
     })
 }
 

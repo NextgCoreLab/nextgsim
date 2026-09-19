@@ -89,6 +89,7 @@ use super::connection::{
     ReestablishmentRequest, ResumeRequestPresented, RrcConnectionManager, SuspendParams,
 };
 use super::handover::{measurement_report_from, GnbHandoverManager, HandoverDecision};
+use super::meas::a3_meas_config_params;
 use super::system_info::{
     encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
     release_cell_reselection_priorities,
@@ -1434,10 +1435,15 @@ impl RrcTask {
             presented.identity, presented.cause
         );
 
+        // The resumed UE's A3 reporting configuration (issue #170): its `RRCResume`
+        // sets `fullConfig`, which releases whatever measurement configuration it
+        // had, so the resume has to supply one or the UE resumes measuring nothing.
+        let meas_config = a3_meas_config_params(&self.task_base.config);
         match self.connection_manager.process_rrc_resume_request(
             &mut self.ue_manager,
             ue_id,
             presented,
+            meas_config,
         ) {
             Ok(result) => {
                 self.send_rrc_message(result.ue_id, result.channel, result.rrc_resume_pdu)
