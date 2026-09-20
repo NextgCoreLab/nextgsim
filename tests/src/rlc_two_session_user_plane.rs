@@ -46,6 +46,14 @@ use tokio::sync::mpsc;
 
 const PSI_A: i32 = 1;
 const PSI_B: i32 = 5;
+/// The QoS flow every payload here rides (issue #44). 5QI 9 is best-effort non-GBR,
+/// so it is a flow the policy maps to a session's **default** DRB — the only bearer
+/// either session has in this test.
+///
+/// Both sessions name the same QFI because a QFI is scoped to its PDU session
+/// (TS 23.501 §5.7.1.1): QFI 9 on PSI 1 and QFI 9 on PSI 5 are two different flows,
+/// so nothing about the two-session split is made ambiguous by sharing the number.
+const QFI_NON_GBR: u8 = 9;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn gnb_config() -> GnbConfig {
@@ -151,6 +159,41 @@ async fn complete_discovery(h: &mut Harness) -> i32 {
     gnb_saw_ue
 }
 
+/// What the gNB's RLS task expects in `DownlinkData.pdu`.
+///
+/// # Why a test about RLC has to know about SDAP
+///
+/// `RlsMessage::DownlinkData` is the boundary BELOW the SDAP sublayer: on the live
+/// path the gNB's GTP task has already prepended the one-octet header (TS 37.324
+/// §6.2.2) by the time it sends one. So with `sdap-dataplane` the field carries an
+/// SDAP Data PDU and without it a bare SDU, and a test that injects here is standing
+/// in for the GTP task — it owes the same framing.
+///
+/// Sending a bare SDU feature-on is not "testing the old path", it is sending a
+/// malformed PDU: `decode_dl_pdu` reads the payload's first octet as the header, so
+/// `large_a` (which starts `0x00`) reads as a Control PDU and is DISCARDED, while
+/// `small_a` (`0xA1`) and `small_b` (`0xB2`) happen to have bit 8 set and so decode
+/// as "valid" headers whose first payload octet the UE strips — delivering each SDU
+/// one byte short. Both failures are the UE being right, not wrong (issue #44).
+///
+/// Built with the SHIPPED encoder, so a change to the octet layout moves this helper
+/// rather than leaving it encoding a stale format.
+#[cfg(feature = "sdap-dataplane")]
+fn framed(qfi: u8, sdu: &[u8]) -> Vec<u8> {
+    use nextgsim_pdcp::sdap::{build_dl_pdu, SdapHeader};
+    // RQI clear: reflective QoS (TS 23.501 §5.7.5.3) has nothing to do with the
+    // per-bearer RLC split this file is about, and setting it would have the UE log a
+    // flow property the test never established.
+    build_dl_pdu(SdapHeader { qfi, rqi: false }, sdu).expect("a legal QFI")
+}
+
+/// Without the feature the field is the bare SDU, exactly as before #44 — so what
+/// this test puts on the wire is byte-identical to what it always did.
+#[cfg(not(feature = "sdap-dataplane"))]
+fn framed(_qfi: u8, sdu: &[u8]) -> Vec<u8> {
+    sdu.to_vec()
+}
+
 /// Collects `count` downlink SDUs the UE handed up to NAS, as `(psi, bytes)`.
 async fn collect_delivered(
     rx: &mut mpsc::Receiver<UeTaskMessage<NasMessage>>,
@@ -194,7 +237,14 @@ async fn two_pdu_sessions_carry_their_own_traffic_end_to_end() {
             .send(GnbRlsMessage::DownlinkData {
                 ue_id,
                 psi,
-                pdu: OctetString::from_slice(&payload),
+                // The session's default DRB, whose identity is the PSI
+                // (`nextgsim_gtp::qfi_drb::allocate_drbs`) — so this test describes the
+                // same two bearers with `sdap-dataplane` on or off (issue #44). It is
+                // also why no `InstallSdapMapping` is needed: the UE's `psi_for_drb`
+                // falls back to the DRB identity, which IS the PSI for a default DRB,
+                // so both sessions' SDUs already reach NAS under the right PSI.
+                drb_id: psi,
+                pdu: OctetString::from_slice(&framed(QFI_NON_GBR, &payload)),
             })
             .await
             .expect("gNB RLS task alive");

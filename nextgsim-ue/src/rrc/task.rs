@@ -2683,6 +2683,14 @@ impl RrcTask {
         // Complete arrives -- meets an entity that can verify it (issue #32).
         self.apply_drb_user_plane_security(bytes).await;
 
+        // And the QoS-flow-to-DRB mapping (issue #44), before the acknowledgement for
+        // the same reason: the Complete tells the gNB the configuration is in force, and
+        // the gNB may send a downlink SDU on the session's second DRB as soon as it
+        // arrives. A UE that had not yet recorded that bearer's PSI would deliver those
+        // SDUs to the wrong session. AFTER the security above so the ordering matches
+        // the stack: a bearer is keyed before it is mapped.
+        self.apply_drb_sdap_mapping(bytes).await;
+
         // §5.3.5.3: apply the `measConfig` if the message carried one (issue #170).
         // BEFORE the acknowledgement, for the same reason the DRB security is: the
         // Complete tells the gNB the configuration is in force, and a gNB that then
@@ -2778,6 +2786,12 @@ impl RrcTask {
                 );
                 let msg = RlsMessage::InstallDrbSecurity {
                     psi,
+                    // The DRB identity keys the RLS task's PDCP entity since issue #44,
+                    // and it has to be THIS DRB's: `bearer` below is derived from it, so
+                    // a binding installed on another bearer's entity would carry a
+                    // BEARER the gNB does not use on that bearer and fail every MAC-I
+                    // with no other symptom.
+                    drb_id: i32::from(drb_id),
                     security: Some(Box::new(PdcpSecurity {
                         security,
                         // BEARER is the radio bearer identity minus one
@@ -2791,6 +2805,125 @@ impl RrcTask {
                 };
                 if let Err(e) = self.task_base.rls_tx.send(msg).await {
                     error!("Failed to install DRB security on the RLS task: {e}");
+                }
+            }
+        }
+    }
+
+    /// Apply the QoS-flow-to-DRB mapping each DRB of an RRCReconfiguration states
+    /// (issue #44, TS 37.324 §5.1).
+    ///
+    /// The UE is **told** the mapping: the gNB derived it from the 5QIs the core
+    /// admitted and put the result in each DRB's `SDAP-Config.mappedQoS-FlowsToAdd`,
+    /// and this reads it back. Recomputing `nextgsim_gtp::qfi_drb`'s policy locally
+    /// would put a second copy of it in the tree, and the two would drift the first
+    /// time the network's policy changed — which is the whole reason the mapping is
+    /// signalled at all.
+    ///
+    /// # Why this is a separate function from `apply_drb_user_plane_security`
+    ///
+    /// That one is entirely inside `#[cfg(feature = "up-security")]`, and SDAP must not
+    /// be gated on it: SDAP works perfectly well with no ciphering, and a UE built with
+    /// `sdap-dataplane` but not `up-security` would otherwise never learn the mapping
+    /// and would send every uplink packet on the wrong bearer, unstamped. Hoisting the
+    /// shared `RadioBearerConfig` decode out into a third helper was the alternative,
+    /// and it was rejected: the two functions need *different* things out of the message
+    /// (one wants `integrityProtection` and the AS keys, the other wants
+    /// `mappedQoS-FlowsToAdd` and the `CellGroupConfig`'s LCIDs), so a shared decode
+    /// would return a union neither wants and couple two independently-gated features
+    /// through it. Decoding twice costs one UPER pass per reconfiguration, which is not
+    /// on the data path.
+    #[allow(unused_variables)]
+    async fn apply_drb_sdap_mapping(&mut self, bytes: &[u8]) {
+        #[cfg(feature = "sdap-dataplane")]
+        {
+            use nextgsim_rrc::procedures::rrc_reconfiguration::{
+                decode_rrc_reconfiguration, lcid_for_drb, read_drb_specs,
+            };
+
+            let Ok(data) = decode_rrc_reconfiguration(bytes) else {
+                return;
+            };
+            let Some(rbc_bytes) = data.radio_bearer_config else {
+                // No radio bearer configuration: a reconfiguration that changes
+                // something else (a measConfig, say), and it establishes no DRB whose
+                // mapping there would be to record.
+                return;
+            };
+            let Ok(rbc) = nextgsim_rrc::codec::decode_rrc::<
+                nextgsim_rrc::codec::generated::RadioBearerConfig,
+            >(&rbc_bytes) else {
+                warn!("Could not decode the RadioBearerConfig; SDAP mapping not applied");
+                return;
+            };
+
+            // The `CellGroupConfig`, which is where the LCIDs live -- a DRB's
+            // `logicalChannelIdentity` is in its `RLC-BearerConfig` and NOT in the
+            // `RadioBearerConfig`, which is why `read_drb_specs` returns `lcid: 0`.
+            // Optional here: the LCID is used only to check that the network gave each
+            // DRB a logical channel (below), and this simulator's RLS transport carries
+            // the DRB identity rather than an LCID, so a missing `CellGroupConfig`
+            // costs the check and nothing else.
+            let cell_group = data.master_cell_group.as_ref().and_then(|mcg| {
+                nextgsim_rrc::codec::decode_rrc::<nextgsim_rrc::codec::generated::CellGroupConfig>(
+                    mcg,
+                )
+                .inspect_err(|e| {
+                    warn!("Could not decode the CellGroupConfig; DRB LCIDs unchecked: {e:?}")
+                })
+                .ok()
+            });
+
+            // Which PDU sessions this message configures. Collected from the message
+            // rather than assumed, because `read_drb_specs` filters by PSI and the UE
+            // has no other way to know which ones to ask about -- a hard-coded list
+            // would silently skip any session the gNB added later.
+            let Some(drbs) = rbc.drb_to_add_mod_list.as_ref() else {
+                return;
+            };
+            let mut sessions: Vec<u8> = drbs
+                .0
+                .iter()
+                .filter_map(|drb| match drb.cn_association.as_ref() {
+                    Some(
+                        nextgsim_rrc::codec::generated::DRB_ToAddModCnAssociation::Sdap_Config(
+                            sdap,
+                        ),
+                    ) => Some(sdap.pdu_session.0),
+                    // An `eps-BearerIdentity` association is an EPS bearer, not a 5GS
+                    // QoS-flow mapping, so it has no QFIs to read and no SDAP entity.
+                    _ => None,
+                })
+                .collect();
+            sessions.sort_unstable();
+            sessions.dedup();
+
+            for psi in sessions {
+                for spec in read_drb_specs(&rbc, psi) {
+                    // A DRB with no `RLC-BearerConfig` naming it has no logical channel
+                    // to ride (TS 38.331 §6.3.2), so nothing would ever carry it. Noted
+                    // and still installed: this simulator's RLS transport keys on the
+                    // DRB identity and never reads an LCID, so the bearer does in fact
+                    // work here -- but a real UE could not use it, and a silent pass
+                    // would hide a gNB that forgot the cell group.
+                    if let Some(cgc) = cell_group.as_ref() {
+                        if lcid_for_drb(cgc, spec.drb_id).is_none() {
+                            warn!(
+                                "DRB {} (PSI {psi}) has no RLC bearer in the CellGroupConfig; a \
+                                 real UE would have no logical channel for it",
+                                spec.drb_id
+                            );
+                        }
+                    }
+                    let msg = RlsMessage::InstallSdapMapping {
+                        psi: i32::from(psi),
+                        drb_id: i32::from(spec.drb_id),
+                        qfis: spec.qfis,
+                        default_drb: spec.default_drb,
+                    };
+                    if let Err(e) = self.task_base.rls_tx.send(msg).await {
+                        error!("Failed to install the SDAP mapping on the RLS task: {e}");
+                    }
                 }
             }
         }
@@ -4856,7 +4989,15 @@ mod tests {
 
             let mut installed = None;
             while let Ok(msg) = rls_rx.try_recv() {
-                if let TaskMessage::Message(RlsMessage::InstallDrbSecurity { psi, security }) = msg
+                // `drb_id` is ignored here and asserted through `security.bearer` below,
+                // which is derived from it (DRB identity minus one) -- so a wrong
+                // `drb_id` would have to be accompanied by a matching wrong `bearer` to
+                // pass, and the two come from the same value.
+                if let TaskMessage::Message(RlsMessage::InstallDrbSecurity {
+                    psi,
+                    drb_id: _,
+                    security,
+                }) = msg
                 {
                     installed = Some((psi, security));
                 }

@@ -38,6 +38,7 @@
 
 pub mod codec;
 pub mod path;
+pub mod qfi_drb;
 pub mod qos;
 pub mod restart;
 pub mod tunnel;
@@ -82,3 +83,5 @@ pub use qos::{
     default_qfi_to_dscp, lookup_5qi, standard_5qi_table, FiveQiCharacteristics, FlowStats,
     QfiDscpMapper, QosFlowEnforcer, QosResourceType, TokenBucket,
 };
+
+pub use qfi_drb::{allocate_drbs, DrbAllocation, DrbChoice, QfiDrbMap, MAX_DRB_ID};

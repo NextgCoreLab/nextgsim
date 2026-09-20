@@ -633,10 +633,63 @@ pub enum RlsMessage {
     /// inherit keys from the previous one.
     #[cfg(feature = "up-security")]
     InstallDrbSecurity {
-        /// PDU session ID, which is also the DRB identity here
+        /// PDU session ID.
+        ///
+        /// Carried alongside `drb_id` and not merged with it since issue #44: the RLS
+        /// task records which session a bearer belongs to so a received SDU can be
+        /// handed to NAS under the right PSI, and the keys normally arrive before any
+        /// traffic does — so this is the message that has to teach it.
         psi: i32,
+        /// The DRB identity whose PDCP entity these keys belong to.
+        ///
+        /// Load-bearing, and not merely the PSI renamed: `PdcpSecurity::bearer` is the
+        /// DRB identity minus one (TS 33.501 Annex D.3.1.2), so keying the entity by
+        /// anything else would install the right BEARER on the wrong bearer and fail
+        /// every MAC-I with no other symptom. Equal to `psi` without
+        /// `sdap-dataplane`, where a session has exactly one DRB.
+        drb_id: i32,
         /// The keys, algorithms and bearer binding, or `None` to remove it
         security: Option<Box<nextgsim_pdcp::PdcpSecurity>>,
+    },
+    /// Install the QoS-flow-to-DRB mapping the network signalled for ONE DRB, from
+    /// RRC (issue #44, TS 37.324 §5.1).
+    ///
+    /// The UE is **told** the mapping rather than recomputing it: the gNB derived it
+    /// from the 5QIs the core admitted and stated it in each DRB's
+    /// `mappedQoS-FlowsToAdd`, and the RRC task reads it back out of the
+    /// `RRCReconfiguration`. That is what lets the network's policy change without a
+    /// matching change here — a UE that recomputed `nextgsim_gtp::qfi_drb`'s policy
+    /// locally would be a second copy of it, and the two would drift.
+    ///
+    /// # Why one message per DRB and not one carrying the whole session
+    ///
+    /// Because `DRB-ToAddModList` is add/**modify** semantics (TS 38.331 §5.3.5.6.5):
+    /// a later `RRCReconfiguration` may add a session's second DRB without restating
+    /// the first. A message carrying "the session's whole DRB set" would therefore
+    /// arrive holding only the DRB that changed, and a receiver that replaced its
+    /// state with it would erase the mapping an earlier reconfiguration installed —
+    /// silently moving those QFIs back to the default DRB. Per-DRB messages
+    /// accumulate, which is what the signalling actually means.
+    #[cfg(feature = "sdap-dataplane")]
+    InstallSdapMapping {
+        /// The PDU session this DRB belongs to, from the DRB's own `SDAP-Config`.
+        ///
+        /// The RLS task needs it to hand a received SDU to NAS, which is per session:
+        /// `NasMessage::UplinkDataDelivery` is keyed by PSI, and the radio bearer is
+        /// not.
+        psi: i32,
+        /// `drb-Identity`, which keys the RLC and PDCP entities and goes on the wire.
+        drb_id: i32,
+        /// Every QFI mapped to this DRB (`mappedQoS-FlowsToAdd`), ascending.
+        ///
+        /// Empty when the network mapped no flow to the bearer, which is a DRB that
+        /// only unmapped flows reach — and only if it is also the default DRB.
+        qfis: Vec<u8>,
+        /// `defaultDRB`: the bearer an unmapped QoS flow falls to (§5.3.1).
+        ///
+        /// The UE's uplink uses this DRB, because it has no per-packet classifier to
+        /// choose another with. See `RlsTask::handle_data_pdu_delivery`.
+        default_drb: bool,
     },
     /// RRC PDU delivery (from RRC)
     RrcPduDelivery {

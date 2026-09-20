@@ -44,6 +44,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 const PSI: i32 = 1;
+/// The DRB identity `PSI`'s session uses. Equal to the PSI because a session's
+/// DEFAULT DRB keeps the identity the PSI produced
+/// (`nextgsim_gtp::qfi_drb::allocate_drbs`), which is what lets this suite describe
+/// the same bearer with `sdap-dataplane` on or off (issue #44).
+const DRB_ID: i32 = PSI;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -200,6 +205,7 @@ async fn drb_traffic_survives_the_pdcp_sublayer_in_both_directions() {
             .send(GnbRlsMessage::DownlinkData {
                 ue_id,
                 psi: PSI,
+                drb_id: DRB_ID,
                 pdu: OctetString::from_slice(payload),
             })
             .await
@@ -244,6 +250,7 @@ async fn the_downlink_carries_a_decodable_pdcp_header() {
         .send(GnbRlsMessage::DownlinkData {
             ue_id,
             psi: PSI,
+            drb_id: DRB_ID,
             pdu: OctetString::from_slice(&payload),
         })
         .await
@@ -287,6 +294,7 @@ async fn a_long_downlink_burst_stays_in_order() {
             .send(GnbRlsMessage::DownlinkData {
                 ue_id,
                 psi: PSI,
+                drb_id: DRB_ID,
                 pdu: OctetString::from_slice(payload),
             })
             .await

@@ -30,6 +30,19 @@ drb-pdcp = []
 # with it on and a UE with it off has the UE read a MAC-I as payload and fail
 # every integrity check, which takes the user plane down rather than degrading it.
 up-security = ["drb-pdcp"]
+# SDAP on the user plane: the QFI picks the DRB, and a one-octet SDAP header
+# carries the QFI and RQI (issue #44, TS 37.324 §5.1/§6.2.2). Off by default for
+# the reason `drb-pdcp` records, one octet earlier in the stack: this interposes a
+# sublayer on the live data path, and a gNB that prepends an SDAP header to a UE
+# that does not strip it has the UE read the header as the first octet of its IP
+# packet. Both ends must agree, and the default build keeps the PSI-selected path
+# byte-for-byte as it was.
+#
+# The feature also turns one DRB per PDU session into two (default + GBR), which
+# re-keys the RLC and PDCP entity maps from the PSI to the DRB identity. The
+# DEFAULT DRB keeps the identity the PSI produced, so a session with one QoS flow
+# is numbered identically either way.
+sdap-dataplane = []
 
 # Umbrella feature enabling all six optional 6G / AI-native research crates at
 # once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and

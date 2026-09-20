@@ -732,6 +732,22 @@ pub struct PduSessionResource {
     pub psi: i32,
     /// `QoS` flow identifier
     pub qfi: Option<u8>,
+    /// Every QoS flow the core admitted on this session, as `(qfi, five_qi)`
+    /// (issue #44).
+    ///
+    /// Kept beside `qfi` rather than replacing it because the two answer different
+    /// questions: `qfi` is the session's *default* flow, which is what
+    /// `PduSession::with_qfi` stamps into the uplink PDU Session Container, while
+    /// this is the whole admitted set the QFI→DRB mapping (TS 37.324 §5.1) is a
+    /// function of. One QFI cannot express a mapping, and the 5QI has to come with
+    /// it: the flow's resource type is what selects its DRB, and a QFI alone says
+    /// nothing about whether the flow is GBR. `None` for a dynamically assigned 5QI.
+    ///
+    /// Empty on the paths that add a session with no NGAP `QosFlowSetupInfo` to read
+    /// (a bare context transfer, and the loopback/UPF auto-created sessions). Empty
+    /// is not a degraded state: every downlink QFI then falls to the default DRB,
+    /// which is TS 37.324 §5.3.1's own rule for a flow with no explicit mapping.
+    pub qos_flows: Vec<(u8, Option<u16>)>,
     /// Uplink TEID (gNB -> UPF)
     pub uplink_teid: u32,
     /// Downlink TEID (UPF -> gNB)
@@ -803,8 +819,19 @@ pub enum RlsMessage {
     InstallDrbSecurity {
         /// UE ID
         ue_id: i32,
-        /// PDU session ID, which is also the DRB identity here
+        /// PDU session ID. Carried alongside `drb_id` and not merged with it since
+        /// issue #44: the RLS task records which session a bearer belongs to so an
+        /// uplink SDU can find its GTP-U tunnel, and the keys usually arrive before
+        /// any traffic does — so this is the message that has to teach it.
         psi: i32,
+        /// The DRB identity whose PDCP entity these keys belong to.
+        ///
+        /// Load-bearing, and not merely the PSI renamed: `PdcpSecurity::bearer` is the
+        /// DRB identity minus one (TS 33.501 Annex D.3.1.2), so keying the entity by
+        /// anything else would install the right BEARER on the wrong bearer and fail
+        /// every MAC-I with no other symptom. Equal to `psi` without
+        /// `sdap-dataplane`, where a session has exactly one DRB.
+        drb_id: i32,
         /// The keys, algorithms and bearer binding, or `None` to remove it
         security: Option<Box<nextgsim_pdcp::PdcpSecurity>>,
     },
@@ -814,7 +841,21 @@ pub enum RlsMessage {
         ue_id: i32,
         /// PDU session ID
         psi: i32,
-        /// User plane PDU
+        /// The DRB identity carrying this PDU, and the key of the RLC and PDCP
+        /// entities that serve it (issue #44).
+        ///
+        /// Equal to `psi` without `sdap-dataplane`, which is the one-DRB-per-session
+        /// numbering the pre-SDAP path used. With the feature the QFI→DRB policy may
+        /// send this SDU to the session's *second* DRB, and then the two differ —
+        /// which is why the entity maps are keyed on this field and not on `psi`: two
+        /// bearers sharing an RLC entity would interleave their sequence-number
+        /// spaces.
+        ///
+        /// `psi` is kept beside it because it is still what the GTP tunnel and the
+        /// SDAP `pdu-Session` are keyed by; only the *radio* bearer is per-DRB.
+        drb_id: i32,
+        /// User plane PDU. Carries a one-octet SDAP header (TS 37.324 §6.2.2) when
+        /// `sdap-dataplane` is on, and is the bare IP payload when it is not.
         pdu: OctetString,
     },
     /// Uplink RRC PDU (internal)
