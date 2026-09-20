@@ -8,11 +8,12 @@
 //!
 //! `CellGroupConfig` carries `sCellToAddModList SEQUENCE (SIZE (1..maxNrofSCells))
 //! OF SCellConfig` and `sCellToReleaseList SEQUENCE (SIZE (1..maxNrofSCells)) OF
-//! SCellIndex` in **Rel-15**, so the vendored `rrc-15.6.0.asn1` schema already
-//! models both and the encoding here is the conformant one. That is the
-//! difference from `conditionalReconfiguration`, which is Rel-16 and therefore
-//! unreachable until issue #105 upgrades the schema — the reason that container
-//! is the simulator's own byte format.
+//! SCellIndex` in **Rel-15**, so the vendored schema has always modelled both and
+//! the encoding here is the conformant one. `conditionalReconfiguration` is
+//! Rel-16, and used to be unreachable for that reason — which is why that
+//! container is the simulator's own byte format. #105 has since upgraded the
+//! schema to Rel-19, so the IE now exists; migrating the CHO container onto it is
+//! separate work and is not done here.
 //!
 //! The transport is still the simulator's hand-rolled DL-DCCH envelope (issue
 //! #107), so what travels is `[0x0E][transaction id][UPER CellGroupConfig]` —

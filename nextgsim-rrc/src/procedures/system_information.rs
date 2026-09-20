@@ -354,24 +354,22 @@ pub struct Sib1Params {
     pub ecall_over_ims_support: bool,
     /// UE timers and constants (optional)
     pub ue_timers_and_constants: Option<UeTimersAndConstantsParams>,
-    /// `intraFreqReselectionRedCap` (Rel-17, TS 38.331 §6.3.2 SIB1-v1700-IEs):
-    /// controls whether RedCap UEs are allowed to perform intra-frequency cell
-    /// reselection.
+    /// `intraFreqReselectionRedCap-r17` (TS 38.331 §6.3.2 `SIB1-v1700-IEs`):
+    /// whether RedCap UEs may perform intra-frequency cell reselection.
     ///
-    /// NOT WIRE-CONFORMANT (Wave 4 honest-defer): the `rrc-15.6.0` SIB1 schema
-    /// predates the Rel-17 field, so this flag is broadcast as a sim-internal
-    /// private marker TLV inside the opaque SIB1 `lateNonCriticalExtension`
-    /// OCTET STRING (see [`SIB1_REDCAP_LNCE_TAG`]). A real UE will not parse it;
-    /// conformant SIB1 RedCap signalling requires a Rel-17 RRC codec.
+    /// WIRE-CONFORMANT since #105 upgraded the vendored schema to Rel-19. This
+    /// travels as the real `ENUMERATED {allowed, notAllowed}` at
+    /// `SIB1-v1700-IEs.intraFreqReselectionRedCap-r17`, reached down the
+    /// non-critical-extension chain `SIB1 -> v1610 -> v1630 -> v1700`. The
+    /// private `0xFE` marker TLV that used to smuggle it through
+    /// `lateNonCriticalExtension` is gone.
+    ///
+    /// `false` maps to the field being ABSENT rather than to `notAllowed`. The
+    /// field is Need S, so absent means the UE applies its default -- and
+    /// broadcasting the whole v1610/v1630/v1700 chain solely to say "default"
+    /// would add bits to every SIB1 for no information.
     pub intra_freq_reselection_redcap: bool,
 }
-
-/// Private, sim-internal marker tag for the `intraFreqReselectionRedCap` TLV
-/// inside the opaque SIB1 `lateNonCriticalExtension` OCTET STRING. NOT a 3GPP
-/// IEI; chosen in the 0xF0-0xFF private range (it previously aliased NAS IEI
-/// 0x52). Kept consistent with `REDCAP_LNCE_TAG` in the `rrc_setup` module.
-/// Conformant SIB1 RedCap signalling requires a Rel-17 RRC codec.
-const SIB1_REDCAP_LNCE_TAG: u8 = 0xFE;
 
 /// Parsed SIB1 data
 #[derive(Debug, Clone)]
@@ -386,8 +384,8 @@ pub struct Sib1Data {
     pub ecall_over_ims_support: bool,
     /// UE timers and constants
     pub ue_timers_and_constants: Option<UeTimersAndConstantsParams>,
-    /// `intraFreqReselectionRedCap` (Rel-17), recovered from the SIB1
-    /// `lateNonCriticalExtension` octet container (see [`Sib1Params`]).
+    /// `intraFreqReselectionRedCap-r17`, read back from the real
+    /// `SIB1-v1700-IEs` field (see [`Sib1Params`]).
     pub intra_freq_reselection_redcap: bool,
 }
 
@@ -423,8 +421,14 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
         .map(build_plmn_identity_info)
         .collect();
 
+    // Rel-16 renamed the first component from `plmn-IdentityList` to
+    // `plmn-IdentityInfoList` and appended two extension groups after the `...`;
+    // the root layout, and so the UPER encoding of a root-only value, is
+    // unchanged. `asn1-compiler` does not emit fields for `[[ ]]` extension
+    // groups, so the generated struct carries only the two root components --
+    // the same shape it had under Rel-15.
     let cell_access_related_info = CellAccessRelatedInfo {
-        plmn_identity_list: PLMN_IdentityInfoList(plmn_identity_list),
+        plmn_identity_info_list: PLMN_IdentityInfoList(plmn_identity_list),
         cell_reserved_for_other_use: None,
     };
 
@@ -451,24 +455,63 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
             .transpose()?,
         uac_barring_info: None,
         use_full_resume_id: None,
-        // intraFreqReselectionRedCap (Rel-17): broadcast as a minimal TLV in the
-        // spec-legal lateNonCriticalExtension OCTET STRING when allowed.
-        late_non_critical_extension: if params.intra_freq_reselection_redcap {
-            Some(SIB1LateNonCriticalExtension(vec![
-                SIB1_REDCAP_LNCE_TAG,
-                1, // length
-                1, // value: intra-freq reselection allowed for RedCap
-            ]))
-        } else {
-            None
-        },
-        non_critical_extension: None,
+        late_non_critical_extension: None,
+        // `intraFreqReselectionRedCap-r17` is a real `SIB1-v1700-IEs` field since
+        // #105 upgraded the schema. Reaching it means walking the whole
+        // non-critical-extension chain -- v1610 and v1630 exist only to carry the
+        // `nonCriticalExtension` pointer onward, so both are emitted with every
+        // other field absent. That is the conformant shape: a Rel-15 UE stops at
+        // SIB1's `nonCriticalExtension` and ignores the rest; a Rel-17 UE walks
+        // the chain and finds the field.
+        non_critical_extension: build_sib1_v1700_chain(params),
     };
 
     Ok(BCCH_DL_SCH_Message {
         message: BCCH_DL_SCH_MessageType::C1(
             BCCH_DL_SCH_MessageType_c1::SystemInformationBlockType1(sib1),
         ),
+    })
+}
+
+/// Build the `SIB1 -> v1610 -> v1630 -> v1700` non-critical-extension chain, or
+/// `None` when nothing in it needs to be broadcast.
+///
+/// Only `intraFreqReselectionRedCap-r17` is populated: it is the one post-Rel-15
+/// SIB1 field this codec models. When it is not being broadcast the whole chain
+/// is omitted, so a SIB1 that says nothing new is byte-identical to the Rel-15
+/// one -- which is why the existing SIB1 encode/decode tests still hold.
+fn build_sib1_v1700_chain(params: &Sib1Params) -> Option<SIB1_v1610_IEs> {
+    if !params.intra_freq_reselection_redcap {
+        return None;
+    }
+
+    let v1700 = SIB1_v1700_IEs {
+        hsdn_cell_r17: None,
+        uac_barring_info_v1700: None,
+        sdt_config_common_r17: None,
+        red_cap_config_common_r17: None,
+        feature_priorities_r17: None,
+        si_scheduling_info_v1700: None,
+        hyper_sfn_r17: None,
+        edrx_allowed_idle_r17: None,
+        edrx_allowed_inactive_r17: None,
+        intra_freq_reselection_red_cap_r17: Some(SIB1_v1700_IEsIntraFreqReselectionRedCap_r17(
+            SIB1_v1700_IEsIntraFreqReselectionRedCap_r17::ALLOWED,
+        )),
+        cell_barred_ntn_r17: None,
+        non_critical_extension: None,
+    };
+
+    let v1630 = SIB1_v1630_IEs {
+        uac_barring_info_v1630: None,
+        non_critical_extension: Some(v1700),
+    };
+
+    Some(SIB1_v1610_IEs {
+        idle_mode_measurements_eutra_r16: None,
+        idle_mode_measurements_nr_r16: None,
+        pos_si_scheduling_info_r16: None,
+        non_critical_extension: Some(v1630),
     })
 }
 
@@ -551,7 +594,7 @@ pub fn parse_sib1(msg: &BCCH_DL_SCH_Message) -> Result<Sib1Data, SystemInformati
     // Parse PLMN identity info list
     let plmn_identity_info_list: Vec<PlmnIdentityInfo> = sib1
         .cell_access_related_info
-        .plmn_identity_list
+        .plmn_identity_info_list
         .0
         .iter()
         .map(parse_plmn_identity_info)
@@ -570,12 +613,17 @@ pub fn parse_sib1(msg: &BCCH_DL_SCH_Message) -> Result<Sib1Data, SystemInformati
         .map(parse_ue_timers_and_constants)
         .transpose()?;
 
-    // intraFreqReselectionRedCap (Rel-17): recovered from the SIB1
-    // lateNonCriticalExtension octet container TLV.
+    // `intraFreqReselectionRedCap-r17`, read off the real `SIB1-v1700-IEs` field
+    // by walking the non-critical-extension chain. `notAllowed` and an absent
+    // field both read back as `false`: absent is Need S (the UE's default) and
+    // this codec's `Sib1Params` has no third state to carry the distinction.
     let intra_freq_reselection_redcap = sib1
-        .late_non_critical_extension
+        .non_critical_extension
         .as_ref()
-        .map(|lnce| parse_redcap_lnce(&lnce.0))
+        .and_then(|v1610| v1610.non_critical_extension.as_ref())
+        .and_then(|v1630| v1630.non_critical_extension.as_ref())
+        .and_then(|v1700| v1700.intra_freq_reselection_red_cap_r17.as_ref())
+        .map(|f| f.0 == SIB1_v1700_IEsIntraFreqReselectionRedCap_r17::ALLOWED)
         .unwrap_or(false);
 
     Ok(Sib1Data {
@@ -586,26 +634,6 @@ pub fn parse_sib1(msg: &BCCH_DL_SCH_Message) -> Result<Sib1Data, SystemInformati
         ue_timers_and_constants,
         intra_freq_reselection_redcap,
     })
-}
-
-/// Scan a SIB1 `lateNonCriticalExtension` octet container for the
-/// `intraFreqReselectionRedCap` TLV (`SIB1_REDCAP_LNCE_TAG`, len, value).
-/// Returns true when present and set.
-fn parse_redcap_lnce(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let tag = bytes[i];
-        let len = bytes[i + 1] as usize;
-        let val_start = i + 2;
-        if val_start + len > bytes.len() {
-            break;
-        }
-        if tag == SIB1_REDCAP_LNCE_TAG {
-            return bytes.get(val_start).copied().unwrap_or(0) != 0;
-        }
-        i = val_start + len;
-    }
-    false
 }
 
 /// Build the generated `UE_TimersAndConstants` from millisecond/count values
@@ -1304,7 +1332,9 @@ fn build_sib3(params: &Sib3Params) -> Result<SIB3, SystemInformationError> {
         } else {
             Some(IntraFreqNeighCellList(neighbours))
         },
-        intra_freq_black_cell_list: None,
+        // Rel-16 renamed `intraFreqBlackCellList` to `intraFreqExcludedCellList`
+        // in place; the SEQUENCE position and so the UPER layout is unchanged.
+        intra_freq_excluded_cell_list: None,
         late_non_critical_extension: None,
     })
 }
@@ -1362,7 +1392,9 @@ fn build_sib4(params: &Sib4Params) -> Result<SIB4, SystemInformationError> {
                 cell_reselection_sub_priority: None,
                 q_offset_freq: None,
                 inter_freq_neigh_cell_list: None,
-                inter_freq_black_cell_list: None,
+                // Rel-16 renamed `interFreqBlackCellList` to
+                // `interFreqExcludedCellList` in place.
+                inter_freq_excluded_cell_list: None,
             })
         })
         .collect::<Result<Vec<_>, SystemInformationError>>()?;
@@ -1646,10 +1678,17 @@ mod tests {
         }
     }
 
+    /// #105: `intraFreqReselectionRedCap-r17` round-trips as the REAL
+    /// `SIB1-v1700-IEs` field, not as a private marker TLV.
+    ///
+    /// The flag surviving encode -> decode is necessary but not sufficient -- the
+    /// retired marker scheme also passed that. So this additionally walks the
+    /// generated type down `SIB1 -> v1610 -> v1630 -> v1700` and asserts the value
+    /// is `ALLOWED` at `intraFreqReselectionRedCap-r17`, and asserts
+    /// `lateNonCriticalExtension` is ABSENT. Putting the marker back fails on both
+    /// the chain assertion (the chain would be `None`) and the `is_none()`.
     #[test]
-    fn test_sib1_intra_freq_reselection_redcap_roundtrip() {
-        // intraFreqReselectionRedCap set: survives UPER encode/decode via the
-        // SIB1 lateNonCriticalExtension octet container.
+    fn intra_freq_reselection_redcap_round_trips_as_a_real_rel17_ie() {
         let params = Sib1Params {
             intra_freq_reselection_redcap: true,
             ..create_test_sib1_params()
@@ -1658,14 +1697,54 @@ mod tests {
         let data = decode_sib1(&bytes).unwrap();
         assert!(
             data.intra_freq_reselection_redcap,
-            "intraFreqReselectionRedCap must round-trip"
+            "intraFreqReselectionRedCap-r17 must round-trip"
         );
 
-        // Not set: default decode yields false.
-        let params_off = create_test_sib1_params();
-        let bytes_off = encode_sib1(&params_off).unwrap();
-        let data_off = decode_sib1(&bytes_off).unwrap();
-        assert!(!data_off.intra_freq_reselection_redcap);
+        // Where it actually sat on the wire.
+        let msg: BCCH_DL_SCH_Message = decode_rrc(&bytes).unwrap();
+        let BCCH_DL_SCH_MessageType::C1(BCCH_DL_SCH_MessageType_c1::SystemInformationBlockType1(
+            sib1,
+        )) = &msg.message
+        else {
+            panic!("expected a SIB1");
+        };
+        assert!(
+            sib1.late_non_critical_extension.is_none(),
+            "the private 0xFE RedCap marker TLV must be gone from \
+             lateNonCriticalExtension"
+        );
+        let v1700 = sib1
+            .non_critical_extension
+            .as_ref()
+            .and_then(|v1610| v1610.non_critical_extension.as_ref())
+            .and_then(|v1630| v1630.non_critical_extension.as_ref())
+            .expect("the v1610 -> v1630 -> v1700 chain must be on the wire");
+        assert_eq!(
+            v1700
+                .intra_freq_reselection_red_cap_r17
+                .as_ref()
+                .map(|f| f.0),
+            Some(SIB1_v1700_IEsIntraFreqReselectionRedCap_r17::ALLOWED),
+        );
+    }
+
+    /// With the flag clear, SIB1 emits no extension chain at all -- so upgrading
+    /// the schema to Rel-19 cost the default SIB1 zero bits, which is why every
+    /// pre-existing SIB1 encode/decode assertion in this file still holds.
+    #[test]
+    fn a_sib1_without_redcap_carries_no_extension_chain() {
+        let bytes = encode_sib1(&create_test_sib1_params()).unwrap();
+        assert!(!decode_sib1(&bytes).unwrap().intra_freq_reselection_redcap);
+
+        let msg: BCCH_DL_SCH_Message = decode_rrc(&bytes).unwrap();
+        let BCCH_DL_SCH_MessageType::C1(BCCH_DL_SCH_MessageType_c1::SystemInformationBlockType1(
+            sib1,
+        )) = &msg.message
+        else {
+            panic!("expected a SIB1");
+        };
+        assert!(sib1.non_critical_extension.is_none());
+        assert!(sib1.late_non_critical_extension.is_none());
     }
 
     #[test]

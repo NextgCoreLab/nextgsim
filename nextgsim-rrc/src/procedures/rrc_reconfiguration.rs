@@ -1150,7 +1150,7 @@ mod tests {
     /// `masterCellGroup` carries a `reconfigurationWithSync` to physCellId 16 with
     /// `newUE-Identity` 1 and `t304` 1000 ms, and `fullConfig` set.
     ///
-    /// Derivation of the framing from `tools/rrc-15.6.0.asn1`:
+    /// Derivation of the framing from `tools/rrc-19.3.0.asn1`:
     ///
     /// ```text
     /// bit 0      DL-DCCH-MessageType CHOICE, 2 alternatives -> 1 bit. c1 = 0
@@ -1627,7 +1627,7 @@ mod tests {
 
     // ========================================================================
     // Wave-6 C5 — hand-derived golden byte vectors (TS 38.331 §6.2.1/§5.3.5,
-    // UPER per X.691). Derived BY HAND from tools/rrc-15.6.0.asn1, NOT produced
+    // UPER per X.691). Derived BY HAND from tools/rrc-19.3.0.asn1, NOT produced
     // by the encoder — the reviewer re-derives every bit below.
     // ========================================================================
 
@@ -1864,7 +1864,7 @@ mod tests {
     // (`.context/GOLDEN-VECTOR-METHOD.md`):
     //
     //   * Derivation A = the per-byte bit tables in the doc comments below,
-    //     hand-derived from `tools/rrc-15.6.0.asn1`.
+    //     hand-derived from `tools/rrc-19.3.0.asn1`.
     //   * Derivation B = the independent `bderive_*` UPER recompute below — a
     //     clean-room bit writer built directly from X.691 + the ASN.1, NOT the
     //     production `encode_rrc`. `golden_h6_derivation_b_matches_frozen`

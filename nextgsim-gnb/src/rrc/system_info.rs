@@ -7,7 +7,8 @@
 //! # What is real and what is a stand-in
 //!
 //! The messages are real ASN.1/UPER (`nextgsim-rrc`'s `encode_mib` / `encode_sib1`
-//! over the Rel-15.6.0 schema) carrying this cell's configured identity. The
+//! over the Rel-19 schema, `tools/rrc-19.3.0.asn1`) carrying this cell's
+//! configured identity. The
 //! physical-layer parameters have no counterpart in a simulator with no PHY, so
 //! they are fixed at the values a 30 kHz FR1 cell would use and are documented as
 //! such below rather than being made configurable knobs nothing reads.
@@ -117,10 +118,14 @@ pub fn sib1_params(config: &GnbConfig) -> Sib1Params {
             n311: 1,
             t319_ms: 1000,
         }),
-        // Rel-17 RedCap reselection is not signalled: it has no conformant home
-        // in the Rel-15 schema this tree compiles (see issue #105), and the
-        // private marker the field would otherwise use is not on the wire for
-        // any real peer.
+        // `intraFreqReselectionRedCap-r17` now HAS a conformant home: #105 upgraded
+        // the schema to Rel-19, so setting this emits the real
+        // `SIB1-v1700-IEs.intraFreqReselectionRedCap-r17` rather than the retired
+        // private marker. It stays `false` because this cell has no RedCap-specific
+        // reselection policy to advertise, and the field is Need S -- absent means
+        // the UE applies its default, which is what we want. Broadcasting the
+        // v1610/v1630/v1700 chain to say "default" would add bits to every SIB1 for
+        // no information.
         intra_freq_reselection_redcap: false,
     }
 }

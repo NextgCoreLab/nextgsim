@@ -855,10 +855,12 @@ impl HandoverManager {
 /// # The SOURCE half is a parameter, because it is not on the wire
 ///
 /// DAPS keeps the source link up, so a conformant DAPS reconfiguration carries
-/// `daps-SourceRelease` and a per-DRB `daps-Config` — **neither of which is in the
-/// Rel-15 schema this tree compiles** (issue #105). The old byte format invented
-/// fields for the source PCI, source C-RNTI and a data-forwarding flag, and no
-/// conformant peer would ever have sent them.
+/// `daps-SourceRelease` and a per-DRB `daps-Config`. Neither used to be in the
+/// vendored schema, which was Rel-15; #105 upgraded it to Rel-19, so the schema is
+/// no longer why the gNB does not send them — it does not maintain a simultaneous
+/// source link for them to describe. Either way they are not on the wire. The old
+/// byte format invented fields for the source PCI, source C-RNTI and a
+/// data-forwarding flag, and no conformant peer would ever have sent them.
 ///
 /// So the source half comes from where the UE already knows it: the cell it is
 /// camped on. That is not a workaround, it is what "source cell" means — the UE

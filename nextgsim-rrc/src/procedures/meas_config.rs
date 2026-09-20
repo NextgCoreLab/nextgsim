@@ -25,11 +25,13 @@
 //! the inter-RAT and SFTD/CGI ones, which this module does not build.) #117 has
 //! landed anyway.
 //!
-//! **#105 (the vendored schema is Rel-15) does not gate it either.** A3 reporting
+//! **#105 (the vendored schema is Rel-15) did not gate it either.** A3 reporting
 //! is a Rel-15 feature: `MeasConfig` is fully modelled with all ten optional
 //! fields, `EventTriggerConfigEventId_eventA3` carries `a3-Offset`,
-//! `reportOnLeave`, `hysteresis`, `timeToTrigger` and `useWhiteCellList`, and
-//! `RRCReconfiguration_IEs.meas_config` sits at `optional_idx = 2`.
+//! `reportOnLeave`, `hysteresis`, `timeToTrigger` and `useAllowedCellList`, and
+//! `RRCReconfiguration_IEs.meas_config` sits at `optional_idx = 2`. #105 has since
+//! landed: the schema is now Rel-19 (`tools/rrc-19.3.0.asn1`), which renamed
+//! `useWhiteCellList` to `useAllowedCellList` in place without moving it.
 //!
 //! # Units
 //!
@@ -391,10 +393,13 @@ pub fn build_a3_meas_config(params: &A3MeasConfigParams) -> Result<MeasConfig, M
         },
         cells_to_remove_list: None,
         cells_to_add_mod_list: None,
-        black_cells_to_remove_list: None,
-        black_cells_to_add_mod_list: None,
-        white_cells_to_remove_list: None,
-        white_cells_to_add_mod_list: None,
+        // Rel-16 renamed `blackCellsTo*List` to `excludedCellsTo*List` and
+        // `whiteCellsTo*List` to `allowedCellsTo*List` in the same SEQUENCE
+        // positions, so the UPER layout is unchanged by the rename.
+        excluded_cells_to_remove_list: None,
+        excluded_cells_to_add_mod_list: None,
+        allowed_cells_to_remove_list: None,
+        allowed_cells_to_add_mod_list: None,
     };
 
     let event_a3 = EventTriggerConfigEventId_eventA3 {
@@ -407,10 +412,11 @@ pub fn build_a3_meas_config(params: &A3MeasConfigParams) -> Result<MeasConfig, M
         report_on_leave: EventTriggerConfigEventId_eventA3ReportOnLeave(false),
         hysteresis: Hysteresis(hysteresis),
         time_to_trigger: TimeToTrigger(time_to_trigger_index(params.time_to_trigger_ms)?),
-        // `false`: no `whiteCellsToAddModList` is signalled, so restricting the
-        // event to a white list would restrict it to the empty set and nothing
-        // could ever trigger.
-        use_white_cell_list: EventTriggerConfigEventId_eventA3UseWhiteCellList(false),
+        // `false`: no `allowedCellsToAddModList` is signalled, so restricting the
+        // event to an allowed list would restrict it to the empty set and nothing
+        // could ever trigger. (Rel-16 renamed the field from `useWhiteCellList`
+        // in place; the bit position is unchanged.)
+        use_allowed_cell_list: EventTriggerConfigEventId_eventA3UseAllowedCellList(false),
     };
 
     let report_config = ReportConfigNR {

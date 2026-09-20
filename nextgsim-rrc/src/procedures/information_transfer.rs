@@ -443,7 +443,7 @@ mod tests {
 
     // ========================================================================
     // Wave-6 C5 — hand-derived golden byte vectors (TS 38.331 §6.2.1/§5.7.2,
-    // UPER per X.691). Derived BY HAND from tools/rrc-15.6.0.asn1, NOT produced
+    // UPER per X.691). Derived BY HAND from tools/rrc-19.3.0.asn1, NOT produced
     // by the encoder. Uses a fixed 3-octet NAS payload [0x7E,0x00,0x42].
     // ========================================================================
 

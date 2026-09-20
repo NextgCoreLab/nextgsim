@@ -1047,16 +1047,19 @@ impl DapsRrcReconfiguration {
     ///
     /// DAPS (Rel-16) keeps the SOURCE link up while the UE accesses the target, so
     /// the conformant message carries `daps-SourceRelease` and a per-DRB
-    /// `daps-Config` — **neither of which exists in the Rel-15 schema this tree
-    /// compiles** (issue #105). So what goes on the wire is the target half: a real
-    /// handover command to the target cell with the DAPS T304. The source-link
+    /// `daps-Config`. Neither used to exist in the vendored schema, which was
+    /// Rel-15; #105 has since upgraded it to Rel-19, so the schema is no longer the
+    /// reason they are absent. What goes on the wire is still the target half: a
+    /// real handover command to the target cell with the DAPS T304. The source-link
     /// state (`source_cell_config`, `data_forwarding_enabled`) stays local to the
     /// gNB, which is where it already was — the old byte format carried it, but no
     /// UE ever read those bytes as anything.
     ///
     /// Stated rather than silently dropped: a reader comparing this to TS 38.331
-    /// should know the DAPS-specific IEs are absent because the schema has no home
-    /// for them, not because they were forgotten.
+    /// should know the DAPS-specific IEs are absent because nothing in this tree
+    /// maintains a simultaneous source link for them to describe — not because they
+    /// were forgotten, and no longer because the schema lacks them. Populating them
+    /// needs the dual-connectivity behaviour they signal, which is separate work.
     pub fn encode(&self) -> Option<Vec<u8>> {
         encode_handover_command(&HandoverCommandParams {
             rrc_transaction_id: self.transaction_id.min(3),
@@ -1421,8 +1424,10 @@ mod tests {
     }
 
     /// The DAPS reconfiguration is a real `RRCReconfiguration` too, carrying the
-    /// target half. Its DAPS-specific IEs have no home in the Rel-15 schema
-    /// (issue #105), which is stated at the encoder rather than left implicit.
+    /// target half. Its DAPS-specific IEs are still not populated — no longer for
+    /// want of a schema (#105 upgraded it to Rel-19) but because nothing here keeps
+    /// a simultaneous source link for them to describe. That is stated at the
+    /// encoder rather than left implicit.
     #[test]
     fn the_daps_reconfiguration_is_a_real_reconfiguration_with_sync() {
         use nextgsim_rrc::procedures::rrc_reconfiguration::decode_handover_command;

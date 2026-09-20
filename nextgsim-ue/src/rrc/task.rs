@@ -102,7 +102,7 @@ use nextgsim_rrc::procedures::system_information::{
     IntraFreqReselection, PlmnIdentity as SibPlmnIdentity,
 };
 use nextgsim_rrc::procedures::ue_capability::{
-    build_minimal_nr_capability_container, encode_ue_capability_information, RatType,
+    build_nr_capability_container, encode_ue_capability_information, RatType,
     UeCapabilityEnquiryData, UeCapabilityInformationParams, UeCapabilityRatContainer,
 };
 
@@ -1595,8 +1595,14 @@ impl RrcTask {
                 q_rx_lev_min,
                 q_rx_lev_min_offset: None,
                 q_qual_min: None,
-                // SIB1 npn-IdentityInfoList (Rel-16 SNPN) is not in the Rel-15
-                // schema this tree compiles, so a broadcast cell is public here.
+                // SIB1 `npn-IdentityInfoList-r16` (Rel-16 SNPN) sits in an ASN.1
+                // `[[ ]]` extension group of `CellAccessRelatedInfo`. Since #105 the
+                // schema is Rel-19 and the group is in the module, but
+                // `asn1-compiler` does not emit struct fields for extension groups,
+                // so the generated `CellAccessRelatedInfo` still carries only its
+                // two root components and there is nothing to read. A broadcast cell
+                // is therefore public here. Reaching it needs a compiler change, not
+                // a schema change.
                 nid: None,
             },
         );
@@ -2204,13 +2210,13 @@ impl RrcTask {
         };
         let nas_data = nas_pdu.data().to_vec();
 
-        // RedCap (Reduced Capability) indication driven by UE config (Rel-17,
-        // TS 38.331 §6.2.2). When set, the gNB caps this UE's serving
-        // bandwidth and the core reduces the session-AMBR.
-        let redcap_indication = self.task_base.config.redcap;
-        if redcap_indication {
-            info!("Signalling RedCap (Reduced Capability) indication in RRCSetupComplete");
-        }
+        // No RedCap indication is signalled here. It used to be, as a private 0xFE
+        // marker TLV inside `lateNonCriticalExtension`; #105 established that TS
+        // 38.331 defines no `redCapIndication` IE in any release, and that the
+        // conformant declaration is `supportOfRedCap-r17` in
+        // `UE-NR-Capability-v1700`. This UE now declares RedCap in the capability
+        // transfer the gNB triggers right after setup -- see
+        // `handle_ue_capability_enquiry`.
 
         // Advertise the UE's configured S-NSSAI(s) in RRCSetupComplete so the
         // gNB can perform slice-aware AMF selection (TS 38.331 §6.2.2,
@@ -2249,7 +2255,6 @@ impl RrcTask {
             s_nssai_list,
             dedicated_nas_message: nas_data.clone(),
             ng_5g_s_tmsi_value: None,
-            redcap_indication,
         };
 
         let pdu = match encode_rrc_setup_complete(&params) {
@@ -2716,10 +2721,13 @@ impl RrcTask {
     /// in the DRB's `PDCP-Config`, and this reads it back. That is what makes the two
     /// ends agree without a shared config file.
     ///
-    /// Ciphering is not signalled and cannot be: `PDCP-Config.cipheringDisabled` is
-    /// in the Rel-15 schema's extension addition group and the generated codec
-    /// dropped the field (see the spec's ceiling). So the UE ciphers whenever it has
-    /// keys, which is the same decision the gNB makes from the same absent IE.
+    /// Ciphering is not signalled and cannot be: `PDCP-Config.cipheringDisabled`
+    /// sits in an ASN.1 `[[ ]]` extension addition group, and `asn1-compiler` does
+    /// not emit struct fields for those, so the generated `PDCP_Config` has no
+    /// member to carry it. #105 upgrading the schema to Rel-19 does NOT fix this --
+    /// the limit is in the code generator, not the schema, and it is unchanged. So
+    /// the UE ciphers whenever it has keys, which is the same decision the gNB makes
+    /// from the same absent IE.
     #[allow(unused_variables)]
     async fn apply_drb_user_plane_security(&mut self, bytes: &[u8]) {
         #[cfg(feature = "up-security")]
@@ -3349,7 +3357,11 @@ impl RrcTask {
         let mut containers = Vec::new();
         for rat in &enquiry.rat_types {
             if *rat == RatType::Nr {
-                match build_minimal_nr_capability_container(DEFAULT_NR_BAND) {
+                // `supportOfRedCap-r17` in `UE-NR-Capability-v1700` is the IE TS
+                // 38.331 actually defines for declaring a RedCap UE -- the spec has
+                // no `redCapIndication` at all (#105). So the declaration travels
+                // here, in capability transfer (§5.6.1), not in RRCSetupComplete.
+                match build_nr_capability_container(DEFAULT_NR_BAND, self.task_base.config.redcap) {
                     Ok(container) => containers.push(UeCapabilityRatContainer {
                         rat_type: RatType::Nr,
                         container,
@@ -4202,7 +4214,7 @@ mod tests {
     // Wave-6 C2: UE-side RRCSetup ASN.1 decode + tolerance verification.
     // The golden literal is the C1 hand-derived RRCSetup(SRB1, tid 0) — see
     // nextgsim-rrc rrc_setup.rs `golden_rrc_setup_srb1_bytes` for the
-    // bit-by-bit derivation from tools/rrc-15.6.0.asn1.
+    // bit-by-bit derivation from tools/rrc-19.3.0.asn1.
     // ========================================================================
 
     use nextgsim_rrc::procedures::rrc_setup::decode_rrc_setup_complete;

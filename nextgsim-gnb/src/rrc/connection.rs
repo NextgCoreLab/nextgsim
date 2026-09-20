@@ -1080,7 +1080,7 @@ mod tests {
     /// Wave-6 C1: the emitted RRCSetup must be EXACTLY the hand-derived
     /// golden UPER PDU carrying the SRB1 configuration (TS 38.331
     /// §5.3.5.6.3). The literal is derived by hand from
-    /// tools/rrc-15.6.0.asn1 — see nextgsim-rrc rrc_setup.rs
+    /// tools/rrc-19.3.0.asn1 — see nextgsim-rrc rrc_setup.rs
     /// `golden_rrc_setup_srb1_bytes` for the bit-by-bit derivation.
     #[test]
     fn test_rrc_setup_request_emits_golden_srb1_pdu_tid0() {

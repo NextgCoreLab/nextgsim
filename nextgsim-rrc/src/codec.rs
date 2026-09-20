@@ -75,7 +75,7 @@ pub fn decode_rrc<T: UperCodec<Output = T>>(bytes: &[u8]) -> Result<T, RrcCodecE
 mod tests {
     // Note: Specific RRC message tests will be added once the generated types
     // are available and we can identify commonly used message types.
-    // The generated code from rrc-15.6.0.asn1 includes all RRC message types.
+    // The generated code from rrc-19.3.0.asn1 includes all RRC message types.
 
     #[test]
     fn test_codec_module_compiles() {

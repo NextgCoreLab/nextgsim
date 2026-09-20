@@ -612,7 +612,7 @@ mod tests {
     // ========================================================================
     // Wave-6 C5 — hand-derived golden byte vectors (TS 38.331 §6.2.1 DL-DCCH /
     // UL-DCCH classes, §5.3.4, UPER per X.691). Derived BY HAND from
-    // tools/rrc-15.6.0.asn1, NOT produced by the encoder — a reviewer can
+    // tools/rrc-19.3.0.asn1, NOT produced by the encoder — a reviewer can
     // re-derive every bit below. The encoder output MUST equal the literal.
     // ========================================================================
 

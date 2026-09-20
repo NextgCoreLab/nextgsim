@@ -573,7 +573,7 @@ mod tests {
     /// Hand-derived `RRCResume` on DL-DCCH, tid 0, carrying the SRB1
     /// configuration with `fullConfig` set.
     ///
-    /// Derivation of the framing from `tools/rrc-15.6.0.asn1`:
+    /// Derivation of the framing from `tools/rrc-19.3.0.asn1`:
     ///
     /// ```text
     /// bit 0      DL-DCCH-MessageType CHOICE, 2 alternatives, no extension

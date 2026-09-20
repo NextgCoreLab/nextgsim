@@ -548,6 +548,16 @@ pub fn parse_measurement_report(
         Some(MeasResultsMeasResultNeighCells::MeasResultListEUTRA(list)) => {
             eutra_neigh_results = list.0.iter().map(parse_meas_result_eutra).collect();
         }
+        // The Rel-19 schema (#105) carries two further extension arms in
+        // `measResultNeighCells`: `measResultListUTRA-FDD-r16` and
+        // `sl-MeasResultsCandRelay-r17`. Neither RAT is modelled here -- there is
+        // no UTRA measurement object and no PC5 sidelink relay -- so a report
+        // that selects one leaves both result lists empty rather than being
+        // refused, the same way an unmodelled SIB is skipped in
+        // `system_information`. Matched explicitly so a further arm is a compile
+        // error rather than a silent drop.
+        Some(MeasResultsMeasResultNeighCells::MeasResultListUTRA_FDD_r16(_))
+        | Some(MeasResultsMeasResultNeighCells::Sl_MeasResultsCandRelay_r17(_)) => {}
         None => {}
     }
 
@@ -772,7 +782,7 @@ mod tests {
     /// Hand-derived `MeasurementReport` on UL-DCCH: measId 1, one serving result
     /// (physCellId 1, RSRP -90 dBm) and no neighbours.
     ///
-    /// Derivation of the framing from `tools/rrc-15.6.0.asn1`:
+    /// Derivation of the framing from `tools/rrc-19.3.0.asn1`:
     ///
     /// ```text
     /// bit 0      UL-DCCH-MessageType CHOICE, 2 alternatives -> 1 bit. c1 = 0

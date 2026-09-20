@@ -349,6 +349,34 @@ pub fn decode_ue_capability_information(
 pub fn build_minimal_nr_capability_container(
     supported_band: u16,
 ) -> Result<Vec<u8>, UeCapabilityError> {
+    build_nr_capability_container(supported_band, false)
+}
+
+/// Build a real UPER-encoded `UE-NR-Capability` container (TS 38.331 §6.3.3)
+/// that additionally declares whether this is a RedCap UE.
+///
+/// # Why this is where the RedCap declaration lives
+///
+/// TS 38.331 V19.3.0 has **no** `redCapIndication` IE -- not in
+/// `RRCSetupComplete-v1700-IEs`, not anywhere in the module (a grep for
+/// `redCapIndication` over the vendored `38331-j30.txt` returns zero hits). The
+/// IE that declares a UE to be RedCap is `supportOfRedCap-r17`, inside
+/// `RedCapParameters-r17` at `UE-NR-Capability-v1700.redCapParameters-r17`;
+/// TS 38.306 defines the other features' behaviour in terms of "a UE ...
+/// indicating `supportOfRedCap-r17`", which is what makes it the declaration.
+///
+/// So the conformant RedCap declaration travels in UE capability transfer
+/// (TS 38.331 §5.6.1), not in `RRCSetupComplete`. See #105.
+///
+/// When `redcap` is set the whole `v1530 -> ... -> v1700` non-critical-extension
+/// chain is emitted with every other field absent, because that is the only way
+/// to reach a Rel-17 field. `access-stratum-release` is raised to `rel17` to
+/// match, since a container claiming `rel15` while carrying Rel-17 extensions
+/// would be self-contradictory.
+pub fn build_nr_capability_container(
+    supported_band: u16,
+    redcap: bool,
+) -> Result<Vec<u8>, UeCapabilityError> {
     if supported_band == 0 || supported_band > 1024 {
         return Err(UeCapabilityError::InvalidFieldValue(
             "NR band must be 1-1024".to_string(),
@@ -356,7 +384,11 @@ pub fn build_minimal_nr_capability_container(
     }
 
     let capability = UE_NR_Capability {
-        access_stratum_release: AccessStratumRelease(AccessStratumRelease::REL15),
+        access_stratum_release: AccessStratumRelease(if redcap {
+            AccessStratumRelease::REL17
+        } else {
+            AccessStratumRelease::REL15
+        }),
         pdcp_parameters: PDCP_Parameters {
             supported_rohc_profiles: PDCP_ParametersSupportedROHC_Profiles {
                 profile0x0000: PDCP_ParametersSupportedROHC_ProfilesProfile0x0000(false),
@@ -404,8 +436,12 @@ pub fn build_minimal_nr_capability_container(
                 pusch_256qam: None,
                 ue_power_class: None,
                 rate_matching_lte_crs: None,
-                channel_b_ws_dl_v1530: None,
-                channel_b_ws_ul_v1530: None,
+                // Rel-16 dropped the `-v1530` suffix from `channelBWs-DL-v1530`
+                // and `channelBWs-UL-v1530` (TS 38.331 Annex A.3.1.2: the suffix
+                // is only carried while the field is distinguished as an
+                // extension); the SEQUENCE positions are unchanged.
+                channel_b_ws_dl: None,
+                channel_b_ws_ul: None,
             }]),
             supported_band_combination_list: None,
             applied_freq_band_list_filter: None,
@@ -418,10 +454,158 @@ pub fn build_minimal_nr_capability_container(
         feature_sets: None,
         feature_set_combinations: None,
         late_non_critical_extension: None,
-        non_critical_extension: None,
+        non_critical_extension: if redcap {
+            Some(build_redcap_capability_chain())
+        } else {
+            None
+        },
     };
 
     Ok(encode_rrc(&capability)?)
+}
+
+/// Build `UE-NR-Capability-v1530 -> ... -> v1700` carrying nothing but
+/// `redCapParameters-r17.supportOfRedCap-r17`.
+///
+/// Every intermediate version group exists only to carry the
+/// `nonCriticalExtension` pointer to the next one, so all their own fields are
+/// absent. `MeasAndMobParameters-v1700` and `MBS-Parameters-r17` are MANDATORY in
+/// `v1700` (no `OPTIONAL`), so both are constructed -- each with its single
+/// optional field absent, which is the minimum a conformant encoder can write.
+fn build_redcap_capability_chain() -> UE_NR_Capability_v1530 {
+    let v1700 = UE_NR_Capability_v1700 {
+        inactive_state_po_determination_r17: None,
+        high_speed_parameters_v1700: None,
+        pow_sav_parameters_v1700: None,
+        mac_parameters_v1700: None,
+        ims_parameters_v1700: None,
+        // Mandatory in v1700, not OPTIONAL.
+        meas_and_mob_parameters_v1700: MeasAndMobParameters_v1700 {
+            meas_and_mob_parameters_fr2_2_r17: None,
+        },
+        app_layer_meas_parameters_r17: None,
+        // The RedCap declaration itself (TS 38.331 `RedCapParameters-r17`).
+        // `supportOf16DRB-RedCap-r17` is left absent: this UE does not claim the
+        // optional 16-DRB extension, only baseline RedCap support.
+        red_cap_parameters_r17: Some(RedCapParameters_r17 {
+            support_of_red_cap_r17: Some(RedCapParameters_r17SupportOfRedCap_r17(
+                RedCapParameters_r17SupportOfRedCap_r17::SUPPORTED,
+            )),
+            support_of16_drb_red_cap_r17: None,
+        }),
+        ra_sdt_r17: None,
+        srb_sdt_r17: None,
+        gnb_side_rtt_based_pdc_r17: None,
+        bh_rlf_detection_recovery_indication_r17: None,
+        nrdc_parameters_v1700: None,
+        bap_parameters_v1700: None,
+        musim_gap_preference_r17: None,
+        musim_leave_connected_r17: None,
+        // Mandatory in v1700, not OPTIONAL.
+        mbs_parameters_r17: MBS_Parameters_r17 {
+            max_mrb_add_r17: None,
+        },
+        non_terrestrial_network_r17: None,
+        ntn_scenario_support_r17: None,
+        slice_infofor_cell_reselection_r17: None,
+        ue_radio_paging_info_r17: None,
+        ul_gap_fr2_pattern_r17: None,
+        ntn_parameters_r17: None,
+        non_critical_extension: None,
+    };
+
+    let v1690 = UE_NR_Capability_v1690 {
+        ul_rrc_segmentation_r16: None,
+        non_critical_extension: Some(v1700),
+    };
+    let v1650 = UE_NR_Capability_v1650 {
+        mps_priority_indication_r16: None,
+        high_speed_parameters_v1650: None,
+        non_critical_extension: Some(v1690),
+    };
+    let v1640 = UE_NR_Capability_v1640 {
+        redirect_at_resume_by_nas_r16: None,
+        phy_parameters_shared_spectrum_ch_access_r16: None,
+        non_critical_extension: Some(v1650),
+    };
+    let v1610 = UE_NR_Capability_v1610 {
+        in_device_coex_ind_r16: None,
+        dl_dedicated_message_segmentation_r16: None,
+        nrdc_parameters_v1610: None,
+        pow_sav_parameters_r16: None,
+        fr1_add_ue_nr_capabilities_v1610: None,
+        fr2_add_ue_nr_capabilities_v1610: None,
+        bh_rlf_indication_r16: None,
+        direct_sn_addition_first_rrc_iab_r16: None,
+        bap_parameters_r16: None,
+        reference_time_provision_r16: None,
+        sidelink_parameters_r16: None,
+        high_speed_parameters_r16: None,
+        mac_parameters_v1610: None,
+        mcg_rlf_recovery_via_scg_r16: None,
+        resume_with_stored_mcg_s_cells_r16: None,
+        resume_with_stored_scg_r16: None,
+        resume_with_scg_config_r16: None,
+        ue_based_perf_meas_parameters_r16: None,
+        son_parameters_r16: None,
+        on_demand_sib_connected_r16: None,
+        non_critical_extension: Some(v1640),
+    };
+    let v1570 = UE_NR_Capability_v1570 {
+        nrdc_parameters_v1570: None,
+        non_critical_extension: Some(v1610),
+    };
+    let v1560 = UE_NR_Capability_v1560 {
+        nrdc_parameters: None,
+        received_filters: None,
+        non_critical_extension: Some(v1570),
+    };
+    let v1550 = UE_NR_Capability_v1550 {
+        reduced_cp_latency: None,
+        non_critical_extension: Some(v1560),
+    };
+    let v1540 = UE_NR_Capability_v1540 {
+        sdap_parameters: None,
+        overheating_ind: None,
+        ims_parameters: None,
+        fr1_add_ue_nr_capabilities_v1540: None,
+        fr2_add_ue_nr_capabilities_v1540: None,
+        fr1_fr2_add_ue_nr_capabilities: None,
+        non_critical_extension: Some(v1550),
+    };
+    UE_NR_Capability_v1530 {
+        fdd_add_ue_nr_capabilities_v1530: None,
+        tdd_add_ue_nr_capabilities_v1530: None,
+        dummy: None,
+        inter_rat_parameters: None,
+        inactive_state: None,
+        delay_budget_reporting: None,
+        non_critical_extension: Some(v1540),
+    }
+}
+
+/// Read `supportOfRedCap-r17` back out of a `UE-NR-Capability` container.
+///
+/// This is the conformant answer to "is this a RedCap UE?" -- see
+/// [`build_nr_capability_container`] for why the question is not answered by
+/// `RRCSetupComplete`.
+pub fn parse_nr_capability_redcap(bytes: &[u8]) -> Result<bool, UeCapabilityError> {
+    let capability: UE_NR_Capability = decode_rrc(bytes)?;
+    Ok(capability
+        .non_critical_extension
+        .as_ref()
+        .and_then(|v1530| v1530.non_critical_extension.as_ref())
+        .and_then(|v1540| v1540.non_critical_extension.as_ref())
+        .and_then(|v1550| v1550.non_critical_extension.as_ref())
+        .and_then(|v1560| v1560.non_critical_extension.as_ref())
+        .and_then(|v1570| v1570.non_critical_extension.as_ref())
+        .and_then(|v1610| v1610.non_critical_extension.as_ref())
+        .and_then(|v1640| v1640.non_critical_extension.as_ref())
+        .and_then(|v1650| v1650.non_critical_extension.as_ref())
+        .and_then(|v1690| v1690.non_critical_extension.as_ref())
+        .and_then(|v1700| v1700.red_cap_parameters_r17.as_ref())
+        .and_then(|rc| rc.support_of_red_cap_r17.as_ref())
+        .is_some_and(|s| s.0 == RedCapParameters_r17SupportOfRedCap_r17::SUPPORTED))
 }
 
 /// Decode a `UE-NR-Capability` container and return the supported NR bands
@@ -550,5 +734,93 @@ mod tests {
         })
         .unwrap();
         assert!(decode_ue_capability_enquiry(&bytes[..1]).is_err());
+    }
+
+    /// #105's headline acceptance: a genuine post-Rel-15 IE encodes and decodes.
+    ///
+    /// `supportOfRedCap-r17` lives in `RedCapParameters-r17` inside
+    /// `UE-NR-Capability-v1700`, ten non-critical-extension hops past where the
+    /// Rel-15 schema stopped. Under `rrc-15.6.0` this test could not even be
+    /// written: `UE-NR-Capability.nonCriticalExtension` bottomed out long before
+    /// v1700 and the type did not exist.
+    ///
+    /// Asserted POSITIVELY on the decoded value, and asserted on the
+    /// `UE-NR-Capability` type rather than on bytes we chose, so the only way to
+    /// pass is for the encoder to have really walked the chain and for the decoder
+    /// to have really found the field.
+    #[test]
+    fn support_of_redcap_r17_round_trips_as_a_real_rel17_ie() {
+        let container = build_nr_capability_container(78, true).unwrap();
+
+        assert!(
+            parse_nr_capability_redcap(&container).unwrap(),
+            "supportOfRedCap-r17 must survive encode -> decode as a real \
+             UE-NR-Capability-v1700 field"
+        );
+
+        // The Rel-15 part of the same container is untouched by the extension.
+        assert_eq!(parse_nr_capability_bands(&container).unwrap(), vec![78]);
+
+        // Decoding the whole type proves the chain is genuinely present and that
+        // `access-stratum-release` was raised to match it, rather than the reader
+        // above having found the value by some shortcut.
+        let decoded: UE_NR_Capability = crate::codec::decode_rrc(&container).unwrap();
+        assert_eq!(
+            decoded.access_stratum_release.0,
+            AccessStratumRelease::REL17
+        );
+        // Ten hops, named: v1530, v1540, v1550, v1560, v1570, v1610, v1640,
+        // v1650, v1690, v1700. Anonymous `.and_then` repetition is how an
+        // off-by-one hides here, so each hop is bound and named.
+        let v1530 = decoded
+            .non_critical_extension
+            .as_ref()
+            .expect("v1530 must be present on the wire");
+        let v1540 = v1530.non_critical_extension.as_ref().expect("v1540");
+        let v1550 = v1540.non_critical_extension.as_ref().expect("v1550");
+        let v1560 = v1550.non_critical_extension.as_ref().expect("v1560");
+        let v1570 = v1560.non_critical_extension.as_ref().expect("v1570");
+        let v1610 = v1570.non_critical_extension.as_ref().expect("v1610");
+        let v1640 = v1610.non_critical_extension.as_ref().expect("v1640");
+        let v1650 = v1640.non_critical_extension.as_ref().expect("v1650");
+        let v1690 = v1650.non_critical_extension.as_ref().expect("v1690");
+        let v1700 = v1690
+            .non_critical_extension
+            .as_ref()
+            .expect("the v1530..v1700 chain must be present on the wire");
+        assert_eq!(
+            v1700
+                .red_cap_parameters_r17
+                .as_ref()
+                .and_then(|rc| rc.support_of_red_cap_r17.as_ref())
+                .map(|s| s.0),
+            Some(RedCapParameters_r17SupportOfRedCap_r17::SUPPORTED),
+        );
+    }
+
+    /// A non-RedCap container carries NO extension chain at all, so the Rel-19
+    /// schema costs nothing on the default path: the bytes are what the Rel-15
+    /// schema produced.
+    #[test]
+    fn a_non_redcap_capability_container_carries_no_rel16_extension() {
+        let container = build_nr_capability_container(78, false).unwrap();
+        assert!(!parse_nr_capability_redcap(&container).unwrap());
+
+        let decoded: UE_NR_Capability = crate::codec::decode_rrc(&container).unwrap();
+        assert_eq!(
+            decoded.access_stratum_release.0,
+            AccessStratumRelease::REL15
+        );
+        assert!(
+            decoded.non_critical_extension.is_none(),
+            "a UE that is not RedCap must not pay for the v1530.. chain"
+        );
+
+        // And it is byte-identical to what the old minimal builder produces, which
+        // is the compatibility claim the golden SIB/setup fixtures rest on.
+        assert_eq!(
+            container,
+            build_minimal_nr_capability_container(78).unwrap()
+        );
     }
 }
