@@ -106,7 +106,6 @@ fn rrc_setup_complete_params() -> impl Strategy<Value = RrcSetupCompleteParams> 
             any::<u64>().prop_map(|v| Ng5gSTmsiValue::Full(v & ((1u64 << 48) - 1))),
             any::<u16>().prop_map(|v| Ng5gSTmsiValue::Part2(v & 0x1FF)),
         ]),
-        any::<bool>(),
     )
         .prop_map(
             |(
@@ -117,7 +116,6 @@ fn rrc_setup_complete_params() -> impl Strategy<Value = RrcSetupCompleteParams> 
                 s_nssai_list,
                 dedicated_nas_message,
                 ng_5g_s_tmsi_value,
-                redcap_indication,
             )| RrcSetupCompleteParams {
                 rrc_transaction_id,
                 selected_plmn_identity,
@@ -126,7 +124,6 @@ fn rrc_setup_complete_params() -> impl Strategy<Value = RrcSetupCompleteParams> 
                 s_nssai_list,
                 dedicated_nas_message,
                 ng_5g_s_tmsi_value,
-                redcap_indication,
             },
         )
 }
@@ -162,7 +159,6 @@ proptest! {
         prop_assert_eq!(decoded.guami_type, params.guami_type);
         prop_assert_eq!(&decoded.registered_amf, &params.registered_amf);
         prop_assert_eq!(&decoded.ng_5g_s_tmsi_value, &params.ng_5g_s_tmsi_value);
-        prop_assert_eq!(decoded.redcap_indication, params.redcap_indication);
 
         let second = encode_rrc_setup_complete(&RrcSetupCompleteParams {
             rrc_transaction_id: decoded.rrc_transaction_id,
@@ -172,7 +168,6 @@ proptest! {
             s_nssai_list: decoded.s_nssai_list.clone(),
             dedicated_nas_message: decoded.dedicated_nas_message.clone(),
             ng_5g_s_tmsi_value: decoded.ng_5g_s_tmsi_value.clone(),
-            redcap_indication: decoded.redcap_indication,
         })
         .expect("UPER re-encode");
         prop_assert_eq!(first, second, "re-encoding a decoded message must be byte-identical");

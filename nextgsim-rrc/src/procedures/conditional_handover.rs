@@ -12,10 +12,15 @@
 //! - The container codec: [`encode_cho_config`] / [`decode_cho_config`]
 //!
 //! The container is the simulator's own byte format, not UPER
-//! `ConditionalReconfiguration`: that IE arrived in Rel-16 and the vendored
-//! schema is Rel-15 (issue #105). The UE-side runtime that stores candidates and
-//! evaluates their execution conditions lives in
-//! `nextgsim-ue/src/rrc/conditional_handover.rs`.
+//! `ConditionalReconfiguration`. That IE arrived in Rel-16 and was unreachable
+//! while the vendored schema was Rel-15; #105 has since upgraded the schema to
+//! Rel-19, so `ConditionalReconfiguration` now exists in the generated tree and
+//! this container is a migration candidate rather than a necessity. Migrating it
+//! is separate work: it changes a wire format both ends read, and the
+//! research-only condition types above (timer-based, predictive, AI-assisted) have
+//! no normative home, so the container cannot simply be deleted. The UE-side
+//! runtime that stores candidates and evaluates their execution conditions lives
+//! in `nextgsim-ue/src/rrc/conditional_handover.rs`.
 
 use thiserror::Error;
 
@@ -499,8 +504,10 @@ fn from_half_db(half_db: i16) -> f64 {
 ///
 /// # Wire layout
 ///
-/// This is the simulator's own container, not UPER `ConditionalReconfiguration`
-/// (which needs the Rel-16 RRC schema — see the Rel-15 ceiling in issue #105).
+/// This is the simulator's own container, not UPER `ConditionalReconfiguration`.
+/// That IE needed a Rel-16 schema, which #105 has now supplied (Rel-19), so the
+/// container is retained for compatibility and for the non-normative condition
+/// types rather than out of necessity — see the module docs.
 /// The three-byte header is unchanged from the original encoder, so
 /// [`decode_cho_config_header`] reads any version of this container:
 ///

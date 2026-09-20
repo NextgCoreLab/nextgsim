@@ -41,8 +41,8 @@ use nextgsim_rrc::procedures::rrc_setup::{
 };
 use nextgsim_rrc::procedures::scell_config::{encode_scell_config, ScellConfig};
 use nextgsim_rrc::procedures::ue_capability::{
-    encode_ue_capability_enquiry, parse_nr_capability_bands, RatType, UeCapabilityEnquiryParams,
-    UeCapabilityInformationData,
+    encode_ue_capability_enquiry, parse_nr_capability_bands, parse_nr_capability_redcap, RatType,
+    UeCapabilityEnquiryParams, UeCapabilityInformationData,
 };
 
 // The `0x06` UE-capability envelope and the `0x0E` secondary-cell envelope used to
@@ -215,9 +215,10 @@ impl RrcTask {
     /// Predictive and AI-assisted conditions are not offered either -- the container
     /// encoder rejects them.
     ///
-    /// The envelope is the simulator's hand-rolled DL-DCCH framing, because
-    /// `conditionalReconfiguration` is a Rel-16 IE and the vendored schema is Rel-15
-    /// (issues #107, #105).
+    /// The envelope is the simulator's hand-rolled DL-DCCH framing. That was
+    /// originally because `conditionalReconfiguration` is a Rel-16 IE and the
+    /// vendored schema was Rel-15; #105 has upgraded the schema to Rel-19, so the IE
+    /// now exists and the envelope is legacy rather than forced (issues #107, #105).
     /// Public because the in-process gNB<->UE harness drives it directly
     /// (`tests/src/conditional_handover_e2e.rs`, issue #165), the same reason
     /// `handle_radio_power_on` and `handle_uplink_rrc` are.
@@ -892,11 +893,10 @@ impl RrcTask {
             .unwrap_or_default();
 
         info!(
-            "RRC Setup Complete (ASN.1 UL-DCCH) from UE[{}]: tid={}, nas_len={}, redcap={}, s_nssai_count={}",
+            "RRC Setup Complete (ASN.1 UL-DCCH) from UE[{}]: tid={}, nas_len={}, s_nssai_count={}",
             ue_id,
             complete.rrc_transaction_id,
             complete.dedicated_nas_message.len(),
-            complete.redcap_indication,
             s_nssai_list.len()
         );
 
@@ -905,7 +905,6 @@ impl RrcTask {
             ue_id,
             complete.rrc_transaction_id,
             nas_pdu,
-            complete.redcap_indication,
             s_nssai_list,
             "ASN.1",
         )
@@ -929,15 +928,11 @@ impl RrcTask {
             OctetString::new()
         };
 
-        // RedCap (Reduced Capability) indication (Rel-17, TS 38.331 §6.2.2).
-        // The UE rides the indication in the RRCSetupComplete
-        // lateNonCriticalExtension octet container; best-effort ASN.1 decode of
-        // the full PDU recovers it without disturbing the lenient NAS
-        // extraction above.
-        let redcap_indication = decode_rrc_setup_complete(bytes)
-            .map(|data| data.redcap_indication)
-            .unwrap_or(false);
-
+        // No RedCap recovery here any more. It used to best-effort ASN.1-decode the
+        // PDU to pull a private 0xFE marker TLV out of `lateNonCriticalExtension`;
+        // #105 retired that marker, because TS 38.331 has no `redCapIndication` IE
+        // in any release and the conformant declaration is `supportOfRedCap-r17`
+        // in UE capability transfer, handled in `process_ue_capability_information`.
         info!(
             "RRC Setup Complete (bespoke fallback) from UE[{}]: tid={}, nas_len={}",
             ue_id,
@@ -949,7 +944,6 @@ impl RrcTask {
             ue_id,
             transaction_id,
             nas_pdu,
-            redcap_indication,
             // The bespoke framing carries no s-NSSAI-List; slice-aware selection
             // is only available on the ASN.1 path.
             Vec::new(),
@@ -968,14 +962,14 @@ impl RrcTask {
         ue_id: i32,
         transaction_id: u8,
         nas_pdu: OctetString,
-        redcap_indication: bool,
         s_nssai_list: Vec<SNssai>,
         via: &str,
     ) {
-        if redcap_indication {
-            self.apply_redcap_restrictions(ue_id);
-        }
-
+        // RedCap restrictions are NOT applied here. They used to be, off a
+        // sim-internal flag smuggled through `lateNonCriticalExtension`; #105 moved
+        // them onto `supportOfRedCap-r17` in UE capability transfer, which is the
+        // IE TS 38.331 actually defines. `send_ue_capability_enquiry` below starts
+        // that exchange, and `process_ue_capability_information` applies them.
         if let Some(result) = self.connection_manager.process_rrc_setup_complete(
             &mut self.ue_manager,
             ue_id,
@@ -1175,6 +1169,28 @@ impl RrcTask {
                     Err(e) => {
                         warn!(
                             "UE[{}] sent an undecodable UE-NR-Capability container: {}",
+                            ue_id, e
+                        );
+                    }
+                }
+                // `supportOfRedCap-r17` in `UE-NR-Capability-v1700` is the IE TS
+                // 38.331 actually defines for declaring a RedCap UE -- there is no
+                // `redCapIndication` anywhere in the spec (#105). So this is the
+                // wire-conformant point at which the gNB learns a UE is RedCap,
+                // and the restrictions are applied from here.
+                match parse_nr_capability_redcap(&container.container) {
+                    Ok(true) => {
+                        info!(
+                            "UE[{}] declared supportOfRedCap-r17 in UE-NR-Capability-v1700 \
+                             (TS 38.331 §6.3.3); applying RedCap restrictions",
+                            ue_id
+                        );
+                        self.apply_redcap_restrictions(ue_id);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(
+                            "UE[{}] capability container: could not read supportOfRedCap-r17: {}",
                             ue_id, e
                         );
                     }
@@ -2757,7 +2773,6 @@ mod tests {
                 s_nssai_list: None,
                 dedicated_nas_message: nas.clone(),
                 ng_5g_s_tmsi_value: None,
-                redcap_indication: false,
             })
             .expect("encode RRCSetupComplete");
 
@@ -2842,7 +2857,6 @@ mod tests {
                 s_nssai_list: None,
                 dedicated_nas_message: nas.clone(),
                 ng_5g_s_tmsi_value: None,
-                redcap_indication: false,
             })
             .unwrap();
             assert!(

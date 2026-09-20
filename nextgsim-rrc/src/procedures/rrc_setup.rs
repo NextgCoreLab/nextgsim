@@ -386,29 +386,7 @@ pub struct RrcSetupCompleteParams {
     pub dedicated_nas_message: Vec<u8>,
     /// 5G-S-TMSI value (optional)
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
-    /// RedCap (Reduced Capability) UE indication (Rel-17, TS 38.331 §6.2.2
-    /// `redCapIndication` in RRCSetupComplete-v1700-IEs).
-    ///
-    /// NOT WIRE-CONFORMANT (Wave 4 honest-defer): the `rrc-15.6.0` ASN.1 schema
-    /// used here predates the v1700 IE group, so there is no conformant slot for
-    /// `redCapIndication`. As a sim-internal stand-in it is carried as a private
-    /// marker TLV inside the structurally-opaque `lateNonCriticalExtension`
-    /// OCTET STRING (see [`REDCAP_LNCE_TAG`]). A real/independent gNB or UE will
-    /// NOT understand this marker; conformant AS-layer RedCap signalling requires
-    /// upgrading the RRC codec to Rel-17. The RedCap indication that actually
-    /// reaches the 5GC at runtime travels in the NAS path (Registration Request
-    /// RedCap IE 0xA9), independently of this field.
-    pub redcap_indication: bool,
 }
-
-/// Private, sim-internal marker tag for the RedCap indication TLV carried inside
-/// the opaque `lateNonCriticalExtension` OCTET STRING. This is NOT a 3GPP IEI —
-/// `lateNonCriticalExtension` has no defined internal TLV structure at Rel-15.
-/// The value is chosen in the 0xF0-0xFF private range so it cannot be mistaken
-/// for a real RRC/NAS IE identifier (it previously aliased NAS IEI 0x52). True
-/// conformance requires a Rel-17 RRC codec; see
-/// [`RrcSetupCompleteParams::redcap_indication`].
-const REDCAP_LNCE_TAG: u8 = 0xFE;
 
 /// Parsed RRC Setup Complete data
 #[derive(Debug, Clone)]
@@ -427,9 +405,6 @@ pub struct RrcSetupCompleteData {
     pub dedicated_nas_message: Vec<u8>,
     /// 5G-S-TMSI value
     pub ng_5g_s_tmsi_value: Option<Ng5gSTmsiValue>,
-    /// RedCap (Reduced Capability) UE indication (Rel-17), recovered from the
-    /// `lateNonCriticalExtension` octet container (see [`RrcSetupCompleteParams`]).
-    pub redcap_indication: bool,
 }
 
 /// Build an RRC Setup Complete message
@@ -512,18 +487,15 @@ pub fn build_rrc_setup_complete(
         .map(build_registered_amf)
         .transpose()?;
 
-    // RedCap indication (Rel-17): carried as a sim-internal private-marker TLV
-    // inside the opaque lateNonCriticalExtension OCTET STRING when set. NOT 3GPP
-    // wire-conformant (see REDCAP_LNCE_TAG); a real peer ignores it.
-    let late_non_critical_extension = if params.redcap_indication {
-        Some(RRCSetupComplete_IEsLateNonCriticalExtension(vec![
-            REDCAP_LNCE_TAG,
-            1, // length
-            1, // value: RedCap = true
-        ]))
-    } else {
-        None
-    };
+    // `lateNonCriticalExtension` is left EMPTY. It used to carry a private 0xFE
+    // marker TLV standing in for a Rel-17 `redCapIndication`; #105 established
+    // that TS 38.331 has no such IE in any release, and that the conformant RedCap
+    // declaration is `supportOfRedCap-r17` in UE capability transfer. So the
+    // marker is gone rather than relocated. `lateNonCriticalExtension` is
+    // `OCTET STRING (CONTAINING RRCSetupComplete-v15s0-IEs)` in the Rel-19 schema
+    // -- a typed container, not a free octet string, so a private TLV here is now
+    // ill-formed as well as non-conformant.
+    let late_non_critical_extension = None;
 
     let rrc_setup_complete_ies = RRCSetupComplete_IEs {
         selected_plmn_identity: RRCSetupComplete_IEsSelectedPLMN_Identity(
@@ -624,14 +596,6 @@ pub fn parse_rrc_setup_complete(
     // Parse RegisteredAMF
     let registered_amf = ies.registered_amf.as_ref().map(parse_registered_amf);
 
-    // RedCap indication (Rel-17): recovered from the lateNonCriticalExtension
-    // octet container TLV emitted by the UE.
-    let redcap_indication = ies
-        .late_non_critical_extension
-        .as_ref()
-        .map(|lnce| parse_redcap_lnce(&lnce.0))
-        .unwrap_or(false);
-
     Ok(RrcSetupCompleteData {
         rrc_transaction_id: rrc_setup_complete.rrc_transaction_identifier.0,
         selected_plmn_identity: ies.selected_plmn_identity.0,
@@ -640,27 +604,7 @@ pub fn parse_rrc_setup_complete(
         s_nssai_list,
         dedicated_nas_message: ies.dedicated_nas_message.0.clone(),
         ng_5g_s_tmsi_value,
-        redcap_indication,
     })
-}
-
-/// Scan a `lateNonCriticalExtension` octet container for the RedCap indication
-/// TLV (`REDCAP_LNCE_TAG`, len, value). Returns true when present and set.
-fn parse_redcap_lnce(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let tag = bytes[i];
-        let len = bytes[i + 1] as usize;
-        let val_start = i + 2;
-        if val_start + len > bytes.len() {
-            break;
-        }
-        if tag == REDCAP_LNCE_TAG {
-            return bytes.get(val_start).copied().unwrap_or(0) != 0;
-        }
-        i = val_start + len;
-    }
-    false
 }
 
 /// Build a generated `RegisteredAMF` from typed parameters
@@ -985,27 +929,39 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E, 0x00, 0x41], // Sample NAS message
             ng_5g_s_tmsi_value: None,
-            redcap_indication: false,
         }
     }
 
+    /// #105: the private `0xFE` RedCap marker TLV is gone from
+    /// `lateNonCriticalExtension`, and nothing replaced it there.
+    ///
+    /// This is a POSITIVE assertion on the encoder's own output, not "the flag no
+    /// longer round-trips": an `RRCSetupComplete` this codec builds must carry NO
+    /// `lateNonCriticalExtension` at all. The old marker scheme set the field, so
+    /// putting the marker back makes this fail on `is_none()`.
+    ///
+    /// The conformant RedCap declaration is asserted in `ue_capability`'s
+    /// `support_of_redcap_r17_round_trips_as_a_real_rel17_ie`.
     #[test]
-    fn test_rrc_setup_complete_redcap_roundtrip() {
-        // RedCap set: indication survives UPER encode/decode via the
-        // lateNonCriticalExtension octet container.
-        let mut params = create_test_setup_complete_params();
-        params.redcap_indication = true;
+    fn rrc_setup_complete_carries_no_private_late_non_critical_extension() {
+        let params = create_test_setup_complete_params();
+        let msg = build_rrc_setup_complete(&params).unwrap();
 
-        let bytes = encode_rrc_setup_complete(&params).unwrap();
-        let data = decode_rrc_setup_complete(&bytes).unwrap();
-        assert!(data.redcap_indication, "RedCap indication must round-trip");
-        assert_eq!(data.dedicated_nas_message, params.dedicated_nas_message);
+        let UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::RrcSetupComplete(complete)) =
+            &msg.message
+        else {
+            panic!("expected a c1 rrcSetupComplete");
+        };
+        let RRCSetupCompleteCriticalExtensions::RrcSetupComplete(ies) =
+            &complete.critical_extensions
+        else {
+            panic!("expected the rrcSetupComplete critical extension");
+        };
 
-        // RedCap not set: default decode yields false.
-        let params_off = create_test_setup_complete_params();
-        let bytes_off = encode_rrc_setup_complete(&params_off).unwrap();
-        let data_off = decode_rrc_setup_complete(&bytes_off).unwrap();
-        assert!(!data_off.redcap_indication);
+        assert!(
+            ies.late_non_critical_extension.is_none(),
+            "lateNonCriticalExtension must be absent: the RedCap marker TLV that              used to occupy it was retired in #105"
+        );
     }
 
     #[test]
@@ -1047,7 +1003,6 @@ mod tests {
             ]),
             dedicated_nas_message: vec![0x7E, 0x00, 0x41, 0x01, 0x02],
             ng_5g_s_tmsi_value: Some(Ng5gSTmsiValue::Full(0x123456789ABC)),
-            redcap_indication: false,
         };
 
         let msg = build_rrc_setup_complete(&params).unwrap();
@@ -1086,7 +1041,6 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: None,
-            redcap_indication: false,
         };
 
         let result = build_rrc_setup_complete(&params);
@@ -1103,7 +1057,6 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: None,
-            redcap_indication: false,
         };
 
         let result = build_rrc_setup_complete(&params);
@@ -1120,7 +1073,6 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: vec![0x7E],
             ng_5g_s_tmsi_value: Some(Ng5gSTmsiValue::Part2(0x1FF)), // Max 9-bit value
-            redcap_indication: false,
         };
 
         let msg = build_rrc_setup_complete(&params).unwrap();
@@ -1210,7 +1162,7 @@ mod tests {
 
     // ========================================================================
     // Wave-6 C1 — hand-derived golden byte vectors (TS 38.331 §6.2.2/§6.3.2,
-    // UPER per X.691). Derived BY HAND from tools/rrc-15.6.0.asn1, NOT
+    // UPER per X.691). Derived BY HAND from tools/rrc-19.3.0.asn1, NOT
     // produced by the encoder — a reviewer can re-derive every bit below.
     // ========================================================================
 

@@ -14,7 +14,7 @@ fn main() {
     let schema_path = manifest_dir
         .parent()
         .unwrap_or(Path::new("."))
-        .join("tools/rrc-15.6.0.asn1");
+        .join("tools/rrc-19.3.0.asn1");
 
     // Rerun if schema changes
     println!("cargo:rerun-if-changed={}", schema_path.display());

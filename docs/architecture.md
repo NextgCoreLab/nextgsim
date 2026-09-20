@@ -332,7 +332,11 @@ nextgsim uses the `asn1-compiler` and `asn1-codecs` crates for ASN.1 encoding/de
 | Protocol | Codec | Schema |
 |----------|-------|--------|
 | NGAP | APER (Aligned PER) | `tools/ngap-17.9.asn` |
-| RRC | UPER (Unaligned PER) | `tools/rrc-15.6.0.asn1` |
+| RRC | UPER (Unaligned PER) | `tools/rrc-19.3.0.asn1` |
+
+The RRC schema is a Release 19 extract of TS 38.331 V19.3.0, taken from the
+vendored `6g_docs/specs/38331-j30.docx` by the Annex A.3.1.1 procedure (issue
+\#105). It replaced a Rel-15 module under which no Rel-16+ RRC IE existed at all.
 
 Code is generated at compile time via `build.rs`:
 

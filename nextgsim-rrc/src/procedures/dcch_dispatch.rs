@@ -36,8 +36,9 @@
 //! dispatch, on the full first byte rather than a nibble, and documented at the
 //! call site as simulator framing. Both now live in the `messageClassExtension`
 //! space so they cannot collide with a real message (see
-//! [`SIM_RECONFIGURATION_WITH_SCELL`]); issue #107 covers replacing them, and the
-//! CHO container also needs a Rel-16 schema (issue #105). A third envelope,
+//! [`SIM_RECONFIGURATION_WITH_SCELL`]); issue #107 covers replacing them. The CHO
+//! container used to need a Rel-16 schema too; #105 has supplied one (Rel-19), so
+//! that is no longer a blocker on either. A third envelope,
 //! `0x06` for UE capability transfer, is gone entirely: it was also a conformant
 //! `RRCReconfiguration` at tid 3.
 
@@ -72,9 +73,12 @@ pub const SIM_RECONFIGURATION_WITH_CHO: u8 = 0x8D;
 ///
 /// This is simulator framing, not 3GPP: a real peer sending
 /// `messageClassExtension` is answered as unsupported, which is the honest
-/// outcome for a message class this release does not define. Issue #107 covers
-/// replacing both envelopes with real UPER — the CHO container additionally
-/// needs a Rel-16 schema (issue #105).
+/// outcome for a message class this release does not define. (`DL-DCCH-MessageType`
+/// still carries a plain `messageClassExtension SEQUENCE {}` under the Rel-19
+/// schema #105 vendored, so the reasoning above is unchanged — only UL-DCCH gained
+/// a CHOICE there.) Issue #107 covers replacing both envelopes with real UPER; the
+/// CHO container no longer additionally needs a newer schema, since #105 supplied
+/// one.
 pub const SIM_RECONFIGURATION_WITH_SCELL: u8 = 0x8E;
 
 use super::information_transfer::{
@@ -332,7 +336,6 @@ mod tests {
             s_nssai_list: None,
             dedicated_nas_message: nas.clone(),
             ng_5g_s_tmsi_value: None,
-            redcap_indication: false,
         })
         .unwrap();
         match dispatch_ul_dcch(&bytes).unwrap() {
@@ -422,12 +425,57 @@ mod tests {
         }
     }
 
+    /// Under the Rel-19 schema (#105) `UL-DCCH-MessageType.messageClassExtension`
+    /// is no longer an empty `SEQUENCE {}`: TS 38.331 Rel-16 turned it into a
+    /// two-arm `CHOICE { c2 CHOICE {...16 arms...}, messageClassExtensionFuture-r16
+    /// SEQUENCE {} }`. So the empty arm now costs a second index bit, and the
+    /// old one-bit `0x80` no longer names it.
+    ///
+    /// Bit layout, written out (`UL-DCCH-Message ::= SEQUENCE { message
+    /// UL-DCCH-MessageType }`, a single mandatory component, so no preamble):
+    ///
+    /// * bit 0 = `1` -> `UL-DCCH-MessageType` CHOICE index 1 of 2 root arms,
+    ///   non-extensible, so a 1-bit index: `messageClassExtension`.
+    /// * bit 1 = `1` -> `messageClassExtension` CHOICE index 1 of 2 root arms,
+    ///   non-extensible, so a 1-bit index: `messageClassExtensionFuture-r16`.
+    /// * `messageClassExtensionFuture-r16` is `SEQUENCE {}`: zero bits.
+    ///
+    /// `0b11` then padding = `0xC0`. That is the byte the assertion pins.
     #[test]
-    fn message_class_extension_is_unsupported() {
-        // Leading bit 1 selects the messageClassExtension arm (empty SEQUENCE),
-        // a well-formed but non-dispatched UL-DCCH-Message.
+    fn message_class_extension_future_is_unsupported() {
         assert!(matches!(
-            dispatch_ul_dcch(&[0x80]).unwrap(),
+            dispatch_ul_dcch(&[0xC0]).unwrap(),
+            UlDcchMessage::Unsupported
+        ));
+    }
+
+    /// The OTHER `messageClassExtension` arm -- `c2`, the Rel-16/17/18 message
+    /// set the Rel-15 schema could not express at all (#105) -- also reaches
+    /// `Unsupported` rather than an error, because none of its 16 arms is a
+    /// message this dispatcher acts on.
+    ///
+    /// `dedicatedSIBRequest-r16` is built as real UPER rather than a hand-rolled
+    /// byte string, so this asserts the arm is genuinely *reachable* from the new
+    /// schema -- the thing #105 was opened to make true.
+    #[test]
+    fn a_rel16_message_class_extension_c2_message_is_unsupported() {
+        let msg = UL_DCCH_Message {
+            message: UL_DCCH_MessageType::MessageClassExtension(
+                UL_DCCH_MessageType_messageClassExtension::C2(
+                    UL_DCCH_MessageType_messageClassExtension_c2::DedicatedSIBRequest_r16(
+                        DedicatedSIBRequest_r16 {
+                            critical_extensions:
+                                DedicatedSIBRequest_r16CriticalExtensions::CriticalExtensionsFuture(
+                                    DedicatedSIBRequest_r16CriticalExtensions_criticalExtensionsFuture {},
+                                ),
+                        },
+                    ),
+                ),
+            ),
+        };
+        let bytes = crate::codec::encode_rrc(&msg).unwrap();
+        assert!(matches!(
+            dispatch_ul_dcch(&bytes).unwrap(),
             UlDcchMessage::Unsupported
         ));
     }
