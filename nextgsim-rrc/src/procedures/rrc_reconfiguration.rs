@@ -11,6 +11,13 @@
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
 use crate::procedures::meas_config::{build_a3_meas_config, A3MeasConfigParams, MeasConfigError};
+// The connected-mode NTN update path (issue #56): `ntn-Config` reaches a
+// connected UE in a `SystemInformation` carried by
+// `dedicatedSystemInformationDelivery`. See [`RrcReconfigurationParams::ntn_config`].
+use crate::procedures::system_information::{
+    build_system_information, parse_system_information, Sib19Data, Sib19Params,
+    SystemInformationError, SystemInformationParams,
+};
 use thiserror::Error;
 
 /// Errors that can occur during RRC Reconfiguration procedures
@@ -19,6 +26,16 @@ pub enum RrcReconfigurationError {
     /// Codec error during encoding/decoding
     #[error("Codec error: {0}")]
     CodecError(#[from] RrcCodecError),
+
+    /// A `dedicatedSystemInformationDelivery` payload that could not be built or
+    /// read (issue #56).
+    ///
+    /// Its own variant for the same reason as [`Self::MeasConfig`]: a caller that
+    /// cannot signal an NTN update must still be able to send the bearer half of
+    /// the reconfiguration, and telling the two failures apart is what makes that
+    /// decision possible.
+    #[error("Invalid dedicatedSystemInformationDelivery: {0}")]
+    DedicatedSystemInformation(#[from] SystemInformationError),
 
     /// Invalid message type received
     #[error("Invalid message type: expected {expected}, got {actual}")]
@@ -78,6 +95,33 @@ pub struct RrcReconfigurationParams {
     /// one the gNB decides handovers on — before this the field was hardcoded
     /// `None`, so the two were independent with no wire path between them.
     pub meas_config: Option<A3MeasConfigParams>,
+    /// The serving cell's `ntn-Config`, for the connected-mode NTN update path
+    /// (TS 38.300 §16.14.2.2, issue #56).
+    ///
+    /// §16.14.2.2: "In connected mode, the UE shall be able to continuously update
+    /// the Timing Advance and frequency pre-compensation." A connected UE is not
+    /// obliged to keep reading BCCH, so the ephemeris has to be able to reach it on
+    /// SRB1 as well as on the broadcast.
+    ///
+    /// # Why this rides `dedicatedSystemInformationDelivery` and not a dedicated IE
+    ///
+    /// The obvious-looking home, `ServingCellConfigCommon.ntn-Config-r17`, is inside
+    /// a `[[ ]]` extension-addition group of that SEQUENCE. The vendored
+    /// `asn1-compiler` does not generate SEQUENCE extension additions, so that field
+    /// does not exist in the generated tree — and the vendored codec's
+    /// `encode_sequence_header_common` still returns `EncodeNotSupported` for an
+    /// extended SEQUENCE, so it could not be encoded even if it did.
+    ///
+    /// `RRCReconfiguration-v1530-IEs.dedicatedSystemInformationDelivery` is in the
+    /// ROOT of its SEQUENCE and is an `OCTET STRING (CONTAINING SystemInformation)`,
+    /// and TS 38.331's own field description says it "is used to transfer SIB6,
+    /// SIB7, SIB8, **SIB19**, SIB20, SIB21, SIB25, SIB26, SIB27 to the UE". So this
+    /// is not a workaround for the codec gap — it is a carrier the spec designates
+    /// for exactly this IE, which happens also to be reachable. The UE applies it by
+    /// "perform[ing] the action upon reception of System Information as specified in
+    /// 5.2.2.4" (§5.3.5.3), i.e. the same handler the broadcast feeds, so one
+    /// application path serves both.
+    pub ntn_config: Option<Sib19Params>,
 }
 
 /// `masterKeyUpdate` as the network sets it and the UE reads it
@@ -113,6 +157,13 @@ pub struct RrcReconfigurationData {
     /// wanted any of those would have to re-decode the message to see them.
     /// [`read_a3_meas_configs`] extracts the A3 bindings from it.
     pub meas_config: Option<MeasConfig>,
+    /// The serving cell's NTN configuration, when the message carried a
+    /// `dedicatedSystemInformationDelivery` containing a SIB19 (issue #56).
+    ///
+    /// Already parsed rather than left as bytes, for the same reason `meas_config`
+    /// is: the receiver CONSUMES it — it derives a timing advance from it — so
+    /// handing back an octet string would only add a place to lose it.
+    pub ntn_config: Option<Sib19Data>,
 }
 
 /// Build an RRC Reconfiguration message
@@ -150,8 +201,16 @@ pub fn build_rrc_reconfiguration(
             .map(build_a3_meas_config)
             .transpose()?,
         late_non_critical_extension: None,
-        non_critical_extension: if params.master_cell_group.is_some() || params.full_config {
-            Some(build_v1530_extension(params))
+        // `ntn_config` joins the condition since issue #56: it lives in the v1530
+        // extension, so a reconfiguration that carries ONLY an NTN update -- which
+        // is exactly the connected-mode ephemeris refresh of TS 38.300 §16.14.2.2 --
+        // would otherwise have the extension omitted and the update silently
+        // dropped.
+        non_critical_extension: if params.master_cell_group.is_some()
+            || params.full_config
+            || params.ntn_config.is_some()
+        {
+            Some(build_v1530_extension(params)?)
         } else {
             None
         },
@@ -173,9 +232,55 @@ pub fn build_rrc_reconfiguration(
     })
 }
 
+/// Wraps a SIB19 as the `SystemInformation` that
+/// `dedicatedSystemInformationDelivery` contains (TS 38.331 §6.2.2, issue #56).
+///
+/// `OCTET STRING (CONTAINING SystemInformation)` means the octets are a complete,
+/// separately-encoded `SystemInformation` UPER PDU — so this reuses
+/// `build_system_information`, the same builder the broadcast path uses, rather
+/// than assembling a second one. That is what keeps the dedicated delivery and the
+/// broadcast byte-identical in content: the UE's SIB19 handler cannot tell them
+/// apart, which is precisely §5.3.5.3's "perform the action upon reception of
+/// System Information".
+fn build_ntn_dedicated_si(ntn_config: &Sib19Params) -> Result<Vec<u8>, SystemInformationError> {
+    let si = build_system_information(&SystemInformationParams {
+        sib19: Some(*ntn_config),
+        ..Default::default()
+    })?;
+    // The contained type is `SystemInformation`, not `BCCH-DL-SCH-Message`: the
+    // channel wrapper belongs to the broadcast, and a receiver decoding this octet
+    // string expects the inner message.
+    let BCCH_DL_SCH_MessageType::C1(BCCH_DL_SCH_MessageType_c1::SystemInformation(inner)) =
+        &si.message
+    else {
+        return Err(SystemInformationError::InvalidMessageType {
+            expected: "SystemInformation".to_string(),
+            actual: "SystemInformationBlockType1".to_string(),
+        });
+    };
+    Ok(encode_rrc(inner)?)
+}
+
+/// Reads a `dedicatedSystemInformationDelivery` back, returning the SIB19 it
+/// carried if any (issue #56).
+///
+/// A payload that does not decode, or that carries no SIB19, yields `None` rather
+/// than an error: the field legally carries SIB6/7/8/20/21/25/26/27 too, and a
+/// reconfiguration that delivered a SIB20 must not fail to apply its bearer half
+/// because this NTN reader found nothing for itself.
+fn read_ntn_dedicated_si(bytes: &[u8]) -> Option<Sib19Data> {
+    let inner: SystemInformation = decode_rrc(bytes).ok()?;
+    let msg = BCCH_DL_SCH_Message {
+        message: BCCH_DL_SCH_MessageType::C1(BCCH_DL_SCH_MessageType_c1::SystemInformation(inner)),
+    };
+    parse_system_information(&msg).ok()?.sib19
+}
+
 /// Build the v1530 extension for RRC Reconfiguration
-fn build_v1530_extension(params: &RrcReconfigurationParams) -> RRCReconfiguration_v1530_IEs {
-    RRCReconfiguration_v1530_IEs {
+fn build_v1530_extension(
+    params: &RrcReconfigurationParams,
+) -> Result<RRCReconfiguration_v1530_IEs, RrcReconfigurationError> {
+    Ok(RRCReconfiguration_v1530_IEs {
         master_cell_group: params
             .master_cell_group
             .as_ref()
@@ -199,10 +304,17 @@ fn build_v1530_extension(params: &RrcReconfigurationParams) -> RRCReconfiguratio
             nas_container: None,
         }),
         dedicated_sib1_delivery: None,
-        dedicated_system_information_delivery: None,
+        // The connected-mode NTN update (issue #56). TS 38.331's field description
+        // names SIB19 among this field's permitted payloads.
+        dedicated_system_information_delivery: params
+            .ntn_config
+            .as_ref()
+            .map(build_ntn_dedicated_si)
+            .transpose()?
+            .map(RRCReconfiguration_v1530_IEsDedicatedSystemInformationDelivery),
         other_config: None,
         non_critical_extension: None,
-    }
+    })
 }
 
 // ============================================================================
@@ -588,6 +700,12 @@ pub fn build_drb_reconfiguration_params(
         // A DRB-establishing reconfiguration is not a handover, so the UE keeps its keys.
         master_key_update: None,
         meas_config,
+        // Left to the caller (issue #56). This builder takes no cell configuration,
+        // so it has no ephemeris to signal; the gNB's RRC task adds the NTN update
+        // to the params it gets back when the cell is an NTN one. Baking `None` in
+        // here rather than inventing a default keeps a TN cell's reconfiguration
+        // byte-identical to what it was.
+        ntn_config: None,
     })
 }
 
@@ -620,6 +738,9 @@ pub fn build_multi_drb_reconfiguration_params(
         full_config: false,
         master_key_update: None,
         meas_config,
+        // See `build_drb_reconfiguration_params`: the caller supplies the NTN
+        // update, because this builder holds no cell configuration (issue #56).
+        ntn_config: None,
     })
 }
 
@@ -707,8 +828,9 @@ pub fn parse_rrc_reconfiguration(
     // Extract secondary cell group
     let secondary_cell_group = ies.secondary_cell_group.as_ref().map(|scg| scg.0.clone());
 
-    // Extract master cell group, full_config and masterKeyUpdate from the v1530 extension
-    let (master_cell_group, full_config, master_key_update) =
+    // Extract master cell group, full_config, masterKeyUpdate and the NTN update
+    // from the v1530 extension
+    let (master_cell_group, full_config, master_key_update, ntn_config) =
         if let Some(ref ext) = ies.non_critical_extension {
             let mcg = ext.master_cell_group.as_ref().map(|m| m.0.clone());
             let fc = ext.full_config.is_some();
@@ -719,9 +841,15 @@ pub fn parse_rrc_reconfiguration(
                     key_set_change_indicator: u.key_set_change_indicator.0,
                     next_hop_chaining_count: u.next_hop_chaining_count.0,
                 });
-            (mcg, fc, mku)
+            // The connected-mode NTN update (issue #56). `None` for a delivery that
+            // carried some other SIB, which is legal -- see `read_ntn_dedicated_si`.
+            let ntn = ext
+                .dedicated_system_information_delivery
+                .as_ref()
+                .and_then(|d| read_ntn_dedicated_si(&d.0));
+            (mcg, fc, mku, ntn)
         } else {
-            (None, false, None)
+            (None, false, None, None)
         };
 
     Ok(RrcReconfigurationData {
@@ -736,6 +864,7 @@ pub fn parse_rrc_reconfiguration(
         // margin), not forwarded, so a byte round trip would only add a way to
         // lose it (issue #170).
         meas_config: ies.meas_config.clone(),
+        ntn_config,
     })
 }
 
@@ -1284,6 +1413,7 @@ mod tests {
             full_config: false,
             master_key_update: None,
             meas_config: None,
+            ntn_config: None,
         }
     }
 
@@ -1338,6 +1468,7 @@ mod tests {
             full_config: true,
             master_key_update: None,
             meas_config: None,
+            ntn_config: None,
         };
 
         let msg = build_rrc_reconfiguration(&params).unwrap();
@@ -1374,6 +1505,7 @@ mod tests {
             full_config: false,
             master_key_update: None,
             meas_config: None,
+            ntn_config: None,
         };
 
         let result = build_rrc_reconfiguration(&params);
@@ -1669,6 +1801,7 @@ mod tests {
             full_config: false,
             master_key_update: None,
             meas_config: None,
+            ntn_config: None,
         })
         .expect("encode minimal RRCReconfiguration");
         assert_eq!(
@@ -1697,6 +1830,7 @@ mod tests {
             full_config: false,
             master_key_update: None,
             meas_config: Some(test_meas_config_params()),
+            ntn_config: None,
         };
         let bytes = encode_rrc_reconfiguration(&params).expect("encode with a measConfig");
         assert_ne!(
@@ -1737,6 +1871,7 @@ mod tests {
                     full_config: false,
                     master_key_update: None,
                     meas_config: Some(test_meas_config_params()),
+                    ntn_config: None,
                 },
             ),
             (
@@ -1751,6 +1886,7 @@ mod tests {
                     full_config: true,
                     master_key_update: None,
                     meas_config: Some(test_meas_config_params()),
+                    ntn_config: None,
                 },
             ),
         ] {
@@ -2265,6 +2401,204 @@ mod tests {
             _ => panic!("expected served DRB identity"),
         }
     }
+
+    // ========================================================================
+    // Connected-mode NTN update (issue #56)
+    // ========================================================================
+
+    use crate::procedures::ntn_timing::{EphemerisStateVector, NtnServingCellConfig};
+
+    /// The same 600 km overhead LEO geometry the SIB19 and timing tests use, so the
+    /// number this reconfiguration carries is the number those modules
+    /// hand-compute.
+    fn test_ntn_sib19_params() -> Sib19Params {
+        Sib19Params {
+            ntn_config: NtnServingCellConfig {
+                epoch_sfn: 512,
+                epoch_subframe: 3,
+                ul_sync_validity_index: 5,
+                cell_specific_k_offset: 478,
+                ta_common: 1_000_000,
+                ta_common_drift: Some(-500),
+                ephemeris: EphemerisStateVector::from_ecef(
+                    [6_378_137.0 + 600_000.0, 0.0, 0.0],
+                    [1000.0, 0.0, 0.0],
+                )
+                .expect("within the ASN.1 ranges"),
+            },
+            t_service: None,
+            distance_thresh: None,
+        }
+    }
+
+    /// Criterion 4: `ntn-Config` reaches a connected UE in an RRCReconfiguration,
+    /// through real UPER, with the ephemeris intact.
+    #[test]
+    fn an_rrc_reconfiguration_carries_the_ntn_config_to_a_connected_ue() {
+        let params = RrcReconfigurationParams {
+            ntn_config: Some(test_ntn_sib19_params()),
+            ..create_test_reconfiguration_params()
+        };
+        let bytes = encode_rrc_reconfiguration(&params).expect("encodes");
+        let data = decode_rrc_reconfiguration(&bytes).expect("decodes");
+
+        let sib19 = data
+            .ntn_config
+            .expect("the reconfiguration must carry the NTN update");
+        let cfg = sib19
+            .ntn_config
+            .expect("and the delivered SIB19 must carry an ntn-Config");
+        assert_eq!(
+            cfg,
+            test_ntn_sib19_params().ntn_config,
+            "every NTN-Config field must survive the dedicated delivery: the UE \
+             re-derives its timing advance from these numbers"
+        );
+        // The value is usable, not merely present: the same non-zero TA the
+        // broadcast path yields.
+        let ue = [6_378_137.0, 0.0, 0.0];
+        assert!(
+            cfg.autonomous_ta_us(ue) > 8000.0,
+            "the TA derived from the connected-mode update must be the same non-zero \
+             ~8075 us as the broadcast's, or the two paths disagree"
+        );
+    }
+
+    /// An NTN update ALONE must still emit the v1530 extension. A reconfiguration
+    /// carrying only an ephemeris refresh is exactly the connected-mode update of
+    /// TS 38.300 §16.14.2.2, and the extension's emit condition used to depend only
+    /// on `masterCellGroup`/`fullConfig`.
+    #[test]
+    fn a_reconfiguration_carrying_only_an_ntn_update_still_emits_the_extension() {
+        let params = RrcReconfigurationParams {
+            rrc_transaction_id: 1,
+            radio_bearer_config: None,
+            secondary_cell_group: None,
+            master_cell_group: None,
+            full_config: false,
+            master_key_update: None,
+            meas_config: None,
+            ntn_config: Some(test_ntn_sib19_params()),
+        };
+        let data = decode_rrc_reconfiguration(&encode_rrc_reconfiguration(&params).unwrap())
+            .expect("decodes");
+        assert!(
+            data.master_cell_group.is_none() && !data.full_config,
+            "nothing but the NTN update is set"
+        );
+        assert!(
+            data.ntn_config.and_then(|s| s.ntn_config).is_some(),
+            "an NTN-only reconfiguration must still carry the update; if the v1530 \
+             extension is omitted the ephemeris is silently dropped"
+        );
+    }
+
+    /// A reconfiguration with no NTN update must be byte-identical to what it was
+    /// before this field existed: a terrestrial cell's signalling must not grow.
+    #[test]
+    fn a_reconfiguration_without_an_ntn_update_carries_no_dedicated_si() {
+        let params = create_test_reconfiguration_params();
+        let data = decode_rrc_reconfiguration(&encode_rrc_reconfiguration(&params).unwrap())
+            .expect("decodes");
+        assert!(
+            data.ntn_config.is_none(),
+            "a TN cell's reconfiguration must carry no dedicatedSystemInformationDelivery"
+        );
+
+        // And the encoded bytes are unchanged by the field's existence: the same
+        // params with `ntn_config: None` must produce the same PDU as one built
+        // before the field was added, which is what this equality pins.
+        let explicit_none = RrcReconfigurationParams {
+            ntn_config: None,
+            ..create_test_reconfiguration_params()
+        };
+        assert_eq!(
+            encode_rrc_reconfiguration(&params).unwrap(),
+            encode_rrc_reconfiguration(&explicit_none).unwrap()
+        );
+    }
+
+    /// A `dedicatedSystemInformationDelivery` carrying some OTHER SIB is legal, and
+    /// must not make the reconfiguration fail to parse — only report no NTN update.
+    #[test]
+    fn a_dedicated_delivery_of_another_sib_yields_no_ntn_update_rather_than_an_error() {
+        use crate::procedures::system_information::{Sib3Params, SystemInformationParams};
+        // A SystemInformation carrying SIB3 instead of SIB19, encoded the way the
+        // contained type requires.
+        let si = build_system_information(&SystemInformationParams {
+            sib3: Some(Sib3Params::default()),
+            ..Default::default()
+        })
+        .expect("a SIB3 SystemInformation builds");
+        let BCCH_DL_SCH_MessageType::C1(BCCH_DL_SCH_MessageType_c1::SystemInformation(inner)) =
+            &si.message
+        else {
+            panic!("expected a SystemInformation");
+        };
+        let payload = encode_rrc(inner).expect("encodes");
+        assert!(
+            read_ntn_dedicated_si(&payload).is_none(),
+            "a delivery carrying SIB3 must report no NTN update"
+        );
+
+        // And garbage must not panic or error either: the bearer half of a
+        // reconfiguration has to keep applying.
+        assert!(read_ntn_dedicated_si(&[0xff, 0xff, 0xff, 0xff]).is_none());
+        assert!(read_ntn_dedicated_si(&[]).is_none());
+    }
+
+    /// An unencodable ephemeris must fail the BUILD rather than emit a
+    /// reconfiguration whose NTN update is quietly absent.
+    #[test]
+    fn an_unencodable_ntn_config_fails_the_reconfiguration_build() {
+        let bad = Sib19Params {
+            ntn_config: NtnServingCellConfig {
+                cell_specific_k_offset: 0, // INTEGER(1..1023)
+                ..test_ntn_sib19_params().ntn_config
+            },
+            ..test_ntn_sib19_params()
+        };
+        let err = encode_rrc_reconfiguration(&RrcReconfigurationParams {
+            ntn_config: Some(bad),
+            ..create_test_reconfiguration_params()
+        })
+        .expect_err("an unencodable NTN config must be refused");
+        assert!(
+            matches!(err, RrcReconfigurationError::DedicatedSystemInformation(_)),
+            "and refused as a dedicated-SI failure, so a caller can still choose to \
+             send the bearer half: got {err:?}"
+        );
+    }
+
+    /// The dedicated delivery and the broadcast must carry the SAME bytes for the
+    /// same configuration. If they diverged, a UE would derive one timing advance
+    /// from BCCH and a different one from SRB1.
+    #[test]
+    fn the_dedicated_delivery_and_the_broadcast_carry_identical_sib19_content() {
+        use crate::procedures::system_information::decode_system_information;
+        let params = test_ntn_sib19_params();
+
+        let dedicated = build_ntn_dedicated_si(&params).expect("dedicated builds");
+        let from_dedicated = read_ntn_dedicated_si(&dedicated).expect("and reads back");
+
+        let broadcast = crate::procedures::system_information::encode_system_information(
+            &SystemInformationParams {
+                sib19: Some(params),
+                ..Default::default()
+            },
+        )
+        .expect("broadcast encodes");
+        let from_broadcast = decode_system_information(&broadcast)
+            .expect("decodes")
+            .sib19
+            .expect("carries SIB19");
+
+        assert_eq!(
+            from_dedicated, from_broadcast,
+            "the connected-mode update and the broadcast must deliver the same \
+             configuration; a UE reading both must not get two different answers"
+        );
+    }
 }
 
 // ============================================================================
@@ -2463,6 +2797,13 @@ pub fn build_handover_command_params(
         // re-send the same configuration with a `reconfigurationWithSync` beside
         // it. If this ever becomes multi-carrier, this is the site.
         meas_config: None,
+        // No NTN update on a handover command (issue #56). TS 38.331's `EpochTime`
+        // description is explicit that on handover the ephemeris reference point and
+        // the SFN are the TARGET cell's, so signalling this cell's `ntn-Config` in a
+        // handover command would hand the UE a configuration referenced to the wrong
+        // clock -- worse than sending none, because the UE would apply it. The
+        // target's own SIB19 broadcast is what the UE reads after the switch.
+        ntn_config: None,
     })
 }
 

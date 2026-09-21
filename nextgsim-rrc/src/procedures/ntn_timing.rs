@@ -439,6 +439,283 @@ pub fn decode_ntn_timing_advance_header(
     Ok((config_id, orbit_type, satellite_id, common_ta_us))
 }
 
+// ============================================================================
+// SIB19 autonomous TA and Doppler pre-compensation (issue #56)
+// ============================================================================
+//
+// TS 38.300 §16.14.2.2: "the UE shall compute the RTT between UE and the RP
+// based on the GNSS position, the ephemeris, and the Common TA parameters ...
+// and autonomously pre-compensate the T_TA for the RTT between the UE and the
+// RP", and "shall compute the frequency Doppler shift of the service link, and
+// autonomously pre-compensate for it in the uplink transmissions, by
+// considering UE position and the ephemeris."
+//
+// The types below are in the units SIB19 actually carries, because a
+// pre-compensation derived from a differently-scaled copy of the ephemeris is
+// wrong in a way no round-trip test would catch. The scale factors are quoted
+// from the TS 38.331 `EphemerisInfo` and `TA-Info` field descriptions.
+//
+// What this deliberately does NOT do: propagate the orbit. Deriving the
+// satellite's position at an arbitrary instant from Keplerian elements needs an
+// orbit propagator, and `EphemerisInfo-r17`'s `positionVelocity` arm already
+// gives the state vector at `epochTime` directly. So the state vector is the
+// supported arm here, and the derivation is the geometry at epoch -- which is
+// what the UE has, and what a simulator with no independent notion of satellite
+// motion can honestly claim.
+
+/// Speed of light in vacuum, m/s (the constant TS 38.211 §4.1 timing rests on).
+pub const SPEED_OF_LIGHT_M_S: f64 = 299_792_458.0;
+
+/// `positionX/Y/Z` granularity: "Step of 1.3 m" (TS 38.331 `EphemerisInfo`).
+pub const EPHEMERIS_POSITION_STEP_M: f64 = 1.3;
+
+/// `velocityVX/VY/VZ` granularity: "Step of 0.06 m/s" (TS 38.331
+/// `EphemerisInfo`).
+pub const EPHEMERIS_VELOCITY_STEP_M_S: f64 = 0.06;
+
+/// `ta-Common` granularity: "4.072 x 10^-3 us" (TS 38.331 `TA-Info`).
+pub const TA_COMMON_STEP_US: f64 = 4.072e-3;
+
+/// `ta-Common-r17` is `INTEGER(0..66485757)` (TS 38.331 `TA-Info-r17`).
+pub const TA_COMMON_MAX: u32 = 66_485_757;
+
+/// `ta-CommonDrift` granularity: "0.2 x 10^-3 us/s" (TS 38.331 `TA-Info`).
+pub const TA_COMMON_DRIFT_STEP_US_PER_S: f64 = 0.2e-3;
+
+/// `ta-CommonDrift-r17` is `INTEGER(-257303..257303)` (TS 38.331 `TA-Info-r17`).
+pub const TA_COMMON_DRIFT_ABS_MAX: i32 = 257_303;
+
+/// `cellSpecificKoffset-r17` is `INTEGER(1..1023)` (TS 38.331 `NTN-Config-r17`).
+pub const CELL_SPECIFIC_K_OFFSET_MIN: u16 = 1;
+/// See [`CELL_SPECIFIC_K_OFFSET_MIN`].
+pub const CELL_SPECIFIC_K_OFFSET_MAX: u16 = 1023;
+
+/// `PositionStateVector-r17 ::= INTEGER (-33554432..33554431)`.
+pub const POSITION_STATE_VECTOR_MIN: i32 = -33_554_432;
+/// See [`POSITION_STATE_VECTOR_MIN`].
+pub const POSITION_STATE_VECTOR_MAX: i32 = 33_554_431;
+/// `VelocityStateVector-r17 ::= INTEGER (-131072..131071)`.
+pub const VELOCITY_STATE_VECTOR_MIN: i32 = -131_072;
+/// See [`VELOCITY_STATE_VECTOR_MIN`].
+pub const VELOCITY_STATE_VECTOR_MAX: i32 = 131_071;
+
+/// The `ntn-UlSyncValidityDuration-r17` ENUMERATED, in seconds, by index.
+///
+/// `{ s5, s10, s15, s20, s25, s30, s35, s40, s45, s50, s55, s60, s120, s180,
+/// s240, s900 }` (TS 38.331 `NTN-Config-r17`). A table rather than an arithmetic
+/// rule because the sequence stops being uniform past index 11.
+pub const UL_SYNC_VALIDITY_DURATION_S: [u16; 16] = [
+    5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 120, 180, 240, 900,
+];
+
+/// A satellite ECEF position/velocity state vector in the raw units of
+/// `EphemerisInfo-r17.positionVelocity-r17`.
+///
+/// Held in the WIRE units rather than in metres so the value the UE computes from
+/// is bit-identical to the value the gNB broadcast. Converting to metres on the
+/// gNB and back on the UE would quantise twice, and the two ends would then
+/// disagree about the derived TA by up to one step with nothing to say why.
+/// [`Self::position_m`] and [`Self::velocity_m_s`] apply the spec's scale factors
+/// at the point of use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EphemerisStateVector {
+    /// `positionX-r17`, `INTEGER (-33554432..33554431)`, step 1.3 m.
+    pub position_x: i32,
+    /// `positionY-r17`, same encoding.
+    pub position_y: i32,
+    /// `positionZ-r17`, same encoding.
+    pub position_z: i32,
+    /// `velocityVX-r17`, `INTEGER (-131072..131071)`, step 0.06 m/s.
+    pub velocity_vx: i32,
+    /// `velocityVY-r17`, same encoding.
+    pub velocity_vy: i32,
+    /// `velocityVZ-r17`, same encoding.
+    pub velocity_vz: i32,
+}
+
+impl EphemerisStateVector {
+    /// The ECEF position in metres, `[x, y, z]`.
+    pub fn position_m(&self) -> [f64; 3] {
+        [
+            f64::from(self.position_x) * EPHEMERIS_POSITION_STEP_M,
+            f64::from(self.position_y) * EPHEMERIS_POSITION_STEP_M,
+            f64::from(self.position_z) * EPHEMERIS_POSITION_STEP_M,
+        ]
+    }
+
+    /// The ECEF velocity in m/s, `[vx, vy, vz]`.
+    pub fn velocity_m_s(&self) -> [f64; 3] {
+        [
+            f64::from(self.velocity_vx) * EPHEMERIS_VELOCITY_STEP_M_S,
+            f64::from(self.velocity_vy) * EPHEMERIS_VELOCITY_STEP_M_S,
+            f64::from(self.velocity_vz) * EPHEMERIS_VELOCITY_STEP_M_S,
+        ]
+    }
+
+    /// Whether every component fits its ASN.1 range, so the value is encodable.
+    ///
+    /// Checked rather than clamped: a clamped ephemeris describes a satellite that
+    /// is not there, and the UE would then pre-compensate for the wrong orbit with
+    /// nothing in the log to say the configuration was out of range.
+    pub fn is_encodable(&self) -> bool {
+        let pos_ok = |v: i32| (POSITION_STATE_VECTOR_MIN..=POSITION_STATE_VECTOR_MAX).contains(&v);
+        let vel_ok = |v: i32| (VELOCITY_STATE_VECTOR_MIN..=VELOCITY_STATE_VECTOR_MAX).contains(&v);
+        pos_ok(self.position_x)
+            && pos_ok(self.position_y)
+            && pos_ok(self.position_z)
+            && vel_ok(self.velocity_vx)
+            && vel_ok(self.velocity_vy)
+            && vel_ok(self.velocity_vz)
+    }
+
+    /// Builds a state vector from ECEF metres and m/s, rounding to the spec steps.
+    ///
+    /// Returns `None` when the result would not fit the ASN.1 range -- see
+    /// [`Self::is_encodable`].
+    pub fn from_ecef(position_m: [f64; 3], velocity_m_s: [f64; 3]) -> Option<Self> {
+        fn quantise(v: f64, step: f64) -> Option<i32> {
+            let scaled = (v / step).round();
+            if scaled.is_finite() && scaled >= f64::from(i32::MIN) && scaled <= f64::from(i32::MAX)
+            {
+                Some(scaled as i32)
+            } else {
+                None
+            }
+        }
+        let v = Self {
+            position_x: quantise(position_m[0], EPHEMERIS_POSITION_STEP_M)?,
+            position_y: quantise(position_m[1], EPHEMERIS_POSITION_STEP_M)?,
+            position_z: quantise(position_m[2], EPHEMERIS_POSITION_STEP_M)?,
+            velocity_vx: quantise(velocity_m_s[0], EPHEMERIS_VELOCITY_STEP_M_S)?,
+            velocity_vy: quantise(velocity_m_s[1], EPHEMERIS_VELOCITY_STEP_M_S)?,
+            velocity_vz: quantise(velocity_m_s[2], EPHEMERIS_VELOCITY_STEP_M_S)?,
+        };
+        v.is_encodable().then_some(v)
+    }
+}
+
+/// The serving cell's NTN parameters as SIB19 carries them, in wire units.
+///
+/// This is the value that crosses the air interface: the gNB builds it from its
+/// configuration and encodes it into `NTN-Config-r17`
+/// (`system_information::build_sib19`), and the UE recovers it by decoding SIB19
+/// and derives its pre-compensation from it ([`Self::autonomous_ta_us`],
+/// [`Self::uplink_doppler_shift_hz`]). One type for both directions is what makes
+/// the two ends agree by construction rather than by two parallel conversions
+/// that can drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtnServingCellConfig {
+    /// `epochTime-r17.sfn-r17`: the SFN the ephemeris is referenced to.
+    pub epoch_sfn: u16,
+    /// `epochTime-r17.subFrameNR-r17` (0..9).
+    pub epoch_subframe: u8,
+    /// `ntn-UlSyncValidityDuration-r17` as its ENUMERATED index (0..15): how long
+    /// the UE may keep applying this configuration. See
+    /// [`Self::ul_sync_validity_duration_s`].
+    pub ul_sync_validity_index: u8,
+    /// `cellSpecificKoffset-r17`, `INTEGER(1..1023)`, in slots.
+    pub cell_specific_k_offset: u16,
+    /// `ta-Info-r17.ta-Common-r17`, in units of [`TA_COMMON_STEP_US`].
+    pub ta_common: u32,
+    /// `ta-Info-r17.ta-CommonDrift-r17`, in units of
+    /// [`TA_COMMON_DRIFT_STEP_US_PER_S`], when the network broadcasts one.
+    pub ta_common_drift: Option<i32>,
+    /// `ephemerisInfo-r17.positionVelocity-r17`.
+    pub ephemeris: EphemerisStateVector,
+}
+
+impl NtnServingCellConfig {
+    /// `ta-Common` converted to microseconds.
+    pub fn ta_common_us(&self) -> f64 {
+        f64::from(self.ta_common) * TA_COMMON_STEP_US
+    }
+
+    /// `ntn-UlSyncValidityDuration` in seconds, or `None` when the index is not
+    /// one the ENUMERATED defines.
+    pub fn ul_sync_validity_duration_s(&self) -> Option<u16> {
+        UL_SYNC_VALIDITY_DURATION_S
+            .get(usize::from(self.ul_sync_validity_index))
+            .copied()
+    }
+
+    /// Whether every field fits its ASN.1 range, so this configuration is
+    /// encodable into `NTN-Config-r17`.
+    pub fn is_encodable(&self) -> bool {
+        self.epoch_sfn <= 1023
+            && self.epoch_subframe <= 9
+            && usize::from(self.ul_sync_validity_index) < UL_SYNC_VALIDITY_DURATION_S.len()
+            && (CELL_SPECIFIC_K_OFFSET_MIN..=CELL_SPECIFIC_K_OFFSET_MAX)
+                .contains(&self.cell_specific_k_offset)
+            && self.ta_common <= TA_COMMON_MAX
+            && self
+                .ta_common_drift
+                .is_none_or(|d| d.abs() <= TA_COMMON_DRIFT_ABS_MAX)
+            && self.ephemeris.is_encodable()
+    }
+
+    /// The service-link slant range in metres between `ue_position_m` (ECEF) and
+    /// the satellite at epoch.
+    pub fn slant_range_m(&self, ue_position_m: [f64; 3]) -> f64 {
+        let sat = self.ephemeris.position_m();
+        let dx = sat[0] - ue_position_m[0];
+        let dy = sat[1] - ue_position_m[1];
+        let dz = sat[2] - ue_position_m[2];
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    /// The autonomous timing advance the UE shall apply, in microseconds
+    /// (TS 38.300 §16.14.2.2).
+    ///
+    /// `T_TA = 2 x (service-link one-way delay) + ta_common`: the service-link RTT
+    /// the UE derives from its own GNSS position and the broadcast ephemeris, plus
+    /// the network-signalled Common TA that covers the feeder link and any offset
+    /// the network chose to include (§16.14.2.1: "Common TA is a configured timing
+    /// offset that is equal to the RTT between the RP and the NTN payload").
+    ///
+    /// The service-link term is DOUBLED because the ephemeris gives a *one-way*
+    /// geometric range while a timing advance pre-compensates a *round trip*;
+    /// `ta_common` is already an RTT and is therefore added as it stands.
+    pub fn autonomous_ta_us(&self, ue_position_m: [f64; 3]) -> f64 {
+        let one_way_s = self.slant_range_m(ue_position_m) / SPEED_OF_LIGHT_M_S;
+        one_way_s * 2.0 * 1e6 + self.ta_common_us()
+    }
+
+    /// The range rate (m/s) of the service link at epoch: the satellite's velocity
+    /// projected onto the UE→satellite line of sight. Positive when receding.
+    pub fn range_rate_m_s(&self, ue_position_m: [f64; 3]) -> f64 {
+        let sat = self.ephemeris.position_m();
+        let vel = self.ephemeris.velocity_m_s();
+        let los = [
+            sat[0] - ue_position_m[0],
+            sat[1] - ue_position_m[1],
+            sat[2] - ue_position_m[2],
+        ];
+        let range = (los[0] * los[0] + los[1] * los[1] + los[2] * los[2]).sqrt();
+        if range == 0.0 {
+            // A UE co-located with the satellite: there is no line of sight to
+            // project the velocity onto. The geometry is degenerate rather than
+            // Doppler-free, and zero is the only answer that does not invent a
+            // direction.
+            return 0.0;
+        }
+        (los[0] * vel[0] + los[1] * vel[1] + los[2] * vel[2]) / range
+    }
+
+    /// The service-link Doppler shift in Hz the UE shall pre-compensate in its
+    /// uplink (TS 38.300 §16.14.2.2), for an uplink carrier of `carrier_freq_hz`.
+    ///
+    /// `f_d = -(range rate / c) x f_c`. This is the NEGATIVE of the shift the link
+    /// imposes, because the value is a *pre*-compensation applied to the UE's
+    /// transmitter so the signal arrives at the satellite on the nominal
+    /// frequency. A receding satellite (positive range rate) red-shifts the
+    /// uplink, so the UE must transmit HIGHER -- which is why the sign is
+    /// inverted, and a UE that applied the raw observed shift would double the
+    /// error instead of cancelling it.
+    pub fn uplink_doppler_shift_hz(&self, ue_position_m: [f64; 3], carrier_freq_hz: f64) -> f64 {
+        -(self.range_rate_m_s(ue_position_m) / SPEED_OF_LIGHT_M_S) * carrier_freq_hz
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +1068,287 @@ mod tests {
         };
         assert!(ta.validate().is_ok());
         assert_eq!(ta.total_ta_us(), 270_500);
+    }
+
+    // ========================================================================
+    // SIB19 autonomous TA and Doppler pre-compensation (issue #56)
+    // ========================================================================
+
+    /// Earth's equatorial radius, WGS84. Only used to place the test UE and
+    /// satellite at plausible ECEF coordinates.
+    const EARTH_RADIUS_M: f64 = 6_378_137.0;
+
+    /// A 600 km LEO satellite directly overhead a UE on the equator at longitude
+    /// 0, receding at 1000 m/s radially.
+    ///
+    /// Directly overhead so the slant range is exactly the altitude and the TA can
+    /// be computed by hand; radial velocity so the whole 1000 m/s projects onto the
+    /// line of sight and the Doppler can be too. A geometry where either had to be
+    /// decomposed would make a sign or axis error invisible.
+    fn overhead_leo() -> NtnServingCellConfig {
+        let altitude_m = 600_000.0;
+        NtnServingCellConfig {
+            epoch_sfn: 512,
+            epoch_subframe: 3,
+            // Index 5 == s30.
+            ul_sync_validity_index: 5,
+            cell_specific_k_offset: 478,
+            // 1 000 000 steps x 4.072e-3 us = 4072 us.
+            ta_common: 1_000_000,
+            ta_common_drift: Some(-500),
+            ephemeris: EphemerisStateVector::from_ecef(
+                [EARTH_RADIUS_M + altitude_m, 0.0, 0.0],
+                [1000.0, 0.0, 0.0],
+            )
+            .expect("an overhead LEO is within the ASN.1 ranges"),
+        }
+    }
+
+    /// The UE, on the equator at longitude 0, directly under [`overhead_leo`].
+    fn ue_under_overhead_leo() -> [f64; 3] {
+        [EARTH_RADIUS_M, 0.0, 0.0]
+    }
+
+    #[test]
+    fn the_state_vector_applies_the_spec_scale_factors() {
+        let v = EphemerisStateVector {
+            position_x: 1000,
+            position_y: -2000,
+            position_z: 3000,
+            velocity_vx: 100,
+            velocity_vy: -200,
+            velocity_vz: 300,
+        };
+        // 1.3 m and 0.06 m/s per step (TS 38.331 `EphemerisInfo`).
+        assert_eq!(v.position_m(), [1300.0, -2600.0, 3900.0]);
+        let vel = v.velocity_m_s();
+        assert!((vel[0] - 6.0).abs() < 1e-9);
+        assert!((vel[1] + 12.0).abs() < 1e-9);
+        assert!((vel[2] - 18.0).abs() < 1e-9);
+    }
+
+    /// A round trip through the quantiser must land within one step, and a value
+    /// outside the ASN.1 range must be REFUSED rather than clamped.
+    #[test]
+    fn from_ecef_quantises_within_one_step_and_refuses_the_unencodable() {
+        let position = [6_978_137.0, -1_234_567.0, 987_654.0];
+        let velocity = [-1234.5, 678.9, -42.0];
+        let v = EphemerisStateVector::from_ecef(position, velocity).expect("within range");
+        for (got, want) in v.position_m().iter().zip(position.iter()) {
+            assert!(
+                (got - want).abs() <= EPHEMERIS_POSITION_STEP_M,
+                "position {got} must be within one 1.3 m step of {want}"
+            );
+        }
+        for (got, want) in v.velocity_m_s().iter().zip(velocity.iter()) {
+            assert!(
+                (got - want).abs() <= EPHEMERIS_VELOCITY_STEP_M_S,
+                "velocity {got} must be within one 0.06 m/s step of {want}"
+            );
+        }
+
+        // `positionX` tops out at 33554431 steps == ~43 618 km. A satellite beyond
+        // that cannot be broadcast, and saying so is the point.
+        let too_far = (f64::from(POSITION_STATE_VECTOR_MAX) + 10.0) * EPHEMERIS_POSITION_STEP_M;
+        assert!(
+            EphemerisStateVector::from_ecef([too_far, 0.0, 0.0], [0.0, 0.0, 0.0]).is_none(),
+            "a position past the ASN.1 range must be refused, not clamped into a \
+             satellite that is somewhere else"
+        );
+    }
+
+    /// The headline number of criterion 3: a non-zero TA derived from the
+    /// ephemeris, checked against the hand-computed value rather than against
+    /// whatever the code produces.
+    ///
+    /// 600 km overhead: one-way 600000/299792458 s = 2001.38 us, doubled = 4002.77
+    /// us, plus ta-Common 1 000 000 x 4.072e-3 = 4072 us => 8074.77 us.
+    #[test]
+    fn the_autonomous_ta_is_the_service_link_rtt_plus_common_ta() {
+        let cfg = overhead_leo();
+        let ue = ue_under_overhead_leo();
+
+        // The satellite is directly overhead, so the slant range is the altitude
+        // (to within the 1.3 m quantisation step).
+        assert!(
+            (cfg.slant_range_m(ue) - 600_000.0).abs() <= EPHEMERIS_POSITION_STEP_M,
+            "slant range {} must be the 600 km altitude",
+            cfg.slant_range_m(ue)
+        );
+
+        let expected_service_link_rtt_us = 2.0 * 600_000.0 / SPEED_OF_LIGHT_M_S * 1e6;
+        let expected = expected_service_link_rtt_us + 4072.0;
+        let got = cfg.autonomous_ta_us(ue);
+        assert!(
+            (got - expected).abs() < 0.1,
+            "autonomous TA {got} us must be the hand-computed {expected} us \
+             (2 x 600 km one-way + ta-Common 4072 us)"
+        );
+        // And it is emphatically non-zero -- the defect this issue is about.
+        assert!(got > 8000.0, "TA {got} us must be non-zero and ~8075 us");
+
+        // ta-Common alone is NOT the answer: a UE that applied only the broadcast
+        // Common TA and skipped the ephemeris would land here, so the two must
+        // differ by the service-link RTT.
+        assert!(
+            (got - cfg.ta_common_us()) > 4000.0,
+            "the ephemeris must contribute ~4003 us on top of ta-Common; a TA equal \
+             to ta-Common means the ephemeris was never read"
+        );
+    }
+
+    /// A UE further from the satellite must advance MORE. This is what makes the TA
+    /// a function of the ephemeris rather than a constant.
+    #[test]
+    fn a_longer_slant_range_yields_a_larger_autonomous_ta() {
+        let cfg = overhead_leo();
+        let overhead = cfg.autonomous_ta_us(ue_under_overhead_leo());
+        // Same satellite, UE displaced 1000 km along Y: the slant range grows, so
+        // the TA must too.
+        let oblique = cfg.autonomous_ta_us([EARTH_RADIUS_M, 1_000_000.0, 0.0]);
+        assert!(
+            oblique > overhead,
+            "an oblique UE ({oblique} us) must advance more than one directly under \
+             the satellite ({overhead} us)"
+        );
+    }
+
+    /// `ta-Common` is in 4.072 ns units, and reading it as microseconds directly
+    /// would be wrong by a factor of ~245.
+    #[test]
+    fn ta_common_is_read_in_its_4_072_ns_granularity() {
+        let cfg = overhead_leo();
+        assert!(
+            (cfg.ta_common_us() - 4072.0).abs() < 1e-6,
+            "1 000 000 steps of 4.072e-3 us is 4072 us, not {}",
+            cfg.ta_common_us()
+        );
+    }
+
+    /// The Doppler pre-compensation must oppose the observed shift, or the UE
+    /// doubles the error instead of cancelling it.
+    #[test]
+    fn the_uplink_doppler_precompensation_opposes_the_range_rate() {
+        let cfg = overhead_leo();
+        let ue = ue_under_overhead_leo();
+        let carrier_hz = 2e9;
+
+        // Receding at 1000 m/s straight up: the whole velocity is along the line of
+        // sight.
+        let rate = cfg.range_rate_m_s(ue);
+        assert!(
+            (rate - 1000.0).abs() < 1.0,
+            "range rate {rate} m/s must be the full 1000 m/s radial velocity"
+        );
+
+        // f_d = -(1000 / c) * 2e9 = -6671 Hz.
+        let expected = -(1000.0 / SPEED_OF_LIGHT_M_S) * carrier_hz;
+        let got = cfg.uplink_doppler_shift_hz(ue, carrier_hz);
+        assert!(
+            (got - expected).abs() < 1.0,
+            "uplink Doppler pre-compensation {got} Hz must be the hand-computed \
+             {expected} Hz"
+        );
+        assert!(
+            got < 0.0,
+            "a RECEDING satellite red-shifts the uplink, so the pre-compensation \
+             must be negative-signed relative to the range rate; {got} Hz has the \
+             wrong sign and would double the error"
+        );
+
+        // An APPROACHING satellite must flip the sign.
+        let approaching = NtnServingCellConfig {
+            ephemeris: EphemerisStateVector {
+                velocity_vx: -cfg.ephemeris.velocity_vx,
+                ..cfg.ephemeris
+            },
+            ..cfg
+        };
+        assert!(
+            approaching.uplink_doppler_shift_hz(ue, carrier_hz) > 0.0,
+            "an approaching satellite blue-shifts the uplink, so the \
+             pre-compensation must be positive"
+        );
+    }
+
+    /// The validity ENUMERATED is not uniform past index 11, so a computed
+    /// `5 * (i + 1)` would be wrong for the last four values.
+    #[test]
+    fn the_ul_sync_validity_duration_table_matches_the_enumerated() {
+        let cfg = overhead_leo();
+        assert_eq!(
+            cfg.ul_sync_validity_duration_s(),
+            Some(30),
+            "index 5 is s30"
+        );
+        assert_eq!(UL_SYNC_VALIDITY_DURATION_S[11], 60, "index 11 is s60");
+        assert_eq!(
+            UL_SYNC_VALIDITY_DURATION_S[12], 120,
+            "index 12 jumps to s120, not s65"
+        );
+        assert_eq!(UL_SYNC_VALIDITY_DURATION_S[15], 900, "index 15 is s900");
+        let out_of_range = NtnServingCellConfig {
+            ul_sync_validity_index: 16,
+            ..cfg
+        };
+        assert_eq!(
+            out_of_range.ul_sync_validity_duration_s(),
+            None,
+            "an index the ENUMERATED does not define must not be invented"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_field_makes_the_config_unencodable() {
+        let cfg = overhead_leo();
+        assert!(cfg.is_encodable());
+        assert!(
+            !NtnServingCellConfig {
+                ta_common: TA_COMMON_MAX + 1,
+                ..cfg
+            }
+            .is_encodable(),
+            "ta-Common past INTEGER(0..66485757) is not encodable"
+        );
+        assert!(
+            !NtnServingCellConfig {
+                cell_specific_k_offset: 0,
+                ..cfg
+            }
+            .is_encodable(),
+            "cellSpecificKoffset is INTEGER(1..1023): 0 is not a value"
+        );
+        assert!(
+            !NtnServingCellConfig {
+                epoch_subframe: 10,
+                ..cfg
+            }
+            .is_encodable(),
+            "subFrameNR is INTEGER(0..9)"
+        );
+        assert!(
+            !NtnServingCellConfig {
+                ta_common_drift: Some(TA_COMMON_DRIFT_ABS_MAX + 1),
+                ..cfg
+            }
+            .is_encodable(),
+            "ta-CommonDrift is INTEGER(-257303..257303)"
+        );
+    }
+
+    /// A degenerate geometry must not produce a NaN that then propagates into a
+    /// transmit timing.
+    #[test]
+    fn a_co_located_ue_and_satellite_yield_zero_range_rate_rather_than_nan() {
+        let cfg = overhead_leo();
+        let at_the_satellite = cfg.ephemeris.position_m();
+        let rate = cfg.range_rate_m_s(at_the_satellite);
+        assert_eq!(
+            rate, 0.0,
+            "a zero line of sight has no direction to project onto"
+        );
+        assert!(cfg
+            .uplink_doppler_shift_hz(at_the_satellite, 2e9)
+            .is_finite());
     }
 }

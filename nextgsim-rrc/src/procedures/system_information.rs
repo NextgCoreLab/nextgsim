@@ -8,6 +8,11 @@
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
+// SIB19's payload types (issue #56). Defined in `ntn_timing` rather than here
+// because the UE's timing-advance and Doppler maths runs on them: one type
+// carries the ephemeris from the gNB's configuration, through UPER, to the
+// pre-compensation the UE applies, so the two ends cannot disagree about units.
+use super::ntn_timing::{EphemerisStateVector, NtnServingCellConfig};
 use bitvec::prelude::*;
 use thiserror::Error;
 
@@ -1185,6 +1190,13 @@ pub struct SystemInformationParams {
     pub sib3: Option<Sib3Params>,
     /// SIB4, when broadcast
     pub sib4: Option<Sib4Params>,
+    /// SIB19, when this is an NTN cell (issue #56).
+    ///
+    /// `None` on a terrestrial cell: TS 38.300 §16.4 makes SIB19 the carrier of
+    /// the *serving-cell NTN configuration*, so a TN cell has nothing to put in
+    /// one and broadcasting an empty SIB19 would advertise a satellite that is
+    /// not there.
+    pub sib19: Option<Sib19Params>,
 }
 
 /// Parsed `SystemInformation` contents.
@@ -1200,6 +1212,11 @@ pub struct SystemInformationData {
     pub sib3: Option<Sib3Data>,
     /// SIB4, when this message carried one
     pub sib4: Option<Sib4Data>,
+    /// SIB19, when this message carried one (issue #56).
+    ///
+    /// This is the field the UE's uplink pre-compensation is derived from: it
+    /// carries the ephemeris and Common TA of TS 38.300 §16.14.2.2.
+    pub sib19: Option<Sib19Data>,
 }
 
 impl SystemInformationData {
@@ -1209,8 +1226,48 @@ impl SystemInformationData {
     /// yields an empty value; a caller that treated that as a parse failure
     /// would log an error for a perfectly legal message.
     pub fn is_empty(&self) -> bool {
-        self.sib2.is_none() && self.sib3.is_none() && self.sib4.is_none()
+        self.sib2.is_none() && self.sib3.is_none() && self.sib4.is_none() && self.sib19.is_none()
     }
+}
+
+/// Parameters for the SIB19 an NTN cell broadcasts (TS 38.331 `SIB19-r17`,
+/// issue #56).
+///
+/// # Why this wraps [`NtnServingCellConfig`] rather than restating its fields
+///
+/// `NtnServingCellConfig` is the value the UE derives its timing advance and
+/// Doppler pre-compensation from, in the wire units `NTN-Config-r17` carries. The
+/// gNB builds one, this encodes it, the UE decodes it back into the same type and
+/// computes from it. A parallel set of fields here would be a second copy of the
+/// ephemeris that could disagree with the one the maths runs on, which is exactly
+/// the class of defect issue #56 was filed about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sib19Params {
+    /// The serving cell's `ntn-Config-r17`.
+    pub ntn_config: NtnServingCellConfig,
+    /// `t-Service-r17`, `INTEGER (0..549755813887)`: when this quasi-earth-fixed
+    /// cell stops serving its area, as a UTC-derived value. `None` for an
+    /// earth-fixed cell, which does not stop.
+    pub t_service: Option<u64>,
+    /// `distanceThresh-r17`, `INTEGER(0..65525)` in metres: how far the UE may
+    /// move from `referenceLocation` before the cell is no longer suitable.
+    /// `None` when the cell imposes no such limit.
+    pub distance_thresh: Option<u16>,
+}
+
+/// Parsed SIB19 contents (issue #56).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sib19Data {
+    /// The serving cell's `ntn-Config-r17`, when the SIB carried one.
+    ///
+    /// `OPTIONAL -- Need R` in the schema, and genuinely absent in a SIB19 that
+    /// carries only neighbour-cell configurations. A UE that treated absence as
+    /// zero would pre-compensate for a satellite at the centre of the Earth.
+    pub ntn_config: Option<NtnServingCellConfig>,
+    /// `t-Service-r17`, when broadcast.
+    pub t_service: Option<u64>,
+    /// `distanceThresh-r17` in metres, when broadcast.
+    pub distance_thresh: Option<u16>,
 }
 
 /// Build a `SystemInformation` message carrying the requested SIBs.
@@ -1232,6 +1289,16 @@ pub fn build_system_information(
     if let Some(sib4) = params.sib4.as_ref() {
         entries.push(SystemInformation_IEsSib_TypeAndInfo_Entry::Sib4(
             build_sib4(sib4)?,
+        ));
+    }
+    // SIB19 (issue #56). `sib19-v1700` is past the `sib-TypeAndInfo` CHOICE's
+    // extension marker, so this entry exercises the extended-CHOICE UPER *encode*
+    // path that issue #117 added to the vendored codec -- before that fork it
+    // returned `EncodeNotSupported` and a conformant SIB19 could not go on the
+    // wire at all.
+    if let Some(sib19) = params.sib19.as_ref() {
+        entries.push(SystemInformation_IEsSib_TypeAndInfo_Entry::Sib19_v1700(
+            build_sib19(sib19)?,
         ));
     }
 
@@ -1405,6 +1472,163 @@ fn build_sib4(params: &Sib4Params) -> Result<SIB4, SystemInformationError> {
     })
 }
 
+/// `t-Service-r17` is `INTEGER (0..549755813887)` (TS 38.331 `SIB19-r17`).
+const T_SERVICE_MAX: u64 = 549_755_813_887;
+
+/// `distanceThresh-r17` is `INTEGER(0..65525)` — note 65525, not 65535
+/// (TS 38.331 `SIB19-r17`).
+const DISTANCE_THRESH_MAX: u16 = 65_525;
+
+/// Builds the `SIB19-r17` an NTN cell broadcasts (TS 38.300 §16.4, §16.14.2.2;
+/// TS 38.331 `SIB19-r17`, issue #56).
+///
+/// This is the message the UE's autonomous timing advance and Doppler
+/// pre-compensation are derived from: §16.14.2.2 requires the network to
+/// "broadcast valid ephemeris information and Common TA parameters" for the
+/// serving cell, and this is the IE §16.4 designates as their carrier.
+///
+/// # What is populated and what is omitted
+///
+/// `ntn-Config-r17` carries the three things the UE cannot compute for itself —
+/// `ephemerisInfo` (the satellite state vector), `ta-Info` (the Common TA, the
+/// feeder-link half of the RTT) and `epochTime` with
+/// `ntn-UlSyncValidityDuration` (what instant the ephemeris is referenced to and
+/// how long it may be trusted), plus `cellSpecificKoffset` from §16.14.2.1.
+///
+/// `ntn-NeighCellConfigList` is omitted: this simulator models one serving NTN
+/// cell, and a neighbour list naming ephemerides for cells that do not exist
+/// would be a broadcast claim with nothing behind it. `kmac`, the polarisation
+/// fields and `ta-Report` are omitted for the same reason — there is no MAC-CE
+/// timing, no antenna model and no TA reporting procedure here for them to
+/// govern, and a Need-R field absent means "the UE applies no such
+/// configuration", which is the truth.
+///
+/// `referenceLocation-r17` is omitted alongside `distanceThresh`, because
+/// `ReferenceLocation-r17` is a raw `OCTET STRING` in the schema whose contents
+/// are a TS 37.355 Ellipsoid-Point encoding; emitting one would mean hand-rolling
+/// those bytes, which is precisely what issue #107 exists to remove.
+fn build_sib19(params: &Sib19Params) -> Result<SIB19_r17, SystemInformationError> {
+    let cfg = &params.ntn_config;
+    if !cfg.is_encodable() {
+        return Err(SystemInformationError::InvalidFieldValue(format!(
+            "NTN serving-cell configuration is outside the NTN-Config-r17 ASN.1 \
+             ranges and cannot be broadcast: {cfg:?}"
+        )));
+    }
+    if let Some(t_service) = params.t_service {
+        if t_service > T_SERVICE_MAX {
+            return Err(SystemInformationError::InvalidFieldValue(format!(
+                "t-Service {t_service} exceeds the ASN.1 maximum {T_SERVICE_MAX}"
+            )));
+        }
+    }
+    if let Some(thresh) = params.distance_thresh {
+        if thresh > DISTANCE_THRESH_MAX {
+            return Err(SystemInformationError::InvalidFieldValue(format!(
+                "distanceThresh {thresh} exceeds the ASN.1 maximum {DISTANCE_THRESH_MAX}"
+            )));
+        }
+    }
+
+    let ntn_config = NTN_Config_r17 {
+        epoch_time_r17: Some(EpochTime_r17 {
+            sfn_r17: EpochTime_r17Sfn_r17(cfg.epoch_sfn),
+            sub_frame_nr_r17: EpochTime_r17SubFrameNR_r17(cfg.epoch_subframe),
+        }),
+        ntn_ul_sync_validity_duration_r17: Some(NTN_Config_r17Ntn_UlSyncValidityDuration_r17(
+            cfg.ul_sync_validity_index,
+        )),
+        cell_specific_koffset_r17: Some(NTN_Config_r17CellSpecificKoffset_r17(
+            cfg.cell_specific_k_offset,
+        )),
+        // See the doc comment: no MAC-CE timing model here for `kmac` to delay.
+        kmac_r17: None,
+        ta_info_r17: Some(TA_Info_r17 {
+            ta_common_r17: TA_Info_r17Ta_Common_r17(cfg.ta_common),
+            ta_common_drift_r17: cfg.ta_common_drift.map(TA_Info_r17Ta_CommonDrift_r17),
+            // Drift VARIANCE, which bounds the drift's own rate of change. Omitted
+            // because nothing here models a second derivative of the range.
+            ta_common_drift_variant_r17: None,
+        }),
+        ntn_polarization_dl_r17: None,
+        ntn_polarization_ul_r17: None,
+        // The `positionVelocity` arm rather than `orbital`: the UE needs the
+        // satellite's state at epoch, and the state vector gives it directly. The
+        // Keplerian arm would need an orbit propagator on the UE side to be usable
+        // at all, and this simulator has none.
+        ephemeris_info_r17: Some(EphemerisInfo_r17::PositionVelocity_r17(
+            PositionVelocity_r17 {
+                position_x_r17: PositionStateVector_r17(cfg.ephemeris.position_x),
+                position_y_r17: PositionStateVector_r17(cfg.ephemeris.position_y),
+                position_z_r17: PositionStateVector_r17(cfg.ephemeris.position_z),
+                velocity_vx_r17: VelocityStateVector_r17(cfg.ephemeris.velocity_vx),
+                velocity_vy_r17: VelocityStateVector_r17(cfg.ephemeris.velocity_vy),
+                velocity_vz_r17: VelocityStateVector_r17(cfg.ephemeris.velocity_vz),
+            },
+        )),
+        ta_report_r17: None,
+    };
+
+    Ok(SIB19_r17 {
+        ntn_config_r17: Some(ntn_config),
+        t_service_r17: params.t_service.map(SIB19_r17T_Service_r17),
+        // Omitted with `distanceThresh`'s companion: see the doc comment above.
+        reference_location_r17: None,
+        distance_thresh_r17: params.distance_thresh.map(SIB19_r17DistanceThresh_r17),
+        ntn_neigh_cell_config_list_r17: None,
+        late_non_critical_extension: None,
+    })
+}
+
+/// Reads a `SIB19-r17` back into the value the UE pre-compensates from
+/// (issue #56).
+///
+/// `ntn-Config-r17` is `OPTIONAL`, and within it so is every field this needs. An
+/// absent `ephemerisInfo`, `ta-Info` or `epochTime` yields `ntn_config: None`
+/// rather than a default-filled configuration: a UE that substituted zeros would
+/// pre-compensate for a satellite at the centre of the Earth and transmit with a
+/// timing advance of roughly the Common TA alone, which is a wrong answer rather
+/// than a missing one.
+///
+/// The `orbital` ephemeris arm is likewise treated as "not usable here" rather
+/// than approximated — see [`build_sib19`] for why the state-vector arm is the
+/// one this codec models.
+fn parse_sib19(sib19: &SIB19_r17) -> Sib19Data {
+    let ntn_config = sib19.ntn_config_r17.as_ref().and_then(|c| {
+        let epoch = c.epoch_time_r17.as_ref()?;
+        let validity = c.ntn_ul_sync_validity_duration_r17.as_ref()?;
+        let k_offset = c.cell_specific_koffset_r17.as_ref()?;
+        let ta_info = c.ta_info_r17.as_ref()?;
+        let EphemerisInfo_r17::PositionVelocity_r17(pv) = c.ephemeris_info_r17.as_ref()? else {
+            // The `orbital` arm decoded fine; this codec just cannot derive a
+            // range from Keplerian elements without a propagator. Reported as
+            // absent, not as zero.
+            return None;
+        };
+        Some(NtnServingCellConfig {
+            epoch_sfn: epoch.sfn_r17.0,
+            epoch_subframe: epoch.sub_frame_nr_r17.0,
+            ul_sync_validity_index: validity.0,
+            cell_specific_k_offset: k_offset.0,
+            ta_common: ta_info.ta_common_r17.0,
+            ta_common_drift: ta_info.ta_common_drift_r17.as_ref().map(|d| d.0),
+            ephemeris: EphemerisStateVector {
+                position_x: pv.position_x_r17.0,
+                position_y: pv.position_y_r17.0,
+                position_z: pv.position_z_r17.0,
+                velocity_vx: pv.velocity_vx_r17.0,
+                velocity_vy: pv.velocity_vy_r17.0,
+                velocity_vz: pv.velocity_vz_r17.0,
+            },
+        })
+    });
+    Sib19Data {
+        ntn_config,
+        t_service: sib19.t_service_r17.as_ref().map(|t| t.0),
+        distance_thresh: sib19.distance_thresh_r17.as_ref().map(|d| d.0),
+    }
+}
+
 /// Parse a `SystemInformation` message, extracting the SIBs this codec models.
 ///
 /// SIB5..SIB9 entries are skipped rather than refused: they are legal in the
@@ -1441,6 +1665,9 @@ pub fn parse_system_information(
             }
             SystemInformation_IEsSib_TypeAndInfo_Entry::Sib4(sib4) => {
                 data.sib4 = Some(parse_sib4(sib4)?);
+            }
+            SystemInformation_IEsSib_TypeAndInfo_Entry::Sib19_v1700(sib19) => {
+                data.sib19 = Some(parse_sib19(sib19));
             }
             _ => {}
         }
@@ -1900,6 +2127,7 @@ mod tests {
             sib2: Some(test_sib2_params()),
             sib3: None,
             sib4: None,
+            sib19: None,
         };
         let bytes = encode_system_information(&params).expect("SIB2 encodes");
         let decoded = decode_system_information(&bytes).expect("SIB2 decodes");
@@ -1940,6 +2168,7 @@ mod tests {
                 ],
             }),
             sib4: None,
+            sib19: None,
         };
         let bytes = encode_system_information(&params).expect("SIB3 encodes");
         let decoded = decode_system_information(&bytes).expect("SIB3 decodes");
@@ -1983,6 +2212,7 @@ mod tests {
                     t_reselection_s: 2,
                 }],
             }),
+            sib19: None,
         };
         let bytes = encode_system_information(&params).expect("SIB4 encodes");
         let decoded = decode_system_information(&bytes).expect("SIB4 decodes");
@@ -2015,6 +2245,7 @@ mod tests {
                     t_reselection_s: 0,
                 }],
             }),
+            sib19: None,
         };
         let bytes = encode_system_information(&params).expect("all three encode");
         let decoded = decode_system_information(&bytes).expect("all three decode");
@@ -2033,6 +2264,7 @@ mod tests {
             sib2: Some(test_sib2_params()),
             sib3: None,
             sib4: None,
+            sib19: None,
         })
         .expect("SI builds");
         let sib1 = build_sib1(&create_test_sib1_params()).expect("SIB1 builds");
@@ -2098,6 +2330,7 @@ mod tests {
             sib2: None,
             sib3: Some(Sib3Params::default()),
             sib4: None,
+            sib19: None,
         };
         let bytes = encode_system_information(&sib3_only_empty).expect("an empty SIB3 encodes");
         let decoded = decode_system_information(&bytes).expect("decodes");
@@ -2111,6 +2344,7 @@ mod tests {
             sib2: None,
             sib3: None,
             sib4: Some(Sib4Params::default()),
+            sib19: None,
         };
         assert!(encode_system_information(&sib4_empty).is_err());
 
@@ -2128,6 +2362,7 @@ mod tests {
             sib2: Some(params.clone()),
             sib3: None,
             sib4: None,
+            sib19: None,
         })
         .is_err());
 
@@ -2137,7 +2372,263 @@ mod tests {
             sib2: Some(params),
             sib3: None,
             sib4: None,
+            sib19: None,
         })
         .is_err());
+    }
+
+    // ========================================================================
+    // SIB19 — the NTN serving-cell broadcast (issue #56)
+    // ========================================================================
+
+    /// A 600 km LEO satellite overhead a UE on the equator, receding radially.
+    ///
+    /// The same geometry `ntn_timing`'s tests use, so the TA the UE derives from
+    /// these encoded bytes is the number that module hand-computes.
+    fn test_ntn_config() -> NtnServingCellConfig {
+        NtnServingCellConfig {
+            epoch_sfn: 512,
+            epoch_subframe: 3,
+            // s30
+            ul_sync_validity_index: 5,
+            cell_specific_k_offset: 478,
+            // 1 000 000 x 4.072e-3 us = 4072 us
+            ta_common: 1_000_000,
+            ta_common_drift: Some(-500),
+            ephemeris: EphemerisStateVector::from_ecef(
+                [6_378_137.0 + 600_000.0, 0.0, 0.0],
+                [1000.0, 0.0, 0.0],
+            )
+            .expect("within the ASN.1 ranges"),
+        }
+    }
+
+    fn test_sib19_params() -> Sib19Params {
+        Sib19Params {
+            ntn_config: test_ntn_config(),
+            t_service: Some(123_456_789),
+            distance_thresh: Some(50_000),
+        }
+    }
+
+    /// The load-bearing test for criterion 1: a conformant SIB19 goes through
+    /// real UPER and comes back with every NTN field intact.
+    ///
+    /// `sib19-v1700` sits past the `sib-TypeAndInfo` extension marker, so this is
+    /// also the guard on the extended-CHOICE *encode* path issue #117 added to the
+    /// vendored codec. Before that fork this assertion could not be written at all:
+    /// `encode_choice_idx_common` returned `EncodeNotSupported`.
+    #[test]
+    fn the_broadcast_sib19_carries_the_ephemeris_and_common_ta_through_real_uper() {
+        let params = SystemInformationParams {
+            sib19: Some(test_sib19_params()),
+            ..Default::default()
+        };
+        let bytes = encode_system_information(&params).expect("SIB19 encodes");
+        let decoded = decode_system_information(&bytes).expect("SIB19 decodes");
+
+        let sib19 = decoded.sib19.expect("SIB19 must be present");
+        assert_eq!(sib19.t_service, Some(123_456_789));
+        assert_eq!(sib19.distance_thresh, Some(50_000));
+
+        let cfg = sib19.ntn_config.expect("ntn-Config must be present");
+        assert_eq!(
+            cfg,
+            test_ntn_config(),
+            "every NTN-Config-r17 field must survive the round trip bit-for-bit: \
+             the UE's timing advance is derived from these numbers, so a single \
+             dropped or rescaled field is a wrong pre-compensation"
+        );
+
+        // And the decoded value yields the SAME derived TA as the source did, which
+        // is what makes the broadcast usable rather than merely decodable.
+        let ue = [6_378_137.0, 0.0, 0.0];
+        assert!(
+            (cfg.autonomous_ta_us(ue) - test_ntn_config().autonomous_ta_us(ue)).abs() < 1e-9,
+            "the TA derived from the decoded config must equal the TA derived from \
+             the broadcast one"
+        );
+        assert!(
+            cfg.autonomous_ta_us(ue) > 8000.0,
+            "and it must be the non-zero ~8075 us of the 600 km geometry"
+        );
+    }
+
+    /// SIB19 rides the same message as SIB2/3/4 without displacing them: a cell
+    /// that broadcast both must have both readable.
+    #[test]
+    fn sib19_is_carried_alongside_the_reselection_sibs() {
+        let params = SystemInformationParams {
+            sib2: Some(test_sib2_params()),
+            sib3: Some(Sib3Params {
+                intra_freq_neighbours: vec![IntraFreqNeighbour {
+                    phys_cell_id: 99,
+                    q_offset_db: -3,
+                }],
+            }),
+            sib4: None,
+            sib19: Some(test_sib19_params()),
+        };
+        let decoded = decode_system_information(&encode_system_information(&params).unwrap())
+            .expect("a mixed SystemInformation decodes");
+        assert!(!decoded.is_empty());
+        assert!(decoded.sib2.is_some(), "SIB2 must survive alongside SIB19");
+        assert_eq!(
+            decoded.sib3.as_ref().expect("SIB3").intra_freq_neighbours[0].phys_cell_id,
+            99
+        );
+        assert_eq!(
+            decoded.sib19.expect("SIB19").ntn_config,
+            Some(test_ntn_config())
+        );
+    }
+
+    /// A terrestrial cell broadcasts no SIB19, and `is_empty` must not be fooled
+    /// into thinking a SIB19-only message carried nothing.
+    #[test]
+    fn a_sib19_only_message_is_not_empty_and_a_tn_cell_sends_none() {
+        let decoded = decode_system_information(
+            &encode_system_information(&SystemInformationParams {
+                sib19: Some(test_sib19_params()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !decoded.is_empty(),
+            "a SIB19-only SystemInformation carries the NTN configuration; treating \
+             it as empty would make the UE discard the ephemeris it needs"
+        );
+
+        let tn = decode_system_information(
+            &encode_system_information(&SystemInformationParams {
+                sib2: Some(test_sib2_params()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            tn.sib19.is_none(),
+            "a terrestrial cell's SystemInformation must carry no SIB19"
+        );
+    }
+
+    /// An out-of-range NTN configuration is refused at build time rather than
+    /// reaching the codec, and rather than being clamped into a satellite that is
+    /// somewhere else.
+    #[test]
+    fn an_unencodable_ntn_config_is_refused_rather_than_clamped() {
+        let bad_ta = Sib19Params {
+            ntn_config: NtnServingCellConfig {
+                ta_common: super::super::ntn_timing::TA_COMMON_MAX + 1,
+                ..test_ntn_config()
+            },
+            ..test_sib19_params()
+        };
+        assert!(
+            encode_system_information(&SystemInformationParams {
+                sib19: Some(bad_ta),
+                ..Default::default()
+            })
+            .is_err(),
+            "ta-Common past INTEGER(0..66485757) must be refused"
+        );
+
+        let bad_thresh = Sib19Params {
+            distance_thresh: Some(DISTANCE_THRESH_MAX + 1),
+            ..test_sib19_params()
+        };
+        assert!(
+            encode_system_information(&SystemInformationParams {
+                sib19: Some(bad_thresh),
+                ..Default::default()
+            })
+            .is_err(),
+            "distanceThresh is INTEGER(0..65525), not 0..65535"
+        );
+
+        let bad_t_service = Sib19Params {
+            t_service: Some(T_SERVICE_MAX + 1),
+            ..test_sib19_params()
+        };
+        assert!(encode_system_information(&SystemInformationParams {
+            sib19: Some(bad_t_service),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    /// `ntn-Config` and the fields inside it are all `OPTIONAL`. A SIB19 missing
+    /// the ephemeris must parse to `ntn_config: None` rather than to a
+    /// default-filled configuration a UE would then pre-compensate from.
+    #[test]
+    fn a_sib19_without_a_usable_ephemeris_parses_to_absent_not_to_zero() {
+        // Built at the generated-type level, because `build_sib19` cannot emit one
+        // — which is the point: this simulator never sends such a SIB19, but a peer
+        // legally may.
+        let no_ephemeris = SIB19_r17 {
+            ntn_config_r17: Some(NTN_Config_r17 {
+                epoch_time_r17: Some(EpochTime_r17 {
+                    sfn_r17: EpochTime_r17Sfn_r17(1),
+                    sub_frame_nr_r17: EpochTime_r17SubFrameNR_r17(0),
+                }),
+                ntn_ul_sync_validity_duration_r17: Some(
+                    NTN_Config_r17Ntn_UlSyncValidityDuration_r17(0),
+                ),
+                cell_specific_koffset_r17: Some(NTN_Config_r17CellSpecificKoffset_r17(1)),
+                kmac_r17: None,
+                ta_info_r17: Some(TA_Info_r17 {
+                    ta_common_r17: TA_Info_r17Ta_Common_r17(1),
+                    ta_common_drift_r17: None,
+                    ta_common_drift_variant_r17: None,
+                }),
+                ntn_polarization_dl_r17: None,
+                ntn_polarization_ul_r17: None,
+                ephemeris_info_r17: None,
+                ta_report_r17: None,
+            }),
+            t_service_r17: None,
+            reference_location_r17: None,
+            distance_thresh_r17: None,
+            ntn_neigh_cell_config_list_r17: None,
+            late_non_critical_extension: None,
+        };
+        assert!(
+            parse_sib19(&no_ephemeris).ntn_config.is_none(),
+            "a SIB19 with no ephemerisInfo must report ABSENT: a zero-filled \
+             configuration would have the UE pre-compensate for a satellite at the \
+             centre of the Earth"
+        );
+
+        // The `orbital` arm decodes but this codec cannot derive a range from it
+        // without an orbit propagator, so it is likewise reported absent.
+        let orbital = SIB19_r17 {
+            ntn_config_r17: Some(NTN_Config_r17 {
+                ephemeris_info_r17: Some(EphemerisInfo_r17::Orbital_r17(Orbital_r17 {
+                    semi_major_axis_r17: Orbital_r17SemiMajorAxis_r17(1),
+                    eccentricity_r17: Orbital_r17Eccentricity_r17(0),
+                    periapsis_r17: Orbital_r17Periapsis_r17(0),
+                    longitude_r17: Orbital_r17Longitude_r17(0),
+                    inclination_r17: Orbital_r17Inclination_r17(0),
+                    mean_anomaly_r17: Orbital_r17MeanAnomaly_r17(0),
+                })),
+                ..no_ephemeris.ntn_config_r17.clone().unwrap()
+            }),
+            ..no_ephemeris.clone()
+        };
+        assert!(
+            parse_sib19(&orbital).ntn_config.is_none(),
+            "the Keplerian arm needs an orbit propagator this codec does not have; \
+             reporting absent is honest, approximating it is not"
+        );
+
+        // And an entirely absent `ntn-Config` (a neighbour-only SIB19).
+        let neighbours_only = SIB19_r17 {
+            ntn_config_r17: None,
+            ..no_ephemeris
+        };
+        assert!(parse_sib19(&neighbours_only).ntn_config.is_none());
     }
 }

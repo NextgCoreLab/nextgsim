@@ -284,3 +284,32 @@ semantic_comm_enabled: false    # Semantic Codec - semantic communication (Rel-2
 # protected and ciphered in both directions, a PDU failing integrity is
 # discarded, and no DRB is established until activation completes.
 as_security_enabled: false
+
+# NTN (satellite) uplink pre-compensation (TS 38.300 §16.14.2.2, issue #56).
+#
+# This UE's own GNSS position in ECEF metres, [x, y, z]. §16.14.2.2 requires a UE to
+# "have valid GNSS position as well as ephemeris and Common TA before connecting to an
+# NTN cell": the position is one of the two inputs to the RTT and Doppler it must
+# pre-compensate, the other being the ephemeris the cell broadcasts in SIB19.
+#
+# Commented out, i.e. ABSENT, which means this UE has no valid GNSS position. It then
+# applies NO pre-compensation even on an NTN cell, logs that it cannot, and behaves
+# exactly as a terrestrial UE -- §16.14.2.2's own rule is that a UE without a position
+# "shall not transmit until both are regained", so inventing one would be worse than
+# having none.
+#
+# Configured rather than measured because this simulator has no GNSS receiver. ECEF
+# rather than lat/lon because that is the frame SIB19's ephemeris uses, and converting
+# between frames twice is how the two ends come to disagree about where the UE is.
+#
+# The example below is on the equator at longitude 0, directly under the satellite
+# config/gnb.yaml's commented `ntn_config` places there -- a 600 km slant range, which
+# yields an applied timing advance of about 8075 us.
+#
+# gnss_position_ecef_m: [6378137.0, 0.0, 0.0]
+#
+# The uplink carrier in Hz, which scales the Doppler pre-compensation
+# (f_d = -(range rate / c) * f_c). Defaults to 2 GHz (S-band, the range the 3GPP NTN
+# work items target). Only read when gnss_position_ecef_m is set.
+#
+# ntn_uplink_carrier_hz: 2000000000.0

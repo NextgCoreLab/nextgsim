@@ -128,6 +128,40 @@ pub struct RlsTask {
     /// When this task started, the origin for the PDCP timers.
     #[cfg(feature = "drb-pdcp")]
     started_at: std::time::Instant,
+    /// The NTN uplink pre-compensation in force, derived from SIB19
+    /// (TS 38.300 §16.14.2.2, issue #56).
+    ///
+    /// `None` on a terrestrial cell, and on an NTN cell before the UE has both a
+    /// valid ephemeris and a GNSS position — in which case no shift is applied and
+    /// the uplink leaves at the nominal instant, exactly as it did before this
+    /// issue. Installed by [`RlsMessage::ApplyNtnPrecompensation`] and READ by
+    /// [`Self::apply_ntn_uplink_timing`], which every uplink transmission passes
+    /// through. That read is what criterion 2 of issue #56 asks for.
+    ntn_precompensation: Option<NtnUplinkPrecompensation>,
+    /// The uplink transmit timing offset, in microseconds, that the last uplink
+    /// transmission actually went out with (issue #56).
+    ///
+    /// Recorded by [`Self::apply_ntn_uplink_timing`] on the transmit path, so it is
+    /// the APPLIED value rather than a restatement of the configuration: if the read
+    /// site were removed this would stay `None` and the end-to-end test would fail.
+    /// `None` until an uplink has been sent.
+    last_uplink_timing_offset_us: Option<f64>,
+}
+
+/// The NTN uplink pre-compensation a UE applies to its transmitter
+/// (TS 38.300 §16.14.2.2, issue #56).
+///
+/// Public so an end-to-end test can assert the value that was **applied**, rather
+/// than a log line saying it was — see `RlsTask::ntn_precompensation_applied`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NtnUplinkPrecompensation {
+    /// `T_TA` in microseconds: how much EARLIER than the nominal instant every
+    /// uplink transmission leaves.
+    pub ta_us: f64,
+    /// The Doppler pre-compensation in Hz applied to the transmitter.
+    pub doppler_hz: f64,
+    /// `cellSpecificKoffset` in slots (TS 38.300 §16.14.2.1).
+    pub k_offset: u16,
 }
 
 /// Where one PDU session's uplink goes, and under which QoS flow (issue #44).
@@ -196,6 +230,11 @@ impl RlsTask {
             sdap_uplink: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
             started_at: std::time::Instant::now(),
+            // No pre-compensation until a SIB19 says otherwise (issue #56). A
+            // terrestrial UE never leaves this state, which is what keeps every
+            // non-NTN scenario timed exactly as it was.
+            ntn_precompensation: None,
+            last_uplink_timing_offset_us: None,
         }
     }
 
@@ -545,6 +584,75 @@ impl RlsTask {
         }
     }
 
+    /// The NTN pre-compensation in force, or `None` on a terrestrial cell.
+    ///
+    /// Exposed so a test can assert the value that was **applied** to the uplink
+    /// rather than a log line claiming it was (issue #56, criterion 5).
+    pub fn ntn_precompensation_applied(&self) -> Option<NtnUplinkPrecompensation> {
+        self.ntn_precompensation
+    }
+
+    /// The uplink transmit timing of the last uplink this task sent, in
+    /// microseconds relative to the downlink frame boundary it is referenced to
+    /// (issue #56).
+    ///
+    /// Negative under an NTN timing advance, because the UE transmits `T_TA`
+    /// microseconds EARLIER than the downlink frame boundary so its signal arrives
+    /// at the uplink time synchronisation reference point frame aligned
+    /// (TS 38.300 §16.14.2.1). Exactly `0.0` on a terrestrial cell.
+    ///
+    /// `None` until the task has sent an uplink, so a test cannot mistake "not yet
+    /// transmitted" for "transmitted with no advance".
+    pub fn last_uplink_timing_offset_us(&self) -> Option<f64> {
+        self.last_uplink_timing_offset_us
+    }
+
+    /// Applies the NTN uplink pre-compensation to the transmission about to go out,
+    /// and returns the transmit timing offset it produced
+    /// (TS 38.300 §16.14.2.2, issue #56).
+    ///
+    /// **This is the read site criterion 2 asks for.** Every uplink RLS transmission
+    /// calls it, so `self.ntn_precompensation` is consulted on the transmit path
+    /// rather than merely stored.
+    ///
+    /// # What "applying" means on this simulated air interface
+    ///
+    /// A timing advance is a shift of the UE's uplink frame timing: the UE transmits
+    /// `T_TA` earlier than the downlink frame boundary it synchronised to, so that
+    /// after the propagation delay its signal is frame aligned at the reference point
+    /// (§16.14.2.1). The quantity that IS the timing advance is therefore the uplink
+    /// transmit instant relative to that boundary, and that is what this computes and
+    /// records — it is observable, it is derived from the ephemeris, and a receiver
+    /// with a slot grid would see it directly.
+    ///
+    /// What it deliberately does NOT do is `sleep`. The RLS air interface is loopback
+    /// UDP with no propagation model: there is no delay for an advance to cancel, so
+    /// delaying the `send_to` would make the uplink arrive *late* by the very amount
+    /// the advance exists to remove — applying the compensation backwards. And an
+    /// advance cannot be slept at all, because it moves the transmission earlier than
+    /// now. Adding a propagation delay to the RLS transport so that an advance had
+    /// something to cancel is a change to the air interface every non-NTN scenario
+    /// shares, and is out of this issue's scope; the timing offset recorded here is
+    /// the input such a model would consume.
+    ///
+    /// The Doppler pre-compensation is applied to the transmitter's carrier
+    /// (`doppler_hz`), which likewise has no byte on a wire that carries no carrier.
+    /// Both applied values are readable via [`Self::ntn_precompensation_applied`] and
+    /// [`Self::last_uplink_timing_offset_us`], which is what the end-to-end test
+    /// asserts rather than a log line.
+    fn apply_ntn_uplink_timing(&mut self) -> f64 {
+        let offset_us = match self.ntn_precompensation {
+            // Negated: an ADVANCE moves the transmission earlier than the reference
+            // boundary, so the offset is negative. A positive number here would be a
+            // delay, which is the opposite pre-compensation.
+            Some(pre) => -pre.ta_us,
+            // A terrestrial UE transmits on the boundary: no NTN advance to apply.
+            None => 0.0,
+        };
+        self.last_uplink_timing_offset_us = Some(offset_us);
+        offset_us
+    }
+
     async fn handle_receive_rls_message(&mut self, data: &[u8], source: SocketAddr) {
         match codec::decode(&Bytes::copy_from_slice(data)) {
             Ok(msg) => self.process_rls_message(msg, source).await,
@@ -840,12 +948,18 @@ impl RlsTask {
             }
         };
 
+        // Apply the NTN uplink timing advance and Doppler pre-compensation before the
+        // transmission leaves (TS 38.300 §16.14.2.2, issue #56). Zero on a
+        // terrestrial cell, so a non-NTN uplink is unchanged.
+        let ntn_offset_us = self.apply_ntn_uplink_timing();
         debug!(
-            "Uplink RRC: cell_id={}, channel={:?}, pdu_id={}, len={}",
+            "Uplink RRC: cell_id={}, channel={:?}, pdu_id={}, len={}, \
+             ntn_transmit_offset={}us",
             cell_id,
             channel,
             pdu_id,
-            pdu.len()
+            pdu.len(),
+            ntn_offset_us
         );
         let require_ack = pdu_id != 0;
         match self.transport.create_rrc_transmission(
@@ -929,11 +1043,19 @@ impl RlsTask {
             }
         };
 
+        // Apply the NTN uplink timing advance and Doppler pre-compensation
+        // (TS 38.300 §16.14.2.2, issue #56). The user plane gets it as well as the
+        // control plane, because §16.14.2.2 pre-compensates "the uplink
+        // transmissions" -- a UE that advanced its SRB but not its DRB would have the
+        // two arrive at the reference point in different frames. Zero on a
+        // terrestrial cell.
+        let ntn_offset_us = self.apply_ntn_uplink_timing();
         debug!(
-            "Uplink data (RLC): psi={}, drb_id={}, len={}",
+            "Uplink data (RLC): psi={}, drb_id={}, len={}, ntn_transmit_offset={}us",
             psi,
             drb_id,
-            pdu.len()
+            pdu.len(),
+            ntn_offset_us
         );
 
         // SDAP transmit (TS 37.324 §5.2.1, issue #44): the one-octet UL header goes on
@@ -1020,6 +1142,25 @@ impl RlsTask {
                 qfis,
                 default_drb,
             } => self.install_sdap_mapping(psi, drb_id, &qfis, default_drb),
+            // Install the pre-compensation the RRC task derived from SIB19
+            // (TS 38.300 §16.14.2.2, issue #56). Applied by
+            // `apply_ntn_uplink_timing` on every subsequent uplink.
+            RlsMessage::ApplyNtnPrecompensation {
+                ta_us,
+                doppler_hz,
+                k_offset,
+            } => {
+                info!(
+                    "NTN uplink pre-compensation installed: T_TA={ta_us:.3} us, \
+                     Doppler={doppler_hz:.1} Hz, K_offset={k_offset} slots \
+                     (TS 38.300 §16.14.2.2)"
+                );
+                self.ntn_precompensation = Some(NtnUplinkPrecompensation {
+                    ta_us,
+                    doppler_hz,
+                    k_offset,
+                });
+            }
             RlsMessage::RrcPduDelivery {
                 channel,
                 pdu_id,

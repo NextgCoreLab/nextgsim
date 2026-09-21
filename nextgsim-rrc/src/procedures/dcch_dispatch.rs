@@ -519,6 +519,7 @@ mod tests {
             full_config: false,
             master_key_update: None,
             meas_config: None,
+            ntn_config: None,
         })
         .expect("encode RRCReconfiguration");
         let resume = encode_rrc_resume(&fresh_rrc_resume_params(2, None).expect("resume params"))

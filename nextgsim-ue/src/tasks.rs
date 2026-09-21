@@ -548,17 +548,21 @@ pub enum RrcMessage {
     },
     /// Trigger cycle (internal)
     TriggerCycle,
-    /// NTN timing advance received from gNB (in RRC Setup/Reconfiguration)
-    NtnTimingAdvanceReceived {
-        /// Common timing advance in microseconds
-        common_ta_us: u64,
-        /// K-offset for HARQ timing
-        k_offset: u16,
-        /// Whether UE should compute autonomous TA from ephemeris
-        autonomous_ta: bool,
-        /// Max Doppler shift in Hz
-        max_doppler_hz: f64,
-    },
+    // `NtnTimingAdvanceReceived` was REMOVED by issue #56.
+    //
+    // It carried `{ common_ta_us, k_offset, autonomous_ta, max_doppler_hz }` to the
+    // UE's RRC task, which stored them in `self.ntn_timing` and read them back
+    // nowhere. Two things were wrong. The state was never read, so no timing advance
+    // or Doppler pre-compensation was ever applied; and the message had **no sender
+    // anywhere in the tree**, so even the write site was unreachable -- the
+    // parameters never arrived in the first place.
+    //
+    // It is not replaced by a wider sim-internal message. What a UE needs includes
+    // the satellite EPHEMERIS (TS 38.300 §16.14.2.2), and SIB19 is the IE §16.4
+    // designates to carry it. The UE now decodes SIB19 off BCCH -- and `ntn-Config`
+    // out of an RRCReconfiguration's `dedicatedSystemInformationDelivery` in
+    // connected mode -- derives its pre-compensation, and pushes the APPLIED values
+    // to the RLS task as `RlsMessage::ApplyNtnPrecompensation`.
 
     // ========================================================================
     // 6G Message Routing (Rel-20 extensions)
@@ -690,6 +694,35 @@ pub enum RlsMessage {
         /// The UE's uplink uses this DRB, because it has no per-packet classifier to
         /// choose another with. See `RlsTask::handle_data_pdu_delivery`.
         default_drb: bool,
+    },
+    /// Install the NTN uplink pre-compensation the UE derived from SIB19, from RRC
+    /// (TS 38.300 §16.14.2.2, issue #56).
+    ///
+    /// The RRC task decodes SIB19 and computes the timing advance and Doppler shift;
+    /// the *transmitter* lives in the RLS task. This message is the seam, and it is
+    /// the seam the old design lacked: the parameters used to stop at the RRC task's
+    /// `ntn_timing` field, which no uplink path ever consulted.
+    ///
+    /// # Why the APPLIED values and not the configuration
+    ///
+    /// Sending `ntn-Config` and letting the RLS task derive its own TA would put the
+    /// same computation in two places — and the recorded failure mode in this tree is
+    /// exactly that: two copies of a derivation that drift. The RRC task owns the
+    /// derivation because it owns the SIB19 decode and the UE's GNSS position; the
+    /// RLS task applies what it is given.
+    ApplyNtnPrecompensation {
+        /// `T_TA` in microseconds: how much earlier every uplink transmission leaves.
+        ///
+        /// Always non-zero in practice — it contains at minimum the service-link RTT,
+        /// and a satellite is never at zero range — which is what makes it assertable
+        /// end to end.
+        ta_us: f64,
+        /// The uplink Doppler pre-compensation in Hz, applied to the transmitter so
+        /// the signal arrives at the satellite on the nominal frequency.
+        doppler_hz: f64,
+        /// `cellSpecificKoffset` in slots (TS 38.300 §16.14.2.1), the scheduling
+        /// offset that accompanies the timing advance.
+        k_offset: u16,
     },
     /// RRC PDU delivery (from RRC)
     RrcPduDelivery {

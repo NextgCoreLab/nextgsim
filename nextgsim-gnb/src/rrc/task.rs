@@ -92,21 +92,30 @@ use super::handover::{measurement_report_from, GnbHandoverManager, HandoverDecis
 use super::meas::a3_meas_config_params;
 use super::system_info::{
     encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
-    release_cell_reselection_priorities,
+    release_cell_reselection_priorities, sib19_params,
 };
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
 use super::ue_context::{ReestablishmentSecurity, RrcUeContextManager, SuspendedIdentity};
 use nextgsim_pdcp::srb_security::SrbSecurity;
+use nextgsim_rrc::procedures::system_information::Sib19Params;
 
-/// NTN configuration stored at RRC level
-#[derive(Debug, Clone)]
-pub struct NtnRrcConfig {
-    pub satellite_type: String,
-    pub common_ta_us: u64,
-    pub k_offset: u16,
-    pub max_doppler_hz: f64,
-    pub autonomous_ta: bool,
-}
+/// The NTN configuration this cell broadcasts, held at RRC level (issue #56).
+///
+/// # Why this is the SIB19 parameters and not a bag of scalars
+///
+/// It used to be `{ satellite_type, common_ta_us, k_offset, max_doppler_hz,
+/// autonomous_ta }` — a set of numbers written once from a sim-internal message and
+/// then never read by anything, which is the defect issue #56 was filed about. The
+/// deeper problem was that the set could not have driven a conformant broadcast even
+/// if something had read it: it carried no **ephemeris**, and TS 38.300 §16.14.2.2
+/// makes the UE's autonomous timing advance a function of the ephemeris. A UE cannot
+/// derive its own slant range from a Common TA the network computed.
+///
+/// So the held state is now exactly what goes on the air: [`Sib19Params`], stamped
+/// with the `epochTime` SFN it was built at. [`RrcTask::broadcast_system_information`]
+/// reads it, and [`RrcTask::ntn_reconfiguration_params`] hands the same value to a
+/// connected UE — so the broadcast and the dedicated update cannot disagree.
+pub type NtnRrcConfig = Sib19Params;
 
 /// RRC Task for managing UE RRC connections
 pub struct RrcTask {
@@ -187,12 +196,26 @@ impl RrcTask {
         // Keyed on this cell's own identity, which is what an intra-gNB handover
         // decision compares a recommended target against. Read before `task_base` moves.
         let own_cell = (task_base.config.nci & 0xF_FFFF_FFFF) as i32;
+        // Read before `task_base` moves, same as `own_cell`.
+        let task_base_config = task_base.config.clone();
         Self {
             task_base,
             ue_manager: RrcUeContextManager::new(),
             connection_manager: RrcConnectionManager::new(),
             pdu_id_counter: 0,
-            ntn_config: None,
+            // Built from this cell's own configuration at construction, not awaited
+            // from a sim-internal message (issue #56). The NTN configuration is a
+            // property of the cell, exactly like the `reselection` block SIB2/3/4
+            // come from, so the RRC task derives it the same way SIB1 derives the
+            // PLMN. It used to arrive over `RrcMessage::NtnTimingAdvanceConfig`
+            // after NG Setup, which meant the cell could not broadcast its ephemeris
+            // until an AMF answered -- and then never did, because nothing read the
+            // stored copy.
+            //
+            // `None` on a terrestrial cell, and on an NTN cell whose configured
+            // values cannot be expressed in `NTN-Config-r17`; `sib19_params` logs
+            // which.
+            ntn_config: sib19_params(&task_base_config),
             scell_configured_ues: std::collections::HashSet::new(),
             cho_configured_ues: std::collections::HashSet::new(),
             pending_handover_arrivals: std::collections::HashSet::new(),
@@ -1855,7 +1878,12 @@ impl RrcTask {
     /// Before this the MIB and SIB1 encoders existed with no caller anywhere, so
     /// a UE never saw the cell's real PLMN, TAC or identity — it assumed them
     /// (`provide_simulated_system_info` on the UE side).
-    async fn broadcast_system_information(&mut self, with_sib1: bool) {
+    /// Public since issue #56: the SIB19 end-to-end test
+    /// (`tests/src/ntn_sib19_timing_e2e.rs`) drives the REAL broadcast to get the
+    /// real bytes, rather than re-encoding them itself. A test that built its own
+    /// SIB19 would pass whether or not `self.ntn_config` was ever read, which is the
+    /// defect the issue is about.
+    pub async fn broadcast_system_information(&mut self, with_sib1: bool) {
         match encode_cell_mib() {
             Ok(mib) => {
                 self.broadcast_rrc_message(RrcChannel::BcchBch, OctetString::from_slice(&mib))
@@ -1878,17 +1906,39 @@ impl RrcTask {
         // own cadence: TS 38.331 §5.2.1 lets a cell choose, and a UE that has
         // just read SIB1 is exactly the UE that needs the reselection parameters.
         //
-        // `None` means the operator turned the broadcast off, which is not an
-        // error -- the UE falls back to its constants and logs that it did.
-        if let Some(result) = encode_cell_system_information(&self.task_base.config) {
+        // `None` means the operator turned the broadcast off and this is not an NTN
+        // cell, which is not an error -- the UE falls back to its constants and logs
+        // that it did.
+        //
+        // SIB19 rides the same message (issue #56). `self.ntn_config` is READ here:
+        // this is the broadcast path criterion 6 requires, and TS 38.300 §16.4 makes
+        // SIB19 the carrier of the serving cell's NTN parameters. Scheduled with
+        // SIB1/SIB2 rather than on its own cadence for the same reason they are --
+        // and a UE that has just read SIB1 is exactly the UE that cannot transmit
+        // until it has the ephemeris (§16.14.2.2).
+        if let Some(result) =
+            encode_cell_system_information(&self.task_base.config, self.ntn_config)
+        {
             match result {
                 Ok(si) => {
                     self.broadcast_rrc_message(RrcChannel::BcchDlSch, OctetString::from_slice(&si))
                         .await;
                 }
-                Err(e) => error!("Failed to encode SIB2/3/4 SystemInformation: {e}"),
+                Err(e) => error!("Failed to encode SIB2/3/4/19 SystemInformation: {e}"),
             }
         }
+    }
+
+    /// The `ntn-Config` a connected UE's RRCReconfiguration should carry, or `None`
+    /// on a terrestrial cell (TS 38.300 §16.14.2.2, issue #56).
+    ///
+    /// The SAME held value the broadcast uses, so the two paths cannot hand a UE two
+    /// different ephemerides — §16.14.2.2's "In connected mode, the UE shall be able
+    /// to continuously update the Timing Advance and frequency pre-compensation" is
+    /// about refreshing the configuration, not about replacing it with a second
+    /// opinion.
+    pub fn ntn_reconfiguration_params(&self) -> Option<Sib19Params> {
+        self.ntn_config
     }
 
     /// Broadcasts an RRC PDU on a downlink common channel (PCCH paging).
@@ -2308,22 +2358,22 @@ impl Task for RrcTask {
                                 self.handle_paging(ue_paging_tmsi, tai_list_for_paging, drx_cycle_frames)
                                     .await;
                             }
-                            RrcMessage::NtnTimingAdvanceConfig {
-                                satellite_type, common_ta_us, k_offset,
-                                max_doppler_hz, autonomous_ta,
-                            } => {
-                                info!(
-                                    "RRC: NTN timing config received: type={}, TA={}us, k_offset={}, doppler={}Hz, autonomous_ta={}",
-                                    satellite_type, common_ta_us, k_offset, max_doppler_hz, autonomous_ta
-                                );
-                                self.ntn_config = Some(NtnRrcConfig {
-                                    satellite_type,
-                                    common_ta_us,
-                                    k_offset,
-                                    max_doppler_hz,
-                                    autonomous_ta,
-                                });
-                            }
+                            // `RrcMessage::NtnTimingAdvanceConfig` was RETIRED by
+                            // issue #56. It was a sim-internal channel that carried
+                            // `{ satellite_type, common_ta_us, k_offset,
+                            // max_doppler_hz, autonomous_ta }` from the NGAP task
+                            // after NG Setup, and its handler logged the values and
+                            // stored them in `self.ntn_config`, which nothing read.
+                            //
+                            // It could not have been made to work by adding a reader:
+                            // it carried no EPHEMERIS, and TS 38.300 §16.14.2.2 makes
+                            // the UE's autonomous timing advance a function of the
+                            // ephemeris. Extending the channel to carry one would
+                            // have built a private parallel to SIB19, which §16.4
+                            // already designates as the carrier. So the NTN
+                            // configuration is now derived from this cell's own
+                            // config at construction and broadcast in SIB19 --
+                            // see `RrcTask::new` and `broadcast_system_information`.
                             // 6G message routing
                             RrcMessage::SixgAiMlInference { ue_id, model_id, input_data } => {
                                 self.route_6g_ai_ml(ue_id, model_id, input_data).await;

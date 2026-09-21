@@ -610,20 +610,21 @@ pub enum RrcMessage {
         /// (issue #99).
         drx_cycle_frames: Option<u16>,
     },
-    /// NTN timing advance configuration (from NGAP, to include in RRC Setup/Reconfiguration)
-    NtnTimingAdvanceConfig {
-        /// Satellite type
-        satellite_type: String,
-        /// Common timing advance in microseconds
-        common_ta_us: u64,
-        /// K-offset for HARQ timing
-        k_offset: u16,
-        /// Max Doppler shift in Hz
-        max_doppler_hz: f64,
-        /// Whether UE should use autonomous TA calculation
-        autonomous_ta: bool,
-    },
-
+    // `NtnTimingAdvanceConfig` was REMOVED by issue #56.
+    //
+    // It carried `{ satellite_type, common_ta_us, k_offset, max_doppler_hz,
+    // autonomous_ta }` from the NGAP task to the RRC task after NG Setup, where the
+    // handler logged them and stored them in `RrcTask::ntn_config` -- which nothing
+    // ever read, so no timing advance or Doppler pre-compensation was applied at
+    // either end.
+    //
+    // It is not replaced by a wider sim-internal message. The NTN configuration is a
+    // property of the cell, not something an AMF answer delivers, so the RRC task now
+    // derives it from `GnbConfig::ntn_config` at construction and puts it on the air
+    // in SIB19 -- which TS 38.300 §16.4 designates as its carrier, and which is the
+    // only way the EPHEMERIS reaches the UE at all. Without an ephemeris the UE cannot
+    // perform the §16.14.2.2 pre-compensation no matter how many scalars it is told.
+    //
     // ========================================================================
     // 6G Message Routing (Rel-20 extensions)
     // ========================================================================

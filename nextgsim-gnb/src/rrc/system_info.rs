@@ -15,16 +15,21 @@
 
 use nextgsim_common::config::GnbConfig;
 use nextgsim_common::frame_clock;
+use nextgsim_rrc::procedures::ntn_timing::{
+    EphemerisStateVector, NtnServingCellConfig, CELL_SPECIFIC_K_OFFSET_MAX,
+    CELL_SPECIFIC_K_OFFSET_MIN, TA_COMMON_MAX, TA_COMMON_STEP_US, UL_SYNC_VALIDITY_DURATION_S,
+};
 use nextgsim_rrc::procedures::rrc_release::{
     CellReselectionPrioritiesParams, FreqPriorityNrParams,
 };
 use nextgsim_rrc::procedures::system_information::{
     encode_mib, encode_sib1, encode_system_information, CellBarredStatus, CellSelectionInfo,
     DmrsTypeAPosition, InterFreqCarrier, IntraFreqNeighbour, IntraFreqReselection, MibParams,
-    PdcchConfigSib1Params, PlmnIdentity, PlmnIdentityInfo, Sib1Params, Sib2Params, Sib3Params,
-    Sib4Params, SubCarrierSpacingCommon, SystemInformationError, SystemInformationParams,
-    UeTimersAndConstantsParams,
+    PdcchConfigSib1Params, PlmnIdentity, PlmnIdentityInfo, Sib19Params, Sib1Params, Sib2Params,
+    Sib3Params, Sib4Params, SubCarrierSpacingCommon, SystemInformationError,
+    SystemInformationParams, UeTimersAndConstantsParams,
 };
+use tracing::warn;
 
 /// CORESET#0 index broadcast in the MIB's `pdcch-ConfigSIB1`.
 ///
@@ -180,13 +185,151 @@ fn mnc_digits(mnc: u16, long_mnc: bool) -> Vec<u8> {
 /// SIB4 is omitted rather than emptied when no other carrier is configured:
 /// `interFreqCarrierFreqList` is `SIZE (1..maxFreq)`, so a zero-length list is
 /// not encodable.
-pub fn system_information_params(config: &GnbConfig) -> Option<SystemInformationParams> {
-    let r = &config.reselection;
-    if !r.broadcast {
+/// Builds the `SIB19-r17` parameters this cell broadcasts, or `None` when it is
+/// not an NTN cell (issue #56).
+///
+/// TS 38.300 §16.4: "SIB19 contains NTN-specific parameters for serving cell."
+/// This is the function that turns the operator's `ntn_config` YAML block into the
+/// ephemeris and Common TA the UE derives its uplink pre-compensation from — the
+/// block used to reach the gNB's RRC task, be logged, be stored in
+/// `self.ntn_config`, and never be read (issue #56's stored-then-never-read half).
+///
+/// Returns `None` for a terrestrial cell (no `ntn_config` block), and `None` with a
+/// warning for an NTN block whose values cannot be expressed in `NTN-Config-r17` —
+/// the cell then broadcasts no SIB19 rather than a SIB19 describing a satellite
+/// somewhere other than where it was configured. Silence is recoverable; a wrong
+/// ephemeris is applied.
+///
+/// # epochTime
+///
+/// Set to the live SFN, because TS 38.331 `EpochTime` requires "the current SFN or
+/// the next upcoming SFN after the frame where the message indicating the epochTime
+/// is received". `nextgsim_common::frame_clock` is the same clock the MIB's SFN
+/// comes from, so the UE and the gNB agree on it without a synchronisation message.
+pub fn sib19_params(config: &GnbConfig) -> Option<Sib19Params> {
+    let ntn = config.ntn_config.as_ref()?;
+
+    let ephemeris =
+        match EphemerisStateVector::from_ecef(ntn.ephemeris.position_m, ntn.ephemeris.velocity_m_s)
+        {
+            Some(e) => e,
+            None => {
+                warn!(
+                    "NTN ephemeris position {:?} m / velocity {:?} m/s is outside the \
+                 EphemerisInfo-r17 ASN.1 ranges (position +-43618 km at 1.3 m steps, \
+                 velocity +-7864 m/s at 0.06 m/s steps). No SIB19 will be broadcast: \
+                 a clamped ephemeris would have every UE pre-compensate for a \
+                 satellite that is not there.",
+                    ntn.ephemeris.position_m, ntn.ephemeris.velocity_m_s
+                );
+                return None;
+            }
+        };
+
+    // `ntn-UlSyncValidityDuration` is an ENUMERATED, not a number of seconds: a
+    // value the set does not contain has no encoding, and rounding to the nearest
+    // one would advertise a validity the operator did not choose.
+    let Some(ul_sync_validity_index) = UL_SYNC_VALIDITY_DURATION_S
+        .iter()
+        .position(|s| *s == ntn.ul_sync_validity_s)
+    else {
+        warn!(
+            "ntn_config.ul_sync_validity_s = {} s is not one of the values \
+             ntn-UlSyncValidityDuration enumerates ({:?}). No SIB19 will be \
+             broadcast.",
+            ntn.ul_sync_validity_s, UL_SYNC_VALIDITY_DURATION_S
+        );
+        return None;
+    };
+
+    // `common_ta_us` is configured in microseconds; `ta-Common` is in 4.072 ns
+    // steps. Getting this conversion wrong by the factor of ~245 between them is
+    // the single most consequential mistake available here, which is why it is one
+    // expression against the named constant rather than an inline literal.
+    let ta_common_steps = (ntn.common_ta_us as f64 / TA_COMMON_STEP_US).round();
+    if !(0.0..=f64::from(TA_COMMON_MAX)).contains(&ta_common_steps) {
+        warn!(
+            "ntn_config.common_ta_us = {} us is {} steps of {} us, outside \
+             ta-Common's INTEGER(0..{}) -- i.e. beyond ~270 ms. No SIB19 will be \
+             broadcast.",
+            ntn.common_ta_us, ta_common_steps, TA_COMMON_STEP_US, TA_COMMON_MAX
+        );
         return None;
     }
 
+    // `cellSpecificKoffset` is INTEGER(1..1023). A configured 0 is not a value the
+    // IE can carry, and TS 38.300 §16.14.2.1 requires K_offset to be "larger or
+    // equal to the sum of the service link RTT and the Common TA" anyway -- zero
+    // could not be right for a satellite.
+    if !(CELL_SPECIFIC_K_OFFSET_MIN..=CELL_SPECIFIC_K_OFFSET_MAX).contains(&ntn.k_offset) {
+        warn!(
+            "ntn_config.k_offset = {} is outside cellSpecificKoffset's \
+             INTEGER({}..{}). No SIB19 will be broadcast.",
+            ntn.k_offset, CELL_SPECIFIC_K_OFFSET_MIN, CELL_SPECIFIC_K_OFFSET_MAX
+        );
+        return None;
+    }
+
+    let sfn = frame_clock::current_sfn();
+    Some(Sib19Params {
+        ntn_config: NtnServingCellConfig {
+            epoch_sfn: sfn,
+            // Subframe 0 of the epoch frame. The frame clock's granularity IS the
+            // radio frame (see its module doc: "no sub-frame or slot timing"), so
+            // any other value here would be a number with nothing behind it.
+            epoch_subframe: 0,
+            ul_sync_validity_index: ul_sync_validity_index as u8,
+            cell_specific_k_offset: ntn.k_offset,
+            ta_common: ta_common_steps as u32,
+            // Nothing here models the Common TA's rate of change -- the ephemeris is
+            // a snapshot at epoch and the satellite does not move between them -- so
+            // the drift is omitted rather than reported as a zero the UE would apply
+            // as "confirmed stationary".
+            ta_common_drift: None,
+            ephemeris,
+        },
+        // `t-Service` says when a quasi-earth-fixed cell stops serving its area.
+        // Omitted for an earth-fixed cell, which does not; and for a non-earth-fixed
+        // one this simulator has no cell-switch schedule to name an instant from, so
+        // inventing one would promise a service end that never arrives.
+        t_service: None,
+        // Omitted with `referenceLocation`, which SIB19 pairs it with: the threshold
+        // is a distance FROM the reference location, and `ReferenceLocation-r17` is
+        // a raw OCTET STRING whose contents are a TS 37.355 Ellipsoid-Point --
+        // hand-rolling those bytes is what issue #107 exists to remove. A
+        // `distanceThresh` with no reference location to measure from would be
+        // meaningless.
+        distance_thresh: None,
+    })
+}
+
+/// The SIBs this cell broadcasts in a `SystemInformation`.
+///
+/// `sib19` is the NTN configuration the RRC task is HOLDING, passed in rather than
+/// re-derived here (issue #56). Passed in for two reasons: criterion 6 requires
+/// `RrcTask::ntn_config` to be READ on the broadcast path, and SIB19's `epochTime`
+/// has to be the SFN the configuration was stamped at — a value only the holder
+/// knows, and one that must match what the connected-mode reconfiguration sends so
+/// the two paths cannot disagree.
+pub fn system_information_params(
+    config: &GnbConfig,
+    sib19: Option<Sib19Params>,
+) -> Option<SystemInformationParams> {
+    let r = &config.reselection;
+    // SIB19 is NOT gated on `reselection.broadcast` (issue #56). That switch turns
+    // off the idle-mode reselection parameters; an NTN cell whose operator turned it
+    // off still has to broadcast its ephemeris, because TS 38.300 §16.14.2.2 makes
+    // the uplink pre-compensation depend on it and a UE lacking it "shall not
+    // transmit". So a reselection-off NTN cell sends a SIB19-only SystemInformation.
+    if !r.broadcast {
+        return sib19.map(|sib19| SystemInformationParams {
+            sib19: Some(sib19),
+            ..Default::default()
+        });
+    }
+
     Some(SystemInformationParams {
+        sib19,
         sib2: Some(Sib2Params {
             q_hyst_db: r.q_hyst_db,
             t_reselection_s: r.t_reselection_s,
@@ -231,11 +374,16 @@ pub fn system_information_params(config: &GnbConfig) -> Option<SystemInformation
 }
 
 /// The encoded `SystemInformation` (`BCCH-DL-SCH-Message`) carrying this cell's
-/// SIB2/SIB3/SIB4, or `None` when the broadcast is turned off.
+/// SIB2/SIB3/SIB4 and — on an NTN cell — its SIB19, or `None` when there is nothing
+/// to broadcast.
+///
+/// `sib19` is the NTN configuration the RRC task is HOLDING — see
+/// [`system_information_params`].
 pub fn encode_cell_system_information(
     config: &GnbConfig,
+    sib19: Option<Sib19Params>,
 ) -> Option<Result<Vec<u8>, SystemInformationError>> {
-    system_information_params(config).map(|params| encode_system_information(&params))
+    system_information_params(config, sib19).map(|params| encode_system_information(&params))
 }
 
 /// The DEDICATED `cellReselectionPriorities` this cell hands a UE in RRCRelease
@@ -278,6 +426,10 @@ pub fn release_cell_reselection_priorities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The NTN config types the SIB19 tests build (issue #56). Imported here rather
+    // than at module scope because only the tests construct them -- the production
+    // `sib19_params` reads them out of a `&GnbConfig` it is handed.
+    use nextgsim_common::config::{NtnConfig, NtnEphemerisConfig};
     use nextgsim_common::Plmn;
     use nextgsim_rrc::procedures::system_information::{decode_mib, decode_sib1};
 
@@ -453,7 +605,7 @@ reselection:
             ..config()
         };
 
-        let encoded = encode_cell_system_information(&cfg)
+        let encoded = encode_cell_system_information(&cfg, None)
             .expect("the broadcast is on")
             .expect("and must encode");
         let decoded = decode_system_information(&encoded).expect("and decode");
@@ -493,7 +645,7 @@ reselection:
             ..config()
         };
         assert!(
-            encode_cell_system_information(&cfg).is_none(),
+            encode_cell_system_information(&cfg, None).is_none(),
             "an operator who turned the broadcast off must get no SI, and not an \
              encode error either"
         );
@@ -538,5 +690,235 @@ reselection:
              and advertising a validity the UE honours while the network forgets \
              makes the two disagree"
         );
+    }
+
+    // ========================================================================
+    // SIB19 / NTN serving-cell broadcast (issue #56)
+    // ========================================================================
+
+    /// The `ntn_config.ephemeris` and `ul_sync_validity_s` YAML keys must actually
+    /// be READ.
+    ///
+    /// Nothing in this config sets `deny_unknown_fields`, so a key no field claims
+    /// is silently DROPPED -- the recorded failure mode where a config block ships,
+    /// looks configured, and is inert. This asserts NON-DEFAULT values arrive,
+    /// because a test using the defaults would pass whether the keys were parsed or
+    /// ignored.
+    #[test]
+    fn the_ntn_ephemeris_config_keys_are_deserialised_rather_than_dropped() {
+        let yaml = r#"
+nci: 1
+gnb_id_length: 24
+plmn:
+  mcc: 1
+  mnc: 1
+  long_mnc: false
+tac: 7
+nssai: []
+amf_configs: []
+link_ip: 127.0.0.1
+ngap_ip: 127.0.0.1
+gtp_ip: 127.0.0.1
+gtp_advertise_ip: null
+ignore_stream_ids: false
+ntn_config:
+  satellite_type: MEO
+  satellite_id: 42
+  propagation_delay_us: 40000
+  common_ta_us: 81440
+  k_offset: 900
+  cell_center_lat: 10.0
+  cell_center_lon: 20.0
+  cell_radius_km: 1000.0
+  ul_sync_validity_s: 180
+  ephemeris:
+    position_m: [12000000.0, -3000000.0, 4000000.0]
+    velocity_m_s: [-500.0, 1200.0, 300.0]
+"#;
+        let parsed: GnbConfig = serde_yaml::from_str(yaml).expect("the sample must parse");
+        let ntn = parsed
+            .ntn_config
+            .expect("the ntn_config block must be read");
+        assert_eq!(ntn.satellite_type, "MEO");
+        assert_eq!(ntn.common_ta_us, 81440, "common_ta_us was dropped");
+        assert_eq!(ntn.k_offset, 900);
+        assert_eq!(
+            ntn.ul_sync_validity_s, 180,
+            "ul_sync_validity_s was dropped (the default is 30)"
+        );
+        assert_eq!(
+            ntn.ephemeris.position_m,
+            [12_000_000.0, -3_000_000.0, 4_000_000.0],
+            "the ephemeris position was dropped (the default is a 600 km LEO at \
+             [6978137, 0, 0]) -- a dropped ephemeris means every UE derives its \
+             timing advance for a satellite the operator did not configure"
+        );
+        assert_eq!(ntn.ephemeris.velocity_m_s, [-500.0, 1200.0, 300.0]);
+    }
+
+    /// What the cell broadcasts is what the config says, asserted by DECODING the
+    /// emitted bytes rather than by reading the params struct back.
+    #[test]
+    fn the_broadcast_sib19_carries_the_configured_ephemeris_and_common_ta() {
+        use nextgsim_rrc::procedures::system_information::decode_system_information;
+
+        // A 600 km LEO overhead a UE on the equator, receding at 1 km/s.
+        let earth_radius_m = 6_378_137.0_f64;
+        let cfg = GnbConfig {
+            ntn_config: Some(ntn_config_with(NtnEphemerisConfig {
+                position_m: [earth_radius_m + 600_000.0, 0.0, 0.0],
+                velocity_m_s: [1000.0, 0.0, 0.0],
+            })),
+            ..config()
+        };
+
+        let encoded = encode_cell_system_information(&cfg, sib19_params(&cfg))
+            .expect("an NTN cell broadcasts SI")
+            .expect("and it must encode");
+        let decoded = decode_system_information(&encoded).expect("and decode");
+        let sib19 = decoded.sib19.expect("SIB19 must be broadcast");
+        let ntn = sib19.ntn_config.expect("with an ntn-Config");
+
+        assert!(
+            (ntn.ephemeris.position_m()[0] - (earth_radius_m + 600_000.0)).abs() <= 1.3,
+            "the broadcast satellite X {} m must be the configured one, within the \
+             1.3 m wire step",
+            ntn.ephemeris.position_m()[0]
+        );
+        assert!(
+            (ntn.ta_common_us() - 4072.0).abs() < 0.01,
+            "the broadcast ta-Common {} us must be the configured 4072 us; this \
+             conversion crosses a factor of ~245, so getting it wrong is the most \
+             consequential mistake available here",
+            ntn.ta_common_us()
+        );
+        assert_eq!(ntn.cell_specific_k_offset, 478);
+        assert_eq!(ntn.ul_sync_validity_duration_s(), Some(30));
+        assert!(
+            ntn.ta_common_drift.is_none(),
+            "no drift is broadcast: nothing here models the Common TA's rate of \
+             change, and a zero would be read as 'confirmed stationary'"
+        );
+
+        // SIB2/3/4 still ride the same message: SIB19 must not displace them.
+        assert!(
+            decoded.sib2.is_some(),
+            "the reselection broadcast must survive alongside SIB19"
+        );
+    }
+
+    /// SIB19 is NOT gated on `reselection.broadcast`. An NTN cell whose operator
+    /// turned the reselection broadcast off still has to put its ephemeris on the
+    /// air, or its UEs cannot transmit at all (TS 38.300 §16.14.2.2).
+    #[test]
+    fn an_ntn_cell_broadcasts_sib19_even_with_the_reselection_broadcast_off() {
+        use nextgsim_common::config::CellReselectionBroadcastConfig;
+        use nextgsim_rrc::procedures::system_information::decode_system_information;
+
+        let cfg = GnbConfig {
+            reselection: CellReselectionBroadcastConfig {
+                broadcast: false,
+                ..Default::default()
+            },
+            ntn_config: Some(ntn_config_with(NtnEphemerisConfig::default())),
+            ..config()
+        };
+        let encoded = encode_cell_system_information(&cfg, sib19_params(&cfg))
+            .expect("an NTN cell must still broadcast SI")
+            .expect("and it must encode");
+        let decoded = decode_system_information(&encoded).expect("and decode");
+        assert!(
+            decoded.sib19.is_some(),
+            "SIB19 must go out even with reselection.broadcast = false: that switch \
+             turns off the idle-mode reselection parameters, not the NTN timing a UE \
+             needs before it may transmit"
+        );
+        assert!(
+            decoded.sib2.is_none(),
+            "and the reselection SIBs must stay off, as the operator asked"
+        );
+    }
+
+    /// A configuration outside the `NTN-Config-r17` ASN.1 ranges must suppress the
+    /// broadcast rather than emit a clamped one. A clamped ephemeris or a
+    /// mis-encoded Common TA is APPLIED by every UE in the cell; silence is not.
+    #[test]
+    fn an_unencodable_ntn_config_suppresses_sib19_rather_than_clamping_it() {
+        // A satellite beyond positionX's ~43618 km reach.
+        let too_far = GnbConfig {
+            ntn_config: Some(ntn_config_with(NtnEphemerisConfig {
+                position_m: [1.0e12, 0.0, 0.0],
+                velocity_m_s: [0.0, 0.0, 0.0],
+            })),
+            ..config()
+        };
+        assert!(
+            sib19_params(&too_far).is_none(),
+            "an ephemeris past EphemerisInfo-r17's range must yield no SIB19"
+        );
+
+        // A validity the ENUMERATED does not define.
+        let bad_validity = GnbConfig {
+            ntn_config: Some(NtnConfig {
+                ul_sync_validity_s: 7,
+                ..ntn_config_with(NtnEphemerisConfig::default())
+            }),
+            ..config()
+        };
+        assert!(
+            sib19_params(&bad_validity).is_none(),
+            "7 s is not one of ntn-UlSyncValidityDuration's values and must not be \
+             rounded to one the operator did not choose"
+        );
+
+        // A K_offset outside INTEGER(1..1023).
+        let bad_k_offset = GnbConfig {
+            ntn_config: Some(NtnConfig {
+                k_offset: 0,
+                ..ntn_config_with(NtnEphemerisConfig::default())
+            }),
+            ..config()
+        };
+        assert!(sib19_params(&bad_k_offset).is_none());
+
+        // A Common TA beyond ta-Common's ~270 ms reach.
+        let bad_ta = GnbConfig {
+            ntn_config: Some(NtnConfig {
+                common_ta_us: 1_000_000,
+                ..ntn_config_with(NtnEphemerisConfig::default())
+            }),
+            ..config()
+        };
+        assert!(
+            sib19_params(&bad_ta).is_none(),
+            "a Common TA of 1 s exceeds ta-Common's INTEGER(0..66485757) at 4.072 ns \
+             per step"
+        );
+    }
+
+    /// A terrestrial cell broadcasts no SIB19.
+    #[test]
+    fn a_cell_with_no_ntn_config_broadcasts_no_sib19() {
+        assert!(sib19_params(&config()).is_none());
+    }
+
+    /// The NTN block the SIB19 tests above configure, with a chosen ephemeris.
+    fn ntn_config_with(ephemeris: NtnEphemerisConfig) -> NtnConfig {
+        NtnConfig {
+            satellite_type: "LEO".to_string(),
+            satellite_id: 1,
+            propagation_delay_us: 2001,
+            // 4072 us == 1 000 000 steps of 4.072e-3 us.
+            common_ta_us: 4072,
+            k_offset: 478,
+            cell_center_lat: 0.0,
+            cell_center_lon: 0.0,
+            cell_radius_km: 500.0,
+            earth_fixed: true,
+            autonomous_ta: true,
+            max_doppler_hz: 50_000.0,
+            ephemeris,
+            ul_sync_validity_s: 30,
+        }
     }
 }
