@@ -14,6 +14,11 @@ use crate::procedures::meas_config::{build_a3_meas_config, A3MeasConfigParams, M
 // The connected-mode NTN update path (issue #56): `ntn-Config` reaches a
 // connected UE in a `SystemInformation` carried by
 // `dedicatedSystemInformationDelivery`. See [`RrcReconfigurationParams::ntn_config`].
+// The dedicated sidelink configuration (issue #141): `sl-ConfigDedicatedNR-r16` lives
+// in the v1610 extension. See [`RrcReconfigurationParams::sl_config`].
+use crate::procedures::sidelink_ue_information::{
+    build_sl_config_dedicated, read_sl_config_dedicated, SidelinkRrcError, SlConfigDedicatedParams,
+};
 use crate::procedures::system_information::{
     build_system_information, parse_system_information, Sib19Data, Sib19Params,
     SystemInformationError, SystemInformationParams,
@@ -57,6 +62,15 @@ pub enum RrcReconfigurationError {
     /// reconfiguration has to be able to tell the two apart.
     #[error("Invalid measConfig: {0}")]
     MeasConfig(#[from] MeasConfigError),
+
+    /// An `sl-ConfigDedicatedNR` that could not be built (issue #141).
+    ///
+    /// Its own variant for the same reason `MeasConfig` is: a gNB that mis-configured a
+    /// sidelink `t400` must still be able to send the bearer half of the
+    /// reconfiguration, and the caller can only decide that if it can tell which half
+    /// failed.
+    #[error("Invalid sl-ConfigDedicatedNR: {0}")]
+    SlConfig(#[from] SidelinkRrcError),
 }
 
 // ============================================================================
@@ -122,6 +136,18 @@ pub struct RrcReconfigurationParams {
     /// 5.2.2.4" (§5.3.5.3), i.e. the same handler the broadcast feeds, so one
     /// application path serves both.
     pub ntn_config: Option<Sib19Params>,
+    /// `sl-ConfigDedicatedNR-r16`: the dedicated sidelink configuration the network
+    /// grants (TS 38.331 §5.3.5.3, §6.3.2; issue #141).
+    ///
+    /// `None` leaves the UE's sidelink configuration alone. `Some` is a `setup`: the UE
+    /// applies it and may transmit sidelink on the configured carriers. Before issue #141
+    /// this field did not exist and the IE was never sent, so a UE running PC5 did so
+    /// with no network grant at all — the gNB was unaware sidelink was in use.
+    ///
+    /// Carried in the `v1610` extension, which is why a reconfiguration that carries only
+    /// this still has to build the whole `v1530 -> v1540 -> v1560 -> v1610` chain: the
+    /// intermediate extensions exist purely to reach it.
+    pub sl_config: Option<SlConfigDedicatedParams>,
 }
 
 /// `masterKeyUpdate` as the network sets it and the UE reads it
@@ -164,6 +190,21 @@ pub struct RrcReconfigurationData {
     /// is: the receiver CONSUMES it — it derives a timing advance from it — so
     /// handing back an octet string would only add a place to lose it.
     pub ntn_config: Option<Sib19Data>,
+    /// The decoded `sl-ConfigDedicatedNR-r16`, when the message carried a `setup`
+    /// (issue #141).
+    ///
+    /// `None` covers both "the IE was absent" and "the IE was a `release`", because the
+    /// UE's action is the same in each: it holds no granted sidelink configuration.
+    /// [`RrcReconfigurationData::sl_config_released`] distinguishes them for a caller
+    /// that needs to, and the UE's own state is what records whether it once had one.
+    pub sl_config: Option<SlConfigDedicatedParams>,
+    /// Whether the message carried an `sl-ConfigDedicatedNR-r16` **`release`**.
+    ///
+    /// Separate from `sl_config: None` because the two mean different things on the wire:
+    /// absent leaves the UE's configuration alone (TS 38.331 §5.3.5.3 acts only on IEs
+    /// present), while `release` revokes it. A UE that treated a release as an absence
+    /// would keep transmitting sidelink the network had just withdrawn.
+    pub sl_config_released: bool,
 }
 
 /// Build an RRC Reconfiguration message
@@ -206,9 +247,14 @@ pub fn build_rrc_reconfiguration(
         // is exactly the connected-mode ephemeris refresh of TS 38.300 §16.14.2.2 --
         // would otherwise have the extension omitted and the update silently
         // dropped.
+        // `sl_config` joins the condition since issue #141, for exactly the reason
+        // `ntn_config` did: it lives further down the extension chain (v1610), so a
+        // reconfiguration that carries ONLY a sidelink grant would otherwise have the
+        // whole chain omitted and the grant silently dropped.
         non_critical_extension: if params.master_cell_group.is_some()
             || params.full_config
             || params.ntn_config.is_some()
+            || params.sl_config.is_some()
         {
             Some(build_v1530_extension(params)?)
         } else {
@@ -313,8 +359,91 @@ fn build_v1530_extension(
             .transpose()?
             .map(RRCReconfiguration_v1530_IEsDedicatedSystemInformationDelivery),
         other_config: None,
-        non_critical_extension: None,
+        // The chain down to v1610, built only when something down there needs carrying
+        // (issue #141). v1540 and v1560 hold nothing this gNB sets; they exist here
+        // solely as the hops to `sl-ConfigDedicatedNR-r16`.
+        non_critical_extension: params
+            .sl_config
+            .as_ref()
+            .map(build_v1610_chain)
+            .transpose()?,
     })
+}
+
+/// Builds `v1540 -> v1560 -> v1610` to carry an `sl-ConfigDedicatedNR-r16` `setup`
+/// (TS 38.331 §6.2.2, issue #141).
+///
+/// Every field in the two intervening extensions is left absent: this gNB sets no
+/// `otherConfig-v1540`, no MR-DC secondary cell group and no `sk-Counter`, so the hops
+/// cost two optional bitmaps and nothing else.
+///
+/// A `setup` rather than an ever-`release`: `release` is reachable through
+/// [`RrcReconfigurationParams::sl_config`] being `None`, which omits the IE — and TS
+/// 38.331 §5.3.5.3 has the UE act only on IEs that are present, so omission leaves the
+/// UE's configuration alone. Revoking a grant needs the explicit `release` arm, which no
+/// caller in this tree has cause to send yet and so is not built here; the *parser*
+/// reads it, because a conformant peer may send one.
+fn build_v1610_chain(
+    sl_config: &SlConfigDedicatedParams,
+) -> Result<RRCReconfiguration_v1540_IEs, RrcReconfigurationError> {
+    let v1610 = RRCReconfiguration_v1610_IEs {
+        other_config_v1610: None,
+        bap_config_r16: None,
+        iab_ip_address_configuration_list_r16: None,
+        conditional_reconfiguration_r16: None,
+        daps_source_release_r16: None,
+        t316_r16: None,
+        need_for_gaps_config_nr_r16: None,
+        on_demand_sib_request_r16: None,
+        dedicated_pos_sys_info_delivery_r16: None,
+        sl_config_dedicated_nr_r16: Some(
+            RRCReconfiguration_v1610_IEsSl_ConfigDedicatedNR_r16::Setup(build_sl_config_dedicated(
+                sl_config,
+            )?),
+        ),
+        // The E-UTRA sidelink configuration. This is an NR-only simulator with no
+        // LTE V2X carrier, so a value here would describe a carrier that does not exist.
+        sl_config_dedicated_eutra_info_r16: None,
+        target_cell_smtc_scg_r16: None,
+        non_critical_extension: None,
+    };
+    let v1560 = RRCReconfiguration_v1560_IEs {
+        mrdc_secondary_cell_group_config: None,
+        radio_bearer_config2: None,
+        sk_counter: None,
+        non_critical_extension: Some(v1610),
+    };
+    Ok(RRCReconfiguration_v1540_IEs {
+        other_config_v1540: None,
+        non_critical_extension: Some(v1560),
+    })
+}
+
+/// Reads an `sl-ConfigDedicatedNR-r16` out of a reconfiguration's extension chain
+/// (issue #141).
+///
+/// Returns `(setup_params, was_released)`. A chain that stops short of v1610 — which is
+/// every reconfiguration this tree sent before issue #141 — yields `(None, false)`,
+/// i.e. "no sidelink IE was present", which leaves the UE's configuration alone.
+fn read_sl_config_from_chain(
+    ies: &RRCReconfiguration_IEs,
+) -> (Option<SlConfigDedicatedParams>, bool) {
+    let Some(v1610) = ies
+        .non_critical_extension
+        .as_ref()
+        .and_then(|v1530| v1530.non_critical_extension.as_ref())
+        .and_then(|v1540| v1540.non_critical_extension.as_ref())
+        .and_then(|v1560| v1560.non_critical_extension.as_ref())
+    else {
+        return (None, false);
+    };
+    match v1610.sl_config_dedicated_nr_r16.as_ref() {
+        Some(RRCReconfiguration_v1610_IEsSl_ConfigDedicatedNR_r16::Setup(config)) => {
+            (Some(read_sl_config_dedicated(config)), false)
+        }
+        Some(RRCReconfiguration_v1610_IEsSl_ConfigDedicatedNR_r16::Release(_)) => (None, true),
+        None => (None, false),
+    }
 }
 
 // ============================================================================
@@ -706,6 +835,9 @@ pub fn build_drb_reconfiguration_params(
         // here rather than inventing a default keeps a TN cell's reconfiguration
         // byte-identical to what it was.
         ntn_config: None,
+        // Likewise left to the caller (issue #141): a sidelink grant answers a UE's
+        // `SidelinkUEInformation`, which this DRB builder knows nothing about.
+        sl_config: None,
     })
 }
 
@@ -741,6 +873,8 @@ pub fn build_multi_drb_reconfiguration_params(
         // See `build_drb_reconfiguration_params`: the caller supplies the NTN
         // update, because this builder holds no cell configuration (issue #56).
         ntn_config: None,
+        // Likewise the sidelink grant (issue #141).
+        sl_config: None,
     })
 }
 
@@ -852,6 +986,12 @@ pub fn parse_rrc_reconfiguration(
             (None, false, None, None)
         };
 
+    // The dedicated sidelink configuration (issue #141). Read from the whole `ies`
+    // rather than from `ext` above, because it sits four extensions further down
+    // (v1530 -> v1540 -> v1560 -> v1610) and the walk is worth having in one named
+    // place.
+    let (sl_config, sl_config_released) = read_sl_config_from_chain(ies);
+
     Ok(RrcReconfigurationData {
         rrc_transaction_id: rrc_reconfiguration.rrc_transaction_identifier.0,
         radio_bearer_config,
@@ -865,6 +1005,10 @@ pub fn parse_rrc_reconfiguration(
         // lose it (issue #170).
         meas_config: ies.meas_config.clone(),
         ntn_config,
+        // The dedicated sidelink grant (issue #141), from four extensions further down
+        // the chain than the NTN update above.
+        sl_config,
+        sl_config_released,
     })
 }
 
@@ -1414,6 +1558,7 @@ mod tests {
             master_key_update: None,
             meas_config: None,
             ntn_config: None,
+            sl_config: None,
         }
     }
 
@@ -1469,6 +1614,7 @@ mod tests {
             master_key_update: None,
             meas_config: None,
             ntn_config: None,
+            sl_config: None,
         };
 
         let msg = build_rrc_reconfiguration(&params).unwrap();
@@ -1506,6 +1652,7 @@ mod tests {
             master_key_update: None,
             meas_config: None,
             ntn_config: None,
+            sl_config: None,
         };
 
         let result = build_rrc_reconfiguration(&params);
@@ -1802,6 +1949,7 @@ mod tests {
             master_key_update: None,
             meas_config: None,
             ntn_config: None,
+            sl_config: None,
         })
         .expect("encode minimal RRCReconfiguration");
         assert_eq!(
@@ -1831,6 +1979,7 @@ mod tests {
             master_key_update: None,
             meas_config: Some(test_meas_config_params()),
             ntn_config: None,
+            sl_config: None,
         };
         let bytes = encode_rrc_reconfiguration(&params).expect("encode with a measConfig");
         assert_ne!(
@@ -1872,6 +2021,7 @@ mod tests {
                     master_key_update: None,
                     meas_config: Some(test_meas_config_params()),
                     ntn_config: None,
+                    sl_config: None,
                 },
             ),
             (
@@ -1887,6 +2037,7 @@ mod tests {
                     master_key_update: None,
                     meas_config: Some(test_meas_config_params()),
                     ntn_config: None,
+                    sl_config: None,
                 },
             ),
         ] {
@@ -2479,6 +2630,7 @@ mod tests {
             master_key_update: None,
             meas_config: None,
             ntn_config: Some(test_ntn_sib19_params()),
+            sl_config: None,
         };
         let data = decode_rrc_reconfiguration(&encode_rrc_reconfiguration(&params).unwrap())
             .expect("decodes");
@@ -2510,6 +2662,7 @@ mod tests {
         // before the field was added, which is what this equality pins.
         let explicit_none = RrcReconfigurationParams {
             ntn_config: None,
+            sl_config: None,
             ..create_test_reconfiguration_params()
         };
         assert_eq!(
@@ -2804,6 +2957,12 @@ pub fn build_handover_command_params(
         // clock -- worse than sending none, because the UE would apply it. The
         // target's own SIB19 broadcast is what the UE reads after the switch.
         ntn_config: None,
+        // No sidelink grant on a handover command either (issue #141), for a related
+        // reason: sidelink resources are the SOURCE cell's, so carrying them into a
+        // handover would grant the UE carriers the target has not allocated. A UE that
+        // needs sidelink after the switch re-sends its `SidelinkUEInformation` to the
+        // target, which is what TS 38.331 §5.8.3.2 requires on entering a new cell.
+        sl_config: None,
     })
 }
 

@@ -25,9 +25,13 @@ use nextgsim_rrc::procedures::information_transfer::{
     encode_dl_information_transfer, DlInformationTransferParams,
 };
 use nextgsim_rrc::procedures::measurement_report::MeasurementReportData;
+// The sidelink resource-request answer (issue #141).
 use nextgsim_rrc::procedures::paging::{encode_paging, PagingRecordParams, FIVE_G_S_TMSI_LEN};
 use nextgsim_rrc::procedures::paging_occasion::{
     self, paging_occasion, ue_id_from_s_tmsi, PagingCycleConfig,
+};
+use nextgsim_rrc::procedures::rrc_reconfiguration::{
+    encode_rrc_reconfiguration, RrcReconfigurationParams,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{
     decode_rrc_reestablishment_request, RrcReestablishmentRequestData,
@@ -40,6 +44,7 @@ use nextgsim_rrc::procedures::rrc_setup::{
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
 };
 use nextgsim_rrc::procedures::scell_config::{encode_scell_config, ScellConfig};
+use nextgsim_rrc::procedures::sidelink_ue_information::SidelinkUeInformationParams;
 use nextgsim_rrc::procedures::ue_capability::{
     encode_ue_capability_enquiry, parse_nr_capability_bands, parse_nr_capability_redcap, RatType,
     UeCapabilityEnquiryParams, UeCapabilityInformationData,
@@ -90,6 +95,7 @@ use super::connection::{
 };
 use super::handover::{measurement_report_from, GnbHandoverManager, HandoverDecision};
 use super::meas::a3_meas_config_params;
+use super::sidelink::{log_refusal, sl_config_for_request, SL_T400_MS};
 use super::system_info::{
     encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
     release_cell_reselection_priorities, sib19_params,
@@ -732,10 +738,104 @@ impl RrcTask {
                 self.handle_security_mode_failure(ue_id, rrc_transaction_id);
                 true
             }
+            Ok(UlDcchMessage::SidelinkUeInformation(request)) => {
+                self.handle_sidelink_ue_information(ue_id, &request).await;
+                true
+            }
             Ok(UlDcchMessage::Unsupported) => false,
             Err(e) => {
                 debug!("UL-DCCH typed decode failed for UE[{}]: {}", ue_id, e);
                 false
+            }
+        }
+    }
+
+    /// Answers a UE's `SidelinkUEInformation` with a dedicated sidelink configuration
+    /// (TS 38.331 §5.8.3, §5.3.5.3; issue #141).
+    ///
+    /// Before this, no `SidelinkUEInformation` was ever produced or consumed anywhere in
+    /// the tree, and `RRCReconfiguration` had no `sl-ConfigDedicatedNR` field to answer
+    /// one with — so a UE using PC5 did so with no network grant and the gNB never knew.
+    /// This is the network half of that exchange.
+    ///
+    /// The answer is a real `RRCReconfiguration` carrying an `sl-ConfigDedicatedNR-r16`
+    /// `setup`, sent on the same DL-DCCH path every other reconfiguration uses — so it
+    /// picks up SRB PDCP protection and transaction-identifier allocation without a
+    /// second copy of either.
+    ///
+    /// A request this cell cannot honour is logged and **not** answered. Not answered
+    /// rather than answered with an empty grant: TS 38.331 §5.3.5.3 has the UE apply an
+    /// `sl-ConfigDedicatedNR` it receives, so sending one the cell cannot back would tell
+    /// the UE it may transmit sidelink the network has not allocated. §5.8.3 places no
+    /// obligation on the network to answer at all.
+    async fn handle_sidelink_ue_information(
+        &mut self,
+        ue_id: i32,
+        request: &SidelinkUeInformationParams,
+    ) {
+        info!(
+            "SidelinkUEInformation from UE[{}]: {} receive carrier(s) {:?}, {} transmit \
+             destination(s)",
+            ue_id,
+            request.rx_interested_freqs.len(),
+            request.rx_interested_freqs,
+            request.tx_resource_requests.len()
+        );
+
+        // An unknown UE is reported and not acted on, for the same reason
+        // `handle_measurement_report` does it: granting resources to a context this gNB
+        // does not hold would allocate against nothing.
+        if self.ue_manager.try_find_ue(ue_id).is_none() {
+            debug!("Ignoring SidelinkUEInformation for unknown UE[{}]", ue_id);
+            return;
+        }
+
+        let sl_config = match sl_config_for_request(request) {
+            Ok(config) => config,
+            Err(refusal) => {
+                log_refusal(ue_id, &refusal);
+                return;
+            }
+        };
+
+        // A sidelink-only reconfiguration: no bearers, no cell group, no measurement
+        // configuration. Every other field stays absent, because §5.3.5.3 has the UE act
+        // only on IEs that are present — so this changes the UE's sidelink grant and
+        // nothing else.
+        let rrc_transaction_id = self
+            .ue_manager
+            .try_find_ue_mut(ue_id)
+            .map(|ctx| ctx.transactions.allocate(RrcProcedure::Reconfiguration))
+            .unwrap_or(0);
+        let params = RrcReconfigurationParams {
+            rrc_transaction_id,
+            radio_bearer_config: None,
+            secondary_cell_group: None,
+            master_cell_group: None,
+            full_config: false,
+            master_key_update: None,
+            meas_config: None,
+            ntn_config: None,
+            sl_config: Some(sl_config),
+        };
+
+        match encode_rrc_reconfiguration(&params) {
+            Ok(pdu) => {
+                self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
+                    .await;
+                info!(
+                    "Granted UE[{}] a dedicated sidelink configuration (t400={}ms, tid={})",
+                    ue_id, SL_T400_MS, rrc_transaction_id
+                );
+            }
+            Err(e) => {
+                // The grant this gNB chose is not encodable. Logged rather than
+                // panicking, and the UE simply gets no grant -- which is the same
+                // outcome as a refusal, and better than taking the RRC task down.
+                warn!(
+                    "Could not encode the sidelink grant for UE[{}]: {}",
+                    ue_id, e
+                );
             }
         }
     }

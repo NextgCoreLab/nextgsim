@@ -78,7 +78,7 @@ and the crate that backs it:
 | `timer.rs` | — | NAS timer constants + `NasTimerManager`, `GprsTimer2/3` decoders |
 | `daps.rs` | — | Rel-17 DAPS handover UE state (`UeDapsState`) — dual-RLC handover model |
 | `ambient_iot/`, `ranging/`, `uav.rs`, `mint/` | (in-crate) | Rel-17/18 5G-Advanced prototypes (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
-| `sidelink/`, `prose.rs` | (in-crate) | Rel-17/18 PC5 surface behind the off-by-default `sidelink` feature — an inert facade, absent from a default build (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
+| `sidelink/` | (in-crate) | Rel-16/17 PC5 surface behind the off-by-default `sidelink` feature — real PC5-S Direct Communication, Model A/B discovery, UE-to-UE relay and the RRC `SidelinkUEInformation`; absent from a default build (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
 | `semantic_codec/`, `she_client/`, `isac_sensor/`, `fl_participant/`, `nwdaf_reporter/` | `nextgsim-semantic`, `nextgsim-she`, `nextgsim-isac`, `nextgsim-fl`, `nextgsim-nwdaf` | Feature-gated 6G/AI client tasks (see [6G & AI prototypes](#6g--ai-prototypes-pointers)) |
 
 The composed crates (declared in `Cargo.toml`):
@@ -349,9 +349,9 @@ gNB, and UPF is in [PDU session & user plane](../concepts/pdu-session-userplane.
 ## 6G & AI prototypes (pointers)
 
 These modules are **non-normative research prototypes**. The Rel-18 Ranging and
-MINT tasks are always compiled and spawned; **Sidelink** (and `prose.rs` with it)
-sits behind the off-by-default `sidelink` Cargo feature, so a default build
-carries neither the task nor its types — see the `sidelink/` row below. The
+MINT tasks are always compiled and spawned; **Sidelink** sits behind the
+off-by-default `sidelink` Cargo feature, so a default build carries neither the
+task nor its types — see the `sidelink/` row below. The
 6G/AI client tasks
 are both Cargo-feature-gated (`nextgsim-she`, `nextgsim-nwdaf`, `nextgsim-isac`,
 `nextgsim-fl`, `nextgsim-semantic`) **and** config-gated
@@ -362,9 +362,9 @@ see [The 6G / AI stack](../concepts/ai-6g-stack.md).
 | Module (`nextgsim-ue/src/…`) | One-line honest pointer |
 |---|---|
 | `ambient_iot/` | Rel-18 Ambient IoT fleet management model (TS 22.369) — device-group coordination, no wire protocol. |
-| `prose.rs` | **Absent from a default build** (`sidelink` feature). ProSe PC5 proximity-services model (TS 23.303/23.304) — discovery + UE-to-UE relay state. It rides the `sidelink` feature because it uses `sidelink::Pc5RrcState`, and its own types have zero consumers anywhere in the workspace. |
+| `prose.rs` | **Removed by issue #141.** It modelled ProSe contexts, PC5 bearers, relay contexts and Model A/B discovery status, and every one of its types had zero consumers workspace-wide — none of it ever ran. Those procedures are now implemented against the wire in `sidelink::{pc5s, link, discovery, relay}`: `ProseContext`/`ProsePeer` → `Pc5DiscoveryEngine`/`DiscoveredPeer`, `Pc5Bearer` → `Pc5LinkContext`, `UeRelayContext` → `RelayForwarder`. |
 | `ranging/` | **Wired on the UE side and exercised in CI; two limits remain.** Rel-18 UE-to-UE ranging / carrier-phase positioning (TS 23.586 §5.3.3): an SL-PRS occasion from `sidelink/` produces RTT and carrier-phase measurements, the session maths resolves a range, and it reaches the LMF in the LPP payload container of an UL NAS TRANSPORT (`tests/src/ranging_report_e2e.rs` asserts the range read back out of those bytes; the `ranging` CI job runs it). **Limit 1:** there is no PC5 radio, so the propagation delay is computed from configured geometry — the accuracy reported is the model's, not a radio's, and nothing exercises the widelane under noise. **Limit 2:** no **two-process** run against a real LMF has happened; the LMF half lives in nextgcore (issue #138), where its LPP codec is held against this UE's golden vector, so the two are proven against the same bytes rather than against each other in flight. Behind the `sidelink` feature and `ranging_config.enabled`, both off by default. Issues #55, #136-#139. |
-| `sidelink/` | **Absent from a default build** (off-by-default `sidelink` feature), because the surface is an inert facade. Only `StartDiscovery`/`StopDiscovery` have a sender anywhere in the tree; `EstablishPc5Link` flips straight to `Active` with no PC5-S `Direct Communication Request`/`Accept` (TS 23.304 §6.4.3.1); there is no RRC `SidelinkUEInformation` / `sl-Config` (TS 38.331), so a gNB peer reserves no sidelink resources; and `Pc5RrcConnection` is constructed only by its own unit test. Enabling the feature compiles the facade back in — it does not make PC5 work. Issue #54. |
+| `sidelink/` | **The real PC5 procedures run; two limits remain.** `EstablishPc5Link` sends a PC5-S `Direct Communication Request` and reaches `Active` only on the peer's `Direct Communication Accept` (TS 23.304 §6.4.3.1), with the peer's Layer-2 ID learned from the accept per step 4. Direct discovery is a real Model A announce / Model B solicit-response exchange with a ProSe Application Code filter (§6.3.1.2, §6.3.1.3), so a UE on another code is not discovered. UE-to-UE relay forwarding consults the live link table, so releasing a link stops the forwarding (§6.4.3.10). The UE emits an RRC `SidelinkUEInformation` (TS 38.331 §5.8.3, real UPER on `messageClassExtension.c2`) and the gNB answers with an `sl-ConfigDedicatedNR` in `RRCReconfiguration`, which the UE applies. `tests/src/sidelink_pc5_e2e.rs` drives three real tasks through discovery → unicast link → relay; the `sidelink-pc5` CI job runs it. **Limit 1:** there is no PC5 radio — the medium between UEs is an in-process channel, so the PDUs are real and the propagation is not. **Limit 2:** no UE-to-Network relay; that needs the TS 38.351 SRAP adaptation layer, filed as issue #190. Still absent from a default build (off-by-default `sidelink` feature), and additionally gated at run time by `UeConfig::prose_enabled`. Issues #54, #141, #190. |
 | `uav.rs` | Rel-17/18 UAV context (TS 23.256) — wraps the RRC UAV types with NAS authorization/C2/geofence modelling. |
 | `mint/` | Rel-18 MINT / multi-USIM (TS 23.761) — multi-SUPI secondary-subscription driver, integrated with the NAS task. |
 | `semantic_codec/` | 6G semantic-communication encode/decode task — research prototype. |

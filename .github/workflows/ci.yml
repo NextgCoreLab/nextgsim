@@ -347,6 +347,39 @@ jobs:
           cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
           cargo clippy -p nextgsim-ue --features sidelink --all-targets
 
+  sidelink-pc5:
+    name: Sidelink PC5 procedures (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The real PC5 procedures (issue #141): the PC5-S Direct Communication handshake,
+      # Model A/B direct discovery, UE-to-UE relay forwarding and the RRC
+      # `SidelinkUEInformation` resource request. All of it sits behind the `sidelink`
+      # cargo feature #54 gated off, so the default jobs above compile none of it -- the
+      # recorded failure mode for feature-gated code here is shipping an enabled arm CI
+      # never built (issues #33, #139).
+      #
+      # Distinct from `sidelink-facade` and `sidelink-ranging` above: those cover the
+      # module's honesty wording and the SL-PRS/ranging pipeline respectively. This one
+      # covers the PC5 procedures and the two-UE end-to-end chain.
+      - name: cargo test (the two-UE PC5 end-to-end chain)
+        run: cargo test -p nextgsim-integration-tests --features sidelink --test sidelink_pc5_e2e
+      - name: cargo test (the PC5-S codec, link state machine, discovery and relay)
+        run: |
+          cargo test -p nextgsim-ue --features sidelink sidelink::
+          cargo test -p nextgsim-rrc sidelink_ue_information
+      - name: cargo test (the gNB's answer to a resource request)
+        run: cargo test -p nextgsim-gnb rrc::sidelink
+      - name: cargo clippy
+        run: |
+          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
+          cargo clippy -p nextgsim-ue --features sidelink --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

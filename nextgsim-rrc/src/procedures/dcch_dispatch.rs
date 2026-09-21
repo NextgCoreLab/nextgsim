@@ -105,6 +105,7 @@ use super::security_mode::{
     parse_security_mode_command, parse_security_mode_complete, SecurityModeCommandData,
     SecurityModeCompleteData,
 };
+use super::sidelink_ue_information::{read_sidelink_ue_information, SidelinkUeInformationParams};
 use super::ue_capability::{
     parse_ue_capability_enquiry, parse_ue_capability_information, UeCapabilityEnquiryData,
     UeCapabilityInformationData,
@@ -138,6 +139,14 @@ pub enum UlDcchMessage {
         /// The `rrc-TransactionIdentifier` being refused.
         rrc_transaction_id: u8,
     },
+    /// `sidelinkUEInformationNR` (`messageClassExtension.c2` index 4) — the UE's
+    /// sidelink resource request (TS 38.331 §5.8.3, issue #141).
+    ///
+    /// The first `c2` message this dispatcher acts on rather than collapsing to
+    /// [`UlDcchMessage::Unsupported`]. Reachable only since issue #105 vendored the
+    /// Rel-19 schema: the Rel-15 schema it replaced declared no sidelink IE at all,
+    /// which is the blocker issue #141 was parked on.
+    SidelinkUeInformation(SidelinkUeInformationParams),
     /// A well-formed UL-DCCH-Message the gNB does not dispatch on (e.g.
     /// locationMeasurementIndication, messageClassExtension).
     Unsupported,
@@ -152,7 +161,15 @@ pub fn dispatch_ul_dcch(bytes: &[u8]) -> Result<UlDcchMessage, RrcCodecError> {
 
     let c1 = match &msg.message {
         UL_DCCH_MessageType::C1(c1) => c1,
-        _ => return Ok(UlDcchMessage::Unsupported),
+        // `messageClassExtension` carries the Rel-16+ message set. Only
+        // `sidelinkUEInformationNR` is acted on (issue #141); every other arm, and the
+        // `messageClassExtensionFuture` arm, stays `Unsupported`.
+        UL_DCCH_MessageType::MessageClassExtension(_) => {
+            return Ok(match read_sidelink_ue_information(&msg) {
+                Some(params) => UlDcchMessage::SidelinkUeInformation(params),
+                None => UlDcchMessage::Unsupported,
+            })
+        }
     };
 
     let dispatched = match c1 {
@@ -450,9 +467,15 @@ mod tests {
     }
 
     /// The OTHER `messageClassExtension` arm -- `c2`, the Rel-16/17/18 message
-    /// set the Rel-15 schema could not express at all (#105) -- also reaches
-    /// `Unsupported` rather than an error, because none of its 16 arms is a
-    /// message this dispatcher acts on.
+    /// set the Rel-15 schema could not express at all (#105) -- reaches
+    /// `Unsupported` rather than an error for every arm this dispatcher does not
+    /// act on.
+    ///
+    /// Since issue #141 there is exactly ONE `c2` arm it does act on:
+    /// `sidelinkUEInformationNR-r16`, covered by
+    /// [`a_sidelink_ue_information_dispatches_from_the_c2_extension`]. This test
+    /// pins that a DIFFERENT `c2` arm still collapses -- so the new arm was added
+    /// selectively rather than by making all of `c2` dispatch to something.
     ///
     /// `dedicatedSIBRequest-r16` is built as real UPER rather than a hand-rolled
     /// byte string, so this asserts the arm is genuinely *reachable* from the new
@@ -478,6 +501,44 @@ mod tests {
             dispatch_ul_dcch(&bytes).unwrap(),
             UlDcchMessage::Unsupported
         ));
+    }
+
+    /// A `sidelinkUEInformationNR` reaches the gNB as a TYPED message with its IEs
+    /// intact (issue #141), not as `Unsupported`.
+    ///
+    /// The assertion is on the decoded destination Layer-2 ID and cast type, not merely
+    /// on the variant: those values exist on the gNB side only because real UPER
+    /// carrying them was decoded, which is what makes the gNB able to allocate against
+    /// the request rather than merely notice one arrived.
+    #[test]
+    fn a_sidelink_ue_information_dispatches_from_the_c2_extension() {
+        use crate::procedures::sidelink_ue_information::{
+            encode_sidelink_ue_information, SidelinkUeInformationParams, SlCastType,
+            SlTxResourceRequest,
+        };
+
+        const PEER: u32 = 0x00_5A_C3_1E & 0x00FF_FFFF;
+        let bytes = encode_sidelink_ue_information(&SidelinkUeInformationParams {
+            rx_interested_freqs: vec![2, 5],
+            tx_resource_requests: vec![SlTxResourceRequest {
+                destination_l2_id: PEER,
+                cast_type: SlCastType::Unicast,
+            }],
+        })
+        .expect("encode");
+
+        match dispatch_ul_dcch(&bytes).expect("decode") {
+            UlDcchMessage::SidelinkUeInformation(params) => {
+                assert_eq!(params.rx_interested_freqs, vec![2, 5]);
+                assert_eq!(params.tx_resource_requests.len(), 1);
+                assert_eq!(params.tx_resource_requests[0].destination_l2_id, PEER);
+                assert_eq!(
+                    params.tx_resource_requests[0].cast_type,
+                    SlCastType::Unicast
+                );
+            }
+            other => panic!("expected a SidelinkUeInformation, got {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -520,6 +581,7 @@ mod tests {
             master_key_update: None,
             meas_config: None,
             ntn_config: None,
+            sl_config: None,
         })
         .expect("encode RRCReconfiguration");
         let resume = encode_rrc_resume(&fresh_rrc_resume_params(2, None).expect("resume params"))

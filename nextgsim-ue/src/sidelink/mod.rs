@@ -22,16 +22,30 @@
 //! in; it does not make PC5 work. Issue #54 tracks that, and its increment 2 is
 //! the real procedures.
 
+pub mod discovery;
+pub mod link;
 pub mod pc5;
+pub mod pc5s;
 pub mod positioning;
+pub mod relay;
 pub mod task;
 
+pub use discovery::{
+    DiscoveredPeer, DiscoveryFilter, DiscoveryModel, DiscoveryOutcome, Pc5DiscoveryEngine,
+};
+pub use link::{Pc5LinkContext, Pc5LinkError, Pc5LinkTable, Pc5Role, Pc5UnicastState};
 pub use pc5::{
     Pc5DiscoveredPeer, Pc5Discovery, Pc5DiscoveryMode, Pc5HarqFeedback, Pc5RadioBearerConfig,
     Pc5ResourceMode, Pc5RrcConnection, Pc5RrcState,
+};
+pub use pc5s::{
+    DirectCommunicationAccept, DirectCommunicationReject, DirectCommunicationRelease,
+    DirectCommunicationRequest, DirectDiscoveryMessage, Pc5CastType, Pc5RejectCause, Pc5SError,
+    Pc5SMessage, Pc5SMessageType, ProseL2Id, RelayServiceCode,
 };
 pub use positioning::{
     AnchorUe, AoaMeasurement, AodMeasurement, Position3D, PositionEstimate, RttMeasurement,
     SidelinkPositioningEngine, SlPrsResourceConfig,
 };
+pub use relay::{RelayForwardDecision, RelayForwarder, RelayRole};
 pub use task::{SidelinkTask, SPAWN_LOG, START_LOG};

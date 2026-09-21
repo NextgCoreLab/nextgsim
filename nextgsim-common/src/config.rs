@@ -1403,6 +1403,95 @@ pub struct RangingAnchor {
     pub position: [f64; 3],
 }
 
+/// ProSe / PC5 sidelink parameters (TS 23.304), issue #141.
+///
+/// Read by the UE's sidelink task when `UeConfig::prose_enabled` is set. Before issue
+/// #141 there was no such struct and `prose_enabled` was read by nothing at all: the PC5
+/// surface had no configuration because it had no behaviour to configure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProseConfig {
+    /// This UE's 24-bit ProSe Layer-2 ID, the `Source User Info` of every PC5-S message
+    /// it sends (TS 23.304 §5.8.2.1).
+    ///
+    /// Bits above 24 are discarded when it reaches `sidelink::ProseL2Id`, which masks at
+    /// construction — so a configuration that sets a wider value gets its low 24 bits
+    /// rather than a silently different identity.
+    #[serde(default = "default_prose_l2_id")]
+    pub local_l2_id: u32,
+    /// The `ProSe Application Code` this UE announces and filters on
+    /// (TS 23.304 §5.8.1).
+    ///
+    /// Both ends of a discovery exchange must agree on it, or the monitor's filter never
+    /// matches and no peer is ever discovered — which is the correct outcome for two UEs
+    /// running different services, and the reason the default is shared.
+    #[serde(default = "default_prose_app_code")]
+    pub prose_app_code: u32,
+    /// Which discovery model to run: `"a"` for Model A announcing (TS 23.304 §6.3.1.2),
+    /// `"b"` for Model B soliciting (§6.3.1.3).
+    ///
+    /// Model A by default: it is the one-message case, so a UE that is merely present
+    /// becomes discoverable without needing a peer to ask first.
+    #[serde(default = "default_discovery_model")]
+    pub discovery_model: String,
+    /// The Relay Service Code this UE serves, when it is acting as a relay
+    /// (TS 23.304 §5.4.2).
+    ///
+    /// `None` means this UE is not a relay: it announces no RSC, and a remote UE's
+    /// `select_relay` will not pick it. Setting it makes the UE announce the code and
+    /// accept `Direct Communication Request`s that name it.
+    #[serde(default)]
+    pub relay_service_code: Option<u32>,
+    /// The sidelink carrier indices this UE asks to receive on, each `1..=8`
+    /// (`SL-InterestedFreqList-r16`, TS 38.331 §6.3.5).
+    ///
+    /// These are what the `SidelinkUEInformation` carries. Defaults to carrier 1, the
+    /// one the gNB's `SL_MAX_GRANTED_FREQ_INDEX` grants: a default that asked for a
+    /// carrier the cell refuses would leave every UE ungranted.
+    #[serde(default = "default_prose_rx_freqs")]
+    pub rx_interested_freqs: Vec<u8>,
+    /// How long a discovered peer is remembered without being heard from again, in ms.
+    #[serde(default = "default_prose_peer_timeout_ms")]
+    pub peer_timeout_ms: u64,
+}
+
+/// Layer-2 ID 1, the lowest non-zero value. Zero is avoided because it is also what an
+/// uninitialised field holds, and "the peer that never set its ID" and "the peer whose
+/// ID is 0" should not be the same peer.
+fn default_prose_l2_id() -> u32 {
+    1
+}
+/// A ProSe Application Code both ends of the shipped configurations share, so two UEs
+/// discover each other out of the box rather than filtering each other out.
+fn default_prose_app_code() -> u32 {
+    0x0000_1000
+}
+fn default_discovery_model() -> String {
+    "a".to_string()
+}
+/// Carrier 1: the one the gNB grants (see `nextgsim-gnb`'s `SL_MAX_GRANTED_FREQ_INDEX`).
+fn default_prose_rx_freqs() -> Vec<u8> {
+    vec![1]
+}
+/// Five seconds. Long enough that a periodic announcer is not expired between
+/// announcements at any plausible interval, short enough that a UE that has gone away
+/// stops being offered as a relay.
+fn default_prose_peer_timeout_ms() -> u64 {
+    5_000
+}
+
+impl Default for ProseConfig {
+    fn default() -> Self {
+        Self {
+            local_l2_id: default_prose_l2_id(),
+            prose_app_code: default_prose_app_code(),
+            discovery_model: default_discovery_model(),
+            relay_service_code: None,
+            rx_interested_freqs: default_prose_rx_freqs(),
+            peer_timeout_ms: default_prose_peer_timeout_ms(),
+        }
+    }
+}
+
 /// Ranging/sidelink positioning configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangingConfig {
@@ -1925,9 +2014,23 @@ pub struct UeConfig {
     /// SNPN access configuration
     #[serde(default)]
     pub snpn_config: Option<SnpnConfig>,
-    /// ProSe/Sidelink capability
+    /// ProSe/Sidelink capability.
+    ///
+    /// **Read since issue #141**, having been written and never read before it: the flag
+    /// gates whether the sidelink task runs PC5 at all, so a UE with the `sidelink`
+    /// feature compiled in but `prose_enabled: false` announces nothing, opens no unicast
+    /// link and requests no sidelink resources. That is the second half of the gating #54
+    /// began — the Cargo feature decides whether the code exists, this decides whether it
+    /// runs.
     #[serde(default)]
     pub prose_enabled: bool,
+    /// ProSe/PC5 parameters (TS 23.304), read when `prose_enabled` (issue #141).
+    ///
+    /// `None` falls back to [`ProseConfig::default`], so a configuration that enables
+    /// ProSe without detailing it still gets a usable Layer-2 ID and application code
+    /// rather than silently doing nothing.
+    #[serde(default)]
+    pub prose_config: Option<ProseConfig>,
     /// UE Route Selection Policy rules
     #[serde(default)]
     pub ursp_rules: Vec<UrspRule>,
@@ -2023,6 +2126,9 @@ impl Default for UeConfig {
             redcap: false,
             snpn_config: None,
             prose_enabled: false,
+            // `None` means "use the ProseConfig defaults if prose is ever enabled";
+            // `prose_enabled: false` above means it is not (issue #141).
+            prose_config: None,
             ursp_rules: Vec::new(),
             pin_role: None,
             xr_config: None,

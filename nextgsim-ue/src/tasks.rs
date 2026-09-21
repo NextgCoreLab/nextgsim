@@ -591,6 +591,31 @@ pub enum RrcMessage {
         /// Encoded data
         data: Vec<u8>,
     },
+    /// This UE's sidelink interest changed, so the RRC layer must request resources
+    /// from the network (TS 38.331 §5.8.3.2; issue #141).
+    ///
+    /// Sent by the **sidelink task**, which is the only place that knows what PC5 is
+    /// doing: which peers it holds unicast links to and which it is about to open one
+    /// with. That is what makes the RRC request reachable in production rather than
+    /// test-only — the defect issue #141 names is handlers with no sender, and this is
+    /// the sender.
+    ///
+    /// §5.8.3.2 triggers on a *change* of interest, so the sidelink task sends this when
+    /// its destination set changes rather than periodically; the RRC task additionally
+    /// suppresses an unchanged request.
+    #[cfg(feature = "sidelink")]
+    SidelinkInterestChanged {
+        /// The carrier indices this UE wants to receive sidelink on, each `1..=8`.
+        rx_interested_freqs: Vec<u8>,
+        /// The peer Layer-2 IDs this UE wants transmission resources for, and whether
+        /// each is for a unicast link.
+        ///
+        /// Carried as `(l2_id, is_unicast)` rather than as the RRC crate's own
+        /// `SlTxResourceRequest` so that `nextgsim-ue::tasks` — which every task
+        /// imports — does not gain a dependency on an RRC procedure type merely to
+        /// name a message.
+        tx_destinations: Vec<(u32, bool)>,
+    },
 }
 
 /// Radio link failure cause.
@@ -1482,6 +1507,35 @@ pub enum SidelinkMessage {
         /// Occasion timestamp in milliseconds, carried through to the
         /// measurements so a session can tell one occasion from the next.
         timestamp_ms: u64,
+    },
+    /// A PC5-S message arrived from a peer UE (TS 24.554, issue #141).
+    ///
+    /// The **receive half of every PC5 procedure**: a `Direct Communication
+    /// Request`/`Accept`/`Reject`/`Release`, or a Model A announcement or Model B
+    /// solicitation/response. Carried as bytes rather than as a decoded message so that
+    /// the decode — and therefore every malformed-input path — happens inside the
+    /// sidelink task, which is where the procedure is. A pre-decoded message would let a
+    /// sender construct a value the wire could not carry.
+    ///
+    /// Sent by the peer UE, which is what makes this simulator's PC5 exchanges real
+    /// exchanges: before issue #141 there was no PC5 receive path at all, so
+    /// `EstablishPc5Link` completed by assignment rather than by answer.
+    Pc5SReceived {
+        /// The PC5-S PDU, message-type octet first.
+        pdu: Vec<u8>,
+    },
+    /// Data to be relayed between two other UEs over PC5 (TS 23.304 §6.4.3.10).
+    ///
+    /// Distinct from `RelayData`, which carries only a size: this carries the payload, so
+    /// a relay can actually forward it and a test can assert the octets arrived. Sent by
+    /// the source UE.
+    RelayPayload {
+        /// The originating UE's Layer-2 ID.
+        source_l2_id: u32,
+        /// The intended final destination's Layer-2 ID.
+        destination_l2_id: u32,
+        /// The payload to forward.
+        payload: Vec<u8>,
     },
 }
 

@@ -79,6 +79,7 @@ pub mod handover;
 pub mod meas;
 pub mod ntn_gnb;
 pub mod redcap;
+pub mod sidelink;
 pub mod system_info;
 pub mod task;
 pub mod transaction;
@@ -106,6 +107,7 @@ pub use redcap::{
     MimoRestriction, RedCapProcessor, RedCapRelease, RedCapRestrictions, RedCapRrcConfig,
     RedCapUeCapabilities,
 };
+pub use sidelink::{log_refusal, sl_config_for_request, SlGrantRefusal, SL_T400_MS};
 pub use task::RrcTask;
 pub use transaction::{
     RrcProcedure, RrcTransactionAllocator, TidVerification, C5_TYPED_DCCH_DISPATCH,
