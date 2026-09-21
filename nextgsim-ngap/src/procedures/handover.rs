@@ -2318,6 +2318,7 @@ mod tests {
                     arp_priority_level: 8,
                 }],
                 security_indication: None,
+                mbs_sessions_to_join: Vec::new(),
             })
             .expect("encode the inner setup transfer")
         };

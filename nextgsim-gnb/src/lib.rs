@@ -162,4 +162,6 @@ pub use energy::EnergyTask;
 
 // Re-export Rel-17 protocol extension types
 pub use daps::{DapsManager, DapsRlcBearer, DapsSession, DapsState};
-pub use mbs_ngap::{GnbMbsSession, GnbMbsState, MbsFlow, NgapMbsManager};
+pub use mbs_ngap::{
+    GnbMbsSession, GnbMbsState, MbsFlow, MbsJoinAccepted, MbsJoinRefusal, NgapMbsManager,
+};

@@ -5,14 +5,24 @@
 //! `nextgsim_ngap::procedures::mbs`; this module holds only what the gNB
 //! remembers between messages:
 //!
-//! - which MBS sessions exist, keyed by the session id the AMF sent;
+//! - which MBS sessions exist, keyed by the TMGI the AMF sent;
 //! - which cells are currently radiating each session;
 //! - which UEs have joined a multicast (as opposed to broadcast) session.
 //!
+//! This is the **only** MBS state machine in `nextgsim-gnb`. A second one
+//! (`ngap::mbs_context::MbsSessionManager`) used to sit beside it, keyed by a
+//! numeric session id that appears nowhere in TS 38.413's IEs and driven by
+//! `NgapMessage::Mbs*` variants that nothing ever constructed. It was deleted in
+//! issue #188: it modelled the same concern with a key the wire cannot resolve.
+//! See this module's `join_ue`/`leave_ue` for where the per-UE half of that
+//! concern actually lives now.
+//!
 //! # Which procedures reach it
 //!
-//! `NgapMbsManager` is driven from `NgapTask::handle_ngap_pdu` for the three
-//! AMF-initiated MBS procedures of TS 38.413 §9.2.9:
+//! Two groups, because 3GPP splits MBS across both halves of NGAP.
+//!
+//! **Session level — non-UE-associated (TS 38.413 §9.2.9),** driven from
+//! `NgapTask::handle_mbs_pdu`:
 //!
 //! - 71 `id-MulticastSessionActivation` -> [`NgapMbsManager::start_session`],
 //!   answered with a `MulticastSessionActivationResponse`;
@@ -20,6 +30,21 @@
 //!   answered with a `MulticastSessionDeactivationResponse`;
 //! - 74 `id-MulticastGroupPaging` -> [`NgapMbsManager::sessions_for_cell`] to
 //!   decide whether this cell carries the paged group.
+//!
+//! **Membership level — UE-associated,** driven from the PDU Session Resource
+//! procedures, because TS 23.247 delivers a multicast session to a UE *through*
+//! its PDU session, so membership travels with it:
+//!
+//! - `MBSSessionSetupRequestList` (IE 318) on a Setup Request, and
+//!   `MBSSessionSetuporModifyRequestList` (319) on a Modify Request ->
+//!   [`NgapMbsManager::join_ue`];
+//! - `MBSSessionToReleaseList` (317) on a Modify Request ->
+//!   [`NgapMbsManager::leave_ue`];
+//! - a UE context going away -> [`NgapMbsManager::remove_ue_everywhere`].
+//!
+//! Each join is answered per session in the response transfer's `iE-Extensions`
+//! (312/310 for setup, 313/311 for modify), so the AMF learns which joins the RAN
+//! admitted and why the rest were refused.
 //!
 //! Procedure 68 (`id-BroadcastSessionSetup`) is deliberately NOT routed here.
 //! It is a *broadcast* session setup whose `BroadcastSessionSetupRequest`
@@ -93,8 +118,16 @@ pub struct GnbMbsSession {
     pub tunnel: Option<MbsTunnel>,
     /// Cell IDs that are broadcasting this session
     pub active_cells: HashSet<i32>,
-    /// UE C-RNTIs that have joined (multicast mode)
-    pub joined_ues: HashSet<u16>,
+    /// UEs that have joined this session (multicast mode), by internal UE id.
+    ///
+    /// Keyed by `ue_id` — the identity `NgapUeContext` is indexed by and that the
+    /// PDU Session procedures resolve from `RAN-UE-NGAP-ID` — and deliberately
+    /// **not** by C-RNTI. This simulator gives every UE the same C-RNTI
+    /// (`SIMULATED_C_RNTI`), whose own documentation notes that `(C-RNTI, PCI)`
+    /// identifies a *set* of contexts rather than one; a C-RNTI-keyed membership
+    /// set therefore cannot hold two UEs at once, so the second join would be a
+    /// silent no-op and the first leave would evict both.
+    pub joined_ues: HashSet<i32>,
     /// Whether this is a broadcast session (no per-UE membership)
     pub is_broadcast: bool,
 }
@@ -134,17 +167,29 @@ impl GnbMbsSession {
         }
     }
 
-    /// UE joins multicast session
-    pub fn ue_join(&mut self, c_rnti: u16) -> bool {
+    /// Records that a UE joined this multicast session.
+    ///
+    /// Returns `false` for a broadcast session, where there is no per-UE
+    /// membership to record: a broadcast session is radiated to the cell whether
+    /// or not any particular UE is interested (TS 23.247 §4.2), so accepting a
+    /// join would invent state the session does not have. Also `false` when the
+    /// UE had already joined, so a caller can tell a new membership from a
+    /// repeated request.
+    pub fn ue_join(&mut self, ue_id: i32) -> bool {
         if self.is_broadcast {
             return false;
         }
-        self.joined_ues.insert(c_rnti)
+        self.joined_ues.insert(ue_id)
     }
 
-    /// UE leaves multicast session
-    pub fn ue_leave(&mut self, c_rnti: u16) -> bool {
-        self.joined_ues.remove(&c_rnti)
+    /// Records that a UE left this session, reporting whether it was a member.
+    pub fn ue_leave(&mut self, ue_id: i32) -> bool {
+        self.joined_ues.remove(&ue_id)
+    }
+
+    /// Whether a given UE is currently a member of this session.
+    pub fn has_ue(&self, ue_id: i32) -> bool {
+        self.joined_ues.contains(&ue_id)
     }
 
     /// Returns TMGI as hex string
@@ -220,6 +265,113 @@ impl NgapMbsManager {
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
+
+    /// Joins a UE to the session named by `tmgi`, for a
+    /// `MBSSessionSetupRequestList` (318) or `MBSSessionSetuporModifyRequestList`
+    /// (319) item on a PDU Session procedure (TS 23.247 §7.2.1.3).
+    ///
+    /// Refuses, rather than creating the session, when this gNB is not already
+    /// radiating that TMGI in `cell_id`. Establishing it here would need the
+    /// Distribution Setup procedures (69/70) against the MB-UPF, which this node
+    /// has no user-plane path for — the same reason procedures 68 and 73 are left
+    /// unrouted. Admitting the join anyway would tell the AMF a UE is receiving a
+    /// session no traffic can reach it on.
+    pub fn join_ue(
+        &mut self,
+        tmgi: &[u8; 6],
+        ue_id: i32,
+        cell_id: i32,
+    ) -> Result<MbsJoinAccepted, MbsJoinRefusal> {
+        let session = self
+            .sessions
+            .get_mut(tmgi)
+            .ok_or(MbsJoinRefusal::UnknownSession)?;
+
+        if !session.active_cells.contains(&cell_id) {
+            return Err(MbsJoinRefusal::NotActiveInCell);
+        }
+        if session.is_broadcast {
+            return Err(MbsJoinRefusal::BroadcastSessionHasNoMembership);
+        }
+
+        let newly_joined = session.ue_join(ue_id);
+        Ok(MbsJoinAccepted {
+            newly_joined,
+            member_count: session.joined_ues.len(),
+        })
+    }
+
+    /// Removes a UE from the session named by `tmgi`, for an
+    /// `MBSSessionToReleaseList` (317) item.
+    ///
+    /// Returns whether the UE was a member. A leave for an unknown TMGI or a
+    /// non-member is not an error: the AMF's intent — that the UE no longer
+    /// receive the session — already holds.
+    pub fn leave_ue(&mut self, tmgi: &[u8; 6], ue_id: i32) -> bool {
+        self.sessions
+            .get_mut(tmgi)
+            .is_some_and(|session| session.ue_leave(ue_id))
+    }
+
+    /// Drops a UE from every session it had joined, returning the TMGIs it left.
+    ///
+    /// Called when a UE context goes away, so a released UE does not linger as a
+    /// member of a session that is still radiating. Without this a long-lived
+    /// session would accumulate the ids of every UE that ever joined it, and
+    /// `member_count` would stop meaning anything.
+    pub fn remove_ue_everywhere(&mut self, ue_id: i32) -> Vec<[u8; 6]> {
+        let mut left = Vec::new();
+        for (tmgi, session) in self.sessions.iter_mut() {
+            if session.ue_leave(ue_id) {
+                left.push(*tmgi);
+            }
+        }
+        left
+    }
+
+    /// The sessions a given UE has joined.
+    pub fn sessions_for_ue(&self, ue_id: i32) -> Vec<&GnbMbsSession> {
+        self.sessions.values().filter(|s| s.has_ue(ue_id)).collect()
+    }
+}
+
+/// What the gNB recorded when it admitted a UE's MBS join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MbsJoinAccepted {
+    /// `false` when the UE was already a member, so the join was a repeat.
+    pub newly_joined: bool,
+    /// How many UEs are members after the join.
+    pub member_count: usize,
+}
+
+/// Why the gNB refused a UE's MBS join.
+///
+/// Distinct variants rather than one error because they map to different NGAP
+/// causes and tell the AMF different things to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MbsJoinRefusal {
+    /// No session with that TMGI has been activated at this gNB.
+    ///
+    /// TS 38.413's `unknown-MBS-Session-ID` names exactly this case.
+    UnknownSession,
+    /// The session exists but is not being radiated in the UE's serving cell,
+    /// which is `indicated-MBS-session-area-information-not-served-by-the-gNB`.
+    NotActiveInCell,
+    /// The TMGI names a broadcast session, which has no per-UE membership.
+    BroadcastSessionHasNoMembership,
+}
+
+impl MbsJoinRefusal {
+    /// A short reason for logs and for the Error Indication's diagnostics.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownSession => "no MBS session with that TMGI is active at this gNB",
+            Self::NotActiveInCell => "the MBS session is not radiating in the UE's serving cell",
+            Self::BroadcastSessionHasNoMembership => {
+                "the TMGI names a broadcast session, which has no per-UE membership"
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +415,41 @@ mod tests {
         assert!(!s.ue_join(0x0100));
     }
 
+    /// Two different UEs are two different members.
+    ///
+    /// This is the guard on the keying fix from issue #188: membership used to be
+    /// keyed by C-RNTI, and every UE in this simulator carries the same
+    /// `SIMULATED_C_RNTI`, so the second UE's join was silently swallowed and the
+    /// first UE's leave evicted both. Keyed by `ue_id` both are held.
+    #[test]
+    fn two_ues_are_two_distinct_members() {
+        let mut s = test_session();
+        assert!(s.ue_join(1), "the first UE joins");
+        assert!(
+            s.ue_join(2),
+            "the second UE is a distinct member, not a repeat"
+        );
+        assert_eq!(s.joined_ues.len(), 2);
+        assert!(s.has_ue(1) && s.has_ue(2));
+
+        assert!(s.ue_leave(1), "the first UE leaves");
+        assert!(
+            s.has_ue(2),
+            "one UE leaving must not evict the other: that is the C-RNTI collision \
+             this keying exists to avoid"
+        );
+        assert_eq!(s.joined_ues.len(), 1);
+    }
+
+    /// A repeated join is reported as a repeat rather than counted twice.
+    #[test]
+    fn a_repeated_join_is_not_a_second_membership() {
+        let mut s = test_session();
+        assert!(s.ue_join(7));
+        assert!(!s.ue_join(7), "the same UE joining again is not new");
+        assert_eq!(s.joined_ues.len(), 1);
+    }
+
     #[test]
     fn test_manager_start_stop() {
         let mut mgr = NgapMbsManager::new();
@@ -303,5 +490,157 @@ mod tests {
         mgr.start_session(s);
         assert_eq!(mgr.sessions_for_cell(5).len(), 1);
         assert!(mgr.sessions_for_cell(99).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Per-UE membership through the manager (issue #188)
+    // ------------------------------------------------------------------
+
+    const CELL: i32 = 5;
+
+    fn manager_radiating_in_cell() -> NgapMbsManager {
+        let mut mgr = NgapMbsManager::new();
+        let mut s = test_session();
+        s.activate_cell(CELL);
+        mgr.start_session(s);
+        mgr
+    }
+
+    /// A join against a session this cell radiates is admitted, and the UE's
+    /// membership is then observable through the manager.
+    #[test]
+    fn a_joined_ue_is_observable_through_the_manager() {
+        let mut mgr = manager_radiating_in_cell();
+
+        let accepted = mgr
+            .join_ue(&TEST_TMGI, 42, CELL)
+            .expect("the session is radiating in this cell");
+        assert!(accepted.newly_joined);
+        assert_eq!(accepted.member_count, 1);
+
+        assert!(
+            mgr.get(&TEST_TMGI).expect("the session").has_ue(42),
+            "the join must be recorded on the session, not just reported"
+        );
+        assert_eq!(
+            mgr.sessions_for_ue(42)
+                .iter()
+                .map(|s| s.tmgi)
+                .collect::<Vec<_>>(),
+            vec![TEST_TMGI],
+            "the UE's memberships must be discoverable from the UE side too"
+        );
+    }
+
+    /// A join naming a TMGI this gNB never activated is refused with the reason
+    /// TS 38.413's `unknown-MBS-Session-ID` names — not silently created.
+    #[test]
+    fn a_join_for_an_unactivated_tmgi_is_refused() {
+        let mut mgr = manager_radiating_in_cell();
+        assert_eq!(
+            mgr.join_ue(&[0x99; 6], 42, CELL),
+            Err(MbsJoinRefusal::UnknownSession)
+        );
+        assert_eq!(
+            mgr.session_count(),
+            1,
+            "a refused join must not conjure a session: establishing one needs the \
+             Distribution Setup this node cannot do"
+        );
+    }
+
+    /// A session that exists but is not radiating in the UE's cell is refused,
+    /// because traffic could not reach the UE there.
+    #[test]
+    fn a_join_in_a_cell_not_radiating_the_session_is_refused() {
+        let mut mgr = manager_radiating_in_cell();
+        assert_eq!(
+            mgr.join_ue(&TEST_TMGI, 42, CELL + 1),
+            Err(MbsJoinRefusal::NotActiveInCell)
+        );
+        assert!(
+            !mgr.get(&TEST_TMGI).expect("the session").has_ue(42),
+            "a refused join must leave no membership behind"
+        );
+    }
+
+    /// A broadcast session has no per-UE membership, so a join against one is
+    /// refused rather than recorded (TS 23.247 §4.2).
+    #[test]
+    fn a_join_against_a_broadcast_session_is_refused() {
+        let mut mgr = NgapMbsManager::new();
+        let mut s = GnbMbsSession::new_broadcast("bc-1".into(), TEST_TMGI);
+        s.activate_cell(CELL);
+        mgr.start_session(s);
+
+        assert_eq!(
+            mgr.join_ue(&TEST_TMGI, 42, CELL),
+            Err(MbsJoinRefusal::BroadcastSessionHasNoMembership)
+        );
+    }
+
+    /// A leave removes exactly the named UE from exactly the named session.
+    #[test]
+    fn a_leave_removes_only_that_ue_from_only_that_session() {
+        let mut mgr = manager_radiating_in_cell();
+        let other_tmgi = [0x11; 6];
+        let mut other = GnbMbsSession::new_multicast("mbs-002".into(), other_tmgi);
+        other.activate_cell(CELL);
+        mgr.start_session(other);
+
+        mgr.join_ue(&TEST_TMGI, 1, CELL).expect("join a");
+        mgr.join_ue(&TEST_TMGI, 2, CELL).expect("join a");
+        mgr.join_ue(&other_tmgi, 1, CELL).expect("join b");
+
+        assert!(mgr.leave_ue(&TEST_TMGI, 1));
+
+        assert!(
+            !mgr.get(&TEST_TMGI).unwrap().has_ue(1),
+            "UE 1 left session A"
+        );
+        assert!(
+            mgr.get(&TEST_TMGI).unwrap().has_ue(2),
+            "UE 2 was not asked to leave"
+        );
+        assert!(
+            mgr.get(&other_tmgi).unwrap().has_ue(1),
+            "UE 1's membership of the other session is untouched"
+        );
+    }
+
+    /// Leaving a session the UE never joined, or an unknown TMGI, reports that
+    /// rather than erroring: the AMF's intent already holds.
+    #[test]
+    fn leaving_without_a_membership_reports_it() {
+        let mut mgr = manager_radiating_in_cell();
+        assert!(!mgr.leave_ue(&TEST_TMGI, 99), "UE 99 was never a member");
+        assert!(!mgr.leave_ue(&[0x99; 6], 1), "that TMGI is not active here");
+    }
+
+    /// A released UE is dropped from every session it had joined, so a session's
+    /// member count keeps meaning "UEs currently receiving this".
+    #[test]
+    fn releasing_a_ue_drops_it_from_every_session() {
+        let mut mgr = manager_radiating_in_cell();
+        let other_tmgi = [0x11; 6];
+        let mut other = GnbMbsSession::new_multicast("mbs-002".into(), other_tmgi);
+        other.activate_cell(CELL);
+        mgr.start_session(other);
+
+        mgr.join_ue(&TEST_TMGI, 1, CELL).expect("join a");
+        mgr.join_ue(&other_tmgi, 1, CELL).expect("join b");
+        mgr.join_ue(&TEST_TMGI, 2, CELL).expect("join a as UE 2");
+
+        let mut left = mgr.remove_ue_everywhere(1);
+        left.sort_unstable();
+        let mut expected = vec![TEST_TMGI, other_tmgi];
+        expected.sort_unstable();
+        assert_eq!(left, expected, "both memberships must be reported as left");
+
+        assert!(mgr.sessions_for_ue(1).is_empty());
+        assert!(
+            mgr.get(&TEST_TMGI).unwrap().has_ue(2),
+            "releasing UE 1 must not evict UE 2"
+        );
     }
 }
