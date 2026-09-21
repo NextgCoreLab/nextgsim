@@ -380,6 +380,50 @@ jobs:
           cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
           cargo clippy -p nextgsim-ue --features sidelink --all-targets
 
+  pqc:
+    name: Post-quantum crypto (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `pqc` feature (issue #22) is off by default because 3GPP has frozen no
+      # normative PQC specification, so no procedure calls ML-KEM or ML-DSA and
+      # enabling them would pull two pre-1.0 release-candidate crates into every
+      # default build of the workspace. So the default jobs above compile NONE of
+      # `pqc_kem`, `pqc_sign` or `hybrid` -- and unlike the other features here,
+      # this one gates code that used to be UNCONDITIONAL, which inverts the risk
+      # exactly as `sidelink` does: without this job the whole post-quantum
+      # surface, its 29 existing tests AND the new FIPS 203/204 known-answer tests
+      # would silently stop being built the moment the gate landed. That is the
+      # recorded failure mode for feature-gated code in this repo (issues #33, #139).
+      #
+      # The KATs are the point of the job, not a side effect: they are the only
+      # tests that hold our byte encodings to NIST ACVP rather than to themselves,
+      # and they are the reason `ml-kem`'s `deterministic` feature is a hard
+      # requirement of `pqc` (see nextgsim-crypto/Cargo.toml).
+      - name: cargo test (the whole post-quantum surface)
+        run: cargo test -p nextgsim-crypto --features pqc
+      - name: cargo test (the FIPS 203/204 known-answer tests specifically)
+        # Named separately so a KAT regression is legible in the job log rather
+        # than buried among ~200 crypto tests. `kat_` is the naming convention for
+        # every vector-backed test in the three modules.
+        run: cargo test -p nextgsim-crypto --features pqc kat_
+      # The feature must also come OFF cleanly: `nextgsim-crypto` is a dependency
+      # of the NAS, PDCP, RRC, gNB and UE crates, so a stray unguarded `use` of a
+      # gated module would break the default build of half the workspace. The
+      # default `check` job covers that, and this makes the negative arm explicit
+      # for the crate itself.
+      - name: cargo test (default features, no PQC)
+        run: cargo test -p nextgsim-crypto
+      - name: cargo clippy
+        run: |
+          cargo clippy -p nextgsim-crypto --features pqc --all-targets
+          cargo clippy -p nextgsim-crypto --all-targets
+
   docker-build:
     name: Docker Build
     if: ${{ github.event_name == 'workflow_dispatch' }}

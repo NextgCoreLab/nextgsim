@@ -36,7 +36,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 | Package | Category | LoC | Completion | Status | Critical 6G Gaps |
 |---------|----------|-----|------------|--------|------------------|
 | nextgsim-common | Core | 5,154 | 85% | Functional | Needs 6G config types (RIS, NTN, ISAC params) |
-| nextgsim-crypto | Core | 4,090 | 90% | Functional | Missing post-quantum crypto (Kyber, Dilithium) |
+| nextgsim-crypto | Core | 5,000 | 90% | Functional | PQC primitives present and ACVP-validated behind the `pqc` feature; no procedure uses them (no 3GPP spec to wire them into) |
 | nextgsim-sctp | Core | 1,330 | 75% | Functional | No multi-homing, path MTU, bundling |
 | nextgsim-nas | 5G Protocol | 10,252 | 60% | Partial | Missing config update, emergency, EAP-AKA' reauth |
 | nextgsim-ngap | 5G Protocol | ~365K bytes | 70% | Functional | Handover basic only, no AMF load balancing |
@@ -102,7 +102,7 @@ nextgsim is a pure Rust 5G UE/gNB simulator converted from UERANSIM, currently a
 - EAP-AKA' re-authentication not fully tested
 
 **6G Gaps:**
-- **Post-quantum cryptography (PQC):** No Kyber (ML-KEM), Dilithium (ML-DSA), or SPHINCS+ support. 3GPP SA3 is studying PQC migration per TR 33.871. This is critical for 6G security.
+- **Post-quantum cryptography (PQC):** ML-KEM (FIPS 203) at 512/768/1024, ML-DSA (FIPS 204) at 44/65/87 and a hybrid X25519+ML-KEM-768 KEM are implemented in `nextgsim-crypto` behind the off-by-default `pqc` feature, each validated against NIST ACVP known-answer vectors rather than only self-round-trip. SLH-DSA (SPHINCS+) and FN-DSA (Falcon) are still absent. The open gap is not the primitives but their USE: 3GPP SA3's PQC migration is study-phase (TR 33.871) with no frozen stage-3 specification, so there is no standardised procedure to carry a PQC key exchange or signature, and nothing outside the crypto crate calls these functions.
 - **Homomorphic encryption:** No support for privacy-preserving computation needed for federated learning
 - **Zero-knowledge proofs:** Not implemented (useful for privacy-preserving authentication in 6G)
 - **Quantum key distribution (QKD):** No QKD integration framework
@@ -631,7 +631,7 @@ These 5G gaps must be resolved before meaningful 6G simulation is possible:
 
 ### Phase 4: 6G Advanced Features (Months 9-12) -- New Capabilities
 1. NTN support: prototype modules exist (timing advance, ephemeris, constellation, ISL handover) — remaining work is satellite cell selection, wire-conformant NAS/RRC encodings, and wiring into live signaling
-2. Post-quantum cryptography: Kyber/Dilithium integration
+2. Post-quantum cryptography: the ML-KEM/ML-DSA/hybrid primitives already exist and are ACVP-validated (`pqc` feature); the remaining work is procedure integration, which is gated on 3GPP freezing a normative PQC specification
 3. Digital twin network framework
 4. Zero-energy device / ambient IoT simulation (UE-side prototype exists: energy harvesting + fleet sim; extend beyond sim-internal)
 5. JCC (Joint Communication and Computing) framework
@@ -670,7 +670,7 @@ These 5G gaps must be resolved before meaningful 6G simulation is possible:
 
 3. **Use existing ONNX ecosystem:** The nextgsim-ai ONNX Runtime integration is well-designed. Leverage it to create pre-trained models for NWDAF (trajectory prediction), ISAC (positioning), and semantic (encoding/decoding) rather than building custom ML frameworks.
 
-4. **Post-quantum crypto urgency:** 3GPP SA3 is actively studying PQC migration. Adding Kyber and Dilithium support early positions the simulator for testing PQC-enabled procedures ahead of standardization.
+4. **Post-quantum crypto:** the ML-KEM and ML-DSA primitives are in place and held to NIST ACVP vectors, so the simulator is positioned for PQC-enabled procedures. Resist wiring them into an invented procedure: 3GPP SA3's migration work is study-phase (TR 33.871), and a bespoke PQC handshake would be a divergence from the standard rather than a head start on it. The useful next step when a specification lands is a conformance target, not more primitives.
 
 ### Testing Recommendations
 
