@@ -1,0 +1,50 @@
+[package]
+name = "asn1-compiler"
+version = "0.7.2"
+authors = ["Ystero Project Developers <hello@ystero.dev>"]
+edition = "2018"
+description = "Compiler for compiling ASN.1 specs to Rust, with PER Codec support and derive macros for PER Codecs."
+keywords = ["asn1", "per"]
+repository = "https://github.com/gabhijit/hampi.git"
+homepage = "https://ystero.dev"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+include = [
+	"tests/**/*.rs",
+	"src/**/*.rs",
+	"README.md",
+	"ARCHITECTURE.md",
+	"Cargo.toml",
+	"LICENSE",
+	"LICENSE-MIT",
+	"LICENSE-Apache2"
+]
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+lazy_static = { version = "1.4.0" }
+topological-sort = { version = "0.2" }
+proc-macro2 = { version = "1.0" }
+quote = { version = "1.0" }
+heck = { version = "0.4" }
+bitvec = { version = "1.0" }
+clap = { version = "4.4", features = ["derive"] }
+docx-rs = { version = "0.4.5" , optional = true }
+regex = { version = "1.6.0" }
+log = { version = "0.4" }
+env_logger = { version = "0.10" }
+anyhow = "1.0.86"
+
+[features]
+rs-specs-gen = [ "docx-rs"]
+
+[[bin]]
+name = "rs-asn1c"
+path = "src/bin/hampi-rs-asn1c.rs"
+
+[[bin]]
+name = "extract-asn-spec"
+required-features = ["rs-specs-gen"]
+path = "src/bin/extract-asn-spec.rs"

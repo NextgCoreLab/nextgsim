@@ -1,10 +1,39 @@
-//! MBS (Multicast-Broadcast Services) NGAP Session Procedures for gNB (Rel-17, TS 38.413 §8.21)
+//! MBS (Multicast-Broadcast Services) session state at the gNB (Rel-17)
 //!
-//! Implements gNB-side MBS NGAP signaling:
-//! - MBSSessionStart / MBSSessionStartResponse
-//! - MBSSessionStop / MBSSessionStopResponse
-//! - MBSSessionProgressTransfer for MCCH broadcast
-//! - Per-cell MBS area session tracking
+//! This is the state machine the NGAP task drives when an MBS procedure arrives
+//! on the NG-C association. The wire codec lives in
+//! `nextgsim_ngap::procedures::mbs`; this module holds only what the gNB
+//! remembers between messages:
+//!
+//! - which MBS sessions exist, keyed by the session id the AMF sent;
+//! - which cells are currently radiating each session;
+//! - which UEs have joined a multicast (as opposed to broadcast) session.
+//!
+//! # Which procedures reach it
+//!
+//! `NgapMbsManager` is driven from `NgapTask::handle_ngap_pdu` for the three
+//! AMF-initiated MBS procedures of TS 38.413 §9.2.9:
+//!
+//! - 71 `id-MulticastSessionActivation` -> [`NgapMbsManager::start_session`],
+//!   answered with a `MulticastSessionActivationResponse`;
+//! - 72 `id-MulticastSessionDeactivation` -> [`NgapMbsManager::stop_session`],
+//!   answered with a `MulticastSessionDeactivationResponse`;
+//! - 74 `id-MulticastGroupPaging` -> [`NgapMbsManager::sessions_for_cell`] to
+//!   decide whether this cell carries the paged group.
+//!
+//! Procedure 68 (`id-BroadcastSessionSetup`) is deliberately NOT routed here.
+//! It is a *broadcast* session setup whose `BroadcastSessionSetupRequest`
+//! carries `MBS-ServiceArea` and `MBS-SessionTNLInfo5GC` — an MB-UPF tunnel this
+//! state machine has no field for — so accepting it would record a session the
+//! gNB cannot actually deliver. See `handle_unroutable_pdu`: it is answered with
+//! an Error Indication, which is the conformant response to a procedure the node
+//! does not support (TS 38.413 §8.7.5).
+//!
+//! # Session identity
+//!
+//! Sessions are keyed by the 6 TMGI octets as they arrived, not by a formatted
+//! string, so a lookup cannot miss because two code paths disagreed on hex case
+//! or on which half of the TMGI comes first (TS 23.003 §30.2).
 
 use std::collections::{HashMap, HashSet};
 
@@ -129,10 +158,18 @@ impl GnbMbsSession {
 }
 
 /// NGAP MBS session manager at gNB
+///
+/// Driven by `NgapTask::handle_ngap_pdu` for procedures 71, 72 and 74; see the
+/// module docs.
 #[derive(Debug, Default)]
 pub struct NgapMbsManager {
-    /// Active MBS sessions keyed by session ID
-    sessions: HashMap<String, GnbMbsSession>,
+    /// Active MBS sessions keyed by the 6 TMGI octets.
+    ///
+    /// Keyed by the raw octets rather than by `mbs_session_id`'s formatted text
+    /// because the TMGI is what the AMF actually puts in `id-MBS-SessionID`
+    /// (299) on every MBS message, so it is the only identifier a deactivation
+    /// or a group paging is guaranteed to arrive with.
+    sessions: HashMap<[u8; 6], GnbMbsSession>,
 }
 
 impl NgapMbsManager {
@@ -140,24 +177,36 @@ impl NgapMbsManager {
         Self::default()
     }
 
-    /// Processes MBSSessionStart from AMF
+    /// Records the session a `MulticastSessionActivationRequest` activated
+    /// (TS 38.413 §9.2.9.1).
+    ///
+    /// Re-activating an existing TMGI replaces the session, which is what the
+    /// AMF asking again means: the previous context is stale.
     pub fn start_session(&mut self, session: GnbMbsSession) -> &GnbMbsSession {
-        let id = session.mbs_session_id.clone();
-        self.sessions.insert(id.clone(), session);
-        &self.sessions[&id]
+        let tmgi = session.tmgi;
+        self.sessions.insert(tmgi, session);
+        &self.sessions[&tmgi]
     }
 
-    /// Processes MBSSessionStop from AMF
-    pub fn stop_session(&mut self, session_id: &str) -> Option<GnbMbsSession> {
-        if let Some(s) = self.sessions.get_mut(session_id) {
-            s.state = GnbMbsState::Stopped;
-        }
-        self.sessions.remove(session_id)
+    /// Removes the session a `MulticastSessionDeactivationRequest` named
+    /// (TS 38.413 §9.2.9.3), returning it in the `Stopped` state.
+    ///
+    /// Returns `None` for a TMGI this gNB never activated, so the caller can
+    /// tell "torn down" from "was never here".
+    pub fn stop_session(&mut self, tmgi: &[u8; 6]) -> Option<GnbMbsSession> {
+        let mut session = self.sessions.remove(tmgi)?;
+        session.state = GnbMbsState::Stopped;
+        Some(session)
     }
 
-    /// Gets a session mutably
-    pub fn get_mut(&mut self, session_id: &str) -> Option<&mut GnbMbsSession> {
-        self.sessions.get_mut(session_id)
+    /// Gets a session mutably by TMGI
+    pub fn get_mut(&mut self, tmgi: &[u8; 6]) -> Option<&mut GnbMbsSession> {
+        self.sessions.get_mut(tmgi)
+    }
+
+    /// Gets a session by TMGI
+    pub fn get(&self, tmgi: &[u8; 6]) -> Option<&GnbMbsSession> {
+        self.sessions.get(tmgi)
     }
 
     /// Returns all sessions active on a given cell
@@ -177,8 +226,10 @@ impl NgapMbsManager {
 mod tests {
     use super::*;
 
+    const TEST_TMGI: [u8; 6] = [0xAB, 0xCD, 0xEF, 0x01, 0x02, 0x03];
+
     fn test_session() -> GnbMbsSession {
-        GnbMbsSession::new_multicast("mbs-001".into(), [0xAB, 0xCD, 0xEF, 0x01, 0x02, 0x03])
+        GnbMbsSession::new_multicast("mbs-001".into(), TEST_TMGI)
     }
 
     #[test]
@@ -217,8 +268,31 @@ mod tests {
         let mut mgr = NgapMbsManager::new();
         mgr.start_session(test_session());
         assert_eq!(mgr.session_count(), 1);
-        mgr.stop_session("mbs-001");
+        let stopped = mgr
+            .stop_session(&TEST_TMGI)
+            .expect("the session was started");
+        assert_eq!(stopped.state, GnbMbsState::Stopped);
         assert_eq!(mgr.session_count(), 0);
+    }
+
+    /// Deactivating a TMGI that was never activated reports that, rather than
+    /// reporting a successful teardown of nothing.
+    #[test]
+    fn stopping_an_unknown_tmgi_reports_it() {
+        let mut mgr = NgapMbsManager::new();
+        mgr.start_session(test_session());
+        assert!(mgr.stop_session(&[0x99; 6]).is_none());
+        assert_eq!(mgr.session_count(), 1, "the real session must survive");
+    }
+
+    /// A session is looked up by the TMGI octets the AMF sends, so the NGAP
+    /// dispatch path can find it from `id-MBS-SessionID` (299) alone.
+    #[test]
+    fn a_session_is_found_by_its_tmgi() {
+        let mut mgr = NgapMbsManager::new();
+        mgr.start_session(test_session());
+        assert_eq!(mgr.get(&TEST_TMGI).map(|s| s.tmgi), Some(TEST_TMGI));
+        assert!(mgr.get(&[0x00; 6]).is_none());
     }
 
     #[test]

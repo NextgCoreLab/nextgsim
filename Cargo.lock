@@ -91,8 +91,6 @@ dependencies = [
 [[package]]
 name = "asn1-compiler"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f9b64c8cf0a213ff6fa91270a6b520013135b1a9936b28f47b91fc19357e6a"
 dependencies = [
  "anyhow",
  "bitvec",

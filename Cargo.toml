@@ -95,7 +95,18 @@ asn1_codecs_derive = { path = "vendor/asn1_codecs_derive" }
 bitvec = "1"
 log = "0.4"
 env_logger = "0.11"
-asn1-compiler = "0.7"
+# Forked under vendor/ (#185). Upstream 0.7.2 silently DROPS an
+# information-object-class field written inline as a base type rather than as a
+# named type reference -- in NGAP, `TYPE OCTET STRING (CONTAINING <Transfer>)`.
+# The variant is omitted from the generated OPEN-type enum with no error, so
+# decoding a PDU carrying that IE fails with `Key <id> Not Found`. In TS 38.413
+# V17.9 this hit 14 ProtocolIE entries, ALL of them MBS, including IE 304
+# (id-MulticastSessionActivationRequestTransfer) -- one of the two mandatory IEs
+# of MulticastSessionActivationRequest. So the gNB could not decode an MBS
+# session activation at all. The fork accepts any resolved type at that site;
+# the change is purely additive (19 IE variants gained, none removed or
+# retyped). See vendor/asn1-compiler/src/resolver/asn/types/constructed.rs.
+asn1-compiler = { path = "vendor/asn1-compiler" }
 
 # Property-based testing (dev-dependency only: generator-driven codec round trips)
 proptest = "1"
@@ -157,6 +168,10 @@ inefficient_to_string = "warn"
 # contain two different `asn1-codecs` -- the derive macro emitting calls against a
 # codec whose extended-CHOICE encoder still refuses. The symptom would be a type
 # error or, worse, a silent split where the fix appears not to take effect.
+# `asn1-compiler` is patched here too (#185) so that any crate reaching it
+# transitively regenerates from the fixed resolver rather than from the registry
+# copy that drops the inline-CONTAINING IEs.
 [patch.crates-io]
 asn1-codecs = { path = "vendor/asn1-codecs" }
 asn1_codecs_derive = { path = "vendor/asn1_codecs_derive" }
+asn1-compiler = { path = "vendor/asn1-compiler" }
