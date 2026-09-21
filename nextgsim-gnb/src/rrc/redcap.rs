@@ -276,34 +276,42 @@ impl RedCapRrcConfig {
     }
 }
 
-/// The RedCap restrictions in force for one UE, as **reported**, not as enforced on a
-/// resource grid (#164).
+/// The RedCap restrictions in force for one UE: the bandwidth limit is **enforced** on this
+/// gNB's own grants, the other three are **reported** only (#164, then #57).
 ///
-/// # The ceiling, stated here because this is where a reader looks for it
+/// # Which is which, stated here because this is where a reader looks for it
 ///
 /// Every field below is a real ceiling derived from the UE's declared capabilities
-/// (TS 38.306 §4.2.21.1), and the gNB reports all four at RRC Setup Complete. **None of
-/// them is enforced against a resource allocation, because this simulator has no PRB
-/// scheduler to enforce them against.** `restricted_bandwidth_mhz` clamps the cell's
-/// serving bandwidth and the equivalent PRB ceiling is derived from it, but nothing
-/// subsequently refuses a grant that exceeds it — there are no grants.
+/// (TS 38.306 §4.2.21.1), and the gNB reports all four when the UE declares
+/// `supportOfRedCap-r17`.
 ///
-/// # Why the wire field is not emitted, which is #164's actual question
+/// - `max_bandwidth_mhz` **is enforced**, since #57. `RrcTask::apply_redcap_restrictions`
+///   derives the equivalent PRB ceiling, scales it into a MAC grant ceiling in octets, and
+///   installs it on the RLS task, which applies it at every `RlcEntity::build_pdu` for that
+///   UE. Grants are the only per-UE resource quantity this simulator allocates, so a
+///   narrower carrier shows up as smaller, more numerous RLC PDUs. #164 recorded this as
+///   unenforceable because "there are no grants"; that premise was wrong —
+///   `rls::task::MAC_GRANT_BYTES` was already a live per-UE grant at two call sites.
+/// - `max_mimo_layers`, `half_duplex_fdd` and `harq_timing_offset` are **reported only**.
+///   Nothing in this tree models MIMO layers, duplex gaps or HARQ timing, so there is no
+///   allocation for them to constrain. They are logged so an operator can see what the UE's
+///   RF would bound it to, and that is the whole of their effect.
 ///
-/// A conformance peer would look for this in `BWP-DownlinkCommon`'s
-/// `locationAndBandwidth`, inside the `spCellConfig` that
-/// `build_srb1_cell_group_config` omits **on purpose** (its own doc comment records
-/// `spCellConfig`, `mac-CellGroupConfig` and `physicalCellGroupConfig` as deliberately
-/// absent). Emitting it was considered and rejected: `grep` finds no PRB, carrier-bandwidth
-/// or `locationAndBandwidth` modelling anywhere in `nextgsim-gnb` or `nextgsim-ue`, so the
-/// field would be a number on the wire that neither end applies — one honest gap traded for
-/// a larger dishonest surface. That follows this project's recorded rule: **store a
-/// non-normative or unenforceable value and report it as inert, rather than inventing
+/// # Why the wire field is still not emitted, which is #164's actual question
+///
+/// A conformance peer would look for the bandwidth restriction in `BWP-DownlinkCommon`'s
+/// `locationAndBandwidth`, inside the `spCellConfig` that `build_srb1_cell_group_config`
+/// omits **on purpose** (its own doc comment records `spCellConfig`, `mac-CellGroupConfig`
+/// and `physicalCellGroupConfig` as deliberately absent). Emitting it was considered and
+/// rejected: `grep` finds no PRB, carrier-bandwidth or `locationAndBandwidth` modelling
+/// anywhere in `nextgsim-gnb` or `nextgsim-ue`, so the field would be a number on the wire
+/// that neither end applies — one honest gap traded for a larger dishonest surface. That
+/// follows this project's recorded rule: **report a value as inert rather than inventing
 /// execution semantics for it.**
 ///
-/// Enforcement needs two things this tree does not have, in this order: a BWP/carrier
-/// configuration surface in the RRCSetup, and a scheduler whose grants it constrains.
-/// Until both exist, a reported ceiling is the honest maximum.
+/// So the bandwidth restriction is enforced *locally* and is not yet *signalled*: a
+/// conformance peer still cannot observe it, while a capacity study run against this
+/// simulator now sees a RedCap UE take its reduced share.
 #[derive(Debug, Clone)]
 pub struct RedCapRestrictions {
     /// Maximum bandwidth in MHz

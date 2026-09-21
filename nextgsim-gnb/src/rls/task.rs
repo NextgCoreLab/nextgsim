@@ -36,11 +36,23 @@ const HEARTBEAT_CHECK_INTERVAL_MS: u64 = 500;
 /// Maximum UDP receive buffer size
 const UDP_BUFFER_SIZE: usize = 65535;
 
-/// MAC grant size handed to RLC when building PDUs.
+/// MAC grant size handed to RLC when building PDUs, for a UE under no
+/// capability-derived restriction.
 ///
 /// This simulator has no MAC scheduler; a 1500-byte grant stands in for one so a
-/// typical IP packet fits in a single PDU.
-const MAC_GRANT_BYTES: usize = 1500;
+/// typical IP packet fits in a single PDU. It is the *cell* budget: the whole of
+/// what a normal FR1 UE (100 MHz / 273 PRB at 30 kHz SCS, TS 38.101-1
+/// Table 5.3.2-1) may be handed in one transmission here.
+///
+/// A RedCap UE gets less, and gets it through [`RlsTask::mac_grant_for`] rather
+/// than by reading this constant directly — see that function for why the ceiling
+/// is applied on this value and not on a resource grid.
+///
+/// `pub(crate)` so the RRC task can scale a per-UE ceiling *off this value* when it
+/// derives one (issue #57). Writing 1500 there instead would make the cell budget
+/// two constants that must be changed together, and the ceiling would silently stop
+/// matching the grant it is supposed to bound.
+pub(crate) const MAC_GRANT_BYTES: usize = 1500;
 
 /// RLS Task for managing radio link simulation
 pub struct RlsTask {
@@ -97,6 +109,19 @@ pub struct RlsTask {
     /// so the elapsed time has to be measured rather than assumed from the timer
     /// period -- a busy task ticks late and would otherwise overstate throughput.
     load_window_start: Instant,
+    /// The MAC grant ceiling in force for one UE, in octets, for those UEs whose
+    /// declared capabilities bound them below the cell budget (issue #57).
+    ///
+    /// Absent means unrestricted, which is every UE until RRC says otherwise: a
+    /// normal UE has no capability-derived ceiling to record, so the map stays
+    /// empty in the common case rather than holding `MAC_GRANT_BYTES` per UE.
+    ///
+    /// Populated from [`RlsMessage::SetUeGrantCeiling`], which the RRC task sends
+    /// when it learns a UE is RedCap from `supportOfRedCap-r17`
+    /// (TS 38.331 §6.3.3). Read by [`RlsTask::mac_grant_for`] at every point a
+    /// grant is handed to RLC, which is what makes the ceiling enforced rather
+    /// than merely stored -- the defect issue #57 was filed about.
+    ue_grant_ceiling: HashMap<i32, usize>,
 }
 
 impl RlsTask {
@@ -126,6 +151,7 @@ impl RlsTask {
             started_at: Instant::now(),
             load_window_octets: 0,
             load_window_start: Instant::now(),
+            ue_grant_ceiling: HashMap::new(),
         }
     }
 
@@ -151,6 +177,7 @@ impl RlsTask {
             started_at: Instant::now(),
             load_window_octets: 0,
             load_window_start: Instant::now(),
+            ue_grant_ceiling: HashMap::new(),
         }
     }
 
@@ -244,6 +271,84 @@ impl RlsTask {
             .unwrap_or(drb_id)
     }
 
+    /// The MAC grant, in octets, that this UE may be handed in one transmission.
+    ///
+    /// [`MAC_GRANT_BYTES`] for an unrestricted UE, and the recorded ceiling for a UE
+    /// whose declared capabilities bound it below that — today only a RedCap UE, whose
+    /// maximum bandwidth is 20 MHz in FR1 (TS 38.306 §4.2.21.1, vendored at
+    /// `6g_docs/specs/38306-j30.txt:29939-29942`: *"The maximum bandwidth is 20 MHz for
+    /// FR1 [...] UE features and corresponding capabilities related to UE bandwidths
+    /// wider than 20 MHz in FR1 [...] are not supported by RedCap UEs"*).
+    ///
+    /// # What is enforced here, and what is not
+    ///
+    /// This clamps the **transport-block-sized grant** handed to
+    /// [`RlcEntity::build_pdu`], which is the only per-UE resource quantity this
+    /// simulator actually allocates. It is NOT a PRB-level allocation on a resource
+    /// grid: there is no resource grid, and issue #164 recorded the decision not to
+    /// invent one. The grant is proportional to bandwidth (a narrower carrier carries
+    /// fewer bits per transmission), so scaling it by the same ratio as the PRB ceiling
+    /// is the faithful reduction available at this layer — and unlike the stored-and-
+    /// unread ceiling #57 was filed about, a UE's traffic demonstrably changes shape
+    /// when it is applied: an SDU over the ceiling is segmented into more, smaller RLC
+    /// PDUs. UM and AM both segment (TS 38.322 §5.2.2), so a smaller grant reduces
+    /// per-transmission throughput without stalling the bearer.
+    ///
+    /// Called at every `build_pdu` site rather than baked into the entity at
+    /// construction, because the RedCap declaration arrives in UE capability transfer —
+    /// after `RRCSetup`, and so potentially after a bearer already exists.
+    fn mac_grant_for(&self, ue_id: i32) -> usize {
+        Self::grant_from(&self.ue_grant_ceiling, ue_id)
+    }
+
+    /// [`Self::mac_grant_for`] over a borrowed ceiling map rather than `&self`.
+    ///
+    /// Separate so [`Self::poll_rlc_timers`] can consult the ceilings while it holds
+    /// `rlc_entities` mutably: a `&self` method would borrow the whole task and
+    /// conflict, whereas two disjoint field borrows do not. The alternative — copying
+    /// the map every tick — would allocate on a timer path to avoid a borrow that is
+    /// provably fine.
+    fn grant_from(ceilings: &HashMap<i32, usize>, ue_id: i32) -> usize {
+        ceilings
+            .get(&ue_id)
+            .copied()
+            .map_or(MAC_GRANT_BYTES, |ceiling| ceiling.min(MAC_GRANT_BYTES))
+    }
+
+    /// Records (or lifts) the MAC grant ceiling for one UE, from
+    /// [`RlsMessage::SetUeGrantCeiling`].
+    ///
+    /// A ceiling of zero is refused rather than stored: `build_pdu(0)` yields no PDU at
+    /// all, so it would silence the bearer entirely instead of narrowing it — a UE with
+    /// a very small bandwidth still has *some* capacity (the same reason
+    /// `redcap_prb_ceiling` floors to 1 rather than 0).
+    fn set_ue_grant_ceiling(&mut self, ue_id: i32, grant_octets: Option<usize>) {
+        match grant_octets {
+            Some(0) => {
+                warn!(
+                    "Refusing a zero MAC grant ceiling for UE[{ue_id}]: it would stop the \
+                     bearer rather than narrow it; leaving the previous ceiling in force"
+                );
+            }
+            Some(octets) => {
+                info!(
+                    "UE[{ue_id}]: MAC grant ceiling set to {octets} octets (was {}) -- \
+                     enforced on every RLC grant (TS 38.306 §4.2.21.1)",
+                    self.mac_grant_for(ue_id)
+                );
+                self.ue_grant_ceiling.insert(ue_id, octets);
+            }
+            None => {
+                if self.ue_grant_ceiling.remove(&ue_id).is_some() {
+                    info!(
+                        "UE[{ue_id}]: MAC grant ceiling lifted, back to the cell budget of \
+                         {MAC_GRANT_BYTES} octets"
+                    );
+                }
+            }
+        }
+    }
+
     /// Drives the RLC timers on every entity and transmits whatever they
     /// produce: a UM `t-Reassembly` expiry discards a stranded SDU
     /// (TS 38.322 §5.2.2.2.4), an AM `t-Reassembly` expiry triggers a STATUS
@@ -256,6 +361,9 @@ impl RlsTask {
         // from -- a PSI here would put a retransmission on the wrong DRB when a
         // session has two.
         let mut outbound: Vec<(i32, i32, Vec<u8>)> = Vec::new();
+        // Disjoint borrow: the loop holds `rlc_entities` mutably, so the ceilings are
+        // read through a separate field reference rather than `self.mac_grant_for`.
+        let ceilings = &self.ue_grant_ceiling;
         for ((ue_id, drb_id), rlc) in &mut self.rlc_entities {
             if rlc.poll_timers(now) {
                 debug!(
@@ -268,7 +376,10 @@ impl RlsTask {
             if let Some(status) = rlc.build_status_pdu() {
                 outbound.push((*ue_id, *drb_id, status));
             }
-            while let Some(retx) = rlc.build_pdu(MAC_GRANT_BYTES) {
+            // A retransmission is re-segmented against the grant in force NOW, so a UE
+            // that declared RedCap after the original transmission gets the narrower
+            // grant on the re-offer too (TS 38.306 §4.2.21.1).
+            while let Some(retx) = rlc.build_pdu(Self::grant_from(ceilings, *ue_id)) {
                 outbound.push((*ue_id, *drb_id, retx));
             }
         }
@@ -823,8 +934,9 @@ impl RlsTask {
     ///
     /// The SDU from GTP is submitted to the PDCP and RLC entities of the bearer
     /// `drb_id` names (UM, SN12). One or more RLC PDUs are then built and sent over
-    /// RLS to the UE. A 1500-byte MTU is used as the MAC grant size so that typical IP
-    /// packets fit in a single PDU.
+    /// RLS to the UE. The MAC grant size comes from [`Self::mac_grant_for`]: a
+    /// 1500-byte MTU for an unrestricted UE, so typical IP packets fit in a single
+    /// PDU, and the narrower capability-derived ceiling for a RedCap UE.
     ///
     /// Takes BOTH `psi` and `drb_id` because they answer different questions and are
     /// only the same number without `sdap-dataplane`: `drb_id` selects the entities and
@@ -867,12 +979,16 @@ impl RlsTask {
             #[cfg(not(feature = "drb-pdcp"))]
             let to_rlc: Vec<Vec<u8>> = vec![data.data().to_vec()];
 
+            // Resolved before the entity is borrowed mutably, and per UE rather than
+            // from the constant: this is the point at which issue #57's ceiling becomes
+            // enforcement instead of a stored number.
+            let grant = self.mac_grant_for(ue_id);
             let rlc = self.rlc_entity_for(ue_id, drb_id, psi);
             for sdu in to_rlc {
                 rlc.submit_sdu(sdu);
             }
             let mut pdus = Vec::new();
-            while let Some(rlc_pdu) = rlc.build_pdu(MAC_GRANT_BYTES) {
+            while let Some(rlc_pdu) = rlc.build_pdu(grant) {
                 pdus.push(rlc_pdu);
             }
             pdus
@@ -941,6 +1057,10 @@ impl RlsTask {
 
                 self.ue_addresses.remove(&ue_id_i32);
                 self.pending_acks.remove(&ue_id_i32);
+                // A capability-derived ceiling belongs to the UE, not to the id. Left
+                // behind, it would narrow the grants of whichever UE is allocated this
+                // id next -- which may not be RedCap at all.
+                self.ue_grant_ceiling.remove(&ue_id_i32);
 
                 // Find and remove STI mapping
                 let sti_to_remove: Vec<u64> = self
@@ -1027,6 +1147,9 @@ impl Task for RlsTask {
                                     // traffic does -- which is the normal order.
                                     self.drb_to_psi.insert((ue_id, drb_id), psi);
                                     self.install_drb_security(ue_id, drb_id, security.map(|b| *b));
+                                }
+                                RlsMessage::SetUeGrantCeiling { ue_id, grant_octets } => {
+                                    self.set_ue_grant_ceiling(ue_id, grant_octets);
                                 }
                                 RlsMessage::SignalDetected { ue_id } => {
                                     debug!("Signal detected notification for UE[{}]", ue_id);
@@ -1310,6 +1433,167 @@ mod tests {
             )),
             _ => None,
         }
+    }
+
+    /// Collects every datagram the task has already sent, returning each PDU's length
+    /// on the wire.
+    ///
+    /// Drains rather than waiting for a fixed count, because the number of PDUs is
+    /// exactly what the grant ceiling changes — a helper that asked for *n* PDUs would
+    /// have to know the answer the test is measuring. The short timeout ends the drain
+    /// once the socket is quiet; `handle_downlink_data` has already sent everything it
+    /// is going to before it returns, so nothing is still in flight.
+    async fn drain_pdu_payload_lengths(socket: &UdpSocket) -> Vec<usize> {
+        let mut lengths = Vec::new();
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        while let Ok(Ok(len)) =
+            tokio::time::timeout(Duration::from_millis(150), socket.recv(&mut buf)).await
+        {
+            let datagram = Bytes::copy_from_slice(&buf[..len]);
+            if let Ok(RlsProtocolMessage::PduTransmission(pdu)) = codec::decode(&datagram) {
+                lengths.push(pdu.pdu.len());
+            }
+        }
+        lengths
+    }
+
+    /// A RedCap UE's grants are clamped to its 20 MHz FR1 ceiling; a normal UE in the
+    /// same cell keeps the full budget (issue #57).
+    ///
+    /// # Why this is the test the issue asks for
+    ///
+    /// #57's live defect was a ceiling that was computed, stored and never read: the
+    /// getter exposing it had zero callers, so a RedCap UE was granted the whole cell
+    /// budget anyway. A test that only asserted the ceiling was *stored* would have
+    /// passed against that defect. So this drives the real downlink path
+    /// ([`RlsTask::handle_downlink_data`], the same function the `DownlinkData` arm of
+    /// the task loop calls) and measures the PDUs that actually leave the socket.
+    ///
+    /// # Why it is a contrast pair, and asserts equality
+    ///
+    /// Both UEs are given the SAME SDU on the SAME kind of bearer, differing only in
+    /// whether a ceiling was installed. The RedCap UE's largest PDU must equal its
+    /// ceiling and the normal UE's must equal the cell grant — positive assertions on
+    /// both sides. "Not more than 1500" would be satisfied by a path that sent nothing
+    /// at all, and by the pre-#57 code for the normal UE; "fewer PDUs" alone would not
+    /// show *which* UE was restricted. The pair is what distinguishes "the clamp is
+    /// applied to RedCap UEs" from "the grant got smaller for everyone".
+    ///
+    /// # Revert-verification
+    ///
+    /// Verified, not asserted: restoring `handle_downlink_data`'s `build_pdu(grant)` to
+    /// `build_pdu(MAC_GRANT_BYTES)` fails this test on the RedCap assertion with
+    /// `left: 1500, right: 300` — the UE takes the whole cell grant in 3 PDUs instead of
+    /// its ceiling — while the normal-UE assertion still passes. That asymmetry is what
+    /// shows the clamp, and not merely the plumbing, is what is being measured.
+    #[tokio::test]
+    async fn a_redcap_ues_grants_are_clamped_while_a_normal_ues_are_not() {
+        let redcap_ue = UdpSocket::bind("127.0.0.1:0").await.expect("RedCap socket");
+        let normal_ue = UdpSocket::bind("127.0.0.1:0").await.expect("normal socket");
+        let mut task = broadcasting_task().await;
+
+        const REDCAP_ID: i32 = 1;
+        const NORMAL_ID: i32 = 2;
+        task.ue_addresses
+            .insert(REDCAP_ID, redcap_ue.local_addr().unwrap());
+        task.ue_addresses
+            .insert(NORMAL_ID, normal_ue.local_addr().unwrap());
+
+        // A ceiling well under the cell grant, so the clamp is unambiguous in the PDU
+        // lengths. Installed through the same entry point the RRC task uses, so this
+        // test cannot pass against a ceiling the message handler ignores.
+        const CEILING: usize = 300;
+        task.set_ue_grant_ceiling(REDCAP_ID, Some(CEILING));
+        assert_eq!(
+            task.mac_grant_for(REDCAP_ID),
+            CEILING,
+            "precondition: the ceiling must be in force for the RedCap UE"
+        );
+        assert_eq!(
+            task.mac_grant_for(NORMAL_ID),
+            MAC_GRANT_BYTES,
+            "precondition: the normal UE must be unrestricted, or the contrast is void"
+        );
+
+        // Big enough that BOTH UEs segment, so neither side's result is "it fitted in
+        // one PDU" -- which would make the two indistinguishable.
+        let payload = OctetString::from_slice(&[0x7Eu8; 4000]);
+
+        task.handle_downlink_data(REDCAP_ID, 1, 1, payload.clone())
+            .await;
+        let redcap_pdus = drain_pdu_payload_lengths(&redcap_ue).await;
+
+        task.handle_downlink_data(NORMAL_ID, 1, 1, payload).await;
+        let normal_pdus = drain_pdu_payload_lengths(&normal_ue).await;
+
+        let redcap_largest = *redcap_pdus.iter().max().expect("RedCap UE got PDUs");
+        let normal_largest = *normal_pdus.iter().max().expect("normal UE got PDUs");
+
+        // Equality, not an upper bound: the RLC fills each grant before it segments, so
+        // the largest PDU of a segmented SDU IS the grant. An inequality here would also
+        // hold if the path sent one tiny PDU and dropped the rest.
+        assert_eq!(
+            redcap_largest,
+            CEILING,
+            "the RedCap UE's largest PDU must be exactly its {CEILING}-octet ceiling \
+             (TS 38.306 §4.2.21.1); got {redcap_largest} from {} PDU(s)",
+            redcap_pdus.len()
+        );
+        assert_eq!(
+            normal_largest, MAC_GRANT_BYTES,
+            "the normal UE must still get the full {MAC_GRANT_BYTES}-octet cell grant -- \
+             a clamp that narrowed every UE would be a regression, not a RedCap \
+             restriction; got {normal_largest}"
+        );
+        assert!(
+            redcap_pdus.len() > normal_pdus.len(),
+            "the same SDU under a narrower grant must take MORE PDUs: RedCap {} vs \
+             normal {}",
+            redcap_pdus.len(),
+            normal_pdus.len()
+        );
+    }
+
+    /// The ceiling belongs to the UE, not to the id it was allocated: a lost UE's
+    /// ceiling must not narrow the grants of whoever gets that id next.
+    ///
+    /// Asserted positively on both sides of the lift -- clamped first, then back to the
+    /// full cell grant -- because `mac_grant_for` returning the cell grant is also what
+    /// it does when nothing was ever installed, so only the transition distinguishes a
+    /// lift from a ceiling that never took effect.
+    #[test]
+    fn lifting_a_grant_ceiling_restores_the_full_cell_grant() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base);
+
+        task.set_ue_grant_ceiling(7, Some(300));
+        assert_eq!(task.mac_grant_for(7), 300, "the ceiling is in force");
+
+        task.set_ue_grant_ceiling(7, None);
+        assert_eq!(
+            task.mac_grant_for(7),
+            MAC_GRANT_BYTES,
+            "lifting the ceiling returns the UE to the cell grant"
+        );
+    }
+
+    /// A zero ceiling is refused, because `build_pdu(0)` yields nothing at all: it would
+    /// silence the bearer rather than narrow it. The previously installed ceiling stays
+    /// in force, which is the safe answer -- a UE with a tiny carrier still has capacity.
+    #[test]
+    fn a_zero_grant_ceiling_is_refused_rather_than_silencing_the_bearer() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base);
+
+        task.set_ue_grant_ceiling(7, Some(300));
+        task.set_ue_grant_ceiling(7, Some(0));
+        assert_eq!(
+            task.mac_grant_for(7),
+            300,
+            "a zero ceiling must be refused and the previous one kept, not stored"
+        );
     }
 
     /// Each PDU session is its own radio bearer, so each owns its sequence-number

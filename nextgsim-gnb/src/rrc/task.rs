@@ -718,7 +718,7 @@ impl RrcTask {
                 true
             }
             Ok(UlDcchMessage::UeCapabilityInformation(info)) => {
-                self.process_ue_capability_information(ue_id, info);
+                self.process_ue_capability_information(ue_id, info).await;
                 true
             }
             Ok(UlDcchMessage::RrcReestablishmentComplete(complete)) => {
@@ -1127,13 +1127,25 @@ impl RrcTask {
     /// and the equivalent PRB ceiling derived from it, so a reader can see what a RedCap
     /// UE's narrowband RF would bound it to.
     ///
-    /// **Reported, not enforced**, and #164 is the decision that says so: this simulator
-    /// has no PRB scheduler for a ceiling to constrain, and the wire field a conformance
-    /// peer would read it from (`locationAndBandwidth`, inside the `spCellConfig` that
-    /// `build_srb1_cell_group_config` deliberately omits) is not emitted because nothing at
-    /// either end models PRBs. See [`super::redcap::RedCapRestrictions`] for the full
-    /// reasoning and for what enforcement would require.
-    fn apply_redcap_restrictions(&mut self, ue_id: i32) {
+    /// # What is enforced, and what is only reported (issue #57)
+    ///
+    /// The bandwidth ratio is **enforced** on the UE's MAC grants: the derived PRB ceiling
+    /// is turned into a proportional grant ceiling in octets and sent to the RLS task as
+    /// [`RlsMessage::SetUeGrantCeiling`], which applies it at every
+    /// `RlcEntity::build_pdu` call for this UE. That is the only per-UE resource quantity
+    /// this simulator allocates, so it is where the 20 MHz FR1 limit of
+    /// TS 38.306 §4.2.21.1 can bite. Before #57 the ceiling was computed and stored with
+    /// no reader at all.
+    ///
+    /// Still **only reported**, and #164 is the decision that says so: there is no PRB
+    /// resource grid, so the PRB numbers in the log line name a ratio rather than an
+    /// allocation, and the wire field a conformance peer would read the restriction from
+    /// (`locationAndBandwidth`, inside the `spCellConfig` that
+    /// `build_srb1_cell_group_config` deliberately omits) is still not emitted. The MIMO
+    /// layer cap, the HD-FDD gaps and the HARQ timing offset are likewise reported only —
+    /// nothing in this tree models layers, duplex gaps or HARQ timing.
+    /// See [`super::redcap::RedCapRestrictions`] for the full reasoning.
+    async fn apply_redcap_restrictions(&mut self, ue_id: i32) {
         // Cell serving bandwidth (FR1 normal UE baseline: 100 MHz / 273 PRB at
         // 30 kHz SCS, TS 38.101-1 Table 5.3.2-1).
         const CELL_BANDWIDTH_MHZ: u8 = 100;
@@ -1173,6 +1185,49 @@ impl RrcTask {
                 &restrictions,
             )
         );
+
+        // #57: the ceiling leaves this function. Before, it was computed here and stored
+        // behind a getter with zero callers, so a RedCap UE was handed the whole cell
+        // grant regardless -- the defect the issue is about. The RLS task owns the grants,
+        // so it is the one that can refuse them.
+        let grant_octets = Self::redcap_grant_ceiling_octets(
+            CELL_MAX_PRB,
+            Self::redcap_prb_ceiling(CELL_MAX_PRB, CELL_BANDWIDTH_MHZ, enforced_bw_mhz),
+        );
+        if let Err(e) = self
+            .task_base
+            .rls_tx
+            .send(RlsMessage::SetUeGrantCeiling {
+                ue_id,
+                grant_octets: Some(grant_octets),
+            })
+            .await
+        {
+            // Reported, not fatal: losing the ceiling leaves the UE over-granted, which is
+            // exactly the pre-#57 behaviour, so it must be visible rather than silent.
+            error!(
+                "Failed to install the RedCap MAC grant ceiling for UE[{ue_id}]: {e}. \
+                 The UE keeps the full cell grant, which is the over-allocation #57 fixed"
+            );
+        }
+    }
+
+    /// The MAC grant ceiling in octets equivalent to `prb_ceiling` of the cell's
+    /// `cell_max_prb` budget.
+    ///
+    /// Scales [`crate::rls::task::MAC_GRANT_BYTES`] — the grant an unrestricted UE gets —
+    /// by the PRB ratio, because the bits carried in one transmission are proportional to
+    /// the bandwidth occupied (TS 38.214 §5.1.3.2 sizes a transport block from the number
+    /// of allocated PRBs). That proportionality is the honest translation from the
+    /// TS 38.306 §4.2.21.1 bandwidth limit into the one per-UE resource quantity this
+    /// simulator actually allocates.
+    ///
+    /// Floors, for the same reason [`Self::redcap_prb_ceiling`] does, and never returns 0:
+    /// a zero grant would stop the bearer rather than narrow it, and the RLS task refuses
+    /// one anyway.
+    fn redcap_grant_ceiling_octets(cell_max_prb: u32, prb_ceiling: u32) -> usize {
+        let full = crate::rls::task::MAC_GRANT_BYTES;
+        (full * prb_ceiling as usize / cell_max_prb.max(1) as usize).max(1)
     }
 
     /// The PRB ceiling equivalent to `bw_mhz` of the cell's serving bandwidth.
@@ -1192,20 +1247,29 @@ impl RrcTask {
     /// only that the bundle *can* be obtained — the recorded trap where the helper is tested
     /// and the wiring is not. Asserting this string is what pins the composition, so a
     /// future edit cannot quietly drop the MIMO cap or the HARQ offset again.
+    ///
+    /// The line separates the one restriction that bites from the three that do not, which
+    /// is #57's requirement on it: a single "not enforced" tail would now be false of the
+    /// bandwidth (the grant ceiling IS applied), and a single "enforced" would be false of
+    /// the MIMO, duplex and HARQ ceilings, which nothing in this tree consumes.
     fn redcap_restriction_report(
         cell_bw_mhz: u8,
         cell_max_prb: u32,
         enforced_bw_mhz: u8,
         restrictions: &super::redcap::RedCapRestrictions,
     ) -> String {
+        let prb_ceiling = Self::redcap_prb_ceiling(cell_max_prb, cell_bw_mhz, enforced_bw_mhz);
         format!(
-            "serving bandwidth restricted to {} MHz ({} PRB max, was {} MHz / {} PRB); \
-             MIMO layers <= {}, HD-FDD gaps={}, HARQ timing offset {} slot(s). Reported, \
-             not enforced: there is no PRB scheduler (see #164)",
+            "serving bandwidth restricted to {} MHz ({} PRB max, was {} MHz / {} PRB), \
+             enforced as a {}-octet MAC grant ceiling (was {}); MIMO layers <= {}, \
+             HD-FDD gaps={}, HARQ timing offset {} slot(s) -- these three reported, not \
+             enforced: nothing models layers, duplex gaps or HARQ timing (see #164)",
             enforced_bw_mhz,
-            Self::redcap_prb_ceiling(cell_max_prb, cell_bw_mhz, enforced_bw_mhz),
+            prb_ceiling,
             cell_bw_mhz,
             cell_max_prb,
+            Self::redcap_grant_ceiling_octets(cell_max_prb, prb_ceiling),
+            crate::rls::task::MAC_GRANT_BYTES,
             restrictions.max_mimo_layers,
             restrictions.half_duplex_fdd,
             restrictions.harq_timing_offset,
@@ -1255,7 +1319,10 @@ impl RrcTask {
     /// Reached from the typed UL-DCCH dispatch. The `0x06`-envelope wrapper that
     /// used to feed it as well is gone with issue #151 -- that envelope byte is
     /// also a conformant RRCReconfiguration at tid 3.
-    fn process_ue_capability_information(
+    /// `async` since issue #57: applying the RedCap restrictions now sends the derived MAC
+    /// grant ceiling to the RLS task, and that send is what makes the ceiling enforced
+    /// rather than stored.
+    async fn process_ue_capability_information(
         &mut self,
         ue_id: i32,
         information: UeCapabilityInformationData,
@@ -1308,7 +1375,7 @@ impl RrcTask {
                              (TS 38.331 §6.3.3); applying RedCap restrictions",
                             ue_id
                         );
-                        self.apply_redcap_restrictions(ue_id);
+                        self.apply_redcap_restrictions(ue_id).await;
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -2519,7 +2586,100 @@ mod tests {
     use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
 
-    // ── #164: the RedCap restrictions are REPORTED, and the arithmetic is pinned ──
+    // ── #164: the RedCap restrictions are reported, and the arithmetic is pinned.
+    //    #57: the bandwidth one is also ENFORCED, as a MAC grant ceiling. ──
+
+    /// Applying the RedCap restrictions SENDS the grant ceiling to the RLS task.
+    ///
+    /// # Why this test exists separately from the arithmetic ones
+    ///
+    /// #57's defect was not a wrong number, it was a right number with no reader: the
+    /// ceiling was computed and stored behind a getter with zero callers. Every test of
+    /// `redcap_prb_ceiling`, `redcap_grant_ceiling_octets` and the report string would have
+    /// passed against that defect, because none of them observes the ceiling LEAVING the
+    /// RRC task. This one does: it asserts on the message the RLS task receives, which is
+    /// the seam the enforcement crosses.
+    ///
+    /// Together with `rls::task::tests::a_redcap_ues_grants_are_clamped_while_a_normal_ues_are_not`
+    /// — which takes a ceiling and shows it shrinking real PDUs — this closes the path from
+    /// `supportOfRedCap-r17` to a narrowed grant with no dead link in the middle.
+    ///
+    /// Verified, not asserted: deleting the `rls_tx.send` in `apply_redcap_restrictions`
+    /// fails this test with *"the ceiling must reach the RLS task"*, which is precisely the
+    /// pre-#57 state — the ceiling derived and dropped.
+    #[tokio::test]
+    async fn applying_redcap_restrictions_installs_the_grant_ceiling_on_the_rls_task() {
+        let (mut task, _ngap_rx, mut rls_rx) = rrc_task_with_connected_ue(test_config(), 1);
+
+        task.apply_redcap_restrictions(1).await;
+
+        // Drain to the ceiling message rather than demanding it be first: the helper's
+        // setup may have queued RLS traffic, and a test that broke when an unrelated
+        // message was added would be pinning message order rather than enforcement.
+        let mut ceiling = None;
+        while let Ok(msg) = rls_rx.try_recv() {
+            if let TaskMessage::Message(RlsMessage::SetUeGrantCeiling {
+                ue_id,
+                grant_octets,
+            }) = msg
+            {
+                assert_eq!(ue_id, 1, "the ceiling must be installed on THIS UE");
+                ceiling = grant_octets;
+            }
+        }
+
+        assert_eq!(
+            ceiling,
+            Some(296),
+            "the ceiling must reach the RLS task, and carry the 296 octets that 54 of 273 \
+             PRB scales the cell grant to. `None` here means the value was derived and \
+             dropped -- the exact defect #57 was filed about"
+        );
+    }
+
+    /// The grant ceiling in octets follows the PRB ratio, and never reaches zero.
+    ///
+    /// Pinned separately from [`RrcTask::redcap_prb_ceiling`] because this is the number
+    /// that leaves the RRC task and becomes enforcement: 54/273 of the cell's 1500-octet
+    /// grant is 296 — deliberately NOT 300, which is what 20/100 of 1500 would give. The
+    /// ceiling is scaled from the floored PRB count rather than recomputed from the
+    /// bandwidth, so the grant can never exceed what the PRB ceiling already permitted.
+    #[test]
+    fn the_redcap_grant_ceiling_follows_the_prb_ratio() {
+        use crate::rls::task::MAC_GRANT_BYTES;
+
+        // Rel-17 RedCap: 273 PRB clamped to 54 (20 MHz of 100 MHz).
+        assert_eq!(
+            RrcTask::redcap_grant_ceiling_octets(273, 54),
+            MAC_GRANT_BYTES * 54 / 273,
+            "the ceiling must be the PRB fraction of the cell grant"
+        );
+        assert_eq!(
+            RrcTask::redcap_grant_ceiling_octets(273, 54),
+            296,
+            "and that fraction is 296 octets -- not the 300 a 20/100 bandwidth ratio \
+             would give, because the PRB count is floored first"
+        );
+
+        // An unrestricted UE's 'ceiling' is the whole grant: the arithmetic must not
+        // shave octets off a UE that is not restricted at all.
+        assert_eq!(
+            RrcTask::redcap_grant_ceiling_octets(273, 273),
+            MAC_GRANT_BYTES,
+            "a full-bandwidth UE keeps the whole cell grant"
+        );
+
+        // Rel-18 reduced RedCap: 5 MHz, 13 PRB.
+        assert_eq!(RrcTask::redcap_grant_ceiling_octets(273, 13), 71);
+
+        // A ratio small enough to floor to zero still yields one octet: a zero grant
+        // would stop the bearer rather than narrow it (the RLS task refuses one too).
+        assert_eq!(
+            RrcTask::redcap_grant_ceiling_octets(u32::MAX, 1),
+            1,
+            "a vanishing ratio must still leave a transmittable grant"
+        );
+    }
 
     /// The PRB ceiling for each RedCap release, and for an unrestricted UE.
     ///
@@ -2554,12 +2714,14 @@ mod tests {
         );
     }
 
-    /// The report names all four ceilings, and says it is not enforced.
+    /// The report names all four ceilings, says which one is enforced, and says the other
+    /// three are not.
     ///
     /// This is the assertion that pins the composition rather than the bundle: before #164
     /// the reporting path asked for the bandwidth and the HD-FDD flag only, so a version
     /// that obtained the bundle and then still printed two of its four fields would satisfy
-    /// every other test here.
+    /// every other test here. Since #57 it also pins the enforcement split, because the
+    /// line is now making two different claims about two different sets of ceilings.
     #[test]
     fn the_report_names_every_restriction_in_force() {
         use crate::rrc::redcap::{RedCapProcessor, RedCapUeCapabilities};
@@ -2588,10 +2750,24 @@ mod tests {
             "the HARQ timing offset must be named, and must be the value the restriction \
              set carries rather than a hardcoded one -- also dropped before #164: {report}"
         );
+        // #57 split this assertion in two. It used to require the whole line to say "not
+        // enforced", which was true of all four ceilings then and is false of the
+        // bandwidth now: the grant ceiling IS applied. A line that still claimed blanket
+        // non-enforcement would understate what the code does, which is the same class of
+        // defect -- a comment that does not match the behaviour -- pointing the other way.
         assert!(
-            report.contains("not enforced"),
-            "the report must say the ceiling is not enforced; a line that merely stated it \
-             would read as enforcement (#164): {report}"
+            report.contains("enforced as a 296-octet MAC grant ceiling"),
+            "the report must name the grant ceiling the bandwidth limit is actually \
+             enforced as, and its value: 273 PRB clamped to 54 scales the 1500-octet cell \
+             grant to 1500 * 54 / 273 = 296 octets. Naming a ceiling without naming the \
+             enforcement is what #57 was filed about: {report}"
+        );
+        assert!(
+            report.contains("these three reported, not enforced"),
+            "the report must still say the MIMO, duplex and HARQ ceilings are NOT \
+             enforced -- nothing models them, and a line that dropped the caveat when the \
+             bandwidth became enforceable would claim three restrictions this gNB does not \
+             apply (#164): {report}"
         );
     }
 
