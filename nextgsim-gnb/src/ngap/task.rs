@@ -31,8 +31,14 @@ use super::amf_context::{AmfIdentity, AmfState, NgapAmfContext};
 use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
 use super::up_security::{self, DrbSecurityDecision, UpSecurityRefusal};
+use crate::mbs_ngap::{GnbMbsSession, NgapMbsManager};
 use crate::rrc::meas::a3_meas_config_params;
 use crate::rrc::transaction::RrcProcedure;
+use nextgsim_ngap::procedures::mbs::{
+    encode_multicast_session_activation_response, encode_multicast_session_deactivation_response,
+    parse_multicast_group_paging, parse_multicast_session_activation_request,
+    parse_multicast_session_deactivation_request, MbsSessionId,
+};
 use nextgsim_rrc::procedures::handover_preparation::{
     encode_handover_preparation_information, HandoverPreparationParams,
 };
@@ -190,6 +196,14 @@ pub struct NgapTask {
     is_initialized: bool,
     /// MBS session manager (Rel-17)
     mbs_sessions: MbsSessionManager,
+    /// MBS session state driven by the NG-C wire path (TS 38.413 §9.2.9).
+    ///
+    /// Separate from `mbs_sessions` above, which is keyed by the AMF-assigned
+    /// numeric session id and is fed by the internal `NgapMessage::Mbs*`
+    /// channel. An MBS procedure arriving on SCTP carries only
+    /// `id-MBS-SessionID` (299) — a TMGI, never a numeric id — so it cannot key
+    /// that map, and this one is keyed by TMGI.
+    mbs_ngap_sessions: NgapMbsManager,
     /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
     /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
     guard_timers: GuardTimers,
@@ -230,6 +244,7 @@ impl NgapTask {
             downlink_teid_counter: 0,
             is_initialized: false,
             mbs_sessions: MbsSessionManager::new(),
+            mbs_ngap_sessions: NgapMbsManager::new(),
             guard_timers: GuardTimers::new(),
             tnla_client_ids: HashMap::new(),
             next_dynamic_tnla_id: DYNAMIC_TNLA_CLIENT_ID_BASE,
@@ -3018,6 +3033,9 @@ impl NgapTask {
                     // locally and MUST NOT be answered with another Error
                     // Indication (which would create an on-wire ping-pong).
                     self.handle_error_indication(client_id, err_ind).await;
+                } else if self.handle_mbs_pdu(client_id, pdu_bytes).await {
+                    // An MBS session procedure (71/72/74) was decoded and
+                    // applied to `mbs_ngap_sessions`; see `handle_mbs_pdu`.
                 } else {
                     // amfg-05: this operational PDU could not be routed to a
                     // handler. Per TS 38.413 §8.7.5 / §10, answer with an NGAP
@@ -4591,6 +4609,212 @@ impl NgapTask {
     // ========================================================================
     // MBS (Multicast/Broadcast Service) Procedures (Rel-17)
     // ========================================================================
+
+    /// Routes an inbound MBS session procedure into [`NgapMbsManager`]
+    /// (TS 38.413 §9.2.9), returning whether this PDU was one.
+    ///
+    /// Called from `handle_ngap_pdu` after the UE-associated and NG-interface
+    /// procedures and before `handle_unroutable_pdu`, so a PDU that is not an
+    /// MBS procedure still earns its Error Indication. Returning `false` rather
+    /// than sending one here keeps that single decision in one place.
+    ///
+    /// The three procedures handled are the AMF-initiated ones the RAN must
+    /// answer or act on:
+    ///
+    /// - **71** `id-MulticastSessionActivation`: record the session and reply
+    ///   `MulticastSessionActivationResponse` echoing `id-MBS-SessionID`.
+    /// - **72** `id-MulticastSessionDeactivation`: tear the session down and
+    ///   reply `MulticastSessionDeactivationResponse`.
+    /// - **74** `id-MulticastGroupPaging`: page the group if this gNB serves one
+    ///   of the TAIs named. Criticality is *ignore* for the area list, and the
+    ///   procedure has **no** response message, so nothing is sent back.
+    ///
+    /// 73 `id-MulticastSessionUpdate` and 68 `id-BroadcastSessionSetup` are not
+    /// handled: both carry `MBS-SessionTNLInfo5GC`, an MB-UPF shared-tunnel
+    /// descriptor this node has no user-plane path for, so answering them
+    /// successfully would claim a delivery capability that does not exist. They
+    /// fall through to the Error Indication, which is the conformant reply to an
+    /// unsupported procedure (TS 38.413 §8.7.5).
+    async fn handle_mbs_pdu(&mut self, amf_id: i32, pdu_bytes: &[u8]) -> bool {
+        let Ok(pdu) = decode_ngap_pdu(pdu_bytes) else {
+            return false;
+        };
+
+        if let Ok(req) = parse_multicast_session_activation_request(&pdu) {
+            self.handle_multicast_session_activation(amf_id, &req.mbs_session_id)
+                .await;
+            return true;
+        }
+
+        if let Ok(req) = parse_multicast_session_deactivation_request(&pdu) {
+            self.handle_multicast_session_deactivation(amf_id, &req.mbs_session_id)
+                .await;
+            return true;
+        }
+
+        if let Ok(paging) = parse_multicast_group_paging(&pdu) {
+            self.handle_ngap_multicast_group_paging(amf_id, &paging)
+                .await;
+            return true;
+        }
+
+        false
+    }
+
+    /// The cell identity `NgapMbsManager` tracks MBS activations against.
+    ///
+    /// The simulated gNB radiates exactly one cell, so the served cell is the
+    /// one derived from the configured NCI — the same value the RRC layer uses
+    /// as its `physCellId`, so "active in this cell" means the same thing on
+    /// both sides of the stack.
+    fn served_mbs_cell_id(&self) -> i32 {
+        i32::from(phys_cell_id_from_nci(self.task_base.config.nci))
+    }
+
+    /// Applies a `MulticastSessionActivationRequest` and answers it
+    /// (TS 38.413 §9.2.9.1 / §9.2.9.2).
+    async fn handle_multicast_session_activation(
+        &mut self,
+        amf_id: i32,
+        mbs_session_id: &MbsSessionId,
+    ) {
+        let cell_id = self.served_mbs_cell_id();
+
+        // A multicast session, not broadcast: the activation procedures of
+        // §9.2.9 are the multicast ones (broadcast uses 66-68), so per-UE
+        // membership applies and `ue_join` must be accepted.
+        let mut session =
+            GnbMbsSession::new_multicast(mbs_session_id.tmgi_hex(), mbs_session_id.tmgi);
+        session.activate_cell(cell_id);
+
+        let session = self.mbs_ngap_sessions.start_session(session);
+        info!(
+            "MulticastSessionActivationRequest from AMF[{}]: TMGI={} activated in cell {} \
+             ({} MBS session(s) now active)",
+            amf_id,
+            session.tmgi_hex(),
+            cell_id,
+            self.mbs_ngap_sessions.session_count()
+        );
+
+        match encode_multicast_session_activation_response(mbs_session_id) {
+            Ok(data) => {
+                // MBS session procedures are non-UE-associated, so stream 0
+                // (TS 38.412 §7).
+                self.send_ngap_non_ue(amf_id, 0, data).await;
+            }
+            Err(e) => {
+                error!("Failed to encode MulticastSessionActivationResponse: {}", e);
+            }
+        }
+    }
+
+    /// Applies a `MulticastSessionDeactivationRequest` and answers it
+    /// (TS 38.413 §9.2.9.3 / §9.2.9.4).
+    ///
+    /// A TMGI this gNB never activated is still answered with a successful
+    /// outcome: the AMF's intent -- that the session not be delivered here --
+    /// already holds, so a failure would tell it to retry a teardown that has
+    /// nothing left to tear down.
+    async fn handle_multicast_session_deactivation(
+        &mut self,
+        amf_id: i32,
+        mbs_session_id: &MbsSessionId,
+    ) {
+        match self.mbs_ngap_sessions.stop_session(&mbs_session_id.tmgi) {
+            Some(session) => info!(
+                "MulticastSessionDeactivationRequest from AMF[{}]: TMGI={} deactivated \
+                 ({} UE(s) had joined)",
+                amf_id,
+                session.tmgi_hex(),
+                session.joined_ues.len()
+            ),
+            None => warn!(
+                "MulticastSessionDeactivationRequest from AMF[{}] for TMGI={}, which is not \
+                 active here; acknowledging anyway",
+                amf_id,
+                mbs_session_id.tmgi_hex()
+            ),
+        }
+
+        match encode_multicast_session_deactivation_response(mbs_session_id) {
+            Ok(data) => self.send_ngap_non_ue(amf_id, 0, data).await,
+            Err(e) => {
+                error!(
+                    "Failed to encode MulticastSessionDeactivationResponse: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    /// Applies a `MulticastGroupPaging` (TS 38.413 §9.2.9.5).
+    ///
+    /// The procedure has no response message. The gNB pages only if it serves
+    /// one of the TAIs in `MulticastGroupPagingAreaList` and is actually
+    /// radiating the paged session, since paging for a group this cell does not
+    /// carry would wake UEs that have nothing to receive.
+    async fn handle_ngap_multicast_group_paging(
+        &mut self,
+        amf_id: i32,
+        paging: &nextgsim_ngap::procedures::mbs::MulticastGroupPagingData,
+    ) {
+        let config = &self.task_base.config;
+        let served_plmn = config.plmn.encode();
+        let served_tac = [
+            ((config.tac >> 16) & 0xFF) as u8,
+            ((config.tac >> 8) & 0xFF) as u8,
+            (config.tac & 0xFF) as u8,
+        ];
+
+        let serves_a_paged_tai = paging
+            .paging_tais
+            .iter()
+            .any(|tai| tai.plmn_identity == served_plmn && tai.tac == served_tac);
+
+        if !serves_a_paged_tai {
+            debug!(
+                "MulticastGroupPaging from AMF[{}] for TMGI={} names no served TAI \
+                 (served plmn={:02x?} tac={:02x?}); ignoring",
+                amf_id,
+                paging.mbs_session_id.tmgi_hex(),
+                served_plmn,
+                served_tac
+            );
+            return;
+        }
+
+        let cell_id = self.served_mbs_cell_id();
+        let is_radiating = self
+            .mbs_ngap_sessions
+            .sessions_for_cell(cell_id)
+            .iter()
+            .any(|s| s.tmgi == paging.mbs_session_id.tmgi);
+
+        if !is_radiating {
+            warn!(
+                "MulticastGroupPaging from AMF[{}] for TMGI={}, which is not active in cell {}; \
+                 nothing to page",
+                amf_id,
+                paging.mbs_session_id.tmgi_hex(),
+                cell_id
+            );
+            return;
+        }
+
+        let joined = self
+            .mbs_ngap_sessions
+            .get(&paging.mbs_session_id.tmgi)
+            .map_or(0, |s| s.joined_ues.len());
+
+        info!(
+            "MulticastGroupPaging from AMF[{}]: TMGI={} is active in cell {} with {} joined UE(s)",
+            amf_id,
+            paging.mbs_session_id.tmgi_hex(),
+            cell_id,
+            joined
+        );
+    }
 
     /// Handles MBS Session Activation Request from AMF
     async fn handle_mbs_session_activation_request(
@@ -8345,6 +8569,228 @@ mod tests {
             decoded.ran_node_name.as_deref(),
             Some("nextgsim-gnb"),
             "the update must carry this node's identity"
+        );
+    }
+
+    // ========================================================================
+    // MBS session procedures on the wire (TS 38.413 §9.2.9, issue #185)
+    // ========================================================================
+
+    /// A `MulticastSessionActivationRequest` as built by a real nextgcore AMF
+    /// (`nextgcore_ngap::builder::build_multicast_session_activation_request`
+    /// for TMGI 00F110010203). Byte 1 = 0x47 = procedure 71.
+    const AMF_MBS_ACTIVATION: &[u8] = &[
+        0x00, 0x47, 0x00, 0x1A, 0x00, 0x00, 0x02, 0x01, 0x2B, 0x00, 0x07, 0x00, 0x00, 0xF1, 0x10,
+        0x01, 0x02, 0x03, 0x01, 0x30, 0x00, 0x08, 0x07, 0x00, 0x00, 0xF1, 0x10, 0x01, 0x02, 0x03,
+    ];
+
+    /// Its deactivation counterpart (procedure 72 = 0x48), same TMGI.
+    const AMF_MBS_DEACTIVATION: &[u8] = &[
+        0x00, 0x48, 0x00, 0x1A, 0x00, 0x00, 0x02, 0x01, 0x2B, 0x00, 0x07, 0x00, 0x00, 0xF1, 0x10,
+        0x01, 0x02, 0x03, 0x01, 0x31, 0x00, 0x08, 0x07, 0x00, 0x00, 0xF1, 0x10, 0x01, 0x02, 0x03,
+    ];
+
+    /// `MulticastGroupPaging` (procedure 74 = 0x4A) for the same TMGI, naming
+    /// TAC 000001 under PLMN 00F110 — which `test_config` serves.
+    const AMF_MBS_GROUP_PAGING: &[u8] = &[
+        0x00, 0x4A, 0x40, 0x1B, 0x00, 0x00, 0x02, 0x01, 0x2B, 0x00, 0x07, 0x00, 0x00, 0xF1, 0x10,
+        0x01, 0x02, 0x03, 0x01, 0x33, 0x40, 0x09, 0x00, 0x00, 0x00, 0x00, 0xF1, 0x10, 0x00, 0x00,
+        0x01,
+    ];
+
+    const AMF_MBS_TMGI: [u8; 6] = [0x00, 0xF1, 0x10, 0x01, 0x02, 0x03];
+
+    /// An NGAP task with one AMF in the Ready state and no UE.
+    fn seed_task_ready() -> (
+        NgapTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<SctpMessage>>,
+    ) {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        (task, sctp_rx)
+    }
+
+    /// Criteria 1, 2 and 3 together: a real AMF's activation request arriving on
+    /// the SCTP receive path reaches `NgapMbsManager`, and the gNB answers with a
+    /// `MulticastSessionActivationResponse` whose `MBS-SessionID` echoes the
+    /// request's.
+    ///
+    /// The session-count and TMGI assertions are only reachable if
+    /// `handle_ngap_pdu` routed the PDU into the manager -- before this change
+    /// the same bytes fell through to `handle_unroutable_pdu` and the reply was
+    /// an Error Indication.
+    #[tokio::test]
+    async fn an_amf_mbs_activation_reaches_the_manager_and_is_answered() {
+        let (mut task, mut sctp_rx) = seed_task_ready();
+        assert_eq!(task.mbs_ngap_sessions.session_count(), 0);
+
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(AMF_MBS_ACTIVATION))
+            .await;
+
+        // (1) The state machine saw it, keyed by the TMGI the AMF sent.
+        assert_eq!(task.mbs_ngap_sessions.session_count(), 1);
+        let session = task
+            .mbs_ngap_sessions
+            .get(&AMF_MBS_TMGI)
+            .expect("the activated session must be keyed by its TMGI");
+        assert_eq!(session.tmgi, AMF_MBS_TMGI);
+        assert!(session.is_active(), "activation must leave it Active");
+        assert!(
+            session
+                .active_cells
+                .contains(&i32::from(phys_cell_id_from_nci(0x000000010))),
+            "the session must be radiating in this gNB's served cell"
+        );
+
+        // (2) The reply is a MulticastSessionActivationResponse echoing the TMGI.
+        let reply = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, stream, .. })) => {
+                assert_eq!(
+                    stream, 0,
+                    "MBS session procedures are non-UE-associated (TS 38.412 §7)"
+                );
+                buffer.data().to_vec()
+            }
+            other => panic!("expected an outbound SCTP SendMessage, got {other:?}"),
+        };
+
+        match decode_ngap_pdu(&reply).expect("the reply must be a valid NGAP PDU") {
+            NGAP_PDU::SuccessfulOutcome(o) => {
+                assert_eq!(
+                    o.procedure_code.0, 71,
+                    "the outcome must be id-MulticastSessionActivation"
+                );
+            }
+            other => panic!("expected a SuccessfulOutcome, got {other:?}"),
+        }
+
+        // Decoded through the public codec so the echo is asserted on the wire
+        // bytes, not on a struct this test built.
+        let echoed =
+            nextgsim_ngap::procedures::mbs::decode_multicast_session_activation_response(&reply)
+                .expect("the reply must decode as a MulticastSessionActivationResponse");
+        assert_eq!(
+            echoed.mbs_session_id.tmgi, AMF_MBS_TMGI,
+            "the response's MBS-SessionID must echo the request's"
+        );
+    }
+
+    /// A deactivation request tears the session down and is answered with a
+    /// `MulticastSessionDeactivationResponse` (TS 38.413 §9.2.9.3/§9.2.9.4).
+    #[tokio::test]
+    async fn an_amf_mbs_deactivation_tears_the_session_down_and_is_answered() {
+        let (mut task, mut sctp_rx) = seed_task_ready();
+
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(AMF_MBS_ACTIVATION))
+            .await;
+        assert_eq!(task.mbs_ngap_sessions.session_count(), 1);
+        let _ = sctp_rx.try_recv(); // the activation response
+
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(AMF_MBS_DEACTIVATION))
+            .await;
+
+        assert_eq!(
+            task.mbs_ngap_sessions.session_count(),
+            0,
+            "deactivation must remove the session"
+        );
+
+        let reply = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                buffer.data().to_vec()
+            }
+            other => panic!("expected an outbound SCTP SendMessage, got {other:?}"),
+        };
+        match decode_ngap_pdu(&reply).expect("valid NGAP PDU") {
+            NGAP_PDU::SuccessfulOutcome(o) => assert_eq!(
+                o.procedure_code.0, 72,
+                "the outcome must be id-MulticastSessionDeactivation"
+            ),
+            other => panic!("expected a SuccessfulOutcome, got {other:?}"),
+        }
+    }
+
+    /// `MulticastGroupPaging` is accepted for an active session and, per
+    /// TS 38.413 §9.2.9.5, answered with nothing at all — in particular NOT with
+    /// an Error Indication, which is what an unrouted PDU would have produced.
+    #[tokio::test]
+    async fn an_amf_multicast_group_paging_is_accepted_without_a_reply() {
+        let (mut task, mut sctp_rx) = seed_task_ready();
+
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(AMF_MBS_ACTIVATION))
+            .await;
+        let _ = sctp_rx.try_recv(); // the activation response
+
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(AMF_MBS_GROUP_PAGING))
+            .await;
+
+        // The session is untouched by paging, and nothing went back on the wire.
+        assert_eq!(task.mbs_ngap_sessions.session_count(), 1);
+        match sctp_rx.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                let pdu = decode_ngap_pdu(buffer.data());
+                panic!("MulticastGroupPaging has no response message, but the gNB sent {pdu:?}");
+            }
+            other => panic!("unexpected SCTP traffic: {other:?}"),
+        }
+    }
+
+    /// The MBS dispatch does not swallow procedures it does not implement.
+    ///
+    /// `BroadcastSessionSetupRequest` (procedure 68) carries an MB-UPF shared
+    /// tunnel this node has no user-plane path for, so it must still fall through
+    /// to the Error Indication rather than being silently accepted.
+    #[tokio::test]
+    async fn an_unsupported_mbs_procedure_still_earns_an_error_indication() {
+        let (mut task, mut sctp_rx) = seed_task_ready();
+
+        // Procedure 68 with an empty IE container: enough to decode as a
+        // BroadcastSessionSetupRequest, which this node does not handle.
+        let pdu = NGAP_PDU::InitiatingMessage(nextgsim_ngap::codec::InitiatingMessage {
+            procedure_code: nextgsim_ngap::codec::ProcedureCode(68),
+            criticality: nextgsim_ngap::codec::Criticality(
+                nextgsim_ngap::codec::Criticality::REJECT,
+            ),
+            value: nextgsim_ngap::codec::InitiatingMessageValue::Id_BroadcastSessionSetup(
+                nextgsim_ngap::codec::BroadcastSessionSetupRequest {
+                    protocol_i_es: nextgsim_ngap::codec::BroadcastSessionSetupRequestProtocolIEs(
+                        vec![],
+                    ),
+                },
+            ),
+        });
+        let bytes = encode_ngap_pdu(&pdu).expect("procedure 68 must encode");
+
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&bytes))
+            .await;
+
+        assert_eq!(
+            task.mbs_ngap_sessions.session_count(),
+            0,
+            "an unsupported broadcast setup must not create a session"
+        );
+
+        let reply = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                buffer.data().to_vec()
+            }
+            other => panic!("expected an Error Indication, got {other:?}"),
+        };
+        let err = decode_error_indication(&reply)
+            .expect("the reply to an unsupported procedure must be an Error Indication");
+        assert_eq!(
+            err.criticality_diagnostics
+                .as_ref()
+                .and_then(|d| d.procedure_code),
+            Some(68),
+            "the diagnostics must name the procedure that was not supported"
         );
     }
 }
