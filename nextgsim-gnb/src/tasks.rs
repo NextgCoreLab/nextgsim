@@ -836,6 +836,23 @@ pub enum RlsMessage {
         /// The keys, algorithms and bearer binding, or `None` to remove it
         security: Option<Box<nextgsim_pdcp::PdcpSecurity>>,
     },
+    /// Install (or lift) a per-UE MAC grant ceiling, from RRC (issue #57).
+    ///
+    /// Sent when the gNB learns from `supportOfRedCap-r17` in
+    /// `UE-NR-Capability-v1700` (TS 38.331 §6.3.3) that a UE is RedCap, whose maximum
+    /// bandwidth is 20 MHz in FR1 (TS 38.306 §4.2.21.1). The ceiling is derived in the
+    /// RRC task, where the UE's capabilities live, and enforced in the RLS task, where
+    /// grants are handed to RLC — this message is the seam, on the same pattern as
+    /// `InstallDrbSecurity`.
+    ///
+    /// `grant_octets: None` lifts the restriction, which is what a released UE needs so
+    /// the next UE allocated the same id cannot inherit a narrowed grant.
+    SetUeGrantCeiling {
+        /// UE ID
+        ue_id: i32,
+        /// The ceiling in octets, or `None` for unrestricted (the full cell budget)
+        grant_octets: Option<usize>,
+    },
     /// Downlink data PDU (from GTP)
     DownlinkData {
         /// UE ID
