@@ -10,6 +10,30 @@ description = "Cryptographic algorithms for nextgsim (Milenage, SNOW3G, ZUC, AES
 [lints]
 workspace = true
 
+[features]
+default = []
+
+# Post-quantum primitives: ML-KEM (FIPS 203), ML-DSA (FIPS 204) and the hybrid
+# X25519 + ML-KEM-768 KEM.
+#
+# Off by default, matching the project's "6G prototypes disabled by default"
+# convention, and for a reason specific to this surface: 3GPP has frozen NO
+# normative PQC specification (SA3's migration work is study-phase, TR 33.871),
+# so there is no 5G/6G procedure these primitives plug into. Enabling them
+# unconditionally pulls two PRE-1.0 release-candidate crates -- `ml-kem` and
+# `ml-dsa` -- into every default build of the whole workspace, since
+# `nextgsim-crypto` is a dependency of the NAS, PDCP, RRC, gNB and UE crates.
+#
+# `ml-kem`'s `deterministic` feature is REQUIRED, not incidental: it is what
+# exposes `KemCore::generate_deterministic` and `EncapsulateDeterministic`,
+# without which the FIPS 203 known-answer tests could not fix (d, z) or m and so
+# could only ever be round trips. See `src/pqc_vectors.rs`.
+#
+# CI: the `pqc` job in `.github/workflows/ci.yml` builds and tests this arm. The
+# default `cargo test --workspace` never compiles it, and this repo's recorded
+# failure mode for feature-gated code is shipping an arm CI never built.
+pqc = ["dep:ml-dsa", "dep:ml-kem"]
+
 [dependencies]
 nextgsim-common.workspace = true
 aes.workspace = true
@@ -17,8 +41,8 @@ ctr.workspace = true
 cmac.workspace = true
 elliptic-curve = { version = "0.13", features = ["ecdh", "arithmetic", "sec1"] }
 hmac.workspace = true
-ml-dsa = "0.1.0-rc.7"
-ml-kem = "0.2.0-rc.1"
+ml-dsa = { version = "0.1.0-rc.7", optional = true }
+ml-kem = { version = "0.2.0-rc.1", features = ["deterministic"], optional = true }
 p256 = { version = "0.13", features = ["ecdh", "arithmetic"] }
 rand.workspace = true
 sha2.workspace = true

@@ -14,7 +14,7 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 | nextgsim-ue | 28 | ~11,500 | **75%** | **5% -- stubs only** |
 | nextgsim-cli | 4 | ~600 | **95%** | N/A |
 | nextgsim-common | 12 | ~3,200 | **95%** | N/A |
-| nextgsim-crypto | 9 | ~3,500 | **90%** | **0% -- no PQC** |
+| nextgsim-crypto | 13 | ~5,000 | **90%** | **PQC primitives present (ACVP-validated, `pqc` feature); no procedure uses them** |
 
 ---
 
@@ -152,7 +152,7 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 | Gap | Details |
 |---|---|
 | No 6G-specific types | Missing types for: ISAC sensing data, semantic communication metadata, FL model parameters, SHE compute descriptors |
-| No PQC-related config | No configuration fields for post-quantum cryptography algorithm selection |
+| PQC config selects algorithms nothing reads | `PqcConfig` exists in `src/config.rs` (deserialised from the `pqc:` key) with `KemAlgorithm` and `SignAlgorithm` enums restricted to the parameter sets `nextgsim-crypto` actually implements. No node crate consumes it, because no 3GPP procedure specifies where a PQC key exchange or signature belongs -- so the config describes an intent, not a behaviour. |
 
 ### Completeness: **95%** (fully functional for 5G; no 6G extensions)
 
@@ -179,13 +179,13 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 | Gap | Details |
 |---|---|
-| **No post-quantum cryptography** | Missing CRYSTALS-Kyber/ML-KEM for key exchange, CRYSTALS-Dilithium/ML-DSA for signatures -- critical 6G requirement per ongoing 3GPP SA3 work |
+| **PQC primitives exist; no procedure uses them** | ML-KEM (FIPS 203, `src/pqc_kem.rs`), ML-DSA (FIPS 204, `src/pqc_sign.rs`) and a hybrid X25519+ML-KEM-768 KEM (`src/hybrid.rs`) are implemented at all parameter sets and validated against NIST ACVP known-answer vectors, behind the off-by-default `pqc` feature. The remaining gap is INTEGRATION, and it is not ours to close unilaterally: 3GPP has frozen no normative PQC specification (SA3 migration is study-phase, TR 33.871), so there is no standardised procedure to wire them into. Nothing outside `nextgsim-crypto` calls them. |
 | No NEA1 (SNOW3G ciphering) | Only `nea2_encrypt` and `nea3_encrypt` exposed; NEA1 ciphering wrapper not provided (though `uea2_f8` exists in snow3g.rs) |
 | No ECIES Profile B | Only Profile A (X25519) implemented; Profile B (secp256r1) not implemented |
 | NFKC normalization missing | `encode_kdf_string()` in `src/kdf.rs:358` notes: "Full NFKC normalization is not implemented" |
 | No 256-bit security | All algorithms are 128-bit; 6G may require 256-bit variants (ZUC-256, SNOW5G) |
 
-### Completeness: **90%** for 5G | **0%** for 6G PQC
+### Completeness: **90%** for 5G | PQC primitives ACVP-validated, procedure integration blocked on 3GPP
 
 ---
 
@@ -212,7 +212,7 @@ The task framework (`TaskManager`, typed mpsc channels, `TaskId` enum) is **well
 
 ### Missing Infrastructure for 6G
 
-1. **Post-quantum cryptography** -- No PQC algorithms in nextgsim-crypto
+1. **Post-quantum cryptography** -- The PRIMITIVES are in nextgsim-crypto (ML-KEM, ML-DSA, hybrid X25519+ML-KEM-768, behind the `pqc` feature, ACVP-validated). What is missing is a procedure that uses them, which waits on 3GPP: SA3's PQC migration is study-phase (TR 33.871), so no stage-3 specification defines where a PQC key exchange or signature belongs in a 5G/6G procedure.
 2. **AI/ML runtime integration** -- No model loading/inference in node crates (exists in nextgsim-ai but not wired in)
 3. **Real ASN.1 encoding** -- RRC messages use simplified byte formats; needed for standards compliance
 4. **Inter-gNB handover** -- Only intra-gNB handover implemented

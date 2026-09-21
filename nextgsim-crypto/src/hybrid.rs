@@ -268,6 +268,86 @@ pub fn hybrid_decapsulate_from_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pqc_vectors as v;
+
+    /// The hybrid combiner held to externally pinned inputs.
+    ///
+    /// No standards body specifies this construction, so there is no published
+    /// end-to-end vector to cite -- but that does not force a round trip. Every
+    /// INPUT here is externally fixed (the X25519 pair from RFC 7748 §6.1, the
+    /// ML-KEM-768 decapsulation key and ciphertext from NIST ACVP), and the
+    /// combiner is SHA-256, so the expected 32-byte output is a consequence of
+    /// published data plus FIPS 180-4. Anyone can recompute it from the cited
+    /// sources without running this crate; see `pqc_vectors.rs` for the one-liner.
+    ///
+    /// What this catches that the round-trip tests below cannot: an argument-order
+    /// mistake in the combiner. `SHA-256(x25519_ss || ml_kem_ss)` and
+    /// `SHA-256(ml_kem_ss || x25519_ss)` round-trip equally well, because
+    /// `hybrid_encapsulate` and `hybrid_decapsulate` would swap the operands the
+    /// same way. Only an external answer distinguishes the documented order from
+    /// its mirror.
+    ///
+    /// The ciphertext is assembled by hand rather than by `hybrid_encapsulate`
+    /// because that function draws its own X25519 ephemeral key: the combined
+    /// ciphertext layout is `ephemeral_public || ml_kem_ciphertext`, so substituting
+    /// RFC 7748's public key for the ephemeral one makes the whole derivation fixed.
+    #[test]
+    fn test_hybrid_decapsulate_kat_rfc7748_and_acvp() {
+        let mlkem_dk = v::unhex(v::MLKEM768_DECAP_DK);
+        let mlkem_ct = v::unhex(v::MLKEM768_DECAP_C);
+
+        // Combined ciphertext = the RFC 7748 peer public key (standing in for the
+        // sender's ephemeral key) || the ACVP ML-KEM-768 ciphertext.
+        let mut combined_ct = Vec::with_capacity(X25519_KEY_SIZE + mlkem_ct.len());
+        combined_ct.extend_from_slice(&v::unhex32(v::HYBRID_X25519_PEER_PUBLIC));
+        combined_ct.extend_from_slice(&mlkem_ct);
+
+        let ss = hybrid_decapsulate_from_keys(
+            &v::unhex32(v::HYBRID_X25519_SECRET),
+            &mlkem_dk,
+            &combined_ct,
+        )
+        .expect("decapsulate the composed vector");
+
+        assert_eq!(
+            ss.to_vec(),
+            v::unhex(v::HYBRID_COMBINED_SHARED),
+            "combined shared secret does not match SHA-256(rfc7748_k || acvp_k) -- \
+             either a leg is wrong or the combiner's operand order is reversed"
+        );
+    }
+
+    /// Both legs of the hybrid, checked separately against their own authorities,
+    /// so a failure of the combined KAT above localises to one leg.
+    #[test]
+    fn test_hybrid_legs_match_their_own_vectors() {
+        // Classical leg: RFC 7748 §6.1.
+        let secret = X25519Secret::from(v::unhex32(v::HYBRID_X25519_SECRET));
+        let peer = X25519PublicKey::from(v::unhex32(v::HYBRID_X25519_PEER_PUBLIC));
+        assert_eq!(
+            secret.diffie_hellman(&peer).as_bytes()[..],
+            v::unhex(v::HYBRID_X25519_SHARED)[..],
+            "X25519 leg does not match RFC 7748 §6.1"
+        );
+
+        // Post-quantum leg: NIST ACVP ML-KEM-768 decapsulation.
+        let dk = <MlKem768 as KemCore>::DecapsulationKey::from_bytes(
+            v::unhex(v::MLKEM768_DECAP_DK)[..]
+                .try_into()
+                .expect("vector dk is the ML-KEM-768 size"),
+        );
+        let ct_bytes = v::unhex(v::MLKEM768_DECAP_C);
+        let ct: &ml_kem::Ciphertext<MlKem768> = ct_bytes[..]
+            .try_into()
+            .expect("vector ct is the ML-KEM-768 size");
+        let ss = dk.decapsulate(ct).expect("decapsulate");
+        let ss_bytes: &[u8] = ss.as_ref();
+        assert_eq!(
+            ss_bytes,
+            &v::unhex(v::HYBRID_MLKEM_SHARED)[..],
+            "ML-KEM-768 leg does not match the ACVP vector"
+        );
+    }
 
     #[test]
     fn test_hybrid_keypair_generation() {
