@@ -16,6 +16,7 @@ pub mod nas_non_delivery_indication;
 pub mod nas_transport;
 pub mod ng_reset;
 pub mod ng_setup;
+pub mod nrppa;
 pub mod ntn_support;
 pub mod overload;
 pub mod paging;

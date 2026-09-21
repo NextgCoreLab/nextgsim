@@ -97,6 +97,10 @@ use nextgsim_ngap::procedures::ng_reset::{
 use nextgsim_ngap::procedures::ng_setup::{
     NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
 };
+use nextgsim_ngap::procedures::nrppa::{
+    build_nrppa_response, encode_uplink_nrppa_transport, parse_downlink_nrppa_transport,
+    NrppaAssociation, NrppaCellInfo, NrppaError, NrppaProcedure,
+};
 use nextgsim_ngap::procedures::overload::{
     decode_overload_start, decode_overload_stop, OverloadData,
 };
@@ -204,6 +208,15 @@ pub struct NgapTask {
     /// (IEs 318/319/317). A second manager keyed by a numeric session id with no
     /// wire representation was deleted in issue #188.
     mbs_ngap_sessions: NgapMbsManager,
+    /// Next `RAN-UE-Measurement-ID` to hand out for an NRPPa E-CID measurement
+    /// (TS 38.455 §9.2.4, issue #45).
+    ///
+    /// gNB-global rather than per-UE, and deliberately: the id distinguishes the
+    /// node's measurements from the LMF's own `LMF-UE-Measurement-ID` in one
+    /// exchange, so it only has to be unique among the measurements this node has
+    /// outstanding — and a global counter cannot collide across UEs the way a
+    /// per-UE one would once two UEs were measured concurrently.
+    next_nrppa_measurement_id: u8,
     /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
     /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
     guard_timers: GuardTimers,
@@ -244,6 +257,8 @@ impl NgapTask {
             downlink_teid_counter: 0,
             is_initialized: false,
             mbs_ngap_sessions: NgapMbsManager::new(),
+            // UE-Measurement-ID is INTEGER (1..256, ...), so ids start at 1.
+            next_nrppa_measurement_id: 1,
             guard_timers: GuardTimers::new(),
             tnla_client_ids: HashMap::new(),
             next_dynamic_tnla_id: DYNAMIC_TNLA_CLIENT_ID_BASE,
@@ -3092,6 +3107,10 @@ impl NgapTask {
                 } else if self.handle_mbs_pdu(client_id, pdu_bytes).await {
                     // An MBS session procedure (71/72/74) was decoded and
                     // applied to `mbs_ngap_sessions`; see `handle_mbs_pdu`.
+                } else if self.handle_nrppa_transport(client_id, pdu_bytes).await {
+                    // An NRPPa transport (NGAP 5 / 8) was decoded, the tunnelled
+                    // NRPPa procedure answered and the answer sent back on the
+                    // matching uplink transport; see `handle_nrppa_transport`.
                 } else {
                     // amfg-05: this operational PDU could not be routed to a
                     // handler. Per TS 38.413 §8.7.5 / §10, answer with an NGAP
@@ -4727,6 +4746,151 @@ impl NgapTask {
         i32::from(phys_cell_id_from_nci(self.task_base.config.nci))
     }
 
+    /// The gNB-side facts an NRPPa answer is built from (TS 38.455 §9.2.2).
+    ///
+    /// Everything here comes from this node's own configuration and the
+    /// conventions the rest of the stack already uses: the PCI is
+    /// `phys_cell_id_from_nci`, the same value the RRC layer presents, so an LMF
+    /// correlating an NRPPa result against a UE's LPP report sees one cell rather
+    /// than two.
+    fn nrppa_cell_info(&self) -> NrppaCellInfo {
+        let config = &self.task_base.config;
+
+        // ValueRSRP-NR ::= INTEGER (0..127) maps -156..-31 dBm in 1 dB steps
+        // (TS 38.133 §10.1.6). Clamp rather than wrap: a wrapped RSRP reports a
+        // signal strength nobody configured.
+        let ss_rsrp = config.nrppa_serving_rsrp_dbm.clamp(-156, -31) + 156;
+
+        NrppaCellInfo {
+            plmn_identity: config.plmn.encode(),
+            // NRCellIdentifier is BIT STRING (SIZE(36)), so only the low 36 bits
+            // of the configured NCI are on the wire.
+            nr_cell_identity: config.nci & 0xF_FFFF_FFFF,
+            tac: [
+                ((config.tac >> 16) & 0xFF) as u8,
+                ((config.tac >> 8) & 0xFF) as u8,
+                (config.tac & 0xFF) as u8,
+            ],
+            nr_pci: phys_cell_id_from_nci(config.nci),
+            nr_arfcn: config.dl_arfcn,
+            #[allow(clippy::cast_sign_loss)] // clamped to 0..=125 above
+            ss_rsrp: ss_rsrp as u8,
+            trp_ids: config.nrppa_trp_ids.clone(),
+        }
+    }
+
+    /// Decodes an NGAP NRPPa transport, answers the tunnelled NRPPa procedure and
+    /// sends the answer back on the matching uplink transport (TS 38.455 §8.2).
+    ///
+    /// Returns `true` when an NRPPa transport was recognised, so the dispatch
+    /// chain stops; `false` leaves the PDU to the next arm and ultimately to
+    /// `handle_unroutable_pdu`. As with `handle_mbs_pdu`, a recognised transport
+    /// this node cannot answer is reported here and then falls through, so the
+    /// single decision to emit an Error Indication stays in one place — which is
+    /// the conformant reply to an unsupported procedure (TS 38.413 §8.7.5).
+    ///
+    /// The three procedures answered are the ones a positioning-capable NG-RAN
+    /// node is obliged to answer:
+    ///
+    /// - **2** `id-e-CIDMeasurementInitiation` (§8.2.1): reply with an E-CID
+    ///   MEASUREMENT INITIATION RESPONSE carrying the serving cell and SS-RSRP.
+    /// - **9** `id-positioningInformationExchange` (§8.2.6): reply with the SFN
+    ///   timing reference.
+    /// - **16** `id-tRPInformationExchange` (§8.2.8): reply with this node's TRPs.
+    async fn handle_nrppa_transport(&mut self, amf_id: i32, pdu_bytes: &[u8]) -> bool {
+        let request = match parse_downlink_nrppa_transport(pdu_bytes) {
+            Ok(request) => request,
+            // Not an NRPPa transport at all: leave it to the rest of the chain.
+            Err(NrppaError::NotNrppaTransport) => return false,
+            Err(e) => {
+                // It WAS an NRPPa transport, but this node cannot answer it.
+                // Falling through earns the Error Indication.
+                warn!("NRPPa transport from AMF[{amf_id}] could not be answered: {e}");
+                return false;
+            }
+        };
+
+        // The RAN's own handle for this measurement. Allocated per request so two
+        // measurements for one UE are distinguishable, which is what the LMF pairs
+        // its own id against (TS 38.455 §9.2.4).
+        let ran_ue_measurement_id = self.next_nrppa_measurement_id();
+
+        // RelativeTime1900: the NTP-format instant SFN 0 of this cell began. The
+        // simulator has no frame clock reaching NGAP, so the cell's start time is
+        // reported as the epoch this node counts SFNs from, which is 0 — an
+        // honest "SFN 0 is my time origin" rather than a fabricated timestamp.
+        let sfn_initialisation_time = 0;
+
+        let procedure = request.procedure.clone();
+        let response = match build_nrppa_response(
+            &request,
+            &self.nrppa_cell_info(),
+            ran_ue_measurement_id,
+            sfn_initialisation_time,
+        ) {
+            Ok(response) => response,
+            Err(e) => {
+                warn!("Failed to build the NRPPa response for AMF[{amf_id}]: {e}");
+                return false;
+            }
+        };
+
+        let data = match encode_uplink_nrppa_transport(&response) {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Failed to encode the uplink NRPPa transport: {e}");
+                return false;
+            }
+        };
+
+        match &response.association {
+            NrppaAssociation::UeAssociated { ran_ue_ngap_id, .. } => {
+                // UE-associated signalling rides the UE's own SCTP stream
+                // (TS 38.412 §7). A target this node does not hold still gets an
+                // answer on stream 0: the LMF addressed a UE by its NGAP ids and
+                // the measurement is of the cell, so refusing would withhold a
+                // result the node does have.
+                let stream = self
+                    .ue_contexts
+                    .values()
+                    .find(|ctx| ctx.ran_ue_ngap_id == i64::from(*ran_ue_ngap_id))
+                    .map_or(0, |ctx| ctx.stream_id);
+
+                info!(
+                    "NRPPa {} from AMF[{}] answered for RAN-UE-NGAP-ID {} on stream {}",
+                    nrppa_procedure_name(&procedure),
+                    amf_id,
+                    ran_ue_ngap_id,
+                    stream
+                );
+                self.send_ngap_ue_associated(amf_id, stream, data).await;
+            }
+            NrppaAssociation::NonUeAssociated { routing_id } => {
+                // Non-UE-associated signalling is stream 0 (TS 38.412 §7).
+                info!(
+                    "NRPPa {} from AMF[{}] answered for LMF routing id {:02x?}",
+                    nrppa_procedure_name(&procedure),
+                    amf_id,
+                    routing_id
+                );
+                self.send_ngap_non_ue(amf_id, 0, data).await;
+            }
+        }
+
+        true
+    }
+
+    /// Allocates the next `RAN-UE-Measurement-ID` (TS 38.455 §9.2.4,
+    /// `UE-Measurement-ID ::= INTEGER (1..256, ...)`).
+    ///
+    /// Wraps at 256 back to 1 rather than to 0: the constraint's lower bound is 1,
+    /// so 0 is not an encodable measurement id.
+    fn next_nrppa_measurement_id(&mut self) -> u8 {
+        let id = self.next_nrppa_measurement_id;
+        self.next_nrppa_measurement_id = if id == u8::MAX { 1 } else { id + 1 };
+        id
+    }
+
     /// Applies a `MulticastSessionActivationRequest` and answers it
     /// (TS 38.413 §9.2.9.1 / §9.2.9.2).
     async fn handle_multicast_session_activation(
@@ -5030,6 +5194,15 @@ fn serialize_five_g_s_tmsi(identity: &UePagingIdentityValue) -> Vec<u8> {
             out.extend_from_slice(&tmsi.five_g_tmsi);
             out
         }
+    }
+}
+
+/// The spec name of an NRPPa procedure, for logging (TS 38.455 §8.2).
+fn nrppa_procedure_name(procedure: &NrppaProcedure) -> &'static str {
+    match procedure {
+        NrppaProcedure::ECidMeasurementInitiation { .. } => "E-CID Measurement Initiation",
+        NrppaProcedure::PositioningInformationExchange => "Positioning Information Exchange",
+        NrppaProcedure::TrpInformationExchange { .. } => "TRP Information Exchange",
     }
 }
 
@@ -9101,5 +9274,655 @@ mod tests {
              because the PDU Session procedure recorded the join"
         );
         assert!(stopped.joined_ues.contains(&35));
+    }
+
+    // ======================================================================
+    // NRPPa positioning procedures (issue #45, TS 38.455 §8.2)
+    // ======================================================================
+
+    /// Build an APER-encoded DL UE-associated NGAP NRPPa transport carrying an
+    /// E-CID Measurement Initiation Request, i.e. the bytes an AMF relaying for an
+    /// LMF actually puts on N2.
+    fn encode_dl_ue_nrppa_ecid_request(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        transaction_id: u16,
+        lmf_ue_measurement_id: u8,
+    ) -> Vec<u8> {
+        use nextgsim_ngap::codec::generated::{
+            Criticality, DownlinkUEAssociatedNRPPaTransport,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_Entry as Entry,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V, InitiatingMessage,
+            InitiatingMessageValue, NRPPa_PDU, ProcedureCode, ProtocolIE_ID, AMF_UE_NGAP_ID,
+            RAN_UE_NGAP_ID,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+
+        // The NRPPa payload: the three mandatory IEs of TS 38.455 §9.1.2.
+        let quantities = nrppa::MeasurementQuantities(vec![nrppa::MeasurementQuantities_Entry {
+            id: nrppa::ProtocolIE_ID(11),
+            criticality: nrppa::Criticality(0),
+            value: nrppa::MeasurementQuantities_EntryValue::Id_MeasurementQuantities_Item(
+                nrppa::MeasurementQuantities_Item {
+                    measurement_quantities_value: nrppa::MeasurementQuantitiesValue(
+                        nrppa::MeasurementQuantitiesValue::R_SRP,
+                    ),
+                    ie_extensions: None,
+                },
+            ),
+        }]);
+
+        use nrppa::E_CIDMeasurementInitiationRequestProtocolIEs_EntryValue as NV;
+        let nrppa_ies = vec![
+            nrppa::E_CIDMeasurementInitiationRequestProtocolIEs_Entry {
+                id: nrppa::ProtocolIE_ID(2),
+                criticality: nrppa::Criticality(0),
+                value: NV::Id_LMF_UE_Measurement_ID(nrppa::UE_Measurement_ID(
+                    lmf_ue_measurement_id,
+                )),
+            },
+            nrppa::E_CIDMeasurementInitiationRequestProtocolIEs_Entry {
+                id: nrppa::ProtocolIE_ID(3),
+                criticality: nrppa::Criticality(0),
+                value: NV::Id_ReportCharacteristics(nrppa::ReportCharacteristics(
+                    nrppa::ReportCharacteristics::ON_DEMAND,
+                )),
+            },
+            nrppa::E_CIDMeasurementInitiationRequestProtocolIEs_Entry {
+                id: nrppa::ProtocolIE_ID(5),
+                criticality: nrppa::Criticality(0),
+                value: NV::Id_MeasurementQuantities(quantities),
+            },
+        ];
+
+        let nrppa_pdu = nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            procedure_code: nrppa::ProcedureCode(2),
+            criticality: nrppa::Criticality(0),
+            nrppatransaction_id: nrppa::NRPPATransactionID(transaction_id),
+            value: nrppa::InitiatingMessageValue::Id_e_CIDMeasurementInitiation(
+                nrppa::E_CIDMeasurementInitiationRequest {
+                    protocol_i_es: nrppa::E_CIDMeasurementInitiationRequestProtocolIEs(nrppa_ies),
+                },
+            ),
+        });
+        let payload = nextgsim_ngap::codec::encode_aper(&nrppa_pdu).expect("NRPPa encodes");
+
+        let pdu = NGAP_PDU::InitiatingMessage(InitiatingMessage {
+            // 8 = id-DownlinkUEAssociatedNRPPaTransport (TS 38.413 §9.3.1.2).
+            procedure_code: ProcedureCode(8),
+            criticality: Criticality(1),
+            value: InitiatingMessageValue::Id_DownlinkUEAssociatedNRPPaTransport(
+                DownlinkUEAssociatedNRPPaTransport {
+                    protocol_i_es: DownlinkUEAssociatedNRPPaTransportProtocolIEs(vec![
+                        Entry {
+                            id: ProtocolIE_ID(10),
+                            criticality: Criticality(0),
+                            value: V::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(85),
+                            criticality: Criticality(0),
+                            value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(46),
+                            criticality: Criticality(0),
+                            value: V::Id_NRPPa_PDU(NRPPa_PDU(payload)),
+                        },
+                    ]),
+                },
+            ),
+        });
+
+        encode_ngap_pdu(&pdu).expect("DL NRPPa transport encodes")
+    }
+
+    /// Build a DL non-UE-associated NGAP NRPPa transport carrying a TRP
+    /// Information Request.
+    fn encode_dl_non_ue_nrppa_trp_request(routing_id: &[u8], transaction_id: u16) -> Vec<u8> {
+        use nextgsim_ngap::codec::generated::{
+            Criticality, DownlinkNonUEAssociatedNRPPaTransport,
+            DownlinkNonUEAssociatedNRPPaTransportProtocolIEs,
+            DownlinkNonUEAssociatedNRPPaTransportProtocolIEs_Entry as Entry,
+            DownlinkNonUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V, InitiatingMessage,
+            InitiatingMessageValue, NRPPa_PDU, ProcedureCode, ProtocolIE_ID, RoutingID,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+
+        // Ask for nR-PCI (0), nG-RAN-CGI (1) and aRFCN (2).
+        let types = [0u8, 1, 2]
+            .iter()
+            .map(|ty| nrppa::TRPInformationTypeListTRPReq_Entry {
+                id: nrppa::ProtocolIE_ID(57),
+                criticality: nrppa::Criticality(0),
+                value: nrppa::TRPInformationTypeListTRPReq_EntryValue::Id_TRPInformationTypeItem(
+                    nrppa::TRPInformationTypeItem(*ty),
+                ),
+            })
+            .collect();
+
+        use nrppa::TRPInformationRequestProtocolIEs_EntryValue as NV;
+        let nrppa_pdu = nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            procedure_code: nrppa::ProcedureCode(16),
+            criticality: nrppa::Criticality(0),
+            nrppatransaction_id: nrppa::NRPPATransactionID(transaction_id),
+            value: nrppa::InitiatingMessageValue::Id_tRPInformationExchange(
+                nrppa::TRPInformationRequest {
+                    protocol_i_es: nrppa::TRPInformationRequestProtocolIEs(vec![
+                        nrppa::TRPInformationRequestProtocolIEs_Entry {
+                            id: nrppa::ProtocolIE_ID(29),
+                            criticality: nrppa::Criticality(0),
+                            value: NV::Id_TRPInformationTypeListTRPReq(
+                                nrppa::TRPInformationTypeListTRPReq(types),
+                            ),
+                        },
+                    ]),
+                },
+            ),
+        });
+        let payload = nextgsim_ngap::codec::encode_aper(&nrppa_pdu).expect("NRPPa encodes");
+
+        let pdu = NGAP_PDU::InitiatingMessage(InitiatingMessage {
+            // 5 = id-DownlinkNonUEAssociatedNRPPaTransport (TS 38.413 §9.3.1.2).
+            procedure_code: ProcedureCode(5),
+            criticality: Criticality(1),
+            value: InitiatingMessageValue::Id_DownlinkNonUEAssociatedNRPPaTransport(
+                DownlinkNonUEAssociatedNRPPaTransport {
+                    protocol_i_es: DownlinkNonUEAssociatedNRPPaTransportProtocolIEs(vec![
+                        Entry {
+                            id: ProtocolIE_ID(89),
+                            criticality: Criticality(0),
+                            value: V::Id_RoutingID(RoutingID(routing_id.to_vec())),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(46),
+                            criticality: Criticality(0),
+                            value: V::Id_NRPPa_PDU(NRPPa_PDU(payload)),
+                        },
+                    ]),
+                },
+            ),
+        });
+
+        encode_ngap_pdu(&pdu).expect("DL non-UE NRPPa transport encodes")
+    }
+
+    /// An E-CID Measurement Initiation Request fed into the SCTP-facing dispatch
+    /// is answered with an UplinkUEAssociatedNRPPaTransport carrying a decodable
+    /// E-CID response — NOT an Error Indication.
+    ///
+    /// This drives `handle_ngap_pdu`, the method the SCTP receive loop calls for
+    /// every `NgapMessage::ReceiveNgapPdu`, so it exercises the production path
+    /// rather than the handler in isolation.
+    #[tokio::test]
+    async fn test_dl_nrppa_ecid_request_is_answered_with_an_uplink_transport() {
+        use nextgsim_ngap::codec::generated::{
+            InitiatingMessageValue, UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let inbound = encode_dl_ue_nrppa_ecid_request(777, ran as u32, 7, 3);
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        let reply = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                buffer.data().to_vec()
+            }
+            other => panic!("expected an outbound NRPPa answer, got {other:?}"),
+        };
+
+        // It must NOT be an Error Indication -- the defect this issue names.
+        assert!(
+            decode_error_indication(&reply).is_err(),
+            "an E-CID request must not be answered with an Error Indication"
+        );
+
+        // Positively: an UplinkUEAssociatedNRPPaTransport (NGAP 50) naming the
+        // same UE and carrying an E-CID response with the serving cell and RSRP.
+        let ngap = decode_ngap_pdu(&reply).expect("the answer must be a valid NGAP PDU");
+        let NGAP_PDU::InitiatingMessage(init) = &ngap else {
+            panic!("expected an NGAP InitiatingMessage, got {ngap:?}");
+        };
+        assert_eq!(
+            init.procedure_code.0, 50,
+            "id-UplinkUEAssociatedNRPPaTransport"
+        );
+        let InitiatingMessageValue::Id_UplinkUEAssociatedNRPPaTransport(ul) = &init.value else {
+            panic!("expected an UplinkUEAssociatedNRPPaTransport");
+        };
+
+        let mut amf_id = None;
+        let mut ran_id = None;
+        let mut payload = None;
+        for ie in &ul.protocol_i_es.0 {
+            match &ie.value {
+                V::Id_AMF_UE_NGAP_ID(id) => amf_id = Some(id.0),
+                V::Id_RAN_UE_NGAP_ID(id) => ran_id = Some(id.0),
+                V::Id_NRPPa_PDU(p) => payload = Some(p.0.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(amf_id, Some(777), "the answer must name the requested UE");
+        assert_eq!(ran_id, Some(ran as u32));
+
+        let inner: nrppa::NRPPA_PDU =
+            nextgsim_ngap::codec::decode_aper(&payload.expect("NRPPa-PDU IE present"))
+                .expect("the tunnelled NRPPa PDU must decode");
+        let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) = inner else {
+            panic!("TS 38.455 §8.2.1.2 requires a successful outcome");
+        };
+        assert_eq!(outcome.procedure_code.0, 2, "id-e-CIDMeasurementInitiation");
+        assert_eq!(
+            outcome.nrppatransaction_id.0, 7,
+            "the transactionID must be echoed"
+        );
+
+        let nrppa::SuccessfulOutcomeValue::Id_e_CIDMeasurementInitiation(resp) = &outcome.value
+        else {
+            panic!("expected an E-CIDMeasurementInitiationResponse");
+        };
+
+        use nrppa::E_CIDMeasurementInitiationResponseProtocolIEs_EntryValue as RV;
+        let mut lmf_id = None;
+        let mut result = None;
+        for ie in &resp.protocol_i_es.0 {
+            match &ie.value {
+                RV::Id_LMF_UE_Measurement_ID(id) => lmf_id = Some(id.0),
+                RV::Id_E_CID_MeasurementResult(r) => result = Some(r.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(lmf_id, Some(3), "the LMF's measurement id must be echoed");
+
+        let result = result.expect("the response must carry an E-CID-MeasurementResult");
+
+        // The serving cell is this gNB's configured cell, reached through the
+        // production config rather than a test constant.
+        let config = test_config();
+        assert_eq!(result.serving_cell_id.plmn_identity.0, config.plmn.encode());
+        let nrppa::NG_RANCell::NR_CellID(nci) = &result.serving_cell_id.ng_ra_ncell else {
+            panic!("a gNB must report an NR cell identity");
+        };
+        let decoded_nci = nci.0.iter().fold(0u64, |acc, b| (acc << 1) | u64::from(*b));
+        assert_eq!(decoded_nci, config.nci & 0xF_FFFF_FFFF);
+
+        // And a radio quantity: SS-RSRP, at the configured level. -85 dBm is
+        // offset 71 in ValueRSRP-NR's -156..-31 window.
+        let measured = result
+            .measured_results
+            .expect("the response must carry a radio quantity");
+        let nrppa::MeasuredResultsValue::Choice_Extension(ext) = &measured.0[0] else {
+            panic!("SS-RSRP rides in the CHOICE extension arm");
+        };
+        let nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_ResultSS_RSRP(rsrp) = &ext.value
+        else {
+            panic!("expected a ResultSS-RSRP");
+        };
+        assert_eq!(
+            rsrp.0[0].value_ss_rsrp_cell.as_ref().map(|v| v.0),
+            Some((config.nrppa_serving_rsrp_dbm + 156) as u8),
+            "the reported RSRP must be the configured serving-cell level"
+        );
+        assert_eq!(rsrp.0[0].nr_arfcn.0, config.dl_arfcn);
+    }
+
+    /// A TRP Information Request arriving non-UE-associated is answered on the
+    /// non-UE-associated uplink transport, on stream 0, with this node's TRPs.
+    #[tokio::test]
+    async fn test_dl_nrppa_trp_request_is_answered_on_the_non_ue_transport() {
+        use nextgsim_ngap::codec::generated::{
+            InitiatingMessageValue, UplinkNonUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+        let routing_id = [0xAAu8, 0xBB];
+        let inbound = encode_dl_non_ue_nrppa_trp_request(&routing_id, 21);
+
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&inbound))
+            .await;
+
+        let (reply, stream) = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, stream, .. })) => {
+                (buffer.data().to_vec(), stream)
+            }
+            other => panic!("expected an outbound NRPPa answer, got {other:?}"),
+        };
+        assert_eq!(
+            stream, 0,
+            "non-UE-associated signalling uses stream 0 (TS 38.412 §7)"
+        );
+        assert!(
+            decode_error_indication(&reply).is_err(),
+            "a TRP Information Request must not be answered with an Error Indication"
+        );
+
+        let ngap = decode_ngap_pdu(&reply).expect("valid NGAP");
+        let NGAP_PDU::InitiatingMessage(init) = &ngap else {
+            panic!("expected an InitiatingMessage");
+        };
+        assert_eq!(
+            init.procedure_code.0, 47,
+            "id-UplinkNonUEAssociatedNRPPaTransport"
+        );
+        let InitiatingMessageValue::Id_UplinkNonUEAssociatedNRPPaTransport(ul) = &init.value else {
+            panic!("expected an UplinkNonUEAssociatedNRPPaTransport");
+        };
+
+        let mut echoed = None;
+        let mut payload = None;
+        for ie in &ul.protocol_i_es.0 {
+            match &ie.value {
+                V::Id_RoutingID(r) => echoed = Some(r.0.clone()),
+                V::Id_NRPPa_PDU(p) => payload = Some(p.0.clone()),
+            }
+        }
+        assert_eq!(
+            echoed.as_deref(),
+            Some(&routing_id[..]),
+            "the RoutingID must be echoed so the answer reaches the originating LMF"
+        );
+
+        let inner: nrppa::NRPPA_PDU =
+            nextgsim_ngap::codec::decode_aper(&payload.expect("payload")).expect("NRPPa decodes");
+        let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) = inner else {
+            panic!("§8.2.8 requires a TRPInformationResponse");
+        };
+        assert_eq!(outcome.procedure_code.0, 16, "id-tRPInformationExchange");
+
+        let nrppa::SuccessfulOutcomeValue::Id_tRPInformationExchange(resp) = &outcome.value else {
+            panic!("expected a TRPInformationResponse");
+        };
+        use nrppa::TRPInformationResponseProtocolIEs_EntryValue as RV;
+        let RV::Id_TRPInformationListTRPResp(list) = &resp.protocol_i_es.0[0].value else {
+            panic!("the response must carry id-TRPInformationListTRPResp");
+        };
+
+        let config = test_config();
+        let reported: Vec<u16> = list.0.iter().map(|e| e.trp_information.trp_id.0).collect();
+        assert_eq!(
+            reported, config.nrppa_trp_ids,
+            "the node must report the TRPs it is configured with"
+        );
+        assert_eq!(
+            list.0[0]
+                .trp_information
+                .trp_information_type_response_list
+                .0
+                .len(),
+            3,
+            "three information types were requested, so three are answered"
+        );
+    }
+
+    /// The counterpart of the two tests above: a Positioning Information Request
+    /// is answered too, so all three §8.2 procedures reach the wire.
+    #[tokio::test]
+    async fn test_dl_nrppa_positioning_information_request_is_answered() {
+        use nextgsim_ngap::codec::generated::{
+            Criticality, DownlinkUEAssociatedNRPPaTransport,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_Entry as Entry,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V, InitiatingMessage,
+            InitiatingMessageValue, NRPPa_PDU, ProcedureCode, ProtocolIE_ID, AMF_UE_NGAP_ID,
+            RAN_UE_NGAP_ID,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+
+        // Every IE of a PositioningInformationRequest is OPTIONAL (§9.1.10), so
+        // an empty container is a legal request.
+        let nrppa_pdu = nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            procedure_code: nrppa::ProcedureCode(9),
+            criticality: nrppa::Criticality(0),
+            nrppatransaction_id: nrppa::NRPPATransactionID(33),
+            value: nrppa::InitiatingMessageValue::Id_positioningInformationExchange(
+                nrppa::PositioningInformationRequest {
+                    protocol_i_es: nrppa::PositioningInformationRequestProtocolIEs(vec![]),
+                },
+            ),
+        });
+        let payload = nextgsim_ngap::codec::encode_aper(&nrppa_pdu).expect("encodes");
+
+        let pdu = NGAP_PDU::InitiatingMessage(InitiatingMessage {
+            procedure_code: ProcedureCode(8),
+            criticality: Criticality(1),
+            value: InitiatingMessageValue::Id_DownlinkUEAssociatedNRPPaTransport(
+                DownlinkUEAssociatedNRPPaTransport {
+                    protocol_i_es: DownlinkUEAssociatedNRPPaTransportProtocolIEs(vec![
+                        Entry {
+                            id: ProtocolIE_ID(10),
+                            criticality: Criticality(0),
+                            value: V::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(5)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(85),
+                            criticality: Criticality(0),
+                            value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran as u32)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(46),
+                            criticality: Criticality(0),
+                            value: V::Id_NRPPa_PDU(NRPPa_PDU(payload)),
+                        },
+                    ]),
+                },
+            ),
+        });
+        let inbound = encode_ngap_pdu(&pdu).expect("encodes");
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        let reply = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                buffer.data().to_vec()
+            }
+            other => panic!("expected an outbound NRPPa answer, got {other:?}"),
+        };
+        assert!(
+            decode_error_indication(&reply).is_err(),
+            "§8.2.6 must be answered, not rejected"
+        );
+
+        let ngap = decode_ngap_pdu(&reply).expect("valid NGAP");
+        let NGAP_PDU::InitiatingMessage(init) = &ngap else {
+            panic!("expected an InitiatingMessage");
+        };
+        let InitiatingMessageValue::Id_UplinkUEAssociatedNRPPaTransport(ul) = &init.value else {
+            panic!("expected an UplinkUEAssociatedNRPPaTransport");
+        };
+
+        use nextgsim_ngap::codec::generated::UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as UV;
+        let payload = ul
+            .protocol_i_es
+            .0
+            .iter()
+            .find_map(|ie| match &ie.value {
+                UV::Id_NRPPa_PDU(p) => Some(p.0.clone()),
+                _ => None,
+            })
+            .expect("NRPPa-PDU IE present");
+
+        let inner: nrppa::NRPPA_PDU =
+            nextgsim_ngap::codec::decode_aper(&payload).expect("NRPPa decodes");
+        let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) = inner else {
+            panic!("expected a PositioningInformationResponse");
+        };
+        assert_eq!(
+            outcome.procedure_code.0, 9,
+            "id-positioningInformationExchange"
+        );
+        assert_eq!(outcome.nrppatransaction_id.0, 33);
+
+        let nrppa::SuccessfulOutcomeValue::Id_positioningInformationExchange(resp) = &outcome.value
+        else {
+            panic!("expected a PositioningInformationResponse");
+        };
+        use nrppa::PositioningInformationResponseProtocolIEs_EntryValue as RV;
+        let RV::Id_SFNInitialisationTime(time) = &resp.protocol_i_es.0[0].value else {
+            panic!("the response must carry id-SFNInitialisationTime");
+        };
+        assert_eq!(
+            time.0.len(),
+            64,
+            "RelativeTime1900 is BIT STRING (SIZE(64))"
+        );
+    }
+
+    /// Successive E-CID measurements get distinct RAN-UE-Measurement-IDs, so an
+    /// LMF running two measurements can tell the node's answers apart
+    /// (TS 38.455 §9.2.4).
+    #[tokio::test]
+    async fn test_successive_ecid_measurements_get_distinct_ran_measurement_ids() {
+        use nextgsim_ngap::codec::generated::{
+            InitiatingMessageValue, UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+
+        let mut ran_ids = Vec::new();
+        for transaction in [1u16, 2] {
+            let inbound = encode_dl_ue_nrppa_ecid_request(777, ran as u32, transaction, 3);
+            task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+                .await;
+
+            let reply = match sctp_rx.try_recv() {
+                Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                    buffer.data().to_vec()
+                }
+                other => panic!("expected an NRPPa answer, got {other:?}"),
+            };
+            let ngap = decode_ngap_pdu(&reply).expect("valid NGAP");
+            let NGAP_PDU::InitiatingMessage(init) = &ngap else {
+                panic!("expected an InitiatingMessage");
+            };
+            let InitiatingMessageValue::Id_UplinkUEAssociatedNRPPaTransport(ul) = &init.value
+            else {
+                panic!("expected an uplink transport");
+            };
+            let payload = ul
+                .protocol_i_es
+                .0
+                .iter()
+                .find_map(|ie| match &ie.value {
+                    V::Id_NRPPa_PDU(p) => Some(p.0.clone()),
+                    _ => None,
+                })
+                .expect("payload");
+            let inner: nrppa::NRPPA_PDU =
+                nextgsim_ngap::codec::decode_aper(&payload).expect("decodes");
+            let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) = inner else {
+                panic!("expected a successful outcome");
+            };
+            let nrppa::SuccessfulOutcomeValue::Id_e_CIDMeasurementInitiation(resp) = &outcome.value
+            else {
+                panic!("expected an E-CID response");
+            };
+            use nrppa::E_CIDMeasurementInitiationResponseProtocolIEs_EntryValue as RV;
+            let ran_measurement_id = resp
+                .protocol_i_es
+                .0
+                .iter()
+                .find_map(|ie| match &ie.value {
+                    RV::Id_RAN_UE_Measurement_ID(id) => Some(id.0),
+                    _ => None,
+                })
+                .expect("RAN-UE-Measurement-ID is mandatory");
+            ran_ids.push(ran_measurement_id);
+        }
+
+        assert_ne!(
+            ran_ids[0], ran_ids[1],
+            "two measurements must not share one RAN-UE-Measurement-ID"
+        );
+        assert!(
+            ran_ids.iter().all(|id| *id >= 1),
+            "UE-Measurement-ID starts at 1, so 0 is not encodable"
+        );
+    }
+
+    /// An NRPPa procedure this gNB does not implement still earns an Error
+    /// Indication, which is the conformant reply to an unsupported procedure
+    /// (TS 38.413 §8.7.5) — adding the NRPPa arm must not silently swallow it.
+    #[tokio::test]
+    async fn test_unsupported_nrppa_procedure_still_earns_an_error_indication() {
+        use nextgsim_ngap::codec::generated::{
+            Criticality, DownlinkUEAssociatedNRPPaTransport,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_Entry as Entry,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V, InitiatingMessage,
+            InitiatingMessageValue, NRPPa_PDU, ProcedureCode, ProtocolIE_ID, AMF_UE_NGAP_ID,
+            RAN_UE_NGAP_ID,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+
+        // Procedure 6, OTDOA Information Exchange: a real NRPPa procedure this
+        // node does not answer.
+        let nrppa_pdu = nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            procedure_code: nrppa::ProcedureCode(6),
+            criticality: nrppa::Criticality(0),
+            nrppatransaction_id: nrppa::NRPPATransactionID(1),
+            value: nrppa::InitiatingMessageValue::Id_oTDOAInformationExchange(
+                nrppa::OTDOAInformationRequest {
+                    protocol_i_es: nrppa::OTDOAInformationRequestProtocolIEs(vec![]),
+                },
+            ),
+        });
+        let payload = nextgsim_ngap::codec::encode_aper(&nrppa_pdu).expect("encodes");
+
+        let pdu = NGAP_PDU::InitiatingMessage(InitiatingMessage {
+            procedure_code: ProcedureCode(8),
+            criticality: Criticality(1),
+            value: InitiatingMessageValue::Id_DownlinkUEAssociatedNRPPaTransport(
+                DownlinkUEAssociatedNRPPaTransport {
+                    protocol_i_es: DownlinkUEAssociatedNRPPaTransportProtocolIEs(vec![
+                        Entry {
+                            id: ProtocolIE_ID(10),
+                            criticality: Criticality(0),
+                            value: V::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(1)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(85),
+                            criticality: Criticality(0),
+                            value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran as u32)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(46),
+                            criticality: Criticality(0),
+                            value: V::Id_NRPPa_PDU(NRPPa_PDU(payload)),
+                        },
+                    ]),
+                },
+            ),
+        });
+        let inbound = encode_ngap_pdu(&pdu).expect("encodes");
+
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+
+        let reply = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                buffer.data().to_vec()
+            }
+            other => panic!("expected an Error Indication, got {other:?}"),
+        };
+        let err = decode_error_indication(&reply)
+            .expect("an unsupported NRPPa procedure must earn an Error Indication");
+        assert_eq!(
+            err.criticality_diagnostics
+                .as_ref()
+                .and_then(|d| d.procedure_code),
+            Some(8),
+            "the diagnostics must name the NGAP transport that could not be handled"
+        );
     }
 }

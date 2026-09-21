@@ -53,6 +53,26 @@ fn default_dl_arfcn() -> u32 {
     632_448
 }
 
+/// Serving-cell SS-RSRP the gNB reports in an NRPPa E-CID measurement result.
+///
+/// -85 dBm, a healthy mid-cell reading. Named rather than left to `i32`'s zero,
+/// because 0 dBm is above `ValueRSRP-NR`'s -31 dBm ceiling and would be clamped
+/// to the maximum — telling an LMF the UE is effectively on top of the antenna.
+fn default_nrppa_serving_rsrp_dbm() -> i32 {
+    -85
+}
+
+/// TRP identities the gNB reports for TRP Information Exchange.
+///
+/// One TRP, id 1: this simulator radiates a single cell from a single logical
+/// point. Id 1 and not 0 because `TRP-ID ::= INTEGER (1..maxnoTRPs, ...)` excludes
+/// 0 (TS 38.455 §9.2.23) — an id of 0 cannot be encoded at all. And not
+/// `Vec::default()`'s empty list, which would encode a node with no reference
+/// points, a claim about the deployment rather than an absence of configuration.
+fn default_nrppa_trp_ids() -> Vec<u16> {
+    vec![1]
+}
+
 /// gNB (gNodeB) configuration.
 ///
 /// Contains all configuration parameters for a 5G base station.
@@ -256,6 +276,46 @@ pub struct GnbConfig {
     /// 632448 is the `absoluteFrequencySSB` of a 3.5 GHz n78 cell.
     #[serde(default = "default_dl_arfcn")]
     pub dl_arfcn: u32,
+
+    /// Serving-cell SS-RSRP this gNB reports in an NRPPa E-CID measurement
+    /// result, in dBm (issue #45, TS 38.455 §9.2.2 `E-CID-MeasurementResult`).
+    ///
+    /// **Configured, not measured, and it has to be**: the measurement an E-CID
+    /// result carries is the one the NG-RAN node made of the target UE, and this
+    /// simulator has no PHY — RLS carries no per-UE signal strength up to NGAP, and
+    /// the only RSRP anywhere in the stack is the value a UE puts in its own RRC
+    /// `MeasurementReport`, which is the UE's measurement of the cell rather than
+    /// the cell's of the UE. So the node has to be told what it measures, exactly
+    /// as the UE side had to be told its `lpp_arfcn_eutra` for issue #46.
+    ///
+    /// Encoded on the wire as `ValueRSRP-NR ::= INTEGER (0..127)`, which maps
+    /// -156..-31 dBm in 1 dB steps (TS 38.133 §10.1.6). A configured value outside
+    /// that window is clamped to it rather than wrapped, because a wrapped RSRP
+    /// names a signal strength the operator did not ask for.
+    ///
+    /// The default of -85 dBm is a healthy mid-cell reading, so a run that
+    /// configures nothing still produces a plausible fix rather than a cell-edge one.
+    #[serde(default = "default_nrppa_serving_rsrp_dbm")]
+    pub nrppa_serving_rsrp_dbm: i32,
+
+    /// TRP identities this gNB reports for TRP Information Exchange (issue #45,
+    /// TS 38.455 §8.2.8).
+    ///
+    /// A TRP is a transmission-reception point: an antenna panel the LMF can treat
+    /// as a distinct reference point when it multilaterates. This simulator
+    /// radiates one cell from one logical point, so the honest default is a single
+    /// TRP — not an empty list, because `TRPInformationListTRPResp` is mandatory
+    /// and a node reporting no TRP at all tells the LMF it has no reference
+    /// points, which is a different and false claim.
+    ///
+    /// **Ids start at 1**: `TRP-ID ::= INTEGER (1..maxnoTRPs, ...)`, so 0 is not
+    /// an encodable TRP id. A configured 0 is dropped rather than shifted to 1,
+    /// because renumbering an operator's TRP would silently rename the reference
+    /// point an LMF correlates its measurements against.
+    ///
+    /// Configure several to exercise an LMF's multi-TRP path.
+    #[serde(default = "default_nrppa_trp_ids")]
+    pub nrppa_trp_ids: Vec<u16>,
 
     /// Idle-mode cell reselection parameters this cell broadcasts in SIB2/SIB3/
     /// SIB4 (TS 38.331 §6.3.1, TS 38.304 §5.2.4.6). Issue #50.
@@ -471,6 +531,8 @@ impl Default for GnbConfig {
             ntn_config: None,
             as_security_enabled: false,
             dl_arfcn: default_dl_arfcn(),
+            nrppa_serving_rsrp_dbm: default_nrppa_serving_rsrp_dbm(),
+            nrppa_trp_ids: default_nrppa_trp_ids(),
             reselection: CellReselectionBroadcastConfig::default(),
             mbs_enabled: false,
             prose_enabled: false,
