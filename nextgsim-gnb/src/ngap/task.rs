@@ -33,6 +33,7 @@ use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
 use super::up_security::{self, DrbSecurityDecision, UpSecurityRefusal};
 use crate::mbs_ngap::{GnbMbsSession, NgapMbsManager};
 use crate::rrc::meas::a3_meas_config_params;
+use crate::rrc::system_info::sib19_params;
 use crate::rrc::transaction::RrcProcedure;
 use nextgsim_ngap::procedures::mbs::{
     encode_multicast_session_activation_response, encode_multicast_session_deactivation_response,
@@ -48,7 +49,7 @@ use nextgsim_rrc::procedures::handover_preparation::{
 // itself rather than leaving an unused name in the production scope.
 use nextgsim_rrc::procedures::rrc_reconfiguration::{
     build_multi_drb_reconfiguration_params, encode_rrc_reconfiguration, DrbIntegrityProtection,
-    DrbSpec,
+    DrbSpec, RrcReconfigurationParams,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
 use nextgsim_rrc::procedures::security_mode::{
@@ -617,20 +618,25 @@ impl NgapTask {
                     ctx.on_ng_setup_response(response);
                 }
 
-                // Forward NTN timing config to RRC task if configured
+                // The NTN configuration is no longer forwarded from here (issue #56).
+                //
+                // This used to send `RrcMessage::NtnTimingAdvanceConfig` so the RRC
+                // task could store parameters nothing read. Two things were wrong
+                // with the shape, not just with the missing reader: the cell's NTN
+                // configuration does not depend on an AMF answer (an NTN cell is an
+                // NTN cell before NG Setup completes, and a UE reads SIB19 while
+                // still in idle), and the message carried no ephemeris, without which
+                // TS 38.300 §16.14.2.2's pre-compensation cannot be computed.
+                //
+                // `RrcTask::new` now derives the SIB19 parameters from the same
+                // `config.ntn_config` block directly. The log line stays, because
+                // "this gNB is running as an NTN cell" is worth one line at startup.
                 if let Some(ref ntn) = self.task_base.config.ntn_config {
                     info!(
-                        "NTN mode active: satellite_type={}, propagation_delay={}us, k_offset={}",
+                        "NTN mode active: satellite_type={}, propagation_delay={}us, \
+                         k_offset={}; the serving-cell ephemeris and Common TA are \
+                         broadcast in SIB19 (TS 38.300 §16.4)",
                         ntn.satellite_type, ntn.propagation_delay_us, ntn.k_offset
-                    );
-                    let _ = self.task_base.rrc_tx.try_send(
-                        crate::tasks::RrcMessage::NtnTimingAdvanceConfig {
-                            satellite_type: ntn.satellite_type.clone(),
-                            common_ta_us: ntn.common_ta_us,
-                            k_offset: ntn.k_offset,
-                            max_doppler_hz: ntn.max_doppler_hz,
-                            autonomous_ta: ntn.autonomous_ta,
-                        },
                     );
                 }
 
@@ -1317,6 +1323,22 @@ impl NgapTask {
                 );
                 return;
             }
+        };
+        // Carry the serving cell's `ntn-Config` on this reconfiguration for the
+        // connected-mode NTN update path (TS 38.300 §16.14.2.2, issue #56).
+        //
+        // This message, not a later one: it is what takes the UE into carrying
+        // traffic, and §16.14.2.2 says a UE without a valid ephemeris and Common TA
+        // "shall not transmit". A UE that acquired SIB19 in idle already has the
+        // configuration; this is the refresh that keeps it valid past
+        // `ntn-UlSyncValidityDuration` without requiring it to keep reading BCCH.
+        //
+        // Derived from the same `sib19_params(&config)` the RRC task's broadcast uses,
+        // so the two cannot hand a UE two different ephemerides. `None` on a
+        // terrestrial cell, where the field is simply absent.
+        let params = RrcReconfigurationParams {
+            ntn_config: sib19_params(&self.task_base.config),
+            ..params
         };
         match encode_rrc_reconfiguration(&params) {
             Ok(pdu) => {

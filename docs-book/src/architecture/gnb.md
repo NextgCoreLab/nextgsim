@@ -303,16 +303,30 @@ the unit tests in `src/tasks.rs`; production shutdown is driven by the
 
 All of the following are grounded in the current source, not in spec text:
 
-- **NTN is parse-forward-store but effectively inert.** When an NG Setup Response
-  arrives and `config.ntn_config` is set, the NGAP task logs it and forwards
-  `RrcMessage::NtnTimingAdvanceConfig` to RRC (`src/ngap/task.rs`,
-  `handle_ng_setup_response`). `RrcTask` stores it into `self.ntn_config`
-  (`src/rrc/task.rs`) — but that stored value is only ever *written*, never read
-  back to shape an outgoing RRC Setup/Reconfiguration. The
-  [Configuration Reference](../configuration.md#ntn-research-prototype) documents
-  `ntn_config` as logging-only/inert for exactly this reason. The NTN modules
-  under `src/rrc/ntn_gnb.rs` are research prototypes and use "Simplified"
-  distance/beam math per their own code comments.
+- **NTN serving-cell timing is live; the surrounding NTN modules are not.**
+  Closed by issue #56. `config.ntn_config` is read at `RrcTask::new`, turned into
+  `SIB19-r17` parameters by `rrc::system_info::sib19_params`, stored in
+  `RrcTask::ntn_config`, and **read back** on the broadcast path
+  (`broadcast_system_information`), so the cell puts its ephemeris, Common TA,
+  `cellSpecificKoffset` and `ntn-UlSyncValidityDuration` on BCCH as real UPER
+  (TS 38.300 §16.4, §16.14.2.2). The same value rides an `RRCReconfiguration`'s
+  `dedicatedSystemInformationDelivery` for the connected-mode update, and the UE
+  derives and **applies** a non-zero uplink timing advance and Doppler
+  pre-compensation from it — asserted end to end in
+  `tests/src/ntn_sib19_timing_e2e.rs`.
+
+  The sim-internal `RrcMessage::NtnTimingAdvanceConfig` that used to carry these
+  parameters was removed. It was written and never read, and it could not have
+  driven a conformant pre-compensation even with a reader: it carried no
+  ephemeris, which §16.14.2.2 makes the autonomous timing advance a function of.
+
+  Still limited: the NTN modules under `src/rrc/ntn_gnb.rs` remain research
+  prototypes with "Simplified" distance/beam math per their own code comments; no
+  neighbour-cell `ntn-NeighCellConfigList` is broadcast, because this simulator
+  models one serving NTN cell; and `kmac`, the polarisation fields, `ta-Report`
+  and `referenceLocation` are omitted because there is no MAC-CE timing, antenna
+  model, TA-reporting procedure or TS 37.355 location encoder here for them to
+  govern.
 - **DAPS and standalone MBS-NGAP are library modules, not wired into a task.**
   `src/daps.rs` (`DapsManager`, `DapsState`) and `src/mbs_ngap.rs`
   (`NgapMbsManager`, `GnbMbsState`) are re-exported from `src/lib.rs` but are not

@@ -197,3 +197,47 @@ federated_learning_enabled: false  # Federated Learning Aggregator (Rel-20)
 # protected and ciphered in both directions, a PDU failing integrity is
 # discarded, and no DRB is established until activation completes.
 as_security_enabled: false
+
+# NTN (satellite) operation (TS 38.300 §16.14, issue #56).
+#
+# Commented out: with this block ABSENT this is a terrestrial cell, it broadcasts no
+# SIB19, and nothing below changes. Uncomment it to make the cell an NTN cell, which
+# makes it broadcast SIB19 carrying the ephemeris, Common TA and validity that let a
+# UE pre-compensate its uplink timing and Doppler (§16.14.2.2).
+#
+# A UE talking to an NTN cell needs `gnss_position_ecef_m` set in its own config, or
+# it cannot compute an RTT and applies no pre-compensation -- see config/ue.yaml.
+#
+# ntn_config:
+#   # LEO | MEO | GEO | HAPS. Descriptive: the timing comes from the ephemeris below.
+#   satellite_type: LEO
+#   satellite_id: 1
+#   # One-way propagation delay in us. Informational -- the UE derives its own delay
+#   # from the ephemeris, which is the point of SIB19.
+#   propagation_delay_us: 2001
+#   # Common TA in us: the RTT between the uplink time synchronisation reference point
+#   # and the NTN payload, i.e. the FEEDER link (§16.14.2.1). The UE adds the service
+#   # link RTT it computes itself. Encoded into ta-Common's 4.072 ns steps, so the
+#   # maximum expressible value is ~270 ms.
+#   common_ta_us: 4072
+#   # cellSpecificKoffset in slots, INTEGER(1..1023). §16.14.2.1 requires it to be at
+#   # least the service link RTT plus the Common TA.
+#   k_offset: 478
+#   cell_center_lat: 0.0
+#   cell_center_lon: 0.0
+#   cell_radius_km: 500.0
+#   earth_fixed: true
+#   autonomous_ta: true
+#   max_doppler_hz: 50000.0
+#   # How long the UE may keep applying this configuration before re-acquiring. Must
+#   # be one of the values ntn-UlSyncValidityDuration enumerates: 5..60 in 5 s steps,
+#   # then 120, 180, 240, 900. Anything else fails the SIB19 build (and is logged).
+#   ul_sync_validity_s: 30
+#   # The satellite's ECEF position and velocity, broadcast as SIB19's ephemerisInfo.
+#   # This is what the UE derives its slant range and Doppler from. Defaults to a
+#   # 600 km LEO satellite over 0N 0E receding at 1 km/s. Quantised to the wire's
+#   # 1.3 m / 0.06 m/s steps; a position beyond ~43618 km cannot be encoded, and the
+#   # cell then broadcasts no SIB19 rather than a clamped one.
+#   ephemeris:
+#     position_m: [6978137.0, 0.0, 0.0]
+#     velocity_m_s: [1000.0, 0.0, 0.0]

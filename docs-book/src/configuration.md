@@ -127,7 +127,9 @@ Multiple AMFs can be configured for redundancy. The gNB will attempt to connect 
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `ntn_config` | object | No | null | Optional NTN (Non-Terrestrial Network) block. **Currently logging-only/inert**: the gNB parses and stores it, but it is not wired into live RRC/NGAP signaling — the NTN modules are non-normative research prototypes |
+| `ntn_config` | object | No | null | Optional NTN (Non-Terrestrial Network) block. Present makes this an **NTN cell**: the gNB broadcasts `SIB19` carrying the `ephemeris`, `common_ta_us`, `k_offset` and `ul_sync_validity_s` below (TS 38.300 §16.4), and also sends them in an `RRCReconfiguration`'s `dedicatedSystemInformationDelivery` for connected-mode updates. A UE with `gnss_position_ecef_m` set then derives and applies a non-zero uplink timing advance and Doppler pre-compensation (§16.14.2.2, issue #56). Absent (the default) is a terrestrial cell: no SIB19 on the air. The surrounding modules under `src/rrc/ntn_gnb.rs` remain non-normative research prototypes |
+| `ntn_config.ephemeris` | object | No | 600 km LEO over 0°N 0°E receding at 1 km/s | The satellite's ECEF `position_m` and `velocity_m_s`, broadcast as SIB19's `ephemerisInfo`. This is what the UE derives its slant range and Doppler from — a `common_ta_us` alone cannot substitute, because it is the network's number for the feeder link, not this UE's service link. Quantised to the wire's 1.3 m / 0.06 m/s steps; a value outside `EphemerisInfo-r17`'s range is refused and the cell broadcasts no SIB19 rather than a clamped ephemeris |
+| `ntn_config.ul_sync_validity_s` | integer | No | 30 | `ntn-UlSyncValidityDuration` in seconds: how long the UE may keep applying this configuration. Must be one of the values the ENUMERATED defines — 5–60 in 5 s steps, then 120, 180, 240, 900. Anything else fails the SIB19 build and is logged |
 
 ---
 
@@ -304,6 +306,8 @@ These optional UE fields drive the Rel-17/18 features that are integrated end-to
 | `uav_config.max_altitude_meters` | f64 | - | Reported flight altitude. Above the AMF geofence ceiling (`AMF_UAV_GEOFENCE`, default 120 m) → the AMF revokes authorization (geofence deny); within bounds → allow. |
 | `uav_config.remote_id_enabled` | bool | false | Include Remote-ID in tracking reports. |
 | `uav_config.c2_link_required` | bool | false | Request a command-and-control link (modelled). |
+| `gnss_position_ecef_m` | array\[f64; 3\] | null | **NTN** (TS 38.300 §16.14.2.2, issue #56). This UE's GNSS position in ECEF metres, `[x, y, z]`. Together with the ephemeris the cell broadcasts in SIB19 it is what the UE computes its uplink timing advance and Doppler pre-compensation from. `null` (the default) means the UE has **no valid GNSS position**: it then applies no pre-compensation even on an NTN cell and logs that it cannot. That is deliberate — §16.14.2.2's own rule is that such a UE "shall not transmit until both are regained", so substituting the origin would be worse than having nothing. Configured rather than measured because this simulator has no GNSS receiver; ECEF rather than lat/lon because that is the frame `EphemerisInfo-r17` uses, and converting frames in two places is how the ends come to disagree. |
+| `ntn_uplink_carrier_hz` | f64 | 2e9 | **NTN**. The uplink carrier the Doppler pre-compensation is scaled by (`f_d = -(range rate / c) × f_c`). Defaults to 2 GHz — S-band, the range the 3GPP NTN work items target. Only read when `gnss_position_ecef_m` is set. |
 
 > The corresponding nextgcore env knobs (`AMF_SNPN_ALLOWED_NIDS`, `AMF_UAV_GEOFENCE`, `REDCAP_SESS_AMBR_DL_BPS`/`_UL_BPS`, the XR DNN→5QI mapping) and ready-to-run example configs are documented in `nextgcore/docker/rust/README.md` and `nextgsim/config/features/`.
 

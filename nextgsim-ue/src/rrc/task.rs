@@ -67,6 +67,7 @@ use nextgsim_rrc::procedures::measurement_report::{
 // skipped, so the wire one is named for what it is (issue #170).
 use nextgsim_rrc::codec::generated::MeasConfig as AsnMeasConfig;
 use nextgsim_rrc::procedures::meas_config::read_a3_meas_configs;
+use nextgsim_rrc::procedures::ntn_timing::NtnServingCellConfig;
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
 };
@@ -258,13 +259,69 @@ const CELL_SELECTION_INTERVAL_MS: u64 = 1000;
 /// yet decoded has nothing else to guard with.
 const T300_DEFAULT_MS: u64 = 1000;
 
-/// UE-side NTN timing state
-#[derive(Debug, Clone)]
+/// The UE's NTN uplink pre-compensation, derived from a received SIB19
+/// (TS 38.300 §16.14.2.2, issue #56).
+///
+/// # What changed and why the old shape could not work
+///
+/// This used to be `{ common_ta_us, k_offset, autonomous_ta, max_doppler_hz }`,
+/// written from a sim-internal `RrcMessage::NtnTimingAdvanceReceived` — a message
+/// that, as it turned out, **had no sender anywhere in the tree** — and read by
+/// nothing. Even with a sender and a reader it could not have produced a conformant
+/// pre-compensation: `autonomous_ta` was a `bool`, and §16.14.2.2 requires the TA to
+/// be *computed* "based on the GNSS position, the ephemeris, and the Common TA
+/// parameters". A flag saying "yes, do compute one" carries no ephemeris to compute
+/// it from.
+///
+/// So this now holds the **derived, applied** values: the timing advance in
+/// microseconds and the Doppler pre-compensation in Hz, alongside the
+/// `NtnServingCellConfig` they came from and the position they were computed for.
+/// [`RrcTask::ntn_timing`] is read on the uplink transmit path — see
+/// [`RrcTask::apply_ntn_precompensation`] and the `RlsMessage::ApplyNtnPrecompensation`
+/// it sends — so the state is no longer stored-then-never-read at either end.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UeNtnTiming {
-    pub common_ta_us: u64,
+    /// The `ntn-Config` this was derived from, as SIB19 carried it.
+    pub config: NtnServingCellConfig,
+    /// The GNSS position the derivation used, ECEF metres. Held so a position
+    /// change can be seen to require a re-derivation rather than silently reusing a
+    /// TA computed for somewhere else.
+    pub gnss_position_ecef_m: [f64; 3],
+    /// **The applied timing advance, in microseconds.** `T_TA` of §16.14.2.2: the
+    /// service-link RTT the UE derived from the ephemeris plus the broadcast Common
+    /// TA. This is the number criterion 5's end-to-end test asserts.
+    pub applied_ta_us: f64,
+    /// **The applied uplink Doppler pre-compensation, in Hz.** Negative of the shift
+    /// the link imposes, so the signal arrives at the satellite on the nominal
+    /// frequency.
+    pub applied_doppler_hz: f64,
+    /// `cellSpecificKoffset`, the scheduling offset of §16.14.2.1. Carried because
+    /// it is part of the configuration the UE is applying, and a UE that reported
+    /// its pre-compensation without it would be describing half the timing
+    /// relationship.
     pub k_offset: u16,
-    pub autonomous_ta: bool,
-    pub max_doppler_hz: f64,
+}
+
+impl UeNtnTiming {
+    /// Derives the pre-compensation a UE at `gnss_position_ecef_m` shall apply for
+    /// the serving cell described by `config` (TS 38.300 §16.14.2.2).
+    ///
+    /// The whole computation lives in `nextgsim_rrc`'s `ntn_timing`, which both ends
+    /// share; this only binds it to the UE's position and carrier.
+    pub fn derive(
+        config: NtnServingCellConfig,
+        gnss_position_ecef_m: [f64; 3],
+        uplink_carrier_hz: f64,
+    ) -> Self {
+        Self {
+            config,
+            gnss_position_ecef_m,
+            applied_ta_us: config.autonomous_ta_us(gnss_position_ecef_m),
+            applied_doppler_hz: config
+                .uplink_doppler_shift_hz(gnss_position_ecef_m, uplink_carrier_hz),
+            k_offset: config.cell_specific_k_offset,
+        }
+    }
 }
 
 /// SRB1 state recorded from a decoded RRCSetup (Wave-6 C2).
@@ -1354,7 +1411,9 @@ impl RrcTask {
                 self.handle_pcch_message(cell_id, &pdu).await;
             }
             RrcChannel::BcchBch => self.handle_broadcast_mib(cell_id, &pdu),
-            RrcChannel::BcchDlSch => self.handle_broadcast_bcch_dl_sch(cell_id, &pdu),
+            // Async since issue #56: a SIB19 on this channel makes the UE push the
+            // derived pre-compensation to the RLS task, which is a channel send.
+            RrcChannel::BcchDlSch => self.handle_broadcast_bcch_dl_sch(cell_id, &pdu).await,
             _ => {
                 warn!("Unexpected downlink channel: {:?}", channel);
             }
@@ -1418,7 +1477,7 @@ impl RrcTask {
     /// unconditionally, so every `SystemInformation` broadcast would have been
     /// logged as a SIB1 decode failure -- a warning per SI period, and the
     /// reselection parameters silently never read.
-    fn handle_broadcast_bcch_dl_sch(&mut self, cell_id: i32, pdu: &OctetString) {
+    async fn handle_broadcast_bcch_dl_sch(&mut self, cell_id: i32, pdu: &OctetString) {
         let msg: BCCH_DL_SCH_Message = match decode_rrc(pdu.data()) {
             Ok(msg) => msg,
             Err(e) => {
@@ -1427,7 +1486,8 @@ impl RrcTask {
             }
         };
         if is_system_information(&msg) {
-            self.handle_broadcast_system_information(cell_id, &msg);
+            self.handle_broadcast_system_information(cell_id, &msg)
+                .await;
         } else {
             self.handle_broadcast_sib1_message(cell_id, &msg);
         }
@@ -1446,7 +1506,11 @@ impl RrcTask {
     /// broadcast most recently set this UE's hysteresis. While no cell is camped
     /// the first SI read is applied, because a UE that has not camped yet has no
     /// serving cell to prefer and needs some parameters to camp with.
-    fn handle_broadcast_system_information(&mut self, cell_id: i32, msg: &BCCH_DL_SCH_Message) {
+    async fn handle_broadcast_system_information(
+        &mut self,
+        cell_id: i32,
+        msg: &BCCH_DL_SCH_Message,
+    ) {
         let serving = self.serving_cell_id;
         if serving.is_some_and(|serving| serving != cell_id) {
             debug!(
@@ -1508,6 +1572,115 @@ impl RrcTask {
             );
             self.cell_selector.apply_sib4(&carriers);
         }
+        // SIB19: the serving cell's NTN configuration (TS 38.300 §16.4, §16.14.2.2,
+        // issue #56). This is where the ephemeris enters the UE, and the only place
+        // it can: nothing else on this simulator's air interface carries one.
+        if let Some(sib19) = si.sib19.as_ref() {
+            match sib19.ntn_config {
+                Some(cfg) => {
+                    info!(
+                        "SIB19 from cell {cell_id}: NTN serving-cell configuration \
+                         (epochTime SFN {}, ta-Common {:.3} us, K_offset {} slots, \
+                         validity {:?} s)",
+                        cfg.epoch_sfn,
+                        cfg.ta_common_us(),
+                        cfg.cell_specific_k_offset,
+                        cfg.ul_sync_validity_duration_s()
+                    );
+                    self.apply_ntn_precompensation(cell_id, cfg).await;
+                }
+                None => {
+                    // Legal: a SIB19 may carry only neighbour-cell configurations, or
+                    // an ephemeris arm this codec does not model. Not applying
+                    // anything is the correct response -- §16.14.2.2 has a UE without
+                    // a valid ephemeris not transmit rather than guess.
+                    debug!(
+                        "SIB19 from cell {cell_id} carries no usable serving-cell \
+                         ntn-Config; no uplink pre-compensation derived"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Derives the NTN uplink pre-compensation from a received `ntn-Config` and
+    /// installs it on the uplink transmit path (TS 38.300 §16.14.2.2, issue #56).
+    ///
+    /// **This is the read site criterion 2 asks for**, and the derivation criterion 3
+    /// asks for. The `ntn-Config` may have arrived in a broadcast SIB19 or in an
+    /// RRCReconfiguration's `dedicatedSystemInformationDelivery`; both land here, so
+    /// there is one application path and the two cannot diverge (§5.3.5.3: a dedicated
+    /// delivery has the UE "perform the action upon reception of System Information").
+    ///
+    /// # Why a missing GNSS position applies nothing
+    ///
+    /// §16.14.2.2 requires the UE to "have valid GNSS position as well as ephemeris
+    /// and Common TA before connecting to an NTN cell", and: "If the UE does not have
+    /// a valid GNSS position and/or valid ephemeris and Common TA, it shall not
+    /// transmit until both are regained." A UE with no configured position therefore
+    /// applies NO pre-compensation and says so — rather than substituting the origin,
+    /// which would compute a slant range from the centre of the Earth and advance by
+    /// a number with nothing behind it.
+    async fn apply_ntn_precompensation(&mut self, cell_id: i32, config: NtnServingCellConfig) {
+        let Some(position) = self.task_base.config.gnss_position_ecef_m else {
+            warn!(
+                "Cell {cell_id} broadcast an NTN configuration but this UE has no \
+                 gnss_position_ecef_m. TS 38.300 §16.14.2.2 requires a valid GNSS \
+                 position to compute the RTT and Doppler, so NO uplink \
+                 pre-compensation is applied."
+            );
+            return;
+        };
+
+        let timing = UeNtnTiming::derive(
+            config,
+            position,
+            self.task_base.config.ntn_uplink_carrier_hz,
+        );
+        // Unchanged configuration and unchanged position: nothing to reinstall. Each
+        // SI period rebroadcasts the same SIB19, and resending an identical
+        // pre-compensation every period would fill the log and the channel with
+        // no-ops.
+        if self.ntn_timing == Some(timing) {
+            debug!("NTN pre-compensation from cell {cell_id} is unchanged");
+            return;
+        }
+
+        info!(
+            "NTN uplink pre-compensation derived from cell {cell_id}'s ephemeris: \
+             T_TA={:.3} us (slant range {:.1} km, ta-Common {:.3} us), \
+             Doppler={:.1} Hz at {:.0} Hz carrier (TS 38.300 §16.14.2.2)",
+            timing.applied_ta_us,
+            config.slant_range_m(position) / 1000.0,
+            config.ta_common_us(),
+            timing.applied_doppler_hz,
+            self.task_base.config.ntn_uplink_carrier_hz
+        );
+        self.ntn_timing = Some(timing);
+
+        // Hand the APPLIED values to the task that owns the transmitter. This send is
+        // what makes the derivation reach the uplink: before issue #56 the UE's NTN
+        // state stopped at the field above.
+        if let Err(e) = self
+            .task_base
+            .rls_tx
+            .send(RlsMessage::ApplyNtnPrecompensation {
+                ta_us: timing.applied_ta_us,
+                doppler_hz: timing.applied_doppler_hz,
+                k_offset: timing.k_offset,
+            })
+            .await
+        {
+            error!("Failed to install the NTN uplink pre-compensation: {e}");
+        }
+    }
+
+    /// The NTN pre-compensation this UE has derived and applied, if any.
+    ///
+    /// Exposed so a test can assert the APPLIED timing advance rather than a log
+    /// line (issue #56, criterion 5).
+    pub fn ntn_timing(&self) -> Option<UeNtnTiming> {
+        self.ntn_timing
     }
 
     /// Handles a broadcast SIB1 on BCCH-DL-SCH (TS 38.331 §6.3.2).
@@ -2702,6 +2875,26 @@ impl RrcTask {
         // acted on a report would be acting on the margin it believes it configured.
         if let Some(signalled) = reconfiguration.meas_config.as_ref() {
             self.apply_signalled_meas_config(signalled);
+        }
+
+        // §5.3.5.3: if the message carried a `dedicatedSystemInformationDelivery`,
+        // "perform the action upon reception of System Information as specified in
+        // 5.2.2.4" — which for a SIB19 means derive and apply the NTN uplink
+        // pre-compensation (TS 38.300 §16.14.2.2, issue #56). This is the
+        // connected-mode update path: §16.14.2.2 requires a connected UE to "be able
+        // to continuously update the Timing Advance and frequency pre-compensation",
+        // and a connected UE need not keep reading BCCH to do it.
+        //
+        // BEFORE the acknowledgement, and for a sharper reason than the measConfig's:
+        // the Complete is itself an uplink transmission, so the refreshed advance must
+        // be in force by the time it leaves.
+        if let Some(cfg) = reconfiguration
+            .ntn_config
+            .as_ref()
+            .and_then(|sib19| sib19.ntn_config)
+        {
+            let cell_id = self.serving_cell_id.unwrap_or(-1);
+            self.apply_ntn_precompensation(cell_id, cfg).await;
         }
 
         // The tid comes from the DECODED message. It used to be read from
@@ -4112,20 +4305,16 @@ impl Task for RrcTask {
                             RrcMessage::TriggerCycle => {
                                 self.perform_cycle().await;
                             }
-                            RrcMessage::NtnTimingAdvanceReceived {
-                                common_ta_us, k_offset, autonomous_ta, max_doppler_hz,
-                            } => {
-                                info!(
-                                    "UE RRC: NTN timing advance received: TA={}us, k_offset={}, autonomous={}, doppler={}Hz",
-                                    common_ta_us, k_offset, autonomous_ta, max_doppler_hz
-                                );
-                                self.ntn_timing = Some(UeNtnTiming {
-                                    common_ta_us,
-                                    k_offset,
-                                    autonomous_ta,
-                                    max_doppler_hz,
-                                });
-                            }
+                            // `RrcMessage::NtnTimingAdvanceReceived` was RETIRED by
+                            // issue #56. Its handler wrote `self.ntn_timing` and
+                            // nothing read it -- and the message had no sender
+                            // anywhere in the tree, so even the write never happened.
+                            // The NTN configuration now arrives in SIB19 off BCCH
+                            // (`handle_broadcast_system_information`) or in an
+                            // RRCReconfiguration's
+                            // `dedicatedSystemInformationDelivery` in connected mode,
+                            // and `apply_ntn_precompensation` derives and installs the
+                            // pre-compensation on the uplink transmit path.
                             // 6G message routing
                             #[cfg(feature = "nextgsim-she")]
                             RrcMessage::SixgInferenceRequest { model_id, input_data } => {
@@ -5733,6 +5922,7 @@ mod tests {
                     report_amount: Some(8),
                     max_report_cells: 4,
                 }),
+                ntn_config: None,
             })
             .expect("encode");
 
@@ -5774,6 +5964,7 @@ mod tests {
                 full_config: false,
                 master_key_update: None,
                 meas_config: None,
+                ntn_config: None,
             })
             .expect("encode");
             task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
@@ -7370,6 +7561,7 @@ mod tests {
                 })
             },
             sib4: None,
+            sib19: None,
         })
         .expect("the reselection SI must encode")
     }

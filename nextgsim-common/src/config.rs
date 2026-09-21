@@ -730,6 +730,68 @@ pub struct NtnConfig {
     /// Maximum Doppler shift in Hz
     #[serde(default)]
     pub max_doppler_hz: f64,
+    /// The satellite's ECEF position and velocity, broadcast as SIB19's
+    /// `ephemerisInfo` (issue #56).
+    ///
+    /// This is the field that makes the UE's autonomous timing advance possible:
+    /// TS 38.300 §16.14.2.2 has the UE compute its RTT "based on the GNSS position,
+    /// the ephemeris, and the Common TA parameters", and no amount of
+    /// `propagation_delay_us` substitutes for it — a UE cannot derive its own
+    /// slant range from a number the network computed for a different UE.
+    ///
+    /// Defaults to a 600 km LEO satellite over the prime meridian on the equator,
+    /// receding at 1 km/s, so a `satellite_type: LEO` configuration that omits the
+    /// block still broadcasts a coherent SIB19 rather than an ephemeris of zeros
+    /// (which would place the satellite at the centre of the Earth).
+    #[serde(default)]
+    pub ephemeris: NtnEphemerisConfig,
+    /// `ntn-UlSyncValidityDuration` in seconds: how long the UE may keep applying
+    /// this configuration before it must re-acquire (TS 38.331 `NTN-Config-r17`).
+    ///
+    /// Must be one of the values the ENUMERATED defines — 5..60 in 5 s steps, then
+    /// 120, 180, 240, 900. A value outside the set fails the SIB19 build rather
+    /// than being rounded to a validity the network never chose.
+    #[serde(default = "default_ntn_ul_sync_validity_s")]
+    pub ul_sync_validity_s: u16,
+}
+
+/// The satellite ephemeris an NTN cell broadcasts in SIB19 (issue #56).
+///
+/// ECEF metres and metres per second, converted to the wire's 1.3 m / 0.06 m/s
+/// steps by `nextgsim_rrc`'s `EphemerisStateVector::from_ecef`. Configured in SI
+/// units rather than in raw steps because an operator writing a satellite position
+/// should not have to divide by 1.3, and a mis-scaled ephemeris is exactly the
+/// defect that would make every derived timing advance wrong while every
+/// round-trip test stayed green.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NtnEphemerisConfig {
+    /// ECEF position in metres, `[x, y, z]`.
+    pub position_m: [f64; 3],
+    /// ECEF velocity in metres per second, `[vx, vy, vz]`.
+    pub velocity_m_s: [f64; 3],
+}
+
+impl Default for NtnEphemerisConfig {
+    fn default() -> Self {
+        // A 600 km LEO satellite on the equator at longitude 0, receding radially
+        // at 1 km/s. WGS84 equatorial radius 6 378 137 m.
+        Self {
+            position_m: [6_378_137.0 + 600_000.0, 0.0, 0.0],
+            velocity_m_s: [1000.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// S-band, the frequency range the 3GPP NTN work items target. See
+/// [`UeConfig::ntn_uplink_carrier_hz`].
+fn default_ntn_uplink_carrier_hz() -> f64 {
+    2e9
+}
+
+fn default_ntn_ul_sync_validity_s() -> u16 {
+    // s30: long enough that a simulator run does not spend its time re-acquiring,
+    // short enough to be a plausible LEO value (a 600 km pass lasts minutes).
+    30
 }
 
 fn default_true() -> bool {
@@ -1715,6 +1777,38 @@ pub struct UeConfig {
     /// selectable.
     #[serde(default)]
     pub require_broadcast_sib1: bool,
+    /// The UE's own GNSS position in ECEF metres, `[x, y, z]` (issue #56).
+    ///
+    /// TS 38.300 §16.14.2.2 requires the UE to "have valid GNSS position as well as
+    /// ephemeris and Common TA before connecting to an NTN cell", and to compute its
+    /// RTT and Doppler "based on the GNSS position, the ephemeris, and the Common TA
+    /// parameters". This is that position. Configured rather than measured because
+    /// this simulator has no GNSS receiver to measure one with — the same choice
+    /// `RangingConfig::own_position` makes, and for the same reason.
+    ///
+    /// `None` (the default) means the UE has NO valid GNSS position. §16.14.2.2 is
+    /// explicit about the consequence: "If the UE does not have a valid GNSS position
+    /// and/or valid ephemeris and Common TA, it shall not transmit until both are
+    /// regained." So a UE with no position applies no pre-compensation, logs that it
+    /// cannot, and behaves exactly as it did before this issue — which is what keeps
+    /// every non-NTN scenario byte-identical.
+    ///
+    /// Given in ECEF and not latitude/longitude because that is the frame
+    /// `EphemerisInfo-r17` uses, and converting between frames in two places is how
+    /// the two ends come to disagree about where the UE is.
+    #[serde(default)]
+    pub gnss_position_ecef_m: Option<[f64; 3]>,
+    /// The uplink carrier frequency in Hz, used for the NTN Doppler
+    /// pre-compensation (issue #56).
+    ///
+    /// `f_d = -(range rate / c) x f_c` needs a carrier to scale by, and this
+    /// simulator has no PHY that would otherwise establish one. Defaults to 2 GHz,
+    /// the S-band the 3GPP NTN work items use (TS 38.101-5 band n256 neighbourhood),
+    /// which is also what `ntn_link_sim`'s `s_band_ntn` link budget assumes.
+    ///
+    /// Only read when [`Self::gnss_position_ecef_m`] is set, i.e. on an NTN UE.
+    #[serde(default = "default_ntn_uplink_carrier_hz")]
+    pub ntn_uplink_carrier_hz: f64,
     /// Inter-RAT (E-UTRA) neighbour cells the UE measures, the source for
     /// measurement events B1 and B2 (TS 38.331 §5.5.4.8, §5.5.4.9).
     ///
@@ -1913,6 +2007,11 @@ impl Default for UeConfig {
             dl_arfcn: default_dl_arfcn(),
             racs_store_assigned_id: default_racs_store_assigned_id(),
             require_broadcast_sib1: false,
+            // No GNSS position by default: a non-NTN UE has nothing to
+            // pre-compensate, and TS 38.300 §16.14.2.2 makes the absence
+            // meaningful rather than a missing default (issue #56).
+            gnss_position_ecef_m: None,
+            ntn_uplink_carrier_hz: default_ntn_uplink_carrier_hz(),
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,

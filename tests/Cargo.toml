@@ -129,6 +129,15 @@ path = "src/paging_mt_service_request.rs"
 name = "rlc_two_session_user_plane"
 path = "src/rlc_two_session_user_plane.rs"
 
+# The NTN SIB19 end-to-end test (issue #56): the gNB broadcasts its ephemeris and the
+# UE applies a non-zero autonomous timing advance derived from it. Deliberately NOT
+# feature-gated, unlike the four below it -- the NTN path is inert unless a cell
+# carries an `ntn_config` block, so there is no default-build behaviour for a gate to
+# protect, and gating it would keep the enabled arm out of `cargo test --workspace`.
+[[test]]
+name = "ntn_sib19_timing_e2e"
+path = "src/ntn_sib19_timing_e2e.rs"
+
 [[test]]
 name = "drb_pdcp_user_plane"
 path = "src/drb_pdcp_user_plane.rs"
