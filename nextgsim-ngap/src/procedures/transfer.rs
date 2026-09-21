@@ -20,6 +20,32 @@
 //! (and encode) the full outer transfer SEQUENCE here, matching the core bit
 //! for bit. The response-direction transfers are likewise plain extensible
 //! SEQUENCEs whose encoding matches the core's decoder.
+//!
+//! # Where per-UE MBS membership lives (Rel-17)
+//!
+//! An MBS *session* is established network-wide by the non-UE-associated §9.2.9
+//! procedures (see `procedures::mbs`). But a *UE's membership* of a multicast
+//! session is UE-associated, and rides these transfer containers:
+//!
+//! | IE | Id | Container | Meaning |
+//! |---|---|---|---|
+//! | `MBSSessionSetupRequestList`         | 318 | SetupRequestTransfer  | UE joins these TMGIs |
+//! | `MBSSessionSetuporModifyRequestList` | 319 | ModifyRequestTransfer | UE joins/updates these |
+//! | `MBSSessionToReleaseList`            | 317 | ModifyRequestTransfer | UE leaves these |
+//! | `MBSSessionSetupResponseList`        | 312 | SetupResponseTransfer (ext) | joins accepted |
+//! | `MBSSessionFailedtoSetupList`        | 310 | SetupResponseTransfer (ext) | joins refused, with cause |
+//! | `MBSSessionSetuporModifyResponseList`| 313 | ModifyResponseTransfer (ext) | joins accepted |
+//! | `MBSSessionFailedtoSetuporModifyList`| 311 | ModifyResponseTransfer (ext) | joins refused, with cause |
+//!
+//! That is TS 23.247's model: a UE receives a multicast MBS session *through* a
+//! PDU session, so the AMF/SMF tells the RAN about membership on the same
+//! UE-associated procedure that carries the PDU session. All seven IEs are
+//! `CRITICALITY ignore`, so a node that does not support MBS drops them and the
+//! unicast session still succeeds — which is why they are optional here too.
+//!
+//! The request-direction lists are decoded; the response-direction lists are
+//! encoded as `iE-Extensions` entries, since that is where TS 38.413 put them
+//! (`PDUSessionResourceSetupResponseTransfer-ExtIEs`).
 
 use std::net::IpAddr;
 
@@ -144,6 +170,191 @@ impl GtpTunnelInfo {
 
         Ok(Self { address, teid })
     }
+}
+
+// ============================================================================
+// Per-UE MBS membership carried on the PDU Session transfers (Rel-17)
+// ============================================================================
+
+/// One MBS session a UE is being joined to, from `MBSSessionSetupRequestItem`
+/// (IE 318) or `MBSSessionSetuporModifyRequestItem` (IE 319).
+///
+/// TS 38.413 §9.3.1.202 / §9.3.1.203. Both items have the same shape for the
+/// purposes of the RAN's membership bookkeeping, so one type serves both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MbsSessionJoinRequest {
+    /// The 6 TMGI octets from `MBS-SessionID` (299), verbatim.
+    ///
+    /// Verbatim for the same reason `procedures::mbs` keeps them so: the TMGI is
+    /// echoed back in the response list, and the peer's octets must round-trip
+    /// regardless of which half it considers first (TS 23.003 §30.2).
+    pub tmgi: [u8; 6],
+    /// `MBS-AreaSessionID` (295), when the session is area-scoped.
+    pub area_session_id: Option<u16>,
+    /// `(MBS QFI, associated unicast QFI)` pairs from the associated flow list.
+    ///
+    /// The association is the point of the IE: each MBS flow is delivered over,
+    /// or falls back to, a named unicast QoS flow of the same PDU session
+    /// (TS 23.247 §5.2), so dropping the unicast half would lose the mapping the
+    /// gNB needs to place the MBS traffic on a bearer.
+    pub associated_qos_flows: Vec<(u8, u8)>,
+}
+
+/// One MBS session a UE is being removed from, from `MBSSessionToReleaseItem`
+/// (IE 317). TS 38.413 §9.3.1.204.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MbsSessionLeaveRequest {
+    /// The 6 TMGI octets from `MBS-SessionID` (299), verbatim.
+    pub tmgi: [u8; 6],
+    /// Why the AMF is removing the UE. Mandatory in the item.
+    pub cause: NgSetupFailureCause,
+}
+
+/// The RAN's answer for one MBS session a UE asked to join.
+///
+/// Encoded into `MBSSessionSetupResponseList` (312) / `...SetuporModifyResponseList`
+/// (313) when accepted, or `MBSSessionFailedtoSetupList` (310) /
+/// `...FailedtoSetuporModifyList` (311) when refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MbsSessionJoinOutcome {
+    /// The TMGI being answered for, echoed from the request.
+    pub tmgi: [u8; 6],
+    /// The area session id, echoed when the request carried one.
+    pub area_session_id: Option<u16>,
+    /// `None` when the join was accepted; the refusal cause otherwise.
+    pub refused_with: Option<NgSetupFailureCause>,
+}
+
+/// Builds an `MBS_SessionID` carrying just a TMGI.
+///
+/// `nID` is left absent: it is only present for a stand-alone non-public network
+/// (TS 23.003 §30.2), and this decoder never invents one the peer did not send.
+fn mbs_session_id_to_asn(tmgi: [u8; 6]) -> MBS_SessionID {
+    MBS_SessionID {
+        tmgi: TMGI(tmgi.to_vec()),
+        nid: None,
+        ie_extensions: None,
+    }
+}
+
+/// Extracts the 6 TMGI octets from a decoded `MBS_SessionID`.
+///
+/// `TMGI ::= OCTET STRING (SIZE(6))`, so any other length means the APER size
+/// constraint was not enforced upstream and the IE cannot be trusted.
+fn tmgi_from_asn(id: &MBS_SessionID) -> Result<[u8; 6], TransferError> {
+    id.tmgi.0.as_slice().try_into().map_err(|_| {
+        TransferError::InvalidIeValue(format!(
+            "TMGI is {} octets, expected 6 (TS 38.413 §9.3.1.206)",
+            id.tmgi.0.len()
+        ))
+    })
+}
+
+fn parse_mbs_setup_request_list(
+    list: &MBSSessionSetupRequestList,
+) -> Result<Vec<MbsSessionJoinRequest>, TransferError> {
+    list.0
+        .iter()
+        .map(|item| {
+            Ok(MbsSessionJoinRequest {
+                tmgi: tmgi_from_asn(&item.mbs_session_id)?,
+                area_session_id: item.mbs_area_session_id.as_ref().map(|a| a.0),
+                associated_qos_flows: item
+                    .associated_mbs_qos_flow_setup_request_list
+                    .as_ref()
+                    .map(|l| {
+                        l.0.iter()
+                            .map(|f| {
+                                (
+                                    f.mbs_qos_flow_identifier.0,
+                                    f.associated_unicast_qos_flow_identifier.0,
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn parse_mbs_setup_or_modify_request_list(
+    list: &MBSSessionSetuporModifyRequestList,
+) -> Result<Vec<MbsSessionJoinRequest>, TransferError> {
+    list.0
+        .iter()
+        .map(|item| {
+            Ok(MbsSessionJoinRequest {
+                tmgi: tmgi_from_asn(&item.mbs_session_id)?,
+                area_session_id: item.mbs_area_session_id.as_ref().map(|a| a.0),
+                associated_qos_flows: item
+                    .associated_mbs_qos_flow_setupor_modify_request_list
+                    .as_ref()
+                    .map(|l| {
+                        l.0.iter()
+                            .map(|f| {
+                                (
+                                    f.mbs_qos_flow_identifier.0,
+                                    f.associated_unicast_qos_flow_identifier.0,
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn parse_mbs_to_release_list(
+    list: &MBSSessionToReleaseList,
+) -> Result<Vec<MbsSessionLeaveRequest>, TransferError> {
+    list.0
+        .iter()
+        .map(|item| {
+            Ok(MbsSessionLeaveRequest {
+                tmgi: tmgi_from_asn(&item.mbs_session_id)?,
+                cause: parse_cause(&item.cause),
+            })
+        })
+        .collect()
+}
+
+/// Splits join outcomes into the (accepted, refused) ASN.1 lists the response
+/// transfers carry.
+///
+/// Returned as a pair rather than one list because TS 38.413 puts accepted and
+/// refused joins in *separate* IEs (312/313 and 310/311), each of which is
+/// `SIZE(1..32)` — so an empty side must be absent, not an empty list.
+fn build_mbs_outcome_lists(
+    outcomes: &[MbsSessionJoinOutcome],
+) -> (
+    Option<MBSSessionSetupResponseList>,
+    Option<MBSSessionFailedtoSetupList>,
+) {
+    let mut accepted = Vec::new();
+    let mut refused = Vec::new();
+
+    for outcome in outcomes {
+        match &outcome.refused_with {
+            None => accepted.push(MBSSessionSetupResponseItem {
+                mbs_session_id: mbs_session_id_to_asn(outcome.tmgi),
+                mbs_area_session_id: outcome.area_session_id.map(MBS_AreaSessionID),
+                ie_extensions: None,
+            }),
+            Some(cause) => refused.push(MBSSessionFailedtoSetupItem {
+                mbs_session_id: mbs_session_id_to_asn(outcome.tmgi),
+                mbs_area_session_id: outcome.area_session_id.map(MBS_AreaSessionID),
+                cause: build_cause(cause),
+                ie_extensions: None,
+            }),
+        }
+    }
+
+    (
+        (!accepted.is_empty()).then(|| MBSSessionSetupResponseList(accepted)),
+        (!refused.is_empty()).then(|| MBSSessionFailedtoSetupList(refused)),
+    )
 }
 
 // ============================================================================
@@ -330,6 +541,12 @@ pub struct SetupRequestTransferData {
     /// Kept as `Option` rather than defaulted here so a consumer can tell "the SMF
     /// asked for `preferred`" from "the SMF said nothing".
     pub security_indication: Option<UpSecurityPolicy>,
+    /// MBS sessions this UE is joining, from `MBSSessionSetupRequestList` (318).
+    ///
+    /// Empty when the IE is absent, which is the common unicast case. The IE is
+    /// `CRITICALITY ignore`, so an empty list and an absent IE mean the same
+    /// thing to the RAN and need not be distinguished.
+    pub mbs_sessions_to_join: Vec<MbsSessionJoinRequest>,
 }
 
 /// Decode a PDU Session Resource Setup Request Transfer.
@@ -349,6 +566,7 @@ pub fn decode_setup_request_transfer(
     let mut pdu_session_type = None;
     let mut qos_flows: Option<Vec<QosFlowSetupInfo>> = None;
     let mut security_indication = None;
+    let mut mbs_sessions_to_join = Vec::new();
 
     for entry in &container.0 {
         match &entry.value {
@@ -387,6 +605,9 @@ pub fn decode_setup_request_transfer(
             PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_SecurityIndication(ind) => {
                 security_indication = Some(up_security_policy_from_asn(ind));
             }
+            PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_MBSSessionSetupRequestList(list) => {
+                mbs_sessions_to_join = parse_mbs_setup_request_list(list)?;
+            }
             _ => {} // Optional IEs we do not act on (criticality handled by sender)
         }
     }
@@ -411,6 +632,7 @@ pub fn decode_setup_request_transfer(
         pdu_session_type,
         qos_flows,
         security_indication,
+        mbs_sessions_to_join,
     })
 }
 
@@ -509,6 +731,49 @@ pub fn encode_setup_request_transfer(
         });
     }
 
+    // Appended after the security policy for the same reason it was: a transfer
+    // with no MBS membership stays byte-identical to what this encoder produced
+    // before, so the existing cross-decode vectors against the core's codec keep
+    // their meaning. `SIZE(1..32)` means an empty list must be absent, not empty.
+    if !data.mbs_sessions_to_join.is_empty() {
+        let items: Vec<MBSSessionSetupRequestItem> = data
+            .mbs_sessions_to_join
+            .iter()
+            .map(|join| MBSSessionSetupRequestItem {
+                mbs_session_id: mbs_session_id_to_asn(join.tmgi),
+                mbs_area_session_id: join.area_session_id.map(MBS_AreaSessionID),
+                associated_mbs_qos_flow_setup_request_list: (!join.associated_qos_flows.is_empty())
+                    .then(|| {
+                        AssociatedMBSQosFlowSetupRequestList(
+                            join.associated_qos_flows
+                                .iter()
+                                .map(|&(mbs_qfi, unicast_qfi)| {
+                                    AssociatedMBSQosFlowSetupRequestItem {
+                                        mbs_qos_flow_identifier: QosFlowIdentifier(mbs_qfi),
+                                        associated_unicast_qos_flow_identifier: QosFlowIdentifier(
+                                            unicast_qfi,
+                                        ),
+                                        ie_extensions: None,
+                                    }
+                                })
+                                .collect(),
+                        )
+                    }),
+                ie_extensions: None,
+            })
+            .collect();
+
+        entries.push(PDUSessionResourceSetupRequestTransferProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_MBS_SESSION_SETUP_REQUEST_LIST),
+            // IGNORE, per TS 38.413 §9.3.4.1: a RAN node with no MBS support must
+            // still establish the unicast session rather than fail it.
+            criticality: Criticality(Criticality::IGNORE),
+            value: PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_MBSSessionSetupRequestList(
+                MBSSessionSetupRequestList(items),
+            ),
+        });
+    }
+
     Ok(encode_aper(&PDUSessionResourceSetupRequestTransfer {
         protocol_i_es: PDUSessionResourceSetupRequestTransferProtocolIEs(entries),
     })?)
@@ -536,6 +801,13 @@ pub struct SetupResponseTransferParams {
     pub accepted_qfis: Vec<u8>,
     /// QoS flows that failed to set up (optional)
     pub failed_qos_flows: Vec<FailedQosFlow>,
+    /// The RAN's answer for each MBS session the request asked this UE to join.
+    ///
+    /// Split into `MBSSessionSetupResponseList` (312) and
+    /// `MBSSessionFailedtoSetupList` (310) on the wire. Empty for a unicast-only
+    /// session, in which case no `iE-Extensions` are emitted at all and the
+    /// encoding is unchanged from before MBS support.
+    pub mbs_join_outcomes: Vec<MbsSessionJoinOutcome>,
 }
 
 /// Encode a PDU Session Resource Setup Response Transfer per TS 38.413 §9.3.4.2
@@ -574,6 +846,29 @@ pub fn encode_setup_response_transfer(
         ))
     };
 
+    // MBS join outcomes are `iE-Extensions` on this transfer, not top-level
+    // fields (`PDUSessionResourceSetupResponseTransfer-ExtIEs`, TS 38.413
+    // §9.3.4.2). Absent entirely for a unicast-only session, which keeps the
+    // encoding byte-identical to what the conformance vectors below pin.
+    let (accepted_mbs, refused_mbs) = build_mbs_outcome_lists(&params.mbs_join_outcomes);
+    let mut ext_entries = Vec::new();
+    if let Some(list) = accepted_mbs {
+        ext_entries.push(PDUSessionResourceSetupResponseTransferIE_Extensions_Entry {
+            id: ProtocolExtensionID(ID_MBS_SESSION_SETUP_RESPONSE_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            extension_value:
+                PDUSessionResourceSetupResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionSetupResponseList(list),
+        });
+    }
+    if let Some(list) = refused_mbs {
+        ext_entries.push(PDUSessionResourceSetupResponseTransferIE_Extensions_Entry {
+            id: ProtocolExtensionID(ID_MBS_SESSION_FAILEDTO_SETUP_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            extension_value:
+                PDUSessionResourceSetupResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionFailedtoSetupList(list),
+        });
+    }
+
     let transfer = PDUSessionResourceSetupResponseTransfer {
         dl_qos_flow_per_tnl_information: QosFlowPerTNLInformation {
             up_transport_layer_information: params.dl_tunnel.to_asn(),
@@ -583,7 +878,8 @@ pub fn encode_setup_response_transfer(
         additional_dl_qos_flow_per_tnl_information: None,
         security_result: None,
         qos_flow_failed_to_setup_list: failed,
-        ie_extensions: None,
+        ie_extensions: (!ext_entries.is_empty())
+            .then(|| PDUSessionResourceSetupResponseTransferIE_Extensions(ext_entries)),
     };
 
     Ok(encode_aper(&transfer)?)
@@ -598,6 +894,8 @@ pub struct SetupResponseTransferData {
     pub accepted_qfis: Vec<u8>,
     /// QoS flows that failed to set up
     pub failed_qos_flows: Vec<FailedQosFlow>,
+    /// The RAN's answer for each MBS join, recombined from IEs 312 and 310.
+    pub mbs_join_outcomes: Vec<MbsSessionJoinOutcome>,
 }
 
 /// Decode a PDU Session Resource Setup Response Transfer
@@ -633,10 +931,36 @@ pub fn decode_setup_response_transfer(
         })
         .unwrap_or_default();
 
+    let mut mbs_join_outcomes = Vec::new();
+    for entry in transfer.ie_extensions.iter().flat_map(|ext| ext.0.iter()) {
+        match &entry.extension_value {
+            PDUSessionResourceSetupResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionSetupResponseList(list) => {
+                for item in &list.0 {
+                    mbs_join_outcomes.push(MbsSessionJoinOutcome {
+                        tmgi: tmgi_from_asn(&item.mbs_session_id)?,
+                        area_session_id: item.mbs_area_session_id.as_ref().map(|a| a.0),
+                        refused_with: None,
+                    });
+                }
+            }
+            PDUSessionResourceSetupResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionFailedtoSetupList(list) => {
+                for item in &list.0 {
+                    mbs_join_outcomes.push(MbsSessionJoinOutcome {
+                        tmgi: tmgi_from_asn(&item.mbs_session_id)?,
+                        area_session_id: item.mbs_area_session_id.as_ref().map(|a| a.0),
+                        refused_with: Some(parse_cause(&item.cause)),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     Ok(SetupResponseTransferData {
         dl_tunnel,
         accepted_qfis,
         failed_qos_flows,
+        mbs_join_outcomes,
     })
 }
 
@@ -858,6 +1182,11 @@ pub struct ModifyRequestTransferData {
     pub qos_flows_add_or_modify: Vec<u8>,
     /// QFIs to release with their causes (optional)
     pub qos_flows_to_release: Vec<FailedQosFlow>,
+    /// MBS sessions this UE is joining or having updated, from
+    /// `MBSSessionSetuporModifyRequestList` (319).
+    pub mbs_sessions_to_join: Vec<MbsSessionJoinRequest>,
+    /// MBS sessions this UE is leaving, from `MBSSessionToReleaseList` (317).
+    pub mbs_sessions_to_leave: Vec<MbsSessionLeaveRequest>,
 }
 
 /// Decode a PDU Session Resource Modify Request Transfer.
@@ -900,6 +1229,12 @@ pub fn decode_modify_request_transfer(
                     })
                     .collect();
             }
+            PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_MBSSessionSetuporModifyRequestList(list) => {
+                data.mbs_sessions_to_join = parse_mbs_setup_or_modify_request_list(list)?;
+            }
+            PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_MBSSessionToReleaseList(list) => {
+                data.mbs_sessions_to_leave = parse_mbs_to_release_list(list)?;
+            }
             _ => {}
         }
     }
@@ -922,6 +1257,14 @@ pub struct ModifyResponseTransferParams {
     pub modified_qfis: Vec<u8>,
     /// QoS flows that failed to add or modify (optional)
     pub failed_qos_flows: Vec<FailedQosFlow>,
+    /// The RAN's answer for each MBS join, split on the wire into
+    /// `MBSSessionSetuporModifyResponseList` (313) and
+    /// `MBSSessionFailedtoSetuporModifyList` (311).
+    ///
+    /// Note that a *leave* has no per-session outcome IE: TS 38.413 gives
+    /// `MBSSessionToReleaseList` no response counterpart, so a leave is
+    /// acknowledged by the Modify Response as a whole.
+    pub mbs_join_outcomes: Vec<MbsSessionJoinOutcome>,
 }
 
 /// Encode a PDU Session Resource Modify Response Transfer per TS 38.413 §9.3.4.4
@@ -959,13 +1302,35 @@ pub fn encode_modify_response_transfer(
         ))
     };
 
+    // Same ext-IE placement as the Setup Response, under the modify-specific ids
+    // 313/311 (`PDUSessionResourceModifyResponseTransfer-ExtIEs`, §9.3.4.4).
+    let (accepted_mbs, refused_mbs) = build_mbs_outcome_lists(&params.mbs_join_outcomes);
+    let mut ext_entries = Vec::new();
+    if let Some(list) = accepted_mbs {
+        ext_entries.push(PDUSessionResourceModifyResponseTransferIE_Extensions_Entry {
+            id: ProtocolExtensionID(ID_MBS_SESSION_SETUPOR_MODIFY_RESPONSE_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            extension_value:
+                PDUSessionResourceModifyResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionSetuporModifyResponseList(list),
+        });
+    }
+    if let Some(list) = refused_mbs {
+        ext_entries.push(PDUSessionResourceModifyResponseTransferIE_Extensions_Entry {
+            id: ProtocolExtensionID(ID_MBS_SESSION_FAILEDTO_SETUPOR_MODIFY_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            extension_value:
+                PDUSessionResourceModifyResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionFailedtoSetuporModifyList(list),
+        });
+    }
+
     let transfer = PDUSessionResourceModifyResponseTransfer {
         dl_ngu_up_tnl_information: params.dl_tunnel.map(GtpTunnelInfo::to_asn),
         ul_ngu_up_tnl_information: params.ul_tunnel.map(GtpTunnelInfo::to_asn),
         qos_flow_add_or_modify_response_list: response_list,
         additional_dl_qos_flow_per_tnl_information: None,
         qos_flow_failed_to_add_or_modify_list: failed,
-        ie_extensions: None,
+        ie_extensions: (!ext_entries.is_empty())
+            .then(|| PDUSessionResourceModifyResponseTransferIE_Extensions(ext_entries)),
     };
 
     Ok(encode_aper(&transfer)?)
@@ -1011,11 +1376,37 @@ pub fn decode_modify_response_transfer(
         })
         .unwrap_or_default();
 
+    let mut mbs_join_outcomes = Vec::new();
+    for entry in transfer.ie_extensions.iter().flat_map(|ext| ext.0.iter()) {
+        match &entry.extension_value {
+            PDUSessionResourceModifyResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionSetuporModifyResponseList(list) => {
+                for item in &list.0 {
+                    mbs_join_outcomes.push(MbsSessionJoinOutcome {
+                        tmgi: tmgi_from_asn(&item.mbs_session_id)?,
+                        area_session_id: item.mbs_area_session_id.as_ref().map(|a| a.0),
+                        refused_with: None,
+                    });
+                }
+            }
+            PDUSessionResourceModifyResponseTransferIE_Extensions_EntryExtensionValue::Id_MBSSessionFailedtoSetuporModifyList(list) => {
+                for item in &list.0 {
+                    mbs_join_outcomes.push(MbsSessionJoinOutcome {
+                        tmgi: tmgi_from_asn(&item.mbs_session_id)?,
+                        area_session_id: item.mbs_area_session_id.as_ref().map(|a| a.0),
+                        refused_with: Some(parse_cause(&item.cause)),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     Ok(ModifyResponseTransferParams {
         dl_tunnel,
         ul_tunnel,
         modified_qfis,
         failed_qos_flows,
+        mbs_join_outcomes,
     })
 }
 
@@ -1110,6 +1501,7 @@ mod tests {
             dl_tunnel: sample_tunnel(),
             accepted_qfis: vec![1],
             failed_qos_flows: vec![],
+            mbs_join_outcomes: Vec::new(),
         };
         let bytes = encode_setup_response_transfer(&params).unwrap();
         assert_eq!(bytes, SETUP_RESPONSE_VECTOR);
@@ -1124,6 +1516,7 @@ mod tests {
                 qfi: 9,
                 cause: NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UnkownQosFlowId),
             }],
+            mbs_join_outcomes: Vec::new(),
         };
         let bytes = encode_setup_response_transfer(&params).unwrap();
         let decoded = decode_setup_response_transfer(&bytes).unwrap();
@@ -1142,6 +1535,7 @@ mod tests {
             },
             accepted_qfis: vec![63],
             failed_qos_flows: vec![],
+            mbs_join_outcomes: Vec::new(),
         };
         let bytes = encode_setup_response_transfer(&params).unwrap();
         let decoded = decode_setup_response_transfer(&bytes).unwrap();
@@ -1155,6 +1549,7 @@ mod tests {
             dl_tunnel: sample_tunnel(),
             accepted_qfis: vec![],
             failed_qos_flows: vec![],
+            mbs_join_outcomes: Vec::new(),
         };
         assert!(encode_setup_response_transfer(&params).is_err());
     }
@@ -1165,6 +1560,7 @@ mod tests {
             dl_tunnel: sample_tunnel(),
             accepted_qfis: vec![1],
             failed_qos_flows: vec![],
+            mbs_join_outcomes: Vec::new(),
         };
         let bytes = encode_setup_response_transfer(&params).unwrap();
         assert!(decode_setup_response_transfer(&bytes[..bytes.len() / 2]).is_err());
@@ -1186,6 +1582,7 @@ mod tests {
                 arp_priority_level: 8,
             }],
             security_indication: None,
+            mbs_sessions_to_join: Vec::new(),
         }
     }
 
@@ -1443,6 +1840,7 @@ mod tests {
             ul_tunnel: None,
             modified_qfis: vec![2],
             failed_qos_flows: vec![],
+            mbs_join_outcomes: Vec::new(),
         };
         let bytes = encode_modify_response_transfer(&params).unwrap();
         let decoded = decode_modify_response_transfer(&bytes).unwrap();
@@ -1489,5 +1887,209 @@ mod tests {
     #[test]
     fn test_release_command_transfer_rejects_empty() {
         assert!(decode_release_command_transfer(&[]).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Per-UE MBS membership on the PDU Session transfers (issue #188)
+    // ------------------------------------------------------------------
+
+    const TMGI_A: [u8; 6] = [0x01, 0x02, 0x03, 0xF1, 0x10, 0x01];
+    const TMGI_B: [u8; 6] = [0x04, 0x05, 0x06, 0xF1, 0x10, 0x01];
+
+    /// `MBSSessionSetupRequestList` (318) survives the Setup Request Transfer
+    /// round trip with its TMGI, area session id and flow associations intact.
+    ///
+    /// The flow association is asserted specifically because it is the part a
+    /// naive decoder drops: without the `(MBS QFI, unicast QFI)` pair the gNB
+    /// cannot tell which unicast flow carries the MBS traffic (TS 23.247 §5.2).
+    #[test]
+    fn an_mbs_join_survives_the_setup_request_transfer() {
+        let mut data = sample_request();
+        data.mbs_sessions_to_join = vec![MbsSessionJoinRequest {
+            tmgi: TMGI_A,
+            area_session_id: Some(7),
+            associated_qos_flows: vec![(5, 1), (6, 1)],
+        }];
+
+        let bytes = encode_setup_request_transfer(&data).expect("encode");
+        let decoded = decode_setup_request_transfer(&bytes).expect("decode");
+
+        assert_eq!(
+            decoded.mbs_sessions_to_join, data.mbs_sessions_to_join,
+            "the whole join item must round-trip: a dropped TMGI makes the join \
+             unattributable, and a dropped flow association makes it undeliverable"
+        );
+        // The unicast half of the transfer must be unaffected by the new IE.
+        assert_eq!(decoded.ul_tunnel, data.ul_tunnel);
+        assert_eq!(decoded.qos_flows, data.qos_flows);
+    }
+
+    /// A transfer with no MBS membership decodes to an empty list rather than
+    /// failing, because the IE is optional and `CRITICALITY ignore`.
+    #[test]
+    fn a_unicast_only_setup_transfer_carries_no_mbs_membership() {
+        let bytes = encode_setup_request_transfer(&sample_request()).expect("encode");
+        let decoded = decode_setup_request_transfer(&bytes).expect("decode");
+        assert!(
+            decoded.mbs_sessions_to_join.is_empty(),
+            "a unicast session must not invent an MBS membership"
+        );
+    }
+
+    /// Accepted and refused joins come back separated, each keyed by the TMGI it
+    /// answers for, because they travel in two different IEs (312 and 310).
+    #[test]
+    fn accepted_and_refused_joins_round_trip_separately() {
+        let params = SetupResponseTransferParams {
+            dl_tunnel: sample_tunnel(),
+            accepted_qfis: vec![1],
+            failed_qos_flows: vec![],
+            mbs_join_outcomes: vec![
+                MbsSessionJoinOutcome {
+                    tmgi: TMGI_A,
+                    area_session_id: Some(7),
+                    refused_with: None,
+                },
+                MbsSessionJoinOutcome {
+                    tmgi: TMGI_B,
+                    area_session_id: None,
+                    refused_with: Some(NgSetupFailureCause::RadioNetwork(
+                        RadioNetworkCause::Unspecified,
+                    )),
+                },
+            ],
+        };
+
+        let bytes = encode_setup_response_transfer(&params).expect("encode");
+        let decoded = decode_setup_response_transfer(&bytes).expect("decode");
+
+        let accepted: Vec<_> = decoded
+            .mbs_join_outcomes
+            .iter()
+            .filter(|o| o.refused_with.is_none())
+            .collect();
+        let refused: Vec<_> = decoded
+            .mbs_join_outcomes
+            .iter()
+            .filter(|o| o.refused_with.is_some())
+            .collect();
+
+        assert_eq!(accepted.len(), 1, "exactly one join was accepted");
+        assert_eq!(
+            accepted[0].tmgi, TMGI_A,
+            "the accepted outcome must name the TMGI that was accepted, not the \
+             refused one"
+        );
+        assert_eq!(accepted[0].area_session_id, Some(7));
+
+        assert_eq!(refused.len(), 1, "exactly one join was refused");
+        assert_eq!(refused[0].tmgi, TMGI_B);
+    }
+
+    /// The Modify Request Transfer carries joins (319) and leaves (317)
+    /// independently, so a message doing both is not collapsed into one action.
+    #[test]
+    fn the_modify_transfer_carries_joins_and_leaves_independently() {
+        let entries = vec![
+            PDUSessionResourceModifyRequestTransferProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_MBS_SESSION_SETUPOR_MODIFY_REQUEST_LIST),
+                criticality: Criticality(Criticality::IGNORE),
+                value: PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_MBSSessionSetuporModifyRequestList(
+                    MBSSessionSetuporModifyRequestList(vec![MBSSessionSetuporModifyRequestItem {
+                        mbs_session_id: mbs_session_id_to_asn(TMGI_A),
+                        mbs_area_session_id: None,
+                        associated_mbs_qos_flow_setupor_modify_request_list: Some(
+                            AssociatedMBSQosFlowSetuporModifyRequestList(vec![
+                                AssociatedMBSQosFlowSetuporModifyRequestItem {
+                                    mbs_qos_flow_identifier: QosFlowIdentifier(5),
+                                    associated_unicast_qos_flow_identifier: QosFlowIdentifier(1),
+                                    ie_extensions: None,
+                                },
+                            ]),
+                        ),
+                        mbs_qos_flow_to_release_list: None,
+                        ie_extensions: None,
+                    }]),
+                ),
+            },
+            PDUSessionResourceModifyRequestTransferProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_MBS_SESSION_TO_RELEASE_LIST),
+                criticality: Criticality(Criticality::IGNORE),
+                value: PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_MBSSessionToReleaseList(
+                    MBSSessionToReleaseList(vec![MBSSessionToReleaseItem {
+                        mbs_session_id: mbs_session_id_to_asn(TMGI_B),
+                        cause: build_cause(&NgSetupFailureCause::RadioNetwork(
+                            RadioNetworkCause::UserInactivity,
+                        )),
+                        ie_extensions: None,
+                    }]),
+                ),
+            },
+        ];
+
+        let bytes = encode_aper(&PDUSessionResourceModifyRequestTransfer {
+            protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(entries),
+        })
+        .expect("encode");
+        let decoded = decode_modify_request_transfer(&bytes).expect("decode");
+
+        assert_eq!(
+            decoded.mbs_sessions_to_join.len(),
+            1,
+            "the join list must not absorb the leave"
+        );
+        assert_eq!(decoded.mbs_sessions_to_join[0].tmgi, TMGI_A);
+        assert_eq!(
+            decoded.mbs_sessions_to_join[0].associated_qos_flows,
+            vec![(5, 1)]
+        );
+
+        assert_eq!(
+            decoded.mbs_sessions_to_leave.len(),
+            1,
+            "the leave list must not absorb the join"
+        );
+        assert_eq!(
+            decoded.mbs_sessions_to_leave[0].tmgi, TMGI_B,
+            "a leave applied to the joined TMGI would undo the join in the same \
+             message"
+        );
+    }
+
+    /// Modify Response outcomes use the modify-specific ext ids (313/311), so a
+    /// decoder reading the setup ids finds nothing and vice versa.
+    #[test]
+    fn modify_response_join_outcomes_round_trip() {
+        let params = ModifyResponseTransferParams {
+            dl_tunnel: Some(sample_tunnel()),
+            ul_tunnel: None,
+            modified_qfis: vec![1],
+            failed_qos_flows: vec![],
+            mbs_join_outcomes: vec![MbsSessionJoinOutcome {
+                tmgi: TMGI_A,
+                area_session_id: Some(3),
+                refused_with: None,
+            }],
+        };
+        let bytes = encode_modify_response_transfer(&params).expect("encode");
+        let decoded = decode_modify_response_transfer(&bytes).expect("decode");
+        assert_eq!(decoded.mbs_join_outcomes, params.mbs_join_outcomes);
+    }
+
+    /// A TMGI of the wrong length is refused rather than silently padded, since
+    /// `TMGI ::= OCTET STRING (SIZE(6))` and a short one cannot identify a
+    /// session (TS 38.413 §9.3.1.206).
+    #[test]
+    fn a_malformed_tmgi_is_refused() {
+        let short = MBS_SessionID {
+            tmgi: TMGI(vec![0x01, 0x02, 0x03]),
+            nid: None,
+            ie_extensions: None,
+        };
+        assert!(tmgi_from_asn(&short).is_err());
+        assert_eq!(
+            tmgi_from_asn(&mbs_session_id_to_asn(TMGI_A)).expect("a 6-octet TMGI"),
+            TMGI_A
+        );
     }
 }

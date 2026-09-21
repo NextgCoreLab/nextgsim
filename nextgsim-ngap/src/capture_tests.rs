@@ -763,6 +763,7 @@ mod tests {
             },
             accepted_qfis: vec![1],
             failed_qos_flows: vec![],
+            mbs_join_outcomes: Vec::new(),
         };
         let bytes = encode_setup_response_transfer(&params).expect("gNB encodes response transfer");
         let decoded = decode_setup_response_transfer(&bytes).expect("self-decode");

@@ -28,10 +28,9 @@ use crate::tasks::{
 use nextgsim_common::OctetString;
 
 use super::amf_context::{AmfIdentity, AmfState, NgapAmfContext};
-use super::mbs_context::{GnbMbsContext, MbsSessionManager, MulticastTunnelInfo, Tmgi};
 use super::ue_context::{AsSecurityContext, NgapPduSession, NgapUeContext};
 use super::up_security::{self, DrbSecurityDecision, UpSecurityRefusal};
-use crate::mbs_ngap::{GnbMbsSession, NgapMbsManager};
+use crate::mbs_ngap::{GnbMbsSession, MbsJoinRefusal, NgapMbsManager};
 use crate::rrc::meas::a3_meas_config_params;
 use crate::rrc::system_info::sib19_params;
 use crate::rrc::transaction::RrcProcedure;
@@ -143,6 +142,7 @@ use nextgsim_ngap::procedures::transfer::{
     encode_modify_response_transfer, encode_modify_unsuccessful_transfer,
     encode_release_response_transfer, encode_setup_response_transfer,
     encode_setup_unsuccessful_transfer, GtpTunnelInfo, HandoverAckTransferParams,
+    MbsSessionJoinOutcome, MbsSessionJoinRequest, MbsSessionLeaveRequest,
     ModifyResponseTransferParams, SetupResponseTransferParams, UpSecurityPolicy, UpSecurityResult,
 };
 use nextgsim_ngap::procedures::ue_context_modification::{
@@ -195,15 +195,14 @@ pub struct NgapTask {
     downlink_teid_counter: u32,
     /// Whether the NGAP task is initialized (at least one AMF ready)
     is_initialized: bool,
-    /// MBS session manager (Rel-17)
-    mbs_sessions: MbsSessionManager,
-    /// MBS session state driven by the NG-C wire path (TS 38.413 §9.2.9).
+    /// The gNB's MBS state (Rel-17), keyed by TMGI.
     ///
-    /// Separate from `mbs_sessions` above, which is keyed by the AMF-assigned
-    /// numeric session id and is fed by the internal `NgapMessage::Mbs*`
-    /// channel. An MBS procedure arriving on SCTP carries only
-    /// `id-MBS-SessionID` (299) — a TMGI, never a numeric id — so it cannot key
-    /// that map, and this one is keyed by TMGI.
+    /// The single MBS state machine: keyed by TMGI because `id-MBS-SessionID`
+    /// (299) is the only MBS identifier that appears on the wire, on every MBS
+    /// message. Driven from `handle_mbs_pdu` for the session-level §9.2.9
+    /// procedures and from the PDU Session procedures for per-UE membership
+    /// (IEs 318/319/317). A second manager keyed by a numeric session id with no
+    /// wire representation was deleted in issue #188.
     mbs_ngap_sessions: NgapMbsManager,
     /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
     /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
@@ -244,7 +243,6 @@ impl NgapTask {
             ran_ue_ngap_id_counter: 0,
             downlink_teid_counter: 0,
             is_initialized: false,
-            mbs_sessions: MbsSessionManager::new(),
             mbs_ngap_sessions: NgapMbsManager::new(),
             guard_timers: GuardTimers::new(),
             tnla_client_ids: HashMap::new(),
@@ -455,6 +453,20 @@ impl NgapTask {
             // Release the stream back to the AMF
             if let Some(amf_ctx) = self.amf_contexts.get_mut(&ctx.amf_ctx_id) {
                 amf_ctx.release_stream(ctx.stream_id);
+            }
+            // A released UE is no longer receiving anything, so it must not stay
+            // on any MBS session's member list. An MBS session outlives the UEs
+            // that join it, so without this a long-running session accumulates
+            // the ids of every UE that ever joined and its member count stops
+            // meaning "UEs currently receiving this".
+            let left = self.mbs_ngap_sessions.remove_ue_everywhere(ue_id);
+            if !left.is_empty() {
+                debug!(
+                    "UE {} removed from {} MBS session(s) on context deletion: {:?}",
+                    ue_id,
+                    left.len(),
+                    left.iter().map(tmgi_hex).collect::<Vec<_>>()
+                );
             }
             debug!("Deleted UE context: ue_id={}", ue_id);
         }
@@ -1749,6 +1761,16 @@ impl NgapTask {
         self.key_and_establish_drb(ue_id, psi, &accepted_flows, decision)
             .await;
 
+        // Per-UE MBS membership from `MBSSessionSetupRequestList` (318), applied
+        // after the unicast session is up: the MBS flows are associated with the
+        // unicast QoS flows of *this* session (TS 23.247 §5.2), so there is
+        // nothing to associate them with until those exist. A refused join is
+        // reported in the response transfer and does not fail the PDU session,
+        // because the IE is `CRITICALITY ignore` — the unicast service must
+        // survive a RAN that cannot serve the multicast one.
+        let mbs_join_outcomes =
+            self.apply_mbs_membership_changes(ue_id, &request.mbs_sessions_to_join, &[]);
+
         // Build the APER PDUSessionResourceSetupResponseTransfer (TS 38.413
         // §9.3.4.2) with the real gNB F-TEID and the accepted QoS flows
         let transfer_params = SetupResponseTransferParams {
@@ -1758,6 +1780,7 @@ impl NgapTask {
             },
             accepted_qfis,
             failed_qos_flows: vec![],
+            mbs_join_outcomes,
         };
         match encode_setup_response_transfer(&transfer_params) {
             Ok(response_transfer) => Ok(PduSessionResourceSetupResponseItem {
@@ -2037,6 +2060,16 @@ impl NgapTask {
                 let _ = self.task_base.rrc_tx.send(msg).await;
             }
 
+            // Per-UE MBS membership from `MBSSessionSetuporModifyRequestList`
+            // (319) and `MBSSessionToReleaseList` (317), applied in that order:
+            // see `apply_mbs_membership_changes` for what a TMGI named in both
+            // lists resolves to.
+            let mbs_join_outcomes = self.apply_mbs_membership_changes(
+                ue_id,
+                &request.mbs_sessions_to_join,
+                &request.mbs_sessions_to_leave,
+            );
+
             // Build the APER PDUSessionResourceModifyResponseTransfer (§9.3.4.4)
             let transfer_params = ModifyResponseTransferParams {
                 dl_tunnel: request.new_ul_tunnel.map(|_| GtpTunnelInfo {
@@ -2046,6 +2079,7 @@ impl NgapTask {
                 ul_tunnel: None,
                 modified_qfis: request.qos_flows_add_or_modify.clone(),
                 failed_qos_flows: vec![],
+                mbs_join_outcomes,
             };
             match encode_modify_response_transfer(&transfer_params) {
                 Ok(response_transfer) => {
@@ -4838,161 +4872,125 @@ impl NgapTask {
         );
     }
 
-    /// Handles MBS Session Activation Request from AMF
-    async fn handle_mbs_session_activation_request(
+    /// Applies the per-UE MBS membership changes carried on a PDU Session
+    /// procedure, returning the per-session outcome for the response transfer.
+    ///
+    /// TS 23.247 delivers a multicast MBS session to a UE *through* a PDU
+    /// session, so membership is UE-associated and travels on these procedures
+    /// rather than on the non-UE-associated §9.2.9 ones:
+    ///
+    /// - `MBSSessionSetupRequestList` (318) on a Setup Request, and
+    ///   `MBSSessionSetuporModifyRequestList` (319) on a Modify Request, join;
+    /// - `MBSSessionToReleaseList` (317) on a Modify Request leaves.
+    ///
+    /// A join is admitted only for a TMGI this gNB is already radiating in the
+    /// UE's serving cell. Refusing the rest is deliberate and matches why
+    /// procedures 68 and 73 are left unrouted: bringing a new MBS session up here
+    /// would require the Distribution Setup procedures (69/70) against the
+    /// MB-UPF, which this node has no user-plane path for, so admitting the join
+    /// would tell the AMF a UE is receiving traffic that cannot reach it.
+    ///
+    /// Leaves are not reported per session: TS 38.413 gives
+    /// `MBSSessionToReleaseList` no response counterpart, so the Modify Response
+    /// as a whole acknowledges them.
+    ///
+    /// Joins are applied before leaves, so a TMGI named in *both* lists of one
+    /// Modify ends up **not** a member. The two lists are independent IEs and the
+    /// spec does not order them, but a request that both adds and removes the same
+    /// membership is contradictory, and dropping it is the safe reading: the gNB
+    /// then delivers nothing rather than delivering traffic the AMF may have meant
+    /// to stop.
+    fn apply_mbs_membership_changes(
         &mut self,
-        session_id: u32,
-        tmgi_bytes: [u8; 6],
-        is_broadcast: bool,
-        multicast_ip: Option<std::net::IpAddr>,
-        qfi: u8,
-    ) {
-        info!(
-            "MBS Session Activation Request: session_id={}, tmgi={:02x?}, broadcast={}, qfi={}",
-            session_id, tmgi_bytes, is_broadcast, qfi
-        );
+        ue_id: i32,
+        joins: &[MbsSessionJoinRequest],
+        leaves: &[MbsSessionLeaveRequest],
+    ) -> Vec<MbsSessionJoinOutcome> {
+        let cell_id = self.served_mbs_cell_id();
+        let mut outcomes = Vec::with_capacity(joins.len());
 
-        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
-        let mut mbs_ctx = GnbMbsContext::new(session_id, tmgi, is_broadcast);
-
-        // Create multicast tunnel info if provided
-        if let Some(mcast_ip) = multicast_ip {
-            let tnl_info = MulticastTunnelInfo {
-                multicast_ip: mcast_ip,
-                source_ip: None,
-                teid: self.next_downlink_teid(),
-                qfi,
+        for join in joins {
+            let outcome = match self.mbs_ngap_sessions.join_ue(&join.tmgi, ue_id, cell_id) {
+                Ok(accepted) => {
+                    info!(
+                        "UE {} joined MBS session TMGI={} in cell {} ({} member(s){}); \
+                         {} associated flow(s)",
+                        ue_id,
+                        tmgi_hex(&join.tmgi),
+                        cell_id,
+                        accepted.member_count,
+                        if accepted.newly_joined {
+                            ""
+                        } else {
+                            ", already a member"
+                        },
+                        join.associated_qos_flows.len()
+                    );
+                    MbsSessionJoinOutcome {
+                        tmgi: join.tmgi,
+                        area_session_id: join.area_session_id,
+                        refused_with: None,
+                    }
+                }
+                Err(refusal) => {
+                    warn!(
+                        "UE {} cannot join MBS session TMGI={}: {}",
+                        ue_id,
+                        tmgi_hex(&join.tmgi),
+                        refusal.reason()
+                    );
+                    MbsSessionJoinOutcome {
+                        tmgi: join.tmgi,
+                        area_session_id: join.area_session_id,
+                        refused_with: Some(mbs_join_refusal_cause(refusal)),
+                    }
+                }
             };
-            mbs_ctx.activate(Some(tnl_info));
-        } else {
-            mbs_ctx.activate(None);
+            outcomes.push(outcome);
         }
 
-        // Add session to manager
-        if self.mbs_sessions.add_session(mbs_ctx) {
-            info!(
-                "MBS session {} activated successfully (TMGI={:02x?})",
-                session_id, tmgi_bytes
-            );
-        } else {
-            warn!(
-                "Failed to activate MBS session {}, already exists",
-                session_id
-            );
-        }
-    }
-
-    /// Handles MBS Session Deactivation Request from AMF
-    async fn handle_mbs_session_deactivation_request(&mut self, session_id: u32) {
-        info!(
-            "MBS Session Deactivation Request: session_id={}",
-            session_id
-        );
-
-        if let Some(mut session) = self.mbs_sessions.remove_session(session_id) {
-            session.deactivate();
-            info!("MBS session {} deactivated", session_id);
-        } else {
-            warn!("MBS session {} not found for deactivation", session_id);
-        }
-    }
-
-    /// Handles Multicast Group Paging from AMF
-    async fn handle_multicast_group_paging(&mut self, tmgi_bytes: [u8; 6], area_scope: Vec<u32>) {
-        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
-        info!(
-            "Multicast Group Paging: tmgi={:02x?}, area_scope={:?}",
-            tmgi_bytes, area_scope
-        );
-
-        // Find the MBS session
-        if let Some(session) = self.mbs_sessions.get_session_by_tmgi(&tmgi) {
-            if session.is_active() {
+        for leave in leaves {
+            if self.mbs_ngap_sessions.leave_ue(&leave.tmgi, ue_id) {
                 info!(
-                    "Paging for MBS session {}, {} joined UEs",
-                    session.session_id,
-                    session.ue_count()
-                );
-                // In a real implementation, would trigger RRC paging for interested UEs
-                // For now, just log the paging request
-            } else {
-                warn!(
-                    "MBS session {} is not active (state: {:?})",
-                    session.session_id, session.state
-                );
-            }
-        } else {
-            warn!("MBS session with TMGI {:02x?} not found", tmgi_bytes);
-        }
-    }
-
-    /// Handles MBS UE Join Request from RRC
-    async fn handle_mbs_ue_join_request(&mut self, ue_id: i32, tmgi_bytes: [u8; 6]) {
-        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
-        info!(
-            "MBS UE Join Request: ue_id={}, tmgi={:02x?}",
-            ue_id, tmgi_bytes
-        );
-
-        if let Some(session) = self.mbs_sessions.get_session_by_tmgi_mut(&tmgi) {
-            if session.add_ue(ue_id) {
-                info!(
-                    "UE {} joined MBS session {}, total UEs: {}",
+                    "UE {} left MBS session TMGI={} (cause {:?})",
                     ue_id,
-                    session.session_id,
-                    session.ue_count()
-                );
-
-                // Send MulticastSessionUpdateRequest to AMF to inform of UE join
-                // In a real implementation, would encode and send NGAP message
-                debug!(
-                    "Would send MulticastSessionUpdateRequest to AMF for session {} (UE {} joined)",
-                    session.session_id, ue_id
+                    tmgi_hex(&leave.tmgi),
+                    leave.cause
                 );
             } else {
-                debug!("UE {} already in MBS session {}", ue_id, session.session_id);
-            }
-        } else {
-            warn!(
-                "Cannot join MBS session: TMGI {:02x?} not found",
-                tmgi_bytes
-            );
-        }
-    }
-
-    /// Handles MBS UE Leave Request from RRC
-    async fn handle_mbs_ue_leave_request(&mut self, ue_id: i32, tmgi_bytes: [u8; 6]) {
-        let tmgi = Tmgi::from_bytes(&tmgi_bytes);
-        info!(
-            "MBS UE Leave Request: ue_id={}, tmgi={:02x?}",
-            ue_id, tmgi_bytes
-        );
-
-        if let Some(session) = self.mbs_sessions.get_session_by_tmgi_mut(&tmgi) {
-            if session.remove_ue(ue_id) {
-                info!(
-                    "UE {} left MBS session {}, remaining UEs: {}",
+                debug!(
+                    "UE {} was not a member of MBS session TMGI={}; nothing to leave",
                     ue_id,
-                    session.session_id,
-                    session.ue_count()
+                    tmgi_hex(&leave.tmgi)
                 );
-
-                // Send MulticastSessionUpdateRequest to AMF to inform of UE leave
-                // In a real implementation, would encode and send NGAP message
-                debug!(
-                    "Would send MulticastSessionUpdateRequest to AMF for session {} (UE {} left)",
-                    session.session_id, ue_id
-                );
-            } else {
-                debug!("UE {} not in MBS session {}", ue_id, session.session_id);
             }
-        } else {
-            warn!(
-                "Cannot leave MBS session: TMGI {:02x?} not found",
-                tmgi_bytes
-            );
         }
+
+        outcomes
     }
+}
+
+/// The TMGI as uppercase hex, for logging.
+fn tmgi_hex(tmgi: &[u8; 6]) -> String {
+    tmgi.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// The NGAP cause for a refused MBS join.
+///
+/// TS 38.413 §9.3.1.2 defines `unknown-MBS-Session-ID` and
+/// `indicated-MBS-session-area-information-not-served-by-the-gNB` for exactly
+/// these two cases. Both are **extension additions** to `CauseRadioNetwork`
+/// (whose extension root ends at 44), and the vendored APER codec rejects
+/// extended enumerated values on encode
+/// (`vendor/asn1-codecs/src/per/common/encode/mod.rs`: "Encode of extended
+/// enumerated not yet implemented"). Emitting the precise cause would therefore
+/// fail to encode the whole response transfer and lose the unicast session with
+/// it, so a refusal is reported as `radio-network/unspecified` and the precise
+/// reason is logged by the caller. The refusal itself is faithful; only its cause
+/// code is coarser than the spec allows.
+fn mbs_join_refusal_cause(refusal: MbsJoinRefusal) -> NgSetupFailureCause {
+    let _ = refusal;
+    NgSetupFailureCause::RadioNetwork(RadioNetworkCause::Unspecified)
 }
 
 /// Builds the Error Indication parameters for an NGAP PDU that the gNB could
@@ -5216,35 +5214,6 @@ impl Task for NgapTask {
                                 "NTN timing info: sat_type={}, sat_id={}, delay={}us, TA={}us, k_offset={}",
                                 satellite_type, satellite_id, propagation_delay_us, common_ta_us, k_offset
                             );
-                    }
-                    NgapMessage::MbsSessionActivationRequest {
-                        session_id,
-                        tmgi,
-                        is_broadcast,
-                        multicast_ip,
-                        qfi,
-                    } => {
-                        self.handle_mbs_session_activation_request(
-                            session_id,
-                            tmgi,
-                            is_broadcast,
-                            multicast_ip,
-                            qfi,
-                        )
-                        .await;
-                    }
-                    NgapMessage::MbsSessionDeactivationRequest { session_id } => {
-                        self.handle_mbs_session_deactivation_request(session_id)
-                            .await;
-                    }
-                    NgapMessage::MulticastGroupPaging { tmgi, area_scope } => {
-                        self.handle_multicast_group_paging(tmgi, area_scope).await;
-                    }
-                    NgapMessage::MbsUeJoinRequest { ue_id, tmgi } => {
-                        self.handle_mbs_ue_join_request(ue_id, tmgi).await;
-                    }
-                    NgapMessage::MbsUeLeaveRequest { ue_id, tmgi } => {
-                        self.handle_mbs_ue_leave_request(ue_id, tmgi).await;
                     }
                 },
                 Some(TaskMessage::Shutdown) => {
@@ -6768,6 +6737,7 @@ mod tests {
                         arp_priority_level: 8,
                     }],
                     security_indication: None,
+                    mbs_sessions_to_join: Vec::new(),
                 })
                 .expect("encode the inner transfer"),
             })
@@ -7253,6 +7223,15 @@ mod tests {
         psi: u8,
         policy: Option<nextgsim_ngap::procedures::transfer::UpSecurityPolicy>,
     ) -> nextgsim_ngap::procedures::pdu_session_resource::PduSessionResourceSetupItem {
+        setup_item_with_policy_and_mbs(psi, policy, Vec::new())
+    }
+
+    /// A Setup Request item carrying `policy` and an `MBSSessionSetupRequestList`.
+    fn setup_item_with_policy_and_mbs(
+        psi: u8,
+        policy: Option<nextgsim_ngap::procedures::transfer::UpSecurityPolicy>,
+        mbs_sessions_to_join: Vec<MbsSessionJoinRequest>,
+    ) -> nextgsim_ngap::procedures::pdu_session_resource::PduSessionResourceSetupItem {
         use nextgsim_ngap::procedures::pdu_session_resource::{
             PduSessionResourceSetupItem, SnssaiValue,
         };
@@ -7273,6 +7252,7 @@ mod tests {
                 arp_priority_level: 8,
             }],
             security_indication: policy,
+            mbs_sessions_to_join,
         })
         .expect("encode the setup transfer");
         PduSessionResourceSetupItem {
@@ -8814,5 +8794,312 @@ mod tests {
             Some(68),
             "the diagnostics must name the procedure that was not supported"
         );
+    }
+
+    // ==================================================================
+    // Per-UE MBS membership, reached from the PDU Session procedures (#188)
+    // ==================================================================
+
+    /// The cell id `NgapMbsManager` tracks activations against, for the test
+    /// config's NCI. Mirrors `served_mbs_cell_id`.
+    fn test_served_cell_id() -> i32 {
+        i32::from(phys_cell_id_from_nci(test_config().nci))
+    }
+
+    /// Activates an MBS session in this gNB's served cell, the way procedure 71
+    /// would, so a join has something to attach to.
+    fn activate_mbs_session(task: &mut NgapTask, tmgi: [u8; 6]) {
+        let mut session = GnbMbsSession::new_multicast(tmgi_hex(&tmgi), tmgi);
+        session.activate_cell(test_served_cell_id());
+        task.mbs_ngap_sessions.start_session(session);
+    }
+
+    /// **Criterion 4.** A UE's MBS membership is reachable from a real NGAP
+    /// procedure: an `MBSSessionSetupRequestList` (IE 318) on a PDU Session
+    /// Resource Setup Request makes that specific UE observably a member.
+    ///
+    /// This is the positive assertion the whole issue turns on. Before this
+    /// change, `ue_join` had no caller outside tests: the only handler that
+    /// reached it sat behind `NgapMessage::MbsUeJoinRequest`, which nothing ever
+    /// constructed. Named UE, named TMGI, membership read back from the manager.
+    #[tokio::test]
+    async fn a_setup_request_mbs_list_makes_the_ue_a_member() {
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(31);
+        key_ue(&mut task, 31, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        activate_mbs_session(&mut task, AMF_MBS_TMGI);
+
+        let item = setup_item_with_policy_and_mbs(
+            1,
+            None,
+            vec![MbsSessionJoinRequest {
+                tmgi: AMF_MBS_TMGI,
+                area_session_id: Some(9),
+                associated_qos_flows: vec![(5, 1)],
+            }],
+        );
+
+        let ok = task
+            .setup_one_pdu_session(31, &item, gnb_ip)
+            .await
+            .expect("the unicast session must succeed");
+
+        // (1) The membership is real state on the session, for THIS UE.
+        assert!(
+            task.mbs_ngap_sessions
+                .get(&AMF_MBS_TMGI)
+                .expect("the session")
+                .has_ue(31),
+            "UE 31 must be observably a member after the NGAP procedure -- this is \
+             the reachability the issue asked for"
+        );
+        assert_eq!(
+            task.mbs_ngap_sessions
+                .sessions_for_ue(31)
+                .iter()
+                .map(|s| s.tmgi)
+                .collect::<Vec<_>>(),
+            vec![AMF_MBS_TMGI]
+        );
+
+        // (2) The AMF is told, on the wire, that the join was accepted.
+        let decoded =
+            nextgsim_ngap::procedures::transfer::decode_setup_response_transfer(&ok.transfer)
+                .expect("the response transfer must decode");
+        assert_eq!(
+            decoded.mbs_join_outcomes,
+            vec![nextgsim_ngap::procedures::transfer::MbsSessionJoinOutcome {
+                tmgi: AMF_MBS_TMGI,
+                area_session_id: Some(9),
+                refused_with: None,
+            }],
+            "an accepted join must be reported in MBSSessionSetupResponseList (312)"
+        );
+    }
+
+    /// A join naming a TMGI this gNB is not radiating is refused on the wire, and
+    /// the unicast PDU session still succeeds.
+    ///
+    /// Both halves matter. The refusal is because bringing the session up would
+    /// need the Distribution Setup procedures against the MB-UPF that this node
+    /// has no path for — the same reason procedures 68 and 73 stay unrouted. The
+    /// survival is because IE 318 is `CRITICALITY ignore`: a RAN that cannot serve
+    /// the multicast session must not destroy the unicast one.
+    #[tokio::test]
+    async fn an_unservable_mbs_join_is_refused_without_failing_the_pdu_session() {
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(32);
+        key_ue(&mut task, 32, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        // Deliberately NO activation: the TMGI is unknown to this gNB.
+
+        let item = setup_item_with_policy_and_mbs(
+            1,
+            None,
+            vec![MbsSessionJoinRequest {
+                tmgi: AMF_MBS_TMGI,
+                area_session_id: None,
+                associated_qos_flows: vec![],
+            }],
+        );
+
+        let ok = task
+            .setup_one_pdu_session(32, &item, gnb_ip)
+            .await
+            .expect("the unicast session must survive an unservable MBS join");
+
+        assert_eq!(
+            task.mbs_ngap_sessions.session_count(),
+            0,
+            "a refused join must not conjure the session into existence"
+        );
+        assert!(
+            task.mbs_ngap_sessions.sessions_for_ue(32).is_empty(),
+            "a refused join must leave no membership"
+        );
+        assert!(
+            task.find_ue_context(32)
+                .is_some_and(|c| c.pdu_session_count() == 1),
+            "the unicast PDU session must still be established"
+        );
+
+        let decoded =
+            nextgsim_ngap::procedures::transfer::decode_setup_response_transfer(&ok.transfer)
+                .expect("decode");
+        assert_eq!(decoded.mbs_join_outcomes.len(), 1);
+        assert!(
+            decoded.mbs_join_outcomes[0].refused_with.is_some(),
+            "the AMF must be told the join was refused, in \
+             MBSSessionFailedtoSetupList (310)"
+        );
+        assert_eq!(decoded.mbs_join_outcomes[0].tmgi, AMF_MBS_TMGI);
+    }
+
+    /// A Modify Request's `MBSSessionToReleaseList` (317) removes that UE's
+    /// membership, and leaves every other member in place.
+    #[tokio::test]
+    async fn a_modify_request_release_list_drops_only_that_ues_membership() {
+        use nextgsim_ngap::procedures::pdu_session_resource::{
+            PduSessionResourceModifyRequestData, PduSessionResourceModifyRequestItem,
+        };
+
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(33);
+        key_ue(&mut task, 33, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        activate_mbs_session(&mut task, AMF_MBS_TMGI);
+
+        // UE 33 joins via a Setup Request, and a second UE joins directly so the
+        // release has a bystander to spare.
+        let item = setup_item_with_policy_and_mbs(
+            1,
+            None,
+            vec![MbsSessionJoinRequest {
+                tmgi: AMF_MBS_TMGI,
+                area_session_id: None,
+                associated_qos_flows: vec![],
+            }],
+        );
+        task.setup_one_pdu_session(33, &item, gnb_ip)
+            .await
+            .expect("setup");
+        task.mbs_ngap_sessions
+            .join_ue(&AMF_MBS_TMGI, 99, test_served_cell_id())
+            .expect("the bystander joins the same session");
+        assert!(task
+            .mbs_ngap_sessions
+            .get(&AMF_MBS_TMGI)
+            .unwrap()
+            .has_ue(33));
+
+        // Now a Modify Request that releases UE 33's membership.
+        let release_transfer = {
+            use nextgsim_ngap::codec::*;
+            let entries = vec![PDUSessionResourceModifyRequestTransferProtocolIEs_Entry {
+                id: ProtocolIE_ID(ID_MBS_SESSION_TO_RELEASE_LIST),
+                criticality: Criticality(Criticality::IGNORE),
+                value: PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_MBSSessionToReleaseList(
+                    MBSSessionToReleaseList(vec![MBSSessionToReleaseItem {
+                        mbs_session_id: MBS_SessionID {
+                            tmgi: TMGI(AMF_MBS_TMGI.to_vec()),
+                            nid: None,
+                            ie_extensions: None,
+                        },
+                        cause: Cause::RadioNetwork(CauseRadioNetwork(
+                            CauseRadioNetwork::USER_INACTIVITY,
+                        )),
+                        ie_extensions: None,
+                    }]),
+                ),
+            }];
+            nextgsim_ngap::codec::encode_aper(&PDUSessionResourceModifyRequestTransfer {
+                protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(entries),
+            })
+            .expect("encode the modify transfer")
+        };
+
+        task.handle_pdu_session_resource_modify(
+            1,
+            0,
+            PduSessionResourceModifyRequestData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id: task.find_ue_context(33).expect("ctx").ran_ue_ngap_id as u32,
+                pdu_session_resource_modify_list: vec![PduSessionResourceModifyRequestItem {
+                    pdu_session_id: 1,
+                    nas_pdu: None,
+                    transfer: release_transfer,
+                }],
+            },
+        )
+        .await;
+
+        let session = task
+            .mbs_ngap_sessions
+            .get(&AMF_MBS_TMGI)
+            .expect("the session outlives its members");
+        assert!(
+            !session.has_ue(33),
+            "the release list must drop UE 33's membership"
+        );
+        assert!(
+            session.has_ue(99),
+            "releasing UE 33 must not evict UE 99: the release named one UE"
+        );
+    }
+
+    /// Deleting a UE context drops its MBS memberships, so a session's member
+    /// list does not accumulate UEs that are gone.
+    #[tokio::test]
+    async fn deleting_a_ue_context_drops_its_mbs_memberships() {
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(34);
+        key_ue(&mut task, 34, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        activate_mbs_session(&mut task, AMF_MBS_TMGI);
+
+        let item = setup_item_with_policy_and_mbs(
+            1,
+            None,
+            vec![MbsSessionJoinRequest {
+                tmgi: AMF_MBS_TMGI,
+                area_session_id: None,
+                associated_qos_flows: vec![],
+            }],
+        );
+        task.setup_one_pdu_session(34, &item, gnb_ip)
+            .await
+            .expect("setup");
+        task.mbs_ngap_sessions
+            .join_ue(&AMF_MBS_TMGI, 99, test_served_cell_id())
+            .expect("a bystander");
+        assert!(task
+            .mbs_ngap_sessions
+            .get(&AMF_MBS_TMGI)
+            .unwrap()
+            .has_ue(34));
+
+        task.delete_ue_context(34);
+
+        let session = task.mbs_ngap_sessions.get(&AMF_MBS_TMGI).expect("session");
+        assert!(
+            !session.has_ue(34),
+            "a released UE must not linger as a member of a radiating session"
+        );
+        assert!(session.has_ue(99), "the other member is untouched");
+    }
+
+    /// A deactivation reports how many UEs were receiving the session, which is
+    /// only meaningful because joins now actually land.
+    ///
+    /// Ties the two halves of MBS together: membership arrives on the
+    /// UE-associated procedures, and the session-level procedure sees it.
+    #[tokio::test]
+    async fn a_deactivation_sees_the_members_the_pdu_procedures_added() {
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(35);
+        key_ue(&mut task, 35, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        activate_mbs_session(&mut task, AMF_MBS_TMGI);
+
+        let item = setup_item_with_policy_and_mbs(
+            1,
+            None,
+            vec![MbsSessionJoinRequest {
+                tmgi: AMF_MBS_TMGI,
+                area_session_id: None,
+                associated_qos_flows: vec![],
+            }],
+        );
+        task.setup_one_pdu_session(35, &item, gnb_ip)
+            .await
+            .expect("setup");
+
+        let stopped = task
+            .mbs_ngap_sessions
+            .stop_session(&AMF_MBS_TMGI)
+            .expect("the session was activated");
+        assert_eq!(
+            stopped.joined_ues.len(),
+            1,
+            "the torn-down session must know it had one member, which it only can \
+             because the PDU Session procedure recorded the join"
+        );
+        assert!(stopped.joined_ues.contains(&35));
     }
 }
