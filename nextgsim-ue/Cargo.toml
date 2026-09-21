@@ -38,20 +38,27 @@ up-security = ["drb-pdcp"]
 # read out of the `SDAP-Config` the network signalled, so the network's policy can
 # change without a matching UE change.
 sdap-dataplane = []
-# Sidelink / ProSe PC5 surface (issue #54, TS 23.304). Off by default because the
-# surface is a FACADE: only `StartDiscovery`/`StopDiscovery` are ever sent, and
-# `EstablishPc5Link` flips straight to `Active` with no over-the-air exchange, so
-# every PC5-link, relay and cooperative-positioning handler is unreachable. There
-# is no PC5-S wire protocol and no RRC `SidelinkUEInformation` / `sl-Config`, so a
-# gNB peer reserves no sidelink resources.
+# Sidelink / ProSe PC5 surface (issues #54 and #141, TS 23.304, TS 24.554).
 #
-# `prose` rides on this feature rather than getting its own: `prose.rs` uses
-# `crate::sidelink::Pc5RrcState`, so it cannot compile without the sidelink types,
-# and it is the same PC5 capability split across two files -- its own types have
-# zero consumers anywhere in the workspace.
+# Since issue #141 this gates WORKING procedures, not a facade: a PC5-S
+# `Direct Communication Request`/`Accept` handshake before a unicast link is usable,
+# Model A/B direct discovery as a real exchange, UE-to-UE relay forwarding against the
+# live link table, and an RRC `SidelinkUEInformation` resource request answered by an
+# `sl-ConfigDedicatedNR` grant. (#141's recorded blocker -- the vendored RRC schema had
+# zero sidelink IEs -- died when #105 vendored the Rel-19 schema.)
 #
-# Turning this on compiles the facade back in; it does not make PC5 work. See #54
-# increment 2 for what would.
+# Still off by default, for two reasons that survive #141: PC5 is not a capability a
+# default UE should advertise, and the gate is what keeps this module out of the lean
+# `cargo test --workspace` build. `UeConfig::prose_enabled` is the RUNTIME half of the
+# gate -- with the feature on but the flag off, the task registers and idles.
+#
+# What is NOT here, and is not stubbed: there is no PC5 radio (the medium is an
+# in-process channel), and no UE-to-Network relay -- that needs the TS 38.351 SRAP
+# adaptation layer, and is filed as issue #190.
+#
+# `prose.rs` used to ride this feature; #141 removed it, because every one of its types
+# had zero consumers and the procedures it modelled are now implemented for real in
+# `sidelink::{pc5s, link, discovery, relay}`. See the note in `src/lib.rs`.
 sidelink = []
 
 [lints]

@@ -42,16 +42,24 @@ pub mod she_client;
 pub mod ambient_iot;
 pub mod mint;
 pub mod ranging;
-// Off by default (issue #54): the sidelink surface is an inert facade, so a
-// default build must not carry it or advertise it. See the `sidelink` feature in
-// Cargo.toml for why `prose` is gated on the same flag.
+// Off by default (issue #54): PC5 is not a capability a default UE should advertise, and
+// the gate also keeps the module out of the lean `cargo test --workspace` build. Since
+// issue #141 what it gates is working procedures rather than a facade -- see
+// `sidelink`'s module docs. `UeConfig::prose_enabled` is the runtime half of the gate.
 #[cfg(feature = "sidelink")]
 pub mod sidelink;
 
 // Rel-17 protocol extensions
 pub mod daps;
-#[cfg(feature = "sidelink")]
-pub mod prose; // ProSe PC5 proximity services (TS 23.303/23.304), needs sidelink::Pc5RrcState
+// `prose` was REMOVED by issue #141, not gated further. It modelled ProSe contexts,
+// bearers, relay contexts and Model A/B discovery status -- and every one of its types had
+// zero consumers workspace-wide, so none of it ever ran. The procedures it described are
+// now implemented, against the wire, in `sidelink::{pc5s, link, discovery, relay}`:
+// `ProseContext`/`ProsePeer` by `Pc5DiscoveryEngine`/`DiscoveredPeer`, `Pc5Bearer` by
+// `Pc5LinkContext`, `UeRelayContext` by `RelayForwarder`, and `ProseDiscoveryStatus` by
+// the real Model A/B exchange. Keeping a second, inert model of the same procedures beside
+// the working one would be two sources of truth with only one of them driven, which is the
+// defect #141 exists to remove.
 pub mod uav; // UAV identification and C2 link management (TS 23.256) // DAPS dual active protocol stack handover (TS 38.331)
 
 // Re-export commonly used types

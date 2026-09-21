@@ -150,6 +150,14 @@ path = "src/up_security_user_plane.rs"
 name = "ranging_report_e2e"
 path = "src/ranging_report_e2e.rs"
 
+# The two-UE PC5 end-to-end test (issue #141): discovery -> unicast link -> relay, with
+# three real SidelinkTasks wired to each other's real inboxes. Behind `sidelink` for the
+# same reason `ranging_report_e2e` is -- the whole sidelink module is gated off by
+# default (#54), so this cannot compile in the default build.
+[[test]]
+name = "sidelink_pc5_e2e"
+path = "src/sidelink_pc5_e2e.rs"
+
 [[test]]
 name = "conditional_handover_e2e"
 path = "src/conditional_handover_e2e.rs"

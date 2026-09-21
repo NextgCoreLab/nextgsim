@@ -67,6 +67,7 @@ use nextgsim_rrc::procedures::measurement_report::{
 // skipped, so the wire one is named for what it is (issue #170).
 use nextgsim_rrc::codec::generated::MeasConfig as AsnMeasConfig;
 use nextgsim_rrc::procedures::meas_config::read_a3_meas_configs;
+// The sidelink resource request and the grant it is answered with (issue #141).
 use nextgsim_rrc::procedures::ntn_timing::NtnServingCellConfig;
 use nextgsim_rrc::procedures::paging::{
     decode_paging, PagedUeIdentity, FIVE_G_S_TMSI_LEN, MAX_PAGE_RECORDS,
@@ -96,6 +97,11 @@ use nextgsim_rrc::procedures::scell_config::decode_scell_config;
 use nextgsim_rrc::procedures::security_mode::{
     decode_security_mode_command, encode_security_mode_complete, encode_security_mode_failure,
     SecurityModeCommandData, SecurityModeCompleteParams, SecurityModeFailureParams,
+};
+use nextgsim_rrc::procedures::sidelink_ue_information::SlConfigDedicatedParams;
+#[cfg(feature = "sidelink")]
+use nextgsim_rrc::procedures::sidelink_ue_information::{
+    encode_sidelink_ue_information, SidelinkUeInformationParams, SlCastType, SlTxResourceRequest,
 };
 use nextgsim_rrc::procedures::suspend_config::{decode_suspend_config, RanNotificationArea};
 use nextgsim_rrc::procedures::system_information::{
@@ -470,6 +476,29 @@ pub struct RrcTask {
     /// one A6 reference and not one per event. That is the ceiling of #112's
     /// "SCell half of CA, not the whole feature".
     configured_scells: std::collections::BTreeMap<u8, i32>,
+    /// The dedicated sidelink configuration the network granted, if any
+    /// (TS 38.331 §5.8.3, §5.3.5.3; issue #141).
+    ///
+    /// `None` means no grant is in force, which is the state a UE is in before it asks
+    /// and after a `release`. A UE must not transmit sidelink without one: before this
+    /// issue there was no such field and no such request, so PC5 ran with the network
+    /// unaware of it entirely.
+    ///
+    /// Readable through [`RrcTask::granted_sl_config`], which is the positive observable
+    /// the tests assert on: it holds a value only because a real `RRCReconfiguration`
+    /// carrying an `sl-ConfigDedicatedNR-r16` `setup` was decoded.
+    granted_sl_config: Option<SlConfigDedicatedParams>,
+    /// The sidelink resource request this UE has sent and not yet had answered.
+    ///
+    /// Held so the request is sent ONCE per connection rather than on every RRC cycle:
+    /// TS 38.331 §5.8.3.2 triggers the procedure on a *change* of interest, not
+    /// periodically, and a UE that re-sent an unchanged request every cycle would flood
+    /// SRB1.
+    ///
+    /// Behind the `sidelink` feature because only the sidelink task sends the trigger
+    /// that populates it, and that task does not exist in a default build.
+    #[cfg(feature = "sidelink")]
+    sent_sl_interest: Option<SidelinkUeInformationParams>,
 }
 
 /// Converts this UE's measurement report into the UPER `MeasurementReport` of
@@ -624,6 +653,9 @@ impl RrcTask {
             cho_transaction_id: 0,
             paging_s_tmsi: None,
             configured_scells: std::collections::BTreeMap::new(),
+            granted_sl_config: None,
+            #[cfg(feature = "sidelink")]
+            sent_sl_interest: None,
         }
     }
 
@@ -1148,6 +1180,141 @@ impl RrcTask {
             );
         }
         bindings.len()
+    }
+
+    /// The dedicated sidelink configuration the network has granted, if any
+    /// (TS 38.331 §5.8.3; issue #141).
+    ///
+    /// `Some` only after an `RRCReconfiguration` carrying an `sl-ConfigDedicatedNR-r16`
+    /// `setup` was decoded, so this is the positive observable that distinguishes a real
+    /// grant from a UE that assumed one. A UE must not transmit sidelink while this is
+    /// `None`.
+    pub fn granted_sl_config(&self) -> Option<SlConfigDedicatedParams> {
+        self.granted_sl_config
+    }
+
+    /// Applies a signalled `sl-ConfigDedicatedNR` (TS 38.331 §5.3.5.3, §5.8.3).
+    ///
+    /// The three cases are distinct, and conflating any two would be a defect:
+    ///
+    /// * a **`setup`** installs the grant, replacing any previous one;
+    /// * a **`release`** revokes it, so the UE must stop transmitting sidelink;
+    /// * **absence** leaves it alone — §5.3.5.3 has the UE act only on IEs that are
+    ///   present, and every reconfiguration this tree sent before issue #141 carried no
+    ///   sidelink IE at all. Treating absence as a release would revoke the grant on the
+    ///   next bearer reconfiguration.
+    ///
+    /// Returns whether the grant changed, for the caller's log and for the tests.
+    fn apply_signalled_sl_config(
+        &mut self,
+        signalled: Option<SlConfigDedicatedParams>,
+        released: bool,
+    ) -> bool {
+        match (signalled, released) {
+            (Some(config), _) => {
+                info!(
+                    "Applying granted sl-ConfigDedicatedNR: t400={:?} ms, PHY/MAC/RLC \
+                     config {}",
+                    config.t400_ms,
+                    if config.phy_mac_rlc_config {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                );
+                let changed = self.granted_sl_config != Some(config);
+                self.granted_sl_config = Some(config);
+                changed
+            }
+            (None, true) => {
+                let had = self.granted_sl_config.is_some();
+                if had {
+                    info!(
+                        "The network released this UE's sidelink configuration; PC5 \
+                         transmission is no longer granted"
+                    );
+                }
+                self.granted_sl_config = None;
+                had
+            }
+            // Absent: §5.3.5.3 leaves what is not signalled untouched.
+            (None, false) => false,
+        }
+    }
+
+    /// Turns the sidelink task's changed interest into a `SidelinkUEInformation`
+    /// (TS 38.331 §5.8.3.2; issue #141).
+    ///
+    /// The translation from `(l2_id, is_unicast)` pairs to `SlTxResourceRequest` happens
+    /// here rather than in the sidelink task, so that the sidelink task needs no RRC
+    /// dependency — see [`crate::tasks::RrcMessage::SidelinkInterestChanged`].
+    ///
+    /// Public so the integration test can drive the real handler rather than re-deriving
+    /// the request itself: a test that built its own `SidelinkUEInformation` would pass
+    /// whether or not this path was ever reached, which is the defect issue #141 is
+    /// about.
+    #[cfg(feature = "sidelink")]
+    pub async fn handle_sidelink_interest_changed(
+        &mut self,
+        rx_interested_freqs: Vec<u8>,
+        tx_destinations: &[(u32, bool)],
+    ) -> bool {
+        let interest = SidelinkUeInformationParams {
+            rx_interested_freqs,
+            tx_resource_requests: tx_destinations
+                .iter()
+                .map(|(l2_id, is_unicast)| SlTxResourceRequest {
+                    destination_l2_id: *l2_id,
+                    cast_type: if *is_unicast {
+                        SlCastType::Unicast
+                    } else {
+                        SlCastType::Broadcast
+                    },
+                })
+                .collect(),
+        };
+        self.send_sidelink_ue_information(interest).await
+    }
+
+    /// Sends a `SidelinkUEInformation` if this UE's sidelink interest has changed
+    /// (TS 38.331 §5.8.3.2; issue #141).
+    ///
+    /// §5.8.3.2 triggers the procedure when the UE "is configured by upper layers to
+    /// transmit NR sidelink communication" and on a *change* of what it wants — not
+    /// periodically. So an unchanged interest sends nothing: `sent_sl_interest` is what
+    /// makes this idempotent, and without it the request would go out on every RRC cycle.
+    ///
+    /// Returns whether a request was sent.
+    #[cfg(feature = "sidelink")]
+    async fn send_sidelink_ue_information(
+        &mut self,
+        interest: SidelinkUeInformationParams,
+    ) -> bool {
+        if self.sent_sl_interest.as_ref() == Some(&interest) {
+            return false;
+        }
+        match encode_sidelink_ue_information(&interest) {
+            Ok(bytes) => {
+                info!(
+                    "Sending SidelinkUEInformation: {} receive carrier(s) {:?}, {} \
+                     transmit destination(s)",
+                    interest.rx_interested_freqs.len(),
+                    interest.rx_interested_freqs,
+                    interest.tx_resource_requests.len()
+                );
+                self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&bytes))
+                    .await;
+                self.sent_sl_interest = Some(interest);
+                true
+            }
+            Err(e) => {
+                // An interest the ASN.1 cannot carry. Logged and not sent: the
+                // alternative is sending a PDU the gNB cannot decode, which loses the
+                // request anyway and costs an SRB1 transmission.
+                warn!("Not sending SidelinkUEInformation: {e}");
+                false
+            }
+        }
     }
 
     /// Setup default A3 measurement for handover.
@@ -2897,6 +3064,19 @@ impl RrcTask {
             self.apply_ntn_precompensation(cell_id, cfg).await;
         }
 
+        // §5.3.5.3: apply the `sl-ConfigDedicatedNR` if the message carried one
+        // (TS 38.331 §5.8.3, issue #141). Before this the IE was neither sent nor read,
+        // so a UE using PC5 held no network grant at all.
+        //
+        // BEFORE the acknowledgement, for the same reason the `measConfig` is: the
+        // Complete tells the gNB the configuration is in force, and a gNB that then
+        // expected sidelink traffic on the granted carriers would be expecting it from a
+        // UE that had not recorded the grant.
+        self.apply_signalled_sl_config(
+            reconfiguration.sl_config,
+            reconfiguration.sl_config_released,
+        );
+
         // The tid comes from the DECODED message. It used to be read from
         // `bytes[1]`, which is a byte of RRCReconfiguration-IEs content: the real
         // tid is in bits 5-6 of the leading byte, so the echo was wrong for every
@@ -4279,6 +4459,22 @@ impl Task for RrcTask {
                             RrcMessage::AsSecurityKey { kgnb } => {
                                 debug!("Received KgNB for AS security from NAS plane");
                                 self.set_pending_kgnb(kgnb);
+                            }
+                            #[cfg(feature = "sidelink")]
+                            RrcMessage::SidelinkInterestChanged {
+                                rx_interested_freqs,
+                                tx_destinations,
+                            } => {
+                                // TS 38.331 §5.8.3.2 (issue #141): the sidelink task's
+                                // destination set changed, so request resources for it.
+                                // The RRC layer owns the request because SRB1 is its
+                                // channel, and the sidelink task owns the trigger
+                                // because it is what knows the PC5 state.
+                                self.handle_sidelink_interest_changed(
+                                    rx_interested_freqs,
+                                    &tx_destinations,
+                                )
+                                .await;
                             }
                             RrcMessage::PerformUac { access_category, access_identities } => {
                                 let allowed = self.perform_uac_check(access_category, access_identities);
@@ -5923,6 +6119,7 @@ mod tests {
                     max_report_cells: 4,
                 }),
                 ntn_config: None,
+                sl_config: None,
             })
             .expect("encode");
 
@@ -5965,6 +6162,7 @@ mod tests {
                 master_key_update: None,
                 meas_config: None,
                 ntn_config: None,
+                sl_config: None,
             })
             .expect("encode");
             task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
