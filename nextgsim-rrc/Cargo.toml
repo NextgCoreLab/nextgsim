@@ -17,6 +17,12 @@ nextgsim-common.workspace = true
 # and the gNB call belongs. nextgsim-crypto depends only on nextgsim-common, so
 # there is no cycle.
 nextgsim-crypto.workspace = true
+# For the SRAP bearer and egress-channel types of TS 38.351 (issue #190). The
+# `sl-SRAP-Config-r17` this crate encodes and the SRAP header `nextgsim-rlc` writes must
+# agree on which bearer identities are legal, so they share one type rather than each
+# keeping a `u8` that could drift apart. `nextgsim-rlc` depends only on
+# `nextgsim-common`, so there is no cycle.
+nextgsim-rlc.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -68,6 +68,28 @@
 //! be an IE no code in this tree reads — there is no PC5 measurement reporting, no PC5
 //! RLF detection and no SLRB manager to configure — and an unread IE is exactly the
 //! defect issue #141 exists to remove.
+//!
+//! # What issue #190 added here
+//!
+//! Three fields, each of which was generated and unused before it:
+//!
+//! * **`ue-Type-r17`** on the request ([`SidelinkUeInformationParams::ue_type`]), in the
+//!   `v1700` non-critical extension. This is how a UE asks for L2 UE-to-Network relay
+//!   resources, and it is what gives the gNB's relay grant a production trigger instead of
+//!   a network-side configuration flag.
+//! * **`sl-ScheduledConfig-r16.sl-RNTI-r16`** on the grant
+//!   ([`SlConfigDedicatedParams::sl_rnti`]) — Mode 1, but the *identity* only. The
+//!   resource pools stay absent for #141's unchanged reason; that field's docs carry the
+//!   full decision, which issue #190's criterion 3 asked to be made explicitly.
+//! * **`sl-RLC-BearerToAddModList-r16`** on the grant
+//!   ([`SlConfigDedicatedParams::sl_rlc_bearers`]), the relay RLC channels a relay's SRAP
+//!   mappings may name. Before #190 `grep -rn sl_rlc_bearer_to_add_mod_list_r16` over the
+//!   tree found exactly one hit: the literal `None` in this file.
+//!
+//! All three ride plain `OPTIONAL` fields of non-critical extensions rather than `[[ ]]`
+//! extension additions, so none of them reaches the vendored codec's unimplemented
+//! extended-SEQUENCE encoder. See `sidelink_relay_config`'s module docs for the measured
+//! bytes.
 
 use crate::codec::generated::*;
 use crate::codec::{decode_rrc, encode_rrc, RrcCodecError};
@@ -156,6 +178,42 @@ pub struct SlTxResourceRequest {
     pub cast_type: SlCastType,
 }
 
+/// What role a UE declares for itself in L2 UE-to-Network relay
+/// (`SidelinkUEInformationNR-v1700-IEs.ue-Type-r17`, TS 38.331 §6.2.2; issue #190).
+///
+/// This is how the gNB learns a UE wants relay resources at all, and it is what makes the
+/// relay grant *requested* rather than configured out of band: without it the gNB would
+/// have to guess which of its UEs is a relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlUeType {
+    /// This UE is offering itself as an L2 UE-to-Network relay.
+    RelayUe,
+    /// This UE wants to reach the network through a relay.
+    RemoteUe,
+}
+
+impl SlUeType {
+    /// The generated ENUMERATED index this role encodes to.
+    fn to_asn(self) -> SidelinkUEInformationNR_v1700_IEsUe_Type_r17 {
+        SidelinkUEInformationNR_v1700_IEsUe_Type_r17(match self {
+            Self::RelayUe => SidelinkUEInformationNR_v1700_IEsUe_Type_r17::RELAY_UE,
+            Self::RemoteUe => SidelinkUEInformationNR_v1700_IEsUe_Type_r17::REMOTE_UE,
+        })
+    }
+
+    /// Reads the role back.
+    ///
+    /// Anything that is not `remoteUE` reads as `RelayUe`, matching the ENUMERATED's two
+    /// code points. The ASN.1 is not extensible here, so there is no third value a
+    /// conformant peer can send.
+    fn from_asn(value: &SidelinkUEInformationNR_v1700_IEsUe_Type_r17) -> Self {
+        match value.0 {
+            SidelinkUEInformationNR_v1700_IEsUe_Type_r17::REMOTE_UE => Self::RemoteUe,
+            _ => Self::RelayUe,
+        }
+    }
+}
+
 /// The sidelink resource request a UE sends (TS 38.331 §5.8.3, `SidelinkUEInformationNR`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidelinkUeInformationParams {
@@ -168,11 +226,41 @@ pub struct SidelinkUeInformationParams {
     /// `sl-TxResourceReqList-r16`: one entry per destination the UE wants to transmit
     /// to.
     pub tx_resource_requests: Vec<SlTxResourceRequest>,
+    /// `ue-Type-r17`: the L2 UE-to-Network relay role this UE declares (issue #190).
+    ///
+    /// `None` is a plain PC5 UE, which is what issue #141's requests were and still are.
+    /// `Some` is what asks the gNB for relay resources, and is why the gNB's relay grant
+    /// has a production trigger rather than needing a configuration flag on the network
+    /// side.
+    ///
+    /// Carried in the `v1700` non-critical extension, so a request that sets it builds
+    /// that extension and a request that does not is byte-for-byte what #141 sent.
+    pub ue_type: Option<SlUeType>,
+}
+
+/// One sidelink relay RLC channel the network configures on the relay's own Uu interface
+/// (`SL-RLC-BearerConfig-r16`, TS 38.331 §6.3.2; issue #190).
+///
+/// This is the IE issue #190's criterion 2 names. Before that issue it was generated and
+/// unused: `grep -rn sl_rlc_bearer_to_add_mod_list_r16` found one hit, the literal `None`
+/// in the old `empty_phy_mac_rlc_config`. A relay needs it because TS 38.300 §16.12.2.1 maps
+/// remote-UE bearers onto *the relay's own* relay RLC channels, and the relay cannot know
+/// which channels exist unless the network says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlRlcBearerConfig {
+    /// `sl-RLC-BearerConfigIndex-r16`, which identifies this bearer configuration.
+    pub index: u16,
+    /// `sl-ServedRadioBearer-r16`: the `SLRB-Uu-ConfigIndex-r16` this RLC channel serves.
+    pub served_radio_bearer: Option<u16>,
 }
 
 /// The network's dedicated sidelink configuration
 /// (TS 38.331 §6.3.2 `SL-ConfigDedicatedNR-r16`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// No longer `Copy` since issue #190: [`Self::sl_rlc_bearers`] is a list, and the
+/// alternative — a fixed-size array sized to `maxSL-LCID-r16` — would carry 512 slots to
+/// describe the one or two channels a relay actually gets.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SlConfigDedicatedParams {
     /// `t400-r16`: the sidelink RRC reconfiguration guard timer, in milliseconds.
     ///
@@ -183,13 +271,41 @@ pub struct SlConfigDedicatedParams {
     pub t400_ms: Option<u16>,
     /// Whether to include an `sl-PHY-MAC-RLC-Config-r16`.
     ///
-    /// The config is included empty (every field within it is `OPTIONAL` and this tree
-    /// has no PC5 scheduler to configure), so it carries presence and nothing more.
-    /// Present because its presence is what tells the UE the network has granted
-    /// sidelink at all: TS 38.331 §5.3.5.3 has the UE apply `sl-ConfigDedicatedNR` on
-    /// reception, and a `setup` with no PHY/MAC/RLC config is the "sidelink is
-    /// permitted, select your own Mode 2 resources" case.
+    /// Its presence is what tells the UE the network has granted sidelink at all:
+    /// TS 38.331 §5.3.5.3 has the UE apply `sl-ConfigDedicatedNR` on reception, and a
+    /// `setup` whose PHY/MAC/RLC config carries neither a scheduled config nor any RLC
+    /// bearer is the "sidelink is permitted, select your own Mode 2 resources" case.
     pub phy_mac_rlc_config: bool,
+    /// `sl-ScheduledConfig-r16.sl-RNTI-r16`: the SL-RNTI for **Mode 1** scheduled
+    /// sidelink resource allocation (TS 38.300 §16.9.3.2; issue #190's criterion 3).
+    ///
+    /// # The explicit decision criterion 3 asks for
+    ///
+    /// Issue #141 granted Mode 2 only, and was right to: `sl-ScheduledConfig-r16`'s
+    /// **resource pools** (`sl-ConfiguredGrantConfigList-r16`) would describe slots in a
+    /// PC5 physical layer this simulator does not have, and signalling a pool nothing
+    /// consults is the unread-IE defect #141 exists to remove.
+    ///
+    /// That reasoning applies to the *pools*, and **not** to the SL-RNTI. An RNTI is an
+    /// identity, not a slot: it is how the gNB names this UE when it schedules sidelink,
+    /// and it is meaningful with or without a PHY — the same way a C-RNTI is meaningful in
+    /// this tree. So this carries the SL-RNTI and **not** a configured-grant list, and
+    /// `sl-PSFCH-ToPUCCH` and `mac-MainConfigSL` stay absent for the pool reason.
+    ///
+    /// `None` keeps #141's Mode-2 behaviour, which is still right for a plain PC5 UE.
+    /// `Some` is the relay case: TS 38.300 §16.12.2.1 has the relay carry remote-UE
+    /// traffic on channels the *network* configured, so a relay whose resources were
+    /// UE-autonomous would be selecting its own resources for traffic the network is
+    /// scheduling.
+    pub sl_rnti: Option<u16>,
+    /// `sl-RLC-BearerToAddModList-r16`: the relay RLC channels on this UE's own interface
+    /// (issue #190's criterion 2).
+    ///
+    /// Empty for a plain PC5 UE, which needs no relay RLC channel. For a relay, these are
+    /// the channels its SRAP bearer mappings may name — and the UE **validates** its SRAP
+    /// mappings against them rather than trusting the mapping alone, so a mapping naming a
+    /// channel the network never configured is rejected rather than used.
+    pub sl_rlc_bearers: Vec<SlRlcBearerConfig>,
 }
 
 /// The eight `t400-r16` values TS 38.331 allows, in ENUMERATED index order.
@@ -198,6 +314,10 @@ pub struct SlConfigDedicatedParams {
 /// `ms500`, and the step changes from 100 to 200 to 400 to 500 — so any formula would be
 /// wrong somewhere.
 const T400_VALUES_MS: [u16; 8] = [100, 200, 300, 400, 600, 1000, 1500, 2000];
+
+/// `SL-RLC-BearerConfigIndex-r16 ::= INTEGER (1..maxSL-LCID-r16)`, and `maxSL-LCID-r16`
+/// is 512 (`tools/rrc-19.3.0.asn1`).
+const SL_RLC_BEARER_CONFIG_INDEX_RANGE: std::ops::RangeInclusive<u16> = 1..=512;
 
 /// Builds a `SidelinkUEInformationNR` as a complete UL-DCCH message
 /// (TS 38.331 §5.8.3, §6.2.1).
@@ -261,7 +381,27 @@ pub fn build_sidelink_ue_information(
         sl_tx_resource_req_list_r16: tx_list,
         sl_failure_list_r16: None,
         late_non_critical_extension: None,
-        non_critical_extension: None,
+        // The v1700 extension, built only to carry `ue-Type-r17` (issue #190). A request
+        // that declares no relay role omits the whole extension, so it stays byte-for-byte
+        // what issue #141 sent.
+        non_critical_extension: params.ue_type.map(|ue_type| {
+            SidelinkUEInformationNR_v1700_IEs {
+                sl_tx_resource_req_list_v1700: None,
+                sl_rx_drx_report_list_v1700: None,
+                sl_rx_interested_gc_bc_dest_list_r17: None,
+                sl_rx_interested_freq_list_disc_r17: None,
+                sl_tx_resource_req_list_disc_r17: None,
+                // `sl-TxResourceReqListCommRelay-r17` carries the per-destination relay
+                // transmission request. Absent because this UE asks for relay resources by
+                // declaring its ROLE, and the destinations are already in the root
+                // `sl-TxResourceReqList-r16` above -- repeating them in a Rel-17 list the
+                // gNB would have to reconcile would be two statements of one fact.
+                sl_tx_resource_req_list_comm_relay_r17: None,
+                ue_type_r17: Some(ue_type.to_asn()),
+                sl_source_identity_remote_ue_r17: None,
+                non_critical_extension: None,
+            }
+        }),
     };
 
     Ok(UL_DCCH_Message {
@@ -355,6 +495,13 @@ pub fn read_sidelink_ue_information(msg: &UL_DCCH_Message) -> Option<SidelinkUeI
                     .collect()
             })
             .unwrap_or_default(),
+        // The declared relay role, from the v1700 extension (issue #190). A request that
+        // carries no extension yields `None`, which is a plain PC5 UE.
+        ue_type: ies
+            .non_critical_extension
+            .as_ref()
+            .and_then(|v1700| v1700.ue_type_r17.as_ref())
+            .map(SlUeType::from_asn),
     })
 }
 
@@ -382,7 +529,7 @@ pub fn build_sl_config_dedicated(
 
     Ok(SL_ConfigDedicatedNR_r16 {
         sl_phy_mac_rlc_config_r16: if params.phy_mac_rlc_config {
-            Some(empty_phy_mac_rlc_config())
+            Some(phy_mac_rlc_config(params)?)
         } else {
             None
         },
@@ -394,35 +541,103 @@ pub fn build_sl_config_dedicated(
     })
 }
 
-/// An `SL-PHY-MAC-RLC-Config-r16` with every optional field absent.
+/// An `SL-PHY-MAC-RLC-Config-r16` carrying whatever this grant configures.
 ///
-/// Its presence is the signal (see [`SlConfigDedicatedParams::phy_mac_rlc_config`]);
-/// there is no PC5 scheduler in this tree for its contents to configure, and inventing
-/// scheduling pools no code reads is the defect issue #141 removes.
-fn empty_phy_mac_rlc_config() -> SL_PHY_MAC_RLC_Config_r16 {
-    SL_PHY_MAC_RLC_Config_r16 {
-        sl_scheduled_config_r16: None,
+/// For a plain PC5 UE that is nothing at all — every field is `OPTIONAL` and its presence
+/// alone is the grant (see [`SlConfigDedicatedParams::phy_mac_rlc_config`]). For a relay
+/// it carries the Mode-1 SL-RNTI and the relay RLC channels; see
+/// [`SlConfigDedicatedParams::sl_rnti`] for why the RNTI is signalled and the resource
+/// pools still are not.
+fn phy_mac_rlc_config(
+    params: &SlConfigDedicatedParams,
+) -> Result<SL_PHY_MAC_RLC_Config_r16, SidelinkRrcError> {
+    let mut bearers = Vec::with_capacity(params.sl_rlc_bearers.len());
+    for bearer in &params.sl_rlc_bearers {
+        if !SL_RLC_BEARER_CONFIG_INDEX_RANGE.contains(&bearer.index) {
+            return Err(SidelinkRrcError::InvalidFieldValue(format!(
+                "sl-RLC-BearerConfigIndex {} is outside 1..={} (maxSL-LCID-r16)",
+                bearer.index,
+                SL_RLC_BEARER_CONFIG_INDEX_RANGE.end()
+            )));
+        }
+        bearers.push(SL_RLC_BearerConfig_r16 {
+            sl_rlc_bearer_config_index_r16: SL_RLC_BearerConfigIndex_r16(bearer.index),
+            sl_served_radio_bearer_r16: bearer.served_radio_bearer.map(SLRB_Uu_ConfigIndex_r16),
+            // The RLC mode and logical-channel priority of the relay RLC channel. Absent
+            // for the reason the resource pools are: there is no PC5 MAC scheduler here to
+            // apply a priority, and a configured value nothing reads is an unread IE.
+            sl_rlc_config_r16: None,
+            sl_mac_logical_channel_config_r16: None,
+        });
+    }
+
+    Ok(SL_PHY_MAC_RLC_Config_r16 {
+        // Mode 1, when the network scheduled this UE's sidelink (issue #190).
+        sl_scheduled_config_r16: params.sl_rnti.map(|rnti| {
+            SL_PHY_MAC_RLC_Config_r16Sl_ScheduledConfig_r16::Setup(SL_ScheduledConfig_r16 {
+                sl_rnti_r16: RNTI_Value(rnti),
+                // Deliberately absent -- these are the resource POOLS and the PSFCH
+                // timing, which would describe slots in a PC5 physical layer this
+                // simulator does not have. See `SlConfigDedicatedParams::sl_rnti`.
+                mac_main_config_sl_r16: None,
+                sl_cs_rnti_r16: None,
+                sl_psfch_to_pucch_r16: None,
+                sl_configured_grant_config_list_r16: None,
+            })
+        }),
         sl_ue_selected_config_r16: None,
         sl_freq_info_to_release_list_r16: None,
         sl_freq_info_to_add_mod_list_r16: None,
         sl_rlc_bearer_to_release_list_r16: None,
-        sl_rlc_bearer_to_add_mod_list_r16: None,
+        // An empty list is OMITTED rather than encoded: `SIZE (1..maxSL-LCID-r16)` makes a
+        // zero-length SEQUENCE OF illegal.
+        sl_rlc_bearer_to_add_mod_list_r16: if bearers.is_empty() {
+            None
+        } else {
+            Some(SL_PHY_MAC_RLC_Config_r16Sl_RLC_BearerToAddModList_r16(
+                bearers,
+            ))
+        },
         sl_max_num_consecutive_dtx_r16: None,
         sl_csi_acquisition_r16: None,
         sl_csi_scheduling_request_id_r16: None,
         sl_ssb_priority_nr_r16: None,
         network_controlled_sync_tx_r16: None,
-    }
+    })
 }
 
 /// Reads an `SL-ConfigDedicatedNR-r16` back to the parameters that built it.
 pub fn read_sl_config_dedicated(config: &SL_ConfigDedicatedNR_r16) -> SlConfigDedicatedParams {
+    let phy_mac_rlc = config.sl_phy_mac_rlc_config_r16.as_ref();
     SlConfigDedicatedParams {
         t400_ms: config
             .t400_r16
             .as_ref()
             .and_then(|t| T400_VALUES_MS.get(usize::from(t.0)).copied()),
-        phy_mac_rlc_config: config.sl_phy_mac_rlc_config_r16.is_some(),
+        phy_mac_rlc_config: phy_mac_rlc.is_some(),
+        // Only a `setup` yields an SL-RNTI: a `release` withdraws Mode 1, which reads back
+        // as `None`, the same as never having been granted it. Both mean "this UE selects
+        // its own resources", which is the UE's actual behaviour in each case.
+        sl_rnti: phy_mac_rlc
+            .and_then(|c| c.sl_scheduled_config_r16.as_ref())
+            .and_then(|s| match s {
+                SL_PHY_MAC_RLC_Config_r16Sl_ScheduledConfig_r16::Setup(cfg) => {
+                    Some(cfg.sl_rnti_r16.0)
+                }
+                SL_PHY_MAC_RLC_Config_r16Sl_ScheduledConfig_r16::Release(_) => None,
+            }),
+        sl_rlc_bearers: phy_mac_rlc
+            .and_then(|c| c.sl_rlc_bearer_to_add_mod_list_r16.as_ref())
+            .map(|list| {
+                list.0
+                    .iter()
+                    .map(|b| SlRlcBearerConfig {
+                        index: b.sl_rlc_bearer_config_index_r16.0,
+                        served_radio_bearer: b.sl_served_radio_bearer_r16.as_ref().map(|s| s.0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -468,6 +683,7 @@ mod tests {
                     cast_type: SlCastType::Groupcast,
                 },
             ],
+            ue_type: None,
         };
 
         let bytes = encode_sidelink_ue_information(&params).expect("encode");
@@ -548,6 +764,7 @@ mod tests {
             let params = SidelinkUeInformationParams {
                 rx_interested_freqs: vec![bad],
                 tx_resource_requests: Vec::new(),
+                ue_type: None,
             };
             assert!(
                 build_sidelink_ue_information(&params).is_err(),
@@ -559,6 +776,7 @@ mod tests {
             let params = SidelinkUeInformationParams {
                 rx_interested_freqs: vec![good],
                 tx_resource_requests: Vec::new(),
+                ue_type: None,
             };
             assert!(build_sidelink_ue_information(&params).is_ok());
         }
@@ -575,6 +793,7 @@ mod tests {
                     cast_type: SlCastType::Unicast,
                 })
                 .collect(),
+            ue_type: None,
         };
         assert!(build_sidelink_ue_information(&params).is_err());
     }
@@ -588,6 +807,7 @@ mod tests {
         let params = SlConfigDedicatedParams {
             t400_ms: Some(400),
             phy_mac_rlc_config: true,
+            ..Default::default()
         };
         let config = build_sl_config_dedicated(&params).expect("build");
         let bytes = encode_rrc(&config).expect(
@@ -597,6 +817,165 @@ mod tests {
         let back: SL_ConfigDedicatedNR_r16 = decode_rrc(&bytes).expect("decode");
         assert_eq!(read_sl_config_dedicated(&back), params);
         assert_eq!(read_sl_config_dedicated(&back).t400_ms, Some(400));
+    }
+
+    /// Issue #190's criterion 3: a **Mode-1** grant round trips, carrying the SL-RNTI and
+    /// the relay RLC channels a relay's SRAP mappings may name.
+    ///
+    /// Both values are positive observables only reachable by having decoded real UPER:
+    /// before #190 `sl_rlc_bearer_to_add_mod_list_r16` was a hardcoded `None` and
+    /// `sl_scheduled_config_r16` was never built at all.
+    #[test]
+    fn a_mode_1_relay_grant_round_trips_with_its_rnti_and_rlc_bearers() {
+        const SL_RNTI: u16 = 0x4602;
+        let params = SlConfigDedicatedParams {
+            t400_ms: Some(400),
+            phy_mac_rlc_config: true,
+            sl_rnti: Some(SL_RNTI),
+            sl_rlc_bearers: vec![
+                SlRlcBearerConfig {
+                    index: 1,
+                    served_radio_bearer: Some(1),
+                },
+                SlRlcBearerConfig {
+                    index: 2,
+                    served_radio_bearer: None,
+                },
+            ],
+        };
+        let config = build_sl_config_dedicated(&params).expect("build");
+        let bytes = encode_rrc(&config).expect(
+            "a Mode-1 grant must encode; if this fails, the vendored codec's \
+             extended-SEQUENCE gap has started to bite on SL-ScheduledConfig",
+        );
+        let back: SL_ConfigDedicatedNR_r16 = decode_rrc(&bytes).expect("decode");
+        let read = read_sl_config_dedicated(&back);
+
+        assert_eq!(
+            read.sl_rnti,
+            Some(SL_RNTI),
+            "the SL-RNTI must survive: it is how the gNB names this UE when scheduling \
+             sidelink"
+        );
+        assert_eq!(read.sl_rlc_bearers.len(), 2);
+        assert_eq!(read.sl_rlc_bearers[0].index, 1);
+        assert_eq!(read.sl_rlc_bearers[0].served_radio_bearer, Some(1));
+        assert_eq!(read.sl_rlc_bearers[1].index, 2);
+        assert_eq!(read.sl_rlc_bearers[1].served_radio_bearer, None);
+        assert_eq!(read, params);
+    }
+
+    /// A Mode-2 grant carries NO SL-RNTI and no relay RLC channel, so Mode 1 and Mode 2
+    /// are distinguishable on the wire. Without this, the Mode-1 test above would pass
+    /// against a builder that always emitted a scheduled config.
+    #[test]
+    fn a_mode_2_grant_carries_no_rnti_and_no_rlc_bearers() {
+        let params = SlConfigDedicatedParams {
+            t400_ms: Some(400),
+            phy_mac_rlc_config: true,
+            ..Default::default()
+        };
+        let config = build_sl_config_dedicated(&params).expect("build");
+        let bytes = encode_rrc(&config).expect("encode");
+        let back: SL_ConfigDedicatedNR_r16 = decode_rrc(&bytes).expect("decode");
+        let read = read_sl_config_dedicated(&back);
+        assert_eq!(read.sl_rnti, None);
+        assert!(read.sl_rlc_bearers.is_empty());
+    }
+
+    /// An `sl-RLC-BearerConfigIndex` outside `1..=512` is refused at the builder rather
+    /// than encoded to a value naming a different channel.
+    #[test]
+    fn an_rlc_bearer_index_outside_the_asn1_range_is_refused() {
+        for bad in [0u16, 513, u16::MAX] {
+            let params = SlConfigDedicatedParams {
+                phy_mac_rlc_config: true,
+                sl_rlc_bearers: vec![SlRlcBearerConfig {
+                    index: bad,
+                    served_radio_bearer: None,
+                }],
+                ..Default::default()
+            };
+            assert!(
+                build_sl_config_dedicated(&params).is_err(),
+                "sl-RLC-BearerConfigIndex {bad} must be refused"
+            );
+        }
+        for good in [1u16, 512] {
+            let params = SlConfigDedicatedParams {
+                phy_mac_rlc_config: true,
+                sl_rlc_bearers: vec![SlRlcBearerConfig {
+                    index: good,
+                    served_radio_bearer: None,
+                }],
+                ..Default::default()
+            };
+            assert!(build_sl_config_dedicated(&params).is_ok());
+        }
+    }
+
+    /// Issue #190: a UE declaring itself a relay carries `ue-Type-r17`, and it survives a
+    /// real UPER round trip through the `v1700` non-critical extension.
+    ///
+    /// This is the IE that gives the gNB's relay grant a production trigger, so it has to
+    /// reach the gNB rather than merely exist.
+    #[test]
+    fn a_declared_relay_role_survives_the_round_trip() {
+        for (role, other) in [
+            (SlUeType::RelayUe, SlUeType::RemoteUe),
+            (SlUeType::RemoteUe, SlUeType::RelayUe),
+        ] {
+            let params = SidelinkUeInformationParams {
+                rx_interested_freqs: vec![1],
+                tx_resource_requests: Vec::new(),
+                ue_type: Some(role),
+            };
+            let bytes = encode_sidelink_ue_information(&params).expect("encode");
+            let decoded = decode_sidelink_ue_information(&bytes)
+                .expect("decode")
+                .expect("still a SidelinkUEInformationNR");
+            assert_eq!(
+                decoded.ue_type,
+                Some(role),
+                "the declared role must survive, and must not become {other:?}"
+            );
+            assert_ne!(decoded.ue_type, Some(other));
+        }
+    }
+
+    /// A request that declares no role omits the whole `v1700` extension, so a plain PC5
+    /// UE's request is unchanged by issue #190.
+    ///
+    /// The byte comparison is the load-bearing part: it proves the extension is *absent*
+    /// rather than present-and-empty, which is what "unchanged" has to mean for a peer
+    /// that decodes it.
+    #[test]
+    fn a_request_declaring_no_role_omits_the_v1700_extension() {
+        let plain = SidelinkUeInformationParams {
+            rx_interested_freqs: vec![1],
+            tx_resource_requests: Vec::new(),
+            ue_type: None,
+        };
+        let with_role = SidelinkUeInformationParams {
+            ue_type: Some(SlUeType::RelayUe),
+            ..plain.clone()
+        };
+        let plain_bytes = encode_sidelink_ue_information(&plain).expect("encode");
+        let role_bytes = encode_sidelink_ue_information(&with_role).expect("encode");
+
+        assert_eq!(
+            decode_sidelink_ue_information(&plain_bytes)
+                .expect("decode")
+                .expect("present")
+                .ue_type,
+            None
+        );
+        assert!(
+            plain_bytes.len() < role_bytes.len(),
+            "declaring a role must cost bytes; without the v1700 extension the two \
+             encodings would be identical and the role unreachable: {plain_bytes:02x?} \
+             vs {role_bytes:02x?}"
+        );
     }
 
     /// The exact bytes of a minimal `SL-ConfigDedicatedNR-r16`, pinned.
@@ -610,6 +989,7 @@ mod tests {
         let config = build_sl_config_dedicated(&SlConfigDedicatedParams {
             t400_ms: Some(300),
             phy_mac_rlc_config: false,
+            ..Default::default()
         })
         .expect("build");
         let bytes = encode_rrc(&config).expect("encode");
@@ -633,6 +1013,7 @@ mod tests {
             let config = build_sl_config_dedicated(&SlConfigDedicatedParams {
                 t400_ms: Some(ms),
                 phy_mac_rlc_config: false,
+                ..Default::default()
             })
             .expect("build");
             let bytes = encode_rrc(&config).expect("encode");
@@ -647,6 +1028,7 @@ mod tests {
         assert!(build_sl_config_dedicated(&SlConfigDedicatedParams {
             t400_ms: Some(500),
             phy_mac_rlc_config: false,
+            ..Default::default()
         })
         .is_err());
     }
@@ -659,6 +1041,7 @@ mod tests {
             let config = build_sl_config_dedicated(&SlConfigDedicatedParams {
                 t400_ms: None,
                 phy_mac_rlc_config: present,
+                ..Default::default()
             })
             .expect("build");
             let bytes = encode_rrc(&config).expect("encode");

@@ -1,21 +1,34 @@
-//! #141 — two UEs, end to end over PC5: discovery → unicast link → relay.
+//! PC5 end to end: discovery → unicast link → UE-to-UE relay (#141), and remote UE →
+//! relay → the network through the SRAP adaptation layer (#190).
 //!
-//! Runs **three real `SidelinkTask`s** in one process, wired to each other's real message
-//! inboxes, and asserts what each UE ends up believing about the others — read out of the
-//! tasks' own state, not out of log lines:
+//! Runs real `SidelinkTask`s in one process, wired to each other's real message inboxes,
+//! and asserts what each UE ends up believing about the others — read out of the tasks' own
+//! state, not out of log lines:
 //!
 //! ```text
-//! UE-1 announces (Model A)                     TS 23.304 §6.3.1.2 step 3a
-//!   → UE-2 decodes it, matches its filter, records UE-1        §6.3.1.2 step 4b
-//! UE-2 sends a DIRECT COMMUNICATION REQUEST to UE-1            §6.4.3.1 step 3
-//!   → UE-1 accepts, answering with its own Layer-2 ID          §6.4.3.1 step 5a
-//!   → UE-2 applies the accept and its link becomes Active      §6.4.3.1 step 4/5
-//! the relay forwards a payload from UE-1 to UE-2               §6.4.3.10
+//! #141, UE-to-UE:
+//!   UE-1 announces (Model A)                                   TS 23.304 §6.3.1.2 step 3a
+//!     → UE-2 decodes it, matches its filter, records UE-1              §6.3.1.2 step 4b
+//!   UE-2 sends a DIRECT COMMUNICATION REQUEST to UE-1                  §6.4.3.1 step 3
+//!     → UE-1 accepts, answering with its own Layer-2 ID                §6.4.3.1 step 5a
+//!     → UE-2 applies the accept and its link becomes Active            §6.4.3.1 step 4/5
+//!   the relay forwards a payload from UE-1 to UE-2                      §6.4.3.10
+//!
+//! #190, UE-to-Network:
+//!   the relay announces its Relay Service Code                          §6.3.2
+//!     → the remote UE discovers it and opens a unicast link             §6.4.3.1
+//!   each declares its ue-Type-r17 to the network              TS 38.331 §6.2.2
+//!   the gNB signals the relay's SRAP bearer mapping                    §5.3.5.17
+//!   the remote UE's payload goes through the relay
+//!     → adapted through SRAP, with the gNB-assigned local Remote UE ID
+//!                                              TS 38.351, TS 38.300 §16.12.2.1
+//!     → and submitted on the relay's OWN Uu connection                 §16.12.2.1
 //! ```
 //!
 //! # What makes these assertions load-bearing
 //!
-//! Each assertion is on a value **only reachable by having decoded a peer's bytes**:
+//! Each is on a value **only reachable by having decoded a peer's bytes, or by having gone
+//! through the adaptation layer**:
 //!
 //! * `link_peer_l2_id` holds the peer's Layer-2 ID, which TS 23.304 §6.4.3.1 step 4 says
 //!   the initiator "obtains" from what the responder sent. A UE that faked a handshake by
@@ -25,6 +38,10 @@
 //! * `relay_forwarded_octets` is incremented only inside `RelayForwarder::forward`,
 //!   which consults the live link table — so a non-zero count proves both that the relay
 //!   ran and that the link it forwarded over was really established.
+//! * the **payload recovered from the SRAP PDU at the relay's Uu boundary**, and the
+//!   **local Remote UE ID in its header**: a UE-to-UE relay produces no `RelayedUplink` at
+//!   all, and a relay with no network-signalled mapping refuses to invent an identity, so
+//!   neither value exists unless the whole #190 path ran.
 //!
 //! The old facade could satisfy none of them: `EstablishPc5Link` set `Active` on the line
 //! after `Establishing` with no peer involved, discovery was a `bool`, and `RelayData`
@@ -38,16 +55,29 @@
 //! sidelink carrier. So this test proves the *procedures* interoperate, not that any
 //! PHY/MAC would carry them. That is the same arrangement the #136 SL-PRS stimulus uses
 //! (it models propagation from geometry), and it is stated here rather than implied
-//! because the startup wording this issue updated says the same thing.
+//! because the startup wording says the same thing.
+//!
+//! **The relay's Uu leg is SRB1, not a numbered Uu relay RLC channel.** TS 38.300
+//! §16.12.2.1 puts SRAP above RLC on the Uu hop, and this tree has no MAC multiplexing for
+//! a numbered relay RLC channel — so the SRAP **header and adaptation are real** while the
+//! channel carrying them is the one that exists. See `RrcTask::handle_relayed_uplink`.
+//!
+//! **No gNB is in this process.** The relay's SRAP mapping is injected as the message the
+//! UE's RRC task sends on decoding an `sl-L2RelayUE-Config`; that the gNB *builds* that IE
+//! and that it survives UPER are covered by `nextgsim-gnb::rrc::sidelink` and
+//! `nextgsim-rrc::procedures::sidelink_relay_config` respectively. What this file covers is
+//! the effect of it arriving.
 //!
 //! **This file only compiles under `--features sidelink`**, like `ranging_report_e2e.rs`,
-//! and is run by the `Sidelink facade (feature-gated)` CI job.
+//! and is run by the `sidelink-pc5` CI job.
 
 #![cfg(feature = "sidelink")]
 
 use nextgsim_common::config::{ProseConfig, UeConfig};
 use nextgsim_ue::sidelink::{Pc5UnicastState, ProseL2Id};
-use nextgsim_ue::tasks::{SidelinkMessage, TaskHandle, TaskMessage, UeTaskBase};
+use nextgsim_ue::tasks::{
+    RrcMessage, SidelinkMessage, SidelinkRelayRole, TaskHandle, TaskMessage, UeTaskBase,
+};
 use nextgsim_ue::SidelinkTask;
 use tokio::sync::mpsc;
 
@@ -81,6 +111,8 @@ fn prose_config(local_l2_id: u32, app_code: u32, relay_service_code: Option<u32>
             prose_app_code: app_code,
             discovery_model: "a".to_string(),
             relay_service_code,
+            // UE-to-UE by default; `u2n_relay_config` overrides it (issue #190).
+            ue_to_network_relay: false,
             rx_interested_freqs: vec![1],
             peer_timeout_ms: 5_000,
         }),
@@ -95,18 +127,27 @@ struct SidelinkUe {
     inbox: TaskHandle<SidelinkMessage>,
     /// The receiving end, drained by [`Self::drain`].
     rx: mpsc::Receiver<TaskMessage<SidelinkMessage>>,
+    /// What this UE sent towards its own RRC task — i.e. up its Uu leg.
+    ///
+    /// Drained rather than discarded since issue #190: the UE-to-Network relay's whole
+    /// point is that a remote UE's traffic leaves on the **relay's Uu connection**, which
+    /// is an `RrcMessage::RelayedUplink`. A test that dropped this channel could not tell
+    /// a relay that carried the traffic from one that adapted it and threw it away.
+    rrc_rx: mpsc::Receiver<TaskMessage<RrcMessage>>,
+    /// SRAP PDUs seen on the Uu leg so far, accumulated by [`Self::drain_uu`].
+    relayed_uplinks: Vec<(u32, Vec<u8>)>,
+    /// The most recent `ue-Type-r17` role declared. `Some(None)` means a request was sent
+    /// declaring no role, which is different from no request at all.
+    declared_role: Option<Option<SidelinkRelayRole>>,
 }
 
 impl SidelinkUe {
     fn new(config: UeConfig) -> Self {
         let (tx, rx) = mpsc::channel::<TaskMessage<SidelinkMessage>>(64);
-        // The task needs a `UeTaskBase`. Its RRC handle is a channel nothing drains here:
-        // this test is about the PC5 exchange, and the RRC `SidelinkUEInformation` half
-        // has its own coverage in `nextgsim-rrc` and in the gNB. A full channel would
-        // block, so it is generously sized.
         let (app_tx, _app_rx) = mpsc::channel(64);
         let (nas_tx, _nas_rx) = mpsc::channel(64);
-        let (rrc_tx, _rrc_rx) = mpsc::channel(64);
+        // Drained by `take_relayed_uplinks` (issue #190): this is the relay's Uu leg.
+        let (rrc_tx, rrc_rx) = mpsc::channel(64);
         let (rls_tx, _rls_rx) = mpsc::channel(64);
         let task_base = UeTaskBase {
             config: std::sync::Arc::new(config),
@@ -128,7 +169,58 @@ impl SidelinkUe {
             task: SidelinkTask::new(task_base),
             inbox: TaskHandle::new(tx),
             rx,
+            rrc_rx,
+            relayed_uplinks: Vec::new(),
+            declared_role: None,
         }
+    }
+
+    /// Drains everything this UE has sent up its Uu leg into the two buckets the tests read.
+    ///
+    /// One drain rather than two accessors, because a `try_recv` loop consumes the channel:
+    /// two independent drainers would have the first to run steal the other's messages, and
+    /// the symptom would be a test failing for a reason that is not the code's.
+    fn drain_uu(&mut self) {
+        while let Ok(msg) = self.rrc_rx.try_recv() {
+            match msg {
+                TaskMessage::Message(RrcMessage::RelayedUplink { remote_l2_id, pdu }) => {
+                    self.relayed_uplinks.push((remote_l2_id, pdu));
+                }
+                TaskMessage::Message(RrcMessage::SidelinkInterestChanged {
+                    relay_role, ..
+                }) => {
+                    self.declared_role = Some(relay_role);
+                }
+                // Anything else is a message this test does not reason about, and absorbing
+                // it is right: the sidelink task legitimately sends others.
+                _ => {}
+            }
+        }
+    }
+
+    /// Every SRAP PDU this UE has sent up its own Uu connection, as
+    /// `(remote_l2_id, pdu)`, and clears the record (issue #190).
+    ///
+    /// This is the far end of the relay leg. A non-empty result proves the relay adapted a
+    /// remote UE's payload AND handed it to its Uu leg — neither of which a UE-to-UE relay
+    /// does.
+    fn take_relayed_uplinks(&mut self) -> Vec<(u32, Vec<u8>)> {
+        self.drain_uu();
+        std::mem::take(&mut self.relayed_uplinks)
+    }
+
+    /// The `ue-Type-r17` relay role this UE has declared to the network, from the most
+    /// recent `SidelinkInterestChanged` it sent (issue #190).
+    ///
+    /// Read off the real message rather than from the task's internals, because the role
+    /// only matters if it reaches RRC — that is what puts it on the wire.
+    ///
+    /// `None` covers both "no request has been sent" and "one was sent declaring no role":
+    /// in each case the gNB is not being asked for relay resources, which is the thing under
+    /// test.
+    fn declared_relay_role(&mut self) -> Option<SidelinkRelayRole> {
+        self.drain_uu();
+        self.declared_role.flatten()
     }
 
     /// Takes every message waiting in this UE's inbox and feeds it to the REAL task
@@ -441,6 +533,332 @@ async fn releasing_the_pc5_link_stops_the_relay_forwarding() {
         relay.task.relay_forwarded_octets(),
         4,
         "the counter must not have moved: the link to the destination is released"
+    );
+}
+
+// ── Issue #190: L2 UE-to-Network relay, end to end ───────────────────────────────
+
+/// A UE configuration for a UE-to-Network relay: it serves an RSC **and** sets
+/// `ue_to_network_relay`, which is what selects the L2 U2N architecture over UE-to-UE
+/// (issue #190).
+fn u2n_relay_config(local_l2_id: u32) -> UeConfig {
+    let mut config = prose_config(local_l2_id, APP_CODE, Some(RELAY_SERVICE_CODE));
+    if let Some(prose) = config.prose_config.as_mut() {
+        prose.ue_to_network_relay = true;
+    }
+    config
+}
+
+/// **The criterion-4 chain**: remote UE → relay UE → the relay's Uu leg towards the gNB,
+/// with the payload read back at the far end.
+///
+/// ```text
+/// relay announces, carrying its Relay Service Code       TS 23.304 §6.3.2
+///   → remote UE discovers it and opens a unicast link    §6.4.3.1
+/// the gNB signals the relay's SRAP bearer mapping        TS 38.331 §5.3.5.17
+/// the remote UE sends a payload through the relay
+///   → the relay adapts it through SRAP                   TS 38.351, §16.12.2.1
+///   → and submits it on its OWN Uu connection            §16.12.2.1
+/// ```
+///
+/// # What makes the assertion load-bearing
+///
+/// The payload is recovered from the SRAP PDU **at the relay's Uu boundary**, and it is
+/// checked that the SRAP header carries the local Remote UE ID the network assigned. Both
+/// are values only reachable by having gone through the adaptation layer:
+///
+/// * a UE-to-UE relay would have produced `RelayForwardDecision::Forward` and sent a
+///   `RelayPayload` over PC5 — no `RelayedUplink` at all;
+/// * a relay with no signalled SRAP mapping refuses to invent a local Remote UE ID, so the
+///   header could not exist;
+/// * the payload equality proves SRAP carried the end-to-end PDU unaltered, which is what
+///   "PDCP is terminated at the remote UE and the gNB" requires.
+#[tokio::test]
+async fn a_remote_ue_reaches_the_network_through_a_relays_srap_adaptation_layer() {
+    use nextgsim_rlc::srap::{SrapHeader, SRAP_HEADER_LEN};
+
+    // The local Remote UE ID the network assigns. Deliberately not 0 or 1, so a default or
+    // an off-by-one cannot produce it.
+    const LOCAL_REMOTE_UE_ID: u8 = 42;
+    const PAYLOAD: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0x5A, 0xA5, 0x01];
+
+    let mut relay = SidelinkUe::new(u2n_relay_config(RELAY_L2_ID));
+    let mut remote = SidelinkUe::new(prose_config(UE2_L2_ID, APP_CODE, None));
+    relay.task.set_pc5_transmitter(remote.inbox.clone());
+    remote.task.set_pc5_transmitter(relay.inbox.clone());
+
+    let relay_id = ProseL2Id::new(RELAY_L2_ID);
+    let remote_id = ProseL2Id::new(UE2_L2_ID);
+
+    // --- The relay announces; the remote UE discovers it and opens the link on its own ---
+    relay
+        .task
+        .handle_message(SidelinkMessage::StartDiscovery)
+        .await;
+    assert_eq!(remote.drain().await, 1, "the announcement arrived");
+    assert_eq!(relay.drain().await, 1, "the relay received the request");
+    assert_eq!(remote.drain().await, 1, "the remote UE received the accept");
+    assert_eq!(
+        relay.task.link_state(remote_id),
+        Some(Pc5UnicastState::Active),
+        "precondition: the relay holds a live PC5 link to the remote UE"
+    );
+
+    // --- The relay declares itself a relay to the network (`ue-Type-r17`) ---
+    //
+    // Read off the real `SidelinkInterestChanged` the task sent. This is what asks the gNB
+    // for relay resources, so if it is absent the whole network-side configuration has no
+    // trigger.
+    assert_eq!(
+        relay.declared_relay_role(),
+        Some(SidelinkRelayRole::Relay),
+        "the relay must declare ue-Type-r17 = relayUE, or the gNB is never asked for \
+         relay resources"
+    );
+
+    // --- The network signals the relay's SRAP bearer mapping (TS 38.331 §5.3.5.17) ---
+    //
+    // Sent as the message the UE's RRC task sends on decoding an `sl-L2RelayUE-Config`.
+    // `nextgsim-gnb`'s `relay_configs_for_remote_ue` builds that IE and
+    // `nextgsim-rrc`'s round-trip tests prove it survives UPER; what this drives is the
+    // effect of it arriving.
+    relay
+        .task
+        .handle_message(SidelinkMessage::SrapMappingConfigured {
+            remote_l2_id: UE2_L2_ID,
+            local_remote_ue_id: LOCAL_REMOTE_UE_ID,
+            is_relay: true,
+        })
+        .await;
+    assert_eq!(
+        relay.task.srap_local_id_for(UE2_L2_ID),
+        Some(LOCAL_REMOTE_UE_ID),
+        "the relay must hold the local Remote UE ID the network assigned"
+    );
+    assert_eq!(
+        relay.task.srap_adapted_payload_octets(),
+        0,
+        "precondition: nothing adapted yet"
+    );
+
+    // --- The remote UE's traffic goes through the relay, towards the network ---
+    //
+    // The destination is UE-1, a Layer-2 ID the relay holds NO link to — deliberately,
+    // because a UE-to-Network relay does not forward to a peer. A UE-to-UE relay would drop
+    // this.
+    relay
+        .task
+        .handle_message(SidelinkMessage::RelayPayload {
+            source_l2_id: UE2_L2_ID,
+            destination_l2_id: UE1_L2_ID,
+            payload: PAYLOAD.to_vec(),
+        })
+        .await;
+
+    // The SRAP layer carried it.
+    assert_eq!(
+        relay.task.srap_adapted_payload_octets(),
+        PAYLOAD.len() as u64,
+        "SRAP must have adapted the remote UE's payload"
+    );
+    assert_eq!(relay.task.srap_submitted_pdus(), 1);
+
+    // --- The far end: the SRAP PDU left on the RELAY's own Uu connection ---
+    let uplinks = relay.take_relayed_uplinks();
+    assert_eq!(
+        uplinks.len(),
+        1,
+        "exactly one SRAP PDU must have left the relay's Uu leg; a UE-to-UE relay would \
+         have sent a PC5 RelayPayload and none of these"
+    );
+    let (reported_remote, pdu) = &uplinks[0];
+    assert_eq!(*reported_remote, UE2_L2_ID);
+    assert_eq!(pdu.len(), SRAP_HEADER_LEN + PAYLOAD.len());
+
+    // **THE assertion**: the payload survives the adaptation layer, and the header names
+    // the remote UE by the identity the NETWORK assigned (TS 38.300 §16.12.2.1).
+    let (header, carried) = SrapHeader::decode(pdu).expect("the relay built a decodable SRAP PDU");
+    assert_eq!(
+        header.local_remote_ue_id, LOCAL_REMOTE_UE_ID,
+        "the SRAP header must carry the gNB-assigned local Remote UE ID, which is what the \
+         gNB correlates the traffic by"
+    );
+    assert_eq!(
+        carried, PAYLOAD,
+        "the remote UE's end-to-end payload must survive the relay unaltered: PDCP is \
+         terminated at the remote UE and the gNB, not at the relay"
+    );
+
+    // And the relay forwarded NOTHING over PC5 — the traffic went to the network, not to a
+    // peer. Without this the test would pass against a relay that did both.
+    assert_eq!(
+        remote.drain().await,
+        0,
+        "nothing may have gone back out over PC5: the destination was the network"
+    );
+}
+
+/// A relay with **no signalled SRAP mapping** adapts nothing, even with a live PC5 link.
+///
+/// The guard that proves the mapping really comes from the network: without it the E2E
+/// above would pass against a relay that invented a local Remote UE ID, which would give
+/// the gNB a header naming a remote UE it has assigned no identity to.
+#[tokio::test]
+async fn a_relay_with_no_signalled_srap_mapping_adapts_nothing() {
+    let mut relay = SidelinkUe::new(u2n_relay_config(RELAY_L2_ID));
+    let mut remote = SidelinkUe::new(prose_config(UE2_L2_ID, APP_CODE, None));
+    relay.task.set_pc5_transmitter(remote.inbox.clone());
+    remote.task.set_pc5_transmitter(relay.inbox.clone());
+
+    // Establish the link, exactly as above.
+    relay
+        .task
+        .handle_message(SidelinkMessage::StartDiscovery)
+        .await;
+    remote.drain().await;
+    relay.drain().await;
+    remote.drain().await;
+    assert_eq!(
+        relay.task.link_state(ProseL2Id::new(UE2_L2_ID)),
+        Some(Pc5UnicastState::Active),
+        "precondition: the link is up, so the ONLY thing missing is the mapping"
+    );
+    assert_eq!(relay.task.srap_local_id_for(UE2_L2_ID), None);
+
+    // No `SrapMappingConfigured` is sent.
+    relay
+        .task
+        .handle_message(SidelinkMessage::RelayPayload {
+            source_l2_id: UE2_L2_ID,
+            destination_l2_id: UE1_L2_ID,
+            payload: vec![0xAA; 8],
+        })
+        .await;
+
+    assert_eq!(
+        relay.task.srap_adapted_payload_octets(),
+        0,
+        "with no network-signalled mapping the relay must adapt nothing rather than \
+         inventing a local Remote UE ID"
+    );
+    assert!(
+        relay.take_relayed_uplinks().is_empty(),
+        "and nothing may reach the relay's Uu leg"
+    );
+}
+
+/// Releasing the remote UE's PC5 link stops the adaptation, so the UE-to-Network path
+/// consults the LIVE link state.
+///
+/// Without this, the E2E would pass against a relay that adapted traffic from any UE it had
+/// ever held a link to.
+#[tokio::test]
+async fn releasing_the_remote_ues_link_stops_the_srap_adaptation() {
+    let mut relay = SidelinkUe::new(u2n_relay_config(RELAY_L2_ID));
+    let mut remote = SidelinkUe::new(prose_config(UE2_L2_ID, APP_CODE, None));
+    relay.task.set_pc5_transmitter(remote.inbox.clone());
+    remote.task.set_pc5_transmitter(relay.inbox.clone());
+
+    relay
+        .task
+        .handle_message(SidelinkMessage::StartDiscovery)
+        .await;
+    remote.drain().await;
+    relay.drain().await;
+    remote.drain().await;
+    relay
+        .task
+        .handle_message(SidelinkMessage::SrapMappingConfigured {
+            remote_l2_id: UE2_L2_ID,
+            local_remote_ue_id: 7,
+            is_relay: true,
+        })
+        .await;
+
+    // One successful adaptation, so the counter is known to move at all.
+    relay
+        .task
+        .handle_message(SidelinkMessage::RelayPayload {
+            source_l2_id: UE2_L2_ID,
+            destination_l2_id: UE1_L2_ID,
+            payload: vec![0xAA; 4],
+        })
+        .await;
+    assert_eq!(relay.task.srap_adapted_payload_octets(), 4);
+    assert_eq!(relay.take_relayed_uplinks().len(), 1);
+
+    // --- The remote UE releases its link ---
+    remote
+        .task
+        .handle_message(SidelinkMessage::ReleasePc5Link {
+            peer_ue_id: u64::from(RELAY_L2_ID),
+        })
+        .await;
+    assert_eq!(relay.drain().await, 1, "the relay received the release");
+
+    relay
+        .task
+        .handle_message(SidelinkMessage::RelayPayload {
+            source_l2_id: UE2_L2_ID,
+            destination_l2_id: UE1_L2_ID,
+            payload: vec![0xAA; 4],
+        })
+        .await;
+    assert_eq!(
+        relay.task.srap_adapted_payload_octets(),
+        4,
+        "the counter must not have moved: the remote UE's link is released, so it is no \
+         longer a served remote UE"
+    );
+    assert!(
+        relay.take_relayed_uplinks().is_empty(),
+        "and nothing further may reach the Uu leg"
+    );
+}
+
+/// A UE that has discovered and linked to a relay declares itself a **remote** UE, which is
+/// what makes the gNB assign it a local Remote UE ID (TS 38.300 §16.12.2.1).
+///
+/// The other half of the `ue-Type-r17` trigger: without it a remote UE would never be given
+/// the identity it must write in its own SRAP headers.
+#[tokio::test]
+async fn a_ue_linked_to_a_relay_declares_itself_a_remote_ue() {
+    let mut relay = SidelinkUe::new(u2n_relay_config(RELAY_L2_ID));
+    let mut remote = SidelinkUe::new(prose_config(UE2_L2_ID, APP_CODE, None));
+    relay.task.set_pc5_transmitter(remote.inbox.clone());
+    remote.task.set_pc5_transmitter(relay.inbox.clone());
+
+    // Before discovering anything, the UE claims nothing: it is a plain PC5 UE.
+    remote
+        .task
+        .handle_message(SidelinkMessage::StartDiscovery)
+        .await;
+    assert_eq!(
+        remote.declared_relay_role(),
+        None,
+        "a UE with no link to a relay must not claim to be a remote UE"
+    );
+    relay.drain().await;
+
+    // Now the relay announces and the link comes up.
+    relay
+        .task
+        .handle_message(SidelinkMessage::StartDiscovery)
+        .await;
+    remote.drain().await;
+    relay.drain().await;
+    remote.drain().await;
+    assert_eq!(
+        remote.task.link_state(ProseL2Id::new(RELAY_L2_ID)),
+        Some(Pc5UnicastState::Active),
+        "precondition: the remote UE holds a link to the relay"
+    );
+
+    assert_eq!(
+        remote.declared_relay_role(),
+        Some(SidelinkRelayRole::Remote),
+        "a UE holding a live link to a relay must declare ue-Type-r17 = remoteUE, or the \
+         gNB never assigns it a local Remote UE ID"
     );
 }
 

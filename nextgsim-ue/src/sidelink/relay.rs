@@ -23,18 +23,26 @@
 //! established by a PC5-S handshake, because that is the only thing that puts a peer in
 //! [`Pc5LinkTable::active_peers`].
 //!
-//! # Scope: layer-2 UE-to-UE relay, not UE-to-Network relay
+//! # Two relay architectures, and how the forwarding decision differs
 //!
-//! What is implemented is **UE-to-UE** relaying: UE-1 → relay → UE-2, all three over
-//! PC5. TS 23.304 §5.4.2's **UE-to-Network** relay — a remote UE reaching the 5GC
-//! *through* a relay UE's Uu connection — is deliberately not, and issue #141's
-//! criterion is scoped to "a two-UE relay forwards data", which is the UE-to-UE case.
+//! **UE-to-UE relay** (TS 23.304 §6.4.3.10, issue #141): UE-1 → relay → UE-2, all three
+//! over PC5. The relay forwards onto *another PC5 link*, so the decision turns on whether
+//! it holds a usable link to the **destination**.
 //!
-//! UE-to-Network relaying needs an adaptation layer (SRAP, TS 38.351) that multiplexes
-//! remote-UE bearers onto the relay's own Uu RLC channels, a relay-side bearer mapping
-//! signalled by the gNB, and remote-UE identity handling in the relay's RRC — none of
-//! which exists in this tree, and none of which this module pretends to. It is filed as
-//! **issue #190** rather than stubbed.
+//! **UE-to-Network relay** (TS 23.304 §5.4.2, TS 38.300 §16.12.2.1, issue #190): a remote
+//! UE reaching the 5GC *through* the relay's own Uu connection. The relay does not forward
+//! onto a PC5 link at all — it adapts the traffic through the SRAP sublayer
+//! (`nextgsim_rlc::srap`) and submits it to one of its own Uu relay RLC channels. So the
+//! link-table check that is right for UE-to-UE relaying is *wrong* here, and would drop
+//! every packet: the destination is the network, which is not a PC5 peer. What is checked
+//! instead is that the **source** is a remote UE this relay serves. See
+//! [`RelayRole::is_ue_to_network`], which is where that fork is named.
+//!
+//! Issue #141 scoped its criterion to "a two-UE relay forwards data" and mapped
+//! `RelayMode::UeToNetworkRelay` to [`RelayRole::None`] with a `warn!`, because the SRAP
+//! layer did not exist. Issue #190 built it, so the variant is real and the `warn!` is
+//! gone. **L3 relay** remains unimplemented and still warns: it forwards IP packets rather
+//! than adapting Layer-2 bearers, and there is no IP forwarding plane in this tree.
 //!
 //! # Why a decision type rather than a `bool`
 //!
@@ -48,7 +56,7 @@ use tracing::{debug, warn};
 use crate::sidelink::link::Pc5LinkTable;
 use crate::sidelink::pc5s::ProseL2Id;
 
-/// Which relay role this UE is playing (TS 23.304 §5.4.2, TS 38.300 §16.9).
+/// Which relay role this UE is playing (TS 23.304 §5.4.2, TS 38.300 §16.9, §16.12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayRole {
     /// Not relaying. Traffic that is not for this UE is dropped.
@@ -56,6 +64,31 @@ pub enum RelayRole {
     /// Layer-2 UE-to-UE relay: forwards PC5 traffic between two remote UEs
     /// (TS 23.304 §6.4.3.10, TS 38.300 §16.9).
     L2UeToUe,
+    /// Layer-2 UE-to-Network relay: carries a remote UE's end-to-end Uu bearers to the
+    /// gNB across its own Uu connection (TS 23.304 §5.4.2, TS 38.300 §16.12.2.1;
+    /// issue #190).
+    ///
+    /// Distinct from [`Self::L2UeToUe`] in **where the traffic goes**, which is why it is a
+    /// separate variant rather than a flag: a UE-to-UE relay forwards onto another PC5 link,
+    /// while a UE-to-Network relay adapts the traffic through the SRAP sublayer
+    /// (`nextgsim_rlc::srap`) and submits it to one of its own Uu relay RLC channels. The
+    /// destination is the network, not a peer.
+    ///
+    /// Until issue #190 this variant did not exist and `RelayMode::UeToNetworkRelay` mapped
+    /// to [`Self::None`] with a `warn!`, because the SRAP layer it needs was absent.
+    L2UeToNetwork,
+}
+
+impl RelayRole {
+    /// Whether this role carries traffic towards the **network** rather than towards
+    /// another PC5 peer (TS 38.300 §16.12.2.1).
+    ///
+    /// Named because the forwarding decision differs on exactly this: a UE-to-Network relay
+    /// has no PC5 link to the "destination" — the destination is the 5GC — so the
+    /// link-table check that is correct for UE-to-UE relaying would drop every packet.
+    pub fn is_ue_to_network(self) -> bool {
+        matches!(self, Self::L2UeToNetwork)
+    }
 }
 
 /// What a relay decided to do with a payload.
@@ -90,12 +123,43 @@ pub enum RelayForwardDecision {
     DeliverLocally,
     /// An empty payload. Forwarding nothing would consume a PC5 grant to no purpose.
     EmptyPayload,
+    /// Adapt `payload_len` octets from the remote UE towards the **network**, through the
+    /// SRAP sublayer (TS 38.300 §16.12.2.1; issue #190).
+    ///
+    /// The uplink direction of L2 UE-to-Network relaying. Distinct from [`Self::Forward`]
+    /// because there is no `next_hop`: the traffic leaves on one of this relay's own Uu
+    /// relay RLC channels rather than on a PC5 link to a peer, so a decision carrying a
+    /// peer Layer-2 ID would name a hop that does not exist.
+    AdaptToNetwork {
+        /// The remote UE the payload came from, by PC5 Layer-2 ID.
+        ///
+        /// Carried so the caller can look up the local Remote UE ID the gNB assigned it —
+        /// the value that goes in the SRAP header.
+        remote_l2_id: ProseL2Id,
+        /// How many octets are adapted.
+        payload_len: usize,
+    },
+    /// This UE is a UE-to-Network relay, but the source is not a remote UE it serves.
+    ///
+    /// Distinguished from [`Self::NoLinkToDestination`] because the missing thing is
+    /// different: there a *destination* was unreachable, here a *source* is not one this
+    /// relay carries traffic for. A relay that adapted traffic from an unserved UE would
+    /// give the gNB a SRAP header naming a remote UE it has assigned no identity to.
+    NotAServedRemoteUe {
+        /// The source that is not served here.
+        source: ProseL2Id,
+    },
 }
 
 impl RelayForwardDecision {
-    /// Whether the payload is being forwarded.
+    /// Whether the payload is being forwarded onto another PC5 link.
     pub fn is_forwarded(&self) -> bool {
         matches!(self, Self::Forward { .. })
+    }
+
+    /// Whether the payload is being adapted towards the network (issue #190).
+    pub fn is_adapted_to_network(&self) -> bool {
+        matches!(self, Self::AdaptToNetwork { .. })
     }
 
     /// The next hop, when the payload is being forwarded.
@@ -218,6 +282,37 @@ impl RelayForwarder {
 
         if payload.is_empty() {
             return RelayForwardDecision::EmptyPayload;
+        }
+
+        // **UE-to-Network relaying diverges here** (issue #190, TS 38.300 §16.12.2.1). The
+        // destination is the 5GC, which this relay reaches over its own Uu connection — so
+        // there is no PC5 link to the destination to check, and the link-table test below
+        // would drop every packet. What matters instead is that the SOURCE is a remote UE
+        // this relay actually serves: the relay holds a live PC5 link to it, and the gNB has
+        // assigned it a local Remote UE ID.
+        if self.role.is_ue_to_network() {
+            if !links.active_peers().contains(&source) {
+                self.dropped_no_link += 1;
+                warn!(
+                    "PC5 relay: {} holds no usable PC5 link to {source}, so it is not a \
+                     served remote UE; dropping {} octet(s) bound for the network",
+                    self.local_l2_id,
+                    payload.len()
+                );
+                return RelayForwardDecision::NotAServedRemoteUe { source };
+            }
+            self.forwarded_octets += payload.len() as u64;
+            self.forwarded_count += 1;
+            debug!(
+                "PC5 relay: {} adapting {} octet(s) from remote UE {source} towards the \
+                 network",
+                self.local_l2_id,
+                payload.len()
+            );
+            return RelayForwardDecision::AdaptToNetwork {
+                remote_l2_id: source,
+                payload_len: payload.len(),
+            };
         }
 
         // The destination has to be a peer this UE holds a USABLE link to. That is the
@@ -392,6 +487,112 @@ mod tests {
             RelayForwardDecision::EmptyPayload
         );
         assert_eq!(relay.forwarded_count(), 0);
+    }
+
+    // ── Issue #190: UE-to-Network relaying ───────────────────────────────────────
+
+    /// A UE-to-Network relay adapts a served remote UE's traffic towards the network, and
+    /// the decision names the remote UE rather than a next hop.
+    ///
+    /// The `AdaptToNetwork` variant is the positive observable: a UE-to-UE relay could
+    /// never produce it, so this cannot pass against the #141 forwarding path.
+    #[test]
+    fn a_ue_to_network_relay_adapts_a_served_remote_ues_traffic_towards_the_network() {
+        // A link to UE-1, which is the remote UE this relay serves.
+        let links = table_with_active_link_to(relay_id(), ue1());
+        let mut relay = RelayForwarder::new(relay_id());
+        relay.set_role(RelayRole::L2UeToNetwork);
+        assert!(relay.role().is_ue_to_network());
+
+        // The destination is a network address, NOT a PC5 peer -- and deliberately one the
+        // relay holds no link to, because that is the whole point: a UE-to-UE relay would
+        // drop this.
+        let decision = relay.forward(&links, ue1(), ue3(), &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            decision,
+            RelayForwardDecision::AdaptToNetwork {
+                remote_l2_id: ue1(),
+                payload_len: 4,
+            }
+        );
+        assert!(decision.is_adapted_to_network());
+        assert!(
+            !decision.is_forwarded(),
+            "adapting to the network is not forwarding onto a PC5 link"
+        );
+        assert_eq!(relay.forwarded_octets(), 4);
+        assert_eq!(relay.dropped_no_link(), 0);
+    }
+
+    /// The same payload, on a UE-to-**UE** relay, is DROPPED — because there is no link to
+    /// the destination.
+    ///
+    /// This is the contrast that makes the test above load-bearing: it proves the two roles
+    /// take genuinely different decisions rather than the new variant being cosmetic.
+    #[test]
+    fn a_ue_to_ue_relay_drops_what_a_ue_to_network_relay_adapts() {
+        let links = table_with_active_link_to(relay_id(), ue1());
+        let mut relay = RelayForwarder::new(relay_id());
+        relay.set_role(RelayRole::L2UeToUe);
+        assert!(!relay.role().is_ue_to_network());
+
+        assert_eq!(
+            relay.forward(&links, ue1(), ue3(), &[0xAA; 4]),
+            RelayForwardDecision::NoLinkToDestination { destination: ue3() }
+        );
+        assert_eq!(relay.forwarded_octets(), 0);
+    }
+
+    /// A UE-to-Network relay refuses traffic from a UE it does NOT serve: the gNB has
+    /// assigned no local Remote UE ID for it, so there is no SRAP header to write.
+    #[test]
+    fn a_ue_to_network_relay_refuses_an_unserved_source() {
+        // A link to UE-1 only; the traffic claims to come from UE-2.
+        let links = table_with_active_link_to(relay_id(), ue1());
+        let mut relay = RelayForwarder::new(relay_id());
+        relay.set_role(RelayRole::L2UeToNetwork);
+
+        let decision = relay.forward(&links, ue2(), ue3(), &[0xAA; 4]);
+        assert_eq!(
+            decision,
+            RelayForwardDecision::NotAServedRemoteUe { source: ue2() }
+        );
+        assert_eq!(relay.forwarded_octets(), 0);
+        assert_eq!(relay.dropped_no_link(), 1);
+    }
+
+    /// Releasing the remote UE's PC5 link stops the adaptation. The guard that proves the
+    /// UE-to-Network path consults the LIVE link state, not a peer list recorded once.
+    #[test]
+    fn releasing_the_remote_ues_link_stops_the_adaptation() {
+        let mut links = table_with_active_link_to(relay_id(), ue1());
+        let mut relay = RelayForwarder::new(relay_id());
+        relay.set_role(RelayRole::L2UeToNetwork);
+
+        assert!(relay
+            .forward(&links, ue1(), ue3(), &[0xAA; 4])
+            .is_adapted_to_network());
+
+        let _ = links.get_mut(ue1()).expect("present").build_release();
+
+        assert_eq!(
+            relay.forward(&links, ue1(), ue3(), &[0xAA; 4]),
+            RelayForwardDecision::NotAServedRemoteUe { source: ue1() }
+        );
+        // The first adaptation still counted; the second did not.
+        assert_eq!(relay.forwarded_count(), 1);
+    }
+
+    /// A UE that is not a relay at all adapts nothing, even towards the network.
+    #[test]
+    fn a_non_relay_ue_does_not_adapt_towards_the_network() {
+        let links = table_with_active_link_to(relay_id(), ue1());
+        let mut not_a_relay = RelayForwarder::new(relay_id());
+        assert_eq!(
+            not_a_relay.forward(&links, ue1(), ue3(), &[0xAA; 4]),
+            RelayForwardDecision::NotARelay
+        );
+        assert_eq!(not_a_relay.forwarded_octets(), 0);
     }
 
     /// Octet counts accumulate across forwards, so an operator reading the counter sees

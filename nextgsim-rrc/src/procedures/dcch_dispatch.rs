@@ -524,6 +524,7 @@ mod tests {
                 destination_l2_id: PEER,
                 cast_type: SlCastType::Unicast,
             }],
+            ue_type: None,
         })
         .expect("encode");
 
@@ -582,6 +583,8 @@ mod tests {
             meas_config: None,
             ntn_config: None,
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
         })
         .expect("encode RRCReconfiguration");
         let resume = encode_rrc_resume(&fresh_rrc_resume_params(2, None).expect("resume params"))

@@ -44,7 +44,7 @@ use nextgsim_rrc::procedures::rrc_setup::{
     RrcEstablishmentCause as AsnEstablishmentCause, RrcSetupCompleteData, UeIdentity,
 };
 use nextgsim_rrc::procedures::scell_config::{encode_scell_config, ScellConfig};
-use nextgsim_rrc::procedures::sidelink_ue_information::SidelinkUeInformationParams;
+use nextgsim_rrc::procedures::sidelink_ue_information::{SidelinkUeInformationParams, SlUeType};
 use nextgsim_rrc::procedures::ue_capability::{
     encode_ue_capability_enquiry, parse_nr_capability_bands, parse_nr_capability_redcap, RatType,
     UeCapabilityEnquiryParams, UeCapabilityInformationData,
@@ -95,7 +95,10 @@ use super::connection::{
 };
 use super::handover::{measurement_report_from, GnbHandoverManager, HandoverDecision};
 use super::meas::a3_meas_config_params;
-use super::sidelink::{log_refusal, sl_config_for_request, SL_T400_MS};
+use super::sidelink::{
+    log_refusal, relay_configs_for_remote_ue, sl_config_for_relay, sl_config_for_request,
+    sl_rnti_for_ue, LocalRemoteUeIdAllocator, DEFAULT_SRAP_BEARER, SL_T400_MS,
+};
 use super::system_info::{
     encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
     release_cell_reselection_priorities, sib19_params,
@@ -153,6 +156,17 @@ pub struct RrcTask {
     /// the NGAP task before this task has any context for the UE at all -- the
     /// arriving UE's first message to the target IS the RRCReconfigurationComplete.
     pending_handover_arrivals: std::collections::HashSet<i32>,
+    /// The local Remote UE IDs assigned per relay UE, for L2 UE-to-Network relay
+    /// (TS 38.300 §16.12.2.1; issue #190).
+    ///
+    /// Keyed by the **relay** UE's `ue_id`, because the identity space is per relay:
+    /// §16.12.2.1 scopes the local Remote UE ID to the SRAP header between one relay and
+    /// the gNB, so two relays may each use ID 0 for different remote UEs. One shared
+    /// allocator would refuse the second relay's first remote UE for no reason.
+    ///
+    /// §16.12.2.1 makes collision avoidance the gNB's responsibility, which is why the
+    /// allocator lives on the network side and not on the relay.
+    relay_local_ue_ids: std::collections::HashMap<i32, LocalRemoteUeIdAllocator>,
 }
 
 /// The `condReconfigId` this gNB uses. One configuration per UE, so a fixed value is
@@ -225,6 +239,7 @@ impl RrcTask {
             scell_configured_ues: std::collections::HashSet::new(),
             cho_configured_ues: std::collections::HashSet::new(),
             pending_handover_arrivals: std::collections::HashSet::new(),
+            relay_local_ue_ids: std::collections::HashMap::new(),
             handover_manager: GnbHandoverManager::new(own_cell),
         }
     }
@@ -790,11 +805,95 @@ impl RrcTask {
             return;
         }
 
-        let sl_config = match sl_config_for_request(request) {
-            Ok(config) => config,
-            Err(refusal) => {
-                log_refusal(ue_id, &refusal);
-                return;
+        // **The L2 UE-to-Network relay branch** (issue #190). A UE that declared
+        // `ue-Type-r17` is asking for relay resources, not just PC5 ones, and the grant it
+        // gets differs in three ways: a Mode-1 SL-RNTI, a relay RLC channel, and — for a
+        // relay — the per-remote-UE SRAP bearer mapping of TS 38.300 §16.12.2.1.
+        //
+        // This is the **production caller** of `sl_config_for_relay` and
+        // `relay_configs_for_remote_ue`: the trigger is the UE's own declared role on the
+        // wire, so nothing here needs a network-side configuration flag naming which UE is
+        // a relay.
+        let (sl_config, sl_l2_relay_ue_config, sl_l2_remote_ue_config) = match request.ue_type {
+            None => {
+                // A plain PC5 UE: Mode 2, exactly as issue #141 granted.
+                match sl_config_for_request(request) {
+                    Ok(config) => (config, None, None),
+                    Err(refusal) => {
+                        log_refusal(ue_id, &refusal);
+                        return;
+                    }
+                }
+            }
+            Some(ue_type) => {
+                // The SL-RNTI this gNB schedules the relay's sidelink with. Derived from
+                // the UE id rather than allocated from a pool: this simulator has one RNTI
+                // space per UE already, and inventing a second allocator would let the two
+                // disagree about which UE a grant is for.
+                let sl_rnti = sl_rnti_for_ue(ue_id);
+                let sl_config = match sl_config_for_relay(request, sl_rnti) {
+                    Ok(config) => config,
+                    Err(refusal) => {
+                        log_refusal(ue_id, &refusal);
+                        return;
+                    }
+                };
+
+                // The remote UE this relay is serving is the destination it asked for
+                // transmission resources to: TS 38.331 §5.8.3.3's `sl-TxResourceReqList`
+                // names the peers, and for a relay UE the peer IS the remote UE.
+                //
+                // A declared relay with no destination has nobody to relay for, and a
+                // relay whose local-ID space is exhausted must not be given a colliding ID
+                // — §16.12.2.1 makes collision avoidance the gNB's job, and two remote UEs
+                // sharing an ID are indistinguishable in the SRAP header. Both cases still
+                // get the Mode-1 grant they asked for, with no mapping.
+                let assignment = request
+                    .tx_resource_requests
+                    .first()
+                    .copied()
+                    .and_then(|remote| {
+                        let allocator = self.relay_local_ue_ids.entry(ue_id).or_default();
+                        match allocator.assign(remote.destination_l2_id) {
+                            Some(local_id) => Some((remote.destination_l2_id, local_id)),
+                            None => {
+                                warn!(
+                                    "UE[{ue_id}] has no free local Remote UE ID for remote UE \
+                                     {:#08x}; granting no SRAP mapping",
+                                    remote.destination_l2_id
+                                );
+                                None
+                            }
+                        }
+                    });
+
+                match assignment {
+                    Some((remote_l2_id, local_remote_ue_id)) => {
+                        let (relay_config, remote_config) = relay_configs_for_remote_ue(
+                            remote_l2_id,
+                            local_remote_ue_id,
+                            // The end-to-end bearer being relayed: the default SRAP bearer
+                            // of TS 38.331 §9.2.5 (SRB1), because that is what the spec
+                            // names as the default and this gNB configures no other
+                            // end-to-end bearer for a remote UE.
+                            DEFAULT_SRAP_BEARER,
+                            sl_rnti,
+                        );
+                        info!(
+                            "UE[{ue_id}] declared {ue_type:?}: assigned local Remote UE ID \
+                             {local_remote_ue_id} for remote UE {remote_l2_id:#08x}"
+                        );
+                        // A relay is told the mapping to apply; a remote UE is told the
+                        // local ID to write. Which of the two IEs goes out is decided by
+                        // the role the UE declared, because sending both would tell one UE
+                        // it was simultaneously a relay and a remote UE.
+                        match ue_type {
+                            SlUeType::RelayUe => (sl_config, Some(relay_config), None),
+                            SlUeType::RemoteUe => (sl_config, None, Some(remote_config)),
+                        }
+                    }
+                    None => (sl_config, None, None),
+                }
             }
         };
 
@@ -817,6 +916,8 @@ impl RrcTask {
             meas_config: None,
             ntn_config: None,
             sl_config: Some(sl_config),
+            sl_l2_relay_ue_config,
+            sl_l2_remote_ue_config,
         };
 
         match encode_rrc_reconfiguration(&params) {
