@@ -313,6 +313,33 @@ pub(crate) fn parse_object_set(tokens: &[Token]) -> Result<(ObjectSet, usize)> {
     let mut additional_elements = vec![];
     let mut extension_token_count = 0;
     loop {
+        // LOCAL FIX (nextgsim #45): remember where this iteration started so a
+        // pass that consumes nothing can be reported as a parse error instead of
+        // spinning forever.
+        //
+        // Every `consumed += 1` below is guarded by an `expect_token`, and the
+        // element match arm can legally yield `None` while consuming zero tokens
+        // ("Empty Values permitted"). So a token that is none of {extension,
+        // set-ish value, object(-set) reference, comma, union, '}'} leaves
+        // `consumed` untouched and the loop retries the identical slice for
+        // ever: an unkillable-looking hang with no output and no error.
+        //
+        // This is what the 40-minute non-termination recorded against this issue
+        // actually was. The NRPPa schema extracted from the FLATTENED
+        // `38455-j20.txt` line-wraps long `--` comments, so a comment's tail
+        // ("set to the value "configure" --") survives as bare identifiers inside
+        // `PRSTRPItem`'s object set; the parser reached one, matched nothing and
+        // looped. A backtrace of the hung process lands here, in
+        // `parse_object_set`. Extracting from the `.docx` PL paragraphs instead
+        // (see `tools/nrppa-19.2.0.asn1`) keeps comments on one line and the same
+        // six modules compile in 1.17s -- so the schema was never the problem,
+        // this loop was.
+        //
+        // Failing loudly is strictly better than hanging: a caller that cannot
+        // make progress has hit malformed input, and `parse_definition` already
+        // reports parse errors with the offending token's line and column.
+        let iteration_start = consumed;
+
         if expect_token(&tokens[consumed..], Token::is_extension)? {
             extension_token_count += 1;
             if extension_token_count > 1 {
@@ -369,6 +396,15 @@ pub(crate) fn parse_object_set(tokens: &[Token]) -> Result<(ObjectSet, usize)> {
         if expect_token(&tokens[consumed..], Token::is_curly_end)? {
             consumed += 1;
             break;
+        }
+
+        // See the LOCAL FIX note at the top of this loop.
+        if consumed == iteration_start {
+            return Err(unexpected_token!(
+                "an object, an object set reference, ',', '|' or '}'",
+                tokens[consumed]
+            )
+            .into());
         }
     }
     Ok((

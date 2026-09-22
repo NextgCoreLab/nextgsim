@@ -23,6 +23,27 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/ngap.rs"));
 }
 
+/// Include the generated NRPPa types from the TS 38.455 ASN.1 schema.
+///
+/// NRPPa is a protocol in its own right, not an NGAP IE: NGAP carries it as an
+/// opaque `NRPPa-PDU ::= OCTET STRING` (TS 38.413 §9.3.3.17). It therefore lives
+/// in its own generated module and is deliberately NOT glob re-exported, because
+/// TS 38.455 defines its own `Criticality`, `ProcedureCode`, `ProtocolIE-ID` and
+/// `CriticalityDiagnostics` with constraints that differ from the NGAP ones.
+/// Refer to these as `nrppa_generated::Criticality` and so on.
+#[allow(
+    missing_docs,
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    unused,
+    non_camel_case_types,
+    non_snake_case
+)]
+pub mod nrppa_generated {
+    include!(concat!(env!("OUT_DIR"), "/nrppa.rs"));
+}
+
 // Re-export commonly used types at the module level
 pub use generated::*;
 
