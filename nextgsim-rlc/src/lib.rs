@@ -9,6 +9,14 @@
 //! - **AM** (Acknowledged Mode): segmentation, reassembly, and ARQ with
 //!   retransmission; used for DCCH and reliable DTCH bearers.
 //!
+//! # SRAP, the sidelink relay adaptation sublayer
+//!
+//! [`srap`] implements the Sidelink Relay Adaptation Protocol of TS 38.351, used for L2
+//! UE-to-Network relay (issue #190). It lives in this crate because TS 38.300 §16.12.2.1
+//! places the SRAP sublayer *directly above RLC* on both the PC5 and Uu hops, and the
+//! end-to-end PDCP entities it multiplexes belong to the remote UE and the gNB rather than
+//! to either hop it runs on.
+//!
 //! # Usage
 //!
 //! ```rust
@@ -39,6 +47,7 @@
 pub mod entity;
 pub mod error;
 pub mod pdu;
+pub mod srap;
 
 pub use entity::{
     RlcEntity, RlcSegment, DEFAULT_T_POLL_RETRANSMIT, DEFAULT_T_REASSEMBLY,
@@ -46,6 +55,10 @@ pub use entity::{
 };
 pub use error::RlcError;
 pub use pdu::{RlcAmPdu, RlcStatusNack, RlcStatusPdu, RlcUmPdu, SegmentationInfo};
+pub use srap::{
+    EgressChannel, RemoteBearerId, RemoteUeMapping, SrapDecision, SrapEntity, SrapHeader,
+    DEFAULT_SRAP_SRB, SRAP_HEADER_LEN,
+};
 
 /// RLC operating mode (TS 38.322 §4.2)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

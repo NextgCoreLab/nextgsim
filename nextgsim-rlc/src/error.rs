@@ -44,4 +44,26 @@ pub enum RlcError {
         /// Name of the current mode
         mode: &'static str,
     },
+
+    /// A SRAP header named a bearer identity outside the range TS 38.331 allows
+    /// (issue #190, `SL-RemoteUE-RB-Identity-r17`).
+    ///
+    /// Carries `is_drb` because the SRB and DRB number spaces differ — `INTEGER (0..3)`
+    /// minus SRB3, against `DRB-Identity`'s `1..=32` — so the identity alone does not say
+    /// which range was violated.
+    #[error("SRAP bearer identity {id} is not a valid {}", if *is_drb { "DRB" } else { "SRB" })]
+    SrapInvalidBearerId {
+        /// The offending bearer identity.
+        id: u8,
+        /// Whether it was carried as a DRB.
+        is_drb: bool,
+    },
+
+    /// A SRAP PDU named a local Remote UE ID this SRAP entity is not configured for
+    /// (issue #190, TS 38.300 §16.12.2.1).
+    #[error("no SRAP mapping is configured for local Remote UE ID {local_remote_ue_id}")]
+    SrapUnknownRemoteUe {
+        /// The local Remote UE ID that is not served here.
+        local_remote_ue_id: u8,
+    },
 }

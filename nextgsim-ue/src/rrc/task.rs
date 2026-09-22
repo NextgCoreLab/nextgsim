@@ -102,6 +102,7 @@ use nextgsim_rrc::procedures::sidelink_ue_information::SlConfigDedicatedParams;
 #[cfg(feature = "sidelink")]
 use nextgsim_rrc::procedures::sidelink_ue_information::{
     encode_sidelink_ue_information, SidelinkUeInformationParams, SlCastType, SlTxResourceRequest,
+    SlUeType,
 };
 use nextgsim_rrc::procedures::suspend_config::{decode_suspend_config, RanNotificationArea};
 use nextgsim_rrc::procedures::system_information::{
@@ -488,6 +489,47 @@ pub struct RrcTask {
     /// the tests assert on: it holds a value only because a real `RRCReconfiguration`
     /// carrying an `sl-ConfigDedicatedNR-r16` `setup` was decoded.
     granted_sl_config: Option<SlConfigDedicatedParams>,
+    /// This UE's SRAP entity, for L2 UE-to-Network relay (TS 38.351; issue #190).
+    ///
+    /// TS 38.331 §5.3.5.17 has the UE *"establish a SRAP entity as specified in TS 38.351"*
+    /// on receiving an `sl-L2RelayUE-Config` or `sl-L2RemoteUE-Config`
+    /// (`38331-j30.txt:14448`), then configure the signalled parameters into it — so the
+    /// entity is created lazily, on the first such configuration, rather than existing for
+    /// every UE.
+    ///
+    /// `None` means the network has configured no relay or remote-UE operation for this UE,
+    /// which is every UE in issue #141's world. Readable through
+    /// [`RrcTask::srap_local_remote_ue_id`] and
+    /// [`RrcTask::srap_egress_for`], which are the positive observables the tests
+    /// assert on: both hold a value only because a real `RRCReconfiguration` carrying the
+    /// relay IE was decoded.
+    #[cfg(feature = "sidelink")]
+    srap: Option<nextgsim_rlc::srap::SrapEntity>,
+    /// Which local Remote UE ID this **relay** holds for each remote UE's PC5 Layer-2 ID
+    /// (issue #190).
+    ///
+    /// Kept beside the SRAP entity rather than inside it because the entity is keyed by the
+    /// local ID — that is what a received header carries — while the relay's *forwarding*
+    /// path knows a peer by its PC5 Layer-2 ID. This is the translation between the two
+    /// identity spaces TS 38.300 §16.12.2.1 keeps separate.
+    #[cfg(feature = "sidelink")]
+    srap_relay_remote_ids: std::collections::HashMap<u32, u8>,
+    /// The local Remote UE ID this UE writes in its own SRAP headers, when the network has
+    /// configured it as a **remote** UE (issue #190).
+    ///
+    /// Separate from [`Self::srap_relay_remote_ids`] because the two roles are different: a
+    /// relay holds an ID *per remote UE it serves*, while a remote UE holds one ID *for
+    /// itself*. One field serving both would make "this UE is a relay for someone" and
+    /// "this UE is reached through someone" indistinguishable.
+    #[cfg(feature = "sidelink")]
+    srap_own_local_id: Option<u8>,
+    /// Octets of relayed uplink carried on this UE's own Uu connection as an L2
+    /// UE-to-Network relay (issue #190). See [`RrcTask::relayed_uplink_octets`].
+    #[cfg(feature = "sidelink")]
+    relayed_uplink_octets: u64,
+    /// Relayed-uplink SRAP PDUs carried (issue #190).
+    #[cfg(feature = "sidelink")]
+    relayed_uplink_pdus: u64,
     /// The sidelink resource request this UE has sent and not yet had answered.
     ///
     /// Held so the request is sent ONCE per connection rather than on every RRC cycle:
@@ -654,6 +696,16 @@ impl RrcTask {
             paging_s_tmsi: None,
             configured_scells: std::collections::BTreeMap::new(),
             granted_sl_config: None,
+            #[cfg(feature = "sidelink")]
+            srap: None,
+            #[cfg(feature = "sidelink")]
+            srap_relay_remote_ids: std::collections::HashMap::new(),
+            #[cfg(feature = "sidelink")]
+            srap_own_local_id: None,
+            #[cfg(feature = "sidelink")]
+            relayed_uplink_octets: 0,
+            #[cfg(feature = "sidelink")]
+            relayed_uplink_pdus: 0,
             #[cfg(feature = "sidelink")]
             sent_sl_interest: None,
         }
@@ -1189,8 +1241,10 @@ impl RrcTask {
     /// `setup` was decoded, so this is the positive observable that distinguishes a real
     /// grant from a UE that assumed one. A UE must not transmit sidelink while this is
     /// `None`.
-    pub fn granted_sl_config(&self) -> Option<SlConfigDedicatedParams> {
-        self.granted_sl_config
+    /// Borrowed rather than returned by value since issue #190: `SlConfigDedicatedParams`
+    /// carries the granted relay RLC channels, so it is no longer `Copy`.
+    pub fn granted_sl_config(&self) -> Option<&SlConfigDedicatedParams> {
+        self.granted_sl_config.as_ref()
     }
 
     /// Applies a signalled `sl-ConfigDedicatedNR` (TS 38.331 §5.3.5.3, §5.8.3).
@@ -1214,15 +1268,17 @@ impl RrcTask {
             (Some(config), _) => {
                 info!(
                     "Applying granted sl-ConfigDedicatedNR: t400={:?} ms, PHY/MAC/RLC \
-                     config {}",
+                     config {}, SL-RNTI {:?}, {} relay RLC channel(s)",
                     config.t400_ms,
                     if config.phy_mac_rlc_config {
                         "present"
                     } else {
                         "absent"
-                    }
+                    },
+                    config.sl_rnti,
+                    config.sl_rlc_bearers.len()
                 );
-                let changed = self.granted_sl_config != Some(config);
+                let changed = self.granted_sl_config.as_ref() != Some(&config);
                 self.granted_sl_config = Some(config);
                 changed
             }
@@ -1242,6 +1298,284 @@ impl RrcTask {
         }
     }
 
+    /// Carries a remote UE's SRAP PDU on this relay's own Uu connection
+    /// (TS 38.300 §16.12.2.1; issue #190).
+    ///
+    /// Sent on **SRB1**, the relay's existing uplink signalling channel, because that is the
+    /// leg this simulator actually has: the relay's Uu connection is RLS/RRC, and there is
+    /// no separate Uu relay RLC channel transport below it. TS 38.300 §16.12.2.1 puts the
+    /// SRAP sublayer above RLC on the Uu hop, so a faithful implementation would submit to a
+    /// numbered relay RLC channel — which this tree has no MAC multiplexing for. The
+    /// **header and the adaptation are real**; the channel it rides is the one that exists.
+    /// Stated here rather than implied, and carried in the docs-book row.
+    ///
+    /// Counted so a test can assert the relay really carried the traffic:
+    /// [`RrcTask::relayed_uplink_octets`] is incremented only here.
+    #[cfg(feature = "sidelink")]
+    async fn handle_relayed_uplink(&mut self, remote_l2_id: u32, pdu: Vec<u8>) {
+        info!(
+            "Carrying {} octet(s) of relayed uplink from remote UE {remote_l2_id:#08x} on \
+             this relay's Uu connection (TS 38.300 §16.12.2.1)",
+            pdu.len()
+        );
+        self.relayed_uplink_octets += pdu.len() as u64;
+        self.relayed_uplink_pdus += 1;
+        self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+            .await;
+    }
+
+    /// Octets of relayed uplink this UE has carried on its own Uu connection as an L2
+    /// UE-to-Network relay (issue #190).
+    ///
+    /// The positive observable at the relay's Uu boundary: non-zero only because a SRAP PDU
+    /// reached [`Self::handle_relayed_uplink`], which requires the sidelink task to have
+    /// adapted it, which requires a network-signalled mapping.
+    #[cfg(feature = "sidelink")]
+    pub fn relayed_uplink_octets(&self) -> u64 {
+        self.relayed_uplink_octets
+    }
+
+    /// How many relayed-uplink SRAP PDUs this UE has carried (issue #190).
+    #[cfg(feature = "sidelink")]
+    pub fn relayed_uplink_pdus(&self) -> u64 {
+        self.relayed_uplink_pdus
+    }
+
+    /// The local Remote UE ID this UE's SRAP entity holds for `remote_l2_id`, if any
+    /// (TS 38.300 §16.12.2.1; issue #190).
+    ///
+    /// The positive observable for the relay half: it is `Some` only because an
+    /// `RRCReconfiguration` carrying an `sl-L2RelayUE-Config` was decoded and applied. A UE
+    /// that assumed a relay configuration would have `None` here.
+    #[cfg(feature = "sidelink")]
+    pub fn srap_local_remote_ue_id(&self, remote_l2_id: u32) -> Option<u8> {
+        let _ = remote_l2_id;
+        // For a relay, the mapping is keyed by the LOCAL id the gNB assigned, and the
+        // relay learns the pairing from the same IE. `srap_relay_remote_l2_ids` records it.
+        self.srap_relay_remote_ids.get(&remote_l2_id).copied()
+    }
+
+    /// The local Remote UE ID this UE writes in its own SRAP headers, when the network has
+    /// configured it as a **remote** UE (`sl-SRAP-ConfigRemote-r17`; issue #190).
+    ///
+    /// TS 38.300 §16.12.2.1: the remote UE *"obtains the local Remote ID from the gNB via
+    /// Uu RRC messages"*. Without this it has no identity to put in a header, so this being
+    /// `Some` is exactly what makes the remote UE able to transmit at all.
+    #[cfg(feature = "sidelink")]
+    pub fn srap_own_local_id(&self) -> Option<u8> {
+        self.srap_own_local_id
+    }
+
+    /// The egress relay RLC channel this UE's SRAP entity maps `bearer` of the remote UE
+    /// known as `local_remote_ue_id` onto (issue #190).
+    #[cfg(feature = "sidelink")]
+    pub fn srap_egress_for(
+        &self,
+        local_remote_ue_id: u8,
+        bearer: nextgsim_rlc::srap::RemoteBearerId,
+    ) -> Option<nextgsim_rlc::srap::EgressChannel> {
+        self.srap
+            .as_ref()?
+            .remote_ue(local_remote_ue_id)?
+            .egress_for(bearer)
+    }
+
+    /// How many remote UEs this UE's SRAP entity is configured for (issue #190).
+    #[cfg(feature = "sidelink")]
+    pub fn srap_remote_ue_count(&self) -> usize {
+        self.srap.as_ref().map_or(0, |s| s.remote_ue_count())
+    }
+
+    /// **Adapts a remote UE's end-to-end PDCP PDU into a SRAP PDU** and says which egress
+    /// relay RLC channel it goes to (TS 38.351; TS 38.300 §16.12.2.1; issue #190).
+    ///
+    /// Public so the relay's forwarding path and the 3-UE E2E drive the REAL entity this
+    /// task configured from the wire, rather than a separately-built one that could pass
+    /// while this configuration was wrong.
+    ///
+    /// `None` when no SRAP entity has been established, which is a UE the network has not
+    /// configured for relay operation — such a UE must not adapt anything.
+    #[cfg(feature = "sidelink")]
+    pub fn srap_adapt(
+        &mut self,
+        local_remote_ue_id: u8,
+        bearer: nextgsim_rlc::srap::RemoteBearerId,
+        payload: &[u8],
+    ) -> Option<nextgsim_rlc::srap::SrapDecision> {
+        Some(
+            self.srap
+                .as_mut()?
+                .adapt(local_remote_ue_id, bearer, payload),
+        )
+    }
+
+    /// Reads a received SRAP PDU, correlating it to the remote UE and end-to-end bearer it
+    /// belongs to (issue #190).
+    #[cfg(feature = "sidelink")]
+    pub fn srap_deliver<'a>(
+        &self,
+        pdu: &'a [u8],
+    ) -> Option<Result<(nextgsim_rlc::srap::SrapHeader, &'a [u8]), nextgsim_rlc::RlcError>> {
+        Some(self.srap.as_ref()?.deliver(pdu))
+    }
+
+    /// Applies a signalled `sl-L2RelayUE-Config` or `sl-L2RemoteUE-Config`
+    /// (TS 38.331 §5.3.5.17; TS 38.351; issue #190).
+    ///
+    /// §5.3.5.17: *"if no SRAP entity has been established: establish a SRAP entity as
+    /// specified in TS 38.351"*, then configure the signalled parameters into it. So the
+    /// entity is created on first use and reconfigured thereafter, which is why a `release`
+    /// removes the mappings rather than the entity — a UE reconfigured back into relay
+    /// operation re-uses the entity it already established.
+    ///
+    /// The same three cases as [`Self::apply_signalled_sl_config`], for the same reason:
+    /// absence leaves the configuration alone (§5.3.5.3 acts only on IEs that are present),
+    /// so a bearer reconfiguration must not silently stop a relay relaying.
+    ///
+    /// **Validated against the granted relay RLC channels.** A mapping naming a Uu channel
+    /// the network never configured in `sl-RLC-BearerToAddModList` is rejected rather than
+    /// installed: the relay would otherwise submit a remote UE's traffic to a channel the
+    /// gNB is not reading, which fails silently in exactly the way that is hardest to
+    /// attribute. This is what makes `sl-RLC-BearerToAddModList` an IE that is *read*.
+    ///
+    /// Returns whether the SRAP configuration changed.
+    #[cfg(feature = "sidelink")]
+    async fn apply_signalled_relay_config(
+        &mut self,
+        relay: Option<nextgsim_rrc::procedures::sidelink_relay_config::L2RelayUeConfigParams>,
+        relay_released: bool,
+        remote: Option<nextgsim_rrc::procedures::sidelink_relay_config::L2RemoteUeConfigParams>,
+        remote_released: bool,
+    ) -> bool {
+        use nextgsim_rlc::srap::{EgressChannel, SrapEntity};
+
+        let mut changed = false;
+
+        // Which Uu relay RLC channels the network granted. A mapping may only name one of
+        // these; an empty set means none were granted, so no Uu mapping is installable.
+        let granted_uu_channels: Vec<u8> = self
+            .granted_sl_config
+            .as_ref()
+            .map(|c| {
+                c.sl_rlc_bearers
+                    .iter()
+                    .filter_map(|b| u8::try_from(b.index).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(relay) = relay {
+            let srap = self.srap.get_or_insert_with(SrapEntity::new);
+            for remote_ue in &relay.remote_ues {
+                // Rebuilt rather than installed as received, so a mapping naming a channel
+                // the network did not grant is dropped and the rest still applies.
+                let mut usable =
+                    nextgsim_rlc::srap::RemoteUeMapping::new(remote_ue.srap.local_remote_ue_id);
+                for (bearer, egress) in remote_ue.srap.bearers() {
+                    match egress {
+                        EgressChannel::Uu(channel) if !granted_uu_channels.contains(&channel) => {
+                            warn!(
+                                "Refusing a SRAP mapping for remote UE {:#08x} bearer {bearer}: \
+                                 Uu relay RLC channel {channel} is not among the granted \
+                                 channels {granted_uu_channels:?}",
+                                remote_ue.remote_l2_id
+                            );
+                        }
+                        usable_egress => usable.map_bearer(bearer, usable_egress),
+                    }
+                }
+                info!(
+                    "Establishing SRAP relay mapping for remote UE {:#08x}: local Remote UE \
+                     ID {}, {} bearer(s)",
+                    remote_ue.remote_l2_id,
+                    usable.local_remote_ue_id,
+                    usable.mapped_bearer_count()
+                );
+                let local_id = usable.local_remote_ue_id;
+                self.srap_relay_remote_ids
+                    .insert(remote_ue.remote_l2_id, local_id);
+                srap.configure_remote_ue(usable);
+                changed = true;
+
+                // **Push the mapping to the sidelink task**, which is what carries PC5
+                // traffic and therefore what needs the SRAP entity. Without this the
+                // mapping would live only here, in a task that never sees a relayed
+                // payload — "correct but unreachable", which is this tree's most common
+                // defect.
+                if let Some(rel18) = self.task_base.rel18.as_ref() {
+                    let _ = rel18
+                        .sidelink_tx
+                        .send(crate::tasks::SidelinkMessage::SrapMappingConfigured {
+                            remote_l2_id: remote_ue.remote_l2_id,
+                            local_remote_ue_id: local_id,
+                            is_relay: true,
+                        })
+                        .await;
+                }
+            }
+            for released in &relay.release_remote_l2_ids {
+                if let Some(local_id) = self.srap_relay_remote_ids.remove(released) {
+                    srap.release_remote_ue(local_id);
+                    changed = true;
+                }
+            }
+        } else if relay_released {
+            // The network stopped this UE relaying. The mappings go; the entity stays, per
+            // §5.3.5.17's establish-once semantics.
+            if let Some(srap) = self.srap.as_mut() {
+                for local_id in self.srap_relay_remote_ids.values() {
+                    srap.release_remote_ue(*local_id);
+                }
+            }
+            changed = !self.srap_relay_remote_ids.is_empty();
+            self.srap_relay_remote_ids.clear();
+            if changed {
+                info!("The network released this UE's L2 relay configuration");
+            }
+        }
+
+        if let Some(remote) = remote {
+            if let Some(mapping) = remote.srap {
+                let local_id = mapping.local_remote_ue_id;
+                info!(
+                    "This UE is configured as an L2 U2N remote UE with local Remote UE ID \
+                     {local_id} (TS 38.300 §16.12.2.1)"
+                );
+                let srap = self.srap.get_or_insert_with(SrapEntity::new);
+                srap.configure_remote_ue(mapping);
+                self.srap_own_local_id = Some(local_id);
+                changed = true;
+
+                // The remote UE's own mapping reaches its sidelink task too: it has to write
+                // this local ID in the headers it sends over PC5.
+                if let Some(rel18) = self.task_base.rel18.as_ref() {
+                    let _ = rel18
+                        .sidelink_tx
+                        .send(crate::tasks::SidelinkMessage::SrapMappingConfigured {
+                            // A remote UE's mapping describes its OWN traffic, so the
+                            // Layer-2 ID is its own.
+                            remote_l2_id: self
+                                .task_base
+                                .config
+                                .prose_config
+                                .as_ref()
+                                .map_or(0, |p| p.local_l2_id),
+                            local_remote_ue_id: local_id,
+                            is_relay: false,
+                        })
+                        .await;
+                }
+            }
+        } else if remote_released {
+            changed = self.srap_own_local_id.take().is_some();
+            if changed {
+                info!("The network released this UE's remote-UE configuration");
+            }
+        }
+
+        changed
+    }
+
     /// Turns the sidelink task's changed interest into a `SidelinkUEInformation`
     /// (TS 38.331 §5.8.3.2; issue #141).
     ///
@@ -1253,11 +1587,17 @@ impl RrcTask {
     /// the request itself: a test that built its own `SidelinkUEInformation` would pass
     /// whether or not this path was ever reached, which is the defect issue #141 is
     /// about.
+    ///
+    /// `ue_type` is the L2 UE-to-Network relay role the sidelink task declares (issue
+    /// #190). It comes from the sidelink task rather than being decided here, because the
+    /// task is what knows whether this UE is serving a Relay Service Code — and it is what
+    /// makes the gNB's relay grant requested rather than configured on the network side.
     #[cfg(feature = "sidelink")]
     pub async fn handle_sidelink_interest_changed(
         &mut self,
         rx_interested_freqs: Vec<u8>,
         tx_destinations: &[(u32, bool)],
+        ue_type: Option<SlUeType>,
     ) -> bool {
         let interest = SidelinkUeInformationParams {
             rx_interested_freqs,
@@ -1272,6 +1612,7 @@ impl RrcTask {
                     },
                 })
                 .collect(),
+            ue_type,
         };
         self.send_sidelink_ue_information(interest).await
     }
@@ -3073,9 +3414,27 @@ impl RrcTask {
         // expected sidelink traffic on the granted carriers would be expecting it from a
         // UE that had not recorded the grant.
         self.apply_signalled_sl_config(
-            reconfiguration.sl_config,
+            reconfiguration.sl_config.clone(),
             reconfiguration.sl_config_released,
         );
+
+        // §5.3.5.17: establish and configure the SRAP entity if the message carried an L2
+        // relay configuration (TS 38.351, issue #190). **This is the production caller of
+        // the SRAP bearer mapping** — the relay's mapping arrives here, on the wire, from
+        // the gNB.
+        //
+        // AFTER `apply_signalled_sl_config`, and that order is load-bearing: the mapping is
+        // validated against the relay RLC channels `sl-RLC-BearerToAddModList` granted, so
+        // the grant has to be recorded first. Reversed, every mapping would be rejected for
+        // naming a channel the UE did not yet know it had.
+        #[cfg(feature = "sidelink")]
+        self.apply_signalled_relay_config(
+            reconfiguration.sl_l2_relay_ue_config.clone(),
+            reconfiguration.sl_l2_relay_ue_config_released,
+            reconfiguration.sl_l2_remote_ue_config.clone(),
+            reconfiguration.sl_l2_remote_ue_config_released,
+        )
+        .await;
 
         // The tid comes from the DECODED message. It used to be read from
         // `bytes[1]`, which is a byte of RRCReconfiguration-IEs content: the real
@@ -4464,17 +4823,36 @@ impl Task for RrcTask {
                             RrcMessage::SidelinkInterestChanged {
                                 rx_interested_freqs,
                                 tx_destinations,
+                                relay_role,
                             } => {
                                 // TS 38.331 §5.8.3.2 (issue #141): the sidelink task's
                                 // destination set changed, so request resources for it.
                                 // The RRC layer owns the request because SRB1 is its
                                 // channel, and the sidelink task owns the trigger
                                 // because it is what knows the PC5 state.
+                                //
+                                // The relay role is converted at this boundary (issue
+                                // #190): `tasks` names it without an RRC dependency, and
+                                // this is where it becomes the `ue-Type-r17` that goes on
+                                // the wire.
+                                let ue_type = relay_role.map(|role| match role {
+                                    crate::tasks::SidelinkRelayRole::Relay => SlUeType::RelayUe,
+                                    crate::tasks::SidelinkRelayRole::Remote => SlUeType::RemoteUe,
+                                });
                                 self.handle_sidelink_interest_changed(
                                     rx_interested_freqs,
                                     &tx_destinations,
+                                    ue_type,
                                 )
                                 .await;
+                            }
+                            #[cfg(feature = "sidelink")]
+                            RrcMessage::RelayedUplink { remote_l2_id, pdu } => {
+                                // TS 38.300 §16.12.2.1 (issue #190): a remote UE's SRAP PDU
+                                // leaves on this relay's OWN Uu connection. RRC owns that
+                                // leg, which is why the sidelink task hands it here rather
+                                // than sending it itself.
+                                self.handle_relayed_uplink(remote_l2_id, pdu).await;
                             }
                             RrcMessage::PerformUac { access_category, access_identities } => {
                                 let allowed = self.perform_uac_check(access_category, access_identities);
@@ -4581,6 +4959,213 @@ mod tests {
         assert_eq!(task.next_pdu_id(), 1);
         assert_eq!(task.next_pdu_id(), 2);
         assert_eq!(task.next_pdu_id(), 3);
+    }
+
+    // ── Issue #190: applying the gNB's L2 relay configuration ────────────────
+
+    /// The UE applies a `sl-L2RelayUE-Config` decoded from a **real UPER
+    /// `RRCReconfiguration`**, and its SRAP entity ends up holding the mapping.
+    ///
+    /// This is the criterion-2 production path end to end on the UE side: the builder makes
+    /// the IE, the codec carries it, `parse_rrc_reconfiguration` decodes it, and
+    /// `apply_signalled_relay_config` installs it. Every assertion is on a value only
+    /// reachable by having decoded those bytes.
+    ///
+    /// The grant is applied **first**, because the mapping is validated against the relay
+    /// RLC channels it granted — which is what makes `sl-RLC-BearerToAddModList` an IE that
+    /// is read rather than merely sent.
+    #[cfg(feature = "sidelink")]
+    #[tokio::test]
+    async fn a_signalled_l2_relay_config_reaches_the_ues_srap_entity() {
+        use nextgsim_rlc::srap::{EgressChannel, RemoteBearerId, RemoteUeMapping};
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration, parse_rrc_reconfiguration, RrcReconfigurationParams,
+        };
+        use nextgsim_rrc::procedures::sidelink_relay_config::{
+            L2RelayUeConfigParams, RelayRemoteUeConfig,
+        };
+        use nextgsim_rrc::procedures::sidelink_ue_information::SlRlcBearerConfig;
+
+        const REMOTE_L2_ID: u32 = 0x00_0A_00_01;
+        const LOCAL_REMOTE_UE_ID: u8 = 42;
+        const UU_CHANNEL: u8 = 1;
+        let bearer = RemoteBearerId::srb(1).expect("SRB1");
+
+        let mut mapping = RemoteUeMapping::new(LOCAL_REMOTE_UE_ID);
+        mapping.map_bearer(bearer, EgressChannel::Uu(UU_CHANNEL));
+
+        let params = RrcReconfigurationParams {
+            rrc_transaction_id: 1,
+            radio_bearer_config: None,
+            secondary_cell_group: None,
+            master_cell_group: None,
+            full_config: false,
+            master_key_update: None,
+            meas_config: None,
+            ntn_config: None,
+            sl_config: Some(SlConfigDedicatedParams {
+                t400_ms: Some(400),
+                phy_mac_rlc_config: true,
+                sl_rnti: Some(0x4601),
+                // The channel the mapping above names. Without it the mapping is rejected,
+                // which `a_mapping_naming_an_ungranted_channel_is_rejected` asserts.
+                sl_rlc_bearers: vec![SlRlcBearerConfig {
+                    index: u16::from(UU_CHANNEL),
+                    served_radio_bearer: Some(1),
+                }],
+            }),
+            sl_l2_relay_ue_config: Some(L2RelayUeConfigParams {
+                remote_ues: vec![RelayRemoteUeConfig {
+                    remote_l2_id: REMOTE_L2_ID,
+                    srap: mapping,
+                }],
+                release_remote_l2_ids: Vec::new(),
+            }),
+            sl_l2_remote_ue_config: None,
+        };
+
+        let bytes = encode_rrc_reconfiguration(&params).expect(
+            "an RRCReconfiguration carrying the v1700 relay config must encode; if this \
+             fails, the vendored codec's extended-SEQUENCE gap has started to bite",
+        );
+        // Through the REAL bytes: decoded from UPER, then parsed. A test that built the
+        // `RrcReconfigurationData` directly would pass whether or not the v1700 extension
+        // survived the codec, which is the thing most worth proving here.
+        let message: nextgsim_rrc::codec::generated::DL_DCCH_Message =
+            nextgsim_rrc::codec::decode_rrc(&bytes).expect("the reconfiguration decodes");
+        let decoded = parse_rrc_reconfiguration(&message).expect("parse");
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        assert_eq!(
+            task.srap_remote_ue_count(),
+            0,
+            "precondition: no SRAP entity"
+        );
+
+        task.apply_signalled_sl_config(decoded.sl_config.clone(), decoded.sl_config_released);
+        task.apply_signalled_relay_config(
+            decoded.sl_l2_relay_ue_config.clone(),
+            decoded.sl_l2_relay_ue_config_released,
+            decoded.sl_l2_remote_ue_config.clone(),
+            decoded.sl_l2_remote_ue_config_released,
+        )
+        .await;
+
+        assert_eq!(task.srap_remote_ue_count(), 1);
+        assert_eq!(
+            task.srap_local_remote_ue_id(REMOTE_L2_ID),
+            Some(LOCAL_REMOTE_UE_ID),
+            "the UE must hold the local Remote UE ID the gNB assigned"
+        );
+        assert_eq!(
+            task.srap_egress_for(LOCAL_REMOTE_UE_ID, bearer),
+            Some(EgressChannel::Uu(UU_CHANNEL)),
+            "and the bearer must be mapped onto the granted Uu relay RLC channel"
+        );
+
+        // The entity really adapts: a payload comes back out as a SRAP PDU that decodes,
+        // carrying the same identity and the same octets.
+        const PAYLOAD: &[u8] = &[0x11, 0x22, 0x33];
+        let decision = task
+            .srap_adapt(LOCAL_REMOTE_UE_ID, bearer, PAYLOAD)
+            .expect("a SRAP entity has been established");
+        assert!(decision.is_submitted());
+        let nextgsim_rlc::srap::SrapDecision::Submit { pdu, .. } = decision else {
+            panic!("a mapped bearer must be submitted");
+        };
+        let (header, carried) = task
+            .srap_deliver(&pdu)
+            .expect("a SRAP entity has been established")
+            .expect("the entity's own PDU must deliver");
+        assert_eq!(header.local_remote_ue_id, LOCAL_REMOTE_UE_ID);
+        assert_eq!(carried, PAYLOAD, "SRAP must carry the payload unaltered");
+    }
+
+    /// A mapping naming a Uu relay RLC channel the grant did **not** include is rejected.
+    ///
+    /// This is what makes `sl-RLC-BearerToAddModList` an IE that is *read*: without the
+    /// check the relay would submit a remote UE's traffic to a channel the gNB is not
+    /// reading for it, which fails silently.
+    #[cfg(feature = "sidelink")]
+    #[tokio::test]
+    async fn a_mapping_naming_an_ungranted_channel_is_rejected() {
+        use nextgsim_rlc::srap::{EgressChannel, RemoteBearerId, RemoteUeMapping};
+        use nextgsim_rrc::procedures::sidelink_relay_config::{
+            L2RelayUeConfigParams, RelayRemoteUeConfig,
+        };
+        use nextgsim_rrc::procedures::sidelink_ue_information::SlRlcBearerConfig;
+
+        const LOCAL_ID: u8 = 9;
+        let bearer = RemoteBearerId::srb(1).expect("SRB1");
+        let mut mapping = RemoteUeMapping::new(LOCAL_ID);
+        // Channel 7, while the grant below names only channel 1.
+        mapping.map_bearer(bearer, EgressChannel::Uu(7));
+
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        task.apply_signalled_sl_config(
+            Some(SlConfigDedicatedParams {
+                t400_ms: Some(400),
+                phy_mac_rlc_config: true,
+                sl_rnti: Some(0x4601),
+                sl_rlc_bearers: vec![SlRlcBearerConfig {
+                    index: 1,
+                    served_radio_bearer: Some(1),
+                }],
+            }),
+            false,
+        );
+        task.apply_signalled_relay_config(
+            Some(L2RelayUeConfigParams {
+                remote_ues: vec![RelayRemoteUeConfig {
+                    remote_l2_id: 0x00_0A_00_01,
+                    srap: mapping,
+                }],
+                release_remote_l2_ids: Vec::new(),
+            }),
+            false,
+            None,
+            false,
+        )
+        .await;
+
+        // The remote UE is configured, but the bearer is NOT mapped: the channel was not
+        // granted. So adapting refuses rather than submitting to a channel nobody reads.
+        assert_eq!(task.srap_remote_ue_count(), 1);
+        assert_eq!(
+            task.srap_egress_for(LOCAL_ID, bearer),
+            None,
+            "a mapping naming an ungranted Uu channel must not be installed"
+        );
+        let decision = task
+            .srap_adapt(LOCAL_ID, bearer, &[0xAA])
+            .expect("the entity exists");
+        assert!(
+            !decision.is_submitted(),
+            "nothing may be submitted for an unmapped bearer: {decision:?}"
+        );
+    }
+
+    /// A UE with no relay configuration has no SRAP entity at all, so it adapts nothing.
+    ///
+    /// The negative control: TS 38.331 §5.3.5.17 establishes the entity *on* receiving the
+    /// configuration, so a UE that never got one must not have one.
+    #[cfg(feature = "sidelink")]
+    #[test]
+    fn a_ue_with_no_relay_configuration_has_no_srap_entity() {
+        use nextgsim_rlc::srap::RemoteBearerId;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        assert_eq!(task.srap_remote_ue_count(), 0);
+        assert_eq!(task.srap_own_local_id(), None);
+        assert!(
+            task.srap_adapt(0, RemoteBearerId::srb(1).expect("SRB1"), &[0xAA])
+                .is_none(),
+            "no SRAP entity has been established, so there is nothing to adapt with"
+        );
+        assert_eq!(task.relayed_uplink_octets(), 0);
+        assert_eq!(task.relayed_uplink_pdus(), 0);
     }
 
     #[test]
@@ -6120,6 +6705,8 @@ mod tests {
                 }),
                 ntn_config: None,
                 sl_config: None,
+                sl_l2_relay_ue_config: None,
+                sl_l2_remote_ue_config: None,
             })
             .expect("encode");
 
@@ -6163,6 +6750,8 @@ mod tests {
                 meas_config: None,
                 ntn_config: None,
                 sl_config: None,
+                sl_l2_relay_ue_config: None,
+                sl_l2_remote_ue_config: None,
             })
             .expect("encode");
             task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&pdu))

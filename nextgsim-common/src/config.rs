@@ -1503,6 +1503,25 @@ pub struct ProseConfig {
     /// accept `Direct Communication Request`s that name it.
     #[serde(default)]
     pub relay_service_code: Option<u32>,
+    /// Whether a relay UE is an **L2 UE-to-Network** relay rather than a UE-to-UE one
+    /// (TS 23.304 §5.4.2, TS 38.300 §16.12.2.1; issue #190).
+    ///
+    /// Read only when [`Self::relay_service_code`] is set — a UE serving no RSC is not a
+    /// relay of either kind. The two architectures differ in **where the traffic goes**,
+    /// which is why this is a separate field rather than inferred:
+    ///
+    /// * `false` (the default) is **UE-to-UE**: the relay forwards onto another PC5 link and
+    ///   the network is not in the path. This is what issue #141 implemented, and stays the
+    ///   default so an existing configuration keeps its behaviour.
+    /// * `true` is **UE-to-Network**: the relay adapts a remote UE's end-to-end bearers
+    ///   through the TS 38.351 SRAP sublayer and carries them on its own Uu connection. It
+    ///   also makes the UE declare `ue-Type-r17 = relayUE` to the gNB, which is what gets it
+    ///   the bearer mapping and the local Remote UE IDs it needs.
+    ///
+    /// Defaulting to `true` would silently change what every configured relay does with its
+    /// traffic, so it defaults to `false`.
+    #[serde(default)]
+    pub ue_to_network_relay: bool,
     /// The sidelink carrier indices this UE asks to receive on, each `1..=8`
     /// (`SL-InterestedFreqList-r16`, TS 38.331 §6.3.5).
     ///
@@ -1548,6 +1567,9 @@ impl Default for ProseConfig {
             prose_app_code: default_prose_app_code(),
             discovery_model: default_discovery_model(),
             relay_service_code: None,
+            // UE-to-UE by default, so an existing relay configuration keeps its behaviour
+            // (issue #190).
+            ue_to_network_relay: false,
             rx_interested_freqs: default_prose_rx_freqs(),
             peer_timeout_ms: default_prose_peer_timeout_ms(),
         }

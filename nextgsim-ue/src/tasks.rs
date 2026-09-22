@@ -615,7 +615,54 @@ pub enum RrcMessage {
         /// imports — does not gain a dependency on an RRC procedure type merely to
         /// name a message.
         tx_destinations: Vec<(u32, bool)>,
+        /// Whether this UE is declaring itself an L2 UE-to-Network **relay** UE, a
+        /// **remote** UE, or neither (issue #190).
+        ///
+        /// `None` is a plain PC5 UE, which is every UE issue #141 produced. `Some` becomes
+        /// `ue-Type-r17` in the request and is what asks the gNB for relay resources —
+        /// so this field is the wire-level trigger for the whole relay configuration.
+        ///
+        /// A `bool` pair would have been enough for two roles, but the two are mutually
+        /// exclusive and a pair can express "both", which is not a state a UE can be in.
+        relay_role: Option<SidelinkRelayRole>,
     },
+    /// A remote UE's SRAP PDU, to leave on this **relay** UE's own Uu connection
+    /// (TS 38.300 §16.12.2.1, TS 38.351; issue #190).
+    ///
+    /// **Sent by the sidelink task**, having adapted a remote UE's payload through SRAP.
+    /// This is the hop that makes UE-to-Network relaying different from UE-to-UE relaying:
+    /// the traffic leaves the relay's Uu leg, which is RRC's channel, rather than going back
+    /// out over PC5.
+    ///
+    /// The PDU is opaque here — header included, already built by the SRAP entity — because
+    /// the relay does not inspect a remote UE's end-to-end PDCP PDU: PDCP is terminated at
+    /// the remote UE and the gNB, not at the relay (§16.12.2.1).
+    #[cfg(feature = "sidelink")]
+    RelayedUplink {
+        /// Which remote UE the traffic came from, by PC5 Layer-2 ID, for the relay's logs.
+        ///
+        /// The value the *gNB* correlates on is the local Remote UE ID inside `pdu`'s SRAP
+        /// header; this is the relay-side identity, and the two are deliberately separate
+        /// spaces (§16.12.2.1).
+        remote_l2_id: u32,
+        /// The SRAP PDU, adaptation header first.
+        pdu: Vec<u8>,
+    },
+}
+
+/// The L2 UE-to-Network relay role a UE declares to the network (issue #190).
+///
+/// Mirrors `nextgsim_rrc::procedures::sidelink_ue_information::SlUeType` rather than using
+/// it directly, for the reason `tx_destinations` is a tuple: `nextgsim-ue::tasks` is
+/// imported by every task, and it should not gain a dependency on an RRC procedure type
+/// merely to name a message. The RRC task converts at the boundary.
+#[cfg(feature = "sidelink")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidelinkRelayRole {
+    /// This UE is offering itself as an L2 UE-to-Network relay.
+    Relay,
+    /// This UE wants to reach the network through a relay.
+    Remote,
 }
 
 /// Radio link failure cause.
@@ -1536,6 +1583,34 @@ pub enum SidelinkMessage {
         destination_l2_id: u32,
         /// The payload to forward.
         payload: Vec<u8>,
+    },
+    /// The network has configured this UE's SRAP bearer mapping for L2 UE-to-Network relay
+    /// (TS 38.331 §5.3.5.17, TS 38.351; issue #190).
+    ///
+    /// **Sent by the RRC task**, on decoding an `sl-L2RelayUE-Config` or
+    /// `sl-L2RemoteUE-Config` in an `RRCReconfiguration`. That is what makes the SRAP
+    /// mapping reachable in production rather than test-only: the mapping originates at the
+    /// gNB, arrives on SRB1, and this message is how it reaches the task that adapts PC5
+    /// traffic with it.
+    ///
+    /// RRC owns the decode because SRB1 is its channel; the sidelink task owns the entity
+    /// because it is what carries the traffic.
+    #[cfg(feature = "sidelink")]
+    SrapMappingConfigured {
+        /// The remote UE this mapping is for, by PC5 Layer-2 ID.
+        ///
+        /// For a **relay** this is the remote UE it serves. For a **remote** UE it is its
+        /// own Layer-2 ID, because the mapping describes its own traffic.
+        remote_l2_id: u32,
+        /// The local Remote UE ID that goes in the SRAP header
+        /// (`sl-LocalIdentity-r17`, TS 38.300 §16.12.2.1).
+        local_remote_ue_id: u8,
+        /// Whether this UE is the relay (`true`) or the remote UE (`false`).
+        ///
+        /// Carried because the two roles map the same bearer onto different egress hops —
+        /// the relay's is Uu towards the gNB, the remote UE's is PC5 towards the relay —
+        /// and a single mapping applied to the wrong role would send traffic the wrong way.
+        is_relay: bool,
     },
 }
 

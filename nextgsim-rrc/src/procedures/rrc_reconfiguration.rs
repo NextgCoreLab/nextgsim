@@ -16,6 +16,13 @@ use crate::procedures::meas_config::{build_a3_meas_config, A3MeasConfigParams, M
 // `dedicatedSystemInformationDelivery`. See [`RrcReconfigurationParams::ntn_config`].
 // The dedicated sidelink configuration (issue #141): `sl-ConfigDedicatedNR-r16` lives
 // in the v1610 extension. See [`RrcReconfigurationParams::sl_config`].
+// The L2 UE-to-Network relay configuration (issue #190): `sl-L2RelayUE-Config-r17` and
+// `sl-L2RemoteUE-Config-r17` live one extension deeper again, in v1700. See
+// [`RrcReconfigurationParams::sl_l2_relay_ue_config`].
+use crate::procedures::sidelink_relay_config::{
+    build_l2_relay_ue_config, build_l2_remote_ue_config, read_l2_relay_ue_config,
+    read_l2_remote_ue_config, L2RelayUeConfigParams, L2RemoteUeConfigParams, SidelinkRelayRrcError,
+};
 use crate::procedures::sidelink_ue_information::{
     build_sl_config_dedicated, read_sl_config_dedicated, SidelinkRrcError, SlConfigDedicatedParams,
 };
@@ -71,6 +78,16 @@ pub enum RrcReconfigurationError {
     /// failed.
     #[error("Invalid sl-ConfigDedicatedNR: {0}")]
     SlConfig(#[from] SidelinkRrcError),
+
+    /// An `sl-L2RelayUE-Config` or `sl-L2RemoteUE-Config` that could not be built
+    /// (issue #190).
+    ///
+    /// Its own variant for the same reason `SlConfig` is: a gNB that mis-configured one
+    /// remote UE's SRAP bearer mapping must still be able to send the rest of the
+    /// reconfiguration, and the caller can only decide that if it can tell which IE
+    /// failed.
+    #[error("Invalid L2 relay configuration: {0}")]
+    SidelinkRelayConfig(#[from] SidelinkRelayRrcError),
 }
 
 // ============================================================================
@@ -148,6 +165,25 @@ pub struct RrcReconfigurationParams {
     /// this still has to build the whole `v1530 -> v1540 -> v1560 -> v1610` chain: the
     /// intermediate extensions exist purely to reach it.
     pub sl_config: Option<SlConfigDedicatedParams>,
+    /// `sl-L2RelayUE-Config-r17`: the L2 UE-to-Network **relay** UE's per-remote-UE SRAP
+    /// bearer mapping (TS 38.331 §5.3.5.17, §6.3.2; TS 38.351; issue #190).
+    ///
+    /// `None` leaves the relay's SRAP configuration alone. `Some` is a `setup` telling the
+    /// relay which remote-UE bearers map onto which of its own relay RLC channels — TS
+    /// 38.300 §16.12.2.1's UL bearer mapping, which nothing in this tree signalled before
+    /// issue #190.
+    ///
+    /// Carried one extension deeper than [`Self::sl_config`], in `v1700`, so a
+    /// reconfiguration carrying only this builds `v1530 -> ... -> v1610 -> v1700`.
+    pub sl_l2_relay_ue_config: Option<L2RelayUeConfigParams>,
+    /// `sl-L2RemoteUE-Config-r17`: the **remote** UE's own L2 configuration, carrying the
+    /// local Remote UE ID the gNB assigned it (TS 38.331 §6.3.2; issue #190).
+    ///
+    /// This is the IE TS 38.300 §16.12.2.1 means by *"L2 U2N Remote UE obtains the local
+    /// Remote ID from the gNB via Uu RRC messages including RRCSetup,
+    /// RRCReconfiguration, RRCResume and RRCReestablishment"* — without it the remote UE
+    /// has no identity to put in its own SRAP headers.
+    pub sl_l2_remote_ue_config: Option<L2RemoteUeConfigParams>,
 }
 
 /// `masterKeyUpdate` as the network sets it and the UE reads it
@@ -205,6 +241,21 @@ pub struct RrcReconfigurationData {
     /// present), while `release` revokes it. A UE that treated a release as an absence
     /// would keep transmitting sidelink the network had just withdrawn.
     pub sl_config_released: bool,
+    /// The decoded `sl-L2RelayUE-Config-r17`, when the message carried a `setup`
+    /// (issue #190).
+    ///
+    /// Decoded rather than left as bytes for the same reason `meas_config` is: the
+    /// receiver consumes it — it configures its SRAP entity from it — so handing back an
+    /// octet string would only add a place to lose it.
+    pub sl_l2_relay_ue_config: Option<L2RelayUeConfigParams>,
+    /// Whether the message carried an `sl-L2RelayUE-Config-r17` **`release`**, which stops
+    /// this UE relaying (TS 38.331 §5.3.5.17).
+    pub sl_l2_relay_ue_config_released: bool,
+    /// The decoded `sl-L2RemoteUE-Config-r17`, when the message carried a `setup`
+    /// (issue #190). This is where a remote UE learns its local Remote UE ID.
+    pub sl_l2_remote_ue_config: Option<L2RemoteUeConfigParams>,
+    /// Whether the message carried an `sl-L2RemoteUE-Config-r17` **`release`**.
+    pub sl_l2_remote_ue_config_released: bool,
 }
 
 /// Build an RRC Reconfiguration message
@@ -251,10 +302,16 @@ pub fn build_rrc_reconfiguration(
         // `ntn_config` did: it lives further down the extension chain (v1610), so a
         // reconfiguration that carries ONLY a sidelink grant would otherwise have the
         // whole chain omitted and the grant silently dropped.
+        // The two L2 relay configurations join it since issue #190, one extension deeper
+        // again (v1700). A relay reconfiguration carries only these -- no bearers, no cell
+        // group, not even an `sl-ConfigDedicatedNR` -- so omitting the chain for them
+        // would drop the entire UE-to-Network relay grant.
         non_critical_extension: if params.master_cell_group.is_some()
             || params.full_config
             || params.ntn_config.is_some()
             || params.sl_config.is_some()
+            || params.sl_l2_relay_ue_config.is_some()
+            || params.sl_l2_remote_ue_config.is_some()
         {
             Some(build_v1530_extension(params)?)
         } else {
@@ -359,23 +416,28 @@ fn build_v1530_extension(
             .transpose()?
             .map(RRCReconfiguration_v1530_IEsDedicatedSystemInformationDelivery),
         other_config: None,
-        // The chain down to v1610, built only when something down there needs carrying
-        // (issue #141). v1540 and v1560 hold nothing this gNB sets; they exist here
-        // solely as the hops to `sl-ConfigDedicatedNR-r16`.
-        non_critical_extension: params
-            .sl_config
-            .as_ref()
-            .map(build_v1610_chain)
-            .transpose()?,
+        // The chain down to v1610 and, since issue #190, on to v1700 — built only when
+        // something down there needs carrying. v1540 and v1560 hold nothing this gNB sets;
+        // they exist here solely as the hops to `sl-ConfigDedicatedNR-r16` and the two L2
+        // relay configurations.
+        non_critical_extension: if params.sl_config.is_some()
+            || params.sl_l2_relay_ue_config.is_some()
+            || params.sl_l2_remote_ue_config.is_some()
+        {
+            Some(build_v1610_chain(params)?)
+        } else {
+            None
+        },
     })
 }
 
-/// Builds `v1540 -> v1560 -> v1610` to carry an `sl-ConfigDedicatedNR-r16` `setup`
-/// (TS 38.331 §6.2.2, issue #141).
+/// Builds `v1540 -> v1560 -> v1610 -> v1700` to carry an `sl-ConfigDedicatedNR-r16`
+/// `setup` and/or the L2 relay configurations (TS 38.331 §6.2.2; issues #141, #190).
 ///
 /// Every field in the two intervening extensions is left absent: this gNB sets no
 /// `otherConfig-v1540`, no MR-DC secondary cell group and no `sk-Counter`, so the hops
-/// cost two optional bitmaps and nothing else.
+/// cost two optional bitmaps and nothing else. v1700 is built only when one of the two L2
+/// relay IEs is present, so a plain sidelink grant still costs nothing for it.
 ///
 /// A `setup` rather than an ever-`release`: `release` is reachable through
 /// [`RrcReconfigurationParams::sl_config`] being `None`, which omits the IE — and TS
@@ -384,7 +446,7 @@ fn build_v1530_extension(
 /// caller in this tree has cause to send yet and so is not built here; the *parser*
 /// reads it, because a conformant peer may send one.
 fn build_v1610_chain(
-    sl_config: &SlConfigDedicatedParams,
+    params: &RrcReconfigurationParams,
 ) -> Result<RRCReconfiguration_v1540_IEs, RrcReconfigurationError> {
     let v1610 = RRCReconfiguration_v1610_IEs {
         other_config_v1610: None,
@@ -396,16 +458,24 @@ fn build_v1610_chain(
         need_for_gaps_config_nr_r16: None,
         on_demand_sib_request_r16: None,
         dedicated_pos_sys_info_delivery_r16: None,
-        sl_config_dedicated_nr_r16: Some(
-            RRCReconfiguration_v1610_IEsSl_ConfigDedicatedNR_r16::Setup(build_sl_config_dedicated(
-                sl_config,
-            )?),
-        ),
+        sl_config_dedicated_nr_r16: match params.sl_config.as_ref() {
+            Some(sl_config) => Some(RRCReconfiguration_v1610_IEsSl_ConfigDedicatedNR_r16::Setup(
+                build_sl_config_dedicated(sl_config)?,
+            )),
+            None => None,
+        },
         // The E-UTRA sidelink configuration. This is an NR-only simulator with no
         // LTE V2X carrier, so a value here would describe a carrier that does not exist.
         sl_config_dedicated_eutra_info_r16: None,
         target_cell_smtc_scg_r16: None,
-        non_critical_extension: None,
+        // On to v1700 for the L2 relay configurations (issue #190).
+        non_critical_extension: if params.sl_l2_relay_ue_config.is_some()
+            || params.sl_l2_remote_ue_config.is_some()
+        {
+            Some(build_v1700_extension(params)?)
+        } else {
+            None
+        },
     };
     let v1560 = RRCReconfiguration_v1560_IEs {
         mrdc_secondary_cell_group_config: None,
@@ -416,6 +486,49 @@ fn build_v1610_chain(
     Ok(RRCReconfiguration_v1540_IEs {
         other_config_v1540: None,
         non_critical_extension: Some(v1560),
+    })
+}
+
+/// Builds the `v1700` extension carrying the L2 UE-to-Network relay configurations
+/// (TS 38.331 §6.2.2, §5.3.5.17; issue #190).
+///
+/// Both IEs are `SetupRelease`, and both are built as `setup` for the reason
+/// [`build_v1610_chain`] gives: omission leaves the UE's configuration alone, which is the
+/// "no change" case, so the only thing a caller needs `setup` for is a change. The parser
+/// reads `release` because a conformant peer may send one.
+///
+/// Every other field of `v1700` stays absent — this gNB configures no MUSIM gaps, no
+/// FR2 UL gap, no application-layer measurement and does not deactivate an SCG — so the
+/// extension costs its optional bitmap and the two relay IEs.
+fn build_v1700_extension(
+    params: &RrcReconfigurationParams,
+) -> Result<RRCReconfiguration_v1700_IEs, RrcReconfigurationError> {
+    Ok(RRCReconfiguration_v1700_IEs {
+        other_config_v1700: None,
+        sl_l2_relay_ue_config_r17: match params.sl_l2_relay_ue_config.as_ref() {
+            Some(relay) => Some(RRCReconfiguration_v1700_IEsSl_L2RelayUE_Config_r17::Setup(
+                build_l2_relay_ue_config(relay)?,
+            )),
+            None => None,
+        },
+        sl_l2_remote_ue_config_r17: match params.sl_l2_remote_ue_config.as_ref() {
+            Some(remote) => Some(RRCReconfiguration_v1700_IEsSl_L2RemoteUE_Config_r17::Setup(
+                build_l2_remote_ue_config(remote)?,
+            )),
+            None => None,
+        },
+        // `dedicatedPagingDelivery-r17` is how a relay forwards a remote UE's paging
+        // (TS 38.300 §16.12.2.1). Absent because nothing in this tree pages through a
+        // relay; see the split note in the PR.
+        dedicated_paging_delivery_r17: None,
+        need_for_gap_ncsg_config_nr_r17: None,
+        need_for_gap_ncsg_config_eutra_r17: None,
+        musim_gap_config_r17: None,
+        ul_gap_fr2_config_r17: None,
+        scg_state_r17: None,
+        app_layer_meas_config_r17: None,
+        ue_tx_teg_request_ul_tdoa_config_r17: None,
+        non_critical_extension: None,
     })
 }
 
@@ -444,6 +557,54 @@ fn read_sl_config_from_chain(
         Some(RRCReconfiguration_v1610_IEsSl_ConfigDedicatedNR_r16::Release(_)) => (None, true),
         None => (None, false),
     }
+}
+
+/// The L2 relay configurations read out of a reconfiguration's extension chain
+/// (issue #190).
+///
+/// Each half is `(setup_params, was_released)`, for the reason
+/// [`read_sl_config_from_chain`] returns that shape: absent and `release` are different
+/// instructions, and a relay that treated a release as an absence would keep adapting
+/// traffic for a remote UE the network had just withdrawn.
+///
+/// A chain that stops short of v1700 — every reconfiguration this tree sent before issue
+/// #190 — yields all-`None`/`false`, i.e. "no relay IE was present".
+type L2RelayConfigsFromChain = (
+    Option<L2RelayUeConfigParams>,
+    bool,
+    Option<L2RemoteUeConfigParams>,
+    bool,
+);
+
+/// Reads the two L2 relay configurations out of a reconfiguration's extension chain
+/// (issue #190).
+fn read_l2_relay_configs_from_chain(ies: &RRCReconfiguration_IEs) -> L2RelayConfigsFromChain {
+    let Some(v1700) = ies
+        .non_critical_extension
+        .as_ref()
+        .and_then(|v1530| v1530.non_critical_extension.as_ref())
+        .and_then(|v1540| v1540.non_critical_extension.as_ref())
+        .and_then(|v1560| v1560.non_critical_extension.as_ref())
+        .and_then(|v1610| v1610.non_critical_extension.as_ref())
+    else {
+        return (None, false, None, false);
+    };
+
+    let (relay, relay_released) = match v1700.sl_l2_relay_ue_config_r17.as_ref() {
+        Some(RRCReconfiguration_v1700_IEsSl_L2RelayUE_Config_r17::Setup(config)) => {
+            (Some(read_l2_relay_ue_config(config)), false)
+        }
+        Some(RRCReconfiguration_v1700_IEsSl_L2RelayUE_Config_r17::Release(_)) => (None, true),
+        None => (None, false),
+    };
+    let (remote, remote_released) = match v1700.sl_l2_remote_ue_config_r17.as_ref() {
+        Some(RRCReconfiguration_v1700_IEsSl_L2RemoteUE_Config_r17::Setup(config)) => {
+            (Some(read_l2_remote_ue_config(config)), false)
+        }
+        Some(RRCReconfiguration_v1700_IEsSl_L2RemoteUE_Config_r17::Release(_)) => (None, true),
+        None => (None, false),
+    };
+    (relay, relay_released, remote, remote_released)
 }
 
 // ============================================================================
@@ -838,6 +999,8 @@ pub fn build_drb_reconfiguration_params(
         // Likewise left to the caller (issue #141): a sidelink grant answers a UE's
         // `SidelinkUEInformation`, which this DRB builder knows nothing about.
         sl_config: None,
+        sl_l2_relay_ue_config: None,
+        sl_l2_remote_ue_config: None,
     })
 }
 
@@ -875,6 +1038,8 @@ pub fn build_multi_drb_reconfiguration_params(
         ntn_config: None,
         // Likewise the sidelink grant (issue #141).
         sl_config: None,
+        sl_l2_relay_ue_config: None,
+        sl_l2_remote_ue_config: None,
     })
 }
 
@@ -992,6 +1157,15 @@ pub fn parse_rrc_reconfiguration(
     // place.
     let (sl_config, sl_config_released) = read_sl_config_from_chain(ies);
 
+    // The L2 UE-to-Network relay configurations (issue #190), one extension deeper again
+    // (v1700).
+    let (
+        sl_l2_relay_ue_config,
+        sl_l2_relay_ue_config_released,
+        sl_l2_remote_ue_config,
+        sl_l2_remote_ue_config_released,
+    ) = read_l2_relay_configs_from_chain(ies);
+
     Ok(RrcReconfigurationData {
         rrc_transaction_id: rrc_reconfiguration.rrc_transaction_identifier.0,
         radio_bearer_config,
@@ -1009,6 +1183,11 @@ pub fn parse_rrc_reconfiguration(
         // the chain than the NTN update above.
         sl_config,
         sl_config_released,
+        // The L2 relay configurations (issue #190), from the v1700 extension.
+        sl_l2_relay_ue_config,
+        sl_l2_relay_ue_config_released,
+        sl_l2_remote_ue_config,
+        sl_l2_remote_ue_config_released,
     })
 }
 
@@ -1559,6 +1738,8 @@ mod tests {
             meas_config: None,
             ntn_config: None,
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
         }
     }
 
@@ -1615,6 +1796,8 @@ mod tests {
             meas_config: None,
             ntn_config: None,
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
         };
 
         let msg = build_rrc_reconfiguration(&params).unwrap();
@@ -1653,6 +1836,8 @@ mod tests {
             meas_config: None,
             ntn_config: None,
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
         };
 
         let result = build_rrc_reconfiguration(&params);
@@ -1950,6 +2135,8 @@ mod tests {
             meas_config: None,
             ntn_config: None,
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
         })
         .expect("encode minimal RRCReconfiguration");
         assert_eq!(
@@ -1980,6 +2167,8 @@ mod tests {
             meas_config: Some(test_meas_config_params()),
             ntn_config: None,
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
         };
         let bytes = encode_rrc_reconfiguration(&params).expect("encode with a measConfig");
         assert_ne!(
@@ -2022,6 +2211,8 @@ mod tests {
                     meas_config: Some(test_meas_config_params()),
                     ntn_config: None,
                     sl_config: None,
+                    sl_l2_relay_ue_config: None,
+                    sl_l2_remote_ue_config: None,
                 },
             ),
             (
@@ -2038,6 +2229,8 @@ mod tests {
                     meas_config: Some(test_meas_config_params()),
                     ntn_config: None,
                     sl_config: None,
+                    sl_l2_relay_ue_config: None,
+                    sl_l2_remote_ue_config: None,
                 },
             ),
         ] {
@@ -2631,6 +2824,8 @@ mod tests {
             meas_config: None,
             ntn_config: Some(test_ntn_sib19_params()),
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
         };
         let data = decode_rrc_reconfiguration(&encode_rrc_reconfiguration(&params).unwrap())
             .expect("decodes");
@@ -2663,6 +2858,8 @@ mod tests {
         let explicit_none = RrcReconfigurationParams {
             ntn_config: None,
             sl_config: None,
+            sl_l2_relay_ue_config: None,
+            sl_l2_remote_ue_config: None,
             ..create_test_reconfiguration_params()
         };
         assert_eq!(
@@ -2963,6 +3160,8 @@ pub fn build_handover_command_params(
         // needs sidelink after the switch re-sends its `SidelinkUEInformation` to the
         // target, which is what TS 38.331 §5.8.3.2 requires on entering a new cell.
         sl_config: None,
+        sl_l2_relay_ue_config: None,
+        sl_l2_remote_ue_config: None,
     })
 }
 

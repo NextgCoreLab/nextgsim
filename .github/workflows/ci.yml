@@ -366,19 +366,30 @@ jobs:
       #
       # Distinct from `sidelink-facade` and `sidelink-ranging` above: those cover the
       # module's honesty wording and the SL-PRS/ranging pipeline respectively. This one
-      # covers the PC5 procedures and the two-UE end-to-end chain.
-      - name: cargo test (the two-UE PC5 end-to-end chain)
+      # covers the PC5 procedures and the end-to-end chains.
+      #
+      # Issue #190 added the L2 UE-to-Network relay to this job: the TS 38.351 SRAP
+      # sublayer, the `sl-L2RelayUE-Config` RRC half, and the remote-UE-to-network E2E.
+      # The SRAP sublayer itself is in `nextgsim-rlc`, which is NOT feature-gated -- so
+      # `cargo test --workspace` already builds and runs it -- but it is named here too
+      # because the only thing that drives it is this gated arm.
+      - name: cargo test (the PC5 and UE-to-Network relay end-to-end chains)
         run: cargo test -p nextgsim-integration-tests --features sidelink --test sidelink_pc5_e2e
       - name: cargo test (the PC5-S codec, link state machine, discovery and relay)
         run: |
           cargo test -p nextgsim-ue --features sidelink sidelink::
           cargo test -p nextgsim-rrc sidelink_ue_information
-      - name: cargo test (the gNB's answer to a resource request)
+      - name: cargo test (the SRAP adaptation layer, TS 38.351)
+        run: |
+          cargo test -p nextgsim-rlc srap
+          cargo test -p nextgsim-rrc sidelink_relay_config
+      - name: cargo test (the gNB's answer to a resource request, and its relay grant)
         run: cargo test -p nextgsim-gnb rrc::sidelink
       - name: cargo clippy
         run: |
           cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
           cargo clippy -p nextgsim-ue --features sidelink --all-targets
+          cargo clippy -p nextgsim-rlc --all-targets
 
   pqc:
     name: Post-quantum crypto (feature-gated)

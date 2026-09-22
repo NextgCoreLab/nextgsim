@@ -46,6 +46,9 @@ nextgsim-rrc = { path = "../nextgsim-rrc" }
 nextgsim-rls = { path = "../nextgsim-rls" }
 nextgsim-gtp = { path = "../nextgsim-gtp" }
 nextgsim-pdcp = { path = "../nextgsim-pdcp" }
+# For the SRAP header of TS 38.351, decoded at the relay's Uu boundary in
+# `sidelink_pc5_e2e` (issue #190).
+nextgsim-rlc = { path = "../nextgsim-rlc" }
 nextgsim-sctp = { path = "../nextgsim-sctp" }
 nextgsim-gnb = { path = "../nextgsim-gnb" }
 nextgsim-ue = { path = "../nextgsim-ue" }
