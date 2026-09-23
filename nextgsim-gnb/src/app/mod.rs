@@ -16,20 +16,23 @@
 //! and the running gNB instance. Commands are sent as structured messages with
 //! version checking for compatibility.
 //!
+//! The transport itself lives in [`nextgsim_common::cli_server`] and is shared with
+//! the UE. That is the only implementation `nr-cli` can resolve: it registers the
+//! node in `PROC_TABLE_DIR`, and that entry is how `nr-cli` turns a node name into
+//! a port. This module used to carry a second `CliServer` of its own which bound a
+//! port without registering it, so every gNB command was unreachable from outside
+//! the process; it also framed messages at protocol version 3.2.7 while `nr-cli`
+//! speaks 1.0.0, so even a discovered port would have rejected every datagram.
+//! Both defects went away with the duplicate (issue #197).
+//!
 //! # Reference
 //!
 //! Based on UERANSIM's `src/gnb/app/` implementation.
 
-mod cli_server;
 mod cmd_handler;
 mod config_loader;
 mod status;
 mod task;
-
-pub use cli_server::{
-    CliMessage, CliMessageType, CliServer, CliServerError, CLI_BUFFER_SIZE, CLI_MIN_LENGTH,
-    CLI_RECV_TIMEOUT_MS, CLI_VERSION_MAJOR, CLI_VERSION_MINOR, CLI_VERSION_PATCH,
-};
 
 pub use cmd_handler::{parse_cli_command, AmfContext, CliResponse, GnbCmdHandler, UeContext};
 
