@@ -15,10 +15,9 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::app::{
-    parse_cli_command, AmfContext, CliServer, CliServerError, GnbCmdHandler, StatusReporter,
-    UeContext,
-};
+use nextgsim_common::cli_server::{CliCommand, CliServer};
+
+use crate::app::{parse_cli_command, AmfContext, GnbCmdHandler, StatusReporter, UeContext};
 use crate::tasks::{
     AppMessage, GnbCliCommandType, GnbTaskBase, NgapMessage, RrcMessage, StatusUpdate, Task,
     TaskMessage, UeReleaseRequestCause,
@@ -67,17 +66,22 @@ impl AppTask {
         }
     }
 
-    /// Initializes the CLI server.
+    /// Initializes the CLI server and registers the gNB in the process table.
     ///
-    /// This should be called before running the task if CLI is enabled.
-    pub async fn init_cli_server(&mut self, node_name: String) -> Result<u16, CliServerError> {
+    /// Registration is what makes the node reachable: `nr-cli` resolves a node name
+    /// to a port by scanning `PROC_TABLE_DIR`, so a server that binds without
+    /// registering is bound to an ephemeral port nothing can find. The gNB used to do
+    /// exactly that, which left its whole command set — including `ue-suspend` and
+    /// `ue-release`, the only triggers for RRC_INACTIVE and the gNB-initiated
+    /// `UEContextReleaseRequest` — unreachable from outside the process (issue #197).
+    pub async fn init_cli_server(&mut self, node_name: String) -> std::io::Result<u16> {
         if !self.cli_enabled {
             return Ok(0);
         }
 
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("value expected");
-        let server = CliServer::new(bind_addr, node_name).await?;
-        let port = server.local_addr()?.port();
+        let mut server = CliServer::new().await?;
+        server.register_nodes(vec![node_name])?;
+        let port = server.port();
         self.cli_server = Some(server);
         Ok(port)
     }
@@ -86,8 +90,7 @@ impl AppTask {
     pub fn cli_port(&self) -> u16 {
         self.cli_server
             .as_ref()
-            .and_then(|s| s.local_addr().ok())
-            .map(|a| a.port())
+            .map(nextgsim_common::CliServer::port)
             .unwrap_or(0)
     }
 
@@ -185,9 +188,9 @@ impl AppTask {
         // Send response if we have a CLI server and destination
         if let (Some(server), Some(addr)) = (&self.cli_server, response.destination) {
             let result = if response.is_error {
-                server.send_error(response.content, addr).await
+                server.send_error(addr, response.content).await
             } else {
-                server.send_result(response.content, addr).await
+                server.send_result(addr, response.content).await
             };
 
             if let Err(e) = result {
@@ -196,33 +199,34 @@ impl AppTask {
         }
     }
 
-    /// Processes a raw CLI message from the server.
-    async fn process_cli_message(&mut self, msg: crate::app::CliMessage) {
+    /// Processes a raw CLI command from the server.
+    async fn process_cli_command(&mut self, cmd: CliCommand) {
         // Parse the command
-        let command = match parse_cli_command(&msg.value) {
-            Ok(cmd) => cmd,
+        let command = match parse_cli_command(&cmd.command) {
+            Ok(parsed) => parsed,
             Err(e) => {
                 // Send error response
                 if let Some(server) = &self.cli_server {
-                    if let Some(addr) = msg.client_addr {
-                        let _ = server.send_error(e, addr).await;
-                    }
+                    let _ = server.send_error(cmd.client_addr, e).await;
                 }
                 return;
             }
         };
 
         // Handle the command
-        self.handle_cli_command(command, msg.client_addr).await;
+        self.handle_cli_command(command, Some(cmd.client_addr))
+            .await;
     }
 
-    /// Polls the CLI server for incoming messages.
+    /// Polls the CLI server for incoming commands.
+    ///
+    /// Uses the non-blocking receive so the caller's `select!` keeps servicing its
+    /// other arms: awaiting a datagram here would stall every inter-task message
+    /// until a CLI client happened to send one.
     async fn poll_cli_server(&mut self) {
-        let msg = if let Some(server) = &self.cli_server {
-            match server.try_receive() {
-                Ok(Some(msg)) => Some(msg),
-                Ok(None) => None,
-                Err(CliServerError::Timeout) => None,
+        let cmd = if let Some(server) = &self.cli_server {
+            match server.try_receive_command() {
+                Ok(cmd) => cmd,
                 Err(e) => {
                     warn!("CLI server error: {}", e);
                     None
@@ -232,8 +236,8 @@ impl AppTask {
             None
         };
 
-        if let Some(msg) = msg {
-            self.process_cli_message(msg).await;
+        if let Some(cmd) = cmd {
+            self.process_cli_command(cmd).await;
         }
     }
 
@@ -287,10 +291,7 @@ impl Task for AppTask {
 
         if self.cli_enabled {
             if let Some(server) = &self.cli_server {
-                info!(
-                    "CLI server listening on port {}",
-                    server.local_addr().map(|a| a.port()).unwrap_or(0)
-                );
+                info!("CLI server listening on port {}", server.port());
             }
         }
 

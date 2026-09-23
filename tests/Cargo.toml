@@ -165,3 +165,11 @@ path = "src/conditional_handover_e2e.rs"
 [[test]]
 name = "sdap_user_plane"
 path = "src/sdap_user_plane.rs"
+
+# `nr-cli` reachability for the gNB (issue #197): the node is discoverable through the
+# proc table and a command sent to the DISCOVERED port takes effect. Deliberately NOT
+# feature-gated -- the CLI server runs in every default build, and this is exactly the
+# property that was silently false, so it belongs in `cargo test --workspace`.
+[[test]]
+name = "gnb_cli_reachability"
+path = "src/gnb_cli_reachability.rs"

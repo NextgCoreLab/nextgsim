@@ -122,13 +122,14 @@ pub use gtp::GtpTask;
 // Re-export RLS module types
 pub use rls::RlsTask;
 
-// Re-export app module types
+// Re-export app module types. The CLI transport types are deliberately NOT
+// re-exported here: `nextgsim_common::cli_server` owns the one implementation
+// `nr-cli` can reach, and a second set of names under `nextgsim_gnb` is how the
+// unregistered duplicate stayed invisible for so long (issue #197).
 pub use app::{
     load_and_validate_gnb_config, load_gnb_config, load_gnb_config_from_str, parse_cli_command,
-    validate_gnb_config, AmfContext, AppTask, CliMessage, CliMessageType, CliResponse, CliServer,
-    CliServerError, ConfigError, ConfigValidationError, GnbCmdHandler, GnbStatusInfo,
-    StatusReporter, UeContext, CLI_BUFFER_SIZE, CLI_MIN_LENGTH, CLI_RECV_TIMEOUT_MS,
-    CLI_VERSION_MAJOR, CLI_VERSION_MINOR, CLI_VERSION_PATCH,
+    validate_gnb_config, AmfContext, AppTask, CliResponse, ConfigError, ConfigValidationError,
+    GnbCmdHandler, GnbStatusInfo, StatusReporter, UeContext,
 };
 
 // Re-export commonly used types
