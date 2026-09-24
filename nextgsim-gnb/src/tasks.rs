@@ -183,6 +183,54 @@ pub enum AppMessage {
     StatusUpdate(StatusUpdate),
     /// CLI command received
     CliCommand(CliCommand),
+    /// A UE-associated logical NG-connection was created, or its NGAP ID pair
+    /// changed (issue #199).
+    ///
+    /// Sent by the NGAP task, which is the only task that can state this: the RAN
+    /// UE NGAP ID is allocated there and the AMF UE NGAP ID arrives there on the
+    /// wire, so RRC could report neither. Delivered so the CLI's UE registry has a
+    /// writer at all — before this it had none outside tests, and `ue-list`
+    /// answered `ues: []` for a fully registered UE while `ue-suspend` answered
+    /// `UE not found`, which left [`RrcMessage::SuspendUe`] — the only production
+    /// trigger for RRC_INACTIVE — unreachable.
+    ///
+    /// Idempotent by construction: the App task upserts, so a UE whose
+    /// `amf_ue_ngap_id` is filled in later (it arrives at Initial Context Setup,
+    /// not at Initial UE Message) produces a second send that revises the same
+    /// entry rather than a duplicate.
+    UeContextUpdate(UeContextUpdate),
+    /// A UE-associated logical NG-connection is gone, so the CLI must stop
+    /// offering its ID (issue #199).
+    ///
+    /// Paired with `UeContextUpdate` on purpose: a registry that only ever grows
+    /// hands `ue-suspend` an ID whose UE has been released, and the resulting
+    /// `RrcMessage::SuspendUe` would name a UE the RRC task no longer holds. The
+    /// NGAP task sends this from its single context-deletion point, so every route
+    /// to a release — AMF release command, gNB-initiated release request, radio
+    /// link failure, NG Reset, Error Indication, or SCTP association loss — removes
+    /// the CLI entry too.
+    UeContextRemove {
+        /// UE whose context is gone
+        ue_id: i32,
+    },
+}
+
+/// The UE state the CLI needs, as the NGAP task holds it (issue #199).
+///
+/// Deliberately a projection rather than the NGAP context itself: `NgapUeContext`
+/// carries AS keys, PDU sessions and an RRC transaction allocator, none of which
+/// any CLI command reads, and copying them into another task would put the AS key
+/// material in a second place. These three fields are exactly what
+/// `handle_ue_list`, `handle_ue_info`, `handle_ue_release`, `handle_ue_suspend` and
+/// `handle_xn_path_switch` read.
+#[derive(Debug, Clone, Copy)]
+pub struct UeContextUpdate {
+    /// UE ID (internal, shared with RRC)
+    pub ue_id: i32,
+    /// RAN UE NGAP ID, allocated by this gNB
+    pub ran_ue_ngap_id: i64,
+    /// AMF UE NGAP ID, once the AMF has assigned one
+    pub amf_ue_ngap_id: Option<i64>,
 }
 
 /// Status update information.
