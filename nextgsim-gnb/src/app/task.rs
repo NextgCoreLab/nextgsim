@@ -20,7 +20,7 @@ use nextgsim_common::cli_server::{CliCommand, CliServer};
 use crate::app::{parse_cli_command, AmfContext, GnbCmdHandler, StatusReporter, UeContext};
 use crate::tasks::{
     AppMessage, GnbCliCommandType, GnbTaskBase, NgapMessage, RrcMessage, StatusUpdate, Task,
-    TaskMessage, UeReleaseRequestCause,
+    TaskMessage, UeContextUpdate, UeReleaseRequestCause,
 };
 
 /// gNB Application Task
@@ -33,7 +33,26 @@ pub struct AppTask {
     cli_server: Option<CliServer>,
     /// Status reporter
     status_reporter: StatusReporter,
-    /// UE contexts for CLI display
+    /// UE contexts for CLI display, fed by [`AppMessage::UeContextUpdate`] and
+    /// [`AppMessage::UeContextRemove`] from the NGAP task (issue #199).
+    ///
+    /// **Kept as a projection rather than unified with `NgapTask.ue_contexts`,
+    /// deliberately.** The two are not duplicates of one state: the NGAP map is
+    /// the authority and this one is a read-only view of three of its fields, so
+    /// there is no second writer to drift. Unifying them the way #197 unified the
+    /// two `CliServer`s, or #188 deleted the id-keyed MBS manager, would mean
+    /// either moving the authority here — putting AS keys, PDU sessions and the
+    /// RRC transaction allocator in the task that answers UDP datagrams — or
+    /// making the CLI query NGAP over a request/response hop. The hop was
+    /// rejected because `poll_cli_server` runs inside this task's `select!`: an
+    /// await on an NGAP round trip there stalls every inter-task message until
+    /// NGAP answers, and NGAP can be blocked on the very UE the query is about.
+    ///
+    /// The staleness that argument concedes is bounded by the removal path being
+    /// wired from NGAP's single deletion point, so the worst case is a UE listed
+    /// for the few microseconds between `delete_ue_context` and this task
+    /// draining its inbox. An ID that survives that window would be refused by
+    /// the NGAP task on arrival anyway, because NGAP re-looks-up every ue_id.
     ue_contexts: HashMap<i32, UeContext>,
     /// AMF contexts for CLI display
     amf_contexts: HashMap<i32, AmfContext>,
@@ -241,24 +260,30 @@ impl AppTask {
         }
     }
 
-    /// Updates UE context (called when UE state changes).
-    pub fn update_ue_context(
-        &mut self,
-        ue_id: i32,
-        ran_ue_ngap_id: i64,
-        amf_ue_ngap_id: Option<i64>,
-    ) {
+    /// Records a UE the NGAP task reported, so the CLI can name it.
+    ///
+    /// Upserts rather than inserts, because a UE is reported twice on a normal
+    /// registration: once at the Initial UE Message, when only the RAN UE NGAP ID
+    /// exists, and again once the AMF has supplied an AMF UE NGAP ID. An insert
+    /// would leave `amf-ngap-id` permanently absent from `ue-info`.
+    fn update_ue_context(&mut self, update: UeContextUpdate) {
+        debug!(
+            "UE context update from NGAP: ue_id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={:?}",
+            update.ue_id, update.ran_ue_ngap_id, update.amf_ue_ngap_id
+        );
         let context = self
             .ue_contexts
-            .entry(ue_id)
-            .or_insert_with(|| UeContext::new(ue_id, ran_ue_ngap_id));
-        context.ran_ue_ngap_id = ran_ue_ngap_id;
-        context.amf_ue_ngap_id = amf_ue_ngap_id;
+            .entry(update.ue_id)
+            .or_insert_with(|| UeContext::new(update.ue_id, update.ran_ue_ngap_id));
+        context.ran_ue_ngap_id = update.ran_ue_ngap_id;
+        context.amf_ue_ngap_id = update.amf_ue_ngap_id;
     }
 
-    /// Removes a UE context.
-    pub fn remove_ue_context(&mut self, ue_id: i32) {
-        self.ue_contexts.remove(&ue_id);
+    /// Drops a UE the NGAP task has released, so the CLI stops offering its ID.
+    fn remove_ue_context(&mut self, ue_id: i32) {
+        if self.ue_contexts.remove(&ue_id).is_some() {
+            debug!("UE context removed from the CLI registry: ue_id={ue_id}");
+        }
     }
 
     /// Updates AMF context.
@@ -307,6 +332,12 @@ impl Task for AppTask {
                                 }
                                 AppMessage::CliCommand(cmd) => {
                                     self.handle_cli_command(cmd.command, cmd.response_addr).await;
+                                }
+                                AppMessage::UeContextUpdate(update) => {
+                                    self.update_ue_context(update);
+                                }
+                                AppMessage::UeContextRemove { ue_id } => {
+                                    self.remove_ue_context(ue_id);
                                 }
                             }
                         }
@@ -420,20 +451,50 @@ mod tests {
         assert!(task.status_reporter.status().is_ngap_up);
     }
 
+    /// The registry's upsert-and-remove semantics, exercised through the message
+    /// shapes the NGAP task actually sends (issue #199).
+    ///
+    /// Unit-level on purpose: this pins the SEMANTICS (a second update for a known
+    /// UE revises rather than duplicates, which is what a registration needs since
+    /// the AMF UE NGAP ID arrives after the RAN one). Whether any production code
+    /// ever sends these is a different property, and a test at this level cannot
+    /// tell — that is precisely how this registry stayed writer-less through #198.
+    /// The reachability claim is pinned by `gnb_cli_reachability`'s
+    /// `a_real_registration_makes_the_ue_visible_and_suspendable`, which drives a
+    /// registration instead of calling this.
     #[test]
     fn test_ue_context_management() {
         let config = test_config();
         let task_base = create_task_base(config);
         let mut task = AppTask::new(task_base);
 
-        // Add UE context
-        task.update_ue_context(1, 100, Some(200));
+        // Add UE context, as the NGAP task does at Initial UE Message time: the RAN
+        // UE NGAP ID is known, the AMF has not answered yet.
+        task.update_ue_context(UeContextUpdate {
+            ue_id: 1,
+            ran_ue_ngap_id: 100,
+            amf_ue_ngap_id: None,
+        });
         assert!(task.ue_contexts.contains_key(&1));
         assert_eq!(task.ue_contexts.get(&1).unwrap().ran_ue_ngap_id, 100);
+        assert_eq!(task.ue_contexts.get(&1).unwrap().amf_ue_ngap_id, None);
+
+        // The AMF answers: the SAME entry gains the pair rather than a duplicate
+        // appearing, which is what makes the two-phase publish safe.
+        task.update_ue_context(UeContextUpdate {
+            ue_id: 1,
+            ran_ue_ngap_id: 100,
+            amf_ue_ngap_id: Some(200),
+        });
+        assert_eq!(task.ue_contexts.len(), 1, "an update must not duplicate");
         assert_eq!(task.ue_contexts.get(&1).unwrap().amf_ue_ngap_id, Some(200));
 
-        // Update UE context
-        task.update_ue_context(1, 100, Some(300));
+        // And a revised AMF UE NGAP ID (a path switch can change it) replaces it.
+        task.update_ue_context(UeContextUpdate {
+            ue_id: 1,
+            ran_ue_ngap_id: 100,
+            amf_ue_ngap_id: Some(300),
+        });
         assert_eq!(task.ue_contexts.get(&1).unwrap().amf_ue_ngap_id, Some(300));
 
         // Remove UE context

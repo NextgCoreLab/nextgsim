@@ -136,8 +136,8 @@ pub use app::{
 pub use tasks::{
     AppMessage, CliCommand, GnbCliCommandType, GnbTaskBase, GtpMessage, GtpUeContextUpdate,
     GutiMobileIdentity, NgapMessage, PduSessionResource, RlfCause, RlsMessage, RrcMessage,
-    SctpMessage, StatusType, StatusUpdate, Task, TaskHandle, TaskMessage, DEFAULT_CHANNEL_CAPACITY,
-    NGAP_PPID,
+    SctpMessage, StatusType, StatusUpdate, Task, TaskHandle, TaskMessage, UeContextUpdate,
+    DEFAULT_CHANNEL_CAPACITY, NGAP_PPID,
 };
 
 // Re-export lifecycle management types

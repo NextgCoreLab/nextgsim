@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::tasks::{
     AppMessage, GnbTaskBase, GtpMessage, GtpUeContextUpdate, HandoverInitiation, NgapMessage,
     PduSessionResource, RrcMessage, SctpMessage, StatusType, StatusUpdate, Task, TaskMessage,
-    UeReleaseRequestCause, NGAP_PPID,
+    UeContextUpdate, UeReleaseRequestCause, NGAP_PPID,
 };
 use nextgsim_common::OctetString;
 
@@ -418,7 +418,15 @@ impl NgapTask {
     // ========================================================================
 
     /// Creates a UE context for a new UE
-    fn create_ue_context(&mut self, ue_id: i32, amf_ctx_id: i32) -> Option<i64> {
+    ///
+    /// `async` so that it can tell the App task about the new UE before returning
+    /// (issue #199). Notifying from inside here rather than from each caller is the
+    /// point: this is the only place a UE context comes into existence, so the CLI
+    /// registry cannot be left unwritten by a caller that forgot — which is exactly
+    /// the state the whole gNB was in, with `AppTask.ue_contexts` having no
+    /// production writer at all and `ue-list` answering `ues: []` for a registered
+    /// UE.
+    async fn create_ue_context(&mut self, ue_id: i32, amf_ctx_id: i32) -> Option<i64> {
         let amf_ctx = self.amf_contexts.get_mut(&amf_ctx_id)?;
         let stream_id = amf_ctx.allocate_stream()?;
         let ran_ue_ngap_id = self.next_ran_ue_ngap_id();
@@ -431,7 +439,37 @@ impl NgapTask {
             ue_id, ran_ue_ngap_id, amf_ctx_id, stream_id
         );
 
+        self.sync_ue_context_to_app(ue_id).await;
+
         Some(ran_ue_ngap_id)
+    }
+
+    /// Reports this UE's NGAP ID pair to the App task, so `ue-list`, `ue-info`,
+    /// `ue-release`, `ue-suspend` and `xn-path-switch` can resolve it (issue #199).
+    ///
+    /// Called at context creation and again wherever the AMF UE NGAP ID is adopted
+    /// — Downlink NAS Transport, Initial Context Setup, UE Context Modification,
+    /// PDU Session Resource Setup, Handover Request and Path Switch Acknowledge.
+    /// Re-sending is intentional and cheap: the App task upserts, and the ID pair
+    /// is only complete after the AMF has answered, so a single send at creation
+    /// would publish a UE whose `amf_ue_ngap_id` stayed `None` for its whole life.
+    ///
+    /// A send failure is logged rather than propagated because the App task is not
+    /// load-bearing for the NGAP procedure in flight: a gNB whose CLI has gone away
+    /// must still serve the UE. It is logged at `warn` and not swallowed because the
+    /// consequence — a CLI that cannot see this UE — is the defect this fixes.
+    async fn sync_ue_context_to_app(&self, ue_id: i32) {
+        let Some(ctx) = self.ue_contexts.get(&ue_id) else {
+            return;
+        };
+        let msg = AppMessage::UeContextUpdate(UeContextUpdate {
+            ue_id: ctx.ue_id,
+            ran_ue_ngap_id: ctx.ran_ue_ngap_id,
+            amf_ue_ngap_id: ctx.amf_ue_ngap_id,
+        });
+        if let Err(e) = self.task_base.app_tx.send(msg).await {
+            warn!("Failed to report UE[{ue_id}] to the App task, so the CLI cannot see it: {e}");
+        }
     }
 
     /// Finds a UE context by UE ID
@@ -463,7 +501,14 @@ impl NgapTask {
     }
 
     /// Deletes a UE context
-    fn delete_ue_context(&mut self, ue_id: i32) {
+    ///
+    /// `async` for the same reason `create_ue_context` is: this is the single point
+    /// every release route converges on — AMF UE Context Release Command,
+    /// gNB-initiated release request, radio link failure, NG Reset, Error
+    /// Indication and SCTP association loss all reach it — so telling the App task
+    /// from here means no route can leave a released UE's ID on offer to
+    /// `ue-suspend` (issue #199).
+    async fn delete_ue_context(&mut self, ue_id: i32) {
         if let Some(ctx) = self.ue_contexts.remove(&ue_id) {
             // Release the stream back to the AMF
             if let Some(amf_ctx) = self.amf_contexts.get_mut(&ctx.amf_ctx_id) {
@@ -484,6 +529,21 @@ impl NgapTask {
                 );
             }
             debug!("Deleted UE context: ue_id={}", ue_id);
+
+            // Drop the CLI's entry too. Inside the `if let` on purpose: a delete for
+            // a ue_id this task never held must not tell the App task to forget an
+            // id that belongs to a live UE, and ids are reused.
+            if let Err(e) = self
+                .task_base
+                .app_tx
+                .send(AppMessage::UeContextRemove { ue_id })
+                .await
+            {
+                warn!(
+                    "Failed to tell the App task UE[{ue_id}] is released; the CLI may \
+                     still offer its id: {e}"
+                );
+            }
         }
     }
 
@@ -541,7 +601,7 @@ impl NgapTask {
             .collect();
 
         for ue_id in ue_ids {
-            self.delete_ue_context(ue_id);
+            self.delete_ue_context(ue_id).await;
             // Notify RRC of AN release
             self.send_an_release(ue_id).await;
         }
@@ -787,6 +847,13 @@ impl NgapTask {
             }
         };
 
+        // Republish the (possibly now complete) NGAP ID pair to the CLI registry
+        // (issue #199). This is the FIRST message that can carry an AMF UE NGAP ID
+        // during a registration -- the AMF answers the Initial UE Message with a
+        // Downlink NAS Transport carrying the Authentication Request -- so without
+        // this, `ue-info` would show no `amf_ue_ngap_id` until Initial Context Setup.
+        self.sync_ue_context_to_app(ue_id).await;
+
         // Log the NAS PDU content for debugging
         debug!(
             "NAS PDU (first 16 bytes): {:02x?}",
@@ -1015,6 +1082,11 @@ impl NgapTask {
             }
         };
 
+        // Publish the complete NGAP ID pair to the CLI registry (issue #199). This
+        // is the point nextgcore #403 depends on: a UE that has reached Initial
+        // Context Setup is one `ue-suspend` can legitimately drive to RRC_INACTIVE.
+        self.sync_ue_context_to_app(ue_id).await;
+
         // TS 33.501 §6.7 / TS 38.331 §5.3.4: establish AS security — derive the
         // AS keys from KgNB, select algorithms from the UE Security
         // Capabilities, and send the RRC SecurityModeCommand — before
@@ -1220,6 +1292,10 @@ impl NgapTask {
                 ctx.ue_security_capabilities = Some(caps);
             }
         }
+
+        // Republish to the CLI registry (issue #199): a modification can be the
+        // first message that carries this UE's AMF UE NGAP ID.
+        self.sync_ue_context_to_app(ue_id).await;
 
         // AS re-keying (TS 33.501 §6.9.2): re-derive the AS key set from the new
         // KgNB. `rekey_caps` is guaranteed present here by the precondition above.
@@ -1856,6 +1932,10 @@ impl NgapTask {
             }
         };
 
+        // Republish to the CLI registry (issue #199), for the same reason as at
+        // Initial Context Setup: this can be where the ID pair first completes.
+        self.sync_ue_context_to_app(ue_id).await;
+
         let mut setup_response_items = Vec::new();
         let mut failed_items = Vec::new();
         let gnb_ip = self
@@ -2322,7 +2402,7 @@ impl NgapTask {
         };
 
         // Delete UE context
-        self.delete_ue_context(ue_id);
+        self.delete_ue_context(ue_id).await;
 
         // Send UE Context Release Complete
         let complete_params = UeContextReleaseCompleteParams {
@@ -2406,7 +2486,7 @@ impl NgapTask {
         }
 
         // Create UE context
-        let ran_ue_ngap_id = match self.create_ue_context(ue_id, amf_id) {
+        let ran_ue_ngap_id = match self.create_ue_context(ue_id, amf_id).await {
             Some(id) => id,
             None => {
                 error!("Failed to create UE context for UE {}", ue_id);
@@ -2502,7 +2582,7 @@ impl NgapTask {
             Err(e) => {
                 error!("Failed to encode Initial UE Message: {}", e);
                 // Clean up UE context on failure
-                self.delete_ue_context(ue_id);
+                self.delete_ue_context(ue_id).await;
                 return;
             }
         }
@@ -2854,7 +2934,7 @@ impl NgapTask {
     /// INDICATION (TS 38.413 §10.6, Handling of AP ID) — where echoing another
     /// NGAP message back to the AMF would be wrong.
     async fn local_release_ue(&mut self, ue_id: i32) {
-        self.delete_ue_context(ue_id);
+        self.delete_ue_context(ue_id).await;
         self.send_an_release(ue_id).await;
         let msg = GtpMessage::UeContextRelease { ue_id };
         if let Err(e) = self.task_base.gtp_tx.send(msg).await {
@@ -3209,7 +3289,7 @@ impl NgapTask {
     /// notify the RRC and GTP tasks (no UE Context Release Complete is sent —
     /// NG Reset is acknowledged at the interface level).
     async fn release_ue_for_reset(&mut self, ue_id: i32) {
-        self.delete_ue_context(ue_id);
+        self.delete_ue_context(ue_id).await;
         self.send_an_release(ue_id).await;
         let msg = GtpMessage::UeContextRelease { ue_id };
         if let Err(e) = self.task_base.gtp_tx.send(msg).await {
@@ -3702,10 +3782,13 @@ impl NgapTask {
         );
 
         // Allocate a new UE context for the incoming handover
-        let Some(ran_ue_ngap_id) = self.create_ue_context(
-            self.ue_contexts.len() as i32 + 1000, // Handover UE IDs start from 1000
-            client_id,
-        ) else {
+        let Some(ran_ue_ngap_id) = self
+            .create_ue_context(
+                self.ue_contexts.len() as i32 + 1000, // Handover UE IDs start from 1000
+                client_id,
+            )
+            .await
+        else {
             error!(
                 "Failed to create UE context for handover, amf_ue_ngap_id={}",
                 ho_req.amf_ue_ngap_id
@@ -3719,6 +3802,10 @@ impl NgapTask {
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
             ctx.amf_ue_ngap_id = Some(ho_req.amf_ue_ngap_id as i64);
         }
+        // Republish to the CLI registry (issue #199). A handed-over UE arrives with
+        // its AMF UE NGAP ID already known, so `create_ue_context`'s send above
+        // published an incomplete pair.
+        self.sync_ue_context_to_app(ue_id).await;
 
         // TS 33.501 §6.9.2.3.1: derive this target's KgNB* BEFORE admitting any
         // session, because the admitted DRBs are keyed from it. Doing it after would
@@ -4400,6 +4487,10 @@ impl NgapTask {
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
             ctx.amf_ue_ngap_id = Some(ack.amf_ue_ngap_id as i64);
         }
+        // Republish to the CLI registry (issue #199). Not merely additive here: the
+        // AMF UE NGAP ID can CHANGE across a path switch, so an entry left at the
+        // old value would report an ID the AMF no longer answers to.
+        self.sync_ue_context_to_app(ue_id).await;
 
         // Adopt the fresh {NH, NCC} the AMF sent and re-key from it (TS 33.501
         // §6.9.2.3.1, issue #39). The same function the HANDOVER REQUEST path uses, so a
@@ -5630,8 +5721,8 @@ mod tests {
         assert_eq!(ctx.state, AmfState::NotConnected);
     }
 
-    #[test]
-    fn test_ngap_task_ue_context_creation() {
+    #[tokio::test]
+    async fn test_ngap_task_ue_context_creation() {
         let config = test_config();
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
@@ -5646,7 +5737,7 @@ mod tests {
         }
 
         // Create UE context
-        let ran_id = task.create_ue_context(10, 1);
+        let ran_id = task.create_ue_context(10, 1).await;
         assert!(ran_id.is_some());
         assert_eq!(ran_id.unwrap(), 1); // First RAN UE NGAP ID
 
@@ -5797,8 +5888,8 @@ mod tests {
 
     /// Multiple-TNLA load balancing (TS 38.412 §7, issue #41 criterion 8):
     /// new UEs spread across the TNLAs of one AMF instead of piling on one.
-    #[test]
-    fn test_select_amf_load_balances_across_tnlas() {
+    #[tokio::test]
+    async fn test_select_amf_load_balances_across_tnlas() {
         use nextgsim_ngap::procedures::{Guami, ServedGuamiItem};
 
         let config = test_config();
@@ -5829,14 +5920,14 @@ mod tests {
         // First UE lands on the lower TNLA id (both idle).
         let first = task.select_amf(&plmn, &[]).unwrap();
         assert_eq!(first, 1);
-        task.create_ue_context(10, first);
+        task.create_ue_context(10, first).await;
         // Next selection load-balances onto the other TNLA of the same AMF.
         let second = task.select_amf(&plmn, &[]).unwrap();
         assert_eq!(
             second, 2,
             "second UE load-balanced onto the other TNLA of the same AMF"
         );
-        task.create_ue_context(11, second);
+        task.create_ue_context(11, second).await;
         // Both TNLAs now at load 1 → tie breaks back to the lower id.
         assert_eq!(task.select_amf(&plmn, &[]).unwrap(), 1);
     }
@@ -5858,8 +5949,8 @@ mod tests {
         assert_eq!(id3, 3);
     }
 
-    #[test]
-    fn test_ngap_task_ue_context_deletion() {
+    #[tokio::test]
+    async fn test_ngap_task_ue_context_deletion() {
         let config = test_config();
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
@@ -5872,12 +5963,12 @@ mod tests {
             ctx.on_association_up(100, 4, 4);
             ctx.state = AmfState::Ready;
         }
-        task.create_ue_context(10, 1);
+        task.create_ue_context(10, 1).await;
 
         assert!(task.find_ue_context(10).is_some());
 
         // Delete
-        task.delete_ue_context(10);
+        task.delete_ue_context(10).await;
         assert!(task.find_ue_context(10).is_none());
     }
 
@@ -5998,8 +6089,8 @@ mod tests {
         }
 
         // Two UE contexts on AMF[1]; give them distinct RAN UE NGAP IDs.
-        let ran1 = task.create_ue_context(10, 1).expect("ue1");
-        let ran2 = task.create_ue_context(20, 1).expect("ue2");
+        let ran1 = task.create_ue_context(10, 1).await.expect("ue1");
+        let ran2 = task.create_ue_context(20, 1).await.expect("ue2");
         assert_ne!(ran1, ran2);
 
         // Reset only UE[10] by its RAN UE NGAP ID.
@@ -6031,8 +6122,8 @@ mod tests {
             ctx.on_association_up(100, 8, 8);
             ctx.state = AmfState::Ready;
         }
-        task.create_ue_context(10, 1).expect("ue1");
-        task.create_ue_context(20, 1).expect("ue2");
+        task.create_ue_context(10, 1).await.expect("ue1");
+        task.create_ue_context(20, 1).await.expect("ue2");
 
         let reset = NgResetData {
             cause: None,
@@ -6134,7 +6225,7 @@ mod tests {
 
     /// Seed an NGAP task with a Ready AMF and one UE context; returns the task
     /// (with `sctp_rx` bound to observe replies) and the UE's RAN-UE-NGAP-ID.
-    fn seed_task_with_ue() -> (
+    async fn seed_task_with_ue() -> (
         NgapTask,
         tokio::sync::mpsc::Receiver<TaskMessage<SctpMessage>>,
         i64,
@@ -6148,7 +6239,7 @@ mod tests {
             ctx.on_association_up(100, 8, 8);
             ctx.state = AmfState::Ready;
         }
-        let ran = task.create_ue_context(10, 1).expect("ue context");
+        let ran = task.create_ue_context(10, 1).await.expect("ue context");
         (task, sctp_rx, ran)
     }
 
@@ -6220,7 +6311,7 @@ mod tests {
     /// the AS keys and the gNB replies with a RESPONSE (not an Error Indication).
     #[tokio::test]
     async fn test_ue_context_modification_rekeys_and_responds() {
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
 
         // Establish a baseline AS security context.
         task.activate_as_security(10, [0x11u8; 32], &caps(0xC000, 0xC000))
@@ -6277,7 +6368,7 @@ mod tests {
     /// replaced UE-AMBR, replies with a RESPONSE, and does not touch AS keys.
     #[tokio::test]
     async fn test_ue_context_modification_updates_ambr_without_rekey() {
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
         task.activate_as_security(10, [0x11u8; 32], &caps(0xC000, 0xC000))
             .await;
         let old = task
@@ -6326,7 +6417,7 @@ mod tests {
     /// UE CONTEXT MODIFICATION FAILURE — never an Error Indication.
     #[tokio::test]
     async fn test_ue_context_modification_unknown_ue_replies_failure() {
-        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue().await;
 
         let data = UeContextModificationRequestData {
             amf_ue_ngap_id: 555,
@@ -6367,7 +6458,7 @@ mod tests {
     async fn test_ue_context_modification_no_caps_rekey_fails_atomically() {
         // A freshly-created UE context has no stored UE Security Capabilities
         // (they are set at Initial Context Setup, which we deliberately skip).
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
         assert!(task
             .find_ue_context(10)
             .unwrap()
@@ -6421,7 +6512,7 @@ mod tests {
     /// UE context (TS 38.413 §8.3.4.2).
     #[tokio::test]
     async fn test_ue_context_modification_stores_updated_caps() {
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
 
         let data = UeContextModificationRequestData {
             amf_ue_ngap_id: 555,
@@ -6462,7 +6553,7 @@ mod tests {
     /// AMF (TS 38.413 §8.7.5 / §10.6).
     #[tokio::test]
     async fn test_error_indication_releases_ue_and_does_not_echo() {
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
         assert!(task.find_ue_context(10).is_some());
 
         let params = ErrorIndicationParams {
@@ -6494,7 +6585,7 @@ mod tests {
     /// local release and, crucially, no reply.
     #[tokio::test]
     async fn test_error_indication_unknown_ue_is_silently_processed() {
-        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue().await;
 
         let params = ErrorIndicationParams {
             amf_ue_ngap_id: None,
@@ -6517,7 +6608,7 @@ mod tests {
     async fn test_downlink_nas_rrc_failure_emits_non_delivery() {
         // `seed_task_with_ue` drops the RRC receiver, so `rrc_tx.send` fails —
         // exercising the RRC-send-failure non-delivery path for a *known* UE.
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
         let nas_pdu = vec![0x7e, 0x00, 0x55];
         let dl_nas = DownlinkNasTransportData {
             amf_ue_ngap_id: 555,
@@ -6545,7 +6636,7 @@ mod tests {
     async fn test_downlink_nas_unknown_ue_emits_non_delivery() {
         use nextgsim_ngap::procedures::nas_non_delivery_indication::is_nas_non_delivery_indication;
 
-        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue().await;
         let nas_pdu = vec![0x7e, 0x00, 0x42, 0x11, 0x22];
         let dl_nas = DownlinkNasTransportData {
             amf_ue_ngap_id: 555,
@@ -6813,7 +6904,7 @@ mod tests {
 
     /// A task with one ready AMF and one UE context that has an AMF UE NGAP ID, i.e.
     /// a UE whose UE-associated signalling connection is usable.
-    fn task_with_ue(
+    async fn task_with_ue(
         ue_id: i32,
     ) -> (
         NgapTask,
@@ -6827,7 +6918,7 @@ mod tests {
             ctx.on_association_up(100, 8, 8);
             ctx.state = AmfState::Ready;
         }
-        task.create_ue_context(ue_id, 1).expect("ue context");
+        task.create_ue_context(ue_id, 1).await.expect("ue context");
         if let Some(ctx) = task.find_ue_context_mut(ue_id) {
             ctx.amf_ue_ngap_id = Some(4242);
         }
@@ -6844,7 +6935,7 @@ mod tests {
     /// four-tuple is destructured by the issue #32 tests, and widening it there would be
     /// churn for no gain.
     #[allow(clippy::type_complexity)]
-    fn task_with_sctp(
+    async fn task_with_sctp(
         ue_id: i32,
     ) -> (
         NgapTask,
@@ -6860,7 +6951,7 @@ mod tests {
             ctx.on_association_up(100, 8, 8);
             ctx.state = AmfState::Ready;
         }
-        task.create_ue_context(ue_id, 1).expect("ue context");
+        task.create_ue_context(ue_id, 1).await.expect("ue context");
         if let Some(ctx) = task.find_ue_context_mut(ue_id) {
             ctx.amf_ue_ngap_id = Some(7777);
         }
@@ -6935,7 +7026,7 @@ mod tests {
         use nextgsim_ngap::procedures::handover::parse_handover_request_acknowledge;
         use nextgsim_ngap::procedures::transfer::decode_handover_ack_transfer;
 
-        let (mut task, _rrc_rx, mut gtp_rx, mut sctp_rx) = task_with_sctp(1);
+        let (mut task, _rrc_rx, mut gtp_rx, mut sctp_rx) = task_with_sctp(1).await;
         // Two sessions with different ids, because a handler that admitted the first
         // twice -- or a hardcoded 1 -- would satisfy a single-session test.
         let pdu = handover_request(
@@ -7038,7 +7129,7 @@ mod tests {
     async fn the_target_arms_arrival_detection_over_the_channel() {
         use nextgsim_ngap::procedures::handover::parse_handover_request_acknowledge;
 
-        let (mut task, mut rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(1);
+        let (mut task, mut rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(1).await;
         let pdu = handover_request(&[5], None);
         let ho_req =
             nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).expect("parse");
@@ -7082,7 +7173,7 @@ mod tests {
     /// cover the encode arm would be claiming something untrue.
     #[tokio::test]
     async fn an_acknowledge_that_could_not_be_delivered_arms_nothing() {
-        let (mut task, mut rrc_rx, _gtp_rx, sctp_rx) = task_with_sctp(1);
+        let (mut task, mut rrc_rx, _gtp_rx, sctp_rx) = task_with_sctp(1).await;
         // The SCTP task is gone: `sctp_tx.send` now fails, so the AMF is never told.
         drop(sctp_rx);
 
@@ -7116,7 +7207,7 @@ mod tests {
     async fn the_target_re_keys_vertically_from_the_amfs_next_hop() {
         use nextgsim_crypto::kdf::derive_kgnb_star;
 
-        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1);
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
         let nh = [0xA5u8; 32];
         let pdu = handover_request(
             &[5],
@@ -7173,7 +7264,7 @@ mod tests {
         };
         use nextgsim_rrc::procedures::handover_preparation::decode_handover_preparation_information;
 
-        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(3);
+        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(3).await;
         // A PDU session, because `PDUSessionResourceListHORqd` is `SIZE(1..)` and a UE
         // with none has no user plane to move.
         if let Some(ctx) = task.find_ue_context_mut(3) {
@@ -7242,7 +7333,7 @@ mod tests {
     /// session 1.
     #[tokio::test]
     async fn initiate_handover_refuses_a_ue_with_no_pdu_session() {
-        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(4);
+        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(4).await;
         assert!(
             task.find_ue_context(4)
                 .is_some_and(|c| c.pdu_session_count() == 0),
@@ -7278,7 +7369,7 @@ mod tests {
         use nextgsim_crypto::kdf::derive_kgnb_star;
         use nextgsim_ngap::procedures::path_switch::SwitchedSessionItem;
 
-        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1);
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
         let ran_ue_ngap_id = task
             .find_ue_context(1)
             .map(|c| c.ran_ue_ngap_id as u32)
@@ -7325,7 +7416,7 @@ mod tests {
             GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
         let mut task = NgapTask::new(task_base);
         task.create_amf_context(1);
-        task.create_ue_context(5, 1).expect("ue context");
+        task.create_ue_context(5, 1).await.expect("ue context");
         // No `amf_ue_ngap_id`.
         assert!(
             !task
@@ -7366,7 +7457,7 @@ mod tests {
     /// `RadioResourcesNotAvailable`, so a security test built on it would see the
     /// wrong refusal and pass for the wrong reason. Found exactly that way.
     #[allow(clippy::type_complexity)]
-    fn task_with_live_receivers(
+    async fn task_with_live_receivers(
         ue_id: i32,
     ) -> (
         NgapTask,
@@ -7382,7 +7473,7 @@ mod tests {
             ctx.on_association_up(100, 8, 8);
             ctx.state = AmfState::Ready;
         }
-        task.create_ue_context(ue_id, 1).expect("ue context");
+        task.create_ue_context(ue_id, 1).await.expect("ue context");
         if let Some(ctx) = task.find_ue_context_mut(ue_id) {
             ctx.amf_ue_ngap_id = Some(4242);
         }
@@ -7469,7 +7560,7 @@ mod tests {
         use nextgsim_ngap::procedures::transfer::{
             decode_setup_unsuccessful_transfer, UpProtectionPolicy,
         };
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(21);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(21).await;
         // NIA0/NEA0 selected: neither protection is possible whatever the build.
         key_ue(&mut task, 21, 0, 0);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
@@ -7528,7 +7619,7 @@ mod tests {
     #[tokio::test]
     async fn a_satisfiable_policy_establishes_the_session_and_is_stored_on_it() {
         use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(22);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(22).await;
         key_ue(&mut task, 22, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -7581,7 +7672,7 @@ mod tests {
         use nextgsim_ngap::procedures::transfer::{
             decode_setup_unsuccessful_transfer, UpProtectionPolicy,
         };
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(26);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(26).await;
         // Real algorithms: the only reason protection is impossible is the build.
         key_ue(&mut task, 26, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
@@ -7609,7 +7700,7 @@ mod tests {
     #[tokio::test]
     async fn with_the_feature_a_required_policy_is_satisfied_and_both_protections_apply() {
         use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(27);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(27).await;
         key_ue(&mut task, 27, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         let item = setup_item_with_policy(
@@ -7637,7 +7728,7 @@ mod tests {
     /// policy, and is still established.
     #[tokio::test]
     async fn a_session_with_no_security_indication_gets_the_local_default() {
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(23);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(23).await;
         key_ue(&mut task, 23, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -7659,7 +7750,7 @@ mod tests {
     #[tokio::test]
     async fn a_not_needed_integrity_policy_leaves_the_drb_without_a_mac_i() {
         use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(24);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(24).await;
         key_ue(&mut task, 24, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -7701,7 +7792,7 @@ mod tests {
         };
         use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
 
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(30);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(30).await;
         key_ue(&mut task, 30, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         // `not-needed` integrity: distinguishable from the local `preferred` default
@@ -7761,7 +7852,7 @@ mod tests {
     async fn the_path_switch_acknowledges_policy_reaches_the_session() {
         use nextgsim_ngap::procedures::path_switch::SwitchedSessionItem;
         use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(25);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(25).await;
         key_ue(&mut task, 25, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         // Establish a session with NO policy, so the Acknowledge is the only source.
@@ -7829,7 +7920,7 @@ mod tests {
         use nextgsim_rrc::procedures::rrc_reconfiguration::{
             decode_rrc_reconfiguration, drb_integrity_protection, DrbIntegrityProtection,
         };
-        let (mut task, mut rrc_rx, _gtp_rx, mut rls_rx) = task_with_live_receivers(28);
+        let (mut task, mut rrc_rx, _gtp_rx, mut rls_rx) = task_with_live_receivers(28).await;
         key_ue(&mut task, 28, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         let item = setup_item_with_policy(
@@ -7918,7 +8009,7 @@ mod tests {
         use nextgsim_rrc::procedures::rrc_reconfiguration::{
             decode_rrc_reconfiguration, drb_integrity_protection, DrbIntegrityProtection,
         };
-        let (mut task, mut rrc_rx, _gtp_rx, mut rls_rx) = task_with_live_receivers(29);
+        let (mut task, mut rrc_rx, _gtp_rx, mut rls_rx) = task_with_live_receivers(29).await;
         key_ue(&mut task, 29, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         let item = setup_item_with_policy(
@@ -7977,7 +8068,7 @@ mod tests {
     /// the context in `Releasing` forever.
     #[tokio::test]
     async fn tngreloc_overall_expiry_releases_a_stuck_ue_context() {
-        let (mut task, _sctp_rx) = task_with_ue(11);
+        let (mut task, _sctp_rx) = task_with_ue(11).await;
 
         task.handle_ue_context_release_request(11, UeReleaseRequestCause::UserTriggered)
             .await;
@@ -8015,7 +8106,7 @@ mod tests {
         use nextgsim_ngap::procedures::ue_context_release::{
             UeContextReleaseCommandData, UeNgapIds,
         };
-        let (mut task, _sctp_rx) = task_with_ue(12);
+        let (mut task, _sctp_rx) = task_with_ue(12).await;
 
         task.handle_ue_context_release_request(12, UeReleaseRequestCause::UserTriggered)
             .await;
@@ -8052,7 +8143,7 @@ mod tests {
     /// may hold resources that only the cancel releases.
     #[tokio::test]
     async fn tngreloc_prep_expiry_cancels_the_handover() {
-        let (mut task, mut sctp_rx) = task_with_ue(13);
+        let (mut task, mut sctp_rx) = task_with_ue(13).await;
         let ran_ue_ngap_id = task
             .find_ue_context(13)
             .map(|c| c.ran_ue_ngap_id)
@@ -8108,7 +8199,7 @@ mod tests {
     /// cancelled by its own guard timer.
     #[tokio::test]
     async fn a_handover_command_cancels_tngreloc_prep() {
-        let (mut task, mut sctp_rx) = task_with_ue(14);
+        let (mut task, mut sctp_rx) = task_with_ue(14).await;
         let ran_ue_ngap_id = task
             .find_ue_context(14)
             .map(|c| c.ran_ue_ngap_id)
@@ -8274,7 +8365,7 @@ mod tests {
     async fn a_released_pdu_session_is_reported_as_a_notify_on_the_wire() {
         use nextgsim_ngap::procedures::pdu_session_resource_notify::decode_pdu_session_resource_notify;
 
-        let (mut task, mut sctp_rx) = task_with_ue(11);
+        let (mut task, mut sctp_rx) = task_with_ue(11).await;
 
         task.send_pdu_session_resource_notify(
             11,
@@ -8307,7 +8398,7 @@ mod tests {
             decode_pdu_session_resource_notify, NotificationCauseValue,
         };
 
-        let (mut task, mut sctp_rx) = task_with_ue(11);
+        let (mut task, mut sctp_rx) = task_with_ue(11).await;
 
         task.send_pdu_session_resource_notify(
             11,
@@ -8343,7 +8434,7 @@ mod tests {
     async fn the_notify_is_reachable_through_the_ngap_message_dispatch() {
         use nextgsim_ngap::procedures::pdu_session_resource_notify::decode_pdu_session_resource_notify;
 
-        let (mut task, mut sctp_rx) = task_with_ue(11);
+        let (mut task, mut sctp_rx) = task_with_ue(11).await;
         let (tx, rx) = tokio::sync::mpsc::channel::<TaskMessage<NgapMessage>>(4);
 
         tx.send(TaskMessage::Message(
@@ -8383,7 +8474,7 @@ mod tests {
             ctx.on_association_up(100, 8, 8);
             ctx.state = AmfState::Ready;
         }
-        task.create_ue_context(12, 1).expect("ue context");
+        task.create_ue_context(12, 1).await.expect("ue context");
         // Deliberately NOT setting amf_ue_ngap_id.
 
         task.send_pdu_session_resource_notify(
@@ -8403,7 +8494,7 @@ mod tests {
     /// with a fabricated RAN-UE-NGAP-ID.
     #[tokio::test]
     async fn an_unknown_ue_emits_no_notify() {
-        let (mut task, mut sctp_rx) = task_with_ue(11);
+        let (mut task, mut sctp_rx) = task_with_ue(11).await;
         task.send_pdu_session_resource_notify(
             999,
             vec![(1, NotifyCause::TransportResourceUnavailable)],
@@ -8997,7 +9088,7 @@ mod tests {
     /// constructed. Named UE, named TMGI, membership read back from the manager.
     #[tokio::test]
     async fn a_setup_request_mbs_list_makes_the_ue_a_member() {
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(31);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(31).await;
         key_ue(&mut task, 31, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         activate_mbs_session(&mut task, AMF_MBS_TMGI);
@@ -9060,7 +9151,7 @@ mod tests {
     /// the multicast session must not destroy the unicast one.
     #[tokio::test]
     async fn an_unservable_mbs_join_is_refused_without_failing_the_pdu_session() {
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(32);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(32).await;
         key_ue(&mut task, 32, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         // Deliberately NO activation: the TMGI is unknown to this gNB.
@@ -9115,7 +9206,7 @@ mod tests {
             PduSessionResourceModifyRequestData, PduSessionResourceModifyRequestItem,
         };
 
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(33);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(33).await;
         key_ue(&mut task, 33, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         activate_mbs_session(&mut task, AMF_MBS_TMGI);
@@ -9202,7 +9293,7 @@ mod tests {
     /// list does not accumulate UEs that are gone.
     #[tokio::test]
     async fn deleting_a_ue_context_drops_its_mbs_memberships() {
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(34);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(34).await;
         key_ue(&mut task, 34, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         activate_mbs_session(&mut task, AMF_MBS_TMGI);
@@ -9228,7 +9319,7 @@ mod tests {
             .unwrap()
             .has_ue(34));
 
-        task.delete_ue_context(34);
+        task.delete_ue_context(34).await;
 
         let session = task.mbs_ngap_sessions.get(&AMF_MBS_TMGI).expect("session");
         assert!(
@@ -9245,7 +9336,7 @@ mod tests {
     /// UE-associated procedures, and the session-level procedure sees it.
     #[tokio::test]
     async fn a_deactivation_sees_the_members_the_pdu_procedures_added() {
-        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(35);
+        let (mut task, _rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(35).await;
         key_ue(&mut task, 35, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         activate_mbs_session(&mut task, AMF_MBS_TMGI);
@@ -9462,7 +9553,7 @@ mod tests {
         };
         use nextgsim_ngap::codec::nrppa_generated as nrppa;
 
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
         let inbound = encode_dl_ue_nrppa_ecid_request(777, ran as u32, 7, 3);
 
         task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
@@ -9579,7 +9670,7 @@ mod tests {
         };
         use nextgsim_ngap::codec::nrppa_generated as nrppa;
 
-        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue().await;
         let routing_id = [0xAAu8, 0xBB];
         let inbound = encode_dl_non_ue_nrppa_trp_request(&routing_id, 21);
 
@@ -9673,7 +9764,7 @@ mod tests {
         };
         use nextgsim_ngap::codec::nrppa_generated as nrppa;
 
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
 
         // Every IE of a PositioningInformationRequest is OPTIONAL (§9.1.10), so
         // an empty container is a legal request.
@@ -9785,7 +9876,7 @@ mod tests {
         };
         use nextgsim_ngap::codec::nrppa_generated as nrppa;
 
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
 
         let mut ran_ids = Vec::new();
         for transaction in [1u16, 2] {
@@ -9863,7 +9954,7 @@ mod tests {
         };
         use nextgsim_ngap::codec::nrppa_generated as nrppa;
 
-        let (mut task, mut sctp_rx, ran) = seed_task_with_ue();
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
 
         // Procedure 6, OTDOA Information Exchange: a real NRPPa procedure this
         // node does not answer.
