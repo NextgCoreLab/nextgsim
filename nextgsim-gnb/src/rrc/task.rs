@@ -496,6 +496,32 @@ impl RrcTask {
             return;
         }
 
+        // A real UPER RRCResumeRequest / RRCResumeRequest1, recognised HERE rather
+        // than in the byte-fallback ladder below (TS 38.331 §5.3.13.3, issue #201).
+        //
+        // This is a second, independent reason RRC_INACTIVE could not be resumed,
+        // and it survives even once the UE has a `resumeMAC-I` to present. The
+        // ladder routes on `bytes[0] & 0x3F` and reaches
+        // `handle_rrc_resume_request` only for `0x28` — but a conformant
+        // `RRCResumeRequest1` is `UL-CCCH1` c1 index 0, so its leading byte is
+        // `0x00`, which falls in the ladder's own `0x00..=0x1F` **RRCSetupRequest**
+        // arm. A resume therefore answered with an `RRCSetup` built on a fabricated
+        // context: the I-RNTI was never looked up, the `resumeMAC-I` was never
+        // verified, and the UE's NGAP context was replaced instead of reused. (The
+        // short form encodes to `0x20`, which the ladder silently dropped as an
+        // unknown type; `0x28` was the pre-#151 bespoke framing that no longer
+        // exists.)
+        //
+        // Safe to try before `decode_rrc_setup_request` because the four UL-CCCH
+        // decoders are mutually exclusive on the c1 index — each rejects the other
+        // three's PDUs — so this cannot capture a setup or a re-establishment. The
+        // message-level decode of both forms, and the choice between them, stays in
+        // `handle_rrc_resume_request`, which already tries the full identity first.
+        if decode_rrc_resume_request1(bytes).is_ok() || decode_rrc_resume_request(bytes).is_ok() {
+            self.handle_rrc_resume_request(ue_id, data).await;
+            return;
+        }
+
         // Try ASN.1 UPER decoding first (proper 3GPP encoding)
         if let Ok(setup_req) = decode_rrc_setup_request(bytes) {
             let (initial_id, is_stmsi) = match setup_req.ue_identity {
@@ -575,10 +601,13 @@ impl RrcTask {
             // RRCSetupRequest, so a re-establishment was answered with an
             // RRCSetup built on a fabricated context. Both ends now use the real
             // UPER encoding, handled before this fallback ladder.
-            // RRC Resume Request (0x28)
-            0x28 => {
-                self.handle_rrc_resume_request(ue_id, data).await;
-            }
+            // No legacy arm for an RRCResumeRequest either. There was one, on 0x28,
+            // and nothing ever reached it: 0x28 was the pre-#151 bespoke framing,
+            // and a REAL RRCResumeRequest1 leads with 0x00 (UL-CCCH1 c1 index 0) —
+            // so it fell into the RRCSetupRequest range above and a resume was
+            // answered with an RRCSetup on a fabricated context, the exact
+            // mirror of the re-establishment defect noted just above (issue #201).
+            // Both real forms are now decoded before this fallback ladder.
             _ => {
                 debug!("Unknown UL-CCCH message type: 0x{:02x}", msg_type);
             }

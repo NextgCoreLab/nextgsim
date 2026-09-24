@@ -329,6 +329,36 @@ impl RrcConnectionManager {
             return None;
         }
 
+        // A UE that ESTABLISHES AFRESH has abandoned any RRC_INACTIVE context it held,
+        // so the gNB's copy goes with it (TS 38.300 §9.2.2.2, issue #201).
+        //
+        // This is the gNB being *told*, on the wire, by a real message. A suspended UE
+        // that could not resume — no `K_RRCint`, an expired `t380`, a `resumeMAC-I` the
+        // network refused — falls back to RRC_IDLE and comes back with an
+        // `RRCSetupRequest` (TS 38.331 §5.3.13.5). There is no UE→network "I am
+        // abandoning this I-RNTI" message in 3GPP; §9.2.2.2 makes "a new RRC connection
+        // instead of resumption of the previous RRC connection" exactly the network's
+        // cue, and this is that cue arriving.
+        //
+        // Without it the store leaked: `initiate_rrc_suspend` inserts by I-RNTI and only
+        // a *verified* resume ever removed one (`take_suspended`), so every failed
+        // resume left a context behind for the lifetime of the process — holding
+        // `K_RRCint` for a UE that had moved on, and, because a later suspension of the
+        // same UE allocates a NEW I-RNTI, accumulating one entry per attempt.
+        //
+        // Keyed on `previous_ue_id` because that is the only identity the two messages
+        // share: the RRCSetupRequest names no I-RNTI, and the suspended context has no
+        // live `ue_id`. It is the id the RLS layer resolves from the UE's STI, which
+        // survives the suspension (the UE keeps sending heartbeats in RRC_INACTIVE),
+        // which is why the same UE reappears under the same id.
+        for stale in ue_mgr.discard_suspended_for_ue(ue_id) {
+            warn!(
+                "Discarded the RRC_INACTIVE context of UE[{ue_id}] (I-RNTI={stale:#x}): the \
+                 UE is establishing a NEW RRC connection, so it has abandoned that \
+                 I-RNTI (TS 38.300 §9.2.2.2)"
+            );
+        }
+
         // Create UE context
         let ctx = ue_mgr.create_ue(ue_id);
         ctx.set_initial_id(initial_id, is_stmsi);

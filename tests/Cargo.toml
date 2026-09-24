@@ -176,3 +176,13 @@ path = "src/sdap_user_plane.rs"
 [[test]]
 name = "gnb_cli_reachability"
 path = "src/gnb_cli_reachability.rs"
+
+# RRC_INACTIVE resume end to end under the SHIPPED config (issue #201): a suspended UE
+# sends an RRCResumeRequest1 whose resumeMAC-I the gNB verifies, and the NAS returns on
+# an UplinkNASTransport with the pre-suspension ran_ue_ngap_id. NOT feature-gated: the
+# resume path is in every default build, and being unreachable under the shipped
+# `as_security_enabled: false` is the defect itself -- so it belongs in
+# `cargo test --workspace`.
+[[test]]
+name = "rrc_inactive_resume"
+path = "src/rrc_inactive_resume.rs"

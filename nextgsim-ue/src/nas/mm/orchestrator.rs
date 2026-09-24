@@ -149,7 +149,14 @@ pub enum MmOutput {
     /// COUNT (TS 33.501 §6.9.4.1). Emitted once NAS security is active so the
     /// caller hands it to the RRC plane (`RrcMessage::AsSecurityKey`) to derive
     /// K_RRCint/K_RRCenc when the AS SecurityModeCommand arrives (Wave-6 I5).
-    /// Only produced when the `UeConfig::as_security_enabled` wire gate is on.
+    ///
+    /// Produced whenever NAS security is active, in EVERY configuration (issue
+    /// #201). It used to be gated on `UeConfig::as_security_enabled`, which starved
+    /// the RRC plane of the key an RRC resume's `resumeMAC-I` needs
+    /// (TS 38.331 §5.3.13.3) under both shipped configs. `KgNB` never crosses the
+    /// air — both ends derive it from KAMF (TS 33.501 §6.2) — so this is in-process
+    /// only and carrying it changes nothing on the wire. The wire gate still
+    /// governs what RRC applies with it.
     AsSecurityKgnb([u8; 32]),
     /// The network signalled its view of PDU session state in a PDU session
     /// status IE on REGISTRATION ACCEPT or SERVICE ACCEPT (TS 24.501
@@ -593,13 +600,6 @@ pub struct MmOrchestrator {
     /// Whether an assigned UE radio capability ID is kept at all
     /// (`UeConfig::racs_store_assigned_id`)
     racs_store_assigned_id: bool,
-    /// Whether AS security activation is enabled (`UeConfig::as_security_enabled`,
-    /// issue #31).
-    ///
-    /// A field read from config at construction rather than a compile-time
-    /// constant, which is what criterion 1 asks for: no shipping build could
-    /// activate AS security while the gate was `const false`.
-    as_security_enabled: bool,
     current_tai: Option<[u8; 6]>,
     /// Equivalent PLMN list signalled in the last Registration Accept
     /// (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). Each entry is a 3-octet
@@ -699,7 +699,6 @@ impl MmOrchestrator {
             pending_nssai: None,
             racs_id: None,
             racs_store_assigned_id: false,
-            as_security_enabled: false,
             current_tai: None,
             equivalent_plmns: Vec::new(),
             t3502_value: None,
@@ -748,7 +747,6 @@ impl MmOrchestrator {
     pub fn from_config(identity: MmUeIdentity, config: &UeConfig) -> Self {
         let mut orch = Self::new(identity);
         orch.racs_store_assigned_id = config.racs_store_assigned_id;
-        orch.as_security_enabled = config.as_security_enabled;
         orch.configure_uav(config);
         let Some(ref path) = config.state_file else {
             return orch;
@@ -2492,14 +2490,28 @@ impl MmOrchestrator {
         let mut outs = vec![MmOutput::SendNasPdu(pdu)];
         // Wave-6 I5: once NAS security is active, hand the derived KgNB to the
         // RRC plane so it can derive K_RRCint/K_RRCenc when the AS
-        // SecurityModeCommand arrives (TS 33.501 §6.9.4.1). Gated behind the
-        // AS-security wire knob; the exact uplink NAS COUNT the AMF uses for the
-        // KgNB derivation is a cross-stack detail verified in the docker E2E
-        // sign-off (hazard #269, host-only).
-        if self.as_security_enabled {
-            if let Some(kgnb) = self.derive_kgnb_for_as_security() {
-                outs.push(MmOutput::AsSecurityKgnb(kgnb));
-            }
+        // SecurityModeCommand arrives (TS 33.501 §6.9.4.1). The exact uplink NAS
+        // COUNT the AMF uses for the KgNB derivation is a cross-stack detail
+        // verified in the docker E2E sign-off (hazard #269, host-only).
+        //
+        // UNGATED since issue #201. This used to be behind `as_security_enabled`,
+        // which made it the third and innermost of three gates that together made
+        // RRC_INACTIVE unresumable in every shipped configuration: with the flag
+        // off the RRC plane never received a KgNB, so it could derive no K_RRCint,
+        // so `initiate_resume` had no `resumeMAC-I` to present and fell back to
+        // RRC_IDLE — while the gNB, which derives the same key with no such check
+        // (`activate_as_security`, nextgsim-gnb), had already committed to holding
+        // an RRC_INACTIVE context.
+        //
+        // Ungating it protects nothing less: `KgNB` never crosses the air in either
+        // direction (TS 33.501 §6.2 derives it independently at both ends from
+        // KAMF), so this message is in-process only and changes no byte on the
+        // wire. What the RRC plane DOES with it is still gated — see
+        // `store_inactive_as_context` (nextgsim-ue/src/rrc/task.rs), which records
+        // the keys for the `resumeMAC-I` of §5.3.13.3 without activating SRB1
+        // protection.
+        if let Some(kgnb) = self.derive_kgnb_for_as_security() {
+            outs.push(MmOutput::AsSecurityKgnb(kgnb));
         }
         outs
     }

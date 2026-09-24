@@ -422,6 +422,24 @@ pub struct RrcTask {
     /// AS security context (set after AS Security Mode Command); required for
     /// ShortMAC-I derivation in re-establishment (TS 38.331 §5.3.7)
     as_security: Option<AsSecurityContext>,
+    /// The **UE Inactive AS Context** keys, recorded even when AS security is not
+    /// activated on the wire (TS 38.331 §5.3.13.3, issue #201).
+    ///
+    /// Separate from [`Self::as_security`] on purpose, and the separation is the
+    /// whole design. `as_security` means "AS security is ACTIVE": it gates
+    /// re-establishment (§5.3.7.2 permits one only after activation), it is the
+    /// `KgNB` a handover re-keys from (§6.9.2.3.1), and it keys the DRBs. This
+    /// field means only "both ends agree on a `K_RRCint`", which is all
+    /// §5.3.13.3's `resumeMAC-I` needs — and which is true under the shipped
+    /// configs, because the gNB derives and distributes that key with no
+    /// `as_security_enabled` check.
+    ///
+    /// Merging the two would silently widen three unrelated procedures: a UE whose
+    /// SRB1 is unprotected would start claiming re-establishment eligibility,
+    /// chaining handover keys, and (under `up-security`) keying DRBs off a context
+    /// no SecurityModeComplete ever confirmed. Hence a second field with one
+    /// reader.
+    inactive_as_security: Option<AsSecurityContext>,
     /// KgNB handed down from the NAS plane once NAS security is active
     /// (TS 33.501 §6.9.4.1: KgNB = KDF(KAMF, uplink NAS COUNT)). Consumed by the
     /// AS SecurityModeCommand handler to derive K_RRCint/K_RRCenc (Wave-6 I5).
@@ -685,6 +703,7 @@ impl RrcTask {
             inactive: None,
             suspended_in_cell_identity: None,
             as_security: None,
+            inactive_as_security: None,
             pending_kgnb: None,
             srb1_config: None,
             rrc_setup_transaction_id: None,
@@ -832,6 +851,89 @@ impl RrcTask {
         );
         self.set_as_security_context(ctx);
         self.send_security_mode_complete(tid).await;
+    }
+
+    /// Records the **UE Inactive AS Context** keys from an SMC the UE is refusing
+    /// on the wire, so a later RRC resume can compute its `resumeMAC-I`
+    /// (TS 38.331 §5.3.13.3, issue #201).
+    ///
+    /// # Why an SMC this UE refuses still leaves keys behind
+    ///
+    /// Because wire protection and the `resumeMAC-I` are answered by different
+    /// clauses. §5.3.4.2 makes an unprotected SecurityModeCommand
+    /// non-compliant, and the caller answers `SecurityModeFailure` for it — this
+    /// function does not change that, and it deliberately does **not** call
+    /// `set_as_security_context`, so nothing starts protecting or verifying SRB1.
+    /// What §5.3.13.3 needs is narrower: "the `K_RRCint` key in the UE Inactive AS
+    /// Context and the previously configured integrity protection algorithm", fed
+    /// to a MAC over `VarResumeMAC-Input` with COUNT/BEARER/DIRECTION all ones.
+    /// That value rides in the `RRCResumeRequest1`'s own `resumeMAC-I` field; it is
+    /// not PDCP protection of anything.
+    ///
+    /// The gNB holds the matching key either way — `activate_as_security`
+    /// (nextgsim-gnb/src/ngap/task.rs) derives all four from `KgNB` at Initial
+    /// Context Setup and hands `k_rrc_int` to its RRC task in
+    /// `RrcMessage::AsSecurityForReestablishment` with **no**
+    /// `as_security_enabled` check. So both ends already agreed on `K_RRCint`
+    /// before this; the asymmetry was that the UE alone dropped its copy, which is
+    /// what made every `ue-suspend` unresumable under the shipped configs
+    /// (`config/ue.yaml` and `config/gnb.yaml` both set `as_security_enabled:
+    /// false`).
+    ///
+    /// # Why this changes no byte on the wire
+    ///
+    /// The wire gate protects PDU FRAMING, not key availability: with
+    /// `as_security_enabled` off, `protect_dl_dcch` / `unprotect_ul_dcch`
+    /// (nextgsim-gnb) and this UE's uplink path all return early before touching a
+    /// PDU, and the UE has no uplink protection site at all. Those early returns
+    /// read the CONFIG, never `self.as_security`, so a stored context cannot make
+    /// them protect anything. The one field this writes, `inactive_as_security`, is
+    /// read only by the resume path.
+    ///
+    /// `None` integrity is refused rather than defaulted: the algorithm identity is
+    /// bound into the MAC, so guessing one produces a `resumeMAC-I` the network
+    /// recomputes differently and reads as a forgery. NIA0 is stored — unlike
+    /// §5.3.4.2's verification, where an all-zero MAC proves nothing, a NIA0
+    /// `resumeMAC-I` is what the network itself will recompute, so refusing it here
+    /// would strand a UE the gNB is willing to resume.
+    fn store_inactive_as_context(&mut self, smc: &SecurityModeCommandData) {
+        let Some(integ_alg) = smc.security_algorithms.integrity_algorithm else {
+            warn!(
+                "Not recording inactive AS keys: the SecurityModeCommand named no \
+                 integrity algorithm, and the algorithm identity is bound into the \
+                 resumeMAC-I (TS 38.331 §5.3.13.3)"
+            );
+            return;
+        };
+        let Some(kgnb) = self.pending_kgnb else {
+            // No KgNB means NAS security is not active, so there is nothing to
+            // derive from. Reported rather than silent: this is the one remaining
+            // way a resume can still be impossible, and a UE that could not
+            // resume should say why.
+            warn!(
+                "Not recording inactive AS keys: no KgNB from the NAS plane yet \
+                 (NAS security not active?), so no K_RRCint can be derived \
+                 (TS 33.501 §6.7)"
+            );
+            return;
+        };
+        let integrity = IntegrityAlgorithm::from(integ_alg);
+        let ciphering = CipheringAlgorithm::from(smc.security_algorithms.ciphering_algorithm);
+        // The SAME four derivations the gNB makes from the same KgNB (TS 33.501
+        // Annex A.8), through the shared constructor — so the K_RRCint this stores
+        // is byte-identical to the one the gNB will verify the resumeMAC-I with.
+        // `AS_SECURITY_C_RNTI` is the C-RNTI both ends use (== the gNB's
+        // `SIMULATED_C_RNTI`) and it is the third field of `VarResumeMAC-Input`.
+        let ctx =
+            AsSecurityContext::derive_from_kgnb(&kgnb, ciphering, integrity, AS_SECURITY_C_RNTI);
+        info!(
+            "Recorded the UE Inactive AS Context (integrity=NIA{}, ciphering=NEA{}): \
+             SRB1 stays UNPROTECTED, but an RRC resume can now compute its \
+             resumeMAC-I (TS 38.331 §5.3.13.3)",
+            integrity.id(),
+            ciphering.id()
+        );
+        self.inactive_as_security = Some(ctx);
     }
 
     /// Verifies a SecurityModeCommand's MAC-I with the freshly derived
@@ -2616,6 +2718,24 @@ impl RrcTask {
                     smc.rrc_transaction_id,
                     as_security_enabled(&self.task_base.config)
                 );
+                // The refusal stands -- and the KEYS are still recorded, because
+                // those are two different questions (issue #201).
+                //
+                // Refusing the command is about the WIRE: an unprotected SMC cannot
+                // be verified, so this UE will not start protecting SRB1 on the
+                // strength of it. But TS 38.331 §5.3.13.3 needs `K_RRCint` for
+                // something the wire never carries -- the `resumeMAC-I` of an
+                // `RRCResumeRequest1` -- and the gNB derives that key regardless
+                // (`activate_as_security` sends `AsSecurityForReestablishment`
+                // unconditionally, nextgsim-gnb/src/ngap/task.rs). So both ends
+                // already hold the same K_RRCint here; only the UE was throwing its
+                // copy away.
+                //
+                // That is what made RRC_INACTIVE unreachable in every SHIPPED
+                // configuration: `initiate_resume` requires `self.as_security`, and
+                // with the gate off nothing ever set it, so every `ue-suspend`
+                // ended in a fallback to RRC_IDLE and a fresh `InitialUEMessage`.
+                self.store_inactive_as_context(&smc);
                 self.send_security_mode_failure(smc.rrc_transaction_id)
                     .await;
             }
@@ -3245,11 +3365,27 @@ impl RrcTask {
             warn!("Cannot resume: no suspend configuration stored");
             return;
         };
-        let Some(security) = self.as_security.clone() else {
-            // Without the AS security context there is no K_RRCint, so no resumeMAC-I
-            // and nothing the network could verify. Falling back to IDLE is §5.3.13.5's
-            // behaviour for a resume the UE cannot perform, and it is honest: an
-            // unauthenticatable resume is the defect this issue reports.
+        // The ACTIVE AS security context when there is one, otherwise the UE Inactive
+        // AS Context recorded from an SMC this UE refused on the wire (issue #201).
+        //
+        // `as_security` first, not merely as a preference: after a handover it holds a
+        // re-keyed `KgNB*` chain (§6.9.2.3.1) and its `K_RRCint` is the one the
+        // TARGET gNB verifies against, so preferring the stored copy would resume
+        // against a key the network has moved on from.
+        //
+        // The fallback is what makes RRC_INACTIVE reachable at all: both shipped
+        // configs set `as_security_enabled: false`, so `as_security` is never
+        // populated in a live run and EVERY resume used to take the IDLE arm below.
+        // The gNB's key does not depend on that flag, so the two ends agree here.
+        let Some(security) = self
+            .as_security
+            .clone()
+            .or_else(|| self.inactive_as_security.clone())
+        else {
+            // Neither: there is no K_RRCint, so no resumeMAC-I and nothing the network
+            // could verify. Falling back to IDLE is §5.3.13.5's behaviour for a resume
+            // the UE cannot perform, and it is honest: an unauthenticatable resume is
+            // worse than an honest re-establishment.
             warn!("Cannot resume: no AS security context; falling back to RRC_IDLE");
             self.leave_rrc_inactive_to_idle().await;
             return;
@@ -3306,12 +3442,50 @@ impl RrcTask {
     ///
     /// The I-RNTI goes with it: the network may reassign it, and a UE that kept
     /// presenting a stale one would be authenticating against another UE's context.
+    ///
+    /// # Telling the network (issue #201, criterion 4)
+    ///
+    /// The gNB must learn that its I-RNTI-keyed context has been abandoned, or it keeps
+    /// `K_RRCint` for a UE that has moved on. 3GPP defines no UE→network "I am dropping
+    /// this I-RNTI" message; TS 38.300 §9.2.2.2 makes the *new RRC connection* the
+    /// network's cue ("the receiving gNB can perform establishment of a new RRC
+    /// connection instead of resumption of the previous RRC connection"), and
+    /// `process_rrc_setup_request` (nextgsim-gnb) discards the stale context on it.
+    ///
+    /// So the fallback ESTABLISHES rather than merely going quiet — which also rescues
+    /// the message that caused the attempt. `initiate_resume` stored the triggering NAS
+    /// in `initial_nas_pdu` so it could ride an `RRCResumeComplete`; on this path it
+    /// rides the `RRCSetupComplete` instead. Without this the PDU sat in
+    /// `initial_nas_pdu` and nothing was sent at all until NAS retransmitted on T3517,
+    /// so the gNB was told late or not at all.
+    ///
+    /// A fallback with nothing pending (an RNAU that could not be performed, where the
+    /// resume itself WAS the message) goes to IDLE quietly. Establishing a connection to
+    /// say nothing on it would be worse than waiting for the next real trigger, and the
+    /// gNB's context is then discarded whenever that trigger arrives.
     async fn leave_rrc_inactive_to_idle(&mut self) {
         self.inactive = None;
         self.suspended_in_cell_identity = None;
         if let Err(e) = self.state_machine.on_rrc_release() {
             warn!("Could not leave RRC_INACTIVE for RRC_IDLE: {e}");
+            return;
         }
+        let Some(pending) = self.initial_nas_pdu.clone() else {
+            debug!(
+                "Fell back to RRC_IDLE with no pending NAS; the gNB learns the I-RNTI is \
+                 abandoned on the next establishment (TS 38.300 §9.2.2.2)"
+            );
+            return;
+        };
+        info!(
+            "Establishing a new RRC connection after the failed resume, carrying the {} \
+             NAS octets that triggered it (TS 38.331 §5.3.13.5)",
+            pending.len()
+        );
+        // `start_connection_establishment` requires RRC_IDLE, which the transition above
+        // has just reached, and it leaves `initial_nas_pdu` in place for
+        // `send_rrc_setup_complete` to spend -- hence the clone rather than a take.
+        self.start_connection_establishment(pending).await;
     }
 
     async fn handle_rrc_release(&mut self) {
