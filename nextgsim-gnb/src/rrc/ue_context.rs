@@ -516,6 +516,37 @@ impl RrcUeContextManager {
         self.suspended.len()
     }
 
+    /// Discard every suspended context belonging to `ue_id`, returning the I-RNTIs
+    /// dropped (issue #201).
+    ///
+    /// Distinct from [`Self::take_suspended`], which a *verified* resume calls to
+    /// restore a context. This throws one away, because the UE has told the network it
+    /// no longer holds it — see
+    /// [`RrcConnectionManager::process_rrc_setup_request`](crate::rrc::connection::RrcConnectionManager::process_rrc_setup_request),
+    /// the sole caller, for why a fresh `RRCSetupRequest` is that statement.
+    ///
+    /// Returns a `Vec` rather than an `Option` so the caller can report each casualty,
+    /// and because more than one is genuinely possible: `initiate_rrc_suspend` allocates
+    /// a fresh I-RNTI each time, so a UE that was suspended, failed to resume,
+    /// re-established and was suspended again left one entry per round before this
+    /// existed. Normally empty — a UE that has never been suspended is the common case,
+    /// and this has to be silent for it.
+    pub fn discard_suspended_for_ue(&mut self, ue_id: i32) -> Vec<u64> {
+        let mut dropped: Vec<u64> = self
+            .suspended
+            .values()
+            .filter(|ctx| ctx.previous_ue_id == ue_id)
+            .map(|ctx| ctx.full_i_rnti)
+            .collect();
+        // Ascending so the caller's log and any assertion over it are deterministic,
+        // matching `suspended_i_rntis`.
+        dropped.sort_unstable();
+        for i_rnti in &dropped {
+            self.suspended.remove(i_rnti);
+        }
+        dropped
+    }
+
     /// The full I-RNTIs of every suspended UE, ascending, for status reporting.
     pub fn suspended_i_rntis(&self) -> Vec<u64> {
         let mut ids: Vec<u64> = self.suspended.keys().copied().collect();
