@@ -46,6 +46,25 @@
 //! in an `UplinkNASTransport` bearing that same value. It has no other way to know
 //! it, and the defect's signature is precisely that this number changes.
 //!
+//! # The fourth gate, found by issue #203
+//!
+//! Clearing the three gates above made the UE SEND a conformant
+//! `RRCResumeRequest1` — confirmed live in nextgcore run 36089664496 — and the
+//! resume still did not complete. A fourth gate remained, and it was a `KgNB`
+//! **derivation** disagreement rather than a message-flow one: the UE derived its
+//! `KgNB` from the uplink NAS COUNT left behind AFTER `protect_uplink` had sent the
+//! Security Mode Complete, while the AMF derives from the COUNT that message was
+//! sent under (TS 33.501 §6.8.1.1.2.3). Every AS key below `KgNB` therefore
+//! differed, the `resumeMAC-I` could never verify, and the gNB answered with silence
+//! — §5.3.13.3's mismatch arm, which looks identical at the AMF to the pre-#202
+//! symptom even though the cause had moved a whole link along.
+//!
+//! The tests above could not see it, because they hand `CAPTURED_KGNB` to both ends
+//! and so make them agree by construction. That is what
+//! `the_two_ends_derive_the_same_kgnb_and_the_resume_mac_verifies` exists to fix: it
+//! derives each end's key the way that end derives it and requires the MAC to verify
+//! across them.
+//!
 //! # References
 //!
 //! * TS 38.331 §5.3.13.3 — `RRCResumeRequest1` contents and the `resumeMAC-I`
@@ -54,11 +73,15 @@
 //! * TS 38.331 §5.3.13.5 — handling of a resume the UE cannot perform
 //! * TS 38.300 §9.2.2.2 — a new RRC connection instead of resumption
 //! * TS 33.501 Annex A.8 — the `K_RRCint` both ends derive from `KgNB`
+//! * TS 33.501 Annex A.9 — the `KgNB` derivation itself, and its COUNT input
+//! * TS 33.501 §6.8.1.1.2.2 / §6.8.1.1.2.3 — WHICH uplink NAS COUNT (issue #203)
 
 use std::time::Duration;
 
 use nextgsim_common::config::{GnbConfig, UeConfig};
 use nextgsim_common::{OctetString, Plmn};
+use nextgsim_crypto::kdf::{derive_kgnb, derive_knas_int};
+use nextgsim_crypto::milenage::Milenage;
 use nextgsim_gnb::rrc::connection::RrcConnectionManager;
 use nextgsim_gnb::rrc::ue_context::RrcUeContextManager;
 use nextgsim_gnb::tasks::{
@@ -66,6 +89,13 @@ use nextgsim_gnb::tasks::{
     SctpMessage, Task, TaskMessage, DEFAULT_CHANNEL_CAPACITY,
 };
 use nextgsim_gnb::{NgapTask, RrcTask as GnbRrcTask};
+use nextgsim_nas::ies::ie1::RegistrationType;
+use nextgsim_nas::messages::mm::security_mode::{IeNasSecurityAlgorithms, IeUeSecurityCapability};
+use nextgsim_nas::messages::mm::{Abba, AuthenticationRequest, SecurityModeCommand};
+use nextgsim_nas::security::{
+    compute_nas_mac, IntegrityAlgorithm, NasCount, NasDirection, NasKeySetIdentifier,
+    SecurityContextType,
+};
 use nextgsim_ngap::procedures::initial_ue_message::decode_initial_ue_message;
 use nextgsim_ngap::procedures::nas_transport::decode_uplink_nas_transport;
 use nextgsim_rls::RrcChannel;
@@ -85,6 +115,7 @@ use nextgsim_rrc::procedures::security_mode::{
 use nextgsim_rrc::procedures::suspend_config::{
     decode_suspend_config, encode_suspend_config, SuspendConfigParams,
 };
+use nextgsim_ue::nas::mm::{MmOrchestrator, MmOutput, MmUeIdentity};
 use nextgsim_ue::{RrcTask as UeRrcTask, UeTaskBase};
 
 /// The internal `ue_id` the RLS layer resolves this UE's STI to. Only this is
@@ -108,6 +139,16 @@ const CAPTURED_KGNB: [u8; 32] = [0x11u8; 32];
 /// `t380` in minutes: a legal `PeriodicRNAU-TimerValue`, long enough that it cannot
 /// expire mid-test and turn a resume into an RNAU.
 const T380_MINUTES: u16 = 20;
+
+/// Byte offset of the `SecurityKey` IE's 32-octet value inside
+/// [`CORE_ICS_REQUEST`], used by `ics_request_with_kgnb` (issue #203) to put a
+/// DERIVED `KgNB` on the AMF's side of the wire instead of the captured constant.
+///
+/// Asserted rather than trusted: `the_captured_ics_security_key_is_where_we_think`
+/// checks the IE id/length preamble and re-decodes the patched PDU with the real
+/// NGAP parser, so a re-capture that shifted the layout fails loudly instead of
+/// silently keying the gNB with 32 bytes of something else.
+const CORE_ICS_SECURITY_KEY_OFFSET: usize = 53;
 
 /// NG Setup Response as produced by the core's own ogs-ngap codec (AMFName
 /// "nextgcore-amf", GUAMI 001-01, capacity 255, PLMN 001-01 with S-NSSAI sst=1).
@@ -194,6 +235,57 @@ fn the_shipped_configuration_has_the_as_security_wire_gate_off() {
         "the UE under test must run with the SHIPPED as_security_enabled: false \
          (config/ue.yaml)"
     );
+}
+
+/// [`CORE_ICS_REQUEST`] with its `SecurityKey` IE replaced by `kgnb`, so the gNB can
+/// be keyed with a `KgNB` the test DERIVED rather than the captured constant.
+///
+/// This is what lets `the_two_ends_derive_the_same_kgnb_from_the_same_kamf` compare
+/// the two ends: TS 33.501 §6.2 has both derive `KgNB` independently from KAMF and it
+/// never crosses the air, so the only way to test that they agree is to compute the
+/// AMF's side the way the AMF does and feed it in here.
+fn ics_request_with_kgnb(kgnb: &[u8; 32]) -> Vec<u8> {
+    let mut pdu = CORE_ICS_REQUEST.to_vec();
+    pdu[CORE_ICS_SECURITY_KEY_OFFSET..CORE_ICS_SECURITY_KEY_OFFSET + 32].copy_from_slice(kgnb);
+    pdu
+}
+
+/// Guards [`CORE_ICS_SECURITY_KEY_OFFSET`] against a re-capture that moved the IE.
+///
+/// A wrong offset would not fail visibly: it would key the gNB with 32 bytes
+/// straddling the IE boundary, and the resume test above would then fail for a
+/// reason that has nothing to do with the code under test. So the offset is
+/// re-established two ways — by the IE id/length preamble, and by round-tripping a
+/// patched PDU through the real NGAP parser.
+#[test]
+fn the_captured_ics_security_key_is_where_we_think() {
+    // ID_SECURITY_KEY is 94 (0x005e), criticality REJECT (0x00), open-type length
+    // 0x20 = 32 octets. The four octets preceding the value.
+    assert_eq!(
+        &CORE_ICS_REQUEST[CORE_ICS_SECURITY_KEY_OFFSET - 4..CORE_ICS_SECURITY_KEY_OFFSET],
+        &[0x00, 0x5e, 0x00, 0x20],
+        "the SecurityKey IE preamble (id 0x005e, REJECT, 32 octets) must sit right \
+         before CORE_ICS_SECURITY_KEY_OFFSET"
+    );
+    // And the patch really lands on the key the gNB will read, per the real parser.
+    let probe = [0xA5u8; 32];
+    let parsed =
+        nextgsim_ngap::procedures::initial_context_setup::decode_initial_context_setup_request(
+            &ics_request_with_kgnb(&probe),
+        )
+        .expect("a patched ICS Request must still decode");
+    assert_eq!(
+        parsed.security_key, probe,
+        "the patched bytes must be what the NGAP parser hands the gNB as SecurityKey"
+    );
+    // The unpatched vector still carries the captured constant, so the two helpers
+    // cannot be silently keying the same thing.
+    let captured =
+        nextgsim_ngap::procedures::initial_context_setup::decode_initial_context_setup_request(
+            &CORE_ICS_REQUEST,
+        )
+        .expect("the captured ICS Request decodes");
+    assert_eq!(captured.security_key, CAPTURED_KGNB);
 }
 
 /// Pops the next uplink RRC PDU the UE handed its RLS, skipping other RLS traffic.
@@ -377,6 +469,25 @@ struct SuspendableUe {
 /// gNB RRC task's own `run` loop; the test only relays the resulting air-interface
 /// PDU to the UE.
 async fn register_and_key_a_ue() -> SuspendableUe {
+    // Both ends keyed with the same `KgNB`, which is what TS 33.501 §6.2 says a
+    // correct stack produces. `the_two_ends_derive_the_same_kgnb_...` is the test that
+    // checks the two ends actually DO produce the same one (issue #203); every test
+    // using this entry point is about a downstream property and takes agreement as
+    // given.
+    register_and_key_a_ue_with(CAPTURED_KGNB, CAPTURED_KGNB).await
+}
+
+/// As [`register_and_key_a_ue`], with the two ends keyed SEPARATELY: `ue_kgnb` goes to
+/// the UE's RRC plane and `gnb_kgnb` reaches the gNB through the AMF's `SecurityKey`
+/// IE.
+///
+/// The split exists for issue #203. `KgNB` never crosses the air (TS 33.501 §6.2
+/// derives it independently at both ends from KAMF), so a harness that hands one
+/// constant to both ends makes them agree **by construction** and cannot see a
+/// derivation disagreement — which is exactly what #203 was. Passing the two values
+/// separately is what lets a test compute each end's key the way that end computes it
+/// and then require the `resumeMAC-I` to verify across them.
+async fn register_and_key_a_ue_with(ue_kgnb: [u8; 32], gnb_kgnb: [u8; 32]) -> SuspendableUe {
     let (base, _app_rx, ngap_rx, rrc_rx, _gtp_rx, gnb_rls_rx, sctp_rx) =
         GnbTaskBase::new(gnb_config(), DEFAULT_CHANNEL_CAPACITY);
     let mut gnb_rls_rx = gnb_rls_rx;
@@ -505,21 +616,20 @@ async fn register_and_key_a_ue() -> SuspendableUe {
     // NAS security. The UE's NAS plane derives KgNB at Security Mode Complete and
     // hands it to RRC as `RrcMessage::AsSecurityKey` (nextgsim-ue/src/main.rs, on
     // `MmOutput::AsSecurityKgnb`). Delivered here through that same public entry
-    // point, carrying the SAME KgNB the captured ICS Request gives the gNB -- which
-    // is what TS 33.501 §6.2 guarantees: both ends derive it independently from KAMF
-    // and it never crosses the air, so there is no wire hop to drive instead.
-    ue_rrc.set_pending_kgnb(CAPTURED_KGNB);
+    // point. `KgNB` never crosses the air (TS 33.501 §6.2 derives it independently at
+    // both ends from KAMF), so there is no wire hop to drive instead.
+    ue_rrc.set_pending_kgnb(ue_kgnb);
 
-    // The AMF's Initial Context Setup Request. The real NGAP task's
-    // `activate_as_security` derives the four AS keys from its `SecurityKey` and
-    // emits BOTH the SecurityModeCommand (bound for the UE) and
-    // `AsSecurityForReestablishment` (the gNB RRC task's own copy of K_RRCint) onto
-    // the RRC inbox, where the spawned task above dispatches them.
+    // The AMF's Initial Context Setup Request, carrying `gnb_kgnb` in its
+    // `SecurityKey` IE. The real NGAP task's `activate_as_security` derives the four
+    // AS keys from that IE and emits BOTH the SecurityModeCommand (bound for the UE)
+    // and `AsSecurityForReestablishment` (the gNB RRC task's own copy of K_RRCint)
+    // onto the RRC inbox, where the spawned task above dispatches them.
     ngap_tx
         .send(NgapMessage::ReceiveNgapPdu {
             client_id: AMF_CLIENT_ID,
             stream: NGAP_STREAM,
-            pdu: OctetString::from_slice(&CORE_ICS_REQUEST),
+            pdu: OctetString::from_slice(&ics_request_with_kgnb(&gnb_kgnb)),
         })
         .await
         .expect("the NGAP task accepts the Initial Context Setup Request");
@@ -1128,4 +1238,285 @@ fn build_production_rrc_setup() -> OctetString {
         .process_rrc_setup_request(&mut ue_mgr, UE_ID, 0x1234_5678, false, 3)
         .expect("the gNB's own setup path must produce an RRCSetup");
     result.rrc_setup_pdu
+}
+
+// ============================================================================
+// Issue #203 — the two ends' KgNB, compared against each other
+// ============================================================================
+
+/// The RAND the AMF-side stand-in authenticates with. Any value works; a fixed one
+/// keeps a failure reproducible.
+const AUTH_RAND: [u8; 16] = [0x5Au8; 16];
+/// SQN and AMF field for the AUTN. The separation bit (`0x80`) must be set, or the UE
+/// correctly rejects the challenge as non-5G (TS 33.501 §6.1.3.3).
+const AUTH_SQN: [u8; 6] = [0, 0, 0, 0, 0, 1];
+const AUTH_AMF_FIELD: [u8; 2] = [0x80, 0x00];
+/// The ABBA the AMF signals, and therefore a KAMF derivation input (TS 33.501 Annex
+/// A.7). `0x0000` is the Rel-15 value.
+const AUTH_ABBA: [u8; 2] = [0x00, 0x00];
+/// The downlink NAS sequence number the Security Mode Command is sent with.
+const SMC_DOWNLINK_SQN: u8 = 2;
+/// NEA2 / NIA2 — both inside the shipped `UeConfig`'s advertised capabilities, so the
+/// UE cannot refuse the SMC for an out-of-capability algorithm.
+const SMC_ENC_ALG: u8 = 2;
+const SMC_INT_ALG: u8 = 2;
+
+/// **Issue #203, the cross-stack assertion.** Drives the REAL UE NAS plane through
+/// authentication and Security Mode Control, derives the AMF's `KgNB` the way
+/// nextgcore's AMF derives it, keys the gNB with THAT, and requires the gNB to VERIFY
+/// the UE's `resumeMAC-I`.
+///
+/// # Why this test had to exist
+///
+/// `a_suspended_ue_resumes_on_the_pre_existing_ngap_context` hands `CAPTURED_KGNB` to
+/// both ends. That was defensible — TS 33.501 §6.2 keeps `KgNB` off the air, so there
+/// is no wire hop to drive — but it made the two ends agree **by construction**, and
+/// so it could not see a DERIVATION disagreement. #203 was exactly that: the UE
+/// derived its `KgNB` at uplink NAS COUNT 1 while the AMF derived at COUNT 0, because
+/// `send_security_mode_complete` read the COUNT *after* `protect_uplink` had already
+/// incremented it. Every AS key below `KgNB` therefore differed, the `resumeMAC-I` of
+/// TS 38.331 §5.3.13.3 could never verify, the gNB answered with silence (§5.3.13.3
+/// leaves the UE to T319), and the UE fell back and established afresh — so the core
+/// saw a second `InitialUEMessage`, the live symptom in nextgcore run 36089664496.
+///
+/// # What is derived rather than seeded
+///
+/// The UE's `KgNB` is whatever its own `MmOrchestrator` hands the RRC plane as
+/// `MmOutput::AsSecurityKgnb`, produced by the real `handle_downlink` path off a real
+/// Authentication Request and a real Security Mode Command.
+///
+/// The AMF's is computed here the way nextgcore's AMF computes it
+/// (`nextgcore_kdf_kgnb_and_kn3iwf`, `src/bins/nextgcore-amfd/src/ngap_path.rs`): from
+/// the shared KAMF at the uplink NAS COUNT the AMF has committed — and the AMF commits
+/// the candidate COUNT reconstructed from the received message's own SQN octet
+/// (`nas_security.rs`, `amf_ue.ul_count = candidate` after the MAC verifies). So the
+/// freshness parameter is read OFF the Security Mode Complete the UE just emitted,
+/// not assumed: TS 33.501 §6.8.1.1.2.3 requires the SMComplete to carry "the start
+/// value of the uplink NAS COUNT that is used as freshness parameter in the KgNB
+/// derivation", and §6.8.1.1.2.2 names "the uplink NAS COUNT of the most recent NAS
+/// Security Mode Complete".
+///
+/// KAMF is shared rather than derived twice on purpose: it IS the shared NAS secret
+/// (both ends hold the same one by construction, from the same authentication run),
+/// and the question under test is whether the two ends' *derivation from* it agrees.
+/// Deriving it twice would test the Milenage chain, which other tests already cover.
+///
+/// Neither end is told the other's `KgNB`: the UE's RRC plane gets the UE's, and the
+/// gNB gets the AMF's through the `SecurityKey` IE of a real ICS Request. The
+/// `resumeMAC-I` verifying is the only evidence they agree, and it is asserted
+/// POSITIVELY — a real `RRCResume` decode on DL-DCCH, which neither silence (the
+/// mismatch arm) nor an `RRCSetup` (the unreadable-request arm) can satisfy.
+///
+/// # Revert-verification
+///
+/// Restore the defect by having `send_security_mode_complete`
+/// (`nextgsim-ue/src/nas/mm/orchestrator.rs`) pass `self.sec.uplink_count().to_u32()`
+/// instead of the pre-send `smc_complete_ul_count`, and this test fails twice over:
+/// at the explicit key comparison, and — with that assertion removed — at the
+/// `RRCResume` assertion, with the gNB silent. The second failure is the live symptom
+/// reproduced in-repo.
+#[tokio::test]
+async fn the_two_ends_derive_the_same_kgnb_and_the_resume_mac_verifies() {
+    let config = ue_config();
+
+    // ---- the UE's half: its own NAS plane, driven to Security Mode Complete ----
+    //
+    // The SUCI is the one the UE's own SUCI builder produces for this configuration,
+    // so the identity the orchestrator registers with is production's.
+    // The SUCI the shipped configuration registers with, from the UE's OWN builder --
+    // the same call `nextgsim-ue`'s main path makes. Not load-bearing for the key
+    // comparison (TS 33.501 Annex A.7 binds KAMF to the SUPI, not the SUCI), but
+    // building it properly keeps the orchestrator on its production path.
+    let suci = nextgsim_ue::nas::mm::build_suci(&config)
+        .expect("the shipped UeConfig must produce a SUCI");
+    let identity = MmUeIdentity::from_config(&config, suci);
+    // The SUPI the KAMF binds to (TS 33.501 Annex A.7 `P0`), taken from the identity
+    // the UE actually uses rather than re-derived from the config.
+    let opc = identity.opc;
+    let k = identity.k;
+    // The capability octets the UE advertises, which the SMC must replay verbatim
+    // (TS 33.501 §6.7.2) or the UE refuses it.
+    let (ea_cap, ia_cap) = (identity.ea_cap, identity.ia_cap);
+    let mut orch = MmOrchestrator::from_config(identity, &config);
+
+    let outs = orch.start_registration(RegistrationType::InitialRegistration);
+    assert!(
+        outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+        "the UE must emit a Registration Request before it can be authenticated"
+    );
+
+    // The Authentication Request, built from the UE's OWN credentials so that the
+    // AMF-side key chain below lands on the same KAMF.
+    let milenage = Milenage::new(&k, &opc);
+    let ak = milenage.f5(&AUTH_RAND);
+    let mut sqn_xor_ak = [0u8; 6];
+    for i in 0..6 {
+        sqn_xor_ak[i] = AUTH_SQN[i] ^ ak[i];
+    }
+    let mut autn = Vec::with_capacity(16);
+    autn.extend_from_slice(&sqn_xor_ak);
+    autn.extend_from_slice(&AUTH_AMF_FIELD);
+    autn.extend_from_slice(&milenage.f1(&AUTH_RAND, &AUTH_SQN, &AUTH_AMF_FIELD));
+
+    let ng_ksi = NasKeySetIdentifier::new(SecurityContextType::Native, 0);
+    let mut auth_pdu = Vec::new();
+    AuthenticationRequest::for_5g_aka(ng_ksi, Abba::new(AUTH_ABBA.to_vec()), AUTH_RAND, autn)
+        .encode(&mut auth_pdu);
+    let outs = orch.handle_downlink(&auth_pdu);
+    assert!(
+        outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+        "the UE must answer the Authentication Request; an AUTN it rejects leaves no \
+         KAMF, and there would be no KgNB to compare"
+    );
+
+    // The KAMF both ends hold after that run. Read from the UE's context because it
+    // IS the shared secret; the AMF-side derivation below starts from the same value,
+    // which is what a real AMF has after the same authentication.
+    let kamf = *orch
+        .security_context()
+        .keys()
+        .kamf()
+        .expect("authentication must have established a KAMF");
+
+    // The Security Mode Command, protected the way the strict core protects it: plain
+    // inner SMC, ciphering NOT applied (SHT 0x03), MAC over SQN || payload with the
+    // new KNASint. Built from `kamf` through `derive_knas_int` rather than from the
+    // UE's derived key, so a UE that derived KNASint differently would answer
+    // SecurityModeReject and the assertion below would catch it.
+    let mut inner = Vec::new();
+    SecurityModeCommand::new(
+        IeNasSecurityAlgorithms::new(SMC_ENC_ALG, SMC_INT_ALG),
+        NasKeySetIdentifier::new(SecurityContextType::Native, 0),
+        replayed_ue_capabilities(ea_cap, ia_cap),
+    )
+    .encode(&mut inner);
+    let knas_int = derive_knas_int(&kamf, SMC_INT_ALG);
+    let int_alg = IntegrityAlgorithm::try_from(SMC_INT_ALG).expect("NIA2 is a known algorithm");
+    let smc_mac = compute_nas_mac(
+        int_alg,
+        &knas_int,
+        &NasCount::new(0, SMC_DOWNLINK_SQN),
+        NasDirection::Downlink,
+        SMC_DOWNLINK_SQN,
+        &inner,
+    );
+    let mut smc_pdu = vec![0x7E, 0x03];
+    smc_pdu.extend_from_slice(&smc_mac);
+    smc_pdu.push(SMC_DOWNLINK_SQN);
+    smc_pdu.extend_from_slice(&inner);
+
+    let outs = orch.handle_downlink(&smc_pdu);
+    let smc_complete = outs
+        .iter()
+        .find_map(|o| match o {
+            MmOutput::SendNasPdu(p) => Some(p.clone()),
+            _ => None,
+        })
+        .expect("the UE must answer the Security Mode Command");
+    assert_eq!(
+        smc_complete[1], 0x04,
+        "the answer must be a Security Mode COMPLETE (SHT 0x04, new security context). \
+         A SecurityModeReject here means the UE and this test disagree about KNASint, \
+         so no KgNB was derived and the comparison below would be vacuous"
+    );
+
+    let ue_kgnb = outs
+        .iter()
+        .find_map(|o| match o {
+            MmOutput::AsSecurityKgnb(kgnb) => Some(*kgnb),
+            _ => None,
+        })
+        .expect(
+            "the Security Mode Complete must hand the RRC plane a KgNB (issue #201 \
+             ungated this); without one there is no K_RRCint and no resumeMAC-I at all",
+        );
+
+    // ---- the AMF's half ----
+    //
+    // Octet 6 of the emitted SMComplete is its sequence number (TS 24.501 §9.1.1:
+    // EPD, SHT, 4-octet MAC, SQN). nextgcore's AMF reconstructs its candidate uplink
+    // COUNT from exactly this octet and commits it once the MAC verifies
+    // (`nas_security.rs`), then derives KgNB from that committed value
+    // (`ngap_path.rs`). So this is the AMF's freshness parameter, read off the wire
+    // rather than assumed.
+    let amf_ul_count = u32::from(smc_complete[6]);
+    // TS 33.501 Annex A.9 with the 3GPP access type distinguisher (0x01, table
+    // A.9-1) — the same computation as `nextgcore_kdf_kgnb_and_kn3iwf`.
+    let amf_kgnb = derive_kgnb(&kamf, amf_ul_count, 0x01);
+
+    assert_eq!(
+        ue_kgnb,
+        amf_kgnb,
+        "the UE's KgNB must equal the AMF's, both derived from the shared KAMF at the \
+         uplink NAS COUNT the Security Mode Complete went out under ({amf_ul_count}). \
+         A mismatch is issue #203: the UE read the COUNT after protect_uplink had \
+         incremented it, so it derived at {} instead, every AS key below KgNB differed \
+         from the gNB's, and the resumeMAC-I could never verify",
+        amf_ul_count + 1
+    );
+
+    // ---- the consequence: the gNB verifies a resumeMAC-I keyed from the OTHER end ----
+    //
+    // The UE's RRC plane is given the UE's own derived key; the gNB is keyed from the
+    // AMF's, through the `SecurityKey` IE of a real ICS Request. So the verification
+    // below is a genuine cross-derivation check.
+    let mut ue = register_and_key_a_ue_with(ue_kgnb, amf_kgnb).await;
+    let i_rnti = suspend_to_inactive(&mut ue).await;
+
+    let nas = service_request_nas();
+    ue.ue_rrc
+        .handle_uplink_nas_delivery(2, OctetString::from_slice(&nas))
+        .await;
+
+    let (ch, resume_req) = next_ue_uplink_rrc(&mut ue.ue_rls_rx);
+    assert_eq!(
+        ch,
+        RrcChannel::UlCcch1,
+        "the UE must send an RRCResumeRequest1 on UL-CCCH1 (TS 38.331 §6.2.1); UL-CCCH \
+         would mean it fell back to RRC_IDLE"
+    );
+    let decoded = decode_rrc_resume_request1(resume_req.data())
+        .expect("a decodable RRCResumeRequest1 off the wire");
+    assert_eq!(
+        decoded.resume_identity, i_rnti,
+        "the UE must present the I-RNTI the gNB allocated, or a refusal would be for \
+         the wrong reason"
+    );
+    assert_ne!(
+        decoded.resume_mac_i, 0,
+        "the resumeMAC-I must be a real NIA2 MAC over VarResumeMAC-Input; 0 is what an \
+         absent K_RRCint produces and it would verify for anyone"
+    );
+
+    send_uplink_rrc(&ue.gnb_rrc_tx, RrcChannel::UlCcch1, resume_req).await;
+    let (ch, _rrc_resume) =
+        await_gnb_rrc_matching(&mut ue.gnb_rls_rx, Duration::from_secs(5), |_, b| {
+            decode_rrc_resume(b).is_ok()
+        })
+        .await
+        .expect(
+            "the gNB must VERIFY the resumeMAC-I and answer a real RRCResume. Silence is \
+             the mismatch arm of TS 38.331 §5.3.13.3, which is precisely what a \
+             K_RRCint disagreement produces and is issue #203's live symptom",
+        );
+    assert_eq!(
+        ch,
+        RrcChannel::DlDcch,
+        "RRCResume rides DL-DCCH on the SRB1 the suspended UE already had (§6.2.2)"
+    );
+
+    for handle in ue.handles {
+        handle.abort();
+    }
+}
+
+/// The replayed UE security capabilities IE an AMF echoes in its Security Mode
+/// Command (TS 33.501 §6.7.2), built from the capability octets this UE advertises.
+///
+/// Must match what the UE sent, or it refuses the SMC for a replay mismatch and the
+/// test would fail for an unrelated reason.
+fn replayed_ue_capabilities(ea_cap: u8, ia_cap: u8) -> IeUeSecurityCapability {
+    let raw = vec![2u8, ea_cap, ia_cap];
+    IeUeSecurityCapability::decode(&mut raw.as_slice())
+        .expect("the UE security capability IE must decode")
 }

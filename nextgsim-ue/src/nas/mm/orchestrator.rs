@@ -85,6 +85,12 @@ pub const SQN_DELTA: u64 = 1 << 28;
 /// (same default as UERANSIM)
 const DEFAULT_IMEISV: &str = "4370816125816151";
 
+/// Access type distinguisher for 3GPP access, the `P1` of the KgNB derivation
+/// (TS 33.501 Annex A.9, table A.9-1). `0x02` is non-3GPP access and yields
+/// K_N3IWF/K_TNGF instead, so this is not a free choice: a UE resuming over NR
+/// that derived with `0x02` would hold a different KgNB from the AMF's.
+const ACCESS_TYPE_3GPP: u8 = 0x01;
+
 /// Sim-private message type for the UAV tracking report.
 ///
 /// NOT 3GPP-conformant (Wave 4, T4.3 — honest reframe). Verified against
@@ -2483,6 +2489,11 @@ impl MmOrchestrator {
             "Sending Security Mode Complete (container={} bytes)",
             complete.nas_message_container.as_ref().map_or(0, Vec::len)
         );
+        // The uplink NAS COUNT this Security Mode Complete is SENT under, captured
+        // BEFORE `protect_uplink` consumes and advances it. That value — not the one
+        // left behind afterwards — is the KgNB freshness parameter (issue #203; see
+        // `derive_kgnb_for_as_security`).
+        let smc_complete_ul_count = self.sec.uplink_count().to_u32();
         let pdu = self.protect_uplink(
             plain,
             SecurityHeaderType::IntegrityProtectedAndCipheredWithNewSecurityContext,
@@ -2490,9 +2501,7 @@ impl MmOrchestrator {
         let mut outs = vec![MmOutput::SendNasPdu(pdu)];
         // Wave-6 I5: once NAS security is active, hand the derived KgNB to the
         // RRC plane so it can derive K_RRCint/K_RRCenc when the AS
-        // SecurityModeCommand arrives (TS 33.501 §6.9.4.1). The exact uplink NAS
-        // COUNT the AMF uses for the KgNB derivation is a cross-stack detail
-        // verified in the docker E2E sign-off (hazard #269, host-only).
+        // SecurityModeCommand arrives (TS 33.501 §6.9.4.1).
         //
         // UNGATED since issue #201. This used to be behind `as_security_enabled`,
         // which made it the third and innermost of three gates that together made
@@ -2510,21 +2519,48 @@ impl MmOrchestrator {
         // `store_inactive_as_context` (nextgsim-ue/src/rrc/task.rs), which records
         // the keys for the `resumeMAC-I` of §5.3.13.3 without activating SRB1
         // protection.
-        if let Some(kgnb) = self.derive_kgnb_for_as_security() {
+        if let Some(kgnb) = self.derive_kgnb_for_as_security(smc_complete_ul_count) {
             outs.push(MmOutput::AsSecurityKgnb(kgnb));
         }
         outs
     }
 
-    /// Derive KgNB for AS security from the active NAS context (TS 33.501
-    /// §6.9.4.1: `KgNB = KDF(KAMF, uplink NAS COUNT, 3GPP-access)`). Returns
-    /// `None` when no KAMF is available (NAS security not established). The gNB
-    /// receives the same KgNB from the AMF in the NGAP InitialContextSetupRequest
-    /// SecurityKey IE, so both ends derive identical K_RRCint/K_RRCenc.
-    pub fn derive_kgnb_for_as_security(&self) -> Option<[u8; 32]> {
+    /// Derive KgNB for AS security from the active NAS context (TS 33.501 Annex
+    /// A.9: `KgNB = KDF(KAMF, uplink NAS COUNT, access type distinguisher)`, with
+    /// the distinguisher `0x01` for 3GPP access per table A.9-1). Returns `None`
+    /// when no KAMF is available (NAS security not established).
+    ///
+    /// # Why the COUNT is a parameter (issue #203)
+    ///
+    /// It used to read `self.sec.uplink_count()` itself, and the sole caller
+    /// invoked it AFTER `protect_uplink` had already sent the Security Mode
+    /// Complete — and `protect_uplink` calls `increment_uplink_count`. So the
+    /// derivation ran on the count of the NEXT uplink message rather than the one
+    /// the SMComplete was protected with: a UE whose SMComplete went out at COUNT 0
+    /// derived its KgNB at COUNT 1.
+    ///
+    /// TS 33.501 §6.8.1.1.2.2 requires "the uplink NAS COUNT of the most recent NAS
+    /// Security Mode Complete", and §6.8.1.1.2.3 says "the NAS SMC complete message
+    /// shall include the start value of the uplink NAS COUNT that is used as
+    /// freshness parameter in the KgNB derivation" — i.e. the value carried in that
+    /// message's own sequence number, which is the pre-increment one. §6.8.1.2.2
+    /// repeats it for the CM-IDLE→CM-CONNECTED case. So the off-by-one was the UE's:
+    /// the AMF derives from the count it accepted off the SMComplete's header.
+    ///
+    /// KgNB never crosses the air (§6.2 derives it independently at both ends from
+    /// KAMF), so nothing on the wire reveals the skew. It stayed latent until #202
+    /// made the RRC_INACTIVE resume reachable, because that made `K_RRCint` the key
+    /// a `resumeMAC-I` is verified with — the first thing to compare the two ends'
+    /// copies. Every AS key derived from a skewed KgNB differs, so the
+    /// `resumeMAC-I` of TS 38.331 §5.3.13.3 could never verify and the gNB answered
+    /// with silence, leaving the UE to fall back (§5.3.13.5).
+    ///
+    /// Taking the COUNT as an argument rather than re-reading it is the point: the
+    /// caller must capture it before the send advances it, and a signature that
+    /// forces that cannot silently regress to reading post-increment state.
+    pub fn derive_kgnb_for_as_security(&self, uplink_nas_count: u32) -> Option<[u8; 32]> {
         let kamf = self.sec.keys().kamf()?;
-        let ul_count = self.sec.uplink_count().to_u32();
-        Some(derive_kgnb(kamf, ul_count, 0x01))
+        Some(derive_kgnb(kamf, uplink_nas_count, ACCESS_TYPE_3GPP))
     }
 
     fn send_security_mode_reject(&mut self, cause: MmCause) -> Vec<MmOutput> {
@@ -6668,17 +6704,94 @@ mod tests {
         use nextgsim_crypto::kdf::derive_kgnb;
         let mut orch = new_orch();
         // No KAMF yet → None (NAS security not established).
-        assert!(orch.derive_kgnb_for_as_security().is_none());
+        assert!(orch.derive_kgnb_for_as_security(0).is_none());
 
-        // Seed a KAMF; KgNB must equal derive_kgnb(KAMF, uplink NAS COUNT,
+        // Seed a KAMF; KgNB must equal derive_kgnb(KAMF, the COUNT handed in,
         // 3GPP-access) — the same value the AMF sends the gNB as SecurityKey
-        // (TS 33.501 §6.9.4.1).
+        // (TS 33.501 Annex A.9).
         let kamf = [0x22u8; 32];
         orch.sec.keys_mut().set_kamf(&kamf);
-        let ul = orch.sec.uplink_count().to_u32();
         assert_eq!(
-            orch.derive_kgnb_for_as_security(),
-            Some(derive_kgnb(&kamf, ul, 0x01))
+            orch.derive_kgnb_for_as_security(0),
+            Some(derive_kgnb(&kamf, 0, 0x01))
+        );
+        // And the COUNT is genuinely load-bearing: a different one yields a
+        // different key, which is the whole reason issue #203's off-by-one was
+        // fatal to the resumeMAC-I.
+        assert_ne!(
+            orch.derive_kgnb_for_as_security(0),
+            orch.derive_kgnb_for_as_security(1)
+        );
+    }
+
+    /// **Issue #203.** The KgNB the NAS plane hands RRC must be derived from the
+    /// uplink NAS COUNT the Security Mode Complete was SENT under — not the
+    /// post-increment value left behind once `protect_uplink` has consumed it.
+    ///
+    /// TS 33.501 §6.8.1.1.2.3: "The NAS SMC complete message shall include the
+    /// start value of the uplink NAS COUNT that is used as freshness parameter in
+    /// the KgNB derivation". The AMF derives from the COUNT it accepts off that
+    /// message's own header (its `ul_count` is committed to the verified candidate),
+    /// so the UE must use the same one.
+    ///
+    /// Asserted through the real `handle_downlink` SMC path, and positively: the
+    /// handed-out key is compared against `derive_kgnb` at the COUNT actually
+    /// carried in the emitted SMComplete's sequence-number octet, which is read off
+    /// the PDU rather than assumed. Before the fix the key matched COUNT 1 while the
+    /// PDU carried SQN 0.
+    #[test]
+    fn the_kgnb_uses_the_count_the_security_mode_complete_was_sent_under() {
+        use nextgsim_crypto::kdf::derive_kgnb;
+
+        let mut orch = MmOrchestrator::new(test_identity());
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        assert_eq!(outs.len(), 1);
+        let auth_pdu = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        let _ = orch.handle_downlink(&auth_pdu);
+
+        let smc_pdu = build_protected_smc(&orch, 2, 2, None);
+        let outs = orch.handle_downlink(&smc_pdu);
+
+        // The SMComplete as it goes on the wire. Octet 6 is the sequence number
+        // (TS 24.501 §9.1.1: EPD, SHT, 4-octet MAC, SQN), i.e. the low 8 bits of the
+        // uplink NAS COUNT this message was protected with.
+        let complete = first_sent_pdu(&outs);
+        assert_eq!(
+            complete[1], 0x04,
+            "the SMComplete must use SHT 0x04 (new security context)"
+        );
+        let wire_sqn = complete[6];
+
+        let handed = outs
+            .iter()
+            .find_map(|o| match o {
+                MmOutput::AsSecurityKgnb(k) => Some(*k),
+                _ => None,
+            })
+            .expect(
+                "the SMComplete must hand the RRC plane a KgNB; without one the resume \
+                 path has no K_RRCint at all (issue #201)",
+            );
+
+        let kamf = *orch.security_context().keys().kamf().expect("kamf");
+        assert_eq!(
+            handed,
+            derive_kgnb(&kamf, u32::from(wire_sqn), 0x01),
+            "the KgNB must be derived from the uplink NAS COUNT the SMComplete went out \
+             under (SQN {wire_sqn} on the wire), per TS 33.501 §6.8.1.1.2.3. Matching \
+             COUNT {} instead is issue #203's off-by-one: protect_uplink had already \
+             incremented, so every AS key differed from the AMF's and the resumeMAC-I \
+             of TS 38.331 §5.3.13.3 could never verify",
+            u32::from(wire_sqn) + 1
+        );
+
+        // The post-send COUNT really is different, so the assertion above is not
+        // vacuously satisfied by the two values happening to coincide.
+        assert_ne!(
+            orch.security_context().uplink_count().to_u32(),
+            u32::from(wire_sqn),
+            "protect_uplink must advance the COUNT, or there would be no off-by-one to \
+             get wrong and this test would prove nothing"
         );
     }
 
