@@ -2,13 +2,35 @@ name: CI
 
 on:
   push:
-    branches: [first_implementation, main]
+    # `first_implementation` was dropped here (#206): that branch NO LONGER EXISTS
+    # -- `git ls-remote --heads` lists 26 branches and it is not among them. Its
+    # rename is what broke nextgcore's cross-repo checkout, which had to move to
+    # `ref: main` with a comment recording the rot. A trigger on a dead branch
+    # fires for nothing and reads as coverage.
+    branches: [main]
   pull_request:
-    branches: [first_implementation, main]
-  # Heavy Docker image/E2E jobs are opt-in only (they recompile both
-  # workspaces in a container and need a cross-repo checkout). Trigger via the
-  # Actions tab "Run workflow". The fast gate (check/test/clippy/fmt) runs on
-  # every push/PR to the branches above.
+    branches: [main]
+  # Heavy Docker image/E2E jobs recompile both workspaces in a container and need
+  # a cross-repo checkout, so they stay off the per-PR path. They run NIGHTLY
+  # (schedule, below) and on demand via the Actions tab "Run workflow". The fast
+  # gate (check/test/clippy/fmt) runs on every push/PR to `main`.
+  #
+  # NIGHTLY rather than dispatch-only (#206). Until this change this repo had NO
+  # schedule at all and no interop test of any kind, so a commit here that broke
+  # the N2 interface was caught only by NEXTGCORE's nightly -- up to 24 hours
+  # later, reported against a nextgcore commit that did not cause it. Wrong repo,
+  # wrong commit, wrong person. The 2026-09-27 run is the evidence: four of the
+  # five links in nextgcore #403's blocker chain were defects in THIS repo
+  # (#197/#198, #199/#200, #201/#202, #203/#204), each surfacing as a nextgcore
+  # blocker. Same reasoning as nextgcore's own schedule (its #349): a cross-repo
+  # E2E that runs only when someone remembers to press a button gates nothing
+  # while reading as covered.
+  #
+  # 05:00 rather than nextgcore's 04:00, deliberately: this job checks out
+  # nextgcore `main`, so running after its nightly means testing a nextgcore
+  # commit that has itself just been validated, instead of racing it.
+  schedule:
+    - cron: "0 5 * * *"
   workflow_dispatch:
 
 env:
@@ -437,7 +459,9 @@ jobs:
 
   docker-build:
     name: Docker Build
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    # Nightly OR on demand (#206). A disjunction, not a replacement: the dispatch
+    # path is unchanged.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -463,7 +487,204 @@ jobs:
         run: |
           docker build -f Dockerfile.ue-local -t nextgsim/nr-ue:latest .
 
-      - name: Verify images
+      # ASSERTS, rather than printing (#206, the same defect nextgcore #421 fixed
+      # in its own image loop). This step used to be `docker images | grep
+      # nextgsim` with no assertion at all -- a listing a human was expected to
+      # read, which gates nothing. `docker image inspect` is the check because it
+      # FAILS on a missing image, where a grep would match a substring of a
+      # neighbouring tag.
+      - name: Verify every expected image exists
         run: |
-          echo "Built images:"
+          set -euo pipefail
+          missing=""
+          for image in nextgsim/nr-gnb:latest nextgsim/nr-ue:latest; do
+            if ! docker image inspect "$image" >/dev/null 2>&1; then
+              missing="${missing} ${image}"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::MISSING IMAGES:${missing}"
+            docker images | grep nextgsim || true
+            exit 1
+          fi
+          echo "Both expected images present (nr-gnb, nr-ue)."
           docker images | grep nextgsim
+
+  # ====================================================================
+  # #206: the INTEROP nightly. Does THIS repo's HEAD still register a UE
+  # against nextgcore?
+  #
+  # WHY IT EXISTS. Until this job, a commit here that broke the N2 interface was
+  # caught only by NEXTGCORE's nightly -- up to 24 hours later, reported against
+  # a nextgcore commit that did not cause it. The 2026-09-27 run is the evidence:
+  # four of the five links in nextgcore #403's blocker chain were defects in this
+  # repo, each surfacing as a nextgcore blocker.
+  #
+  # WHY IT IS MINIMAL, AND WHAT THAT COSTS. nextgcore's `docker-e2e` is ~893
+  # lines with ~75 references to nextgcore-local things (its compose files, its
+  # 172.23.0.0/24 core network, `namf_event_probe`, `Dockerfile.builder`).
+  # Copying that here would be two copies of one procedure drifting -- the defect
+  # shape of this repo's own #197/#198, where two CliServer implementations
+  # drifted to incompatible wire versions 3.2.7 and 1.0.0. So this job asserts
+  # only the RAN-side contract that is this repo's responsibility:
+  #
+  #   * the gNB completes NG Setup with the AMF (N2 is up), and
+  #   * the UE receives a Registration Accept (NAS registration completes).
+  #
+  # DELIBERATELY NOT COPIED, and therefore NOT covered here: the Namf
+  # event-delivery probes, the Service Request CM-IDLE cycle (#403), the OAuth2
+  # overlay, and the EPC stage. Those live in nextgcore's nightly and are its to
+  # assert -- they are about the CORE's behaviour, not the RAN's. A reader must
+  # not take this job's green as covering them.
+  #
+  # ASSERTIONS ARE POSITIVE and read the EXACT log lines this repo emits:
+  # `nextgsim-gnb/src/ngap/task.rs:700` and
+  # `nextgsim-ue/src/nas/mm/orchestrator.rs:1675`. Both were grepped out of the
+  # source rather than paraphrased -- a paraphrase makes the check silently
+  # unfalsifiable, and nextgcore #187's history is the precedent: its first CI
+  # assertion grepped for a string that was absent because ZERO requests had been
+  # made, so it passed by vacuity.
+  # ====================================================================
+  interop-e2e:
+    name: Interop E2E (registers a real UE against nextgcore)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout nextgsim
+        uses: actions/checkout@v4
+        with:
+          path: nextgsim
+
+      # nextgcore `main`, tracked rather than pinned -- for the same reason
+      # nextgcore tracks this repo's main: a pinned ref is what rotted when this
+      # repo renamed its default branch. The sha actually used is recorded below
+      # so a failure names the pair.
+      - name: Checkout nextgcore
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgcore
+          ref: main
+          path: nextgcore
+
+      - name: Record the pair under test
+        run: |
+          set -euo pipefail
+          sim=$(git -C nextgsim rev-parse HEAD)
+          core=$(git -C nextgcore rev-parse HEAD)
+          echo "### Interop pair" >> "$GITHUB_STEP_SUMMARY"
+          echo "| repo | commit |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| nextgsim (this repo, HEAD) | \`${sim}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| nextgcore (main) | \`${core}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "nextgsim=${sim} nextgcore=${core}"
+
+      # nextgcore's builder compiles BOTH workspaces, including this repo's nr-gnb
+      # and nr-ue out of the sibling checkout. Reused rather than re-implemented:
+      # the build context is the parent of both trees, which is why the checkouts
+      # above use sibling paths.
+      - name: Build both workspaces via nextgcore's builder
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../../
+          cd ../..
+          docker create --name builder nextg-builder /bin/true
+          mkdir -p docker/rust/binaries
+          docker cp builder:/out/. docker/rust/binaries/
+          docker rm builder
+          # The RAN binaries are this job's whole point, so their absence is a
+          # hard failure here rather than a puzzling compose error later.
+          test -f docker/rust/binaries/nr-gnb && test -f docker/rust/binaries/nr-ue \
+            || { echo "::error::nr-gnb or nr-ue missing from the builder output -- this \
+                 repo's binaries did not compile. Check the builder log."; \
+                 ls -la docker/rust/binaries/; exit 1; }
+
+      - name: Build the 5GC images this test needs
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.core -t nextgcore-core:latest .
+          # Only the NFs a registration touches, not all 24: this job is the RAN
+          # contract, and every extra image is build minutes that assert nothing
+          # about it.
+          for nf in amfd ausfd bsfd nrfd nssfd pcfd smfd udmd udrd upfd; do
+            docker build -f Dockerfile.nf \
+              --build-arg CORE_IMAGE=nextgcore-core:latest \
+              --build-arg NF_NAME=nextgcore-${nf} \
+              -t nextgcore-rust/${nf%%d}:latest .
+          done
+
+      - name: Build this repo's gNB and UE images
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          mkdir -p ../../../nextgsim/binaries
+          cp binaries/nr-gnb binaries/nr-ue ../../../nextgsim/binaries/
+          docker build -f ../../../nextgsim/Dockerfile.gnb-local \
+            -t nextgsim-gnb:latest ../../../nextgsim
+          docker build -f ../../../nextgsim/Dockerfile.ue-local \
+            -t nextgsim-ue:latest ../../../nextgsim
+
+      - name: Start the 5GC
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker compose up -d mongodb nrf
+          sleep 5
+          docker compose up -d ausf udm udr pcf nssf bsf
+          sleep 5
+          docker compose up -d amf smf upf
+          sleep 10
+          docker compose ps
+
+      # THE GATE. Two positive assertions, each on the exact text this repo emits.
+      #
+      # `docker compose logs` is captured to a FILE and the file is grepped, never
+      # piped into `grep -q`: under pipefail, grep -q exits on the first match,
+      # docker logs dies with SIGPIPE, and the pipeline reports failure -- turning
+      # a real match into a false negative. nextgcore's e2e-test.sh records the
+      # same rule.
+      - name: Register a real UE through this repo's gNB over N2
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker compose up -d gnb ue
+          # NG Setup first: the gNB must associate and be accepted before any UE
+          # NAS can cross N2, so failing here is a RAN-transport problem and is
+          # worth distinguishing from a NAS failure below.
+          for _ in $(seq 1 60); do
+            docker compose logs gnb > /tmp/gnb.log 2>&1 || true
+            if grep -qF 'Received NG Setup Response' /tmp/gnb.log; then break; fi
+            sleep 2
+          done
+          grep -F 'Received NG Setup Response' /tmp/gnb.log \
+            || { echo "::error::this repo's gNB never completed NG Setup with the AMF, so \
+                 no UE could register. N2 is down."; \
+                 tail -60 /tmp/gnb.log; docker compose logs --tail=60 amf; exit 1; }
+          echo "NG Setup complete."
+          # Then the NAS registration itself.
+          for _ in $(seq 1 60); do
+            docker compose logs ue > /tmp/ue.log 2>&1 || true
+            if grep -qF 'Received Registration Accept' /tmp/ue.log; then break; fi
+            sleep 2
+          done
+          grep -F 'Received Registration Accept' /tmp/ue.log \
+            || { echo "::error::the UE never received a Registration Accept. NG Setup \
+                 succeeded, so N2 transport is up and this is a NAS-layer failure."; \
+                 tail -80 /tmp/ue.log; docker compose logs --tail=80 amf; exit 1; }
+          echo "UE registered. This repo's RAN still interoperates with nextgcore."
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          cd nextgcore/docker/rust
+          docker compose logs --tail=100 amf || true
+          docker compose logs --tail=100 gnb || true
+          docker compose logs --tail=100 ue || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          cd nextgcore/docker/rust
+          docker compose down -v || true
