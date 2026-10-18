@@ -47,61 +47,32 @@ use crate::association::{ReceivedMessage, Result, SctpConfig, SctpError, NGAP_PP
 // libsctp (lksctp-tools) FFI
 // ===========================================================================
 
-/// lksctp `struct sctp_sndrcvinfo` (from `<netinet/sctp.h>`).
-///
-/// Layout taken from the lksctp / Linux kernel UAPI definition. All multi-byte
-/// integer fields are in host byte order **except** `sinfo_ppid`, which the
-/// kernel carries in network byte order (see the module-level note).
-///
-/// ```c
-/// struct sctp_sndrcvinfo {
-///     __u16 sinfo_stream;
-///     __u16 sinfo_ssn;
-///     __u16 sinfo_flags;
-///     __u32 sinfo_ppid;
-///     __u32 sinfo_context;
-///     __u32 sinfo_timetolive;
-///     __u32 sinfo_tsn;
-///     __u32 sinfo_cumtsn;
-///     sctp_assoc_t sinfo_assoc_id; // sctp_assoc_t == __s32 (i32)
-/// };
-/// ```
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct SctpSndRcvInfo {
-    sinfo_stream: u16,
-    sinfo_ssn: u16,
-    sinfo_flags: u16,
-    sinfo_ppid: u32,
-    sinfo_context: u32,
-    sinfo_timetolive: u32,
-    sinfo_tsn: u32,
-    sinfo_cumtsn: u32,
-    sinfo_assoc_id: i32,
-}
+// `sctp_sndrcvinfo` and `sctp_initmsg` are used straight from `libc` (#209):
+// they were hand-transcribed here, independently of nextgcore's own copy, and
+// comparing the two transcriptions is how nextgcore #429's unsigned
+// `sinfo_assoc_id` was found. `sinfo_ppid` still arrives in network byte order
+// (see the module-level note); that is a property of the kernel, not the type.
 
-/// lksctp `struct sctp_initmsg` (from `<netinet/sctp.h>`), used with the
-/// `SCTP_INITMSG` socket option to request the number of streams.
-///
-/// ```c
-/// struct sctp_initmsg {
-///     __u16 sinit_num_ostreams;
-///     __u16 sinit_max_instreams;
-///     __u16 sinit_max_attempts;
-///     __u16 sinit_max_init_timeo;
-/// };
-/// ```
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct SctpInitMsg {
-    sinit_num_ostreams: u16,
-    sinit_max_instreams: u16,
-    sinit_max_attempts: u16,
-    sinit_max_init_timeo: u16,
+/// A zeroed `sctp_sndrcvinfo` out-parameter for `sctp_recvmsg`. `libc`'s
+/// struct does not implement `Default`, so it is spelled out.
+fn empty_sndrcvinfo() -> libc::sctp_sndrcvinfo {
+    libc::sctp_sndrcvinfo {
+        sinfo_stream: 0,
+        sinfo_ssn: 0,
+        sinfo_flags: 0,
+        sinfo_ppid: 0,
+        sinfo_context: 0,
+        sinfo_timetolive: 0,
+        sinfo_tsn: 0,
+        sinfo_cumtsn: 0,
+        sinfo_assoc_id: 0,
+    }
 }
 
 /// lksctp `struct sctp_event_subscribe` (from `<netinet/sctp.h>`), used with
-/// the `SCTP_EVENTS` socket option. Every field is a `__u8` flag (0/1). The
+/// the `SCTP_EVENTS` socket option. `libc` does not define it, so it is the one
+/// SCTP struct still transcribed; `event_subscribe_layout_matches_the_kernel`
+/// pins it. Every field is a `__u8` flag (0/1). The
 /// struct has grown across kernel versions; the kernel copies
 /// `min(optlen, sizeof(kernel struct))` bytes and leaves the rest at its
 /// default, so passing this stable prefix (through `sctp_stream_change_event`)
@@ -146,20 +117,18 @@ struct SctpEventSubscribe {
     sctp_stream_change_event: u8,
 }
 
-// SCTP socket-option level and names (from <netinet/sctp.h>). These are stable
-// UAPI constants; libc does not always export them, so we define them locally.
+// SCTP socket-option level and names. `libc` defines `SOL_SCTP` for Android
+// only, not Linux, so it stays local; the option names come from `libc` (#209).
 /// `IPPROTO_SCTP` socket option level for `setsockopt` (== 132).
 const SOL_SCTP: c_int = 132;
-/// `SCTP_INITMSG` socket option: request outbound/inbound stream counts.
-const SCTP_INITMSG: c_int = 2;
-/// `SCTP_EVENTS` socket option: subscribe to SCTP events. Critically, enabling
-/// `sctp_data_io_event` makes the kernel attach the legacy `SCTP_SNDRCV`
-/// ancillary message that lksctp's `sctp_recvmsg()` parses to fill
-/// `sctp_sndrcvinfo` (PPID + stream). This is the same setup Open5GS uses
-/// (`ogs_sctp_socket`). The newer `SCTP_RECVRCVINFO` delivers a *different*
-/// cmsg (`SCTP_RCVINFO`) that `sctp_recvmsg()` does not read, which left the
-/// received PPID/stream zeroed.
-const SCTP_EVENTS: c_int = 11;
+// `SCTP_INITMSG` requests outbound/inbound stream counts. `SCTP_EVENTS`
+// subscribes to SCTP events. Critically, enabling `sctp_data_io_event` makes
+// the kernel attach the legacy `SCTP_SNDRCV` ancillary message that lksctp's
+// `sctp_recvmsg()` parses to fill `sctp_sndrcvinfo` (PPID + stream). This is
+// the same setup Open5GS uses (`ogs_sctp_socket`). The newer
+// `SCTP_RECVRCVINFO` delivers a *different* cmsg (`SCTP_RCVINFO`) that
+// `sctp_recvmsg()` does not read, which left the received PPID/stream zeroed.
+use libc::{SCTP_EVENTS, SCTP_INITMSG};
 
 // libsctp helper functions. We link against `-lsctp` (libsctp-dev). These are
 // the classic one-to-one helpers that carry the PPID/stream out-of-band so we
@@ -190,7 +159,7 @@ extern "C" {
         len: size_t,
         from: *mut sockaddr,
         fromlen: *mut socklen_t,
-        sinfo: *mut SctpSndRcvInfo,
+        sinfo: *mut libc::sctp_sndrcvinfo,
         msg_flags: *mut c_int,
     ) -> ssize_t;
 }
@@ -263,7 +232,7 @@ impl KernelSctpAssociation {
         let fd = socket.as_raw_fd();
 
         // 2a. SCTP_INITMSG: request the configured number of out/in streams.
-        let initmsg = SctpInitMsg {
+        let initmsg = libc::sctp_initmsg {
             sinit_num_ostreams: config.max_outbound_streams,
             sinit_max_instreams: config.max_inbound_streams,
             sinit_max_attempts: 0,   // 0 = kernel default
@@ -277,7 +246,7 @@ impl KernelSctpAssociation {
                 SOL_SCTP,
                 SCTP_INITMSG,
                 std::ptr::addr_of!(initmsg).cast::<c_void>(),
-                std::mem::size_of::<SctpInitMsg>() as socklen_t,
+                std::mem::size_of::<libc::sctp_initmsg>() as socklen_t,
             )
         };
         if rc != 0 {
@@ -447,7 +416,7 @@ impl KernelSctpAssociation {
             let mut guard = self.async_fd.readable().await.map_err(SctpError::Io)?;
 
             let mut buf = vec![0u8; cap];
-            let mut sinfo = SctpSndRcvInfo::default();
+            let mut sinfo = empty_sndrcvinfo();
             let mut msg_flags: c_int = 0;
 
             let result = guard.try_io(|_| {
@@ -547,7 +516,7 @@ impl KernelSctpAssociation {
         let fd = self.fd;
         let cap = self.max_recv.max(1);
         let mut buf = vec![0u8; cap];
-        let mut sinfo = SctpSndRcvInfo::default();
+        let mut sinfo = empty_sndrcvinfo();
         let mut msg_flags: c_int = 0;
 
         // SAFETY: `fd` is a valid SCTP socket; `buf` has `cap` bytes;
@@ -700,3 +669,30 @@ impl Drop for KernelSctpAssociation {
 // deregisters the fd from the reactor — it does NOT close it. Therefore the fd
 // is closed exactly once, by `Socket`'s `Drop`. Both fields are kept alive in
 // the struct for the association's lifetime.
+
+#[cfg(test)]
+mod tests {
+    use super::SctpEventSubscribe;
+    use std::mem;
+
+    /// `SctpEventSubscribe` is the one SCTP struct `libc` lacks, so it is still
+    /// transcribed and handed to `setsockopt` by size: a dropped, reordered or
+    /// widened member shifts every flag after it and silently subscribes the
+    /// wrong events. Pin the size, the alignment and the offsets of the three
+    /// members `connect` sets against `<linux/sctp.h>`.
+    #[test]
+    fn event_subscribe_layout_matches_the_kernel() {
+        assert_eq!(mem::size_of::<SctpEventSubscribe>(), 13);
+        assert_eq!(mem::align_of::<SctpEventSubscribe>(), 1);
+        assert_eq!(mem::offset_of!(SctpEventSubscribe, sctp_data_io_event), 0);
+        assert_eq!(
+            mem::offset_of!(SctpEventSubscribe, sctp_association_event),
+            1
+        );
+        assert_eq!(mem::offset_of!(SctpEventSubscribe, sctp_shutdown_event), 5);
+        assert_eq!(
+            mem::offset_of!(SctpEventSubscribe, sctp_stream_change_event),
+            12
+        );
+    }
+}
