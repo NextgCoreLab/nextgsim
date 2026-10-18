@@ -40,6 +40,10 @@ pub(crate) struct ResolvedSeqComponent {
     pub(crate) optional: bool,
     pub(crate) class_field_type: Option<ClassFieldComponentType>,
     pub(crate) key_field: bool,
+    // #214: a non-key fixed-type-value class field named `...criticality`
+    // (`&criticality` in every 3GPP *AP IE class). Marked so the codec can report
+    // an unknown IE's criticality.
+    pub(crate) criticality_field: bool,
     // FIXME : Handle default
     // pub(crate) default: Option<Asn1ResolvedType>
 }

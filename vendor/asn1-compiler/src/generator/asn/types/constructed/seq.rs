@@ -59,6 +59,9 @@ impl ResolvedConstructedType {
                 if c.key_field {
                     fld_attrs.push(quote! { key_field = true })
                 }
+                if c.criticality_field {
+                    fld_attrs.push(quote! { criticality_field = true })
+                }
 
                 let fld_attr_tokens = if !fld_attrs.is_empty() {
                     quote! { #[asn(#(#fld_attrs),*)] }

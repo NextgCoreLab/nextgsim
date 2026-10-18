@@ -85,6 +85,12 @@ pub(super) fn generate_per_codec_for_asn_open_type(
 
                 let result = match key {
                     #(#variant_decode_tokens)*
+                    // #214: an IE id this schema does not know. Skipped (and
+                    // reported to the enclosing container) only on the caller's
+                    // opt-in; otherwise the decode fails as it always has.
+                    _ if data.skips_unknown_open_types() => {
+                        Err(data.skip_unknown_open_type(key, length))
+                    }
                     _ => Err(asn1_codecs::PerCodecError::new(
                             asn1_codecs::PerCodecErrorCause::Generic,
                             format!("Key {} Not Found", key).as_str()))
@@ -134,7 +140,13 @@ fn generate_open_type_variant_tokens_using_attrs(
                             let unnamed = unnamed.as_ref().unwrap();
                             let ty = &unnamed.ty;
                             let variant_decode_token = quote! {
-                                #key => Ok(Self::#variant_ident(#ty::#codec_decode_fn(data)?)),
+                                // A known value's own contents are a nested
+                                // position: an unknown IE inside it cannot be
+                                // skipped from here (#214).
+                                #key => Ok(Self::#variant_ident(
+                                    #ty::#codec_decode_fn(data)
+                                        .map_err(asn1_codecs::PerCodecError::into_unskippable)?,
+                                )),
                             };
                             let variant_encode_token = quote! {
                                 Self::#variant_ident(ref v) => v.#codec_encode_fn(&mut inner)?,

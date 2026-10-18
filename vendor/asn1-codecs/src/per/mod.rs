@@ -25,6 +25,32 @@ pub struct PerCodecData {
     decode_offset: usize,
     key: Option<i128>,
     aligned: bool,
+    // #214: the criticality decoded alongside the current `key`, so a skipped
+    // unknown open type can report it.
+    criticality: Option<i128>,
+    skip_unknown_open_types: bool,
+    unknown_open_types: Vec<UnknownOpenType>,
+}
+
+/// An open-type value whose key (an IE id) the schema does not know, skipped
+/// during decode instead of failing it (#214).
+///
+/// Recorded only when the caller opted in with
+/// [`PerCodecData::set_skip_unknown_open_types`]. The codec does not interpret
+/// `criticality`: what to do with an unknown IE -- ignore it, ignore it and
+/// report it, or reject the procedure (TS 38.413 §10.3.4, and the equivalent
+/// clause of every 3GPP *AP) -- is protocol behaviour, so it is the caller's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownOpenType {
+    /// The key (the IE or extension id) the schema has no variant for.
+    pub key: i128,
+    /// The raw value of the sibling field marked `criticality_field`, decoded
+    /// immediately before the open type, or `None` if the containing SEQUENCE
+    /// has no such field. For NGAP this is the `Criticality` index:
+    /// 0 = reject, 1 = ignore, 2 = notify.
+    pub criticality: Option<i128>,
+    /// The open type's content octets, exactly as framed by its length.
+    pub value: Vec<u8>,
 }
 
 impl PerCodecData {
@@ -58,9 +84,8 @@ impl PerCodecData {
     fn from_slice_internal(bytes: &[u8], aligned: bool) -> Self {
         Self {
             bits: BitSlice::<_, _>::from_slice(bytes).to_bitvec(),
-            decode_offset: 0,
-            key: None,
             aligned,
+            ..Self::default()
         }
     }
 
@@ -351,6 +376,70 @@ impl PerCodecData {
     /// function, which updates the internal state of the decoder data.
     pub fn set_key(&mut self, key: i128) {
         let _ = self.key.replace(key);
+        // A new key starts a new IE: a criticality left over from the previous
+        // one must not be attributed to this one.
+        self.criticality = None;
+    }
+
+    /// Records the criticality decoded alongside the current key (#214). Called
+    /// by the derive for a field marked `criticality_field`.
+    pub fn set_criticality(&mut self, criticality: i128) {
+        let _ = self.criticality.replace(criticality);
+    }
+
+    /// The criticality decoded alongside the current key, if any.
+    pub fn get_criticality(&self) -> Option<i128> {
+        self.criticality
+    }
+
+    /// Opt in to skipping open-type values whose key the schema does not know
+    /// (#214).
+    ///
+    /// Off by default, and deliberately so: with it on, a decode SUCCEEDS without
+    /// the unknown IEs, so a caller that never inspects
+    /// [`take_unknown_open_types`](Self::take_unknown_open_types) would silently
+    /// ignore an IE whose criticality says to reject the procedure. With it off,
+    /// an unknown key fails the decode exactly as before.
+    ///
+    /// Only an unknown value that is the LAST field of a SEQUENCE carrying a
+    /// `key_field` -- i.e. an IE in a protocol-IE or extension container -- is
+    /// skipped, and only that container's entry is dropped. Anywhere else (a
+    /// nested position, a non-final field, a CHOICE arm) skipping cannot resume
+    /// at a well-defined point, and the decode still fails.
+    pub fn set_skip_unknown_open_types(&mut self, skip: bool) {
+        self.skip_unknown_open_types = skip;
+    }
+
+    /// Whether unknown open types are skipped (see
+    /// [`set_skip_unknown_open_types`](Self::set_skip_unknown_open_types)).
+    pub fn skips_unknown_open_types(&self) -> bool {
+        self.skip_unknown_open_types
+    }
+
+    /// Takes the open types skipped so far, in wire order.
+    pub fn take_unknown_open_types(&mut self) -> Vec<UnknownOpenType> {
+        std::mem::take(&mut self.unknown_open_types)
+    }
+
+    /// Skips an open type whose key is unknown: consumes its `length` content
+    /// octets, records it, and returns an error of cause
+    /// [`PerCodecErrorCause::UnknownOpenTypeSkipped`] for the enclosing container
+    /// to act on. Called by the derive; requires the opt-in.
+    pub fn skip_unknown_open_type(&mut self, key: i128, length: usize) -> PerCodecError {
+        match self.get_bytes(length) {
+            Err(e) => e,
+            Ok(value) => {
+                self.unknown_open_types.push(UnknownOpenType {
+                    key,
+                    criticality: self.criticality,
+                    value,
+                });
+                PerCodecError::new(
+                    PerCodecErrorCause::UnknownOpenTypeSkipped,
+                    format!("Open type key {} is unknown and was skipped", key),
+                )
+            }
+        }
     }
 
     /// Dump current 'offset'.
@@ -482,5 +571,72 @@ impl PerCodecData {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unknown_open_type_tests {
+    use super::*;
+
+    /// #214: skipping consumes exactly the framed octets, records key,
+    /// criticality and value, and yields the "skipped" cause.
+    #[test]
+    fn skipping_consumes_the_value_and_records_it() {
+        let mut data = PerCodecData::from_slice_aper(&[0xAA, 0xBB, 0xCC]);
+        data.set_skip_unknown_open_types(true);
+        data.set_key(9999);
+        data.set_criticality(1);
+
+        let err = data.skip_unknown_open_type(9999, 2);
+        assert!(err.is_unknown_open_type_skipped(), "{}", err);
+        assert_eq!(data.decode_offset_bits(), 16, "exactly two octets consumed");
+        assert_eq!(
+            data.take_unknown_open_types(),
+            vec![UnknownOpenType {
+                key: 9999,
+                criticality: Some(1),
+                value: vec![0xAA, 0xBB],
+            }]
+        );
+        assert!(data.take_unknown_open_types().is_empty(), "take drains");
+    }
+
+    /// A new key clears the previous IE's criticality, so a SEQUENCE without a
+    /// criticality field cannot inherit a stale one.
+    #[test]
+    fn a_new_key_clears_the_criticality() {
+        let mut data = PerCodecData::new_aper();
+        data.set_key(1);
+        data.set_criticality(0);
+        data.set_key(2);
+        assert_eq!(data.get_criticality(), None);
+    }
+
+    /// A value framed longer than the buffer is a buffer error, not a skip.
+    #[test]
+    fn a_truncated_value_is_not_a_skip() {
+        let mut data = PerCodecData::from_slice_aper(&[0xAA]);
+        let err = data.skip_unknown_open_type(7, 4);
+        assert!(!err.is_unknown_open_type_skipped(), "{}", err);
+        assert!(data.take_unknown_open_types().is_empty());
+    }
+
+    /// `into_unskippable` hardens only the skipped cause.
+    #[test]
+    fn into_unskippable_hardens_only_the_skip() {
+        let skipped = PerCodecError::new(PerCodecErrorCause::UnknownOpenTypeSkipped, "x");
+        assert!(!skipped.into_unskippable().is_unknown_open_type_skipped());
+        let other = PerCodecError::new(PerCodecErrorCause::BufferTooShort, "y");
+        assert!(matches!(
+            other.into_unskippable().cause,
+            PerCodecErrorCause::BufferTooShort
+        ));
+    }
+
+    /// The opt-in is off by default.
+    #[test]
+    fn skipping_is_opt_in() {
+        assert!(!PerCodecData::new_aper().skips_unknown_open_types());
+        assert!(!PerCodecData::from_slice_uper(&[]).skips_unknown_open_types());
     }
 }

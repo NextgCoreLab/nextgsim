@@ -87,6 +87,58 @@ pub fn decode_ngap_pdu(bytes: &[u8]) -> Result<NGAP_PDU, NgapCodecError> {
     NGAP_PDU::aper_decode(&mut data).map_err(|e| NgapCodecError::DecodeError(format!("{e:?}")))
 }
 
+/// An IE (or IE extension) whose id this schema does not know, skipped by
+/// [`decode_ngap_pdu_with_unknown_ies`] instead of failing the decode.
+///
+/// TS 38.413 §10.3.4.1 makes what happens next depend on `criticality`:
+/// `reject` -- reject the procedure; `notify` -- ignore the IE and report it;
+/// `ignore` -- ignore it. That is the receiver's decision, which is why the IE is
+/// handed back rather than dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownIe {
+    /// The ProtocolIE-ID (or ProtocolExtensionID) the schema has no entry for.
+    pub id: i128,
+    /// Its criticality as sent, if the container carries one (every NGAP IE
+    /// container does).
+    pub criticality: Option<Criticality>,
+    /// The IE value's octets, exactly as framed on the wire.
+    pub value: Vec<u8>,
+}
+
+/// Decode an NGAP PDU, skipping protocol IEs whose id the schema does not know
+/// and returning them alongside the PDU (#214, TS 38.413 §10.3.4).
+///
+/// [`decode_ngap_pdu`] fails the whole message on such an IE, so a newer-release
+/// peer that adds one is refused. This variant drops only the unknown entries --
+/// the rest of the message decodes as if they were absent -- and reports each
+/// with its criticality, which the caller MUST inspect: an unknown IE marked
+/// `reject` still means the procedure is to be rejected.
+///
+/// An unknown id is only skippable as an entry of a protocol-IE or extension
+/// container. Anywhere else -- an unknown procedure code, for one -- the decode
+/// still fails.
+pub fn decode_ngap_pdu_with_unknown_ies(
+    bytes: &[u8],
+) -> Result<(NGAP_PDU, Vec<UnknownIe>), NgapCodecError> {
+    let mut data = PerCodecData::from_slice_aper(bytes);
+    data.set_skip_unknown_open_types(true);
+    let pdu = NGAP_PDU::aper_decode(&mut data)
+        .map_err(|e| NgapCodecError::DecodeError(format!("{e:?}")))?;
+    let unknown = data
+        .take_unknown_open_types()
+        .into_iter()
+        .map(|u| UnknownIe {
+            id: u.key,
+            criticality: u
+                .criticality
+                .and_then(|c| u8::try_from(c).ok())
+                .map(Criticality),
+            value: u.value,
+        })
+        .collect();
+    Ok((pdu, unknown))
+}
+
 /// Encode any generated NGAP type to bytes using APER
 ///
 /// Used for standalone IEs and transfer containers that are carried as

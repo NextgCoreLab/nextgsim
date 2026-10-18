@@ -979,6 +979,107 @@ mod tests {
         }
     }
 
+    /// Encodes an NG Setup Request carrying one extra IE whose id is then
+    /// rewritten to `unknown_id`, i.e. an IE from a newer release this schema
+    /// does not know. The extra entry is a RANNodeName with a distinctive value,
+    /// so its octets can be found verbatim: every entry starts octet-aligned (the
+    /// ProtocolIE-ID is a two-octet aligned field), so the entry encoded on its
+    /// own appears unchanged inside the PDU.
+    fn ng_setup_request_with_unknown_ie(unknown_id: u16, criticality: u8) -> (Vec<u8>, NGAP_PDU) {
+        let original = build_ng_setup_request(&create_test_params()).expect("build");
+        let extra = NGSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_RAN_NODE_NAME),
+            criticality: Criticality(criticality),
+            value: NGSetupRequestProtocolIEs_EntryValue::Id_RANNodeName(RANNodeName(
+                "unknown-ie-marker".to_string(),
+            )),
+        };
+        let mut with_extra = original.clone();
+        if let NGAP_PDU::InitiatingMessage(ref mut msg) = with_extra {
+            if let InitiatingMessageValue::Id_NGSetup(ref mut req) = msg.value {
+                req.protocol_i_es.0.insert(1, extra.clone());
+            }
+        }
+        let mut bytes = crate::codec::encode_ngap_pdu(&with_extra).expect("encode");
+        let entry = crate::codec::encode_aper(&extra).expect("entry");
+        let at = bytes
+            .windows(entry.len())
+            .position(|w| w == entry.as_slice())
+            .expect("the extra entry's octets appear verbatim in the PDU");
+        bytes[at..at + 2].copy_from_slice(&unknown_id.to_be_bytes());
+        (bytes, original)
+    }
+
+    /// #214: an unknown IE marked `ignore` (TS 38.413 §10.3.4.1) no longer fails
+    /// the whole NG Setup Request. With the opt-in decode the message decodes to
+    /// exactly the request WITHOUT that IE, and the IE is reported with its id,
+    /// criticality and value octets. The default decode still refuses it, so no
+    /// existing caller silently starts ignoring IEs.
+    #[test]
+    fn test_unknown_ignorable_ie_is_skipped_and_reported() {
+        let (bytes, original) = ng_setup_request_with_unknown_ie(9999, Criticality::IGNORE);
+
+        assert!(
+            crate::codec::decode_ngap_pdu(&bytes).is_err(),
+            "the default decode is unchanged: an unknown IE id fails it"
+        );
+
+        let (pdu, unknown) =
+            crate::codec::decode_ngap_pdu_with_unknown_ies(&bytes).expect("opt-in decode");
+        assert_eq!(pdu, original, "everything except the unknown IE decodes");
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].id, 9999);
+        assert_eq!(
+            unknown[0].criticality,
+            Some(Criticality(Criticality::IGNORE))
+        );
+        let expected_value =
+            crate::codec::encode_aper(&RANNodeName("unknown-ie-marker".to_string()))
+                .expect("value");
+        assert_eq!(
+            unknown[0].value, expected_value,
+            "the value octets as framed"
+        );
+    }
+
+    /// The criticality reported is the one sent, so a caller can tell an unknown
+    /// `reject` IE -- which still requires rejecting the procedure -- from an
+    /// ignorable one.
+    #[test]
+    fn test_unknown_ie_reports_reject_criticality() {
+        let (bytes, _) = ng_setup_request_with_unknown_ie(9998, Criticality::REJECT);
+        let (_, unknown) =
+            crate::codec::decode_ngap_pdu_with_unknown_ies(&bytes).expect("opt-in decode");
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].id, 9998);
+        assert_eq!(
+            unknown[0].criticality,
+            Some(Criticality(Criticality::REJECT))
+        );
+    }
+
+    /// Skipping is confined to IE-container entries. An unknown PROCEDURE CODE
+    /// is the value of the top-level CHOICE, not a container entry, so there is
+    /// nothing to resume from: the opt-in decode must still fail, and must not
+    /// leak the internal "skipped" cause as if the PDU were usable.
+    #[test]
+    fn test_unknown_procedure_code_is_not_skippable() {
+        let mut bytes = encode_ng_setup_request(&create_test_params()).expect("encode");
+        // NGAP-PDU: byte 0 = CHOICE index (initiatingMessage), byte 1 = the
+        // procedure code (NG Setup = 21), constrained 0..255 in one octet.
+        assert_eq!(bytes[1], ID_NG_SETUP);
+        bytes[1] = 250;
+
+        let err = crate::codec::decode_ngap_pdu_with_unknown_ies(&bytes)
+            .expect_err("an unknown procedure code cannot be skipped");
+        let msg = err.to_string();
+        assert!(msg.contains("Generic"), "a hard failure, got {msg}");
+        assert!(
+            !msg.contains("UnknownOpenTypeSkipped"),
+            "the skipped cause must not escape the PDU: {msg}"
+        );
+    }
+
     #[test]
     fn test_build_ng_setup_request() {
         let params = create_test_params();

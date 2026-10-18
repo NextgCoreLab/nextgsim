@@ -8,6 +8,7 @@ struct FieldTokens {
     decode_tokens: Vec<proc_macro2::TokenStream>,
     encode_tokens: Vec<proc_macro2::TokenStream>,
     hdr_encode_tokens: Vec<proc_macro2::TokenStream>,
+    has_key_field: bool,
 }
 
 pub(super) fn generate_per_codec_for_asn_sequence(
@@ -45,10 +46,12 @@ pub(super) fn generate_per_codec_for_asn_sequence(
 
     let aligned = syn::LitBool::new(aligned, proc_macro2::Span::call_site());
 
+    let extensible = ext.is_some_and(|e| e.value());
     let field_tokens = generate_seq_field_codec_tokens_using_attrs(
         ast,
         codec_encode_fn.clone(),
         codec_decode_fn.clone(),
+        extensible,
     );
     if field_tokens.is_err() {
         return field_tokens.err().unwrap().to_compile_error().into();
@@ -57,6 +60,31 @@ pub(super) fn generate_per_codec_for_asn_sequence(
     let fld_decode_tokens = field_tokens.decode_tokens;
     let hdr_encode_tokens = field_tokens.hdr_encode_tokens;
     let fld_encode_tokens = field_tokens.encode_tokens;
+    let has_key_field = field_tokens.has_key_field;
+
+    let inner_body = quote! {
+        let (bitmap, extensions_present) = #ty_decode_path(data, #ext, #opt_count)?;
+        if !extensions_present {
+            Ok(Self{#(#fld_decode_tokens)*})
+        } else {
+            let ty = Self {
+                #(#fld_decode_tokens)*
+            };
+            asn1_codecs::decode_sequence_extensions_skip_bits(data, #aligned)?;
+            Ok(ty)
+        }
+    };
+    // #214: only a protocol-IE SEQUENCE (with a key field) may pass a skipped
+    // unknown open type up to its SEQUENCE OF; any other SEQUENCE is a nested
+    // position the skip cannot resume from.
+    let decode_body = if has_key_field {
+        inner_body
+    } else {
+        quote! {
+            let result: Result<Self::Output, asn1_codecs::PerCodecError> = (|| { #inner_body })();
+            result.map_err(asn1_codecs::PerCodecError::into_unskippable)
+        }
+    };
 
     let tokens = quote! {
         impl #codec_path for #name {
@@ -65,16 +93,7 @@ pub(super) fn generate_per_codec_for_asn_sequence(
             fn #codec_decode_fn(data: &mut asn1_codecs::PerCodecData) -> Result<Self::Output, asn1_codecs::PerCodecError> {
                 log::trace!(concat!("decode: ", stringify!(#name)));
 
-                let (bitmap, extensions_present) = #ty_decode_path(data, #ext, #opt_count)?;
-                if !extensions_present {
-                    Ok(Self{#(#fld_decode_tokens)*})
-                } else {
-                    let ty = Self {
-                        #(#fld_decode_tokens)*
-                    };
-                    asn1_codecs::decode_sequence_extensions_skip_bits(data, #aligned)?;
-                    Ok(ty)
-                }
+                #decode_body
             }
 
             fn #codec_encode_fn(&self, data: &mut asn1_codecs::PerCodecData) -> Result<(), asn1_codecs::PerCodecError> {
@@ -100,8 +119,10 @@ fn generate_seq_field_codec_tokens_using_attrs(
     ast: &syn::DeriveInput,
     codec_encode_fn: proc_macro2::TokenStream,
     codec_decode_fn: proc_macro2::TokenStream,
+    extensible: bool,
 ) -> Result<FieldTokens, syn::Error> {
-    let mut decode_tokens = vec![];
+    let mut decode_fields: Vec<(syn::Ident, proc_macro2::TokenStream)> = vec![];
+    let mut has_key_field = false;
     let mut encode_tokens = vec![];
     let mut hdr_encode_tokens = vec![];
 
@@ -156,7 +177,20 @@ fn generate_seq_field_codec_tokens_using_attrs(
                                     false
                                 };
 
-                                if !is_key_field {
+                                let is_criticality_field =
+                                    cp.criticality_field.as_ref().is_some_and(|c| c.value());
+
+                                if is_criticality_field {
+                                    // #214: remembered so a skipped unknown open
+                                    // type in this SEQUENCE can report it.
+                                    quote! {
+                                        {
+                                        let value = #ty_ident::#codec_decode_fn(data)?;
+                                        data.set_criticality(value.0 as i128);
+                                        value
+                                        }
+                                    }
+                                } else if !is_key_field {
                                     quote! {
                                         {
                                         #ty_ident::#codec_decode_fn(data)?
@@ -198,8 +232,10 @@ fn generate_seq_field_codec_tokens_using_attrs(
                             } else {
                                 quote! {}
                             };
-                            let field_decode_token = quote! { #id: #fld_decode_tokens, };
-                            decode_tokens.push(field_decode_token);
+                            if cp.key_field.as_ref().is_some_and(|k| k.value()) {
+                                has_key_field = true;
+                            }
+                            decode_fields.push((id.clone(), fld_decode_tokens));
                             encode_tokens.push(field_encode_token);
                             hdr_encode_tokens.push(header_encode_token);
                         }
@@ -208,6 +244,28 @@ fn generate_seq_field_codec_tokens_using_attrs(
             }
         }
     }
+
+    // #214: a skipped unknown open type may only escape a protocol-IE SEQUENCE
+    // (one with a `key_field`) from its FINAL field, and only when the SEQUENCE is
+    // not extensible: then the skip has consumed the whole entry and the
+    // enclosing SEQUENCE OF can drop it and carry on. From any earlier field the
+    // entry is only partly read, so the skip becomes a hard failure here. (A
+    // SEQUENCE without a key field converts it wholesale, in the caller.)
+    let n = decode_fields.len();
+    let decode_tokens = decode_fields
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, expr))| {
+            if has_key_field && (i + 1 < n || extensible) {
+                quote! {
+                    #id: (|| -> Result<_, asn1_codecs::PerCodecError> { Ok(#expr) })()
+                        .map_err(asn1_codecs::PerCodecError::into_unskippable)?,
+                }
+            } else {
+                quote! { #id: #expr, }
+            }
+        })
+        .collect();
 
     if let Some((first, others)) = errors.split_first_mut() {
         for e in others {
@@ -219,6 +277,7 @@ fn generate_seq_field_codec_tokens_using_attrs(
             decode_tokens,
             hdr_encode_tokens,
             encode_tokens,
+            has_key_field,
         })
     }
 }

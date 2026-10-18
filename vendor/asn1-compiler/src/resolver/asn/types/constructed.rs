@@ -109,6 +109,7 @@ fn resolve_sequence_type(
             optional: c.optional || c.default.is_some(),
             class_field_type: None,
             key_field: false,
+            criticality_field: false,
         };
         components.push(seq_component);
     }
@@ -136,6 +137,7 @@ fn resolve_sequence_type(
                             optional: c.optional || c.default.is_some(),
                             class_field_type: None,
                             key_field: false,
+                            criticality_field: false,
                         };
                         additions.push(seq_component);
                     }
@@ -156,6 +158,7 @@ fn resolve_sequence_type(
                         optional: c.optional || c.default.is_some(),
                         class_field_type: None,
                         key_field: false,
+                        criticality_field: false,
                     };
                     additions.push(seq_component);
                 }
@@ -302,6 +305,8 @@ fn resolve_seq_components_for_objects(
                         optional: false, // FIXME:
                         class_field_type: Some(ClassFieldComponentType::FixedTypeValue),
                         key_field: comp_spec.is_none(),
+                        criticality_field: comp_spec.is_some()
+                            && fieldref.to_ascii_lowercase().ends_with("criticality"),
                     };
                     result.push(seq_component);
                 } else {
@@ -319,6 +324,7 @@ fn resolve_seq_components_for_objects(
                         optional: false, // FIXME:
                         class_field_type: Some(ClassFieldComponentType::Type),
                         key_field: false,
+                        criticality_field: false,
                     };
                     result.push(seq_component);
                 }
@@ -340,6 +346,7 @@ fn resolve_seq_components_for_objects(
                 optional: false, // FIXME: Not sure
                 class_field_type: None,
                 key_field: false,
+                criticality_field: false,
             };
             result.push(seq_component);
         }

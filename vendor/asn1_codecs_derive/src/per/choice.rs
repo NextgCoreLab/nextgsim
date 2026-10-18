@@ -82,6 +82,9 @@ pub(super) fn generate_per_codec_for_asn_choice(
             fn #codec_decode_fn(data: &mut asn1_codecs::PerCodecData) -> Result<Self::Output, asn1_codecs::PerCodecError> {
                 log::trace!(concat!("decode: ", stringify!(#name)));
 
+                // #214: a CHOICE arm is a nested position; a skipped unknown open
+                // type inside it cannot be resumed from, so it is a hard failure.
+                let result: Result<Self::Output, asn1_codecs::PerCodecError> = (|| {
                 let (idx, extended) = #ty_decode_path(data, #lb, #ub, #ext)?;
                 // Root and extension indices are SEPARATE number spaces (X.691
                 // §23.6): an extension addition is numbered from 0 in declaration
@@ -116,6 +119,8 @@ pub(super) fn generate_per_codec_for_asn_choice(
                     #open_type_resync_fn(data, start, length)?;
                     Ok(decoded)
                 }
+                })();
+                result.map_err(asn1_codecs::PerCodecError::into_unskippable)
             }
 
             fn #codec_encode_fn(&self, data: &mut asn1_codecs::PerCodecData) -> Result<(), asn1_codecs::PerCodecError> {
