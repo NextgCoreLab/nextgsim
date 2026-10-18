@@ -16,14 +16,14 @@ use thiserror::Error;
 use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
 use tracing::{debug, error, info, trace, warn};
 
-/// NGAP Payload Protocol Identifier (PPID) as defined in 3GPP TS 38.412
-pub const NGAP_PPID: u32 = 60;
-/// Default number of SCTP streams for NGAP
-pub const DEFAULT_NUM_STREAMS: u16 = 2;
-/// Default maximum message size (64KB)
-pub const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;
-/// Default receive buffer size (256KB)
-pub const DEFAULT_RECEIVE_BUFFER_SIZE: u32 = 262144;
+// The NGAP PPID, the association defaults and the received-message shape are
+// the SCTP core both repos share, so they are defined once, in nextgcore-sctp
+// (#205). Only transport is shared: protocol codecs stay independent, because
+// this repo is the peer that tests nextgcore.
+pub use nextgcore_sctp::{
+    ReceivedMessage, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_NUM_STREAMS, DEFAULT_RECEIVE_BUFFER_SIZE,
+    NGAP_PPID,
+};
 
 /// SCTP association errors
 #[derive(Debug, Error)]
@@ -110,14 +110,6 @@ impl Default for SctpConfig {
             backend: SctpBackend::Userspace,
         }
     }
-}
-
-/// Received SCTP message
-#[derive(Debug, Clone)]
-pub struct ReceivedMessage {
-    pub stream_id: u16,
-    pub data: Bytes,
-    pub ppid: u32,
 }
 
 /// SCTP association events
@@ -1710,6 +1702,19 @@ mod tests {
     #[test]
     fn test_ngap_ppid() {
         assert_eq!(NGAP_PPID, 60);
+    }
+
+    /// `ReceivedMessage` is nextgcore's type, not a lookalike (#205). A local
+    /// struct reintroduced here is a distinct type, and this stops compiling.
+    #[test]
+    fn received_message_is_nextgcores() {
+        let ours = ReceivedMessage {
+            stream_id: 1,
+            data: Bytes::from_static(b"ngap"),
+            ppid: NGAP_PPID,
+        };
+        let theirs: nextgcore_sctp::ReceivedMessage = ours;
+        assert_eq!(theirs.ppid, 60);
     }
 
     #[test]

@@ -1522,8 +1522,9 @@ impl GnbTaskBase {
 /// Default channel capacity for task message queues.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
-/// NGAP Payload Protocol ID for SCTP.
-pub const NGAP_PPID: u32 = 60;
+/// NGAP Payload Protocol ID for SCTP. Re-exported rather than redefined: this
+/// crate used to carry a second copy beside nextgsim-sctp's (#205).
+pub use nextgsim_sctp::NGAP_PPID;
 
 /// Default shutdown timeout in milliseconds.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
