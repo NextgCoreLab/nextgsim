@@ -325,6 +325,47 @@ docker exec nextgcore-amf tcpdump -i eth0 port 38412 -w /tmp/ngap.pcap
 docker cp nextgcore-amf:/tmp/ngap.pcap ./ngap.pcap
 ```
 
+## The nextgcore-sctp dependency
+
+`nextgsim-sctp` takes the SCTP core it shares with the AMF from nextgcore
+instead of keeping its own copy (#205): `NGAP_PPID`, the three association
+defaults (`DEFAULT_NUM_STREAMS`, `DEFAULT_MAX_MESSAGE_SIZE`,
+`DEFAULT_RECEIVE_BUFFER_SIZE`) and `ReceivedMessage`. It is a git dependency
+**pinned by `rev`**, declared in `nextgsim-sctp/Cargo.toml`. CI needs no extra
+checkout step, because cargo fetches the public repository itself. nextgcore
+has no root `Cargo.toml` (its workspace root is `src/Cargo.toml`), and cargo
+finds the member anyway.
+
+**Only transport is shared.** Each repo keeps the client or server half it
+actually drives: nextgcore is the SCTP server for NGAP, and this repo is the
+client, including multihoming. The NGAP, NAS and NRPPa codecs stay
+independent. This repo is the peer that tests nextgcore, so a misreading the
+two shared would pass the cross-repo E2E (#45 found one that way).
+
+### Bumping the rev
+
+1. Pick a nextgcore sha that is on `main` **and** that the cross-repo E2E
+   validated. Use the `validated-pair.json` artifact that nextgcore's
+   `ci.yml` writes once all three heavy jobs pass. Take it from a `schedule`
+   run, and check its `event` and `nextgcore_ref` fields as well as the shas:
+   a manifest from a branch dispatch passes every check while naming a
+   feature branch. Don't pin a branch head or an unmerged sha, because a
+   rebase or a squash-merge would orphan it.
+2. Replace the `rev` in `nextgsim-sctp/Cargo.toml`, then run
+   `cargo update -p nextgcore-sctp` so `Cargo.lock` follows.
+3. Run `cargo test --workspace --no-fail-fast`. A compile error here means
+   nextgcore renamed or removed something this repo consumes. Port to the new
+   name, or ask nextgcore to keep the item. Don't redefine it locally: that
+   recreates the copy this dependency removed.
+4. Name the old and new shas, and the manifest run they came from, in the
+   commit message.
+
+A nextgcore change does **not** reach this repo until somebody bumps the rev.
+That is deliberate. It also means nextgcore's own E2E, which builds this repo,
+compiles these constants from the pinned rev, not from the nextgcore commit
+under test. That doesn't matter for constants. It would matter if anything
+with behaviour were shared.
+
 ## References
 
 - [3GPP TS 38.413](https://www.3gpp.org/ftp/Specs/archive/38_series/38.413/) - NGAP Specification
