@@ -363,6 +363,74 @@ mod tests {
         assert!(!stream.is_non_ue_associated());
     }
 
+    /// #213: NGAP CauseRadioNetwork extension additions are named, encode and
+    /// decode back to the SAME root-continuing value. n26-interface-not-available
+    /// is the first addition after 45 root values, so it is 45 and its wire form
+    /// is the extension bit then normally-small index 0: 0b1_0_000000 = 0x80.
+    /// Pinned as bytes, because a codec that encoded and decoded the wrong index
+    /// symmetrically would still round trip.
+    #[test]
+    fn test_enumerated_extension_values_encode_and_decode() {
+        assert_eq!(CauseRadioNetwork::N26_INTERFACE_NOT_AVAILABLE, 45);
+        assert_eq!(CauseRadioNetwork::RELEASE_DUE_TO_PRE_EMPTION, 46);
+
+        for (value, wire) in [
+            (CauseRadioNetwork::N26_INTERFACE_NOT_AVAILABLE, 0x80_u8),
+            (CauseRadioNetwork::RELEASE_DUE_TO_PRE_EMPTION, 0x81),
+        ] {
+            let bytes = encode_aper(&CauseRadioNetwork(value)).expect("extension value encodes");
+            assert_eq!(bytes, vec![wire], "value {value}");
+            let back: CauseRadioNetwork = decode_aper(&bytes).expect("decodes");
+            assert_eq!(
+                back.0, value,
+                "value {value} must decode to itself, not root 0"
+            );
+        }
+
+        // The last root value is unchanged: bit 0, then 44 in six bits.
+        let bytes = encode_aper(&CauseRadioNetwork(
+            CauseRadioNetwork::RELEASE_DUE_TO_CN_DETECTED_MOBILITY,
+        ))
+        .expect("root");
+        assert_eq!(bytes, vec![0b0101_1000]);
+
+        // Inside the Cause CHOICE, as amfd would send it.
+        let cause = Cause::RadioNetwork(CauseRadioNetwork(
+            CauseRadioNetwork::RELEASE_DUE_TO_PRE_EMPTION,
+        ));
+        let bytes = encode_aper(&cause).expect("Cause with an extension value encodes");
+        let back: Cause = decode_aper(&bytes).expect("decodes");
+        assert_eq!(back, cause);
+    }
+
+    /// An addition this schema does not know (a newer peer's) decodes to its
+    /// root-continuing number; one whose number cannot fit the generated u8 is
+    /// refused rather than wrapped onto a root value.
+    #[test]
+    fn test_unknown_enumerated_extension_index_does_not_wrap() {
+        let encode_idx = |idx: i128| {
+            let mut data = PerCodecData::new_aper();
+            asn1_codecs::aper::encode::encode_enumerated(
+                &mut data,
+                Some(0),
+                Some(44),
+                true,
+                idx,
+                true,
+            )
+            .expect("encode raw extension index");
+            data.into_bytes()
+        };
+
+        let back: CauseRadioNetwork = decode_aper(&encode_idx(100)).expect("fits u8");
+        assert_eq!(back.0, 145);
+
+        assert!(
+            decode_aper::<CauseRadioNetwork>(&encode_idx(250)).is_err(),
+            "45 + 250 does not fit u8 and must not wrap"
+        );
+    }
+
     #[test]
     fn test_stream_manager_creation() {
         let manager = SctpStreamManager::new(4, StreamAllocationStrategy::RoundRobin);
