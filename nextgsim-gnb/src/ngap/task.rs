@@ -8157,7 +8157,13 @@ mod tests {
             0x1234,
             &[0x00, 0x00, 0x01],
             &[0x00],
-            &[],
+            // One session: PDUSessionResourceListHORqd is SIZE (1..256), so an empty
+            // list is refused by the encoder since #212 -- this fixture used to put
+            // exactly that undecodable message on the wire.
+            &[PduSessionResourceHoRequiredItem {
+                pdu_session_id: 5,
+                handover_required_transfer: vec![0x00],
+            }],
         )
         .await;
         assert!(

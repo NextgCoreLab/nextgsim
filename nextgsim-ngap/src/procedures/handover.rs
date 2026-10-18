@@ -2411,16 +2411,15 @@ mod tests {
         );
     }
 
-    /// A HANDOVER REQUIRED with an **empty** PDU session list encodes but does **not
-    /// decode**, which is why the gNB refuses to build one.
+    /// A HANDOVER REQUIRED with an **empty** PDU session list is **refused by the
+    /// encoder**, which is why the gNB refuses to build one.
     ///
-    /// `PDUSessionResourceListHORqd` is `SIZE(1..maxnoofPDUSessions)`: the encoder emits a
-    /// length prefix the decoder cannot then satisfy, so the message reaches the wire and
-    /// no peer can read it. Pinned here rather than left as a comment on the gNB's
-    /// refusal, because it is the *reason* for that refusal and it is a property of this
-    /// codec — found by a gNB test failing for exactly this.
+    /// `PDUSessionResourceListHORqd` is `SIZE(1..maxnoofPDUSessions)`. Until #212 the
+    /// encoder did not enforce that: it dropped the length prefix, the message reached
+    /// the wire and no peer could read it. This test used to pin that trap; it now pins
+    /// that the trap is closed, at the encoder, before anything is sent.
     #[test]
-    fn a_handover_required_with_no_sessions_encodes_but_does_not_decode() {
+    fn a_handover_required_with_no_sessions_is_refused_by_the_encoder() {
         use crate::codec::{decode_ngap_pdu, encode_ngap_pdu};
         let mut params = HandoverRequiredParams {
             amf_ue_ngap_id: 1,
@@ -2438,12 +2437,10 @@ mod tests {
             pdu_session_resource_list: Vec::new(),
             source_to_target_transparent_container: vec![0x11],
         };
-        let bytes = encode_ngap_pdu(&build_handover_required(&params).expect("build"))
-            .expect("the encoder does NOT refuse an empty list, which is the trap");
         assert!(
-            decode_ngap_pdu(&bytes).is_err(),
-            "an empty PDUSessionResourceListHORqd produces an undecodable message, so a \
-             sender must refuse it rather than putting it on the wire"
+            encode_ngap_pdu(&build_handover_required(&params).expect("build")).is_err(),
+            "an empty PDUSessionResourceListHORqd is outside SIZE (1..256) and must not \
+             encode into an undecodable message"
         );
 
         // The positive control: one session encodes AND decodes, so the failure above is

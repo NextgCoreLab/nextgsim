@@ -235,6 +235,27 @@ pub fn decode_bool_common(data: &mut PerCodecData, _aligned: bool) -> Result<boo
     Ok(result)
 }
 
+// Common function to decode the length of a SIZE-constrained SEQUENCE OF / SET OF.
+//
+// Mirror of `encode_sequence_of_length_common` (X.691 §20.4): an extensible size
+// constraint carries one leading bit, and a count outside the root is a
+// semi-constrained length. Before #212 the derive passed the extensibility flag
+// into the length determinant's `normally_small` slot, which is a different
+// encoding altogether; no schema in this tree has an extensible SEQUENCE OF size
+// yet, so that misreading never reached a wire.
+pub fn decode_sequence_of_length_common(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    aligned: bool,
+) -> Result<usize, PerCodecError> {
+    if is_extensible && data.decode_bool()? {
+        return decode_length_determinent_common(data, None, None, false, aligned);
+    }
+    decode_length_determinent_common(data, lb, ub, false, aligned)
+}
+
 // Common function to decode an Enumerated Value
 pub fn decode_enumerated_common(
     data: &mut PerCodecData,

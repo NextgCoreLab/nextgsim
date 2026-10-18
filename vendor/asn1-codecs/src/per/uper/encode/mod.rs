@@ -173,6 +173,28 @@ pub fn encode_length_determinent(
     encode_length_determinent_common(data, lb, ub, normally_small, value, false)
 }
 
+/// Encode the length of a SIZE-constrained SEQUENCE OF (X.691 §20.4).
+///
+/// Unlike [`encode_length_determinent`], this honours an extensible size
+/// constraint and refuses a count outside a non-extensible one.
+pub fn encode_sequence_of_length(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    value: usize,
+) -> Result<(), PerCodecError> {
+    log::trace!(
+        "encode_sequence_of_length: lb: {:?}, ub: {:?}, is_extensible: {}, value: {}",
+        lb,
+        ub,
+        is_extensible,
+        value
+    );
+
+    encode_sequence_of_length_common(data, lb, ub, is_extensible, value, false)
+}
+
 /// Encode a VisibleString CharacterString Type.
 pub fn encode_visible_string(
     data: &mut PerCodecData,

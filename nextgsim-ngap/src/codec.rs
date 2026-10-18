@@ -349,6 +349,38 @@ mod tests {
     // SCTP Stream Management Tests
     // ========================================================================
 
+    /// #212: the generated SEQUENCE OF encoder enforces its SIZE bounds. Before
+    /// the fix the derive discarded the length encoder's error, so an empty or
+    /// over-long list "encoded" into a PDU with no length field at all. Driven
+    /// through generated types, because the defect lived in the derive.
+    #[test]
+    fn test_sequence_of_size_bounds_are_enforced_on_encode() {
+        let plmn = || PLMNIdentity(vec![0x00, 0xF1, 0x10]);
+
+        // PLMNListforQMC ::= SEQUENCE (SIZE (1..16)) OF PLMNIdentity
+        assert!(
+            encode_aper(&PLMNListforQMC(vec![])).is_err(),
+            "an empty SIZE (1..16) list must not encode"
+        );
+        assert!(
+            encode_aper(&PLMNListforQMC((0..17).map(|_| plmn()).collect())).is_err(),
+            "a 17-element SIZE (1..16) list must not encode"
+        );
+        for n in [1usize, 16] {
+            let list = PLMNListforQMC((0..n).map(|_| plmn()).collect());
+            let bytes = encode_aper(&list).expect("an exact bound encodes");
+            let back: PLMNListforQMC = decode_aper(&bytes).expect("and decodes");
+            assert_eq!(back, list, "n={n}");
+        }
+
+        // ServedGUAMIList ::= SEQUENCE (SIZE (1..256)) OF ServedGUAMIItem -- the
+        // case nextgcore #443 had to guard by hand in amfd.
+        assert!(
+            encode_aper(&ServedGUAMIList(vec![])).is_err(),
+            "an empty ServedGUAMIList must not encode"
+        );
+    }
+
     #[test]
     fn test_stream_id_non_ue_associated() {
         let stream = StreamId::NON_UE_ASSOCIATED;
