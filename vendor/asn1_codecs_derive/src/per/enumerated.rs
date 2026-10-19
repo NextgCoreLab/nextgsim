@@ -61,15 +61,46 @@ pub(super) fn generate_per_codec_for_asn_enumerated(
             fn #codec_decode_fn(data: &mut asn1_codecs::PerCodecData) -> Result<Self::Output, asn1_codecs::PerCodecError> {
                 log::trace!(concat!("decode: ", stringify!(#name)));
 
-                let decoded = #ty_decode_path(data, #lb, #ub, #ext)?;
+                let (decoded, extended) = #ty_decode_path(data, #lb, #ub, #ext)?;
 
-                Ok(Self(decoded.0 as #ty))
+                // An extension addition arrives as its index WITHIN the additions
+                // (X.691 §14.3). The generated constants number additions on from
+                // the root (root `ub + 1` is the first addition), so map it back --
+                // before #213 index 0 was returned as-is and an extension value
+                // decoded as root value 0.
+                let value: i128 = if extended {
+                    let root_ub: Option<i128> = #ub;
+                    root_ub.unwrap_or(-1) + 1 + decoded
+                } else {
+                    decoded
+                };
+
+                let value = <#ty as ::core::convert::TryFrom<i128>>::try_from(value).map_err(|_| {
+                    asn1_codecs::PerCodecError::new(
+                        asn1_codecs::PerCodecErrorCause::Generic,
+                        format!(
+                            concat!("ENUMERATED ", stringify!(#name), ": value {} does not fit the generated type"),
+                            value
+                        ),
+                    )
+                })?;
+
+                Ok(Self(value))
             }
 
             fn #codec_encode_fn(&self, data: &mut asn1_codecs::PerCodecData) -> Result<(), asn1_codecs::PerCodecError> {
                 log::trace!(concat!("encode: ", stringify!(#name)));
 
-                #ty_encode_path(data, #lb, #ub, #ext, self.0 as i128, false)
+                // A value past the root's `ub` is an extension addition (#213); its
+                // wire index is its position within the additions.
+                let value = self.0 as i128;
+                let root_ub: Option<i128> = #ub;
+                match root_ub {
+                    Some(u) if #ext && value > u => {
+                        #ty_encode_path(data, #lb, #ub, #ext, value - (u + 1), true)
+                    }
+                    _ => #ty_encode_path(data, #lb, #ub, #ext, value, false),
+                }
             }
         }
     };

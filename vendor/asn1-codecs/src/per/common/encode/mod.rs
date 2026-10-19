@@ -174,6 +174,18 @@ pub(crate) fn encode_bool_common(
 }
 
 // Common function to encode an ENUMERATED Value
+//
+// X.691 §14. For a ROOT value (`extended == false`) `value` is the root
+// enumeration index, encoded as a constrained whole number over `lb..=ub`
+// (after the extension bit, if the type is extensible).
+//
+// For an EXTENSION ADDITION (`extended == true`) `value` is the index WITHIN the
+// extension additions, numbered from 0 in declaration order -- not the
+// root-continuing number the generated constants use. §14.3: the extension bit
+// is set and that index is encoded as a normally small non-negative whole number
+// (§11.6), exactly the layout `decode_enumerated_common` already read. Until
+// #213 this branch returned `EncodeNotSupported`, so an extension value such as
+// NGAP CauseRadioNetwork n26-interface-not-available could not be sent at all.
 pub(crate) fn encode_enumerated_common(
     data: &mut PerCodecData,
     lb: Option<i128>,
@@ -184,10 +196,16 @@ pub(crate) fn encode_enumerated_common(
     aligned: bool,
 ) -> Result<(), PerCodecError> {
     if extended {
-        return Err(PerCodecError::new(
-            PerCodecErrorCause::EncodeNotSupported,
-            "Encode of extended enumerated not yet implemented",
-        ));
+        if !is_extensible {
+            return Err(PerCodecError::new(
+                PerCodecErrorCause::Generic,
+                "An extension value was selected in an ENUMERATED that has no extension marker",
+            ));
+        }
+        data.encode_bool(true);
+        encode_normally_small_non_negative_whole_number_common(data, value, aligned)?;
+        data.dump_encode();
+        return Ok(());
     }
 
     if is_extensible {
@@ -425,6 +443,66 @@ mod tests {
 
     use super::*;
     use crate::per::common::decode::decode_choice_idx_common;
+
+    use crate::per::common::decode::decode_enumerated_common;
+
+    /// #213: an ENUMERATED extension addition encodes (X.691 §14.3) and the
+    /// shipped decoder reads back the same within-additions index, flagged as
+    /// extended. 63/64 straddles the six-bit short form of the normally small
+    /// number, where an off-by-one would hide.
+    #[test]
+    fn an_extension_enumerated_value_round_trips_for_both_codecs() {
+        for idx in [0_i128, 1, 2, 62, 63, 64, 200] {
+            for aligned in [true, false] {
+                let mut data = if aligned {
+                    PerCodecData::new_aper()
+                } else {
+                    PerCodecData::new_uper()
+                };
+                encode_enumerated_common(&mut data, Some(0), Some(44), true, idx, true, aligned)
+                    .expect("an extension value must encode");
+                let bytes = data.into_bytes();
+                assert_eq!(bytes[0] & 0x80, 0x80, "the extension bit must be set");
+
+                let mut read = if aligned {
+                    PerCodecData::from_slice_aper(&bytes)
+                } else {
+                    PerCodecData::from_slice_uper(&bytes)
+                };
+                let (decoded, extended) =
+                    decode_enumerated_common(&mut read, Some(0), Some(44), true, aligned)
+                        .expect("decode");
+                assert!(
+                    extended,
+                    "idx {} aligned={} must decode as extended",
+                    idx, aligned
+                );
+                assert_eq!(decoded, idx, "idx {idx} aligned={aligned}");
+            }
+        }
+    }
+
+    /// A root value keeps its pre-#213 wire form: extension bit 0, then the
+    /// constrained index. For lb 0 / ub 44 (range 45, six bits) value 44 is
+    /// 0 + 101100, padded: 0b0101_1000.
+    #[test]
+    fn a_root_enumerated_value_keeps_its_wire_form() {
+        let mut data = PerCodecData::new_aper();
+        encode_enumerated_common(&mut data, Some(0), Some(44), true, 44, false, true)
+            .expect("encode");
+        assert_eq!(data.into_bytes(), vec![0b0101_1000]);
+    }
+
+    /// An extension value in a type without an extension marker is a caller
+    /// error: there is no extension bit to set, so it would read back as a root
+    /// value.
+    #[test]
+    fn an_extension_value_in_a_non_extensible_enumerated_is_rejected() {
+        let mut data = PerCodecData::new_aper();
+        let err = encode_enumerated_common(&mut data, Some(0), Some(3), false, 0, true, true)
+            .expect_err("no extension marker");
+        assert!(err.to_string().contains("no extension marker"), "{}", err);
+    }
 
     /// The core X.691 §23.6 guarantee, asserted against the DECODER rather than
     /// against hand-computed bytes: for every extension index the decoder must
