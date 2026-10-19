@@ -17,3 +17,6 @@ mod capture_tests;
 
 #[cfg(test)]
 mod proptest_roundtrip;
+
+#[cfg(test)]
+mod fragmentation_tests;

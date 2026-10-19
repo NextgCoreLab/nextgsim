@@ -12,6 +12,7 @@ use std::convert::TryFrom;
 use decode_internal::*;
 
 pub(crate) use decode_internal::decode_length_determinent_common;
+pub(crate) use decode_internal::decode_length_fragment_common;
 
 // Common decode functions used by the API functions of the codec. The API functions call the
 // common functions For example, `decode_choice_idx` API will call `decode_choice_idx_common` fro
@@ -84,7 +85,7 @@ pub fn decode_sequence_extensions_skip_bits(
         let mut extension_no = 0;
         while present_extensions > extension_no {
             extension_no += 1;
-            let octets = decode_length_determinent_common(data, None, None, false, aligned)?;
+            let octets = decode_open_type_length_common(data, aligned)?;
             log::trace!(
                 "Extension #: {}, Open Type Encoded in '{}' Octets",
                 extension_no,
@@ -256,6 +257,86 @@ pub fn decode_sequence_of_length_common(
     decode_length_determinent_common(data, lb, ub, false, aligned)
 }
 
+// Common function to decode a SEQUENCE OF / SET OF: its count AND its
+// components. Mirror of `encode_sequence_of_common`: when the count is
+// fragmented (X.691 §20.6, §11.9.3.8) each fragment's components follow its
+// header, and the next header follows them. `decode(data, n)` decodes the next
+// `n` components.
+pub fn decode_sequence_of_common<F>(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    aligned: bool,
+    mut decode: F,
+) -> Result<(), PerCodecError>
+where
+    F: FnMut(&mut PerCodecData, usize) -> Result<(), PerCodecError>,
+{
+    let (lb, ub) = if is_extensible && data.decode_bool()? {
+        (None, None)
+    } else {
+        (lb, ub)
+    };
+    let (mut n, mut more) = decode_length_fragment_common(data, lb, ub, aligned)?;
+    loop {
+        decode(data, n)?;
+        if !more {
+            return Ok(());
+        }
+        (n, more) = decode_length_fragment_common(data, None, None, aligned)?;
+    }
+}
+
+// Common function to decode the length of an open type (X.691 §11.2), leaving
+// its content CONTIGUOUS at the current offset.
+//
+// An open type is decoded in place: the caller decodes the inner value
+// straight from `data` and then resynchronises to the end of the frame. That
+// is only correct if nothing interrupts the content, and a fragmented length
+// (§11.9.3.8) interrupts it with a header every 16K..64K octets -- which the
+// in-place decoder then read as content, silently (a NAS-PDU just past 16K came
+// back corrupted, without an error). So when the length is fragmented, this
+// reassembles the frame in place: it walks the pieces, removes each later
+// header from the buffer, and returns the total. Content and everything after
+// it stay where the caller expects them; an unfragmented frame is untouched.
+pub fn decode_open_type_length_common(
+    data: &mut PerCodecData,
+    aligned: bool,
+) -> Result<usize, PerCodecError> {
+    let (first, mut more) = decode_internal::decode_indefinite_length_or_fragment(data, aligned)?;
+    if !more {
+        return Ok(first);
+    }
+
+    let start = data.decode_offset;
+    let mut total = first;
+    let mut cursor = start + first * 8;
+    while more {
+        if cursor > data.bits.len() {
+            return Err(PerCodecError::new(
+                PerCodecErrorCause::BufferTooShort,
+                "Open type fragment extends past the end of the buffer",
+            ));
+        }
+        data.decode_offset = cursor;
+        let (length, next) = decode_internal::decode_indefinite_length_or_fragment(data, aligned)?;
+        let header_end = data.decode_offset;
+        data.bits.drain(cursor..header_end);
+        total += length;
+        cursor += length * 8;
+        more = next;
+    }
+    if cursor > data.bits.len() {
+        return Err(PerCodecError::new(
+            PerCodecErrorCause::BufferTooShort,
+            "Open type fragment extends past the end of the buffer",
+        ));
+    }
+    data.decode_offset = start;
+    Ok(total)
+}
+
 // Common function to decode an Enumerated Value
 pub fn decode_enumerated_common(
     data: &mut PerCodecData,
@@ -303,13 +384,10 @@ pub fn decode_bitstring_common(
         false
     };
 
+    let (mut lb, mut ub) = if is_extended { (None, None) } else { (lb, ub) };
     let mut bv = BitVec::new();
     loop {
-        let length = if is_extended {
-            decode_length_determinent_common(data, None, None, false, aligned)?
-        } else {
-            decode_length_determinent_common(data, lb, ub, false, aligned)?
-        };
+        let (length, more) = decode_length_fragment_common(data, lb, ub, aligned)?;
 
         if length > 0 {
             if length > 16 && aligned {
@@ -318,12 +396,12 @@ pub fn decode_bitstring_common(
             bv.extend(data.get_bitvec(length)?);
         }
 
-        // Fragmented So get the chunks in multiples of 16384,
-        if length >= 16384 {
-            continue;
-        } else {
+        // Only a fragment header (X.691 §11.9.3.8) announces another piece; the
+        // pieces after the first are unconstrained determinants.
+        if !more {
             break;
         }
+        (lb, ub) = (None, None);
     }
 
     data.dump();
@@ -352,13 +430,10 @@ pub fn decode_octetstring_common(
         false
     };
 
+    let (mut lb, mut ub) = if is_extended { (None, None) } else { (lb, ub) };
     let mut octets = Vec::new();
     loop {
-        let length = if is_extended {
-            decode_length_determinent_common(data, None, None, false, aligned)?
-        } else {
-            decode_length_determinent_common(data, lb, ub, false, aligned)?
-        };
+        let (length, more) = decode_length_fragment_common(data, lb, ub, aligned)?;
 
         if length > 0 {
             if length > 2 && aligned {
@@ -367,12 +442,13 @@ pub fn decode_octetstring_common(
             octets.extend(data.get_bytes(length)?);
         }
 
-        // Fragmented So get the chunks in multiples of 16384,
-        if length >= 16384 {
-            continue;
-        } else {
+        // Only a fragment header (X.691 §11.9.3.8) announces another piece. A
+        // constrained length (`ub` below 64K) of 16K or more is complete, and
+        // used to be misread as a fragment.
+        if !more {
             break;
         }
+        (lb, ub) = (None, None);
     }
 
     data.dump();
@@ -394,17 +470,21 @@ pub(crate) fn decode_string_common(
         false
     };
 
-    let length = if is_extended {
-        decode_length_determinent_common(data, None, None, false, aligned)?
-    } else {
-        decode_length_determinent_common(data, lb, ub, false, aligned)?
-    };
-
-    let length = length * bits_per_char;
-    if length > 16 && aligned {
-        data.decode_align()?;
+    // X.691 §30.5.7: the length counts characters and fragments at 16K of them.
+    let (mut lb, mut ub) = if is_extended { (None, None) } else { (lb, ub) };
+    let mut bits: BitVec<u8, Msb0> = BitVec::new();
+    loop {
+        let (length, more) = decode_length_fragment_common(data, lb, ub, aligned)?;
+        let length = length * bits_per_char;
+        if length > 16 && aligned {
+            data.decode_align()?;
+        }
+        bits.extend(data.get_bitvec(length)?);
+        if !more {
+            break;
+        }
+        (lb, ub) = (None, None);
     }
-    let bits = data.get_bitvec(length)?;
     let bytes = bits
         .chunks_exact(bits_per_char)
         .map(|c| {

@@ -20,3 +20,6 @@ const NOT_A_NUMBER: u8 = 0b0100_0010;
 const BASE_10_NR1: u8 = 0b0000_0001;
 const BASE_10_NR2: u8 = 0b0000_0010;
 const BASE_10_NR3: u8 = 0b0000_0011;
+
+#[cfg(test)]
+mod fragment_tests;

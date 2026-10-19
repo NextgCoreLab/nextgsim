@@ -195,6 +195,46 @@ pub fn encode_sequence_of_length(
     encode_sequence_of_length_common(data, lb, ub, is_extensible, value, false)
 }
 
+/// Encode a SEQUENCE OF / SET OF: its count and, through `emit`, its
+/// components (X.691 §20.6).
+///
+/// `emit(data, start, count)` must encode components `start..start + count`.
+/// It is called once per piece, so a count of 16K or more in an unconstrained
+/// size is fragmented (§11.9.3.8) with the headers interleaved. Prefer this to
+/// [`encode_sequence_of_length`], which can only write a single length.
+pub fn encode_sequence_of<F>(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    count: usize,
+    emit: F,
+) -> Result<(), PerCodecError>
+where
+    F: FnMut(&mut PerCodecData, usize, usize) -> Result<(), PerCodecError>,
+{
+    log::trace!(
+        "encode_sequence_of: lb: {:?}, ub: {:?}, is_extensible: {}, count: {}",
+        lb,
+        ub,
+        is_extensible,
+        count
+    );
+
+    encode_sequence_of_common(data, lb, ub, is_extensible, count, false, emit)
+}
+
+/// Encode an open type (X.691 §11.2): `inner`'s complete encoding, padded to
+/// whole octets and framed by a length in octets that fragments at 16K
+/// (§11.9.3.8). Prefer this to [`encode_length_determinent`] plus an append,
+/// which cannot frame 16K octets or more.
+pub fn encode_open_type(
+    data: &mut PerCodecData,
+    inner: &mut PerCodecData,
+) -> Result<(), PerCodecError> {
+    encode_open_type_common(data, inner, false, false)
+}
+
 /// Encode a VisibleString CharacterString Type.
 pub fn encode_visible_string(
     data: &mut PerCodecData,
@@ -315,22 +355,28 @@ fn encode_ascii_ish_string_common(
         data.encode_bool(extended);
     }
 
-    encode_length_determinent_common(data, lb, ub, false, value.len(), false)?;
-
     // FIXME: bits_per_char is hardcoded it shold be obtained from the 'alphabet' of the string.
     let bits_per_char = 7;
     let offset = 8 - bits_per_char;
-    let chars_vec = value
-        .chars()
-        .map(|c| BitSlice::<_, Msb0>::from_element(&(c as u8))[offset..].to_bitvec())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect::<BitVec<u8, Msb0>>();
-
-    data.append_bits(chars_vec.as_bitslice());
-
-    Ok(())
+    let chars = value.as_bytes();
+    let length = chars.len();
+    // X.691 §30.5.7: a known-multiplier string's length counts characters, and
+    // fragments at 16K characters like any other unconstrained length.
+    let emit = |data: &mut PerCodecData, start: usize, count: usize| {
+        let chars_vec = chars[start..start + count]
+            .iter()
+            .flat_map(|c| BitSlice::<_, Msb0>::from_element(c)[offset..].to_bitvec())
+            .collect::<BitVec<u8, Msb0>>();
+        data.append_bits(chars_vec.as_bitslice());
+        Ok(())
+    };
+    if crate::per::common::encode::length_fragments(ub) {
+        crate::per::common::encode::check_length_bounds(lb, ub, length)?;
+        crate::per::common::encode::encode_fragmented_common(data, length, false, emit)
+    } else {
+        encode_length_determinent_common(data, lb, ub, false, length, false)?;
+        emit(data, 0, length)
+    }
 }
 
 #[cfg(test)]

@@ -163,6 +163,34 @@ pub fn decode_length_determinent(
     decode_length_determinent_common(data, lb, ub, normally_small, true)
 }
 
+/// Decode a SEQUENCE OF / SET OF: its count and, through `decode`, its
+/// components (X.691 §20.6). `decode(data, n)` must decode the next `n`
+/// components; it is called once per fragment (§11.9.3.8).
+pub fn decode_sequence_of<F>(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    decode: F,
+) -> Result<(), PerCodecError>
+where
+    F: FnMut(&mut PerCodecData, usize) -> Result<(), PerCodecError>,
+{
+    log::trace!(
+        "decode_sequence_of: lb: {:?}, ub: {:?}, is_extensible: {}",
+        lb,
+        ub,
+        is_extensible
+    );
+    crate::per::common::decode::decode_sequence_of_common(data, lb, ub, is_extensible, true, decode)
+}
+
+/// Decode the length of an open type (X.691 §11.2), reassembling a fragmented
+/// frame (§11.9.3.8) so its content is contiguous at the current offset.
+pub fn decode_open_type_length(data: &mut PerCodecData) -> Result<usize, PerCodecError> {
+    crate::per::common::decode::decode_open_type_length_common(data, true)
+}
+
 /// Decodes the length of a SIZE-constrained SEQUENCE OF (X.691 §20.4).
 pub fn decode_sequence_of_length(
     data: &mut PerCodecData,
