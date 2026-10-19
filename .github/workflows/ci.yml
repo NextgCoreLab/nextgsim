@@ -212,6 +212,28 @@ jobs:
           cargo clippy -p nextgsim-gnb --features drb-pdcp --all-targets
           cargo clippy -p nextgsim-ue --features drb-pdcp --all-targets
 
+  lte-enb-kernel-sctp:
+    name: LTE eNB kernel SCTP (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # S1-MME is real SCTP (TS 36.412 §7), so the eNB's production transport is
+      # the kernel backend, which needs libsctp at link time and is therefore off
+      # in the default jobs above. This job compiles and lints that arm so it
+      # cannot rot unseen (#186). The cross-repo interop test against nextgcore's
+      # mmed stays `#[ignore]`: it needs an mmed binary, see its module docs.
+      - name: install libsctp
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+      - name: cargo test
+        run: cargo test -p nextgsim-enb --features kernel-sctp
+      - name: cargo clippy
+        run: cargo clippy -p nextgsim-enb --features kernel-sctp --all-targets
+
   up-security:
     name: UP security (feature-gated)
     runs-on: ubuntu-latest

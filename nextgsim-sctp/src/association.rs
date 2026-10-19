@@ -24,6 +24,11 @@ pub use nextgcore_sctp::{
     ReceivedMessage, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_NUM_STREAMS, DEFAULT_RECEIVE_BUFFER_SIZE,
     NGAP_PPID,
 };
+// S1-MME's PPID and destination port (TS 36.412 §7, IANA), likewise defined once
+// in nextgcore-sctp and only renamed here to this crate's spelling.
+pub use nextgcore_sctp::{
+    NEXTGCORE_S1AP_SCTP_PORT as S1AP_SCTP_PORT, NEXTGCORE_SCTP_S1AP_PPID as S1AP_PPID,
+};
 
 /// SCTP association errors
 #[derive(Debug, Error)]

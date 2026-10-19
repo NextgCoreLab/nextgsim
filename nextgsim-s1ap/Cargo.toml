@@ -1,0 +1,21 @@
+[package]
+name = "nextgsim-s1ap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "S1AP protocol library for nextgsim (TS 36.413)"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+asn1-codecs.workspace = true
+asn1_codecs_derive.workspace = true
+bitvec.workspace = true
+log.workspace = true
+
+[build-dependencies]
+asn1-compiler.workspace = true
