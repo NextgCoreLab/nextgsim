@@ -43,6 +43,11 @@ pub trait S1Transport: Send {
     ) -> impl Future<Output = std::io::Result<()>> + Send;
     /// Receive the next user message; `None` when the association is gone.
     fn recv(&mut self) -> impl Future<Output = std::io::Result<Option<S1Message>>> + Send;
+    /// Outbound streams available on the association (TS 36.412 §7 reserves
+    /// stream 0 for non UE-associated signalling; the rest carry UEs).
+    fn outbound_streams(&self) -> u16 {
+        nextgsim_sctp::DEFAULT_NUM_STREAMS
+    }
 }
 
 /// Opens associations towards an MME.
@@ -220,29 +225,6 @@ pub async fn establish_s1<C: S1Connector>(
     }
 }
 
-/// After S1 Setup, keep the association serviced until it closes. Later
-/// increments dispatch UE-associated procedures here; for now inbound PDUs
-/// are logged.
-pub async fn serve<T: S1Transport>(transport: &mut T) {
-    loop {
-        match transport.recv().await {
-            Ok(Some(m)) => log::info!(
-                "S1AP PDU on stream {} ({} octets) not handled in this build",
-                m.stream,
-                m.data.len()
-            ),
-            Ok(None) => {
-                log::warn!("S1-MME association closed");
-                return;
-            }
-            Err(e) => {
-                log::warn!("S1-MME receive failed: {e}");
-                return;
-            }
-        }
-    }
-}
-
 /// Kernel SCTP (IP protocol 132), the only S1-MME transport a real MME
 /// accepts (TS 36.412 §7).
 #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
@@ -255,10 +237,17 @@ pub mod kernel {
         std::io::Error::other(e.to_string())
     }
 
-    /// A kernel SCTP S1-MME association.
-    pub struct KernelS1Transport(pub KernelSctpAssociation);
+    /// A kernel SCTP S1-MME association, and the outbound stream count it
+    /// requested. The kernel may negotiate fewer (the peer's inbound limit);
+    /// nextgsim-sctp does not expose the negotiated count, so the default
+    /// configuration requests exactly the two streams TS 36.412 §7 needs at
+    /// minimum, which any MME accepts.
+    pub struct KernelS1Transport(pub KernelSctpAssociation, pub u16);
 
     impl S1Transport for KernelS1Transport {
+        fn outbound_streams(&self) -> u16 {
+            self.1
+        }
         async fn send(&mut self, stream: u16, data: &[u8], ppid: u32) -> std::io::Result<()> {
             self.0.send_with_ppid(stream, data, ppid).await.map_err(io)
         }
@@ -285,9 +274,10 @@ pub mod kernel {
             local: SocketAddr,
             remote: SocketAddr,
         ) -> std::io::Result<KernelS1Transport> {
+            let streams = self.config.max_outbound_streams;
             KernelSctpAssociation::connect(local, remote, &self.config)
                 .await
-                .map(KernelS1Transport)
+                .map(|a| KernelS1Transport(a, streams))
                 .map_err(io)
         }
     }
