@@ -244,12 +244,13 @@ pub(crate) fn encode_bitstring_common(
     }
 
     let length = bit_string.len();
-    // X.691 §16.11: content longer than 16 bits is octet-aligned in APER. Per
-    // piece, so a fragmented string aligns each fragment (already aligned by its
-    // header) exactly as an unfragmented one aligns its whole content.
+    // X.691 §16.9-16.11: only a fixed size of at most 16 bits is unaligned; any
+    // other content is octet-aligned in APER. Per piece, so a fragmented string
+    // aligns each fragment (already aligned by its header) exactly as an
+    // unfragmented one aligns its whole content.
     let emit = |data: &mut PerCodecData, start: usize, count: usize| {
         if count > 0 {
-            if count > 16 && aligned {
+            if aligned && super::string_content_aligned(lb, ub, count, 16) {
                 data.align();
             }
             data.append_bits(&bit_string[start..start + count]);
@@ -264,7 +265,6 @@ pub(crate) fn encode_bitstring_common(
         emit(data, 0, length)?;
     }
 
-    // TODO: Not sure if 15.11 is handled correctly?
     data.dump_encode();
 
     Ok(())
@@ -292,10 +292,11 @@ pub(crate) fn encode_octet_string_common(
     }
 
     let length = octet_string.len();
-    // X.691 §17.8: content longer than two octets is octet-aligned in APER.
+    // X.691 §17.6-17.8: only a fixed size of at most two octets is unaligned;
+    // any other content is octet-aligned in APER.
     let emit = |data: &mut PerCodecData, start: usize, count: usize| {
         if count > 0 {
-            if count > 2 && aligned {
+            if aligned && super::string_content_aligned(lb, ub, count, 2) {
                 data.align();
             }
             data.append_bits(octet_string[start..start + count].view_bits());

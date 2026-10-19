@@ -390,7 +390,7 @@ pub fn decode_bitstring_common(
         let (length, more) = decode_length_fragment_common(data, lb, ub, aligned)?;
 
         if length > 0 {
-            if length > 16 && aligned {
+            if aligned && super::string_content_aligned(lb, ub, length, 16) {
                 data.decode_align()?;
             }
             bv.extend(data.get_bitvec(length)?);
@@ -436,7 +436,7 @@ pub fn decode_octetstring_common(
         let (length, more) = decode_length_fragment_common(data, lb, ub, aligned)?;
 
         if length > 0 {
-            if length > 2 && aligned {
+            if aligned && super::string_content_aligned(lb, ub, length, 2) {
                 data.decode_align()?;
             }
             octets.extend(data.get_bytes(length)?);
