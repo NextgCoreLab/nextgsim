@@ -197,6 +197,46 @@ pub fn encode_sequence_of_length(
     encode_sequence_of_length_common(data, lb, ub, is_extensible, value, true)
 }
 
+/// Encode a SEQUENCE OF / SET OF: its count and, through `emit`, its
+/// components (X.691 §20.6).
+///
+/// `emit(data, start, count)` must encode components `start..start + count`.
+/// It is called once per piece, so a count of 16K or more in an unconstrained
+/// size is fragmented (§11.9.3.8) with the headers interleaved. Prefer this to
+/// [`encode_sequence_of_length`], which can only write a single length.
+pub fn encode_sequence_of<F>(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    count: usize,
+    emit: F,
+) -> Result<(), PerCodecError>
+where
+    F: FnMut(&mut PerCodecData, usize, usize) -> Result<(), PerCodecError>,
+{
+    log::trace!(
+        "encode_sequence_of: lb: {:?}, ub: {:?}, is_extensible: {}, count: {}",
+        lb,
+        ub,
+        is_extensible,
+        count
+    );
+
+    encode_sequence_of_common(data, lb, ub, is_extensible, count, true, emit)
+}
+
+/// Encode an open type (X.691 §11.2): `inner`'s complete encoding, padded to
+/// whole octets and framed by a length in octets that fragments at 16K
+/// (§11.9.3.8). Prefer this to [`encode_length_determinent`] plus an append,
+/// which cannot frame 16K octets or more.
+pub fn encode_open_type(
+    data: &mut PerCodecData,
+    inner: &mut PerCodecData,
+) -> Result<(), PerCodecError> {
+    encode_open_type_common(data, inner, true, true)
+}
+
 /// Encode a VisibleString CharacterString Type.
 pub fn encode_visible_string(
     data: &mut PerCodecData,

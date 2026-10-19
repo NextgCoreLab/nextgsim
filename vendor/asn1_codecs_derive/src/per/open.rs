@@ -24,8 +24,8 @@ pub(super) fn generate_per_codec_for_asn_open_type(
             quote!(asn1_codecs::PerCodecData::new_aper),
             quote!(aper_encode),
             quote!(aper_decode),
-            quote!(asn1_codecs::aper::encode::encode_length_determinent),
-            quote!(asn1_codecs::aper::decode::decode_length_determinent),
+            quote!(asn1_codecs::aper::encode::encode_open_type),
+            quote!(asn1_codecs::aper::decode::decode_open_type_length),
         )
     } else {
         (
@@ -33,8 +33,8 @@ pub(super) fn generate_per_codec_for_asn_open_type(
             quote!(asn1_codecs::PerCodecData::new_uper),
             quote!(uper_encode),
             quote!(uper_decode),
-            quote!(asn1_codecs::uper::encode::encode_length_determinent),
-            quote!(asn1_codecs::uper::decode::decode_length_determinent),
+            quote!(asn1_codecs::uper::encode::encode_open_type),
+            quote!(asn1_codecs::uper::decode::decode_open_type_length),
         )
     };
     let variant_tokens = generate_open_type_variant_tokens_using_attrs(
@@ -53,10 +53,10 @@ pub(super) fn generate_per_codec_for_asn_open_type(
                 let _ = match self {
                     #(#variant_encode_tokens)*
                 };
-                let length = inner.length_in_bytes();
-                let _ = #ty_encode_path(data, None, None, false, length)?;
-                data.append_aligned(&mut inner);
-                Ok(())
+                // The length fragments at 16K octets (X.691 §11.9.3.8); a
+                // single determinant cannot frame more, so this is one call.
+                #ty_encode_path(data, &mut inner)
+
         }
     } else {
         quote! {
@@ -71,7 +71,9 @@ pub(super) fn generate_per_codec_for_asn_open_type(
             fn #codec_decode_fn(data: &mut asn1_codecs::PerCodecData) -> Result<Self::Output, asn1_codecs::PerCodecError> {
                 log::trace!(concat!("decode: ", stringify!(#name)));
 
-                let length = #ty_decode_path(data, None, None, false)?;
+                // Reassembles a fragmented frame (X.691 §11.9.3.8) so the value
+                // below can be decoded in place.
+                let length = #ty_decode_path(data)?;
 
                 log::trace!("open type: decoded length: {}", length);
 

@@ -29,8 +29,8 @@ pub(super) fn generate_per_codec_for_asn_choice(
             quote!(asn1_codecs::aper::encode::encode_choice_idx),
             quote!(asn1_codecs::aper::decode::decode_choice_idx),
             quote!(asn1_codecs::PerCodecData::new_aper),
-            quote!(asn1_codecs::aper::encode::encode_length_determinent),
-            quote!(asn1_codecs::aper::decode::decode_length_determinent),
+            quote!(asn1_codecs::aper::encode::encode_open_type),
+            quote!(asn1_codecs::aper::decode::decode_open_type_length),
         )
     } else {
         (
@@ -40,16 +40,9 @@ pub(super) fn generate_per_codec_for_asn_choice(
             quote!(asn1_codecs::uper::encode::encode_choice_idx),
             quote!(asn1_codecs::uper::decode::decode_choice_idx),
             quote!(asn1_codecs::PerCodecData::new_uper),
-            quote!(asn1_codecs::uper::encode::encode_length_determinent),
-            quote!(asn1_codecs::uper::decode::decode_length_determinent),
+            quote!(asn1_codecs::uper::encode::encode_open_type),
+            quote!(asn1_codecs::uper::decode::decode_open_type_length),
         )
-    };
-    // Aligned PER aligns before the open-type octets; unaligned PER must not (see
-    // `append_open_type_unaligned`).
-    let open_type_append_fn = if aligned {
-        quote!(asn1_codecs::PerCodecData::append_aligned)
-    } else {
-        quote!(asn1_codecs::PerCodecData::append_open_type_unaligned)
     };
     let open_type_offset_fn = quote!(asn1_codecs::PerCodecData::decode_offset_bits);
     let open_type_resync_fn = quote!(asn1_codecs::PerCodecData::advance_to_open_type_end);
@@ -67,7 +60,6 @@ pub(super) fn generate_per_codec_for_asn_choice(
         ty_encode_path,
         codec_new_perdata_path,
         open_type_length_encode_path,
-        open_type_append_fn,
     );
     if variant_tokens.is_err() {
         return variant_tokens.err().unwrap().to_compile_error().into();
@@ -108,7 +100,7 @@ pub(super) fn generate_per_codec_for_asn_choice(
                     // frames, then resynchronise -- the inner value may not fill
                     // the final octet, and the bits after it are padding that
                     // belongs to the frame rather than to the next field.
-                    let length = #open_type_length_decode_path(data, None, None, false)?;
+                    let length = #open_type_length_decode_path(data)?;
                     let start = #open_type_offset_fn(data);
                     let decoded = match idx {
                         #(#ext_decode_tokens)*
@@ -152,7 +144,6 @@ fn generate_choice_variant_decode_tokens_using_attrs(
     choice_encode_path: proc_macro2::TokenStream,
     codec_new_perdata_path: proc_macro2::TokenStream,
     open_type_length_encode_path: proc_macro2::TokenStream,
-    open_type_append_fn: proc_macro2::TokenStream,
 ) -> Result<
     (
         Vec<proc_macro2::TokenStream>,
@@ -203,10 +194,9 @@ fn generate_choice_variant_decode_tokens_using_attrs(
                                         #choice_encode_path(data, #lb, #ub, #ext, #key, #extended)?;
                                         let mut inner = #codec_new_perdata_path();
                                         v.#codec_encode_fn(&mut inner)?;
-                                        let length = inner.length_in_bytes();
-                                        #open_type_length_encode_path(data, None, None, false, length)?;
-                                        #open_type_append_fn(data, &mut inner);
-                                        Ok(())
+                                        // Frames, aligns (APER only) and, at 16K
+                                        // octets, fragments (X.691 §11.9.3.8).
+                                        #open_type_length_encode_path(data, &mut inner)
                                     }
                                 }
                             } else {

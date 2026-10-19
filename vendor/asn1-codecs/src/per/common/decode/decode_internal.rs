@@ -104,6 +104,63 @@ fn decode_constrained_length_determinent_common(
     }
 }
 
+/// Whether a length with this upper bound is the unconstrained form, which
+/// fragments at 16K (X.691 §11.9.3.8); a `ub` below 64K never does.
+pub(crate) fn length_fragments(ub: Option<i128>) -> bool {
+    ub.is_none_or(|u| u >= 65_536)
+}
+
+/// Decode one length determinant and say whether it is a §11.9.3.8 FRAGMENT
+/// header, i.e. whether another determinant follows this piece's content.
+///
+/// The second element is what the callers' loops must test. Testing the
+/// length instead (`length >= 16384`) is wrong twice over: a constrained length
+/// (`ub` below 64K) of 16K or more is a complete length, not a fragment, and
+/// was read as one; and every caller that framed its content with a single
+/// length (open types, extension additions) never looked for a second
+/// determinant at all.
+pub(crate) fn decode_length_fragment_common(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    aligned: bool,
+) -> Result<(usize, bool), PerCodecError> {
+    if length_fragments(ub) {
+        decode_indefinite_length_or_fragment(data, aligned)
+    } else {
+        Ok((
+            decode_length_determinent_common(data, lb, ub, false, aligned)?,
+            false,
+        ))
+    }
+}
+
+/// The unconstrained determinant (§11.9.3.6-8), reporting a fragment header.
+pub(crate) fn decode_indefinite_length_or_fragment(
+    data: &mut PerCodecData,
+    aligned: bool,
+) -> Result<(usize, bool), PerCodecError> {
+    if aligned {
+        data.decode_align()?;
+    }
+    let first = data.decode_bool()?;
+    if !first {
+        return Ok((data.decode_bits_as_integer(7, false)? as usize, false));
+    }
+    let second = data.decode_bool()?;
+    if !second {
+        return Ok((data.decode_bits_as_integer(14, false)? as usize, false));
+    }
+    let m = data.decode_bits_as_integer(6, false)?;
+    if !(1..=4).contains(&m) {
+        return Err(PerCodecError::new(
+            PerCodecErrorCause::Generic,
+            format!("A length fragment multiplier must be 1 to 4, found {m} (X.691 §11.9.3.8.1)"),
+        ));
+    }
+    Ok((m as usize * 16384, true))
+}
+
 // Called when `ub` is not determined or `ub ` - `lb` is greater than 64K and in this case value of
 // `lb` is don't care.
 fn decode_indefinite_length_determinent_common(

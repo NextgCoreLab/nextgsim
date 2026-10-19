@@ -153,6 +153,59 @@ pub(super) fn encode_constrained_whole_number_common(
     Ok(())
 }
 
+/// The fragment unit of X.691 §11.9.3.8: 16K octets, bits, characters or
+/// components, depending on what the length counts.
+pub(crate) const FRAGMENT_UNIT: usize = 16384;
+
+/// Whether a length determinant with this upper bound is the unconstrained
+/// form (§11.9.4.2 / §11.9.3.6-8), and so the one that fragments at 16K.
+///
+/// A length whose `ub` is below 64K is a constrained whole number (§11.9.3.3 /
+/// §11.9.4.1) and never fragments, even when the length itself is 16K or more.
+pub(crate) fn length_fragments(ub: Option<i128>) -> bool {
+    ub.is_none_or(|u| u >= 65_536)
+}
+
+/// Encode `total` units of an unconstrained length together with their content,
+/// fragmenting as X.691 §11.9.3.8 requires.
+///
+/// Below 16K this writes exactly the single determinant
+/// [`encode_indefinite_length_determinent_common`] always wrote, then the
+/// content, so no shorter encoding changes. At 16K and above it writes, largest
+/// first, fragments of 64K, 48K, 32K or 16K units -- each headed by one octet
+/// `0b11` followed by the six-bit multiplier m (1..=4) -- then the remainder
+/// `total mod 16K` with an ordinary determinant, which is a single zero octet
+/// when the remainder is zero (§11.9.3.8.4).
+///
+/// `emit(data, start, count)` writes units `start..start + count` of the
+/// content; it is called once per piece, immediately after that piece's
+/// determinant, which is what interleaves the headers with the content.
+pub(crate) fn encode_fragmented_common<F>(
+    data: &mut PerCodecData,
+    total: usize,
+    aligned: bool,
+    mut emit: F,
+) -> Result<(), PerCodecError>
+where
+    F: FnMut(&mut PerCodecData, usize, usize) -> Result<(), PerCodecError>,
+{
+    let mut start = 0;
+    let mut remaining = total;
+    while remaining >= FRAGMENT_UNIT {
+        let m = (remaining / FRAGMENT_UNIT).min(4);
+        if aligned {
+            data.align();
+        }
+        let header = 0xC0_u8 | m as u8;
+        data.append_bits(header.view_bits::<Msb0>());
+        emit(data, start, m * FRAGMENT_UNIT)?;
+        start += m * FRAGMENT_UNIT;
+        remaining -= m * FRAGMENT_UNIT;
+    }
+    encode_indefinite_length_determinent_common(data, remaining, aligned)?;
+    emit(data, start, remaining)
+}
+
 // Section 10.9 Note 2. Actual procedure in 10.9.3.6 -> 10.9.3.8
 pub(super) fn encode_indefinite_length_determinent_common(
     data: &mut PerCodecData,
@@ -169,9 +222,15 @@ pub(super) fn encode_indefinite_length_determinent_common(
         let bytes = (value as u16 | 0x8000).to_be_bytes();
         data.append_bits(bytes.view_bits::<Msb0>());
     } else {
+        // A single determinant cannot express 16K or more: the caller must
+        // fragment (`encode_fragmented_common`). Reaching here means a caller
+        // that frames its own content tried to write one length for all of it.
         return Err(PerCodecError::new(
             PerCodecErrorCause::EncodeNotSupported,
-            "Length determinent >= 16384 not implemented",
+            format!(
+                "A single length determinant cannot carry {value}: lengths of 16K and over \
+                 must be fragmented (X.691 §11.9.3.8)"
+            ),
         ));
     }
     Ok(())

@@ -9,6 +9,8 @@ mod encode_internal;
 #[allow(unused)]
 use encode_internal::*;
 
+pub(crate) use encode_internal::{encode_fragmented_common, length_fragments};
+
 // Functions defined in this module are called by the respective API functions in the codecs. For
 // example, `crate::aper::encode::encode_choice_index` would call `encode_choice_index_common`
 // with `aligned` as `true`.
@@ -242,19 +244,24 @@ pub(crate) fn encode_bitstring_common(
     }
 
     let length = bit_string.len();
-    if length >= 16384 {
-        return Err(PerCodecError::new(
-            PerCodecErrorCause::EncodeNotSupported,
-            "Encode of fragmented bitstring not yet implemented",
-        ));
-    }
-
-    encode_length_determinent_common(data, lb, ub, false, length, aligned)?;
-    if length > 0 {
-        if length > 16 && aligned {
-            data.align();
+    // X.691 §16.11: content longer than 16 bits is octet-aligned in APER. Per
+    // piece, so a fragmented string aligns each fragment (already aligned by its
+    // header) exactly as an unfragmented one aligns its whole content.
+    let emit = |data: &mut PerCodecData, start: usize, count: usize| {
+        if count > 0 {
+            if count > 16 && aligned {
+                data.align();
+            }
+            data.append_bits(&bit_string[start..start + count]);
         }
-        data.append_bits(bit_string);
+        Ok(())
+    };
+    if length_fragments(ub) {
+        check_length_bounds(lb, ub, length)?;
+        encode_fragmented_common(data, length, aligned, emit)?;
+    } else {
+        encode_length_determinent_common(data, lb, ub, false, length, aligned)?;
+        emit(data, 0, length)?;
     }
 
     // TODO: Not sure if 15.11 is handled correctly?
@@ -285,20 +292,24 @@ pub(crate) fn encode_octet_string_common(
     }
 
     let length = octet_string.len();
-    if length >= 16384 {
-        return Err(PerCodecError::new(
-            PerCodecErrorCause::EncodeNotSupported,
-            "Encode of fragmented octetstring not yet implemented",
-        ));
-    }
-
-    encode_length_determinent_common(data, lb, ub, false, length, aligned)?;
-
-    if length > 0 {
-        if length > 2 && aligned {
-            data.align();
+    // X.691 §17.8: content longer than two octets is octet-aligned in APER.
+    let emit = |data: &mut PerCodecData, start: usize, count: usize| {
+        if count > 0 {
+            if count > 2 && aligned {
+                data.align();
+            }
+            data.append_bits(octet_string[start..start + count].view_bits());
         }
-        data.append_bits(octet_string.view_bits());
+        Ok(())
+    };
+    if length_fragments(ub) {
+        check_length_bounds(lb, ub, length)?;
+        encode_fragmented_common(data, length, aligned, emit)?;
+    } else {
+        // A `ub` below 64K is a constrained length (§11.9.3.3): it never
+        // fragments, so 16K..ub octets are legal here and were wrongly refused.
+        encode_length_determinent_common(data, lb, ub, false, length, aligned)?;
+        emit(data, 0, length)?;
     }
 
     data.dump_encode();
@@ -428,12 +439,135 @@ pub(crate) fn encode_string_common(
     if is_extensible {
         data.encode_bool(extended);
     }
-    encode_length_determinent_common(data, lb, ub, false, value.len(), aligned)?;
-    if value.len() > 2 && aligned {
-        data.align();
+    // Eight bits per character (the APER encoding of these types here), so a
+    // character is an octet and the §30.5.7 fragment unit of 16K characters is
+    // 16K octets.
+    let bytes = value.as_bytes();
+    let length = bytes.len();
+    let emit = |data: &mut PerCodecData, start: usize, count: usize| {
+        if count > 2 && aligned {
+            data.align();
+        }
+        data.append_bits(bytes[start..start + count].view_bits());
+        Ok(())
+    };
+    if length_fragments(ub) {
+        check_length_bounds(lb, ub, length)?;
+        encode_fragmented_common(data, length, aligned, emit)?;
+    } else {
+        encode_length_determinent_common(data, lb, ub, false, length, aligned)?;
+        emit(data, 0, length)?;
     }
-    data.append_bits(value.as_bits());
 
+    data.dump_encode();
+    Ok(())
+}
+
+// Refuse a length outside `lb..=ub` before writing anything (§11.9.4.2 only
+// carries the length; the bound is the type's).
+pub(crate) fn check_length_bounds(
+    lb: Option<i128>,
+    ub: Option<i128>,
+    value: usize,
+) -> Result<(), PerCodecError> {
+    if let Some(u) = ub {
+        if value as i128 > u {
+            return Err(PerCodecError::new(
+                PerCodecErrorCause::Generic,
+                format!(
+                    "Cannot encode length determinent {} - greater than upper bound {}",
+                    value, u,
+                ),
+            ));
+        }
+    }
+    if let Some(l) = lb {
+        if (value as i128) < l {
+            return Err(PerCodecError::new(
+                PerCodecErrorCause::Generic,
+                format!(
+                    "Cannot encode length determinent {} - less than lower bound {}",
+                    value, l,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Common function to encode a SEQUENCE OF / SET OF: its count AND its
+// components, because once the count reaches 16K in an unconstrained (or
+// `ub >= 64K`) size the components are interleaved with fragment headers
+// (X.691 §20.6 via §11.9.3.8): 16K..64K components, then the next header.
+// `emit(data, start, count)` encodes components `start..start + count`.
+//
+// For every count the plain length could already express, the bytes are
+// exactly those of `encode_sequence_of_length_common` followed by the
+// components.
+pub(crate) fn encode_sequence_of_common<F>(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    count: usize,
+    aligned: bool,
+    mut emit: F,
+) -> Result<(), PerCodecError>
+where
+    F: FnMut(&mut PerCodecData, usize, usize) -> Result<(), PerCodecError>,
+{
+    let n = count as i128;
+    let in_root = lb.is_none_or(|l| n >= l) && ub.is_none_or(|u| n <= u);
+
+    if is_extensible {
+        data.encode_bool(!in_root);
+        if !in_root {
+            // Outside the root the count is semi-constrained (§20.4).
+            return encode_fragmented_common(data, count, aligned, emit);
+        }
+    } else if !in_root {
+        return Err(PerCodecError::new(
+            PerCodecErrorCause::Generic,
+            format!(
+                "Cannot encode SEQUENCE OF with {} elements - outside SIZE ({}..{})",
+                count,
+                lb.map_or("MIN".to_string(), |l| l.to_string()),
+                ub.map_or("MAX".to_string(), |u| u.to_string()),
+            ),
+        ));
+    }
+
+    if length_fragments(ub) {
+        encode_fragmented_common(data, count, aligned, emit)
+    } else {
+        encode_length_determinent_common(data, lb, ub, false, count, aligned)?;
+        emit(data, 0, count)
+    }
+}
+
+// Common function to encode an open type (X.691 §11.2): the complete
+// encoding of `inner`, padded to a whole number of octets, framed by an
+// unconstrained length in octets -- fragmented at 16K like any other.
+//
+// `align_outer` pads THIS buffer before each piece of content. That is right
+// for APER, where the determinant has already aligned and the pad is a no-op,
+// and wrong for UPER (see `append_open_type_unaligned`); callers pass `aligned`.
+pub(crate) fn encode_open_type_common(
+    data: &mut PerCodecData,
+    inner: &mut PerCodecData,
+    align_outer: bool,
+    aligned: bool,
+) -> Result<(), PerCodecError> {
+    inner.align();
+    let octets: Vec<u8> = inner.bits.as_raw_slice().to_vec();
+    let total = inner.length_in_bytes();
+    encode_fragmented_common(data, total, aligned, |data, start, count| {
+        if align_outer {
+            data.align();
+        }
+        data.append_bits(octets[start..start + count].view_bits());
+        Ok(())
+    })?;
     data.dump_encode();
     Ok(())
 }
