@@ -25,7 +25,6 @@ kernel-sctp = ["dep:socket2", "dep:libc"]
 # nextgsim 67a0d79. default-features = false: only the shared core is wanted,
 # not nextgcore's sctp-proto SERVER. Bump procedure: docs/nextgcore-integration.md.
 nextgcore-sctp = { git = "https://github.com/NextgCoreLab/nextgcore", rev = "bf3dbd800376db8ec2aa44a04dbb299b5c5e40a0", default-features = false }
-nextgsim-common.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true

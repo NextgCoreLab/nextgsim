@@ -1875,7 +1875,6 @@ dependencies = [
  "bytes",
  "libc",
  "nextgcore-sctp",
- "nextgsim-common",
  "quinn",
  "rcgen",
  "rustls",
@@ -2701,8 +2700,6 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sctp-proto"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "572b7e45d72e65e8f5ab350f06c205f5cd2a9bb12642d5f087870c8fdd47a331"
 dependencies = [
  "bytes",
  "crc",

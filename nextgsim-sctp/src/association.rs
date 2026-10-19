@@ -476,14 +476,10 @@ impl SctpAssociation {
             if let Ok(mut stream) = self.association.stream(stream_id) {
                 // Try to read from the stream
                 if let Ok(Some(chunks)) = stream.read() {
-                    let ppid = match chunks.ppi {
-                        PayloadProtocolIdentifier::Dcep => 50,
-                        PayloadProtocolIdentifier::String => 51,
-                        PayloadProtocolIdentifier::Binary => 53,
-                        PayloadProtocolIdentifier::StringEmpty => 56,
-                        PayloadProtocolIdentifier::BinaryEmpty => 57,
-                        PayloadProtocolIdentifier::Unknown => NGAP_PPID,
-                    };
+                    // The PPID the peer actually put on the wire (#220): the
+                    // vendored sctp-proto carries it verbatim, so nothing is
+                    // assumed to be NGAP.
+                    let ppid = u32::from(chunks.ppi);
                     // Read all data from chunks into a buffer
                     let total_len = chunks.len();
                     if total_len > 0 {
