@@ -32,3 +32,16 @@ s1ap_ip: 172.24.0.50
 # response timer (TS 36.413 defines neither).
 s1_setup_retry_secs: 10
 s1_setup_response_timeout_ms: 5000
+
+# The E-UTRA cell and its RLS radio endpoint (nextgsim #186 increment 2). RLS
+# replaces PHY/MAC; RRC (TS 36.331) and SRB1 PDCP (TS 36.323) run over it.
+radio:
+  link_ip: 172.24.0.50
+  rls_port: 4997
+  # Low bits of the E-UTRAN Cell Identity under the macro eNB ID (8 bits here).
+  cell_id: 1
+  freq_band: 7
+  dl_bandwidth: n50
+  q_rx_lev_min_dbm: -140
+  t300_ms: 1000
+  si_broadcast_period_ms: 160

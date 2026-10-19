@@ -1,0 +1,38 @@
+[package]
+name = "nextgsim-lte-ue"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LTE UE simulator (E-UTRA RRC over RLS) for nextgsim"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lte-ue"
+path = "src/main.rs"
+
+[lib]
+name = "nextgsim_lte_ue"
+path = "src/lib.rs"
+
+[dependencies]
+nextgsim-common.workspace = true
+nextgsim-lte-rrc.workspace = true
+nextgsim-pdcp.workspace = true
+nextgsim-rls.workspace = true
+bytes.workspace = true
+log.workspace = true
+rand.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+tracing-log.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

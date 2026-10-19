@@ -1,0 +1,8 @@
+# nextgsim LTE UE configuration (nextgsim #186).
+# The selected PLMN: cell selection camps on a cell whose SIB1 lists it
+# (TS 36.304 §5.2.3). 999-70 matches config/enb.yaml.
+plmn: { mcc: 999, mnc: 70, long_mnc: false }
+
+# eNB RLS endpoints to search ("ip" uses port 4997).
+enb_search_list:
+  - "172.24.0.50"
