@@ -1,0 +1,45 @@
+[package]
+name = "nextgsim-enb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LTE eNB (E-UTRAN NodeB) simulator binary"
+
+[lints]
+workspace = true
+
+[features]
+# Kernel SCTP (IP protocol 132) for S1-MME. TS 36.412 §7 makes S1-MME real
+# SCTP, and an MME (nextgcore's mmed included) accepts nothing else, so the
+# `lte-enb` binary refuses to start without this. Off by default only because it
+# needs Linux + libsctp at link time and default CI has neither; the S1AP
+# procedure logic is transport-independent and tested either way.
+kernel-sctp = ["nextgsim-sctp/kernel-sctp"]
+
+[[bin]]
+name = "lte-enb"
+path = "src/main.rs"
+
+[lib]
+name = "nextgsim_enb"
+path = "src/lib.rs"
+
+[dependencies]
+nextgsim-common.workspace = true
+nextgsim-s1ap.workspace = true
+nextgsim-sctp.workspace = true
+bitvec.workspace = true
+log.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+tracing-log.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

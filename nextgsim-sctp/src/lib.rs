@@ -97,6 +97,8 @@ pub use association::{
     DEFAULT_NUM_STREAMS,
     DEFAULT_RECEIVE_BUFFER_SIZE,
     NGAP_PPID,
+    S1AP_PPID,
+    S1AP_SCTP_PORT,
 };
 
 // Re-export server types

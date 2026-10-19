@@ -1619,6 +1619,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgsim-enb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitvec",
+ "clap",
+ "log",
+ "nextgsim-common",
+ "nextgsim-s1ap",
+ "nextgsim-sctp",
+ "serde",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nextgsim-fl"
 version = "0.1.0"
 dependencies = [
@@ -1835,6 +1854,18 @@ dependencies = [
  "proptest",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "nextgsim-s1ap"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -1,0 +1,373 @@
+//! eNB configuration.
+//!
+//! Field names and YAML shape follow the gNB's (`plmn`, `tac`, `*_configs`,
+//! `*_ip`) so one operator vocabulary covers both. Every value that reaches the
+//! wire is validated here against the S1AP type it is encoded into, so a bad
+//! config fails at load time rather than as an encode error mid-procedure.
+
+use std::fs;
+use std::net::IpAddr;
+use std::path::Path;
+
+use nextgsim_common::Plmn;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// The S1AP `ENB-ID` CHOICE alternative the eNB identifies itself with
+/// (TS 36.413 §9.2.1.37, Global eNB ID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EnbIdType {
+    /// `macroENB-ID`, 20 bits: the eNB ID is the leftmost 20 bits of the
+    /// 28-bit E-UTRAN Cell Identity.
+    #[default]
+    Macro,
+    /// `homeENB-ID`, 28 bits: a HeNB, whose eNB ID equals the cell identity.
+    Home,
+    /// `short-macroENB-ID`, 18 bits (extension alternative).
+    ShortMacro,
+    /// `long-macroENB-ID`, 21 bits (extension alternative).
+    LongMacro,
+}
+
+impl EnbIdType {
+    /// The BIT STRING length of this alternative.
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::Macro => 20,
+            Self::Home => 28,
+            Self::ShortMacro => 18,
+            Self::LongMacro => 21,
+        }
+    }
+}
+
+/// Default Paging DRX (TS 36.413 §9.2.1.16; TS 36.304 §7.1), in radio frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PagingDrx {
+    /// 32 radio frames.
+    #[serde(rename = "v32")]
+    V32,
+    /// 64 radio frames.
+    #[serde(rename = "v64")]
+    V64,
+    /// 128 radio frames.
+    #[default]
+    #[serde(rename = "v128")]
+    V128,
+    /// 256 radio frames.
+    #[serde(rename = "v256")]
+    V256,
+}
+
+impl PagingDrx {
+    /// The `PagingDRX` ENUMERATED index.
+    pub const fn index(self) -> u8 {
+        match self {
+            Self::V32 => 0,
+            Self::V64 => 1,
+            Self::V128 => 2,
+            Self::V256 => 3,
+        }
+    }
+}
+
+/// One MME the eNB connects to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MmeConfig {
+    /// MME S1-MME address.
+    pub address: IpAddr,
+    /// SCTP destination port; IANA assigns 36412 to S1AP (TS 36.412 §7).
+    #[serde(default = "default_mme_port")]
+    pub port: u16,
+}
+
+fn default_mme_port() -> u16 {
+    nextgsim_sctp::S1AP_SCTP_PORT
+}
+
+/// One entry of the Supported TAs IE (TS 36.413 §9.1.8.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupportedTa {
+    /// Tracking Area Code, 16 bits (TS 36.413 §9.2.3.7, `TAC ::= OCTET STRING (SIZE(2))`).
+    pub tac: u16,
+    /// PLMNs broadcast in this TA, 1..6 (`BPLMNs`, maxnoofBPLMNs = 6).
+    pub broadcast_plmns: Vec<Plmn>,
+}
+
+/// eNB configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnbConfig {
+    /// eNB ID, interpreted as `enb_id_type.bits()` bits.
+    pub enb_id: u32,
+    /// Which `ENB-ID` alternative to send.
+    #[serde(default)]
+    pub enb_id_type: EnbIdType,
+    /// The PLMN of the Global eNB ID.
+    pub plmn: Plmn,
+    /// Primary Tracking Area Code. Used, broadcasting `plmn`, when
+    /// `supported_tas` is empty.
+    pub tac: u16,
+    /// Explicit Supported TAs. Empty means `[{ tac, [plmn] }]`.
+    #[serde(default)]
+    pub supported_tas: Vec<SupportedTa>,
+    /// Human-readable eNB name sent in S1 SETUP REQUEST (optional IE).
+    #[serde(default)]
+    pub enb_name: Option<String>,
+    /// Default Paging DRX (mandatory IE).
+    #[serde(default)]
+    pub paging_drx: PagingDrx,
+    /// MMEs to connect to.
+    pub mme_configs: Vec<MmeConfig>,
+    /// Local address the S1-MME SCTP association is bound to.
+    pub s1ap_ip: IpAddr,
+    /// Seconds to wait before re-initiating S1 Setup after a failure that
+    /// carried no Time To Wait, or after a lost association. TS 36.413 §8.7.3.3
+    /// only constrains the case where Time To Wait is present, so this is an
+    /// implementation choice.
+    #[serde(default = "default_s1_setup_retry_secs")]
+    pub s1_setup_retry_secs: u64,
+    /// Milliseconds to wait for S1 SETUP RESPONSE/FAILURE before treating the
+    /// attempt as failed. TS 36.413 defines no timer for S1 Setup; without one a
+    /// silent MME would stall the eNB forever.
+    #[serde(default = "default_s1_setup_response_timeout_ms")]
+    pub s1_setup_response_timeout_ms: u64,
+}
+
+fn default_s1_setup_retry_secs() -> u64 {
+    10
+}
+
+fn default_s1_setup_response_timeout_ms() -> u64 {
+    5000
+}
+
+impl EnbConfig {
+    /// The Supported TAs the S1 SETUP REQUEST carries.
+    pub fn effective_supported_tas(&self) -> Vec<SupportedTa> {
+        if self.supported_tas.is_empty() {
+            vec![SupportedTa {
+                tac: self.tac,
+                broadcast_plmns: vec![self.plmn],
+            }]
+        } else {
+            self.supported_tas.clone()
+        }
+    }
+}
+
+/// Configuration errors.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// The file could not be read.
+    #[error("cannot read {path}: {source}")]
+    Io {
+        /// Path that failed.
+        path: String,
+        /// Underlying error.
+        source: std::io::Error,
+    },
+    /// The YAML did not deserialize.
+    #[error("invalid YAML: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    /// A value failed validation.
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
+}
+
+/// Load an eNB configuration file without validating it.
+pub fn load_enb_config<P: AsRef<Path>>(path: P) -> Result<EnbConfig, ConfigError> {
+    let path = path.as_ref();
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(serde_yaml::from_str(&text)?)
+}
+
+/// Load and validate an eNB configuration file.
+pub fn load_and_validate_enb_config<P: AsRef<Path>>(path: P) -> Result<EnbConfig, ConfigError> {
+    let config = load_enb_config(path)?;
+    validate_enb_config(&config)?;
+    Ok(config)
+}
+
+/// maxnoofTACs (TS 36.413 §9.3.6).
+const MAX_TACS: usize = 256;
+/// maxnoofBPLMNs (TS 36.413 §9.3.6).
+const MAX_BPLMNS: usize = 6;
+
+fn validate_plmn(plmn: &Plmn, what: &str) -> Result<(), ConfigError> {
+    if plmn.mcc > 999 || plmn.mnc > 999 || (!plmn.long_mnc && plmn.mnc > 99) {
+        return Err(ConfigError::Invalid(format!(
+            "{what}: PLMN {}-{} is not a valid MCC/MNC (long_mnc={})",
+            plmn.mcc, plmn.mnc, plmn.long_mnc
+        )));
+    }
+    Ok(())
+}
+
+/// X.680 §41.4 PrintableString alphabet.
+fn is_printable_string(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || " '()+,-./:=?".contains(c))
+}
+
+/// Validate an eNB configuration against the S1AP types it is encoded into.
+pub fn validate_enb_config(c: &EnbConfig) -> Result<(), ConfigError> {
+    let bits = c.enb_id_type.bits();
+    if u64::from(c.enb_id) >= (1u64 << bits) {
+        return Err(ConfigError::Invalid(format!(
+            "enb_id {:#x} does not fit the {bits}-bit {:?} eNB ID",
+            c.enb_id, c.enb_id_type
+        )));
+    }
+    validate_plmn(&c.plmn, "plmn")?;
+
+    let tas = c.effective_supported_tas();
+    if tas.len() > MAX_TACS {
+        return Err(ConfigError::Invalid(format!(
+            "{} supported TAs exceed maxnoofTACs ({MAX_TACS})",
+            tas.len()
+        )));
+    }
+    for ta in &tas {
+        if ta.broadcast_plmns.is_empty() || ta.broadcast_plmns.len() > MAX_BPLMNS {
+            return Err(ConfigError::Invalid(format!(
+                "TAC {}: broadcast PLMN count {} is outside 1..={MAX_BPLMNS}",
+                ta.tac,
+                ta.broadcast_plmns.len()
+            )));
+        }
+        for plmn in &ta.broadcast_plmns {
+            validate_plmn(plmn, &format!("TAC {}", ta.tac))?;
+        }
+    }
+
+    if let Some(name) = &c.enb_name {
+        if name.is_empty() || name.chars().count() > 150 || !is_printable_string(name) {
+            return Err(ConfigError::Invalid(format!(
+                "enb_name {name:?} must be a 1..150 character PrintableString"
+            )));
+        }
+    }
+    if c.mme_configs.is_empty() {
+        return Err(ConfigError::Invalid("mme_configs is empty".into()));
+    }
+    if c.s1_setup_response_timeout_ms == 0 {
+        return Err(ConfigError::Invalid(
+            "s1_setup_response_timeout_ms must be > 0".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    pub(crate) fn valid() -> EnbConfig {
+        EnbConfig {
+            enb_id: 0x19B,
+            enb_id_type: EnbIdType::Macro,
+            plmn: Plmn::new(999, 70, false),
+            tac: 1,
+            supported_tas: vec![],
+            enb_name: Some("nextgsim-enb".into()),
+            paging_drx: PagingDrx::V128,
+            mme_configs: vec![MmeConfig {
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 36412,
+            }],
+            s1ap_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            s1_setup_retry_secs: 10,
+            s1_setup_response_timeout_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn valid_config_passes() {
+        validate_enb_config(&valid()).unwrap();
+    }
+
+    #[test]
+    fn enb_id_must_fit_its_alternative() {
+        let mut c = valid();
+        c.enb_id = 1 << 20;
+        assert!(validate_enb_config(&c).is_err());
+        c.enb_id_type = EnbIdType::Home;
+        validate_enb_config(&c).unwrap();
+        c.enb_id = (1 << 28) - 1;
+        validate_enb_config(&c).unwrap();
+        c.enb_id = 1 << 28;
+        assert!(validate_enb_config(&c).is_err());
+    }
+
+    #[test]
+    fn default_supported_ta_is_tac_with_plmn() {
+        let tas = valid().effective_supported_tas();
+        assert_eq!(
+            tas,
+            vec![SupportedTa {
+                tac: 1,
+                broadcast_plmns: vec![Plmn::new(999, 70, false)]
+            }]
+        );
+    }
+
+    #[test]
+    fn broadcast_plmn_count_is_bounded() {
+        let mut c = valid();
+        c.supported_tas = vec![SupportedTa {
+            tac: 7,
+            broadcast_plmns: vec![],
+        }];
+        assert!(validate_enb_config(&c).is_err());
+        c.supported_tas[0].broadcast_plmns = vec![Plmn::new(1, 1, false); 7];
+        assert!(validate_enb_config(&c).is_err());
+        c.supported_tas[0].broadcast_plmns.truncate(6);
+        validate_enb_config(&c).unwrap();
+    }
+
+    #[test]
+    fn enb_name_must_be_printable_string() {
+        let mut c = valid();
+        c.enb_name = Some("enb_1".into()); // '_' is not in the PrintableString alphabet
+        assert!(validate_enb_config(&c).is_err());
+        c.enb_name = Some(String::new());
+        assert!(validate_enb_config(&c).is_err());
+        c.enb_name = Some("x".repeat(151));
+        assert!(validate_enb_config(&c).is_err());
+        c.enb_name = Some("x".repeat(150));
+        validate_enb_config(&c).unwrap();
+    }
+
+    #[test]
+    fn two_digit_mnc_above_99_is_rejected() {
+        let mut c = valid();
+        c.plmn = Plmn::new(999, 100, false);
+        assert!(validate_enb_config(&c).is_err());
+        c.plmn.long_mnc = true;
+        validate_enb_config(&c).unwrap();
+    }
+
+    #[test]
+    fn yaml_defaults_apply() {
+        let y = r#"
+enb_id: 0x19B
+plmn: { mcc: 999, mnc: 70, long_mnc: false }
+tac: 1
+mme_configs:
+  - address: 127.0.0.1
+s1ap_ip: 127.0.0.1
+"#;
+        let c: EnbConfig = serde_yaml::from_str(y).unwrap();
+        assert_eq!(c.enb_id_type, EnbIdType::Macro);
+        assert_eq!(c.paging_drx, PagingDrx::V128);
+        assert_eq!(c.mme_configs[0].port, 36412);
+        assert_eq!(c.s1_setup_retry_secs, 10);
+        assert_eq!(c.s1_setup_response_timeout_ms, 5000);
+        validate_enb_config(&c).unwrap();
+    }
+}

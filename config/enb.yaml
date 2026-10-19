@@ -1,0 +1,34 @@
+# nextgsim LTE eNB configuration (nextgsim #186).
+# PLMN 999-70 and TAC 1 match nextgcore's docker/rust/configs/epc/mme.yaml.
+
+# eNB ID, interpreted per enb_id_type: macro (20 bits, default), home (28),
+# short_macro (18) or long_macro (21) -- TS 36.413 §9.2.1.37.
+enb_id: 0x19B
+enb_id_type: macro
+
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+# Primary TAC (16 bits). With supported_tas omitted the eNB advertises this TAC
+# broadcasting `plmn`.
+tac: 1
+# supported_tas:
+#   - tac: 1
+#     broadcast_plmns: [{ mcc: 999, mnc: 70, long_mnc: false }]
+
+enb_name: nextgsim-enb
+paging_drx: v128
+
+mme_configs:
+  - address: 172.24.0.5
+    port: 36412
+
+# Local S1-MME address.
+s1ap_ip: 172.24.0.50
+
+# Re-initiation delay when S1 SETUP FAILURE carries no Time To Wait, and the
+# response timer (TS 36.413 defines neither).
+s1_setup_retry_secs: 10
+s1_setup_response_timeout_ms: 5000
