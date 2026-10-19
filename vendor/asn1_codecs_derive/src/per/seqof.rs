@@ -17,16 +17,16 @@ pub(super) fn generate_per_codec_for_asn_sequence_of(
             quote!(asn1_codecs::aper::AperCodec),
             quote!(aper_encode),
             quote!(aper_decode),
-            quote!(asn1_codecs::aper::encode::encode_length_determinent),
-            quote!(asn1_codecs::aper::decode::decode_length_determinent),
+            quote!(asn1_codecs::aper::encode::encode_sequence_of_length),
+            quote!(asn1_codecs::aper::decode::decode_sequence_of_length),
         )
     } else {
         (
             quote!(asn1_codecs::uper::UperCodec),
             quote!(uper_encode),
             quote!(uper_decode),
-            quote!(asn1_codecs::uper::encode::encode_length_determinent),
-            quote!(asn1_codecs::uper::decode::decode_length_determinent),
+            quote!(asn1_codecs::uper::encode::encode_sequence_of_length),
+            quote!(asn1_codecs::uper::decode::decode_sequence_of_length),
         )
     };
     let ty = if let syn::Data::Struct(ref d) = &ast.data {
@@ -82,10 +82,12 @@ pub(super) fn generate_per_codec_for_asn_sequence_of(
             fn #codec_encode_fn(&self, data:&mut asn1_codecs::PerCodecData) -> Result<(), asn1_codecs::PerCodecError> {
                 log::trace!(concat!("encode: ", stringify!(#name)));
 
-                let _ = #ty_encode_path(data, #sz_lb, #sz_ub, #sz_ext, self.0.len());
+                // The result MUST propagate (#212): discarding it let an out-of-SIZE
+                // list encode with no length field at all.
+                #ty_encode_path(data, #sz_lb, #sz_ub, #sz_ext, self.0.len())?;
 
                 for elem in &self.0 {
-                    let _ = elem.#codec_encode_fn(data)?;
+                    elem.#codec_encode_fn(data)?;
                 }
                 Ok(())
             }

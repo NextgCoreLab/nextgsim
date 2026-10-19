@@ -345,6 +345,51 @@ pub(crate) fn encode_length_determinent_common(
     Ok(())
 }
 
+// Common function to encode the length of a SIZE-constrained SEQUENCE OF / SET OF.
+//
+// X.691 §20.4-20.6 (2021: §20; SEQUENCE OF reuses the §11.9 length determinant).
+// Two things the plain length determinant cannot do, and the reason this exists
+// (#212):
+//
+//   - an EXTENSIBLE size constraint (`SIZE (lb..ub, ...)`) is preceded by one
+//     bit saying whether the count lies in the root `lb..=ub`. Inside the root
+//     the length is constrained as usual; outside it the length is encoded as a
+//     semi-constrained (unbounded) length determinant (§20.4, §11.9.4.2).
+//   - a NON-extensible constraint must REFUSE a count outside `lb..=ub`. The
+//     derive used to discard this function's result, so an empty
+//     `SIZE (1..n)` list or an over-long one encoded as a PDU with no length
+//     field at all -- silently, and unreadable by any peer.
+pub(crate) fn encode_sequence_of_length_common(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+    value: usize,
+    aligned: bool,
+) -> Result<(), PerCodecError> {
+    let count = value as i128;
+    let in_root = lb.is_none_or(|l| count >= l) && ub.is_none_or(|u| count <= u);
+
+    if is_extensible {
+        data.encode_bool(!in_root);
+        if !in_root {
+            return encode_length_determinent_common(data, None, None, false, value, aligned);
+        }
+    } else if !in_root {
+        return Err(PerCodecError::new(
+            PerCodecErrorCause::Generic,
+            format!(
+                "Cannot encode SEQUENCE OF with {} elements - outside SIZE ({}..{})",
+                value,
+                lb.map_or("MIN".to_string(), |l| l.to_string()),
+                ub.map_or("MAX".to_string(), |u| u.to_string()),
+            ),
+        ));
+    }
+
+    encode_length_determinent_common(data, lb, ub, false, value, aligned)
+}
+
 // Common function to encode string value.
 pub(crate) fn encode_string_common(
     data: &mut PerCodecData,
@@ -490,6 +535,112 @@ mod tests {
             .expect("encode");
         // 0b0_111111 + one pad bit: the top of the six-bit short form.
         assert_eq!(data.into_bytes(), vec![0b0111_1110]);
+    }
+
+    use crate::per::common::decode::decode_sequence_of_length_common;
+
+    fn seq_of_len_round_trip(
+        lb: Option<i128>,
+        ub: Option<i128>,
+        ext: bool,
+        n: usize,
+        aligned: bool,
+    ) -> Result<(Vec<u8>, usize), PerCodecError> {
+        let mut data = if aligned {
+            PerCodecData::new_aper()
+        } else {
+            PerCodecData::new_uper()
+        };
+        encode_sequence_of_length_common(&mut data, lb, ub, ext, n, aligned)?;
+        let bytes = data.into_bytes();
+        let mut read = if aligned {
+            PerCodecData::from_slice_aper(&bytes)
+        } else {
+            PerCodecData::from_slice_uper(&bytes)
+        };
+        let decoded = decode_sequence_of_length_common(&mut read, lb, ub, ext, aligned)?;
+        Ok((bytes, decoded))
+    }
+
+    /// #212: a non-extensible SIZE refuses a count below the lower bound and
+    /// above the upper bound, and still accepts both exact bounds. The bounds
+    /// are NGAP's PLMNSupportList, SIZE (1..maxnoofPLMNs = 12).
+    #[test]
+    fn a_sequence_of_count_outside_a_fixed_size_is_refused() {
+        for aligned in [true, false] {
+            for n in [0usize, 13, 1000] {
+                let err = seq_of_len_round_trip(Some(1), Some(12), false, n, aligned)
+                    .expect_err("an out-of-SIZE count must not encode");
+                assert!(
+                    err.to_string().contains("outside SIZE (1..12)"),
+                    "n={} aligned={}: unexpected error {}",
+                    n,
+                    aligned,
+                    err
+                );
+            }
+            for n in [1usize, 12] {
+                let (_, decoded) = seq_of_len_round_trip(Some(1), Some(12), false, n, aligned)
+                    .expect("an exact bound must encode");
+                assert_eq!(decoded, n, "n={n} aligned={aligned}");
+            }
+        }
+    }
+
+    /// The bound check also covers the large-ub path (ub >= 64K), which goes
+    /// through the unconstrained length determinant rather than a constrained
+    /// whole number.
+    #[test]
+    fn a_large_upper_bound_is_still_a_bound() {
+        let err = seq_of_len_round_trip(Some(1), Some(70_000), false, 0, true)
+            .expect_err("below the lower bound");
+        assert!(
+            err.to_string().contains("outside SIZE (1..70000)"),
+            "{}",
+            err
+        );
+        // (Counts >= 16K need fragmentation, which this codec does not implement.)
+        let (_, decoded) =
+            seq_of_len_round_trip(Some(1), Some(70_000), false, 300, true).expect("in range");
+        assert_eq!(decoded, 300);
+    }
+
+    /// X.691 §20.4: an extensible SIZE leads with one bit -- 0 for a count in the
+    /// root, 1 for a count outside it -- and an out-of-root count round trips
+    /// instead of being refused. Pinned on the first bit as well as the round
+    /// trip, because a codec that dropped the bit on both sides would still
+    /// round trip.
+    #[test]
+    fn an_extensible_size_flags_and_carries_an_out_of_root_count() {
+        for aligned in [true, false] {
+            let (bytes, decoded) =
+                seq_of_len_round_trip(Some(1), Some(4), true, 3, aligned).expect("in root");
+            assert_eq!(decoded, 3);
+            assert_eq!(
+                bytes[0] & 0x80,
+                0,
+                "in-root count must clear the extension bit"
+            );
+
+            for n in [0usize, 5, 200] {
+                let (bytes, decoded) =
+                    seq_of_len_round_trip(Some(1), Some(4), true, n, aligned).expect("ext");
+                assert_eq!(decoded, n, "n={n} aligned={aligned}");
+                assert_eq!(
+                    bytes[0] & 0x80,
+                    0x80,
+                    "out-of-root count {n} must set the extension bit"
+                );
+            }
+        }
+    }
+
+    /// The wire form of an in-root, non-extensible length is unchanged by #212:
+    /// SIZE (1..12) with 3 elements is the constrained whole number 2 in 4 bits.
+    #[test]
+    fn a_fixed_size_length_keeps_its_wire_form() {
+        let (bytes, _) = seq_of_len_round_trip(Some(1), Some(12), false, 3, true).expect("ok");
+        assert_eq!(bytes, vec![0b0010_0000]);
     }
 
     #[test]

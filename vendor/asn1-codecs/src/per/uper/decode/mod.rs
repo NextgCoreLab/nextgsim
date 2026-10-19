@@ -161,5 +161,17 @@ pub fn decode_length_determinent(
     decode_length_determinent_common(data, lb, ub, normally_small, false)
 }
 
+/// Decodes the length of a SIZE-constrained SEQUENCE OF (X.691 §20.4).
+pub fn decode_sequence_of_length(
+    data: &mut PerCodecData,
+    lb: Option<i128>,
+    ub: Option<i128>,
+    is_extensible: bool,
+) -> Result<usize, PerCodecError> {
+    log::trace!("decode_sequence_of_length:");
+
+    decode_sequence_of_length_common(data, lb, ub, is_extensible, false)
+}
+
 mod decode_charstrings;
 pub use decode_charstrings::*;
