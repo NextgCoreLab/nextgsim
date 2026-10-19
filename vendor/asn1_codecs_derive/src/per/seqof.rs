@@ -65,10 +65,15 @@ pub(super) fn generate_per_codec_for_asn_sequence_of(
                 let length = #ty_decode_path(data, #sz_lb, #sz_ub, #sz_ext)?;
 
                 let mut items = vec![];
-                let mut count = 0;
-
                 for _ in 0..length {
-                    items.push(#ty::#codec_decode_fn(data)?);
+                    match #ty::#codec_decode_fn(data) {
+                        Ok(item) => items.push(item),
+                        // #214: an entry whose IE id is unknown, already consumed
+                        // and recorded by the codec (opt-in only). Drop the entry
+                        // and keep going; the caller applies its criticality.
+                        Err(e) if e.is_unknown_open_type_skipped() => continue,
+                        Err(e) => return Err(e),
+                    }
                 }
 
                 Ok(Self(items))

@@ -13,6 +13,9 @@ pub use per::PerCodecError;
 pub use per::PerCodecErrorCause;
 
 #[doc(inline)]
+pub use per::UnknownOpenType;
+
+#[doc(inline)]
 pub use per::aper;
 
 #[doc(inline)]

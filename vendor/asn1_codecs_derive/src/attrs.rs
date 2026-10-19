@@ -207,6 +207,9 @@ pub(crate) struct FieldVarCodecParams {
     // If this is a Key Field
     pub(crate) key_field: Option<syn::LitBool>,
 
+    // If this is the Criticality field of a protocol-IE SEQUENCE (#214)
+    pub(crate) criticality_field: Option<syn::LitBool>,
+
     // The actual 'attribute' from the Syntax tree from which this struct is generated. This will
     // be used mainly for error reporting inside the functions where this struct is passed.
     pub(crate) attr: Option<syn::Attribute>,
@@ -281,6 +284,18 @@ pub(crate) fn parse_fld_meta_as_codec_params(
                                 _ => errors.push(syn::Error::new_spanned(
                                     nested,
                                     "`extended` value should be an Bool Literal",
+                                )),
+                            }
+                        }
+                        // parses #[asn(criticality_field = true)] (#214)
+                        syn::NestedMeta::Meta(syn::Meta::NameValue(ref m)) if m.path == CRITICALITY_FIELD => {
+                            match m.lit {
+                                syn::Lit::Bool(ref critfld) => {
+                                    codec_params.criticality_field.replace(critfld.clone());
+                                }
+                                _ => errors.push(syn::Error::new_spanned(
+                                    nested,
+                                    "`criticality_field` value should be a Bool Literal",
                                 )),
                             }
                         }

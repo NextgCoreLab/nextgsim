@@ -26,6 +26,12 @@ pub enum ErrorCause {
 
     /// Generic Error during Encode or Decode
     Generic,
+
+    /// An open type with an unknown key was skipped (#214). Only produced when
+    /// the caller opted in with `PerCodecData::set_skip_unknown_open_types`; the
+    /// enclosing protocol-IE container consumes it and drops that entry. If it
+    /// reaches the caller, skipping was not possible at that position.
+    UnknownOpenTypeSkipped,
 }
 
 impl Error {
@@ -38,6 +44,31 @@ impl Error {
     }
     pub fn push_context(&mut self, context_elem: &str) {
         self.context.push(context_elem.to_string());
+    }
+
+    /// Whether this is a skipped unknown open type (#214).
+    pub fn is_unknown_open_type_skipped(&self) -> bool {
+        matches!(self.cause, ErrorCause::UnknownOpenTypeSkipped)
+    }
+
+    /// Turns a skipped unknown open type into a hard failure (#214).
+    ///
+    /// Used at every boundary where the skip cannot be resumed from -- a nested
+    /// value, a non-final field, a CHOICE -- so that only the immediately
+    /// enclosing protocol-IE container ever drops an entry. Any other error is
+    /// returned unchanged.
+    pub fn into_unskippable(self) -> Self {
+        if self.is_unknown_open_type_skipped() {
+            Error::new(
+                ErrorCause::Generic,
+                format!(
+                    "{} -- but it is not in a position that can be skipped",
+                    self.msg
+                ),
+            )
+        } else {
+            self
+        }
     }
 }
 impl std::fmt::Display for Error {
