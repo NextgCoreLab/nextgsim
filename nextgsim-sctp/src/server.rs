@@ -369,10 +369,9 @@ impl SctpServer {
                     if total_len > 0 {
                         let mut buf = vec![0u8; total_len];
                         if chunks.read(&mut buf).is_ok() {
-                            let ppid = match chunks.ppi {
-                                PayloadProtocolIdentifier::Unknown => NGAP_PPID,
-                                _ => NGAP_PPID, // Default to NGAP for 5G
-                            };
+                            // The PPID the peer actually sent (#220), not an
+                            // NGAP default.
+                            let ppid = u32::from(chunks.ppi);
 
                             let message = ReceivedMessage {
                                 stream_id,
@@ -468,20 +467,38 @@ impl SctpServer {
         Ok(())
     }
 
-    /// Send data to a specific association
+    /// Send data to a specific association with the NGAP PPID
     pub async fn send(&mut self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
+        self.send_with_ppid(association_id, stream_id, data, NGAP_PPID)
+            .await
+    }
+
+    /// Send data to a specific association with a caller-chosen PPID
+    pub async fn send_with_ppid(
+        &mut self,
+        association_id: u64,
+        stream_id: u16,
+        data: &[u8],
+        ppid: u32,
+    ) -> Result<()> {
         let handle = self
             .id_to_handle
             .get(&association_id)
             .ok_or(ServerError::AssociationNotFound(association_id))?;
 
         if let Some(managed) = self.associations.get_mut(handle) {
-            let ppi = PayloadProtocolIdentifier::from(NGAP_PPID);
+            let ppi = PayloadProtocolIdentifier::from(ppid);
 
-            let mut stream = managed
-                .association
-                .open_stream(stream_id, ppi)
-                .map_err(|e| ServerError::SendError(e.to_string()))?;
+            // Reuse the stream if the peer (or an earlier send) already opened
+            // it: open_stream refuses an existing stream id, so a reply on the
+            // stream a request arrived on used to fail.
+            let mut stream = match managed.association.stream(stream_id) {
+                Ok(s) => s,
+                Err(_) => managed
+                    .association
+                    .open_stream(stream_id, ppi)
+                    .map_err(|e| ServerError::SendError(e.to_string()))?,
+            };
 
             stream
                 .write_with_ppi(data, ppi)

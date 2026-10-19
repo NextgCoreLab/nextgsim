@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# Third-party source vendored only to carry a local patch: kept out of the
+# workspace so its own tests and lints are not ours (see NEXTGSIM-PATCH.md).
+exclude = ["vendor/sctp-proto"]
 
 members = [
     "nextgsim-common",
@@ -178,3 +181,7 @@ inefficient_to_string = "warn"
 asn1-codecs = { path = "vendor/asn1-codecs" }
 asn1_codecs_derive = { path = "vendor/asn1_codecs_derive" }
 asn1-compiler = { path = "vendor/asn1-compiler" }
+# sctp-proto 0.6.0 patched to carry any SCTP PPID verbatim (#220): upstream
+# (0.6.0 and 0.10.7 alike) maps every non-WebRTC PPID to `Unknown`, sent as 58.
+# See vendor/sctp-proto/NEXTGSIM-PATCH.md.
+sctp-proto = { path = "vendor/sctp-proto" }
