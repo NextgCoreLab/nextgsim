@@ -6,6 +6,7 @@ use crate::parser::asn::structs::types::{
     constructed::{
         AdditionGroupOrComponent, Asn1TypeChoice, Asn1TypeSequence, Asn1TypeSequenceOf, Component,
     },
+    ioc::ObjectClassFieldSpec,
     Asn1ConstructedType, Asn1Type, Asn1TypeKind, Asn1TypeReference,
 };
 
@@ -283,7 +284,7 @@ fn resolve_seq_components_for_objects(
     resolver: &mut Resolver,
 ) -> Result<Vec<ResolvedSeqComponent>> {
     if objects.elements.is_empty() {
-        return Ok(vec![]);
+        return resolve_seq_components_for_empty_set(input_components, set_reference, resolver);
     }
     let first = &objects.elements[0];
     let mut result = vec![];
@@ -354,6 +355,118 @@ fn resolve_seq_components_for_objects(
     // Only add to the result if Every Component in the Input is also found in the Object. This
     // is mainly true for optional components. If Optional Components are missing, They should
     // not be part of the generated Set.
+    Ok(result)
+}
+
+// LOCAL FIX (nextgsim #218): a SEQUENCE whose class-field components are
+// constrained by an EMPTY object set still has those components.
+//
+// Upstream returned no components at all here, because the component types were
+// read off the set's first object and an empty set has none. Every
+// `ProtocolExtensionContainer { {X-ExtIEs} }` whose `X-ExtIEs ::= { ... }` lists
+// no extension (307 of them in TS 38.413 V17.9) therefore generated an EMPTY
+// entry struct, and an empty SEQUENCE decodes zero bits. Because extension sets
+// are extensible, a peer may legitimately send an entry, which was then "decoded"
+// without consuming its id, criticality or value, and every field after it was
+// read from the wrong offset -- a silent misparse rather than an error.
+//
+// The component types are the CLASS's field types, so take them from the class:
+// a fixed-type-value field (`&id`, `&criticality`) resolves to its declared type,
+// and a type field (`&Extension`) becomes an open type with no variants. The open
+// type then rejects the entry's key by default, or skips it on opt-in (#214),
+// exactly as for a non-empty set whose objects do not include that key.
+fn resolve_seq_components_for_empty_set(
+    input_components: &[Component],
+    set_reference: &str,
+    resolver: &mut Resolver,
+) -> Result<Vec<ResolvedSeqComponent>> {
+    let mut result = vec![];
+    for component in input_components {
+        if let Asn1TypeKind::Reference(Asn1TypeReference::ClassField { classref, fieldref }) =
+            &component.ty.kind
+        {
+            let class = match resolver
+                .classes
+                .get(classref)
+                .and_then(|c| c.get_inner_class())
+            {
+                Some(c) => c.classref,
+                None => {
+                    return Err(resolve_error!(
+                        "Class '{}' definition not found to resolve empty object set '{}'!",
+                        classref,
+                        set_reference
+                    )
+                    .into());
+                }
+            };
+            let seq_component = match class.fields.get(fieldref) {
+                Some(ObjectClassFieldSpec::FixedTypeValue {
+                    field_type, unique, ..
+                }) => {
+                    let constraint = &component.ty.constraints.as_ref().unwrap()[0];
+                    let comp_spec = constraint.get_comp_reference();
+                    // The key of an open type must be the class's UNIQUE field,
+                    // which is what makes it an integer lookup key. A class whose
+                    // identifying field is not UNIQUE -- the *AP PRIVATE-IES
+                    // classes, keyed by a `PrivateIE-ID` CHOICE -- cannot be keyed
+                    // that way, so its empty sets keep the previous (empty)
+                    // shape. Private IEs are outside 3GPP's procedures and no set
+                    // in this tree populates one.
+                    if comp_spec.is_none() && !unique {
+                        return Ok(vec![]);
+                    }
+                    let ty = resolve_type(field_type, resolver)?;
+                    ResolvedSeqComponent {
+                        component: ResolvedComponent {
+                            id: component.id.clone(),
+                            ty,
+                        },
+                        optional: false,
+                        class_field_type: Some(ClassFieldComponentType::FixedTypeValue),
+                        key_field: comp_spec.is_none(),
+                        criticality_field: comp_spec.is_some()
+                            && fieldref.to_ascii_lowercase().ends_with("criticality"),
+                    }
+                }
+                Some(ObjectClassFieldSpec::Type { .. }) => ResolvedSeqComponent {
+                    component: ResolvedComponent {
+                        id: component.id.clone(),
+                        ty: Asn1ResolvedType::Set(ResolvedSetType {
+                            setref: set_reference.to_string(),
+                            types: BTreeMap::new(),
+                        }),
+                    },
+                    optional: false,
+                    class_field_type: Some(ClassFieldComponentType::Type),
+                    key_field: false,
+                    criticality_field: false,
+                },
+                None => {
+                    return Err(resolve_error!(
+                        "Field '{}' not found in class '{}' for empty object set '{}'!",
+                        fieldref,
+                        classref,
+                        set_reference
+                    )
+                    .into());
+                }
+            };
+            result.push(seq_component);
+        } else {
+            let ty = resolve_type(&component.ty, resolver)?;
+            result.push(ResolvedSeqComponent {
+                component: ResolvedComponent {
+                    id: component.id.clone(),
+                    ty,
+                },
+                optional: false,
+                class_field_type: None,
+                key_field: false,
+                criticality_field: false,
+            });
+        }
+    }
     Ok(result)
 }
 
