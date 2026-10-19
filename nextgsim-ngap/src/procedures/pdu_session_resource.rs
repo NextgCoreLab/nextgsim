@@ -1272,6 +1272,141 @@ mod tests {
         assert_eq!(parsed.released_list[0].pdu_session_id, 1);
     }
 
+    /// The released sessions of [`release_response_with_extension_on_first_item`].
+    const EXT_CASE_SESSIONS: [(u8, [u8; 2]); 2] = [(5, [0x00, 0x05]), (6, [0x00, 0x06])];
+
+    /// A PDU Session Resource Release Response whose first released item carries
+    /// one `iE-Extensions` entry (#218), and the extension value octets.
+    ///
+    /// `PDUSessionResourceReleasedItemRelRes-ExtIEs` is `{ ... }`, so no typed
+    /// value can carry an extension there. The wire form is borrowed from
+    /// `PDUSessionResourceSwitchedList`, whose item has the identical root layout
+    /// (PDUSessionID, OCTET STRING, ProtocolExtensionContainer; extensible; one
+    /// optional) and whose extension set is NOT empty -- the layout identity is
+    /// asserted, not assumed. Its list octets are spliced in place of the plain
+    /// released list, and the two enclosing open-type lengths are adjusted.
+    fn release_response_with_extension_on_first_item() -> (Vec<u8>, Vec<u8>) {
+        let params = PduSessionResourceReleaseResponseParams {
+            amf_ue_ngap_id: 12345,
+            ran_ue_ngap_id: 1,
+            released_list: EXT_CASE_SESSIONS
+                .iter()
+                .map(|(id, transfer)| PduSessionResourceReleasedItem {
+                    pdu_session_id: *id,
+                    transfer: transfer.to_vec(),
+                })
+                .collect(),
+        };
+        let plain_pdu = encode_pdu_session_resource_release_response(&params).unwrap();
+        let plain_list =
+            crate::codec::encode_aper(&build_released_list_rel_res(&params.released_list)).unwrap();
+
+        let ext_value = ExpectedUEActivityBehaviour {
+            expected_activity_period: None,
+            expected_idle_period: None,
+            source_of_ue_activity_behaviour_information: None,
+            ie_extensions: None,
+        };
+        let twin = |with_ext: bool| {
+            PDUSessionResourceSwitchedList(
+                EXT_CASE_SESSIONS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, transfer))| PDUSessionResourceSwitchedItem {
+                        pdu_session_id: PDUSessionID(*id),
+                        path_switch_request_acknowledge_transfer:
+                            PDUSessionResourceSwitchedItemPathSwitchRequestAcknowledgeTransfer(
+                                transfer.to_vec(),
+                            ),
+                        ie_extensions: (with_ext && i == 0).then(|| {
+                            PDUSessionResourceSwitchedItemIE_Extensions(vec![
+                                PDUSessionResourceSwitchedItemIE_Extensions_Entry {
+                                    id: ProtocolExtensionID(
+                                        ID_PDU_SESSION_EXPECTED_UE_ACTIVITY_BEHAVIOUR,
+                                    ),
+                                    criticality: Criticality(Criticality::IGNORE),
+                                    extension_value:
+                                        PDUSessionResourceSwitchedItemIE_Extensions_EntryExtensionValue::Id_PduSessionExpectedUEActivityBehaviour(
+                                            ext_value.clone(),
+                                        ),
+                                },
+                            ])
+                        }),
+                    })
+                    .collect(),
+            )
+        };
+        // Without the extension the borrowed form IS the released list.
+        assert_eq!(crate::codec::encode_aper(&twin(false)).unwrap(), plain_list);
+        let ext_list = crate::codec::encode_aper(&twin(true)).unwrap();
+
+        // successfulOutcome: [choice] [procedure code] [criticality] [length] ...
+        // The IE value sits behind its own one-octet length. Both lengths are
+        // short-form here, which the splice relies on and therefore checks.
+        let at = plain_pdu
+            .windows(plain_list.len())
+            .position(|w| w == plain_list.as_slice())
+            .expect("released list octets in the PDU");
+        assert_eq!(usize::from(plain_pdu[at - 1]), plain_list.len());
+        assert_eq!(usize::from(plain_pdu[3]), plain_pdu.len() - 4);
+        assert!(plain_pdu.len() - 4 + ext_list.len() - plain_list.len() < 128);
+
+        let mut spliced = plain_pdu[..at].to_vec();
+        spliced[at - 1] = u8::try_from(ext_list.len()).unwrap();
+        spliced[3] = u8::try_from(plain_pdu.len() - 4 + ext_list.len() - plain_list.len()).unwrap();
+        spliced.extend_from_slice(&ext_list);
+        spliced.extend_from_slice(&plain_pdu[at + plain_list.len()..]);
+
+        (spliced, crate::codec::encode_aper(&ext_value).unwrap())
+    }
+
+    /// #218: an extension entry in an item whose extension set is EMPTY fails the
+    /// default decode. Before the fix the entry was an empty SEQUENCE that
+    /// decoded zero bits, and the response "decoded" as sessions 5 and 9.
+    #[test]
+    fn released_item_extension_in_empty_set_fails_the_default_decode() {
+        let (bytes, _) = release_response_with_extension_on_first_item();
+        let err = decode_ngap_pdu(&bytes).expect_err("an unknown extension must not decode");
+        assert!(
+            format!("{err:?}").contains(&format!(
+                "Key {ID_PDU_SESSION_EXPECTED_UE_ACTIVITY_BEHAVIOUR} Not Found"
+            )),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// #218: on opt-in the entry is skipped and reported, and every following
+    /// field -- the rest of the first item, and the whole second item -- decodes
+    /// from the right offset.
+    #[test]
+    fn released_item_extension_in_empty_set_is_skipped_on_opt_in() {
+        let (bytes, ext_value) = release_response_with_extension_on_first_item();
+        let (pdu, unknown) =
+            crate::codec::decode_ngap_pdu_with_unknown_ies(&bytes).expect("opt-in decode");
+
+        assert_eq!(
+            unknown,
+            vec![crate::codec::UnknownIe {
+                id: i128::from(ID_PDU_SESSION_EXPECTED_UE_ACTIVITY_BEHAVIOUR),
+                criticality: Some(Criticality(Criticality::IGNORE)),
+                value: ext_value,
+            }]
+        );
+        let parsed = parse_pdu_session_resource_release_response(&pdu).unwrap();
+        assert_eq!(parsed.amf_ue_ngap_id, 12345);
+        assert_eq!(parsed.ran_ue_ngap_id, 1);
+        let released: Vec<(u8, Vec<u8>)> = parsed
+            .released_list
+            .iter()
+            .map(|i| (i.pdu_session_id, i.transfer.clone()))
+            .collect();
+        let expected: Vec<(u8, Vec<u8>)> = EXT_CASE_SESSIONS
+            .iter()
+            .map(|(id, t)| (*id, t.to_vec()))
+            .collect();
+        assert_eq!(released, expected);
+    }
+
     #[test]
     fn test_build_pdu_session_resource_modify_response() {
         let params = create_test_modify_response_params();
