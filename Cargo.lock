@@ -1624,9 +1624,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bitvec",
+ "bytes",
  "clap",
  "log",
  "nextgsim-common",
+ "nextgsim-lte-rrc",
+ "nextgsim-lte-ue",
+ "nextgsim-pdcp",
+ "nextgsim-rls",
  "nextgsim-s1ap",
  "nextgsim-sctp",
  "serde",
@@ -1747,6 +1752,38 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nextgsim-lte-rrc"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "nextgsim-lte-ue"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "log",
+ "nextgsim-common",
+ "nextgsim-lte-rrc",
+ "nextgsim-pdcp",
+ "nextgsim-rls",
+ "rand 0.8.5",
+ "serde",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing-log",
+ "tracing-subscriber",
 ]
 
 [[package]]

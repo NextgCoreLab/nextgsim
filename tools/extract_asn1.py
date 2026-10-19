@@ -12,10 +12,24 @@ schema text. Stdlib only, so it runs anywhere Python 3 does.
 
 Usage:
     extract_asn1.py SPEC.docx OUT.asn [--blocks N] [--skip-module NAME ...]
+                                      [--only-module NAME ...]
+                                      [--space-glued-comments]
 
-``--blocks N`` keeps only the first N blocks; ``--skip-module`` drops any block
-whose module header names NAME (e.g. an annex-defined module that the main
-protocol does not import).
+``--blocks N`` keeps only the first N blocks; ``--skip-module`` drops every block
+belonging to module NAME (e.g. an annex-defined module that the main protocol
+does not import); ``--only-module`` keeps only the blocks of the named modules.
+
+A module may span many blocks: TS 36.413 gives each module one block, but
+TS 36.331 opens ``EUTRA-RRC-Definitions`` in one block and then delimits every
+message and IE definition separately, ~560 blocks before its ``END``. So a
+block belongs to the module whose header block most recently preceded it.
+
+``--space-glued-comments`` inserts one space before a ``--`` that directly
+follows a letter or digit (TS 36.331 V19.4.0 has two: ``OPTIONAL-- Need OR``).
+X.680 §12.6.2 starts a comment at ``--`` wherever it appears and §12.3 forbids
+``--`` inside an identifier, so the edit cannot change the schema's meaning; it
+exists because the vendored asn1-compiler tokenizer reads ``OPTIONAL--`` as one
+identifier. It is opt-in so that every other extraction stays verbatim.
 """
 import argparse
 import re
@@ -56,6 +70,7 @@ def blocks(lines):
             cur.append(line)
 
 
+GLUED_COMMENT_RE = re.compile(r"([A-Za-z0-9])--")
 MODULE_RE = re.compile(r"^([A-Z][A-Za-z0-9-]*)\s*(\{|DEFINITIONS|$)")
 
 
@@ -69,22 +84,45 @@ def module_name(block):
     return None
 
 
+def is_module_header(block):
+    """True when the block opens a module: a ``DEFINITIONS ... ::=`` line before
+    ``BEGIN``. The name, OID and DEFINITIONS may span several lines (TS 36.413
+    puts the OID on its own lines), and comment lines may precede them."""
+    for line in block:
+        s = line.strip()
+        if s == "BEGIN":
+            return False
+        if "DEFINITIONS" in s and "::=" in s:
+            return True
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("docx")
     ap.add_argument("out")
     ap.add_argument("--blocks", type=int)
     ap.add_argument("--skip-module", action="append", default=[])
+    ap.add_argument("--only-module", action="append", default=[])
+    ap.add_argument("--space-glued-comments", action="store_true")
     a = ap.parse_args()
     out = []
     kept = []
+    current = None
     for i, b in enumerate(blocks(paragraphs(a.docx))):
         if a.blocks is not None and i >= a.blocks:
             break
         name = module_name(b)
-        if name in a.skip_module:
+        if is_module_header(b):
+            current = name
+        if current in a.skip_module:
             continue
-        kept.append(name)
+        if a.only_module and current not in a.only_module:
+            continue
+        if is_module_header(b):
+            kept.append(name)
+        if a.space_glued_comments:
+            b = [GLUED_COMMENT_RE.sub(r"\1 --", line) for line in b]
         out.append("\n".join(b).rstrip() + "\n")
     with open(a.out, "w", encoding="utf-8") as f:
         f.write("\n".join(out))

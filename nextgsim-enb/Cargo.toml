@@ -29,6 +29,10 @@ path = "src/lib.rs"
 [dependencies]
 nextgsim-common.workspace = true
 nextgsim-s1ap.workspace = true
+nextgsim-lte-rrc.workspace = true
+nextgsim-pdcp.workspace = true
+nextgsim-rls.workspace = true
+bytes.workspace = true
 nextgsim-sctp.workspace = true
 bitvec.workspace = true
 log.workspace = true
@@ -42,4 +46,7 @@ serde.workspace = true
 serde_yaml.workspace = true
 
 [dev-dependencies]
+# The in-process radio test drives the real LTE UE against this eNB over RLS.
+nextgsim-lte-ue.workspace = true
+nextgsim-lte-rrc.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

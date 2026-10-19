@@ -95,6 +95,80 @@ pub struct SupportedTa {
     pub broadcast_plmns: Vec<Plmn>,
 }
 
+/// `dl-Bandwidth` (TS 36.331 §6.2.2 MasterInformationBlock), in resource blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DlBandwidthRb {
+    /// 6 RBs (1.4 MHz).
+    #[serde(rename = "n6")]
+    N6,
+    /// 15 RBs (3 MHz).
+    #[serde(rename = "n15")]
+    N15,
+    /// 25 RBs (5 MHz).
+    #[serde(rename = "n25")]
+    N25,
+    /// 50 RBs (10 MHz).
+    #[default]
+    #[serde(rename = "n50")]
+    N50,
+    /// 75 RBs (15 MHz).
+    #[serde(rename = "n75")]
+    N75,
+    /// 100 RBs (20 MHz).
+    #[serde(rename = "n100")]
+    N100,
+}
+
+/// The E-UTRA cell and its RLS radio endpoint (nextgsim #186, increment 2).
+///
+/// RLS replaces the physical layer and MAC, exactly as on the NR side, so the
+/// radio "interface" is a UDP socket; everything above it -- system
+/// information, RRC, SRB PDCP -- is TS 36.331 / TS 36.323.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RadioConfig {
+    /// Address the RLS socket binds to (the UE's search space points here).
+    pub link_ip: IpAddr,
+    /// RLS UDP port. 4997 is the NR gNB's, so an eNB and a gNB on one host
+    /// need different ports or addresses.
+    pub rls_port: u16,
+    /// The cell's local identity within the eNB: the low `28 - enb_id bits`
+    /// bits of the E-UTRAN Cell Identity (TS 36.300 §8.2; TS 36.413 §9.2.1.37:
+    /// a macro eNB ID is the leftmost 20 bits of the cell identity). Must be 0
+    /// for a home eNB, whose ID *is* the cell identity.
+    pub cell_id: u32,
+    /// `freqBandIndicator` (SIB1), 1..=64.
+    pub freq_band: u8,
+    /// `dl-Bandwidth` (MIB).
+    pub dl_bandwidth: DlBandwidthRb,
+    /// `q-RxLevMin` (SIB1) in dBm: even, -140..=-44 (TS 36.331 §6.3.4).
+    pub q_rx_lev_min_dbm: i16,
+    /// T300 broadcast in SIB2, ms (TS 36.331 §6.3.6 allows 100, 200, 300, 400,
+    /// 600, 1000, 1500, 2000).
+    pub t300_ms: u16,
+    /// How often MIB, SIB1 and the SIB2 SystemInformation are sent to every
+    /// discovered UE, ms. TS 36.331 §5.2.1.2 fixes the MIB at 40 ms and SIB1 at
+    /// 80 ms over the air; over RLS each broadcast is a UDP datagram per UE, so
+    /// the default (160 ms, the SI periodicity this cell advertises) is the SIB2
+    /// period applied to all three.
+    pub si_broadcast_period_ms: u64,
+}
+
+impl Default for RadioConfig {
+    fn default() -> Self {
+        Self {
+            link_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            rls_port: 4997,
+            cell_id: 1,
+            freq_band: 7,
+            dl_bandwidth: DlBandwidthRb::N50,
+            q_rx_lev_min_dbm: -140,
+            t300_ms: 1000,
+            si_broadcast_period_ms: 160,
+        }
+    }
+}
+
 /// eNB configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnbConfig {
@@ -132,6 +206,9 @@ pub struct EnbConfig {
     /// silent MME would stall the eNB forever.
     #[serde(default = "default_s1_setup_response_timeout_ms")]
     pub s1_setup_response_timeout_ms: u64,
+    /// The E-UTRA cell and its RLS endpoint.
+    #[serde(default)]
+    pub radio: RadioConfig,
 }
 
 fn default_s1_setup_retry_secs() -> u64 {
@@ -143,6 +220,17 @@ fn default_s1_setup_response_timeout_ms() -> u64 {
 }
 
 impl EnbConfig {
+    /// The 28-bit E-UTRAN Cell Identity: the eNB ID in the leftmost bits, the
+    /// cell ID in the rest (TS 36.300 §8.2, TS 36.413 §9.2.1.37).
+    pub fn cell_identity(&self) -> u32 {
+        let bits = self.enb_id_type.bits();
+        if bits >= 28 {
+            self.enb_id
+        } else {
+            (self.enb_id << (28 - bits)) | self.radio.cell_id
+        }
+    }
+
     /// The Supported TAs the S1 SETUP REQUEST carries.
     pub fn effective_supported_tas(&self) -> Vec<SupportedTa> {
         if self.supported_tas.is_empty() {
@@ -259,6 +347,41 @@ pub fn validate_enb_config(c: &EnbConfig) -> Result<(), ConfigError> {
             "s1_setup_response_timeout_ms must be > 0".into(),
         ));
     }
+    validate_radio(c)
+}
+
+fn validate_radio(c: &EnbConfig) -> Result<(), ConfigError> {
+    let r = &c.radio;
+    let cell_bits = 28u32.saturating_sub(c.enb_id_type.bits());
+    if u64::from(r.cell_id) >= (1u64 << cell_bits) {
+        return Err(ConfigError::Invalid(format!(
+            "radio.cell_id {} does not fit the {cell_bits} cell-identity bits a {:?} eNB ID leaves",
+            r.cell_id, c.enb_id_type
+        )));
+    }
+    if !(1..=64).contains(&r.freq_band) {
+        return Err(ConfigError::Invalid(format!(
+            "radio.freq_band {} is outside 1..=64",
+            r.freq_band
+        )));
+    }
+    if r.q_rx_lev_min_dbm % 2 != 0 || !(-140..=-44).contains(&r.q_rx_lev_min_dbm) {
+        return Err(ConfigError::Invalid(format!(
+            "radio.q_rx_lev_min_dbm {} must be even and within -140..=-44",
+            r.q_rx_lev_min_dbm
+        )));
+    }
+    if ![100, 200, 300, 400, 600, 1000, 1500, 2000].contains(&r.t300_ms) {
+        return Err(ConfigError::Invalid(format!(
+            "radio.t300_ms {} is not a TS 36.331 T300 value",
+            r.t300_ms
+        )));
+    }
+    if r.si_broadcast_period_ms == 0 {
+        return Err(ConfigError::Invalid(
+            "radio.si_broadcast_period_ms must be > 0".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -283,7 +406,39 @@ mod tests {
             s1ap_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             s1_setup_retry_secs: 10,
             s1_setup_response_timeout_ms: 5000,
+            radio: RadioConfig::default(),
         }
+    }
+
+    #[test]
+    fn cell_identity_puts_the_enb_id_leftmost() {
+        let mut c = valid();
+        assert_eq!(c.cell_identity(), (0x19B << 8) | 1);
+        c.enb_id_type = EnbIdType::Home;
+        c.radio.cell_id = 0;
+        assert_eq!(c.cell_identity(), 0x19B);
+        validate_enb_config(&c).unwrap();
+        c.radio.cell_id = 1;
+        assert!(
+            validate_enb_config(&c).is_err(),
+            "a home eNB has no cell bits"
+        );
+    }
+
+    #[test]
+    fn radio_values_are_validated_against_ts_36_331() {
+        let mut c = valid();
+        c.radio.cell_id = 256;
+        assert!(validate_enb_config(&c).is_err());
+        let mut c = valid();
+        c.radio.q_rx_lev_min_dbm = -139;
+        assert!(validate_enb_config(&c).is_err());
+        let mut c = valid();
+        c.radio.t300_ms = 250;
+        assert!(validate_enb_config(&c).is_err());
+        let mut c = valid();
+        c.radio.freq_band = 0;
+        assert!(validate_enb_config(&c).is_err());
     }
 
     #[test]
@@ -297,6 +452,8 @@ mod tests {
         c.enb_id = 1 << 20;
         assert!(validate_enb_config(&c).is_err());
         c.enb_id_type = EnbIdType::Home;
+        // A home eNB ID is the whole 28-bit cell identity, so no cell bits.
+        c.radio.cell_id = 0;
         validate_enb_config(&c).unwrap();
         c.enb_id = (1 << 28) - 1;
         validate_enb_config(&c).unwrap();

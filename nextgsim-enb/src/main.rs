@@ -49,8 +49,21 @@ async fn main() -> ExitCode {
 
 #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
 async fn run(cfg: nextgsim_enb::EnbConfig) -> ExitCode {
-    use nextgsim_enb::s1_task::{establish_s1, kernel::KernelConnector, serve};
+    use nextgsim_enb::radio::{run_operational, RlsRadio, Stopped};
+    use nextgsim_enb::s1_task::{establish_s1, kernel::KernelConnector};
     use std::net::SocketAddr;
+
+    let mut radio = match RlsRadio::bind(&cfg).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!(
+                "cannot bind the RLS radio endpoint {}:{}: {e}",
+                cfg.radio.link_ip,
+                cfg.radio.rls_port
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mme = &cfg.mme_configs[0];
     if cfg.mme_configs.len() > 1 {
@@ -64,8 +77,15 @@ async fn run(cfg: nextgsim_enb::EnbConfig) -> ExitCode {
     loop {
         tokio::select! {
             (_, mut transport) = establish_s1(&cfg, &mut connector, remote) => {
+                // The cell is only on air while S1 is operational: a UE
+                // camping on it could not reach an MME otherwise.
                 tokio::select! {
-                    () = serve(&mut transport) => {}
+                    stopped = run_operational(&cfg, &mut radio, &mut transport) => {
+                        if let Stopped::RadioFailed(e) = stopped {
+                            log::error!("RLS radio endpoint failed: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                     _ = tokio::signal::ctrl_c() => return ExitCode::SUCCESS,
                 }
                 // TS 36.412 §7: the eNB (re-)establishes the association.
