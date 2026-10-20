@@ -37,6 +37,13 @@ pub enum GuardTimer {
         /// The UE being handed over.
         ue_id: i32,
     },
+    /// A UE RADIO CAPABILITY ID MAPPING REQUEST was sent for this UE's UE Radio
+    /// Capability ID and no response has arrived (TS 38.413 §8.14.3 defines no timer;
+    /// see `racs::RACS_MAPPING_TIMEOUT_SECS`). On expiry the gNB stops waiting.
+    RacsMapping {
+        /// The UE waiting for the mapping.
+        ue_id: i32,
+    },
     /// The NG Setup retry an NG Setup Failure's Time to Wait IE gates. The retry must
     /// not fire before the indicated time (TS 38.413 §8.7.1.3).
     NgSetupRetry {
