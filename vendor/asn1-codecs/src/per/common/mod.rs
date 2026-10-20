@@ -46,3 +46,6 @@ mod fragment_tests;
 
 #[cfg(test)]
 mod bitstring_align_tests;
+
+#[cfg(test)]
+mod integer_ext_tests;

@@ -62,12 +62,27 @@ pub(super) fn generate_per_codec_for_asn_integer(
                 log::trace!(concat!("decode: ", stringify!(#name)));
 
                 let decoded = #ty_decode_path(data, #lb, #ub, #ext)?;
-                Ok(Self(decoded.0 as #ty))
+                // An extension value (X.691 §12.1) is an unconstrained whole number,
+                // so it can exceed the Rust type; refuse it rather than wrap (#231).
+                let value = <#ty as ::core::convert::TryFrom<i128>>::try_from(decoded.0).map_err(|_| {
+                    asn1_codecs::PerCodecError::new(
+                        asn1_codecs::PerCodecErrorCause::Generic,
+                        format!(concat!("decode: ", stringify!(#name), " value {} does not fit the type"), decoded.0),
+                    )
+                })?;
+                Ok(Self(value))
             }
             fn #codec_encode_fn(&self, data: &mut asn1_codecs::PerCodecData) -> Result<(), asn1_codecs::PerCodecError> {
                 log::trace!(concat!("encode: ", stringify!(#name)));
 
-                #ty_encode_path(data, #lb, #ub, #ext, self.0 as i128, false)
+                // X.691 §12.1: a value of an extensible INTEGER outside the root
+                // takes the extension encoding (#231).
+                let value = self.0 as i128;
+                let lb: Option<i128> = #lb;
+                let ub: Option<i128> = #ub;
+                let extended = #ext
+                    && (lb.is_some_and(|l| value < l) || ub.is_some_and(|u| value > u));
+                #ty_encode_path(data, lb, ub, #ext, value, extended)
             }
         }
     };

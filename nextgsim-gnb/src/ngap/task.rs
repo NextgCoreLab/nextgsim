@@ -216,7 +216,7 @@ pub struct NgapTask {
     /// exchange, so it only has to be unique among the measurements this node has
     /// outstanding — and a global counter cannot collide across UEs the way a
     /// per-UE one would once two UEs were measured concurrently.
-    next_nrppa_measurement_id: u8,
+    next_nrppa_measurement_id: u16,
     /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
     /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
     guard_timers: GuardTimers,
@@ -245,6 +245,10 @@ const DYNAMIC_TNLA_CLIENT_ID_BASE: i32 = 10_000;
 /// The NGAP SCTP port to use for a TNL association the AMF named without one
 /// (TS 38.412 §7: NGAP has no port IE, so the AMF can only give an address).
 const DEFAULT_NGAP_PORT: u16 = 38412;
+
+/// The largest `UE-Measurement-ID`: `INTEGER (1..15, ..., 16..256)` (TS 38.455
+/// §9.2.4). The RAN-side allocator wraps back to 1 after it.
+const NRPPA_UE_MEASUREMENT_ID_MAX: u16 = 256;
 
 impl NgapTask {
     /// Creates a new NGAP task
@@ -4976,9 +4980,15 @@ impl NgapTask {
     ///
     /// Wraps at 256 back to 1 rather than to 0: the constraint's lower bound is 1,
     /// so 0 is not an encodable measurement id.
-    fn next_nrppa_measurement_id(&mut self) -> u8 {
+    fn next_nrppa_measurement_id(&mut self) -> u16 {
+        // UE-Measurement-ID is INTEGER (1..15, ..., 16..256) (TS 38.455 §9.2.4):
+        // 16..256 are extension values, encodable since #231.
         let id = self.next_nrppa_measurement_id;
-        self.next_nrppa_measurement_id = if id == u8::MAX { 1 } else { id + 1 };
+        self.next_nrppa_measurement_id = if id >= NRPPA_UE_MEASUREMENT_ID_MAX {
+            1
+        } else {
+            id + 1
+        };
         id
     }
 
@@ -9384,7 +9394,7 @@ mod tests {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         transaction_id: u16,
-        lmf_ue_measurement_id: u8,
+        lmf_ue_measurement_id: u16,
     ) -> Vec<u8> {
         use nextgsim_ngap::codec::generated::{
             Criticality, DownlinkUEAssociatedNRPPaTransport,
@@ -9942,6 +9952,84 @@ mod tests {
         assert!(
             ran_ids.iter().all(|id| *id >= 1),
             "UE-Measurement-ID starts at 1, so 0 is not encodable"
+        );
+    }
+
+    /// UE-Measurement-ID is `INTEGER (1..15, ..., 16..256)` (TS 38.455 §9.2.4):
+    /// 16..256 are extension values. Before #231 the codec refused to encode
+    /// them, so the 16th E-CID measurement this node answered — and any LMF
+    /// measurement id of 16 or more — produced no reply at all. Both ids past the
+    /// root must now go out, and the allocator must wrap after 256, not 255.
+    #[tokio::test]
+    async fn test_ecid_measurement_ids_past_the_root_are_answered() {
+        use nextgsim_ngap::codec::generated::{
+            InitiatingMessageValue, UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V,
+        };
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+        use nrppa::E_CIDMeasurementInitiationResponseProtocolIEs_EntryValue as RV;
+
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
+        // The next RAN id the node allocates is the first extension value.
+        task.next_nrppa_measurement_id = 16;
+
+        let inbound = encode_dl_ue_nrppa_ecid_request(777, ran as u32, 1, 200);
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&inbound))
+            .await;
+        let reply = match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                buffer.data().to_vec()
+            }
+            other => panic!("an LMF id of 200 and a RAN id of 16 must be answered, got {other:?}"),
+        };
+        let NGAP_PDU::InitiatingMessage(init) = decode_ngap_pdu(&reply).expect("valid NGAP") else {
+            panic!("expected an InitiatingMessage");
+        };
+        let InitiatingMessageValue::Id_UplinkUEAssociatedNRPPaTransport(ul) = &init.value else {
+            panic!("expected an uplink transport");
+        };
+        let payload = ul
+            .protocol_i_es
+            .0
+            .iter()
+            .find_map(|ie| match &ie.value {
+                V::Id_NRPPa_PDU(p) => Some(p.0.clone()),
+                _ => None,
+            })
+            .expect("payload");
+        let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) =
+            nextgsim_ngap::codec::decode_aper::<nrppa::NRPPA_PDU>(&payload).expect("decodes")
+        else {
+            panic!("expected a successful outcome");
+        };
+        let nrppa::SuccessfulOutcomeValue::Id_e_CIDMeasurementInitiation(resp) = &outcome.value
+        else {
+            panic!("expected an E-CID response");
+        };
+        let (mut lmf_id, mut ran_id) = (None, None);
+        for ie in &resp.protocol_i_es.0 {
+            match &ie.value {
+                RV::Id_LMF_UE_Measurement_ID(id) => lmf_id = Some(id.0),
+                RV::Id_RAN_UE_Measurement_ID(id) => ran_id = Some(id.0),
+                _ => {}
+            }
+        }
+        assert_eq!(lmf_id, Some(200), "the LMF's extension-range id is echoed");
+        assert_eq!(
+            ran_id,
+            Some(16),
+            "the node's first extension-range id is sent"
+        );
+
+        task.next_nrppa_measurement_id = 256;
+        assert_eq!(
+            task.next_nrppa_measurement_id(),
+            256,
+            "256 is the last valid id"
+        );
+        assert_eq!(
+            task.next_nrppa_measurement_id(),
+            1,
+            "and the allocator wraps to 1"
         );
     }
 

@@ -198,7 +198,8 @@ pub enum NrppaProcedure {
     /// E-CID Measurement Initiation Request (§8.2.1).
     ECidMeasurementInitiation {
         /// `LMF-UE-Measurement-ID`, mandatory, echoed in the response.
-        lmf_ue_measurement_id: u8,
+        /// `INTEGER (1..15, ..., 16..256)` (TS 38.455 §9.2.4), so `u16`.
+        lmf_ue_measurement_id: u16,
     },
     /// Positioning Information Request (§8.2.6). Every IE of this request is
     /// OPTIONAL (TS 38.455 §9.1.10), so there is nothing mandatory to extract:
@@ -496,8 +497,8 @@ fn build_e_cid_measurement_result(cell: &NrppaCellInfo) -> nrppa::E_CID_Measurem
 /// the point of the procedure, so it is always emitted.
 fn build_e_cid_response(
     transaction_id: u16,
-    lmf_ue_measurement_id: u8,
-    ran_ue_measurement_id: u8,
+    lmf_ue_measurement_id: u16,
+    ran_ue_measurement_id: u16,
     cell: &NrppaCellInfo,
 ) -> nrppa::NRPPA_PDU {
     use nrppa::E_CIDMeasurementInitiationResponseProtocolIEs_EntryValue as V;
@@ -677,7 +678,7 @@ fn build_trp_information_response(
 pub fn build_nrppa_response(
     request: &NrppaRequest,
     cell: &NrppaCellInfo,
-    ran_ue_measurement_id: u8,
+    ran_ue_measurement_id: u16,
     sfn_initialisation_time: u64,
 ) -> Result<NrppaResponse, NrppaError> {
     let pdu = match &request.procedure {

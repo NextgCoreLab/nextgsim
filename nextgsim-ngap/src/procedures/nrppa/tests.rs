@@ -64,7 +64,7 @@ fn ecid_request_header_bytes() -> Vec<u8> {
 /// Carries the three mandatory IEs of TS 38.455 §9.1.2: `LMF-UE-Measurement-ID`,
 /// `ReportCharacteristics` (`onDemand`, so no `MeasurementPeriodicity` is
 /// required) and `MeasurementQuantities`.
-fn build_ecid_request(transaction_id: u16, lmf_ue_measurement_id: u8) -> nrppa::NRPPA_PDU {
+fn build_ecid_request(transaction_id: u16, lmf_ue_measurement_id: u16) -> nrppa::NRPPA_PDU {
     use nrppa::E_CIDMeasurementInitiationRequestProtocolIEs_EntryValue as V;
 
     // Each element of MeasurementQuantities is a ProtocolIE-Single-Container

@@ -95,15 +95,24 @@ pub(crate) fn encode_integer_common(
     extended: bool,
     aligned: bool,
 ) -> Result<(), PerCodecError> {
-    if extended {
+    if extended && !is_extensible {
         return Err(PerCodecError::new(
-            PerCodecErrorCause::EncodeNotSupported,
-            "Encode of extended integer not yet implemented",
+            PerCodecErrorCause::Generic,
+            "extension encoding requested for an INTEGER without an extension marker",
         ));
     }
 
     if is_extensible {
         data.encode_bool(extended);
+    }
+
+    // X.691 §12.1: a value outside the extension root is encoded, after the `1`
+    // bit, as an unconstrained whole number (§12.2.6). The root bounds do not
+    // apply to it.
+    if extended {
+        encode_unconstrained_whole_number_common(data, value, aligned)?;
+        data.dump_encode();
+        return Ok(());
     }
 
     match (lb, ub) {
