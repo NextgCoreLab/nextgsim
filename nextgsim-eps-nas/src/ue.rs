@@ -159,6 +159,13 @@ pub struct EpsNasUe {
     /// kept so a retransmitted AUTHENTICATION REQUEST is answered without
     /// the USIM (§5.4.2.3), and the T3416 deadline that bounds it.
     stored_auth: Option<StoredAuth>,
+    /// Whether the secure exchange of NAS messages is established on the
+    /// current NAS signalling connection (§4.4.5). Only a SECURITY MODE
+    /// CONTROL procedure on this connection sets it, and the connection's
+    /// release clears it; until then a current context integrity-protects
+    /// but does not cipher (§4.4.4.2), so an MME that no longer holds the
+    /// context can still read the message (§4.4.4.3 NOTE 3).
+    secure_exchange: bool,
 }
 
 /// RAND, RES and `K_ASME` held in the ME's volatile memory (§5.4.2.3).
@@ -194,6 +201,7 @@ impl EpsNasUe {
             attach_pti: None,
             bearer: None,
             stored_auth: None,
+            secure_exchange: false,
         }
     }
 
@@ -312,6 +320,7 @@ impl EpsNasUe {
             log::warn!("EMM: T3410 expired; attach aborted (§5.5.1.2.6 c)");
             self.t3410 = None;
             self.attach_failed(now, None);
+            self.secure_exchange = false;
             return NasOutput {
                 uplink: vec![],
                 release: true,
@@ -361,13 +370,22 @@ impl EpsNasUe {
         // and §5.4.2.3 deletes the stored RAND and RES on entering EMM-IDLE.
         self.pending = None;
         self.stored_auth = None;
+        // §4.4.5: ciphering lasts "until the NAS signalling connection is
+        // released"; the next connection needs its own SMC.
+        self.secure_exchange = false;
     }
 
     /// Wrap an uplink EMM message: protected with the current context when
-    /// one exists (§4.4.4.2), plain otherwise.
+    /// one exists (§4.4.4.2), plain otherwise; ciphered only once the secure
+    /// exchange is established on this connection (§4.4.5).
     fn send_emm(&mut self, plain: Vec<u8>) -> NasOutput {
+        let ht = if self.secure_exchange {
+            header_type::INTEGRITY_CIPHERED
+        } else {
+            header_type::INTEGRITY
+        };
         let pdu = match &mut self.ctx {
-            Some(c) => c.protect(&plain, header_type::INTEGRITY_CIPHERED),
+            Some(c) => c.protect(&plain, ht),
             None => plain,
         };
         NasOutput::send(pdu)
@@ -661,6 +679,8 @@ impl EpsNasUe {
         );
         self.ctx = Some(candidate);
         self.pending = None;
+        // §4.4.5: the secure exchange is established on this connection.
+        self.secure_exchange = true;
         NasOutput::send(complete)
     }
 

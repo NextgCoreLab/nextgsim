@@ -447,3 +447,52 @@ fn imei_check_digit_is_luhn() {
     // TS 23.003 Annex B example: IMEI 35-209900-176148-1.
     assert_eq!(imei_of("3520990017614800"), "352099001761481");
 }
+
+/// After a release, the next connection's messages are integrity protected
+/// with the kept context but not ciphered until that connection's SMC
+/// (TS 24.301 §4.4.5); the release-then-re-attach case of #238.
+#[test]
+fn a_new_connection_integrity_protects_but_does_not_cipher_until_its_smc() {
+    let (mut ue, mut old, _) = attach();
+    let now = Instant::now();
+    // The MME released the connection (e.g. after an ATTACH REJECT, nextgcore
+    // #473); the UE keeps its current EPS security context (§5.5.1.2.5).
+    ue.state = EmmState::Deregistered;
+    ue.on_released(now);
+
+    let req = ue.initial_message(now).expect("re-attach due");
+    assert_eq!(req[0], 0x17, "ATTACH REQUEST: header type 1");
+    let plain = old.unprotect(&req);
+    assert_eq!(&plain[..2], &[0x07, 0x41]);
+
+    // A fresh challenge on the new connection.
+    let mut mme = Mme::with_rand(0x22, [0x5A; 16]);
+    let out = ue.on_downlink(&mme.authentication_request(), now);
+    let resp = &out.uplink[0];
+    assert_eq!(
+        resp[0], 0x17,
+        "AUTHENTICATION RESPONSE before this connection's SMC: header type 1, not 2"
+    );
+    // Not ciphered: the NAS message is readable after the 6-octet header, and
+    // the MAC verifies under the kept context.
+    assert_eq!(&resp[6..9], &[0x07, 0x53, 8]);
+    assert_eq!(&resp[9..], &mme.xres);
+    let plain = old.unprotect(resp);
+    assert_eq!(&plain[..3], &[0x07, 0x53, 8]);
+
+    // This connection's SMC establishes the secure exchange: ciphered again.
+    let out = ue.on_downlink(&mme.security_mode_command([0xE0, 0xE0], false), now);
+    assert_eq!(
+        out.uplink[0][0], 0x47,
+        "SECURITY MODE COMPLETE: header type 4"
+    );
+    mme.unprotect(&out.uplink[0]);
+    let pti = ue.attach_pti.expect("the re-attach's PTI");
+    let out = ue.on_downlink(&mme.attach_accept(pti), now);
+    assert_eq!(
+        out.uplink[0][0], 0x27,
+        "ATTACH COMPLETE after the SMC: header type 2"
+    );
+    let complete = mme.unprotect(&out.uplink[0]);
+    assert_eq!(&complete[..2], &[0x07, 0x43]);
+}
