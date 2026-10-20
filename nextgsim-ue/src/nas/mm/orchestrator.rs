@@ -2630,19 +2630,78 @@ impl MmOrchestrator {
             return Vec::new();
         };
 
-        let mut req =
-            ServiceRequest::new(self.sec.nas_ksi(), IeServiceType::new(service_type), s_tmsi);
+        let ksi = self.sec.nas_ksi();
+        let mut req = ServiceRequest::new(ksi, IeServiceType::new(service_type), s_tmsi.clone());
         req.uplink_data_status = uplink_data_status;
 
         let mut plain = Vec::new();
         req.encode(&mut plain);
 
+        // TS 24.501 §5.6.1.2.1 / §4.4.6 b): a SERVICE REQUEST sent from
+        // 5GMM-IDLE is an initial NAS message. With a valid context it is sent
+        // integrity protected but NOT ciphered (§4.4.5), carrying the cleartext
+        // IEs only; any non-cleartext IE (Uplink data status, PDU session
+        // status, Allowed PDU session status) travels inside the NAS message
+        // container, whose value part is ciphered. Sending the whole message
+        // ciphered (security header type 2) hides the 5G-S-TMSI the AMF needs to
+        // find the UE's context, so the network can never answer it.
+        let mut cleartext_only = ServiceRequest::new(ksi, IeServiceType::new(service_type), s_tmsi);
+        let mut cleartext = Vec::new();
+        cleartext_only.encode(&mut cleartext);
+        let initial = self.state.is_idle();
+
         self.state
             .switch_mm_state(MmSubState::ServiceRequestInitiated);
         self.timers.start(TIMER_T3517, true);
         info!("Sending Service Request ({service_type:?}), T3517 started");
-        let pdu = self.protect_if_active(plain);
+        let pdu = if initial && self.sec.is_active() {
+            self.protect_initial_nas(plain, cleartext, |container| {
+                cleartext_only.nas_message_container = Some(container);
+                let mut out = Vec::new();
+                cleartext_only.encode(&mut out);
+                out
+            })
+        } else {
+            self.protect_if_active(plain)
+        };
         vec![MmOutput::SendNasPdu(pdu)]
+    }
+
+    /// Protect an initial NAS message sent from 5GMM-IDLE with a valid 5G NAS
+    /// security context (TS 24.501 §4.4.6 b), §4.4.5).
+    ///
+    /// `full` is the message with every IE; `cleartext` the same message with
+    /// the cleartext IEs only. When they are equal the message is sent as is
+    /// (§4.4.6 b) 3)); otherwise `full` is ciphered and handed to
+    /// `with_container` to be wrapped in the NAS message container of the
+    /// cleartext message (§4.4.6 b) 1)). Either way the result is integrity
+    /// protected but not ciphered: security header type 1. The container is
+    /// ciphered with the same uplink NAS COUNT the MAC is computed over
+    /// (TS 33.501 §6.4.6), so it is ciphered BEFORE the count advances.
+    fn protect_initial_nas(
+        &mut self,
+        full: Vec<u8>,
+        cleartext: Vec<u8>,
+        with_container: impl FnOnce(Vec<u8>) -> Vec<u8>,
+    ) -> Vec<u8> {
+        let outer = if full == cleartext {
+            full
+        } else {
+            let count = *self.sec.uplink_count();
+            let mut value = full;
+            if let Some(key) = self.sec.keys().knas_enc() {
+                nas_cipher(
+                    self.sec.ciphering_algorithm(),
+                    key,
+                    &count,
+                    NAS_BEARER,
+                    NasDirection::Uplink,
+                    &mut value,
+                );
+            }
+            with_container(value)
+        };
+        self.protect_uplink(outer, SecurityHeaderType::IntegrityProtected)
     }
 
     /// Derive the 5G-S-TMSI mobile identity from the stored 5G-GUTI
@@ -3732,6 +3791,45 @@ mod tests {
             }
         }
         panic!("no SendNasPdu in outputs: {outs:?}");
+    }
+
+    /// Opens an initial SERVICE REQUEST sent from 5GMM-IDLE (TS 24.501
+    /// §4.4.6 b)): asserts security header type 1 (integrity protected, NOT
+    /// ciphered) and a valid MAC, decodes the cleartext outer message, and
+    /// deciphers the NAS message container, if present, with the same uplink
+    /// COUNT the MAC was computed over.
+    fn open_initial_service_request(
+        orch: &MmOrchestrator,
+        pdu: &[u8],
+    ) -> (ServiceRequest, Option<ServiceRequest>) {
+        assert_eq!(pdu[0], 0x7E);
+        assert_eq!(pdu[1], 0x01, "an initial NAS message from 5GMM-IDLE is integrity protected, not ciphered");
+        let sec = orch.security_context();
+        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+        assert_eq!(pdu[6], count.sqn, "sequence number");
+        let mac = compute_nas_mac(
+            sec.integrity_algorithm(),
+            sec.keys().knas_int().unwrap(),
+            &count,
+            NasDirection::Uplink,
+            count.sqn,
+            &pdu[7..],
+        );
+        assert_eq!(&pdu[2..6], &mac, "MAC over the cleartext message");
+        let outer = ServiceRequest::decode(&mut &pdu[10..]).unwrap();
+        let inner = outer.nas_message_container.as_ref().map(|c| {
+            let mut v = c.clone();
+            nas_cipher(
+                sec.ciphering_algorithm(),
+                sec.keys().knas_enc().unwrap(),
+                &count,
+                NAS_BEARER,
+                NasDirection::Uplink,
+                &mut v,
+            );
+            ServiceRequest::decode(&mut &v[3..]).unwrap()
+        });
+        (outer, inner)
     }
 
     /// Drive a full successful registration + authentication + SMC sequence;
@@ -5023,6 +5121,51 @@ mod tests {
     // Service request / deregistration tests
     // ========================================================================
 
+    /// #252: a paged UE's SERVICE REQUEST from 5GMM-IDLE, byte for byte.
+    ///
+    /// Hand-derived from TS 24.501: security header type 1 (§4.4.5 -- integrity
+    /// protected, not ciphered, because it is an initial NAS message) around
+    /// the plain message
+    ///   7E          extended protocol discriminator (5GMM, 9.2)
+    ///   00          security header type 0 + spare half octet
+    ///   4C          SERVICE REQUEST (9.7)
+    ///   20          ngKSI 0 (native, bits 1-4) | service type 2 =
+    ///               "mobile terminated services" (bits 5-8, 9.11.3.50)
+    ///   00 07       5GS mobile identity length (LV-E, 9.11.3.4)
+    ///   F4          1111 | even | type 100 = 5G-S-TMSI
+    ///   00 40       AMF set ID (10 bits) + AMF pointer (6 bits) from the GUTI
+    ///   DE AD BE EF 5G-TMSI
+    /// with no NAS message container, since an MT request with no pending
+    /// uplink data has no non-cleartext IE (§4.4.6 b) 3)).
+    #[test]
+    fn a_paged_service_request_matches_hand_derived_bytes() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+
+        let outs = orch.start_service_request(ServiceType::MobileTerminatedServices, None);
+        let pdu = first_sent_pdu(&outs).to_vec();
+        open_initial_service_request(&orch, &pdu); // header type 1 + MAC
+        assert_eq!(
+            &pdu[7..],
+            &[0x7E, 0x00, 0x4C, 0x20, 0x00, 0x07, 0xF4, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    /// From 5GMM-CONNECTED a SERVICE REQUEST rides an existing NAS signalling
+    /// connection, so it is not an initial NAS message and is ciphered as
+    /// usual (TS 24.501 §4.4.5): only the idle case changed for #252.
+    #[test]
+    fn a_service_request_from_connected_mode_is_ciphered() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        assert!(orch.state().is_connected());
+        let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        assert_eq!(first_sent_pdu(&outs)[1], 0x02);
+    }
+
     #[test]
     fn test_service_request_uses_stored_tmsi() {
         let mut orch = establish_security_context();
@@ -5035,30 +5178,24 @@ mod tests {
         // 0x2000 (PSI 13) constant this path used to hardcode, nor with the
         // PSI-1 case the dedicated bitmap tests below cover.
         let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[3]));
-        let pdu = first_sent_pdu(&outs);
-        assert_eq!(pdu[1], 0x02, "service request must be protected");
+        let pdu = first_sent_pdu(&outs).to_vec();
         assert!(orch.timers().t3517.is_running());
         assert_eq!(
             orch.state().mm_substate(),
             MmSubState::ServiceRequestInitiated
         );
 
-        // Decipher and verify the 5G-S-TMSI is derived from the GUTI
-        let sec = orch.security_context();
-        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
-        let mut payload = pdu[7..].to_vec();
-        nas_cipher(
-            sec.ciphering_algorithm(),
-            sec.keys().knas_enc().unwrap(),
-            &count,
-            NAS_BEARER,
-            NasDirection::Uplink,
-            &mut payload,
-        );
-        let req = ServiceRequest::decode(&mut &payload[3..]).unwrap();
+        // TS 24.501 §4.4.6 b) 1): the 5G-S-TMSI is a cleartext IE, readable
+        // without the ciphering key, so the AMF can find the context; the
+        // Uplink data status is not, so it rides only in the ciphered container.
+        let (outer, inner) = open_initial_service_request(&orch, &pdu);
         // GUTI TMSI bytes were 0xDEADBEEF; the 5G-S-TMSI carries set/ptr + TMSI
-        assert_eq!(&req.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(req.uplink_data_status, Some(0x0008), "PSI 3 is bit 3");
+        assert_eq!(&outer.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(outer.uplink_data_status, None, "a non-cleartext IE must not be sent in the clear");
+        let inner = inner.expect("non-cleartext IEs travel in the NAS message container");
+        assert_eq!(&inner.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(inner.uplink_data_status, Some(0x0008), "PSI 3 is bit 3");
+        assert_eq!(inner.nas_message_container, None);
     }
 
     // ========================================================================
@@ -5868,20 +6005,11 @@ mod tests {
         assert!(orch.state().is_registered() && orch.state().is_idle());
 
         let outs = orch.start_service_request(ServiceType::MobileTerminatedServices, None);
-        let pdu = first_sent_pdu(&outs);
+        let pdu = first_sent_pdu(&outs).to_vec();
 
-        let sec = orch.security_context();
-        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
-        let mut payload = pdu[7..].to_vec();
-        nas_cipher(
-            sec.ciphering_algorithm(),
-            sec.keys().knas_enc().unwrap(),
-            &count,
-            NAS_BEARER,
-            NasDirection::Uplink,
-            &mut payload,
-        );
-        let req = ServiceRequest::decode(&mut &payload[3..]).unwrap();
+        // No non-cleartext IE to send, so no container (§4.4.6 b) 3)).
+        let (req, inner) = open_initial_service_request(&orch, &pdu);
+        assert!(inner.is_none(), "an MT request with nothing non-cleartext carries no container");
 
         assert_eq!(
             req.service_type.service_type,
@@ -5936,20 +6064,10 @@ mod tests {
         orch.state_mut().switch_cm_state(CmState::Idle);
 
         let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
-        let pdu = first_sent_pdu(&outs);
+        let pdu = first_sent_pdu(&outs).to_vec();
 
-        let sec = orch.security_context();
-        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
-        let mut payload = pdu[7..].to_vec();
-        nas_cipher(
-            sec.ciphering_algorithm(),
-            sec.keys().knas_enc().unwrap(),
-            &count,
-            NAS_BEARER,
-            NasDirection::Uplink,
-            &mut payload,
-        );
-        let req = ServiceRequest::decode(&mut &payload[3..]).unwrap();
+        let (_outer, inner) = open_initial_service_request(&orch, &pdu);
+        let req = inner.expect("the Uplink data status rides in the NAS message container");
         assert_eq!(
             req.uplink_data_status,
             Some(0x0002),
