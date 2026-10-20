@@ -166,6 +166,13 @@ pub struct NgapUeContext {
     /// SecurityModeCommand and RRCReconfiguration. Independent per UE — never a
     /// gNB-global counter.
     pub transactions: RrcTransactionAllocator,
+    /// The UE radio capability (an encoded TS 38.331
+    /// `UERadioAccessCapabilityInformation`), however the gNB obtained it: from the
+    /// AMF, from the RACS cache, by ID mapping, or from the UE.
+    pub ue_radio_capability: Option<Vec<u8>>,
+    /// The UE Radio Capability ID the AMF gave for this UE (RACS), kept so a
+    /// mapping response and a later handover can be matched to it.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
 }
 
 impl NgapUeContext {
@@ -184,6 +191,8 @@ impl NgapUeContext {
             ue_ambr: None,
             ue_security_capabilities: None,
             transactions: RrcTransactionAllocator::new(),
+            ue_radio_capability: None,
+            ue_radio_capability_id: None,
         }
     }
 

@@ -459,6 +459,8 @@ pub struct PathSwitchRequestAcknowledgeParams {
     pub next_hop_nh: [u8; 32],
     /// Switched PDU sessions
     pub switched_sessions: Vec<SwitchedSessionItem>,
+    /// UE Radio Capability ID (optional, TS 38.413 §9.2.3.9 / §9.3.1.142) -- RACS.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
 }
 
 /// Parsed Path Switch Request Acknowledge data
@@ -474,6 +476,10 @@ pub struct PathSwitchRequestAcknowledgeData {
     pub next_hop_nh: [u8; 32],
     /// Switched PDU sessions
     pub switched_sessions: Vec<SwitchedSessionItem>,
+    /// UE Radio Capability ID (optional) -- RACS. TS 23.502 §4.9.1.2.2 step 7: when
+    /// present and the target holds no capability set for it, the target NG-RAN node
+    /// requests the mapping from the AMF.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
 }
 
 fn encode_path_switch_ack_transfer(item: &SwitchedSessionItem) -> Result<Vec<u8>, PathSwitchError> {
@@ -570,6 +576,18 @@ pub fn build_path_switch_request_acknowledge(
         });
     }
 
+    // IE: UERadioCapabilityID (optional) -- after the switched list, in object-set
+    // order (none of the IEs between them is built here).
+    if let Some(id) = &params.ue_radio_capability_id {
+        protocol_ies.push(PathSwitchRequestAcknowledgeProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_RADIO_CAPABILITY_ID),
+            criticality: Criticality(Criticality::REJECT),
+            value: PathSwitchRequestAcknowledgeProtocolIEs_EntryValue::Id_UERadioCapabilityID(
+                UERadioCapabilityID(id.clone()),
+            ),
+        });
+    }
+
     Ok(NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
         procedure_code: ProcedureCode(ID_PATH_SWITCH_REQUEST),
         criticality: Criticality(Criticality::REJECT),
@@ -606,6 +624,7 @@ pub fn parse_path_switch_request_acknowledge(
     let mut ran_ue_ngap_id = None;
     let mut security_context: Option<(u8, [u8; 32])> = None;
     let mut switched_sessions = Vec::new();
+    let mut ue_radio_capability_id = None;
 
     for ie in &ack.protocol_i_es.0 {
         match &ie.value {
@@ -637,6 +656,9 @@ pub fn parse_path_switch_request_acknowledge(
                     )?);
                 }
             }
+            PathSwitchRequestAcknowledgeProtocolIEs_EntryValue::Id_UERadioCapabilityID(id) => {
+                ue_radio_capability_id = Some(id.0.clone());
+            }
             _ => {}
         }
     }
@@ -652,6 +674,7 @@ pub fn parse_path_switch_request_acknowledge(
         next_hop_chaining_count,
         next_hop_nh,
         switched_sessions,
+        ue_radio_capability_id,
     })
 }
 
@@ -844,6 +867,7 @@ mod tests {
     #[test]
     fn test_path_switch_request_acknowledge_roundtrip() {
         let params = PathSwitchRequestAcknowledgeParams {
+            ue_radio_capability_id: None,
             amf_ue_ngap_id: 4242,
             ran_ue_ngap_id: 7,
             next_hop_chaining_count: 2,
@@ -889,6 +913,7 @@ mod tests {
             max_integrity_protected_data_rate: None,
         };
         let params = PathSwitchRequestAcknowledgeParams {
+            ue_radio_capability_id: None,
             amf_ue_ngap_id: 1,
             ran_ue_ngap_id: 2,
             next_hop_chaining_count: 3,

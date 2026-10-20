@@ -46,8 +46,10 @@ use nextgsim_rrc::procedures::rrc_setup::{
 use nextgsim_rrc::procedures::scell_config::{encode_scell_config, ScellConfig};
 use nextgsim_rrc::procedures::sidelink_ue_information::{SidelinkUeInformationParams, SlUeType};
 use nextgsim_rrc::procedures::ue_capability::{
-    encode_ue_capability_enquiry, parse_nr_capability_bands, parse_nr_capability_redcap, RatType,
-    UeCapabilityEnquiryParams, UeCapabilityInformationData,
+    decode_ue_radio_access_capability_information, encode_ue_capability_enquiry,
+    encode_ue_radio_access_capability_information, parse_nr_capability_bands,
+    parse_nr_capability_redcap, RatType, UeCapabilityEnquiryParams, UeCapabilityInformationData,
+    UeCapabilityRatContainer,
 };
 
 // The `0x06` UE-capability envelope and the `0x0E` secondary-cell envelope used to
@@ -1245,8 +1247,11 @@ impl RrcTask {
             )
             .await;
 
-            // Enquire UE radio access capabilities (TS 38.331 §5.6.1)
-            self.send_ue_capability_enquiry(ue_id).await;
+            // UE capability transfer is no longer started here. TS 38.331 §5.6.1.1:
+            // "the network should retrieve UE capabilities only after AS security
+            // activation", and with RACS the AMF may already hold the capability (or
+            // an ID for it). The NGAP task asks for an enquiry at Initial Context
+            // Setup when the request carried neither (TS 38.413 §8.3.1.2).
         }
     }
 
@@ -1477,7 +1482,40 @@ impl RrcTask {
             }
         }
 
-        for container in &information.containers {
+        self.apply_ue_capability_containers(ue_id, &information.containers)
+            .await;
+
+        if information.containers.is_empty() {
+            info!("UE[{}] reported no radio access capabilities", ue_id);
+        }
+
+        // TS 38.413 §8.14.1: the capability the UE reported goes to the AMF in a UE
+        // RADIO CAPABILITY INFO INDICATION, carried as a TS 38.331
+        // `UERadioAccessCapabilityInformation` (§9.3.1.74).
+        match encode_ue_radio_access_capability_information(&information.containers) {
+            Ok(ue_radio_capability) => {
+                let _ = self
+                    .task_base
+                    .ngap_tx
+                    .send(NgapMessage::UeRadioCapabilityInformation {
+                        ue_id,
+                        ue_radio_capability,
+                    })
+                    .await;
+            }
+            Err(e) => warn!("UE[{ue_id}]: cannot encode UERadioAccessCapabilityInformation: {e}"),
+        }
+    }
+
+    /// Apply UE capability containers, however they reached the gNB: from the UE
+    /// (`UECapabilityInformation`) or from the core network (UE Radio Capability IE,
+    /// or a RACS-resolved UE Radio Capability ID).
+    async fn apply_ue_capability_containers(
+        &mut self,
+        ue_id: i32,
+        containers: &[UeCapabilityRatContainer],
+    ) {
+        for container in containers {
             if container.rat_type == RatType::Nr {
                 match parse_nr_capability_bands(&container.container) {
                     Ok(bands) => {
@@ -1520,9 +1558,24 @@ impl RrcTask {
                 }
             }
         }
+    }
 
-        if information.containers.is_empty() {
-            info!("UE[{}] reported no radio access capabilities", ue_id);
+    /// A UE radio capability from the core network (TS 38.413 §9.3.1.74), already
+    /// in `UERadioAccessCapabilityInformation` form: decode and apply it.
+    async fn apply_core_network_ue_radio_capability(&mut self, ue_id: i32, bytes: &[u8]) {
+        match decode_ue_radio_access_capability_information(bytes) {
+            Ok(containers) => {
+                info!(
+                    "UE[{}] radio capability from the core network: {} container(s)",
+                    ue_id,
+                    containers.len()
+                );
+                self.apply_ue_capability_containers(ue_id, &containers)
+                    .await;
+            }
+            Err(e) => {
+                warn!("UE[{ue_id}]: undecodable UE Radio Capability from the core network: {e}")
+            }
         }
     }
 
@@ -2559,6 +2612,19 @@ impl Task for RrcTask {
                             }
                             RrcMessage::NasDelivery { ue_id, pdu } => {
                                 self.handle_nas_delivery(ue_id, pdu).await;
+                            }
+                            RrcMessage::UeCapabilityEnquiry { ue_id } => {
+                                self.send_ue_capability_enquiry(ue_id).await;
+                            }
+                            RrcMessage::UeRadioCapability {
+                                ue_id,
+                                ue_radio_capability,
+                            } => {
+                                self.apply_core_network_ue_radio_capability(
+                                    ue_id,
+                                    &ue_radio_capability,
+                                )
+                                .await;
                             }
                             RrcMessage::SecurityModeCommand { ue_id, pdu } => {
                                 // TS 38.331 §5.3.4: deliver the SecurityModeCommand

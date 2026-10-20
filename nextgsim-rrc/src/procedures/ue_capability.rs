@@ -338,6 +338,80 @@ pub fn decode_ue_capability_information(
 }
 
 // ============================================================================
+// UERadioAccessCapabilityInformation (TS 38.331 §6.2.2)
+// ============================================================================
+
+/// Encode capability containers as a `UERadioAccessCapabilityInformation`
+/// (TS 38.331 §6.2.2), the format the UE Radio Capability IE carries over NG
+/// (TS 38.413 §9.3.1.74). Its `ue-RadioAccessCapabilityInfo` is an OCTET STRING
+/// CONTAINING the UPER-encoded `UE-CapabilityRAT-ContainerList`.
+pub fn encode_ue_radio_access_capability_information(
+    containers: &[UeCapabilityRatContainer],
+) -> Result<Vec<u8>, UeCapabilityError> {
+    if containers.len() > 8 {
+        return Err(UeCapabilityError::InvalidFieldValue(
+            "At most 8 capability containers allowed".to_string(),
+        ));
+    }
+    let list = UE_CapabilityRAT_ContainerList(
+        containers
+            .iter()
+            .map(|c| UE_CapabilityRAT_Container {
+                rat_type: c.rat_type.to_asn(),
+                ue_capability_rat_container: UE_CapabilityRAT_ContainerUe_CapabilityRAT_Container(
+                    c.container.clone(),
+                ),
+            })
+            .collect(),
+    );
+    let info = UERadioAccessCapabilityInformation {
+        critical_extensions: UERadioAccessCapabilityInformationCriticalExtensions::C1(
+            UERadioAccessCapabilityInformationCriticalExtensions_c1::UeRadioAccessCapabilityInformation(
+                UERadioAccessCapabilityInformation_IEs {
+                    ue_radio_access_capability_info:
+                        UERadioAccessCapabilityInformation_IEsUe_RadioAccessCapabilityInfo(
+                            encode_rrc(&list)?,
+                        ),
+                    non_critical_extension: None,
+                },
+            ),
+        ),
+    };
+    Ok(encode_rrc(&info)?)
+}
+
+/// Decode a `UERadioAccessCapabilityInformation` (TS 38.331 §6.2.2) into its
+/// capability containers.
+pub fn decode_ue_radio_access_capability_information(
+    bytes: &[u8],
+) -> Result<Vec<UeCapabilityRatContainer>, UeCapabilityError> {
+    let info: UERadioAccessCapabilityInformation = decode_rrc(bytes)?;
+    let ies = match info.critical_extensions {
+        UERadioAccessCapabilityInformationCriticalExtensions::C1(
+            UERadioAccessCapabilityInformationCriticalExtensions_c1::UeRadioAccessCapabilityInformation(
+                ies,
+            ),
+        ) => ies,
+        _ => {
+            return Err(UeCapabilityError::InvalidMessageType {
+                expected: "ueRadioAccessCapabilityInformation".to_string(),
+                actual: "spare or criticalExtensionsFuture".to_string(),
+            })
+        }
+    };
+    let list: UE_CapabilityRAT_ContainerList = decode_rrc(&ies.ue_radio_access_capability_info.0)?;
+    list.0
+        .iter()
+        .map(|c| {
+            Ok(UeCapabilityRatContainer {
+                rat_type: RatType::from_asn(&c.rat_type)?,
+                container: c.ue_capability_rat_container.0.clone(),
+            })
+        })
+        .collect()
+}
+
+// ============================================================================
 // Minimal UE-NR-Capability container
 // ============================================================================
 
@@ -669,6 +743,30 @@ mod tests {
             decoded.containers[0].container,
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
+    }
+
+    /// UPER (X.691) by hand for one NR container `[0xAB]`.
+    ///
+    /// Contained `UE-CapabilityRAT-ContainerList` (SIZE 0..8): count 1 in 4 bits
+    /// `0001`; RAT-Type (4 root values, extensible): ext bit `0` + `00` (nr);
+    /// OCTET STRING, unconstrained length `00000001`, then `10101011`; 23 bits padded
+    /// to `10 03 56`.
+    ///
+    /// Outer: criticalExtensions CHOICE (2) `0`, c1 CHOICE (8) `000`, the IEs'
+    /// one optional-bitmap bit `0`, the OCTET STRING length `00000011`, then the three
+    /// contained octets; 37 bits padded to `00 18 80 1A B0`.
+    #[test]
+    fn a_radio_access_capability_information_matches_hand_derived_bits() {
+        let bytes = encode_ue_radio_access_capability_information(&[UeCapabilityRatContainer {
+            rat_type: RatType::Nr,
+            container: vec![0xAB],
+        }])
+        .unwrap();
+        assert_eq!(bytes, vec![0x00, 0x18, 0x80, 0x1A, 0xB0]);
+        let decoded = decode_ue_radio_access_capability_information(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].rat_type, RatType::Nr);
+        assert_eq!(decoded[0].container, vec![0xAB]);
     }
 
     #[test]

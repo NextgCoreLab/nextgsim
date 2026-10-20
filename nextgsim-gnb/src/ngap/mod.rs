@@ -26,6 +26,7 @@
 //! #188 as unreachable.
 
 mod amf_context;
+pub mod racs;
 mod task;
 pub mod timers;
 mod ue_context;

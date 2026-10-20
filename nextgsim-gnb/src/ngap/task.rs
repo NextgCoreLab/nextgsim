@@ -220,6 +220,12 @@ pub struct NgapTask {
     /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
     /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
     guard_timers: GuardTimers,
+    /// RACS: UE radio capability sets learned by UE Radio Capability ID
+    /// (TS 23.501 §5.4.4.1a). Bounded LRU; see `super::racs`.
+    racs_cache: super::racs::RacsCache,
+    /// RACS: IDs with a UE RADIO CAPABILITY ID MAPPING REQUEST outstanding, and the
+    /// UEs waiting on each. One request per ID however many UEs present it.
+    racs_pending: HashMap<Vec<u8>, Vec<i32>>,
     /// SCTP client IDs of TNL associations this node opened because an AMF
     /// Configuration Update asked it to (TS 38.413 §9.2.6.5, issue #41).
     ///
@@ -264,6 +270,8 @@ impl NgapTask {
             // UE-Measurement-ID is INTEGER (1..256, ...), so ids start at 1.
             next_nrppa_measurement_id: 1,
             guard_timers: GuardTimers::new(),
+            racs_cache: super::racs::RacsCache::default(),
+            racs_pending: HashMap::new(),
             tnla_client_ids: HashMap::new(),
             next_dynamic_tnla_id: DYNAMIC_TNLA_CLIENT_ID_BASE,
         }
@@ -514,6 +522,8 @@ impl NgapTask {
     /// `ue-suspend` (issue #199).
     async fn delete_ue_context(&mut self, ue_id: i32) {
         if let Some(ctx) = self.ue_contexts.remove(&ue_id) {
+            // A released UE no longer waits on any RACS mapping.
+            self.forget_racs_waiter(ue_id);
             // Release the stream back to the AMF
             if let Some(amf_ctx) = self.amf_contexts.get_mut(&ctx.amf_ctx_id) {
                 amf_ctx.release_stream(ctx.stream_id);
@@ -1120,6 +1130,19 @@ impl NgapTask {
                 );
             }
         }
+
+        // TS 38.413 §8.3.1.2 / TS 23.501 §5.4.4.1a: take the UE radio capability
+        // from the request, or resolve its UE Radio Capability ID (RACS), or -- when
+        // the request carried neither -- retrieve it from the UE now that AS security
+        // is active (TS 38.331 §5.6.1.1).
+        self.resolve_ue_radio_capability(
+            amf_id,
+            ue_id,
+            ics_req.ue_radio_capability.clone(),
+            ics_req.ue_radio_capability_id.clone(),
+            true,
+        )
+        .await;
 
         // Transition to Active state (security context established)
         if let Some(ctx) = self.ue_contexts.values_mut().find(|ctx| ctx.ue_id == ue_id) {
@@ -2992,6 +3015,172 @@ impl NgapTask {
     }
 
     // ========================================================================
+    // UE radio capability and RACS (TS 38.413 §8.14, TS 23.501 §5.4.4.1a)
+    // ========================================================================
+
+    /// Settle where this UE's radio capability comes from.
+    ///
+    /// * `capability` given (the UE Radio Capability IE): use it, and if an ID came
+    ///   with it, remember the pair in the RACS cache.
+    /// * only `id` given: a cache hit is used at once; a miss starts UE Radio
+    ///   Capability ID Mapping toward `amf_id` (TS 38.413 §8.14.3), one request per
+    ///   ID however many UEs wait on it.
+    /// * neither: when `enquire_if_absent` (the Initial Context Setup case,
+    ///   §8.3.1.2) and the gNB holds no capability for the UE, ask the UE.
+    async fn resolve_ue_radio_capability(
+        &mut self,
+        amf_id: i32,
+        ue_id: i32,
+        capability: Option<Vec<u8>>,
+        id: Option<Vec<u8>>,
+        enquire_if_absent: bool,
+    ) {
+        let plmn = self.task_base.config.plmn.encode();
+        let Some(ctx) = self.ue_contexts.get_mut(&ue_id) else {
+            return;
+        };
+        if id.is_some() {
+            ctx.ue_radio_capability_id = id.clone();
+        }
+        let already_known = ctx.ue_radio_capability.is_some();
+
+        if let Some(cap) = capability {
+            if let Some(id) = id {
+                self.racs_cache.insert((plmn, id), cap.clone());
+            }
+            self.apply_ue_radio_capability(ue_id, cap).await;
+            return;
+        }
+
+        if let Some(id) = id {
+            if already_known {
+                return;
+            }
+            if let Some(cap) = self.racs_cache.get(&(plmn, id.clone())) {
+                info!("UE[{ue_id}]: UE Radio Capability ID resolved from the RACS cache");
+                self.apply_ue_radio_capability(ue_id, cap).await;
+                return;
+            }
+            let first = !self.racs_pending.contains_key(&id);
+            let waiters = self.racs_pending.entry(id.clone()).or_default();
+            if !waiters.contains(&ue_id) {
+                waiters.push(ue_id);
+            }
+            self.guard_timers.start(
+                Instant::now(),
+                Duration::from_secs(super::racs::RACS_MAPPING_TIMEOUT_SECS),
+                GuardTimer::RacsMapping { ue_id },
+            );
+            if first {
+                match nextgsim_ngap::procedures::ue_radio_capability::encode_ue_radio_capability_id_mapping_request(&id) {
+                    Ok(bytes) => {
+                        info!(
+                            "UE[{ue_id}]: UE Radio Capability ID not cached; sending UE RADIO \
+                             CAPABILITY ID MAPPING REQUEST to AMF[{amf_id}] (TS 38.413 §8.14.3)"
+                        );
+                        // Non-UE-associated signalling (§8.14.3.1): stream 0.
+                        self.send_ngap_non_ue(amf_id, 0, bytes).await;
+                    }
+                    Err(e) => error!("Failed to encode UE Radio Capability ID Mapping Request: {e}"),
+                }
+            }
+            return;
+        }
+
+        if enquire_if_absent && !already_known {
+            let _ = self
+                .task_base
+                .rrc_tx
+                .send(RrcMessage::UeCapabilityEnquiry { ue_id })
+                .await;
+        }
+    }
+
+    /// Store `capability` on the UE and hand it to RRC, which applies it exactly as
+    /// it would a `UECapabilityInformation` from the UE.
+    async fn apply_ue_radio_capability(&mut self, ue_id: i32, capability: Vec<u8>) {
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            ctx.ue_radio_capability = Some(capability.clone());
+        }
+        let _ = self
+            .task_base
+            .rrc_tx
+            .send(RrcMessage::UeRadioCapability {
+                ue_id,
+                ue_radio_capability: capability,
+            })
+            .await;
+    }
+
+    /// A UE RADIO CAPABILITY ID MAPPING RESPONSE (TS 38.413 §8.14.3.2): cache the
+    /// mapping and give it to every UE waiting on that ID.
+    async fn handle_ue_radio_capability_id_mapping_response(
+        &mut self,
+        mapping: nextgsim_ngap::procedures::ue_radio_capability::UeRadioCapabilityIdMappingResponseData,
+    ) {
+        let plmn = self.task_base.config.plmn.encode();
+        self.racs_cache.insert(
+            (plmn, mapping.ue_radio_capability_id.clone()),
+            mapping.ue_radio_capability.clone(),
+        );
+        let waiters = self
+            .racs_pending
+            .remove(&mapping.ue_radio_capability_id)
+            .unwrap_or_default();
+        info!(
+            "UE RADIO CAPABILITY ID MAPPING RESPONSE: cached, {} UE(s) waiting",
+            waiters.len()
+        );
+        for ue_id in waiters {
+            self.guard_timers.cancel(GuardTimer::RacsMapping { ue_id });
+            let needs = self
+                .ue_contexts
+                .get(&ue_id)
+                .is_some_and(|c| c.ue_radio_capability.is_none());
+            if needs {
+                self.apply_ue_radio_capability(ue_id, mapping.ue_radio_capability.clone())
+                    .await;
+            }
+        }
+    }
+
+    /// Drop `ue_id` from every outstanding RACS mapping and cancel its timer.
+    fn forget_racs_waiter(&mut self, ue_id: i32) {
+        self.guard_timers.cancel(GuardTimer::RacsMapping { ue_id });
+        self.racs_pending.retain(|_, waiters| {
+            waiters.retain(|w| *w != ue_id);
+            !waiters.is_empty()
+        });
+    }
+
+    /// The UE answered a capability enquiry: store the capability and report it to
+    /// the AMF in a UE RADIO CAPABILITY INFO INDICATION (TS 38.413 §8.14.1).
+    async fn report_ue_radio_capability(&mut self, ue_id: i32, capability: Vec<u8>) {
+        let Some(ctx) = self.ue_contexts.get_mut(&ue_id) else {
+            return;
+        };
+        ctx.ue_radio_capability = Some(capability.clone());
+        let Some(amf_ue_ngap_id) = ctx.amf_ue_ngap_id else {
+            debug!("UE[{ue_id}]: capability stored; no AMF UE NGAP ID yet, nothing to report");
+            return;
+        };
+        let (amf_id, stream, ran_ue_ngap_id) = (ctx.amf_ctx_id, ctx.stream_id, ctx.ran_ue_ngap_id);
+        let data =
+            nextgsim_ngap::procedures::ue_radio_capability::UeRadioCapabilityInfoIndicationData {
+                amf_ue_ngap_id: amf_ue_ngap_id as u64,
+                ran_ue_ngap_id: ran_ue_ngap_id as u32,
+                ue_radio_capability: capability,
+            };
+        match nextgsim_ngap::procedures::ue_radio_capability::encode_ue_radio_capability_info_indication(&data) {
+            Ok(bytes) => {
+                info!("UE[{ue_id}]: sending UE RADIO CAPABILITY INFO INDICATION (TS 38.413 §8.14.1)");
+                self.send_ngap_ue_associated(amf_id, stream, bytes).await;
+            }
+            Err(e) => error!("Failed to encode UE Radio Capability Info Indication: {e}"),
+        }
+    }
+
+    // ========================================================================
     // NGAP guard timers (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3)
     // ========================================================================
 
@@ -3025,6 +3214,30 @@ impl NgapTask {
                          preparation, UE stays on the source cell"
                     );
                     self.send_handover_cancel(ue_id).await;
+                }
+                GuardTimer::RacsMapping { ue_id } => {
+                    // TS 38.413 §8.14.3 has no unsuccessful outcome, so an AMF that
+                    // cannot (or does not) map the ID simply never answers. Stop
+                    // waiting and, as an implementation choice, retrieve the
+                    // capability from the UE instead (TS 38.331 §5.6.1), which is
+                    // always available to the network once AS security is active.
+                    self.forget_racs_waiter(ue_id);
+                    let has_capability = self
+                        .ue_contexts
+                        .get(&ue_id)
+                        .is_some_and(|c| c.ue_radio_capability.is_some());
+                    if self.ue_contexts.contains_key(&ue_id) && !has_capability {
+                        warn!(
+                            "UE[{ue_id}]: no UE RADIO CAPABILITY ID MAPPING RESPONSE \
+                             within {}s; retrieving the capability from the UE",
+                            super::racs::RACS_MAPPING_TIMEOUT_SECS
+                        );
+                        let _ = self
+                            .task_base
+                            .rrc_tx
+                            .send(RrcMessage::UeCapabilityEnquiry { ue_id })
+                            .await;
+                    }
                 }
                 GuardTimer::NgSetupRetry { amf_id } => {
                     // TS 38.413 §8.7.1.3: the Time to Wait has elapsed, so NG Setup may
@@ -3225,6 +3438,13 @@ impl NgapTask {
                         "Received RAN Configuration Update Failure from AMF[{}]: cause={:?}, time_to_wait={:?}",
                         client_id, fail.cause, fail.time_to_wait
                     );
+                } else if let Ok(mapping) =
+                    nextgsim_ngap::procedures::ue_radio_capability::decode_ue_radio_capability_id_mapping_response(
+                        pdu_bytes,
+                    )
+                {
+                    self.handle_ue_radio_capability_id_mapping_response(mapping)
+                        .await;
                 } else if let Ok(err_ind) = decode_error_indication(pdu_bytes) {
                     // TS 38.413 §8.7.5: a received Error Indication is processed
                     // locally and MUST NOT be answered with another Error
@@ -3858,6 +4078,20 @@ impl NgapTask {
         // hand `install_drb_security` the source's keys, and every PDCP MAC on this
         // cell would fail with nothing to say why.
         self.adopt_handover_security_context(ue_id, ho_req.security_context);
+
+        // TS 23.502 §4.9.1.3.2 step 9 (RACS): a UE Radio Capability ID in the request
+        // is resolved from the cache, or by UE Radio Capability ID Mapping on a miss.
+        // The Source to Target container is relayed opaquely and its capabilities
+        // are not read, so the ID is the only capability source here; the UE is not
+        // asked (the handover proceeds either way).
+        self.resolve_ue_radio_capability(
+            client_id,
+            ue_id,
+            None,
+            ho_req.ue_radio_capability_id.clone(),
+            false,
+        )
+        .await;
 
         // Admit the requested sessions -- each one allocating a real DL F-TEID, a GTP-U
         // tunnel and a DRB through the SAME path a PDU Session Resource Setup uses
@@ -4532,6 +4766,25 @@ impl NgapTask {
         // Adopt the AMF-assigned ID (it can change across the path switch)
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
             ctx.amf_ue_ngap_id = Some(ack.amf_ue_ngap_id as i64);
+        }
+
+        // TS 23.502 §4.9.1.2.2 step 7 (RACS): with a UE Radio Capability ID in the
+        // acknowledge and no capability set held for it, the target NG-RAN node
+        // requests the mapping from the AMF.
+        if ack.ue_radio_capability_id.is_some() {
+            let amf_id = self
+                .ue_contexts
+                .get(&ue_id)
+                .map(|c| c.amf_ctx_id)
+                .unwrap_or(_client_id);
+            self.resolve_ue_radio_capability(
+                amf_id,
+                ue_id,
+                None,
+                ack.ue_radio_capability_id.clone(),
+                false,
+            )
+            .await;
         }
         // Republish to the CLI registry (issue #199). Not merely additive here: the
         // AMF UE NGAP ID can CHANGE across a path switch, so an entry left at the
@@ -5503,6 +5756,13 @@ impl Task for NgapTask {
                         for id in targets {
                             self.send_ran_configuration_update(id).await;
                         }
+                    }
+                    NgapMessage::UeRadioCapabilityInformation {
+                        ue_id,
+                        ue_radio_capability,
+                    } => {
+                        self.report_ue_radio_capability(ue_id, ue_radio_capability)
+                            .await;
                     }
                     NgapMessage::PduSessionResourceNotify {
                         ue_id,
@@ -7436,6 +7696,7 @@ mod tests {
                 ran_ue_ngap_id,
                 next_hop_chaining_count: 4,
                 next_hop_nh: nh,
+                ue_radio_capability_id: None,
                 switched_sessions: vec![SwitchedSessionItem {
                     pdu_session_id: 1,
                     ul_tunnel: None,
@@ -7923,6 +8184,7 @@ mod tests {
             1,
             8,
             PathSwitchRequestAcknowledgeData {
+                ue_radio_capability_id: None,
                 amf_ue_ngap_id: 4242,
                 ran_ue_ngap_id,
                 next_hop_chaining_count: 1,
@@ -10248,5 +10510,263 @@ mod tests {
             })
             .expect("a UE Context Release Request");
         assert_eq!(req.pdu_session_ids, vec![5, 6]);
+    }
+
+    // ========================================================================
+    // RACS (TS 23.501 §5.4.4.1a, TS 38.413 §8.14) -- issue #120
+    // ========================================================================
+
+    use nextgsim_ngap::procedures::initial_context_setup::{
+        AllowedSnssaiValue, GuamiValue, InitialContextSetupRequestData,
+    };
+    use nextgsim_ngap::procedures::ue_radio_capability::{
+        decode_ue_radio_capability_id_mapping_request, decode_ue_radio_capability_info_indication,
+        encode_ue_radio_capability_id_mapping_response, UeRadioCapabilityIdMappingResponseData,
+    };
+
+    fn racs_ics(
+        ran_ue_ngap_id: u32,
+        capability: Option<Vec<u8>>,
+        id: Option<Vec<u8>>,
+    ) -> InitialContextSetupRequestData {
+        InitialContextSetupRequestData {
+            amf_ue_ngap_id: 7777,
+            ran_ue_ngap_id,
+            old_amf: None,
+            ue_aggregate_max_bit_rate: None,
+            guami: GuamiValue {
+                plmn_identity: [0x09, 0xF1, 0x07],
+                amf_region_id: 2,
+                amf_set_id: 1,
+                amf_pointer: 0,
+            },
+            allowed_nssai: vec![AllowedSnssaiValue { sst: 1, sd: None }],
+            ue_security_capabilities: UeSecurityCapabilitiesValue {
+                nr_encryption_algorithms: 0xE000,
+                nr_integrity_algorithms: 0xE000,
+                eutra_encryption_algorithms: None,
+                eutra_integrity_algorithms: None,
+            },
+            security_key: [0x11; 32],
+            nas_pdu: None,
+            pdu_session_setup_list: Vec::new(),
+            ue_radio_capability: capability,
+            ue_radio_capability_id: id,
+        }
+    }
+
+    /// What reached RRC about capabilities: `Some(None)` for an enquiry,
+    /// `Some(Some(bytes))` for a capability handed over, per message in order.
+    fn drain_rrc_capability(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RrcMessage>>,
+    ) -> Vec<(i32, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                TaskMessage::Message(RrcMessage::UeCapabilityEnquiry { ue_id }) => {
+                    out.push((ue_id, None))
+                }
+                TaskMessage::Message(RrcMessage::UeRadioCapability {
+                    ue_id,
+                    ue_radio_capability,
+                }) => out.push((ue_id, Some(ue_radio_capability))),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn mapping_requests(pdus: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        pdus.iter()
+            .filter_map(|p| decode_ue_radio_capability_id_mapping_request(p).ok())
+            .collect()
+    }
+
+    async fn ran_id(task: &NgapTask, ue_id: i32) -> u32 {
+        task.find_ue_context(ue_id).expect("ue").ran_ue_ngap_id as u32
+    }
+
+    /// TS 38.413 §8.3.1.2 + §8.14.3: an ICS carrying only an ID the gNB has never
+    /// seen makes it ask the AMF -- once, however many UEs present that ID -- and NOT
+    /// ask the UE.
+    #[tokio::test]
+    async fn an_unknown_id_is_mapped_by_the_amf_once_for_all_ues_presenting_it() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        task.create_ue_context(2, 1).await.expect("ue 2");
+        let id = vec![0x10, 0x20, 0x30];
+        for ue in [1, 2] {
+            let ran = ran_id(&task, ue).await;
+            task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(id.clone())))
+                .await;
+        }
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(
+            mapping_requests(&sent),
+            vec![id.clone()],
+            "exactly one mapping request"
+        );
+        assert!(
+            drain_rrc_capability(&mut rrc_rx).is_empty(),
+            "no UE capability enquiry and nothing applied while the mapping is outstanding"
+        );
+        assert_eq!(task.racs_pending.get(&id).map(Vec::len), Some(2));
+    }
+
+    /// The mapping response fills the cache and resolves every waiting UE; a later
+    /// UE with the same ID is resolved from the cache with no new request.
+    #[tokio::test]
+    async fn the_mapping_response_resolves_waiters_and_later_ues_hit_the_cache() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        task.create_ue_context(2, 1).await.expect("ue 2");
+        let id = vec![0x42];
+        let cap = vec![0x00, 0x18, 0x80, 0x1A, 0xB0];
+        for ue in [1, 2] {
+            let ran = ran_id(&task, ue).await;
+            task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(id.clone())))
+                .await;
+        }
+        drain_sctp(&mut sctp_rx);
+        drain_rrc_capability(&mut rrc_rx);
+
+        let response = encode_ue_radio_capability_id_mapping_response(
+            &UeRadioCapabilityIdMappingResponseData {
+                ue_radio_capability_id: id.clone(),
+                ue_radio_capability: cap.clone(),
+            },
+        )
+        .unwrap();
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&response))
+            .await;
+
+        let mut applied = drain_rrc_capability(&mut rrc_rx);
+        applied.sort();
+        assert_eq!(
+            applied,
+            vec![(1, Some(cap.clone())), (2, Some(cap.clone()))]
+        );
+        assert!(task.racs_pending.is_empty());
+        assert!(!task
+            .guard_timers
+            .is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
+
+        task.create_ue_context(3, 1).await.expect("ue 3");
+        let ran = ran_id(&task, 3).await;
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(id)))
+            .await;
+        assert!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty(),
+            "cache hit: no request"
+        );
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(3, Some(cap))]);
+    }
+
+    /// Capability and ID together: use the capability, remember the pair, ask no one.
+    #[tokio::test]
+    async fn a_capability_with_its_id_is_used_and_cached() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_initial_context_setup_request(
+            1,
+            1,
+            racs_ics(ran, Some(vec![9, 9]), Some(vec![0x77])),
+        )
+        .await;
+        assert!(mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty());
+        assert_eq!(
+            drain_rrc_capability(&mut rrc_rx),
+            vec![(1, Some(vec![9, 9]))]
+        );
+        let plmn = test_config().plmn.encode();
+        assert_eq!(task.racs_cache.get(&(plmn, vec![0x77])), Some(vec![9, 9]));
+    }
+
+    /// TS 38.413 §8.3.1.2: neither IE -- the gNB retrieves the capability from the UE.
+    #[tokio::test]
+    async fn neither_capability_nor_id_asks_the_ue() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, None))
+            .await;
+        assert!(mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty());
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(1, None)]);
+    }
+
+    /// No answer to the mapping: stop waiting and fall back to the UE.
+    #[tokio::test]
+    async fn an_unanswered_mapping_falls_back_to_the_ue_on_timeout() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        let before = Instant::now();
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(vec![1])))
+            .await;
+        drain_sctp(&mut sctp_rx);
+        drain_rrc_capability(&mut rrc_rx);
+        task.process_expired_guard_timers(
+            before + Duration::from_secs(super::super::racs::RACS_MAPPING_TIMEOUT_SECS + 1),
+        )
+        .await;
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(1, None)]);
+        assert!(task.racs_pending.is_empty());
+    }
+
+    /// A released UE stops waiting on the mapping.
+    #[tokio::test]
+    async fn a_released_ue_no_longer_waits_on_a_mapping() {
+        let (mut task, _rrc_rx, _gtp, _sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(vec![5])))
+            .await;
+        task.delete_ue_context(1).await;
+        assert!(task.racs_pending.is_empty());
+        assert!(!task
+            .guard_timers
+            .is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
+    }
+
+    /// TS 38.413 §8.14.1: what the UE reported goes to the AMF as a UE RADIO
+    /// CAPABILITY INFO INDICATION on the UE's stream, with its NGAP IDs.
+    #[tokio::test]
+    async fn a_capability_from_the_ue_is_reported_to_the_amf() {
+        let (mut task, _rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.report_ue_radio_capability(1, vec![0xAB, 0xCD]).await;
+        let ind: Vec<_> = drain_sctp(&mut sctp_rx)
+            .iter()
+            .filter_map(|p| decode_ue_radio_capability_info_indication(p).ok())
+            .collect();
+        assert_eq!(ind.len(), 1);
+        assert_eq!(ind[0].amf_ue_ngap_id, 7777);
+        assert_eq!(ind[0].ran_ue_ngap_id, ran);
+        assert_eq!(ind[0].ue_radio_capability, vec![0xAB, 0xCD]);
+    }
+
+    /// TS 23.502 §4.9.1.2.2 step 7: an ID in the Path Switch Request Acknowledge
+    /// with nothing cached for it triggers the mapping.
+    #[tokio::test]
+    async fn a_path_switch_acknowledge_with_an_unknown_id_requests_the_mapping() {
+        use nextgsim_ngap::procedures::path_switch::SwitchedSessionItem;
+        let (mut task, _rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_path_switch_request_acknowledge(
+            1,
+            8,
+            PathSwitchRequestAcknowledgeData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id: ran,
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0x77; 32],
+                switched_sessions: vec![SwitchedSessionItem {
+                    pdu_session_id: 1,
+                    ul_tunnel: None,
+                    security_indication: None,
+                }],
+                ue_radio_capability_id: Some(vec![0xEE]),
+            },
+        )
+        .await;
+        assert_eq!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)),
+            vec![vec![0xEE]]
+        );
     }
 }

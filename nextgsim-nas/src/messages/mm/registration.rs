@@ -638,7 +638,13 @@ pub struct RegistrationRequest {
     /// REGISTRATION REQUEST sent without integrity protection, only in the full
     /// request replayed inside the SECURITY MODE COMPLETE NAS message container.
     pub ue_radio_capability_id: Option<String>,
+    /// 5GMM capability (optional, Type 4 TLV, IEI 0x10) -- TS 24.501 §9.11.3.1,
+    /// the value octets (octet 3 onwards). A non-cleartext IE (§4.4.6).
+    pub five_gmm_capability: Option<Vec<u8>>,
 }
+
+/// 5GMM capability octet 4, bit 8: "RACS supported" (TS 24.501 §9.11.3.1).
+pub const FIVE_GMM_CAPABILITY_OCTET4_RACS: u8 = 0x80;
 
 /// The filler nibble of a UE radio capability ID with an odd digit count
 /// (TS 24.501 §9.11.3.68).
@@ -798,6 +804,7 @@ impl Default for RegistrationRequest {
             payload_container_type: None,
             payload_container: None,
             ue_radio_capability_id: None,
+            five_gmm_capability: None,
         }
     }
 }
@@ -880,6 +887,19 @@ impl RegistrationRequest {
 
             // Full octet IEI
             match iei {
+                registration_request_iei::MM_CAPABILITY => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.five_gmm_capability = Some(data);
+                }
                 registration_request_iei::UE_SECURITY_CAPABILITY => {
                     buf.advance(1);
                     if buf.remaining() < 1 {
@@ -1157,6 +1177,13 @@ impl RegistrationRequest {
             );
         }
 
+        // 5GMM capability (Table 8.2.6.1.1: after Non-current native NAS KSI).
+        if let Some(ref cap) = self.five_gmm_capability {
+            buf.put_u8(registration_request_iei::MM_CAPABILITY);
+            buf.put_u8(cap.len() as u8);
+            buf.put_slice(cap);
+        }
+
         if let Some(ref cap) = self.ue_security_capability {
             buf.put_u8(registration_request_iei::UE_SECURITY_CAPABILITY);
             buf.put_u8(cap.len() as u8);
@@ -1393,6 +1420,12 @@ mod registration_accept_iei {
     pub const NTN_TIMING_ADVANCE: u8 = 0xA4;
     /// NTN access barring (6G extension)
     pub const NTN_ACCESS_BARRING: u8 = 0xA5;
+    /// UE radio capability ID (RACS, TS 24.501 Table 8.2.7.1.1, IEI 0x67, TLV,
+    /// 9.11.3.68)
+    pub const UE_RADIO_CAPABILITY_ID: u8 = 0x67;
+    /// UE radio capability ID deletion indication (RACS, Type 1, IEI nibble 0xE,
+    /// 9.11.3.69)
+    pub const UE_RADIO_CAPABILITY_ID_DELETION: u8 = 0xE;
 }
 
 /// Registration Accept message (network to UE)
@@ -1441,6 +1474,13 @@ pub struct RegistrationAccept {
     pub mico_indication: Option<IeMicoIndication>,
     /// LADN information (optional, Type 6, IEI 0x79)
     pub ladn_information: Option<Vec<u8>>,
+    /// UE radio capability ID (optional, Type 4, IEI 0x67) -- RACS, TS 24.501
+    /// §8.2.7.32 / §9.11.3.68, as its hexadecimal digits.
+    pub ue_radio_capability_id: Option<String>,
+    /// UE radio capability ID deletion indication (optional, Type 1, IEI 0xE) --
+    /// RACS, TS 24.501 §8.2.7.33 / §9.11.3.69: the 3-bit value (1 = delete the
+    /// network-assigned IDs).
+    pub ue_radio_capability_id_deletion: Option<u8>,
     /// AI/ML capability (optional, Type 4, IEI 0xA0) - 6G extension
     pub ai_ml_capability: Option<IeAiMlCapability>,
     /// ISAC parameter (optional, Type 4, IEI 0xA1) - 6G extension
@@ -1491,6 +1531,12 @@ impl RegistrationAccept {
                     // indication): 1 => "subscription changed". Bit 2 (DCNI) is
                     // spare in the network-to-UE direction.
                     msg.network_slicing_subscription_change = Some((iei & 0x01) != 0);
+                    buf.advance(1);
+                    continue;
+                }
+                registration_accept_iei::UE_RADIO_CAPABILITY_ID_DELETION => {
+                    // UE radio capability ID deletion indication (Type 1, 9.11.3.69)
+                    msg.ue_radio_capability_id_deletion = Some(iei & 0x07);
                     buf.advance(1);
                     continue;
                 }
@@ -1686,6 +1732,20 @@ impl RegistrationAccept {
                     buf.copy_to_slice(&mut data);
                     msg.pending_nssai = Some(data);
                 }
+                registration_accept_iei::UE_RADIO_CAPABILITY_ID => {
+                    // UE radio capability ID (Type 4 TLV, 9.11.3.68)
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.ue_radio_capability_id = Some(decode_ue_radio_capability_id(&data));
+                }
                 registration_accept_iei::LADN_INFORMATION => {
                     buf.advance(1);
                     if buf.remaining() < 2 {
@@ -1865,6 +1925,21 @@ impl RegistrationAccept {
             buf.put_u8(registration_accept_iei::LADN_INFORMATION);
             buf.put_u16(ladn.len() as u16);
             buf.put_slice(ladn);
+        }
+
+        // RACS (Table 8.2.7.1.1): UE radio capability ID, then its deletion
+        // indication.
+        if let Some(ref id) = self.ue_radio_capability_id {
+            if let Some(octets) = encode_ue_radio_capability_id(id) {
+                buf.put_u8(registration_accept_iei::UE_RADIO_CAPABILITY_ID);
+                buf.put_u8(octets.len() as u8);
+                buf.put_slice(&octets);
+            }
+        }
+        if let Some(value) = self.ue_radio_capability_id_deletion {
+            buf.put_u8(
+                (registration_accept_iei::UE_RADIO_CAPABILITY_ID_DELETION << 4) | (value & 0x07),
+            );
         }
 
         // 6G extension IEs

@@ -340,6 +340,15 @@ pub struct HandoverInitiation {
 /// Messages for the NGAP task.
 #[derive(Debug)]
 pub enum NgapMessage {
+    /// The UE answered a UE capability enquiry (from RRC). NGAP stores the
+    /// capability and reports it to the AMF in a UE RADIO CAPABILITY INFO INDICATION
+    /// (TS 38.413 §8.14.1).
+    UeRadioCapabilityInformation {
+        /// UE ID
+        ue_id: i32,
+        /// An encoded TS 38.331 `UERadioAccessCapabilityInformation`
+        ue_radio_capability: Vec<u8>,
+    },
     /// SCTP association established
     SctpAssociationUp {
         /// SCTP client ID
@@ -528,6 +537,24 @@ pub enum RrcMessage {
         ue_id: i32,
         /// NAS PDU
         pdu: OctetString,
+    },
+    /// Run UE capability transfer (TS 38.331 §5.6.1) for this UE (from NGAP).
+    ///
+    /// Sent when an INITIAL CONTEXT SETUP REQUEST carried neither the UE Radio
+    /// Capability IE nor the UE Radio Capability ID IE (TS 38.413 §8.3.1.2), i.e.
+    /// after AS security activation, as TS 38.331 §5.6.1.1 requires.
+    UeCapabilityEnquiry {
+        /// UE ID
+        ue_id: i32,
+    },
+    /// A UE radio capability the gNB obtained from the core network rather than
+    /// from the UE (from NGAP): in the Initial Context Setup Request, or via RACS —
+    /// a cached or AMF-mapped UE Radio Capability ID (TS 23.501 §5.4.4.1a).
+    UeRadioCapability {
+        /// UE ID
+        ue_id: i32,
+        /// An encoded TS 38.331 `UERadioAccessCapabilityInformation`
+        ue_radio_capability: Vec<u8>,
     },
     /// RRC Security Mode Command delivery on DL-DCCH (from NGAP, at Initial
     /// Context Setup — TS 38.331 §5.3.4). Carries the encoded DL-DCCH
