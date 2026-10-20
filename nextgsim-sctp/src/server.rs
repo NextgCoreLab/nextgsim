@@ -14,7 +14,7 @@ use sctp_proto::{
     PayloadProtocolIdentifier, ServerConfig, Transmit, TransportConfig,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     io,
     net::SocketAddr,
     sync::Arc,
@@ -91,6 +91,10 @@ struct ManagedAssociation {
     association: Association,
     remote_addr: SocketAddr,
     pending_transmits: VecDeque<Transmit>,
+    /// Every stream open on this association, whichever side opened it.
+    /// `accept_stream()` hands a peer-opened stream over exactly once, so the
+    /// ids must be kept to read the stream's later messages.
+    streams: BTreeSet<u16>,
 }
 
 /// SCTP Server using sctp-proto
@@ -272,6 +276,7 @@ impl SctpServer {
             association,
             remote_addr,
             pending_transmits: VecDeque::new(),
+            streams: BTreeSet::new(),
         };
 
         self.associations.insert(handle, managed);
@@ -358,45 +363,60 @@ impl SctpServer {
     }
 
     /// Check for and handle received data
+    ///
+    /// Reads every open stream until it is drained, not just streams that
+    /// `accept_stream()` returns: SCTP streams are long-lived (RFC 9260 §1.5.2)
+    /// and NGAP/S1AP reuse stream 0 for every non-UE-associated message, so a
+    /// stream is accepted once and then carries many messages. Each `read()`
+    /// yields one whole user message; messages on a stream come out in order
+    /// (RFC 9260 §6.6).
     fn check_for_data(&mut self, handle: AssociationHandle) -> Result<()> {
-        if let Some(managed) = self.associations.get_mut(&handle) {
-            while let Some(mut stream) = managed.association.accept_stream() {
-                let stream_id = stream.stream_identifier();
-                debug!("Accepted stream {} on association {:?}", stream_id, handle);
+        let Some(managed) = self.associations.get_mut(&handle) else {
+            return Ok(());
+        };
 
-                if let Ok(Some(chunks)) = stream.read() {
-                    let total_len = chunks.len();
-                    if total_len > 0 {
-                        let mut buf = vec![0u8; total_len];
-                        if chunks.read(&mut buf).is_ok() {
-                            // The PPID the peer actually sent (#220), not an
-                            // NGAP default.
-                            let ppid = u32::from(chunks.ppi);
+        while let Some(stream) = managed.association.accept_stream() {
+            let stream_id = stream.stream_identifier();
+            debug!("Accepted stream {} on association {:?}", stream_id, handle);
+            managed.streams.insert(stream_id);
+        }
 
-                            let message = ReceivedMessage {
-                                stream_id,
-                                data: Bytes::from(buf),
-                                ppid,
-                            };
-
-                            debug!(
-                                "Received {} bytes on stream {} from {:?}",
-                                message.data.len(),
-                                stream_id,
-                                handle
-                            );
-
-                            if let Some(&id) = self.handle_to_id.get(&handle) {
-                                if let Some(tx) = &self.event_tx {
-                                    let _ = tx.send(ServerEvent::DataReceived {
-                                        association_id: id,
-                                        message,
-                                    });
-                                }
-                            }
-                        }
-                    }
+        let mut messages = Vec::new();
+        for &stream_id in &managed.streams {
+            let Ok(mut stream) = managed.association.stream(stream_id) else {
+                continue;
+            };
+            while let Ok(Some(chunks)) = stream.read() {
+                let total_len = chunks.len();
+                if total_len == 0 {
+                    continue;
                 }
+                let mut buf = vec![0u8; total_len];
+                if chunks.read(&mut buf).is_err() {
+                    continue;
+                }
+                // The PPID the peer actually sent (#220), not an NGAP default.
+                messages.push(ReceivedMessage {
+                    stream_id,
+                    data: Bytes::from(buf),
+                    ppid: u32::from(chunks.ppi),
+                });
+            }
+        }
+
+        let id = self.handle_to_id.get(&handle).copied();
+        for message in messages {
+            debug!(
+                "Received {} bytes on stream {} from {:?}",
+                message.data.len(),
+                message.stream_id,
+                handle
+            );
+            if let (Some(association_id), Some(tx)) = (id, &self.event_tx) {
+                let _ = tx.send(ServerEvent::DataReceived {
+                    association_id,
+                    message,
+                });
             }
         }
 
@@ -499,6 +519,7 @@ impl SctpServer {
                     .open_stream(stream_id, ppi)
                     .map_err(|e| ServerError::SendError(e.to_string()))?,
             };
+            managed.streams.insert(stream_id);
 
             stream
                 .write_with_ppi(data, ppi)

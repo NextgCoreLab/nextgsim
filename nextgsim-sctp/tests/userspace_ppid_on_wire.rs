@@ -129,9 +129,8 @@ async fn spawn_echo_server() -> (SocketAddr, Arc<Mutex<Vec<u32>>>) {
 }
 
 /// Send `data` on `stream` with `ppid` and wait for the echo. Each message uses
-/// its own stream: SctpServer reads a stream only when it is first accepted, so
-/// a second message on the same stream would not be delivered (a separate,
-/// pre-existing limitation of the test-only server).
+/// its own stream so the two PPIDs are checked independently; repeated messages
+/// on one stream are covered by `userspace_server_stream_reads.rs`.
 async fn round_trip(
     client: &mut SctpAssociation,
     stream: u16,
