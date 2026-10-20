@@ -54,6 +54,11 @@ pub struct UeContextReleaseRequestParams {
     pub amf_ue_ngap_id: u64,
     /// RAN UE NGAP ID
     pub ran_ue_ngap_id: u32,
+    /// The UE's PDU sessions, sent as the PDU Session Resource List (IE 133,
+    /// TS 38.413 §9.2.2.4) when non-empty. TS 23.502 §4.2.6 step 1: the NG-RAN
+    /// lists the UE's active sessions so the AMF can release their user plane;
+    /// leave empty for a UE with none (the IE is then absent, SIZE(1..256)).
+    pub pdu_session_ids: Vec<u8>,
     /// Cause of release request
     pub cause: UeContextReleaseCause,
 }
@@ -65,6 +70,8 @@ pub struct UeContextReleaseRequestData {
     pub amf_ue_ngap_id: u64,
     /// RAN UE NGAP ID
     pub ran_ue_ngap_id: u32,
+    /// PDU Session Resource List (IE 133), empty when absent
+    pub pdu_session_ids: Vec<u8>,
     /// Cause of release request
     pub cause: UeContextReleaseCause,
 }
@@ -99,6 +106,28 @@ pub fn build_ue_context_release_request(
             params.ran_ue_ngap_id,
         )),
     });
+
+    // IE: PDU Session Resource List (optional, criticality reject), in
+    // object-set order between the UE IDs and the Cause.
+    if !params.pdu_session_ids.is_empty() {
+        protocol_ies.push(UEContextReleaseRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_LIST_CXT_REL_REQ),
+            criticality: Criticality(Criticality::REJECT),
+            value:
+                UEContextReleaseRequestProtocolIEs_EntryValue::Id_PDUSessionResourceListCxtRelReq(
+                    PDUSessionResourceListCxtRelReq(
+                        params
+                            .pdu_session_ids
+                            .iter()
+                            .map(|&psi| PDUSessionResourceItemCxtRelReq {
+                                pdu_session_id: PDUSessionID(psi),
+                                ie_extensions: None,
+                            })
+                            .collect(),
+                    ),
+                ),
+        });
+    }
 
     // IE: Cause (mandatory)
     let cause = build_cause(&params.cause);
@@ -155,6 +184,7 @@ pub fn parse_ue_context_release_request(
     let mut amf_ue_ngap_id: Option<u64> = None;
     let mut ran_ue_ngap_id: Option<u32> = None;
     let mut cause: Option<UeContextReleaseCause> = None;
+    let mut pdu_session_ids = Vec::new();
 
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
@@ -167,8 +197,10 @@ pub fn parse_ue_context_release_request(
             UEContextReleaseRequestProtocolIEs_EntryValue::Id_Cause(c) => {
                 cause = Some(parse_cause(c));
             }
-            _ => {
-                // Ignore other IEs
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_PDUSessionResourceListCxtRelReq(
+                list,
+            ) => {
+                pdu_session_ids = list.0.iter().map(|i| i.pdu_session_id.0).collect();
             }
         }
     }
@@ -180,6 +212,7 @@ pub fn parse_ue_context_release_request(
         ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
             UeContextReleaseError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
         })?,
+        pdu_session_ids,
         cause: cause
             .ok_or_else(|| UeContextReleaseError::MissingMandatoryIe("Cause".to_string()))?,
     })
@@ -829,6 +862,7 @@ mod tests {
         UeContextReleaseRequestParams {
             amf_ue_ngap_id: 12345,
             ran_ue_ngap_id: 1,
+            pdu_session_ids: Vec::new(),
             cause: UeContextReleaseCause::RadioNetwork(RadioNetworkCause::UserInactivity),
         }
     }
@@ -992,6 +1026,7 @@ mod tests {
             let params = UeContextReleaseRequestParams {
                 amf_ue_ngap_id: 12345,
                 ran_ue_ngap_id: 1,
+                pdu_session_ids: Vec::new(),
                 cause: cause.clone(),
             };
 
@@ -1000,5 +1035,47 @@ mod tests {
 
             assert_eq!(parsed.cause, cause);
         }
+    }
+
+    /// IE 133, PDU Session Resource List (TS 38.413 §9.2.2.4), between the UE IDs
+    /// and the Cause in object-set order, and absent when the UE has no session.
+    /// The entry's octets are derived by hand from X.691 APER:
+    ///   id 133            -> 00 85
+    ///   criticality reject-> 00   (2 bits, then the open type aligns)
+    ///   open-type length  -> 03
+    ///   value: SEQUENCE OF SIZE(1..256): count-1 = 0 in 8 bits -> 00
+    ///          item: ext bit 0, iE-Extensions absent 0, then PDUSessionID
+    ///          (0..255, range 256: one octet, octet-aligned) -> 00 05
+    #[test]
+    fn release_request_carries_the_pdu_session_list_in_order() {
+        let mut params = create_test_request_params();
+        params.pdu_session_ids = vec![5];
+        let pdu = build_ue_context_release_request(&params).expect("builds");
+        let NGAP_PDU::InitiatingMessage(ref m) = pdu else {
+            panic!()
+        };
+        let InitiatingMessageValue::Id_UEContextReleaseRequest(ref req) = m.value else {
+            panic!()
+        };
+        let ids: Vec<u16> = req.protocol_i_es.0.iter().map(|e| e.id.0).collect();
+        assert_eq!(ids, vec![10, 85, 133, 15]);
+        let entry = crate::codec::encode_aper(&req.protocol_i_es.0[2]).expect("entry");
+        assert_eq!(entry, [0x00, 0x85, 0x00, 0x03, 0x00, 0x00, 0x05]);
+        let bytes = encode_ngap_pdu(&pdu).unwrap();
+        let back = parse_ue_context_release_request(&decode_ngap_pdu(&bytes).unwrap()).unwrap();
+        assert_eq!(back.pdu_session_ids, vec![5]);
+
+        params.pdu_session_ids.clear();
+        let pdu = build_ue_context_release_request(&params).expect("builds");
+        let NGAP_PDU::InitiatingMessage(ref m) = pdu else {
+            panic!()
+        };
+        let InitiatingMessageValue::Id_UEContextReleaseRequest(ref req) = m.value else {
+            panic!()
+        };
+        assert!(
+            req.protocol_i_es.0.iter().all(|e| e.id.0 != 133),
+            "absent when empty"
+        );
     }
 }

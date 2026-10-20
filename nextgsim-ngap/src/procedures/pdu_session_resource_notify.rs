@@ -686,6 +686,7 @@ mod tests {
         let other = build_ue_context_release_request(&UeContextReleaseRequestParams {
             amf_ue_ngap_id: 1,
             ran_ue_ngap_id: 1,
+            pdu_session_ids: Vec::new(),
             cause: UeContextReleaseCause::RadioNetwork(RadioNetworkCause::Unspecified),
         })
         .expect("builds");
