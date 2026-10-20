@@ -16,11 +16,10 @@
 #     cargo test -p nextgsim-enb --features kernel-sctp --test mmed_interop \
 #     lte_ue_attaches_through_the_nextgcore_epc -- --ignored --nocapture
 #
-# hssd answers every AIR with 5012 until nextgcore #478 (it never opens the
-# subscriber DB) is fixed; mmed's attach then stops at #479 and #480.
-#
-# sgwcd and sgwud take their addresses from the environment only (nextgcore
-# #482), hence the variables below rather than YAML.
+# Needs nextgcore main at 6abfb23 or later: the attach depended on #478, #479,
+# #480, #481, #491, #492, #495 and #496 (all merged). sgwcd and sgwud are given
+# their addresses through the environment below; since #482 they also read
+# YAML.
 set -euo pipefail
 
 DIR=${EPC_DIR:-/tmp/nextgsim-epc}

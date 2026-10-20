@@ -48,6 +48,8 @@ use crate::security::{header_type, security_header_type, EpsSecurityContext};
 pub const T3410: Duration = Duration::from_secs(15);
 /// T3411: attach retry (§10.2).
 pub const T3411: Duration = Duration::from_secs(10);
+/// T3416: lifetime of the stored RAND and RES (§5.4.2.3, Table 10.2.1).
+pub const T3416: Duration = Duration::from_secs(30);
 /// T3402 default: 12 minutes (§10.2).
 pub const T3402_DEFAULT: Duration = Duration::from_secs(12 * 60);
 /// Attach attempt counter limit (§5.5.1.2.6: "equal to 5").
@@ -153,6 +155,26 @@ pub struct EpsNasUe {
     next_pti: u8,
     attach_pti: Option<u8>,
     bearer: Option<DefaultBearer>,
+    /// The RAND of the last successful challenge with its RES and `K_ASME`,
+    /// kept so a retransmitted AUTHENTICATION REQUEST is answered without
+    /// the USIM (§5.4.2.3), and the T3416 deadline that bounds it.
+    stored_auth: Option<StoredAuth>,
+    /// Whether the secure exchange of NAS messages is established on the
+    /// current NAS signalling connection (§4.4.5). Only a SECURITY MODE
+    /// CONTROL procedure on this connection sets it, and the connection's
+    /// release clears it; until then a current context integrity-protects
+    /// but does not cipher (§4.4.4.2), so an MME that no longer holds the
+    /// context can still read the message (§4.4.4.3 NOTE 3).
+    secure_exchange: bool,
+}
+
+/// RAND, RES and `K_ASME` held in the ME's volatile memory (§5.4.2.3).
+#[derive(Debug, Clone)]
+struct StoredAuth {
+    rand: [u8; 16],
+    res: Vec<u8>,
+    kasme: [u8; 32],
+    t3416: Instant,
 }
 
 impl EpsNasUe {
@@ -178,6 +200,8 @@ impl EpsNasUe {
             next_pti: 1,
             attach_pti: None,
             bearer: None,
+            stored_auth: None,
+            secure_exchange: false,
         }
     }
 
@@ -274,17 +298,29 @@ impl EpsNasUe {
 
     /// The earliest NAS timer deadline.
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.t3410, self.retry_at].into_iter().flatten().min()
+        [
+            self.t3410,
+            self.retry_at,
+            self.stored_auth.as_ref().map(|a| a.t3416),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Timer expiry.
     pub fn on_timer(&mut self, now: Instant) -> NasOutput {
+        if self.stored_auth.as_ref().is_some_and(|a| now >= a.t3416) {
+            // §5.4.2.3: the stored RAND and RES are deleted on T3416 expiry.
+            self.stored_auth = None;
+        }
         if self.t3410.is_some_and(|t| now >= t) {
             // §5.5.1.2.6 c): abort the attach, release the NAS signalling
             // connection locally, and handle the attempt counter.
             log::warn!("EMM: T3410 expired; attach aborted (§5.5.1.2.6 c)");
             self.t3410 = None;
             self.attach_failed(now, None);
+            self.secure_exchange = false;
             return NasOutput {
                 uplink: vec![],
                 release: true,
@@ -302,6 +338,9 @@ impl EpsNasUe {
     /// retry; at 5, T3402 (or the network's value). `wait` overrides both, for
     /// T3346 (#22 congestion).
     fn attach_failed(&mut self, now: Instant, wait: Option<Duration>) {
+        // EMM-DEREGISTERED.ATTEMPTING-TO-ATTACH: §5.4.2.3 deletes the stored
+        // RAND and RES on entering EMM-DEREGISTERED.
+        self.stored_auth = None;
         self.attempts = self.attempts.saturating_add(1);
         let t = wait.unwrap_or(if self.attempts < MAX_ATTACH_ATTEMPTS {
             T3411
@@ -327,15 +366,26 @@ impl EpsNasUe {
             self.t3410 = None;
             self.attach_failed(now, None);
         }
-        // AKA results that no SMC took into use do not survive the connection.
+        // AKA results that no SMC took into use do not survive the connection,
+        // and §5.4.2.3 deletes the stored RAND and RES on entering EMM-IDLE.
         self.pending = None;
+        self.stored_auth = None;
+        // §4.4.5: ciphering lasts "until the NAS signalling connection is
+        // released"; the next connection needs its own SMC.
+        self.secure_exchange = false;
     }
 
     /// Wrap an uplink EMM message: protected with the current context when
-    /// one exists (§4.4.4.2), plain otherwise.
+    /// one exists (§4.4.4.2), plain otherwise; ciphered only once the secure
+    /// exchange is established on this connection (§4.4.5).
     fn send_emm(&mut self, plain: Vec<u8>) -> NasOutput {
+        let ht = if self.secure_exchange {
+            header_type::INTEGRITY_CIPHERED
+        } else {
+            header_type::INTEGRITY
+        };
         let pdu = match &mut self.ctx {
-            Some(c) => c.protect(&plain, header_type::INTEGRITY_CIPHERED),
+            Some(c) => c.protect(&plain, ht),
             None => plain,
         };
         NasOutput::send(pdu)
@@ -444,9 +494,10 @@ impl EpsNasUe {
                 self.send_emm(msg::encode_identity_response(&id))
             }
             DownlinkEmm::AuthenticationRequest { ksi, rand, autn } => {
-                self.on_authentication_request(ksi, &rand, &autn)
+                self.on_authentication_request(ksi, &rand, &autn, now)
             }
             DownlinkEmm::AuthenticationReject => {
+                self.stored_auth = None;
                 // §5.4.2.5: the USIM is invalid for EPS services; GUTI, TAI
                 // list and KSI are deleted; no further attach.
                 log::warn!("EMM: AUTHENTICATION REJECT; USIM invalid for EPS (§5.4.2.5)");
@@ -486,13 +537,30 @@ impl EpsNasUe {
         ksi: NasKsi,
         rand: &[u8; 16],
         autn: &[u8; 16],
+        now: Instant,
     ) -> NasOutput {
+        // §5.4.2.3: a RAND equal to the stored one is not passed to the USIM --
+        // its SQN is no longer fresh, so the USIM would answer synch failure --
+        // and the stored RES is sent again.
+        if let Some(stored) = self.stored_auth.as_ref().filter(|a| &a.rand == rand) {
+            let res = stored.res.clone();
+            self.pending = Some((ksi, stored.kasme));
+            log::info!("EMM: retransmitted challenge; stored RES re-sent (§5.4.2.3)");
+            return self.send_emm(msg::encode_authentication_response(&res));
+        }
         let sn_id = self.cfg.plmn.encode();
         match aka::authenticate(&self.cfg.credentials, &mut self.sqn, rand, autn, &sn_id) {
             AkaOutcome::Success { res, kasme } => {
                 // §5.4.2.3: store K_ASME under the KSI; it is taken into use by
-                // the SECURITY MODE COMMAND that names that KSI.
+                // the SECURITY MODE COMMAND that names that KSI. RAND and RES
+                // override any stored pair, and T3416 (re)starts.
                 self.pending = Some((ksi, kasme));
+                self.stored_auth = Some(StoredAuth {
+                    rand: *rand,
+                    res: res.to_vec(),
+                    kasme,
+                    t3416: now + T3416,
+                });
                 log::info!(
                     "EMM: network authenticated (KSI {}); AUTHENTICATION RESPONSE",
                     ksi.value
@@ -526,6 +594,9 @@ impl EpsNasUe {
     /// SECURITY MODE COMMAND (§5.4.3.3), which arrives with security header
     /// type 3 and is verified with the context it creates.
     fn on_security_mode_command(&mut self, pdu: &[u8]) -> NasOutput {
+        // §5.4.2.3: the stored RAND and RES are deleted on receipt of a
+        // SECURITY MODE COMMAND.
+        self.stored_auth = None;
         if pdu.len() < 6 {
             return NasOutput::default();
         }
@@ -608,6 +679,8 @@ impl EpsNasUe {
         );
         self.ctx = Some(candidate);
         self.pending = None;
+        // §4.4.5: the secure exchange is established on this connection.
+        self.secure_exchange = true;
         NasOutput::send(complete)
     }
 
@@ -676,6 +749,7 @@ impl EpsNasUe {
     }
 
     fn invalidate(&mut self, cause: u8) {
+        self.stored_auth = None;
         self.guti = None;
         self.tai_list.clear();
         self.ctx = None;
