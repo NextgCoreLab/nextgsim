@@ -69,6 +69,9 @@ pub struct UeContextModificationRequestData {
     /// New NR key (KgNB), BIT STRING(256) rendered as 32 bytes (optional).
     /// When present, triggers AS re-keying.
     pub security_key: Option<[u8; 32]>,
+    /// UE Radio Capability ID (optional, IE 264, criticality reject) -- RACS.
+    /// TS 38.413 §8.3.4.2: the NG-RAN node uses it as TS 23.501 / 23.502 specify.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
 }
 
 /// Parse a UE Context Modification Request from an already-decoded NGAP PDU.
@@ -100,6 +103,7 @@ pub fn parse_ue_context_modification_request(
     let mut ue_aggregate_max_bit_rate: Option<UeAggregateMaxBitRate> = None;
     let mut ue_security_capabilities: Option<UeSecurityCapabilitiesValue> = None;
     let mut security_key: Option<[u8; 32]> = None;
+    let mut ue_radio_capability_id: Option<Vec<u8>> = None;
 
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
@@ -120,6 +124,9 @@ pub fn parse_ue_context_modification_request(
             UEContextModificationRequestProtocolIEs_EntryValue::Id_SecurityKey(key) => {
                 security_key = Some(parse_security_key(key));
             }
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(id) => {
+                ue_radio_capability_id = Some(id.0.clone());
+            }
             // Other IEs (New AMF-UE-NGAP-ID, New GUAMI, IndexToRFSP,
             // EmergencyFallbackIndicator, ...) are not modelled here.
             _ => {}
@@ -136,6 +143,7 @@ pub fn parse_ue_context_modification_request(
         ue_aggregate_max_bit_rate,
         ue_security_capabilities,
         security_key,
+        ue_radio_capability_id,
     })
 }
 
@@ -275,6 +283,16 @@ pub fn build_ue_context_modification_request(
             value: UEContextModificationRequestProtocolIEs_EntryValue::Id_SecurityKey(SecurityKey(
                 BitVec::<u8, Msb0>::from_slice(key),
             )),
+        });
+    }
+
+    if let Some(id) = &data.ue_radio_capability_id {
+        protocol_ies.push(UEContextModificationRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_RADIO_CAPABILITY_ID),
+            criticality: Criticality(Criticality::REJECT),
+            value: UEContextModificationRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(
+                UERadioCapabilityID(id.clone()),
+            ),
         });
     }
 
@@ -461,6 +479,7 @@ mod tests {
                 eutra_integrity_algorithms: Some(0),
             }),
             security_key,
+            ue_radio_capability_id: None,
         };
         build_ue_context_modification_request(&data).expect("build request")
     }

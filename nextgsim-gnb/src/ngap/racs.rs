@@ -33,6 +33,30 @@ pub const RACS_CACHE_CAPACITY: usize = 256;
 /// received". An implementation choice.
 pub const RACS_MAPPING_TIMEOUT_SECS: u64 = 2;
 
+/// Seconds a UE Radio Capability Check (TS 38.413 §8.14.2) waits for the UE's radio
+/// capability before answering with what the gNB holds. §8.14.2 defines no timer and
+/// no unsuccessful outcome, so the AMF is always answered; this bounds the wait to a
+/// mapping timeout plus a UE capability enquiry. An implementation choice.
+pub const RADIO_CAPABILITY_CHECK_TIMEOUT_SECS: u64 = 3 * RACS_MAPPING_TIMEOUT_SECS;
+
+/// Whether `capability` (an encoded TS 38.331 `UERadioAccessCapabilityInformation`)
+/// is compatible with a network configured for IMS voice over NR (TS 38.413
+/// §8.14.2): the gNB must support it (`network_supports`) and some NR container
+/// must declare `voiceOverNR` (TS 38.331 §6.3.3). An undecodable capability is
+/// not compatible.
+pub fn ims_voice_compatible(network_supports: bool, capability: &[u8]) -> bool {
+    use nextgsim_rrc::procedures::ue_capability::{
+        decode_ue_radio_access_capability_information, parse_nr_capability_voice_over_nr, RatType,
+    };
+    network_supports
+        && decode_ue_radio_access_capability_information(capability).is_ok_and(|containers| {
+            containers.iter().any(|c| {
+                matches!(c.rat_type, RatType::Nr)
+                    && parse_nr_capability_voice_over_nr(&c.container).unwrap_or(false)
+            })
+        })
+}
+
 /// Cache key: serving PLMN (encoded, 3 octets) and the opaque UE Radio Capability ID.
 pub type RacsKey = ([u8; 3], Vec<u8>);
 

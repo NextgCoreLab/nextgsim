@@ -86,6 +86,9 @@ fn params(nas: Vec<u8>) -> DownlinkNasTransportParams {
         index_to_rfsp: None,
         ue_ambr: None,
         allowed_nssai: None,
+        ue_radio_capability: None,
+        ue_capability_info_request: false,
+        ue_radio_capability_id: None,
     }
 }
 

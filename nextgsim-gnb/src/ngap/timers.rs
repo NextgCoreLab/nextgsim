@@ -44,6 +44,14 @@ pub enum GuardTimer {
         /// The UE waiting for the mapping.
         ue_id: i32,
     },
+    /// A UE RADIO CAPABILITY CHECK REQUEST (TS 38.413 §8.14.2) is waiting for this
+    /// UE's radio capability (by ID mapping or from the UE). §8.14.2 defines no
+    /// timer; on expiry the gNB answers with what it holds -- see
+    /// `racs::RADIO_CAPABILITY_CHECK_TIMEOUT_SECS`.
+    RadioCapabilityCheck {
+        /// The UE whose check is outstanding.
+        ue_id: i32,
+    },
     /// The NG Setup retry an NG Setup Failure's Time to Wait IE gates. The retry must
     /// not fire before the indicated time (TS 38.413 §8.7.1.3).
     NgSetupRetry {

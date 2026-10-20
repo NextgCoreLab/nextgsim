@@ -187,6 +187,15 @@ pub struct GnbConfig {
     /// which neighbours exist.
     #[serde(default)]
     pub conditional_handover: bool,
+    /// Whether this gNB's network configuration supports IMS voice over NR.
+    ///
+    /// The input to the UE Radio Capability Check (TS 38.413 §8.14.2): the gNB
+    /// answers the AMF's IMS Voice Support Indicator "supported" only when this is
+    /// set AND the UE's radio capability declares `voiceOverNR` (TS 38.331 §6.3.3,
+    /// `IMS-ParametersFRX-Diff`). Off by default: a deployment without an IMS that
+    /// can carry voice must not tell the AMF that voice over PS is possible.
+    #[serde(default)]
+    pub ims_voice_over_nr: bool,
     /// `a3-Offset` in dB for the CHO execution condition (TS 38.331 §5.5.4.4).
     ///
     /// The neighbour must beat the serving cell by this much. Defaults to 3 dB, the
@@ -524,6 +533,7 @@ impl Default for GnbConfig {
             si_broadcast_period_ms: default_si_broadcast_period_ms(),
             accept_raw_nas_on_dcch: false,
             scell_phys_cell_id: None,
+            ims_voice_over_nr: false,
             conditional_handover: false,
             cho_a3_offset_db: default_cho_a3_offset_db(),
             cho_hysteresis_db: default_cho_hysteresis_db(),
