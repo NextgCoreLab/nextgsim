@@ -110,6 +110,11 @@ pub struct InitialContextSetupRequestData {
     /// `PDUSessionResourceSetupListCxtReq` (TS 38.413 §9.2.2.1). Empty when the
     /// IE is absent. amfg-01.
     pub pdu_session_setup_list: Vec<PduSessionResourceSetupItem>,
+    /// UE Radio Capability (optional, TS 38.413 §9.3.1.74): an encoded TS 38.331
+    /// `UERadioAccessCapabilityInformation`.
+    pub ue_radio_capability: Option<Vec<u8>>,
+    /// UE Radio Capability ID (optional, TS 38.413 §9.3.1.142) -- RACS.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
 }
 
 /// Parameters for building an Initial Context Setup Response
@@ -207,6 +212,8 @@ pub fn parse_initial_context_setup_request(
     let mut security_key: Option<[u8; 32]> = None;
     let mut nas_pdu: Option<Vec<u8>> = None;
     let mut pdu_session_setup_list: Vec<PduSessionResourceSetupItem> = Vec::new();
+    let mut ue_radio_capability: Option<Vec<u8>> = None;
+    let mut ue_radio_capability_id: Option<Vec<u8>> = None;
 
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
@@ -246,6 +253,12 @@ pub fn parse_initial_context_setup_request(
                 // (TS 38.413 §9.2.2.1 PDUSessionResourceSetupListCxtReq).
                 pdu_session_setup_list = parse_setup_list_cxt_req(list);
             }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UERadioCapability(cap) => {
+                ue_radio_capability = Some(cap.0.clone());
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(id) => {
+                ue_radio_capability_id = Some(id.0.clone());
+            }
             _ => {
                 // Ignore other IEs
             }
@@ -274,6 +287,8 @@ pub fn parse_initial_context_setup_request(
         })?,
         nas_pdu,
         pdu_session_setup_list,
+        ue_radio_capability,
+        ue_radio_capability_id,
     })
 }
 

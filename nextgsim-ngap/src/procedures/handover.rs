@@ -674,6 +674,10 @@ pub struct HandoverRequestData {
     /// context the target cannot re-key at all and must say so, rather than deriving
     /// from a zero NH it invented.
     pub security_context: Option<HandoverSecurityContext>,
+    /// UE Radio Capability ID (optional) -- RACS. TS 23.502 §4.9.1.3.2 step 9: when
+    /// present and the Source to Target container carries no radio capabilities, the
+    /// target requests the mapping from the AMF if it holds none for the ID.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
 }
 
 /// Parse a Handover Request from an NGAP PDU
@@ -705,6 +709,7 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
     let mut pdu_sessions: Vec<HandoverRequestSetupItem> = Vec::new();
     let mut security_context: Option<HandoverSecurityContext> = None;
 
+    let mut ue_radio_capability_id = None;
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
             HandoverRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
@@ -727,6 +732,9 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
             HandoverRequestProtocolIEs_EntryValue::Id_SecurityContext(ctx) => {
                 security_context = parse_handover_security_context(ctx);
             }
+            HandoverRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(id) => {
+                ue_radio_capability_id = Some(id.0.clone());
+            }
             _ => {}
         }
     }
@@ -742,6 +750,7 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
         )?,
         pdu_sessions,
         security_context,
+        ue_radio_capability_id,
     })
 }
 

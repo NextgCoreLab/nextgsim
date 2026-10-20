@@ -27,6 +27,7 @@ pub mod ran_configuration_update;
 pub mod transfer;
 pub mod ue_context_modification;
 pub mod ue_context_release;
+pub mod ue_radio_capability;
 
 pub use error_indication::*;
 // Note: handover exports UserLocationInfoNr which conflicts with initial_ue_message
@@ -52,3 +53,4 @@ pub use pdu_session_resource_notify::*;
 pub use ran_configuration_update::*;
 pub use ue_context_modification::*;
 pub use ue_context_release::*;
+pub use ue_radio_capability::*;
