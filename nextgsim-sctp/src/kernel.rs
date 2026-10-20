@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 
 use bytes::Bytes;
-use libc::{c_int, c_void, size_t, sockaddr, socklen_t, ssize_t};
+use libc::{c_int, c_void, size_t, sockaddr, socklen_t};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, trace, warn};
@@ -139,6 +139,11 @@ extern "C" {
     /// `sctp_sendmsg` — send `len` bytes on `sd` with the given `ppid` (network
     /// byte order), `stream_no`, and SCTP flags. `to`/`tolen` may be NULL/0 on
     /// a connected one-to-one socket.
+    // Both helpers return `int` in <netinet/sctp.h>, NOT `ssize_t` (#243).
+    // Declaring `ssize_t` reads the whole of `rax`, whose upper half the
+    // callee need not set: with Debian bookworm's libsctp1 a `-1`/EAGAIN came
+    // back as 4294967295, was taken for a full-buffer message with a zeroed
+    // sndrcvinfo (PPID 0), and the receive loop spun on it at 100% CPU.
     fn sctp_sendmsg(
         sd: c_int,
         msg: *const c_void,
@@ -150,7 +155,7 @@ extern "C" {
         stream_no: u16,
         timetolive: u32,
         context: u32,
-    ) -> ssize_t;
+    ) -> c_int;
 
     /// `sctp_recvmsg` — receive up to `len` bytes into `msg`, filling `sinfo`
     /// (stream, ppid in network byte order, flags, ...) and `msg_flags`.
@@ -162,7 +167,57 @@ extern "C" {
         fromlen: *mut socklen_t,
         sinfo: *mut libc::sctp_sndrcvinfo,
         msg_flags: *mut c_int,
-    ) -> ssize_t;
+    ) -> c_int;
+}
+
+/// What one `sctp_recvmsg` produced (see `recv_step`).
+enum RecvStep {
+    /// A whole user message.
+    Message(ReceivedMessage),
+    /// A notification or a partial delivery was consumed; read again.
+    Pending,
+    /// The association has ended (orderly shutdown, SHUTDOWN or COMM_LOST).
+    Closed,
+}
+
+/// The out-parameters of one `sctp_recvmsg`.
+struct RawRecv {
+    buf: Vec<u8>,
+    n: usize,
+    sinfo: libc::sctp_sndrcvinfo,
+    msg_flags: c_int,
+}
+
+/// One `sctp_recvmsg` on `fd` into a `cap`-byte buffer. `Err` carries errno,
+/// so EAGAIN surfaces as [`io::ErrorKind::WouldBlock`] — never as data.
+fn raw_recvmsg(fd: RawFd, cap: usize) -> io::Result<RawRecv> {
+    let mut buf = vec![0u8; cap];
+    let mut sinfo = empty_sndrcvinfo();
+    let mut msg_flags: c_int = 0;
+    // SAFETY: `fd` is a valid SCTP socket; `buf` has `cap` bytes;
+    // `sinfo`/`msg_flags` are valid out-params; from/fromlen NULL (no peer
+    // address is needed on a connected one-to-one socket).
+    let rc = unsafe {
+        sctp_recvmsg(
+            fd,
+            buf.as_mut_ptr().cast::<c_void>(),
+            cap as size_t,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::addr_of_mut!(sinfo),
+            std::ptr::addr_of_mut!(msg_flags),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let n = usize::try_from(rc).map_or(0, |n| n.min(cap));
+    Ok(RawRecv {
+        buf,
+        n,
+        sinfo,
+        msg_flags,
+    })
 }
 
 // ===========================================================================
@@ -236,6 +291,9 @@ pub struct KernelSctpAssociation {
     established: bool,
     /// Maximum receive buffer size from config (per-recv allocation cap).
     max_recv: usize,
+    /// The pieces of a partially delivered message received so far, with
+    /// its PPID and stream (RFC 6458 §8.1.20), until the piece with MSG_EOR.
+    partial: Option<(Vec<u8>, u32, u16)>,
     /// The PPID this association carries, as stated by the caller.
     ppid_check: PpidCheck,
 }
@@ -380,6 +438,7 @@ impl KernelSctpAssociation {
             remote_addr: remote,
             established: true,
             max_recv: config.max_receive_buffer_size as usize,
+            partial: None,
             ppid_check: PpidCheck::new(expected_ppid),
         })
     }
@@ -460,81 +519,24 @@ impl KernelSctpAssociation {
         if !self.established {
             return Err(SctpError::AssociationClosed);
         }
-
-        let fd = self.fd;
-        let cap = self.max_recv.max(1);
-
+        let (fd, cap) = (self.fd, self.max_recv.max(1));
         loop {
             let mut guard = self.async_fd.readable().await.map_err(SctpError::Io)?;
-
-            let mut buf = vec![0u8; cap];
-            let mut sinfo = empty_sndrcvinfo();
-            let mut msg_flags: c_int = 0;
-
-            let result = guard.try_io(|_| {
-                // SAFETY: `fd` is a valid SCTP socket; `buf` has `cap` bytes;
-                // `sinfo`/`msg_flags` are valid out-params; from/fromlen NULL
-                // (we don't need the peer address on a connected socket).
-                let n = unsafe {
-                    sctp_recvmsg(
-                        fd,
-                        buf.as_mut_ptr().cast::<c_void>(),
-                        cap as size_t,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::addr_of_mut!(sinfo),
-                        std::ptr::addr_of_mut!(msg_flags),
-                    )
-                };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            });
-
-            let n = match result {
-                Ok(Ok(n)) => n,
+            // Only an EAGAIN reported through `try_io` clears readiness, so a
+            // would-block must never be mistaken for data (#243). While data
+            // remains, readiness stays set and `readable()` returns at once.
+            let raw = match guard.try_io(|_| raw_recvmsg(fd, cap)) {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(e)) => return Err(SctpError::Io(e)),
                 Err(_would_block) => continue,
             };
-
-            // MSG_NOTIFICATION: this is an SCTP notification event, not user
-            // data. Drain it and keep waiting for an actual NGAP PDU.
-            if (msg_flags & libc::MSG_NOTIFICATION) != 0 {
-                trace!("Kernel SCTP notification received ({} bytes), skipping", n);
-                // A SHUTDOWN/COMM_LOST notification means the association is
-                // gone; treat as closed so the gNB tears the connection down.
-                self.handle_notification_state(&buf[..n.min(buf.len())]);
-                if !self.established {
-                    return Ok(None);
-                }
-                continue;
+            drop(guard);
+            match self.classify(raw) {
+                RecvStep::Message(m) => return Ok(Some(m)),
+                RecvStep::Closed => return Ok(None),
+                RecvStep::Pending => continue,
             }
-
-            if n == 0 {
-                // Peer performed an orderly shutdown.
-                debug!("Kernel SCTP peer shut down the association");
-                self.established = false;
-                return Ok(None);
-            }
-
-            buf.truncate(n);
-            // CRITICAL: sinfo_ppid arrives in network byte order; convert back.
-            let ppid = u32::from_be(sinfo.sinfo_ppid);
-            let stream_id = sinfo.sinfo_stream;
-
-            debug!(
-                "Kernel SCTP received {} bytes on stream {} with PPID {} (wire be: {:#010x})",
-                n, stream_id, ppid, sinfo.sinfo_ppid
-            );
-            self.ppid_check.observe(ppid, stream_id);
-
-            return Ok(Some(ReceivedMessage {
-                stream_id,
-                data: Bytes::from(buf),
-                ppid,
-            }));
         }
     }
 
@@ -559,73 +561,96 @@ impl KernelSctpAssociation {
         if !self.established {
             return Err(SctpError::AssociationClosed);
         }
-
-        let fd = self.fd;
-        let cap = self.max_recv.max(1);
-        let mut buf = vec![0u8; cap];
-        let mut sinfo = empty_sndrcvinfo();
-        let mut msg_flags: c_int = 0;
-
-        // SAFETY: `fd` is a valid SCTP socket; `buf` has `cap` bytes;
-        // `sinfo`/`msg_flags` are valid out-params; from/fromlen NULL. The
-        // socket is non-blocking, so this returns EWOULDBLOCK instead of
-        // blocking when no message is ready.
-        let n = unsafe {
-            sctp_recvmsg(
-                fd,
-                buf.as_mut_ptr().cast::<c_void>(),
-                cap as size_t,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::addr_of_mut!(sinfo),
-                std::ptr::addr_of_mut!(msg_flags),
-            )
-        };
-
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
-                // No PDU buffered this tick; the next poll will retry.
-                return Ok(None);
+        loop {
+            match self.recv_step() {
+                Ok(RecvStep::Message(m)) => return Ok(Some(m)),
+                Ok(RecvStep::Closed) => return Err(SctpError::AssociationClosed),
+                // A notification or a partial delivery was consumed; look for
+                // more in this tick rather than waiting for the next poll.
+                Ok(RecvStep::Pending) => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SctpError::Io(e)),
             }
-            return Err(SctpError::Io(err));
         }
-        let n = n as usize;
+    }
 
-        // MSG_NOTIFICATION: an SCTP event, not user data. Update association
-        // state and report "nothing to deliver" for this tick.
+    /// One `sctp_recvmsg` on the non-blocking socket, classified per the SCTP
+    /// sockets API (RFC 6458):
+    /// * `Err(WouldBlock)` — nothing to read (EAGAIN). Never data (#243);
+    /// * a notification (`MSG_NOTIFICATION`, §6.1) — association state is
+    ///   updated; [`RecvStep::Closed`] if it ended the association, else
+    ///   [`RecvStep::Pending`];
+    /// * a return of 0 — the peer shut the association down (EOF);
+    /// * user data without `MSG_EOR` — one piece of a message larger than the
+    ///   receive buffer (partial delivery, §8.1.20): buffered, `Pending`;
+    /// * user data with `MSG_EOR` — the end of a message: the buffered pieces
+    ///   plus this one, with the stream and PPID of the message (§5.3.2;
+    ///   the PPID in network byte order).
+    fn recv_step(&mut self) -> io::Result<RecvStep> {
+        let raw = raw_recvmsg(self.fd, self.max_recv.max(1))?;
+        Ok(self.classify(raw))
+    }
+
+    /// Classify one completed `sctp_recvmsg` (see [`recv_step`](Self::recv_step)).
+    fn classify(&mut self, raw: RawRecv) -> RecvStep {
+        let RawRecv {
+            mut buf,
+            n,
+            sinfo,
+            msg_flags,
+        } = raw;
         if (msg_flags & libc::MSG_NOTIFICATION) != 0 {
-            trace!("Kernel SCTP notification received ({} bytes), skipping", n);
-            self.handle_notification_state(&buf[..n.min(buf.len())]);
-            if !self.established {
-                return Err(SctpError::AssociationClosed);
-            }
-            return Ok(None);
+            trace!("Kernel SCTP notification received ({} bytes)", n);
+            self.handle_notification_state(&buf[..n]);
+            return if self.established {
+                RecvStep::Pending
+            } else {
+                RecvStep::Closed
+            };
         }
 
-        if n == 0 {
-            // Peer performed an orderly shutdown.
+        if n == 0 && self.partial.is_none() {
             debug!("Kernel SCTP peer shut down the association");
             self.established = false;
-            return Err(SctpError::AssociationClosed);
+            return RecvStep::Closed;
         }
 
         buf.truncate(n);
-        // CRITICAL: sinfo_ppid arrives in network byte order; convert back.
-        let ppid = u32::from_be(sinfo.sinfo_ppid);
-        let stream_id = sinfo.sinfo_stream;
+        let piece_ppid = u32::from_be(sinfo.sinfo_ppid);
+        let piece_stream = sinfo.sinfo_stream;
+        let (mut data, ppid, stream_id) = match self.partial.take() {
+            // Later pieces of one message: the stream and PPID are the
+            // message's, taken from its first piece.
+            Some((mut acc, ppid, stream)) => {
+                acc.extend_from_slice(&buf);
+                (acc, ppid, stream)
+            }
+            None => (buf, piece_ppid, piece_stream),
+        };
+
+        if (msg_flags & libc::MSG_EOR) == 0 {
+            trace!(
+                "Kernel SCTP partial delivery: {} bytes so far on stream {}",
+                data.len(),
+                stream_id
+            );
+            self.partial = Some((std::mem::take(&mut data), ppid, stream_id));
+            return RecvStep::Pending;
+        }
 
         debug!(
-            "Kernel SCTP received {} bytes on stream {} with PPID {} (wire be: {:#010x})",
-            n, stream_id, ppid, sinfo.sinfo_ppid
+            "Kernel SCTP received {} bytes on stream {} with PPID {}",
+            data.len(),
+            stream_id,
+            ppid
         );
         self.ppid_check.observe(ppid, stream_id);
-
-        Ok(Some(ReceivedMessage {
+        RecvStep::Message(ReceivedMessage {
             stream_id,
-            data: Bytes::from(buf),
+            data: Bytes::from(data),
             ppid,
-        }))
+        })
     }
 
     /// Inspect an SCTP notification body and update `established` if it
@@ -728,6 +753,7 @@ mod tests {
     use super::{PpidCheck, SctpEventSubscribe};
     use crate::association::{SctpConfig, NGAP_PPID};
     use crate::S1AP_PPID;
+    use libc::c_int;
     use std::mem;
 
     #[test]
@@ -803,7 +829,7 @@ mod tests {
                         0,
                     )
                 };
-                assert_eq!(n, msg.len() as isize, "sctp_sendmsg");
+                assert_eq!(n, msg.len() as c_int, "sctp_sendmsg");
             }
             // Keep the association up until the client has read both.
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -831,6 +857,172 @@ mod tests {
             "an NGAP message on an S1AP association is counted, and still delivered"
         );
 
+        server.join().expect("server thread");
+    }
+
+    /// Accept one kernel-SCTP association on 127.0.0.1 and run `serve` on the
+    /// server side in a thread. `None` (with a note) on a host without SCTP.
+    fn kernel_server(
+        serve: impl FnOnce(socket2::Socket) + Send + 'static,
+    ) -> Option<(std::net::SocketAddr, std::thread::JoinHandle<()>)> {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+        let listener = match Socket::new(
+            Domain::IPV4,
+            Type::STREAM,
+            Some(Protocol::from(libc::IPPROTO_SCTP)),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: no kernel SCTP on this host ({e})");
+                return None;
+            }
+        };
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        listener.bind(&SockAddr::from(any)).expect("bind");
+        listener.listen(1).expect("listen");
+        let addr = listener
+            .local_addr()
+            .expect("local addr")
+            .as_socket()
+            .expect("inet");
+        let handle = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            serve(conn);
+        });
+        Some((addr, handle))
+    }
+
+    /// Send `msg` with `ppid` on a connected one-to-one kernel SCTP socket.
+    fn server_send(conn: &socket2::Socket, msg: &[u8], ppid: u32) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `conn` is a connected one-to-one SCTP socket; `msg` is a
+        // valid slice; `to`/`tolen` are NULL/0 for a connected socket.
+        let n = unsafe {
+            super::sctp_sendmsg(
+                conn.as_raw_fd(),
+                msg.as_ptr().cast(),
+                msg.len(),
+                std::ptr::null(),
+                0,
+                ppid.to_be(),
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        assert_eq!(n, msg.len() as c_int, "sctp_sendmsg");
+    }
+
+    /// #243: once the one pending message is read, the socket has nothing
+    /// left. `sctp_recvmsg` then fails with EAGAIN, and that must be reported
+    /// as "nothing pending" — not as a phantom PPID-0 message the size of the
+    /// receive buffer, which is what a `ssize_t`-declared binding of libsctp's
+    /// `int`-returning function produced, spinning the eNB at 100% CPU.
+    #[tokio::test]
+    async fn an_empty_socket_yields_no_phantom_message() {
+        let Some((addr, server)) = kernel_server(|conn| {
+            server_send(&conn, b"s1-setup-response", S1AP_PPID);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }) else {
+            return;
+        };
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let mut client =
+            super::KernelSctpAssociation::connect(any, addr, &SctpConfig::default(), S1AP_PPID)
+                .await
+                .expect("connect");
+
+        let first = client.recv().await.expect("recv").expect("open");
+        assert_eq!(
+            (first.ppid, &first.data[..]),
+            (S1AP_PPID, &b"s1-setup-response"[..])
+        );
+
+        // Non-blocking path: nothing pending is Ok(None), every time.
+        for _ in 0..1000 {
+            assert!(
+                client.try_recv().expect("try_recv").is_none(),
+                "an empty socket must not produce a message"
+            );
+        }
+        // Async path: recv waits instead of returning a phantom message.
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(300), client.recv()).await;
+        assert!(
+            waited.is_err(),
+            "recv must wait on an empty socket, got {waited:?}"
+        );
+        assert_eq!(
+            client.unexpected_ppid_count(),
+            0,
+            "no PPID-0 message was seen"
+        );
+
+        server.join().expect("server thread");
+    }
+
+    /// A message larger than the receive buffer arrives in several partial
+    /// deliveries; only the last carries MSG_EOR (RFC 6458 §8.1.20). They must
+    /// be reassembled into one message with its own PPID and stream.
+    #[tokio::test]
+    async fn a_partially_delivered_message_is_reassembled() {
+        let big: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let sent = big.clone();
+        let Some((addr, server)) = kernel_server(move |conn| {
+            server_send(&conn, &sent, S1AP_PPID);
+            server_send(&conn, b"after", S1AP_PPID);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }) else {
+            return;
+        };
+        let config = SctpConfig {
+            max_receive_buffer_size: 512,
+            ..SctpConfig::default()
+        };
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let mut client = super::KernelSctpAssociation::connect(any, addr, &config, S1AP_PPID)
+            .await
+            .expect("connect");
+
+        let whole = client.recv().await.expect("recv").expect("open");
+        assert_eq!(whole.ppid, S1AP_PPID);
+        assert_eq!(
+            whole.data.len(),
+            big.len(),
+            "one message, not 512-octet pieces"
+        );
+        assert_eq!(&whole.data[..], &big[..]);
+        let next = client.recv().await.expect("recv").expect("open");
+        assert_eq!(&next.data[..], b"after", "message boundaries are kept");
+        assert_eq!(client.unexpected_ppid_count(), 0);
+
+        server.join().expect("server thread");
+    }
+
+    /// An orderly peer shutdown ends the association: `recv` reports EOF
+    /// (`Ok(None)`) instead of looping.
+    #[tokio::test]
+    async fn a_peer_shutdown_is_end_of_stream() {
+        let Some((addr, server)) = kernel_server(|conn| {
+            server_send(&conn, b"bye", S1AP_PPID);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(conn);
+        }) else {
+            return;
+        };
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let mut client =
+            super::KernelSctpAssociation::connect(any, addr, &SctpConfig::default(), S1AP_PPID)
+                .await
+                .expect("connect");
+        let first = client.recv().await.expect("recv").expect("open");
+        assert_eq!(&first.data[..], b"bye");
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), client.recv())
+            .await
+            .expect("recv returns once the peer has shut down");
+        assert!(matches!(end, Ok(None)), "EOF, got {end:?}");
+        assert!(!client.is_established());
         server.join().expect("server thread");
     }
 
