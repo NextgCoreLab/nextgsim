@@ -9,8 +9,11 @@
 //! makes the eNB run the AS Security Mode Command with the `K_eNB` the MME
 //! derived (TS 33.401 §7.2.6.2) and an RRCConnectionReconfiguration carrying
 //! the ATTACH ACCEPT; the UE's ATTACH COMPLETE comes back over a ciphered,
-//! integrity-protected SRB1; and INITIAL CONTEXT SETUP RESPONSE names the
-//! eNB's S1-U endpoint.
+//! integrity-protected SRB2 -- the reconfiguration added it -- and INITIAL
+//! CONTEXT SETUP RESPONSE names the eNB's S1-U endpoint. Then the user plane:
+//! an IP packet the UE sends leaves the eNB as a G-PDU on the SGW's TEID, and
+//! a G-PDU on the eNB's TEID reaches the UE's IP stack, through PDCP
+//! (ciphered with `K_UPenc`), RLC UM and RLS in both directions.
 //!
 //! The MME here is written from TS 24.301 / TS 33.401 with the crypto
 //! primitives directly -- not with `nextgsim-eps-nas` -- so a symmetric
@@ -24,7 +27,7 @@ use nextgsim_crypto::eps_kdf::{derive_algorithm_key, derive_kasme, derive_kenb, 
 use nextgsim_crypto::milenage::Milenage;
 use nextgsim_crypto::nea::nea2_encrypt;
 use nextgsim_crypto::nia::nia2_compute_mac;
-use nextgsim_enb::radio::{run_operational, RlsRadio};
+use nextgsim_enb::radio::{run_operational, RlsRadio, S1uEndpoint};
 use nextgsim_enb::s1_task::{S1Message, S1Transport};
 use nextgsim_lte_ue::config::{LteUeConfig, SubscriberConfig};
 use nextgsim_lte_ue::nas::EpsNas;
@@ -108,7 +111,13 @@ fn bits(octets: &[u8]) -> bitvec::vec::BitVec<u8, bitvec::order::Msb0> {
 
 /// INITIAL CONTEXT SETUP REQUEST (TS 36.413 §9.1.4.1) with one E-RAB
 /// carrying `nas`, UE security capabilities 128-EEA1/2 and 128-EIA1/2.
-fn initial_context_setup(mme: u32, enb: u32, kenb: &[u8; 32], nas: &[u8]) -> Vec<u8> {
+fn initial_context_setup(
+    mme: u32,
+    enb: u32,
+    kenb: &[u8; 32],
+    nas: &[u8],
+    sgw: Ipv4Addr,
+) -> Vec<u8> {
     use InitialContextSetupRequestProtocolIEs_EntryValue as V;
     let ie = |id, v| InitialContextSetupRequestProtocolIEs_Entry {
         id: ProtocolIE_ID(id),
@@ -132,7 +141,7 @@ fn initial_context_setup(mme: u32, enb: u32, kenb: &[u8; 32], nas: &[u8]) -> Vec
                     gbr_qos_information: None,
                     ie_extensions: None,
                 },
-                transport_layer_address: TransportLayerAddress(bits(&[127, 0, 0, 2])),
+                transport_layer_address: TransportLayerAddress(bits(&sgw.octets())),
                 gtp_teid: GTP_TEID(vec![0, 0, 0x12, 0x34]),
                 nas_pdu: Some(NAS_PDU(nas.to_vec())),
                 ie_extensions: None,
@@ -288,6 +297,11 @@ struct Harness {
     mme_rx: mpsc::UnboundedReceiver<(u16, Vec<u8>)>,
     state_rx: watch::Receiver<UeRrcState>,
     enb_ue_id: u32,
+    /// IP packets into the UE's uplink, and out of its downlink.
+    ip_ul: mpsc::Sender<Vec<u8>>,
+    ip_dl: mpsc::Receiver<Vec<u8>>,
+    /// The eNB's S1-U socket address.
+    enb_s1u: SocketAddr,
     _stop: watch::Sender<bool>,
 }
 
@@ -305,6 +319,8 @@ async fn start() -> Harness {
     cfg.s1ap_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut radio = RlsRadio::bind(&cfg).await.unwrap();
     let enb_addr: SocketAddr = radio.local_addr().unwrap();
+    let mut s1u = S1uEndpoint::bind(&cfg, Some(0)).await.unwrap();
+    let enb_s1u = s1u.local_addr().unwrap();
     let (to_enb, from_mme) = mpsc::unbounded_channel();
     let (to_mme, mut mme_rx) = mpsc::unbounded_channel();
     let mut s1 = ChannelMme {
@@ -312,7 +328,7 @@ async fn start() -> Harness {
         tx: to_mme,
     };
     let enb_cfg = cfg.clone();
-    tokio::spawn(async move { run_operational(&enb_cfg, &mut radio, &mut s1).await });
+    tokio::spawn(async move { run_operational(&enb_cfg, &mut radio, &mut s1u, &mut s1).await });
 
     let ue_cfg = LteUeConfig {
         plmn: Plmn::new(999, 70, false),
@@ -331,14 +347,16 @@ async fn start() -> Harness {
             apn: None,
             pdn_type: Default::default(),
         }),
+        tun: None,
     };
     nextgsim_lte_ue::config::validate(&ue_cfg).unwrap();
     let nas = Box::new(EpsNas::new(ue_cfg.eps_nas().unwrap()));
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (state_tx, state_rx) = watch::channel(UeRrcState::NoCell);
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (ip, ip_ul, ip_dl) = nextgsim_lte_ue::task::IpIo::channel(16);
     tokio::spawn(async move {
-        nextgsim_lte_ue::task::run(&ue_cfg, nas, socket, state_tx, stop_rx).await
+        nextgsim_lte_ue::task::run(&ue_cfg, nas, socket, state_tx, stop_rx, ip).await
     });
 
     let (stream, pdu) = next_s1(&mut mme_rx).await;
@@ -376,6 +394,9 @@ async fn start() -> Harness {
         mme_rx,
         state_rx,
         enb_ue_id: enb_ue_id.unwrap(),
+        ip_ul,
+        ip_dl,
+        enb_s1u,
         _stop: stop_tx,
     }
 }
@@ -423,20 +444,26 @@ fn attach_accept(mme: &mut MmeNas) -> Vec<u8> {
     mme.protect(&m, 2)
 }
 
-#[tokio::test]
-async fn the_ue_attaches_through_the_enb_with_as_security_and_initial_context_setup() {
-    let mut h = start().await;
+/// Run the attach to ATTACH COMPLETE with the SGW's S1-U address `sgw`;
+/// returns the eNB's S1-U TEID for E-RAB 5.
+async fn attach(h: &mut Harness, sgw: Ipv4Addr) -> u32 {
     wait_state(&mut h.state_rx, |s| {
         matches!(s, UeRrcState::Connected { .. })
     })
     .await;
-    let mut mme = authenticate_and_secure(&mut h).await;
+    let mut mme = authenticate_and_secure(h).await;
 
     // TS 33.401 §7.2.6.2: K_eNB from K_ASME and the SMC complete's UL COUNT 0.
     let kenb = derive_kenb(&mme.kasme, 0);
     let accept = attach_accept(&mut mme);
     h.to_enb
-        .send(initial_context_setup(4242, h.enb_ue_id, &kenb, &accept))
+        .send(initial_context_setup(
+            4242,
+            h.enb_ue_id,
+            &kenb,
+            &accept,
+            sgw,
+        ))
         .unwrap();
 
     // The eNB answers only after the AS SMC verified and the reconfiguration
@@ -467,7 +494,8 @@ async fn the_ue_attaches_through_the_enb_with_as_security_and_initial_context_se
     assert_ne!(teid, vec![0, 0, 0, 0]);
 
     // ATTACH COMPLETE, sent by the UE's NAS after the RRCConnectionReconfiguration
-    // delivered the ATTACH ACCEPT, over SRB1 with AS ciphering on.
+    // delivered the ATTACH ACCEPT, over SRB2 (which that reconfiguration added)
+    // with AS ciphering on.
     let (_, ul) = uplink_nas(next_s1(&mut h.mme_rx).await.1);
     let complete = mme.unprotect(&ul);
     assert_eq!(&complete[..2], &[0x07, 0x43]);
@@ -476,6 +504,58 @@ async fn the_ue_attaches_through_the_enb_with_as_security_and_initial_context_se
         &[0x52, 0x01, 0xC2],
         "default EPS bearer 5 accepted"
     );
+    u32::from_be_bytes(teid.try_into().unwrap())
+}
+
+#[tokio::test]
+async fn the_ue_attaches_through_the_enb_with_as_security_and_initial_context_setup() {
+    let mut h = start().await;
+    attach(&mut h, Ipv4Addr::new(127, 0, 0, 2)).await;
+}
+
+/// The user plane end to end: UE IP stack → PDCP (EEA2) → RLC UM → RLS →
+/// eNB → G-PDU to the SGW's S1-U TEID, and back on the eNB's TEID.
+#[tokio::test]
+async fn ip_packets_cross_the_drb_and_s1u_in_both_directions() {
+    // A stand-in SGW-U on its own loopback address, on the GTP-U port the eNB
+    // derives from the E-RAB's Transport Layer Address.
+    let sgw_ip = Ipv4Addr::new(127, 0, 0, 77);
+    let sgw = tokio::net::UdpSocket::bind((sgw_ip, 2152)).await.unwrap();
+    let mut h = start().await;
+    let enb_teid = attach(&mut h, sgw_ip).await;
+
+    let mut buf = vec![0u8; 2048];
+    for i in 0..5u8 {
+        // Uplink: an IPv4 header's worth of octets from the UE address.
+        let packet = vec![
+            0x45, 0, 0, 24, 0, i, 0, 0, 64, 1, 0, 0, 10, 45, 0, 2, 8, 8, 8, 8, 0, 0, 0, i,
+        ];
+        h.ip_ul.send(packet.clone()).await.unwrap();
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), sgw.recv_from(&mut buf))
+            .await
+            .expect("no G-PDU at the SGW")
+            .unwrap();
+        // TS 29.281 §5.1: version 1, PT 1, no optional fields; G-PDU; the
+        // SGW's TEID from the E-RAB item (0x1234); the packet unchanged.
+        let mut expect = vec![0x30, 0xFF, 0x00, packet.len() as u8, 0x00, 0x00, 0x12, 0x34];
+        expect.extend_from_slice(&packet);
+        assert_eq!(&buf[..n], expect.as_slice(), "uplink G-PDU {i}");
+        assert_eq!(from, h.enb_s1u);
+
+        // Downlink: a G-PDU on the eNB's TEID reaches the UE's IP stack.
+        let reply = vec![
+            0x45, 0, 0, 24, 0, i, 0, 0, 64, 1, 0, 0, 8, 8, 8, 8, 10, 45, 0, 2, 0, 0, 0, i,
+        ];
+        let mut g = vec![0x30, 0xFF, 0x00, reply.len() as u8];
+        g.extend_from_slice(&enb_teid.to_be_bytes());
+        g.extend_from_slice(&reply);
+        sgw.send_to(&g, h.enb_s1u).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), h.ip_dl.recv())
+            .await
+            .expect("no downlink packet at the UE")
+            .unwrap();
+        assert_eq!(got, reply, "downlink packet {i}");
+    }
 }
 
 #[tokio::test]
@@ -491,7 +571,13 @@ async fn a_wrong_kenb_fails_the_as_smc_and_initial_context_setup() {
     // answers SecurityModeFailure, and the eNB fails the procedure.
     let accept = attach_accept(&mut mme);
     h.to_enb
-        .send(initial_context_setup(4242, h.enb_ue_id, &[0; 32], &accept))
+        .send(initial_context_setup(
+            4242,
+            h.enb_ue_id,
+            &[0; 32],
+            &accept,
+            Ipv4Addr::new(127, 0, 0, 2),
+        ))
         .unwrap();
     let (_, pdu) = next_s1(&mut h.mme_rx).await;
     let S1AP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome {

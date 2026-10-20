@@ -212,7 +212,9 @@ fn enb_config(port: u16, plmn: Plmn) -> EnbConfig {
         s1_setup_response_timeout_ms: 5000,
         radio: Default::default(),
         security: Default::default(),
-        gtp_ip: None,
+        // S1-U on its own loopback address: port 2152 on 127.0.0.1 belongs to
+        // whatever else runs GTP-U on this host (the EPC's SGW-U is 127.0.0.6).
+        gtp_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 10))),
     }
 }
 
@@ -313,6 +315,12 @@ fn subscriber() -> SubscriberConfig {
 
 /// eNB with S1 set up against `mmed` on `remote`, and the LTE UE with its EPS
 /// NAS camped on it. Returns the UE's RRC state and NAS status.
+/// The UE's IP seam: packets into its uplink, and out of its downlink.
+type IpEnds = (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+);
+
 async fn enb_and_ue(
     cfg: EnbConfig,
     remote: SocketAddr,
@@ -320,8 +328,9 @@ async fn enb_and_ue(
     tokio::sync::watch::Receiver<UeRrcState>,
     std::sync::Arc<std::sync::Mutex<EpsNasStatus>>,
     tokio::sync::watch::Sender<bool>,
+    IpEnds,
 ) {
-    use nextgsim_enb::radio::{run_operational, RlsRadio};
+    use nextgsim_enb::radio::{run_operational, RlsRadio, S1uEndpoint};
     let (_mme, mut transport) = tokio::time::timeout(
         Duration::from_secs(30),
         establish_s1(&cfg, &mut KernelConnector::default(), remote),
@@ -330,8 +339,11 @@ async fn enb_and_ue(
     .expect("S1 Setup did not complete against mmed");
     let mut radio = RlsRadio::bind(&cfg).await.unwrap();
     let enb_addr = radio.local_addr().unwrap();
+    let mut s1u = S1uEndpoint::bind(&cfg, None).await.unwrap();
     let enb_cfg = cfg.clone();
-    tokio::spawn(async move { run_operational(&enb_cfg, &mut radio, &mut transport).await });
+    tokio::spawn(
+        async move { run_operational(&enb_cfg, &mut radio, &mut s1u, &mut transport).await },
+    );
 
     let ue_cfg = LteUeConfig {
         plmn: Plmn::new(999, 70, false),
@@ -339,6 +351,7 @@ async fn enb_and_ue(
         sti: Some(0xABCD),
         position: [0, 0, 0],
         subscriber: Some(subscriber()),
+        tun: None,
     };
     nextgsim_lte_ue::config::validate(&ue_cfg).unwrap();
     let nas = EpsNas::new(ue_cfg.eps_nas().unwrap());
@@ -346,10 +359,11 @@ async fn enb_and_ue(
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (state_tx, state_rx) = tokio::sync::watch::channel(UeRrcState::NoCell);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (ip, ip_ul, ip_dl) = nextgsim_lte_ue::task::IpIo::channel(64);
     tokio::spawn(async move {
-        nextgsim_lte_ue::task::run(&ue_cfg, Box::new(nas), socket, state_tx, stop_rx).await
+        nextgsim_lte_ue::task::run(&ue_cfg, Box::new(nas), socket, state_tx, stop_rx, ip).await
     });
-    (state_rx, status, stop_tx)
+    (state_rx, status, stop_tx, (ip_ul, ip_dl))
 }
 
 async fn wait_nas(
@@ -386,7 +400,7 @@ async fn lte_ue_attach_without_an_hss_is_rejected_and_retried() {
     let mut cfg = enb_config(port, Plmn::new(999, 70, false));
     cfg.radio.rls_port = 0;
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let (mut state_rx, status, _stop) = enb_and_ue(cfg, remote).await;
+    let (mut state_rx, status, _stop, _ip) = enb_and_ue(cfg, remote).await;
     assert!(
         mmed.wait_for(
             "Attach Request: IMSI[999700000000001] attach_type[1] on enb_ue_s1ap_id=",
@@ -426,7 +440,7 @@ async fn lte_ue_attaches_through_the_nextgcore_epc() {
     cfg.mme_configs[0].address = IpAddr::V4(MME_ADDR);
     cfg.radio.rls_port = 0;
     let remote = SocketAddr::new(IpAddr::V4(MME_ADDR), port);
-    let (_state_rx, status, _stop) = enb_and_ue(cfg, remote).await;
+    let (_state_rx, status, _stop, _ip) = enb_and_ue(cfg, remote).await;
     let s = wait_nas(&status, Duration::from_secs(40), |s| {
         s.state == EmmState::Registered || matches!(s.state, EmmState::NoService(_))
     })
@@ -440,4 +454,94 @@ async fn lte_ue_attaches_through_the_nextgcore_epc() {
             || mmed.wait_for("attach complete", Duration::from_secs(1)),
         "mmed did not log the ATTACH COMPLETE"
     );
+}
+
+/// RFC 1071 Internet checksum.
+fn inet_checksum(b: &[u8]) -> u16 {
+    let mut sum: u32 = b
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])))
+        .sum();
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An IPv4 ICMP Echo Request (RFC 792) from `src` to `dst`.
+fn icmp_echo(src: Ipv4Addr, dst: Ipv4Addr, id: u16, seq: u16) -> Vec<u8> {
+    let mut icmp = vec![8, 0, 0, 0];
+    icmp.extend_from_slice(&id.to_be_bytes());
+    icmp.extend_from_slice(&seq.to_be_bytes());
+    icmp.extend_from_slice(b"nextgsim-lte-ping");
+    let c = inet_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&c.to_be_bytes());
+    let len = (20 + icmp.len()) as u16;
+    let mut ip = vec![0x45, 0];
+    ip.extend_from_slice(&len.to_be_bytes());
+    ip.extend_from_slice(&[0, 0, 0x40, 0, 64, 1, 0, 0]);
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    let c = inet_checksum(&ip);
+    ip[10..12].copy_from_slice(&c.to_be_bytes());
+    ip.extend_from_slice(&icmp);
+    ip
+}
+
+/// #186 increment 4's exit criterion: after the attach, ICMP echo through the
+/// default bearer -- UE PDCP/RLC over RLS, the eNB's S1-U, nextgcore's SGW-U
+/// and PGW-U -- with 0% loss. Needs everything the attach test needs, plus a
+/// PGW-U with its SGi data plane up and a host that answers `NEXTGSIM_PING_TARGET`
+/// (default 10.45.0.1, the PGW's gateway address): `bring-up.sh` starts upfd
+/// without a data plane, because its N6 interface needs CAP_NET_ADMIN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the attach test's EPC plus a PGW-U SGi data plane (CAP_NET_ADMIN)"]
+async fn lte_ue_pings_through_the_nextgcore_epc_with_no_loss() {
+    assert!(
+        std::env::var("NEXTGCORE_EPC_DATAPLANE").is_ok(),
+        "start the EPC with a PGW-U data plane and set NEXTGCORE_EPC_DATAPLANE=1"
+    );
+    init_logging();
+    let port = 36412;
+    let _mmed = start_mmed_with(&tmpdir("epc-ping"), port, true);
+    let mut cfg = enb_config(port, Plmn::new(999, 70, false));
+    cfg.mme_configs[0].address = IpAddr::V4(MME_ADDR);
+    cfg.radio.rls_port = 0;
+    let remote = SocketAddr::new(IpAddr::V4(MME_ADDR), port);
+    let (_state_rx, status, _stop, (ul, mut dl)) = enb_and_ue(cfg, remote).await;
+    let s = wait_nas(&status, Duration::from_secs(40), |s| s.bearer.is_some()).await;
+    let bearer = s.bearer.unwrap();
+    let ue_ip = match bearer.pdn_address {
+        nextgsim_eps_nas::ie::PdnAddress::Ipv4(a)
+        | nextgsim_eps_nas::ie::PdnAddress::Ipv4v6(_, a) => a,
+        other => panic!("no IPv4 PDN address: {other:?}"),
+    };
+    let target: Ipv4Addr = std::env::var("NEXTGSIM_PING_TARGET")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(Ipv4Addr::new(10, 45, 0, 1));
+    let count = 20u16;
+    for seq in 0..count {
+        ul.send(icmp_echo(ue_ip, target, 0x186, seq)).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let p = dl.recv().await.expect("UE downlink closed");
+                // Echo Reply (type 0) for this id/seq, to the UE's address.
+                if p.len() >= 28
+                    && p[9] == 1
+                    && p[16..20] == ue_ip.octets()
+                    && p[20] == 0
+                    && p[24..26] == 0x186u16.to_be_bytes()
+                    && p[26..28] == seq.to_be_bytes()
+                {
+                    return p;
+                }
+            }
+        })
+        .await;
+        assert!(
+            reply.is_ok(),
+            "echo {seq} of {count} lost: the loss must be 0%"
+        );
+    }
 }

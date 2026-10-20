@@ -70,6 +70,11 @@ pub trait NasLayer: Send {
     fn k_enb(&mut self) -> Option<[u8; 32]> {
         None
     }
+    /// The EPS bearer identity of the default bearer, once activated: the
+    /// bearer uplink IP packets go on (TS 23.401 §4.7.2; no TFTs here).
+    fn default_bearer_ebi(&self) -> Option<u8> {
+        None
+    }
     /// The earliest NAS timer deadline.
     fn next_deadline(&self) -> Option<Instant> {
         None
@@ -173,6 +178,10 @@ impl NasLayer for EpsNas {
 
     fn k_enb(&mut self) -> Option<[u8; 32]> {
         self.ue.k_enb()
+    }
+
+    fn default_bearer_ebi(&self) -> Option<u8> {
+        self.ue.default_bearer().map(|b| b.ebi)
     }
 
     fn next_deadline(&self) -> Option<Instant> {

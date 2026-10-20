@@ -24,3 +24,9 @@ subscriber:
   # Requested APN in the PDN CONNECTIVITY REQUEST; omitted, the network's default.
   # apn: internet
   pdn_type: ipv4
+
+# The TUN interface the default bearer's PDN address goes on (needs
+# CAP_NET_ADMIN). Remove the section to run without one.
+tun:
+  # name: lteuetun5
+  configure_routing: false

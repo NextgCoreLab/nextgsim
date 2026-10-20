@@ -49,7 +49,7 @@ async fn main() -> ExitCode {
 
 #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
 async fn run(cfg: nextgsim_enb::EnbConfig) -> ExitCode {
-    use nextgsim_enb::radio::{run_operational, RlsRadio, Stopped};
+    use nextgsim_enb::radio::{run_operational, RlsRadio, S1uEndpoint, Stopped};
     use nextgsim_enb::s1_task::{establish_s1, kernel::KernelConnector};
     use std::net::SocketAddr;
 
@@ -61,6 +61,14 @@ async fn run(cfg: nextgsim_enb::EnbConfig) -> ExitCode {
                 cfg.radio.link_ip,
                 cfg.radio.rls_port
             );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut s1u = match S1uEndpoint::bind(&cfg, None).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("cannot bind the S1-U GTP-U endpoint: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -80,7 +88,7 @@ async fn run(cfg: nextgsim_enb::EnbConfig) -> ExitCode {
                 // The cell is only on air while S1 is operational: a UE
                 // camping on it could not reach an MME otherwise.
                 tokio::select! {
-                    stopped = run_operational(&cfg, &mut radio, &mut transport) => {
+                    stopped = run_operational(&cfg, &mut radio, &mut s1u, &mut transport) => {
                         if let Stopped::RadioFailed(e) = stopped {
                             log::error!("RLS radio endpoint failed: {e}");
                             return ExitCode::FAILURE;

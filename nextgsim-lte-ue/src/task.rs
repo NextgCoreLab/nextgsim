@@ -1,6 +1,8 @@
 //! The LTE UE's RLS runtime: heartbeats to the search space (cell search and
 //! measurement, as RLS models them), RRC PDUs to and from the serving cell,
-//! and the [`UeRrc`] timers.
+//! DRB data PDUs and the IP packets they carry ([`IpIo`]), and the
+//! [`UeRrc`] timers. RLS frames carry the E-UTRA LCID in their `payload`
+//! ([`nextgsim_rls::lte`]).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -8,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use nextgsim_rls::{
-    codec as rls_codec, CellSearchEvent, PduType, RlsMessage, RlsPduTransmission,
-    RlsPduTransmissionAck, RrcChannel, SimCoord, UeCellSearch,
+    codec as rls_codec, lte, CellSearchEvent, PduType, RlsMessage, RlsPduTransmission,
+    RlsPduTransmissionAck, SimCoord, UeCellSearch,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::LteUeConfig;
 use crate::nas::NasLayer;
@@ -20,6 +22,33 @@ use crate::rrc::{UeAction, UeRrc, UeRrcState};
 
 /// RLS heartbeat interval (as the NR UE).
 const HEARTBEAT_MS: u64 = nextgsim_rls::DEFAULT_HEARTBEAT_INTERVAL_MS;
+
+/// The UE's IP stack seam: packets to send (from the TUN interface, or a
+/// test) and a sink for packets received on the DRBs.
+#[derive(Debug)]
+pub struct IpIo {
+    /// IP packets for the uplink.
+    pub uplink: mpsc::Receiver<Vec<u8>>,
+    /// IP packets from the downlink.
+    pub downlink: mpsc::Sender<Vec<u8>>,
+}
+
+impl IpIo {
+    /// An `IpIo` and the far ends of its two channels: send uplink packets on
+    /// the first, receive downlink packets from the second.
+    pub fn channel(depth: usize) -> (Self, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (ul_tx, ul_rx) = mpsc::channel(depth);
+        let (dl_tx, dl_rx) = mpsc::channel(depth);
+        (
+            Self {
+                uplink: ul_rx,
+                downlink: dl_tx,
+            },
+            ul_tx,
+            dl_rx,
+        )
+    }
+}
 
 /// Run the UE until `stop` fires. Every state change is published on the
 /// returned watch channel, so a caller (a test, or a future CLI) can follow
@@ -30,6 +59,7 @@ pub async fn run(
     socket: UdpSocket,
     state_tx: watch::Sender<UeRrcState>,
     mut stop: watch::Receiver<bool>,
+    mut ip: IpIo,
 ) -> std::io::Result<()> {
     let sti = cfg.sti.unwrap_or_else(rand::random);
     let search = cfg
@@ -81,6 +111,7 @@ pub async fn run(
                 acts
             }
             _ = sleep => rrc.on_timer(Instant::now()),
+            Some(packet) = ip.uplink.recv() => rrc.send_ip(&packet),
             r = socket.recv_from(&mut buf) => {
                 let (n, from) = r?;
                 match rls_codec::decode(&buf[..n]) {
@@ -93,11 +124,17 @@ pub async fn run(
                         let _ = socket.send_to(&rls_codec::encode(&RlsMessage::PduTransmissionAck(
                             RlsPduTransmissionAck { sti, pdu_ids: vec![pdu.pdu_id] },
                         )), from).await;
-                        match RrcChannel::from_u32(pdu.payload) {
-                            Some(ch) if ch.is_downlink() => {
-                                rrc.on_downlink(pdu.sti, ch, &pdu.pdu, Instant::now())
+                        match lte::split_rrc_payload(pdu.payload) {
+                            Some((ch, lcid)) if ch.is_downlink() => {
+                                rrc.on_downlink(pdu.sti, ch, lcid, &pdu.pdu, Instant::now())
                             }
                             _ => Vec::new(),
+                        }
+                    }
+                    Ok(RlsMessage::PduTransmission(pdu)) if pdu.pdu_type == PduType::Data => {
+                        match lte::data_lcid(pdu.payload) {
+                            Some(lcid) => rrc.on_data(pdu.sti, lcid, &pdu.pdu, Instant::now()),
+                            None => Vec::new(),
                         }
                     }
                     Ok(_) => Vec::new(),
@@ -105,20 +142,42 @@ pub async fn run(
                 }
             }
         };
-        for UeAction::Rrc { cell, channel, pdu } in actions {
+        for action in actions {
+            let (cell, msg) = match action {
+                UeAction::DeliverIp(packet) => {
+                    if ip.downlink.try_send(packet).is_err() {
+                        log::debug!("downlink IP packet dropped: IP stack not keeping up");
+                    }
+                    continue;
+                }
+                UeAction::Rrc {
+                    cell,
+                    channel,
+                    lcid,
+                    pdu,
+                } => (
+                    cell,
+                    RlsPduTransmission::rrc(
+                        sti,
+                        next_pdu_id,
+                        lte::rrc_payload(channel, lcid),
+                        Bytes::from(pdu),
+                    ),
+                ),
+                UeAction::Data { cell, lcid, pdu } => {
+                    let mut m = RlsPduTransmission::data(sti, next_pdu_id, Bytes::from(pdu));
+                    m.payload = u32::from(lcid);
+                    (cell, m)
+                }
+            };
+            next_pdu_id = next_pdu_id.wrapping_add(1).max(1);
             let Some(&to) = cell_addr.get(&cell) else {
                 log::warn!("no RLS address for cell {cell:#x}; PDU dropped");
                 continue;
             };
-            let id = next_pdu_id;
-            next_pdu_id = next_pdu_id.wrapping_add(1).max(1);
-            let msg = RlsMessage::PduTransmission(RlsPduTransmission::rrc(
-                sti,
-                id,
-                channel as u32,
-                Bytes::from(pdu),
-            ));
-            let _ = socket.send_to(&rls_codec::encode(&msg), to).await;
+            let _ = socket
+                .send_to(&rls_codec::encode(&RlsMessage::PduTransmission(msg)), to)
+                .await;
         }
         state_tx.send_if_modified(|s| {
             let now = rrc.state();

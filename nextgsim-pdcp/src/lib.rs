@@ -43,10 +43,12 @@
 //! simulator's time source.
 
 pub mod algorithms;
+pub mod lte_drb;
 pub mod lte_srb;
 pub mod sdap;
 pub mod srb_security;
 pub mod up_security;
+pub use lte_drb::{LteDrbPdcp, LteDrbPdcpError};
 pub use lte_srb::{LteSrbPdcp, LteSrbPdcpError, LteSrbReceived};
 pub use sdap::{SdapError, SdapHeader, SDAP_HEADER_LEN};
 pub use srb_security::{SrbSecurity, SrbSecurityError, MAC_I_LEN};

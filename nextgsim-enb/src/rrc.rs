@@ -14,15 +14,15 @@
 //! UE completes it, an RRCConnectionReconfiguration sets up one DRB per E-RAB
 //! and carries the E-RABs' NAS-PDUs (the ATTACH ACCEPT); its completion is
 //! answered with INITIAL CONTEXT SETUP RESPONSE naming the eNB's S1-U
-//! endpoints. The DRBs' user plane (PDCP/RLC on RLS, GTP-U on S1-U) is
-//! increment 4: the TEIDs are allocated here, nothing yet listens on them.
+//! endpoints, and hands each E-RAB's DRB and S1-U tunnel to the user plane
+//! ([`crate::userplane`]) as an [`Action::UserPlane`].
 //!
-//! **Not done here, by decision:** SRB2. TS 36.331 §4.2.2 has E-UTRAN
-//! configure it after security activation and move NAS onto it, but RLS
-//! carries no logical channel identity to tell SRB1 from SRB2 (or a DRB) on
-//! DCCH; that mapping is the same RLS change the DRB user plane of increment 4
-//! needs, so both come together. Until then all DCCH traffic, NAS included,
-//! stays on SRB1. **UE Capability Enquiry** is not run either: over RLS no
+//! The same reconfiguration adds **SRB2** (TS 36.331 §4.2.2: "configured by
+//! E-UTRAN after security activation"), with SRB1's AS security; NAS moves
+//! onto it once the UE has completed the reconfiguration. RLS tells SRB1,
+//! SRB2 and the DRBs apart by LCID ([`nextgsim_rls::lte`]).
+//!
+//! **UE Capability Enquiry** is not run: over RLS no
 //! configuration this eNB sends depends on a UE capability, and forwarding one
 //! to the MME (UE CAPABILITY INFO INDICATION) needs the
 //! `EUTRA-InterNodeDefinitions` module the RRC codec does not generate yet.
@@ -34,8 +34,8 @@
 //!
 //! RLS replaces the physical layer and MAC (as on the NR side). The logical
 //! channels map onto RLS RRC channels: SRB0 is CCCH and carries bare RRC
-//! messages (TM RLC, no PDCP, TS 36.331 §4.2.2); SRB1 is DCCH and carries
-//! PDCP Data PDUs (TS 36.323 §6.2.2, via [`LteSrbPdcp`]).
+//! messages (TM RLC, no PDCP, TS 36.331 §4.2.2); SRB1 and SRB2 are DCCH, LCID
+//! 1 and 2, and carry PDCP Data PDUs (TS 36.323 §6.2.2, via [`LteSrbPdcp`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -43,12 +43,16 @@ use std::net::IpAddr;
 use nextgsim_common::Plmn;
 use nextgsim_crypto::eps_kdf::{derive_algorithm_key, EpsAlgorithmType};
 use nextgsim_lte_rrc::msg::{
-    self, CellInfo, DrbConfig, InitialUeIdentity, MibInfo, PlmnId, Sib2Info,
+    self, CellInfo, DrbConfig, DrbRlc, InitialUeIdentity, MibInfo, PlmnId, Sib2Info,
 };
 use nextgsim_pdcp::lte_srb::{DIRECTION_DOWNLINK, SRB1_BEARER};
+
+/// BEARER of SRB2: RB identity 2 − 1 (TS 36.323 §5.6.0).
+const SRB2_BEARER: u8 = 1;
 use nextgsim_pdcp::LteSrbPdcp;
+use nextgsim_rls::lte::{LCID_SRB1, LCID_SRB2};
 use nextgsim_rls::RrcChannel;
-use nextgsim_s1ap::codec::{self as s1codec, Cause, CauseRadioNetwork, S1AP_PDU};
+use nextgsim_s1ap::codec::{self as s1codec, Cause, CauseRadioNetwork, CauseTransport, S1AP_PDU};
 
 use crate::config::{AsSecurityConfig, EnbConfig};
 use crate::s1_task::NON_UE_ASSOCIATED_STREAM;
@@ -57,6 +61,7 @@ use crate::s1ap_ue::{
     self, ErabSetup, ErabToSetup, InitialContextSetup, ReleaseIds, S1Inbound, UeLocation,
     MAX_ENB_UE_S1AP_ID,
 };
+use crate::userplane::{sgw_endpoint, UpBearer};
 
 /// DRBs one RRCConnectionReconfiguration can add here: logical channel
 /// identities 3..=10 (TS 36.331 §6.3.2 `DRB-ToAddMod`).
@@ -79,8 +84,19 @@ pub enum Action {
         ue: u32,
         /// Logical channel.
         channel: RrcChannel,
+        /// LCID on DCCH (1 SRB1, 2 SRB2), 0 otherwise ([`nextgsim_rls::lte`]).
+        lcid: u8,
         /// The PDU (an RRC message on CCCH, a PDCP PDU on DCCH).
         pdu: Vec<u8>,
+    },
+    /// Establish the user plane of `ue`'s E-RABs (their DRBs and S1-U
+    /// tunnels): the UE has completed the RRCConnectionReconfiguration that
+    /// set the DRBs up (TS 36.331 §5.3.5.3).
+    UserPlane {
+        /// RLS UE id.
+        ue: u32,
+        /// The E-RABs.
+        bearers: Vec<UpBearer>,
     },
     /// Send an S1AP PDU to the MME on `stream`.
     S1 {
@@ -132,8 +148,10 @@ impl std::fmt::Debug for PendingIcs {
 struct AsSecurity {
     eea: u8,
     eia: u8,
-    /// `K_UPenc`, for the DRBs' PDCP of increment 4.
-    #[allow(dead_code)]
+    /// `K_RRCint` and `K_RRCenc`, for SRB2 (the same AS security as SRB1).
+    k_rrc_int: [u8; 16],
+    k_rrc_enc: [u8; 16],
+    /// `K_UPenc`, for the DRBs' PDCP.
     k_up_enc: [u8; 16],
 }
 
@@ -149,6 +167,11 @@ struct UeContext {
     mme_ue_s1ap_id: Option<u32>,
     state: UeState,
     srb1: LteSrbPdcp,
+    /// SRB2 (TS 36.331 §4.2.2), from the RRCConnectionReconfiguration of
+    /// Initial Context Setup on; NAS moves onto it once the UE has completed
+    /// that reconfiguration (`srb2_ready`).
+    srb2: Option<LteSrbPdcp>,
+    srb2_ready: bool,
     identity: InitialUeIdentity,
     cause: msg::EstablishmentCauseValue,
     location: Option<UeLocation>,
@@ -182,6 +205,8 @@ pub struct EnbRrc {
     security: AsSecurityConfig,
     gtp_ip: IpAddr,
     next_teid: u32,
+    /// UEs whose context was removed since [`EnbRrc::take_released`].
+    released: Vec<u32>,
 }
 
 fn to_rrc_plmn(p: &Plmn) -> PlmnId {
@@ -257,6 +282,7 @@ impl EnbRrc {
             security: cfg.security.clone(),
             gtp_ip: cfg.gtp_ip.unwrap_or(cfg.s1ap_ip),
             next_teid: 1,
+            released: Vec::new(),
         }
     }
 
@@ -336,7 +362,19 @@ impl EnbRrc {
     fn remove(&mut self, ue: u32) -> Option<UeContext> {
         let ctx = self.ues.remove(&ue)?;
         self.by_enb_id.remove(&ctx.enb_ue_s1ap_id);
+        self.released.push(ue);
         Some(ctx)
+    }
+
+    /// The UEs whose RRC context ended since the last call: their user plane
+    /// must be released with it.
+    pub fn take_released(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.released)
+    }
+
+    /// This eNB's S1-U address.
+    pub fn gtp_ip(&self) -> IpAddr {
+        self.gtp_ip
     }
 
     /// A PDU from `ue` on UL-CCCH (SRB0): RRCConnectionRequest (§5.3.3.3).
@@ -388,6 +426,7 @@ impl EnbRrc {
                 Ok(pdu) => vec![Action::Rrc {
                     ue,
                     channel: RrcChannel::DlCcch,
+                    lcid: 0,
                     pdu,
                 }],
                 Err(e) => {
@@ -403,6 +442,8 @@ impl EnbRrc {
             // SRB1 is established when RRCConnectionSetup is sent (§5.3.3.4);
             // the eNB transmits downlink on it.
             srb1: LteSrbPdcp::with_bearer(SRB1_BEARER, DIRECTION_DOWNLINK),
+            srb2: None,
+            srb2_ready: false,
             identity,
             cause,
             location: None,
@@ -429,16 +470,40 @@ impl EnbRrc {
         vec![Action::Rrc {
             ue,
             channel: RrcChannel::DlCcch,
+            lcid: 0,
             pdu,
         }]
     }
 
-    /// A PDCP PDU from `ue` on UL-DCCH (SRB1).
-    pub fn on_ul_dcch(&mut self, ue: u32, pdcp_pdu: &[u8]) -> Vec<Action> {
+    /// A PDCP PDU from `ue` on UL-DCCH, on SRB1 or SRB2 (`lcid`).
+    pub fn on_ul_dcch(&mut self, ue: u32, lcid: u8, pdcp_pdu: &[u8]) -> Vec<Action> {
         let Some(ctx) = self.ues.get_mut(&ue) else {
             log::warn!("UE {ue}: UL-DCCH PDU with no RRC connection, discarded");
             return vec![];
         };
+        if lcid == LCID_SRB2 {
+            let Some(srb2) = ctx.srb2.as_mut() else {
+                log::warn!("UE {ue}: PDU on SRB2 before SRB2 was established, discarded");
+                return vec![];
+            };
+            return match srb2.receive(pdcp_pdu).map(|r| msg::decode_ul_dcch(&r.sdu)) {
+                // TS 36.331 §4.2.2: SRB2 carries NAS (and logged
+                // measurements, which this build does not request).
+                Ok(Ok(msg::UlDcch::InformationTransfer { nas })) => self.on_ul_nas(ue, nas),
+                Ok(Ok(other)) => {
+                    log::warn!("UE {ue}: {other:?} on SRB2, which carries NAS only here");
+                    vec![]
+                }
+                Ok(Err(e)) => {
+                    log::warn!("UE {ue}: undecodable UL-DCCH message on SRB2: {e}");
+                    vec![]
+                }
+                Err(e) => {
+                    log::warn!("UE {ue}: SRB2 PDCP: {e}; discarded");
+                    vec![]
+                }
+            };
+        }
         let sdu = match ctx.srb1.receive(pdcp_pdu) {
             Ok(r) => r.sdu,
             Err(nextgsim_pdcp::LteSrbPdcpError::IntegrityCheckFailed(_))
@@ -680,10 +745,16 @@ impl EnbRrc {
         let mut acts = Vec::new();
         match msg::encode_dl_information_transfer(tid, &nas) {
             Ok(rrc) => {
-                let (pdcp, _) = ctx.srb1.transmit(&rrc);
+                // TS 36.331 §4.2.2: NAS goes on SRB2 once it is established;
+                // before that (attach, before Initial Context Setup) on SRB1.
+                let (lcid, pdcp) = match (&mut ctx.srb2, ctx.srb2_ready) {
+                    (Some(srb2), true) => (LCID_SRB2, srb2.transmit(&rrc).0),
+                    _ => (LCID_SRB1, ctx.srb1.transmit(&rrc).0),
+                };
                 acts.push(Action::Rrc {
                     ue,
                     channel: RrcChannel::DlDcch,
+                    lcid,
                     pdu: pdcp,
                 });
             }
@@ -761,6 +832,23 @@ impl EnbRrc {
                 )),
             );
         }
+        if let Some(e) = ics
+            .erabs
+            .iter()
+            .find(|e| sgw_endpoint(&e.sgw_address).is_none())
+        {
+            // §9.2.2.1: 32, 128 or 160 bits. Anything else names no SGW.
+            log::warn!(
+                "UE {ue}: E-RAB {} Transport Layer Address of {} octets",
+                e.e_rab_id,
+                e.sgw_address.len()
+            );
+            return self.ics_failure(
+                mme,
+                enb,
+                Cause::Transport(CauseTransport(CauseTransport::UNSPECIFIED)),
+            );
+        }
         // TS 33.401 §7.2.4.2.1: the highest-priority algorithm of the eNB's
         // list that is also in the UE's security capabilities.
         let eia = self
@@ -818,7 +906,13 @@ impl EnbRrc {
         if let Err(e) = ctx.srb1.activate_tx_ciphering(eea, k_rrc_enc) {
             log::error!("UE {ue}: {e}");
         }
-        ctx.security = Some(AsSecurity { eea, eia, k_up_enc });
+        ctx.security = Some(AsSecurity {
+            eea,
+            eia,
+            k_rrc_int,
+            k_rrc_enc,
+            k_up_enc,
+        });
         log::info!(
             "UE {ue}: INITIAL CONTEXT SETUP REQUEST ({} E-RAB(s)); SecurityModeCommand EEA{eea}/EIA{eia}",
             ics.erabs.len()
@@ -834,6 +928,7 @@ impl EnbRrc {
         vec![Action::Rrc {
             ue,
             channel: RrcChannel::DlDcch,
+            lcid: LCID_SRB1,
             pdu: pdcp,
         }]
     }
@@ -865,6 +960,7 @@ impl EnbRrc {
                 eps_bearer_identity: e.e_rab_id,
                 drb_identity: i as u8 + 1,
                 logical_channel_identity: i as u8 + 3,
+                rlc: DrbRlc::UmSn10,
             });
             if let Some(n) = &e.nas {
                 nas.push(n.clone());
@@ -888,7 +984,22 @@ impl EnbRrc {
             t
         };
         ics.reconfiguration_transaction_id = Some(tid);
-        let reconf = match msg::encode_rrc_connection_reconfiguration(tid, &drbs, &nas) {
+        // SRB2 is added in the same reconfiguration (TS 36.331 §4.2.2, after
+        // security activation), with SRB1's AS security from the start.
+        let mut srb2 = LteSrbPdcp::with_bearer(SRB2_BEARER, DIRECTION_DOWNLINK);
+        if let Some(sec) = &ctx.security {
+            let on = srb2
+                .activate_tx_integrity(sec.eia, sec.k_rrc_int)
+                .and_then(|()| srb2.activate_rx_integrity(sec.eia, sec.k_rrc_int))
+                .and_then(|()| srb2.activate_tx_ciphering(sec.eea, sec.k_rrc_enc))
+                .and_then(|()| srb2.activate_rx_ciphering(sec.eea, sec.k_rrc_enc));
+            if let Err(e) = on {
+                log::error!("UE {ue}: SRB2: {e}");
+                return vec![];
+            }
+        }
+        ctx.srb2 = Some(srb2);
+        let reconf = match msg::encode_rrc_connection_reconfiguration(tid, true, &drbs, &nas) {
             Ok(b) => b,
             Err(e) => {
                 log::error!("cannot encode RRCConnectionReconfiguration: {e}");
@@ -905,6 +1016,7 @@ impl EnbRrc {
         vec![Action::Rrc {
             ue,
             channel: RrcChannel::DlDcch,
+            lcid: LCID_SRB1,
             pdu: pdcp,
         }]
     }
@@ -946,8 +1058,35 @@ impl EnbRrc {
             return vec![];
         }
         let ics = ctx.ics.take().expect("checked");
+        // The UE has applied the configuration (§5.3.5.3): SRB2 carries NAS
+        // from here, and the DRBs' user plane can run.
+        ctx.srb2_ready = true;
         let (Some(mme), enb) = (ctx.mme_ue_s1ap_id, ctx.enb_ue_s1ap_id) else {
             return vec![];
+        };
+        let bearers: Vec<UpBearer> = match &ctx.security {
+            Some(sec) => ics
+                .erabs
+                .iter()
+                .zip(&ics.teids)
+                .filter_map(|(e, (_, teid))| {
+                    let lcid = ctx
+                        .drbs
+                        .iter()
+                        .find(|d| d.eps_bearer_identity == e.e_rab_id)?
+                        .logical_channel_identity;
+                    Some(UpBearer {
+                        e_rab_id: e.e_rab_id,
+                        lcid,
+                        enb_teid: *teid,
+                        sgw: sgw_endpoint(&e.sgw_address)?,
+                        sgw_teid: e.sgw_teid,
+                        eea: sec.eea,
+                        k_up_enc: sec.k_up_enc,
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
         };
         let gtp_ip = self.gtp_ip;
         let erabs: Vec<ErabSetup> = ics
@@ -963,19 +1102,19 @@ impl EnbRrc {
             "UE {ue}: RRCConnectionReconfigurationComplete; INITIAL CONTEXT SETUP RESPONSE ({} E-RAB(s))",
             erabs.len()
         );
-        encode_s1(&s1ap_ue::build_initial_context_setup_response(
+        let mut acts = vec![Action::UserPlane { ue, bearers }];
+        if let Some(pdu) = encode_s1(&s1ap_ue::build_initial_context_setup_response(
             mme,
             enb,
             &erabs,
             &ics.notify,
-        ))
-        .map(|pdu| {
-            vec![Action::S1 {
+        )) {
+            acts.push(Action::S1 {
                 stream: self.ue_stream(enb),
                 pdu,
-            }]
-        })
-        .unwrap_or_default()
+            });
+        }
+        acts
     }
 
     fn on_release_command(&mut self, ids: ReleaseIds) -> Vec<Action> {
@@ -1015,6 +1154,7 @@ impl EnbRrc {
                 acts.push(Action::Rrc {
                     ue,
                     channel: RrcChannel::DlDcch,
+                    lcid: LCID_SRB1,
                     pdu: pdcp,
                 });
             }

@@ -3,8 +3,11 @@
 //!
 //! RLS stands in for the physical layer and MAC exactly as on the NR side:
 //! UE heartbeats are cell search and measurement, an RLS PDU transmission is
-//! a transport block on a logical channel. Everything carried is real
-//! protocol -- TS 36.331 RRC on CCCH, TS 36.323 PDCP PDUs on DCCH.
+//! a transport block on a logical channel (told apart by LCID,
+//! [`nextgsim_rls::lte`]). Everything carried is real protocol -- TS 36.331
+//! RRC on CCCH, TS 36.323 PDCP PDUs on DCCH (SRB1, SRB2) and, on the DRBs,
+//! TS 36.322 RLC UM PDUs carrying TS 36.323 PDCP. The same task serves the
+//! S1-U GTP-U socket ([`crate::userplane`]).
 //!
 //! One task rather than two linked by channels because every radio event that
 //! matters ends in S1 traffic and vice versa, and both receive paths are
@@ -14,12 +17,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use nextgsim_gtp::tunnel::GTP_U_PORT;
 use nextgsim_rls::{
-    codec as rls_codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsMessage, RlsPduTransmission,
-    RlsPduTransmissionAck, RrcChannel, SimCoord,
+    codec as rls_codec, lte, GnbCellTracker, GnbTrackerEvent, PduType, RlsMessage,
+    RlsPduTransmission, RlsPduTransmissionAck, RrcChannel, SimCoord,
 };
 use nextgsim_sctp::S1AP_PPID;
 use tokio::net::UdpSocket;
@@ -27,6 +31,7 @@ use tokio::net::UdpSocket;
 use crate::config::EnbConfig;
 use crate::rrc::{Action, EnbRrc};
 use crate::s1_task::S1Transport;
+use crate::userplane::{Downlink, EnbUserPlane};
 
 /// How often lost UEs are looked for (heartbeat supervision).
 const LOST_UE_CHECK_MS: u64 = 500;
@@ -79,31 +84,96 @@ impl RlsRadio {
         }
     }
 
-    async fn send_rrc(&mut self, ue: u32, channel: RrcChannel, pdu: Vec<u8>) {
+    async fn send_rrc(&mut self, ue: u32, channel: RrcChannel, lcid: u8, pdu: Vec<u8>) {
         let Some(&to) = self.ue_addr.get(&ue) else {
             log::warn!("RRC PDU for UE {ue} dropped: UE not heard on RLS");
             return;
         };
-        let id = self.next_pdu_id;
-        self.next_pdu_id = self.next_pdu_id.wrapping_add(1).max(1);
+        let id = self.next_pdu_id();
         let msg = RlsMessage::PduTransmission(RlsPduTransmission::rrc(
             self.sti,
             id,
-            channel as u32,
+            lte::rrc_payload(channel, lcid),
             Bytes::from(pdu),
         ));
         self.send(to, &msg).await;
+    }
+
+    async fn send_data(&mut self, ue: u32, lcid: u8, pdu: Vec<u8>) {
+        let Some(&to) = self.ue_addr.get(&ue) else {
+            log::debug!("data PDU for UE {ue} dropped: UE not heard on RLS");
+            return;
+        };
+        let mut msg = RlsPduTransmission::data(self.sti, self.next_pdu_id(), Bytes::from(pdu));
+        msg.payload = u32::from(lcid);
+        self.send(to, &RlsMessage::PduTransmission(msg)).await;
+    }
+
+    fn next_pdu_id(&mut self) -> u32 {
+        let id = self.next_pdu_id;
+        self.next_pdu_id = self.next_pdu_id.wrapping_add(1).max(1);
+        id
+    }
+}
+
+/// The eNB's S1-U endpoint: the GTP-U socket and the DRBs behind it.
+pub struct S1uEndpoint {
+    socket: UdpSocket,
+    ip: std::net::IpAddr,
+    up: EnbUserPlane,
+}
+
+impl S1uEndpoint {
+    /// Bind the S1-U GTP-U socket on the eNB's GTP address and port 2152
+    /// (TS 29.281 §4.4.2.0), or on `port` when given (tests).
+    pub async fn bind(cfg: &EnbConfig, port: Option<u16>) -> std::io::Result<Self> {
+        let ip = cfg.gtp_ip.unwrap_or(cfg.s1ap_ip);
+        let socket = UdpSocket::bind(SocketAddr::new(ip, port.unwrap_or(GTP_U_PORT))).await?;
+        log::info!("S1-U GTP-U endpoint bound on {}", socket.local_addr()?);
+        Ok(Self {
+            socket,
+            ip,
+            up: EnbUserPlane::new(ip),
+        })
+    }
+
+    fn up_ip(&self) -> std::net::IpAddr {
+        self.ip
+    }
+
+    /// The bound address.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    async fn send_all(&self, datagrams: Vec<(SocketAddr, Vec<u8>)>) {
+        for (to, d) in datagrams {
+            if let Err(e) = self.socket.send_to(&d, to).await {
+                log::warn!("S1-U send to {to} failed: {e}");
+            }
+        }
     }
 }
 
 async fn execute<T: S1Transport>(
     actions: Vec<Action>,
+    rrc: &mut EnbRrc,
     radio: &mut RlsRadio,
+    s1u: &mut S1uEndpoint,
     transport: &mut T,
 ) -> Result<(), Stopped> {
+    for ue in rrc.take_released() {
+        s1u.up.release(ue);
+    }
     for a in actions {
         match a {
-            Action::Rrc { ue, channel, pdu } => radio.send_rrc(ue, channel, pdu).await,
+            Action::Rrc {
+                ue,
+                channel,
+                lcid,
+                pdu,
+            } => radio.send_rrc(ue, channel, lcid, pdu).await,
+            Action::UserPlane { ue, bearers } => s1u.up.install(ue, &bearers),
             Action::S1 { stream, pdu } => {
                 if let Err(e) = transport.send(stream, &pdu, S1AP_PPID).await {
                     log::warn!("S1-MME send failed: {e}");
@@ -119,7 +189,7 @@ async fn broadcast_si(rrc: &mut EnbRrc, radio: &mut RlsRadio, ues: &[u32], sfn: 
     let si = rrc.system_information(sfn);
     for &ue in ues {
         for (channel, pdu) in &si {
-            radio.send_rrc(ue, *channel, pdu.clone()).await;
+            radio.send_rrc(ue, *channel, 0, pdu.clone()).await;
         }
     }
 }
@@ -131,6 +201,7 @@ async fn broadcast_si(rrc: &mut EnbRrc, radio: &mut RlsRadio, ues: &[u32], sfn: 
 pub async fn run_operational<T: S1Transport>(
     cfg: &EnbConfig,
     radio: &mut RlsRadio,
+    s1u: &mut S1uEndpoint,
     transport: &mut T,
 ) -> Stopped {
     let mut rrc = EnbRrc::new(cfg, transport.outbound_streams());
@@ -140,9 +211,34 @@ pub async fn run_operational<T: S1Transport>(
     let frames_per_si = (cfg.radio.si_broadcast_period_ms / RADIO_FRAME_MS).max(1) as u16;
     let mut sfn: u16 = 0;
     let mut buf = vec![0u8; 65535];
+    let mut gtp_buf = vec![0u8; 65535];
+    // A new S1 session has no UE contexts, so none of their DRBs either.
+    s1u.up = EnbUserPlane::new(s1u.up_ip());
     log::info!("cell {:#09x} operational", cfg.cell_identity());
     loop {
+        let up_deadline = s1u.up.next_deadline();
+        let up_timer = async {
+            match up_deadline {
+                Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
+            r = s1u.socket.recv_from(&mut gtp_buf) => {
+                let (n, from) = match r {
+                    Ok(v) => v,
+                    Err(e) => return Stopped::RadioFailed(format!("S1-U: {e}")),
+                };
+                match s1u.up.downlink(&gtp_buf[..n], from) {
+                    Downlink::ToUe { ue, lcid, pdu } => radio.send_data(ue, lcid, pdu).await,
+                    Downlink::Reply { to, datagram } => s1u.send_all(vec![(to, datagram)]).await,
+                    Downlink::None => {}
+                }
+            }
+            () = up_timer => {
+                let out = s1u.up.on_timer(Instant::now());
+                s1u.send_all(out).await;
+            }
             r = transport.recv() => {
                 let m = match r {
                     Ok(Some(m)) => m,
@@ -154,7 +250,7 @@ pub async fn run_operational<T: S1Transport>(
                     continue;
                 }
                 let acts = rrc.on_s1(&m.data);
-                if let Err(s) = execute(acts, radio, transport).await { return s; }
+                if let Err(s) = execute(acts, &mut rrc, radio, s1u, transport).await { return s; }
             }
             r = radio.socket.recv_from(&mut buf) => {
                 let (n, from) = match r {
@@ -194,19 +290,27 @@ pub async fn run_operational<T: S1Transport>(
                             sti: radio.sti,
                             pdu_ids: vec![pdu.pdu_id],
                         })).await;
-                        if pdu.pdu_type != PduType::Rrc {
-                            log::debug!("UE {ue}: user-plane RLS PDU dropped (no DRBs in this build)");
+                        if pdu.pdu_type == PduType::Data {
+                            let Some(lcid) = lte::data_lcid(pdu.payload) else {
+                                log::warn!("UE {ue}: data PDU on payload {} is not a DRB LCID", pdu.payload);
+                                continue;
+                            };
+                            let out = s1u.up.uplink(ue, lcid, &pdu.pdu, Instant::now());
+                            s1u.send_all(out).await;
                             continue;
                         }
-                        let acts = match RrcChannel::from_u32(pdu.payload) {
-                            Some(RrcChannel::UlCcch) => rrc.on_ul_ccch(ue, &pdu.pdu),
-                            Some(RrcChannel::UlDcch) => rrc.on_ul_dcch(ue, &pdu.pdu),
+                        if pdu.pdu_type != PduType::Rrc {
+                            continue;
+                        }
+                        let acts = match lte::split_rrc_payload(pdu.payload) {
+                            Some((RrcChannel::UlCcch, _)) => rrc.on_ul_ccch(ue, &pdu.pdu),
+                            Some((RrcChannel::UlDcch, lcid)) => rrc.on_ul_dcch(ue, lcid, &pdu.pdu),
                             other => {
                                 log::warn!("UE {ue}: RRC PDU on {other:?} is not an E-UTRA uplink channel");
                                 continue;
                             }
                         };
-                        if let Err(s) = execute(acts, radio, transport).await { return s; }
+                        if let Err(s) = execute(acts, &mut rrc, radio, s1u, transport).await { return s; }
                     }
                     RlsMessage::HeartbeatAck(_) | RlsMessage::PduTransmissionAck(_) => {}
                 }
@@ -221,7 +325,7 @@ pub async fn run_operational<T: S1Transport>(
                     if let GnbTrackerEvent::UeLost { ue_id } = ev {
                         radio.ue_addr.remove(&ue_id);
                         let acts = rrc.on_ue_lost(ue_id);
-                        if let Err(s) = execute(acts, radio, transport).await { return s; }
+                        if let Err(s) = execute(acts, &mut rrc, radio, s1u, transport).await { return s; }
                     }
                 }
             }

@@ -312,13 +312,18 @@ fn reconfiguration_carries_the_drb_and_the_nas_in_order() {
         eps_bearer_identity: 5,
         drb_identity: 1,
         logical_channel_identity: 3,
+        rlc: DrbRlc::UmSn10,
     };
     let nas = vec![vec![0x27, 1, 2, 3, 4, 5, 0x07, 0x42], vec![0x07, 0x61]];
-    let b = encode_rrc_connection_reconfiguration(1, &[drb], &nas).unwrap();
+    let b = encode_rrc_connection_reconfiguration(1, true, &[drb], &nas).unwrap();
+    // The DRB decodes back as RLC UM with 10-bit SNs and a 12-bit PDCP SN: the
+    // decoder reads the mode off the PDU (`decoded_drb_rlc`), it does not
+    // assume the encoder's choice.
     assert_eq!(
         decode_dl_dcch(&b).unwrap(),
         DlDcch::ConnectionReconfiguration(Reconfiguration {
             transaction_id: 1,
+            srb2: true,
             drbs: vec![drb],
             nas,
             mobility_control: false,
@@ -328,5 +333,15 @@ fn reconfiguration_carries_the_drb_and_the_nas_in_order() {
         logical_channel_identity: 2,
         ..drb
     };
-    assert!(encode_rrc_connection_reconfiguration(1, &[bad], &[]).is_err());
+    assert!(encode_rrc_connection_reconfiguration(1, false, &[bad], &[]).is_err());
+}
+
+#[test]
+fn reconfiguration_without_srb2_says_so() {
+    let b = encode_rrc_connection_reconfiguration(2, false, &[], &[vec![0x07, 0x61]]).unwrap();
+    let DlDcch::ConnectionReconfiguration(r) = decode_dl_dcch(&b).unwrap() else {
+        panic!("not a reconfiguration");
+    };
+    assert!(!r.srb2);
+    assert!(r.drbs.is_empty());
 }

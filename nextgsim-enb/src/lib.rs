@@ -15,5 +15,6 @@ pub mod rrc;
 pub mod s1_task;
 pub mod s1ap;
 pub mod s1ap_ue;
+pub mod userplane;
 
 pub use config::{load_and_validate_enb_config, EnbConfig};
