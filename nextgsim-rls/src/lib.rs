@@ -26,6 +26,7 @@
 //!   implementations of the same trait; the last three are non-normative, as no
 //!   frozen Rel-20 stage-3 specification exists.
 //! - [`transport`]: RRC and user plane data transport
+//! - [`lte`]: E-UTRA logical channels (LCIDs) on the RLS `payload` field
 //!
 //! # Example
 //!
@@ -68,6 +69,7 @@
 pub mod cell_search;
 pub mod channel;
 pub mod codec;
+pub mod lte;
 pub mod protocol;
 pub mod transport;
 

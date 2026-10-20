@@ -46,6 +46,7 @@
 
 pub mod entity;
 pub mod error;
+pub mod lte_um;
 pub mod pdu;
 pub mod srap;
 

@@ -1151,12 +1151,18 @@ pub fn decode_dl_dcch(bytes: &[u8]) -> Result<DlDcch, RrcMsgError> {
                 ),
             ) => DlDcch::ConnectionReconfiguration(Reconfiguration {
                 transaction_id: r.rrc_transaction_identifier.0,
+                srb2: r8
+                    .radio_resource_config_dedicated
+                    .as_ref()
+                    .and_then(|d| d.srb_to_add_mod_list.as_ref())
+                    .is_some_and(|l| l.0.iter().any(|s| s.srb_identity.0 == 2)),
                 drbs: r8
                     .radio_resource_config_dedicated
                     .and_then(|d| d.drb_to_add_mod_list)
                     .map(|l| {
                         l.0.into_iter()
                             .map(|d| DrbConfig {
+                                rlc: decoded_drb_rlc(&d),
                                 eps_bearer_identity: d.eps_bearer_identity.map_or(0, |e| e.0),
                                 drb_identity: d.drb_identity.0,
                                 logical_channel_identity: d
@@ -1265,6 +1271,28 @@ pub struct DrbConfig {
     pub drb_identity: u8,
     /// `logicalChannelIdentity` (3..10).
     pub logical_channel_identity: u8,
+    /// The DRB's RLC mode and, with it, its PDCP SN length (§6.3.2
+    /// `RLC-Config`, `PDCP-Config`).
+    pub rlc: DrbRlc,
+}
+
+/// The RLC mode of a DRB and the PDCP SN length that goes with it.
+///
+/// TS 36.323 §6.2.3/§6.2.4: a DRB on RLC AM uses the 12-bit PDCP SN; on RLC
+/// UM, `pdcp-SN-Size` chooses 7 or 12 bits. This eNB configures
+/// [`DrbRlc::UmSn10`] (see [`drb_to_add_mod`]); the decoder reports whatever
+/// the network sent so a UE can refuse a configuration it does not support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrbRlc {
+    /// RLC UM bi-directional, 10-bit RLC SN, 12-bit PDCP SN.
+    UmSn10,
+    /// RLC UM bi-directional with any other SN pairing (5-bit RLC SN or a
+    /// 7-bit PDCP SN) -- decoded, not configured by this eNB.
+    UmOther,
+    /// RLC AM (12-bit PDCP SN) -- decoded, not configured by this eNB.
+    Am,
+    /// Uni-directional UM, or no `rlc-Config` at all.
+    Other,
 }
 
 /// A decoded RRCConnectionReconfiguration.
@@ -1272,6 +1300,8 @@ pub struct DrbConfig {
 pub struct Reconfiguration {
     /// `rrc-TransactionIdentifier`.
     pub transaction_id: u8,
+    /// `srb-ToAddModList` adds SRB2.
+    pub srb2: bool,
     /// DRBs to add (`drb-ToAddModList`).
     pub drbs: Vec<DrbConfig>,
     /// `dedicatedInfoNASList`, in order.
@@ -1280,41 +1310,51 @@ pub struct Reconfiguration {
     pub mobility_control: bool,
 }
 
-/// The DRB-ToAddMod for one EPS bearer: PDCP with 12-bit SN over RLC AM and
-/// no header compression -- `nextgsim` advertises no ROHC profile -- and the
-/// RLC AM and logical channel parameters of a default (QCI 9) bearer.
+/// The DRB-ToAddMod for one EPS bearer: RLC UM bi-directional with a 10-bit
+/// SN, PDCP with a 12-bit SN and no header compression -- `nextgsim`
+/// advertises no ROHC profile.
 ///
-/// The values are this eNB's choices, not defaults of the specification (DRBs
-/// have none, §9.2.1): `t-PollRetransmit` 45 ms, `pollPDU`/`pollByte`
-/// infinity, `maxRetxThreshold` 4, `t-Reordering` 35 ms, `t-StatusProhibit`
-/// 0 ms, PDCP `discardTimer` infinity with status reports, logical channel
-/// priority 13 in group 3, PBR 8 kbit/s with a 100 ms bucket.
+/// **Why UM, for a QCI 9 default bearer.** TS 36.331 leaves the RLC mode of a
+/// DRB to E-UTRAN (DRBs have no default configuration, §9.2.1) and TS 23.203
+/// specifies a QCI by its packet error loss rate, not by an RLC mode. RLC AM
+/// exists to recover HARQ residual losses over the air; RLS replaces the
+/// physical layer and MAC and carries no residual radio loss model, so ARQ
+/// would add status traffic and nothing else. The NR side of `nextgsim` runs
+/// its DRBs on RLC UM for the same reason. A 10-bit RLC SN (UM window 512,
+/// TS 36.322 §7.2) and a 12-bit PDCP SN (TS 36.323 §6.2.3, the length a DRB on
+/// AM would also use) keep both sequence spaces far larger than anything in
+/// flight between two RLS endpoints.
+///
+/// The remaining values are this eNB's choices: `t-Reordering` 35 ms,
+/// PDCP `discardTimer` infinity, logical channel priority 13 in group 3,
+/// PBR 8 kbit/s with a 100 ms bucket.
 fn drb_to_add_mod(d: &DrbConfig) -> DRB_ToAddMod {
     DRB_ToAddMod {
         eps_bearer_identity: Some(DRB_ToAddModEps_BearerIdentity(d.eps_bearer_identity)),
         drb_identity: DRB_Identity(d.drb_identity),
         pdcp_config: Some(PDCP_Config {
             discard_timer: Some(PDCP_ConfigDiscardTimer(PDCP_ConfigDiscardTimer::INFINITY)),
-            rlc_am: Some(PDCP_ConfigRlc_AM {
-                status_report_required: PDCP_ConfigRlc_AMStatusReportRequired(true),
+            rlc_am: None,
+            rlc_um: Some(PDCP_ConfigRlc_UM {
+                pdcp_sn_size: PDCP_ConfigRlc_UMPdcp_SN_Size(
+                    PDCP_ConfigRlc_UMPdcp_SN_Size::LEN12BITS,
+                ),
             }),
-            rlc_um: None,
             header_compression: PDCP_ConfigHeaderCompression::NotUsed(
                 PDCP_ConfigHeaderCompression_notUsed,
             ),
         }),
-        rlc_config: Some(RLC_Config::Am(RLC_Config_am {
-            ul_am_rlc: UL_AM_RLC {
-                t_poll_retransmit: T_PollRetransmit(T_PollRetransmit::MS45),
-                poll_pdu: PollPDU(PollPDU::P_INFINITY),
-                poll_byte: PollByte(PollByte::K_BINFINITY),
-                max_retx_threshold: UL_AM_RLCMaxRetxThreshold(UL_AM_RLCMaxRetxThreshold::T4),
+        rlc_config: Some(RLC_Config::Um_Bi_Directional(
+            RLC_Config_um_Bi_Directional {
+                ul_um_rlc: UL_UM_RLC {
+                    sn_field_length: SN_FieldLength(SN_FieldLength::SIZE10),
+                },
+                dl_um_rlc: DL_UM_RLC {
+                    sn_field_length: SN_FieldLength(SN_FieldLength::SIZE10),
+                    t_reordering: T_Reordering(T_Reordering::MS35),
+                },
             },
-            dl_am_rlc: DL_AM_RLC {
-                t_reordering: T_Reordering(T_Reordering::MS35),
-                t_status_prohibit: T_StatusProhibit(T_StatusProhibit::MS0),
-            },
-        })),
+        )),
         logical_channel_identity: Some(DRB_ToAddModLogicalChannelIdentity(
             d.logical_channel_identity,
         )),
@@ -1335,11 +1375,48 @@ fn drb_to_add_mod(d: &DrbConfig) -> DRB_ToAddMod {
     }
 }
 
+/// What a received DRB-ToAddMod configures, as a [`DrbRlc`].
+fn decoded_drb_rlc(d: &DRB_ToAddMod) -> DrbRlc {
+    let pdcp12 = d
+        .pdcp_config
+        .as_ref()
+        .and_then(|p| p.rlc_um.as_ref())
+        .is_some_and(|u| u.pdcp_sn_size.0 == PDCP_ConfigRlc_UMPdcp_SN_Size::LEN12BITS);
+    match &d.rlc_config {
+        Some(RLC_Config::Am(_)) => DrbRlc::Am,
+        Some(RLC_Config::Um_Bi_Directional(u))
+            if pdcp12
+                && u.ul_um_rlc.sn_field_length.0 == SN_FieldLength::SIZE10
+                && u.dl_um_rlc.sn_field_length.0 == SN_FieldLength::SIZE10 =>
+        {
+            DrbRlc::UmSn10
+        }
+        Some(RLC_Config::Um_Bi_Directional(_)) => DrbRlc::UmOther,
+        _ => DrbRlc::Other,
+    }
+}
+
+/// SRB2 with the default RLC and logical channel configuration (§9.2.1.2):
+/// "E-UTRAN ... establishes SRB2 ... after having activated security" (§4.2.2).
+fn srb2_to_add_mod() -> SRB_ToAddMod {
+    SRB_ToAddMod {
+        srb_identity: SRB_ToAddModSrb_Identity(2),
+        rlc_config: Some(SRB_ToAddModRlc_Config::DefaultValue(
+            SRB_ToAddModRlc_Config_defaultValue,
+        )),
+        logical_channel_config: Some(SRB_ToAddModLogicalChannelConfig::DefaultValue(
+            SRB_ToAddModLogicalChannelConfig_defaultValue,
+        )),
+    }
+}
+
 /// Encode a `DL-DCCH-Message` carrying RRCConnectionReconfiguration
-/// (§5.3.5.2) that adds `drbs` and carries `nas` in `dedicatedInfoNASList`
+/// (§5.3.5.2) that adds SRB2 when `add_srb2`, adds `drbs`, and carries `nas`
+/// in `dedicatedInfoNASList`
 /// (1..maxDRB = 11 entries, §6.2.2).
 pub fn encode_rrc_connection_reconfiguration(
     transaction_id: u8,
+    add_srb2: bool,
     drbs: &[DrbConfig],
     nas: &[Vec<u8>],
 ) -> Result<Vec<u8>, RrcMsgError> {
@@ -1363,13 +1440,16 @@ pub fn encode_rrc_connection_reconfiguration(
                 nas.iter().map(|n| DedicatedInfoNAS(n.clone())).collect(),
             )
         }),
-        radio_resource_config_dedicated: (!drbs.is_empty()).then(|| RadioResourceConfigDedicated {
-            srb_to_add_mod_list: None,
-            drb_to_add_mod_list: Some(DRB_ToAddModList(drbs.iter().map(drb_to_add_mod).collect())),
-            drb_to_release_list: None,
-            mac_main_config: None,
-            sps_config: None,
-            physical_config_dedicated: None,
+        radio_resource_config_dedicated: (add_srb2 || !drbs.is_empty()).then(|| {
+            RadioResourceConfigDedicated {
+                srb_to_add_mod_list: add_srb2.then(|| SRB_ToAddModList(vec![srb2_to_add_mod()])),
+                drb_to_add_mod_list: (!drbs.is_empty())
+                    .then(|| DRB_ToAddModList(drbs.iter().map(drb_to_add_mod).collect())),
+                drb_to_release_list: None,
+                mac_main_config: None,
+                sps_config: None,
+                physical_config_dedicated: None,
+            }
         }),
         security_config_ho: None,
         non_critical_extension: None,

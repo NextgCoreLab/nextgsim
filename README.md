@@ -120,14 +120,14 @@ RUST_LOG=info,nextgsim_ue=debug,nextgsim_nas=debug
 nextgsim/
 ├── nextgsim-gnb/       # gNB binary - 5G base station simulator
 ├── nextgsim-ue/        # UE binary - 5G user equipment simulator
-├── nextgsim-enb/       # eNB binary (lte-enb) - LTE base station: S1-MME, E-UTRA cell over RLS (#186)
+├── nextgsim-enb/       # eNB binary (lte-enb) - LTE base station: S1-MME, S1-U GTP-U, E-UTRA cell over RLS (#186)
 ├── nextgsim-cli/       # CLI binary - control interface
 ├── nextgsim-common/    # Common types (PLMN, TAI, SUPI, configs)
 ├── nextgsim-nas/       # NAS protocol encoding/decoding
 ├── nextgsim-ngap/      # NGAP protocol (ASN.1 PER codec)
 ├── nextgsim-s1ap/      # S1AP protocol (TS 36.413, ASN.1 PER codec)
 ├── nextgsim-lte-rrc/   # E-UTRA RRC protocol (TS 36.331, ASN.1 UPER codec)
-├── nextgsim-lte-ue/    # LTE UE binary (lte-ue) - cell selection, RRC connection (#186)
+├── nextgsim-lte-ue/    # LTE UE binary (lte-ue) - cell selection, RRC, EPS NAS, DRBs and TUN (#186)
 ├── nextgsim-rrc/       # RRC protocol (ASN.1 UPER codec)
 ├── nextgsim-crypto/    # Cryptographic algorithms
 ├── nextgsim-rls/       # Radio Link Simulation protocol

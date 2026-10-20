@@ -34,6 +34,23 @@ pub struct LteUeConfig {
     /// NAS: it selects a cell and camps (TS 36.304 §5.2) and never attaches.
     #[serde(default)]
     pub subscriber: Option<SubscriberConfig>,
+    /// The TUN interface the default bearer's PDN address is assigned to.
+    /// Absent, no interface is created and IP packets only flow through the
+    /// [`crate::task::IpIo`] seam (tests).
+    #[serde(default)]
+    pub tun: Option<TunSettings>,
+}
+
+/// The UE's TUN interface (as the NR UE's, `nextgsim_ue::tun`). Creating one
+/// needs `CAP_NET_ADMIN`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TunSettings {
+    /// Interface name; `lteuetun<EBI>` when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Whether to install a route for the PDN address's traffic.
+    #[serde(default)]
+    pub configure_routing: bool,
 }
 
 /// The subscription (USIM) and the UE's EPS capabilities. Field names follow
@@ -218,6 +235,7 @@ mod tests {
             sti: None,
             position: [0; 3],
             subscriber: None,
+            tun: None,
         };
         assert!(validate(&c).is_err());
     }

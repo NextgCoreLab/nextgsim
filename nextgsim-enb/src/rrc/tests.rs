@@ -27,7 +27,7 @@ fn only_s1(acts: &[Action]) -> (u16, S1AP_PDU) {
         .iter()
         .filter_map(|a| match a {
             Action::S1 { stream, pdu } => Some((*stream, decode_s1ap_pdu(pdu).unwrap())),
-            Action::Rrc { .. } => None,
+            Action::Rrc { .. } | Action::UserPlane { .. } => None,
         })
         .collect();
     assert_eq!(s1.len(), 1, "{acts:?}");
@@ -50,7 +50,7 @@ fn connect(e: &mut EnbRrc, ue: u32, ue_pdcp: &mut LteSrbPdcp, nas: &[u8]) -> Vec
         panic!("not RRCConnectionSetup");
     };
     let complete = msg::encode_rrc_connection_setup_complete(transaction_id, 1, nas).unwrap();
-    e.on_ul_dcch(ue, &ue_dcch(ue_pdcp, &complete))
+    e.on_ul_dcch(ue, LCID_SRB1, &ue_dcch(ue_pdcp, &complete))
 }
 
 #[test]
@@ -86,7 +86,9 @@ fn setup_complete_with_the_wrong_transaction_id_is_ignored() {
     e.on_ul_ccch(1, &connection_request());
     let mut pdcp = LteSrbPdcp::new();
     let complete = msg::encode_rrc_connection_setup_complete(3, 1, &[1]).unwrap();
-    assert!(e.on_ul_dcch(1, &ue_dcch(&mut pdcp, &complete)).is_empty());
+    assert!(e
+        .on_ul_dcch(1, LCID_SRB1, &ue_dcch(&mut pdcp, &complete))
+        .is_empty());
 }
 
 #[test]
@@ -96,7 +98,7 @@ fn a_bare_rrc_message_on_dcch_is_not_accepted_as_a_pdcp_pdu() {
     let mut e = rrc();
     e.on_ul_ccch(1, &connection_request());
     let complete = msg::encode_rrc_connection_setup_complete(0, 1, &[0x07, 0x41]).unwrap();
-    let acts = e.on_ul_dcch(1, &complete);
+    let acts = e.on_ul_dcch(1, LCID_SRB1, &complete);
     assert!(
         !acts.iter().any(|a| matches!(a, Action::S1 { .. })),
         "a non-PDCP PDU produced an INITIAL UE MESSAGE"
@@ -109,7 +111,9 @@ fn selected_plmn_outside_sib1_is_refused() {
     e.on_ul_ccch(1, &connection_request());
     let mut pdcp = LteSrbPdcp::new();
     let complete = msg::encode_rrc_connection_setup_complete(0, 2, &[1]).unwrap();
-    assert!(e.on_ul_dcch(1, &ue_dcch(&mut pdcp, &complete)).is_empty());
+    assert!(e
+        .on_ul_dcch(1, LCID_SRB1, &ue_dcch(&mut pdcp, &complete))
+        .is_empty());
 }
 
 fn downlink_nas(mme: u32, enb: u32, nas: &[u8]) -> Vec<u8> {
@@ -156,6 +160,7 @@ fn downlink_nas_is_relayed_in_a_pdcp_pdu_and_uplink_nas_uses_the_stored_mme_id()
     let [Action::Rrc {
         ue: 5,
         channel: RrcChannel::DlDcch,
+        lcid: LCID_SRB1,
         pdu,
     }] = acts.as_slice()
     else {
@@ -174,7 +179,7 @@ fn downlink_nas_is_relayed_in_a_pdcp_pdu_and_uplink_nas_uses_the_stored_mme_id()
     );
 
     let ul = msg::encode_ul_information_transfer(&[0x07, 0x53]).unwrap();
-    let (stream, pdu) = only_s1(&e.on_ul_dcch(5, &ue_dcch(&mut ue_pdcp, &ul)));
+    let (stream, pdu) = only_s1(&e.on_ul_dcch(5, LCID_SRB1, &ue_dcch(&mut ue_pdcp, &ul)));
     assert_eq!(stream, 1);
     let S1AP_PDU::InitiatingMessage(InitiatingMessage {
         value: InitiatingMessageValue::Id_uplinkNASTransport(u),
@@ -196,7 +201,9 @@ fn uplink_nas_before_the_mme_id_is_held_then_sent() {
     let mut ue_pdcp = LteSrbPdcp::new();
     connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
     let ul = msg::encode_ul_information_transfer(&[0x07, 0x5E]).unwrap();
-    assert!(e.on_ul_dcch(5, &ue_dcch(&mut ue_pdcp, &ul)).is_empty());
+    assert!(e
+        .on_ul_dcch(5, LCID_SRB1, &ue_dcch(&mut ue_pdcp, &ul))
+        .is_empty());
     let enb = e.enb_ue_s1ap_id(5).unwrap();
     let acts = e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
     assert!(acts.iter().any(|a| matches!(a, Action::Rrc { .. })));
@@ -367,4 +374,95 @@ fn system_information_carries_the_configured_cell() {
     };
     assert_eq!(sib2.timers.t300_ms, cfg().radio.t300_ms);
     assert_eq!(sib2.default_paging_cycle, msg::PagingCycle::Rf128);
+}
+
+/// After Initial Context Setup's AS SMC: the reconfiguration adds SRB2 and the
+/// DRB (RLC UM), its completion hands the E-RAB to the user plane, and the
+/// next DOWNLINK NAS TRANSPORT goes out on SRB2 under SRB1's AS keys.
+#[test]
+fn reconfiguration_adds_srb2_and_nas_moves_onto_it() {
+    let mut e = rrc();
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(77, enb, &[0x07, 0x52]));
+    let (k_int, k_enc, k_up) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+    {
+        // The state the AS SMC of on_initial_context_setup leaves (that path is
+        // run end to end in tests/lte_radio_e2e.rs).
+        let ctx = e.ues.get_mut(&5).unwrap();
+        ctx.security = Some(AsSecurity {
+            eea: 2,
+            eia: 2,
+            k_rrc_int: k_int,
+            k_rrc_enc: k_enc,
+            k_up_enc: k_up,
+        });
+        ctx.ics = Some(PendingIcs {
+            erabs: vec![ErabToSetup {
+                e_rab_id: 5,
+                qci: 9,
+                sgw_address: vec![10, 0, 0, 9],
+                sgw_teid: 0x1234,
+                nas: Some(vec![0x27, 0, 0, 0, 0, 0, 0x07, 0x42]),
+            }],
+            notify: vec![],
+            rx_ciphering: (2, k_enc),
+            smc_transaction_id: 1,
+            reconfiguration_transaction_id: None,
+            teids: vec![],
+        });
+    }
+    let acts = e.on_security_mode_complete(5, 1);
+    let [Action::Rrc {
+        lcid: LCID_SRB1,
+        pdu,
+        ..
+    }] = acts.as_slice()
+    else {
+        panic!("{acts:?}");
+    };
+    // The UE's view of SRB1 (no ciphering on in this hand-built context, so
+    // the reconfiguration is read from the PDU as transmitted: the eNB's SRB1
+    // has no TX ciphering here).
+    let mut ue_srb1 = LteSrbPdcp::new();
+    ue_srb1.receive(&[0, 0, 0, 0, 0]).unwrap(); // the DLInformationTransfer before it
+    let msg::DlDcch::ConnectionReconfiguration(r) =
+        msg::decode_dl_dcch(&ue_srb1.receive(pdu).unwrap().sdu).unwrap()
+    else {
+        panic!("not a reconfiguration");
+    };
+    assert!(r.srb2, "SRB2 added with the DRBs");
+    assert_eq!(r.drbs[0].rlc, DrbRlc::UmSn10);
+    let tid = r.transaction_id;
+
+    let acts = e.on_reconfiguration_complete(5, tid);
+    let Some(Action::UserPlane { ue: 5, bearers }) = acts.first() else {
+        panic!("no user plane: {acts:?}");
+    };
+    assert_eq!(bearers.len(), 1);
+    let b = &bearers[0];
+    assert_eq!(
+        (b.e_rab_id, b.lcid, b.sgw, b.sgw_teid, b.eea, b.k_up_enc),
+        (5, 3, "10.0.0.9:2152".parse().unwrap(), 0x1234, 2, k_up)
+    );
+
+    let acts = e.on_s1(&downlink_nas(77, enb, &[0x07, 0x61]));
+    let [Action::Rrc {
+        lcid: LCID_SRB2,
+        pdu,
+        ..
+    }] = acts.as_slice()
+    else {
+        panic!("DL NAS not on SRB2: {acts:?}");
+    };
+    let mut ue_srb2 = LteSrbPdcp::with_bearer(1, nextgsim_pdcp::lte_srb::DIRECTION_UPLINK);
+    ue_srb2.activate_rx_integrity(2, k_int).unwrap();
+    ue_srb2.activate_rx_ciphering(2, k_enc).unwrap();
+    assert_eq!(
+        msg::decode_dl_dcch(&ue_srb2.receive(pdu).unwrap().sdu).unwrap(),
+        msg::DlDcch::InformationTransfer {
+            nas: vec![0x07, 0x61]
+        }
+    );
 }

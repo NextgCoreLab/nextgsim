@@ -18,9 +18,16 @@
 //!   and `K_UPenc` (Annex A.7), verifies the command's MAC-I, and switches
 //!   SRB1's PDCP on in the order of TS 33.401 §7.2.4.5 -- the
 //!   SecurityModeComplete goes out integrity protected and unciphered.
-//! - **RRCConnectionReconfiguration** (§5.3.5.3) adds the DRBs of the default
-//!   bearer and hands `dedicatedInfoNASList` (the ATTACH ACCEPT) to NAS. The
-//!   DRBs are configured, not yet carried: their user plane is increment 4.
+//! - **RRCConnectionReconfiguration** (§5.3.5.3) adds SRB2 and the DRBs of the
+//!   default bearer and hands `dedicatedInfoNASList` (the ATTACH ACCEPT) to
+//!   NAS. SRB2 runs with SRB1's AS security; uplink NAS moves onto it (TS
+//!   36.331 §4.2.2: SRB2 is "for NAS messages"). Each DRB is a TS 36.323 PDCP
+//!   entity ciphered with `K_UPenc` over TS 36.322 RLC UM; the UE refuses a
+//!   DRB configuration it does not support by leaving RRC_CONNECTED
+//!   (§5.3.5.5).
+//! - **User plane**: IP packets in ([`UeRrc::send_ip`]) go on the default
+//!   bearer's DRB; RLC PDUs in ([`UeRrc::on_data`]) come out as
+//!   [`UeAction::DeliverIp`].
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -28,16 +35,25 @@ use std::time::{Duration, Instant};
 use nextgsim_common::Plmn;
 use nextgsim_crypto::eps_kdf::{derive_algorithm_key, EpsAlgorithmType};
 use nextgsim_lte_rrc::msg::{
-    self, BcchDlSch, CellInfo, DlCcch, DlDcch, DrbConfig, InitialUeIdentity, MibInfo, PlmnId,
-    Reconfiguration, Sib2Info,
+    self, BcchDlSch, CellInfo, DlCcch, DlDcch, DrbConfig, DrbRlc, InitialUeIdentity, MibInfo,
+    PlmnId, Reconfiguration, Sib2Info,
 };
-use nextgsim_pdcp::lte_srb::{verify_mac_i, DIRECTION_DOWNLINK, SRB1_BEARER};
-use nextgsim_pdcp::{LteSrbPdcp, LteSrbReceived};
+use nextgsim_pdcp::lte_drb::drb_bearer;
+use nextgsim_pdcp::lte_srb::{verify_mac_i, DIRECTION_DOWNLINK, DIRECTION_UPLINK, SRB1_BEARER};
+use nextgsim_pdcp::{LteDrbPdcp, LteSrbPdcp, LteSrbReceived};
+use nextgsim_rlc::lte_um::{LteUmRx, LteUmTx};
+use nextgsim_rls::lte::{LCID_SRB1, LCID_SRB2};
 use nextgsim_rls::RrcChannel;
 
 use crate::nas::{InitialNas, NasLayer, RrcIndication};
 
-/// Something the UE must transmit.
+/// BEARER of SRB2: RB identity 2 − 1 (TS 36.323 §5.6.0).
+const SRB2_BEARER: u8 = 1;
+/// `t-Reordering` of the DRBs' RLC UM receivers: the value this eNB sends
+/// (`nextgsim_lte_rrc::msg`, ms35).
+const DRB_T_REORDERING: Duration = Duration::from_millis(35);
+
+/// Something the UE must do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UeAction {
     /// Send an RRC PDU to `cell` (RLS STI) on `channel`.
@@ -46,9 +62,47 @@ pub enum UeAction {
         cell: u64,
         /// Uplink logical channel.
         channel: RrcChannel,
+        /// LCID on DCCH (1 SRB1, 2 SRB2), 0 on CCCH.
+        lcid: u8,
         /// The PDU.
         pdu: Vec<u8>,
     },
+    /// Send an RLC PDU to `cell` on the DRB `lcid`.
+    Data {
+        /// The cell.
+        cell: u64,
+        /// The DRB's LCID.
+        lcid: u8,
+        /// The RLC UMD PDU.
+        pdu: Vec<u8>,
+    },
+    /// Hand a received IP packet to the IP stack (the TUN interface).
+    DeliverIp(Vec<u8>),
+}
+
+/// AS keys of the connection (TS 33.401 Annex A.7). Never printed.
+#[derive(Clone)]
+struct AsKeys {
+    eea: u8,
+    eia: u8,
+    k_rrc_int: [u8; 16],
+    k_rrc_enc: [u8; 16],
+    k_up_enc: [u8; 16],
+}
+
+impl std::fmt::Debug for AsKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EEA{}/EIA{} (keys redacted)", self.eea, self.eia)
+    }
+}
+
+/// One DRB's user plane.
+#[derive(Debug)]
+struct UeDrb {
+    ebi: u8,
+    pdcp: LteDrbPdcp,
+    tx: LteUmTx,
+    rx: LteUmRx,
 }
 
 /// The UE's RRC state, for observers.
@@ -92,10 +146,17 @@ enum State {
     Connected {
         cell: u64,
         srb1: LteSrbPdcp,
+        /// SRB2, once a reconfiguration added it (boxed, like `keys`: the
+        /// variant is otherwise several times the size of the others).
+        srb2: Option<Box<LteSrbPdcp>>,
         /// AS security activated (§5.3.4.3).
         secured: bool,
+        /// The AS keys, from the Security Mode Command on.
+        keys: Option<Box<AsKeys>>,
         /// DRBs added by RRCConnectionReconfiguration.
         drbs: Vec<DrbConfig>,
+        /// Their user plane, by LCID.
+        user: HashMap<u8, UeDrb>,
     },
 }
 
@@ -156,7 +217,13 @@ impl UeRrc {
             State::Connecting { t300_expiry, .. } => Some(*t300_expiry),
             _ => None,
         };
-        [t300, self.barred_until, self.nas.next_deadline()]
+        let drb = match &self.state {
+            State::Connected { user, .. } => {
+                user.values().filter_map(|d| d.rx.next_deadline()).min()
+            }
+            _ => None,
+        };
+        [t300, self.barred_until, self.nas.next_deadline(), drb]
             .into_iter()
             .flatten()
             .min()
@@ -255,6 +322,7 @@ impl UeRrc {
         vec![UeAction::Rrc {
             cell,
             channel: RrcChannel::UlCcch,
+            lcid: 0,
             pdu,
         }]
     }
@@ -293,6 +361,20 @@ impl UeRrc {
 
     /// Timers: T300 (§5.3.3.6), T302 (§5.3.3.8) and NAS's.
     pub fn on_timer(&mut self, now: Instant) -> Vec<UeAction> {
+        let mut delivered = Vec::new();
+        if let State::Connected { user, .. } = &mut self.state {
+            for d in user.values_mut() {
+                for sdu in d.rx.on_timer(now) {
+                    match d.pdcp.receive(&sdu) {
+                        Ok((ip, _)) => delivered.push(UeAction::DeliverIp(ip)),
+                        Err(e) => log::warn!("DRB of EPS bearer {}: PDCP: {e}", d.ebi),
+                    }
+                }
+            }
+        }
+        if !delivered.is_empty() {
+            return delivered;
+        }
         if self.nas.next_deadline().is_some_and(|t| now >= t) {
             let out = self.nas.on_timer(now);
             if out.release && matches!(self.state, State::Connected { .. }) {
@@ -327,6 +409,7 @@ impl UeRrc {
         &mut self,
         cell: u64,
         channel: RrcChannel,
+        lcid: u8,
         pdu: &[u8],
         now: Instant,
     ) -> Vec<UeAction> {
@@ -350,7 +433,7 @@ impl UeRrc {
                 self.reselect(now)
             }
             RrcChannel::DlCcch => self.on_dl_ccch(cell, pdu, now),
-            RrcChannel::DlDcch => self.on_dl_dcch(cell, pdu, now),
+            RrcChannel::DlDcch => self.on_dl_dcch(cell, lcid, pdu, now),
             other => {
                 log::debug!("cell {cell:#x}: RRC PDU on {other:?} ignored");
                 vec![]
@@ -405,14 +488,18 @@ impl UeRrc {
                 self.state = State::Connected {
                     cell,
                     srb1,
+                    srb2: None,
                     secured: false,
+                    keys: None,
                     drbs: Vec::new(),
+                    user: HashMap::new(),
                 };
                 log::info!("RRCConnectionSetup; RRCConnectionSetupComplete sent (RRC_CONNECTED)");
                 self.nas.on_rrc_indication(RrcIndication::Connected);
                 vec![UeAction::Rrc {
                     cell,
                     channel: RrcChannel::UlDcch,
+                    lcid: LCID_SRB1,
                     pdu: pdcp,
                 }]
             }
@@ -435,10 +522,11 @@ impl UeRrc {
         }
     }
 
-    fn on_dl_dcch(&mut self, cell: u64, pdu: &[u8], now: Instant) -> Vec<UeAction> {
+    fn on_dl_dcch(&mut self, cell: u64, lcid: u8, pdu: &[u8], now: Instant) -> Vec<UeAction> {
         let State::Connected {
             cell: serving,
             srb1,
+            srb2,
             ..
         } = &mut self.state
         else {
@@ -447,20 +535,28 @@ impl UeRrc {
         if *serving != cell {
             return vec![];
         }
-        let received = match srb1.receive(pdu) {
+        let srb = match (lcid, srb2) {
+            (LCID_SRB2, Some(s)) => &mut **s,
+            (LCID_SRB2, None) => {
+                log::warn!("PDU on SRB2 before SRB2 was established; discarded");
+                return vec![];
+            }
+            _ => srb1,
+        };
+        let received = match srb.receive(pdu) {
             Ok(r) => r,
             Err(nextgsim_pdcp::LteSrbPdcpError::IntegrityCheckFailed(count)) => {
                 // §5.3.7.2: an "integrity check failure indication from lower
-                // layers concerning SRB1" initiates RRC connection
+                // layers concerning SRB1 or SRB2" initiates RRC connection
                 // re-establishment, which this UE does not implement; it leaves
                 // RRC_CONNECTED instead (§5.3.12).
                 return self.leave_connected(
-                    &format!("SRB1 integrity check failure at COUNT {count}"),
+                    &format!("SRB{lcid} integrity check failure at COUNT {count}"),
                     now,
                 );
             }
             Err(e) => {
-                log::warn!("SRB1 PDCP: {e}");
+                log::warn!("SRB{lcid} PDCP: {e}");
                 return vec![];
             }
         };
@@ -503,7 +599,13 @@ impl UeRrc {
         eia: u8,
     ) -> Vec<UeAction> {
         let k_enb = self.nas.k_enb();
-        let State::Connected { srb1, secured, .. } = &mut self.state else {
+        let State::Connected {
+            srb1,
+            secured,
+            keys,
+            ..
+        } = &mut self.state
+        else {
             return vec![];
         };
         let failure =
@@ -512,6 +614,7 @@ impl UeRrc {
                 Ok(f) => vec![UeAction::Rrc {
                     cell,
                     channel: RrcChannel::UlDcch,
+                    lcid: LCID_SRB1,
                     pdu: srb1.transmit(&f).0,
                 }],
                 Err(e) => {
@@ -557,10 +660,18 @@ impl UeRrc {
             log::error!("SRB1: {e}");
         }
         *secured = true;
+        *keys = Some(Box::new(AsKeys {
+            eea,
+            eia,
+            k_rrc_int,
+            k_rrc_enc,
+            k_up_enc: derive_algorithm_key(&k_enb, EpsAlgorithmType::UpEnc, eea),
+        }));
         log::info!("SecurityModeCommand EEA{eea}/EIA{eia}: AS security activated");
         vec![UeAction::Rrc {
             cell,
             channel: RrcChannel::UlDcch,
+            lcid: LCID_SRB1,
             pdu,
         }]
     }
@@ -568,7 +679,7 @@ impl UeRrc {
     /// §5.3.5.3: apply the radio resource configuration, hand the NAS list to
     /// upper layers, and complete.
     fn on_reconfiguration(&mut self, cell: u64, r: Reconfiguration, now: Instant) -> Vec<UeAction> {
-        let State::Connected { secured, drbs, .. } = &mut self.state else {
+        let State::Connected { secured, .. } = &mut self.state else {
             return vec![];
         };
         if r.mobility_control {
@@ -582,12 +693,69 @@ impl UeRrc {
             // that cannot comply leaves RRC_CONNECTED (§5.3.5.5).
             return self.leave_connected("DRB setup before AS security activation", now);
         }
+        if let Some(d) = r.drbs.iter().find(|d| d.rlc != DrbRlc::UmSn10) {
+            // This UE implements RLC UM with 10-bit SNs and PDCP with 12-bit
+            // SNs for its DRBs; anything else it cannot comply with.
+            let why = format!("DRB {} configured as {:?}", d.drb_identity, d.rlc);
+            return self.leave_connected(&format!("cannot comply: {why}"), now);
+        }
+        let State::Connected {
+            drbs,
+            srb2,
+            keys,
+            user,
+            ..
+        } = &mut self.state
+        else {
+            return vec![];
+        };
+        if r.srb2 && srb2.is_none() {
+            let Some(k) = keys.as_ref() else {
+                return self.leave_connected("SRB2 setup without AS security", now);
+            };
+            let mut s = LteSrbPdcp::with_bearer(SRB2_BEARER, DIRECTION_UPLINK);
+            let on = s
+                .activate_tx_integrity(k.eia, k.k_rrc_int)
+                .and_then(|()| s.activate_rx_integrity(k.eia, k.k_rrc_int))
+                .and_then(|()| s.activate_tx_ciphering(k.eea, k.k_rrc_enc))
+                .and_then(|()| s.activate_rx_ciphering(k.eea, k.k_rrc_enc));
+            if let Err(e) = on {
+                log::error!("SRB2: {e}");
+                return vec![];
+            }
+            log::info!("SRB2 established");
+            *srb2 = Some(Box::new(s));
+        }
         for d in &r.drbs {
+            let Some(k) = keys.as_ref() else {
+                break;
+            };
+            let pdcp = match LteDrbPdcp::new(
+                drb_bearer(d.logical_channel_identity),
+                DIRECTION_UPLINK,
+                k.eea,
+                k.k_up_enc,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("DRB {}: {e}", d.drb_identity);
+                    continue;
+                }
+            };
             log::info!(
-                "DRB {} configured for EPS bearer {} on logical channel {}",
+                "DRB {} configured for EPS bearer {} on logical channel {} (RLC UM SN10, PDCP SN12)",
                 d.drb_identity,
                 d.eps_bearer_identity,
                 d.logical_channel_identity
+            );
+            user.insert(
+                d.logical_channel_identity,
+                UeDrb {
+                    ebi: d.eps_bearer_identity,
+                    pdcp,
+                    tx: LteUmTx::new(),
+                    rx: LteUmRx::new(DRB_T_REORDERING),
+                },
             );
             drbs.retain(|x| x.drb_identity != d.drb_identity);
             drbs.push(*d);
@@ -609,15 +777,81 @@ impl UeRrc {
         let mut acts = vec![UeAction::Rrc {
             cell,
             channel: RrcChannel::UlDcch,
+            lcid: LCID_SRB1,
             pdu: srb1.transmit(&complete).0,
         }];
         acts.extend(self.send_ul_nas(cell, replies));
         acts
     }
 
-    fn send_ul_nas(&mut self, cell: u64, nas_msgs: Vec<Vec<u8>>) -> Vec<UeAction> {
-        let State::Connected { srb1, .. } = &mut self.state else {
+    /// An RLC PDU from `cell` on the DRB `lcid`: the IP packets it completes.
+    pub fn on_data(&mut self, cell: u64, lcid: u8, pdu: &[u8], now: Instant) -> Vec<UeAction> {
+        let State::Connected {
+            cell: serving,
+            user,
+            ..
+        } = &mut self.state
+        else {
             return vec![];
+        };
+        if *serving != cell {
+            return vec![];
+        }
+        let Some(d) = user.get_mut(&lcid) else {
+            log::debug!("data PDU on LCID {lcid} with no DRB; discarded");
+            return vec![];
+        };
+        let sdus = match d.rx.receive(pdu, now) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("LCID {lcid}: RLC UM: {e}");
+                return vec![];
+            }
+        };
+        sdus.into_iter()
+            .filter_map(|sdu| match d.pdcp.receive(&sdu) {
+                Ok((ip, _)) => Some(UeAction::DeliverIp(ip)),
+                Err(e) => {
+                    log::warn!("LCID {lcid}: PDCP: {e}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// An IP packet from the IP stack, for the default bearer's DRB (the
+    /// lowest LCID when NAS names no default bearer). Dropped when no DRB is
+    /// set up.
+    pub fn send_ip(&mut self, packet: &[u8]) -> Vec<UeAction> {
+        let ebi = self.nas.default_bearer_ebi();
+        let State::Connected { cell, user, .. } = &mut self.state else {
+            return vec![];
+        };
+        let lcid = user
+            .iter()
+            .find(|(_, d)| Some(d.ebi) == ebi)
+            .map(|(l, _)| *l)
+            .or_else(|| user.keys().min().copied());
+        let Some(lcid) = lcid else {
+            return vec![];
+        };
+        let d = user.get_mut(&lcid).expect("found above");
+        let pdcp = d.pdcp.transmit(packet).0;
+        vec![UeAction::Data {
+            cell: *cell,
+            lcid,
+            pdu: d.tx.transmit(&pdcp),
+        }]
+    }
+
+    fn send_ul_nas(&mut self, cell: u64, nas_msgs: Vec<Vec<u8>>) -> Vec<UeAction> {
+        let State::Connected { srb1, srb2, .. } = &mut self.state else {
+            return vec![];
+        };
+        // TS 36.331 §4.2.2: NAS goes on SRB2 once it is established.
+        let (lcid, srb): (u8, &mut LteSrbPdcp) = match srb2 {
+            Some(s) => (LCID_SRB2, s),
+            None => (LCID_SRB1, srb1),
         };
         nas_msgs
             .into_iter()
@@ -625,7 +859,8 @@ impl UeRrc {
                 Ok(rrc) => Some(UeAction::Rrc {
                     cell,
                     channel: RrcChannel::UlDcch,
-                    pdu: srb1.transmit(&rrc).0,
+                    lcid,
+                    pdu: srb.transmit(&rrc).0,
                 }),
                 Err(e) => {
                     log::error!("cannot encode ULInformationTransfer: {e}");
