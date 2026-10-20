@@ -313,6 +313,81 @@ pub fn load_and_validate_enb_config<P: AsRef<Path>>(path: P) -> Result<EnbConfig
     Ok(config)
 }
 
+/// Load an eNB configuration file, apply the `NEXTGSIM_*` environment
+/// overrides (see [`apply_env_overrides`]), then validate the result.
+///
+/// Validation runs after the overrides so a malformed override is refused with
+/// the same checks as a malformed file.
+pub fn load_with_env_and_validate<P: AsRef<Path>>(path: P) -> Result<EnbConfig, ConfigError> {
+    let mut config = load_enb_config(path)?;
+    apply_env_overrides(&mut config, |k| std::env::var(k).ok())?;
+    validate_enb_config(&config)?;
+    Ok(config)
+}
+
+/// Override deployment-dependent eNB fields from environment variables, so one
+/// baked image config serves any test network (`Dockerfile.enb-local`).
+///
+/// | Variable | Field(s) |
+/// |---|---|
+/// | `NEXTGSIM_ENB_MME_ADDR` | `mme_configs` -- comma-separated `ip` or `ip:port` (port 36412 if omitted, TS 36.412 §7) |
+/// | `NEXTGSIM_ENB_IP` | `s1ap_ip` and `radio.link_ip` |
+/// | `NEXTGSIM_ENB_GTP_IP` | `gtp_ip` (the S1-U address; defaults to `s1ap_ip`) |
+/// | `NEXTGSIM_ENB_ID` | `enb_id`, decimal or `0x` hex |
+/// | `NEXTGSIM_PLMN` | `plmn`, written `MCC-MNC` |
+/// | `NEXTGSIM_TAC` | `tac` |
+///
+/// `NEXTGSIM_PLMN` and `NEXTGSIM_TAC` only override the top-level PLMN and TAC,
+/// so they are refused when the file lists `supported_tas` explicitly: there
+/// the advertised TAs would silently disagree with the override. `lookup` is
+/// injected so tests need not mutate the process environment.
+pub fn apply_env_overrides(
+    c: &mut EnbConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    use nextgsim_common::env_override::{parse_endpoints, parse_plmn, parse_u32};
+    let bad = |var: &str, e: String| ConfigError::Invalid(format!("{var}: {e}"));
+    let ip = |var: &str, v: String| v.trim().parse::<IpAddr>().map_err(|_| bad(var, format!("{v:?} is not an IP address")));
+
+    if let Some(v) = lookup("NEXTGSIM_ENB_MME_ADDR") {
+        c.mme_configs = parse_endpoints(&v, 36412)
+            .map_err(|e| bad("NEXTGSIM_ENB_MME_ADDR", e))?
+            .into_iter()
+            .map(|a| MmeConfig { address: a.ip(), port: a.port() })
+            .collect();
+    }
+    if let Some(v) = lookup("NEXTGSIM_ENB_IP") {
+        let addr = ip("NEXTGSIM_ENB_IP", v)?;
+        c.s1ap_ip = addr;
+        c.radio.link_ip = addr;
+    }
+    if let Some(v) = lookup("NEXTGSIM_ENB_GTP_IP") {
+        c.gtp_ip = Some(ip("NEXTGSIM_ENB_GTP_IP", v)?);
+    }
+    if let Some(v) = lookup("NEXTGSIM_ENB_ID") {
+        c.enb_id = parse_u32(v.trim()).map_err(|e| bad("NEXTGSIM_ENB_ID", e))?;
+    }
+    let plmn = lookup("NEXTGSIM_PLMN");
+    let tac = lookup("NEXTGSIM_TAC");
+    if (plmn.is_some() || tac.is_some()) && !c.supported_tas.is_empty() {
+        return Err(ConfigError::Invalid(
+            "NEXTGSIM_PLMN/NEXTGSIM_TAC override the top-level plmn/tac, but the file lists \
+             supported_tas explicitly; remove supported_tas or edit it instead"
+                .into(),
+        ));
+    }
+    if let Some(v) = plmn {
+        c.plmn = parse_plmn(v.trim()).map_err(|e| bad("NEXTGSIM_PLMN", e))?;
+    }
+    if let Some(v) = tac {
+        c.tac = v
+            .trim()
+            .parse()
+            .map_err(|_| bad("NEXTGSIM_TAC", format!("{v:?} is not a 16-bit TAC")))?;
+    }
+    Ok(())
+}
+
 /// maxnoofTACs (TS 36.413 §9.3.6).
 const MAX_TACS: usize = 256;
 /// maxnoofBPLMNs (TS 36.413 §9.3.6).
@@ -464,6 +539,67 @@ mod tests {
             security: AsSecurityConfig::default(),
             gtp_ip: None,
         }
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn env_overrides_set_the_deployment_fields() {
+        let mut c = valid();
+        apply_env_overrides(
+            &mut c,
+            env(&[
+                ("NEXTGSIM_ENB_MME_ADDR", "172.24.0.5"),
+                ("NEXTGSIM_ENB_IP", "172.24.0.50"),
+                ("NEXTGSIM_ENB_GTP_IP", "172.24.0.51"),
+                ("NEXTGSIM_ENB_ID", "0x1A0"),
+                ("NEXTGSIM_PLMN", "001-01"),
+                ("NEXTGSIM_TAC", "7"),
+            ]),
+        )
+        .unwrap();
+        validate_enb_config(&c).unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(c.mme_configs, vec![MmeConfig { address: ip("172.24.0.5"), port: 36412 }]);
+        assert_eq!(c.s1ap_ip, ip("172.24.0.50"));
+        assert_eq!(c.radio.link_ip, ip("172.24.0.50"));
+        assert_eq!(c.gtp_ip, Some(ip("172.24.0.51")));
+        assert_eq!(c.enb_id, 0x1A0);
+        assert_eq!(c.plmn, Plmn::new(1, 1, false));
+        assert_eq!(c.tac, 7);
+    }
+
+    #[test]
+    fn no_env_leaves_the_file_untouched() {
+        let mut c = valid();
+        let before = format!("{c:?}");
+        apply_env_overrides(&mut c, |_| None).unwrap();
+        assert_eq!(format!("{c:?}"), before);
+    }
+
+    #[test]
+    fn malformed_env_is_refused_naming_the_variable() {
+        for (var, val) in [
+            ("NEXTGSIM_ENB_MME_ADDR", "mme.local"),
+            ("NEXTGSIM_ENB_IP", "x"),
+            ("NEXTGSIM_ENB_ID", "0xZZ"),
+            ("NEXTGSIM_PLMN", "99970"),
+            ("NEXTGSIM_TAC", "70000"),
+        ] {
+            let err = apply_env_overrides(&mut valid(), env(&[(var, val)])).unwrap_err();
+            assert!(err.to_string().contains(var), "{var}: {err}");
+        }
+    }
+
+    #[test]
+    fn plmn_override_conflicts_with_explicit_supported_tas() {
+        let mut c = valid();
+        c.supported_tas = vec![SupportedTa { tac: 1, broadcast_plmns: vec![Plmn::new(999, 70, false)] }];
+        assert!(apply_env_overrides(&mut c, env(&[("NEXTGSIM_PLMN", "001-01")])).is_err());
     }
 
     #[test]

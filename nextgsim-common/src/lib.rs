@@ -18,6 +18,7 @@ pub mod bit_string;
 pub mod bus;
 pub mod cli_server;
 pub mod config;
+pub mod env_override;
 pub mod error;
 pub mod frame_clock;
 pub mod logging;
