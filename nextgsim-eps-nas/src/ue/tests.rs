@@ -47,8 +47,12 @@ impl Mme {
     /// An AV for SQN `sqn` as the HSS builds it (TS 33.102 §6.3.2, TS 33.401
     /// §6.1.1 with the separation bit set in AMF 0x8000).
     fn new(sqn: u64) -> Self {
+        Self::with_rand(sqn, [0x23; 16])
+    }
+
+    /// An AV for SQN `sqn` with a chosen RAND.
+    fn with_rand(sqn: u64, rand: [u8; 16]) -> Self {
         let m = Milenage::new(&K, &OPC);
-        let rand = [0x23; 16];
         let sqn_b: [u8; 6] = sqn.to_be_bytes()[2..].try_into().unwrap();
         let ak = m.f5(&rand);
         let mut autn = [0u8; 16];
@@ -249,10 +253,110 @@ fn a_bad_autn_gets_mac_failure_and_a_stale_one_synch_failure() {
     let last = bad.len() - 1;
     bad[last] ^= 1;
     assert_eq!(ue.on_downlink(&bad, now).uplink, vec![vec![0x07, 0x5C, 20]]);
-    // Authenticate once at SQN 0x21, then replay it.
+    // Authenticate once at SQN 0x21; a new challenge (different RAND) at a
+    // stale SQN then reaches the USIM and fails synchronisation.
     ue.on_downlink(&mme.authentication_request(), now);
-    let out = ue.on_downlink(&mme.authentication_request(), now);
+    let stale = Mme::with_rand(0x21, [0x24; 16]);
+    let out = ue.on_downlink(&stale.authentication_request(), now);
     assert_eq!(&out.uplink[0][..5], &[0x07, 0x5C, 21, 0x30, 14]);
+}
+
+/// A retransmitted AUTHENTICATION REQUEST (same RAND, e.g. after the MME's
+/// T3460 fires) is answered with the stored RES, not passed to the USIM
+/// again, where its SQN is no longer fresh (TS 24.301 §5.4.2.3, #237).
+fn first_challenge() -> (EpsNasUe, Mme, Instant) {
+    let now = Instant::now();
+    let mut ue = EpsNasUe::new(cfg());
+    ue.initial_message(now).unwrap();
+    let mme = Mme::new(0x21);
+    let out = ue.on_downlink(&mme.authentication_request(), now);
+    assert_eq!(&out.uplink[0][3..], &mme.xres);
+    (ue, mme, now)
+}
+
+fn is_synch_failure(out: &NasOutput) -> bool {
+    out.uplink
+        .first()
+        .is_some_and(|p| p[..3] == [0x07, 0x5C, 21])
+}
+
+#[test]
+fn a_retransmitted_challenge_gets_the_stored_res() {
+    let (mut ue, mut mme, now) = first_challenge();
+    let out = ue.on_downlink(&mme.authentication_request(), now);
+    assert_eq!(out.uplink.len(), 1);
+    assert_eq!(
+        &out.uplink[0][..3],
+        &[0x07, 0x53, 8],
+        "AUTHENTICATION RESPONSE"
+    );
+    assert_eq!(&out.uplink[0][3..], &mme.xres, "the stored RES, unchanged");
+    // The K_ASME of that challenge is still the one the SMC takes into use.
+    let out = ue.on_downlink(&mme.security_mode_command([0xE0, 0xE0], false), now);
+    assert_eq!(out.uplink[0][0], 0x47, "SECURITY MODE COMPLETE");
+}
+
+#[test]
+fn a_new_rand_replaces_the_stored_pair() {
+    let (mut ue, mme, now) = first_challenge();
+    let second = Mme::with_rand(0x22, [0x24; 16]);
+    let out = ue.on_downlink(&second.authentication_request(), now);
+    assert_eq!(&out.uplink[0][3..], &second.xres);
+    // The first RAND is no longer stored: it goes to the USIM and is stale.
+    assert!(is_synch_failure(
+        &ue.on_downlink(&mme.authentication_request(), now)
+    ));
+}
+
+#[test]
+fn the_stored_pair_is_deleted_on_security_mode_command() {
+    let (mut ue, mut mme, now) = first_challenge();
+    let complete = ue.on_downlink(&mme.security_mode_command([0xE0, 0xE0], false), now);
+    mme.unprotect(&complete.uplink[0]);
+    // Answered inside the new security context, so unprotect before reading.
+    let out = ue.on_downlink(&mme.authentication_request(), now);
+    let plain = mme.unprotect(&out.uplink[0]);
+    assert_eq!(&plain[..3], &[0x07, 0x5C, 21], "the RAND went to the USIM");
+}
+
+#[test]
+fn the_stored_pair_is_deleted_on_t3416_expiry() {
+    let (mut ue, mme, now) = first_challenge();
+    // T3416 is armed alongside T3410. T3410 (15 s) would otherwise abort the
+    // attach first, which deletes the pair on entering EMM-DEREGISTERED; stop
+    // it so T3416 is the timer under test.
+    assert!(ue
+        .stored_auth
+        .as_ref()
+        .is_some_and(|a| a.t3416 == now + T3416));
+    ue.t3410 = None;
+    assert_eq!(ue.next_deadline(), Some(now + T3416));
+    ue.on_timer(now + T3416 - Duration::from_millis(1));
+    assert!(!is_synch_failure(
+        &ue.on_downlink(&mme.authentication_request(), now)
+    ));
+    ue.on_timer(now + T3416);
+    assert!(is_synch_failure(
+        &ue.on_downlink(&mme.authentication_request(), now)
+    ));
+}
+
+#[test]
+fn the_stored_pair_is_deleted_on_entering_emm_idle() {
+    let (mut ue, mme, now) = first_challenge();
+    ue.on_released(now);
+    assert!(is_synch_failure(
+        &ue.on_downlink(&mme.authentication_request(), now)
+    ));
+}
+
+#[test]
+fn the_stored_pair_is_deleted_on_authentication_reject() {
+    let (mut ue, mme, now) = first_challenge();
+    ue.on_downlink(&[0x07, 0x54], now);
+    assert!(is_synch_failure(
+        &ue.on_downlink(&mme.authentication_request(), now)
+    ));
 }
 
 #[test]
@@ -342,4 +446,53 @@ fn a_second_attach_uses_the_guti_and_integrity_protects() {
 fn imei_check_digit_is_luhn() {
     // TS 23.003 Annex B example: IMEI 35-209900-176148-1.
     assert_eq!(imei_of("3520990017614800"), "352099001761481");
+}
+
+/// After a release, the next connection's messages are integrity protected
+/// with the kept context but not ciphered until that connection's SMC
+/// (TS 24.301 §4.4.5); the release-then-re-attach case of #238.
+#[test]
+fn a_new_connection_integrity_protects_but_does_not_cipher_until_its_smc() {
+    let (mut ue, mut old, _) = attach();
+    let now = Instant::now();
+    // The MME released the connection (e.g. after an ATTACH REJECT, nextgcore
+    // #473); the UE keeps its current EPS security context (§5.5.1.2.5).
+    ue.state = EmmState::Deregistered;
+    ue.on_released(now);
+
+    let req = ue.initial_message(now).expect("re-attach due");
+    assert_eq!(req[0], 0x17, "ATTACH REQUEST: header type 1");
+    let plain = old.unprotect(&req);
+    assert_eq!(&plain[..2], &[0x07, 0x41]);
+
+    // A fresh challenge on the new connection.
+    let mut mme = Mme::with_rand(0x22, [0x5A; 16]);
+    let out = ue.on_downlink(&mme.authentication_request(), now);
+    let resp = &out.uplink[0];
+    assert_eq!(
+        resp[0], 0x17,
+        "AUTHENTICATION RESPONSE before this connection's SMC: header type 1, not 2"
+    );
+    // Not ciphered: the NAS message is readable after the 6-octet header, and
+    // the MAC verifies under the kept context.
+    assert_eq!(&resp[6..9], &[0x07, 0x53, 8]);
+    assert_eq!(&resp[9..], &mme.xres);
+    let plain = old.unprotect(resp);
+    assert_eq!(&plain[..3], &[0x07, 0x53, 8]);
+
+    // This connection's SMC establishes the secure exchange: ciphered again.
+    let out = ue.on_downlink(&mme.security_mode_command([0xE0, 0xE0], false), now);
+    assert_eq!(
+        out.uplink[0][0], 0x47,
+        "SECURITY MODE COMPLETE: header type 4"
+    );
+    mme.unprotect(&out.uplink[0]);
+    let pti = ue.attach_pti.expect("the re-attach's PTI");
+    let out = ue.on_downlink(&mme.attach_accept(pti), now);
+    assert_eq!(
+        out.uplink[0][0], 0x27,
+        "ATTACH COMPLETE after the SMC: header type 2"
+    );
+    let complete = mme.unprotect(&out.uplink[0]);
+    assert_eq!(&complete[..2], &[0x07, 0x43]);
 }
