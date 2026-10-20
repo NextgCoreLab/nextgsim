@@ -26,20 +26,44 @@ impl Asn1ResolvedInteger {
 
         // Get the Values that are expected
         let value_set = ty.get_integer_valueset_from_constraint(resolver)?;
-        if let Some(x) = value_set.root_values.min() {
+
+        // The Rust type must hold every value the type can carry, which for an
+        // extensible INTEGER includes its extension additions
+        // (`INTEGER (0..4095, ..., 4096..2000000)`): X.691 §12.1 encodes those as
+        // unconstrained whole numbers, so a root-sized type could neither build
+        // nor decode them (#231). The PER-visible bounds stay the ROOT's -- the
+        // generator reads `root_values` for lb/ub. A bare `...` has no visible
+        // additions, so such a type keeps its root width; a received value that
+        // does not fit is refused on decode rather than wrapped.
+        let (min, max) = {
+            let root = &value_set.root_values;
+            let added = value_set.additional_values.as_ref();
+            let min = [root.min(), added.and_then(|a| a.min())]
+                .iter()
+                .flatten()
+                .copied()
+                .min();
+            let max = [root.max(), added.and_then(|a| a.max())]
+                .iter()
+                .flatten()
+                .copied()
+                .max();
+            (min, max)
+        };
+        if let Some(x) = min {
             base.signed = x < 0
         }
 
         let bit_width = if base.signed {
-            let min = value_set.root_values.min().unwrap();
-            let max = value_set.root_values.max().unwrap();
+            let min = min.unwrap();
+            let max = max.unwrap();
             let bits_needed_max = 128 - max.abs().leading_zeros();
             let bits_needed_min = 128 - min.abs().leading_zeros();
             std::cmp::max(bits_needed_min, bits_needed_max)
-        } else if value_set.root_values.min().is_none() {
+        } else if min.is_none() {
             8_u32
         } else {
-            let max = value_set.root_values.max().unwrap();
+            let max = max.unwrap();
             128 - max.leading_zeros()
         };
 

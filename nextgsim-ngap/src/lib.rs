@@ -20,3 +20,6 @@ mod proptest_roundtrip;
 
 #[cfg(test)]
 mod fragmentation_tests;
+
+#[cfg(test)]
+mod integer_extension_tests;
