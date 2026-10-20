@@ -44,7 +44,7 @@ impl ConstraintValues {
             None => ranges_max,
             Some(vals_max) => match ranges_max {
                 None => Some(*vals_max),
-                Some(rnges_max) => Some(std::cmp::min(rnges_max, *vals_max)), // FIXME: This should be std::cmp::max?
+                Some(rnges_max) => Some(std::cmp::max(rnges_max, *vals_max)),
             },
         }
     }
