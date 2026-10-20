@@ -29,6 +29,7 @@ mod amf_context;
 mod task;
 pub mod timers;
 mod ue_context;
+mod unknown_ies;
 pub mod up_security;
 
 pub use amf_context::{AmfContextInfo, AmfState, NgapAmfContext};

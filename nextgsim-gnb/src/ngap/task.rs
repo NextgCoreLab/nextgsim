@@ -2883,9 +2883,15 @@ impl NgapTask {
                 ),
             };
 
+            // TS 23.502 §4.2.6 step 1 / TS 38.413 §9.2.2.4: list the UE's PDU
+            // sessions so the AMF releases their user plane too. Sorted so the
+            // wire form is deterministic.
+            let mut pdu_session_ids: Vec<u8> = ctx.pdu_sessions.keys().copied().collect();
+            pdu_session_ids.sort_unstable();
             let params = UeContextReleaseRequestParams {
                 amf_ue_ngap_id: amf_id as u64,
                 ran_ue_ngap_id: ran_ue_ngap_id as u32,
+                pdu_session_ids,
                 cause: ngap_cause,
             };
 
@@ -3101,7 +3107,43 @@ impl NgapTask {
             pdu.len()
         );
 
-        let pdu_bytes = pdu.data();
+        // TS 38.413 §10.3.4: an IE this schema does not know is handled by the
+        // criticality the AMF gave it, not by refusing the whole message.
+        let gated: Vec<u8>;
+        let pdu_bytes: &[u8] = match super::unknown_ies::classify(pdu.data()) {
+            super::unknown_ies::UnknownIeVerdict::Clean
+            | super::unknown_ies::UnknownIeVerdict::Undecodable => pdu.data(),
+            super::unknown_ies::UnknownIeVerdict::Proceed { bytes, notify } => {
+                if let Some(report) = notify {
+                    warn!(
+                        "NGAP PDU from AMF[{}] carries unknown ignore-and-notify IE(s); \
+                         processing without them and sending Error Indication (§10.3.4.2)",
+                        client_id
+                    );
+                    self.send_error_indication(client_id, report).await;
+                }
+                gated = bytes;
+                &gated
+            }
+            super::unknown_ies::UnknownIeVerdict::Reject { report } => {
+                match report {
+                    Some(report) => {
+                        warn!(
+                            "NGAP initiating message from AMF[{}] carries an unknown reject \
+                             IE; procedure not executed, sending Error Indication (§10.3.4.2)",
+                            client_id
+                        );
+                        self.send_error_indication(client_id, report).await;
+                    }
+                    None => warn!(
+                        "NGAP response from AMF[{}] carries an unknown reject IE; procedure \
+                         terminated with local error handling (§10.3.4.2)",
+                        client_id
+                    ),
+                }
+                return;
+            }
+        };
 
         // Check AMF state
         let amf_state = self
@@ -10109,5 +10151,102 @@ mod tests {
             Some(8),
             "the diagnostics must name the NGAP transport that could not be handled"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TS 38.413 §10.3.4 at the dispatch gate, through `handle_ngap_pdu`.
+    // ------------------------------------------------------------------
+
+    fn overload_with(criticality: u8) -> Vec<u8> {
+        crate::ngap::unknown_ies::tests::overload_start_with_unknown_ie(9999, criticality).0
+    }
+
+    fn amf_state(task: &NgapTask) -> AmfState {
+        task.amf_contexts.get(&1).expect("amf").state
+    }
+
+    /// An unknown `ignore` IE: the Overload Start is applied and nothing is sent.
+    /// Before the gate the default decode refused the message, so it was answered
+    /// as undecodable and the overload was never applied.
+    #[tokio::test]
+    async fn an_unknown_ignore_ie_does_not_stop_the_procedure() {
+        let (mut task, mut sctp_rx, _) = seed_task_with_ue().await;
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&overload_with(1)))
+            .await;
+        assert_eq!(amf_state(&task), AmfState::Overloaded);
+        assert!(drain_sctp(&mut sctp_rx).is_empty(), "ignore is silent");
+    }
+
+    /// An unknown `notify` IE: applied, and one Error Indication names the IE.
+    #[tokio::test]
+    async fn an_unknown_notify_ie_is_applied_and_reported() {
+        let (mut task, mut sctp_rx, _) = seed_task_with_ue().await;
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&overload_with(2)))
+            .await;
+        assert_eq!(amf_state(&task), AmfState::Overloaded);
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(sent.len(), 1, "exactly one Error Indication");
+        let ei = decode_error_indication(&sent[0]).expect("an Error Indication");
+        let diag = ei.criticality_diagnostics.expect("diagnostics");
+        assert_eq!(diag.procedure_code, Some(22));
+        assert_eq!(diag.ies_criticality_diagnostics.len(), 1);
+        assert_eq!(diag.ies_criticality_diagnostics[0].ie_id, 9999);
+    }
+
+    /// An unknown `reject` IE: the Overload Start is NOT applied, and the AMF is
+    /// told with an abstract-syntax-error-reject Error Indication.
+    #[tokio::test]
+    async fn an_unknown_reject_ie_stops_the_procedure() {
+        use nextgsim_ngap::procedures::ng_setup::{NgSetupFailureCause, ProtocolCause};
+        let (mut task, mut sctp_rx, _) = seed_task_with_ue().await;
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&overload_with(0)))
+            .await;
+        assert_eq!(
+            amf_state(&task),
+            AmfState::Ready,
+            "the procedure is not executed"
+        );
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(sent.len(), 1);
+        let ei = decode_error_indication(&sent[0]).expect("an Error Indication");
+        assert!(matches!(
+            ei.cause,
+            Some(NgSetupFailureCause::Protocol(
+                ProtocolCause::AbstractSyntaxErrorReject
+            ))
+        ));
+    }
+
+    /// TS 23.502 §4.2.6 step 1 / TS 38.413 §9.2.2.4: a UE Context Release
+    /// Request for a UE with PDU sessions lists them (IE 133).
+    #[tokio::test]
+    async fn a_release_request_lists_the_ues_pdu_sessions() {
+        use nextgsim_ngap::procedures::ue_context_release::parse_ue_context_release_request;
+        let (mut task, mut sctp_rx, _) = seed_task_with_ue().await;
+        let ctx = task.ue_contexts.get_mut(&10).expect("ue");
+        ctx.amf_ue_ngap_id = Some(7777);
+        for psi in [6u8, 5] {
+            ctx.add_pdu_session(NgapPduSession {
+                psi,
+                qfi: Some(1),
+                uplink_teid: 1,
+                downlink_teid: 2,
+                upf_address: "10.0.0.1".parse().unwrap(),
+                up_security_policy: UpSecurityPolicy::locally_configured_default(),
+                up_security: DrbSecurityDecision::default(),
+            });
+        }
+        task.handle_ue_context_release_request(10, UeReleaseRequestCause::RadioLinkFailure)
+            .await;
+        let sent = drain_sctp(&mut sctp_rx);
+        let req = sent
+            .iter()
+            .find_map(|b| {
+                decode_ngap_pdu(b)
+                    .ok()
+                    .and_then(|p| parse_ue_context_release_request(&p).ok())
+            })
+            .expect("a UE Context Release Request");
+        assert_eq!(req.pdu_session_ids, vec![5, 6]);
     }
 }
