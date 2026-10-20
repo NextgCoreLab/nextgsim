@@ -683,24 +683,51 @@ pub fn encode_ue_radio_capability_id(id: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Digit count of a UE radio capability ID whose Type Field is `tf`, per the
+/// structure of TS 23.003 §29.2: TF (1) + Vendor ID (8) + RCI (11) for a
+/// manufacturer-assigned ID, TF (1) + Version ID (2) + RCI (11) for a
+/// network-assigned one. `None` for the spare Type Field values 2 to F, whose
+/// structure is not defined.
+fn racs_id_digit_count(tf: u8) -> Option<usize> {
+    match tf {
+        0x0 => Some(1 + 8 + 11),
+        0x1 => Some(1 + 2 + 11),
+        _ => None,
+    }
+}
+
 /// Read a UE radio capability ID out of the octets of TS 24.501 §9.11.3.68.
 ///
-/// The inverse of [`encode_ue_radio_capability_id`]: low nibble first, and a
-/// `1111` in the **last** high nibble is the odd-count filler rather than a digit.
+/// The inverse of [`encode_ue_radio_capability_id`]: low nibble first.
 ///
-/// `f` anywhere else is a digit. In the last octet the two readings are genuinely
-/// ambiguous and the IE's rule wins — which costs nothing for a conformant ID,
-/// because TS 23.003 §29.2 gives every UE radio capability ID an even number of
-/// digits (1 + 2 + 11 network-assigned, 1 + 8 + 11 manufacturer-assigned), so the
-/// filler should never appear.
+/// The IE carries no digit count, so a `1111` in the last high nibble is
+/// genuinely ambiguous: it is the odd-count end mark (§9.11.3.68) *or* a final
+/// hexadecimal digit `f` — and TS 23.003 §29.2 makes every element "hexadecimal
+/// digits only", so `f` is a legal digit anywhere, last position included.
+/// The ambiguity is resolved by the identifier's own structure (§29.2): its
+/// first digit is the Type Field, which fixes the length at 20 digits
+/// (manufacturer-assigned) or 14 (network-assigned) — both even, so a
+/// conformant ID never carries the end mark. When the octet count matches the
+/// length its Type Field implies, every nibble is a digit. Otherwise (a spare
+/// Type Field, or a length §29.2 does not define) the IE's end-mark rule
+/// applies to the last high nibble.
+///
+/// The previous reading applied the end-mark rule unconditionally, so a
+/// conformant ID ending in `f` lost its last digit and resolved to a different
+/// capability set at the UCMF (nextgsim RACS follow-up, TS 23.003 §29.2).
 pub fn decode_ue_radio_capability_id(octets: &[u8]) -> String {
+    let conformant_length = octets
+        .first()
+        .and_then(|first| racs_id_digit_count(first & 0x0F))
+        .is_some_and(|digits| digits == octets.len() * 2);
+
     let mut id = String::with_capacity(octets.len() * 2);
     for (index, octet) in octets.iter().enumerate() {
         id.push(racs_hex_digit(octet & 0x0F));
         let high = octet >> 4;
         let is_last = index + 1 == octets.len();
-        if is_last && high == RACS_ID_FILLER_NIBBLE {
-            // Odd number of digits: the filler is not part of the ID.
+        if is_last && high == RACS_ID_FILLER_NIBBLE && !conformant_length {
+            // Odd number of digits: the end mark is not part of the ID.
             continue;
         }
         id.push(racs_hex_digit(high));
@@ -2638,18 +2665,13 @@ mod tests {
         assert_eq!(decode_ue_radio_capability_id(&[0xF1, 0x32]), "1f23");
     }
 
-    /// **A ceiling of the IE, not of this codec.** An identifier whose *last*
-    /// digit is `f` encodes to the same octets as the same identifier without it,
-    /// because `1111` in the last high nibble is the odd-length end mark
-    /// (TS 24.501 §9.11.3.68). Nothing in the encoding distinguishes them, so
-    /// "0f" comes back as "0".
-    ///
-    /// This costs nothing for a conformant identifier: TS 23.003 §29.2 gives every
-    /// UE radio capability ID an even number of digits, so the end mark should
-    /// never be emitted at all — and this tree reads the digits as hexadecimal
-    /// only because that is what the pre-existing decoder did. Pinned rather than
-    /// papered over, so a future change to BCD-only digits (which would remove the
-    /// ambiguity outright) shows up here.
+    /// **A ceiling of the IE for non-conformant identifiers.** An identifier whose
+    /// *last* digit is `f` encodes to the same octets as the same identifier
+    /// without it, because `1111` in the last high nibble is the odd-length end
+    /// mark (TS 24.501 §9.11.3.68). For an identifier whose length TS 23.003 §29.2
+    /// does not define, nothing distinguishes them, so "0f" comes back as "0".
+    /// Conformant identifiers are disambiguated by their Type Field — see
+    /// `a_conformant_identifier_ending_in_f_keeps_its_last_digit`.
     #[test]
     fn an_identifier_ending_in_f_collides_with_the_odd_length_filler() {
         let with_f = encode_ue_radio_capability_id("0f").expect("packable");
@@ -2659,6 +2681,46 @@ mod tests {
             decode_ue_radio_capability_id(&with_f),
             "0",
             "and the end-mark reading wins on decode"
+        );
+    }
+
+    /// A TS 23.003 §29.2 identifier may end in the hexadecimal digit `f` — every
+    /// element is "hexadecimal digits only". Its Type Field fixes its length
+    /// (14 digits network-assigned, 20 manufacturer-assigned, both even), so a
+    /// final `1111` is that digit, not the odd-count end mark.
+    ///
+    /// Octets derived by hand from §9.11.3.68's low-nibble-first rule:
+    /// "1ab0123456789f" pairs as (1,a)(b,0)(1,2)(3,4)(5,6)(7,8)(9,f) →
+    /// A1 0B 21 43 65 87 F9.
+    #[test]
+    fn a_conformant_identifier_ending_in_f_keeps_its_last_digit() {
+        let network = "1ab0123456789f";
+        let octets = vec![0xA1, 0x0B, 0x21, 0x43, 0x65, 0x87, 0xF9];
+        assert_eq!(encode_ue_radio_capability_id(network), Some(octets.clone()));
+        assert_eq!(decode_ue_radio_capability_id(&octets), network);
+
+        // Manufacturer-assigned: TF 0, Vendor ID 00007ED9 (IANA PEN 32473, the
+        // §29.2 NOTE's own example), an RCI ending in f.
+        let manufacturer = "000007ed90123456789f";
+        let packed = encode_ue_radio_capability_id(manufacturer).expect("packable");
+        assert_eq!(packed.len(), 10);
+        assert_eq!(packed[9], 0xF9, "last octet carries digits 9 and f");
+        assert_eq!(decode_ue_radio_capability_id(&packed), manufacturer);
+    }
+
+    /// The end-mark reading still applies where §29.2 does not fix the length:
+    /// a spare Type Field (2..F), or a TF 0/1 identifier of another length.
+    #[test]
+    fn the_end_mark_still_applies_outside_the_23003_structure() {
+        // TF 2 (spare): no defined length, end mark honoured.
+        assert_eq!(decode_ue_radio_capability_id(&[0x22, 0xF3]), "223");
+        // TF 1 in 2 octets: not the 14-digit shape, end mark honoured.
+        assert_eq!(decode_ue_radio_capability_id(&[0x21, 0xF3]), "123");
+        // TF 0 in 7 octets: 14 digits is TF 1's length, not TF 0's (20), so a
+        // final 1111 is still the end mark.
+        assert_eq!(
+            decode_ue_radio_capability_id(&[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xFC]),
+            "0123456789abc"
         );
     }
 
