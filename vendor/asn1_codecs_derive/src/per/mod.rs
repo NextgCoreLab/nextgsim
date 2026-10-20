@@ -35,6 +35,9 @@ pub(crate) fn generate_codec(
         "NULL" => null::generate_per_codec_for_asn_null(ast, params, aligned),
         "REAL" => real::generate_per_codec_for_asn_real(ast, params, aligned),
         "SEQUENCE" => seq::generate_per_codec_for_asn_sequence(ast, params, aligned),
+        "SEQUENCE-EXTENSIONS" => {
+            seq::generate_per_codec_for_asn_sequence_extensions(ast, params, aligned)
+        }
         "OPEN" => open::generate_per_codec_for_asn_open_type(ast, params, aligned),
         "SEQUENCE-OF" => seqof::generate_per_codec_for_asn_sequence_of(ast, params, aligned),
         "OBJECT-IDENTIFIER" => {

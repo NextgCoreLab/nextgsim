@@ -366,6 +366,7 @@ fn build_cell_reselection_priorities(
     });
 
     Ok(CellReselectionPriorities {
+        extensions: Default::default(),
         freq_priority_list_eutra: None,
         freq_priority_list_nr,
         t320,

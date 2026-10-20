@@ -24,3 +24,9 @@ pub use per::uper;
 // For now making this public, eventually when we have a proper sequence extensions support, this
 // will not be required anyways.
 pub use per::common::decode::decode_sequence_extensions_skip_bits;
+
+#[doc(hidden)]
+pub use per::common::decode::decode_sequence_extension_additions_bitmap;
+
+#[doc(hidden)]
+pub use per::common::encode::encode_sequence_extension_additions_bitmap;

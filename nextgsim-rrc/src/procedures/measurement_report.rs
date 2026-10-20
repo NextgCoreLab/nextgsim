@@ -262,6 +262,7 @@ pub fn build_measurement_report(
         build_neigh_cell_results(&params.neigh_freq_results, &params.eutra_neigh_results)?;
 
     let meas_results = MeasResults {
+        extensions: Default::default(),
         meas_id,
         meas_result_serving_mo_list: meas_result_serv_mo_list,
         meas_result_neigh_cells,
@@ -358,6 +359,7 @@ fn build_meas_result_nr_value(nr: &MeasResultNr) -> MeasResultNR {
     };
 
     MeasResultNR {
+        extensions: Default::default(),
         phys_cell_id: nr.phys_cell_id.map(PhysCellId),
         meas_result,
     }
@@ -456,6 +458,7 @@ fn build_meas_result_eutra_value(
     }
 
     Ok(MeasResultEUTRA {
+        extensions: Default::default(),
         eutra_phys_cell_id: PhysCellId(cell.eutra_phys_cell_id),
         meas_result: MeasQuantityResultsEUTRA {
             rsrp: cell.rsrp.map(RSRP_RangeEUTRA),

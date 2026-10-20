@@ -13,3 +13,6 @@ pub mod procedures;
 
 #[cfg(test)]
 mod proptest_roundtrip;
+
+#[cfg(test)]
+mod seq_extension_tests;

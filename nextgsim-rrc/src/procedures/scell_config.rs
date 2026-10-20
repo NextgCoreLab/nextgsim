@@ -180,8 +180,10 @@ pub fn build_scell_cell_group_config(
     for addition in &config.to_add {
         addition.validate()?;
         additions.push(SCellConfig {
+            extensions: Default::default(),
             s_cell_index: SCellIndex(addition.scell_index),
             s_cell_config_common: Some(ServingCellConfigCommon {
+                extensions: Default::default(),
                 phys_cell_id: Some(PhysCellId(addition.phys_cell_id)),
                 downlink_config_common: None,
                 uplink_config_common: None,
@@ -218,6 +220,7 @@ pub fn build_scell_cell_group_config(
     }
 
     Ok(CellGroupConfig {
+        extensions: Default::default(),
         cell_group_id: CellGroupId(0),
         rlc_bearer_to_add_mod_list: None,
         rlc_bearer_to_release_list: None,
@@ -389,6 +392,7 @@ mod tests {
     #[test]
     fn a_cell_group_without_scells_reads_as_no_change() {
         let cell_group = CellGroupConfig {
+            extensions: Default::default(),
             cell_group_id: CellGroupId(0),
             rlc_bearer_to_add_mod_list: None,
             rlc_bearer_to_release_list: None,
@@ -409,6 +413,7 @@ mod tests {
     /// fields. Its `physCellId` is absent, which is legal ASN.1 and useless here.
     fn common_without_a_phys_cell_id() -> ServingCellConfigCommon {
         ServingCellConfigCommon {
+            extensions: Default::default(),
             phys_cell_id: None,
             downlink_config_common: None,
             uplink_config_common: None,
@@ -448,6 +453,7 @@ mod tests {
             ),
         ] {
             let cell_group = CellGroupConfig {
+                extensions: Default::default(),
                 cell_group_id: CellGroupId(0),
                 rlc_bearer_to_add_mod_list: None,
                 rlc_bearer_to_release_list: None,
@@ -455,6 +461,7 @@ mod tests {
                 physical_cell_group_config: None,
                 sp_cell_config: None,
                 s_cell_to_add_mod_list: Some(CellGroupConfigSCellToAddModList(vec![SCellConfig {
+                    extensions: Default::default(),
                     s_cell_index: SCellIndex(4),
                     s_cell_config_common: common,
                     s_cell_config_dedicated: None,

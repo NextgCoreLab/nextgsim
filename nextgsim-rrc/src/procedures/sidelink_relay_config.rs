@@ -189,6 +189,7 @@ pub fn build_srap_config(
             }
         };
         list.push(SL_MappingToAddMod_r17 {
+            extensions: Default::default(),
             sl_remote_ue_rb_identity_r17: bearer_identity(bearer),
             sl_egress_rlc_channel_uu_r17: uu,
             sl_egress_rlc_channel_pc5_r17: pc5,
@@ -290,12 +291,14 @@ pub fn build_l2_relay_ue_config(
     let mut add_mod = Vec::with_capacity(params.remote_ues.len());
     for remote in &params.remote_ues {
         add_mod.push(SL_RemoteUE_ToAddMod_r17 {
+            extensions: Default::default(),
             sl_l2_identity_remote_r17: destination_identity(remote.remote_l2_id),
             sl_srap_config_relay_r17: Some(build_srap_config(&remote.srap)?),
         });
     }
 
     Ok(SL_L2RelayUE_Config_r17 {
+        extensions: Default::default(),
         sl_remote_ue_to_add_mod_list_r17: if add_mod.is_empty() {
             None
         } else {
@@ -358,6 +361,7 @@ pub fn build_l2_remote_ue_config(
     params: &L2RemoteUeConfigParams,
 ) -> Result<SL_L2RemoteUE_Config_r17, SidelinkRelayRrcError> {
     Ok(SL_L2RemoteUE_Config_r17 {
+        extensions: Default::default(),
         sl_srap_config_remote_r17: match params.srap.as_ref() {
             Some(mapping) => Some(build_srap_config(mapping)?),
             None => None,
@@ -654,6 +658,7 @@ mod tests {
                 vec![
                     // SRB3, which TS 38.331 says is not supported.
                     SL_MappingToAddMod_r17 {
+                        extensions: Default::default(),
                         sl_remote_ue_rb_identity_r17: SL_RemoteUE_RB_Identity_r17::Srb_Identity_r17(
                             SL_RemoteUE_RB_Identity_r17_srb_Identity_r17(3),
                         ),
@@ -662,6 +667,7 @@ mod tests {
                     },
                     // And a perfectly good DRB after it.
                     SL_MappingToAddMod_r17 {
+                        extensions: Default::default(),
                         sl_remote_ue_rb_identity_r17: SL_RemoteUE_RB_Identity_r17::Drb_Identity_r17(
                             DRB_Identity(5),
                         ),
@@ -689,6 +695,7 @@ mod tests {
             sl_local_identity_r17: Some(SL_SRAP_Config_r17Sl_LocalIdentity_r17(LOCAL_ID)),
             sl_mapping_to_add_mod_list_r17: Some(SL_SRAP_Config_r17Sl_MappingToAddModList_r17(
                 vec![SL_MappingToAddMod_r17 {
+                    extensions: Default::default(),
                     sl_remote_ue_rb_identity_r17: SL_RemoteUE_RB_Identity_r17::Drb_Identity_r17(
                         DRB_Identity(5),
                     ),

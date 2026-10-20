@@ -464,6 +464,7 @@ pub fn build_nr_capability_container(
             AccessStratumRelease::REL15
         }),
         pdcp_parameters: PDCP_Parameters {
+            extensions: Default::default(),
             supported_rohc_profiles: PDCP_ParametersSupportedROHC_Profiles {
                 profile0x0000: PDCP_ParametersSupportedROHC_ProfilesProfile0x0000(false),
                 profile0x0001: PDCP_ParametersSupportedROHC_ProfilesProfile0x0001(false),
@@ -496,7 +497,9 @@ pub fn build_nr_capability_container(
             phy_parameters_fr2: None,
         },
         rf_parameters: RF_Parameters {
+            extensions: Default::default(),
             supported_band_list_nr: RF_ParametersSupportedBandListNR(vec![BandNR {
+                extensions: Default::default(),
                 band_nr: FreqBandIndicatorNR(supported_band),
                 modified_mpr_behaviour: None,
                 mimo_parameters_per_band: None,

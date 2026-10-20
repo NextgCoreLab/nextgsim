@@ -660,6 +660,7 @@ pub fn build_drb_radio_bearer_config(
         integrity_protection,
     );
     RadioBearerConfig {
+        extensions: Default::default(),
         srb_to_add_mod_list: None,
         srb3_to_release: None,
         drb_to_add_mod_list: Some(DRB_ToAddModList(vec![drb])),
@@ -723,12 +724,14 @@ fn build_drb_to_add_mod(
         }),
     };
     let pdcp_config = PDCP_Config {
+        extensions: Default::default(),
         drb,
         more_than_one_rlc: None,
         t_reordering: None,
     };
 
     DRB_ToAddMod {
+        extensions: Default::default(),
         cn_association: Some(DRB_ToAddModCnAssociation::Sdap_Config(sdap_config)),
         drb_identity: DRB_Identity(drb_id),
         reestablish_pdcp: None,
@@ -825,6 +828,7 @@ pub fn build_multi_drb_radio_bearer_config(
         .collect();
 
     Ok(RadioBearerConfig {
+        extensions: Default::default(),
         srb_to_add_mod_list: None,
         srb3_to_release: None,
         drb_to_add_mod_list: Some(DRB_ToAddModList(drbs)),
@@ -849,6 +853,7 @@ pub fn build_multi_drb_cell_group_config(bearers: &[(u8, u8)]) -> CellGroupConfi
     let rlc_bearers: Vec<RLC_BearerConfig> = bearers
         .iter()
         .map(|&(drb_id, lcid)| RLC_BearerConfig {
+            extensions: Default::default(),
             logical_channel_identity: LogicalChannelIdentity(lcid),
             served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Drb_Identity(
                 DRB_Identity(drb_id),
@@ -860,6 +865,7 @@ pub fn build_multi_drb_cell_group_config(bearers: &[(u8, u8)]) -> CellGroupConfi
         .collect();
 
     CellGroupConfig {
+        extensions: Default::default(),
         cell_group_id: CellGroupId(0),
         // `None` for an empty list, not an empty SEQUENCE-OF: the ASN.1 has a
         // lower bound of 1, so an empty vector would not encode.
@@ -3070,6 +3076,7 @@ pub fn build_handover_cell_group_config(
     }
 
     let sp_cell_config_common = ServingCellConfigCommon {
+        extensions: Default::default(),
         phys_cell_id: Some(PhysCellId(target_phys_cell_id)),
         // The target's frequency configuration is deliberately absent. This
         // simulator's RLS presents one carrier, so a target cell is always on the
@@ -3098,8 +3105,10 @@ pub fn build_handover_cell_group_config(
     };
 
     let sp_cell_config = SpCellConfig {
+        extensions: Default::default(),
         serv_cell_index: None,
         reconfiguration_with_sync: Some(ReconfigurationWithSync {
+            extensions: Default::default(),
             sp_cell_config_common: Some(sp_cell_config_common),
             new_ue_identity: RNTI_Value(new_ue_identity),
             t304: ReconfigurationWithSyncT304(t304_index(t304_ms)?),
@@ -3113,6 +3122,7 @@ pub fn build_handover_cell_group_config(
     };
 
     Ok(CellGroupConfig {
+        extensions: Default::default(),
         cell_group_id: CellGroupId(0),
         rlc_bearer_to_add_mod_list: None,
         rlc_bearer_to_release_list: None,

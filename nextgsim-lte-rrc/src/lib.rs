@@ -8,3 +8,6 @@
 
 pub mod codec;
 pub mod msg;
+
+#[cfg(test)]
+mod seq_extension_tests;

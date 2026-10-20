@@ -13,7 +13,7 @@ pub(crate) enum ResolvedConstructedType {
         name: Option<String>,
         extensible: bool,
         components: Vec<ResolvedSeqComponent>,
-        additions: Option<Vec<ResolvedSeqComponent>>,
+        additions: Option<Vec<ResolvedSeqAddition>>,
     },
     SequenceOf {
         name: Option<String>,
@@ -32,6 +32,17 @@ pub(crate) enum ClassFieldComponentType {
 pub(crate) struct ResolvedComponent {
     pub(crate) id: String,
     pub(crate) ty: Asn1ResolvedType,
+}
+
+/// One SEQUENCE extension addition (X.691 §19.7): either a lone component
+/// after the extension marker, or an extension addition group `[[ ... ]]`.
+/// Each is ONE bit of the extension-additions presence bitmap and ONE open
+/// type on the wire (§19.8, §19.9); a group's components are encoded inside
+/// it as a non-extensible SEQUENCE.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedSeqAddition {
+    pub(crate) components: Vec<ResolvedSeqComponent>,
+    pub(crate) is_group: bool,
 }
 
 #[derive(Debug, Clone)]

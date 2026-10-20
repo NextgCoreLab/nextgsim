@@ -357,6 +357,7 @@ pub fn build_a3_meas_config(params: &A3MeasConfigParams) -> Result<MeasConfig, M
     let hysteresis = hysteresis_signalled(params.hysteresis_db)?;
 
     let meas_object = MeasObjectNR {
+        extensions: Default::default(),
         ssb_frequency: Some(ARFCN_ValueNR(params.ssb_frequency_arfcn)),
         ssb_subcarrier_spacing: Some(SubcarrierSpacing(subcarrier_spacing_index(
             params.ssb_subcarrier_spacing_khz,
@@ -421,6 +422,7 @@ pub fn build_a3_meas_config(params: &A3MeasConfigParams) -> Result<MeasConfig, M
 
     let report_config = ReportConfigNR {
         report_type: ReportConfigNRReportType::EventTriggered(EventTriggerConfig {
+            extensions: Default::default(),
             event_id: EventTriggerConfigEventId::EventA3(event_a3),
             rs_type: NR_RS_Type(NR_RS_Type::SSB),
             report_interval: ReportInterval(report_interval_index(params.report_interval_ms)?),
@@ -444,6 +446,7 @@ pub fn build_a3_meas_config(params: &A3MeasConfigParams) -> Result<MeasConfig, M
     };
 
     Ok(MeasConfig {
+        extensions: Default::default(),
         meas_object_to_remove_list: None,
         meas_object_to_add_mod_list: Some(MeasObjectToAddModList(vec![MeasObjectToAddMod {
             meas_object_id: MeasObjectId(params.meas_object_id),
@@ -792,6 +795,7 @@ mod tests {
     #[test]
     fn a_meas_config_with_no_binding_reads_as_no_a3_configuration() {
         let config = MeasConfig {
+            extensions: Default::default(),
             meas_object_to_remove_list: None,
             meas_object_to_add_mod_list: None,
             report_config_to_remove_list: None,

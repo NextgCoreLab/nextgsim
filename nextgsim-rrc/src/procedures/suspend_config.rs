@@ -257,6 +257,7 @@ pub fn build_suspend_config(
     };
 
     Ok(SuspendConfig {
+        extensions: Default::default(),
         full_i_rnti: I_RNTI_Value(bits_of(params.full_i_rnti, FULL_I_RNTI_BITS)),
         short_i_rnti: ShortI_RNTI_Value(bits_of(
             u64::from(short_i_rnti_of(params.full_i_rnti)),
@@ -507,6 +508,7 @@ mod tests {
     #[test]
     fn a_ran_area_coded_notification_area_is_none_and_not_empty() {
         let config = SuspendConfig {
+            extensions: Default::default(),
             full_i_rnti: I_RNTI_Value(bits_of(1, FULL_I_RNTI_BITS)),
             short_i_rnti: ShortI_RNTI_Value(bits_of(1, SHORT_I_RNTI_BITS)),
             ran_paging_cycle: PagingCycle(PagingCycle::RF64),

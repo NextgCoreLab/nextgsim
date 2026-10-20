@@ -528,6 +528,7 @@ pub fn build_sl_config_dedicated(
     };
 
     Ok(SL_ConfigDedicatedNR_r16 {
+        extensions: Default::default(),
         sl_phy_mac_rlc_config_r16: if params.phy_mac_rlc_config {
             Some(phy_mac_rlc_config(params)?)
         } else {
@@ -561,6 +562,7 @@ fn phy_mac_rlc_config(
             )));
         }
         bearers.push(SL_RLC_BearerConfig_r16 {
+            extensions: Default::default(),
             sl_rlc_bearer_config_index_r16: SL_RLC_BearerConfigIndex_r16(bearer.index),
             sl_served_radio_bearer_r16: bearer.served_radio_bearer.map(SLRB_Uu_ConfigIndex_r16),
             // The RLC mode and logical-channel priority of the relay RLC channel. Absent
@@ -575,6 +577,7 @@ fn phy_mac_rlc_config(
         // Mode 1, when the network scheduled this UE's sidelink (issue #190).
         sl_scheduled_config_r16: params.sl_rnti.map(|rnti| {
             SL_PHY_MAC_RLC_Config_r16Sl_ScheduledConfig_r16::Setup(SL_ScheduledConfig_r16 {
+                extensions: Default::default(),
                 sl_rnti_r16: RNTI_Value(rnti),
                 // Deliberately absent -- these are the resource POOLS and the PSFCH
                 // timing, which would describe slots in a PC5 physical layer this

@@ -433,6 +433,7 @@ pub fn build_sib1(params: &Sib1Params) -> Result<BCCH_DL_SCH_Message, SystemInfo
     // groups, so the generated struct carries only the two root components --
     // the same shape it had under Rel-15.
     let cell_access_related_info = CellAccessRelatedInfo {
+        extensions: Default::default(),
         plmn_identity_info_list: PLMN_IdentityInfoList(plmn_identity_list),
         cell_reserved_for_other_use: None,
     };
@@ -554,6 +555,7 @@ fn build_plmn_identity_info(info: &PlmnIdentityInfo) -> PLMN_IdentityInfo {
     }
 
     PLMN_IdentityInfo {
+        extensions: Default::default(),
         plmn_identity_list: PLMN_IdentityInfoPlmn_IdentityList(plmn_list),
         tracking_area_code: tac,
         ranac: None,
@@ -1340,6 +1342,7 @@ fn build_sib2(params: &Sib2Params) -> Result<SIB2, SystemInformationError> {
     }
 
     Ok(SIB2 {
+        extensions: Default::default(),
         cell_reselection_info_common: SIB2CellReselectionInfoCommon {
             nrof_ss_blocks_to_average: None,
             abs_thresh_ss_blocks_consolidation: None,
@@ -1348,6 +1351,7 @@ fn build_sib2(params: &Sib2Params) -> Result<SIB2, SystemInformationError> {
             speed_state_reselection_pars: None,
         },
         cell_reselection_serving_freq_info: SIB2CellReselectionServingFreqInfo {
+            extensions: Default::default(),
             s_non_intra_search_p: None,
             s_non_intra_search_q: None,
             thresh_serving_low_p: ReselectionThreshold(params.thresh_serving_low_p),
@@ -1356,6 +1360,7 @@ fn build_sib2(params: &Sib2Params) -> Result<SIB2, SystemInformationError> {
             cell_reselection_sub_priority: None,
         },
         intra_freq_cell_reselection_info: SIB2IntraFreqCellReselectionInfo {
+            extensions: Default::default(),
             q_rx_lev_min: Q_RxLevMin(params.q_rx_lev_min),
             q_rx_lev_min_sul: None,
             q_qual_min: None,
@@ -1391,6 +1396,7 @@ fn build_sib3(params: &Sib3Params) -> Result<SIB3, SystemInformationError> {
         .collect::<Result<Vec<_>, SystemInformationError>>()?;
 
     Ok(SIB3 {
+        extensions: Default::default(),
         // `IntraFreqNeighCellList` is SIZE (1..maxCellIntra): an empty list is
         // not encodable, so an empty request omits the field rather than
         // encoding a zero-length list.
@@ -1467,6 +1473,7 @@ fn build_sib4(params: &Sib4Params) -> Result<SIB4, SystemInformationError> {
         .collect::<Result<Vec<_>, SystemInformationError>>()?;
 
     Ok(SIB4 {
+        extensions: Default::default(),
         inter_freq_carrier_freq_list: InterFreqCarrierFreqList(carriers),
         late_non_critical_extension: None,
     })
@@ -1531,6 +1538,7 @@ fn build_sib19(params: &Sib19Params) -> Result<SIB19_r17, SystemInformationError
     }
 
     let ntn_config = NTN_Config_r17 {
+        extensions: Default::default(),
         epoch_time_r17: Some(EpochTime_r17 {
             sfn_r17: EpochTime_r17Sfn_r17(cfg.epoch_sfn),
             sub_frame_nr_r17: EpochTime_r17SubFrameNR_r17(cfg.epoch_subframe),
@@ -1570,6 +1578,7 @@ fn build_sib19(params: &Sib19Params) -> Result<SIB19_r17, SystemInformationError
     };
 
     Ok(SIB19_r17 {
+        extensions: Default::default(),
         ntn_config_r17: Some(ntn_config),
         t_service_r17: params.t_service.map(SIB19_r17T_Service_r17),
         // Omitted with `distanceThresh`'s companion: see the doc comment above.
@@ -2569,7 +2578,9 @@ mod tests {
         // — which is the point: this simulator never sends such a SIB19, but a peer
         // legally may.
         let no_ephemeris = SIB19_r17 {
+            extensions: Default::default(),
             ntn_config_r17: Some(NTN_Config_r17 {
+                extensions: Default::default(),
                 epoch_time_r17: Some(EpochTime_r17 {
                     sfn_r17: EpochTime_r17Sfn_r17(1),
                     sub_frame_nr_r17: EpochTime_r17SubFrameNR_r17(0),

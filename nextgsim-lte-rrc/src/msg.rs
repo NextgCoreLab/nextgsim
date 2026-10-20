@@ -402,7 +402,9 @@ fn sib2_asn(sib2: &Sib2Info) -> Result<SystemInformationBlockType2, RrcMsgError>
     // the physical layer and MAC, so the UE does not act on them; the values are
     // the ones a typical 10 MHz FDD cell broadcasts.
     let rrc_common = RadioResourceConfigCommonSIB {
+        extensions: Default::default(),
         rach_config_common: RACH_ConfigCommon {
+            extensions: Default::default(),
             preamble_info: RACH_ConfigCommonPreambleInfo {
                 number_of_ra_preambles: RACH_ConfigCommonPreambleInfoNumberOfRA_Preambles(
                     RACH_ConfigCommonPreambleInfoNumberOfRA_Preambles::N52,
@@ -505,9 +507,11 @@ fn sib2_asn(sib2: &Sib2Info) -> Result<SystemInformationBlockType2, RrcMsgError>
         ul_cyclic_prefix_length: UL_CyclicPrefixLength(UL_CyclicPrefixLength::LEN1),
     };
     Ok(SystemInformationBlockType2 {
+        extensions: Default::default(),
         ac_barring_info: None,
         radio_resource_config_common: rrc_common,
         ue_timers_and_constants: UE_TimersAndConstants {
+            extensions: Default::default(),
             t300: UE_TimersAndConstantsT300(index_of(&T300_T301_MS, t.t300_ms, "T300")?),
             t301: UE_TimersAndConstantsT301(index_of(&T300_T301_MS, t.t301_ms, "T301")?),
             t310: UE_TimersAndConstantsT310(index_of(&T310_MS, t.t310_ms, "T310")?),
@@ -783,7 +787,9 @@ pub fn encode_rrc_connection_setup(transaction_id: u8) -> Result<Vec<u8>, RrcMsg
             RRCConnectionSetupCriticalExtensions_c1::RrcConnectionSetup_r8(
                 RRCConnectionSetup_r8_IEs {
                     radio_resource_config_dedicated: RadioResourceConfigDedicated {
+                        extensions: Default::default(),
                         srb_to_add_mod_list: Some(SRB_ToAddModList(vec![SRB_ToAddMod {
+                            extensions: Default::default(),
                             srb_identity: SRB_ToAddModSrb_Identity(1),
                             rlc_config: Some(SRB_ToAddModRlc_Config::DefaultValue(
                                 SRB_ToAddModRlc_Config_defaultValue,
@@ -1330,9 +1336,11 @@ pub struct Reconfiguration {
 /// PBR 8 kbit/s with a 100 ms bucket.
 fn drb_to_add_mod(d: &DrbConfig) -> DRB_ToAddMod {
     DRB_ToAddMod {
+        extensions: Default::default(),
         eps_bearer_identity: Some(DRB_ToAddModEps_BearerIdentity(d.eps_bearer_identity)),
         drb_identity: DRB_Identity(d.drb_identity),
         pdcp_config: Some(PDCP_Config {
+            extensions: Default::default(),
             discard_timer: Some(PDCP_ConfigDiscardTimer(PDCP_ConfigDiscardTimer::INFINITY)),
             rlc_am: None,
             rlc_um: Some(PDCP_ConfigRlc_UM {
@@ -1359,6 +1367,7 @@ fn drb_to_add_mod(d: &DrbConfig) -> DRB_ToAddMod {
             d.logical_channel_identity,
         )),
         logical_channel_config: Some(LogicalChannelConfig {
+            extensions: Default::default(),
             ul_specific_parameters: Some(LogicalChannelConfigUl_SpecificParameters {
                 priority: LogicalChannelConfigUl_SpecificParametersPriority(13),
                 prioritised_bit_rate: LogicalChannelConfigUl_SpecificParametersPrioritisedBitRate(
@@ -1400,6 +1409,7 @@ fn decoded_drb_rlc(d: &DRB_ToAddMod) -> DrbRlc {
 /// "E-UTRAN ... establishes SRB2 ... after having activated security" (§4.2.2).
 fn srb2_to_add_mod() -> SRB_ToAddMod {
     SRB_ToAddMod {
+        extensions: Default::default(),
         srb_identity: SRB_ToAddModSrb_Identity(2),
         rlc_config: Some(SRB_ToAddModRlc_Config::DefaultValue(
             SRB_ToAddModRlc_Config_defaultValue,
@@ -1442,6 +1452,7 @@ pub fn encode_rrc_connection_reconfiguration(
         }),
         radio_resource_config_dedicated: (add_srb2 || !drbs.is_empty()).then(|| {
             RadioResourceConfigDedicated {
+                extensions: Default::default(),
                 srb_to_add_mod_list: add_srb2.then(|| SRB_ToAddModList(vec![srb2_to_add_mod()])),
                 drb_to_add_mod_list: (!drbs.is_empty())
                     .then(|| DRB_ToAddModList(drbs.iter().map(drb_to_add_mod).collect())),
