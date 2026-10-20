@@ -50,3 +50,6 @@ serde_yaml.workspace = true
 nextgsim-lte-ue.workspace = true
 nextgsim-lte-rrc.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+# The kernel-SCTP transport test opens a loopback SCTP listener.
+socket2.workspace = true
+libc = "0.2"

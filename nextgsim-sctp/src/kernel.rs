@@ -29,7 +29,8 @@
 //! `htobe32(ppid)` before `sctp_sendmsg`. We mirror that exactly: we pass
 //! `NGAP_PPID.to_be()` to `sctp_sendmsg`, and on receive we read
 //! `sinfo.sinfo_ppid` (which the kernel hands back in network byte order) and
-//! convert it with `u32::from_be` before comparing against [`NGAP_PPID`].
+//! convert it with `u32::from_be` before comparing it against the PPID the
+//! caller said the association carries (`connect`'s `expected_ppid`).
 
 use std::io;
 use std::net::SocketAddr;
@@ -165,6 +166,48 @@ extern "C" {
 }
 
 // ===========================================================================
+// Expected-PPID check
+// ===========================================================================
+
+/// The PPID one association is meant to carry, and how many received messages
+/// carried another.
+///
+/// An association runs one application protocol: NGAP (PPID 60, TS 38.412 §7)
+/// for a gNB, S1AP (PPID 18, TS 36.412 §7) for an eNB. The caller states which,
+/// so a mismatch is reported against the protocol actually in use rather than
+/// against an assumed NGAP — the eNB used to log `non-NGAP PPID 18` for every
+/// conformant S1AP message. The message is still delivered with the PPID it
+/// carried; the warning is the diagnostic, and the count makes it observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PpidCheck {
+    expected: u32,
+    unexpected: u64,
+}
+
+impl PpidCheck {
+    fn new(expected: u32) -> Self {
+        Self {
+            expected,
+            unexpected: 0,
+        }
+    }
+
+    /// Record a received PPID; warn and count it if it is not the expected one.
+    /// Returns whether it matched.
+    fn observe(&mut self, ppid: u32, stream_id: u16) -> bool {
+        if ppid == self.expected {
+            return true;
+        }
+        self.unexpected += 1;
+        warn!(
+            "Kernel SCTP received PPID {} on stream {} (this association expects {})",
+            ppid, stream_id, self.expected
+        );
+        false
+    }
+}
+
+// ===========================================================================
 // KernelSctpAssociation
 // ===========================================================================
 
@@ -193,6 +236,8 @@ pub struct KernelSctpAssociation {
     established: bool,
     /// Maximum receive buffer size from config (per-recv allocation cap).
     max_recv: usize,
+    /// The PPID this association carries, as stated by the caller.
+    ppid_check: PpidCheck,
 }
 
 impl KernelSctpAssociation {
@@ -204,10 +249,16 @@ impl KernelSctpAssociation {
     ///    can read the PPID).
     /// 3. Bind to `local`, connect to `remote` (blocking 4-way handshake).
     /// 4. Switch to non-blocking and register with the tokio reactor.
+    ///
+    /// `expected_ppid` is the application protocol this association carries —
+    /// [`NGAP_PPID`] for a gNB, [`crate::S1AP_PPID`] for an eNB. A received
+    /// message with any other PPID is still delivered, but is warned about and
+    /// counted ([`unexpected_ppid_count`](Self::unexpected_ppid_count)).
     pub async fn connect(
         local: SocketAddr,
         remote: SocketAddr,
         config: &SctpConfig,
+        expected_ppid: u32,
     ) -> Result<Self> {
         info!(
             "Connecting to kernel SCTP endpoint at {} (proto 132)",
@@ -329,6 +380,7 @@ impl KernelSctpAssociation {
             remote_addr: remote,
             established: true,
             max_recv: config.max_receive_buffer_size as usize,
+            ppid_check: PpidCheck::new(expected_ppid),
         })
     }
 
@@ -476,12 +528,7 @@ impl KernelSctpAssociation {
                 "Kernel SCTP received {} bytes on stream {} with PPID {} (wire be: {:#010x})",
                 n, stream_id, ppid, sinfo.sinfo_ppid
             );
-            if ppid != NGAP_PPID {
-                warn!(
-                    "Kernel SCTP received non-NGAP PPID {} (expected {})",
-                    ppid, NGAP_PPID
-                );
-            }
+            self.ppid_check.observe(ppid, stream_id);
 
             return Ok(Some(ReceivedMessage {
                 stream_id,
@@ -572,12 +619,7 @@ impl KernelSctpAssociation {
             "Kernel SCTP received {} bytes on stream {} with PPID {} (wire be: {:#010x})",
             n, stream_id, ppid, sinfo.sinfo_ppid
         );
-        if ppid != NGAP_PPID {
-            warn!(
-                "Kernel SCTP received non-NGAP PPID {} (expected {})",
-                ppid, NGAP_PPID
-            );
-        }
+        self.ppid_check.observe(ppid, stream_id);
 
         Ok(Some(ReceivedMessage {
             stream_id,
@@ -639,6 +681,17 @@ impl KernelSctpAssociation {
         self.established
     }
 
+    /// The PPID this association was opened to carry.
+    pub fn expected_ppid(&self) -> u32 {
+        self.ppid_check.expected
+    }
+
+    /// How many received messages carried a PPID other than
+    /// [`expected_ppid`](Self::expected_ppid).
+    pub fn unexpected_ppid_count(&self) -> u64 {
+        self.ppid_check.unexpected
+    }
+
     /// Close the association. Performs an SCTP shutdown via the underlying
     /// socket (dropping the `Socket` also closes the fd).
     pub fn close(&mut self) {
@@ -672,8 +725,114 @@ impl Drop for KernelSctpAssociation {
 
 #[cfg(test)]
 mod tests {
-    use super::SctpEventSubscribe;
+    use super::{PpidCheck, SctpEventSubscribe};
+    use crate::association::{SctpConfig, NGAP_PPID};
+    use crate::S1AP_PPID;
     use std::mem;
+
+    #[test]
+    fn an_s1ap_association_does_not_flag_ppid_18() {
+        let mut check = PpidCheck::new(S1AP_PPID);
+        assert!(check.observe(18, 0), "PPID 18 is what S1-MME carries");
+        assert!(check.observe(18, 1));
+        assert_eq!(check.unexpected, 0, "conformant S1AP is never counted");
+    }
+
+    #[test]
+    fn an_s1ap_association_flags_any_other_ppid() {
+        let mut check = PpidCheck::new(S1AP_PPID);
+        assert!(!check.observe(NGAP_PPID, 0), "NGAP on S1-MME is a mismatch");
+        assert!(!check.observe(0, 0), "unspecified (0) is a mismatch too");
+        assert_eq!(check.unexpected, 2);
+    }
+
+    #[test]
+    fn an_ngap_association_keeps_flagging_non_ngap_ppids() {
+        // The gNB relies on this as its only PPID check (#186 increment 2).
+        let mut check = PpidCheck::new(NGAP_PPID);
+        assert!(check.observe(60, 0));
+        assert!(!check.observe(S1AP_PPID, 0));
+        assert_eq!(check.unexpected, 1);
+    }
+
+    /// Real kernel SCTP over loopback: a listener sends one S1AP (18) and one
+    /// NGAP (60) message to a client opened for S1AP. Both are delivered with
+    /// the PPID they carried; only the NGAP one is counted. Skips, saying so,
+    /// on a host without kernel SCTP.
+    #[tokio::test]
+    async fn kernel_loopback_counts_only_the_unexpected_ppid() {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+        use std::os::fd::AsRawFd;
+
+        let listener = match Socket::new(
+            Domain::IPV4,
+            Type::STREAM,
+            Some(Protocol::from(libc::IPPROTO_SCTP)),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: no kernel SCTP on this host ({e})");
+                return;
+            }
+        };
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        listener.bind(&SockAddr::from(any)).expect("bind");
+        listener.listen(1).expect("listen");
+        let server_addr = listener
+            .local_addr()
+            .expect("local addr")
+            .as_socket()
+            .expect("inet");
+
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            for (ppid, msg) in [(S1AP_PPID, &b"s1ap"[..]), (NGAP_PPID, b"ngap")] {
+                // SAFETY: `conn` is a connected one-to-one SCTP socket; `msg` is
+                // a valid slice; `to`/`tolen` are NULL/0 for a connected socket.
+                let n = unsafe {
+                    super::sctp_sendmsg(
+                        conn.as_raw_fd(),
+                        msg.as_ptr().cast(),
+                        msg.len(),
+                        std::ptr::null(),
+                        0,
+                        ppid.to_be(),
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                };
+                assert_eq!(n, msg.len() as isize, "sctp_sendmsg");
+            }
+            // Keep the association up until the client has read both.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+
+        let mut client = super::KernelSctpAssociation::connect(
+            any,
+            server_addr,
+            &SctpConfig::default(),
+            S1AP_PPID,
+        )
+        .await
+        .expect("connect");
+        assert_eq!(client.expected_ppid(), S1AP_PPID);
+
+        let first = client.recv().await.expect("recv").expect("open");
+        assert_eq!((first.ppid, &first.data[..]), (S1AP_PPID, &b"s1ap"[..]));
+        assert_eq!(client.unexpected_ppid_count(), 0, "PPID 18 is expected");
+
+        let second = client.recv().await.expect("recv").expect("open");
+        assert_eq!((second.ppid, &second.data[..]), (NGAP_PPID, &b"ngap"[..]));
+        assert_eq!(
+            client.unexpected_ppid_count(),
+            1,
+            "an NGAP message on an S1AP association is counted, and still delivered"
+        );
+
+        server.join().expect("server thread");
+    }
 
     /// `SctpEventSubscribe` is the one SCTP struct `libc` lacks, so it is still
     /// transcribed and handed to `setsockopt` by size: a dropped, reordered or

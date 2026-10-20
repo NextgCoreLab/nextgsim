@@ -243,10 +243,13 @@ impl AmfConnection {
             // `secondary_addresses` here and use the primary path.
             #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
             {
+                // N2 carries NGAP only (TS 38.412 §7): a received message with
+                // any other PPID is warned about and counted.
                 let association = KernelSctpAssociation::connect(
                     self.local_address,
                     self.remote_address,
                     &config.sctp_config,
+                    nextgsim_sctp::NGAP_PPID,
                 )
                 .await?;
                 self.local_address = association.local_addr();

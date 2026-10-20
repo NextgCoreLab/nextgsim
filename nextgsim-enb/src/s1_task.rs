@@ -275,10 +275,46 @@ pub mod kernel {
             remote: SocketAddr,
         ) -> std::io::Result<KernelS1Transport> {
             let streams = self.config.max_outbound_streams;
-            KernelSctpAssociation::connect(local, remote, &self.config)
+            // S1-MME carries S1AP only (TS 36.412 §7).
+            KernelSctpAssociation::connect(local, remote, &self.config, nextgsim_sctp::S1AP_PPID)
                 .await
                 .map(|a| KernelS1Transport(a, streams))
                 .map_err(io)
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::{KernelConnector, S1Connector};
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+        /// The eNB's kernel association is opened for S1AP, so conformant
+        /// S1-MME traffic (PPID 18) is not flagged as unexpected.
+        #[tokio::test]
+        async fn the_enb_opens_its_kernel_association_for_s1ap() {
+            let Ok(listener) = Socket::new(
+                Domain::IPV4,
+                Type::STREAM,
+                Some(Protocol::from(libc::IPPROTO_SCTP)),
+            ) else {
+                eprintln!("skipping: no kernel SCTP on this host");
+                return;
+            };
+            let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+            listener.bind(&SockAddr::from(any)).expect("bind");
+            listener.listen(1).expect("listen");
+            let mme = listener
+                .local_addr()
+                .expect("addr")
+                .as_socket()
+                .expect("inet");
+            let accept = std::thread::spawn(move || listener.accept().map(|_| ()));
+
+            let transport = KernelConnector::default()
+                .connect(any, mme)
+                .await
+                .expect("connect");
+            assert_eq!(transport.0.expected_ppid(), nextgsim_sctp::S1AP_PPID);
+            accept.join().expect("thread").expect("accept");
         }
     }
 }
