@@ -26,3 +26,6 @@ mod integer_extension_tests;
 
 #[cfg(test)]
 mod constraint_union_tests;
+
+#[cfg(test)]
+mod charstring_tests;

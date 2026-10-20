@@ -295,15 +295,11 @@ pub fn encode_utf8_string(
         extended
     );
 
-    encode_octet_string_common(
-        data,
-        lb,
-        ub,
-        is_extensible,
-        value.as_bytes(),
-        extended,
-        false,
-    )
+    // X.691 §30.6 / §10.9.3.3: UTF8String is not a known-multiplier type, so
+    // its size constraint and extensibility are not PER-visible: no extension
+    // bit and an unconstrained length in octets.
+    let _ = (lb, ub, is_extensible, extended);
+    encode_octet_string_common(data, None, None, false, value.as_bytes(), false, false)
 }
 
 /// Encode a UTF8String CharacterString Type.

@@ -53,7 +53,9 @@ pub fn decode_utf8_string(
         ub,
         is_extensible
     );
-    decode_string_common(data, lb, ub, is_extensible, 8, true)
+    // X.691 §30.6 / §10.9.3.3: the size constraint is not PER-visible.
+    let _ = (lb, ub, is_extensible);
+    decode_string_common(data, None, None, false, 8, true)
 }
 
 // UTCTime is Just Like UTF8String

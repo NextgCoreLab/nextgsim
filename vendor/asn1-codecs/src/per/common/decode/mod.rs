@@ -472,11 +472,13 @@ pub(crate) fn decode_string_common(
 
     // X.691 §30.5.7: the length counts characters and fragments at 16K of them.
     let (mut lb, mut ub) = if is_extended { (None, None) } else { (lb, ub) };
+    // §30.5.7: the type's upper bound decides alignment, not the value's length.
+    let align_content = aligned && super::charstring_content_aligned(ub, bits_per_char);
     let mut bits: BitVec<u8, Msb0> = BitVec::new();
     loop {
         let (length, more) = decode_length_fragment_common(data, lb, ub, aligned)?;
         let length = length * bits_per_char;
-        if length > 16 && aligned {
+        if length > 0 && align_content {
             data.decode_align()?;
         }
         bits.extend(data.get_bitvec(length)?);

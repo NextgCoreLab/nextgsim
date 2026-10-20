@@ -41,11 +41,31 @@ pub(crate) fn string_content_aligned(
     !fixed || count > fixed_unaligned_max
 }
 
+/// Whether the characters of a known-multiplier character string are placed
+/// "octet-aligned in the ALIGNED variant" (X.691 §30.5.6-30.5.8).
+///
+/// The decision is the TYPE's, not the value's: with `aub` the upper bound and
+/// `b` the bits per character, the characters are aligned when `aub × b > 16`,
+/// and always when there is no upper bound below 64K (the fragmenting /
+/// unconstrained case, §30.5.8). A fixed size of at most 16 bits is the only
+/// unaligned case (§30.5.6). The fork used to compare the value's own length
+/// instead, so a 1- or 2-character `SIZE(1..150)` string went unaligned.
+/// Callers only ask for non-empty content.
+pub(crate) fn charstring_content_aligned(ub: Option<i128>, bits_per_char: usize) -> bool {
+    match ub {
+        Some(u) if u < 65_536 => u * bits_per_char as i128 > 16,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod fragment_tests;
 
 #[cfg(test)]
 mod bitstring_align_tests;
+
+#[cfg(test)]
+mod charstring_align_tests;
 
 #[cfg(test)]
 mod integer_ext_tests;
