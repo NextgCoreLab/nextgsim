@@ -432,12 +432,33 @@ async fn lte_ue_attaches_through_the_nextgcore_epc() {
     })
     .await;
     assert_eq!(s.state, EmmState::Registered, "attach did not complete");
+    // The UE's own state is the primary evidence: EMM-REGISTERED with the
+    // default EPS bearer active and a network-assigned PDN address.
     let bearer = s.bearer.expect("default EPS bearer activated");
     eprintln!("[test] default EPS bearer {bearer:?}");
     assert!(
-        mmed.wait_for("Attach Complete", Duration::from_secs(5))
-            || mmed.wait_for("ATTACH COMPLETE", Duration::from_secs(1))
-            || mmed.wait_for("attach complete", Duration::from_secs(1)),
-        "mmed did not log the ATTACH COMPLETE"
+        (5..=15).contains(&bearer.ebi),
+        "EBI {} out of 5..=15",
+        bearer.ebi
+    );
+    match bearer.pdn_address {
+        nextgsim_eps_nas::ie::PdnAddress::Ipv4(a)
+        | nextgsim_eps_nas::ie::PdnAddress::Ipv4v6(_, a) => {
+            assert!(!a.is_unspecified(), "PDN address is 0.0.0.0")
+        }
+        nextgsim_eps_nas::ie::PdnAddress::Ipv6(iid) => {
+            assert_ne!(iid, [0; 8], "IPv6 interface identifier is zero")
+        }
+    }
+    // And the MME agrees: it activated the same bearer. Matched on the EBI
+    // rather than on free text describing ATTACH COMPLETE, whose wording is
+    // mmed's to change.
+    assert!(
+        mmed.wait_for(
+            &format!("Default EPS bearer (ebi={}) activated", bearer.ebi),
+            Duration::from_secs(5)
+        ),
+        "mmed did not activate default EPS bearer {}",
+        bearer.ebi
     );
 }
