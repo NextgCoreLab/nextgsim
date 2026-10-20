@@ -366,6 +366,30 @@ compiles these constants from the pinned rev, not from the nextgcore commit
 under test. That doesn't matter for constants. It would matter if anything
 with behaviour were shared.
 
+### The patched sctp-proto
+
+The userspace SCTP backend runs on sctp-proto 0.6.0 patched to carry any PPID
+verbatim (#220): upstream maps every non-WebRTC PPID to `Unknown`, sent as 58.
+That patched crate has **one home**, nextgcore's `src/vendor/sctp-proto`
+(nextgcore #467/#468; its `HOME.md` and `NEXTGSIM-PATCH.md` record the patch).
+This repo takes it through `[patch.crates-io]` in the root `Cargo.toml`, as a git
+dependency on nextgcore pinned by `rev` (#230), instead of vendoring a second
+copy. Cargo finds the crate inside the nextgcore checkout by name even though it
+is excluded from nextgcore's workspace.
+
+Unlike the constants above, this **is** shared behaviour: the bytes on the wire
+come from nextgcore's copy. So:
+
+- The `rev` here differs from `nextgcore-sctp`'s on purpose. `nextgcore-sctp`
+  stays on the E2E-validated pair (the procedure above), which predates #468.
+  This `rev` only has to contain #468. Unify the two the next time
+  `nextgcore-sctp` is bumped to a validated pair at or after it.
+- To change the patch, change it in nextgcore, then bump this `rev` and run
+  `cargo update -p sctp-proto`. `nextgsim-sctp/tests/userspace_ppid_on_wire.rs`
+  is the proof that the patch is in effect: 60 and 18 on the wire, both ways.
+  Without the patch the crate does not compile at all, because nextgsim-sctp
+  converts the PPID to `u32`.
+
 ## References
 
 - [3GPP TS 38.413](https://www.3gpp.org/ftp/Specs/archive/38_series/38.413/) - NGAP Specification

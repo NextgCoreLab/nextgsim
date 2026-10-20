@@ -1,9 +1,5 @@
 [workspace]
 resolver = "2"
-# Third-party source vendored only to carry a local patch: kept out of the
-# workspace so its own tests and lints are not ours (see NEXTGSIM-PATCH.md).
-exclude = ["vendor/sctp-proto"]
-
 members = [
     "nextgsim-common",
     "nextgsim-crypto",
@@ -187,5 +183,16 @@ asn1_codecs_derive = { path = "vendor/asn1_codecs_derive" }
 asn1-compiler = { path = "vendor/asn1-compiler" }
 # sctp-proto 0.6.0 patched to carry any SCTP PPID verbatim (#220): upstream
 # (0.6.0 and 0.10.7 alike) maps every non-WebRTC PPID to `Unknown`, sent as 58.
-# See vendor/sctp-proto/NEXTGSIM-PATCH.md.
-sctp-proto = { path = "vendor/sctp-proto" }
+# The patched crate has ONE home, nextgcore's src/vendor/sctp-proto (nextgcore
+# #467/#468; see its HOME.md and NEXTGSIM-PATCH.md), consumed here by git rev
+# (#230) rather than vendored a second time -- two copies of one patch drift,
+# which is what #205 exists to prevent. Cargo finds the crate inside the nextgcore
+# checkout by name even though it is excluded from nextgcore's workspace.
+#
+# The rev differs from nextgcore-sctp's on purpose: nextgcore-sctp stays pinned to
+# the E2E-validated pair (bf3dbd8, see nextgsim-sctp/Cargo.toml and
+# docs/nextgcore-integration.md), which predates #468 and so has no
+# src/vendor/sctp-proto. This rev only has to contain #468; bump it whenever the
+# patch changes in nextgcore. When nextgcore-sctp is next bumped to a validated
+# pair at or after f428e6c, the two revs can be unified.
+sctp-proto = { git = "https://github.com/NextgCoreLab/nextgcore", rev = "f428e6ca33846791645592eac55d0d79a91fba26" }
