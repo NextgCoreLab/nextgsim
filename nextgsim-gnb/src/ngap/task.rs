@@ -10510,4 +10510,241 @@ mod tests {
             .expect("a UE Context Release Request");
         assert_eq!(req.pdu_session_ids, vec![5, 6]);
     }
+
+    // ========================================================================
+    // RACS (TS 23.501 §5.4.4.1a, TS 38.413 §8.14) -- issue #120
+    // ========================================================================
+
+    use nextgsim_ngap::procedures::initial_context_setup::{
+        AllowedSnssaiValue, GuamiValue, InitialContextSetupRequestData,
+    };
+    use nextgsim_ngap::procedures::ue_radio_capability::{
+        decode_ue_radio_capability_id_mapping_request, decode_ue_radio_capability_info_indication,
+        encode_ue_radio_capability_id_mapping_response, UeRadioCapabilityIdMappingResponseData,
+    };
+
+    fn racs_ics(
+        ran_ue_ngap_id: u32,
+        capability: Option<Vec<u8>>,
+        id: Option<Vec<u8>>,
+    ) -> InitialContextSetupRequestData {
+        InitialContextSetupRequestData {
+            amf_ue_ngap_id: 7777,
+            ran_ue_ngap_id,
+            old_amf: None,
+            ue_aggregate_max_bit_rate: None,
+            guami: GuamiValue {
+                plmn_identity: [0x09, 0xF1, 0x07],
+                amf_region_id: 2,
+                amf_set_id: 1,
+                amf_pointer: 0,
+            },
+            allowed_nssai: vec![AllowedSnssaiValue { sst: 1, sd: None }],
+            ue_security_capabilities: UeSecurityCapabilitiesValue {
+                nr_encryption_algorithms: 0xE000,
+                nr_integrity_algorithms: 0xE000,
+                eutra_encryption_algorithms: None,
+                eutra_integrity_algorithms: None,
+            },
+            security_key: [0x11; 32],
+            nas_pdu: None,
+            pdu_session_setup_list: Vec::new(),
+            ue_radio_capability: capability,
+            ue_radio_capability_id: id,
+        }
+    }
+
+    /// What reached RRC about capabilities: `Some(None)` for an enquiry,
+    /// `Some(Some(bytes))` for a capability handed over, per message in order.
+    fn drain_rrc_capability(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RrcMessage>>,
+    ) -> Vec<(i32, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                TaskMessage::Message(RrcMessage::UeCapabilityEnquiry { ue_id }) => {
+                    out.push((ue_id, None))
+                }
+                TaskMessage::Message(RrcMessage::UeRadioCapability {
+                    ue_id,
+                    ue_radio_capability,
+                }) => out.push((ue_id, Some(ue_radio_capability))),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn mapping_requests(pdus: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        pdus.iter()
+            .filter_map(|p| decode_ue_radio_capability_id_mapping_request(p).ok())
+            .collect()
+    }
+
+    async fn ran_id(task: &NgapTask, ue_id: i32) -> u32 {
+        task.find_ue_context(ue_id).expect("ue").ran_ue_ngap_id as u32
+    }
+
+    /// TS 38.413 §8.3.1.2 + §8.14.3: an ICS carrying only an ID the gNB has never
+    /// seen makes it ask the AMF -- once, however many UEs present that ID -- and NOT
+    /// ask the UE.
+    #[tokio::test]
+    async fn an_unknown_id_is_mapped_by_the_amf_once_for_all_ues_presenting_it() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        task.create_ue_context(2, 1).await.expect("ue 2");
+        let id = vec![0x10, 0x20, 0x30];
+        for ue in [1, 2] {
+            let ran = ran_id(&task, ue).await;
+            task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(id.clone())))
+                .await;
+        }
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(mapping_requests(&sent), vec![id.clone()], "exactly one mapping request");
+        assert!(
+            drain_rrc_capability(&mut rrc_rx).is_empty(),
+            "no UE capability enquiry and nothing applied while the mapping is outstanding"
+        );
+        assert_eq!(task.racs_pending.get(&id).map(Vec::len), Some(2));
+    }
+
+    /// The mapping response fills the cache and resolves every waiting UE; a later
+    /// UE with the same ID is resolved from the cache with no new request.
+    #[tokio::test]
+    async fn the_mapping_response_resolves_waiters_and_later_ues_hit_the_cache() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        task.create_ue_context(2, 1).await.expect("ue 2");
+        let id = vec![0x42];
+        let cap = vec![0x00, 0x18, 0x80, 0x1A, 0xB0];
+        for ue in [1, 2] {
+            let ran = ran_id(&task, ue).await;
+            task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(id.clone())))
+                .await;
+        }
+        drain_sctp(&mut sctp_rx);
+        drain_rrc_capability(&mut rrc_rx);
+
+        let response = encode_ue_radio_capability_id_mapping_response(
+            &UeRadioCapabilityIdMappingResponseData {
+                ue_radio_capability_id: id.clone(),
+                ue_radio_capability: cap.clone(),
+            },
+        )
+        .unwrap();
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&response)).await;
+
+        let mut applied = drain_rrc_capability(&mut rrc_rx);
+        applied.sort();
+        assert_eq!(applied, vec![(1, Some(cap.clone())), (2, Some(cap.clone()))]);
+        assert!(task.racs_pending.is_empty());
+        assert!(!task.guard_timers.is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
+
+        task.create_ue_context(3, 1).await.expect("ue 3");
+        let ran = ran_id(&task, 3).await;
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(id)))
+            .await;
+        assert!(mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty(), "cache hit: no request");
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(3, Some(cap))]);
+    }
+
+    /// Capability and ID together: use the capability, remember the pair, ask no one.
+    #[tokio::test]
+    async fn a_capability_with_its_id_is_used_and_cached() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_initial_context_setup_request(
+            1,
+            1,
+            racs_ics(ran, Some(vec![9, 9]), Some(vec![0x77])),
+        )
+        .await;
+        assert!(mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty());
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(1, Some(vec![9, 9]))]);
+        let plmn = test_config().plmn.encode();
+        assert_eq!(task.racs_cache.get(&(plmn, vec![0x77])), Some(vec![9, 9]));
+    }
+
+    /// TS 38.413 §8.3.1.2: neither IE -- the gNB retrieves the capability from the UE.
+    #[tokio::test]
+    async fn neither_capability_nor_id_asks_the_ue() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, None))
+            .await;
+        assert!(mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty());
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(1, None)]);
+    }
+
+    /// No answer to the mapping: stop waiting and fall back to the UE.
+    #[tokio::test]
+    async fn an_unanswered_mapping_falls_back_to_the_ue_on_timeout() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        let before = Instant::now();
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(vec![1])))
+            .await;
+        drain_sctp(&mut sctp_rx);
+        drain_rrc_capability(&mut rrc_rx);
+        task.process_expired_guard_timers(
+            before + Duration::from_secs(super::super::racs::RACS_MAPPING_TIMEOUT_SECS + 1),
+        )
+        .await;
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(1, None)]);
+        assert!(task.racs_pending.is_empty());
+    }
+
+    /// A released UE stops waiting on the mapping.
+    #[tokio::test]
+    async fn a_released_ue_no_longer_waits_on_a_mapping() {
+        let (mut task, _rrc_rx, _gtp, _sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(vec![5])))
+            .await;
+        task.delete_ue_context(1).await;
+        assert!(task.racs_pending.is_empty());
+        assert!(!task.guard_timers.is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
+    }
+
+    /// TS 38.413 §8.14.1: what the UE reported goes to the AMF as a UE RADIO
+    /// CAPABILITY INFO INDICATION on the UE's stream, with its NGAP IDs.
+    #[tokio::test]
+    async fn a_capability_from_the_ue_is_reported_to_the_amf() {
+        let (mut task, _rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.report_ue_radio_capability(1, vec![0xAB, 0xCD]).await;
+        let ind: Vec<_> = drain_sctp(&mut sctp_rx)
+            .iter()
+            .filter_map(|p| decode_ue_radio_capability_info_indication(p).ok())
+            .collect();
+        assert_eq!(ind.len(), 1);
+        assert_eq!(ind[0].amf_ue_ngap_id, 7777);
+        assert_eq!(ind[0].ran_ue_ngap_id, ran);
+        assert_eq!(ind[0].ue_radio_capability, vec![0xAB, 0xCD]);
+    }
+
+    /// TS 23.502 §4.9.1.2.2 step 7: an ID in the Path Switch Request Acknowledge
+    /// with nothing cached for it triggers the mapping.
+    #[tokio::test]
+    async fn a_path_switch_acknowledge_with_an_unknown_id_requests_the_mapping() {
+        use nextgsim_ngap::procedures::path_switch::SwitchedSessionItem;
+        let (mut task, _rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_path_switch_request_acknowledge(
+            1,
+            8,
+            PathSwitchRequestAcknowledgeData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id: ran,
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0x77; 32],
+                switched_sessions: vec![SwitchedSessionItem {
+                    pdu_session_id: 1,
+                    ul_tunnel: None,
+                    security_indication: None,
+                }],
+                ue_radio_capability_id: Some(vec![0xEE]),
+            },
+        )
+        .await;
+        assert_eq!(mapping_requests(&drain_sctp(&mut sctp_rx)), vec![vec![0xEE]]);
+    }
 }

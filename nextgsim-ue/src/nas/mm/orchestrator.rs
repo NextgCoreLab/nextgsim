@@ -1552,6 +1552,17 @@ impl MmOrchestrator {
             req.ue_radio_capability_id = Some(racs_id.to_string());
             info!("RACS registration: presenting UE radio capability ID {racs_id}");
         }
+        // The 5GMM capability's RACS bit (TS 24.501 §9.11.3.1 octet 4 bit 8) is
+        // what entitles the AMF to send a UE radio capability ID or its deletion
+        // indication at all (§5.5.1.2.4); without it the network-side half of RACS
+        // can never reach this UE. Every other capability bit is 0: this UE
+        // supports none of them. Non-cleartext (§4.4.6), so `req` only.
+        if self.racs_store_assigned_id {
+            req.five_gmm_capability = Some(vec![
+                0x00,
+                nextgsim_nas::messages::mm::FIVE_GMM_CAPABILITY_OCTET4_RACS,
+            ]);
+        }
 
         let mut plain = Vec::new();
         req.encode(&mut plain);
@@ -1747,10 +1758,30 @@ impl MmOrchestrator {
         // set to "changed", or negotiated DRX parameters. The AMF runs T3550
         // awaiting the acknowledgement, so gating the Complete on the GUTI alone
         // would leave that timer to expire on any of these other Accepts.
+        // §5.5.1.2.4: a UE radio capability ID IE or its deletion indication IE
+        // is acknowledged with REGISTRATION COMPLETE too (the AMF runs T3550).
+        let racs_signalled =
+            acc.ue_radio_capability_id.is_some() || acc.ue_radio_capability_id_deletion.is_some();
         let needs_ack = acc.guti.is_some()
             || acc.pending_nssai.is_some()
             || acc.network_slicing_subscription_change == Some(true)
-            || acc.negotiated_drx_parameters.is_some();
+            || acc.negotiated_drx_parameters.is_some()
+            || racs_signalled;
+        // §5.5.1.2.4 a)/b): delete on the deletion indication (then re-register
+        // after this registration completes), store a newly assigned ID.
+        let mut racs_reregister = false;
+        if acc.ue_radio_capability_id_deletion == Some(1) {
+            if self.racs_id.take().is_some() {
+                info!("Registration Accept deleted the network-assigned UE radio capability ID");
+            }
+            racs_reregister = true;
+        }
+        if let Some(ref id) = acc.ue_radio_capability_id {
+            if self.racs_store_assigned_id {
+                info!("Registration Accept assigned UE radio capability ID {id}");
+                self.racs_id = Some(id.clone());
+            }
+        }
         if let Some(guti) = acc.guti {
             info!(
                 "Registration Accept assigned a new 5G-GUTI ({} bytes)",
@@ -1764,6 +1795,13 @@ impl MmOrchestrator {
             let pdu = self.protect_if_active(complete);
             info!("Sending Registration Complete");
             outs.push(MmOutput::SendNasPdu(pdu));
+        }
+        if racs_reregister && self.racs_store_assigned_id {
+            // §5.5.1.2.4 a): "after the completion of the ongoing registration
+            // procedure, initiate a registration procedure for mobility and periodic
+            // registration update ... over the existing N1 NAS signalling connection".
+            info!("RACS ID deleted: starting a mobility registration update (§5.5.1.2.4 a))");
+            outs.extend(self.start_registration(RegistrationType::MobilityRegistrationUpdating));
         }
         // Surface the equivalent-PLMN list so the caller can wire it into the
         // TS 23.122 PLMN selector. Emitted only when the list changed (a list
@@ -5467,6 +5505,94 @@ mod tests {
                 .as_deref(),
             Some("123456")
         );
+    }
+
+    /// TS 24.501 §9.11.3.1: the full request carries a 5GMM capability IE with
+    /// the RACS bit (octet 4, bit 8) -- `10 02 00 80` -- and the plain cleartext
+    /// request does not (§4.4.6), and a UE with RACS switched off sets no bit.
+    #[test]
+    fn the_registration_request_advertises_racs_in_the_5gmm_capability() {
+        let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
+        let outputs = orch.start_registration(RegistrationType::InitialRegistration);
+        let full = orch.last_registration_request.clone().expect("full request");
+        let ie = [0x10u8, 0x02, 0x00, 0x80];
+        assert!(full.windows(4).any(|w| w == ie), "got {full:02X?}");
+        let plain = first_sent_pdu(&outputs);
+        assert!(!plain.windows(4).any(|w| w == ie), "non-cleartext IE leaked: {plain:02X?}");
+
+        let mut off = MmOrchestrator::from_config(test_identity(), &config_with_racs(false));
+        off.start_registration(RegistrationType::InitialRegistration);
+        let full = off.last_registration_request.clone().expect("full request");
+        assert_eq!(
+            RegistrationRequest::decode(&mut &full[3..]).unwrap().five_gmm_capability,
+            None
+        );
+    }
+
+    fn racs_accept(id: Option<&str>, deletion: Option<u8>) -> RegistrationAccept {
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.allowed_nssai = Some(vec![0x01, 0x01]);
+        acc.ue_radio_capability_id = id.map(str::to_string);
+        acc.ue_radio_capability_id_deletion = deletion;
+        acc
+    }
+
+    /// The two RACS IEs on the wire (Table 8.2.7.1.1): `67 03 21 43 65` and the
+    /// Type 1 `E1`, and back.
+    #[test]
+    fn the_registration_accept_racs_ies_round_trip() {
+        let mut plain = Vec::new();
+        racs_accept(Some("123456"), Some(1)).encode(&mut plain);
+        assert!(plain.windows(5).any(|w| w == [0x67, 0x03, 0x21, 0x43, 0x65]));
+        assert!(plain.contains(&0xE1));
+        let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
+        assert_eq!(decoded.ue_radio_capability_id.as_deref(), Some("123456"));
+        assert_eq!(decoded.ue_radio_capability_id_deletion, Some(1));
+    }
+
+    /// §5.5.1.2.4 b) and the T3550 rule: an assigned ID is stored and acknowledged
+    /// with REGISTRATION COMPLETE even with no new 5G-GUTI.
+    #[test]
+    fn a_registration_accept_assigning_an_id_stores_it_and_completes() {
+        let mut orch = establish_security_context();
+        orch.racs_store_assigned_id = true;
+        let mut plain = Vec::new();
+        racs_accept(Some("abcde1"), None).encode(&mut plain);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 1));
+        assert_eq!(orch.racs_id(), Some("abcde1"));
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "the ID must be acknowledged with Registration Complete"
+        );
+    }
+
+    /// §5.5.1.2.4 a): the deletion indication deletes the network-assigned ID,
+    /// is acknowledged, and is followed by a mobility registration update.
+    #[test]
+    fn a_registration_accept_deleting_the_id_completes_then_re_registers() {
+        let mut orch = establish_security_context();
+        orch.racs_store_assigned_id = true;
+        orch.racs_id = Some("123456".to_string());
+        let mut plain = Vec::new();
+        racs_accept(None, Some(1)).encode(&mut plain);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 1));
+        assert_eq!(orch.racs_id(), None);
+        let sent = outs
+            .iter()
+            .filter(|o| matches!(o, MmOutput::SendNasPdu(_)))
+            .count();
+        assert!(sent >= 2, "Registration Complete and a new Registration Request: {outs:?}");
+        let req = orch.last_registration_request.clone().expect("re-registration");
+        let decoded = RegistrationRequest::decode(&mut &req[3..]).unwrap();
+        assert_eq!(
+            decoded.registration_type.registration_type,
+            RegistrationType::MobilityRegistrationUpdating
+        );
+        assert_eq!(decoded.ue_radio_capability_id, None, "the deleted ID is not presented");
     }
 
     /// §4.4.6: the ID is a NON-cleartext IE, so it must be absent from the plain
