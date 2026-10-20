@@ -62,6 +62,43 @@ use nextgsim_ngap::procedures::amf_status_indication::{
 };
 use std::time::{Duration, Instant};
 
+/// The UE radio capability a Source NG-RAN Node to Target NG-RAN Node Transparent
+/// Container carries, as an encoded `UERadioAccessCapabilityInformation` (the form
+/// the UE Radio Capability IE and the RACS cache hold): the NR container of the RRC
+/// `HandoverPreparationInformation` in its `rRCContainer` (TS 38.413 §9.3.1.29,
+/// TS 38.331 §11.2.2). `None` when the container is undecodable or carries no NR
+/// capability.
+fn capability_from_source_to_target_container(container: &[u8]) -> Option<Vec<u8>> {
+    use nextgsim_ngap::procedures::handover::decode_source_to_target_container;
+    use nextgsim_rrc::procedures::handover_preparation::decode_handover_preparation_information;
+    use nextgsim_rrc::procedures::ue_capability::{
+        encode_ue_radio_access_capability_information, RatType, UeCapabilityRatContainer,
+    };
+    let s2t = decode_source_to_target_container(container).ok()?;
+    let nr = decode_handover_preparation_information(&s2t.rrc_container)
+        .ok()?
+        .nr_capability?;
+    encode_ue_radio_access_capability_information(&[UeCapabilityRatContainer {
+        rat_type: RatType::Nr,
+        container: nr,
+    }])
+    .ok()
+}
+
+/// A UE Radio Capability Check (TS 38.413 §8.14.2) waiting for the UE's radio
+/// capability before it can be answered.
+#[derive(Debug, Clone)]
+struct PendingCapabilityCheck {
+    /// The AMF the response goes to.
+    amf_id: i32,
+    /// The UE-associated SCTP stream the request arrived on.
+    stream: u16,
+    /// The AMF UE NGAP ID to echo.
+    amf_ue_ngap_id: u64,
+    /// The RAN UE NGAP ID to echo.
+    ran_ue_ngap_id: u32,
+}
+
 use crate::ngap::timers::{GuardTimer, GuardTimers};
 use nextgsim_ngap::procedures::error_indication::{
     decode_error_indication, encode_error_indication, error_indication_abstract_syntax_error,
@@ -226,6 +263,14 @@ pub struct NgapTask {
     /// RACS: IDs with a UE RADIO CAPABILITY ID MAPPING REQUEST outstanding, and the
     /// UEs waiting on each. One request per ID however many UEs present it.
     racs_pending: HashMap<Vec<u8>, Vec<i32>>,
+    /// UE Radio Capability Checks (TS 38.413 §8.14.2) waiting for the UE's radio
+    /// capability, keyed by UE, answered once it is known or on
+    /// `GuardTimer::RadioCapabilityCheck`.
+    capability_checks: HashMap<i32, PendingCapabilityCheck>,
+    /// UEs whose Downlink NAS Transport carried UE Capability Info Request
+    /// "requested" (TS 38.413 §8.6.2.2) before AS security was active: the
+    /// enquiry is made once Initial Context Setup activates it (TS 38.331 §5.6.1.1).
+    capability_info_requested: std::collections::HashSet<i32>,
     /// SCTP client IDs of TNL associations this node opened because an AMF
     /// Configuration Update asked it to (TS 38.413 §9.2.6.5, issue #41).
     ///
@@ -272,6 +317,8 @@ impl NgapTask {
             guard_timers: GuardTimers::new(),
             racs_cache: super::racs::RacsCache::default(),
             racs_pending: HashMap::new(),
+            capability_checks: HashMap::new(),
+            capability_info_requested: std::collections::HashSet::new(),
             tnla_client_ids: HashMap::new(),
             next_dynamic_tnla_id: DYNAMIC_TNLA_CLIENT_ID_BASE,
         }
@@ -522,8 +569,13 @@ impl NgapTask {
     /// `ue-suspend` (issue #199).
     async fn delete_ue_context(&mut self, ue_id: i32) {
         if let Some(ctx) = self.ue_contexts.remove(&ue_id) {
-            // A released UE no longer waits on any RACS mapping.
+            // A released UE no longer waits on any RACS mapping, nor has a
+            // capability check or capability info request outstanding.
             self.forget_racs_waiter(ue_id);
+            self.capability_checks.remove(&ue_id);
+            self.capability_info_requested.remove(&ue_id);
+            self.guard_timers
+                .cancel(GuardTimer::RadioCapabilityCheck { ue_id });
             // Release the stream back to the AMF
             if let Some(amf_ctx) = self.amf_contexts.get_mut(&ctx.amf_ctx_id) {
                 amf_ctx.release_stream(ctx.stream_id);
@@ -868,6 +920,46 @@ impl NgapTask {
         // this, `ue-info` would show no `amf_ue_ngap_id` until Initial Context Setup.
         self.sync_ue_context_to_app(ue_id).await;
 
+        // TS 38.413 §8.6.2.2 (RACS): store the UE Radio Capability, or resolve the
+        // UE Radio Capability ID, the AMF sent along with the NAS. Never an enquiry
+        // here: a DL NAS Transport can precede AS security (TS 38.331 §5.6.1.1).
+        if dl_nas.ue_radio_capability.is_some() || dl_nas.ue_radio_capability_id.is_some() {
+            let refresh = dl_nas.ue_radio_capability_id.is_some()
+                && self
+                    .ue_contexts
+                    .get(&ue_id)
+                    .and_then(|c| c.ue_radio_capability_id.as_ref())
+                    != dl_nas.ue_radio_capability_id.as_ref();
+            self.resolve_ue_radio_capability(
+                amf_id,
+                ue_id,
+                dl_nas.ue_radio_capability.clone(),
+                dl_nas.ue_radio_capability_id.clone(),
+                false,
+                refresh,
+            )
+            .await;
+        }
+        // "Interaction with the UE Radio Capability Info Indication procedure"
+        // (§8.6.2.2): retrieve the capability from the UE and report it. Only once AS
+        // security is active; until then the request waits for Initial Context Setup.
+        if dl_nas.ue_capability_info_requested {
+            let secured = self
+                .ue_contexts
+                .get(&ue_id)
+                .is_some_and(|c| c.as_security.is_some());
+            if secured {
+                info!("UE[{ue_id}]: UE Capability Info Request; enquiring the UE (TS 38.413 §8.6.2.2)");
+                let _ = self
+                    .task_base
+                    .rrc_tx
+                    .send(RrcMessage::UeCapabilityEnquiry { ue_id })
+                    .await;
+            } else {
+                self.capability_info_requested.insert(ue_id);
+            }
+        }
+
         // Log the NAS PDU content for debugging
         debug!(
             "NAS PDU (first 16 bytes): {:02x?}",
@@ -1135,14 +1227,32 @@ impl NgapTask {
         // from the request, or resolve its UE Radio Capability ID (RACS), or -- when
         // the request carried neither -- retrieve it from the UE now that AS security
         // is active (TS 38.331 §5.6.1.1).
+        let resolve_enquires = ics_req.ue_radio_capability.is_none()
+            && ics_req.ue_radio_capability_id.is_none()
+            && self
+                .ue_contexts
+                .get(&ue_id)
+                .is_some_and(|c| c.ue_radio_capability.is_none());
         self.resolve_ue_radio_capability(
             amf_id,
             ue_id,
             ics_req.ue_radio_capability.clone(),
             ics_req.ue_radio_capability_id.clone(),
             true,
+            false,
         )
         .await;
+        // A UE Capability Info Request that arrived in a DL NAS Transport before AS
+        // security (TS 38.413 §8.6.2.2) is honoured now that security is active,
+        // unless the resolution above already enquires the UE.
+        if self.capability_info_requested.remove(&ue_id) && !resolve_enquires {
+            info!("UE[{ue_id}]: deferred UE Capability Info Request; enquiring the UE");
+            let _ = self
+                .task_base
+                .rrc_tx
+                .send(RrcMessage::UeCapabilityEnquiry { ue_id })
+                .await;
+        }
 
         // Transition to Active state (security context established)
         if let Some(ctx) = self.ue_contexts.values_mut().find(|ctx| ctx.ue_id == ue_id) {
@@ -1323,6 +1433,20 @@ impl NgapTask {
         // Republish to the CLI registry (issue #199): a modification can be the
         // first message that carries this UE's AMF UE NGAP ID.
         self.sync_ue_context_to_app(ue_id).await;
+
+        // TS 38.413 §8.3.4.2 (RACS): a UE Radio Capability ID is used as TS 23.501
+        // §5.4.4.1a specifies. A different ID than the held capability was learned
+        // under means the UE's capability set changed: resolve it afresh (cache, else
+        // mapping), keeping the held capability in use until the new one is known.
+        if let Some(id) = ucm_req.ue_radio_capability_id.clone() {
+            let refresh = self
+                .ue_contexts
+                .get(&ue_id)
+                .and_then(|c| c.ue_radio_capability_id.as_ref())
+                != Some(&id);
+            self.resolve_ue_radio_capability(amf_id, ue_id, None, Some(id), false, refresh)
+                .await;
+        }
 
         // AS re-keying (TS 33.501 §6.9.2): re-derive the AS key set from the new
         // KgNB. `rekey_caps` is guaranteed present here by the precondition above.
@@ -3027,6 +3151,11 @@ impl NgapTask {
     ///   ID however many UEs wait on it.
     /// * neither: when `enquire_if_absent` (the Initial Context Setup case,
     ///   §8.3.1.2) and the gNB holds no capability for the UE, ask the UE.
+    ///
+    /// `refresh` resolves an ID even when the UE already has a capability: the AMF
+    /// sent a *different* ID than the one the held capability was learned under
+    /// (UE Context Modification, TS 38.413 §8.3.4.2), so the held one may be stale.
+    /// It stays in use until the new one is known.
     async fn resolve_ue_radio_capability(
         &mut self,
         amf_id: i32,
@@ -3034,6 +3163,7 @@ impl NgapTask {
         capability: Option<Vec<u8>>,
         id: Option<Vec<u8>>,
         enquire_if_absent: bool,
+        refresh: bool,
     ) {
         let plmn = self.task_base.config.plmn.encode();
         let Some(ctx) = self.ue_contexts.get_mut(&ue_id) else {
@@ -3053,7 +3183,7 @@ impl NgapTask {
         }
 
         if let Some(id) = id {
-            if already_known {
+            if already_known && !refresh {
                 return;
             }
             if let Some(cap) = self.racs_cache.get(&(plmn, id.clone())) {
@@ -3102,6 +3232,7 @@ impl NgapTask {
         if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
             ctx.ue_radio_capability = Some(capability.clone());
         }
+        self.answer_capability_check(ue_id).await;
         let _ = self
             .task_base
             .rrc_tx
@@ -3153,6 +3284,153 @@ impl NgapTask {
         });
     }
 
+    /// Answer the UE Radio Capability Check waiting on `ue_id`, if any, from the
+    /// capability the UE context now holds (TS 38.413 §8.14.2.2).
+    async fn answer_capability_check(&mut self, ue_id: i32) {
+        let Some(check) = self.capability_checks.remove(&ue_id) else {
+            return;
+        };
+        self.guard_timers
+            .cancel(GuardTimer::RadioCapabilityCheck { ue_id });
+        let capability = self
+            .ue_contexts
+            .get(&ue_id)
+            .and_then(|c| c.ue_radio_capability.clone());
+        self.send_capability_check_response(&check, capability.as_deref())
+            .await;
+    }
+
+    /// Send a UE RADIO CAPABILITY CHECK RESPONSE whose IMS Voice Support Indicator is
+    /// derived from `capability` and this gNB's IMS voice configuration. No capability
+    /// means "not-supported": nothing shows the UE can do IMS voice over NR.
+    async fn send_capability_check_response(
+        &mut self,
+        check: &PendingCapabilityCheck,
+        capability: Option<&[u8]>,
+    ) {
+        let supported = capability.is_some_and(|cap| {
+            super::racs::ims_voice_compatible(self.task_base.config.ims_voice_over_nr, cap)
+        });
+        let data =
+            nextgsim_ngap::procedures::ue_radio_capability::UeRadioCapabilityCheckResponseData {
+                amf_ue_ngap_id: check.amf_ue_ngap_id,
+                ran_ue_ngap_id: check.ran_ue_ngap_id,
+                ims_voice_supported: supported,
+            };
+        match nextgsim_ngap::procedures::ue_radio_capability::encode_ue_radio_capability_check_response(&data) {
+            Ok(bytes) => {
+                info!(
+                    "RAN-UE-NGAP-ID {}: UE RADIO CAPABILITY CHECK RESPONSE, IMS voice {} \
+                     (TS 38.413 §8.14.2)",
+                    check.ran_ue_ngap_id,
+                    if supported { "supported" } else { "not supported" }
+                );
+                self.send_ngap_ue_associated(check.amf_id, check.stream, bytes)
+                    .await;
+            }
+            Err(e) => error!("Failed to encode UE Radio Capability Check Response: {e}"),
+        }
+    }
+
+    /// UE RADIO CAPABILITY CHECK REQUEST (TS 38.413 §8.14.2.2): decide whether the UE
+    /// radio capabilities are compatible with this network's IMS voice configuration.
+    ///
+    /// * The UE Radio Capability IE, when present, is what the decision uses.
+    /// * Otherwise the UE Radio Capability ID is resolved (RACS cache, else UE Radio
+    ///   Capability ID Mapping) and the answer waits for it.
+    /// * With neither, a capability the gNB already holds is used; failing that the
+    ///   gNB retrieves it from the UE and sends it in a UE Radio Capability Info
+    ///   Indication ("Interactions with UE Radio Capability Info Indication").
+    ///
+    /// §8.14.2.3 makes the procedure unconditionally successful, so a wait that never
+    /// ends is bounded by `GuardTimer::RadioCapabilityCheck` and then answered.
+    async fn handle_ue_radio_capability_check_request(
+        &mut self,
+        amf_id: i32,
+        stream: u16,
+        req: nextgsim_ngap::procedures::ue_radio_capability::UeRadioCapabilityCheckRequestData,
+    ) {
+        let check = PendingCapabilityCheck {
+            amf_id,
+            stream,
+            amf_ue_ngap_id: req.amf_ue_ngap_id,
+            ran_ue_ngap_id: req.ran_ue_ngap_id,
+        };
+        let Some(ue_id) = self
+            .find_ue_by_ran_id(i64::from(req.ran_ue_ngap_id))
+            .map(|c| c.ue_id)
+        else {
+            // No context: nothing is known of this UE's capability, so it cannot
+            // be shown compatible. Still answered: the procedure has no failure.
+            warn!(
+                "UE Radio Capability Check for unknown RAN-UE-NGAP-ID {}; answering \
+                 not supported",
+                req.ran_ue_ngap_id
+            );
+            self.send_capability_check_response(&check, None).await;
+            return;
+        };
+        if let Some(ctx) = self.ue_contexts.get_mut(&ue_id) {
+            if ctx.amf_ue_ngap_id.is_none() {
+                // §8.14.2.2: the request may establish the UE-associated connection.
+                ctx.amf_ue_ngap_id = Some(req.amf_ue_ngap_id as i64);
+            }
+        }
+
+        if let Some(cap) = req.ue_radio_capability.as_deref() {
+            if let Some(id) = req.ue_radio_capability_id.clone() {
+                let plmn = self.task_base.config.plmn.encode();
+                self.racs_cache.insert((plmn, id), cap.to_vec());
+            }
+            self.send_capability_check_response(&check, Some(cap)).await;
+            return;
+        }
+
+        let held = self
+            .ue_contexts
+            .get(&ue_id)
+            .and_then(|c| c.ue_radio_capability.clone());
+        let held_id = self
+            .ue_contexts
+            .get(&ue_id)
+            .and_then(|c| c.ue_radio_capability_id.clone());
+        let id_is_new =
+            req.ue_radio_capability_id.is_some() && req.ue_radio_capability_id != held_id;
+        if let (Some(cap), false) = (held.as_deref(), id_is_new) {
+            self.send_capability_check_response(&check, Some(cap)).await;
+            return;
+        }
+
+        // Wait for the capability: by ID (cache / mapping) or from the UE.
+        self.capability_checks.insert(ue_id, check);
+        self.guard_timers.start(
+            Instant::now(),
+            Duration::from_secs(super::racs::RADIO_CAPABILITY_CHECK_TIMEOUT_SECS),
+            GuardTimer::RadioCapabilityCheck { ue_id },
+        );
+        if req.ue_radio_capability_id.is_some() {
+            self.resolve_ue_radio_capability(
+                amf_id,
+                ue_id,
+                None,
+                req.ue_radio_capability_id,
+                false,
+                true,
+            )
+            .await;
+        } else {
+            info!(
+                "UE[{ue_id}]: UE Radio Capability Check with no capability held; \
+                 retrieving it from the UE (TS 38.413 §8.14.2.2)"
+            );
+            let _ = self
+                .task_base
+                .rrc_tx
+                .send(RrcMessage::UeCapabilityEnquiry { ue_id })
+                .await;
+        }
+    }
+
     /// The UE answered a capability enquiry: store the capability and report it to
     /// the AMF in a UE RADIO CAPABILITY INFO INDICATION (TS 38.413 §8.14.1).
     async fn report_ue_radio_capability(&mut self, ue_id: i32, capability: Vec<u8>) {
@@ -3160,6 +3438,12 @@ impl NgapTask {
             return;
         };
         ctx.ue_radio_capability = Some(capability.clone());
+        // A UE Radio Capability Check waiting on this UE can be answered now; the
+        // Info Indication below is sent regardless (TS 38.413 §8.14.2.2).
+        self.answer_capability_check(ue_id).await;
+        let Some(ctx) = self.ue_contexts.get_mut(&ue_id) else {
+            return;
+        };
         let Some(amf_ue_ngap_id) = ctx.amf_ue_ngap_id else {
             debug!("UE[{ue_id}]: capability stored; no AMF UE NGAP ID yet, nothing to report");
             return;
@@ -3236,6 +3520,23 @@ impl NgapTask {
                             .task_base
                             .rrc_tx
                             .send(RrcMessage::UeCapabilityEnquiry { ue_id })
+                            .await;
+                    }
+                }
+                GuardTimer::RadioCapabilityCheck { ue_id } => {
+                    // §8.14.2 has no unsuccessful outcome: answer with whatever the
+                    // gNB holds rather than leave the AMF waiting.
+                    if let Some(check) = self.capability_checks.remove(&ue_id) {
+                        warn!(
+                            "UE[{ue_id}]: UE radio capability not obtained within {}s; \
+                             answering the UE Radio Capability Check with what is held",
+                            super::racs::RADIO_CAPABILITY_CHECK_TIMEOUT_SECS
+                        );
+                        let capability = self
+                            .ue_contexts
+                            .get(&ue_id)
+                            .and_then(|c| c.ue_radio_capability.clone());
+                        self.send_capability_check_response(&check, capability.as_deref())
                             .await;
                     }
                 }
@@ -3444,6 +3745,13 @@ impl NgapTask {
                     )
                 {
                     self.handle_ue_radio_capability_id_mapping_response(mapping)
+                        .await;
+                } else if let Ok(check) =
+                    nextgsim_ngap::procedures::ue_radio_capability::decode_ue_radio_capability_check_request(
+                        pdu_bytes,
+                    )
+                {
+                    self.handle_ue_radio_capability_check_request(client_id, stream, check)
                         .await;
                 } else if let Ok(err_ind) = decode_error_indication(pdu_bytes) {
                     // TS 38.413 §8.7.5: a received Error Indication is processed
@@ -4079,16 +4387,21 @@ impl NgapTask {
         // cell would fail with nothing to say why.
         self.adopt_handover_security_context(ue_id, ho_req.security_context);
 
-        // TS 23.502 §4.9.1.3.2 step 9 (RACS): a UE Radio Capability ID in the request
-        // is resolved from the cache, or by UE Radio Capability ID Mapping on a miss.
-        // The Source to Target container is relayed opaquely and its capabilities
-        // are not read, so the ID is the only capability source here; the UE is not
-        // asked (the handover proceeds either way).
+        // TS 23.502 §4.9.1.3.2 step 9 (RACS): the target uses the UE radio capability
+        // the Source to Target Transparent Container carries -- the RRC
+        // HandoverPreparationInformation's ue-CapabilityRAT-List (TS 38.413 §9.3.1.29,
+        // TS 38.331 §11.2.2) -- and only when it carries none resolves the UE Radio
+        // Capability ID (cache, else UE Radio Capability ID Mapping). The UE is not
+        // asked here (the handover proceeds either way).
+        let container_capability = capability_from_source_to_target_container(
+            &ho_req.source_to_target_transparent_container,
+        );
         self.resolve_ue_radio_capability(
             client_id,
             ue_id,
-            None,
+            container_capability,
             ho_req.ue_radio_capability_id.clone(),
+            false,
             false,
         )
         .await;
@@ -4782,6 +5095,7 @@ impl NgapTask {
                 ue_id,
                 None,
                 ack.ue_radio_capability_id.clone(),
+                false,
                 false,
             )
             .await;
@@ -6642,6 +6956,8 @@ mod tests {
             ue_aggregate_max_bit_rate: None,
             ue_security_capabilities: Some(caps(0xC000, 0xC000)),
             security_key: Some([0x22u8; 32]),
+
+            ue_radio_capability_id: None,
         };
         let inbound = encode_ucm_request(&data);
 
@@ -6701,6 +7017,7 @@ mod tests {
             ),
             ue_security_capabilities: None,
             security_key: None,
+            ue_radio_capability_id: None,
         };
         let inbound = encode_ucm_request(&data);
 
@@ -6737,6 +7054,8 @@ mod tests {
             ue_aggregate_max_bit_rate: None,
             ue_security_capabilities: None,
             security_key: Some([0x22u8; 32]),
+
+            ue_radio_capability_id: None,
         };
         let inbound = encode_ucm_request(&data);
 
@@ -6789,6 +7108,7 @@ mod tests {
             ),
             ue_security_capabilities: None,
             security_key: Some([0x22u8; 32]),
+            ue_radio_capability_id: None,
         };
         task.handle_ngap_pdu(1, 2, OctetString::from_slice(&encode_ucm_request(&data)))
             .await;
@@ -6832,6 +7152,8 @@ mod tests {
             ue_aggregate_max_bit_rate: None,
             ue_security_capabilities: Some(caps(0xA000, 0x8000)),
             security_key: None,
+
+            ue_radio_capability_id: None,
         };
         task.handle_ngap_pdu(1, 2, OctetString::from_slice(&encode_ucm_request(&data)))
             .await;
@@ -6930,6 +7252,9 @@ mod tests {
             ran_paging_priority: None,
             index_to_rfsp: None,
             allowed_nssai: None,
+            ue_radio_capability: None,
+            ue_radio_capability_id: None,
+            ue_capability_info_requested: false,
         };
 
         task.handle_downlink_nas_transport(1, 3, dl_nas).await;
@@ -6958,6 +7283,9 @@ mod tests {
             ran_paging_priority: None,
             index_to_rfsp: None,
             allowed_nssai: None,
+            ue_radio_capability: None,
+            ue_radio_capability_id: None,
+            ue_capability_info_requested: false,
         };
 
         task.handle_downlink_nas_transport(1, 3, dl_nas).await;
@@ -10738,6 +11066,349 @@ mod tests {
         assert_eq!(ind[0].amf_ue_ngap_id, 7777);
         assert_eq!(ind[0].ran_ue_ngap_id, ran);
         assert_eq!(ind[0].ue_radio_capability, vec![0xAB, 0xCD]);
+    }
+
+    // ---- RACS in the other messages that carry the ID or the capability (#254) ----
+
+    use nextgsim_ngap::procedures::nas_transport::{
+        encode_downlink_nas_transport, DownlinkNasTransportParams,
+    };
+    use nextgsim_ngap::procedures::ue_radio_capability::{
+        decode_ue_radio_capability_check_response, encode_ue_radio_capability_check_request,
+        UeRadioCapabilityCheckRequestData,
+    };
+
+    /// A real `UERadioAccessCapabilityInformation` around one NR container, with or
+    /// without `voiceOverNR` (TS 38.331 §6.3.3).
+    fn nr_capability(voice: bool) -> Vec<u8> {
+        use nextgsim_rrc::procedures::ue_capability::{
+            build_nr_capability_container, encode_ue_radio_access_capability_information,
+            with_voice_over_nr, RatType, UeCapabilityRatContainer,
+        };
+        let mut nr = build_nr_capability_container(78, false).unwrap();
+        if voice {
+            nr = with_voice_over_nr(&nr).unwrap();
+        }
+        encode_ue_radio_access_capability_information(&[UeCapabilityRatContainer {
+            rat_type: RatType::Nr,
+            container: nr,
+        }])
+        .unwrap()
+    }
+
+    fn dl_nas_params(
+        ran: u32,
+        cap: Option<Vec<u8>>,
+        id: Option<Vec<u8>>,
+        info_request: bool,
+    ) -> Vec<u8> {
+        encode_downlink_nas_transport(&DownlinkNasTransportParams {
+            amf_ue_ngap_id: 7777,
+            ran_ue_ngap_id: ran,
+            nas_pdu: vec![0x7E, 0x00, 0x56],
+            old_amf: None,
+            ran_paging_priority: None,
+            index_to_rfsp: None,
+            ue_ambr: None,
+            allowed_nssai: None,
+            ue_radio_capability: cap,
+            ue_capability_info_request: info_request,
+            ue_radio_capability_id: id,
+        })
+        .unwrap()
+    }
+
+    /// TS 38.413 §8.6.2.2: a DL NAS Transport's UE Radio Capability is stored and
+    /// used (and cached under its ID); a bare unknown ID is mapped -- and the UE is
+    /// never asked from a DL NAS Transport.
+    #[tokio::test]
+    async fn a_dl_nas_transport_capability_is_used_and_its_id_mapped() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        task.create_ue_context(2, 1).await.expect("ue 2");
+        let (r1, r2) = (ran_id(&task, 1).await, ran_id(&task, 2).await);
+
+        let pdu = dl_nas_params(r1, Some(vec![7, 7]), Some(vec![0x31]), false);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        assert!(drain_rrc_capability(&mut rrc_rx).contains(&(1, Some(vec![7, 7]))));
+        assert_eq!(
+            task.racs_cache
+                .get(&(task.task_base.config.plmn.encode(), vec![0x31])),
+            Some(vec![7, 7]),
+            "the pair is cached"
+        );
+
+        let pdu = dl_nas_params(r2, None, Some(vec![0x32]), false);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        assert_eq!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)),
+            vec![vec![0x32]]
+        );
+        assert!(drain_rrc_capability(&mut rrc_rx).is_empty(), "no enquiry");
+    }
+
+    /// §8.6.2.2 "Interaction with the UE Radio Capability Info Indication procedure":
+    /// with AS security active the UE is enquired at once; before it, the request
+    /// waits for Initial Context Setup (TS 38.331 §5.6.1.1) and is honoured there.
+    #[tokio::test]
+    async fn a_ue_capability_info_request_enquires_the_ue_once_secured() {
+        let (mut task, mut rrc_rx, _gtp, _sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        let pdu = dl_nas_params(ran, None, None, true);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        assert!(
+            drain_rrc_capability(&mut rrc_rx).is_empty(),
+            "not before AS security"
+        );
+        assert!(task.capability_info_requested.contains(&1));
+
+        // ICS carrying the capability: the resolution itself would not enquire, so the
+        // deferred request does.
+        task.handle_initial_context_setup_request(1, 1, racs_ics(ran, Some(vec![1]), None))
+            .await;
+        let rrc = drain_rrc_capability(&mut rrc_rx);
+        assert!(rrc.contains(&(1, None)), "deferred enquiry made: {rrc:?}");
+        assert!(!task.capability_info_requested.contains(&1));
+
+        // Now secured: a further request enquires immediately.
+        let pdu = dl_nas_params(ran, None, None, true);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(1, None)]);
+    }
+
+    /// TS 38.413 §8.3.4.2: a UE Context Modification carrying a *new* UE Radio
+    /// Capability ID re-resolves it even though the UE holds a capability; the same
+    /// ID again changes nothing.
+    #[tokio::test]
+    async fn a_new_id_in_ue_context_modification_is_resolved_afresh() {
+        let (mut task, _rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        task.handle_initial_context_setup_request(
+            1,
+            1,
+            racs_ics(ran, Some(vec![1, 1]), Some(vec![0x50])),
+        )
+        .await;
+        drain_sctp(&mut sctp_rx);
+
+        let mut data = UeContextModificationRequestData {
+            amf_ue_ngap_id: 7777,
+            ran_ue_ngap_id: ran,
+            ue_aggregate_max_bit_rate: None,
+            ue_security_capabilities: None,
+            security_key: None,
+            ue_radio_capability_id: Some(vec![0x50]),
+        };
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&encode_ucm_request(&data)))
+            .await;
+        assert!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty(),
+            "same ID"
+        );
+
+        data.ue_radio_capability_id = Some(vec![0x51]);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&encode_ucm_request(&data)))
+            .await;
+        assert_eq!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)),
+            vec![vec![0x51]]
+        );
+        assert_eq!(
+            task.find_ue_context(1).unwrap().ue_radio_capability,
+            Some(vec![1, 1]),
+            "the held capability stays in use until the new one is known"
+        );
+    }
+
+    /// TS 23.502 §4.9.1.3.2 step 9: the target takes the UE radio capability from the
+    /// Source to Target container's HandoverPreparationInformation, and so does not
+    /// map the ID -- it caches the pair instead.
+    #[tokio::test]
+    async fn the_handover_target_reads_the_capability_from_the_container() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let nr = nextgsim_rrc::procedures::ue_capability::build_nr_capability_container(78, false)
+            .unwrap();
+        let rrc_container = encode_handover_preparation_information(&HandoverPreparationParams {
+            nr_capability: Some(nr),
+        })
+        .unwrap();
+        let container = encode_source_to_target_container(&SourceToTargetContainerParams {
+            rrc_container,
+            target_cell: HandoverNrCgiValue {
+                plmn_identity: [0x09, 0xF1, 0x07],
+                nr_cell_identity: 0x10,
+            },
+            source_cell: HandoverNrCgiValue {
+                plmn_identity: [0x09, 0xF1, 0x07],
+                nr_cell_identity: 0x20,
+            },
+            time_in_source_cell_s: 5,
+        })
+        .unwrap();
+        let pdu = handover_request(
+            &[],
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0xA5; 32],
+            }),
+        );
+        let mut ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).unwrap();
+        let expected =
+            capability_from_source_to_target_container(&container).expect("an NR capability");
+        ho_req.source_to_target_transparent_container = container;
+        ho_req.ue_radio_capability_id = Some(vec![0x60]);
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        assert!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty(),
+            "the container answered it: no mapping"
+        );
+        let applied: Vec<_> = drain_rrc_capability(&mut rrc_rx)
+            .into_iter()
+            .filter_map(|(_, c)| c)
+            .collect();
+        assert_eq!(
+            applied,
+            vec![expected.clone()],
+            "the container's capability applied"
+        );
+        assert_eq!(
+            task.racs_cache
+                .get(&(task.task_base.config.plmn.encode(), vec![0x60])),
+            Some(expected),
+            "cached under the ID"
+        );
+    }
+
+    fn capability_check(ran: u32, cap: Option<Vec<u8>>, id: Option<Vec<u8>>) -> Vec<u8> {
+        encode_ue_radio_capability_check_request(&UeRadioCapabilityCheckRequestData {
+            amf_ue_ngap_id: 7777,
+            ran_ue_ngap_id: ran,
+            ue_radio_capability: cap,
+            ue_radio_capability_id: id,
+        })
+        .unwrap()
+    }
+
+    fn check_responses(pdus: &[Vec<u8>]) -> Vec<bool> {
+        pdus.iter()
+            .filter_map(|p| decode_ue_radio_capability_check_response(p).ok())
+            .map(|r| r.ims_voice_supported)
+            .collect()
+    }
+
+    fn with_ims_voice(task: &mut NgapTask, on: bool) {
+        let mut config = (*task.task_base.config).clone();
+        config.ims_voice_over_nr = on;
+        task.task_base.config = std::sync::Arc::new(config);
+    }
+
+    /// TS 38.413 §8.14.2.2: with the UE Radio Capability IE the answer is immediate,
+    /// "supported" only when the network supports IMS voice over NR AND the
+    /// capability declares voiceOverNR.
+    #[tokio::test]
+    async fn the_capability_check_answers_from_the_capability_ie() {
+        let (mut task, _rrc, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        let ran = ran_id(&task, 1).await;
+        for (network, voice, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            with_ims_voice(&mut task, network);
+            let pdu = capability_check(ran, Some(nr_capability(voice)), None);
+            task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+                .await;
+            assert_eq!(
+                check_responses(&drain_sctp(&mut sctp_rx)),
+                vec![expected],
+                "network={network} voice={voice}"
+            );
+        }
+    }
+
+    /// With an unknown ID the check waits for the mapping, then answers from it.
+    #[tokio::test]
+    async fn the_capability_check_waits_for_the_id_mapping() {
+        let (mut task, _rrc, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        with_ims_voice(&mut task, true);
+        let ran = ran_id(&task, 1).await;
+        let pdu = capability_check(ran, None, Some(vec![0x70]));
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(mapping_requests(&sent), vec![vec![0x70]]);
+        assert!(check_responses(&sent).is_empty(), "not answered yet");
+
+        let response = encode_ue_radio_capability_id_mapping_response(
+            &UeRadioCapabilityIdMappingResponseData {
+                ue_radio_capability_id: vec![0x70],
+                ue_radio_capability: nr_capability(true),
+            },
+        )
+        .unwrap();
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&response))
+            .await;
+        assert_eq!(check_responses(&drain_sctp(&mut sctp_rx)), vec![true]);
+        assert!(task.capability_checks.is_empty());
+    }
+
+    /// With neither IE and nothing held, the gNB asks the UE, reports the answer in a
+    /// UE Radio Capability Info Indication, and answers the check from it.
+    #[tokio::test]
+    async fn the_capability_check_retrieves_the_capability_from_the_ue() {
+        let (mut task, mut rrc_rx, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        with_ims_voice(&mut task, true);
+        let ran = ran_id(&task, 1).await;
+        let pdu = capability_check(ran, None, None);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        assert_eq!(
+            drain_rrc_capability(&mut rrc_rx),
+            vec![(1, None)],
+            "UE enquired"
+        );
+        assert!(check_responses(&drain_sctp(&mut sctp_rx)).is_empty());
+
+        task.report_ue_radio_capability(1, nr_capability(true))
+            .await;
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(check_responses(&sent), vec![true]);
+        assert_eq!(
+            sent.iter()
+                .filter(|p| decode_ue_radio_capability_info_indication(p).is_ok())
+                .count(),
+            1,
+            "and the Info Indication still goes out"
+        );
+    }
+
+    /// §8.14.2.3: no unsuccessful outcome, so a capability that never arrives is
+    /// answered on timeout ("not supported": nothing shows the UE can do it), and an
+    /// unknown UE is answered at once.
+    #[tokio::test]
+    async fn the_capability_check_is_always_answered() {
+        let (mut task, _rrc, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        with_ims_voice(&mut task, true);
+        let ran = ran_id(&task, 1).await;
+        let pdu = capability_check(ran, None, None);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        drain_sctp(&mut sctp_rx);
+        task.process_expired_guard_timers(
+            Instant::now()
+                + Duration::from_secs(super::super::racs::RADIO_CAPABILITY_CHECK_TIMEOUT_SECS + 1),
+        )
+        .await;
+        assert_eq!(check_responses(&drain_sctp(&mut sctp_rx)), vec![false]);
+
+        let pdu = capability_check(9999, None, None);
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        assert_eq!(check_responses(&drain_sctp(&mut sctp_rx)), vec![false]);
     }
 
     /// TS 23.502 §4.9.1.2.2 step 7: an ID in the Path Switch Request Acknowledge

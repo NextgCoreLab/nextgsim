@@ -682,6 +682,78 @@ pub fn parse_nr_capability_redcap(bytes: &[u8]) -> Result<bool, UeCapabilityErro
         .is_some_and(|s| s.0 == RedCapParameters_r17SupportOfRedCap_r17::SUPPORTED))
 }
 
+/// Read whether a `UE-NR-Capability` container declares IMS voice over NR in FR1.
+///
+/// TS 38.306 §4.2.7.x: `voiceOverNR` in `IMS-ParametersFRX-Diff` "indicates
+/// whether the UE supports IMS voice over NR". It sits in the v1540 extension
+/// (TS 38.331 §6.3.3), either FR-independent (`ims-Parameters`) or FR1-specific
+/// (`fr1-Add-UE-NR-Capabilities-v1540`); either counts for an FR1 cell.
+pub fn parse_nr_capability_voice_over_nr(bytes: &[u8]) -> Result<bool, UeCapabilityError> {
+    let capability: UE_NR_Capability = decode_rrc(bytes)?;
+    let Some(v1540) = capability
+        .non_critical_extension
+        .as_ref()
+        .and_then(|v1530| v1530.non_critical_extension.as_ref())
+    else {
+        return Ok(false);
+    };
+    let supported = |d: Option<&IMS_ParametersFRX_Diff>| {
+        d.and_then(|d| d.voice_over_nr.as_ref())
+            .is_some_and(|v| v.0 == IMS_ParametersFRX_DiffVoiceOverNR::SUPPORTED)
+    };
+    Ok(supported(
+        v1540
+            .ims_parameters
+            .as_ref()
+            .and_then(|i| i.ims_parameters_frx_diff.as_ref()),
+    ) || supported(
+        v1540
+            .fr1_add_ue_nr_capabilities_v1540
+            .as_ref()
+            .and_then(|f| f.ims_parameters_frx_diff.as_ref()),
+    ))
+}
+
+/// Return `bytes` (a `UE-NR-Capability` container) with FR-independent
+/// `voiceOverNR` declared (TS 38.331 §6.3.3, `IMS-ParametersFRX-Diff`), creating
+/// the v1530 → v1540 extension chain when absent. Used to build capability
+/// fixtures for IMS-voice checks (TS 38.413 §8.14.2).
+pub fn with_voice_over_nr(bytes: &[u8]) -> Result<Vec<u8>, UeCapabilityError> {
+    let mut capability: UE_NR_Capability = decode_rrc(bytes)?;
+    let v1530 = capability
+        .non_critical_extension
+        .get_or_insert_with(|| UE_NR_Capability_v1530 {
+            fdd_add_ue_nr_capabilities_v1530: None,
+            tdd_add_ue_nr_capabilities_v1530: None,
+            dummy: None,
+            inter_rat_parameters: None,
+            inactive_state: None,
+            delay_budget_reporting: None,
+            non_critical_extension: None,
+        });
+    let v1540 = v1530
+        .non_critical_extension
+        .get_or_insert_with(|| UE_NR_Capability_v1540 {
+            sdap_parameters: None,
+            overheating_ind: None,
+            ims_parameters: None,
+            fr1_add_ue_nr_capabilities_v1540: None,
+            fr2_add_ue_nr_capabilities_v1540: None,
+            fr1_fr2_add_ue_nr_capabilities: None,
+            non_critical_extension: None,
+        });
+    let ims = v1540.ims_parameters.get_or_insert(IMS_Parameters {
+        ims_parameters_common: None,
+        ims_parameters_frx_diff: None,
+    });
+    ims.ims_parameters_frx_diff = Some(IMS_ParametersFRX_Diff {
+        voice_over_nr: Some(IMS_ParametersFRX_DiffVoiceOverNR(
+            IMS_ParametersFRX_DiffVoiceOverNR::SUPPORTED,
+        )),
+    });
+    Ok(encode_rrc(&capability)?)
+}
+
 /// Decode a `UE-NR-Capability` container and return the supported NR bands
 pub fn parse_nr_capability_bands(bytes: &[u8]) -> Result<Vec<u16>, UeCapabilityError> {
     let capability: UE_NR_Capability = decode_rrc(bytes)?;
@@ -697,6 +769,21 @@ pub fn parse_nr_capability_bands(bytes: &[u8]) -> Result<Vec<u16>, UeCapabilityE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal container declares no IMS voice; `with_voice_over_nr` adds
+    /// FR-independent `voiceOverNR` and the parser then reads it back.
+    #[test]
+    fn voice_over_nr_is_read_from_the_v1540_ims_parameters() {
+        for redcap in [false, true] {
+            let plain = build_nr_capability_container(78, redcap).unwrap();
+            assert!(!parse_nr_capability_voice_over_nr(&plain).unwrap());
+            let voice = with_voice_over_nr(&plain).unwrap();
+            assert!(parse_nr_capability_voice_over_nr(&voice).unwrap());
+            // Everything else survives the edit.
+            assert_eq!(parse_nr_capability_bands(&voice).unwrap(), vec![78]);
+            assert_eq!(parse_nr_capability_redcap(&voice).unwrap(), redcap);
+        }
+    }
 
     #[test]
     fn test_ue_capability_enquiry_roundtrip() {

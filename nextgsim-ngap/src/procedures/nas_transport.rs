@@ -59,6 +59,13 @@ pub struct DownlinkNasTransportParams {
     pub ue_ambr: Option<UeAmbrParams>,
     /// Allowed NSSAI (optional)
     pub allowed_nssai: Option<Vec<AllowedSnssaiItem>>,
+    /// UE Radio Capability (optional, IE 117) -- `UERadioAccessCapabilityInformation`
+    /// octets (TS 38.413 §9.3.1.74).
+    pub ue_radio_capability: Option<Vec<u8>>,
+    /// UE Capability Info Request "requested" (optional, IE 228), TS 38.413 §8.6.2.2.
+    pub ue_capability_info_request: bool,
+    /// UE Radio Capability ID (optional, IE 264) -- RACS.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
 }
 
 /// UE Aggregate Maximum Bit Rate parameters
@@ -96,6 +103,17 @@ pub struct DownlinkNasTransportData {
     pub index_to_rfsp: Option<u16>,
     /// Allowed NSSAI (optional)
     pub allowed_nssai: Option<Vec<AllowedSnssaiItem>>,
+    /// UE Radio Capability (optional, IE 117, criticality ignore) -- the
+    /// `UERadioAccessCapabilityInformation` octets (TS 38.413 §9.3.1.74). Per
+    /// §8.6.2.2 the NG-RAN node stores it in the UE context.
+    pub ue_radio_capability: Option<Vec<u8>>,
+    /// UE Radio Capability ID (optional, IE 264, criticality reject) -- RACS,
+    /// TS 38.413 §8.6.2.2 / TS 23.501 §5.4.4.1a.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
+    /// UE Capability Info Request set to "requested" (optional, IE 228): per
+    /// §8.6.2.2 the NG-RAN node triggers UE Radio Capability Info Indication once
+    /// it has retrieved the capability from the UE.
+    pub ue_capability_info_requested: bool,
 }
 
 /// Build a Downlink NAS Transport PDU
@@ -205,6 +223,40 @@ pub fn build_downlink_nas_transport(
         });
     }
 
+    // IE: UERadioCapability (optional) -- after AllowedNSSAI, in the
+    // DownlinkNASTransport-IEs object-set order (TS 38.413 §9.4.4).
+    if let Some(ref cap) = params.ue_radio_capability {
+        protocol_ies.push(DownlinkNASTransportProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_RADIO_CAPABILITY),
+            criticality: Criticality(Criticality::IGNORE),
+            value: DownlinkNASTransportProtocolIEs_EntryValue::Id_UERadioCapability(
+                UERadioCapability(cap.clone()),
+            ),
+        });
+    }
+
+    // IE: UECapabilityInfoRequest (optional)
+    if params.ue_capability_info_request {
+        protocol_ies.push(DownlinkNASTransportProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_CAPABILITY_INFO_REQUEST),
+            criticality: Criticality(Criticality::IGNORE),
+            value: DownlinkNASTransportProtocolIEs_EntryValue::Id_UECapabilityInfoRequest(
+                UECapabilityInfoRequest(UECapabilityInfoRequest::REQUESTED),
+            ),
+        });
+    }
+
+    // IE: UERadioCapabilityID (optional)
+    if let Some(ref id) = params.ue_radio_capability_id {
+        protocol_ies.push(DownlinkNASTransportProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_RADIO_CAPABILITY_ID),
+            criticality: Criticality(Criticality::REJECT),
+            value: DownlinkNASTransportProtocolIEs_EntryValue::Id_UERadioCapabilityID(
+                UERadioCapabilityID(id.clone()),
+            ),
+        });
+    }
+
     let downlink_nas_transport = DownlinkNASTransport {
         protocol_i_es: DownlinkNASTransportProtocolIEs(protocol_ies),
     };
@@ -256,6 +308,9 @@ pub fn parse_downlink_nas_transport(
     let mut ran_paging_priority: Option<u16> = None;
     let mut index_to_rfsp: Option<u16> = None;
     let mut allowed_nssai: Option<Vec<AllowedSnssaiItem>> = None;
+    let mut ue_radio_capability: Option<Vec<u8>> = None;
+    let mut ue_radio_capability_id: Option<Vec<u8>> = None;
+    let mut ue_capability_info_requested = false;
 
     for ie in &downlink_nas_transport.protocol_i_es.0 {
         match &ie.value {
@@ -280,6 +335,15 @@ pub fn parse_downlink_nas_transport(
             DownlinkNASTransportProtocolIEs_EntryValue::Id_AllowedNSSAI(nssai) => {
                 allowed_nssai = Some(parse_allowed_nssai(nssai));
             }
+            DownlinkNASTransportProtocolIEs_EntryValue::Id_UERadioCapability(cap) => {
+                ue_radio_capability = Some(cap.0.clone());
+            }
+            DownlinkNASTransportProtocolIEs_EntryValue::Id_UERadioCapabilityID(id) => {
+                ue_radio_capability_id = Some(id.0.clone());
+            }
+            DownlinkNASTransportProtocolIEs_EntryValue::Id_UECapabilityInfoRequest(r) => {
+                ue_capability_info_requested = r.0 == UECapabilityInfoRequest::REQUESTED;
+            }
             _ => {
                 // Ignore other IEs
             }
@@ -297,6 +361,9 @@ pub fn parse_downlink_nas_transport(
         ran_paging_priority,
         index_to_rfsp,
         allowed_nssai,
+        ue_radio_capability,
+        ue_radio_capability_id,
+        ue_capability_info_requested,
     })
 }
 
@@ -602,6 +669,33 @@ pub fn is_uplink_nas_transport(pdu: &NGAP_PDU) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// TS 38.413 §8.6.2.2 RACS IEs survive the round trip: UE Radio Capability
+    /// (117), UE Capability Info Request "requested" (228) and UE Radio Capability ID
+    /// (264), in the DownlinkNASTransport-IEs object-set order.
+    #[test]
+    fn the_dl_nas_transport_carries_the_racs_ies() {
+        let mut params = create_downlink_test_params();
+        params.ue_radio_capability = Some(vec![0x01, 0x02]);
+        params.ue_capability_info_request = true;
+        params.ue_radio_capability_id = Some(vec![0x12, 0x34]);
+        let bytes = encode_downlink_nas_transport(&params).unwrap();
+        let data = decode_downlink_nas_transport(&bytes).unwrap();
+        assert_eq!(data.ue_radio_capability, Some(vec![0x01, 0x02]));
+        assert!(data.ue_capability_info_requested);
+        assert_eq!(data.ue_radio_capability_id, Some(vec![0x12, 0x34]));
+        // The UE Radio Capability ID IE as it appears on the wire, by hand: id 264
+        // `01 08`, criticality reject `00`, open-type length 3, OCTET STRING length 2.
+        let ie = [0x01, 0x08, 0x00, 0x03, 0x02, 0x12, 0x34];
+        assert!(bytes.windows(ie.len()).any(|w| w == ie));
+
+        let plain = decode_downlink_nas_transport(
+            &encode_downlink_nas_transport(&create_downlink_test_params()).unwrap(),
+        )
+        .unwrap();
+        assert!(plain.ue_radio_capability.is_none() && plain.ue_radio_capability_id.is_none());
+        assert!(!plain.ue_capability_info_requested);
+    }
+
     use super::*;
     use crate::procedures::initial_ue_message::{NrCgi, Tai};
 
@@ -615,6 +709,9 @@ mod tests {
             index_to_rfsp: None,
             ue_ambr: None,
             allowed_nssai: None,
+            ue_radio_capability: None,
+            ue_capability_info_request: false,
+            ue_radio_capability_id: None,
         }
     }
 
