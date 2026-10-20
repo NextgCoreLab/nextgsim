@@ -742,7 +742,7 @@ pub fn with_voice_over_nr(bytes: &[u8]) -> Result<Vec<u8>, UeCapabilityError> {
             fr1_fr2_add_ue_nr_capabilities: None,
             non_critical_extension: None,
         });
-    let ims = v1540.ims_parameters.get_or_insert_with(|| IMS_Parameters {
+    let ims = v1540.ims_parameters.get_or_insert(IMS_Parameters {
         ims_parameters_common: None,
         ims_parameters_frx_diff: None,
     });
