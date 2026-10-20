@@ -1629,6 +1629,8 @@ dependencies = [
  "libc",
  "log",
  "nextgsim-common",
+ "nextgsim-crypto",
+ "nextgsim-eps-nas",
  "nextgsim-lte-rrc",
  "nextgsim-lte-ue",
  "nextgsim-pdcp",
@@ -1642,6 +1644,17 @@ dependencies = [
  "tokio",
  "tracing-log",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nextgsim-eps-nas"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "nextgsim-common",
+ "nextgsim-crypto",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1776,6 +1789,8 @@ dependencies = [
  "clap",
  "log",
  "nextgsim-common",
+ "nextgsim-crypto",
+ "nextgsim-eps-nas",
  "nextgsim-lte-rrc",
  "nextgsim-pdcp",
  "nextgsim-rls",

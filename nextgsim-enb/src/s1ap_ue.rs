@@ -1,6 +1,7 @@
-//! UE-associated S1AP the eNB drives in this increment: Initial UE Message
-//! (TS 36.413 §8.6.2.1), Uplink NAS Transport (§8.6.2.3) and the receive side
-//! of Downlink NAS Transport (§8.6.2.2), with the §10 error handling and the
+//! UE-associated S1AP the eNB drives: Initial UE Message (TS 36.413
+//! §8.6.2.1), Uplink NAS Transport (§8.6.2.3) and the receive side of
+//! Downlink NAS Transport (§8.6.2.2); from #186 increment 3 the Initial
+//! Context Setup procedure (§8.3.1); with the §10 error handling and the
 //! UE-associated Error Indication of §10.6 / §8.7.2.
 //!
 //! Pure functions, like [`crate::s1ap`]: PDUs in, PDUs and decisions out.
@@ -307,6 +308,16 @@ pub enum S1Inbound {
         /// Which UE.
         ids: ReleaseIds,
     },
+    /// INITIAL CONTEXT SETUP REQUEST to act on (§8.3.1.2).
+    InitialContextSetup(Box<InitialContextSetup>),
+    /// INITIAL CONTEXT SETUP FAILURE owed for a request the eNB cannot
+    /// process (§10.3.4.2 / §10.3.5 for a class 1 procedure).
+    InitialContextSetupFailure {
+        /// The UE's eNB UE S1AP ID, for the stream.
+        enb_ue_s1ap_id: u32,
+        /// The encoded failure.
+        pdu: Vec<u8>,
+    },
     /// Nothing to relay; send this Error Indication (§10).
     ErrorIndication(Vec<u8>),
     /// A PDU this build does not act on, for the log.
@@ -496,6 +507,407 @@ fn handle_release_command(cmd: &UEContextReleaseCommand, unknown: &[UnknownIe]) 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Initial Context Setup (§8.3.1)
+// ---------------------------------------------------------------------------
+
+/// One E-RAB of INITIAL CONTEXT SETUP REQUEST (§9.1.4.1, E-RAB To Be Setup
+/// Item).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErabToSetup {
+    /// E-RAB ID (= EPS bearer identity).
+    pub e_rab_id: u8,
+    /// QCI.
+    pub qci: u8,
+    /// The SGW's S1-U transport layer address, as octets (4 IPv4, 16 IPv6).
+    pub sgw_address: Vec<u8>,
+    /// The SGW's S1-U GTP-TEID.
+    pub sgw_teid: u32,
+    /// NAS-PDU to deliver to the UE (the ATTACH ACCEPT, during attach).
+    pub nas: Option<Vec<u8>>,
+}
+
+/// INITIAL CONTEXT SETUP REQUEST, the parts the eNB acts on.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InitialContextSetup {
+    /// MME UE S1AP ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID.
+    pub enb_ue_s1ap_id: u32,
+    /// UE AMBR downlink, bit/s.
+    pub ue_ambr_dl: u64,
+    /// UE AMBR uplink, bit/s.
+    pub ue_ambr_ul: u64,
+    /// The E-RABs.
+    pub erabs: Vec<ErabToSetup>,
+    /// Encryption Algorithms (§9.2.1.40): bit 0 (most significant) = 128-EEA1,
+    /// bit 1 = 128-EEA2, bit 2 = 128-EEA3; EEA0 is always supported.
+    pub eea_bitmap: u16,
+    /// Integrity Protection Algorithms, same layout for EIA1..EIA3.
+    pub eia_bitmap: u16,
+    /// Security Key: `K_eNB` (§9.2.1.41).
+    pub security_key: [u8; 32],
+    /// Notify-criticality IEs not comprehended, reported in the response's
+    /// Criticality Diagnostics (§10.3.4.2).
+    pub notify: Vec<DiagnosedIe>,
+}
+
+impl std::fmt::Debug for InitialContextSetup {
+    /// Never prints the Security Key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialContextSetup")
+            .field("mme_ue_s1ap_id", &self.mme_ue_s1ap_id)
+            .field("enb_ue_s1ap_id", &self.enb_ue_s1ap_id)
+            .field("erabs", &self.erabs)
+            .field("eea_bitmap", &format_args!("{:#06x}", self.eea_bitmap))
+            .field("eia_bitmap", &format_args!("{:#06x}", self.eia_bitmap))
+            .field("security_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl InitialContextSetup {
+    /// Whether 128-EEA`alg` is in the UE's capabilities (EEA0 always is).
+    pub fn ue_supports_eea(&self, alg: u8) -> bool {
+        alg == 0 || (1..=3).contains(&alg) && self.eea_bitmap & (0x8000 >> (alg - 1)) != 0
+    }
+
+    /// Whether 128-EIA`alg` is in the UE's capabilities (EIA0 is not signalled).
+    pub fn ue_supports_eia(&self, alg: u8) -> bool {
+        (1..=3).contains(&alg) && self.eia_bitmap & (0x8000 >> (alg - 1)) != 0
+    }
+}
+
+fn bits_value(b: &bitvec::slice::BitSlice<u8, bitvec::order::Msb0>) -> u32 {
+    b.iter()
+        .take(16)
+        .fold(0u32, |acc, x| (acc << 1) | u32::from(*x))
+        << 16u32.saturating_sub(b.len().min(16) as u32)
+}
+
+fn bit_octets(b: &bitvec::slice::BitSlice<u8, bitvec::order::Msb0>) -> Vec<u8> {
+    b.chunks(8)
+        .map(|c| c.iter().fold(0u8, |acc, x| (acc << 1) | u8::from(*x)) << (8 - c.len()))
+        .collect()
+}
+
+/// The procedure tuple of Initial Context Setup for Criticality Diagnostics.
+const ICS_PROCEDURE: (u8, u8, u8) = (
+    ID_INITIAL_CONTEXT_SETUP,
+    TriggeringMessage::INITIATING_MESSAGE,
+    Criticality::REJECT,
+);
+
+fn handle_initial_context_setup(
+    req: &InitialContextSetupRequest,
+    unknown: &[UnknownIe],
+) -> S1Inbound {
+    let mut mme = None;
+    let mut enb = None;
+    let mut ambr = None;
+    let mut erabs = None;
+    let mut caps = None;
+    let mut key = None;
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(v) => {
+                mme = Some(v.0)
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(v) => {
+                enb = Some(v.0)
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(a) => {
+                ambr = Some((
+                    a.u_eaggregate_maximum_bit_rate_dl.0,
+                    a.u_eaggregate_maximum_bit_rate_ul.0,
+                ));
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_E_RABToBeSetupListCtxtSUReq(l) => {
+                erabs = Some(
+                    l.0.iter()
+                        .map(|e| {
+                            let E_RABToBeSetupListCtxtSUReq_EntryValue::Id_E_RABToBeSetupItemCtxtSUReq(i) =
+                                &e.value;
+                            ErabToSetup {
+                                e_rab_id: i.e_rab_id.0,
+                                qci: i.e_ra_blevel_qo_s_parameters.qci.0,
+                                sgw_address: bit_octets(&i.transport_layer_address.0),
+                                sgw_teid: u32::from_be_bytes(
+                                    i.gtp_teid.0.as_slice().try_into().unwrap_or([0; 4]),
+                                ),
+                                nas: i.nas_pdu.as_ref().map(|n| n.0.clone()),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UESecurityCapabilities(c) => {
+                caps = Some((
+                    bits_value(&c.encryption_algorithms.0) as u16,
+                    bits_value(&c.integrity_protection_algorithms.0) as u16,
+                ));
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_SecurityKey(k) => {
+                let o = bit_octets(&k.0);
+                key = <[u8; 32]>::try_from(o.as_slice()).ok();
+            }
+            _ => {}
+        }
+    }
+    let rejected: Vec<DiagnosedIe> = unknown
+        .iter()
+        .filter(|u| {
+            u.criticality
+                .as_ref()
+                .is_none_or(|c| c.0 == Criticality::REJECT)
+        })
+        .filter_map(|u| {
+            Some(DiagnosedIe {
+                id: u16::try_from(u.id).ok()?,
+                criticality: Criticality::REJECT,
+                type_of_error: TypeOfError::NOT_UNDERSTOOD,
+            })
+        })
+        .collect();
+    // §10.3.5: every mandatory IE of this message is criticality reject.
+    let mut missing = Vec::new();
+    for (present, id) in [
+        (mme.is_some(), ID_MME_UE_S1AP_ID),
+        (enb.is_some(), ID_E_NB_UE_S1AP_ID),
+        (ambr.is_some(), ID_U_EAGGREGATE_MAXIMUM_BITRATE),
+        (erabs.is_some(), ID_E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ),
+        (caps.is_some(), ID_UE_SECURITY_CAPABILITIES),
+        (key.is_some(), ID_SECURITY_KEY),
+    ] {
+        if !present {
+            missing.push(DiagnosedIe {
+                id,
+                criticality: Criticality::REJECT,
+                type_of_error: TypeOfError::MISSING,
+            });
+        }
+    }
+    if !rejected.is_empty() || !missing.is_empty() {
+        let mut diag = rejected;
+        diag.extend(missing);
+        // Class 1 (§10.3.4.2, §10.3.5): terminate and answer with the
+        // unsuccessful outcome -- which needs both UE S1AP IDs; without them
+        // only an Error Indication can say anything.
+        return match (mme, enb) {
+            (Some(m), Some(e)) => encode_or_log(&build_initial_context_setup_failure(
+                m,
+                e,
+                protocol(CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT),
+                &diag,
+            ))
+            .map_or_else(
+                || S1Inbound::NotHandled("INITIAL CONTEXT SETUP rejected".into()),
+                |pdu| S1Inbound::InitialContextSetupFailure {
+                    enb_ue_s1ap_id: e,
+                    pdu,
+                },
+            ),
+            _ => encode_or_log(&build_ue_error_indication(
+                mme,
+                enb,
+                protocol(CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT),
+                Some(ICS_PROCEDURE),
+                &diag,
+            ))
+            .map_or_else(
+                || S1Inbound::NotHandled("INITIAL CONTEXT SETUP rejected".into()),
+                S1Inbound::ErrorIndication,
+            ),
+        };
+    }
+    let notify = unknown
+        .iter()
+        .filter(|u| u.criticality.as_ref().map(|c| c.0) == Some(Criticality::NOTIFY))
+        .filter_map(|u| {
+            Some(DiagnosedIe {
+                id: u16::try_from(u.id).ok()?,
+                criticality: Criticality::NOTIFY,
+                type_of_error: TypeOfError::NOT_UNDERSTOOD,
+            })
+        })
+        .collect();
+    let (Some(mme), Some(enb), Some((dl, ul)), Some(erabs), Some((eea, eia)), Some(key)) =
+        (mme, enb, ambr, erabs, caps, key)
+    else {
+        unreachable!("checked above");
+    };
+    S1Inbound::InitialContextSetup(Box::new(InitialContextSetup {
+        mme_ue_s1ap_id: mme,
+        enb_ue_s1ap_id: enb,
+        ue_ambr_dl: dl,
+        ue_ambr_ul: ul,
+        erabs,
+        eea_bitmap: eea,
+        eia_bitmap: eia,
+        security_key: key,
+        notify,
+    }))
+}
+
+fn criticality_diagnostics(procedure: (u8, u8, u8), ies: &[DiagnosedIe]) -> CriticalityDiagnostics {
+    CriticalityDiagnostics {
+        procedure_code: Some(ProcedureCode(procedure.0)),
+        triggering_message: Some(TriggeringMessage(procedure.1)),
+        procedure_criticality: Some(Criticality(procedure.2)),
+        i_es_criticality_diagnostics: (!ies.is_empty()).then(|| {
+            CriticalityDiagnostics_IE_List(
+                ies.iter()
+                    .map(|ie| CriticalityDiagnostics_IE_Item {
+                        ie_criticality: Criticality(ie.criticality),
+                        ie_id: ProtocolIE_ID(ie.id),
+                        type_of_error: TypeOfError(ie.type_of_error),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            )
+        }),
+        ie_extensions: None,
+    }
+}
+
+/// One established E-RAB for INITIAL CONTEXT SETUP RESPONSE: its ID and the
+/// eNB's S1-U endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErabSetup {
+    /// E-RAB ID.
+    pub e_rab_id: u8,
+    /// eNB S1-U address.
+    pub address: std::net::IpAddr,
+    /// eNB S1-U GTP-TEID.
+    pub teid: u32,
+}
+
+fn transport_layer_address(ip: std::net::IpAddr) -> TransportLayerAddress {
+    let octets = match ip {
+        std::net::IpAddr::V4(a) => a.octets().to_vec(),
+        std::net::IpAddr::V6(a) => a.octets().to_vec(),
+    };
+    TransportLayerAddress(
+        octets
+            .iter()
+            .flat_map(|o| (0..8).rev().map(move |i| (o >> i) & 1 == 1))
+            .collect(),
+    )
+}
+
+/// Build INITIAL CONTEXT SETUP RESPONSE (§9.1.4.2), IEs in message-table
+/// order with their `InitialContextSetupResponseIEs` criticalities (all
+/// ignore), with Criticality Diagnostics when notify IEs were not comprehended.
+pub fn build_initial_context_setup_response(
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    erabs: &[ErabSetup],
+    notify: &[DiagnosedIe],
+) -> S1AP_PDU {
+    let mut ies = vec![
+        InitialContextSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_MME_UE_S1AP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(
+                MME_UE_S1AP_ID(mme_ue_s1ap_id),
+            ),
+        },
+        InitialContextSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_NB_UE_S1AP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(
+                ENB_UE_S1AP_ID(enb_ue_s1ap_id),
+            ),
+        },
+        InitialContextSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_RAB_SETUP_LIST_CTXT_SU_RES),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_E_RABSetupListCtxtSURes(
+                E_RABSetupListCtxtSURes(
+                    erabs
+                        .iter()
+                        .map(|e| E_RABSetupListCtxtSURes_Entry {
+                            id: ProtocolIE_ID(ID_E_RAB_SETUP_ITEM_CTXT_SU_RES),
+                            criticality: Criticality(Criticality::IGNORE),
+                            value: E_RABSetupListCtxtSURes_EntryValue::Id_E_RABSetupItemCtxtSURes(
+                                E_RABSetupItemCtxtSURes {
+                                    e_rab_id: E_RAB_ID(e.e_rab_id),
+                                    transport_layer_address: transport_layer_address(e.address),
+                                    gtp_teid: GTP_TEID(e.teid.to_be_bytes().to_vec()),
+                                    ie_extensions: None,
+                                },
+                            ),
+                        })
+                        .collect(),
+                ),
+            ),
+        },
+    ];
+    if !notify.is_empty() {
+        ies.push(InitialContextSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CRITICALITY_DIAGNOSTICS),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupResponseProtocolIEs_EntryValue::Id_CriticalityDiagnostics(
+                criticality_diagnostics(ICS_PROCEDURE, notify),
+            ),
+        });
+    }
+    S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(ID_INITIAL_CONTEXT_SETUP),
+        criticality: Criticality(Criticality::REJECT),
+        value: SuccessfulOutcomeValue::Id_InitialContextSetup(InitialContextSetupResponse {
+            protocol_i_es: InitialContextSetupResponseProtocolIEs(ies),
+        }),
+    })
+}
+
+/// Build INITIAL CONTEXT SETUP FAILURE (§9.1.4.3), with Criticality
+/// Diagnostics when `diag` names the IEs that caused it.
+pub fn build_initial_context_setup_failure(
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    cause: Cause,
+    diag: &[DiagnosedIe],
+) -> S1AP_PDU {
+    let mut ies = vec![
+        InitialContextSetupFailureProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_MME_UE_S1AP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupFailureProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(
+                MME_UE_S1AP_ID(mme_ue_s1ap_id),
+            ),
+        },
+        InitialContextSetupFailureProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_NB_UE_S1AP_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupFailureProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(
+                ENB_UE_S1AP_ID(enb_ue_s1ap_id),
+            ),
+        },
+        InitialContextSetupFailureProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CAUSE),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupFailureProtocolIEs_EntryValue::Id_Cause(cause),
+        },
+    ];
+    if !diag.is_empty() {
+        ies.push(InitialContextSetupFailureProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CRITICALITY_DIAGNOSTICS),
+            criticality: Criticality(Criticality::IGNORE),
+            value: InitialContextSetupFailureProtocolIEs_EntryValue::Id_CriticalityDiagnostics(
+                criticality_diagnostics(ICS_PROCEDURE, diag),
+            ),
+        });
+    }
+    S1AP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome {
+        procedure_code: ProcedureCode(ID_INITIAL_CONTEXT_SETUP),
+        criticality: Criticality(Criticality::REJECT),
+        value: UnsuccessfulOutcomeValue::Id_InitialContextSetup(InitialContextSetupFailure {
+            protocol_i_es: InitialContextSetupFailureProtocolIEs(ies),
+        }),
+    })
+}
+
 /// Classify an S1AP PDU received on an operational S1 interface.
 pub fn handle_s1_pdu(bytes: &[u8]) -> S1Inbound {
     let (pdu, unknown) = match codec::decode_s1ap_pdu_with_unknown_ies(bytes) {
@@ -551,6 +963,10 @@ pub fn handle_s1_pdu(bytes: &[u8]) -> S1Inbound {
             value: InitiatingMessageValue::Id_UEContextRelease(cmd),
             ..
         }) => handle_release_command(cmd, &unknown),
+        S1AP_PDU::InitiatingMessage(InitiatingMessage {
+            value: InitiatingMessageValue::Id_InitialContextSetup(req),
+            ..
+        }) => handle_initial_context_setup(req, &unknown),
         S1AP_PDU::InitiatingMessage(m) => S1Inbound::NotHandled(format!(
             "initiating message, procedure {} (not supported in this build)",
             m.procedure_code.0

@@ -4,9 +4,10 @@
 //! lte-ue -c config/lte-ue.yaml
 //! ```
 //!
-//! Without EPS NAS (nextgsim #186 increment 3) the UE selects a cell, reads
-//! its system information and camps (TS 36.304 §5.2); it does not originate
-//! an attach, because there is no NAS to supply one.
+//! With a `subscriber` configured the UE attaches (TS 24.301 §5.5.1) on the
+//! cell it selects; without one it selects a cell, reads its system
+//! information and camps (TS 36.304 §5.2), because there is no USIM to attach
+//! with.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
@@ -54,15 +55,17 @@ async fn main() -> ExitCode {
         let _ = tokio::signal::ctrl_c().await;
         let _ = stop_tx.send(true);
     });
-    match nextgsim_lte_ue::task::run(
-        &cfg,
-        Box::new(nextgsim_lte_ue::nas::NoNas),
-        socket,
-        state_tx,
-        stop_rx,
-    )
-    .await
-    {
+    let nas: Box<dyn nextgsim_lte_ue::nas::NasLayer> = match cfg.eps_nas() {
+        Some(n) => {
+            log::info!("USIM IMSI {}: EPS NAS enabled", n.imsi);
+            Box::new(nextgsim_lte_ue::nas::EpsNas::new(n))
+        }
+        None => {
+            log::info!("no subscriber configured: camping only");
+            Box::new(nextgsim_lte_ue::nas::NoNas)
+        }
+    };
+    match nextgsim_lte_ue::task::run(&cfg, nas, socket, state_tx, stop_rx).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log::error!("RLS socket failed: {e}");

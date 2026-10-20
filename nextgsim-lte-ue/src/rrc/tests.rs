@@ -193,7 +193,8 @@ fn setup_is_answered_with_complete_over_srb1_pdcp() {
         panic!("{acts:?}");
     };
     let mut enb_srb1 = LteSrbPdcp::new();
-    let (sdu, count) = enb_srb1.receive(pdu).unwrap();
+    let r = enb_srb1.receive(pdu).unwrap();
+    let (sdu, count) = (r.sdu, r.count);
     assert_eq!(count, 0);
     assert_eq!(
         msg::decode_ul_dcch(&sdu).unwrap(),
@@ -269,7 +270,8 @@ fn downlink_nas_is_delivered_and_replies_go_out_as_ul_information_transfer() {
     };
     let mut enb_rx = LteSrbPdcp::new();
     enb_rx.receive(&[0, 0, 0, 0, 0]).unwrap(); // the SetupComplete before it
-    let (sdu, count) = enb_rx.receive(pdu).unwrap();
+    let r = enb_rx.receive(pdu).unwrap();
+    let (sdu, count) = (r.sdu, r.count);
     assert_eq!(count, 1, "second uplink SRB1 PDU");
     assert_eq!(
         msg::decode_ul_dcch(&sdu).unwrap(),

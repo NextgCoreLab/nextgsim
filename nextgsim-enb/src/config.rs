@@ -169,6 +169,31 @@ impl Default for RadioConfig {
     }
 }
 
+/// The eNB's AS algorithm preferences (TS 33.401 §7.2.4.2.1: "each eNB shall
+/// be configured via network management with lists of algorithms which are
+/// allowed for usage", ordered by priority). Identities are TS 33.401 §5.1.3 /
+/// §5.1.4: 0 = EEA0/EIA0, 1 = 128-EEA1/EIA1 (SNOW 3G), 2 = 128-EEA2/EIA2
+/// (AES), 3 = 128-EEA3/EIA3 (ZUC).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AsSecurityConfig {
+    /// Integrity algorithms, highest priority first. EIA0 is refused: TS 33.401
+    /// §5.1.4.2 allows it only for unauthenticated emergency calls, which this
+    /// eNB does not serve.
+    pub integrity: Vec<u8>,
+    /// Ciphering algorithms, highest priority first.
+    pub ciphering: Vec<u8>,
+}
+
+impl Default for AsSecurityConfig {
+    fn default() -> Self {
+        Self {
+            integrity: vec![2, 1],
+            ciphering: vec![2, 1, 0],
+        }
+    }
+}
+
 /// eNB configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnbConfig {
@@ -209,6 +234,14 @@ pub struct EnbConfig {
     /// The E-UTRA cell and its RLS endpoint.
     #[serde(default)]
     pub radio: RadioConfig,
+    /// AS security algorithm preferences.
+    #[serde(default)]
+    pub security: AsSecurityConfig,
+    /// The eNB's S1-U (GTP-U) address, sent as the E-RAB transport layer
+    /// address in INITIAL CONTEXT SETUP RESPONSE (TS 36.413 §9.1.4.2). Defaults
+    /// to `s1ap_ip`.
+    #[serde(default)]
+    pub gtp_ip: Option<IpAddr>,
 }
 
 fn default_s1_setup_retry_secs() -> u64 {
@@ -347,7 +380,28 @@ pub fn validate_enb_config(c: &EnbConfig) -> Result<(), ConfigError> {
             "s1_setup_response_timeout_ms must be > 0".into(),
         ));
     }
-    validate_radio(c)
+    validate_radio(c)?;
+    validate_security(&c.security)
+}
+
+fn validate_security(s: &AsSecurityConfig) -> Result<(), ConfigError> {
+    if s.integrity.is_empty() || s.ciphering.is_empty() {
+        return Err(ConfigError::Invalid(
+            "security.integrity and security.ciphering must not be empty".into(),
+        ));
+    }
+    if let Some(a) = s.integrity.iter().chain(&s.ciphering).find(|a| **a > 3) {
+        return Err(ConfigError::Invalid(format!(
+            "security: algorithm identity {a} is not one of 0..=3"
+        )));
+    }
+    if s.integrity.contains(&0) {
+        return Err(ConfigError::Invalid(
+            "security.integrity: EIA0 is only for unauthenticated emergency calls (TS 33.401 §5.1.4.2)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_radio(c: &EnbConfig) -> Result<(), ConfigError> {
@@ -407,7 +461,22 @@ mod tests {
             s1_setup_retry_secs: 10,
             s1_setup_response_timeout_ms: 5000,
             radio: RadioConfig::default(),
+            security: AsSecurityConfig::default(),
+            gtp_ip: None,
         }
+    }
+
+    #[test]
+    fn security_lists_are_validated() {
+        let mut c = valid();
+        c.security.integrity = vec![2, 0];
+        assert!(validate_enb_config(&c).is_err(), "EIA0");
+        let mut c = valid();
+        c.security.ciphering = vec![4];
+        assert!(validate_enb_config(&c).is_err());
+        let mut c = valid();
+        c.security.integrity.clear();
+        assert!(validate_enb_config(&c).is_err());
     }
 
     #[test]

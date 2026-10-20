@@ -163,7 +163,8 @@ fn downlink_nas_is_relayed_in_a_pdcp_pdu_and_uplink_nas_uses_the_stored_mme_id()
     };
     // The UE side of SRB1: strip the PDCP PDU, decode DLInformationTransfer.
     let mut ue_rx = LteSrbPdcp::new();
-    let (sdu, count) = ue_rx.receive(pdu).unwrap();
+    let r = ue_rx.receive(pdu).unwrap();
+    let (sdu, count) = (r.sdu, r.count);
     assert_eq!(count, 0, "first downlink SRB1 PDU uses COUNT 0");
     assert_eq!(
         msg::decode_dl_dcch(&sdu).unwrap(),
@@ -276,7 +277,10 @@ fn release_command_releases_rrc_and_completes() {
     });
     let mut ue_rx = LteSrbPdcp::new();
     ue_rx.receive(&[0, 0, 0, 0, 0]).unwrap(); // the DLInformationTransfer before it
-    let (sdu, _) = ue_rx.receive(&rrc.expect("RRCConnectionRelease")).unwrap();
+    let sdu = ue_rx
+        .receive(&rrc.expect("RRCConnectionRelease"))
+        .unwrap()
+        .sdu;
     assert_eq!(
         msg::decode_dl_dcch(&sdu).unwrap(),
         msg::DlDcch::ConnectionRelease

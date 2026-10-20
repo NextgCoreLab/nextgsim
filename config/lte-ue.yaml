@@ -6,3 +6,21 @@ plmn: { mcc: 999, mnc: 70, long_mnc: false }
 # eNB RLS endpoints to search ("ip" uses port 4997).
 enb_search_list:
   - "172.24.0.50"
+
+# The USIM and EPS NAS (TS 24.301). Without it the UE only relays NAS (no
+# attach). This is the test subscriber of nextgcore's
+# k8s/manifests/mongodb-init.yaml; key/op/op_type/imei_sv follow config/ue.yaml.
+subscriber:
+  imsi: "999700000000001"
+  key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+  op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+  op_type: Opc
+  # Highest SQN the USIM has accepted (TS 33.102 §C.2).
+  sqn: 0
+  imei_sv: "3534900698733019"
+  # UE network capability: the EEA/EIA the UE supports (TS 24.301 §9.9.3.34).
+  eea: [0, 1, 2, 3]
+  eia: [0, 1, 2, 3]
+  # Requested APN in the PDN CONNECTIVITY REQUEST; omitted, the network's default.
+  # apn: internet
+  pdn_type: ipv4

@@ -13,15 +13,26 @@
 //!   (§5.3.3.2: "ensure having valid and up to date essential system
 //!   information"); T300 from SIB2 supervises it (§5.3.3.3, §7.3).
 //! - **SRB1** is a PDCP entity (TS 36.323) from RRCConnectionSetup on.
+//! - **AS security** (§5.3.4.3): on SecurityModeCommand the UE derives
+//!   `K_eNB` from NAS's `K_ASME` (TS 33.401 §7.2.6.2), `K_RRCint`, `K_RRCenc`
+//!   and `K_UPenc` (Annex A.7), verifies the command's MAC-I, and switches
+//!   SRB1's PDCP on in the order of TS 33.401 §7.2.4.5 -- the
+//!   SecurityModeComplete goes out integrity protected and unciphered.
+//! - **RRCConnectionReconfiguration** (§5.3.5.3) adds the DRBs of the default
+//!   bearer and hands `dedicatedInfoNASList` (the ATTACH ACCEPT) to NAS. The
+//!   DRBs are configured, not yet carried: their user plane is increment 4.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use nextgsim_common::Plmn;
+use nextgsim_crypto::eps_kdf::{derive_algorithm_key, EpsAlgorithmType};
 use nextgsim_lte_rrc::msg::{
-    self, BcchDlSch, CellInfo, DlCcch, DlDcch, InitialUeIdentity, MibInfo, PlmnId, Sib2Info,
+    self, BcchDlSch, CellInfo, DlCcch, DlDcch, DrbConfig, InitialUeIdentity, MibInfo, PlmnId,
+    Reconfiguration, Sib2Info,
 };
-use nextgsim_pdcp::LteSrbPdcp;
+use nextgsim_pdcp::lte_srb::{verify_mac_i, DIRECTION_DOWNLINK, SRB1_BEARER};
+use nextgsim_pdcp::{LteSrbPdcp, LteSrbReceived};
 use nextgsim_rls::RrcChannel;
 
 use crate::nas::{InitialNas, NasLayer, RrcIndication};
@@ -81,6 +92,10 @@ enum State {
     Connected {
         cell: u64,
         srb1: LteSrbPdcp,
+        /// AS security activated (§5.3.4.3).
+        secured: bool,
+        /// DRBs added by RRCConnectionReconfiguration.
+        drbs: Vec<DrbConfig>,
     },
 }
 
@@ -135,13 +150,37 @@ impl UeRrc {
         }
     }
 
-    /// The earliest timer deadline, if any (T300, T302).
+    /// The earliest timer deadline, if any (T300, T302, NAS timers).
     pub fn next_deadline(&self) -> Option<Instant> {
         let t300 = match &self.state {
             State::Connecting { t300_expiry, .. } => Some(*t300_expiry),
             _ => None,
         };
-        [t300, self.barred_until].into_iter().flatten().min()
+        [t300, self.barred_until, self.nas.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Whether AS security is active on the connection.
+    pub fn as_security_active(&self) -> bool {
+        matches!(self.state, State::Connected { secured: true, .. })
+    }
+
+    /// The DRBs of the connection.
+    pub fn drbs(&self) -> Vec<DrbConfig> {
+        match &self.state {
+            State::Connected { drbs, .. } => drbs.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Leave RRC_CONNECTED (§5.3.12) and tell NAS the connection is gone.
+    fn leave_connected(&mut self, why: &str, now: Instant) -> Vec<UeAction> {
+        log::warn!("leaving RRC_CONNECTED: {why}");
+        self.state = State::Idle;
+        self.nas.on_rrc_indication(RrcIndication::Released);
+        self.reselect(now)
     }
 
     /// TS 36.304 §5.2.3.2.
@@ -252,8 +291,23 @@ impl UeRrc {
         self.reselect(now)
     }
 
-    /// Timers: T300 (§5.3.3.6) and T302 (§5.3.3.8).
+    /// Timers: T300 (§5.3.3.6), T302 (§5.3.3.8) and NAS's.
     pub fn on_timer(&mut self, now: Instant) -> Vec<UeAction> {
+        if self.nas.next_deadline().is_some_and(|t| now >= t) {
+            let out = self.nas.on_timer(now);
+            if out.release && matches!(self.state, State::Connected { .. }) {
+                // Upper layers request the release (§5.3.12, "release cause
+                // other").
+                return self.leave_connected("NAS requested a local release", now);
+            }
+            if let State::Connected { cell, .. } = &self.state {
+                let cell = *cell;
+                let acts = self.send_ul_nas(cell, out.uplink);
+                if !acts.is_empty() {
+                    return acts;
+                }
+            }
+        }
         if let State::Connecting { t300_expiry, .. } = &self.state {
             if now >= *t300_expiry {
                 log::warn!("T300 expired: RRC connection establishment failed (§5.3.3.6)");
@@ -348,7 +402,12 @@ impl UeRrc {
                     }
                 };
                 let (pdcp, _) = srb1.transmit(&complete);
-                self.state = State::Connected { cell, srb1 };
+                self.state = State::Connected {
+                    cell,
+                    srb1,
+                    secured: false,
+                    drbs: Vec::new(),
+                };
                 log::info!("RRCConnectionSetup; RRCConnectionSetupComplete sent (RRC_CONNECTED)");
                 self.nas.on_rrc_indication(RrcIndication::Connected);
                 vec![UeAction::Rrc {
@@ -380,6 +439,7 @@ impl UeRrc {
         let State::Connected {
             cell: serving,
             srb1,
+            ..
         } = &mut self.state
         else {
             return vec![];
@@ -387,14 +447,24 @@ impl UeRrc {
         if *serving != cell {
             return vec![];
         }
-        let sdu = match srb1.receive(pdu) {
-            Ok((sdu, _)) => sdu,
+        let received = match srb1.receive(pdu) {
+            Ok(r) => r,
+            Err(nextgsim_pdcp::LteSrbPdcpError::IntegrityCheckFailed(count)) => {
+                // §5.3.7.2: an "integrity check failure indication from lower
+                // layers concerning SRB1" initiates RRC connection
+                // re-establishment, which this UE does not implement; it leaves
+                // RRC_CONNECTED instead (§5.3.12).
+                return self.leave_connected(
+                    &format!("SRB1 integrity check failure at COUNT {count}"),
+                    now,
+                );
+            }
             Err(e) => {
                 log::warn!("SRB1 PDCP: {e}");
                 return vec![];
             }
         };
-        match msg::decode_dl_dcch(&sdu) {
+        match msg::decode_dl_dcch(&received.sdu) {
             Ok(DlDcch::InformationTransfer { nas }) => {
                 let replies = self.nas.on_downlink_nas(&nas);
                 self.send_ul_nas(cell, replies)
@@ -406,6 +476,12 @@ impl UeRrc {
                 self.nas.on_rrc_indication(RrcIndication::Released);
                 self.reselect(now)
             }
+            Ok(DlDcch::SecurityModeCommand {
+                transaction_id,
+                eea,
+                eia,
+            }) => self.on_security_mode_command(cell, &received, transaction_id, eea, eia),
+            Ok(DlDcch::ConnectionReconfiguration(r)) => self.on_reconfiguration(cell, r, now),
             Ok(DlDcch::Unsupported) => {
                 log::info!("DL-DCCH message not supported in this build, ignored");
                 vec![]
@@ -415,6 +491,128 @@ impl UeRrc {
                 vec![]
             }
         }
+    }
+
+    /// §5.3.4.3, with the PDCP ordering of TS 33.401 §7.2.4.5.
+    fn on_security_mode_command(
+        &mut self,
+        cell: u64,
+        received: &LteSrbReceived,
+        transaction_id: u8,
+        eea: u8,
+        eia: u8,
+    ) -> Vec<UeAction> {
+        let k_enb = self.nas.k_enb();
+        let State::Connected { srb1, secured, .. } = &mut self.state else {
+            return vec![];
+        };
+        let failure =
+            |srb1: &mut LteSrbPdcp| match msg::encode_security_mode_failure(transaction_id) {
+                // "neither apply integrity protection nor ciphering".
+                Ok(f) => vec![UeAction::Rrc {
+                    cell,
+                    channel: RrcChannel::UlDcch,
+                    pdu: srb1.transmit(&f).0,
+                }],
+                Err(e) => {
+                    log::error!("cannot encode SecurityModeFailure: {e}");
+                    vec![]
+                }
+            };
+        let Some(k_enb) = k_enb else {
+            log::warn!("SecurityModeCommand with no NAS security context; SecurityModeFailure");
+            return failure(srb1);
+        };
+        if *secured {
+            log::warn!("SecurityModeCommand with AS security already active; ignored");
+            return vec![];
+        }
+        let k_rrc_int = derive_algorithm_key(&k_enb, EpsAlgorithmType::RrcInt, eia);
+        if eia > 3
+            || eea > 3
+            || !verify_mac_i(received, eia, &k_rrc_int, SRB1_BEARER, DIRECTION_DOWNLINK)
+        {
+            log::warn!("SecurityModeCommand failed its integrity check; SecurityModeFailure");
+            return failure(srb1);
+        }
+        let k_rrc_enc = derive_algorithm_key(&k_enb, EpsAlgorithmType::RrcEnc, eea);
+        let complete = match msg::encode_security_mode_complete(transaction_id) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("cannot encode SecurityModeComplete: {e}");
+                return vec![];
+            }
+        };
+        let activated = srb1
+            .activate_rx_integrity(eia, k_rrc_int)
+            .and_then(|()| srb1.activate_rx_ciphering(eea, k_rrc_enc))
+            .and_then(|()| srb1.activate_tx_integrity(eia, k_rrc_int));
+        if let Err(e) = activated {
+            log::error!("SRB1: {e}");
+            return vec![];
+        }
+        let (pdu, _) = srb1.transmit(&complete);
+        // "ciphering ... except for the SecurityModeComplete message".
+        if let Err(e) = srb1.activate_tx_ciphering(eea, k_rrc_enc) {
+            log::error!("SRB1: {e}");
+        }
+        *secured = true;
+        log::info!("SecurityModeCommand EEA{eea}/EIA{eia}: AS security activated");
+        vec![UeAction::Rrc {
+            cell,
+            channel: RrcChannel::UlDcch,
+            pdu,
+        }]
+    }
+
+    /// §5.3.5.3: apply the radio resource configuration, hand the NAS list to
+    /// upper layers, and complete.
+    fn on_reconfiguration(&mut self, cell: u64, r: Reconfiguration, now: Instant) -> Vec<UeAction> {
+        let State::Connected { secured, drbs, .. } = &mut self.state else {
+            return vec![];
+        };
+        if r.mobility_control {
+            log::warn!(
+                "RRCConnectionReconfiguration with mobilityControlInfo: handover not supported"
+            );
+            return self.leave_connected("cannot comply with a handover command", now);
+        }
+        if !*secured && !r.drbs.is_empty() {
+            // §5.3.5.2 permits DRB establishment only after AS security; a UE
+            // that cannot comply leaves RRC_CONNECTED (§5.3.5.5).
+            return self.leave_connected("DRB setup before AS security activation", now);
+        }
+        for d in &r.drbs {
+            log::info!(
+                "DRB {} configured for EPS bearer {} on logical channel {}",
+                d.drb_identity,
+                d.eps_bearer_identity,
+                d.logical_channel_identity
+            );
+            drbs.retain(|x| x.drb_identity != d.drb_identity);
+            drbs.push(*d);
+        }
+        let complete = match msg::encode_rrc_connection_reconfiguration_complete(r.transaction_id) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("cannot encode RRCConnectionReconfigurationComplete: {e}");
+                return vec![];
+            }
+        };
+        let mut replies = Vec::new();
+        for nas in &r.nas {
+            replies.extend(self.nas.on_downlink_nas(nas));
+        }
+        let State::Connected { srb1, .. } = &mut self.state else {
+            return vec![];
+        };
+        let mut acts = vec![UeAction::Rrc {
+            cell,
+            channel: RrcChannel::UlDcch,
+            pdu: srb1.transmit(&complete).0,
+        }];
+        acts.extend(self.send_ul_nas(cell, replies));
+        acts
     }
 
     fn send_ul_nas(&mut self, cell: u64, nas_msgs: Vec<Vec<u8>>) -> Vec<UeAction> {

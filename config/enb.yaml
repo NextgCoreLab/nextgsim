@@ -45,3 +45,12 @@ radio:
   q_rx_lev_min_dbm: -140
   t300_ms: 1000
   si_broadcast_period_ms: 160
+
+# AS security algorithm preference, most preferred first (TS 33.401 §7.2.4.2.1);
+# the eNB picks the first the UE supports. EIA0 is refused (§5.1.4.1).
+security:
+  integrity: [2, 1]
+  ciphering: [2, 1, 0]
+
+# The eNB's S1-U address named in INITIAL CONTEXT SETUP RESPONSE; default s1ap_ip.
+# gtp_ip: 172.24.0.50

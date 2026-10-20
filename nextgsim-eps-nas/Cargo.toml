@@ -1,0 +1,18 @@
+[package]
+name = "nextgsim-eps-nas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "EPS NAS (TS 24.301 EMM/ESM, UE side) for the nextgsim LTE UE"
+
+[lints]
+workspace = true
+
+[dependencies]
+nextgsim-common.workspace = true
+nextgsim-crypto.workspace = true
+log.workspace = true
+thiserror.workspace = true
+serde.workspace = true

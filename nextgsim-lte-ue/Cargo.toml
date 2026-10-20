@@ -20,6 +20,8 @@ path = "src/lib.rs"
 
 [dependencies]
 nextgsim-common.workspace = true
+nextgsim-eps-nas.workspace = true
+nextgsim-crypto.workspace = true
 nextgsim-lte-rrc.workspace = true
 nextgsim-pdcp.workspace = true
 nextgsim-rls.workspace = true
