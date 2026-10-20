@@ -64,9 +64,9 @@ pub fn build_ue_radio_capability_id_mapping_request(ue_radio_capability_id: &[u8
 pub fn encode_ue_radio_capability_id_mapping_request(
     ue_radio_capability_id: &[u8],
 ) -> Result<Vec<u8>, UeRadioCapabilityError> {
-    Ok(encode_ngap_pdu(&build_ue_radio_capability_id_mapping_request(
-        ue_radio_capability_id,
-    ))?)
+    Ok(encode_ngap_pdu(
+        &build_ue_radio_capability_id_mapping_request(ue_radio_capability_id),
+    )?)
 }
 
 /// Decode a UE RADIO CAPABILITY ID MAPPING REQUEST, returning the requested ID.
@@ -92,7 +92,9 @@ pub fn decode_ue_radio_capability_id_mapping_request(
             }
         })
         .next()
-        .ok_or(UeRadioCapabilityError::MissingMandatoryIe("UERadioCapabilityID"))
+        .ok_or(UeRadioCapabilityError::MissingMandatoryIe(
+            "UERadioCapabilityID",
+        ))
 }
 
 /// A UE RADIO CAPABILITY ID MAPPING RESPONSE (TS 38.413 §9.2.15.5).
@@ -114,10 +116,9 @@ pub fn build_ue_radio_capability_id_mapping_response(
         UERadioCapabilityIDMappingResponseProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_UE_RADIO_CAPABILITY_ID),
             criticality: Criticality(Criticality::REJECT),
-            value:
-                UERadioCapabilityIDMappingResponseProtocolIEs_EntryValue::Id_UERadioCapabilityID(
-                    UERadioCapabilityID(data.ue_radio_capability_id.clone()),
-                ),
+            value: UERadioCapabilityIDMappingResponseProtocolIEs_EntryValue::Id_UERadioCapabilityID(
+                UERadioCapabilityID(data.ue_radio_capability_id.clone()),
+            ),
         },
         UERadioCapabilityIDMappingResponseProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_UE_RADIO_CAPABILITY),
@@ -142,7 +143,9 @@ pub fn build_ue_radio_capability_id_mapping_response(
 pub fn encode_ue_radio_capability_id_mapping_response(
     data: &UeRadioCapabilityIdMappingResponseData,
 ) -> Result<Vec<u8>, UeRadioCapabilityError> {
-    Ok(encode_ngap_pdu(&build_ue_radio_capability_id_mapping_response(data))?)
+    Ok(encode_ngap_pdu(
+        &build_ue_radio_capability_id_mapping_response(data),
+    )?)
 }
 
 /// Decode a UE RADIO CAPABILITY ID MAPPING RESPONSE.
@@ -175,10 +178,12 @@ pub fn decode_ue_radio_capability_id_mapping_response(
         }
     }
     Ok(UeRadioCapabilityIdMappingResponseData {
-        ue_radio_capability_id: id
-            .ok_or(UeRadioCapabilityError::MissingMandatoryIe("UERadioCapabilityID"))?,
-        ue_radio_capability: capability
-            .ok_or(UeRadioCapabilityError::MissingMandatoryIe("UERadioCapability"))?,
+        ue_radio_capability_id: id.ok_or(UeRadioCapabilityError::MissingMandatoryIe(
+            "UERadioCapabilityID",
+        ))?,
+        ue_radio_capability: capability.ok_or(UeRadioCapabilityError::MissingMandatoryIe(
+            "UERadioCapability",
+        ))?,
     })
 }
 
@@ -243,7 +248,9 @@ pub fn build_ue_radio_capability_info_indication(
 pub fn encode_ue_radio_capability_info_indication(
     data: &UeRadioCapabilityInfoIndicationData,
 ) -> Result<Vec<u8>, UeRadioCapabilityError> {
-    Ok(encode_ngap_pdu(&build_ue_radio_capability_info_indication(data))?)
+    Ok(encode_ngap_pdu(
+        &build_ue_radio_capability_info_indication(data),
+    )?)
 }
 
 /// Decode a UE RADIO CAPABILITY INFO INDICATION.
@@ -278,8 +285,9 @@ pub fn decode_ue_radio_capability_info_indication(
     Ok(UeRadioCapabilityInfoIndicationData {
         amf_ue_ngap_id: amf.ok_or(UeRadioCapabilityError::MissingMandatoryIe("AMF-UE-NGAP-ID"))?,
         ran_ue_ngap_id: ran.ok_or(UeRadioCapabilityError::MissingMandatoryIe("RAN-UE-NGAP-ID"))?,
-        ue_radio_capability: cap
-            .ok_or(UeRadioCapabilityError::MissingMandatoryIe("UERadioCapability"))?,
+        ue_radio_capability: cap.ok_or(UeRadioCapabilityError::MissingMandatoryIe(
+            "UERadioCapability",
+        ))?,
     })
 }
 
@@ -323,7 +331,10 @@ mod tests {
         let bytes = encode_ue_radio_capability_id_mapping_response(&data).unwrap();
         assert_eq!(bytes[0], 0x20, "SuccessfulOutcome");
         assert_eq!(bytes[1], 60, "procedure code 60");
-        assert_eq!(decode_ue_radio_capability_id_mapping_response(&bytes).unwrap(), data);
+        assert_eq!(
+            decode_ue_radio_capability_id_mapping_response(&bytes).unwrap(),
+            data
+        );
     }
 
     #[test]
@@ -334,8 +345,15 @@ mod tests {
             ue_radio_capability: vec![1, 2, 3],
         };
         let bytes = encode_ue_radio_capability_info_indication(&data).unwrap();
-        assert_eq!(&bytes[..3], &[0x00, 44, 0x40], "initiating, code 44, ignore");
-        assert_eq!(decode_ue_radio_capability_info_indication(&bytes).unwrap(), data);
+        assert_eq!(
+            &bytes[..3],
+            &[0x00, 44, 0x40],
+            "initiating, code 44, ignore"
+        );
+        assert_eq!(
+            decode_ue_radio_capability_info_indication(&bytes).unwrap(),
+            data
+        );
     }
 
     #[test]

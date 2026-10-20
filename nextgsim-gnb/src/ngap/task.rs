@@ -3165,11 +3165,12 @@ impl NgapTask {
             return;
         };
         let (amf_id, stream, ran_ue_ngap_id) = (ctx.amf_ctx_id, ctx.stream_id, ctx.ran_ue_ngap_id);
-        let data = nextgsim_ngap::procedures::ue_radio_capability::UeRadioCapabilityInfoIndicationData {
-            amf_ue_ngap_id: amf_ue_ngap_id as u64,
-            ran_ue_ngap_id: ran_ue_ngap_id as u32,
-            ue_radio_capability: capability,
-        };
+        let data =
+            nextgsim_ngap::procedures::ue_radio_capability::UeRadioCapabilityInfoIndicationData {
+                amf_ue_ngap_id: amf_ue_ngap_id as u64,
+                ran_ue_ngap_id: ran_ue_ngap_id as u32,
+                ue_radio_capability: capability,
+            };
         match nextgsim_ngap::procedures::ue_radio_capability::encode_ue_radio_capability_info_indication(&data) {
             Ok(bytes) => {
                 info!("UE[{ue_id}]: sending UE RADIO CAPABILITY INFO INDICATION (TS 38.413 §8.14.1)");
@@ -10599,7 +10600,11 @@ mod tests {
                 .await;
         }
         let sent = drain_sctp(&mut sctp_rx);
-        assert_eq!(mapping_requests(&sent), vec![id.clone()], "exactly one mapping request");
+        assert_eq!(
+            mapping_requests(&sent),
+            vec![id.clone()],
+            "exactly one mapping request"
+        );
         assert!(
             drain_rrc_capability(&mut rrc_rx).is_empty(),
             "no UE capability enquiry and nothing applied while the mapping is outstanding"
@@ -10630,19 +10635,28 @@ mod tests {
             },
         )
         .unwrap();
-        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&response)).await;
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&response))
+            .await;
 
         let mut applied = drain_rrc_capability(&mut rrc_rx);
         applied.sort();
-        assert_eq!(applied, vec![(1, Some(cap.clone())), (2, Some(cap.clone()))]);
+        assert_eq!(
+            applied,
+            vec![(1, Some(cap.clone())), (2, Some(cap.clone()))]
+        );
         assert!(task.racs_pending.is_empty());
-        assert!(!task.guard_timers.is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
+        assert!(!task
+            .guard_timers
+            .is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
 
         task.create_ue_context(3, 1).await.expect("ue 3");
         let ran = ran_id(&task, 3).await;
         task.handle_initial_context_setup_request(1, 1, racs_ics(ran, None, Some(id)))
             .await;
-        assert!(mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty(), "cache hit: no request");
+        assert!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty(),
+            "cache hit: no request"
+        );
         assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(3, Some(cap))]);
     }
 
@@ -10658,7 +10672,10 @@ mod tests {
         )
         .await;
         assert!(mapping_requests(&drain_sctp(&mut sctp_rx)).is_empty());
-        assert_eq!(drain_rrc_capability(&mut rrc_rx), vec![(1, Some(vec![9, 9]))]);
+        assert_eq!(
+            drain_rrc_capability(&mut rrc_rx),
+            vec![(1, Some(vec![9, 9]))]
+        );
         let plmn = test_config().plmn.encode();
         assert_eq!(task.racs_cache.get(&(plmn, vec![0x77])), Some(vec![9, 9]));
     }
@@ -10701,7 +10718,9 @@ mod tests {
             .await;
         task.delete_ue_context(1).await;
         assert!(task.racs_pending.is_empty());
-        assert!(!task.guard_timers.is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
+        assert!(!task
+            .guard_timers
+            .is_pending(GuardTimer::RacsMapping { ue_id: 1 }));
     }
 
     /// TS 38.413 §8.14.1: what the UE reported goes to the AMF as a UE RADIO
@@ -10745,6 +10764,9 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(mapping_requests(&drain_sctp(&mut sctp_rx)), vec![vec![0xEE]]);
+        assert_eq!(
+            mapping_requests(&drain_sctp(&mut sctp_rx)),
+            vec![vec![0xEE]]
+        );
     }
 }

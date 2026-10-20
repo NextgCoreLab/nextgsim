@@ -5514,17 +5514,25 @@ mod tests {
     fn the_registration_request_advertises_racs_in_the_5gmm_capability() {
         let mut orch = MmOrchestrator::from_config(test_identity(), &UeConfig::default());
         let outputs = orch.start_registration(RegistrationType::InitialRegistration);
-        let full = orch.last_registration_request.clone().expect("full request");
+        let full = orch
+            .last_registration_request
+            .clone()
+            .expect("full request");
         let ie = [0x10u8, 0x02, 0x00, 0x80];
         assert!(full.windows(4).any(|w| w == ie), "got {full:02X?}");
         let plain = first_sent_pdu(&outputs);
-        assert!(!plain.windows(4).any(|w| w == ie), "non-cleartext IE leaked: {plain:02X?}");
+        assert!(
+            !plain.windows(4).any(|w| w == ie),
+            "non-cleartext IE leaked: {plain:02X?}"
+        );
 
         let mut off = MmOrchestrator::from_config(test_identity(), &config_with_racs(false));
         off.start_registration(RegistrationType::InitialRegistration);
         let full = off.last_registration_request.clone().expect("full request");
         assert_eq!(
-            RegistrationRequest::decode(&mut &full[3..]).unwrap().five_gmm_capability,
+            RegistrationRequest::decode(&mut &full[3..])
+                .unwrap()
+                .five_gmm_capability,
             None
         );
     }
@@ -5547,7 +5555,9 @@ mod tests {
     fn the_registration_accept_racs_ies_round_trip() {
         let mut plain = Vec::new();
         racs_accept(Some("123456"), Some(1)).encode(&mut plain);
-        assert!(plain.windows(5).any(|w| w == [0x67, 0x03, 0x21, 0x43, 0x65]));
+        assert!(plain
+            .windows(5)
+            .any(|w| w == [0x67, 0x03, 0x21, 0x43, 0x65]));
         assert!(plain.contains(&0xE1));
         let decoded = RegistrationAccept::decode(&mut &plain[3..]).unwrap();
         assert_eq!(decoded.ue_radio_capability_id.as_deref(), Some("123456"));
@@ -5585,14 +5595,23 @@ mod tests {
             .iter()
             .filter(|o| matches!(o, MmOutput::SendNasPdu(_)))
             .count();
-        assert!(sent >= 2, "Registration Complete and a new Registration Request: {outs:?}");
-        let req = orch.last_registration_request.clone().expect("re-registration");
+        assert!(
+            sent >= 2,
+            "Registration Complete and a new Registration Request: {outs:?}"
+        );
+        let req = orch
+            .last_registration_request
+            .clone()
+            .expect("re-registration");
         let decoded = RegistrationRequest::decode(&mut &req[3..]).unwrap();
         assert_eq!(
             decoded.registration_type.registration_type,
             RegistrationType::MobilityRegistrationUpdating
         );
-        assert_eq!(decoded.ue_radio_capability_id, None, "the deleted ID is not presented");
+        assert_eq!(
+            decoded.ue_radio_capability_id, None,
+            "the deleted ID is not presented"
+        );
     }
 
     /// §4.4.6: the ID is a NON-cleartext IE, so it must be absent from the plain

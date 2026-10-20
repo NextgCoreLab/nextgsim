@@ -48,8 +48,8 @@ use nextgsim_rrc::procedures::sidelink_ue_information::{SidelinkUeInformationPar
 use nextgsim_rrc::procedures::ue_capability::{
     decode_ue_radio_access_capability_information, encode_ue_capability_enquiry,
     encode_ue_radio_access_capability_information, parse_nr_capability_bands,
-    parse_nr_capability_redcap, RatType, UeCapabilityRatContainer,
-    UeCapabilityEnquiryParams, UeCapabilityInformationData,
+    parse_nr_capability_redcap, RatType, UeCapabilityEnquiryParams, UeCapabilityInformationData,
+    UeCapabilityRatContainer,
 };
 
 // The `0x06` UE-capability envelope and the `0x0E` secondary-cell envelope used to
@@ -1558,7 +1558,6 @@ impl RrcTask {
                 }
             }
         }
-
     }
 
     /// A UE radio capability from the core network (TS 38.413 §9.3.1.74), already
@@ -1571,11 +1570,12 @@ impl RrcTask {
                     ue_id,
                     containers.len()
                 );
-                self.apply_ue_capability_containers(ue_id, &containers).await;
+                self.apply_ue_capability_containers(ue_id, &containers)
+                    .await;
             }
-            Err(e) => warn!(
-                "UE[{ue_id}]: undecodable UE Radio Capability from the core network: {e}"
-            ),
+            Err(e) => {
+                warn!("UE[{ue_id}]: undecodable UE Radio Capability from the core network: {e}")
+            }
         }
     }
 

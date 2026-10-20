@@ -1937,7 +1937,9 @@ impl RegistrationAccept {
             }
         }
         if let Some(value) = self.ue_radio_capability_id_deletion {
-            buf.put_u8((registration_accept_iei::UE_RADIO_CAPABILITY_ID_DELETION << 4) | (value & 0x07));
+            buf.put_u8(
+                (registration_accept_iei::UE_RADIO_CAPABILITY_ID_DELETION << 4) | (value & 0x07),
+            );
         }
 
         // 6G extension IEs
