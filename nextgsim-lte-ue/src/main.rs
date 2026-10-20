@@ -39,7 +39,7 @@ async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let args = Args::parse();
-    let cfg = match nextgsim_lte_ue::config::load_and_validate(&args.config_file) {
+    let cfg = match nextgsim_lte_ue::config::load_with_env_and_validate(&args.config_file) {
         Ok(c) => c,
         Err(e) => {
             log::error!("{}: {e}", args.config_file);

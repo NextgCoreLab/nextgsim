@@ -1,0 +1,29 @@
+# nextgsim-lte-ue - LTE UE simulator (pre-built binary), nextgsim #186.
+#
+# Expects ./binaries/lte-ue:
+#   cargo build --release -p nextgsim-lte-ue --bin lte-ue
+#
+# The default bearer's PDN address goes on a TUN interface (lteuetun<EBI>,
+# lteuetun5 for the default bearer), which needs the container run with
+#   --cap-add NET_ADMIN --device /dev/net/tun
+# Without them the UE still attaches; only the TUN (and the ping) fails.
+# lte-ue-ping-check (scripts/lte-ue-ping-check.sh) asserts a 0%-loss ping
+# through the PDN once the bearer is up.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    iputils-ping \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY binaries/lte-ue /usr/local/bin/
+COPY scripts/lte-ue-ping-check.sh /usr/local/bin/lte-ue-ping-check
+COPY config/lte-ue.yaml /etc/nextgsim/lte-ue.yaml
+
+WORKDIR /etc/nextgsim
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["lte-ue"]
+CMD ["-c", "/etc/nextgsim/lte-ue.yaml"]

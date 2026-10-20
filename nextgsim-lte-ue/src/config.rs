@@ -164,6 +164,87 @@ pub fn load_and_validate(path: impl AsRef<Path>) -> Result<LteUeConfig, ConfigEr
     Ok(c)
 }
 
+/// Load a configuration file, apply the `NEXTGSIM_*` environment overrides (see
+/// [`apply_env_overrides`]), then validate the result.
+pub fn load_with_env_and_validate(path: impl AsRef<Path>) -> Result<LteUeConfig, ConfigError> {
+    let path = path.as_ref();
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut c: LteUeConfig = serde_yaml::from_str(&text)?;
+    apply_env_overrides(&mut c, |k| std::env::var(k).ok())?;
+    validate(&c)?;
+    Ok(c)
+}
+
+/// Override deployment-dependent LTE UE fields from environment variables, so
+/// one baked image config serves any test network (`Dockerfile.lte-ue-local`).
+///
+/// | Variable | Field(s) |
+/// |---|---|
+/// | `NEXTGSIM_UE_ENB_ADDR` | `enb_search_list` -- comma-separated `ip` or `ip:port` |
+/// | `NEXTGSIM_PLMN` | `plmn`, written `MCC-MNC` |
+/// | `NEXTGSIM_UE_IMSI` | `subscriber.imsi` |
+/// | `NEXTGSIM_UE_KEY` | `subscriber.key`, 32 hex digits |
+/// | `NEXTGSIM_UE_OPC` | `subscriber.op` with `op_type: Opc`, 32 hex digits |
+/// | `NEXTGSIM_UE_APN` | `subscriber.apn` |
+/// | `NEXTGSIM_UE_TUN_NAME` | `tun.name` (creates the `tun` section if absent) |
+///
+/// The subscriber variables need a `subscriber` section in the file to amend:
+/// the remaining USIM fields (SQN, EEA/EIA, PDN type) have no sensible
+/// defaults to invent, so an override without one is refused. `lookup` is
+/// injected so tests need not mutate the process environment.
+pub fn apply_env_overrides(
+    c: &mut LteUeConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    use nextgsim_common::env_override::{parse_endpoints, parse_hex16, parse_plmn};
+    let bad = |var: &str, e: String| ConfigError::Invalid(format!("{var}: {e}"));
+
+    if let Some(v) = lookup("NEXTGSIM_UE_ENB_ADDR") {
+        c.enb_search_list = parse_endpoints(&v, DEFAULT_RLS_PORT)
+            .map_err(|e| bad("NEXTGSIM_UE_ENB_ADDR", e))?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+    if let Some(v) = lookup("NEXTGSIM_PLMN") {
+        c.plmn = parse_plmn(v.trim()).map_err(|e| bad("NEXTGSIM_PLMN", e))?;
+    }
+    let sub_vars = [
+        "NEXTGSIM_UE_IMSI",
+        "NEXTGSIM_UE_KEY",
+        "NEXTGSIM_UE_OPC",
+        "NEXTGSIM_UE_APN",
+    ];
+    if let Some(var) = sub_vars.iter().find(|v| lookup(v).is_some()) {
+        let s = c.subscriber.as_mut().ok_or_else(|| {
+            bad(
+                var,
+                "the configuration file has no `subscriber` section to amend".into(),
+            )
+        })?;
+        if let Some(v) = lookup("NEXTGSIM_UE_IMSI") {
+            s.imsi = v.trim().to_string();
+        }
+        if let Some(v) = lookup("NEXTGSIM_UE_KEY") {
+            s.key = parse_hex16(v.trim()).map_err(|e| bad("NEXTGSIM_UE_KEY", e))?;
+        }
+        if let Some(v) = lookup("NEXTGSIM_UE_OPC") {
+            s.op = parse_hex16(v.trim()).map_err(|e| bad("NEXTGSIM_UE_OPC", e))?;
+            s.op_type = OpType::Opc;
+        }
+        if let Some(v) = lookup("NEXTGSIM_UE_APN") {
+            s.apn = Some(v.trim().to_string());
+        }
+    }
+    if let Some(v) = lookup("NEXTGSIM_UE_TUN_NAME") {
+        c.tun.get_or_insert_with(TunSettings::default).name = Some(v.trim().to_string());
+    }
+    Ok(())
+}
+
 /// Validate a configuration.
 pub fn validate(c: &LteUeConfig) -> Result<(), ConfigError> {
     let p = &c.plmn;
@@ -210,6 +291,87 @@ pub fn validate(c: &LteUeConfig) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn with_subscriber() -> LteUeConfig {
+        serde_yaml::from_str(
+            "plmn: { mcc: 999, mnc: 70, long_mnc: false }\nenb_search_list: [\"127.0.0.1\"]\n\
+             subscriber:\n  imsi: \"999700000000001\"\n  key: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]\n  \
+             op: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]\n  op_type: Op\n  sqn: 0\n  eea: [0]\n  eia: [1]\n  pdn_type: ipv4\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn env_overrides_set_the_deployment_fields() {
+        let mut c = with_subscriber();
+        apply_env_overrides(
+            &mut c,
+            env(&[
+                ("NEXTGSIM_UE_ENB_ADDR", "172.24.0.50"),
+                ("NEXTGSIM_PLMN", "001-01"),
+                ("NEXTGSIM_UE_IMSI", "001010000000002"),
+                ("NEXTGSIM_UE_KEY", "465B5CE8B199B49FAA5F0A2EE238A6BC"),
+                ("NEXTGSIM_UE_OPC", "E8ED289DEBA952E4283B54E88E6D834D"),
+                ("NEXTGSIM_UE_APN", "internet"),
+                ("NEXTGSIM_UE_TUN_NAME", "lteuetun0"),
+            ]),
+        )
+        .unwrap();
+        validate(&c).unwrap();
+        assert_eq!(
+            c.search_space().unwrap(),
+            vec!["172.24.0.50:4997".parse().unwrap()]
+        );
+        assert_eq!(c.plmn, Plmn::new(1, 1, false));
+        let s = c.subscriber.as_ref().unwrap();
+        assert_eq!(s.imsi, "001010000000002");
+        assert_eq!(s.key[0], 0x46);
+        assert_eq!(s.op[15], 0x4D);
+        assert_eq!(s.op_type, OpType::Opc);
+        assert_eq!(s.apn.as_deref(), Some("internet"));
+        assert_eq!(c.tun.as_ref().unwrap().name.as_deref(), Some("lteuetun0"));
+    }
+
+    #[test]
+    fn no_env_leaves_the_file_untouched() {
+        let mut c = with_subscriber();
+        let before = format!("{c:?}");
+        apply_env_overrides(&mut c, |_| None).unwrap();
+        assert_eq!(format!("{c:?}"), before);
+    }
+
+    #[test]
+    fn subscriber_override_needs_a_subscriber_section() {
+        let mut c = with_subscriber();
+        c.subscriber = None;
+        let err = apply_env_overrides(&mut c, env(&[("NEXTGSIM_UE_KEY", "00")])).unwrap_err();
+        assert!(err.to_string().contains("NEXTGSIM_UE_KEY"), "{err}");
+    }
+
+    #[test]
+    fn malformed_env_is_refused_naming_the_variable() {
+        for (var, val) in [
+            ("NEXTGSIM_UE_ENB_ADDR", "enb.local"),
+            ("NEXTGSIM_PLMN", "99970"),
+            ("NEXTGSIM_UE_KEY", "465B"),
+            ("NEXTGSIM_UE_OPC", "zz"),
+        ] {
+            let err = apply_env_overrides(&mut with_subscriber(), env(&[(var, val)])).unwrap_err();
+            assert!(err.to_string().contains(var), "{var}: {err}");
+        }
+        // A bad IMSI is caught by the same validation a bad file gets.
+        let mut c = with_subscriber();
+        apply_env_overrides(&mut c, env(&[("NEXTGSIM_UE_IMSI", "12ab")])).unwrap();
+        assert!(validate(&c).is_err());
+    }
 
     #[test]
     fn search_list_accepts_bare_ips_and_ports() {

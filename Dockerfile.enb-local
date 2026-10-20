@@ -1,0 +1,30 @@
+# nextgsim-enb - LTE eNodeB simulator (pre-built binary), nextgsim #186.
+#
+# Expects ./binaries/lte-enb, built WITH kernel SCTP (S1-MME is real SCTP,
+# TS 36.412 §7; the binary refuses to start without it):
+#   cargo build --release -p nextgsim-enb --features kernel-sctp --bin lte-enb
+#
+# The baked config/enb.yaml targets nextgcore's EPC compose network
+# (172.24.0.0/24); a compose file adjusts it through NEXTGSIM_ENB_* variables
+# (see nextgsim-enb/src/config.rs::apply_env_overrides) or mounts its own.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libsctp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY binaries/lte-enb /usr/local/bin/
+COPY config/enb.yaml /etc/nextgsim/enb.yaml
+
+WORKDIR /etc/nextgsim
+
+# RLS radio endpoint (UDP) and S1-U GTP-U (UDP, TS 29.281). S1-MME is an
+# outbound SCTP association to the MME, so nothing is exposed for it.
+EXPOSE 4997/udp
+EXPOSE 2152/udp
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["lte-enb"]
+CMD ["-c", "/etc/nextgsim/enb.yaml"]

@@ -492,14 +492,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build Rust binaries
-        # The Dockerfile.{gnb,ue}-local images expect ./binaries/nr-gnb and
-        # ./binaries/nr-ue to exist (binaries are NOT tracked in git — see
+        # The Dockerfile.{gnb,ue,enb,lte-ue}-local images expect ./binaries/nr-gnb,
+        # nr-ue, lte-enb and lte-ue to exist (binaries are NOT tracked in git — see
         # nextgcore DECISIONS.md). Build them here before the docker build.
+        #
+        # lte-enb needs kernel SCTP for S1-MME (TS 36.412 §7) and refuses to start
+        # without it, so it is built with the feature and libsctp-dev installed
+        # (#186 increment 5).
         run: |
+          sudo apt-get update && sudo apt-get install -y libsctp-dev
           cargo build --release --bin nr-gnb --bin nr-ue
+          cargo build --release -p nextgsim-enb --features kernel-sctp --bin lte-enb
+          cargo build --release -p nextgsim-lte-ue --bin lte-ue
           mkdir -p binaries
           cp target/release/nr-gnb binaries/
           cp target/release/nr-ue binaries/
+          cp target/release/lte-enb binaries/
+          cp target/release/lte-ue binaries/
 
       - name: Build gNB image
         run: |
@@ -508,6 +517,14 @@ jobs:
       - name: Build UE image
         run: |
           docker build -f Dockerfile.ue-local -t nextgsim/nr-ue:latest .
+
+      - name: Build LTE eNB image
+        run: |
+          docker build -f Dockerfile.enb-local -t nextgsim/lte-enb:latest .
+
+      - name: Build LTE UE image
+        run: |
+          docker build -f Dockerfile.lte-ue-local -t nextgsim/lte-ue:latest .
 
       # ASSERTS, rather than printing (#206, the same defect nextgcore #421 fixed
       # in its own image loop). This step used to be `docker images | grep
@@ -519,7 +536,8 @@ jobs:
         run: |
           set -euo pipefail
           missing=""
-          for image in nextgsim/nr-gnb:latest nextgsim/nr-ue:latest; do
+          for image in nextgsim/nr-gnb:latest nextgsim/nr-ue:latest \
+                       nextgsim/lte-enb:latest nextgsim/lte-ue:latest; do
             if ! docker image inspect "$image" >/dev/null 2>&1; then
               missing="${missing} ${image}"
             fi
@@ -529,7 +547,7 @@ jobs:
             docker images | grep nextgsim || true
             exit 1
           fi
-          echo "Both expected images present (nr-gnb, nr-ue)."
+          echo "All expected images present (nr-gnb, nr-ue, lte-enb, lte-ue)."
           docker images | grep nextgsim
 
   # ====================================================================

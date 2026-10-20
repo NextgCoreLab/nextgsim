@@ -29,7 +29,7 @@ fn init_logging() {
 async fn main() -> ExitCode {
     init_logging();
     let args = Args::parse();
-    let cfg = match nextgsim_enb::load_and_validate_enb_config(&args.config_file) {
+    let cfg = match nextgsim_enb::config::load_with_env_and_validate(&args.config_file) {
         Ok(c) => c,
         Err(e) => {
             log::error!("{}: {e}", args.config_file);
