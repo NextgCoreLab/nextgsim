@@ -297,7 +297,11 @@ pub fn encode_utf8_string(
         extended
     );
 
-    encode_string_common(data, lb, ub, is_extensible, value, extended, true)
+    // X.691 §30.6 / §10.9.3.3: UTF8String is not a known-multiplier type, so
+    // its size constraint and extensibility are not PER-visible: no extension
+    // bit, an unconstrained length in octets, octet-aligned content.
+    let _ = (lb, ub, is_extensible, extended);
+    encode_string_common(data, None, None, false, value, false, true)
 }
 
 /// Encode a UTCTime CharacterString Type.

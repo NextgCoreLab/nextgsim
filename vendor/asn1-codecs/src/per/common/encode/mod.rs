@@ -454,8 +454,10 @@ pub(crate) fn encode_string_common(
     // 16K octets.
     let bytes = value.as_bytes();
     let length = bytes.len();
+    // §30.5.7: alignment is decided by the type's upper bound, not the value.
+    let align_content = aligned && super::charstring_content_aligned(ub, 8);
     let emit = |data: &mut PerCodecData, start: usize, count: usize| {
-        if count > 2 && aligned {
+        if count > 0 && align_content {
             data.align();
         }
         data.append_bits(bytes[start..start + count].view_bits());
