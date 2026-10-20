@@ -27,9 +27,11 @@ name = "nextgsim_enb"
 path = "src/lib.rs"
 
 [dependencies]
+nextgsim-crypto.workspace = true
 nextgsim-common.workspace = true
 nextgsim-s1ap.workspace = true
 nextgsim-lte-rrc.workspace = true
+nextgsim-eps-nas.workspace = true
 nextgsim-pdcp.workspace = true
 nextgsim-rls.workspace = true
 bytes.workspace = true
@@ -49,6 +51,7 @@ serde_yaml.workspace = true
 # The in-process radio test drives the real LTE UE against this eNB over RLS.
 nextgsim-lte-ue.workspace = true
 nextgsim-lte-rrc.workspace = true
+nextgsim-eps-nas.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # The kernel-SCTP transport test opens a loopback SCTP listener.
 socket2.workspace = true

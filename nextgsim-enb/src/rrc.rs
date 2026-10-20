@@ -1,7 +1,31 @@
 //! The eNB's E-UTRA RRC: system information and UE contexts from RRC
 //! connection establishment (TS 36.331 §5.3.3) through NAS relay (§5.6.1,
-//! §5.6.2) to release (§5.3.8), tied to UE-associated S1AP (TS 36.413 §8.6,
-//! §8.3).
+//! §5.6.2), initial security activation (§5.3.4) and the RRC connection
+//! reconfiguration of Initial Context Setup (§5.3.5; TS 36.413 §8.3.1) to
+//! release (§5.3.8), tied to UE-associated S1AP (TS 36.413 §8.6, §8.3).
+//!
+//! # Initial Context Setup (TS 36.413 §8.3.1.2; TS 23.401 §5.3.2.1 steps 17-21)
+//!
+//! INITIAL CONTEXT SETUP REQUEST brings `K_eNB` and the UE's security
+//! capabilities. The eNB picks the highest-priority EIA and EEA of its own
+//! lists that the UE supports (TS 33.401 §7.2.4.2.1), derives `K_RRCint`,
+//! `K_RRCenc` and `K_UPenc` (Annex A.7), and runs the AS Security Mode Command
+//! with SRB1's PDCP switches set in the order of TS 33.401 §7.2.4.5. Once the
+//! UE completes it, an RRCConnectionReconfiguration sets up one DRB per E-RAB
+//! and carries the E-RABs' NAS-PDUs (the ATTACH ACCEPT); its completion is
+//! answered with INITIAL CONTEXT SETUP RESPONSE naming the eNB's S1-U
+//! endpoints. The DRBs' user plane (PDCP/RLC on RLS, GTP-U on S1-U) is
+//! increment 4: the TEIDs are allocated here, nothing yet listens on them.
+//!
+//! **Not done here, by decision:** SRB2. TS 36.331 §4.2.2 has E-UTRAN
+//! configure it after security activation and move NAS onto it, but RLS
+//! carries no logical channel identity to tell SRB1 from SRB2 (or a DRB) on
+//! DCCH; that mapping is the same RLS change the DRB user plane of increment 4
+//! needs, so both come together. Until then all DCCH traffic, NAS included,
+//! stays on SRB1. **UE Capability Enquiry** is not run either: over RLS no
+//! configuration this eNB sends depends on a UE capability, and forwarding one
+//! to the MME (UE CAPABILITY INFO INDICATION) needs the
+//! `EUTRA-InterNodeDefinitions` module the RRC codec does not generate yet.
 //!
 //! Pure: radio and S1 inputs in, [`Action`]s out. [`crate::radio`] owns the
 //! RLS socket and the S1-MME association and executes the actions.
@@ -14,16 +38,29 @@
 //! PDCP Data PDUs (TS 36.323 §6.2.2, via [`LteSrbPdcp`]).
 
 use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 
 use nextgsim_common::Plmn;
-use nextgsim_lte_rrc::msg::{self, CellInfo, InitialUeIdentity, MibInfo, PlmnId, Sib2Info};
+use nextgsim_crypto::eps_kdf::{derive_algorithm_key, EpsAlgorithmType};
+use nextgsim_lte_rrc::msg::{
+    self, CellInfo, DrbConfig, InitialUeIdentity, MibInfo, PlmnId, Sib2Info,
+};
+use nextgsim_pdcp::lte_srb::{DIRECTION_DOWNLINK, SRB1_BEARER};
 use nextgsim_pdcp::LteSrbPdcp;
 use nextgsim_rls::RrcChannel;
-use nextgsim_s1ap::codec::{self as s1codec, CauseRadioNetwork, S1AP_PDU};
+use nextgsim_s1ap::codec::{self as s1codec, Cause, CauseRadioNetwork, S1AP_PDU};
 
-use crate::config::EnbConfig;
+use crate::config::{AsSecurityConfig, EnbConfig};
 use crate::s1_task::NON_UE_ASSOCIATED_STREAM;
-use crate::s1ap_ue::{self, ReleaseIds, S1Inbound, UeLocation, MAX_ENB_UE_S1AP_ID};
+use crate::s1ap::DiagnosedIe;
+use crate::s1ap_ue::{
+    self, ErabSetup, ErabToSetup, InitialContextSetup, ReleaseIds, S1Inbound, UeLocation,
+    MAX_ENB_UE_S1AP_ID,
+};
+
+/// DRBs one RRCConnectionReconfiguration can add here: logical channel
+/// identities 3..=10 (TS 36.331 §6.3.2 `DRB-ToAddMod`).
+pub const MAX_DRBS: usize = 8;
 
 /// How many UE contexts the cell admits before answering RRCConnectionRequest
 /// with RRCConnectionReject (§5.3.3.8).
@@ -64,6 +101,48 @@ enum UeState {
     Connected,
 }
 
+/// An Initial Context Setup in progress (TS 36.413 §8.3.1.2).
+#[derive(Clone)]
+struct PendingIcs {
+    erabs: Vec<ErabToSetup>,
+    notify: Vec<DiagnosedIe>,
+    /// The ciphering algorithm and `K_RRCenc`, for switching on uplink
+    /// deciphering once SecurityModeComplete verifies (TS 33.401 §7.2.4.5).
+    rx_ciphering: (u8, [u8; 16]),
+    smc_transaction_id: u8,
+    reconfiguration_transaction_id: Option<u8>,
+    teids: Vec<(u8, u32)>,
+}
+
+impl std::fmt::Debug for PendingIcs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingIcs")
+            .field("erabs", &self.erabs)
+            .field("smc_transaction_id", &self.smc_transaction_id)
+            .field(
+                "reconfiguration_transaction_id",
+                &self.reconfiguration_transaction_id,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// AS security of a UE (TS 33.401 §7.2.4). Keys never printed.
+#[derive(Clone)]
+struct AsSecurity {
+    eea: u8,
+    eia: u8,
+    /// `K_UPenc`, for the DRBs' PDCP of increment 4.
+    #[allow(dead_code)]
+    k_up_enc: [u8; 16],
+}
+
+impl std::fmt::Debug for AsSecurity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EEA{}/EIA{} (keys redacted)", self.eea, self.eia)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UeContext {
     enb_ue_s1ap_id: u32,
@@ -75,6 +154,9 @@ struct UeContext {
     location: Option<UeLocation>,
     next_transaction_id: u8,
     pending_ul_nas: VecDeque<Vec<u8>>,
+    security: Option<AsSecurity>,
+    ics: Option<PendingIcs>,
+    drbs: Vec<DrbConfig>,
 }
 
 impl UeContext {
@@ -97,6 +179,9 @@ pub struct EnbRrc {
     by_enb_id: HashMap<u32, u32>,
     next_enb_ue_s1ap_id: u32,
     outbound_streams: u16,
+    security: AsSecurityConfig,
+    gtp_ip: IpAddr,
+    next_teid: u32,
 }
 
 fn to_rrc_plmn(p: &Plmn) -> PlmnId {
@@ -169,7 +254,27 @@ impl EnbRrc {
             by_enb_id: HashMap::new(),
             next_enb_ue_s1ap_id: 1,
             outbound_streams,
+            security: cfg.security.clone(),
+            gtp_ip: cfg.gtp_ip.unwrap_or(cfg.s1ap_ip),
+            next_teid: 1,
         }
+    }
+
+    /// The AS algorithms a UE context runs with, `(EEA, EIA)`, once its
+    /// security is active.
+    pub fn as_algorithms(&self, ue: u32) -> Option<(u8, u8)> {
+        self.ues
+            .get(&ue)
+            .and_then(|c| c.security.as_ref())
+            .map(|s| (s.eea, s.eia))
+    }
+
+    /// The DRBs configured for a UE.
+    pub fn drbs(&self, ue: u32) -> Vec<DrbConfig> {
+        self.ues
+            .get(&ue)
+            .map(|c| c.drbs.clone())
+            .unwrap_or_default()
     }
 
     /// Number of UE contexts.
@@ -295,13 +400,17 @@ impl EnbRrc {
             enb_ue_s1ap_id,
             mme_ue_s1ap_id: None,
             state: UeState::Connected,
-            // SRB1 is established when RRCConnectionSetup is sent (§5.3.3.4).
-            srb1: LteSrbPdcp::new(),
+            // SRB1 is established when RRCConnectionSetup is sent (§5.3.3.4);
+            // the eNB transmits downlink on it.
+            srb1: LteSrbPdcp::with_bearer(SRB1_BEARER, DIRECTION_DOWNLINK),
             identity,
             cause,
             location: None,
             next_transaction_id: 0,
             pending_ul_nas: VecDeque::new(),
+            security: None,
+            ics: None,
+            drbs: Vec::new(),
         };
         let transaction_id = ctx.next_tid();
         ctx.state = UeState::AwaitingSetupComplete { transaction_id };
@@ -331,9 +440,35 @@ impl EnbRrc {
             return vec![];
         };
         let sdu = match ctx.srb1.receive(pdcp_pdu) {
-            Ok((sdu, _count)) => sdu,
+            Ok(r) => r.sdu,
+            Err(nextgsim_pdcp::LteSrbPdcpError::IntegrityCheckFailed(_))
+                if ctx
+                    .ics
+                    .as_ref()
+                    .is_some_and(|i| i.reconfiguration_transaction_id.is_none()) =>
+            {
+                // TS 33.401 §7.2.4.5: a UE whose checks of the AS SMC fail
+                // replies with an UNPROTECTED SecurityModeFailure, so while the
+                // command is outstanding that one message is accepted without a
+                // MAC; anything else that fails verification is still dropped.
+                let Ok(r) = ctx.srb1.clone().receive_unprotected(pdcp_pdu) else {
+                    return vec![];
+                };
+                match msg::decode_ul_dcch(&r.sdu) {
+                    Ok(msg::UlDcch::SecurityModeFailure { transaction_id }) => {
+                        let _ = ctx.srb1.receive_unprotected(pdcp_pdu);
+                        return self.on_security_mode_failure(ue, transaction_id);
+                    }
+                    _ => {
+                        log::warn!("UE {ue}: SRB1 integrity verification failed; discarded");
+                        return vec![];
+                    }
+                }
+            }
             Err(e) => {
-                log::warn!("UE {ue}: SRB1 PDCP: {e}");
+                // TS 36.323 §5.7: an integrity failure is indicated to RRC and
+                // the PDU discarded.
+                log::warn!("UE {ue}: SRB1 PDCP: {e}; discarded");
                 return vec![];
             }
         };
@@ -351,6 +486,15 @@ impl EnbRrc {
                 nas,
             } => self.on_setup_complete(ue, transaction_id, selected_plmn_index, nas),
             msg::UlDcch::InformationTransfer { nas } => self.on_ul_nas(ue, nas),
+            msg::UlDcch::SecurityModeComplete { transaction_id } => {
+                self.on_security_mode_complete(ue, transaction_id)
+            }
+            msg::UlDcch::SecurityModeFailure { transaction_id } => {
+                self.on_security_mode_failure(ue, transaction_id)
+            }
+            msg::UlDcch::ReconfigurationComplete { transaction_id } => {
+                self.on_reconfiguration_complete(ue, transaction_id)
+            }
             msg::UlDcch::Unsupported => {
                 log::info!("UE {ue}: UL-DCCH message not supported in this build, ignored");
                 vec![]
@@ -486,6 +630,14 @@ impl EnbRrc {
                 acts
             }
             S1Inbound::ReleaseCommand { ids } => self.on_release_command(ids),
+            S1Inbound::InitialContextSetup(ics) => self.on_initial_context_setup(*ics),
+            S1Inbound::InitialContextSetupFailure {
+                enb_ue_s1ap_id,
+                pdu,
+            } => vec![Action::S1 {
+                stream: self.ue_stream(enb_ue_s1ap_id),
+                pdu,
+            }],
             S1Inbound::ErrorIndication(pdu) => vec![Action::S1 {
                 stream: NON_UE_ASSOCIATED_STREAM,
                 pdu,
@@ -543,6 +695,287 @@ impl EnbRrc {
             acts.extend(self.on_ul_nas(ue, nas));
         }
         acts
+    }
+
+    fn ics_failure(&self, mme: u32, enb: u32, cause: Cause) -> Vec<Action> {
+        encode_s1(&s1ap_ue::build_initial_context_setup_failure(
+            mme,
+            enb,
+            cause,
+            &[],
+        ))
+        .map(|pdu| {
+            vec![Action::S1 {
+                stream: self.ue_stream(enb),
+                pdu,
+            }]
+        })
+        .unwrap_or_default()
+    }
+
+    /// INITIAL CONTEXT SETUP REQUEST (TS 36.413 §8.3.1.2): take the security
+    /// context into use with the AS Security Mode Command (TS 36.331 §5.3.4).
+    fn on_initial_context_setup(&mut self, ics: InitialContextSetup) -> Vec<Action> {
+        let (mme, enb) = (ics.mme_ue_s1ap_id, ics.enb_ue_s1ap_id);
+        let Some(&ue) = self.by_enb_id.get(&enb) else {
+            log::warn!("INITIAL CONTEXT SETUP REQUEST for unknown eNB UE S1AP ID {enb}");
+            return s1ap_ue::unknown_enb_ue_s1ap_id_error(mme, enb)
+                .map(|pdu| {
+                    vec![Action::S1 {
+                        stream: NON_UE_ASSOCIATED_STREAM,
+                        pdu,
+                    }]
+                })
+                .unwrap_or_default();
+        };
+        let ctx = self.ues.get(&ue).expect("by_enb_id and ues agree");
+        if ctx.mme_ue_s1ap_id.is_some_and(|m| m != mme) {
+            log::warn!("UE {ue}: INITIAL CONTEXT SETUP for MME UE S1AP ID {mme}, stored differs");
+            return s1ap_ue::unknown_enb_ue_s1ap_id_error(mme, enb)
+                .map(|pdu| {
+                    vec![Action::S1 {
+                        stream: self.ue_stream(enb),
+                        pdu,
+                    }]
+                })
+                .unwrap_or_default();
+        }
+        if ctx.security.is_some() || ctx.ics.is_some() || ctx.state != UeState::Connected {
+            log::warn!("UE {ue}: INITIAL CONTEXT SETUP while one is active or in progress");
+            return self.ics_failure(
+                mme,
+                enb,
+                Cause::RadioNetwork(CauseRadioNetwork(CauseRadioNetwork::UNSPECIFIED)),
+            );
+        }
+        if ics.erabs.is_empty() || ics.erabs.len() > MAX_DRBS {
+            log::warn!(
+                "UE {ue}: {} E-RABs; this eNB sets up 1..={MAX_DRBS}",
+                ics.erabs.len()
+            );
+            return self.ics_failure(
+                mme,
+                enb,
+                Cause::RadioNetwork(CauseRadioNetwork(
+                    CauseRadioNetwork::RADIO_RESOURCES_NOT_AVAILABLE,
+                )),
+            );
+        }
+        // TS 33.401 §7.2.4.2.1: the highest-priority algorithm of the eNB's
+        // list that is also in the UE's security capabilities.
+        let eia = self
+            .security
+            .integrity
+            .iter()
+            .copied()
+            .find(|a| ics.ue_supports_eia(*a));
+        let eea = self
+            .security
+            .ciphering
+            .iter()
+            .copied()
+            .find(|a| ics.ue_supports_eea(*a));
+        let (Some(eia), Some(eea)) = (eia, eea) else {
+            log::warn!(
+                "UE {ue}: no AS algorithm in common (UE EEA {:#06x}, EIA {:#06x})",
+                ics.eea_bitmap,
+                ics.eia_bitmap
+            );
+            return self.ics_failure(
+                mme,
+                enb,
+                Cause::RadioNetwork(CauseRadioNetwork(
+                    CauseRadioNetwork::ENCRYPTION_AND_OR_INTEGRITY_PROTECTION_ALGORITHMS_NOT_SUPPORTED,
+                )),
+            );
+        };
+        let k_enb = ics.security_key;
+        let k_rrc_int = derive_algorithm_key(&k_enb, EpsAlgorithmType::RrcInt, eia);
+        let k_rrc_enc = derive_algorithm_key(&k_enb, EpsAlgorithmType::RrcEnc, eea);
+        let k_up_enc = derive_algorithm_key(&k_enb, EpsAlgorithmType::UpEnc, eea);
+        let ctx = self.ues.get_mut(&ue).expect("present");
+        ctx.mme_ue_s1ap_id = Some(mme);
+        let tid = ctx.next_tid();
+        let smc = match msg::encode_security_mode_command(tid, eea, eia) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("cannot encode SecurityModeCommand: {e}");
+                return vec![];
+            }
+        };
+        // TS 33.401 §7.2.4.5: the command is integrity protected; uplink is
+        // verified from the complete on; downlink ciphering starts after the
+        // command is sent; uplink deciphering after the complete verifies.
+        if let Err(e) = ctx
+            .srb1
+            .activate_tx_integrity(eia, k_rrc_int)
+            .and_then(|()| ctx.srb1.activate_rx_integrity(eia, k_rrc_int))
+        {
+            log::error!("UE {ue}: {e}");
+            return vec![];
+        }
+        let (pdcp, _) = ctx.srb1.transmit(&smc);
+        if let Err(e) = ctx.srb1.activate_tx_ciphering(eea, k_rrc_enc) {
+            log::error!("UE {ue}: {e}");
+        }
+        ctx.security = Some(AsSecurity { eea, eia, k_up_enc });
+        log::info!(
+            "UE {ue}: INITIAL CONTEXT SETUP REQUEST ({} E-RAB(s)); SecurityModeCommand EEA{eea}/EIA{eia}",
+            ics.erabs.len()
+        );
+        ctx.ics = Some(PendingIcs {
+            erabs: ics.erabs,
+            notify: ics.notify,
+            rx_ciphering: (eea, k_rrc_enc),
+            smc_transaction_id: tid,
+            reconfiguration_transaction_id: None,
+            teids: Vec::new(),
+        });
+        vec![Action::Rrc {
+            ue,
+            channel: RrcChannel::DlDcch,
+            pdu: pdcp,
+        }]
+    }
+
+    fn on_security_mode_complete(&mut self, ue: u32, transaction_id: u8) -> Vec<Action> {
+        let Some(ctx) = self.ues.get_mut(&ue) else {
+            return vec![];
+        };
+        let Some(ics) = ctx.ics.as_mut() else {
+            log::warn!("UE {ue}: SecurityModeComplete with no security activation running");
+            return vec![];
+        };
+        if ics.smc_transaction_id != transaction_id || ics.reconfiguration_transaction_id.is_some()
+        {
+            log::warn!("UE {ue}: SecurityModeComplete (transaction {transaction_id}) not expected");
+            return vec![];
+        }
+        // It passed PDCP integrity verification to get here.
+        let (eea, k) = ics.rx_ciphering;
+        if let Err(e) = ctx.srb1.activate_rx_ciphering(eea, k) {
+            log::error!("UE {ue}: {e}");
+            return vec![];
+        }
+        let mut drbs = Vec::new();
+        let mut nas = Vec::new();
+        let mut teids = Vec::new();
+        for (i, e) in ics.erabs.iter().enumerate() {
+            drbs.push(DrbConfig {
+                eps_bearer_identity: e.e_rab_id,
+                drb_identity: i as u8 + 1,
+                logical_channel_identity: i as u8 + 3,
+            });
+            if let Some(n) = &e.nas {
+                nas.push(n.clone());
+            }
+            teids.push(e.e_rab_id);
+        }
+        let teids: Vec<(u8, u32)> = teids
+            .into_iter()
+            .map(|e| {
+                let t = self.next_teid;
+                self.next_teid = self.next_teid.wrapping_add(1).max(1);
+                (e, t)
+            })
+            .collect();
+        let ctx = self.ues.get_mut(&ue).expect("present");
+        let ics = ctx.ics.as_mut().expect("present");
+        ics.teids = teids;
+        let tid = {
+            let t = ctx.next_transaction_id;
+            ctx.next_transaction_id = (t + 1) & 3;
+            t
+        };
+        ics.reconfiguration_transaction_id = Some(tid);
+        let reconf = match msg::encode_rrc_connection_reconfiguration(tid, &drbs, &nas) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("cannot encode RRCConnectionReconfiguration: {e}");
+                return vec![];
+            }
+        };
+        log::info!(
+            "UE {ue}: SecurityModeComplete; AS security active. RRCConnectionReconfiguration: {} DRB(s), {} NAS PDU(s)",
+            drbs.len(),
+            nas.len()
+        );
+        ctx.drbs = drbs;
+        let (pdcp, _) = ctx.srb1.transmit(&reconf);
+        vec![Action::Rrc {
+            ue,
+            channel: RrcChannel::DlDcch,
+            pdu: pdcp,
+        }]
+    }
+
+    fn on_security_mode_failure(&mut self, ue: u32, transaction_id: u8) -> Vec<Action> {
+        let Some(ctx) = self.ues.get_mut(&ue) else {
+            return vec![];
+        };
+        if ctx.ics.as_ref().map(|i| i.smc_transaction_id) != Some(transaction_id) {
+            return vec![];
+        }
+        // TS 36.331 §5.3.4.3: the UE continues without security; so does SRB1.
+        log::warn!("UE {ue}: SecurityModeFailure; INITIAL CONTEXT SETUP FAILURE");
+        ctx.srb1.deactivate_security();
+        ctx.security = None;
+        ctx.ics = None;
+        let (Some(mme), enb) = (ctx.mme_ue_s1ap_id, ctx.enb_ue_s1ap_id) else {
+            return vec![];
+        };
+        self.ics_failure(
+            mme,
+            enb,
+            Cause::RadioNetwork(CauseRadioNetwork(
+                CauseRadioNetwork::FAILURE_IN_RADIO_INTERFACE_PROCEDURE,
+            )),
+        )
+    }
+
+    fn on_reconfiguration_complete(&mut self, ue: u32, transaction_id: u8) -> Vec<Action> {
+        let Some(ctx) = self.ues.get_mut(&ue) else {
+            return vec![];
+        };
+        let Some(ics) = ctx.ics.as_ref() else {
+            log::info!("UE {ue}: RRCConnectionReconfigurationComplete");
+            return vec![];
+        };
+        if ics.reconfiguration_transaction_id != Some(transaction_id) {
+            log::warn!("UE {ue}: RRCConnectionReconfigurationComplete (transaction {transaction_id}) not expected");
+            return vec![];
+        }
+        let ics = ctx.ics.take().expect("checked");
+        let (Some(mme), enb) = (ctx.mme_ue_s1ap_id, ctx.enb_ue_s1ap_id) else {
+            return vec![];
+        };
+        let gtp_ip = self.gtp_ip;
+        let erabs: Vec<ErabSetup> = ics
+            .teids
+            .iter()
+            .map(|(e, t)| ErabSetup {
+                e_rab_id: *e,
+                address: gtp_ip,
+                teid: *t,
+            })
+            .collect();
+        log::info!(
+            "UE {ue}: RRCConnectionReconfigurationComplete; INITIAL CONTEXT SETUP RESPONSE ({} E-RAB(s))",
+            erabs.len()
+        );
+        encode_s1(&s1ap_ue::build_initial_context_setup_response(
+            mme,
+            enb,
+            &erabs,
+            &ics.notify,
+        ))
+        .map(|pdu| {
+            vec![Action::S1 {
+                stream: self.ue_stream(enb),
+                pdu,
+            }]
+        })
+        .unwrap_or_default()
     }
 
     fn on_release_command(&mut self, ids: ReleaseIds) -> Vec<Action> {

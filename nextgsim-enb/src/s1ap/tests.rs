@@ -19,6 +19,8 @@ pub(crate) fn cfg() -> EnbConfig {
         s1_setup_retry_secs: 10,
         s1_setup_response_timeout_ms: 5000,
         radio: Default::default(),
+        security: Default::default(),
+        gtp_ip: None,
     }
 }
 

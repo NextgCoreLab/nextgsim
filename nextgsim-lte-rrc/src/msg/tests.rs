@@ -234,3 +234,99 @@ fn rrc_connection_release_round_trips() {
     assert_eq!(decode_dl_dcch(&bytes).unwrap(), DlDcch::ConnectionRelease);
     assert!(encode_rrc_connection_release(4).is_err());
 }
+
+/// ```text
+/// DL-DCCH-MessageType  CHOICE{c1, messageClassExtension}    1 bit  0
+/// c1                   CHOICE of 16                         4 bits 0110 securityModeCommand (6)
+/// rrc-TransactionIdentifier INTEGER (0..3)                  2 bits 00
+/// criticalExtensions   CHOICE{c1, future}                   1 bit  0
+/// c1                   CHOICE{r8, spare3, spare2, spare1}   2 bits 00
+/// r8-IEs preamble      nonCriticalExtension absent          1 bit  0
+/// SecurityConfigSMC    extension bit (SEQUENCE {..., ...})  1 bit  0
+/// cipheringAlgorithm   ENUMERATED {8, ...}: ext bit + 3     4 bits 0 010 eea2
+/// integrityProtAlgorithm ENUMERATED {8, ...}: ext bit + 3   4 bits 0 010 eia2
+/// = 0 0110 00 0 | 00 0 0 0010 | 0010 + pad 0000
+/// = 30 02 20
+/// ```
+const GOLDEN_SECURITY_MODE_COMMAND: [u8; 3] = [0x30, 0x02, 0x20];
+
+/// ```text
+/// UL-DCCH-MessageType  CHOICE{c1, messageClassExtension}    1 bit  0
+/// c1                   CHOICE of 16                         4 bits 0101 securityModeComplete (5)
+/// rrc-TransactionIdentifier                                 2 bits 01
+/// criticalExtensions   CHOICE{r8, future}                   1 bit  0
+/// r8-IEs preamble      nonCriticalExtension absent          1 bit  0
+/// = 0 0101 01 0 | 0 + pad 0000000
+/// = 2A 00
+/// ```
+const GOLDEN_SECURITY_MODE_COMPLETE: [u8; 2] = [0x2A, 0x00];
+
+/// The same layout with c1 index 2 (rrcConnectionReconfigurationComplete)
+/// and transaction 3: 0 0010 11 0 | 0 -> 16 00.
+const GOLDEN_RECONFIGURATION_COMPLETE: [u8; 2] = [0x16, 0x00];
+
+#[test]
+fn security_mode_command_matches_x691_golden_and_round_trips() {
+    let b = encode_security_mode_command(0, 2, 2).unwrap();
+    assert_eq!(b, GOLDEN_SECURITY_MODE_COMMAND);
+    for eea in 0..=3 {
+        for eia in 0..=3 {
+            let b = encode_security_mode_command(2, eea, eia).unwrap();
+            assert_eq!(
+                decode_dl_dcch(&b).unwrap(),
+                DlDcch::SecurityModeCommand {
+                    transaction_id: 2,
+                    eea,
+                    eia
+                }
+            );
+        }
+    }
+    assert!(encode_security_mode_command(0, 4, 2).is_err());
+}
+
+#[test]
+fn security_mode_complete_and_failure_and_reconfiguration_complete() {
+    let c = encode_security_mode_complete(1).unwrap();
+    assert_eq!(c, GOLDEN_SECURITY_MODE_COMPLETE);
+    assert_eq!(
+        decode_ul_dcch(&c).unwrap(),
+        UlDcch::SecurityModeComplete { transaction_id: 1 }
+    );
+    let f = encode_security_mode_failure(0).unwrap();
+    assert_eq!(
+        decode_ul_dcch(&f).unwrap(),
+        UlDcch::SecurityModeFailure { transaction_id: 0 }
+    );
+    let r = encode_rrc_connection_reconfiguration_complete(3).unwrap();
+    assert_eq!(r, GOLDEN_RECONFIGURATION_COMPLETE);
+    assert_eq!(
+        decode_ul_dcch(&r).unwrap(),
+        UlDcch::ReconfigurationComplete { transaction_id: 3 }
+    );
+}
+
+#[test]
+fn reconfiguration_carries_the_drb_and_the_nas_in_order() {
+    let drb = DrbConfig {
+        eps_bearer_identity: 5,
+        drb_identity: 1,
+        logical_channel_identity: 3,
+    };
+    let nas = vec![vec![0x27, 1, 2, 3, 4, 5, 0x07, 0x42], vec![0x07, 0x61]];
+    let b = encode_rrc_connection_reconfiguration(1, &[drb], &nas).unwrap();
+    assert_eq!(
+        decode_dl_dcch(&b).unwrap(),
+        DlDcch::ConnectionReconfiguration(Reconfiguration {
+            transaction_id: 1,
+            drbs: vec![drb],
+            nas,
+            mobility_control: false,
+        })
+    );
+    let bad = DrbConfig {
+        logical_channel_identity: 2,
+        ..drb
+    };
+    assert!(encode_rrc_connection_reconfiguration(1, &[bad], &[]).is_err());
+}

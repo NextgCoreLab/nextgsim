@@ -3,7 +3,10 @@
 //!
 //! Scope is RRC connection establishment and NAS transfer (nextgsim #186,
 //! increment 2): system information (§5.2), RRC connection establishment
-//! (§5.3.3) and DL/UL information transfer (§5.6.1, §5.6.2). Every builder
+//! (§5.3.3) and DL/UL information transfer (§5.6.1, §5.6.2); and from
+//! increment 3, initial security activation (§5.3.4) and the RRC connection
+//! reconfiguration that sets up the default bearer's DRB and carries the
+//! ATTACH ACCEPT (§5.3.5). Every builder
 //! encodes the message's *logical channel* PDU (`BCCH-BCH-Message`,
 //! `DL-CCCH-Message`, ...), which is what TS 36.331 §6.2.1 defines as the unit
 //! RRC hands to the lower layers.
@@ -965,6 +968,21 @@ pub enum UlDcch {
         /// `dedicatedInfoNAS`.
         nas: Vec<u8>,
     },
+    /// SecurityModeComplete (§5.3.4.3).
+    SecurityModeComplete {
+        /// `rrc-TransactionIdentifier`.
+        transaction_id: u8,
+    },
+    /// SecurityModeFailure (§5.3.4.3).
+    SecurityModeFailure {
+        /// `rrc-TransactionIdentifier`.
+        transaction_id: u8,
+    },
+    /// RRCConnectionReconfigurationComplete (§5.3.5.3).
+    ReconfigurationComplete {
+        /// `rrc-TransactionIdentifier`.
+        transaction_id: u8,
+    },
     /// A message this build does not handle.
     Unsupported,
 }
@@ -997,6 +1015,17 @@ pub fn decode_ul_dcch(bytes: &[u8]) -> Result<UlDcch, RrcMsgError> {
             },
             _ => UlDcch::Unsupported,
         },
+        UL_DCCH_MessageType_c1::SecurityModeComplete(c) => UlDcch::SecurityModeComplete {
+            transaction_id: c.rrc_transaction_identifier.0,
+        },
+        UL_DCCH_MessageType_c1::SecurityModeFailure(f) => UlDcch::SecurityModeFailure {
+            transaction_id: f.rrc_transaction_identifier.0,
+        },
+        UL_DCCH_MessageType_c1::RrcConnectionReconfigurationComplete(c) => {
+            UlDcch::ReconfigurationComplete {
+                transaction_id: c.rrc_transaction_identifier.0,
+            }
+        }
         _ => UlDcch::Unsupported,
     })
 }
@@ -1063,6 +1092,17 @@ pub enum DlDcch {
     },
     /// RRCConnectionRelease.
     ConnectionRelease,
+    /// SecurityModeCommand (§5.3.4).
+    SecurityModeCommand {
+        /// `rrc-TransactionIdentifier`.
+        transaction_id: u8,
+        /// `cipheringAlgorithm` (EEA identity).
+        eea: u8,
+        /// `integrityProtAlgorithm` (EIA identity).
+        eia: u8,
+    },
+    /// RRCConnectionReconfiguration (§5.3.5).
+    ConnectionReconfiguration(Reconfiguration),
     /// A message this build does not handle.
     Unsupported,
 }
@@ -1087,7 +1127,283 @@ pub fn decode_dl_dcch(bytes: &[u8]) -> Result<DlDcch, RrcMsgError> {
         DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcConnectionRelease(_)) => {
             DlDcch::ConnectionRelease
         }
+        DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::SecurityModeCommand(c)) => {
+            match c.critical_extensions {
+                SecurityModeCommandCriticalExtensions::C1(
+                    SecurityModeCommandCriticalExtensions_c1::SecurityModeCommand_r8(r8),
+                ) => {
+                    let a = r8.security_config_smc.security_algorithm_config;
+                    DlDcch::SecurityModeCommand {
+                        transaction_id: c.rrc_transaction_identifier.0,
+                        eea: a.ciphering_algorithm.0,
+                        eia: a.integrity_prot_algorithm.0,
+                    }
+                }
+                _ => DlDcch::Unsupported,
+            }
+        }
+        DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcConnectionReconfiguration(r)) => match r
+            .critical_extensions
+        {
+            RRCConnectionReconfigurationCriticalExtensions::C1(
+                RRCConnectionReconfigurationCriticalExtensions_c1::RrcConnectionReconfiguration_r8(
+                    r8,
+                ),
+            ) => DlDcch::ConnectionReconfiguration(Reconfiguration {
+                transaction_id: r.rrc_transaction_identifier.0,
+                drbs: r8
+                    .radio_resource_config_dedicated
+                    .and_then(|d| d.drb_to_add_mod_list)
+                    .map(|l| {
+                        l.0.into_iter()
+                            .map(|d| DrbConfig {
+                                eps_bearer_identity: d.eps_bearer_identity.map_or(0, |e| e.0),
+                                drb_identity: d.drb_identity.0,
+                                logical_channel_identity: d
+                                    .logical_channel_identity
+                                    .map_or(0, |l| l.0),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                nas: r8
+                    .dedicated_info_nas_list
+                    .map(|l| l.0.into_iter().map(|n| n.0).collect())
+                    .unwrap_or_default(),
+                mobility_control: r8.mobility_control_info.is_some(),
+            }),
+            _ => DlDcch::Unsupported,
+        },
         _ => DlDcch::Unsupported,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Security activation and RRC connection reconfiguration (§5.3.4, §5.3.5)
+// ---------------------------------------------------------------------------
+
+fn check_tid(transaction_id: u8) -> Result<(), RrcMsgError> {
+    if transaction_id > 3 {
+        return Err(RrcMsgError::Invalid("rrc-TransactionIdentifier > 3".into()));
+    }
+    Ok(())
+}
+
+/// Encode a `DL-DCCH-Message` carrying SecurityModeCommand (§5.3.4.2) with
+/// the selected EEA (`cipheringAlgorithm`) and EIA (`integrityProtAlgorithm`)
+/// identities, 0..3.
+pub fn encode_security_mode_command(
+    transaction_id: u8,
+    eea: u8,
+    eia: u8,
+) -> Result<Vec<u8>, RrcMsgError> {
+    check_tid(transaction_id)?;
+    if eea > 3 || eia > 3 {
+        return Err(RrcMsgError::Invalid(format!("EEA{eea} / EIA{eia}")));
+    }
+    let smc = SecurityModeCommand {
+        rrc_transaction_identifier: RRC_TransactionIdentifier(transaction_id),
+        critical_extensions: SecurityModeCommandCriticalExtensions::C1(
+            SecurityModeCommandCriticalExtensions_c1::SecurityModeCommand_r8(
+                SecurityModeCommand_r8_IEs {
+                    security_config_smc: SecurityConfigSMC {
+                        security_algorithm_config: SecurityAlgorithmConfig {
+                            ciphering_algorithm: CipheringAlgorithm_r12(eea),
+                            integrity_prot_algorithm: SecurityAlgorithmConfigIntegrityProtAlgorithm(
+                                eia,
+                            ),
+                        },
+                    },
+                    non_critical_extension: None,
+                },
+            ),
+        ),
+    };
+    enc(&DL_DCCH_Message {
+        message: DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::SecurityModeCommand(smc)),
+    })
+}
+
+/// Encode a `UL-DCCH-Message` carrying SecurityModeComplete (§5.3.4.3).
+pub fn encode_security_mode_complete(transaction_id: u8) -> Result<Vec<u8>, RrcMsgError> {
+    check_tid(transaction_id)?;
+    let c = SecurityModeComplete {
+        rrc_transaction_identifier: RRC_TransactionIdentifier(transaction_id),
+        critical_extensions: SecurityModeCompleteCriticalExtensions::SecurityModeComplete_r8(
+            SecurityModeComplete_r8_IEs {
+                non_critical_extension: None,
+            },
+        ),
+    };
+    enc(&UL_DCCH_Message {
+        message: UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::SecurityModeComplete(c)),
+    })
+}
+
+/// Encode a `UL-DCCH-Message` carrying SecurityModeFailure (§5.3.4.3).
+pub fn encode_security_mode_failure(transaction_id: u8) -> Result<Vec<u8>, RrcMsgError> {
+    check_tid(transaction_id)?;
+    let f = SecurityModeFailure {
+        rrc_transaction_identifier: RRC_TransactionIdentifier(transaction_id),
+        critical_extensions: SecurityModeFailureCriticalExtensions::SecurityModeFailure_r8(
+            SecurityModeFailure_r8_IEs {
+                non_critical_extension: None,
+            },
+        ),
+    };
+    enc(&UL_DCCH_Message {
+        message: UL_DCCH_MessageType::C1(UL_DCCH_MessageType_c1::SecurityModeFailure(f)),
+    })
+}
+
+/// One DRB of an RRCConnectionReconfiguration (§6.3.2 DRB-ToAddMod).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrbConfig {
+    /// `eps-BearerIdentity` (0..15): the E-RAB ID of the EPS bearer it carries.
+    pub eps_bearer_identity: u8,
+    /// `drb-Identity` (1..32).
+    pub drb_identity: u8,
+    /// `logicalChannelIdentity` (3..10).
+    pub logical_channel_identity: u8,
+}
+
+/// A decoded RRCConnectionReconfiguration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reconfiguration {
+    /// `rrc-TransactionIdentifier`.
+    pub transaction_id: u8,
+    /// DRBs to add (`drb-ToAddModList`).
+    pub drbs: Vec<DrbConfig>,
+    /// `dedicatedInfoNASList`, in order.
+    pub nas: Vec<Vec<u8>>,
+    /// Whether `mobilityControlInfo` is present (a handover).
+    pub mobility_control: bool,
+}
+
+/// The DRB-ToAddMod for one EPS bearer: PDCP with 12-bit SN over RLC AM and
+/// no header compression -- `nextgsim` advertises no ROHC profile -- and the
+/// RLC AM and logical channel parameters of a default (QCI 9) bearer.
+///
+/// The values are this eNB's choices, not defaults of the specification (DRBs
+/// have none, §9.2.1): `t-PollRetransmit` 45 ms, `pollPDU`/`pollByte`
+/// infinity, `maxRetxThreshold` 4, `t-Reordering` 35 ms, `t-StatusProhibit`
+/// 0 ms, PDCP `discardTimer` infinity with status reports, logical channel
+/// priority 13 in group 3, PBR 8 kbit/s with a 100 ms bucket.
+fn drb_to_add_mod(d: &DrbConfig) -> DRB_ToAddMod {
+    DRB_ToAddMod {
+        eps_bearer_identity: Some(DRB_ToAddModEps_BearerIdentity(d.eps_bearer_identity)),
+        drb_identity: DRB_Identity(d.drb_identity),
+        pdcp_config: Some(PDCP_Config {
+            discard_timer: Some(PDCP_ConfigDiscardTimer(PDCP_ConfigDiscardTimer::INFINITY)),
+            rlc_am: Some(PDCP_ConfigRlc_AM {
+                status_report_required: PDCP_ConfigRlc_AMStatusReportRequired(true),
+            }),
+            rlc_um: None,
+            header_compression: PDCP_ConfigHeaderCompression::NotUsed(
+                PDCP_ConfigHeaderCompression_notUsed,
+            ),
+        }),
+        rlc_config: Some(RLC_Config::Am(RLC_Config_am {
+            ul_am_rlc: UL_AM_RLC {
+                t_poll_retransmit: T_PollRetransmit(T_PollRetransmit::MS45),
+                poll_pdu: PollPDU(PollPDU::P_INFINITY),
+                poll_byte: PollByte(PollByte::K_BINFINITY),
+                max_retx_threshold: UL_AM_RLCMaxRetxThreshold(UL_AM_RLCMaxRetxThreshold::T4),
+            },
+            dl_am_rlc: DL_AM_RLC {
+                t_reordering: T_Reordering(T_Reordering::MS35),
+                t_status_prohibit: T_StatusProhibit(T_StatusProhibit::MS0),
+            },
+        })),
+        logical_channel_identity: Some(DRB_ToAddModLogicalChannelIdentity(
+            d.logical_channel_identity,
+        )),
+        logical_channel_config: Some(LogicalChannelConfig {
+            ul_specific_parameters: Some(LogicalChannelConfigUl_SpecificParameters {
+                priority: LogicalChannelConfigUl_SpecificParametersPriority(13),
+                prioritised_bit_rate: LogicalChannelConfigUl_SpecificParametersPrioritisedBitRate(
+                    LogicalChannelConfigUl_SpecificParametersPrioritisedBitRate::K_BPS8,
+                ),
+                bucket_size_duration: LogicalChannelConfigUl_SpecificParametersBucketSizeDuration(
+                    LogicalChannelConfigUl_SpecificParametersBucketSizeDuration::MS100,
+                ),
+                logical_channel_group: Some(
+                    LogicalChannelConfigUl_SpecificParametersLogicalChannelGroup(3),
+                ),
+            }),
+        }),
+    }
+}
+
+/// Encode a `DL-DCCH-Message` carrying RRCConnectionReconfiguration
+/// (§5.3.5.2) that adds `drbs` and carries `nas` in `dedicatedInfoNASList`
+/// (1..maxDRB = 11 entries, §6.2.2).
+pub fn encode_rrc_connection_reconfiguration(
+    transaction_id: u8,
+    drbs: &[DrbConfig],
+    nas: &[Vec<u8>],
+) -> Result<Vec<u8>, RrcMsgError> {
+    check_tid(transaction_id)?;
+    if drbs.len() > 11 || nas.len() > 11 {
+        return Err(RrcMsgError::Invalid("more than maxDRB (11) entries".into()));
+    }
+    for d in drbs {
+        if d.eps_bearer_identity > 15
+            || !(1..=32).contains(&d.drb_identity)
+            || !(3..=10).contains(&d.logical_channel_identity)
+        {
+            return Err(RrcMsgError::Invalid(format!("{d:?}")));
+        }
+    }
+    let r8 = RRCConnectionReconfiguration_r8_IEs {
+        meas_config: None,
+        mobility_control_info: None,
+        dedicated_info_nas_list: (!nas.is_empty()).then(|| {
+            RRCConnectionReconfiguration_r8_IEsDedicatedInfoNASList(
+                nas.iter().map(|n| DedicatedInfoNAS(n.clone())).collect(),
+            )
+        }),
+        radio_resource_config_dedicated: (!drbs.is_empty()).then(|| RadioResourceConfigDedicated {
+            srb_to_add_mod_list: None,
+            drb_to_add_mod_list: Some(DRB_ToAddModList(drbs.iter().map(drb_to_add_mod).collect())),
+            drb_to_release_list: None,
+            mac_main_config: None,
+            sps_config: None,
+            physical_config_dedicated: None,
+        }),
+        security_config_ho: None,
+        non_critical_extension: None,
+    };
+    let r = RRCConnectionReconfiguration {
+        rrc_transaction_identifier: RRC_TransactionIdentifier(transaction_id),
+        critical_extensions: RRCConnectionReconfigurationCriticalExtensions::C1(
+            RRCConnectionReconfigurationCriticalExtensions_c1::RrcConnectionReconfiguration_r8(r8),
+        ),
+    };
+    enc(&DL_DCCH_Message {
+        message: DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcConnectionReconfiguration(r)),
+    })
+}
+
+/// Encode a `UL-DCCH-Message` carrying RRCConnectionReconfigurationComplete
+/// (§5.3.5.3).
+pub fn encode_rrc_connection_reconfiguration_complete(
+    transaction_id: u8,
+) -> Result<Vec<u8>, RrcMsgError> {
+    check_tid(transaction_id)?;
+    let c = RRCConnectionReconfigurationComplete {
+        rrc_transaction_identifier: RRC_TransactionIdentifier(transaction_id),
+        critical_extensions:
+            RRCConnectionReconfigurationCompleteCriticalExtensions::RrcConnectionReconfigurationComplete_r8(
+                RRCConnectionReconfigurationComplete_r8_IEs {
+                    non_critical_extension: None,
+                },
+            ),
+    };
+    enc(&UL_DCCH_Message {
+        message: UL_DCCH_MessageType::C1(
+            UL_DCCH_MessageType_c1::RrcConnectionReconfigurationComplete(c),
+        ),
     })
 }
 

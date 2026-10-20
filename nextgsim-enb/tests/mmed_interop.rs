@@ -1,4 +1,5 @@
-//! Cross-repo interop: the nextgsim eNB against nextgcore's real `mmed`.
+//! Cross-repo interop: the nextgsim eNB and LTE UE against nextgcore's real
+//! `mmed`, and -- for the attach -- its real HSS, SGW and PGW.
 //!
 //! Needs Linux kernel SCTP, the `kernel-sctp` feature, and an mmed binary built
 //! with nextgcore's own `kernel-sctp` feature (the only S1-MME transport mmed
@@ -11,7 +12,11 @@
 //! ```
 //!
 //! mmed starts standalone for S1 Setup: S6a and S11 peers are dialled lazily
-//! and their absence is not fatal, so no HSS or SGW is needed.
+//! and their absence is not fatal, so no HSS or SGW is needed. The attach test
+//! ([`lte_ue_attaches_through_the_nextgcore_epc`]) needs the rest of the EPC
+//! running on loopback first -- `tests/epc/bring-up.sh` starts MongoDB (with the
+//! test subscriber), hssd, sgwcd, sgwud, smfd as PGW-C and upfd as PGW-U at the
+//! addresses this file uses, and `NEXTGCORE_EPC=1` enables the test.
 //!
 //! Before nextgcore `5879548` (nextgcore #455, PR #456) every test here
 //! failed, correctly: mmed's hand-written S1AP omitted the extension bit of
@@ -31,6 +36,15 @@ use nextgsim_enb::config::{EnbConfig, EnbIdType, MmeConfig, PagingDrx};
 use nextgsim_enb::s1_task::{
     establish_s1, kernel::KernelConnector, run_s1_setup_attempt, AttemptResult, S1Connector,
 };
+use nextgsim_eps_nas::EmmState;
+use nextgsim_lte_ue::config::{LteUeConfig, SubscriberConfig};
+use nextgsim_lte_ue::nas::{EpsNas, EpsNasStatus};
+use nextgsim_lte_ue::rrc::UeRrcState;
+
+/// The loopback addresses `tests/epc/bring-up.sh` puts the EPC on.
+const MME_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 5);
+const SGWC_ADDR: &str = "127.0.0.3";
+const HSS_ADDR: &str = "127.0.0.8";
 
 struct Mmed {
     child: Child,
@@ -78,22 +92,56 @@ fn free_port() -> u16 {
 }
 
 fn start_mmed(dir: &std::path::Path, s1ap_port: u16) -> Mmed {
+    start_mmed_with(dir, s1ap_port, false)
+}
+
+/// Start mmed. With `epc` it binds the MME address of `tests/epc/bring-up.sh`,
+/// reaches the HSS over S6a (Diameter over TCP, `No_SCTP`) and the SGW-C over
+/// S11; without, it runs standalone on 127.0.0.1.
+fn start_mmed_with(dir: &std::path::Path, s1ap_port: u16, epc: bool) -> Mmed {
     let bin = std::env::var("NEXTGCORE_MMED")
         .expect("set NEXTGCORE_MMED to an mmed built with --features kernel-sctp");
-    let gtpc_port = free_port();
+    let (addr, gtpc_port) = if epc {
+        (MME_ADDR.to_string(), 2123)
+    } else {
+        ("127.0.0.1".to_string(), free_port())
+    };
+    let peers = if epc {
+        let fd = dir.join("mme-fd.conf");
+        std::fs::write(
+            &fd,
+            format!(
+                "Identity = \"mme.localdomain\";\nRealm = \"localdomain\";\nNo_IPv6;\nNo_SCTP;\n\
+                 ListenOn = \"{addr}\";\nNoRelay;\n\
+                 ConnectPeer = \"hss.localdomain\" {{ ConnectTo = \"{HSS_ADDR}\"; No_TLS; }};\n"
+            ),
+        )
+        .unwrap();
+        format!(
+            "  freeDiameter: {}\n  metrics:\n    server:\n      - address: {addr}\n        port: 19095\n",
+            fd.display()
+        )
+    } else {
+        String::new()
+    };
+    let client = if epc {
+        format!("    client:\n      sgwc:\n        - address: {SGWC_ADDR}\n")
+    } else {
+        String::new()
+    };
     let cfg = format!(
         r#"logger:
   file:
     path: {log}
   level: info
 mme:
-  s1ap:
+{peers}  s1ap:
     server:
-      - address: 127.0.0.1
+      - address: {addr}
         port: {s1ap_port}
   gtpc:
-    server:
-      - address: 127.0.0.1
+{client}    server:
+      - address: {addr}
         port: {gtpc_port}
   gummei:
     - plmn_id: {{ mcc: 999, mnc: 70 }}
@@ -112,6 +160,7 @@ mme:
     let path = dir.join("mme.yaml");
     std::fs::write(&path, cfg).unwrap();
     let mut child = Command::new(bin)
+        .env("MME_RESTART_COUNTER_FILE", dir.join("mme-restart-counter"))
         .arg("-c")
         .arg(&path)
         .stdout(Stdio::piped())
@@ -162,6 +211,8 @@ fn enb_config(port: u16, plmn: Plmn) -> EnbConfig {
         s1_setup_retry_secs: 1,
         s1_setup_response_timeout_ms: 5000,
         radio: Default::default(),
+        security: Default::default(),
+        gtp_ip: None,
     }
 }
 
@@ -237,54 +288,40 @@ async fn an_unserved_plmn_gets_s1_setup_failure_with_time_to_wait() {
     assert!(mmed.wait_for("no served TAI matches", Duration::from_secs(5)));
 }
 
-/// TS 24.301 §8.2.4 ATTACH REQUEST, plain NAS: IMSI 999700000000001, EEA0-2 /
-/// EIA0-2, PDN CONNECTIVITY REQUEST (IPv4) in the ESM container. A TEST INPUT
-/// only -- the product UE has no EMM until nextgsim #186 increment 3.
-const ATTACH_REQUEST: &[u8] = &[
-    0x07, 0x41, 0x71, 0x08, 0x99, 0x99, 0x07, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0xE0, 0xE0, 0x00,
-    0x04, 0x02, 0x01, 0xD0, 0x11,
-];
-
-struct AttachOnce {
-    asked: bool,
-    downlink: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+fn subscriber() -> SubscriberConfig {
+    // The test subscriber of nextgcore's k8s/manifests/mongodb-init.yaml, which
+    // tests/epc/bring-up.sh provisions.
+    SubscriberConfig {
+        imsi: "999700000000001".into(),
+        key: [
+            0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38,
+            0xA6, 0xBC,
+        ],
+        op: [
+            0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D,
+            0x83, 0x4D,
+        ],
+        op_type: nextgsim_common::OpType::Opc,
+        sqn: 0,
+        imei_sv: Some("3534900698733019".into()),
+        eea: vec![0, 1, 2, 3],
+        eia: vec![1, 2, 3],
+        apn: std::env::var("NEXTGSIM_TEST_APN").ok(),
+        pdn_type: Default::default(),
+    }
 }
 
-impl nextgsim_lte_ue::nas::NasLayer for AttachOnce {
-    fn initial_nas(&mut self) -> Option<nextgsim_lte_ue::nas::InitialNas> {
-        if std::mem::replace(&mut self.asked, true) {
-            return None;
-        }
-        Some(nextgsim_lte_ue::nas::InitialNas {
-            nas: ATTACH_REQUEST.to_vec(),
-            cause: nextgsim_lte_rrc::msg::EstablishmentCauseValue::MoSignalling,
-            s_tmsi: None,
-        })
-    }
-    fn on_downlink_nas(&mut self, nas: &[u8]) -> Vec<Vec<u8>> {
-        self.downlink.lock().unwrap().push(nas.to_vec());
-        Vec::new()
-    }
-    fn on_rrc_indication(&mut self, _ind: nextgsim_lte_ue::nas::RrcIndication) {}
-}
-
-/// nextgsim #186 increment 2's exit criterion: the LTE UE's NAS, carried over
-/// E-UTRA RRC and SRB1 PDCP on RLS, reaches mmed in an S1AP INITIAL UE MESSAGE
-/// that mmed decodes.
-// Multi-threaded: `Mmed::wait_for` blocks on a std channel, which on the
-// default current-thread runtime would stop the eNB and UE tasks it waits on.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs NEXTGCORE_MMED and kernel SCTP"]
-async fn lte_ue_attach_request_reaches_nextgcore_mmed() {
+/// eNB with S1 set up against `mmed` on `remote`, and the LTE UE with its EPS
+/// NAS camped on it. Returns the UE's RRC state and NAS status.
+async fn enb_and_ue(
+    cfg: EnbConfig,
+    remote: SocketAddr,
+) -> (
+    tokio::sync::watch::Receiver<UeRrcState>,
+    std::sync::Arc<std::sync::Mutex<EpsNasStatus>>,
+    tokio::sync::watch::Sender<bool>,
+) {
     use nextgsim_enb::radio::{run_operational, RlsRadio};
-    use nextgsim_lte_ue::rrc::UeRrcState;
-
-    init_logging();
-    let port = free_port();
-    let mut mmed = start_mmed(&tmpdir("attach"), port);
-    let mut cfg = enb_config(port, Plmn::new(999, 70, false));
-    cfg.radio.rls_port = 0;
-    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let (_mme, mut transport) = tokio::time::timeout(
         Duration::from_secs(30),
         establish_s1(&cfg, &mut KernelConnector::default(), remote),
@@ -296,59 +333,132 @@ async fn lte_ue_attach_request_reaches_nextgcore_mmed() {
     let enb_cfg = cfg.clone();
     tokio::spawn(async move { run_operational(&enb_cfg, &mut radio, &mut transport).await });
 
-    let downlink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let ue_cfg = nextgsim_lte_ue::config::LteUeConfig {
+    let ue_cfg = LteUeConfig {
         plmn: Plmn::new(999, 70, false),
         enb_search_list: vec![enb_addr.to_string()],
         sti: Some(0xABCD),
         position: [0, 0, 0],
+        subscriber: Some(subscriber()),
     };
+    nextgsim_lte_ue::config::validate(&ue_cfg).unwrap();
+    let nas = EpsNas::new(ue_cfg.eps_nas().unwrap());
+    let status = nas.status();
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let (state_tx, mut state_rx) = tokio::sync::watch::channel(UeRrcState::NoCell);
-    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let nas = Box::new(AttachOnce {
-        asked: false,
-        downlink: std::sync::Arc::clone(&downlink),
-    });
+    let (state_tx, state_rx) = tokio::sync::watch::channel(UeRrcState::NoCell);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        nextgsim_lte_ue::task::run(&ue_cfg, nas, socket, state_tx, stop_rx).await
+        nextgsim_lte_ue::task::run(&ue_cfg, Box::new(nas), socket, state_tx, stop_rx).await
     });
+    (state_rx, status, stop_tx)
+}
 
+async fn wait_nas(
+    status: &std::sync::Arc<std::sync::Mutex<EpsNasStatus>>,
+    within: Duration,
+    f: impl Fn(&EpsNasStatus) -> bool,
+) -> EpsNasStatus {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let s = status.lock().unwrap().clone();
+        if f(&s) {
+            return s;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "NAS did not reach the expected state; last {s:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// With no HSS, mmed's S6a request fails and the UE's own ATTACH REQUEST is
+/// answered with ATTACH REJECT #17, which the UE's EMM treats as abnormal case
+/// §5.5.1.2.6 d) -- attempt counter, T3411 -- while mmed releases the S1 UE
+/// context (nextgcore #472/#473), returning the UE to RRC_IDLE.
+// Multi-threaded: `Mmed::wait_for` blocks on a std channel, which on the
+// default current-thread runtime would stop the eNB and UE tasks it waits on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs NEXTGCORE_MMED and kernel SCTP"]
+async fn lte_ue_attach_without_an_hss_is_rejected_and_retried() {
+    init_logging();
+    let port = free_port();
+    let mut mmed = start_mmed(&tmpdir("attach-nohss"), port);
+    let mut cfg = enb_config(port, Plmn::new(999, 70, false));
+    cfg.radio.rls_port = 0;
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let (mut state_rx, status, _stop) = enb_and_ue(cfg, remote).await;
+    assert!(
+        mmed.wait_for(
+            "Attach Request: IMSI[999700000000001] attach_type[1] on enb_ue_s1ap_id=",
+            Duration::from_secs(15)
+        ),
+        "mmed did not decode the UE's ATTACH REQUEST"
+    );
+    wait_nas(&status, Duration::from_secs(15), |s| {
+        s.state == EmmState::AttemptingToAttach
+    })
+    .await;
     tokio::time::timeout(Duration::from_secs(15), async {
-        while !matches!(*state_rx.borrow_and_update(), UeRrcState::Connected { .. }) {
+        while !matches!(*state_rx.borrow_and_update(), UeRrcState::Camped { .. }) {
             state_rx.changed().await.unwrap();
         }
     })
     .await
-    .expect("UE did not reach RRC_CONNECTED");
-    // mmed decoded INITIAL UE MESSAGE and the ATTACH REQUEST inside it: it
-    // names the IMSI from the EPS mobile identity and the eNB UE S1AP ID.
+    .expect("mmed's release after ATTACH REJECT did not return the UE to RRC_IDLE");
+}
+
+/// nextgsim #186 increment 3's exit criterion: the UE attaches through the
+/// real EPC -- EPS AKA against hssd, NAS SMC, ULR, Create Session through
+/// SGW-C to the PGW-C, INITIAL CONTEXT SETUP with the AS Security Mode Command,
+/// ATTACH ACCEPT in RRCConnectionReconfiguration -- and is EMM-REGISTERED with
+/// the default EPS bearer activated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs NEXTGCORE_MMED, kernel SCTP and the EPC of tests/epc/bring-up.sh"]
+async fn lte_ue_attaches_through_the_nextgcore_epc() {
+    assert!(
+        std::env::var("NEXTGCORE_EPC").is_ok(),
+        "start the EPC with tests/epc/bring-up.sh and set NEXTGCORE_EPC=1"
+    );
+    init_logging();
+    let port = 36412;
+    let mut mmed = start_mmed_with(&tmpdir("epc"), port, true);
+    let mut cfg = enb_config(port, Plmn::new(999, 70, false));
+    cfg.mme_configs[0].address = IpAddr::V4(MME_ADDR);
+    cfg.radio.rls_port = 0;
+    let remote = SocketAddr::new(IpAddr::V4(MME_ADDR), port);
+    let (_state_rx, status, _stop) = enb_and_ue(cfg, remote).await;
+    let s = wait_nas(&status, Duration::from_secs(40), |s| {
+        s.state == EmmState::Registered || matches!(s.state, EmmState::NoService(_))
+    })
+    .await;
+    assert_eq!(s.state, EmmState::Registered, "attach did not complete");
+    // The UE's own state is the primary evidence: EMM-REGISTERED with the
+    // default EPS bearer active and a network-assigned PDN address.
+    let bearer = s.bearer.expect("default EPS bearer activated");
+    eprintln!("[test] default EPS bearer {bearer:?}");
+    assert!(
+        (5..=15).contains(&bearer.ebi),
+        "EBI {} out of 5..=15",
+        bearer.ebi
+    );
+    match bearer.pdn_address {
+        nextgsim_eps_nas::ie::PdnAddress::Ipv4(a)
+        | nextgsim_eps_nas::ie::PdnAddress::Ipv4v6(_, a) => {
+            assert!(!a.is_unspecified(), "PDN address is 0.0.0.0")
+        }
+        nextgsim_eps_nas::ie::PdnAddress::Ipv6(iid) => {
+            assert_ne!(iid, [0; 8], "IPv6 interface identifier is zero")
+        }
+    }
+    // And the MME agrees: it activated the same bearer. Matched on the EBI
+    // rather than on free text describing ATTACH COMPLETE, whose wording is
+    // mmed's to change.
     assert!(
         mmed.wait_for(
-            "Attach Request: IMSI[999700000000001] attach_type[1] on enb_ue_s1ap_id=",
-            Duration::from_secs(10)
+            &format!("Default EPS bearer (ebi={}) activated", bearer.ebi),
+            Duration::from_secs(5)
         ),
-        "mmed did not decode the ATTACH REQUEST from the INITIAL UE MESSAGE"
-    );
-    // And mmed's answer travels the whole downlink path back to the UE's NAS:
-    // DOWNLINK NAS TRANSPORT, DLInformationTransfer, SRB1 PDCP. With no HSS
-    // configured mmed's S6a AIR fails, so the answer it sends is ATTACH REJECT
-    // (07 44, EMM cause #17 "network failure"); with an HSS it would be an
-    // AUTHENTICATION REQUEST. Either way it is a plain EMM message (PD 7).
-    let got = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(first) = downlink.lock().unwrap().first().cloned() {
-                return first;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("no downlink NAS reached the UE");
-    eprintln!("[test] downlink NAS delivered to the UE: {got:02x?}");
-    assert_eq!(
-        got.first(),
-        Some(&0x07),
-        "plain EPS mobility management message"
+        "mmed did not activate default EPS bearer {}",
+        bearer.ebi
     );
 }

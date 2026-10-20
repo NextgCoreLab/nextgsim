@@ -8,6 +8,7 @@
 //! - ZUC-256 (256-bit security variant)
 //! - AES-based (NEA2/NIA2)
 //! - Key derivation functions (5G key hierarchy, TS 33.501 Annex A)
+//! - The EPS key hierarchy (`K_ASME`, `K_eNB`, NH, algorithm keys; TS 33.401 Annex A)
 //! - EAP-AKA' key derivation (RFC 9048 / TS 33.501 §6.1.3.1)
 //! - ECIES for SUPI concealment (Profile A and Profile B)
 //! - SNOW5G (next-gen stream cipher, placeholder)
@@ -31,6 +32,7 @@
 pub mod aes;
 pub mod eap_aka_prime;
 pub mod ecies;
+pub mod eps_kdf;
 #[cfg(feature = "pqc")]
 pub mod hybrid;
 pub mod kdf;
