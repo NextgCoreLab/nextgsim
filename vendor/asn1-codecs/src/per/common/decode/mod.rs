@@ -67,6 +67,26 @@ pub fn decode_sequence_header_common(
     Ok((bitmap, extended))
 }
 
+/// #253: decode the extension-additions presence bitmap of a SEQUENCE (X.691
+/// §19.7, §19.8) -- a normally small length, then that many presence bits.
+/// The present additions follow as open types, in bitmap order; additions
+/// beyond the ones the decoder knows (a newer peer's) are skipped by length.
+pub fn decode_sequence_extension_additions_bitmap(
+    data: &mut PerCodecData,
+    aligned: bool,
+) -> Result<BitVec<u8, Msb0>, PerCodecError> {
+    let bitmap_length = decode_length_determinent_common(data, None, None, true, aligned)?;
+    if bitmap_length == 0 {
+        return Err(PerCodecError::new(
+            PerCodecErrorCause::Generic,
+            "Extension Bit set, but extensions length zero!",
+        ));
+    }
+    let mut bitmap: BitVec<u8, Msb0> = BitVec::new();
+    bitmap.extend(data.get_bitvec(bitmap_length)?);
+    Ok(bitmap)
+}
+
 // Common extensions skip
 pub fn decode_sequence_extensions_skip_bits(
     data: &mut PerCodecData,

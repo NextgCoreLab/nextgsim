@@ -29,3 +29,6 @@ mod constraint_union_tests;
 
 #[cfg(test)]
 mod charstring_tests;
+
+#[cfg(test)]
+mod seq_extension_tests;

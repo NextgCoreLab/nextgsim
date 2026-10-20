@@ -764,12 +764,14 @@ pub fn is_rrc_setup_complete(msg: &UL_DCCH_Message) -> bool {
 /// transaction id (0x20 for tid 0).
 pub fn build_srb1_radio_bearer_config() -> RadioBearerConfig {
     let srb1 = SRB_ToAddMod {
+        extensions: Default::default(),
         srb_identity: SRB_Identity(1),
         reestablish_pdcp: None,
         discard_on_pdcp: None,
         pdcp_config: None,
     };
     RadioBearerConfig {
+        extensions: Default::default(),
         srb_to_add_mod_list: Some(SRB_ToAddModList(vec![srb1])),
         srb3_to_release: None,
         drb_to_add_mod_list: None,
@@ -790,6 +792,7 @@ pub fn build_srb1_radio_bearer_config() -> RadioBearerConfig {
 /// [`srb1_rrc_setup_params`].
 pub fn build_srb1_cell_group_config() -> CellGroupConfig {
     let rlc_bearer = RLC_BearerConfig {
+        extensions: Default::default(),
         logical_channel_identity: LogicalChannelIdentity(1),
         served_radio_bearer: Some(RLC_BearerConfigServedRadioBearer::Srb_Identity(
             SRB_Identity(1),
@@ -799,6 +802,7 @@ pub fn build_srb1_cell_group_config() -> CellGroupConfig {
         mac_logical_channel_config: None,
     };
     CellGroupConfig {
+        extensions: Default::default(),
         cell_group_id: CellGroupId(0),
         rlc_bearer_to_add_mod_list: Some(CellGroupConfigRlc_BearerToAddModList(vec![rlc_bearer])),
         rlc_bearer_to_release_list: None,

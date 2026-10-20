@@ -17,7 +17,7 @@ use crate::resolver::{
             types::{
                 constructed::{
                     ClassFieldComponentType, ResolvedComponent, ResolvedConstructedType,
-                    ResolvedSeqComponent,
+                    ResolvedSeqAddition, ResolvedSeqComponent,
                 },
                 ioc::{ResolvedFieldSpec, ResolvedObjectSet, ResolvedObjectSetElement},
                 Asn1ResolvedType, ResolvedSetType, ResolvedSetTypeMap,
@@ -120,50 +120,35 @@ fn resolve_sequence_type(
     } else {
         let mut additions = vec![];
         for addition in &sequence.additions {
-            match addition {
+            let (seq_components, is_group) = match addition {
                 AdditionGroupOrComponent::AdditionGroup(ref group) => {
-                    for c in &group.components {
-                        let ty = match resolve_type(&c.component.ty, resolver) {
-                            Ok(ty) => ty,
-                            Err(_e) => {
-                                return resolve_sequence_classfield_components(sequence, resolver);
-                            }
-                        };
-                        let component = ResolvedComponent {
-                            id: c.component.id.clone(),
-                            ty,
-                        };
-                        let seq_component = ResolvedSeqComponent {
-                            component,
-                            optional: c.optional || c.default.is_some(),
-                            class_field_type: None,
-                            key_field: false,
-                            criticality_field: false,
-                        };
-                        additions.push(seq_component);
-                    }
+                    (group.components.iter().collect::<Vec<_>>(), true)
                 }
-                AdditionGroupOrComponent::Component(ref c) => {
-                    let ty = match resolve_type(&c.component.ty, resolver) {
-                        Ok(ty) => ty,
-                        Err(_e) => {
-                            return resolve_sequence_classfield_components(sequence, resolver);
-                        }
-                    };
-                    let component = ResolvedComponent {
+                AdditionGroupOrComponent::Component(ref c) => (vec![c], false),
+            };
+            let mut components = vec![];
+            for c in seq_components {
+                let ty = match resolve_type(&c.component.ty, resolver) {
+                    Ok(ty) => ty,
+                    Err(_e) => {
+                        return resolve_sequence_classfield_components(sequence, resolver);
+                    }
+                };
+                components.push(ResolvedSeqComponent {
+                    component: ResolvedComponent {
                         id: c.component.id.clone(),
                         ty,
-                    };
-                    let seq_component = ResolvedSeqComponent {
-                        component,
-                        optional: c.optional || c.default.is_some(),
-                        class_field_type: None,
-                        key_field: false,
-                        criticality_field: false,
-                    };
-                    additions.push(seq_component);
-                }
+                    },
+                    optional: c.optional || c.default.is_some(),
+                    class_field_type: None,
+                    key_field: false,
+                    criticality_field: false,
+                });
             }
+            additions.push(ResolvedSeqAddition {
+                components,
+                is_group,
+            });
         }
 
         if additions.is_empty() {

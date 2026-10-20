@@ -67,10 +67,13 @@ pub(crate) fn encode_sequence_header_common(
     extended: bool,
     _aligned: bool,
 ) -> Result<(), PerCodecError> {
-    if extended {
+    // #253: `extended` is the X.691 §19.1 extension bit -- set when at least
+    // one extension addition is present; the additions themselves follow the
+    // root components (see `encode_sequence_extension_additions_bitmap`).
+    if extended && !is_extensible {
         return Err(PerCodecError::new(
-            PerCodecErrorCause::EncodeNotSupported,
-            "Encode of extended sequence not yet implemented",
+            PerCodecErrorCause::Generic,
+            "extension additions present on a SEQUENCE without an extension marker",
         ));
     }
 
@@ -82,6 +85,21 @@ pub(crate) fn encode_sequence_header_common(
 
     data.dump_encode();
 
+    Ok(())
+}
+
+/// #253: encode the extension-additions presence bitmap of a SEQUENCE (X.691
+/// §19.7, §19.8): a normally small length giving the number of extension
+/// additions in the type, then one bit per addition. Each present addition
+/// then follows as an open type (§19.9), written by the caller.
+pub fn encode_sequence_extension_additions_bitmap(
+    data: &mut PerCodecData,
+    presence: &BitSlice<u8, Msb0>,
+    aligned: bool,
+) -> Result<(), PerCodecError> {
+    encode_length_determinent_common(data, None, None, true, presence.len(), aligned)?;
+    data.append_bits(presence);
+    data.dump_encode();
     Ok(())
 }
 

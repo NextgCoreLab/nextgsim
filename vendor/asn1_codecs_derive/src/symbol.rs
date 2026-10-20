@@ -17,6 +17,10 @@ pub(crate) const OPTIONAL_FIELDS: Symbol = Symbol("optional_fields");
 pub(crate) const OPTIONAL_IDX: Symbol = Symbol("optional_idx");
 pub(crate) const KEY_FIELD: Symbol = Symbol("key_field");
 pub(crate) const CRITICALITY_FIELD: Symbol = Symbol("criticality_field");
+pub(crate) const EXTENSION_IDX: Symbol = Symbol("extension_idx");
+pub(crate) const GROUP_OPTIONAL_IDX: Symbol = Symbol("group_optional_idx");
+pub(crate) const EXTENSION_GROUP: Symbol = Symbol("extension_group");
+pub(crate) const EXTENSION_ADDITIONS: Symbol = Symbol("extension_additions");
 
 impl PartialEq<Symbol> for Ident {
     fn eq(&self, word: &Symbol) -> bool {

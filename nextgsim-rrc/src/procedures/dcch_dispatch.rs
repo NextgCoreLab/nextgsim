@@ -221,10 +221,12 @@ pub fn dispatch_ul_dcch(bytes: &[u8]) -> Result<UlDcchMessage, RrcCodecError> {
 /// what the nibble dispatcher did (issue #151).
 #[derive(Debug, Clone)]
 pub enum DlDcchMessage {
-    /// `rrcReconfiguration` (c1 index 0).
-    RrcReconfiguration(RrcReconfigurationData),
+    /// `rrcReconfiguration` (c1 index 0). Boxed, as is `RrcResume`: both
+    /// carry generated configs whose extension additions (#253) made them
+    /// several hundred bytes, which every other variant would otherwise pay.
+    RrcReconfiguration(Box<RrcReconfigurationData>),
     /// `rrcResume` (c1 index 1).
-    RrcResume(RrcResumeData),
+    RrcResume(Box<RrcResumeData>),
     /// `rrcRelease` (c1 index 2).
     RrcRelease(RrcReleaseData),
     /// `rrcReestablishment` (c1 index 3).
@@ -254,11 +256,11 @@ pub fn dispatch_dl_dcch(bytes: &[u8]) -> Result<DlDcchMessage, RrcCodecError> {
     };
 
     let dispatched = match c1 {
-        DL_DCCH_MessageType_c1::RrcReconfiguration(_) => {
-            DlDcchMessage::RrcReconfiguration(parse_error(parse_rrc_reconfiguration(&msg))?)
-        }
+        DL_DCCH_MessageType_c1::RrcReconfiguration(_) => DlDcchMessage::RrcReconfiguration(
+            Box::new(parse_error(parse_rrc_reconfiguration(&msg))?),
+        ),
         DL_DCCH_MessageType_c1::RrcResume(_) => {
-            DlDcchMessage::RrcResume(parse_error(parse_rrc_resume(&msg))?)
+            DlDcchMessage::RrcResume(Box::new(parse_error(parse_rrc_resume(&msg))?))
         }
         DL_DCCH_MessageType_c1::RrcRelease(_) => {
             DlDcchMessage::RrcRelease(parse_error(parse_rrc_release(&msg))?)

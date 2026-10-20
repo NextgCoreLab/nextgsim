@@ -285,7 +285,16 @@ pub(super) fn encode_normally_small_length_determinent_common(
     value: usize,
     aligned: bool,
 ) -> Result<(), PerCodecError> {
-    if value <= 32 {
+    // X.691 §11.9.3.4: n is never 0 here (it counts at least one bit), and
+    // up to 64 is a 0 bit followed by n-1 in six bits. The cut-off used to be
+    // 32, which sent 33..=64 in the long form the decoder does not expect.
+    if value == 0 {
+        return Err(PerCodecError::new(
+            PerCodecErrorCause::Generic,
+            "a normally small length must be at least 1",
+        ));
+    }
+    if value <= 64 {
         let byte = (value - 1) as u8;
         data.encode_bool(false);
         data.append_bits(&byte.view_bits::<Msb0>()[2..8]);

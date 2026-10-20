@@ -210,6 +210,24 @@ pub(crate) struct FieldVarCodecParams {
     // If this is the Criticality field of a protocol-IE SEQUENCE (#214)
     pub(crate) criticality_field: Option<syn::LitBool>,
 
+    // #253: index of this field's SEQUENCE extension addition (X.691 §19.7):
+    // its bit in the extension-additions presence bitmap. Fields of one
+    // extension addition group `[[ ... ]]` share it.
+    pub(crate) extension_idx: Option<syn::LitInt>,
+
+    // #253: this field belongs to an extension addition GROUP (encoded as a
+    // non-extensible SEQUENCE inside the addition's open type, §19.9), not a
+    // lone extension addition component.
+    pub(crate) extension_group: Option<syn::LitBool>,
+
+    // #253: for an OPTIONAL member of an extension addition group, its index
+    // in that group's own optional-components bitmap.
+    pub(crate) group_optional_idx: Option<syn::LitInt>,
+
+    // #253: this field is the `SEQUENCE-EXTENSIONS` container holding the
+    // SEQUENCE's extension additions.
+    pub(crate) extension_additions: Option<syn::LitBool>,
+
     // The actual 'attribute' from the Syntax tree from which this struct is generated. This will
     // be used mainly for error reporting inside the functions where this struct is passed.
     pub(crate) attr: Option<syn::Attribute>,
@@ -296,6 +314,54 @@ pub(crate) fn parse_fld_meta_as_codec_params(
                                 _ => errors.push(syn::Error::new_spanned(
                                     nested,
                                     "`criticality_field` value should be a Bool Literal",
+                                )),
+                            }
+                        }
+                        // parses #[asn(extension_idx = <int>)] (#253)
+                        syn::NestedMeta::Meta(syn::Meta::NameValue(ref m)) if m.path == EXTENSION_IDX => {
+                            match m.lit {
+                                syn::Lit::Int(ref idx) => {
+                                    codec_params.extension_idx.replace(idx.clone());
+                                }
+                                _ => errors.push(syn::Error::new_spanned(
+                                    nested,
+                                    "`extension_idx` value should be an Integer Literal",
+                                )),
+                            }
+                        }
+                        // parses #[asn(extension_group = true)] (#253)
+                        syn::NestedMeta::Meta(syn::Meta::NameValue(ref m)) if m.path == EXTENSION_GROUP => {
+                            match m.lit {
+                                syn::Lit::Bool(ref g) => {
+                                    codec_params.extension_group.replace(g.clone());
+                                }
+                                _ => errors.push(syn::Error::new_spanned(
+                                    nested,
+                                    "`extension_group` value should be a Bool Literal",
+                                )),
+                            }
+                        }
+                        // parses #[asn(extension_additions = true)] (#253)
+                        syn::NestedMeta::Meta(syn::Meta::NameValue(ref m)) if m.path == EXTENSION_ADDITIONS => {
+                            match m.lit {
+                                syn::Lit::Bool(ref b) => {
+                                    codec_params.extension_additions.replace(b.clone());
+                                }
+                                _ => errors.push(syn::Error::new_spanned(
+                                    nested,
+                                    "`extension_additions` value should be a Bool Literal",
+                                )),
+                            }
+                        }
+                        // parses #[asn(group_optional_idx = <int>)] (#253)
+                        syn::NestedMeta::Meta(syn::Meta::NameValue(ref m)) if m.path == GROUP_OPTIONAL_IDX => {
+                            match m.lit {
+                                syn::Lit::Int(ref idx) => {
+                                    codec_params.group_optional_idx.replace(idx.clone());
+                                }
+                                _ => errors.push(syn::Error::new_spanned(
+                                    nested,
+                                    "`group_optional_idx` value should be an Integer Literal",
                                 )),
                             }
                         }
