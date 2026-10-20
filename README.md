@@ -114,6 +114,32 @@ RUST_LOG=info,nextgsim_gnb=debug,nextgsim_ngap=debug
 RUST_LOG=info,nextgsim_ue=debug,nextgsim_nas=debug
 ```
 
+### LTE eNB and UE containers (#186)
+
+`Dockerfile.enb-local` (`lte-enb`, built with `--features kernel-sctp`) and
+`Dockerfile.lte-ue-local` (`lte-ue`) bake `config/enb.yaml` and
+`config/lte-ue.yaml`, which target nextgcore's EPC compose network
+(172.24.0.0/24). A compose file adjusts them through `NEXTGSIM_*` variables,
+applied before validation so a bad value is refused like a bad file:
+
+| Variable | Node | Overrides |
+|---|---|---|
+| `NEXTGSIM_ENB_MME_ADDR` | eNB | `mme_configs` (comma-separated `ip` or `ip:port`, port 36412 by default) |
+| `NEXTGSIM_ENB_IP` | eNB | `s1ap_ip` and `radio.link_ip` |
+| `NEXTGSIM_ENB_GTP_IP` | eNB | `gtp_ip` (S1-U; defaults to `s1ap_ip`) |
+| `NEXTGSIM_ENB_ID` | eNB | `enb_id` (decimal or `0x` hex) |
+| `NEXTGSIM_PLMN` | both | `plmn`, written `MCC-MNC` |
+| `NEXTGSIM_TAC` | eNB | `tac` |
+| `NEXTGSIM_UE_ENB_ADDR` | UE | `enb_search_list` |
+| `NEXTGSIM_UE_IMSI` / `_KEY` / `_OPC` / `_APN` | UE | the USIM (`subscriber`); key and OPc as 32 hex digits |
+| `NEXTGSIM_UE_TUN_NAME` | UE | `tun.name` |
+
+The UE puts the default bearer's PDN address on a TUN (`lteuetun5`), which
+needs `cap_add: [NET_ADMIN]` and `devices: [/dev/net/tun:/dev/net/tun]`.
+`docker exec <ue> lte-ue-ping-check <target> [count]` then waits for that
+address and asserts a 0%-loss ping through the PDN (exit 0 pass, 1 no bearer,
+2 loss).
+
 ## Workspace Structure
 
 ```

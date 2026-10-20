@@ -347,13 +347,20 @@ pub fn apply_env_overrides(
 ) -> Result<(), ConfigError> {
     use nextgsim_common::env_override::{parse_endpoints, parse_plmn, parse_u32};
     let bad = |var: &str, e: String| ConfigError::Invalid(format!("{var}: {e}"));
-    let ip = |var: &str, v: String| v.trim().parse::<IpAddr>().map_err(|_| bad(var, format!("{v:?} is not an IP address")));
+    let ip = |var: &str, v: String| {
+        v.trim()
+            .parse::<IpAddr>()
+            .map_err(|_| bad(var, format!("{v:?} is not an IP address")))
+    };
 
     if let Some(v) = lookup("NEXTGSIM_ENB_MME_ADDR") {
         c.mme_configs = parse_endpoints(&v, 36412)
             .map_err(|e| bad("NEXTGSIM_ENB_MME_ADDR", e))?
             .into_iter()
-            .map(|a| MmeConfig { address: a.ip(), port: a.port() })
+            .map(|a| MmeConfig {
+                address: a.ip(),
+                port: a.port(),
+            })
             .collect();
     }
     if let Some(v) = lookup("NEXTGSIM_ENB_IP") {
@@ -542,8 +549,10 @@ mod tests {
     }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: std::collections::HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k| map.get(k).cloned()
     }
 
@@ -564,7 +573,13 @@ mod tests {
         .unwrap();
         validate_enb_config(&c).unwrap();
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert_eq!(c.mme_configs, vec![MmeConfig { address: ip("172.24.0.5"), port: 36412 }]);
+        assert_eq!(
+            c.mme_configs,
+            vec![MmeConfig {
+                address: ip("172.24.0.5"),
+                port: 36412
+            }]
+        );
         assert_eq!(c.s1ap_ip, ip("172.24.0.50"));
         assert_eq!(c.radio.link_ip, ip("172.24.0.50"));
         assert_eq!(c.gtp_ip, Some(ip("172.24.0.51")));
@@ -598,7 +613,10 @@ mod tests {
     #[test]
     fn plmn_override_conflicts_with_explicit_supported_tas() {
         let mut c = valid();
-        c.supported_tas = vec![SupportedTa { tac: 1, broadcast_plmns: vec![Plmn::new(999, 70, false)] }];
+        c.supported_tas = vec![SupportedTa {
+            tac: 1,
+            broadcast_plmns: vec![Plmn::new(999, 70, false)],
+        }];
         assert!(apply_env_overrides(&mut c, env(&[("NEXTGSIM_PLMN", "001-01")])).is_err());
     }
 

@@ -212,10 +212,18 @@ pub fn apply_env_overrides(
     if let Some(v) = lookup("NEXTGSIM_PLMN") {
         c.plmn = parse_plmn(v.trim()).map_err(|e| bad("NEXTGSIM_PLMN", e))?;
     }
-    let sub_vars = ["NEXTGSIM_UE_IMSI", "NEXTGSIM_UE_KEY", "NEXTGSIM_UE_OPC", "NEXTGSIM_UE_APN"];
+    let sub_vars = [
+        "NEXTGSIM_UE_IMSI",
+        "NEXTGSIM_UE_KEY",
+        "NEXTGSIM_UE_OPC",
+        "NEXTGSIM_UE_APN",
+    ];
     if let Some(var) = sub_vars.iter().find(|v| lookup(v).is_some()) {
         let s = c.subscriber.as_mut().ok_or_else(|| {
-            bad(var, "the configuration file has no `subscriber` section to amend".into())
+            bad(
+                var,
+                "the configuration file has no `subscriber` section to amend".into(),
+            )
         })?;
         if let Some(v) = lookup("NEXTGSIM_UE_IMSI") {
             s.imsi = v.trim().to_string();
@@ -285,8 +293,10 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: std::collections::HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k| map.get(k).cloned()
     }
 
@@ -316,7 +326,10 @@ mod tests {
         )
         .unwrap();
         validate(&c).unwrap();
-        assert_eq!(c.search_space().unwrap(), vec!["172.24.0.50:4997".parse().unwrap()]);
+        assert_eq!(
+            c.search_space().unwrap(),
+            vec!["172.24.0.50:4997".parse().unwrap()]
+        );
         assert_eq!(c.plmn, Plmn::new(1, 1, false));
         let s = c.subscriber.as_ref().unwrap();
         assert_eq!(s.imsi, "001010000000002");

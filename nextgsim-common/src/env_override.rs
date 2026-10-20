@@ -20,9 +20,8 @@ pub fn parse_plmn(value: &str) -> Result<Plmn, String> {
     let (mcc, mnc) = value
         .split_once('-')
         .ok_or_else(|| format!("{value:?} is not MCC-MNC"))?;
-    let digits = |s: &str, lens: &[usize]| {
-        lens.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
-    };
+    let digits =
+        |s: &str, lens: &[usize]| lens.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
     if !digits(mcc, &[3]) || !digits(mnc, &[2, 3]) {
         return Err(format!(
             "{value:?} is not MCC-MNC (3-digit MCC, 2- or 3-digit MNC)"
@@ -68,7 +67,10 @@ pub fn parse_endpoints(value: &str, default_port: u16) -> Result<Vec<SocketAddr>
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<SocketAddr>()
-                .or_else(|_| s.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, default_port)))
+                .or_else(|_| {
+                    s.parse::<IpAddr>()
+                        .map(|ip| SocketAddr::new(ip, default_port))
+                })
                 .map_err(|_| format!("{s:?} is not an IP or IP:port"))
         })
         .collect::<Result<_, _>>()?;
@@ -86,11 +88,19 @@ mod tests {
     fn plmn_two_and_three_digit_mnc() {
         assert_eq!(
             parse_plmn("999-70").unwrap(),
-            Plmn { mcc: 999, mnc: 70, long_mnc: false }
+            Plmn {
+                mcc: 999,
+                mnc: 70,
+                long_mnc: false
+            }
         );
         assert_eq!(
             parse_plmn("001-001").unwrap(),
-            Plmn { mcc: 1, mnc: 1, long_mnc: true }
+            Plmn {
+                mcc: 1,
+                mnc: 1,
+                long_mnc: true
+            }
         );
         for bad in ["99970", "99-70", "999-7", "999-7000", "abc-70", ""] {
             assert!(parse_plmn(bad).is_err(), "{bad:?} accepted");
@@ -102,7 +112,10 @@ mod tests {
         let k = parse_hex16("465B5CE8B199B49FAA5F0A2EE238A6BC").unwrap();
         assert_eq!(k[0], 0x46);
         assert_eq!(k[15], 0xBC);
-        assert_eq!(parse_hex16("0x465b5ce8b199b49faa5f0a2ee238a6bc").unwrap(), k);
+        assert_eq!(
+            parse_hex16("0x465b5ce8b199b49faa5f0a2ee238a6bc").unwrap(),
+            k
+        );
         assert!(parse_hex16("465B").is_err());
         assert!(parse_hex16("Z65B5CE8B199B49FAA5F0A2EE238A6BC").is_err());
     }
