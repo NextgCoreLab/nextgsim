@@ -58,7 +58,7 @@ jobs:
     # once as its unit-test binary, and runs the two rustc processes concurrently.
     # nextgsim-rrc's 5.5 MB generated rrc.rs costs about 9.7 GB per rustc with
     # full debuginfo, and nextgsim-lte-rrc about 4.5 GB. The workspace build
-    # peaked at 17.7 GB summed RSS, on a runner with 16 GB of RAM and 4 GB of
+    # peaked at 17.7 GB summed RSS, on a runner with 16 GB of RAM and 3 GB of
     # swap. The two fixes below are measured in #278. Both are needed.
     # A healthy run finishes in about 10 minutes. 60 minutes turns a swap-thrash
     # into a clear timeout instead of a 6-hour hang.
@@ -75,9 +75,9 @@ jobs:
       - name: Add swap headroom
         # About 14 GB is still too close to 16 GB, and the peak depends on how
         # the rrc / lte-rrc lib and test units happen to overlap. The 12 GB of
-        # extra swap goes on the runner's /mnt scratch disk, so the build space
-        # on / is untouched. It only absorbs the overlap. It is not paged
-        # through in steady state.
+        # extra swap only absorbs that overlap; it is not paged through in
+        # steady state. On ubuntu-24.04, /mnt is on the root disk (145 GB, about
+        # 86 GB free at job start), so this uses disk the build never needs.
         run: |
           set -eu
           nproc; free -m; swapon --show; df -h / /mnt
