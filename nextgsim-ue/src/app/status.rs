@@ -101,6 +101,15 @@ impl UeStatusInfo {
             UeStatusUpdate::CmStateChanged { cm_state } => {
                 self.cm_state = cm_state.to_string();
             }
+            UeStatusUpdate::MmStateChanged {
+                rm_state,
+                mm_state,
+                mm_sub_state,
+            } => {
+                self.set_rm_state(*rm_state);
+                self.set_mm_state(*mm_state);
+                self.set_mm_sub_state(*mm_sub_state);
+            }
         }
     }
 

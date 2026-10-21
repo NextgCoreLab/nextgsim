@@ -16,11 +16,42 @@ use tracing::{debug, error, info, warn};
 use nextgsim_common::cli_server::{CliCommand, CliServer};
 
 use crate::app::{CliHandler, NasAction};
-use crate::nas::mm::{MmState, MmSubState, RmState};
+use crate::nas::mm::{MmState, MmStateMachine, MmSubState, RmState};
 use crate::tasks::{
     AppMessage, NasMessage, Task, TaskMessage, UeCliCommand, UeCliCommandType, UeStatusUpdate,
     UeTaskBase,
 };
+
+/// Tracks the 5GMM state last published to the App task, so the NAS task
+/// sends one [`UeStatusUpdate::MmStateChanged`] per real change rather than
+/// one per loop iteration (issue #266).
+#[derive(Debug, Default)]
+pub struct MmStatePublisher {
+    last: Option<(RmState, MmState, MmSubState)>,
+}
+
+impl MmStatePublisher {
+    /// Creates a publisher that has published nothing yet, so the first
+    /// [`Self::poll`] always reports.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the update to send when `state` differs from what was last
+    /// published, and records it as published.
+    pub fn poll(&mut self, state: &MmStateMachine) -> Option<UeStatusUpdate> {
+        let now = (state.rm_state(), state.mm_state(), state.mm_substate());
+        if self.last == Some(now) {
+            return None;
+        }
+        self.last = Some(now);
+        Some(UeStatusUpdate::MmStateChanged {
+            rm_state: now.0,
+            mm_state: now.1,
+            mm_sub_state: now.2,
+        })
+    }
+}
 
 /// UE Application Task
 ///
@@ -104,6 +135,15 @@ impl AppTask {
             }
             UeStatusUpdate::CmStateChanged { cm_state } => {
                 info!("CM state changed to: {}", cm_state);
+            }
+            UeStatusUpdate::MmStateChanged {
+                rm_state,
+                mm_state,
+                mm_sub_state,
+            } => {
+                self.rm_state = rm_state;
+                self.mm_state = mm_state;
+                self.mm_sub_state = mm_sub_state;
             }
         }
     }
@@ -231,21 +271,24 @@ impl AppTask {
     }
 
     /// Polls the CLI server for incoming commands.
+    ///
+    /// Non-blocking, as the gNB's App task is (nextgsim #197): awaiting a
+    /// datagram here parked the whole `select!` until a CLI client sent one, so
+    /// no inter-task message -- the NAS task's state updates among them -- was
+    /// read in between, and a full channel would back-pressure the NAS task.
     async fn poll_cli_server(&mut self) {
-        if let Some(server) = &self.cli_server {
-            match server.receive_command().await {
-                Ok(Some(cmd)) => {
-                    // Store the command and process it
-                    let cmd_clone = cmd;
-                    self.process_cli_command(cmd_clone).await;
-                }
-                Ok(None) => {
-                    // No command available or not for us
-                }
+        let cmd = match &self.cli_server {
+            Some(server) => match server.try_receive_command() {
+                Ok(cmd) => cmd,
                 Err(e) => {
                     warn!("CLI server error: {}", e);
+                    None
                 }
-            }
+            },
+            None => None,
+        };
+        if let Some(cmd) = cmd {
+            self.process_cli_command(cmd).await;
         }
     }
 
@@ -267,6 +310,24 @@ impl AppTask {
     fn handle_downlink_data(&self, psi: i32, data: nextgsim_common::OctetString) {
         debug!("Downlink data delivery: psi={}, len={}", psi, data.len());
         // Downlink data forwarding to TUN is handled in main.rs
+    }
+
+    /// Feeds one message to the task the way its run loop does, without the
+    /// loop or the CLI server. Returns `false` when the message would end the
+    /// loop. Lets a test drive the App task with the NAS task's real updates.
+    pub async fn handle_message(&mut self, msg: AppMessage) -> bool {
+        match msg {
+            AppMessage::StatusUpdate(update) => self.handle_status_update(update),
+            AppMessage::CliCommand(cmd) => self.handle_cli_command(cmd).await,
+            AppMessage::TunDataDelivery { psi, data } => self.handle_tun_data(psi, data).await,
+            AppMessage::TunError { error } => error!("TUN error: {}", error),
+            AppMessage::DownlinkDataDelivery { psi, data } => self.handle_downlink_data(psi, data),
+            AppMessage::PerformSwitchOff => {
+                info!("Performing switch off");
+                return false;
+            }
+        }
+        true
     }
 
     /// Updates the RM state.
@@ -292,7 +353,7 @@ impl AppTask {
 /// - `info` - Show UE information
 /// - `status` - Show UE status
 /// - `timers` - Show active timers
-/// - `deregister [--switch-off]` - Deregister from network
+/// - `deregister [normal|switch-off]` - Deregister from network (`--switch-off`/`-s` also accepted)
 /// - `ps-establish [--type <type>] [--apn <apn>] [--sst <sst>]` - Establish PDU session
 /// - `ps-release <psi>` - Release PDU session
 /// - `ps-release-all` - Release all PDU sessions
@@ -314,8 +375,34 @@ pub fn parse_ue_cli_command(input: &str) -> Result<UeCliCommandType, String> {
         "status" => Ok(UeCliCommandType::Status),
         "timers" => Ok(UeCliCommandType::Timers),
         "deregister" => {
-            let switch_off = tokens.iter().any(|&t| t == "--switch-off" || t == "-s");
-            Ok(UeCliCommandType::Deregister { switch_off })
+            // UERANSIM's nr-cli form `deregister <type>`, plus the older flag
+            // spelling. The type is the TS 24.501 §9.11.3.20 switch-off bit:
+            // "normal" sends a de-registration the AMF answers with a
+            // DEREGISTRATION ACCEPT, "switch-off" one it does not answer.
+            let mut switch_off = None;
+            for &t in &tokens[1..] {
+                let this = match t.to_lowercase().as_str() {
+                    "normal" => false,
+                    "switch-off" | "--switch-off" | "-s" => true,
+                    "disable-5g" | "remove-sim" => {
+                        return Err(format!(
+                            "deregister {t} is not supported (supported: normal, switch-off)"
+                        ))
+                    }
+                    other => {
+                        return Err(format!(
+                            "Unknown de-registration type: {other} (expected normal or switch-off)"
+                        ))
+                    }
+                };
+                if switch_off.is_some_and(|s| s != this) {
+                    return Err("Conflicting de-registration types".to_string());
+                }
+                switch_off = Some(this);
+            }
+            Ok(UeCliCommandType::Deregister {
+                switch_off: switch_off.unwrap_or(false),
+            })
         }
         "ps-establish" => {
             let mut session_type = None;
@@ -386,26 +473,8 @@ impl Task for AppTask {
                 msg = rx.recv() => {
                     match msg {
                         Some(TaskMessage::Message(app_msg)) => {
-                            match app_msg {
-                                AppMessage::StatusUpdate(update) => {
-                                    self.handle_status_update(update);
-                                }
-                                AppMessage::CliCommand(cmd) => {
-                                    self.handle_cli_command(cmd).await;
-                                }
-                                AppMessage::TunDataDelivery { psi, data } => {
-                                    self.handle_tun_data(psi, data).await;
-                                }
-                                AppMessage::TunError { error } => {
-                                    error!("TUN error: {}", error);
-                                }
-                                AppMessage::DownlinkDataDelivery { psi, data } => {
-                                    self.handle_downlink_data(psi, data);
-                                }
-                                AppMessage::PerformSwitchOff => {
-                                    info!("Performing switch off");
-                                    break;
-                                }
+                            if !self.handle_message(app_msg).await {
+                                break;
                             }
                         }
                         Some(TaskMessage::Shutdown) => {
@@ -628,6 +697,118 @@ mod tests {
 
         task.set_mm_sub_state(MmSubState::RegisteredNormalService);
         assert_eq!(task.mm_sub_state, MmSubState::RegisteredNormalService);
+    }
+
+    /// A task base whose NAS receiver is kept, so a test can see what the App
+    /// task asks the NAS task to do.
+    fn create_task_base_with_nas_rx() -> (UeTaskBase, mpsc::Receiver<TaskMessage<NasMessage>>) {
+        let mut base = create_task_base();
+        let (nas_tx, nas_rx) = mpsc::channel::<TaskMessage<NasMessage>>(8);
+        base.nas_tx = TaskHandle::new(nas_tx);
+        (base, nas_rx)
+    }
+
+    fn cli(command: UeCliCommandType) -> AppMessage {
+        AppMessage::CliCommand(UeCliCommand {
+            command,
+            response_addr: None,
+        })
+    }
+
+    #[test]
+    fn the_publisher_reports_each_5gmm_change_once() {
+        let mut state = MmStateMachine::new();
+        let mut publisher = MmStatePublisher::new();
+        assert!(
+            publisher.poll(&state).is_some(),
+            "the first poll always reports"
+        );
+        assert!(publisher.poll(&state).is_none(), "no change, no update");
+
+        state.switch_mm_state(MmSubState::RegisteredNormalService);
+        match publisher.poll(&state) {
+            Some(UeStatusUpdate::MmStateChanged {
+                rm_state,
+                mm_state,
+                mm_sub_state,
+            }) => {
+                assert_eq!(rm_state, RmState::Registered);
+                assert_eq!(mm_state, MmState::Registered);
+                assert_eq!(mm_sub_state, MmSubState::RegisteredNormalService);
+            }
+            other => panic!("expected MmStateChanged, got {other:?}"),
+        }
+        assert!(publisher.poll(&state).is_none());
+    }
+
+    /// Issue #266: `deregister` reached the App task, which still believed the
+    /// UE DEREGISTERED because nothing ever told it otherwise, and answered
+    /// "not registered" without asking the NAS task for anything.
+    #[tokio::test]
+    async fn deregister_reaches_the_nas_task_once_the_nas_task_reports_registered() {
+        let (base, mut nas_rx) = create_task_base_with_nas_rx();
+        let mut task = AppTask::new_without_cli(base);
+
+        // What the NAS task publishes after a Registration Accept.
+        let mut state = MmStateMachine::new();
+        state.switch_mm_state(MmSubState::RegisteredNormalService);
+        let update = MmStatePublisher::new().poll(&state).unwrap();
+        assert!(task.handle_message(AppMessage::StatusUpdate(update)).await);
+
+        assert!(
+            task.handle_message(cli(parse_ue_cli_command("deregister normal").unwrap()))
+                .await
+        );
+        match nas_rx.try_recv() {
+            Ok(TaskMessage::Message(NasMessage::InitiateDeregistration { switch_off })) => {
+                assert!(!switch_off, "normal de-registration is not switch-off");
+            }
+            other => panic!("expected InitiateDeregistration, got {other:?}"),
+        }
+
+        // De-registration in progress: a second command is refused.
+        let mut publisher = MmStatePublisher::new();
+        state.switch_mm_state(MmSubState::DeregisteredInitiated);
+        let update = publisher.poll(&state).unwrap();
+        task.handle_message(AppMessage::StatusUpdate(update)).await;
+        task.handle_message(cli(parse_ue_cli_command("deregister switch-off").unwrap()))
+            .await;
+        assert!(nas_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn switch_off_reaches_the_nas_task_as_switch_off() {
+        let (base, mut nas_rx) = create_task_base_with_nas_rx();
+        let mut task = AppTask::new_without_cli(base);
+        let mut state = MmStateMachine::new();
+        state.switch_mm_state(MmSubState::RegisteredNormalService);
+        let update = MmStatePublisher::new().poll(&state).unwrap();
+        task.handle_message(AppMessage::StatusUpdate(update)).await;
+
+        task.handle_message(cli(parse_ue_cli_command("deregister switch-off").unwrap()))
+            .await;
+        assert!(matches!(
+            nas_rx.try_recv(),
+            Ok(TaskMessage::Message(NasMessage::InitiateDeregistration {
+                switch_off: true
+            }))
+        ));
+    }
+
+    #[test]
+    fn deregister_takes_the_nr_cli_type_argument() {
+        assert!(matches!(
+            parse_ue_cli_command("deregister normal").unwrap(),
+            UeCliCommandType::Deregister { switch_off: false }
+        ));
+        assert!(matches!(
+            parse_ue_cli_command("deregister switch-off").unwrap(),
+            UeCliCommandType::Deregister { switch_off: true }
+        ));
+        assert!(parse_ue_cli_command("deregister disable-5g").is_err());
+        assert!(parse_ue_cli_command("deregister remove-sim").is_err());
+        assert!(parse_ue_cli_command("deregister bogus").is_err());
+        assert!(parse_ue_cli_command("deregister normal switch-off").is_err());
     }
 
     #[tokio::test]
