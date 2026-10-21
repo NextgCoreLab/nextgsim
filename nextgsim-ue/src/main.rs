@@ -685,6 +685,13 @@ impl UeApp {
                     .send(AppMessage::StatusUpdate(update))
                     .await;
             }
+            // The CM state rides the same publisher (issue #270).
+            if let Some(update) = mm_state_publisher.poll_cm(orch.state()) {
+                let _ = task_base
+                    .app_tx
+                    .send(AppMessage::StatusUpdate(update))
+                    .await;
+            }
             tokio::select! {
             _ = sl_prs_tick.tick(), if sl_prs_enabled => {
                 // The occasion itself is the sidelink task's business: it owns the
