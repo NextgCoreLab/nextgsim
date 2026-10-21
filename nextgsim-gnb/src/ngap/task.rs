@@ -5856,7 +5856,7 @@ fn tmgi_hex(tmgi: &[u8; 6]) -> String {
 /// these two cases. Both are **extension additions** to `CauseRadioNetwork`
 /// (whose extension root ends at 44), and the vendored APER codec rejects
 /// extended enumerated values on encode
-/// (`vendor/asn1-codecs/src/per/common/encode/mod.rs`: "Encode of extended
+/// (asn1-codegen `asn1-codecs/src/per/common/encode/mod.rs`: "Encode of extended
 /// enumerated not yet implemented"). Emitting the precise cause would therefore
 /// fail to encode the whole response transfer and lose the unicast session with
 /// it, so a refusal is reported as `radio-network/unspecified` and the precise

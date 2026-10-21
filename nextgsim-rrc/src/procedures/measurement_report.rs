@@ -1198,7 +1198,7 @@ mod tests {
     /// `encode_choice_idx_common` returned `EncodeNotSupported` — so a UE could not
     /// put an inter-RAT measurement result on the wire at all, whatever #107 did
     /// about the hand-rolled report: the block was one layer below, in the codec
-    /// crate. The fork under `vendor/asn1-codecs` implements X.691 §23.6 (the
+    /// crate. The fork (`asn1-codecs` in NextgCoreLab/asn1-codegen) implements X.691 §23.6 (the
     /// extension index as a normally small non-negative whole number) and §23.8
     /// (the arm's value as a length-prefixed open type).
     ///

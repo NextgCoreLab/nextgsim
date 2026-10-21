@@ -30,7 +30,7 @@
 //! neither does. Recorded because the *reason* is non-obvious and a future agent
 //! extending this module will hit them:
 //!
-//! **1. The extended-SEQUENCE encode gap does not bite.** `vendor/asn1-codecs`'s
+//! **1. The extended-SEQUENCE encode gap does not bite.** asn1-codegen's `asn1-codecs`
 //! `encode_sequence_header_common` still returns `EncodeNotSupported` for an extended
 //! SEQUENCE carrying an extension addition (issue #117 implemented the extended-CHOICE
 //! case only). `SL-ConfigDedicatedNR-r16` **is** an extensible SEQUENCE — it has `...`
