@@ -920,16 +920,30 @@ impl UeApp {
                             info!("RRC connection setup complete");
                             orch.state_mut().switch_cm_state(CmState::Connected);
                         }
-                        NasMessage::RrcConnectionRelease => {
-                            info!("RRC connection released");
-                            orch.state_mut().switch_cm_state(CmState::Idle);
+                        NasMessage::RrcConnectionRelease | NasMessage::RadioLinkFailure => {
+                            if matches!(msg, NasMessage::RadioLinkFailure) {
+                                warn!("Radio link failure");
+                            } else {
+                                info!("RRC connection released");
+                            }
+                            // CM-IDLE, plus any registration that had to wait for
+                            // the NAS signalling connection to go (TS 24.501
+                            // §5.5.2.3.2, issue #265).
+                            let outs = orch.on_nas_signalling_connection_released();
+                            process_mm_outputs(
+                                outs,
+                                &mut orch,
+                                &mut sm_orch,
+                                &sm_session_params,
+                                &mut plmn_selector,
+                                &task_base,
+                                &tun_tx,
+                                &mut pdu_counter,
+                            )
+                            .await;
                         }
                         NasMessage::RrcEstablishmentFailure => {
                             warn!("RRC establishment failure");
-                        }
-                        NasMessage::RadioLinkFailure => {
-                            warn!("Radio link failure");
-                            orch.state_mut().switch_cm_state(CmState::Idle);
                         }
                         NasMessage::Paging { paging_s_tmsi } => {
                             info!(
