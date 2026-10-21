@@ -635,7 +635,7 @@ jobs:
           docker rm builder
           # The RAN binaries are this job's whole point, so their absence is a
           # hard failure here rather than a puzzling compose error later.
-          test -f docker/rust/binaries/nr-gnb && test -f docker/rust/binaries/nr-ue \
+          test -f docker/rust/binaries/nr-gnb && test -f docker/rust/binaries/nr-ue && test -f docker/rust/binaries/nr-cli \
             || { echo "::error::nr-gnb or nr-ue missing from the builder output -- this \
                  repo's binaries did not compile. Check the builder log."; \
                  ls -la docker/rust/binaries/; exit 1; }
@@ -714,6 +714,55 @@ jobs:
                  succeeded, so N2 transport is up and this is a NAS-layer failure."; \
                  tail -80 /tmp/ue.log; docker compose logs --tail=80 amf; exit 1; }
           echo "UE registered. This repo's RAN still interoperates with nextgcore."
+
+      - name: Release the UE to CM-IDLE and bring it back with a Service Request (#252)
+        # A Service Request sent from 5GMM-IDLE is an initial NAS message: integrity
+        # protected, NOT ciphered, non-cleartext IEs in the NAS message container
+        # (TS 24.501 §4.4.6 b), §5.6.1.2.1). Before #252 this UE ciphered the whole
+        # message, hiding the 5G-S-TMSI, and amfd logged "Unhandled NAS message type"
+        # for it. Asserted at the signalling level only: user-plane re-activation and
+        # network-triggered paging are blocked on nextgcore #540.
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          for _ in $(seq 1 60); do
+            docker compose logs ue > /tmp/ue.log 2>&1 || true
+            if grep -qF 'is now ACTIVE' /tmp/ue.log; then break; fi
+            sleep 2
+          done
+          grep -F 'is now ACTIVE' /tmp/ue.log \
+            || { echo "::error::no PDU session, so no TUN to originate uplink data on"; \
+                 tail -60 /tmp/ue.log; exit 1; }
+          # nr-cli must run inside the gNB container (its CLI server binds 127.0.0.1).
+          docker cp binaries/nr-cli nextgsim-gnb:/tmp/nr-cli
+          docker compose exec -T --user root gnb chmod 0755 /tmp/nr-cli
+          UE_ID=$(docker compose exec -T gnb /tmp/nr-cli gnb --exec 'ue-list' \
+                  | grep -oE 'ue_id: [0-9]+' | head -1 | grep -oE '[0-9]+')
+          test -n "$UE_ID" || { echo "::error::the gNB listed no UE context"; exit 1; }
+          docker compose exec -T gnb /tmp/nr-cli gnb --exec "ue-release ${UE_ID}"
+          for _ in $(seq 1 30); do
+            docker compose logs ue > /tmp/ue.log 2>&1 || true
+            if grep -qF 'Received RRC Release' /tmp/ue.log; then break; fi
+            sleep 1
+          done
+          grep -F 'Received RRC Release' /tmp/ue.log \
+            || { echo "::error::the UE never received RRCRelease, so it is not CM-IDLE"; \
+                 tail -60 /tmp/ue.log; exit 1; }
+          # Uplink data from CM-IDLE triggers the Service Request (TS 24.501 §5.6.1.1).
+          docker compose exec -T ue ping -I uesimtun -c 3 -W 3 10.45.0.1 || true
+          for _ in $(seq 1 30); do
+            docker compose logs amf > /tmp/amf.log 2>&1 || true
+            if grep -qF 'Service Request from CM-IDLE' /tmp/amf.log; then break; fi
+            sleep 1
+          done
+          grep -F 'Service Request from CM-IDLE' /tmp/amf.log \
+            || { echo "::error::the AMF never accepted the idle-mode Service Request"; \
+                 grep -iE 'service|unhandled' /tmp/amf.log | tail -20; exit 1; }
+          docker compose logs ue > /tmp/ue.log 2>&1 || true
+          grep -F 'Service Accept received' /tmp/ue.log \
+            || { echo "::error::the UE never received the Service Accept"; \
+                 tail -60 /tmp/ue.log; exit 1; }
+          echo "Idle-mode Service Request accepted by nextgcore."
 
       - name: Collect logs on failure
         if: failure()

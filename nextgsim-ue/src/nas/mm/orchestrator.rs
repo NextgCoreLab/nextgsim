@@ -3803,7 +3803,10 @@ mod tests {
         pdu: &[u8],
     ) -> (ServiceRequest, Option<ServiceRequest>) {
         assert_eq!(pdu[0], 0x7E);
-        assert_eq!(pdu[1], 0x01, "an initial NAS message from 5GMM-IDLE is integrity protected, not ciphered");
+        assert_eq!(
+            pdu[1], 0x01,
+            "an initial NAS message from 5GMM-IDLE is integrity protected, not ciphered"
+        );
         let sec = orch.security_context();
         let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
         assert_eq!(pdu[6], count.sqn, "sequence number");
@@ -5149,11 +5152,17 @@ mod tests {
         let (req, _) = open_initial_service_request(&orch, &pdu); // header type 1 + MAC
         assert_eq!(&pdu[7..10], &[0x7E, 0x00, 0x4C]);
         // Octet 4 carries the ngKSI / service type half-octet pair. Its nibble
-        // order is tracked separately (see the spec): this codec and
+        // order is nextgsim #257 / nextgcore #537: this codec and
         // nextgcore's both put the ngKSI in bits 5-8, so it is checked through
         // the decoder here rather than pinned.
-        assert_eq!(req.service_type.service_type, ServiceType::MobileTerminatedServices);
-        assert_eq!(&pdu[11..], &[0x00, 0x07, 0xF4, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            req.service_type.service_type,
+            ServiceType::MobileTerminatedServices
+        );
+        assert_eq!(
+            &pdu[11..],
+            &[0x00, 0x07, 0xF4, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF]
+        );
     }
 
     /// From 5GMM-CONNECTED a SERVICE REQUEST rides an existing NAS signalling
@@ -5194,7 +5203,10 @@ mod tests {
         let (outer, inner) = open_initial_service_request(&orch, &pdu);
         // GUTI TMSI bytes were 0xDEADBEEF; the 5G-S-TMSI carries set/ptr + TMSI
         assert_eq!(&outer.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(outer.uplink_data_status, None, "a non-cleartext IE must not be sent in the clear");
+        assert_eq!(
+            outer.uplink_data_status, None,
+            "a non-cleartext IE must not be sent in the clear"
+        );
         let inner = inner.expect("non-cleartext IEs travel in the NAS message container");
         assert_eq!(&inner.tmsi.data[3..7], &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(inner.uplink_data_status, Some(0x0008), "PSI 3 is bit 3");
@@ -6012,7 +6024,10 @@ mod tests {
 
         // No non-cleartext IE to send, so no container (§4.4.6 b) 3)).
         let (req, inner) = open_initial_service_request(&orch, &pdu);
-        assert!(inner.is_none(), "an MT request with nothing non-cleartext carries no container");
+        assert!(
+            inner.is_none(),
+            "an MT request with nothing non-cleartext carries no container"
+        );
 
         assert_eq!(
             req.service_type.service_type,
