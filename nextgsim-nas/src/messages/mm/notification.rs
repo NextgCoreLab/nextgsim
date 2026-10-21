@@ -7,6 +7,7 @@ use bytes::{Buf, BufMut};
 use thiserror::Error;
 
 use crate::enums::MmMessageType;
+use crate::header::PlainMmHeader;
 use crate::ies::ie1::AccessType;
 
 /// Error type for Notification message encoding/decoding
@@ -61,10 +62,8 @@ impl Notification {
         Self { access_type }
     }
 
-    /// Decode from bytes (after header has been parsed)
-    ///
-    /// The access type is encoded in the spare half-octet that was part
-    /// of the header. It should be passed in from the header parsing.
+    /// Build from an already-extracted Access type half octet (bits 1-4 of the
+    /// octet after the message type). Reserved values are refused.
     pub fn decode_with_access_type(access_type_val: u8) -> Result<Self, NotificationError> {
         let access_type = AccessType::try_from(access_type_val & 0x03).map_err(|_| {
             NotificationError::InvalidIeValue(format!(
@@ -76,42 +75,33 @@ impl Notification {
 
     /// Decode from bytes (after header has been parsed)
     ///
-    /// For the Notification message, the access type is in the spare
-    /// half-octet of the security header type byte. Since the header
-    /// decoder may have already consumed it, we read it from the
-    /// remaining buffer if present. If the header parsing already
-    /// extracted the access type, use `decode_with_access_type` instead.
+    /// The Access type is a mandatory V IE in bits 1-4 of the octet after the
+    /// message type (TS 24.501 Table 8.2.23.1.1, §8.1 b)); its value is in bits
+    /// 1-2 (§9.11.2.1A). A missing octet or a reserved value is an error: the
+    /// old decoder silently defaulted both to 3GPP access.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, NotificationError> {
-        // The access type is encoded in the spare half of the
-        // security header type octet. If the caller already parsed
-        // the header, this byte may already be consumed.
-        // In the simplest case with no additional IEs, the body is empty.
-        // Default to 3GPP access if we cannot determine from buffer.
-        if buf.remaining() >= 1 {
-            let val = buf.get_u8();
-            let access_type =
-                AccessType::try_from(val & 0x03).unwrap_or(AccessType::ThreeGppAccess);
-            Ok(Self { access_type })
-        } else {
-            // No additional data; access type was in header spare bits
-            Ok(Self::default())
+        if buf.remaining() < 1 {
+            return Err(NotificationError::BufferTooShort {
+                expected: 1,
+                actual: 0,
+            });
         }
+        Self::decode_with_access_type(buf.get_u8() & 0x0F)
     }
 
     /// Encode to bytes (including header)
     ///
-    /// The access type is encoded in the spare half-octet of the
-    /// security header type octet (upper nibble).
+    /// TS 24.501 Table 8.2.23.1.1: after the message type comes the Access type
+    /// (V, 1/2) followed by a spare half octet, so per §8.1 b) the access type
+    /// occupies bits 1-4 of octet 4 and bits 5-8 are spare. It used to be
+    /// written into the spare half of the security header type octet (octet 2,
+    /// which a receiver reads as part of the security header) and octet 4 was
+    /// never written at all (nextgsim #257).
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        // EPD
-        buf.put_u8(0x7E); // MobilityManagement EPD
-
-        // Security header type (lower nibble = 0x00) + access type (upper nibble)
+        let header = PlainMmHeader::new(MmMessageType::Notification);
+        header.encode(buf);
         let access_val: u8 = self.access_type.into();
-        buf.put_u8((access_val << 4) & 0xF0);
-
-        // Message type
-        buf.put_u8(MmMessageType::Notification as u8);
+        buf.put_u8(access_val & 0x0F);
     }
 
     /// Get the message type
@@ -241,10 +231,11 @@ mod tests {
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 
-        assert_eq!(buf.len(), 3);
-        assert_eq!(buf[0], 0x7E); // EPD
-        assert_eq!(buf[1], 0x10); // Access type (01) in upper nibble
-        assert_eq!(buf[2], 0x65); // Message Type (Notification)
+        // Hand-derived from Table 8.2.23.1.1 + §8.1 b): EPD 7E; security
+        // header type 0 / spare 0; message type 65; Access type 01 (3GPP) in
+        // bits 1-4, spare half octet 0 in bits 5-8. The old encoder wrote
+        // `7E 10 65`, folding the access type into the security header octet.
+        assert_eq!(buf, [0x7E, 0x00, 0x65, 0x01]);
     }
 
     #[test]
@@ -253,10 +244,8 @@ mod tests {
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 
-        assert_eq!(buf.len(), 3);
-        assert_eq!(buf[0], 0x7E); // EPD
-        assert_eq!(buf[1], 0x20); // Access type (10) in upper nibble
-        assert_eq!(buf[2], 0x65); // Message Type
+        // Access type 10 (non-3GPP) in bits 1-4 of octet 4.
+        assert_eq!(buf, [0x7E, 0x00, 0x65, 0x02]);
     }
 
     #[test]
@@ -288,10 +277,30 @@ mod tests {
         let mut buf = Vec::new();
         msg.encode(&mut buf);
 
-        // Extract access type from the encoded header byte
-        let access_type_val = (buf[1] >> 4) & 0x0F;
-        let decoded = Notification::decode_with_access_type(access_type_val).unwrap();
+        // The body after the 3-octet header is the Access type octet.
+        let decoded = Notification::decode(&mut &buf[3..]).unwrap();
         assert_eq!(decoded.access_type, AccessType::ThreeGppAccess);
+        let msg = Notification::new(AccessType::NonThreeGppAccess);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        let decoded = Notification::decode(&mut &buf[3..]).unwrap();
+        assert_eq!(decoded.access_type, AccessType::NonThreeGppAccess);
+    }
+
+    /// The Access type is mandatory: a missing octet or a reserved value is an
+    /// error, not a silent default to 3GPP access (nextgsim #257).
+    #[test]
+    fn test_notification_decode_refuses_missing_or_reserved_access_type() {
+        assert!(Notification::decode(&mut &[][..]).is_err());
+        assert!(Notification::decode(&mut &[0x00u8][..]).is_err());
+        assert!(Notification::decode(&mut &[0x03u8][..]).is_err());
+        // Bits 5-8 are the spare half octet and are ignored on receipt.
+        assert_eq!(
+            Notification::decode(&mut &[0xF2u8][..])
+                .unwrap()
+                .access_type,
+            AccessType::NonThreeGppAccess
+        );
     }
 
     // ========================================================================
