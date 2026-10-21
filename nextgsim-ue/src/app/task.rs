@@ -18,8 +18,8 @@ use nextgsim_common::cli_server::{CliCommand, CliServer};
 use crate::app::{CliHandler, NasAction};
 use crate::nas::mm::{MmState, MmStateMachine, MmSubState, RmState};
 use crate::tasks::{
-    AppMessage, NasMessage, Task, TaskMessage, UeCliCommand, UeCliCommandType, UeStatusUpdate,
-    UeTaskBase,
+    AppMessage, CmState, NasMessage, Task, TaskMessage, UeCliCommand, UeCliCommandType,
+    UeStatusUpdate, UeTaskBase,
 };
 
 /// Tracks the 5GMM state last published to the App task, so the NAS task
@@ -28,6 +28,9 @@ use crate::tasks::{
 #[derive(Debug, Default)]
 pub struct MmStatePublisher {
     last: Option<(RmState, MmState, MmSubState)>,
+    /// The CM state last published (issue #270: it was never published, so the
+    /// CLI `status` reported CM-IDLE forever).
+    last_cm: Option<crate::nas::mm::CmState>,
 }
 
 impl MmStatePublisher {
@@ -49,6 +52,22 @@ impl MmStatePublisher {
             rm_state: now.0,
             mm_state: now.1,
             mm_sub_state: now.2,
+        })
+    }
+
+    /// Returns a [`UeStatusUpdate::CmStateChanged`] when the CM state in
+    /// `state` differs from what was last published, and records it.
+    pub fn poll_cm(&mut self, state: &MmStateMachine) -> Option<UeStatusUpdate> {
+        let now = state.cm_state();
+        if self.last_cm == Some(now) {
+            return None;
+        }
+        self.last_cm = Some(now);
+        Some(UeStatusUpdate::CmStateChanged {
+            cm_state: match now {
+                crate::nas::mm::CmState::Idle => CmState::Idle,
+                crate::nas::mm::CmState::Connected => CmState::Connected,
+            },
         })
     }
 }
@@ -135,6 +154,7 @@ impl AppTask {
             }
             UeStatusUpdate::CmStateChanged { cm_state } => {
                 info!("CM state changed to: {}", cm_state);
+                self.cli_handler.set_cm_state(cm_state);
             }
             UeStatusUpdate::MmStateChanged {
                 rm_state,
@@ -739,6 +759,43 @@ mod tests {
             other => panic!("expected MmStateChanged, got {other:?}"),
         }
         assert!(publisher.poll(&state).is_none());
+    }
+
+    /// Issue #270: the CM state is published once per change, and `status`
+    /// reports what was published: CM-CONNECTED while connected, CM-IDLE after
+    /// the RRC release.
+    #[tokio::test]
+    async fn status_reports_the_cm_state_the_nas_task_publishes() {
+        let mut task = AppTask::new_without_cli(create_task_base());
+        let mut publisher = MmStatePublisher::new();
+        let mut state = MmStateMachine::new();
+        state.switch_mm_state(MmSubState::RegisteredNormalService);
+        let status = |task: &mut AppTask| {
+            let (result, _) = task.cli_handler.handle_command(
+                &UeCliCommand {
+                    command: UeCliCommandType::Status,
+                    response_addr: None,
+                },
+                task.rm_state,
+                task.mm_state,
+                task.mm_sub_state,
+            );
+            assert!(result.success);
+            result.message
+        };
+
+        state.switch_cm_state(crate::nas::mm::CmState::Connected);
+        let update = publisher.poll_cm(&state).expect("CM change is published");
+        assert!(publisher.poll_cm(&state).is_none(), "no change, no update");
+        task.handle_message(AppMessage::StatusUpdate(update)).await;
+        let out = status(&mut task);
+        assert!(out.contains("CM-CONNECTED"), "{out}");
+
+        state.switch_cm_state(crate::nas::mm::CmState::Idle);
+        let update = publisher.poll_cm(&state).expect("CM change is published");
+        task.handle_message(AppMessage::StatusUpdate(update)).await;
+        let out = status(&mut task);
+        assert!(out.contains("CM-IDLE"), "{out}");
     }
 
     /// Issue #266: `deregister` reached the App task, which still believed the
