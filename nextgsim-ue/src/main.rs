@@ -1518,6 +1518,20 @@ async fn process_mm_outputs(
                     process_sm_outputs(sm_outs, orch, task_base, tun_tx, pdu_counter).await;
                 }
             }
+            MmOutput::ReleasePduSessionsLocally => {
+                // TS 24.501 §5.5.2.1 / §5.5.2.3.2 (nextgsim #272): a network
+                // de-registration releases the sessions locally. Each becomes a
+                // SessionReleased, which tears its TUN interface down; with none
+                // left, the next Registration Accept re-establishes the defaults.
+                let sm_outs = sm_orch.release_all_locally();
+                if !sm_outs.is_empty() {
+                    info!(
+                        "Network-initiated de-registration: {} PDU session(s) released locally",
+                        sm_outs.len()
+                    );
+                    process_sm_outputs(sm_outs, orch, task_base, tun_tx, pdu_counter).await;
+                }
+            }
         }
     }
 
@@ -1767,6 +1781,13 @@ async fn process_secondary_mm_outputs(
                 tracing::debug!(
                     "MINT: secondary subscription {index} PDU session status {status:#06x} \
                      not reconciled (secondary session state is held separately)"
+                );
+            }
+            MmOutput::ReleasePduSessionsLocally => {
+                // As above: a secondary's sessions are not held here.
+                tracing::debug!(
+                    "MINT: secondary subscription {index} de-registered by the network; \
+                     its sessions are not held here"
                 );
             }
         }

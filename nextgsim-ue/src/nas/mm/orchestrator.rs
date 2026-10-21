@@ -175,6 +175,12 @@ pub enum MmOutput {
     /// to [`crate::nas::sm::SmOrchestrator::reconcile_pdu_session_status`],
     /// which owns both the state and the teardown.
     NetworkPduSessionStatus(u16),
+    /// The UE is de-registered over 3GPP access by the network, so it releases
+    /// all its PDU sessions locally (TS 24.501 §5.5.2.1, §5.5.2.3.2). Session
+    /// state lives in the SM orchestrator, so the caller does the release
+    /// ([`crate::nas::sm::SmOrchestrator::release_all_locally`]) and the TUN
+    /// teardown (nextgsim #272).
+    ReleasePduSessionsLocally,
 }
 
 /// The Uplink data status bit for `psi` (TS 24.501 §9.11.3.44).
@@ -2969,6 +2975,10 @@ impl MmOrchestrator {
             accept.encode(&mut pdu);
             info!("Network-initiated de-registration: sending Deregistration Accept");
             outs.push(MmOutput::SendNasPdu(self.protect_if_active(pdu)));
+            // De-registered over 3GPP access: the PDU sessions go with it, so the
+            // default session is re-established after the next registration
+            // (nextgsim #272). The UE-initiated path already did this.
+            outs.push(MmOutput::ReleasePduSessionsLocally);
         }
 
         if let Some(sub) = result.new_sub_state {
@@ -6570,6 +6580,15 @@ mod tests {
             })
             .collect();
         assert_eq!(sent.len(), 1, "expected exactly one Deregistration Accept");
+        // Issue #272 (TS 24.501 §5.5.2.1): de-registered over 3GPP access, the UE
+        // releases its PDU sessions locally, after the accept.
+        assert!(
+            matches!(
+                outs.as_slice(),
+                [MmOutput::SendNasPdu(_), MmOutput::ReleasePduSessionsLocally]
+            ),
+            "{outs:?}"
+        );
 
         // Decipher the (protected) accept and confirm its message type.
         let sec = orch.security_context();
@@ -6593,6 +6612,33 @@ mod tests {
         assert_eq!(
             orch.state().mm_substate(),
             MmSubState::DeregisteredPlmnSearch
+        );
+    }
+
+    /// Issue #272: a de-registration for non-3GPP access only leaves the 3GPP
+    /// sessions alone.
+    #[test]
+    fn a_non_3gpp_network_deregistration_keeps_the_pdu_sessions() {
+        use nextgsim_nas::ies::ie1::{
+            DeRegistrationAccessType, IeDeRegistrationType, ReRegistrationRequired, SwitchOff,
+        };
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        let mut req = Vec::new();
+        nextgsim_nas::messages::mm::DeregistrationRequestUeTerminated::new(
+            IeDeRegistrationType::new(
+                DeRegistrationAccessType::NonThreeGppAccess,
+                ReRegistrationRequired::NotRequired,
+                SwitchOff::NormalDeRegistration,
+            ),
+        )
+        .encode(&mut req);
+        let protected = protect_downlink(&orch, &req, 2);
+        let outs = orch.handle_downlink(&protected);
+        assert!(
+            !outs.contains(&MmOutput::ReleasePduSessionsLocally),
+            "{outs:?}"
         );
     }
 
@@ -6629,7 +6675,9 @@ mod tests {
         // Issue #265: only the DEREGISTRATION ACCEPT goes out on the connection
         // the AMF is about to release; a REGISTRATION REQUEST sent on it was
         // lost and the UE waited out T3510.
-        assert_eq!(outs.len(), 1, "only the accept is sent now: {outs:?}");
+        assert_eq!(outs.len(), 2, "only the accept is sent now: {outs:?}");
+        // Issue #272: the sessions are released locally with the de-registration.
+        assert_eq!(outs[1], MmOutput::ReleasePduSessionsLocally);
         assert!(!outs.iter().any(is_registration_request));
         assert_eq!(
             orch.state().mm_substate(),
