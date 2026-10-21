@@ -490,6 +490,20 @@ impl CellSelector {
         self.reselection_params.candidate_better_since = None;
     }
 
+    /// Forgets every detected cell and the camp, so cell selection starts over
+    /// from the cells the RLS layer reports next.
+    ///
+    /// For a local release of the RRC connection (nextgsim #275): the RLS layer
+    /// takes a fresh STI and drops its own cell table, so the cells it reports
+    /// afterwards carry new IDs. The old IDs name nothing, and camping on one
+    /// left the UE unable to establish a connection ("no serving cell").
+    pub fn forget_cells(&mut self) {
+        self.cells.clear();
+        self.current_cell = None;
+        self.reselection_params.reselection_candidate = None;
+        self.reselection_params.candidate_better_since = None;
+    }
+
     /// Get the current active cell, or `None` while not camped on any cell.
     pub fn current_cell(&self) -> Option<&ActiveCellInfo> {
         self.current_cell.as_ref()
