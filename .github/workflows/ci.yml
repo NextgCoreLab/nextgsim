@@ -52,12 +52,58 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     needs: check
+    # The job used to die mid-compile with "The runner has received a shutdown
+    # signal" / exit 143. That was the runner running out of memory (#278).
+    # `cargo test` compiles each generated-codec crate twice, once as the lib and
+    # once as its unit-test binary, and runs the two rustc processes concurrently.
+    # nextgsim-rrc's 5.5 MB generated rrc.rs costs about 9.7 GB per rustc with
+    # full debuginfo, and nextgsim-lte-rrc about 4.5 GB. The workspace build
+    # peaked at 17.7 GB summed RSS, on a runner with 16 GB of RAM and 4 GB of
+    # swap. The two fixes below are measured in #278. Both are needed.
+    # A healthy run finishes in about 10 minutes. 60 minutes turns a swap-thrash
+    # into a clear timeout instead of a 6-hour hang.
+    timeout-minutes: 60
+    env:
+      # No DWARF for CI test builds. This cuts rrc's rustc peak from 9.7 GB to
+      # 7.6 GB, and the workspace peak to about 14 GB. Panic messages keep their
+      # file:line, because that comes from `Location`, not debuginfo, and
+      # RUST_BACKTRACE frames keep their function names. Local builds are
+      # unaffected: this is an env override for this job only.
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Add swap headroom
+        # About 14 GB is still too close to 16 GB, and the peak depends on how
+        # the rrc / lte-rrc lib and test units happen to overlap. The 12 GB of
+        # extra swap goes on the runner's /mnt scratch disk, so the build space
+        # on / is untouched. It only absorbs the overlap. It is not paged
+        # through in steady state.
+        run: |
+          set -eu
+          nproc; free -m; swapon --show; df -h / /mnt
+          sudo fallocate -l 12G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          free -m
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace
+        # A background sampler records peak used RAM and swap, so a future
+        # regression shows up as a number in the log before it shows up as a
+        # dead runner.
+        run: |
+          ( while sleep 2; do
+              awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} /^SwapTotal/{st=$2} /^SwapFree/{sf=$2}
+                   END{printf "%d %d\n", (t-a)/1024, (st-sf)/1024}' /proc/meminfo
+            done > "$RUNNER_TEMP/mem.log" ) &
+          cargo test --workspace
+      - name: Peak memory
+        if: always()
+        run: |
+          echo "peak used RAM (MB): $(sort -n  -k1 "$RUNNER_TEMP/mem.log" | tail -1 | cut -d' ' -f1)"
+          echo "peak used swap (MB): $(sort -n -k2 "$RUNNER_TEMP/mem.log" | tail -1 | cut -d' ' -f2)"
+          df -h / /mnt
 
   clippy:
     name: Clippy
