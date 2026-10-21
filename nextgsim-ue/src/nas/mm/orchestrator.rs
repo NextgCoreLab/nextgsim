@@ -1583,13 +1583,21 @@ impl MmOrchestrator {
         // incorrect message". UE security capability and the NID *are* cleartext
         // IEs, so they stay. When a security context is already active the full
         // request is sent integrity-protected and all IEs are allowed.
-        let wire = if self.sec.is_active() {
-            plain
-        } else {
+        //
+        // TS 24.501 §4.4.6 b) / §4.4.5: a request sent from 5GMM-IDLE WITH a
+        // valid context (mobility or periodic registration update) is also an
+        // initial NAS message. It is integrity protected but NOT ciphered, carries
+        // the cleartext IEs only (with the current ngKSI, so the AMF can find the
+        // context the MAC is checked under), and the full request travels ciphered
+        // in the NAS message container. Ciphering the whole message instead hides
+        // the 5G-GUTI the AMF needs to locate that context (nextgsim #258). From
+        // 5GMM-CONNECTED the request rides an existing NAS signalling connection
+        // and is ciphered as usual.
+        let cleartext_request = |ksi: NasKeySetIdentifier| {
             let mut ct = RegistrationRequest::new(
                 Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
-                NasKeySetIdentifier::no_key(),
-                mobile_identity,
+                ksi,
+                mobile_identity.clone(),
             );
             ct.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
             if let Some(ref nid) = self.identity.snpn_nid {
@@ -1602,19 +1610,35 @@ impl MmOrchestrator {
             if self.identity.disaster_roaming {
                 ct.disaster_roaming = true;
             }
-            let mut ct_bytes = Vec::new();
-            ct.encode(&mut ct_bytes);
-            ct_bytes
+            ct
         };
+        let initial_protected = self.sec.is_active() && self.state.is_idle();
 
         info!(
-            "Sending Registration Request ({:?}), len={}, cleartext_only={}, T3510 started",
+            "Sending Registration Request ({:?}), len={}, cleartext_only={}, initial_protected={}, T3510 started",
             reg_type,
-            wire.len(),
-            !self.sec.is_active()
+            plain.len(),
+            !self.sec.is_active(),
+            initial_protected
         );
 
-        let pdu = self.protect_if_active(wire);
+        let pdu = if !self.sec.is_active() {
+            let mut ct_bytes = Vec::new();
+            cleartext_request(NasKeySetIdentifier::no_key()).encode(&mut ct_bytes);
+            self.protect_if_active(ct_bytes)
+        } else if initial_protected {
+            let mut outer = cleartext_request(ng_ksi);
+            let mut cleartext = Vec::new();
+            outer.encode(&mut cleartext);
+            self.protect_initial_nas(plain, cleartext, |container| {
+                outer.nas_message_container = Some(container);
+                let mut out = Vec::new();
+                outer.encode(&mut out);
+                out
+            })
+        } else {
+            self.protect_if_active(plain)
+        };
         vec![MmOutput::SendNasPdu(pdu)]
     }
 
@@ -3589,23 +3613,7 @@ mod tests {
         let outs = orch.start_registration(RegistrationType::InitialRegistration);
         let pdu = first_sent_pdu(&outs).to_vec();
         let protected = pdu[1] != 0x00;
-        let body = if protected {
-            let sec = orch.security_context();
-            let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
-            let mut payload = pdu[7..].to_vec();
-            nas_cipher(
-                sec.ciphering_algorithm(),
-                sec.keys().knas_enc().unwrap(),
-                &count,
-                NAS_BEARER,
-                NasDirection::Uplink,
-                &mut payload,
-            );
-            payload
-        } else {
-            pdu.clone()
-        };
-        let req = RegistrationRequest::decode(&mut &body[3..]).unwrap();
+        let (_, req) = open_registration_request(orch, &pdu);
         (req.mobile_identity.identity_type, req.ng_ksi.ksi, protected)
     }
 
@@ -3791,6 +3799,71 @@ mod tests {
             }
         }
         panic!("no SendNasPdu in outputs: {outs:?}");
+    }
+
+    /// Opens a REGISTRATION REQUEST PDU in whichever of the three forms the UE
+    /// sends it (nextgsim #258) and returns `(outer, full)`:
+    /// - security header type 0: no context, plain request (`outer == full`);
+    /// - type 1: an initial NAS message from 5GMM-IDLE with a valid context
+    ///   (TS 24.501 §4.4.6 b)) -- the MAC is checked, the outer request carries
+    ///   the cleartext IEs only, and `full` is the NAS message container
+    ///   deciphered with the uplink COUNT the MAC was computed over (or the outer
+    ///   request itself when it needed no container, §4.4.6 b) 3));
+    /// - type 2: from 5GMM-CONNECTED, the whole message ciphered.
+    fn open_registration_request(
+        orch: &MmOrchestrator,
+        pdu: &[u8],
+    ) -> (RegistrationRequest, RegistrationRequest) {
+        assert_eq!(pdu[0], 0x7E);
+        let decipher = |v: &mut Vec<u8>| {
+            let sec = orch.security_context();
+            let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+            nas_cipher(
+                sec.ciphering_algorithm(),
+                sec.keys().knas_enc().unwrap(),
+                &count,
+                NAS_BEARER,
+                NasDirection::Uplink,
+                v,
+            );
+        };
+        match pdu[1] {
+            0x00 => {
+                let r = RegistrationRequest::decode(&mut &pdu[3..]).unwrap();
+                (r.clone(), r)
+            }
+            0x01 => {
+                let sec = orch.security_context();
+                let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+                assert_eq!(pdu[6], count.sqn, "sequence number");
+                let mac = compute_nas_mac(
+                    sec.integrity_algorithm(),
+                    sec.keys().knas_int().unwrap(),
+                    &count,
+                    NasDirection::Uplink,
+                    count.sqn,
+                    &pdu[7..],
+                );
+                assert_eq!(&pdu[2..6], &mac, "MAC over the cleartext request");
+                let outer = RegistrationRequest::decode(&mut &pdu[10..]).unwrap();
+                let full = match outer.nas_message_container.as_ref() {
+                    Some(c) => {
+                        let mut v = c.clone();
+                        decipher(&mut v);
+                        RegistrationRequest::decode(&mut &v[3..]).unwrap()
+                    }
+                    None => outer.clone(),
+                };
+                (outer, full)
+            }
+            0x02 => {
+                let mut v = pdu[7..].to_vec();
+                decipher(&mut v);
+                let r = RegistrationRequest::decode(&mut &v[3..]).unwrap();
+                (r.clone(), r)
+            }
+            other => panic!("unexpected security header type {other:#04x}"),
+        }
     }
 
     /// Opens an initial SERVICE REQUEST sent from 5GMM-IDLE (TS 24.501
@@ -4642,9 +4715,22 @@ mod tests {
         assert!(orch.timers().t3512.is_running());
 
         let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3512, true, 1));
-        let pdu = first_sent_pdu(&outs);
-        // Periodic registration must be security protected (active ctx)
-        assert_eq!(pdu[1], 0x02);
+        let pdu = first_sent_pdu(&outs).to_vec();
+        // A periodic registration is sent from 5GMM-IDLE with the active
+        // context: an initial NAS message, so integrity protected but NOT
+        // ciphered (TS 24.501 §4.4.6 b), §4.4.5; nextgsim #258). This assertion
+        // used to pin header type 2, which hid the 5G-GUTI from the AMF.
+        assert_eq!(pdu[1], 0x01);
+        let (outer, full) = open_registration_request(&orch, &pdu);
+        assert_eq!(
+            outer.mobile_identity.identity_type,
+            MobileIdentityType::Guti,
+            "the 5G-GUTI is cleartext, so the AMF can find the context"
+        );
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::PeriodicRegistrationUpdating
+        );
         assert!(orch.timers().t3510.is_running());
     }
 
@@ -5163,6 +5249,82 @@ mod tests {
             &pdu[11..],
             &[0x00, 0x07, 0xF4, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF]
         );
+    }
+
+    /// nextgsim #258: a mobility registration update sent from 5GMM-IDLE with a
+    /// valid context is an initial NAS message (TS 24.501 §4.4.6 b)): integrity
+    /// protected but not ciphered, the cleartext IEs only outside, and the full
+    /// request -- here carrying the non-cleartext Requested NSSAI and Last
+    /// visited TAI -- inside the ciphered NAS message container.
+    ///
+    /// The outer octets are derived by hand from Table 8.2.6.1.1 and §8.1 b):
+    /// `7E 00 41` (EPD, plain header, REGISTRATION REQUEST); `02` = 5GS
+    /// registration type "mobility registration updating" (FOR 0) in bits 1-4,
+    /// the first half-octet IE, and ngKSI native/0 in bits 5-8; the 5G-GUTI as
+    /// LV-E `00 0B F2 99 F9 07 01 00 40 DE AD BE EF`; UE security capability
+    /// `2E 02 F0 70`; then the NAS message container `71 LL LL ...`.
+    #[test]
+    fn an_idle_mode_registration_is_integrity_protected_with_a_ciphered_container() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        let pdu = first_sent_pdu(&outs).to_vec();
+        assert_eq!(
+            pdu[1], 0x01,
+            "header type 1: integrity protected, not ciphered"
+        );
+        let (outer, full) = open_registration_request(&orch, &pdu); // checks the MAC
+
+        let head = [
+            0x7E, 0x00, 0x41, 0x02, 0x00, 0x0B, 0xF2, 0x99, 0xF9, 0x07, 0x01, 0x00, 0x40, 0xDE,
+            0xAD, 0xBE, 0xEF, 0x2E, 0x02, 0xF0, 0x70, 0x71,
+        ];
+        assert_eq!(&pdu[7..7 + head.len()], &head);
+        assert!(
+            outer.requested_nssai.is_none() && outer.last_visited_tai.is_none(),
+            "non-cleartext IEs must not appear outside the container"
+        );
+        let container = outer.nas_message_container.as_ref().expect("container");
+        let len = u16::from_be_bytes([pdu[7 + head.len()], pdu[8 + head.len()]]) as usize;
+        assert_eq!(len, container.len());
+        assert_eq!(
+            pdu.len(),
+            7 + head.len() + 2 + len,
+            "the container is the last IE"
+        );
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::MobilityRegistrationUpdating
+        );
+        assert!(
+            full.requested_nssai.is_some(),
+            "the full request is in the container"
+        );
+        assert_eq!(full.mobile_identity.identity_type, MobileIdentityType::Guti);
+        // The container is ciphered: the plaintext full request must not be
+        // readable in the outer PDU.
+        let mut plain_full = Vec::new();
+        full.encode(&mut plain_full);
+        assert_ne!(container, &plain_full);
+    }
+
+    /// From 5GMM-CONNECTED a REGISTRATION REQUEST rides the existing NAS
+    /// signalling connection, so it is ciphered as usual (TS 24.501 §4.4.5):
+    /// only the idle case changed for #258.
+    #[test]
+    fn a_registration_from_connected_mode_is_ciphered() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        let pdu = first_sent_pdu(&outs).to_vec();
+        assert_eq!(pdu[1], 0x02);
+        let (_, full) = open_registration_request(&orch, &pdu);
+        assert!(full.requested_nssai.is_some());
     }
 
     /// From 5GMM-CONNECTED a SERVICE REQUEST rides an existing NAS signalling
@@ -6657,23 +6819,7 @@ mod tests {
     ) -> (Option<PayloadContainerType>, Option<Vec<u8>>) {
         let outs = orch.start_registration(RegistrationType::InitialRegistration);
         let pdu = first_sent_pdu(&outs).to_vec();
-        let body = if pdu[1] == 0x00 {
-            pdu.clone()
-        } else {
-            let sec = orch.security_context();
-            let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
-            let mut payload = pdu[7..].to_vec();
-            nas_cipher(
-                sec.ciphering_algorithm(),
-                sec.keys().knas_enc().unwrap(),
-                &count,
-                NAS_BEARER,
-                NasDirection::Uplink,
-                &mut payload,
-            );
-            payload
-        };
-        let req = RegistrationRequest::decode(&mut &body[3..]).expect("decodes");
+        let (_, req) = open_registration_request(orch, &pdu);
         (req.payload_container_type, req.payload_container)
     }
 
