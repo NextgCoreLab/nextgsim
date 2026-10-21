@@ -475,6 +475,21 @@ impl CellSelector {
         }
     }
 
+    /// Forgets the camped cell, so the next [`Self::perform_cell_selection`]
+    /// selects afresh and reports the camp as a change.
+    ///
+    /// For leaving RRC_CONNECTED after a radio link failure (TS 38.331
+    /// §5.3.7.6 / §5.3.10, TS 38.304 §5.2.6): the UE performs cell selection.
+    /// Without this, the selector still believed it was camped on the failed
+    /// cell, so selecting that cell again counted as "no change". The RRC task
+    /// never re-assigned a serving cell, and the UE stayed without service
+    /// (issue #264).
+    pub fn clear_camp(&mut self) {
+        self.current_cell = None;
+        self.reselection_params.reselection_candidate = None;
+        self.reselection_params.candidate_better_since = None;
+    }
+
     /// Get the current active cell, or `None` while not camped on any cell.
     pub fn current_cell(&self) -> Option<&ActiveCellInfo> {
         self.current_cell.as_ref()

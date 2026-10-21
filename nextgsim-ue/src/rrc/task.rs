@@ -4538,7 +4538,12 @@ impl RrcTask {
             );
             self.reestablishment_proc
                 .on_timer_expired(&mut self.state_machine);
-            self.handle_establishment_failure().await;
+            // §5.3.7.6: "the actions upon going to RRC_IDLE ... with release
+            // cause 'RRC connection failure'". RRC_IDLE means NAS is CM-IDLE too,
+            // and the UE selects a cell again (issue #264). Before, only an
+            // establishment failure went to NAS, which left it CM-CONNECTED on
+            // a connection that no longer existed.
+            self.enter_idle_after_radio_link_failure().await;
         }
 
         // T304 (TS 38.331 §5.3.5.8.3): the UE could not synchronise with the target within
@@ -4605,6 +4610,30 @@ impl RrcTask {
         // having two. See `QOUT_RSRP_DBM`.
     }
 
+    /// Leaves RRC_CONNECTED for RRC_IDLE after a radio link failure that is
+    /// not (or no longer) being recovered by re-establishment (TS 38.331
+    /// §5.3.10.3, §5.3.7.6). The UE then performs cell selection
+    /// (TS 38.304 §5.2.6). The camp is cleared and the selection throttle reset,
+    /// so the next cycle selects a cell and hands it to RLS and NAS
+    /// (`AssignCurrentCell`, `ActiveCellChanged`). That is how service comes
+    /// back, through the NAS registration update that follows (issue #264).
+    /// NAS is told the connection is gone, so it enters CM-IDLE.
+    async fn enter_idle_after_radio_link_failure(&mut self) {
+        let _ = self.state_machine.on_rrc_release();
+        self.serving_cell_id = None;
+        self.measurement_manager.set_serving_cell(None);
+        self.cell_selector.clear_camp();
+        self.last_cell_selection = None;
+        if let Err(e) = self
+            .task_base
+            .nas_tx
+            .send(NasMessage::RadioLinkFailure)
+            .await
+        {
+            error!("Failed to notify NAS of radio link failure: {}", e);
+        }
+    }
+
     /// Handle radio link failure
     async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
         warn!("Radio link failure: {:?}", cause);
@@ -4648,16 +4677,7 @@ impl RrcTask {
                 Ok(mac) => mac,
                 Err(e) => {
                     error!("ShortMAC-I derivation failed: {} — going to idle", e);
-                    let _ = self.state_machine.on_rrc_release();
-                    self.serving_cell_id = None;
-                    if let Err(ne) = self
-                        .task_base
-                        .nas_tx
-                        .send(NasMessage::RadioLinkFailure)
-                        .await
-                    {
-                        error!("Failed to notify NAS of radio link failure: {}", ne);
-                    }
+                    self.enter_idle_after_radio_link_failure().await;
                     return;
                 }
             };
@@ -4713,16 +4733,7 @@ impl RrcTask {
                                 "RRCReestablishmentRequest encoding failed: {} -- going to idle",
                                 e
                             );
-                            let _ = self.state_machine.on_rrc_release();
-                            self.serving_cell_id = None;
-                            if let Err(ne) = self
-                                .task_base
-                                .nas_tx
-                                .send(NasMessage::RadioLinkFailure)
-                                .await
-                            {
-                                error!("Failed to notify NAS of radio link failure: {}", ne);
-                            }
+                            self.enter_idle_after_radio_link_failure().await;
                         }
                     }
                 }
@@ -4731,31 +4742,13 @@ impl RrcTask {
                         "Could not initiate re-establishment: {} — falling back to idle",
                         e
                     );
-                    let _ = self.state_machine.on_rrc_release();
-                    self.serving_cell_id = None;
-                    if let Err(ne) = self
-                        .task_base
-                        .nas_tx
-                        .send(NasMessage::RadioLinkFailure)
-                        .await
-                    {
-                        error!("Failed to notify NAS of radio link failure: {}", ne);
-                    }
+                    self.enter_idle_after_radio_link_failure().await;
                 }
             }
         } else {
             // Already idle, re-establishment in progress, or AS security never
             // activated (TS 38.331 §5.3.7.2: go to RRC_IDLE) — just notify NAS
-            let _ = self.state_machine.on_rrc_release();
-            self.serving_cell_id = None;
-            if let Err(e) = self
-                .task_base
-                .nas_tx
-                .send(NasMessage::RadioLinkFailure)
-                .await
-            {
-                error!("Failed to notify NAS of radio link failure: {}", e);
-            }
+            self.enter_idle_after_radio_link_failure().await;
         }
     }
 
@@ -9221,6 +9214,94 @@ mod tests {
         });
     }
 
+    /// Camp on cell 1 and connect through the real RRCSetup path, with no AS
+    /// security: an RLF then goes straight to RRC_IDLE (TS 38.331 §5.3.7.2).
+    async fn camped_and_connected_without_keys(
+        task: &mut RrcTask,
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) {
+        camp_and_request(task, rls_rx).await;
+        task.handle_downlink_rrc(
+            1,
+            RrcChannel::DlCcch,
+            OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+        )
+        .await;
+        assert_eq!(task.state_machine.state(), RrcState::Connected);
+    }
+
+    /// The cell the UE camped on, as told to NAS and RLS by a cycle.
+    fn camp_reported(
+        nas_rx: &mut mpsc::Receiver<TaskMessage<NasMessage>>,
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) -> (bool, Option<i32>) {
+        let mut nas_told = false;
+        while let Ok(msg) = nas_rx.try_recv() {
+            if let TaskMessage::Message(NasMessage::ActiveCellChanged { .. }) = msg {
+                nas_told = true;
+            }
+        }
+        let mut assigned = None;
+        while let Ok(msg) = rls_rx.try_recv() {
+            if let TaskMessage::Message(RlsMessage::AssignCurrentCell { cell_id }) = msg {
+                assigned = Some(cell_id);
+            }
+        }
+        (nas_told, assigned)
+    }
+
+    /// Issue #264: after an RLF on a cell that is still there (T310, quality),
+    /// the UE in RRC_IDLE selects a cell again. It used to keep believing it was
+    /// camped, so re-selecting the same cell counted as "no change", and no
+    /// serving cell was ever assigned again.
+    #[test]
+    fn after_a_radio_link_failure_the_ue_reselects_the_cell_it_lost() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_and_connected_without_keys(&mut task, &mut rls_rx).await;
+            task.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
+            let _ = camp_reported(&mut nas_rx, &mut rls_rx);
+
+            task.perform_cycle().await;
+            let (nas_told, assigned) = camp_reported(&mut nas_rx, &mut rls_rx);
+            assert_eq!(assigned, Some(1), "RLS is given the serving cell again");
+            assert!(nas_told, "NAS hears of the camp and can restore service");
+            assert_eq!(task.serving_cell_id, Some(1));
+        });
+    }
+
+    /// Issue #264: the serving cell vanished (RLS: RLF + the cell lost) and the
+    /// same gNB reappears as a new cell. The UE camps on the new one.
+    #[test]
+    fn after_losing_its_cell_the_ue_camps_on_the_cell_that_appears() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_and_connected_without_keys(&mut task, &mut rls_rx).await;
+            // What `RlsTask::on_cell_lost` sends, in that order.
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            task.handle_signal_changed(1, i32::MIN).await;
+            assert!(
+                task.cell_selector.get_cell(1).is_none(),
+                "the lost cell is gone"
+            );
+            let _ = camp_reported(&mut nas_rx, &mut rls_rx);
+
+            task.handle_signal_changed(2, -60).await;
+            task.perform_cycle().await;
+            let (nas_told, assigned) = camp_reported(&mut nas_rx, &mut rls_rx);
+            assert_eq!(assigned, Some(2));
+            assert!(nas_told);
+            assert_eq!(task.serving_cell_id, Some(2));
+        });
+    }
+
     /// T301 (TS 38.331 §5.3.7.6): a re-establishment whose `RRCReestablishment` never
     /// arrives must drop the UE to RRC_IDLE and tell NAS.
     #[test]
@@ -9254,13 +9335,19 @@ mod tests {
                 RrcState::Idle,
                 "T301/T311 expiry drops the UE to RRC_IDLE (§5.3.7.6)"
             );
+            // §5.3.7.6 goes to RRC_IDLE "with release cause 'RRC connection
+            // failure'": NAS must learn the connection is gone (it used to get an
+            // establishment failure, which left it CM-CONNECTED, issue #264), and
+            // the camp is cleared so cell selection runs again.
             let mut told_nas = false;
             while let Ok(msg) = nas_rx.try_recv() {
-                if let TaskMessage::Message(NasMessage::RrcEstablishmentFailure) = msg {
+                if let TaskMessage::Message(NasMessage::RadioLinkFailure) = msg {
                     told_nas = true;
                 }
             }
-            assert!(told_nas, "and NAS is told the establishment failed");
+            assert!(told_nas, "and NAS is told the connection failed");
+            assert!(task.cell_selector.current_cell().is_none(), "camp cleared");
+            assert!(task.serving_cell_id.is_none());
         });
     }
 
