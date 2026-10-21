@@ -181,6 +181,12 @@ pub enum MmOutput {
     /// ([`crate::nas::sm::SmOrchestrator::release_all_locally`]) and the TUN
     /// teardown (nextgsim #272).
     ReleasePduSessionsLocally,
+    /// Release the NAS signalling connection locally (TS 24.501 §5.5.1.2.7 c),
+    /// §5.5.1.3.7 c)): the caller has RRC drop the connection without
+    /// signalling (`RrcMessage::LocalReleaseConnection`). The orchestrator is
+    /// already in CM-IDLE when this is emitted, so the next NAS message it
+    /// builds is an initial NAS message on a fresh RRC connection.
+    ReleaseConnectionLocally,
 }
 
 /// The Uplink data status bit for `psi` (TS 24.501 §9.11.3.44).
@@ -1347,7 +1353,20 @@ impl MmOrchestrator {
                 // TS 24.501 5.5.1.2.7 case c: T3510 expiry -> abort the
                 // procedure, abnormal case handling
                 warn!("T3510 expired: registration procedure timed out");
-                self.abnormal_registration_failure()
+                let mut outs = Vec::new();
+                // TS 24.501 §5.5.1.2.7 c), §5.5.1.3.7 c): abort the procedure
+                // and release the NAS signalling connection locally (unless the
+                // request is for emergency services). Keeping it sent the T3511
+                // retry as an uplink NAS transport on a connection the AMF never
+                // answered, so the gNB, holding no AMF UE NGAP ID, dropped every
+                // retry (nextgsim #275).
+                if self.pending_reg_type != RegistrationType::EmergencyRegistration {
+                    info!("T3510 expired: releasing the NAS signalling connection locally");
+                    self.state.switch_cm_state(CmState::Idle);
+                    outs.push(MmOutput::ReleaseConnectionLocally);
+                }
+                outs.extend(self.abnormal_registration_failure());
+                outs
             }
             TIMER_T3511 => {
                 if self.may_retry_registration() {
@@ -4765,9 +4784,53 @@ mod tests {
         let mut orch = new_orch();
         orch.start_registration(RegistrationType::InitialRegistration);
         let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
-        assert!(outs.is_empty());
+        assert_eq!(outs, vec![MmOutput::ReleaseConnectionLocally]);
         assert!(orch.timers().t3511.is_running());
         assert_eq!(orch.registration_attempt_counter(), 1);
+    }
+
+    /// nextgsim #275, TS 24.501 §5.5.1.2.7 c): T3510 expiry releases the NAS
+    /// signalling connection locally, so the T3511 retry is a new initial NAS
+    /// message (integrity protected, not ciphered: SHT 0x01) rather than an
+    /// uplink NAS transport on the connection the AMF never answered.
+    #[test]
+    fn t3510_expiry_releases_the_connection_and_the_retry_is_an_initial_nas_message() {
+        let mut orch = establish_security_context();
+        // The RRC connection carrying the request is up (main.rs sets this on
+        // RRC connection setup).
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.timers().t3510.is_running());
+
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(
+            outs.contains(&MmOutput::ReleaseConnectionLocally),
+            "T3510 expiry must release the connection locally: {outs:?}"
+        );
+        assert!(orch.state().is_idle());
+        assert!(orch.timers().t3511.is_running());
+
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3511, true, 1));
+        let pdu = first_sent_pdu(&outs);
+        assert_eq!(
+            pdu[1], 0x01,
+            "the retry is an initial NAS message: integrity protected, not ciphered"
+        );
+        let (_outer, full) = open_registration_request(&orch, pdu);
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::InitialRegistration
+        );
+    }
+
+    /// The release is skipped for an emergency registration (§5.5.1.2.7 c).
+    #[test]
+    fn t3510_expiry_keeps_the_connection_for_an_emergency_registration() {
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::EmergencyRegistration);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(!outs.contains(&MmOutput::ReleaseConnectionLocally));
+        assert!(!orch.state().is_idle());
     }
 
     #[test]

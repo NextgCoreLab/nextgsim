@@ -4822,6 +4822,11 @@ impl RrcTask {
         if let Err(e) = self.task_base.rls_tx.send(RlsMessage::ResetSti).await {
             error!("Failed to send ResetSti to RLS: {}", e);
         }
+        // The RLS layer forgets its cells with the STI and rediscovers them under
+        // new IDs, so the selector forgets them too and camps on what comes back
+        // (nextgsim #275).
+        self.cell_selector.forget_cells();
+        self.last_cell_selection = None;
     }
 
     /// Send uplink RRC message
@@ -6579,6 +6584,37 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// nextgsim #275: after a local release the RLS layer reports its cells
+    /// under new IDs (fresh STI). The UE camps on the rediscovered cell, so the
+    /// next NAS message opens a new RRC connection on it (an RRCSetupRequest,
+    /// hence a new Initial UE Message) instead of failing with "no serving cell".
+    #[test]
+    fn after_a_local_release_the_next_nas_message_opens_a_new_connection() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camp_and_request(&mut task, &mut rls_rx).await;
+            task.handle_local_release_connection(false).await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
+            while rls_rx.try_recv().is_ok() {}
+
+            // The same gNB, rediscovered under a new cell ID.
+            task.handle_signal_changed(0, -60).await;
+            task.perform_cycle().await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(0),
+                "camped on the rediscovered cell"
+            );
+
+            let nas = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+            task.handle_uplink_nas_delivery(2, OctetString::from_slice(&nas))
+                .await;
+            let (ch, _) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(ch, RrcChannel::UlCcch, "a fresh RRCSetupRequest");
+        });
     }
 
     // ========================================================================

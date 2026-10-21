@@ -957,6 +957,12 @@ impl UeApp {
                             } else if orch.state().is_deregistered()
                                 && orch.state().mm_substate()
                                     != nextgsim_ue::nas::mm::MmSubState::RegisteredInitiated
+                                // A retry is already scheduled (TS 24.501
+                                // §5.5.1.2.7): re-camping after the local release
+                                // on T3510 expiry must not bypass T3511/T3502
+                                // (nextgsim #275).
+                                && !orch.timers().t3511.is_running()
+                                && !orch.timers().t3502.is_running()
                             {
                                 // Initial registration on first camp, and the ONLY
                                 // initial-attach trigger: the library RrcTask emits
@@ -1539,6 +1545,17 @@ async fn process_mm_outputs(
                     process_sm_outputs(sm_outs, orch, task_base, tun_tx, pdu_counter).await;
                 }
             }
+            MmOutput::ReleaseConnectionLocally => {
+                // TS 24.501 §5.5.1.2.7 c) / §5.5.1.3.7 c) (nextgsim #275): drop the
+                // RRC connection without signalling, so the next NAS message (the
+                // T3511 retry) opens a fresh one as an Initial UE Message.
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::LocalReleaseConnection {
+                        treat_barred: false,
+                    })
+                    .await;
+            }
         }
     }
 
@@ -1795,6 +1812,13 @@ async fn process_secondary_mm_outputs(
                 tracing::debug!(
                     "MINT: secondary subscription {index} de-registered by the network; \
                      its sessions are not held here"
+                );
+            }
+            MmOutput::ReleaseConnectionLocally => {
+                // The radio connection is shared with the primary subscription;
+                // a secondary's registration timeout must not tear it down.
+                tracing::debug!(
+                    "MINT: secondary subscription {index} T3510 expired; shared RRC connection kept"
                 );
             }
         }
