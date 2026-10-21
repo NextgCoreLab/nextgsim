@@ -635,6 +635,10 @@ pub struct MmOrchestrator {
 
     // -- deregistration state --
     dereg_pdu: Option<Vec<u8>>,
+    /// A network-initiated de-registration said "re-registration required"
+    /// while the NAS signalling connection was up: the initial registration
+    /// waits for that connection's release (TS 24.501 §5.5.2.3.2, issue #265).
+    reregistration_on_release: bool,
 
     // -- SUCI freshness (TS 24.501 §5.4.3.3 / §5.5.1.2.2) --
     /// The last SUCI sent to the network. Reused while T3519 is running instead
@@ -722,6 +726,7 @@ impl MmOrchestrator {
             usim_invalid: false,
             n1_mode_disabled: false,
             dereg_pdu: None,
+            reregistration_on_release: false,
             stored_suci: None,
             ue_policy_sections: HashMap::new(),
             updp_pti: 0,
@@ -2991,16 +2996,51 @@ impl MmOrchestrator {
         self.dereg_pdu = None;
 
         // §5.5.2.3.2: re-registration required — release local resources and
-        // start a fresh initial registration (mirrors the implicit-dereg path).
+        // initiate an initial registration "after the completion of the
+        // de-registration procedure and the release of the existing NAS
+        // signalling connection". Sending it at once put the REGISTRATION
+        // REQUEST on the connection the AMF was already releasing after the
+        // DEREGISTRATION ACCEPT: amfd took it into a UE context it then
+        // released, nothing answered, and every such re-registration waited
+        // out T3510 before the retry succeeded (issue #265).
         if result.re_registration_required {
             let _ = proc.perform_local_deregistration();
             self.delete_registration_context();
             self.state
                 .switch_mm_state(MmSubState::DeregisteredNormalService);
-            outs.extend(self.build_and_send_registration(RegistrationType::InitialRegistration));
+            if self.state.is_connected() {
+                info!(
+                    "Re-registration required: initial registration deferred until the \
+                     NAS signalling connection is released (TS 24.501 §5.5.2.3.2)"
+                );
+                self.reregistration_on_release = true;
+            } else {
+                outs.extend(
+                    self.build_and_send_registration(RegistrationType::InitialRegistration),
+                );
+            }
         }
 
         outs
+    }
+
+    /// The NAS signalling connection was released (RRC release or radio link
+    /// failure): the UE is CM-IDLE. Starts the initial registration a
+    /// network-initiated de-registration deferred to this point
+    /// (TS 24.501 §5.5.2.3.2), unless one has already been started.
+    pub fn on_nas_signalling_connection_released(&mut self) -> Vec<MmOutput> {
+        self.state.switch_cm_state(CmState::Idle);
+        if !std::mem::take(&mut self.reregistration_on_release) {
+            return Vec::new();
+        }
+        if !self.state.is_deregistered()
+            || self.state.mm_substate() == MmSubState::RegisteredInitiated
+        {
+            debug!("Deferred re-registration dropped: a registration already ran");
+            return Vec::new();
+        }
+        info!("NAS signalling connection released: initiating the deferred initial registration");
+        self.build_and_send_registration(RegistrationType::InitialRegistration)
     }
 
     // ========================================================================
@@ -6638,19 +6678,52 @@ mod tests {
         let mut req = Vec::new();
         nextgsim_nas::messages::mm::DeregistrationRequestUeTerminated::new(dereg_type)
             .encode(&mut req);
+        // The request arrives on a NAS signalling connection.
+        orch.state_mut().switch_cm_state(CmState::Connected);
         let protected = protect_downlink(&orch, &req, 2);
         let outs = orch.handle_downlink(&protected);
 
-        // A fresh registration is initiated: the context is reset first, so the
-        // REGISTRATION REQUEST goes out unprotected.
-        let re_registers = outs.iter().any(|o| match o {
+        let is_registration_request = |o: &MmOutput| match o {
             MmOutput::SendNasPdu(p) => {
                 p.len() >= 3 && p[1] == 0x00 && p[2] == u8::from(MmMessageType::RegistrationRequest)
             }
             _ => false,
-        });
-        assert!(re_registers, "re-registration must be initiated");
+        };
+        // Issue #265: only the DEREGISTRATION ACCEPT goes out on the connection
+        // the AMF is about to release; a REGISTRATION REQUEST sent on it was
+        // lost and the UE waited out T3510.
+        assert_eq!(outs.len(), 1, "only the accept is sent now: {outs:?}");
+        assert!(!outs.iter().any(is_registration_request));
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::DeregisteredNormalService
+        );
+        assert!(!orch.timers().t3510.is_running());
+
+        // The release of that connection starts the initial registration, with
+        // the context reset first, so it goes out unprotected.
+        let outs = orch.on_nas_signalling_connection_released();
+        assert!(
+            outs.iter().any(is_registration_request),
+            "re-registration must be initiated"
+        );
         assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
+        assert!(orch.state().is_idle());
+
+        // Once only: a later release starts nothing.
+        assert!(orch.on_nas_signalling_connection_released().is_empty());
+    }
+
+    /// A release with no deferred re-registration pending only enters CM-IDLE.
+    #[test]
+    fn a_plain_connection_release_starts_no_registration() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.on_nas_signalling_connection_released().is_empty());
+        assert!(orch.state().is_idle());
+        assert!(orch.state().is_registered());
     }
 
     // ========================================================================
