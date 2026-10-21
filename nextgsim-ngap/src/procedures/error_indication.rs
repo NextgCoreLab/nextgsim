@@ -410,7 +410,9 @@ fn build_misc_cause(cause: &MiscCause) -> CauseMisc {
     CauseMisc(value)
 }
 
-fn build_criticality_diagnostics(diag: &CriticalityDiagnosticsInfo) -> CriticalityDiagnostics {
+/// Map [`CriticalityDiagnosticsInfo`] into the generated `CriticalityDiagnostics`
+/// (TS 38.413 §9.3.1.3), for any message that carries the IE.
+pub fn build_criticality_diagnostics(diag: &CriticalityDiagnosticsInfo) -> CriticalityDiagnostics {
     let procedure_code = diag.procedure_code.map(ProcedureCode);
     let triggering_message = diag.triggering_message.map(std::convert::Into::into);
     let procedure_criticality = diag.procedure_criticality.map(std::convert::Into::into);
@@ -637,7 +639,9 @@ fn parse_misc_cause(cause: &CauseMisc) -> MiscCause {
     }
 }
 
-fn parse_criticality_diagnostics(
+/// Map a generated `CriticalityDiagnostics` (TS 38.413 §9.3.1.3) into
+/// [`CriticalityDiagnosticsInfo`], for any message that carries the IE.
+pub fn parse_criticality_diagnostics(
     diag: &CriticalityDiagnostics,
 ) -> Result<CriticalityDiagnosticsInfo, ErrorIndicationError> {
     let procedure_code = diag.procedure_code.as_ref().map(|pc| pc.0);

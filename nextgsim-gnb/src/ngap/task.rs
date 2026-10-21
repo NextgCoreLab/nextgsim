@@ -97,6 +97,9 @@ struct PendingCapabilityCheck {
     amf_ue_ngap_id: u64,
     /// The RAN UE NGAP ID to echo.
     ran_ue_ngap_id: u32,
+    /// An ignore-and-notify report the request owed its response, held here when
+    /// the response waits beyond the request's dispatch (TS 38.413 §10.3.4.2).
+    diagnostics: Option<CriticalityDiagnosticsInfo>,
 }
 
 use crate::ngap::timers::{GuardTimer, GuardTimers};
@@ -285,6 +288,18 @@ pub struct NgapTask {
     /// the `amf_configs` INDEX (0, 1, 2 ...), so a dynamic ID drawn from the same
     /// space would collide with a configured AMF and the two would share a context.
     next_dynamic_tnla_id: i32,
+    /// An ignore-and-notify report for the request being handled, attached to
+    /// that request's response as it is sent (TS 38.413 §10.3.4.2). Set and
+    /// cleared by `handle_ngap_pdu` around one dispatch; a Mutex only because the
+    /// send path takes `&self`.
+    pending_notify: std::sync::Mutex<Option<PendingNotify>>,
+}
+
+/// Criticality Diagnostics owed to the response of procedure `procedure_code`.
+#[derive(Debug, Clone)]
+struct PendingNotify {
+    procedure_code: u8,
+    diagnostics: CriticalityDiagnosticsInfo,
 }
 
 /// The first SCTP client ID used for a dynamically added TNL association.
@@ -321,6 +336,7 @@ impl NgapTask {
             capability_info_requested: std::collections::HashSet::new(),
             tnla_client_ids: HashMap::new(),
             next_dynamic_tnla_id: DYNAMIC_TNLA_CLIENT_ID_BASE,
+            pending_notify: std::sync::Mutex::new(None),
         }
     }
 
@@ -3319,6 +3335,15 @@ impl NgapTask {
             };
         match nextgsim_ngap::procedures::ue_radio_capability::encode_ue_radio_capability_check_response(&data) {
             Ok(bytes) => {
+                let bytes = match &check.diagnostics {
+                    Some(diagnostics) => super::unknown_ies::with_criticality_diagnostics(
+                        &bytes,
+                        nextgsim_ngap::codec::generated::ID_UE_RADIO_CAPABILITY_CHECK,
+                        diagnostics,
+                    )
+                    .unwrap_or(bytes),
+                    None => bytes,
+                };
                 info!(
                     "RAN-UE-NGAP-ID {}: UE RADIO CAPABILITY CHECK RESPONSE, IMS voice {} \
                      (TS 38.413 §8.14.2)",
@@ -3355,6 +3380,7 @@ impl NgapTask {
             stream,
             amf_ue_ngap_id: req.amf_ue_ngap_id,
             ran_ue_ngap_id: req.ran_ue_ngap_id,
+            diagnostics: None,
         };
         let Some(ue_id) = self
             .find_ue_by_ran_id(i64::from(req.ran_ue_ngap_id))
@@ -3401,7 +3427,17 @@ impl NgapTask {
             return;
         }
 
-        // Wait for the capability: by ID (cache / mapping) or from the UE.
+        // Wait for the capability: by ID (cache / mapping) or from the UE. A
+        // §10.3.4.2 report owed to the response waits with it.
+        let mut check = check;
+        {
+            let mut pending = self.pending_notify_lock();
+            if pending.as_ref().is_some_and(|p| {
+                p.procedure_code == nextgsim_ngap::codec::generated::ID_UE_RADIO_CAPABILITY_CHECK
+            }) {
+                check.diagnostics = pending.take().map(|p| p.diagnostics);
+            }
+        }
         self.capability_checks.insert(ue_id, check);
         self.guard_timers.start(
             Instant::now(),
@@ -3621,35 +3657,43 @@ impl NgapTask {
             pdu.len()
         );
 
-        // TS 38.413 §10.3.4: an IE this schema does not know is handled by the
+        // TS 38.413 §10.3.4.2: an IE this schema does not know is handled by the
         // criticality the AMF gave it, not by refusing the whole message.
+        use super::unknown_ies::{RejectAnswer, UnknownIeVerdict};
         let gated: Vec<u8>;
+        let mut notify = None;
         let pdu_bytes: &[u8] = match super::unknown_ies::classify(pdu.data()) {
-            super::unknown_ies::UnknownIeVerdict::Clean
-            | super::unknown_ies::UnknownIeVerdict::Undecodable => pdu.data(),
-            super::unknown_ies::UnknownIeVerdict::Proceed { bytes, notify } => {
-                if let Some(report) = notify {
-                    warn!(
-                        "NGAP PDU from AMF[{}] carries unknown ignore-and-notify IE(s); \
-                         processing without them and sending Error Indication (§10.3.4.2)",
-                        client_id
-                    );
-                    self.send_error_indication(client_id, report).await;
-                }
+            UnknownIeVerdict::Clean | UnknownIeVerdict::Undecodable => pdu.data(),
+            UnknownIeVerdict::Proceed { bytes, notify: n } => {
+                notify = n;
                 gated = bytes;
                 &gated
             }
-            super::unknown_ies::UnknownIeVerdict::Reject { report } => {
-                match report {
-                    Some(report) => {
+            UnknownIeVerdict::Reject {
+                answer,
+                ue_associated,
+            } => {
+                // A UE-associated answer goes back on the UE's stream (§8.7.5.1).
+                let out_stream = if ue_associated { stream } else { 0 };
+                match answer {
+                    RejectAnswer::Failure(failure) => {
+                        warn!(
+                            "NGAP request from AMF[{}] carries an unknown reject IE; \
+                             procedure rejected with its failure message (§10.3.4.2)",
+                            client_id
+                        );
+                        self.send_ngap_on(client_id, out_stream, failure).await;
+                    }
+                    RejectAnswer::ErrorIndication(report) => {
                         warn!(
                             "NGAP initiating message from AMF[{}] carries an unknown reject \
                              IE; procedure not executed, sending Error Indication (§10.3.4.2)",
                             client_id
                         );
-                        self.send_error_indication(client_id, report).await;
+                        self.send_error_indication_on(client_id, out_stream, report)
+                            .await;
                     }
-                    None => warn!(
+                    RejectAnswer::Local => warn!(
                         "NGAP response from AMF[{}] carries an unknown reject IE; procedure \
                          terminated with local error handling (§10.3.4.2)",
                         client_id
@@ -3659,6 +3703,43 @@ impl NgapTask {
             }
         };
 
+        let Some(notify) = notify else {
+            self.dispatch_ngap_pdu(client_id, stream, pdu_bytes).await;
+            return;
+        };
+        // ignore-and-notify IEs: the procedure runs without them. For a request
+        // the report rides in the procedure's response (`send_ngap_on` attaches
+        // it); only a procedure that sends none -- or a response message, or a
+        // Class 2 procedure -- is answered by Error Indication (§10.3.4.2).
+        if notify.initiating {
+            *self.pending_notify_lock() = Some(PendingNotify {
+                procedure_code: notify.procedure_code,
+                diagnostics: notify.diagnostics.clone(),
+            });
+        }
+        self.dispatch_ngap_pdu(client_id, stream, pdu_bytes).await;
+        let unreported = !notify.initiating || self.pending_notify_lock().take().is_some();
+        if unreported {
+            warn!(
+                "NGAP PDU from AMF[{}] carried unknown ignore-and-notify IE(s); processed \
+                 without them, reporting by Error Indication (§10.3.4.2)",
+                client_id
+            );
+            let out_stream = if notify.ue_associated { stream } else { 0 };
+            self.send_error_indication_on(client_id, out_stream, notify.error_indication)
+                .await;
+        } else {
+            info!(
+                "NGAP request from AMF[{}] carried unknown ignore-and-notify IE(s); reported \
+                 in the response's Criticality Diagnostics (§10.3.4.2)",
+                client_id
+            );
+        }
+    }
+
+    /// Routes one received NGAP PDU, already through the §10.3.4 gate, to its
+    /// handler by AMF state and message type.
+    async fn dispatch_ngap_pdu(&mut self, client_id: i32, stream: u16, pdu_bytes: &[u8]) {
         // Check AMF state
         let amf_state = self
             .amf_contexts
@@ -5296,8 +5377,61 @@ impl NgapTask {
         }
     }
 
+    /// Sends an Error Indication on `stream`: UE-associated when non-zero, the
+    /// Error Indication then being about a UE-associated message (§8.7.5.1).
+    async fn send_error_indication_on(
+        &self,
+        amf_id: i32,
+        stream: u16,
+        params: ErrorIndicationParams,
+    ) {
+        match encode_error_indication(&params) {
+            Ok(data) => self.send_ngap_on(amf_id, stream, data).await,
+            Err(e) => error!("Failed to encode Error Indication: {}", e),
+        }
+    }
+
+    /// Sends `data` UE-associated on `stream`, or non-UE-associated on stream 0.
+    async fn send_ngap_on(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
+        if stream == 0 {
+            self.send_ngap_non_ue(amf_id, 0, data).await;
+        } else {
+            self.send_ngap_ue_associated(amf_id, stream, data).await;
+        }
+    }
+
+    /// The §10.3.4.2 report waiting on the current request's response.
+    fn pending_notify_lock(&self) -> std::sync::MutexGuard<'_, Option<PendingNotify>> {
+        self.pending_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `data` with the pending ignore-and-notify report attached, when `data` is
+    /// the response to the request that carried it (TS 38.413 §10.3.4.2: "report
+    /// in the response message of the procedure"); the report is then consumed.
+    /// Every outbound PDU passes here, so no response encoder needs to know.
+    fn with_pending_diagnostics(&self, data: Vec<u8>) -> Vec<u8> {
+        let mut pending = self.pending_notify_lock();
+        let Some(p) = pending.as_ref() else {
+            return data;
+        };
+        match super::unknown_ies::with_criticality_diagnostics(
+            &data,
+            p.procedure_code,
+            &p.diagnostics,
+        ) {
+            Some(reported) => {
+                *pending = None;
+                reported
+            }
+            None => data,
+        }
+    }
+
     /// Sends an NGAP PDU for non-UE-associated signaling (stream 0)
     async fn send_ngap_non_ue(&self, amf_id: i32, stream: u16, data: Vec<u8>) {
+        let data = self.with_pending_diagnostics(data);
         let msg = SctpMessage::SendMessage {
             client_id: amf_id,
             stream,
@@ -5316,6 +5450,7 @@ impl NgapTask {
     /// the AMF has been told something does need to know, and used to have no way to ask
     /// (issue #169).
     async fn send_ngap_ue_associated(&self, amf_id: i32, stream: u16, data: Vec<u8>) -> bool {
+        let data = self.with_pending_diagnostics(data);
         debug!(
             "Sending UE-associated NGAP PDU: amf_id={}, stream={}, len={}",
             amf_id,
@@ -10807,6 +10942,175 @@ mod tests {
         ));
     }
 
+    /// Every SCTP send, with its stream.
+    fn drain_sends(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<SctpMessage>>,
+    ) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let TaskMessage::Message(SctpMessage::SendMessage { buffer, stream, .. }) = msg {
+                out.push((stream, buffer.data().to_vec()));
+            }
+        }
+        out
+    }
+
+    /// The (IE id, criticality) items of a Criticality Diagnostics.
+    fn diagnosed(
+        d: &CriticalityDiagnosticsInfo,
+    ) -> Vec<(
+        u16,
+        nextgsim_ngap::procedures::error_indication::CriticalityValue,
+    )> {
+        d.ies_criticality_diagnostics
+            .iter()
+            .map(|i| (i.ie_id, i.ie_criticality))
+            .collect()
+    }
+
+    /// The Criticality Diagnostics of an encoded UE CONTEXT MODIFICATION RESPONSE.
+    fn ucm_response_diagnostics(bytes: &[u8]) -> Option<CriticalityDiagnosticsInfo> {
+        use nextgsim_ngap::codec::generated::{
+            SuccessfulOutcomeValue, UEContextModificationResponseProtocolIEs_EntryValue as V,
+        };
+        use nextgsim_ngap::procedures::error_indication::parse_criticality_diagnostics;
+        let NGAP_PDU::SuccessfulOutcome(o) = decode_ngap_pdu(bytes).expect("decodes") else {
+            panic!("expected a SuccessfulOutcome");
+        };
+        let SuccessfulOutcomeValue::Id_UEContextModification(r) = o.value else {
+            panic!("expected a UE Context Modification Response");
+        };
+        r.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+            V::Id_CriticalityDiagnostics(d) => Some(parse_criticality_diagnostics(d).unwrap()),
+            _ => None,
+        })
+    }
+
+    /// #268 (1), TS 38.413 §10.3.4.2 "Ignore IE and Notify Sender" in a message
+    /// initiating a procedure with a response: the procedure runs, and the IE is
+    /// reported in that response's Criticality Diagnostics -- not by Error
+    /// Indication.
+    #[tokio::test]
+    async fn a_notify_ie_in_a_class_1_request_is_reported_in_its_response() {
+        use nextgsim_ngap::procedures::error_indication::CriticalityValue;
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
+        task.activate_as_security(10, [0x11u8; 32], &caps(0xC000, 0xC000))
+            .await;
+        let request = crate::ngap::unknown_ies::tests::with_unknown_ie(
+            &crate::ngap::unknown_ies::tests::ucm_request(555, ran as u32),
+            9999,
+            2,
+        );
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&request))
+            .await;
+
+        let sent = drain_sends(&mut sctp_rx);
+        assert_eq!(
+            sent.len(),
+            1,
+            "the response alone, no Error Indication: {sent:?}"
+        );
+        let (stream, response) = &sent[0];
+        assert_eq!(*stream, 2);
+        assert_eq!(response_ids(response), (555, ran as u32));
+        let diag = ucm_response_diagnostics(response).expect("Criticality Diagnostics");
+        assert_eq!(diagnosed(&diag), vec![(9999, CriticalityValue::Notify)]);
+        assert_eq!(
+            task.find_ue_context(10)
+                .unwrap()
+                .as_security
+                .as_ref()
+                .unwrap()
+                .kgnb,
+            [0x22u8; 32],
+            "the procedure ran with the understood IEs"
+        );
+        assert!(
+            task.pending_notify_lock().is_none(),
+            "the report was consumed"
+        );
+    }
+
+    /// #268 (2), §10.3.4.2 "Reject IE" in a request whose procedure has a
+    /// failure message: none of it is executed and the AMF gets that failure
+    /// message (cause abstract-syntax-error-reject, the IE named), on the UE's
+    /// stream -- not an Error Indication.
+    #[tokio::test]
+    async fn a_reject_ie_in_a_request_with_a_failure_message_earns_the_failure() {
+        use nextgsim_ngap::codec::generated::{Cause, CauseProtocol};
+        use nextgsim_ngap::procedures::error_indication::CriticalityValue;
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
+        task.activate_as_security(10, [0x11u8; 32], &caps(0xC000, 0xC000))
+            .await;
+        let request = crate::ngap::unknown_ies::tests::with_unknown_ie(
+            &crate::ngap::unknown_ies::tests::ucm_request(555, ran as u32),
+            9999,
+            0,
+        );
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&request))
+            .await;
+
+        let sent = drain_sends(&mut sctp_rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let (stream, failure) = &sent[0];
+        assert_eq!(*stream, 2, "UE-associated");
+        let (ids, cause, diag) = crate::ngap::unknown_ies::tests::ucm_failure(failure);
+        assert_eq!(ids, Some((555, ran as u32)));
+        assert_eq!(
+            cause,
+            Cause::Protocol(CauseProtocol(CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT))
+        );
+        assert_eq!(diagnosed(&diag), vec![(9999, CriticalityValue::Reject)]);
+        assert_eq!(
+            task.find_ue_context(10)
+                .unwrap()
+                .as_security
+                .as_ref()
+                .unwrap()
+                .kgnb,
+            [0x11u8; 32],
+            "the procedure is not executed"
+        );
+    }
+
+    /// #268 (3), §8.7.5.2: an Error Indication about a UE-associated message
+    /// carries its AMF and RAN UE NGAP IDs and uses UE-associated signalling --
+    /// for a notify IE in a Class 2 message (reported by Error Indication) and a
+    /// reject IE in a message whose procedure has no failure message.
+    #[tokio::test]
+    async fn an_error_indication_about_a_ue_associated_message_carries_its_ue_ngap_ids() {
+        use nextgsim_ngap::procedures::error_indication::CriticalityValue;
+        for (criticality, expected) in [
+            (2u8, CriticalityValue::Notify),
+            (0u8, CriticalityValue::Reject),
+        ] {
+            let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
+            let message = crate::ngap::unknown_ies::tests::with_unknown_ie(
+                &crate::ngap::unknown_ies::tests::dl_nas(555, ran as u32),
+                9999,
+                criticality,
+            );
+            task.handle_ngap_pdu(1, 3, OctetString::from_slice(&message))
+                .await;
+            let indications: Vec<(u16, ErrorIndicationData)> = drain_sends(&mut sctp_rx)
+                .into_iter()
+                .filter_map(|(stream, p)| decode_error_indication(&p).ok().map(|e| (stream, e)))
+                .collect();
+            assert_eq!(indications.len(), 1, "criticality {criticality}");
+            let (stream, ei) = &indications[0];
+            assert_eq!(
+                (ei.amf_ue_ngap_id, ei.ran_ue_ngap_id),
+                (Some(555), Some(ran as u32)),
+                "criticality {criticality}"
+            );
+            assert_eq!(*stream, 3, "UE-associated signalling");
+            assert_eq!(
+                diagnosed(ei.criticality_diagnostics.as_ref().unwrap()),
+                vec![(9999, expected)]
+            );
+        }
+    }
+
     /// TS 23.502 §4.2.6 step 1 / TS 38.413 §9.2.2.4: a UE Context Release
     /// Request for a UE with PDU sessions lists them (IE 133).
     #[tokio::test]
@@ -11354,6 +11658,67 @@ mod tests {
             .await;
         assert_eq!(check_responses(&drain_sctp(&mut sctp_rx)), vec![true]);
         assert!(task.capability_checks.is_empty());
+    }
+
+    /// #268 (1) for a response that waits beyond the request's dispatch: a notify
+    /// IE in a UE Radio Capability Check Request is reported in the eventual
+    /// UE RADIO CAPABILITY CHECK RESPONSE (TS 38.413 §10.3.4.2), and no Error
+    /// Indication goes out meanwhile.
+    #[tokio::test]
+    async fn a_waiting_capability_check_response_still_carries_the_notify_report() {
+        use nextgsim_ngap::codec::generated::{
+            SuccessfulOutcomeValue, UERadioCapabilityCheckResponseProtocolIEs_EntryValue as V,
+        };
+        let (mut task, _rrc, _gtp, mut sctp_rx) = task_with_sctp(1).await;
+        with_ims_voice(&mut task, true);
+        let ran = ran_id(&task, 1).await;
+        let pdu = crate::ngap::unknown_ies::tests::with_unknown_ie(
+            &capability_check(ran, None, Some(vec![0x70])),
+            9999,
+            2,
+        );
+        task.handle_ngap_pdu(1, 1, OctetString::from_slice(&pdu))
+            .await;
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(mapping_requests(&sent), vec![vec![0x70]]);
+        assert!(
+            sent.iter().all(|p| decode_error_indication(p).is_err()),
+            "no Error Indication while the response is owed"
+        );
+
+        let response = encode_ue_radio_capability_id_mapping_response(
+            &UeRadioCapabilityIdMappingResponseData {
+                ue_radio_capability_id: vec![0x70],
+                ue_radio_capability: nr_capability(true),
+            },
+        )
+        .unwrap();
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&response))
+            .await;
+        let sent = drain_sctp(&mut sctp_rx);
+        assert_eq!(check_responses(&sent), vec![true]);
+        let reported: Vec<u16> = sent
+            .iter()
+            .filter_map(|p| match decode_ngap_pdu(p).ok()? {
+                NGAP_PDU::SuccessfulOutcome(o) => match o.value {
+                    SuccessfulOutcomeValue::Id_UERadioCapabilityCheck(r) => {
+                        r.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
+                            V::Id_CriticalityDiagnostics(d) => Some(d),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .flat_map(|d| {
+                d.i_es_criticality_diagnostics
+                    .map(|l| l.0)
+                    .unwrap_or_default()
+            })
+            .map(|i| i.ie_id.0)
+            .collect();
+        assert_eq!(reported, vec![9999]);
     }
 
     /// With neither IE and nothing held, the gNB asks the UE, reports the answer in a
