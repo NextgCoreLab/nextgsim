@@ -326,8 +326,23 @@ fn write_r9_body_preamble(w: &mut UperWriter, ecid_present: bool) {
 ///
 /// Returns `(additions_follow, ecid_present)`.
 fn read_r9_body_preamble(r: &mut UperReader<'_>, common: CommonIes) -> UperResult<(bool, bool)> {
+    let (additions, ecid, epdu) = read_r9_body_preamble_with_epdu(r, common)?;
+    if epdu {
+        return Err(UperError::Unsupported(
+            "LPP body for a positioning method other than E-CID",
+        ));
+    }
+    Ok((additions, ecid))
+}
+
+/// [`read_r9_body_preamble`] for the one body that may carry nextg's EPDU
+/// (`ProvideLocationInformation`), returning `(additions, ecid, epdu)`.
+fn read_r9_body_preamble_with_epdu(
+    r: &mut UperReader<'_>,
+    common: CommonIes,
+) -> UperResult<(bool, bool, bool)> {
     let (additions, opts) = r.read_sequence_preamble(true, 5)?;
-    if opts[1] || opts[2] || opts[4] {
+    if opts[1] || opts[2] {
         // A-GNSS, OTDOA or an EPDU. Each has its own content, so continuing would
         // read later fields at the wrong offsets.
         return Err(UperError::Unsupported(
@@ -351,7 +366,7 @@ fn read_r9_body_preamble(r: &mut UperReader<'_>, common: CommonIes) -> UperResul
             }
         }
     }
-    Ok((additions, opts[3]))
+    Ok((additions, opts[3], opts[4]))
 }
 
 /// The `criticalExtensions` wrapper every LPP body carries: a 2-alternative CHOICE
@@ -470,22 +485,122 @@ impl SidelinkRangingResult {
     }
 }
 
-/// Which extension-addition group of `ProvideLocationInformation-r9-IEs` carries the
-/// sidelink ranging report: the FOURTH, index 3.
-///
-/// TS 37.355 declares three groups on that sequence — G1(r13), G2(r16), G3(r19) — so
-/// a simulator-defined IE must sit past them rather than squat on one. G2 in
-/// particular is where the peer LMF reads nr-Multi-RTT and nr-DL-TDOA; G1 and G3 it
-/// ignores, which is exactly why putting the report in G1 would have looked like it
-/// worked from this end and delivered nothing.
-const SIDELINK_ADDITION_GROUP: usize = 3;
+/// `EPDU-ID` nextg uses for its sidelink ranging payload (nextgcore #542). Not
+/// 3GPP-assigned: TS 37.355 §6.5.7 leaves EPDU-ID values to the external protocol.
+pub const EPDU_ID_NEXTG_SIDELINK_RANGING: i64 = 256;
+
+/// `EPDU-Name` that must accompany [`EPDU_ID_NEXTG_SIDELINK_RANGING`], so a foreign
+/// EPDU that happens to use the same number is never read as a range report.
+pub const EPDU_NAME_NEXTG_SIDELINK_RANGING: &str = "nextg-sidelink-ranging";
+
+/// Write the `EPDU-Sequence` (TS 37.355 §6.5.7) carrying `report`:
+/// `SEQUENCE (SIZE(1..16)) OF EPDU`, one entry, `EPDU-Identifier` with ID and name,
+/// `EPDU-Body` the report's own UPER octets.
+fn write_sidelink_epdu(w: &mut UperWriter, report: &SidelinkRangingReport) -> UperResult<()> {
+    let body = report.encode()?;
+    w.write_constrained(1, 1, 16)?;
+    // EPDU ::= SEQUENCE { ePDU-Identifier, ePDU-Body } -- not extensible, no optionals.
+    // EPDU-Identifier ::= SEQUENCE { ePDU-ID, ePDU-Name OPTIONAL, ... }
+    w.write_sequence_preamble(Some(false), &[true]);
+    w.write_constrained(EPDU_ID_NEXTG_SIDELINK_RANGING, 1, 256)?;
+    // EPDU-Name ::= VisibleString (SIZE (1..32)): length, then 7 bits per character
+    // (X.691 §30.5.3: 95 printable characters, ISO 646 values fit 7 bits).
+    let name = EPDU_NAME_NEXTG_SIDELINK_RANGING.as_bytes();
+    w.write_constrained(name.len() as i64, 1, 32)?;
+    for &c in name {
+        w.write_bits(u64::from(c), 7);
+    }
+    // EPDU-Body ::= OCTET STRING, unconstrained: X.691 §11.9 length determinant.
+    write_unconstrained_length(w, body.len())?;
+    for b in body {
+        w.write_bits(u64::from(b), 8);
+    }
+    Ok(())
+}
+
+fn write_unconstrained_length(w: &mut UperWriter, len: usize) -> UperResult<()> {
+    if len < 128 {
+        w.write_bits(len as u64, 8);
+    } else if len < 16_384 {
+        w.write_bits(0x8000 | len as u64, 16);
+    } else {
+        return Err(UperError::InvalidLength(len));
+    }
+    Ok(())
+}
+
+fn read_unconstrained_length(r: &mut UperReader<'_>) -> UperResult<usize> {
+    if !r.read_bit()? {
+        return Ok(r.read_bits(7)? as usize);
+    }
+    if !r.read_bit()? {
+        return Ok(r.read_bits(14)? as usize);
+    }
+    Err(UperError::Unsupported("a fragmented EPDU-Body"))
+}
+
+/// Read an `EPDU-Sequence` and return nextg's sidelink ranging report if one of its
+/// EPDUs carries it. Other EPDUs are consumed and ignored.
+/// Test access to [`write_sidelink_epdu`].
+#[cfg(test)]
+pub(crate) fn write_sidelink_epdu_for_test(
+    w: &mut UperWriter,
+    report: &SidelinkRangingReport,
+) -> UperResult<()> {
+    write_sidelink_epdu(w, report)
+}
+
+/// Test access to [`read_sidelink_epdu`].
+#[cfg(test)]
+pub(crate) fn read_sidelink_epdu_for_test(
+    r: &mut UperReader<'_>,
+) -> UperResult<Option<SidelinkRangingReport>> {
+    read_sidelink_epdu(r)
+}
+
+fn read_sidelink_epdu(r: &mut UperReader<'_>) -> UperResult<Option<SidelinkRangingReport>> {
+    let count = r.read_constrained(1, 16)?;
+    let mut report = None;
+    for _ in 0..count {
+        let (ext, opts) = r.read_sequence_preamble(true, 1)?;
+        let id = r.read_constrained(1, 256)?;
+        let name = if opts[0] {
+            let len = r.read_constrained(1, 32)? as usize;
+            let mut name = String::with_capacity(len);
+            for _ in 0..len {
+                name.push(char::from(r.read_bits(7)? as u8));
+            }
+            Some(name)
+        } else {
+            None
+        };
+        if ext {
+            r.skip_extension_additions()?;
+        }
+        let len = read_unconstrained_length(r)?;
+        let mut body = Vec::with_capacity(len);
+        for _ in 0..len {
+            body.push(r.read_bits(8)? as u8);
+        }
+        let ours = id == EPDU_ID_NEXTG_SIDELINK_RANGING
+            && name
+                .as_deref()
+                .is_none_or(|n| n == EPDU_NAME_NEXTG_SIDELINK_RANGING);
+        if ours && report.is_none() {
+            report = Some(SidelinkRangingReport::decode(&body)?);
+        }
+    }
+    Ok(report)
+}
 
 /// The sidelink ranging report a UE sends to the LMF (issue #137).
 ///
-/// Carried as an **extension addition** of `ProvideLocationInformation-r9-IEs`,
-/// which is where a Rel-18 IE belongs in a Rel-9 root sequence: a root member
-/// cannot be added without changing the byte layout of every existing LPP message,
-/// and this codec's peer is nextgcore's LMF.
+/// A payload of nextg's own design (3GPP's protocol for this is SLPP, TS 38.355,
+/// not implemented yet -- nextgcore #557). It rides LPP's EPDU
+/// (`epdu-ProvideLocationInformation`, TS 37.355 §6.5.7), the extension point LPP
+/// defines for non-3GPP data, under [`EPDU_ID_NEXTG_SIDELINK_RANGING`]; before
+/// nextgcore #542 it sat in an invented fourth extension-addition group that a
+/// conformant LPP codec skips.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidelinkRangingReport {
     /// One entry per ranged peer, `SEQUENCE (SIZE(1..32))`.
@@ -499,8 +614,8 @@ impl SidelinkRangingReport {
     /// decode, and the sender would see no error.
     pub const MAX_RESULTS: usize = 32;
 
-    /// Encode as a standalone open-type payload: a complete UPER encoding padded to
-    /// whole octets, which is what an extension addition is.
+    /// Encode as a standalone payload: a complete UPER encoding padded to whole
+    /// octets, which becomes the `EPDU-Body`.
     pub fn encode(&self) -> UperResult<Vec<u8>> {
         if self.results.len() < Self::MIN_RESULTS || self.results.len() > Self::MAX_RESULTS {
             return Err(UperError::InvalidLength(self.results.len()));
@@ -518,41 +633,23 @@ impl SidelinkRangingReport {
         Ok(w.into_bytes())
     }
 
-    /// The most octets an extension addition can carry: an open type's length
-    /// determinant is written in the SHORT form here (one octet, values below 128),
-    /// which is all the matching reader can read.
-    pub const MAX_ADDITION_OCTETS: usize = 0x7F;
-
-    /// Build a report from `results`, dropping trailing entries until it fits an
-    /// extension addition, and say how many were dropped.
-    ///
-    /// The bound is found by ENCODING rather than by arithmetic over the field
-    /// widths, so it cannot drift from the layout: a result gained a field, and a
-    /// hand-computed capacity would silently become wrong while still looking
-    /// derived. Roughly 12 results fit today, which is well under the ASN.1
-    /// `SIZE(1..32)` — so the size bound is NOT the binding one, and a caller that
-    /// only checked it would emit an addition the peer cannot read.
-    ///
-    /// Returns `None` for an empty input, and for the case where even one result does
-    /// not fit — which cannot happen at the current field widths but is not asserted
-    /// away, because that is exactly what changes when a field is added.
-    pub fn fitting_an_addition(results: &[SidelinkRangingResult]) -> Option<(Self, usize)> {
-        let mut kept = results.len().min(Self::MAX_RESULTS).min(results.len());
-        while kept > 0 {
-            let candidate = Self {
-                results: results[..kept].to_vec(),
-            };
-            match candidate.encode() {
-                Ok(bytes) if bytes.len() <= Self::MAX_ADDITION_OCTETS => {
-                    return Some((candidate, results.len() - kept));
-                }
-                _ => kept -= 1,
-            }
+    /// Build a report from `results`, keeping at most [`Self::MAX_RESULTS`] (the
+    /// `SIZE(1..32)` bound -- the binding one now that the report is an EPDU body,
+    /// whose length determinant carries far more than 32 results), and say how many
+    /// were dropped. `None` for an empty input.
+    pub fn fitting_an_epdu(results: &[SidelinkRangingResult]) -> Option<(Self, usize)> {
+        let kept = results.len().min(Self::MAX_RESULTS);
+        if kept == 0 {
+            return None;
         }
-        None
+        let candidate = Self {
+            results: results[..kept].to_vec(),
+        };
+        candidate.encode().ok()?;
+        Some((candidate, results.len() - kept))
     }
 
-    /// Decode an open-type payload produced by [`Self::encode`].
+    /// Decode an `EPDU-Body` produced by [`Self::encode`].
     pub fn decode(bytes: &[u8]) -> UperResult<Self> {
         let mut r = UperReader::new(bytes);
         let (additions, _) = r.read_sequence_preamble(true, 0)?;
@@ -633,31 +730,20 @@ impl LppBody {
             } => {
                 w.write_choice_index(c1::PROVIDE_LOCATION_INFORMATION, c1::ALTERNATIVES)?;
                 write_critical_extensions(w)?;
-                // The extension bit is set only when there is an addition to carry,
-                // so a report without sidelink results encodes exactly as it did
-                // before this existed.
+                // Root presence bits [commonIEs, a-gnss, otdoa, ecid, epdu]: the
+                // EPDU bit is set only when there is a report, so a reply without one
+                // encodes exactly as before. No extension additions are written.
                 w.write_sequence_preamble(
-                    Some(sidelink.is_some()),
-                    &[false, false, false, true, false],
+                    Some(false),
+                    &[false, false, false, true, sidelink.is_some()],
                 );
                 // ECID-ProvideLocationInformation: [signalMeasurementInformation,
                 // ecid-Error], and only the measurements are produced here.
                 w.write_sequence_preamble(Some(false), &[true, false]);
                 measurements.write(w)?;
-                // Additions come after every root member, which is why this is here
-                // and not beside the preamble.
-                //
-                // The report is addition GROUP 4, not the first addition. TS 37.355
-                // declares three groups on this sequence -- G1(r13), G2(r16),
-                // G3(r19) -- and the peer LMF reads nr-Multi-RTT and nr-DL-TDOA out
-                // of G2 and *ignores* G1 and G3 (see nextgcore-asn1c
-                // `lpp::ecid::ProvideLocationInformationR9`). Writing the report as
-                // the first addition would put it in G1, where the LMF would drop it
-                // silently, and would also claim a group the spec defines.
+                // epdu-ProvideLocationInformation follows ecid in root order.
                 if let Some(report) = sidelink {
-                    let mut groups = vec![None; SIDELINK_ADDITION_GROUP];
-                    groups.push(Some(report.encode()?));
-                    w.write_extension_additions(&groups)?;
+                    write_sidelink_epdu(w, report)?;
                 }
                 Ok(())
             }
@@ -719,7 +805,8 @@ impl LppBody {
             }
             c1::PROVIDE_LOCATION_INFORMATION => {
                 read_critical_extensions(r)?;
-                let (additions, ecid) = read_r9_body_preamble(r, CommonIes::Unmodelled)?;
+                let (additions, ecid, epdu) =
+                    read_r9_body_preamble_with_epdu(r, CommonIes::Unmodelled)?;
                 if !ecid {
                     return Err(UperError::Unsupported(
                         "ProvideLocationInformation with no E-CID body",
@@ -736,23 +823,10 @@ impl LppBody {
                 if inner_additions {
                     r.skip_extension_additions()?;
                 }
-                // The report rides addition GROUP 4 (see the encoder). Groups are
-                // read POSITIONALLY and a peer may send fewer -- the trailing-absent
-                // ones are trimmed (X.691 18.8) -- so a message carrying only the
-                // spec's G1..G3 decodes to no report rather than to an error.
-                let sidelink = if additions {
-                    match r
-                        .read_extension_additions()?
-                        .into_iter()
-                        .nth(SIDELINK_ADDITION_GROUP)
-                        .flatten()
-                    {
-                        Some(bytes) => Some(SidelinkRangingReport::decode(&bytes)?),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
+                let sidelink = if epdu { read_sidelink_epdu(r)? } else { None };
+                if additions {
+                    r.skip_extension_additions()?;
+                }
                 Ok(Self::ProvideLocationInformation {
                     measurements,
                     sidelink,
