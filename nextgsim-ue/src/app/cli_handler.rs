@@ -22,7 +22,7 @@ use std::fmt;
 
 use crate::nas::mm::{DeregistrationCause, MmState, MmSubState, RmState};
 use crate::nas::sm::{ProcedureTransactionManager, SmMessageType, SM_TIMER_T3580, SM_TIMER_T3582};
-use crate::tasks::{UeCliCommand, UeCliCommandType};
+use crate::tasks::{CmState, UeCliCommand, UeCliCommandType};
 
 /// Result of a CLI command execution.
 #[derive(Debug, Clone)]
@@ -191,6 +191,8 @@ pub struct CliHandler {
     next_psi: u8,
     /// Active PDU sessions (PSI -> session info)
     active_sessions: Vec<u8>,
+    /// CM state as last published by the NAS task (issue #270)
+    cm_state: CmState,
 }
 
 impl Default for CliHandler {
@@ -206,7 +208,13 @@ impl CliHandler {
             pt_manager: ProcedureTransactionManager::new(),
             next_psi: 1, // PSI starts at 1
             active_sessions: Vec::new(),
+            cm_state: CmState::Idle,
         }
+    }
+
+    /// Records the CM state the NAS task published, for `status`.
+    pub fn set_cm_state(&mut self, cm_state: CmState) {
+        self.cm_state = cm_state;
     }
 
     /// Processes a CLI command and returns the result and any NAS action needed.
@@ -282,6 +290,7 @@ impl CliHandler {
         status.set_rm_state(rm_state);
         status.set_mm_state(mm_state);
         status.set_mm_sub_state(mm_sub_state);
+        status.set_cm_state(self.cm_state);
         // Add active sessions
         for &psi in &self.active_sessions {
             status.pdu_sessions.push(psi);
