@@ -247,7 +247,7 @@ impl LppEndpoint {
                 // SIZE(1..32), and so is the ranging list, so an EMPTY set of results
                 // must encode as an ABSENT report rather than an empty list -- an
                 // empty one encodes and then fails to decode.
-                let sidelink = match SidelinkRangingReport::fitting_an_addition(sidelink_ranging) {
+                let sidelink = match SidelinkRangingReport::fitting_an_epdu(sidelink_ranging) {
                     Some((report, 0)) => {
                         info!(
                             "LPP: reporting {} sidelink range(s) to the LMF",
@@ -259,11 +259,11 @@ impl LppEndpoint {
                         // Named rather than silent: a truncated report looks exactly
                         // like a complete one at the LMF.
                         warn!(
-                            "LPP: reporting {} sidelink range(s) and DROPPING {}; an \
-                             extension addition carries at most {} octets",
+                            "LPP: reporting {} sidelink range(s) and DROPPING {}; the \
+                             report carries at most {} (SIZE(1..32))",
                             report.results.len(),
                             dropped,
-                            SidelinkRangingReport::MAX_ADDITION_OCTETS
+                            SidelinkRangingReport::MAX_RESULTS
                         );
                         Some(report)
                     }
@@ -1276,7 +1276,7 @@ mod tests {
                     Some(SidelinkRangingReport {
                         results: vec![ranging_result()],
                     }),
-                    "the ranging report must survive the extension addition"
+                    "the ranging report must survive the EPDU"
                 );
             }
             other => panic!("expected ProvideLocationInformation, got {other:?}"),
@@ -1326,49 +1326,52 @@ mod tests {
         );
     }
 
-    /// The report must sit in addition GROUP 4 (index 3), past the three TS 37.355
-    /// declares — the peer LMF reads nr-Multi-RTT out of G2 and IGNORES G1 and G3.
+    /// The report rides LPP's EPDU (TS 37.355 §6.5.7) under nextg's identifier, and
+    /// the `EPDU-Sequence` is pinned to octets derived by hand from X.691 -- the
+    /// contract nextgcore's LMF reads (nextgcore #542, its `sidelink_epdu` module
+    /// holds the same derivation inside a whole message):
     ///
-    /// Pinned at the addition-block level rather than by round-tripping a whole
-    /// message, and the reason is worth stating: within this crate the group index
-    /// CANNOT be caught by a round trip, because the encoder and decoder move
-    /// together — a report written to group 1 and read from group 1 looks perfect
-    /// here and delivers nothing at the LMF. The cross-repo half of this guard is
-    /// nextgcore reading index 3 with its own constant (issue #138).
+    /// ```text
+    ///   EPDU-Sequence SIZE(1..16), one entry:                        0000
+    ///   EPDU-Identifier ext 0 | ePDU-Name present:                   0 1
+    ///   EPDU-ID 256 in (1..256) -> 8 bits of 255:                    1111 1111
+    ///   EPDU-Name SIZE(1..32), 22 chars -> 5 bits of 21:             10101
+    ///   "nextg-sidelink-ranging", 7-bit ISO 646 each (X.691 30.5.3)
+    ///   EPDU-Body: length 11 (8 bits), then GOLDEN_SIDELINK_RANGING_REPORT
+    ///                                                              = 272 bits, 34 octets
+    /// ```
+    const GOLDEN_SIDELINK_EPDU_SEQUENCE: &[u8] = &[
+        0x07, 0xFE, 0xBB, 0xB2, 0xF8, 0xE9, 0x9D, 0x6F, 0x3D, 0x39, 0x32, 0xEC, 0xD3, 0xBB, 0x5A,
+        0xDE, 0x58, 0x77, 0x67, 0xD3, 0xBB, 0x38, 0x58, 0x0A, 0x5A, 0x5A, 0x50, 0x13, 0x88, 0x00,
+        0x01, 0x40, 0x00, 0xC0,
+    ];
+
     #[test]
-    fn the_report_occupies_addition_group_four_and_not_the_first() {
-        let payload = SidelinkRangingReport {
+    fn the_report_rides_an_epdu_matching_its_hand_derived_bytes() {
+        let report = SidelinkRangingReport {
             results: vec![ranging_result()],
-        }
-        .encode()
-        .expect("encodes");
-
-        let groups_of = |members: &[Option<Vec<u8>>]| {
-            let mut w = UperWriter::new();
-            w.write_extension_additions(members).expect("writes");
-            let bytes = w.into_bytes();
-            let mut r = UperReader::new(&bytes);
-            r.read_extension_additions().expect("reads")
         };
-
-        // What the encoder emits: three absent groups, then the report.
-        let correct = groups_of(&[None, None, None, Some(payload.clone())]);
+        let mut w = UperWriter::new();
+        message::write_sidelink_epdu_for_test(&mut w, &report).expect("writes");
+        assert_eq!(w.into_bytes(), GOLDEN_SIDELINK_EPDU_SEQUENCE);
+        let mut r = UperReader::new(GOLDEN_SIDELINK_EPDU_SEQUENCE);
         assert_eq!(
-            correct.get(3).cloned().flatten(),
-            Some(payload.clone()),
-            "the report must be the FOURTH group"
+            message::read_sidelink_epdu_for_test(&mut r).expect("reads"),
+            Some(report)
         );
-        assert!(
-            correct[..3].iter().all(Option::is_none),
-            "and G1..G3 must be left absent rather than claimed"
-        );
+    }
 
-        // The naive placement: one addition, which IS group 1.
-        let naive = groups_of(&[Some(payload)]);
-        assert!(
-            naive.get(3).is_none(),
-            "a single addition is group 1, so nothing is at index 3 -- which is why \
-             the naive placement delivers nothing to the LMF"
+    /// A foreign EPDU that happens to use nextg's number but another name is ignored
+    /// rather than misread as a range report.
+    #[test]
+    fn an_epdu_with_our_number_but_another_name_is_ignored() {
+        let mut bytes = GOLDEN_SIDELINK_EPDU_SEQUENCE.to_vec();
+        // Flip a bit inside the name's first character ('n' -> 'o').
+        bytes[2] ^= 0x01;
+        let mut r = UperReader::new(&bytes);
+        assert_eq!(
+            message::read_sidelink_epdu_for_test(&mut r).expect("reads"),
+            None
         );
     }
 
@@ -1422,15 +1425,11 @@ mod tests {
                 ..
             }) => {
                 let encoded = report.encode().expect("the kept report encodes");
-                assert!(
-                    encoded.len() <= SidelinkRangingReport::MAX_ADDITION_OCTETS,
-                    "the kept report must fit an addition: {} octets",
-                    encoded.len()
-                );
-                assert!(
-                    report.results.len() < SidelinkRangingReport::MAX_RESULTS,
-                    "the binding bound is the 127-octet open type, NOT SIZE(1..32): \
-                     {} results kept",
+                assert!(!encoded.is_empty(), "the kept report encodes");
+                assert_eq!(
+                    report.results.len(),
+                    SidelinkRangingReport::MAX_RESULTS,
+                    "SIZE(1..32) is the binding bound for an EPDU body: {} results kept",
                     report.results.len()
                 );
                 assert_eq!(
