@@ -32,7 +32,7 @@ use std::net::Ipv4Addr;
 use nextgsim_common::config::UeConfig;
 use nextgsim_ue::app::MmStatePublisher;
 use nextgsim_ue::nas::mm::registration_type_for_cell_category;
-use nextgsim_ue::tun::{TunAppMessage, TunMessage, TunTask, TunTaskConfig};
+use nextgsim_ue::tun::{TunAppMessage, TunMessage, TunTask, TunTaskConfig, UplinkBuffer};
 #[cfg(feature = "nextgsim-fl")]
 use nextgsim_ue::FlParticipantTask;
 #[cfg(feature = "nextgsim-isac")]
@@ -297,6 +297,10 @@ impl UeApp {
         // Create TUN task channel
         let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<TunMessage>(64);
         let (tun_app_tx, mut tun_app_rx) = tokio::sync::mpsc::channel::<TunAppMessage>(64);
+        // Whether uplink user data can be sent (issue #267): written by the NAS
+        // task, which owns the CM state and the service request procedure, and
+        // read by the TUN forwarder below, which holds data until it is.
+        let (up_ready_tx, mut up_ready_rx) = watch::channel(false);
 
         // Spawn TUN task (handles TUN interface for user plane data)
         let tun_config = TunTaskConfig::default();
@@ -315,7 +319,32 @@ impl UeApp {
         let (ursp_os_id, ursp_os_app_id) =
             nextgsim_ue::nas::sm::ApplicationDescriptor::configured_os_identity(&task_base.config);
         tokio::spawn(async move {
-            while let Some(msg) = tun_app_rx.recv().await {
+            let mut uplink_buffer = UplinkBuffer::default();
+            loop {
+                let msg = tokio::select! {
+                    msg = tun_app_rx.recv() => match msg {
+                        Some(msg) => msg,
+                        None => break,
+                    },
+                    changed = up_ready_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if *up_ready_rx.borrow_and_update() && !uplink_buffer.is_empty() {
+                            let held = uplink_buffer.drain();
+                            info!(
+                                "User plane ready: sending {} uplink packet(s) held during the service request",
+                                held.len()
+                            );
+                            for (psi, pdu) in held {
+                                let _ = rls_tx_for_tun
+                                    .send(RlsMessage::DataPduDelivery { psi, pdu })
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
+                };
                 match msg {
                     TunAppMessage::InterfaceCreated { psi, name } => {
                         info!("TUN interface created: {} for PSI {}", name, psi);
@@ -357,10 +386,23 @@ impl UeApp {
                                 psi: u8::try_from(psi).ok(),
                             })
                             .await;
-                        // Forward uplink data to RLS for transmission to gNB
-                        let _ = rls_tx_for_tun
-                            .send(RlsMessage::DataPduDelivery { psi, pdu: data })
-                            .await;
+                        // Forward uplink data to RLS for transmission to gNB --
+                        // or hold it while the user plane is down: from CM-IDLE
+                        // the gNB has no context for this UE and dropped the
+                        // packet that triggered the service request (#267).
+                        let ready = *up_ready_rx.borrow();
+                        let to_send = uplink_buffer.offer(ready, psi, data);
+                        if !ready {
+                            debug!(
+                                "User plane not ready: holding uplink packet ({} held)",
+                                uplink_buffer.len()
+                            );
+                        }
+                        for (psi, pdu) in to_send {
+                            let _ = rls_tx_for_tun
+                                .send(RlsMessage::DataPduDelivery { psi, pdu })
+                                .await;
+                        }
                     }
                     TunAppMessage::Error { message } => {
                         warn!("TUN error: {}", message);
@@ -395,7 +437,9 @@ impl UeApp {
 
         // Spawn NAS task (handles MM and SM procedures)
         let nas_task_base = task_base.clone();
-        tokio::spawn(async move { Self::run_nas_task(nas_task_base, nas_rx, tun_tx).await });
+        tokio::spawn(async move {
+            Self::run_nas_task(nas_task_base, nas_rx, tun_tx, up_ready_tx).await
+        });
         info!("NAS task spawned");
 
         // Spawn RRC task: the conformant library RrcTask (issue #30). It runs
@@ -512,6 +556,7 @@ impl UeApp {
         task_base: UeTaskBase,
         mut rx: tokio::sync::mpsc::Receiver<TaskMessage<NasMessage>>,
         tun_tx: tokio::sync::mpsc::Sender<TunMessage>,
+        up_ready_tx: watch::Sender<bool>,
     ) {
         use nextgsim_nas::ies::ie1::ServiceType;
         use nextgsim_nas::ies::RegistrationType;
@@ -679,6 +724,16 @@ impl UeApp {
         let mut mm_state_publisher = MmStatePublisher::new();
 
         loop {
+            // Published at the top of every iteration, so the state change any
+            // arm made (Service Accept, RRC release, ...) reaches the TUN
+            // forwarder before the next message is read. send_if_modified wakes
+            // the forwarder only on a real change.
+            let ready = orch.uplink_user_plane_ready();
+            up_ready_tx.send_if_modified(|current| {
+                let changed = *current != ready;
+                *current = ready;
+                changed
+            });
             if let Some(update) = mm_state_publisher.poll(orch.state()) {
                 let _ = task_base
                     .app_tx

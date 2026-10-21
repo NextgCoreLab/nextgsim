@@ -2768,6 +2768,19 @@ impl MmOrchestrator {
         Some(Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, data))
     }
 
+    /// Whether uplink user data can be sent now: a NAS signalling connection
+    /// is up and no SERVICE REQUEST is awaiting its answer (T3517 stopped).
+    ///
+    /// From CM-IDLE the user plane comes back only once the service request
+    /// procedure completes (TS 24.501 §5.6.1.2, TS 23.502 §4.2.3.2 steps
+    /// 12-13: the AMF's Initial Context Setup re-establishes the N3 tunnel the
+    /// Service Accept rides with). Data written before that -- including the
+    /// packet that triggered the procedure -- has nowhere to go and must be
+    /// held (issue #267).
+    pub fn uplink_user_plane_ready(&self) -> bool {
+        self.state.is_connected() && !self.timers.t3517.is_running()
+    }
+
     fn handle_service_accept(&mut self, plain: &[u8]) -> Vec<MmOutput> {
         info!("Service Accept received");
         self.timers.stop(TIMER_T3517, true);
@@ -6389,6 +6402,34 @@ mod tests {
     /// was unreachable — which is why the assertion is on the emitted output and
     /// not on a flag: the output is the only thing that can reach the SM
     /// orchestrator.
+    /// Issue #267: the user plane is not ready from the moment uplink data
+    /// triggers a SERVICE REQUEST from CM-IDLE -- through the RRC connection
+    /// coming up -- until the Service Accept; then it is.
+    #[test]
+    fn the_uplink_user_plane_is_ready_only_once_the_service_request_completes() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.uplink_user_plane_ready(), "registered and connected");
+
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        assert!(!orch.uplink_user_plane_ready(), "CM-IDLE: no user plane");
+
+        orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        // The RRC connection the request rides on is up; the N3 tunnel is not.
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(!orch.uplink_user_plane_ready(), "service request in flight");
+
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+        assert!(
+            orch.uplink_user_plane_ready(),
+            "Service Accept: user plane back"
+        );
+    }
+
     #[test]
     fn a_service_accept_surfaces_the_network_pdu_session_status() {
         let mut orch = establish_security_context();

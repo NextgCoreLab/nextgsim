@@ -15,6 +15,11 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{NasMessage, RlfCause, RlsMessage, RrcMessage, Task, TaskMessage, UeTaskBase};
+
+/// The level reported to RRC for a cell that stopped answering: below
+/// `rrc::cell_selection::CELL_LOST_THRESHOLD_DBM`, which is what makes the cell
+/// selector drop the cell.
+const CELL_SIGNAL_LOST_DBM: i32 = i32::MIN;
 use nextgsim_common::OctetString;
 #[cfg(feature = "drb-pdcp")]
 use nextgsim_pdcp::{Pdcp, PdcpConfig};
@@ -539,22 +544,43 @@ impl RlsTask {
         }
     }
 
+    /// A cell stopped answering heartbeats. Losing the serving cell is a radio
+    /// link failure (TS 38.331 §5.3.10.3). Every lost cell, serving or not, is
+    /// then reported to RRC as gone, so its cell selector stops offering it
+    /// (issue #264). It used to hear only the RLF, so the dead cell stayed
+    /// selectable forever.
+    ///
+    /// The RLF goes first: RRC handles it with the failed cell still as its
+    /// serving cell, which the re-establishment request names.
+    async fn on_cell_lost(&mut self, cell_id: u32) {
+        info!("Cell lost: cell_id={}", cell_id);
+        let cell_id = cell_id as i32;
+        self.cell_addresses.remove(&cell_id);
+        if self.serving_cell == Some(cell_id) {
+            self.serving_cell = None;
+            self.transport.clear_serving_endpoint();
+            let _ = self
+                .task_base
+                .rrc_tx
+                .send(RrcMessage::RadioLinkFailure {
+                    cause: RlfCause::SignalLostToConnectedCell,
+                })
+                .await;
+        }
+        let _ = self
+            .task_base
+            .rrc_tx
+            .send(RrcMessage::SignalChanged {
+                cell_id,
+                dbm: CELL_SIGNAL_LOST_DBM,
+            })
+            .await;
+    }
+
     async fn check_lost_cells(&mut self) {
         for event in self.cell_search.check_lost_cells() {
             if let CellSearchEvent::CellLost { cell_id } = event {
-                info!("Cell lost: cell_id={}", cell_id);
-                self.cell_addresses.remove(&(cell_id as i32));
-                if self.serving_cell == Some(cell_id as i32) {
-                    self.serving_cell = None;
-                    self.transport.clear_serving_endpoint();
-                    let _ = self
-                        .task_base
-                        .rrc_tx
-                        .send(RrcMessage::RadioLinkFailure {
-                            cause: RlfCause::SignalLostToConnectedCell,
-                        })
-                        .await;
-                }
+                self.on_cell_lost(cell_id).await;
             }
         }
     }
@@ -709,19 +735,7 @@ impl RlsTask {
                         .await;
                 }
                 CellSearchEvent::CellLost { cell_id } => {
-                    info!("Cell lost: cell_id={}", cell_id);
-                    self.cell_addresses.remove(&(cell_id as i32));
-                    if self.serving_cell == Some(cell_id as i32) {
-                        self.serving_cell = None;
-                        self.transport.clear_serving_endpoint();
-                        let _ = self
-                            .task_base
-                            .rrc_tx
-                            .send(RrcMessage::RadioLinkFailure {
-                                cause: RlfCause::SignalLostToConnectedCell,
-                            })
-                            .await;
-                    }
+                    self.on_cell_lost(cell_id).await;
                 }
             }
         }
@@ -1379,6 +1393,51 @@ mod tests {
         let mut task = RlsTask::new(task_base, rls_config);
         task.handle_assign_current_cell(1);
         assert!(task.serving_cell.is_none()); // Unknown cell
+    }
+
+    /// Issue #264: losing a cell must reach RRC as the cell being gone, after
+    /// the RLF for a serving cell. RRC heard only the RLF, so its cell selector
+    /// kept offering the dead cell.
+    #[tokio::test]
+    async fn a_lost_serving_cell_reaches_rrc_as_an_rlf_then_as_gone() {
+        let (task_base, _app_rx, _nas_rx, mut rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base, RlsTaskConfig::default());
+        task.serving_cell = Some(3);
+
+        task.on_cell_lost(3).await;
+
+        assert!(task.serving_cell.is_none());
+        assert!(matches!(
+            rrc_rx.try_recv(),
+            Ok(TaskMessage::Message(RrcMessage::RadioLinkFailure {
+                cause: RlfCause::SignalLostToConnectedCell
+            }))
+        ));
+        match rrc_rx.try_recv() {
+            Ok(TaskMessage::Message(RrcMessage::SignalChanged { cell_id, dbm })) => {
+                assert_eq!(cell_id, 3);
+                assert!(dbm < crate::rrc::cell_selection::CELL_LOST_THRESHOLD_DBM);
+            }
+            other => panic!("expected the cell reported gone, got {other:?}"),
+        }
+    }
+
+    /// A non-serving cell's loss is no RLF, but RRC still learns it is gone.
+    #[tokio::test]
+    async fn a_lost_neighbour_reaches_rrc_as_gone_only() {
+        let (task_base, _app_rx, _nas_rx, mut rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base, RlsTaskConfig::default());
+        task.serving_cell = Some(1);
+        task.on_cell_lost(4).await;
+        assert_eq!(task.serving_cell, Some(1));
+        assert!(matches!(
+            rrc_rx.try_recv(),
+            Ok(TaskMessage::Message(RrcMessage::SignalChanged {
+                cell_id: 4,
+                ..
+            }))
+        ));
+        assert!(rrc_rx.try_recv().is_err());
     }
 
     // ── RLC mode selector (#15) ──────────────────────────────────────────────
