@@ -2892,6 +2892,19 @@ impl MmOrchestrator {
         }
         info!("Sending Deregistration Request (switch_off={switch_off})");
         let pdu = self.protect_if_active(plain);
+        if switch_off {
+            // TS 24.501 §5.5.2.2.1: a switched-off UE may power down as soon as
+            // the request is sent, and the AMF answers a switch-off with no
+            // DEREGISTRATION ACCEPT (§5.5.2.2.2), so nothing would ever move the
+            // UE out of 5GMM-DEREGISTERED-INITIATED. 5GS services are now
+            // disabled: 5GMM-NULL (§5.1.3.2.1.1). Switched after protecting, so
+            // the request still goes out under the active context. T3512 is
+            // stopped as the DEREGISTRATION ACCEPT path stops it: left running,
+            // a switched-off UE started a periodic registration update 9
+            // minutes later against an AMF that had deleted its context.
+            self.timers.stop(TIMER_T3512, true);
+            self.state.switch_mm_state(MmSubState::Null);
+        }
         vec![MmOutput::SendNasPdu(pdu)]
     }
 
@@ -6471,6 +6484,28 @@ mod tests {
             orch.state().mm_substate(),
             MmSubState::DeregisteredNormalService
         );
+    }
+
+    /// Issue #266: a switch-off de-registration gets no DEREGISTRATION ACCEPT
+    /// (TS 24.501 §5.5.2.2.2), so the UE must not wait in
+    /// 5GMM-DEREGISTERED-INITIATED -- and still REGISTERED -- for one.
+    #[test]
+    fn a_switch_off_deregistration_leaves_the_ue_deregistered_without_an_accept() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        assert!(orch.state().is_registered());
+
+        let outs = orch.start_deregistration(true);
+        assert_eq!(outs.len(), 1);
+        assert!(matches!(outs[0], MmOutput::SendNasPdu(_)));
+        assert!(!orch.timers().t3521.is_running(), "no answer is awaited");
+        assert!(
+            !orch.timers().t3512.is_running(),
+            "no periodic registration update from a switched-off UE"
+        );
+        assert_eq!(orch.state().mm_substate(), MmSubState::Null);
+        assert!(orch.state().is_deregistered());
     }
 
     // TS 24.501 §5.4.3.3: the UE reuses a stored SUCI while T3519 runs and only

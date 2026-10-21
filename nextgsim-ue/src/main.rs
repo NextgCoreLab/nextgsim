@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 use std::net::Ipv4Addr;
 
 use nextgsim_common::config::UeConfig;
+use nextgsim_ue::app::MmStatePublisher;
 use nextgsim_ue::nas::mm::registration_type_for_cell_category;
 use nextgsim_ue::tun::{TunAppMessage, TunMessage, TunTask, TunTaskConfig, UplinkBuffer};
 #[cfg(feature = "nextgsim-fl")]
@@ -44,7 +45,7 @@ use nextgsim_ue::SemanticCodecTask;
 use nextgsim_ue::SheClientTask;
 use nextgsim_ue::{
     AppMessage, AppTask, MintMessage, MintTask, NasMessage, RangingTask, RlsMessage, RlsTask,
-    RrcMessage, Task, TaskManager, TaskMessage, UeRel18Receivers, UeTaskBase,
+    RrcMessage, Task, TaskManager, TaskMessage, UeRel18Receivers, UeStatusUpdate, UeTaskBase,
     DEFAULT_CHANNEL_CAPACITY,
 };
 #[cfg(feature = "sidelink")]
@@ -715,6 +716,13 @@ impl UeApp {
             tokio::time::interval(sl_prs_period.unwrap_or(Duration::from_secs(3600)));
         sl_prs_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // The App task gates its CLI commands on the 5GMM state, which only
+        // this task holds (issue #266). Published at the top of every
+        // iteration, so whatever the previous message changed -- including an
+        // arm that `continue`s -- reaches the App task before the next one is
+        // read.
+        let mut mm_state_publisher = MmStatePublisher::new();
+
         loop {
             // Published at the top of every iteration, so the state change any
             // arm made (Service Accept, RRC release, ...) reaches the TUN
@@ -726,6 +734,19 @@ impl UeApp {
                 *current = ready;
                 changed
             });
+            if let Some(update) = mm_state_publisher.poll(orch.state()) {
+                let _ = task_base
+                    .app_tx
+                    .send(AppMessage::StatusUpdate(update))
+                    .await;
+            }
+            // The CM state rides the same publisher (issue #270).
+            if let Some(update) = mm_state_publisher.poll_cm(orch.state()) {
+                let _ = task_base
+                    .app_tx
+                    .send(AppMessage::StatusUpdate(update))
+                    .await;
+            }
             tokio::select! {
             _ = sl_prs_tick.tick(), if sl_prs_enabled => {
                 // The occasion itself is the sidelink task's business: it owns the
@@ -1607,6 +1628,14 @@ async fn process_sm_outputs(
                 // "PDU Session" capitalised to match the 3GPP term used
                 // everywhere else in these logs (and in the E2E assertions).
                 info!("PDU Session {psi} is now ACTIVE (IPv4: {ipv4:?})");
+                let _ = task_base
+                    .app_tx
+                    .send(AppMessage::StatusUpdate(
+                        UeStatusUpdate::SessionEstablishment {
+                            psi: i32::from(psi),
+                        },
+                    ))
+                    .await;
                 if let Some(ip) = ipv4 {
                     let address = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
                     info!("PDU Session {psi} established with IP {address}");
@@ -1632,6 +1661,14 @@ async fn process_sm_outputs(
                     .send(TunMessage::DestroyInterface {
                         psi: i32::from(psi),
                     })
+                    .await;
+                // The App task's session list backs `ps-release-all` and
+                // `status` (issue #266).
+                let _ = task_base
+                    .app_tx
+                    .send(AppMessage::StatusUpdate(UeStatusUpdate::SessionRelease {
+                        psi: i32::from(psi),
+                    }))
                     .await;
             }
             SmOutput::SessionModified { psi } => {
