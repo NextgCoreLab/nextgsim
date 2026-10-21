@@ -5151,10 +5151,10 @@ mod tests {
         let pdu = first_sent_pdu(&outs).to_vec();
         let (req, _) = open_initial_service_request(&orch, &pdu); // header type 1 + MAC
         assert_eq!(&pdu[7..10], &[0x7E, 0x00, 0x4C]);
-        // Octet 4 carries the ngKSI / service type half-octet pair. Its nibble
-        // order is nextgsim #257 / nextgcore #537: this codec and
-        // nextgcore's both put the ngKSI in bits 5-8, so it is checked through
-        // the decoder here rather than pinned.
+        // Octet 4: ngKSI (native, 0) in bits 1-4 and service type "mobile
+        // terminated services" (0010) in bits 5-8 -- TS 24.501 §8.1 b),
+        // Table 8.2.16.1.1 (nextgsim #257 / nextgcore #537).
+        assert_eq!(pdu[10], 0x20);
         assert_eq!(
             req.service_type.service_type,
             ServiceType::MobileTerminatedServices

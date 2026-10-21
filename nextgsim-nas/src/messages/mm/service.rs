@@ -160,11 +160,14 @@ impl ServiceRequest {
             });
         }
 
-        // First octet: ngKSI (high nibble) + Service type (low nibble)
+        // First octet: ngKSI (bits 1-4) + Service type (bits 5-8). TS 24.501
+        // §8.1 b): in a sequence of half-octet IEs the first one listed in the
+        // message table occupies bits 1-4, and Table 8.2.16.1.1 lists ngKSI
+        // before Service type (nextgsim #257 -- the two were swapped).
         let first_octet = buf.get_u8();
-        let ng_ksi = NasKeySetIdentifier::decode((first_octet >> 4) & 0x0F)
+        let ng_ksi = NasKeySetIdentifier::decode(first_octet & 0x0F)
             .map_err(|e| ServiceError::InvalidIeValue(e.to_string()))?;
-        let service_type = IeServiceType::decode(first_octet & 0x0F)
+        let service_type = IeServiceType::decode((first_octet >> 4) & 0x0F)
             .map_err(|e| ServiceError::InvalidIeValue(e.to_string()))?;
 
         // 5G-S-TMSI (mandatory, Type 6)
@@ -255,8 +258,9 @@ impl ServiceRequest {
         let header = PlainMmHeader::new(MmMessageType::ServiceRequest);
         header.encode(buf);
 
-        // First octet: ngKSI (high nibble) + Service type (low nibble)
-        let first_octet = (self.ng_ksi.encode() << 4) | (self.service_type.encode() & 0x0F);
+        // First octet: ngKSI (bits 1-4) + Service type (bits 5-8), TS 24.501
+        // §8.1 b) / Table 8.2.16.1.1 (nextgsim #257).
+        let first_octet = (self.service_type.encode() << 4) | (self.ng_ksi.encode() & 0x0F);
         buf.put_u8(first_octet);
 
         // 5G-S-TMSI (mandatory)
@@ -788,5 +792,48 @@ mod tests {
         );
         assert_eq!(ServiceAccept::message_type(), MmMessageType::ServiceAccept);
         assert_eq!(ServiceReject::message_type(), MmMessageType::ServiceReject);
+    }
+
+    /// nextgsim #257: TS 24.501 §8.1 b) puts the first half-octet IE listed in
+    /// Table 8.2.16.1.1 -- ngKSI -- in bits 1-4, and Service type in bits 5-8.
+    /// Hand-derived: a mobile-terminated request (service type 0010) with
+    /// native ngKSI 0 is octet `0x20`; data (0001) with ngKSI 5 is `0x15`. The
+    /// codec used to write `0x02` / `0x51`, which a conformant AMF reads as
+    /// ngKSI 2 / service type "signalling" -- hidden because nextgcore's amfd
+    /// had the mirror-image swap (nextgcore #537).
+    #[test]
+    fn service_request_half_octets_follow_table_order() {
+        let tmsi = Ie5gsMobileIdentity::new(
+            MobileIdentityType::Tmsi,
+            vec![0xF4, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF],
+        );
+        for (st, ksi, octet) in [
+            (ServiceType::MobileTerminatedServices, 0u8, 0x20u8),
+            (ServiceType::Data, 5, 0x15),
+        ] {
+            let req = ServiceRequest::new(
+                NasKeySetIdentifier::new(crate::security::SecurityContextType::Native, ksi),
+                IeServiceType::new(st),
+                tmsi.clone(),
+            );
+            let mut buf = Vec::new();
+            req.encode(&mut buf);
+            assert_eq!(&buf[..4], &[0x7E, 0x00, 0x4C, octet]);
+            assert_eq!(
+                &buf[4..],
+                &[0x00, 0x07, 0xF4, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF]
+            );
+            let back = ServiceRequest::decode(&mut &buf[3..]).unwrap();
+            assert_eq!(back.service_type.service_type, st);
+            assert_eq!(back.ng_ksi.ksi, ksi);
+        }
+        // Decoding a hand-built octet, independent of the encoder.
+        let wire = [0x20u8, 0x00, 0x07, 0xF4, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF];
+        let d = ServiceRequest::decode(&mut &wire[..]).unwrap();
+        assert_eq!(
+            d.service_type.service_type,
+            ServiceType::MobileTerminatedServices
+        );
+        assert_eq!(d.ng_ksi.ksi, 0);
     }
 }
