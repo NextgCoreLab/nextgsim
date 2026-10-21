@@ -19,8 +19,10 @@ pub mod config;
 pub mod interface;
 pub mod packet;
 pub mod task;
+pub mod uplink_buffer;
 
 pub use config::TunConfig;
 pub use interface::{TunError, TunInterface, TunReader, TunWriter};
 pub use packet::{is_valid_ip_packet, IpPacket, IpVersion};
 pub use task::{spawn_tun_reader, TunAppMessage, TunMessage, TunTask, TunTaskConfig};
+pub use uplink_buffer::{UplinkBuffer, DEFAULT_UPLINK_BUFFER_PACKETS};
