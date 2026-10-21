@@ -22,4 +22,4 @@ pub use config_loader::{
     ConfigError, ConfigValidationError,
 };
 pub use status::{StatusReporter, TimerInfo, TimersInfo, UeInfo, UeStatusInfo};
-pub use task::{parse_ue_cli_command, AppTask};
+pub use task::{parse_ue_cli_command, AppTask, MmStatePublisher};

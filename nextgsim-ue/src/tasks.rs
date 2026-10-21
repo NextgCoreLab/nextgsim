@@ -238,6 +238,18 @@ pub enum UeStatusUpdate {
         /// New CM state
         cm_state: CmState,
     },
+    /// The NAS task's 5GMM state changed (TS 24.501 §5.1.3). The App task
+    /// gates CLI commands (`deregister`, `ps-establish`, ...) on it, so the
+    /// NAS task publishes every change (issue #266: the App task's copy used
+    /// to be written by nothing and stayed DEREGISTERED forever).
+    MmStateChanged {
+        /// RM state
+        rm_state: crate::nas::mm::RmState,
+        /// 5GMM main state
+        mm_state: crate::nas::mm::MmState,
+        /// 5GMM sub-state
+        mm_sub_state: crate::nas::mm::MmSubState,
+    },
 }
 
 /// Connection Management state.
