@@ -245,16 +245,18 @@ async fn an_amf_paging_reaches_the_idle_ue_as_a_nas_paging_indication() {
         GnbTaskBase::new(gnb_config(), 32);
     let mut gnb_rrc = GnbRrcTask::new(gnb_base);
 
-    // The paging occasion the gNB will use (issue #99), computed before the send
-    // so the test knows how long the transmission is legitimately deferred.
-    let schedule = gnb_rrc.schedule_paging(
-        &PAGED_S_TMSI,
-        Some(PAGING_DRX_FRAMES),
-        nextgsim_common::frame_clock::current_sfn(),
-    );
-    gnb_rrc
+    // The paging occasion the gNB USED (issue #99), as `handle_paging` reports it.
+    //
+    // Not recomputed here from a second `current_sfn()` read (issue #299): the two
+    // reads straddle a 10 ms frame boundary often enough on a loaded runner, and
+    // then they disagree by a whole cycle. A test read in the occasion (delay 0)
+    // against a gNB read one frame later (delay 31 frames) waited 300 ms for a
+    // broadcast deferred 310 ms; the opposite straddle (test 10 ms, gNB 0) made
+    // the gNB transmit at once and failed criterion 4 below.
+    let schedule = gnb_rrc
         .handle_paging(ue_paging_tmsi, tai_list, Some(PAGING_DRX_FRAMES))
-        .await;
+        .await
+        .expect("a well-formed 5G-S-TMSI is scheduled, not dropped");
 
     // CRITERION 4: nothing goes out before the occasion. Only asserted when the
     // occasion is not the current frame -- roughly 31 runs in 32, and claiming it
@@ -289,6 +291,12 @@ async fn an_amf_paging_reaches_the_idle_ue_as_a_nas_paging_indication() {
     // What the UE's NAS plane hands down once a 5G-GUTI is assigned
     // (`RrcMessage::PagingIdentity`).
     ue_rrc.set_paging_identity(Some(PAGED_S_TMSI));
+    // Received in the frame the gNB transmitted it in. Without the pin the UE
+    // re-reads the live clock when the PDU is handed to it, and a broadcast the
+    // runner delivered late enough would fall outside the occasion window -- the
+    // same second-clock-read race as above, on the UE side (issue #299; the
+    // pattern #171 removed from the off-occasion test below).
+    ue_rrc.pin_sfn(schedule.paging_frame);
 
     ue_rrc
         .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, pcch_pdu)
@@ -319,14 +327,11 @@ async fn a_ue_with_a_different_5g_s_tmsi_is_not_paged_by_the_same_broadcast() {
     let (gnb_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut gnb_rls_rx, _sctp_rx) =
         GnbTaskBase::new(gnb_config(), 32);
     let mut gnb_rrc = GnbRrcTask::new(gnb_base);
-    let schedule = gnb_rrc.schedule_paging(
-        &PAGED_S_TMSI,
-        Some(PAGING_DRX_FRAMES),
-        nextgsim_common::frame_clock::current_sfn(),
-    );
-    gnb_rrc
+    // The schedule the gNB used, not a second clock read (issue #299).
+    let schedule = gnb_rrc
         .handle_paging(ue_paging_tmsi, tai_list, Some(PAGING_DRX_FRAMES))
-        .await;
+        .await
+        .expect("a well-formed 5G-S-TMSI is scheduled, not dropped");
     let (_, pcch_pdu) =
         await_broadcast(&mut gnb_rls_rx, schedule.delay + Duration::from_millis(300))
             .await
@@ -336,6 +341,9 @@ async fn a_ue_with_a_different_5g_s_tmsi_is_not_paged_by_the_same_broadcast() {
         UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
     ue_rrc.set_paging_identity(Some(OTHER_S_TMSI));
+    // Received in the frame the gNB transmitted it in (issue #299), so the only
+    // thing that can keep this UE silent is the identity mismatch under test.
+    ue_rrc.pin_sfn(schedule.paging_frame);
 
     ue_rrc
         .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, pcch_pdu)
