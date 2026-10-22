@@ -100,6 +100,11 @@ pub struct TunTask {
     app_tx: mpsc::Sender<TunAppMessage>,
     /// Active TUN interface writers indexed by PSI (readers are spawned as separate tasks)
     interfaces: HashMap<i32, TunWriter>,
+    /// The reader task of each interface. Each holds the read half (and so the
+    /// device) open, so destroying an interface must stop its reader: otherwise
+    /// the device outlived the session, and re-creating it for the next session
+    /// failed with EBUSY (nextgsim #272).
+    readers: HashMap<i32, tokio::task::JoinHandle<()>>,
 }
 
 impl TunTask {
@@ -109,6 +114,7 @@ impl TunTask {
             config,
             app_tx,
             interfaces: HashMap::new(),
+            readers: HashMap::new(),
         }
     }
 
@@ -192,7 +198,7 @@ impl TunTask {
 
                 // Spawn reader task for uplink data
                 let app_tx = self.app_tx.clone();
-                tokio::spawn(async move {
+                let reader_task = tokio::spawn(async move {
                     info!("TUN reader started for interface {} (PSI {})", name, psi);
 
                     loop {
@@ -238,6 +244,7 @@ impl TunTask {
 
                     info!("TUN reader stopped for interface {} (PSI {})", name, psi);
                 });
+                self.readers.insert(psi, reader_task);
 
                 // Notify App task of session establishment
                 let _ = self
@@ -263,6 +270,12 @@ impl TunTask {
     /// Destroy a TUN interface
     async fn destroy_interface(&mut self, psi: i32) {
         if let Some(interface) = self.interfaces.remove(&psi) {
+            // Stop the reader and wait for it, so its half of the device is
+            // dropped and the device is closed before this returns.
+            if let Some(reader_task) = self.readers.remove(&psi) {
+                reader_task.abort();
+                let _ = reader_task.await;
+            }
             info!(
                 "Destroyed TUN interface {} for PSI {}",
                 interface.name(),
