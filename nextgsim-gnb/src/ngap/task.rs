@@ -1104,27 +1104,13 @@ impl NgapTask {
             ue_id, ciph_id, int_id
         );
 
-        // Encode + send the RRC SecurityModeCommand (SRB1, DL-DCCH).
-        let params = SecurityModeCommandParams {
-            rrc_transaction_id,
-            security_algorithms: SecurityAlgorithms {
-                ciphering_algorithm: ciph_alg,
-                integrity_algorithm: Some(int_alg),
-            },
-        };
-        match encode_security_mode_command(&params) {
-            Ok(pdu) => {
-                let msg = RrcMessage::SecurityModeCommand {
-                    ue_id,
-                    pdu: OctetString::from_slice(&pdu),
-                };
-                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
-                    error!("Failed to hand RRC SecurityModeCommand to RRC task: {}", e);
-                }
-            }
-            Err(e) => error!("Failed to encode RRC SecurityModeCommand: {}", e),
-        }
-
+        // The keys go to the RRC task BEFORE the SecurityModeCommand. `rrc_tx` is
+        // one FIFO channel, and the RRC task integrity-protects the command with
+        // the K_RRCint it holds when the command arrives: sent second, the keys
+        // arrived after the command, so with `as_security_enabled` on the command
+        // still went out bare ("no AS security keys yet") and every UE answered
+        // SecurityModeFailure (#284).
+        //
         // The RRC task verifies an RRCReestablishmentRequest's shortMAC-I with
         // K_RRCint (TS 38.331 §5.3.7.2) and answers with the AS context's
         // nextHopChainingCount, neither of which it can reach on its own: the AS
@@ -1151,6 +1137,27 @@ impl NgapTask {
                 "Failed to hand the re-establishment security context to the RRC task: {}",
                 e
             );
+        }
+
+        // Encode + send the RRC SecurityModeCommand (SRB1, DL-DCCH).
+        let params = SecurityModeCommandParams {
+            rrc_transaction_id,
+            security_algorithms: SecurityAlgorithms {
+                ciphering_algorithm: ciph_alg,
+                integrity_algorithm: Some(int_alg),
+            },
+        };
+        match encode_security_mode_command(&params) {
+            Ok(pdu) => {
+                let msg = RrcMessage::SecurityModeCommand {
+                    ue_id,
+                    pdu: OctetString::from_slice(&pdu),
+                };
+                if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                    error!("Failed to hand RRC SecurityModeCommand to RRC task: {}", e);
+                }
+            }
+            Err(e) => error!("Failed to encode RRC SecurityModeCommand: {}", e),
         }
     }
 
@@ -7066,6 +7073,88 @@ mod tests {
             },
             other => panic!("expected UnsuccessfulOutcome, got {other:?}"),
         }
+    }
+
+    /// #284: with `as_security_enabled` on, the SecurityModeCommand that
+    /// Initial Context Setup triggers reaches the UE integrity protected. Driven
+    /// through the REAL NGAP -> RRC channel and the RRC task's own loop, which
+    /// is where the defect lived: the command used to be queued ahead of the
+    /// keys, so the RRC task protected it with no keys and sent it bare.
+    #[tokio::test]
+    async fn the_security_mode_command_from_initial_context_setup_carries_a_mac_i() {
+        use crate::rrc::RrcTask;
+        use crate::tasks::{RlsMessage, Task};
+        use nextgsim_pdcp::srb_security::{SrbSecurity, MAC_I_LEN};
+        use nextgsim_rls::RrcChannel;
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_request, RrcEstablishmentCause, RrcSetupRequestParams, UeIdentity,
+        };
+        use nextgsim_rrc::procedures::security_mode::decode_security_mode_command;
+
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let (task_base, _app_rx, _ngap_rx, rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+
+        // The RRC side: UE 10 has an RRC connection being set up.
+        let mut rrc = RrcTask::new(task_base.clone());
+        rrc.handle_radio_power_on();
+        let req = encode_rrc_setup_request(&RrcSetupRequestParams {
+            ue_identity: UeIdentity::RandomValue(0x12345),
+            establishment_cause: RrcEstablishmentCause::MoSignalling,
+        })
+        .expect("encode RRCSetupRequest");
+        rrc.handle_uplink_rrc(10, RrcChannel::UlCcch, OctetString::from_slice(&req))
+            .await;
+        while rls_rx.try_recv().is_ok() {}
+
+        // The NGAP side: Initial Context Setup activates AS security.
+        let mut ngap = NgapTask::new(task_base);
+        ngap.create_amf_context(1);
+        ngap.create_ue_context(10, 1).await.expect("ue context");
+        ngap.activate_as_security(10, [0x11u8; 32], &caps(0x4000, 0x4000))
+            .await;
+        let k_rrc_int = ngap
+            .find_ue_context(10)
+            .unwrap()
+            .as_security
+            .as_ref()
+            .unwrap()
+            .k_rrc_int;
+
+        // Run the RRC task over exactly what NGAP queued, in queue order.
+        let rrc_handle = tokio::spawn(async move { rrc.run(rrc_rx).await });
+        let smc = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rls_rx.recv().await {
+                    Some(TaskMessage::Message(RlsMessage::DownlinkRrc {
+                        ue_id: 10,
+                        rrc_channel: RrcChannel::DlDcch,
+                        data,
+                        ..
+                    })) => break data,
+                    Some(_) => continue,
+                    None => panic!("RLS channel closed before the SecurityModeCommand"),
+                }
+            }
+        })
+        .await
+        .expect("the SecurityModeCommand reaches RLS");
+        rrc_handle.abort();
+
+        let bytes = smc.data();
+        assert!(bytes.len() > MAC_I_LEN, "too short to carry a MAC-I");
+        let (body, mac) = bytes.split_at(bytes.len() - MAC_I_LEN);
+        decode_security_mode_command(body).expect("the body is the plain (unciphered) command");
+        // NIA2, COUNT 0, SRB1 bearer 0, downlink (TS 38.331 §5.3.4.2).
+        let verifier = SrbSecurity::new([0u8; 16], k_rrc_int, 0, 2).expect("NIA2");
+        assert_eq!(
+            verifier.compute_mac_i(0, 0, 1, body).as_slice(),
+            mac,
+            "the SecurityModeCommand must carry a MAC-I computed with K_RRCint"
+        );
     }
 
     /// A UE CONTEXT MODIFICATION REQUEST carrying a new Security Key re-derives

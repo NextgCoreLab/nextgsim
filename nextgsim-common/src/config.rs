@@ -249,12 +249,12 @@ pub struct GnbConfig {
     /// **`false` by default**, which is a deliberate deviation from #31's own
     /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
     /// rule already carves out: default-ON *except where the behaviour drops
-    /// traffic*. Turning this on drops **all** UL-DCCH traffic today, because the
-    /// gNB's uplink dispatcher still routes on `bytes[0] & 0x0F` of the RAW PDU
-    /// (`C5_TYPED_DCCH_DISPATCH` is `false`), and a ciphered PDU has no meaningful
-    /// leading nibble. Enabling it by default therefore requires the C5 typed
-    /// dispatch flip as well, which is a separate call about when the peer UE is a
-    /// conformant typed peer.
+    /// traffic*. Turning this on drops **all** UL-DCCH traffic after the
+    /// SecurityModeComplete today, because the UE has no SRB1 PDCP protection site
+    /// yet (nextgsim#285): it keeps sending plaintext, and the gNB, now active,
+    /// discards every uplink PDU that fails its integrity check. (The earlier
+    /// reason, `C5_TYPED_DCCH_DISPATCH` being `false`, no longer holds: it is
+    /// `true`, and the gNB unprotects UL-DCCH before dispatch.)
     ///
     /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
     /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
@@ -2020,12 +2020,12 @@ pub struct UeConfig {
     /// **`false` by default**, which is a deliberate deviation from #31's own
     /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
     /// rule already carves out: default-ON *except where the behaviour drops
-    /// traffic*. Turning this on drops **all** UL-DCCH traffic today, because the
-    /// gNB's uplink dispatcher still routes on `bytes[0] & 0x0F` of the RAW PDU
-    /// (`C5_TYPED_DCCH_DISPATCH` is `false`), and a ciphered PDU has no meaningful
-    /// leading nibble. Enabling it by default therefore requires the C5 typed
-    /// dispatch flip as well, which is a separate call about when the peer UE is a
-    /// conformant typed peer.
+    /// traffic*. Turning this on drops **all** UL-DCCH traffic after the
+    /// SecurityModeComplete today, because the UE has no SRB1 PDCP protection site
+    /// yet (nextgsim#285): it keeps sending plaintext, and the gNB, now active,
+    /// discards every uplink PDU that fails its integrity check. (The earlier
+    /// reason, `C5_TYPED_DCCH_DISPATCH` being `false`, no longer holds: it is
+    /// `true`, and the gNB unprotects UL-DCCH before dispatch.)
     ///
     /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
     /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
