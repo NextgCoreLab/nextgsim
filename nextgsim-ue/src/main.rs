@@ -1620,7 +1620,8 @@ async fn process_mm_outputs(
                 let sm_outs = sm_orch.release_all_locally();
                 if !sm_outs.is_empty() {
                     info!(
-                        "Network-initiated de-registration: {} PDU session(s) released locally",
+                        "5GMM-DEREGISTERED (network de-registration or a reject): {} PDU session(s) \
+                         released locally",
                         sm_outs.len()
                     );
                     process_sm_outputs(sm_outs, orch, task_base, tun_tx, pdu_counter).await;

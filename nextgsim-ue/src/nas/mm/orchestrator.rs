@@ -2058,6 +2058,22 @@ impl MmOrchestrator {
                     MmOutput::RegistrationFailed(cause),
                 ]
             }
+            // TS 24.501 §5.5.1.3.5: a MOBILITY or PERIODIC registration rejected
+            // with #9 / #10 (a restarted AMF that has no context for this UE)
+            // deletes the 5G-GUTI and starts an initial registration. It used to
+            // fall through to the abnormal case, which retried the same GUTI five
+            // times and then waited out T3502.
+            MmCause::UeIdentityCannotBeDerived | MmCause::ImplicitlyDeregistered
+                if self.pending_reg_type != RegistrationType::InitialRegistration
+                    && self.pending_reg_type != RegistrationType::EmergencyRegistration =>
+            {
+                self.state.switch_update_status(UpdateStatus::NotUpdated);
+                self.delete_registration_context();
+                self.registration_attempt_counter = 0;
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredNormalService);
+                self.reregister_after_identity_loss()
+            }
             MmCause::PermanentlyNotAuthorizedForSnpn => {
                 self.delete_registration_context();
                 self.snpn_permanently_forbidden = true;
@@ -2071,6 +2087,22 @@ impl MmOrchestrator {
             }
             _ => self.abnormal_registration_failure(),
         }
+    }
+
+    /// The network lost this UE's identity (#9 / #10): the UE is now
+    /// 5GMM-DEREGISTERED, which holds no PDU sessions, so they are released
+    /// locally BEFORE the new initial registration (TS 24.501 §5.6.1.5,
+    /// §5.5.1.3.5). The default sessions then come back after the Registration
+    /// Accept, the #272 path.
+    ///
+    /// Keeping them was the devtest1 failure after an AMF restart: the new AMF
+    /// had no SM context for PSI 1, traffic only flowed on the untouched old
+    /// tunnels, and the first Service Request that tried to re-activate PSI 1
+    /// (after a gNB restart) found nothing to activate.
+    fn reregister_after_identity_loss(&mut self) -> Vec<MmOutput> {
+        let mut outs = vec![MmOutput::ReleasePduSessionsLocally];
+        outs.extend(self.build_and_send_registration(RegistrationType::InitialRegistration));
+        outs
     }
 
     /// Abnormal registration failure (TS 24.501 Section 5.5.1.2.7):
@@ -2888,15 +2920,19 @@ impl MmOrchestrator {
                 self.delete_registration_context();
                 self.usim_invalid = true;
                 self.state.switch_mm_state(MmSubState::Deregistered);
-                vec![MmOutput::RegistrationFailed(cause)]
+                // 5GMM-DEREGISTERED holds no PDU sessions (TS 24.501 §5.6.1.5).
+                vec![
+                    MmOutput::ReleasePduSessionsLocally,
+                    MmOutput::RegistrationFailed(cause),
+                ]
             }
             MmCause::UeIdentityCannotBeDerived | MmCause::ImplicitlyDeregistered => {
-                // TS 24.501 5.6.1.5: delete the GUTI and perform a fresh
-                // initial registration
+                // TS 24.501 5.6.1.5: delete the GUTI, enter 5GMM-DEREGISTERED and
+                // perform a fresh initial registration.
                 self.delete_registration_context();
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredNormalService);
-                self.build_and_send_registration(RegistrationType::InitialRegistration)
+                self.reregister_after_identity_loss()
             }
             MmCause::Congestion => {
                 let secs = rej.t3346_value.map(gprs_timer2_seconds).unwrap_or(0);
@@ -6672,6 +6708,49 @@ mod tests {
         assert_eq!(pdu[2], u8::from(MmMessageType::RegistrationRequest));
         assert!(!orch.timers().t3517.is_running());
         assert!(orch.stored_guti().is_none());
+        // 5GMM-DEREGISTERED holds no PDU sessions (§5.6.1.5): they are released
+        // locally BEFORE the new registration, so the defaults come back after
+        // its accept instead of lingering without an SM context at the new AMF.
+        let release = outs
+            .iter()
+            .position(|o| *o == MmOutput::ReleasePduSessionsLocally);
+        let send = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::SendNasPdu(_)));
+        assert!(
+            matches!((release, send), (Some(r), Some(s)) if r < s),
+            "sessions released locally before the registration: {outs:?}"
+        );
+    }
+
+    /// TS 24.501 §5.5.1.3.5: a MOBILITY registration rejected #9 (an AMF that
+    /// restarted and lost the UE) deletes the 5G-GUTI, releases the PDU
+    /// sessions locally and starts an initial registration with the SUCI. It
+    /// used to be an abnormal failure: the same GUTI was retried five times,
+    /// then T3502.
+    #[test]
+    fn a_mobility_registration_rejected_9_re_registers_from_scratch() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+
+        let rej = build_registration_reject_pdu(MmCause::UeIdentityCannotBeDerived, None);
+        let outs = orch.handle_downlink(&rej);
+
+        assert_eq!(
+            outs.first(),
+            Some(&MmOutput::ReleasePduSessionsLocally),
+            "{outs:?}"
+        );
+        let pdu = first_sent_pdu(&outs);
+        assert_eq!(pdu[2], u8::from(MmMessageType::RegistrationRequest));
+        assert!(orch.stored_guti().is_none());
+        assert!(
+            !orch.timers().t3511.is_running(),
+            "not the abnormal-case retry"
+        );
     }
 
     /// The complement: on the connection where the secure exchange WAS
