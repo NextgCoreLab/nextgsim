@@ -100,6 +100,8 @@ pub struct RlsTask {
     /// The last successful resolution of each `gnb_search_hosts` entry (#286).
     /// A failed lookup keeps the previous answer rather than emptying it.
     resolved_hosts: HashMap<PeerAddr, Vec<SocketAddr>>,
+    /// Sources already warned about by `handle_pdu_transmission`.
+    unknown_sources_warned: std::collections::HashSet<SocketAddr>,
     sti: u64,
     /// RLC entities keyed by DRB identity.
     /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
@@ -231,6 +233,7 @@ impl RlsTask {
             socket: None,
             config,
             resolved_hosts: HashMap::new(),
+            unknown_sources_warned: std::collections::HashSet::new(),
             sti,
             rlc_entities: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
@@ -815,7 +818,16 @@ impl RlsTask {
         {
             Some(id) => id,
             None => {
-                warn!("PDU from unknown source {}", source);
+                // Expected while two gNB incarnations share an STI (a pod
+                // restart's overlap, #292): the one not adopted as a cell still
+                // broadcasts to this UE. Warned once per source, not per PDU.
+                if self.unknown_sources_warned.insert(source) {
+                    warn!(
+                        "PDU from unknown source {} (not a discovered cell); further PDUs \
+                         from it are dropped silently",
+                        source
+                    );
+                }
                 return;
             }
         };
@@ -1604,6 +1616,49 @@ mod tests {
                 RlcMode::UnacknowledgedMode
             );
         }
+    }
+
+    /// #292 (seen on devtest1): the UE is attached to gNB A; A's pod is
+    /// replaced by gNB B with the SAME STI (the NCI) at a new address. B's
+    /// heartbeat ack must end the A cell (radio link failure to RRC) and map
+    /// B as a new cell, so B's PDUs are accepted. Before, the cell was
+    /// re-pointed inside the cell search only, the link layer stayed bound to
+    /// A, and every PDU from B was dropped as "from unknown source".
+    #[tokio::test]
+    async fn a_serving_gnb_restarted_at_a_new_address_is_a_new_cell() {
+        let (task_base, _app_rx, _nas_rx, mut rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let a: SocketAddr = "10.0.0.1:4997".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:4997".parse().unwrap();
+        let mut task = RlsTask::new(
+            task_base,
+            RlsTaskConfig {
+                gnb_search_list: vec![a],
+                ..Default::default()
+            },
+        );
+        let ack = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60);
+        task.handle_heartbeat_ack(a, &ack).await;
+        task.handle_assign_current_cell(0);
+        assert_eq!(task.serving_cell, Some(0));
+        while rrc_rx.try_recv().is_ok() {}
+
+        // The name now resolves to B only (what re-resolution installs).
+        task.cell_search.set_search_space(vec![b]);
+        task.handle_heartbeat_ack(b, &ack).await;
+
+        assert_eq!(task.serving_cell, None, "the A cell is gone");
+        assert_eq!(task.cell_addresses.get(&1), Some(&b), "B is a new cell");
+        assert!(!task.cell_addresses.values().any(|addr| *addr == a));
+        let mut rlf = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if matches!(
+                msg,
+                TaskMessage::Message(RrcMessage::RadioLinkFailure { .. })
+            ) {
+                rlf = true;
+            }
+        }
+        assert!(rlf, "losing the serving cell is a radio link failure");
     }
 
     #[test]

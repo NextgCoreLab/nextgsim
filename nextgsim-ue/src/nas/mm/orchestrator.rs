@@ -590,6 +590,18 @@ pub struct MmOrchestrator {
     /// context as an established exchange made the UE discard that reject and
     /// sit out T3517 instead of re-registering.
     secure_exchange: bool,
+    /// The user-plane resources of this UE's PDU sessions were lost with the
+    /// last NAS signalling connection, and no Service Request has re-established
+    /// them yet (nextgsim #288).
+    ///
+    /// Set when a registered UE's connection is released (RRC release or radio
+    /// link failure); cleared by SERVICE ACCEPT or SERVICE REJECT. A UE that
+    /// lost its cell and re-registered on a new one (mobility registration) is
+    /// CM-CONNECTED again with no user plane, and only a Service Request asks
+    /// the network to establish it (TS 24.501 §5.6.1.1). Without this flag the
+    /// UE treated "CM-CONNECTED" as "user plane up" and sent uplink on a DRB the
+    /// new gNB never set up, forever.
+    up_reactivation_pending: bool,
 
     // -- authentication state --
     /// ABBA parameter received in the last Authentication Request
@@ -719,6 +731,7 @@ impl MmOrchestrator {
             timers: NasTimerManager::new(),
             sec: NasSecurityContext::new_3gpp(),
             secure_exchange: false,
+            up_reactivation_pending: false,
             abba: vec![0x00, 0x00],
             sqn_ms: [0u8; 6],
             res_star: None,
@@ -2793,11 +2806,23 @@ impl MmOrchestrator {
     /// packet that triggered the procedure -- has nowhere to go and must be
     /// held (issue #267).
     pub fn uplink_user_plane_ready(&self) -> bool {
-        self.state.is_connected() && !self.timers.t3517.is_running()
+        self.state.is_connected()
+            && !self.timers.t3517.is_running()
+            && !self.up_reactivation_pending
+    }
+
+    /// Whether uplink data in CM-CONNECTED must first trigger a Service Request
+    /// to re-establish the user plane lost with an earlier connection (#288).
+    pub fn user_plane_reactivation_needed(&self) -> bool {
+        self.up_reactivation_pending
+            && self.state.is_registered()
+            && self.state.is_connected()
+            && !self.timers.t3517.is_running()
     }
 
     fn handle_service_accept(&mut self, plain: &[u8]) -> Vec<MmOutput> {
         info!("Service Accept received");
+        self.up_reactivation_pending = false;
         self.timers.stop(TIMER_T3517, true);
         self.timers.stop(TIMER_T3516, true);
         self.res_star = None;
@@ -2852,6 +2877,8 @@ impl MmOrchestrator {
         let cause = rej.mm_cause.value;
         warn!("Service Reject: cause {:?} (#{})", cause, cause as u8);
         self.timers.stop(TIMER_T3517, true);
+        // The request was answered; asking again on every packet would loop.
+        self.up_reactivation_pending = false;
 
         match cause {
             MmCause::IllegalUe | MmCause::IllegalMe | MmCause::FiveGsServicesNotAllowed => {
@@ -3070,6 +3097,10 @@ impl MmOrchestrator {
         self.state.switch_cm_state(CmState::Idle);
         // A secure exchange belongs to one connection (§4.4.4.2).
         self.secure_exchange = false;
+        // So do the user-plane resources (#288).
+        if self.state.is_registered() {
+            self.up_reactivation_pending = true;
+        }
         if !std::mem::take(&mut self.reregistration_on_release) {
             return Vec::new();
         }
@@ -6448,6 +6479,50 @@ mod tests {
             orch.uplink_user_plane_ready(),
             "Service Accept: user plane back"
         );
+    }
+
+    /// nextgsim #288: a UE that lost its connection (RLF on a gNB that
+    /// restarted) and is CM-CONNECTED again after a mobility registration on
+    /// the new gNB has NO user plane. Uplink must be held and a Service Request
+    /// sent; the user plane counts as up only after Service Accept. Before,
+    /// CM-CONNECTED alone read as "user plane up" and uplink went to a DRB the
+    /// new gNB never set up.
+    #[test]
+    fn after_a_lost_connection_cm_connected_alone_is_not_a_user_plane() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.uplink_user_plane_ready());
+        assert!(!orch.user_plane_reactivation_needed());
+
+        // Radio link failure, then a new connection on the new gNB.
+        orch.on_nas_signalling_connection_released();
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(
+            !orch.uplink_user_plane_ready(),
+            "connected, but the user plane went with the old connection"
+        );
+        assert!(orch.user_plane_reactivation_needed());
+
+        let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        assert!(
+            !outs.is_empty(),
+            "a Service Request is sent from CM-CONNECTED"
+        );
+        assert!(
+            !orch.user_plane_reactivation_needed(),
+            "one request in flight, not one per packet"
+        );
+
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+        assert!(
+            orch.uplink_user_plane_ready(),
+            "Service Accept: user plane back"
+        );
+        assert!(!orch.user_plane_reactivation_needed());
     }
 
     #[test]
