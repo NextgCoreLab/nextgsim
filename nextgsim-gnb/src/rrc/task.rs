@@ -1941,12 +1941,20 @@ impl RrcTask {
     /// Public because it is a real message-handler entry point also driven
     /// directly by the in-process strict-peer harness
     /// (`tests/src/paging_mt_service_request.rs`).
+    ///
+    /// Returns the schedule it actually used, or `None` when the paging was
+    /// dropped (issue #299). The schedule is computed from a clock read made
+    /// inside this call, so a caller that computes its own from a separate
+    /// `current_sfn()` read can disagree with it by a whole DRX cycle whenever a
+    /// 10 ms frame boundary falls between the two reads: the caller sees the
+    /// occasion "now" while this call defers to the next one, T frames later.
+    /// Anything that needs to know when the PCCH goes out must use this value.
     pub async fn handle_paging(
         &mut self,
         ue_paging_tmsi: Vec<u8>,
         tai_list_for_paging: Vec<u8>,
         drx_cycle_frames: Option<u16>,
-    ) {
+    ) -> Option<PagingSchedule> {
         let s_tmsi: [u8; FIVE_G_S_TMSI_LEN] = match ue_paging_tmsi.as_slice().try_into() {
             Ok(tmsi) => tmsi,
             Err(_) => {
@@ -1955,7 +1963,7 @@ impl RrcTask {
                     ue_paging_tmsi.len(),
                     FIVE_G_S_TMSI_LEN
                 );
-                return;
+                return None;
             }
         };
 
@@ -1963,7 +1971,7 @@ impl RrcTask {
             Ok(pdu) => pdu,
             Err(e) => {
                 error!("Failed to encode PCCH Paging: {e}");
-                return;
+                return None;
             }
         };
 
@@ -1985,7 +1993,7 @@ impl RrcTask {
             // to sleep for nothing.
             self.broadcast_rrc_message(RrcChannel::Pcch, OctetString::from_slice(&pdu))
                 .await;
-            return;
+            return Some(schedule);
         }
 
         // Deferred on its own task so the RRC task keeps serving other UEs. The
@@ -2011,6 +2019,7 @@ impl RrcTask {
                 );
             }
         });
+        Some(schedule)
     }
 
     /// Work out when a paged UE's next paging frame falls (TS 38.304 §7.1).
@@ -3717,10 +3726,13 @@ mod tests {
         // paging frame, so the broadcast can be up to T radio frames away. rf32
         // bounds that at 320 ms.
         let (channel, pdu_id, pdu) = run_async(async {
-            let schedule =
-                task.schedule_paging(&PAGED_S_TMSI, Some(32), frame_clock::current_sfn());
-            task.handle_paging(PAGED_S_TMSI.to_vec(), served_tai_list(), Some(32))
-                .await;
+            // The schedule handle_paging USED, not one recomputed from a second
+            // clock read: across a frame boundary the two differ by a whole cycle
+            // (issue #299).
+            let schedule = task
+                .handle_paging(PAGED_S_TMSI.to_vec(), served_tai_list(), Some(32))
+                .await
+                .expect("a well-formed 5G-S-TMSI is scheduled, not dropped");
             await_broadcast(&mut rls_rx, schedule.delay + Duration::from_millis(200)).await
         })
         .expect("paging must be broadcast to RLS at the UE's paging frame");
@@ -3750,8 +3762,12 @@ mod tests {
         let mut task = RrcTask::new(task_base);
 
         run_async(async {
-            task.handle_paging(vec![0xDE, 0xAD, 0xBE], served_tai_list(), None)
-                .await;
+            assert_eq!(
+                task.handle_paging(vec![0xDE, 0xAD, 0xBE], served_tai_list(), None)
+                    .await,
+                None,
+                "a dropped paging has no schedule"
+            );
         });
 
         assert!(
