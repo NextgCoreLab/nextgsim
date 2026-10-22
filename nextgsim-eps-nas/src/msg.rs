@@ -225,6 +225,11 @@ pub fn encode_security_mode_complete(imeisv: Option<&MobileIdentity>) -> Vec<u8>
     out
 }
 
+/// DETACH ACCEPT, UE to network (§8.2.10.1).
+pub fn encode_detach_accept() -> Vec<u8> {
+    vec![PD_EMM, emm_type::DETACH_ACCEPT]
+}
+
 /// SECURITY MODE REJECT (§8.2.22).
 pub fn encode_security_mode_reject(cause: u8) -> Vec<u8> {
     vec![PD_EMM, emm_type::SECURITY_MODE_REJECT, cause]
@@ -402,6 +407,14 @@ pub enum DownlinkEmm {
     AttachReject(AttachReject),
     /// SERVICE REJECT.
     ServiceReject(ServiceReject),
+    /// DETACH REQUEST, network to UE (§8.2.11.2).
+    DetachRequest {
+        /// Detach type (§9.9.3.7): 1 re-attach required, 2 re-attach not
+        /// required, 3 IMSI detach.
+        detach_type: u8,
+        /// EMM cause (IEI 53).
+        cause: Option<u8>,
+    },
     /// AUTHENTICATION REQUEST (§8.2.7).
     AuthenticationRequest {
         /// NAS key set identifier ASME.
@@ -497,6 +510,17 @@ pub fn decode_downlink_emm(msg: &[u8]) -> Result<DownlinkEmm, NasDecodeError> {
                 }
             }
             DownlinkEmm::ServiceReject(rej)
+        }
+        emm_type::DETACH_REQUEST => {
+            // Octet 3: spare half octet, then the detach type (§9.9.3.7).
+            let detach_type = r.u8()? & 0x07;
+            let mut cause = None;
+            for (iei, v) in r.optional_ies(&[(0x53, 2)])? {
+                if iei == 0x53 {
+                    cause = v.first().copied();
+                }
+            }
+            DownlinkEmm::DetachRequest { detach_type, cause }
         }
         emm_type::AUTHENTICATION_REQUEST => {
             let ksi = NasKsi::from_nibble(r.u8()? & 0x0F);

@@ -496,8 +496,8 @@ fn attach_accept(mme: &mut MmeNas) -> Vec<u8> {
 }
 
 /// Run the attach to ATTACH COMPLETE with the SGW's S1-U address `sgw`;
-/// returns the eNB's S1-U TEID for E-RAB 5.
-async fn attach(h: &mut Harness, sgw: Ipv4Addr) -> u32 {
+/// returns the eNB's S1-U TEID for E-RAB 5 and the MME's NAS context.
+async fn attach(h: &mut Harness, sgw: Ipv4Addr) -> (u32, MmeNas) {
     wait_state(&mut h.state_rx, |s| {
         matches!(s, UeRrcState::Connected { .. })
     })
@@ -555,7 +555,7 @@ async fn attach(h: &mut Harness, sgw: Ipv4Addr) -> u32 {
         &[0x52, 0x01, 0xC2],
         "default EPS bearer 5 accepted"
     );
-    u32::from_be_bytes(teid.try_into().unwrap())
+    (u32::from_be_bytes(teid.try_into().unwrap()), mme)
 }
 
 #[tokio::test]
@@ -573,7 +573,7 @@ async fn ip_packets_cross_the_drb_and_s1u_in_both_directions() {
     let sgw_ip = Ipv4Addr::new(127, 0, 0, 77);
     let sgw = tokio::net::UdpSocket::bind((sgw_ip, 2152)).await.unwrap();
     let mut h = start().await;
-    let enb_teid = attach(&mut h, sgw_ip).await;
+    let (enb_teid, _) = attach(&mut h, sgw_ip).await;
 
     let mut buf = vec![0u8; 2048];
     for i in 0..5u8 {
@@ -697,4 +697,29 @@ async fn an_idle_ue_sends_a_service_request_and_reattaches_after_reject_9() {
         &[0x08, 0x99, 0x99, 0x07, 0x00, 0x00, 0x00, 0x00, 0x10],
         "IMSI identity"
     );
+}
+
+/// nextgsim #301: the MME's network-initiated detach with "re-attach
+/// required" (TS 24.301 §5.5.2.3), as nextgcore mmed sends it when the UE's
+/// PDN connection is lost at a restarted PGW-U or SGW. The UE answers DETACH
+/// ACCEPT over SRB2 under its NAS context, and once the network releases the
+/// connection attaches again -- integrity protected with the kept context.
+#[tokio::test]
+async fn a_network_detach_with_reattach_required_is_accepted_and_the_ue_reattaches() {
+    let mut h = start().await;
+    let (_, mut mme) = attach(&mut h, Ipv4Addr::new(127, 0, 0, 2)).await;
+    // DETACH REQUEST: re-attach required, EMM cause #10, ciphered.
+    let detach = mme.protect(&[0x07, 0x45, 0x01, 0x53, 10], 2);
+    h.to_enb.send(dl_nas(4242, h.enb_ue_id, &detach)).unwrap();
+    let (_, ul) = uplink_nas(next_s1(&mut h.mme_rx).await.1);
+    assert_eq!(mme.unprotect(&ul), vec![0x07, 0x46], "DETACH ACCEPT");
+
+    h.to_enb.send(release_command(4242, h.enb_ue_id)).unwrap();
+    expect_release_complete(&mut h.mme_rx).await;
+    let (_, nas) = initial_ue_message(next_s1(&mut h.mme_rx).await.1);
+    assert_eq!(
+        nas[0], 0x17,
+        "integrity protected ATTACH REQUEST: {nas:02x?}"
+    );
+    assert_eq!(&mme.unprotect(&nas)[..2], &[0x07, 0x41]);
 }

@@ -26,10 +26,16 @@
 //!   indication (§5.6.1.4); SERVICE REJECT per §5.6.1.5 -- #9, #10 and #40
 //!   lead to a new attach -- and the abnormal cases of §5.6.1.6 that apply
 //!   (T3417 expiry, lower layer failure).
+//! - **Network-initiated detach** (§5.5.2.3): DETACH REQUEST is answered with
+//!   DETACH ACCEPT and the EPS bearer contexts are deactivated locally; with
+//!   "re-attach required" (or "re-attach not required" without a cause that
+//!   bars service) the UE is EMM-DEREGISTERED.NORMAL-SERVICE and attaches
+//!   again once the NAS signalling connection is released (T3440 releasing it
+//!   locally if the network does not).
 //!
 //! # What is not (and is said so where it would be reached)
 //!
-//! Tracking area update, detach and paging are not implemented. A network
+//! Tracking area update, UE-initiated detach and paging are not implemented. A network
 //! message of a procedure this UE does not implement is answered with EMM
 //! STATUS #97 (§7.4), which is what the clause asks of a UE that does not
 //! implement a message type.
@@ -621,6 +627,9 @@ impl EpsNasUe {
                 self.on_service_reject(r, now);
                 NasOutput::default()
             }
+            DownlinkEmm::DetachRequest { detach_type, cause } => {
+                self.on_detach_request(detach_type, cause, now)
+            }
             DownlinkEmm::SecurityModeCommand(_) => {
                 // A SMC with header type 1/2 does not establish a context;
                 // §5.4.3.2 has the network send it with header type 3.
@@ -972,6 +981,67 @@ impl EpsNasUe {
             // §5.6.1.6: any other cause aborts the procedure.
             _ => self.state = EmmState::Registered,
         }
+    }
+
+    /// DETACH REQUEST from the network (§5.5.2.3.2).
+    fn on_detach_request(&mut self, detach_type: u8, cause: Option<u8>, now: Instant) -> NasOutput {
+        const REATTACH_REQUIRED: u8 = 1;
+        const IMSI_DETACH: u8 = 3;
+        if detach_type == IMSI_DETACH {
+            // Non-EPS services only; this UE attaches for EPS services alone,
+            // so its EPS state is untouched.
+            log::info!("EMM: DETACH REQUEST (IMSI detach); DETACH ACCEPT");
+            return self.send_emm(msg::encode_detach_accept());
+        }
+        log::warn!(
+            "EMM: DETACH REQUEST from the network (detach type {detach_type}, cause {cause:?}) in \
+             {:?}; EPS bearer contexts deactivated locally, DETACH ACCEPT",
+            self.state
+        );
+        // §5.5.2.3.4 e): a detach colliding with the UE's own attach or
+        // service request is progressed; those procedures are aborted.
+        self.t3410 = None;
+        self.t3417 = None;
+        // DETACH ACCEPT goes out under the context the request came with,
+        // before a cause below deletes that context.
+        let out = self.send_emm(msg::encode_detach_accept());
+        // "re-attach required": the EMM cause, if any, is ignored.
+        let cause = if detach_type == REATTACH_REQUIRED {
+            None
+        } else {
+            cause
+        };
+        match cause {
+            Some(
+                c @ (emm_cause::ILLEGAL_UE
+                | emm_cause::ILLEGAL_ME
+                | emm_cause::EPS_SERVICES_NOT_ALLOWED
+                | emm_cause::EPS_AND_NON_EPS_NOT_ALLOWED),
+            ) => {
+                self.bearer = None;
+                self.invalidate(c);
+            }
+            Some(
+                c @ (emm_cause::PLMN_NOT_ALLOWED
+                | emm_cause::TA_NOT_ALLOWED
+                | emm_cause::ROAMING_NOT_ALLOWED_IN_TA
+                | emm_cause::EPS_NOT_ALLOWED_IN_PLMN
+                | emm_cause::NO_SUITABLE_CELLS_IN_TA
+                | emm_cause::NOT_AUTHORIZED_FOR_CSG
+                | emm_cause::SERVICE_OPTION_NOT_AUTHORIZED_IN_PLMN),
+            ) => {
+                self.bearer = None;
+                self.guti = None;
+                self.ctx = None;
+                self.state = EmmState::NoService(c);
+            }
+            // Re-attach required, or not required with no (or another) cause:
+            // EMM-DEREGISTERED.NORMAL-SERVICE, so an attach follows the
+            // release of this connection.
+            _ => self.local_detach(),
+        }
+        self.t3440 = Some(now + T3440);
+        out
     }
 
     /// Deactivate the EPS bearer contexts locally and enter

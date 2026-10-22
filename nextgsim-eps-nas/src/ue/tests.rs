@@ -661,3 +661,114 @@ fn an_unsolicited_service_reject_is_ignored() {
     assert_eq!(ue.state(), EmmState::Registered);
     assert!(ue.guti().is_some());
 }
+
+/// DETACH REQUEST (network to UE) as the MME sends it: detach type, then the
+/// optional EMM cause (IEI 53).
+fn detach_request(detach_type: u8, cause: Option<u8>) -> Vec<u8> {
+    let mut m = vec![0x07, 0x45, detach_type];
+    if let Some(c) = cause {
+        m.extend_from_slice(&[0x53, c]);
+    }
+    m
+}
+
+/// §5.5.2.3.2 "re-attach required" (what nextgcore mmed sends after a PGW-U
+/// or SGW restart, with cause #10): DETACH ACCEPT under the current context,
+/// bearers deactivated locally, EMM-DEREGISTERED; the attach waits for the
+/// release of the connection, then goes out with the GUTI.
+#[test]
+fn detach_reattach_required_accepts_and_reattaches_after_the_release() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.on_downlink(&mme.protect(&detach_request(1, Some(10)), 2), now);
+    assert_eq!(out.uplink.len(), 1);
+    assert_eq!(out.uplink[0][0], 0x27, "integrity protected and ciphered");
+    assert_eq!(
+        mme.unprotect(&out.uplink[0]),
+        vec![0x07, 0x46],
+        "DETACH ACCEPT"
+    );
+    assert_eq!(ue.state(), EmmState::Deregistered);
+    assert_eq!(ue.default_bearer(), None);
+    assert!(
+        ue.guti().is_some(),
+        "the cause is ignored for re-attach required"
+    );
+    // The UE's RRC only asks NAS for an initial message in RRC_IDLE; the
+    // network releases (here) or T3440 does.
+    assert_eq!(ue.next_deadline(), Some(now + T3440));
+    ue.on_released(now);
+    assert_eq!(ue.next_deadline(), None);
+    let req = ue.initial_message(now).expect("re-attach");
+    assert_eq!(req[0], 0x17, "integrity protected with the kept context");
+    let plain = mme.unprotect(&req);
+    assert_eq!(&plain[..2], &[0x07, 0x41]);
+    assert_eq!(plain[4], 0xF6, "GUTI identity");
+}
+
+/// T3440: a network that does not release after the detach.
+#[test]
+fn detach_without_a_network_release_releases_locally_on_t3440() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    ue.on_downlink(&mme.protect(&detach_request(1, None), 2), now);
+    assert!(!ue.on_timer(now + T3440 - Duration::from_millis(1)).release);
+    assert!(ue.on_timer(now + T3440).release);
+}
+
+/// §5.5.2.3.2: "re-attach not required" with #7 -- the USIM is invalid for
+/// EPS services; no further attach.
+#[test]
+fn detach_not_required_with_7_leaves_no_service() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.on_downlink(&mme.protect(&detach_request(2, Some(7)), 2), now);
+    assert_eq!(mme.unprotect(&out.uplink[0]), vec![0x07, 0x46]);
+    assert_eq!(ue.state(), EmmState::NoService(7));
+    assert_eq!(ue.default_bearer(), None);
+    ue.on_released(now);
+    assert_eq!(ue.initial_message(now), None);
+}
+
+/// "re-attach not required" with no cause: EMM-DEREGISTERED.NORMAL-SERVICE.
+#[test]
+fn detach_not_required_without_a_cause_deregisters() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    ue.on_downlink(&mme.protect(&detach_request(2, None), 2), now);
+    assert_eq!(ue.state(), EmmState::Deregistered);
+    assert_eq!(ue.default_bearer(), None);
+}
+
+/// IMSI detach concerns non-EPS services only: accepted, EPS state kept.
+#[test]
+fn imsi_detach_keeps_the_eps_registration() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.on_downlink(&mme.protect(&detach_request(3, None), 2), now);
+    assert_eq!(mme.unprotect(&out.uplink[0]), vec![0x07, 0x46]);
+    assert_eq!(ue.state(), EmmState::Registered);
+    assert!(ue.default_bearer().is_some());
+}
+
+/// A DETACH REQUEST must be integrity protected (§4.4.4.2): a plain one is
+/// discarded.
+#[test]
+fn a_plain_detach_request_is_discarded() {
+    let (mut ue, _mme, _) = attach();
+    let out = ue.on_downlink(&detach_request(1, None), Instant::now());
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.state(), EmmState::Registered);
+}
+
+/// A detach that collides with the UE's service request wins (§5.5.2.3.4).
+#[test]
+fn a_detach_during_a_service_request_aborts_it() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    let out = ue.on_downlink(&mme.protect(&detach_request(1, None), 2), now);
+    assert_eq!(mme.unprotect(&out.uplink[0]), vec![0x07, 0x46]);
+    assert_eq!(ue.state(), EmmState::Deregistered);
+    assert_eq!(ue.next_deadline(), Some(now + T3440), "T3417 stopped");
+}
