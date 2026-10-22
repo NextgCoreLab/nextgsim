@@ -89,7 +89,9 @@ pqc:
   # nia4: ML-DSA-65 integrity protection (FIPS 204)
 
 # gNB addresses to search for (RLS protocol)
-# When running in Docker, use the gNB container hostname or IP
+# IPs or hostnames (e.g. the gNB container or Service name). Hostnames are
+# re-resolved every few seconds and on losing the cell, so a gNB that comes back
+# at a new address is found again.
 # Note: Port is optional - defaults to 4997
 gnb_search_list:
   - "172.23.0.100"

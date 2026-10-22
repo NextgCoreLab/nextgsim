@@ -82,34 +82,6 @@ spec:
             - |
               set -eu
 
-              # busybox (this image) ships no getent, so nslookup is the only
-              # resolver available. The parse is anchored: skip everything until
-              # ^Name:, then take the first following Address:. The original
-              # `grep -A1 'Name:' | grep Address | awk` was fragile for two
-              # reasons -- it depended on exact Name:/Address line adjacency,
-              # and without the ^Name: anchor a bare `grep Address` returns the
-              # DNS server's own IP from the "Address: 172.20.0.10:53" preamble
-              # rather than the answer. That produced a plausible-looking but
-              # wrong IP, which the old `-z` empty-check could not catch.
-              resolve() {
-                _host="$1"; _ip=""; _i=0
-                while [ "$_i" -lt 60 ]; do
-                  _ip=$(nslookup "$_host" 2>/dev/null \
-                        | awk '/^Name:/{n=1;next} n&&/^Address( 1)?:/{print $NF; exit}')
-                  case "$_ip" in
-                    *.*.*.*) echo "$_ip"; return 0 ;;
-                  esac
-                  _i=$((_i+1))
-                  echo "[resolve-dns] waiting for $_host ($_i/60)" >&2
-                  sleep 2
-                done
-                echo "[resolve-dns] FATAL: could not resolve $_host" >&2
-                return 1
-              }
-
-              # The gNB's config fields are typed IpAddr, so a malformed value
-              # fails to deserialize and the reason ends up buried in a serde
-              # error. Fail here instead, naming the field.
               assert_ip() {
                 case "$2" in
                   *[0-9].[0-9]*) ;;
@@ -120,31 +92,28 @@ spec:
               echo "[resolve-dns] pod IP: $POD_IP"
               assert_ip POD_IP "$POD_IP"
 
-              AMF_IP=$(resolve amf.nextg-system.svc.cluster.local)
-              UPF_IP=$(resolve upf.nextg-system.svc.cluster.local)
-              assert_ip AMF_IP "$AMF_IP"
-              assert_ip UPF_IP "$UPF_IP"
-              echo "[resolve-dns] AMF=$AMF_IP UPF=$UPF_IP"
-
               cp /tmp/config-template/gnb.yaml /etc/nextgsim/gnb.yaml
 
-              # link_ip/ngap_ip/gtp_ip must be the pod IP, not 0.0.0.0: the gNB
-              # advertises these in NGAP and GTP-U, and a peer told 0.0.0.0 has
-              # nowhere to send return traffic. Anchored to the key so a bare
-              # 0.0.0.0 elsewhere in the file is not rewritten.
+              # Only the gNB's OWN addresses are substituted. link_ip/ngap_ip/
+              # gtp_ip must be the pod IP, not 0.0.0.0: the gNB advertises them
+              # in NGAP and GTP-U, and a peer told 0.0.0.0 has nowhere to send
+              # return traffic. Anchored to the key so a bare 0.0.0.0 elsewhere
+              # in the file is not rewritten.
+              #
+              # The AMF and UPF stay Service NAMES (nextgsim #286): the gNB
+              # resolves them itself, re-resolves the AMF while connected and on
+              # every reconnect, and re-runs NG Setup, so an AMF pod that comes
+              # back at a new IP is found again without restarting this pod. A
+              # literal resolved here once would be stale after that restart.
               sed -i \
-                -e "s|amf\.nextg-system\.svc\.cluster\.local|$AMF_IP|g" \
-                -e "s|upf\.nextg-system\.svc\.cluster\.local|$UPF_IP|g" \
                 -e "s|^\( *link_ip:\).*|\1 $POD_IP|" \
                 -e "s|^\( *ngap_ip:\).*|\1 $POD_IP|" \
                 -e "s|^\( *gtp_ip:\).*|\1 $POD_IP|" \
                 /etc/nextgsim/gnb.yaml
 
-              # Nothing unresolved may survive: the gNB would start, fail to
-              # parse IpAddr, and bury the reason in a serde error.
-              if grep -qE 'svc\.cluster\.local|0\.0\.0\.0' /etc/nextgsim/gnb.yaml; then
+              if grep -qE '0\.0\.0\.0' /etc/nextgsim/gnb.yaml; then
                 echo "[resolve-dns] FATAL: unresolved values remain:" >&2
-                grep -nE 'svc\.cluster\.local|0\.0\.0\.0' /etc/nextgsim/gnb.yaml >&2
+                grep -nE '0\.0\.0\.0' /etc/nextgsim/gnb.yaml >&2
                 exit 1
               fi
 

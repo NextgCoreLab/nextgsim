@@ -97,6 +97,7 @@ async fn start_harness() -> Harness {
             bind_address: Some("127.0.0.1:0".parse().expect("UE bind address")),
             heartbeat_interval: Duration::from_millis(100),
             heartbeat_threshold: Duration::from_millis(2000),
+            ..Default::default()
         },
     );
     tokio::spawn(async move { ue_rls.run(ue_rls_rx).await });

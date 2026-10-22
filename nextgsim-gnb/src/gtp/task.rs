@@ -107,7 +107,7 @@ impl GtpTask {
         } else {
             info!(
                 "GTP-U forwarding to UPF at {}:{}",
-                task_base.config.upf_addr.expect("value expected"),
+                task_base.config.upf_addr.as_deref().unwrap_or_default(),
                 task_base.config.upf_port
             );
         }
@@ -483,14 +483,28 @@ impl GtpTask {
     /// Auto-create a PDU session to UPF for user plane forwarding
     fn auto_create_upf_session(&mut self, ue_id: i32, psi: i32) {
         // Get UPF address from config
-        let upf_addr = match self.task_base.config.upf_addr {
-            Some(addr) => addr,
+        let upf_port = self.task_base.config.upf_port;
+        let upf_addr = match self.task_base.config.upf_addr.as_deref() {
+            Some(addr) => match addr.parse::<std::net::IpAddr>() {
+                Ok(ip) => ip,
+                // A hostname (#286). Resolved here, on this fallback path only;
+                // the PDU-session path uses the address the AMF signalled.
+                Err(_) => {
+                    use std::net::ToSocketAddrs;
+                    match (addr, upf_port).to_socket_addrs().map(|mut a| a.next()) {
+                        Ok(Some(sa)) => sa.ip(),
+                        _ => {
+                            error!("Cannot create UPF session: upf_addr {addr} does not resolve");
+                            return;
+                        }
+                    }
+                }
+            },
             None => {
                 error!("Cannot create UPF session: upf_addr not configured");
                 return;
             }
         };
-        let upf_port = self.task_base.config.upf_port;
 
         // Ensure UE context exists
         self.ue_contexts.entry(ue_id).or_insert_with(|| {
@@ -1159,7 +1173,7 @@ impl Task for GtpTask {
         // Log mode
         if self.loopback_mode {
             info!("GTP-U loopback mode enabled (no UPF configured)");
-        } else if let Some(upf_addr) = self.task_base.config.upf_addr {
+        } else if let Some(upf_addr) = self.task_base.config.upf_addr.as_deref() {
             info!(
                 "GTP-U forwarding to UPF at {}:{}",
                 upf_addr, self.task_base.config.upf_port

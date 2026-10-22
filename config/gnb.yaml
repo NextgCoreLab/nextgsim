@@ -29,6 +29,9 @@ nssai:
     sd: null  # No SD specified (default slice)
 
 # AMF Configuration - Points to nextgcore AMF
+# `address` is an IP or a hostname (e.g. a Kubernetes Service name). A hostname
+# is re-resolved while connected and on every reconnect; the gNB reconnects and
+# re-runs NG Setup on its own when the AMF goes away or moves.
 amf_configs:
   - address: 172.23.0.5
     port: 38412

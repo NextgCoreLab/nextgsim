@@ -339,6 +339,7 @@ async fn send_one_uplink(ue_config: UeConfig, precompensation: Option<UeRlsMessa
             bind_address: Some("127.0.0.1:0".parse().expect("UE bind address")),
             heartbeat_interval: Duration::from_millis(100),
             heartbeat_threshold: Duration::from_millis(2000),
+            ..Default::default()
         },
     );
 
