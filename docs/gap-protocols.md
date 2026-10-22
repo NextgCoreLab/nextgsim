@@ -1,19 +1,19 @@
 # nextgsim Protocol Crates -- 6G Gap Analysis
 
-> Generated: 2026-02-07 | Scope: nextgsim-nas, nextgsim-ngap, nextgsim-rrc, nextgsim-rls, nextgsim-gtp, nextgsim-sctp
+> Generated: 2026-02-07, rows re-checked against the code before 0.2.0 | Scope: nextgsim-nas, nextgsim-ngap, nextgsim-rrc, nextgsim-rls, nextgsim-gtp, nextgsim-sctp. The LTE crates (`nextgsim-s1ap`, `nextgsim-lte-rrc`, `nextgsim-eps-nas`) and `nextgsim-pdcp` postdate this analysis and are not covered.
 
 ---
 
 ## Executive Summary
 
-| Crate | Source Files | Role | Completeness | 6G Readiness |
-|-------|-------------|------|-------------|--------------|
-| nextgsim-nas | 22 | NAS 5GMM/5GSM encoding/decoding | **80%** | Low |
-| nextgsim-ngap | 13 | NGAP procedures (gNB-AMF) | **85%** | Low |
-| nextgsim-rrc | 9 | RRC procedures (UE-gNB) | **75%** | Low |
-| nextgsim-rls | 5 | Radio Link Simulation over UDP | **95%** | N/A |
-| nextgsim-gtp | 3 | GTP-U tunnel management | **90%** | Low |
-| nextgsim-sctp | 3 | SCTP transport for NGAP | **90%** | Low |
+| Crate | Role | 6G Readiness |
+|-------|------|--------------|
+| nextgsim-nas | NAS 5GMM/5GSM encoding/decoding | Low |
+| nextgsim-ngap | NGAP procedures (gNB-AMF) | Low |
+| nextgsim-rrc | RRC procedures (UE-gNB) | Low |
+| nextgsim-rls | Radio Link Simulation over UDP | N/A |
+| nextgsim-gtp | GTP-U tunnel management | Low |
+| nextgsim-sctp | SCTP transport for NGAP | Low |
 
 **Zero `todo!()` or `unimplemented!()` macros found across all 6 crates.** All gaps are marked with comments.
 
@@ -21,14 +21,14 @@
 
 ## 1. nextgsim-nas
 
-**Spec**: 3GPP TS 24.501 | **Files**: 22 | **Modules**: codec, eap, enums, header, ies, messages (mm + sm), security
+**Spec**: 3GPP TS 24.501 | **Modules**: codec, eap, enums, header, ies, messages (mm + sm), security
 
 ### Implemented
 
 | Component | Key Types | Status |
 |-----------|----------|--------|
 | Header encoding | `PlainMmHeader`, `PlainSmHeader`, `SecuredHeader` (7 bytes) | Complete |
-| 5GMM message types | `MmMessageType` enum (24 variants) | Complete |
+| 5GMM message types | `MmMessageType` enum | Complete |
 | 5GMM messages | Registration (Request/Accept/Reject/Complete), Authentication (Request/Response/Result/Reject), Security Mode (Command/Complete), Deregistration, Service (Request/Accept/Reject), Identity (Request/Response), Status, Configuration Update | Complete |
 | 5GSM messages | PDU Session Establishment (Request/Accept/Reject), PDU Session Modification (Request/Command/Complete/Reject) | Complete |
 | Type 1 IEs | 30+ IE types: RegistrationType, ServiceType, AccessType, PduSessionType, SscMode, IdentityType, etc. | Complete |
@@ -41,13 +41,12 @@
 
 | Gap | Details |
 |-----|---------|
-| 5GMM message coverage | DL/UL NAS Transport (`src/messages/mm/nas_transport.rs`, ~637 lines, encode/decode for DlNasTransport + UlNasTransport), Notification (`notification.rs`), and UE policy / UPDP (`ue_policy.rs`, TS 24.501 Annex D + TS 24.526 URSP) are now implemented | Complete |
-| 5GSM coverage | PDU Session Release (Request/Command/Complete/Reject) now implemented in `src/messages/sm/pdu_session_release.rs` (~888 lines) |
+| 5GMM message coverage | DL/UL NAS Transport (`src/messages/mm/nas_transport.rs`, encode/decode for DlNasTransport + UlNasTransport), Notification (`notification.rs`), and UE policy / UPDP (`ue_policy.rs`, TS 24.501 Annex D + TS 24.526 URSP) are now implemented | Complete |
+| 5GSM coverage | PDU Session Release (Request/Command/Complete/Reject) now implemented in `src/messages/sm/pdu_session_release.rs` |
 | Missing IEs | UE security capabilities, LADN info, MICO indication encoding |
 | No 6G NAS IEs | No AI/ML capability, ISAC, semantic comm, sub-THz parameters |
 | NTN extensions unwired | NTN NAS IEs (satellite timing advance, NTN access barring) now exist as bespoke sim-only prototypes; the gap is wire conformance and wiring, not absence |
 
-### Completeness: **80%**
 
 Strong 5GMM and 5GSM baseline with full security algorithms. Key missing: PDU Session Release messages, some advanced IEs, all 6G extensions.
 
@@ -55,7 +54,7 @@ Strong 5GMM and 5GSM baseline with full security algorithms. Key missing: PDU Se
 
 ## 2. nextgsim-ngap
 
-**Spec**: 3GPP TS 38.413 | **Files**: 13 | **Modules**: codec, procedures (9 procedure modules)
+**Spec**: 3GPP TS 38.413 | **Modules**: codec, procedures
 
 ### Implemented
 
@@ -76,13 +75,12 @@ Strong 5GMM and 5GSM baseline with full security algorithms. Key missing: PDU Se
 
 | Gap | Details |
 |-----|---------|
-| Handover preparation failure | Now implemented: `procedures/handover_preparation_failure.rs` (~541 lines) |
-| AMF Status Indication | Now implemented: `procedures/amf_status_indication.rs` (~387 lines) |
-| RAN Configuration Update | Now implemented: `procedures/ran_configuration_update.rs` (~501 lines); `ng_reset.rs` and `path_switch.rs` procedures also added |
+| Handover preparation failure | Now implemented: `procedures/handover_preparation_failure.rs` |
+| AMF Status Indication | Now implemented: `procedures/amf_status_indication.rs` |
+| RAN Configuration Update | Now implemented: `procedures/ran_configuration_update.rs`; `ng_reset.rs` and `path_switch.rs` procedures also added |
 | NGAP over multiple SCTP streams | Stream management for parallel procedures not fully modeled |
 | No 6G NGAP extensions | No ISAC reporting or AI-native procedures; an off-wire NTN support module now exists (bespoke, sim-only) but no wire-conformant NTN IEs |
 
-### Completeness: **85%**
 
 Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) are well implemented with proper APER encoding. Missing some secondary procedures.
 
@@ -90,7 +88,7 @@ Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) ar
 
 ## 3. nextgsim-rrc
 
-**Spec**: 3GPP TS 38.331 | **Files**: 9 | **Modules**: codec, procedures (6 procedure modules)
+**Spec**: 3GPP TS 38.331 | **Modules**: codec, procedures
 
 ### Implemented
 
@@ -109,15 +107,14 @@ Core NGAP procedures (NG Setup, NAS transport, PDU session, handover, paging) ar
 
 | Gap | Details |
 |-----|---------|
-| Measurement Report | `procedures/measurement_report.rs` codec now exists in this crate, but the gNB/UE tasks still emit/parse a simplified byte format (not yet wired to the codec) |
-| Residual hand-rolled RRC PDUs | `RRCReestablishment`, `RRCResume`, the handover command and the measurement report are still emitted/parsed as bespoke byte formats rather than UPER (documented in-source); tracked separately from the SI broadcast |
-| Paging occasion (PF/PO) | Paging is broadcast immediately instead of at the UE's paging occasion. TS 38.304 §7.1 derives the PF/PO from the UE identity and the DRX cycle in radio frames, and the simulator maintains no SFN, so there is no frame clock to schedule against |
-| RRC Reestablishment | Now implemented: `procedures/rrc_reestablishment.rs` (~422 lines) |
-| RRC Resume | Now implemented: `procedures/rrc_resume.rs` (~642 lines) + UE-side `nextgsim-ue/src/rrc/resume.rs` (TS 38.331 5.3.13, T319) |
-| Conditional Handover | Now implemented: `procedures/conditional_handover.rs` (~803 lines) |
-| No 6G RRC extensions | No AI/ML configuration, ISAC measurement config, NTN timing advance, sub-THz band config |
+| Measurement Report | Done: the UE sends and the gNB parses a real UPER `MeasurementReport` (#107) |
+| Residual hand-rolled RRC PDUs | Done (#146): `RRCReestablishment`, `RRCResume`, the handover command and the measurement report are UPER. Two fallbacks remain in the gNB: a bespoke RRCSetup frame if the ASN.1 encode fails, and a bespoke UL-CCCH parse if the UPER decode fails |
+| Paging occasion (PF/PO) | Done (#99): the paging occasion is derived from a shared frame clock per TS 38.304 §7.1 (`paging_default_cycle_frames` on both ends) |
+| RRC Reestablishment | Now implemented: `procedures/rrc_reestablishment.rs` |
+| RRC Resume | Now implemented: `procedures/rrc_resume.rs` + UE-side `nextgsim-ue/src/rrc/resume.rs` (TS 38.331 5.3.13, T319) |
+| Conditional Handover | Now implemented: `procedures/conditional_handover.rs` |
+| No 6G RRC extensions | No AI/ML configuration, ISAC measurement config or sub-THz band config. (NTN timing advance is done: SIB19 is broadcast and applied, #56) |
 
-### Completeness: **75%**
 
 Core RRC procedures implemented with UPER codec. Missing RRC Reestablishment/Resume and all 6G extensions.
 
@@ -125,7 +122,7 @@ Core RRC procedures implemented with UPER codec. Missing RRC Reestablishment/Res
 
 ## 4. nextgsim-rls
 
-**Role**: Radio Link Simulation protocol (UERANSIM-compatible) | **Files**: 5
+**Role**: Radio Link Simulation protocol (UERANSIM-compatible)
 
 ### Implemented
 
@@ -137,7 +134,6 @@ Core RRC procedures implemented with UPER codec. Missing RRC Reestablishment/Res
 | gNB Cell Tracker | `cell_search.rs` | Complete (UE registration, signal strength) |
 | RRC/Data Transport | `transport.rs` | Complete (RRC message and user plane data transport) |
 
-### Completeness: **95%**
 
 Fully functional simulation protocol. Not 3GPP-standardized, so no 6G relevance.
 
@@ -145,7 +141,7 @@ Fully functional simulation protocol. Not 3GPP-standardized, so no 6G relevance.
 
 ## 5. nextgsim-gtp
 
-**Spec**: 3GPP TS 29.281 | **Files**: 3
+**Spec**: 3GPP TS 29.281
 
 ### Implemented
 
@@ -159,39 +155,37 @@ Fully functional simulation protocol. Not 3GPP-standardized, so no 6G relevance.
 
 | Gap | Details |
 |-----|---------|
-| No GTP-U extension header chaining | Single extension header only |
-| No PDU Session Container IE | Missing 5GC-specific GTP-U extension |
-| No 6G extensions | No deterministic networking, no in-network computing markers |
+| GTP-U extension header chaining | Done: `codec.rs` chains extension headers |
+| PDU Session Container | Done: QFI and RQI on the PDU Session Container (`PduSessionInfo`) |
+| 6G extensions | Research markers only: `TsnMarker` and `InNetworkCompute` extension headers, non-normative |
 
-### Completeness: **90%**
 
-Strong GTP-U implementation for simulation. Missing some 5GC-specific extension headers.
+Strong GTP-U implementation for simulation.
 
 ---
 
 ## 6. nextgsim-sctp
 
-**Spec**: RFC 4960 | **Files**: 3 | **Backend**: sctp-proto (pure Rust)
+**Spec**: RFC 4960 | **Backend**: sctp-proto (pure Rust)
 
 ### Implemented
 
 | Component | File | Status |
 |-----------|------|--------|
-| Association | `association.rs` | Complete (connect, send, recv, shutdown, state machine) |
+| Association | `association.rs` | Complete (connect, send, recv, shutdown, state machine), including `MultihomeSctpAssociation` |
 | Server | `server.rs` | Complete (accept connections, multi-association) |
-| Config | `lib.rs` | Complete (streams, buffer sizes, NGAP PPID) |
+| Kernel backend | `kernel.rs` | Complete behind `kernel-sctp`: real SCTP via libsctp, partial-delivery reassembly |
+| Config | `lib.rs` | Complete (streams, buffer sizes, NGAP PPID); the shared constants come from nextgcore's `nextgcore-sctp` |
 
 ### Gaps
 
 | Gap | Details |
 |-----|---------|
-| No multi-homing | Single address only |
 | No PR-SCTP | Partial reliability not supported |
-| No QUIC alternative | 6G may move away from SCTP |
+| QUIC not selectable | `quic.rs` exists, but the gNB's SCTP task falls back to SCTP when `quic_enabled` is set |
 
-### Completeness: **90%**
 
-Production-quality SCTP with async tokio interface. Wire-compatible with nextgcore.
+Async tokio interface. The userspace backend is SCTP over UDP and only interoperates with nextgcore's matching backend; the kernel backend talks to any AMF or MME.
 
 ---
 

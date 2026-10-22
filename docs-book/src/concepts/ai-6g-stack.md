@@ -102,11 +102,13 @@ placeholder). "Drives a live path?" is answered for a *default* build/run.
 | AI agent framework | `nextgsim-agent` + gNB `agent/task.rs` | partial (real intent executors, no LLM/RL) | No — off by default | unit tests + integration test |
 | Service Hosting Env (SHE) | `nextgsim-she` + gNB `she/task.rs`, UE `she_client/` | partial (placement scheduler, no orchestration) | No — off by default | unit tests |
 | UE ambient IoT | `nextgsim-ue/src/ambient_iot/` | illustrative stub (fleet + energy model) | No — sim-internal | unit tests |
-| UE ProSe / sidelink | `nextgsim-ue/src/prose.rs`, `src/sidelink/` | prototype (bespoke, not wire-conformant) | Task spawned but idle by default | unit tests |
-| UE ranging / MINT / UAV | `nextgsim-ue/src/{ranging,mint,uav}.rs` | prototype (bespoke encodings) | Task spawned but idle by default | unit tests |
+| UE ProSe / sidelink | `nextgsim-ue/src/sidelink/` | partial (real PC5-S messages and SRAP over an in-process medium; no PC5 radio) | No — `sidelink` feature and `prose_enabled` | unit tests + `sidelink_pc5_e2e` |
+| UE ranging | `nextgsim-ue/src/ranging/` | partial (range from configured geometry, carried to the LMF over LPP) | No — `sidelink` feature and `ranging_config.enabled` | unit tests + `ranging_report_e2e` |
+| UE MINT / UAV | `nextgsim-ue/src/mint/`, `src/uav.rs` | integrated with NextGCore (see note below) | Task spawned but idle by default | unit tests + nextgcore feature E2E |
 | gNB energy saving | `nextgsim-gnb/src/energy/` | prototype (cell sleep model) | No — `energy_saving_enabled=false` | unit tests |
-| gNB MBS (NGAP) | `nextgsim-gnb/src/mbs_ngap.rs` | prototype (Rel-17 MBS) | No — `mbs_enabled=false` | unit tests |
-| NTN (gNB/RRC) | `nextgsim-gnb/src/rrc/ntn_gnb.rs` | prototype, **inert** | No — parsed but unwired | unit tests |
+| gNB MBS (NGAP) | `nextgsim-gnb/src/mbs_ngap.rs` | partial (Rel-17 MBS session procedures decoded and answered) | Yes — when the AMF sends MBS procedures | unit tests |
+| NTN serving cell (gNB/RRC) | `nextgsim-gnb/src/rrc/system_info.rs` (SIB19), UE timing advance | partial (real SIB19 UPER; one serving cell) | No — only with `ntn_config` | unit tests + `ntn_sib19_timing_e2e` |
+| NTN helpers (gNB) | `nextgsim-gnb/src/rrc/ntn_gnb.rs` | prototype (simplified beam/distance maths) | No | unit tests |
 
 A note on scope: several Rel-17/18 features that *look* adjacent — **RedCap,
 SNPN, MINT, UAV, XR** — are a **different maturity tier**. Those carry real NAS
@@ -326,9 +328,11 @@ logic with **bespoke encodings that are not wire-conformant** (consistent with
 - **UE ambient IoT** (`nextgsim-ue/src/ambient_iot/fleet.rs`, "Rel-18, TS 22.369"
   per code comments): energy-harvesting device model + `FleetManager`. No air
   interface; sim-internal.
-- **UE ProSe / sidelink** (`prose.rs`, `sidelink/pc5.rs`, `sidelink/positioning.rs`,
-  "TS 23.303/23.304/23.586" per code comments): PC5 link management, direct
-  discovery, L2/L3 relay, and SL-PRS/RTT/AoA positioning via multilateration.
+- **UE ProSe / sidelink** (`sidelink/`, behind the `sidelink` feature; "TS
+  23.303/23.304/23.586" per code comments): PC5-S unicast link set-up, Model A/B
+  direct discovery, UE-to-UE relay, the L2 UE-to-Network relay over SRAP, and
+  SL-PRS/RTT/AoA positioning. The PC5-S messages are real; the medium between
+  UEs is an in-process channel. (`prose.rs` was removed in #141.)
 - **UE ranging** (`ranging/task.rs`, "TS 23.586"): RTT + multi-frequency carrier
   phase with ambiguity resolution.
 - **UE MINT** (`mint/task.rs`, "TS 23.761"): multi-IMSI/USIM context management.
@@ -337,7 +341,7 @@ logic with **bespoke encodings that are not wire-conformant** (consistent with
 - **gNB energy saving** (`energy/task.rs`, Rel-18): cell sleep/dormant modes and
   efficiency metrics — spawned only if `energy_saving_enabled`.
 - **gNB MBS** (`mbs_ngap.rs`, "Rel-17, TS 38.413 §8.21"): MBS session
-  start/stop NGAP signalling — behind `mbs_enabled`.
+  NGAP signalling, routed live from the NGAP task (#187, #188).
 - **NTN** (`rrc/ntn_gnb.rs`): satellite timing-advance / HARQ / beam models that
   are **parsed but inert** — the gNB stores the `ntn_config` block and logs it but
   does not wire it into live RRC/NGAP signalling (see the NTN row in

@@ -1,18 +1,19 @@
 # Contributing to NextGSim
 
-NextGSim is a 5G UE and gNB simulator in Rust implementing a 3GPP Rel-15 baseline with selected Rel-17/18 features and 6G exploration prototypes. 3GPP Rel-20 (6G) has no frozen stage-3 spec, so the 6G items are research-only (informed by TR 22.870 use cases) and disabled by default.
+NextGSim is a 5G UE and gNB simulator in Rust, with an LTE eNB and LTE UE, implementing a 3GPP Rel-15 baseline with selected Rel-16/17/18 features and 6G exploration prototypes. 3GPP Rel-20 (6G) has no frozen stage-3 spec, so the 6G items are research-only (informed by TR 22.870 use cases) and disabled by default.
 
 ## Prerequisites
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Rust | stable (≥1.75) | Build toolchain |
-| Docker + docker-compose | ≥24 | E2E testing with NextGCore |
+| Rust | pinned by `rust-toolchain.toml` (1.95.0) | Build toolchain; rustup installs it on the first `cargo` command |
+| Docker + docker compose | ≥24 | E2E testing with NextGCore |
+| libsctp (`libsctp-dev`) | any | Only for `--features kernel-sctp` (the LTE eNB, or a gNB against a real AMF), Linux only |
 
 ```bash
 # macOS (Homebrew)
 brew install rustup
-rustup toolchain install stable
+rustup-init
 ```
 
 ## Building
@@ -26,8 +27,10 @@ cargo build --workspace --release  # release
 To build a single component:
 
 ```bash
-cargo build -p nextgsim-ue   # UE simulator
-cargo build -p nextgsim-gnb  # gNB simulator
+cargo build -p nextgsim-ue   # UE simulator (nr-ue)
+cargo build -p nextgsim-gnb  # gNB simulator (nr-gnb)
+cargo build -p nextgsim-enb --features kernel-sctp   # LTE eNB (lte-enb), Linux
+cargo build -p nextgsim-lte-ue                       # LTE UE (lte-ue)
 ```
 
 ## Testing
@@ -38,25 +41,28 @@ cargo test -p nextgsim-ue             # UE only
 cargo test -- --nocapture             # with log output
 ```
 
-E2E tests require a running NextGCore stack:
+The `tests/` crate (`nextgsim-integration-tests`) runs the gNB and UE tasks in
+one process against a mock AMF; some of its suites need a feature
+(`--features drb-pdcp`, `up-security`, `sdap-dataplane`, `sidelink`, `6g`). The
+end-to-end suite against a real core runs from the nextgcore repo:
 
 ```bash
-cd ../nextgcore/docker/rust && docker compose up -d
-cd ../../nextgsim
-cargo test -p nextgsim-tests --features e2e
+cd ../nextgcore/docker/rust
+./e2e.sh            # builds both repos' images, then registration + PDU session + ping
 ```
 
 ## Code Style
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets
 ```
 
 Pre-commit checklist:
-- [ ] `cargo fmt --all` — no formatting changes
-- [ ] `cargo clippy --workspace -- -D warnings` — zero warnings
+- [ ] `cargo fmt --all -- --check` — no formatting changes
+- [ ] `cargo clippy --workspace --all-targets` — no new warnings in the code you touched
 - [ ] `cargo test --workspace` — all tests pass
+- [ ] The feature-gated CI job for any feature your change touches (see `docs/ci-and-release.md`)
 - [ ] `cargo audit` — no unpatched advisories
 
 ## Security Auditing
@@ -82,24 +88,30 @@ nextgsim/
 │   └── src/
 │       ├── nas/        # 5G NAS (N1 interface)
 │       ├── rrc/        # NR RRC
-│       ├── prose.rs    # ProSe PC5 (Rel-17)
+│       ├── sidelink/   # PC5-S, discovery, relay (behind the sidelink feature)
 │       ├── uav.rs      # UAV context (Rel-18)
 │       ├── daps.rs     # DAPS (Rel-16)
 │       └── ...
-├── nextgsim-nas/       # Shared NAS codec
-├── nextgsim-ngap/      # NGAP ASN.1 codec (auto-generated)
+├── nextgsim-enb/       # LTE eNB (lte-enb)
+├── nextgsim-lte-ue/    # LTE UE (lte-ue)
+├── nextgsim-nas/       # 5GS NAS codec
+├── nextgsim-eps-nas/   # EPS NAS (UE side)
+├── nextgsim-ngap/      # NGAP + NRPPa codecs (generated at build time)
+├── nextgsim-s1ap/      # S1AP codec (generated)
+├── nextgsim-rrc/       # NR RRC codec (generated)
+├── nextgsim-lte-rrc/   # E-UTRA RRC codec (generated)
 ├── nextgsim-common/    # Config, types, utilities
-├── nextgsim-tests/     # Integration + E2E tests
-└── tools/              # ASN.1 grammars
+├── tests/              # Integration tests (nextgsim-integration-tests)
+└── tools/              # 3GPP ASN.1 schemas and extract_asn1.py
 ```
 
 ## Simulated Releases
 
 | Release | Features |
 |---------|---------|
-| Rel-15 | 5G-NR baseline, SA registration, PDU sessions |
-| Rel-16 | DAPS handover, URLLC, RedCap, V2X PC5 |
-| Rel-17 | MBS, ProSe, NTN, SNPN, UAV identity |
+| Rel-15 | 5G-NR baseline, SA registration, PDU sessions, paging and Service Request; LTE attach (E-UTRA RRC, S1AP, EPS NAS) |
+| Rel-16 | DAPS handover, URLLC, V2X PC5, RACS (UE radio capability IDs) |
+| Rel-17 | RedCap, MBS, ProSe and L2 UE-to-Network relay, NTN (SIB19), SNPN, UAV identity |
 | Rel-18 | XR traffic, Ambient IoT, RedCap R18, MINT |
 | Rel-20* | ISAC, Federated Learning, Semantic comms, Agent AI |
 
@@ -112,6 +124,9 @@ Each module includes a doc comment with the spec reference. When adding protocol
 - **TS 38.331** — NR RRC
 - **TS 38.413** — NGAP
 - **TS 24.501** — 5G NAS
+- **TS 36.413** — S1AP
+- **TS 36.331** — E-UTRA RRC
+- **TS 24.301** — EPS NAS
 - **TS 23.256** — UAV
 - **TS 23.304** — ProSe
 
@@ -136,4 +151,4 @@ test(prose): add relay selection RSRP unit test
 
 ## License
 
-AGPL-3.0. See [LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](https://github.com/NextgCoreLab/nextgsim/blob/main/LICENSE).

@@ -29,26 +29,22 @@
 <section style="padding-top: calc(var(--nav-height) + 2rem);">
   <div class="container">
     <h2 class="section-title">CLI Reference</h2>
-    <p class="section-subtitle">Command-line interface for the gNB, UE, and interactive CLI binaries.</p>
+    <p class="section-subtitle">The six binaries a release build produces. Logging is set with <code>RUST_LOG</code>, not a flag. The full reference is the <a href="book/cli-reference.html">nr-cli Reference</a> chapter.</p>
 
     <!-- nr-gnb -->
     <div class="cli-section">
       <h3 class="group-heading">nr-gnb — gNodeB Simulator</h3>
       <div class="cli-command">
-        <h4>nr-gnb [OPTIONS]</h4>
-        <p>Start a 5G gNB (gNodeB) simulator instance that connects to the core network AMF via NGAP/SCTP.</p>
+        <h4>nr-gnb [OPTIONS] --config &lt;FILE&gt;</h4>
+        <p>Start a 5G gNB that connects to one or more AMFs over NGAP and serves UEs over RLS.</p>
         <div style="margin-top: 0.75rem;">
           <div class="cli-flag">
             <code>-c, --config &lt;FILE&gt;</code>
-            <span>Path to gNB configuration YAML file (required)</span>
+            <span>gNB configuration YAML file (required)</span>
           </div>
           <div class="cli-flag">
-            <code>-v, --verbose</code>
-            <span>Enable verbose logging (TRACE level)</span>
-          </div>
-          <div class="cli-flag">
-            <code>--log-level &lt;LEVEL&gt;</code>
-            <span>Set log level: error, warn, info, debug, trace (default: info)</span>
+            <code>-l, --disable-cmd</code>
+            <span>Do not open the nr-cli command interface</span>
           </div>
         </div>
       </div>
@@ -58,7 +54,7 @@
 <span class="cmd">nr-gnb --config config/gnb.yaml</span>
 
 <span class="comment"># With debug logging</span>
-<span class="cmd">nr-gnb --config config/gnb.yaml --log-level debug</span></code>
+<span class="cmd">RUST_LOG=debug nr-gnb --config config/gnb.yaml</span></code>
       </div>
     </div>
 
@@ -66,24 +62,32 @@
     <div class="cli-section">
       <h3 class="group-heading">nr-ue — UE Simulator</h3>
       <div class="cli-command">
-        <h4>nr-ue [OPTIONS]</h4>
-        <p>Start a 5G UE (User Equipment) simulator that connects to a gNB and performs NAS procedures.</p>
+        <h4>nr-ue [OPTIONS] --config &lt;FILE&gt;</h4>
+        <p>Start one or more 5G UEs that find a gNB over RLS, register and establish the configured PDU sessions. Needs CAP_NET_ADMIN for its TUN interfaces.</p>
         <div style="margin-top: 0.75rem;">
           <div class="cli-flag">
             <code>-c, --config &lt;FILE&gt;</code>
-            <span>Path to UE configuration YAML file (required)</span>
+            <span>UE configuration YAML file (required)</span>
           </div>
           <div class="cli-flag">
-            <code>-n, --num-ues &lt;COUNT&gt;</code>
-            <span>Number of UE instances to simulate (default: 1)</span>
+            <code>-i, --imsi &lt;IMSI&gt;</code>
+            <span>Use this IMSI instead of the config&#x27;s (15 digits, optional imsi- prefix)</span>
           </div>
           <div class="cli-flag">
-            <code>-v, --verbose</code>
-            <span>Enable verbose logging (TRACE level)</span>
+            <code>-n, --num-of-UE &lt;NUM&gt;</code>
+            <span>Number of UEs, 1..512 (default 1), IMSI incremented per UE</span>
           </div>
           <div class="cli-flag">
-            <code>--log-level &lt;LEVEL&gt;</code>
-            <span>Set log level: error, warn, info, debug, trace (default: info)</span>
+            <code>-t, --tempo &lt;TEMPO&gt;</code>
+            <span>Delay in ms between UE starts (default 0)</span>
+          </div>
+          <div class="cli-flag">
+            <code>-l, --disable-cmd</code>
+            <span>Do not open the nr-cli command interface</span>
+          </div>
+          <div class="cli-flag">
+            <code>-r, --no-routing-config</code>
+            <span>Do not configure TUN routing (currently only logged)</span>
           </div>
         </div>
       </div>
@@ -92,81 +96,129 @@
         <code><span class="comment"># Single UE</span>
 <span class="cmd">nr-ue --config config/ue.yaml</span>
 
-<span class="comment"># Multiple UEs (auto-incrementing IMSI)</span>
-<span class="cmd">nr-ue --config config/ue.yaml --num-ues 10</span></code>
+<span class="comment"># Ten UEs, 100 ms apart (auto-incrementing IMSI)</span>
+<span class="cmd">nr-ue --config config/ue.yaml -n 10 -t 100</span></code>
       </div>
     </div>
 
     <!-- nr-cli -->
     <div class="cli-section">
-      <h3 class="group-heading">nr-cli — Interactive Console</h3>
+      <h3 class="group-heading">nr-cli — Control Interface</h3>
       <div class="cli-command">
-        <h4>nr-cli [OPTIONS]</h4>
-        <p>Interactive CLI for runtime control of running gNB and UE instances.</p>
+        <h4>nr-cli [OPTIONS] [NODE]</h4>
+        <p>Inspect and drive running gNB and UE nodes on the same host. Nodes register in /tmp/nextgsim.proc-table/; nr-cli talks to them over UDP on 127.0.0.1.</p>
         <div style="margin-top: 0.75rem;">
           <div class="cli-flag">
-            <code>-h, --host &lt;ADDR&gt;</code>
-            <span>Control socket address (default: 127.0.0.1)</span>
+            <code>NODE</code>
+            <span>gnb, or ue0, ue1, ... for UEs</span>
           </div>
           <div class="cli-flag">
-            <code>-p, --port &lt;PORT&gt;</code>
-            <span>Control socket port (default: 9000)</span>
+            <code>-d, --dump</code>
+            <span>List the running nodes and exit</span>
+          </div>
+          <div class="cli-flag">
+            <code>-e, --exec &lt;COMMAND&gt;</code>
+            <span>Run one command and exit</span>
           </div>
         </div>
       </div>
       <div class="code-block">
         <button class="copy-btn">Copy</button>
-        <code><span class="comment"># Connect to running instance</span>
-<span class="cmd">nr-cli</span>
+        <code><span class="comment"># List nodes, then query one</span>
+<span class="cmd">nr-cli --dump</span>
+<span class="cmd">nr-cli ue0 -e status</span>
 
-<span class="comment"># Available commands</span>
-<span class="cmd">status</span>          <span class="comment"># Show gNB/UE status</span>
-<span class="cmd">ue list</span>         <span class="comment"># List connected UEs</span>
-<span class="cmd">ue info &lt;id&gt;</span>    <span class="comment"># Show UE details</span>
-<span class="cmd">ue deregister &lt;id&gt;</span> <span class="comment"># Trigger deregistration</span></code>
+<span class="comment"># UE commands</span>
+<span class="cmd">info | status | ps-list | timers | deregister [normal|switch-off]</span>
+<span class="cmd">ps-establish [-t &lt;type&gt;] [-a &lt;apn&gt;] [-s &lt;sst&gt;] | ps-release &lt;psi&gt; | ps-release-all | emergency-register</span>
+
+<span class="comment"># gNB commands</span>
+<span class="cmd">info | status | amf-list | ue-list | ue-info &lt;id&gt; | ue-release &lt;id&gt;</span>
+<span class="cmd">ue-suspend &lt;id&gt; [t380-minutes] | xn-path-switch &lt;id&gt; &lt;source-amf-ue-ngap-id&gt;</span></code>
+      </div>
+    </div>
+
+    <!-- nr-loadtest -->
+    <div class="cli-section">
+      <h3 class="group-heading">nr-loadtest — Load Test</h3>
+      <div class="cli-command">
+        <h4>nr-loadtest [OPTIONS]</h4>
+        <p>Register many UEs against a 5G core and report the success rate; exits non-zero below 90%.</p>
+        <div style="margin-top: 0.75rem;">
+          <div class="cli-flag">
+            <code>--ues &lt;UES&gt;</code>
+            <span>Number of UEs (default 10)</span>
+          </div>
+          <div class="cli-flag">
+            <code>--rate &lt;RATE&gt;</code>
+            <span>Registrations per second, 0 = burst (default 5)</span>
+          </div>
+          <div class="cli-flag">
+            <code>--gnb-addr / --amf-addr</code>
+            <span>gNB and AMF addresses (defaults 127.0.0.100 / 127.0.0.5)</span>
+          </div>
+          <div class="cli-flag">
+            <code>--base-imsi &lt;IMSI&gt;</code>
+            <span>First IMSI (default 999700000000001)</span>
+          </div>
+          <div class="cli-flag">
+            <code>--skip-pdu / --ping</code>
+            <span>Skip the PDU session / ping after it</span>
+          </div>
+        </div>
+      </div>
+      <div class="code-block">
+        <button class="copy-btn">Copy</button>
+        <code><span class="cmd">nr-loadtest --ues 100 --rate 20 --amf-addr 10.0.0.5 --ping</span></code>
+      </div>
+    </div>
+
+    <!-- lte -->
+    <div class="cli-section">
+      <h3 class="group-heading">lte-enb / lte-ue — LTE eNB and UE</h3>
+      <div class="cli-command">
+        <h4>lte-enb --config &lt;FILE&gt;   |   lte-ue --config &lt;FILE&gt;</h4>
+        <p>The LTE eNB (S1 Setup, S1AP, S1-U GTP-U; build with --features kernel-sctp on Linux) and the LTE UE (cell selection, RRC, EPS NAS attach, DRBs, TUN). Both read NEXTGSIM_* environment overrides.</p>
+        <div style="margin-top: 0.75rem;">
+          <div class="cli-flag">
+            <code>-c, --config &lt;FILE&gt;</code>
+            <span>Configuration YAML file (required)</span>
+          </div>
+        </div>
+      </div>
+      <div class="code-block">
+        <button class="copy-btn">Copy</button>
+        <code><span class="cmd">lte-enb --config config/enb.yaml</span>
+<span class="cmd">lte-ue --config config/lte-ue.yaml</span></code>
       </div>
     </div>
 
     <!-- Configuration Reference -->
     <h2 class="section-title" style="margin-top: 3rem;">Configuration Reference</h2>
-    <p class="section-subtitle">YAML configuration files for gNB and UE.</p>
+    <p class="section-subtitle">YAML for the gNB and UE, cut down from the shipped <code>config/gnb.yaml</code> and <code>config/ue.yaml</code>. Keys are byte arrays and <code>nci</code> is an integer. Every key is in the <a href="book/configuration.html">Configuration Reference</a>.</p>
 
     <div class="cli-section">
       <h3 class="group-heading">gNB Configuration (gnb.yaml)</h3>
       <div class="code-block">
         <button class="copy-btn">Copy</button>
-        <code><span class="comment"># PLMN Identity</span>
-mcc: '999'          <span class="comment"># Mobile Country Code</span>
-mnc: '70'           <span class="comment"># Mobile Network Code</span>
-
-<span class="comment"># Cell Identity</span>
-nci: 0x000000010    <span class="comment"># NR Cell Identity (36-bit)</span>
-tac: 1              <span class="comment"># Tracking Area Code</span>
-
-<span class="comment"># Network interfaces</span>
-link_ip: 127.0.0.1  <span class="comment"># gNB-UE RLS interface</span>
-ngap_ip: 127.0.0.1  <span class="comment"># NGAP/SCTP towards AMF</span>
-gtp_ip: 127.0.0.1   <span class="comment"># GTP-U towards UPF</span>
-
-<span class="comment"># AMF connections</span>
+        <code>nci: 0x000000010            # NR Cell Identity (36-bit), an integer
+gnb_id_length: 32
+plmn: { mcc: 999, mnc: 70, long_mnc: false }
+tac: 1
+nssai:
+  - { sst: 1, sd: null }
 amf_configs:
-  - address: 127.0.0.5
+  - address: 172.23.0.5     # IP or hostname
     port: 38412
-
-<span class="comment"># Supported slices</span>
-slices:
-  - sst: 1           <span class="comment"># eMBB</span>
-  - sst: 2           <span class="comment"># URLLC</span>
-  - sst: 3           <span class="comment"># MIoT</span>
-
-<span class="comment"># 6G feature flags (each spawns a corresponding task at runtime)</span>
-she_enabled: false
-nwdaf_enabled: false
-nkef_enabled: false
+sctp_backend: userspace     # kernel for a real AMF (--features kernel-sctp)
+link_ip: 172.23.0.100
+ngap_ip: 172.23.0.100
+gtp_ip: 172.23.0.100
+ignore_stream_ids: false
+upf_addr: 172.23.0.7
+# 6G research tasks (need a --features 6g build)
 isac_enabled: false
-agent_enabled: false
-fl_enabled: false
-energy_enabled: false</code>
+nwdaf_enabled: false</code>
       </div>
     </div>
 
@@ -174,35 +226,24 @@ energy_enabled: false</code>
       <h3 class="group-heading">UE Configuration (ue.yaml)</h3>
       <div class="code-block">
         <button class="copy-btn">Copy</button>
-        <code><span class="comment"># Subscriber Identity</span>
-supi: 'imsi-999700000000001'
-mcc: '999'
-mnc: '70'
-
-<span class="comment"># Security credentials</span>
-key: '465B5CE8B199B49FAA5F0A2EE238A6BC'
-op: 'E8ED289DEBA952E4283B54E88E6183CA'
-op_type: OPC         <span class="comment"># OP or OPC</span>
-
-<span class="comment"># Network configuration</span>
-gnb_search_list:
-  - 127.0.0.1
-
-<span class="comment"># Requested slices</span>
-default_nssai:
-  - sst: 1
-    sd: 0x010203
-
-<span class="comment"># PDU session configuration</span>
+        <code>supi: { supi_type: Imsi, value: &quot;999700000000001&quot; }
+protection_scheme: 0
+home_network_public_key_id: 0
+home_network_public_key: []
+hplmn: { mcc: 999, mnc: 70, long_mnc: false }
+key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+op_type: Opc
+amf: [0x80, 0x00]
+supported_algs: { nia1: true, nia2: true, nia3: true, nea1: true, nea2: true, nea3: true }
+gnb_search_list: [&quot;172.23.0.100&quot;]
 sessions:
-  - type: IPv4
-    apn: internet
-    slice:
-      sst: 1</code>
+  - { type: Ipv4, s_nssai: { sst: 1, sd: null }, apn: internet, is_emergency: false }
+configured_nssai:
+  slices: [{ sst: 1, sd: null }]</code>
       </div>
     </div>
 
-    <!-- Crate API Links -->
     <h2 class="section-title" style="margin-top: 3rem;">Crate API Documentation</h2>
     <p class="section-subtitle">Generated Rust API docs for each crate.</p>
 

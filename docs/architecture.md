@@ -1,6 +1,6 @@
 # nextgsim Architecture
 
-This document describes the architecture of nextgsim, a pure-Rust implementation of a 5G UE and gNB simulator.
+This document describes the architecture of nextgsim, a pure-Rust 5G UE and gNB simulator with an LTE eNB and LTE UE beside them. The deeper, code-referenced chapters are in the mdBook (`docs-book/src/architecture/gnb.md`, `ue.md`).
 
 ## Overview
 
@@ -30,25 +30,42 @@ nextgsim is organized as a Cargo workspace with multiple crates, each responsibl
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+The diagram shows the NR side. The LTE side (`lte-enb`, `lte-ue`) uses
+`nextgsim-s1ap`, `nextgsim-lte-rrc` and `nextgsim-eps-nas` over the same
+`rls`, `rlc`, `pdcp`, `gtp` and `sctp` crates.
+
 ---
 
 ## Workspace Structure
 
+The workspace (`Cargo.toml` `members`) has 26 crates plus the `tests/`
+integration-test crate (`nextgsim-integration-tests`). Counted from the
+`members` list: `sed -n '/^members/,/^]/p' Cargo.toml | grep -c nextgsim-`.
+
 ```
 nextgsim/
-├── Cargo.toml                    # Workspace manifest
-├── nextgsim-gnb/                 # gNB binary crate
-├── nextgsim-ue/                  # UE binary crate
-├── nextgsim-cli/                 # CLI binary crate
-├── nextgsim-common/              # Common types and utilities
-├── nextgsim-nas/                 # NAS protocol library
-├── nextgsim-ngap/                # NGAP protocol library
-├── nextgsim-rrc/                 # RRC protocol library
-├── nextgsim-crypto/              # Cryptographic functions
+├── Cargo.toml                    # Workspace manifest (pins asn1-codegen, sctp-proto)
+├── rust-toolchain.toml           # Pinned toolchain
+├── nextgsim-gnb/                 # nr-gnb
+├── nextgsim-ue/                  # nr-ue
+├── nextgsim-enb/                 # lte-enb
+├── nextgsim-lte-ue/              # lte-ue
+├── nextgsim-cli/                 # nr-cli, nr-loadtest
+├── nextgsim-common/              # Types, configuration, CLI server, errors
+├── nextgsim-nas/                 # 5GS NAS (TS 24.501)
+├── nextgsim-eps-nas/             # EPS NAS (TS 24.301, UE side)
+├── nextgsim-ngap/                # NGAP + NRPPa (generated APER)
+├── nextgsim-s1ap/                # S1AP (generated APER)
+├── nextgsim-rrc/                 # NR RRC (generated UPER)
+├── nextgsim-lte-rrc/             # E-UTRA RRC (generated UPER)
+├── nextgsim-rlc/                 # RLC TM/UM/AM, SRAP
+├── nextgsim-pdcp/                # PDCP SRB/DRB, AS security, SDAP header
+├── nextgsim-crypto/              # Milenage, TUAK, SNOW3G, ZUC, AES, ECIES, KDF, PQC
 ├── nextgsim-rls/                 # Radio Link Simulation
-├── nextgsim-rlc/                 # RLC layer (UM/AM entities, SN12 DRB for user plane)
-├── nextgsim-gtp/                 # GTP-U protocol
-├── nextgsim-sctp/                # SCTP transport
+├── nextgsim-gtp/                 # GTP-U
+├── nextgsim-sctp/                # SCTP (userspace + kernel backends)
+├── nextgsim-ai/ -she/ -nwdaf/ -nkef/ -isac/ -agent/ -fl/ -semantic/   # 6G research crates
+├── tools/                        # 3GPP ASN.1 schemas + extract_asn1.py
 └── tests/                        # Integration tests
 ```
 
@@ -58,64 +75,55 @@ nextgsim/
 
 ### Binary Crates
 
-| Crate | Description |
-|-------|-------------|
-| `nextgsim-gnb` | 5G gNodeB simulator with NGAP, RRC, GTP, RLS tasks |
-| `nextgsim-ue` | 5G User Equipment simulator with NAS, RRC, RLS tasks |
-| `nextgsim-cli` | Command-line interface for controlling running instances |
+| Crate | Binary | Description |
+|-------|--------|-------------|
+| `nextgsim-gnb` | `nr-gnb` | 5G gNodeB: App, NGAP, RRC, GTP, RLS and SCTP tasks |
+| `nextgsim-ue` | `nr-ue` | 5G UE: App, NAS, RRC, RLS and TUN tasks |
+| `nextgsim-enb` | `lte-enb` | LTE eNB: S1 Setup and UE-associated S1AP, E-UTRA cell over RLS, SRB/DRB PDCP, S1-U GTP-U |
+| `nextgsim-lte-ue` | `lte-ue` | LTE UE: cell selection, E-UTRA RRC, EPS NAS attach, AS security, DRBs, TUN |
+| `nextgsim-cli` | `nr-cli`, `nr-loadtest` | Control interface for running instances; multi-UE load test |
 
 ### Protocol Libraries
 
 | Crate | Description | 3GPP Spec |
 |-------|-------------|-----------|
-| `nextgsim-nas` | NAS message encoding/decoding, 5GMM/5GSM messages | TS 24.501 |
-| `nextgsim-ngap` | NGAP ASN.1 PER codec, NG interface procedures | TS 38.413 |
-| `nextgsim-rrc` | RRC ASN.1 UPER codec, radio resource control | TS 38.331 |
-| `nextgsim-rls` | Radio Link Simulation protocol for UE-gNB communication | Custom |
+| `nextgsim-nas` | 5GMM/5GSM message encoding/decoding, NAS security | TS 24.501 |
+| `nextgsim-eps-nas` | EMM/ESM (UE side), EPS AKA, NAS security | TS 24.301 |
+| `nextgsim-ngap` | NGAP and NRPPa APER codecs and NG procedures | TS 38.413, TS 38.455 |
+| `nextgsim-s1ap` | S1AP APER codec | TS 36.413 |
+| `nextgsim-rrc` | NR RRC UPER codec and procedures | TS 38.331 |
+| `nextgsim-lte-rrc` | E-UTRA RRC UPER codec | TS 36.331 |
+| `nextgsim-rlc` | RLC TM/UM/AM, LTE RLC UM, SRAP | TS 38.322, TS 36.322, TS 38.351 |
+| `nextgsim-pdcp` | PDCP entities for SRBs and DRBs, AS integrity/ciphering, SDAP header | TS 38.323, TS 36.323, TS 37.324 |
+| `nextgsim-rls` | Radio Link Simulation protocol for UE-gNB / UE-eNB communication over UDP | Custom |
 
 ### Transport & Support
 
 | Crate | Description |
 |-------|-------------|
-| `nextgsim-sctp` | SCTP transport using `sctp-proto` (pure Rust) |
-| `nextgsim-gtp` | GTP-U header encoding/decoding, tunnel management |
-| `nextgsim-crypto` | Milenage, SNOW3G, ZUC, NEA/NIA algorithms, KDF, ECIES |
-| `nextgsim-common` | Common types (PLMN, TAI, SUPI), configuration, errors |
+| `nextgsim-sctp` | SCTP: a userspace `sctp-proto` backend over UDP (default) and a kernel backend via libsctp (`kernel-sctp` feature). The shared constants come from nextgcore's `nextgcore-sctp` crate |
+| `nextgsim-gtp` | GTP-U header encoding/decoding, tunnel management, path supervision |
+| `nextgsim-crypto` | Milenage, TUAK, SNOW3G, ZUC, NEA/NIA algorithms, KDF, ECIES, PQC (`pqc` feature) |
+| `nextgsim-common` | Common types (PLMN, TAI, SUPI), configuration, CLI server, errors |
 
 ---
 
 ## Crate Dependencies
 
+Workspace-internal dependencies, from each crate's `[dependencies]`:
+
 ```
-nextgsim-gnb
-├── nextgsim-common
-├── nextgsim-ngap
-├── nextgsim-rrc
-├── nextgsim-rls
-├── nextgsim-gtp
-├── nextgsim-sctp
-└── nextgsim-crypto
-
-nextgsim-ue
-├── nextgsim-common
-├── nextgsim-nas
-├── nextgsim-rrc
-├── nextgsim-rls
-├── nextgsim-crypto
-└── nextgsim-gtp
-
-nextgsim-cli
-└── nextgsim-common
-
-nextgsim-nas
-├── nextgsim-common
-└── nextgsim-crypto
-
-nextgsim-ngap
-└── nextgsim-common
-
-nextgsim-rrc
-└── nextgsim-common
+nextgsim-gnb     common, crypto, ngap, rrc, rls, rlc, pdcp, gtp, sctp (+ optional 6G crates)
+nextgsim-ue      common, crypto, nas, rrc, rls, rlc, pdcp, gtp (+ optional 6G crates)
+nextgsim-enb     common, crypto, s1ap, lte-rrc, eps-nas, pdcp, rls, rlc, gtp, sctp
+nextgsim-lte-ue  common, crypto, eps-nas, lte-rrc, pdcp, rls, rlc, ue
+nextgsim-cli     common
+nextgsim-nas     common, crypto
+nextgsim-eps-nas common, crypto
+nextgsim-ngap    common
+nextgsim-rrc     common, crypto, rlc
+nextgsim-pdcp    crypto
+nextgsim-sctp    nextgcore-sctp (git, pinned by rev)
 ```
 
 ---
@@ -262,9 +270,9 @@ pub enum RrcState {
 ```rust
 pub enum AmfState {
     NotConnected,    // No SCTP association
-    WaitingNgSetup,  // SCTP connected, awaiting NG Setup Response
-    Connected,       // NG Setup complete, ready for UE procedures
-    Ready,           // Alias for Connected
+    Connected,       // SCTP association up, NG Setup not yet sent
+    WaitingNgSetup,  // NG Setup in progress
+    Ready,           // NG Setup complete, ready for UE procedures
     Overloaded,      // AMF indicated overload
 }
 ```
@@ -323,29 +331,64 @@ pub enum AmfState {
      │    User Plane Data (GTP-U tunnel)          │
 ```
 
+### LTE attach (lte-ue, lte-enb, nextgcore EPC)
+
+```
+    UE                    eNB                    MME
+     │──RRCConnectionRequest─►│                   │
+     │◄─RRCConnectionSetup───│                   │
+     │──RRCConnectionSetupComplete (ATTACH REQUEST + PDN CONNECTIVITY REQUEST)
+     │                     │──Initial UE Message─►│
+     │◄────── EPS AKA, NAS Security Mode (DL/UL NAS Transport) ──────►│
+     │                     │◄─Initial Context Setup Request (ATTACH ACCEPT)
+     │◄─SecurityModeCommand (AS)                  │
+     │◄─RRCConnectionReconfiguration (SRB2, DRB)  │
+     │                     │──Initial Context Setup Response (S1-U F-TEID)
+     │──ATTACH COMPLETE───►│──Uplink NAS Transport►│
+     │◄═══════ IP over the default bearer (PDCP/RLC UM, S1-U GTP-U) ═══════►
+```
+
 ---
 
 ## ASN.1 Codec Strategy
 
-nextgsim uses the `asn1-compiler` and `asn1-codecs` crates for ASN.1 encoding/decoding:
+Every ASN.1 codec is generated at build time. Each crate's `build.rs` runs the
+`asn1-compiler` over a 3GPP schema in `tools/`, and the generated types use the
+`asn1-codecs` runtime. Both come from
+[NextgCoreLab/asn1-codegen](https://github.com/NextgCoreLab/asn1-codegen),
+pinned by `rev` in the workspace `Cargo.toml` (`[workspace.dependencies]` and
+`[patch.crates-io]`, so every crate sees one copy). asn1-codegen is the shared
+home of the compiler fixes both this repo and nextgcore need; nextgsim no
+longer vendors the compiler.
 
-| Protocol | Codec | Schema |
-|----------|-------|--------|
-| NGAP | APER (Aligned PER) | `tools/ngap-17.9.asn` |
-| RRC | UPER (Unaligned PER) | `tools/rrc-19.3.0.asn1` |
+| Protocol | Crate | Codec | Schema |
+|----------|-------|-------|--------|
+| NGAP | `nextgsim-ngap` | APER | `tools/ngap-17.9.asn` |
+| NRPPa | `nextgsim-ngap` | APER | `tools/nrppa-19.2.0.asn1` |
+| S1AP | `nextgsim-s1ap` | APER | `tools/s1ap-19.2.0.asn` |
+| NR RRC | `nextgsim-rrc` | UPER | `tools/rrc-19.3.0.asn1` |
+| E-UTRA RRC | `nextgsim-lte-rrc` | UPER | `tools/lte-rrc-19.4.0.asn` |
 
-The RRC schema is a Release 19 extract of TS 38.331 V19.3.0, taken from the
-vendored `6g_docs/specs/38331-j30.docx` by the Annex A.3.1.1 procedure (issue
-\#105). It replaced a Rel-15 module under which no Rel-16+ RRC IE existed at all.
+The S1AP and E-UTRA RRC schemas were extracted from the 3GPP `.docx` by
+`tools/extract_asn1.py`; `tools/S1AP-PROVENANCE.md` and
+`tools/LTE-RRC-PROVENANCE.md` record the source, the command and both sha256
+values. The NR RRC schema is a Release 19 extract of TS 38.331 V19.3.0.
 
-Code is generated at compile time via `build.rs`:
+The build scripts call the compiler like this (`nextgsim-ngap/build.rs`):
 
 ```rust
-// In build.rs
-let mut compiler = Asn1Compiler::new();
-compiler.compile_file("tools/ngap-17.9.asn")?;
-compiler.generate("ngap.rs", Codec::Aper)?;
+let mut compiler = Asn1Compiler::new(
+    output_file.to_str().expect("value expected"),
+    &Visibility::Public,
+    vec![Codec::Aper],
+    vec![Derive::Debug, Derive::Clone, Derive::PartialEq],
+);
+compiler.compile_files(&[schema_str])?;
 ```
+
+The output lands in `OUT_DIR` and is pulled in with
+`include!(concat!(env!("OUT_DIR"), "/ngap.rs"))`. The generated RRC codecs are
+large: CI gives the Test job swap headroom for them.
 
 ---
 
@@ -364,49 +407,32 @@ compiler.generate("ngap.rs", Codec::Aper)?;
 
 ## External Dependencies
 
-```toml
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+The authoritative list is `[workspace.dependencies]` in `Cargo.toml`. The ones
+that shape the design:
 
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = "0.3"
-
-# Cryptography
-aes = "0.8"
-cmac = "0.7"
-sha2 = "0.10"
-hmac = "0.12"
-x25519-dalek = "2"
-zuc = "0.1"
-
-# ASN.1
-asn1-codecs = "0.7"
-
-# Transport
-sctp-proto = "0.6"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Error handling
-thiserror = "1"
-anyhow = "1"
-```
+| Dependency | Use |
+|------------|-----|
+| `tokio` | Async runtime and the task channels |
+| `serde`, `serde_yaml` | Configuration |
+| `tracing`, `tracing-subscriber` | Logging |
+| `aes`, `cmac`, `sha2`, `hmac`, `x25519-dalek`, `zuc` | Cryptographic primitives |
+| `asn1-codecs`, `asn1_codecs_derive`, `asn1-compiler` | ASN.1 runtime and build-time compiler, git dependencies on NextgCoreLab/asn1-codegen |
+| `sctp-proto` 0.6 | Userspace SCTP. Patched to carry any PPID verbatim; the patched crate lives in nextgcore's `src/vendor/sctp-proto` and is taken via `[patch.crates-io]` (see [nextgcore-integration.md](nextgcore-integration.md#the-patched-sctp-proto)) |
+| `nextgcore-sctp` | Shared SCTP constants, a git dependency on nextgcore pinned by `rev` |
+| `tun-rs` | TUN interfaces |
+| `clap` | Command-line parsing |
+| `ort` (`load-dynamic`) | ONNX Runtime for the 6G research crates |
+| `thiserror`, `anyhow` | Errors |
 
 ---
 
 ## Error Handling
 
-Errors are defined using `thiserror` for each crate:
+Errors are defined using `thiserror`; the shared one is:
 
 ```rust
 #[derive(Debug, thiserror::Error)]
-pub enum NextgsimError {
+pub enum Error {   // nextgsim-common/src/error.rs
     #[error("Configuration error: {0}")]
     Config(String),
     
@@ -418,9 +444,18 @@ pub enum NextgsimError {
     
     #[error("ASN.1 encoding error: {0}")]
     Asn1Encode(String),
-    
+
+    #[error("ASN.1 decoding error: {0}")]
+    Asn1Decode(String),
+
     #[error("Crypto error: {0}")]
     Crypto(String),
+
+    #[error("State machine error: {0}")]
+    StateMachine(String),
+
+    #[error("YAML parse error: {0}")]
+    YamlParse(#[from] serde_yaml::Error),
 }
 ```
 
@@ -432,13 +467,13 @@ Structured logging via `tracing`:
 
 ```bash
 # Debug all crates
-RUST_LOG=debug ./nextgsim-ue -c config.yaml
+RUST_LOG=debug ./nr-ue -c config/ue.yaml
 
 # Trace specific crate
-RUST_LOG=nextgsim_nas=trace ./nextgsim-ue -c config.yaml
+RUST_LOG=nextgsim_nas=trace ./nr-ue -c config/ue.yaml
 
 # Multiple levels
-RUST_LOG=nextgsim_nas=trace,nextgsim_rrc=debug ./nextgsim-ue -c config.yaml
+RUST_LOG=nextgsim_nas=trace,nextgsim_rrc=debug ./nr-ue -c config/ue.yaml
 ```
 
 ---
@@ -448,15 +483,16 @@ RUST_LOG=nextgsim_nas=trace,nextgsim_rrc=debug ./nextgsim-ue -c config.yaml
 | Level | Location | Description |
 |-------|----------|-------------|
 | Unit | Each crate's `src/` | Encoding/decoding, state transitions |
-| Integration | `tests/` | UE-gNB-AMF message flows |
-| Conformance | Crypto crates | 3GPP test vectors |
+| Property | `nextgsim-nas`, `nextgsim-ngap`, `nextgsim-rrc` | `proptest` codec round trips |
+| Integration | `tests/` | UE-gNB-AMF message flows against a mock AMF, one `[[test]]` per file |
+| Conformance | `nextgsim-crypto` | 3GPP test vectors (TS 35.207 Milenage, TS 35.232 TUAK) and NIST ACVP vectors for PQC |
+| Cross-repo E2E | nextgcore `docker/rust/e2e.sh`, nightly | Registration, PDU session, ping, paging, Service Request, de-registration against the real core |
 
 Run tests:
 ```bash
-cd nextgsim
-cargo test                    # All tests
-cargo test -p nextgsim-crypto # Single crate
-cargo test --test integration # Integration tests only
+cargo test --workspace                       # All tests
+cargo test -p nextgsim-crypto                # Single crate
+cargo test -p nextgsim-integration-tests     # Integration tests only
 ```
 
 ---
@@ -466,6 +502,8 @@ cargo test --test integration # Integration tests only
 - [3GPP TS 24.501](https://www.3gpp.org/DynaReport/24501.htm) - NAS protocol for 5G
 - [3GPP TS 38.413](https://www.3gpp.org/DynaReport/38413.htm) - NGAP specification
 - [3GPP TS 38.331](https://www.3gpp.org/DynaReport/38331.htm) - RRC specification
+- [3GPP TS 36.413](https://www.3gpp.org/DynaReport/36413.htm) - S1AP
+- [3GPP TS 24.301](https://www.3gpp.org/DynaReport/24301.htm) - EPS NAS
 - [3GPP TS 33.501](https://www.3gpp.org/DynaReport/33501.htm) - 5G Security architecture
 - [3GPP TS 35.207](https://www.3gpp.org/DynaReport/35207.htm) - Milenage test vectors
 - [UERANSIM](https://github.com/aligungr/UERANSIM) - Original C++ implementation

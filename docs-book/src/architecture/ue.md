@@ -14,12 +14,13 @@ this page is about how the UE itself is wired.
 > **Honesty note:** The `nextgsim-ue` behaviour described here is validated by
 > per-crate unit tests and by the project's **matched-simulator docker E2E** — the
 > project drives *its own* gNB/UE against the NextGCore 5G core, and the UE→UPF
-> GTP-U data plane is exercised end to end (84/84 green, 0% loss as of 2026-07-02).
+> GTP-U data plane is exercised end to end, nightly, together with paging,
+> Service Request and de-registration (nextgcore's `ue-flow-check.sh`).
 > This proves internal consistency of the pair; it is **not** third-party
 > conformance certification, and the peer is a cooperative simulator, not an
 > arbitrary commercial network. The live authentication path supports **5G-AKA and
-> EAP-AKA′** (both Milenage-based); the AS-security wire path is **default-off** (see
-> *Simplifications & known gaps*). The Rel-18 5G-Advanced tasks and the 6G/AI
+> EAP-AKA′** (both Milenage-based); AS security is **off unless
+> `as_security_enabled` is set** (see *Simplifications & known gaps*). The Rel-18 5G-Advanced tasks and the 6G/AI
 > client tasks are **non-normative research prototypes** — no frozen Rel-20
 > Stage-3 wire spec exists. 3GPP TS numbers below are quoted only where they
 > appear in this repo's source comments, phrased "per code comments".
@@ -35,7 +36,7 @@ The crate declares one binary, `nr-ue`, in `nextgsim-ue/Cargo.toml`
    `-l/--disable-cmd`, and `-r/--no-routing-config`. `Args` is validated into
    `UeOptions` via `TryFrom<Args>`; `normalize_imsi` strips an `imsi-` prefix and
    enforces exactly 15 digits. These flags are documented for operators in the
-   [CLI section of Configuration](../configuration.md#ue-cli-options).
+   [nr-cli Reference](../cli-reference.md#nr-ue).
 2. **Load + validate config.** `load_and_validate_ue_config` →
    `load_ue_config` (serde_yaml into `nextgsim_common::config::UeConfig`) then
    `validate_ue_config`, which checks HPLMN MCC/MNC ranges, a non-empty
@@ -49,7 +50,7 @@ The crate declares one binary, `nr-ue`, in `nextgsim-ue/Cargo.toml`
 4. **Spawn the actors.** `spawn_tasks` launches, in order: the **TUN** task
    (`TunTask::run`) plus a small TUN→app handler closure; the **App** task
    (`AppTask`, with a CLI server unless `--disable-cmd`); the **NAS** task
-   (`UeApp::run_nas_task`); the **RRC** task (`UeApp::run_rrc_task`); the Rel-18
+   (`UeApp::run_nas_task`); the **RRC** task (the library `RrcTask`); the Rel-18
    **Ranging / MINT** tasks (and **Sidelink** only under the off-by-default
    `sidelink` Cargo feature); any enabled **6G** tasks; and last the
    **RLS** task (`RlsTask::from_ue_config`). `-n > 1` spawns that many `UeApp`
@@ -67,13 +68,13 @@ and the crate that backs it:
 
 | Module (path under `nextgsim-ue/src/`) | Backing crate(s) | Responsibility |
 |---|---|---|
-| `main.rs` | — | `nr-ue` entry: CLI, config load/validate, task spawning, the NAS and RRC task loops (`run_nas_task`, `run_rrc_task`) and the MM/SM output pumps (`process_mm_outputs`, `process_sm_outputs`) |
+| `main.rs` | — | `nr-ue` entry: CLI, config load/validate, task spawning, the NAS task loop (`run_nas_task`), the MM/SM output pumps (`process_mm_outputs`, `process_sm_outputs`) and the uplink buffer that holds packets during a Service Request |
 | `tasks.rs` | `nextgsim-common` | Actor framework: `Task` trait, `TaskManager`, `UeTaskBase` (holds `app_tx/nas_tx/rrc_tx/rls_tx` `TaskHandle`s), the `TaskId` enum, and every inter-task `*Message` type |
 | `app/` | `nextgsim-common` | App task, CLI command parsing/handling (`parse_ue_cli_command`, `cli_handler.rs`), status/`info` reporting (`status.rs`), config loading (`config_loader.rs`) |
 | `nas/mm/` | `nextgsim-nas`, `nextgsim-crypto` | 5GMM: `MmOrchestrator`, MM state machine, SUCI build, authentication, NAS security, deregistration/service-request/config-update/emergency/MINT procedures |
 | `nas/sm/` | `nextgsim-nas` | 5GSM: `SmOrchestrator`, PDU-session establishment/modification/release, PSI/PTI allocation, T3580/T3581/T3582, UL/DL NAS Transport wrapping |
-| `rrc/` | `nextgsim-rrc`, `nextgsim-crypto` | RRC state machine, cell selection (TS 38.304), measurement, handover, RedCap, re-establishment, resume, AS security (`security.rs`), UAV RRC types |
-| `rls/` | `nextgsim-rls`, `nextgsim-rlc` | Radio Link Simulation transport: cell search over UDP, RRC + user-plane PDU transport, per-PSI RLC (UM SN12) segmentation/reassembly |
+| `rrc/` | `nextgsim-rrc`, `nextgsim-crypto`, `nextgsim-pdcp` | The `RrcTask`: RRC state machine, cell selection (TS 38.304), measurement, handover and conditional handover, RedCap, re-establishment, RRC_INACTIVE and resume, AS security (`security.rs`), UAV RRC types |
+| `rls/` | `nextgsim-rls`, `nextgsim-rlc` | Radio Link Simulation transport: cell search over UDP, RRC + user-plane PDU transport, per-PSI RLC segmentation/reassembly (UM SN12, or AM for `rlc_am_psis`) |
 | `tun/` | `nextgsim-common`, `tun-rs` | TUN device lifecycle and IP-packet I/O for the user plane (`TunTask`, `TunInterface`, `packet.rs`) |
 | `timer.rs` | — | NAS timer constants + `NasTimerManager`, `GprsTimer2/3` decoders |
 | `daps.rs` | — | Rel-17 DAPS handover UE state (`UeDapsState`) — dual-RLC handover model |
@@ -90,7 +91,8 @@ The composed crates (declared in `Cargo.toml`):
 | `nextgsim-crypto` | Milenage, TUAK, NEA/NIA ciphers, ECIES SUCI concealment, and the 5G KDF hierarchy (`kdf::{derive_kausf, derive_kseaf, derive_kamf, derive_kgnb, derive_res_star}`) |
 | `nextgsim-rrc` | ASN.1 UPER RRC codec (`codec::generated`) and RRC procedures (`procedures::security_mode`) |
 | `nextgsim-rls` | The UDP RLS protocol: `UeCellSearch`, `RlsTransport`, `RrcChannel`, message codec |
-| `nextgsim-rlc` | `RlcEntity` (TS 38.322) — UM SN12 segmentation/reassembly for the user plane |
+| `nextgsim-rlc` | `RlcEntity` (TS 38.322) — UM SN12 or AM segmentation/reassembly for the user plane; SRAP for the L2 relay |
+| `nextgsim-pdcp` | The shared SRB1 PDCP layer for AS security; the DRB entity behind `drb-pdcp` / `up-security`; the SDAP header behind `sdap-dataplane` |
 | `nextgsim-gtp` | GTP-U codec (linked as a workspace dependency). On the matched-sim path the UE's user plane rides **RLS** to the gNB, and the **gNB** is the GTP-U (N3) endpoint toward the UPF — see [gNB Architecture](gnb.md) |
 
 ### Task topology
@@ -147,8 +149,8 @@ The state machine (`nas/mm/state.rs`, `MmStateMachine`) tracks four orthogonal
 `SendNasPdu`, `RegistrationSucceeded`, `EquivalentPlmnsUpdated`,
 `RegistrationFailed(MmCause)`, `AuthenticationRejected`, `PlmnSearchNeeded`,
 `NotHandled` (a plain 5GMM PDU the orchestrator does not own — e.g. a 5GSM
-piggyback, dispatched onward), and `AsSecurityKgnb` (only when the AS-security
-gate is on).
+piggyback, dispatched onward), and `AsSecurityKgnb` (only when
+`as_security_enabled` is set).
 
 ### SUCI construction
 
@@ -231,10 +233,9 @@ subscription routing are applied here too.
 
 The end-to-end trigger chain, all in `main.rs` unless noted:
 
-1. The **RRC task** selects a serving cell on the first `RrcMessage::SignalChanged`
-   and sends `NasMessage::PerformMmCycle` to the NAS task
-   (`run_rrc_task`, `registration_triggered` latch).
-2. `PerformMmCycle` in a `Deregistered` UE calls
+1. The **RRC task** (`rrc/task.rs`) selects a serving cell and tells the NAS
+   task, which starts registration.
+2. A `Deregistered` UE calls
    `orch.start_registration(RegistrationType::InitialRegistration)`.
 3. The resulting `MmOutput::SendNasPdu` becomes `RrcMessage::UplinkNasDelivery`
    → RRC → RLS → gNB.
@@ -279,23 +280,22 @@ path rather than reachable only from tests.
   can honour TS 38.304 §4.4: camping on an **acceptable-only** cell puts the UE in
   limited service and it attempts **emergency** registration
   (`registration_type_for_cell_category`) rather than normal initial registration.
-- **Uplink NAS.** `UplinkNasDelivery` is wrapped in a simplified **UL Information
-  Transfer** frame (`[0x08, 0x00, …NAS]`) once connected, or sent as a **raw NAS
-  PDU** for initial access (the gNB auto-creates the UE context) — see the byte
-  prefixes in `run_rrc_task`.
-- **Downlink RRC.** A **DL Information Transfer** frame (leading `0x04`) is
-  unwrapped and the inner NAS PDU is forwarded to the NAS task as
-  `NasMessage::NasDelivery`.
+- **Uplink NAS.** The initial NAS message rides the **RRCSetupComplete**
+  (`dedicatedNAS-Message`); once connected, `UplinkNasDelivery` is encoded as a
+  real UPER **UL Information Transfer** (`encode_ul_information_transfer`).
+- **Downlink RRC.** A **DL Information Transfer** is decoded and the inner NAS
+  PDU is forwarded to the NAS task as `NasMessage::NasDelivery`.
 
-**AS security is behind a wire gate.** `rrc/security.rs` defines
-`pub const I5_UE_AS_SECURITY: bool = false;` — **default-off**. When false, the
-DL-DCCH handling is byte-for-byte the legacy path so the matched-sim E2E is
-unchanged. When flipped on, the RRC task decodes the AS `SecurityModeCommand`
+**AS security is a runtime switch.** It used to be the compile-time constant
+`I5_UE_AS_SECURITY = false`; it is now `UeConfig::as_security_enabled`
+(`rrc/security.rs`, `as_security_enabled`), **off by default** and set on both
+gNB and UE together. When on, the RRC task decodes the AS `SecurityModeCommand`
 (`nextgsim_rrc::procedures::security_mode::decode_security_mode_command`), derives
 the AS keys (`AsSecurityContext::derive_from_kgnb`, using the `KgNB` handed down
-from the NAS plane via `RrcMessage::AsSecurityKey`), and replies with
-`SecurityModeComplete`. The derivation is **fail-closed** (no KgNB/algorithm →
-not activated) and explicitly refuses NEA3 (unsupported keystream). `security.rs`
+from the NAS plane), and replies with `SecurityModeComplete`; SRB1 then runs
+through the shared PDCP layer in `nextgsim-pdcp`. The derivation is
+**fail-closed** (no KgNB/algorithm → not activated), and NEA1/NEA2/NEA3 all
+work (NEA3 used to be refused). `security.rs`
 also implements the ShortMAC-I (TS 38.331 §5.3.7.4) and resumeMAC-I (§5.3.13.3)
 computations over the UPER-encoded `VarShortMAC_Input` / `VarResumeMAC_Input`
 ASN.1 types from `nextgsim-rrc`, using the NIA algorithms from `nextgsim-crypto`.
@@ -320,10 +320,13 @@ sends `TunMessage::DestroyInterface`. `TunTask` (`tun/task.rs`) creates a
 **Uplink (TUN → gNB):**
 
 1. A reader task on the TUN device emits `TunAppMessage::UplinkData { psi, data }`.
-2. The handler in `spawn_tasks` (`main.rs`) does two things: sends
-   `NasMessage::InitiateServiceRequest` (so a CM-IDLE UE wakes and runs Service
-   Request), and forwards the packet as `RlsMessage::DataPduDelivery { psi, pdu }`
-   straight to the RLS task.
+2. The handler in `spawn_tasks` (`main.rs`) sends
+   `NasMessage::InitiateServiceRequest` with the packet's PSI (the NAS task only
+   acts on it from CM-IDLE), then forwards the packet as
+   `RlsMessage::DataPduDelivery { psi, pdu }` to the RLS task if the user plane
+   is up. If it is not, the packet is **held** in an uplink buffer and sent once
+   the user plane is back (TS 24.501 §5.6.1.2; nextgsim #267), so the packet
+   that triggered the Service Request is not lost.
 3. `RlsTask::handle_data_pdu_delivery` submits the SDU to the **per-PSI RLC
    entity** — created as `RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12)`
    (`rlc_entity_for`) — segments it with `build_pdu(1500)`, and sends each RLC PDU
@@ -378,31 +381,23 @@ see [The 6G / AI stack](../concepts/ai-6g-stack.md).
 Grounded in the code, these are the honest deviations from a textbook UE:
 
 - **RLS is the radio; there is no PHY/MAC.** UE↔gNB is UDP RLS
-  (`rls/task.rs`); the only Layer-2 processing on the user plane is RLC in
-  **UM with SN12** (`rlc_entity_for`) — no AM, no HARQ, no scheduler.
-- **AS security is default-off.** `I5_UE_AS_SECURITY = false`
-  (`rrc/security.rs`): on the matched-sim path SRBs are **not** integrity-protected
-  or ciphered at the AS layer. NAS-layer security (Knas_int/Knas_enc) *is* real
-  and active. Flipping the gate on requires the docker A/B sign-off noted in the
-  source (it mirrors the gNB's `C5_TYPED_DCCH_DISPATCH` gate).
+  (`rls/task.rs`); Layer 2 on the user plane is RLC (UM SN12 by default, AM for
+  `rlc_am_psis`), plus PDCP and SDAP when built with `drb-pdcp` /
+  `up-security` / `sdap-dataplane` — no HARQ, no scheduler.
+- **AS security is off by default.** With `as_security_enabled: false` (the
+  shipped configs) SRBs are **not** integrity-protected or ciphered at the AS
+  layer. NAS-layer security (Knas_int/Knas_enc) *is* real and active.
 - **5G-AKA and EAP-AKA′ on the live path; TUAK unwired.** The live orchestrator
   handles both **5G-AKA** and **EAP-AKA′**, which are both Milenage-based
   (`handle_eap_aka_prime_challenge` calls
   `nextgsim_crypto::eap_aka_prime::run_eap_aka_prime`). **TUAK** also exists in
   `nextgsim-crypto` (byte-exact vs TS 35.232 in its own tests) but is not wired
   into the UE orchestrator.
-- **RRC framing is simplified.** Uplink/downlink NAS is carried with fixed
-  one/two/three-byte UL/DL Information Transfer prefixes (`0x08` / `0x04`) and a
-  raw-NAS fallback for initial access, not full ASN.1 RRC containers
-  (`run_rrc_task`).
 - **UAV tracking uses a sim-private message type.** The UE emits a UAV tracking
   report on 5GMM message type `0x6A` (`UAV_TRACKING_REPORT_MSG_TYPE`,
   `nas/mm/orchestrator.rs`); the source comment is explicit that **no such
   UE-originated UAV NAS message exists in 3GPP** — it is a self-contained geofence
   demo, kept in sync with the matched core.
-- **6G RRC messages are logged and dropped in the binary.** The `Sixg*` arms of
-  `RrcMessage` in `run_nas_task`/`run_rrc_task` are handled only by the library's
-  `RrcTask`; in the `nr-ue` binary loop they are debug-logged and discarded.
 - **Cooperative peer.** Everything above is exercised against the matched
   nextgsim gNB and NextGCore core, not an arbitrary commercial network.
 

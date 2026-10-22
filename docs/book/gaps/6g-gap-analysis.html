@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "../searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -179,10 +179,10 @@
                     <main>
                         <h1 id="nextgsim--6g-readiness-and-missing-component-register"><a class="header" href="#nextgsim--6g-readiness-and-missing-component-register">nextgsim — 6G Readiness and Missing-Component Register</a></h1>
 <p><strong>Standards baseline:</strong> 3GPP Rel-18/19; ITU-R IMT-2030. Relevant study items include TS 23.288 (NWDAF), TR 22.837 (integrated sensing) and TR 33.871 (post-quantum migration).</p>
-<p><strong>Status.</strong> This document reflects the current codebase. nextgsim is a UE + gNB 5G/6G simulator of <strong>20 crates</strong> producing <strong>3 binaries</strong> (<code>nextgsim-gnb</code>, <code>nextgsim-ue</code>, <code>nr-cli</code>). Behaviour is validated by unit tests and a matched-simulator end-to-end run in which the simulator drives its own gNB/UE against the NextGCore 5G core over N2 (NGAP/SCTP) and N3 (GTP-U), with the user-plane data path verified. The 6G components below are <strong>non-normative research prototypes</strong>; several are compiled into the binaries but are disabled by default. Each missing or partial component is itemized with a stable task ID and, where the work is bounded, a tracked implementation issue.</p>
+<p><strong>Status.</strong> This document reflects the current codebase. nextgsim is a UE + gNB 5G/6G simulator, with an LTE eNB and LTE UE, of <strong>26 crates</strong> (plus the integration-test crate) producing <strong>6 binaries</strong> (<code>nr-gnb</code>, <code>nr-ue</code>, <code>nr-cli</code>, <code>nr-loadtest</code>, <code>lte-enb</code>, <code>lte-ue</code>). Behaviour is validated by unit tests and a matched-simulator end-to-end run in which the simulator drives its own gNB/UE against the NextGCore 5G core over N2 (NGAP/SCTP) and N3 (GTP-U), with the user-plane data path verified. The 6G components below are <strong>non-normative research prototypes</strong>; several are compiled into the binaries but are disabled by default. Each missing or partial component is itemized with a stable task ID and, where the work is bounded, a tracked implementation issue.</p>
 <hr>
 <h2 id="1-implemented-components"><a class="header" href="#1-implemented-components">1. Implemented components</a></h2>
-<p><strong>Core infrastructure:</strong> <code>nextgsim-common</code> (types, config, CLI, transport), <code>nextgsim-crypto</code> (Milenage/5G-AKA, SNOW3G, ZUC, AES, KDF, ECIES), <code>nextgsim-sctp</code> (N2 transport), <code>nextgsim-rlc</code> (RLC TM/UM; AM data path present).</p>
+<p><strong>Core infrastructure:</strong> <code>nextgsim-common</code> (types, config, CLI, transport), <code>nextgsim-crypto</code> (Milenage/5G-AKA, SNOW3G, ZUC, AES, KDF, ECIES), <code>nextgsim-sctp</code> (N2 transport), <code>nextgsim-rlc</code> (RLC TM/UM/AM: AM carries STATUS reporting with NACKs, NACK-driven retransmission and the ARQ timers).</p>
 <p><strong>5G protocol stack:</strong> <code>nextgsim-nas</code> (5GMM + 5GSM), <code>nextgsim-ngap</code> (NGAP with ASN.1 PER), <code>nextgsim-rrc</code> (RRC with ASN.1 UPER), <code>nextgsim-rls</code> (radio-link simulation), <code>nextgsim-gtp</code> (GTP-U).</p>
 <p><strong>Binaries:</strong> <code>nextgsim-gnb</code>, <code>nextgsim-ue</code>, <code>nextgsim-cli</code> (<code>nr-cli</code>, plus a load-test binary).</p>
 <p><strong>6G AI-native crates:</strong> <code>nextgsim-ai</code> (ONNX Runtime inference), <code>nextgsim-she</code> (edge compute placement), <code>nextgsim-nwdaf</code>, <code>nextgsim-nkef</code>, <code>nextgsim-isac</code>, <code>nextgsim-agent</code>, <code>nextgsim-fl</code>, <code>nextgsim-semantic</code>. These are prototypes; see the register below for what each is missing.</p>
@@ -223,10 +223,10 @@
 <tr><th>Task ID</th><th>Component</th><th>Remaining work</th><th>Reference</th><th>Status</th><th>Tracking</th></tr>
 </thead>
 <tbody>
-<tr><td>NGS-5G-01</td><td>RLC Acknowledged Mode</td><td>ARQ: STATUS with NACK list, automatic retransmission, timers; make AM selectable in the data path (TM/UM already work)</td><td>TS 38.322</td><td>Partial</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/15">#15</a></td></tr>
-<tr><td>NGS-5G-02</td><td>UE NAS MM</td><td>Configuration Update command handling (received parameters are decoded but not applied), rejected/pending NSSAI state, RACS</td><td>TS 24.501</td><td>Partial</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/19">#19</a></td></tr>
-<tr><td>NGS-5G-03</td><td>UE RRC</td><td>measurement event A6, conditional handover wiring, inter-RAT B1/B2</td><td>TS 38.331</td><td>Partial</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/20">#20</a></td></tr>
-<tr><td>NGS-5G-04</td><td>gNB RRC</td><td>UPER-encoded MIB/SIB1 broadcast over BCCH and migration of residual simplified RRC PDUs to real ASN.1</td><td>TS 38.331</td><td>Partial</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/21">#21</a></td></tr>
+<tr><td>NGS-5G-01</td><td>RLC Acknowledged Mode</td><td>Done: STATUS reporting with an E1-chained NACK list, NACK-driven retransmission, <code>t-PollRetransmit</code> / <code>t-StatusProhibit</code> / <code>t-Reassembly</code>, and AM selectable per bearer via <code>rlc_am_psis</code> (UM SN12 stays the default). Re-segmentation of an oversized retransmission and SO-level NACK ranges are decode-only</td><td>TS 38.322</td><td>Complete</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/15">#15</a></td></tr>
+<tr><td>NGS-5G-02</td><td>UE NAS MM</td><td>Done: Configuration Update parameters are applied (5G-GUTI, TAI list, allowed NSSAI, T3512), rejected/pending NSSAI are stored and rejected S-NSSAIs excluded from the next requested NSSAI, and the UE radio capability ID (RACS) IEs are decoded. RACS is not yet SIGNALLED (no IE in the REGISTRATION REQUEST, no RRC/NGAP consumer)</td><td>TS 24.501</td><td>Complete</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/19">#19</a></td></tr>
+<tr><td>NGS-5G-03</td><td>UE RRC</td><td>Done: measurement events A1-A6 and inter-RAT B1/B2 with both the entering and the leaving inequality and a per-cell <code>cellsTriggeredList</code>, the conditional-handover runtime, and a secondary cell configured over the air (<code>sCellToAddModList</code>) so A6 has the reference it is defined against. Inter-RAT B1/B2 still have no E-UTRA measurement source</td><td>TS 38.331</td><td>Complete</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/20">#20</a>, <a href="https://github.com/NextgCoreLab/nextgsim/issues/111">#111</a>, <a href="https://github.com/NextgCoreLab/nextgsim/issues/112">#112</a></td></tr>
+<tr><td>NGS-5G-04</td><td>gNB RRC</td><td>Done: the gNB broadcasts UPER MIB/SIB1 on BCCH (<code>si_broadcast_period_ms</code>) and the UE decodes them, so a cell’s PLMN/TAC/NCI come off the air rather than being assumed. The residual hand-rolled RRC PDUs (re-establishment, resume, handover command, measurement report) are split out</td><td>TS 38.331</td><td>Complete</td><td><a href="https://github.com/NextgCoreLab/nextgsim/issues/21">#21</a></td></tr>
 </tbody>
 </table>
 </div>
@@ -304,7 +304,7 @@
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

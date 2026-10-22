@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -178,107 +178,238 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="nr-cli-reference"><a class="header" href="#nr-cli-reference">nr-cli Reference</a></h1>
-<p><code>nr-cli</code> is nextgsim’s control tool for inspecting and driving running UE and gNB instances, modeled on UERANSIM’s CLI (<code>nextgsim-cli/src/main.rs</code>). A second binary, <code>nr-loadtest</code>, provides multi-UE load testing (<code>src/loadtest_main.rs</code>).</p>
-<blockquote>
-<p><strong>Scope note:</strong> these commands drive the simulator’s own UE/gNB processes. Behavior is validated by the project’s tests and matched-simulator E2E runs, not third-party certified. Commands mentioning 6G features are non-normative research prototypes.</p>
-</blockquote>
-<h2 id="invocation"><a class="header" href="#invocation">Invocation</a></h2>
-<pre><code class="language-text">nr-cli [NODE] [-d|--dump] [-e|--exec &lt;COMMAND&gt;]
+<p>This page covers the command-line binaries and <code>nr-cli</code>, the control tool for
+running gNB and UE instances. Flags are taken from each binary’s clap <code>Args</code>
+struct; <code>nr-cli</code> commands from the gNB and UE command parsers.</p>
+<h2 id="binaries-and-flags"><a class="header" href="#binaries-and-flags">Binaries and flags</a></h2>
+<p><code>cargo build --release</code> produces six binaries:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Binary</th><th>Crate</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nr-gnb</code></td><td><code>nextgsim-gnb</code></td><td>5G gNodeB simulator</td></tr>
+<tr><td><code>nr-ue</code></td><td><code>nextgsim-ue</code></td><td>5G UE simulator</td></tr>
+<tr><td><code>nr-cli</code></td><td><code>nextgsim-cli</code></td><td>Control interface for running <code>nr-gnb</code> / <code>nr-ue</code> instances</td></tr>
+<tr><td><code>nr-loadtest</code></td><td><code>nextgsim-cli</code></td><td>Multi-UE registration load test against a 5G core</td></tr>
+<tr><td><code>lte-enb</code></td><td><code>nextgsim-enb</code></td><td>LTE eNB simulator (needs <code>--features kernel-sctp</code> on Linux to do anything)</td></tr>
+<tr><td><code>lte-ue</code></td><td><code>nextgsim-lte-ue</code></td><td>LTE UE simulator</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="nr-gnb"><a class="header" href="#nr-gnb">nr-gnb</a></h2>
+<p>Connects to one or more AMFs and serves UEs over RLS.</p>
+<pre><code class="language-bash">nr-gnb [OPTIONS] --config &lt;FILE&gt;
 </code></pre>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Argument / flag</th><th>Meaning</th></tr>
+<tr><th>Option</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>NODE</code></td><td>Node name to connect to (e.g. <code>ue1</code>, <code>gnb1</code>); validated for min/max length</td></tr>
-<tr><td><code>-d</code>, <code>--dump</code></td><td>List all running nodes and exit</td></tr>
-<tr><td><code>-e</code>, <code>--exec &lt;COMMAND&gt;</code></td><td>Run a single node command non-interactively and exit (non-zero exit code on command error)</td></tr>
+<tr><td><code>-c, --config &lt;FILE&gt;</code></td><td>gNB configuration file (required)</td></tr>
+<tr><td><code>-l, --disable-cmd</code></td><td>Do not open the <code>nr-cli</code> command interface</td></tr>
+<tr><td><code>-h, --help</code></td><td>Print help</td></tr>
+<tr><td><code>-V, --version</code></td><td>Print version</td></tr>
 </tbody>
 </table>
 </div>
-<p>With a node name and no <code>--exec</code>, <code>nr-cli</code> opens an interactive prompt (<code>&lt;node&gt;&gt; </code>); <code>help</code> prints command hints, <code>exit</code>/<code>quit</code> (or EOF) leaves.</p>
-<h3 id="how-discovery-and-transport-work"><a class="header" href="#how-discovery-and-transport-work">How discovery and transport work</a></h3>
-<p>Running gNB/UE instances register in a process-table directory (<code>/tmp/nextgsim.proc-table/</code>, see <code>src/proc_table.rs</code>). <code>nr-cli --dump</code> scans it; connecting resolves the node’s command port and talks to it over a local UDP socket on <code>127.0.0.1</code> (<code>src/client.rs</code>). Entries with a mismatched nextgsim version are skipped and reported.</p>
-<pre><code class="language-console">$ nr-cli --dump
-ue1
-gnb1
-$ nr-cli ue1 -e status
-$ nr-cli gnb1          # interactive session
+<pre><code class="language-bash">nr-gnb -c config/gnb.yaml
+nr-gnb -c config/gnb.yaml --disable-cmd
+RUST_LOG=debug nr-gnb -c config/gnb.yaml
 </code></pre>
-<h2 id="ue-node-commands"><a class="header" href="#ue-node-commands">UE node commands</a></h2>
-<p>Parsed in <code>nextgsim-ue/src/app/task.rs</code> (<code>parse_ue_cli_command</code>) and executed by <code>nextgsim-ue/src/app/cli_handler.rs</code>, which triggers the corresponding NAS procedures.</p>
+<hr>
+<h2 id="nr-ue"><a class="header" href="#nr-ue">nr-ue</a></h2>
+<p>Finds a gNB over RLS, registers, and establishes the configured PDU sessions.
+It creates a TUN interface per PDU session, so it needs <code>CAP_NET_ADMIN</code>.</p>
+<pre><code class="language-bash">nr-ue [OPTIONS] --config &lt;FILE&gt;
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c, --config &lt;FILE&gt;</code></td><td>UE configuration file (required)</td></tr>
+<tr><td><code>-i, --imsi &lt;IMSI&gt;</code></td><td>Use this IMSI instead of the config’s: 15 digits, optionally prefixed <code>imsi-</code></td></tr>
+<tr><td><code>-n, --num-of-UE &lt;NUM&gt;</code></td><td>Run NUM UEs (1..512, default 1), the IMSI incremented for each</td></tr>
+<tr><td><code>-t, --tempo &lt;TEMPO&gt;</code></td><td>Delay in ms between UE starts (default 0)</td></tr>
+<tr><td><code>-l, --disable-cmd</code></td><td>Do not open the <code>nr-cli</code> command interface</td></tr>
+<tr><td><code>-r, --no-routing-config</code></td><td>Do not configure routing for the UE TUN interface. Currently only logged</td></tr>
+<tr><td><code>-h, --help</code></td><td>Print help</td></tr>
+<tr><td><code>-V, --version</code></td><td>Print version</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-bash">nr-ue -c config/ue.yaml
+nr-ue -c config/ue.yaml -i imsi-999700000000099
+nr-ue -c config/ue.yaml -n 10 -t 100
+RUST_LOG=nextgsim_nas=trace nr-ue -c config/ue.yaml
+</code></pre>
+<p>With <code>-n 5</code> and a config SUPI of <code>999700000000001</code> the UEs are
+<code>999700000000001</code> .. <code>999700000000005</code>, registered with <code>nr-cli</code> as <code>ue0</code> ..
+<code>ue4</code>.</p>
+<hr>
+<h2 id="lte-enb-and-lte-ue"><a class="header" href="#lte-enb-and-lte-ue">lte-enb and lte-ue</a></h2>
+<pre><code class="language-bash">lte-enb --config &lt;FILE&gt;
+lte-ue  --config &lt;FILE&gt;
+</code></pre>
+<p>Each takes only <code>-c, --config &lt;FILE&gt;</code> (plus <code>-h</code> and <code>-V</code>). Their configuration,
+and the <code>NEXTGSIM_*</code> environment overrides they read, are in
+<a href="configuration.html#lte-enb-configuration-lte-enb">configuration.md</a>. Neither
+registers with <code>nr-cli</code>.</p>
+<p>The <code>lte-ue</code> container image also ships <code>lte-ue-ping-check &lt;target&gt; [count]</code>,
+which waits for the default bearer’s PDN address and asserts a 0%-loss ping
+(exit 0 pass, 1 no bearer, 2 loss).</p>
+<hr>
+<h2 id="nr-cli"><a class="header" href="#nr-cli">nr-cli</a></h2>
+<p><code>nr-cli</code> connects to running <code>nr-gnb</code> / <code>nr-ue</code> instances on the same host.
+Each instance registers its node names in <code>/tmp/nextgsim.proc-table/</code>; <code>nr-cli</code>
+reads that directory and talks to the node’s command port over UDP on
+127.0.0.1. Entries written by a different nextgsim version are skipped.</p>
+<pre><code class="language-bash">nr-cli [OPTIONS] [NODE]
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument / option</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NODE</code></td><td>Node to connect to: <code>gnb</code> for a gNB, <code>ue0</code>, <code>ue1</code>, … for UEs</td></tr>
+<tr><td><code>-d, --dump</code></td><td>List the running nodes and exit</td></tr>
+<tr><td><code>-e, --exec &lt;COMMAND&gt;</code></td><td>Run one command and exit (non-zero exit code on a command error)</td></tr>
+<tr><td><code>-h, --help</code></td><td>Print help</td></tr>
+<tr><td><code>-V, --version</code></td><td>Print version</td></tr>
+</tbody>
+</table>
+</div>
+<p>With a node and no <code>--exec</code>, <code>nr-cli</code> opens an interactive prompt; <code>help</code> lists
+commands and <code>exit</code> / <code>quit</code> leaves. The interactive help also lists some 6G
+commands (<code>nwdaf-query</code>, <code>she-offload</code>, …) that the node parsers do not accept;
+they return <code>Unknown command</code>.</p>
+<pre><code class="language-bash">nr-cli --dump
+nr-cli ue0 -e status
+nr-cli gnb                # interactive
+</code></pre>
+<p>In the Docker images <code>nr-cli</code> is not installed; copy <code>binaries/nr-cli</code> into the
+container and run it there (nextgcore’s <code>docker/rust/ue-flow-check.sh</code> does
+exactly this).</p>
+<h3 id="ue-commands"><a class="header" href="#ue-commands">UE commands</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Command</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>info</code></td><td>UE information (SUPI, active PDU sessions, pending procedures) as YAML</td></tr>
-<tr><td><code>status</code></td><td>RM/MM state, MM sub-state, and PDU session list as YAML</td></tr>
-<tr><td><code>ps-list</code></td><td>Alias for <code>status</code> (shows PDU sessions)</td></tr>
-<tr><td><code>timers</code></td><td>Active NAS session-management timers (e.g. T3580/T3582)</td></tr>
-<tr><td><code>deregister [--switch-off|-s]</code></td><td>Initiate deregistration; <code>--switch-off</code> sends switch-off cause and does not wait for a response</td></tr>
-<tr><td><code>ps-establish [--type|-t &lt;ipv4|ipv6|ipv4v6|unstructured|ethernet&gt;] [--apn|-a &lt;apn&gt;] [--sst|-s &lt;sst&gt;]</code></td><td>Establish a PDU session (default type IPv4; PSI/PTI auto-allocated)</td></tr>
-<tr><td><code>ps-release &lt;psi&gt;</code></td><td>Release PDU session with PSI 1–15</td></tr>
-<tr><td><code>ps-release-all</code></td><td>Release all active PDU sessions</td></tr>
-<tr><td><code>emergency-register</code></td><td>Initiate emergency registration (only from DEREGISTERED state)</td></tr>
+<tr><td><code>info</code></td><td>UE information (SUPI, sessions, pending procedures) as YAML</td></tr>
+<tr><td><code>status</code></td><td>RM, CM and MM state and the PDU sessions, as YAML</td></tr>
+<tr><td><code>ps-list</code></td><td>Same as <code>status</code></td></tr>
+<tr><td><code>timers</code></td><td>Running NAS session-management timers</td></tr>
+<tr><td><code>deregister [normal|switch-off]</code></td><td>UE-originated de-registration. <code>normal</code> (the default) waits for DEREGISTRATION ACCEPT; <code>switch-off</code> (also <code>--switch-off</code>, <code>-s</code>) does not. <code>disable-5g</code> and <code>remove-sim</code> are refused</td></tr>
+<tr><td><code>ps-establish [--type|-t &lt;type&gt;] [--apn|-a &lt;apn&gt;] [--sst|-s &lt;sst&gt;]</code></td><td>Establish a PDU session (default type IPv4)</td></tr>
+<tr><td><code>ps-release &lt;psi&gt;</code></td><td>Release the PDU session with this PSI (1..15)</td></tr>
+<tr><td><code>ps-release-all</code></td><td>Release every PDU session</td></tr>
+<tr><td><code>emergency-register</code></td><td>Emergency registration (only from DEREGISTERED)</td></tr>
 </tbody>
 </table>
 </div>
-<p>Preconditions are enforced: <code>deregister</code>, <code>ps-establish</code>, <code>ps-release</code>, and <code>ps-release-all</code> require the UE to be RM-REGISTERED (and MM-REGISTERED for session commands); violations return an <code>ERROR:</code> response instead of acting.</p>
-<pre><code class="language-console">$ nr-cli ue1 -e "ps-establish --type IPv4 --apn internet"
-OK: Initiating PDU session establishment (PSI: 1, PTI: 1, Type: IPv4)
-$ nr-cli ue1 -e "ps-release 1"
-$ nr-cli ue1 -e "deregister --switch-off"
-</code></pre>
-<h2 id="gnb-node-commands"><a class="header" href="#gnb-node-commands">gNB node commands</a></h2>
-<p>Parsed and handled in <code>nextgsim-gnb/src/app/cmd_handler.rs</code> (<code>parse_cli_command</code>).</p>
+<h3 id="gnb-commands"><a class="header" href="#gnb-commands">gNB commands</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Command</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>info</code></td><td>gNB configuration/information as YAML</td></tr>
+<tr><td><code>info</code></td><td>gNB configuration as YAML</td></tr>
 <tr><td><code>status</code></td><td>gNB runtime status as YAML</td></tr>
-<tr><td><code>amf-list</code></td><td>List connected AMFs</td></tr>
-<tr><td><code>ue-list</code></td><td>List UEs attached via this gNB</td></tr>
-<tr><td><code>ue-info &lt;ue-id&gt;</code></td><td>Details for one UE by numeric ID</td></tr>
-<tr><td><code>ue-release &lt;ue-id&gt;</code></td><td>Release the RRC/NGAP context of a UE by numeric ID</td></tr>
+<tr><td><code>amf-list</code></td><td>Connected AMFs</td></tr>
+<tr><td><code>ue-list</code></td><td>UEs served by this gNB</td></tr>
+<tr><td><code>ue-info &lt;ue-id&gt;</code></td><td>One UE’s details</td></tr>
+<tr><td><code>ue-release &lt;ue-id&gt;</code></td><td>Release one UE’s context</td></tr>
+<tr><td><code>ue-suspend &lt;ue-id&gt; [t380-minutes]</code></td><td>Move a UE to RRC_INACTIVE, optionally with a periodic RNAU timer</td></tr>
+<tr><td><code>xn-path-switch &lt;ue-id&gt; &lt;source-amf-ue-ngap-id&gt;</code></td><td>Send a Path Switch Request for a UE, as after an Xn handover</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-console">$ nr-cli gnb1 -e ue-list
-$ nr-cli gnb1 -e "ue-info 1"
-$ nr-cli gnb1 -e "ue-release 1"
+<pre><code class="language-bash">nr-cli ue0 -e "ps-establish --type IPv4 --apn internet --sst 1"
+nr-cli ue0 -e "ps-release 1"
+nr-cli ue0 -e "deregister switch-off"
+nr-cli gnb -e ue-list
+nr-cli gnb -e "ue-suspend 1 5"
 </code></pre>
-<h3 id="help-text-vs-accepted-commands"><a class="header" href="#help-text-vs-accepted-commands">Help text vs. accepted commands</a></h3>
-<p>The interactive <code>help</code> output in <code>main.rs</code> also advertises 6G-feature commands (<code>nwdaf-query</code>, <code>she-offload</code>, <code>isac-sense</code>, <code>fl-train</code>, <code>semantic-encode</code> for UEs; <code>nwdaf-status</code>, <code>she-status</code>, <code>isac-config</code>, <code>fl-status</code>, <code>semantic-status</code>, <code>amf-status</code> for gNBs). These are <strong>not present in the UE/gNB command parsers</strong> listed above and will return <code>Unknown command</code>; treat the tables above (grounded in the parser code) as authoritative.</p>
+<hr>
 <h2 id="nr-loadtest"><a class="header" href="#nr-loadtest">nr-loadtest</a></h2>
-<p>Multi-UE load-testing binary against a 5G core (<code>src/loadtest_main.rs</code>, <code>src/loadtest.rs</code>). Exits non-zero if the registration success rate is below 90%.</p>
+<p>Registers many UEs against a 5G core and reports the success rate; it exits
+non-zero if fewer than 90% register.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--ues &lt;N&gt;</code></td><td>10</td><td>Number of UEs to simulate</td></tr>
-<tr><td><code>--rate &lt;N&gt;</code></td><td>5</td><td>Registrations per second (0 = burst)</td></tr>
-<tr><td><code>--gnb-addr &lt;IP&gt;</code></td><td>127.0.0.100</td><td>gNB address</td></tr>
-<tr><td><code>--amf-addr &lt;IP&gt;</code></td><td>127.0.0.5</td><td>AMF address</td></tr>
-<tr><td><code>--base-imsi &lt;IMSI&gt;</code></td><td>999700000000001</td><td>Base IMSI, incremented per UE</td></tr>
-<tr><td><code>--dnn &lt;name&gt;</code></td><td>internet</td><td>DNN for PDU sessions</td></tr>
-<tr><td><code>--sst &lt;N&gt;</code></td><td>1</td><td>S-NSSAI SST</td></tr>
-<tr><td><code>--duration &lt;secs&gt;</code></td><td>0</td><td>Test duration limit (0 = unlimited)</td></tr>
+<tr><td><code>--ues &lt;UES&gt;</code></td><td>10</td><td>Number of UEs</td></tr>
+<tr><td><code>--rate &lt;RATE&gt;</code></td><td>5</td><td>Registrations per second (0 = burst)</td></tr>
+<tr><td><code>--gnb-addr &lt;GNB_ADDR&gt;</code></td><td>127.0.0.100</td><td>gNB address</td></tr>
+<tr><td><code>--amf-addr &lt;AMF_ADDR&gt;</code></td><td>127.0.0.5</td><td>AMF address</td></tr>
+<tr><td><code>--base-imsi &lt;BASE_IMSI&gt;</code></td><td>999700000000001</td><td>First IMSI, incremented per UE</td></tr>
+<tr><td><code>--dnn &lt;DNN&gt;</code></td><td>internet</td><td>DNN for the PDU session</td></tr>
+<tr><td><code>--sst &lt;SST&gt;</code></td><td>1</td><td>S-NSSAI SST</td></tr>
+<tr><td><code>--duration &lt;DURATION&gt;</code></td><td>0</td><td>Time limit in seconds (0 = none)</td></tr>
 <tr><td><code>--skip-pdu</code></td><td>off</td><td>Skip PDU session establishment</td></tr>
-<tr><td><code>--ping</code></td><td>off</td><td>Ping test after PDU session setup</td></tr>
-<tr><td><code>--log-level &lt;lvl&gt;</code></td><td>info</td><td>Log verbosity</td></tr>
+<tr><td><code>--ping</code></td><td>off</td><td>Ping after the PDU session is up</td></tr>
+<tr><td><code>--log-level &lt;LOG_LEVEL&gt;</code></td><td>info</td><td>Log level</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-console">$ nr-loadtest --ues 100 --rate 20 --amf-addr 10.0.0.5 --ping
+<hr>
+<blockquote>
+<p><strong>Scope note:</strong> these commands drive the simulator’s own UE and gNB processes. Their behaviour is checked by the project’s tests and the matched-simulator E2E runs, not by a third party.</p>
+</blockquote>
+<h2 id="logging"><a class="header" href="#logging">Logging</a></h2>
+<p>All binaries log through <code>tracing</code>; set the level with <code>RUST_LOG</code>.</p>
+<pre><code class="language-bash">RUST_LOG=debug nr-ue -c config/ue.yaml
+RUST_LOG=nextgsim_nas=trace,nextgsim_rrc=debug nr-ue -c config/ue.yaml
+RUST_LOG=info,nextgsim_gnb=debug,nextgsim_ngap=debug nr-gnb -c config/gnb.yaml
 </code></pre>
+<hr>
+<h2 id="quick-start"><a class="header" href="#quick-start">Quick start</a></h2>
+<ol>
+<li>Start a core. The nextgcore Docker stack (<code>../nextgcore/docker/rust</code>) is the
+matched peer; with any other AMF use <code>sctp_backend: kernel</code> and a
+<code>kernel-sctp</code> build.</li>
+<li>Start the gNB and wait for the NG Setup Response in its log:
+<code>nr-gnb -c config/gnb.yaml</code></li>
+<li>Start the UE: <code>sudo nr-ue -c config/ue.yaml</code>. It searches for the gNB, sets
+up RRC, registers and establishes the configured PDU sessions.</li>
+<li>Check it: <code>nr-cli ue0 -e status</code>.</li>
+<li>Send traffic through the session: <code>ping -I uesimtun0 &lt;address&gt;</code>.</li>
+</ol>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<h3 id="gnb-does-not-connect-to-the-amf"><a class="header" href="#gnb-does-not-connect-to-the-amf">gNB does not connect to the AMF</a></h3>
+<ol>
+<li>Check the AMF address and port in <code>amf_configs</code>.</li>
+<li>Check the SCTP backend: <code>userspace</code> only talks to nextgcore’s userspace backend.</li>
+<li>Check the PLMN matches the AMF’s.</li>
+<li><code>RUST_LOG=nextgsim_sctp=debug,nextgsim_ngap=debug</code>.</li>
+</ol>
+<h3 id="ue-does-not-find-the-gnb"><a class="header" href="#ue-does-not-find-the-gnb">UE does not find the gNB</a></h3>
+<ol>
+<li><code>gnb_search_list</code> must contain the gNB’s <code>link_ip</code>.</li>
+<li><code>RUST_LOG=nextgsim_rls=debug</code>.</li>
+</ol>
+<h3 id="registration-fails"><a class="header" href="#registration-fails">Registration fails</a></h3>
+<ol>
+<li>The UE’s <code>hplmn</code> must match the gNB’s <code>plmn</code>.</li>
+<li><code>key</code>, <code>op</code> and <code>op_type</code> must match the subscriber in the core.</li>
+<li><code>RUST_LOG=nextgsim_nas=trace</code>.</li>
+</ol>
+<h3 id="pdu-session-fails"><a class="header" href="#pdu-session-fails">PDU session fails</a></h3>
+<ol>
+<li>The session’s S-NSSAI and DNN must be configured in the core.</li>
+<li><code>RUST_LOG=nextgsim_ue=debug</code>.</li>
+</ol>
 
                     </main>
 
@@ -328,7 +459,7 @@ $ nr-cli gnb1 -e "ue-release 1"
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

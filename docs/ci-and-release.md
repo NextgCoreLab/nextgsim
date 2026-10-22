@@ -4,31 +4,79 @@
 
 ### `ci.yml`
 
+Runs on push and pull request to `main`, nightly at 05:00 UTC, and on manual
+dispatch.
+
+**Fast gate** (every push and PR):
+
 | Job | Command | Gates on |
 |-----|---------|----------|
 | **Check** | `cargo check --workspace` | compile errors |
-| **Format** | `cargo fmt --all -- --check` | rustfmt drift (fails on any diff) |
-| **Clippy** | `cargo clippy --workspace` | errors only (warnings shown, non-blocking) |
-| **Test** | `cargo test --workspace` | any failing test |
-| **Docker Build** | builds the Rust binaries, then the gNB and UE images; verifies images | build failures |
+| **Format** | `cargo fmt --all -- --check` | any rustfmt diff |
+| **Clippy** | `cargo clippy --workspace` | errors (warnings are shown, not blocking) |
+| **Test** | `cargo test --workspace` | any failing test. The job adds swap first, because the generated RRC codecs need the memory |
 
-> **Docker jobs are opt-in.** `docker-build` (and the dependent `docker-e2e`/`docker-e2e-epc`) run **only on manual `workflow_dispatch`** (Actions tab → Run workflow), not on push/PR — they recompile both workspaces in a container and need a cross-repo checkout, so they are too heavy/fragile for every commit. The fast gate (Check/Format/Clippy/Test) protects every push/PR.
+**Feature-gated jobs** (every push and PR). A default build compiles none of
+these surfaces, so each has its own job that turns the feature on and runs its
+tests (and usually clippy):
 
-The end-to-end data-plane validation lives in the **nextgcore** repo
-(`nextgcore/docker/rust/e2e.sh`), which runs this simulator's gNB + UE against the 22-NF core.
+| Job | Feature(s) | Crates |
+|-----|------------|--------|
+| Event bus | `event-bus` | `nextgsim-common`, `nextgsim-gnb` (with `6g`), `nextgsim-ue` |
+| Model registry | `model-registry` | `nextgsim-ai`, `nextgsim-nwdaf`, `nextgsim-semantic` |
+| UUAA-MM | `uuaa-mm` | `nextgsim-ue` |
+| 6G crates | `6g` | `nextgsim-gnb` |
+| DRB PDCP | `drb-pdcp` | `nextgsim-pdcp`, `nextgsim-gnb`, `nextgsim-ue`, the end-to-end test |
+| LTE eNB kernel SCTP | `kernel-sctp` (installs libsctp) | `nextgsim-enb` |
+| UP security | `up-security` | `nextgsim-pdcp`, `nextgsim-gnb`, `nextgsim-ue`, the end-to-end test |
+| SDAP data plane | `sdap-dataplane` | `nextgsim-pdcp`, `nextgsim-gtp`, `nextgsim-gnb`, `nextgsim-ue` |
+| Sidelink facade | `sidelink` | `nextgsim-ue` |
+| AS security | config-gated (`as_security_enabled`) | `nextgsim-pdcp`, `nextgsim-ue`, `nextgsim-gnb` |
+| Sidelink ranging | `sidelink` | `ranging_report_e2e`, `nextgsim-ue` |
+| Sidelink PC5 procedures | `sidelink` | `sidelink_pc5_e2e`, `nextgsim-ue`, `nextgsim-rrc`, `nextgsim-rlc` (SRAP) |
+| Post-quantum crypto | `pqc` | `nextgsim-crypto`, including the FIPS 203/204 known-answer tests |
+
+**Heavy jobs** (nightly and manual dispatch only):
+
+| Job | What it does |
+|-----|--------------|
+| **Docker Build** | Builds `nr-gnb`, `nr-ue`, `lte-enb` (with `kernel-sctp`) and `lte-ue`, then the four images `nextgsim/nr-gnb`, `nextgsim/nr-ue`, `nextgsim/lte-enb`, `nextgsim/lte-ue`, and checks each exists |
+| **Interop E2E** | Checks out nextgcore `main`, builds both workspaces with nextgcore's builder, starts the 5GC, and registers a real UE through this repo's gNB over N2 |
+
+The nightly runs an hour after nextgcore's (04:00 UTC), so it tests a
+nextgcore commit that its own nightly has just validated. nextgcore's nightly
+in turn builds this repo's `main` and runs the deeper cross-repo suite: the
+data-plane ping, the UE-flow gate (paging, idle uplink, de-registration,
+network-triggered re-registration) and the EPC stage (LTE attach and ping). See
+[nextgcore-integration.md](nextgcore-integration.md#nightly-ue-flow-gate-and-the-epc-stage).
 
 ### `pages.yml`
 
-Deploys `docs/` to GitHub Pages **only when a release is published** (`on: release: [published]`,
-plus `workflow_dispatch` for manual re-deploys) — not on every `docs/**` push.
+Deploys `docs/` to GitHub Pages **only when a release is published**
+(`on: release: [published]`, plus `workflow_dispatch` for a manual re-deploy).
+The mdBook under `docs-book/` builds into `docs/book/`, which is committed, so
+rebuild it (`mdbook build docs-book`) in the same change as any edit under
+`docs-book/src/`.
 
-## Branch triggers
+### `release.yml`
 
-`ci.yml` runs on push + PR to the default release branch **`main`** and the development branch
-**`first_implementation`** (`branches: [first_implementation, main]`). `pages.yml` is not
-branch-triggered — it deploys the docs site when a release is published.
+Manual dispatch only. It releases this repo as a commit pair that nextgcore's
+cross-repo E2E validated:
 
-## Local pre-push gate (mirror of CI)
+| Input | Meaning |
+|-------|---------|
+| `version` | Version to release this repo as, for example `0.2.0`. Independent of nextgcore's |
+| `validated_run_id` | The nextgcore CI run whose `validated-pair.json` authorises the release |
+| `paired_version` | The nextgcore version released alongside, recorded in the tag message |
+| `dry_run` | Validate and print everything without committing, tagging or publishing (default `true`) |
+
+It fetches the manifest from that nextgcore run, refuses a sha that is no
+longer on the branch or a tag that already exists, generates the release notes
+from `git log <previous tag>..<sha>` grouped by commit prefix, bumps
+`[workspace.package] version` in `Cargo.toml` and asserts the bump, then
+commits, tags, pushes and runs `gh release create`.
+
+## Local pre-push gate (mirror of the fast gate)
 
 ```bash
 cargo fmt --all -- --check
@@ -37,16 +85,19 @@ cargo clippy --workspace
 cargo test --workspace
 ```
 
-Full data-plane E2E (from the nextgcore repo): `cd ../nextgcore/docker/rust && ./e2e.sh`.
+Add the feature jobs that touch your change, for example
+`cargo test -p nextgsim-ue --features sidelink`. The full data-plane E2E runs
+from the nextgcore repo: `cd ../nextgcore/docker/rust && ./e2e.sh`.
 
 ## Cutting a release
 
-1. Green CI + matched-sim E2E (via nextgcore `e2e.sh`).
-2. Bump versions in the workspace `Cargo.toml`(s). Current: `0.1.0`.
-3. Promote `## [Unreleased]` in `CHANGELOG.md` to a dated `## [X.Y.Z]`; add a fresh Unreleased.
-4. Commit (`Signed-off-by: Murat Parlakisik <parlakisik@gmail.com>`), tag `X.Y.Z`, push the tag.
-5. `gh release create X.Y.Z --repo NextgCoreLab/nextgsim --title "NextgSim X.Y.Z" --notes-file …`
-   using the CHANGELOG section as notes.
+1. A green nightly in nextgcore whose `validated-pair.json` names the nextgsim
+   commit to release.
+2. Promote `## [Unreleased]` in `CHANGELOG.md` to a dated `## [X.Y.Z]` section
+   and merge that. `release.yml` does not edit the CHANGELOG.
+3. Run `release.yml` with `dry_run: true`, read the output, then again with
+   `dry_run: false`. It bumps the version, tags `X.Y.Z` and publishes the GitHub
+   release, which triggers `pages.yml`.
 
-> Keep the honest framing: matched-sim validated (not real-peer / not certified); 6G crates are
-> research prototypes, disabled by default.
+> Keep the honest framing: matched-sim validated (not real-peer, not
+> certified); the 6G crates are research prototypes, disabled by default.

@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "../searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -307,15 +307,22 @@ raises <code>CellDiscovered { cell_id, dbm }</code> and the RLS task forwards
 <code>RrcMessage::SignalChanged</code> to the RRC task. Loss detection is by timeout: a
 cell unseen for <code>heartbeat_threshold</code> (2000 ms) becomes <code>CellLost</code>, which — if
 it was the serving cell — raises a <code>RadioLinkFailure</code>.</p>
-<h3 id="3-cell-selection-and-fabricated-system-information"><a class="header" href="#3-cell-selection-and-fabricated-system-information">3. Cell selection and fabricated system information</a></h3>
+<h3 id="3-cell-selection-and-system-information"><a class="header" href="#3-cell-selection-and-system-information">3. Cell selection and system information</a></h3>
 <p>The UE RRC task (<code>nextgsim-ue/src/rrc/task.rs</code>) handles <code>SignalChanged</code> in
 <code>handle_signal_changed</code> → <code>CellSelector::handle_signal_change</code>
-(<code>nextgsim-ue/src/rrc/cell_selection.rs</code>). On a newly detected cell it calls
+(<code>nextgsim-ue/src/rrc/cell_selection.rs</code>).</p>
+<p>The gNB <strong>does broadcast</strong> real UPER MIB and SIB1 on BCCH (TS 38.331 §5.2.1,
+<code>si_broadcast_period_ms</code>, default 80/160 ms), and the UE decodes them in
+<code>handle_broadcast_mib</code> / <code>handle_broadcast_sib1</code>, taking the cell’s PLMN, TAC and
+NR Cell Identity off the air.</p>
+<p>Until a broadcast arrives, a newly detected cell still gets
 <code>provide_simulated_system_info</code>, which <strong>fabricates the MIB and SIB1 locally</strong>
 (not barred, not reserved, <code>q_rx_lev_min = -70</code>, PLMN = the UE’s configured
-HPLMN, and the SNPN NID only when <code>snpn_config</code> is set). This is a deliberate
-simplification: there is no on-air SIB broadcast, so the UE synthesises just
-enough system information to make the discovered cell selectable.</p>
+HPLMN, and the SNPN NID only when <code>snpn_config</code> is set) so heartbeat-only
+discovery keeps working. Two things suppress the fabrication: a cell that has
+broadcast its own system information (which must not be overwritten by an
+assumption), and <code>require_broadcast_sib1</code>, which makes the UE wait for the real
+broadcast and select on what the cell actually advertises.</p>
 <p><code>perform_cell_selection</code> runs <code>CellSelector::perform_cell_selection</code> (cited
 against TS 38.304 §5.2 per code comments): after a 1 s startup delay it looks
 for a <em>suitable</em> cell (SIB1 present, PLMN matches the NAS-selected PLMN, not
@@ -378,7 +385,7 @@ keeping the matched path default-safe), transitions the RRC state machine to
 <p><code>send_rrc_setup_complete</code> (UE RRC task) takes the stored <code>initial_nas_pdu</code> and
 encodes an <strong>RRCSetupComplete</strong> via <code>encode_rrc_setup_complete</code> with
 <code>dedicated_nas_message = &lt;Registration Request&gt;</code>, <code>selected_plmn_identity = 1</code>,
-and the echoed transaction id pinned to <code>0</code>. The RedCap indication rides here
+and the RRCSetup’s transaction id echoed back. The RedCap indication rides here
 when <code>config.redcap</code> is set. It is sent on <strong>UL-DCCH</strong> (SRB1).</p>
 <p>The gNB’s <code>handle_ul_dcch_message</code> tries an <strong>ASN.1-first</strong> decode with
 <code>decode_rrc_setup_complete</code>; on success it routes to
@@ -517,43 +524,36 @@ comments), so both ends arrive at identical RRC keys. The UE RRC handler
 <code>handle_as_security_mode_command</code> (<code>nextgsim-ue/src/rrc/task.rs</code>) then
 <code>derive_from_kgnb</code>s and replies SecurityModeComplete.</p>
 <blockquote>
-<p><strong>Caveat (honesty):</strong> the UE-side AS SecurityModeCommand handling is gated
-behind the compile-time flag <code>I5_UE_AS_SECURITY</code> (<code>nextgsim-ue/src/rrc/security.rs</code>),
-<strong>default off</strong>. With the flag off — the matched-sim default and the E2E path —
-the gNB still derives AS keys and emits the RRC SecurityModeCommand, but the
-UE’s legacy DL-DCCH nibble dispatcher misroutes the gNB’s ASN.1 SMC rather than
-completing typed AS security (this exact behavior is pinned as the red/green
-baseline in <code>tests/src/rrc_handshake.rs</code>). Because RLS/RLC do not actually
-cipher SRBs/DRBs in the sim, registration and the user plane still complete;
-full UE↔gNB AS-security completion is a tracked Wave-6 residue (I5), not a
-claim of this default path.</p>
+<p><strong>Caveat (honesty):</strong> AS security is a runtime switch,
+<code>as_security_enabled</code>, on both gNB and UE, <strong>off</strong> in the shipped configs.
+(It replaced the compile-time constant <code>I5_UE_AS_SECURITY</code>.) With it off the
+gNB still derives the AS keys and sends the RRC SecurityModeCommand and the UE
+still answers SecurityModeComplete, but nothing is integrity-protected or
+ciphered on SRB1; the gNB logs that it is “confirmed at RRC framing level
+only”. With it on, SRB1 is protected in both directions through the shared
+PDCP layer (<code>nextgsim-pdcp</code>), and the CI <code>as-security</code> job covers it.</p>
 </blockquote>
 <h2 id="simplifications--known-gaps"><a class="header" href="#simplifications--known-gaps">Simplifications &amp; known gaps</a></h2>
 <p>Grounded in the code, these are the honest deviations from a textbook TS 23.502
 registration:</p>
 <ul>
-<li><strong>Simulated radio and system information.</strong> RLS models signal strength as
-<code>-distance</code> (<code>GnbCellTracker::estimate_dbm</code>) over UDP; there is no MIB/SIB
-broadcast. The UE <em>fabricates</em> SIB1/MIB locally in
-<code>provide_simulated_system_info</code> (<code>nextgsim-ue/src/rrc/task.rs</code>) so the cell is
-selectable — TS 38.304 cell selection runs, but on synthesised inputs.</li>
+<li><strong>Simulated radio, real system information.</strong> RLS models signal strength as
+<code>-distance</code> (<code>GnbCellTracker::estimate_dbm</code>) over UDP — there is no PHY. The
+MIB/SIB1 broadcast IS real (UPER on BCCH, <code>si_broadcast_period_ms</code>), so TS
+38.304 cell selection runs on the cell’s advertised PLMN/TAC/NCI once a
+broadcast has been received. Before that, or with the broadcast disabled, the UE
+falls back to <code>provide_simulated_system_info</code>, which synthesises those values —
+set <code>require_broadcast_sib1</code> to refuse the fallback.</li>
 <li><strong>5G-AKA only on the live path.</strong> <code>handle_authentication_request</code> runs
 MILENAGE-based 5G-AKA. <code>handle_eap_aka_prime_challenge</code> is only reached if the
 Authentication Request omits RAND/AUTN and carries an EAP-message IE, which the
 matched core does not do.</li>
-<li><strong>AS security default-off on the UE (I5).</strong> See the caveat above:
-<code>I5_UE_AS_SECURITY</code> gates the UE’s typed AS SMC handling; the default path
-leaves AS security key-derived-but-not-completed on the UE, tolerated because
-the simulated air interface does not cipher.</li>
-<li><strong>RRC transaction ids pinned to 0.</strong> Both the gNB’s RRCSetup/SMC tids and the
-UE’s echoed RRCSetupComplete tid are pinned to <code>0</code> while
-<code>C5_TYPED_DCCH_DISPATCH</code> (<code>nextgsim-gnb/src/rrc/transaction.rs</code>) is off, to stay
-nibble-safe on the legacy dispatchers. The full per-UE <code>0..3</code> cycle only lands
-with C5.</li>
-<li><strong>Bespoke DCCH framing alongside ASN.1.</strong> The gNB accepts both real UPER
-UL-DCCH and a bespoke fallback (<code>[0x04, tid, 0x01, NAS…]</code>), and emits DL NAS as
-a bespoke <code>[0x04,0x00,0x00,NAS…]</code> container unless C5 is on. These legacy paths
-are slated for retirement (C6) and exist for matched-sim interop.</li>
+<li><strong>AS security off by default.</strong> See the caveat above.</li>
+<li><strong>A bespoke UL-DCCH fallback is still accepted.</strong> The gNB decodes real UPER
+UL-DCCH first and only then tries the old bespoke RRCSetupComplete framing
+(<code>[0x04, tid, 0x01, NAS…]</code>). With <code>C5_TYPED_DCCH_DISPATCH = true</code>
+(<code>nextgsim-gnb/src/rrc/transaction.rs</code>) DL NAS goes out as a real UPER DL
+Information Transfer and transaction ids cycle per UE.</li>
 <li><strong>Identity procedure normally skipped.</strong> The matched UE sends its SUCI directly
 in the initial Registration Request, so no Identity Request/Response runs on the
 happy path.</li>
@@ -598,12 +598,12 @@ to the original Registration Request. <code>tests/src/ue_registration.rs</code> 
 <code>tests/src/e2e_scenario.rs</code> (<code>test_e2e_ue_registration_flow</code>) exercise the
 registration path through the task graph.</p>
 <p><strong>Matched-simulator docker E2E.</strong> <code>nextgsim/docker/docker-compose.yml</code> brings up
-the prebuilt <code>nr-gnb</code>/<code>nr-ue</code> (<code>docker/binaries/</code>) on the <code>nextgcore_core</code>
-network and runs them against nextgcore; the end-to-end driver script lives in
+the <code>nr-gnb</code>/<code>nr-ue</code> images (built from prebuilt binaries in <code>binaries/</code>) on the
+<code>rust_core</code> network and runs them against nextgcore; the end-to-end driver script lives in
 the nextgcore repo (<code>nextgcore/docker/rust/e2e.sh</code>). That suite asserts the
 registration flow through source-anchored log lines (<code>Sending Registration Request</code> … <code>Registration Accept: UE is now …</code> … <code>Sending Registration Complete</code>)
 and then verifies the data plane by pinging <strong>through the UE’s GTP-U tunnel</strong>,
-finishing at an active PDU session — <strong>84/84 green</strong> as of the last baseline. This
+finishing at an active PDU session; it runs nightly in nextgcore’s CI. This
 is functional validation against a cooperative peer; it is not third-party
 conformance certification. See <a href="../getting-started.html">Getting Started</a> for the
 run recipe and <a href="../configuration.html">Configuration Reference</a> for the knobs that
@@ -657,7 +657,7 @@ must match between gNB and UE for registration to succeed.</p>
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

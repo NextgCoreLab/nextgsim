@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -178,194 +178,218 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="nextgsim-configuration-reference"><a class="header" href="#nextgsim-configuration-reference">nextgsim Configuration Reference</a></h1>
-<p>This document provides a comprehensive reference for all configuration options available in nextgsim for both gNB (gNodeB) and UE (User Equipment) simulators.</p>
+<p>This is the reference for the YAML configuration files of the four simulator
+binaries: <code>nr-gnb</code>, <code>nr-ue</code>, <code>lte-enb</code> and <code>lte-ue</code>. The key names, types and
+defaults below are read from the structs the files deserialize into:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Binary</th><th>Struct</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nr-gnb</code></td><td><code>GnbConfig</code></td><td><code>nextgsim-common/src/config.rs</code></td></tr>
+<tr><td><code>nr-ue</code></td><td><code>UeConfig</code> (and <code>SessionConfig</code>)</td><td><code>nextgsim-common/src/config.rs</code></td></tr>
+<tr><td><code>lte-enb</code></td><td><code>EnbConfig</code></td><td><code>nextgsim-enb/src/config.rs</code></td></tr>
+<tr><td><code>lte-ue</code></td><td><code>LteUeConfig</code></td><td><code>nextgsim-lte-ue/src/config.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>When this page and a struct disagree, the struct wins: every field carries a
+doc comment with the full rationale, which this page shortens.</p>
 <h2 id="configuration-file-format"><a class="header" href="#configuration-file-format">Configuration File Format</a></h2>
-<p>Configuration files use YAML format. The configuration is loaded at startup and cannot be changed at runtime.</p>
-<pre><code class="language-bash"># gNB
-./nextgsim-gnb -c config/gnb.yaml
-
-# UE
-./nextgsim-ue -c config/ue.yaml
+<p>Configuration files are YAML, loaded once at startup.</p>
+<pre><code class="language-bash">nr-gnb -c config/gnb.yaml
+nr-ue  -c config/ue.yaml
+lte-enb -c config/enb.yaml
+lte-ue  -c config/lte-ue.yaml
 </code></pre>
+<p>Format rules that are easy to get wrong:</p>
+<ul>
+<li><strong><code>nci</code> is an integer.</strong> Write it unquoted, in hex or decimal
+(<code>nci: 0x000000010</code>). A quoted <code>'0x000000010'</code> is a string and is refused.</li>
+<li><strong>Keys are byte arrays.</strong> <code>key</code> and <code>op</code> are 16 bytes and <code>amf</code> is 2 bytes,
+written as YAML sequences (<code>amf: [0x80, 0x00]</code>), not hex strings.</li>
+<li><strong><code>supi</code> is a mapping</strong>, <code>{ supi_type: Imsi, value: "999700000000001" }</code>, not an
+<code>imsi-...</code> string. (The <code>-i/--imsi</code> command-line override does take the
+<code>imsi-</code> form.)</li>
+<li><strong>Enum spellings are the Rust variant names</strong>: <code>op_type: Opc</code> or <code>Op</code>;
+session <code>type: Ipv4</code>, <code>Ipv6</code>, <code>Ipv4v6</code>, <code>Unstructured</code> or <code>Ethernet</code>.</li>
+<li><strong><code>plmn</code> / <code>hplmn</code> need all three keys</strong>: <code>mcc</code>, <code>mnc</code> and <code>long_mnc</code>.</li>
+<li><strong>An S-NSSAI</strong> is <code>{ sst: 1, sd: null }</code> or <code>{ sst: 1, sd: [0, 0, 1] }</code>.</li>
+<li>A key not listed here is ignored silently (no struct sets
+<code>deny_unknown_fields</code>), so a misspelt optional key has no effect.</li>
+</ul>
+<p>“Required” below means the file is refused without the key. A key marked
+optional takes the default shown when absent.</p>
+<p>The shipped files in <code>config/</code> all parse and are the best starting point:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Use</th></tr>
+</thead>
+<tbody>
+<tr><td><code>gnb.yaml</code>, <code>ue.yaml</code></td><td>gNB and UE on the nextgcore Docker network (172.23.0.0/24)</td></tr>
+<tr><td><code>gnb-docker.yaml</code>, <code>ue-docker.yaml</code></td><td>Mounted by <code>docker/docker-compose.yml</code></td></tr>
+<tr><td><code>gnb-local.yaml</code>, <code>ue-local.yaml</code></td><td>gNB and UE on the host (RLS over 127.0.0.1) against the Docker AMF</td></tr>
+<tr><td><code>gnb-kernel.yaml</code></td><td>Kernel-SCTP N2 (<code>sctp_backend: kernel</code>)</td></tr>
+<tr><td><code>enb.yaml</code>, <code>lte-ue.yaml</code></td><td>LTE eNB and UE for nextgcore’s EPC network (172.24.0.0/24)</td></tr>
+<tr><td><code>features/*.yaml</code></td><td>Rel-17/18 scenarios: RedCap, XR, MINT, SNPN accept/reject, UAV allow/deny</td></tr>
+</tbody>
+</table>
+</div>
 <hr>
 <h2 id="gnb-configuration"><a class="header" href="#gnb-configuration">gNB Configuration</a></h2>
-<p>The gNB configuration defines parameters for the 5G base station simulator.</p>
-<h3 id="complete-example"><a class="header" href="#complete-example">Complete Example</a></h3>
-<pre><code class="language-yaml"># NR Cell Identity (36-bit value, hex or decimal)
-nci: '0x000000010'
-
-# gNB ID length in bits (22-32)
-gnb_id_length: 24
-
-# Public Land Mobile Network identifier
+<h3 id="example"><a class="header" href="#example">Example</a></h3>
+<p>Cut down from <code>config/gnb.yaml</code>; it parses as it stands.</p>
+<pre><code class="language-yaml">nci: 0x000000010            # NR Cell Identity (36-bit)
+gnb_id_length: 32           # 22..32
 plmn:
-  mcc: 001
-  mnc: 01
+  mcc: 999
+  mnc: 70
   long_mnc: false
-
-# Tracking Area Code (24-bit)
 tac: 1
-
-# Network Slice Selection Assistance Information
 nssai:
   - sst: 1
-    sd: [0, 0, 1]
-  - sst: 2
-
-# AMF connection configurations
+    sd: null
 amf_configs:
-  - address: 127.0.0.5
+  - address: 172.23.0.5     # an IP address or a hostname
     port: 38412
-
-# IP addresses for interfaces
-link_ip: 127.0.0.1
-ngap_ip: 127.0.0.1
-gtp_ip: 127.0.0.1
-gtp_advertise_ip: null
-
-# SCTP stream handling
+sctp_backend: userspace     # or kernel
+link_ip: 172.23.0.100       # RLS (radio) socket
+ngap_ip: 172.23.0.100       # N2
+gtp_ip: 172.23.0.100        # N3
 ignore_stream_ids: false
+upf_addr: 172.23.0.7
+upf_port: 2152
+si_broadcast_period_ms: 80
 </code></pre>
-<h3 id="parameter-reference"><a class="header" href="#parameter-reference">Parameter Reference</a></h3>
-<h4 id="cell-identity"><a class="header" href="#cell-identity">Cell Identity</a></h4>
+<h3 id="core-parameters"><a class="header" href="#core-parameters">Core parameters</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>nci</code></td><td>u64</td><td>Yes</td><td>-</td><td>NR Cell Identity (36-bit value). Can be specified in hex (<code>'0x000000010'</code>) or decimal. The NCI contains both the gNB ID and Cell ID.</td></tr>
-<tr><td><code>gnb_id_length</code></td><td>u8</td><td>Yes</td><td>-</td><td>Length of the gNB ID portion within the NCI, in bits. Valid range: 22-32. The Cell ID uses the remaining bits (36 - gnb_id_length).</td></tr>
+<tr><td><code>nci</code></td><td>u64</td><td>Yes</td><td>-</td><td>NR Cell Identity, at most 36 bits (validated). The upper <code>gnb_id_length</code> bits are the gNB ID, the rest the cell ID</td></tr>
+<tr><td><code>gnb_id_length</code></td><td>u8</td><td>Yes</td><td>-</td><td>gNB ID length in bits, 22..32 (validated)</td></tr>
+<tr><td><code>plmn</code></td><td>object</td><td>Yes</td><td>-</td><td><code>mcc</code>, <code>mnc</code>, <code>long_mnc</code> (all three required)</td></tr>
+<tr><td><code>tac</code></td><td>u32</td><td>Yes</td><td>-</td><td>Tracking Area Code, 1..16777215 (validated: 0 is refused)</td></tr>
+<tr><td><code>nssai</code></td><td>list of S-NSSAI</td><td>Yes</td><td>-</td><td>Slices this gNB supports</td></tr>
+<tr><td><code>amf_configs</code></td><td>list</td><td>Yes</td><td>-</td><td>At least one AMF (validated)</td></tr>
+<tr><td><code>amf_configs[].address</code></td><td>string</td><td>Yes</td><td>-</td><td>IP address <strong>or hostname</strong> (for example a Kubernetes Service name). A hostname is resolved on connect and on every reconnect, so an AMF that restarts at a new address is found again</td></tr>
+<tr><td><code>amf_configs[].port</code></td><td>u16</td><td>Yes</td><td>-</td><td>SCTP port, normally 38412</td></tr>
+<tr><td><code>amf_configs[].secondary_addresses</code></td><td>list of string</td><td>No</td><td><code>[]</code></td><td>Extra AMF addresses for SCTP multi-homing</td></tr>
+<tr><td><code>link_ip</code></td><td>IP</td><td>Yes</td><td>-</td><td>Local address of the RLS (radio) UDP socket, port 4997</td></tr>
+<tr><td><code>ngap_ip</code></td><td>IP</td><td>Yes</td><td>-</td><td>Local address for N2</td></tr>
+<tr><td><code>gtp_ip</code></td><td>IP</td><td>Yes</td><td>-</td><td>Local address for N3 GTP-U (port 2152)</td></tr>
+<tr><td><code>gtp_advertise_ip</code></td><td>IP</td><td>No</td><td>none</td><td>GTP-U address advertised to the core instead of <code>gtp_ip</code> (NAT)</td></tr>
+<tr><td><code>ignore_stream_ids</code></td><td>bool</td><td>Yes</td><td>-</td><td>Ignore SCTP stream-id mismatches</td></tr>
+<tr><td><code>sctp_backend</code></td><td><code>userspace</code> | <code>kernel</code></td><td>No</td><td><code>userspace</code></td><td><code>userspace</code> is the in-process <code>sctp-proto</code> over UDP, which only nextgcore’s matching backend speaks. <code>kernel</code> is real SCTP (IP protocol 132) via libsctp; it needs a Linux build with <code>--features kernel-sctp</code> and fails loudly at run time otherwise. Use it for a real AMF</td></tr>
+<tr><td><code>upf_addr</code></td><td>string</td><td>No</td><td>none</td><td>UPF GTP-U address (IP or hostname). Unset puts the GTP task in loopback mode (it echoes user data back to the UE)</td></tr>
+<tr><td><code>upf_port</code></td><td>u16</td><td>No</td><td>2152</td><td>UPF GTP-U port</td></tr>
 </tbody>
 </table>
 </div>
-<p>The NCI is split into:</p>
-<ul>
-<li><strong>gNB ID</strong>: Upper <code>gnb_id_length</code> bits</li>
-<li><strong>Cell ID</strong>: Lower <code>(36 - gnb_id_length)</code> bits</li>
-</ul>
-<p>Example: With <code>nci: 0x123456789</code> and <code>gnb_id_length: 24</code>:</p>
-<ul>
-<li>gNB ID = <code>0x123456</code> (upper 24 bits)</li>
-<li>Cell ID = <code>0x789</code> (lower 12 bits)</li>
-</ul>
-<h4 id="plmn-configuration"><a class="header" href="#plmn-configuration">PLMN Configuration</a></h4>
+<h3 id="n2-n3-and-timers"><a class="header" href="#n2-n3-and-timers">N2, N3 and timers</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>plmn.mcc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Mobile Country Code (3 digits, 000-999)</td></tr>
-<tr><td><code>plmn.mnc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Mobile Network Code (2 or 3 digits)</td></tr>
-<tr><td><code>plmn.long_mnc</code></td><td>bool</td><td>No</td><td>false</td><td>Set to <code>true</code> if MNC is 3 digits (e.g., MNC 001 vs MNC 01)</td></tr>
+<tr><td><code>ngap_tngreloc_overall_secs</code></td><td>u64</td><td>5</td><td>TNGRELOCoverall: wait for UE Context Release Command after a UE Context Release Request (TS 38.413 §8.3.3.4)</td></tr>
+<tr><td><code>ngap_tngreloc_prep_secs</code></td><td>u64</td><td>10</td><td>TNGRELOCprep: how long handover preparation may stay in flight (TS 38.413 §8.4.1.2)</td></tr>
+<tr><td><code>gtpu_echo_period_secs</code></td><td>u64</td><td>0</td><td>GTP-U Echo period for N3 path supervision (TS 29.281 §7.2.1). 0 disables the prober</td></tr>
+<tr><td><code>gtpu_echo_max_misses</code></td><td>u32</td><td>3</td><td>Unanswered Echo periods before the N3 path is declared down</td></tr>
+<tr><td><code>gtpu_restart_counter_path</code></td><td>path</td><td>none</td><td>File that keeps the GTP-U Recovery restart counter across restarts (TS 23.007). Unset advertises a fixed 0</td></tr>
+<tr><td><code>quic_enabled</code></td><td>bool</td><td>false</td><td>Research flag. A QUIC transport exists in <code>nextgsim-sctp</code>, but the SCTP task logs a warning and stays on SCTP when this is set</td></tr>
 </tbody>
 </table>
 </div>
-<h4 id="tracking-area"><a class="header" href="#tracking-area">Tracking Area</a></h4>
+<h3 id="radio-rrc-and-mobility"><a class="header" href="#radio-rrc-and-mobility">Radio, RRC and mobility</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>tac</code></td><td>u32</td><td>Yes</td><td>-</td><td>Tracking Area Code (24-bit value, 0-16777215)</td></tr>
+<tr><td><code>si_broadcast_period_ms</code></td><td>u64</td><td>80</td><td>BCCH period: MIB every period, SIB1 every second period</td></tr>
+<tr><td><code>reselection</code></td><td>object</td><td>see struct</td><td>Idle-mode reselection parameters broadcast in SIB2/SIB3/SIB4: <code>broadcast</code> (true), <code>q_hyst_db</code>, <code>t_reselection_s</code>, <code>cell_reselection_priority</code>, <code>s_intra_search_p</code>, <code>thresh_serving_low_p</code>, <code>intra_freq_neighbours</code>, <code>inter_freq_carriers</code> (<code>CellReselectionBroadcastConfig</code>)</td></tr>
+<tr><td><code>paging_default_cycle_frames</code></td><td>u16</td><td>128</td><td>Default paging cycle in radio frames (32, 64, 128 or 256), used when the AMF supplies no Paging DRX. Must match the UE’s value</td></tr>
+<tr><td><code>accept_raw_nas_on_dcch</code></td><td>bool</td><td>false</td><td>Accept a raw NAS PDU on UL-DCCH from a UE that never sent RRCSetupComplete. <code>false</code> is strict TS 38.331 behaviour</td></tr>
+<tr><td><code>as_security_enabled</code></td><td>bool</td><td>false</td><td>Activate AS security (SRB1 PDCP integrity and ciphering, TS 33.501 §6.5). Must match the UE’s value</td></tr>
+<tr><td><code>dl_arfcn</code></td><td>u32</td><td>632448</td><td>Downlink ARFCN of this cell, bound into the handover KgNB* derivation; both ends must hold the same value</td></tr>
+<tr><td><code>scell_phys_cell_id</code></td><td>u16</td><td>none</td><td><code>physCellId</code> of a secondary cell to configure on each UE (event A6)</td></tr>
+<tr><td><code>conditional_handover</code></td><td>bool</td><td>false</td><td>Nominate the configured intra-frequency neighbours as conditional-handover candidates</td></tr>
+<tr><td><code>cho_a3_offset_db</code></td><td>f64</td><td>3.0</td><td>CHO execution <code>a3-Offset</code> in dB</td></tr>
+<tr><td><code>cho_hysteresis_db</code></td><td>f64</td><td>1.0</td><td>CHO execution hysteresis in dB</td></tr>
+<tr><td><code>rlc_am_psis</code></td><td>list of u8</td><td><code>[]</code></td><td>PDU sessions whose DRB uses RLC Acknowledged Mode instead of Unacknowledged Mode. Must match the UE’s value</td></tr>
+<tr><td><code>ims_voice_over_nr</code></td><td>bool</td><td>false</td><td>Answer the AMF’s UE Radio Capability Check with “IMS voice supported” when the UE also supports it</td></tr>
+<tr><td><code>nrppa_serving_rsrp_dbm</code></td><td>i32</td><td>-85</td><td>SS-RSRP reported in an NRPPa E-CID measurement result (configured, not measured)</td></tr>
+<tr><td><code>nrppa_trp_ids</code></td><td>list of u16</td><td><code>[1]</code></td><td>TRP identities reported for NRPPa TRP Information Exchange</td></tr>
 </tbody>
 </table>
 </div>
-<h4 id="network-slicing-nssai"><a class="header" href="#network-slicing-nssai">Network Slicing (NSSAI)</a></h4>
+<h3 id="rel-1718-switches"><a class="header" href="#rel-1718-switches">Rel-17/18 switches</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>nssai</code></td><td>array</td><td>Yes</td><td>-</td><td>List of supported S-NSSAI (Single Network Slice Selection Assistance Information)</td></tr>
-<tr><td><code>nssai[].sst</code></td><td>u8</td><td>Yes</td><td>-</td><td>Slice/Service Type (0-255). Common values: 1=eMBB, 2=URLLC, 3=MIoT</td></tr>
-<tr><td><code>nssai[].sd</code></td><td>[u8; 3]</td><td>No</td><td>null</td><td>Slice Differentiator (24-bit). Specified as 3-byte array <code>[0, 0, 1]</code> or omitted</td></tr>
+<tr><td><code>ntn_config</code></td><td>object</td><td>none</td><td>Makes the cell an <strong>NTN cell</strong>: the gNB broadcasts <code>SIB19</code> (ephemeris, <code>common_ta_us</code>, <code>k_offset</code>, <code>ul_sync_validity_s</code>; TS 38.300 §16.4) and also sends it in an RRCReconfiguration’s <code>dedicatedSystemInformationDelivery</code>. A UE with <code>gnss_position_ecef_m</code> set then applies an uplink timing advance and Doppler pre-compensation (§16.14.2.2). Absent is a terrestrial cell</td></tr>
+<tr><td><code>ntn_config.ephemeris</code></td><td>object</td><td>600 km LEO over 0°N 0°E</td><td>The satellite’s ECEF <code>position_m</code> and <code>velocity_m_s</code>, broadcast as SIB19’s <code>ephemerisInfo</code>. A value outside <code>EphemerisInfo-r17</code>’s range is refused and no SIB19 is broadcast</td></tr>
+<tr><td><code>ntn_config.ul_sync_validity_s</code></td><td>u16</td><td>30</td><td><code>ntn-UlSyncValidityDuration</code> in seconds: one of 5..60 in steps of 5, 120, 180, 240, 900</td></tr>
+<tr><td><code>ntn_config</code> (other keys)</td><td></td><td></td><td><code>satellite_type</code>, <code>satellite_id</code>, <code>propagation_delay_us</code>, <code>common_ta_us</code>, <code>k_offset</code>, <code>cell_center_lat</code>, <code>cell_center_lon</code> and <code>cell_radius_km</code> are required inside the block; <code>earth_fixed</code>, <code>autonomous_ta</code> and <code>max_doppler_hz</code> are optional</td></tr>
+<tr><td><code>snpn_config</code></td><td>object</td><td>none</td><td>SNPN cell: <code>nid</code> (required inside the block), <code>cag_ids</code>, <code>onboarding_enabled</code></td></tr>
+<tr><td><code>mbs_enabled</code>, <code>prose_enabled</code>, <code>lcs_enabled</code>, <code>xr_qos_enabled</code>, <code>ai_ml_nr_enabled</code>, <code>ambient_iot_enabled</code>, <code>uav_enabled</code>, <code>ranging_enabled</code>, <code>energy_saving_enabled</code></td><td>bool</td><td>false</td><td>Rel-17/18 feature flags. <code>energy_saving_enabled</code> spawns the energy-saving task</td></tr>
 </tbody>
 </table>
 </div>
-<h4 id="amf-configuration"><a class="header" href="#amf-configuration">AMF Configuration</a></h4>
+<h3 id="6g-research-flags-gnb"><a class="header" href="#6g-research-flags-gnb">6G research flags (gNB)</a></h3>
+<p>These spawn research-prototype tasks, and only in a gNB built with
+<code>--features 6g</code>. All default to <code>false</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+<tr><th>Parameter</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>amf_configs</code></td><td>array</td><td>Yes</td><td>-</td><td>List of AMF (Access and Mobility Management Function) endpoints</td></tr>
-<tr><td><code>amf_configs[].address</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>IP address of the AMF (IPv4 or IPv6)</td></tr>
-<tr><td><code>amf_configs[].port</code></td><td>u16</td><td>Yes</td><td>-</td><td>SCTP port of the AMF (typically 38412 per 3GPP)</td></tr>
-</tbody>
-</table>
-</div>
-<p>Multiple AMFs can be configured for redundancy. The gNB will attempt to connect to each in order.</p>
-<h4 id="network-interfaces"><a class="header" href="#network-interfaces">Network Interfaces</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>link_ip</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>Local IP address for RLS (Radio Link Simulation) UDP interface</td></tr>
-<tr><td><code>ngap_ip</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>Local IP address for NGAP/SCTP interface (N2 interface to AMF)</td></tr>
-<tr><td><code>gtp_ip</code></td><td>IpAddr</td><td>Yes</td><td>-</td><td>Local IP address for GTP-U interface (N3 interface for user plane)</td></tr>
-<tr><td><code>gtp_advertise_ip</code></td><td>IpAddr</td><td>No</td><td>null</td><td>Advertised GTP IP address for NAT scenarios. If set, this IP is sent to the UPF instead of <code>gtp_ip</code></td></tr>
-</tbody>
-</table>
-</div>
-<h4 id="sctp-options"><a class="header" href="#sctp-options">SCTP Options</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>ignore_stream_ids</code></td><td>bool</td><td>No</td><td>false</td><td>If <code>true</code>, ignore SCTP stream ID errors. Useful for compatibility with some core network implementations</td></tr>
-</tbody>
-</table>
-</div>
-<h4 id="ntn-research-prototype"><a class="header" href="#ntn-research-prototype">NTN (research prototype)</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>ntn_config</code></td><td>object</td><td>No</td><td>null</td><td>Optional NTN (Non-Terrestrial Network) block. <strong>Currently logging-only/inert</strong>: the gNB parses and stores it, but it is not wired into live RRC/NGAP signaling — the NTN modules are non-normative research prototypes</td></tr>
+<tr><td><code>she_enabled</code></td><td>Service Hosting Environment task</td></tr>
+<tr><td><code>nwdaf_enabled</code></td><td>NWDAF analytics task</td></tr>
+<tr><td><code>nwdaf_model_path</code></td><td>ONNX trajectory-prediction model for the NWDAF task. No model ships; unset uses linear extrapolation</td></tr>
+<tr><td><code>nkef_enabled</code></td><td>NKEF knowledge-exposure task</td></tr>
+<tr><td><code>isac_enabled</code></td><td>ISAC sensing task</td></tr>
+<tr><td><code>isac_ekf_tracking</code></td><td>Track with the Extended Kalman Filter instead of the scalar smoother</td></tr>
+<tr><td><code>isac_ekf_process_noise_accel</code></td><td>EKF acceleration process noise; unset uses the crate default</td></tr>
+<tr><td><code>isac_anchors</code></td><td>Anchor positions <code>[x, y, z]</code> in metres; defaults to a 100 m triangle at 10 m height</td></tr>
+<tr><td><code>agent_enabled</code></td><td>AI agent framework task</td></tr>
+<tr><td><code>federated_learning_enabled</code></td><td>Federated-learning aggregator task</td></tr>
+<tr><td><code>pqc</code></td><td>Post-quantum settings (<code>enabled</code>, <code>kem_algorithm</code>, <code>sign_algorithm</code>, <code>hybrid_mode</code>). The primitives are real, but no NAS or RRC path consumes them yet</td></tr>
 </tbody>
 </table>
 </div>
 <hr>
 <h2 id="ue-configuration"><a class="header" href="#ue-configuration">UE Configuration</a></h2>
-<p>The UE configuration defines parameters for the 5G user equipment simulator.</p>
-<h3 id="complete-example-1"><a class="header" href="#complete-example-1">Complete Example</a></h3>
-<pre><code class="language-yaml"># Subscriber identity
-supi: 'imsi-001010000000001'
-
-# SUCI protection
-protection_scheme: 0
-home_network_public_key_id: 1
-home_network_public_key: '5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650'
-routing_indicator: '0000'
-
-# Home PLMN
+<h3 id="example-1"><a class="header" href="#example-1">Example</a></h3>
+<p>Cut down from <code>config/ue.yaml</code>; it parses as it stands.</p>
+<pre><code class="language-yaml">supi:
+  supi_type: Imsi
+  value: "999700000000001"
+protection_scheme: 0                 # 0 null, 1 Profile A, 2 Profile B
+home_network_public_key_id: 0
+home_network_public_key: []
+routing_indicator: "0000"
 hplmn:
-  mcc: 001
-  mnc: 01
+  mcc: 999
+  mnc: 70
   long_mnc: false
-
-# Authentication credentials
-key: '465B5CE8B199B49FAA5F0A2EE238A6BC'
-op: 'E8ED289DEBA952E4283B54E88E6183CA'
+key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
 op_type: Opc
-amf: '8000'
-
-# Device identity
-imei: '356938035643803'
-imei_sv: '4370816125816151'
-
-# Security algorithms
+amf: [0x80, 0x00]
+imei: "356938035643803"
+imei_sv: null
 supported_algs:
   nia1: true
   nia2: true
@@ -373,317 +397,240 @@ supported_algs:
   nea1: true
   nea2: true
   nea3: true
-
-# gNB discovery
 gnb_search_list:
-  - 127.0.0.1
-
-# PDU sessions
+  - "172.23.0.100"                    # IPs or hostnames, port 4997 by default
 sessions:
-  - type: IPv4
-    apn: internet
+  - type: Ipv4
     s_nssai:
       sst: 1
+      sd: null
+    apn: "internet"
     is_emergency: false
-
-# Network slicing
 configured_nssai:
   slices:
     - sst: 1
-      sd: [0, 0, 1]
-
-# TUN interface
-tun_name: uesimtun0
+      sd: null
+tun_name: null
 </code></pre>
-<h3 id="parameter-reference-1"><a class="header" href="#parameter-reference-1">Parameter Reference</a></h3>
-<h4 id="subscriber-identity"><a class="header" href="#subscriber-identity">Subscriber Identity</a></h4>
+<h3 id="core-parameters-1"><a class="header" href="#core-parameters-1">Core parameters</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>supi</code></td><td>string</td><td>No</td><td>null</td><td>Subscription Permanent Identifier. Format: <code>imsi-&lt;15 digits&gt;</code> (e.g., <code>imsi-001010000000001</code>)</td></tr>
-<tr><td><code>imei</code></td><td>string</td><td>No</td><td>null</td><td>International Mobile Equipment Identity (15 digits). Used if SUPI is not provided</td></tr>
-<tr><td><code>imei_sv</code></td><td>string</td><td>No</td><td>null</td><td>IMEI Software Version (16 digits). Used if SUPI and IMEI are not provided</td></tr>
+<tr><td><code>supi</code></td><td><code>{supi_type, value}</code></td><td>No</td><td>none</td><td>Subscription Permanent Identifier. <code>supi_type</code> is <code>Imsi</code> or <code>Nai</code></td></tr>
+<tr><td><code>protection_scheme</code></td><td>u8</td><td>Yes</td><td>-</td><td>SUCI scheme: 0 null, 1 Profile A (ECIES X25519), 2 Profile B (ECIES secp256r1). Validated 0..2</td></tr>
+<tr><td><code>home_network_public_key_id</code></td><td>u8</td><td>Yes</td><td>-</td><td>Home-network public key identifier</td></tr>
+<tr><td><code>home_network_public_key</code></td><td>list of u8</td><td>Yes</td><td>-</td><td>Home-network public key; <code>[]</code> for the null scheme. <code>config/ue.yaml</code> carries the TS 33.501 Annex C.4.3/C.4.4 test keys, commented out</td></tr>
+<tr><td><code>routing_indicator</code></td><td>string</td><td>No</td><td>none</td><td>SUCI routing indicator, 1..4 decimal digits</td></tr>
+<tr><td><code>hplmn</code></td><td>object</td><td>Yes</td><td>-</td><td>Home PLMN: <code>mcc</code>, <code>mnc</code>, <code>long_mnc</code></td></tr>
+<tr><td><code>key</code></td><td>16 bytes</td><td>Yes</td><td>-</td><td>Subscriber key K. All zeros is refused</td></tr>
+<tr><td><code>op</code></td><td>16 bytes</td><td>Yes</td><td>-</td><td>OP or OPc, per <code>op_type</code></td></tr>
+<tr><td><code>op_type</code></td><td><code>Op</code> | <code>Opc</code></td><td>Yes</td><td>-</td><td><code>Op</code> is converted to OPc at start-up</td></tr>
+<tr><td><code>amf</code></td><td>2 bytes</td><td>Yes</td><td>-</td><td>Authentication Management Field, normally <code>[0x80, 0x00]</code></td></tr>
+<tr><td><code>imei</code>, <code>imei_sv</code></td><td>string</td><td>No</td><td>none</td><td>Device identities</td></tr>
+<tr><td><code>supported_algs</code></td><td>object</td><td>Yes</td><td>-</td><td><code>nia1</code>, <code>nia2</code>, <code>nia3</code>, <code>nea1</code>, <code>nea2</code>, <code>nea3</code> (all six required)</td></tr>
+<tr><td><code>gnb_search_list</code></td><td>list of string</td><td>Yes</td><td>-</td><td>gNB RLS addresses: IPs or hostnames, optionally <code>:port</code> (default 4997). Hostnames are re-resolved periodically and on losing the cell. Must be non-empty (validated)</td></tr>
+<tr><td><code>sessions</code></td><td>list</td><td>Yes</td><td>-</td><td>PDU sessions to establish after registration; may be <code>[]</code></td></tr>
+<tr><td><code>configured_nssai</code></td><td><code>{slices: [...]}</code></td><td>Yes</td><td>-</td><td>Configured NSSAI</td></tr>
+<tr><td><code>tun_name</code></td><td>string</td><td>No</td><td>none</td><td>TUN interface name; unset gives <code>uesimtun&lt;N&gt;</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>At least one of <code>supi</code>, <code>imei</code>, or <code>imei_sv</code> should be provided for UE identification.</p>
-<h4 id="suci-protection-privacy"><a class="header" href="#suci-protection-privacy">SUCI Protection (Privacy)</a></h4>
+<h4 id="pdu-sessions-sessions"><a class="header" href="#pdu-sessions-sessions">PDU sessions (<code>sessions[]</code>)</a></h4>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>protection_scheme</code></td><td>u8</td><td>No</td><td>0</td><td>SUCI protection scheme: <code>0</code> = Null scheme (no encryption), <code>1</code> = Profile A (ECIES), <code>2</code> = Profile B</td></tr>
-<tr><td><code>home_network_public_key_id</code></td><td>u8</td><td>No</td><td>0</td><td>Identifier for the home network public key (0-255)</td></tr>
-<tr><td><code>home_network_public_key</code></td><td>string</td><td>No</td><td>“”</td><td>Home network public key for SUCI calculation (hex string). Required for protection schemes 1 and 2</td></tr>
-<tr><td><code>routing_indicator</code></td><td>string</td><td>No</td><td>null</td><td>Routing Indicator for SUCI (4 digits, e.g., <code>"0000"</code>)</td></tr>
+<tr><td><code>type</code></td><td>enum</td><td>Yes</td><td>-</td><td><code>Ipv4</code>, <code>Ipv6</code>, <code>Ipv4v6</code>, <code>Unstructured</code>, <code>Ethernet</code></td></tr>
+<tr><td><code>s_nssai</code></td><td>S-NSSAI</td><td>No</td><td>none</td><td>Slice for the session</td></tr>
+<tr><td><code>apn</code></td><td>string</td><td>No</td><td>none</td><td>DNN</td></tr>
+<tr><td><code>is_emergency</code></td><td>bool</td><td>Yes</td><td>-</td><td>Emergency PDU session</td></tr>
+<tr><td><code>requested_5qi</code></td><td>u8</td><td>No</td><td>none</td><td>An XR delay-critical GBR 5QI (82..85, Rel-18) requests an XR session; with no <code>apn</code> the UE picks the XR DNN (<code>xr</code> / <code>xr-split</code> / <code>xr-haptic</code>)</td></tr>
 </tbody>
 </table>
 </div>
-<h4 id="home-plmn"><a class="header" href="#home-plmn">Home PLMN</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>hplmn.mcc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Home PLMN Mobile Country Code (3 digits)</td></tr>
-<tr><td><code>hplmn.mnc</code></td><td>u16</td><td>Yes</td><td>-</td><td>Home PLMN Mobile Network Code (2 or 3 digits)</td></tr>
-<tr><td><code>hplmn.long_mnc</code></td><td>bool</td><td>No</td><td>false</td><td>Set to <code>true</code> if MNC is 3 digits</td></tr>
-</tbody>
-</table>
-</div>
-<h4 id="authentication-credentials"><a class="header" href="#authentication-credentials">Authentication Credentials</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>key</code></td><td>string</td><td>Yes</td><td>-</td><td>Subscriber key K (128-bit, 32 hex characters). Shared secret with the network</td></tr>
-<tr><td><code>op</code></td><td>string</td><td>Yes</td><td>-</td><td>Operator key OP or OPc (128-bit, 32 hex characters)</td></tr>
-<tr><td><code>op_type</code></td><td>enum</td><td>No</td><td><code>Opc</code></td><td>Type of operator key: <code>Op</code> (needs conversion to OPc) or <code>Opc</code> (used directly)</td></tr>
-<tr><td><code>amf</code></td><td>string</td><td>No</td><td><code>"8000"</code></td><td>Authentication Management Field (16-bit, 4 hex characters). Default <code>8000</code> per 3GPP</td></tr>
-</tbody>
-</table>
-</div>
-<h4 id="security-algorithms"><a class="header" href="#security-algorithms">Security Algorithms</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>supported_algs.nia1</code></td><td>bool</td><td>No</td><td>true</td><td>Support NIA1 (SNOW3G-based integrity)</td></tr>
-<tr><td><code>supported_algs.nia2</code></td><td>bool</td><td>No</td><td>true</td><td>Support NIA2 (AES-based integrity)</td></tr>
-<tr><td><code>supported_algs.nia3</code></td><td>bool</td><td>No</td><td>true</td><td>Support NIA3 (ZUC-based integrity)</td></tr>
-<tr><td><code>supported_algs.nea1</code></td><td>bool</td><td>No</td><td>true</td><td>Support NEA1 (SNOW3G-based ciphering)</td></tr>
-<tr><td><code>supported_algs.nea2</code></td><td>bool</td><td>No</td><td>true</td><td>Support NEA2 (AES-based ciphering)</td></tr>
-<tr><td><code>supported_algs.nea3</code></td><td>bool</td><td>No</td><td>true</td><td>Support NEA3 (ZUC-based ciphering)</td></tr>
-</tbody>
-</table>
-</div>
-<p>The network selects algorithms based on UE capabilities and network policy. NIA0/NEA0 (null algorithms) are always supported.</p>
-<h4 id="gnb-discovery"><a class="header" href="#gnb-discovery">gNB Discovery</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>gnb_search_list</code></td><td>array</td><td>Yes</td><td>-</td><td>List of gNB IP addresses to search for via RLS heartbeats</td></tr>
-</tbody>
-</table>
-</div>
-<p>The UE sends heartbeat messages to all addresses in this list and connects to the gNB with the strongest signal.</p>
-<h4 id="pdu-sessions"><a class="header" href="#pdu-sessions">PDU Sessions</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>sessions</code></td><td>array</td><td>No</td><td>[]</td><td>List of PDU sessions to establish after registration</td></tr>
-<tr><td><code>sessions[].type</code></td><td>enum</td><td>No</td><td><code>Ipv4</code></td><td>PDU session type: <code>Ipv4</code>, <code>Ipv6</code>, <code>Ipv4v6</code>, <code>Unstructured</code>, <code>Ethernet</code></td></tr>
-<tr><td><code>sessions[].apn</code></td><td>string</td><td>No</td><td>null</td><td>Access Point Name (Data Network Name)</td></tr>
-<tr><td><code>sessions[].s_nssai</code></td><td>object</td><td>No</td><td>null</td><td>S-NSSAI for the session</td></tr>
-<tr><td><code>sessions[].s_nssai.sst</code></td><td>u8</td><td>Yes</td><td>-</td><td>Slice/Service Type</td></tr>
-<tr><td><code>sessions[].s_nssai.sd</code></td><td>[u8; 3]</td><td>No</td><td>null</td><td>Slice Differentiator</td></tr>
-<tr><td><code>sessions[].is_emergency</code></td><td>bool</td><td>No</td><td>false</td><td>Whether this is an emergency session</td></tr>
-<tr><td><code>sessions[].requested_5qi</code></td><td>u8</td><td>No</td><td>null</td><td>Requested 5QI for the session. Set to an XR delay-critical GBR 5QI (<code>82</code>-<code>85</code>, Rel-18) to request an XR flow; with no <code>apn</code>, the UE auto-selects the matching XR DNN (<code>xr</code>/<code>xr-split</code>/<code>xr-haptic</code>) so the SMF installs an XR QoS flow. See <a href="#rel-1718-feature-configuration-ue">Rel-17/18 Features</a>.</td></tr>
-</tbody>
-</table>
-</div>
-<h4 id="network-slicing"><a class="header" href="#network-slicing">Network Slicing</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>configured_nssai</code></td><td>object</td><td>No</td><td>empty</td><td>Configured NSSAI for this UE by HPLMN</td></tr>
-<tr><td><code>configured_nssai.slices</code></td><td>array</td><td>No</td><td>[]</td><td>List of configured S-NSSAIs</td></tr>
-<tr><td><code>configured_nssai.slices[].sst</code></td><td>u8</td><td>Yes</td><td>-</td><td>Slice/Service Type</td></tr>
-<tr><td><code>configured_nssai.slices[].sd</code></td><td>[u8; 3]</td><td>No</td><td>null</td><td>Slice Differentiator</td></tr>
-</tbody>
-</table>
-</div>
-<h4 id="tun-interface"><a class="header" href="#tun-interface">TUN Interface</a></h4>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>tun_name</code></td><td>string</td><td>No</td><td>null</td><td>Name for the TUN interface (e.g., <code>uesimtun0</code>). If not specified, a name is auto-generated</td></tr>
-</tbody>
-</table>
-</div>
-<h4 id="rel-1718-feature-configuration-ue"><a class="header" href="#rel-1718-feature-configuration-ue">Rel-17/18 Feature Configuration (UE)</a></h4>
-<p>These optional UE fields drive the Rel-17/18 features that are integrated end-to-end with nextgcore. Each is inert unless set.</p>
+<h3 id="nas-rrc-and-mobility"><a class="header" href="#nas-rrc-and-mobility">NAS, RRC and mobility</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>redcap</code></td><td>bool</td><td>false</td><td><strong>RedCap</strong> (Reduced Capability, Rel-17 / TS 38.101). When <code>true</code>, the UE signals a reduced-capability indication in the Registration Request (NAS IE <code>0xA9</code>); the AMF caps UE-AMBR and the SMF reduces the session-AMBR (default 150 Mbps DL / 50 Mbps UL, overridable on the SMF via <code>REDCAP_SESS_AMBR_DL_BPS</code> / <code>REDCAP_SESS_AMBR_UL_BPS</code>).</td></tr>
-<tr><td><code>snpn_config</code></td><td>object</td><td>null</td><td><strong>SNPN</strong> access (Rel-17 / TS 23.501 §5.30). Presence makes the UE include the NID in the Registration Request and gate cell selection to a matching broadcast NID.</td></tr>
-<tr><td><code>snpn_config.nid</code></td><td>string</td><td>-</td><td>11-hex-char Network Identifier (e.g. <code>"7AB01234567"</code>). Must match the gNB’s broadcast NID; the AMF accepts it only if it is in <code>AMF_SNPN_ALLOWED_NIDS</code> (or that env is unset = accept any), otherwise rejects with 5GMM cause #75.</td></tr>
-<tr><td><code>snpn_config.cag_ids</code></td><td>[u32]</td><td>[]</td><td>Closed Access Group IDs.</td></tr>
-<tr><td><code>snpn_config.onboarding_enabled</code></td><td>bool</td><td>false</td><td>Request SNPN onboarding / credentials provisioning.</td></tr>
-<tr><td><code>mint_config</code></td><td>object</td><td>null</td><td><strong>MINT</strong> / disaster roaming (Rel-18 / TS 23.761). Models a multi-SUPI UE that, after the primary registers, runs a simultaneous registration per secondary SUPI carrying the disaster-roaming indication (NAS IE <code>0xA7</code>).</td></tr>
-<tr><td><code>mint_config.enabled</code></td><td>bool</td><td>false</td><td>Enable the MINT secondary-subscription driver.</td></tr>
-<tr><td><code>mint_config.secondary_supis</code></td><td>[string]</td><td>[]</td><td>Secondary SUPIs (each must be provisioned in the core’s subscriber DB).</td></tr>
-<tr><td><code>mint_config.simultaneous_registration</code></td><td>bool</td><td>false</td><td>Register secondaries alongside the primary.</td></tr>
-<tr><td><code>mint_config.disaster_roaming</code></td><td>bool</td><td>false</td><td>Set the disaster-roaming indication on secondary registrations.</td></tr>
-<tr><td><code>mint_config.dnn_subscription_map</code></td><td>array</td><td>[]</td><td>Map a session DNN to a secondary subscription index, so that DNN’s PDU session is established under the secondary SUPI.</td></tr>
-<tr><td><code>uav_config</code></td><td>object</td><td>null</td><td><strong>UAV</strong> (Rel-18 / TS 23.256). Registers the UE as an aerial UE and periodically sends a UAV tracking report the AMF checks against its geofence.</td></tr>
-<tr><td><code>uav_config.is_aerial_ue</code></td><td>bool</td><td>false</td><td>Register as an aerial UE (includes UAV indication NAS IE <code>0xA8</code>).</td></tr>
-<tr><td><code>uav_config.uav_id</code></td><td>string</td><td>null</td><td>UAV CAA-level identifier.</td></tr>
-<tr><td><code>uav_config.max_altitude_meters</code></td><td>f64</td><td>-</td><td>Reported flight altitude. Above the AMF geofence ceiling (<code>AMF_UAV_GEOFENCE</code>, default 120 m) → the AMF revokes authorization (geofence deny); within bounds → allow.</td></tr>
-<tr><td><code>uav_config.remote_id_enabled</code></td><td>bool</td><td>false</td><td>Include Remote-ID in tracking reports.</td></tr>
-<tr><td><code>uav_config.c2_link_required</code></td><td>bool</td><td>false</td><td>Request a command-and-control link (modelled).</td></tr>
+<tr><td><code>state_file</code></td><td>path</td><td>none</td><td>File keeping the TS 24.501 Annex C.1 parameters (5G-GUTI, last visited TAI, update status, native security context) across restarts. Unset disables persistence</td></tr>
+<tr><td><code>racs_store_assigned_id</code></td><td>bool</td><td>true</td><td>Keep the network-assigned UE radio capability ID (RACS) from a CONFIGURATION UPDATE COMMAND and present it in later Registration Requests</td></tr>
+<tr><td><code>paging_default_cycle_frames</code></td><td>u16</td><td>128</td><td>Paging cycle for the UE’s own paging occasion (TS 38.304 §7.1). Must match the gNB</td></tr>
+<tr><td><code>as_security_enabled</code></td><td>bool</td><td>false</td><td>AS security on SRB1. Must match the gNB</td></tr>
+<tr><td><code>dl_arfcn</code></td><td>u32</td><td>632448</td><td>Must match the gNB’s (handover key derivation)</td></tr>
+<tr><td><code>require_broadcast_sib1</code></td><td>bool</td><td>false</td><td>Require a decoded broadcast SIB1 before a cell is selectable</td></tr>
+<tr><td><code>rlc_am_psis</code></td><td>list of u8</td><td><code>[]</code></td><td>PDU sessions whose DRB uses RLC AM. Must match the gNB</td></tr>
+<tr><td><code>conditional_handover</code></td><td>bool</td><td>false</td><td>Store CHO candidates from RRCReconfiguration and execute one when its condition holds</td></tr>
+<tr><td><code>eutra_neighbours</code></td><td>list</td><td><code>[]</code></td><td>E-UTRA neighbour cells the UE measures for events B1/B2</td></tr>
+<tr><td><code>eutra_b1_threshold_dbm</code></td><td>i32</td><td>-110</td><td><code>b1-ThresholdEUTRA</code> of the default B1 measurement</td></tr>
+<tr><td><code>lpp_arfcn_eutra</code></td><td>u32</td><td>0</td><td><code>arfcnEUTRA</code> reported in an LPP E-CID measurement (configured, not measured)</td></tr>
+<tr><td><code>plmn_user_preferred</code>, <code>plmn_operator_preferred</code></td><td>list of <code>"mcc-mnc"</code></td><td><code>[]</code></td><td>Preferred PLMN lists for automatic PLMN selection (TS 23.122)</td></tr>
+<tr><td><code>plmn_hp_search_interval_secs</code></td><td>u32</td><td>none</td><td>Higher-priority PLMN search timer T; clamped to 6 min..8 h</td></tr>
+<tr><td><code>ursp_evaluation</code></td><td>bool</td><td>false</td><td>Evaluate URSP rules (TS 24.526 §5.2) to pick DNN, S-NSSAI, SSC mode and session type. Off: sessions come from <code>sessions</code> only</td></tr>
+<tr><td><code>ursp_rules</code></td><td>list</td><td><code>[]</code></td><td>Locally configured URSP rules</td></tr>
+<tr><td><code>ursp_os_id</code>, <code>ursp_os_app_id</code></td><td>string</td><td>none</td><td>The OS Id / OS App Id the UE reports to URSP evaluation (the simulator detects no applications)</td></tr>
+<tr><td><code>gnss_position_ecef_m</code></td><td><code>[f64; 3]</code></td><td>none</td><td><strong>NTN.</strong> The UE’s GNSS position in ECEF metres. With the cell’s SIB19 ephemeris it is what the timing advance and Doppler pre-compensation are computed from. Unset: no pre-compensation, logged</td></tr>
+<tr><td><code>ntn_uplink_carrier_hz</code></td><td>f64</td><td>2e9</td><td><strong>NTN.</strong> Uplink carrier the Doppler pre-compensation is scaled by</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="rel-1718-feature-configuration-ue"><a class="header" href="#rel-1718-feature-configuration-ue">Rel-17/18 Feature Configuration (UE)</a></h3>
+<p>These optional fields drive the Rel-17/18 features integrated end to end with
+nextgcore. Each is inert unless set.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>redcap</code></td><td>bool</td><td>false</td><td><strong>RedCap</strong> (Rel-17). The UE signals reduced capability in the Registration Request; the AMF caps UE-AMBR and the SMF reduces session-AMBR (nextgcore knobs <code>REDCAP_SESS_AMBR_DL_BPS</code> / <code>REDCAP_SESS_AMBR_UL_BPS</code>)</td></tr>
+<tr><td><code>redcap_r18</code></td><td>object</td><td>none</td><td>Rel-18 RedCap extensions</td></tr>
+<tr><td><code>snpn_config</code></td><td>object</td><td>none</td><td><strong>SNPN</strong> (TS 23.501 §5.30). The UE includes the NID in the Registration Request and only selects a cell broadcasting a matching NID</td></tr>
+<tr><td><code>snpn_config.nid</code></td><td>string</td><td>-</td><td>Network Identifier (required inside the block), for example <code>"7AB01234567"</code>. The AMF accepts it only if it is in <code>AMF_SNPN_ALLOWED_NIDS</code> (or that variable is unset), otherwise rejects with 5GMM cause #75</td></tr>
+<tr><td><code>snpn_config.cag_ids</code></td><td>list of u32</td><td><code>[]</code></td><td>Closed Access Group IDs</td></tr>
+<tr><td><code>snpn_config.onboarding_enabled</code></td><td>bool</td><td>false</td><td>Request SNPN onboarding</td></tr>
+<tr><td><code>mint_config</code></td><td>object</td><td>none</td><td><strong>MINT</strong> / disaster roaming (TS 23.761). After the primary registers, the UE registers each secondary SUPI</td></tr>
+<tr><td><code>mint_config.enabled</code></td><td>bool</td><td>false</td><td>Enable the secondary-subscription driver</td></tr>
+<tr><td><code>mint_config.secondary_supis</code></td><td>list of string</td><td><code>[]</code></td><td>Secondary SUPIs; each must be provisioned in the core</td></tr>
+<tr><td><code>mint_config.active_subscription</code></td><td>u8</td><td>0</td><td>Active subscription index (0 is the primary)</td></tr>
+<tr><td><code>mint_config.simultaneous_registration</code></td><td>bool</td><td>false</td><td>Register secondaries alongside the primary</td></tr>
+<tr><td><code>mint_config.disaster_roaming</code></td><td>bool</td><td>false</td><td>Set the disaster-roaming indication on secondary registrations</td></tr>
+<tr><td><code>mint_config.dnn_subscription_map</code></td><td>list of <code>{dnn, subscription_index}</code></td><td><code>[]</code></td><td>Establish a DNN’s PDU session under a secondary SUPI</td></tr>
+<tr><td><code>uav_config</code></td><td>object</td><td>none</td><td><strong>UAV</strong> (TS 23.256). Registers an aerial UE and periodically sends a tracking report the AMF checks against its geofence</td></tr>
+<tr><td><code>uav_config.is_aerial_ue</code></td><td>bool</td><td>false</td><td>Register as an aerial UE</td></tr>
+<tr><td><code>uav_config.uav_id</code>, <code>uav_config.uss_address</code></td><td>string</td><td>none</td><td>CAA-level UAV ID; USS address</td></tr>
+<tr><td><code>uav_config.max_altitude_meters</code></td><td>f64</td><td>see struct</td><td>Reported altitude. Above the AMF ceiling (<code>AMF_UAV_GEOFENCE</code>, default 120 m) the AMF revokes authorization</td></tr>
+<tr><td><code>uav_config.remote_id_enabled</code>, <code>uav_config.c2_link_required</code></td><td>bool</td><td>false</td><td>Remote ID in reports; request a C2 link</td></tr>
+<tr><td><code>uav_config.uuaa_payload_hex</code></td><td>string</td><td>none</td><td>Opaque UUAA payload for the service-level authentication procedure. UUAA-MM over NAS transport needs a UE built with <code>--features uuaa-mm</code></td></tr>
+<tr><td><code>xr_config</code>, <code>ambient_iot_config</code>, <code>ranging_config</code>, <code>v2x_config</code>, <code>pin_role</code></td><td>object</td><td>none</td><td>Rel-16/18 prototypes (XR, ambient IoT, ranging, V2X, PIN). Ranging also needs <code>--features sidelink</code></td></tr>
+<tr><td><code>prose_enabled</code></td><td>bool</td><td>false</td><td>Run PC5 at all (needs <code>--features sidelink</code>)</td></tr>
+<tr><td><code>prose_config</code></td><td>object</td><td>default</td><td>PC5 parameters (Layer-2 ID, application code) when <code>prose_enabled</code></td></tr>
 </tbody>
 </table>
 </div>
 <blockquote>
-<p>The corresponding nextgcore env knobs (<code>AMF_SNPN_ALLOWED_NIDS</code>, <code>AMF_UAV_GEOFENCE</code>, <code>REDCAP_SESS_AMBR_DL_BPS</code>/<code>_UL_BPS</code>, the XR DNN→5QI mapping) and ready-to-run example configs are documented in <code>nextgcore/docker/rust/README.md</code> and <code>nextgsim/config/features/</code>.</p>
+<p>The nextgcore env knobs (<code>AMF_SNPN_ALLOWED_NIDS</code>, <code>AMF_UAV_GEOFENCE</code>,
+<code>REDCAP_SESS_AMBR_DL_BPS</code>/<code>_UL_BPS</code>, the XR DNN to 5QI mapping) and the matching
+example configs are documented in nextgcore’s <code>docker/rust/README.md</code> and in
+<code>config/features/</code>.</p>
 </blockquote>
+<h3 id="6g-research-flags-ue"><a class="header" href="#6g-research-flags-ue">6G research flags (UE)</a></h3>
+<p>All default to <code>false</code>. The task also needs the matching cargo feature
+(<code>nextgsim-she</code>, <code>nextgsim-nwdaf</code>, <code>nextgsim-isac</code>, <code>nextgsim-fl</code>,
+<code>nextgsim-semantic</code>) in the <code>nr-ue</code> build.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>she_enabled</code></td><td>Service Hosting Environment client</td></tr>
+<tr><td><code>ai_ml_enabled</code></td><td>NWDAF reporter</td></tr>
+<tr><td><code>isac_enabled</code></td><td>ISAC sensor</td></tr>
+<tr><td><code>federated_learning_enabled</code></td><td>Federated-learning participant</td></tr>
+<tr><td><code>semantic_comm_enabled</code></td><td>Semantic codec</td></tr>
+<tr><td><code>pqc</code></td><td>Post-quantum settings; the comments in <code>config/ue.yaml</code> list the accepted values</td></tr>
+</tbody>
+</table>
+</div>
 <hr>
-<h2 id="cli-options"><a class="header" href="#cli-options">CLI Options</a></h2>
-<h3 id="gnb-cli-options"><a class="header" href="#gnb-cli-options">gNB CLI Options</a></h3>
-<pre><code class="language-bash">nextgsim-gnb [OPTIONS] -c &lt;CONFIG&gt;
-
-Options:
-  -c, --config &lt;FILE&gt;    Path to gNB configuration file (required)
-  -l, --disable-cmd      Disable CLI command interface
-  -h, --help             Print help
-  -V, --version          Print version
-</code></pre>
-<h3 id="ue-cli-options"><a class="header" href="#ue-cli-options">UE CLI Options</a></h3>
-<pre><code class="language-bash">nextgsim-ue [OPTIONS] -c &lt;CONFIG&gt;
-
-Options:
-  -c, --config &lt;FILE&gt;    Path to UE configuration file (required)
-  -i, --imsi &lt;IMSI&gt;      Override IMSI from config file
-  -n, --num-of-UE &lt;NUM&gt;  Number of UEs to spawn (1-512, default: 1)
-  -t, --tempo &lt;MS&gt;       Delay in milliseconds between UE starts (default: 0)
-  -l, --disable-cmd      Disable CLI command interface
-  -r, --no-routing-config  Disable TUN routing configuration
-  -h, --help             Print help
-  -V, --version          Print version
-</code></pre>
-<p>When spawning multiple UEs (<code>-n</code>), each UE gets an incremented IMSI (last digits incremented).</p>
+<h2 id="lte-enb-configuration-lte-enb"><a class="header" href="#lte-enb-configuration-lte-enb">LTE eNB Configuration (<code>lte-enb</code>)</a></h2>
+<p>Example: <code>config/enb.yaml</code>. The eNB must be built on Linux with
+<code>--features kernel-sctp</code>: S1-MME is kernel SCTP, and a build without the
+feature exits with an error.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enb_id</code></td><td>u32</td><td>Yes</td><td>-</td><td>eNB ID (decimal or <code>0x</code> hex), interpreted as <code>enb_id_type</code>’s bit width</td></tr>
+<tr><td><code>enb_id_type</code></td><td><code>macro</code> | <code>home</code> | <code>short_macro</code> | <code>long_macro</code></td><td>No</td><td><code>macro</code></td><td>Which <code>ENB-ID</code> alternative to send</td></tr>
+<tr><td><code>plmn</code></td><td>object</td><td>Yes</td><td>-</td><td>PLMN of the Global eNB ID</td></tr>
+<tr><td><code>tac</code></td><td>u16</td><td>Yes</td><td>-</td><td>Primary TAC (used when <code>supported_tas</code> is empty)</td></tr>
+<tr><td><code>supported_tas</code></td><td>list</td><td>No</td><td><code>[{tac, [plmn]}]</code></td><td>Explicit Supported TAs</td></tr>
+<tr><td><code>enb_name</code></td><td>string</td><td>No</td><td>none</td><td>eNB name in S1 SETUP REQUEST</td></tr>
+<tr><td><code>paging_drx</code></td><td><code>v32</code> | <code>v64</code> | <code>v128</code> | <code>v256</code></td><td>No</td><td>see struct</td><td>Default Paging DRX</td></tr>
+<tr><td><code>mme_configs</code></td><td>list of <code>{address, port}</code></td><td>Yes</td><td>-</td><td>MMEs (port 36412)</td></tr>
+<tr><td><code>s1ap_ip</code></td><td>IP</td><td>Yes</td><td>-</td><td>Local S1-MME address</td></tr>
+<tr><td><code>gtp_ip</code></td><td>IP</td><td>No</td><td><code>s1ap_ip</code></td><td>S1-U GTP-U address sent in INITIAL CONTEXT SETUP RESPONSE</td></tr>
+<tr><td><code>s1_setup_retry_secs</code></td><td>u64</td><td>No</td><td>10</td><td>Retry delay after an S1 Setup failure without Time To Wait, or a lost association</td></tr>
+<tr><td><code>s1_setup_response_timeout_ms</code></td><td>u64</td><td>No</td><td>5000</td><td>Wait for S1 SETUP RESPONSE/FAILURE</td></tr>
+<tr><td><code>radio</code></td><td>object</td><td>No</td><td>see struct</td><td><code>link_ip</code>, <code>rls_port</code> (4997), <code>cell_id</code>, <code>freq_band</code>, <code>dl_bandwidth</code> (<code>n6</code>..<code>n100</code>), <code>q_rx_lev_min_dbm</code>, <code>t300_ms</code>, <code>si_broadcast_period_ms</code></td></tr>
+<tr><td><code>security</code></td><td>object</td><td>No</td><td>see struct</td><td>AS algorithm preference lists: <code>integrity</code>, <code>ciphering</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="lte-ue-configuration-lte-ue"><a class="header" href="#lte-ue-configuration-lte-ue">LTE UE Configuration (<code>lte-ue</code>)</a></h2>
+<p>Example: <code>config/lte-ue.yaml</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>plmn</code></td><td>object</td><td>Yes</td><td>-</td><td>The PLMN NAS selected</td></tr>
+<tr><td><code>enb_search_list</code></td><td>list of string</td><td>Yes</td><td>-</td><td>eNB RLS endpoints, <code>"ip"</code> or <code>"ip:port"</code></td></tr>
+<tr><td><code>sti</code></td><td>u64</td><td>No</td><td>random</td><td>RLS sender identity</td></tr>
+<tr><td><code>position</code></td><td><code>[i32; 3]</code></td><td>No</td><td>origin</td><td>Simulated position (signal level)</td></tr>
+<tr><td><code>subscriber</code></td><td>object</td><td>No</td><td>none</td><td>USIM and attach parameters: <code>imsi</code>, <code>key</code>, <code>op</code>, <code>op_type</code>, <code>sqn</code>, <code>imei_sv</code>, <code>eea</code>, <code>eia</code>, <code>apn</code>, <code>pdn_type</code> (<code>ipv4</code>, <code>ipv6</code>, <code>ipv4v6</code>). Without it the UE camps and never attaches</td></tr>
+<tr><td><code>tun</code></td><td>object</td><td>No</td><td>none</td><td><code>name</code> (default <code>lteuetun&lt;EBI&gt;</code>) and <code>configure_routing</code>. Absent, no TUN is created</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="environment-overrides-lte-containers"><a class="header" href="#environment-overrides-lte-containers">Environment overrides (LTE containers)</a></h3>
+<p><code>lte-enb</code> and <code>lte-ue</code> read <code>NEXTGSIM_*</code> variables after loading the file and
+before validating it, so a bad value is refused like a bad file:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Node</th><th>Overrides</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NEXTGSIM_ENB_MME_ADDR</code></td><td>eNB</td><td><code>mme_configs</code> (comma-separated <code>ip</code> or <code>ip:port</code>, port 36412 by default)</td></tr>
+<tr><td><code>NEXTGSIM_ENB_IP</code></td><td>eNB</td><td><code>s1ap_ip</code> and <code>radio.link_ip</code></td></tr>
+<tr><td><code>NEXTGSIM_ENB_GTP_IP</code></td><td>eNB</td><td><code>gtp_ip</code></td></tr>
+<tr><td><code>NEXTGSIM_ENB_ID</code></td><td>eNB</td><td><code>enb_id</code> (decimal or <code>0x</code> hex)</td></tr>
+<tr><td><code>NEXTGSIM_PLMN</code></td><td>both</td><td><code>plmn</code>, written <code>MCC-MNC</code></td></tr>
+<tr><td><code>NEXTGSIM_TAC</code></td><td>eNB</td><td><code>tac</code></td></tr>
+<tr><td><code>NEXTGSIM_UE_ENB_ADDR</code></td><td>UE</td><td><code>enb_search_list</code></td></tr>
+<tr><td><code>NEXTGSIM_UE_IMSI</code> / <code>_KEY</code> / <code>_OPC</code> / <code>_APN</code></td><td>UE</td><td>the <code>subscriber</code>; key and OPc as 32 hex digits</td></tr>
+<tr><td><code>NEXTGSIM_UE_TUN_NAME</code></td><td>UE</td><td><code>tun.name</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>nr-gnb</code> and <code>nr-ue</code> read no such variables.</p>
 <hr>
-<h2 id="example-configurations"><a class="header" href="#example-configurations">Example Configurations</a></h2>
-<h3 id="open5gs-core"><a class="header" href="#open5gs-core">Open5GS Core</a></h3>
-<p><strong>gNB</strong> (<code>config/open5gs-gnb.yaml</code>):</p>
-<pre><code class="language-yaml">nci: '0x000000010'
-gnb_id_length: 32
-plmn:
-  mcc: 999
-  mnc: 70
-tac: 1
-nssai:
-  - sst: 1
-amf_configs:
-  - address: 127.0.0.5
-    port: 38412
-link_ip: 127.0.0.1
-ngap_ip: 127.0.0.1
-gtp_ip: 127.0.0.1
-ignore_stream_ids: true
-</code></pre>
-<p><strong>UE</strong> (<code>config/open5gs-ue.yaml</code>):</p>
-<pre><code class="language-yaml">supi: 'imsi-999700000000001'
-hplmn:
-  mcc: 999
-  mnc: 70
-key: '465B5CE8B199B49FAA5F0A2EE238A6BC'
-op: 'E8ED289DEBA952E4283B54E88E6183CA'
-op_type: Opc
-amf: '8000'
-gnb_search_list:
-  - 127.0.0.1
-sessions:
-  - type: IPv4
-    apn: internet
-    s_nssai:
-      sst: 1
-configured_nssai:
-  slices:
-    - sst: 1
-</code></pre>
-<h3 id="free5gc-core"><a class="header" href="#free5gc-core">Free5GC Core</a></h3>
-<p><strong>gNB</strong> (<code>config/free5gc-gnb.yaml</code>):</p>
-<pre><code class="language-yaml">nci: '0x000000010'
-gnb_id_length: 32
-plmn:
-  mcc: 208
-  mnc: 93
-tac: 1
-nssai:
-  - sst: 1
-    sd: [0, 1, 2]
-amf_configs:
-  - address: 127.0.0.1
-    port: 38412
-link_ip: 127.0.0.1
-ngap_ip: 127.0.0.1
-gtp_ip: 127.0.0.1
-ignore_stream_ids: true
-</code></pre>
-<p><strong>UE</strong> (<code>config/free5gc-ue.yaml</code>):</p>
-<pre><code class="language-yaml">supi: 'imsi-208930000000001'
-hplmn:
-  mcc: 208
-  mnc: 93
-key: '8baf473f2f8fd09487cccbd7097c6862'
-op: '8e27b6af0e692e750f32667a3b14605d'
-op_type: Opc
-amf: '8000'
-gnb_search_list:
-  - 127.0.0.1
-sessions:
-  - type: IPv4
-    apn: internet
-    s_nssai:
-      sst: 1
-      sd: [0, 1, 2]
-configured_nssai:
-  slices:
-    - sst: 1
-      sd: [0, 1, 2]
-</code></pre>
+<h2 id="command-line-options"><a class="header" href="#command-line-options">Command-line options</a></h2>
+<p>The flags of every binary are listed in the <a href="cli-reference.html#binaries-and-flags">nr-cli Reference</a>.</p>
 <hr>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
-<h3 id="common-configuration-issues"><a class="header" href="#common-configuration-issues">Common Configuration Issues</a></h3>
 <ol>
-<li>
-<p><strong>PLMN Mismatch</strong>: Ensure <code>plmn</code> (gNB) matches <code>hplmn</code> (UE) for the UE to register.</p>
-</li>
-<li>
-<p><strong>NSSAI Mismatch</strong>: The UE’s <code>configured_nssai</code> must include slices supported by the gNB’s <code>nssai</code>.</p>
-</li>
-<li>
-<p><strong>Authentication Failure</strong>: Verify <code>key</code>, <code>op</code>, and <code>op_type</code> match the subscriber profile in the core network.</p>
-</li>
-<li>
-<p><strong>Connection Timeout</strong>: Check that <code>amf_configs</code> addresses are reachable and the AMF is running.</p>
-</li>
-<li>
-<p><strong>gNB Not Found</strong>: Ensure <code>gnb_search_list</code> contains the correct gNB <code>link_ip</code> address.</p>
-</li>
+<li><strong>The file is refused.</strong> The error names the key and line. The usual causes
+are a quoted <code>nci</code>, hex-string keys, an <code>imsi-...</code> string for <code>supi</code>, a
+missing <code>long_mnc</code>, or other spellings of the enum values (<code>IPv4</code>, <code>OPC</code>).</li>
+<li><strong>PLMN mismatch.</strong> <code>plmn</code> (gNB) must match <code>hplmn</code> (UE) and the core.</li>
+<li><strong>NSSAI mismatch.</strong> The UE’s <code>configured_nssai</code> must include a slice the gNB’s
+<code>nssai</code> supports.</li>
+<li><strong>Authentication failure.</strong> <code>key</code>, <code>op</code> and <code>op_type</code> must match the
+subscriber in the core’s database.</li>
+<li><strong>No NG Setup against a real AMF.</strong> The default <code>sctp_backend: userspace</code> is
+SCTP over UDP. Build with <code>--features kernel-sctp</code> and set
+<code>sctp_backend: kernel</code>.</li>
+<li><strong>gNB not found.</strong> <code>gnb_search_list</code> must contain the gNB’s <code>link_ip</code>.</li>
+<li><strong>A paired setting differs.</strong> <code>as_security_enabled</code>, <code>dl_arfcn</code>,
+<code>paging_default_cycle_frames</code> and <code>rlc_am_psis</code> must agree between gNB and UE.</li>
 </ol>
-<h3 id="logging"><a class="header" href="#logging">Logging</a></h3>
-<p>Enable debug logging to troubleshoot configuration issues:</p>
-<pre><code class="language-bash">RUST_LOG=debug ./nextgsim-ue -c config.yaml
-RUST_LOG=nextgsim_nas=trace ./nextgsim-ue -c config.yaml
+<p>Enable debug logging with <code>RUST_LOG</code>:</p>
+<pre><code class="language-bash">RUST_LOG=debug nr-ue -c config/ue.yaml
+RUST_LOG=nextgsim_nas=trace nr-ue -c config/ue.yaml
 </code></pre>
 
                     </main>
@@ -734,7 +681,7 @@ RUST_LOG=nextgsim_nas=trace ./nextgsim-ue -c config.yaml
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 
