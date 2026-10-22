@@ -2125,6 +2125,26 @@ impl NgapTask {
             }
         }
 
+        // The MESSAGE-level NAS-PDU (TS 38.413 §9.2.1.1, e.g. the SERVICE ACCEPT
+        // of a connected-mode Service Request, TS 23.502 §4.2.3.2 step 12) goes to
+        // the UE AFTER every session's GTP tunnel and DRB: it is queued on the
+        // same FIFO `rrc_tx` behind the RRCReconfiguration(s) above, so the UE
+        // learns its user plane is back only once the gNB can carry it. It used
+        // to be dropped (only the per-item NAS-PDU was forwarded), and with the
+        // AMF sending the Accept this way the UE would never have received it.
+        if let Some(ref nas_pdu) = setup_req.nas_pdu {
+            let msg = RrcMessage::NasDelivery {
+                ue_id,
+                pdu: OctetString::from_slice(nas_pdu),
+            };
+            if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                error!(
+                    "Failed to forward the Setup Request's NAS-PDU to RRC: {}",
+                    e
+                );
+            }
+        }
+
         // Build and send PDU Session Resource Setup Response
         let response_params = PduSessionResourceSetupResponseParams {
             amf_ue_ngap_id: setup_req.amf_ue_ngap_id,
@@ -8390,6 +8410,46 @@ mod tests {
             s_nssai: SnssaiValue { sst: 1, sd: None },
             transfer,
         }
+    }
+
+    /// The message-level NAS-PDU of a PDU SESSION RESOURCE SETUP REQUEST (the
+    /// AMF's SERVICE ACCEPT for a connected-mode Service Request) reaches the UE,
+    /// and only AFTER the DRB's RRCReconfiguration, so the UE does not resume
+    /// uplink before the gNB has the session. It used to be dropped.
+    #[tokio::test]
+    async fn the_setup_requests_message_level_nas_pdu_reaches_the_ue_after_the_drb() {
+        use nextgsim_ngap::procedures::pdu_session_resource::PduSessionResourceSetupRequestData;
+        let (mut task, mut rrc_rx, _gtp_rx, _rls_rx) = task_with_live_receivers(31).await;
+        key_ue(&mut task, 31, 2, 2);
+        let ran = task.find_ue_context(31).unwrap().ran_ue_ngap_id as u32;
+        let service_accept = vec![0x7E, 0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x7E, 0x00, 0x4E];
+        task.handle_pdu_session_resource_setup(
+            1,
+            1,
+            PduSessionResourceSetupRequestData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id: ran,
+                nas_pdu: Some(service_accept.clone()),
+                pdu_session_resource_setup_list: vec![setup_item_with_policy(1, None)],
+            },
+        )
+        .await;
+
+        let mut order = Vec::new();
+        while let Ok(TaskMessage::Message(msg)) = rrc_rx.try_recv() {
+            match msg {
+                RrcMessage::RrcReconfiguration { .. } => order.push("drb"),
+                RrcMessage::NasDelivery { pdu, .. } if pdu.data() == service_accept.as_slice() => {
+                    order.push("nas")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            order,
+            vec!["drb", "nas"],
+            "the NAS-PDU must be delivered, after the DRB setup"
+        );
     }
 
     /// Give a UE the AS security context an Initial Context Setup would install.
