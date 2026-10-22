@@ -29,6 +29,12 @@ metadata:
     app.kubernetes.io/part-of: nextgsim
 spec:
   replicas: 1
+  # Recreate, not the default RollingUpdate: the gNB is a singleton radio
+  # identity. In a rolling update two gNB pods would advertise the same cell
+  # (NR-CGI) to the AMF at once, and a UE restarted in the overlap attaches to
+  # the OLD gNB and is stranded when it terminates (#290).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: gnb

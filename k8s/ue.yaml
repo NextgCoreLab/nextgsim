@@ -8,6 +8,11 @@ metadata:
     app.kubernetes.io/part-of: nextgsim
 spec:
   replicas: 1
+  # Recreate, not the default RollingUpdate: the UE is a singleton radio
+  # identity. In a rolling update two UE pods would register the same SUPI at
+  # once and fight over one 5GMM context (#290).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: ue
