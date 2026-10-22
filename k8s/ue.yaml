@@ -45,44 +45,14 @@ spec:
             - |
               set -eu
 
-              # busybox ships no getent, so nslookup with an anchored parse.
-              # See gnb.yaml for why the ^Name: anchor matters (without it the
-              # DNS server's own address is returned instead of the answer).
-              resolve() {
-                _host="$1"; _ip=""; _i=0
-                while [ "$_i" -lt 60 ]; do
-                  _ip=$(nslookup "$_host" 2>/dev/null \
-                        | awk '/^Name:/{n=1;next} n&&/^Address( 1)?:/{print $NF; exit}')
-                  case "$_ip" in
-                    *.*.*.*) echo "$_ip"; return 0 ;;
-                  esac
-                  _i=$((_i+1))
-                  echo "[resolve-dns] waiting for $_host ($_i/60)" >&2
-                  sleep 2
-                done
-                echo "[resolve-dns] FATAL: could not resolve $_host" >&2
-                return 1
-              }
-
-              GNB_IP=$(resolve gnb.nextg-system.svc.cluster.local)
-              case "$GNB_IP" in
-                *[0-9].[0-9]*) ;;
-                *) echo "[resolve-dns] FATAL: GNB_IP is not an IPv4 address: '$GNB_IP'" >&2; exit 1 ;;
-              esac
-              echo "[resolve-dns] gNB IP: $GNB_IP"
-
+              # Nothing is resolved here any more (nextgsim #286): the UE
+              # resolves gnb_search_list hostnames itself and re-resolves them
+              # every few seconds and on losing its cell, so a gNB pod that comes
+              # back at a new IP is found again without restarting this pod. A
+              # literal resolved here once would be stale after that restart.
+              # Kept as a copy step so the volume layout (and any overlay that
+              # patches this container by name) is unchanged.
               cp /tmp/config-template/ue.yaml /etc/nextgsim/ue.yaml
-              sed -i "s|gnb\.nextg-system\.svc\.cluster\.local|$GNB_IP|g" /etc/nextgsim/ue.yaml
-
-              # A surviving hostname here is worse than elsewhere: gnb_search_list
-              # is Vec<String>, so the UE deserializes it fine and then rejects
-              # the entry when converting to SocketAddr. Catch it now.
-              if grep -qE 'svc\.cluster\.local' /etc/nextgsim/ue.yaml; then
-                echo "[resolve-dns] FATAL: unresolved names remain:" >&2
-                grep -nE 'svc\.cluster\.local' /etc/nextgsim/ue.yaml >&2
-                exit 1
-              fi
-
               echo "[resolve-dns] final ue.yaml:"
               cat /etc/nextgsim/ue.yaml
           volumeMounts:

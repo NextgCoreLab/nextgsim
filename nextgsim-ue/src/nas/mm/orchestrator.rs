@@ -578,6 +578,18 @@ pub struct MmOrchestrator {
     state: MmStateMachine,
     timers: NasTimerManager,
     sec: NasSecurityContext,
+    /// Whether a secure exchange of NAS messages has been established FOR THE
+    /// CURRENT NAS signalling connection (TS 24.501 §4.4.4.2, nextgsim #286).
+    ///
+    /// Distinct from `sec.is_active()`, which survives CM-IDLE: a UE that
+    /// holds a security context and opens a new connection with a Service
+    /// Request has no secure exchange on that connection until a message passes
+    /// its integrity check. Until then the §4.4.4.2 allow-list applies, which is
+    /// what lets a new AMF incarnation that knows nothing of the UE reject it
+    /// with an unprotected SERVICE REJECT #9 (§5.6.1.5). Treating the stored
+    /// context as an established exchange made the UE discard that reject and
+    /// sit out T3517 instead of re-registering.
+    secure_exchange: bool,
 
     // -- authentication state --
     /// ABBA parameter received in the last Authentication Request
@@ -706,6 +718,7 @@ impl MmOrchestrator {
             state: MmStateMachine::new(),
             timers: NasTimerManager::new(),
             sec: NasSecurityContext::new_3gpp(),
+            secure_exchange: false,
             abba: vec![0x00, 0x00],
             sqn_ms: [0u8; 6],
             res_star: None,
@@ -1363,6 +1376,7 @@ impl MmOrchestrator {
                 if self.pending_reg_type != RegistrationType::EmergencyRegistration {
                     info!("T3510 expired: releasing the NAS signalling connection locally");
                     self.state.switch_cm_state(CmState::Idle);
+                    self.secure_exchange = false;
                     outs.push(MmOutput::ReleaseConnectionLocally);
                 }
                 outs.extend(self.abnormal_registration_failure());
@@ -2558,6 +2572,7 @@ impl MmOrchestrator {
         // MAC verified: activate the new security context
         self.sec.set_nas_ksi(smc.ng_ksi);
         self.sec.update_downlink_count(&count);
+        self.secure_exchange = true;
         self.sec.activate();
         // TS 24.501 5.4.1.3.3: stop T3516 on Security Mode Command
         self.timers.stop(TIMER_T3516, true);
@@ -3053,6 +3068,8 @@ impl MmOrchestrator {
     /// (TS 24.501 §5.5.2.3.2), unless one has already been started.
     pub fn on_nas_signalling_connection_released(&mut self) -> Vec<MmOutput> {
         self.state.switch_cm_state(CmState::Idle);
+        // A secure exchange belongs to one connection (§4.4.4.2).
+        self.secure_exchange = false;
         if !std::mem::take(&mut self.reregistration_on_release) {
             return Vec::new();
         }
@@ -3089,9 +3106,11 @@ impl MmOrchestrator {
 
         if sht == SecurityHeaderType::NotProtected {
             // TS 24.501 4.4.4.2 (last paragraph): once a secure exchange of NAS
-            // messages has been established, the UE shall discard any NAS
-            // signalling message received without integrity protection.
-            if self.sec.is_active() {
+            // messages has been established FOR THIS NAS signalling connection,
+            // the UE shall discard any NAS signalling message received without
+            // integrity protection. Before that, `handle_plain`'s allow-list
+            // decides (e.g. SERVICE REJECT #9 from an AMF that lost the UE).
+            if self.sec.is_active() && self.secure_exchange {
                 warn!(
                     "Unprotected NAS message received after security activation: discarded (TS 24.501 4.4.4.2)"
                 );
@@ -3162,6 +3181,7 @@ impl MmOrchestrator {
             return Vec::new();
         }
         self.sec.update_downlink_count(&count);
+        self.secure_exchange = true;
 
         let mut plain = payload.to_vec();
         if sht.is_ciphered() {
@@ -6550,6 +6570,46 @@ mod tests {
         assert_eq!(pdu[2], u8::from(MmMessageType::RegistrationRequest));
         assert!(!orch.timers().t3517.is_running());
         assert!(orch.stored_guti().is_none());
+    }
+
+    /// nextgsim #286: an AMF that restarted knows nothing of the UE. The UE,
+    /// CM-IDLE with a stored security context, sends a Service Request on a NEW
+    /// NAS signalling connection; the AMF can only answer with an UNPROTECTED
+    /// SERVICE REJECT #9. No secure exchange exists on this connection yet, so
+    /// §4.4.4.2's allow-list applies, the reject is processed, and the UE
+    /// re-registers from scratch (§5.6.1.5). The UE used to discard it and sit
+    /// out T3517, never recovering.
+    #[test]
+    fn an_unprotected_service_reject_9_on_a_new_connection_triggers_reregistration() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        assert!(orch.stored_guti().is_some());
+        orch.on_nas_signalling_connection_released();
+
+        orch.start_service_request(ServiceType::Data, None);
+        let mut rej_pdu = Vec::new();
+        ServiceReject::new(MmCause::UeIdentityCannotBeDerived).encode(&mut rej_pdu);
+        assert_eq!(rej_pdu[1] & 0x0F, 0, "sent in the clear");
+        let outs = orch.handle_downlink(&rej_pdu);
+
+        let pdu = first_sent_pdu(&outs);
+        assert_eq!(pdu[2], u8::from(MmMessageType::RegistrationRequest));
+        assert!(!orch.timers().t3517.is_running());
+        assert!(orch.stored_guti().is_none());
+    }
+
+    /// The complement: on the connection where the secure exchange WAS
+    /// established, the same unprotected reject is still discarded (§4.4.4.2).
+    #[test]
+    fn an_unprotected_service_reject_on_a_secured_connection_is_discarded() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        let mut rej_pdu = Vec::new();
+        ServiceReject::new(MmCause::UeIdentityCannotBeDerived).encode(&mut rej_pdu);
+        assert!(orch.handle_downlink(&rej_pdu).is_empty());
+        assert!(orch.stored_guti().is_some());
     }
 
     #[test]

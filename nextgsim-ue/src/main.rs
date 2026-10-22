@@ -191,9 +191,9 @@ fn validate_ue_config(config: &UeConfig) -> Result<()> {
     }
 
     // Validate gNB search list. Checking the parsed form matters: the entries
-    // are Vec<String>, so a hostname deserializes cleanly and used to be
-    // dropped silently when converted to SocketAddr, leaving an empty search
-    // space and a UE that never finds a cell. Reject it here instead.
+    // are Vec<String>, and an entry the RLS task cannot use used to be dropped
+    // silently, leaving an empty search space and a UE that never finds a cell.
+    // Hostnames are valid (issue #286) and resolved by the RLS task.
     if config.gnb_search_list.is_empty() {
         bail!("At least one gNB address must be specified in gnb_search_list");
     }

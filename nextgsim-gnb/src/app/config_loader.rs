@@ -198,6 +198,13 @@ pub fn validate_gnb_config(config: &GnbConfig) -> Result<(), ConfigValidationErr
                 "AMF {i} has invalid port 0"
             )));
         }
+        // An IP or a hostname (issue #286). A hostname is NOT resolved here: the
+        // AMF's DNS record may not exist yet, and the SCTP task keeps retrying.
+        if let Err(e) = amf.peer() {
+            return Err(ConfigValidationError::InvalidAmfConfig(format!(
+                "AMF {i} address: {e}"
+            )));
+        }
     }
 
     // Validate IP addresses are not unspecified (0.0.0.0 or ::)
@@ -456,6 +463,47 @@ upf_port: 2152
         assert_eq!(config.gnb_id_length, 24);
         assert_eq!(config.tac, 1);
         assert_eq!(config.amf_configs.len(), 1);
+    }
+
+    /// #286: the AMF may be named by hostname (a Kubernetes Service); it
+    /// loads and validates without being resolved, and garbage is refused.
+    #[test]
+    fn test_amf_address_accepts_a_hostname_and_rejects_garbage() {
+        let yaml = r#"
+nci: 16
+gnb_id_length: 24
+plmn:
+  mcc: 310
+  mnc: 410
+  long_mnc: false
+tac: 1
+nssai: []
+amf_configs:
+  - address: amf.nextg-system.svc.cluster.local
+    port: 38412
+link_ip: 127.0.0.1
+ngap_ip: 127.0.0.1
+gtp_ip: 127.0.0.1
+ignore_stream_ids: false
+upf_addr: null
+upf_port: 2152
+"#;
+        let config = load_gnb_config_from_str(yaml).unwrap();
+        validate_gnb_config(&config).expect("a hostname is a valid AMF address");
+        assert_eq!(
+            config.amf_configs[0].peer().unwrap(),
+            nextgsim_common::peer_addr::PeerAddr::Host(
+                "amf.nextg-system.svc.cluster.local".into(),
+                38412
+            )
+        );
+
+        let mut bad = valid_config();
+        bad.amf_configs[0].address = "not a host".into();
+        assert!(matches!(
+            validate_gnb_config(&bad),
+            Err(ConfigValidationError::InvalidAmfConfig(_))
+        ));
     }
 
     #[test]

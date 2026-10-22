@@ -29,33 +29,27 @@ use nextgsim_rls::{
     TransportEvent, UeCellSearch,
 };
 
+use nextgsim_common::peer_addr::PeerAddr;
+
 /// Default RLS port for gNB
 pub const DEFAULT_RLS_PORT: u16 = 4997;
 
-/// Parse one `gnb_search_list` entry into a socket address.
+/// Parse one `gnb_search_list` entry.
 ///
-/// Accepts a bare IP (`10.0.0.1`, port defaults to [`DEFAULT_RLS_PORT`]) or an
-/// explicit `IP:port` (`10.0.0.1:4997`). Hostnames are rejected: the entry is
-/// used as a UDP destination without a resolution step, so a name has no
-/// meaning here. The error names the offending entry so a misconfiguration is
-/// actionable from the message alone.
-pub fn parse_gnb_search_entry(entry: &str) -> Result<SocketAddr, String> {
-    let trimmed = entry.trim();
-    if trimmed.is_empty() {
-        return Err("entry is empty".to_string());
-    }
-    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, DEFAULT_RLS_PORT));
-    }
-    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    Err(format!(
-        "{trimmed:?} is not a literal IP address or IP:port. Hostnames are not \
-         supported; resolve the name to an IP first (an init container or \
-         startup script can do this)."
-    ))
+/// Accepts a bare IP or hostname (port defaults to [`DEFAULT_RLS_PORT`]), or
+/// `IP:port` / `host:port`. A hostname (issue #286; e.g. a Kubernetes Service
+/// name) is not resolved here: the RLS task resolves it, and keeps re-resolving
+/// it, so a gNB that restarts at a new address is found again. It used to be
+/// rejected, which forced deployments to pin a literal IP once at startup. The
+/// error names the offending entry so a misconfiguration is actionable from the
+/// message alone.
+pub fn parse_gnb_search_entry(entry: &str) -> Result<PeerAddr, String> {
+    PeerAddr::parse(entry, DEFAULT_RLS_PORT)
 }
+
+/// How often hostnames in `gnb_search_list` are re-resolved (issue #286). A
+/// serving-cell loss also re-resolves at once.
+pub const GNB_SEARCH_RERESOLVE_INTERVAL: Duration = Duration::from_secs(5);
 
 const HEARTBEAT_INTERVAL_MS: u64 = 1000;
 const LOST_CELL_CHECK_INTERVAL_MS: u64 = 500;
@@ -70,7 +64,12 @@ const MAC_GRANT_BYTES: usize = 1500;
 /// RLS task configuration
 #[derive(Debug, Clone)]
 pub struct RlsTaskConfig {
+    /// Literal gNB addresses.
     pub gnb_search_list: Vec<SocketAddr>,
+    /// gNBs named by hostname, resolved and re-resolved by the task (#286).
+    pub gnb_search_hosts: Vec<PeerAddr>,
+    /// How often `gnb_search_hosts` are re-resolved.
+    pub reresolve_interval: Duration,
     pub bind_address: Option<SocketAddr>,
     pub heartbeat_interval: Duration,
     pub heartbeat_threshold: Duration,
@@ -80,6 +79,8 @@ impl Default for RlsTaskConfig {
     fn default() -> Self {
         Self {
             gnb_search_list: Vec::new(),
+            gnb_search_hosts: Vec::new(),
+            reresolve_interval: GNB_SEARCH_RERESOLVE_INTERVAL,
             bind_address: None,
             heartbeat_interval: Duration::from_millis(HEARTBEAT_INTERVAL_MS),
             heartbeat_threshold: Duration::from_millis(2000),
@@ -96,6 +97,9 @@ pub struct RlsTask {
     serving_cell: Option<i32>,
     socket: Option<Arc<UdpSocket>>,
     config: RlsTaskConfig,
+    /// The last successful resolution of each `gnb_search_hosts` entry (#286).
+    /// A failed lookup keeps the previous answer rather than emptying it.
+    resolved_hosts: HashMap<PeerAddr, Vec<SocketAddr>>,
     sti: u64,
     /// RLC entities keyed by DRB identity.
     /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
@@ -226,6 +230,7 @@ impl RlsTask {
             serving_cell: None,
             socket: None,
             config,
+            resolved_hosts: HashMap::new(),
             sti,
             rlc_entities: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
@@ -251,13 +256,18 @@ impl RlsTask {
         // validation, so a malformed list normally fails before reaching this
         // point; the warning covers callers that build a config directly.
         let mut gnb_search_list = Vec::new();
+        let mut gnb_search_hosts = Vec::new();
         for entry in &task_base.config.gnb_search_list {
             match parse_gnb_search_entry(entry) {
-                Ok(addr) => gnb_search_list.push(addr),
+                Ok(PeerAddr::Literal(addr)) => gnb_search_list.push(addr),
+                Ok(host) => gnb_search_hosts.push(host),
                 Err(e) => warn!("ignoring gnb_search_list entry {entry:?}: {e}"),
             }
         }
-        if gnb_search_list.is_empty() && !task_base.config.gnb_search_list.is_empty() {
+        if gnb_search_list.is_empty()
+            && gnb_search_hosts.is_empty()
+            && !task_base.config.gnb_search_list.is_empty()
+        {
             error!(
                 "no usable gNB addresses: all {} gnb_search_list entries were rejected. \
                  The UE cannot find a cell.",
@@ -266,9 +276,58 @@ impl RlsTask {
         }
         let config = RlsTaskConfig {
             gnb_search_list,
+            gnb_search_hosts,
             ..Default::default()
         };
         Self::new(task_base, config)
+    }
+
+    /// The literal addresses plus the latest resolution of every hostname.
+    fn effective_search_space(&self) -> Vec<SocketAddr> {
+        let mut space: Vec<SocketAddr> = self
+            .config
+            .gnb_search_list
+            .iter()
+            .map(|addr| {
+                if addr.port() == 0 {
+                    SocketAddr::new(addr.ip(), DEFAULT_RLS_PORT)
+                } else {
+                    *addr
+                }
+            })
+            .collect();
+        for host in &self.config.gnb_search_hosts {
+            for addr in self.resolved_hosts.get(host).into_iter().flatten() {
+                if !space.contains(addr) {
+                    space.push(*addr);
+                }
+            }
+        }
+        space
+    }
+
+    /// Re-resolve every gNB named by hostname and update the heartbeat search
+    /// space if any answer changed (issue #286). A gNB pod that restarts comes
+    /// back at a new address; the cell at the old one stops answering and is
+    /// lost as usual, and the new one is discovered by the next heartbeat.
+    async fn reresolve_search_hosts(&mut self) {
+        let mut changed = false;
+        for host in self.config.gnb_search_hosts.clone() {
+            match host.resolve().await {
+                Ok(addrs) => {
+                    if self.resolved_hosts.get(&host) != Some(&addrs) {
+                        info!("gNB {host} resolves to {addrs:?}");
+                        self.resolved_hosts.insert(host, addrs);
+                        changed = true;
+                    }
+                }
+                Err(e) => debug!("gNB {host} does not resolve now: {e}"),
+            }
+        }
+        if changed {
+            let space = self.effective_search_space();
+            self.cell_search.set_search_space(space);
+        }
     }
 
     pub fn cell_count(&self) -> usize {
@@ -559,6 +618,8 @@ impl RlsTask {
         if self.serving_cell == Some(cell_id) {
             self.serving_cell = None;
             self.transport.clear_serving_endpoint();
+            // The serving gNB may have restarted at a new address (#286).
+            self.reresolve_search_hosts().await;
             let _ = self
                 .task_base
                 .rrc_tx
@@ -936,7 +997,7 @@ impl RlsTask {
         self.serving_cell = None;
         self.cell_addresses.clear();
         self.transport = RlsTransport::new(self.sti);
-        let search_space: Vec<SocketAddr> = self.config.gnb_search_list.clone();
+        let search_space: Vec<SocketAddr> = self.effective_search_space();
         self.cell_search = UeCellSearch::new(self.sti, search_space);
         self.cell_search
             .set_heartbeat_interval(self.config.heartbeat_interval);
@@ -1237,10 +1298,17 @@ impl Task for RlsTask {
             error!("Failed to initialize RLS socket: {}", e);
             return;
         }
+        // Hostnames are resolved before the first heartbeat; one that does not
+        // resolve yet is retried on `resolve_timer` (#286).
+        self.reresolve_search_hosts().await;
         info!(
-            "RLS task started with {} gNBs in search list",
-            self.config.gnb_search_list.len()
+            "RLS task started with {} gNB address(es) and {} gNB hostname(s) in search list",
+            self.config.gnb_search_list.len(),
+            self.config.gnb_search_hosts.len()
         );
+        let mut resolve_timer = interval(self.config.reresolve_interval);
+        resolve_timer.tick().await;
+        let has_hosts = !self.config.gnb_search_hosts.is_empty();
 
         let mut heartbeat_timer = interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
         let mut lost_cell_timer = interval(Duration::from_millis(LOST_CELL_CHECK_INTERVAL_MS));
@@ -1271,6 +1339,7 @@ impl Task for RlsTask {
                     }
                 }
                 _ = heartbeat_timer.tick() => self.send_heartbeats().await,
+                _ = resolve_timer.tick(), if has_hosts => self.reresolve_search_hosts().await,
                 _ = lost_cell_timer.tick() => {
                     self.check_lost_cells().await;
                     self.send_pending_acks().await;
@@ -1329,11 +1398,14 @@ mod tests {
         assert_eq!(task.config.gnb_search_list.len(), 1);
     }
 
+    fn lit(s: &str) -> PeerAddr {
+        PeerAddr::Literal(s.parse().unwrap())
+    }
+
     #[test]
     fn test_parse_gnb_search_entry_bare_ip_gets_default_port() {
         let addr = parse_gnb_search_entry("10.0.0.1").expect("bare IP must parse");
-        assert_eq!(addr.ip().to_string(), "10.0.0.1");
-        assert_eq!(addr.port(), DEFAULT_RLS_PORT);
+        assert_eq!(addr, lit(&format!("10.0.0.1:{DEFAULT_RLS_PORT}")));
     }
 
     #[test]
@@ -1344,15 +1416,20 @@ mod tests {
         assert_eq!(addr.port(), 5000);
     }
 
+    /// #286: a hostname is accepted (it used to be rejected, and before that
+    /// silently dropped) and kept as a name for the RLS task to resolve.
     #[test]
-    fn test_parse_gnb_search_entry_rejects_hostname() {
-        // The regression this guards: a hostname used to be silently discarded,
-        // leaving an empty search space and a UE that never finds a cell.
-        let err = parse_gnb_search_entry("gnb.nextg-system.svc.cluster.local")
-            .expect_err("a hostname must be rejected, not dropped");
-        assert!(
-            err.contains("gnb.nextg-system.svc.cluster.local"),
-            "error must name the offending entry, got: {err}"
+    fn test_parse_gnb_search_entry_accepts_a_hostname() {
+        assert_eq!(
+            parse_gnb_search_entry("gnb.nextg-system.svc.cluster.local"),
+            Ok(PeerAddr::Host(
+                "gnb.nextg-system.svc.cluster.local".into(),
+                DEFAULT_RLS_PORT
+            ))
+        );
+        assert_eq!(
+            parse_gnb_search_entry("gnb:5000"),
+            Ok(PeerAddr::Host("gnb".into(), 5000))
         );
     }
 
@@ -1360,26 +1437,74 @@ mod tests {
     fn test_parse_gnb_search_entry_rejects_empty_and_garbage() {
         assert!(parse_gnb_search_entry("").is_err());
         assert!(parse_gnb_search_entry("   ").is_err());
-        assert!(parse_gnb_search_entry("not-an-ip").is_err());
+        let err = parse_gnb_search_entry("not an ip").unwrap_err();
+        assert!(
+            err.contains("not an ip"),
+            "error must name the entry: {err}"
+        );
     }
 
     #[test]
     fn test_parse_gnb_search_entry_tolerates_surrounding_whitespace() {
         let addr = parse_gnb_search_entry("  10.0.0.1  ").expect("whitespace must be trimmed");
-        assert_eq!(addr.ip().to_string(), "10.0.0.1");
+        assert_eq!(addr, lit(&format!("10.0.0.1:{DEFAULT_RLS_PORT}")));
     }
 
     #[test]
-    fn test_from_ue_config_skips_bad_entries_but_keeps_good_ones() {
+    fn test_from_ue_config_splits_literals_and_hostnames() {
         let mut config = test_config();
         config.gnb_search_list = vec![
             "gnb.example.svc.cluster.local".to_string(),
             "10.0.0.7".to_string(),
+            "not an ip".to_string(),
         ];
         let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let task = RlsTask::from_ue_config(task_base);
         assert_eq!(task.config.gnb_search_list.len(), 1);
         assert_eq!(task.config.gnb_search_list[0].ip().to_string(), "10.0.0.7");
+        assert_eq!(
+            task.config.gnb_search_hosts,
+            vec![PeerAddr::Host(
+                "gnb.example.svc.cluster.local".into(),
+                DEFAULT_RLS_PORT
+            )]
+        );
+    }
+
+    /// #286: re-resolving a gNB hostname replaces the address heartbeats go
+    /// to. The UE last resolved the name to a dead address (the gNB pod that
+    /// restarted); the name now resolves elsewhere (`localhost` stands in for
+    /// the Service), and the search space follows it, while literals stay.
+    #[tokio::test]
+    async fn a_gnb_hostname_is_re_resolved_into_the_search_space() {
+        let mut config = test_config();
+        config.gnb_search_list = vec!["10.0.0.7".to_string(), "localhost:4321".to_string()];
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RlsTask::from_ue_config(task_base);
+        let host = PeerAddr::Host("localhost".into(), 4321);
+        let stale: SocketAddr = "192.0.2.1:4321".parse().unwrap();
+        task.resolved_hosts.insert(host.clone(), vec![stale]);
+        let space = task.effective_search_space();
+        task.cell_search.set_search_space(space);
+        assert!(task.cell_search.search_space().contains(&stale));
+
+        task.reresolve_search_hosts().await;
+
+        let space = task.cell_search.search_space();
+        assert!(
+            !space.contains(&stale),
+            "the dead address must go: {space:?}"
+        );
+        assert!(
+            space
+                .iter()
+                .any(|a| a.ip().is_loopback() && a.port() == 4321),
+            "the new address must be searched: {space:?}"
+        );
+        assert!(
+            space.contains(&"10.0.0.7:4997".parse().unwrap()),
+            "literals stay"
+        );
     }
 
     #[test]

@@ -15,8 +15,13 @@ use crate::types::{NetworkSlice, Plmn, SNssai, Supi};
 /// Defines the connection parameters for an AMF that the gNB connects to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AmfConfig {
-    /// IP address of the AMF
-    pub address: IpAddr,
+    /// The AMF: a literal IP address, or a hostname (issue #286).
+    ///
+    /// A hostname (e.g. a Kubernetes Service name) is resolved when the gNB
+    /// connects and again on every reconnect, and is re-checked while the
+    /// association is up, so an AMF that restarts at a new address is found
+    /// again without restarting the gNB. See [`AmfConfig::peer`].
+    pub address: String,
     /// SCTP port of the AMF (typically 38412)
     pub port: u16,
     /// Secondary AMF addresses for SCTP multi-homing (e.g. `["192.168.1.2"]`).
@@ -33,13 +38,26 @@ impl AmfConfig {
     /// Creates a new AMF configuration.
     ///
     /// # Arguments
-    /// * `address` - IP address of the AMF
+    /// * `address` - IP address or hostname of the AMF
     /// * `port` - SCTP port of the AMF
-    pub fn new(address: IpAddr, port: u16) -> Self {
+    pub fn new(address: impl std::fmt::Display, port: u16) -> Self {
         Self {
-            address,
+            address: address.to_string(),
             port,
             secondary_addresses: Vec::new(),
+        }
+    }
+
+    /// The AMF endpoint as a [`crate::peer_addr::PeerAddr`] on `port`.
+    pub fn peer(&self) -> Result<crate::peer_addr::PeerAddr, String> {
+        match crate::peer_addr::PeerAddr::parse(&self.address, self.port)? {
+            // `address` carries no port of its own; `port` is authoritative.
+            crate::peer_addr::PeerAddr::Literal(sa) => Ok(crate::peer_addr::PeerAddr::Literal(
+                std::net::SocketAddr::new(sa.ip(), self.port),
+            )),
+            crate::peer_addr::PeerAddr::Host(h, _) => {
+                Ok(crate::peer_addr::PeerAddr::Host(h, self.port))
+            }
         }
     }
 }
@@ -110,9 +128,14 @@ pub struct GnbConfig {
     /// it is cancelled and the UE stays on the source cell (TS 38.413 §8.4.1.2).
     #[serde(default = "default_tngreloc_prep_secs")]
     pub ngap_tngreloc_prep_secs: u64,
-    /// UPF GTP-U address for data plane forwarding (if None, uses loopback mode)
+    /// UPF GTP-U address for data plane forwarding (if None, uses loopback mode).
+    ///
+    /// An IP address or a hostname (issue #286). Only the presence of a value
+    /// and the fallback session path read it: a PDU session's uplink goes to
+    /// the UPF transport address the AMF signals in PDU Session Resource Setup,
+    /// so a UPF that restarts at a new address is followed without this.
     #[serde(default)]
-    pub upf_addr: Option<IpAddr>,
+    pub upf_addr: Option<String>,
     /// UPF GTP-U port (default: 2152)
     #[serde(default = "default_gtp_port")]
     pub upf_port: u16,
@@ -2398,7 +2421,7 @@ mod tests {
     #[test]
     fn test_amf_config_new() {
         let config = AmfConfig::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 38412);
-        assert_eq!(config.address, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(config.address, "192.168.1.1");
         assert_eq!(config.port, 38412);
     }
 

@@ -129,6 +129,18 @@ impl UeCellSearch {
         }
     }
 
+    /// Replaces the addresses heartbeats go to (issue #286): a gNB named by
+    /// hostname that restarts comes back at a new address. Cells already
+    /// discovered are kept; one that stops answering is lost as usual.
+    pub fn set_search_space(&mut self, search_space: Vec<SocketAddr>) {
+        self.search_space = search_space;
+    }
+
+    /// The addresses heartbeats currently go to.
+    pub fn search_space(&self) -> &[SocketAddr] {
+        &self.search_space
+    }
+
     /// Sets the UE's simulated position
     pub fn set_position(&mut self, pos: SimCoord) {
         self.sim_pos = pos;
