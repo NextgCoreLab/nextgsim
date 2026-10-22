@@ -1194,6 +1194,32 @@ impl UeApp {
                                     &mut pdu_counter,
                                 )
                                 .await;
+                            } else if orch.user_plane_reactivation_needed() {
+                                // CM-CONNECTED, but the user plane went with an
+                                // earlier connection (e.g. RLF and a mobility
+                                // registration on a new gNB): only a Service
+                                // Request re-establishes it (TS 24.501 §5.6.1.1,
+                                // nextgsim #288). The packet is held meanwhile.
+                                let uplink_data_status = psi
+                                    .map(|psi| nextgsim_ue::nas::mm::uplink_data_status(&[psi]))
+                                    .unwrap_or(None);
+                                info!(
+                                    "Initiating Service Request (data-triggered, CM-CONNECTED without \
+                                     user plane), uplink data status {uplink_data_status:?} for PSI {psi:?}"
+                                );
+                                let outs = orch
+                                    .start_service_request(ServiceType::Data, uplink_data_status);
+                                process_mm_outputs(
+                                    outs,
+                                    &mut orch,
+                                    &mut sm_orch,
+                                    &sm_session_params,
+                                    &mut plmn_selector,
+                                    &task_base,
+                                    &tun_tx,
+                                    &mut pdu_counter,
+                                )
+                                .await;
                             } else if orch.state().is_registered() && orch.state().is_connected() {
                                 debug!("Service Request not needed: already in CM-CONNECTED");
                             } else {

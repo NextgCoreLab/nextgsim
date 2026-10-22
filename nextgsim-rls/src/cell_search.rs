@@ -187,6 +187,36 @@ impl UeCellSearch {
     ) -> Vec<CellSearchEvent> {
         let mut events = Vec::new();
 
+        // The same STI answering from a DIFFERENT address is a new gNB
+        // incarnation, not the old cell (nextgsim #292). A gNB's STI is its NCI,
+        // so a restarted gNB pod -- same config, new IP -- reuses it. Updating
+        // the address in place kept the cell "alive" with the UE's link layer
+        // still bound to the dead address, so every PDU from the new gNB was
+        // dropped as coming from an unknown source and the UE never noticed it
+        // had lost its serving cell. Report the old cell lost, then discover
+        // the new one.
+        //
+        // While the old address is still being searched (both incarnations
+        // resolvable, e.g. a rolling update's overlap) the old cell is kept and
+        // the stranger's ack ignored, so two live gNBs sharing an STI cannot
+        // make the cell flap between them.
+        if let Some(old_addr) = self
+            .cells
+            .get(&sti)
+            .map(|c| c.address)
+            .filter(|a| *a != address)
+        {
+            if self.search_space.contains(&old_addr) {
+                return events;
+            }
+            if let Some(old) = self.cells.remove(&sti) {
+                self.cell_id_to_sti.remove(&old.cell_id);
+                events.push(CellSearchEvent::CellLost {
+                    cell_id: old.cell_id,
+                });
+            }
+        }
+
         if let Some(cell) = self.cells.get_mut(&sti) {
             // Existing cell - check for signal change
             let old_dbm = cell.dbm;
@@ -491,6 +521,45 @@ mod tests {
                 dbm: -80
             }
         ));
+        assert_eq!(search.cell_count(), 1);
+    }
+
+    /// #292: a cell whose STI answers from a new address (a gNB pod restarted
+    /// with the same NCI at a new IP) is lost and rediscovered under a new
+    /// cell ID at the new address, not silently re-pointed.
+    #[test]
+    fn a_known_sti_at_a_new_address_is_a_lost_cell_and_a_new_one() {
+        let mut search = UeCellSearch::new(12345, vec![test_addr(4997)]);
+        let ack = RlsHeartbeatAck::with_dbm(67890, -80);
+        search.process_heartbeat_ack(67890, test_addr(4997), &ack);
+
+        // Overlap: both addresses searched -> the old cell is kept.
+        search.set_search_space(vec![test_addr(4997), test_addr(5997)]);
+        let events = search.process_heartbeat_ack(67890, test_addr(5997), &ack);
+        assert!(
+            events.is_empty(),
+            "no flapping while both are searched: {events:?}"
+        );
+        assert_eq!(search.get_cell(0).unwrap().address, test_addr(4997));
+
+        // The old address no longer resolves -> new incarnation.
+        search.set_search_space(vec![test_addr(5997)]);
+        let events = search.process_heartbeat_ack(67890, test_addr(5997), &ack);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            events[0],
+            CellSearchEvent::CellLost { cell_id: 0 }
+        ));
+        assert!(matches!(
+            events[1],
+            CellSearchEvent::CellDiscovered {
+                cell_id: 1,
+                sti: 67890,
+                ..
+            }
+        ));
+        assert!(search.get_cell(0).is_none());
+        assert_eq!(search.get_cell(1).unwrap().address, test_addr(5997));
         assert_eq!(search.cell_count(), 1);
     }
 
