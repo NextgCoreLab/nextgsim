@@ -31,6 +31,8 @@ pub mod emm_type {
     pub const DETACH_REQUEST: u8 = 0x45;
     /// DETACH ACCEPT.
     pub const DETACH_ACCEPT: u8 = 0x46;
+    /// SERVICE REJECT.
+    pub const SERVICE_REJECT: u8 = 0x4E;
     /// AUTHENTICATION REQUEST.
     pub const AUTHENTICATION_REQUEST: u8 = 0x52;
     /// AUTHENTICATION RESPONSE.
@@ -87,6 +89,10 @@ pub mod emm_cause {
     pub const EPS_SERVICES_NOT_ALLOWED: u8 = 7;
     /// #8 EPS services and non-EPS services not allowed.
     pub const EPS_AND_NON_EPS_NOT_ALLOWED: u8 = 8;
+    /// #9 UE identity cannot be derived by the network.
+    pub const UE_IDENTITY_CANNOT_BE_DERIVED: u8 = 9;
+    /// #10 Implicitly detached.
+    pub const IMPLICITLY_DETACHED: u8 = 10;
     /// #11 PLMN not allowed.
     pub const PLMN_NOT_ALLOWED: u8 = 11;
     /// #12 Tracking area not allowed.
@@ -101,6 +107,8 @@ pub mod emm_cause {
     pub const MAC_FAILURE: u8 = 20;
     /// #21 Synch failure.
     pub const SYNCH_FAILURE: u8 = 21;
+    /// #22 Congestion.
+    pub const CONGESTION: u8 = 22;
     /// #23 UE security capabilities mismatch.
     pub const UE_SECURITY_CAPABILITIES_MISMATCH: u8 = 23;
     /// #24 Security mode rejected, unspecified.
@@ -111,6 +119,8 @@ pub mod emm_cause {
     pub const NON_EPS_AUTHENTICATION_UNACCEPTABLE: u8 = 26;
     /// #35 Requested service option not authorized in this PLMN.
     pub const SERVICE_OPTION_NOT_AUTHORIZED_IN_PLMN: u8 = 35;
+    /// #40 No EPS bearer context activated.
+    pub const NO_EPS_BEARER_CONTEXT_ACTIVATED: u8 = 40;
     /// #96 Invalid mandatory information.
     pub const INVALID_MANDATORY_INFORMATION: u8 = 96;
     /// #97 Message type non-existent or not implemented.
@@ -372,6 +382,17 @@ pub struct SecurityModeCommand {
     pub imeisv_requested: bool,
 }
 
+/// SERVICE REJECT (§8.2.24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceReject {
+    /// EMM cause.
+    pub cause: u8,
+    /// T3442 (IEI 5B), seconds; for #39 only.
+    pub t3442_s: Option<u64>,
+    /// T3346 (IEI 5F), seconds; for #22.
+    pub t3346_s: Option<u64>,
+}
+
 /// A downlink EMM message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownlinkEmm {
@@ -379,6 +400,8 @@ pub enum DownlinkEmm {
     AttachAccept(AttachAccept),
     /// ATTACH REJECT.
     AttachReject(AttachReject),
+    /// SERVICE REJECT.
+    ServiceReject(ServiceReject),
     /// AUTHENTICATION REQUEST (§8.2.7).
     AuthenticationRequest {
         /// NAS key set identifier ASME.
@@ -458,6 +481,22 @@ pub fn decode_downlink_emm(msg: &[u8]) -> Result<DownlinkEmm, NasDecodeError> {
                 }
             }
             DownlinkEmm::AttachReject(rej)
+        }
+        emm_type::SERVICE_REJECT => {
+            let cause = r.u8()?;
+            let mut rej = ServiceReject {
+                cause,
+                t3442_s: None,
+                t3346_s: None,
+            };
+            for (iei, v) in r.optional_ies(&[(0x5B, 2)])? {
+                match iei {
+                    0x5B => rej.t3442_s = timer2(v),
+                    0x5F => rej.t3346_s = timer2(v),
+                    _ => {}
+                }
+            }
+            DownlinkEmm::ServiceReject(rej)
         }
         emm_type::AUTHENTICATION_REQUEST => {
             let ksi = NasKsi::from_nibble(r.u8()? & 0x0F);

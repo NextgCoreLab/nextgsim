@@ -119,6 +119,24 @@ impl Mme {
         body
     }
 
+    /// Verify a SERVICE REQUEST (§8.2.25): KSI and the low 5 bits of the
+    /// uplink NAS COUNT, and the short MAC -- the 2 low octets of the EIA2 MAC
+    /// over the first two octets (§9.9.3.28). Returns the COUNT it used.
+    fn verify_service_request(&mut self, sr: &[u8]) -> u32 {
+        let count = self.ul;
+        assert_eq!(sr.len(), 4, "SERVICE REQUEST is 4 octets");
+        assert_eq!(sr[0], 0xC7, "security header type 12, EMM");
+        assert_eq!(
+            sr[1],
+            (1 << 5) | (count & 0x1F) as u8,
+            "KSI 1, sequence number"
+        );
+        let mac = nia2_compute_mac(count, 0, 0, &self.knas_int, &sr[..2]);
+        assert_eq!(&sr[2..], &mac[2..], "short MAC at COUNT {count}");
+        self.ul += 1;
+        count
+    }
+
     fn security_mode_command(&mut self, replayed: [u8; 2], imeisv: bool) -> Vec<u8> {
         let mut m = vec![0x07, 0x5D, 0x22, 0x01, 0x02, replayed[0], replayed[1]];
         if imeisv {
@@ -495,4 +513,151 @@ fn a_new_connection_integrity_protects_but_does_not_cipher_until_its_smc() {
     );
     let complete = mme.unprotect(&out.uplink[0]);
     assert_eq!(&complete[..2], &[0x07, 0x43]);
+}
+
+/// Attach, then lose the connection (an MME restart takes the cell down):
+/// EMM-REGISTERED in EMM-IDLE.
+fn registered_idle() -> (EpsNasUe, Mme, Instant) {
+    let (mut ue, mme, _) = attach();
+    let now = Instant::now();
+    ue.on_released(now);
+    assert_eq!(ue.state(), EmmState::Registered);
+    (ue, mme, now)
+}
+
+/// §5.6.1.1 b / §5.6.1.2: only pending uplink data makes a registered idle UE
+/// ask for a connection, and it asks with a SERVICE REQUEST under T3417 whose
+/// COUNT keys K_eNB (TS 33.401 A.3).
+#[test]
+fn pending_uplink_data_starts_a_service_request() {
+    let (mut ue, mut mme, now) = registered_idle();
+    assert_eq!(ue.initial_message(now), None, "no data, no connection");
+    ue.on_uplink_data_pending();
+    let sr = ue.initial_message(now).expect("SERVICE REQUEST");
+    let count = mme.verify_service_request(&sr);
+    assert_eq!(ue.state(), EmmState::ServiceRequestInitiated);
+    assert_eq!(ue.next_deadline(), Some(now + T3417));
+    assert_eq!(ue.k_enb(), Some(derive_kenb(&mme.kasme, count)));
+    assert_eq!(ue.initial_message(now), None, "one SERVICE REQUEST");
+    // §5.6.1.4: the DRBs set up complete it.
+    ue.on_user_plane_established();
+    assert_eq!(ue.state(), EmmState::Registered);
+    assert_eq!(ue.next_deadline(), None);
+    assert!(
+        ue.default_bearer().is_some(),
+        "the bearer survives idle mode"
+    );
+}
+
+/// §5.6.1.5 #9 (what a restarted MME answers): GUTI, TAI list and KSI deleted,
+/// bearers deactivated locally, EMM-DEREGISTERED; the network (or T3440)
+/// releases the connection and the UE attaches again with its IMSI.
+#[test]
+fn service_reject_9_reattaches_with_the_imsi() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    let sr = ue.initial_message(now).unwrap();
+    mme.verify_service_request(&sr);
+    let out = ue.on_downlink(&[0x07, 0x4E, 9], now);
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.state(), EmmState::Deregistered);
+    assert_eq!(ue.guti(), None);
+    assert_eq!(ue.default_bearer(), None);
+    assert!(ue.tai_list().is_empty());
+    assert_eq!(ue.k_enb(), None, "KSI deleted");
+    // No network release: T3440 releases locally.
+    assert_eq!(ue.next_deadline(), Some(now + T3440));
+    assert!(ue.on_timer(now + T3440).release);
+    ue.on_released(now + T3440);
+    let req = ue.initial_message(now + T3440).expect("re-attach");
+    assert_eq!(&req[..3], &[0x07, 0x41, 0x71], "plain, no KSI, EPS attach");
+    assert_eq!(ue.state(), EmmState::RegisteredInitiated);
+}
+
+/// §5.6.1.5 #10: bearers deactivated locally, EMM-DEREGISTERED, a new attach
+/// -- with the GUTI and the kept security context, so integrity protected.
+#[test]
+fn service_reject_10_reattaches_with_the_guti() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_downlink(&[0x07, 0x4E, 10], now);
+    assert_eq!(ue.state(), EmmState::Deregistered);
+    assert_eq!(ue.default_bearer(), None);
+    assert!(ue.guti().is_some());
+    ue.on_released(now);
+    assert_eq!(ue.next_deadline(), None, "the release stops T3440");
+    let req = ue.initial_message(now).expect("re-attach");
+    assert_eq!(req[0], 0x17, "integrity protected with the kept context");
+    let plain = mme.unprotect(&req);
+    assert_eq!(&plain[..2], &[0x07, 0x41]);
+    assert_eq!(plain[4], 0xF6, "GUTI identity");
+}
+
+/// §5.6.1.5 #40: no EPS bearer context at the network; the same re-attach.
+#[test]
+fn service_reject_40_reattaches() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    let out = ue.on_downlink(&mme.protect(&[0x07, 0x4E, 40], 2), now);
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.state(), EmmState::Deregistered);
+    assert_eq!(ue.default_bearer(), None);
+}
+
+/// §5.6.1.6 c: T3417 expiry (an MME that accepts without setting up the
+/// bearers) aborts the procedure and releases locally; the UE stays
+/// registered and the next uplink data tries again.
+#[test]
+fn t3417_expiry_aborts_and_the_next_data_retries() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    let out = ue.on_timer(now + T3417);
+    assert!(out.release);
+    assert_eq!(ue.state(), EmmState::Registered);
+    ue.on_released(now + T3417);
+    ue.on_uplink_data_pending();
+    let sr = ue
+        .initial_message(now + T3417)
+        .expect("a new SERVICE REQUEST");
+    mme.verify_service_request(&sr);
+}
+
+/// §5.6.1.6 a: a connection lost before the bearers are set up aborts it.
+#[test]
+fn a_release_during_the_service_request_aborts_it() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_released(now);
+    assert_eq!(ue.state(), EmmState::Registered);
+    assert_eq!(ue.next_deadline(), None);
+}
+
+/// §5.6.1.5 #22 with T3346: no new SERVICE REQUEST until T3346 expires.
+#[test]
+fn service_reject_22_bars_service_requests_for_t3346() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    // T3346 TLV: IEI 5F, length 1, GPRS timer 2 s (unit 2 s, value 1).
+    ue.on_downlink(&[0x07, 0x4E, 22, 0x5F, 0x01, 0x01], now);
+    assert_eq!(ue.state(), EmmState::Registered);
+    ue.on_released(now);
+    ue.on_uplink_data_pending();
+    assert_eq!(ue.initial_message(now), None, "barred by T3346");
+    let later = now + Duration::from_secs(2);
+    ue.on_timer(later);
+    assert!(ue.initial_message(later).is_some(), "T3346 expired");
+}
+
+/// A SERVICE REJECT outside a service request is not acted on.
+#[test]
+fn an_unsolicited_service_reject_is_ignored() {
+    let (mut ue, _mme, now) = registered_idle();
+    ue.on_downlink(&[0x07, 0x4E, 9], now);
+    assert_eq!(ue.state(), EmmState::Registered);
+    assert!(ue.guti().is_some());
 }

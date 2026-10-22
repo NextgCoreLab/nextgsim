@@ -771,6 +771,10 @@ impl UeRrc {
         for nas in &r.nas {
             replies.extend(self.nas.on_downlink_nas(nas));
         }
+        if !r.drbs.is_empty() {
+            self.nas
+                .on_rrc_indication(RrcIndication::RadioBearersEstablished);
+        }
         let State::Connected { srb1, .. } = &mut self.state else {
             return vec![];
         };
@@ -821,8 +825,14 @@ impl UeRrc {
 
     /// An IP packet from the IP stack, for the default bearer's DRB (the
     /// lowest LCID when NAS names no default bearer). Dropped when no DRB is
-    /// set up.
-    pub fn send_ip(&mut self, packet: &[u8]) -> Vec<UeAction> {
+    /// set up; in RRC_IDLE NAS is told uplink data is pending, which starts a
+    /// service request (TS 24.301 §5.6.1.1 b) -- the packet itself is not
+    /// buffered.
+    pub fn send_ip(&mut self, packet: &[u8], now: Instant) -> Vec<UeAction> {
+        if matches!(self.state, State::Idle) {
+            self.nas.on_uplink_pending();
+            return self.try_establish(now);
+        }
         let ebi = self.nas.default_bearer_ebi();
         let State::Connected { cell, user, .. } = &mut self.state else {
             return vec![];

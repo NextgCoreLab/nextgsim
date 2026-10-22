@@ -39,6 +39,8 @@ pub mod header_type {
     pub const INTEGRITY_NEW_CONTEXT: u8 = 3;
     /// Integrity protected and ciphered with new EPS security context.
     pub const INTEGRITY_CIPHERED_NEW_CONTEXT: u8 = 4;
+    /// Security header for the SERVICE REQUEST message (§9.3.1, 1100).
+    pub const SERVICE_REQUEST: u8 = 12;
 }
 
 /// Errors processing a security-protected NAS message.
@@ -166,6 +168,23 @@ impl EpsSecurityContext {
             .kenb_ul_count
             .unwrap_or_else(|| self.ul_count.wrapping_sub(1) & NAS_COUNT_MASK);
         derive_kenb(&self.kasme.0, count)
+    }
+
+    /// SERVICE REQUEST (§8.2.25): the security header type 12 octet, the KSI
+    /// and the 5 least significant bits of the uplink NAS COUNT (§9.9.3.19),
+    /// and the short MAC -- the 2 least significant octets of the NAS-MAC
+    /// computed over the first two octets with that COUNT (§9.9.3.28). The
+    /// message consumes the COUNT, which also keys `K_eNB` for the connection
+    /// it establishes (TS 33.401 §7.2.6.2 / A.3: the uplink NAS COUNT of the
+    /// SERVICE REQUEST).
+    pub fn service_request(&mut self) -> Vec<u8> {
+        let count = self.ul_count;
+        let first = (header_type::SERVICE_REQUEST << 4) | crate::msg::PD_EMM;
+        let second = ((self.ksi.value & 0x07) << 5) | (count & 0x1F) as u8;
+        let m = mac(self.eia, &self.k_nas_int.0, count, UPLINK, &[first, second]);
+        self.kenb_ul_count = Some(count);
+        self.ul_count = (count + 1) & NAS_COUNT_MASK;
+        vec![first, second, m[2], m[3]]
     }
 
     /// Protect an uplink NAS message with security header type `ht` (1..4).

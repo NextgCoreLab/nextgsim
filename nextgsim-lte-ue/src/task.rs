@@ -111,7 +111,7 @@ pub async fn run(
                 acts
             }
             _ = sleep => rrc.on_timer(Instant::now()),
-            Some(packet) = ip.uplink.recv() => rrc.send_ip(&packet),
+            Some(packet) = ip.uplink.recv() => rrc.send_ip(&packet, Instant::now()),
             r = socket.recv_from(&mut buf) => {
                 let (n, from) = r?;
                 match rls_codec::decode(&buf[..n]) {
