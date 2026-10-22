@@ -272,10 +272,12 @@ semantic_comm_enabled: false    # Semantic Codec - semantic communication (Rel-2
 # protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4).
 #
 # false by default, and that is deliberate rather than caution. Turning it on
-# drops ALL UL-DCCH traffic today, because the gNB's uplink dispatcher still
-# routes on `bytes[0] & 0x0F` of the RAW PDU (C5_TYPED_DCCH_DISPATCH is false)
-# and a ciphered PDU has no meaningful leading nibble. Enabling it by default
-# therefore needs the C5 typed-dispatch flip as well.
+# drops ALL UL-DCCH traffic after the SecurityModeComplete today, because the UE
+# has no SRB1 PDCP protection site yet (nextgsim#285): it keeps sending plaintext,
+# and the gNB, now active, discards every PDU that fails its integrity check --
+# Registration Complete and the PDU Session Establishment Request included.
+# Leave it false on both ends until #285 lands; with it off the UE answers the
+# unprotected AS SecurityModeCommand with SecurityModeFailure, which is expected.
 #
 # THE gNB AND THE UE MUST BE SET THE SAME WAY. A gNB with it on and a UE with it
 # off would have the UE read a MAC-I as message content.
