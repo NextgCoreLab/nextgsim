@@ -865,6 +865,13 @@ impl RrcConnectionManager {
         // connection is keyed on, and dropping it here would leave a CONNECTED UE
         // whose SRB1 could not be protected.
         ctx.reestablishment_security = Some(stored.security);
+        // §5.3.13.3/§5.3.13.4: SRB1 comes back re-established -- COUNTs at 0 --
+        // and protected (ciphered and integrity protected, RRCResume included) when
+        // it was before the suspend (#285).
+        if stored.srb1_protected {
+            ctx.on_as_security_activated();
+            ctx.reestablish_srb1_pdcp();
+        }
         ctx.on_setup_sent();
 
         info!(

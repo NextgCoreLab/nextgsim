@@ -269,15 +269,13 @@ pub struct GnbConfig {
     /// Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
     /// protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4, issue #31).
     ///
-    /// **`false` by default**, which is a deliberate deviation from #31's own
-    /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
-    /// rule already carves out: default-ON *except where the behaviour drops
-    /// traffic*. Turning this on drops **all** UL-DCCH traffic after the
-    /// SecurityModeComplete today, because the UE has no SRB1 PDCP protection site
-    /// yet (nextgsim#285): it keeps sending plaintext, and the gNB, now active,
-    /// discards every uplink PDU that fails its integrity check. (The earlier
-    /// reason, `C5_TYPED_DCCH_DISPATCH` being `false`, no longer holds: it is
-    /// `true`, and the gNB unprotects UL-DCCH before dispatch.)
+    /// **`false` by default**, a deliberate deviation from #31's criterion 1
+    /// ("defaults to on") under the runtime-switch rule's carve-out: default-ON
+    /// *except where the behaviour drops traffic*. Since #285 both ends protect
+    /// SRB1 through registration, PDU session setup, RRC re-establishment and
+    /// resume; what still drops traffic is a HANDOVER with it on: the target gNB
+    /// does not activate SRB1 protection with the re-derived keys, so the UE (which
+    /// does) and the target disagree (#325).
     ///
     /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
     /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
@@ -2040,15 +2038,13 @@ pub struct UeConfig {
     /// Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
     /// protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4, issue #31).
     ///
-    /// **`false` by default**, which is a deliberate deviation from #31's own
-    /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
-    /// rule already carves out: default-ON *except where the behaviour drops
-    /// traffic*. Turning this on drops **all** UL-DCCH traffic after the
-    /// SecurityModeComplete today, because the UE has no SRB1 PDCP protection site
-    /// yet (nextgsim#285): it keeps sending plaintext, and the gNB, now active,
-    /// discards every uplink PDU that fails its integrity check. (The earlier
-    /// reason, `C5_TYPED_DCCH_DISPATCH` being `false`, no longer holds: it is
-    /// `true`, and the gNB unprotects UL-DCCH before dispatch.)
+    /// **`false` by default**, a deliberate deviation from #31's criterion 1
+    /// ("defaults to on") under the runtime-switch rule's carve-out: default-ON
+    /// *except where the behaviour drops traffic*. Since #285 both ends protect
+    /// SRB1 through registration, PDU session setup, RRC re-establishment and
+    /// resume; what still drops traffic is a HANDOVER with it on: the target gNB
+    /// does not activate SRB1 protection with the re-derived keys, so the UE (which
+    /// does) and the target disagree (#325).
     ///
     /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
     /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
