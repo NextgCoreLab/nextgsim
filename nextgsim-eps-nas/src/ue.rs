@@ -285,11 +285,19 @@ impl EpsNasUe {
 
     /// The lower layers indicate that the user plane radio bearers are set
     /// up: the service request completed successfully (§5.6.1.4).
+    ///
+    /// On a connection a SERVICE REQUEST set up, this indication is also what
+    /// establishes the secure exchange of NAS messages (§4.4.2.3 item 2): from
+    /// here on every uplink NAS message is ciphered (§4.4.5), and a receiver
+    /// discards one that should have been but was not (#318).
     pub fn on_user_plane_established(&mut self) {
         if self.state == EmmState::ServiceRequestInitiated {
             log::info!("EMM: user plane radio bearers set up; service request complete (§5.6.1.4)");
             self.t3417 = None;
             self.state = EmmState::Registered;
+            if self.ctx.is_some() {
+                self.secure_exchange = true;
+            }
         }
     }
 
