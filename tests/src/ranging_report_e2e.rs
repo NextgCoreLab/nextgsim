@@ -120,18 +120,18 @@ fn spawn_harness() -> Harness {
 
     let sidelink = TaskHandle::new(sidelink_tx);
     let ranging = TaskHandle::new(ranging_tx);
-    let base = UeTaskBase {
-        config: std::sync::Arc::new(ranging_config()),
-        app_tx: TaskHandle::new(app_tx),
-        nas_tx: TaskHandle::new(nas_tx),
-        rrc_tx: TaskHandle::new(rrc_tx),
-        rls_tx: TaskHandle::new(rls_tx),
-        rel18: Some(UeRel18Handles {
+    let base = UeTaskBase::from_handles(
+        std::sync::Arc::new(ranging_config()),
+        TaskHandle::new(app_tx),
+        TaskHandle::new(nas_tx),
+        TaskHandle::new(rrc_tx),
+        TaskHandle::new(rls_tx),
+        Some(UeRel18Handles {
             ranging_tx: ranging.clone(),
             mint_tx: TaskHandle::new(mint_tx),
             sidelink_tx: sidelink.clone(),
         }),
-    };
+    );
 
     let mut sidelink_task = SidelinkTask::new(base.clone());
     let mut ranging_task = RangingTask::new(base);
@@ -254,18 +254,18 @@ async fn a_ue_with_ranging_disabled_sends_no_range_at_all() {
     let (mint_tx, _mint_rx) = mpsc::channel(8);
     let sidelink = TaskHandle::new(sidelink_tx);
     let ranging = TaskHandle::new(ranging_tx);
-    let base = UeTaskBase {
-        config: std::sync::Arc::new(config.clone()),
-        app_tx: TaskHandle::new(app_tx),
-        nas_tx: TaskHandle::new(nas_tx),
-        rrc_tx: TaskHandle::new(rrc_tx),
-        rls_tx: TaskHandle::new(rls_tx),
-        rel18: Some(UeRel18Handles {
+    let base = UeTaskBase::from_handles(
+        std::sync::Arc::new(config.clone()),
+        TaskHandle::new(app_tx),
+        TaskHandle::new(nas_tx),
+        TaskHandle::new(rrc_tx),
+        TaskHandle::new(rls_tx),
+        Some(UeRel18Handles {
             ranging_tx: ranging.clone(),
             mint_tx: TaskHandle::new(mint_tx),
             sidelink_tx: sidelink.clone(),
         }),
-    };
+    );
     let mut sidelink_task = SidelinkTask::new(base.clone());
     let mut ranging_task = RangingTask::new(base);
     let sidelink_run = tokio::spawn(async move { sidelink_task.run(sidelink_rx).await });
