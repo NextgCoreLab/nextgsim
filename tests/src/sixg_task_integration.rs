@@ -445,8 +445,9 @@ async fn test_nwdaf_to_rrc_handover_recommendation_arrives() {
     sixg.nwdaf_tx
         .send(NwdafMessage::CellLoad {
             cell_id: 1,
-            prb_usage: 0.75,
+            prb_usage: Some(0.75),
             connected_ues: 12,
+            throughput_mbps: None,
         })
         .await
         .expect("CellLoad send must succeed");
