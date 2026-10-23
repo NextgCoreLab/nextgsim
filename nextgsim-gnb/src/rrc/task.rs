@@ -242,7 +242,17 @@ impl RrcTask {
             cho_configured_ues: std::collections::HashSet::new(),
             pending_handover_arrivals: std::collections::HashSet::new(),
             relay_local_ue_ids: std::collections::HashMap::new(),
-            handover_manager: GnbHandoverManager::new(own_cell),
+            handover_manager: {
+                // The decision margin is the one the UE's A3 measurement
+                // configuration carries (#324); it was a fixed 3/1 dB.
+                let mut manager = GnbHandoverManager::new(own_cell);
+                manager.set_config(crate::rrc::handover::HandoverConfig {
+                    a3_offset: task_base_config.cho_a3_offset_db,
+                    hysteresis: task_base_config.cho_hysteresis_db,
+                    ..Default::default()
+                });
+                manager
+            },
         }
     }
 
@@ -2494,12 +2504,10 @@ impl RrcTask {
                     ue_id
                 );
             }
-            HandoverDecision::IntraGnbHandover { target_cell_id } => {
-                info!(
-                    "UE[{}] measurement-triggered handover to cell {}",
-                    ue_id, target_cell_id
-                );
-                self.execute_handover(ue_id, target_cell_id).await;
+            HandoverDecision::IntraGnbHandover {
+                target_cell_id: reported_pci,
+            } => {
+                self.handover_to_reported_pci(ue_id, reported_pci).await;
             }
             other => {
                 // The manager models Xn and inter-gNB decisions its A3 evaluator does
@@ -2512,6 +2520,49 @@ impl RrcTask {
                 );
             }
         }
+    }
+
+    /// Act on the A3 winner of a measurement report, named by the `physCellId` the
+    /// UE reported (#324).
+    ///
+    /// - This gNB's configured SCell: intra-gNB, as before.
+    /// - A configured `handover_neighbours` cell (`nci % 1008`): inter-gNB, HANDOVER
+    ///   REQUIRED naming that neighbour's gNB ID, cell and TAC (TS 38.413 §8.4.1).
+    /// - Anything else: not handed over to. The PCI used to be passed on as a cell
+    ///   ID, and from there as the target gNB ID, so the AMF was asked to route to
+    ///   a gNB whose ID was a PCI.
+    async fn handover_to_reported_pci(&mut self, ue_id: i32, reported_pci: i32) {
+        let Ok(pci) = u16::try_from(reported_pci) else {
+            warn!("UE[{ue_id}] reported PCI {reported_pci}, out of range; staying");
+            return;
+        };
+        if self.task_base.config.scell_phys_cell_id == Some(pci) {
+            info!("UE[{ue_id}] measurement-triggered intra-gNB handover to PCI {pci}");
+            self.execute_handover(ue_id, i32::from(pci)).await;
+            return;
+        }
+        let neighbour = self
+            .task_base
+            .config
+            .handover_neighbours
+            .iter()
+            .find(|n| n.phys_cell_id() == pci)
+            .copied();
+        let Some(neighbour) = neighbour else {
+            info!(
+                "UE[{ue_id}] reports PCI {pci} better than its serving cell, but no \
+                 configured handover neighbour has it; staying"
+            );
+            return;
+        };
+        let target_gnb_id = neighbour.gnb_id(self.task_base.config.gnb_id_length);
+        info!(
+            "UE[{ue_id}] measurement-triggered N2 handover to PCI {pci}: gNB {target_gnb_id}, \
+             cell {:#x}, TAC {}",
+            neighbour.nci, neighbour.tac
+        );
+        self.start_n2_handover(ue_id, target_gnb_id, neighbour.nci, neighbour.tac)
+            .await;
     }
 
     /// Hand a UE over to `target_cell`, intra-gNB or inter-gNB (issue #39).
@@ -2553,22 +2604,47 @@ impl RrcTask {
             return;
         }
 
-        // Inter-gNB: HANDOVER REQUIRED through NGAP. The UE's capability container comes
-        // from this context because the NGAP task does not hold it, and the target needs
-        // it to configure the UE at all.
+        // Inter-gNB. A configured neighbour names the target node (#324); a cell
+        // that matches none falls back to the old stand-in, the cell's own identity
+        // as the gNB ID, which an AMF can route only by coincidence.
+        if let Some(neighbour) = self
+            .task_base
+            .config
+            .handover_neighbours
+            .iter()
+            .find(|n| (n.nci & 0xF_FFFF_FFFF) as i32 == target_cell)
+            .copied()
+        {
+            let gnb_id = neighbour.gnb_id(self.task_base.config.gnb_id_length);
+            self.start_n2_handover(ue_id, gnb_id, neighbour.nci, neighbour.tac)
+                .await;
+            return;
+        }
+        let tac = self.task_base.config.tac;
+        self.start_n2_handover(ue_id, target_cell as u32, target_cell as u64, tac)
+            .await;
+    }
+
+    /// Ask NGAP to send HANDOVER REQUIRED for `ue_id` toward `target_gnb_id`
+    /// (TS 38.413 §8.4.1).
+    async fn start_n2_handover(
+        &mut self,
+        ue_id: i32,
+        target_gnb_id: u32,
+        target_cell_identity: u64,
+        target_tac: u32,
+    ) {
+        // The UE's capability container comes from this context because the NGAP task
+        // does not hold it, and the target needs it to configure the UE at all.
         let ue_nr_capability = self
             .ue_manager
             .try_find_ue(ue_id)
             .and_then(|ctx| ctx.nr_capability.clone());
         let msg = NgapMessage::InitiateHandover(Box::new(HandoverInitiation {
             ue_id,
-            // The simulator has no inter-gNB topology, so the recommended cell's own
-            // identity stands in for the target node's. Stated rather than hidden: an
-            // AMF routes on the gNB ID, and with no neighbour table this is the only
-            // value this gNB has.
-            target_gnb_id: target_cell as u32,
-            target_tac: self.task_base.config.tac,
-            target_cell_identity: target_cell as u64,
+            target_gnb_id,
+            target_tac,
+            target_cell_identity: target_cell_identity & 0xF_FFFF_FFFF,
             ue_nr_capability,
             // Time on the source cell is not tracked per UE, so 0 is reported: "no
             // measured dwell time" rather than an invented one.
@@ -4538,8 +4614,17 @@ mod tests {
     /// `execute_handover`).
     #[test]
     fn a_measurement_report_with_a_better_neighbour_triggers_a_handover() {
+        // #324: the reported PCI is resolved through the configured neighbours.
+        // The neighbour is NCI 1050, whose PCI is 1050 % 1008 = 42 and whose gNB ID
+        // is 1050 >> 4 = 65 with this gNB's 32-bit ID length; TAC 7.
+        let mut config = test_config();
+        config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+            nci: 1050,
+            tac: 7,
+            gnb_id_length: None,
+        }];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
-            GnbTaskBase::new(test_config(), 16);
+            GnbTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
 
         run_async(async {
@@ -4565,9 +4650,82 @@ mod tests {
             initiated.expect("a report naming a much better neighbour must start a handover");
         assert_eq!(init.ue_id, 7);
         assert_eq!(
-            init.target_cell_identity, 42,
-            "and it must target the cell the UE reported"
+            init.target_cell_identity, 1050,
+            "the neighbour cell whose PCI the UE reported"
         );
+        assert_eq!(init.target_gnb_id, 1050 >> 4, "that neighbour's gNB ID");
+        assert_eq!(init.target_tac, 7, "and its TAC");
+    }
+
+    /// #324: a better neighbour whose PCI no configured neighbour carries is not
+    /// handed over to. Before, the PCI itself became the target gNB ID.
+    #[test]
+    fn a_better_neighbour_that_is_not_configured_triggers_nothing() {
+        let mut config = test_config();
+        config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+            nci: 1050,
+            tac: 7,
+            gnb_id_length: None,
+        }];
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                ctx.on_setup_complete();
+            }
+            while ngap_rx.try_recv().is_ok() {}
+            let pdu = measurement_report_pdu(-100, 43, -80);
+            task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+        });
+        while let Ok(msg) = ngap_rx.try_recv() {
+            assert!(
+                !matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_))),
+                "PCI 43 is no configured neighbour"
+            );
+        }
+    }
+
+    /// #324: the decision margin is the configured `cho_a3_offset_db` /
+    /// `cho_hysteresis_db`, the values the UE's measurement configuration carries.
+    /// A neighbour 2 dB better triggers nothing under the default 3/1 dB margin and
+    /// a handover under a configured 1/0.5 dB one.
+    #[test]
+    fn the_handover_decision_uses_the_configured_a3_margin() {
+        for (offset, hysteresis, expect) in [(3.0, 1.0, false), (1.0, 0.5, true)] {
+            let mut config = test_config();
+            config.cho_a3_offset_db = offset;
+            config.cho_hysteresis_db = hysteresis;
+            config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 1050,
+                tac: 7,
+                gnb_id_length: None,
+            }];
+            let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, 16);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                establish_pending_setup(&mut task, 7).await;
+                if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                    ctx.on_setup_complete();
+                }
+                while ngap_rx.try_recv().is_ok() {}
+                let pdu = measurement_report_pdu(-90, 42, -88);
+                task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                    .await;
+            });
+            let mut handed_over = false;
+            while let Ok(msg) = ngap_rx.try_recv() {
+                handed_over |=
+                    matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_)));
+            }
+            assert_eq!(
+                handed_over, expect,
+                "offset {offset}, hysteresis {hysteresis}"
+            );
+        }
     }
 
     /// The negative control: a neighbour that does NOT beat the serving cell by the A3

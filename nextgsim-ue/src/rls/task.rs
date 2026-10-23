@@ -25,7 +25,7 @@ use nextgsim_common::OctetString;
 use nextgsim_pdcp::{Pdcp, PdcpConfig};
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
-    codec, CellSearchEvent, RlsMessage as RlsProtocolMessage, RlsTransport, RrcChannel,
+    codec, CellSearchEvent, RlsMessage as RlsProtocolMessage, RlsTransport, RrcChannel, SimCoord,
     TransportEvent, UeCellSearch,
 };
 
@@ -136,8 +136,8 @@ pub struct RlsTask {
     /// of the gNB's policy, which would be a second copy of it.
     #[cfg(feature = "sdap-dataplane")]
     sdap_uplink: HashMap<i32, SdapUplinkBinding>,
-    /// When this task started, the origin for the PDCP timers.
-    #[cfg(feature = "drb-pdcp")]
+    /// When this task started: the origin for the PDCP timers and for the
+    /// UE's `sim_movement` (#324).
     started_at: std::time::Instant,
     /// The NTN uplink pre-compensation in force, derived from SIB19
     /// (TS 38.300 §16.14.2.2, issue #56).
@@ -241,7 +241,6 @@ impl RlsTask {
             drb_to_psi: HashMap::new(),
             #[cfg(feature = "sdap-dataplane")]
             sdap_uplink: HashMap::new(),
-            #[cfg(feature = "drb-pdcp")]
             started_at: std::time::Instant::now(),
             // No pre-compensation until a SIB19 says otherwise (issue #56). A
             // terrestrial UE never leaves this state, which is what keeps every
@@ -600,6 +599,17 @@ impl RlsTask {
         // next heartbeat ~2 s out — exceeding the 2 s cell-lost threshold and
         // spuriously dropping the serving cell (SignalLostToConnectedCell) right
         // after registration, before the PDU session could complete.
+        // The UE's simulated position now (#324): its configured start, moved
+        // along `sim_movement` if one is set. Each gNB derives this UE's received
+        // level from it, so a moving UE's measurements change and a handover can
+        // be driven. Carried in every heartbeat.
+        let cfg = &self.task_base.config;
+        let pos = match cfg.sim_movement {
+            Some(movement) => movement.position_at(cfg.sim_position, self.started_at.elapsed()),
+            None => cfg.sim_position,
+        };
+        self.cell_search
+            .set_position(SimCoord::new(pos.x, pos.y, pos.z));
         for (addr, heartbeat) in self.cell_search.create_heartbeats() {
             self.send_rls_message(addr, &RlsProtocolMessage::Heartbeat(heartbeat))
                 .await;

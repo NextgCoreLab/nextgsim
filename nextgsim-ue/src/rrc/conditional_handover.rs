@@ -189,7 +189,13 @@ impl CondReconfigStore {
             let Some((event_type, ref trigger)) = stored.trigger else {
                 continue;
             };
-            let cell_id = candidate_cell_id(&stored.candidate);
+            let Some(cell_id) =
+                measurements.cell_id_for_pci(stored.candidate.target_cell.phys_cell_id)
+            else {
+                // The target cell is not measured (not heard yet).
+                stored.condition_met_since = None;
+                continue;
+            };
 
             if !measurements.candidate_condition_holds(event_type, trigger, cell_id) {
                 stored.condition_met_since = None;
@@ -223,12 +229,12 @@ impl CondReconfigStore {
     }
 }
 
-/// The simulator cell id of a candidate's target cell.
+/// A placeholder simulator cell id for a candidate's target cell: its PCI.
 ///
-/// The UE measurement path keys cells by the RLS cell id and reports that id as
-/// the physical cell identity (`MeasurementManager::update_measurement` sets
-/// `pci: cell_id as u32`), so the two are the same number throughout this
-/// simulator and a candidate's `phys_cell_id` identifies the measured cell.
+/// Since #324 measured cells carry their real PCI (`nci % 1008`), so a PCI is no
+/// longer a cell id. [`CondReconfigStore::evaluate`] finds the measured cell by
+/// PCI, and `handle_handover_command` re-resolves the target from the PCI, so
+/// this value is overwritten before anything uses it.
 pub fn candidate_cell_id(candidate: &ChoCandidateCell) -> i32 {
     i32::from(candidate.target_cell.phys_cell_id)
 }

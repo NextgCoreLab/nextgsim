@@ -129,7 +129,10 @@ impl RlsTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         // Generate STI from gNB NCI
         let sti = task_base.config.nci;
-        let phy_location = SimCoord::new(0, 0, 0);
+        // The configured antenna position (#324). Fixed at the origin before, so
+        // every gNB measured the same to every UE and no handover could trigger.
+        let pos = task_base.config.sim_position;
+        let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
 
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
@@ -158,7 +161,10 @@ impl RlsTask {
     /// Creates a new RLS task with custom bind address
     pub fn with_bind_address(task_base: GnbTaskBase, bind_address: SocketAddr) -> Self {
         let sti = task_base.config.nci;
-        let phy_location = SimCoord::new(0, 0, 0);
+        // The configured antenna position (#324). Fixed at the origin before, so
+        // every gNB measured the same to every UE and no handover could trigger.
+        let pos = task_base.config.sim_position;
+        let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
 
         Self {
             task_base,

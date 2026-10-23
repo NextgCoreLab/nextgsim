@@ -1167,6 +1167,11 @@ impl RrcTask {
         for (&cell_id, cell) in cells.iter() {
             self.measurement_manager
                 .update_measurement(cell_id, cell.dbm);
+            // The real PCI, so a MeasurementReport names the cell the gNB knows
+            // (#324). It used to carry the local RLS index (0, 1, ...).
+            if let Some(pci) = self.cell_selector.phys_cell_id_of(cell_id) {
+                self.measurement_manager.set_phys_cell_id(cell_id, pci);
+            }
         }
 
         // Inter-RAT (E-UTRA) measurements, for events B1/B2. Configured rather
@@ -1919,6 +1924,9 @@ impl RrcTask {
                 debug!("Signal updated: cell_id={}, dbm={}", id, dbm);
                 // Update measurement manager
                 self.measurement_manager.update_measurement(id, dbm);
+                if let Some(pci) = self.cell_selector.phys_cell_id_of(id) {
+                    self.measurement_manager.set_phys_cell_id(id, pci);
+                }
             }
             CellChangeEvent::None => {}
         }
@@ -3910,9 +3918,12 @@ impl RrcTask {
                     }
                 }
                 for addition in &config.to_add {
-                    // physCellId is the simulator cell id throughout the UE
-                    // measurement path (see `candidate_cell_id`).
-                    let cell_id = i32::from(addition.phys_cell_id);
+                    // The SCell is named by its physCellId; the measured cell
+                    // carrying it is found by PCI (#324). A cell not heard yet
+                    // keeps the PCI as its key, so it matches nothing until then.
+                    let cell_id = self
+                        .resolve_target_cell(u32::from(addition.phys_cell_id))
+                        .unwrap_or(i32::from(addition.phys_cell_id));
                     self.configured_scells.insert(addition.scell_index, cell_id);
                     info!(
                         "SCell configured: sCellIndex={}, physCellId={}, measured={}",

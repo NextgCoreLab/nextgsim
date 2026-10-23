@@ -6183,6 +6183,22 @@ impl Task for NgapTask {
                     NgapMessage::RadioLinkFailure { ue_id } => {
                         self.handle_radio_link_failure(ue_id).await;
                     }
+                    NgapMessage::InitiateHandover(request)
+                        if self
+                            .guard_timers
+                            .is_pending(GuardTimer::HandoverPreparation {
+                                ue_id: request.ue_id,
+                            }) =>
+                    {
+                        // One preparation per UE at a time (TS 38.413 §8.4.1.2:
+                        // TNGRELOCprep guards it). A UE keeps reporting the better
+                        // neighbour every report interval until it moves (#324), and
+                        // each report used to send another HANDOVER REQUIRED.
+                        debug!(
+                            "UE[{}]: handover preparation already in progress; not repeated",
+                            request.ue_id
+                        );
+                    }
                     NgapMessage::InitiateHandover(request) => {
                         // The production caller `initiate_handover` never had (issue #39).
                         if !self.initiate_handover(*request).await {

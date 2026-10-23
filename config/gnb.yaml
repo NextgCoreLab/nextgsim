@@ -203,6 +203,24 @@ federated_learning_enabled: false  # Federated Learning Aggregator (Rel-20)
 # discarded, and no DRB is established until activation completes.
 as_security_enabled: false
 
+# Simulated position and N2 handover neighbours (#324).
+#
+# Every UE's received level is derived from the distance between this position
+# and the UE's own `sim_position` (in metres; -1 dBm per metre, so keep the two
+# 31..120 m apart: nearer than 31 m every level reports at the RSRP-Range limit
+# of -31 dBm, beyond 120 m the cell is not heard).
+sim_position: { x: 0, y: 0, z: 0 }
+# Cells of OTHER gNBs a measurement-triggered handover may target. A UE's
+# MeasurementReport names a cell by physCellId, which in this simulator is
+# `nci % 1008`; the matching entry gives the target gNB ID (the top
+# `gnb_id_length` bits of its nci) and TAC for HANDOVER REQUIRED. A reported
+# PCI matching no entry is not handed over to. This one is the second gNB of
+# the N2-handover scenario, config/gnb-n2ho-target.yaml; with no such gNB
+# running nothing ever reports it.
+handover_neighbours:
+  - nci: 0x000000020
+    tac: 1
+
 # NTN (satellite) operation (TS 38.300 §16.14, issue #56).
 #
 # Commented out: with this block ABSENT this is a terrestrial cell, it broadcasts no
