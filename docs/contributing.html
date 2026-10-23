@@ -59,7 +59,7 @@
       <h3 class="group-heading">2. Clone &amp; provision your environment</h3>
       <table class="cg-table">
         <tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
-        <tr><td>Rust</td><td>stable (&ge;1.75)</td><td>Build toolchain</td></tr>
+        <tr><td>Rust</td><td>pinned by rust-toolchain.toml (1.95.0)</td><td>Build toolchain</td></tr>
         <tr><td>Docker + docker-compose</td><td>&ge;24</td><td>E2E testing with NextGCore</td></tr>
       </table>
       <div class="code-block">
@@ -70,7 +70,7 @@
 <span class="comment"># Fork on GitHub, then:</span>
 <span class="cmd">git clone https://github.com/&lt;you&gt;/nextgsim.git &amp;&amp; cd nextgsim</span></code>
       </div>
-      <p>Pure Rust, zero C dependencies — no protoc, libsctp, or ASN.1 compiler needed.</p>
+      <p>Pure Rust, zero C dependencies in the default build — no protoc or system ASN.1 compiler (the codecs are generated at build time by NextgCoreLab/asn1-codegen). libsctp is needed only for <code>--features kernel-sctp</code>.</p>
     </div>
 
     <div class="cg-section" id="build">
@@ -94,9 +94,8 @@
 <span class="cmd">cargo test -p nextgsim-ue</span>       <span class="comment"># one crate</span>
 <span class="cmd">cargo test -- --nocapture</span>       <span class="comment"># with log output</span>
 
-<span class="comment"># E2E against a running NextGCore stack</span>
-<span class="cmd">cd ../nextgcore/docker/rust &amp;&amp; docker compose up -d &amp;&amp; cd -</span>
-<span class="cmd">cargo test -p nextgsim-tests --features e2e</span></code>
+<span class="comment"># E2E against NextGCore (builds both repos, then registration + PDU session + ping)</span>
+<span class="cmd">cd ../nextgcore/docker/rust &amp;&amp; ./e2e.sh</span></code>
       </div>
       <p><strong>Honesty rule:</strong> E2E validation runs against the matched NextGCore — it proves internal consistency, not third-party conformance. Where an encoding is sim-internal/bespoke (several Rel-17/18 and all 6G prototypes), say so in the module doc comment.</p>
     </div>
@@ -105,8 +104,8 @@
       <h3 class="group-heading">5. Code style &amp; pre-commit checklist</h3>
       <div class="code-block">
         <button class="copy-btn">Copy</button>
-        <code><span class="cmd">cargo fmt --all</span>
-<span class="cmd">cargo clippy --workspace -- -D warnings</span>
+        <code><span class="cmd">cargo fmt --all -- --check</span>
+<span class="cmd">cargo clippy --workspace --all-targets</span>
 <span class="cmd">cargo test --workspace</span>
 <span class="cmd">cargo audit</span>   <span class="comment"># cargo install cargo-audit</span></code>
       </div>

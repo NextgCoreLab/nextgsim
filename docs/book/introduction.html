@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -178,61 +178,71 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
-<p><strong>NextGSim</strong> is a 5G UE and gNB simulator written in pure Rust — no C dependencies from SCTP to ASN.1 PER. It implements a 3GPP Rel-15 baseline with selected Rel-17/18 features, plus a set of 6G exploration prototypes (AI-native crates for sensing, learning, and autonomous agents) that are disabled by default.</p>
-<p>The workspace contains <strong>20 crates</strong> producing <strong>3 binaries</strong>:</p>
+<p><strong>NextGSim</strong> is a 5G UE and gNB simulator, with an LTE eNB and LTE UE beside them, written in pure Rust — the default build has no C dependencies from SCTP to ASN.1 PER (the optional <code>kernel-sctp</code> feature links libsctp). It implements a 3GPP Rel-15 baseline with selected Rel-16/17/18 features, plus a set of 6G exploration prototypes (AI-native crates for sensing, learning, and autonomous agents) that are disabled by default.</p>
+<p>The workspace has <strong>26 crates</strong> (plus the integration-test crate; count the
+<code>members</code> list in <code>Cargo.toml</code>) producing <strong>6 binaries</strong>:</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Binary</th><th>Role</th></tr>
 </thead>
 <tbody>
-<tr><td><code>nr-gnb</code></td><td>gNodeB simulator — NGAP, RRC, GTP-U, cell management, UE contexts, handover</td></tr>
-<tr><td><code>nr-ue</code></td><td>UE simulator — NAS procedures, RRC state machine, PDU sessions, multi-UE (<code>--num-ues</code>)</td></tr>
-<tr><td><code>nr-cli</code></td><td>Interactive CLI — runtime control, status queries, scenario scripting</td></tr>
+<tr><td><code>nr-gnb</code></td><td>gNodeB simulator — NGAP, RRC, GTP-U, cell management, UE contexts, paging, handover</td></tr>
+<tr><td><code>nr-ue</code></td><td>UE simulator — NAS procedures, RRC state machine, PDU sessions, Service Request, multi-UE (<code>-n/--num-of-UE</code>)</td></tr>
+<tr><td><code>nr-cli</code></td><td>CLI — runtime control and status queries of running gNB/UE nodes</td></tr>
+<tr><td><code>nr-loadtest</code></td><td>Multi-UE registration load test</td></tr>
+<tr><td><code>lte-enb</code></td><td>LTE eNB — S1 Setup, UE-associated S1AP, E-UTRA cell over RLS, S1-U GTP-U</td></tr>
+<tr><td><code>lte-ue</code></td><td>LTE UE — cell selection, E-UTRA RRC, EPS NAS attach, AS security, DRBs, TUN</td></tr>
 </tbody>
 </table>
 </div>
-<p>NextGSim pairs with the <a href="../index.html">NextGCore</a> core network (AMF/SMF/UPF and friends) for end-to-end runs: full RLS → RRC → NGAP → NAS registration, 5G-AKA authentication, PDU session establishment with GTP-U user plane, and Xn handover (per the TS 23.502 procedure flows).</p>
+<p>NextGSim pairs with the <a href="https://github.com/NextgCoreLab/nextgcore">NextGCore</a> core network for end-to-end runs: full RLS → RRC → NGAP → NAS registration, 5G-AKA authentication, PDU session establishment with a GTP-U user plane, CM-IDLE paging and Service Request, de-registration and re-registration, and Xn handover (per the TS 23.502 procedure flows). On the LTE side, <code>lte-ue</code> and <code>lte-enb</code> attach to NextGCore’s EPC and pass a ping through the PDN.</p>
 <h2 id="crate-layers"><a class="header" href="#crate-layers">Crate Layers</a></h2>
 <p>The workspace is layered from radio link up to AI intelligence:</p>
 <p><strong>Protocol crates</strong> — the wire stack:</p>
 <ul>
-<li><code>nextgsim-nas</code> — 5G NAS codec (registration, authentication, security mode, PDU session, deregistration)</li>
-<li><code>nextgsim-ngap</code> — NGAP ASN.1 PER encoder/decoder for gNB–AMF signaling over SCTP</li>
-<li><code>nextgsim-rrc</code> — RRC setup, reconfiguration, measurement reports, handover (plus unwired NTN prototypes with bespoke encodings)</li>
+<li><code>nextgsim-nas</code> — 5G NAS codec (registration, authentication, security mode, service request, PDU session, deregistration)</li>
+<li><code>nextgsim-eps-nas</code> — EPS NAS (TS 24.301) for the LTE UE: attach, EPS AKA, NAS security</li>
+<li><code>nextgsim-ngap</code> — NGAP and NRPPa ASN.1 APER codecs for gNB–AMF signaling</li>
+<li><code>nextgsim-s1ap</code> — S1AP ASN.1 APER codec for eNB–MME signaling</li>
+<li><code>nextgsim-rrc</code> — NR RRC UPER codec: setup, reconfiguration, measurement, handover, resume, SIB19 for NTN</li>
+<li><code>nextgsim-lte-rrc</code> — E-UTRA RRC UPER codec</li>
+<li><code>nextgsim-pdcp</code> — PDCP for SRBs and DRBs, AS integrity and ciphering, the SDAP header</li>
 <li><code>nextgsim-gtp</code> — GTP-U user-plane tunneling</li>
-<li><code>nextgsim-sctp</code> — pure Rust SCTP, no libsctp</li>
+<li><code>nextgsim-sctp</code> — SCTP: pure-Rust userspace backend over UDP (default) or kernel SCTP via libsctp</li>
 <li><code>nextgsim-rls</code> — Radio Link Simulation: UE–gNB air interface over UDP</li>
-<li><code>nextgsim-rlc</code> — RLC TM/UM/AM (TS 38.322) with segmentation and AM ARQ</li>
+<li><code>nextgsim-rlc</code> — RLC TM/UM/AM (TS 38.322) with segmentation and AM ARQ, plus the TS 38.351 SRAP sublayer</li>
 </ul>
-<p><strong>Core crates</strong> — <code>nextgsim-gnb</code>, <code>nextgsim-ue</code>, <code>nextgsim-cli</code>, <code>nextgsim-common</code> (shared types: SUPI, PLMN, S-NSSAI, QoS, config), and <code>nextgsim-crypto</code> (pure Rust MILENAGE, Snow3G, ZUC, AES, HMAC-SHA256).</p>
+<p>All ASN.1 codecs are generated at build time from the 3GPP schemas in <code>tools/</code> by the <a href="https://github.com/NextgCoreLab/asn1-codegen">NextgCoreLab/asn1-codegen</a> compiler.</p>
+<p><strong>Core crates</strong> — <code>nextgsim-gnb</code>, <code>nextgsim-ue</code>, <code>nextgsim-enb</code>, <code>nextgsim-lte-ue</code>, <code>nextgsim-cli</code>, <code>nextgsim-common</code> (shared types: SUPI, PLMN, S-NSSAI, QoS, config), and <code>nextgsim-crypto</code> (pure Rust MILENAGE, TUAK, Snow3G, ZUC, AES, HMAC-SHA256, ECIES).</p>
 <p><strong>6G AI crates (8)</strong> — research prototypes: <code>nextgsim-ai</code> (sole ONNX Runtime provider for the workspace), <code>nextgsim-she</code> (3-tier compute placement), <code>nextgsim-nwdaf</code> (4-layer analytics), <code>nextgsim-nkef</code> (knowledge graph / RAG context), <code>nextgsim-isac</code> (joint radar-comm sensing, EKF fusion), <code>nextgsim-agent</code> (intent-based RL agents), <code>nextgsim-fl</code> (FedAvg/FedProx, differential privacy), and <code>nextgsim-semantic</code> (JSCC semantic codecs).</p>
-<p>6G modules are opt-in twice over: gNB tasks are spawned only when config flags (<code>isac_enabled</code>, <code>agent_enabled</code>, <code>fl_enabled</code>, …) are set, and UE 6G modules are additionally gated behind Cargo features, so <code>--no-default-features</code> yields a lean 5G-only UE for large-scale load tests.</p>
+<p>6G modules are opt-in twice over: they are compiled only with a Cargo feature (<code>6g</code> for the gNB, the crate-named features such as <code>nextgsim-isac</code> for the UE), and their tasks are spawned only when a config flag (<code>isac_enabled</code>, <code>agent_enabled</code>, <code>federated_learning_enabled</code>, …) is set. The default build is a lean 5G-only UE and gNB.</p>
 <h2 id="honesty-notes"><a class="header" href="#honesty-notes">Honesty Notes</a></h2>
 <p>Read these before quoting capability claims:</p>
 <ul>
 <li><strong>6G / Rel-20 crates are non-normative research prototypes.</strong> No frozen 6G Stage-3 specification exists; these crates prototype 3GPP Stage-1 study material (e.g. TR 22.870 AI-agent use cases, TR 22.837 ISAC, TR 23.700-80 FL) and are disabled by default.</li>
 <li><strong>Matched-sim validated, not third-party certified.</strong> End-to-end behavior is validated against the matched NextGCore simulator and against 3GPP/RFC test vectors — no external certification or interop lab has verified conformance.</li>
 <li><strong>Some ML paths are illustrative stubs.</strong> No trained models ship: the ISAC ML positioning models and the semantic neural codec require user-supplied ONNX models (the default semantic build uses a non-neural fallback), and FL SecAgg is a pairwise-masking simulation demo, not production secure aggregation.</li>
-<li><strong>Rel-17/18 items</strong> (RedCap, XR QoS, SNPN, MINT, UAV) are implemented, but some UE-side prototypes (ProSe, ranging/sidelink, ambient IoT) use sim-internal encodings where no wire spec is implemented.</li>
+<li><strong>Rel-17/18 items</strong> (RedCap, XR QoS, SNPN, MINT, UAV) are implemented. The PC5 procedures behind the <code>sidelink</code> feature are real PC5-S messages over an in-process medium (there is no PC5 radio), and a few prototypes (ambient IoT, the UAV tracking report) use sim-internal encodings where no wire spec exists.</li>
 </ul>
 <h2 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h2>
 <pre><code class="language-bash">git clone https://github.com/NextgCoreLab/nextgsim.git
 cd nextgsim
-cargo build --release          # builds all 20 crates
+cargo build --release          # builds the whole workspace
 
-./target/release/nr-gnb --config config/gnb.yaml   # terminal 1
-./target/release/nr-ue  --config config/ue.yaml    # terminal 2
-./target/release/nr-cli                            # terminal 3
+./target/release/nr-gnb --config config/gnb.yaml        # terminal 1
+sudo ./target/release/nr-ue --config config/ue.yaml     # terminal 2
+./target/release/nr-cli ue0 -e status                   # terminal 3
 </code></pre>
-<p>A <code>docker-compose.yaml</code> is provided for a full RAN deployment ready to connect to a NextGCore AMF/UPF stack.</p>
+<p><code>docker/docker-compose.yml</code> runs the gNB and UE as containers on an existing NextGCore Docker network.</p>
 <h2 id="where-to-go-next"><a class="header" href="#where-to-go-next">Where to Go Next</a></h2>
 <ul>
 <li><a href="../index.html">Project landing page</a> — hero overview, architecture diagrams, workflows</li>
 <li><a href="../features.html">Feature matrix</a> — per-feature implementation status</li>
 <li><a href="../api.html">CLI &amp; API reference</a> — <code>nr-cli</code> commands and runtime APIs</li>
+<li><a href="cli-reference.html">nr-cli Reference</a> — every binary’s flags and every <code>nr-cli</code> command</li>
 </ul>
-<p>NextGSim is licensed under AGPL-3.0. Contributions are welcome — see the contributing guide for setup, the zero-warning style gate (<code>cargo fmt</code> + <code>cargo clippy -D warnings</code>), 3GPP spec-reference rules, and DCO sign-off requirements.</p>
+<p>NextGSim is licensed under AGPL-3.0. Contributions are welcome — see the contributing guide for setup, the style gate (<code>cargo fmt</code> + <code>cargo clippy</code>), 3GPP spec-reference rules, and sign-off requirements.</p>
 
                     </main>
 
@@ -276,7 +286,7 @@ cargo build --release          # builds all 20 crates
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

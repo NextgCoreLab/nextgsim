@@ -48,13 +48,14 @@
 <tr><td>RRC reestablishment/resume</td><td>ReestablishmentRequest/Complete, ResumeRequest/Complete handlers in live RRC task</td><td>TS 38.331 §5.3.7/§5.3.13</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>N2 handover + Xn handover</td><td>HandoverRequired/Request/Ack, PathSwitchRequest wired via NGAP; Xn structs+DAPS local-only</td><td>TS 38.300/38.413 §8.4</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>GTP-U / N3 user plane</td><td>UDP GTP-U tunnels, TEID mgmt, DL/UL forwarding to RLS; E2E-validated 0% loss</td><td>TS 29.281</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>LTE eNB + LTE UE (lte-enb, lte-ue)</td><td>S1 Setup and S1AP UE signalling, E-UTRA RRC over RLS, EPS NAS attach with EPS AKA, AS security, SRB2/DRBs on PDCP and RLC UM, S1-U GTP-U; attaches to nextgcore EPC with a 0%-loss ping in CI</td><td>TS 36.413 / 36.331 / 24.301</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>Kernel-SCTP NGAP transport</td><td>Real kernel SCTP (Linux, feature kernel-sctp) or userspace/multi-homed backends</td><td>RFC 4960 / TS 38.412</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>RedCap (Rel-17)</td><td>RedCap indication in RRCSetupComplete, BW clamp 20MHz, HD-FDD restriction — live in RRC task</td><td>TS 38.331/38.306</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>NTN (Rel-17)</td><td>SIB19-style timing/HARQ/beam mgrs, ISL handover — module exported, not called by tasks</td><td>TS 38.331 / TR 38.821</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>NTN (Rel-17)</td><td>SIB19 (ephemeris, Common TA, K_offset) broadcast as UPER with <code>ntn_config</code>; the UE applies timing advance and Doppler pre-compensation. Beam/ISL helpers remain prototypes</td><td>TS 38.300 §16.14 / TS 38.331</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>MBS multicast (Rel-17)</td><td>MBS session activation/deactivation, TMGI, multicast tunnel context in NGAP task</td><td>TS 38.413/23.247</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>6G AI-native tasks (Rel-20)</td><td>ISAC sensing, SHE, NKEF, NWDAF, agent/FL, Rel-18 energy saving — config-gated spawned tasks</td><td>non-normative (no Stage-3)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 </table></div>
-<p class="fm-notes">Xn handover types/DAPS exist in nextgsim-gnb/src/rrc/handover.rs but no inter-gNB transport wiring found; NTN module only re-exported.</p>
+<p class="fm-notes">Inter-gNB (Xn) handover runs and re-keys (KgNB*); conditional handover is config-gated. DAPS types exist but are not task-wired.</p>
 <h3 class="group-heading">UE (nr-ue)</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
@@ -68,7 +69,7 @@
 <tr><td>RedCap + SNPN (Rel-17)</td><td>RedCap capability in RRC task/config; SNPN NID cell selection and MM integration</td><td>TS 38.331 / TS 23.501</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>MINT multi-IMSI (Rel-18)</td><td>MintTask spawned in main; per-IMSI NAS context, IMSI selection</td><td>TS 23.761</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>Ranging/SL positioning (Rel-18)</td><td>RangingTask spawned; UE-UE RTT, carrier-phase, LMF reporting (sim-level)</td><td>TS 23.586</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
-<tr><td>ProSe + sidelink</td><td>PC5 unicast, Model A/B discovery, L2 relay/RSC matching; library types, not task-wired</td><td>TS 23.303/23.304</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>ProSe + sidelink</td><td>Real PC5-S unicast link, Model A/B discovery, UE-to-UE relay and L2 UE-to-Network relay over SRAP, behind the <code>sidelink</code> feature; in-process medium, no PC5 radio</td><td>TS 23.304 / TS 38.351</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>UAV + Ambient IoT</td><td>UAV C2 link/geofence/UTM context, ambient IoT fleet manager; unwired contexts</td><td>TS 23.256 / TS 22.369</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 </table></div>
 <p class="fm-notes">MintTask/RangingTask are spawned in main.rs; prose.rs, uav.rs, ambient_iot/ are library-only (no task wiring found).</p>

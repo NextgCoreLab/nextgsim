@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -178,7 +178,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
-<p>NextGSim is a pure-Rust 5G UE and gNB simulator implementing a 3GPP Rel-15 baseline with selected Rel-17/18 features. Rel-20 (6G) items are <strong>non-normative research prototypes</strong> — no frozen 3GPP Stage-3 spec exists — and are disabled by default. NextGSim is validated against its companion core, NextGCore, in end-to-end tests; it is <strong>not</strong> third-party certified, and no conformance is claimed beyond what those tests exercise.</p>
+<p>NextGSim is a pure-Rust 5G UE and gNB simulator, with an LTE eNB and LTE UE, implementing a 3GPP Rel-15 baseline with selected Rel-16/17/18 features. Rel-20 (6G) items are <strong>non-normative research prototypes</strong> — no frozen 3GPP Stage-3 spec exists — and are disabled by default. NextGSim is validated against its companion core, NextGCore, in end-to-end tests; it is <strong>not</strong> third-party certified, and no conformance is claimed beyond what those tests exercise.</p>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <p>NextGSim is pure Rust — no C toolchain or external protocol libraries are required for the default build.</p>
 <div class="table-wrapper">
@@ -187,14 +187,15 @@
 <tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust (stable)</td><td>≥ 1.75</td><td>Build toolchain</td></tr>
+<tr><td>Rust</td><td>pinned by <code>rust-toolchain.toml</code> (1.95.0)</td><td>Build toolchain; rustup installs it on the first <code>cargo</code> command</td></tr>
 <tr><td>Docker + docker compose</td><td>≥ 24</td><td>Container runs and E2E testing with NextGCore</td></tr>
+<tr><td>libsctp (<code>libsctp-dev</code>)</td><td>any</td><td>Only for <code>--features kernel-sctp</code> (Linux)</td></tr>
 </tbody>
 </table>
 </div>
 <pre><code class="language-bash"># macOS (Homebrew)
 brew install rustup
-rustup toolchain install stable
+rustup-init
 </code></pre>
 <h2 id="build"><a class="header" href="#build">Build</a></h2>
 <pre><code class="language-bash">git clone https://github.com/NextgCoreLab/nextgsim.git
@@ -204,7 +205,7 @@ cargo build --workspace            # debug
 cargo build --workspace --release  # release
 
 # Resulting binaries
-ls target/release/nr-*             # nr-gnb, nr-ue, nr-cli
+ls target/release/{nr,lte}-*       # nr-gnb, nr-ue, nr-cli, nr-loadtest, lte-enb, lte-ue
 </code></pre>
 <p>Build a single component:</p>
 <pre><code class="language-bash">cargo build -p nextgsim-ue    # UE simulator
@@ -214,7 +215,8 @@ cargo build -p nextgsim-gnb   # gNB simulator
 <p>Sample configurations live in <code>config/</code>:</p>
 <ul>
 <li><code>gnb.yaml</code>, <code>ue.yaml</code> — defaults, pointed at a NextGCore stack (PLMN 999-70)</li>
-<li><code>gnb-local.yaml</code>, <code>ue-local.yaml</code> — local (non-Docker) addressing</li>
+<li><code>gnb-local.yaml</code>, <code>ue-local.yaml</code> — gNB and UE on the host (RLS over 127.0.0.1) against the Docker AMF</li>
+<li><code>enb.yaml</code>, <code>lte-ue.yaml</code> — LTE eNB and UE for NextGCore’s EPC stack</li>
 <li><code>gnb-docker.yaml</code>, <code>ue-docker.yaml</code> — used by the Docker Compose deployment</li>
 <li><code>gnb-kernel.yaml</code> — kernel-SCTP variant (see below)</li>
 <li><code>config/features/</code> — per-feature scenario configs (RedCap, XR, MINT, SNPN accept/reject, UAV allow/deny)</li>
@@ -222,41 +224,58 @@ cargo build -p nextgsim-gnb   # gNB simulator
 <pre><code class="language-bash"># Terminal 1: gNB (connects to the AMF configured in gnb.yaml)
 ./target/release/nr-gnb --config config/gnb.yaml
 
-# Terminal 2: UE
-./target/release/nr-ue --config config/ue.yaml
+# Terminal 2: UE (creates a TUN interface, so it needs CAP_NET_ADMIN)
+sudo ./target/release/nr-ue --config config/ue.yaml
 
-# Terminal 3: interactive CLI
-./target/release/nr-cli
+# Terminal 3: CLI
+./target/release/nr-cli --dump        # gnb, ue0
+./target/release/nr-cli ue0           # interactive
 </code></pre>
 <p>Key settings to align with your core (comments in <code>config/gnb.yaml</code> / <code>config/ue.yaml</code>):</p>
 <ul>
 <li><strong>PLMN / TAC / NSSAI</strong> in <code>gnb.yaml</code> must match the AMF configuration (default PLMN 999-70, TAC 1, SST 1).</li>
 <li><strong><code>amf_configs</code></strong> points at the AMF NGAP endpoint (default <code>172.23.0.5:38412</code>, the NextGCore AMF container).</li>
-<li><strong>UE subscriber</strong> (<code>supi</code>, <code>key</code>, <code>op</code>/<code>op_type</code>) must be provisioned in the core’s subscriber database. Default IMSI is <code>999700000000001</code> with well-known test K/OPc values.</li>
+<li><strong>UE subscriber</strong> (<code>supi</code>, <code>key</code>, <code>op</code>/<code>op_type</code>) must be provisioned in the core’s subscriber database. Default IMSI is <code>999700000000001</code> with well-known test K/OPc values. <code>key</code>, <code>op</code> and <code>amf</code> are YAML byte arrays and <code>supi</code> is a <code>{supi_type, value}</code> mapping; see the <a href="configuration.html#configuration-file-format">Configuration Reference</a>.</li>
 <li><strong>SUCI protection</strong> (<code>protection_scheme</code>) defaults to the null scheme; Profile A/B ECIES key material (TS 33.501 Annex C test vectors, per the config comments) is included commented-out.</li>
 </ul>
 <h3 id="sctp-backend-note"><a class="header" href="#sctp-backend-note">SCTP backend note</a></h3>
 <p>The default NGAP transport is <code>sctp_backend: userspace</code> — an in-process SCTP-over-UDP that interoperates with the NextGCore simulator AMF but <strong>not</strong> a real AMF (the wire is UDP). To associate with a real kernel-SCTP AMF, use a Linux build with the gNB’s <code>kernel-sctp</code> cargo feature and set <code>sctp_backend: kernel</code> (see <code>config/gnb-kernel.yaml</code>); otherwise the connection fails loudly at runtime.</p>
 <h2 id="multi-ue-simulation"><a class="header" href="#multi-ue-simulation">Multi-UE Simulation</a></h2>
-<pre><code class="language-bash"># Simulate 10 UEs with auto-incrementing IMSI
-./target/release/nr-ue --config config/ue.yaml --num-ues 10
+<pre><code class="language-bash"># Simulate 10 UEs with auto-incrementing IMSI, 100 ms apart
+sudo ./target/release/nr-ue --config config/ue.yaml -n 10 -t 100
 
 # With debug logging
 RUST_LOG=debug ./target/release/nr-gnb --config config/gnb.yaml
 </code></pre>
 <h2 id="docker-compose-full-ran"><a class="header" href="#docker-compose-full-ran">Docker Compose (Full RAN)</a></h2>
 <p><code>docker/docker-compose.yml</code> brings up <code>nextgsim-gnb</code> and <code>nextgsim-ue</code> containers, mounting <code>config/gnb-docker.yaml</code> and <code>config/ue-docker.yaml</code>, pre-networked to reach a NextGCore AMF/UPF stack:</p>
-<pre><code class="language-bash">docker compose up          # start gNB + UE
-docker compose up --build  # rebuild images (e.g. after editing configs)
+<pre><code class="language-bash">cd docker
+docker compose up -d       # start gNB + UE on the existing rust_core network
 </code></pre>
+<p>The images (<code>nextgsim/nr-gnb</code>, <code>nextgsim/nr-ue</code>) are built from
+<code>Dockerfile.gnb-local</code> / <code>Dockerfile.ue-local</code>, which copy prebuilt binaries
+from <code>binaries/</code>; nextgcore’s <code>docker/rust/build.sh</code> builds both repos and the
+images in one go.</p>
+<h2 id="lte-enb-and-ue"><a class="header" href="#lte-enb-and-ue">LTE eNB and UE</a></h2>
+<pre><code class="language-bash">cargo build --release -p nextgsim-enb --features kernel-sctp   # Linux, libsctp
+cargo build --release -p nextgsim-lte-ue
+./target/release/lte-enb --config config/enb.yaml
+sudo ./target/release/lte-ue --config config/lte-ue.yaml
+</code></pre>
+<p>They target NextGCore’s EPC compose network (172.24.0.0/24). The container
+images take <code>NEXTGSIM_*</code> environment overrides; see the
+<a href="configuration.html#environment-overrides-lte-containers">Configuration Reference</a>.</p>
 <h2 id="lean-ue-builds-feature-gated-6g-crates"><a class="header" href="#lean-ue-builds-feature-gated-6g-crates">Lean UE Builds (Feature-Gated 6G Crates)</a></h2>
-<p>The UE binary’s 6G/AI client crates (<code>nextgsim-she</code>, <code>nextgsim-nwdaf</code>, <code>nextgsim-nkef</code>, <code>nextgsim-isac</code>, <code>nextgsim-agent</code>, <code>nextgsim-fl</code>, <code>nextgsim-semantic</code>) are <strong>optional dependencies</strong> — they are compiled in only when explicitly enabled, so the default build is already the lean 5G-only UE:</p>
+<p>The 6G/AI crates are <strong>optional dependencies</strong> of both binaries — compiled in only when explicitly enabled, so the default build is already the lean 5G-only UE and gNB. The gNB has one umbrella feature, <code>6g</code>; the UE uses crate-named features:</p>
 <pre><code class="language-bash"># Default: minimal 5G-only UE (no 6G crates compiled)
 cargo build --release -p nextgsim-ue
 
 # Opt into specific 6G research prototypes (crate-named feature flags)
 cargo build --release -p nextgsim-ue \
   --features "nextgsim-isac,nextgsim-agent,nextgsim-fl"
+
+# gNB with every 6G task available
+cargo build --release -p nextgsim-gnb --features 6g
 </code></pre>
 <p>These 6G features are research explorations only: enabling them compiles prototype code, not standardized protocol behavior.</p>
 <h2 id="testing-and-e2e-with-nextgcore"><a class="header" href="#testing-and-e2e-with-nextgcore">Testing and E2E with NextGCore</a></h2>
@@ -264,19 +283,17 @@ cargo build --release -p nextgsim-ue \
 cargo test -p nextgsim-ue       # UE only
 cargo test -- --nocapture       # with log output
 </code></pre>
-<p>End-to-end tests require a running NextGCore stack:</p>
-<pre><code class="language-bash"># 1. Start the core (from the sibling nextgcore checkout)
-cd ../nextgcore/docker/rust &amp;&amp; docker compose up -d
-
-# 2. Run the E2E suite
-cd ../../nextgsim
-cargo test -p nextgsim-tests --features e2e
+<p>The end-to-end suite runs from the sibling nextgcore checkout. It builds both
+repos and their images, starts the core with this repo’s gNB and UE, and
+asserts registration, the PDU session and a ping through the GTP-U tunnel:</p>
+<pre><code class="language-bash">cd ../nextgcore/docker/rust
+./e2e.sh                   # add --keep to leave the stack running
 </code></pre>
 <p>The E2E suite validates the full flow — UE registration through the gNB to the core, PDU session establishment, and GTP-U user-plane traffic — against NextGCore. This is matched-simulator validation between the two projects, not interoperability certification against third-party equipment.</p>
 <h2 id="contributing-checklist"><a class="header" href="#contributing-checklist">Contributing Checklist</a></h2>
 <p>Before submitting changes:</p>
-<pre><code class="language-bash">cargo fmt --all
-cargo clippy --workspace -- -D warnings
+<pre><code class="language-bash">cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
 cargo test --workspace
 cargo audit    # cargo install cargo-audit
 </code></pre>
@@ -330,7 +347,7 @@ cargo audit    # cargo install cargo-audit
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

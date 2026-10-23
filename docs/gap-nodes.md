@@ -1,6 +1,18 @@
 # nextgsim Node/Infrastructure Crates -- 6G Gap Analysis
 
 > Generated: 2026-02-07 | Scope: nextgsim-gnb, nextgsim-ue, nextgsim-cli, nextgsim-common, nextgsim-crypto
+>
+> **Status before 0.2.0: this is a dated snapshot and many of its gap rows are
+> closed.** Checked against `main`: inter-gNB (Xn) handover is implemented and
+> re-keys (#150); the gNB sends UE Context Release Request (#245); RRC Setup,
+> Release, Resume, Reestablishment, the handover command and the measurement
+> report are real UPER (#107, #146); the six gNB 6G tasks and the UE 6G tasks
+> run when built with their features and enabled in config; `nextgsim-crypto`
+> has NEA1 (`nea.rs`) and ECIES Profile B (`generate_suci_profile_b`) and
+> normalises KDF strings with NFKC. File counts, line counts and the source
+> line numbers below are from February and no longer match. For the current
+> state read the mdBook chapters `architecture/gnb.md` and `architecture/ue.md`
+> and `CHANGELOG.md`.
 
 ---
 
@@ -8,13 +20,13 @@
 
 The five node/infrastructure crates provide a solid 5G NR simulation baseline with fully implemented core protocol stacks (NGAP, RRC, NAS, GTP-U, RLS, SCTP). However, the node-level 6G AI-native functions (SHE/NWDAF/NKEF/ISAC/Agent/FL) are wired only as `TaskId` variants, message enums, and mpsc channel handles on `GnbTaskBase`/`UeTaskBase` -- no consumer `run()` loops are spawned (the actual algorithms live in the separate `nextgsim-isac`/`-fl`/`-she`/`-semantic`/`-nwdaf` crates). RRC Setup, Setup Complete, Setup Request, and Release now use real ASN.1 UPER via the `nextgsim-rrc` codec; only the Measurement Report path still uses a simplified byte format, and several secondary NGAP procedures remain incomplete.
 
-| Crate | Files | Lines (est.) | Completeness | 6G Readiness |
-|---|---|---|---|---|
-| nextgsim-gnb | 25 | ~12,000 | **75%** | **5% -- stubs only** |
-| nextgsim-ue | 28 | ~11,500 | **75%** | **5% -- stubs only** |
-| nextgsim-cli | 4 | ~600 | **95%** | N/A |
-| nextgsim-common | 12 | ~3,200 | **95%** | N/A |
-| nextgsim-crypto | 13 | ~5,000 | **90%** | **PQC primitives present (ACVP-validated, `pqc` feature); no procedure uses them** |
+| Crate | 6G Readiness |
+|---|---|
+| nextgsim-gnb | **5% -- stubs only** |
+| nextgsim-ue | **5% -- stubs only** |
+| nextgsim-cli | N/A |
+| nextgsim-common | N/A |
+| nextgsim-crypto | **PQC primitives present (ACVP-validated, `pqc` feature); no procedure uses them** |
 
 ---
 
@@ -26,8 +38,8 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 | Component | File(s) | Key Types/Functions | Status |
 |---|---|---|---|
-| Task framework | `src/tasks.rs` (1546 lines) | `TaskId`, `GnbTaskBase`, `TaskManager`, typed mpsc channels | Fully implemented for 6 core tasks |
-| NGAP task | `src/ngap/task.rs` (1147 lines) | `NgapTask::run()`, NG Setup, NAS routing, PDU session management | Mostly implemented |
+| Task framework | `src/tasks.rs` | `TaskId`, `GnbTaskBase`, `TaskManager`, typed mpsc channels | Fully implemented for 6 core tasks |
+| NGAP task | `src/ngap/task.rs` | `NgapTask::run()`, NG Setup, NAS routing, PDU session management | Mostly implemented |
 | NGAP AMF context | `src/ngap/amf_context.rs` | `AmfContext`, stream allocation, PLMN matching | Fully implemented |
 | RRC task | `src/rrc/task.rs` | `RrcTask`, UL/DL message routing, NAS extraction | Fully implemented |
 | RRC UE context | `src/rrc/ue_context.rs` | `RrcUeContext`, `RrcUeContextManager`, C-RNTI allocation | Fully implemented |
@@ -69,23 +81,23 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 | Component | File(s) | Key Types/Functions | Status |
 |---|---|---|---|
-| Task framework | `src/tasks.rs` (1749 lines) | `TaskId` (9 variants), `UeTaskBase`, `TaskManager` | Core tasks implemented; 6G stubs only |
-| NAS MM state machine | `src/nas/mm/state.rs` (854 lines) | `MmStateMachine`, `RmState`, `CmState`, `MmState`, `MmSubState`, `UpdateStatus` | Fully implemented per TS 24.501 |
-| NAS deregistration | `src/nas/mm/deregistration.rs` (789 lines) | `DeregistrationManager`, UE-initiated, network-initiated, collision handling | Fully implemented per TS 24.501 5.5.2 |
-| NAS SM procedures | `src/nas/sm/procedure.rs` (686 lines) | `ProcedureTransactionManager`, PTI 1-254, timer management | Fully implemented |
-| NAS timer management | `src/timer.rs` (1136 lines) | `NasTimerManager`, T3346-T3582, GPRS Timer 2/3 support | Fully implemented |
-| RRC state machine | `src/rrc/state.rs` (641 lines) | `RrcStateMachine`, Idle/Connected/Inactive, transition validation | Fully implemented |
-| RRC task | `src/rrc/task.rs` (826 lines) | `RrcTask`, cell selection, measurement, handover, RRC setup/release | Implemented (simplified encoding) |
+| Task framework | `src/tasks.rs` | `TaskId` (9 variants), `UeTaskBase`, `TaskManager` | Core tasks implemented; 6G stubs only |
+| NAS MM state machine | `src/nas/mm/state.rs` | `MmStateMachine`, `RmState`, `CmState`, `MmState`, `MmSubState`, `UpdateStatus` | Fully implemented per TS 24.501 |
+| NAS deregistration | `src/nas/mm/deregistration.rs` | `DeregistrationManager`, UE-initiated, network-initiated, collision handling | Fully implemented per TS 24.501 5.5.2 |
+| NAS SM procedures | `src/nas/sm/procedure.rs` | `ProcedureTransactionManager`, PTI 1-254, timer management | Fully implemented |
+| NAS timer management | `src/timer.rs` | `NasTimerManager`, T3346-T3582, GPRS Timer 2/3 support | Fully implemented |
+| RRC state machine | `src/rrc/state.rs` | `RrcStateMachine`, Idle/Connected/Inactive, transition validation | Fully implemented |
+| RRC task | `src/rrc/task.rs` | `RrcTask`, cell selection, measurement, handover, RRC setup/release | Implemented (simplified encoding) |
 | RRC cell selection | `src/rrc/cell_selection.rs` | `CellSelector`, suitable/acceptable categories, MIB/SIB1 | Fully implemented per TS 38.304 |
 | RRC measurement | `src/rrc/measurement.rs` | `MeasurementManager`, A1-A5 events, SS-RSRP/RSRQ/SINR | Fully implemented |
 | RRC handover | `src/rrc/handover.rs` | `HandoverManager`, T304 timer, state machine | Fully implemented (simplified PDU parsing) |
 | RLS task | `src/rls/task.rs` | `RlsTask`, UeCellSearch, heartbeat-based cell discovery | Fully implemented |
 | TUN task | `src/tun/task.rs` | `TunTask`, TUN interface lifecycle, IP packet handling | Fully implemented |
 | TUN interface | `src/tun/interface.rs` | `TunInterface`, async via tun-rs | Fully implemented |
-| App task | `src/app/task.rs` (589 lines) | `AppTask`, CLI server, status, NAS action execution | Fully implemented |
-| CLI handler | `src/app/cli_handler.rs` (865 lines) | Command handling: info, status, timers, deregister, ps-establish, ps-release | Fully implemented |
-| Config loader | `src/app/config_loader.rs` (502 lines) | HPLMN, gNB search list, subscriber key, protection scheme validation | Fully implemented |
-| Status reporting | `src/app/status.rs` (494 lines) | `UeStatusInfo`, `StatusReporter`, YAML/JSON | Fully implemented |
+| App task | `src/app/task.rs` | `AppTask`, CLI server, status, NAS action execution | Fully implemented |
+| CLI handler | `src/app/cli_handler.rs` | Command handling: info, status, timers, deregister, ps-establish, ps-release | Fully implemented |
+| Config loader | `src/app/config_loader.rs` | HPLMN, gNB search list, subscriber key, protection scheme validation | Fully implemented |
+| Status reporting | `src/app/status.rs` | `UeStatusInfo`, `StatusReporter`, YAML/JSON | Fully implemented |
 
 ### Gaps and Incomplete Items
 
@@ -113,7 +125,7 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 | Component | File | Key Types/Functions | Status |
 |---|---|---|---|
-| CLI entry point | `src/main.rs` (223 lines) | clap CLI, interactive mode, dump nodes, execute commands | Fully implemented |
+| CLI entry point | `src/main.rs` | clap CLI, interactive mode, dump nodes, execute commands | Fully implemented |
 | CLI client | `src/client.rs` | `CliClient`, UDP send_command, receive_message with timeout | Fully implemented |
 | Protocol codec | `src/protocol.rs` | 5 `MessageType` variants, encode/decode with version header | Fully implemented |
 | Process table | `src/proc_table.rs` | `/tmp/nextgsim.proc-table/` discovery, `ProcTableEntry` | Fully implemented |
@@ -134,18 +146,18 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 ### Implemented
 
-| Component | File | Lines | Key Types | Status |
-|---|---|---|---|---|
-| BitBuffer | `src/bit_buffer.rs` | 505 | `BitBuffer`, `BitBufferReader`, bit-level read/write | Fully implemented with tests |
-| BitString | `src/bit_string.rs` | 429 | `BitString`, variable-length bit sequences | Fully implemented with tests |
-| CLI server | `src/cli_server.rs` | 461 | `CliServer`, `CliMessage`, `ProcTableEntry`, UDP command server | Fully implemented with tests |
-| Config | `src/config.rs` | ~300 | `GnbConfig`, `UeConfig`, `AmfConfig` | Fully implemented |
-| Error types | `src/error.rs` | 39 | `Error` enum (Config, Protocol, Network, ASN.1, Crypto, State, YAML) | Fully implemented |
-| Logging | `src/logging.rs` | 367 | `init_logging()`, protocol message logging, hex dump | Fully implemented with tests |
-| OctetString | `src/octet_string.rs` | 561 | `OctetString`, append/get multi-byte, hex, XOR | Fully implemented with tests |
-| OctetView | `src/octet_view.rs` | 434 | `OctetView`, sequential byte parsing | Fully implemented with tests |
-| Transport | `src/transport.rs` | 144 | `UdpTransport`, async bind/send/recv | Fully implemented with tests |
-| Types | `src/types.rs` | ~300 | `Plmn`, `Tai`, `SNssai`, `Supi`, core 5G types | Fully implemented |
+| Component | File | Key Types | Status |
+|---|---|---|---|
+| BitBuffer | `src/bit_buffer.rs` | `BitBuffer`, `BitBufferReader`, bit-level read/write | Fully implemented with tests |
+| BitString | `src/bit_string.rs` | `BitString`, variable-length bit sequences | Fully implemented with tests |
+| CLI server | `src/cli_server.rs` | `CliServer`, `CliMessage`, `ProcTableEntry`, UDP command server | Fully implemented with tests |
+| Config | `src/config.rs` | `GnbConfig`, `UeConfig`, `AmfConfig` | Fully implemented |
+| Error types | `src/error.rs` | `Error` enum (Config, Protocol, Network, ASN.1, Crypto, State, YAML) | Fully implemented |
+| Logging | `src/logging.rs` | `init_logging()`, protocol message logging, hex dump | Fully implemented with tests |
+| OctetString | `src/octet_string.rs` | `OctetString`, append/get multi-byte, hex, XOR | Fully implemented with tests |
+| OctetView | `src/octet_view.rs` | `OctetView`, sequential byte parsing | Fully implemented with tests |
+| Transport | `src/transport.rs` | `UdpTransport`, async bind/send/recv | Fully implemented with tests |
+| Types | `src/types.rs` | `Plmn`, `Tai`, `SNssai`, `Supi`, core 5G types | Fully implemented |
 
 ### Gaps
 
@@ -164,16 +176,16 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 ### Implemented
 
-| Component | File | Lines | Key Functions | Status |
-|---|---|---|---|---|
-| AES-128 | `src/aes.rs` | 316 | `Aes128Block`, `Aes128Cmac`, `xor_block` | Fully implemented, RFC 4493 test vectors |
-| ECIES Profile A | `src/ecies.rs` | 377 | `ecies_encrypt/decrypt`, `generate_suci_profile_a`, X25519 + AES-CTR + HMAC-SHA256 | Fully implemented per TS 33.501 |
-| KDF | `src/kdf.rs` | 664 | `derive_kausf/kseaf/kamf/knas_enc/knas_int/kgnb/nh/res_star`, HMAC-SHA256 | Fully implemented per TS 33.501 Annex A |
-| Milenage | `src/milenage.rs` | 960 | `Milenage` f1-f5, f1\*/f5\*, `compute_opc` | Fully implemented, 6 3GPP TS 35.207 test sets |
-| NEA2 | `src/nea.rs` | 302 | `nea2_encrypt/decrypt`, AES-128-CTR | Fully implemented, 3GPP test vector |
-| NIA1/NIA2/NIA3 | `src/nia.rs` | 497 | `nia1_compute_mac` (SNOW3G), `nia2_compute_mac` (AES-CMAC), `nia3_compute_mac` (ZUC) | Fully implemented, 3GPP test vectors |
-| SNOW3G | `src/snow3g.rs` | 603 | `Snow3g`, `uea2_f8`, `uia2_f9` | Fully implemented, 3GPP TS 35.222 test vectors |
-| ZUC (NEA3) | `src/zuc.rs` | 361 | `nea3_encrypt/decrypt` | Fully implemented, 3GPP TS 35.222 test vectors |
+| Component | File | Key Functions | Status |
+|---|---|---|---|
+| AES-128 | `src/aes.rs` | `Aes128Block`, `Aes128Cmac`, `xor_block` | Fully implemented, RFC 4493 test vectors |
+| ECIES Profile A | `src/ecies.rs` | `ecies_encrypt/decrypt`, `generate_suci_profile_a`, X25519 + AES-CTR + HMAC-SHA256 | Fully implemented per TS 33.501 |
+| KDF | `src/kdf.rs` | `derive_kausf/kseaf/kamf/knas_enc/knas_int/kgnb/nh/res_star`, HMAC-SHA256 | Fully implemented per TS 33.501 Annex A |
+| Milenage | `src/milenage.rs` | `Milenage` f1-f5, f1\*/f5\*, `compute_opc` | Fully implemented, 6 3GPP TS 35.207 test sets |
+| NEA2 | `src/nea.rs` | `nea2_encrypt/decrypt`, AES-128-CTR | Fully implemented, 3GPP test vector |
+| NIA1/NIA2/NIA3 | `src/nia.rs` | `nia1_compute_mac` (SNOW3G), `nia2_compute_mac` (AES-CMAC), `nia3_compute_mac` (ZUC) | Fully implemented, 3GPP test vectors |
+| SNOW3G | `src/snow3g.rs` | `Snow3g`, `uea2_f8`, `uia2_f9` | Fully implemented, 3GPP TS 35.222 test vectors |
+| ZUC (NEA3) | `src/zuc.rs` | `nea3_encrypt/decrypt` | Fully implemented, 3GPP TS 35.222 test vectors |
 
 ### Gaps
 

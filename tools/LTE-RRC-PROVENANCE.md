@@ -36,7 +36,7 @@ Two lines of the source glue a comment to the keyword before it:
 The flag inserts one space before a `--` that directly follows a letter or
 digit (`OPTIONAL -- Need OR`). X.680 §12.6.2 starts a comment at `--` wherever it
 appears and §12.3 forbids `--` inside an identifier, so the edit cannot change
-the schema; it is needed because the vendored asn1-compiler tokenizer reads
+the schema; it is needed because the asn1-compiler tokenizer (NextgCoreLab/asn1-codegen) reads
 `OPTIONAL--` as a single identifier and stops with
 `Tokenize Error (16) at Line: 6354`. Every other character is the source's.
 

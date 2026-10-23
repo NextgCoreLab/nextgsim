@@ -27,7 +27,7 @@ docker run --rm -v "$PWD":/work -w /work -v "$CACHE/target":/target \
 cd docker/exit-gate
 docker compose up -d --build nrf scp amf ausf udm udr pcf bsf nssf upf smf gnb
 # 3. Provision the subscriber (IMSI 999700000000001, K/OPc test keys):
-docker exec eg-mongodb mongosh open5gs --quiet --eval '<see git history / runbook>'
+docker exec -i eg-mongodb mongosh open5gs --quiet < ../../scripts/add-subscriber.js
 # 4. Bring up the UE:
 docker compose up -d --build ue
 docker logs eg-ue -f       # UE: registration / PDU / data plane
@@ -36,6 +36,10 @@ docker compose down        # teardown
 ```
 
 ## Status — 2026-06-15
+
+This section is the record of the last run, on 2026-06-15. The gate has not
+been re-run since, so it predates the 0.2.0 changes (paging, Service Request,
+the generated-codec work in nextgcore).
 
 **MILESTONE 1 (SCTP/association) — PASSED.** Confirmed against a real Open5GS AMF:
 - Our **kernel SCTP backend (T0.2) works at runtime**: `Kernel SCTP association
@@ -126,7 +130,7 @@ emits **no `PDUSessionResourceSetupRequest`** to the gNB (only `InitialContext
 Setup`), and retransmits hit `DUPLICATED_PDU_SESSION_ID`. The gNB *has* a
 `handle_pdu_session_resource_setup` handler, so the next investigation is the
 AMF↔gNB N2 PDU-session-resource-setup path (why the N2 isn't sent/acted on), then
-DRB + GTP-U + `ping` UE↔DN through the real UPF. See `.context/EXIT-GATE-RUNBOOK.md`.
+DRB + GTP-U + `ping` UE↔DN through the real UPF.
 
 ## Config issues already surfaced + fixed (this run)
 - Open5GS 2.7 AMF requires `amf.time.t3512.value` (added to `open5gs/amf.yaml`).
@@ -135,5 +139,5 @@ DRB + GTP-U + `ping` UE↔DN through the real UPF. See `.context/EXIT-GATE-RUNBO
 
 ## For full reg + data plane (milestones 3-4)
 Add Open5GS ausf/udm/udr/pcf/smf/upf services + a provisioned subscriber (Mongo)
-matching the sim UE's IMSI/K/OPc, and bring up the sim UE. See
-`.context/EXIT-GATE-RUNBOOK.md`.
+matching the sim UE's IMSI/K/OPc (`scripts/add-subscriber.js`), and bring up
+the sim UE.

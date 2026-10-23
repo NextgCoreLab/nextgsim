@@ -1,7 +1,7 @@
 # nextgsim 6G Gap Analysis Report
 
 **Date:** 2026-02-07
-**Scope:** All 21 workspace packages in the nextgsim Rust workspace
+**Scope:** All 21 workspace packages in the nextgsim Rust workspace at that date (it now has 26 crates plus the integration-test crate)
 **Reference Standards:** 3GPP Rel-18/19, ITU-R IMT-2030 Framework, 3GPP TS 23.288, TR 22.837, TR 23.700-80
 
 ---
@@ -584,7 +584,7 @@ These 5G gaps must be resolved before meaningful 6G simulation is possible:
   implemented and tested. UE radio capability ID (RACS) IEs are decoded and
   optionally stored; RACS is not yet *signalled* — see the tracking issue.
 - **Remaining:** tracked per item in
-  [`gaps/6g-gap-analysis.md`](gaps/6g-gap-analysis.md) (NGS-5G-*) rather than as
+  [`docs-book/src/gaps/6g-gap-analysis.md`](../docs-book/src/gaps/6g-gap-analysis.md) (NGS-5G-*) rather than as
   a percentage here.
 
 ### Priority 3: UE NAS SM Procedures (~60% missing)

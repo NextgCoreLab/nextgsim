@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -178,7 +178,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="contributing-to-nextgsim"><a class="header" href="#contributing-to-nextgsim">Contributing to NextGSim</a></h1>
-<p>NextGSim is a 5G UE and gNB simulator in Rust implementing a 3GPP Rel-15 baseline with selected Rel-17/18 features and 6G exploration prototypes. 3GPP Rel-20 (6G) has no frozen stage-3 spec, so the 6G items are research-only (informed by TR 22.870 use cases) and disabled by default.</p>
+<p>NextGSim is a 5G UE and gNB simulator in Rust, with an LTE eNB and LTE UE, implementing a 3GPP Rel-15 baseline with selected Rel-16/17/18 features and 6G exploration prototypes. 3GPP Rel-20 (6G) has no frozen stage-3 spec, so the 6G items are research-only (informed by TR 22.870 use cases) and disabled by default.</p>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <div class="table-wrapper">
 <table>
@@ -186,14 +186,15 @@
 <tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
-<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing with NextGCore</td></tr>
+<tr><td>Rust</td><td>pinned by <code>rust-toolchain.toml</code> (1.95.0)</td><td>Build toolchain; rustup installs it on the first <code>cargo</code> command</td></tr>
+<tr><td>Docker + docker compose</td><td>≥24</td><td>E2E testing with NextGCore</td></tr>
+<tr><td>libsctp (<code>libsctp-dev</code>)</td><td>any</td><td>Only for <code>--features kernel-sctp</code> (the LTE eNB, or a gNB against a real AMF), Linux only</td></tr>
 </tbody>
 </table>
 </div>
 <pre><code class="language-bash"># macOS (Homebrew)
 brew install rustup
-rustup toolchain install stable
+rustup-init
 </code></pre>
 <h2 id="building"><a class="header" href="#building">Building</a></h2>
 <pre><code class="language-bash">cd nextgsim
@@ -201,28 +202,33 @@ cargo build --workspace            # debug
 cargo build --workspace --release  # release
 </code></pre>
 <p>To build a single component:</p>
-<pre><code class="language-bash">cargo build -p nextgsim-ue   # UE simulator
-cargo build -p nextgsim-gnb  # gNB simulator
+<pre><code class="language-bash">cargo build -p nextgsim-ue   # UE simulator (nr-ue)
+cargo build -p nextgsim-gnb  # gNB simulator (nr-gnb)
+cargo build -p nextgsim-enb --features kernel-sctp   # LTE eNB (lte-enb), Linux
+cargo build -p nextgsim-lte-ue                       # LTE UE (lte-ue)
 </code></pre>
 <h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
 <pre><code class="language-bash">cargo test --workspace                 # all tests
 cargo test -p nextgsim-ue             # UE only
 cargo test -- --nocapture             # with log output
 </code></pre>
-<p>E2E tests require a running NextGCore stack:</p>
-<pre><code class="language-bash">cd ../nextgcore/docker/rust &amp;&amp; docker compose up -d
-cd ../../nextgsim
-cargo test -p nextgsim-tests --features e2e
+<p>The <code>tests/</code> crate (<code>nextgsim-integration-tests</code>) runs the gNB and UE tasks in
+one process against a mock AMF; some of its suites need a feature
+(<code>--features drb-pdcp</code>, <code>up-security</code>, <code>sdap-dataplane</code>, <code>sidelink</code>, <code>6g</code>). The
+end-to-end suite against a real core runs from the nextgcore repo:</p>
+<pre><code class="language-bash">cd ../nextgcore/docker/rust
+./e2e.sh            # builds both repos' images, then registration + PDU session + ping
 </code></pre>
 <h2 id="code-style"><a class="header" href="#code-style">Code Style</a></h2>
 <pre><code class="language-bash">cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets
 </code></pre>
 <p>Pre-commit checklist:</p>
 <ul>
-<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
-<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
+<li><input disabled="" type="checkbox"> <code>cargo fmt --all -- --check</code> — no formatting changes</li>
+<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace --all-targets</code> — no new warnings in the code you touched</li>
 <li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
+<li><input disabled="" type="checkbox"> The feature-gated CI job for any feature your change touches (see <code>docs/ci-and-release.md</code>)</li>
 <li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
 </ul>
 <h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
@@ -243,15 +249,21 @@ cargo audit
 │   └── src/
 │       ├── nas/        # 5G NAS (N1 interface)
 │       ├── rrc/        # NR RRC
-│       ├── prose.rs    # ProSe PC5 (Rel-17)
+│       ├── sidelink/   # PC5-S, discovery, relay (behind the sidelink feature)
 │       ├── uav.rs      # UAV context (Rel-18)
 │       ├── daps.rs     # DAPS (Rel-16)
 │       └── ...
-├── nextgsim-nas/       # Shared NAS codec
-├── nextgsim-ngap/      # NGAP ASN.1 codec (auto-generated)
+├── nextgsim-enb/       # LTE eNB (lte-enb)
+├── nextgsim-lte-ue/    # LTE UE (lte-ue)
+├── nextgsim-nas/       # 5GS NAS codec
+├── nextgsim-eps-nas/   # EPS NAS (UE side)
+├── nextgsim-ngap/      # NGAP + NRPPa codecs (generated at build time)
+├── nextgsim-s1ap/      # S1AP codec (generated)
+├── nextgsim-rrc/       # NR RRC codec (generated)
+├── nextgsim-lte-rrc/   # E-UTRA RRC codec (generated)
 ├── nextgsim-common/    # Config, types, utilities
-├── nextgsim-tests/     # Integration + E2E tests
-└── tools/              # ASN.1 grammars
+├── tests/              # Integration tests (nextgsim-integration-tests)
+└── tools/              # 3GPP ASN.1 schemas and extract_asn1.py
 </code></pre>
 <h2 id="simulated-releases"><a class="header" href="#simulated-releases">Simulated Releases</a></h2>
 <div class="table-wrapper">
@@ -260,9 +272,9 @@ cargo audit
 <tr><th>Release</th><th>Features</th></tr>
 </thead>
 <tbody>
-<tr><td>Rel-15</td><td>5G-NR baseline, SA registration, PDU sessions</td></tr>
-<tr><td>Rel-16</td><td>DAPS handover, URLLC, RedCap, V2X PC5</td></tr>
-<tr><td>Rel-17</td><td>MBS, ProSe, NTN, SNPN, UAV identity</td></tr>
+<tr><td>Rel-15</td><td>5G-NR baseline, SA registration, PDU sessions, paging and Service Request; LTE attach (E-UTRA RRC, S1AP, EPS NAS)</td></tr>
+<tr><td>Rel-16</td><td>DAPS handover, URLLC, V2X PC5, RACS (UE radio capability IDs)</td></tr>
+<tr><td>Rel-17</td><td>RedCap, MBS, ProSe and L2 UE-to-Network relay, NTN (SIB19), SNPN, UAV identity</td></tr>
 <tr><td>Rel-18</td><td>XR traffic, Ambient IoT, RedCap R18, MINT</td></tr>
 <tr><td>Rel-20*</td><td>ISAC, Federated Learning, Semantic comms, Agent AI</td></tr>
 </tbody>
@@ -275,6 +287,9 @@ cargo audit
 <li><strong>TS 38.331</strong> — NR RRC</li>
 <li><strong>TS 38.413</strong> — NGAP</li>
 <li><strong>TS 24.501</strong> — 5G NAS</li>
+<li><strong>TS 36.413</strong> — S1AP</li>
+<li><strong>TS 36.331</strong> — E-UTRA RRC</li>
+<li><strong>TS 24.301</strong> — EPS NAS</li>
 <li><strong>TS 23.256</strong> — UAV</li>
 <li><strong>TS 23.304</strong> — ProSe</li>
 </ul>
@@ -296,7 +311,7 @@ test(prose): add relay selection RSRP unit test
 <li>Open a PR referencing the 3GPP TS item</li>
 </ol>
 <h2 id="license"><a class="header" href="#license">License</a></h2>
-<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
+<p>AGPL-3.0. See <a href="https://github.com/NextgCoreLab/nextgsim/blob/main/LICENSE">LICENSE</a>.</p>
 
                     </main>
 
@@ -340,7 +355,7 @@ test(prose): add relay selection RSRP unit test
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

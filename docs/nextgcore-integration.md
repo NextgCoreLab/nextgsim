@@ -4,54 +4,24 @@ This document describes how to connect NextGSim (5G UE/gNB Simulator) to NextGCo
 
 ## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Docker Network: nextgcore-network                       │
-│                           Subnet: 172.23.0.0/24                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                        NextGCore 5G Core                                │ │
-│  │                                                                         │ │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐      │ │
-│  │  │   NRF   │  │  AUSF   │  │   UDM   │  │   UDR   │  │   PCF   │      │ │
-│  │  │ .0.10   │  │ .0.11   │  │ .0.12   │  │ .0.13   │  │ .0.14   │      │ │
-│  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └─────────┘      │ │
-│  │                                                                         │ │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────────────────────────────────┐    │ │
-│  │  │  NSSF   │  │   BSF   │  │              MongoDB                 │    │ │
-│  │  │ .0.15   │  │ .0.16   │  │     .0.2:27017 (exposed 27018)      │    │ │
-│  │  └─────────┘  └─────────┘  └─────────────────────────────────────┘    │ │
-│  │                                                                         │ │
-│  │  ┌───────────────────┐              ┌───────────────────┐             │ │
-│  │  │        AMF        │◄── NGAP ────►│        SMF        │             │ │
-│  │  │  .0.17:38412/sctp │              │  .0.18:8805/udp   │             │ │
-│  │  │  (N2 Interface)   │              │  (N4 Interface)   │             │ │
-│  │  └───────────────────┘              └─────────┬─────────┘             │ │
-│  │                                               │ PFCP                   │ │
-│  │                                     ┌─────────▼─────────┐             │ │
-│  │                                     │        UPF        │             │ │
-│  │                                     │  .0.19:2152/udp   │             │ │
-│  │                                     │  (N3 Interface)   │             │ │
-│  │                                     │  UE Pool: 10.45.0.0/16         │ │
-│  │                                     └───────────────────┘             │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                        NextGSim Simulator                               │ │
-│  │                                                                         │ │
-│  │  ┌───────────────────┐              ┌───────────────────┐             │ │
-│  │  │        gNB        │◄─── RLS ────►│         UE        │             │ │
-│  │  │    172.23.0.100   │   (Radio)    │    172.23.0.101   │             │ │
-│  │  │                   │              │                   │             │ │
-│  │  │  • NGAP → AMF     │              │  • NAS signaling  │             │ │
-│  │  │  • GTP-U → UPF    │              │  • PDU sessions   │             │ │
-│  │  │  • RRC handling   │              │  • TUN interface  │             │ │
-│  │  └───────────────────┘              └───────────────────┘             │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The nextgcore 5GC compose stack (`nextgcore/docker/rust/docker-compose.yml`,
+compose network `core`, which Docker names `rust_core`, subnet 172.23.0.0/24)
+puts the simulator on the same bridge as the core. The addresses this guide
+relies on, from that file's `ipv4_address` entries:
+
+| Container | Address | Interface |
+|-----------|---------|-----------|
+| `nextgcore-mongodb` | 172.23.0.2:27017 | subscriber database |
+| `nextgcore-nrf` | 172.23.0.10:7777 | SBI |
+| `nextgcore-amf` | 172.23.0.5:38412 | N2 (userspace SCTP over UDP) |
+| `nextgcore-smf` | 172.23.0.4:8805 | N4 |
+| `nextgcore-upf` | 172.23.0.7:2152 | N3; UE pool 10.45.0.0/16 |
+| `nextgsim-gnb` | 172.23.0.100 | RLS, N2, N3 |
+| `nextgsim-ue` | 172.23.0.101 | RLS; `uesimtun0` inside the container |
+
+The other NFs in that file have their own addresses there. nextgcore's EPC
+stack (`docker-compose-epc.yml`, 172.24.0.0/24) is the peer for `lte-enb` and
+`lte-ue`; `config/enb.yaml` and `config/lte-ue.yaml` target it.
 
 ## Protocol Stack
 
@@ -93,7 +63,7 @@ This document describes how to connect NextGSim (5G UE/gNB Simulator) to NextGCo
 | PLMN | 999-70 | MCC=999, MNC=70 |
 | TAC | 1 | Tracking Area Code |
 | S-NSSAI | SST=1 | Default network slice |
-| AMF Address | 172.23.0.5:38412 | NGAP/SCTP endpoint (userspace SCTP over UDP) |
+| AMF Address | 172.23.0.5:38412 | NGAP endpoint (userspace SCTP over UDP by default; `docker-compose.kernel-sctp.yml` switches N2 to kernel SCTP) |
 | UPF Address | 172.23.0.7:2152 | GTP-U endpoint |
 | UE IP Pool | 10.45.0.0/16 | Assigned to UEs |
 
@@ -116,17 +86,20 @@ This document describes how to connect NextGSim (5G UE/gNB Simulator) to NextGCo
 
 2. **Network Available**: Verify the Docker network exists
    ```bash
-   docker network inspect nextgcore-network
+   docker network inspect rust_core
    ```
 
 3. **Subscriber Provisioned**: Add test subscriber to MongoDB
    ```bash
    docker exec -i nextgcore-mongodb mongosh open5gs < scripts/add-subscriber.js
    ```
+   nextgcore's compose stack seeds this subscriber from its
+   `docs/assets/webui/mongo-init.js` when MongoDB starts on a fresh volume, so
+   this is only needed against a database that lacks it.
 
 ## Quick Start
 > **Fastest path (recommended):** the entire matched-sim E2E — our gNB+UE against
-> our 22-NF 5GC, full registration + PDU session + data-plane ping (UE gets
+> the nextgcore 5GC, full registration + PDU session + data-plane ping (UE gets
 > 10.45.0.2, `uesimtun0` up, ping through the GTP-U tunnel) — is driven by one
 > command from the nextgcore repo. It bundles disk preflight (hazard #269), image
 > build, and the assertion run:
@@ -171,11 +144,15 @@ docker logs -f nextgcore-amf
 ### 4. Verify Connection
 
 ```bash
+# nr-cli is not in the images: copy it in first
+docker cp binaries/nr-cli nextgsim-gnb:/tmp/nr-cli
+docker cp binaries/nr-cli nextgsim-ue:/tmp/nr-cli
+
 # Check gNB is connected to AMF
-docker exec nextgsim-gnb nr-cli gnb status
+docker exec nextgsim-gnb /tmp/nr-cli gnb -e amf-list
 
 # Check UE registration status
-docker exec nextgsim-ue nr-cli ue status
+docker exec nextgsim-ue /tmp/nr-cli ue0 -e status
 
 # Ping from UE through the core
 docker exec nextgsim-ue ping -I uesimtun0 10.45.0.1
@@ -267,6 +244,9 @@ nextgcore env knobs (`AMF_SNPN_ALLOWED_NIDS`, `AMF_UAV_GEOFENCE`,
 | `config/gnb.yaml` | gNB configuration (PLMN, TAC, AMF address) |
 | `config/ue.yaml` | UE configuration (IMSI, keys, sessions) |
 | `config/features/*.yaml` | Per-feature UE/gNB configs for the Rel-17/18 feature E2E test |
+| `config/enb.yaml`, `config/lte-ue.yaml` | LTE eNB and UE for nextgcore's EPC stack |
+| `docker/docker-compose.yml` | gNB + UE containers on an existing `rust_core` network |
+| `scripts/add-subscriber.js` | MongoDB subscriber provisioning |
 
 Beyond the feature configs above, URSP/UE-Policy delivery is now exercised on the
 baseline path: PCF delivers URSP rules via the TS 24.501 Annex D UPDP codec over
@@ -282,19 +262,36 @@ which slice and data network a session uses; set `ursp_evaluation: true` in the
 UE config to turn it on. With it off, session parameters come from the static
 `sessions` config exactly as before. SUCI de-concealment (SIDF) is performed and
 logged at the core's UDM per TS 33.501 §6.12; UDR only ever sees the SUPI.
-| `docker-compose.yaml` | Container orchestration |
-| `scripts/add-subscriber.js` | MongoDB subscriber provisioning |
+
+## Nightly UE-flow gate and the EPC stage
+
+nextgcore's nightly CI builds this repo from `main` and, after the baseline
+registration and ping, runs `docker/rust/ue-flow-check.sh` against the real
+`nr-gnb` and `nr-ue`. Each scenario passes only on a positive assertion:
+
+| Scenario | What it drives |
+|----------|----------------|
+| `paging` | CM-IDLE, then downlink data: the AMF pages, the UE answers with a Service Request, every downlink ping is answered |
+| `idle-uplink` | CM-IDLE, then uplink data: a UE-triggered Service Request, and the packet that triggered it is not lost |
+| `deregister` | `nr-cli <ue> -e deregister`: Deregistration Accept, then a fresh registration, PDU session and ping |
+| `network-rereg` | A UDM de-registration notification with `REREGISTRATION_REQUIRED`: the UE re-registers promptly and pings again |
+| `all` | All of the above, with a second paging round after the Service Request |
+
+The EPC stage of the same pipeline runs `lte-enb` and `lte-ue` against
+nextgcore's MME, HSS, PCRF, SGW-C/SGW-U and PGW-C/PGW-U (`docker/rust/epc-attach-check.sh`) and
+asserts a real LTE attach and a 0%-loss ping through the PDN.
+
+This repo's own `ci.yml` runs an interop job nightly too (05:00 UTC, after
+nextgcore's), which registers a real UE through this repo's gNB against
+nextgcore `main`.
 
 ## Metrics & Monitoring
 
-NextGCore exposes Prometheus metrics:
-
-| Component | Metrics Endpoint |
-|-----------|-----------------|
-| AMF | http://localhost:9091/metrics |
-| SMF | http://localhost:9092/metrics |
-| PCF | http://localhost:9093/metrics |
-| UPF | http://localhost:9094/metrics |
+The nextgcore NFs serve Prometheus metrics on port 9090 of their container
+address (for example the AMF at `http://172.23.0.5:9090/metrics`; see the
+`metrics` block of each file in `nextgcore/docker/rust/configs/5gc/`). The
+stack's Prometheus is published on `http://localhost:9090` and Grafana on
+`http://localhost:3000`.
 
 ## Development Notes
 
@@ -306,16 +303,16 @@ For development, you can run nextgsim binaries directly:
 # Build
 cargo build --release
 
-# Run gNB
-./target/release/nextgsim-gnb -c config/gnb.yaml
+# Run gNB on the host against the Docker AMF
+./target/release/nr-gnb -c config/gnb-local.yaml
 
-# Run UE (requires root for TUN)
-sudo ./target/release/nextgsim-ue -c config/ue.yaml
+# Run UE (requires CAP_NET_ADMIN for TUN)
+sudo ./target/release/nr-ue -c config/ue-local.yaml
 ```
 
 ### Debugging SCTP Issues
 
-Since Docker uses userspace SCTP (over UDP), standard SCTP tools may not work. Use:
+The default N2 is userspace SCTP over UDP, so SCTP dissectors do not decode it as NGAP. Capture the UDP port instead:
 
 ```bash
 # Capture NGAP traffic

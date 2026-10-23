@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "../searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -191,14 +191,15 @@ matched simulator that drives it over N2 (NGAP/SCTP) and N3 (GTP-U).</p>
 <blockquote>
 <p><strong>Honesty note:</strong> This flow is validated by nextgsim’s own unit tests and by a
 <strong>matched-simulator</strong> docker E2E — the project drives its <em>own</em> gNB and UE
-against nextgcore, and the UE→UPF GTP-U data plane has been verified with 0%
-packet loss (project record: 84/84 green, 2026-07-02). It is <strong>not</strong>
+against nextgcore, and the UE→UPF GTP-U data plane is checked with a ping on
+every nightly run of nextgcore’s CI. It is <strong>not</strong>
 third-party conformance-certified, and it matches a cooperative peer rather
 than an arbitrary commercial UPF/UE. Several deliberate simplifications exist
-(the UE acknowledges the DRB <code>RRCReconfiguration</code> without installing a
-per-DRB user-plane path; the simulated radio is UDP + an RLC-UM segmentation
-layer keyed by PDU-session ID; the <code>--no-routing-config</code> flag is currently
-inert). 6G GTP-U extension headers (TSN, in-network compute) are non-normative
+(in a default build the UE acknowledges the DRB <code>RRCReconfiguration</code>
+without installing a per-DRB user-plane path — the <code>drb-pdcp</code>, <code>up-security</code>
+and <code>sdap-dataplane</code> features add one; the simulated radio is UDP + an RLC
+segmentation layer keyed by PDU-session ID; the <code>--no-routing-config</code> flag is
+currently inert). 6G GTP-U extension headers (TSN, in-network compute) are non-normative
 research prototypes with no frozen Rel-20 Stage-3 to conform to. 3GPP TS
 numbers below are quoted only where they appear in this repo’s source
 comments, phrased “per code comments”.</p>
@@ -213,7 +214,7 @@ comments, phrased “per code comments”.</p>
 <tr><td>UE 5GSM state machine</td><td><code>nextgsim-ue</code></td><td><code>src/nas/sm/orchestrator.rs</code>, <code>src/nas/sm/procedure.rs</code></td><td>Builds/parses PDU session messages; PSI/PTI allocation; T3580/T3581/T3582</td></tr>
 <tr><td>UE TUN device</td><td><code>nextgsim-ue</code></td><td><code>src/tun/interface.rs</code>, <code>src/tun/task.rs</code>, <code>src/tun/config.rs</code></td><td>Creates <code>uesimtun&lt;N&gt;</code>, reads uplink / writes downlink IP packets</td></tr>
 <tr><td>UE↔gNB radio link</td><td><code>nextgsim-rls</code></td><td><code>src/protocol.rs</code>, <code>src/transport.rs</code></td><td>RLS-over-UDP frames for RRC and user data</td></tr>
-<tr><td>RLC segmentation</td><td><code>nextgsim-rlc</code></td><td><code>src/entity.rs</code></td><td>Per-session RLC-UM (SN12) segment/reassemble</td></tr>
+<tr><td>RLC segmentation</td><td><code>nextgsim-rlc</code></td><td><code>src/entity.rs</code></td><td>Per-bearer RLC-UM (SN12) segment/reassemble, with the reassembly window and <code>t-Reassembly</code></td></tr>
 <tr><td>gNB NGAP / N2</td><td><code>nextgsim-gnb</code></td><td><code>src/ngap/task.rs</code></td><td><code>PDUSessionResourceSetup</code> + <code>InitialContextSetup</code>, DRB reconfig</td></tr>
 <tr><td>NGAP transfer codecs</td><td><code>nextgsim-ngap</code></td><td><code>src/procedures/transfer.rs</code></td><td>APER encode/decode of the N2 SM transfer containers</td></tr>
 <tr><td>gNB GTP-U / N3</td><td><code>nextgsim-gnb</code>, <code>nextgsim-gtp</code></td><td><code>src/gtp/task.rs</code>; <code>src/tunnel.rs</code>, <code>src/codec.rs</code></td><td>GTP-U encap/decap, TEID/tunnel management</td></tr>
@@ -360,9 +361,11 @@ SSC mode, authorized QoS rules, and session-AMBR. It returns
 <code>handle_rrc_reconfiguration</code> (<code>nextgsim-ue/src/rrc/task.rs</code>). For a
 non-handover reconfiguration the UE extracts the transaction id (a simplified
 <code>bytes[1]</code>) and replies with an <code>RRCReconfigurationComplete</code>
-(<code>build_reconfiguration_complete</code>) — <strong>it does not decode the
-<code>RadioBearerConfig</code> or install a per-DRB user-plane bearer.</strong> See
-<em>Simplifications &amp; known gaps</em>.</p>
+(<code>build_reconfiguration_complete</code>). In a default build <strong>it does not install
+a per-DRB user-plane bearer</strong>; with <code>up-security</code> it applies the DRB’s
+integrity/ciphering (<code>apply_drb_user_plane_security</code>) and with
+<code>sdap-dataplane</code> it reads the DRB specs and maps QFIs to DRBs
+(<code>apply_drb_sdap_mapping</code>). See <em>Simplifications &amp; known gaps</em>.</p>
 </li>
 <li>
 <p><strong>UE brings up the TUN device.</strong> Back in <code>process_sm_outputs</code>
@@ -424,7 +427,8 @@ field to the <strong>PSI</strong> and <code>pdu_id = 0</code> (user data is unac
 frame goes over UDP to the serving cell.</li>
 <li><strong>gNB RLS + RLC.</strong> The gNB RLS task routes <code>PduType::Data</code> frames to
 <code>handle_uplink_data</code> (<code>nextgsim-gnb/src/rls/task.rs</code>), which reads
-<code>psi = pdu.payload</code>, feeds the bytes into the per-UE RLC entity, and on each
+<code>psi = pdu.payload</code>, feeds the bytes into the <code>(ue_id, psi)</code> RLC entity — one
+per radio bearer, TS 38.322 §4.2.1 — and on each
 fully reassembled SDU sends <code>GtpMessage::DataPduDelivery { ue_id, psi, pdu }</code>
 to the GTP task.</li>
 <li>
@@ -492,23 +496,22 @@ research prototypes (see <a href="ai-6g-stack.html">AI/6G stack</a>).</p>
 <p>Grounded in the code, these are the honest deviations from a textbook TS
 23.501/23.502 user plane:</p>
 <ul>
-<li><strong>The UE does not install the DRB it is told to.</strong> <code>handle_rrc_reconfiguration</code>
-(<code>nextgsim-ue/src/rrc/task.rs</code>) acknowledges a non-handover
-<code>RRCReconfiguration</code> with <code>RRCReconfigurationComplete</code> but never decodes the
-<code>RadioBearerConfig</code>/<code>SDAP-Config</code> or maps QFIs to a bearer. The gNB <em>emits</em> a
-real ASN.1/UPER DRB config (<code>build_drb_reconfiguration_params</code>,
-<code>nextgsim-rrc</code>), but user-plane data is switched purely by <strong>PDU-session ID</strong>,
-not by DRB/LCID/QFI.</li>
-<li><strong>The “radio” is UDP plus RLC-UM.</strong> RLS frames (<code>nextgsim-rls</code>) ride UDP with
-no MAC/PHY, HARQ, or PDCP ciphering on the user plane. Segmentation/reassembly
-is a per-session RLC-UM (SN12) entity (<code>nextgsim-rlc</code>); the PSI is carried in
-the RLS frame’s <code>payload</code> field (<code>create_data_transmission</code>), not in a real
-logical-channel identity.</li>
-<li><strong>DL QoS metadata is surfaced but not acted on.</strong> <code>decapsulate_downlink</code>
-(<code>nextgsim-gtp/src/tunnel.rs</code>) extracts the DL QFI/RQI, but per the <code>amfg-09</code>
-code comment they drive nothing toward the UE yet (“Until the SDAP/DRB layer
-is wired … the session is selected by PSI and the QoS metadata is surfaced for
-diagnostics / reflective QoS”).</li>
+<li><strong>In a default build the UE does not install the DRB it is told to.</strong> The gNB
+emits a real ASN.1/UPER DRB config (<code>build_drb_reconfiguration_params</code>,
+<code>nextgsim-rrc</code>), but without the user-plane features data is switched purely
+by <strong>PDU-session ID</strong>, not by DRB/LCID/QFI. <code>drb-pdcp</code> adds a PDCP entity per
+DRB (TS 38.323), <code>up-security</code> adds DRB integrity and ciphering with
+K_UPenc/K_UPint, and <code>sdap-dataplane</code> maps QFIs to DRBs with a one-octet SDAP
+header (TS 37.324). Each has its own CI job and end-to-end test.</li>
+<li><strong>The “radio” is UDP plus RLC.</strong> RLS frames (<code>nextgsim-rls</code>) ride UDP with
+no MAC/PHY or HARQ. Segmentation/reassembly is a per-session RLC entity
+(<code>nextgsim-rlc</code>): UM SN12 by default, AM for sessions in <code>rlc_am_psis</code>. The
+PSI is carried in the RLS frame’s <code>payload</code> field
+(<code>create_data_transmission</code>), not in a real logical-channel identity.</li>
+<li><strong>DL QoS metadata is diagnostic by default.</strong> <code>decapsulate_downlink</code>
+(<code>nextgsim-gtp/src/tunnel.rs</code>) extracts the DL QFI/RQI; without
+<code>sdap-dataplane</code> they only reach the log (the <code>amfg-09</code> comment in the gNB’s
+<code>handle_downlink_gpdu</code>).</li>
 <li><strong>The <code>--no-routing-config</code> (<code>-r</code>) flag is currently inert.</strong> The CLI option
 and the <code>TunConfig::configure_routing</code> field exist
 (<code>nextgsim-ue/src/main.rs</code>, <code>src/tun/config.rs</code>), but the option is only logged
@@ -558,10 +561,12 @@ the nextgsim gNB and UE on the same Docker bridge as nextgcore and runs the full
 registration + PDU-session + data-plane path; the single-command entrypoint that
 chains build and assertions lives on the core side
 (<code>nextgcore/docker/rust/e2e.sh</code>). The suite pings <strong>through the UE’s GTP-U
-tunnel</strong> and finishes at <code>UE PDU session 1 ACTIVE with IPv4 address</code>; the project
-record has this at <strong>84/84 green (2026-07-02) with UE→UPF GTP-U at 0% packet
-loss</strong>. A stricter <strong>exit-gate</strong> (<code>nextgsim/docker/exit-gate/</code>) runs the gNB
-(kernel SCTP) + UE against a real Open5GS 2.7 SA core as an independent peer.</p>
+tunnel</strong> and finishes at <code>UE PDU session 1 ACTIVE with IPv4 address</code>; it runs
+nightly in nextgcore’s CI. A stricter <strong>exit-gate</strong> (<code>nextgsim/docker/exit-gate/</code>) runs the gNB
+(kernel SCTP) + UE against a real Open5GS 2.7 SA core as an independent peer.
+Its README records NG Setup and registration passing and the PDU session not
+yet completing as of its last recorded run (2026-06-15); it is run by hand, not
+in CI.</p>
 <p>All of this is functional validation against a cooperative or reference peer —
 it is <strong>not</strong> third-party conformance certification.</p>
 
@@ -613,7 +618,7 @@ it is <strong>not</strong> third-party conformance certification.</p>
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 
