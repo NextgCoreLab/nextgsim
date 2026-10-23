@@ -819,3 +819,67 @@ fn the_service_request_secure_exchange_ends_with_the_connection() {
     );
     assert_eq!(mme.unprotect(&out.uplink[0]), vec![0x07, 0x46]);
 }
+
+/// #351, TS 24.301 §5.6.2.2.1: paged with the S-TMSI, a registered idle UE
+/// answers with a SERVICE REQUEST (no uplink data needed) whose RRC cause is
+/// mt-Access; T3346 is stopped by the paging.
+#[test]
+fn an_s_tmsi_paging_is_answered_with_a_service_request() {
+    let (mut ue, mut mme, now) = registered_idle();
+    assert_eq!(ue.initial_message(now), None);
+    assert!(ue.on_paging(PagedWith::STmsi));
+    let sr = ue
+        .initial_message(now)
+        .expect("SERVICE REQUEST for the paging");
+    mme.verify_service_request(&sr);
+    assert_eq!(ue.state(), EmmState::ServiceRequestInitiated);
+    assert!(ue.service_request_answers_paging());
+    assert_eq!(ue.initial_message(now), None, "one SERVICE REQUEST");
+
+    // A data-triggered one is not mt-Access.
+    ue.on_user_plane_established();
+    ue.on_released(now);
+    ue.on_uplink_data_pending();
+    ue.initial_message(now).unwrap();
+    assert!(!ue.service_request_answers_paging());
+}
+
+/// §5.6.2.2.1: T3346 does not hold back a paging response; it is stopped.
+#[test]
+fn a_paging_is_answered_under_t3346() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_downlink(&[0x07, 0x4E, 22, 0x5F, 0x01, 0x01], now);
+    ue.on_released(now);
+    ue.on_uplink_data_pending();
+    assert_eq!(ue.initial_message(now), None, "barred by T3346");
+    assert!(ue.on_paging(PagedWith::STmsi));
+    assert!(ue.initial_message(now).is_some(), "the paging is answered");
+}
+
+/// A UE that is not EMM-REGISTERED (here: attaching) does not answer an S-TMSI
+/// paging.
+#[test]
+fn an_s_tmsi_paging_is_not_answered_outside_emm_registered() {
+    let mut ue = EpsNasUe::new(cfg());
+    let now = Instant::now();
+    ue.initial_message(now).unwrap();
+    assert_eq!(ue.state(), EmmState::RegisteredInitiated);
+    assert!(!ue.on_paging(PagedWith::STmsi));
+}
+
+/// #351, §5.6.2.2.2: paged with the IMSI, the UE detaches locally (bearers,
+/// GUTI, TAI list and KSI gone) and attaches again, with the IMSI.
+#[test]
+fn an_imsi_paging_detaches_locally_and_reattaches() {
+    let (mut ue, _mme, now) = registered_idle();
+    assert!(ue.on_paging(PagedWith::Imsi));
+    assert_eq!(ue.state(), EmmState::Deregistered);
+    assert_eq!(ue.guti(), None);
+    assert_eq!(ue.default_bearer(), None);
+    assert!(ue.tai_list().is_empty());
+    assert_eq!(ue.k_enb(), None, "KSI deleted");
+    let req = ue.initial_message(now).expect("re-attach");
+    assert_eq!(&req[..3], &[0x07, 0x41, 0x71], "plain, no KSI, EPS attach");
+}

@@ -318,10 +318,115 @@ pub enum S1Inbound {
         /// The encoded failure.
         pdu: Vec<u8>,
     },
+    /// S1AP PAGING (§8.5), to broadcast on the cell when its TAI is listed.
+    Paging(PagingRequest),
     /// Nothing to relay; send this Error Indication (§10).
     ErrorIndication(Vec<u8>),
     /// A PDU this build does not act on, for the log.
     NotHandled(String),
+}
+
+/// The paged UE's identity (§9.2.3.13 UE Paging Identity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagingIdentity {
+    /// `s-TMSI`: MMEC and M-TMSI.
+    STmsi {
+        /// MME Code.
+        mmec: u8,
+        /// M-TMSI.
+        m_tmsi: u32,
+    },
+    /// `iMSI`, as decimal digits (§9.2.3.11: TBCD, two digits per octet).
+    Imsi(Vec<u8>),
+}
+
+/// A decoded S1AP PAGING (§9.1.6), the IEs the eNB acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagingRequest {
+    /// UE Identity Index value (§9.2.3.10, IMSI mod 1024), for the paging
+    /// occasion.
+    pub identity_index: u16,
+    /// Who is paged.
+    pub identity: PagingIdentity,
+    /// Paging for the CS domain (CN Domain, §9.2.3.22); otherwise PS.
+    pub cs_domain: bool,
+    /// The TAIs to page in, as (PLMN, TAC).
+    pub tais: Vec<(Plmn, u16)>,
+}
+
+/// IMSI digits from its TBCD encoding: low nibble first, a 0xF filler ends it.
+fn imsi_digits(tbcd: &[u8]) -> Vec<u8> {
+    let mut digits = Vec::with_capacity(tbcd.len() * 2);
+    for b in tbcd {
+        for nibble in [b & 0x0F, b >> 4] {
+            if nibble > 9 {
+                return digits;
+            }
+            digits.push(nibble);
+        }
+    }
+    digits
+}
+
+fn handle_paging(paging: &Paging) -> S1Inbound {
+    let mut index = None;
+    let mut identity = None;
+    let mut cs_domain = None;
+    let mut tais = None;
+    for ie in &paging.protocol_i_es.0 {
+        match &ie.value {
+            PagingProtocolIEs_EntryValue::Id_UEIdentityIndexValue(v) => {
+                index = Some(bits_value(&v.0) as u16);
+            }
+            PagingProtocolIEs_EntryValue::Id_UEPagingID(UEPagingID::S_TMSI(t)) => {
+                identity = Some(PagingIdentity::STmsi {
+                    mmec: t.mmec.0.first().copied().unwrap_or(0),
+                    m_tmsi: t
+                        .m_tmsi
+                        .0
+                        .iter()
+                        .fold(0u32, |acc, b| (acc << 8) | u32::from(*b)),
+                });
+            }
+            PagingProtocolIEs_EntryValue::Id_UEPagingID(UEPagingID::IMSI(i)) => {
+                identity = Some(PagingIdentity::Imsi(imsi_digits(&i.0)));
+            }
+            PagingProtocolIEs_EntryValue::Id_CNDomain(d) => {
+                cs_domain = Some(d.0 == CNDomain::CS);
+            }
+            PagingProtocolIEs_EntryValue::Id_TAIList(list) => {
+                tais = Some(
+                    list.0
+                        .iter()
+                        .filter_map(|e| {
+                            let TAIList_EntryValue::Id_TAIItem(item) = &e.value;
+                            let plmn = <[u8; 3]>::try_from(item.tai.plm_nidentity.0.as_slice())
+                                .ok()
+                                .map(Plmn::decode)?;
+                            let tac = <[u8; 2]>::try_from(item.tai.tac.0.as_slice())
+                                .ok()
+                                .map(u16::from_be_bytes)?;
+                            Some((plmn, tac))
+                        })
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    // §9.1.6: all four are mandatory. Paging is a class 2 procedure whose
+    // receiver has nothing to answer; a PAGING missing one cannot be acted on.
+    match (index, identity, cs_domain, tais) {
+        (Some(identity_index), Some(identity), Some(cs_domain), Some(tais)) => {
+            S1Inbound::Paging(PagingRequest {
+                identity_index,
+                identity,
+                cs_domain,
+                tais,
+            })
+        }
+        _ => S1Inbound::NotHandled("PAGING without a mandatory IE".into()),
+    }
 }
 
 fn encode_or_log(pdu: &S1AP_PDU) -> Option<Vec<u8>> {
@@ -967,6 +1072,10 @@ pub fn handle_s1_pdu(bytes: &[u8]) -> S1Inbound {
             value: InitiatingMessageValue::Id_InitialContextSetup(req),
             ..
         }) => handle_initial_context_setup(req, &unknown),
+        S1AP_PDU::InitiatingMessage(InitiatingMessage {
+            value: InitiatingMessageValue::Id_Paging(paging),
+            ..
+        }) => handle_paging(paging),
         S1AP_PDU::InitiatingMessage(m) => S1Inbound::NotHandled(format!(
             "initiating message, procedure {} (not supported in this build)",
             m.procedure_code.0

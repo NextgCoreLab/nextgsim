@@ -14,8 +14,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use nextgsim_eps_nas::{DefaultBearer, EmmState, EpsNasConfig, EpsNasUe};
-use nextgsim_lte_rrc::msg::EstablishmentCauseValue;
+use nextgsim_eps_nas::{DefaultBearer, EmmState, EpsNasConfig, EpsNasUe, PagedWith};
+use nextgsim_lte_rrc::msg::{EstablishmentCauseValue, PagedUeIdentity};
 
 /// What NAS hands RRC when it needs a connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +89,13 @@ pub trait NasLayer: Send {
     fn on_timer(&mut self, _now: Instant) -> NasTimerOutcome {
         NasTimerOutcome::default()
     }
+    /// A PCCH paging record (TS 36.331 §5.3.2.3: forwarded "to the upper
+    /// layers" when the identity matches one the UE was allocated). Returns
+    /// whether NAS now wants a connection (#351). Only PS-domain records reach
+    /// here; this UE has no CS fallback.
+    fn on_paging(&mut self, _identity: &PagedUeIdentity) -> bool {
+        false
+    }
 }
 
 /// A NAS that never requests a connection: the UE selects a cell and camps
@@ -158,7 +165,10 @@ impl NasLayer for EpsNas {
         let nas = nas?;
         // TS 24.301 Annex D Table D.1.1: attach is "mo-Signalling"; a service
         // request for uplink user data is "mo-Data".
-        let cause = if self.ue.state() == EmmState::ServiceRequestInitiated {
+        // A service request answering a paging is "mt-Access" (#351).
+        let cause = if self.ue.service_request_answers_paging() {
+            EstablishmentCauseValue::MtAccess
+        } else if self.ue.state() == EmmState::ServiceRequestInitiated {
             EstablishmentCauseValue::MoData
         } else {
             EstablishmentCauseValue::MoSignalling
@@ -191,6 +201,35 @@ impl NasLayer for EpsNas {
 
     fn on_uplink_pending(&mut self) {
         self.ue.on_uplink_data_pending();
+    }
+
+    fn on_paging(&mut self, identity: &PagedUeIdentity) -> bool {
+        // TS 36.331 §5.3.2.3: a record is for this UE when its ue-Identity
+        // matches the S-TMSI, or the IMSI, it holds.
+        let with = match identity {
+            PagedUeIdentity::STmsi { mmec, m_tmsi } => {
+                if self.ue.s_tmsi() != Some((*mmec, *m_tmsi)) {
+                    return false;
+                }
+                PagedWith::STmsi
+            }
+            PagedUeIdentity::Imsi(digits) => {
+                let ours: Vec<u8> = self
+                    .ue
+                    .imsi()
+                    .bytes()
+                    .filter(u8::is_ascii_digit)
+                    .map(|b| b - b'0')
+                    .collect();
+                if *digits != ours {
+                    return false;
+                }
+                PagedWith::Imsi
+            }
+        };
+        let wants = self.ue.on_paging(with);
+        self.publish();
+        wants
     }
 
     fn k_enb(&mut self) -> Option<[u8; 32]> {

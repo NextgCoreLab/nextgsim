@@ -191,6 +191,20 @@ pub struct EpsNasUe {
     /// T3346 from a SERVICE REJECT #22: no service request before it expires
     /// (§5.6.1.5).
     t3346: Option<Instant>,
+    /// Paged with the S-TMSI and not answered yet (§5.6.2.2.1, #351).
+    paging_response_pending: bool,
+    /// The service request in progress answers a paging: the RRC establishment
+    /// cause is mt-Access (Annex D, #351).
+    service_request_for_paging: bool,
+}
+
+/// How the network paged the UE (TS 24.301 §5.6.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagedWith {
+    /// The S-TMSI (§5.6.2.2.1): answer with a SERVICE REQUEST.
+    STmsi,
+    /// The IMSI (§5.6.2.2.2): the network lost the UE's context.
+    Imsi,
 }
 
 /// RAND, RES and `K_ASME` held in the ME's volatile memory (§5.4.2.3).
@@ -231,7 +245,64 @@ impl EpsNasUe {
             t3417: None,
             t3440: None,
             t3346: None,
+            paging_response_pending: false,
+            service_request_for_paging: false,
         }
+    }
+
+    /// The UE was paged for the PS domain (TS 24.301 §5.6.2.2, #351). Returns
+    /// whether NAS now needs an RRC connection.
+    ///
+    /// - S-TMSI, EMM-REGISTERED in EMM-IDLE (§5.6.2.2.1): "Upon reception of a
+    ///   paging indication, ... the UE shall stop the timer T3346, if running,
+    ///   and shall initiate ... a service request procedure to respond to the
+    ///   paging". It follows on the next [`Self::initial_message`], with
+    ///   establishment cause mt-Access.
+    /// - IMSI (§5.6.2.2.2): "the UE shall stop timer T3346, if it is running,
+    ///   locally deactivate any EPS bearer context(s), if any, and locally
+    ///   detach from EPS. Additionally, the UE shall delete the following
+    ///   parameters: last visited registered TAI, TAI list, GUTI and KSI_(ASME)",
+    ///   then attaches. A UE-initiated EMM procedure in progress is aborted.
+    ///   A UE with no EPS service (an invalid USIM, a refused PLMN) stays as it
+    ///   is.
+    pub fn on_paging(&mut self, with: PagedWith) -> bool {
+        match with {
+            PagedWith::STmsi => {
+                if self.state != EmmState::Registered {
+                    log::info!(
+                        "EMM: paged with the S-TMSI in {:?}; not answered",
+                        self.state
+                    );
+                    return false;
+                }
+                log::info!("EMM: paged with the S-TMSI; SERVICE REQUEST (§5.6.2.2.1)");
+                self.t3346 = None;
+                self.paging_response_pending = true;
+                true
+            }
+            PagedWith::Imsi => {
+                if matches!(self.state, EmmState::NoService(_)) {
+                    return false;
+                }
+                log::info!("EMM: paged with the IMSI; local detach, then attach (§5.6.2.2.2)");
+                self.t3346 = None;
+                self.t3410 = None;
+                self.t3417 = None;
+                self.attach_pti = None;
+                self.local_detach();
+                self.guti = None;
+                self.tai_list.clear();
+                self.ctx = None;
+                self.secure_exchange = false;
+                true
+            }
+        }
+    }
+
+    /// Whether the service request in progress answers a paging (#351): the
+    /// RRC establishment cause is then mt-Access (Annex D Table D.1.1).
+    pub fn service_request_answers_paging(&self) -> bool {
+        self.state == EmmState::ServiceRequestInitiated && self.service_request_for_paging
     }
 
     /// The EMM state.
@@ -262,6 +333,12 @@ impl EpsNasUe {
 
     /// The S-TMSI (MME code, M-TMSI) RRC identifies the UE with, when it
     /// holds a GUTI (TS 36.331 §5.3.3.3).
+    /// The UE's IMSI, as configured (#351: an IMSI paging record is compared
+    /// with it).
+    pub fn imsi(&self) -> &str {
+        &self.cfg.imsi
+    }
+
     pub fn s_tmsi(&self) -> Option<(u8, u32)> {
         self.guti.map(|g| (g.mme_code, g.m_tmsi))
     }
@@ -304,10 +381,15 @@ impl EpsNasUe {
     /// SERVICE REQUEST (§5.6.1.2), when EMM-REGISTERED with uplink data
     /// pending and not barred by T3346.
     fn service_request(&mut self, now: Instant) -> Option<Vec<u8>> {
-        if !self.uplink_pending || self.t3346.is_some_and(|t| now < t) {
+        let paging = self.paging_response_pending;
+        // T3346 bars a data-triggered service request (§5.6.1.5); a paging
+        // response already stopped it (§5.6.2.2.1).
+        if !paging && (!self.uplink_pending || self.t3346.is_some_and(|t| now < t)) {
             return None;
         }
         self.t3346 = None;
+        self.paging_response_pending = false;
+        self.service_request_for_paging = paging;
         let Some(ctx) = self.ctx.as_mut() else {
             // A registered UE always holds the context the attach's SMC
             // created; without one there is nothing to compute the short MAC.
@@ -319,7 +401,14 @@ impl EpsNasUe {
         self.uplink_pending = false;
         self.state = EmmState::ServiceRequestInitiated;
         self.t3417 = Some(now + T3417);
-        log::info!("EMM: SERVICE REQUEST (uplink data pending); T3417 started");
+        log::info!(
+            "EMM: SERVICE REQUEST ({}); T3417 started",
+            if paging {
+                "paging response"
+            } else {
+                "uplink data pending"
+            }
+        );
         Some(pdu)
     }
 

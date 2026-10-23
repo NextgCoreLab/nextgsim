@@ -23,4 +23,4 @@ pub mod msg;
 pub mod security;
 pub mod ue;
 
-pub use ue::{DefaultBearer, EmmState, EpsNasConfig, EpsNasUe, NasOutput};
+pub use ue::{DefaultBearer, EmmState, EpsNasConfig, EpsNasUe, NasOutput, PagedWith};

@@ -27,7 +27,7 @@ fn only_s1(acts: &[Action]) -> (u16, S1AP_PDU) {
         .iter()
         .filter_map(|a| match a {
             Action::S1 { stream, pdu } => Some((*stream, decode_s1ap_pdu(pdu).unwrap())),
-            Action::Rrc { .. } | Action::UserPlane { .. } => None,
+            Action::Rrc { .. } | Action::UserPlane { .. } | Action::Broadcast { .. } => None,
         })
         .collect();
     assert_eq!(s1.len(), 1, "{acts:?}");
@@ -570,5 +570,99 @@ fn the_inactivity_release_is_off_by_default_and_needs_an_s1_connection() {
         e.check_inactivity(Instant::now() + Duration::from_secs(60))
             .is_empty(),
         "no MME UE S1AP ID yet"
+    );
+}
+
+/// An S1AP PAGING (TS 36.413 §9.1.6) for S-TMSI `(mmec, m_tmsi)` in TAC `tac`
+/// of PLMN 999/70.
+fn paging(mmec: u8, m_tmsi: u32, tac: u16, cs: bool) -> Vec<u8> {
+    let ies = vec![
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_IDENTITY_INDEX_VALUE),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_UEIdentityIndexValue(UEIdentityIndexValue(
+                (0..10).rev().map(|i| (1u16 >> i) & 1 == 1).collect(),
+            )),
+        },
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_PAGING_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_UEPagingID(UEPagingID::S_TMSI(S_TMSI {
+                mmec: MME_Code(vec![mmec]),
+                m_tmsi: M_TMSI(m_tmsi.to_be_bytes().to_vec()),
+                ie_extensions: None,
+            })),
+        },
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CN_DOMAIN),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_CNDomain(CNDomain(if cs {
+                CNDomain::CS
+            } else {
+                CNDomain::PS
+            })),
+        },
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_TAI_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_TAIList(TAIList(vec![TAIList_Entry {
+                id: ProtocolIE_ID(ID_TAI_ITEM),
+                criticality: Criticality(Criticality::IGNORE),
+                value: TAIList_EntryValue::Id_TAIItem(TAIItem {
+                    tai: TAI {
+                        plm_nidentity: TBCD_STRING(Plmn::new(999, 70, false).encode().to_vec()),
+                        tac: TAC(tac.to_be_bytes().to_vec()),
+                        ie_extensions: None,
+                    },
+                    ie_extensions: None,
+                }),
+            }])),
+        },
+    ];
+    encode_s1ap_pdu(&S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_PAGING),
+        criticality: Criticality(Criticality::IGNORE),
+        value: InitiatingMessageValue::Id_Paging(Paging {
+            protocol_i_es: PagingProtocolIEs(ies),
+        }),
+    }))
+    .unwrap()
+}
+
+/// #351, TS 36.413 §8.5.2 / TS 36.331 §5.3.2.2: an S1AP PAGING listing this
+/// cell's TAI is broadcast as an RRC Paging on PCCH carrying the S-TMSI and the
+/// CN domain; one for another TA is not this cell's to send.
+#[test]
+fn an_s1_paging_for_this_tai_is_broadcast_on_pcch() {
+    let mut e = rrc();
+    let acts = e.on_s1(&paging(1, 0x1234_5678, 1, false));
+    let [Action::Broadcast {
+        channel: RrcChannel::Pcch,
+        pdu,
+    }] = acts.as_slice()
+    else {
+        panic!("expected one PCCH broadcast: {acts:?}");
+    };
+    assert_eq!(
+        msg::decode_pcch(pdu).unwrap(),
+        vec![msg::PagingRecordInfo {
+            identity: msg::PagedUeIdentity::STmsi {
+                mmec: 1,
+                m_tmsi: 0x1234_5678
+            },
+            cn_domain: msg::PagingCnDomain::Ps,
+        }]
+    );
+    let acts = e.on_s1(&paging(1, 0x1234_5678, 1, true));
+    let [Action::Broadcast { pdu, .. }] = acts.as_slice() else {
+        panic!("{acts:?}");
+    };
+    assert_eq!(
+        msg::decode_pcch(pdu).unwrap()[0].cn_domain,
+        msg::PagingCnDomain::Cs
+    );
+    assert!(
+        e.on_s1(&paging(1, 0x1234_5678, 7, false)).is_empty(),
+        "TAC 7 is not this cell"
     );
 }

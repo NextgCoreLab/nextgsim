@@ -174,6 +174,12 @@ async fn execute<T: S1Transport>(
                 pdu,
             } => radio.send_rrc(ue, channel, lcid, pdu).await,
             Action::UserPlane { ue, bearers } => s1u.up.install(ue, &bearers),
+            Action::Broadcast { channel, pdu } => {
+                let ues: Vec<u32> = radio.ue_addr.keys().copied().collect();
+                for ue in ues {
+                    radio.send_rrc(ue, channel, 0, pdu.clone()).await;
+                }
+            }
             Action::S1 { stream, pdu } => {
                 if let Err(e) = transport.send(stream, &pdu, S1AP_PPID).await {
                     log::warn!("S1-MME send failed: {e}");

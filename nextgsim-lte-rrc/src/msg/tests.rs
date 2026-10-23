@@ -345,3 +345,49 @@ fn reconfiguration_without_srb2_says_so() {
     assert!(!r.srb2);
     assert!(r.drbs.is_empty());
 }
+
+/// #351: a Paging with one S-TMSI record, derived by hand from X.691 (UPER):
+/// `0` PCCH c1, (c1 has one alternative: no bits), `1000` Paging presence
+/// (pagingRecordList only), `0000` list size 1, `0` PagingRecord extension,
+/// `0 0` PagingUE-Identity extension and s-TMSI, MMEC `00000001`, M-TMSI
+/// `0x12345678`, `0` cn-Domain ps, then padding.
+#[test]
+fn an_s_tmsi_paging_matches_x691() {
+    let rec = PagingRecordInfo {
+        identity: PagedUeIdentity::STmsi {
+            mmec: 1,
+            m_tmsi: 0x1234_5678,
+        },
+        cn_domain: PagingCnDomain::Ps,
+    };
+    let bytes = encode_paging(std::slice::from_ref(&rec)).unwrap();
+    assert_eq!(bytes, vec![0x40, 0x00, 0x11, 0x23, 0x45, 0x67, 0x80]);
+    assert_eq!(decode_pcch(&bytes).unwrap(), vec![rec]);
+}
+
+/// #351: IMSI and CS records round-trip; an empty or oversized list, and a
+/// malformed IMSI, are refused.
+#[test]
+fn paging_records_round_trip_and_bounds_are_enforced() {
+    let recs = vec![
+        PagingRecordInfo {
+            identity: PagedUeIdentity::Imsi(vec![9, 9, 9, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            cn_domain: PagingCnDomain::Ps,
+        },
+        PagingRecordInfo {
+            identity: PagedUeIdentity::STmsi {
+                mmec: 0xFF,
+                m_tmsi: u32::MAX,
+            },
+            cn_domain: PagingCnDomain::Cs,
+        },
+    ];
+    assert_eq!(decode_pcch(&encode_paging(&recs).unwrap()).unwrap(), recs);
+    assert!(encode_paging(&[]).is_err());
+    assert!(encode_paging(&vec![recs[1].clone(); MAX_PAGE_REC + 1]).is_err());
+    assert!(encode_paging(&[PagingRecordInfo {
+        identity: PagedUeIdentity::Imsi(vec![1, 2, 3]),
+        cn_domain: PagingCnDomain::Ps,
+    }])
+    .is_err());
+}

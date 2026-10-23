@@ -99,6 +99,15 @@ pub enum Action {
         /// The E-RABs.
         bearers: Vec<UpBearer>,
     },
+    /// Broadcast an RRC PDU on a common channel to every UE the cell hears
+    /// (PCCH paging, TS 36.331 §5.3.2). RLS has no paging occasions, so it goes
+    /// out at once.
+    Broadcast {
+        /// Logical channel.
+        channel: RrcChannel,
+        /// The RRC message.
+        pdu: Vec<u8>,
+    },
     /// Send an S1AP PDU to the MME on `stream`.
     S1 {
         /// SCTP stream.
@@ -763,12 +772,64 @@ impl EnbRrc {
                 stream: self.ue_stream(enb_ue_s1ap_id),
                 pdu,
             }],
+            S1Inbound::Paging(p) => self.on_paging(&p),
             S1Inbound::ErrorIndication(pdu) => vec![Action::S1 {
                 stream: NON_UE_ASSOCIATED_STREAM,
                 pdu,
             }],
             S1Inbound::NotHandled(what) => {
                 log::info!("S1AP {what}: not handled in this build");
+                vec![]
+            }
+        }
+    }
+
+    /// S1AP PAGING (TS 36.413 §8.5.2): when one of the listed TAIs is this
+    /// cell's (one of its broadcast PLMNs and its TAC), broadcast an RRC Paging
+    /// with the UE's paging record (TS 36.331 §5.3.2.2). A PAGING for other TAs
+    /// is not this cell's to send.
+    fn on_paging(&mut self, p: &s1ap_ue::PagingRequest) -> Vec<Action> {
+        let ours = p
+            .tais
+            .iter()
+            .any(|(plmn, tac)| *tac == self.cell.tac && self.plmns.contains(plmn));
+        if !ours {
+            log::info!(
+                "PAGING for TAIs {:?}: not this cell's (TAC {})",
+                p.tais,
+                self.cell.tac
+            );
+            return vec![];
+        }
+        let identity = match &p.identity {
+            s1ap_ue::PagingIdentity::STmsi { mmec, m_tmsi } => msg::PagedUeIdentity::STmsi {
+                mmec: *mmec,
+                m_tmsi: *m_tmsi,
+            },
+            s1ap_ue::PagingIdentity::Imsi(d) => msg::PagedUeIdentity::Imsi(d.clone()),
+        };
+        let record = msg::PagingRecordInfo {
+            identity,
+            cn_domain: if p.cs_domain {
+                msg::PagingCnDomain::Cs
+            } else {
+                msg::PagingCnDomain::Ps
+            },
+        };
+        match msg::encode_paging(std::slice::from_ref(&record)) {
+            Ok(pdu) => {
+                log::info!(
+                    "PAGING ({:?}, {}): RRC Paging on PCCH",
+                    record.identity,
+                    if p.cs_domain { "CS" } else { "PS" }
+                );
+                vec![Action::Broadcast {
+                    channel: RrcChannel::Pcch,
+                    pdu,
+                }]
+            }
+            Err(e) => {
+                log::warn!("PAGING not broadcast: {e}");
                 vec![]
             }
         }
