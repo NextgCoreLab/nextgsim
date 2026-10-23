@@ -165,6 +165,12 @@ pub struct RrcUeContext {
     /// arrived: the next UL-DCCH PDU is a SecurityModeComplete integrity
     /// protected at UL COUNT 0, or an unprotected SecurityModeFailure (#285).
     pub(crate) smc_awaiting_answer: bool,
+    /// Downlink SRB1 protection is on: from the moment a protected
+    /// SecurityModeCommand is sent (TS 33.501 §6.7.4: "The gNB starts RRC
+    /// downlink ciphering after sending the AS security mode command"), before the
+    /// SecurityModeComplete turns on the uplink (`as_security_active`). Cleared by a
+    /// SecurityModeFailure, after which the UE keeps its old configuration (#285).
+    pub(crate) dl_protection_active: bool,
     /// The SecurityModeComplete's MAC-I verified (TS 38.331 §5.3.4.3). AS
     /// security is activated only on a verified Complete (#285).
     pub(crate) smc_complete_verified: bool,
@@ -191,6 +197,7 @@ impl RrcUeContext {
             dl_pdcp_count: 1,
             ul_pdcp_count: 0,
             smc_awaiting_answer: false,
+            dl_protection_active: false,
             smc_complete_verified: false,
             dl_next_integrity_only: false,
         }
@@ -214,6 +221,7 @@ impl RrcUeContext {
     /// (TS 38.331 §5.3.4.3).
     pub fn on_as_security_activated(&mut self) {
         self.as_security_active = true;
+        self.dl_protection_active = true;
     }
 
     /// Whether AS security is active for this UE.

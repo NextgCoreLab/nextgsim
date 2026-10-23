@@ -1059,6 +1059,13 @@ impl RrcTask {
                 TidVerification::Match | TidVerification::NoOutstanding => {}
             }
         }
+        // The UE keeps its previous configuration (§5.3.4.4), so the downlink the
+        // SecurityModeCommand turned on goes back off (#285).
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            if !ctx.as_security_active() {
+                ctx.dl_protection_active = false;
+            }
+        }
         warn!(
             "SecurityModeFailure from UE[{}], tid={}: the UE refused AS security and \
              keeps its previous configuration (TS 38.331 §5.3.4.4). SRB1 stays \
@@ -2162,9 +2169,9 @@ impl RrcTask {
         let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
             return Some(data);
         };
-        if !ctx.as_security_active() {
+        if !ctx.dl_protection_active {
             // Not yet activated: the SecurityModeCommand itself is handled by
-            // `protect_security_mode_command`, and everything before activation
+            // `protect_security_mode_command`, and everything before it
             // legitimately goes in the clear.
             return Some(data);
         }
@@ -2705,8 +2712,17 @@ impl Task for RrcTask {
                                         ctx.smc_awaiting_answer = true;
                                         ctx.smc_complete_verified = false;
                                     }
+                                    // Sent first, unprotected by the DL path (the
+                                    // command carries its own MAC-I at DL COUNT 0);
+                                    // every later DL-DCCH PDU is protected
+                                    // (TS 33.501 §6.7.4, #285).
+                                    self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                                    if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                                        ctx.dl_protection_active = true;
+                                    }
+                                } else {
+                                    self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
                                 }
-                                self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
                             }
                             RrcMessage::AsSecurityForReestablishment {
                                 ue_id, k_rrc_int, k_rrc_enc, integrity_alg_id,
@@ -4562,6 +4578,57 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// #285, TS 33.501 §6.7.4: the gNB starts downlink protection right after
+    /// sending the SecurityModeCommand, before the Complete: the DL-DCCH PDU that
+    /// follows the command (here the DL NAS of the same Initial Context Setup) is
+    /// protected at DL COUNT 1, which is where the UE, having verified the command,
+    /// expects it. A SecurityModeFailure turns it back off.
+    #[test]
+    fn downlink_protection_starts_with_the_security_mode_command() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::{
+            phys_cell_id_from_nci, SIMULATED_C_RNTI,
+        };
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(as_security_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            task.handle_as_security_for_reestablishment(
+                7,
+                ReestablishmentSecurity {
+                    k_rrc_int: AS_K_INT,
+                    k_rrc_enc: AS_K_ENC,
+                    integrity_alg_id: 2,
+                    ciphering_alg_id: 2,
+                    c_rnti: SIMULATED_C_RNTI,
+                    phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
+                    next_hop_chaining_count: 0,
+                },
+            );
+            let ctx = task.ue_manager.try_find_ue_mut(7).unwrap();
+            ctx.smc_awaiting_answer = true;
+            ctx.dl_protection_active = true; // as the SMC arm sets it once sent
+            let plain = vec![0x28u8, 0x11, 0x22];
+            let sent = task
+                .protect_dl_dcch(7, RrcChannel::DlDcch, OctetString::from_slice(&plain))
+                .expect("sent");
+            assert_eq!(
+                ue_side_security().unprotect(1, 0, 1, sent.data()).unwrap(),
+                plain,
+                "protected at DL COUNT 1 before the SecurityModeComplete"
+            );
+            task.handle_security_mode_failure(7, 0);
+            let after = task
+                .protect_dl_dcch(7, RrcChannel::DlDcch, OctetString::from_slice(&plain))
+                .expect("sent");
+            assert_eq!(
+                after.data(),
+                &plain[..],
+                "back in the clear after a failure"
+            );
+        });
     }
 
     /// #285: a re-establishment restarts both SRB1 COUNTs at 0, and the
