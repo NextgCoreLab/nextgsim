@@ -48,6 +48,29 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
 
+  all-features:
+    name: Check (all features)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Every feature-gated job below builds a chosen set of crates with a chosen
+      # set of features. None of them compiles EVERY target with EVERY feature,
+      # so a test target behind a feature nobody lists rots unseen: the 6G
+      # integration tests stopped compiling in September, and the sidelink tests
+      # stopped compiling once a cfg-gated field was added to UeTaskBase (#319).
+      # This job compiles the whole workspace, all targets, all features at once,
+      # including the gNB's `kernel-sctp` arm, which no other job builds (#311).
+      #
+      # It is a compile gate, not a test run. Some features are mutually
+      # exclusive at run time: the drb-pdcp end-to-end test asserts a bare PDCP
+      # header, which `up-security` and `sdap-dataplane` deliberately change. The
+      # feature jobs below run the tests in the combinations that are meaningful.
+      - name: cargo check --all-features
+        run: cargo check --workspace --all-targets --all-features
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -225,8 +248,15 @@ jobs:
       # (nwdaf/task.rs and the rls/task.rs forwarding) lands here.
       - name: cargo test (6g alone)
         run: cargo test -p nextgsim-gnb --features 6g
+      # The 6G end-to-end tests (tests/src/sixg_task_integration.rs) only compile
+      # under the integration crate's `6g` feature. No job built them, so they
+      # stopped compiling in September and nobody saw it (#319).
+      - name: cargo test (6g end to end)
+        run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-gnb --features 6g --all-targets
+        run: |
+          cargo clippy -p nextgsim-gnb --features 6g --all-targets
+          cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
 
   drb-pdcp:
     name: DRB PDCP (feature-gated)

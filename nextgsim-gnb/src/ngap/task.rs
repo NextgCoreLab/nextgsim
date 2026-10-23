@@ -696,10 +696,21 @@ impl NgapTask {
             .map(|ctx| ctx.ue_id)
             .collect();
 
+        // Each UE is released locally, like the other AMF-less release routes
+        // (Error Indication, NG Reset): NGAP context, RRC, AND the GTP-U tunnels.
+        // Releasing only the first two left every UE's PDU session state and
+        // TEIDs in the GTP task after an AMF restart. Because `ue_id` is keyed by
+        // the UE's STI, a UE that re-registered came back with the same id and
+        // its uplink could ride the stale tunnel toward the old UPF TEID (#310).
+        if !ue_ids.is_empty() {
+            info!(
+                "AMF[{}] association down: releasing {} UE(s) locally",
+                client_id,
+                ue_ids.len()
+            );
+        }
         for ue_id in ue_ids {
-            self.delete_ue_context(ue_id).await;
-            // Notify RRC of AN release
-            self.send_an_release(ue_id).await;
+            self.local_release_ue(ue_id).await;
         }
 
         // Update initialization status
@@ -7948,6 +7959,53 @@ mod tests {
             ctx.amf_ue_ngap_id = Some(7777);
         }
         (task, rrc_rx, gtp_rx, sctp_rx)
+    }
+
+    /// #310: losing the AMF association releases every one of that AMF's UEs
+    /// locally INCLUDING its GTP-U tunnels -- one `GtpMessage::UeContextRelease`
+    /// per UE -- the way the Error Indication and NG Reset routes already did. A
+    /// UE on another AMF is untouched.
+    #[tokio::test]
+    async fn association_down_releases_each_ues_gtp_tunnels() {
+        let (mut task, mut rrc_rx, mut gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        task.create_ue_context(2, 1).await.expect("ue 2");
+        // A UE on a second AMF, which must survive AMF 1's association loss.
+        task.create_amf_context(2);
+        if let Some(ctx) = task.find_amf_context_mut(2) {
+            ctx.on_association_up(200, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(3, 2).await.expect("ue 3");
+
+        task.handle_association_down(1).await;
+
+        let mut released = Vec::new();
+        while let Ok(msg) = gtp_rx.try_recv() {
+            if let TaskMessage::Message(GtpMessage::UeContextRelease { ue_id }) = msg {
+                released.push(ue_id);
+            }
+        }
+        released.sort_unstable();
+        assert_eq!(
+            released,
+            vec![1, 2],
+            "one GTP release per UE of the lost AMF"
+        );
+
+        let mut an_released = Vec::new();
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(RrcMessage::AnRelease { ue_id }) = msg {
+                an_released.push(ue_id);
+            }
+        }
+        an_released.sort_unstable();
+        assert_eq!(an_released, vec![1, 2]);
+        assert!(task.find_ue_context(1).is_none());
+        assert!(task.find_ue_context(2).is_none());
+        assert!(
+            task.find_ue_context(3).is_some(),
+            "the other AMF's UE stays"
+        );
     }
 
     /// Every NGAP PDU the task put on the SCTP channel.

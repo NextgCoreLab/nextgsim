@@ -149,22 +149,14 @@ impl SidelinkUe {
         // Drained by `take_relayed_uplinks` (issue #190): this is the relay's Uu leg.
         let (rrc_tx, rrc_rx) = mpsc::channel(64);
         let (rls_tx, _rls_rx) = mpsc::channel(64);
-        let task_base = UeTaskBase {
-            config: std::sync::Arc::new(config),
-            app_tx: TaskHandle::new(app_tx),
-            nas_tx: TaskHandle::new(nas_tx),
-            rrc_tx: TaskHandle::new(rrc_tx),
-            rls_tx: TaskHandle::new(rls_tx),
-            #[cfg(any(
-                feature = "nextgsim-she",
-                feature = "nextgsim-nwdaf",
-                feature = "nextgsim-isac",
-                feature = "nextgsim-fl",
-                feature = "nextgsim-semantic",
-            ))]
-            sixg: None,
-            rel18: None,
-        };
+        let task_base = UeTaskBase::from_handles(
+            std::sync::Arc::new(config),
+            TaskHandle::new(app_tx),
+            TaskHandle::new(nas_tx),
+            TaskHandle::new(rrc_tx),
+            TaskHandle::new(rls_tx),
+            None,
+        );
         Self {
             task: SidelinkTask::new(task_base),
             inbox: TaskHandle::new(tx),
@@ -587,7 +579,6 @@ async fn a_remote_ue_reaches_the_network_through_a_relays_srap_adaptation_layer(
     relay.task.set_pc5_transmitter(remote.inbox.clone());
     remote.task.set_pc5_transmitter(relay.inbox.clone());
 
-    let relay_id = ProseL2Id::new(RELAY_L2_ID);
     let remote_id = ProseL2Id::new(UE2_L2_ID);
 
     // --- The relay announces; the remote UE discovers it and opens the link on its own ---

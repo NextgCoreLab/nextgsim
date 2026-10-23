@@ -341,3 +341,73 @@ async fn the_smc_hop_reaches_the_ue_security_handler_and_answers_it() {
         "a SecurityModeFailure is an RRC-local outcome and must not reach NGAP"
     );
 }
+
+/// #264 (TS 38.331 §5.3.10.3, §5.3.11; TS 38.304 §5.2): after a radio link
+/// failure with no AS security to re-establish with, the real UE RRC goes to
+/// RRC_IDLE and tells NAS, selects the cell that is there now (the restarted gNB
+/// shows up as a new cell), hands it to NAS as an active-cell change, and the
+/// registration NAS that follows reaches the real gNB as a new Initial UE
+/// Message. Before #276 the UE kept camping on the lost cell and nothing
+/// followed the failure.
+#[tokio::test]
+async fn after_a_radio_link_failure_the_ue_reselects_and_reaches_the_gnb_again() {
+    let mut h = harness();
+    let (setup_complete, _nas) = run_setup_handshake(&mut h).await;
+    h.gnb
+        .handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, setup_complete)
+        .await;
+    assert!(try_take_initial_nas(&mut h.gnb_ngap_rx).is_some());
+    while h.ue_nas_rx.try_recv().is_ok() {}
+
+    // The serving cell disappears (RLS reports it lost), then the RLF.
+    h.ue.handle_signal_changed(CELL_ID, i32::MIN).await;
+    h.ue.handle_radio_link_failure(nextgsim_ue::tasks::RlfCause::SignalLostToConnectedCell)
+        .await;
+    let mut saw_rlf = false;
+    while let Ok(msg) = h.ue_nas_rx.try_recv() {
+        if let UeTaskMessage::Message(NasMessage::RadioLinkFailure) = msg {
+            saw_rlf = true;
+        }
+    }
+    assert!(saw_rlf, "NAS learns the connection is gone (CM-IDLE)");
+
+    // The gNB comes back as a new cell; the UE selects it and tells NAS.
+    const NEW_CELL: i32 = 2;
+    h.ue.handle_signal_changed(NEW_CELL, -60).await;
+    h.ue.perform_cycle().await;
+    let mut changed = false;
+    while let Ok(msg) = h.ue_nas_rx.try_recv() {
+        if let UeTaskMessage::Message(NasMessage::ActiveCellChanged { .. }) = msg {
+            changed = true;
+        }
+    }
+    assert!(changed, "the reselected cell reaches NAS");
+    assert_eq!(h.ue.serving_cell_id(), Some(NEW_CELL));
+
+    // NAS's registration update: a new RRC connection to the gNB.
+    let update = vec![0x7E, 0x00, 0x41, 0x03];
+    h.ue.handle_uplink_nas_delivery(2, OctetString::from_slice(&update))
+        .await;
+    let (ch, setup_req) = next_ue_uplink_rrc(&mut h.ue_rls_rx);
+    assert_eq!(ch, RrcChannel::UlCcch);
+    const NEW_UE_ID: i32 = 2;
+    h.gnb
+        .handle_uplink_rrc(NEW_UE_ID, RrcChannel::UlCcch, setup_req)
+        .await;
+    let (_, ch, rrc_setup) = next_gnb_downlink_rrc(&mut h.gnb_rls_rx);
+    assert_eq!(ch, RrcChannel::DlCcch);
+    h.ue.handle_downlink_rrc(NEW_CELL, RrcChannel::DlCcch, rrc_setup)
+        .await;
+    let (_, complete) = next_ue_uplink_rrc(&mut h.ue_rls_rx);
+    h.gnb
+        .handle_uplink_rrc(NEW_UE_ID, RrcChannel::UlDcch, complete)
+        .await;
+    let (ue_id, pdu, _) =
+        try_take_initial_nas(&mut h.gnb_ngap_rx).expect("a new Initial UE Message");
+    assert_eq!(ue_id, NEW_UE_ID);
+    assert_eq!(
+        pdu.data(),
+        &update[..],
+        "the registration update NAS, byte for byte"
+    );
+}
