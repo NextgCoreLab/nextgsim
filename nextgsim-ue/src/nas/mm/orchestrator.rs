@@ -647,6 +647,10 @@ pub struct MmOrchestrator {
     /// reported by RRC on every cell change. Unlike `current_tai` (the first
     /// entry of the TAI list), this is where the UE actually is (#277).
     serving_tai: Option<[u8; 6]>,
+    /// The serving TAI when the last registration update was sent (#277 review).
+    /// While its retry is scheduled (T3511/T3502), a cell change triggers a new
+    /// update only if the TAI differs from this one (TS 24.501 §5.2.3.2.3 d)).
+    update_attempt_tai: Option<[u8; 6]>,
     /// Equivalent PLMN list signalled in the last Registration Accept
     /// (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). Each entry is a 3-octet
     /// BCD-encoded PLMN, in the network-supplied priority order. Replaced
@@ -753,6 +757,7 @@ impl MmOrchestrator {
             racs_store_assigned_id: false,
             current_tai: None,
             serving_tai: None,
+            update_attempt_tai: None,
             equivalent_plmns: Vec::new(),
             t3502_value: None,
             forbidden_plmns: Vec::new(),
@@ -1325,6 +1330,39 @@ impl MmOrchestrator {
         self.serving_tai = Some(tai);
     }
 
+    /// Whether a cell change (RRC's `ActiveCellChanged`, the serving TAI already
+    /// recorded) starts a registration for mobility and periodic registration
+    /// update (TS 24.501 §5.5.1.3.2 a), §5.2.3.2.3).
+    ///
+    /// - Not registered: no (the initial registration has its own trigger).
+    /// - 5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE with T3346 running: no.
+    ///   §5.2.3.2.3 d) starts the update on a TAI change only "if timer T3346 is
+    ///   not running", and its expiry retries the update.
+    /// - A failed update's retry scheduled (T3511 or T3502): only if the serving
+    ///   TAI differs from the one the failed update was sent in. A re-camp in
+    ///   the same TA must not bypass the retry timer (#275); a move to another TA
+    ///   must not wait it out (§5.2.3.2.3 d), up to 12 minutes of T3502).
+    /// - Otherwise: yes, as before.
+    pub fn registration_update_on_cell_change(&self) -> bool {
+        if !self.state.is_registered() {
+            return false;
+        }
+        if self.state.mm_substate() == MmSubState::RegisteredAttemptingRegistrationUpdate
+            && self.timers.t3346.is_running()
+        {
+            return false;
+        }
+        if self.timers.t3511.is_running() || self.timers.t3502.is_running() {
+            return match (self.serving_tai, self.update_attempt_tai) {
+                (Some(now), Some(then)) => now != then,
+                // The TA of the failed attempt is unknown, or the serving one is:
+                // nothing shows the TAI changed.
+                _ => false,
+            };
+        }
+        true
+    }
+
     /// Whether the serving cell's TAI is in the stored TAI list. False when
     /// either is unknown: nothing then shows the UE is inside its registration
     /// area (#277).
@@ -1569,6 +1607,13 @@ impl MmOrchestrator {
 
     /// Build, record and emit a Registration Request; arms T3510.
     fn build_and_send_registration(&mut self, reg_type: RegistrationType) -> Vec<MmOutput> {
+        if matches!(
+            reg_type,
+            RegistrationType::MobilityRegistrationUpdating
+                | RegistrationType::PeriodicRegistrationUpdating
+        ) {
+            self.update_attempt_tai = self.serving_tai;
+        }
         let ng_ksi = if self.sec.is_active() {
             self.sec.nas_ksi()
         } else {
@@ -2236,10 +2281,19 @@ impl MmOrchestrator {
             self.state.switch_update_status(UpdateStatus::NotUpdated);
             self.state
                 .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+            // A network T3502 of zero starts a zero-length timer, which expires
+            // on the next tick: "the actions defined for the expiry of the timer
+            // T3502", as §5.5.1.3.7 asks.
             if let Some(timer3) = self.t3502_value {
                 self.timers.start_with_timer3(TIMER_T3502, timer3, true);
             } else {
                 self.timers.start(TIMER_T3502, true);
+            }
+            // §5.5.1.3.7: at 5 attempts the list of equivalent PLMNs goes too
+            // (single access: never registered over both accesses).
+            if !self.equivalent_plmns.is_empty() {
+                self.equivalent_plmns.clear();
+                return vec![MmOutput::EquivalentPlmnsUpdated(Vec::new())];
             }
         }
         Vec::new()
@@ -2970,6 +3024,9 @@ impl MmOrchestrator {
         self.state.is_connected()
             && !self.timers.t3517.is_running()
             && !self.up_reactivation_pending
+            // §5.2.3.2.3 a): in ATTEMPTING-REGISTRATION-UPDATE the UE "shall not
+            // send any user data", even over a user plane still up (#277 review).
+            && self.state.mm_substate() != MmSubState::RegisteredAttemptingRegistrationUpdate
     }
 
     /// Whether uplink data in CM-CONNECTED must first trigger a Service Request
@@ -5084,6 +5141,98 @@ mod tests {
         assert!(!orch.start_registration(reg_type).is_empty());
         assert!(orch.timers().t3510.is_running());
         orch
+    }
+
+    /// #277 review, TS 24.501 §5.2.3.2.3 d): while a failed update's retry is
+    /// scheduled, a cell change re-registers at once only if the TAI changed; a
+    /// re-camp in the same TA waits for the timer. With T3346 running in
+    /// ATTEMPTING-REGISTRATION-UPDATE, not even a TAI change does.
+    #[test]
+    fn a_tai_change_bypasses_a_scheduled_update_retry_but_a_recamp_does_not() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(
+            orch.timers().t3511.is_running(),
+            "precondition: retry scheduled"
+        );
+
+        orch.set_serving_tai(TAI_NOT_IN_LIST);
+        assert!(
+            !orch.registration_update_on_cell_change(),
+            "same TA: T3511 decides"
+        );
+        orch.set_serving_tai(TAI_IN_LIST);
+        assert!(
+            orch.registration_update_on_cell_change(),
+            "a new TA: the update starts now"
+        );
+
+        // T3502 stage: the same rule.
+        orch.timers.stop(TIMER_T3511, true);
+        orch.timers.start(TIMER_T3502, true);
+        orch.set_serving_tai(TAI_NOT_IN_LIST);
+        assert!(!orch.registration_update_on_cell_change());
+        orch.set_serving_tai(TAI_IN_LIST);
+        assert!(orch.registration_update_on_cell_change());
+
+        // T3346 in ATTEMPTING-REGISTRATION-UPDATE: no update on any cell change.
+        orch.timers.stop(TIMER_T3502, true);
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+        orch.timers
+            .start_with_timer2(TIMER_T3346, GprsTimer2::new(60), true);
+        assert!(!orch.registration_update_on_cell_change());
+        orch.timers.stop(TIMER_T3346, true);
+        assert!(
+            orch.registration_update_on_cell_change(),
+            "no timer: as before"
+        );
+    }
+
+    /// #277 review, §5.2.3.2.3 a): no user data in ATTEMPTING-REGISTRATION-UPDATE,
+    /// even with the user plane still up; back in NORMAL-SERVICE it flows again.
+    #[test]
+    fn no_user_data_in_attempting_registration_update() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.uplink_user_plane_ready(), "precondition");
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+        assert!(!orch.uplink_user_plane_ready());
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredNormalService);
+        assert!(orch.uplink_user_plane_ready());
+    }
+
+    /// A UE that is not registered never starts an update on a cell change.
+    #[test]
+    fn a_deregistered_ue_starts_no_update_on_a_cell_change() {
+        let orch = registered_orch();
+        assert!(!orch.registration_update_on_cell_change());
+    }
+
+    /// #277 review, §5.5.1.3.7: at five failed update attempts the equivalent
+    /// PLMN list is deleted, and PLMN selection is told.
+    #[test]
+    fn the_fifth_failed_update_deletes_the_equivalent_plmns() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_IN_LIST,
+        );
+        orch.equivalent_plmns = vec![[0x00, 0xF1, 0x10]];
+        orch.registration_attempt_counter = MAX_REGISTRATION_ATTEMPTS - 1;
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(orch.timers().t3502.is_running());
+        assert!(orch.equivalent_plmns().is_empty());
+        assert!(
+            outs.contains(&MmOutput::EquivalentPlmnsUpdated(Vec::new())),
+            "{outs:?}"
+        );
     }
 
     /// nextgsim #277, TS 24.501 §5.5.1.3.7: a failed periodic update with the UE

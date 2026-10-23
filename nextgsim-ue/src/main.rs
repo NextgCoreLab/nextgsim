@@ -997,14 +997,11 @@ impl UeApp {
                             if let Some(plmn) = reported_serving_plmn {
                                 plmn_selector.set_serving_plmn(Some(plmn));
                             }
-                            if orch.state().is_registered()
-                                // A failed update already has its retry
-                                // scheduled on T3511/T3502 (TS 24.501
-                                // §5.5.1.3.7, nextgsim #277): re-camping must not
-                                // bypass it.
-                                && !orch.timers().t3511.is_running()
-                                && !orch.timers().t3502.is_running()
-                            {
+                            if orch.registration_update_on_cell_change() {
+                                // A failed update's scheduled retry (T3511/T3502)
+                                // is bypassed only by a TAI change, and T3346 is
+                                // respected (TS 24.501 §5.2.3.2.3 d), nextgsim
+                                // #277): see the method.
                                 // Mobility registration update trigger
                                 // (TS 24.501 Section 5.5.1.3.2)
                                 let outs = orch.start_registration(
