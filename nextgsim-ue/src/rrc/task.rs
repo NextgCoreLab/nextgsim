@@ -10513,12 +10513,14 @@ mod tests {
                 .await;
             task.handle_signal_changed(1, i32::MIN).await;
             assert!(task.reestablishment_proc.is_in_progress());
-            assert!(next_uplink_rrc_opt(&mut rls_rx).is_none(), "nothing sent yet");
             assert!(
-                !nas_rx.try_recv().is_ok_and(|m| matches!(
-                    m,
-                    TaskMessage::Message(NasMessage::RadioLinkFailure)
-                )),
+                next_uplink_rrc_opt(&mut rls_rx).is_none(),
+                "nothing sent yet"
+            );
+            assert!(
+                !nas_rx
+                    .try_recv()
+                    .is_ok_and(|m| matches!(m, TaskMessage::Message(NasMessage::RadioLinkFailure))),
                 "NAS is not told: the connection may still be recovered"
             );
             task.handle_signal_changed(2, -60).await;
@@ -10542,7 +10544,10 @@ mod tests {
                 "the shortMAC-I covers the SELECTED cell's identity"
             );
             assert_eq!(task.serving_cell_id, Some(2));
-            assert!(task.reestablishment_proc.t301_remaining().is_some(), "T301 armed");
+            assert!(
+                task.reestablishment_proc.t301_remaining().is_some(),
+                "T301 armed"
+            );
         });
     }
 
