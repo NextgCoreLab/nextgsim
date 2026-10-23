@@ -230,7 +230,7 @@ keeping the matched path default-safe), transitions the RRC state machine to
 `send_rrc_setup_complete` (UE RRC task) takes the stored `initial_nas_pdu` and
 encodes an **RRCSetupComplete** via `encode_rrc_setup_complete` with
 `dedicated_nas_message = <Registration Request>`, `selected_plmn_identity = 1`,
-and the echoed transaction id pinned to `0`. The RedCap indication rides here
+and the RRCSetup's transaction id echoed back. The RedCap indication rides here
 when `config.redcap` is set. It is sent on **UL-DCCH** (SRB1).
 
 The gNB's `handle_ul_dcch_message` tries an **ASN.1-first** decode with
@@ -392,16 +392,14 @@ comments), so both ends arrive at identical RRC keys. The UE RRC handler
 `handle_as_security_mode_command` (`nextgsim-ue/src/rrc/task.rs`) then
 `derive_from_kgnb`s and replies SecurityModeComplete.
 
-> **Caveat (honesty):** the UE-side AS SecurityModeCommand handling is gated
-> behind the compile-time flag `I5_UE_AS_SECURITY` (`nextgsim-ue/src/rrc/security.rs`),
-> **default off**. With the flag off — the matched-sim default and the E2E path —
-> the gNB still derives AS keys and emits the RRC SecurityModeCommand, but the
-> UE's legacy DL-DCCH nibble dispatcher misroutes the gNB's ASN.1 SMC rather than
-> completing typed AS security (this exact behavior is pinned as the red/green
-> baseline in `tests/src/rrc_handshake.rs`). Because RLS/RLC do not actually
-> cipher SRBs/DRBs in the sim, registration and the user plane still complete;
-> full UE↔gNB AS-security completion is a tracked Wave-6 residue (I5), not a
-> claim of this default path.
+> **Caveat (honesty):** AS security is a runtime switch,
+> `as_security_enabled`, on both gNB and UE, **off** in the shipped configs.
+> (It replaced the compile-time constant `I5_UE_AS_SECURITY`.) With it off the
+> gNB still derives the AS keys and sends the RRC SecurityModeCommand and the UE
+> still answers SecurityModeComplete, but nothing is integrity-protected or
+> ciphered on SRB1; the gNB logs that it is "confirmed at RRC framing level
+> only". With it on, SRB1 is protected in both directions through the shared
+> PDCP layer (`nextgsim-pdcp`), and the CI `as-security` job covers it.
 
 ## Simplifications & known gaps
 
@@ -419,19 +417,12 @@ registration:
   MILENAGE-based 5G-AKA. `handle_eap_aka_prime_challenge` is only reached if the
   Authentication Request omits RAND/AUTN and carries an EAP-message IE, which the
   matched core does not do.
-- **AS security default-off on the UE (I5).** See the caveat above:
-  `I5_UE_AS_SECURITY` gates the UE's typed AS SMC handling; the default path
-  leaves AS security key-derived-but-not-completed on the UE, tolerated because
-  the simulated air interface does not cipher.
-- **RRC transaction ids pinned to 0.** Both the gNB's RRCSetup/SMC tids and the
-  UE's echoed RRCSetupComplete tid are pinned to `0` while
-  `C5_TYPED_DCCH_DISPATCH` (`nextgsim-gnb/src/rrc/transaction.rs`) is off, to stay
-  nibble-safe on the legacy dispatchers. The full per-UE `0..3` cycle only lands
-  with C5.
-- **Bespoke DCCH framing alongside ASN.1.** The gNB accepts both real UPER
-  UL-DCCH and a bespoke fallback (`[0x04, tid, 0x01, NAS…]`), and emits DL NAS as
-  a bespoke `[0x04,0x00,0x00,NAS…]` container unless C5 is on. These legacy paths
-  are slated for retirement (C6) and exist for matched-sim interop.
+- **AS security off by default.** See the caveat above.
+- **A bespoke UL-DCCH fallback is still accepted.** The gNB decodes real UPER
+  UL-DCCH first and only then tries the old bespoke RRCSetupComplete framing
+  (`[0x04, tid, 0x01, NAS…]`). With `C5_TYPED_DCCH_DISPATCH = true`
+  (`nextgsim-gnb/src/rrc/transaction.rs`) DL NAS goes out as a real UPER DL
+  Information Transfer and transaction ids cycle per UE.
 - **Identity procedure normally skipped.** The matched UE sends its SUCI directly
   in the initial Registration Request, so no Identity Request/Response runs on the
   happy path.
@@ -478,13 +469,13 @@ to the original Registration Request. `tests/src/ue_registration.rs` and
 registration path through the task graph.
 
 **Matched-simulator docker E2E.** `nextgsim/docker/docker-compose.yml` brings up
-the prebuilt `nr-gnb`/`nr-ue` (`docker/binaries/`) on the `nextgcore_core`
-network and runs them against nextgcore; the end-to-end driver script lives in
+the `nr-gnb`/`nr-ue` images (built from prebuilt binaries in `binaries/`) on the
+`rust_core` network and runs them against nextgcore; the end-to-end driver script lives in
 the nextgcore repo (`nextgcore/docker/rust/e2e.sh`). That suite asserts the
 registration flow through source-anchored log lines (`Sending Registration
 Request` … `Registration Accept: UE is now …` … `Sending Registration Complete`)
 and then verifies the data plane by pinging **through the UE's GTP-U tunnel**,
-finishing at an active PDU session — **84/84 green** as of the last baseline. This
+finishing at an active PDU session; it runs nightly in nextgcore's CI. This
 is functional validation against a cooperative peer; it is not third-party
 conformance certification. See [Getting Started](../getting-started.md) for the
 run recipe and [Configuration Reference](../configuration.md) for the knobs that

@@ -22,9 +22,12 @@ here, see the [gNB section of the Configuration Reference](../configuration.md#g
 
 The runnable binary is declared in `nextgsim-gnb/Cargo.toml` as
 `[[bin]] name = "nr-gnb"` (path `src/main.rs`), alongside a library target
-`nextgsim_gnb` (`src/lib.rs`). The crate has one Cargo feature, `kernel-sctp`,
-which forwards to `nextgsim-sctp/kernel-sctp` for a real kernel-SCTP transport
-on Linux; it is off by default.
+`nextgsim_gnb` (`src/lib.rs`). Its Cargo features, all off by default:
+`kernel-sctp` (forwards to `nextgsim-sctp/kernel-sctp` for a real kernel-SCTP
+transport on Linux), `drb-pdcp` (a PDCP entity per DRB), `up-security`
+(DRB integrity and ciphering; implies `drb-pdcp`), `sdap-dataplane` (QFI-to-DRB
+mapping with an SDAP header), `event-bus`, and `6g` (compiles the six 6G task
+crates).
 
 `src/main.rs` is a `#[tokio::main]` async entry point. Its flow:
 
@@ -62,16 +65,16 @@ The gNB binary's own modules (`src/lib.rs` declares them all):
 
 | Module | Path | Responsibility |
 |---|---|---|
-| `app` | `src/app/` | Config load/validate (`config_loader`), UDP CLI server (`cli_server`), command parsing/handling (`cmd_handler`), status reporting (`status`), App task loop (`task`). Central coordinator. |
+| `app` | `src/app/` | Config load/validate (`config_loader`), command parsing/handling (`cmd_handler`), status reporting (`status`), App task loop (`task`), which hosts the UDP CLI server from `nextgsim-common/src/cli_server.rs`. Central coordinator. |
 | `tasks` | `src/tasks.rs` | Actor framework: `Task` trait, `GnbTaskBase`, `TaskHandle`, `TaskManager`, all inter-task message enums, and the constants (`DEFAULT_CHANNEL_CAPACITY = 256`, `NGAP_PPID = 60`). |
-| `ngap` | `src/ngap/` | N2 control plane: `NgapTask` (`task.rs`), AMF context (`amf_context.rs`), UE context (`ue_context.rs`), MBS context (`mbs_context.rs`). |
+| `ngap` | `src/ngap/` | N2 control plane: `NgapTask` (`task.rs`), AMF context (`amf_context.rs`), UE context (`ue_context.rs`), RACS capability cache (`racs.rs`), unknown-IE handling by criticality (`unknown_ies.rs`, TS 38.413 §10.3.4), NGAP timers, UP security indication. |
 | `rrc` | `src/rrc/` | Air-interface control: `RrcTask` (`task.rs`), connection/state management (`connection.rs`, `ue_context.rs`), transactions, handover, redcap, energy-saving, NTN (`ntn_gnb.rs`). |
 | `rls` | `src/rls/` | `RlsTask`: UDP radio-link simulation — UE discovery, RRC relay, user-plane relay. |
 | `gtp` | `src/gtp/` | `GtpTask`: N3 GTP-U user-plane tunnel management and forwarding. |
 | `sctp` | `src/sctp/` | `SctpTask` and `AmfConnection`: N2 transport (association management, backend selection). |
 | `energy` | `src/energy/` | `EnergyTask` (Rel-18): cell sleep/dormant modes and energy-efficiency metrics. Spawned only if `energy_saving_enabled`. |
 | `daps` | `src/daps.rs` | Rel-17 DAPS handover types (`DapsManager`, `DapsState`), per code comments TS 38.300 §10.1.2.4. Library module — see [gaps](#simplifications--known-gaps). |
-| `mbs_ngap` | `src/mbs_ngap.rs` | Rel-17 MBS NGAP session types (`NgapMbsManager`, `GnbMbsState`), per code comments TS 38.413 §8.21. Library module — see [gaps](#simplifications--known-gaps). |
+| `mbs_ngap` | `src/mbs_ngap.rs` | Rel-17 MBS NGAP session state (`NgapMbsManager`, `GnbMbsState`), per code comments TS 38.413 §8.21. Live: the NGAP task owns one `NgapMbsManager` and routes the MBS session procedures into it. |
 | `agent` | `src/agent/` | 6G AI Agent Framework task. One-line honest pointer only; deferred to the [AI/6G stack chapter](../concepts/ai-6g-stack.md). |
 | `fl` | `src/fl/` | 6G Federated-Learning aggregator task. Prototype — see [AI/6G stack](../concepts/ai-6g-stack.md). |
 | `isac` | `src/isac/` | 6G Integrated Sensing & Communication task. Prototype — see [AI/6G stack](../concepts/ai-6g-stack.md). |
@@ -104,10 +107,13 @@ crates for codec and procedure work.
   handle the opaque per-session transfer containers.
 - **Procedures:** `nextgsim-ngap/src/procedures/` (see `procedures/mod.rs`,
   header cites TS 38.413) implements NG Setup, Initial UE Message, NAS transport
-  (up/downlink), Initial Context Setup, PDU Session Resource setup/modify/release,
-  the transfer containers, UE Context Release, Paging, Path Switch, Handover, and
-  NG Reset — plus 6G extension modules (`ai_native`, `isac_reporting`,
-  `ntn_support`).
+  (up/downlink) and NAS Non-Delivery Indication, Initial Context Setup, PDU
+  Session Resource setup/modify/release/notify, the transfer containers, UE
+  Context Release and Modification, UE Radio Capability (RACS), Paging, Path
+  Switch, Handover and Handover Preparation Failure, NG Reset, Error Indication,
+  Overload, AMF Status Indication, RAN Configuration Update, MBS, and NRPPa
+  (`procedures/nrppa/`, on its own generated codec) — plus 6G extension modules
+  (`ai_native`, `isac_reporting`, `ntn_support`).
 - **What the gNB does with it:** `NgapTask` (`src/ngap/task.rs`) imports these
   procedure builders/parsers directly. `send_ng_setup_request` derives the gNB
   ID as `nci >> (36 - gnb_id_length)` and advertises `ran_node_name =
@@ -122,23 +128,21 @@ crates for codec and procedure work.
 
 - **Codec:** `nextgsim-rrc/src/codec.rs` provides `encode_rrc` / `decode_rrc`
   over **Unaligned PER (UPER)** using `asn1_codecs::uper`, with types generated
-  from the 3GPP RRC ASN.1 schema (`OUT_DIR/rrc.rs`). Core messages (RRC Setup
-  Request/Setup/Setup Complete, DL Information Transfer, Security Mode Command,
-  RRC Reconfiguration, UE Capability) use this real UPER path.
+  from the 3GPP RRC ASN.1 schema (`OUT_DIR/rrc.rs`). The messages the gNB and
+  UE exchange (RRC Setup Request/Setup/Setup Complete, UL/DL Information
+  Transfer, Security Mode Command, RRC Reconfiguration including the handover
+  command, Measurement Report, UE Capability, RRCResume, RRCReestablishment,
+  Paging, MIB/SIB1/SIB19) use this real UPER path.
 - **What the gNB does with it:** `RrcTask` (`src/rrc/task.rs`) dispatches uplink
   PDUs by logical channel in `handle_uplink_rrc` — UL-CCCH via
   `decode_rrc_setup_request`, UL-DCCH via `dispatch_ul_dcch`. Downlink NAS is
   wrapped with `encode_dl_information_transfer` and relayed to RLS. The
   `SecurityModeCommand` and `RrcReconfiguration` PDUs arrive already ASN.1-encoded
   from the NGAP task and are relayed on DL-DCCH.
-- **Real vs simplified:** some paths deliberately fall back to sim-internal
-  encodings for interop with the matched UE. `src/rrc/task.rs` defines
-  `RRC_MSG_TYPE_UE_CAPABILITY = 0x06` as an envelope byte in front of the real
-  ASN.1; `src/rrc/connection.rs` notes the gNB-side RRCResume (DL-CCCH) "uses a
-  simplified encoding" because the ASN.1 gNB-side builder requires
-  `masterCellGroup` and radio-bearer configuration from the suspended UE context;
-  and `src/rrc/handover.rs` builds handover RRC Reconfiguration in a "Simplified
-  format (not real ASN.1)". These are called out again under
+- **Real vs simplified:** two fallbacks remain. If the ASN.1 RRCSetup encode
+  fails, `src/rrc/connection.rs` sends a short bespoke frame instead, and
+  `src/rrc/task.rs` still parses a bespoke UL-CCCH byte layout when the UPER
+  decode fails. Both are called out again under
   [gaps](#simplifications--known-gaps).
 
 ### RLS (radio-link simulation) — `nextgsim-rls`
@@ -167,10 +171,10 @@ with four message types: `Heartbeat`, `HeartbeatAck`, `PduTransmission`,
   otherwise uplink SDUs are `encapsulate_uplink`'d into GTP-U G-PDUs to the UPF,
   and downlink G-PDUs are `decapsulate_downlink`'d in `handle_downlink_gpdu` and
   handed to RLS as `RlsMessage::DownlinkData`. It also answers GTP-U Echo Request.
-- **Real vs simplified:** the SDAP/DRB QoS layer is not fully wired — per code
-  comments in `handle_downlink_gpdu` (amfg-04/amfg-09), the session is selected
-  by **PSI** and the DL **QFI/RQI** are surfaced only for diagnostics /
-  reflective QoS rather than driving DRB selection.
+- **QoS flows:** in a default build the session is selected by **PSI** and the
+  DL **QFI/RQI** only reach the log (`handle_downlink_gpdu`, amfg-09). With the
+  `sdap-dataplane` feature the QFI picks the DRB (TS 37.324 §5.1) and rides a
+  one-octet SDAP header to the UE.
 
 ### SCTP (N2 transport) — `nextgsim-sctp`
 
@@ -198,7 +202,12 @@ with four message types: `Heartbeat`, `HeartbeatAck`, `PduTransmission`,
   sequence-number space and reassembly buffer (`src/rls/task.rs`,
   `rlc_entity_for`). The receiving side enforces the reassembly window and runs
   `t-Reassembly`, discarding a partially received SDU whose missing segment never
-  arrives (`poll_rlc_timers`, ticked from the task's run loop).
+  arrives (`poll_rlc_timers`, ticked from the task's run loop). A session listed
+  in `rlc_am_psis` gets an **AM** entity instead, with STATUS reporting and
+  NACK-driven retransmission.
+- **`nextgsim-pdcp`**: the shared SRB1 PDCP layer for AS security (when
+  `as_security_enabled`), and the per-DRB entity behind `drb-pdcp` /
+  `up-security`.
 - **`nextgsim-common`** (`src/config.rs`, `types.rs`): `GnbConfig`, the
   `TaskMessage<T>` envelope, `OctetString`, `Plmn`, and the SCTP backend enum.
 
@@ -327,25 +336,22 @@ All of the following are grounded in the current source, not in spec text:
   and `referenceLocation` are omitted because there is no MAC-CE timing, antenna
   model, TA-reporting procedure or TS 37.355 location encoder here for them to
   govern.
-- **DAPS and standalone MBS-NGAP are library modules, not wired into a task.**
-  `src/daps.rs` (`DapsManager`, `DapsState`) and `src/mbs_ngap.rs`
-  (`NgapMbsManager`, `GnbMbsState`) are re-exported from `src/lib.rs` but are not
-  instantiated in any task `run` loop. MBS activation/deactivation *is* handled
-  live, but through a different type — `MbsSessionManager` in
-  `src/ngap/mbs_context.rs`, driven by the `MbsSession*` variants of
-  `NgapMessage` in the NGAP task loop.
+- **DAPS is a library module, not wired into a task.** `src/daps.rs`
+  (`DapsManager`, `DapsState`) is re-exported from `src/lib.rs` but not
+  instantiated in any task `run` loop. (MBS is live: the id-keyed
+  `MbsSessionManager` was retired in #188 and the NGAP task drives
+  `NgapMbsManager` from the wire.)
 - **QUIC transport is present but unreachable.** `nextgsim-sctp/src/quic.rs`
   exists, yet `SctpTask::handle_connection_request` (`src/sctp/task.rs`) warns and
   falls back to SCTP when `quic_enabled` is set — QUIC is never actually selected.
-- **Some RRC encodings are sim-internal.** The UE-capability envelope byte
-  (`RRC_MSG_TYPE_UE_CAPABILITY = 0x06`, `src/rrc/task.rs`), the gNB-side
-  RRCResume DL-CCCH fallback (`src/rrc/connection.rs`), and the handover RRC
-  Reconfiguration "not real ASN.1" format (`src/rrc/handover.rs`) are simplified
-  for interop with the matched UE rather than being fully spec-conformant on the
-  wire.
-- **User-plane QoS below the flow level is not modelled.** As noted above, GTP-U
-  downlink selects the session by PSI and treats QFI/RQI as diagnostic; there is
-  no SDAP-to-DRB mapping yet (`src/gtp/task.rs`, `handle_downlink_gpdu`).
+- **Two RRC fallbacks remain.** The bespoke RRCSetup frame used only if the
+  ASN.1 encode fails (`src/rrc/connection.rs`), and the bespoke UL-CCCH parse
+  tried when the UPER decode fails (`src/rrc/task.rs`). The earlier hand-rolled
+  UE-capability envelope, RRCResume and handover command were replaced by UPER
+  (#107, #146).
+- **QFI-to-DRB mapping is off by default.** Without `sdap-dataplane` the GTP-U
+  downlink selects the session by PSI and the QFI/RQI are diagnostic only
+  (`src/gtp/task.rs`, `handle_downlink_gpdu`).
 - **6G / AI-native tasks are prototypes.** `agent`, `fl`, `isac`, `nkef`,
   `nwdaf`, `she` are each config-gated (`*_enabled`) and only spawned when
   enabled (`src/main.rs`, `spawn_tasks`). They implement Stage-1 study ideas, not
@@ -358,7 +364,8 @@ All of the following are grounded in the current source, not in spec text:
   interface IPs, `ntn_config`) that feed the `GnbConfig` used throughout this
   chapter.
 - [nr-cli Reference](../cli-reference.md): the `info`/`status`/`amf-list`/
-  `ue-list`/`ue-info`/`ue-release` commands the App task serves.
+  `ue-list`/`ue-info`/`ue-release`/`ue-suspend`/`xn-path-switch` commands the
+  App task serves.
 - [Registration flow](../concepts/registration-flow.md): the end-to-end control
   path that threads RLS → RRC → NGAP → SCTP → AMF.
 - [PDU session & user plane](../concepts/pdu-session-userplane.md): the RLC →

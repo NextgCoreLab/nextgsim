@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "../searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -192,12 +192,13 @@ this page is about how the UE itself is wired.</p>
 <p><strong>Honesty note:</strong> The <code>nextgsim-ue</code> behaviour described here is validated by
 per-crate unit tests and by the project’s <strong>matched-simulator docker E2E</strong> — the
 project drives <em>its own</em> gNB/UE against the NextGCore 5G core, and the UE→UPF
-GTP-U data plane is exercised end to end (84/84 green, 0% loss as of 2026-07-02).
+GTP-U data plane is exercised end to end, nightly, together with paging,
+Service Request and de-registration (nextgcore’s <code>ue-flow-check.sh</code>).
 This proves internal consistency of the pair; it is <strong>not</strong> third-party
 conformance certification, and the peer is a cooperative simulator, not an
 arbitrary commercial network. The live authentication path supports <strong>5G-AKA and
-EAP-AKA′</strong> (both Milenage-based); the AS-security wire path is <strong>default-off</strong> (see
-<em>Simplifications &amp; known gaps</em>). The Rel-18 5G-Advanced tasks and the 6G/AI
+EAP-AKA′</strong> (both Milenage-based); AS security is <strong>off unless
+<code>as_security_enabled</code> is set</strong> (see <em>Simplifications &amp; known gaps</em>). The Rel-18 5G-Advanced tasks and the 6G/AI
 client tasks are <strong>non-normative research prototypes</strong> — no frozen Rel-20
 Stage-3 wire spec exists. 3GPP TS numbers below are quoted only where they
 appear in this repo’s source comments, phrased “per code comments”.</p>
@@ -212,7 +213,7 @@ appear in this repo’s source comments, phrased “per code comments”.</p>
 <code>-l/--disable-cmd</code>, and <code>-r/--no-routing-config</code>. <code>Args</code> is validated into
 <code>UeOptions</code> via <code>TryFrom&lt;Args&gt;</code>; <code>normalize_imsi</code> strips an <code>imsi-</code> prefix and
 enforces exactly 15 digits. These flags are documented for operators in the
-<a href="../configuration.html#ue-cli-options">CLI section of Configuration</a>.</li>
+<a href="../cli-reference.html#nr-ue">nr-cli Reference</a>.</li>
 <li><strong>Load + validate config.</strong> <code>load_and_validate_ue_config</code> →
 <code>load_ue_config</code> (serde_yaml into <code>nextgsim_common::config::UeConfig</code>) then
 <code>validate_ue_config</code>, which checks HPLMN MCC/MNC ranges, a non-empty
@@ -226,8 +227,9 @@ install the Rel-18 handles <em>before</em> the task base is cloned, and finally
 <li><strong>Spawn the actors.</strong> <code>spawn_tasks</code> launches, in order: the <strong>TUN</strong> task
 (<code>TunTask::run</code>) plus a small TUN→app handler closure; the <strong>App</strong> task
 (<code>AppTask</code>, with a CLI server unless <code>--disable-cmd</code>); the <strong>NAS</strong> task
-(<code>UeApp::run_nas_task</code>); the <strong>RRC</strong> task (<code>UeApp::run_rrc_task</code>); the Rel-18
-<strong>Ranging / MINT / Sidelink</strong> tasks; any enabled <strong>6G</strong> tasks; and last the
+(<code>UeApp::run_nas_task</code>); the <strong>RRC</strong> task (the library <code>RrcTask</code>); the Rel-18
+<strong>Ranging / MINT</strong> tasks (and <strong>Sidelink</strong> only under the off-by-default
+<code>sidelink</code> Cargo feature); any enabled <strong>6G</strong> tasks; and last the
 <strong>RLS</strong> task (<code>RlsTask::from_ue_config</code>). <code>-n &gt; 1</code> spawns that many <code>UeApp</code>
 instances with incrementing IMSIs.</li>
 </ol>
@@ -244,17 +246,18 @@ and the crate that backs it:</p>
 <tr><th>Module (path under <code>nextgsim-ue/src/</code>)</th><th>Backing crate(s)</th><th>Responsibility</th></tr>
 </thead>
 <tbody>
-<tr><td><code>main.rs</code></td><td>—</td><td><code>nr-ue</code> entry: CLI, config load/validate, task spawning, the NAS and RRC task loops (<code>run_nas_task</code>, <code>run_rrc_task</code>) and the MM/SM output pumps (<code>process_mm_outputs</code>, <code>process_sm_outputs</code>)</td></tr>
+<tr><td><code>main.rs</code></td><td>—</td><td><code>nr-ue</code> entry: CLI, config load/validate, task spawning, the NAS task loop (<code>run_nas_task</code>), the MM/SM output pumps (<code>process_mm_outputs</code>, <code>process_sm_outputs</code>) and the uplink buffer that holds packets during a Service Request</td></tr>
 <tr><td><code>tasks.rs</code></td><td><code>nextgsim-common</code></td><td>Actor framework: <code>Task</code> trait, <code>TaskManager</code>, <code>UeTaskBase</code> (holds <code>app_tx/nas_tx/rrc_tx/rls_tx</code> <code>TaskHandle</code>s), the <code>TaskId</code> enum, and every inter-task <code>*Message</code> type</td></tr>
 <tr><td><code>app/</code></td><td><code>nextgsim-common</code></td><td>App task, CLI command parsing/handling (<code>parse_ue_cli_command</code>, <code>cli_handler.rs</code>), status/<code>info</code> reporting (<code>status.rs</code>), config loading (<code>config_loader.rs</code>)</td></tr>
 <tr><td><code>nas/mm/</code></td><td><code>nextgsim-nas</code>, <code>nextgsim-crypto</code></td><td>5GMM: <code>MmOrchestrator</code>, MM state machine, SUCI build, authentication, NAS security, deregistration/service-request/config-update/emergency/MINT procedures</td></tr>
 <tr><td><code>nas/sm/</code></td><td><code>nextgsim-nas</code></td><td>5GSM: <code>SmOrchestrator</code>, PDU-session establishment/modification/release, PSI/PTI allocation, T3580/T3581/T3582, UL/DL NAS Transport wrapping</td></tr>
-<tr><td><code>rrc/</code></td><td><code>nextgsim-rrc</code>, <code>nextgsim-crypto</code></td><td>RRC state machine, cell selection (TS 38.304), measurement, handover, RedCap, re-establishment, resume, AS security (<code>security.rs</code>), UAV RRC types</td></tr>
-<tr><td><code>rls/</code></td><td><code>nextgsim-rls</code>, <code>nextgsim-rlc</code></td><td>Radio Link Simulation transport: cell search over UDP, RRC + user-plane PDU transport, per-PSI RLC (UM SN12) segmentation/reassembly</td></tr>
+<tr><td><code>rrc/</code></td><td><code>nextgsim-rrc</code>, <code>nextgsim-crypto</code>, <code>nextgsim-pdcp</code></td><td>The <code>RrcTask</code>: RRC state machine, cell selection (TS 38.304), measurement, handover and conditional handover, RedCap, re-establishment, RRC_INACTIVE and resume, AS security (<code>security.rs</code>), UAV RRC types</td></tr>
+<tr><td><code>rls/</code></td><td><code>nextgsim-rls</code>, <code>nextgsim-rlc</code></td><td>Radio Link Simulation transport: cell search over UDP, RRC + user-plane PDU transport, per-PSI RLC segmentation/reassembly (UM SN12, or AM for <code>rlc_am_psis</code>)</td></tr>
 <tr><td><code>tun/</code></td><td><code>nextgsim-common</code>, <code>tun-rs</code></td><td>TUN device lifecycle and IP-packet I/O for the user plane (<code>TunTask</code>, <code>TunInterface</code>, <code>packet.rs</code>)</td></tr>
 <tr><td><code>timer.rs</code></td><td>—</td><td>NAS timer constants + <code>NasTimerManager</code>, <code>GprsTimer2/3</code> decoders</td></tr>
 <tr><td><code>daps.rs</code></td><td>—</td><td>Rel-17 DAPS handover UE state (<code>UeDapsState</code>) — dual-RLC handover model</td></tr>
-<tr><td><code>ambient_iot/</code>, <code>prose.rs</code>, <code>ranging/</code>, <code>sidelink/</code>, <code>uav.rs</code>, <code>mint/</code></td><td>(in-crate)</td><td>Rel-17/18 5G-Advanced prototypes (see <a href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes</a>)</td></tr>
+<tr><td><code>ambient_iot/</code>, <code>ranging/</code>, <code>uav.rs</code>, <code>mint/</code></td><td>(in-crate)</td><td>Rel-17/18 5G-Advanced prototypes (see <a href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes</a>)</td></tr>
+<tr><td><code>sidelink/</code></td><td>(in-crate)</td><td>Rel-16/17 PC5 surface behind the off-by-default <code>sidelink</code> feature — real PC5-S Direct Communication, Model A/B discovery, UE-to-UE relay, <strong>L2 UE-to-Network relay with the TS 38.351 SRAP adaptation layer</strong> and the RRC <code>SidelinkUEInformation</code>; absent from a default build (see <a href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes</a>)</td></tr>
 <tr><td><code>semantic_codec/</code>, <code>she_client/</code>, <code>isac_sensor/</code>, <code>fl_participant/</code>, <code>nwdaf_reporter/</code></td><td><code>nextgsim-semantic</code>, <code>nextgsim-she</code>, <code>nextgsim-isac</code>, <code>nextgsim-fl</code>, <code>nextgsim-nwdaf</code></td><td>Feature-gated 6G/AI client tasks (see <a href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes</a>)</td></tr>
 </tbody>
 </table>
@@ -271,7 +274,8 @@ and the crate that backs it:</p>
 <tr><td><code>nextgsim-crypto</code></td><td>Milenage, TUAK, NEA/NIA ciphers, ECIES SUCI concealment, and the 5G KDF hierarchy (<code>kdf::{derive_kausf, derive_kseaf, derive_kamf, derive_kgnb, derive_res_star}</code>)</td></tr>
 <tr><td><code>nextgsim-rrc</code></td><td>ASN.1 UPER RRC codec (<code>codec::generated</code>) and RRC procedures (<code>procedures::security_mode</code>)</td></tr>
 <tr><td><code>nextgsim-rls</code></td><td>The UDP RLS protocol: <code>UeCellSearch</code>, <code>RlsTransport</code>, <code>RrcChannel</code>, message codec</td></tr>
-<tr><td><code>nextgsim-rlc</code></td><td><code>RlcEntity</code> (TS 38.322) — UM SN12 segmentation/reassembly for the user plane</td></tr>
+<tr><td><code>nextgsim-rlc</code></td><td><code>RlcEntity</code> (TS 38.322) — UM SN12 or AM segmentation/reassembly for the user plane; SRAP for the L2 relay</td></tr>
+<tr><td><code>nextgsim-pdcp</code></td><td>The shared SRB1 PDCP layer for AS security; the DRB entity behind <code>drb-pdcp</code> / <code>up-security</code>; the SDAP header behind <code>sdap-dataplane</code></td></tr>
 <tr><td><code>nextgsim-gtp</code></td><td>GTP-U codec (linked as a workspace dependency). On the matched-sim path the UE’s user plane rides <strong>RLS</strong> to the gNB, and the <strong>gNB</strong> is the GTP-U (N3) endpoint toward the UPF — see <a href="gnb.html">gNB Architecture</a></td></tr>
 </tbody>
 </table>
@@ -326,8 +330,8 @@ octets, the encoded Requested NSSAI, and the Rel-17/18 indications
 <code>SendNasPdu</code>, <code>RegistrationSucceeded</code>, <code>EquivalentPlmnsUpdated</code>,
 <code>RegistrationFailed(MmCause)</code>, <code>AuthenticationRejected</code>, <code>PlmnSearchNeeded</code>,
 <code>NotHandled</code> (a plain 5GMM PDU the orchestrator does not own — e.g. a 5GSM
-piggyback, dispatched onward), and <code>AsSecurityKgnb</code> (only when the AS-security
-gate is on).</p>
+piggyback, dispatched onward), and <code>AsSecurityKgnb</code> (only when
+<code>as_security_enabled</code> is set).</p>
 <h3 id="suci-construction"><a class="header" href="#suci-construction">SUCI construction</a></h3>
 <p><code>build_suci</code> (<code>nas/mm/suci.rs</code>) assembles the 5GS mobile-identity IE per
 TS 24.501 §9.11.3.4 (per code comments): SUPI-format/type octet, home-network
@@ -398,10 +402,9 @@ subscription routing are applied here too.</p>
 <h3 id="driving-registration-from-the-ue-side"><a class="header" href="#driving-registration-from-the-ue-side">Driving registration from the UE side</a></h3>
 <p>The end-to-end trigger chain, all in <code>main.rs</code> unless noted:</p>
 <ol>
-<li>The <strong>RRC task</strong> selects a serving cell on the first <code>RrcMessage::SignalChanged</code>
-and sends <code>NasMessage::PerformMmCycle</code> to the NAS task
-(<code>run_rrc_task</code>, <code>registration_triggered</code> latch).</li>
-<li><code>PerformMmCycle</code> in a <code>Deregistered</code> UE calls
+<li>The <strong>RRC task</strong> (<code>rrc/task.rs</code>) selects a serving cell and tells the NAS
+task, which starts registration.</li>
+<li>A <code>Deregistered</code> UE calls
 <code>orch.start_registration(RegistrationType::InitialRegistration)</code>.</li>
 <li>The resulting <code>MmOutput::SendNasPdu</code> becomes <code>RrcMessage::UplinkNasDelivery</code>
 → RRC → RLS → gNB.</li>
@@ -419,29 +422,50 @@ configured default PDU sessions via <code>sm_orch.establish_default_sessions</co
 <code>resume</code>, <code>security</code>, <code>state</code>, <code>uav</code>. The live state machine is
 <code>RrcStateMachine</code> (<code>rrc/state.rs</code>): <code>Idle</code> / <code>Connected</code> / <code>Inactive</code> driven by
 <code>RrcStateTransition</code>.</p>
-<p>The RRC task loop (<code>run_rrc_task</code> in <code>main.rs</code>) is deliberately thin:</p>
+<p>The RRC task is the <strong>library <code>RrcTask</code></strong> (<code>rrc/task.rs</code>), spawned by
+<code>UeApp::spawn_tasks</code>. Issue #30 replaced the thin inline <code>run_rrc_task</code> loop that
+used to live in <code>main.rs</code>, so the <code>CellSelector</code> procedure surface is on the live
+path rather than reachable only from tests.</p>
 <ul>
-<li><strong>Cell selection.</strong> It tracks <code>discovered_cells: HashMap&lt;cell_id, dbm&gt;</code> and, on
-the first <code>SignalChanged</code> while <code>Idle</code>, picks the strongest cell
-(<code>max_by_key</code> on dBm), sends <code>RlsMessage::AssignCurrentCell</code>, and triggers NAS
-registration.</li>
-<li><strong>Uplink NAS.</strong> <code>UplinkNasDelivery</code> is wrapped in a simplified <strong>UL Information
-Transfer</strong> frame (<code>[0x08, 0x00, …NAS]</code>) once connected, or sent as a <strong>raw NAS
-PDU</strong> for initial access (the gNB auto-creates the UE context) — see the byte
-prefixes in <code>run_rrc_task</code>.</li>
-<li><strong>Downlink RRC.</strong> A <strong>DL Information Transfer</strong> frame (leading <code>0x04</code>) is
-unwrapped and the inner NAS PDU is forwarded to the NAS task as
-<code>NasMessage::NasDelivery</code>.</li>
+<li>
+<p><strong>Cell selection and reselection.</strong> <code>RrcTask::perform_cycle</code> runs
+<code>CellSelector::perform_cell_selection</code> every cycle while <code>Idle</code>, so a <em>camped</em>
+UE keeps re-evaluating rather than holding its first choice until radio-link
+failure. Reselection applies the TS 38.304 §5.2.4.6 R-criterion —
+<code>R_s = Q_meas,s + Q_hyst</code> against <code>R_n = Q_meas,n - Qoffset</code> — and only reselects
+once the neighbour has been better ranked for <code>Treselection</code>.</p>
+<p>All three terms come from <strong>broadcast system information</strong> (issue #50): <code>Q_hyst</code>
+and <code>t-ReselectionNR</code> from SIB2, the per-neighbour <code>q-OffsetCell</code> from SIB3
+(keyed by <code>physCellId</code>, which this tree derives from the NR Cell Identity a
+cell’s SIB1 broadcast), and carrier reselection priorities from SIB4 or from a
+dedicated <code>cellReselectionPriorities</code> list in <code>RRCRelease</code>. They used to be the
+compile-time constants <code>DEFAULT_Q_HYST_DB</code> and
+<code>CELL_RESELECTION_TIME_TO_TRIGGER_MS</code>, with no per-cell offset at all.</p>
+<p><code>NasMessage::ActiveCellChanged</code> carries the camped cell’s <code>CellCategory</code>, so NAS
+can honour TS 38.304 §4.4: camping on an <strong>acceptable-only</strong> cell puts the UE in
+limited service and it attempts <strong>emergency</strong> registration
+(<code>registration_type_for_cell_category</code>) rather than normal initial registration.</p>
+</li>
+<li>
+<p><strong>Uplink NAS.</strong> The initial NAS message rides the <strong>RRCSetupComplete</strong>
+(<code>dedicatedNAS-Message</code>); once connected, <code>UplinkNasDelivery</code> is encoded as a
+real UPER <strong>UL Information Transfer</strong> (<code>encode_ul_information_transfer</code>).</p>
+</li>
+<li>
+<p><strong>Downlink RRC.</strong> A <strong>DL Information Transfer</strong> is decoded and the inner NAS
+PDU is forwarded to the NAS task as <code>NasMessage::NasDelivery</code>.</p>
+</li>
 </ul>
-<p><strong>AS security is behind a wire gate.</strong> <code>rrc/security.rs</code> defines
-<code>pub const I5_UE_AS_SECURITY: bool = false;</code> — <strong>default-off</strong>. When false, the
-DL-DCCH handling is byte-for-byte the legacy path so the matched-sim E2E is
-unchanged. When flipped on, the RRC task decodes the AS <code>SecurityModeCommand</code>
+<p><strong>AS security is a runtime switch.</strong> It used to be the compile-time constant
+<code>I5_UE_AS_SECURITY = false</code>; it is now <code>UeConfig::as_security_enabled</code>
+(<code>rrc/security.rs</code>, <code>as_security_enabled</code>), <strong>off by default</strong> and set on both
+gNB and UE together. When on, the RRC task decodes the AS <code>SecurityModeCommand</code>
 (<code>nextgsim_rrc::procedures::security_mode::decode_security_mode_command</code>), derives
 the AS keys (<code>AsSecurityContext::derive_from_kgnb</code>, using the <code>KgNB</code> handed down
-from the NAS plane via <code>RrcMessage::AsSecurityKey</code>), and replies with
-<code>SecurityModeComplete</code>. The derivation is <strong>fail-closed</strong> (no KgNB/algorithm →
-not activated) and explicitly refuses NEA3 (unsupported keystream). <code>security.rs</code>
+from the NAS plane), and replies with <code>SecurityModeComplete</code>; SRB1 then runs
+through the shared PDCP layer in <code>nextgsim-pdcp</code>. The derivation is
+<strong>fail-closed</strong> (no KgNB/algorithm → not activated), and NEA1/NEA2/NEA3 all
+work (NEA3 used to be refused). <code>security.rs</code>
 also implements the ShortMAC-I (TS 38.331 §5.3.7.4) and resumeMAC-I (§5.3.13.3)
 computations over the UPER-encoded <code>VarShortMAC_Input</code> / <code>VarResumeMAC_Input</code>
 ASN.1 types from <code>nextgsim-rrc</code>, using the NIA algorithms from <code>nextgsim-crypto</code>.</p>
@@ -461,10 +485,13 @@ sends <code>TunMessage::DestroyInterface</code>. <code>TunTask</code> (<code>tun
 <p><strong>Uplink (TUN → gNB):</strong></p>
 <ol>
 <li>A reader task on the TUN device emits <code>TunAppMessage::UplinkData { psi, data }</code>.</li>
-<li>The handler in <code>spawn_tasks</code> (<code>main.rs</code>) does two things: sends
-<code>NasMessage::InitiateServiceRequest</code> (so a CM-IDLE UE wakes and runs Service
-Request), and forwards the packet as <code>RlsMessage::DataPduDelivery { psi, pdu }</code>
-straight to the RLS task.</li>
+<li>The handler in <code>spawn_tasks</code> (<code>main.rs</code>) sends
+<code>NasMessage::InitiateServiceRequest</code> with the packet’s PSI (the NAS task only
+acts on it from CM-IDLE), then forwards the packet as
+<code>RlsMessage::DataPduDelivery { psi, pdu }</code> to the RLS task if the user plane
+is up. If it is not, the packet is <strong>held</strong> in an uplink buffer and sent once
+the user plane is back (TS 24.501 §5.6.1.2; nextgsim #267), so the packet
+that triggered the Service Request is not lost.</li>
 <li><code>RlsTask::handle_data_pdu_delivery</code> submits the SDU to the <strong>per-PSI RLC
 entity</strong> — created as <code>RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12)</code>
 (<code>rlc_entity_for</code>) — segments it with <code>build_pdu(1500)</code>, and sends each RLC PDU
@@ -486,8 +513,11 @@ says so explicitly (“This is actually downlink data (from network to UE)”).<
 GTP-U tunnel is what the E2E ping traverses. The full data-plane trace across UE,
 gNB, and UPF is in <a href="../concepts/pdu-session-userplane.html">PDU session &amp; user plane</a>.</p>
 <h2 id="6g--ai-prototypes-pointers"><a class="header" href="#6g--ai-prototypes-pointers">6G &amp; AI prototypes (pointers)</a></h2>
-<p>These modules are <strong>non-normative research prototypes</strong>. The Rel-18 tasks
-(Ranging, MINT, Sidelink) are always compiled and spawned; the 6G/AI client tasks
+<p>These modules are <strong>non-normative research prototypes</strong>. The Rel-18 Ranging and
+MINT tasks are always compiled and spawned; <strong>Sidelink</strong> sits behind the
+off-by-default <code>sidelink</code> Cargo feature, so a default build carries neither the
+task nor its types — see the <code>sidelink/</code> row below. The
+6G/AI client tasks
 are both Cargo-feature-gated (<code>nextgsim-she</code>, <code>nextgsim-nwdaf</code>, <code>nextgsim-isac</code>,
 <code>nextgsim-fl</code>, <code>nextgsim-semantic</code>) <strong>and</strong> config-gated
 (<code>she_enabled</code>, <code>ai_ml_enabled</code>, <code>isac_enabled</code>, <code>federated_learning_enabled</code>,
@@ -500,9 +530,9 @@ see <a href="../concepts/ai-6g-stack.html">The 6G / AI stack</a>.</p>
 </thead>
 <tbody>
 <tr><td><code>ambient_iot/</code></td><td>Rel-18 Ambient IoT fleet management model (TS 22.369) — device-group coordination, no wire protocol.</td></tr>
-<tr><td><code>prose.rs</code></td><td>ProSe PC5 proximity-services model (TS 23.303/23.304) — discovery + UE-to-UE relay state, prototype.</td></tr>
-<tr><td><code>ranging/</code></td><td>Rel-18 UE-to-UE ranging / carrier-phase positioning (TS 23.586) — RTT/phase model + LMF report, prototype.</td></tr>
-<tr><td><code>sidelink/</code></td><td>NR sidelink relay, PC5 link, sidelink positioning — prototype state machines.</td></tr>
+<tr><td><code>prose.rs</code></td><td><strong>Removed by issue #141.</strong> It modelled ProSe contexts, PC5 bearers, relay contexts and Model A/B discovery status, and every one of its types had zero consumers workspace-wide — none of it ever ran. Those procedures are now implemented against the wire in <code>sidelink::{pc5s, link, discovery, relay}</code>: <code>ProseContext</code>/<code>ProsePeer</code> → <code>Pc5DiscoveryEngine</code>/<code>DiscoveredPeer</code>, <code>Pc5Bearer</code> → <code>Pc5LinkContext</code>, <code>UeRelayContext</code> → <code>RelayForwarder</code>.</td></tr>
+<tr><td><code>ranging/</code></td><td><strong>Wired on the UE side and exercised in CI; two limits remain.</strong> Rel-18 UE-to-UE ranging / carrier-phase positioning (TS 23.586 §5.3.3): an SL-PRS occasion from <code>sidelink/</code> produces RTT and carrier-phase measurements, the session maths resolves a range, and it reaches the LMF in the LPP payload container of an UL NAS TRANSPORT (<code>tests/src/ranging_report_e2e.rs</code> asserts the range read back out of those bytes; the <code>ranging</code> CI job runs it). <strong>Limit 1:</strong> there is no PC5 radio, so the propagation delay is computed from configured geometry — the accuracy reported is the model’s, not a radio’s, and nothing exercises the widelane under noise. <strong>Limit 2:</strong> no <strong>two-process</strong> run against a real LMF has happened; the LMF half lives in nextgcore (issue #138), where its LPP codec is held against this UE’s golden vector, so the two are proven against the same bytes rather than against each other in flight. Behind the <code>sidelink</code> feature and <code>ranging_config.enabled</code>, both off by default. Issues #55, #136-#139.</td></tr>
+<tr><td><code>sidelink/</code></td><td><strong>The real PC5 procedures run; two limits remain.</strong> <code>EstablishPc5Link</code> sends a PC5-S <code>Direct Communication Request</code> and reaches <code>Active</code> only on the peer’s <code>Direct Communication Accept</code> (TS 23.304 §6.4.3.1), with the peer’s Layer-2 ID learned from the accept per step 4. Direct discovery is a real Model A announce / Model B solicit-response exchange with a ProSe Application Code filter (§6.3.1.2, §6.3.1.3), so a UE on another code is not discovered. UE-to-UE relay forwarding consults the live link table, so releasing a link stops the forwarding (§6.4.3.10). The UE emits an RRC <code>SidelinkUEInformation</code> (TS 38.331 §5.8.3, real UPER on <code>messageClassExtension.c2</code>) and the gNB answers with an <code>sl-ConfigDedicatedNR</code> in <code>RRCReconfiguration</code>, which the UE applies. <code>tests/src/sidelink_pc5_e2e.rs</code> drives three real tasks through discovery → unicast link → relay; the <code>sidelink-pc5</code> CI job runs it. <strong>Limit 1:</strong> there is no PC5 radio — the medium between UEs is an in-process channel, so the PDUs are real and the propagation is not. <strong>L2 UE-to-Network relay also runs (issue #190):</strong> a remote UE’s end-to-end bearers are adapted through the TS 38.351 SRAP sublayer (<code>nextgsim_rlc::srap</code>) onto the relay’s own Uu relay RLC channels, with the per-remote-UE bearer mapping and the local Remote UE ID signalled by the gNB in <code>sl-L2RelayUE-Config-r17</code> / <code>sl-L2RemoteUE-Config-r17</code> (TS 38.300 §16.12.2.1), and the relay granted a Mode-1 <code>sl-ScheduledConfig-r16</code> SL-RNTI plus an <code>sl-RLC-BearerToAddModList</code> channel it validates its mappings against. A UE asks for this by declaring <code>ue-Type-r17</code>. <strong>Limit 2:</strong> TS 38.351 itself is not in the vendored spec text, so the header’s <em>fields and ranges</em> come from TS 38.300 §16.12.2.1 and the TS 38.331 ASN.1 (both vendored) while its <em>octet layout</em> is this simulator’s own assignment — the same position #141 recorded for the PC5-S message-type octets. <strong>Limit 3:</strong> the relay’s Uu leg is SRB1, not a numbered Uu relay RLC channel, because there is no MAC multiplexing here for one; the adaptation is real, the channel is the one that exists. <strong>Limit 4:</strong> no multi-hop relay, and no L3 relay (it needs an IP forwarding plane). Still absent from a default build (off-by-default <code>sidelink</code> feature), and additionally gated at run time by <code>UeConfig::prose_enabled</code>. Issues #54, #141, #190.</td></tr>
 <tr><td><code>uav.rs</code></td><td>Rel-17/18 UAV context (TS 23.256) — wraps the RRC UAV types with NAS authorization/C2/geofence modelling.</td></tr>
 <tr><td><code>mint/</code></td><td>Rel-18 MINT / multi-USIM (TS 23.761) — multi-SUPI secondary-subscription driver, integrated with the NAS task.</td></tr>
 <tr><td><code>semantic_codec/</code></td><td>6G semantic-communication encode/decode task — research prototype.</td></tr>
@@ -517,31 +547,23 @@ see <a href="../concepts/ai-6g-stack.html">The 6G / AI stack</a>.</p>
 <p>Grounded in the code, these are the honest deviations from a textbook UE:</p>
 <ul>
 <li><strong>RLS is the radio; there is no PHY/MAC.</strong> UE↔gNB is UDP RLS
-(<code>rls/task.rs</code>); the only Layer-2 processing on the user plane is RLC in
-<strong>UM with SN12</strong> (<code>rlc_entity_for</code>) — no AM, no HARQ, no scheduler.</li>
-<li><strong>AS security is default-off.</strong> <code>I5_UE_AS_SECURITY = false</code>
-(<code>rrc/security.rs</code>): on the matched-sim path SRBs are <strong>not</strong> integrity-protected
-or ciphered at the AS layer. NAS-layer security (Knas_int/Knas_enc) <em>is</em> real
-and active. Flipping the gate on requires the docker A/B sign-off noted in the
-source (it mirrors the gNB’s <code>C5_TYPED_DCCH_DISPATCH</code> gate).</li>
+(<code>rls/task.rs</code>); Layer 2 on the user plane is RLC (UM SN12 by default, AM for
+<code>rlc_am_psis</code>), plus PDCP and SDAP when built with <code>drb-pdcp</code> /
+<code>up-security</code> / <code>sdap-dataplane</code> — no HARQ, no scheduler.</li>
+<li><strong>AS security is off by default.</strong> With <code>as_security_enabled: false</code> (the
+shipped configs) SRBs are <strong>not</strong> integrity-protected or ciphered at the AS
+layer. NAS-layer security (Knas_int/Knas_enc) <em>is</em> real and active.</li>
 <li><strong>5G-AKA and EAP-AKA′ on the live path; TUAK unwired.</strong> The live orchestrator
 handles both <strong>5G-AKA</strong> and <strong>EAP-AKA′</strong>, which are both Milenage-based
 (<code>handle_eap_aka_prime_challenge</code> calls
 <code>nextgsim_crypto::eap_aka_prime::run_eap_aka_prime</code>). <strong>TUAK</strong> also exists in
 <code>nextgsim-crypto</code> (byte-exact vs TS 35.232 in its own tests) but is not wired
 into the UE orchestrator.</li>
-<li><strong>RRC framing is simplified.</strong> Uplink/downlink NAS is carried with fixed
-one/two/three-byte UL/DL Information Transfer prefixes (<code>0x08</code> / <code>0x04</code>) and a
-raw-NAS fallback for initial access, not full ASN.1 RRC containers
-(<code>run_rrc_task</code>).</li>
 <li><strong>UAV tracking uses a sim-private message type.</strong> The UE emits a UAV tracking
 report on 5GMM message type <code>0x6A</code> (<code>UAV_TRACKING_REPORT_MSG_TYPE</code>,
 <code>nas/mm/orchestrator.rs</code>); the source comment is explicit that <strong>no such
 UE-originated UAV NAS message exists in 3GPP</strong> — it is a self-contained geofence
 demo, kept in sync with the matched core.</li>
-<li><strong>6G RRC messages are logged and dropped in the binary.</strong> The <code>Sixg*</code> arms of
-<code>RrcMessage</code> in <code>run_nas_task</code>/<code>run_rrc_task</code> are handled only by the library’s
-<code>RrcTask</code>; in the <code>nr-ue</code> binary loop they are debug-logged and discarded.</li>
 <li><strong>Cooperative peer.</strong> Everything above is exercised against the matched
 nextgsim gNB and NextGCore core, not an arbitrary commercial network.</li>
 </ul>
@@ -609,7 +631,7 @@ above.</li>
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

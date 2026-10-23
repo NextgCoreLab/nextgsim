@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "../searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -281,11 +281,13 @@ placeholder). “Drives a live path?” is answered for a <em>default</em> build
 <tr><td>AI agent framework</td><td><code>nextgsim-agent</code> + gNB <code>agent/task.rs</code></td><td>partial (real intent executors, no LLM/RL)</td><td>No — off by default</td><td>unit tests + integration test</td></tr>
 <tr><td>Service Hosting Env (SHE)</td><td><code>nextgsim-she</code> + gNB <code>she/task.rs</code>, UE <code>she_client/</code></td><td>partial (placement scheduler, no orchestration)</td><td>No — off by default</td><td>unit tests</td></tr>
 <tr><td>UE ambient IoT</td><td><code>nextgsim-ue/src/ambient_iot/</code></td><td>illustrative stub (fleet + energy model)</td><td>No — sim-internal</td><td>unit tests</td></tr>
-<tr><td>UE ProSe / sidelink</td><td><code>nextgsim-ue/src/prose.rs</code>, <code>src/sidelink/</code></td><td>prototype (bespoke, not wire-conformant)</td><td>Task spawned but idle by default</td><td>unit tests</td></tr>
-<tr><td>UE ranging / MINT / UAV</td><td><code>nextgsim-ue/src/{ranging,mint,uav}.rs</code></td><td>prototype (bespoke encodings)</td><td>Task spawned but idle by default</td><td>unit tests</td></tr>
+<tr><td>UE ProSe / sidelink</td><td><code>nextgsim-ue/src/sidelink/</code></td><td>partial (real PC5-S messages and SRAP over an in-process medium; no PC5 radio)</td><td>No — <code>sidelink</code> feature and <code>prose_enabled</code></td><td>unit tests + <code>sidelink_pc5_e2e</code></td></tr>
+<tr><td>UE ranging</td><td><code>nextgsim-ue/src/ranging/</code></td><td>partial (range from configured geometry, carried to the LMF over LPP)</td><td>No — <code>sidelink</code> feature and <code>ranging_config.enabled</code></td><td>unit tests + <code>ranging_report_e2e</code></td></tr>
+<tr><td>UE MINT / UAV</td><td><code>nextgsim-ue/src/mint/</code>, <code>src/uav.rs</code></td><td>integrated with NextGCore (see note below)</td><td>Task spawned but idle by default</td><td>unit tests + nextgcore feature E2E</td></tr>
 <tr><td>gNB energy saving</td><td><code>nextgsim-gnb/src/energy/</code></td><td>prototype (cell sleep model)</td><td>No — <code>energy_saving_enabled=false</code></td><td>unit tests</td></tr>
-<tr><td>gNB MBS (NGAP)</td><td><code>nextgsim-gnb/src/mbs_ngap.rs</code></td><td>prototype (Rel-17 MBS)</td><td>No — <code>mbs_enabled=false</code></td><td>unit tests</td></tr>
-<tr><td>NTN (gNB/RRC)</td><td><code>nextgsim-gnb/src/rrc/ntn_gnb.rs</code></td><td>prototype, <strong>inert</strong></td><td>No — parsed but unwired</td><td>unit tests</td></tr>
+<tr><td>gNB MBS (NGAP)</td><td><code>nextgsim-gnb/src/mbs_ngap.rs</code></td><td>partial (Rel-17 MBS session procedures decoded and answered)</td><td>Yes — when the AMF sends MBS procedures</td><td>unit tests</td></tr>
+<tr><td>NTN serving cell (gNB/RRC)</td><td><code>nextgsim-gnb/src/rrc/system_info.rs</code> (SIB19), UE timing advance</td><td>partial (real SIB19 UPER; one serving cell)</td><td>No — only with <code>ntn_config</code></td><td>unit tests + <code>ntn_sib19_timing_e2e</code></td></tr>
+<tr><td>NTN helpers (gNB)</td><td><code>nextgsim-gnb/src/rrc/ntn_gnb.rs</code></td><td>prototype (simplified beam/distance maths)</td><td>No</td><td>unit tests</td></tr>
 </tbody>
 </table>
 </div>
@@ -471,9 +473,11 @@ logic with <strong>bespoke encodings that are not wire-conformant</strong> (cons
 <li><strong>UE ambient IoT</strong> (<code>nextgsim-ue/src/ambient_iot/fleet.rs</code>, “Rel-18, TS 22.369”
 per code comments): energy-harvesting device model + <code>FleetManager</code>. No air
 interface; sim-internal.</li>
-<li><strong>UE ProSe / sidelink</strong> (<code>prose.rs</code>, <code>sidelink/pc5.rs</code>, <code>sidelink/positioning.rs</code>,
-“TS 23.303/23.304/23.586” per code comments): PC5 link management, direct
-discovery, L2/L3 relay, and SL-PRS/RTT/AoA positioning via multilateration.</li>
+<li><strong>UE ProSe / sidelink</strong> (<code>sidelink/</code>, behind the <code>sidelink</code> feature; “TS
+23.303/23.304/23.586” per code comments): PC5-S unicast link set-up, Model A/B
+direct discovery, UE-to-UE relay, the L2 UE-to-Network relay over SRAP, and
+SL-PRS/RTT/AoA positioning. The PC5-S messages are real; the medium between
+UEs is an in-process channel. (<code>prose.rs</code> was removed in #141.)</li>
 <li><strong>UE ranging</strong> (<code>ranging/task.rs</code>, “TS 23.586”): RTT + multi-frequency carrier
 phase with ambiguity resolution.</li>
 <li><strong>UE MINT</strong> (<code>mint/task.rs</code>, “TS 23.761”): multi-IMSI/USIM context management.</li>
@@ -482,7 +486,7 @@ C2 link quality thresholds, geofence, Remote-ID.</li>
 <li><strong>gNB energy saving</strong> (<code>energy/task.rs</code>, Rel-18): cell sleep/dormant modes and
 efficiency metrics — spawned only if <code>energy_saving_enabled</code>.</li>
 <li><strong>gNB MBS</strong> (<code>mbs_ngap.rs</code>, “Rel-17, TS 38.413 §8.21”): MBS session
-start/stop NGAP signalling — behind <code>mbs_enabled</code>.</li>
+NGAP signalling, routed live from the NGAP task (#187, #188).</li>
 <li><strong>NTN</strong> (<code>rrc/ntn_gnb.rs</code>): satellite timing-advance / HARQ / beam models that
 are <strong>parsed but inert</strong> — the gNB stores the <code>ntn_config</code> block and logs it but
 does not wire it into live RRC/NGAP signalling (see the NTN row in
@@ -585,7 +589,7 @@ summarises implemented / partial / prototype status per row.</li>
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

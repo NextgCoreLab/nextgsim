@@ -2,7 +2,7 @@
 
 **Standards baseline:** 3GPP Rel-18/19; ITU-R IMT-2030. Relevant study items include TS 23.288 (NWDAF), TR 22.837 (integrated sensing) and TR 33.871 (post-quantum migration).
 
-**Status.** This document reflects the current codebase. nextgsim is a UE + gNB 5G/6G simulator of **20 crates** producing **3 binaries** (`nextgsim-gnb`, `nextgsim-ue`, `nr-cli`). Behaviour is validated by unit tests and a matched-simulator end-to-end run in which the simulator drives its own gNB/UE against the NextGCore 5G core over N2 (NGAP/SCTP) and N3 (GTP-U), with the user-plane data path verified. The 6G components below are **non-normative research prototypes**; several are compiled into the binaries but are disabled by default. Each missing or partial component is itemized with a stable task ID and, where the work is bounded, a tracked implementation issue.
+**Status.** This document reflects the current codebase. nextgsim is a UE + gNB 5G/6G simulator, with an LTE eNB and LTE UE, of **26 crates** (plus the integration-test crate) producing **6 binaries** (`nr-gnb`, `nr-ue`, `nr-cli`, `nr-loadtest`, `lte-enb`, `lte-ue`). Behaviour is validated by unit tests and a matched-simulator end-to-end run in which the simulator drives its own gNB/UE against the NextGCore 5G core over N2 (NGAP/SCTP) and N3 (GTP-U), with the user-plane data path verified. The 6G components below are **non-normative research prototypes**; several are compiled into the binaries but are disabled by default. Each missing or partial component is itemized with a stable task ID and, where the work is bounded, a tracked implementation issue.
 
 ---
 

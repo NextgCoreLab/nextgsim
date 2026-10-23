@@ -1,321 +1,235 @@
 # nextgsim CLI Usage
 
-This document describes how to use the nextgsim command-line tools.
+This page covers the command-line binaries and `nr-cli`, the control tool for
+running gNB and UE instances. Flags are taken from each binary's clap `Args`
+struct; `nr-cli` commands from the gNB and UE command parsers.
 
 ## Binaries
 
-nextgsim provides three binaries:
+`cargo build --release` produces six binaries:
 
-| Binary | Description |
-|--------|-------------|
-| `nextgsim-gnb` | 5G gNodeB simulator |
-| `nextgsim-ue` | 5G User Equipment simulator |
-| `nextgsim-cli` | Control interface for running instances |
+| Binary | Crate | Description |
+|--------|-------|-------------|
+| `nr-gnb` | `nextgsim-gnb` | 5G gNodeB simulator |
+| `nr-ue` | `nextgsim-ue` | 5G UE simulator |
+| `nr-cli` | `nextgsim-cli` | Control interface for running `nr-gnb` / `nr-ue` instances |
+| `nr-loadtest` | `nextgsim-cli` | Multi-UE registration load test against a 5G core |
+| `lte-enb` | `nextgsim-enb` | LTE eNB simulator (needs `--features kernel-sctp` on Linux to do anything) |
+| `lte-ue` | `nextgsim-lte-ue` | LTE UE simulator |
 
 ---
 
-## nextgsim-gnb
+## nr-gnb
 
-The gNB simulator connects to a 5G core network (AMF) and provides radio simulation for UEs.
-
-### Usage
+Connects to one or more AMFs and serves UEs over RLS.
 
 ```bash
-nextgsim-gnb [OPTIONS] -c <CONFIG>
+nr-gnb [OPTIONS] --config <FILE>
 ```
-
-### Options
 
 | Option | Description |
 |--------|-------------|
-| `-c, --config <FILE>` | Path to gNB configuration file (required) |
-| `-l, --disable-cmd` | Disable CLI command interface |
-| `-h, --help` | Print help information |
+| `-c, --config <FILE>` | gNB configuration file (required) |
+| `-l, --disable-cmd` | Do not open the `nr-cli` command interface |
+| `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
-### Examples
-
 ```bash
-# Start gNB with Open5GS configuration
-./nextgsim-gnb -c config/open5gs-gnb.yaml
-
-# Start gNB without CLI interface
-./nextgsim-gnb -c config/gnb.yaml --disable-cmd
-
-# Enable debug logging
-RUST_LOG=debug ./nextgsim-gnb -c config/gnb.yaml
+nr-gnb -c config/gnb.yaml
+nr-gnb -c config/gnb.yaml --disable-cmd
+RUST_LOG=debug nr-gnb -c config/gnb.yaml
 ```
 
 ---
 
-## nextgsim-ue
+## nr-ue
 
-The UE simulator connects to a gNB via RLS (Radio Link Simulation) and performs 5G procedures.
-
-### Usage
+Finds a gNB over RLS, registers, and establishes the configured PDU sessions.
+It creates a TUN interface per PDU session, so it needs `CAP_NET_ADMIN`.
 
 ```bash
-nextgsim-ue [OPTIONS] -c <CONFIG>
+nr-ue [OPTIONS] --config <FILE>
 ```
-
-### Options
 
 | Option | Description |
 |--------|-------------|
-| `-c, --config <FILE>` | Path to UE configuration file (required) |
-| `-i, --imsi <IMSI>` | Override IMSI from config file |
-| `-n, --num-of-UE <NUM>` | Number of UEs to spawn (1-512, default: 1) |
-| `-t, --tempo <MS>` | Delay in milliseconds between UE starts (default: 0) |
-| `-l, --disable-cmd` | Disable CLI command interface |
-| `-r, --no-routing-config` | Disable TUN routing configuration |
-| `-h, --help` | Print help information |
+| `-c, --config <FILE>` | UE configuration file (required) |
+| `-i, --imsi <IMSI>` | Use this IMSI instead of the config's: 15 digits, optionally prefixed `imsi-` |
+| `-n, --num-of-UE <NUM>` | Run NUM UEs (1..512, default 1), the IMSI incremented for each |
+| `-t, --tempo <TEMPO>` | Delay in ms between UE starts (default 0) |
+| `-l, --disable-cmd` | Do not open the `nr-cli` command interface |
+| `-r, --no-routing-config` | Do not configure routing for the UE TUN interface. Currently only logged |
+| `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
-### Examples
-
 ```bash
-# Start single UE
-./nextgsim-ue -c config/open5gs-ue.yaml
-
-# Start UE with custom IMSI
-./nextgsim-ue -c config/ue.yaml -i imsi-001010000000099
-
-# Start 10 UEs with 100ms delay between each
-./nextgsim-ue -c config/ue.yaml -n 10 -t 100
-
-# Start UE without TUN routing (useful for testing)
-./nextgsim-ue -c config/ue.yaml --no-routing-config
-
-# Enable trace logging for NAS
-RUST_LOG=nextgsim_nas=trace ./nextgsim-ue -c config/ue.yaml
+nr-ue -c config/ue.yaml
+nr-ue -c config/ue.yaml -i imsi-999700000000099
+nr-ue -c config/ue.yaml -n 10 -t 100
+RUST_LOG=nextgsim_nas=trace nr-ue -c config/ue.yaml
 ```
 
-### Multi-UE Mode
+With `-n 5` and a config SUPI of `999700000000001` the UEs are
+`999700000000001` .. `999700000000005`, registered with `nr-cli` as `ue0` ..
+`ue4`.
 
-When using `-n` to spawn multiple UEs:
-- Each UE gets an incremented IMSI (last digits incremented)
-- The `-t` tempo option adds delay between UE starts to avoid overwhelming the network
-- All UEs share the same configuration except for IMSI
+---
 
-Example with 5 UEs starting from IMSI 001010000000001:
+## lte-enb and lte-ue
+
 ```bash
-./nextgsim-ue -c config/ue.yaml -n 5 -t 200
-# Creates UEs with IMSIs:
-# - imsi-001010000000001
-# - imsi-001010000000002
-# - imsi-001010000000003
-# - imsi-001010000000004
-# - imsi-001010000000005
+lte-enb --config <FILE>
+lte-ue  --config <FILE>
+```
+
+Each takes only `-c, --config <FILE>` (plus `-h` and `-V`). Their configuration,
+and the `NEXTGSIM_*` environment overrides they read, are in
+[configuration.md](configuration.md#lte-enb-configuration-lte-enb). Neither
+registers with `nr-cli`.
+
+The `lte-ue` container image also ships `lte-ue-ping-check <target> [count]`,
+which waits for the default bearer's PDN address and asserts a 0%-loss ping
+(exit 0 pass, 1 no bearer, 2 loss).
+
+---
+
+## nr-cli
+
+`nr-cli` connects to running `nr-gnb` / `nr-ue` instances on the same host.
+Each instance registers its node names in `/tmp/nextgsim.proc-table/`; `nr-cli`
+reads that directory and talks to the node's command port over UDP on
+127.0.0.1. Entries written by a different nextgsim version are skipped.
+
+```bash
+nr-cli [OPTIONS] [NODE]
+```
+
+| Argument / option | Description |
+|-------------------|-------------|
+| `NODE` | Node to connect to: `gnb` for a gNB, `ue0`, `ue1`, ... for UEs |
+| `-d, --dump` | List the running nodes and exit |
+| `-e, --exec <COMMAND>` | Run one command and exit (non-zero exit code on a command error) |
+| `-h, --help` | Print help |
+| `-V, --version` | Print version |
+
+With a node and no `--exec`, `nr-cli` opens an interactive prompt; `help` lists
+commands and `exit` / `quit` leaves. The interactive help also lists some 6G
+commands (`nwdaf-query`, `she-offload`, ...) that the node parsers do not accept;
+they return `Unknown command`.
+
+```bash
+nr-cli --dump
+nr-cli ue0 -e status
+nr-cli gnb                # interactive
+```
+
+In the Docker images `nr-cli` is not installed; copy `binaries/nr-cli` into the
+container and run it there (nextgcore's `docker/rust/ue-flow-check.sh` does
+exactly this).
+
+### UE commands
+
+| Command | Description |
+|---------|-------------|
+| `info` | UE information (SUPI, sessions, pending procedures) as YAML |
+| `status` | RM, CM and MM state and the PDU sessions, as YAML |
+| `ps-list` | Same as `status` |
+| `timers` | Running NAS session-management timers |
+| `deregister [normal\|switch-off]` | UE-originated de-registration. `normal` (the default) waits for DEREGISTRATION ACCEPT; `switch-off` (also `--switch-off`, `-s`) does not. `disable-5g` and `remove-sim` are refused |
+| `ps-establish [--type\|-t <type>] [--apn\|-a <apn>] [--sst\|-s <sst>]` | Establish a PDU session (default type IPv4) |
+| `ps-release <psi>` | Release the PDU session with this PSI (1..15) |
+| `ps-release-all` | Release every PDU session |
+| `emergency-register` | Emergency registration (only from DEREGISTERED) |
+
+### gNB commands
+
+| Command | Description |
+|---------|-------------|
+| `info` | gNB configuration as YAML |
+| `status` | gNB runtime status as YAML |
+| `amf-list` | Connected AMFs |
+| `ue-list` | UEs served by this gNB |
+| `ue-info <ue-id>` | One UE's details |
+| `ue-release <ue-id>` | Release one UE's context |
+| `ue-suspend <ue-id> [t380-minutes]` | Move a UE to RRC_INACTIVE, optionally with a periodic RNAU timer |
+| `xn-path-switch <ue-id> <source-amf-ue-ngap-id>` | Send a Path Switch Request for a UE, as after an Xn handover |
+
+```bash
+nr-cli ue0 -e "ps-establish --type IPv4 --apn internet --sst 1"
+nr-cli ue0 -e "ps-release 1"
+nr-cli ue0 -e "deregister switch-off"
+nr-cli gnb -e ue-list
+nr-cli gnb -e "ue-suspend 1 5"
 ```
 
 ---
 
-## nextgsim-cli
+## nr-loadtest
 
-The CLI tool connects to running gNB or UE instances to send commands and query status.
+Registers many UEs against a 5G core and reports the success rate; it exits
+non-zero if fewer than 90% register.
 
-### Usage
-
-```bash
-nextgsim-cli [OPTIONS] <COMMAND>
-```
-
-### Global Options
-
-| Option | Description |
-|--------|-------------|
-| `-a, --address <ADDR>` | Address of the instance (default: 127.0.0.1) |
-| `-p, --port <PORT>` | CLI port of the instance |
-| `-h, --help` | Print help information |
-
-### Commands
-
-#### Status Commands
-
-```bash
-# Get UE status
-nextgsim-cli -p <port> status
-
-# Get UE information
-nextgsim-cli -p <port> info
-
-# Get UE timer status
-nextgsim-cli -p <port> timers
-```
-
-#### UE Control Commands
-
-```bash
-# Deregister from network
-nextgsim-cli -p <port> deregister
-
-# Deregister with switch-off indication
-nextgsim-cli -p <port> deregister --switch-off
-
-# Establish PDU session
-nextgsim-cli -p <port> ps-establish
-
-# Establish PDU session with options
-nextgsim-cli -p <port> ps-establish --type IPv4 --apn internet --sst 1
-
-# Release specific PDU session
-nextgsim-cli -p <port> ps-release <psi>
-
-# Release all PDU sessions
-nextgsim-cli -p <port> ps-release-all
-```
-
-#### gNB Control Commands
-
-```bash
-# Get gNB status
-nextgsim-cli -p <port> status
-
-# Get gNB information
-nextgsim-cli -p <port> info
-
-# List connected UEs
-nextgsim-cli -p <port> ue-list
-
-# List connected AMFs
-nextgsim-cli -p <port> amf-list
-```
-
-### Examples
-
-```bash
-# Query UE status on default port
-nextgsim-cli -p 9001 status
-
-# Establish PDU session for eMBB slice
-nextgsim-cli -p 9001 ps-establish --sst 1
-
-# Release PDU session 1
-nextgsim-cli -p 9001 ps-release 1
-
-# Deregister UE
-nextgsim-cli -p 9001 deregister
-```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--ues <UES>` | 10 | Number of UEs |
+| `--rate <RATE>` | 5 | Registrations per second (0 = burst) |
+| `--gnb-addr <GNB_ADDR>` | 127.0.0.100 | gNB address |
+| `--amf-addr <AMF_ADDR>` | 127.0.0.5 | AMF address |
+| `--base-imsi <BASE_IMSI>` | 999700000000001 | First IMSI, incremented per UE |
+| `--dnn <DNN>` | internet | DNN for the PDU session |
+| `--sst <SST>` | 1 | S-NSSAI SST |
+| `--duration <DURATION>` | 0 | Time limit in seconds (0 = none) |
+| `--skip-pdu` | off | Skip PDU session establishment |
+| `--ping` | off | Ping after the PDU session is up |
+| `--log-level <LOG_LEVEL>` | info | Log level |
 
 ---
 
 ## Logging
 
-nextgsim uses the `tracing` crate for structured logging. Control log levels via the `RUST_LOG` environment variable.
-
-### Log Levels
-
-| Level | Description |
-|-------|-------------|
-| `error` | Error conditions |
-| `warn` | Warning conditions |
-| `info` | Informational messages (default) |
-| `debug` | Debug information |
-| `trace` | Detailed trace information |
-
-### Examples
+All binaries log through `tracing`; set the level with `RUST_LOG`.
 
 ```bash
-# Enable debug for all crates
-RUST_LOG=debug ./nextgsim-ue -c config.yaml
-
-# Enable trace for specific crate
-RUST_LOG=nextgsim_nas=trace ./nextgsim-ue -c config.yaml
-
-# Multiple crate levels
-RUST_LOG=nextgsim_nas=trace,nextgsim_rrc=debug,nextgsim_ue=info ./nextgsim-ue -c config.yaml
-
-# Filter by module
-RUST_LOG=nextgsim_nas::mm=trace ./nextgsim-ue -c config.yaml
-```
-
-### Log Output
-
-Logs include timestamps, levels, and structured fields:
-
-```
-2026-01-02T10:15:30.123Z  INFO nextgsim_ue: Starting UE with IMSI imsi-001010000000001
-2026-01-02T10:15:30.456Z DEBUG nextgsim_rls: Cell search started, searching 1 addresses
-2026-01-02T10:15:30.789Z  INFO nextgsim_rls: Cell found at 127.0.0.1, signal=-65dBm
-2026-01-02T10:15:31.012Z DEBUG nextgsim_nas: Sending Registration Request
-2026-01-02T10:15:31.234Z TRACE nextgsim_nas: NAS PDU: 7e004179000d0199...
+RUST_LOG=debug nr-ue -c config/ue.yaml
+RUST_LOG=nextgsim_nas=trace,nextgsim_rrc=debug nr-ue -c config/ue.yaml
+RUST_LOG=info,nextgsim_gnb=debug,nextgsim_ngap=debug nr-gnb -c config/gnb.yaml
 ```
 
 ---
 
-## Quick Start
+## Quick start
 
-### 1. Start the 5G Core
-
-Start your 5G core network (Open5GS, free5GC, etc.) with appropriate configuration.
-
-### 2. Start gNB
-
-```bash
-./nextgsim-gnb -c config/open5gs-gnb.yaml
-```
-
-Wait for "NG Setup successful" message.
-
-### 3. Start UE
-
-```bash
-./nextgsim-ue -c config/open5gs-ue.yaml
-```
-
-The UE will automatically:
-1. Search for gNB via RLS heartbeats
-2. Establish RRC connection
-3. Perform registration
-4. Establish configured PDU sessions
-
-### 4. Verify Connection
-
-```bash
-# Check UE status
-nextgsim-cli -p 9001 status
-
-# Should show:
-# RM State: Registered
-# CM State: Connected
-# PDU Sessions: 1 active
-```
-
-### 5. Test Data Plane
-
-```bash
-# Ping through TUN interface
-ping -I uesimtun0 8.8.8.8
-```
-
----
+1. Start a core. The nextgcore Docker stack (`../nextgcore/docker/rust`) is the
+   matched peer; with any other AMF use `sctp_backend: kernel` and a
+   `kernel-sctp` build.
+2. Start the gNB and wait for the NG Setup Response in its log:
+   `nr-gnb -c config/gnb.yaml`
+3. Start the UE: `sudo nr-ue -c config/ue.yaml`. It searches for the gNB, sets
+   up RRC, registers and establishes the configured PDU sessions.
+4. Check it: `nr-cli ue0 -e status`.
+5. Send traffic through the session: `ping -I uesimtun0 <address>`.
 
 ## Troubleshooting
 
-### gNB won't connect to AMF
+### gNB does not connect to the AMF
 
-1. Check AMF address and port in configuration
-2. Verify AMF is running and accepting connections
-3. Check PLMN matches between gNB and AMF
-4. Enable debug logging: `RUST_LOG=nextgsim_sctp=debug,nextgsim_ngap=debug`
+1. Check the AMF address and port in `amf_configs`.
+2. Check the SCTP backend: `userspace` only talks to nextgcore's userspace backend.
+3. Check the PLMN matches the AMF's.
+4. `RUST_LOG=nextgsim_sctp=debug,nextgsim_ngap=debug`.
 
-### UE won't find gNB
+### UE does not find the gNB
 
-1. Verify `gnb_search_list` contains correct gNB IP
-2. Check gNB `link_ip` matches search list
-3. Ensure gNB is running and radio is powered on
-4. Enable debug logging: `RUST_LOG=nextgsim_rls=debug`
+1. `gnb_search_list` must contain the gNB's `link_ip`.
+2. `RUST_LOG=nextgsim_rls=debug`.
 
 ### Registration fails
 
-1. Verify PLMN matches between UE (`hplmn`) and gNB (`plmn`)
-2. Check authentication credentials (`key`, `op`, `op_type`)
-3. Verify subscriber exists in core network
-4. Enable trace logging: `RUST_LOG=nextgsim_nas=trace`
+1. The UE's `hplmn` must match the gNB's `plmn`.
+2. `key`, `op` and `op_type` must match the subscriber in the core.
+3. `RUST_LOG=nextgsim_nas=trace`.
 
 ### PDU session fails
 
-1. Check S-NSSAI configuration matches network
-2. Verify APN/DNN is configured in core
-3. Check SMF/UPF are running
-4. Enable debug logging: `RUST_LOG=nextgsim_nas::sm=debug`
+1. The session's S-NSSAI and DNN must be configured in the core.
+2. `RUST_LOG=nextgsim_ue=debug`.

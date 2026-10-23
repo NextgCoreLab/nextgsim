@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-da6969eb.js";
+            window.path_to_searchindex_js = "../searchindex-efe6c60a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -199,9 +199,12 @@ studies — no frozen Rel-20 Stage-3 wire spec exists to conform to.</p>
 <h2 id="binary-and-startup"><a class="header" href="#binary-and-startup">Binary and startup</a></h2>
 <p>The runnable binary is declared in <code>nextgsim-gnb/Cargo.toml</code> as
 <code>[[bin]] name = "nr-gnb"</code> (path <code>src/main.rs</code>), alongside a library target
-<code>nextgsim_gnb</code> (<code>src/lib.rs</code>). The crate has one Cargo feature, <code>kernel-sctp</code>,
-which forwards to <code>nextgsim-sctp/kernel-sctp</code> for a real kernel-SCTP transport
-on Linux; it is off by default.</p>
+<code>nextgsim_gnb</code> (<code>src/lib.rs</code>). Its Cargo features, all off by default:
+<code>kernel-sctp</code> (forwards to <code>nextgsim-sctp/kernel-sctp</code> for a real kernel-SCTP
+transport on Linux), <code>drb-pdcp</code> (a PDCP entity per DRB), <code>up-security</code>
+(DRB integrity and ciphering; implies <code>drb-pdcp</code>), <code>sdap-dataplane</code> (QFI-to-DRB
+mapping with an SDAP header), <code>event-bus</code>, and <code>6g</code> (compiles the six 6G task
+crates).</p>
 <p><code>src/main.rs</code> is a <code>#[tokio::main]</code> async entry point. Its flow:</p>
 <ol>
 <li><code>init_logging()</code> installs a <code>tracing_subscriber</code> registry plus a
@@ -238,16 +241,16 @@ by the NGAP task (see <a href="#internal-wiring--task-model">Internal wiring</a>
 <tr><th>Module</th><th>Path</th><th>Responsibility</th></tr>
 </thead>
 <tbody>
-<tr><td><code>app</code></td><td><code>src/app/</code></td><td>Config load/validate (<code>config_loader</code>), UDP CLI server (<code>cli_server</code>), command parsing/handling (<code>cmd_handler</code>), status reporting (<code>status</code>), App task loop (<code>task</code>). Central coordinator.</td></tr>
+<tr><td><code>app</code></td><td><code>src/app/</code></td><td>Config load/validate (<code>config_loader</code>), command parsing/handling (<code>cmd_handler</code>), status reporting (<code>status</code>), App task loop (<code>task</code>), which hosts the UDP CLI server from <code>nextgsim-common/src/cli_server.rs</code>. Central coordinator.</td></tr>
 <tr><td><code>tasks</code></td><td><code>src/tasks.rs</code></td><td>Actor framework: <code>Task</code> trait, <code>GnbTaskBase</code>, <code>TaskHandle</code>, <code>TaskManager</code>, all inter-task message enums, and the constants (<code>DEFAULT_CHANNEL_CAPACITY = 256</code>, <code>NGAP_PPID = 60</code>).</td></tr>
-<tr><td><code>ngap</code></td><td><code>src/ngap/</code></td><td>N2 control plane: <code>NgapTask</code> (<code>task.rs</code>), AMF context (<code>amf_context.rs</code>), UE context (<code>ue_context.rs</code>), MBS context (<code>mbs_context.rs</code>).</td></tr>
+<tr><td><code>ngap</code></td><td><code>src/ngap/</code></td><td>N2 control plane: <code>NgapTask</code> (<code>task.rs</code>), AMF context (<code>amf_context.rs</code>), UE context (<code>ue_context.rs</code>), RACS capability cache (<code>racs.rs</code>), unknown-IE handling by criticality (<code>unknown_ies.rs</code>, TS 38.413 §10.3.4), NGAP timers, UP security indication.</td></tr>
 <tr><td><code>rrc</code></td><td><code>src/rrc/</code></td><td>Air-interface control: <code>RrcTask</code> (<code>task.rs</code>), connection/state management (<code>connection.rs</code>, <code>ue_context.rs</code>), transactions, handover, redcap, energy-saving, NTN (<code>ntn_gnb.rs</code>).</td></tr>
 <tr><td><code>rls</code></td><td><code>src/rls/</code></td><td><code>RlsTask</code>: UDP radio-link simulation — UE discovery, RRC relay, user-plane relay.</td></tr>
 <tr><td><code>gtp</code></td><td><code>src/gtp/</code></td><td><code>GtpTask</code>: N3 GTP-U user-plane tunnel management and forwarding.</td></tr>
 <tr><td><code>sctp</code></td><td><code>src/sctp/</code></td><td><code>SctpTask</code> and <code>AmfConnection</code>: N2 transport (association management, backend selection).</td></tr>
 <tr><td><code>energy</code></td><td><code>src/energy/</code></td><td><code>EnergyTask</code> (Rel-18): cell sleep/dormant modes and energy-efficiency metrics. Spawned only if <code>energy_saving_enabled</code>.</td></tr>
 <tr><td><code>daps</code></td><td><code>src/daps.rs</code></td><td>Rel-17 DAPS handover types (<code>DapsManager</code>, <code>DapsState</code>), per code comments TS 38.300 §10.1.2.4. Library module — see <a href="#simplifications--known-gaps">gaps</a>.</td></tr>
-<tr><td><code>mbs_ngap</code></td><td><code>src/mbs_ngap.rs</code></td><td>Rel-17 MBS NGAP session types (<code>NgapMbsManager</code>, <code>GnbMbsState</code>), per code comments TS 38.413 §8.21. Library module — see <a href="#simplifications--known-gaps">gaps</a>.</td></tr>
+<tr><td><code>mbs_ngap</code></td><td><code>src/mbs_ngap.rs</code></td><td>Rel-17 MBS NGAP session state (<code>NgapMbsManager</code>, <code>GnbMbsState</code>), per code comments TS 38.413 §8.21. Live: the NGAP task owns one <code>NgapMbsManager</code> and routes the MBS session procedures into it.</td></tr>
 <tr><td><code>agent</code></td><td><code>src/agent/</code></td><td>6G AI Agent Framework task. One-line honest pointer only; deferred to the <a href="../concepts/ai-6g-stack.html">AI/6G stack chapter</a>.</td></tr>
 <tr><td><code>fl</code></td><td><code>src/fl/</code></td><td>6G Federated-Learning aggregator task. Prototype — see <a href="../concepts/ai-6g-stack.html">AI/6G stack</a>.</td></tr>
 <tr><td><code>isac</code></td><td><code>src/isac/</code></td><td>6G Integrated Sensing &amp; Communication task. Prototype — see <a href="../concepts/ai-6g-stack.html">AI/6G stack</a>.</td></tr>
@@ -279,10 +282,13 @@ This is real ASN.1/APER, not a bespoke encoding. <code>encode_aper</code>/<code>
 handle the opaque per-session transfer containers.</li>
 <li><strong>Procedures:</strong> <code>nextgsim-ngap/src/procedures/</code> (see <code>procedures/mod.rs</code>,
 header cites TS 38.413) implements NG Setup, Initial UE Message, NAS transport
-(up/downlink), Initial Context Setup, PDU Session Resource setup/modify/release,
-the transfer containers, UE Context Release, Paging, Path Switch, Handover, and
-NG Reset — plus 6G extension modules (<code>ai_native</code>, <code>isac_reporting</code>,
-<code>ntn_support</code>).</li>
+(up/downlink) and NAS Non-Delivery Indication, Initial Context Setup, PDU
+Session Resource setup/modify/release/notify, the transfer containers, UE
+Context Release and Modification, UE Radio Capability (RACS), Paging, Path
+Switch, Handover and Handover Preparation Failure, NG Reset, Error Indication,
+Overload, AMF Status Indication, RAN Configuration Update, MBS, and NRPPa
+(<code>procedures/nrppa/</code>, on its own generated codec) — plus 6G extension modules
+(<code>ai_native</code>, <code>isac_reporting</code>, <code>ntn_support</code>).</li>
 <li><strong>What the gNB does with it:</strong> <code>NgapTask</code> (<code>src/ngap/task.rs</code>) imports these
 procedure builders/parsers directly. <code>send_ng_setup_request</code> derives the gNB
 ID as <code>nci &gt;&gt; (36 - gnb_id_length)</code> and advertises <code>ran_node_name = "nextgsim-gnb"</code> and a supported-TA list built from <code>config.nssai</code>.
@@ -296,23 +302,21 @@ from KgNB via <code>nextgsim_crypto::kdf</code> (per code comments TS 33.501 Ann
 <ul>
 <li><strong>Codec:</strong> <code>nextgsim-rrc/src/codec.rs</code> provides <code>encode_rrc</code> / <code>decode_rrc</code>
 over <strong>Unaligned PER (UPER)</strong> using <code>asn1_codecs::uper</code>, with types generated
-from the 3GPP RRC ASN.1 schema (<code>OUT_DIR/rrc.rs</code>). Core messages (RRC Setup
-Request/Setup/Setup Complete, DL Information Transfer, Security Mode Command,
-RRC Reconfiguration, UE Capability) use this real UPER path.</li>
+from the 3GPP RRC ASN.1 schema (<code>OUT_DIR/rrc.rs</code>). The messages the gNB and
+UE exchange (RRC Setup Request/Setup/Setup Complete, UL/DL Information
+Transfer, Security Mode Command, RRC Reconfiguration including the handover
+command, Measurement Report, UE Capability, RRCResume, RRCReestablishment,
+Paging, MIB/SIB1/SIB19) use this real UPER path.</li>
 <li><strong>What the gNB does with it:</strong> <code>RrcTask</code> (<code>src/rrc/task.rs</code>) dispatches uplink
 PDUs by logical channel in <code>handle_uplink_rrc</code> — UL-CCCH via
 <code>decode_rrc_setup_request</code>, UL-DCCH via <code>dispatch_ul_dcch</code>. Downlink NAS is
 wrapped with <code>encode_dl_information_transfer</code> and relayed to RLS. The
 <code>SecurityModeCommand</code> and <code>RrcReconfiguration</code> PDUs arrive already ASN.1-encoded
 from the NGAP task and are relayed on DL-DCCH.</li>
-<li><strong>Real vs simplified:</strong> some paths deliberately fall back to sim-internal
-encodings for interop with the matched UE. <code>src/rrc/task.rs</code> defines
-<code>RRC_MSG_TYPE_UE_CAPABILITY = 0x06</code> as an envelope byte in front of the real
-ASN.1; <code>src/rrc/connection.rs</code> notes the gNB-side RRCResume (DL-CCCH) “uses a
-simplified encoding” because the ASN.1 gNB-side builder requires
-<code>masterCellGroup</code> and radio-bearer configuration from the suspended UE context;
-and <code>src/rrc/handover.rs</code> builds handover RRC Reconfiguration in a “Simplified
-format (not real ASN.1)”. These are called out again under
+<li><strong>Real vs simplified:</strong> two fallbacks remain. If the ASN.1 RRCSetup encode
+fails, <code>src/rrc/connection.rs</code> sends a short bespoke frame instead, and
+<code>src/rrc/task.rs</code> still parses a bespoke UL-CCCH byte layout when the UPER
+decode fails. Both are called out again under
 <a href="#simplifications--known-gaps">gaps</a>.</li>
 </ul>
 <h3 id="rls-radio-link-simulation--nextgsim-rls"><a class="header" href="#rls-radio-link-simulation--nextgsim-rls">RLS (radio-link simulation) — <code>nextgsim-rls</code></a></h3>
@@ -340,10 +344,10 @@ on <code>gtp_ip:2152</code> (<code>GTP_U_PORT</code>). If <code>config.upf_addr<
 otherwise uplink SDUs are <code>encapsulate_uplink</code>’d into GTP-U G-PDUs to the UPF,
 and downlink G-PDUs are <code>decapsulate_downlink</code>’d in <code>handle_downlink_gpdu</code> and
 handed to RLS as <code>RlsMessage::DownlinkData</code>. It also answers GTP-U Echo Request.</li>
-<li><strong>Real vs simplified:</strong> the SDAP/DRB QoS layer is not fully wired — per code
-comments in <code>handle_downlink_gpdu</code> (amfg-04/amfg-09), the session is selected
-by <strong>PSI</strong> and the DL <strong>QFI/RQI</strong> are surfaced only for diagnostics /
-reflective QoS rather than driving DRB selection.</li>
+<li><strong>QoS flows:</strong> in a default build the session is selected by <strong>PSI</strong> and the
+DL <strong>QFI/RQI</strong> only reach the log (<code>handle_downlink_gpdu</code>, amfg-09). With the
+<code>sdap-dataplane</code> feature the QFI picks the DRB (TS 37.324 §5.1) and rides a
+one-octet SDAP header to the UE.</li>
 </ul>
 <h3 id="sctp-n2-transport--nextgsim-sctp"><a class="header" href="#sctp-n2-transport--nextgsim-sctp">SCTP (N2 transport) — <code>nextgsim-sctp</code></a></h3>
 <ul>
@@ -366,8 +370,17 @@ transport exists (<code>nextgsim-sctp/src/quic.rs</code>) but is <strong>not</st
 <h3 id="supporting-crates"><a class="header" href="#supporting-crates">Supporting crates</a></h3>
 <ul>
 <li><strong><code>nextgsim-rlc</code></strong> (<code>src/lib.rs</code>, cites TS 38.322): RLC TM/UM/AM entities. The
-gNB RLS task creates one <strong>UM, SN12</strong> <code>RlcEntity</code> per UE for user-plane
-reassembly (<code>src/rls/task.rs</code>, <code>rlc_entity_for</code>).</li>
+gNB RLS task creates one <strong>UM, SN12</strong> <code>RlcEntity</code> per <strong>(UE, PDU session)</strong> —
+one per radio bearer, as TS 38.322 §4.2.1 requires, so each bearer has its own
+sequence-number space and reassembly buffer (<code>src/rls/task.rs</code>,
+<code>rlc_entity_for</code>). The receiving side enforces the reassembly window and runs
+<code>t-Reassembly</code>, discarding a partially received SDU whose missing segment never
+arrives (<code>poll_rlc_timers</code>, ticked from the task’s run loop). A session listed
+in <code>rlc_am_psis</code> gets an <strong>AM</strong> entity instead, with STATUS reporting and
+NACK-driven retransmission.</li>
+<li><strong><code>nextgsim-pdcp</code></strong>: the shared SRB1 PDCP layer for AS security (when
+<code>as_security_enabled</code>), and the per-DRB entity behind <code>drb-pdcp</code> /
+<code>up-security</code>.</li>
 <li><strong><code>nextgsim-common</code></strong> (<code>src/config.rs</code>, <code>types.rs</code>): <code>GnbConfig</code>, the
 <code>TaskMessage&lt;T&gt;</code> envelope, <code>OctetString</code>, <code>Plmn</code>, and the SCTP backend enum.</li>
 </ul>
@@ -460,39 +473,60 @@ the unit tests in <code>src/tasks.rs</code>; production shutdown is driven by th
 <h2 id="simplifications--known-gaps"><a class="header" href="#simplifications--known-gaps">Simplifications &amp; known gaps</a></h2>
 <p>All of the following are grounded in the current source, not in spec text:</p>
 <ul>
-<li><strong>NTN is parse-forward-store but effectively inert.</strong> When an NG Setup Response
-arrives and <code>config.ntn_config</code> is set, the NGAP task logs it and forwards
-<code>RrcMessage::NtnTimingAdvanceConfig</code> to RRC (<code>src/ngap/task.rs</code>,
-<code>handle_ng_setup_response</code>). <code>RrcTask</code> stores it into <code>self.ntn_config</code>
-(<code>src/rrc/task.rs</code>) — but that stored value is only ever <em>written</em>, never read
-back to shape an outgoing RRC Setup/Reconfiguration. The
-<a href="../configuration.html#ntn-research-prototype">Configuration Reference</a> documents
-<code>ntn_config</code> as logging-only/inert for exactly this reason. The NTN modules
-under <code>src/rrc/ntn_gnb.rs</code> are research prototypes and use “Simplified”
-distance/beam math per their own code comments.</li>
-<li><strong>DAPS and standalone MBS-NGAP are library modules, not wired into a task.</strong>
-<code>src/daps.rs</code> (<code>DapsManager</code>, <code>DapsState</code>) and <code>src/mbs_ngap.rs</code>
-(<code>NgapMbsManager</code>, <code>GnbMbsState</code>) are re-exported from <code>src/lib.rs</code> but are not
-instantiated in any task <code>run</code> loop. MBS activation/deactivation <em>is</em> handled
-live, but through a different type — <code>MbsSessionManager</code> in
-<code>src/ngap/mbs_context.rs</code>, driven by the <code>MbsSession*</code> variants of
-<code>NgapMessage</code> in the NGAP task loop.</li>
-<li><strong>QUIC transport is present but unreachable.</strong> <code>nextgsim-sctp/src/quic.rs</code>
+<li>
+<p><strong>NTN serving-cell timing is live; the surrounding NTN modules are not.</strong>
+Closed by issue #56. <code>config.ntn_config</code> is read at <code>RrcTask::new</code>, turned into
+<code>SIB19-r17</code> parameters by <code>rrc::system_info::sib19_params</code>, stored in
+<code>RrcTask::ntn_config</code>, and <strong>read back</strong> on the broadcast path
+(<code>broadcast_system_information</code>), so the cell puts its ephemeris, Common TA,
+<code>cellSpecificKoffset</code> and <code>ntn-UlSyncValidityDuration</code> on BCCH as real UPER
+(TS 38.300 §16.4, §16.14.2.2). The same value rides an <code>RRCReconfiguration</code>’s
+<code>dedicatedSystemInformationDelivery</code> for the connected-mode update, and the UE
+derives and <strong>applies</strong> a non-zero uplink timing advance and Doppler
+pre-compensation from it — asserted end to end in
+<code>tests/src/ntn_sib19_timing_e2e.rs</code>.</p>
+<p>The sim-internal <code>RrcMessage::NtnTimingAdvanceConfig</code> that used to carry these
+parameters was removed. It was written and never read, and it could not have
+driven a conformant pre-compensation even with a reader: it carried no
+ephemeris, which §16.14.2.2 makes the autonomous timing advance a function of.</p>
+<p>Still limited: the NTN modules under <code>src/rrc/ntn_gnb.rs</code> remain research
+prototypes with “Simplified” distance/beam math per their own code comments; no
+neighbour-cell <code>ntn-NeighCellConfigList</code> is broadcast, because this simulator
+models one serving NTN cell; and <code>kmac</code>, the polarisation fields, <code>ta-Report</code>
+and <code>referenceLocation</code> are omitted because there is no MAC-CE timing, antenna
+model, TA-reporting procedure or TS 37.355 location encoder here for them to
+govern.</p>
+</li>
+<li>
+<p><strong>DAPS is a library module, not wired into a task.</strong> <code>src/daps.rs</code>
+(<code>DapsManager</code>, <code>DapsState</code>) is re-exported from <code>src/lib.rs</code> but not
+instantiated in any task <code>run</code> loop. (MBS is live: the id-keyed
+<code>MbsSessionManager</code> was retired in #188 and the NGAP task drives
+<code>NgapMbsManager</code> from the wire.)</p>
+</li>
+<li>
+<p><strong>QUIC transport is present but unreachable.</strong> <code>nextgsim-sctp/src/quic.rs</code>
 exists, yet <code>SctpTask::handle_connection_request</code> (<code>src/sctp/task.rs</code>) warns and
-falls back to SCTP when <code>quic_enabled</code> is set — QUIC is never actually selected.</li>
-<li><strong>Some RRC encodings are sim-internal.</strong> The UE-capability envelope byte
-(<code>RRC_MSG_TYPE_UE_CAPABILITY = 0x06</code>, <code>src/rrc/task.rs</code>), the gNB-side
-RRCResume DL-CCCH fallback (<code>src/rrc/connection.rs</code>), and the handover RRC
-Reconfiguration “not real ASN.1” format (<code>src/rrc/handover.rs</code>) are simplified
-for interop with the matched UE rather than being fully spec-conformant on the
-wire.</li>
-<li><strong>User-plane QoS below the flow level is not modelled.</strong> As noted above, GTP-U
-downlink selects the session by PSI and treats QFI/RQI as diagnostic; there is
-no SDAP-to-DRB mapping yet (<code>src/gtp/task.rs</code>, <code>handle_downlink_gpdu</code>).</li>
-<li><strong>6G / AI-native tasks are prototypes.</strong> <code>agent</code>, <code>fl</code>, <code>isac</code>, <code>nkef</code>,
+falls back to SCTP when <code>quic_enabled</code> is set — QUIC is never actually selected.</p>
+</li>
+<li>
+<p><strong>Two RRC fallbacks remain.</strong> The bespoke RRCSetup frame used only if the
+ASN.1 encode fails (<code>src/rrc/connection.rs</code>), and the bespoke UL-CCCH parse
+tried when the UPER decode fails (<code>src/rrc/task.rs</code>). The earlier hand-rolled
+UE-capability envelope, RRCResume and handover command were replaced by UPER
+(#107, #146).</p>
+</li>
+<li>
+<p><strong>QFI-to-DRB mapping is off by default.</strong> Without <code>sdap-dataplane</code> the GTP-U
+downlink selects the session by PSI and the QFI/RQI are diagnostic only
+(<code>src/gtp/task.rs</code>, <code>handle_downlink_gpdu</code>).</p>
+</li>
+<li>
+<p><strong>6G / AI-native tasks are prototypes.</strong> <code>agent</code>, <code>fl</code>, <code>isac</code>, <code>nkef</code>,
 <code>nwdaf</code>, <code>she</code> are each config-gated (<code>*_enabled</code>) and only spawned when
 enabled (<code>src/main.rs</code>, <code>spawn_tasks</code>). They implement Stage-1 study ideas, not
-standardised procedures — see the <a href="../concepts/ai-6g-stack.html">AI/6G stack chapter</a>.</li>
+standardised procedures — see the <a href="../concepts/ai-6g-stack.html">AI/6G stack chapter</a>.</p>
+</li>
 </ul>
 <h2 id="where-to-look-next"><a class="header" href="#where-to-look-next">Where to look next</a></h2>
 <ul>
@@ -501,7 +535,8 @@ the YAML fields (<code>nci</code>, <code>gnb_id_length</code>, <code>plmn</code>
 interface IPs, <code>ntn_config</code>) that feed the <code>GnbConfig</code> used throughout this
 chapter.</li>
 <li><a href="../cli-reference.html">nr-cli Reference</a>: the <code>info</code>/<code>status</code>/<code>amf-list</code>/
-<code>ue-list</code>/<code>ue-info</code>/<code>ue-release</code> commands the App task serves.</li>
+<code>ue-list</code>/<code>ue-info</code>/<code>ue-release</code>/<code>ue-suspend</code>/<code>xn-path-switch</code> commands the
+App task serves.</li>
 <li><a href="../concepts/registration-flow.html">Registration flow</a>: the end-to-end control
 path that threads RLS → RRC → NGAP → SCTP → AMF.</li>
 <li><a href="../concepts/pdu-session-userplane.html">PDU session &amp; user plane</a>: the RLC →
@@ -562,7 +597,7 @@ is and isn’t implemented.</li>
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

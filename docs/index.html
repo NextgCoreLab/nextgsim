@@ -33,7 +33,7 @@
   <div class="container">
     <div class="hero-content">
       <div class="hero-badge">
-        <span>v0.1.0</span> &middot; 5G + 6G AI-Native &middot; Zero C Dependencies &middot; 6G = research prototypes
+        <span>v0.2.0</span> &middot; 5G + LTE + 6G AI-Native &middot; Zero C Dependencies (default build) &middot; 6G = research prototypes
       </div>
       <h1>Agentic <span class="accent">6G</span> Simulator</h1>
       <p>The first AI-native 5G/6G UE and gNB simulator — with 8 dedicated 6G crates for ISAC, federated learning, semantic communication, autonomous AI agents, and knowledge graph-driven network intelligence. Pure Rust, zero C dependencies.</p>
@@ -43,10 +43,10 @@
         <a href="api.html" class="btn btn-secondary">CLI Reference</a>
       </div>
       <div class="stats-row">
-        <div class="stat"><div class="stat-value">20</div><div class="stat-label">Rust Crates</div></div>
+        <div class="stat"><div class="stat-value">26</div><div class="stat-label">Rust Crates</div></div>
         <div class="stat"><div class="stat-value">8</div><div class="stat-label">6G AI Crates</div></div>
-        <div class="stat"><div class="stat-value">~200k</div><div class="stat-label">Lines of Rust</div></div>
-        <div class="stat"><div class="stat-value">3</div><div class="stat-label">Binaries</div></div>
+        <div class="stat"><div class="stat-value">2</div><div class="stat-label">RANs: NR + LTE</div></div>
+        <div class="stat"><div class="stat-value">6</div><div class="stat-label">Binaries</div></div>
       </div>
     </div>
   </div>
@@ -541,7 +541,7 @@
 <!-- Components -->
 <section id="components">
   <div class="container">
-    <h2 class="section-title">All 20 Crates</h2>
+    <h2 class="section-title">All 26 Crates</h2>
     <p class="section-subtitle">Protocol, core, and 6G AI modules.</p>
 
     <h3 class="group-heading">Protocol Crates</h3>
@@ -552,11 +552,11 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-ngap</span><span class="component-badge badge-proto">Proto</span></div>
-        <div class="component-desc">NGAP — ASN.1 PER encoder/decoder for gNB-AMF signaling over SCTP.</div>
+        <div class="component-desc">NGAP and NRPPa — generated ASN.1 APER codecs for gNB-AMF signaling.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-rrc</span><span class="component-badge badge-proto">Proto</span></div>
-        <div class="component-desc">RRC — Setup, Reconfig, Measurement Reports, Handover. NTN timing/link-simulation prototypes (bespoke encodings, not wired into live signaling).</div>
+        <div class="component-desc">NR RRC — generated UPER codec: Setup, Reconfig, Measurement Reports, Handover, Resume, SIB19 for NTN.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-gtp</span><span class="component-badge badge-proto">Proto</span></div>
@@ -564,7 +564,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-sctp</span><span class="component-badge badge-proto">Proto</span></div>
-        <div class="component-desc">Pure Rust SCTP — No libsctp dependency.</div>
+        <div class="component-desc">SCTP — pure-Rust userspace backend (default) or kernel SCTP via libsctp (kernel-sctp feature).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-rls</span><span class="component-badge badge-proto">Proto</span></div>
@@ -573,6 +573,22 @@
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-rlc</span><span class="component-badge badge-proto">Proto</span></div>
         <div class="component-desc">RLC (TS 38.322) — TM/UM/AM modes with segmentation, reassembly, and AM ARQ between MAC and PDCP.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-pdcp</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">PDCP (TS 38.323 / 36.323) — SRB and DRB entities, AS integrity and ciphering, SDAP header.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-s1ap</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">S1AP (TS 36.413) — generated ASN.1 APER codec for eNB-MME signaling.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-lte-rrc</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">E-UTRA RRC (TS 36.331) — generated UPER codec.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-eps-nas</span><span class="component-badge badge-proto">Proto</span></div>
+        <div class="component-desc">EPS NAS (TS 24.301) — attach, EPS AKA and NAS security for the LTE UE.</div>
       </div>
     </div>
 
@@ -585,6 +601,14 @@
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-ue</span><span class="component-badge badge-core">Core</span></div>
         <div class="component-desc">UE — NAS procedures, RRC state machine, PDU sessions, multi-UE.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-enb</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">lte-enb — LTE eNB: S1 Setup, S1AP, E-UTRA cell over RLS, S1-U GTP-U.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgsim-lte-ue</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">lte-ue — LTE UE: cell selection, RRC, EPS NAS attach, DRBs, TUN.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgsim-cli</span><span class="component-badge badge-core">Core</span></div>
@@ -707,7 +731,7 @@
 <section id="contributing">
   <div class="container">
     <h2 class="section-title">Contributing</h2>
-    <p class="section-subtitle">We welcome contributions to the protocol stack, AI crates, and documentation. The full guide takes you from a clean machine to a merged PR: setup (pure Rust, zero C deps), building, testing against a NextGCore stack, the zero-warning style gate, 3GPP spec-reference rules, conventional commits with DCO sign-off, and the review process.</p>
+    <p class="section-subtitle">We welcome contributions to the protocol stack, AI crates, and documentation. The full guide takes you from a clean machine to a merged PR: setup (pure Rust, zero C deps), building, testing against a NextGCore stack, the fmt and clippy style gate, 3GPP spec-reference rules, conventional commits with DCO sign-off, and the review process.</p>
     <div class="hero-buttons" style="justify-content:center;">
       <a href="contributing.html" class="btn btn-primary">Read the Contributing Guide</a>
       <a href="https://github.com/NextgCoreLab/nextgsim/blob/main/CONTRIBUTING.md" class="btn btn-secondary">CONTRIBUTING.md</a>
