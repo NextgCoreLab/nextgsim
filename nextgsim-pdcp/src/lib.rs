@@ -255,6 +255,31 @@ impl Pdcp {
         }
     }
 
+    /// Re-establish the entity (TS 38.323 §5.1.2) for a UM DRB, keeping its
+    /// configuration and security (#315).
+    ///
+    /// Transmit side: `TX_NEXT` back to its initial value, every stored PDU
+    /// discarded. Receive side: `t-Reordering` stopped, every SDU held in the
+    /// reception buffer delivered (returned here in ascending COUNT order), and
+    /// `RX_NEXT`/`RX_DELIV`/`RX_REORD` back to their initial values. The keys stay
+    /// as installed: §5.1.2 applies keys "provided by upper layers", and a caller
+    /// that has new ones installs them with [`Self::set_security`].
+    ///
+    /// Without this, a peer that started a fresh entity at COUNT 0 (a restarted
+    /// gNB, a handover target) faced one still at COUNT N: past half the SN space
+    /// every PDU fell outside the receive window, and under user-plane security the
+    /// two ends ciphered with different COUNTs.
+    pub fn reestablish(&mut self) -> Vec<Vec<u8>> {
+        let delivered: Vec<Vec<u8>> = std::mem::take(&mut self.rx_buffer).into_values().collect();
+        self.tx_next = 0;
+        self.tx_pending.clear();
+        self.rx_next = 0;
+        self.rx_deliv = 0;
+        self.rx_reord = 0;
+        self.t_reordering_started_ms = None;
+        delivered
+    }
+
     /// The configuration in force.
     pub fn config(&self) -> &PdcpConfig {
         &self.config
@@ -727,6 +752,49 @@ mod tests {
         let mut p = Pdcp::encode_header(sn_size, sn);
         p.extend_from_slice(payload);
         p
+    }
+
+    // ---- re-establishment (§5.1.2, #315) ----
+
+    /// After 2100 SDUs (past half the 12-bit SN space) a re-established entity
+    /// talks to a fresh peer again: TX restarts at COUNT 0, RX accepts COUNT 0,
+    /// held SDUs are delivered, and the installed security is kept.
+    #[test]
+    fn a_reestablished_entity_restarts_its_counts_and_keeps_its_keys() {
+        let mut e = entity();
+        for i in 0..2100u32 {
+            let sn = i % PdcpSnSize::Sn12.sn_modulus();
+            e.receive_pdu(&pdu(PdcpSnSize::Sn12, sn, &[1]), 0).unwrap();
+            e.submit_sdu(&[2], 0);
+        }
+        e.take_transmittable(0);
+        assert_eq!(e.rx_deliv(), 2100);
+        assert_eq!(e.tx_count_for_next_sdu(), 2100);
+        // A gap, so one SDU is held for reordering.
+        e.receive_pdu(&pdu(PdcpSnSize::Sn12, 2101 % 4096, &[9]), 0)
+            .unwrap();
+        assert_eq!(e.buffered_count(), 1);
+        // A fresh peer's first PDU (SN 0) is not delivered: past half the SN space
+        // it reads as COUNT 4096 -- far in the future -- and waits behind the gap.
+        let fresh = e.receive_pdu(&pdu(PdcpSnSize::Sn12, 0, &[3]), 0);
+        assert!(matches!(&fresh, Ok(d) if d.is_empty()), "{fresh:?}");
+
+        let sec = PdcpSecurity {
+            security: UpSecurity::new([1; 16], [2; 16], 2, Some(2)).unwrap(),
+            bearer: 0,
+            tx_direction: 1,
+        };
+        e.set_security(Some(sec));
+        let held = e.reestablish();
+        assert_eq!(
+            held,
+            vec![vec![9], vec![3]],
+            "held SDUs are delivered in COUNT order"
+        );
+        assert_eq!(e.tx_count_for_next_sdu(), 0);
+        assert_eq!((e.rx_next(), e.rx_deliv(), e.rx_reord()), (0, 0, 0));
+        assert!(!e.t_reordering_running());
+        assert!(e.security().is_some(), "the keys stay");
     }
 
     // ---- header and SN/COUNT (§5.2.1, §6.2.2.2/§6.2.2.3) ----

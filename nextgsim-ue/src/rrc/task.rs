@@ -2921,6 +2921,11 @@ impl RrcTask {
         self.setup_default_measurements();
         self.measurement_manager.set_serving_cell(Some(cell_id));
 
+        // A new connection carries no DRB yet (§5.3.3.4: only SRB1): whatever
+        // L2 state an earlier connection left on the RLS task goes, so the DRBs
+        // this connection sets up start at COUNT 0 like the gNB's (#315).
+        self.send_rls(RlsMessage::ReleaseDrbs).await;
+
         // Send RRC Setup Complete with initial NAS
         self.send_rrc_setup_complete().await;
 
@@ -3488,6 +3493,13 @@ impl RrcTask {
         self.start_connection_establishment(pending).await;
     }
 
+    /// Send `msg` to the RLS task, logging (not failing) a closed channel.
+    async fn send_rls(&self, msg: RlsMessage) {
+        if let Err(e) = self.task_base.rls_tx.send(msg).await {
+            error!("Failed to reach the RLS task: {e}");
+        }
+    }
+
     async fn handle_rrc_release(&mut self) {
         // Transition to idle state
         if let Err(e) = self.state_machine.on_rrc_release() {
@@ -3501,6 +3513,9 @@ impl RrcTask {
         // Secondary cells are part of that configuration (§5.3.5.5.9), so they
         // go the same way: A6 has no reference in RRC_IDLE.
         self.release_all_scells();
+        // §5.3.11: the release takes every radio bearer's PDCP and RLC entity
+        // with it (#315).
+        self.send_rls(RlsMessage::ReleaseDrbs).await;
 
         info!("RRC connection released");
 
@@ -4178,6 +4193,12 @@ impl RrcTask {
             // are gone. The target names its own in a later reconfiguration.
             self.release_all_scells();
 
+            // A reconfiguration with sync re-establishes the DRBs' PDCP and RLC
+            // (TS 38.323 §5.1.2, TS 38.322 §5.1.2): the target's entities start
+            // fresh, so the UE's must too (#315). Before the cell switch, so no
+            // PDU reaches the target from the source's COUNT space.
+            self.send_rls(RlsMessage::ReestablishDrbs).await;
+
             // Notify RLS of new serving cell
             if let Err(e) = self
                 .task_base
@@ -4620,6 +4641,8 @@ impl RrcTask {
     /// NAS is told the connection is gone, so it enters CM-IDLE.
     async fn enter_idle_after_radio_link_failure(&mut self) {
         let _ = self.state_machine.on_rrc_release();
+        // Going to RRC_IDLE releases the radio bearers (§5.3.11, #315).
+        self.send_rls(RlsMessage::ReleaseDrbs).await;
         self.serving_cell_id = None;
         self.measurement_manager.set_serving_cell(None);
         self.cell_selector.clear_camp();
