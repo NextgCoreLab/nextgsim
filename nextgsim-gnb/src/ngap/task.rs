@@ -312,6 +312,20 @@ const DYNAMIC_TNLA_CLIENT_ID_BASE: i32 = 10_000;
 /// (TS 38.412 §7: NGAP has no port IE, so the AMF can only give an address).
 const DEFAULT_NGAP_PORT: u16 = 38412;
 
+/// How long the gNB waits for an NG Setup Response or Failure before treating the
+/// attempt as unanswered (TS 38.413 §8.7.1.4 abnormal conditions; the spec names no
+/// timer). An AMF answers NG Setup in milliseconds, so a few seconds is a lost
+/// request or a hung peer, not a slow one (#312).
+const NG_SETUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// First NG Setup retry wait after a failure without Time to Wait, or no response.
+/// Doubled per consecutive failed attempt up to [`NG_SETUP_BACKOFF_MAX`] (#312).
+const NG_SETUP_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Ceiling of the NG Setup retry backoff. TS 38.413's longest Time to Wait is 60 s,
+/// so an AMF is never retried less often than it could have asked for.
+const NG_SETUP_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
 /// The largest `UE-Measurement-ID`: `INTEGER (1..15, ..., 16..256)` (TS 38.455
 /// §9.2.4). The RAN-side allocator wraps back to 1 after it.
 const NRPPA_UE_MEASUREMENT_ID_MAX: u16 = 256;
@@ -746,6 +760,17 @@ impl NgapTask {
                         if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
                             ctx.on_ng_setup_sent();
                         }
+                        // A request now in flight supersedes any scheduled retry,
+                        // so a retry timer armed before (for example) an
+                        // association re-up cannot send a second, duplicate
+                        // request (#312). The response timer bounds the wait.
+                        self.guard_timers
+                            .cancel(GuardTimer::NgSetupRetry { amf_id });
+                        self.guard_timers.start(
+                            Instant::now(),
+                            NG_SETUP_RESPONSE_TIMEOUT,
+                            GuardTimer::NgSetupResponse { amf_id },
+                        );
 
                         // Send via SCTP
                         self.send_ngap_non_ue(amf_id, 0, bytes).await;
@@ -783,6 +808,13 @@ impl NgapTask {
                     amf_id, response.amf_name
                 );
 
+                // A late answer (after the response timer already scheduled a
+                // retry) completes the procedure all the same: nothing is
+                // re-sent.
+                self.guard_timers
+                    .cancel(GuardTimer::NgSetupResponse { amf_id });
+                self.guard_timers
+                    .cancel(GuardTimer::NgSetupRetry { amf_id });
                 if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
                     ctx.on_ng_setup_response(response);
                 }
@@ -818,6 +850,20 @@ impl NgapTask {
         }
     }
 
+    /// The wait before the next NG Setup attempt toward `amf_id` when no Time to
+    /// Wait applies: `NG_SETUP_BACKOFF_BASE` doubled per consecutive failed
+    /// attempt, capped at `NG_SETUP_BACKOFF_MAX` (#312).
+    fn ng_setup_backoff(&self, amf_id: i32) -> Duration {
+        let failures = self
+            .amf_contexts
+            .get(&amf_id)
+            .map_or(1, |c| c.ng_setup_failures.max(1));
+        let doublings = (failures - 1).min(16);
+        NG_SETUP_BACKOFF_BASE
+            .saturating_mul(1u32 << doublings)
+            .min(NG_SETUP_BACKOFF_MAX)
+    }
+
     /// Handles NG Setup Failure
     fn handle_ng_setup_failure(&mut self, amf_id: i32, pdu_bytes: &[u8]) -> bool {
         let pdu = match decode_ngap_pdu(pdu_bytes) {
@@ -839,32 +885,42 @@ impl NgapTask {
                     amf_id, failure.cause
                 );
 
-                // TS 38.413 §8.7.1.3: with a Time to Wait IE the gNB "shall wait at
-                // least for the indicated time before re-initiating the NG Setup
-                // procedure towards the same AMF". Scheduled as a guard timer rather
-                // than left to SCTP reconnection, which is not gated by the IE at all
-                // and would retry sooner than the AMF asked.
-                if let Some(time_to_wait) = failure.time_to_wait {
-                    let wait = time_to_wait.as_duration();
-                    info!(
-                        "AMF {} requested a {:?} wait before retry ({:?}); NG Setup retry scheduled",
-                        amf_id, wait, time_to_wait
-                    );
-                    self.guard_timers.start(
-                        Instant::now(),
-                        wait,
-                        GuardTimer::NgSetupRetry { amf_id },
-                    );
-                } else {
-                    // No IE: no wait is mandated, so the existing SCTP reconnection
-                    // path governs. Not retried here, because retrying immediately
-                    // against an AMF that just refused is its own kind of wrong.
-                    debug!("NG Setup Failure from AMF {amf_id} carried no Time to Wait");
+                self.guard_timers
+                    .cancel(GuardTimer::NgSetupResponse { amf_id });
+                if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
+                    ctx.on_ng_setup_attempt_failed();
                 }
 
-                if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
-                    ctx.on_association_down(); // Reset to not connected
-                }
+                // TS 38.413 §8.7.1.3: with a Time to Wait IE the gNB "shall wait at
+                // least for the indicated time before re-initiating the NG Setup
+                // procedure towards the same AMF". Without the IE no wait is
+                // mandated, but the procedure must still be re-initiated: the
+                // association is up, so no SCTP reconnection will ever come along
+                // to do it, and the gNB used to stay un-set-up until it restarted
+                // (#312). It is retried after a bounded exponential backoff rather
+                // than at once, because an AMF that just refused (for example one
+                // still starting up) is unlikely to accept a request sent
+                // immediately.
+                let wait = match failure.time_to_wait {
+                    Some(time_to_wait) => {
+                        let wait = time_to_wait.as_duration();
+                        info!(
+                            "AMF {} requested a {:?} wait before retry ({:?}); NG Setup retry scheduled",
+                            amf_id, wait, time_to_wait
+                        );
+                        wait
+                    }
+                    None => {
+                        let wait = self.ng_setup_backoff(amf_id);
+                        info!(
+                            "NG Setup Failure from AMF {amf_id} carried no Time to Wait; \
+                             retrying NG Setup in {wait:?}"
+                        );
+                        wait
+                    }
+                };
+                self.guard_timers
+                    .start(Instant::now(), wait, GuardTimer::NgSetupRetry { amf_id });
                 true
             }
             Err(e) => {
@@ -3604,17 +3660,56 @@ impl NgapTask {
                     }
                 }
                 GuardTimer::NgSetupRetry { amf_id } => {
-                    // TS 38.413 §8.7.1.3: the Time to Wait has elapsed, so NG Setup may
-                    // be re-initiated toward this AMF.
-                    let still_known = self.amf_contexts.contains_key(&amf_id);
-                    if still_known {
-                        info!("Time to Wait elapsed, re-initiating NG Setup toward AMF {amf_id}");
-                        self.send_ng_setup_request(amf_id).await;
-                    } else {
-                        debug!(
-                            "Time to Wait elapsed for AMF {amf_id}, which is no longer \
-                             configured; no retry"
+                    // TS 38.413 §8.7.1.3/§8.7.1.4: the wait (Time to Wait, or this
+                    // gNB's backoff) has elapsed, so NG Setup may be re-initiated.
+                    // Only from `Connected`: the association is up and no NG Setup
+                    // is in flight or done. Anything else means the retry is stale
+                    // -- the association went down (its re-up sends NG Setup), or
+                    // already re-sent it -- and acting on it would send a duplicate
+                    // NG Setup Request (#312).
+                    match self.amf_contexts.get(&amf_id).map(|c| c.state) {
+                        Some(AmfState::Connected) => {
+                            info!("NG Setup retry wait elapsed, re-initiating NG Setup toward AMF {amf_id}");
+                            self.send_ng_setup_request(amf_id).await;
+                        }
+                        Some(state) => {
+                            debug!(
+                                "NG Setup retry for AMF {amf_id} dropped: AMF is {state}, \
+                                 not waiting for a retry"
+                            );
+                        }
+                        None => {
+                            debug!(
+                                "NG Setup retry for AMF {amf_id}, which is no longer \
+                                 configured; no retry"
+                            );
+                        }
+                    }
+                }
+                GuardTimer::NgSetupResponse { amf_id } => {
+                    // TS 38.413 §8.7.1.4: "If the NG-RAN node initiates the procedure
+                    // and does not receive any response, the NG-RAN node may
+                    // reinitiate the NG Setup procedure towards the same AMF,
+                    // provided that the content of the new NG SETUP REQUEST message
+                    // is identical". The request is rebuilt from the same
+                    // configuration, so it is. Retried after the backoff, as for a
+                    // failure without Time to Wait.
+                    let waiting = self
+                        .amf_contexts
+                        .get(&amf_id)
+                        .is_some_and(|c| c.state == AmfState::WaitingNgSetup);
+                    if waiting {
+                        if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
+                            ctx.on_ng_setup_attempt_failed();
+                        }
+                        let wait = self.ng_setup_backoff(amf_id);
+                        warn!(
+                            "No NG Setup Response from AMF {amf_id} within {:?}; \
+                             re-initiating NG Setup in {wait:?} (TS 38.413 §8.7.1.4)",
+                            NG_SETUP_RESPONSE_TIMEOUT
                         );
+                        self.guard_timers
+                            .start(now, wait, GuardTimer::NgSetupRetry { amf_id });
                     }
                 }
             }
@@ -9243,30 +9338,194 @@ mod tests {
         }
     }
 
-    /// An NG Setup Failure with NO Time to Wait must not schedule anything: there is no
-    /// mandated wait, and retrying on a timer this gNB invented would be worse than
-    /// leaving the existing SCTP reconnection path to govern.
-    #[tokio::test]
-    async fn ng_setup_failure_without_time_to_wait_schedules_no_retry() {
-        use nextgsim_ngap::procedures::ng_setup::{build_ng_setup_failure, NgSetupFailureParams};
-        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
-            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
-        let mut task = NgapTask::new(task_base);
-        task.create_amf_context(1);
+    /// How many NG Setup Requests the task put on the SCTP channel (draining it).
+    fn count_ng_setup_requests(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) -> usize {
+        use nextgsim_ngap::codec::generated::{InitiatingMessageValue, NGAP_PDU};
+        drain_sctp(rx)
+            .iter()
+            .filter(|bytes| {
+                matches!(
+                    nextgsim_ngap::codec::decode_ngap_pdu(bytes),
+                    Ok(NGAP_PDU::InitiatingMessage(m))
+                        if matches!(m.value, InitiatingMessageValue::Id_NGSetup(_))
+                )
+            })
+            .count()
+    }
 
+    /// An encoded NG Setup Failure, with or without Time to Wait.
+    fn ng_setup_failure_bytes(time_to_wait: Option<TimeToWaitValue>) -> Vec<u8> {
+        use nextgsim_ngap::procedures::ng_setup::{build_ng_setup_failure, NgSetupFailureParams};
         let failure = build_ng_setup_failure(&NgSetupFailureParams {
             cause: NgSetupFailureCause::Misc(
                 nextgsim_ngap::procedures::ng_setup::MiscCause::Unspecified,
             ),
-            time_to_wait: None,
+            time_to_wait,
         })
         .expect("build failure");
-        let bytes = nextgsim_ngap::codec::encode_ngap_pdu(&failure).expect("encode");
-        assert!(task.handle_ng_setup_failure(1, &bytes));
-        assert!(
-            task.guard_timers.is_empty(),
-            "no Time to Wait means no mandated wait and so no scheduled retry"
+        nextgsim_ngap::codec::encode_ngap_pdu(&failure).expect("encode")
+    }
+
+    /// A task whose AMF 1 association just came up, so its first NG Setup Request
+    /// is in flight; the SCTP channel is drained of it.
+    async fn task_with_ng_setup_in_flight() -> (
+        NgapTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        task.handle_association_up(1, 100, 8, 8).await;
+        assert_eq!(count_ng_setup_requests(&mut sctp_rx), 1);
+        assert_eq!(
+            task.find_amf_context(1).map(|c| c.state),
+            Some(AmfState::WaitingNgSetup)
         );
+        (task, sctp_rx)
+    }
+
+    /// #312, TS 38.413 §8.7.1.4: an NG Setup Failure WITHOUT Time to Wait is still
+    /// retried -- the association stays up, so no reconnection will ever do it --
+    /// after a backoff that doubles per consecutive failure and is capped.
+    #[tokio::test]
+    async fn ng_setup_failure_without_time_to_wait_is_retried_with_backoff() {
+        let (mut task, mut sctp_rx) = task_with_ng_setup_in_flight().await;
+        let mut expected = NG_SETUP_BACKOFF_BASE;
+        for attempt in 1..=8u32 {
+            assert!(task.handle_ng_setup_failure(1, &ng_setup_failure_bytes(None)));
+            assert_eq!(
+                task.find_amf_context(1).map(|c| c.state),
+                Some(AmfState::Connected),
+                "the association is still up after a failure"
+            );
+            assert!(task
+                .guard_timers
+                .is_pending(GuardTimer::NgSetupRetry { amf_id: 1 }));
+            assert!(
+                !task
+                    .guard_timers
+                    .is_pending(GuardTimer::NgSetupResponse { amf_id: 1 }),
+                "the answer stops the response timer"
+            );
+            let base = Instant::now();
+            task.process_expired_guard_timers(base + expected - Duration::from_millis(1))
+                .await;
+            assert_eq!(
+                count_ng_setup_requests(&mut sctp_rx),
+                0,
+                "attempt {attempt}: not before the {expected:?} backoff"
+            );
+            task.process_expired_guard_timers(base + expected).await;
+            assert_eq!(
+                count_ng_setup_requests(&mut sctp_rx),
+                1,
+                "attempt {attempt}: one retry after the {expected:?} backoff"
+            );
+            expected = (expected * 2).min(NG_SETUP_BACKOFF_MAX);
+        }
+        assert_eq!(
+            expected, NG_SETUP_BACKOFF_MAX,
+            "the backoff reached its cap"
+        );
+
+        // Success resets the backoff.
+        task.find_amf_context_mut(1).unwrap().ng_setup_failures = 0;
+        assert_eq!(task.ng_setup_backoff(1), NG_SETUP_BACKOFF_BASE);
+    }
+
+    /// #312, TS 38.413 §8.7.1.4: an NG Setup Request that gets NO answer is
+    /// re-initiated once the response timer runs out, with the same content.
+    #[tokio::test]
+    async fn an_unanswered_ng_setup_is_reinitiated() {
+        let (mut task, mut sctp_rx) = task_with_ng_setup_in_flight().await;
+        assert!(task
+            .guard_timers
+            .is_pending(GuardTimer::NgSetupResponse { amf_id: 1 }));
+        let base = Instant::now();
+        task.process_expired_guard_timers(
+            base + NG_SETUP_RESPONSE_TIMEOUT - Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            task.guard_timers
+                .is_pending(GuardTimer::NgSetupResponse { amf_id: 1 }),
+            "not before the response timeout"
+        );
+        task.process_expired_guard_timers(base + NG_SETUP_RESPONSE_TIMEOUT)
+            .await;
+        assert!(task
+            .guard_timers
+            .is_pending(GuardTimer::NgSetupRetry { amf_id: 1 }));
+        task.process_expired_guard_timers(base + NG_SETUP_RESPONSE_TIMEOUT + NG_SETUP_BACKOFF_BASE)
+            .await;
+        assert_eq!(count_ng_setup_requests(&mut sctp_rx), 1, "re-initiated");
+        assert_eq!(
+            task.find_amf_context(1).map(|c| c.state),
+            Some(AmfState::WaitingNgSetup)
+        );
+        assert!(
+            task.guard_timers
+                .is_pending(GuardTimer::NgSetupResponse { amf_id: 1 }),
+            "the retry is bounded by its own response timer"
+        );
+    }
+
+    /// #312: an NG Setup Response stops the response timer, so a late expiry
+    /// cannot re-send NG Setup to an AMF that is set up.
+    #[tokio::test]
+    async fn a_response_timer_firing_after_setup_completed_is_ignored() {
+        let (mut task, mut sctp_rx) = task_with_ng_setup_in_flight().await;
+        task.guard_timers
+            .cancel(GuardTimer::NgSetupResponse { amf_id: 1 });
+        // Simulate the answer the way the handler applies it, then fire every timer.
+        task.find_amf_context_mut(1).unwrap().state = AmfState::Ready;
+        task.guard_timers.start(
+            Instant::now(),
+            Duration::ZERO,
+            GuardTimer::NgSetupResponse { amf_id: 1 },
+        );
+        task.process_expired_guard_timers(Instant::now() + Duration::from_secs(3600))
+            .await;
+        assert_eq!(count_ng_setup_requests(&mut sctp_rx), 0);
+        assert!(task.guard_timers.is_empty(), "nothing rescheduled");
+    }
+
+    /// #312: a retry armed by a Time to Wait must not fire once NG Setup has been
+    /// re-sent another way -- here the association went down and came back up,
+    /// which sends NG Setup itself. Before, that gave a duplicate NG Setup Request.
+    #[tokio::test]
+    async fn a_stale_ng_setup_retry_sends_no_duplicate_request() {
+        let (mut task, mut sctp_rx) = task_with_ng_setup_in_flight().await;
+        assert!(
+            task.handle_ng_setup_failure(1, &ng_setup_failure_bytes(Some(TimeToWaitValue::V10s)))
+        );
+        task.handle_association_down(1).await;
+        task.handle_association_up(1, 101, 8, 8).await;
+        assert_eq!(
+            count_ng_setup_requests(&mut sctp_rx),
+            1,
+            "the re-up sends one"
+        );
+        assert!(
+            !task
+                .guard_timers
+                .is_pending(GuardTimer::NgSetupRetry { amf_id: 1 }),
+            "the request in flight supersedes the scheduled retry"
+        );
+        // Even if a retry were pending, it is dropped while a request is in flight.
+        task.guard_timers.start(
+            Instant::now(),
+            Duration::ZERO,
+            GuardTimer::NgSetupRetry { amf_id: 1 },
+        );
+        task.guard_timers
+            .cancel(GuardTimer::NgSetupResponse { amf_id: 1 });
+        task.process_expired_guard_timers(Instant::now() + Duration::from_secs(60))
+            .await;
+        assert_eq!(count_ng_setup_requests(&mut sctp_rx), 0, "no duplicate");
     }
 
     // ========================================================================
