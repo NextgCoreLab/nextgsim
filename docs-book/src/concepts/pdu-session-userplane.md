@@ -292,11 +292,13 @@ socket and the `TunnelManager`.
 downlink. The gNB advertises its own TEID/address in the setup response transfer
 (using `gtp_advertise_ip` if configured, else `gtp_ip`).
 
-**Auto-create fallback and loopback.** If a data PDU arrives for a session that
-was never signalled, `handle_uplink_data` (`gtp/task.rs`) creates one on the
-fly: `auto_create_upf_session` derives a TEID by bit-packing `ue_id`/`psi` and
-forwards to the config `upf_addr`, while `auto_create_loopback_session` is used
-when `upf_addr` is unset. `loopback_mode` is enabled whenever the gNB config has
+**No session, no tunnel; loopback.** If a data PDU arrives for a session that
+was never signalled, `handle_uplink_data` (`gtp/task.rs`) drops it when a UPF is
+configured (`upf_addr` set): the uplink TEID belongs to the UPF and only NGAP
+(PDU Session Resource Setup, Initial Context Setup, Handover Request) can supply
+it, so the gNB never invents one (#293). The drops are counted and logged at a
+bounded rate. When `upf_addr` is unset, `auto_create_loopback_session` creates a
+local echo session instead. `loopback_mode` is enabled whenever the gNB config has
 no `upf_addr` (`GtpTask::new`); in that mode `handle_loopback_data` echoes ICMP
 Echo Requests straight back to the UE (swapping src/dst and recomputing the IP
 and ICMP checksums), letting the data plane be exercised without any core. The
