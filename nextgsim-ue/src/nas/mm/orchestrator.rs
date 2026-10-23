@@ -6613,6 +6613,99 @@ mod tests {
         assert!(!orch.user_plane_reactivation_needed());
     }
 
+    #[test]
+    fn a_service_accept_surfaces_the_network_pdu_session_status() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+
+        // PSI 1 active, PSI 3 NOT: a UE holding both must release 3.
+        let mut accept = ServiceAccept::new();
+        accept.pdu_session_status = Some(0x0002);
+        let mut plain = Vec::new();
+        accept.encode(&mut plain);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+
+        assert!(
+            outs.contains(&MmOutput::NetworkPduSessionStatus(0x0002)),
+            "the PDU session status IE must reach the caller, got {outs:?}"
+        );
+        // The procedure itself still completed.
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert!(!orch.timers().t3517.is_running(), "T3517 must be stopped");
+    }
+
+    /// #51: a SERVICE ACCEPT with no PDU session status IE reconciles nothing.
+    ///
+    /// The negative case matters here: emitting a zero bitmap for an absent IE
+    /// would read as "the network says every session is inactive" and release
+    /// every session the UE holds.
+    #[test]
+    fn a_service_accept_without_the_ie_reconciles_nothing() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        orch.start_service_request(ServiceType::Data, None);
+
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, MmOutput::NetworkPduSessionStatus(_))),
+            "an absent IE must produce no reconciliation, got {outs:?}"
+        );
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService,
+            "the Service Accept is still accepted"
+        );
+    }
+
+    /// #51: a REGISTRATION ACCEPT carrying a PDU session status IE surfaces it
+    /// too (TS 24.501 §5.5.1.3.4), and does so BEFORE `RegistrationSucceeded`.
+    ///
+    /// The ordering is load-bearing, not stylistic: the caller's
+    /// `RegistrationSucceeded` arm establishes the configured default sessions
+    /// only when `active_sessions()` is empty, so a reconciliation arriving after
+    /// it would leave the stale sessions counted, and the UE would neither
+    /// release them nor establish anything.
+    #[test]
+    fn a_registration_accept_surfaces_the_status_before_success() {
+        let mut orch = establish_security_context();
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        acc.pdu_session_status = Some(0x0002);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 1));
+
+        let status_at = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::NetworkPduSessionStatus(0x0002)))
+            .expect("the PDU session status IE must reach the caller");
+        let success_at = outs
+            .iter()
+            .position(|o| matches!(o, MmOutput::RegistrationSucceeded))
+            .expect("registration must still succeed");
+        assert!(
+            status_at < success_at,
+            "reconciliation must precede RegistrationSucceeded, got {outs:?}"
+        );
+    }
+
     /// #317, TS 24.501 §5.6.1.2: a second trigger while a service request is in
     /// progress (T3517 running, SERVICE-REQUEST-INITIATED) sends nothing -- one
     /// SERVICE REQUEST PDU, one UL NAS COUNT, T3517 not restarted.
@@ -6719,99 +6812,6 @@ mod tests {
         assert!(!orch.timers().t3517.is_running(), "T3517 stopped");
         assert!(orch.timers().t3510.is_running());
         assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
-    }
-
-    #[test]
-    fn a_service_accept_surfaces_the_network_pdu_session_status() {
-        let mut orch = establish_security_context();
-        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
-        orch.handle_downlink(&acc);
-        orch.state_mut().switch_cm_state(CmState::Idle);
-        orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
-
-        // PSI 1 active, PSI 3 NOT: a UE holding both must release 3.
-        let mut accept = ServiceAccept::new();
-        accept.pdu_session_status = Some(0x0002);
-        let mut plain = Vec::new();
-        accept.encode(&mut plain);
-        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
-
-        assert!(
-            outs.contains(&MmOutput::NetworkPduSessionStatus(0x0002)),
-            "the PDU session status IE must reach the caller, got {outs:?}"
-        );
-        // The procedure itself still completed.
-        assert_eq!(
-            orch.state().mm_substate(),
-            MmSubState::RegisteredNormalService
-        );
-        assert!(!orch.timers().t3517.is_running(), "T3517 must be stopped");
-    }
-
-    /// #51: a SERVICE ACCEPT with no PDU session status IE reconciles nothing.
-    ///
-    /// The negative case matters here: emitting a zero bitmap for an absent IE
-    /// would read as "the network says every session is inactive" and release
-    /// every session the UE holds.
-    #[test]
-    fn a_service_accept_without_the_ie_reconciles_nothing() {
-        let mut orch = establish_security_context();
-        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
-        orch.handle_downlink(&acc);
-        orch.state_mut().switch_cm_state(CmState::Idle);
-        orch.start_service_request(ServiceType::Data, None);
-
-        let mut plain = Vec::new();
-        ServiceAccept::new().encode(&mut plain);
-        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
-
-        assert!(
-            !outs
-                .iter()
-                .any(|o| matches!(o, MmOutput::NetworkPduSessionStatus(_))),
-            "an absent IE must produce no reconciliation, got {outs:?}"
-        );
-        assert_eq!(
-            orch.state().mm_substate(),
-            MmSubState::RegisteredNormalService,
-            "the Service Accept is still accepted"
-        );
-    }
-
-    /// #51: a REGISTRATION ACCEPT carrying a PDU session status IE surfaces it
-    /// too (TS 24.501 §5.5.1.3.4), and does so BEFORE `RegistrationSucceeded`.
-    ///
-    /// The ordering is load-bearing, not stylistic: the caller's
-    /// `RegistrationSucceeded` arm establishes the configured default sessions
-    /// only when `active_sessions()` is empty, so a reconciliation arriving after
-    /// it would leave the stale sessions counted, and the UE would neither
-    /// release them nor establish anything.
-    #[test]
-    fn a_registration_accept_surfaces_the_status_before_success() {
-        let mut orch = establish_security_context();
-        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
-            SmsOverNasAllowed::NotAllowed,
-            RegistrationResultValue::ThreeGppAccess,
-        ));
-        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
-        acc.pdu_session_status = Some(0x0002);
-        let mut plain = Vec::new();
-        acc.encode(&mut plain);
-
-        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 1));
-
-        let status_at = outs
-            .iter()
-            .position(|o| matches!(o, MmOutput::NetworkPduSessionStatus(0x0002)))
-            .expect("the PDU session status IE must reach the caller");
-        let success_at = outs
-            .iter()
-            .position(|o| matches!(o, MmOutput::RegistrationSucceeded))
-            .expect("registration must still succeed");
-        assert!(
-            status_at < success_at,
-            "reconciliation must precede RegistrationSucceeded, got {outs:?}"
-        );
     }
 
     #[test]
