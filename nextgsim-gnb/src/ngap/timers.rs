@@ -1,4 +1,4 @@
-//! NGAP guard timers (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3, §8.7.1.4)
+//! NGAP guard timers (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3)
 //!
 //! NGAP procedures that wait on the AMF need a bound, or a peer that never answers
 //! leaves the gNB holding state forever: a UE context stuck in `Releasing`, a handover
@@ -59,9 +59,10 @@ pub enum GuardTimer {
         amf_id: i32,
     },
     /// An NG Setup Request was sent and neither an NG Setup Response nor an NG
-    /// Setup Failure has arrived. TS 38.413 defines no timer for this, but
-    /// §8.7.1.4 lets the NG-RAN node re-initiate the procedure when it gets no
-    /// response; see `NG_SETUP_RESPONSE_TIMEOUT` in the NGAP task (#312).
+    /// Setup Failure has arrived. TS 38.413 defines no timer and no rule for
+    /// this; the gNB re-sends an identical request, by analogy with §8.7.2.4
+    /// (RAN Configuration Update). See `NG_SETUP_RESPONSE_TIMEOUT` in the NGAP
+    /// task (#312).
     NgSetupResponse {
         /// The AMF the request went to.
         amf_id: i32,
