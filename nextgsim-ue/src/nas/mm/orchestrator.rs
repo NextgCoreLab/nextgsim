@@ -360,6 +360,9 @@ pub struct MmUeIdentity {
     /// SNPN NID (Rel-17, TS 23.501 §5.30) when the UE is configured to access
     /// a Standalone Non-Public Network; included in the Registration Request.
     pub snpn_nid: Option<String>,
+    /// The UE is configured for high priority access in the selected PLMN
+    /// (`UeConfig::high_priority_access`; TS 24.501 §5.6.1.7 c) 4)).
+    pub high_priority_access: bool,
     /// MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2). Set on the
     /// identity of a MINT secondary subscription so its Registration Request
     /// carries the disaster-roaming indication. Independent of the SNPN field.
@@ -441,6 +444,7 @@ impl MmUeIdentity {
             // SNPN access (Rel-17, TS 23.501 §5.30): carry the configured NID
             // so the Registration Request advertises the SNPN being accessed.
             snpn_nid: config.snpn_config.as_ref().map(|s| s.nid.clone()),
+            high_priority_access: config.high_priority_access,
             // The primary subscription never sets disaster-roaming; MINT
             // secondary identities opt in via `with_supi` (TS 23.761 §4.2).
             disaster_roaming: false,
@@ -621,8 +625,24 @@ pub struct MmOrchestrator {
     /// asking again on the very next uplink packet would loop the AMF through
     /// reject after reject; see [`SERVICE_REJECT_BACKOFF_BASE`].
     sr_backoff_until: Option<std::time::Instant>,
+    /// Uplink data waiting for a data SERVICE REQUEST that has not yet
+    /// succeeded, as an Uplink data status bitmap (TS 24.501 §9.11.3.44; `0`
+    /// when no PSI was named). The TUN forwarder holds the packets themselves.
+    /// When the bar on the request lifts (T3346 expiry, the end of the backoff)
+    /// the request is started from here: §5.6.1.5 #22 starts it "if still
+    /// necessary, when timer T3346 expires", and a one-shot sender sends nothing
+    /// more that could trigger it (#313 review). Cleared by SERVICE ACCEPT and by
+    /// the rejects that release the PDU sessions.
+    held_uplink_data_status: Option<u16>,
     /// Service type of the last SERVICE REQUEST sent (§5.6.1.5 #28 depends on it).
     pending_service_type: Option<ServiceType>,
+    /// The Uplink data status the last registration update carried (#313 review):
+    /// the sessions whose user plane the Registration Accept is to bring back.
+    registration_uplink_data_status: Option<u16>,
+    /// Whether this UE is configured for high priority access
+    /// (`UeConfig::high_priority_access`). §5.6.1.7 c) 4) exempts such a UE from
+    /// T3346, and §5.3.5 from the non-allowed-area bar.
+    high_priority_access: bool,
 
     // -- authentication state --
     /// ABBA parameter received in the last Authentication Request
@@ -750,7 +770,9 @@ pub struct MmOrchestrator {
 impl MmOrchestrator {
     /// Create a new orchestrator for the given UE identity.
     pub fn new(identity: MmUeIdentity) -> Self {
+        let high_priority_access = identity.high_priority_access;
         Self {
+            high_priority_access,
             identity,
             state: MmStateMachine::new(),
             timers: NasTimerManager::new(),
@@ -759,7 +781,9 @@ impl MmOrchestrator {
             up_reactivation_pending: false,
             sr_reject_count: 0,
             sr_backoff_until: None,
+            held_uplink_data_status: None,
             pending_service_type: None,
+            registration_uplink_data_status: None,
             abba: vec![0x00, 0x00],
             sqn_ms: [0u8; 6],
             res_star: None,
@@ -1398,7 +1422,35 @@ impl MmOrchestrator {
         for ev in events {
             outs.extend(self.handle_timer_expiry(ev));
         }
+        // The end of the local Service Reject backoff (#313) is noticed here,
+        // once: the deadline is cleared (the reject count, which sets the next
+        // backoff, is not) and held uplink asks again.
+        if self
+            .sr_backoff_until
+            .is_some_and(|until| std::time::Instant::now() >= until)
+        {
+            self.sr_backoff_until = None;
+            outs.extend(self.retry_held_uplink_service_request("Service Reject backoff over"));
+        }
         outs
+    }
+
+    /// Start the data SERVICE REQUEST for uplink still held after a rejected one,
+    /// once nothing bars it (#313 review). Nothing happens when no uplink is
+    /// held, the user plane is up, or a request is already in flight.
+    fn retry_held_uplink_service_request(&mut self, why: &str) -> Vec<MmOutput> {
+        let Some(status) = self.held_uplink_data_status else {
+            return Vec::new();
+        };
+        let user_plane_down = self.state.is_idle() || self.up_reactivation_pending;
+        if !self.state.is_registered() || !user_plane_down || self.timers.t3517.is_running() {
+            return Vec::new();
+        }
+        if self.service_request_barred(ServiceType::Data).is_some() {
+            return Vec::new();
+        }
+        info!("{why}: starting the Service Request for held uplink data");
+        self.start_service_request(ServiceType::Data, (status != 0).then_some(status))
     }
 
     /// Handle a single timer expiry event.
@@ -1455,7 +1507,9 @@ impl MmOrchestrator {
                     self.registration_attempt_counter = 0;
                     self.build_and_send_registration(self.pending_reg_type)
                 } else {
-                    Vec::new()
+                    // §5.6.1.5 #22, §5.6.1.7 c): "The service request procedure is
+                    // started, if still necessary, when timer T3346 expires".
+                    self.retry_held_uplink_service_request("T3346 expired")
                 }
             }
             TIMER_T3516 => {
@@ -1570,11 +1624,32 @@ impl MmOrchestrator {
             Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci)
         };
 
+        // TS 24.501 §5.5.1.3.2: a registration update sent with uplink user data
+        // pending names those PDU sessions in the Uplink data status IE, with
+        // the follow-on request pending, so the network brings their user plane
+        // back with the Registration Accept (#313 review: after SERVICE REJECT
+        // #28 the held uplink otherwise waited for another packet).
+        let uplink_data_status = match reg_type {
+            RegistrationType::MobilityRegistrationUpdating
+            | RegistrationType::PeriodicRegistrationUpdating
+                if self.state.is_idle() || self.up_reactivation_pending =>
+            {
+                self.held_uplink_data_status.filter(|status| *status != 0)
+            }
+            _ => None,
+        };
+        self.registration_uplink_data_status = uplink_data_status;
+        let follow_on = if uplink_data_status.is_some() {
+            FollowOnRequest::Pending
+        } else {
+            FollowOnRequest::NoPending
+        };
         let mut req = RegistrationRequest::new(
-            Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
+            Ie5gsRegistrationType::new(follow_on, reg_type),
             ng_ksi,
             mobile_identity.clone(),
         );
+        req.uplink_data_status = uplink_data_status;
         // Mandatory-for-security IEs: UE security capability (replayed by
         // the network in the Security Mode Command) and requested NSSAI
         req.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
@@ -1681,7 +1756,9 @@ impl MmOrchestrator {
         // and is ciphered as usual.
         let cleartext_request = |ksi: NasKeySetIdentifier| {
             let mut ct = RegistrationRequest::new(
-                Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
+                // The registration type IE is cleartext; its follow-on bit is the
+                // full request's.
+                Ie5gsRegistrationType::new(follow_on, reg_type),
                 ksi,
                 mobile_identity.clone(),
             );
@@ -1785,6 +1862,23 @@ impl MmOrchestrator {
 
         self.timers.stop(TIMER_T3510, true);
         self.timers.stop(TIMER_T3346, true);
+        // §5.5.1.3.4: the user plane of the sessions the request named in its
+        // Uplink data status is re-established, except those the PDU session
+        // reactivation result marks as failed (bit set = failed, §9.11.3.42).
+        if let Some(requested) = self.registration_uplink_data_status.take() {
+            let failed = acc.pdu_session_reactivation_result.unwrap_or(0) & requested;
+            if failed == 0 {
+                info!("Registration Accept re-established the user plane for held uplink");
+                self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
+            } else {
+                warn!(
+                    "Registration Accept: user-plane reactivation failed for {failed:#06x}; \
+                     a Service Request will ask again"
+                );
+                self.held_uplink_data_status = Some(failed);
+            }
+        }
         // TS 24.501 5.4.1.3.3: stop T3516 and delete RES* on registration accept
         self.timers.stop(TIMER_T3516, true);
         self.res_star = None;
@@ -2768,6 +2862,10 @@ impl MmOrchestrator {
             warn!("Service Request not started: UE not registered");
             return Vec::new();
         }
+        if service_type == ServiceType::Data {
+            self.held_uplink_data_status =
+                Some(self.held_uplink_data_status.unwrap_or(0) | uplink_data_status.unwrap_or(0));
+        }
         if let Some(reason) = self.service_request_barred(service_type) {
             info!("Service Request ({service_type:?}) not started: {reason}");
             return Vec::new();
@@ -2904,13 +3002,14 @@ impl MmOrchestrator {
     ///   triggers (data, signalling): it is this UE's choice, not the network's,
     ///   and must not stop the UE answering a page.
     fn service_request_barred(&self, service_type: ServiceType) -> Option<&'static str> {
+        // §5.6.1.7 c) 4) exempts "a UE configured for high priority access in
+        // selected PLMN": the UE's configuration, not a request's service type.
         let exempt = matches!(
             service_type,
             ServiceType::MobileTerminatedServices
                 | ServiceType::EmergencyServices
                 | ServiceType::EmergencyServicesFallback
-                | ServiceType::HighPriorityAccess
-        );
+        ) || self.high_priority_access;
         // §5.6.1.7 c) 7): elevated signalling is also exempt from T3346.
         if !exempt
             && service_type != ServiceType::ElevatedSignalling
@@ -2951,6 +3050,7 @@ impl MmOrchestrator {
     fn handle_service_accept(&mut self, plain: &[u8]) -> Vec<MmOutput> {
         info!("Service Accept received");
         self.up_reactivation_pending = false;
+        self.held_uplink_data_status = None;
         self.sr_reject_count = 0;
         self.sr_backoff_until = None;
         self.timers.stop(TIMER_T3517, true);
@@ -3016,6 +3116,7 @@ impl MmOrchestrator {
             MmCause::IllegalUe | MmCause::IllegalMe | MmCause::FiveGsServicesNotAllowed => {
                 // Same terminal handling as for registration (5.6.1.5)
                 self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
                 self.state
                     .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
@@ -3031,6 +3132,7 @@ impl MmOrchestrator {
                 // TS 24.501 5.6.1.5: delete the GUTI, enter 5GMM-DEREGISTERED and
                 // perform a fresh initial registration.
                 self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
                 self.delete_registration_context();
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredNormalService);
@@ -3901,6 +4003,7 @@ mod tests {
             requested_nssai: Some(vec![0x01, 0x01]),
             plmn_bcd: encode_plmn_bcd(999, 70, false),
             snpn_nid: None,
+            high_priority_access: false,
             disaster_roaming: false,
             uav_indication: None,
             redcap: false,
@@ -6785,6 +6888,81 @@ mod tests {
         assert!(!outs.is_empty(), "a new Service Request is sent");
     }
 
+    /// #313 review, §5.6.1.5 #22: "The service request procedure is started, if
+    /// still necessary, when timer T3346 expires". Held uplink gets its Service
+    /// Request on the expiry itself, with no new packet to trigger it, and with
+    /// the PSI the rejected request named.
+    #[test]
+    fn t3346_expiry_starts_the_service_request_for_held_uplink() {
+        for idle in [false, true] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+            if idle {
+                orch.on_nas_signalling_connection_released();
+            }
+            assert!(orch.held_uplink_data_status.is_some());
+            orch.timers.stop(TIMER_T3346, true);
+            let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3346, true, 1));
+            assert!(
+                outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+                "idle={idle}: a Service Request on expiry: {outs:?}"
+            );
+            assert!(orch.timers().t3517.is_running(), "idle={idle}");
+            assert_eq!(orch.pending_service_type, Some(ServiceType::Data));
+            assert_eq!(
+                orch.held_uplink_data_status,
+                uplink_data_status(&[1]),
+                "the PSI the rejected request named"
+            );
+        }
+    }
+
+    /// The complement: with no uplink held (the rejected request was signalling),
+    /// T3346 expiry starts nothing.
+    #[test]
+    fn t3346_expiry_without_held_uplink_starts_nothing() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        assert!(!orch
+            .start_service_request(ServiceType::Signalling, None)
+            .is_empty());
+        reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+        orch.timers.stop(TIMER_T3346, true);
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3346, true, 1));
+        assert!(outs.is_empty(), "{outs:?}");
+        assert!(!orch.timers().t3517.is_running());
+    }
+
+    /// #313 review: the end of the local backoff is noticed by the 1 s tick, once,
+    /// and held uplink asks again then; a Service Accept ends the holding.
+    #[test]
+    fn the_end_of_the_backoff_starts_the_service_request_for_held_uplink() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::ProtocolErrorUnspecified, None, 2);
+        assert!(
+            !orch
+                .tick()
+                .iter()
+                .any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "not inside the backoff"
+        );
+        orch.sr_backoff_until = Some(std::time::Instant::now());
+        let outs = orch.tick();
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "{outs:?}"
+        );
+        assert!(orch.sr_backoff_until.is_none(), "noticed once");
+        assert_eq!(orch.sr_reject_count, 1, "the next backoff still doubles");
+
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+        assert!(orch.held_uplink_data_status.is_none());
+    }
+
     /// #313, §5.6.1.5 #28: restricted service area. The UE enters
     /// 5GMM-REGISTERED.NON-ALLOWED-SERVICE with 5U1 UPDATED; its sessions stay but
     /// their user plane cannot be activated, so uplink is held and only exempt
@@ -6819,6 +6997,67 @@ mod tests {
         assert_eq!(
             full.registration_type.registration_type,
             RegistrationType::MobilityRegistrationUpdating
+        );
+        // §5.5.1.3.2 (#313 review): it names the held uplink's session in the
+        // Uplink data status IE, with the follow-on request pending.
+        assert_eq!(full.uplink_data_status, uplink_data_status(&[1]));
+        assert_eq!(
+            full.registration_type.follow_on_request_pending,
+            FollowOnRequest::Pending
+        );
+    }
+
+    /// #313 review, §5.5.1.3.4: the Registration Accept to an update that named
+    /// held uplink brings its user plane back, unless the PDU session
+    /// reactivation result marks the session as failed (bit set = failed).
+    #[test]
+    fn a_registration_accept_restores_the_user_plane_the_update_asked_for() {
+        for (failed, restored) in [(None, true), (Some(0x0002), false)] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            reject_service_request(&mut orch, MmCause::RestrictedServiceArea, None, 2);
+            orch.on_nas_signalling_connection_released();
+            assert_eq!(
+                orch.registration_uplink_data_status,
+                uplink_data_status(&[1])
+            );
+            let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+                SmsOverNasAllowed::NotAllowed,
+                RegistrationResultValue::ThreeGppAccess,
+            ));
+            acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+            acc.pdu_session_reactivation_result = failed;
+            let mut plain = Vec::new();
+            acc.encode(&mut plain);
+            orch.state_mut().switch_cm_state(CmState::Connected);
+            orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+            assert_eq!(!orch.up_reactivation_pending, restored, "failed={failed:?}");
+            assert_eq!(
+                orch.held_uplink_data_status, failed,
+                "what failed is still held for a Service Request"
+            );
+        }
+    }
+
+    /// #313 review, §5.6.1.7 c) 4): the T3346 exemption belongs to a UE
+    /// CONFIGURED for high priority access, whatever the request's service type.
+    #[test]
+    fn the_high_priority_exemption_follows_the_configuration() {
+        for configured in [false, true] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            orch.high_priority_access = configured;
+            reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+            assert!(orch.timers().t3346.is_running());
+            let sent = !orch
+                .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty();
+            assert_eq!(sent, configured, "configured={configured}");
+        }
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+        assert!(
+            orch.start_service_request(ServiceType::HighPriorityAccess, None)
+                .is_empty(),
+            "the service type alone exempts nothing"
         );
     }
 
