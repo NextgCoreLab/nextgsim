@@ -232,6 +232,38 @@ pub struct ProcTableEntry {
     pub port: u16,
     /// Node names registered by this process
     pub nodes: Vec<String>,
+    /// The process's start time (`/proc/<pid>/stat` field 22, clock ticks since
+    /// boot), written as a trailing `st:<ticks>` token (#320).
+    ///
+    /// A PID alone does not identify a process across a container restart: the
+    /// filesystem survives `docker restart` and both incarnations are PID 1, so a
+    /// dead instance's entry looked live and `nr-cli` sent commands to it. The
+    /// start time differs between the two. `None` for entries written before
+    /// this field existed; readers older than it ignore the extra token.
+    pub start_time: Option<u64>,
+}
+
+/// The start time of process `pid` (`/proc/<pid>/stat` field 22, `starttime`, in
+/// clock ticks since boot), or `None` if there is no such process or the file
+/// cannot be read (#320).
+///
+/// Field 2 (`comm`) is parenthesised and may itself contain spaces and
+/// parentheses, so the fields are counted from the LAST `)`.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // After `comm` come field 3 (state) onward, so field 22 is the 20th here.
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Whether the process that wrote `entry` is still running (#320): its PID
+/// exists and, when the entry recorded one, its start time matches.
+pub fn proc_entry_is_live(entry: &ProcTableEntry) -> bool {
+    match (process_start_time(entry.pid), entry.start_time) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(now), Some(recorded)) => now == recorded,
+    }
 }
 
 impl ProcTableEntry {
@@ -249,6 +281,9 @@ impl ProcTableEntry {
         for node in &self.nodes {
             s.push(' ');
             s.push_str(node);
+        }
+        if let Some(st) = self.start_time {
+            s.push_str(&format!(" st:{st}"));
         }
         s
     }
@@ -280,6 +315,11 @@ impl ProcTableEntry {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
+        // Optional and trailing, so entries from before #320 still decode.
+        let start_time = parts
+            .get(6 + node_count)
+            .and_then(|t| t.strip_prefix("st:"))
+            .and_then(|t| t.parse().ok());
 
         Some(Self {
             major,
@@ -288,6 +328,7 @@ impl ProcTableEntry {
             pid,
             port,
             nodes,
+            start_time,
         })
     }
 }
@@ -327,12 +368,50 @@ pub fn lookup_node_port(node_name: &str) -> Option<u16> {
             continue;
         }
 
-        if table_entry.nodes.iter().any(|n| n == node_name) {
+        if table_entry.nodes.iter().any(|n| n == node_name) && proc_entry_is_live(&table_entry) {
             return Some(table_entry.port);
         }
     }
 
     None
+}
+
+/// Removes every process table entry that names one of `nodes` and does not
+/// belong to a live process (#320). Called when a node registers, so a previous
+/// incarnation that died without cleaning up -- a killed or restarted container,
+/// whose new process has the same PID 1 -- cannot be mistaken for this one.
+///
+/// An entry with OUR pid but a different file is stale by construction: this
+/// process writes exactly one entry. That also catches entries written before
+/// the start time was recorded, which [`proc_entry_is_live`] cannot tell apart.
+fn remove_stale_entries_for(nodes: &[String], own_pid: u32, own_file: &Path) {
+    let Ok(entries) = fs::read_dir(PROC_TABLE_DIR) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == own_file || !path.is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(table_entry) = ProcTableEntry::decode(&content) else {
+            continue;
+        };
+        if !table_entry.nodes.iter().any(|n| nodes.contains(n)) {
+            continue;
+        }
+        if table_entry.pid == own_pid || !proc_entry_is_live(&table_entry) {
+            tracing::info!(
+                "Removing stale CLI process-table entry {} (pid {}, nodes {:?})",
+                path.display(),
+                table_entry.pid,
+                table_entry.nodes
+            );
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// CLI server for accepting commands from the CLI tool
@@ -404,6 +483,7 @@ impl CliServer {
         });
 
         let file_path = Path::new(PROC_TABLE_DIR).join(filename);
+        remove_stale_entries_for(&nodes, pid, &file_path);
 
         // Create entry
         let entry = ProcTableEntry {
@@ -413,6 +493,7 @@ impl CliServer {
             pid,
             port: self.port(),
             nodes,
+            start_time: process_start_time(pid),
         };
 
         // Write entry
@@ -575,6 +656,7 @@ mod tests {
             pid: 12345,
             port: 5000,
             nodes: vec!["gnb1".to_string(), "gnb2".to_string()],
+            start_time: None,
         };
 
         let encoded = entry.encode();
@@ -670,6 +752,7 @@ mod tests {
             pid: 4242,
             port: 6000,
             nodes: vec!["gnb".to_string(), "ue1".to_string()],
+            start_time: Some(987654),
         };
 
         let decoded = ProcTableEntry::decode(&entry.encode()).unwrap();
@@ -767,5 +850,79 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// #320: the start time round-trips, and an entry without one (written
+    /// before #320) still decodes.
+    #[test]
+    fn proc_table_start_time_is_optional_and_trailing() {
+        let with = ProcTableEntry::decode("1 0 0 1 6000 1 ue0 st:4711").unwrap();
+        assert_eq!(with.start_time, Some(4711));
+        assert_eq!(with.nodes, vec!["ue0"]);
+        assert_eq!(
+            ProcTableEntry::decode(&with.encode()).unwrap().start_time,
+            Some(4711)
+        );
+        let without = ProcTableEntry::decode("1 0 0 1 6000 1 ue0").unwrap();
+        assert_eq!(without.start_time, None);
+        assert_eq!(without.encode(), "1 0 0 1 6000 1 ue0");
+    }
+
+    /// #320: the same PID with a different start time is a different process --
+    /// the dead PID 1 of a restarted container.
+    #[test]
+    fn a_reused_pid_with_another_start_time_is_not_live() {
+        let pid = std::process::id();
+        let st = process_start_time(pid).expect("this process has a start time");
+        let entry = |start_time| ProcTableEntry {
+            major: VERSION_MAJOR,
+            minor: VERSION_MINOR,
+            patch: VERSION_PATCH,
+            pid,
+            port: 1,
+            nodes: vec![],
+            start_time,
+        };
+        assert!(proc_entry_is_live(&entry(Some(st))));
+        assert!(proc_entry_is_live(&entry(None)), "legacy entry: PID only");
+        assert!(!proc_entry_is_live(&entry(Some(st + 1))));
+        assert!(process_start_time(u32::MAX).is_none());
+    }
+
+    /// #320, the reported failure: a dead incarnation's entry with the same PID as
+    /// the new process (both PID 1 in a restarted container) is removed when the
+    /// node registers, so lookups find the live instance. Modelled here with this
+    /// test process's PID, written both with a stale start time and without one.
+    #[tokio::test]
+    async fn registering_removes_a_dead_incarnations_entry() {
+        let node = format!("ue-restart-{}", std::process::id());
+        let pid = std::process::id();
+        fs::create_dir_all(PROC_TABLE_DIR).unwrap();
+        let stale_paths: Vec<PathBuf> = [Some(1u64), None]
+            .iter()
+            .enumerate()
+            .map(|(i, st)| {
+                let stale = ProcTableEntry {
+                    major: VERSION_MAJOR,
+                    minor: VERSION_MINOR,
+                    patch: VERSION_PATCH,
+                    pid,
+                    port: 9,
+                    nodes: vec![node.clone()],
+                    start_time: *st,
+                };
+                let path = Path::new(PROC_TABLE_DIR).join(format!("stale-{node}-{i}"));
+                fs::write(&path, stale.encode()).unwrap();
+                path
+            })
+            .collect();
+
+        let mut server = CliServer::new().await.unwrap();
+        server.register_nodes(vec![node.clone()]).unwrap();
+
+        for path in &stale_paths {
+            assert!(!path.exists(), "{} removed", path.display());
+        }
+        assert_eq!(lookup_node_port(&node), Some(server.port()));
     }
 }
