@@ -230,7 +230,10 @@ pub async fn run_operational<T: S1Transport>(
                     Err(e) => return Stopped::RadioFailed(format!("S1-U: {e}")),
                 };
                 match s1u.up.downlink(&gtp_buf[..n], from) {
-                    Downlink::ToUe { ue, lcid, pdu } => radio.send_data(ue, lcid, pdu).await,
+                    Downlink::ToUe { ue, lcid, pdu } => {
+                        rrc.on_user_plane_activity(ue, Instant::now());
+                        radio.send_data(ue, lcid, pdu).await;
+                    }
                     Downlink::Reply { to, datagram } => s1u.send_all(vec![(to, datagram)]).await,
                     Downlink::None => {}
                 }
@@ -295,6 +298,7 @@ pub async fn run_operational<T: S1Transport>(
                                 log::warn!("UE {ue}: data PDU on payload {} is not a DRB LCID", pdu.payload);
                                 continue;
                             };
+                            rrc.on_user_plane_activity(ue, Instant::now());
                             let out = s1u.up.uplink(ue, lcid, &pdu.pdu, Instant::now());
                             s1u.send_all(out).await;
                             continue;
@@ -321,6 +325,9 @@ pub async fn run_operational<T: S1Transport>(
                 sfn = (sfn + frames_per_si) & 0x3FF;
             }
             _ = lost_timer.tick() => {
+                // The user-inactivity release (#350) rides the same 500 ms tick.
+                let acts = rrc.check_inactivity(Instant::now());
+                if let Err(s) = execute(acts, &mut rrc, radio, s1u, transport).await { return s; }
                 for ev in radio.tracker.check_lost_ues() {
                     if let GnbTrackerEvent::UeLost { ue_id } = ev {
                         radio.ue_addr.remove(&ue_id);

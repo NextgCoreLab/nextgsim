@@ -466,3 +466,109 @@ fn reconfiguration_adds_srb2_and_nas_moves_onto_it() {
         }
     );
 }
+
+fn rrc_with_inactivity(secs: u64) -> EnbRrc {
+    let mut c = cfg();
+    c.inactivity_timer_secs = Some(secs);
+    EnbRrc::new(&c, 2)
+}
+
+fn release_request_cause(acts: &[Action]) -> u8 {
+    let (_, pdu) = only_s1(acts);
+    let S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_UEContextReleaseRequest(r),
+        ..
+    }) = pdu
+    else {
+        panic!("not UE CONTEXT RELEASE REQUEST: {pdu:?}");
+    };
+    r.protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(
+                CauseRadioNetwork(c),
+            )) => Some(*c),
+            _ => None,
+        })
+        .expect("a Radio Network cause")
+}
+
+/// #350, TS 36.413 §8.3.2: a UE with an S1 connection that stays silent for the
+/// configured time gets one UE CONTEXT RELEASE REQUEST with cause
+/// user-inactivity. Not before the time, and not twice while the command is
+/// awaited; the command then releases RRC as for any other release.
+#[test]
+fn an_inactive_ue_is_released_with_cause_user_inactivity() {
+    let mut e = rrc_with_inactivity(10);
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
+    let start = Instant::now();
+
+    assert!(e
+        .check_inactivity(start + Duration::from_secs(9))
+        .is_empty());
+    let acts = e.check_inactivity(start + Duration::from_secs(11));
+    assert_eq!(
+        release_request_cause(&acts),
+        CauseRadioNetwork::USER_INACTIVITY
+    );
+    assert!(
+        e.check_inactivity(start + Duration::from_secs(30))
+            .is_empty(),
+        "one request per release"
+    );
+    assert_eq!(e.ue_count(), 1, "the context stays until the command");
+
+    let acts = e.on_s1(&release_command(9, enb));
+    assert!(acts.iter().any(|a| matches!(
+        a,
+        Action::Rrc {
+            channel: RrcChannel::DlDcch,
+            ..
+        }
+    )));
+    assert_eq!(e.ue_count(), 0);
+}
+
+/// #350: user data restarts the timer.
+#[test]
+fn user_plane_activity_restarts_the_inactivity_timer() {
+    let mut e = rrc_with_inactivity(10);
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
+    let start = Instant::now();
+    e.on_user_plane_activity(5, start + Duration::from_secs(8));
+    assert!(e
+        .check_inactivity(start + Duration::from_secs(15))
+        .is_empty());
+    assert!(!e
+        .check_inactivity(start + Duration::from_secs(19))
+        .is_empty());
+}
+
+/// #350: off by default, and a UE with no S1 connection yet is not asked about.
+#[test]
+fn the_inactivity_release_is_off_by_default_and_needs_an_s1_connection() {
+    let mut e = rrc();
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
+    assert!(e
+        .check_inactivity(Instant::now() + Duration::from_secs(86_400))
+        .is_empty());
+
+    let mut e = rrc_with_inactivity(1);
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 6, &mut ue_pdcp, &[0x07, 0x41]);
+    assert!(
+        e.check_inactivity(Instant::now() + Duration::from_secs(60))
+            .is_empty(),
+        "no MME UE S1AP ID yet"
+    );
+}

@@ -346,6 +346,7 @@ feature exits with an error.
 | `s1_setup_response_timeout_ms` | u64 | No | 5000 | Wait for S1 SETUP RESPONSE/FAILURE |
 | `radio` | object | No | see struct | `link_ip`, `rls_port` (4997), `cell_id`, `freq_band`, `dl_bandwidth` (`n6`..`n100`), `q_rx_lev_min_dbm`, `t300_ms`, `si_broadcast_period_ms` |
 | `security` | object | No | see struct | AS algorithm preference lists: `integrity`, `ciphering` |
+| `inactivity_timer_secs` | u64 | No | none (off) | User-inactivity release: after this many seconds with no user data and no signalling for an RRC-connected UE with an S1 connection, send UE CONTEXT RELEASE REQUEST with cause user-inactivity (TS 36.413 §8.3.2). The MME's release command then releases RRC and the UE goes ECM-IDLE. 0 is refused |
 
 ## LTE UE Configuration (`lte-ue`)
 
