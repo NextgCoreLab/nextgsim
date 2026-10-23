@@ -865,7 +865,10 @@ mod tests {
             "connect_timeout bounds the attempt: {elapsed:?}"
         );
         if elapsed < std::time::Duration::from_millis(900) {
-            eprintln!("skipping the runtime check: the connect failed at once ({:?})", result.err());
+            eprintln!(
+                "skipping the runtime check: the connect failed at once ({:?})",
+                result.err()
+            );
             return;
         }
         let n = ticks.load(std::sync::atomic::Ordering::Relaxed);
