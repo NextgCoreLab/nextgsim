@@ -34,7 +34,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["nextgsim contributors"]
-license = "GPL-3.0"
+license = "AGPL-3.0"
 repository = "https://github.com/nextgsim/nextgsim"
 description = "Pure Rust 5G UE and gNB simulator"
 
