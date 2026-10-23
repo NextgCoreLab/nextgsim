@@ -372,6 +372,7 @@ before validating it, so a bad value is refused like a bad file:
 | `NEXTGSIM_ENB_IP` | eNB | `s1ap_ip` and `radio.link_ip` |
 | `NEXTGSIM_ENB_GTP_IP` | eNB | `gtp_ip` |
 | `NEXTGSIM_ENB_ID` | eNB | `enb_id` (decimal or `0x` hex) |
+| `NEXTGSIM_ENB_INACTIVITY_TIMER_SECS` | eNB | `inactivity_timer_secs` (seconds; empty or `off` disables it) |
 | `NEXTGSIM_PLMN` | both | `plmn`, written `MCC-MNC` |
 | `NEXTGSIM_TAC` | eNB | `tac` |
 | `NEXTGSIM_UE_ENB_ADDR` | UE | `enb_search_list` |

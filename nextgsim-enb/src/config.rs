@@ -342,6 +342,7 @@ pub fn load_with_env_and_validate<P: AsRef<Path>>(path: P) -> Result<EnbConfig, 
 /// | `NEXTGSIM_ENB_IP` | `s1ap_ip` and `radio.link_ip` |
 /// | `NEXTGSIM_ENB_GTP_IP` | `gtp_ip` (the S1-U address; defaults to `s1ap_ip`) |
 /// | `NEXTGSIM_ENB_ID` | `enb_id`, decimal or `0x` hex |
+/// | `NEXTGSIM_ENB_INACTIVITY_TIMER_SECS` | `inactivity_timer_secs` (#350); empty or `off` disables it |
 /// | `NEXTGSIM_PLMN` | `plmn`, written `MCC-MNC` |
 /// | `NEXTGSIM_TAC` | `tac` |
 ///
@@ -381,6 +382,19 @@ pub fn apply_env_overrides(
     }
     if let Some(v) = lookup("NEXTGSIM_ENB_ID") {
         c.enb_id = parse_u32(v.trim()).map_err(|e| bad("NEXTGSIM_ENB_ID", e))?;
+    }
+    if let Some(v) = lookup("NEXTGSIM_ENB_INACTIVITY_TIMER_SECS") {
+        let v = v.trim();
+        c.inactivity_timer_secs = if v.is_empty() || v.eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(v.parse::<u64>().map_err(|_| {
+                bad(
+                    "NEXTGSIM_ENB_INACTIVITY_TIMER_SECS",
+                    format!("{v:?} is not a number of seconds"),
+                )
+            })?)
+        };
     }
     let plmn = lookup("NEXTGSIM_PLMN");
     let tac = lookup("NEXTGSIM_TAC");
@@ -580,6 +594,7 @@ mod tests {
                 ("NEXTGSIM_ENB_IP", "172.24.0.50"),
                 ("NEXTGSIM_ENB_GTP_IP", "172.24.0.51"),
                 ("NEXTGSIM_ENB_ID", "0x1A0"),
+                ("NEXTGSIM_ENB_INACTIVITY_TIMER_SECS", "15"),
                 ("NEXTGSIM_PLMN", "001-01"),
                 ("NEXTGSIM_TAC", "7"),
             ]),
@@ -598,6 +613,7 @@ mod tests {
         assert_eq!(c.radio.link_ip, ip("172.24.0.50"));
         assert_eq!(c.gtp_ip, Some(ip("172.24.0.51")));
         assert_eq!(c.enb_id, 0x1A0);
+        assert_eq!(c.inactivity_timer_secs, Some(15));
         assert_eq!(c.plmn, Plmn::new(1, 1, false));
         assert_eq!(c.tac, 7);
     }
@@ -616,6 +632,7 @@ mod tests {
             ("NEXTGSIM_ENB_MME_ADDR", "mme.local"),
             ("NEXTGSIM_ENB_IP", "x"),
             ("NEXTGSIM_ENB_ID", "0xZZ"),
+            ("NEXTGSIM_ENB_INACTIVITY_TIMER_SECS", "soon"),
             ("NEXTGSIM_PLMN", "99970"),
             ("NEXTGSIM_TAC", "70000"),
         ] {
