@@ -43,6 +43,9 @@ pub enum RrcIndication {
     /// The connection is gone: RRCConnectionRelease (§5.3.8.3) or radio link
     /// failure before AS security (§5.3.11.3, release cause "other").
     Released,
+    /// An RRCConnectionReconfiguration set up the DRBs: "the user plane radio
+    /// bearers are set up" (TS 24.301 §5.6.1.4).
+    RadioBearersEstablished,
 }
 
 /// What a NAS timer asks of RRC.
@@ -65,6 +68,9 @@ pub trait NasLayer: Send {
     fn on_downlink_nas(&mut self, nas: &[u8]) -> Vec<Vec<u8>>;
     /// An RRC indication.
     fn on_rrc_indication(&mut self, ind: RrcIndication);
+    /// An uplink IP packet found no DRB because the UE is in RRC_IDLE: NAS
+    /// may want a connection for it (TS 24.301 §5.6.1.1 b).
+    fn on_uplink_pending(&mut self) {}
     /// `K_eNB` for the AS Security Mode Command, when NAS has a security
     /// context (TS 33.401 §7.2.6.2).
     fn k_enb(&mut self) -> Option<[u8; 32]> {
@@ -150,10 +156,16 @@ impl NasLayer for EpsNas {
         let nas = self.ue.initial_message(Instant::now());
         self.publish();
         let nas = nas?;
+        // TS 24.301 Annex D Table D.1.1: attach is "mo-Signalling"; a service
+        // request for uplink user data is "mo-Data".
+        let cause = if self.ue.state() == EmmState::ServiceRequestInitiated {
+            EstablishmentCauseValue::MoData
+        } else {
+            EstablishmentCauseValue::MoSignalling
+        };
         Some(InitialNas {
             nas,
-            // TS 24.301 Annex D Table D.1.1: attach is "mo-Signalling".
-            cause: EstablishmentCauseValue::MoSignalling,
+            cause,
             s_tmsi: self.ue.s_tmsi(),
         })
     }
@@ -172,8 +184,13 @@ impl NasLayer for EpsNas {
             RrcIndication::EstablishmentFailed { .. } | RrcIndication::Released => {
                 self.ue.on_released(Instant::now());
             }
+            RrcIndication::RadioBearersEstablished => self.ue.on_user_plane_established(),
         }
         self.publish();
+    }
+
+    fn on_uplink_pending(&mut self) {
+        self.ue.on_uplink_data_pending();
     }
 
     fn k_enb(&mut self) -> Option<[u8; 32]> {

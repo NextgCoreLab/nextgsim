@@ -305,6 +305,73 @@ struct Harness {
     _stop: watch::Sender<bool>,
 }
 
+/// The eNB UE S1AP ID and the NAS-PDU of an INITIAL UE MESSAGE.
+fn initial_ue_message(pdu: S1AP_PDU) -> (u32, Vec<u8>) {
+    let S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_initialUEMessage(m),
+        ..
+    }) = pdu
+    else {
+        panic!("expected INITIAL UE MESSAGE, got {pdu:?}");
+    };
+    let mut enb_ue_id = None;
+    let mut nas = None;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            InitialUEMessageProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(v) => enb_ue_id = Some(v.0),
+            InitialUEMessageProtocolIEs_EntryValue::Id_NAS_PDU(v) => nas = Some(v.0),
+            _ => {}
+        }
+    }
+    (enb_ue_id.unwrap(), nas.unwrap())
+}
+
+/// UE CONTEXT RELEASE COMMAND (TS 36.413 §9.1.4.6), cause NAS normal release.
+fn release_command(mme: u32, enb: u32) -> Vec<u8> {
+    encode_s1ap_pdu(&S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_UE_CONTEXT_RELEASE),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_UEContextRelease(UEContextReleaseCommand {
+            protocol_i_es: UEContextReleaseCommandProtocolIEs(vec![
+                UEContextReleaseCommandProtocolIEs_Entry {
+                    id: ProtocolIE_ID(ID_UE_S1AP_I_DS),
+                    criticality: Criticality(Criticality::REJECT),
+                    value: UEContextReleaseCommandProtocolIEs_EntryValue::Id_UE_S1AP_IDs(
+                        UE_S1AP_IDs::UE_S1AP_ID_pair(UE_S1AP_ID_pair {
+                            mme_ue_s1ap_id: MME_UE_S1AP_ID(mme),
+                            enb_ue_s1ap_id: ENB_UE_S1AP_ID(enb),
+                            ie_extensions: None,
+                        }),
+                    ),
+                },
+                UEContextReleaseCommandProtocolIEs_Entry {
+                    id: ProtocolIE_ID(ID_CAUSE),
+                    criticality: Criticality(Criticality::IGNORE),
+                    value: UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(Cause::Nas(
+                        CauseNas(CauseNas::NORMAL_RELEASE),
+                    )),
+                },
+            ]),
+        }),
+    }))
+    .unwrap()
+}
+
+/// Wait for the UE CONTEXT RELEASE COMPLETE that answers a release command.
+async fn expect_release_complete(rx: &mut mpsc::UnboundedReceiver<(u16, Vec<u8>)>) {
+    let (_, pdu) = next_s1(rx).await;
+    assert!(
+        matches!(
+            pdu,
+            S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+                value: SuccessfulOutcomeValue::Id_UEContextRelease(_),
+                ..
+            })
+        ),
+        "expected UE CONTEXT RELEASE COMPLETE, got {pdu:?}"
+    );
+}
+
 /// eNB and UE up; returns once INITIAL UE MESSAGE has reached the MME,
 /// checking it carries the ATTACH REQUEST the UE's NAS built.
 async fn start() -> Harness {
@@ -364,23 +431,7 @@ async fn start() -> Harness {
         stream, 1,
         "TS 36.412 §7: UE-associated signalling is not on stream 0"
     );
-    let S1AP_PDU::InitiatingMessage(InitiatingMessage {
-        value: InitiatingMessageValue::Id_initialUEMessage(m),
-        ..
-    }) = pdu
-    else {
-        panic!("expected INITIAL UE MESSAGE, got {pdu:?}");
-    };
-    let mut enb_ue_id = None;
-    let mut nas = None;
-    for ie in m.protocol_i_es.0 {
-        match ie.value {
-            InitialUEMessageProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(v) => enb_ue_id = Some(v.0),
-            InitialUEMessageProtocolIEs_EntryValue::Id_NAS_PDU(v) => nas = Some(v.0),
-            _ => {}
-        }
-    }
-    let nas = nas.unwrap();
+    let (enb_ue_id, nas) = initial_ue_message(pdu);
     // The UE's own ATTACH REQUEST: plain, KSI 7 / EPS attach, IMSI identity,
     // UE network capability EEA0-2 / EIA1-2 (TS 24.301 §8.2.4).
     assert_eq!(&nas[..3], &[0x07, 0x41, 0x71]);
@@ -393,7 +444,7 @@ async fn start() -> Harness {
         to_enb,
         mme_rx,
         state_rx,
-        enb_ue_id: enb_ue_id.unwrap(),
+        enb_ue_id,
         ip_ul,
         ip_dl,
         enb_s1u,
@@ -596,5 +647,54 @@ async fn a_wrong_kenb_fails_the_as_smc_and_initial_context_setup() {
     assert_eq!(
         cause,
         Some(CauseRadioNetwork::FAILURE_IN_RADIO_INTERFACE_PROCEDURE)
+    );
+}
+
+/// nextgsim #300: an attached UE whose connection is released (as when an
+/// MME restart takes S1 down) is EMM-REGISTERED in EMM-IDLE. Uplink data
+/// then makes it send a SERVICE REQUEST (TS 24.301 §5.6.1.1 b) -- in an
+/// INITIAL UE MESSAGE with the S-TMSI, verified here with the short MAC
+/// (§9.9.3.28) -- and a SERVICE REJECT #9 from an MME that does not know it
+/// (§5.6.1.5) makes it attach again, with its IMSI, on a new connection.
+#[tokio::test]
+async fn an_idle_ue_sends_a_service_request_and_reattaches_after_reject_9() {
+    let mut h = start().await;
+    attach(&mut h, Ipv4Addr::new(127, 0, 0, 2)).await;
+    h.to_enb.send(release_command(4242, h.enb_ue_id)).unwrap();
+    expect_release_complete(&mut h.mme_rx).await;
+    wait_state(&mut h.state_rx, |s| matches!(s, UeRrcState::Camped { .. })).await;
+
+    // Uplink data in RRC_IDLE.
+    let packet = vec![
+        0x45, 0, 0, 24, 0, 1, 0, 0, 64, 1, 0, 0, 10, 45, 0, 2, 8, 8, 8, 8, 0, 0, 0, 1,
+    ];
+    h.ip_ul.send(packet).await.unwrap();
+    let (enb_ue_id, sr) = initial_ue_message(next_s1(&mut h.mme_rx).await.1);
+    assert_eq!(sr.len(), 4, "SERVICE REQUEST: {sr:02x?}");
+    assert_eq!(sr[0], 0xC7, "security header type 12");
+    // KSI 0 (the SMC's), sequence number: UL NAS COUNT 2 after SECURITY MODE
+    // COMPLETE (0) and ATTACH COMPLETE (1).
+    assert_eq!(sr[1], 0x02);
+    let k_int = derive_algorithm_key(&MmeNas::new().kasme, EpsAlgorithmType::NasInt, 2);
+    let mac = nia2_compute_mac(2, 0, 0, &k_int, &sr[..2]);
+    assert_eq!(&sr[2..], &mac[2..], "short MAC");
+
+    // A restarted MME: no context, SERVICE REJECT #9, then the release.
+    h.to_enb
+        .send(dl_nas(5151, enb_ue_id, &[0x07, 0x4E, 9]))
+        .unwrap();
+    h.to_enb.send(release_command(5151, enb_ue_id)).unwrap();
+    expect_release_complete(&mut h.mme_rx).await;
+
+    let (_, nas) = initial_ue_message(next_s1(&mut h.mme_rx).await.1);
+    assert_eq!(
+        &nas[..3],
+        &[0x07, 0x41, 0x71],
+        "a plain ATTACH REQUEST with no KSI: GUTI and KSI were deleted"
+    );
+    assert_eq!(
+        &nas[3..12],
+        &[0x08, 0x99, 0x99, 0x07, 0x00, 0x00, 0x00, 0x00, 0x10],
+        "IMSI identity"
     );
 }

@@ -20,12 +20,16 @@
 //!   security capability check (§5.4.3.3, #23), the IMEISV request, and from
 //!   then on protected uplink and verified downlink (§4.4.4).
 //! - `K_eNB` for the AS Security Mode Command (TS 33.401 §7.2.6.2, A.3).
+//! - **Service request** (§5.6.1) for an EMM-REGISTERED UE in EMM-IDLE with
+//!   pending uplink user data (§5.6.1.1 case b): SERVICE REQUEST under T3417,
+//!   completed by the lower layers' "user plane radio bearers set up"
+//!   indication (§5.6.1.4); SERVICE REJECT per §5.6.1.5 -- #9, #10 and #40
+//!   lead to a new attach -- and the abnormal cases of §5.6.1.6 that apply
+//!   (T3417 expiry, lower layer failure).
 //!
 //! # What is not (and is said so where it would be reached)
 //!
-//! Tracking area update, service request, detach and paging are not
-//! implemented: after ATTACH COMPLETE the UE is EMM-REGISTERED and, when the
-//! connection is released, stays so without TAU or service request. A network
+//! Tracking area update, detach and paging are not implemented. A network
 //! message of a procedure this UE does not implement is answered with EMM
 //! STATUS #97 (§7.4), which is what the clause asks of a UE that does not
 //! implement a message type.
@@ -52,6 +56,12 @@ pub const T3411: Duration = Duration::from_secs(10);
 pub const T3416: Duration = Duration::from_secs(30);
 /// T3402 default: 12 minutes (§10.2).
 pub const T3402_DEFAULT: Duration = Duration::from_secs(12 * 60);
+/// T3417: service request supervision (§10.2, Table 10.2.1).
+pub const T3417: Duration = Duration::from_secs(5);
+/// T3440: wait for the network to release the NAS signalling connection
+/// after a reject that ends the UE's registration (§10.2, Table 10.2.1); on
+/// expiry the UE releases it locally.
+pub const T3440: Duration = Duration::from_secs(10);
 /// Attach attempt counter limit (§5.5.1.2.6: "equal to 5").
 pub const MAX_ATTACH_ATTEMPTS: u8 = 5;
 
@@ -95,6 +105,8 @@ pub enum EmmState {
     RegisteredInitiated,
     /// EMM-REGISTERED.
     Registered,
+    /// EMM-SERVICE-REQUEST-INITIATED: SERVICE REQUEST sent, T3417 running.
+    ServiceRequestInitiated,
     /// EMM-DEREGISTERED.ATTEMPTING-TO-ATTACH: T3411 or T3402 running.
     AttemptingToAttach,
     /// EMM-DEREGISTERED with no further attach: the USIM is invalid for EPS
@@ -166,6 +178,13 @@ pub struct EpsNasUe {
     /// but does not cipher (§4.4.4.2), so an MME that no longer holds the
     /// context can still read the message (§4.4.4.3 NOTE 3).
     secure_exchange: bool,
+    /// Uplink user data is waiting for a connection (§5.6.1.1 b).
+    uplink_pending: bool,
+    t3417: Option<Instant>,
+    t3440: Option<Instant>,
+    /// T3346 from a SERVICE REJECT #22: no service request before it expires
+    /// (§5.6.1.5).
+    t3346: Option<Instant>,
 }
 
 /// RAND, RES and `K_ASME` held in the ME's volatile memory (§5.4.2.3).
@@ -202,6 +221,10 @@ impl EpsNasUe {
             bearer: None,
             stored_auth: None,
             secure_exchange: false,
+            uplink_pending: false,
+            t3417: None,
+            t3440: None,
+            t3346: None,
         }
     }
 
@@ -244,9 +267,55 @@ impl EpsNasUe {
         p
     }
 
+    /// Uplink user data is waiting and there is no connection to send it on.
+    /// An EMM-REGISTERED UE then starts the service request procedure on the
+    /// next [`Self::initial_message`] (§5.6.1.1 b); in any other state the
+    /// data cannot be served and nothing is remembered.
+    pub fn on_uplink_data_pending(&mut self) {
+        if self.state == EmmState::Registered {
+            self.uplink_pending = true;
+        }
+    }
+
+    /// The lower layers indicate that the user plane radio bearers are set
+    /// up: the service request completed successfully (§5.6.1.4).
+    pub fn on_user_plane_established(&mut self) {
+        if self.state == EmmState::ServiceRequestInitiated {
+            log::info!("EMM: user plane radio bearers set up; service request complete (§5.6.1.4)");
+            self.t3417 = None;
+            self.state = EmmState::Registered;
+        }
+    }
+
+    /// SERVICE REQUEST (§5.6.1.2), when EMM-REGISTERED with uplink data
+    /// pending and not barred by T3346.
+    fn service_request(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if !self.uplink_pending || self.t3346.is_some_and(|t| now < t) {
+            return None;
+        }
+        self.t3346 = None;
+        let Some(ctx) = self.ctx.as_mut() else {
+            // A registered UE always holds the context the attach's SMC
+            // created; without one there is nothing to compute the short MAC.
+            log::warn!("EMM: uplink data pending but no EPS security context; no SERVICE REQUEST");
+            self.uplink_pending = false;
+            return None;
+        };
+        let pdu = ctx.service_request();
+        self.uplink_pending = false;
+        self.state = EmmState::ServiceRequestInitiated;
+        self.t3417 = Some(now + T3417);
+        log::info!("EMM: SERVICE REQUEST (uplink data pending); T3417 started");
+        Some(pdu)
+    }
+
     /// The NAS message that needs an RRC connection now, if any: ATTACH
-    /// REQUEST when an attach is due and no retry timer is running.
+    /// REQUEST when an attach is due and no retry timer is running, SERVICE
+    /// REQUEST when registered with uplink data pending.
     pub fn initial_message(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.state == EmmState::Registered {
+            return self.service_request(now);
+        }
         if self.state != EmmState::Deregistered {
             return None;
         }
@@ -300,6 +369,9 @@ impl EpsNasUe {
     pub fn next_deadline(&self) -> Option<Instant> {
         [
             self.t3410,
+            self.t3417,
+            self.t3440,
+            self.t3346,
             self.retry_at,
             self.stored_auth.as_ref().map(|a| a.t3416),
         ]
@@ -325,6 +397,32 @@ impl EpsNasUe {
                 uplink: vec![],
                 release: true,
             };
+        }
+        if self.t3417.is_some_and(|t| now >= t) {
+            // §5.6.1.6 c): back to EMM-REGISTERED, the procedure aborted and
+            // the resources allocated for it released locally. The next
+            // uplink data starts a new service request.
+            log::warn!("EMM: T3417 expired; service request aborted (§5.6.1.6 c)");
+            self.t3417 = None;
+            self.state = EmmState::Registered;
+            self.secure_exchange = false;
+            return NasOutput {
+                uplink: vec![],
+                release: true,
+            };
+        }
+        if self.t3440.is_some_and(|t| now >= t) {
+            // Table 10.2.1: the network did not release the connection.
+            log::warn!("EMM: T3440 expired; NAS signalling connection released locally");
+            self.t3440 = None;
+            self.secure_exchange = false;
+            return NasOutput {
+                uplink: vec![],
+                release: true,
+            };
+        }
+        if self.t3346.is_some_and(|t| now >= t) {
+            self.t3346 = None;
         }
         if self.retry_at.is_some_and(|t| now >= t) && self.state == EmmState::AttemptingToAttach {
             log::info!("EMM: retry timer expired; attach due again");
@@ -366,6 +464,15 @@ impl EpsNasUe {
             self.t3410 = None;
             self.attach_failed(now, None);
         }
+        if self.state == EmmState::ServiceRequestInitiated {
+            // §5.6.1.6 a): lower layer failure or release before the user
+            // plane radio bearers are set up aborts the procedure.
+            log::warn!("EMM: NAS signalling connection lost during service request (§5.6.1.6 a)");
+            self.t3417 = None;
+            self.state = EmmState::Registered;
+        }
+        // Table 10.2.1: T3440 stops when the connection is released.
+        self.t3440 = None;
         // AKA results that no SMC took into use do not survive the connection,
         // and §5.4.2.3 deletes the stored RAND and RES on entering EMM-IDLE.
         self.pending = None;
@@ -449,7 +556,8 @@ impl EpsNasUe {
             DownlinkEmm::IdentityRequest(_)
             | DownlinkEmm::AuthenticationRequest { .. }
             | DownlinkEmm::AuthenticationReject
-            | DownlinkEmm::AttachReject(_) => self.on_emm(m, now),
+            | DownlinkEmm::AttachReject(_)
+            | DownlinkEmm::ServiceReject(_) => self.on_emm(m, now),
             other => {
                 log::warn!("EMM: unprotected {other:?} discarded (§4.4.4.2)");
                 NasOutput::default()
@@ -507,6 +615,10 @@ impl EpsNasUe {
             DownlinkEmm::AttachAccept(a) => self.on_attach_accept(a, now),
             DownlinkEmm::AttachReject(r) => {
                 self.on_attach_reject(r.cause, r.t3402_s, r.t3346_s, now);
+                NasOutput::default()
+            }
+            DownlinkEmm::ServiceReject(r) => {
+                self.on_service_reject(r, now);
                 NasOutput::default()
             }
             DownlinkEmm::SecurityModeCommand(_) => {
@@ -796,6 +908,80 @@ impl EpsNasUe {
             // Any other cause is abnormal case §5.5.1.2.6 d).
             _ => self.attach_failed(now, None),
         }
+    }
+
+    /// SERVICE REJECT (§5.6.1.5).
+    fn on_service_reject(&mut self, r: msg::ServiceReject, now: Instant) {
+        if self.state != EmmState::ServiceRequestInitiated {
+            log::warn!(
+                "EMM: SERVICE REJECT #{} in {:?}; ignored",
+                r.cause,
+                self.state
+            );
+            return;
+        }
+        self.t3417 = None;
+        log::warn!("EMM: SERVICE REJECT #{}", r.cause);
+        match r.cause {
+            emm_cause::ILLEGAL_UE
+            | emm_cause::ILLEGAL_ME
+            | emm_cause::EPS_SERVICES_NOT_ALLOWED
+            | emm_cause::EPS_AND_NON_EPS_NOT_ALLOWED => {
+                self.bearer = None;
+                self.invalidate(r.cause);
+                self.t3440 = Some(now + T3440);
+            }
+            emm_cause::UE_IDENTITY_CANNOT_BE_DERIVED => {
+                // #9: delete the GUTI, last visited TAI, TAI list and KSI, enter
+                // EMM-DEREGISTERED, deactivate the EPS bearer contexts locally,
+                // and attach again.
+                log::info!("EMM: identity unknown to the network; GUTI deleted, re-attach");
+                self.guti = None;
+                self.tai_list.clear();
+                self.ctx = None;
+                self.local_detach();
+                self.t3440 = Some(now + T3440);
+            }
+            emm_cause::IMPLICITLY_DETACHED | emm_cause::NO_EPS_BEARER_CONTEXT_ACTIVATED => {
+                // #10: EMM-DEREGISTERED.NORMAL-SERVICE, EPS bearer contexts
+                // deactivated locally, a new attach. #40: the same, as the UE
+                // is left with no EPS bearer context.
+                log::info!("EMM: EPS bearer contexts deactivated locally, re-attach");
+                self.local_detach();
+                self.t3440 = Some(now + T3440);
+            }
+            emm_cause::PLMN_NOT_ALLOWED
+            | emm_cause::TA_NOT_ALLOWED
+            | emm_cause::ROAMING_NOT_ALLOWED_IN_TA
+            | emm_cause::EPS_NOT_ALLOWED_IN_PLMN
+            | emm_cause::NO_SUITABLE_CELLS_IN_TA
+            | emm_cause::NOT_AUTHORIZED_FOR_CSG
+            | emm_cause::SERVICE_OPTION_NOT_AUTHORIZED_IN_PLMN => {
+                self.bearer = None;
+                self.guti = None;
+                self.ctx = None;
+                self.state = EmmState::NoService(r.cause);
+                self.t3440 = Some(now + T3440);
+            }
+            emm_cause::CONGESTION => {
+                // #22: abort, stay EMM-REGISTERED; no new service request
+                // while T3346 runs.
+                self.state = EmmState::Registered;
+                self.t3346 = r.t3346_s.map(|s| now + Duration::from_secs(s));
+            }
+            // §5.6.1.6: any other cause aborts the procedure.
+            _ => self.state = EmmState::Registered,
+        }
+    }
+
+    /// Deactivate the EPS bearer contexts locally and enter
+    /// EMM-DEREGISTERED.NORMAL-SERVICE, so an attach is due.
+    fn local_detach(&mut self) {
+        self.bearer = None;
+        self.uplink_pending = false;
+        self.state = EmmState::Deregistered;
+        self.attempts = 0;
+        self.retry_at = None;
     }
 
     fn on_esm(&mut self, plain: &[u8]) -> NasOutput {

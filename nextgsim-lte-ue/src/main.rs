@@ -86,9 +86,26 @@ async fn main() -> ExitCode {
     }
 }
 
+/// The IPv4 PDN address of the default bearer NAS holds now, with its EBI.
+fn bearer_ipv4(status: &Mutex<EpsNasStatus>) -> Option<(u8, Ipv4Addr)> {
+    let b = status.lock().ok()?.bearer.clone()?;
+    match b.pdn_address {
+        PdnAddress::Ipv4(a) | PdnAddress::Ipv4v6(_, a) => Some((b.ebi, a)),
+        other => {
+            log::warn!("default bearer PDN address {other:?}: no IPv4 for the TUN interface");
+            None
+        }
+    }
+}
+
 /// Bridge the default bearer to a TUN interface: wait for NAS to activate
 /// the default EPS bearer with an IPv4 PDN address (TS 24.301 §6.4.1.3),
 /// give the interface that address, and pump packets both ways.
+///
+/// The interface outlives the bearer. When a later attach (after a SERVICE
+/// REJECT, or a network-initiated detach) activates a default bearer with a
+/// different PDN address, the same interface takes the new address, so its
+/// name -- and whatever the host routes through it -- stays.
 async fn tun_bridge(
     settings: TunSettings,
     status: Arc<Mutex<EpsNasStatus>>,
@@ -96,24 +113,16 @@ async fn tun_bridge(
     mut dl_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let (ebi, address) = loop {
-        let bearer = status.lock().ok().and_then(|s| s.bearer.clone());
-        if let Some(b) = bearer {
-            match b.pdn_address {
-                PdnAddress::Ipv4(a) | PdnAddress::Ipv4v6(_, a) => break (b.ebi, a),
-                other => {
-                    log::warn!(
-                        "default bearer PDN address {other:?}: no IPv4 for the TUN interface"
-                    );
-                    return;
-                }
-            }
+        if let Some(b) = bearer_ipv4(&status) {
+            break b;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
+    let netmask = Ipv4Addr::new(255, 255, 255, 255);
     let config = TunConfig {
         name: Some(settings.name.unwrap_or_else(|| format!("lteuetun{ebi}"))),
         address: Some(address),
-        netmask: Some(Ipv4Addr::new(255, 255, 255, 255)),
+        netmask: Some(netmask),
         configure_routing: settings.configure_routing,
         psi: Some(ebi),
         ..TunConfig::default()
@@ -134,9 +143,32 @@ async fn tun_bridge(
             }
         }
     });
-    while let Some(p) = dl_rx.recv().await {
-        if let Err(e) = tun.send(&p).await {
-            log::warn!("TUN write failed: {e}");
+    let mut current = address;
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            p = dl_rx.recv() => {
+                let Some(p) = p else { return };
+                if let Err(e) = tun.send(&p).await {
+                    log::warn!("TUN write failed: {e}");
+                }
+            }
+            _ = poll.tick() => {
+                let Some((ebi, a)) = bearer_ipv4(&status) else { continue };
+                if a == current {
+                    continue;
+                }
+                match tun.set_ipv4_address(a, netmask) {
+                    Ok(()) => {
+                        log::info!(
+                            "default bearer EBI {ebi} re-established: TUN interface {} now {a} (was {current})",
+                            tun.name()
+                        );
+                        current = a;
+                    }
+                    Err(e) => log::error!("cannot re-address the TUN interface: {e}"),
+                }
+            }
         }
     }
 }

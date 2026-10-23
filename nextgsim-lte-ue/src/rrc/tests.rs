@@ -9,6 +9,7 @@ struct Seen {
     initial_asked: usize,
     indications: Vec<RrcIndication>,
     downlink: Vec<Vec<u8>>,
+    uplink_pending: usize,
 }
 
 /// A NAS that requests a connection with a fixed message, echoes a fixed
@@ -18,6 +19,8 @@ struct Scripted {
     initial: Option<Vec<u8>>,
     reply: Option<Vec<u8>>,
     k_enb: Option<[u8; 32]>,
+    /// The initial message NAS asks for once told uplink data is pending.
+    on_pending: Option<Vec<u8>>,
 }
 
 impl NasLayer for Scripted {
@@ -39,6 +42,12 @@ impl NasLayer for Scripted {
     fn k_enb(&mut self) -> Option<[u8; 32]> {
         self.k_enb
     }
+    fn on_uplink_pending(&mut self) {
+        self.seen.lock().unwrap().uplink_pending += 1;
+        if let Some(m) = self.on_pending.take() {
+            self.initial = Some(m);
+        }
+    }
 }
 
 fn plmn() -> Plmn {
@@ -52,6 +61,7 @@ fn ue(initial: Option<&[u8]>) -> (UeRrc, Arc<Mutex<Seen>>) {
         initial: initial.map(<[u8]>::to_vec),
         reply: Some(vec![0x07, 0x53]),
         k_enb: Some(K_ENB),
+        on_pending: None,
     };
     (
         UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A)),
@@ -395,6 +405,13 @@ fn after_reconfiguration_nas_uses_srb2_and_ip_crosses_the_drb() {
         "ReconfigurationComplete goes on SRB1: {acts:?}"
     );
     assert_eq!(u.drbs(), vec![drb]);
+    assert!(
+        seen.lock()
+            .unwrap()
+            .indications
+            .contains(&RrcIndication::RadioBearersEstablished),
+        "NAS is told the user plane radio bearers are set up (TS 24.301 §5.6.1.4)"
+    );
 
     // Downlink NAS on SRB2 (BEARER 1, SRB1's keys); the reply comes back on SRB2.
     let mut srb2 = LteSrbPdcp::with_bearer(1, DIRECTION_DOWNLINK);
@@ -450,7 +467,7 @@ fn after_reconfiguration_nas_uses_srb2_and_ip_crosses_the_drb() {
     let mut enb_rx = LteUmRx::new(DRB_T_REORDERING);
     let mut enb_tx = LteUmTx::new();
     let ip = vec![0x45, 0, 0, 20, 7, 7, 7, 7];
-    let ul = u.send_ip(&ip);
+    let ul = u.send_ip(&ip, Instant::now());
     let [UeAction::Data {
         cell: CELL,
         lcid: 3,
@@ -468,4 +485,36 @@ fn after_reconfiguration_nas_uses_srb2_and_ip_crosses_the_drb() {
     );
     // A data PDU on an LCID with no DRB is not delivered.
     assert!(u.on_data(CELL, 4, &down, now).is_empty());
+}
+
+/// TS 24.301 §5.6.1.1 b: an uplink IP packet in RRC_IDLE has no DRB to go
+/// on; RRC tells NAS uplink data is pending and establishes the connection
+/// NAS then asks for (the SERVICE REQUEST).
+#[test]
+fn an_idle_uplink_packet_makes_nas_request_a_connection() {
+    let now = Instant::now();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let nas = Scripted {
+        seen: Arc::clone(&seen),
+        initial: None,
+        reply: None,
+        k_enb: Some(K_ENB),
+        on_pending: Some(vec![0xC7, 0x02, 0xAB, 0xCD]),
+    };
+    let mut u = UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A));
+    assert!(acquire(&mut u, cell_info(), true, now).is_empty());
+    assert_eq!(u.state(), UeRrcState::Camped { cell: CELL });
+    let acts = u.send_ip(&[0x45, 0, 0, 20], now);
+    assert_eq!(seen.lock().unwrap().uplink_pending, 1);
+    assert!(
+        matches!(
+            acts.as_slice(),
+            [UeAction::Rrc {
+                channel: RrcChannel::UlCcch,
+                ..
+            }]
+        ),
+        "RRCConnectionRequest for the pending data: {acts:?}"
+    );
+    assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
 }

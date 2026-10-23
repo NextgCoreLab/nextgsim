@@ -189,6 +189,23 @@ impl TunInterface {
         Ok(())
     }
 
+    /// Replaces the interface's IPv4 address, keeping the interface (its name,
+    /// its routes by device, and any reader) in place: what a UE needs when a
+    /// re-established PDN connection brings a new address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address cannot be set.
+    pub fn set_ipv4_address(&self, address: Ipv4Addr, netmask: Ipv4Addr) -> Result<(), TunError> {
+        self.device
+            .set_network_address(address, netmask, None::<Ipv4Addr>)
+            .map_err(|e| {
+                TunError::ConfigureFailed(format!("failed to set network address: {e}"))
+            })?;
+        info!(name = %self.name, address = %address, "TUN interface re-addressed");
+        Ok(())
+    }
+
     /// Returns the name of the TUN interface.
     #[must_use]
     pub fn name(&self) -> &str {
