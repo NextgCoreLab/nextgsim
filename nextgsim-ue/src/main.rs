@@ -975,11 +975,16 @@ impl UeApp {
                         }
                         NasMessage::ActiveCellChanged {
                             previous_tai,
+                            serving_tai,
                             available_plmns: reported_plmns,
                             serving_plmn: reported_serving_plmn,
                             cell_category,
                         } => {
-                            info!("Active cell changed from TAI: {:?}", previous_tai);
+                            info!(
+                                "Active cell changed from TAI: {:?} to {:?}",
+                                previous_tai, serving_tai
+                            );
+                            orch.set_serving_tai(serving_tai.encode());
                             // Refresh the selector's available-PLMN candidate set
                             // from the radio report (TS 23.122 §4.4.3); an empty
                             // report leaves the last-known set in place.
@@ -992,7 +997,14 @@ impl UeApp {
                             if let Some(plmn) = reported_serving_plmn {
                                 plmn_selector.set_serving_plmn(Some(plmn));
                             }
-                            if orch.state().is_registered() {
+                            if orch.state().is_registered()
+                                // A failed update already has its retry
+                                // scheduled on T3511/T3502 (TS 24.501
+                                // §5.5.1.3.7, nextgsim #277): re-camping must not
+                                // bypass it.
+                                && !orch.timers().t3511.is_running()
+                                && !orch.timers().t3502.is_running()
+                            {
                                 // Mobility registration update trigger
                                 // (TS 24.501 Section 5.5.1.3.2)
                                 let outs = orch.start_registration(

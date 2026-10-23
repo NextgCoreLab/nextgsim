@@ -352,6 +352,12 @@ pub enum NasMessage {
     ActiveCellChanged {
         /// Previous TAI
         previous_tai: Tai,
+        /// TAI of the cell the UE is now camped on, from its SIB1 (PLMN + TAC).
+        ///
+        /// NAS needs it to tell whether the serving cell's TA is in its TAI
+        /// list, which decides the 5GMM substate after a failed registration
+        /// update (TS 24.501 §5.5.1.3.7, #277).
+        serving_tai: Tai,
         /// PLMNs currently available on the radio (broadcast by the cells the
         /// UE can detect), reported by the RRC CellSelector for TS 23.122
         /// §4.4.3 automatic PLMN selection. Empty if none are known yet.

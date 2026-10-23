@@ -1115,6 +1115,9 @@ impl RrcTask {
                     .nas_tx
                     .send(NasMessage::ActiveCellChanged {
                         previous_tai: old_tai,
+                        // Read after `serving_cell_id` was updated above, so this
+                        // is the NEW cell's TAI (#277).
+                        serving_tai: self.get_current_tai(),
                         // Report the PLMNs the UE can currently see so NAS can
                         // run TS 23.122 §4.4.3 selection over the real radio
                         // rather than a hardcoded home-PLMN list.
