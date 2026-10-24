@@ -38,6 +38,60 @@ pub const AMF_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// and the association to the old address is treated as lost.
 pub const AMF_RERESOLVE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Upper bound on one connection attempt (resolve + SCTP association setup).
+///
+/// The attempt runs off the task loop (#311), so this does not stall other
+/// associations; it only bounds how long one black-holed AMF holds its own
+/// retry slot. The userspace backend's own INIT timeout is 30 s, so this is a
+/// little above it rather than cutting it short.
+pub const AMF_CONNECT_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// The result of one connection attempt, sent back to the task loop (#311).
+struct ConnectOutcome {
+    client_id: i32,
+    /// Which attempt this was: an outcome whose attempt is no longer the
+    /// current one (the target was closed or replaced meanwhile) is discarded.
+    attempt: u64,
+    result: Result<(AmfConnection, AmfConnectionEvent), String>,
+}
+
+/// The result of one round of hostname re-resolution (#311).
+type ReresolveOutcome = Vec<(i32, PeerAddr, std::io::Result<Vec<SocketAddr>>)>;
+
+/// How a target's address is resolved: DNS, or (tests) a fixed answer.
+#[derive(Clone, Default)]
+struct Resolver {
+    #[cfg(test)]
+    override_addrs: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
+    /// Test seam: a hostname lookup that never answers, as against an
+    /// unreachable DNS server.
+    #[cfg(test)]
+    hang: bool,
+}
+
+impl Resolver {
+    async fn resolve(&self, remote: &PeerAddr) -> std::io::Result<Vec<SocketAddr>> {
+        #[cfg(test)]
+        if let PeerAddr::Host(..) = remote {
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            if let Some(over) = &self.override_addrs {
+                let addrs = over.lock().unwrap().clone();
+                return if addrs.is_empty() {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "override: none",
+                    ))
+                } else {
+                    Ok(addrs)
+                };
+            }
+        }
+        remote.resolve().await
+    }
+}
+
 /// What the gNB was asked to connect to, kept so it can reconnect (issue #286).
 #[derive(Debug, Clone)]
 struct AmfTarget {
@@ -61,14 +115,24 @@ pub struct SctpTask {
     last_reresolve: Instant,
     reconnect_delay: Duration,
     reresolve_interval: Duration,
-    /// Test seam: answers resolution instead of DNS when set.
-    #[cfg(test)]
-    resolve_override: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
+    connect_timeout: Duration,
+    resolver: Resolver,
+    /// Targets with a connection attempt in flight, and that attempt's number.
+    connecting: HashMap<i32, u64>,
+    next_attempt: u64,
+    connect_tx: mpsc::UnboundedSender<ConnectOutcome>,
+    connect_rx: mpsc::UnboundedReceiver<ConnectOutcome>,
+    /// Whether a re-resolution round is in flight; one at a time.
+    reresolving: bool,
+    reresolve_tx: mpsc::UnboundedSender<ReresolveOutcome>,
+    reresolve_rx: mpsc::UnboundedReceiver<ReresolveOutcome>,
 }
 
 impl SctpTask {
     /// Creates a new SCTP task
     pub fn new(task_base: GnbTaskBase) -> Self {
+        let (connect_tx, connect_rx) = mpsc::unbounded_channel();
+        let (reresolve_tx, reresolve_rx) = mpsc::unbounded_channel();
         Self {
             task_base,
             connections: HashMap::new(),
@@ -77,26 +141,16 @@ impl SctpTask {
             last_reresolve: Instant::now(),
             reconnect_delay: AMF_RECONNECT_DELAY,
             reresolve_interval: AMF_RERESOLVE_INTERVAL,
-            #[cfg(test)]
-            resolve_override: None,
+            connect_timeout: AMF_CONNECT_TIMEOUT,
+            resolver: Resolver::default(),
+            connecting: HashMap::new(),
+            next_attempt: 0,
+            connect_tx,
+            connect_rx,
+            reresolving: false,
+            reresolve_tx,
+            reresolve_rx,
         }
-    }
-
-    /// Resolve a target's AMF address; a literal resolves to itself.
-    async fn resolve(&self, remote: &PeerAddr) -> std::io::Result<Vec<SocketAddr>> {
-        #[cfg(test)]
-        if let (Some(over), PeerAddr::Host(..)) = (&self.resolve_override, remote) {
-            let addrs = over.lock().unwrap().clone();
-            return if addrs.is_empty() {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "override: none",
-                ))
-            } else {
-                Ok(addrs)
-            };
-        }
-        remote.resolve().await
     }
 
     /// A connection failed or was lost: tell NGAP (which releases the AMF's UE
@@ -116,6 +170,12 @@ impl SctpTask {
 
     /// Reconnect due targets, and re-resolve connected hostname targets to
     /// detect an AMF that moved (issue #286).
+    ///
+    /// Neither waits on the network here (#311): a reconnect spawns its attempt
+    /// ([`Self::connect_target`]) and a re-resolution round runs as its own task,
+    /// whose answer comes back through [`Self::apply_reresolution`]. This loop
+    /// also carries every other association's NGAP traffic, and a DNS lookup or
+    /// SCTP INIT toward a black-holed AMF used to stall it for seconds.
     async fn maintain_targets(&mut self) {
         let now = Instant::now();
         let due: Vec<i32> = self
@@ -131,7 +191,7 @@ impl SctpTask {
             }
         }
 
-        if now.duration_since(self.last_reresolve) < self.reresolve_interval {
+        if self.reresolving || now.duration_since(self.last_reresolve) < self.reresolve_interval {
             return;
         }
         self.last_reresolve = now;
@@ -141,12 +201,36 @@ impl SctpTask {
             .filter(|(id, t)| t.remote.is_hostname() && self.connections.contains_key(id))
             .map(|(id, t)| (*id, t.remote.clone()))
             .collect();
-        for (client_id, remote) in named {
+        if named.is_empty() {
+            return;
+        }
+        self.reresolving = true;
+        let resolver = self.resolver.clone();
+        let tx = self.reresolve_tx.clone();
+        tokio::spawn(async move {
+            let mut out = Vec::with_capacity(named.len());
+            for (client_id, remote) in named {
+                let result = resolver.resolve(&remote).await;
+                out.push((client_id, remote, result));
+            }
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Act on one round of re-resolution: an association whose AMF now
+    /// resolves elsewhere is treated as lost and reconnected (issue #286).
+    async fn apply_reresolution(&mut self, results: ReresolveOutcome) {
+        self.reresolving = false;
+        for (client_id, remote, result) in results {
             // A lookup failure is not evidence the AMF moved (the record can be
             // briefly absent while a pod turns over); only a different answer is.
-            let Ok(addrs) = self.resolve(&remote).await else {
+            let Ok(addrs) = result else {
                 continue;
             };
+            // The answer is for the target as it was when the round started.
+            if self.targets.get(&client_id).map(|t| &t.remote) != Some(&remote) {
+                continue;
+            }
             let Some(current) = self
                 .connections
                 .get(&client_id)
@@ -161,8 +245,7 @@ impl SctpTask {
                     client_id, remote, addrs, current
                 );
                 // Dropped, not shut down: the old address no longer answers,
-                // and a graceful SHUTDOWN would block this task until it times
-                // out.
+                // and a graceful SHUTDOWN would wait for it to time out.
                 self.on_link_lost(client_id).await;
                 // Reconnect now: the new address is already known.
                 self.reconnect_due.insert(client_id, Instant::now());
@@ -213,13 +296,22 @@ impl SctpTask {
             },
         );
         self.reconnect_due.remove(&client_id);
+        // A request for a target replaces it: an attempt still in flight for the
+        // previous one is now stale and its outcome is discarded.
+        self.connecting.remove(&client_id);
         self.connect_target(client_id).await;
     }
 
-    /// One connection attempt to a stored target, resolving its address afresh
-    /// (issue #286). A failure is reported to NGAP and retried after
-    /// [`AMF_RECONNECT_DELAY`].
+    /// Start one connection attempt to a stored target, resolving its address
+    /// afresh (issue #286). The attempt runs as its own task (#311) and reports
+    /// back through [`Self::on_connect_outcome`]; a failure is reported to NGAP
+    /// and retried after [`AMF_RECONNECT_DELAY`].
+    ///
+    /// At most one attempt per target is in flight.
     async fn connect_target(&mut self, client_id: i32) {
+        if self.connecting.contains_key(&client_id) {
+            return;
+        }
         let Some(target) = self.targets.get(&client_id).cloned() else {
             return;
         };
@@ -237,23 +329,6 @@ impl SctpTask {
                 return;
             }
         };
-        let remote_addr: SocketAddr = match self.resolve(&target.remote).await {
-            Ok(addrs) => addrs[0],
-            Err(e) => {
-                warn!(
-                    "AMF {} ({}) does not resolve yet: {}; retrying in {:?}",
-                    client_id, target.remote, e, self.reconnect_delay
-                );
-                self.on_link_lost(client_id).await;
-                return;
-            }
-        };
-        if target.remote.is_hostname() {
-            info!(
-                "AMF {} ({}) resolved to {}",
-                client_id, target.remote, remote_addr
-            );
-        }
 
         // Resolve secondary addresses from the gNB config using client_id as
         // an index into amf_configs.  An out-of-range client_id means no
@@ -304,25 +379,72 @@ impl SctpTask {
             SctpBackendKind::Kernel => SctpBackend::Kernel,
         };
 
-        // Build the full connection config.
-        let conn_config = AmfConnectionConfig {
-            local_address: local_addr,
-            remote_address: remote_addr,
-            secondary_addresses,
-            sctp_config: SctpConfig {
-                backend,
-                ..SctpConfig::default()
-            },
-        };
+        self.next_attempt += 1;
+        let attempt = self.next_attempt;
+        self.connecting.insert(client_id, attempt);
+        let resolver = self.resolver.clone();
+        let tx = self.connect_tx.clone();
+        let connect_timeout = self.connect_timeout;
+        let remote = target.remote;
+        tokio::spawn(async move {
+            let work = async {
+                let remote_addr = match resolver.resolve(&remote).await {
+                    Ok(addrs) => addrs[0],
+                    Err(e) => return Err(format!("{remote} does not resolve yet: {e}")),
+                };
+                if remote.is_hostname() {
+                    info!("AMF {} ({}) resolved to {}", client_id, remote, remote_addr);
+                }
+                let conn_config = AmfConnectionConfig {
+                    local_address: local_addr,
+                    remote_address: remote_addr,
+                    secondary_addresses,
+                    sctp_config: SctpConfig {
+                        backend,
+                        ..SctpConfig::default()
+                    },
+                };
+                let mut connection = AmfConnection::new(client_id, conn_config.clone());
+                match connection.connect(&conn_config).await {
+                    Ok(event) => Ok((connection, event)),
+                    Err(e) => Err(format!("connect to {remote_addr}: {e}")),
+                }
+            };
+            let result = match tokio::time::timeout(connect_timeout, work).await {
+                Ok(r) => r,
+                Err(_) => Err(format!(
+                    "{remote}: no association within {connect_timeout:?}"
+                )),
+            };
+            let _ = tx.send(ConnectOutcome {
+                client_id,
+                attempt,
+                result,
+            });
+        });
+    }
 
-        // Create and connect.
-        let mut connection = AmfConnection::new(client_id, conn_config.clone());
-        match connection.connect(&conn_config).await {
-            Ok(event) => {
-                // Store the connection
+    /// A connection attempt finished (#311).
+    async fn on_connect_outcome(&mut self, outcome: ConnectOutcome) {
+        let ConnectOutcome {
+            client_id,
+            attempt,
+            result,
+        } = outcome;
+        let current = self.connecting.get(&client_id) == Some(&attempt)
+            && self.targets.contains_key(&client_id);
+        if !current {
+            // The target was closed or replaced while this attempt ran.
+            if let Ok((mut connection, _)) = result {
+                debug!("AMF {client_id}: discarding the association of a superseded attempt");
+                let _ = connection.close().await;
+            }
+            return;
+        }
+        self.connecting.remove(&client_id);
+        match result {
+            Ok((connection, event)) => {
                 self.connections.insert(client_id, connection);
-
-                // Route association up event to NGAP task
                 if let AmfConnectionEvent::AssociationUp {
                     client_id,
                     association_id,
@@ -335,9 +457,9 @@ impl SctpTask {
                 }
             }
             Err(e) => {
-                error!(
-                    "Failed to connect to AMF at {}: {}; retrying in {:?}",
-                    remote_addr, e, self.reconnect_delay
+                warn!(
+                    "AMF {}: connection attempt failed ({}); retrying in {:?}",
+                    client_id, e, self.reconnect_delay
                 );
                 // Notify NGAP task of connection failure, and retry.
                 self.on_link_lost(client_id).await;
@@ -348,6 +470,8 @@ impl SctpTask {
     /// Handles a connection close request
     async fn handle_connection_close(&mut self, client_id: i32) {
         info!("SCTP connection close request (client_id: {})", client_id);
+        // An attempt still in flight is now stale.
+        self.connecting.remove(&client_id);
 
         if let Some(mut connection) = self.connections.remove(&client_id) {
             if let Err(e) = connection.close().await {
@@ -595,6 +719,16 @@ impl Task for SctpTask {
                     }
                 }
 
+                // A connection attempt finished (#311).
+                Some(outcome) = self.connect_rx.recv() => {
+                    self.on_connect_outcome(outcome).await;
+                }
+
+                // A re-resolution round finished (#311).
+                Some(results) = self.reresolve_rx.recv() => {
+                    self.apply_reresolution(results).await;
+                }
+
                 // Poll connections periodically
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
                     self.poll_connections().await;
@@ -769,7 +903,7 @@ mod tests {
         task.reconnect_delay = Duration::from_millis(100);
         task.reresolve_interval = Duration::from_millis(200);
         let dns = std::sync::Arc::new(std::sync::Mutex::new(vec![a]));
-        task.resolve_override = Some(dns.clone());
+        task.resolver.override_addrs = Some(dns.clone());
 
         let (tx, rx) = mpsc::channel(16);
         let runner = tokio::spawn(async move { task.run(rx).await });
@@ -817,7 +951,7 @@ mod tests {
         let mut task = SctpTask::new(task_base);
         task.reconnect_delay = Duration::from_millis(100);
         let dns = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        task.resolve_override = Some(dns.clone());
+        task.resolver.override_addrs = Some(dns.clone());
 
         let (tx, rx) = mpsc::channel(16);
         let runner = tokio::spawn(async move { task.run(rx).await });
@@ -848,6 +982,112 @@ mod tests {
         }
         tx.send(TaskMessage::Shutdown).await.unwrap();
         let _ = runner.await;
+    }
+
+    /// #311: a hostname target whose DNS lookup never answers (an unreachable
+    /// resolver) does not stall the task loop: an association to another AMF
+    /// still comes up, and an NGAP message on it still reaches that AMF at once.
+    /// Before, resolve and connect ran inline in the loop.
+    #[tokio::test]
+    async fn a_hanging_resolver_does_not_delay_another_association() {
+        // AMF 2: a stand-in that reports what it receives.
+        let mut server =
+            nextgsim_sctp::SctpServer::bind("127.0.0.1:0".parse().unwrap(), Default::default())
+                .await
+                .expect("bind AMF stand-in");
+        let amf2 = server.local_addr();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        server.set_event_sender(ev_tx);
+        let _amf2_task = tokio::spawn(async move {
+            loop {
+                let _ = server.recv(Duration::from_millis(20)).await;
+            }
+        });
+
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = SctpTask::new(task_base);
+        task.resolver.hang = true; // every hostname lookup hangs
+        let (tx, rx) = mpsc::channel(16);
+        let runner = tokio::spawn(async move { task.run(rx).await });
+
+        // AMF 1 by hostname (hangs), then AMF 2 by literal address.
+        for (client_id, remote) in [(1, "amf1.test".to_string()), (2, amf2.ip().to_string())] {
+            tx.send(TaskMessage::Message(SctpMessage::ConnectionRequest {
+                client_id,
+                local_address: "127.0.0.1".into(),
+                local_port: 0,
+                remote_address: remote,
+                remote_port: amf2.port(),
+                ppid: nextgsim_sctp::NGAP_PPID,
+            }))
+            .await
+            .unwrap();
+        }
+        let started = Instant::now();
+        assert!(matches!(
+            next_association_event(&mut ngap_rx).await,
+            NgapMessage::SctpAssociationUp { client_id: 2, .. }
+        ));
+        tx.send(TaskMessage::Message(SctpMessage::SendMessage {
+            client_id: 2,
+            stream: 0,
+            buffer: OctetString::from_slice(&[0xAB, 0xCD]),
+        }))
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(nextgsim_sctp::ServerEvent::DataReceived { message, .. }) =
+                    ev_rx.recv().await
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("AMF 2 receives the message while AMF 1's lookup hangs");
+        assert_eq!(&got.data[..], &[0xAB, 0xCD]);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    }
+
+    /// #311: an attempt's outcome for a target that was closed meanwhile is
+    /// discarded, not installed as a live association.
+    #[tokio::test]
+    async fn a_superseded_connect_outcome_is_discarded() {
+        let (amf, _amf_task) = amf_stand_in("127.0.0.1:0".parse().unwrap()).await;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = SctpTask::new(task_base);
+        task.handle_connection_request(
+            4,
+            "127.0.0.1".into(),
+            0,
+            amf.ip().to_string(),
+            amf.port(),
+            nextgsim_sctp::NGAP_PPID,
+        )
+        .await;
+        assert!(task.connecting.contains_key(&4), "the attempt is in flight");
+        // Closed before the attempt reports.
+        task.targets.remove(&4);
+        task.handle_connection_close(4).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task.connect_rx.recv())
+            .await
+            .expect("the attempt reports")
+            .expect("channel open");
+        task.on_connect_outcome(outcome).await;
+        assert!(
+            task.connections.is_empty(),
+            "no association for a closed target"
+        );
+        assert!(ngap_rx.try_recv().is_err(), "nothing reported to NGAP");
     }
 
     #[tokio::test]

@@ -88,6 +88,9 @@ impl Default for RlsTaskConfig {
     }
 }
 
+/// One round of gNB hostname resolutions, in `gnb_search_hosts` order (#311).
+type HostResolutions = Vec<(PeerAddr, std::io::Result<Vec<SocketAddr>>)>;
+
 /// RLS Task for managing radio link simulation on UE side
 pub struct RlsTask {
     task_base: UeTaskBase,
@@ -100,6 +103,13 @@ pub struct RlsTask {
     /// The last successful resolution of each `gnb_search_hosts` entry (#286).
     /// A failed lookup keeps the previous answer rather than emptying it.
     resolved_hosts: HashMap<PeerAddr, Vec<SocketAddr>>,
+    /// Whether a re-resolution round is in flight; at most one (#311).
+    resolving: bool,
+    resolve_tx: mpsc::UnboundedSender<HostResolutions>,
+    resolve_rx: mpsc::UnboundedReceiver<HostResolutions>,
+    /// Test seam: hostname lookups never answer, as against an unreachable DNS.
+    #[cfg(test)]
+    resolve_hang: bool,
     /// Rate limiter for the "PDU from unknown source" warning. Bounded (#314).
     unknown_sources: UnknownSourceWarner,
     sti: u64,
@@ -224,6 +234,7 @@ impl RlsTask {
         cell_search.set_heartbeat_interval(config.heartbeat_interval);
         cell_search.set_heartbeat_threshold(config.heartbeat_threshold);
 
+        let (resolve_tx, resolve_rx) = mpsc::unbounded_channel();
         Self {
             task_base,
             cell_search,
@@ -233,6 +244,11 @@ impl RlsTask {
             socket: None,
             config,
             resolved_hosts: HashMap::new(),
+            resolving: false,
+            resolve_tx,
+            resolve_rx,
+            #[cfg(test)]
+            resolve_hang: false,
             unknown_sources: UnknownSourceWarner::new(Instant::now()),
             sti,
             rlc_entities: HashMap::new(),
@@ -313,10 +329,44 @@ impl RlsTask {
     /// space if any answer changed (issue #286). A gNB pod that restarts comes
     /// back at a new address; the cell at the old one stops answering and is
     /// lost as usual, and the new one is discovered by the next heartbeat.
-    async fn reresolve_search_hosts(&mut self) {
+    /// Start a round of resolving every `gnb_search_hosts` entry, off the task
+    /// loop (#311). The answers arrive through `resolve_rx` and are applied by
+    /// [`Self::apply_resolutions`].
+    ///
+    /// This loop also carries the user plane and the RLS heartbeats; a lookup
+    /// against an unreachable DNS server used to stall it for up to 2 s per
+    /// hostname every 5 s, which risks a spurious radio link failure. One round
+    /// at a time: a round still waiting on DNS is not stacked on.
+    fn start_reresolve(&mut self) {
+        if self.resolving || self.config.gnb_search_hosts.is_empty() {
+            return;
+        }
+        self.resolving = true;
+        let hosts = self.config.gnb_search_hosts.clone();
+        let tx = self.resolve_tx.clone();
+        #[cfg(test)]
+        let hang = self.resolve_hang;
+        tokio::spawn(async move {
+            #[cfg(test)]
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            let mut out = Vec::with_capacity(hosts.len());
+            for host in hosts {
+                let result = host.resolve().await;
+                out.push((host, result));
+            }
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Apply one round of resolutions (#286): a changed answer replaces the
+    /// host's addresses in the search space; a failed lookup keeps the old one.
+    fn apply_resolutions(&mut self, results: HostResolutions) {
+        self.resolving = false;
         let mut changed = false;
-        for host in self.config.gnb_search_hosts.clone() {
-            match host.resolve().await {
+        for (host, result) in results {
+            match result {
                 Ok(addrs) => {
                     if self.resolved_hosts.get(&host) != Some(&addrs) {
                         info!("gNB {host} resolves to {addrs:?}");
@@ -331,6 +381,17 @@ impl RlsTask {
             let space = self.effective_search_space();
             self.cell_search.set_search_space(space);
         }
+    }
+
+    /// Resolve every hostname now and apply the answers, awaiting them.
+    #[cfg(test)]
+    async fn reresolve_search_hosts(&mut self) {
+        let mut out = Vec::new();
+        for host in self.config.gnb_search_hosts.clone() {
+            let result = host.resolve().await;
+            out.push((host, result));
+        }
+        self.apply_resolutions(out);
     }
 
     pub fn cell_count(&self) -> usize {
@@ -622,7 +683,7 @@ impl RlsTask {
             self.serving_cell = None;
             self.transport.clear_serving_endpoint();
             // The serving gNB may have restarted at a new address (#286).
-            self.reresolve_search_hosts().await;
+            self.start_reresolve();
             let _ = self
                 .task_base
                 .rrc_tx
@@ -1306,9 +1367,11 @@ impl Task for RlsTask {
             error!("Failed to initialize RLS socket: {}", e);
             return;
         }
-        // Hostnames are resolved before the first heartbeat; one that does not
-        // resolve yet is retried on `resolve_timer` (#286).
-        self.reresolve_search_hosts().await;
+        // Hostnames are resolved off the loop (#311): the first heartbeats go to
+        // the literal addresses, and a hostname joins the search space as soon as
+        // it answers. One that does not resolve yet is retried on
+        // `resolve_timer` (#286).
+        self.start_reresolve();
         info!(
             "RLS task started with {} gNB address(es) and {} gNB hostname(s) in search list",
             self.config.gnb_search_list.len(),
@@ -1347,7 +1410,8 @@ impl Task for RlsTask {
                     }
                 }
                 _ = heartbeat_timer.tick() => self.send_heartbeats().await,
-                _ = resolve_timer.tick(), if has_hosts => self.reresolve_search_hosts().await,
+                _ = resolve_timer.tick(), if has_hosts => self.start_reresolve(),
+                Some(results) = self.resolve_rx.recv() => self.apply_resolutions(results),
                 _ = lost_cell_timer.tick() => {
                     self.check_lost_cells().await;
                     self.send_pending_acks().await;
@@ -1598,6 +1662,45 @@ mod tests {
                 "gnb.example.svc.cluster.local".into(),
                 DEFAULT_RLS_PORT
             )]
+        );
+    }
+
+    /// #311: with DNS unreachable, the RLS loop keeps running -- heartbeats keep
+    /// going to the literal gNB at their interval -- and a second round is not
+    /// stacked on the first. Before, the lookup ran inline in the loop.
+    #[tokio::test]
+    async fn a_hanging_resolver_does_not_stall_the_rls_loop() {
+        let gnb = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, rls_rx) = UeTaskBase::new(test_config(), 16);
+        let rls_config = RlsTaskConfig {
+            gnb_search_list: vec![gnb.local_addr().unwrap()],
+            gnb_search_hosts: vec![PeerAddr::Host("gnb.test".into(), 4997)],
+            reresolve_interval: Duration::from_millis(50),
+            bind_address: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut task = RlsTask::new(task_base, rls_config);
+        task.resolve_hang = true;
+        task.start_reresolve();
+        assert!(task.resolving);
+        task.start_reresolve(); // not stacked: still one round in flight
+        assert!(task.resolving);
+        let runner = tokio::spawn(async move { task.run(rls_rx).await });
+
+        let mut buf = [0u8; 2048];
+        let mut heartbeats = 0;
+        // The loop heartbeats every HEARTBEAT_INTERVAL_MS (1 s), starting at once.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+        while heartbeats < 3 {
+            match tokio::time::timeout_at(deadline, gnb.recv_from(&mut buf)).await {
+                Ok(Ok(_)) => heartbeats += 1,
+                _ => break,
+            }
+        }
+        runner.abort();
+        assert!(
+            heartbeats >= 3,
+            "heartbeats kept flowing while every lookup hung: {heartbeats}"
         );
     }
 
