@@ -464,6 +464,12 @@ impl GnbCellTracker {
         self.channel_model.estimate_dbm(&self.phy_location, ue_pos)
     }
 
+    /// The distance in metres from this gNB to `ue_pos`.
+    #[must_use]
+    pub fn distance_m(&self, ue_pos: &SimCoord) -> f64 {
+        crate::channel::distance_m(&self.phy_location, ue_pos)
+    }
+
     /// Processes a heartbeat from a UE
     ///
     /// Returns the heartbeat acknowledgment to send and any events generated
