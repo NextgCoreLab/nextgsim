@@ -2140,6 +2140,16 @@ impl RrcTask {
                 {
                     self.send_reestablishment_request(cell_id).await;
                 }
+            } else if self.reestablishment_proc.state() == ReestablishmentState::CellSearch
+                && self.serving_cell_id.is_none()
+            {
+                // T311 runs, and a cell's essential system information has just
+                // arrived: select now rather than at the next throttled cycle.
+                // T311 is as short as 1 s (the gNB broadcasts ms1000), less than
+                // the selection interval, so waiting for the cycle let it expire
+                // with a suitable cell in hand (seen on real binaries, #348).
+                self.last_cell_selection = None;
+                self.perform_cell_selection().await;
             }
         }
     }
@@ -10650,6 +10660,39 @@ mod tests {
                 compute_short_mac_i(&security, source_pci, 0x20).unwrap(),
                 "the shortMAC-I covers the identity the SIB1 broadcast"
             );
+        });
+    }
+
+    /// #348 real-binary run: the broadcast T311 is 1 s, less than the cell
+    /// selection interval. A cell whose SIB1 arrives during T311 is selected at
+    /// once, not at the next throttled cycle, so the request goes before T311
+    /// expires.
+    #[test]
+    fn a_sib1_arriving_during_t311_selects_the_cell_at_once() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment_request;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 1, 2000).await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            task.handle_signal_changed(1, i32::MIN).await;
+            // A cycle with no cell: the selection throttle is now armed.
+            task.perform_cycle().await;
+            assert!(next_uplink_rrc_opt(&mut rls_rx).is_none());
+
+            task.handle_signal_changed(2, -60).await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_nci(0x20)),
+            )
+            .await;
+            let (channel, bytes) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch, "no wait for the next cycle");
+            decode_rrc_reestablishment_request(bytes.data()).expect("a request");
+            assert_eq!(task.serving_cell_id, Some(2));
         });
     }
 
