@@ -215,6 +215,7 @@ fn enb_config(port: u16, plmn: Plmn) -> EnbConfig {
         // S1-U on its own loopback address: port 2152 on 127.0.0.1 belongs to
         // whatever else runs GTP-U on this host (the EPC's SGW-U is 127.0.0.6).
         gtp_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 10))),
+        inactivity_timer_secs: None,
     }
 }
 

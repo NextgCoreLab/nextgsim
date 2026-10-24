@@ -10,6 +10,10 @@ description = "EPS NAS (TS 24.301 EMM/ESM, UE side) for the nextgsim LTE UE"
 [lints]
 workspace = true
 
+[features]
+# The scripted MME in `testing`, for other crates' tests.
+testing = []
+
 [dependencies]
 nextgsim-common.workspace = true
 nextgsim-crypto.workspace = true

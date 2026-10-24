@@ -39,6 +39,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use nextgsim_common::Plmn;
 use nextgsim_crypto::eps_kdf::{derive_algorithm_key, EpsAlgorithmType};
@@ -97,6 +98,15 @@ pub enum Action {
         ue: u32,
         /// The E-RABs.
         bearers: Vec<UpBearer>,
+    },
+    /// Broadcast an RRC PDU on a common channel to every UE the cell hears
+    /// (PCCH paging, TS 36.331 §5.3.2). RLS has no paging occasions, so it goes
+    /// out at once.
+    Broadcast {
+        /// Logical channel.
+        channel: RrcChannel,
+        /// The RRC message.
+        pdu: Vec<u8>,
     },
     /// Send an S1AP PDU to the MME on `stream`.
     S1 {
@@ -180,6 +190,15 @@ struct UeContext {
     security: Option<AsSecurity>,
     ics: Option<PendingIcs>,
     drbs: Vec<DrbConfig>,
+    /// The last user data or signalling to or from the UE, for the
+    /// user-inactivity release (#350).
+    last_activity: Instant,
+    /// When a UE CONTEXT RELEASE REQUEST (user-inactivity) went out (#350). It
+    /// is not sent again while the MME's command is awaited, but a request is
+    /// re-armed when activity follows it (the MME kept the UE connected) or when
+    /// no command came within one more inactivity period (the request or the
+    /// command was lost), so a UE is never left connected for good (#353 review).
+    inactivity_release_requested_at: Option<Instant>,
 }
 
 impl UeContext {
@@ -207,6 +226,8 @@ pub struct EnbRrc {
     next_teid: u32,
     /// UEs whose context was removed since [`EnbRrc::take_released`].
     released: Vec<u32>,
+    /// `inactivity_timer_secs` (#350): `None` disables the release.
+    inactivity: Option<Duration>,
 }
 
 fn to_rrc_plmn(p: &Plmn) -> PlmnId {
@@ -283,7 +304,51 @@ impl EnbRrc {
             gtp_ip: cfg.gtp_ip.unwrap_or(cfg.s1ap_ip),
             next_teid: 1,
             released: Vec::new(),
+            inactivity: cfg.inactivity_timer_secs.map(Duration::from_secs),
         }
+    }
+
+    /// User data went to or came from `ue` (#350): the inactivity timer
+    /// restarts.
+    pub fn on_user_plane_activity(&mut self, ue: u32, now: Instant) {
+        if let Some(ctx) = self.ues.get_mut(&ue) {
+            ctx.last_activity = now;
+        }
+    }
+
+    /// The user-inactivity release (#350, TS 36.413 §8.3.2): every UE with an
+    /// S1 connection that has been silent -- no user data, no signalling -- for
+    /// the configured time gets one UE CONTEXT RELEASE REQUEST with cause
+    /// user-inactivity. The release itself follows the MME's UE CONTEXT RELEASE
+    /// COMMAND (§8.3.3), so the UE keeps its context until then.
+    pub fn check_inactivity(&mut self, now: Instant) -> Vec<Action> {
+        let Some(limit) = self.inactivity else {
+            return vec![];
+        };
+        let due: Vec<(u32, u32, u32)> = self
+            .ues
+            .iter()
+            .filter(|(_, c)| {
+                c.state == UeState::Connected
+                    && now.saturating_duration_since(c.last_activity) >= limit
+                    && c.inactivity_release_requested_at.is_none_or(|at| {
+                        c.last_activity > at || now.saturating_duration_since(at) >= limit
+                    })
+            })
+            .filter_map(|(ue, c)| c.mme_ue_s1ap_id.map(|mme| (*ue, mme, c.enb_ue_s1ap_id)))
+            .collect();
+        let mut acts = Vec::new();
+        for (ue, mme, enb) in due {
+            log::info!(
+                "UE {ue}: no activity for {}s; UE CONTEXT RELEASE REQUEST (user-inactivity)",
+                limit.as_secs()
+            );
+            self.push_release_request_with(&mut acts, mme, enb, CauseRadioNetwork::USER_INACTIVITY);
+            if let Some(c) = self.ues.get_mut(&ue) {
+                c.inactivity_release_requested_at = Some(now);
+            }
+        }
+        acts
     }
 
     /// The AS algorithms a UE context runs with, `(EEA, EIA)`, once its
@@ -452,6 +517,8 @@ impl EnbRrc {
             security: None,
             ics: None,
             drbs: Vec::new(),
+            last_activity: Instant::now(),
+            inactivity_release_requested_at: None,
         };
         let transaction_id = ctx.next_tid();
         ctx.state = UeState::AwaitingSetupComplete { transaction_id };
@@ -481,6 +548,8 @@ impl EnbRrc {
             log::warn!("UE {ue}: UL-DCCH PDU with no RRC connection, discarded");
             return vec![];
         };
+        // Signalling is activity too (#350): a UE mid-procedure is not idle.
+        ctx.last_activity = Instant::now();
         if lcid == LCID_SRB2 {
             let Some(srb2) = ctx.srb2.as_mut() else {
                 log::warn!("UE {ue}: PDU on SRB2 before SRB2 was established, discarded");
@@ -644,11 +713,16 @@ impl EnbRrc {
     }
 
     fn push_release_request(&self, acts: &mut Vec<Action>, mme: u32, enb: u32) {
-        if let Some(pdu) = encode_s1(&s1ap_ue::build_ue_context_release_request(
+        self.push_release_request_with(
+            acts,
             mme,
             enb,
             CauseRadioNetwork::RADIO_CONNECTION_WITH_UE_LOST,
-        )) {
+        );
+    }
+
+    fn push_release_request_with(&self, acts: &mut Vec<Action>, mme: u32, enb: u32, cause: u8) {
+        if let Some(pdu) = encode_s1(&s1ap_ue::build_ue_context_release_request(mme, enb, cause)) {
             acts.push(Action::S1 {
                 stream: self.ue_stream(enb),
                 pdu,
@@ -703,12 +777,64 @@ impl EnbRrc {
                 stream: self.ue_stream(enb_ue_s1ap_id),
                 pdu,
             }],
+            S1Inbound::Paging(p) => self.on_paging(&p),
             S1Inbound::ErrorIndication(pdu) => vec![Action::S1 {
                 stream: NON_UE_ASSOCIATED_STREAM,
                 pdu,
             }],
             S1Inbound::NotHandled(what) => {
                 log::info!("S1AP {what}: not handled in this build");
+                vec![]
+            }
+        }
+    }
+
+    /// S1AP PAGING (TS 36.413 §8.5.2): when one of the listed TAIs is this
+    /// cell's (one of its broadcast PLMNs and its TAC), broadcast an RRC Paging
+    /// with the UE's paging record (TS 36.331 §5.3.2.2). A PAGING for other TAs
+    /// is not this cell's to send.
+    fn on_paging(&mut self, p: &s1ap_ue::PagingRequest) -> Vec<Action> {
+        let ours = p
+            .tais
+            .iter()
+            .any(|(plmn, tac)| *tac == self.cell.tac && self.plmns.contains(plmn));
+        if !ours {
+            log::info!(
+                "PAGING for TAIs {:?}: not this cell's (TAC {})",
+                p.tais,
+                self.cell.tac
+            );
+            return vec![];
+        }
+        let identity = match &p.identity {
+            s1ap_ue::PagingIdentity::STmsi { mmec, m_tmsi } => msg::PagedUeIdentity::STmsi {
+                mmec: *mmec,
+                m_tmsi: *m_tmsi,
+            },
+            s1ap_ue::PagingIdentity::Imsi(d) => msg::PagedUeIdentity::Imsi(d.clone()),
+        };
+        let record = msg::PagingRecordInfo {
+            identity,
+            cn_domain: if p.cs_domain {
+                msg::PagingCnDomain::Cs
+            } else {
+                msg::PagingCnDomain::Ps
+            },
+        };
+        match msg::encode_paging(std::slice::from_ref(&record)) {
+            Ok(pdu) => {
+                log::info!(
+                    "PAGING ({:?}, {}): RRC Paging on PCCH",
+                    record.identity,
+                    if p.cs_domain { "CS" } else { "PS" }
+                );
+                vec![Action::Broadcast {
+                    channel: RrcChannel::Pcch,
+                    pdu,
+                }]
+            }
+            Err(e) => {
+                log::warn!("PAGING not broadcast: {e}");
                 vec![]
             }
         }
@@ -726,6 +852,9 @@ impl EnbRrc {
                 })
                 .unwrap_or_default();
         };
+        if let Some(c) = self.ues.get_mut(&ue) {
+            c.last_activity = Instant::now();
+        }
         let stream = self.ue_stream(enb);
         let ctx = self.ues.get_mut(&ue).expect("by_enb_id and ues agree");
         match ctx.mme_ue_s1ap_id {

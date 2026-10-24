@@ -360,6 +360,9 @@ pub struct MmUeIdentity {
     /// SNPN NID (Rel-17, TS 23.501 §5.30) when the UE is configured to access
     /// a Standalone Non-Public Network; included in the Registration Request.
     pub snpn_nid: Option<String>,
+    /// The UE is configured for high priority access in the selected PLMN
+    /// (`UeConfig::high_priority_access`; TS 24.501 §5.6.1.7 c) 4)).
+    pub high_priority_access: bool,
     /// MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2). Set on the
     /// identity of a MINT secondary subscription so its Registration Request
     /// carries the disaster-roaming indication. Independent of the SNPN field.
@@ -441,6 +444,7 @@ impl MmUeIdentity {
             // SNPN access (Rel-17, TS 23.501 §5.30): carry the configured NID
             // so the Registration Request advertises the SNPN being accessed.
             snpn_nid: config.snpn_config.as_ref().map(|s| s.nid.clone()),
+            high_priority_access: config.high_priority_access,
             // The primary subscription never sets disaster-roaming; MINT
             // secondary identities opt in via `with_supi` (TS 23.761 §4.2).
             disaster_roaming: false,
@@ -572,6 +576,14 @@ pub enum UePolicyReaction {
     Ignore,
 }
 
+/// First wait before a data-triggered SERVICE REQUEST is retried after a SERVICE
+/// REJECT that named no wait (no T3346) and left the UE registered (#313).
+/// Doubled per consecutive reject up to [`SERVICE_REJECT_BACKOFF_MAX`].
+pub const SERVICE_REJECT_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ceiling of the Service Reject backoff.
+pub const SERVICE_REJECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(80);
+
 /// 5GMM procedure orchestrator (UE side).
 pub struct MmOrchestrator {
     identity: MmUeIdentity,
@@ -595,13 +607,42 @@ pub struct MmOrchestrator {
     /// them yet (nextgsim #288).
     ///
     /// Set when a registered UE's connection is released (RRC release or radio
-    /// link failure); cleared by SERVICE ACCEPT or SERVICE REJECT. A UE that
+    /// link failure); cleared by SERVICE ACCEPT, or by a SERVICE REJECT whose
+    /// cause releases the PDU sessions (#3/#6/#7, #9/#10). Any other reject
+    /// leaves it set: no user plane came back (#313). A UE that
     /// lost its cell and re-registered on a new one (mobility registration) is
     /// CM-CONNECTED again with no user plane, and only a Service Request asks
     /// the network to establish it (TS 24.501 §5.6.1.1). Without this flag the
     /// UE treated "CM-CONNECTED" as "user plane up" and sent uplink on a DRB the
     /// new gNB never set up, forever.
     up_reactivation_pending: bool,
+    /// Consecutive SERVICE REJECTs that neither carried a T3346 value nor ended
+    /// the UE's registration (#313). Sets [`Self::sr_backoff_until`]; cleared by
+    /// SERVICE ACCEPT.
+    sr_reject_count: u32,
+    /// No data-triggered SERVICE REQUEST before this instant (#313). After a
+    /// reject that leaves the UE registered with its user plane still down,
+    /// asking again on the very next uplink packet would loop the AMF through
+    /// reject after reject; see [`SERVICE_REJECT_BACKOFF_BASE`].
+    sr_backoff_until: Option<std::time::Instant>,
+    /// Uplink data waiting for a data SERVICE REQUEST that has not yet
+    /// succeeded, as an Uplink data status bitmap (TS 24.501 §9.11.3.44; `0`
+    /// when no PSI was named). The TUN forwarder holds the packets themselves.
+    /// When the bar on the request lifts (T3346 expiry, the end of the backoff)
+    /// the request is started from here: §5.6.1.5 #22 starts it "if still
+    /// necessary, when timer T3346 expires", and a one-shot sender sends nothing
+    /// more that could trigger it (#313 review). Cleared by SERVICE ACCEPT and by
+    /// the rejects that release the PDU sessions.
+    held_uplink_data_status: Option<u16>,
+    /// Service type of the last SERVICE REQUEST sent (§5.6.1.5 #28 depends on it).
+    pending_service_type: Option<ServiceType>,
+    /// The Uplink data status the last registration update carried (#313 review):
+    /// the sessions whose user plane the Registration Accept is to bring back.
+    registration_uplink_data_status: Option<u16>,
+    /// Whether this UE is configured for high priority access
+    /// (`UeConfig::high_priority_access`). §5.6.1.7 c) 4) exempts such a UE from
+    /// T3346, and §5.3.5 from the non-allowed-area bar.
+    high_priority_access: bool,
 
     // -- authentication state --
     /// ABBA parameter received in the last Authentication Request
@@ -669,6 +710,10 @@ pub struct MmOrchestrator {
     /// while the NAS signalling connection was up: the initial registration
     /// waits for that connection's release (TS 24.501 §5.5.2.3.2, issue #265).
     reregistration_on_release: bool,
+    /// A SERVICE REJECT #28 asked for a registration for mobility and periodic
+    /// update once the N1 NAS signalling connection is released (TS 24.501
+    /// §5.6.1.5 #28, #313).
+    mobility_registration_on_release: bool,
 
     // -- SUCI freshness (TS 24.501 §5.4.3.3 / §5.5.1.2.2) --
     /// The last SUCI sent to the network. Reused while T3519 is running instead
@@ -725,13 +770,20 @@ pub struct MmOrchestrator {
 impl MmOrchestrator {
     /// Create a new orchestrator for the given UE identity.
     pub fn new(identity: MmUeIdentity) -> Self {
+        let high_priority_access = identity.high_priority_access;
         Self {
+            high_priority_access,
             identity,
             state: MmStateMachine::new(),
             timers: NasTimerManager::new(),
             sec: NasSecurityContext::new_3gpp(),
             secure_exchange: false,
             up_reactivation_pending: false,
+            sr_reject_count: 0,
+            sr_backoff_until: None,
+            held_uplink_data_status: None,
+            pending_service_type: None,
+            registration_uplink_data_status: None,
             abba: vec![0x00, 0x00],
             sqn_ms: [0u8; 6],
             res_star: None,
@@ -759,6 +811,7 @@ impl MmOrchestrator {
             n1_mode_disabled: false,
             dereg_pdu: None,
             reregistration_on_release: false,
+            mobility_registration_on_release: false,
             stored_suci: None,
             ue_policy_sections: HashMap::new(),
             updp_pti: 0,
@@ -1369,7 +1422,35 @@ impl MmOrchestrator {
         for ev in events {
             outs.extend(self.handle_timer_expiry(ev));
         }
+        // The end of the local Service Reject backoff (#313) is noticed here,
+        // once: the deadline is cleared (the reject count, which sets the next
+        // backoff, is not) and held uplink asks again.
+        if self
+            .sr_backoff_until
+            .is_some_and(|until| std::time::Instant::now() >= until)
+        {
+            self.sr_backoff_until = None;
+            outs.extend(self.retry_held_uplink_service_request("Service Reject backoff over"));
+        }
         outs
+    }
+
+    /// Start the data SERVICE REQUEST for uplink still held after a rejected one,
+    /// once nothing bars it (#313 review). Nothing happens when no uplink is
+    /// held, the user plane is up, or a request is already in flight.
+    fn retry_held_uplink_service_request(&mut self, why: &str) -> Vec<MmOutput> {
+        let Some(status) = self.held_uplink_data_status else {
+            return Vec::new();
+        };
+        let user_plane_down = self.state.is_idle() || self.up_reactivation_pending;
+        if !self.state.is_registered() || !user_plane_down || self.timers.t3517.is_running() {
+            return Vec::new();
+        }
+        if self.service_request_barred(ServiceType::Data).is_some() {
+            return Vec::new();
+        }
+        info!("{why}: starting the Service Request for held uplink data");
+        self.start_service_request(ServiceType::Data, (status != 0).then_some(status))
     }
 
     /// Handle a single timer expiry event.
@@ -1426,7 +1507,9 @@ impl MmOrchestrator {
                     self.registration_attempt_counter = 0;
                     self.build_and_send_registration(self.pending_reg_type)
                 } else {
-                    Vec::new()
+                    // §5.6.1.5 #22, §5.6.1.7 c): "The service request procedure is
+                    // started, if still necessary, when timer T3346 expires".
+                    self.retry_held_uplink_service_request("T3346 expired")
                 }
             }
             TIMER_T3516 => {
@@ -1541,11 +1624,44 @@ impl MmOrchestrator {
             Ie5gsMobileIdentity::new(MobileIdentityType::Suci, suci)
         };
 
+        // TS 24.501 §5.5.1.3.2: a registration update sent with uplink user data
+        // pending names those PDU sessions in the Uplink data status IE, with
+        // the follow-on request pending, so the network brings their user plane
+        // back with the Registration Accept (#313 review: after SERVICE REJECT
+        // #28 the held uplink otherwise waited for another packet).
+        //
+        // Two of §5.5.1.3.2's limits apply (#313 re-review):
+        // - "For all cases except case b ... the UE may include the Uplink data
+        //   status IE": case b is the periodic update on T3512 expiry in
+        //   5GMM-IDLE, so a periodic update never carries it;
+        // - "If the UE is in a non-allowed area or is not in an allowed area ...
+        //   the UE shall not include the Uplink data status IE except for
+        //   emergency services or for high priority access": the update after
+        //   #28 (5GMM-REGISTERED.NON-ALLOWED-SERVICE) carries it only for a UE
+        //   configured for high priority access. Its held uplink waits for an
+        //   allowed area, or for a Service Request after the Accept.
+        let non_allowed = self.state.mm_substate() == MmSubState::RegisteredNonAllowedService
+            && !self.high_priority_access;
+        let uplink_data_status = match reg_type {
+            RegistrationType::MobilityRegistrationUpdating
+                if !non_allowed && (self.state.is_idle() || self.up_reactivation_pending) =>
+            {
+                self.held_uplink_data_status.filter(|status| *status != 0)
+            }
+            _ => None,
+        };
+        self.registration_uplink_data_status = uplink_data_status;
+        let follow_on = if uplink_data_status.is_some() {
+            FollowOnRequest::Pending
+        } else {
+            FollowOnRequest::NoPending
+        };
         let mut req = RegistrationRequest::new(
-            Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
+            Ie5gsRegistrationType::new(follow_on, reg_type),
             ng_ksi,
             mobile_identity.clone(),
         );
+        req.uplink_data_status = uplink_data_status;
         // Mandatory-for-security IEs: UE security capability (replayed by
         // the network in the Security Mode Command) and requested NSSAI
         req.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
@@ -1628,6 +1744,11 @@ impl MmOrchestrator {
         // NAS message container once security is up (TS 24.501 §4.4.6).
         self.last_registration_request = Some(plain.clone());
         self.pending_reg_type = reg_type;
+        // TS 24.501 §5.6.1.7: a registration procedure for mobility or periodic
+        // update triggered while a service request is in progress aborts it and
+        // stops T3517 (#316). No other registration can start while one runs: a
+        // service request is only started from 5GMM-REGISTERED.
+        self.abort_service_request("registration procedure started");
         self.state.switch_mm_state(MmSubState::RegisteredInitiated);
         self.timers.start(TIMER_T3510, true);
         self.timers.stop(TIMER_T3511, true);
@@ -1652,7 +1773,9 @@ impl MmOrchestrator {
         // and is ciphered as usual.
         let cleartext_request = |ksi: NasKeySetIdentifier| {
             let mut ct = RegistrationRequest::new(
-                Ie5gsRegistrationType::new(FollowOnRequest::NoPending, reg_type),
+                // The registration type IE is cleartext; its follow-on bit is the
+                // full request's.
+                Ie5gsRegistrationType::new(follow_on, reg_type),
                 ksi,
                 mobile_identity.clone(),
             );
@@ -1756,6 +1879,23 @@ impl MmOrchestrator {
 
         self.timers.stop(TIMER_T3510, true);
         self.timers.stop(TIMER_T3346, true);
+        // §5.5.1.3.4: the user plane of the sessions the request named in its
+        // Uplink data status is re-established, except those the PDU session
+        // reactivation result marks as failed (bit set = failed, §9.11.3.42).
+        if let Some(requested) = self.registration_uplink_data_status.take() {
+            let failed = acc.pdu_session_reactivation_result.unwrap_or(0) & requested;
+            if failed == 0 {
+                info!("Registration Accept re-established the user plane for held uplink");
+                self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
+            } else {
+                warn!(
+                    "Registration Accept: user-plane reactivation failed for {failed:#06x}; \
+                     a Service Request will ask again"
+                );
+                self.held_uplink_data_status = Some(failed);
+            }
+        }
         // TS 24.501 5.4.1.3.3: stop T3516 and delete RES* on registration accept
         self.timers.stop(TIMER_T3516, true);
         self.res_star = None;
@@ -1906,7 +2046,27 @@ impl MmOrchestrator {
             outs.push(MmOutput::NetworkPduSessionStatus(status));
         }
         outs.push(MmOutput::RegistrationSucceeded);
+        // The Accept stopped T3346 (above). §5.6.1.5 #22 / §5.6.1.7 c): "The
+        // service request procedure is started, if still necessary, when timer
+        // T3346 expires or is stopped" -- uplink still held asks now (#313
+        // re-review).
+        outs.extend(
+            self.retry_held_uplink_service_request("T3346 stopped by the Registration Accept"),
+        );
         outs
+    }
+
+    /// PDU session `psi` was released (#313 re-review): it has no uplink data
+    /// pending any more, so its bit leaves the held Uplink data status
+    /// (§5.6.1.2 names only sessions with pending data).
+    pub fn on_pdu_session_released(&mut self, psi: u8) {
+        let bit = uplink_data_status_bit(psi);
+        if let Some(status) = self.held_uplink_data_status.as_mut() {
+            *status &= !bit;
+            if *status == 0 {
+                self.held_uplink_data_status = None;
+            }
+        }
     }
 
     /// Registration Reject handling with the full cause table of
@@ -2139,6 +2299,9 @@ impl MmOrchestrator {
     fn delete_registration_context(&mut self) {
         self.stored_guti = None;
         self.tai_list = None;
+        // De-registered: no session has uplink waiting for a service request.
+        self.held_uplink_data_status = None;
+        self.registration_uplink_data_status = None;
         self.sec.reset();
         // TS 24.501 Annex C.1: the stored copy goes with the in-memory one.
         // Leaving the file behind would mean a restart presents a 5G-GUTI and a
@@ -2739,6 +2902,26 @@ impl MmOrchestrator {
             warn!("Service Request not started: UE not registered");
             return Vec::new();
         }
+        // Recorded first, so uplink for any PSI is remembered even when the
+        // request itself does not go out now (in progress, or barred).
+        if service_type == ServiceType::Data {
+            self.held_uplink_data_status =
+                Some(self.held_uplink_data_status.unwrap_or(0) | uplink_data_status.unwrap_or(0));
+        }
+        // TS 24.501 §5.6.1.2: a service request is initiated when the UE is not
+        // already in 5GMM-SERVICE-REQUEST-INITIATED; while T3517 runs the
+        // procedure is in progress. Before #317 every uplink packet that arrived
+        // between the first SERVICE REQUEST and the RRC connection setup built
+        // and sent another one, each with a new UL NAS COUNT and a restarted
+        // T3517, which the AMF then saw as duplicates.
+        if self.service_request_in_progress() {
+            debug!("Service Request ({service_type:?}) not started: one is already in progress");
+            return Vec::new();
+        }
+        if let Some(reason) = self.service_request_barred(service_type) {
+            info!("Service Request ({service_type:?}) not started: {reason}");
+            return Vec::new();
+        }
         let Some(s_tmsi) = self.build_s_tmsi() else {
             warn!("Service Request not started: no stored 5G-GUTI");
             return Vec::new();
@@ -2764,6 +2947,7 @@ impl MmOrchestrator {
         cleartext_only.encode(&mut cleartext);
         let initial = self.state.is_idle();
 
+        self.pending_service_type = Some(service_type);
         self.state
             .switch_mm_state(MmSubState::ServiceRequestInitiated);
         self.timers.start(TIMER_T3517, true);
@@ -2828,6 +3012,29 @@ impl MmOrchestrator {
         Some(Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, data))
     }
 
+    /// Whether a service request procedure is in progress: T3517 running, or
+    /// 5GMM-SERVICE-REQUEST-INITIATED (TS 24.501 §5.6.1.2, #317).
+    pub fn service_request_in_progress(&self) -> bool {
+        self.timers.t3517.is_running()
+            || self.state.mm_substate() == MmSubState::ServiceRequestInitiated
+    }
+
+    /// Abort a service request procedure in progress: stop T3517 and leave
+    /// 5GMM-SERVICE-REQUEST-INITIATED for 5GMM-REGISTERED.NORMAL-SERVICE
+    /// (TS 24.501 §5.6.1.7, #316). Returns whether one was in progress.
+    fn abort_service_request(&mut self, why: &str) -> bool {
+        if !self.service_request_in_progress() {
+            return false;
+        }
+        info!("Service request procedure aborted ({why}): T3517 stopped");
+        self.timers.stop(TIMER_T3517, true);
+        if self.state.mm_substate() == MmSubState::ServiceRequestInitiated {
+            self.state
+                .switch_mm_state(MmSubState::RegisteredNormalService);
+        }
+        true
+    }
+
     /// Whether uplink user data can be sent now: a NAS signalling connection
     /// is up and no SERVICE REQUEST is awaiting its answer (T3517 stopped).
     ///
@@ -2845,16 +3052,87 @@ impl MmOrchestrator {
 
     /// Whether uplink data in CM-CONNECTED must first trigger a Service Request
     /// to re-establish the user plane lost with an earlier connection (#288).
+    ///
+    /// False while a new data Service Request is barred (#313): under T3346 after
+    /// a #22 reject, in 5GMM-REGISTERED.NON-ALLOWED-SERVICE after #28, or inside
+    /// the backoff after another reject. The user plane stays down meanwhile, so
+    /// [`Self::uplink_user_plane_ready`] keeps holding the uplink.
     pub fn user_plane_reactivation_needed(&self) -> bool {
         self.up_reactivation_pending
             && self.state.is_registered()
             && self.state.is_connected()
             && !self.timers.t3517.is_running()
+            && self.service_request_barred(ServiceType::Data).is_none()
+    }
+
+    /// Why a SERVICE REQUEST of `service_type` may not be initiated now, if it
+    /// may not (#313).
+    ///
+    /// - T3346 running (congestion, TS 24.501 §5.3.9, §5.6.1.5 #22) and
+    ///   5GMM-REGISTERED.NON-ALLOWED-SERVICE (§5.3.5, §5.6.1.5 #28) both bar every
+    ///   request except those the spec exempts: responding to paging (mobile
+    ///   terminated services), emergency services, emergency services fallback
+    ///   and high priority access.
+    /// - The local backoff after another reject bars only the requests uplink data
+    ///   triggers (data, signalling): it is this UE's choice, not the network's,
+    ///   and must not stop the UE answering a page.
+    fn service_request_barred(&self, service_type: ServiceType) -> Option<&'static str> {
+        // §5.6.1.7 c) 4) exempts "a UE configured for high priority access in
+        // selected PLMN": the UE's configuration, not a request's service type.
+        let exempt = matches!(
+            service_type,
+            ServiceType::MobileTerminatedServices
+                | ServiceType::EmergencyServices
+                | ServiceType::EmergencyServicesFallback
+        ) || self.high_priority_access;
+        // §5.6.1.7 c) 7): elevated signalling is also exempt from T3346.
+        if !exempt
+            && service_type != ServiceType::ElevatedSignalling
+            && self.timers.t3346.is_running()
+        {
+            return Some("T3346 (congestion backoff) is running");
+        }
+        if exempt {
+            return None;
+        }
+        // A configured high-priority UE passed the `exempt` check above, so it
+        // is not held here. §5.6.1.5 #28 withdraws that exemption when the
+        // network indicates "High priority access UEs are not exempt from
+        // service area restrictions"; that indication is not parsed yet, so
+        // such a UE is always treated as exempt.
+        if self.state.mm_substate() == MmSubState::RegisteredNonAllowedService {
+            return Some("5GMM-REGISTERED.NON-ALLOWED-SERVICE (restricted service area)");
+        }
+        if self
+            .sr_backoff_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return Some("backing off after a Service Reject");
+        }
+        None
+    }
+
+    /// Start the local backoff after a SERVICE REJECT that left the user plane
+    /// down and named no wait of its own (#313).
+    fn start_service_reject_backoff(&mut self) {
+        self.sr_reject_count = self.sr_reject_count.saturating_add(1);
+        let doublings = (self.sr_reject_count - 1).min(16);
+        let wait = SERVICE_REJECT_BACKOFF_BASE
+            .saturating_mul(1u32 << doublings)
+            .min(SERVICE_REJECT_BACKOFF_MAX);
+        info!(
+            "Service Request backoff {wait:?} after {} consecutive reject(s)",
+            self.sr_reject_count
+        );
+        self.sr_backoff_until = Some(std::time::Instant::now() + wait);
     }
 
     fn handle_service_accept(&mut self, plain: &[u8]) -> Vec<MmOutput> {
         info!("Service Accept received");
         self.up_reactivation_pending = false;
+        self.held_uplink_data_status = None;
+        self.sr_reject_count = 0;
+        self.sr_backoff_until = None;
         self.timers.stop(TIMER_T3517, true);
         self.timers.stop(TIMER_T3516, true);
         self.res_star = None;
@@ -2898,7 +3176,7 @@ impl MmOrchestrator {
         outs
     }
 
-    fn handle_service_reject(&mut self, plain: &[u8]) -> Vec<MmOutput> {
+    fn handle_service_reject(&mut self, plain: &[u8], protected: bool) -> Vec<MmOutput> {
         let rej = match ServiceReject::decode(&mut &plain[3..]) {
             Ok(rej) => rej,
             Err(e) => {
@@ -2909,12 +3187,16 @@ impl MmOrchestrator {
         let cause = rej.mm_cause.value;
         warn!("Service Reject: cause {:?} (#{})", cause, cause as u8);
         self.timers.stop(TIMER_T3517, true);
-        // The request was answered; asking again on every packet would loop.
-        self.up_reactivation_pending = false;
+        // `up_reactivation_pending` is NOT cleared here (#313). Only the arms
+        // that release the PDU sessions clear it; after any other reject the
+        // user plane is still down, so uplink stays held and a new request is
+        // gated on T3346, NON-ALLOWED-SERVICE or the backoff instead.
 
         match cause {
             MmCause::IllegalUe | MmCause::IllegalMe | MmCause::FiveGsServicesNotAllowed => {
                 // Same terminal handling as for registration (5.6.1.5)
+                self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
                 self.state
                     .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
@@ -2929,23 +3211,65 @@ impl MmOrchestrator {
             MmCause::UeIdentityCannotBeDerived | MmCause::ImplicitlyDeregistered => {
                 // TS 24.501 5.6.1.5: delete the GUTI, enter 5GMM-DEREGISTERED and
                 // perform a fresh initial registration.
+                self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
                 self.delete_registration_context();
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredNormalService);
                 self.reregister_after_identity_loss()
             }
             MmCause::Congestion => {
+                // §5.6.1.5 #22: with a T3346 value the UE starts T3346 and may
+                // initiate the service request again once it expires. Without
+                // one (or a zero value) nothing tells it when, so the local
+                // backoff applies.
                 let secs = rej.t3346_value.map(gprs_timer2_seconds).unwrap_or(0);
                 if secs > 0 {
+                    // An unprotected reject's value is not trusted: T3346 then
+                    // runs for a random value from TS 24.008's default range,
+                    // 15 to 30 minutes (§5.6.1.5 #22).
+                    let secs = if protected {
+                        secs
+                    } else {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(15 * 60..=30 * 60)
+                    };
                     self.timers
                         .start_with_timer2(TIMER_T3346, GprsTimer2::new(secs), true);
                     info!("T3346 (congestion backoff) started: {secs}s");
+                } else {
+                    // No usable T3346 value: an abnormal case (§5.6.1.7 i):
+                    // REGISTERED, procedure aborted. The backoff is this UE's.
+                    self.start_service_reject_backoff();
                 }
                 self.state
                     .switch_mm_state(MmSubState::RegisteredNormalService);
                 Vec::new()
             }
+            MmCause::RestrictedServiceArea => {
+                // §5.6.1.5 #28: enter 5GMM-REGISTERED.NON-ALLOWED-SERVICE, wait
+                // for the release of the N1 NAS signalling connection and perform
+                // the registration procedure for mobility and periodic update
+                // (unless the request was for elevated signalling, which then
+                // waits for an allowed area). The PDU sessions stay; their user
+                // plane cannot be activated meanwhile (§5.3.5).
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredNonAllowedService);
+                if self.pending_service_type != Some(ServiceType::ElevatedSignalling) {
+                    if self.state.is_connected() {
+                        self.mobility_registration_on_release = true;
+                        Vec::new()
+                    } else {
+                        self.build_and_send_registration(
+                            RegistrationType::MobilityRegistrationUpdating,
+                        )
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
             _ => {
+                self.start_service_reject_backoff();
                 self.state
                     .switch_mm_state(MmSubState::RegisteredNormalService);
                 Vec::new()
@@ -3017,6 +3341,7 @@ impl MmOrchestrator {
     }
 
     fn handle_deregistration_accept(&mut self) -> Vec<MmOutput> {
+        self.held_uplink_data_status = None;
         info!("Deregistration Accept received");
         self.timers.stop(TIMER_T3521, true);
         self.timers.stop(TIMER_T3512, true);
@@ -3125,17 +3450,40 @@ impl MmOrchestrator {
         outs
     }
 
+    /// The lower layers failed to establish the RRC connection a NAS message
+    /// was waiting for (T300 expiry, RRC reject). A service request in progress
+    /// is aborted: T3517 stopped, 5GMM-REGISTERED (TS 24.501 §5.6.1.7 l), #316).
+    /// A registration in progress is left to T3510.
+    pub fn on_rrc_establishment_failure(&mut self) {
+        self.abort_service_request("RRC connection establishment failed");
+    }
+
     /// The NAS signalling connection was released (RRC release or radio link
     /// failure): the UE is CM-IDLE. Starts the initial registration a
     /// network-initiated de-registration deferred to this point
     /// (TS 24.501 §5.5.2.3.2), unless one has already been started.
     pub fn on_nas_signalling_connection_released(&mut self) -> Vec<MmOutput> {
         self.state.switch_cm_state(CmState::Idle);
+        // TS 24.501 §5.6.1.7: a lower-layer release or failure before the
+        // service request completes aborts the procedure; the UE stops T3517
+        // and enters 5GMM-REGISTERED. Left running, T3517 kept the uplink held
+        // and refused a new Service Request for up to 15 s after the connection
+        // it belonged to was gone (#316).
+        self.abort_service_request("NAS signalling connection released");
         // A secure exchange belongs to one connection (§4.4.4.2).
         self.secure_exchange = false;
         // So do the user-plane resources (#288).
         if self.state.is_registered() {
             self.up_reactivation_pending = true;
+        }
+        if std::mem::take(&mut self.mobility_registration_on_release) && self.state.is_registered()
+        {
+            info!(
+                "NAS signalling connection released after SERVICE REJECT #28: registration \
+                 for mobility and periodic update (TS 24.501 §5.6.1.5)"
+            );
+            return self
+                .build_and_send_registration(RegistrationType::MobilityRegistrationUpdating);
         }
         if !std::mem::take(&mut self.reregistration_on_release) {
             return Vec::new();
@@ -3296,7 +3644,7 @@ impl MmOrchestrator {
             MmMessageType::RegistrationAccept => self.handle_registration_accept(&plain),
             MmMessageType::RegistrationReject => self.handle_registration_reject(&plain),
             MmMessageType::ServiceAccept => self.handle_service_accept(&plain),
-            MmMessageType::ServiceReject => self.handle_service_reject(&plain),
+            MmMessageType::ServiceReject => self.handle_service_reject(&plain, protected),
             MmMessageType::DeregistrationAcceptUeOriginating => self.handle_deregistration_accept(),
             MmMessageType::DeregistrationRequestUeTerminated => {
                 self.handle_network_deregistration(&plain)
@@ -3750,6 +4098,7 @@ mod tests {
             requested_nssai: Some(vec![0x01, 0x01]),
             plmn_bcd: encode_plmn_bcd(999, 70, false),
             snpn_nid: None,
+            high_priority_access: false,
             disaster_roaming: false,
             uav_indication: None,
             redcap: false,
@@ -6561,6 +6910,394 @@ mod tests {
         assert!(!orch.user_plane_reactivation_needed());
     }
 
+    /// A registered UE that lost its connection and is CM-CONNECTED again with no
+    /// user plane, with a data Service Request for PSI 1 in flight (#313).
+    fn connected_without_user_plane_with_sr_in_flight() -> MmOrchestrator {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.user_plane_reactivation_needed());
+        let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        assert!(!outs.is_empty());
+        orch
+    }
+
+    /// Deliver a protected SERVICE REJECT with `cause` and an optional T3346 value.
+    fn reject_service_request(
+        orch: &mut MmOrchestrator,
+        cause: MmCause,
+        t3346: Option<u8>,
+        dl_count: u8,
+    ) -> Vec<MmOutput> {
+        let mut rej = ServiceReject::new(cause);
+        rej.t3346_value = t3346;
+        let mut plain = Vec::new();
+        rej.encode(&mut plain);
+        let protected = protect_downlink(orch, &plain, dl_count);
+        orch.handle_downlink(&protected)
+    }
+
+    /// #313, TS 24.501 §5.6.1.5 #22: a congestion reject with T3346 does NOT bring
+    /// the user plane back, so uplink stays held and no new data Service Request
+    /// goes out while T3346 runs; once it stops, the next uplink asks again. Before,
+    /// any reject cleared the flag: uplink was released onto a DRB that did not
+    /// exist and the UE never asked again.
+    #[test]
+    fn a_congestion_reject_keeps_the_user_plane_down_until_t3346_expires() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        // 0x05: GPRS timer 2, unit 2 s, value 5 -> 10 s.
+        reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+        assert!(orch.timers().t3346.is_running());
+        assert!(!orch.timers().t3517.is_running());
+        assert!(
+            !orch.uplink_user_plane_ready(),
+            "the reject brought no user plane back"
+        );
+        assert!(
+            !orch.user_plane_reactivation_needed(),
+            "no new data Service Request while T3346 runs"
+        );
+        assert!(
+            orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty(),
+            "a data Service Request is barred under T3346"
+        );
+        assert!(
+            !orch
+                .start_service_request(ServiceType::MobileTerminatedServices, None)
+                .is_empty(),
+            "answering a page is exempt from T3346"
+        );
+        // Back to the state before the page, with T3346 over.
+        orch.timers.stop(TIMER_T3517, true);
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredNormalService);
+        orch.timers.stop(TIMER_T3346, true);
+        assert!(
+            orch.user_plane_reactivation_needed(),
+            "T3346 over: the next uplink re-asks"
+        );
+        let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        assert!(!outs.is_empty(), "a new Service Request is sent");
+    }
+
+    /// #313 review, §5.6.1.5 #22: "The service request procedure is started, if
+    /// still necessary, when timer T3346 expires". Held uplink gets its Service
+    /// Request on the expiry itself, with no new packet to trigger it, and with
+    /// the PSI the rejected request named.
+    #[test]
+    fn t3346_expiry_starts_the_service_request_for_held_uplink() {
+        for idle in [false, true] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+            if idle {
+                orch.on_nas_signalling_connection_released();
+            }
+            assert!(orch.held_uplink_data_status.is_some());
+            orch.timers.stop(TIMER_T3346, true);
+            let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3346, true, 1));
+            assert!(
+                outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+                "idle={idle}: a Service Request on expiry: {outs:?}"
+            );
+            assert!(orch.timers().t3517.is_running(), "idle={idle}");
+            assert_eq!(orch.pending_service_type, Some(ServiceType::Data));
+            assert_eq!(
+                orch.held_uplink_data_status,
+                uplink_data_status(&[1]),
+                "the PSI the rejected request named"
+            );
+        }
+    }
+
+    /// The complement: with no uplink held (the rejected request was signalling),
+    /// T3346 expiry starts nothing.
+    #[test]
+    fn t3346_expiry_without_held_uplink_starts_nothing() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        assert!(!orch
+            .start_service_request(ServiceType::Signalling, None)
+            .is_empty());
+        reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+        orch.timers.stop(TIMER_T3346, true);
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3346, true, 1));
+        assert!(outs.is_empty(), "{outs:?}");
+        assert!(!orch.timers().t3517.is_running());
+    }
+
+    /// #313 review: the end of the local backoff is noticed by the 1 s tick, once,
+    /// and held uplink asks again then; a Service Accept ends the holding.
+    #[test]
+    fn the_end_of_the_backoff_starts_the_service_request_for_held_uplink() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::ProtocolErrorUnspecified, None, 2);
+        assert!(
+            !orch
+                .tick()
+                .iter()
+                .any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "not inside the backoff"
+        );
+        orch.sr_backoff_until = Some(std::time::Instant::now());
+        let outs = orch.tick();
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "{outs:?}"
+        );
+        assert!(orch.sr_backoff_until.is_none(), "noticed once");
+        assert_eq!(orch.sr_reject_count, 1, "the next backoff still doubles");
+
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+        assert!(orch.held_uplink_data_status.is_none());
+    }
+
+    /// #313, §5.6.1.5 #28: restricted service area. The UE enters
+    /// 5GMM-REGISTERED.NON-ALLOWED-SERVICE with 5U1 UPDATED; its sessions stay but
+    /// their user plane cannot be activated, so uplink is held and only exempt
+    /// requests (a paging response) may go out.
+    #[test]
+    fn a_restricted_service_area_reject_enters_non_allowed_service() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        let outs = reject_service_request(&mut orch, MmCause::RestrictedServiceArea, None, 2);
+        assert!(
+            !outs.contains(&MmOutput::ReleasePduSessionsLocally),
+            "#28 keeps the PDU sessions"
+        );
+        assert!(
+            outs.is_empty(),
+            "the registration waits for the release: {outs:?}"
+        );
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNonAllowedService
+        );
+        assert!(!orch.uplink_user_plane_ready());
+        assert!(!orch.user_plane_reactivation_needed());
+        assert!(orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+
+        // §5.6.1.5 #28: once the N1 NAS signalling connection is released, a
+        // registration for mobility and periodic update.
+        let outs = orch.on_nas_signalling_connection_released();
+        let pdu = first_sent_pdu(&outs);
+        let (_outer, full) = open_registration_request(&orch, pdu);
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::MobilityRegistrationUpdating
+        );
+        // §5.5.1.3.2 (#313 re-review): in a non-allowed area the UE "shall not
+        // include the Uplink data status IE except for emergency services or
+        // for high priority access".
+        assert_eq!(full.uplink_data_status, None);
+        assert_eq!(
+            full.registration_type.follow_on_request_pending,
+            FollowOnRequest::NoPending
+        );
+    }
+
+    /// #313 re-review: a UE configured for high priority access does name its
+    /// held uplink in the #28 update.
+    #[test]
+    fn a_high_priority_ue_names_held_uplink_in_the_update_after_28() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        orch.high_priority_access = true;
+        reject_service_request(&mut orch, MmCause::RestrictedServiceArea, None, 2);
+        let outs = orch.on_nas_signalling_connection_released();
+        let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(full.uplink_data_status, uplink_data_status(&[1]));
+        assert_eq!(
+            full.registration_type.follow_on_request_pending,
+            FollowOnRequest::Pending
+        );
+    }
+
+    /// The UE held after another reject, now idle.
+    fn idle_with_held_uplink() -> MmOrchestrator {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::ProtocolErrorUnspecified, None, 2);
+        orch.on_nas_signalling_connection_released();
+        assert_eq!(orch.held_uplink_data_status, uplink_data_status(&[1]));
+        orch
+    }
+
+    /// #313 re-review, §5.5.1.3.2: a mobility update names the held session; a
+    /// periodic one (case b, T3512 expiry in 5GMM-IDLE) never does.
+    #[test]
+    fn only_a_mobility_update_names_held_uplink() {
+        for (reg_type, named) in [
+            (RegistrationType::MobilityRegistrationUpdating, true),
+            (RegistrationType::PeriodicRegistrationUpdating, false),
+        ] {
+            let mut orch = idle_with_held_uplink();
+            let outs = orch.start_registration(reg_type);
+            let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+            assert_eq!(
+                full.uplink_data_status.is_some(),
+                named,
+                "{reg_type:?}: {:?}",
+                full.uplink_data_status
+            );
+        }
+    }
+
+    /// #313 re-review: a released session leaves the held status, and losing
+    /// the registration clears it.
+    #[test]
+    fn held_uplink_is_cleared_by_release_and_deregistration() {
+        let mut orch = idle_with_held_uplink();
+        orch.on_pdu_session_released(1);
+        assert_eq!(orch.held_uplink_data_status, None);
+        let mut orch = idle_with_held_uplink();
+        orch.delete_registration_context();
+        assert_eq!(orch.held_uplink_data_status, None);
+    }
+
+    /// #313 review, §5.5.1.3.4: the Registration Accept to an update that named
+    /// held uplink brings its user plane back, unless the PDU session
+    /// reactivation result marks the session as failed (bit set = failed).
+    #[test]
+    fn a_registration_accept_restores_the_user_plane_the_update_asked_for() {
+        for (failed, restored) in [(None, true), (Some(0x0002), false)] {
+            let mut orch = idle_with_held_uplink();
+            orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+            assert_eq!(
+                orch.registration_uplink_data_status,
+                uplink_data_status(&[1])
+            );
+            let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+                SmsOverNasAllowed::NotAllowed,
+                RegistrationResultValue::ThreeGppAccess,
+            ));
+            acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+            acc.pdu_session_reactivation_result = failed;
+            let mut plain = Vec::new();
+            acc.encode(&mut plain);
+            orch.state_mut().switch_cm_state(CmState::Connected);
+            orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+            assert_eq!(!orch.up_reactivation_pending, restored, "failed={failed:?}");
+            assert_eq!(
+                orch.held_uplink_data_status, failed,
+                "what failed is still held for a Service Request"
+            );
+        }
+    }
+
+    /// #313 review, §5.6.1.7 c) 4): the T3346 exemption belongs to a UE
+    /// CONFIGURED for high priority access, whatever the request's service type.
+    #[test]
+    fn the_high_priority_exemption_follows_the_configuration() {
+        for configured in [false, true] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            orch.high_priority_access = configured;
+            reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+            assert!(orch.timers().t3346.is_running());
+            let sent = !orch
+                .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty();
+            assert_eq!(sent, configured, "configured={configured}");
+        }
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+        assert!(
+            orch.start_service_request(ServiceType::HighPriorityAccess, None)
+                .is_empty(),
+            "the service type alone exempts nothing"
+        );
+    }
+
+    /// #313, §5.6.1.5 #22: an UNPROTECTED congestion reject's T3346 value is not
+    /// used; T3346 runs for a random 15-30 minutes (TS 24.008 default range).
+    #[test]
+    fn an_unprotected_congestion_reject_uses_the_default_t3346_range() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        let mut rej = ServiceReject::new(MmCause::Congestion);
+        rej.t3346_value = Some(0x05); // 10 s, which must NOT be used
+        let mut plain = Vec::new();
+        rej.encode(&mut plain);
+        orch.handle_downlink(&plain);
+        assert!(orch.timers().t3346.is_running());
+        let left = orch.timers().t3346.remaining();
+        assert!((15 * 60 - 1..=30 * 60).contains(&left), "T3346 {left}s");
+    }
+
+    /// #313, §5.3.5: in NON-ALLOWED-SERVICE a paging response is still allowed.
+    #[test]
+    fn non_allowed_service_still_answers_paging() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::RestrictedServiceArea, None, 2);
+        assert!(!orch
+            .start_service_request(ServiceType::MobileTerminatedServices, None)
+            .is_empty());
+    }
+
+    /// #313: any other non-terminal reject (here #111) also leaves the user plane
+    /// down. The UE does not re-ask on the very next packet -- that would loop the
+    /// AMF through reject after reject -- but after a backoff that doubles per
+    /// consecutive reject, and a Service Accept resets it.
+    #[test]
+    fn another_reject_keeps_the_user_plane_down_and_backs_off() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::ProtocolErrorUnspecified, None, 2);
+        assert!(orch.state().is_registered());
+        assert!(!orch.uplink_user_plane_ready());
+        assert!(!orch.user_plane_reactivation_needed(), "inside the backoff");
+        let until = orch.sr_backoff_until.expect("a backoff");
+        let first = until.saturating_duration_since(std::time::Instant::now());
+        assert!(first <= SERVICE_REJECT_BACKOFF_BASE && first > SERVICE_REJECT_BACKOFF_BASE / 2);
+
+        // Backoff over: the next uplink re-asks, and a second reject doubles it.
+        orch.sr_backoff_until = Some(std::time::Instant::now());
+        assert!(orch.user_plane_reactivation_needed());
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        reject_service_request(&mut orch, MmCause::ProtocolErrorUnspecified, None, 3);
+        let second = orch
+            .sr_backoff_until
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(second > SERVICE_REJECT_BACKOFF_BASE, "doubled: {second:?}");
+
+        // A Service Accept ends the backoff and the user-plane gap.
+        orch.sr_backoff_until = Some(std::time::Instant::now());
+        orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 4));
+        assert!(orch.uplink_user_plane_ready());
+        assert_eq!(orch.sr_reject_count, 0);
+        assert!(orch.sr_backoff_until.is_none());
+    }
+
+    /// #313: the causes that release the PDU sessions DO end the user-plane gap --
+    /// there is nothing left to reactivate.
+    #[test]
+    fn a_reject_that_releases_the_sessions_clears_the_reactivation() {
+        for cause in [MmCause::IllegalUe, MmCause::UeIdentityCannotBeDerived] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            let outs = reject_service_request(&mut orch, cause, None, 2);
+            assert!(
+                outs.contains(&MmOutput::ReleasePduSessionsLocally),
+                "{cause:?}: {outs:?}"
+            );
+            assert!(!orch.up_reactivation_pending, "{cause:?}");
+        }
+    }
+
     #[test]
     fn a_service_accept_surfaces_the_network_pdu_session_status() {
         let mut orch = establish_security_context();
@@ -6652,6 +7389,114 @@ mod tests {
             status_at < success_at,
             "reconciliation must precede RegistrationSucceeded, got {outs:?}"
         );
+    }
+
+    /// #317, TS 24.501 §5.6.1.2: a second trigger while a service request is in
+    /// progress (T3517 running, SERVICE-REQUEST-INITIATED) sends nothing -- one
+    /// SERVICE REQUEST PDU, one UL NAS COUNT, T3517 not restarted.
+    #[test]
+    fn two_triggers_send_one_service_request() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+
+        let first = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        assert_eq!(first.len(), 1, "{first:?}");
+        let count_after_first = orch.sec.uplink_count().to_u32();
+        assert!(orch.service_request_in_progress());
+
+        for _ in 0..10 {
+            let again = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+            assert!(again.is_empty(), "no duplicate SERVICE REQUEST: {again:?}");
+        }
+        assert_eq!(
+            orch.sec.uplink_count().to_u32(),
+            count_after_first,
+            "no UL NAS COUNT spent on duplicates"
+        );
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::ServiceRequestInitiated
+        );
+    }
+
+    /// #316, TS 24.501 §5.6.1.7: a lower-layer release before the Service Accept
+    /// aborts the procedure -- T3517 stopped, 5GMM-REGISTERED -- so after the UE
+    /// reconnects (here: an RLF and a mobility registration elsewhere) it can ask
+    /// for its user plane at once instead of waiting out T3517.
+    #[test]
+    fn a_release_during_a_service_request_stops_t3517() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        assert!(orch.timers().t3517.is_running());
+
+        orch.on_nas_signalling_connection_released();
+
+        assert!(!orch.timers().t3517.is_running(), "T3517 stopped");
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert!(!orch.service_request_in_progress());
+        // Reconnected without a user plane: a new Service Request may go out now.
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.user_plane_reactivation_needed());
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+    }
+
+    /// #316, §5.6.1.7 l): an RRC establishment failure (the SERVICE REQUEST from
+    /// CM-IDLE never got a connection) aborts the procedure too.
+    #[test]
+    fn an_rrc_establishment_failure_aborts_the_service_request() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        orch.on_rrc_establishment_failure();
+        assert!(!orch.timers().t3517.is_running());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert!(
+            !orch
+                .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty(),
+            "the next uplink may try again"
+        );
+    }
+
+    /// #316, TS 24.501 §5.6.1.7: a mobility registration triggered while a service
+    /// request is in progress aborts it and stops T3517; the registration runs
+    /// under T3510.
+    #[test]
+    fn a_mobility_registration_stops_t3517() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        assert!(orch.timers().t3517.is_running());
+
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+
+        assert!(!outs.is_empty(), "the registration request is sent");
+        assert!(!orch.timers().t3517.is_running(), "T3517 stopped");
+        assert!(orch.timers().t3510.is_running());
+        assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
     }
 
     #[test]
