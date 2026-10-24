@@ -51,7 +51,7 @@ nextgsim-pdcp = { path = "../nextgsim-pdcp" }
 nextgsim-rlc = { path = "../nextgsim-rlc" }
 nextgsim-sctp = { path = "../nextgsim-sctp" }
 nextgsim-gnb = { path = "../nextgsim-gnb" }
-nextgsim-ue = { path = "../nextgsim-ue" }
+nextgsim-ue = { path = "../nextgsim-ue", features = ["testing"] }
 
 # 6G AI-native network function crates
 nextgsim-ai = { path = "../nextgsim-ai" }

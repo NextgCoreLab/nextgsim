@@ -79,6 +79,9 @@ pub const T3421: Duration = Duration::from_secs(15);
 /// of the timer, the UE shall retransmit the DETACH REQUEST message"
 /// (§5.5.2.2.4 c).
 pub const MAX_DETACH_RETRANSMISSIONS: u8 = 4;
+/// Type of detach "IMSI detach" in the network-to-UE direction (§9.9.3.7: bits
+/// 3-1 = 011).
+const NETWORK_DETACH_TYPE_IMSI: u8 = 0b011;
 /// Attach attempt counter limit (§5.5.1.2.6: "equal to 5").
 pub const MAX_ATTACH_ATTEMPTS: u8 = 5;
 
@@ -296,10 +299,21 @@ impl EpsNasUe {
     pub fn detach(&mut self, switch_off: bool, connected: bool, now: Instant) -> NasOutput {
         match self.state {
             EmmState::Registered | EmmState::ServiceRequestInitiated => {}
+            EmmState::RegisteredInitiated if connected => {
+                // §5.5.2.2.1: the DETACH REQUEST goes, with T3421, "in the state
+                // EMM-REGISTERED or EMM-REGISTERED-INITIATED". The attach is
+                // abandoned for it, so the MME is told rather than left with an
+                // attach in progress (#369 review).
+                log::info!("EMM: detach requested during attach; T3410 stopped, DETACH REQUEST");
+                self.t3410 = None;
+                self.attach_pti = None;
+                return self.send_detach_request(switch_off, now);
+            }
             EmmState::RegisteredInitiated => {
-                // An attach in progress ends: no point registering only to
-                // detach. Its connection is released by the caller.
-                log::info!("EMM: detach requested during attach; attach aborted, no detach needed");
+                // No connection to send it on: the attach ends locally.
+                log::info!(
+                    "EMM: detach requested during attach without a connection; attach aborted"
+                );
                 self.t3410 = None;
                 self.attach_pti = None;
                 self.enter_detached();
@@ -914,6 +928,20 @@ impl EpsNasUe {
                     log::warn!("EMM: DETACH ACCEPT with no detach in progress; ignored");
                 }
                 NasOutput::default()
+            }
+            DownlinkEmm::DetachRequest {
+                detach_type: NETWORK_DETACH_TYPE_IMSI,
+                cause,
+            } if self.state == EmmState::DeregisteredInitiated && self.detach_request.is_some() => {
+                // §5.5.2.2.4 d): a network "IMSI detach" while this UE runs an
+                // "EPS detach": "the UE shall progress both procedures". The
+                // network's is answered; this UE's own detach goes on, T3421 with
+                // it (#369 review). This UE has no CS domain to detach from.
+                log::info!(
+                    "EMM: network IMSI DETACH REQUEST (cause {cause:?}) during this UE's detach; \
+                     DETACH ACCEPT, own detach continues (§5.5.2.2.4 d)"
+                );
+                self.send_emm(msg::encode_detach_accept())
             }
             DownlinkEmm::DetachRequest { detach_type, cause }
                 if self.state == EmmState::DeregisteredInitiated

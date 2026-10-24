@@ -29,6 +29,9 @@ use nextgsim_lte_ue::rrc::UeRrcState;
 use nextgsim_ue::tun::{TunConfig, TunInterface};
 use tokio::sync::mpsc;
 
+/// The longest control command line read; the commands are a few words.
+const MAX_CONTROL_LINE: u64 = 256;
+
 /// The control socket a running UE listens on unless `LTE_UE_CONTROL_SOCKET`
 /// names another.
 const DEFAULT_CONTROL_SOCKET: &str = "/run/nextgsim/lte-ue.sock";
@@ -121,7 +124,19 @@ async fn control_server(
     if let Some(dir) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::remove_file(&path);
+    // A stale socket from an earlier run is replaced; anything else at the path
+    // is left alone, and the UE runs without a control socket (#369 review).
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        use std::os::unix::fs::FileTypeExt;
+        if !meta.file_type().is_socket() {
+            log::warn!(
+                "{path} exists and is not a socket; no control socket, `lte-ue detach` \
+                 will not reach this UE"
+            );
+            return;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
     let listener = match tokio::net::UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
@@ -146,10 +161,16 @@ async fn serve_control(
     commands: mpsc::UnboundedSender<nextgsim_lte_ue::task::ControlCommand>,
 ) {
     use nextgsim_eps_nas::EmmState;
+    use tokio::io::AsyncReadExt;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
-    if BufReader::new(read).read_line(&mut line).await.is_err() {
+    // One short command line; a peer that sends more is cut off (#369 review).
+    if BufReader::new(read.take(MAX_CONTROL_LINE))
+        .read_line(&mut line)
+        .await
+        .is_err()
+    {
         return;
     }
     let words: Vec<&str> = line.split_whitespace().collect();

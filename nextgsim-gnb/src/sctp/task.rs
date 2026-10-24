@@ -68,6 +68,10 @@ struct Resolver {
     /// unreachable DNS server.
     #[cfg(test)]
     hang: bool,
+    /// Test seam: the next `panics` hostname lookups panic, as a connect task
+    /// that dies mid-attempt (#367 review).
+    #[cfg(test)]
+    panics: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Resolver {
@@ -76,6 +80,14 @@ impl Resolver {
         if let PeerAddr::Host(..) = remote {
             if self.hang {
                 std::future::pending::<()>().await;
+            }
+            use std::sync::atomic::Ordering;
+            if self
+                .panics
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                panic!("test seam: the resolver panics");
             }
             if let Some(over) = &self.override_addrs {
                 let addrs = over.lock().unwrap().clone();
@@ -1010,6 +1022,52 @@ mod tests {
                 NgapMessage::SctpAssociationUp { client_id: 0, .. }
             ));
         }
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        let _ = runner.await;
+    }
+
+    /// #367 review: the connect task's OutcomeGuard, end to end. A connect task
+    /// that panics still reports a failed attempt, so the target leaves
+    /// `connecting`, NGAP hears the association is down, and the target is retried
+    /// and comes up. With a plain sender the panic left `connecting` set and the
+    /// target was never retried.
+    #[tokio::test]
+    async fn a_connect_task_that_panics_is_still_retried() {
+        let (amf, _amf_task) = amf_stand_in("127.0.0.1:0".parse().unwrap()).await;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = SctpTask::new(task_base);
+        task.reconnect_delay = Duration::from_millis(100);
+        task.resolver.override_addrs = Some(std::sync::Arc::new(std::sync::Mutex::new(vec![amf])));
+        task.resolver
+            .panics
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(16);
+        let runner = tokio::spawn(async move { task.run(rx).await });
+        tx.send(TaskMessage::Message(SctpMessage::ConnectionRequest {
+            client_id: 4,
+            local_address: "127.0.0.1".into(),
+            local_port: 0,
+            remote_address: "amf.test".into(),
+            remote_port: amf.port(),
+            ppid: nextgsim_sctp::NGAP_PPID,
+        }))
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                next_association_event(&mut ngap_rx).await,
+                NgapMessage::SctpAssociationDown { client_id: 4 }
+            ),
+            "the panicked attempt is reported as a failure"
+        );
+        assert!(
+            matches!(
+                next_association_event(&mut ngap_rx).await,
+                NgapMessage::SctpAssociationUp { client_id: 4, .. }
+            ),
+            "and the target is retried"
+        );
         tx.send(TaskMessage::Shutdown).await.unwrap();
         let _ = runner.await;
     }

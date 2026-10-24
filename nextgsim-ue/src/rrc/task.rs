@@ -825,7 +825,7 @@ impl RrcTask {
     /// Returns the installed AS security context, if AS security has been
     /// activated (test/observability hook, Wave-6 I5; the in-process cross-end
     /// test in `tests/src/rrc_handshake.rs` checks a re-derived key with it).
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn as_security(&self) -> Option<&AsSecurityContext> {
         self.as_security.as_ref()
     }
@@ -8381,6 +8381,33 @@ mod tests {
                 "the next connection's SRB1 is not suspended"
             );
         });
+    }
+
+    /// #348 delta review: an RRCSetup (the fallback to a request, or a new
+    /// connection) and an RRC release also end the SRB1 suspension.
+    #[test]
+    fn an_rrc_setup_or_release_ends_the_srb1_suspension() {
+        for via_setup in [true, false] {
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+                UeTaskBase::new(as_security_on_config(), 32);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                task.set_pending_kgnb(TEST_KGNB);
+                deliver_gnb_smc(&mut task, 0).await;
+                let _ = next_uplink_rrc(&mut rls_rx);
+                task.suspend_srb1_for_reestablishment();
+                assert!(task.srb1_suspended_for_reestablishment);
+                if via_setup {
+                    task.handle_rrc_setup(1, None).await;
+                } else {
+                    task.handle_rrc_release().await;
+                }
+                assert!(
+                    !task.srb1_suspended_for_reestablishment,
+                    "via_setup={via_setup}"
+                );
+            });
+        }
     }
 
     /// NIA0 is refused: its MAC is all zeros, so "the MAC verified" would prove

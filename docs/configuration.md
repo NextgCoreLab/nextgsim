@@ -258,7 +258,7 @@ tun_name: null
 | `paging_default_cycle_frames` | u16 | 128 | Paging cycle for the UE's own paging occasion (TS 38.304 §7.1). Must match the gNB |
 | `as_security_enabled` | bool | false | AS security on SRB1. Must match the gNB. Not yet usable across a handover (#325) |
 | `dl_arfcn` | u32 | 632448 | Must match every gNB's (handover and re-establishment key derivation) |
-| `require_broadcast_sib1` | bool | false | Require a decoded broadcast SIB1 before a cell is selectable |
+| `require_broadcast_sib1` | bool | false | Require a decoded broadcast SIB1 before a cell is selectable. With `false` a detected cell is selectable at once on a simulated SIB1, but an RRC re-establishment still waits for the selected cell's broadcast SIB1 (its shortMAC-I covers the broadcast cell identity, TS 38.331 §5.3.7.3-4): against a gNB that never broadcasts SIB1 the request is not sent, T311 expires and the UE recovers through RRC_IDLE and a new RRCSetup |
 | `rlc_am_psis` | list of u8 | `[]` | PDU sessions whose DRB uses RLC AM. Must match the gNB |
 | `conditional_handover` | bool | false | Store CHO candidates from RRCReconfiguration and execute one when its condition holds |
 | `eutra_neighbours` | list | `[]` | E-UTRA neighbour cells the UE measures for events B1/B2 |

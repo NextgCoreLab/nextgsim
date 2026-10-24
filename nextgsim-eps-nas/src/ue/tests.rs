@@ -756,7 +756,11 @@ fn t3421_retransmits_four_times_then_gives_up() {
     let mut now = Instant::now();
     let first = ue.detach(false, true, now);
     let first = detach_request_body(&mut mme, &first.uplink[0]);
-    for n in 1..=MAX_DETACH_RETRANSMISSIONS {
+    // §5.5.2.2.4 c): "On the first four expiries of the timer, the UE shall
+    // retransmit the DETACH REQUEST message". The literal, not the constant, so
+    // a changed constant fails here (#369 review).
+    assert_eq!(MAX_DETACH_RETRANSMISSIONS, 4);
+    for n in 1..=4 {
         now += T3421;
         let out = ue.on_timer(now);
         assert_eq!(out.uplink.len(), 1, "retransmission {n}");
@@ -821,4 +825,50 @@ fn a_detach_while_not_attached_stops_attaching() {
     assert!(out.uplink.is_empty());
     assert_eq!(ue.state(), EmmState::Detached);
     assert_eq!(ue.initial_message(Instant::now()), None);
+}
+
+/// #369 review, §5.5.2.2.4 d): a network "IMSI detach" during this UE's "EPS
+/// detach" is answered, and the UE's own detach goes on: still
+/// EMM-DEREGISTERED-INITIATED, T3421 running, completed by its DETACH ACCEPT.
+#[test]
+fn a_network_imsi_detach_during_the_ues_detach_progresses_both() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.detach(false, true, now);
+    detach_request_body(&mut mme, &out.uplink[0]);
+    let req = mme.protect(&[0x07, 0x45, 0x03], 2);
+    let out = ue.on_downlink(&req, now);
+    let accept = mme.unprotect(&out.uplink[0]);
+    assert_eq!(
+        &accept[..2],
+        &[0x07, 0x46],
+        "DETACH ACCEPT for the IMSI detach"
+    );
+    assert_eq!(
+        ue.state(),
+        EmmState::DeregisteredInitiated,
+        "own detach continues"
+    );
+    assert_eq!(ue.next_deadline(), Some(now + T3421));
+    let out = ue.on_downlink(&mme.protect(&[0x07, 0x46], 2), now);
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.state(), EmmState::Detached);
+}
+
+/// #369 review, §5.5.2.2.1: a detach during an attach sends the DETACH REQUEST,
+/// with T3421, on the attach's connection.
+#[test]
+fn a_detach_during_an_attach_sends_the_request() {
+    let now = Instant::now();
+    let mut ue = EpsNasUe::new(cfg());
+    ue.initial_message(now).expect("ATTACH REQUEST");
+    assert_eq!(ue.state(), EmmState::RegisteredInitiated);
+    let out = ue.detach(false, true, now);
+    assert_eq!(
+        &out.uplink[0][..2],
+        &[0x07, 0x45],
+        "plain DETACH REQUEST: no context yet"
+    );
+    assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
+    assert_eq!(ue.next_deadline(), Some(now + T3421), "T3421, not T3410");
 }

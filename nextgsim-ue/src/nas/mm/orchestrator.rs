@@ -49,7 +49,8 @@ use nextgsim_nas::messages::mm::{
 };
 use nextgsim_nas::security::{
     compute_nas_mac, nas_cipher, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
-    NasDirection, NasKeySetIdentifier, NasSecurityContext, NAS_BEARER,
+    NasDirection, NasKeySetIdentifier, NasSecurityContext, SecurityContextState,
+    SecurityContextType, NAS_BEARER,
 };
 
 use crate::timer::{
@@ -3174,15 +3175,17 @@ impl MmOrchestrator {
         }
         // 5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE (TS 24.501 §5.2.3.2.3):
         // the registration area is not up to date, so the UE does not request
-        // service for its own data until the update succeeds; answering a page,
-        // emergency services and high priority access are still allowed (#277).
+        // service for its own data until the update succeeds; answering a page
+        // and emergency services are still allowed, and so is a UE configured
+        // for high priority access -- the same configuration-keyed exemption the
+        // T3346 bar uses, not the request's service type (#277, #333 review).
         if self.state.mm_substate() == MmSubState::RegisteredAttemptingRegistrationUpdate
+            && !self.high_priority_access
             && !matches!(
                 service_type,
                 ServiceType::MobileTerminatedServices
                     | ServiceType::EmergencyServices
                     | ServiceType::EmergencyServicesFallback
-                    | ServiceType::HighPriorityAccess
             )
         {
             info!(
@@ -3483,6 +3486,8 @@ impl MmOrchestrator {
         let raw_cause = plain.get(3).copied().unwrap_or(0);
         // TS 24.501 §5.6.1.5: a SERVICE REJECT with #76 or #78 that is not
         // integrity protected is discarded, before anything else acts on it.
+        // Defence in depth: the §4.4.4.2 allow-list (`allowed_when_plain`)
+        // already drops such a reject before it reaches here (#361 review).
         if !protected && matches!(raw_cause, 76 | 78) {
             warn!("Service Reject with cause #{raw_cause} without integrity protection: discarded");
             return Vec::new();
@@ -3507,7 +3512,8 @@ impl MmOrchestrator {
                 warn!("Service Reject PDU session status ignored: not integrity protected");
             }
         }
-        // §5.6.1.5, regardless of the cause: the forbidden-TAI IEs.
+        // §5.6.1.5, "Regardless of the 5GMM cause value received in the SERVICE
+        // REJECT message via satellite NG-RAN": the forbidden-TAI IEs.
         let mut tais_changed = self.store_service_reject_forbidden_tais(&rej);
         let snpn = self.identity.snpn_nid.is_some();
 
@@ -3524,20 +3530,40 @@ impl MmOrchestrator {
                     self.equivalent_plmns.clear();
                 }
                 self.usim_invalid = true;
-                self.state.switch_mm_state(MmSubState::Deregistered);
+                // §5.6.1.5 #3/#6/#7: "shall enter the state
+                // 5GMM-DEREGISTERED.NO-SUPI" (#361 review).
+                self.state.switch_mm_state(MmSubState::DeregisteredNoSupi);
                 // 5GMM-DEREGISTERED holds no PDU sessions (TS 24.501 §5.6.1.5).
                 outs.push(MmOutput::ReleasePduSessionsLocally);
                 outs.push(MmOutput::RegistrationFailed(cause));
             }
-            MmCause::UeIdentityCannotBeDerived | MmCause::ImplicitlyDeregistered => {
-                // TS 24.501 5.6.1.5: delete the GUTI, enter 5GMM-DEREGISTERED and
-                // perform a fresh initial registration. #9 also sets 5U2.
+            MmCause::UeIdentityCannotBeDerived => {
+                // §5.6.1.5 #9: 5U2, delete the 5G-GUTI, last visited registered
+                // TAI, TAI list and ngKSI, 5GMM-DEREGISTERED, and a new initial
+                // registration.
                 self.up_reactivation_pending = false;
-                if cause == MmCause::UeIdentityCannotBeDerived {
-                    self.state.switch_update_status(UpdateStatus::NotUpdated);
-                }
+                self.state.switch_update_status(UpdateStatus::NotUpdated);
                 self.held_uplink_data_status = None;
                 self.delete_registration_context();
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredNormalService);
+                outs.extend(self.reregister_after_identity_loss());
+            }
+            MmCause::ImplicitlyDeregistered => {
+                // §5.6.1.5 #10: "The UE shall enter the state
+                // 5GMM-DEREGISTERED.NORMAL-SERVICE. The UE shall delete any mapped
+                // 5G NAS security context or partial native 5G NAS security
+                // context", then "perform a new initial registration procedure".
+                // Nothing else is deleted: the 5G-GUTI and a full native context
+                // stay, so the registration is GUTI-based and integrity protected
+                // (#361 review; this used to share #9's deletions).
+                self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
+                let partial_or_mapped = self.sec.tsc() == SecurityContextType::Mapped
+                    || self.sec.state() != SecurityContextState::Active;
+                if partial_or_mapped {
+                    self.sec.reset();
+                }
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredNormalService);
                 outs.extend(self.reregister_after_identity_loss());
@@ -3698,7 +3724,8 @@ impl MmOrchestrator {
     }
 
     /// Store the TAIs of a SERVICE REJECT's forbidden-TAI IEs (TS 24.501
-    /// §5.6.1.5, "regardless of the 5GMM cause value"), if not already stored.
+    /// §5.6.1.5, "Regardless of the 5GMM cause value received in the SERVICE
+    /// REJECT message via satellite NG-RAN"), if not already stored.
     /// Only TAIs of the serving PLMN or an equivalent PLMN are kept; the rest
     /// are ignored. True if a list changed.
     ///
@@ -3717,7 +3744,15 @@ impl MmOrchestrator {
         };
         let mut roaming: Vec<[u8; 6]> = Vec::new();
         let mut service: Vec<[u8; 6]> = Vec::new();
-        if let Some(ref v) = rej.forbidden_tais_roaming {
+        // §5.6.1.5: the roaming list takes the IE's TAIs only "if the UE receives
+        // the Forbidden TAI(s) for the list of "5GS forbidden tracking areas for
+        // roaming" IE and the Access technology utilization control IE is not
+        // included in the SERVICE REJECT message" (#361 review). The regional
+        // provision list has no such condition.
+        if let (Some(ref v), None) = (
+            &rej.forbidden_tais_roaming,
+            &rej.access_tech_utilization_control,
+        ) {
             roaming = tai_list_entries(v)
                 .into_iter()
                 .filter(|t| ours(t))
@@ -6099,6 +6134,39 @@ mod tests {
         assert!(!orch
             .start_service_request(ServiceType::MobileTerminatedServices, None)
             .is_empty());
+    }
+
+    /// #333 review: in ATTEMPTING-REGISTRATION-UPDATE the high-priority exemption
+    /// follows the UE's configuration, as the T3346 bar's does. The request's
+    /// service type alone exempts nothing.
+    #[test]
+    fn the_attempting_update_gate_exempts_a_configured_high_priority_ue_only() {
+        for configured in [false, true] {
+            let mut orch = registered_with_update_in_flight(
+                RegistrationType::MobilityRegistrationUpdating,
+                TAI_NOT_IN_LIST,
+            );
+            orch.high_priority_access = configured;
+            orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::RegisteredAttemptingRegistrationUpdate
+            );
+            let sent = !orch
+                .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty();
+            assert_eq!(sent, configured, "configured={configured}");
+        }
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(
+            orch.start_service_request(ServiceType::HighPriorityAccess, None)
+                .is_empty(),
+            "the service type alone exempts nothing"
+        );
     }
 
     /// #277: an accepted registration stops a retry timer an earlier failure left
@@ -8557,6 +8625,63 @@ mod tests {
         );
     }
 
+    /// #361 review, §5.6.1.5: the roaming list takes the IE's TAIs only when "the
+    /// Access technology utilization control IE is not included in the SERVICE
+    /// REJECT message"; the regional-provision list takes its TAIs regardless.
+    #[test]
+    fn an_atuc_ie_keeps_the_roaming_tais_out_of_the_list() {
+        let ours = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x05];
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request_with(&mut orch, MmCause::ProtocolErrorUnspecified, 2, |r| {
+            r.forbidden_tais_roaming = encode_tai_list(&[ours]);
+            r.forbidden_tais_service = encode_tai_list(&[ours]);
+            r.access_tech_utilization_control = Some(vec![0x01]);
+        });
+        assert!(orch.forbidden_tais_roaming().is_empty());
+        assert_eq!(orch.forbidden_tais_service(), &[ours]);
+    }
+
+    /// #361 review, §5.6.1.5 #3/#6/#7: "shall enter the state
+    /// 5GMM-DEREGISTERED.NO-SUPI".
+    #[test]
+    fn an_illegal_ue_service_reject_enters_no_supi() {
+        for cause in [
+            MmCause::IllegalUe,
+            MmCause::IllegalMe,
+            MmCause::FiveGsServicesNotAllowed,
+        ] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            reject_service_request(&mut orch, cause, None, 2);
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::DeregisteredNoSupi,
+                "{cause:?}"
+            );
+        }
+    }
+
+    /// #361 review, §5.6.1.5 #10: only a mapped or partial native context is
+    /// deleted. The 5G-GUTI and the full native context stay, so the new initial
+    /// registration is GUTI-based and integrity protected.
+    #[test]
+    fn an_implicitly_deregistered_service_reject_keeps_the_guti() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        let guti = orch.stored_guti.clone().expect("registered with a GUTI");
+        let outs = reject_service_request(&mut orch, MmCause::ImplicitlyDeregistered, None, 2);
+        assert_eq!(orch.stored_guti, Some(guti), "the 5G-GUTI stays");
+        assert!(orch.sec.is_active(), "the full native context stays");
+        let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::InitialRegistration
+        );
+        assert_eq!(
+            full.mobile_identity.identity_type,
+            MobileIdentityType::Guti,
+            "a GUTI-based initial registration"
+        );
+    }
+
     /// #27: 5U3, REGISTERED.LIMITED-SERVICE, N1 mode disabled: no Service
     /// Request, no registration.
     #[test]
@@ -8974,12 +9099,16 @@ mod tests {
         ServiceReject::new(MmCause::ImplicitlyDeregistered).encode(&mut rej_pdu);
         let protected = protect_downlink(&orch, &rej_pdu, 2);
         let outs = orch.handle_downlink(&protected);
-        // A fresh registration must be initiated (GUTI deleted -> SUCI used;
-        // security context was reset so the request is plain)
-        let pdu = first_sent_pdu(&outs);
-        assert_eq!(pdu[2], u8::from(MmMessageType::RegistrationRequest));
+        // A new initial registration is initiated (§5.6.1.5 #10). The 5G-GUTI
+        // and the full native security context stay (#361 review), so the
+        // request is GUTI-based and integrity protected.
+        let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::InitialRegistration
+        );
         assert!(!orch.timers().t3517.is_running());
-        assert!(orch.stored_guti().is_none());
+        assert!(orch.stored_guti().is_some());
     }
 
     /// nextgsim #286: an AMF that restarted knows nothing of the UE. The UE,

@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
+            window.path_to_searchindex_js = "searchindex-bbb7f802.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -196,7 +196,7 @@
 </tbody>
 </table>
 </div>
-<p>NextGSim pairs with the <a href="https://github.com/NextgCoreLab/nextgcore">NextGCore</a> core network for end-to-end runs: full RLS → RRC → NGAP → NAS registration, 5G-AKA authentication, PDU session establishment with a GTP-U user plane, CM-IDLE paging and Service Request, de-registration and re-registration, and Xn handover (per the TS 23.502 procedure flows). On the LTE side, <code>lte-ue</code> and <code>lte-enb</code> attach to NextGCore’s EPC and pass a ping through the PDN.</p>
+<p>NextGSim pairs with the <a href="https://github.com/NextgCoreLab/nextgcore">NextGCore</a> core network for end-to-end runs: full RLS → RRC → NGAP → NAS registration, 5G-AKA authentication, PDU session establishment with a GTP-U user plane, CM-IDLE paging and Service Request, de-registration and re-registration, and N2 handover between gNBs (per the TS 23.502 procedure flows; there is no Xn-C between gNBs). On the LTE side, <code>lte-ue</code> and <code>lte-enb</code> attach to NextGCore’s EPC and pass a ping through the PDN.</p>
 <h2 id="crate-layers"><a class="header" href="#crate-layers">Crate Layers</a></h2>
 <p>The workspace is layered from radio link up to AI intelligence:</p>
 <p><strong>Protocol crates</strong> — the wire stack:</p>
