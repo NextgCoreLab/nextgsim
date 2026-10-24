@@ -101,6 +101,10 @@ pub struct NgapAmfContext {
     next_stream: u16,
     /// Set of allocated stream IDs
     allocated_streams: HashSet<u16>,
+    /// Consecutive NG Setup attempts on this association that ended in a
+    /// failure or no response (#312). Sets the retry backoff; cleared by an NG
+    /// Setup Response and by a new association.
+    pub ng_setup_failures: u32,
 }
 
 impl NgapAmfContext {
@@ -122,6 +126,7 @@ impl NgapAmfContext {
             tnla_established: Vec::new(),
             next_stream: 1, // Stream 0 is for non-UE-associated signaling
             allocated_streams: HashSet::new(),
+            ng_setup_failures: 0,
         }
     }
 
@@ -131,6 +136,7 @@ impl NgapAmfContext {
         self.in_streams = in_streams;
         self.out_streams = out_streams;
         self.state = AmfState::Connected;
+        self.ng_setup_failures = 0;
     }
 
     /// Updates the context when SCTP association is closed
@@ -148,6 +154,24 @@ impl NgapAmfContext {
         self.next_stream = 1;
     }
 
+    /// The NG Setup attempt failed (NG Setup Failure, or no response in time)
+    /// while the SCTP association stays up (#312).
+    ///
+    /// Back to `Connected`, NOT `NotConnected`: the association is still there,
+    /// and the retry goes out on it. The AMF's NG Setup Response data is cleared,
+    /// since none is valid any more.
+    pub fn on_ng_setup_attempt_failed(&mut self) {
+        self.state = if self.association_id.is_some() {
+            AmfState::Connected
+        } else {
+            AmfState::NotConnected
+        };
+        self.amf_name = None;
+        self.served_guami_list.clear();
+        self.plmn_support_list.clear();
+        self.ng_setup_failures = self.ng_setup_failures.saturating_add(1);
+    }
+
     /// Updates the context with NG Setup Response data
     pub fn on_ng_setup_response(&mut self, response: NgSetupResponseData) {
         self.amf_name = Some(response.amf_name);
@@ -156,6 +180,7 @@ impl NgapAmfContext {
         self.plmn_support_list = response.plmn_support_list;
         self.unavailable = false;
         self.state = AmfState::Ready;
+        self.ng_setup_failures = 0;
     }
 
     /// Marks the AMF as waiting for NG Setup response

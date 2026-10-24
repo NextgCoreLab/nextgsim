@@ -1969,6 +1969,12 @@ pub struct UeConfig {
     /// without ever being compiled by the gate meant to cover it.
     #[serde(default)]
     pub conditional_handover: bool,
+    /// The UE is configured for high priority access in the selected PLMN
+    /// (access identity 1, 2 or 11..15 in a real USIM, TS 24.501 §4.5.2). Such a
+    /// UE is exempt from T3346 (§5.6.1.7 c) 4)) and from the non-allowed-area
+    /// bar (§5.3.5). Default `false`.
+    #[serde(default)]
+    pub high_priority_access: bool,
     /// Require a decoded broadcast SIB1 before a cell is selectable.
     ///
     /// `false` (the default) keeps the pre-#21 behaviour: on detecting a cell the
@@ -2235,6 +2241,7 @@ impl Default for UeConfig {
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
+            high_priority_access: false,
             paging_default_cycle_frames: default_paging_cycle_frames(),
             lpp_arfcn_eutra: 0,
             rlc_am_psis: Vec::new(),
@@ -2717,6 +2724,7 @@ configured_nssai:
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
+            high_priority_access: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
@@ -3008,6 +3016,7 @@ configured_nssai:
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
+            high_priority_access: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::new(
