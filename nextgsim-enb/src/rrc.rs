@@ -99,6 +99,15 @@ pub enum Action {
         /// The E-RABs.
         bearers: Vec<UpBearer>,
     },
+    /// Broadcast an RRC PDU on a common channel to every UE the cell hears
+    /// (PCCH paging, TS 36.331 §5.3.2). RLS has no paging occasions, so it goes
+    /// out at once.
+    Broadcast {
+        /// Logical channel.
+        channel: RrcChannel,
+        /// The RRC message.
+        pdu: Vec<u8>,
+    },
     /// Send an S1AP PDU to the MME on `stream`.
     S1 {
         /// SCTP stream.
@@ -184,9 +193,12 @@ struct UeContext {
     /// The last user data or signalling to or from the UE, for the
     /// user-inactivity release (#350).
     last_activity: Instant,
-    /// A UE CONTEXT RELEASE REQUEST (user-inactivity) went out and the MME's
-    /// command has not come yet: not sent again (#350).
-    inactivity_release_requested: bool,
+    /// When a UE CONTEXT RELEASE REQUEST (user-inactivity) went out (#350). It
+    /// is not sent again while the MME's command is awaited, but a request is
+    /// re-armed when activity follows it (the MME kept the UE connected) or when
+    /// no command came within one more inactivity period (the request or the
+    /// command was lost), so a UE is never left connected for good (#353 review).
+    inactivity_release_requested_at: Option<Instant>,
 }
 
 impl UeContext {
@@ -318,8 +330,10 @@ impl EnbRrc {
             .iter()
             .filter(|(_, c)| {
                 c.state == UeState::Connected
-                    && !c.inactivity_release_requested
                     && now.saturating_duration_since(c.last_activity) >= limit
+                    && c.inactivity_release_requested_at.is_none_or(|at| {
+                        c.last_activity > at || now.saturating_duration_since(at) >= limit
+                    })
             })
             .filter_map(|(ue, c)| c.mme_ue_s1ap_id.map(|mme| (*ue, mme, c.enb_ue_s1ap_id)))
             .collect();
@@ -331,7 +345,7 @@ impl EnbRrc {
             );
             self.push_release_request_with(&mut acts, mme, enb, CauseRadioNetwork::USER_INACTIVITY);
             if let Some(c) = self.ues.get_mut(&ue) {
-                c.inactivity_release_requested = true;
+                c.inactivity_release_requested_at = Some(now);
             }
         }
         acts
@@ -504,7 +518,7 @@ impl EnbRrc {
             ics: None,
             drbs: Vec::new(),
             last_activity: Instant::now(),
-            inactivity_release_requested: false,
+            inactivity_release_requested_at: None,
         };
         let transaction_id = ctx.next_tid();
         ctx.state = UeState::AwaitingSetupComplete { transaction_id };
@@ -763,12 +777,64 @@ impl EnbRrc {
                 stream: self.ue_stream(enb_ue_s1ap_id),
                 pdu,
             }],
+            S1Inbound::Paging(p) => self.on_paging(&p),
             S1Inbound::ErrorIndication(pdu) => vec![Action::S1 {
                 stream: NON_UE_ASSOCIATED_STREAM,
                 pdu,
             }],
             S1Inbound::NotHandled(what) => {
                 log::info!("S1AP {what}: not handled in this build");
+                vec![]
+            }
+        }
+    }
+
+    /// S1AP PAGING (TS 36.413 §8.5.2): when one of the listed TAIs is this
+    /// cell's (one of its broadcast PLMNs and its TAC), broadcast an RRC Paging
+    /// with the UE's paging record (TS 36.331 §5.3.2.2). A PAGING for other TAs
+    /// is not this cell's to send.
+    fn on_paging(&mut self, p: &s1ap_ue::PagingRequest) -> Vec<Action> {
+        let ours = p
+            .tais
+            .iter()
+            .any(|(plmn, tac)| *tac == self.cell.tac && self.plmns.contains(plmn));
+        if !ours {
+            log::info!(
+                "PAGING for TAIs {:?}: not this cell's (TAC {})",
+                p.tais,
+                self.cell.tac
+            );
+            return vec![];
+        }
+        let identity = match &p.identity {
+            s1ap_ue::PagingIdentity::STmsi { mmec, m_tmsi } => msg::PagedUeIdentity::STmsi {
+                mmec: *mmec,
+                m_tmsi: *m_tmsi,
+            },
+            s1ap_ue::PagingIdentity::Imsi(d) => msg::PagedUeIdentity::Imsi(d.clone()),
+        };
+        let record = msg::PagingRecordInfo {
+            identity,
+            cn_domain: if p.cs_domain {
+                msg::PagingCnDomain::Cs
+            } else {
+                msg::PagingCnDomain::Ps
+            },
+        };
+        match msg::encode_paging(std::slice::from_ref(&record)) {
+            Ok(pdu) => {
+                log::info!(
+                    "PAGING ({:?}, {}): RRC Paging on PCCH",
+                    record.identity,
+                    if p.cs_domain { "CS" } else { "PS" }
+                );
+                vec![Action::Broadcast {
+                    channel: RrcChannel::Pcch,
+                    pdu,
+                }]
+            }
+            Err(e) => {
+                log::warn!("PAGING not broadcast: {e}");
                 vec![]
             }
         }
