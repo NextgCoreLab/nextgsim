@@ -2039,11 +2039,27 @@ impl MmOrchestrator {
         // from 5GMM-REGISTERED (#277).
         self.timers.stop(TIMER_T3511, true);
         self.timers.stop(TIMER_T3502, true);
-        // §5.5.1.3.4: the user plane of the sessions the request named in its
-        // Uplink data status is re-established, except those the PDU session
-        // reactivation result marks as failed (bit set = failed, §9.11.3.42).
+        // §5.5.1.3.4: for an update that carried the Uplink data status IE the
+        // AMF re-establishes the user plane and "include[s] PDU session
+        // reactivation result IE in the REGISTRATION ACCEPT message to indicate
+        // the user-plane resources re-establishment result". A bit of 0 for a
+        // requested session means its user plane "is successful" (§9.11.3.42);
+        // 1, that it is not. An Accept WITHOUT the IE says nothing was
+        // re-established: the requested sessions stay held, and the Service
+        // Request below asks for them. Treating the absence as success left the
+        // uplink held for good with nothing to ask for it (seen against amfd
+        // after a gNB restart, #337 run).
         if let Some(requested) = self.registration_uplink_data_status.take() {
-            let failed = acc.pdu_session_reactivation_result.unwrap_or(0) & requested;
+            let failed = match acc.pdu_session_reactivation_result {
+                Some(result) => result & requested,
+                None => {
+                    warn!(
+                        "Registration Accept carries no PDU session reactivation result for \
+                         the requested {requested:#06x}: the user plane is not re-established"
+                    );
+                    requested
+                }
+            };
             if failed == 0 {
                 info!("Registration Accept re-established the user plane for held uplink");
                 self.up_reactivation_pending = false;
@@ -2210,9 +2226,7 @@ impl MmOrchestrator {
         // service request procedure is started, if still necessary, when timer
         // T3346 expires or is stopped" -- uplink still held asks now (#313
         // re-review).
-        outs.extend(
-            self.retry_held_uplink_service_request("T3346 stopped by the Registration Accept"),
-        );
+        outs.extend(self.retry_held_uplink_service_request("After the Registration Accept"));
         outs
     }
 
@@ -8081,12 +8095,42 @@ mod tests {
         assert_eq!(orch.held_uplink_data_status, None);
     }
 
+    /// An Accept to an update that named held uplink but carries NO PDU session
+    /// reactivation result re-established nothing (§5.5.1.3.4: the AMF includes
+    /// the IE "to indicate the user-plane resources re-establishment result").
+    /// The uplink stays held and, connected, the UE asks with a Service Request.
+    #[test]
+    fn an_accept_without_a_reactivation_result_restores_nothing() {
+        let mut orch = idle_with_held_uplink();
+        orch.sr_backoff_until = None;
+        orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        assert_eq!(
+            orch.registration_uplink_data_status,
+            uplink_data_status(&[1])
+        );
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+        assert!(orch.up_reactivation_pending, "the user plane is still down");
+        assert_eq!(orch.held_uplink_data_status, uplink_data_status(&[1]));
+        assert!(
+            orch.timers().t3517.is_running(),
+            "a Service Request asks for it: {outs:?}"
+        );
+    }
+
     /// #313 review, §5.5.1.3.4: the Registration Accept to an update that named
     /// held uplink brings its user plane back, unless the PDU session
     /// reactivation result marks the session as failed (bit set = failed).
     #[test]
     fn a_registration_accept_restores_the_user_plane_the_update_asked_for() {
-        for (failed, restored) in [(None, true), (Some(0x0002), false)] {
+        for (failed, restored) in [(Some(0x0000), true), (Some(0x0002), false)] {
             let mut orch = idle_with_held_uplink();
             orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
             assert_eq!(
@@ -8105,7 +8149,8 @@ mod tests {
             orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
             assert_eq!(!orch.up_reactivation_pending, restored, "failed={failed:?}");
             assert_eq!(
-                orch.held_uplink_data_status, failed,
+                orch.held_uplink_data_status,
+                failed.filter(|f| *f != 0),
                 "what failed is still held for a Service Request"
             );
         }
