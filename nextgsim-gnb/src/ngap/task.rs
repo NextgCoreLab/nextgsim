@@ -234,6 +234,8 @@ pub struct NgapTask {
     ue_contexts: HashMap<i32, NgapUeContext>,
     /// Counter for generating RAN UE NGAP IDs
     ran_ue_ngap_id_counter: i64,
+    /// The next handover-in UE id (`allocate_handover_ue_id`, #355 review).
+    next_handover_ue_id: i32,
     /// Counter for generating downlink TEIDs
     #[allow(dead_code)]
     downlink_teid_counter: u32,
@@ -321,7 +323,36 @@ const NRPPA_UE_MEASUREMENT_ID_MAX: u16 = 256;
 /// It goes to the UE in the reconfigurationWithSync and back to the RRC task in
 /// `ExpectHandoverArrival`, which binds the arrival on it (#355 review).
 fn handover_c_rnti(ue_id: i32) -> u16 {
-    (ue_id as u32 % 65536) as u16
+    // RNTI-Value is 0..65535, but TS 38.321 §7.1 Table 7.1-1 reserves 0x0000
+    // and 0xFFF0-0xFFFD, and assigns 0xFFFE (P-RNTI) and 0xFFFF (SI-RNTI): a
+    // C-RNTI comes from 0x0001-0xFFEF (#355 review).
+    const USABLE: u32 = 0xFFEF;
+    ((ue_id as u32).wrapping_sub(FIRST_HANDOVER_UE_ID as u32) % USABLE + 1) as u16
+}
+
+/// The first UE id a handover-in admission allocates.
+const FIRST_HANDOVER_UE_ID: i32 = 1000;
+
+/// Criticality Diagnostics for a HANDOVER REQUEST missing its Security Context
+/// (TS 38.413 §9.2.3.4: mandatory, criticality reject; §10.3.5).
+fn missing_security_context_diagnostics(
+) -> nextgsim_ngap::procedures::error_indication::CriticalityDiagnosticsInfo {
+    use nextgsim_ngap::procedures::error_indication::{
+        CriticalityDiagnosticsInfo, CriticalityValue, IeCriticalityDiagnosticsItem,
+        TriggeringMessageValue, TypeOfErrorValue,
+    };
+    CriticalityDiagnosticsInfo {
+        procedure_code: Some(
+            nextgsim_ngap::codec::generated::ID_HANDOVER_RESOURCE_ALLOCATION as u8,
+        ),
+        triggering_message: Some(TriggeringMessageValue::InitiatingMessage),
+        procedure_criticality: Some(CriticalityValue::Reject),
+        ies_criticality_diagnostics: vec![IeCriticalityDiagnosticsItem {
+            ie_criticality: CriticalityValue::Reject,
+            ie_id: nextgsim_ngap::codec::generated::ID_SECURITY_CONTEXT as u16,
+            type_of_error: TypeOfErrorValue::Missing,
+        }],
+    }
 }
 
 impl NgapTask {
@@ -332,6 +363,7 @@ impl NgapTask {
             amf_contexts: HashMap::new(),
             ue_contexts: HashMap::new(),
             ran_ue_ngap_id_counter: 0,
+            next_handover_ue_id: FIRST_HANDOVER_UE_ID,
             downlink_teid_counter: 0,
             is_initialized: false,
             mbs_ngap_sessions: NgapMbsManager::new(),
@@ -510,6 +542,12 @@ impl NgapTask {
     /// production writer at all and `ue-list` answering `ues: []` for a registered
     /// UE.
     async fn create_ue_context(&mut self, ue_id: i32, amf_ctx_id: i32) -> Option<i64> {
+        // A live context is never overwritten: its NGAP IDs, sessions and
+        // tunnels would silently pass to whichever UE asked second (#355 review).
+        if self.ue_contexts.contains_key(&ue_id) {
+            error!("UE context {ue_id} already exists; not overwritten");
+            return None;
+        }
         let amf_ctx = self.amf_contexts.get_mut(&amf_ctx_id)?;
         let stream_id = amf_ctx.allocate_stream()?;
         let ran_ue_ngap_id = self.next_ran_ue_ngap_id();
@@ -4518,19 +4556,20 @@ impl NgapTask {
                 stream,
                 ho_req.amf_ue_ngap_id,
                 NgSetupFailureCause::Protocol(ProtocolCause::AbstractSyntaxErrorReject),
+                // §10.3.5: "report the missing IEs/IE groups": the Security
+                // Context (§9.2.3.4, criticality reject), missing, in the
+                // initiating message of Handover Resource Allocation.
+                Some(missing_security_context_diagnostics()),
             )
             .await;
             return;
         };
 
-        // Allocate a new UE context for the incoming handover
-        let Some(ran_ue_ngap_id) = self
-            .create_ue_context(
-                self.ue_contexts.len() as i32 + 1000, // Handover UE IDs start from 1000
-                client_id,
-            )
-            .await
-        else {
+        // Allocate a new UE context for the incoming handover, under an id no live
+        // context holds (#355 review: `ue_contexts.len() + 1000` reused the id of a
+        // context still alive once an earlier one was released).
+        let new_id = self.allocate_handover_ue_id();
+        let Some(ran_ue_ngap_id) = self.create_ue_context(new_id, client_id).await else {
             error!(
                 "Failed to create UE context for handover, amf_ue_ngap_id={}",
                 ho_req.amf_ue_ngap_id
@@ -4623,6 +4662,7 @@ impl NgapTask {
                 NgSetupFailureCause::RadioNetwork(
                     RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
                 ),
+                None,
             )
             .await;
             self.local_release_ue(ue_id).await;
@@ -4648,6 +4688,7 @@ impl NgapTask {
                     NgSetupFailureCause::RadioNetwork(
                         RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
                     ),
+                    None,
                 )
                 .await;
                 self.local_release_ue(ue_id).await;
@@ -4868,6 +4909,23 @@ impl NgapTask {
         }
     }
 
+    /// The next handover-in UE id: monotonic from [`FIRST_HANDOVER_UE_ID`],
+    /// skipping any id a live context holds, so neither the context nor the
+    /// C-RNTI derived from it (`handover_c_rnti`) is shared (#355 review).
+    fn allocate_handover_ue_id(&mut self) -> i32 {
+        loop {
+            let id = self.next_handover_ue_id;
+            self.next_handover_ue_id = if id == i32::MAX {
+                FIRST_HANDOVER_UE_ID
+            } else {
+                id + 1
+            };
+            if !self.ue_contexts.values().any(|c| c.ue_id == id) {
+                return id;
+            }
+        }
+    }
+
     /// Sends HANDOVER FAILURE (TS 38.413 §8.4.2.3) for the AMF's `amf_ue_ngap_id`.
     async fn send_handover_failure(
         &mut self,
@@ -4875,11 +4933,15 @@ impl NgapTask {
         stream: u16,
         amf_ue_ngap_id: u64,
         cause: NgSetupFailureCause,
+        criticality_diagnostics: Option<
+            nextgsim_ngap::procedures::error_indication::CriticalityDiagnosticsInfo,
+        >,
     ) {
         let failure = nextgsim_ngap::procedures::handover::build_handover_failure(
             &nextgsim_ngap::procedures::handover::HandoverFailureParams {
                 amf_ue_ngap_id,
                 cause,
+                criticality_diagnostics,
             },
         )
         .ok()
@@ -8295,7 +8357,8 @@ mod tests {
             .expect("parse the request");
         task.handle_handover_request(1, 8, ho_req).await;
 
-        let failure = drain_sctp(&mut sctp_rx).iter().any(|bytes| {
+        let drain_sctp_kept = drain_sctp(&mut sctp_rx);
+        let failure = drain_sctp_kept.iter().any(|bytes| {
             matches!(
                 nextgsim_ngap::codec::decode_ngap_pdu(bytes),
                 Ok(NGAP_PDU::UnsuccessfulOutcome(o))
@@ -8303,9 +8366,112 @@ mod tests {
             )
         });
         assert!(failure, "HANDOVER FAILURE");
+        // §10.3.5: the missing IE is reported in Criticality Diagnostics.
+        let diagnostics = drain_sctp_kept.iter().find_map(|bytes| {
+            let Ok(NGAP_PDU::UnsuccessfulOutcome(o)) = nextgsim_ngap::codec::decode_ngap_pdu(bytes)
+            else {
+                return None;
+            };
+            let UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(f) = o.value else {
+                return None;
+            };
+            f.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
+                nextgsim_ngap::codec::generated::HandoverFailureProtocolIEs_EntryValue::Id_CriticalityDiagnostics(d) => Some(d),
+                _ => None,
+            })
+        });
+        let diagnostics = diagnostics.expect("Criticality Diagnostics");
+        let ie = &diagnostics
+            .i_es_criticality_diagnostics
+            .expect("the IEs at fault")
+            .0[0];
+        assert_eq!(
+            ie.ie_id.0,
+            nextgsim_ngap::codec::generated::ID_SECURITY_CONTEXT
+        );
+        assert_eq!(
+            ie.type_of_error.0,
+            nextgsim_ngap::codec::generated::TypeOfError::MISSING
+        );
         assert_eq!(task.ue_contexts.len(), before, "no UE context admitted");
         assert!(gtp_rx.try_recv().is_err(), "no session created");
         assert!(armed_arrivals(&mut rrc_rx).is_empty(), "no arrival armed");
+    }
+
+    /// #355 review (BLOCKER): handover-in ids are never reused while their
+    /// context lives. With `ue_contexts.len() + 1000`, admitting 1000 and 1001 and
+    /// releasing 1000 made the next admission 1001 again, which overwrote the live
+    /// context, and its C-RNTI with it.
+    #[tokio::test]
+    async fn a_handover_in_id_is_not_reused_while_its_context_lives() {
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        let admit = |_: &mut NgapTask| {
+            let pdu = handover_request(&[5], Some(test_security_context()));
+            nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).unwrap()
+        };
+        let before: std::collections::BTreeSet<i32> = task.ue_contexts.keys().copied().collect();
+        let req = admit(&mut task);
+        task.handle_handover_request(1, 8, req).await;
+        let req = admit(&mut task);
+        task.handle_handover_request(1, 8, req).await;
+        let ids: Vec<i32> = task
+            .ue_contexts
+            .keys()
+            .copied()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(ids.len(), 2, "two admissions: {ids:?}");
+        let (first, second) = (
+            ids.iter().min().copied().unwrap(),
+            ids.iter().max().copied().unwrap(),
+        );
+        let second_ran = task.ue_contexts[&second].ran_ue_ngap_id;
+        task.local_release_ue(first).await;
+        let req = admit(&mut task);
+        task.handle_handover_request(1, 8, req).await;
+        assert_eq!(
+            task.ue_contexts[&second].ran_ue_ngap_id, second_ran,
+            "the live context is untouched"
+        );
+        let third: Vec<i32> = task
+            .ue_contexts
+            .keys()
+            .copied()
+            .filter(|id| !before.contains(id) && *id != second)
+            .collect();
+        assert_eq!(third.len(), 1);
+        assert_ne!(third[0], second);
+        assert_ne!(
+            handover_c_rnti(third[0]),
+            handover_c_rnti(second),
+            "C-RNTIs differ"
+        );
+    }
+
+    /// A UE context is never overwritten (#355 review).
+    #[tokio::test]
+    async fn an_existing_ue_context_is_not_overwritten() {
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        let ran = task.ue_contexts[&1].ran_ue_ngap_id;
+        assert!(task.create_ue_context(1, 1).await.is_none());
+        assert_eq!(task.ue_contexts[&1].ran_ue_ngap_id, ran);
+    }
+
+    /// TS 38.321 §7.1 Table 7.1-1: a C-RNTI is 0x0001-0xFFEF. 0x0000 and
+    /// 0xFFF0-0xFFFF (reserved, P-RNTI, SI-RNTI) are never allocated (#355 review).
+    #[test]
+    fn handover_c_rntis_stay_in_the_c_rnti_range() {
+        assert_eq!(handover_c_rnti(FIRST_HANDOVER_UE_ID), 0x0001);
+        assert_eq!(handover_c_rnti(FIRST_HANDOVER_UE_ID + 0xFFEE), 0xFFEF);
+        assert_eq!(
+            handover_c_rnti(FIRST_HANDOVER_UE_ID + 0xFFEF),
+            0x0001,
+            "wraps"
+        );
+        for id in FIRST_HANDOVER_UE_ID..FIRST_HANDOVER_UE_ID + 0x2_0000 {
+            let c = handover_c_rnti(id);
+            assert!((0x0001..=0xFFEF).contains(&c), "{id} -> {c:#06x}");
+        }
     }
 
     /// #324 (nextgcore #978 run): the GTP task learns of a handover-in UE BEFORE

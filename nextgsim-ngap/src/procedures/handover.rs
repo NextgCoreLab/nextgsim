@@ -1347,6 +1347,11 @@ pub struct HandoverFailureParams {
     pub amf_ue_ngap_id: u64,
     /// Cause of failure
     pub cause: HandoverCause,
+    /// Criticality Diagnostics (TS 38.413 §9.2.3.6, optional): for a HANDOVER
+    /// REQUEST rejected for a missing or not understood IE, the IEs at fault
+    /// (§10.3.5, #355 review).
+    pub criticality_diagnostics:
+        Option<crate::procedures::error_indication::CriticalityDiagnosticsInfo>,
 }
 
 /// Parsed Handover Failure data
@@ -1378,6 +1383,17 @@ pub fn build_handover_failure(params: &HandoverFailureParams) -> Result<NGAP_PDU
         criticality: Criticality(Criticality::IGNORE),
         value: HandoverFailureProtocolIEs_EntryValue::Id_Cause(cause),
     });
+
+    // IE: Criticality Diagnostics (optional)
+    if let Some(diag) = &params.criticality_diagnostics {
+        protocol_ies.push(HandoverFailureProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CRITICALITY_DIAGNOSTICS),
+            criticality: Criticality(Criticality::IGNORE),
+            value: HandoverFailureProtocolIEs_EntryValue::Id_CriticalityDiagnostics(
+                crate::procedures::error_indication::build_criticality_diagnostics(diag),
+            ),
+        });
+    }
 
     let handover_failure = HandoverFailure {
         protocol_i_es: HandoverFailureProtocolIEs(protocol_ies),
@@ -2181,6 +2197,7 @@ mod tests {
             cause: NgSetupFailureCause::RadioNetwork(
                 RadioNetworkCause::NoRadioResourcesAvailableInTargetCell,
             ),
+            criticality_diagnostics: None,
         }
     }
 
