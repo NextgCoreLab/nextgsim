@@ -96,6 +96,13 @@ pub trait NasLayer: Send {
     fn on_paging(&mut self, _identity: &PagedUeIdentity) -> bool {
         false
     }
+    /// A UE-initiated detach (TS 24.301 §5.5.2.2, #365). `connected` says
+    /// whether there is a NAS signalling connection to send the DETACH REQUEST
+    /// on now. The returned uplink goes on it; without one, NAS holds the
+    /// request as its next initial NAS message.
+    fn detach(&mut self, _switch_off: bool, _connected: bool) -> NasTimerOutcome {
+        NasTimerOutcome::default()
+    }
 }
 
 /// A NAS that never requests a connection: the UE selects a cell and camps
@@ -236,6 +243,15 @@ impl NasLayer for EpsNas {
         self.ue.k_enb()
     }
 
+    fn detach(&mut self, switch_off: bool, connected: bool) -> NasTimerOutcome {
+        let out = self.ue.detach(switch_off, connected, Instant::now());
+        self.publish();
+        NasTimerOutcome {
+            uplink: out.uplink,
+            release: out.release,
+        }
+    }
+
     fn default_bearer_ebi(&self) -> Option<u8> {
         self.ue.default_bearer().map(|b| b.ebi)
     }
@@ -331,6 +347,23 @@ mod tests {
         let initial = nas.initial_nas().expect("ATTACH REQUEST");
         assert_eq!(&initial.nas[..2], &[0x07, 0x41], "plain ATTACH REQUEST");
         assert_eq!(initial.cause, EstablishmentCauseValue::MoSignalling);
+    }
+
+    /// #365: the real EpsNas holds an idle detach as its initial NAS message,
+    /// with cause mo-Signalling (Annex D), and says it is detaching.
+    #[test]
+    fn an_idle_detach_is_the_next_initial_nas_message() {
+        let mut nas = registered();
+        let out = nas.detach(false, false);
+        assert!(out.uplink.is_empty());
+        let initial = nas.initial_nas().expect("the DETACH REQUEST");
+        assert_eq!(initial.cause, EstablishmentCauseValue::MoSignalling);
+        assert_eq!(initial.nas[0] >> 4, 1, "integrity protected");
+        assert_eq!(nas.ue.state(), EmmState::DeregisteredInitiated);
+        assert_eq!(
+            nas.status.lock().unwrap().state,
+            EmmState::DeregisteredInitiated
+        );
     }
 
     /// Another UE's IMSI must not wipe this UE's registration.

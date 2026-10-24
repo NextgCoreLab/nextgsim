@@ -14,7 +14,7 @@ The workspace has **26 crates** (plus the integration-test crate; count the
 | `lte-enb` | LTE eNB — S1 Setup, UE-associated S1AP, E-UTRA cell over RLS, S1-U GTP-U |
 | `lte-ue` | LTE UE — cell selection, E-UTRA RRC, EPS NAS attach, AS security, DRBs, TUN |
 
-NextGSim pairs with the [NextGCore](https://github.com/NextgCoreLab/nextgcore) core network for end-to-end runs: full RLS → RRC → NGAP → NAS registration, 5G-AKA authentication, PDU session establishment with a GTP-U user plane, CM-IDLE paging and Service Request, de-registration and re-registration, and Xn handover (per the TS 23.502 procedure flows). On the LTE side, `lte-ue` and `lte-enb` attach to NextGCore's EPC and pass a ping through the PDN.
+NextGSim pairs with the [NextGCore](https://github.com/NextgCoreLab/nextgcore) core network for end-to-end runs: full RLS → RRC → NGAP → NAS registration, 5G-AKA authentication, PDU session establishment with a GTP-U user plane, CM-IDLE paging and Service Request, de-registration and re-registration, and N2 handover between gNBs (per the TS 23.502 procedure flows; there is no Xn-C between gNBs). On the LTE side, `lte-ue` and `lte-enb` attach to NextGCore's EPC and pass a ping through the PDN.
 
 ## Crate Layers
 

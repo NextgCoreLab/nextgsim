@@ -49,7 +49,8 @@ use nextgsim_nas::messages::mm::{
 };
 use nextgsim_nas::security::{
     compute_nas_mac, nas_cipher, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
-    NasDirection, NasKeySetIdentifier, NasSecurityContext, NAS_BEARER,
+    NasDirection, NasKeySetIdentifier, NasSecurityContext, SecurityContextState,
+    SecurityContextType, NAS_BEARER,
 };
 
 use crate::timer::{
@@ -187,6 +188,18 @@ pub enum MmOutput {
     /// already in CM-IDLE when this is emitted, so the next NAS message it
     /// builds is an initial NAS message on a fresh RRC connection.
     ReleaseConnectionLocally,
+    /// The "5GS forbidden tracking areas for roaming" or "... for regional
+    /// provision of service" list changed (TS 24.501 §5.3.13, §5.5.1.2.5,
+    /// §5.6.1.5). Both lists, whole, as 6-octet TAIs (PLMN BCD + TAC). The caller
+    /// hands them to RRC cell selection, which must not treat a cell in one of
+    /// those TAs as suitable (TS 38.304 §4.5), so the UE leaves the TA it was
+    /// told it may not use (nextgsim #322).
+    ForbiddenTaisChanged {
+        /// "5GS forbidden tracking areas for roaming".
+        roaming: Vec<[u8; 6]>,
+        /// "5GS forbidden tracking areas for regional provision of service".
+        service: Vec<[u8; 6]>,
+    },
 }
 
 /// The Uplink data status bit for `psi` (TS 24.501 §9.11.3.44).
@@ -684,6 +697,14 @@ pub struct MmOrchestrator {
     /// (`UeConfig::racs_store_assigned_id`)
     racs_store_assigned_id: bool,
     current_tai: Option<[u8; 6]>,
+    /// TAI of the cell the UE is camped on (PLMN + TAC as in the TAI list IE),
+    /// reported by RRC on every cell change. Unlike `current_tai` (the first
+    /// entry of the TAI list), this is where the UE actually is (#277).
+    serving_tai: Option<[u8; 6]>,
+    /// The serving TAI when the last registration update was sent (#277 review).
+    /// While its retry is scheduled (T3511/T3502), a cell change triggers a new
+    /// update only if the TAI differs from this one (TS 24.501 §5.2.3.2.3 d)).
+    update_attempt_tai: Option<[u8; 6]>,
     /// Equivalent PLMN list signalled in the last Registration Accept
     /// (TS 24.501 §5.5.1.2.4 / IE 9.11.3.45). Each entry is a 3-octet
     /// BCD-encoded PLMN, in the network-supplied priority order. Replaced
@@ -800,6 +821,8 @@ impl MmOrchestrator {
             racs_id: None,
             racs_store_assigned_id: false,
             current_tai: None,
+            serving_tai: None,
+            update_attempt_tai: None,
             equivalent_plmns: Vec::new(),
             t3502_value: None,
             forbidden_plmns: Vec::new(),
@@ -1368,6 +1391,54 @@ impl MmOrchestrator {
         self.tai_list.as_deref()
     }
 
+    /// Record the TAI of the cell the UE is now camped on (#277).
+    pub fn set_serving_tai(&mut self, tai: [u8; 6]) {
+        self.serving_tai = Some(tai);
+    }
+
+    /// Whether a cell change (RRC's `ActiveCellChanged`, the serving TAI already
+    /// recorded) starts a registration for mobility and periodic registration
+    /// update (TS 24.501 §5.5.1.3.2 a), §5.2.3.2.3).
+    ///
+    /// - Not registered: no (the initial registration has its own trigger).
+    /// - 5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE with T3346 running: no.
+    ///   §5.2.3.2.3 d) starts the update on a TAI change only "if timer T3346 is
+    ///   not running", and its expiry retries the update.
+    /// - A failed update's retry scheduled (T3511 or T3502): only if the serving
+    ///   TAI differs from the one the failed update was sent in. A re-camp in
+    ///   the same TA must not bypass the retry timer (#275); a move to another TA
+    ///   must not wait it out (§5.2.3.2.3 d), up to 12 minutes of T3502).
+    /// - Otherwise: yes, as before.
+    pub fn registration_update_on_cell_change(&self) -> bool {
+        if !self.state.is_registered() {
+            return false;
+        }
+        if self.state.mm_substate() == MmSubState::RegisteredAttemptingRegistrationUpdate
+            && self.timers.t3346.is_running()
+        {
+            return false;
+        }
+        if self.timers.t3511.is_running() || self.timers.t3502.is_running() {
+            return match (self.serving_tai, self.update_attempt_tai) {
+                (Some(now), Some(then)) => now != then,
+                // The TA of the failed attempt is unknown, or the serving one is:
+                // nothing shows the TAI changed.
+                _ => false,
+            };
+        }
+        true
+    }
+
+    /// Whether the serving cell's TAI is in the stored TAI list. False when
+    /// either is unknown: nothing then shows the UE is inside its registration
+    /// area (#277).
+    fn serving_tai_in_tai_list(&self) -> bool {
+        match (&self.serving_tai, &self.tai_list) {
+            (Some(tai), Some(list)) => tai_list_contains(list, tai),
+            _ => false,
+        }
+    }
+
     /// Equivalent PLMN list (TS 24.501 §5.5.1.2.4) signalled in the last
     /// Registration Accept, as 3-octet BCD PLMNs in priority order. Empty when
     /// the network never signalled one (or deleted it).
@@ -1404,6 +1475,59 @@ impl MmOrchestrator {
     /// "5GS forbidden tracking areas for regional provision of service" list
     pub fn forbidden_tais_service(&self) -> &[[u8; 6]] {
         &self.forbidden_tais_service
+    }
+
+    /// Whether the serving cell's TAI is in either forbidden-TA list, so the UE
+    /// may not register or ask for service there (TS 24.501 §5.3.13). False when
+    /// the serving TAI is unknown.
+    pub fn serving_tai_forbidden(&self) -> bool {
+        self.serving_tai.is_some_and(|tai| {
+            self.forbidden_tais_roaming.contains(&tai) || self.forbidden_tais_service.contains(&tai)
+        })
+    }
+
+    /// The TAI a reject's "current TAI" means: the serving cell's, as RRC last
+    /// reported it, else the first TAI of the stored list.
+    fn current_tai_for_reject(&self) -> Option<[u8; 6]> {
+        self.serving_tai.or(self.current_tai)
+    }
+
+    /// Add `tai` to a forbidden-TA list unless already there. True if it was added.
+    fn add_forbidden_tai(list: &mut Vec<[u8; 6]>, tai: [u8; 6]) -> bool {
+        if list.contains(&tai) {
+            return false;
+        }
+        list.push(tai);
+        true
+    }
+
+    /// The current forbidden-TA lists, for RRC cell selection.
+    fn forbidden_tais_output(&self) -> MmOutput {
+        MmOutput::ForbiddenTaisChanged {
+            roaming: self.forbidden_tais_roaming.clone(),
+            service: self.forbidden_tais_service.clone(),
+        }
+    }
+
+    /// Remove `tai` from the stored TAI list if present (TS 24.501 §5.6.1.5 #13,
+    /// #15). The list is rebuilt as "list of TAIs belonging to different PLMNs"
+    /// partial lists (§9.11.3.9 type 10); a list left empty is deleted.
+    fn remove_tai_from_tai_list(&mut self, tai: &[u8; 6]) {
+        let Some(list) = self.tai_list.as_ref() else {
+            return;
+        };
+        if !tai_list_contains(list, tai) {
+            return;
+        }
+        let kept: Vec<[u8; 6]> = tai_list_entries(list)
+            .into_iter()
+            .filter(|t| t != tai)
+            .collect();
+        self.tai_list = encode_tai_list(&kept);
+        info!(
+            "TAI {tai:02x?} removed from the stored TAI list ({} left)",
+            kept.len()
+        );
     }
 
     /// Registration attempt counter (TS 24.501 Section 5.5.1.2.7)
@@ -1502,7 +1626,10 @@ impl MmOrchestrator {
                 }
             }
             TIMER_T3346 => {
-                if !self.state.is_registered() && !self.usim_invalid {
+                let update_waiting = self.state.mm_substate()
+                    == MmSubState::RegisteredAttemptingRegistrationUpdate
+                    && self.pending_is_registration_update();
+                if (!self.state.is_registered() || update_waiting) && !self.usim_invalid {
                     info!("T3346 expired: congestion backoff over, retrying registration");
                     self.registration_attempt_counter = 0;
                     self.build_and_send_registration(self.pending_reg_type)
@@ -1570,8 +1697,20 @@ impl MmOrchestrator {
     fn may_retry_registration(&self) -> bool {
         !self.usim_invalid
             && !self.n1_mode_disabled
-            && !self.state.is_registered()
+            // A failed mobility/periodic update is retried from 5GMM-REGISTERED
+            // (TS 24.501 §5.5.1.3.7, nextgsim #277).
+            && (!self.state.is_registered() || self.pending_is_registration_update())
             && !self.timers.t3346.is_running()
+    }
+
+    /// Whether the pending registration is a mobility or periodic registration
+    /// update (§5.5.1.3) rather than an initial or emergency registration.
+    fn pending_is_registration_update(&self) -> bool {
+        matches!(
+            self.pending_reg_type,
+            RegistrationType::MobilityRegistrationUpdating
+                | RegistrationType::PeriodicRegistrationUpdating
+        )
     }
 
     // ========================================================================
@@ -1594,8 +1733,18 @@ impl MmOrchestrator {
                 self.timers.t3346.remaining()
             );
             self.pending_reg_type = reg_type;
-            self.state
-                .switch_mm_state(MmSubState::DeregisteredAttemptingRegistration);
+            if self.state.is_registered() && self.pending_is_registration_update() {
+                // A deferred mobility or periodic update leaves the UE
+                // registered: it is still known to the network, just not at its
+                // current location (TS 24.501 §5.5.1.3.7, #277). T3346 expiry
+                // runs the update.
+                self.state.switch_update_status(UpdateStatus::NotUpdated);
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+            } else {
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredAttemptingRegistration);
+            }
             return Vec::new();
         }
         if self.state.mm_substate() == MmSubState::RegisteredInitiated {
@@ -1607,6 +1756,13 @@ impl MmOrchestrator {
 
     /// Build, record and emit a Registration Request; arms T3510.
     fn build_and_send_registration(&mut self, reg_type: RegistrationType) -> Vec<MmOutput> {
+        if matches!(
+            reg_type,
+            RegistrationType::MobilityRegistrationUpdating
+                | RegistrationType::PeriodicRegistrationUpdating
+        ) {
+            self.update_attempt_tai = self.serving_tai;
+        }
         let ng_ksi = if self.sec.is_active() {
             self.sec.nas_ksi()
         } else {
@@ -1879,11 +2035,32 @@ impl MmOrchestrator {
 
         self.timers.stop(TIMER_T3510, true);
         self.timers.stop(TIMER_T3346, true);
-        // §5.5.1.3.4: the user plane of the sessions the request named in its
-        // Uplink data status is re-established, except those the PDU session
-        // reactivation result marks as failed (bit set = failed, §9.11.3.42).
+        // A retry scheduled by an earlier failed attempt is moot once one is
+        // accepted; left running, its expiry would re-run a registration update
+        // from 5GMM-REGISTERED (#277).
+        self.timers.stop(TIMER_T3511, true);
+        self.timers.stop(TIMER_T3502, true);
+        // §5.5.1.3.4: for an update that carried the Uplink data status IE the
+        // AMF re-establishes the user plane and "include[s] PDU session
+        // reactivation result IE in the REGISTRATION ACCEPT message to indicate
+        // the user-plane resources re-establishment result". A bit of 0 for a
+        // requested session means its user plane "is successful" (§9.11.3.42);
+        // 1, that it is not. An Accept WITHOUT the IE says nothing was
+        // re-established: the requested sessions stay held, and the Service
+        // Request below asks for them. Treating the absence as success left the
+        // uplink held for good with nothing to ask for it (seen against amfd
+        // after a gNB restart, #337 run).
         if let Some(requested) = self.registration_uplink_data_status.take() {
-            let failed = acc.pdu_session_reactivation_result.unwrap_or(0) & requested;
+            let failed = match acc.pdu_session_reactivation_result {
+                Some(result) => result & requested,
+                None => {
+                    warn!(
+                        "Registration Accept carries no PDU session reactivation result for \
+                         the requested {requested:#06x}: the user plane is not re-established"
+                    );
+                    requested
+                }
+            };
             if failed == 0 {
                 info!("Registration Accept re-established the user plane for held uplink");
                 self.up_reactivation_pending = false;
@@ -2050,9 +2227,7 @@ impl MmOrchestrator {
         // service request procedure is started, if still necessary, when timer
         // T3346 expires or is stopped" -- uplink still held asks now (#313
         // re-review).
-        outs.extend(
-            self.retry_held_uplink_service_request("T3346 stopped by the Registration Accept"),
-        );
+        outs.extend(self.retry_held_uplink_service_request("After the Registration Accept"));
         outs
     }
 
@@ -2123,24 +2298,28 @@ impl MmOrchestrator {
                     .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 if let Some(tai) = self.current_tai {
-                    self.forbidden_tais_service.push(tai);
+                    Self::add_forbidden_tai(&mut self.forbidden_tais_service, tai);
                 }
                 self.registration_attempt_counter = 0;
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredLimitedService);
-                vec![MmOutput::RegistrationFailed(cause)]
+                vec![
+                    self.forbidden_tais_output(),
+                    MmOutput::RegistrationFailed(cause),
+                ]
             }
             MmCause::RoamingNotAllowedInTa => {
                 self.state
                     .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
                 if let Some(tai) = self.current_tai {
-                    self.forbidden_tais_roaming.push(tai);
+                    Self::add_forbidden_tai(&mut self.forbidden_tais_roaming, tai);
                 }
                 self.registration_attempt_counter = 0;
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
                 vec![
+                    self.forbidden_tais_output(),
                     MmOutput::PlmnSearchNeeded,
                     MmOutput::RegistrationFailed(cause),
                 ]
@@ -2149,16 +2328,22 @@ impl MmOrchestrator {
                 self.state
                     .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 if let Some(tai) = self.current_tai {
-                    self.forbidden_tais_roaming.push(tai);
+                    Self::add_forbidden_tai(&mut self.forbidden_tais_roaming, tai);
                 }
                 self.registration_attempt_counter = 0;
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredLimitedService);
-                vec![MmOutput::RegistrationFailed(cause)]
+                vec![
+                    self.forbidden_tais_output(),
+                    MmOutput::RegistrationFailed(cause),
+                ]
             }
             MmCause::Congestion => {
                 // TS 24.501 5.5.1.2.5 #22: start T3346 with the signalled
-                // value; without a usable value treat as abnormal case
+                // value; without a usable value treat as abnormal case.
+                // §5.5.1.3.5 #22: for a mobility or periodic update the UE stays
+                // registered, in 5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE
+                // (#277).
                 let secs = rej.t3346_value.map(gprs_timer2_seconds).unwrap_or(0);
                 if secs > 0 {
                     self.state.switch_update_status(UpdateStatus::NotUpdated);
@@ -2166,7 +2351,11 @@ impl MmOrchestrator {
                     self.timers
                         .start_with_timer2(TIMER_T3346, GprsTimer2::new(secs), true);
                     self.state
-                        .switch_mm_state(MmSubState::DeregisteredAttemptingRegistration);
+                        .switch_mm_state(if self.pending_is_registration_update() {
+                            MmSubState::RegisteredAttemptingRegistrationUpdate
+                        } else {
+                            MmSubState::DeregisteredAttemptingRegistration
+                        });
                     info!("T3346 (congestion backoff) started: {secs}s");
                     vec![MmOutput::RegistrationFailed(cause)]
                 } else {
@@ -2268,7 +2457,13 @@ impl MmOrchestrator {
     /// Abnormal registration failure (TS 24.501 Section 5.5.1.2.7):
     /// increment the attempt counter; below the limit retry via T3511,
     /// at the limit fall back to T3502.
+    ///
+    /// A mobility or periodic registration update follows §5.5.1.3.7 instead
+    /// (nextgsim #277): the UE stays registered.
     fn abnormal_registration_failure(&mut self) -> Vec<MmOutput> {
+        if self.pending_is_registration_update() {
+            return self.abnormal_registration_update_failure();
+        }
         self.registration_attempt_counter += 1;
         if self.registration_attempt_counter < MAX_REGISTRATION_ATTEMPTS {
             info!(
@@ -2290,6 +2485,62 @@ impl MmOrchestrator {
                 self.timers.start_with_timer3(TIMER_T3502, timer3, true);
             } else {
                 self.timers.start(TIMER_T3502, true);
+            }
+        }
+        Vec::new()
+    }
+
+    /// Abnormal failure of a mobility or periodic registration update
+    /// (TS 24.501 §5.5.1.3.7). Below the attempt limit, T3511 runs. The UE
+    /// re-enters 5GMM-REGISTERED.NORMAL-SERVICE when its update status is still
+    /// 5U1 UPDATED and the current TAI is in its TAI list. Otherwise it goes to
+    /// 5U2 NOT UPDATED and 5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE. At
+    /// the limit: T3502, 5U2, ATTEMPTING-REGISTRATION-UPDATE.
+    ///
+    /// "The TAI is in the list" is the serving cell's TAI, which RRC reports on
+    /// every cell change, against the stored TAI list.
+    fn abnormal_registration_update_failure(&mut self) -> Vec<MmOutput> {
+        if self.registration_attempt_counter < MAX_REGISTRATION_ATTEMPTS {
+            self.registration_attempt_counter += 1;
+        }
+        if self.registration_attempt_counter < MAX_REGISTRATION_ATTEMPTS {
+            if self.serving_tai_in_tai_list() && self.state.update_status() == UpdateStatus::Updated
+            {
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredNormalService);
+            } else {
+                self.state.switch_update_status(UpdateStatus::NotUpdated);
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+            }
+            info!(
+                "Registration update attempt {} of {} failed; {}, starting T3511",
+                self.registration_attempt_counter,
+                MAX_REGISTRATION_ATTEMPTS,
+                self.state.mm_substate()
+            );
+            self.timers.start(TIMER_T3511, true);
+        } else {
+            warn!(
+                "Registration attempt counter reached {}; starting T3502",
+                MAX_REGISTRATION_ATTEMPTS
+            );
+            self.state.switch_update_status(UpdateStatus::NotUpdated);
+            self.state
+                .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+            // A network T3502 of zero starts a zero-length timer, which expires
+            // on the next tick: "the actions defined for the expiry of the timer
+            // T3502", as §5.5.1.3.7 asks.
+            if let Some(timer3) = self.t3502_value {
+                self.timers.start_with_timer3(TIMER_T3502, timer3, true);
+            } else {
+                self.timers.start(TIMER_T3502, true);
+            }
+            // §5.5.1.3.7: at 5 attempts the list of equivalent PLMNs goes too
+            // (single access: never registered over both accesses).
+            if !self.equivalent_plmns.is_empty() {
+                self.equivalent_plmns.clear();
+                return vec![MmOutput::EquivalentPlmnsUpdated(Vec::new())];
             }
         }
         Vec::new()
@@ -2922,6 +3173,31 @@ impl MmOrchestrator {
             info!("Service Request ({service_type:?}) not started: {reason}");
             return Vec::new();
         }
+        // 5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE (TS 24.501 §5.2.3.2.3):
+        // the registration area is not up to date, so the UE does not request
+        // service for its own data until the update succeeds; answering a page
+        // and emergency services are still allowed, and so is a UE configured
+        // for high priority access -- the same configuration-keyed exemption the
+        // T3346 bar uses, not the request's service type (#277, #333 review).
+        if self.state.mm_substate() == MmSubState::RegisteredAttemptingRegistrationUpdate
+            && !self.high_priority_access
+            && !matches!(
+                service_type,
+                ServiceType::MobileTerminatedServices
+                    | ServiceType::EmergencyServices
+                    | ServiceType::EmergencyServicesFallback
+            )
+        {
+            info!(
+                "Service Request ({service_type:?}) not started: registration update pending \
+                 (5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE)"
+            );
+            return Vec::new();
+        }
+        if let Some(reason) = self.service_request_barred(service_type) {
+            info!("Service Request ({service_type:?}) not started: {reason}");
+            return Vec::new();
+        }
         let Some(s_tmsi) = self.build_s_tmsi() else {
             warn!("Service Request not started: no stored 5G-GUTI");
             return Vec::new();
@@ -3048,6 +3324,9 @@ impl MmOrchestrator {
         self.state.is_connected()
             && !self.timers.t3517.is_running()
             && !self.up_reactivation_pending
+            // §5.2.3.2.3 a): in ATTEMPTING-REGISTRATION-UPDATE the UE "shall not
+            // send any user data", even over a user plane still up (#277 review).
+            && self.state.mm_substate() != MmSubState::RegisteredAttemptingRegistrationUpdate
     }
 
     /// Whether uplink data in CM-CONNECTED must first trigger a Service Request
@@ -3077,6 +3356,24 @@ impl MmOrchestrator {
     ///   triggers (data, signalling): it is this UE's choice, not the network's,
     ///   and must not stop the UE answering a page.
     fn service_request_barred(&self, service_type: ServiceType) -> Option<&'static str> {
+        // §5.2.3.2.4-5: 5GMM-REGISTERED.LIMITED-SERVICE and PLMN-SEARCH offer no
+        // normal service; the UE reselects (or selects a PLMN) and only an
+        // emergency request may go out. After #27 N1 mode is disabled (§4.9).
+        let emergency = matches!(
+            service_type,
+            ServiceType::EmergencyServices | ServiceType::EmergencyServicesFallback
+        );
+        if !emergency
+            && matches!(
+                self.state.mm_substate(),
+                MmSubState::RegisteredLimitedService | MmSubState::RegisteredPlmnSearch
+            )
+        {
+            return Some("5GMM-REGISTERED.LIMITED-SERVICE or PLMN-SEARCH (no normal service)");
+        }
+        if self.n1_mode_disabled {
+            return Some("N1 mode is disabled (5GMM cause #27 or #31)");
+        }
         // §5.6.1.7 c) 4) exempts "a UE configured for high priority access in
         // selected PLMN": the UE's configuration, not a request's service type.
         let exempt = matches!(
@@ -3184,13 +3481,41 @@ impl MmOrchestrator {
                 return Vec::new();
             }
         };
+        // The cause octet as sent: #78 has no MmCause variant, so the decoded
+        // value cannot tell it apart from any other unknown cause.
+        let raw_cause = plain.get(3).copied().unwrap_or(0);
+        // TS 24.501 §5.6.1.5: a SERVICE REJECT with #76 or #78 that is not
+        // integrity protected is discarded, before anything else acts on it.
+        // Defence in depth: the §4.4.4.2 allow-list (`allowed_when_plain`)
+        // already drops such a reject before it reaches here (#361 review).
+        if !protected && matches!(raw_cause, 76 | 78) {
+            warn!("Service Reject with cause #{raw_cause} without integrity protection: discarded");
+            return Vec::new();
+        }
         let cause = rej.mm_cause.value;
-        warn!("Service Reject: cause {:?} (#{})", cause, cause as u8);
+        warn!("Service Reject: cause {:?} (#{raw_cause})", cause);
         self.timers.stop(TIMER_T3517, true);
         // `up_reactivation_pending` is NOT cleared here (#313). Only the arms
         // that release the PDU sessions clear it; after any other reject the
         // user plane is still down, so uplink stays held and a new request is
-        // gated on T3346, NON-ALLOWED-SERVICE or the backoff instead.
+        // gated on T3346, NON-ALLOWED-SERVICE, LIMITED-SERVICE, PLMN-SEARCH or
+        // the backoff instead.
+
+        let mut outs = Vec::new();
+        // §5.6.1.5: an integrity-protected reject's PDU session status IE says
+        // which sessions the AMF still has; the UE releases the others locally.
+        // From an unprotected one it is ignored.
+        if let Some(status) = rej.pdu_session_status {
+            if protected {
+                outs.push(MmOutput::NetworkPduSessionStatus(status));
+            } else {
+                warn!("Service Reject PDU session status ignored: not integrity protected");
+            }
+        }
+        // §5.6.1.5, "Regardless of the 5GMM cause value received in the SERVICE
+        // REJECT message via satellite NG-RAN": the forbidden-TAI IEs.
+        let mut tais_changed = self.store_service_reject_forbidden_tais(&rej);
+        let snpn = self.identity.snpn_nid.is_some();
 
         match cause {
             MmCause::IllegalUe | MmCause::IllegalMe | MmCause::FiveGsServicesNotAllowed => {
@@ -3200,23 +3525,137 @@ impl MmOrchestrator {
                 self.state
                     .switch_update_status(UpdateStatus::RoamingNotAllowed);
                 self.delete_registration_context();
+                if cause != MmCause::FiveGsServicesNotAllowed {
+                    // #3/#6 also delete the equivalent PLMNs.
+                    self.equivalent_plmns.clear();
+                }
                 self.usim_invalid = true;
-                self.state.switch_mm_state(MmSubState::Deregistered);
+                // §5.6.1.5 #3/#6/#7: "shall enter the state
+                // 5GMM-DEREGISTERED.NO-SUPI" (#361 review).
+                self.state.switch_mm_state(MmSubState::DeregisteredNoSupi);
                 // 5GMM-DEREGISTERED holds no PDU sessions (TS 24.501 §5.6.1.5).
-                vec![
-                    MmOutput::ReleasePduSessionsLocally,
-                    MmOutput::RegistrationFailed(cause),
-                ]
+                outs.push(MmOutput::ReleasePduSessionsLocally);
+                outs.push(MmOutput::RegistrationFailed(cause));
             }
-            MmCause::UeIdentityCannotBeDerived | MmCause::ImplicitlyDeregistered => {
-                // TS 24.501 5.6.1.5: delete the GUTI, enter 5GMM-DEREGISTERED and
-                // perform a fresh initial registration.
+            MmCause::UeIdentityCannotBeDerived => {
+                // §5.6.1.5 #9: 5U2, delete the 5G-GUTI, last visited registered
+                // TAI, TAI list and ngKSI, 5GMM-DEREGISTERED, and a new initial
+                // registration.
                 self.up_reactivation_pending = false;
+                self.state.switch_update_status(UpdateStatus::NotUpdated);
                 self.held_uplink_data_status = None;
                 self.delete_registration_context();
                 self.state
                     .switch_mm_state(MmSubState::DeregisteredNormalService);
-                self.reregister_after_identity_loss()
+                outs.extend(self.reregister_after_identity_loss());
+            }
+            MmCause::ImplicitlyDeregistered => {
+                // §5.6.1.5 #10: "The UE shall enter the state
+                // 5GMM-DEREGISTERED.NORMAL-SERVICE. The UE shall delete any mapped
+                // 5G NAS security context or partial native 5G NAS security
+                // context", then "perform a new initial registration procedure".
+                // Nothing else is deleted: the 5G-GUTI and a full native context
+                // stay, so the registration is GUTI-based and integrity protected
+                // (#361 review; this used to share #9's deletions).
+                self.up_reactivation_pending = false;
+                self.held_uplink_data_status = None;
+                let partial_or_mapped = self.sec.tsc() == SecurityContextType::Mapped
+                    || self.sec.state() != SecurityContextState::Active;
+                if partial_or_mapped {
+                    self.sec.reset();
+                }
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredNormalService);
+                outs.extend(self.reregister_after_identity_loss());
+            }
+            // #11 PLMN not allowed, #73 serving network not authorized: leave
+            // the PLMN. From an SNPN cell both are abnormal (§5.6.1.7).
+            MmCause::PlmnNotAllowed | MmCause::ServingNetworkNotAuthorized if !snpn => {
+                self.up_reactivation_pending = false;
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.delete_registration_context();
+                self.equivalent_plmns.clear();
+                if !self.forbidden_plmns.contains(&self.identity.plmn_bcd) {
+                    self.forbidden_plmns.push(self.identity.plmn_bcd);
+                }
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
+                outs.push(MmOutput::ReleasePduSessionsLocally);
+                outs.push(MmOutput::PlmnSearchNeeded);
+                outs.push(MmOutput::RegistrationFailed(cause));
+            }
+            // #12 tracking area not allowed: the TA goes on the "regional
+            // provision of service" list and the UE de-registers.
+            MmCause::TrackingAreaNotAllowed => {
+                self.up_reactivation_pending = false;
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
+                let tai = self.current_tai_for_reject();
+                self.delete_registration_context();
+                if let Some(tai) = tai {
+                    tais_changed |= Self::add_forbidden_tai(&mut self.forbidden_tais_service, tai);
+                }
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredLimitedService);
+                outs.push(MmOutput::ReleasePduSessionsLocally);
+                outs.push(MmOutput::RegistrationFailed(cause));
+            }
+            // #13 roaming not allowed in this TA: the UE stays registered, the TA
+            // goes on the "roaming" list and out of the TAI list, PLMN selection.
+            MmCause::RoamingNotAllowedInTa => {
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
+                if let Some(tai) = self.current_tai_for_reject() {
+                    tais_changed |= Self::add_forbidden_tai(&mut self.forbidden_tais_roaming, tai);
+                    self.remove_tai_from_tai_list(&tai);
+                }
+                self.state.switch_mm_state(MmSubState::RegisteredPlmnSearch);
+                outs.push(MmOutput::PlmnSearchNeeded);
+            }
+            // #15 no suitable cells in TA: REGISTERED.LIMITED-SERVICE and a
+            // suitable cell in another TA. The current TAI is not stored when
+            // the reject names the forbidden TAIs itself, or carries an access
+            // technology utilization control IE under integrity protection.
+            MmCause::NoSuitableCellsInTa => {
+                let store_current = rej.forbidden_tais_roaming.is_none()
+                    && !(rej.access_tech_utilization_control.is_some() && protected);
+                if store_current {
+                    if let Some(tai) = self.current_tai_for_reject() {
+                        tais_changed |=
+                            Self::add_forbidden_tai(&mut self.forbidden_tais_roaming, tai);
+                        self.remove_tai_from_tai_list(&tai);
+                    }
+                }
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredLimitedService);
+            }
+            // #27 N1 mode not allowed.
+            MmCause::N1ModeNotAllowed => {
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.n1_mode_disabled = true;
+                self.state
+                    .switch_mm_state(MmSubState::RegisteredLimitedService);
+            }
+            // #74/#75 apply only from an SNPN cell (otherwise abnormal).
+            MmCause::TemporarilyNotAuthorizedForSnpn | MmCause::PermanentlyNotAuthorizedForSnpn
+                if snpn =>
+            {
+                self.up_reactivation_pending = false;
+                self.state
+                    .switch_update_status(UpdateStatus::RoamingNotAllowed);
+                self.delete_registration_context();
+                if cause == MmCause::TemporarilyNotAuthorizedForSnpn {
+                    self.snpn_temporarily_forbidden = true;
+                } else {
+                    self.snpn_permanently_forbidden = true;
+                }
+                self.state
+                    .switch_mm_state(MmSubState::DeregisteredPlmnSearch);
+                outs.push(MmOutput::ReleasePduSessionsLocally);
+                outs.push(MmOutput::PlmnSearchNeeded);
+                outs.push(MmOutput::RegistrationFailed(cause));
             }
             MmCause::Congestion => {
                 // §5.6.1.5 #22: with a T3346 value the UE starts T3346 and may
@@ -3244,7 +3683,6 @@ impl MmOrchestrator {
                 }
                 self.state
                     .switch_mm_state(MmSubState::RegisteredNormalService);
-                Vec::new()
             }
             MmCause::RestrictedServiceArea => {
                 // §5.6.1.5 #28: enter 5GMM-REGISTERED.NON-ALLOWED-SERVICE, wait
@@ -3258,23 +3696,82 @@ impl MmOrchestrator {
                 if self.pending_service_type != Some(ServiceType::ElevatedSignalling) {
                     if self.state.is_connected() {
                         self.mobility_registration_on_release = true;
-                        Vec::new()
                     } else {
-                        self.build_and_send_registration(
+                        outs.extend(self.build_and_send_registration(
                             RegistrationType::MobilityRegistrationUpdating,
-                        )
+                        ));
                     }
-                } else {
-                    Vec::new()
                 }
             }
+            // Every other cause, and those §5.6.1.5 itself calls abnormal here:
+            // #11/#73 from an SNPN cell, #31 (this UE indicates no CIoT
+            // optimization), #36 (not an IAB-node; no MmCause variant, so it
+            // lands here), #72 over 3GPP access, #74/#75 from a non-SNPN cell,
+            // #76 (this UE does not support CAG, so it holds no CAG lists to
+            // update), #77 (not wireline), #78 (not a satellite cell). §5.6.1.7
+            // i): 5GMM-REGISTERED, procedure aborted, resources released. Nothing
+            // says when to retry, so the backoff is this UE's own.
             _ => {
                 self.start_service_reject_backoff();
                 self.state
                     .switch_mm_state(MmSubState::RegisteredNormalService);
-                Vec::new()
             }
         }
+        if tais_changed {
+            outs.push(self.forbidden_tais_output());
+        }
+        outs
+    }
+
+    /// Store the TAIs of a SERVICE REJECT's forbidden-TAI IEs (TS 24.501
+    /// §5.6.1.5, "Regardless of the 5GMM cause value received in the SERVICE
+    /// REJECT message via satellite NG-RAN"), if not already stored.
+    /// Only TAIs of the serving PLMN or an equivalent PLMN are kept; the rest
+    /// are ignored. True if a list changed.
+    ///
+    /// Rel-19 scopes these IEs to a reject received via satellite NG-RAN, and
+    /// the AMF includes them only then. This NAS layer does not know whether
+    /// the cell is a satellite one, so it honours them whenever they arrive: an
+    /// AMF that sends them means them.
+    fn store_service_reject_forbidden_tais(&mut self, rej: &ServiceReject) -> bool {
+        let serving_plmn: [u8; 3] = match self.serving_tai {
+            Some(t) => [t[0], t[1], t[2]],
+            None => self.identity.plmn_bcd,
+        };
+        let ours = |tai: &[u8; 6]| {
+            let plmn = [tai[0], tai[1], tai[2]];
+            plmn == serving_plmn || self.equivalent_plmns.contains(&plmn)
+        };
+        let mut roaming: Vec<[u8; 6]> = Vec::new();
+        let mut service: Vec<[u8; 6]> = Vec::new();
+        // §5.6.1.5: the roaming list takes the IE's TAIs only "if the UE receives
+        // the Forbidden TAI(s) for the list of "5GS forbidden tracking areas for
+        // roaming" IE and the Access technology utilization control IE is not
+        // included in the SERVICE REJECT message" (#361 review). The regional
+        // provision list has no such condition.
+        if let (Some(ref v), None) = (
+            &rej.forbidden_tais_roaming,
+            &rej.access_tech_utilization_control,
+        ) {
+            roaming = tai_list_entries(v)
+                .into_iter()
+                .filter(|t| ours(t))
+                .collect();
+        }
+        if let Some(ref v) = rej.forbidden_tais_service {
+            service = tai_list_entries(v)
+                .into_iter()
+                .filter(|t| ours(t))
+                .collect();
+        }
+        let mut changed = false;
+        for tai in roaming {
+            changed |= Self::add_forbidden_tai(&mut self.forbidden_tais_roaming, tai);
+        }
+        for tai in service {
+            changed |= Self::add_forbidden_tai(&mut self.forbidden_tais_service, tai);
+        }
+        changed
     }
 
     // ========================================================================
@@ -4042,6 +4539,137 @@ fn parse_first_tai(tai_list: &[u8]) -> Option<[u8; 6]> {
     let mut tai = [0u8; 6];
     tai.copy_from_slice(&tai_list[1..7]);
     Some(tai)
+}
+
+/// Whether `tai` (PLMN + TAC, 6 octets) is in a 5GS tracking area identity list
+/// IE value (TS 24.501 §9.11.3.9).
+///
+/// The value is a sequence of partial lists. Each starts with an octet whose
+/// bits 7-6 give the type and bits 5-1 the number of elements minus one:
+/// - `00`: one PLMN, then that many TACs;
+/// - `01`: one PLMN and one TAC, standing for that many consecutive TACs;
+/// - `10`: that many PLMN + TAC pairs.
+///
+/// A truncated or unknown partial list ends the scan: what was parsed so far
+/// still counts, and nothing past it is guessed at.
+fn tai_list_contains(list: &[u8], tai: &[u8; 6]) -> bool {
+    let (plmn, tac) = (&tai[..3], &tai[3..]);
+    let tac_value = |t: &[u8]| (u32::from(t[0]) << 16) | (u32::from(t[1]) << 8) | u32::from(t[2]);
+    let mut rest = list;
+    while let Some((&head, body)) = rest.split_first() {
+        let kind = (head >> 5) & 0x03;
+        let n = usize::from(head & 0x1F) + 1;
+        match kind {
+            0b00 => {
+                let Some(part) = body.get(..3 + 3 * n) else {
+                    return false;
+                };
+                if &part[..3] == plmn && part[3..].chunks_exact(3).any(|t| t == tac) {
+                    return true;
+                }
+                rest = &body[3 + 3 * n..];
+            }
+            0b01 => {
+                let Some(part) = body.get(..6) else {
+                    return false;
+                };
+                if &part[..3] == plmn {
+                    let first = tac_value(&part[3..6]);
+                    let want = tac_value(tac);
+                    // n consecutive TACs from `first`; u64 so the end cannot wrap.
+                    if want >= first && u64::from(want) < u64::from(first) + n as u64 {
+                        return true;
+                    }
+                }
+                rest = &body[6..];
+            }
+            0b10 => {
+                let Some(part) = body.get(..6 * n) else {
+                    return false;
+                };
+                if part.chunks_exact(6).any(|t| t == tai) {
+                    return true;
+                }
+                rest = &body[6 * n..];
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Every TAI in a 5GS tracking area identity list IE value (TS 24.501
+/// §9.11.3.9), in order. A type `01` partial list (consecutive TACs) is
+/// expanded. A truncated or unknown partial list ends the walk, as in
+/// [`tai_list_contains`].
+fn tai_list_entries(list: &[u8]) -> Vec<[u8; 6]> {
+    let mut out = Vec::new();
+    let tai_of = |plmn: &[u8], tac: u32| {
+        let mut t = [0u8; 6];
+        t[..3].copy_from_slice(plmn);
+        t[3..].copy_from_slice(&tac.to_be_bytes()[1..]);
+        t
+    };
+    let mut rest = list;
+    while let Some((&head, body)) = rest.split_first() {
+        let n = usize::from(head & 0x1F) + 1;
+        match (head >> 5) & 0x03 {
+            0b00 => {
+                let Some(part) = body.get(..3 + 3 * n) else {
+                    break;
+                };
+                for tac in part[3..].chunks_exact(3) {
+                    out.push(tai_of(
+                        &part[..3],
+                        u32::from_be_bytes([0, tac[0], tac[1], tac[2]]),
+                    ));
+                }
+                rest = &body[3 + 3 * n..];
+            }
+            0b01 => {
+                let Some(part) = body.get(..6) else {
+                    break;
+                };
+                let first = u32::from_be_bytes([0, part[3], part[4], part[5]]);
+                // TACs are 24 bits; a run past 0xFFFFFF does not exist.
+                for i in 0..n as u32 {
+                    let Some(tac) = first.checked_add(i).filter(|t| *t <= 0x00FF_FFFF) else {
+                        break;
+                    };
+                    out.push(tai_of(&part[..3], tac));
+                }
+                rest = &body[6..];
+            }
+            0b10 => {
+                let Some(part) = body.get(..6 * n) else {
+                    break;
+                };
+                for t in part.chunks_exact(6) {
+                    out.push([t[0], t[1], t[2], t[3], t[4], t[5]]);
+                }
+                rest = &body[6 * n..];
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Encode `tais` as a 5GS tracking area identity list IE value of type `10`
+/// partial lists (TS 24.501 §9.11.3.9), at most 16 elements each. `None` for no
+/// TAIs: an empty list is not a list.
+fn encode_tai_list(tais: &[[u8; 6]]) -> Option<Vec<u8>> {
+    if tais.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for chunk in tais.chunks(16) {
+        out.push(0x40 | (chunk.len() as u8 - 1));
+        for t in chunk {
+            out.extend_from_slice(t);
+        }
+    }
+    Some(out)
 }
 
 /// Parse the Equivalent PLMNs IE value (TS 24.501 §9.11.3.45): a sequence of
@@ -5226,6 +5854,381 @@ mod tests {
         let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3502, true, 1));
         assert!(!outs.is_empty());
         assert_eq!(orch.registration_attempt_counter(), 0);
+    }
+
+    /// The TAI the test registration accept's TAI list holds: PLMN 999/70, TAC 1.
+    const TAI_IN_LIST: [u8; 6] = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x01];
+    /// A TAI the list does not hold: same PLMN, TAC 2.
+    const TAI_NOT_IN_LIST: [u8; 6] = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x02];
+
+    /// A registered UE, camped on `serving_tai`, whose registration update of
+    /// `reg_type` is in flight.
+    fn registered_with_update_in_flight(
+        reg_type: RegistrationType,
+        serving_tai: [u8; 6],
+    ) -> MmOrchestrator {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        assert!(orch.state().is_registered());
+        orch.set_serving_tai(serving_tai);
+        assert!(!orch.start_registration(reg_type).is_empty());
+        assert!(orch.timers().t3510.is_running());
+        orch
+    }
+
+    /// #277 review, TS 24.501 §5.2.3.2.3 d): while a failed update's retry is
+    /// scheduled, a cell change re-registers at once only if the TAI changed; a
+    /// re-camp in the same TA waits for the timer. With T3346 running in
+    /// ATTEMPTING-REGISTRATION-UPDATE, not even a TAI change does.
+    #[test]
+    fn a_tai_change_bypasses_a_scheduled_update_retry_but_a_recamp_does_not() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(
+            orch.timers().t3511.is_running(),
+            "precondition: retry scheduled"
+        );
+
+        orch.set_serving_tai(TAI_NOT_IN_LIST);
+        assert!(
+            !orch.registration_update_on_cell_change(),
+            "same TA: T3511 decides"
+        );
+        orch.set_serving_tai(TAI_IN_LIST);
+        assert!(
+            orch.registration_update_on_cell_change(),
+            "a new TA: the update starts now"
+        );
+
+        // T3502 stage: the same rule.
+        orch.timers.stop(TIMER_T3511, true);
+        orch.timers.start(TIMER_T3502, true);
+        orch.set_serving_tai(TAI_NOT_IN_LIST);
+        assert!(!orch.registration_update_on_cell_change());
+        orch.set_serving_tai(TAI_IN_LIST);
+        assert!(orch.registration_update_on_cell_change());
+
+        // T3346 in ATTEMPTING-REGISTRATION-UPDATE: no update on any cell change.
+        orch.timers.stop(TIMER_T3502, true);
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+        orch.timers
+            .start_with_timer2(TIMER_T3346, GprsTimer2::new(60), true);
+        assert!(!orch.registration_update_on_cell_change());
+        orch.timers.stop(TIMER_T3346, true);
+        assert!(
+            orch.registration_update_on_cell_change(),
+            "no timer: as before"
+        );
+    }
+
+    /// #277 review, §5.2.3.2.3 a): no user data in ATTEMPTING-REGISTRATION-UPDATE,
+    /// even with the user plane still up; back in NORMAL-SERVICE it flows again.
+    #[test]
+    fn no_user_data_in_attempting_registration_update() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.uplink_user_plane_ready(), "precondition");
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredAttemptingRegistrationUpdate);
+        assert!(!orch.uplink_user_plane_ready());
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredNormalService);
+        assert!(orch.uplink_user_plane_ready());
+    }
+
+    /// A UE that is not registered never starts an update on a cell change.
+    #[test]
+    fn a_deregistered_ue_starts_no_update_on_a_cell_change() {
+        let orch = registered_orch();
+        assert!(!orch.registration_update_on_cell_change());
+    }
+
+    /// #277 review, §5.5.1.3.7: at five failed update attempts the equivalent
+    /// PLMN list is deleted, and PLMN selection is told.
+    #[test]
+    fn the_fifth_failed_update_deletes_the_equivalent_plmns() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_IN_LIST,
+        );
+        orch.equivalent_plmns = vec![[0x00, 0xF1, 0x10]];
+        orch.registration_attempt_counter = MAX_REGISTRATION_ATTEMPTS - 1;
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(orch.timers().t3502.is_running());
+        assert!(orch.equivalent_plmns().is_empty());
+        assert!(
+            outs.contains(&MmOutput::EquivalentPlmnsUpdated(Vec::new())),
+            "{outs:?}"
+        );
+    }
+
+    /// nextgsim #277, TS 24.501 §5.5.1.3.7: a failed periodic update with the UE
+    /// still 5U1 UPDATED and its serving TAI in the TAI list returns to
+    /// 5GMM-REGISTERED.NORMAL-SERVICE, and T3511 retries the same update. Before,
+    /// the UE dropped to 5GMM-DEREGISTERED.
+    #[test]
+    fn a_failed_periodic_update_keeps_the_ue_registered_and_retries_it() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::PeriodicRegistrationUpdating,
+            TAI_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+
+        assert!(
+            orch.state().is_registered(),
+            "{}",
+            orch.state().mm_substate()
+        );
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert_eq!(orch.state().update_status(), UpdateStatus::Updated);
+        assert!(orch.timers().t3511.is_running());
+
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3511, true, 1));
+        let pdu = first_sent_pdu(&outs);
+        let (_outer, full) = open_registration_request(&orch, pdu);
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::PeriodicRegistrationUpdating
+        );
+    }
+
+    /// nextgsim #277: a failed update whose serving TAI is NOT in the TAI list
+    /// goes to 5U2 NOT UPDATED and 5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE,
+    /// still registered. At the attempt limit T3502 runs, and its expiry retries
+    /// the update from that state.
+    #[test]
+    fn a_failed_mobility_update_attempts_the_update_while_registered() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        for i in 1..=MAX_REGISTRATION_ATTEMPTS {
+            orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, i));
+            assert!(orch.state().is_registered(), "attempt {i}");
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::RegisteredAttemptingRegistrationUpdate
+            );
+            assert_eq!(orch.state().update_status(), UpdateStatus::NotUpdated);
+            if i < MAX_REGISTRATION_ATTEMPTS {
+                assert!(orch.timers().t3511.is_running());
+                let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3511, true, i));
+                assert!(!outs.is_empty(), "T3511 retries the update");
+            }
+        }
+        assert_eq!(
+            orch.registration_attempt_counter(),
+            MAX_REGISTRATION_ATTEMPTS
+        );
+        assert!(orch.timers().t3502.is_running());
+        assert!(!orch.timers().t3511.is_running());
+
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3502, true, 1));
+        let pdu = first_sent_pdu(&outs);
+        let (_outer, full) = open_registration_request(&orch, pdu);
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::MobilityRegistrationUpdating
+        );
+    }
+
+    /// #277: the serving TAI decides the substate, not the update's type. A
+    /// mobility update (sent for another reason) that fails inside the TAI list
+    /// with 5U1 keeps NORMAL-SERVICE; a periodic one outside it does not.
+    #[test]
+    fn the_serving_tai_decides_the_substate_after_a_failed_update() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::PeriodicRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredAttemptingRegistrationUpdate
+        );
+    }
+
+    /// #277: an initial registration that fails still follows §5.5.1.2.7, i.e.
+    /// 5GMM-DEREGISTERED.ATTEMPTING-REGISTRATION.
+    #[test]
+    fn a_failed_initial_registration_still_deregisters() {
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(!orch.state().is_registered());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::DeregisteredAttemptingRegistration
+        );
+    }
+
+    /// #277, §5.5.1.3.5 #22: a congestion reject of a registration update keeps
+    /// the UE registered (ATTEMPTING-REGISTRATION-UPDATE, 5U2) under T3346, and
+    /// T3346 expiry runs the update.
+    #[test]
+    fn a_congestion_reject_of_an_update_keeps_the_ue_registered() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        let rej = protect_downlink(
+            &orch,
+            &build_registration_reject_pdu(MmCause::Congestion, Some(0x05)),
+            2,
+        );
+        orch.handle_downlink(&rej);
+        assert!(orch.state().is_registered());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredAttemptingRegistrationUpdate
+        );
+        assert_eq!(orch.state().update_status(), UpdateStatus::NotUpdated);
+        assert!(orch.timers().t3346.is_running());
+
+        orch.timers.stop(TIMER_T3346, true);
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3346, true, 1));
+        let pdu = first_sent_pdu(&outs);
+        let (_outer, full) = open_registration_request(&orch, pdu);
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::MobilityRegistrationUpdating
+        );
+    }
+
+    /// #277, §5.2.3.2.3: in ATTEMPTING-REGISTRATION-UPDATE no data Service Request
+    /// is started, but a paging response is.
+    #[test]
+    fn attempting_registration_update_bars_data_service_requests() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredAttemptingRegistrationUpdate
+        );
+        assert!(orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        assert!(!orch
+            .start_service_request(ServiceType::MobileTerminatedServices, None)
+            .is_empty());
+    }
+
+    /// #333 review: in ATTEMPTING-REGISTRATION-UPDATE the high-priority exemption
+    /// follows the UE's configuration, as the T3346 bar's does. The request's
+    /// service type alone exempts nothing.
+    #[test]
+    fn the_attempting_update_gate_exempts_a_configured_high_priority_ue_only() {
+        for configured in [false, true] {
+            let mut orch = registered_with_update_in_flight(
+                RegistrationType::MobilityRegistrationUpdating,
+                TAI_NOT_IN_LIST,
+            );
+            orch.high_priority_access = configured;
+            orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::RegisteredAttemptingRegistrationUpdate
+            );
+            let sent = !orch
+                .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty();
+            assert_eq!(sent, configured, "configured={configured}");
+        }
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::MobilityRegistrationUpdating,
+            TAI_NOT_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(
+            orch.start_service_request(ServiceType::HighPriorityAccess, None)
+                .is_empty(),
+            "the service type alone exempts nothing"
+        );
+    }
+
+    /// #277: an accepted registration stops a retry timer an earlier failure left
+    /// running, so it cannot re-run an update from 5GMM-REGISTERED.
+    #[test]
+    fn a_registration_accept_stops_t3511() {
+        let mut orch = registered_with_update_in_flight(
+            RegistrationType::PeriodicRegistrationUpdating,
+            TAI_IN_LIST,
+        );
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+        assert!(orch.timers().t3511.is_running());
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3511, true, 1));
+        assert!(!outs.is_empty());
+        orch.timers.start(TIMER_T3511, true);
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 2);
+        orch.handle_downlink(&acc);
+        assert!(!orch.timers().t3511.is_running());
+        assert!(!orch.timers().t3502.is_running());
+    }
+
+    /// The 5GS TAI list parser, all three partial-list types (TS 24.501 §9.11.3.9).
+    #[test]
+    fn tai_list_contains_reads_every_partial_list_type() {
+        let plmn = [0x99, 0xF9, 0x07];
+        let tai = |tac: u32| {
+            let mut t = [0u8; 6];
+            t[..3].copy_from_slice(&plmn);
+            t[3..].copy_from_slice(&tac.to_be_bytes()[1..]);
+            t
+        };
+        // Type 00, two TACs (count-1 = 1): 5 and 9.
+        let t00 = [0x01, 0x99, 0xF9, 0x07, 0, 0, 5, 0, 0, 9];
+        assert!(tai_list_contains(&t00, &tai(5)));
+        assert!(tai_list_contains(&t00, &tai(9)));
+        assert!(!tai_list_contains(&t00, &tai(7)));
+        // Type 01, three consecutive TACs from 0x0000FF: FF, 100, 101.
+        let t01 = [0x22, 0x99, 0xF9, 0x07, 0, 0, 0xFF];
+        assert!(tai_list_contains(&t01, &tai(0xFF)));
+        assert!(tai_list_contains(&t01, &tai(0x101)));
+        assert!(!tai_list_contains(&t01, &tai(0x102)));
+        assert!(!tai_list_contains(&t01, &tai(0xFE)));
+        // Type 10, two TAIs with different PLMNs; then a type 00 partial list.
+        let mut t10 = vec![0x41, 0x00, 0xF1, 0x10, 0, 0, 1];
+        t10.extend_from_slice(&tai(3));
+        t10.extend_from_slice(&[0x00, 0x99, 0xF9, 0x07, 0, 0, 8]);
+        assert!(tai_list_contains(&t10, &tai(3)));
+        assert!(tai_list_contains(&t10, &tai(8)));
+        assert!(
+            !tai_list_contains(&t10, &tai(1)),
+            "TAC 1 is in another PLMN"
+        );
+        // Truncated and empty input: no panic, no match.
+        assert!(!tai_list_contains(&t00[..6], &tai(9)));
+        assert!(!tai_list_contains(&[], &tai(1)));
+        assert!(
+            !tai_list_contains(&[0x60, 1, 2, 3], &tai(1)),
+            "type 11 is reserved"
+        );
+        // The last TAC of a 32-element type 01 list at the top of the TAC range.
+        let top = [0x3F, 0x99, 0xF9, 0x07, 0xFF, 0xFF, 0xE0];
+        assert!(tai_list_contains(&top, &tai(0xFF_FFFF)));
     }
 
     #[test]
@@ -7160,12 +8163,42 @@ mod tests {
         assert_eq!(orch.held_uplink_data_status, None);
     }
 
+    /// An Accept to an update that named held uplink but carries NO PDU session
+    /// reactivation result re-established nothing (§5.5.1.3.4: the AMF includes
+    /// the IE "to indicate the user-plane resources re-establishment result").
+    /// The uplink stays held and, connected, the UE asks with a Service Request.
+    #[test]
+    fn an_accept_without_a_reactivation_result_restores_nothing() {
+        let mut orch = idle_with_held_uplink();
+        orch.sr_backoff_until = None;
+        orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        assert_eq!(
+            orch.registration_uplink_data_status,
+            uplink_data_status(&[1])
+        );
+        let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+            SmsOverNasAllowed::NotAllowed,
+            RegistrationResultValue::ThreeGppAccess,
+        ));
+        acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+        let mut plain = Vec::new();
+        acc.encode(&mut plain);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+        assert!(orch.up_reactivation_pending, "the user plane is still down");
+        assert_eq!(orch.held_uplink_data_status, uplink_data_status(&[1]));
+        assert!(
+            orch.timers().t3517.is_running(),
+            "a Service Request asks for it: {outs:?}"
+        );
+    }
+
     /// #313 review, §5.5.1.3.4: the Registration Accept to an update that named
     /// held uplink brings its user plane back, unless the PDU session
     /// reactivation result marks the session as failed (bit set = failed).
     #[test]
     fn a_registration_accept_restores_the_user_plane_the_update_asked_for() {
-        for (failed, restored) in [(None, true), (Some(0x0002), false)] {
+        for (failed, restored) in [(Some(0x0000), true), (Some(0x0002), false)] {
             let mut orch = idle_with_held_uplink();
             orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
             assert_eq!(
@@ -7184,9 +8217,45 @@ mod tests {
             orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
             assert_eq!(!orch.up_reactivation_pending, restored, "failed={failed:?}");
             assert_eq!(
-                orch.held_uplink_data_status, failed,
+                orch.held_uplink_data_status,
+                failed.filter(|f| *f != 0),
                 "what failed is still held for a Service Request"
             );
+        }
+    }
+
+    /// #331 review, §5.6.1.5 #22 / §5.6.1.7 c): "The service request procedure
+    /// is started, if still necessary, when timer T3346 expires or is stopped."
+    /// A Registration Accept stops T3346, and uplink still held then gets its
+    /// Service Request. With nothing held, nothing is asked.
+    #[test]
+    fn a_registration_accept_that_stops_t3346_retries_held_uplink() {
+        for held in [true, false] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+            orch.on_nas_signalling_connection_released();
+            assert!(orch.timers().t3346.is_running());
+            if !held {
+                orch.held_uplink_data_status = None;
+            }
+            let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+                SmsOverNasAllowed::NotAllowed,
+                RegistrationResultValue::ThreeGppAccess,
+            ));
+            acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+            let mut plain = Vec::new();
+            acc.encode(&mut plain);
+            orch.state_mut().switch_cm_state(CmState::Connected);
+            let outs = orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+            assert!(!orch.timers().t3346.is_running(), "the Accept stops T3346");
+            assert_eq!(
+                orch.timers().t3517.is_running(),
+                held,
+                "held={held}: a Service Request after the Accept: {outs:?}"
+            );
+            if held {
+                assert_eq!(orch.pending_service_type, Some(ServiceType::Data));
+            }
         }
     }
 
@@ -7296,6 +8365,516 @@ mod tests {
             );
             assert!(!orch.up_reactivation_pending, "{cause:?}");
         }
+    }
+
+    // ---- #322: SERVICE REJECT cause by cause (TS 24.501 §5.6.1.5) ----
+
+    /// The fixture's registration-area TAI: PLMN 999/70, TAC 1.
+    const FIXTURE_TAI: [u8; 6] = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x01];
+
+    /// Deliver a protected SERVICE REJECT built by `build`.
+    fn reject_service_request_with(
+        orch: &mut MmOrchestrator,
+        cause: MmCause,
+        dl_count: u8,
+        build: impl FnOnce(&mut ServiceReject),
+    ) -> Vec<MmOutput> {
+        let mut rej = ServiceReject::new(cause);
+        build(&mut rej);
+        let mut plain = Vec::new();
+        rej.encode(&mut plain);
+        let protected = protect_downlink(orch, &plain, dl_count);
+        orch.handle_downlink(&protected)
+    }
+
+    /// #11 and #73: 5U3, the registration context and the equivalent PLMNs go,
+    /// the PLMN is forbidden, 5GMM-DEREGISTERED.PLMN-SEARCH, PLMN selection, and
+    /// the PDU sessions are released (DEREGISTERED holds none).
+    #[test]
+    fn a_plmn_not_allowed_service_reject_leaves_the_plmn() {
+        for cause in [
+            MmCause::PlmnNotAllowed,
+            MmCause::ServingNetworkNotAuthorized,
+        ] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            orch.equivalent_plmns = vec![[0x00, 0xF1, 0x10]];
+            let outs = reject_service_request(&mut orch, cause, None, 2);
+            for want in [
+                MmOutput::ReleasePduSessionsLocally,
+                MmOutput::PlmnSearchNeeded,
+                MmOutput::RegistrationFailed(cause),
+            ] {
+                assert!(
+                    outs.contains(&want),
+                    "{cause:?}: {want:?} missing from {outs:?}"
+                );
+            }
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::DeregisteredPlmnSearch,
+                "{cause:?}"
+            );
+            assert_eq!(
+                orch.state().update_status(),
+                UpdateStatus::RoamingNotAllowed
+            );
+            assert!(orch.stored_guti().is_none() && orch.tai_list().is_none());
+            assert!(orch.equivalent_plmns().is_empty(), "{cause:?}");
+            assert_eq!(orch.forbidden_plmns(), &[orch.identity.plmn_bcd]);
+            assert!(!orch.up_reactivation_pending);
+        }
+    }
+
+    /// §5.6.1.5: #11/#73 from an SNPN cell, and #74/#75 from a non-SNPN cell,
+    /// are abnormal (§5.6.1.7 i): the UE stays registered.
+    #[test]
+    fn snpn_mismatched_causes_are_abnormal() {
+        for (cause, snpn) in [
+            (MmCause::PlmnNotAllowed, true),
+            (MmCause::ServingNetworkNotAuthorized, true),
+            (MmCause::TemporarilyNotAuthorizedForSnpn, false),
+            (MmCause::PermanentlyNotAuthorizedForSnpn, false),
+        ] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            orch.identity.snpn_nid = snpn.then(|| "000000000001".to_string());
+            let outs = reject_service_request(&mut orch, cause, None, 2);
+            assert!(outs.is_empty(), "{cause:?}: {outs:?}");
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::RegisteredNormalService,
+                "{cause:?}"
+            );
+            assert!(orch.stored_guti().is_some(), "{cause:?}");
+            assert!(orch.forbidden_plmns().is_empty(), "{cause:?}");
+            assert!(orch.sr_backoff_until.is_some(), "{cause:?}");
+        }
+    }
+
+    /// #74/#75 from an SNPN cell: the SNPN is forbidden, DEREGISTERED.PLMN-SEARCH.
+    #[test]
+    fn an_snpn_not_authorized_service_reject_leaves_the_snpn() {
+        for cause in [
+            MmCause::TemporarilyNotAuthorizedForSnpn,
+            MmCause::PermanentlyNotAuthorizedForSnpn,
+        ] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            orch.identity.snpn_nid = Some("000000000001".to_string());
+            let outs = reject_service_request(&mut orch, cause, None, 2);
+            assert!(outs.contains(&MmOutput::PlmnSearchNeeded), "{outs:?}");
+            assert!(outs.contains(&MmOutput::ReleasePduSessionsLocally));
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::DeregisteredPlmnSearch
+            );
+            assert_eq!(
+                (
+                    orch.snpn_temporarily_forbidden,
+                    orch.snpn_permanently_forbidden
+                ),
+                (
+                    cause == MmCause::TemporarilyNotAuthorizedForSnpn,
+                    cause == MmCause::PermanentlyNotAuthorizedForSnpn
+                )
+            );
+            assert!(orch.stored_guti().is_none());
+        }
+    }
+
+    /// #12: the current TAI goes on the "regional provision of service" list,
+    /// the registration context goes, 5GMM-DEREGISTERED.LIMITED-SERVICE, and
+    /// RRC is told the new list.
+    #[test]
+    fn a_tracking_area_not_allowed_service_reject_forbids_the_ta_and_deregisters() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        let outs = reject_service_request(&mut orch, MmCause::TrackingAreaNotAllowed, None, 2);
+        assert_eq!(orch.forbidden_tais_service(), &[FIXTURE_TAI]);
+        assert!(orch.forbidden_tais_roaming().is_empty());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::DeregisteredLimitedService
+        );
+        assert_eq!(
+            orch.state().update_status(),
+            UpdateStatus::RoamingNotAllowed
+        );
+        assert!(orch.stored_guti().is_none() && orch.tai_list().is_none());
+        assert!(outs.contains(&MmOutput::ReleasePduSessionsLocally));
+        assert!(outs.contains(&MmOutput::ForbiddenTaisChanged {
+            roaming: vec![],
+            service: vec![FIXTURE_TAI],
+        }));
+    }
+
+    /// #13: REGISTERED.PLMN-SEARCH, the current TAI on the "roaming" list and out
+    /// of the TAI list, PLMN selection. The 5G-GUTI and the PDU sessions stay;
+    /// no normal Service Request goes out.
+    #[test]
+    fn a_roaming_not_allowed_in_ta_service_reject_keeps_the_registration() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        let outs = reject_service_request(&mut orch, MmCause::RoamingNotAllowedInTa, None, 2);
+        assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredPlmnSearch);
+        assert_eq!(
+            orch.state().update_status(),
+            UpdateStatus::RoamingNotAllowed
+        );
+        assert_eq!(orch.forbidden_tais_roaming(), &[FIXTURE_TAI]);
+        assert!(orch.serving_tai_forbidden() || orch.serving_tai.is_none());
+        assert!(orch.tai_list().is_none(), "its only TAI was removed");
+        assert!(orch.stored_guti().is_some());
+        assert!(outs.contains(&MmOutput::PlmnSearchNeeded), "{outs:?}");
+        assert!(!outs.contains(&MmOutput::ReleasePduSessionsLocally));
+        assert!(outs.contains(&MmOutput::ForbiddenTaisChanged {
+            roaming: vec![FIXTURE_TAI],
+            service: vec![],
+        }));
+        assert!(orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        assert!(orch
+            .start_service_request(ServiceType::MobileTerminatedServices, None)
+            .is_empty());
+    }
+
+    /// #13 removes only the current TAI: the rest of the registration area stays.
+    #[test]
+    fn a_roaming_not_allowed_in_ta_reject_removes_only_the_current_tai() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        // Type 00, two TACs (1 and 2) of 999/70; camped in TAC 2.
+        orch.tai_list = Some(vec![0x01, 0x99, 0xF9, 0x07, 0, 0, 1, 0, 0, 2]);
+        let tac2 = [0x99, 0xF9, 0x07, 0, 0, 2];
+        orch.set_serving_tai(tac2);
+        reject_service_request(&mut orch, MmCause::RoamingNotAllowedInTa, None, 2);
+        let list = orch.tai_list().expect("TAC 1 is left");
+        assert_eq!(tai_list_entries(list), vec![FIXTURE_TAI]);
+        assert_eq!(orch.forbidden_tais_roaming(), &[tac2]);
+    }
+
+    /// #15: REGISTERED.LIMITED-SERVICE, the current TAI on the "roaming" list.
+    #[test]
+    fn a_no_suitable_cells_service_reject_enters_limited_service() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        let outs = reject_service_request(&mut orch, MmCause::NoSuitableCellsInTa, None, 2);
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredLimitedService
+        );
+        assert_eq!(orch.forbidden_tais_roaming(), &[FIXTURE_TAI]);
+        assert!(orch.tai_list().is_none());
+        assert!(orch.stored_guti().is_some());
+        assert!(!outs.contains(&MmOutput::ReleasePduSessionsLocally));
+        assert!(outs
+            .iter()
+            .any(|o| matches!(o, MmOutput::ForbiddenTaisChanged { .. })));
+        assert!(orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+    }
+
+    /// #15 (Rel-19): the current TAI is NOT stored when the reject names the
+    /// forbidden TAIs itself, or carries an integrity-protected access
+    /// technology utilization control IE. The named TAIs are stored instead.
+    #[test]
+    fn a_no_suitable_cells_reject_naming_tais_does_not_forbid_the_current_one() {
+        let other = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x09];
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request_with(&mut orch, MmCause::NoSuitableCellsInTa, 2, |r| {
+            r.forbidden_tais_roaming = encode_tai_list(&[other]);
+        });
+        assert_eq!(orch.forbidden_tais_roaming(), &[other]);
+        assert!(
+            orch.tai_list().is_some(),
+            "the current TAI stays in the list"
+        );
+
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request_with(&mut orch, MmCause::NoSuitableCellsInTa, 2, |r| {
+            r.access_tech_utilization_control = Some(vec![0x01]);
+        });
+        assert!(orch.forbidden_tais_roaming().is_empty());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredLimitedService
+        );
+    }
+
+    /// §5.6.1.5, regardless of the cause: the forbidden-TAI IEs are stored, but
+    /// only TAIs of the serving or an equivalent PLMN; the rest are ignored.
+    /// Stored once, however often they are repeated.
+    #[test]
+    fn forbidden_tai_ies_are_stored_for_the_serving_and_equivalent_plmns_only() {
+        let ours = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x05];
+        let equivalent = [0x00, 0xF1, 0x10, 0x00, 0x00, 0x05];
+        let foreign = [0x21, 0xF3, 0x54, 0x00, 0x00, 0x05];
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        orch.equivalent_plmns = vec![[0x00, 0xF1, 0x10]];
+        let outs =
+            reject_service_request_with(&mut orch, MmCause::ProtocolErrorUnspecified, 2, |r| {
+                r.forbidden_tais_roaming = encode_tai_list(&[ours, foreign, ours]);
+                r.forbidden_tais_service = encode_tai_list(&[equivalent]);
+            });
+        assert_eq!(orch.forbidden_tais_roaming(), &[ours]);
+        assert_eq!(orch.forbidden_tais_service(), &[equivalent]);
+        assert!(outs.contains(&MmOutput::ForbiddenTaisChanged {
+            roaming: vec![ours],
+            service: vec![equivalent],
+        }));
+        // The cause is still handled: #111 is abnormal.
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+    }
+
+    /// #361 review, §5.6.1.5: the roaming list takes the IE's TAIs only when "the
+    /// Access technology utilization control IE is not included in the SERVICE
+    /// REJECT message"; the regional-provision list takes its TAIs regardless.
+    #[test]
+    fn an_atuc_ie_keeps_the_roaming_tais_out_of_the_list() {
+        let ours = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x05];
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request_with(&mut orch, MmCause::ProtocolErrorUnspecified, 2, |r| {
+            r.forbidden_tais_roaming = encode_tai_list(&[ours]);
+            r.forbidden_tais_service = encode_tai_list(&[ours]);
+            r.access_tech_utilization_control = Some(vec![0x01]);
+        });
+        assert!(orch.forbidden_tais_roaming().is_empty());
+        assert_eq!(orch.forbidden_tais_service(), &[ours]);
+    }
+
+    /// #361 review, §5.6.1.5 #3/#6/#7: "shall enter the state
+    /// 5GMM-DEREGISTERED.NO-SUPI".
+    #[test]
+    fn an_illegal_ue_service_reject_enters_no_supi() {
+        for cause in [
+            MmCause::IllegalUe,
+            MmCause::IllegalMe,
+            MmCause::FiveGsServicesNotAllowed,
+        ] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            reject_service_request(&mut orch, cause, None, 2);
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::DeregisteredNoSupi,
+                "{cause:?}"
+            );
+        }
+    }
+
+    /// #361 review, §5.6.1.5 #10: only a mapped or partial native context is
+    /// deleted. The 5G-GUTI and the full native context stay, so the new initial
+    /// registration is GUTI-based and integrity protected.
+    #[test]
+    fn an_implicitly_deregistered_service_reject_keeps_the_guti() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        let guti = orch.stored_guti.clone().expect("registered with a GUTI");
+        let outs = reject_service_request(&mut orch, MmCause::ImplicitlyDeregistered, None, 2);
+        assert_eq!(orch.stored_guti, Some(guti), "the 5G-GUTI stays");
+        assert!(orch.sec.is_active(), "the full native context stays");
+        let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::InitialRegistration
+        );
+        assert_eq!(
+            full.mobile_identity.identity_type,
+            MobileIdentityType::Guti,
+            "a GUTI-based initial registration"
+        );
+    }
+
+    /// #27: 5U3, REGISTERED.LIMITED-SERVICE, N1 mode disabled: no Service
+    /// Request, no registration.
+    #[test]
+    fn an_n1_mode_not_allowed_service_reject_disables_n1_mode() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::N1ModeNotAllowed, None, 2);
+        assert!(orch.n1_mode_disabled);
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredLimitedService
+        );
+        assert_eq!(
+            orch.state().update_status(),
+            UpdateStatus::RoamingNotAllowed
+        );
+        assert!(orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        assert!(orch
+            .start_registration(RegistrationType::MobilityRegistrationUpdating)
+            .is_empty());
+    }
+
+    /// The causes §5.6.1.5 makes abnormal for this UE -- #31 (no CIoT support
+    /// indicated), #72 (3GPP access), #76 (no CAG support), #77 (not wireline)
+    /// -- and #62, which §5.6.1.5 does not list: 5GMM-REGISTERED, the
+    /// registration kept, the local backoff.
+    #[test]
+    fn causes_that_are_abnormal_here_keep_the_ue_registered() {
+        for cause in [
+            MmCause::RedirectionToEpcRequired,
+            MmCause::Non3gppAccessTo5gcnNotAllowed,
+            MmCause::NotAuthorizedForCag,
+            MmCause::WirelineAccessAreaNotAllowed,
+            MmCause::NoNetworkSlicesAvailable,
+        ] {
+            let mut orch = connected_without_user_plane_with_sr_in_flight();
+            let outs = reject_service_request(&mut orch, cause, None, 2);
+            assert!(outs.is_empty(), "{cause:?}: {outs:?}");
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::RegisteredNormalService,
+                "{cause:?}"
+            );
+            assert_eq!(
+                orch.state().update_status(),
+                UpdateStatus::Updated,
+                "{cause:?}"
+            );
+            assert!(orch.stored_guti().is_some(), "{cause:?}");
+            assert!(!orch.n1_mode_disabled, "{cause:?}");
+            assert!(!orch.timers().t3517.is_running(), "{cause:?}");
+            assert!(orch.sr_backoff_until.is_some(), "{cause:?}");
+        }
+    }
+
+    /// §5.6.1.5: a SERVICE REJECT with #76 or #78 that is not integrity
+    /// protected is discarded: T3517 keeps running, nothing changes.
+    #[test]
+    fn an_unprotected_service_reject_76_or_78_is_discarded() {
+        for raw in [76u8, 78] {
+            let mut orch = establish_security_context();
+            let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+            orch.handle_downlink(&acc);
+            orch.on_nas_signalling_connection_released();
+            assert!(!orch
+                .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty());
+            let mut plain = Vec::new();
+            ServiceReject::new(MmCause::NotAuthorizedForCag).encode(&mut plain);
+            plain[3] = raw;
+            let outs = orch.handle_downlink(&plain);
+            assert!(outs.is_empty(), "#{raw}: {outs:?}");
+            assert!(orch.timers().t3517.is_running(), "#{raw}: not processed");
+            assert!(orch.sr_backoff_until.is_none(), "#{raw}");
+        }
+    }
+
+    /// The control: an unprotected reject with another cause on a new
+    /// connection IS processed (§4.4.4.2), so the test above isolates #76/#78.
+    #[test]
+    fn an_unprotected_service_reject_with_another_cause_is_processed() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        let mut plain = Vec::new();
+        ServiceReject::new(MmCause::ProtocolErrorUnspecified).encode(&mut plain);
+        orch.handle_downlink(&plain);
+        assert!(!orch.timers().t3517.is_running());
+    }
+
+    /// §5.6.1.5: the PDU session status IE of an integrity-protected reject
+    /// reaches the SM reconciliation; from an unprotected reject it is ignored.
+    #[test]
+    fn a_service_reject_pdu_session_status_is_used_only_when_protected() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        let outs =
+            reject_service_request_with(&mut orch, MmCause::ProtocolErrorUnspecified, 2, |r| {
+                r.pdu_session_status = Some(0x0002);
+            });
+        assert!(
+            outs.contains(&MmOutput::NetworkPduSessionStatus(0x0002)),
+            "{outs:?}"
+        );
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        let mut rej = ServiceReject::new(MmCause::ProtocolErrorUnspecified);
+        rej.pdu_session_status = Some(0x0000);
+        let mut plain = Vec::new();
+        rej.encode(&mut plain);
+        let outs = orch.handle_downlink(&plain);
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, MmOutput::NetworkPduSessionStatus(_))),
+            "{outs:?}"
+        );
+    }
+
+    /// #9 sets 5U2 NOT UPDATED (§5.6.1.5).
+    #[test]
+    fn a_ue_identity_cannot_be_derived_service_reject_sets_5u2() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::UeIdentityCannotBeDerived, None, 2);
+        assert_eq!(orch.state().update_status(), UpdateStatus::NotUpdated);
+    }
+
+    /// A registration reject's #12/#13/#15 also reach RRC cell selection, and a
+    /// repeated reject does not duplicate the TAI.
+    #[test]
+    fn a_registration_reject_forbidding_a_ta_tells_rrc_once() {
+        for already_stored in [false, true] {
+            let mut orch = registered_orch();
+            orch.current_tai = Some(FIXTURE_TAI);
+            if already_stored {
+                orch.forbidden_tais_roaming = vec![FIXTURE_TAI];
+            }
+            // A new connection, so the unprotected reject is accepted (§4.4.4.2).
+            orch.on_nas_signalling_connection_released();
+            orch.start_registration(RegistrationType::InitialRegistration);
+            let outs = orch.handle_downlink(&build_registration_reject_pdu(
+                MmCause::NoSuitableCellsInTa,
+                None,
+            ));
+            assert_eq!(orch.forbidden_tais_roaming(), &[FIXTURE_TAI]);
+            assert!(outs.contains(&MmOutput::ForbiddenTaisChanged {
+                roaming: vec![FIXTURE_TAI],
+                service: vec![],
+            }));
+        }
+    }
+
+    /// §9.11.3.9: every partial-list type expands to its TAIs, and the type-10
+    /// re-encoding reads back the same.
+    #[test]
+    fn tai_list_entries_expand_every_partial_list_type() {
+        let list = [
+            // 00: 999/70, TACs 1 and 2
+            0x01, 0x99, 0xF9, 0x07, 0, 0, 1, 0, 0, 2, //
+            // 01: 001/01, three consecutive TACs from 0x10
+            0x22, 0x00, 0xF1, 0x10, 0, 0, 0x10, //
+            // 10: one PLMN+TAC pair
+            0x40, 0x21, 0xF3, 0x54, 0, 1, 0,
+        ];
+        let entries = tai_list_entries(&list);
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[1], [0x99, 0xF9, 0x07, 0, 0, 2]);
+        assert_eq!(entries[4], [0x00, 0xF1, 0x10, 0, 0, 0x12]);
+        assert_eq!(entries[5], [0x21, 0xF3, 0x54, 0, 1, 0]);
+        let encoded = encode_tai_list(&entries).unwrap();
+        assert_eq!(tai_list_entries(&encoded), entries);
+        for t in &entries {
+            assert!(tai_list_contains(&encoded, t));
+        }
+        assert_eq!(encode_tai_list(&[]), None);
+        // 17 TAIs need two partial lists of at most 16.
+        let many: Vec<[u8; 6]> = (0..17u8).map(|i| [0x99, 0xF9, 0x07, 0, 0, i]).collect();
+        let encoded = encode_tai_list(&many).unwrap();
+        assert_eq!(encoded[0], 0x4F);
+        assert_eq!(tai_list_entries(&encoded), many);
+        // A truncated list yields what parsed, and never panics.
+        assert_eq!(tai_list_entries(&list[..12]).len(), 2);
+        // A type-01 run cannot pass the 24-bit TAC space.
+        assert_eq!(
+            tai_list_entries(&[0x3F, 0x00, 0xF1, 0x10, 0xFF, 0xFF, 0xFE]).len(),
+            2
+        );
     }
 
     #[test]
@@ -7520,12 +9099,16 @@ mod tests {
         ServiceReject::new(MmCause::ImplicitlyDeregistered).encode(&mut rej_pdu);
         let protected = protect_downlink(&orch, &rej_pdu, 2);
         let outs = orch.handle_downlink(&protected);
-        // A fresh registration must be initiated (GUTI deleted -> SUCI used;
-        // security context was reset so the request is plain)
-        let pdu = first_sent_pdu(&outs);
-        assert_eq!(pdu[2], u8::from(MmMessageType::RegistrationRequest));
+        // A new initial registration is initiated (§5.6.1.5 #10). The 5G-GUTI
+        // and the full native security context stay (#361 review), so the
+        // request is GUTI-based and integrity protected.
+        let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(
+            full.registration_type.registration_type,
+            RegistrationType::InitialRegistration
+        );
         assert!(!orch.timers().t3517.is_running());
-        assert!(orch.stored_guti().is_none());
+        assert!(orch.stored_guti().is_some());
     }
 
     /// nextgsim #286: an AMF that restarted knows nothing of the UE. The UE,
@@ -8755,6 +10338,7 @@ mod tests {
             system_frame_number: Some(100),
             rsrp_result: Some(60),
             rsrq_result: None,
+            ..Default::default()
         });
 
         let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
@@ -8768,7 +10352,10 @@ mod tests {
         assert_eq!(reply.transaction_id.map(|t| t.transaction_number), Some(0));
         assert!(reply.end_transaction);
         match reply.body {
-            Some(LppBody::ProvideLocationInformation { measurements, .. }) => {
+            Some(LppBody::ProvideLocationInformation {
+                measurements: Some(measurements),
+                ..
+            }) => {
                 let element = measurements.primary_cell.expect("primary");
                 assert_eq!(element.phys_cell_id, 7, "the cell RRC reported");
                 assert_eq!(element.arfcn, 1850);
@@ -8798,6 +10385,7 @@ mod tests {
             system_frame_number: None,
             rsrp_result: Some(60),
             rsrq_result: None,
+            ..Default::default()
         });
         let measured = SidelinkRangingResult {
             peer_layer2_id: 0x00A5_A5A5,
@@ -8821,8 +10409,9 @@ mod tests {
             .body
         {
             Some(LppBody::ProvideLocationInformation {
-                measurements,
+                measurements: Some(measurements),
                 sidelink,
+                ..
             }) => {
                 assert_eq!(
                     sidelink,
@@ -8853,6 +10442,7 @@ mod tests {
             system_frame_number: None,
             rsrp_result: Some(60),
             rsrq_result: None,
+            ..Default::default()
         });
         assert!(
             orch.sidelink_ranging_results().is_empty(),
@@ -8890,6 +10480,7 @@ mod tests {
                 system_frame_number: None,
                 rsrp_result: Some(rsrp),
                 rsrq_result: None,
+                ..Default::default()
             });
             let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
                 panic!("answered");
@@ -8899,7 +10490,10 @@ mod tests {
                 .expect("decodes")
                 .body
             {
-                Some(LppBody::ProvideLocationInformation { measurements, .. }) => {
+                Some(LppBody::ProvideLocationInformation {
+                    measurements: Some(measurements),
+                    ..
+                }) => {
                     let element = measurements.primary_cell.expect("primary");
                     reported.push((element.phys_cell_id, element.rsrp_result));
                 }

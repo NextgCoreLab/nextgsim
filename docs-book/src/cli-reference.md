@@ -82,7 +82,8 @@ lte-enb --config <FILE>
 lte-ue  --config <FILE>
 ```
 
-Each takes only `-c, --config <FILE>` (plus `-h` and `-V`). Their configuration,
+Each takes `-c, --config <FILE>` (plus `-h` and `-V`); `lte-ue` also has the
+`detach` subcommand below. Their configuration,
 and the `NEXTGSIM_*` environment overrides they read, are in
 [configuration.md](configuration.md#lte-enb-configuration-lte-enb). Neither
 registers with `nr-cli`.
@@ -90,6 +91,14 @@ registers with `nr-cli`.
 The `lte-ue` container image also ships `lte-ue-ping-check <target> [count]`,
 which waits for the default bearer's PDN address and asserts a 0%-loss ping
 (exit 0 pass, 1 no bearer, 2 loss).
+
+`lte-ue detach [--switch-off] [--timeout SECS]` (in the image also as
+`lte-ue-detach`) asks the running UE to detach (TS 24.301 §5.5.2.2) through its
+control socket (`LTE_UE_CONTROL_SOCKET`, default `/run/nextgsim/lte-ue.sock`):
+an integrity-protected DETACH REQUEST, "EPS detach", with the switch-off bit as
+asked. It exits 0 once the UE is EMM-DEREGISTERED (after DETACH ACCEPT, or at
+once for switch-off), 1 otherwise. The detached UE does not attach again, and
+its TUN interface goes down.
 
 ---
 
@@ -123,9 +132,11 @@ nr-cli ue0 -e status
 nr-cli gnb                # interactive
 ```
 
-In the Docker images `nr-cli` is not installed; copy `binaries/nr-cli` into the
-container and run it there (nextgcore's `docker/rust/ue-flow-check.sh` does
-exactly this).
+The `nr-ue` image includes `nr-cli` when `binaries/nr-cli` is present at build
+time; otherwise copy it into the container and run it there (nextgcore's
+`docker/rust/ue-flow-check.sh` does exactly this). The image also ships
+`nr-ue-deregister [NODE] [normal|switch-off]`, which runs `deregister` and waits
+until the UE is RM-DEREGISTERED (exit 0), the 5G counterpart of `lte-ue-detach`.
 
 ### UE commands
 

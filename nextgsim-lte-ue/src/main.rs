@@ -2,12 +2,19 @@
 //!
 //! ```bash
 //! lte-ue -c config/lte-ue.yaml
+//! lte-ue detach [--switch-off] [--timeout SECS]   # ask the running UE to detach
 //! ```
 //!
 //! With a `subscriber` configured the UE attaches (TS 24.301 §5.5.1) on the
 //! cell it selects; without one it selects a cell, reads its system
 //! information and camps (TS 36.304 §5.2), because there is no USIM to attach
 //! with.
+//!
+//! A running UE listens on a Unix control socket (`LTE_UE_CONTROL_SOCKET`,
+//! default [`DEFAULT_CONTROL_SOCKET`]). `lte-ue detach` connects to it, and the
+//! UE runs a UE-initiated detach (TS 24.301 §5.5.2.2, #365). The command exits
+//! 0 once the UE is EMM-DEREGISTERED (after DETACH ACCEPT, or at once for a
+//! switch-off detach), 1 otherwise.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
@@ -22,13 +29,197 @@ use nextgsim_lte_ue::rrc::UeRrcState;
 use nextgsim_ue::tun::{TunConfig, TunInterface};
 use tokio::sync::mpsc;
 
+/// The longest control command line read; the commands are a few words.
+const MAX_CONTROL_LINE: u64 = 256;
+
+/// The control socket a running UE listens on unless `LTE_UE_CONTROL_SOCKET`
+/// names another.
+const DEFAULT_CONTROL_SOCKET: &str = "/run/nextgsim/lte-ue.sock";
+
 /// nextgsim LTE UE - E-UTRA UE simulator
 #[derive(Parser, Debug)]
 #[command(name = "lte-ue", author, version, about, long_about = None)]
 struct Args {
-    /// Path to the UE configuration file (YAML)
+    /// Path to the UE configuration file (YAML); runs the UE
     #[arg(short = 'c', long = "config", value_name = "FILE")]
-    config_file: String,
+    config_file: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Ask the running UE to detach (TS 24.301 §5.5.2.2) and wait until it is
+    /// EMM-DEREGISTERED.
+    Detach {
+        /// Detach with the switch-off bit set: the network sends no DETACH ACCEPT
+        #[arg(long)]
+        switch_off: bool,
+        /// Seconds to wait for the detach to complete
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// The UE's control socket
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
+}
+
+/// The control socket path: `LTE_UE_CONTROL_SOCKET`, else the default.
+fn control_socket_path(arg: Option<String>) -> String {
+    arg.or_else(|| std::env::var("LTE_UE_CONTROL_SOCKET").ok())
+        .unwrap_or_else(|| DEFAULT_CONTROL_SOCKET.to_string())
+}
+
+/// `lte-ue detach`: send the command and report the UE's answer.
+async fn detach_client(switch_off: bool, timeout: u64, socket: Option<String>) -> ExitCode {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let path = control_socket_path(socket);
+    let stream = match tokio::net::UnixStream::connect(&path).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lte-ue detach: cannot reach the UE at {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (read, mut write) = stream.into_split();
+    let line = format!(
+        "detach{} {timeout}\n",
+        if switch_off { " switch-off" } else { "" }
+    );
+    if let Err(e) = write.write_all(line.as_bytes()).await {
+        eprintln!("lte-ue detach: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut answer = String::new();
+    let mut read = BufReader::new(read);
+    let wait = std::time::Duration::from_secs(timeout + 5);
+    match tokio::time::timeout(wait, read.read_line(&mut answer)).await {
+        Ok(Ok(_)) => {
+            let answer = answer.trim();
+            println!("{answer}");
+            if answer.starts_with("detached") {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("lte-ue detach: {e}");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("lte-ue detach: no answer from the UE");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Serve the control socket (#365): each connection carries one command line,
+/// `detach [switch-off] [TIMEOUT_SECS]`, and gets one answer line.
+async fn control_server(
+    path: String,
+    status: Option<Arc<Mutex<EpsNasStatus>>>,
+    commands: mpsc::UnboundedSender<nextgsim_lte_ue::task::ControlCommand>,
+) {
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // A stale socket from an earlier run is replaced; anything else at the path
+    // is left alone, and the UE runs without a control socket (#369 review).
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        use std::os::unix::fs::FileTypeExt;
+        if !meta.file_type().is_socket() {
+            log::warn!(
+                "{path} exists and is not a socket; no control socket, `lte-ue detach` \
+                 will not reach this UE"
+            );
+            return;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("no control socket at {path} ({e}); `lte-ue detach` will not reach this UE");
+            return;
+        }
+    };
+    log::info!("control socket {path}");
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let status = status.clone();
+        let commands = commands.clone();
+        tokio::spawn(async move { serve_control(stream, status, commands).await });
+    }
+}
+
+async fn serve_control(
+    stream: tokio::net::UnixStream,
+    status: Option<Arc<Mutex<EpsNasStatus>>>,
+    commands: mpsc::UnboundedSender<nextgsim_lte_ue::task::ControlCommand>,
+) {
+    use nextgsim_eps_nas::EmmState;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (read, mut write) = stream.into_split();
+    let mut line = String::new();
+    // One short command line; a peer that sends more is cut off (#369 review).
+    if BufReader::new(read.take(MAX_CONTROL_LINE))
+        .read_line(&mut line)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let answer = match words.as_slice() {
+        ["detach", rest @ ..] => {
+            let switch_off = rest.contains(&"switch-off");
+            let timeout = rest
+                .iter()
+                .find_map(|w| w.parse::<u64>().ok())
+                .unwrap_or(60);
+            match status {
+                None => "error: no subscriber configured, nothing to detach".to_string(),
+                Some(status) => {
+                    let state = || status.lock().map(|s| s.state).ok();
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+                    let mut asked: Option<tokio::time::Instant> = None;
+                    loop {
+                        let now = tokio::time::Instant::now();
+                        match state() {
+                            Some(EmmState::Detached) => break "detached".to_string(),
+                            Some(EmmState::DeregisteredInitiated) => {}
+                            // Ask (again, at most once a second): RRC does not act
+                            // on a detach while a connection is being set up.
+                            _ if asked
+                                .is_none_or(|t| now >= t + std::time::Duration::from_secs(1)) =>
+                            {
+                                let _ =
+                                    commands.send(nextgsim_lte_ue::task::ControlCommand::Detach {
+                                        switch_off,
+                                    });
+                                asked = Some(now);
+                            }
+                            _ => {}
+                        }
+                        if now >= deadline {
+                            break format!(
+                                "error: not detached within {timeout} s (EMM {:?})",
+                                state()
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+        _ => format!("error: unknown command {:?}", line.trim()),
+    };
+    let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
 }
 
 #[tokio::main]
@@ -39,10 +230,22 @@ async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let args = Args::parse();
-    let cfg = match nextgsim_lte_ue::config::load_with_env_and_validate(&args.config_file) {
+    if let Some(Command::Detach {
+        switch_off,
+        timeout,
+        socket,
+    }) = args.command
+    {
+        return detach_client(switch_off, timeout, socket).await;
+    }
+    let Some(config_file) = args.config_file else {
+        eprintln!("lte-ue: -c <config> is required to run the UE");
+        return ExitCode::FAILURE;
+    };
+    let cfg = match nextgsim_lte_ue::config::load_with_env_and_validate(&config_file) {
         Ok(c) => c,
         Err(e) => {
-            log::error!("{}: {e}", args.config_file);
+            log::error!("{config_file}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -63,10 +266,12 @@ async fn main() -> ExitCode {
         let _ = stop_tx.send(true);
     });
     let (ip, ul_tx, dl_rx) = nextgsim_lte_ue::task::IpIo::channel(256);
+    let mut status = None;
     let nas: Box<dyn nextgsim_lte_ue::nas::NasLayer> = match cfg.eps_nas() {
         Some(n) => {
             log::info!("USIM IMSI {}: EPS NAS enabled", n.imsi);
             let nas = nextgsim_lte_ue::nas::EpsNas::new(n);
+            status = Some(nas.status());
             if let Some(tun) = cfg.tun.clone() {
                 tokio::spawn(tun_bridge(tun, nas.status(), ul_tx, dl_rx));
             }
@@ -77,7 +282,17 @@ async fn main() -> ExitCode {
             Box::new(nextgsim_lte_ue::nas::NoNas)
         }
     };
-    match nextgsim_lte_ue::task::run(&cfg, nas, socket, state_tx, stop_rx, ip).await {
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    tokio::spawn(control_server(
+        control_socket_path(None),
+        status,
+        control_tx,
+    ));
+    match nextgsim_lte_ue::task::run_with_control(
+        &cfg, nas, socket, state_tx, stop_rx, ip, control_rx,
+    )
+    .await
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log::error!("RLS socket failed: {e}");
@@ -154,6 +369,17 @@ async fn tun_bridge(
                 }
             }
             _ = poll.tick() => {
+                // A detached UE has no PDN connection: its TUN goes down (#365).
+                let detached = status
+                    .lock()
+                    .is_ok_and(|s| s.state == nextgsim_eps_nas::EmmState::Detached);
+                if detached {
+                    match tun.set_up(false) {
+                        Ok(()) => log::info!("detached: TUN interface {} down", tun.name()),
+                        Err(e) => log::error!("cannot bring the TUN interface down: {e}"),
+                    }
+                    return;
+                }
                 let Some((ebi, a)) = bearer_ipv4(&status) else { continue };
                 if a == current {
                     continue;

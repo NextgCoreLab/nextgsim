@@ -93,6 +93,9 @@ pub struct ReestablishmentSecurity {
     /// Request Acknowledge. That path is not wired (issue #39), so this stays 0
     /// in a live run — which is the spec's own initial value, not a placeholder.
     pub next_hop_chaining_count: u8,
+    /// `KgNB` the RRC keys derive from (#285 review): a re-establishment re-keys
+    /// from it (TS 38.331 §5.3.7.5).
+    pub kgnb: [u8; 32],
 }
 
 impl std::fmt::Debug for ReestablishmentSecurity {
@@ -161,6 +164,23 @@ pub struct RrcUeContext {
     /// Starts at 0: the UE's first protected uplink PDU is the
     /// SecurityModeComplete.
     ul_pdcp_count: u32,
+    /// An integrity-protected SecurityModeCommand went out and no answer has
+    /// arrived: the next UL-DCCH PDU is a SecurityModeComplete integrity
+    /// protected at UL COUNT 0, or an unprotected SecurityModeFailure (#285).
+    pub(crate) smc_awaiting_answer: bool,
+    /// Downlink SRB1 protection is on: from the moment a protected
+    /// SecurityModeCommand is sent (TS 33.501 §6.7.4: "RRC downlink ciphering
+    /// (encryption) at the gNB/ng-eNB shall start after sending the AS security
+    /// mode command message"), before the
+    /// SecurityModeComplete turns on the uplink (`as_security_active`). Cleared by a
+    /// SecurityModeFailure, after which the UE keeps its old configuration (#285).
+    pub(crate) dl_protection_active: bool,
+    /// The SecurityModeComplete's MAC-I verified (TS 38.331 §5.3.4.3). AS
+    /// security is activated only on a verified Complete (#285).
+    pub(crate) smc_complete_verified: bool,
+    /// The next DL-DCCH PDU is integrity protected but NOT ciphered: the
+    /// RRCReestablishment (TS 38.331 §5.3.7.5 resumes ciphering only after it).
+    pub(crate) dl_next_integrity_only: bool,
 }
 
 impl RrcUeContext {
@@ -180,7 +200,19 @@ impl RrcUeContext {
             as_security_active: false,
             dl_pdcp_count: 1,
             ul_pdcp_count: 0,
+            smc_awaiting_answer: false,
+            dl_protection_active: false,
+            smc_complete_verified: false,
+            dl_next_integrity_only: false,
         }
+    }
+
+    /// PDCP for SRB1 is (re-)established (TS 38.331 §5.3.7.4, §5.3.13.3,
+    /// §5.3.5.8.3): both COUNTs restart at 0 (#285). The UE resets at the same
+    /// points.
+    pub fn reestablish_srb1_pdcp(&mut self) {
+        self.dl_pdcp_count = 0;
+        self.ul_pdcp_count = 0;
     }
 
     /// Records the AS security material a re-establishment is verified against,
@@ -193,6 +225,7 @@ impl RrcUeContext {
     /// (TS 38.331 §5.3.4.3).
     pub fn on_as_security_activated(&mut self) {
         self.as_security_active = true;
+        self.dl_protection_active = true;
     }
 
     /// Whether AS security is active for this UE.
@@ -327,6 +360,9 @@ pub struct SuspendedUeContext {
     pub ran_notification_area: Option<RanNotificationArea>,
     /// `t380` in minutes, as signalled. Recorded, not enforced — see the type docs.
     pub t380_minutes: Option<u16>,
+    /// Whether SRB1 was protected (AS security active) when the UE was
+    /// suspended: a resume brings that back, on a re-established SRB1 (#285).
+    pub srb1_protected: bool,
 }
 
 // NOTE on what is deliberately NOT stored: the UE's radio bearer configuration.
@@ -466,7 +502,7 @@ impl RrcUeContextManager {
         ran_notification_area: Option<RanNotificationArea>,
         t380_minutes: Option<u16>,
     ) -> Option<&SuspendedUeContext> {
-        self.contexts.get(&ue_id)?;
+        let srb1_protected = self.contexts.get(&ue_id)?.as_security_active();
         // Removed from the active map, not merely flagged: the UE is no longer
         // reachable by `ue_id`, and leaving it there would let a downlink send path
         // address a UE that is not listening.
@@ -479,6 +515,7 @@ impl RrcUeContextManager {
                 security,
                 ran_notification_area,
                 t380_minutes,
+                srb1_protected,
             },
         );
         self.suspended.get(&full_i_rnti)

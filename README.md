@@ -5,7 +5,7 @@ A pure Rust implementation of a 5G User Equipment (UE) and gNodeB (gNB) simulato
 ## Features
 
 - **Pure Rust**: No C/C++ dependencies in the default build
-- **5G-SA**: registration, authentication (5G-AKA, EAP-AKA'), NAS and AS security, PDU sessions over a GTP-U user plane, CM-IDLE paging and Service Request (the UE answers a page and holds the uplink packet that triggers a Service Request until the user plane is back), RRC_INACTIVE resume, Xn/N2 and conditional handover, re-registration after a network-initiated de-registration
+- **5G-SA**: registration, authentication (5G-AKA, EAP-AKA'), NAS and AS security, PDU sessions over a GTP-U user plane, CM-IDLE paging and Service Request (the UE answers a page and holds the uplink packet that triggers a Service Request until the user plane is back), RRC_INACTIVE resume, N2 and conditional handover (no Xn-C between gNBs), re-registration after a network-initiated de-registration
 - **LTE (E-UTRA / EPC)**: an LTE eNB (`lte-enb`: S1 Setup, S1AP UE signalling, S1-U GTP-U) and an LTE UE (`lte-ue`: cell selection, RRC, EPS NAS attach with EPS AKA, AS security, SRB2 and DRBs on PDCP/RLC UM, TUN) that attach to nextgcore's EPC and pass a ping through the PDN
 - **Rel-17/18 features**: RedCap, XR 5QI, SNPN (NID), MINT/disaster-roaming, and UAV aerial-UE registration, integrated end-to-end with nextgcore (UE config knobs in `docs/configuration.md` → Rel-17/18 Feature Configuration; example configs in `config/features/`)
 - **6G Exploration**: Research-grade AI/ML prototypes (ISAC, federated learning, semantic communication) — not conformant to any frozen 3GPP spec (Rel-20 is in discussion; disabled by default)
@@ -152,7 +152,8 @@ The UE puts the default bearer's PDN address on a TUN (`lteuetun5`), which
 needs `cap_add: [NET_ADMIN]` and `devices: [/dev/net/tun:/dev/net/tun]`.
 `docker exec <ue> lte-ue-ping-check <target> [count]` then waits for that
 address and asserts a 0%-loss ping through the PDN (exit 0 pass, 1 no bearer,
-2 loss).
+2 loss). `docker exec <ue> lte-ue-detach [--switch-off]` makes the UE detach
+(TS 24.301 §5.5.2.2) and exits 0 once it is EMM-DEREGISTERED.
 
 ## Workspace Structure
 

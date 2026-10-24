@@ -186,3 +186,9 @@ path = "src/gnb_cli_reachability.rs"
 [[test]]
 name = "rrc_inactive_resume"
 path = "src/rrc_inactive_resume.rs"
+
+# `testing` (as_security(), for rrc_handshake, #348) only in test builds: as a
+# normal dependency it would also reach the production nr-ue of a
+# `cargo build --workspace`.
+[dev-dependencies]
+nextgsim-ue = { path = "../nextgsim-ue", features = ["testing"] }

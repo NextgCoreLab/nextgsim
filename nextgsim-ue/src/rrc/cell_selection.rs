@@ -393,6 +393,12 @@ impl CellSelector {
     }
 
     /// Clear forbidden TAI lists
+    /// Replace both forbidden-TA lists with NAS's (TS 24.501 §5.3.13).
+    pub fn set_forbidden_tais(&mut self, roaming: Vec<Tai>, regional_service: Vec<Tai>) {
+        self.forbidden_tai_roaming = roaming;
+        self.forbidden_tai_rps = regional_service;
+    }
+
     pub fn clear_forbidden_tais(&mut self) {
         self.forbidden_tai_roaming.clear();
         self.forbidden_tai_rps.clear();
