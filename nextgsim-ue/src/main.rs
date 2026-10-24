@@ -372,8 +372,11 @@ impl UeApp {
                         } else {
                             None
                         };
-                        // Trigger Service Request if UE is in IDLE state
-                        // (NAS task will check actual state and only send if needed)
+                        // Tell the NAS task uplink data is waiting. It decides
+                        // whether that needs a Service Request: none if the user
+                        // plane is up, and none while one is already in progress
+                        // (T3517 running, TS 24.501 §5.6.1.2, #317) -- so a burst
+                        // of packets still sends ONE request.
                         //
                         // The PSI travels with the trigger: it becomes the Uplink
                         // data status bit the SERVICE REQUEST advertises
@@ -944,6 +947,9 @@ impl UeApp {
                         }
                         NasMessage::RrcEstablishmentFailure => {
                             warn!("RRC establishment failure");
+                            // A lower-layer failure before the service request
+                            // completed aborts it (TS 24.501 §5.6.1.7 l), #316).
+                            orch.on_rrc_establishment_failure();
                         }
                         NasMessage::Paging { paging_s_tmsi } => {
                             info!(
@@ -1166,7 +1172,10 @@ impl UeApp {
                                 .await;
                             }
                             // Data-triggered Service Request: UE has data to send while in IDLE
-                            if orch.state().is_registered() && orch.state().is_idle() {
+                            if orch.service_request_in_progress() {
+                                // The burst that follows the first packet (#317).
+                                debug!("Service Request already in progress; uplink held");
+                            } else if orch.state().is_registered() && orch.state().is_idle() {
                                 // TS 24.501 §5.6.1.2 / §9.11.3.44: the Uplink data
                                 // status IE names the session with pending uplink
                                 // data. Built from the PSI the TUN write arrived on,

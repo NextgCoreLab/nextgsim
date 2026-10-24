@@ -1628,6 +1628,11 @@ impl MmOrchestrator {
         // NAS message container once security is up (TS 24.501 §4.4.6).
         self.last_registration_request = Some(plain.clone());
         self.pending_reg_type = reg_type;
+        // TS 24.501 §5.6.1.7: a registration procedure for mobility or periodic
+        // update triggered while a service request is in progress aborts it and
+        // stops T3517 (#316). No other registration can start while one runs: a
+        // service request is only started from 5GMM-REGISTERED.
+        self.abort_service_request("registration procedure started");
         self.state.switch_mm_state(MmSubState::RegisteredInitiated);
         self.timers.start(TIMER_T3510, true);
         self.timers.stop(TIMER_T3511, true);
@@ -2739,6 +2744,16 @@ impl MmOrchestrator {
             warn!("Service Request not started: UE not registered");
             return Vec::new();
         }
+        // TS 24.501 §5.6.1.2: a service request is initiated when the UE is not
+        // already in 5GMM-SERVICE-REQUEST-INITIATED; while T3517 runs the
+        // procedure is in progress. Before #317 every uplink packet that arrived
+        // between the first SERVICE REQUEST and the RRC connection setup built
+        // and sent another one, each with a new UL NAS COUNT and a restarted
+        // T3517, which the AMF then saw as duplicates.
+        if self.service_request_in_progress() {
+            debug!("Service Request ({service_type:?}) not started: one is already in progress");
+            return Vec::new();
+        }
         let Some(s_tmsi) = self.build_s_tmsi() else {
             warn!("Service Request not started: no stored 5G-GUTI");
             return Vec::new();
@@ -2826,6 +2841,29 @@ impl MmOrchestrator {
         data.push(0xF0 | (MobileIdentityType::Tmsi as u8));
         data.extend_from_slice(&s_tmsi);
         Some(Ie5gsMobileIdentity::new(MobileIdentityType::Tmsi, data))
+    }
+
+    /// Whether a service request procedure is in progress: T3517 running, or
+    /// 5GMM-SERVICE-REQUEST-INITIATED (TS 24.501 §5.6.1.2, #317).
+    pub fn service_request_in_progress(&self) -> bool {
+        self.timers.t3517.is_running()
+            || self.state.mm_substate() == MmSubState::ServiceRequestInitiated
+    }
+
+    /// Abort a service request procedure in progress: stop T3517 and leave
+    /// 5GMM-SERVICE-REQUEST-INITIATED for 5GMM-REGISTERED.NORMAL-SERVICE
+    /// (TS 24.501 §5.6.1.7, #316). Returns whether one was in progress.
+    fn abort_service_request(&mut self, why: &str) -> bool {
+        if !self.service_request_in_progress() {
+            return false;
+        }
+        info!("Service request procedure aborted ({why}): T3517 stopped");
+        self.timers.stop(TIMER_T3517, true);
+        if self.state.mm_substate() == MmSubState::ServiceRequestInitiated {
+            self.state
+                .switch_mm_state(MmSubState::RegisteredNormalService);
+        }
+        true
     }
 
     /// Whether uplink user data can be sent now: a NAS signalling connection
@@ -3125,12 +3163,26 @@ impl MmOrchestrator {
         outs
     }
 
+    /// The lower layers failed to establish the RRC connection a NAS message
+    /// was waiting for (T300 expiry, RRC reject). A service request in progress
+    /// is aborted: T3517 stopped, 5GMM-REGISTERED (TS 24.501 §5.6.1.7 l), #316).
+    /// A registration in progress is left to T3510.
+    pub fn on_rrc_establishment_failure(&mut self) {
+        self.abort_service_request("RRC connection establishment failed");
+    }
+
     /// The NAS signalling connection was released (RRC release or radio link
     /// failure): the UE is CM-IDLE. Starts the initial registration a
     /// network-initiated de-registration deferred to this point
     /// (TS 24.501 §5.5.2.3.2), unless one has already been started.
     pub fn on_nas_signalling_connection_released(&mut self) -> Vec<MmOutput> {
         self.state.switch_cm_state(CmState::Idle);
+        // TS 24.501 §5.6.1.7: a lower-layer release or failure before the
+        // service request completes aborts the procedure; the UE stops T3517
+        // and enters 5GMM-REGISTERED. Left running, T3517 kept the uplink held
+        // and refused a new Service Request for up to 15 s after the connection
+        // it belonged to was gone (#316).
+        self.abort_service_request("NAS signalling connection released");
         // A secure exchange belongs to one connection (§4.4.4.2).
         self.secure_exchange = false;
         // So do the user-plane resources (#288).
@@ -6652,6 +6704,114 @@ mod tests {
             status_at < success_at,
             "reconciliation must precede RegistrationSucceeded, got {outs:?}"
         );
+    }
+
+    /// #317, TS 24.501 §5.6.1.2: a second trigger while a service request is in
+    /// progress (T3517 running, SERVICE-REQUEST-INITIATED) sends nothing -- one
+    /// SERVICE REQUEST PDU, one UL NAS COUNT, T3517 not restarted.
+    #[test]
+    fn two_triggers_send_one_service_request() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+
+        let first = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        assert_eq!(first.len(), 1, "{first:?}");
+        let count_after_first = orch.sec.uplink_count().to_u32();
+        assert!(orch.service_request_in_progress());
+
+        for _ in 0..10 {
+            let again = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+            assert!(again.is_empty(), "no duplicate SERVICE REQUEST: {again:?}");
+        }
+        assert_eq!(
+            orch.sec.uplink_count().to_u32(),
+            count_after_first,
+            "no UL NAS COUNT spent on duplicates"
+        );
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::ServiceRequestInitiated
+        );
+    }
+
+    /// #316, TS 24.501 §5.6.1.7: a lower-layer release before the Service Accept
+    /// aborts the procedure -- T3517 stopped, 5GMM-REGISTERED -- so after the UE
+    /// reconnects (here: an RLF and a mobility registration elsewhere) it can ask
+    /// for its user plane at once instead of waiting out T3517.
+    #[test]
+    fn a_release_during_a_service_request_stops_t3517() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        assert!(orch.timers().t3517.is_running());
+
+        orch.on_nas_signalling_connection_released();
+
+        assert!(!orch.timers().t3517.is_running(), "T3517 stopped");
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert!(!orch.service_request_in_progress());
+        // Reconnected without a user plane: a new Service Request may go out now.
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(orch.user_plane_reactivation_needed());
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+    }
+
+    /// #316, §5.6.1.7 l): an RRC establishment failure (the SERVICE REQUEST from
+    /// CM-IDLE never got a connection) aborts the procedure too.
+    #[test]
+    fn an_rrc_establishment_failure_aborts_the_service_request() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        orch.on_rrc_establishment_failure();
+        assert!(!orch.timers().t3517.is_running());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert!(
+            !orch
+                .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+                .is_empty(),
+            "the next uplink may try again"
+        );
+    }
+
+    /// #316, TS 24.501 §5.6.1.7: a mobility registration triggered while a service
+    /// request is in progress aborts it and stops T3517; the registration runs
+    /// under T3510.
+    #[test]
+    fn a_mobility_registration_stops_t3517() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        assert!(orch.timers().t3517.is_running());
+
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+
+        assert!(!outs.is_empty(), "the registration request is sent");
+        assert!(!orch.timers().t3517.is_running(), "T3517 stopped");
+        assert!(orch.timers().t3510.is_running());
+        assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
     }
 
     #[test]

@@ -772,3 +772,50 @@ fn a_detach_during_a_service_request_aborts_it() {
     assert_eq!(ue.state(), EmmState::Deregistered);
     assert_eq!(ue.next_deadline(), Some(now + T3440), "T3417 stopped");
 }
+
+/// §4.4.2.3 item 2: on a connection a SERVICE REQUEST set up, the lower layers'
+/// "user plane radio bearers set up" indication establishes the secure exchange,
+/// so the next uplink EMM message -- here the DETACH ACCEPT answering a network
+/// DETACH REQUEST -- is integrity protected AND ciphered (header type 2, octet
+/// 0x27), not integrity protected only (0x17) (#318).
+#[test]
+fn uplink_nas_is_ciphered_once_a_service_request_set_up_the_bearers() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_user_plane_established();
+    assert_eq!(ue.state(), EmmState::Registered);
+    let out = ue.on_downlink(&mme.protect(&detach_request(1, None), 2), now);
+    let accept = &out.uplink[0];
+    assert_eq!(
+        accept[0], 0x27,
+        "DETACH ACCEPT: integrity protected and ciphered"
+    );
+    assert_ne!(
+        &accept[6..],
+        &[0x07, 0x46],
+        "the message body is not in clear"
+    );
+    assert_eq!(mme.unprotect(accept), vec![0x07, 0x46]);
+}
+
+/// The secure exchange is per connection (§4.4.5): the release that ends the
+/// service-request connection ends it too, and the next SERVICE REQUEST
+/// connection is integrity only until its own bearers are set up.
+#[test]
+fn the_service_request_secure_exchange_ends_with_the_connection() {
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_user_plane_established();
+    ue.on_released(now);
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    // Bearers not yet up: a DETACH ACCEPT here is integrity protected only.
+    let out = ue.on_downlink(&mme.protect(&detach_request(1, None), 2), now);
+    assert_eq!(
+        out.uplink[0][0], 0x17,
+        "no secure exchange before the bearers"
+    );
+    assert_eq!(mme.unprotect(&out.uplink[0]), vec![0x07, 0x46]);
+}
