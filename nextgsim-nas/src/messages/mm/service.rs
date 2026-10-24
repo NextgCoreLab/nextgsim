@@ -673,6 +673,50 @@ mod tests {
         assert!(pos >= 3);
     }
 
+    /// TS 24.501 §9.11.3.44 (PDU session status) and §9.11.3.57 (Uplink data
+    /// status): octet 3 is PSI(7)..PSI(0) from bit 8 to bit 1, octet 4 is
+    /// PSI(15)..PSI(8). Derived by hand from that layout:
+    /// - PSI 9 alone: octet 3 0x00, octet 4 bit 2 = 0x02, so `00 02`;
+    /// - PSI 5 and 13: bit 6 of each octet, so `20 20`;
+    /// - PSI 1 and 10: octet 3 bit 2 = 0x02, octet 4 bit 3 = 0x04, so `02 04`.
+    ///   This is the vector a byte swap cannot pass.
+    ///
+    /// Checked both ways, encode and decode, on both IEs. The existing round trips
+    /// would also pass against a swap on both sides.
+    #[test]
+    fn psi_bitmaps_match_the_spec_octets_both_ways() {
+        for (psis, octets) in [
+            (&[9u8][..], [0x00u8, 0x02]),
+            (&[5, 13][..], [0x20, 0x20]),
+            (&[1, 10][..], [0x02, 0x04]),
+        ] {
+            let bitmap = psis.iter().fold(0u16, |acc, psi| acc | (1u16 << psi));
+            let tmsi = Ie5gsMobileIdentity::new(
+                MobileIdentityType::Tmsi,
+                vec![0xF4, 0x01, 0x02, 0x03, 0x04],
+            );
+            let mut msg = ServiceRequest::new(
+                NasKeySetIdentifier::new(SecurityContextType::Native, 2),
+                IeServiceType::new(ServiceType::Data),
+                tmsi,
+            );
+            msg.uplink_data_status = Some(bitmap);
+            msg.pdu_session_status = Some(bitmap);
+            let mut buf = Vec::new();
+            msg.encode(&mut buf);
+            for iei in [0x40u8, 0x50] {
+                let ie = [iei, 0x02, octets[0], octets[1]];
+                assert!(
+                    buf.windows(4).any(|w| w == ie),
+                    "PSIs {psis:?}: IE {iei:#04x} must be {ie:02X?} in {buf:02X?}"
+                );
+            }
+            let decoded = ServiceRequest::decode(&mut &buf[3..]).unwrap();
+            assert_eq!(decoded.uplink_data_status, Some(bitmap), "PSIs {psis:?}");
+            assert_eq!(decoded.pdu_session_status, Some(bitmap), "PSIs {psis:?}");
+        }
+    }
+
     #[test]
     fn test_service_accept_encode_decode() {
         let msg = ServiceAccept::new();

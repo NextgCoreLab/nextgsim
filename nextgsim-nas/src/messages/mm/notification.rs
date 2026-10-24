@@ -313,6 +313,11 @@ mod tests {
         assert!(msg.pdu_session_status.is_none());
     }
 
+    // The PDU session status value is carried as raw octets here (TS 24.501
+    // §9.11.3.44): octet 3 is PSI(7)..PSI(0), octet 4 is PSI(15)..PSI(8). So
+    // `00 20` below is PSI 13 (octet 4, bit 6), not PSI 5, which would be
+    // `20 00`. These tests only round-trip the octets. A caller that fills the
+    // field from a u16 bitmap (bit n = PSI n) must use `to_le_bytes()`.
     #[test]
     fn test_notification_response_with_pdu_session_status() {
         let msg = NotificationResponse::with_pdu_session_status(vec![0x00, 0x20]);
